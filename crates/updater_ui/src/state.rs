@@ -12,19 +12,17 @@ use bytes::Bytes;
 use gpui_kit::{Context, Task};
 use i18n::language::codes::LanguageCode;
 use network::transport::hub::TransportHub;
-use smol_str::SmolStr;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
-    error::{InstallError, MetadataError, SignatureError, UpdateRequestError, UpdaterError},
+    error::{InstallError, MetadataError, UpdateRequestError, UpdaterError},
     fetch,
     global::UpdaterDeps,
     install, publish,
     release::ReleaseInfo,
-    verify,
 };
 
 /// How long after startup the first check runs.
@@ -63,7 +61,7 @@ pub(crate) enum UpdaterState {
     Available(ReleaseInfo),
     /// The payload of the available release is being downloaded.
     Downloading(Download),
-    /// The payload is downloaded and verified, waiting for the user.
+    /// The payload is downloaded, waiting for the user.
     ReadyToInstall(DownloadedUpdate),
     /// The payload is being installed.
     Installing(ReleaseInfo),
@@ -83,7 +81,7 @@ pub(crate) struct Download {
     cancellation: CancellationToken,
 }
 
-/// A payload that was downloaded and verified, waiting to be installed.
+/// A payload that was downloaded, waiting to be installed.
 #[derive(Debug)]
 pub(crate) struct DownloadedUpdate {
     release: ReleaseInfo,
@@ -192,7 +190,7 @@ impl UpdaterState {
         (download.downloaded, download.total) != before
     }
 
-    /// Applies a payload that arrived and verified.
+    /// Applies a payload that arrived.
     ///
     /// Only a download in flight becomes ready to install: a payload that arrives
     /// after the user cancelled, or after the state moved on, is dropped here.
@@ -265,7 +263,7 @@ impl UpdaterState {
         })
     }
 
-    /// A payload that was downloaded and verified, for a test that draws one without a network.
+    /// A payload that was downloaded, for a test that draws one without a network.
     #[cfg(test)]
     pub(crate) fn ready_for_test(release: ReleaseInfo, bytes: Bytes) -> Self {
         Self::ReadyToInstall(DownloadedUpdate { release, bytes })
@@ -423,7 +421,6 @@ impl Updater {
         let config = self.config.borrow().clone();
         let runtime = self.runtime.clone();
         let resolving = runtime.clone();
-        let signature = release.asset.signature.clone();
         let (progress_sender, mut progress) = mpsc::unbounded_channel();
         let read = cancellation.clone();
         let downloaded = runtime.run(async move {
@@ -442,7 +439,6 @@ impl Updater {
             )
             .await
         });
-        let verifying = self.runtime.clone();
         let progress = cx.spawn(async move |updater, cx| {
             while let Some((bytes, total)) = progress.recv().await {
                 let _ = updater.update(cx, |updater, cx| updater.record_progress(bytes, total, cx));
@@ -450,8 +446,7 @@ impl Updater {
         });
         let outcome = cx.spawn(async move |updater, cx| {
             let result = match downloaded.await {
-                Ok(Ok(bytes)) => verify_off_thread(&verifying, bytes, signature).await,
-                Ok(Err(error)) => Err(error),
+                Ok(result) => result,
                 Err(error) => Err(UpdaterError::Transport(UpdateRequestError::Task(error))),
             };
             let _ = updater.update(cx, |updater, cx| {
@@ -473,7 +468,7 @@ impl Updater {
         }
     }
 
-    /// Applies what the download produced: verified bytes, a cancellation, or a failure.
+    /// Applies what the download produced: bytes, a cancellation, or a failure.
     fn finish_download(
         &mut self,
         result: Result<Bytes, UpdaterError>,
@@ -483,7 +478,7 @@ impl Updater {
         // A cancelled request reports whatever its own stage called the
         // cancellation; the token is what says the user asked for it, and the
         // user's own answer is the one that counts. Nothing reaches the installer
-        // through this path either: the bytes, verified or not, are dropped.
+        // through this path either: the bytes are dropped.
         if cancellation.is_cancelled() {
             self.state.abandon_attempt();
         } else {
@@ -569,29 +564,6 @@ impl Updater {
     }
 }
 
-/// Verifies a downloaded payload on the application runtime's blocking pool.
-///
-/// The check hashes the whole payload — up to the download limit — which is not
-/// work for the interface thread and not work for a thread that is driving
-/// requests. The payload is handed back with the outcome so the caller keeps it.
-async fn verify_off_thread(
-    runtime: &Runtime,
-    bytes: Bytes,
-    signature: SmolStr,
-) -> Result<Bytes, UpdaterError> {
-    let checking = runtime.blocking(move || {
-        let outcome = verify::verify(&bytes, signature.as_str(), publish::PUBKEY);
-        (bytes, outcome)
-    });
-    let (bytes, outcome) = checking
-        .await
-        .map_err(|error| UpdaterError::Signature(SignatureError::Task(error)))?;
-
-    outcome.map_err(UpdaterError::Signature)?;
-
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use gpui_kit::AppContext as _;
@@ -608,16 +580,13 @@ mod tests {
             pub_date: None,
             asset: PlatformRelease {
                 url: url::Url::parse("https://example.invalid/kytrix-setup.exe").unwrap(),
-                signature: SmolStr::new_static("signature"),
                 format: ReleaseFormat::Nsis,
             },
         }
     }
 
     fn failure() -> UpdaterError {
-        UpdaterError::Signature(SignatureError::Verification(
-            minisign_verify::Error::InvalidSignature,
-        ))
+        UpdaterError::Transport(UpdateRequestError::Cancelled)
     }
 
     /// Every attempt at what one entity's dependencies are, without a network.
@@ -799,7 +768,7 @@ mod tests {
         );
         assert!(
             state.begin_install().is_none(),
-            "a payload that did not verify never reaches the installer"
+            "a failed attempt never reaches the installer"
         );
 
         state.failure_dismissed();

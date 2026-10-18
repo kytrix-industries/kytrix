@@ -1,7 +1,7 @@
 //! The dialog an offered update is read about, downloaded through and installed from.
 //!
 //! One entity draws all of it: the notes before anything is downloaded, the
-//! progress while it is, and the invitation to install once it has verified. Which
+//! progress while it is, and the invitation to install once it has downloaded. Which
 //! of them is drawn is read from the updater, which owns that state — the dialog
 //! keeps no copy, it follows the entity that does. Closing is the dialog's own
 //! [`DismissEvent`], which is what the layer it was opened on subscribes to.
@@ -336,7 +336,7 @@ fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement
         .into_any_element()
 }
 
-/// What a downloaded and verified payload says.
+/// What a downloaded payload says.
 fn downloaded_body(cx: &Context<UpdateDialog>) -> AnyElement {
     div()
         .debug_selector(|| UPDATER_DIALOG_DOWNLOADED.into())
@@ -393,7 +393,6 @@ mod tests {
             pub_date: None,
             asset: PlatformRelease {
                 url: url::Url::parse("https://example.invalid/kytrix-setup.exe").unwrap(),
-                signature: SmolStr::new_static("signature"),
                 format: ReleaseFormat::Nsis,
             },
         }
@@ -622,7 +621,7 @@ mod tests {
 
         assert!(
             cx.debug_bounds(UPDATER_DIALOG_DOWNLOADED).is_some(),
-            "a verified payload says so"
+            "a downloaded payload says so"
         );
         assert!(
             cx.debug_bounds(UPDATER_DIALOG_INSTALL).is_some(),

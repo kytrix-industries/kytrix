@@ -118,7 +118,6 @@ mod tests {
             pub_date: None,
             asset: PlatformRelease {
                 url: url::Url::parse("https://example.invalid/kytrix-setup.exe").unwrap(),
-                signature: smol_str::SmolStr::new_static("signature"),
                 format: ReleaseFormat::Nsis,
             },
         }

@@ -220,18 +220,8 @@ jobs:
         shell: bash
         env:
           FORMATS: ${{ matrix.formats }}
-        # The signing key must not be in this step's environment: with
-        # CARGO_PACKAGER_SIGN_PRIVATE_KEY set, cargo-packager signs every output
-        # (cli/mod.rs:126-136 and 176-183). On macOS that archives the .app bundle
-        # itself into an architecture-less Kytrix.app.tar.gz - the same asset name
-        # would come from both macOS jobs - and it would add .dmg.sig / .deb.sig
-        # that §15.1 does not allow. Signing happens in its own step below.
         run: |
           set -euo pipefail
-          test -z "${CARGO_PACKAGER_SIGN_PRIVATE_KEY:-}" \
-            || { echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY is set for packaging; the packager would sign every output"; exit 1; }
-          test -z "${CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD:-}" \
-            || { echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD is set for packaging; the packager would sign every output"; exit 1; }
           # -c: use the repository's Packager.toml verbatim. No --release (ignored
           # when --config is used) and no --target (native builds only).
           cargo packager -c Packager.toml --formats "$FORMATS"
@@ -282,33 +272,17 @@ jobs:
             *) echo "update payload $(basename "$PAYLOADS") does not carry the architecture token '$ARCH'"; exit 1 ;;
           esac
 
-      - name: Sign the update payload
-        shell: bash
-        # The two secrets exist in this step's environment only.
-        env:
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # One explicit signer invocation per update payload; the CLI reads both
-          # values from the environment and writes <file>.sig next to the file.
-          cargo packager signer sign "$(ls target/packager/${{ matrix.payload_glob }})"
-
-      - name: Assert signatures and the uploaded file set
+      - name: Assert the uploaded file set
         shell: bash
         run: |
           set -euo pipefail
           PAYLOAD="$(ls target/packager/${{ matrix.payload_glob }})"
-          test -s "$PAYLOAD.sig" \
-            || { echo "expected a non-empty $(basename "$PAYLOAD").sig"; exit 1; }
-          # §15.1 allows exactly: the update payload, its .sig and this platform's
-          # installer. Anything else means an output that the release job would
-          # publish, e.g. an architecture-less Kytrix.app.tar.gz or a .dmg.sig from
-          # a signed packaging run, so fail here and name it.
+          # The published set is exactly the update payload and this platform's
+          # installer. Anything else means an output the release job would publish,
+          # e.g. an architecture-less Kytrix.app.tar.gz, so fail here and name it.
           EXPECTED="$(
             {
               basename "$PAYLOAD"
-              basename "$PAYLOAD.sig"
               if [ -n "${{ matrix.installer_glob }}" ]; then
                 ls target/packager/${{ matrix.installer_glob }} | while IFS= read -r f; do basename "$f"; done
               fi
@@ -336,26 +310,22 @@ jobs:
           set -euo pipefail
           PAYLOAD="$(ls target/packager/${{ matrix.payload_glob }})"
           URL="https://github.com/kytrix-industries/kytrix/releases/download/v$VERSION/$(basename "$PAYLOAD")"
-          # `signature` is the .sig file's content, not its path.
-          jq -n --arg key "$KEY" --arg url "$URL" --arg sig "$(cat "$PAYLOAD.sig")" --arg format "$FORMAT" \
-            '{platforms: {($key): {url: $url, signature: $sig, format: $format}}}' \
+          jq -n --arg key "$KEY" --arg url "$URL" --arg format "$FORMAT" \
+            '{platforms: {($key): {url: $url, format: $format}}}' \
             > "target/packager/latest-fragment-$KEY.json"
 
       - uses: actions/upload-artifact@v4
         with:
           name: kytrix-${{ matrix.job }}
           if-no-files-found: error
-          # Only §15.1 assets plus the fragment: the Kytrix.app directory is not an
-          # asset and no pattern below matches it.
+          # Only the published assets plus the fragment: the Kytrix.app directory is
+          # not an asset and no pattern below matches it.
           path: |
             target/packager/*.exe
-            target/packager/*.exe.sig
             target/packager/*.dmg
             target/packager/*.app.tar.gz
-            target/packager/*.app.tar.gz.sig
             target/packager/*.deb
             target/packager/*.AppImage
-            target/packager/*.AppImage.sig
             target/packager/latest-fragment-*.json
 
   release:
@@ -450,10 +420,10 @@ jobs:
           set -euo pipefail
           # The fragments are inputs to latest.json, not release assets (§15.1).
           find dist -name 'latest-fragment-*.json' -delete
-          # §15.1's asset set, asserted before anything is published: 6 update
-          # payloads (2 NSIS .exe, 2 .app.tar.gz, 2 .AppImage), their 6 .sig,
-          # 2 .dmg, 2 .deb and latest.json - 17 files.
-          for spec in "*.exe:2" "*.app.tar.gz:2" "*.AppImage:2" "*.sig:6" "*.dmg:2" "*.deb:2" "latest.json:1"; do
+          # The published asset set, asserted before anything is published: 6 update
+          # payloads (2 NSIS .exe, 2 .app.tar.gz, 2 .AppImage), 2 .dmg, 2 .deb and
+          # latest.json - 11 files.
+          for spec in "*.exe:2" "*.app.tar.gz:2" "*.AppImage:2" "*.dmg:2" "*.deb:2" "latest.json:1"; do
             pattern="${spec%:*}"
             want="${spec##*:}"
             got="$(find dist -type f -name "$pattern" | wc -l)"
@@ -461,15 +431,15 @@ jobs:
               || { echo "expected $want '$pattern' asset(s), found $got"; find dist -type f; exit 1; }
           done
           TOTAL="$(find dist -type f | wc -l)"
-          test "$TOTAL" = 17 || { echo "expected 17 assets, found $TOTAL"; find dist -type f; exit 1; }
+          test "$TOTAL" = 11 || { echo "expected 11 assets, found $TOTAL"; find dist -type f; exit 1; }
 
           # Idempotent re-runs: drop an existing release first and keep the tag.
           gh release delete "v$VERSION" --yes --cleanup-tag=false || true
 
           mapfile -t ASSETS < <(find dist -type f | sort)
           printf '%s\n' "${ASSETS[@]}"
-          # --draft on purpose: a human inspects the installers, the .sig files and
-          # latest.json and publishes (§6.3). The release body is the English notes;
+          # --draft on purpose: a human inspects the installers and latest.json and
+          # publishes (§6.3). The release body is the English notes;
           # the Chinese translation is published to the updater through latest.json.
           # --target pins a tag this run has to create to the commit that was built:
           # nothing has pushed v$VERSION, so without it gh would tag the default

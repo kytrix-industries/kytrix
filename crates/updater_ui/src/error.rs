@@ -29,9 +29,6 @@ pub enum UpdaterError {
     /// The published metadata could not be read as the release it announces.
     #[error("the update metadata could not be read")]
     Metadata(#[source] MetadataError),
-    /// The payload does not match the key the release was signed with.
-    #[error("the update payload did not verify")]
-    Signature(#[source] SignatureError),
     /// This build has no update it could install for the platform it runs on.
     #[error("this platform has no in-app update")]
     UnsupportedPlatform,
@@ -48,7 +45,6 @@ impl UpdaterError {
             Self::Client(_) => "error.updater.client",
             Self::Transport(_) => "error.updater.transport",
             Self::Metadata(_) => "error.updater.metadata",
-            Self::Signature(_) => "error.updater.signature",
             Self::UnsupportedPlatform => "error.updater.unsupported_platform",
             Self::Install(_) => "error.updater.install",
         }
@@ -119,39 +115,6 @@ pub enum MetadataError {
     PublishDate(#[source] time::error::Parse),
 }
 
-/// Why the payload did not verify against the published signature.
-///
-/// The public key and the signature are each base64 over minisign's own text, so
-/// each of them can fail to decode before minisign ever sees it; which of the two
-/// steps failed is what a log line has to say.
-#[derive(Debug, Error)]
-pub enum SignatureError {
-    /// The public key is not base64.
-    #[error("the update public key is not base64")]
-    PublicKeyEncoding(#[source] base64::DecodeError),
-    /// The public key is not UTF-8.
-    #[error("the update public key is not text")]
-    PublicKeyUtf8(#[source] std::string::FromUtf8Error),
-    /// The public key is not a minisign key.
-    #[error("the update public key is not a minisign key")]
-    PublicKey(#[source] minisign_verify::Error),
-    /// The signature is not base64.
-    #[error("the release signature is not base64")]
-    SignatureEncoding(#[source] base64::DecodeError),
-    /// The signature is not UTF-8.
-    #[error("the release signature is not text")]
-    SignatureUtf8(#[source] std::string::FromUtf8Error),
-    /// The signature is not a minisign signature.
-    #[error("the release signature is not a minisign signature")]
-    Signature(#[source] minisign_verify::Error),
-    /// The payload does not match the signature.
-    #[error("the update payload does not match its signature")]
-    Verification(#[source] minisign_verify::Error),
-    /// The task that was checking the payload did not finish.
-    #[error("the update signature check did not finish")]
-    Task(#[source] tokio::task::JoinError),
-}
-
 /// Why the platform's installer did not take the payload.
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -204,7 +167,7 @@ mod tests {
 
         assert_eq!(
             keys.len(),
-            7,
+            6,
             "every failure the updater reports names its message, and {} was read",
             keys.len()
         );

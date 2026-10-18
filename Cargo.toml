@@ -83,7 +83,6 @@ keyring = "4.2.0"
 kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "e02a954c4e55f6f7b05ae8f20401ae89c80e0c9d" }
 log = "0.4.34"
 longbridge-proto = "5.2.0"
-minisign-verify = "0.2"
 nucleo = "0.5.0"
 p256 = "0.14.0"
 parking_lot = "0.12.5"

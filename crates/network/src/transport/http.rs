@@ -75,14 +75,12 @@ impl HttpClientClass {
                 redirect_limit: 10,
                 // Not a small budget: this is the whole of `latest.json`, which the
                 // release job publishes with both `release_notes/vX.Y.Z/{en,zh-CN}.md`
-                // files as its `notes` plus one entry per platform, each carrying the
-                // ~430-byte base64 signature `signer sign` wrote next to the payload.
-                // Six of those are ~2.6 KiB before the notes are counted, so 4 KiB was
-                // smaller than the metadata this pipeline actually writes: the
-                // assembled v0.1.0 file measured 5294 bytes with one language, and
-                // every check would have failed with `ResponseBodyTooLarge` —
-                // silently, because a failed check only retries. The release job
-                // asserts the assembled file stays under this number.
+                // files as its `notes` plus one entry per platform. 4 KiB was smaller
+                // than the metadata this pipeline actually writes: the assembled
+                // v0.1.0 file measured 5294 bytes with one language, and every check
+                // would have failed with `ResponseBodyTooLarge` — silently, because a
+                // failed check only retries. The release job asserts the assembled
+                // file stays under this number.
                 response_body_limit: 64 * 1024,
                 user_agent: concat!("Kytrix/", env!("CARGO_PKG_VERSION")),
             },

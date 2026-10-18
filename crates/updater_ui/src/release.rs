@@ -24,13 +24,11 @@ pub enum ReleaseFormat {
     AppImage,
 }
 
-/// One platform of a release: what to download, and what signs it.
+/// One platform of a release: what to download, and how it is installed.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PlatformRelease {
     /// Where the payload is downloaded from.
     pub url: Url,
-    /// The minisign signature of the payload, as the `.sig` file holds it.
-    pub signature: SmolStr,
     /// How the payload is installed.
     pub format: ReleaseFormat,
 }
@@ -199,12 +197,12 @@ mod tests {
         "notes": {"en": "## Notes\n\nWhat changed.", "zh-CN": "## 说明\n\n更新内容。"},
         "pub_date": "2026-10-20T09:00:00Z",
         "platforms": {
-            "windows-x86_64":  { "url": "https://example.invalid/kytrix-x64-setup.exe",  "signature": "one",   "format": "nsis" },
-            "windows-aarch64": { "url": "https://example.invalid/kytrix-arm64-setup.exe", "signature": "two",   "format": "nsis" },
-            "macos-x86_64":    { "url": "https://example.invalid/kytrix-x64.app.tar.gz",  "signature": "three", "format": "app" },
-            "macos-aarch64":   { "url": "https://example.invalid/kytrix-arm64.app.tar.gz", "signature": "four", "format": "app" },
-            "linux-x86_64":    { "url": "https://example.invalid/kytrix-x86_64.AppImage", "signature": "five", "format": "appimage" },
-            "linux-aarch64":   { "url": "https://example.invalid/kytrix-aarch64.AppImage", "signature": "six", "format": "appimage" }
+            "windows-x86_64":  { "url": "https://example.invalid/kytrix-x64-setup.exe",  "format": "nsis" },
+            "windows-aarch64": { "url": "https://example.invalid/kytrix-arm64-setup.exe", "format": "nsis" },
+            "macos-x86_64":    { "url": "https://example.invalid/kytrix-x64.app.tar.gz",  "format": "app" },
+            "macos-aarch64":   { "url": "https://example.invalid/kytrix-arm64.app.tar.gz", "format": "app" },
+            "linux-x86_64":    { "url": "https://example.invalid/kytrix-x86_64.AppImage", "format": "appimage" },
+            "linux-aarch64":   { "url": "https://example.invalid/kytrix-aarch64.AppImage", "format": "appimage" }
         }
     }"####;
 
@@ -245,10 +243,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key:?} is newer than the running build"));
             assert_eq!(release.key, key);
             assert_eq!(release.asset.url.host_str(), Some("example.invalid"));
-            assert!(
-                !release.asset.signature.is_empty(),
-                "{key:?} is published with a signature"
-            );
         }
         assert_eq!(
             manifest
@@ -273,7 +267,7 @@ mod tests {
     #[test]
     fn a_release_without_notes_or_a_publish_date_should_still_be_read() {
         let manifest = ReleaseManifest::parse(
-            br#"{"version": "9.9.9", "platforms": {"windows-x86_64": {"url": "https://example.invalid/a.exe", "signature": "s", "format": "nsis"}}}"#,
+            br#"{"version": "9.9.9", "platforms": {"windows-x86_64": {"url": "https://example.invalid/a.exe", "format": "nsis"}}}"#,
         )
         .expect("the optional fields are optional");
 
@@ -304,7 +298,7 @@ mod tests {
     #[test]
     fn a_publish_date_that_is_not_rfc_3339_should_be_refused() {
         let manifest = ReleaseManifest::parse(
-            br#"{"version": "9.9.9", "pub_date": "20 October 2026", "platforms": {"windows-x86_64": {"url": "https://example.invalid/a.exe", "signature": "s", "format": "nsis"}}}"#,
+            br#"{"version": "9.9.9", "pub_date": "20 October 2026", "platforms": {"windows-x86_64": {"url": "https://example.invalid/a.exe", "format": "nsis"}}}"#,
         )
         .expect("the text is a string like any other");
 
@@ -318,7 +312,7 @@ mod tests {
     fn a_format_the_updater_does_not_know_should_be_refused() {
         assert!(
             ReleaseManifest::parse(
-                br#"{"version": "9.9.9", "platforms": {"linux-x86_64": {"url": "https://example.invalid/a.deb", "signature": "s", "format": "deb"}}}"#
+                br#"{"version": "9.9.9", "platforms": {"linux-x86_64": {"url": "https://example.invalid/a.deb", "format": "deb"}}}"#
             )
             .is_err(),
             "a format no installer can take is not a release this build reads"
@@ -355,7 +349,7 @@ mod tests {
     #[test]
     fn a_newer_release_without_this_platform_should_be_refused() {
         let manifest = ReleaseManifest::parse(
-            br#"{"version": "9.9.9", "platforms": {"linux-x86_64": {"url": "https://example.invalid/a.AppImage", "signature": "s", "format": "appimage"}}}"#,
+            br#"{"version": "9.9.9", "platforms": {"linux-x86_64": {"url": "https://example.invalid/a.AppImage", "format": "appimage"}}}"#,
         )
         .unwrap();
 

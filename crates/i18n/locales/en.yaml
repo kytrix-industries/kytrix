@@ -422,7 +422,6 @@ error:
     client: The update HTTP client could not be created
     transport: The update download failed on the network
     metadata: The update metadata could not be read
-    signature: The update package did not pass signature verification
     unsupported_platform: This platform does not support in-app updates
     install: The update could not be installed
   upgrade:

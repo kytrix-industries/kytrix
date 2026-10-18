@@ -9989,7 +9989,6 @@ version = "0.0.1"
 dependencies = [
  "ahash",
  "app_config",
- "base64 0.23.1",
  "base_ui",
  "bytes",
  "cargo-packager-updater",
@@ -9999,7 +9998,6 @@ dependencies = [
  "hyper-util",
  "i18n",
  "log",
- "minisign-verify",
  "network",
  "reqwest 0.13.5",
  "semver",

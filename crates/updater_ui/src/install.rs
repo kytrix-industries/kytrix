@@ -79,12 +79,11 @@ pub(crate) fn install(
 fn update_value(release: &ReleaseInfo, language: LanguageCode) -> Result<Update, InstallError> {
     Ok(Update {
         // The installer reads the Windows install mode and nothing else of the
-        // configuration, so the endpoints are left empty rather than pointing a
-        // second copy of the same URL at a request nobody makes. The key is the
-        // published one: it is what a future re-verification would check against.
+        // configuration. It never downloads or verifies: the payload arrives from
+        // this crate's own fetch, so `pubkey` here and `signature` below stay empty.
         config: Config {
             endpoints: Vec::new(),
-            pubkey: publish::PUBKEY.to_owned(),
+            pubkey: String::new(),
             windows: Some(WindowsConfig {
                 installer_args: None,
                 // Passive shows the installer's progress window and asks nothing.
@@ -102,7 +101,7 @@ fn update_value(release: &ReleaseInfo, language: LanguageCode) -> Result<Update,
         target: release.key.wire().to_owned(),
         extract_path: extract_path()?,
         download_url: release.asset.url.clone(),
-        signature: release.asset.signature.to_string(),
+        signature: String::new(),
         timeout: None,
         headers: http::HeaderMap::new(),
         format: release.asset.format.into(),
@@ -233,7 +232,6 @@ mod tests {
             pub_date: None,
             asset: crate::release::PlatformRelease {
                 url: url::Url::parse("https://example.invalid/kytrix-1.2.3-setup.exe").unwrap(),
-                signature: smol_str::SmolStr::new_static("signature"),
                 format: ReleaseFormat::Nsis,
             },
         };
@@ -246,9 +244,7 @@ mod tests {
         assert_eq!(update.target, release.key.wire());
         assert_eq!(update.body.as_deref(), Some("更新内容"));
         assert_eq!(update.download_url, release.asset.url);
-        assert_eq!(update.signature, "signature");
         assert_eq!(update.date, None);
-        assert_eq!(update.config.pubkey, publish::PUBKEY);
         assert!(update.headers.is_empty());
         assert!(matches!(
             update

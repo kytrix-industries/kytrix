@@ -2,8 +2,7 @@
 //!
 //! The requests go through a real transport, a real client and a real redirect
 //! chain, so what is exercised here is the path production takes: metadata behind
-//! a redirect, a payload behind another one, frames that arrive one at a time,
-//! and a signature that is checked against the bytes that arrived.
+//! a redirect, a payload behind another one, and frames that arrive one at a time.
 
 use std::{
     collections::VecDeque,
@@ -35,7 +34,6 @@ use updater_ui::{
     error::{UpdateRequestError, UpdaterError},
     fetch,
     release::{PlatformKey, ReleaseFormat},
-    verify,
 };
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
@@ -47,16 +45,7 @@ const FRAME: usize = 16 * 1024;
 /// is a download that is still going.
 const LENGTH: usize = 192 * 1024;
 
-/// A minisign public key made for these tests, in the same form as the published one.
-///
-/// Generated as documented on `verify.rs`'s own fixture; the private half was
-/// discarded after the two payloads below were signed with it.
-const PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBRkIxRDAxODQ4MjdEQzYKUlVUNit4MEJoSUo5eHNCMG5ncHhUdFNnVExmcUdENHNENlArNHZ6MHpnYzJQeHEyU2JPT0F1V1AK";
-
-/// The signature of the payload the server serves.
-const SIGNATURE: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIG1pbmlzaWduIHNlY3JldCBrZXkKUlVUNit4MEJoSUo5eGgvM1A5d2ZUcUUxQjFRT3R0M2I5dGI0cCthZk9sSXFUclpWTzRJNEE2N2lXeldxUk5seWZkazI4MGZqSUVFZFVlWnBCdk42TGlpdjlXcDF5Ni9KeXc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzYwMDAwMDAxCWZpbGU6a3l0cml4LXRlc3QtcGF5bG9hZC1sYXJnZQlwcmVoYXNoZWQKaU1zd2RRN1FLTjUwUkVYeU1zZnJTODNKMXVsZytLTUpHVnh2MFRLaWl4REdkTnBmRHVDcHUzT3g4K244bG81T0gzRGs4U2JmWUNFaFViT09yUnJqREE9PQo=";
-
-/// The payload the release publishes, generated the way the fixture signed it.
+/// The payload the release publishes.
 fn payload() -> Bytes {
     Bytes::from(
         (0..LENGTH)
@@ -159,7 +148,6 @@ fn metadata(address: SocketAddr, payload_path: &str) -> Bytes {
         "platforms": {
             key.wire(): {
                 "url": format!("http://{address}{payload_path}"),
-                "signature": SIGNATURE,
                 "format": "nsis",
             },
         },
@@ -245,7 +233,7 @@ fn endpoint(address: SocketAddr) -> Url {
 }
 
 #[tokio::test]
-async fn a_release_should_be_read_downloaded_and_verified_end_to_end() {
+async fn a_release_should_be_read_and_downloaded_end_to_end() {
     let address = spawn_release_server("/payload", Duration::ZERO, None).await;
     let hub = transport();
     let runtime = Runtime::for_test();
@@ -259,7 +247,6 @@ async fn a_release_should_be_read_downloaded_and_verified_end_to_end() {
         .expect("a newer release is offered");
     assert_eq!(release.version, semver::Version::new(9, 9, 9));
     assert_eq!(release.asset.format, ReleaseFormat::Nsis);
-    assert_eq!(release.asset.signature.as_str(), SIGNATURE);
     assert_eq!(
         release.asset.url.as_str(),
         format!("http://{address}/payload"),
@@ -289,8 +276,6 @@ async fn a_release_should_be_read_downloaded_and_verified_end_to_end() {
         payload(),
         "the bytes that arrived are the bytes served"
     );
-    verify::verify(&bytes, release.asset.signature.as_str(), PUBKEY)
-        .expect("the payload verifies against the key it was signed with");
 
     let reported = reported.lock().expect("the recorder is never poisoned");
     assert!(

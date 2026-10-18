@@ -422,7 +422,6 @@ error:
     client: 无法创建更新用的网络客户端
     transport: 下载更新时网络出错
     metadata: 更新元数据无法解析
-    signature: 更新包签名校验失败
     unsupported_platform: 当前平台不支持应用内更新
     install: 安装更新失败
   upgrade:
