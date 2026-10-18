@@ -1,0 +1,59 @@
+# Kytrix packaging config. Field names use the serde primary names (camelCase);
+# kebab-case and snake_case spellings are accepted as aliases.
+
+# Required: with `name` unset, cargo-packager 0.11.8 calls `set_current_dir` on the
+# config file path itself (cli/config.rs:55-56, reached from cli/config.rs:99), which
+# fails with ENOTDIR / Windows os error 267 and aborts config loading. It is also the
+# package-selection key matched by `--packages`.
+name = "kytrix"
+productName = "Kytrix"
+# Local default only. cargo-packager has no version flag, so the release workflow
+# must rewrite this line to the tagged version before packaging; keep it equal to
+# [workspace.package] version.
+version = "0.0.1"
+# Must match CREDENTIAL_SERVICE in crates/kytrix_service_provider/src/auth/constants.rs.
+identifier = "xyz.kytrix.desktop"
+description = "Kytrix desktop terminal"
+homepage = "https://kytrix.xyz"
+authors = ["Kytrix Industries"]
+publisher = "Kytrix Industries"
+copyright = "Copyright (c) Kytrix Industries"
+
+outDir = "target/packager"
+# Explicit on purpose: Config::binaries_dir defaults to out_dir, so without this the
+# packager would look for the binary inside target/packager. A file config is used
+# verbatim, so --target does not redirect this.
+binariesDir = "target/release"
+
+category = "Finance"
+icons = [
+    "assets/branding/kytrix.png",
+    "assets/branding/kytrix.icns",
+    "assets/branding/kytrix.ico",
+]
+
+[[binaries]]
+path = "kytrix" # relative to binariesDir, without the .exe suffix
+main = true
+
+# Windows: NSIS only, mixed per-user / per-machine install (decision D12).
+[nsis]
+installMode = "both"
+languages = ["English", "SimpChinese"]
+displayLanguageSelector = true
+# Becomes MUI_ICON in install.nsi. nsis/mod.rs dunce::canonicalizes it after the
+# CLI chdirs to this file's directory, so the path is relative to the repo root.
+installerIcon = "assets/branding/kytrix_bordered.ico"
+# NSIS 3.09 only accepts notset|true|false (system-DPI-aware), so the installer UI
+# is bitmap-stretched on scaled displays without this. NsisConfig has no DPI field
+# and is deny_unknown_fields, so the compiler directive rides on preinstallSection:
+# the one config string that upstream renders at global scope (installer.nsi:437,
+# outside every Section). NSIS applies it to the installer only, not the uninstaller.
+preinstallSection = "ManifestDPIAware true"
+
+# Linux: deb runtime dependencies. Must be a string array: a bare string parses as the
+# path variant of Dependencies, i.e. a dependency-list file.
+[deb]
+depends = ["libxkbcommon0", "libwayland-client0", "libxcb1", "libvulkan1"]
+section = "utils"
+priority = "optional"

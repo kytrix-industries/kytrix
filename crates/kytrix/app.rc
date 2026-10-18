@@ -1,0 +1,10 @@
+/*
+ * The executable icon shown by Explorer, the taskbar and Alt-Tab, and the icon
+ * GPUI uses for the window class: its Windows backend loads icon resource ID 1
+ * from the executable (gpui-pre-windows `load_icon`). Keep the ID at 1.
+ *
+ * The path is relative to this file, which is also the resource compiler's
+ * working directory: embed-resource runs RC.EXE from the crate root.
+ */
+"KytrixApp" ICON "../../assets/branding/kytrix_bordered.ico"
+1 ICON "../../assets/branding/kytrix.ico"

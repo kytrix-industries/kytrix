@@ -1,0 +1,21 @@
+[package]
+name = "i18n"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash = { workspace = true, features = ["serde"] }
+either = { workspace = true }
+gpui-kit = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

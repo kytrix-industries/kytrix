@@ -1,0 +1,482 @@
+name: Release
+
+# Manual only: `cargo xtask bump-version` writes the version into Cargo.toml, and
+# this workflow reads it from there. No tag is required to trigger a release, and no
+# tag is read as the version; the release job tags the built commit as v$VERSION.
+on:
+  workflow_dispatch:
+
+concurrency:
+  # A manual run is tied to the branch or tag it was started from, so two runs of
+  # one ref share a group. cancel-in-progress stays false: a queued run must not
+  # cancel a build that is already uploading.
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify versions and release notes
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      # cargo metadata has to read a resolver-3 / edition-2024 workspace; pin the
+      # toolchain instead of relying on whatever cargo the image ships.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify versions and release notes
+        id: version
+        run: |
+          set -euo pipefail
+          # --no-deps keeps this offline: only workspace manifests are read.
+          VERSIONS="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kytrix") | .version')"
+          test "$(printf '%s\n' "$VERSIONS" | grep -c .)" = 1 \
+            || { echo "expected exactly one package named kytrix, got: $VERSIONS"; exit 1; }
+          VERSION="$VERSIONS"
+          # §6.2: the workspace version is the single source of truth for every
+          # later step; this workflow is started by hand and reads no tag.
+          PACKAGER_VERSION="$(awk -F'"' '
+            /^version[[:space:]]*=/ { print $2; exit }
+          ' Packager.toml)"
+          test "$PACKAGER_VERSION" = "$VERSION" \
+            || { echo "Packager.toml version $PACKAGER_VERSION != workspace version $VERSION"; exit 1; }
+          # §10.3: latest.json's `notes` carries both language files, and the draft
+          # release body is the English one. A release without either is not one the
+          # updater can show in every language, so fail before anything is built.
+          for language in en zh-CN; do
+            NOTE="release_notes/v$VERSION/$language.md"
+            test -s "$NOTE" || { echo "$NOTE is missing or empty"; exit 1; }
+          done
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.job }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # One native build per platform: no --target anywhere, because Packager.toml
+        # is a file config and is used verbatim, so its binariesDir "target/release"
+        # is literal (the target-triple prefixing only happens on the
+        # [package.metadata.packager] route, cli/config.rs:178-189).
+        #   arch         packager's architecture token, asserted to appear in the
+        #                payload file name (§5's uniqueness constraint)
+        #   key          latest.json platform key
+        #   update_format  cargo-packager-updater UpdateFormat value
+        include:
+          - job: windows-x64
+            os: windows-2025
+            formats: nsis
+            key: windows-x86_64
+            update_format: nsis
+            payload_glob: "*-setup.exe"
+            installer_glob: ""
+            arch: x64
+          - job: windows-arm64
+            os: windows-11-arm
+            formats: nsis
+            key: windows-aarch64
+            update_format: nsis
+            payload_glob: "*-setup.exe"
+            installer_glob: ""
+            arch: arm64
+          - job: macos-arm64
+            os: macos-26
+            formats: app,dmg
+            key: macos-aarch64
+            update_format: app
+            payload_glob: "Kytrix_*.app.tar.gz"
+            installer_glob: "*.dmg"
+            arch: aarch64
+          # macos-26-intel is the unsuffixed *standard* x64 macOS label: GitHub's
+          # standard-runner table lists it for public and private repositories
+          # (macOS / 4 CPU / Intel). The larger-runner sibling is macos-26-large,
+          # which needs a billing plan and would not schedule on a normal repo.
+          - job: macos-x64
+            os: macos-26-intel
+            formats: app,dmg
+            key: macos-x86_64
+            update_format: app
+            payload_glob: "Kytrix_*.app.tar.gz"
+            installer_glob: "*.dmg"
+            arch: x86_64
+          - job: linux-x64
+            os: ubuntu-22.04
+            formats: deb,appimage
+            key: linux-x86_64
+            update_format: appimage
+            payload_glob: "*.AppImage"
+            installer_glob: "*.deb"
+            arch: x86_64
+          - job: linux-arm64
+            os: ubuntu-22.04-arm
+            formats: deb,appimage
+            key: linux-aarch64
+            update_format: appimage
+            payload_glob: "*.AppImage"
+            installer_glob: "*.deb"
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      # protoc: the git dependency kytrix_proto builds with prost-build, which needs
+      # the protoc binary; no runner image ships it (checked against the 2026-10
+      # image tool lists). Chocolatey 2.7.4 and Homebrew are preinstalled.
+      - name: Install protoc (linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        # Same calibrated Linux list as ci.yml: libxkbcommon(-x11) for xkbcommon's
+        # #[link], libxcb1-dev for x11rb's allow-unsafe-code, libasound2-dev for
+        # alsa-sys, libfreetype-dev + libfontconfig1-dev for zed-font-kit's build
+        # scripts, cmake for aws-lc-sys. libfuse2: cargo-packager downloads and runs
+        # the linuxdeploy AppImage for the AppImage format, and the image has no
+        # FUSE library (cargo-packager passes --appimage-extract-and-run to
+        # linuxdeploy itself, but the appimage plugin next to it is executed as an
+        # AppImage, so keep FUSE available - §16.1 item 3).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler libfuse2 \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libasound2-dev libfreetype-dev libfontconfig1-dev \
+            cmake
+      - name: Install protoc (macos)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install protobuf
+      - name: Install protoc (windows)
+        if: startsWith(matrix.os, 'windows')
+        run: choco install protoc -y --no-progress
+
+      # Native builds only, so no `targets` input: the host target is the one the
+      # packager looks for in target/release.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: ${{ matrix.job }}
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      # cargo-packager has no version flag and no version env var: config.version is
+      # only auto-assigned on the [package.metadata.packager] route
+      # (cli/config.rs:161-163) and a file config is used verbatim, so the workspace
+      # version must be written into Packager.toml here.
+      # awk + mv instead of `sed -i` / python3: the Windows jobs run Git Bash, where
+      # `sed -i` semantics differ from GNU sed and python3 may not exist.
+      - name: Set the workspace version in Packager.toml
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # grep and awk share the same pattern, so the count below is exactly the
+          # number of lines awk replaces.
+          SEEN="$(grep -c '^version[[:space:]]*=' Packager.toml || true)"
+          test "$SEEN" = 1 \
+            || { echo "expected exactly one top-level version line in Packager.toml, found $SEEN"; exit 1; }
+          awk -v version="$VERSION" '
+            /^version[[:space:]]*=/ { print "version = \"" version "\""; next }
+            { print }
+          ' Packager.toml > Packager.toml.tmp
+          mv Packager.toml.tmp Packager.toml
+          grep -Fxq "version = \"$VERSION\"" Packager.toml \
+            || { echo "Packager.toml does not contain version = \"$VERSION\" after the rewrite"; exit 1; }
+          echo "Packager.toml version $VERSION"
+
+      - name: Build
+        shell: bash
+        env:
+          # aws-lc-sys (rustls -> aws-lc-rs -> aws-lc-sys) assembles its x86-64
+          # Windows crypto sources with NASM, which the windows-2025 image does not
+          # ship, and the crate carries prebuilt objects for exactly
+          # x86_64-pc-windows-msvc. aws-lc-sys only reads this when
+          # target_os == "windows" && target_arch == "x86_64"
+          # (aws-lc-sys builder/main.rs use_prebuilt_nasm), so "0" is inert on the
+          # other five jobs.
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.job == 'windows-x64' && '1' || '0' }}
+        # No --target: every job builds natively, so target/release is exactly where
+        # cargo puts the binary and where the packager looks for it.
+        run: cargo build --release --features production
+
+      - name: Package
+        shell: bash
+        env:
+          FORMATS: ${{ matrix.formats }}
+        # The signing key must not be in this step's environment: with
+        # CARGO_PACKAGER_SIGN_PRIVATE_KEY set, cargo-packager signs every output
+        # (cli/mod.rs:126-136 and 176-183). On macOS that archives the .app bundle
+        # itself into an architecture-less Kytrix.app.tar.gz - the same asset name
+        # would come from both macOS jobs - and it would add .dmg.sig / .deb.sig
+        # that §15.1 does not allow. Signing happens in its own step below.
+        run: |
+          set -euo pipefail
+          test -z "${CARGO_PACKAGER_SIGN_PRIVATE_KEY:-}" \
+            || { echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY is set for packaging; the packager would sign every output"; exit 1; }
+          test -z "${CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD:-}" \
+            || { echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD is set for packaging; the packager would sign every output"; exit 1; }
+          # -c: use the repository's Packager.toml verbatim. No --release (ignored
+          # when --config is used) and no --target (native builds only).
+          cargo packager -c Packager.toml --formats "$FORMATS"
+
+      # Two macOS jobs upload to one Release, so the updater archive is named by us
+      # and must carry the architecture (§5).
+      - name: Make the macOS updater archive
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test -d target/packager/Kytrix.app \
+            || { echo "target/packager/Kytrix.app is not a directory; --formats app,dmg did not produce the bundle"; ls -l target/packager; exit 1; }
+          tar -czf "target/packager/Kytrix_${VERSION}_${ARCH}.app.tar.gz" -C target/packager Kytrix.app
+          # The updater skips the first path component when it unpacks (§11.5), so
+          # the archive has to have the bundle itself at the top level.
+          # No `tar -tzf ... | head -n 1` here: with `set -o pipefail` the closed pipe
+          # kills tar with SIGPIPE (exit 141) as soon as the bundle has more entries
+          # than one pipe buffer holds, which is every real .app bundle.
+          ENTRIES="$(tar -tzf "target/packager/Kytrix_${VERSION}_${ARCH}.app.tar.gz")"
+          FIRST="${ENTRIES%%$'\n'*}"
+          test "$FIRST" = "Kytrix.app/" \
+            || { echo "first archive entry is '$FIRST', expected 'Kytrix.app/'"; exit 1; }
+
+      # §5's hard constraint, checked per job: exactly one installer of this
+      # platform's kind and exactly one update payload, whose name has to carry the
+      # architecture token (the two jobs of one OS otherwise collide in the Release).
+      - name: Assert package outputs
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          INSTALLER_GLOB="${{ matrix.installer_glob }}"
+          if [ -n "$INSTALLER_GLOB" ]; then
+            INSTALLERS="$(ls target/packager/$INSTALLER_GLOB 2>/dev/null || true)"
+            test "$(printf '%s\n' "$INSTALLERS" | grep -c .)" = 1 \
+              || { echo "expected exactly one '$INSTALLER_GLOB' installer in target/packager, found: $INSTALLERS"; exit 1; }
+          fi
+          PAYLOADS="$(ls target/packager/${{ matrix.payload_glob }} 2>/dev/null || true)"
+          test "$(printf '%s\n' "$PAYLOADS" | grep -c .)" = 1 \
+            || { echo "expected exactly one '${{ matrix.payload_glob }}' update payload in target/packager, found: $PAYLOADS"; exit 1; }
+          case "$(basename "$PAYLOADS")" in
+            *"$ARCH"*) echo "update payload $(basename "$PAYLOADS")" ;;
+            *) echo "update payload $(basename "$PAYLOADS") does not carry the architecture token '$ARCH'"; exit 1 ;;
+          esac
+
+      - name: Sign the update payload
+        shell: bash
+        # The two secrets exist in this step's environment only.
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # One explicit signer invocation per update payload; the CLI reads both
+          # values from the environment and writes <file>.sig next to the file.
+          cargo packager signer sign "$(ls target/packager/${{ matrix.payload_glob }})"
+
+      - name: Assert signatures and the uploaded file set
+        shell: bash
+        run: |
+          set -euo pipefail
+          PAYLOAD="$(ls target/packager/${{ matrix.payload_glob }})"
+          test -s "$PAYLOAD.sig" \
+            || { echo "expected a non-empty $(basename "$PAYLOAD").sig"; exit 1; }
+          # §15.1 allows exactly: the update payload, its .sig and this platform's
+          # installer. Anything else means an output that the release job would
+          # publish, e.g. an architecture-less Kytrix.app.tar.gz or a .dmg.sig from
+          # a signed packaging run, so fail here and name it.
+          EXPECTED="$(
+            {
+              basename "$PAYLOAD"
+              basename "$PAYLOAD.sig"
+              if [ -n "${{ matrix.installer_glob }}" ]; then
+                ls target/packager/${{ matrix.installer_glob }} | while IFS= read -r f; do basename "$f"; done
+              fi
+            } | sort
+          )"
+          ACTUAL="$(find target/packager -maxdepth 1 -type f | while IFS= read -r f; do basename "$f"; done | sort)"
+          test "$EXPECTED" = "$ACTUAL" || {
+            echo "unexpected file set under target/packager/"
+            echo "expected:"; printf '%s\n' "$EXPECTED"
+            echo "actual:";   printf '%s\n' "$ACTUAL"
+            exit 1
+          }
+          echo "$ACTUAL" | sed 's/^/asset: /'
+
+      # §15.2: one fragment per platform, keyed by the §5 platform key. The key
+      # comes from the matrix (not from the job name) and the file name carries it,
+      # because six fragments are merged into one directory by the release job.
+      - name: Assemble the platform fragment
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          KEY: ${{ matrix.key }}
+          FORMAT: ${{ matrix.update_format }}
+        run: |
+          set -euo pipefail
+          PAYLOAD="$(ls target/packager/${{ matrix.payload_glob }})"
+          URL="https://github.com/kytrix-industries/kytrix/releases/download/v$VERSION/$(basename "$PAYLOAD")"
+          # `signature` is the .sig file's content, not its path.
+          jq -n --arg key "$KEY" --arg url "$URL" --arg sig "$(cat "$PAYLOAD.sig")" --arg format "$FORMAT" \
+            '{platforms: {($key): {url: $url, signature: $sig, format: $format}}}' \
+            > "target/packager/latest-fragment-$KEY.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kytrix-${{ matrix.job }}
+          if-no-files-found: error
+          # Only §15.1 assets plus the fragment: the Kytrix.app directory is not an
+          # asset and no pattern below matches it.
+          path: |
+            target/packager/*.exe
+            target/packager/*.exe.sig
+            target/packager/*.dmg
+            target/packager/*.app.tar.gz
+            target/packager/*.app.tar.gz.sig
+            target/packager/*.deb
+            target/packager/*.AppImage
+            target/packager/*.AppImage.sig
+            target/packager/latest-fragment-*.json
+
+  release:
+    name: draft release
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble latest.json
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # merge-multiple is off, so every artifact sits in dist/<artifact-name>/:
+          # the basename scan below has to see all six jobs before the fragments
+          # are merged. §5's hard constraint is that the six jobs publish into one
+          # Release, where a repeated asset name makes `gh release create` fail or
+          # silently replace a file; this is the pipeline-wide backstop.
+          NAMES="$(find dist -type f ! -name 'latest-fragment-*.json' -printf '%f\n' | sort)"
+          DUPS="$(printf '%s\n' "$NAMES" | uniq -d)"
+          test -z "$DUPS" || { echo "duplicate asset names: $DUPS"; exit 1; }
+
+          # §15.1: six platforms, one fragment each.
+          FRAGMENTS="$(find dist -name 'latest-fragment-*.json' | wc -l)"
+          test "$FRAGMENTS" = 6 \
+            || { echo "expected 6 latest.json fragments, found $FRAGMENTS"; find dist -name 'latest-fragment-*.json'; exit 1; }
+
+          # --rawfile, not --arg "$(cat ...)": command substitution strips the
+          # trailing newline, and §15.2 wants notes to equal the files' content.
+          # The updater looks a translation up by the language code the interface is
+          # in, and the file names carry those same codes, so the manifest keys and
+          # the file stems agree.
+          jq -s --arg version "$VERSION" \
+            --rawfile notes_en "release_notes/v$VERSION/en.md" \
+            --rawfile notes_zh_cn "release_notes/v$VERSION/zh-CN.md" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, notes: {en: $notes_en, "zh-CN": $notes_zh_cn}, pub_date: $pub_date, platforms: (map(.platforms) | add)}' \
+            dist/*/latest-fragment-*.json > dist/latest.json
+
+          test "$(jq -r '.version' dist/latest.json)" = "$VERSION" \
+            || { echo "latest.json version is not $VERSION"; exit 1; }
+          # Both translations are what the dialog can draw, so neither may be
+          # missing or empty whichever language the user runs the application in.
+          jq -e '(.notes | keys | sort) == ["en","zh-CN"]
+                 and (.notes.en | length > 0)
+                 and (.notes["zh-CN"] | length > 0)' \
+            dist/latest.json > /dev/null \
+            || { echo "latest.json notes are not the non-empty en and zh-CN pair:"; jq '.notes' dist/latest.json; exit 1; }
+          # A fragment whose key does not match what the app looks up would still
+          # pass a length check, so assert the six §5 keys explicitly. The format
+          # strings are pinned the same way, because cargo-packager-updater maps
+          # each one to an UpdateFormat (custom_serialization.rs: nsis/wix/app/
+          # appimage) that decides how the payload is installed: a typo in the
+          # matrix's update_format column would otherwise only show up in the
+          # field, as a rejected manifest or an install that does nothing.
+          jq -e '(.platforms | length == 6)
+                 and ((.platforms | keys | sort) == ["linux-aarch64","linux-x86_64","macos-aarch64","macos-x86_64","windows-aarch64","windows-x86_64"])
+                 and ((.platforms | map_values(.format)) == {"linux-aarch64":"appimage","linux-x86_64":"appimage","macos-aarch64":"app","macos-x86_64":"app","windows-aarch64":"nsis","windows-x86_64":"nsis"})' \
+            dist/latest.json > /dev/null \
+            || { echo "latest.json platforms are not the six §5 keys, each with its §5 format:"; jq '.platforms | map_values(.format)' dist/latest.json; exit 1; }
+
+          # The updater reads this file through HttpClientClass::UpdaterMetadata,
+          # whose response_body_limit is the whole budget available to it
+          # (crates/network/src/transport/http.rs; a body over it fails the check on
+          # every machine and the application says nothing, because a failed check
+          # only retries). The notes are both release_notes files in full, so the
+          # file grows with them: assert it here rather than shipping one nothing
+          # can read.
+          BYTES="$(stat -c%s dist/latest.json)"
+          test "$BYTES" -lt 65536 \
+            || { echo "latest.json is $BYTES bytes, over the 65536 bytes the updater reads it with; shorten release_notes/v$VERSION/{en,zh-CN}.md"; exit 1; }
+          echo "latest.json is $BYTES bytes"
+
+          jq -r '.platforms | to_entries[] | "\(.key) \(.value.format) \(.value.url)"' dist/latest.json
+
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The fragments are inputs to latest.json, not release assets (§15.1).
+          find dist -name 'latest-fragment-*.json' -delete
+          # §15.1's asset set, asserted before anything is published: 6 update
+          # payloads (2 NSIS .exe, 2 .app.tar.gz, 2 .AppImage), their 6 .sig,
+          # 2 .dmg, 2 .deb and latest.json - 17 files.
+          for spec in "*.exe:2" "*.app.tar.gz:2" "*.AppImage:2" "*.sig:6" "*.dmg:2" "*.deb:2" "latest.json:1"; do
+            pattern="${spec%:*}"
+            want="${spec##*:}"
+            got="$(find dist -type f -name "$pattern" | wc -l)"
+            test "$got" = "$want" \
+              || { echo "expected $want '$pattern' asset(s), found $got"; find dist -type f; exit 1; }
+          done
+          TOTAL="$(find dist -type f | wc -l)"
+          test "$TOTAL" = 17 || { echo "expected 17 assets, found $TOTAL"; find dist -type f; exit 1; }
+
+          # Idempotent re-runs: drop an existing release first and keep the tag.
+          gh release delete "v$VERSION" --yes --cleanup-tag=false || true
+
+          mapfile -t ASSETS < <(find dist -type f | sort)
+          printf '%s\n' "${ASSETS[@]}"
+          # --draft on purpose: a human inspects the installers, the .sig files and
+          # latest.json and publishes (§6.3). The release body is the English notes;
+          # the Chinese translation is published to the updater through latest.json.
+          # --target pins a tag this run has to create to the commit that was built:
+          # nothing has pushed v$VERSION, so without it gh would tag the default
+          # branch instead.
+          gh release create "v$VERSION" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Kytrix v$VERSION" \
+            --notes-file "release_notes/v$VERSION/en.md" \
+            "${ASSETS[@]}"

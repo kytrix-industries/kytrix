@@ -1,0 +1,7 @@
+# Chinese (Traditional) messages.
+#
+# This locale only translates a few messages on purpose: the ones it lacks come
+# from the fallback language.
+
+menu:
+  market: 行情

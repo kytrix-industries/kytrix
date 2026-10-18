@@ -1,0 +1,962 @@
+common:
+  amount: Amount
+  cancel: Cancel
+  close: Close
+  confirm: OK
+  connecting: Connecting
+  market_participants: Market participant
+  instrument: Instrument
+  loading: Loading
+  market_not_loaded: "<p align=\"center\">This widget needs the metadata of a supported market participant to be loaded first.\nLoad the metadata of at least one supported market participant from the <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> section in the top left corner.\nThe market participants this widget supports are:\n%{markets}</p>"
+  no_data: No data
+  no_matches: No matches
+  pair: Pair
+  price: Price
+  route: Route
+  retry: Retry
+  time: Time
+  yes: 'Yes'
+  no: 'No'
+error:
+  account:
+    credential_store: The operating system credential store is unavailable
+    invalid_credential: The stored sign-in credential is invalid
+    invalid_grant: The sign-in is no longer valid. Sign in again
+    login_callback: The sign-in callback was invalid
+    login_expired: The browser did not finish signing in in time. Try again
+    login_listener: Failed to open a local port for the sign-in callback
+    missing_credential: There is no stored sign-in credential
+    refresh_unknown: The sign-in renewal outcome is unknown. Sign in again
+    request: The account service could not be reached
+    response: The account service returned an unrecognized response
+    route: The account service route is invalid
+    secure_random: Failed to generate secure randomness
+    sequence_exhausted: The account authentication sequence is exhausted
+    session_closed: The account session is closed
+    status: The account service returned HTTP %{status}
+    system_time: The system clock is incorrect
+  auth:
+    account_identity_missing: The account identity is missing
+    api_key_not_found: The API key was not found
+    handshake_timeout: The market participant authentication handshake timed out
+    invalid_credentials: The market participant credentials are invalid
+    ip_not_whitelisted: This IP address is not whitelisted for the API key
+    no_market_data_permission: These credentials have no market-data permission for this market
+    invalid_account_identity: The account identity %{value} is not a valid account id
+    response_malformed: The market participant authentication response was malformed
+    unusable_credentials: The %{market} credentials cannot be used
+    incomplete_credentials: The %{market} credentials are incomplete
+    incomplete_market_credentials: The %{market} credentials of the %{scope} market are incomplete
+    service_closed: The market participant authentication service closed the connection
+    session_expired: The market participant session has expired
+    signature_invalid: The request signature is invalid
+    timestamp_out_of_range: The request timestamp is outside the allowed window
+  candlestick:
+    no_active_stream: The candlestick data stream is inactive
+    stream_busy: The candlestick data stream is busy
+    stream_closed: The candlestick data stream is closed
+  catalog_validation:
+    ambiguous_listing_continuity: Listing %{listing} shares its listing continuity with another listing
+    ambiguous_risk_pool_membership: Outcome group %{group} belongs to more than one risk pool
+    duplicate_listing_id: Route %{route} reuses the listing id %{listing_id}
+    duplicate_native_identifier: Route %{route} reuses the normalized native identifier %{identifier}
+    identifier_normalization_mismatch: The %{kind} identifiers of listing %{listing} are not normalized as its route declares
+    incomplete_outcome_set: Listing %{listing} references %{count} missing %{kind} objects that route %{route} does not carry
+    instrument_kind_mismatch: Listing %{listing} declares %{declared} but its instrument is %{kind}
+    instrument_lineage_invalid: The instrument lineage of the catalog is not a valid graph
+    instrument_terms_mismatch: Listing %{listing} declares the instrument %{declared} but its terms produce %{computed}
+    invalid_listing_continuity_terms: Listing %{listing} declares unusable listing continuity terms
+    invalid_listing_identifiers: Listing %{listing} carries unusable %{kind} identifiers
+    invalid_trading_rules: Listing %{listing} declares trading rules that do not hold for its instrument
+    listing_event_unknown: Listing %{listing} declares the native event %{event}, which no published generation carries
+    listing_identifier_route_mismatch: Route %{route} cannot hold the native identifier of its own listing
+    listing_route_mismatch: Listing %{listing} does not belong to the fetched route %{route}
+    listing_without_identity: Listing %{listing} carries neither a symbol nor typed identifiers
+    outcome_event_incomplete: Outcome event %{event} lists a group or risk pool its batch does not carry
+    outcome_group_incomplete: Outcome group %{group} references a member or side the batch does not carry
+    outcome_group_lineage_invalid: The outcome group lineage is not a valid graph at %{group}
+    outcome_listing_leg_unknown: Outcome listing %{listing} trades a member %{member} and side %{side} that group %{group} does not carry
+    outcome_price_basis_unsupported: Outcome listing %{listing} declares a price basis that does not express a fraction of collateral
+    outcome_price_quote_mismatch: Outcome listing %{listing} quotes %{found} but its group settles in %{expected}
+    outcome_risk_pool_incomplete: Risk pool %{pool} references a group or conversion the batch does not carry
+    outcome_risk_pool_lineage_invalid: Risk pool %{pool} is not a valid lineage successor of a member group
+    snapshot_key_mismatch: The snapshot of listing %{listing} does not describe it
+  display:
+    display_unavailable: Display unavailable
+    generation_mismatch: The operation was made for %{expected} but read %{actual}
+    instrument_name_mismatch: Instrument %{instrument} has no name that its own details render
+    listing_identifier_echo: Listing %{listing} declares identifiers that %{kind} does not echo
+    listing_identifier_mismatch: Listing %{listing} declares %{value} as %{kind}, which its native symbols do not carry
+    listing_not_found: Listing %{listing} has no published display name
+    missing_asset_code: The canonical asset %{asset} has no display code
+    missing_asset_terms: The canonical asset %{asset} has no registered terms
+    missing_external_reference_terms: The external reference %{reference} has no registered terms
+    missing_index_terms: The index %{index} has no registered terms
+    missing_outcome_terms: Outcome group %{group} has no registered terms
+    missing_reference_terms: The price reference %{reference} has no registered terms
+    reference_direction_mismatch: The price reference %{reference} is not the %{field} its contract requires
+    staged_code_mismatch: The canonical asset %{asset} is staged with two different display codes
+    unknown_asset: Unknown asset
+    unknown_listing: Unknown listing
+  disconnect:
+    authentication_expired: Authentication expired
+    heartbeat_timeout: The heartbeat timed out
+    network: 'Network error: %{cause}'
+    normal: The remote endpoint closed the connection normally
+    proxy_changed: The proxy configuration changed
+    server_closed: 'The server closed the connection (%{code}): %{reason}'
+  etf:
+    duplicate_date: 'Duplicate ETF trading date: %{value}'
+    invalid_date: 'Invalid ETF trading date: %{value}'
+    invalid_number: 'Invalid ETF number: %{value}'
+    no_data: The ETF answer contained no trading days
+    non_finite: The ETF answer contains a number that is not finite
+    stream_unavailable: The ETF data stream is unavailable
+    timeout: The ETF request timed out after %{seconds} seconds
+    too_many_rows: The ETF answer exceeds the %{maximum}-day history limit
+  market_participants:
+    authentication_failed: 'Authentication for the %{venue} market participant account failed: %{cause}'
+    capability_mismatch: The protocol request requires the %{expected} capability, but the request context declares %{actual}
+    venue_publishes_no_scope_table: The %{market} market participant publishes no scope table to read
+    unusable_credentials: The %{market} credentials cannot be used
+    incomplete_credentials: The %{market} credentials are incomplete
+    incomplete_market_credentials: The %{market} credentials of the %{scope} market are incomplete
+    configuration: 'Invalid market participant configuration: %{detail}'
+    connection_failed: 'The connection to %{venue} at %{endpoint} failed: %{cause}'
+    decode_failed: Failed to decode %{operation}
+    disconnected: 'The market participant disconnected: %{cause}'
+    insufficient_balance: 'Insufficient %{asset}: required %{required}, available %{available}'
+    internal: 'Internal market participant error: %{detail}'
+    invalid_limit: The %{operation} limit %{requested} exceeds the maximum %{maximum}
+    listing_action_not_allowed: '%{listing} does not accept this command while it is %{status}'
+    listing_route_mismatch: Listing %{listing} does not belong to route %{route}
+    order_error: 'The market participant order failed: %{cause}'
+    protocol: 'A protocol error occurred while attempting to %{operation}: %{reason}'
+    rate_limited: The market participant rate limit was reached
+    rejected: 'The market participant rejected the request (%{code}): %{message}'
+    route_mismatch: The protocol request route %{request} does not match the context route %{context}
+    runtime_unavailable: A Tokio runtime is required for this market participant operation
+    service_closed: The market participant service is closed
+    symbol_directory_failed: 'The %{market} symbol directory could not be fetched: %{detail}'
+    timeout: '%{operation} timed out after %{timeout_ms}ms'
+    unsupported_capability: The %{capability} capability is unsupported for %{route}
+    unsupported_adjustment: '%{adjustment} is unsupported for %{route}'
+    unsupported_time_frame: '%{timeframe} is unsupported for %{route}'
+    venue_not_loaded: The %{scope} market of %{venue} has not been loaded
+    venue_request_failed: 'The request to the %{venue} market participant at %{endpoint} failed: %{cause}'
+    venue_unsupported: This build speaks no market named %{market}
+  market_participants_account:
+    listing_not_found: Listing %{listing} is absent from the %{route} account catalog
+    listing_route_mismatch: Listing %{listing} does not belong to route %{route}
+    protocol: The account protocol returned an invalid response while performing %{operation}
+    unknown_asset: The asset with identity %{asset} is absent from the %{route} account catalog
+  indices:
+    duplicate_category: 'The index manifest repeats the category %{code}'
+    duplicate_index: 'The index manifest repeats the index %{code}'
+    index_limit: Your current limit is %{limit} indices
+    index_limit_unknown: The selection exceeds your current index limit
+    invalid_code: The index manifest carries an invalid code
+    manifest_too_large: The index manifest has more entries than the %{limit} it supports
+    missing_name: An index manifest entry has no name
+    name_format: 'An index name must be 1 to %{limit} characters without surrounding whitespace'
+    selection_capacity: You can select at most %{limit} indices
+    unknown_category: 'Index %{index} references the undefined category %{category}'
+  kytrix:
+    account_changed: The Kytrix account session changed
+    authentication: 'Kytrix service authentication failed: %{detail}'
+    closed: The Kytrix service connector is closed
+    connect: 'The Kytrix service connection failed: %{detail}'
+    disconnected: The Kytrix service connection disconnected
+    invalid_url: 'The Kytrix service URL is invalid: %{detail}'
+    protocol: 'Kytrix service protocol error: %{detail}'
+    read: 'Reading from the Kytrix service failed: %{detail}'
+    route_changed: The Kytrix service route changed
+    server_authentication_unavailable: Authentication is temporarily unavailable
+    server_entitlement_required: The current account is not entitled to this feature
+    server_index_limit: The selected indices exceed the current limit
+    server_invalid_argument: A request argument is invalid
+    server_invalid_request: The service request is invalid
+    server_invalid_topic: The requested data topic is invalid
+    server_mutation_unknown: The mutation outcome is unknown
+    server_not_found: The requested resource was not found
+    server_not_ready: The service is not ready
+    server_protected_account: Protected accounts are not supported
+    server_protocol: The server reported a protocol error
+    server_quota_exceeded: The current account quota is full
+    server_rate_limit: The request rate limit was reached
+    server_timeout: The server operation timed out
+    server_unspecified: The Kytrix service returned an unspecified error
+    server_upstream_unavailable: The upstream service is unavailable
+    slow_subscriber: The Kytrix service subscriber fell behind
+    timeout: The Kytrix service operation timed out
+    write: 'Writing to the Kytrix service failed: %{detail}'
+  listing_identifier:
+    ambiguous: A native identifier names several listings on route %{route}
+    identifier_not_found: The native identifier is not registered on route %{route}
+    invalid_value: The %{kind} identifier %{value} is invalid
+    product_mismatch: The native identifier does not match the declared product of route %{route}
+    route_mismatch: The native identifier belongs to %{owner} rather than %{route}
+  listing_publication:
+    identifier_echo_mismatch: The published %{kind} identifier %{value} does not echo the listing's own
+    snapshot_key_mismatch: The snapshot of listing %{listing} does not describe it
+  market:
+    configuration: 'Invalid market configuration: %{detail}'
+    disconnected: 'The market stream disconnected: %{cause}'
+    listing_not_readable: The %{operation} request named a listing published as %{status}
+    listing_route_mismatch: Listing %{listing} does not belong to route %{route}
+    network: 'The market network request failed: %{cause}'
+    protocol: The market protocol returned an invalid response while performing %{operation}
+    service_closed: The market service is closed
+    timeout: The %{operation} market operation timed out after %{timeout_ms}ms
+    unsupported_capability: The %{capability} market capability is unsupported for %{route}
+  catalog:
+    catalog_not_loaded: The catalog of route %{route} has not been loaded yet
+    catalog_source_on_non_catalog_route: Route %{route} binds catalog source %{id} but does not provide the catalog capability
+    duplicate_catalog_source_id: The catalog source id %{id} is registered more than once
+    identifier_normalization_mismatch: The %{kind} identifiers of listing %{listing} are not normalized as its route declares
+    inconsistent_route_registration: The registered catalog route %{route} declares inconsistent inputs
+    invalid_catalog: 'The instrument catalog of %{route} was refused: %{cause}'
+    invalid_catalog_source_id: The catalog source id %{id} is not a valid namespace
+    invalid_registries: 'The published instrument registries were refused: %{cause}'
+    listing_not_found: Listing %{listing} is absent from the published generation
+    listing_route_mismatch: Listing %{found} belongs to another route than %{expected}
+    missing_catalog_source: Route %{route} provides %{capability} but does not bind a catalog source
+    native_event_identifier_not_found: Route %{route} has no outcome event for this native identifier
+    native_group_identifier_not_found: Route %{route} has no outcome group for this native identifier
+    native_identifier_ambiguous: A native identifier names several listings on route %{route}
+    native_identifier_not_found: A native identifier is not registered on route %{route}
+    native_identifier_route_mismatch: A native identifier belongs to another route than %{route}
+    native_symbol_absent: Listing %{listing} is published without a native symbol
+    native_symbol_invalid: The symbol %{symbol} is not a usable native symbol on route %{route}
+    native_symbol_not_found: The symbol %{symbol} is not registered on route %{route}
+    outcome_event_not_found: Outcome event %{event} is absent from the published generation
+    outcome_group_not_found: Outcome group %{group} is absent from the published generation
+    outcome_risk_pool_not_found: Outcome risk pool %{pool} is absent from the published generation
+    registered_route_mismatch: The registered catalog route %{route} does not match the fetched route
+    route_not_registered: Route %{route} is not a registered catalog route
+    route_revision_changed: The staged batch of %{route} was built under another route input revision
+    unregistered_catalog_source: Route %{route} binds the catalog source %{id}, which is not registered
+  instrument_catalog:
+    authentication: 'Instrument catalog authentication failed: %{reason}'
+    configuration: 'Instrument catalog configuration failed: %{reason}'
+    decode: Failed to decode the instrument catalog during %{operation}
+    lost: The instrument catalog request was lost before it answered
+    network: 'Instrument catalog network request failed: %{reason}'
+    other: 'Instrument catalog request failed: %{reason}'
+    protocol_listing_terms: The instrument catalog cannot read the terms of a listing it staged during %{operation}
+    protocol_model: 'The instrument catalog refused the %{operation} answer: %{cause}'
+    protocol_unexpected_response: The instrument catalog answered %{operation} with a response it cannot read
+    protocol_venue: 'The venue refused the instrument catalog %{operation} request: %{reason}'
+    rate_limited: The instrument catalog request was rate limited
+    rejected: 'The instrument catalog request was rejected (%{code}): %{message}; retryable: %{retryable}'
+    symbol_directory: 'The %{market} symbol directory could not be read: %{detail}'
+  model:
+    ambiguous_listing_continuity: Route %{route} publishes two listings that normalize to one continuity key
+    contradictory_delivery_legs: The delivery legs of the contract contradict one another
+    contract_size_without_asset: The contract size is not denominated in an asset
+    conversion_direction_basis: basis
+    conversion_direction_mismatch: The conversion reference disagrees with the contract on its %{direction}
+    conversion_direction_quote: quote
+    conversion_direction_underlying: underlying
+    conversion_reference_mismatch: The conversion reference does not match the one the contract declares
+    crossed_order_book: The order book is crossed
+    decimal_overflow: The decimal value is outside the supported range
+    decimal_precision: The decimal value has more than %{maximum} fractional digits
+    delivery_leg_mismatch: A physical delivery does not carry a leg for the underlying asset
+    duplicate_collection_entry: The %{field} collection repeats an entry
+    empty_collection: The %{field} collection must not be empty
+    empty_decimal: The decimal value is empty
+    empty_identifier: The %{field} identifier must not be empty
+    empty_order_book_level: Order book level quantity must be greater than zero
+    fraction_out_of_range: The fraction must be greater than zero and at most one
+    identical_spot_assets: A spot instrument cannot list one asset against itself
+    identifier_normalization_mismatch: The %{kind} identifier is not normalized as its route declares
+    incompatible_delivery_mode: The delivery mode does not match the settlement the contract declares
+    incompatible_pnl_model: The pnl model does not match the underlying the contract tracks
+    incompatible_price_basis: The price basis does not match the contract it prices
+    index_mismatch_contract_unit: An index contract has to state its contract unit as a notional of one index point
+    index_mismatch_contract_unit_index: The contract unit names a different index than the contract tracks
+    index_mismatch_contract_unit_quote_asset: The contract unit is quoted in another asset than the contract price quote
+    index_mismatch_reference_basis: The price reference is not expressed per index point of the index it tracks
+    index_point_payoff_unsupported: An index-point contract cannot be valued from a single per-asset price
+    instrument_lineage_invalid: The %{field} lineage is not a valid graph
+    instrument_terms_mismatch: The %{field} does not match the terms it is derived from
+    inverse_contract_size_mismatch: An inverse contract size must be denominated in the price quote asset
+    inverse_requires_cash_delivery: An inverse contract must settle in cash
+    inverse_settlement_mismatch: An inverse contract must settle in the asset it tracks
+    invalid_candlestick_prices: Candlestick prices do not form a valid range
+    invalid_chain_id: The chain id %{value} is invalid
+    invalid_commodity_code: The commodity code %{value} is invalid
+    invalid_contract_address: The contract address %{value} is invalid
+    invalid_ctf_condition_id: The condition id %{value} is invalid
+    invalid_ctf_token_id: The CTF token id %{value} is invalid
+    invalid_decimal: The decimal value is invalid
+    invalid_field: The %{field} %{value} is invalid
+    invalid_identifier_namespace: The identifier namespace %{value} is invalid
+    invalid_identifier_value: The identifier value %{value} is invalid
+    invalid_identity_value: The identity value %{value} is not a %{version} value
+    invalid_iso_4217_code: The %{kind} currency code is not a current ISO 4217 code
+    invalid_listing_continuity_terms: The %{field} continuity terms are unusable
+    invalid_mic: The MIC %{value} is invalid
+    invalid_native_identifier: The native symbol %{symbol} is invalid
+    invalid_reference_terms_version: The reference terms version %{value} is invalid
+    invalid_security_issuer_id: The security issuer id %{value} is invalid
+    invalid_share_class_designation: The share class designation %{value} is invalid
+    invalid_time_order: The %{field} must not be later than its %{limit}
+    invalid_time_range: The start time must not be later than the end time
+    invalid_time_zone_id: The time zone id %{value} is invalid
+    invalid_timestamp: The %{field} timestamp is invalid
+    invalid_trading_calendar_id: The trading calendar id %{value} is invalid
+    unknown_venue: The venue %{value} is not one of the venues this build speaks
+    invalid_venue_scope_id: The venue scope id %{value} is invalid
+    invalid_wallet_address: The wallet address %{value} is invalid
+    listing_identifier: 'The listing identifier is invalid: %{cause}'
+    listing_not_found: The listing is absent from route %{route}
+    listing_not_tradable: The listing does not accept new trading while it is %{status}
+    listing_publication: 'The listing publication is invalid: %{cause}'
+    listing_route_mismatch: The listing does not belong to route %{route}
+    missing_adr_ratio: The ADR ratio %{value} is missing
+    negative_decimal: The decimal value cannot be negative
+    non_positive_quantity: The %{field} quantity must be greater than zero
+    non_positive_ratio: The ratio must be greater than zero
+    outcome_conversion_cycle: The outcome conversion graph contains a cycle
+    outcome_conversion_unresolved: The %{field} conversion of risk pool %{pool} is unresolved
+    outcome_group_incomplete: 'Outcome group %{group} is incomplete: %{field}'
+    outcome_group_lineage_invalid: 'The outcome group lineage is not a valid graph: %{field}'
+    outcome_group_unresolved: The %{field} outcome group is unresolved
+    outcome_question_too_long: The outcome question is longer than the maximum of %{maximum} Unicode scalar values
+    outcome_risk_pool_incomplete: 'Risk pool %{pool} is incomplete: %{field}'
+    outcome_risk_pool_lineage_invalid: 'The risk pool lineage is not a valid graph: %{field}'
+    outcome_risk_pool_unresolved: The %{field} risk pool is unresolved
+    outcome_settlement_fraction_invalid: The %{fraction_kind} settlement fraction of outcome group %{group} is invalid
+    outcome_settlement_incomplete: The settlement of outcome group %{group} is incomplete
+    payoff_unit_mismatch: The contract unit is not denominated in the asset the contract tracks
+    quantity_unit_mismatch_listed_unit: The quantity must be expressed in the quantity unit the listing rules declare
+    quantity_unit_mismatch_notional: The quantity must be expressed as a monetary amount of one asset
+    quantity_unit_mismatch_notional_asset: The quantity must be expressed in the asset the listing notional rule names
+    quantity_unit_mismatch_outcome_instrument: The quantity must be a quantity of the listed outcome instrument
+    quantity_unit_mismatch_traded_quantity: The quantity must be expressed in asset units, contracts or outcome tokens
+    required_conversion_reference: A settlement in another asset requires a conversion reference
+    route_not_registered: Route %{route} is not registered
+    scheduled_listing_without_availability: A listing that is not continuously available must declare its window
+    settlement_asset_mismatch: The converted settlement amount is not denominated in the settlement asset
+    strike_quote_mismatch: The strike price is quoted in another asset than the option settles in
+    time_window_too_large: The time window must not exceed %{maximum} milliseconds
+    trading_rules_mismatch: The %{field} trading rules do not match the contract
+    underlying_without_asset: The underlying is not an asset, so the contract cannot settle in it
+    index_underlying_requires_cash_delivery: An index cannot be delivered, so the contract has to settle in cash
+    unexpected_conversion_reference: A contract that performs no conversion must not declare a conversion reference
+    unsorted_collection: The %{field} collection is not sorted
+    unsupported_instrument_kind: The %{kind} instrument kind is unsupported here
+    unsupported_security_form: The %{form} security form is unsupported
+    unsupported_settlement_asset_cash_delivery: The settlement asset %{asset} cannot denominate a cash settlement
+    unsupported_settlement_asset_outcome_group: The settlement asset %{asset} cannot settle an outcome group
+    unsupported_settlement_asset_outcome_risk_pool: The settlement asset %{asset} cannot settle an outcome risk pool
+    unsorted_order_book: The %{side} order book levels are not in best-to-worst order
+    unverified_token_origin: The token %{token} on chain %{chain} has no verified origin
+    zero_tick: The price tick must be positive
+    zero_value: '%{field} must be greater than zero'
+  mutation:
+    account_changed: The account session changed and the mutation outcome is unknown
+    invalid_response: The mutation response was invalid and its outcome is unknown
+    response_lost: The mutation response was lost and its outcome is unknown
+    server: The mutation returned HTTP %{status} and its outcome is unknown
+    service_closed: The service closed and the mutation outcome is unknown
+    timeout: The mutation timed out and its outcome is unknown
+    transport: The mutation transport outcome is unknown
+  network:
+    dns_resolution_failed: Could not resolve host %{host}
+    invalid_data: 'Invalid data while attempting to %{operation}: %{reason}'
+    io: 'Network I/O error: %{message}'
+    limit_exceeded: '%{operation} exceeded the %{limit}-item limit'
+    proxy_connection_failed: '%{proxy_type} proxy connection failed: %{message}'
+    tcp_connection_failed: 'Could not establish the TCP connection: %{endpoint}'
+    tls_handshake_failed: 'TLS handshake failed: %{endpoint}'
+    websocket_upgrade_failed: 'The WebSocket upgrade failed for %{endpoint}: %{cause}'
+  news:
+    entitlement_required: News access requires an active subscription
+  order:
+    already_canceled: The order was already canceled
+    already_filled: The order was already filled
+    invalid_price: 'Invalid price: %{reason}'
+    invalid_quantity: 'Invalid quantity: %{reason}'
+    market_suspended: The market is suspended
+    not_found: The order was not found
+    other: 'The market participant rejected the order (%{code}): %{message}'
+    position_limit_exceeded: The position limit was exceeded
+    self_trade_protection: Self-trade protection prevented the order
+  order_book:
+    snapshot_behind_updates: The order-book snapshot stayed behind the venue's updates
+    snapshot_sync_failed: The order book could not be synchronized with the live updates
+    snapshot_unavailable: The order-book snapshot is unavailable
+    subscription_closed: The order-book subscription closed
+  rpc:
+    deadline: RPC request %{request_id} exceeded its deadline
+    response_dropped: The response for RPC request %{request_id} was lost
+    service_closed: The service closed before RPC request %{request_id} could be submitted
+  statistics:
+    stream_unavailable: The statistics stream is not available
+    timeout: The statistics request timed out after %{seconds} seconds
+  transport:
+    cancelled: The network operation was cancelled
+    client_pool: The network client pool is unavailable
+    closed: The subscription is closed
+    credential_changed: The authentication session changed
+    disconnected: The network connection disconnected
+    http_client: The HTTP client could not be created
+    invalid_capacity: Subscription capacity must be greater than zero
+    invalid_websocket_endpoint: The WebSocket endpoint is invalid
+    protocol: A protocol error occurred while attempting to %{operation}
+    proxy: The selected proxy route could not be configured
+    rejected: 'The remote endpoint rejected the subscription (%{code}): %{message}'
+    response_read: The response could not be read
+    response_too_large: The response exceeds the %{limit}-byte limit
+    resync_failed: A consistent data snapshot could not be restored
+    route_changed: The configured network route changed
+    slow_subscriber: The subscriber could not keep up with the stream
+    timeout: The network request timed out
+    websocket_connect: 'The WebSocket connection could not be established: %{cause}'
+    websocket_io: The WebSocket connection failed
+  updater:
+    route: The update request could not be routed
+    client: The update HTTP client could not be created
+    transport: The update download failed on the network
+    metadata: The update metadata could not be read
+    signature: The update package did not pass signature verification
+    unsupported_platform: This platform does not support in-app updates
+    install: The update could not be installed
+  upgrade:
+    handshake: 'The peer handshake is not usable: %{detail}'
+    rejected: The peer answered %{status} instead of switching protocols
+    timeout: The connect attempt timed out
+    transport: 'The transport failed: %{detail}'
+  venue_load:
+    catalog: 'The %{scope} catalog of %{market} could not be read: %{cause}'
+    catalog_validation: 'The %{scope} catalog of %{market} was refused: %{cause}'
+    discovery: 'Reading what %{market} publishes failed: %{cause}'
+    discovery_limit_exceeded: '%{market} named %{named} deployments, more than the %{limit} a load verifies'
+    discovery_unverifiable: '%{market} publishes the deployment %{dex}, which names no scope this build serves'
+    interrupted: Loading %{market} was cancelled
+    metadata: 'Reading the metadata of %{market} failed: %{cause}'
+    registration: The market list of %{market} could not be registered
+    revision_changed: 'The %{scope} catalog of %{market} changed while it was loading. Try again'
+    unsupported_venue: This build serves no market for %{market}
+  volume_heatmap:
+    asset_not_named: "The volume heat map cannot name a market: the published display catalog gives no code for that market's base asset, although the same generation's asset registry carries it"
+    notional_overflow: The combined notional of a volume heat map market is outside the supported range
+    stream_unavailable: The volume heat map stream is not available
+    timeout: The volume heat map did not answer within %{seconds} seconds
+    too_many_tickers: 'The %{route} ticker answer contains %{count} entries, which is more than the %{limit} a heat map is built from'
+  wallet:
+    account_changed: The Wallet API account session changed
+    closed: The Wallet API account session is closed
+    invalid_response: The Wallet API returned invalid data
+    network: 'The Wallet API request failed: %{detail}'
+    not_ready: Wallet monitoring is not ready
+    protocol: 'Wallet API protocol error: %{detail}'
+    response_too_large: The Wallet API response is too large
+    server: The Wallet API returned HTTP %{status}
+    timeout: The Wallet API request timed out
+  watch_list:
+    capacity: The watch list already follows %{maximum} instruments
+    duplicate_entry: The instrument is already in the watch list
+    entry_not_active: The instrument is no longer in the watch list
+  x:
+    account_changed: The X account session changed
+    closed: The X account session is closed
+    not_ready: X monitoring is not ready
+    protocol: 'X API protocol error: %{detail}'
+    server: The X API returned HTTP %{status}
+    timeout: The X API request timed out
+instrument_selector:
+  empty: No trading instruments available
+  filter_placeholder: Filter symbols
+  loading: Loading instruments...
+  market_not_loaded: This market has not been loaded yet
+  no_matches: No matching instruments
+  spot: Spot
+widget:
+  candlestick:
+    adjust_forward: Forward adjusted
+    adjust_none: No adjustment
+    chart: Candlestick chart
+    contracts: Contracts
+    days: Days
+    hours: Hours
+    minutes: Minutes
+    months: Months
+    outcome_tokens: Outcome tokens
+    quarters: Quarters
+    seconds: Seconds
+    select_instrument: Select instrument
+    select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
+    timeframe: Candlestick interval
+    weeks: Weeks
+    years: Years
+  categories:
+    market: Market
+    monitoring: Monitoring
+    statistics: Statistics
+  empty:
+    hint: 'Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button in the upper-right corner to select a widget.'
+  etf:
+    all: All
+    asset: ETF asset
+    chart: ETF chart
+    date: Date
+    day_net_flow: Daily net flow (M)
+    day_net_inflow: Daily net inflow (M)
+    day_net_outflow: Daily net outflow (M)
+    days: '%{count} days'
+    flow_axis: Daily net inflow/outflow (M)
+    fund: ETF fund
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    net_assets_axis: Total net assets (M)
+    net_flow: '%{name} net flow'
+    net_inflow: '%{name} net inflow'
+    net_outflow: '%{name} net outflow'
+    refresh_now: Refresh ETF data now
+    time_window: ETF time window
+    total_net_assets: Total net assets
+    value: '%{label}: %{value}'
+  force_orders:
+    table: Live force orders from %{markets}
+  hyperliquid_wallet_monitor:
+    add: Add monitored address
+    age_days: '%{value}d ago'
+    age_hours: '%{value}h ago'
+    age_minutes: '%{value}min ago'
+    age_seconds: '%{value}s ago'
+    already_monitored: Address is already monitored
+    asset: Asset
+    asset_share: Asset share
+    auto_deleveraged: Auto-Deleveraged
+    back: Back to overview
+    buy: Buy
+    close_long: Close Long
+    close_short: Close Short
+    coin: Coin
+    collateral: Collateral
+    detail_tabs: Wallet details
+    empty_addresses: <p align="center">No monitored wallets yet — add one from the settings control in the top-left corner.</p>
+    empty_monitored: No monitored wallets yet.
+    entry: Entry price
+    error_codec: Invalid %{market} wallet data while attempting to %{operation}
+    error_dex_read: 'Reading the %{market} wallet data for %{dex} failed: %{cause}'
+    error_listing_missing: The %{market} wallet market catalog of %{route} is missing a listing this reading carries
+    error_route_mismatch: The %{market} wallet market catalog of %{route} does not describe the market it was fetched for
+    error_stream_closed: '%{market} wallet event stream closed'
+    error_subscription_buffer_full: The %{market} wallet subscription buffer for %{operation} reached its %{capacity}-event limit
+    error_subscription_closed: '%{market} wallet subscription closed'
+    fee: Fee
+    funding: Funding fee
+    invalid_address: Invalid address
+    kind: Type
+    limit_reached: Monitoring limit reached
+    liquidated: Liquidated
+    liquidation: Liquidation price
+    long: Long
+    long_to_short: Long > Short
+    manage_addresses: Manage monitored addresses
+    margin: Margin
+    mark: Mark price
+    monitored_count: 'Monitored/limit %{current}/%{limit}'
+    open_long: Open Long
+    open_short: Open Short
+    perpetual_value: Perpetual value
+    placeholder: Wallet Address
+    position: Position
+    position_value: Position value
+    quantity: Quantity
+    realized_pnl: Realized PnL
+    reduce_only: Reduce only
+    refresh: Refresh current tab
+    remove_address: Remove monitored address %{address}
+    retry_failed: Retry %{value} failed wallets
+    scroll_addresses: Scroll monitored addresses
+    scroll_rows: Scroll wallet data rows
+    sell: Sell
+    short: Short
+    short_to_long: Short > Long
+    side: Side
+    spot: Spot
+    spot_value: Spot value
+    status: Status
+    tab_historical_orders: Historical Orders
+    tab_ledger: Deposits, Withdrawals & Transfers
+    tab_open_orders: Open orders
+    tab_perpetual: Perpetual positions
+    tab_spot: Spot positions
+    tab_trades: Recent trades
+    timeline_end: NOW
+    timeline_loading: Loading recent fills
+    timeline_marker: '%{side} marker, %{value} fills'
+    timeline_start: 6H ago
+    timeline_title: 'Activity timeline:'
+    trigger_price: Trigger price
+    unknown: Unknown
+    unrealized_pnl: Unrealized PnL
+    value: Value
+  indices:
+    change: Change
+    change_percent: Change %
+    choose: Choose indices
+    grid: Grid
+    index: Index
+    latest: Latest
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    market_closed: Market closed
+    select_at_least_one: <p align="center">Select at least one index</p>
+    selector:
+      empty: No indices available
+      filter_placeholder: Filter indices
+      load_failed: Could not load index manifest
+      loading: Loading index manifest...
+      selection_count: 'Added/Limit: %{current}/%{limit}'
+    table: Table
+  market_trades:
+    amount_with_unit: Amount (%{unit})
+    contracts: Contracts
+    outcome_tokens: Outcome tokens
+    price_with_unit: Price (%{unit})
+    select_instrument: Select instrument
+    select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
+    table: Recent market trades
+  names:
+    candlestick: Candlestick
+    empty: Empty
+    etf_flow: ETF Flow
+    force_orders: Force Orders Stream
+    hyperliquid_wallet_monitor: Hyperliquid Wallet Monitor
+    indices: Indices
+    long_short_account_ratio: Long/Short Account Ratio
+    market_trades: Market Trades
+    news: News
+    open_interest: Open Interest
+    order_book: Order Book
+    taker_volume: Taker Buy/Sell Volume
+    top_trader_account_ratio: Top Trader Account Ratio
+    top_trader_position_ratio: Top Trader Position Ratio
+    tweet_monitor: Tweet Monitor
+    volume_heatmap: Volume Heat Map
+    wallet_monitor: Wallet Monitor
+    watch_list: Watch List
+  news:
+    crypto: Crypto
+    disable_sound: Mute notification sound
+    enable_sound: Unmute notification sound
+    general: General
+    item: '%{category} news at %{time}'
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    political: Political
+    scroll_vertical: Scroll the news feed vertically
+    view_plans: View plans
+  order_book:
+    amount_with_unit: Amount (%{unit})
+    book: Live market depth
+    contracts_unit: Contracts
+    outcome_tokens_unit: Outcome tokens
+    price_grouping: Order book price grouping
+    price_with_unit: Price (%{unit})
+    rows: '%{count} rows'
+    select_instrument: Select instrument
+    select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
+    spread: Spread %{value}
+    total_with_unit: Total (%{unit})
+    visible_rows: Order book visible rows
+  perpetual_statistics:
+    account_ratio: Account Ratio
+    amount: Amount
+    buy_volume: Buy Volume
+    contracts_unit: Contracts
+    interval: Statistics interval
+    long_accounts: Long Accounts
+    long_positions: Long Positions
+    outcome_tokens_unit: Outcome tokens
+    refresh_now: Refresh statistics now
+    select_instrument: Select instrument
+    select_instrument_prompt: <p align="center">Select a perpetual instrument from the picker in the top left</p>
+    sell_volume: Sell Volume
+    short_accounts: Short Accounts
+    short_positions: Short Positions
+    position_ratio: Position Ratio
+    value: Value
+    volume: Volume
+  tweet_monitor:
+    account_id: 'X user ID: %{id}'
+    active: Active
+    add_account: Add new account
+    add_search_result: 'Add X account @%{username}'
+    add_success: <p align="center">Account added successfully</p>
+    age_date: '%{month}/%{day}'
+    age_full_date: '%{year}/%{month}/%{day}'
+    age_hours: '%{count}h ago'
+    age_minutes: '%{count}m ago'
+    age_seconds: '%{count}s ago'
+    already_monitored: Already monitored
+    back: Back
+    delete_account: 'Delete monitored account %{account}'
+    dialog_title: Monitored X accounts
+    empty_accounts: No monitored accounts
+    error_title: Error
+    filter_placeholder: Filter accounts
+    followers_following: '%{followers} followers · %{following} following'
+    load_failed: Could not load monitored accounts
+    loading_accounts: Loading monitored accounts
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    manage: Manage monitored X accounts
+    media_load_failed: Media failed to load
+    monitored_accounts: 'Monitored accounts: %{current}/%{limit}'
+    no_search_results: No matching X accounts
+    paused: Paused
+    pending: Pending activation
+    protected: Protected
+    refresh: Refresh monitored accounts
+    reposted: '%{name} reposted'
+    scroll_tweets: Scroll tweets
+    search_placeholder: username
+    search_users: Search X accounts
+    searching_users: Searching X accounts
+    stream_unavailable: The X timeline stream is not connected
+    success_title: Success
+    timeline_end: There are currently no more tweets.
+    tweet: 'Tweet by %{author} at %{time}'
+    waiting: <p align="center">Waiting for tweets</p>
+  volume_heatmap:
+    choose_venue: Choose a market participant
+    refresh_now: Refresh the volume heat map now
+  wallet_monitor:
+    active: Active
+    add_address: Add wallet address
+    add_success: Wallet address added successfully
+    address_placeholder: Ethereum or Solana address
+    authentication_failed: Your login has expired. Please log in again.
+    conflict: The address already exists or the current quota is full
+    delete_address: Delete current wallet
+    dialog_title: Monitored wallet addresses
+    empty_addresses: <p align="center">No monitored wallet addresses</p>
+    ethereum: Ethereum
+    from: From
+    inconsistent_selections: The confirmed wallet address does not fit the list it was added to
+    invalid_address: The wallet address is invalid
+    load_failed: Could not load wallet addresses
+    loading_addresses: Loading wallet addresses
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    manage: Manage monitored wallet addresses
+    monitored_addresses: 'Selected addresses: %{current}/%{limit}'
+    not_found: The wallet address was not found
+    paused: Paused
+    refresh: Refresh wallet addresses
+    scroll_transfers: Scroll wallet transfers
+    solana: Solana
+    stream_unavailable: The wallet transfer stream is not connected
+    to: To
+    transfer: '%{amount} transfer at %{time}'
+    unavailable: Wallet monitoring is not configured or is unavailable
+  watch_list:
+    add: Add instrument
+    change_24h: 24h Change
+    change_percent_24h: '24h Change %'
+    contracts: Contracts
+    loading_snapshot: Loading ticker
+    market_metadata_not_loaded: <p align="center">Load the metadata of **%{market}** ![](file://%{logo}?size=16) first</p>
+    outcome_tokens: Outcome tokens
+    remove: Remove
+    table: Followed instruments with their 24-hour statistics
+    ticker_unavailable: Ticker unavailable
+    traded_notional_24h: 24h Traded Notional
+    traded_quantity_24h: 24h Traded Quantity
+    us:
+      change: Session Change
+      change_percent: 'Session Change %'
+      traded_notional: Session Traded Notional
+      traded_quantity: Session Traded Quantity
+  x_monitor:
+    account_not_found: The X account was not found
+    authentication_failed: Your login has expired. Please log in again.
+    invalid_search_query: The search query is invalid
+    invalid_username: The X username is invalid
+    protected_account: Protected X accounts cannot be added
+    quota_exceeded: Your current tier's X account quota is full
+window:
+  account:
+    authorization_complete: Authorization complete
+    authorization_complete_message: <p align="center">Authorized wallet %{kind} %{wallet}</p>
+    authorized_wallet: Authorized wallet
+    awaiting_authorization: <p align="center">Finish signing in and authorizing in your browser. Choosing “Cancel sign-in” gives up this attempt.</p>
+    cancel_sign_in: Cancel sign-in
+    copy_wallet_address: Copy wallet address
+    menu: Account menu
+    plan_unavailable: Subscription plan unavailable
+    sign_in: Sign in
+    sign_out: Sign out
+    sign_out_confirm: <p align="center">Signing out means authorizing again before account features can be used.</p>
+  market_participants:
+    load: Load
+    credentials_required_message: "Configure %{market}'s API Key and other credentials in Settings first"
+    credentials_required_title: '%{market} cannot be loaded'
+    failed: '%{market} failed to load'
+    loading: 'Loading %{market}...'
+    loaded: '%{market} is loaded'
+    unloaded: '%{market} is not loaded'
+    refresh: Refresh
+    title: Markets
+  pane:
+    close: Close pane
+    select_widget: Select widget
+    split: Split pane
+    split_keep_bottom: Split then keep on the bottom
+    split_keep_left: Split then keep on the left
+    split_keep_right: Split then keep on the right
+    split_keep_top: Split then keep on the top
+    widget_menu: Widget
+  updater:
+    available: Update available
+    available_tooltip: Version %{version} is available
+    dialog_title: Version %{version} is available
+    download: Update
+    cancel: Cancel
+    install: Install update
+    downloading: Downloading the update…
+    download_progress: '%{percent}% downloaded'
+    downloaded_message: The new version has been downloaded. Choosing “Install update” quits the application so the installation can finish.
+    restart_hint: Start Kytrix again once the update has finished.
+    manual_required: This installation cannot be updated from inside the application. Download the package from the release page.
+    open_release_page: Open the release page
+  workspace:
+    add: Add New Workspace
+    add_message: <p align="center">Name the new workspace.</p>
+    add_title: Add Workspace
+    default_name: Workspace %{index}
+    delete: Delete Current Workspace
+    delete_message: '<p align="center">Delete the workspace "%{name}"? Its pane layout is deleted with it.</p>'
+    delete_title: Delete Workspace
+    empty: No Other Workspace
+    name_exists: <p align="center">Another workspace already uses this name</p>
+    name_placeholder: Workspace name
+    name_required: <p align="center">Enter a workspace name</p>
+    rename: Rename Current Workspace
+    rename_message: '<p align="center">Enter the new name of "%{name}".</p>'
+    rename_title: Rename Workspace
+    select: Workspace
+settings_ui:
+  about:
+    title: About
+    version: Version
+    version_description: The currently installed application version
+  appearance:
+    dark: Dark
+    language: Language
+    language_description: Choose the application display language
+    language_en: English
+    language_zh_cn: 简体中文
+    light: Light
+    mode: Appearance mode
+    mode_description: Choose the application's light, dark, or system appearance
+    system: System
+    title: Appearance
+  market_participants:
+    access_token: Access Token
+    access_token_description: The access token issued for the application; the venue authenticates a session with it
+    api_agent_private_key: API Agent private key
+    api_key: API Key
+    api_key_description: The API key this venue's requests authenticate with
+    app_key: App Key
+    app_key_description: The application key of the OpenAPI application
+    app_secret: App Secret
+    app_secret_description: The application secret the access token is signed with
+    ed25519_passphrase: Ed25519 Passphrase
+    ed25519_private_key: Ed25519 Private Key
+    enter_access_token: Enter Access Token
+    enter_api_key: Enter API Key
+    enter_app_key: Enter App Key
+    enter_app_secret: Enter App Secret
+    enter_passphrase: Enter Passphrase
+    enter_private_key: Enter Private Key
+    enter_secret_key: Enter Secret Key
+    http_origin: HTTP origin
+    hyperliquid_http_origin_description: The address HyperCore requests are sent to; the venue publishes one
+    hyperliquid_websocket_origin_description: The address HyperCore streams are opened on; the venue publishes one
+    main_account_address: Main account address
+    main_account_description: The main account the API agent is allowed to operate
+    origins: Origins
+    passphrase: Passphrase
+    passphrase_description: The passphrase the key was created with
+    private_key_description: The private key this venue's requests are signed with
+    secret_key: Secret Key
+    secret_key_description: The secret key this venue's requests authenticate with
+    service_region: Service region
+    service_region_china: Mainland China
+    service_region_description: The region the account was registered in; the venue answers on that region's hosts
+    service_region_eu: Europe (EU)
+    service_region_global: International (Global)
+    service_region_us_au: United States and Australia (US&AU)
+    title: Market participants
+    websocket_origin: WebSocket origin
+  no_matches: No settings match the search
+  proxies:
+    add: Add proxy
+    address: Address
+    app_updates: App updates
+    applications: Proxy applications
+    authorization: Authentication
+    default_line: Default line
+    default_line_description: Network targets without an override use this line
+    delete: Delete proxy
+    delete_message: '<p align="center">Delete the proxy "%{name}"? Network targets set to this line go back to the default line.</p>'
+    delete_title: Delete Proxy
+    dns_mode: DNS mode
+    dns_mode_local: Local
+    dns_mode_proxy: Proxy
+    edit: Edit proxy
+    empty: No proxies
+    group_description: Apply the same line to every network target in this group
+    inherit: Follow the default line
+    invalid_address: Enter a host name or an IP address
+    invalid_port: Port must be an integer from 1 to 65535
+    kytrix_cloud: Account and cloud services
+    kytrix_section: Kytrix
+    management: Proxy management
+    mixed: Multiple lines
+    name: Name
+    name_exists: A proxy with this name already exists
+    name_required: Enter a proxy name
+    name_reserved: This name is reserved for route options
+    no_authorization: No authentication
+    no_proxy: Do not use a proxy
+    password: Password
+    password_required: Enter a password
+    port: Port
+    socks5_address: Socks5 address
+    socks5_authorization: Socks5 authentication
+    socks5_port: Socks5 port
+    system_proxy: Use the system proxy
+    title: Proxies
+    username: Username
+    username_password: Username and password
+    username_required: Enter a username
+    venue_description: This venue's requests use this line; until it names one, they follow the default line
+    venue_section: Venue
+    x_media_group: Media
+    x_section: X (Twitter)
+  save_failed:
+    message: '<p align="center">The settings were not written to disk: %{reason}</p>'
+    title: The settings could not be saved
+  search:
+    placeholder: Search settings
+
+startup:
+  config_reset_message: <p align="center">The configuration file was damaged and has been reset to defaults. The previous file was kept as %{file}.</p>
+  config_reset_message_no_backup: <p align="center">The configuration file was damaged and has been reset to defaults. The previous file could not be backed up.</p>
+  config_reset_title: Configuration Reset
+
+# The names the venues of this build are drawn under.
+#
+# A venue is named here and nowhere else: the canonical lower-case identity
+# (`binance`) is what identity digests, catalog source ids and persisted keys are
+# built from, and it is never what a reader sees.
+venue:
+  binance: Binance
+  hyperliquid: Hyperliquid
+  longbridge: Longbridge
+  okx: OKX

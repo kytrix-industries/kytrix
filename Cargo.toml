@@ -1,0 +1,180 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kytrix",
+    "crates/base_ui",
+    "crates/i18n",
+    "crates/network",
+    "crates/market_participants_model",
+    "crates/app_config",
+    "crates/app_config_provider",
+    "crates/market_participants_connector",
+    "crates/instrument_selector_ui",
+    "crates/kytrix_service_provider",
+    "crates/market_participants_ui",
+    "crates/profile_ui",
+    "crates/settings_ui",
+    "crates/updater_ui",
+    "crates/widget_tokio_runtime",
+    "crates/widget",
+    "crates/widget_gallery_ui",
+    "crates/widget_registry",
+    "crates/widgets/candlestick",
+    "crates/widgets/empty",
+    "crates/widgets/etf",
+    "crates/widgets/force_orders",
+    "crates/widgets/hyperliquid_wallet_monitor",
+    "crates/widgets/indices",
+    "crates/widgets/market_trades",
+    "crates/widgets/news",
+    "crates/widgets/order_book",
+    "crates/widgets/perpetual_statistics",
+    "crates/widgets/tweet_monitor",
+    "crates/widgets/volume_heatmap",
+    "crates/widgets/wallet_monitor",
+    "crates/widgets/watch_list",
+    "xtask",
+]
+default-members = ["crates/kytrix"]
+
+[workspace.package]
+version = "0.0.1"
+publish = false
+edition = "2024"
+
+[workspace.dependencies]
+ahash = { version = "0.8.12", features = ["serde"] }
+alloy-primitives = { version = "1.7.2", default-features = false }
+alloy-sol-types = { version = "1.7.2", default-features = false }
+base64 = "0.23.1"
+boa_engine = "0.22.0"
+bs58 = "0.5.1"
+bytes = "1.12.1"
+cargo-packager-updater = "0.2.3"
+color = "0.3.3"
+comrak = { version = "0.56.0", default-features = false }
+const-hex = "1.19.1"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+dicebear-core = "10.7.0"
+dicebear-styles = { version = "10.6.0", default-features = false }
+dirs = "7.0.0"
+ed25519-dalek = "3.0.0"
+either = "1.18.0"
+embed-resource = "3.0.11"
+flate2 = "1.1.10"
+futures = "0.3.34"
+gpui-kit = { version = "0.7.1", default-features = false }
+hmac = "0.13.0"
+http = "1"
+hyper = "1.11.1"
+hyper-util = "0.1.20"
+image = { version = "0.25.10", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "webp",
+] }
+jiff = "0.2.38"
+k256 = { version = "0.14.0", default-features = false }
+keyring = "4.2.0"
+kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "7702ba34664a15acf9e64d07128cb5e231b4d970" }
+log = "0.4.34"
+longbridge-proto = "5.2.0"
+minisign-verify = "0.2"
+nucleo = "0.5.0"
+p256 = "0.14.0"
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+pkcs8 = "0.11.0"
+prost = "0.14.4"
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false }
+rmp-serde = "1.3.1"
+rodio = { version = "0.22.2", default-features = false }
+rust-embed = "8.12.0"
+semver = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "1.2.0", default-features = false, features = [
+    "deserialize",
+    "serde_derived_types",
+] }
+serde_json = "1.0.151"
+sha1 = "0.10.7"
+sha2 = "0.11.0"
+smallvec = "1.16.0"
+smol_str = "0.3.6"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+time = "0.3.55"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.18"
+url = "2.5.8"
+uuid = "1.26.0"
+windows = "0.62.2"
+yawc = { version = "0.4.0", default-features = false }
+zeroize = "1.9.0"
+
+# Workspace members
+app_config = { path = "crates/app_config" }
+app_config_provider = { path = "crates/app_config_provider" }
+base_ui = { path = "crates/base_ui" }
+candlestick = { path = "crates/widgets/candlestick" }
+empty = { path = "crates/widgets/empty" }
+etf = { path = "crates/widgets/etf" }
+force_orders = { path = "crates/widgets/force_orders" }
+hyperliquid_wallet_monitor = { path = "crates/widgets/hyperliquid_wallet_monitor" }
+i18n = { path = "crates/i18n" }
+indices = { path = "crates/widgets/indices" }
+instrument_selector_ui = { path = "crates/instrument_selector_ui" }
+kytrix_service_provider = { path = "crates/kytrix_service_provider" }
+market_participants_connector = { path = "crates/market_participants_connector" }
+market_participants_model = { path = "crates/market_participants_model" }
+market_participants_ui = { path = "crates/market_participants_ui" }
+market_trades = { path = "crates/widgets/market_trades" }
+network = { path = "crates/network" }
+news = { path = "crates/widgets/news" }
+order_book = { path = "crates/widgets/order_book" }
+perpetual_statistics = { path = "crates/widgets/perpetual_statistics" }
+profile_ui = { path = "crates/profile_ui" }
+settings_ui = { path = "crates/settings_ui" }
+tweet_monitor = { path = "crates/widgets/tweet_monitor" }
+updater_ui = { path = "crates/updater_ui" }
+volume_heatmap = { path = "crates/widgets/volume_heatmap" }
+wallet_monitor = { path = "crates/widgets/wallet_monitor" }
+watch_list = { path = "crates/widgets/watch_list" }
+widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }
+widget = { path = "crates/widget" }
+widget_gallery_ui = { path = "crates/widget_gallery_ui" }
+widget_registry = { path = "crates/widget_registry" }
+
+[workspace.lints.clippy]
+self_named_module_files = "forbid"
+pub_use = "forbid"
+field_scoped_visibility_modifiers = "forbid"
+pub_without_shorthand = "forbid"
+definition_in_module_root = "forbid"
+inline_modules = "forbid"
+multiple_inherent_impl = "forbid"
+empty_structs_with_brackets = "forbid"
+empty_enum_variants_with_brackets = "forbid"
+unnecessary_self_imports = "forbid"
+unneeded_field_pattern = "forbid"
+pub_underscore_fields = "deny"
+no_effect_underscore_binding = "forbid"
+used_underscore_items = "forbid"
+used_underscore_binding = "deny"
+too_many_arguments = "allow"
+redundant_clone = "deny"
+disallowed_methods = "deny"
+type_complexity = "allow"
+large_enum_variant = "allow"
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

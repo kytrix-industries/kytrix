@@ -1,0 +1,38 @@
+[package]
+name = "perpetual_statistics"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+log = { workspace = true }
+i18n = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+# Workspace members
+app_config = { workspace = true }
+base_ui = { workspace = true }
+instrument_selector_ui = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
+widget = { workspace = true }
+widget_tokio_runtime = { workspace = true }
+
+[dev-dependencies]
+# The connection seam a widget test connects a venue through: the crate's own
+# `test-support` feature, which is never enabled for a release build.
+market_participants_connector = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
+# The market participants root a pane reads the route registry from is built from typed
+# runtime inputs, so a view test needs the transport hub those inputs name.
+network = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+# Chinese (Simplified) messages.
+
+menu:
+  market: 行情
+  portfolio: 投资组合
+  sub:
+    quant: 量化
+
+greeting: "你好，%{name}！"
+inbox: "%{name} 有 %{count} 条未读消息"

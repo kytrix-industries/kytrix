@@ -1,0 +1,29 @@
+[package]
+name = "news"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+app_config = { workspace = true }
+app_config_provider = { workspace = true }
+base_ui = { workspace = true }
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+kytrix_service_provider = { workspace = true }
+log = { workspace = true }
+network = { workspace = true }
+rodio = { workspace = true, features = ["playback", "hound"] }
+serde = { workspace = true, features = ["derive"] }
+smol_str = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+widget = { workspace = true }
+widget_tokio_runtime = { workspace = true }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

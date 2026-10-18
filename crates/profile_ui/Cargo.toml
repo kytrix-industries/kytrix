@@ -1,0 +1,37 @@
+[package]
+name = "profile_ui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+dicebear-core.workspace = true
+dicebear-styles = { workspace = true, features = ["gaze"] }
+futures.workspace = true
+gpui-kit.workspace = true
+log.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+url.workspace = true
+zeroize.workspace = true
+
+# Workspace members
+app_config.workspace = true
+app_config_provider.workspace = true
+base_ui.workspace = true
+i18n.workspace = true
+kytrix_service_provider.workspace = true
+widget_tokio_runtime.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

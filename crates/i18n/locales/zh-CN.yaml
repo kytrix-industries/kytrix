@@ -1,0 +1,960 @@
+common:
+  amount: 数量
+  cancel: 取消
+  close: 关闭
+  confirm: 确认
+  connecting: 正在连接
+  market_participants: 市场参与者
+  instrument: 标的
+  loading: 正在加载
+  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> 中加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
+  no_data: 暂无数据
+  no_matches: 没有匹配项
+  pair: 交易对
+  price: 价格
+  route: 路由
+  retry: 重试
+  time: 时间
+  yes: 是
+  no: 否
+error:
+  account:
+    credential_store: 系统凭据存储不可用
+    invalid_credential: 本机登录凭据已损坏
+    invalid_grant: 登录状态已失效，请重新登录
+    login_callback: 登录回调无效
+    login_expired: 等待浏览器授权超时，请重试
+    login_listener: 无法在本机启动登录回调端口
+    missing_credential: 本机没有可用的登录凭据
+    refresh_unknown: 登录续期的结果未知，请重新登录
+    request: 无法连接账户服务
+    response: 账户服务返回了无法识别的响应
+    route: 账户服务的网络路由无效
+    secure_random: 无法生成安全随机数
+    sequence_exhausted: 账户认证序列已用尽
+    session_closed: 账户会话已关闭
+    status: 账户服务返回 HTTP %{status}
+    system_time: 本机系统时间不正确
+  auth:
+    account_identity_missing: 账户身份缺失
+    api_key_not_found: 未找到 API Key
+    handshake_timeout: 市场参与者认证握手超时
+    invalid_credentials: 市场参与者凭据无效
+    ip_not_whitelisted: 当前 IP 地址不在该 API Key 的白名单中
+    no_market_data_permission: 当前凭据没有该市场的行情权限
+    invalid_account_identity: 账户标识 %{value} 不是有效的账户 id
+    response_malformed: 市场参与者认证响应格式错误
+    unusable_credentials: '%{market} 的凭据无法使用'
+    incomplete_credentials: '%{market} 的凭据不完整'
+    incomplete_market_credentials: '%{market} 的 %{scope} 市场凭据不完整'
+    service_closed: 市场参与者认证服务已关闭连接
+    session_expired: 市场参与者会话已过期
+    signature_invalid: 请求签名无效
+    timestamp_out_of_range: 请求时间戳超出允许范围
+  candlestick:
+    no_active_stream: K 线数据流未启动
+    stream_busy: K 线数据流请求过多
+    stream_closed: K 线数据流已关闭
+  catalog_validation:
+    ambiguous_listing_continuity: 挂牌 %{listing} 与另一条挂牌共用同一个连续性键
+    ambiguous_risk_pool_membership: 结果组 %{group} 同时属于多个风险池
+    duplicate_listing_id: 路由 %{route} 重复使用了挂牌 id %{listing_id}
+    duplicate_native_identifier: 路由 %{route} 重复使用了归一化后的原生标识 %{identifier}
+    identifier_normalization_mismatch: 挂牌 %{listing} 的 %{kind} 标识与所属路由声明的归一化方式不一致
+    incomplete_outcome_set: 挂牌 %{listing} 引用了 %{count} 个路由 %{route} 未携带的 %{kind} 对象
+    instrument_kind_mismatch: 挂牌 %{listing} 声明的种类是 %{declared}，但其合约种类是 %{kind}
+    instrument_lineage_invalid: 目录中的合约谱系不是合法图
+    instrument_terms_mismatch: 挂牌 %{listing} 声明的合约是 %{declared}，但其条款推导出 %{computed}
+    invalid_listing_continuity_terms: 挂牌 %{listing} 声明的挂牌连续性条款不可用
+    invalid_listing_identifiers: 挂牌 %{listing} 携带不可用的 %{kind} 标识
+    invalid_trading_rules: 挂牌 %{listing} 声明的交易规则不适用于其合约
+    listing_event_unknown: 挂牌 %{listing} 声明的原生事件 %{event} 不在任何已发布世代中
+    listing_identifier_route_mismatch: 路由 %{route} 无法承载其自身挂牌的原生标识
+    listing_route_mismatch: 挂牌 %{listing} 不属于本次抓取的路由 %{route}
+    listing_without_identity: 挂牌 %{listing} 既没有符号也没有类型化标识
+    outcome_event_incomplete: 结果事件 %{event} 引用了其批次未携带的结果组或风险池
+    outcome_group_incomplete: 结果组 %{group} 引用了批次未携带的成员或方向
+    outcome_group_lineage_invalid: 结果组谱系在 %{group} 处不是合法图
+    outcome_listing_leg_unknown: 结果挂牌 %{listing} 交易的成员 %{member} 与方向 %{side} 不在结果组 %{group} 中
+    outcome_price_basis_unsupported: 结果挂牌 %{listing} 声明的价格基准无法表示担保物的份额
+    outcome_price_quote_mismatch: 结果挂牌 %{listing} 报价为 %{found}，但其结果组以 %{expected} 结算
+    outcome_risk_pool_incomplete: 风险池 %{pool} 引用了批次未携带的结果组或转换
+    outcome_risk_pool_lineage_invalid: 风险池 %{pool} 不是成员组合法的谱系后继
+    snapshot_key_mismatch: 挂牌 %{listing} 的快照描述的不是该挂牌
+  display:
+    display_unavailable: 显示不可用
+    generation_mismatch: '该操作针对 %{expected}，但实际读取到 %{actual}'
+    instrument_name_mismatch: 合约 %{instrument} 没有能由其自身明细重新渲染出的名称
+    listing_identifier_echo: 挂牌 %{listing} 声明的标识符无法由 %{kind} 回显
+    listing_identifier_mismatch: 挂牌 %{listing} 声明 %{kind} 为 %{value}，但其原生符号并不包含该值
+    listing_not_found: 挂牌 %{listing} 没有已发布的显示名称
+    missing_asset_code: 规范资产 %{asset} 没有显示代码
+    missing_asset_terms: 规范资产 %{asset} 没有已注册的条款
+    missing_external_reference_terms: 外部引用 %{reference} 没有已注册的条款
+    missing_index_terms: 指数 %{index} 没有已注册的条款
+    missing_outcome_terms: 结果组 %{group} 没有已注册的条款
+    missing_reference_terms: 价格引用 %{reference} 没有已注册的条款
+    reference_direction_mismatch: 价格引用 %{reference} 不是其合约要求的 %{field}
+    staged_code_mismatch: 规范资产 %{asset} 被 staged 了两个不同的显示代码
+    unknown_asset: 未知资产
+    unknown_listing: 未知挂牌
+  disconnect:
+    authentication_expired: 鉴权已过期
+    heartbeat_timeout: 心跳超时
+    network: 网络错误：%{cause}
+    normal: 远端正常关闭连接
+    proxy_changed: 代理配置已改变
+    server_closed: 服务器关闭连接（%{code}）：%{reason}
+  etf:
+    duplicate_date: 'ETF 日期重复：%{value}'
+    invalid_date: 'ETF 日期无效：%{value}'
+    invalid_number: 'ETF 数值无效：%{value}'
+    no_data: ETF 数据中没有交易日
+    non_finite: ETF 数据中包含非有限值
+    stream_unavailable: ETF 数据流不可用
+    timeout: ETF 请求在 %{seconds} 秒后超时
+    too_many_rows: ETF 数据超过 %{maximum} 个交易日的历史上限
+  market_participants:
+    authentication_failed: '%{venue} 市场参与者账户认证失败：%{cause}'
+    capability_mismatch: 协议请求需要 %{expected} 能力，但请求上下文声明的是 %{actual}
+    venue_publishes_no_scope_table: '%{market} 市场参与者没有可供读取的 scope 表'
+    unusable_credentials: '%{market} 的凭据无法使用'
+    incomplete_credentials: '%{market} 的凭据不完整'
+    incomplete_market_credentials: '%{market} 的 %{scope} 市场凭据不完整'
+    configuration: 市场参与者配置无效：%{detail}
+    connection_failed: 连接 %{venue}（%{endpoint}）失败：%{cause}
+    decode_failed: 解析 %{operation} 失败
+    disconnected: 市场参与者连接已断开：%{cause}
+    insufficient_balance: '%{asset} 余额不足：需要 %{required}，可用 %{available}'
+    internal: 市场参与者内部错误：%{detail}
+    invalid_limit: '%{operation} 请求的 %{requested} 条超过上限 %{maximum}'
+    listing_action_not_allowed: '%{listing} 处于 %{status} 状态，不接受该命令'
+    listing_route_mismatch: 挂牌 %{listing} 不属于路由 %{route}
+    order_error: 市场参与者下单失败：%{cause}
+    protocol: 执行 %{operation} 时市场参与者协议返回了无效响应：%{reason}
+    rate_limited: 已达到市场参与者速率限制
+    rejected: 市场参与者拒绝了请求（%{code}）：%{message}
+    route_mismatch: 协议请求路由 %{request} 与上下文路由 %{context} 不一致
+    runtime_unavailable: 此市场参与者操作需要 Tokio 运行时
+    service_closed: 市场参与者服务已关闭
+    symbol_directory_failed: 无法获取 %{market} 的符号目录：%{detail}
+    timeout: '%{operation} 在 %{timeout_ms}ms 后超时'
+    unsupported_capability: '%{route} 不支持 %{capability} 能力'
+    unsupported_adjustment: '%{route} 不支持 %{adjustment}'
+    unsupported_time_frame: '%{route} 不支持 %{timeframe}'
+    venue_not_loaded: '%{venue} 的 %{scope} 市场尚未加载'
+    venue_request_failed: 向 %{venue} 市场参与者（%{endpoint}）发起请求失败：%{cause}
+    venue_unsupported: 本程序不支持名为 %{market} 的行情
+  market_participants_account:
+    listing_not_found: 挂牌 %{listing} 不在 %{route} 的账户目录中
+    listing_route_mismatch: 挂牌 %{listing} 不属于路由 %{route}
+    protocol: 执行 %{operation} 时账户协议返回了无效响应
+    unknown_asset: 身份为 %{asset} 的资产不在 %{route} 的账户目录中
+  indices:
+    duplicate_category: 指数清单包含重复分类 `%{code}`
+    duplicate_index: 指数清单包含重复指数 `%{code}`
+    index_limit: 当前最多可选择 %{limit} 个指数
+    index_limit_unknown: 所选指数超过当前额度
+    invalid_code: 指数清单包含无效的代码
+    manifest_too_large: 指数清单条目超过 %{limit} 条上限
+    missing_name: 指数清单中有条目缺少名称
+    name_format: 指数名称必须为 1 到 %{limit} 个字符，且首尾不能有空格
+    selection_capacity: 最多可选择 %{limit} 个指数
+    unknown_category: 指数 `%{index}` 引用了未定义的分类 `%{category}`
+  kytrix:
+    account_changed: Kytrix 账户会话已变更
+    authentication: Kytrix 服务认证失败：%{detail}
+    closed: Kytrix 服务连接器已关闭
+    connect: Kytrix 服务连接失败：%{detail}
+    disconnected: Kytrix 服务连接已断开
+    invalid_url: Kytrix 服务地址无效：%{detail}
+    protocol: Kytrix 服务协议错误：%{detail}
+    read: 读取 Kytrix 服务失败：%{detail}
+    route_changed: Kytrix 服务线路已变更
+    server_authentication_unavailable: 认证服务暂不可用
+    server_entitlement_required: 当前账户没有此功能的使用权限
+    server_index_limit: 所选指数超过当前额度
+    server_invalid_argument: 请求参数无效
+    server_invalid_request: 服务请求无效
+    server_invalid_topic: 请求的数据主题无效
+    server_mutation_unknown: 变更操作结果未知
+    server_not_found: 请求的资源不存在
+    server_not_ready: 服务尚未就绪
+    server_protected_account: 不支持受保护账户
+    server_protocol: 服务端协议错误
+    server_quota_exceeded: 当前账户额度已满
+    server_rate_limit: 请求过于频繁，请稍后重试
+    server_timeout: 服务端操作超时
+    server_unspecified: Kytrix 服务返回未知错误
+    server_upstream_unavailable: 上游服务暂不可用
+    slow_subscriber: Kytrix 服务数据消费速度不足
+    timeout: Kytrix 服务操作超时
+    write: 写入 Kytrix 服务失败：%{detail}
+  listing_identifier:
+    ambiguous: 某个原生标识在路由 %{route} 上指向多条挂牌
+    identifier_not_found: 该原生标识未在路由 %{route} 上注册
+    invalid_value: '%{kind} 标识 %{value} 无效'
+    product_mismatch: 该原生标识与路由 %{route} 声明的产品不一致
+    route_mismatch: 该原生标识属于 %{owner} 而不是 %{route}
+  listing_publication:
+    identifier_echo_mismatch: 发布的 %{kind} 标识 %{value} 与挂牌自身的不一致
+    snapshot_key_mismatch: 挂牌 %{listing} 的快照描述的不是该挂牌
+  market:
+    configuration: 行情配置无效：%{detail}
+    disconnected: 行情流已断开：%{cause}
+    listing_not_readable: '%{operation} 请求的挂牌已处于 %{status} 状态'
+    listing_route_mismatch: 挂牌 %{listing} 不属于路由 %{route}
+    network: 行情网络请求失败：%{cause}
+    protocol: 执行 %{operation} 时行情协议返回了无效响应
+    service_closed: 行情服务已关闭
+    timeout: '%{operation} 行情操作在 %{timeout_ms}ms 后超时'
+    unsupported_capability: '%{route} 不支持 %{capability} 行情能力'
+  catalog:
+    catalog_not_loaded: 路由 %{route} 的目录尚未加载
+    catalog_source_on_non_catalog_route: 路由 %{route} 绑定了目录源 %{id}，但未提供目录能力
+    duplicate_catalog_source_id: 目录源 id %{id} 被注册了多次
+    identifier_normalization_mismatch: 挂牌 %{listing} 的 %{kind} 标识与所属路由声明的归一化方式不一致
+    inconsistent_route_registration: 已注册的目录路由 %{route} 声明的输入自相矛盾
+    invalid_catalog: '%{route} 的合约目录被拒绝：%{cause}'
+    invalid_catalog_source_id: 目录源 id %{id} 不是合法的命名空间
+    invalid_registries: '已发布的合约登记表被拒绝：%{cause}'
+    listing_not_found: 挂牌 %{listing} 不在已发布世代中
+    listing_route_mismatch: 挂牌 %{found} 属于 %{expected} 之外的另一个路由
+    missing_catalog_source: 路由 %{route} 提供了 %{capability}，但未绑定目录源
+    native_event_identifier_not_found: 路由 %{route} 没有与该原生标识对应的结果事件
+    native_group_identifier_not_found: 路由 %{route} 没有与该原生标识对应的结果组
+    native_identifier_ambiguous: 某个原生标识在路由 %{route} 上指向多条挂牌
+    native_identifier_not_found: 某个原生标识未在路由 %{route} 上注册
+    native_identifier_route_mismatch: 某个原生标识属于 %{route} 之外的另一个路由
+    native_symbol_absent: 挂牌 %{listing} 发布时没有原生符号
+    native_symbol_invalid: 符号 %{symbol} 不是路由 %{route} 上可用的原生符号
+    native_symbol_not_found: 符号 %{symbol} 未在路由 %{route} 上注册
+    outcome_event_not_found: 结果事件 %{event} 不在已发布世代中
+    outcome_group_not_found: 结果组 %{group} 不在已发布世代中
+    outcome_risk_pool_not_found: 结果风险池 %{pool} 不在已发布世代中
+    registered_route_mismatch: 已注册的目录路由 %{route} 与本次抓取的路由不一致
+    route_not_registered: 路由 %{route} 不是已注册的目录路由
+    route_revision_changed: '%{route} 的暂存批次是在另一个路由输入修订下构建的'
+    unregistered_catalog_source: 路由 %{route} 绑定了未注册的目录源 %{id}
+  instrument_catalog:
+    authentication: 交易品种目录认证失败：%{reason}
+    configuration: 交易品种目录配置错误：%{reason}
+    decode: 解析交易品种目录响应失败（%{operation}）
+    lost: 交易品种目录请求在得到应答前已丢失
+    network: 交易品种目录网络请求失败：%{reason}
+    other: 交易品种目录请求失败：%{reason}
+    protocol_listing_terms: 交易品种目录无法读取其暂存的某条挂牌条款（%{operation}）
+    protocol_model: '交易品种目录拒绝了 %{operation} 的返回内容：%{cause}'
+    protocol_unexpected_response: 交易品种目录针对 %{operation} 返回了无法读取的响应
+    protocol_venue: '市场参与者拒绝了交易品种目录的 %{operation} 请求：%{reason}'
+    rate_limited: 交易品种目录请求触发了速率限制
+    rejected: '交易品种目录请求被拒绝（%{code}）：%{message}；可重试：%{retryable}'
+    symbol_directory: 无法读取 %{market} 的符号目录：%{detail}
+  model:
+    ambiguous_listing_continuity: 路由 %{route} 发布了两条归一化后连续性键相同的挂牌
+    contradictory_delivery_legs: 合约的交割腿互相矛盾
+    contract_size_without_asset: 合约规模没有以任何资产计价
+    conversion_direction_basis: 价格基准
+    conversion_direction_mismatch: 转换参考与其所属合约的%{direction}不一致
+    conversion_direction_quote: 计价资产
+    conversion_direction_underlying: 基础资产
+    conversion_reference_mismatch: 转换参考与合约声明的转换参考不一致
+    crossed_order_book: 订单簿买卖盘发生交叉
+    decimal_overflow: 数值超出支持范围
+    decimal_precision: 数值的小数位数超过 %{maximum} 位
+    delivery_leg_mismatch: 实物交割缺少基础资产的交割腿
+    duplicate_collection_entry: '%{field} 集合中存在重复项'
+    empty_collection: '%{field} 集合不能为空'
+    empty_decimal: 数值不能为空
+    empty_identifier: '%{field} 标识符不能为空'
+    empty_order_book_level: 订单簿档位数量必须大于零
+    fraction_out_of_range: 份额必须大于零且不超过一
+    identical_spot_assets: 现货合约不能以同一资产同时作为基础与计价资产
+    identifier_normalization_mismatch: 该 %{kind} 标识与所属路由声明的归一化方式不一致
+    incompatible_delivery_mode: 交割方式与合约声明的结算方式不一致
+    incompatible_pnl_model: 盈亏模型与合约跟踪的基础不一致
+    incompatible_price_basis: 价格基准与其定价的合约不一致
+    index_mismatch_contract_unit: 指数合约的合约单位必须表示为一个指数点的名义金额
+    index_mismatch_contract_unit_index: 合约单位所指的指数与合约跟踪的指数不一致
+    index_mismatch_contract_unit_quote_asset: 合约单位以合约计价货币之外的其他资产计价
+    index_mismatch_reference_basis: 价格参考并非以其跟踪指数的一个指数点表示
+    index_point_payoff_unsupported: 指数点合约无法由单一每资产价格估值
+    instrument_lineage_invalid: '%{field} 谱系不是合法图'
+    instrument_terms_mismatch: '%{field} 与其推导来源的条款不一致'
+    inverse_contract_size_mismatch: 反向合约规模必须以计价资产计价
+    inverse_requires_cash_delivery: 反向合约必须以现金交割
+    inverse_settlement_mismatch: 反向合约必须以其跟踪的资产结算
+    invalid_candlestick_prices: K 线价格范围无效
+    invalid_chain_id: 链 id %{value} 无效
+    invalid_commodity_code: 商品代码 %{value} 无效
+    invalid_contract_address: 合约地址 %{value} 无效
+    invalid_ctf_condition_id: 条件 id %{value} 无效
+    invalid_ctf_token_id: CTF 代币 id %{value} 无效
+    invalid_decimal: 数值格式无效
+    invalid_field: '%{field} %{value} 无效'
+    invalid_identifier_namespace: 标识命名空间 %{value} 无效
+    invalid_identifier_value: 标识值 %{value} 无效
+    invalid_identity_value: 身份值 %{value} 不是 %{version} 形式的值
+    invalid_iso_4217_code: '%{kind} 货币代码不是现行 ISO 4217 代码'
+    invalid_listing_continuity_terms: '%{field} 连续性条款不可用'
+    invalid_mic: MIC %{value} 无效
+    invalid_native_identifier: 原生符号 %{symbol} 无效
+    invalid_reference_terms_version: 参考条款版本 %{value} 无效
+    invalid_security_issuer_id: 证券发行方 id %{value} 无效
+    invalid_share_class_designation: 股份类别标识 %{value} 无效
+    invalid_time_order: '%{field} 不能晚于其 %{limit}'
+    invalid_time_range: 开始时间不能晚于结束时间
+    invalid_time_zone_id: 时区 id %{value} 无效
+    invalid_timestamp: '%{field} 时间戳无效'
+    invalid_trading_calendar_id: 交易日历 id %{value} 无效
+    unknown_venue: 本程序不支持 %{value} 这一场所
+    invalid_venue_scope_id: 场所作用域 id %{value} 无效
+    invalid_wallet_address: 钱包地址 %{value} 无效
+    listing_identifier: 挂牌标识无效：%{cause}
+    listing_not_found: 该挂牌不在路由 %{route} 中
+    listing_not_tradable: 该挂牌处于 %{status} 状态，不接受新的交易
+    listing_publication: 挂牌发布无效：%{cause}
+    listing_route_mismatch: 该挂牌不属于路由 %{route}
+    missing_adr_ratio: 缺少 ADR 比例 %{value}
+    negative_decimal: 数值不能为负数
+    non_positive_quantity: '%{field} 数量必须大于零'
+    non_positive_ratio: 比例必须大于零
+    outcome_conversion_cycle: 结果转换图中存在环
+    outcome_conversion_unresolved: 风险池 %{pool} 的 %{field} 转换未解析
+    outcome_group_incomplete: 结果组 %{group} 不完整：%{field}
+    outcome_group_lineage_invalid: 结果组谱系不是合法图：%{field}
+    outcome_group_unresolved: '%{field} 结果组未解析'
+    outcome_question_too_long: 结果问题超过 %{maximum} 个 Unicode 标量值的上限
+    outcome_risk_pool_incomplete: 风险池 %{pool} 不完整：%{field}
+    outcome_risk_pool_lineage_invalid: 风险池谱系不是合法图：%{field}
+    outcome_risk_pool_unresolved: '%{field} 风险池未解析'
+    outcome_settlement_fraction_invalid: 结果组 %{group} 的 %{fraction_kind} 结算份额无效
+    outcome_settlement_incomplete: 结果组 %{group} 的结算不完整
+    payoff_unit_mismatch: 合约规模并非以合约所跟踪的资产计价
+    quantity_unit_mismatch_listed_unit: 数量必须以挂牌规则声明的数量单位表示
+    quantity_unit_mismatch_notional: 数量必须以某一资产的货币金额表示
+    quantity_unit_mismatch_notional_asset: 数量必须以挂牌名义金额规则所指的资产表示
+    quantity_unit_mismatch_outcome_instrument: 数量必须为所挂牌结果工具的数量
+    quantity_unit_mismatch_traded_quantity: 数量必须以资产单位、合约数量或结果代币表示
+    required_conversion_reference: 以其他资产结算时必须提供转换参考
+    route_not_registered: 路由 %{route} 未注册
+    scheduled_listing_without_availability: 非全天可交易的挂牌必须声明其时间窗口
+    settlement_asset_mismatch: 转换后的结算金额未以结算资产计价
+    strike_quote_mismatch: 行权价的计价资产与期权的结算资产不一致
+    time_window_too_large: 时间窗口不能超过 %{maximum} 毫秒
+    trading_rules_mismatch: '%{field} 交易规则与合约不一致'
+    underlying_without_asset: 基础不是资产，合约无法以其结算
+    index_underlying_requires_cash_delivery: 指数无法交割，合约必须以现金结算
+    unexpected_conversion_reference: 不进行转换的合约不得声明转换参考
+    unsorted_collection: '%{field} 集合未排序'
+    unsupported_instrument_kind: 此处不支持 %{kind} 合约种类
+    unsupported_security_form: 不支持 %{form} 证券形式
+    unsupported_settlement_asset_cash_delivery: 结算资产 %{asset} 无法用于现金结算
+    unsupported_settlement_asset_outcome_group: 结算资产 %{asset} 无法结算结果组
+    unsupported_settlement_asset_outcome_risk_pool: 结算资产 %{asset} 无法结算结果风险池
+    unsorted_order_book: 订单簿 %{side} 档位顺序无效
+    unverified_token_origin: 链 %{chain} 上的代币 %{token} 没有经过验证的来源
+    zero_tick: 最小价格变动必须大于零
+    zero_value: '%{field} 必须大于零'
+  mutation:
+    account_changed: 变更期间账户会话已变更，结果未知
+    invalid_response: 变更操作响应无效，结果未知
+    response_lost: 变更操作响应已丢失，结果未知
+    server: 变更操作返回 HTTP %{status}，结果未知
+    service_closed: 变更期间服务已关闭，结果未知
+    timeout: 变更操作超时，结果未知
+    transport: 变更操作的网络结果未知
+  network:
+    dns_resolution_failed: 无法解析主机 %{host}
+    invalid_data: 执行 %{operation} 时收到无效数据：%{reason}
+    io: 网络 I/O 错误：%{message}
+    limit_exceeded: '%{operation} 超过 %{limit} 条上限'
+    proxy_connection_failed: '%{proxy_type} 代理连接失败：%{message}'
+    tcp_connection_failed: 无法建立 TCP 连接：%{endpoint}
+    tls_handshake_failed: TLS 握手失败：%{endpoint}
+    websocket_upgrade_failed: WebSocket 升级失败：%{endpoint}（%{cause}）
+  news:
+    entitlement_required: 新闻阅读需要有效订阅
+  order:
+    already_canceled: 订单已被撤销
+    already_filled: 订单已完全成交
+    invalid_price: '价格无效：%{reason}'
+    invalid_quantity: '数量无效：%{reason}'
+    market_suspended: 市场已暂停交易
+    not_found: 未找到该订单
+    other: 市场参与者拒绝了订单（%{code}）：%{message}
+    position_limit_exceeded: 超出持仓上限
+    self_trade_protection: 触发自成交保护，订单被拒绝
+  order_book:
+    snapshot_behind_updates: 订单簿快照始终落后于市场参与者的增量
+    snapshot_sync_failed: 订单簿与实时增量无法同步
+    snapshot_unavailable: 订单簿快照不可用
+    subscription_closed: 订单簿订阅已关闭
+  rpc:
+    deadline: RPC 请求 %{request_id} 已超时
+    response_dropped: RPC 请求 %{request_id} 的响应已丢失
+    service_closed: RPC 请求 %{request_id} 提交前服务已关闭
+  statistics:
+    stream_unavailable: 统计数据流不可用
+    timeout: 统计数据请求在 %{seconds} 秒后超时
+  transport:
+    cancelled: 网络操作已取消
+    client_pool: 网络客户端池不可用
+    closed: 订阅已关闭
+    credential_changed: 登录凭据已变更
+    disconnected: 网络连接已断开
+    http_client: 无法创建 HTTP 客户端
+    invalid_capacity: 订阅容量必须大于零
+    invalid_websocket_endpoint: WebSocket 端点无效
+    protocol: 执行 %{operation} 时发生网络协议错误
+    proxy: 无法配置所选代理线路
+    rejected: 远端拒绝订阅（%{code}）：%{message}
+    response_read: 读取响应失败
+    response_too_large: 响应超过 %{limit} 字节上限
+    resync_failed: 无法恢复一致的数据快照
+    route_changed: 网络线路已变更
+    slow_subscriber: 数据流消费速度不足
+    timeout: 网络请求超时
+    websocket_connect: 无法建立 WebSocket 连接：%{cause}
+    websocket_io: WebSocket 连接失败
+  updater:
+    route: 无法为更新请求建立网络线路
+    client: 无法创建更新用的网络客户端
+    transport: 下载更新时网络出错
+    metadata: 更新元数据无法解析
+    signature: 更新包签名校验失败
+    unsupported_platform: 当前平台不支持应用内更新
+    install: 安装更新失败
+  upgrade:
+    handshake: 对端握手无效：%{detail}
+    rejected: 对端返回 %{status}，未切换协议
+    timeout: 连接尝试超时
+    transport: 传输层失败：%{detail}
+  venue_load:
+    catalog: 无法读取 %{market} 的 %{scope} 目录：%{cause}
+    catalog_validation: '%{market} 的 %{scope} 目录被拒绝：%{cause}'
+    discovery: 无法读取 %{market} 发布的市场列表：%{cause}
+    discovery_limit_exceeded: '%{market} 公布了 %{named} 个部署，超过一次加载可校验的 %{limit} 个'
+    discovery_unverifiable: '%{market} 公布了部署 %{dex}，它没有本版本可服务的作用域'
+    interrupted: 已取消加载 %{market}
+    metadata: 无法读取 %{market} 的元数据：%{cause}
+    registration: 无法注册 %{market} 的作用域
+    revision_changed: 加载过程中 %{market} 的 %{scope} 发生了变化，请重试
+    unsupported_venue: 本版本不提供 %{market} 市场
+  volume_heatmap:
+    asset_not_named: 成交量热力图无法为某个市场命名：展示目录没有为该市场的基础资产发布代码，而同一代的资产注册表载有这个资产
+    notional_overflow: 成交量热力图中某个市场的合计成交额超出范围
+    stream_unavailable: 成交量热力图数据流不可用
+    timeout: 成交量热力图请求在 %{seconds} 秒后超时
+    too_many_tickers: '%{route} 返回了 %{count} 条 ticker，超过热力图可用的 %{limit} 条上限'
+  wallet:
+    account_changed: 钱包账户会话已变更
+    closed: 钱包账户会话已关闭
+    invalid_response: 钱包 API 返回了无效数据
+    network: 钱包 API 请求失败：%{detail}
+    not_ready: 钱包监控尚未就绪
+    protocol: 钱包 API 协议错误：%{detail}
+    response_too_large: 钱包 API 响应过大
+    server: 钱包 API 返回 HTTP %{status}
+    timeout: 钱包 API 请求超时
+  watch_list:
+    capacity: 自选列表最多只能关注 %{maximum} 个标的
+    duplicate_entry: 该标的已在自选列表中
+    entry_not_active: 该标的已不在自选列表中
+  x:
+    account_changed: X 账户会话已变更
+    closed: X 账户会话已关闭
+    not_ready: X 监控尚未就绪
+    protocol: X API 协议错误：%{detail}
+    server: X API 返回 HTTP %{status}
+    timeout: X API 请求超时
+instrument_selector:
+  empty: 暂无可用交易品种
+  filter_placeholder: 筛选交易对
+  loading: 正在加载交易品种...
+  market_not_loaded: 该市场还没有加载
+  no_matches: 没有匹配的交易品种
+  spot: 现货
+widget:
+  candlestick:
+    adjust_forward: 前复权
+    adjust_none: 不复权
+    chart: K 线图
+    contracts: 合约
+    days: 天
+    hours: 小时
+    minutes: 分钟
+    months: 月
+    outcome_tokens: 结果代币
+    quarters: 季度
+    seconds: 秒
+    select_instrument: 选择标的
+    select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
+    timeframe: K 线周期
+    weeks: 周
+    years: 年
+  categories:
+    market: 行情
+    monitoring: 监控
+    statistics: 统计
+  empty:
+    hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
+  etf:
+    all: 全部
+    asset: ETF 币种
+    chart: ETF 图表
+    date: 日期
+    day_net_flow: 当日净流量（百万）
+    day_net_inflow: 当日净流入（百万）
+    day_net_outflow: 当日净流出（百万）
+    days: '%{count} 天'
+    flow_axis: 当日净流入/流出（百万）
+    fund: ETF 基金
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    net_assets_axis: 总净资产（百万）
+    net_flow: '%{name} 净流量'
+    net_inflow: '%{name} 净流入'
+    net_outflow: '%{name} 净流出'
+    refresh_now: 立即刷新 ETF 数据
+    time_window: ETF 时间范围
+    total_net_assets: 总净资产
+    value: '%{label}：%{value}'
+  force_orders:
+    table: 来自 %{markets} 的实时强平订单
+  hyperliquid_wallet_monitor:
+    add: 添加监控地址
+    age_days: '%{value} 天前'
+    age_hours: '%{value} 小时前'
+    age_minutes: '%{value} 分钟前'
+    age_seconds: '%{value} 秒前'
+    already_monitored: 地址已在监控列表中
+    asset: 资产
+    asset_share: 资产份额
+    auto_deleveraged: 自动减仓
+    back: 返回总览
+    buy: 买入
+    close_long: 平多
+    close_short: 平空
+    coin: 币种
+    collateral: 抵押品
+    detail_tabs: 钱包详情
+    empty_addresses: <p align="center">暂无监控钱包，请从左上角设置中添加</p>
+    empty_monitored: 还没有监控钱包
+    entry: 入场均价
+    error_codec: 处理 %{market} 钱包数据失败（%{operation}）
+    error_dex_read: 读取 %{dex} 的 %{market} 钱包数据失败：%{cause}
+    error_listing_missing: 本次读取涉及的某条挂牌不在 %{route} 的 %{market} 钱包行情目录中
+    error_route_mismatch: '%{route} 的 %{market} 钱包行情目录与本次抓取的市场不一致'
+    error_stream_closed: '%{market} 钱包事件流已关闭'
+    error_subscription_buffer_full: '%{operation} 的 %{market} 钱包订阅缓冲区已达到 %{capacity} 条上限'
+    error_subscription_closed: '%{market} 钱包订阅已关闭'
+    fee: 费用
+    funding: 资金费用
+    invalid_address: 地址无效
+    kind: 类型
+    limit_reached: 已达到监控上限
+    liquidated: 已强平
+    liquidation: 强平价
+    long: 多
+    long_to_short: 多转空
+    manage_addresses: 管理监控地址
+    margin: 保证金
+    mark: 标记价格
+    monitored_count: '已监控/监控上限 %{current}/%{limit}'
+    open_long: 开多
+    open_short: 开空
+    perpetual_value: 永续合约持仓价值
+    placeholder: 钱包地址
+    position: 仓位
+    position_value: 持仓价值
+    quantity: 数量
+    realized_pnl: 已实现盈亏
+    reduce_only: 仅减仓
+    refresh: 刷新当前页
+    remove_address: 删除监控地址 %{address}
+    retry_failed: 重试 %{value} 个失败钱包
+    scroll_addresses: 滚动监控地址
+    scroll_rows: 滚动钱包数据行
+    sell: 卖出
+    short: 空
+    short_to_long: 空转多
+    side: 方向
+    spot: 现货
+    spot_value: 现货持仓价值
+    status: 状态
+    tab_historical_orders: 历史委托
+    tab_ledger: 存取款与转账
+    tab_open_orders: 挂单
+    tab_perpetual: 永续合约持仓
+    tab_spot: 现货持仓
+    tab_trades: 最近成交
+    timeline_end: 现在
+    timeline_loading: 正在加载近期成交
+    timeline_marker: '%{side}标记，%{value} 笔成交'
+    timeline_start: 6小时前
+    timeline_title: '操作时间轴：'
+    trigger_price: 触发价格
+    unknown: 未知
+    unrealized_pnl: 未实现盈亏
+    value: 价值
+  indices:
+    change: 涨跌
+    change_percent: 涨跌幅
+    choose: 选择指数
+    grid: 网格
+    index: 指数
+    latest: 最新
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    market_closed: 休市
+    select_at_least_one: <p align="center">请选择至少一个指数</p>
+    selector:
+      empty: 暂无可用指数
+      filter_placeholder: 筛选指数
+      load_failed: 无法加载指数清单
+      loading: 正在加载指数清单...
+      selection_count: '已添加/限额：%{current}/%{limit}'
+    table: 表格
+  market_trades:
+    amount_with_unit: 数量（%{unit}）
+    contracts: 合约
+    outcome_tokens: 结果代币
+    price_with_unit: 价格（%{unit}）
+    select_instrument: 选择标的
+    select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
+    table: 最近市场成交
+  names:
+    candlestick: K 线
+    empty: 空白
+    etf_flow: ETF 资金流
+    force_orders: 强平订单流
+    hyperliquid_wallet_monitor: Hyperliquid 钱包监控
+    indices: 指数
+    long_short_account_ratio: 多空账户比
+    market_trades: 市场成交
+    news: 新闻
+    open_interest: 持仓量
+    order_book: 订单簿
+    taker_volume: 主动买卖量
+    top_trader_account_ratio: 大户账户多空比
+    top_trader_position_ratio: 大户持仓多空比
+    tweet_monitor: 推文监控
+    volume_heatmap: 成交量热力图
+    wallet_monitor: 钱包监控
+    watch_list: 自选列表
+  news:
+    crypto: 加密货币
+    disable_sound: 禁止提示音
+    enable_sound: 播放提示音
+    general: 综合
+    item: '%{category}新闻，时间 %{time}'
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    political: 政治
+    scroll_vertical: 垂直滚动新闻列表
+    view_plans: 查看订阅方案
+  order_book:
+    amount_with_unit: 数量（%{unit}）
+    book: 实时市场深度
+    contracts_unit: 合约
+    outcome_tokens_unit: 结果代币
+    price_grouping: 订单簿价格分组
+    price_with_unit: 价格（%{unit}）
+    rows: '%{count} 行'
+    select_instrument: 选择标的
+    select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
+    spread: 价差 %{value}
+    total_with_unit: 累计（%{unit}）
+    visible_rows: 订单簿可见行数
+  perpetual_statistics:
+    account_ratio: 账户比
+    amount: 数量
+    buy_volume: 买入量
+    contracts_unit: 合约
+    interval: 统计周期
+    long_accounts: 多头账户
+    long_positions: 多头持仓
+    outcome_tokens_unit: 结果代币
+    position_ratio: 持仓比
+    refresh_now: 立即刷新统计数据
+    select_instrument: 选择标的
+    select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择永续合约标的</p>
+    sell_volume: 卖出量
+    short_accounts: 空头账户
+    short_positions: 空头持仓
+    value: 价值
+    volume: 成交量
+  tweet_monitor:
+    account_id: 'X 用户 ID：%{id}'
+    active: 已激活
+    add_account: 增加新账号
+    add_search_result: '添加 X 账号 @%{username}'
+    add_success: <p align="center">账号添加成功</p>
+    age_date: '%{month}月%{day}日'
+    age_full_date: '%{year}年%{month}月%{day}日'
+    age_hours: '%{count}小时前'
+    age_minutes: '%{count}分钟前'
+    age_seconds: '%{count}秒前'
+    already_monitored: 已监控
+    back: 回退
+    delete_account: '删除监控账号 %{account}'
+    dialog_title: 监控的 X 账号
+    empty_accounts: 暂无监控账号
+    error_title: 错误
+    filter_placeholder: 筛选账号
+    followers_following: '%{followers} 位关注者 · 正在关注 %{following} 人'
+    load_failed: 无法加载监控账号
+    loading_accounts: 正在加载监控账号
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    manage: 管理 X 监控账号
+    media_load_failed: 媒体加载失败
+    monitored_accounts: '已监控账号：%{current}/%{limit}'
+    no_search_results: 未找到匹配的 X 账号
+    paused: 已暂停
+    pending: 等待激活
+    protected: 受保护
+    refresh: 刷新监控账号
+    reposted: '%{name} 已转贴'
+    scroll_tweets: 滚动推文
+    search_placeholder: 用户名
+    search_users: 搜索 X 账号
+    searching_users: 正在搜索 X 账号
+    stream_unavailable: X 推文流尚未连接
+    success_title: 成功
+    timeline_end: 当前没有更多推文
+    tweet: '%{author} 的推文，时间 %{time}'
+    waiting: <p align="center">等待推文</p>
+  volume_heatmap:
+    choose_venue: 请选择市场参与者
+    refresh_now: 立即刷新成交量热力图
+  wallet_monitor:
+    active: 已激活
+    add_address: 添加钱包地址
+    add_success: 钱包地址添加成功
+    address_placeholder: Ethereum 或 Solana 地址
+    authentication_failed: 登录状态已失效，请重新登录
+    conflict: 地址已存在或当前额度已满
+    delete_address: 删除当前钱包
+    dialog_title: 监控钱包地址
+    empty_addresses: <p align="center">暂无监控钱包地址</p>
+    ethereum: Ethereum
+    from: 从
+    inconsistent_selections: 服务端确认的钱包地址无法并入当前地址列表
+    invalid_address: 钱包地址无效
+    load_failed: 无法加载钱包地址
+    loading_addresses: 正在加载钱包地址
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    manage: 管理监控钱包地址
+    monitored_addresses: '已选择地址：%{current}/%{limit}'
+    not_found: 未找到该钱包地址
+    paused: 已暂停
+    refresh: 刷新钱包地址
+    scroll_transfers: 垂直滚动钱包转账
+    solana: Solana
+    stream_unavailable: 钱包转账推送未连接
+    to: 至
+    transfer: '%{amount} 转账，时间 %{time}'
+    unavailable: 钱包监控尚未配置或暂不可用
+  watch_list:
+    add: 添加标的
+    change_24h: 24h 涨跌额
+    change_percent_24h: 24h 涨跌幅
+    contracts: 合约
+    loading_snapshot: 正在加载行情
+    market_metadata_not_loaded: <p align="center">请先加载 ![](file://%{logo}?size=16) **%{market}** 的元数据</p>
+    outcome_tokens: 结果代币
+    remove: 移除
+    table: 已关注标的及其 24 小时统计
+    ticker_unavailable: 行情不可用
+    traded_notional_24h: 24h 成交额
+    traded_quantity_24h: 24h 成交量
+    us:
+      change: 当日涨跌额
+      change_percent: 当日涨跌幅
+      traded_notional: 当日成交额
+      traded_quantity: 当日成交量
+  x_monitor:
+    account_not_found: 未找到该 X 账号
+    authentication_failed: 登录状态已失效，请重新登录
+    invalid_search_query: 搜索内容无效
+    invalid_username: X 用户名无效
+    protected_account: 无法添加受保护的 X 账号
+    quota_exceeded: 当前订阅等级的 X 账号额度已满
+window:
+  account:
+    authorization_complete: 授权完成
+    authorization_complete_message: <p align="center">已授权钱包 %{kind} %{wallet}</p>
+    authorized_wallet: 已授权钱包
+    awaiting_authorization: <p align="center">请在浏览器中完成登录/授权流程。点击“取消登录”可放弃本次登录。</p>
+    cancel_sign_in: 取消登录
+    copy_wallet_address: 复制钱包地址
+    menu: 账户菜单
+    plan_unavailable: 订阅档位未知
+    sign_in: 登录
+    sign_out: 退出登录
+    sign_out_confirm: <p align="center">退出登录后需要重新授权才能使用账户功能。</p>
+  market_participants:
+    load: 加载
+    credentials_required_message: 请先前往设置中配置%{market}的 API Key 等凭证信息
+    credentials_required_title: 无法加载 %{market}
+    failed: '%{market} 加载失败'
+    loading: 正在加载 %{market}...
+    loaded: '%{market} 已加载'
+    unloaded: '%{market} 未加载'
+    refresh: 刷新
+    title: 市场
+  pane:
+    close: 关闭面板
+    select_widget: 选择组件
+    split: 拆分面板
+    split_keep_bottom: 拆分并保留下方
+    split_keep_left: 拆分并保留左侧
+    split_keep_right: 拆分并保留右侧
+    split_keep_top: 拆分并保留上方
+    widget_menu: 组件
+  updater:
+    available: 有可用更新
+    available_tooltip: 发现新版本 %{version}
+    dialog_title: 发现新版本 %{version}
+    download: 更新
+    cancel: 取消
+    install: 安装更新
+    downloading: 正在下载更新…
+    download_progress: 已下载 %{percent}%
+    downloaded_message: 新版本已下载完成，点击“安装更新”后应用将退出以完成安装。
+    restart_hint: 更新完成后请重新启动 Kytrix。
+    manual_required: 当前安装方式不支持应用内更新，请在发布页下载安装包。
+    open_release_page: 打开发布页
+  workspace:
+    add: 新增工作区
+    add_message: <p align="center">为新工作区命名。</p>
+    add_title: 新增工作区
+    default_name: 工作区 %{index}
+    delete: 删除当前工作区
+    delete_message: <p align="center">确定删除工作区「%{name}」吗？其中的面板布局也会一并删除。</p>
+    delete_title: 删除工作区
+    empty: 没有其它工作区
+    name_exists: <p align="center">该名称已被其它工作区使用</p>
+    name_placeholder: 工作区名称
+    name_required: <p align="center">请输入工作区名称</p>
+    rename: 重命名当前工作区
+    rename_message: <p align="center">输入「%{name}」的新名称。</p>
+    rename_title: 重命名工作区
+    select: 工作区
+settings_ui:
+  about:
+    title: 关于
+    version: 版本
+    version_description: 当前安装的应用程序版本
+  appearance:
+    dark: 深色
+    language: 语言
+    language_description: 选择应用显示语言
+    language_en: English
+    language_zh_cn: 简体中文
+    light: 浅色
+    mode: 外观模式
+    mode_description: 选择应用的浅色、深色或跟随系统外观
+    system: 跟随系统
+    title: 外观
+  market_participants:
+    access_token: Access Token
+    access_token_description: 为该应用签发的 Access Token，场所用它认证一条会话
+    api_agent_private_key: API Agent 私钥
+    api_key: API Key
+    api_key_description: 该场所请求认证使用的 API Key
+    app_key: App Key
+    app_key_description: OpenAPI 应用的 App Key
+    app_secret: App Secret
+    app_secret_description: 用于签发 Access Token 的 App Secret
+    ed25519_passphrase: Ed25519 Passphrase
+    ed25519_private_key: Ed25519 Private Key
+    enter_access_token: 请输入 Access Token
+    enter_api_key: 请输入 API Key
+    enter_app_key: 请输入 App Key
+    enter_app_secret: 请输入 App Secret
+    enter_passphrase: 请输入 Passphrase
+    enter_private_key: 请输入 Private Key
+    enter_secret_key: 请输入 Secret Key
+    http_origin: HTTP 地址
+    hyperliquid_http_origin_description: HyperCore 请求发送的地址，该场所只发布一个
+    hyperliquid_websocket_origin_description: HyperCore 建立订阅的地址，该场所只发布一个
+    main_account_address: 主账户地址
+    main_account_description: API Agent 有权操作的主账户
+    origins: 来源地址
+    passphrase: Passphrase
+    passphrase_description: 创建该 API Key 时设置的 Passphrase
+    private_key_description: 该场所请求签名使用的私钥
+    secret_key: Secret Key
+    secret_key_description: 该场所请求认证使用的 Secret Key
+    service_region: 服务地区
+    service_region_china: 中国大陆
+    service_region_description: 该账户注册的地区，该场所只在该地区的地址上应答
+    service_region_eu: 欧洲（EU）
+    service_region_global: 国际（Global）
+    service_region_us_au: 美国与澳大利亚（US&AU）
+    title: 市场参与者
+    websocket_origin: WebSocket 地址
+  no_matches: 没有匹配的设置项
+  proxies:
+    add: 新增代理
+    address: 地址
+    app_updates: 应用更新
+    applications: 代理应用
+    authorization: 认证方式
+    default_line: 默认线路
+    default_line_description: 未单独覆盖的网络目标都走这条线路
+    delete: 删除代理
+    delete_message: <p align="center">确定删除代理「%{name}」吗？指定该线路的网络目标会回到默认线路。</p>
+    delete_title: 删除代理
+    dns_mode: DNS 模式
+    dns_mode_local: 本地解析
+    dns_mode_proxy: 代理解析
+    edit: 编辑代理
+    empty: 暂无代理
+    group_description: 将该组全部网络目标设为同一线路
+    inherit: 跟随默认线路
+    invalid_address: 请输入主机名或 IP 地址
+    invalid_port: 端口必须是 1 到 65535 之间的整数
+    kytrix_cloud: 账户与云服务
+    kytrix_section: Kytrix
+    management: 代理管理
+    mixed: 多种线路
+    name: 名称
+    name_exists: 代理名称已存在
+    name_required: 请输入代理名称
+    name_reserved: 该名称已被线路选项保留
+    no_authorization: 无认证
+    no_proxy: 不使用代理
+    password: 密码
+    password_required: 请输入密码
+    port: 端口
+    socks5_address: Socks5 地址
+    socks5_authorization: Socks5 认证方式
+    socks5_port: Socks5 端口
+    system_proxy: 使用系统代理
+    title: 代理
+    username: 用户名
+    username_password: 用户名和密码
+    username_required: 请输入用户名
+    venue_description: 该场所的请求走这条线路，未指定时跟随默认线路
+    venue_section: 场所
+    x_media_group: 媒体
+    x_section: X（Twitter）
+  save_failed:
+    message: <p align="center">设置未能写入磁盘：%{reason}</p>
+    title: 设置保存失败
+  search:
+    placeholder: 搜索设置
+startup:
+  config_reset_message: <p align="center">配置文件受损，已重新初始化为默认配置。原文件已备份为 %{file}。</p>
+  config_reset_message_no_backup: <p align="center">配置文件受损，已重新初始化为默认配置；原文件备份失败。</p>
+  config_reset_title: 配置已重置
+
+# 本程序支持的市场参与者名称。
+#
+# 市场参与者名称只在此处定义：规范形式（`binance`）用于身份摘要、目录来源 ID 与持久化键，
+# 而绝不会是用户看到的名字。
+venue:
+  binance: 币安
+  hyperliquid: Hyperliquid
+  longbridge: 长桥
+  okx: 欧易

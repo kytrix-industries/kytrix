@@ -1,0 +1,49 @@
+[package]
+name = "kytrix"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+# Selects the production service endpoints. A development build talks to the local
+# service on 127.0.0.1 and therefore has to send plaintext over the loopback; a
+# production build is TLS-only. Both the origins and the transport policy follow
+# from this one switch.
+production = ["kytrix_service_provider/production"]
+
+[dependencies]
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+log = { workspace = true }
+smallvec = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+
+# Workspace members
+app_config = { workspace = true }
+app_config_provider = { workspace = true }
+base_ui = { workspace = true }
+kytrix_service_provider = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
+market_participants_ui = { workspace = true }
+network = { workspace = true }
+profile_ui = { workspace = true }
+settings_ui = { workspace = true }
+updater_ui = { workspace = true }
+widget_tokio_runtime = { workspace = true }
+widget = { workspace = true }
+widget_gallery_ui = { workspace = true }
+widget_registry = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "empty"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+app_config = { workspace = true }
+base_ui = { workspace = true }
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+widget = { workspace = true }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

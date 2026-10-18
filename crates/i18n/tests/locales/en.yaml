@@ -1,0 +1,17 @@
+# English (US) messages.
+#
+# Keys nest, and a nested key is addressed with dots: the value below is the
+# message `menu.market`.
+
+menu:
+  market: Market
+  portfolio: Portfolio
+  sub:
+    quant: Quant
+
+window:
+  close: Close
+
+greeting: "Hello, %{name}!"
+inbox: "%{name} has %{count} unread messages."
+ratio: "Ratio: %{ratio}"

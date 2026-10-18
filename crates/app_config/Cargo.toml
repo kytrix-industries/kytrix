@@ -1,0 +1,31 @@
+[package]
+name = "app_config"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+# Exposes the fixture seam other crates' tests point a venue at sockets they own with.
+# Every address a real installation may store is one the venue publishes, so this is
+# the one place the resolution of a published address can move. Opt-in and test-only:
+# every edge that enables it in this workspace is a `[dev-dependencies]` one.
+test-support = []
+
+[dependencies]
+ahash.workspace = true
+market_participants_model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol_str = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+url = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+# The crate's own integration test drives the fixture seam `test-support` exposes, and a
+# `-p app_config` build has no other edge that enables the feature: without this self
+# dev-dependency that test target only compiles in a workspace build, where another
+# member's dev-dependency happens to unify the feature on.
+app_config = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

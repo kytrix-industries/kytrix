@@ -1,0 +1,40 @@
+[package]
+name = "market_participants_ui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash.workspace = true
+gpui-kit.workspace = true
+i18n.workspace = true
+log.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+# The type of a task that did not finish, which the menu reports as its own failure.
+tokio.workspace = true
+
+# Workspace members
+base_ui.workspace = true
+market_participants_connector.workspace = true
+market_participants_model.workspace = true
+# `LocalizedError`: the workspace's one spelling of "this failure, in the user's
+# language", including the catalog errors a failed fetch reports.
+widget.workspace = true
+widget_tokio_runtime.workspace = true
+
+[dev-dependencies]
+# The connection seam a test connects a venue through: the crate's own
+# `test-support` feature, which is never enabled for a release build.
+market_participants_connector = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
+# The market participants root a test builds from typed runtime inputs names the application
+# settings and the transport hub those inputs are made of.
+app_config.workspace = true
+network.workspace = true
+# The origin a harness points a venue at is a URL, which is what the venue configuration stores.
+url.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

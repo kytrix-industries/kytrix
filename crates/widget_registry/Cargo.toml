@@ -1,0 +1,38 @@
+[package]
+name = "widget_registry"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+
+# Workspace members
+app_config = { workspace = true }
+candlestick = { workspace = true }
+empty = { workspace = true }
+etf = { workspace = true }
+force_orders = { workspace = true }
+hyperliquid_wallet_monitor = { workspace = true }
+indices = { workspace = true }
+market_trades = { workspace = true }
+news = { workspace = true }
+order_book = { workspace = true }
+perpetual_statistics = { workspace = true }
+tweet_monitor = { workspace = true }
+volume_heatmap = { workspace = true }
+wallet_monitor = { workspace = true }
+watch_list = { workspace = true }
+widget = { workspace = true }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
+

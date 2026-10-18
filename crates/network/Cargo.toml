@@ -1,0 +1,57 @@
+[package]
+name = "network"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+# Exposes the observation seams other crates' unit tests need to assert cache
+# keying and synchronous subscription delivery. Never enabled for a release
+# build: it is a dev-dependency feature only.
+test-support = []
+
+[dependencies]
+ahash.workspace = true
+app_config.workspace = true
+market_participants_model.workspace = true
+boa_engine.workspace = true
+bytes.workspace = true
+futures.workspace = true
+reqwest = { workspace = true, features = [
+    "blocking",
+    "brotli",
+    "default-tls",
+    "deflate",
+    "form",
+    "gzip",
+    "socks",
+    "stream",
+] }
+smol_str = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+widget_tokio_runtime.workspace = true
+yawc = { workspace = true, features = ["reqwest"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+core-foundation-sys.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+reqwest.workspace = true
+url.workspace = true
+yawc.workspace = true
+
+[lints]
+workspace = true

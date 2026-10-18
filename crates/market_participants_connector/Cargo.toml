@@ -1,0 +1,99 @@
+[package]
+name = "market_participants_connector"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+# Exposes the seams other crates' tests wire the connector through: a test builds
+# the catalogue and connects a venue without a venue answering. Never enabled for
+# a release build: it is a dev-dependency feature only.
+#
+# It carries `app_config`'s own fixture seam with it, because a test that points a
+# venue at a socket it owns needs both: the venue configuration that names the
+# socket, and the catalogue that is built without one answering.
+test-support = ["app_config/test-support"]
+
+[dependencies]
+ahash.workspace = true
+app_config.workspace = true
+app_config_provider.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types.workspace = true
+base64.workspace = true
+bytes.workspace = true
+const-hex.workspace = true
+ed25519-dalek = { workspace = true, features = ["pem"] }
+flate2.workspace = true
+futures.workspace = true
+gpui-kit.workspace = true
+hmac = { workspace = true, features = ["zeroize"] }
+jiff.workspace = true
+k256 = { workspace = true, features = ["ecdsa"] }
+log.workspace = true
+longbridge-proto.workspace = true
+market_participants_model.workspace = true
+network.workspace = true
+parking_lot.workspace = true
+pkcs8 = { workspace = true, features = ["encryption", "pem"] }
+prost.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = [
+    "blocking",
+    "brotli",
+    "default-tls",
+    "deflate",
+    "form",
+    "gzip",
+    "socks",
+    "stream",
+] }
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+smol_str = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting"] }
+tokio.workspace = true
+widget_tokio_runtime.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+yawc.workspace = true
+
+[dev-dependencies]
+# The fixture seam a test points a venue at sockets it owns through. Every address a
+# real installation may store is one the venue publishes, so this is the only way a
+# test reaches a loopback fixture.
+app_config = { workspace = true, features = ["test-support"] }
+# The crate's own integration tests drive the seams `test-support` exposes, and a
+# `-p market_participants_connector` build has no other edge that enables the
+# feature: without this self dev-dependency its test targets only compile in a
+# workspace build, where another member's dev-dependency happens to unify the
+# feature on.
+market_participants_connector = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+# The live Longbridge suite speaks the venue's wire itself rather than through the
+# adapter, so it dials the socket with the workspace's own WebSocket client over the
+# same transport hub every other integration test reaches a venue through. Both are
+# already dependencies of the crate; naming them here is what lets a test target use
+# them, because an integration test only sees the dependencies it declares itself.
+network.workspace = true
+percent-encoding.workspace = true
+# The live suite signs the token request with the same algorithm the adapter's own
+# OTP request is signed with, so it reads the same three crates; `hmac`, `sha1` and
+# `sha2` are all declared under `[dependencies]` above and named here only because an
+# integration-test target sees the dependencies it declares itself.
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+# A fixture that has to wait out a download deadline moves the runtime's clock
+# instead of the wall's: `#[tokio::test(start_paused = true)]` needs this feature.
+tokio = { workspace = true, features = ["test-util"] }
+yawc.workspace = true
+
+[lints]
+workspace = true

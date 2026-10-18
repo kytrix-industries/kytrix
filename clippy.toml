@@ -1,0 +1,33 @@
+# Clippy configuration for the whole workspace.
+#
+# `large-error-threshold` is raised above its 128-byte default because the
+# workspace's error types are deliberately rich: `MarketParticipantError`, `ModelError`,
+# `MarketError` and `AccountError` each name the exact route, listing, field or
+# operation that failed, which is what lets a caller decide how to react instead
+# of matching on free text. Clippy's default sits exactly at the size such an enum
+# reaches, so every function that returns one of them would have to box it; boxing
+# the whole error surface of four crates is the only alternative, and it buys the
+# size of a pointer at the cost of an allocation on every failure path.
+large-error-threshold = 256
+
+# Tokio's context-sensitive APIs are denied workspace-wide.
+#
+# A Tokio runtime is two things at once and its own API spells both `Handle`: the
+# capability to put work on the runtime, and the fact that the current thread is
+# already inside one. `Handle::spawn` needs only the capability, so it works from
+# anywhere, but `tokio::task::spawn_blocking` and `Handle::current` need the fact
+# and panic without it with "there is no reactor running, must be called from the
+# context of a Tokio 1.x runtime". A GPUI task runs on GPUI's own executor, so it
+# has no such context, and the panic lands in the middle of a frame.
+#
+# Passing a `Handle` around does not fix that: the callee still has to establish
+# the context itself, and nothing in the type system says whether it did. The
+# workspace therefore owns the one API that carries both halves —
+# `widget_tokio_runtime::runtime::Runtime` — and these denials make reaching
+# around it a compile error rather than a matter of remembering. The single
+# exemption is the module that implements `Runtime`, which is also the only place
+# in the workspace allowed to name these APIs.
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "a GPUI task has no Tokio context and this panics without one; take the application runtime and use Runtime::blocking, which establishes the context itself", replacement = "widget_tokio_runtime::runtime::Runtime::blocking" },
+    { path = "tokio::runtime::Handle::current", reason = "panics outside a runtime context, which is exactly where GPUI tasks run; read the application runtime with widget_tokio_runtime::global::try_handle instead", replacement = "widget_tokio_runtime::global::try_handle" },
+]

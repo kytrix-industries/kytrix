@@ -1,0 +1,3 @@
+[alias]
+# Runs the workspace tooling crate: `cargo xtask bump-version <major|minor|patch>`.
+xtask = "run --package xtask --"

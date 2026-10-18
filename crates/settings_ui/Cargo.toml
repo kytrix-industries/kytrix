@@ -1,0 +1,36 @@
+[package]
+name = "settings_ui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash = { workspace = true }
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+log = { workspace = true }
+smol_str = { workspace = true }
+url = { workspace = true }
+
+# Workspace members
+app_config = { workspace = true }
+app_config_provider = { workspace = true }
+base_ui = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
+# The layer that names a venue in the reader's language.
+widget = { workspace = true }
+
+[dev-dependencies]
+# The connection seam a widget test connects a venue through: the crate's own
+# `test-support` feature, which is never enabled for a release build.
+market_participants_connector = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+# The runtime global the market participants root is installed against: a test that opens the
+# settings the way the system button does installs both, the way the composition
+# root does.
+widget_tokio_runtime = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "instrument_selector_ui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+i18n = { workspace = true }
+nucleo = { workspace = true }
+smol_str = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+# Workspace members
+base_ui = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
+widget = { workspace = true }
+
+[dev-dependencies]
+# The connection seam a widget test connects a venue through: the crate's own
+# `test-support` feature, which is never enabled for a release build.
+market_participants_connector = { workspace = true, features = ["test-support"] }
+app_config = { workspace = true }
+gpui-kit = { workspace = true, features = ["test-support"] }
+# Only the view tests install a runtime; production reads the connector globals.
+widget_tokio_runtime = { workspace = true }
+
+[lints]
+workspace = true

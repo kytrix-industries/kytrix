@@ -1,0 +1,34 @@
+[package]
+name = "widget"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash.workspace = true
+gpui-kit.workspace = true
+i18n.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+smol_str.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+
+# Workspace members
+app_config.workspace = true
+base_ui.workspace = true
+kytrix_service_provider.workspace = true
+market_participants_connector.workspace = true
+market_participants_model.workspace = true
+network.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+# The instrument-link tests build legacy payloads as dynamic JSON; production
+# code never touches `serde_json`.
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
