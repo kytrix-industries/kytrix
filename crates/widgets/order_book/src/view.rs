@@ -73,7 +73,8 @@ use widget_tokio_runtime::global;
 use super::{
     model::{
         GroupedBook, OrderBookMetadata, OrderBookSnapshot, PRICE_MULTIPLIERS, WINDOW_SIZES,
-        interpolated_ratio, is_after, price_step_label, price_step_labels,
+        default_window_size, interpolated_ratio, is_after, price_step_label, price_step_labels,
+        window_sizes,
     },
     paint::{
         DEPTH_ANIMATION_SETTLE_EPSILON, HEADER_HEIGHT, IMBALANCE_HEIGHT, MID_PRICE_HEIGHT,
@@ -115,22 +116,27 @@ impl WidgetConfig for OrderBookConfig {
 }
 
 impl OrderBookConfig {
-    /// Settles the two drawing choices against the ones this widget offers.
+    /// Settles the two drawing choices against the ones this book offers.
     ///
     /// A persisted config can name a grouping or a row limit this build no longer
-    /// offers. Such a choice goes back to the default one: a neighbouring choice is
-    /// something the user did not pick, and drawing the book with it would look like a
-    /// decision they made. Returns whether anything was replaced, which is what the pane
-    /// reports so the replacement is written back.
-    fn settle(&mut self) -> bool {
+    /// offers — or a row limit the route's book is too shallow to fill. Such a
+    /// choice goes back to the default one: a neighbouring choice is something the
+    /// user did not pick, and drawing the book with it would look like a decision
+    /// they made. The row limit is judged only when the route's depth is known: a
+    /// book that follows nothing has no route to judge it against, and its stored
+    /// choice is left alone until one is chosen. Returns whether anything was
+    /// replaced, which is what the pane reports so the replacement is written back.
+    fn settle(&mut self, depth: Option<u16>) -> bool {
         let defaults = Self::default();
         let mut settled = false;
         if !PRICE_MULTIPLIERS.contains(&self.price_multiplier) {
             self.price_multiplier = defaults.price_multiplier;
             settled = true;
         }
-        if !WINDOW_SIZES.contains(&self.window_size) {
-            self.window_size = defaults.window_size;
+        if let Some(depth) = depth
+            && !window_sizes(Some(depth)).contains(&self.window_size)
+        {
+            self.window_size = default_window_size(Some(depth));
             settled = true;
         }
 
@@ -702,10 +708,20 @@ impl OrderBookWidget {
         self.awaiting_market = false;
         self.directory_generation = self.directory_generation.wrapping_add(1);
         let generation = self.directory_generation;
-        if self.config.settle() {
+        // The row limits the book offers follow from how deep its venue publishes,
+        // and that bound is known before the stream is opened: a stored choice the
+        // route cannot fill goes back to the default here, so the request and the
+        // header agree on one choice from the first frame.
+        let depth = self.config.selection.as_ref().and_then(|selection| {
+            cx.global::<MarketParticipantsConnector>()
+                .market()
+                .order_book_depth(&selection.listing.route)
+                .ok()
+        });
+        if self.config.settle(depth) {
             log::warn!(
-                "the book's stored grouping or row limit is not offered by this build; \
-                 it was reset to the defaults"
+                "the book's stored grouping or row limit is not offered here; \
+                 it was reset to the default"
             );
             self.config_change.publish(cx);
         }
@@ -1039,7 +1055,9 @@ impl OrderBookWidget {
     }
 
     fn select_window_size(&mut self, window_size: usize, cx: &mut Context<Self>) {
-        if self.config.window_size == window_size || !WINDOW_SIZES.contains(&window_size) {
+        if self.config.window_size == window_size
+            || !window_sizes(self.book_depth()).contains(&window_size)
+        {
             return;
         }
         self.config.window_size = window_size;
@@ -1165,10 +1183,19 @@ impl OrderBookWidget {
         })
     }
 
+    /// The depth the book being drawn was published at.
+    ///
+    /// The metadata arrives before the first snapshot, so a pane with a book knows
+    /// how deep its venue publishes; a pane that follows nothing, or whose stream
+    /// has not answered yet, has no bound to offer its row limits from.
+    fn book_depth(&self) -> Option<u16> {
+        self.metadata.as_ref().map(|metadata| metadata.depth)
+    }
+
     /// The row-limit picker.
     fn window_size_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
         let selected = SharedString::new(format_smolstr!("{}", self.config.window_size).as_str());
-        let select = WINDOW_SIZES.iter().copied().fold(
+        let select = window_sizes(self.book_depth()).iter().copied().fold(
             Select::new(ElementId::Name(SharedString::new_static(
                 "OrderBookWindowSize",
             )))
@@ -1491,7 +1518,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::MAX_LEVELS_PER_SIDE,
+        model::{MAX_LEVELS_PER_SIDE, SHALLOW_WINDOW_SIZES},
         service::{OrderBookEventSubscription, OrderBookSource, OrderBookStreamError},
     };
 
@@ -1628,7 +1655,7 @@ mod tests {
                 .cached_listing(&listing)
                 .expect("the fixture publishes the listing the book follows");
             Ok(ResolvingSubscription {
-                metadata: OrderBookMetadata::of(&published.snapshot.rules),
+                metadata: OrderBookMetadata::of(&published.snapshot.rules, FIXTURE_DEPTH),
             })
         }
     }
@@ -1694,6 +1721,10 @@ mod tests {
         }
     }
 
+    /// The depth the fixture route's venue publishes per side, which is the bound
+    /// the pane offers its row limits from.
+    const FIXTURE_DEPTH: u16 = 5_000;
+
     fn metadata() -> OrderBookMetadata {
         OrderBookMetadata {
             precision: ListingPrecision {
@@ -1708,6 +1739,7 @@ mod tests {
                     "binance", "BTC",
                 ),
             },
+            depth: FIXTURE_DEPTH,
         }
     }
 
@@ -3605,6 +3637,74 @@ mod tests {
         });
     }
 
+    /// A shallow book only offers the rows it can fill: a row limit the venue is
+    /// too shallow for is refused, and one of its own is taken.
+    #[gpui_kit::test]
+    fn a_shallow_book_should_only_take_the_row_limits_it_can_fill(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+
+        cx.update(|cx| {
+            let book = ListingOrderBook {
+                listing: listing("BTC"),
+                sequence: MarketSequence::Numeric(1),
+                timestamp: None,
+                bids: levels(&[("100", 1)]),
+                asks: levels(&[("101", 1)]),
+            };
+            let shallow = OrderBookSnapshot::from_market_participant(
+                &book,
+                OrderBookMetadata {
+                    depth: 20,
+                    ..metadata()
+                },
+                MAX_LEVELS_PER_SIDE,
+            );
+            accept_book(&widget, shallow, cx);
+
+            widget.update(cx, |widget, context| {
+                widget.select_window_size(WINDOW_SIZES[2], context);
+                assert_eq!(
+                    widget.config.window_size, WINDOW_SIZES[0],
+                    "a row limit the book cannot fill is not offered"
+                );
+
+                widget.select_window_size(SHALLOW_WINDOW_SIZES[1], context);
+                assert_eq!(
+                    widget.config.window_size, SHALLOW_WINDOW_SIZES[1],
+                    "a row limit the book can fill is taken"
+                );
+            });
+        });
+    }
+
+    /// The depth the route publishes is read before the stream opens, so a stored
+    /// row limit that route cannot fill is replaced before it can reach the header
+    /// or the request.
+    #[gpui_kit::test]
+    fn a_row_limit_the_route_cannot_fill_should_be_settled_before_the_stream_opens(
+        cx: &mut TestAppContext,
+    ) {
+        let (widget, reports) = widget_over_source_reporting(
+            cx,
+            OrderBookConfig {
+                window_size: SHALLOW_WINDOW_SIZES[0],
+                ..config()
+            },
+            PendingSource,
+            Published::Listings(vec!["BTC"]),
+        );
+
+        assert_eq!(
+            cx.read(|cx| widget.read(cx).config.window_size),
+            WINDOW_SIZES[0],
+            "the route's own depth settles the stored choice"
+        );
+        assert!(
+            reports.get() > 0,
+            "the replacement is reported so it is written back"
+        );
+    }
+
     #[gpui_kit::test]
     fn reduce_motion_should_put_the_bars_where_they_belong(cx: &mut TestAppContext) {
         let widget = widget(cx);
@@ -3825,7 +3925,10 @@ mod tests {
             ..OrderBookConfig::default()
         };
 
-        assert!(config.settle(), "a replaced choice is reported as a change");
+        assert!(
+            config.settle(None),
+            "a replaced choice is reported as a change"
+        );
 
         assert_eq!(
             config.price_multiplier,
@@ -3840,7 +3943,7 @@ mod tests {
             ..OrderBookConfig::default()
         };
 
-        assert!(config.settle());
+        assert!(config.settle(Some(FIXTURE_DEPTH)));
 
         assert_eq!(config.window_size, OrderBookConfig::default().window_size);
     }
@@ -3854,12 +3957,41 @@ mod tests {
         };
 
         assert!(
-            !config.settle(),
+            !config.settle(Some(FIXTURE_DEPTH)),
             "nothing was replaced, so nothing is reported"
         );
 
         assert_eq!(config.price_multiplier, PRICE_MULTIPLIERS[4]);
         assert_eq!(config.window_size, WINDOW_SIZES[2]);
+    }
+
+    /// A route whose venue publishes at most twenty levels per side cannot fill the
+    /// standard row limits, so a choice from the deep ladder goes back to the default
+    /// the shallow ladder starts with.
+    #[test]
+    fn a_row_limit_a_shallow_route_cannot_fill_should_reset_to_its_own_default() {
+        let mut config = OrderBookConfig {
+            window_size: WINDOW_SIZES[2],
+            ..OrderBookConfig::default()
+        };
+
+        assert!(config.settle(Some(20)));
+
+        assert_eq!(config.window_size, SHALLOW_WINDOW_SIZES[2]);
+    }
+
+    /// A pane that follows nothing has no route to judge its row limit against, so
+    /// the stored choice is left alone until one is chosen.
+    #[test]
+    fn a_row_limit_should_survive_settling_without_a_route() {
+        let mut config = OrderBookConfig {
+            window_size: SHALLOW_WINDOW_SIZES[0],
+            ..OrderBookConfig::default()
+        };
+
+        assert!(!config.settle(None));
+
+        assert_eq!(config.window_size, SHALLOW_WINDOW_SIZES[0]);
     }
 
     #[test]

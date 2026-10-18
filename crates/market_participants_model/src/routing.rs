@@ -97,6 +97,15 @@ pub enum CapabilityId {
     MarketTrades,
     #[serde(rename = "tickers")]
     Tickers,
+    /// The route-level read of every ticker of a scope.
+    ///
+    /// It is separate from [`Self::Tickers`] because a venue may answer a ticker one
+    /// listing at a time without answering the whole scope in one read: Longbridge's
+    /// US-equity scope does. A caller that folds every listing's ticker into one
+    /// number — a volume heat map — can only be drawn from a scope that serves this
+    /// capability.
+    #[serde(rename = "all_tickers")]
+    AllTickers,
     #[serde(rename = "order_book")]
     OrderBook,
     #[serde(rename = "open_interest")]
@@ -135,6 +144,7 @@ impl CapabilityId {
             Self::Candlesticks => "candlesticks",
             Self::MarketTrades => "market_trades",
             Self::Tickers => "tickers",
+            Self::AllTickers => "all_tickers",
             Self::OrderBook => "order_book",
             Self::OpenInterest => "open_interest",
             Self::LongShortAccountRatio => "long_short_account_ratio",

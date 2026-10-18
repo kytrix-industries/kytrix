@@ -331,6 +331,73 @@ fn order_book_should_reject_an_unsorted_side() {
     );
 }
 
+/// One level of one side, with the quantity the test asks for.
+fn order_book_level(value: u32, quantity: Quantity) -> ListingOrderBookLevel {
+    ListingOrderBookLevel {
+        price: MarketPrice {
+            value: Price::from(value),
+            ..price()
+        },
+        quantity: MarketQuantity {
+            value: quantity,
+            unit: QuantityUnit::AssetUnits { asset: btc() },
+        },
+    }
+}
+
+/// A snapshot at a fixed sequence, so a test only has to state its two sides.
+fn order_book(
+    bids: Vec<ListingOrderBookLevel>,
+    asks: Vec<ListingOrderBookLevel>,
+) -> ListingOrderBook {
+    ListingOrderBook {
+        listing: listing_key(),
+        sequence: MarketSequence::Numeric(1),
+        timestamp: None,
+        bids,
+        asks,
+    }
+}
+
+#[test]
+fn a_snapshot_level_must_carry_a_quantity() {
+    let book = order_book(vec![order_book_level(100, Quantity::ZERO)], Vec::new());
+
+    assert_eq!(book.validate(), Err(ModelError::EmptyOrderBookLevel));
+}
+
+#[test]
+fn a_snapshot_level_must_name_a_price() {
+    let book = order_book(vec![order_book_level(0, Quantity::from(1_u8))], Vec::new());
+
+    assert_eq!(
+        book.validate(),
+        Err(ModelError::InvalidField {
+            field: "order_book.price",
+            value: "zero".into(),
+        })
+    );
+}
+
+/// A venue removes a price level by publishing it with quantity zero, so an update
+/// carrying one is a valid update and not an empty level.
+#[test]
+fn an_update_level_may_carry_the_zero_quantity_that_removes_it() {
+    let sequence = MarketSequence::Numeric(1);
+    let update = ListingOrderBookUpdate {
+        listing: listing_key(),
+        snapshot: false,
+        first_sequence: sequence.clone(),
+        last_sequence: sequence,
+        previous_sequence: None,
+        timestamp: None,
+        bids: vec![order_book_level(100, Quantity::ZERO)],
+        asks: Vec::new(),
+    };
+
+    assert_eq!(update.validate(), Ok(()));
+}
+
 #[test]
 fn market_sequence_should_only_compare_like_representations() {
     assert_eq!(

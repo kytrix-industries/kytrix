@@ -101,8 +101,18 @@ pub struct ListingOrderBookLevel {
 }
 
 impl ListingOrderBookLevel {
-    /// Validates that the level quantity is a traded quantity.
+    /// Validates that the level names a price and that its quantity is traded.
+    ///
+    /// A zero quantity is not refused here: a venue publishes one to remove the
+    /// price level, so only a snapshot has to carry a quantity for every level it
+    /// lists. [`ListingOrderBook::validate`] states that half of the rule.
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.price.value.is_zero() {
+            return Err(ModelError::InvalidField {
+                field: "order_book.price",
+                value: "zero".into(),
+            });
+        }
         self.quantity.validate_traded("order_book.quantity")
     }
 }
@@ -191,11 +201,16 @@ pub struct ListingOrderBook {
 impl ListingOrderBook {
     /// Validates both sides and rejects a crossed book.
     ///
-    /// Bids must be ordered by descending price and asks by ascending price, and
-    /// the best bid must stay strictly below the best ask.
+    /// Bids must be ordered by descending price and asks by ascending price, the
+    /// best bid must stay strictly below the best ask, and every level has to carry
+    /// a quantity: a snapshot is a book that exists, so a level without quantity is
+    /// the removal marker of an update and not a level of this book.
     pub fn validate(&self) -> Result<(), ModelError> {
         for level in self.bids.iter().chain(self.asks.iter()) {
             level.validate()?;
+            if level.quantity.value.is_zero() {
+                return Err(ModelError::EmptyOrderBookLevel);
+            }
         }
         if self
             .bids
@@ -245,7 +260,9 @@ impl ListingOrderBookUpdate {
     /// Validates the sequence bounds and both sides of the update.
     ///
     /// Sequences of different representations are not comparable, so an update
-    /// whose bounds disagree with the stream is rejected instead of replayed.
+    /// whose bounds disagree with the stream is rejected instead of replayed. A
+    /// level may carry a zero quantity: that is how a venue removes the price
+    /// level, and the book applies it as the removal it is.
     pub fn validate(&self) -> Result<(), ModelError> {
         let advances = |after: &MarketSequence, before: &MarketSequence| {
             after == before || after.is_after(before) == Some(true)

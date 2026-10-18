@@ -810,6 +810,10 @@ window:
     split_keep_right: 拆分并保留右侧
     split_keep_top: 拆分并保留上方
     widget_menu: 组件
+  tabs:
+    market: 市场
+    portfolio: 投资组合
+    quant: 量化
   updater:
     available: 有可用更新
     available_tooltip: 发现新版本 %{version}

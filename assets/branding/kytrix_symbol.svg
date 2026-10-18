@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="19 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Kytrix symbol</title>
+<desc>K monogram with ring and market arc</desc>
+
+  <g fill="#28C76F">
+    <path d="M209.192 43.092 A120.078 120.078 0 0 1 209.192 212.908 L190.808 194.523 A94.078 94.078 0 0 0 190.808 61.477 Z"/>
+  </g>
+  <g fill="#12203A">
+    <path d="M50 52.284 H76 V203.716 H50 Z"/>
+    <circle cx="63" cy="52.284" r="13"/>
+    <circle cx="63" cy="203.716" r="13"/>
+    <path d="M119.335 151.335 L209.192 61.477 L190.808 43.092 L100.95 132.95 Z"/>
+    <path d="M100.95 123.05 L190.808 212.908 L209.192 194.523 L119.335 104.665 Z"/>
+    <circle cx="200" cy="52.284" r="13"/>
+    <circle cx="200" cy="203.716" r="13"/>
+    <path fill-rule="evenodd" d="M96 95 a33 33 0 0 0 0 66 a33 33 0 0 0 0 -66 Z M96 121 a7 7 0 0 0 0 14 a7 7 0 0 0 0 -14 Z"/>
+  </g>
+</svg>

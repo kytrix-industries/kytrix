@@ -332,7 +332,7 @@ async fn a_request_for_an_unloaded_scope_is_refused_without_a_request() {
         connector.venues().scopes().is_empty(),
         "nothing is loaded in this root"
     );
-    let identity = RequestIdentity::new(spot.clone(), CapabilityId::Tickers);
+    let identity = RequestIdentity::new(spot.clone(), CapabilityId::AllTickers);
     let refused = market
         .gateway()
         .execute(

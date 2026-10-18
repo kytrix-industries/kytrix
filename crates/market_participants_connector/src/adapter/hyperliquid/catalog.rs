@@ -575,6 +575,7 @@ fn perp_dex_capabilities() -> Vec<RouteCapabilityDescriptor> {
         RouteCapabilityDescriptor::new(CapabilityId::Candlesticks, false),
         RouteCapabilityDescriptor::new(CapabilityId::MarketTrades, false),
         RouteCapabilityDescriptor::new(CapabilityId::Tickers, false),
+        RouteCapabilityDescriptor::new(CapabilityId::AllTickers, false),
         RouteCapabilityDescriptor::new(CapabilityId::OrderBook, false),
         RouteCapabilityDescriptor::new(CapabilityId::WalletMonitor, false),
         RouteCapabilityDescriptor::new(CapabilityId::AuthenticatedTrading, true),
@@ -848,6 +849,7 @@ mod tests {
             CapabilityId::Candlesticks,
             CapabilityId::MarketTrades,
             CapabilityId::Tickers,
+            CapabilityId::AllTickers,
             CapabilityId::OrderBook,
             CapabilityId::WalletMonitor,
             CapabilityId::AuthenticatedTrading,
@@ -864,7 +866,7 @@ mod tests {
         for absent in [CapabilityId::AccountHistory, CapabilityId::ForceOrders] {
             assert!(!declared.contains(&absent), "{absent:?} is not implemented");
         }
-        assert_eq!(declared.len(), 11);
+        assert_eq!(declared.len(), 12);
         assert!(descriptor.catalog_source().is_some());
         assert!(
             descriptor

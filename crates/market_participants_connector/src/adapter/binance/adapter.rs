@@ -2138,7 +2138,11 @@ fn decode_ticker(
     })
 }
 
-/// One order-book side of a REST depth answer.
+/// One order-book side of a REST depth answer or of a diff depth event.
+///
+/// A level is decoded exactly as the venue printed it, a zero quantity included:
+/// the diff stream publishes one to remove the price level, and which of the two
+/// shapes the level may appear in is the model's rule, not the wire's.
 fn decode_levels(
     levels: &[BinanceLevelRow],
     operation: &'static str,
@@ -2146,11 +2150,10 @@ fn decode_levels(
     levels
         .iter()
         .map(|level| {
-            crate::market_participants::model::require_order_book_level(
-                parse_price(&level.price, operation)?,
-                parse_quantity(&level.quantity, operation)?,
-            )
-            .map_err(|error| MarketParticipantError::MarketModel(Box::new(error)))
+            Ok(NativeOrderBookLevel {
+                price: parse_price(&level.price, operation)?,
+                quantity: parse_quantity(&level.quantity, operation)?,
+            })
         })
         .collect()
 }
@@ -2713,8 +2716,8 @@ mod tests {
 
     use super::{
         BinanceAdapter, BinanceCodec, BinanceMarketParticipantFilter,
-        BinanceMarketParticipantSymbol, BinanceTickerWire, SubscriptionKind, decode_levels,
-        decode_market_entry, decode_subscription_event, decode_ticker, listing_identity,
+        BinanceMarketParticipantSymbol, BinanceTickerWire, SubscriptionKind, decode_market_entry,
+        decode_subscription_event, decode_ticker, listing_identity,
     };
     use crate::{
         adapter::{ExecutionContext, MarketParticipantAdapter, ProtocolEvent},
@@ -3159,19 +3162,26 @@ mod tests {
         );
     }
 
-    /// A zero quantity is never a published order-book level.
+    /// A diff depth event removes a price level by publishing it with quantity
+    /// zero, so that level is decoded like any other and the book applies the
+    /// removal.
     #[test]
-    fn a_zero_order_book_level_is_rejected() {
-        let error = decode_levels(
-            &[super::BinanceLevelRow {
-                price: "100".into(),
-                quantity: "0".into(),
-            }],
-            "decode Binance order book",
+    fn a_depth_update_level_with_zero_quantity_is_decoded() {
+        let event = decode_subscription_event(
+            br#"{"e":"depthUpdate","E":1700000000000,"s":"BTCUSDT","U":101,"u":105,"b":[["100","0"]],"a":[["101","3"]]}"#,
+            &SubscriptionKind::OrderBook {
+                listing: listing(crate::routing::SPOT_SCOPE, "BTCUSDT"),
+                symbol: symbol("BTCUSDT"),
+            },
         )
-        .expect_err("a zero quantity is not a level");
+        .expect("a removal level is not an error")
+        .expect("depth event should match");
 
-        assert!(matches!(error, MarketParticipantError::MarketModel(_)));
+        let ProtocolEvent::OrderBook(update) = event else {
+            panic!("expected order-book event");
+        };
+        assert_eq!(update.data.bids[0].price.to_string(), "100");
+        assert!(update.data.bids[0].quantity.is_zero());
     }
 
     /// The two scopes address different markets: a spot route signs spot paths and

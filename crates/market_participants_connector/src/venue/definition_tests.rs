@@ -204,8 +204,8 @@ fn the_definition_table_covers_every_venue_this_build_serves() {
 
 /// A definition answers the capability names its loader produces, and nothing
 /// else: the liquidation stream belongs to the two market participants that publish one, the
-/// wallet monitor to the venue that has one, and a capability no loader
-/// produces to no venue at all.
+/// wallet monitor to the venue that has one, the whole-scope ticker read to the venues
+/// that answer it, and a capability no loader produces to no venue at all.
 #[test]
 fn a_definition_carries_its_capability_names() {
     assert_eq!(
@@ -227,6 +227,11 @@ fn a_definition_carries_its_capability_names() {
         venues_supporting(CapabilityId::WalletMonitor),
         vec![venue("hyperliquid")],
         "only Hyperliquid monitors a wallet"
+    );
+    assert_eq!(
+        venues_supporting(CapabilityId::AllTickers),
+        vec![venue("binance"), venue("okx"), venue("hyperliquid")],
+        "Longbridge answers tickers one listing at a time, so it serves no whole-scope read"
     );
 }
 

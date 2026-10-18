@@ -13,8 +13,9 @@
 //! a map that added them would report a market nobody quotes. The venue is
 //! therefore the map's scope: the stream is keyed by it, the service reads only it,
 //! and every tile of the map is one market participant's money. The control that picks it
-//! offers exactly the venues whose market is loaded, because a venue that is not
-//! loaded publishes no scope this map may read.
+//! offers exactly the loaded venues with a scope this map can be drawn from: a venue
+//! that is not loaded publishes no market to read, and one that answers tickers a
+//! listing at a time cannot answer the whole-scope read the map is made of.
 //!
 //! # What the pane reports, and what it does not
 //!
@@ -61,7 +62,9 @@ use gpui_kit::{
 };
 use i18n::t;
 use market_participants_connector::venue::loaded::VenuesUpdated;
-use market_participants_model::{identifier::VenueId, listing::route::VenueRoute};
+use market_participants_model::{
+    identifier::VenueId, listing::route::VenueRoute, routing::CapabilityId,
+};
 use serde::{Deserialize, Serialize};
 use widget::{
     binding::{WidgetBinding, WidgetRpcResult},
@@ -112,8 +115,8 @@ impl WidgetConfig for VolumeHeatMapConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// The market this map reads: one venue, and the scopes of it that answer with
-/// tickers and publish a catalog.
+/// The market this map reads: one venue, and the scopes of it that answer the
+/// route-level bulk ticker read and publish a catalog.
 ///
 /// The two travel together because they are one question — "which map is this pane
 /// reading" — and every decision below is a comparison of two of these. A venue
@@ -125,33 +128,54 @@ struct Reading {
     routes: Arc<[VenueRoute]>,
 }
 
-/// Every loaded venue whose market this map may be drawn from, in the order the
+/// Every loaded venue with a market this map may be drawn from, in the order the
 /// interface states venues.
 ///
-/// A venue is a candidate exactly when its market is loaded, which is the one
-/// question the loaded-venues view answers ([`market_participants_connector::venue::loaded`]):
-/// a load commits a venue's whole scope set, catalogs and metadata in one step, and
-/// the built-in venues all declare a spot scope, so a loaded venue always has a
-/// market this map can read. A venue no longer loaded is no longer offered, and a
-/// map of it is replaced by the market that is there.
+/// A venue is a candidate exactly when one of its loaded scopes is one this map reads
+/// ([`reads_the_whole_market`]): a loaded market participant that answers tickers one
+/// listing at a time — Longbridge, today — publishes no route-level read this map is
+/// made of, so it is not offered even though its market is in memory. A venue no
+/// longer loaded is no longer offered either, and a map of it is replaced by the
+/// market that is there.
 fn available_venues(cx: &App) -> Vec<VenueId> {
     let connector =
         cx.global::<market_participants_connector::connector::MarketParticipantsConnector>();
+    let entries = connector.venues().entries();
     connector
         .supported_venues()
         .into_iter()
-        .filter(|venue| connector.venues().loaded(venue).is_some())
+        .filter(|venue| {
+            entries
+                .iter()
+                .any(|(route, entry)| route.venue == *venue && reads_the_whole_market(entry))
+        })
         .collect()
+}
+
+/// Whether one loaded scope is a market this map is drawn from.
+///
+/// The scope has to answer the route-level bulk ticker read: the map folds the
+/// tickers of a whole market, so a scope that answers one listing at a time cannot
+/// produce one, however many tickers it can serve one by one. It also has to publish
+/// a catalog, because a ticker carries a listing key and the catalog is the only
+/// thing that says which listing and instrument that key names.
+fn reads_the_whole_market(
+    entry: &market_participants_connector::venue::definition::ScopeEntry,
+) -> bool {
+    entry.catalog_source.is_some()
+        && entry
+            .capabilities
+            .iter()
+            .any(|support| support.capability == CapabilityId::AllTickers)
 }
 
 /// The scopes of one loaded venue that this map is drawn from.
 ///
-/// A route that answers with tickers but publishes no catalog has no listings to
-/// resolve them against, so it is not a scope this map can be drawn from. One
-/// question is asked of the loaded venues — which scopes carry the capability and
-/// publish a catalog — so a pane that reads one market participant never enumerates scopes of
-/// its own. The route and the entry it is judged by come from one reading of one
-/// commit: [`market_participants_connector::venue::loaded::LoadedVenues::entries`] takes the
+/// One question is asked of the loaded venues — which scopes carry the whole-scope
+/// ticker read and publish a catalog — so a pane that reads one market participant never
+/// enumerates scopes of its own. The route and the entry it is judged by come from
+/// one reading of one commit:
+/// [`market_participants_connector::venue::loaded::LoadedVenues::entries`] takes the
 /// venue table's lock once, so a load landing while this runs cannot put one
 /// commit's route beside another's catalog source.
 fn venue_routes(
@@ -162,13 +186,7 @@ fn venue_routes(
         .venues()
         .entries()
         .iter()
-        .filter(|(route, entry)| {
-            route.venue == venue
-                && entry.catalog_source.is_some()
-                && entry.capabilities.iter().any(|support| {
-                    support.capability == market_participants_model::routing::CapabilityId::Tickers
-                })
-        })
+        .filter(|(route, entry)| route.venue == venue && reads_the_whole_market(entry))
         .map(|(route, _)| route.clone())
         .collect()
 }
@@ -185,7 +203,7 @@ fn market_ready(cx: &App, route: &VenueRoute) -> bool {
 }
 
 /// The markets a notice names while nothing is loaded: the venues whose loader can
-/// answer with tickers, in the order supported_venues() answers.
+/// answer the route-level bulk ticker read, in the order supported_venues() answers.
 ///
 /// This is the one static answer a pane may read: the capability's venue
 /// name set, never a scope, an origin or a credential. It is what says which
@@ -196,9 +214,7 @@ fn market_ready(cx: &App, route: &VenueRoute) -> bool {
 /// reference into the catalogue, and the sentence that names them is resolved by the
 /// framework, in the language showing on the frame that draws it.
 fn market_venues() -> Vec<VenueId> {
-    market_participants_connector::venue::definition::venues_supporting(
-        market_participants_model::routing::CapabilityId::Tickers,
-    )
+    market_participants_connector::venue::definition::venues_supporting(CapabilityId::AllTickers)
 }
 
 /// A failure a pane reports that is not already a stream error.
@@ -291,12 +307,14 @@ pub struct VolumeHeatMapWidget {
     /// presents it, and the tests below read it through the extension trait.
     status: Entity<WidgetStatus>,
     pub recovery: WidgetAction,
-    /// The venues whose market is loaded, in the order the interface states them.
+    /// The venues with a loaded market this map can be drawn from, in the order the
+    /// interface states them.
     ///
-    /// Which venues may be read is the loaded venues' answer, and the user may load
-    /// one at any time, so it is re-read on every load rather than taken once. Empty
-    /// means no market this pane reads is loaded, which is what keeps
-    /// [`Self::has_content`] false while the pane waits.
+    /// Which venues may be read is the loaded venues' answer together with the
+    /// capability they publish, and the user may load one at any time, so it is
+    /// re-read on every load rather than taken once. Empty means no market this pane
+    /// reads is loaded, which is what keeps [`Self::has_content`] false while the pane
+    /// waits.
     venues: Vec<VenueId>,
     /// The market the map on screen was read from, or nothing while the pane waits.
     ///
@@ -377,17 +395,20 @@ impl WidgetView for VolumeHeatMapWidget {
         // to a market once more.
         self.awaiting_market = false;
         self.venues = venues;
-        // A venue this build no longer reads, or one whose market is not loaded any
-        // more, is a choice that does not hold: it goes back to "not chosen" and the
-        // pane picks from the markets that are there, so a stored venue cannot pin
-        // the map to a market participant the user can no longer see.
+        // A venue this build no longer reads, one whose market is not loaded any
+        // more, or one that publishes no route-level read this map is made of, is a
+        // choice that does not hold: it goes back to "not chosen" and the pane picks
+        // from the markets that are there, so a stored venue cannot pin the map to a
+        // market participant the user can no longer see.
         if self
             .config
             .venue
             .is_some_and(|venue| !self.venues.contains(&venue))
         {
             self.config.venue = None;
-            log::warn!("the volume heat map's venue is not loaded; the pane picks a loaded one");
+            log::warn!(
+                "the volume heat map's venue is not one this map can read; the pane picks a readable one"
+            );
             self.config_change.publish(cx);
         }
         let venue = match self.config.venue {
@@ -511,10 +532,10 @@ impl VolumeHeatMapWidget {
     /// Runs the load a venue commit may have unblocked.
     ///
     /// The pane compares the market it is reading — the venue and the scopes of it
-    /// that answer with tickers — with the one that is loaded now: a commit that
-    /// leaves both as they are is a publication behind a market the pane already has,
-    /// so it only re-checks its precondition and never starts over what the user is
-    /// watching. That is this pane's answer even when the commit is a refresh of its own market,
+    /// that answer the route-level bulk ticker read — with the one that is loaded now: a
+    /// commit that leaves both as they are is a publication behind a market the pane
+    /// already has, so it only re-checks its precondition and never starts over what the
+    /// user is watching. That is this pane's answer even when the commit is a refresh of its own market,
     /// which is the one place it differs from the panes whose streams resolve a listing when they
     /// are opened: every fetch here reads the catalogue generation in memory at the moment it is
     /// taken ([`crate::service::stream::VolumeHeatMapSource`]), so the map that follows such a
@@ -542,8 +563,8 @@ impl VolumeHeatMapWidget {
             self.wait_for_market(cx);
             return;
         }
-        // The picker offers the markets that are loaded, and a commit is the only
-        // thing that can change which those are: the list is refreshed before
+        // The picker offers the markets that are loaded and readable, and a commit is
+        // the only thing that can change which those are: the list is refreshed before
         // anything is compared, so a venue loaded behind the market on screen joins
         // the picker without the map being disturbed.
         self.venues = venues;
@@ -612,9 +633,9 @@ impl VolumeHeatMapWidget {
     /// market to read reports it. The sentence is the framework's to resolve, in the
     /// language showing on the frame that draws it.
     ///
-    /// The pane waits for every venue that answers with tickers and lists every one of
-    /// them: it reads the whole market, so the venues it can read at all and the venues
-    /// it waits for are the same answer.
+    /// The pane waits for every venue that answers the route-level bulk ticker read and
+    /// lists every one of them: it reads the whole market, so the venues it can read at
+    /// all and the venues it waits for are the same answer.
     fn report_markets_not_loaded(&self, cx: &mut Context<Self>) {
         let venues = market_venues();
         self.status.report(
@@ -847,11 +868,11 @@ impl VolumeHeatMapWidget {
 
     /// The picker that decides which market participant the map is drawn from.
     ///
-    /// It offers the markets that are loaded and nothing else, because a map can only
-    /// be drawn from a market that is in memory. The choice is identified by the
-    /// venue's canonical identity and *labelled* with its name in the language
-    /// showing now, so the same choice survives a language switch instead of being
-    /// looked up by a translated string.
+    /// It offers the loaded markets this map can read and nothing else, because a map
+    /// can only be drawn from a market that is in memory *and* answers the whole-scope
+    /// ticker read. The choice is identified by the venue's canonical identity and
+    /// *labelled* with its name in the language showing now, so the same choice survives
+    /// a language switch instead of being looked up by a translated string.
     fn venue_select(&self, cx: &Context<Self>) -> AnyElement {
         let selected = self.config.venue;
         let label = selected.map_or_else(
@@ -1034,7 +1055,7 @@ mod tests {
     use gpui_kit::{App, Entity, TestAppContext};
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::{catalog::test_support, market::error::MarketError};
-    use market_participants_model::{decimal::Quantity, routing::CapabilityId};
+    use market_participants_model::decimal::Quantity;
     use smol_str::SmolStr;
     use widget::protocol::RequestId;
     use widget_tokio_runtime::global;
@@ -1096,7 +1117,7 @@ mod tests {
     }
 
     /// Installs the market participants root and the directory a pane reads, with every venue
-    /// that answers with tickers loaded or not.
+    /// that answers the route-level bulk ticker read loaded or not.
     ///
     /// A loaded market is one commit of every one of its scopes, catalogs and metadata
     /// routes, so the fixture publishes an (empty) catalog for every route the
@@ -1169,7 +1190,8 @@ mod tests {
             .expect("the shrinking commit lands");
     }
 
-    /// The scopes of one venue that answer with tickers, as the pane reads them.
+    /// The scopes of one venue that answer the route-level bulk ticker read, as the
+    /// pane reads them.
     fn ticker_routes_of(
         cx: &App,
         venue: market_participants_model::identifier::VenueId,
@@ -1348,9 +1370,9 @@ mod tests {
         });
     }
 
-    /// A scope that answers with tickers but publishes no catalog is not a scope this map can
-    /// be drawn from: a ticker has no listing to be resolved against, so it is not read —
-    /// while a scope beside it that publishes one is.
+    /// A scope that answers the whole-scope ticker read but publishes no catalog is not a
+    /// scope this map can be drawn from: a ticker has no listing to be resolved against,
+    /// so it is not read — while a scope beside it that publishes one is.
     #[gpui_kit::test]
     fn a_route_that_publishes_no_catalog_should_not_be_read(cx: &mut TestAppContext) {
         let pane = pane_over(cx, false);
@@ -1364,8 +1386,8 @@ mod tests {
                         venue,
                         vec![
                             // The scope beside it: it publishes a catalog, so it is read.
-                            scope_entry("usd-m-perp", &[CapabilityId::Tickers], true),
-                            scope_entry("spot", &[CapabilityId::Tickers], false),
+                            scope_entry("usd-m-perp", &[CapabilityId::AllTickers], true),
+                            scope_entry("spot", &[CapabilityId::AllTickers], false),
                         ],
                     )],
                     &[],
@@ -1379,17 +1401,19 @@ mod tests {
             assert_eq!(
                 routes.as_ref(),
                 [test_support::route("binance", "usd-m-perp")],
-                "a scope that answers with tickers but publishes no catalog has no listing to \
-                 be resolved against"
+                "a scope that answers the whole-scope ticker read but publishes no catalog has \
+                 no listing to be resolved against"
             );
         });
     }
 
-    /// A loaded scope that does not carry tickers is not a scope this map reads, however
-    /// loaded and however catalogued it is: the scopes are the ones that answer with a
-    /// ticker, and one that does not is not a column of the map.
+    /// A loaded scope that serves a ticker one listing at a time is not a scope this map
+    /// reads, however loaded and however catalogued it is: a heat map is folded from the
+    /// whole-scope read, and a scope that does not answer it is not a column of the map.
     #[gpui_kit::test]
-    fn a_route_that_does_not_answer_tickers_should_not_be_read(cx: &mut TestAppContext) {
+    fn a_route_that_does_not_answer_the_whole_scope_ticker_read_should_not_be_read(
+        cx: &mut TestAppContext,
+    ) {
         let pane = pane_over(cx, false);
         let venue = market_participants_model::identifier::VenueId::Binance;
 
@@ -1400,9 +1424,9 @@ mod tests {
                     &[(
                         venue,
                         vec![
-                            // The scope beside it: it answers with tickers, so it is read.
-                            scope_entry("usd-m-perp", &[CapabilityId::Tickers], true),
-                            scope_entry("spot", &[CapabilityId::Candlesticks], true),
+                            // The scope beside it: it answers the whole-scope read, so it is read.
+                            scope_entry("usd-m-perp", &[CapabilityId::AllTickers], true),
+                            scope_entry("spot", &[CapabilityId::Tickers], true),
                         ],
                     )],
                     &[],
@@ -1416,12 +1440,79 @@ mod tests {
             assert_eq!(
                 routes.as_ref(),
                 [test_support::route("binance", "usd-m-perp")],
-                "a loaded scope that carries no tickers is not a market this map is drawn from"
+                "a loaded scope that serves only the listing-scoped ticker read is not a market \
+                 this map is drawn from"
             );
             assert!(
                 !routes.iter().any(|route| route.scope.as_str() == "spot"),
-                "the scope that does not answer with tickers is excluded, not merely outpaced: \
-                 {routes:?}"
+                "the scope that does not answer the whole-scope read is excluded, not merely \
+                 outpaced: {routes:?}"
+            );
+        });
+    }
+
+    /// A market participant can be loaded and still not be a market this map reads: the
+    /// map is folded from the route-level read of every ticker of a scope, and a venue
+    /// that answers tickers one listing at a time publishes nothing of that shape.
+    /// Longbridge is that venue today, so the picker must not offer it however loaded it
+    /// is.
+    #[gpui_kit::test]
+    fn a_loaded_venue_without_the_whole_scope_ticker_read_should_not_be_offered(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = pane_with(cx);
+
+        cx.update(|cx| {
+            let longbridge = VenueId::Longbridge;
+            assert!(
+                cx.global::<market_participants_connector::connector::MarketParticipantsConnector>(
+                )
+                .venues()
+                .loaded(&longbridge)
+                .is_some(),
+                "the fixture loaded Longbridge, so only the read it serves can exclude it"
+            );
+            assert!(
+                !pane.read(cx).venues.contains(&longbridge),
+                "a venue that answers tickers a listing at a time is not a market this map \
+                 reads: {:?}",
+                pane.read(cx).venues
+            );
+            assert!(
+                pane.read(cx).routes_of(cx, longbridge).is_empty(),
+                "and it contributes no scope to the map"
+            );
+            assert_eq!(
+                pane.read(cx).venues,
+                [binance(), okx(), VenueId::Hyperliquid],
+                "the picker offers the loaded venues that do answer the whole-scope read"
+            );
+        });
+    }
+
+    /// A stored choice of such a venue is a choice that no longer holds: it is reset and
+    /// the pane reads a market it can draw, so a user who had Longbridge selected before
+    /// the map stopped reading it is not left on a map that cannot be produced.
+    #[gpui_kit::test]
+    fn a_stored_venue_without_the_whole_scope_ticker_read_should_be_reset(cx: &mut TestAppContext) {
+        let pane = pane_over_config(
+            cx,
+            FakeSource::pending(),
+            true,
+            VolumeHeatMapConfig {
+                venue: Some(VenueId::Longbridge),
+            },
+        );
+
+        cx.update(|cx| {
+            assert_eq!(
+                pane.read(cx).config.venue,
+                Some(binance()),
+                "the market that is readable is the one the pane falls back to"
+            );
+            assert_eq!(
+                pane.read(cx).reading.as_ref().map(|reading| reading.venue),
+                Some(binance())
             );
         });
     }
@@ -1482,7 +1573,11 @@ mod tests {
             let sentence = notice.resolve(cx);
             assert!(
                 sentence.contains("Binance") && sentence.contains("OKX"),
-                "the notice names the markets that answer with tickers: {sentence}"
+                "the notice names the markets that answer the whole-scope ticker read: {sentence}"
+            );
+            assert!(
+                !sentence.contains("Longbridge"),
+                "and not the one that answers a ticker only one listing at a time: {sentence}"
             );
             assert!(
                 sentence.contains("top left corner") && sentence.contains("Markets"),
@@ -1539,7 +1634,11 @@ mod tests {
             let sentence = notice.resolve(cx);
             assert!(
                 sentence.contains("Binance") && sentence.contains("OKX"),
-                "the notice names the markets that answer with tickers: {sentence}"
+                "the notice names the markets that answer the whole-scope ticker read: {sentence}"
+            );
+            assert!(
+                !sentence.contains("Longbridge"),
+                "and not the one that answers a ticker only one listing at a time: {sentence}"
             );
 
             (notice, sentence.to_string())

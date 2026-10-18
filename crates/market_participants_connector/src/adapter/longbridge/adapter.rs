@@ -561,7 +561,8 @@ mod tests {
     /// read, which the venue has no command for: it is refused before anything is read,
     /// and no connection is dialled for it. A listing-scoped ticker request is not
     /// refused any more — it is what `tickers` answers — so what is left here is the
-    /// route-level shape, whose capability gate the gateway applies itself.
+    /// route-level shape, which the route does not declare as a capability and which
+    /// the gateway therefore refuses before it reaches any adapter.
     #[tokio::test]
     async fn the_route_level_bulk_ticker_read_is_refused_without_a_connection() {
         let fixture = LongbridgeFixture::install(
@@ -571,7 +572,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+        let context = execution(&fixture, credentials(), CapabilityId::AllTickers);
 
         let error = adapter
             .execute(
@@ -587,7 +588,7 @@ mod tests {
             error,
             MarketParticipantError::UnsupportedCapability {
                 route: route(),
-                capability: CapabilityId::Tickers,
+                capability: CapabilityId::AllTickers,
             }
         );
         assert!(fixture.token_header_blocks().is_empty());

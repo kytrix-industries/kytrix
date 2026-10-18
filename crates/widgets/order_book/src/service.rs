@@ -231,11 +231,14 @@ impl OrderBookSource for MarketCapability {
         // rounded or labelled in the listing's own units is not this listing's
         // book.
         let resolved = self.resolve_listing(&listing)?;
-        let metadata = OrderBookMetadata::of(&resolved.rules);
-        // The depth is a request: the provider narrows it to what the route's
-        // venue publishes, and the copy this service keeps is bounded by what the
-        // model can hold.
-        let depth = depth.clamp(1, SNAPSHOT_DEPTH);
+        // The venue's own bound is read with the rules: it caps the depth the
+        // connector asks for, and it is what the pane offers its row limits from.
+        let venue_depth = self.order_book_depth(&listing.route)?;
+        let metadata = OrderBookMetadata::of(&resolved.rules, venue_depth);
+        // The requested depth is narrowed to what the venue publishes, so the copy
+        // this service keeps is the one the book actually has rather than the one
+        // the snapshot cap would allow.
+        let depth = depth.clamp(1, SNAPSHOT_DEPTH).min(venue_depth);
         let inner = self
             .market(listing.route.clone())
             .order_book(listing.clone())
@@ -1094,6 +1097,7 @@ mod tests {
                     "binance", "BTC",
                 ),
             },
+            depth: 5_000,
         }
     }
 
@@ -1277,6 +1281,29 @@ mod tests {
         assert_eq!(applied, Applied::Changed);
         assert_eq!(current.sequence, MarketSequence::Numeric(12));
         assert_eq!(current.bids.len(), 2);
+    }
+
+    /// A venue removes a price level by publishing it with quantity zero, so the
+    /// book drops the level instead of holding a row nothing is behind.
+    #[test]
+    fn a_zero_quantity_update_should_remove_the_price_level() {
+        let mut current = book(10, 2);
+        let applied = apply_order_book_update(
+            &mut current,
+            delta(11, 11, Some(10), vec![level(100, 0)], Vec::new()),
+            20,
+        )
+        .expect("a removal is not a failure");
+
+        assert_eq!(applied, Applied::Changed);
+        assert_eq!(
+            current
+                .bids
+                .iter()
+                .map(|level| level.price.value)
+                .collect::<Vec<_>>(),
+            [Price::from(99_u64)]
+        );
     }
 
     /// The futures stream names the update it follows and its ranges begin well

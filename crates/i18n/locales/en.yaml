@@ -810,6 +810,10 @@ window:
     split_keep_right: Split then keep on the right
     split_keep_top: Split then keep on the top
     widget_menu: Widget
+  tabs:
+    market: Market
+    portfolio: Portfolio
+    quant: Quant
   updater:
     available: Update available
     available_tooltip: Version %{version} is available

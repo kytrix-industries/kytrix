@@ -8,7 +8,11 @@ use base_ui::{
     size::UnifiedSizable,
     style::theme::ThemeExt,
 };
-use gpui_kit::{base::Selectable, prelude::FluentBuilder, *};
+use gpui_kit::{
+    base::{Disableable, Selectable},
+    prelude::FluentBuilder,
+    *,
+};
 use i18n::t;
 use profile_ui::profile::ProfileMenu;
 use settings_ui::appearance;
@@ -137,7 +141,7 @@ impl Render for RootWindow {
             .button(
                 Button::new("Market")
                     .medium()
-                    .child("Market")
+                    .child(t!(cx, "window.tabs.market"))
                     .outline()
                     .occlude()
                     .selected(self.selected_tab_index == 0)
@@ -149,26 +153,20 @@ impl Render for RootWindow {
             .button(
                 Button::new("Portfolio")
                     .medium()
-                    .child("Portfolio")
+                    .child(t!(cx, "window.tabs.portfolio"))
                     .outline()
                     .occlude()
                     .selected(self.selected_tab_index == 1)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.selected_tab_index = 1;
-                        cx.notify();
-                    })),
+                    .disabled(true),
             )
             .button(
                 Button::new("Quant")
                     .medium()
-                    .child("Quant")
+                    .child(t!(cx, "window.tabs.quant"))
                     .outline()
                     .occlude()
                     .selected(self.selected_tab_index == 2)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.selected_tab_index = 2;
-                        cx.notify();
-                    })),
+                    .disabled(true),
             );
 
         // The update button comes before the profile: the header reads from the outside

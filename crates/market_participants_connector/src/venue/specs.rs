@@ -188,6 +188,7 @@ const BINANCE_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             authenticated(CapabilityId::AuthenticatedTrading),
             authenticated(CapabilityId::AccountOrders),
@@ -204,6 +205,7 @@ const BINANCE_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             public(CapabilityId::ForceOrders),
             public(CapabilityId::OpenInterest),
@@ -231,6 +233,7 @@ const OKX_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             authenticated(CapabilityId::AuthenticatedTrading),
             authenticated(CapabilityId::AccountOrders),
@@ -247,6 +250,7 @@ const OKX_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             public(CapabilityId::ForceOrders),
             public(CapabilityId::OpenInterest),
@@ -274,6 +278,7 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             public(CapabilityId::WalletMonitor),
             authenticated(CapabilityId::AuthenticatedTrading),
@@ -290,6 +295,7 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
             public(CapabilityId::Candlesticks),
             public(CapabilityId::MarketTrades),
             public(CapabilityId::Tickers),
+            public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
             public(CapabilityId::WalletMonitor),
             authenticated(CapabilityId::AuthenticatedTrading),
@@ -310,6 +316,10 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
 /// behind the account's credentials. Candlesticks and tickers are authenticated: the venue
 /// serves history, streams and real-time quotes on one authenticated session, so a request
 /// for any of them is honest about needing the venue's credential.
+///
+/// [`CapabilityId::AllTickers`] is deliberately absent: the venue answers a ticker one
+/// listing at a time and has no command for the whole-scope read, so a caller that needs
+/// every listing's ticker in one answer cannot be served by this route.
 const LONGBRIDGE_ROUTES: &[RouteSpec] = &[RouteSpec {
     scope: LONGBRIDGE_US_SCOPE,
     capabilities: &[

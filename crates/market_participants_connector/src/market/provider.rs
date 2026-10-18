@@ -148,6 +148,16 @@ impl MarketCapability {
             .map(|limits| limits.adjustments)
     }
 
+    /// The deepest book one route publishes per side.
+    ///
+    /// The depth is the venue's own bound for the route: a book deeper than this is
+    /// not something the venue hands over, and a caller that draws the book uses it
+    /// to offer only the rows the book can fill.
+    pub fn order_book_depth(&self, route: &VenueRoute) -> Result<u16, MarketError> {
+        self.limits(route, CapabilityId::OrderBook)
+            .map(|limits| limits.order_book_depth_limit)
+    }
+
     pub fn market(&self, route: VenueRoute) -> MarketSelector {
         MarketSelector::new(self.clone(), route)
     }

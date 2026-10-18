@@ -384,6 +384,7 @@ const BINANCE_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::Candlesticks,
     CapabilityId::MarketTrades,
     CapabilityId::Tickers,
+    CapabilityId::AllTickers,
     CapabilityId::OrderBook,
     CapabilityId::ForceOrders,
     CapabilityId::OpenInterest,
@@ -405,6 +406,7 @@ const OKX_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::Candlesticks,
     CapabilityId::MarketTrades,
     CapabilityId::Tickers,
+    CapabilityId::AllTickers,
     CapabilityId::OrderBook,
     CapabilityId::ForceOrders,
     CapabilityId::OpenInterest,
@@ -429,6 +431,7 @@ const HYPERLIQUID_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::Candlesticks,
     CapabilityId::MarketTrades,
     CapabilityId::Tickers,
+    CapabilityId::AllTickers,
     CapabilityId::OrderBook,
     CapabilityId::WalletMonitor,
     CapabilityId::AuthenticatedTrading,
@@ -443,7 +446,8 @@ const HYPERLIQUID_CAPABILITIES: &[CapabilityId] = &[
 /// The venue publishes a symbol directory and, over one authenticated session, the
 /// candles and the real-time quotes of the markets in it — and nothing else this build
 /// serves: its order book, its trades and every account read belong to surfaces this
-/// build does not declare for it.
+/// build does not declare for it, and its quotes answer one listing at a time rather
+/// than every listing of a scope in one read.
 const LONGBRIDGE_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::MarketCatalog,
     CapabilityId::Candlesticks,

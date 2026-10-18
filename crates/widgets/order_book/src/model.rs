@@ -43,9 +43,39 @@ use smol_str::format_smolstr;
 pub(super) const PRICE_MULTIPLIERS: [u32; 5] = [1, 10, 100, 1_000, 10_000];
 /// The visible rows one side may be limited to, in the order they are offered.
 pub(super) const WINDOW_SIZES: [usize; 3] = [25, 50, 100];
+/// The visible rows a venue that publishes a shallow book is offered.
+pub(super) const SHALLOW_WINDOW_SIZES: [usize; 3] = [5, 10, 20];
 /// The most levels one side keeps. The far end of a book is never drawn, so a
 /// venue that publishes deeper than this is truncated where nothing is read.
 pub(super) const MAX_LEVELS_PER_SIDE: usize = 5_000;
+
+/// The row limits one side of a book `depth` levels deep is offered.
+///
+/// A venue that publishes at most twenty levels per side cannot fill a standard
+/// window at all, so its book offers the shallow ladder instead: a window larger
+/// than the book would only draw the rows that exist under a label that claims
+/// more. A route whose depth the venue has not answered yet keeps the standard
+/// ladder, which is what a book deeper than every window looks like.
+pub(super) fn window_sizes(depth: Option<u16>) -> &'static [usize] {
+    match depth {
+        Some(depth) if usize::from(depth) < WINDOW_SIZES[0] => &SHALLOW_WINDOW_SIZES,
+        _ => &WINDOW_SIZES,
+    }
+}
+
+/// The row limit a book of that depth starts with.
+///
+/// The standard default is kept wherever the route can fill it; a shallow route
+/// starts with the deepest window it offers, which is the one closest to the
+/// default without naming rows the book does not have.
+pub(super) fn default_window_size(depth: Option<u16>) -> usize {
+    let sizes = window_sizes(depth);
+    if sizes.contains(&WINDOW_SIZES[0]) {
+        WINDOW_SIZES[0]
+    } else {
+        sizes.last().copied().unwrap_or(WINDOW_SIZES[0])
+    }
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -63,11 +93,14 @@ where
     SharedString::new(format().as_ref())
 }
 
-/// The increments and the units every label of one book is written in.
+/// The increments and the units every label of one book is written in, and how
+/// deep the venue publishes it.
 ///
-/// They come from the listing's own rule set, which the service reads before it
-/// opens a stream, and they are carried on the snapshot because a book cannot be
-/// rounded or labelled without them.
+/// The increments and the units come from the listing's own rule set, which the
+/// service reads before it opens a stream, and they are carried on the snapshot
+/// because a book cannot be rounded or labelled without them. The depth is the
+/// venue's own bound for the route, read at the same time: it is what decides
+/// which row limits the book can fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OrderBookMetadata {
     /// The increments every price and quantity of the book is written at.
@@ -76,20 +109,24 @@ pub(super) struct OrderBookMetadata {
     pub quote_asset: AssetId,
     /// What every quantity of the listing counts.
     pub quantity_unit: QuantityUnit,
+    /// The deepest book the venue publishes per side.
+    pub depth: u16,
 }
 
 impl OrderBookMetadata {
-    /// Reads the increments and units a listing publishes its book in.
+    /// Reads the increments and the units of one book, with the depth its venue
+    /// publishes it at.
     ///
     /// A price tick is non-zero by its own type, and a quantity step the rule set
     /// states as zero leaves the book rounding quantities to whole units rather
     /// than refusing to draw it.
-    pub(super) fn of(rules: &TradingRules) -> Self {
+    pub(super) fn of(rules: &TradingRules, depth: u16) -> Self {
         let price = &rules.common.price;
         Self {
             precision: ListingPrecision::of(rules),
             quote_asset: price.quote_asset.clone(),
             quantity_unit: rules.common.quantity.unit.clone(),
+            depth,
         }
     }
 }
@@ -663,6 +700,7 @@ mod tests {
             quantity_unit: QuantityUnit::AssetUnits {
                 asset: asset("USD"),
             },
+            depth: 5_000,
         }
     }
 
@@ -771,6 +809,7 @@ mod tests {
                 quote.clone(),
                 base.clone(),
             ),
+            5_000,
         );
 
         assert_eq!(
@@ -779,12 +818,14 @@ mod tests {
                 metadata.precision.quantity_tick,
                 metadata.quote_asset,
                 metadata.quantity_unit,
+                metadata.depth,
             ),
             (
                 tick("1"),
                 tick("1"),
                 quote,
                 QuantityUnit::AssetUnits { asset: base },
+                5_000,
             )
         );
     }
@@ -795,9 +836,28 @@ mod tests {
             market_participants_connector::catalog::test_support::rules(asset("USD"), asset("EUR"));
         rules.common.quantity.step = Quantity::ZERO;
 
-        let metadata = OrderBookMetadata::of(&rules);
+        let metadata = OrderBookMetadata::of(&rules, 5_000);
 
         assert_eq!(metadata.precision.quantity_tick, tick("1"));
+    }
+
+    #[test]
+    fn a_shallow_route_should_offer_the_row_limits_its_book_can_fill() {
+        assert_eq!(window_sizes(Some(20)), &SHALLOW_WINDOW_SIZES[..]);
+        assert_eq!(default_window_size(Some(20)), SHALLOW_WINDOW_SIZES[2]);
+    }
+
+    #[test]
+    fn a_deep_route_should_offer_the_standard_row_limits() {
+        assert_eq!(window_sizes(Some(5_000)), &WINDOW_SIZES[..]);
+        assert_eq!(default_window_size(Some(5_000)), WINDOW_SIZES[0]);
+        assert_eq!(default_window_size(Some(25)), WINDOW_SIZES[0]);
+    }
+
+    #[test]
+    fn a_route_whose_depth_is_not_known_should_keep_the_standard_row_limits() {
+        assert_eq!(window_sizes(None), &WINDOW_SIZES[..]);
+        assert_eq!(default_window_size(None), WINDOW_SIZES[0]);
     }
 
     #[test]

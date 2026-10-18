@@ -15,7 +15,6 @@ use market_participants_model::{
     market::units::{PositionSide, Side},
 };
 
-use super::query::invalid_field;
 use crate::account::shared::{
     AccountTradeId, HistoricalPositionStatus, LiquidityRole, MarginMode, OrderId, OrderKind,
     OrderStatus, PositionDirection, PositionId,
@@ -111,22 +110,12 @@ pub struct NativeHistoricalPosition {
 }
 
 /// One native order-book level, before any unit is attached.
+///
+/// A level is what the venue printed: the diff stream publishes one with a zero
+/// quantity to remove the price level, so the value is not validated here. Which
+/// levels a book may hold is the model's rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeOrderBookLevel {
     pub price: Price,
     pub quantity: Quantity,
-}
-
-/// Validates that a native order-book level was published.
-pub fn require_order_book_level(
-    price: Price,
-    quantity: Quantity,
-) -> Result<NativeOrderBookLevel, market_participants_model::error::ModelError> {
-    if price.is_zero() {
-        return Err(invalid_field("order_book.price", "zero"));
-    }
-    if quantity.is_zero() {
-        return Err(invalid_field("order_book.quantity", "zero"));
-    }
-    Ok(NativeOrderBookLevel { price, quantity })
 }

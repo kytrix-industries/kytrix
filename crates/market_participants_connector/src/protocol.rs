@@ -243,7 +243,10 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
         Request::FetchTicker(query) | Request::SubscribeTicker(query) => {
             listing_request(Capability::Tickers, &query.listing, None)
         }
-        Request::FetchAllTickers(query) => route_request(Capability::Tickers, query.route()),
+        // The whole-scope read is its own capability: a venue may answer a ticker one
+        // listing at a time without answering every listing in one request, and the
+        // gateway's admission must refuse that shape on such a route.
+        Request::FetchAllTickers(query) => route_request(Capability::AllTickers, query.route()),
         Request::FetchOrderBook(query) | Request::SubscribeOrderBook(query) => {
             listing_request(Capability::OrderBook, &query.listing, None)
         }
