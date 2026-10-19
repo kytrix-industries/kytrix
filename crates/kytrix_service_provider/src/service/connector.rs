@@ -465,6 +465,12 @@ impl KytrixServiceConnector {
     ///
     /// This is the owner's single install point: it creates the auth session (D1),
     /// the bridge, and the notification's reconfigure consumer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ConfigManager` was not installed, because the bridge the connector
+    /// routes with reads that manager's events. The composition root installs the
+    /// manager before it calls this; see [`ConfigEventBridge::install`].
     pub fn install(
         cx: &mut App,
         runtime: &Runtime,

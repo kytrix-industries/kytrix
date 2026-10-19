@@ -328,6 +328,12 @@ impl Updater {
         &self.state
     }
 
+    /// The network configuration this updater routes its requests with.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &ConfigNotification<Config> {
+        &self.config
+    }
+
     /// Asks the metadata endpoint whether a newer release exists.
     fn check_now(&mut self, cx: &mut Context<Self>) {
         if !self.state.begin_check() {

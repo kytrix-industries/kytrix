@@ -132,6 +132,9 @@ pub(super) async fn run_service_supervisor(
                         let _ = respond_to.send(result);
                     }
                     SupervisorCommand::Reconfigure => {
+                        // Best effort: a send that times out is logged and dropped, so a
+                        // saturated session keeps the routing it had until the next
+                        // command or configuration publication reaches it.
                         for (key, entry) in &sessions {
                             if timeout(
                                 OPERATION_TIMEOUT,

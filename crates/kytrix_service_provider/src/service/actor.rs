@@ -873,12 +873,21 @@ impl ServiceSessionActor {
             })
     }
 
+    /// Whether the fence still names a route the latest published configuration
+    /// resolves.
+    ///
+    /// The fence compares against the latest *published* owner projection, not
+    /// against the settings a write already holds: `ConfigEventBridge` publishes
+    /// during the GPUI effect flush, so a configuration write made inside the
+    /// current `App::update` becomes visible to this fence at the end of that
+    /// update, not synchronously.
+    ///
+    /// The fence must consult the current configuration, not only the subscriber
+    /// map: `Command::Reconfigure` is what retires a route that a publication
+    /// changed, and it cannot run while the actor is parked inside `wait_for_ack`
+    /// or `await_control_with_routes`. Checking the route here is what turns that
+    /// queued retire into a result the waiting operation can observe.
     pub(super) fn subscription_route_is_current(&self, fence: &SubscriptionRouteFence) -> bool {
-        // The fence must consult the current configuration, not only the subscriber
-        // map: `Command::Reconfigure` is what retires a route that a publication
-        // changed, and it cannot run while the actor is parked inside `wait_for_ack`
-        // or `await_control_with_routes`. Checking the route here is what turns that
-        // queued retire into a result the waiting operation can observe.
         self.capability_route_is_current(fence.capability, fence.route_generation)
             && self
                 .subscribers

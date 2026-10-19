@@ -68,3 +68,82 @@ struct UpdaterGlobal {
 }
 
 impl Global for UpdaterGlobal {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use app_config::{
+        network::{ProxyAuthorizationConfig, ProxyConfig},
+        settings::{Config, Language},
+    };
+    use app_config_provider::manager::ConfigManager;
+    use gpui_kit::{BorrowAppContext as _, TestAppContext};
+    use network::transport::hub::{TransportHub, TransportPolicy};
+    use smol_str::SmolStr;
+    use widget_tokio_runtime::runtime::Runtime;
+
+    use super::{UpdaterDeps, entity, install};
+
+    #[gpui_kit::test]
+    fn install_should_connect_the_updater_to_the_network_projection_of_the_settings(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
+            install(
+                cx,
+                UpdaterDeps {
+                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
+                    runtime: Runtime::for_test(),
+                },
+            );
+        });
+
+        let updater = cx.update(|cx| entity(cx).expect("install puts the updater in a global"));
+        let initial = cx.update(|cx| updater.read(cx).config_for_test().current());
+        assert_eq!(
+            initial.as_ref(),
+            &cx.update(|cx| cx.global::<ConfigManager>().read().network_config()),
+            "the updater starts from the network projection the manager holds"
+        );
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.proxies.insert(
+                            SmolStr::new_static("install-bridge"),
+                            ProxyConfig {
+                                addr: SmolStr::new_static("127.0.0.1"),
+                                port: 9,
+                                authorization: ProxyAuthorizationConfig::None,
+                                resolve_dns_at_remote: false,
+                            },
+                        );
+                    },
+                    cx,
+                );
+            });
+        });
+        let after_network_write = cx.update(|cx| updater.read(cx).config_for_test().current());
+        assert!(
+            after_network_write
+                .proxies
+                .contains_key(&SmolStr::new_static("install-bridge")),
+            "a network write should reach the projection the updater routes with"
+        );
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| config.language = Language::En, cx);
+            });
+        });
+        let after_language_write = cx.update(|cx| updater.read(cx).config_for_test().current());
+        assert!(
+            Arc::ptr_eq(&after_network_write, &after_language_write),
+            "a write outside the network domain must not publish a network projection"
+        );
+    }
+}

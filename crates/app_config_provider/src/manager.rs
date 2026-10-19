@@ -60,9 +60,10 @@ impl ConfigManager {
 
     /// Stores a submitted snapshot and only then publishes it.
     ///
-    /// An unchanged snapshot is neither stored nor published. The emitter is
-    /// part of this manager, so a write that returns `Ok` has published exactly
-    /// one change set (possibly empty only for workspaces).
+    /// An unchanged snapshot is neither stored nor published: that write returns
+    /// `Ok(())` and emits nothing. The emitter is part of this manager, so a write
+    /// that stores a changed snapshot has published exactly one change set
+    /// (possibly empty only for workspaces).
     ///
     /// This takes `&mut App` so a caller cannot reach it through
     /// `cx.global_mut::<ConfigManager>()`: the borrow that yields the manager

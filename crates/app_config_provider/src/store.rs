@@ -270,8 +270,9 @@ impl ConfigStore {
 
         let mut candidate = config;
         self.network_generations.stamp(&mut candidate);
-        // The new snapshot is the receiver and the stored snapshot is `previous`;
-        // the plan §2.5 snippet reverses these arguments (§2.2 defines the signature).
+        // The new snapshot is the receiver and the stored snapshot is `previous`:
+        // `Config::changes_since(&self /* the new snapshot */, previous)`, as the
+        // signature in `settings.rs` defines it.
         let changes = candidate.changes_since(self.config.as_ref());
         self.persist(&candidate)?;
         self.config = Arc::new(candidate);
@@ -300,8 +301,9 @@ impl ConfigStore {
         }
 
         self.network_generations.stamp(&mut candidate);
-        // The new snapshot is the receiver and the stored snapshot is `previous`;
-        // the plan §2.5 snippet reverses these arguments (§2.2 defines the signature).
+        // The new snapshot is the receiver and the stored snapshot is `previous`:
+        // `Config::changes_since(&self /* the new snapshot */, previous)`, as the
+        // signature in `settings.rs` defines it.
         let changes = candidate.changes_since(self.config.as_ref());
         self.config = Arc::new(candidate);
         self.persist_current();
