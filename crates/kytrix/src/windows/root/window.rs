@@ -1,4 +1,4 @@
-use app_config_provider::manager::{ConfigManager, ConfigRecovery};
+use app_config_provider::{manager::ConfigManager, store::ConfigRecovery};
 use base_ui::{
     button::Button,
     interactive::InteractiveVariantExt,
@@ -247,7 +247,7 @@ impl Render for RootWindow {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use app_config_provider::manager::ConfigLoadError;
+    use app_config_provider::store::ConfigLoadError;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer, style};
     use gpui_kit::{
         AppContext, Context, IntoElement, Modifiers, Render, Styled, TestAppContext,

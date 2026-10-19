@@ -5,7 +5,10 @@ mod windows;
 use std::sync::Arc;
 
 use app_config::settings::Language;
-use app_config_provider::manager::{self as config_manager, ConfigManager, ConfigRecovery};
+use app_config_provider::{
+    manager::{self as config_manager, ConfigManager},
+    store::ConfigRecovery,
+};
 use i18n::language::codes::LanguageCode;
 use kytrix_service_provider::{
     auth::{model::AuthError, session::AuthSession},

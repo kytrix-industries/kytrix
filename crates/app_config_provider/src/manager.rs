@@ -1,1623 +1,745 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
-use app_config::{
-    network::{
-        Config as NetworkConfig, KytrixServiceCapability, NamedProxyError, NetworkRouteGeneration,
-        NetworkRuntimeGenerations, ProxyRoute, ResolvedProxy, ServiceTarget,
+use app_config::{change::ConfigChangeSet, settings::Config};
+use gpui_kit::{App, AppContext as _, Entity, Global};
+
+use crate::{
+    events::{
+        AccountChanged, AppearanceChanged, ConfigEvents, DataTimeZoneChanged, DefaultRouteChanged,
+        LanguageChanged, ProxyCatalogChanged, ServiceRouteChanged, VenueChanged,
     },
-    settings::Config,
+    store::{ConfigLoadError, ConfigPersistenceError, ConfigRecovery, ConfigStore},
 };
-use gpui_kit::{App, Global};
-use market_participants_model::identifier::VenueId;
-use tempfile::NamedTempFile;
-use thiserror::Error;
-use tokio::sync::watch;
 
-const CONFIG_DIRECTORY_NAME: &str = "kytrix";
-const CONFIG_FILE_NAME: &str = "config.json";
-/// How many `-N` suffixes a backup name tries before giving up.
-const MAX_BACKUP_ATTEMPTS: u32 = 1_000;
-
-pub(super) fn config_file_path(config_directory: &Path) -> PathBuf {
-    config_directory
-        .join(CONFIG_DIRECTORY_NAME)
-        .join(CONFIG_FILE_NAME)
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum ProxyFingerprint {
-    Direct,
-    System,
-    Named(Result<ResolvedProxy, NamedProxyError>),
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct EffectiveRouteFingerprint {
-    proxy: ProxyFingerprint,
-}
-
-struct NetworkGenerationTracker {
-    next_route_generation: u64,
-    default_route: Option<(ProxyFingerprint, NetworkRouteGeneration)>,
-    venues: BTreeMap<VenueId, (EffectiveRouteFingerprint, NetworkRouteGeneration)>,
-    services: BTreeMap<ServiceTarget, (EffectiveRouteFingerprint, NetworkRouteGeneration)>,
-}
-
-impl NetworkGenerationTracker {
-    fn new() -> Self {
-        Self {
-            next_route_generation: 1,
-            default_route: None,
-            venues: BTreeMap::new(),
-            services: BTreeMap::new(),
-        }
-    }
-
-    fn stamp(&mut self, config: &mut Config) {
-        let mut runtime = NetworkRuntimeGenerations::default();
-        let default_fingerprint = proxy_fingerprint(config, &config.proxy_default);
-        let default_generation = self
-            .default_route
-            .as_ref()
-            .filter(|(previous, _)| previous == &default_fingerprint)
-            .map_or_else(
-                || {
-                    let generation = NetworkRouteGeneration::new(self.next_route_generation);
-                    self.next_route_generation = self.next_route_generation.saturating_add(1);
-                    generation
-                },
-                |(_, generation)| *generation,
-            );
-        self.default_route = Some((default_fingerprint, default_generation));
-        runtime.default_route = default_generation;
-
-        for venue in VenueId::ALL {
-            let fingerprint = effective_route_fingerprint(config, &venue);
-            let generation = self
-                .venues
-                .get(&venue)
-                .filter(|(previous, _)| previous == &fingerprint)
-                .map_or_else(
-                    || {
-                        let generation = NetworkRouteGeneration::new(self.next_route_generation);
-                        self.next_route_generation = self.next_route_generation.saturating_add(1);
-                        generation
-                    },
-                    |(_, generation)| *generation,
-                );
-            self.venues.insert(venue, (fingerprint, generation));
-            runtime.venues.insert(venue, generation);
-        }
-
-        // Kytrix's own services are stamped apart from the venues: they are routed
-        // by their own applications and a venue moving must not invalidate them.
-        for target in all_network_targets(config, self.services.keys().cloned()) {
-            let fingerprint = service_route_fingerprint(config, &target);
-            let generation = self
-                .services
-                .get(&target)
-                .filter(|(previous, _)| previous == &fingerprint)
-                .map_or_else(
-                    || {
-                        let generation = NetworkRouteGeneration::new(self.next_route_generation);
-                        self.next_route_generation = self.next_route_generation.saturating_add(1);
-                        generation
-                    },
-                    |(_, generation)| *generation,
-                );
-            self.services
-                .insert(target.clone(), (fingerprint, generation));
-            runtime.services.insert(target, generation);
-        }
-
-        config.set_network_generations(runtime);
-    }
-}
-
-fn all_network_targets(
-    config: &Config,
-    known_targets: impl IntoIterator<Item = ServiceTarget>,
-) -> BTreeSet<ServiceTarget> {
-    let mut targets = [
-        KytrixServiceCapability::Account,
-        KytrixServiceCapability::Etf,
-        KytrixServiceCapability::News,
-        KytrixServiceCapability::Indices,
-        KytrixServiceCapability::X,
-        KytrixServiceCapability::Wallet,
-        KytrixServiceCapability::XMedia,
-        KytrixServiceCapability::UpdaterMetadata,
-        KytrixServiceCapability::UpdaterDownload,
-    ]
-    .into_iter()
-    .map(|capability| ServiceTarget::KytrixService { capability })
-    .collect::<BTreeSet<_>>();
-    targets.extend(config.proxy_applications.keys().cloned());
-    targets.extend(known_targets);
-    targets
-}
-
-/// Fingerprints the route one venue's requests take.
-///
-/// A venue that names a line of its own carries it; a venue that names none
-/// follows the default, exactly as the network snapshot answers it — so the
-/// default moving rotates every venue that has no line of its own, and no venue
-/// that has one.
-fn effective_route_fingerprint(config: &Config, venue: &VenueId) -> EffectiveRouteFingerprint {
-    let route = config
-        .venue(venue)
-        .and_then(|settings| settings.proxy())
-        .unwrap_or_else(|| config.proxy_default.clone());
-    EffectiveRouteFingerprint {
-        proxy: proxy_fingerprint(config, &route),
-    }
-}
-
-/// Fingerprints the route one Kytrix service takes.
-fn service_route_fingerprint(config: &Config, target: &ServiceTarget) -> EffectiveRouteFingerprint {
-    let route = config
-        .proxy_applications
-        .get(target)
-        .cloned()
-        .unwrap_or_else(|| config.proxy_default.clone());
-    EffectiveRouteFingerprint {
-        proxy: proxy_fingerprint(config, &route),
-    }
-}
-
-/// Fingerprints the effective route itself.
-///
-/// The default route has no target, and two targets that select the same route
-/// must fingerprint alike, so the target never takes part in the fingerprint.
-fn proxy_fingerprint(config: &Config, route: &ProxyRoute) -> ProxyFingerprint {
-    match route {
-        ProxyRoute::Direct => ProxyFingerprint::Direct,
-        ProxyRoute::System => ProxyFingerprint::System,
-        ProxyRoute::Named { name } => {
-            ProxyFingerprint::Named(config.network_config().resolve_named_proxy_entry(name))
-        }
-    }
-}
-
-/// Owns the current immutable settings snapshot and its typed projections.
+/// Owns the current settings snapshot and the entity its changes are emitted from.
 pub struct ConfigManager {
-    config: Arc<Config>,
-    sender: watch::Sender<Arc<Config>>,
-    network_sender: watch::Sender<Arc<NetworkConfig>>,
-    network_generations: NetworkGenerationTracker,
-    path: Option<PathBuf>,
+    store: ConfigStore,
+    events: Entity<ConfigEvents>,
 }
 
 impl Global for ConfigManager {}
 
+/// Loads the stored settings, creates the event entity and installs both.
+///
+/// This stays a module-level function: the composition root already calls
+/// `config_manager::install(cx)`; only the construction helpers are associated.
+pub fn install(cx: &mut App) -> Option<ConfigRecovery> {
+    let (store, recovery) = ConfigStore::load_default();
+    let events = cx.new(|_| ConfigEvents);
+    cx.set_global(ConfigManager { store, events });
+
+    recovery
+}
+
 impl ConfigManager {
-    /// Loads settings from `dirs::config_dir()/kytrix/config.json`, replacing an
-    /// unusable file with defaults.
-    ///
-    /// A missing file starts with [`Config::default`]. A file that cannot be read
-    /// or decoded is moved aside, replaced with [`Config::default`], and reported
-    /// so the user can be told once a window exists to tell them in. Starting up
-    /// is never blocked by a damaged file.
-    pub fn load_default() -> (Self, Option<ConfigRecovery>) {
-        let Some(config_directory) = dirs::config_dir() else {
-            let error = ConfigLoadError::ConfigDirectoryUnavailable;
-            log::error!("failed to load settings config: {error}");
-
-            return (
-                Self::in_memory(Config::default()),
-                Some(ConfigRecovery {
-                    backup: None,
-                    error,
-                }),
-            );
-        };
-
-        Self::load_or_recover(config_file_path(&config_directory))
+    /// Creates an in-memory manager for injected runtimes and tests.
+    pub fn in_memory(config: Config, cx: &mut App) -> Self {
+        Self {
+            store: ConfigStore::in_memory(config),
+            events: cx.new(|_| ConfigEvents),
+        }
     }
 
-    /// Loads settings from an injected path.
-    ///
-    /// A missing file starts with [`Config::default`]. Existing files that cannot
-    /// be read or decoded return an error and are left untouched.
-    pub fn from_path(path: impl Into<PathBuf>) -> Result<Self, ConfigLoadError> {
-        let path = path.into();
-        let config = match load_config(&path) {
-            Ok(Some(config)) => config,
-            Ok(None) => Config::default(),
-            Err(error) => return Err(error),
-        };
-
-        Ok(Self::with_path(config, Some(path)))
+    /// Loads an in-memory manager from an injected path, for tests that need a file.
+    pub fn from_path(path: impl Into<PathBuf>, cx: &mut App) -> Result<Self, ConfigLoadError> {
+        Ok(Self {
+            store: ConfigStore::from_path(path)?,
+            events: cx.new(|_| ConfigEvents),
+        })
     }
 
     /// Returns a cheaply cloned immutable snapshot of the current settings.
     pub fn read(&self) -> Arc<Config> {
-        self.config.clone()
+        self.store.read()
     }
 
-    /// Subscribes to the latest immutable settings snapshot.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
-        self.sender.subscribe()
-    }
-
-    /// Subscribes to the network-only projection of the current settings.
-    pub fn network_subscribe(&self) -> watch::Receiver<Arc<NetworkConfig>> {
-        self.network_sender.subscribe()
+    /// Returns the entity every configuration event is emitted from.
+    pub fn events(&self) -> &Entity<ConfigEvents> {
+        &self.events
     }
 
     /// Stores a submitted snapshot and only then publishes it.
     ///
-    /// Nothing the application is running with changes until the file holds the
-    /// submitted settings, so a submission that cannot be stored is reported to
-    /// the caller and leaves the current snapshot, and everyone watching it,
-    /// exactly as it was. That is what lets the user submit the same change
-    /// again. A manager without a file has nothing to store and never fails.
+    /// An unchanged snapshot is neither stored nor published. The emitter is
+    /// part of this manager, so a write that returns `Ok` has published exactly
+    /// one change set (possibly empty only for workspaces).
     ///
-    /// An unchanged snapshot is neither stored nor published; its network
-    /// generations stay as they are. That is deliberate — there is nothing to
-    /// store — and it has a consequence worth knowing: this is not what repairs
-    /// a file that fell behind the snapshot, which is what a failed
-    /// [`Self::update`] leaves behind. That failure is logged where it happens.
-    pub fn write(&mut self, config: Config) -> Result<(), ConfigPersistenceError> {
-        if self.config.as_ref() == &config {
-            return Ok(());
+    /// This takes `&mut App` so a caller cannot reach it through
+    /// `cx.global_mut::<ConfigManager>()`: the borrow that yields the manager
+    /// and the borrow that yields the application would overlap. Configuration
+    /// writes therefore always go through `cx.update_global`.
+    pub fn write(&mut self, config: Config, cx: &mut App) -> Result<(), ConfigPersistenceError> {
+        if let Some(changes) = self.store.write(config)? {
+            self.emit(changes, cx);
         }
-
-        let mut candidate = config;
-        self.network_generations.stamp(&mut candidate);
-        self.persist(&candidate)?;
-        self.publish(candidate);
 
         Ok(())
     }
 
     /// Mutates a cloned candidate and publishes it, persisting it afterwards.
     ///
-    /// Subsystems that own a part of the settings (the account, the avatar, the
-    /// workspaces) change a value nobody can be asked to submit again, so the
-    /// candidate is published first and a persistence failure is only logged.
-    /// A change a user submits and can submit again belongs in [`Self::write`],
-    /// which reports the failure instead of dropping it.
-    ///
-    /// Returns the value produced by `update`.
-    pub fn update<R>(&mut self, update: impl FnOnce(&mut Config) -> R) -> R {
-        let mut candidate = self.config.as_ref().clone();
-        let result = update(&mut candidate);
-        if self.config.as_ref() == &candidate {
-            return result;
+    /// A persistence failure is logged, not returned; the in-memory snapshot is
+    /// still published. Returns the closure's value.
+    pub fn update<R>(&mut self, update: impl FnOnce(&mut Config) -> R, cx: &mut App) -> R {
+        let (result, changes) = self.store.update(update);
+        if let Some(changes) = changes {
+            self.emit(changes, cx);
         }
-
-        self.network_generations.stamp(&mut candidate);
-        self.publish(candidate);
-        self.persist_current();
 
         result
     }
 
-    /// Creates an in-memory manager for injected runtimes and offline tests.
-    pub fn in_memory(config: Config) -> Self {
-        Self::with_path(config, None)
-    }
-
-    fn with_path(mut config: Config, path: Option<PathBuf>) -> Self {
-        let mut network_generations = NetworkGenerationTracker::new();
-        network_generations.stamp(&mut config);
-        let config = Arc::new(config);
-        let (sender, _) = watch::channel(config.clone());
-        let (network_sender, _) = watch::channel(Arc::new(config.network_config()));
-        Self {
-            config,
-            sender,
-            network_sender,
-            network_generations,
-            path,
-        }
-    }
-
-    /// Loads a config file, falling back to defaults when it is unusable.
+    /// Emits one event per changed item, in a fixed domain order.
     ///
-    /// The damaged bytes are moved aside before the replacement is written, so a
-    /// start that resets the settings never destroys what the user had.
-    fn load_or_recover(path: PathBuf) -> (Self, Option<ConfigRecovery>) {
-        match load_config(&path) {
-            Ok(Some(config)) => (Self::with_path(config, Some(path)), None),
-            Ok(None) => (Self::with_path(Config::default(), Some(path)), None),
-            Err(error) => {
-                log::error!("failed to load settings config: {error}");
-                let backup = back_up_damaged_config(&path);
-                let config = Config::default();
-                if let Err(error) = persist_config(&path, &config) {
-                    log::error!("failed to write default settings config: {error}");
-                }
-
-                (
-                    Self::with_path(config, Some(path)),
-                    Some(ConfigRecovery { backup, error }),
-                )
+    /// The order is appearance, language, display time zone, account, proxy
+    /// catalog (map order), default route, service routes (map order), venues
+    /// (map order). Tests pin it; consumers must not depend on it for
+    /// correctness, only the notification layer does not reorder.
+    fn emit(&mut self, changes: ConfigChangeSet, cx: &mut App) {
+        let events = self.events.clone();
+        events.update(cx, |_, cx| {
+            if let Some(appearance) = changes.appearance {
+                cx.emit(AppearanceChanged(appearance));
             }
-        }
+            if let Some(language) = changes.language {
+                cx.emit(LanguageChanged(language));
+            }
+            if let Some(data_time_zone) = changes.data_time_zone {
+                cx.emit(DataTimeZoneChanged(data_time_zone));
+            }
+            if changes.account_changed {
+                cx.emit(AccountChanged);
+            }
+            for name in changes.proxies {
+                cx.emit(ProxyCatalogChanged { name });
+            }
+            if changes.proxy_default_changed {
+                cx.emit(DefaultRouteChanged);
+            }
+            for target in changes.proxy_applications {
+                cx.emit(ServiceRouteChanged { target });
+            }
+            for venue in changes.venues {
+                cx.emit(VenueChanged { venue });
+            }
+        });
     }
-
-    /// Makes an already stamped candidate the current snapshot and announces it.
-    fn publish(&mut self, candidate: Config) {
-        let previous_network_config = self.config.network_config();
-        self.config = Arc::new(candidate);
-        self.sender.send_replace(self.config.clone());
-        let network_config = self.config.network_config();
-        if previous_network_config != network_config {
-            self.network_sender.send_replace(Arc::new(network_config));
-        }
-    }
-
-    /// Stores `config`, or succeeds when this manager has no file to store it in.
-    fn persist(&self, config: &Config) -> Result<(), ConfigPersistenceError> {
-        match self.path.as_deref() {
-            Some(path) => persist_config(path, config),
-            None => Ok(()),
-        }
-    }
-
-    /// Stores the published snapshot, logging a failure instead of reporting it.
-    fn persist_current(&self) {
-        if let Err(error) = self.persist(self.config.as_ref()) {
-            log::error!("failed to persist settings config: {error}");
-        }
-    }
-}
-
-/// Loads the persisted settings and installs the manager in GPUI global state.
-///
-/// The manager owns the watch channels every configuration projection depends
-/// on, so it must outlive every window that reads the settings.
-///
-/// Returns the record of a damaged stored file that was replaced with defaults,
-/// for the application to show once it has a window. A missing file starts from
-/// `Config::default()` and is not reported: that is a first start, not a loss.
-pub fn install(cx: &mut App) -> Option<ConfigRecovery> {
-    let (manager, recovery) = ConfigManager::load_default();
-    cx.set_global(manager);
-
-    recovery
-}
-
-/// What was recovered from when a stored config file had to be discarded.
-#[derive(Debug)]
-pub struct ConfigRecovery {
-    /// Where the damaged file was moved, or `None` when it could not be kept.
-    pub backup: Option<PathBuf>,
-    /// Why the file was unusable. Logged, never shown to the user.
-    pub error: ConfigLoadError,
-}
-
-/// Moves an unusable config file aside so the next start does not read it again.
-///
-/// Losing the old file is worse than starting over, but not bad enough to refuse
-/// to start, so a failure here is logged and reported as "nothing was kept".
-fn back_up_damaged_config(path: &Path) -> Option<PathBuf> {
-    let Some(backup) = available_backup_path(path) else {
-        log::error!("failed to find a free backup name for damaged settings config {path:?}");
-
-        return None;
-    };
-
-    match fs::rename(path, &backup) {
-        Ok(()) => Some(backup),
-        Err(error) => {
-            log::error!("failed to back up damaged settings config {path:?}: {error}");
-
-            None
-        }
-    }
-}
-
-/// The first free `config.json.corrupt-<timestamp>[-N]` name next to `path`.
-fn available_backup_path(path: &Path) -> Option<PathBuf> {
-    let directory = path.parent()?;
-    let file_name = path.file_name()?.to_str()?;
-    let backup_name = format!("{file_name}.corrupt-{}", utc_timestamp());
-    let first = directory.join(&backup_name);
-    if !first.exists() {
-        return Some(first);
-    }
-
-    (2..=MAX_BACKUP_ATTEMPTS)
-        .map(|attempt| directory.join(format!("{backup_name}-{attempt}")))
-        .find(|candidate| !candidate.exists())
-}
-
-/// The UTC instant a backup was taken, as `YYYYMMDD-HHMMSS`.
-fn utc_timestamp() -> String {
-    let now = time::OffsetDateTime::now_utc();
-
-    format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    )
-}
-
-fn load_config(path: &Path) -> Result<Option<Config>, ConfigLoadError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ConfigLoadError::Read {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|source| ConfigLoadError::Decode {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn persist_config(path: &Path, config: &Config) -> Result<(), ConfigPersistenceError> {
-    let directory = path
-        .parent()
-        .filter(|directory| !directory.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    fs::create_dir_all(directory).map_err(|source| ConfigPersistenceError::CreateDirectory {
-        path: directory.to_path_buf(),
-        source,
-    })?;
-
-    let mut temporary_file = NamedTempFile::new_in(directory).map_err(|source| {
-        ConfigPersistenceError::CreateTemporaryFile {
-            path: directory.to_path_buf(),
-            source,
-        }
-    })?;
-
-    serde_json::to_writer_pretty(temporary_file.as_file_mut(), config).map_err(|source| {
-        ConfigPersistenceError::Serialize {
-            path: temporary_file.path().to_path_buf(),
-            source,
-        }
-    })?;
-    temporary_file
-        .as_file_mut()
-        .write_all(b"\n")
-        .map_err(|source| ConfigPersistenceError::Write {
-            path: temporary_file.path().to_path_buf(),
-            source,
-        })?;
-    temporary_file
-        .as_file()
-        .sync_all()
-        .map_err(|source| ConfigPersistenceError::Sync {
-            path: temporary_file.path().to_path_buf(),
-            source,
-        })?;
-
-    temporary_file
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| ConfigPersistenceError::Replace {
-            path: path.to_path_buf(),
-            source: error.error,
-        })
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigLoadError {
-    #[error("the operating system config directory is unavailable")]
-    ConfigDirectoryUnavailable,
-    #[error("failed to read config file {path:?}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to decode JSON config file {path:?}: {source}")]
-    Decode {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-}
-
-/// Why a settings snapshot could not be stored.
-#[derive(Debug, Error)]
-pub enum ConfigPersistenceError {
-    #[error("failed to create config directory {path:?}: {source}")]
-    CreateDirectory {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to create a temporary config file in {path:?}: {source}")]
-    CreateTemporaryFile {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to serialize config to temporary file {path:?}: {source}")]
-    Serialize {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to finish writing temporary config file {path:?}: {source}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to synchronize temporary config file {path:?}: {source}")]
-    Sync {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to atomically replace config file {path:?}: {source}")]
-    Replace {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
+    use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
     use app_config::{
-        market_participants::{
-            credentials::{BinanceCredentials, OkxCredentials},
-            origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
-            settings::{BinanceOrigins, VenueSettings},
-        },
-        network::{
-            KytrixServiceCapability, NamedProxyError, ProxyAuthorizationConfig, ProxyConfig,
-            ProxyRoute, ServiceTarget,
-        },
-        settings::{AccountConfig, AccountWalletKind, Config, Language},
+        network::{KytrixServiceCapability, ProxyConfig, ProxyRoute, ServiceTarget},
+        settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
+        time_zone::DataTimeZone,
+        workspace::{WorkspaceConfig, WorkspaceLayout},
+    };
+    use gpui_kit::{
+        App, BorrowAppContext as _, Entity, EventEmitter, Subscription, TestAppContext,
     };
     use market_participants_model::identifier::VenueId;
     use smol_str::SmolStr;
 
-    use super::{
-        CONFIG_DIRECTORY_NAME, CONFIG_FILE_NAME, ConfigLoadError, ConfigManager,
-        ConfigPersistenceError, available_backup_path, back_up_damaged_config, config_file_path,
+    use super::ConfigManager;
+    use crate::{
+        events::{
+            AccountChanged, AppearanceChanged, ConfigEvents, DataTimeZoneChanged,
+            DefaultRouteChanged, LanguageChanged, ProxyCatalogChanged, ServiceRouteChanged,
+            VenueChanged,
+        },
+        store::{ConfigPersistenceError, ConfigStore},
+        test_support::test_temp,
     };
 
-    fn venue(name: &str) -> VenueId {
-        VenueId::from_name(name).expect("the venue should be canonical")
+    /// One delivered event, kept so a test can assert both what and in which
+    /// order the manager emitted.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Recorded {
+        Appearance(Appearance),
+        Language(Language),
+        DataTimeZone(DataTimeZone),
+        Account,
+        Proxy(SmolStr),
+        DefaultRoute,
+        ServiceRoute(ServiceTarget),
+        Venue(VenueId),
     }
 
-    fn x_media_target() -> ServiceTarget {
-        ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XMedia,
+    fn account() -> AccountConfig {
+        AccountConfig {
+            user_id: String::from("11111111-1111-4111-8111-111111111111"),
+            wallet_address: String::from("0x0123456789abcdef"),
+            wallet_kind: AccountWalletKind::Ethereum,
         }
     }
 
-    fn manager_from_path(path: impl Into<PathBuf>) -> ConfigManager {
-        ConfigManager::from_path(path).expect("config manager should load")
-    }
-
-    /// A temporary directory of the test's own, under the workspace's build output.
-    ///
-    /// The system temporary directory is not usable here: a test that runs behind a restricted
-    /// integrity token cannot create directories in `%TEMP%`, which leaves every test about a
-    /// file on disk failing for a reason that has nothing to do with the code under test. The
-    /// build output is the workspace's own writable scratch space, so the directory goes there.
-    fn test_temp(name: &str) -> tempfile::TempDir {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("this crate lives two directories below the workspace root");
-        let root = workspace.join("target").join("test-temp").join("config");
-        fs::create_dir_all(&root).expect("the test temporary directory should be created");
-        tempfile::Builder::new()
-            .prefix(name)
-            .tempdir_in(&root)
-            .expect("a temporary directory should be created")
-    }
-
-    #[test]
-    fn persisted_config_should_reject_unknown_routing_enums_without_rewriting_the_file() {
-        let cases = [
-            serde_json::json!({
-                "kind": "unknown",
-                "capability": "news",
-            }),
-            serde_json::json!({
-                "kind": "route",
-                "id": 1,
-            }),
-            serde_json::json!({
-                "kind": "exchange",
-                "venue": "binance",
-                "market": "spot",
-                "capability": "candlesticks",
-            }),
-            serde_json::json!({
-                "kind": "kytrix_service",
-                "capability": "Chat",
-            }),
-            serde_json::json!({
-                "kind": "venue",
-                "target": {
-                    "venue": "Kraken",
-                    "scope": "core/spot",
-                    "capability": "candlesticks",
-                },
-            }),
-            serde_json::json!({
-                "kind": "venue",
-                "target": {
-                    "venue": "binance",
-                    "scope": "Core/Spot",
-                    "capability": "candlesticks",
-                },
-            }),
-            serde_json::json!({
-                "kind": "venue",
-                "target": {
-                    "venue": "binance",
-                    "scope": "core/spot",
-                    "capability": "depth",
-                },
-            }),
-            serde_json::json!({
-                "kind": "venue",
-                "target": {
-                    "venue": "binance",
-                    "scope": "core/spot",
-                },
-            }),
-        ];
-        let temporary_directory = test_temp("config");
-
-        for (index, target) in cases.into_iter().enumerate() {
-            let mut fixture =
-                serde_json::to_value(Config::default()).expect("default config should serialize");
-            fixture["proxy_applications"] = serde_json::json!([{
-                "target": target,
-                "route": { "kind": "named", "name": "local" },
-            }]);
-            assert!(serde_json::from_value::<Config>(fixture.clone()).is_err());
-            let bytes = serde_json::to_vec_pretty(&fixture).expect("fixture should encode");
-            let path = temporary_directory
-                .path()
-                .join(format!("invalid-{index}.json"));
-            fs::write(&path, &bytes).expect("invalid fixture should be written");
-
-            let result = ConfigManager::from_path(&path);
-
-            assert!(matches!(result, Err(ConfigLoadError::Decode { .. })));
-            assert_eq!(
-                fs::read(&path).expect("invalid config should remain readable"),
-                bytes
-            );
+    fn proxy(port: u16) -> ProxyConfig {
+        ProxyConfig {
+            port,
+            ..ProxyConfig::default()
         }
     }
 
-    #[test]
-    fn a_service_target_without_an_application_should_decode() {
-        let mut fixture =
-            serde_json::to_value(Config::default()).expect("default config should serialize");
-        fixture["proxy_applications"] = serde_json::json!([{
-            "target": { "kind": "kytrix_service", "capability": "news" },
-            "route": { "kind": "named", "name": "local" },
-        }]);
-
-        let decoded = serde_json::from_value::<Config>(fixture)
-            .expect("a service target decodes whether or not it has an override");
-
-        assert_eq!(decoded.proxy_applications.len(), 1);
-    }
-
-    #[test]
-    fn config_file_path_should_append_kytrix_config_json() {
-        let base = Path::new("base");
-
-        let path = config_file_path(base);
-
-        assert_eq!(path, base.join("kytrix").join("config.json"));
-    }
-
-    #[test]
-    fn subscribe_should_expose_the_initial_arc_snapshot() {
-        let manager = ConfigManager::in_memory(Config::default());
-        let receiver = manager.subscribe();
-        let manager_snapshot = manager.read();
-        let receiver_snapshot = receiver.borrow().clone();
-
-        assert!(Arc::ptr_eq(&manager_snapshot, &receiver_snapshot));
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn network_subscribe_should_expose_the_initial_projection() {
-        let manager = ConfigManager::in_memory(Config::default());
-        let receiver = manager.network_subscribe();
-        let expected = manager.read().network_config();
-
-        assert_eq!(receiver.borrow().as_ref(), &expected);
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn network_subscribe_should_publish_network_updates() {
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let mut receiver = manager.network_subscribe();
-
-        manager.update(|config| config.proxy_default = ProxyRoute::System);
-
-        assert!(receiver.has_changed().expect("sender should remain open"));
-        let snapshot = receiver.borrow_and_update().clone();
-        assert_eq!(snapshot.proxy_default, ProxyRoute::System);
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn unrelated_settings_should_not_publish_or_rotate_network_snapshot() {
-        let target = venue("binance");
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let receiver = manager.network_subscribe();
-        let initial_generation = manager.read().network_route_generation(&target);
-        let initial_snapshot = receiver.borrow().clone();
-
-        manager.update(|config| config.language = Language::En);
-
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-        assert_eq!(receiver.borrow().as_ref(), initial_snapshot.as_ref());
-        assert_eq!(
-            manager.read().network_route_generation(&target),
-            initial_generation
-        );
-    }
-
-    #[test]
-    fn route_generation_should_detect_aba_before_a_receiver_polls() {
-        let target = venue("binance");
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let mut receiver = manager.subscribe();
-        let initial_generation = manager.read().network_route_generation(&target);
-
-        manager.update(|config| {
-            config.proxies.insert("route-b".into(), local_proxy());
-            config.set_venue_proxy(&target, Some(ProxyRoute::named("route-b")));
+    /// Installs an in-memory manager over `config`, as the composition root does.
+    fn install_manager_with(cx: &mut TestAppContext, config: Config) {
+        cx.update(|cx| {
+            let manager = ConfigManager::in_memory(config, cx);
+            cx.set_global(manager);
         });
-        manager.update(|config| {
-            config.set_venue_proxy(&target, Some(ProxyRoute::Direct));
-            config.proxies.remove("route-b");
+    }
+
+    fn install_manager(cx: &mut TestAppContext) {
+        install_manager_with(cx, Config::default());
+    }
+
+    fn events(cx: &mut TestAppContext) -> Entity<ConfigEvents> {
+        cx.update(|cx| cx.global::<ConfigManager>().events().clone())
+    }
+
+    /// Stores `change` applied to the current snapshot, as a settings submission does.
+    fn write_settings(
+        cx: &mut TestAppContext,
+        change: impl FnOnce(&mut Config),
+    ) -> Result<(), ConfigPersistenceError> {
+        cx.update(|cx| {
+            let mut next = cx.global::<ConfigManager>().read().as_ref().clone();
+            change(&mut next);
+            cx.update_global::<ConfigManager, _>(|manager, cx| manager.write(next, cx))
+        })
+    }
+
+    /// Subscribes `on_event` to one event type of the manager's event entity.
+    fn subscribe<E: 'static>(
+        cx: &mut App,
+        events: &Entity<ConfigEvents>,
+        mut on_event: impl FnMut(&E) + 'static,
+    ) -> Subscription
+    where
+        ConfigEvents: EventEmitter<E>,
+    {
+        cx.subscribe(events, move |_, event: &E, _| on_event(event))
+    }
+
+    /// Subscribes to every configuration event and records the delivery order.
+    fn record_every_event(
+        cx: &mut App,
+        events: &Entity<ConfigEvents>,
+    ) -> (Rc<RefCell<Vec<Recorded>>>, Vec<Subscription>) {
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let mut subscriptions = Vec::with_capacity(8);
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &AppearanceChanged| {
+                sink.borrow_mut().push(Recorded::Appearance(event.0));
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &LanguageChanged| {
+                sink.borrow_mut().push(Recorded::Language(event.0));
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &DataTimeZoneChanged| {
+                sink.borrow_mut().push(Recorded::DataTimeZone(event.0));
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |_: &AccountChanged| {
+                sink.borrow_mut().push(Recorded::Account);
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &ProxyCatalogChanged| {
+                sink.borrow_mut().push(Recorded::Proxy(event.name.clone()));
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |_: &DefaultRouteChanged| {
+                sink.borrow_mut().push(Recorded::DefaultRoute);
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &ServiceRouteChanged| {
+                sink.borrow_mut()
+                    .push(Recorded::ServiceRoute(event.target.clone()));
+            }));
+        }
+        {
+            let sink = Rc::clone(&recorded);
+            subscriptions.push(subscribe(cx, events, move |event: &VenueChanged| {
+                sink.borrow_mut().push(Recorded::Venue(event.venue));
+            }));
+        }
+
+        (recorded, subscriptions)
+    }
+
+    #[gpui_kit::test]
+    fn a_write_should_emit_one_event_per_changed_item(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let languages = Rc::new(RefCell::new(Vec::new()));
+        let zones = Rc::new(RefCell::new(Vec::new()));
+        let proxies = Rc::new(RefCell::new(Vec::new()));
+        let venues = Rc::new(RefCell::new(Vec::new()));
+        let (_language, _zone, _proxy, _venue) = cx.update(|cx| {
+            let language = subscribe(cx, &events, {
+                let sink = Rc::clone(&languages);
+                move |event: &LanguageChanged| sink.borrow_mut().push(event.0)
+            });
+            let zone = subscribe(cx, &events, {
+                let sink = Rc::clone(&zones);
+                move |event: &DataTimeZoneChanged| sink.borrow_mut().push(event.0)
+            });
+            let proxy = subscribe(cx, &events, {
+                let sink = Rc::clone(&proxies);
+                move |event: &ProxyCatalogChanged| sink.borrow_mut().push(event.name.clone())
+            });
+            let venue = subscribe(cx, &events, {
+                let sink = Rc::clone(&venues);
+                move |event: &VenueChanged| sink.borrow_mut().push(event.venue)
+            });
+
+            (language, zone, proxy, venue)
         });
+        let zone = DataTimeZone::from_hours(-3).expect("UTC-3 is an offered offset");
 
-        assert!(receiver.has_changed().expect("sender should remain open"));
-        let latest = receiver.borrow_and_update().clone();
-        assert_eq!(
-            latest.network_config().proxy_route_for(&target),
-            ProxyRoute::Direct
-        );
-
-        assert_ne!(latest.network_route_generation(&target), initial_generation);
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn equal_write_should_preserve_generations_without_publishing() {
-        let target = venue("binance");
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let receiver = manager.subscribe();
-        let initial_generation = manager.read().network_route_generation(&target);
-
-        manager
-            .write(Config::default())
-            .expect("an unchanged snapshot is accepted without being stored");
-
-        assert_eq!(
-            manager.read().network_route_generation(&target),
-            initial_generation
-        );
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn equivalent_proxy_rename_should_preserve_route_generation() {
-        let target = venue("binance");
-        let proxy = local_proxy();
-        let mut configured = Config::default();
-        configured.proxies.insert("local".into(), proxy.clone());
-        configured.set_venue_proxy(&target, Some(ProxyRoute::named("local")));
-        let mut manager = ConfigManager::in_memory(configured);
-        let initial_generation = manager.read().network_route_generation(&target);
-
-        manager.update(|config| {
+        write_settings(cx, |config| {
+            config.language = Language::En;
+            config.data_time_zone = zone;
             config
-                .replace_proxy("local", "renamed".into(), proxy)
-                .expect("proxy rename should succeed");
+                .proxies
+                .insert(SmolStr::new_static("local"), proxy(1080));
+            config.set_venue_proxy(&VenueId::Binance, Some(ProxyRoute::System));
+        })
+        .expect("an in-memory manager has nothing to store");
+
+        assert_eq!(*languages.borrow(), [Language::En]);
+        assert_eq!(*zones.borrow(), [zone]);
+        assert_eq!(*proxies.borrow(), [SmolStr::new_static("local")]);
+        assert_eq!(*venues.borrow(), [VenueId::Binance]);
+    }
+
+    #[gpui_kit::test]
+    fn a_write_that_changes_nothing_should_emit_nothing(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+        let before = cx.update(|cx| cx.global::<ConfigManager>().read());
+
+        write_settings(cx, |_| {}).expect("an unchanged snapshot is accepted");
+
+        assert!(recorded.borrow().is_empty());
+        let after = cx.update(|cx| cx.global::<ConfigManager>().read());
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged write keeps the snapshot the application reads"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn an_update_should_emit_the_change_set_of_its_diff(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let languages = Rc::new(RefCell::new(Vec::new()));
+        let _language = cx.update(|cx| {
+            let sink = Rc::clone(&languages);
+            subscribe(cx, &events, move |event: &LanguageChanged| {
+                sink.borrow_mut().push(event.0);
+            })
         });
 
-        assert_eq!(
-            manager.read().network_route_generation(&target),
-            initial_generation
-        );
-    }
-
-    #[test]
-    fn proxy_definition_invalidity_and_dangling_reference_should_rotate_generation() {
-        let target = venue("binance");
-        let mut configured = Config::default();
-        configured.proxies.insert("local".into(), local_proxy());
-        configured.set_venue_proxy(&target, Some(ProxyRoute::named("local")));
-        let mut manager = ConfigManager::in_memory(configured);
-        let mut previous = manager.read().network_route_generation(&target);
-
-        manager.update(|config| config.proxies.get_mut("local").unwrap().port = 2080);
-        let changed = manager.read().network_route_generation(&target);
-        assert_ne!(changed, previous);
-        previous = changed;
-
-        manager.update(|config| config.proxies.get_mut("local").unwrap().addr = "bad host".into());
-        let invalid = manager.read().network_route_generation(&target);
-        assert_ne!(invalid, previous);
-        assert!(matches!(
-            manager
-                .read()
-                .network_config()
-                .resolve_named_proxy_entry("local"),
-            Err(NamedProxyError::InvalidAddress { .. })
-        ));
-        previous = invalid;
-
-        manager.update(|config| {
-            config.proxies.remove("local");
+        let result = cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(
+                |config| {
+                    config.language = Language::En;
+                    7
+                },
+                cx,
+            )
         });
-        let dangling = manager.read().network_route_generation(&target);
-        assert_ne!(dangling, previous);
-        assert!(matches!(
-            manager
-                .read()
-                .network_config()
-                .resolve_named_proxy_entry("local"),
-            Err(NamedProxyError::Missing { .. })
-        ));
-    }
-
-    /// The default line is stamped apart from every venue, and the venues that
-    /// name a line of their own keep their stamp when it moves.
-    ///
-    /// A venue that shared the default's stamp would move with it, so the stamps
-    /// the venues hold across the default line's own rotations are what says the
-    /// two are stamped apart.
-    #[test]
-    fn the_default_route_generation_should_follow_the_route_it_resolves() {
-        let bound = venue("binance");
-        let following = venue("okx");
-        let mut configured = Config::default();
-        configured.proxies.insert("local".into(), local_proxy());
-        configured.proxy_default = ProxyRoute::named("local");
-        configured.set_venue_proxy(&bound, Some(ProxyRoute::Direct));
-        let mut manager = ConfigManager::in_memory(configured);
-        let initial = manager.read().network_route_generation(&following);
-        let bound_initial = manager.read().network_route_generation(&bound);
-
-        manager.update(|config| config.proxies.get_mut("local").unwrap().port = 2080);
-        let rotated = manager.read().network_route_generation(&following);
-
-        assert_ne!(
-            rotated, initial,
-            "the default route is fingerprinted from its own configuration, without a placeholder venue"
-        );
-        assert_eq!(
-            manager.read().network_route_generation(&bound),
-            bound_initial,
-            "a venue that names its own route does not follow the default's rotation"
-        );
-
-        manager.update(|config| config.proxies.get_mut("local").unwrap().addr = "bad host".into());
-        assert_ne!(manager.read().network_route_generation(&following), rotated);
-
-        manager.update(|config| config.proxy_default = ProxyRoute::Direct);
-        let direct = manager.read().network_route_generation(&following);
-        assert_ne!(direct, rotated);
-        assert_eq!(
-            manager.read().network_route_generation(&bound),
-            bound_initial,
-            "and it keeps its own stamp however the default line changes"
-        );
-    }
-
-    #[test]
-    fn meaningful_write_should_publish_once() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path);
-        let mut receiver = manager.subscribe();
-        let expected = configured_settings();
-
-        manager
-            .write(expected.clone())
-            .expect("the submitted settings should be stored");
-
-        assert!(receiver.has_changed().expect("sender should remain open"));
-        let received = receiver.borrow_and_update().clone();
-        assert_eq!(received.as_ref(), &expected);
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-
-        manager
-            .write(expected)
-            .expect("an unchanged snapshot should be accepted again");
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn no_op_write_should_not_persist_or_publish() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        let receiver = manager.subscribe();
-
-        manager
-            .write(Config::default())
-            .expect("an unchanged snapshot should be accepted");
-
-        assert!(!path.exists());
-        assert!(!receiver.has_changed().expect("sender should remain open"));
-    }
-
-    #[test]
-    fn no_op_update_should_not_persist_or_publish() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        let receiver = manager.subscribe();
-
-        let result = manager.update(|_| 7);
 
         assert_eq!(result, 7);
-        assert!(!path.exists());
-        assert!(!receiver.has_changed().expect("sender should remain open"));
+        assert_eq!(*languages.borrow(), [Language::En]);
     }
 
-    #[test]
-    fn slow_receiver_should_observe_only_the_latest_snapshot() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path);
-        let mut receiver = manager.subscribe();
-        let mut latest = Config::default();
+    #[gpui_kit::test]
+    fn a_language_write_should_emit_only_language_changed(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
 
-        for name in ["first", "second", "latest"] {
-            latest.proxies.clear();
-            latest.proxies.insert(
-                SmolStr::new(name),
-                ProxyConfig {
-                    addr: SmolStr::new_static("127.0.0.1"),
-                    port: 1080,
-                    authorization: ProxyAuthorizationConfig::None,
-                    resolve_dns_at_remote: true,
-                },
-            );
-            manager
-                .write(latest.clone())
-                .expect("each renamed proxy should be stored");
-        }
+        write_settings(cx, |config| config.language = Language::En)
+            .expect("an in-memory manager has nothing to store");
 
-        assert!(receiver.has_changed().expect("sender should remain open"));
-        let received = receiver.borrow_and_update().clone();
-        assert_eq!(received.as_ref(), &latest);
-        assert!(!receiver.has_changed().expect("sender should remain open"));
+        assert_eq!(*recorded.borrow(), [Recorded::Language(Language::En)]);
     }
 
-    #[test]
-    fn config_should_round_trip_through_json_file() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory
-            .path()
-            .join(CONFIG_DIRECTORY_NAME)
-            .join(CONFIG_FILE_NAME);
-        let expected = configured_settings();
-        let mut manager = manager_from_path(&path);
-
-        manager
-            .write(expected.clone())
-            .expect("the submitted settings should be stored");
-        let loaded = manager_from_path(path).read();
-
-        assert_eq!(loaded.as_ref(), &expected);
-    }
-
-    #[test]
-    fn manager_should_write_pretty_json_with_a_trailing_newline() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-
-        manager
-            .write(configured_settings())
-            .expect("the submitted settings should be stored");
-        let contents = fs::read_to_string(path).expect("config file should be readable");
-
-        assert!(contents.lines().count() > 2 && contents.ends_with('\n'));
-    }
-
-    #[test]
-    fn manager_should_use_defaults_when_config_file_is_missing() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join("missing.json");
-
-        let loaded = manager_from_path(path).read();
-
-        assert_eq!(loaded.as_ref(), &Config::default());
-    }
-
-    #[test]
-    fn manager_should_reject_invalid_json_without_changing_the_file() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, b"{not valid JSON").expect("invalid fixture should be written");
-
-        let result = ConfigManager::from_path(&path);
-
-        assert!(matches!(result, Err(ConfigLoadError::Decode { .. })));
-        assert_eq!(
-            fs::read(path).expect("invalid fixture should remain readable"),
-            b"{not valid JSON"
-        );
-    }
-
-    #[test]
-    fn a_damaged_config_file_should_be_backed_up_and_replaced_with_defaults() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let damaged = b"{not valid JSON";
-        fs::write(&path, damaged).expect("invalid fixture should be written");
-
-        let (manager, recovery) = ConfigManager::load_or_recover(path.clone());
-
-        let recovery = recovery.expect("a damaged file should be reported as recovered");
-        assert!(matches!(recovery.error, ConfigLoadError::Decode { .. }));
-        let backup = recovery.backup.expect("the damaged file should be kept");
-        assert_eq!(
-            fs::read(&backup).expect("the backup should be readable"),
-            damaged,
-            "the backup keeps exactly what the user had"
-        );
-        assert_eq!(manager.read().as_ref(), &Config::default());
-        assert_eq!(
-            ConfigManager::from_path(&path)
-                .expect("the replacement should load")
-                .read()
-                .as_ref(),
-            &Config::default(),
-            "the original path holds a usable config again"
-        );
-    }
-
-    /// A configuration written under the previous shape is reset whole.
-    ///
-    /// The file is valid JSON and even names settings this build understands — a
-    /// language, an appearance, the workspaces and the widget selection a user
-    /// had — but it does not name the venues this build speaks, so it is not this
-    /// shape. It is kept aside as a `.corrupt-*` backup and the application starts
-    /// from defaults: nothing is migrated, nothing is completed from the built-in
-    /// table, and every setting the old file carried is gone with it.
-    #[test]
-    fn an_old_configuration_is_reset_whole_and_reported() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut old = serde_json::to_value(Config::default()).expect("config should serialize");
-        {
-            let old = old.as_object_mut().expect("config serializes as an object");
-            // The previous shape: a market-participants section and no venue map at all.
-            old.remove("venues");
-            old.insert(
-                "exchanges".to_owned(),
-                serde_json::json!({
-                    "endpoints": {
-                        "binance-core-http": { "http_origin": "https://api.binance.com" },
-                    },
-                    "credential_profiles": {
-                        "binance-main": {
-                            "kind": "binance",
-                            "ed_25519_api_key": "old-key",
-                            "ed_25519_private_key": "old-private",
-                            "ed_25519_passphrase": "",
-                        },
-                    },
-                }),
-            );
-            old.insert("language".to_owned(), serde_json::json!("en"));
-            old.insert("appearance".to_owned(), serde_json::json!("dark"));
-        }
-        let old_bytes = serde_json::to_vec_pretty(&old).expect("the old file should serialize");
-        fs::write(&path, &old_bytes).expect("the old fixture should be written");
-
-        let (manager, recovery) = ConfigManager::load_or_recover(path.clone());
-
-        let recovery = recovery.expect("an old file is reported as recovered");
-        assert!(
-            matches!(recovery.error, ConfigLoadError::Decode { .. }),
-            "the old shape is refused at decode, not read partially"
-        );
-        let backup = recovery.backup.expect("the old file should be kept");
-        assert_eq!(
-            fs::read(&backup).expect("the backup should be readable"),
-            old_bytes,
-            "the backup keeps exactly what the user had"
-        );
-
-        // Every setting the file carried is gone: the reset is whole rather than
-        // a migration of the parts this build still understands.
-        assert_eq!(manager.read().as_ref(), &Config::default());
-        assert_eq!(
-            (
-                manager.read().language,
-                manager.read().appearance,
-                manager.read().workspaces.clone(),
-            ),
-            (
-                Config::default().language,
-                Config::default().appearance,
-                Config::default().workspaces,
-            ),
-            "language, appearance, workspaces and the widget selection reset together"
-        );
-        assert!(
-            !path
-                .parent()
-                .expect("the config has a directory")
-                .join("")
-                .as_os_str()
-                .is_empty(),
-            "the replacement lives where the old file did"
-        );
-    }
-
-    /// A venue edit submitted the way a settings interface submits one — a mutated
-    /// `Config` handed to a write-back entry — reaches the file and moves the venue's
-    /// outbound generation. The dialog submits a whole applied configuration through
-    /// `write`; this drives `update`, which takes the edit as a closure.
-    #[test]
-    fn a_venue_edit_should_persist_and_rotate_the_venue_generation() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path.clone());
-        let binance = venue("binance");
-        let initial = manager.read().network_route_generation(&binance);
-        let initial_origin = manager
-            .read()
-            .venue(&binance)
-            .expect("the venue is configured")
-            .origins("spot")
-            .expect("the venue publishes the scope its requests are addressed by")
-            .http;
-
-        manager.update(|config| {
-            assert!(config.set_binance_market_origins(
-                &binance,
-                BinanceMarket::Spot,
-                &BinanceOrigins::new(
-                    BinanceMarket::Spot,
-                    BinanceHttpOrigin::Api3,
-                    BinanceWebsocketOrigin::StreamAlt,
-                ),
-            ));
-            config.set_venue_proxy(&binance, Some(ProxyRoute::System));
+    #[gpui_kit::test]
+    fn an_account_and_its_avatar_should_emit_one_account_changed(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let account_changes = Rc::new(RefCell::new(0_u32));
+        let _account = cx.update(|cx| {
+            let sink = Rc::clone(&account_changes);
+            subscribe(cx, &events, move |_: &AccountChanged| {
+                *sink.borrow_mut() += 1;
+            })
         });
 
-        let stored = manager_from_path(path).read();
-        assert_ne!(
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(
+                |config| {
+                    config.account = Some(account());
+                    config.avatar = Some(String::from("<svg>avatar</svg>"));
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(*account_changes.borrow(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn a_workspace_only_write_should_emit_nothing(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+
+        write_settings(cx, |config| {
+            config.workspaces.entries.push(WorkspaceConfig {
+                name: SmolStr::new_static("second"),
+                layout: WorkspaceLayout::single_pane(),
+            });
+            config.workspaces.active = Some(SmolStr::new_static("second"));
+        })
+        .expect("an in-memory manager has nothing to store");
+
+        assert!(recorded.borrow().is_empty());
+        let stored = cx.update(|cx| cx.global::<ConfigManager>().read());
+        assert_eq!(
+            stored.workspaces.active,
+            Some(SmolStr::new_static("second")),
+            "the write reached the store even though it emits nothing"
+        );
+        assert!(
             stored
-                .venue(&binance)
-                .expect("the venue is configured")
-                .origins("spot")
-                .expect("the venue publishes the scope its requests are addressed by")
-                .http,
-            initial_origin,
-            "the edit reached the file"
-        );
-        assert_eq!(
-            stored
-                .venue(&binance)
-                .expect("the venue is configured")
-                .proxy(),
-            Some(ProxyRoute::System)
-        );
-        assert_ne!(
-            manager.read().network_route_generation(&binance),
-            initial,
-            "and its outbound route moved the venue's generation"
-        );
-    }
-
-    #[test]
-    fn a_backup_name_should_carry_a_timestamp_and_should_not_overwrite_an_existing_backup() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-
-        let first = available_backup_path(&path).expect("a backup name should be available");
-        let stamp = first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("config.json.corrupt-"))
-            .expect("the backup name should name the damaged file");
-        assert_eq!(stamp.len(), "YYYYMMDD-HHMMSS".len());
-        assert!(
-            stamp
-                .char_indices()
-                .all(|(index, character)| index == 8 && character == '-'
-                    || character.is_ascii_digit()),
-            "the backup name should carry a UTC timestamp; found {stamp:?}"
-        );
-        fs::write(&first, b"kept").expect("the first backup should be written");
-
-        let second =
-            available_backup_path(&path).expect("a second backup name should be available");
-
-        assert_ne!(first, second);
-        assert!(
-            second
-                .to_str()
-                .expect("the backup path should be UTF-8")
-                .ends_with("-2")
-        );
-        assert_eq!(
-            fs::read(&first).expect("the first backup should remain readable"),
-            b"kept",
-            "an existing backup is never overwritten"
-        );
-    }
-
-    #[test]
-    fn a_damaged_file_that_cannot_be_moved_aside_should_be_reported_without_a_backup() {
-        let temporary_directory = test_temp("config");
-        let blocking_file = temporary_directory.path().join("not-a-directory");
-        fs::write(&blocking_file, b"block directory creation")
-            .expect("blocking file should be written");
-        let path = blocking_file.join(CONFIG_FILE_NAME);
-
-        let backup = back_up_damaged_config(&path);
-
-        assert!(
-            backup.is_none(),
-            "a file that cannot be moved aside is reported, not silently dropped"
-        );
-    }
-
-    #[test]
-    fn a_missing_config_file_should_not_report_a_recovery() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-
-        let (manager, recovery) = ConfigManager::load_or_recover(path.clone());
-
-        assert!(recovery.is_none(), "a first start is not a recovery");
-        assert_eq!(manager.read().as_ref(), &Config::default());
-        assert!(
-            !path.exists(),
-            "a first start writes nothing until something changes"
-        );
-    }
-
-    #[test]
-    fn manager_should_replace_existing_config_on_consecutive_writes() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        manager
-            .write(configured_settings())
-            .expect("the submitted settings should be stored");
-        manager
-            .write(Config::default())
-            .expect("the replacement settings should be stored");
-
-        let loaded = manager_from_path(path).read();
-
-        assert_eq!(loaded.as_ref(), &Config::default());
-    }
-
-    #[test]
-    fn write_should_report_a_persistence_failure_without_publishing() {
-        let temporary_directory = test_temp("config");
-        let blocking_file = temporary_directory.path().join("not-a-directory");
-        fs::write(&blocking_file, b"block directory creation")
-            .expect("blocking file should be written");
-        let path = blocking_file.join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path);
-        let receiver = manager.subscribe();
-        let previous = manager.read();
-
-        let result = manager.write(configured_settings());
-
-        assert!(matches!(
-            result,
-            Err(ConfigPersistenceError::CreateDirectory { .. })
-        ));
-        assert!(
-            Arc::ptr_eq(&manager.read(), &previous),
-            "a submission that was not stored leaves the snapshot the application uses alone"
-        );
-        assert!(
-            !receiver.has_changed().expect("sender should remain open"),
-            "nothing is published before the file holds it"
-        );
-    }
-
-    #[test]
-    fn write_should_retry_storing_a_snapshot_an_earlier_failure_never_published() {
-        let temporary_directory = test_temp("config");
-        let directory = temporary_directory.path().join("settings");
-        let path = directory.join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        let expected = configured_settings();
-        fs::write(&directory, b"block the config directory")
-            .expect("blocking file should be written");
-
-        assert!(
-            matches!(
-                manager.write(expected.clone()),
-                Err(ConfigPersistenceError::CreateDirectory { .. })
-            ),
-            "the blocking file should make storing the settings fail"
-        );
-        fs::remove_file(&directory).expect("the blocking file should be removable");
-        manager
-            .write(expected.clone())
-            .expect("the same snapshot is submitted again after the failure is gone");
-
-        let contents = fs::read_to_string(&path).expect("the retry should have stored a file");
-        assert_eq!(
-            serde_json::from_str::<Config>(&contents).expect("the stored file should decode"),
-            expected,
-            "a rejected submission is not treated as already written"
-        );
-    }
-
-    #[test]
-    fn write_should_succeed_without_a_file() {
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let expected = configured_settings();
-
-        manager
-            .write(expected.clone())
-            .expect("a manager without a file has nothing to store");
-
-        assert_eq!(manager.read().as_ref(), &expected);
-    }
-
-    #[test]
-    fn write_should_store_the_new_config_in_the_file() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        let expected = configured_settings();
-
-        manager
-            .write(expected.clone())
-            .expect("the submitted settings should be stored");
-
-        let contents = fs::read_to_string(&path).expect("the config file should be readable");
-        assert_eq!(
-            serde_json::from_str::<Config>(&contents).expect("the config file should decode"),
-            expected,
-            "the file holds the submitted settings"
-        );
-    }
-
-    #[test]
-    fn update_should_keep_changes_in_memory_when_persistence_fails() {
-        let temporary_directory = test_temp("config");
-        let blocking_file = temporary_directory.path().join("not-a-directory");
-        fs::write(&blocking_file, b"block directory creation")
-            .expect("blocking file should be written");
-        let path = blocking_file.join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path);
-
-        manager.update(|config| {
-            config.proxies.insert(
-                SmolStr::new_static("local"),
-                ProxyConfig {
-                    addr: SmolStr::new_static("127.0.0.1"),
-                    port: 1080,
-                    authorization: ProxyAuthorizationConfig::None,
-                    resolve_dns_at_remote: true,
-                },
-            );
-        });
-
-        assert!(manager.read().proxies.contains_key("local"));
-    }
-
-    #[test]
-    fn update_should_preserve_an_existing_arc_snapshot() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(path);
-        let previous_snapshot = manager.read();
-
-        let result = manager.update(|config| {
-            config.proxies.insert(
-                SmolStr::new_static("local"),
-                ProxyConfig {
-                    addr: SmolStr::new_static("127.0.0.1"),
-                    port: 1080,
-                    authorization: ProxyAuthorizationConfig::None,
-                    resolve_dns_at_remote: true,
-                },
-            );
-            7
-        });
-        let current_snapshot = manager.read();
-
-        assert_eq!(
-            (
-                previous_snapshot.proxies.len(),
-                current_snapshot.proxies.len(),
-                result,
-            ),
-            (0, 1, 7)
-        );
-    }
-
-    /// Every venue that names no line of its own is stamped on the default
-    /// line's route, so moving that line rotates each of them.
-    #[test]
-    fn changing_proxy_default_should_rotate_generation_for_venues_without_their_own_route() {
-        let following = venue("binance");
-        let other = venue("okx");
-        let mut manager = ConfigManager::in_memory(Config::default());
-        let initial_following = manager.read().network_route_generation(&following);
-        let initial_other = manager.read().network_route_generation(&other);
-
-        manager.update(|config| config.proxy_default = ProxyRoute::System);
-
-        assert_ne!(
-            manager.read().network_route_generation(&following),
-            initial_following,
-            "a configured venue that names no line follows the default"
-        );
-        assert_ne!(
-            manager.read().network_route_generation(&other),
-            initial_other,
-            "and so does every other venue without a line of its own"
-        );
-        assert_eq!(
-            manager.read().network_config().proxy_route_for(&following),
-            ProxyRoute::System
-        );
-    }
-
-    /// A credential set of one market is what that market's requests sign with, and the
-    /// file keeps the set each configured venue holds.
-    #[test]
-    fn a_venues_credentials_should_survive_a_stored_file() {
-        let temporary_directory = test_temp("config");
-        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
-        let mut manager = manager_from_path(&path);
-        manager
-            .write(configured_settings())
-            .expect("the submitted settings should be stored");
-
-        let loaded = manager_from_path(path).read();
-        let binance = venue("binance");
-
-        assert_eq!(
-            loaded
-                .venue(&binance)
-                .expect("the venue is configured")
-                .validate_credentials(binance, "spot"),
-            Ok(true),
-            "the spot market's own set is complete"
-        );
-        assert_eq!(
-            loaded
-                .venue(&binance)
-                .expect("the venue is configured")
-                .validate_credentials(binance, "usd-m-perp"),
-            Ok(true),
-            "and so is the perpetual market's"
-        );
-        assert_eq!(
-            loaded
-                .venues
+                .workspaces
+                .entries
                 .iter()
-                .filter(|(venue, config)| config
-                    .validate_credentials(**venue, config.primary_scope())
-                    .is_ok_and(|configured| configured))
-                .count(),
-            2,
-            "the two venues the fixture configured hold a complete set"
+                .any(|workspace| workspace.name == "second"),
+            "the new workspace entry is stored"
         );
+    }
+
+    #[gpui_kit::test]
+    fn a_workspace_only_write_should_survive_a_file_backed_manager(cx: &mut TestAppContext) {
+        let temporary_directory = test_temp("config");
+        let path = temporary_directory.path().join("config.json");
+        let manager = cx
+            .update(|cx| ConfigManager::from_path(path.clone(), cx))
+            .expect("a missing config file starts from defaults");
+        cx.update(|cx| cx.set_global(manager));
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+
+        write_settings(cx, |config| {
+            config.workspaces.entries.push(WorkspaceConfig {
+                name: SmolStr::new_static("second"),
+                layout: WorkspaceLayout::single_pane(),
+            });
+            config.workspaces.active = Some(SmolStr::new_static("second"));
+        })
+        .expect("the file-backed manager should store the workspace");
+
+        assert!(
+            recorded.borrow().is_empty(),
+            "a workspace-only write emits no domain event"
+        );
+        let stored = ConfigStore::from_path(path)
+            .expect("the stored config should load")
+            .read();
         assert_eq!(
-            loaded
-                .venue(&venue("hyperliquid"))
-                .expect("the venue is configured")
-                .validate_credentials(venue("hyperliquid"), "core-perp"),
-            Ok(false),
-            "and a venue the fixture did not configure holds none"
+            stored.workspaces.active,
+            Some(SmolStr::new_static("second")),
+            "the active workspace reached the file"
+        );
+        assert!(
+            stored
+                .workspaces
+                .entries
+                .iter()
+                .any(|workspace| workspace.name == "second"),
+            "the named workspace entry reached the file"
         );
     }
 
-    fn local_proxy() -> ProxyConfig {
-        ProxyConfig {
-            addr: SmolStr::new_static("127.0.0.1"),
-            port: 1080,
-            authorization: ProxyAuthorizationConfig::None,
-            resolve_dns_at_remote: true,
-        }
+    #[gpui_kit::test]
+    fn a_failed_write_should_emit_nothing(cx: &mut TestAppContext) {
+        let blocking_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manager = cx
+            .update(|cx| ConfigManager::from_path(blocking_file.join("config.json"), cx))
+            .expect("a missing config file starts from defaults");
+        cx.update(|cx| cx.set_global(manager));
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+        let before = cx.update(|cx| cx.global::<ConfigManager>().read());
+
+        let result = write_settings(cx, |config| config.language = Language::En);
+
+        assert!(
+            result.is_err(),
+            "a directory below a file cannot be created"
+        );
+        assert!(recorded.borrow().is_empty());
+        let after = cx.update(|cx| cx.global::<ConfigManager>().read());
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a submission that was not stored leaves the snapshot alone"
+        );
     }
 
-    fn configured_settings() -> Config {
-        let mut config = Config::default();
-        config.account = Some(AccountConfig {
-            user_id: "11111111-1111-4111-8111-111111111111".into(),
-            wallet_address: "0x0123456789abcdef".into(),
-            wallet_kind: AccountWalletKind::Ethereum,
+    #[gpui_kit::test]
+    fn events_should_arrive_in_the_documented_order(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+        let zone = DataTimeZone::from_hours(-3).expect("UTC-3 is an offered offset");
+        let service = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::News,
+        };
+
+        write_settings(cx, |config| {
+            config.appearance = Appearance::Dark;
+            config.language = Language::En;
+            config.data_time_zone = zone;
+            config.account = Some(account());
+            config
+                .proxies
+                .insert(SmolStr::new_static("local"), proxy(1080));
+            config.proxy_default = ProxyRoute::System;
+            config
+                .proxy_applications
+                .insert(service.clone(), ProxyRoute::Direct);
+            config.set_venue_proxy(&VenueId::Binance, Some(ProxyRoute::System));
+        })
+        .expect("an in-memory manager has nothing to store");
+
+        assert_eq!(
+            *recorded.borrow(),
+            [
+                Recorded::Appearance(Appearance::Dark),
+                Recorded::Language(Language::En),
+                Recorded::DataTimeZone(zone),
+                Recorded::Account,
+                Recorded::Proxy(SmolStr::new_static("local")),
+                Recorded::DefaultRoute,
+                Recorded::ServiceRoute(service),
+                Recorded::Venue(VenueId::Binance),
+            ]
+        );
+    }
+
+    /// Two service routes and two venues are emitted in the maps' order, at their
+    /// documented positions, whatever order the mutation applied them in.
+    #[gpui_kit::test]
+    fn events_should_follow_the_map_order_of_the_change_set(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let (recorded, _subscriptions) = cx.update(|cx| record_every_event(cx, &events));
+        let zone = DataTimeZone::from_hours(-3).expect("UTC-3 is an offered offset");
+        let account_service = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::Account,
+        };
+        let news_service = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::News,
+        };
+
+        write_settings(cx, |config| {
+            config.appearance = Appearance::Dark;
+            config.language = Language::En;
+            config.data_time_zone = zone;
+            config.account = Some(account());
+            config
+                .proxies
+                .insert(SmolStr::new_static("local"), proxy(1080));
+            config.proxy_default = ProxyRoute::System;
+            // Applied in reverse key order, so the assertion proves the emission
+            // follows the maps rather than the order this closure applied.
+            config
+                .proxy_applications
+                .insert(news_service.clone(), ProxyRoute::System);
+            config
+                .proxy_applications
+                .insert(account_service.clone(), ProxyRoute::Direct);
+            config.set_venue_proxy(&VenueId::Okx, Some(ProxyRoute::Direct));
+            config.set_venue_proxy(&VenueId::Binance, Some(ProxyRoute::System));
+        })
+        .expect("an in-memory manager has nothing to store");
+
+        assert_eq!(
+            *recorded.borrow(),
+            [
+                Recorded::Appearance(Appearance::Dark),
+                Recorded::Language(Language::En),
+                Recorded::DataTimeZone(zone),
+                Recorded::Account,
+                Recorded::Proxy(SmolStr::new_static("local")),
+                Recorded::DefaultRoute,
+                Recorded::ServiceRoute(account_service),
+                Recorded::ServiceRoute(news_service),
+                Recorded::Venue(VenueId::Binance),
+                Recorded::Venue(VenueId::Okx),
+            ]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dropping_a_subscription_should_stop_delivery(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let languages = Rc::new(RefCell::new(Vec::new()));
+        let subscription = cx.update(|cx| {
+            let sink = Rc::clone(&languages);
+            subscribe(cx, &events, move |event: &LanguageChanged| {
+                sink.borrow_mut().push(event.0);
+            })
         });
-        config.avatar = Some("<svg>configured-avatar</svg>".to_owned());
-        config.proxies.insert(
-            SmolStr::new_static("local"),
-            ProxyConfig {
-                addr: SmolStr::new_static("127.0.0.1"),
-                port: 1080,
-                authorization: ProxyAuthorizationConfig::UsernameAndPassword {
-                    username: SmolStr::new_static("proxy-user"),
-                    password: SmolStr::new_static("proxy-password"),
-                },
-                resolve_dns_at_remote: true,
-            },
-        );
-        config
-            .proxy_applications
-            .extend([(x_media_target(), ProxyRoute::named("local"))]);
-        config.set_venue_proxy(&venue("binance"), Some(ProxyRoute::named("local")));
-        config.set_venue_proxy(&venue("okx"), Some(ProxyRoute::named("local")));
-        {
-            let VenueSettings::Binance(binance) = config
-                .venues
-                .get_mut(&venue("binance"))
-                .expect("binance is a built-in venue")
-            else {
-                panic!("binance is configured as Binance");
-            };
-            binance.credentials = BinanceCredentials {
-                spot_api_key: SmolStr::new_static("binance-spot-key"),
-                spot_private_key: SmolStr::new_static("binance-spot-private"),
-                spot_passphrase: SmolStr::new_static("binance-spot-passphrase"),
-                usd_m_perp_api_key: SmolStr::new_static("binance-perp-key"),
-                usd_m_perp_private_key: SmolStr::new_static("binance-perp-private"),
-                usd_m_perp_passphrase: SmolStr::new_static("binance-perp-passphrase"),
-            };
-        }
-        {
-            let VenueSettings::Okx(okx) = config
-                .venues
-                .get_mut(&venue("okx"))
-                .expect("okx is a built-in venue")
-            else {
-                panic!("okx is configured as OKX");
-            };
-            okx.credentials = OkxCredentials {
-                api_key: SmolStr::new_static("okx-api-key"),
-                secret_key: SmolStr::new_static("okx-secret-key"),
-                passphrase: SmolStr::new_static("okx-passphrase"),
-            };
-        }
 
-        config
+        drop(subscription);
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(|config| config.language = Language::En, cx);
+        });
+
+        assert!(languages.borrow().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn a_proxy_catalog_change_should_emit_one_event_per_name(cx: &mut TestAppContext) {
+        let mut configured = Config::default();
+        configured
+            .proxies
+            .insert(SmolStr::new_static("zulu"), proxy(0));
+        configured
+            .proxies
+            .insert(SmolStr::new_static("mike"), proxy(0));
+        install_manager_with(cx, configured);
+        let events = events(cx);
+        let names = Rc::new(RefCell::new(Vec::new()));
+        let _proxy = cx.update(|cx| {
+            let sink = Rc::clone(&names);
+            subscribe(cx, &events, move |event: &ProxyCatalogChanged| {
+                sink.borrow_mut().push(event.name.clone());
+            })
+        });
+
+        write_settings(cx, |config| {
+            config
+                .proxies
+                .insert(SmolStr::new_static("alpha"), proxy(0));
+            config
+                .proxies
+                .insert(SmolStr::new_static("zulu"), proxy(1080));
+            config.proxies.remove("mike");
+        })
+        .expect("an in-memory manager has nothing to store");
+
+        assert_eq!(
+            *names.borrow(),
+            [
+                SmolStr::new_static("alpha"),
+                SmolStr::new_static("zulu"),
+                SmolStr::new_static("mike"),
+            ],
+            "the added and edited names come in map order, then the removed name"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_venue_change_should_carry_the_venue_key(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let venues = Rc::new(RefCell::new(Vec::new()));
+        let _venue = cx.update(|cx| {
+            let sink = Rc::clone(&venues);
+            subscribe(cx, &events, move |event: &VenueChanged| {
+                sink.borrow_mut().push(event.venue);
+            })
+        });
+
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(
+                |config| {
+                    config.set_venue_proxy(&VenueId::Okx, Some(ProxyRoute::System));
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(*venues.borrow(), [VenueId::Okx]);
+    }
+
+    #[gpui_kit::test]
+    fn a_subscriber_that_defers_its_write_should_not_reenter_the_emit(cx: &mut TestAppContext) {
+        install_manager(cx);
+        let events = events(cx);
+        let appearances = Rc::new(RefCell::new(Vec::new()));
+        let observed_by_the_next_listener = Rc::new(RefCell::new(Vec::new()));
+        let before_update = cx.update(|cx| cx.global::<ConfigManager>().read().appearance);
+        // The deferred write must actually change the appearance, whichever value the
+        // defaults give it, or there would be no event to observe.
+        let target = if before_update == Appearance::Dark {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        };
+        let (_appearance, _language, _next_listener) = cx.update(|cx| {
+            let appearance = subscribe(cx, &events, {
+                let sink = Rc::clone(&appearances);
+                move |event: &AppearanceChanged| sink.borrow_mut().push(event.0)
+            });
+            let language = cx.subscribe(
+                &events,
+                move |_: Entity<ConfigEvents>, _: &LanguageChanged, cx| {
+                    cx.defer(move |cx| {
+                        cx.update_global::<ConfigManager, _>(|manager, cx| {
+                            manager.update(|config| config.appearance = target, cx);
+                        });
+                    });
+                },
+            );
+            let next_listener = cx.subscribe(&events, {
+                let sink = Rc::clone(&observed_by_the_next_listener);
+                move |_: Entity<ConfigEvents>, _: &LanguageChanged, cx| {
+                    sink.borrow_mut()
+                        .push(cx.global::<ConfigManager>().read().appearance);
+                }
+            });
+
+            (appearance, language, next_listener)
+        });
+
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(|config| config.language = Language::En, cx);
+        });
+
+        assert_eq!(
+            *observed_by_the_next_listener.borrow(),
+            [before_update],
+            "a listener registered after the writer runs before the deferred write"
+        );
+        assert_eq!(*appearances.borrow(), [target]);
+        assert_eq!(
+            cx.update(|cx| cx.global::<ConfigManager>().read().appearance),
+            target
+        );
     }
 }

@@ -45,11 +45,6 @@ impl<P: Send + Sync + 'static> ConfigNotification<P> {
     /// [`crate::events::ConfigEventBridge`]. A cross-crate test fake that drives
     /// an owner's state uses [`Self::publish_for_test`], which only exists with
     /// the `test-support` feature.
-    // No production caller exists until the bridge lands in `crate::events`, so
-    // the write side is compiled only where it has one; an unconditional
-    // `pub(crate)` method is dead code in the library build. The bridge removes
-    // this attribute together with its first call.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish(&self, projection: Arc<P>) {
         // The write must precede the wake: a woken consumer reads `current()`.
         *self.shared.write() = projection;

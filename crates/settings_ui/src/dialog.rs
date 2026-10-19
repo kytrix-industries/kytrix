@@ -916,7 +916,7 @@ mod tests {
         settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
-    use app_config_provider::manager::{ConfigManager, ConfigPersistenceError};
+    use app_config_provider::{manager::ConfigManager, store::ConfigPersistenceError};
     use base_ui::{
         animation::ANIMATION_TICK,
         layer::{Layer, LayerExt},
