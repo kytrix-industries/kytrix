@@ -10,7 +10,7 @@
 
 <p align="center"><em>Key-Tricks — decode the market's key tricks.</em></p>
 
-**Kytrix**, pronounced **Key-Tricks**, means “key tricks”. It is a blazing-fast multi-market terminal built with Rust
+**Kytrix**, pronounced **Key-Tricks**. It is a blazing-fast multi-market terminal built with Rust
 and GPUI, bringing crypto, US equities, ETFs, global indices, and commodities into one workspace: live quotes, order
 books, trade-by-trade data, candlesticks, X (Twitter) feeds, news, charting, and monitoring tools — all in one place,
 within a single interface. Research the market, watch the tape, and monitor what matters to you without switching
