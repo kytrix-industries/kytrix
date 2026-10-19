@@ -7,6 +7,7 @@ use thiserror::Error;
 
 pub(crate) use crate::network::{ProxyConfig, ProxyRoute, ServiceTarget};
 use crate::{
+    change::ConfigChangeSet,
     market_participants::{
         origins::{
             BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin, HyperliquidHttpOrigin,
@@ -430,6 +431,96 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| self.proxy_default.clone())
     }
+
+    /// Returns every configuration item `previous` and `self` disagree on.
+    ///
+    /// The comparison follows the hand-written `PartialEq` of every nested
+    /// settings type: the runtime generations are not settings, and the
+    /// test-support `bindings` of a venue row is not settings either. The
+    /// workspaces are not reported because nothing outside their single writer
+    /// reads them.
+    ///
+    /// The destructuring is exhaustive on purpose: a field added to [`Config`]
+    /// is a compile error here until it is classified as reported or ignored.
+    pub fn changes_since(&self, previous: &Self) -> ConfigChangeSet {
+        let Config {
+            appearance: previous_appearance,
+            language: previous_language,
+            data_time_zone: previous_data_time_zone,
+            account: previous_account,
+            avatar: previous_avatar,
+            proxies: previous_proxies,
+            proxy_default: previous_proxy_default,
+            proxy_applications: previous_proxy_applications,
+            venues: previous_venues,
+            // The workspaces have one writer and no external reader: a layout
+            // write must not wake a single subscriber. The field is still named
+            // rather than matched with `_`, which the workspace forbids.
+            workspaces: WorkspacesConfig { .. },
+            // Generations are runtime identity, not settings: they never take
+            // part in a diff (see `PartialEq for Config`).
+            network_generations: NetworkRuntimeGenerations { .. },
+        } = previous;
+
+        let mut changes = ConfigChangeSet {
+            proxies: Vec::with_capacity(previous_proxies.len().saturating_add(self.proxies.len())),
+            proxy_applications: Vec::with_capacity(
+                previous_proxy_applications
+                    .len()
+                    .saturating_add(self.proxy_applications.len()),
+            ),
+            venues: Vec::with_capacity(previous_venues.len().saturating_add(self.venues.len())),
+            ..ConfigChangeSet::default()
+        };
+
+        if *previous_appearance != self.appearance {
+            changes.appearance = Some(self.appearance);
+        }
+        if *previous_language != self.language {
+            changes.language = Some(self.language);
+        }
+        if *previous_data_time_zone != self.data_time_zone {
+            changes.data_time_zone = Some(self.data_time_zone);
+        }
+        if previous_account != &self.account || previous_avatar != &self.avatar {
+            changes.account_changed = true;
+        }
+        for (name, proxy) in &self.proxies {
+            if previous_proxies.get(name) != Some(proxy) {
+                changes.proxies.push(name.clone());
+            }
+        }
+        for name in previous_proxies.keys() {
+            if !self.proxies.contains_key(name) {
+                changes.proxies.push(name.clone());
+            }
+        }
+        if previous_proxy_default != &self.proxy_default {
+            changes.proxy_default_changed = true;
+        }
+        for (target, route) in &self.proxy_applications {
+            if previous_proxy_applications.get(target) != Some(route) {
+                changes.proxy_applications.push(target.clone());
+            }
+        }
+        for target in previous_proxy_applications.keys() {
+            if !self.proxy_applications.contains_key(target) {
+                changes.proxy_applications.push(target.clone());
+            }
+        }
+        for (venue, settings) in &self.venues {
+            if previous_venues.get(venue) != Some(settings) {
+                changes.venues.push(*venue);
+            }
+        }
+        for venue in previous_venues.keys() {
+            if !self.venues.contains_key(venue) {
+                changes.venues.push(*venue);
+            }
+        }
+
+        changes
+    }
 }
 
 impl Default for Config {
@@ -498,6 +589,7 @@ mod tests {
     use smol_str::SmolStr;
 
     use crate::{
+        change::ConfigChangeSet,
         market_participants::{
             credentials::{
                 BinanceCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
@@ -513,8 +605,8 @@ mod tests {
             },
         },
         network::{
-            KytrixServiceCapability, ProxyAuthorizationConfig, ProxyConfig, ProxyRoute,
-            ServiceTarget,
+            KytrixServiceCapability, NetworkRouteGeneration, NetworkRuntimeGenerations,
+            ProxyAuthorizationConfig, ProxyConfig, ProxyRoute, ServiceTarget,
         },
         settings::{
             AccountConfig, AccountWalletKind, Appearance, Config, Language, ReplaceProxyError,
@@ -547,6 +639,16 @@ mod tests {
     fn x_media_target() -> ServiceTarget {
         ServiceTarget::KytrixService {
             capability: KytrixServiceCapability::XMedia,
+        }
+    }
+
+    /// Runtime generations that differ from [`NetworkRuntimeGenerations::default`]
+    /// in every field.
+    fn different_generations() -> NetworkRuntimeGenerations {
+        NetworkRuntimeGenerations {
+            default_route: NetworkRouteGeneration::new(7),
+            venues: BTreeMap::from([(venue("binance"), NetworkRouteGeneration::new(8))]),
+            services: BTreeMap::from([(x_media_target(), NetworkRouteGeneration::new(9))]),
         }
     }
 
@@ -1995,6 +2097,447 @@ mod tests {
                 wallet_address: "0xabc".to_owned(),
                 wallet_kind: AccountWalletKind::Ethereum,
             })
+        );
+    }
+
+    /// A scalar change carries the new value, not the old one and not merely the
+    /// fact that something moved: that value is what a subscriber projects.
+    #[test]
+    fn a_changed_scalar_should_be_reported_with_its_new_value() {
+        let previous = Config {
+            appearance: Appearance::Light,
+            language: Language::En,
+            data_time_zone: DataTimeZone::from_hours(-5).expect("UTC-5 is an offered offset"),
+            ..Config::default()
+        };
+
+        let appearance = Config {
+            appearance: Appearance::Dark,
+            ..previous.clone()
+        };
+        assert_eq!(
+            appearance.changes_since(&previous),
+            ConfigChangeSet {
+                appearance: Some(Appearance::Dark),
+                ..ConfigChangeSet::default()
+            }
+        );
+
+        let language = Config {
+            language: Language::ZhCn,
+            ..previous.clone()
+        };
+        assert_eq!(
+            language.changes_since(&previous),
+            ConfigChangeSet {
+                language: Some(Language::ZhCn),
+                ..ConfigChangeSet::default()
+            }
+        );
+
+        let data_time_zone = Config {
+            data_time_zone: DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset"),
+            ..previous.clone()
+        };
+        assert_eq!(
+            data_time_zone.changes_since(&previous),
+            ConfigChangeSet {
+                data_time_zone: Some(
+                    DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset")
+                ),
+                ..ConfigChangeSet::default()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unchanged_config_should_report_nothing() {
+        let config = configured_settings();
+
+        assert_eq!(config.changes_since(&config), ConfigChangeSet::default());
+        assert!(config.changes_since(&config).is_empty());
+    }
+
+    /// The account and its avatar are one domain: changing either, or both, is one
+    /// account change and nothing else.
+    #[test]
+    fn an_account_and_an_avatar_should_report_one_account_change() {
+        let previous = configured_settings();
+
+        let mut account = previous.clone();
+        account
+            .account
+            .as_mut()
+            .expect("the configured settings hold an account")
+            .wallet_address = "0xfeed".to_owned();
+
+        let mut avatar = previous.clone();
+        avatar.avatar = Some("<svg>another-avatar</svg>".to_owned());
+
+        let mut both = previous.clone();
+        both.account
+            .as_mut()
+            .expect("the configured settings hold an account")
+            .user_id = "22222222-2222-4222-8222-222222222222".to_owned();
+        both.avatar = Some("<svg>both-changed</svg>".to_owned());
+
+        let mut removed_account = previous.clone();
+        removed_account.account = None;
+
+        let mut removed_avatar = previous.clone();
+        removed_avatar.avatar = None;
+
+        for (label, changed) in [
+            ("the account", account),
+            ("the avatar", avatar),
+            ("both", both),
+            ("a removed account", removed_account),
+            ("a removed avatar", removed_avatar),
+        ] {
+            assert_eq!(
+                changed.changes_since(&previous),
+                ConfigChangeSet {
+                    account_changed: true,
+                    ..ConfigChangeSet::default()
+                },
+                "{label} is one account change"
+            );
+        }
+
+        let absent = Config {
+            account: None,
+            avatar: None,
+            ..previous
+        };
+        assert_eq!(
+            absent.changes_since(&absent),
+            ConfigChangeSet::default(),
+            "no account and no avatar before and after is no change"
+        );
+    }
+
+    /// The proxy catalog is reported by name once per entry: an edit keeps the
+    /// name, an addition names the new entry, a removal names the old one, and a
+    /// rename is an addition and a removal, so it names both.
+    #[test]
+    fn a_proxy_catalog_edit_should_report_the_name_once() {
+        let mut previous = Config::default();
+        previous
+            .proxies
+            .insert(SmolStr::new_static("local"), local_proxy());
+
+        let mut edited = previous.clone();
+        edited
+            .proxies
+            .insert(SmolStr::new_static("local"), replacement_proxy());
+        assert_eq!(
+            edited.changes_since(&previous),
+            ConfigChangeSet {
+                proxies: vec![SmolStr::new_static("local")],
+                ..ConfigChangeSet::default()
+            },
+            "an edited entry is its own name once"
+        );
+
+        let mut added = previous.clone();
+        added
+            .proxies
+            .insert(SmolStr::new_static("backup"), replacement_proxy());
+        assert_eq!(
+            added.changes_since(&previous),
+            ConfigChangeSet {
+                proxies: vec![SmolStr::new_static("backup")],
+                ..ConfigChangeSet::default()
+            },
+            "an added entry is its own name once"
+        );
+
+        let mut removed = previous.clone();
+        assert_eq!(
+            removed.proxies.remove("local"),
+            Some(local_proxy()),
+            "the fixture removes the entry it added"
+        );
+        assert_eq!(
+            removed.changes_since(&previous),
+            ConfigChangeSet {
+                proxies: vec![SmolStr::new_static("local")],
+                ..ConfigChangeSet::default()
+            },
+            "a removed entry is its old name once"
+        );
+
+        let mut renamed = previous.clone();
+        renamed
+            .replace_proxy("local", SmolStr::new_static("renamed"), replacement_proxy())
+            .expect("the source entry exists");
+        assert_eq!(
+            renamed.changes_since(&previous),
+            ConfigChangeSet {
+                proxies: vec![SmolStr::new_static("renamed"), SmolStr::new_static("local"),],
+                ..ConfigChangeSet::default()
+            },
+            "a rename is the added pass first and the removed pass second"
+        );
+    }
+
+    #[test]
+    fn a_default_route_change_should_report_the_flag() {
+        let previous = Config::default();
+        let changed = Config {
+            proxy_default: ProxyRoute::System,
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            changed.changes_since(&previous),
+            ConfigChangeSet {
+                proxy_default_changed: true,
+                ..ConfigChangeSet::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_service_application_edit_should_report_the_target_once() {
+        let previous = configured_settings();
+        let wallet = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::Wallet,
+        };
+
+        let mut added = previous.clone();
+        added
+            .proxy_applications
+            .insert(wallet.clone(), ProxyRoute::named("local"));
+        assert_eq!(
+            added.changes_since(&previous),
+            ConfigChangeSet {
+                proxy_applications: vec![wallet],
+                ..ConfigChangeSet::default()
+            },
+            "an added application is its target once"
+        );
+
+        let mut edited = previous.clone();
+        edited
+            .proxy_applications
+            .insert(x_media_target(), ProxyRoute::Direct);
+        assert_eq!(
+            edited.changes_since(&previous),
+            ConfigChangeSet {
+                proxy_applications: vec![x_media_target()],
+                ..ConfigChangeSet::default()
+            },
+            "an edited application is its target once"
+        );
+
+        let mut removed = previous.clone();
+        assert_eq!(
+            removed.proxy_applications.remove(&x_media_target()),
+            Some(ProxyRoute::named("local")),
+            "the fixture removes the application it added"
+        );
+        assert_eq!(
+            removed.changes_since(&previous),
+            ConfigChangeSet {
+                proxy_applications: vec![x_media_target()],
+                ..ConfigChangeSet::default()
+            },
+            "a removed application is its target once"
+        );
+    }
+
+    /// A venue is reported once however its row moved: an added or removed row,
+    /// a credential, an origin choice and its own line are all settings of the
+    /// same venue.
+    #[test]
+    fn a_venue_edit_should_report_the_venue_once() {
+        let previous = configured_settings();
+        let binance = venue("binance");
+        let okx = venue("okx");
+        let longbridge = venue("longbridge");
+
+        let mut inserted = without_rows();
+        assert!(
+            inserted
+                .venues
+                .insert(longbridge, default_venues()[&longbridge].clone())
+                .is_none(),
+            "the fixture adds a row the empty snapshot does not hold"
+        );
+        assert_eq!(
+            inserted.changes_since(&without_rows()),
+            ConfigChangeSet {
+                venues: vec![longbridge],
+                ..ConfigChangeSet::default()
+            },
+            "an added row is its venue once"
+        );
+
+        let mut removed = previous.clone();
+        assert!(
+            removed.venues.remove(&longbridge).is_some(),
+            "the fixture removes a row the configured snapshot holds"
+        );
+        assert_eq!(
+            removed.changes_since(&previous),
+            ConfigChangeSet {
+                venues: vec![longbridge],
+                ..ConfigChangeSet::default()
+            },
+            "a removed row is its venue once"
+        );
+
+        let mut credentials = previous.clone();
+        assert!(credentials.set_venue_credential(&binance, "spot_api_key", "rotated-key"));
+        assert_eq!(
+            credentials.changes_since(&previous),
+            ConfigChangeSet {
+                venues: vec![binance],
+                ..ConfigChangeSet::default()
+            },
+            "a credential edit is its venue once"
+        );
+
+        let mut origins = previous.clone();
+        assert!(origins.set_binance_market_origins(
+            &binance,
+            BinanceMarket::Spot,
+            &BinanceOrigins {
+                http: BinanceHttpOrigin::Api3,
+                websocket: BinanceWebsocketOrigin::StreamAlt,
+            },
+        ));
+        assert_eq!(
+            origins.changes_since(&previous),
+            ConfigChangeSet {
+                venues: vec![binance],
+                ..ConfigChangeSet::default()
+            },
+            "an origin edit is its venue once"
+        );
+
+        let mut proxy = previous.clone();
+        assert!(proxy.set_venue_proxy(&okx, Some(ProxyRoute::named("local"))));
+        assert_eq!(
+            proxy.changes_since(&previous),
+            ConfigChangeSet {
+                venues: vec![okx],
+                ..ConfigChangeSet::default()
+            },
+            "a line edit is its venue once"
+        );
+    }
+
+    /// The workspaces have one writer and no external reader: a layout write is a
+    /// real configuration difference that wakes nobody.
+    #[test]
+    fn a_workspace_only_change_should_report_nothing() {
+        let previous = configured_settings();
+        let mut changed = previous.clone();
+        changed.workspaces = WorkspacesConfig {
+            entries: vec![WorkspaceConfig {
+                name: SmolStr::new_static("Workspace 1"),
+                layout: WorkspaceLayout::single_pane(),
+            }],
+            active: Some(SmolStr::new_static("Workspace 1")),
+        };
+
+        assert_ne!(changed, previous, "a workspace write is a real difference");
+        assert_eq!(changed.changes_since(&previous), ConfigChangeSet::default());
+    }
+
+    /// Every settings field the change set covers can reach it: a field that
+    /// could not would be one the exhaustive destructuring names as ignored, and
+    /// this is the runtime guard on that classification.
+    ///
+    /// The two ignored fields are checked apart: a workspace write has its own
+    /// test, and the network generations are runtime identity that `PartialEq`
+    /// does not compare at all.
+    #[test]
+    fn every_non_workspace_difference_should_report_something() {
+        let previous = configured_settings();
+        let with_change = |update: fn(&mut Config)| {
+            let mut config = previous.clone();
+            update(&mut config);
+            config
+        };
+        let changes = [
+            (
+                "appearance",
+                with_change(|config| config.appearance = Appearance::Light),
+            ),
+            (
+                "language",
+                with_change(|config| config.language = Language::En),
+            ),
+            (
+                "display time zone",
+                with_change(|config| {
+                    config.data_time_zone =
+                        DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset");
+                }),
+            ),
+            (
+                "account",
+                with_change(|config| {
+                    config
+                        .account
+                        .as_mut()
+                        .expect("the configured settings hold an account")
+                        .wallet_address = "0xfeed".to_owned();
+                }),
+            ),
+            (
+                "avatar",
+                with_change(|config| config.avatar = Some("<svg>another-avatar</svg>".to_owned())),
+            ),
+            (
+                "proxy catalog",
+                with_change(|config| {
+                    config
+                        .proxies
+                        .insert(SmolStr::new_static("local"), replacement_proxy());
+                }),
+            ),
+            (
+                "default route",
+                with_change(|config| config.proxy_default = ProxyRoute::System),
+            ),
+            (
+                "service application",
+                with_change(|config| {
+                    config
+                        .proxy_applications
+                        .insert(x_media_target(), ProxyRoute::Direct);
+                }),
+            ),
+            (
+                "venue",
+                with_change(|config| {
+                    assert!(config.set_venue_proxy(&venue("binance"), Some(ProxyRoute::Direct)));
+                }),
+            ),
+        ];
+
+        for (domain, changed) in changes {
+            assert_ne!(changed, previous, "the {domain} fixture must differ");
+            assert!(
+                !changed.changes_since(&previous).is_empty(),
+                "a {domain} difference must be reported"
+            );
+        }
+
+        let mut regenerated = previous.clone();
+        regenerated.set_network_generations(different_generations());
+        assert_eq!(
+            regenerated, previous,
+            "the runtime generations are not settings, so the snapshots compare equal"
+        );
+        assert_eq!(
+            regenerated.changes_since(&previous),
+            ConfigChangeSet::default(),
+            "a generation-only change reports nothing"
         );
     }
 }

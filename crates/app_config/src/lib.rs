@@ -11,6 +11,7 @@
 //! connection pools remain outside this crate in `market_participants_connector`;
 //! `app_config` never creates or owns those runtime resources.
 
+pub mod change;
 pub mod market_participants;
 pub mod network;
 pub mod settings;

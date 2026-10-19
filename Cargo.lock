@@ -362,6 +362,7 @@ dependencies = [
  "gpui-kit",
  "log",
  "market_participants_model",
+ "parking_lot",
  "serde_json",
  "smol_str",
  "tempfile",
