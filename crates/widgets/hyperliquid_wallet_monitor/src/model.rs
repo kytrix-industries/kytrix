@@ -1313,29 +1313,35 @@ pub(super) fn now_millis() -> Option<i64> {
     i64::try_from(value).ok()
 }
 
-/// When a fill, an order or a transfer happened, in UTC, to the second.
+/// When a fill, an order or a transfer happened, read in `zone`, to the second.
 ///
 /// It is what a relative age is a summary of, so it is written the same way for every row.
-pub(super) fn absolute_time(timestamp: i64) -> SharedString {
+pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SharedString {
     use time::OffsetDateTime;
 
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--"),
-        |time| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-                    time.year(),
-                    u8::from(time.month()),
-                    time.day(),
-                    time.hour(),
-                    time.minute(),
-                    time.second()
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|time| time.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--"),
+            |time| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        time.year(),
+                        u8::from(time.month()),
+                        time.day(),
+                        time.hour(),
+                        time.minute(),
+                        time.second()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 #[cfg(test)]
@@ -2161,12 +2167,58 @@ mod tests {
     }
 
     #[test]
-    fn absolute_time_should_be_utc_to_the_second() {
+    fn absolute_time_should_be_read_in_the_display_zone_to_the_second() {
         assert_eq!(
-            absolute_time(1_700_000_000_000).as_ref(),
-            "2023-11-14 22:13:20Z"
+            absolute_time(1_700_000_000_000, time::UtcOffset::UTC).as_ref(),
+            "2023-11-14 22:13:20"
         );
-        assert_eq!(absolute_time(i64::MIN).as_ref(), "--");
+        assert_eq!(
+            absolute_time(
+                1_700_000_000_000,
+                time::UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
+            )
+            .as_ref(),
+            "2023-11-15 06:13:20"
+        );
+        assert_eq!(absolute_time(i64::MIN, time::UtcOffset::UTC).as_ref(), "--");
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds.
+    /// That is not a date this can write, so it is a placeholder rather than a panic.
+    #[test]
+    fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+
+        assert_eq!(
+            absolute_time(
+                timestamp,
+                time::UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            )
+            .as_ref(),
+            "--"
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+
+        assert_eq!(
+            absolute_time(
+                timestamp,
+                time::UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
+            )
+            .as_ref(),
+            "--",
+            "a western offset runs off the other end of the calendar"
+        );
     }
 
     /// A tab's index is where it sits in the order the tabs are shown in.

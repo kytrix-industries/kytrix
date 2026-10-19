@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use gpui_kit::SharedString;
@@ -18,7 +18,7 @@ use market_participants_model::{
     listing::rules::ListingPrecision, market::book::ListingForceOrder,
 };
 use smol_str::{ToSmolStr, format_smolstr};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 pub(super) const MAX_FORCE_ORDERS: usize = 200;
 
@@ -72,7 +72,7 @@ impl ForceOrdersSnapshot {
 pub(super) struct ForceOrderRow {
     order: ListingForceOrder,
     listing: ForceOrderListing,
-    display: OnceLock<ForceOrderDisplay>,
+    display: Mutex<Option<(UtcOffset, Arc<ForceOrderDisplay>)>>,
 }
 
 impl ForceOrderRow {
@@ -80,9 +80,22 @@ impl ForceOrderRow {
         &self.order
     }
 
-    pub(super) fn display(&self) -> &ForceOrderDisplay {
-        self.display
-            .get_or_init(|| ForceOrderDisplay::new(&self.order, &self.listing))
+    /// The text of a row that is produced only once something draws it.
+    ///
+    /// The zone the time was read in is remembered beside the text, so a frame that
+    /// draws the same zone reuses it and a frame after the setting moved reads it
+    /// again.
+    pub(super) fn display(&self, zone: UtcOffset) -> Arc<ForceOrderDisplay> {
+        let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_zone, display)) = cached.as_ref()
+            && *cached_zone == zone
+        {
+            return Arc::clone(display);
+        }
+
+        let display = Arc::new(ForceOrderDisplay::new(&self.order, &self.listing, zone));
+        *cached = Some((zone, Arc::clone(&display)));
+        display
     }
 }
 
@@ -98,7 +111,7 @@ pub(super) struct ForceOrderDisplay {
 }
 
 impl ForceOrderDisplay {
-    fn new(order: &ListingForceOrder, listing: &ForceOrderListing) -> Self {
+    fn new(order: &ListingForceOrder, listing: &ForceOrderListing, zone: UtcOffset) -> Self {
         // A liquidation is written at the increments of its own listing, so a price
         // of `90000` on a listing with a tick of `0.01` reads as `90000.00`.
         let (price, quantity) = match listing.precision {
@@ -121,7 +134,7 @@ impl ForceOrderDisplay {
             listing: listing.label.clone(),
             price: SharedString::new(price.as_str()),
             quantity: SharedString::new(quantity.as_str()),
-            time: format_utc_time(order.timestamp),
+            time: format_time(order.timestamp, zone),
         }
     }
 }
@@ -173,7 +186,7 @@ impl ForceOrdersState {
                 Arc::new(ForceOrderRow {
                     order: entry.order.clone(),
                     listing: entry.listing.clone(),
-                    display: OnceLock::new(),
+                    display: Mutex::new(None),
                 }),
             );
             retained += 1;
@@ -198,22 +211,29 @@ impl ForceOrdersState {
     }
 }
 
-fn format_utc_time(timestamp: i64) -> SharedString {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--:--:--.---"),
-        |datetime| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:02}:{:02}:{:02}.{:03}",
-                    datetime.hour(),
-                    datetime.minute(),
-                    datetime.second(),
-                    datetime.millisecond()
+/// The time of a liquidation, read in the zone the settings display data in.
+fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|datetime| datetime.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--:--:--.---"),
+            |datetime| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:02}:{:02}:{:02}.{:03}",
+                        datetime.hour(),
+                        datetime.minute(),
+                        datetime.second(),
+                        datetime.millisecond()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 #[cfg(test)]
@@ -335,17 +355,63 @@ mod tests {
     }
 
     #[test]
-    fn row_display_should_be_initialized_once_on_demand() {
+    fn row_display_should_be_built_once_per_zone() {
         let mut state = ForceOrdersState::new(1);
         state.merge(&[entry("perpetual", "BTCUSDT", 1)]);
         let snapshot = state.snapshot();
         let row = &snapshot.orders()[0];
-        assert!(row.display.get().is_none());
+        assert!(
+            row.display
+                .lock()
+                .expect("the cache is not poisoned")
+                .is_none()
+        );
 
-        let first = row.display();
-        let second = row.display();
+        let first = row.display(UtcOffset::UTC);
+        let second = row.display(UtcOffset::UTC);
+        let other = row.display(UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset"));
 
-        assert!(std::ptr::eq(first, second));
+        assert!(Arc::ptr_eq(&first, &second), "the same zone reuses the row");
+        assert_ne!(
+            first.time, other.time,
+            "another zone is another reading of the same instant"
+        );
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds.
+    /// That is not a time this can write, so it is a placeholder rather than a panic.
+    #[test]
+    fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            ),
+            "--:--:--.---"
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
+            ),
+            "--:--:--.---",
+            "a western offset runs off the other end of the calendar"
+        );
     }
 
     /// A liquidation states its numbers at the increments of its own listing, so a
@@ -357,7 +423,7 @@ mod tests {
         order.order.price.value = Price::from(90_000_u64);
         state.merge(&[order]);
         let snapshot = state.snapshot();
-        let display = snapshot.orders()[0].display();
+        let display = snapshot.orders()[0].display(UtcOffset::UTC);
 
         assert_eq!(
             [display.price.as_ref(), display.quantity.as_ref()],
@@ -374,7 +440,7 @@ mod tests {
         order.listing.precision = None;
         state.merge(&[order]);
         let snapshot = state.snapshot();
-        let display = snapshot.orders()[0].display();
+        let display = snapshot.orders()[0].display(UtcOffset::UTC);
 
         assert_eq!(
             [display.price.as_ref(), display.quantity.as_ref()],

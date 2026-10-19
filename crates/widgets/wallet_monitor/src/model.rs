@@ -23,7 +23,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use gpui_kit::{App, SharedString};
@@ -33,7 +33,7 @@ use kytrix_service_provider::service::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 use widget::error::LocalizedError;
 
 /// How many transfers one subscription retains.
@@ -51,7 +51,7 @@ pub(super) struct TransferItem {
     to_address: SharedString,
     amount: SharedString,
     token_symbol: SharedString,
-    display: OnceLock<TransferDisplay>,
+    display: Mutex<Option<(UtcOffset, Arc<TransferDisplay>)>>,
 }
 
 impl TransferItem {
@@ -63,7 +63,7 @@ impl TransferItem {
             to_address: SharedString::new(transfer.to_address.as_str()),
             amount: SharedString::new(transfer.amount.as_str()),
             token_symbol: SharedString::new(transfer.token_symbol.as_str()),
-            display: OnceLock::new(),
+            display: Mutex::new(None),
         }
     }
 
@@ -89,9 +89,20 @@ impl TransferItem {
     ///
     /// A transfer is retained the moment it arrives, while most of what a feed holds is
     /// never on screen: joining and formatting are the one part of a row that costs
-    /// anything, so they happen here rather than when the transfer is retained.
-    pub(super) fn display(&self) -> &TransferDisplay {
-        self.display.get_or_init(|| TransferDisplay::new(self))
+    /// anything, so they happen here rather than when the transfer is retained. The zone
+    /// the time was read in is remembered beside the text, so a frame that draws the same
+    /// zone reuses it and a frame after the setting moved reads it again.
+    pub(super) fn display(&self, zone: UtcOffset) -> Arc<TransferDisplay> {
+        let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_zone, display)) = cached.as_ref()
+            && *cached_zone == zone
+        {
+            return Arc::clone(display);
+        }
+
+        let display = Arc::new(TransferDisplay::new(self, zone));
+        *cached = Some((zone, Arc::clone(&display)));
+        display
     }
 }
 
@@ -104,12 +115,12 @@ pub(super) struct TransferDisplay {
 }
 
 impl TransferDisplay {
-    fn new(item: &TransferItem) -> Self {
+    fn new(item: &TransferItem, zone: UtcOffset) -> Self {
         Self {
             amount: SharedString::new(
                 format_smolstr!("{} {}", item.amount, item.token_symbol).as_str(),
             ),
-            time: format_time(item.timestamp),
+            time: format_time(item.timestamp, zone),
         }
     }
 }
@@ -320,25 +331,34 @@ impl LocalizedError for WalletMonitorDataError {
     }
 }
 
-/// The time of a transfer, in UTC, which is the clock the service stamps transfers on.
-fn format_time(timestamp: i64) -> SharedString {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--"),
-        |time| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    time.year(),
-                    u8::from(time.month()),
-                    time.day(),
-                    time.hour(),
-                    time.minute(),
-                    time.second()
+/// The time of a transfer, read in the zone the settings display data in.
+///
+/// The service stamps transfers in UTC, so what a reader sees is that instant
+/// converted by the offset the caller read from the settings.
+fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|time| time.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--"),
+            |time| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        time.year(),
+                        u8::from(time.month()),
+                        time.day(),
+                        time.hour(),
+                        time.minute(),
+                        time.second()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 #[cfg(test)]
@@ -480,20 +500,29 @@ mod tests {
         zero.amount = SmolStr::new_static("0");
         state.push(zero);
 
-        assert_eq!(state.snapshot().items()[0].display().amount, "0 ETH");
+        assert_eq!(
+            state.snapshot().items()[0].display(UtcOffset::UTC).amount,
+            "0 ETH"
+        );
     }
 
     #[test]
-    fn the_time_of_a_transfer_should_be_utc() {
+    fn the_time_of_a_transfer_should_be_read_in_the_display_zone() {
         let mut state = TransferState::new();
         state.push(transfer("instant", 1_700_000_000_000));
         let snapshot = state.snapshot();
         let item = &snapshot.items()[0];
 
         assert_eq!(
-            item.display().time,
+            item.display(UtcOffset::UTC).time,
             "2023-11-14 22:13:20",
-            "the clock is the service's rather than the reader's"
+            "the instant is the service's rather than the reader's clock"
+        );
+        assert_eq!(
+            item.display(UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset"))
+                .time,
+            "2023-11-15 06:13:20",
+            "and it is drawn in the zone the settings display data in"
         );
     }
 
@@ -504,7 +533,43 @@ mod tests {
         let snapshot = state.snapshot();
         let item = &snapshot.items()[0];
 
-        assert_eq!(item.display().time, "--");
+        assert_eq!(item.display(UtcOffset::UTC).time, "--");
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds.
+    /// That is not a date this can write, so it is a placeholder rather than a panic.
+    #[test]
+    fn a_transfer_the_display_zone_cannot_hold_should_read_without_a_time() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            ),
+            "--"
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
+            ),
+            "--",
+            "a western offset runs off the other end of the calendar"
+        );
     }
 
     #[test]

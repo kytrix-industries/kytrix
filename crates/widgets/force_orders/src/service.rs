@@ -1020,7 +1020,7 @@ mod tests {
             panic!("latest value should be a force-orders snapshot");
         };
         let label = snapshot.orders()[0]
-            .display()
+            .display(time::UtcOffset::UTC)
             .listing
             .clone()
             .expect("the injected generation names the row");
@@ -1084,7 +1084,7 @@ mod tests {
         let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
             panic!("latest value should be a force-orders snapshot");
         };
-        let display = snapshot.orders()[0].display();
+        let display = snapshot.orders()[0].display(time::UtcOffset::UTC);
 
         assert_eq!(
             [display.price.as_ref(), display.quantity.as_ref()],
@@ -1145,7 +1145,10 @@ mod tests {
             "the fixture really published no name for the listing"
         );
         assert!(
-            snapshot.orders()[0].display().listing.is_none(),
+            snapshot.orders()[0]
+                .display(time::UtcOffset::UTC)
+                .listing
+                .is_none(),
             "a listing the generation does not name keeps no label"
         );
         runtime.shutdown().await;

@@ -11,6 +11,7 @@ use gpui_kit::{
 };
 use i18n::language::codes::LanguageCode;
 use market_participants_model::listing::rules::ListingPrecision;
+use time::UtcOffset;
 
 use super::{
     axes::{AxisScale, ChartLayout, nearest_index},
@@ -247,6 +248,14 @@ impl<D: ChartData> Chart<D> {
             data: Rc::new(RefCell::new(data)),
             state: Rc::new(ChartState::default()),
         }
+    }
+
+    /// Rewrites the chart's time labels in another display zone.
+    ///
+    /// The prepared frame is keyed by the zone, so the next paint rebuilds what the
+    /// labels moved rather than serving the frame from before the change.
+    pub(super) fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
+        self.data.borrow_mut().set_time_zone(zone)
     }
 
     /// Rebuilds the chart from a new window, reporting whether anything changed.
@@ -600,6 +609,18 @@ impl ChartDispatch {
         self.state().horizontal_scroll()
     }
 
+    /// Rewrites every time label in another display zone.
+    ///
+    /// Returns whether anything moved, which is what keeps a frame that redrew for
+    /// the setting from claiming a change no label made.
+    pub(crate) fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
+        match self {
+            Self::OpenInterest(chart) => chart.set_time_zone(zone),
+            Self::TakerVolume(chart) => chart.set_time_zone(zone),
+            Self::Ratio(chart) => chart.set_time_zone(zone),
+        }
+    }
+
     pub(crate) fn set_snapshot(&mut self, message: &StatisticsStreamMessage) -> bool {
         let StatisticsStreamMessage::Snapshot(snapshot) = message else {
             return false;
@@ -667,6 +688,10 @@ pub(crate) trait ChartData: Sized + 'static {
 
     /// The tooltip of one point.
     fn tooltip(&self, index: usize) -> Option<Tooltip>;
+
+    /// Rewrites the chart's time labels in another display zone, reporting
+    /// whether anything moved.
+    fn set_time_zone(&mut self, zone: UtcOffset) -> bool;
 
     /// Rebuilds the chart from a new window, reporting whether anything changed.
     fn set_snapshot(

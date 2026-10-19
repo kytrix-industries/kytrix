@@ -48,6 +48,7 @@ use market_participants_model::{
         units::{MarketQuantity, Side},
     },
 };
+use widget::time_zone::data_time_zone;
 
 use super::{
     model::{
@@ -181,7 +182,7 @@ impl<const N: usize> DetailRows<N> {
             .into();
     }
 
-    fn cell(&self, row_index: usize, column_index: usize, _cx: &App) -> AnyElement {
+    fn cell(&self, row_index: usize, column_index: usize, cx: &App) -> AnyElement {
         let Some(cell) = self
             .rows
             .get(row_index)
@@ -217,7 +218,7 @@ impl<const N: usize> DetailRows<N> {
                 .id(ElementId::Name(SharedString::new_static(
                     "HyperliquidWalletTimeCell",
                 )))
-                .aria_label(absolute_time(timestamp))
+                .aria_label(absolute_time(timestamp, data_time_zone(cx)))
                 .child(content)
                 .into_any_element(),
             None => content,

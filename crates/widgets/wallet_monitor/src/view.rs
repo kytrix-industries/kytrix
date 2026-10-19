@@ -72,6 +72,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, on_data_time_zone_change},
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -243,6 +244,8 @@ pub struct WalletMonitorWidget {
     /// The open dialog, which is the pane's only way of managing addresses.
     dialog: Option<WeakEntity<WalletMonitorDialog>>,
     _account_task: Task<()>,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for WalletMonitorWidget {
@@ -366,6 +369,12 @@ impl WalletMonitorWidget {
             selection_read: SelectionRead::default(),
             dialog: None,
             _account_task: account_task,
+            // The rows are built by the list entity, which keeps what it drew until it
+            // is told otherwise: moving the display zone has to wake the list itself.
+            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+                this.list.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
         }
     }
 
@@ -1073,7 +1082,7 @@ fn feed_list() -> DequeUnsizedList<Arc<TransferItem>> {
 /// the newest transfer is the row a reader starts at.
 fn transfer_row(item: &TransferItem, index: usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let display = item.display();
+    let display = item.display(data_time_zone(cx));
     let row = div()
         .id(ElementId::NamedInteger(
             SharedString::new_static("WalletTransferRow"),

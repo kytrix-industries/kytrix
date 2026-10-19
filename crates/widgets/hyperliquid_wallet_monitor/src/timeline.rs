@@ -56,6 +56,7 @@ use market_participants_model::{
     },
 };
 use smol_str::{SmolStr, format_smolstr};
+use widget::time_zone::data_time_zone;
 
 use super::model::{
     AgeBucket, DisplayPrecision, TimelineSnapshot, absolute_time, age_bucket, now_millis,
@@ -1196,7 +1197,7 @@ fn tooltip_row(
                     marker_row_id(row.timestamp),
                 ))
                 .flex_none()
-                .aria_label(absolute_time(row.timestamp))
+                .aria_label(absolute_time(row.timestamp, data_time_zone(cx)))
                 .text_color(theme.roles.fg.muted.hsla)
                 .child(age_text(cx, now, row.timestamp)),
         )

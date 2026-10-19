@@ -11,6 +11,8 @@ use gpui_kit::{App, Bounds, Pixels, Point, SharedString};
 use i18n::t;
 use market_participants_model::listing::rules::ListingPrecision;
 use smol_str::SmolStr;
+use time::UtcOffset;
+use widget::time_zone::data_time_zone;
 
 use super::{
     ChartData,
@@ -69,13 +71,22 @@ pub(crate) struct TakerVolumeChart {
     volume: AxisScale,
     time_labels: Box<[SmolStr]>,
     tooltips: Arc<[Tooltip]>,
+    /// The zone the axis labels and tooltips were written in.
+    zone: UtcOffset,
 }
 
 impl TakerVolumeChart {
     /// Builds an empty chart of `instrument`'s taker volume.
     pub(super) fn new(cx: &App, base: &str) -> Self {
         let labels = Labels::resolve(cx);
-        Self::build(Arc::from(Vec::new()), None, 0, SmolStr::new(base), labels)
+        Self::build(
+            Arc::from(Vec::new()),
+            None,
+            0,
+            SmolStr::new(base),
+            labels,
+            data_time_zone(cx),
+        )
     }
 
     fn build(
@@ -84,6 +95,7 @@ impl TakerVolumeChart {
         revision: u64,
         base: SmolStr,
         labels: Labels,
+        zone: UtcOffset,
     ) -> Self {
         let quantity_tick = metadata.map(|metadata| metadata.quantity_tick);
         let volume = AxisScale::new(
@@ -98,13 +110,15 @@ impl TakerVolumeChart {
                 None => format_compact(value, step),
             },
         );
-        let time_labels = time_labels(points.iter().map(|point| point.timestamp), format_axis_time);
+        let time_labels = time_labels(points.iter().map(|point| point.timestamp), |timestamp| {
+            format_axis_time(timestamp, zone)
+        });
         let buy_label = label_with_unit(labels.buy.as_str(), base.as_str());
         let sell_label = label_with_unit(labels.sell.as_str(), base.as_str());
         let tooltips = points
             .iter()
             .map(|point| Tooltip {
-                title: format_tooltip_time(point.timestamp),
+                title: format_tooltip_time(point.timestamp, zone),
                 entries: vec![
                     TooltipEntry {
                         text: labelled_value(
@@ -140,6 +154,7 @@ impl TakerVolumeChart {
             volume,
             time_labels,
             tooltips,
+            zone,
         }
     }
 }
@@ -163,7 +178,7 @@ impl ChartData for TakerVolumeChart {
     }
 
     fn frame_key(&self, bounds: Bounds<Pixels>) -> FrameKey {
-        FrameKey::new(bounds, self.revision, self.metadata.is_some())
+        FrameKey::new(bounds, self.revision, self.metadata.is_some(), self.zone)
     }
 
     fn scales(&self) -> (Option<&AxisScale>, &AxisScale, Option<&AxisScale>) {
@@ -202,6 +217,22 @@ impl ChartData for TakerVolumeChart {
         self.tooltips.get(index).cloned()
     }
 
+    /// Rewrites the labels in another display zone.
+    ///
+    /// Returns whether anything moved: the same zone is the same labels, and the
+    /// chart is left exactly as it was.
+    fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
+        if self.zone == zone {
+            return false;
+        }
+        let points = Arc::clone(&self.points);
+        let metadata = self.metadata;
+        let base = self.base.clone();
+        let labels = self.labels.clone();
+        *self = Self::build(points, metadata, self.revision, base, labels, zone);
+        true
+    }
+
     fn set_snapshot(
         &mut self,
         revision: u64,
@@ -219,7 +250,7 @@ impl ChartData for TakerVolumeChart {
         }
         let base = self.base.clone();
         let labels = self.labels.clone();
-        *self = Self::build(points, metadata, revision, base, labels);
+        *self = Self::build(points, metadata, revision, base, labels, self.zone);
         true
     }
 }

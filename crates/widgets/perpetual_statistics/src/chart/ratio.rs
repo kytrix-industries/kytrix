@@ -12,6 +12,8 @@ use gpui_kit::{App, Bounds, Pixels, Point, SharedString};
 use i18n::t;
 use market_participants_model::listing::rules::ListingPrecision;
 use smol_str::SmolStr;
+use time::UtcOffset;
+use widget::time_zone::data_time_zone;
 
 use super::{
     ChartData,
@@ -86,6 +88,8 @@ pub(crate) struct RatioChart {
     /// The indices whose ratio is a reading, which is what a hover may land on
     /// and the only points the chart draws.
     valid: Box<[usize]>,
+    /// The zone the axis labels and tooltips were written in.
+    zone: UtcOffset,
 }
 
 impl RatioChart {
@@ -95,10 +99,16 @@ impl RatioChart {
             Arc::from(Vec::new()),
             0,
             Labels::resolve(cx, long, short, ratio),
+            data_time_zone(cx),
         )
     }
 
-    fn build(points: Arc<[LongShortRatioPoint]>, revision: u64, labels: Labels) -> Self {
+    fn build(
+        points: Arc<[LongShortRatioPoint]>,
+        revision: u64,
+        labels: Labels,
+        zone: UtcOffset,
+    ) -> Self {
         let valid = points
             .iter()
             .enumerate()
@@ -115,11 +125,13 @@ impl RatioChart {
             ),
             |value, _| format_ratio(value),
         );
-        let time_labels = time_labels(points.iter().map(|point| point.timestamp), format_axis_time);
+        let time_labels = time_labels(points.iter().map(|point| point.timestamp), |timestamp| {
+            format_axis_time(timestamp, zone)
+        });
         let tooltips = points
             .iter()
             .map(|point| Tooltip {
-                title: format_tooltip_time(point.timestamp),
+                title: format_tooltip_time(point.timestamp, zone),
                 entries: ratio_shares(point.ratio)
                     .map_or_else(Vec::new, |(long, short)| {
                         vec![
@@ -153,6 +165,7 @@ impl RatioChart {
             time_labels,
             tooltips,
             valid,
+            zone,
         }
     }
 }
@@ -176,7 +189,7 @@ impl ChartData for RatioChart {
     }
 
     fn frame_key(&self, bounds: Bounds<Pixels>) -> FrameKey {
-        FrameKey::new(bounds, self.revision, true)
+        FrameKey::new(bounds, self.revision, true, self.zone)
     }
 
     fn scales(&self) -> (Option<&AxisScale>, &AxisScale, Option<&AxisScale>) {
@@ -216,6 +229,21 @@ impl ChartData for RatioChart {
             .cloned()
     }
 
+    /// Rewrites the labels in another display zone.
+    ///
+    /// Returns whether anything moved: the same zone is the same labels, and the
+    /// chart is left exactly as it was.
+    fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
+        if self.zone == zone {
+            return false;
+        }
+        let points = Arc::clone(&self.points);
+        let revision = self.revision;
+        let labels = self.labels.clone();
+        *self = Self::build(points, revision, labels, zone);
+        true
+    }
+
     fn set_snapshot(
         &mut self,
         revision: u64,
@@ -230,7 +258,7 @@ impl ChartData for RatioChart {
             return false;
         }
         let labels = self.labels.clone();
-        *self = Self::build(points, revision, labels);
+        *self = Self::build(points, revision, labels, self.zone);
         true
     }
 }

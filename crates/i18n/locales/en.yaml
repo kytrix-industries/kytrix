@@ -859,6 +859,8 @@ settings_ui:
     mode_description: Choose the application's light, dark, or system appearance
     system: System
     title: Appearance
+  general:
+    title: General
   market_participants:
     access_token: Access Token
     access_token_description: The access token issued for the application; the venue authenticates a session with it
@@ -948,6 +950,9 @@ settings_ui:
     title: The settings could not be saved
   search:
     placeholder: Search settings
+  time_zone:
+    description: Choose the time zone widgets display data timestamps in; every data timestamp is converted to it
+    title: Data time zone
 
 startup:
   config_reset_message: <p align="center">The configuration file was damaged and has been reset to defaults. The previous file was kept as %{file}.</p>

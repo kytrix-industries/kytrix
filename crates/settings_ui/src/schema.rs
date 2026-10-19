@@ -24,13 +24,14 @@ use app_config::{
     },
     network::{KytrixServiceCapability, ServiceTarget},
     settings::Config,
+    time_zone::DataTimeZone,
 };
 use gpui_kit::SharedString;
 use market_participants_model::{
     display::lexical::scope_display_code,
     identifier::{VenueId, VenueScopeId},
 };
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use widget::venue::VenueDisplay;
 
 use crate::{
@@ -52,6 +53,7 @@ const fn text(key: &'static str) -> Text {
 pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
     let mut pages = vec![
         appearance_page(),
+        time_zone_page(),
         management_page(),
         applications_page(venues),
     ];
@@ -59,7 +61,16 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
     pages.push(about_page());
 
     let mut tree = vec![
-        TreeNodeDef::Page(SharedString::new_static("appearance")),
+        TreeNodeDef::Group {
+            id: "general",
+            label: text("settings_ui.general.title"),
+            keywords: &["general", "通用", "设置"],
+            open: true,
+            children: vec![
+                TreeNodeDef::Page(SharedString::new_static("appearance")),
+                TreeNodeDef::Page(SharedString::new_static("time-zone")),
+            ],
+        },
         TreeNodeDef::Group {
             id: "proxy",
             label: text("settings_ui.proxies.title"),
@@ -215,6 +226,86 @@ static LANGUAGE_OPTIONS: [SelectOptionDef; 2] = [
     SelectOptionDef::new(text("settings_ui.appearance.language_zh_cn"), "zh-CN"),
     SelectOptionDef::new(text("settings_ui.appearance.language_en"), "en"),
 ];
+
+/// The offsets the data time zone offers, west to east.
+///
+/// Each choice is drawn as the offset it stores, because that is what a UTC offset
+/// is called in every language. The list is spelled out rather than derived so the
+/// order the control draws is visible here; a test holds it to [`DataTimeZone::ALL`].
+static DATA_TIME_ZONE_OPTIONS: [SelectOptionDef; DataTimeZone::COUNT] = [
+    SelectOptionDef::literal("UTC-12", "-12"),
+    SelectOptionDef::literal("UTC-11", "-11"),
+    SelectOptionDef::literal("UTC-10", "-10"),
+    SelectOptionDef::literal("UTC-9", "-9"),
+    SelectOptionDef::literal("UTC-8", "-8"),
+    SelectOptionDef::literal("UTC-7", "-7"),
+    SelectOptionDef::literal("UTC-6", "-6"),
+    SelectOptionDef::literal("UTC-5", "-5"),
+    SelectOptionDef::literal("UTC-4", "-4"),
+    SelectOptionDef::literal("UTC-3", "-3"),
+    SelectOptionDef::literal("UTC-2", "-2"),
+    SelectOptionDef::literal("UTC-1", "-1"),
+    SelectOptionDef::literal("UTC+0", "0"),
+    SelectOptionDef::literal("UTC+1", "1"),
+    SelectOptionDef::literal("UTC+2", "2"),
+    SelectOptionDef::literal("UTC+3", "3"),
+    SelectOptionDef::literal("UTC+4", "4"),
+    SelectOptionDef::literal("UTC+5", "5"),
+    SelectOptionDef::literal("UTC+6", "6"),
+    SelectOptionDef::literal("UTC+7", "7"),
+    SelectOptionDef::literal("UTC+8", "8"),
+    SelectOptionDef::literal("UTC+9", "9"),
+    SelectOptionDef::literal("UTC+10", "10"),
+    SelectOptionDef::literal("UTC+11", "11"),
+    SelectOptionDef::literal("UTC+12", "12"),
+    SelectOptionDef::literal("UTC+13", "13"),
+    SelectOptionDef::literal("UTC+14", "14"),
+];
+
+fn time_zone_page() -> PageDef {
+    PageDef {
+        id: SharedString::new_static("time-zone"),
+        title: PageTitle::Key(text("settings_ui.time_zone.title")),
+        keywords: &[
+            "time zone",
+            "timezone",
+            "utc",
+            "offset",
+            "时区",
+            "时间",
+            "数据时间",
+        ],
+        sections: vec![SectionDef::fields(
+            None,
+            false,
+            vec![FieldDef {
+                id: SharedString::new_static("time-zone.offset"),
+                label: text("settings_ui.time_zone.title"),
+                description: text("settings_ui.time_zone.description"),
+                keywords: &["time zone", "timezone", "utc", "offset", "时区", "时间"],
+                access: FieldAccess::Select {
+                    options: &DATA_TIME_ZONE_OPTIONS,
+                    get: Rc::new(time_zone_get),
+                    set: Rc::new(time_zone_set),
+                },
+            }],
+        )],
+    }
+}
+
+fn time_zone_get(config: &Config) -> FieldValue {
+    FieldValue::new(format_smolstr!("{}", config.data_time_zone.hours()).as_str())
+}
+
+fn time_zone_set(config: &mut Config, value: &FieldValue) {
+    let Ok(hours) = value.as_str().parse::<i8>() else {
+        return;
+    };
+    let Some(zone) = DataTimeZone::from_hours(hours) else {
+        return;
+    };
+    config.data_time_zone = zone;
+}
 
 fn appearance_page() -> PageDef {
     PageDef {
@@ -1986,6 +2077,91 @@ pub(crate) mod tests {
                 venue.as_str()
             );
         }
+    }
+
+    /// The display preferences live under one general group, and its entries are the
+    /// appearance page and the data time zone page — the appearance page is not a
+    /// top-level entry of its own any more.
+    #[test]
+    fn the_general_group_should_hold_the_display_settings() {
+        let catalog = catalog_of();
+        let general = catalog
+            .tree
+            .iter()
+            .find(|node| node.id() == "general")
+            .expect("the settings should offer a general group");
+        let TreeNodeDef::Group { children, .. } = general else {
+            panic!("general is a group");
+        };
+
+        assert_eq!(
+            children.iter().map(TreeNodeDef::id).collect::<Vec<_>>(),
+            ["appearance", "time-zone"],
+            "the group holds the appearance and the data time zone pages"
+        );
+        assert!(
+            !catalog.tree.iter().any(|node| node.id() == "appearance"),
+            "the appearance page is offered under the group rather than at the top"
+        );
+        assert!(
+            catalog.page("time-zone").is_some(),
+            "the time zone page is built"
+        );
+    }
+
+    /// The data time zone offers every offset the setting can store, west to east, and
+    /// each choice is drawn as the offset it stores.
+    ///
+    /// The list is spelled out in this module, so this is what holds it to the type:
+    /// an option the setting cannot hold would be a choice that writes nothing, and an
+    /// offset missing from the list would be one a user cannot choose.
+    #[test]
+    fn the_data_time_zone_should_offer_every_offset_it_can_store() {
+        let catalog = catalog_of();
+        let field = field(page(&catalog, "time-zone"), "time-zone.offset");
+        let FieldAccess::Select { options, .. } = &field.access else {
+            panic!("the data time zone is a select");
+        };
+
+        assert_eq!(options.len(), DataTimeZone::COUNT);
+
+        let mut config = Config::default();
+        let mut zones = Vec::with_capacity(options.len());
+        for option in options.iter() {
+            let hours = option
+                .id
+                .as_str()
+                .parse::<i8>()
+                .expect("an offset is stored as a number of hours");
+            let zone = DataTimeZone::from_hours(hours)
+                .expect("every option is an offset the setting offers");
+            let Text::Literal(label) = &option.label else {
+                panic!("a UTC offset is drawn as it is");
+            };
+
+            assert_eq!(label.as_ref(), zone.label().as_str());
+            field.access.write(&mut config, &option.id);
+            assert_eq!(config.data_time_zone, zone);
+            assert_eq!(field.access.current(&config), option.id);
+            zones.push(zone);
+        }
+
+        assert_eq!(zones, DataTimeZone::ALL, "the choices are the whole range");
+    }
+
+    /// A value the control never offers is not a value this setting can hold: a
+    /// write that names one leaves the stored offset exactly as it was.
+    #[test]
+    fn the_data_time_zone_should_refuse_a_value_it_does_not_offer() {
+        let catalog = catalog_of();
+        let field = field(page(&catalog, "time-zone"), "time-zone.offset");
+        let mut config = Config::default();
+
+        for value in ["15", "-13", "not-a-number", ""] {
+            field.access.write(&mut config, &SmolStr::new_static(value));
+        }
+
+        assert_eq!(config.data_time_zone, DataTimeZone::UTC);
     }
 
     /// Binance's page is its two markets, each with the addresses it is reached on and the

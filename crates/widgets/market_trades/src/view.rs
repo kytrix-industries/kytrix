@@ -16,7 +16,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Empty, Entity, Hsla, InteractiveElement,
     IntoElement, Length, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Window, base::Align, div, relative,
+    Task, Window, base::Align, div, relative,
 };
 use i18n::t;
 use instrument_selector_ui::{
@@ -49,6 +49,7 @@ use widget::{
     error::market_is_catalog_not_loaded,
     identity::{WidgetId, WidgetInstanceId},
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, on_data_time_zone_change},
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -218,7 +219,7 @@ impl TableDataSet<COLUMN_COUNT> for MarketTradesTable {
         COLUMN_WIDTHS
     }
 
-    fn cell(&self, row_index: usize, column_index: usize, _cx: &App) -> impl IntoElement {
+    fn cell(&self, row_index: usize, column_index: usize, cx: &App) -> impl IntoElement {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return Empty.into_any_element();
         };
@@ -231,7 +232,7 @@ impl TableDataSet<COLUMN_COUNT> for MarketTradesTable {
         let Some(row) = row else {
             return Empty.into_any_element();
         };
-        let display = row.display();
+        let display = row.display(data_time_zone(cx));
 
         match column_index {
             // The price carries the direction colour: a tape is read by which side
@@ -296,6 +297,8 @@ pub struct MarketTradesWidget {
     /// that is already live.
     market_reloaded: bool,
     directory_generation: u64,
+    /// Wakes the tape when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for MarketTradesWidget {
@@ -415,6 +418,12 @@ impl MarketTradesWidget {
             awaiting_market: false,
             market_reloaded: false,
             directory_generation: 0,
+            // The rows are drawn by the table entity, which keeps what it drew until
+            // it is told otherwise: moving the display zone has to wake the table.
+            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+                this.table.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
         }
     }
 
@@ -2744,7 +2753,8 @@ mod tests {
             buy: gpui_kit::green(),
             sell: gpui_kit::red(),
         };
-        let display = table.snapshot.as_ref().expect("snapshot").rows()[0].display();
+        let display =
+            table.snapshot.as_ref().expect("snapshot").rows()[0].display(time::UtcOffset::UTC);
 
         // The numbers keep the increments of the listing the tape follows: a whole
         // price is still read with the decimals its tick states.

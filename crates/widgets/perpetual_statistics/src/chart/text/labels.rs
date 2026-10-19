@@ -20,7 +20,7 @@ use std::sync::Arc;
 use gpui_kit::{Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window};
 use market_participants_model::decimal::{Price, Quantity, Tick};
 use smol_str::{SmolStr, format_smolstr};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 pub(crate) const TEXT_CACHE_CAPACITY: usize = 192;
 /// The decimal scale every value in `market_participants_model` is stored at.
@@ -272,12 +272,13 @@ pub(crate) fn label_with_unit(label: &str, unit: &str) -> SmolStr {
     format_smolstr!("{label} ({unit})")
 }
 
-/// The time axis' own format: the interval, without a year or a zone.
+/// The time axis' own format: the interval, without a year.
 ///
 /// The axis spans hours at most, so the date is only there to say when the window
-/// starts; the zone and the seconds are the tooltip's business.
-pub(crate) fn format_axis_time(timestamp: i64) -> SmolStr {
-    datetime(timestamp).map_or_else(
+/// starts; the year is the tooltip's business, and seconds are not a reading either
+/// of them shows. Both read the instant in the zone the settings display data in.
+pub(crate) fn format_axis_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
+    datetime(timestamp, zone).map_or_else(
         || SmolStr::new_static("--"),
         |datetime| {
             format_smolstr!(
@@ -291,13 +292,13 @@ pub(crate) fn format_axis_time(timestamp: i64) -> SmolStr {
     )
 }
 
-/// The tooltip's own format: the exact interval, in UTC.
-pub(crate) fn format_tooltip_time(timestamp: i64) -> SmolStr {
-    datetime(timestamp).map_or_else(
+/// The tooltip's own format: the exact interval, in the zone the settings display data in.
+pub(crate) fn format_tooltip_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
+    datetime(timestamp, zone).map_or_else(
         || SmolStr::new_static("--"),
         |datetime| {
             format_smolstr!(
-                "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+                "{:04}-{:02}-{:02} {:02}:{:02}",
                 datetime.year(),
                 u8::from(datetime.month()),
                 datetime.day(),
@@ -308,6 +309,14 @@ pub(crate) fn format_tooltip_time(timestamp: i64) -> SmolStr {
     )
 }
 
-pub(crate) fn datetime(timestamp: i64) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).ok()
+/// The instant `timestamp` names, read in `zone`, or nothing when either the
+/// timestamp or its local reading is outside the calendar.
+///
+/// The offset can move an instant past the last date the calendar holds, and a
+/// label formatted from that would panic: an instant off the end of the range is
+/// one this cannot read.
+pub(crate) fn datetime(timestamp: i64, zone: UtcOffset) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|datetime| datetime.checked_to_offset(zone))
 }

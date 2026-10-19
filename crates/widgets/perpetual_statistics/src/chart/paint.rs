@@ -22,6 +22,7 @@ use gpui_kit::{
 };
 use i18n::language::codes::LanguageCode;
 use smol_str::SmolStr;
+use time::UtcOffset;
 
 use super::{
     axes::{
@@ -248,14 +249,23 @@ pub(crate) struct FrameKey {
     pub bounds: Bounds<Pixels>,
     revision: u64,
     precise: bool,
+    /// The zone the time labels were written in, which a frame reused across a
+    /// setting change would otherwise draw from before the change.
+    zone: UtcOffset,
 }
 
 impl FrameKey {
-    pub(super) const fn new(bounds: Bounds<Pixels>, revision: u64, precise: bool) -> Self {
+    pub(super) const fn new(
+        bounds: Bounds<Pixels>,
+        revision: u64,
+        precise: bool,
+        zone: UtcOffset,
+    ) -> Self {
         Self {
             bounds,
             revision,
             precise,
+            zone,
         }
     }
 }

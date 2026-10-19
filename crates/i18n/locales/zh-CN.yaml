@@ -859,6 +859,8 @@ settings_ui:
     mode_description: 选择应用的浅色、深色或跟随系统外观
     system: 跟随系统
     title: 外观
+  general:
+    title: 通用设置
   market_participants:
     access_token: Access Token
     access_token_description: 为该应用签发的 Access Token，场所用它认证一条会话
@@ -948,6 +950,9 @@ settings_ui:
     title: 设置保存失败
   search:
     placeholder: 搜索设置
+  time_zone:
+    description: 选择各个组件显示数据时间时使用的时区，所有数据时间都会按该时区换算
+    title: 数据时间时区
 startup:
   config_reset_message: <p align="center">配置文件受损，已重新初始化为默认配置。原文件已备份为 %{file}。</p>
   config_reset_message_no_backup: <p align="center">配置文件受损，已重新初始化为默认配置；原文件备份失败。</p>

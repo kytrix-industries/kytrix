@@ -12,11 +12,13 @@ log.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smol_str.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util.workspace = true
 
 # Workspace members
 app_config.workspace = true
+app_config_provider.workspace = true
 base_ui.workspace = true
 kytrix_service_provider.workspace = true
 market_participants_connector.workspace = true

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use gpui_kit::SharedString;
@@ -10,7 +10,7 @@ use market_participants_model::{
     market::{book::ListingTrade, units::MarketTradeId},
 };
 use smol_str::format_smolstr;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 /// How many trades the tape keeps. Older ones are evicted as newer arrive.
 pub(super) const MAX_TRADES: usize = 200;
@@ -40,7 +40,7 @@ pub(super) struct MarketTradeRow {
     /// The row keeps them because its labels are built long after the generation
     /// that resolved the listing was published.
     precision: ListingPrecision,
-    display: OnceLock<MarketTradeDisplay>,
+    display: Mutex<Option<(UtcOffset, Arc<MarketTradeDisplay>)>>,
 }
 
 impl MarketTradeRow {
@@ -48,13 +48,24 @@ impl MarketTradeRow {
         &self.trade
     }
 
-    /// The formatted labels of this row, built once and shared afterwards.
+    /// The formatted labels of this row, built once per display zone and shared
+    /// afterwards.
     ///
     /// Formatting is deferred rather than done on arrival: a trade that is
-    /// evicted before it is ever drawn never costs a single label.
-    pub(super) fn display(&self) -> &MarketTradeDisplay {
-        self.display
-            .get_or_init(|| MarketTradeDisplay::new(&self.trade, self.precision))
+    /// evicted before it is ever drawn never costs a single label. The zone the
+    /// time was read in is remembered beside the labels, so a frame that draws the
+    /// same zone reuses them and a frame after the setting moved reads them again.
+    pub(super) fn display(&self, zone: UtcOffset) -> Arc<MarketTradeDisplay> {
+        let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_zone, display)) = cached.as_ref()
+            && *cached_zone == zone
+        {
+            return Arc::clone(display);
+        }
+
+        let display = Arc::new(MarketTradeDisplay::new(&self.trade, self.precision, zone));
+        *cached = Some((zone, Arc::clone(&display)));
+        display
     }
 }
 
@@ -75,7 +86,7 @@ pub(super) struct MarketTradeDisplay {
 }
 
 impl MarketTradeDisplay {
-    fn new(trade: &ListingTrade, precision: ListingPrecision) -> Self {
+    fn new(trade: &ListingTrade, precision: ListingPrecision, zone: UtcOffset) -> Self {
         Self {
             price: SharedString::new(
                 trade
@@ -91,7 +102,7 @@ impl MarketTradeDisplay {
                     .format_and_round_tick(precision.quantity_tick)
                     .as_str(),
             ),
-            time: format_utc_time(trade.timestamp),
+            time: format_time(trade.timestamp, zone),
         }
     }
 }
@@ -176,7 +187,7 @@ impl MarketTradesState {
             Arc::new(MarketTradeRow {
                 trade: trade.clone(),
                 precision: self.precision,
-                display: OnceLock::new(),
+                display: Mutex::new(None),
             }),
         );
         self.snapshot_dirty = true;
@@ -201,22 +212,29 @@ impl MarketTradesState {
     }
 }
 
-fn format_utc_time(timestamp: UnixMillis) -> SharedString {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--:--:--.---"),
-        |datetime| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:02}:{:02}:{:02}.{:03}",
-                    datetime.hour(),
-                    datetime.minute(),
-                    datetime.second(),
-                    datetime.millisecond()
+/// The time of a trade, read in the zone the settings display data in.
+fn format_time(timestamp: UnixMillis, zone: UtcOffset) -> SharedString {
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|datetime| datetime.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--:--:--.---"),
+            |datetime| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:02}:{:02}:{:02}.{:03}",
+                        datetime.hour(),
+                        datetime.minute(),
+                        datetime.second(),
+                        datetime.millisecond()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 #[cfg(test)]
@@ -415,12 +433,58 @@ mod tests {
         trades.insert(&trade(1, 10, 100));
         let snapshot = trades.snapshot();
         let row = &snapshot.rows()[0];
-        assert!(row.display.get().is_none());
+        assert!(
+            row.display
+                .lock()
+                .expect("the cache is not poisoned")
+                .is_none()
+        );
 
-        let first = row.display();
-        let second = row.display();
+        let first = row.display(UtcOffset::UTC);
+        let second = row.display(UtcOffset::UTC);
+        let other = row.display(UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset"));
 
-        assert!(std::ptr::addr_eq(first, second));
+        assert!(Arc::ptr_eq(&first, &second), "the same zone reuses the row");
+        assert_ne!(
+            first.time, other.time,
+            "another zone is another reading of the same instant"
+        );
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds.
+    /// That is not a time this can write, so it is a placeholder rather than a panic.
+    #[test]
+    fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            ),
+            "--:--:--.---"
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
+            ),
+            "--:--:--.---",
+            "a western offset runs off the other end of the calendar"
+        );
     }
 
     /// A number is written at the precision of the listing it printed on, so a
@@ -431,7 +495,7 @@ mod tests {
         let mut trades = state(1);
         trades.insert(&trade(1, 1_000, 90_000));
         let snapshot = trades.snapshot();
-        let display = snapshot.rows()[0].display();
+        let display = snapshot.rows()[0].display(UtcOffset::UTC);
 
         assert_eq!(
             [
@@ -460,7 +524,7 @@ mod tests {
         exact.quantity.value = "0.0004".parse::<Quantity>().expect("quantity should parse");
         trades.insert(&exact);
         let snapshot = trades.snapshot();
-        let display = snapshot.rows()[0].display();
+        let display = snapshot.rows()[0].display(UtcOffset::UTC);
 
         assert_eq!(
             [

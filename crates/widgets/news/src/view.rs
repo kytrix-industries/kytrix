@@ -64,6 +64,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, on_data_time_zone_change},
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -154,6 +155,8 @@ pub struct NewsWidget {
     /// Wakes the pane once its sound has a device, so the control it draws is not a control
     /// for a sound that arrived after the last frame it drew.
     _device_task: Task<()>,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for NewsWidget {
@@ -288,6 +291,13 @@ impl NewsWidget {
             let _ = this.update(cx, |_, cx| cx.notify());
         });
 
+        // The rows are built by the list entity, which keeps what it drew until it is
+        // told otherwise: moving the display zone has to wake the list itself.
+        let time_zone_task = on_data_time_zone_change(cx, |this, _, cx| {
+            this.list.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        });
+
         // The list holds the feed itself, so what a reader is reading is the list's to keep:
         // it is told about the reports a snapshot added rather than about the snapshot.
         let list = cx.new(|_| feed_list());
@@ -308,6 +318,7 @@ impl NewsWidget {
             throttle: Throttle::default(),
             _account_task: account_task,
             _device_task: device_task,
+            _time_zone_task: time_zone_task,
         }
     }
 
@@ -666,7 +677,7 @@ fn feed_list() -> DequeUnsizedList<Arc<NewsItem>> {
 /// list, and the newest news is the row a reader starts at.
 fn news_row(item: &NewsItem, index: usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let display = item.display();
+    let display = item.display(data_time_zone(cx));
     let category = item.category();
     let title = item.title().cloned();
     // The time belongs at the trailing edge whether or not the report has a title, so the

@@ -12,6 +12,8 @@ use gpui_kit::{App, Bounds, Pixels, Point, SharedString};
 use i18n::t;
 use market_participants_model::listing::rules::ListingPrecision;
 use smol_str::SmolStr;
+use time::UtcOffset;
+use widget::time_zone::data_time_zone;
 
 use super::{
     ChartData,
@@ -75,6 +77,8 @@ pub(crate) struct OpenInterestChart {
     value: AxisScale,
     time_labels: Box<[SmolStr]>,
     tooltips: Arc<[Tooltip]>,
+    /// The zone the axis labels and tooltips were written in.
+    zone: UtcOffset,
 }
 
 impl OpenInterestChart {
@@ -85,7 +89,14 @@ impl OpenInterestChart {
             quote: SmolStr::new(quote),
         };
         let labels = Labels::resolve(cx);
-        Self::build(Arc::from(Vec::new()), None, 0, units, labels)
+        Self::build(
+            Arc::from(Vec::new()),
+            None,
+            0,
+            units,
+            labels,
+            data_time_zone(cx),
+        )
     }
 
     fn build(
@@ -94,6 +105,7 @@ impl OpenInterestChart {
         revision: u64,
         units: Units,
         labels: Labels,
+        zone: UtcOffset,
     ) -> Self {
         let quantity_tick = metadata.map(|metadata| metadata.quantity_tick);
         let price_tick = metadata.map(|metadata| metadata.price_tick);
@@ -120,7 +132,9 @@ impl OpenInterestChart {
                 None => format_compact(value, step),
             },
         );
-        let time_labels = time_labels(points.iter().map(|point| point.timestamp), format_axis_time);
+        let time_labels = time_labels(points.iter().map(|point| point.timestamp), |timestamp| {
+            format_axis_time(timestamp, zone)
+        });
         let amount_label = label_with_unit(labels.amount.as_str(), units.base.as_str());
         let value_label = label_with_unit(labels.value.as_str(), units.quote.as_str());
         // Neither line of this tooltip is read in a series colour. The two are one
@@ -132,7 +146,7 @@ impl OpenInterestChart {
         let tooltips = points
             .iter()
             .map(|point| Tooltip {
-                title: format_tooltip_time(point.timestamp),
+                title: format_tooltip_time(point.timestamp, zone),
                 entries: vec![
                     TooltipEntry {
                         text: labelled_value(
@@ -177,6 +191,7 @@ impl OpenInterestChart {
             value,
             time_labels,
             tooltips,
+            zone,
         }
     }
 }
@@ -200,7 +215,7 @@ impl ChartData for OpenInterestChart {
     }
 
     fn frame_key(&self, bounds: Bounds<Pixels>) -> FrameKey {
-        FrameKey::new(bounds, self.revision, self.metadata.is_some())
+        FrameKey::new(bounds, self.revision, self.metadata.is_some(), self.zone)
     }
 
     fn scales(&self) -> (Option<&AxisScale>, &AxisScale, Option<&AxisScale>) {
@@ -248,6 +263,22 @@ impl ChartData for OpenInterestChart {
         self.tooltips.get(index).cloned()
     }
 
+    /// Rewrites the labels in another display zone.
+    ///
+    /// Returns whether anything moved: the same zone is the same labels, and the
+    /// chart is left exactly as it was.
+    fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
+        if self.zone == zone {
+            return false;
+        }
+        let points = Arc::clone(&self.points);
+        let metadata = self.metadata;
+        let units = self.units.clone();
+        let labels = self.labels.clone();
+        *self = Self::build(points, metadata, self.revision, units, labels, zone);
+        true
+    }
+
     fn set_snapshot(
         &mut self,
         revision: u64,
@@ -265,7 +296,7 @@ impl ChartData for OpenInterestChart {
         }
         let units = self.units.clone();
         let labels = self.labels.clone();
-        *self = Self::build(points, metadata, revision, units, labels);
+        *self = Self::build(points, metadata, revision, units, labels, self.zone);
         true
     }
 }

@@ -32,7 +32,7 @@ use kytrix_service_provider::service::{
     x::{MAX_X_SEARCH_PROFILES, MAX_X_SELECTIONS, XSelection, XSelectionsResponse},
 };
 use smol_str::{SmolStr, format_smolstr};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 /// The newest tweets a pane keeps.
 pub(super) const MAX_TWEETS: usize = 50;
@@ -272,14 +272,14 @@ impl TweetItem {
         }
     }
 
-    /// How long ago this tweet was published.
-    pub(super) fn age(&self, now: OffsetDateTime) -> TweetAge {
-        tweet_age(self.timestamp, now)
+    /// How long ago this tweet was published, read in `zone`.
+    pub(super) fn age(&self, now: OffsetDateTime, zone: UtcOffset) -> TweetAge {
+        tweet_age(self.timestamp, now, zone)
     }
 
-    /// When this tweet was published, in UTC, to the second.
-    pub(super) fn published_at(&self) -> SharedString {
-        absolute_time(self.timestamp)
+    /// When this tweet was published, read in `zone`, to the second.
+    pub(super) fn published_at(&self, zone: UtcOffset) -> SharedString {
+        absolute_time(self.timestamp, zone)
     }
 }
 
@@ -601,9 +601,11 @@ pub(super) enum TweetAge {
 
 /// How long ago a tweet stamped `timestamp` was published, as of `now`.
 ///
-/// Both are UTC and the difference between them is what an age is, so the reader's own clock
-/// never enters into it: a tweet is the same number of minutes old wherever it is read.
-pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime) -> TweetAge {
+/// Both instants are UTC and the difference between them is what an age is, so the reader's
+/// own clock never enters into it: a tweet is the same number of minutes old wherever it is
+/// read. The date an age older than a day reads as is the day it was published *in `zone`*,
+/// because that is the day the reader saw on their own clock.
+pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime, zone: UtcOffset) -> TweetAge {
     let Ok(time) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
     else {
         return TweetAge::Unknown;
@@ -611,41 +613,52 @@ pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime) -> TweetAge {
     // A timestamp in the future is a clock that disagrees with the service rather than a
     // tweet from tomorrow, and the newest thing it can be is now.
     let seconds = (now - time).whole_seconds().max(0);
+    // The offset can move an instant past the last date the calendar holds. Nothing an
+    // age says would describe a date that is not one, so a dated age reads as the one
+    // answer for a timestamp that is not a time. An age short enough to be a duration is
+    // not read in any zone at all, so the offset never touches it.
+    let published = || time.checked_to_offset(zone);
     match seconds {
         0..60 => TweetAge::Seconds(seconds.unsigned_abs()),
         60..3_600 => TweetAge::Minutes(seconds.unsigned_abs() / 60),
         3_600..86_400 => TweetAge::Hours(seconds.unsigned_abs() / 3_600),
-        86_400..31_536_000 => TweetAge::Date {
-            month: u8::from(time.month()),
-            day: time.day(),
-        },
-        _ => TweetAge::FullDate {
-            year: time.year(),
-            month: u8::from(time.month()),
-            day: time.day(),
-        },
+        86_400..31_536_000 => published().map_or(TweetAge::Unknown, |published| TweetAge::Date {
+            month: u8::from(published.month()),
+            day: published.day(),
+        }),
+        _ => published().map_or(TweetAge::Unknown, |published| TweetAge::FullDate {
+            year: published.year(),
+            month: u8::from(published.month()),
+            day: published.day(),
+        }),
     }
 }
 
-/// When a tweet was published, in UTC, to the second.
-pub(super) fn absolute_time(timestamp: i64) -> SharedString {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--"),
-        |time| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    time.year(),
-                    u8::from(time.month()),
-                    time.day(),
-                    time.hour(),
-                    time.minute(),
-                    time.second()
+/// When a tweet was published, read in `zone`, to the second.
+pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|time| time.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--"),
+            |time| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        time.year(),
+                        u8::from(time.month()),
+                        time.day(),
+                        time.hour(),
+                        time.minute(),
+                        time.second()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 /// The name one monitored account is known by, or `None` when nothing names it.
@@ -1117,17 +1130,35 @@ mod tests {
         // measured in.
         let ago = |seconds: i64| now.unix_timestamp() * 1_000 - seconds * 1_000;
 
-        assert_eq!(tweet_age(ago(-1), now), TweetAge::Seconds(0));
-        assert_eq!(tweet_age(ago(59), now), TweetAge::Seconds(59));
-        assert_eq!(tweet_age(ago(60), now), TweetAge::Minutes(1));
-        assert_eq!(tweet_age(ago(3_599), now), TweetAge::Minutes(59));
-        assert_eq!(tweet_age(ago(3_600), now), TweetAge::Hours(1));
-        assert_eq!(tweet_age(ago(86_399), now), TweetAge::Hours(23));
+        assert_eq!(
+            tweet_age(ago(-1), now, UtcOffset::UTC),
+            TweetAge::Seconds(0)
+        );
+        assert_eq!(
+            tweet_age(ago(59), now, UtcOffset::UTC),
+            TweetAge::Seconds(59)
+        );
+        assert_eq!(
+            tweet_age(ago(60), now, UtcOffset::UTC),
+            TweetAge::Minutes(1)
+        );
+        assert_eq!(
+            tweet_age(ago(3_599), now, UtcOffset::UTC),
+            TweetAge::Minutes(59)
+        );
+        assert_eq!(
+            tweet_age(ago(3_600), now, UtcOffset::UTC),
+            TweetAge::Hours(1)
+        );
+        assert_eq!(
+            tweet_age(ago(86_399), now, UtcOffset::UTC),
+            TweetAge::Hours(23)
+        );
 
         let day = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ago(86_400)) * 1_000_000)
             .expect("a day ago is a time");
         assert_eq!(
-            tweet_age(ago(86_400), now),
+            tweet_age(ago(86_400), now, UtcOffset::UTC),
             TweetAge::Date {
                 month: u8::from(day.month()),
                 day: day.day(),
@@ -1138,23 +1169,120 @@ mod tests {
         )
         .expect("a year ago is a time");
         assert_eq!(
-            tweet_age(ago(365 * 24 * 60 * 60), now),
+            tweet_age(ago(365 * 24 * 60 * 60), now, UtcOffset::UTC),
             TweetAge::FullDate {
                 year: year.year(),
                 month: u8::from(year.month()),
                 day: year.day(),
             }
         );
-        assert_eq!(tweet_age(i64::MAX, now), TweetAge::Unknown);
+        assert_eq!(tweet_age(i64::MAX, now, UtcOffset::UTC), TweetAge::Unknown);
+    }
+
+    /// A date an age reads as is the day the tweet was published in the display zone,
+    /// which is the day the reader saw on their own clock.
+    #[test]
+    fn a_dated_age_should_read_the_day_in_the_display_zone() {
+        // 2024-01-01T23:00:00Z: the same instant is already the 2nd at UTC+14.
+        let timestamp = 1_704_150_000_000;
+        let now = OffsetDateTime::from_unix_timestamp(1_704_150_000 + 86_400)
+            .expect("the fixture is a time");
+
+        assert_eq!(
+            tweet_age(timestamp, now, UtcOffset::UTC),
+            TweetAge::Date { month: 1, day: 1 }
+        );
+        assert_eq!(
+            tweet_age(
+                timestamp,
+                now,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            ),
+            TweetAge::Date { month: 1, day: 2 }
+        );
     }
 
     #[test]
-    fn absolute_time_should_be_utc_to_the_second() {
+    fn absolute_time_should_be_read_in_the_display_zone_to_the_second() {
         assert_eq!(
-            absolute_time(1_800_000_000_000).as_ref(),
+            absolute_time(1_800_000_000_000, UtcOffset::UTC).as_ref(),
             "2027-01-15 08:00:00"
         );
-        assert_eq!(absolute_time(i64::MAX).as_ref(), "--");
+        assert_eq!(
+            absolute_time(
+                1_800_000_000_000,
+                UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
+            )
+            .as_ref(),
+            "2027-01-15 16:00:00"
+        );
+        assert_eq!(absolute_time(i64::MAX, UtcOffset::UTC).as_ref(), "--");
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds, so
+    /// no date can be written for it: the absolute time is the placeholder. What an age
+    /// says is still the difference between two UTC instants — a stamp at the far end of
+    /// the calendar is a future one, which reads as now, and an ancient one needs a date
+    /// the calendar cannot give it, which reads as unknown.
+    #[test]
+    fn a_tweet_the_display_zone_cannot_hold_should_read_without_a_date() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+        let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+
+        assert_eq!(absolute_time(timestamp, zone).as_ref(), "--");
+        assert_eq!(
+            tweet_age(timestamp, OffsetDateTime::now_utc(), zone),
+            TweetAge::Seconds(0),
+            "a stamp in the future is now, and that is a duration rather than a date"
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+        let zone = UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset");
+
+        assert_eq!(
+            absolute_time(timestamp, zone).as_ref(),
+            "--",
+            "a western offset runs off the other end of the calendar"
+        );
+        assert_eq!(
+            tweet_age(timestamp, OffsetDateTime::now_utc(), zone),
+            TweetAge::Unknown,
+            "an age that needs a date the calendar cannot give it has no answer"
+        );
+    }
+
+    /// An age short enough to be a duration is the difference between two UTC instants,
+    /// so it is the same answer whatever the display zone is — even one whose local
+    /// reading of the instant has no date at all.
+    #[test]
+    fn a_relative_age_should_not_depend_on_the_display_zone() {
+        let now = time::Date::MAX
+            .with_hms(23, 59, 59)
+            .expect("the last day has a last second")
+            .assume_utc();
+        let timestamp = i64::try_from(now.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last second is a millisecond timestamp")
+            - 30_000;
+
+        assert_eq!(
+            tweet_age(
+                timestamp,
+                now,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            ),
+            TweetAge::Seconds(30),
+            "the offset has no date to give this instant, and a duration needs none"
+        );
     }
 
     #[test]

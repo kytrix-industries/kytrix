@@ -744,7 +744,7 @@ mod tests {
         snapshot
             .rows()
             .iter()
-            .map(|row| row.display().price.to_string())
+            .map(|row| row.display(time::UtcOffset::UTC).price.to_string())
             .collect()
     }
 

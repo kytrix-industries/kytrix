@@ -97,6 +97,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, on_data_time_zone_change},
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -283,6 +284,8 @@ pub struct TweetMonitorWidget {
     /// The open dialog, which is the pane's only way of managing accounts.
     dialog: Option<WeakEntity<TweetDialog>>,
     _account_task: Task<()>,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for TweetMonitorWidget {
@@ -414,6 +417,12 @@ impl TweetMonitorWidget {
             hints: Arc::new(HashMap::new()),
             dialog: None,
             _account_task: account_task,
+            // The rows are built by the list entity, which keeps what it drew until it
+            // is told otherwise: moving the display zone has to wake the list itself.
+            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+                this.list.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
         }
     }
 
@@ -1299,7 +1308,7 @@ fn tweet_row(
     // A repost row shows the tweet that was reposted and opens *that* tweet, while the line
     // above it names who reposted it.
     let url = tweet_url(author.username.as_ref(), tweet.tweet_id());
-    let age = tweet.age(OffsetDateTime::now_utc());
+    let age = tweet.age(OffsetDateTime::now_utc(), data_time_zone(cx));
 
     let mut row = div()
         .id(ElementId::NamedInteger(
@@ -1425,7 +1434,7 @@ fn tweet_content(
 fn tweet_header(tweet: &TweetItem, author: &super::model::TweetAuthor, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let muted = theme.roles.fg.muted.hsla;
-    let age = tweet.age(OffsetDateTime::now_utc());
+    let age = tweet.age(OffsetDateTime::now_utc(), data_time_zone(cx));
     let mut name_row = div()
         .min_w_0()
         .flex()
@@ -1465,7 +1474,7 @@ fn tweet_header(tweet: &TweetItem, author: &super::model::TweetAuthor, cx: &App)
                         format_id("tweet-time", tweet.tweet_id()),
                         div().flex_none().child(age_text(age, cx)),
                     )
-                    .content(tweet.published_at()),
+                    .content(tweet.published_at(data_time_zone(cx))),
                 ),
         );
 

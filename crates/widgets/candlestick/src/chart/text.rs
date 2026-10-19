@@ -24,6 +24,7 @@ use market_participants_model::{
     market::book::ListingCandlestick,
 };
 use smol_str::{SmolStr, format_smolstr};
+use time::UtcOffset;
 
 use crate::{model::CandlePrices, time::format_crosshair_time};
 
@@ -174,6 +175,8 @@ struct HoverLabelCacheInput<'a> {
     previous_close: Option<Price>,
     price_tick: Tick,
     interval: TimeFrame,
+    /// The zone the crosshair's date is read in.
+    zone: UtcOffset,
     volume_unit: &'a SharedString,
     text_style: &'a TextStyle,
     muted_color: Hsla,
@@ -185,6 +188,7 @@ struct HoverLabelCacheEntry {
     previous_close: Option<Price>,
     price_tick: Tick,
     interval: TimeFrame,
+    zone: UtcOffset,
     volume_unit: SharedString,
     text_style: TextStyle,
     muted_color: Hsla,
@@ -198,6 +202,7 @@ impl HoverLabelCacheEntry {
             && self.previous_close == input.previous_close
             && self.price_tick == input.price_tick
             && self.interval == input.interval
+            && self.zone == input.zone
             && self.volume_unit == *input.volume_unit
             && self.text_style == *input.text_style
             && self.muted_color == input.muted_color
@@ -228,6 +233,7 @@ impl HoverLabelCache {
         previous: Option<&ListingCandlestick>,
         price_tick: Tick,
         interval: TimeFrame,
+        zone: UtcOffset,
         volume_unit: &SharedString,
         theme: &Theme,
         window: &Window,
@@ -241,6 +247,7 @@ impl HoverLabelCache {
             previous_close,
             price_tick,
             interval,
+            zone,
             volume_unit,
             text_style: &text_style,
             muted_color,
@@ -256,7 +263,7 @@ impl HoverLabelCache {
 
         let presentation = HoverLabelPresentation {
             time_label: SharedString::new(
-                format_crosshair_time(candle.timestamp, interval).as_str(),
+                format_crosshair_time(candle.timestamp, interval, zone).as_str(),
             ),
             line: Arc::new(shape_hover_label(
                 candle,
@@ -274,6 +281,7 @@ impl HoverLabelCache {
             previous_close,
             price_tick,
             interval,
+            zone,
             volume_unit: volume_unit.clone(),
             text_style,
             muted_color,

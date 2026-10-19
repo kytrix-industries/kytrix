@@ -52,9 +52,9 @@ use base_ui::{
     tooltip::TooltipExt,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, ClipboardItem, Context, ElementId, Empty, Entity, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, WeakEntity, Window,
+    AnyElement, AnyView, App, AppContext, ClipboardItem, Context, ElementId, Empty, Entity,
+    EntityId, Hsla, InteractiveElement, IntoElement, ParentElement, Render, Role, SharedString,
+    StatefulInteractiveElement, Styled, Task, UniformListScrollHandle, WeakEntity, Window,
     base::{
         Disableable, NavMotion, NavOperation, NavPage, NavStack, NavStackState, ScrollbarMode,
         Selectable,
@@ -83,6 +83,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::on_data_time_zone_change,
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -396,6 +397,8 @@ pub struct HyperliquidWalletMonitorWidget {
     /// rather than the idempotent `Load`, which the service answers without touching a stream
     /// that is already live.
     market_reloaded: bool,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for HyperliquidWalletMonitorWidget {
@@ -599,6 +602,21 @@ impl HyperliquidWalletMonitorWidget {
             awaiting_market: false,
             markets: Arc::default(),
             market_reloaded: false,
+            // Every page is a cached view drawing from the pane, so moving the display
+            // zone has to wake the pages as well as the pane itself.
+            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+                this.overview_page.update(cx, |_, cx| cx.notify());
+                let pages: Vec<EntityId> = this
+                    .stack
+                    .read(cx)
+                    .views()
+                    .map(AnyView::entity_id)
+                    .collect();
+                for page in pages {
+                    App::notify(cx, page);
+                }
+                cx.notify();
+            }),
         }
     }
 

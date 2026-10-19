@@ -10749,6 +10749,7 @@ version = "0.0.1"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "gpui-kit",
  "i18n",
@@ -10761,6 +10762,7 @@ dependencies = [
  "serde_json",
  "smol_str",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-util",
 ]

@@ -33,6 +33,8 @@ use market_participants_model::{
     market::{book::ListingCandlestick, units::QuantityUnit},
 };
 use smol_str::SmolStr;
+use time::UtcOffset;
+use widget::time_zone::data_time_zone;
 
 use super::{
     geometry::{CandleGeometry, ChartLayout, ChartViewport, visible_range},
@@ -111,6 +113,7 @@ pub(crate) fn chart_canvas(
                 &prepaint_snapshot,
                 prepaint_viewport,
                 prepaint_interval,
+                data_time_zone(cx),
                 bounds,
                 cx.theme().components.chart.axis.hsla,
                 window,
@@ -190,6 +193,8 @@ struct PreparedChartKey {
     candle_width: f32,
     right_timestamp: Option<i64>,
     interval: TimeFrame,
+    /// The zone the time axis was formatted in.
+    zone: UtcOffset,
     bounds: Bounds<Pixels>,
     text_style: TextStyle,
     text_color: Hsla,
@@ -201,6 +206,7 @@ impl PreparedChartKey {
         snapshot: &CandlestickSeriesSnapshot,
         viewport: ChartViewport,
         interval: TimeFrame,
+        zone: UtcOffset,
         bounds: Bounds<Pixels>,
         text_style: &TextStyle,
         text_color: Hsla,
@@ -209,6 +215,7 @@ impl PreparedChartKey {
             && self.candle_width == viewport.candle_width
             && self.right_timestamp == viewport.right_timestamp
             && self.interval == interval
+            && self.zone == zone
             && self.bounds == bounds
             && self.text_style == *text_style
             && self.text_color == text_color
@@ -229,6 +236,7 @@ fn prepare_chart_cached(
     snapshot: &CandlestickSeriesSnapshot,
     viewport: ChartViewport,
     interval: TimeFrame,
+    zone: UtcOffset,
     bounds: Bounds<Pixels>,
     text_color: Hsla,
     window: &Window,
@@ -241,6 +249,7 @@ fn prepare_chart_cached(
                 snapshot,
                 viewport,
                 interval,
+                zone,
                 bounds,
                 &text_style,
                 text_color,
@@ -264,13 +273,16 @@ fn prepare_chart_cached(
         &caches.text,
         window,
     );
-    let prepared = Arc::new(prepare_visible_chart(snapshot, viewport, interval, layout));
+    let prepared = Arc::new(prepare_visible_chart(
+        snapshot, viewport, interval, zone, layout,
+    ));
     let mut cache = caches.prepared.borrow_mut();
     cache.key = Some(PreparedChartKey {
         snapshot: snapshot.clone(),
         candle_width: viewport.candle_width,
         right_timestamp: viewport.right_timestamp,
         interval,
+        zone,
         bounds,
         text_style,
         text_color,
@@ -287,6 +299,7 @@ fn prepare_visible_chart(
     snapshot: &CandlestickSeriesSnapshot,
     viewport: ChartViewport,
     interval: TimeFrame,
+    zone: UtcOffset,
     layout: ChartLayout,
 ) -> PreparedChart {
     let range = visible_range(snapshot.candles(), viewport, layout.price_plot.size.width);
@@ -357,7 +370,7 @@ fn prepare_visible_chart(
             .map(|index| PreparedTimeTick {
                 x: geometry.center_x(index - range.start),
                 label: SharedString::new(
-                    format_axis_time(candles[index].timestamp, interval).as_str(),
+                    format_axis_time(candles[index].timestamp, interval, zone).as_str(),
                 ),
             })
             .collect::<Vec<_>>();
@@ -580,6 +593,9 @@ fn paint_chart(
     let Some(visible) = visible else {
         return;
     };
+    // The crosshair's date is read in the zone the settings display data in, and it is
+    // read here rather than remembered: a frame after the setting moved paints the new one.
+    let zone = data_time_zone(context);
     let mut painter = ChartPainter {
         text_cache,
         window,
@@ -619,6 +635,7 @@ fn paint_chart(
             snapshot,
             visible,
             options.interval,
+            zone,
             cursor,
             layout,
             hover_label_cache,
@@ -781,6 +798,7 @@ impl ChartPainter<'_> {
         snapshot: &CandlestickSeriesSnapshot,
         visible: &PreparedVisibleChart,
         interval: TimeFrame,
+        zone: UtcOffset,
         cursor: Point<Pixels>,
         layout: ChartLayout,
         hover_label_cache: &Rc<RefCell<HoverLabelCache>>,
@@ -837,6 +855,7 @@ impl ChartPainter<'_> {
             previous,
             price_tick,
             interval,
+            zone,
             &volume_unit,
             self.context.theme(),
             self.window,
@@ -1793,6 +1812,7 @@ mod tests {
             candle_width: viewport.candle_width,
             right_timestamp: viewport.right_timestamp,
             interval: TimeFrame::Minute1,
+            zone: UtcOffset::UTC,
             bounds,
             text_style: TextStyle::default(),
             text_color,
@@ -1800,12 +1820,14 @@ mod tests {
         let unchanged = |snapshot: &CandlestickSeriesSnapshot,
                          viewport: ChartViewport,
                          interval: TimeFrame,
+                         zone: UtcOffset,
                          bounds: Bounds<Pixels>,
                          text_color: Hsla| {
             key.matches(
                 snapshot,
                 viewport,
                 interval,
+                zone,
                 bounds,
                 &TextStyle::default(),
                 text_color,
@@ -1816,6 +1838,7 @@ mod tests {
             &snapshot,
             viewport,
             TimeFrame::Minute1,
+            UtcOffset::UTC,
             bounds,
             text_color
         ));
@@ -1827,6 +1850,7 @@ mod tests {
                     ..viewport
                 },
                 TimeFrame::Minute1,
+                UtcOffset::UTC,
                 bounds,
                 text_color,
             ),
@@ -1840,6 +1864,7 @@ mod tests {
                     ..viewport
                 },
                 TimeFrame::Minute1,
+                UtcOffset::UTC,
                 bounds,
                 text_color,
             ),
@@ -1850,13 +1875,21 @@ mod tests {
                 &snapshot,
                 viewport,
                 TimeFrame::Minute1,
+                UtcOffset::UTC,
                 Bounds::new(point(px(0.0), px(0.0)), size(px(640.0), px(480.0))),
                 text_color,
             ),
             "resizing changes every box"
         );
         assert!(
-            !unchanged(&snapshot, viewport, TimeFrame::Minute5, bounds, text_color,),
+            !unchanged(
+                &snapshot,
+                viewport,
+                TimeFrame::Minute5,
+                UtcOffset::UTC,
+                bounds,
+                text_color,
+            ),
             "the interval changes both time labels and the label stride"
         );
         assert!(
@@ -1864,6 +1897,18 @@ mod tests {
                 &snapshot,
                 viewport,
                 TimeFrame::Minute1,
+                UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset"),
+                bounds,
+                text_color,
+            ),
+            "another display zone changes every time label"
+        );
+        assert!(
+            !unchanged(
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
                 bounds,
                 other_text_color
             ),
@@ -1874,6 +1919,7 @@ mod tests {
                 &one_candle_snapshot(),
                 viewport,
                 TimeFrame::Minute1,
+                UtcOffset::UTC,
                 bounds,
                 text_color,
             ),

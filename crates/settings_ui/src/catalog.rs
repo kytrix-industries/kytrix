@@ -154,6 +154,18 @@ impl SelectOptionDef {
             id: SmolStr::new_static(id),
         }
     }
+
+    /// A choice drawn as the name it is stored under.
+    ///
+    /// An identity nobody translates — a UTC offset, a scope this build speaks — is
+    /// the same text in every language, so it is carried as the literal it is rather
+    /// than looked up under a key.
+    pub const fn literal(label: &'static str, id: &'static str) -> Self {
+        Self {
+            label: Text::Literal(SharedString::new_static(label)),
+            id: SmolStr::new_static(id),
+        }
+    }
 }
 
 /// How one field is presented, and what it converts to and from the settings.

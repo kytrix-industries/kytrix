@@ -229,9 +229,10 @@ pub(crate) fn current_timestamp_millis() -> i64 {
     }
 }
 
-/// How a timestamp reads on the time axis, at the resolution `interval` needs.
-pub(crate) fn format_axis_time(timestamp: i64, interval: TimeFrame) -> SmolStr {
-    let Some(datetime) = datetime(timestamp) else {
+/// How a timestamp reads on the time axis, at the resolution `interval` needs and in
+/// the zone the settings display data in.
+pub(crate) fn format_axis_time(timestamp: i64, interval: TimeFrame, zone: UtcOffset) -> SmolStr {
+    let Some(datetime) = datetime(timestamp, zone) else {
         return timestamp.to_smolstr();
     };
     let (tick, unit) = tick_and_unit(interval);
@@ -261,9 +262,14 @@ pub(crate) fn format_axis_time(timestamp: i64, interval: TimeFrame) -> SmolStr {
     }
 }
 
-/// How a timestamp reads under the crosshair, which has room for the full date.
-pub(crate) fn format_crosshair_time(timestamp: i64, interval: TimeFrame) -> SmolStr {
-    let Some(datetime) = datetime(timestamp) else {
+/// How a timestamp reads under the crosshair, which has room for the full date and
+/// is read in the zone the settings display data in.
+pub(crate) fn format_crosshair_time(
+    timestamp: i64,
+    interval: TimeFrame,
+    zone: UtcOffset,
+) -> SmolStr {
+    let Some(datetime) = datetime(timestamp, zone) else {
         return timestamp.to_smolstr();
     };
     match tick_and_unit(interval).1 {
@@ -362,7 +368,7 @@ fn candle_boundary_offset(venue: &VenueId) -> UtcOffset {
 /// candle that opened on the last day of its month always lands on the last day
 /// of the target month.
 fn add_calendar_months(timestamp: i64, months: u8, offset: UtcOffset) -> Option<i64> {
-    let datetime = datetime(timestamp)?.to_offset(offset);
+    let datetime = datetime(timestamp, offset)?;
     let source_year = datetime.year();
     let source_month = datetime.month();
     let month_index = i64::from(source_year)
@@ -388,8 +394,16 @@ fn add_calendar_months(timestamp: i64, months: u8, offset: UtcOffset) -> Option<
     i64::try_from(target_millis).ok()
 }
 
-fn datetime(timestamp: i64) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).ok()
+/// The instant `timestamp` names, read in `zone`, or nothing when either the
+/// timestamp or its local reading is outside the calendar.
+///
+/// The offset can move an instant past the last date the calendar holds, and a
+/// caller that formatted that would panic: an instant off the end of the range is
+/// one this cannot read.
+fn datetime(timestamp: i64, zone: UtcOffset) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|datetime| datetime.checked_to_offset(zone))
 }
 
 #[cfg(test)]
@@ -514,13 +528,13 @@ mod tests {
 
         assert_eq!(
             [
-                format_axis_time(timestamp, TimeFrame::Minute1),
-                format_axis_time(timestamp, TimeFrame::Hour1),
-                format_axis_time(timestamp, TimeFrame::Hour4),
-                format_axis_time(timestamp, TimeFrame::Day1),
-                format_axis_time(timestamp, TimeFrame::Month1),
-                format_axis_time(timestamp, TimeFrame::Quarter1),
-                format_axis_time(timestamp, TimeFrame::Year1),
+                format_axis_time(timestamp, TimeFrame::Minute1, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Hour1, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Hour4, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Day1, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Month1, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Quarter1, UtcOffset::UTC),
+                format_axis_time(timestamp, TimeFrame::Year1, UtcOffset::UTC),
             ],
             [
                 "00:00",
@@ -534,17 +548,89 @@ mod tests {
         );
     }
 
+    /// The axis and the crosshair read the instant in the zone the settings display data
+    /// in, so a candle that opened at midnight UTC opens in the afternoon at UTC+14.
+    #[test]
+    fn axis_and_crosshair_times_should_read_the_instant_in_the_display_zone() {
+        // 2024-01-01T00:00:00Z.
+        let timestamp = 1_704_067_200_000;
+        let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+
+        assert_eq!(
+            format_axis_time(timestamp, TimeFrame::Minute1, zone),
+            "14:00"
+        );
+        assert_eq!(
+            format_crosshair_time(timestamp, TimeFrame::Minute1, zone),
+            "2024-01-01 14:00"
+        );
+        assert_eq!(
+            format_axis_time(-1, TimeFrame::Day1, zone),
+            "01-01",
+            "an instant just before the epoch is already the next day at UTC+14"
+        );
+        assert_eq!(
+            format_axis_time(
+                -1,
+                TimeFrame::Day1,
+                UtcOffset::from_hms(-1, 0, 0).expect("UTC-1 is a valid offset")
+            ),
+            "12-31"
+        );
+    }
+
+    /// An offset can move an instant past the last day the calendar holds. That is
+    /// not a time this can format, so the axis reads the raw stamp rather than
+    /// panicking on a date that is not one.
+    #[test]
+    fn an_instant_the_display_zone_cannot_hold_should_not_panic() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+        let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+
+        assert_eq!(
+            format_axis_time(timestamp, TimeFrame::Minute1, zone),
+            timestamp.to_smolstr()
+        );
+        assert_eq!(
+            format_crosshair_time(timestamp, TimeFrame::Minute1, zone),
+            timestamp.to_smolstr()
+        );
+
+        let boundary = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+        let zone = UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset");
+
+        assert_eq!(
+            format_axis_time(timestamp, TimeFrame::Minute1, zone),
+            timestamp.to_smolstr(),
+            "a western offset runs off the other end of the calendar"
+        );
+        assert_eq!(
+            format_crosshair_time(timestamp, TimeFrame::Minute1, zone),
+            timestamp.to_smolstr()
+        );
+    }
+
     #[test]
     fn crosshair_time_should_include_the_date_at_every_resolution() {
         let timestamp = 1_704_067_200_000;
 
         assert_eq!(
             [
-                format_crosshair_time(timestamp, TimeFrame::Minute1),
-                format_crosshair_time(timestamp, TimeFrame::Hour1),
-                format_crosshair_time(timestamp, TimeFrame::Day1),
-                format_crosshair_time(timestamp, TimeFrame::Quarter1),
-                format_crosshair_time(timestamp, TimeFrame::Year1),
+                format_crosshair_time(timestamp, TimeFrame::Minute1, UtcOffset::UTC),
+                format_crosshair_time(timestamp, TimeFrame::Hour1, UtcOffset::UTC),
+                format_crosshair_time(timestamp, TimeFrame::Day1, UtcOffset::UTC),
+                format_crosshair_time(timestamp, TimeFrame::Quarter1, UtcOffset::UTC),
+                format_crosshair_time(timestamp, TimeFrame::Year1, UtcOffset::UTC),
             ],
             [
                 "2024-01-01 00:00",

@@ -18,13 +18,13 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use gpui_kit::SharedString;
 use kytrix_service_provider::service::engine::{NewsEvent, NewsKind};
 use smol_str::format_smolstr;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 /// How many items one subscription retains.
 ///
@@ -57,7 +57,7 @@ pub(super) struct NewsItem {
     title: Option<SharedString>,
     content: SharedString,
     category: NewsCategory,
-    display: OnceLock<NewsItemDisplay>,
+    display: Mutex<Option<(UtcOffset, Arc<NewsItemDisplay>)>>,
 }
 
 impl NewsItem {
@@ -67,7 +67,7 @@ impl NewsItem {
             title: event.title.map(|title| SharedString::new(title.as_str())),
             content: SharedString::new(event.content.as_str()),
             category: NewsCategory::from(event.category),
-            display: OnceLock::new(),
+            display: Mutex::new(None),
         }
     }
 
@@ -87,9 +87,20 @@ impl NewsItem {
     ///
     /// A report is retained the moment it arrives, while most of what a feed holds is
     /// never on screen: formatting a timestamp is the one part of a row that costs
-    /// anything, so it happens here rather than when the item is retained.
-    pub(super) fn display(&self) -> &NewsItemDisplay {
-        self.display.get_or_init(|| NewsItemDisplay::new(self))
+    /// anything, so it happens here rather than when the item is retained. The clock
+    /// it was formatted in is remembered beside the text, so a frame that draws the
+    /// same zone reuses it and a frame after the setting moved formats it again.
+    pub(super) fn display(&self, zone: UtcOffset) -> Arc<NewsItemDisplay> {
+        let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_zone, display)) = cached.as_ref()
+            && *cached_zone == zone
+        {
+            return Arc::clone(display);
+        }
+
+        let display = Arc::new(NewsItemDisplay::new(self, zone));
+        *cached = Some((zone, Arc::clone(&display)));
+        display
     }
 }
 
@@ -100,9 +111,9 @@ pub(super) struct NewsItemDisplay {
 }
 
 impl NewsItemDisplay {
-    fn new(item: &NewsItem) -> Self {
+    fn new(item: &NewsItem, zone: UtcOffset) -> Self {
         Self {
-            time: format_time(item.timestamp),
+            time: format_time(item.timestamp, zone),
         }
     }
 }
@@ -244,25 +255,34 @@ pub(super) fn unshown(held: &[Arc<NewsItem>], next: &[Arc<NewsItem>]) -> Option<
         .then_some(unshown)
 }
 
-/// The time of an item, in UTC, which is the clock the service stamps news on.
-fn format_time(timestamp: i64) -> SharedString {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000).map_or_else(
-        |_| SharedString::new_static("--"),
-        |time| {
-            SharedString::new(
-                format_smolstr!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    time.year(),
-                    u8::from(time.month()),
-                    time.day(),
-                    time.hour(),
-                    time.minute(),
-                    time.second()
+/// The time of an item, read in the zone the settings display data in.
+///
+/// The service stamps news in UTC, so what a reader sees is that instant converted
+/// by the offset the caller read from the settings.
+fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+    // The offset can move an instant past the last date the calendar holds — a
+    // timestamp at the far end of the range is one the service cannot publish, and
+    // it is written as a placeholder rather than taken to a date that is not one.
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
+        .ok()
+        .and_then(|time| time.checked_to_offset(zone))
+        .map_or_else(
+            || SharedString::new_static("--"),
+            |time| {
+                SharedString::new(
+                    format_smolstr!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        time.year(),
+                        u8::from(time.month()),
+                        time.day(),
+                        time.hour(),
+                        time.minute(),
+                        time.second()
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-        },
-    )
+            },
+        )
 }
 
 #[cfg(test)]
@@ -297,14 +317,61 @@ mod tests {
         // 2023-11-14T22:13:20Z, so a formatter that reads seconds as milliseconds, or
         // that drops the date, does not pass.
         assert_eq!(
-            format_time(1_700_000_000_000).as_ref(),
+            format_time(1_700_000_000_000, UtcOffset::UTC).as_ref(),
             "2023-11-14 22:13:20"
+        );
+        assert_eq!(
+            format_time(
+                1_700_000_000_000,
+                UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
+            )
+            .as_ref(),
+            "2023-11-15 06:13:20",
+            "the instant is read in the zone the settings display"
         );
     }
 
     #[test]
     fn time_should_read_as_a_placeholder_when_it_is_not_an_instant() {
-        assert_eq!(format_time(i64::MAX).as_ref(), "--");
+        assert_eq!(format_time(i64::MAX, UtcOffset::UTC).as_ref(), "--");
+    }
+
+    /// The display offset can move an instant past the last day the calendar holds.
+    /// That is not a date this can write, so it is a placeholder rather than a panic.
+    #[test]
+    fn time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
+        let boundary = time::Date::MAX
+            .with_hms(23, 0, 0)
+            .expect("the last day has an evening")
+            .assume_utc();
+        let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+            .expect("the last day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
+            )
+            .as_ref(),
+            "--"
+        );
+
+        let first = time::Date::MIN
+            .with_hms(0, 0, 0)
+            .expect("the first day has a midnight")
+            .assume_utc();
+        let timestamp = i64::try_from(first.unix_timestamp_nanos() / 1_000_000)
+            .expect("the first day is a millisecond timestamp");
+
+        assert_eq!(
+            format_time(
+                timestamp,
+                UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
+            )
+            .as_ref(),
+            "--",
+            "a western offset can run off the other end of the calendar"
+        );
     }
 
     #[test]
@@ -383,16 +450,29 @@ mod tests {
     }
 
     #[test]
-    fn display_should_be_built_once_when_it_is_first_read() {
-        let state = state(1, &[1]);
+    fn display_should_be_built_once_per_zone() {
+        let state = state(1, &[1_700_000_000_000]);
         let snapshot = state.snapshot();
         let item = &snapshot.items()[0];
-        assert!(item.display.get().is_none());
+        assert!(
+            item.display
+                .lock()
+                .expect("the cache is not poisoned")
+                .is_none()
+        );
 
-        let first = item.display();
-        let second = item.display();
+        let first = item.display(UtcOffset::UTC);
+        let second = item.display(UtcOffset::UTC);
+        let other = item.display(UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset"));
 
-        assert!(std::ptr::eq(first, second));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same zone reuses the text"
+        );
+        assert_ne!(
+            first.time, other.time,
+            "another zone is another reading of the same instant"
+        );
     }
 
     /// A feed that grew at its head is the reports at the head of it a list has not been

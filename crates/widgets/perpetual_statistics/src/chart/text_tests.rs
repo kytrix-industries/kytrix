@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use market_participants_model::decimal::Tick;
+use time::UtcOffset;
 
 use super::text::labels::*;
 
@@ -95,14 +96,62 @@ fn a_share_should_be_written_as_a_percentage() {
 
 #[test]
 fn the_axis_should_omit_the_year_and_the_tooltip_should_not() {
-    assert_eq!(format_axis_time(0), "01-01 00:00");
-    assert_eq!(format_tooltip_time(0), "1970-01-01 00:00 UTC");
+    assert_eq!(format_axis_time(0, UtcOffset::UTC), "01-01 00:00");
+    assert_eq!(format_tooltip_time(0, UtcOffset::UTC), "1970-01-01 00:00");
+}
+
+/// Both labels read the instant in the zone the settings display data in.
+#[test]
+fn the_axis_and_the_tooltip_should_read_the_display_zone() {
+    let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+
+    assert_eq!(format_axis_time(0, zone), "01-01 14:00");
+    assert_eq!(format_tooltip_time(0, zone), "1970-01-01 14:00");
+    assert_eq!(
+        format_axis_time(
+            0,
+            UtcOffset::from_hms(-1, 0, 0).expect("UTC-1 is a valid offset")
+        ),
+        "12-31 23:00"
+    );
 }
 
 #[test]
 fn a_timestamp_outside_the_calendar_should_not_panic() {
-    assert_eq!(format_axis_time(i64::MAX), "--");
-    assert_eq!(format_tooltip_time(i64::MIN), "--");
+    assert_eq!(format_axis_time(i64::MAX, UtcOffset::UTC), "--");
+    assert_eq!(format_tooltip_time(i64::MIN, UtcOffset::UTC), "--");
+}
+
+/// An offset can move an instant past the last day the calendar holds. That is not
+/// a date a label can say, so both labels read as the placeholder rather than
+/// panicking on a date that is not one.
+#[test]
+fn an_instant_the_display_zone_cannot_hold_should_not_panic() {
+    let boundary = time::Date::MAX
+        .with_hms(23, 0, 0)
+        .expect("the last day has an evening")
+        .assume_utc();
+    let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+        .expect("the last day is a millisecond timestamp");
+    let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+
+    assert_eq!(format_axis_time(timestamp, zone), "--");
+    assert_eq!(format_tooltip_time(timestamp, zone), "--");
+
+    let boundary = time::Date::MIN
+        .with_hms(0, 0, 0)
+        .expect("the first day has a midnight")
+        .assume_utc();
+    let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
+        .expect("the first day is a millisecond timestamp");
+    let zone = UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset");
+
+    assert_eq!(format_axis_time(timestamp, zone), "--");
+    assert_eq!(
+        format_tooltip_time(timestamp, zone),
+        "--",
+        "a western offset runs off the other end of the calendar"
+    );
 }
 
 #[test]

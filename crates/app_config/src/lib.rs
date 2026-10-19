@@ -14,5 +14,6 @@
 pub mod market_participants;
 pub mod network;
 pub mod settings;
+pub mod time_zone;
 pub mod widget;
 pub mod workspace;

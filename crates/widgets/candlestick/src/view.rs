@@ -77,6 +77,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::notify_on_data_time_zone_change,
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -464,6 +465,8 @@ pub struct CandlestickWidget {
     /// reason: a convention this build persisted may have stopped being published, and the
     /// route's own declaration is what answers whether it still is.
     published_adjustments: Rc<dyn Fn(&VenueRoute) -> Result<Vec<Adjustment>, MarketError>>,
+    /// Wakes the chart when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for CandlestickWidget {
@@ -609,6 +612,7 @@ impl CandlestickWidget {
             market_reloaded: false,
             published_timeframes,
             published_adjustments,
+            _time_zone_task: notify_on_data_time_zone_change(cx),
         }
     }
 

@@ -15,6 +15,7 @@ use crate::{
         settings::{BinanceOrigins, VenueSettings, default_venues, deserialize_venues},
     },
     network::{Config as NetworkConfig, NetworkRouteGeneration, NetworkRuntimeGenerations},
+    time_zone::DataTimeZone,
     workspace::WorkspacesConfig,
 };
 
@@ -75,6 +76,9 @@ pub struct Config {
     /// Application display language.
     #[serde(default)]
     pub language: Language,
+    /// The time zone every data timestamp is displayed in.
+    #[serde(default)]
+    pub data_time_zone: DataTimeZone,
     /// Wallet account currently associated with this installation.
     #[serde(default)]
     pub account: Option<AccountConfig>,
@@ -112,6 +116,7 @@ impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
         self.appearance == other.appearance
             && self.language == other.language
+            && self.data_time_zone == other.data_time_zone
             && self.account == other.account
             && self.avatar == other.avatar
             && self.proxies == other.proxies
@@ -432,6 +437,7 @@ impl Default for Config {
         Self {
             appearance: Appearance::System,
             language: Language::default(),
+            data_time_zone: DataTimeZone::default(),
             account: None,
             avatar: None,
             proxies: BTreeMap::new(),
@@ -513,6 +519,7 @@ mod tests {
         settings::{
             AccountConfig, AccountWalletKind, Appearance, Config, Language, ReplaceProxyError,
         },
+        time_zone::DataTimeZone,
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
 
@@ -1732,6 +1739,72 @@ mod tests {
             serde_json::from_value(json).expect("legacy config should deserialize");
 
         assert_eq!(decoded.language, Language::ZhCn);
+    }
+
+    #[test]
+    fn default_data_time_zone_should_be_utc() {
+        assert_eq!(Config::default().data_time_zone, DataTimeZone::UTC);
+    }
+
+    /// The setting stores the number of hours it adds to UTC, and what is written
+    /// back is what a reader converts by.
+    #[test]
+    fn data_time_zone_should_round_trip_the_stored_hours() {
+        let config = Config {
+            data_time_zone: DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset"),
+            ..Config::default()
+        };
+        let serialized = serde_json::to_value(&config).expect("config should serialize");
+
+        assert_eq!(serialized["data_time_zone"], json!(8));
+        assert_eq!(
+            serde_json::from_value::<Config>(serialized).expect("config should deserialize"),
+            config
+        );
+    }
+
+    /// A file written before the setting existed holds every other value and no
+    /// offset; it reads as UTC, which is the clock those timestamps were drawn in.
+    #[test]
+    fn legacy_config_without_data_time_zone_should_use_utc() {
+        let mut json = serde_json::to_value(configured_settings())
+            .expect("configured settings should serialize");
+        json.as_object_mut()
+            .expect("config should serialize as an object")
+            .remove("data_time_zone");
+
+        let decoded: Config =
+            serde_json::from_value(json).expect("legacy config should deserialize");
+
+        assert_eq!(decoded.data_time_zone, DataTimeZone::UTC);
+    }
+
+    /// An offset no real zone is at is not this shape, exactly as a venue this
+    /// build does not speak is not: the value is refused rather than clamped.
+    #[test]
+    fn a_data_time_zone_outside_the_offered_range_should_be_refused() {
+        for hours in [-13, 15] {
+            let mut json =
+                serde_json::to_value(Config::default()).expect("default config should serialize");
+            json["data_time_zone"] = json!(hours);
+
+            assert!(
+                serde_json::from_value::<Config>(json).is_err(),
+                "{hours} is not an offset the setting offers"
+            );
+        }
+    }
+
+    /// The manager persists a candidate only when it differs from what it holds, so
+    /// an equality that ignored the display time zone would silently drop the edit.
+    #[test]
+    fn config_equality_should_notice_a_data_time_zone_change() {
+        let other = Config {
+            data_time_zone: DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset"),
+            ..Config::default()
+        };
+
+        assert_ne!(Config::default(), other);
     }
 
     /// A first start has no workspaces, which is what makes the workspace list

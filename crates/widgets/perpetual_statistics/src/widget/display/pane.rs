@@ -66,6 +66,7 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, notify_on_data_time_zone_change},
     util::{format_countdown, unix_millis},
     view::{WidgetHeader, WidgetView},
 };
@@ -304,6 +305,8 @@ pub struct StatisticsWidget<M: StatisticsMetric> {
     /// what the header controls refuse input on is this flag.
     pub awaiting_market: bool,
     _countdown_task: Task<()>,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
     _metric: PhantomData<fn() -> M>,
 }
 
@@ -532,6 +535,7 @@ where
             directory_generation: 0,
             awaiting_market: false,
             _countdown_task: countdown_task,
+            _time_zone_task: notify_on_data_time_zone_change(cx),
             _metric: PhantomData,
         };
         widget.rebuild_chart(cx);
@@ -1245,6 +1249,12 @@ where
     M: StatisticsMetric,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A window's time labels and tooltips are written when it arrives, so a zone
+        // that moved while the pane was open is rewritten here, on the frame that
+        // reads the new setting — before anything is drawn from the chart.
+        if let Some(chart) = self.chart.as_mut() {
+            chart.set_time_zone(data_time_zone(cx));
+        }
         // The body is only embedded while the pane has content, so this is the
         // ready state and nothing else. Everything the pane is *doing* is drawn by
         // the framework around this.

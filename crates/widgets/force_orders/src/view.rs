@@ -9,7 +9,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Empty, Entity, Hsla, InteractiveElement,
     IntoElement, Length, ParentElement, Render, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Window, base::Align, div, relative,
+    StatefulInteractiveElement, Styled, Task, Window, base::Align, div, relative,
 };
 use i18n::t;
 use market_participants_connector::{
@@ -26,6 +26,7 @@ use widget::{
     error::is_catalog_not_loaded,
     identity::{WidgetId, WidgetInstanceId},
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::{data_time_zone, on_data_time_zone_change},
     venue::{VenueDisplay, route_display_string},
     view::WidgetView,
 };
@@ -209,7 +210,7 @@ impl TableDataSet<COLUMN_COUNT> for ForceOrdersTable {
         let Some(row) = row else {
             return Empty.into_any_element();
         };
-        let display = row.display();
+        let display = row.display(data_time_zone(cx));
         let direction = if row.order().position_side == PositionSide::Long {
             self.long
         } else {
@@ -295,6 +296,8 @@ pub struct ForceOrdersWidget {
     /// Accepting it would write a status over the notice the framework is drawing, so
     /// every message entry refuses while this is set.
     awaiting_market: bool,
+    /// Wakes the pane when the zone its timestamps are read in moves.
+    _time_zone_task: Option<Task<()>>,
 }
 
 impl WidgetView for ForceOrdersWidget {
@@ -423,6 +426,12 @@ impl ForceOrdersWidget {
             awaiting_snapshot: true,
             awaiting_market: false,
             market_reloaded: false,
+            // The rows are drawn by the table entity, which keeps what it drew until
+            // it is told otherwise: moving the display zone has to wake the table.
+            _time_zone_task: on_data_time_zone_change(context, |this, _, cx| {
+                this.table.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
         }
     }
 
@@ -2069,7 +2078,7 @@ mod tests {
             long: gpui_kit::green(),
             short: gpui_kit::red(),
         };
-        let display = table.snapshot.orders()[0].display();
+        let display = table.snapshot.orders()[0].display(time::UtcOffset::UTC);
 
         assert_eq!(
             [
