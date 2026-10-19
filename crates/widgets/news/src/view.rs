@@ -28,11 +28,8 @@
 
 use std::{convert::Infallible, sync::Arc, time::Instant};
 
-use app_config::{
-    settings::Config,
-    widget::{WidgetConfig, WidgetConfigSchemaVersion},
-};
-use app_config_provider::manager::ConfigManager;
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     badge::Badge,
     button::Button,
@@ -48,7 +45,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement,
     ListAlignment, ParentElement, Render, Role, SharedString, StatefulInteractiveElement, Styled,
-    Task, Window, base::Disableable, div, prelude::FluentBuilder, px,
+    Subscription, Task, Window, base::Disableable, div, prelude::FluentBuilder, px,
 };
 use i18n::t;
 use kytrix_service_provider::{
@@ -57,6 +54,7 @@ use kytrix_service_provider::{
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
@@ -151,12 +149,12 @@ pub struct NewsWidget {
     sound: Box<dyn NotificationSound>,
     /// How recently this pane was heard, so a run of reports is one sound.
     throttle: Throttle,
-    _account_task: Task<()>,
+    _account: Subscription,
     /// Wakes the pane once its sound has a device, so the control it draws is not a control
     /// for a sound that arrived after the last frame it drew.
     _device_task: Task<()>,
-    /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    /// Keeps the pane, and the list that draws its rows, following the display time zone.
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for NewsWidget {
@@ -264,20 +262,9 @@ impl NewsWidget {
         // The account is the pane's scope, and the user can change it while the pane is
         // open: signing out has to take the feed with it, and signing in as someone else
         // has to read again.
-        let (initial_account, mut changes) = {
-            let manager = cx.global::<ConfigManager>();
-            (account_of(&manager.read()), manager.subscribe())
-        };
-        let account_task = cx.spawn(async move |this, cx| {
-            while changes.changed().await.is_ok() {
-                let account = account_of(&changes.borrow_and_update());
-                if this
-                    .update(cx, |this, cx| this.reconcile_account(account, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
         });
 
         // The device is opened on the sound's own thread, which is a moment no frame knows
@@ -293,7 +280,7 @@ impl NewsWidget {
 
         // The rows are built by the list entity, which keeps what it drew until it is
         // told otherwise: moving the display zone has to wake the list itself.
-        let time_zone_task = on_data_time_zone_change(cx, |this, _, cx| {
+        let time_zone = on_data_time_zone_change(cx, |this, _, cx| {
             this.list.update(cx, |_, cx| cx.notify());
             cx.notify();
         });
@@ -310,15 +297,15 @@ impl NewsWidget {
             config_change,
             // The pane records the account it was built for, but it starts nothing: the
             // framework calls `load` once construction is done.
-            account_id: initial_account,
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
             snapshot: None,
             ready: false,
             list,
             sound,
             throttle: Throttle::default(),
-            _account_task: account_task,
+            _account: account,
             _device_task: device_task,
-            _time_zone_task: time_zone_task,
+            _time_zone: time_zone,
         }
     }
 
@@ -771,14 +758,6 @@ fn view_plans() -> WidgetAction {
     })
 }
 
-/// The account a pane follows, as the settings hold it.
-fn account_of(config: &Config) -> Option<SmolStr> {
-    config
-        .account
-        .as_ref()
-        .map(|account| SmolStr::new(account.user_id.as_str()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -788,8 +767,8 @@ mod tests {
         widget::{VersionedWidgetConfig, decode_or_default},
     };
     use gpui_kit::{
-        AppContext, Entity, IntoElement, Pixels, Render, TestAppContext, VisualTestContext, Window,
-        div, point, px, size,
+        AppContext, BorrowAppContext, Entity, IntoElement, Pixels, Render, TestAppContext,
+        VisualTestContext, Window, div, point, px, size,
     };
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::engine::KytrixServiceError;
@@ -820,7 +799,8 @@ mod tests {
         base_ui::style::theme::install(cx);
         i18n::global::embedded::install(cx).expect("the embedded locales should load");
         global::install(cx).expect("the test Tokio runtime should build");
-        cx.set_global(ConfigManager::in_memory(settings(account)));
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
     }
 
     /// A pane the framework would have built, driven by a fake session and a fake sound.
@@ -1373,12 +1353,17 @@ mod tests {
         });
 
         cx.update(|cx| {
-            cx.global_mut::<ConfigManager>().update(|config| {
-                config.account = Some(AccountConfig {
-                    user_id: "someone-else".to_owned(),
-                    wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                    wallet_kind: AccountWalletKind::Ethereum,
-                });
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(AccountConfig {
+                            user_id: "someone-else".to_owned(),
+                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                    },
+                    cx,
+                );
             });
         });
 

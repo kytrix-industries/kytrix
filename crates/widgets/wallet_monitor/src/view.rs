@@ -36,11 +36,8 @@
 
 use std::sync::Arc;
 
-use app_config::{
-    settings::Config,
-    widget::{WidgetConfig, WidgetConfigSchemaVersion},
-};
-use app_config_provider::manager::ConfigManager;
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     button::Button,
     deque_unsized_list::DequeUnsizedList,
@@ -55,7 +52,8 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement,
     IntoElement, ListAlignment, ParentElement, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, Task, WeakEntity, Window, base::Disableable, div, px,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, base::Disableable, div,
+    px,
 };
 use i18n::t;
 use kytrix_service_provider::service::{
@@ -65,6 +63,7 @@ use kytrix_service_provider::service::{
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
@@ -243,9 +242,10 @@ pub struct WalletMonitorWidget {
     selection_read: SelectionRead,
     /// The open dialog, which is the pane's only way of managing addresses.
     dialog: Option<WeakEntity<WalletMonitorDialog>>,
-    _account_task: Task<()>,
-    /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    /// Keeps the pane following the account the settings hold.
+    _account: Subscription,
+    /// Keeps the pane, and the list that draws its rows, following the display time zone.
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for WalletMonitorWidget {
@@ -333,20 +333,9 @@ impl WalletMonitorWidget {
         // The account is the pane's scope, and the user can change it while the pane is
         // open: signing out has to take the transfers with it, and signing in as someone
         // else has to read again.
-        let (initial_account, mut changes) = {
-            let manager = cx.global::<ConfigManager>();
-            (account_of(&manager.read()), manager.subscribe())
-        };
-        let account_task = cx.spawn(async move |this, cx| {
-            while changes.changed().await.is_ok() {
-                let account = account_of(&changes.borrow_and_update());
-                if this
-                    .update(cx, |this, cx| this.reconcile_account(account, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
         });
 
         // The list holds the feed itself, so what a reader is reading is the list's to keep:
@@ -359,7 +348,7 @@ impl WalletMonitorWidget {
             recovery,
             // The pane records the account it was built for, but it starts nothing: the
             // framework calls `load` once construction is done.
-            account_id: initial_account,
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
             snapshot: None,
             ready: false,
             list,
@@ -368,10 +357,10 @@ impl WalletMonitorWidget {
             notice: None,
             selection_read: SelectionRead::default(),
             dialog: None,
-            _account_task: account_task,
+            _account: account,
             // The rows are built by the list entity, which keeps what it drew until it
             // is told otherwise: moving the display zone has to wake the list itself.
-            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+            _time_zone: on_data_time_zone_change(cx, |this, _, cx| {
                 this.list.update(cx, |_, cx| cx.notify());
                 cx.notify();
             }),
@@ -1049,14 +1038,6 @@ fn inconsistent() -> SelectionNotice {
     ))
 }
 
-/// The account a pane follows, as the settings hold it.
-fn account_of(config: &Config) -> Option<SmolStr> {
-    config
-        .account
-        .as_ref()
-        .map(|account| SmolStr::new(account.user_id.as_str()))
-}
-
 /// The list a pane draws its feed with.
 ///
 /// The list holds the feed itself, so what a reader is reading is the list's to keep: it is
@@ -1185,7 +1166,9 @@ pub(crate) mod tests {
         widget::{VersionedWidgetConfig, decode_or_default},
     };
     use base_ui::{animation::ANIMATION_TICK, input::InputStateBuilder, layer::Layer};
-    use gpui_kit::{AppContext, IntoElement, Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::{
+        AppContext, BorrowAppContext, IntoElement, Modifiers, TestAppContext, VisualTestContext,
+    };
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::{engine::KytrixServiceError, wallet::WalletSelection};
     use network::transport::error::TransportError;
@@ -1219,7 +1202,8 @@ pub(crate) mod tests {
         base_ui::style::theme::install(cx);
         i18n::global::embedded::install(cx).expect("the embedded locales should load");
         global::install(cx).expect("the test Tokio runtime should build");
-        cx.set_global(ConfigManager::in_memory(settings(account)));
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
     }
 
     /// A pane the framework would have built, driven by a fake wallet.
@@ -1956,6 +1940,49 @@ pub(crate) mod tests {
             assert!(!pane.has_content());
             assert!(pane.selections.is_none());
         });
+    }
+
+    /// Another account is another feed, and the pane hears about it from the settings
+    /// rather than from a reload: it opens that account's session and reads for it.
+    #[gpui_kit::test]
+    fn an_account_change_should_read_the_new_account(cx: &mut TestAppContext) {
+        let source = FakeSource::default();
+        let first = source.session(ACCOUNT);
+        let _first_control = first.subscribe();
+        let second = source.session("someone-else");
+        let _second_control = second.subscribe();
+        let pane = pane(cx, &source);
+        settle_until(cx, "the stream to come up", |cx| pane.read(cx).ready);
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(AccountConfig {
+                            user_id: "someone-else".to_owned(),
+                            wallet_address: FIRST.to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                    },
+                    cx,
+                );
+            });
+        });
+
+        settle_until(cx, "the replacement session", |_| {
+            second.state().subscribes == 1
+        });
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).account_id.as_deref(), Some("someone-else"));
+        });
+        assert_eq!(
+            source.requested(),
+            [
+                SmolStr::new_static(ACCOUNT),
+                SmolStr::new_static("someone-else"),
+            ],
+            "the session the pane opened is the new account's"
+        );
     }
 
     #[gpui_kit::test]

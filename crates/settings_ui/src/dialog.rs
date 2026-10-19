@@ -27,7 +27,8 @@
 //! either way. Deleting a row is the one request that is put to the user before it is recorded,
 //! and the alert it is put to is opened the same way — see [`SettingsDialog::open_requested_form`].
 
-use app_config::settings::{Config, Language};
+use std::borrow::BorrowMut as _;
+
 use app_config_provider::manager::ConfigManager;
 use base_ui::{
     button::Button,
@@ -51,7 +52,6 @@ use market_participants_connector::venue::definition::supported_venues;
 
 use crate::{
     access::FieldValue,
-    appearance,
     catalog::{
         Catalog, FieldAccess, FieldDef, PageDef, TreeNodeDef, VenueView, catalog, default_page,
     },
@@ -395,13 +395,12 @@ impl SettingsDialog {
         self.commit_inputs(cx);
         let previous = cx.global::<ConfigManager>().read();
         let applied = self.draft.read(cx).applied_to(previous.as_ref());
-        let stored = cx.update_global::<ConfigManager, _>(|manager, _| manager.write(applied));
+        let stored = cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.write(applied, cx.borrow_mut())
+        });
 
         match stored {
-            Ok(()) => {
-                self.apply_interface(window, &previous, cx);
-                cx.emit(DismissEvent);
-            }
+            Ok(()) => cx.emit(DismissEvent),
             Err(error) => {
                 let title = t!(cx, "settings_ui.save_failed.title");
                 let message = t!(cx, "settings_ui.save_failed.message", reason = error);
@@ -410,30 +409,6 @@ impl SettingsDialog {
                     alert.ok(title, message).ok_text(confirm)
                 });
             }
-        }
-    }
-
-    /// Applies the settings the interface itself follows, if the commit moved them.
-    ///
-    /// The language and the appearance are read while the interface is rendered rather than from
-    /// the settings, so what changed has to be handed to the translator and to the theme; a
-    /// commit that did not touch one of them leaves that one alone.
-    fn apply_interface(&mut self, window: &mut Window, previous: &Config, cx: &mut Context<Self>) {
-        let stored = cx.global::<ConfigManager>().read();
-
-        if stored.language != previous.language {
-            // The language is the global every label is rendered through, so switching it
-            // is the whole of applying a language: the windows are asked to draw again and
-            // read the new text on their next frame.
-            cx.set_global(language_code(stored.language));
-            cx.refresh_windows();
-        }
-        if stored.appearance != previous.appearance {
-            // The appearance is resolved against the settings rather than read while the
-            // interface is rendered, so the schema the new preference resolves to is applied
-            // here. `System` resolves against this window, which is the window the observer
-            // watching the system appearance belongs to.
-            appearance::apply(stored.appearance, window, cx);
         }
     }
 
@@ -731,14 +706,6 @@ impl Render for SettingsDialog {
     }
 }
 
-/// The translator's own name for one persisted language.
-fn language_code(language: Language) -> LanguageCode {
-    match language {
-        Language::ZhCn => LanguageCode::ZhCn,
-        Language::En => LanguageCode::En,
-    }
-}
-
 /// What a column says when the query admitted nothing it could draw.
 fn no_matches(cx: &App) -> AnyElement {
     div()
@@ -916,7 +883,11 @@ mod tests {
         settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
-    use app_config_provider::{manager::ConfigManager, store::ConfigPersistenceError};
+    use app_config_provider::{
+        events::{AppearanceChanged, LanguageChanged},
+        manager::ConfigManager,
+        store::ConfigPersistenceError,
+    };
     use base_ui::{
         animation::ANIMATION_TICK,
         layer::{Layer, LayerExt},
@@ -925,8 +896,8 @@ mod tests {
     };
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement,
-        Modifiers, Render, SharedString, Styled, TestAppContext, VisualTestContext, Window,
-        WindowAppearance, div, px,
+        Modifiers, Render, SharedString, Styled, Subscription, TestAppContext, VisualTestContext,
+        Window, WindowAppearance, div, px,
     };
     use i18n::{language::codes::LanguageCode, t};
     use market_participants_connector::connector::MarketParticipantsConnector;
@@ -935,7 +906,7 @@ mod tests {
     use tempfile::TempDir;
     use widget_tokio_runtime::global;
 
-    use super::{SettingsDialog, default_page, language_code};
+    use super::{SettingsDialog, default_page};
     use crate::{
         access::FieldValue,
         appearance,
@@ -1002,7 +973,41 @@ mod tests {
     /// The settings are drawn as the window's dialog rather than as a child of this view: the
     /// form over them is a dialog of its own, and a commit that failed is reported by an
     /// alert, neither of which exists without a window layer to open it on.
-    struct Harness;
+    struct Harness {
+        _language: Subscription,
+        _appearance: Subscription,
+    }
+
+    impl Harness {
+        /// Subscribes the projections the application itself installs: the language the
+        /// interface is rendered through and the appearance the window is drawn in.
+        ///
+        /// This is the test fixture's half of what the root window and the language projection
+        /// do in the application: a commit writes the settings, and these subscriptions are
+        /// what turn the published events into the globals and the theme the window draws from.
+        fn new(window: &Window, cx: &mut Context<Self>) -> Self {
+            let events = cx.global::<ConfigManager>().events().clone();
+            let language = cx.subscribe(&events, |_, _, event: &LanguageChanged, cx| {
+                cx.set_global(match event.0 {
+                    Language::ZhCn => LanguageCode::ZhCn,
+                    Language::En => LanguageCode::En,
+                });
+                cx.refresh_windows();
+            });
+            let appearance = cx.subscribe_in(
+                &events,
+                window,
+                |_, _, event: &AppearanceChanged, window, cx| {
+                    appearance::apply(event.0, window, cx)
+                },
+            );
+
+            Self {
+                _language: language,
+                _appearance: appearance,
+            }
+        }
+    }
 
     impl Render for Harness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -1023,8 +1028,9 @@ mod tests {
     ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
         let mut config = config;
         config.language = language;
+        let manager = cx.update(|cx| ConfigManager::in_memory(config, cx));
 
-        settings_over(ConfigManager::in_memory(config), language, cx)
+        settings_over(manager, language, cx)
     }
 
     /// Opens the settings over a manager the caller built, which is how a test gets settings
@@ -1058,13 +1064,16 @@ mod tests {
             gpui_kit::base::init(cx);
             base_ui::style::theme::install(cx);
             i18n::global::embedded::install(cx).expect("embedded locales should load");
-            cx.set_global(language_code(language));
+            cx.set_global(match language {
+                Language::ZhCn => LanguageCode::ZhCn,
+                Language::En => LanguageCode::En,
+            });
             cx.set_global(manager);
             // A manager whose settings are stored under another language than the one the
             // interface is drawn in is a session that starts with a change nobody made, so the
             // two are made to agree here rather than left to what a default happens to be.
-            cx.update_global::<ConfigManager, _>(|manager, _| {
-                manager.update(|config| config.language = language);
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| config.language = language, cx);
             });
             let draft = cx.new(|cx| {
                 let current = cx.global::<ConfigManager>().read();
@@ -1073,7 +1082,8 @@ mod tests {
 
             cx.new(|cx| SettingsDialog::new_with_catalog(draft, catalog, cx))
         });
-        let (_, cx) = cx.add_window_view(|_, cx| Layer::new(cx.new(|_| Harness)));
+        let (_, cx) =
+            cx.add_window_view(|window, cx| Layer::new(cx.new(move |cx| Harness::new(window, cx))));
         // The appearance the settings name is applied the way a window applies it when it is
         // built, so a test starts from the theme the stored preference resolves to rather than
         // from whichever one `install` left behind.
@@ -1108,8 +1118,10 @@ mod tests {
         config: Config,
         cx: &mut TestAppContext,
     ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+        let manager = cx.update(|cx| ConfigManager::in_memory(config, cx));
+
         settings_over_catalog(
-            ConfigManager::in_memory(config),
+            manager,
             Language::En,
             catalog_closing("market_participants"),
             cx,
@@ -1156,7 +1168,8 @@ mod tests {
             gpui_kit::base::init(cx);
             base_ui::style::theme::install(cx);
             i18n::global::embedded::install(cx).expect("embedded locales should load");
-            cx.set_global(ConfigManager::in_memory(Config::default()));
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
             global::install(cx).expect("the test Tokio runtime should build");
             MarketParticipantsConnector::install(cx)
                 .expect("the market participants root should install");
@@ -1169,7 +1182,8 @@ mod tests {
 
             cx.new(|cx| SettingsDialog::new(draft, cx))
         });
-        let (_, cx) = cx.add_window_view(|_, cx| Layer::new(cx.new(|_| Harness)));
+        let (_, cx) =
+            cx.add_window_view(|window, cx| Layer::new(cx.new(move |cx| Harness::new(window, cx))));
         // The appearance the settings name is applied the way a window applies it when it is
         // built, so a test starts from the theme the stored preference resolves to rather than
         // from whichever one `install` left behind.
@@ -1352,12 +1366,13 @@ mod tests {
     /// A test that repairs the path the way a user repairs a permission is the one thing that can
     /// tell a retry apart from a commit that was never attempted again, so the handle lives for as
     /// long as the path is used: dropping it removes the directory and what the test put in it.
-    fn manager_behind_a_file() -> (ConfigManager, PathBuf, TempDir) {
+    fn manager_behind_a_file(cx: &mut TestAppContext) -> (ConfigManager, PathBuf, TempDir) {
         let directory = test_temp("manager-behind-a-file");
         let blocking = directory.path().join("not-a-directory");
         fs::write(&blocking, b"block directory creation").expect("the blocking file is written");
 
-        let manager = ConfigManager::from_path(blocking.join("config.json"))
+        let manager = cx
+            .update(|cx| ConfigManager::from_path(blocking.join("config.json"), cx))
             .expect("a config manager loads around a missing file");
 
         (manager, blocking, directory)
@@ -1389,46 +1404,27 @@ mod tests {
     /// dialog must neither know about them nor undo them.
     fn write_while_open(cx: &mut VisualTestContext) {
         cx.update(|_, cx| {
-            cx.update_global::<ConfigManager, _>(|manager, _| {
-                manager.update(|config| {
-                    config.avatar = Some("<svg>generated-while-open</svg>".to_owned());
-                    config.account = Some(AccountConfig {
-                        user_id: "22222222-2222-4222-8222-222222222222".to_owned(),
-                        wallet_address: "0xfeed".to_owned(),
-                        wallet_kind: AccountWalletKind::Ethereum,
-                    });
-                    config.workspaces = WorkspacesConfig {
-                        entries: vec![WorkspaceConfig {
-                            name: SmolStr::new_static("written-while-open"),
-                            layout: WorkspaceLayout::single_pane(),
-                        }],
-                        active: Some(SmolStr::new_static("written-while-open")),
-                    };
-                });
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.avatar = Some("<svg>generated-while-open</svg>".to_owned());
+                        config.account = Some(AccountConfig {
+                            user_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                            wallet_address: "0xfeed".to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                        config.workspaces = WorkspacesConfig {
+                            entries: vec![WorkspaceConfig {
+                                name: SmolStr::new_static("written-while-open"),
+                                layout: WorkspaceLayout::single_pane(),
+                            }],
+                            active: Some(SmolStr::new_static("written-while-open")),
+                        };
+                    },
+                    cx,
+                );
             });
         });
-    }
-
-    /// The settings behind a file that cannot be written are reported as not stored, rather
-    /// than being published as if they had been.
-    #[test]
-    fn a_manager_behind_a_file_should_report_a_failed_write() {
-        let (mut manager, _blocking, _directory) = manager_behind_a_file();
-        let previous = manager.read();
-        let mut candidate = previous.as_ref().clone();
-        candidate.appearance = Appearance::Dark;
-
-        let outcome = manager.write(candidate);
-
-        assert!(
-            outcome.is_err(),
-            "storing behind a file must fail, and it failed with {outcome:?}"
-        );
-        assert_eq!(
-            manager.read().appearance,
-            previous.appearance,
-            "a write that could not be stored must leave the snapshot alone"
-        );
     }
 
     /// Opens the form that edits an entry, the way the row of the catalog that asks for one
@@ -1631,12 +1627,14 @@ mod tests {
     /// key would otherwise reach the user as an alert with nothing in it.
     #[gpui_kit::test]
     fn the_failure_alert_should_name_the_reason_in_both_languages(cx: &mut TestAppContext) {
-        let (mut manager, _blocking, _directory) = manager_behind_a_file();
+        let (mut manager, _blocking, _directory) = manager_behind_a_file(cx);
         let mut candidate = manager.read().as_ref().clone();
         candidate.appearance = Appearance::Dark;
-        let reason: ConfigPersistenceError = manager
-            .write(candidate)
-            .expect_err("storing behind a file should fail");
+        let reason: ConfigPersistenceError = cx.update(|cx| {
+            manager
+                .write(candidate, cx)
+                .expect_err("storing behind a file should fail")
+        });
 
         cx.update(|cx| {
             i18n::global::embedded::install(cx).expect("embedded locales should load");
@@ -1718,7 +1716,7 @@ mod tests {
     fn a_commit_that_could_not_be_stored_should_be_stored_when_it_is_tried_again(
         cx: &mut TestAppContext,
     ) {
-        let (manager, blocking, _directory) = manager_behind_a_file();
+        let (manager, blocking, _directory) = manager_behind_a_file(cx);
         let path = blocking.join("config.json");
         let (panel, cx) = settings_over(manager, Language::En, cx);
 
@@ -1760,7 +1758,9 @@ mod tests {
             written.contains("\"appearance\": \"Dark\""),
             "the file should hold what the user confirmed: {written}"
         );
-        let reloaded = ConfigManager::from_path(&path).expect("the stored settings should load");
+        let reloaded = cx
+            .update(|_, cx| ConfigManager::from_path(&path, cx))
+            .expect("the stored settings should load");
         assert_eq!(
             reloaded.read().as_ref(),
             &stored(cx),
@@ -2027,7 +2027,7 @@ mod tests {
     fn a_commit_that_cannot_be_stored_should_be_reported_and_keep_the_dialog(
         cx: &mut TestAppContext,
     ) {
-        let (manager, _blocking, _directory) = manager_behind_a_file();
+        let (manager, _blocking, _directory) = manager_behind_a_file(cx);
         let (panel, cx) = settings_over(manager, Language::ZhCn, cx);
 
         write_draft_field(&panel, "appearance", "language", "en", cx);

@@ -34,7 +34,8 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, base::Disableable, div,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    base::Disableable, div,
 };
 use i18n::t;
 use instrument_selector_ui::{
@@ -306,7 +307,7 @@ pub struct StatisticsWidget<M: StatisticsMetric> {
     pub awaiting_market: bool,
     _countdown_task: Task<()>,
     /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    _time_zone: Option<Subscription>,
     _metric: PhantomData<fn() -> M>,
 }
 
@@ -535,7 +536,7 @@ where
             directory_generation: 0,
             awaiting_market: false,
             _countdown_task: countdown_task,
-            _time_zone_task: notify_on_data_time_zone_change(cx),
+            _time_zone: notify_on_data_time_zone_change(cx),
             _metric: PhantomData,
         };
         widget.rebuild_chart(cx);

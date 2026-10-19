@@ -120,21 +120,27 @@ const fn configured_wallet_kind(wallet_kind: ServiceWalletKind) -> AccountWallet
 /// just went away, and a menu that showed the new address beside the old face for
 /// even one frame would be showing two accounts at once.
 pub(crate) fn store_account(account: AccountConfig, cx: &mut App) {
-    cx.update_global::<ConfigManager, _>(|manager, _| {
-        manager.update(|config| {
-            config.account = Some(account);
-            config.avatar = None;
-        });
+    cx.update_global::<ConfigManager, _>(|manager, cx| {
+        manager.update(
+            |config| {
+                config.account = Some(account);
+                config.avatar = None;
+            },
+            cx,
+        );
     });
 }
 
 /// Forgets the current account and its avatar.
 pub(crate) fn clear_account(cx: &mut App) {
-    cx.update_global::<ConfigManager, _>(|manager, _| {
-        manager.update(|config| {
-            config.account = None;
-            config.avatar = None;
-        });
+    cx.update_global::<ConfigManager, _>(|manager, cx| {
+        manager.update(
+            |config| {
+                config.account = None;
+                config.avatar = None;
+            },
+            cx,
+        );
     });
 }
 
@@ -155,8 +161,8 @@ pub(crate) fn store_avatar_if_current(wallet_address: &str, svg: String, cx: &mu
         return false;
     }
 
-    cx.update_global::<ConfigManager, _>(|manager, _| {
-        manager.update(|config| config.avatar = Some(svg));
+    cx.update_global::<ConfigManager, _>(|manager, cx| {
+        manager.update(|config| config.avatar = Some(svg), cx);
     });
     true
 }
@@ -193,7 +199,10 @@ mod tests {
     }
 
     fn install(cx: &mut TestAppContext, config: Config) {
-        cx.update(|cx| cx.set_global(ConfigManager::in_memory(config)));
+        cx.update(|cx| {
+            let manager = ConfigManager::in_memory(config, cx);
+            cx.set_global(manager);
+        });
     }
 
     /// A settings snapshot with the two fields this feature owns.

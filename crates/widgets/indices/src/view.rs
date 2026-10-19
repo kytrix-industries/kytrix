@@ -39,11 +39,8 @@ use std::{
 };
 
 use ahash::{AHashSet, HashMap, HashMapExt};
-use app_config::{
-    settings::Config,
-    widget::{WidgetConfig, WidgetConfigSchemaVersion},
-};
-use app_config_provider::manager::ConfigManager;
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     button::Button,
     empty_state::EmptyState,
@@ -59,7 +56,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Empty, Entity, FontWeight, Hsla,
     InteractiveElement, IntoElement, Length, ParentElement, Pixels, Point, Render, RenderOnce,
-    ScrollHandle, SharedString, Size, StatefulInteractiveElement, Styled, Task, Window,
+    ScrollHandle, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Window,
     base::{Align, Disableable, ScrollbarMode, Selectable},
     canvas, div, point,
     prelude::FluentBuilder,
@@ -75,6 +72,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::SmolStr;
 use tokio::runtime::Handle;
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
@@ -475,14 +473,6 @@ fn mode_button(
         .child(Icon::new(mode.icon()).size_3())
 }
 
-/// The account a pane follows, as the settings hold it.
-fn account_of(config: &Config) -> Option<SmolStr> {
-    config
-        .account
-        .as_ref()
-        .map(|account| SmolStr::new(account.user_id.as_str()))
-}
-
 /// Reads the manifest of the indices the service currently carries.
 ///
 /// The pane's own question, kept apart from the service seam: the service subscribes and
@@ -549,7 +539,8 @@ pub struct IndicesWidget {
     /// The flash each index left behind the last time its price moved.
     flashes: HashMap<IndexTopic, QuoteFlash>,
     grid_scroll: ScrollHandle,
-    _account_task: Task<()>,
+    /// Keeps the pane following the account the settings hold.
+    _account: Subscription,
 }
 
 impl WidgetView for IndicesWidget {
@@ -689,20 +680,9 @@ impl IndicesWidget {
         // The account is the pane's scope, and the user can change it while the pane
         // is open: signing out has to take the indices with it, and signing in has to
         // read again.
-        let (initial_account, mut changes) = {
-            let manager = cx.global::<ConfigManager>();
-            (account_of(&manager.read()), manager.subscribe())
-        };
-        let account_task = cx.spawn(async move |this, cx| {
-            while changes.changed().await.is_ok() {
-                let account = account_of(&changes.borrow_and_update());
-                if this
-                    .update(cx, |this, cx| this.reconcile_account(account, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
         });
 
         Self {
@@ -714,7 +694,7 @@ impl IndicesWidget {
             config_change,
             // The pane records the account it was built for, but it starts nothing:
             // the framework calls `load` once construction is done.
-            account_id: initial_account,
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
             quotes: None,
             accepted: None,
             ready: false,
@@ -723,7 +703,7 @@ impl IndicesWidget {
             synced_busy: false,
             flashes: HashMap::new(),
             grid_scroll: ScrollHandle::new(),
-            _account_task: account_task,
+            _account: account,
         }
     }
 
@@ -1429,8 +1409,8 @@ mod tests {
         widget::{VersionedWidgetConfig, decode_or_default},
     };
     use gpui_kit::{
-        AppContext, Bounds, Entity, IntoElement, TestAppContext, VisualTestContext,
-        base::Selectable, point,
+        AppContext, BorrowAppContext, Bounds, Entity, IntoElement, TestAppContext,
+        VisualTestContext, base::Selectable, point,
     };
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use network::transport::error::TransportError;
@@ -1459,7 +1439,8 @@ mod tests {
         base_ui::style::theme::install(cx);
         i18n::global::embedded::install(cx).expect("the embedded locales should load");
         global::install(cx).expect("the test Tokio runtime should build");
-        cx.set_global(ConfigManager::in_memory(settings(account)));
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
     }
 
     fn config(selection: &[SelectedIndex]) -> IndicesConfig {
@@ -2186,6 +2167,47 @@ mod tests {
             1,
             "a pane that follows nothing leaves nothing subscribed"
         );
+    }
+
+    /// Another account is another scope, and the pane hears about it from the settings
+    /// rather than from a reload: the subscription it holds is replaced for the new
+    /// account.
+    #[gpui_kit::test]
+    fn an_account_change_should_subscribe_again_for_the_new_account(cx: &mut TestAppContext) {
+        let source = FakeSource::default();
+        let first = source.subscribe();
+        let _second = source.subscribe();
+        let pane = pane(cx, source.clone(), config(&[selected("HSI")]));
+
+        settle_until(cx, "the pane to subscribe", |_| {
+            source.subscribed().len() == 1
+        });
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(AccountConfig {
+                            user_id: "someone-else".to_owned(),
+                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                    },
+                    cx,
+                );
+            });
+        });
+
+        settle_until(cx, "the replacement subscription", |_| {
+            source.subscribed().len() == 2
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).account_id.as_deref(), Some("someone-else"));
+        });
+        settle_until(cx, "the first subscription to be let go", |_| {
+            first.drops.load(Ordering::SeqCst) == 1
+        });
     }
 
     #[gpui_kit::test]

@@ -9,7 +9,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Empty, Entity, Hsla, InteractiveElement,
     IntoElement, Length, ParentElement, Render, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, base::Align, div, relative,
+    StatefulInteractiveElement, Styled, Subscription, Window, base::Align, div, relative,
 };
 use i18n::t;
 use market_participants_connector::{
@@ -297,7 +297,7 @@ pub struct ForceOrdersWidget {
     /// every message entry refuses while this is set.
     awaiting_market: bool,
     /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for ForceOrdersWidget {
@@ -428,7 +428,7 @@ impl ForceOrdersWidget {
             market_reloaded: false,
             // The rows are drawn by the table entity, which keeps what it drew until
             // it is told otherwise: moving the display zone has to wake the table.
-            _time_zone_task: on_data_time_zone_change(context, |this, _, cx| {
+            _time_zone: on_data_time_zone_change(context, |this, _, cx| {
                 this.table.update(cx, |_, cx| cx.notify());
                 cx.notify();
             }),

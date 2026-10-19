@@ -54,7 +54,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext, ClipboardItem, Context, ElementId, Empty, Entity,
     EntityId, Hsla, InteractiveElement, IntoElement, ParentElement, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, Task, UniformListScrollHandle, WeakEntity, Window,
+    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
     base::{
         Disableable, NavMotion, NavOperation, NavPage, NavStack, NavStackState, ScrollbarMode,
         Selectable,
@@ -398,7 +398,7 @@ pub struct HyperliquidWalletMonitorWidget {
     /// that is already live.
     market_reloaded: bool,
     /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for HyperliquidWalletMonitorWidget {
@@ -604,7 +604,7 @@ impl HyperliquidWalletMonitorWidget {
             market_reloaded: false,
             // Every page is a cached view drawing from the pane, so moving the display
             // zone has to wake the pages as well as the pane itself.
-            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+            _time_zone: on_data_time_zone_change(cx, |this, _, cx| {
                 this.overview_page.update(cx, |_, cx| cx.notify());
                 let pages: Vec<EntityId> = this
                     .stack

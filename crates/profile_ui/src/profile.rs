@@ -12,10 +12,10 @@
 //!
 //! The account itself. That is the application settings, and this is a *reader* of them
 //! with one writer: [`crate::account`]. Every screen that cares who is signed in —
-//! widgets with an account-scoped stream, and this menu — watches the same record, so
-//! signing in changes one value and nothing has to be told twice. That is also why
-//! nothing here calls `refresh_windows`: settings changes are already published to
-//! every watcher.
+//! widgets with an account-scoped stream, and this menu — subscribes to the account
+//! event, so signing in publishes one event and nothing has to be told twice. That is
+//! also why nothing here calls `refresh_windows`: the event subscription is what
+//! redraws the screens that follow it.
 //!
 //! # What it does not do
 //!
@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use app_config::settings::{AccountConfig, AccountWalletKind};
-use app_config_provider::manager::ConfigManager;
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::layer::LayerExt as _;
 use futures::future::BoxFuture;
 use gpui_kit::*;
@@ -181,7 +181,8 @@ pub struct ProfileMenu {
     /// it is dropped, and the task this menu spawned to wait on it answers with a
     /// cancellation.
     sign_in: Option<AbortHandle>,
-    _account_task: Task<()>,
+    /// Keeps the menu following the account the settings hold.
+    _account: Subscription,
     _session_task: Task<()>,
     avatar_task: Option<Task<()>>,
     plan_task: Option<Task<()>>,
@@ -199,19 +200,10 @@ impl ProfileMenu {
     }
 
     fn with_source(source: Arc<dyn AccountService>, cx: &mut Context<Self>) -> Self {
-        let mut changes = cx.global::<ConfigManager>().subscribe();
-        let account_task = cx.spawn(async move |menu, cx| {
-            loop {
-                if changes.changed().await.is_err() {
-                    return;
-                }
-                let Ok(()) = menu.update(cx, |menu, cx| {
-                    menu.refresh_account(cx);
-                    cx.notify();
-                }) else {
-                    return;
-                };
-            }
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |menu, _, _: &AccountChanged, cx| {
+            menu.refresh_account(cx);
+            cx.notify();
         });
 
         let session_source = Arc::clone(&source);
@@ -240,7 +232,7 @@ impl ProfileMenu {
             plan: None,
             plan_generation: 0,
             sign_in: None,
-            _account_task: account_task,
+            _account: account,
             _session_task: session_task,
             avatar_task: None,
             plan_task: None,
@@ -359,8 +351,8 @@ impl ProfileMenu {
         self.avatar_task.take();
 
         match result {
-            // The settings publish the new avatar, and this menu reads it back with
-            // every other watcher, so the face and the record cannot disagree.
+            // The settings publish the new avatar, and this menu reads it back from the
+            // account change it subscribes to, so the face and the record cannot disagree.
             Ok((wallet, svg)) => {
                 if !account::store_avatar_if_current(&wallet, svg, cx) {
                     log::warn!("a generated avatar no longer belonged to the signed-in account");
@@ -940,7 +932,8 @@ mod tests {
             base_ui::style::theme::install(cx);
             i18n::global::embedded::install(cx).expect("embedded locales should load");
             global::install(cx).expect("test Tokio runtime should build");
-            cx.set_global(ConfigManager::in_memory(config));
+            let manager = ConfigManager::in_memory(config, cx);
+            cx.set_global(manager);
         });
         let menu =
             cx.update(|cx| cx.new(|cx| ProfileMenu::with_source(Arc::new(source.clone()), cx)));
@@ -1622,10 +1615,13 @@ mod tests {
             .source
             .with(|state| state.plan = Some(Some(PlanCode::Free)));
         harness.cx.update(|_, cx| {
-            cx.update_global::<ConfigManager, _>(|manager, _| {
-                manager.update(|config| {
-                    config.account = Some(other_account());
-                });
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(other_account());
+                    },
+                    cx,
+                );
             });
         });
         harness.cx.run_until_parked();

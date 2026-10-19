@@ -11,8 +11,8 @@
 //! the services publish.
 
 use app_config::time_zone::DataTimeZone;
-use app_config_provider::manager::ConfigManager;
-use gpui_kit::{App, Context, Task};
+use app_config_provider::{events::DataTimeZoneChanged, manager::ConfigManager};
+use gpui_kit::{App, Context, Subscription};
 use time::UtcOffset;
 
 /// The offset every data timestamp is displayed in.
@@ -34,11 +34,11 @@ fn utc_offset(zone: DataTimeZone) -> UtcOffset {
 
 /// Wakes the widget behind `cx` whenever the display time zone moves.
 ///
-/// The returned task is the subscription: a widget keeps it for as long as it wants
-/// to follow the setting, and dropping it stops following. Nothing is returned when
-/// there is no settings manager to follow, which is what an offline runtime and a
-/// widget test look like.
-pub fn notify_on_data_time_zone_change<T: 'static>(cx: &mut Context<T>) -> Option<Task<()>> {
+/// The returned subscription is the connection: a widget keeps it for as long as it
+/// wants to follow the setting, and dropping it stops following. Nothing is returned
+/// when there is no settings manager to follow, which is what an offline runtime and
+/// a widget test look like.
+pub fn notify_on_data_time_zone_change<T: 'static>(cx: &mut Context<T>) -> Option<Subscription> {
     on_data_time_zone_change(cx, |_, _, cx| cx.notify())
 }
 
@@ -51,27 +51,14 @@ pub fn notify_on_data_time_zone_change<T: 'static>(cx: &mut Context<T>) -> Optio
 pub fn on_data_time_zone_change<T: 'static>(
     cx: &mut Context<T>,
     mut changed: impl FnMut(&mut T, UtcOffset, &mut Context<T>) + 'static,
-) -> Option<Task<()>> {
-    let manager = cx.try_global::<ConfigManager>()?;
-    let mut changes = manager.subscribe();
-    let mut zone = manager.read().data_time_zone;
+) -> Option<Subscription> {
+    let events = cx.try_global::<ConfigManager>()?.events().clone();
 
-    Some(cx.spawn(async move |this, cx| {
-        while changes.changed().await.is_ok() {
-            let next = changes.borrow_and_update().data_time_zone;
-            if next == zone {
-                continue;
-            }
-            zone = next;
-            let offset = utc_offset(next);
-            if this
-                .update(cx, |this, cx| changed(this, offset, cx))
-                .is_err()
-            {
-                return;
-            }
-        }
-    }))
+    Some(
+        cx.subscribe(&events, move |this, _, event: &DataTimeZoneChanged, cx| {
+            changed(this, utc_offset(event.0), cx);
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -84,8 +71,8 @@ mod tests {
     };
     use app_config_provider::manager::ConfigManager;
     use gpui_kit::{
-        AppContext, Context, Entity, IntoElement, ParentElement, Render, TestAppContext, Window,
-        div,
+        AppContext, BorrowAppContext as _, Context, Entity, IntoElement, ParentElement, Render,
+        Subscription, TestAppContext, Window, div,
     };
 
     use super::*;
@@ -114,7 +101,8 @@ mod tests {
             let mut config = Config::default();
             config.data_time_zone =
                 DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset");
-            cx.set_global(ConfigManager::in_memory(config));
+            let manager = ConfigManager::in_memory(config, cx);
+            cx.set_global(manager);
 
             assert_eq!(data_time_zone(cx).whole_hours(), 8);
         });
@@ -126,7 +114,7 @@ mod tests {
     fn a_zone_change_should_wake_the_widget_that_follows_it(cx: &mut TestAppContext) {
         struct Probe {
             renders: Rc<Cell<usize>>,
-            _task: Option<Task<()>>,
+            _subscription: Option<Subscription>,
         }
 
         impl Render for Probe {
@@ -137,22 +125,28 @@ mod tests {
         }
 
         cx.update(|cx| {
-            cx.set_global(ConfigManager::in_memory(Config::default()));
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
         });
 
         let renders = Rc::new(Cell::new(0));
         let counted = Rc::clone(&renders);
         let (_, cx) = cx.add_window_view(move |_, cx| Probe {
             renders: counted,
-            _task: notify_on_data_time_zone_change(cx),
+            _subscription: notify_on_data_time_zone_change(cx),
         });
         let initial = renders.get();
         assert!(initial > 0, "the probe draws once the window exists");
 
         cx.update(|_, cx| {
-            cx.global_mut::<ConfigManager>().update(|config| {
-                config.data_time_zone =
-                    DataTimeZone::from_hours(-3).expect("UTC-3 is an offered offset");
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.data_time_zone =
+                            DataTimeZone::from_hours(-3).expect("UTC-3 is an offered offset");
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();
@@ -169,7 +163,7 @@ mod tests {
     fn another_setting_should_not_wake_the_widget(cx: &mut TestAppContext) {
         struct Probe {
             renders: Rc<Cell<usize>>,
-            _task: Option<Task<()>>,
+            _subscription: Option<Subscription>,
         }
 
         impl Render for Probe {
@@ -180,22 +174,28 @@ mod tests {
         }
 
         cx.update(|cx| {
-            cx.set_global(ConfigManager::in_memory(Config::default()));
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
         });
 
         let renders = Rc::new(Cell::new(0));
         let counted = Rc::clone(&renders);
         let (_, cx) = cx.add_window_view(move |_, cx| Probe {
             renders: counted,
-            _task: notify_on_data_time_zone_change(cx),
+            _subscription: notify_on_data_time_zone_change(cx),
         });
         cx.run_until_parked();
         let initial = renders.get();
         assert!(initial > 0, "the probe draws once the window exists");
 
         cx.update(|_, cx| {
-            cx.global_mut::<ConfigManager>().update(|config| {
-                config.appearance = Appearance::Dark;
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.appearance = Appearance::Dark;
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();
@@ -225,7 +225,7 @@ mod tests {
 
         struct Pane {
             rows: Entity<Rows>,
-            _task: Option<Task<()>>,
+            _subscription: Option<Subscription>,
         }
 
         impl Render for Pane {
@@ -235,7 +235,8 @@ mod tests {
         }
 
         cx.update(|cx| {
-            cx.set_global(ConfigManager::in_memory(Config::default()));
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
         });
 
         let renders = Rc::new(Cell::new(0));
@@ -247,7 +248,7 @@ mod tests {
             Pane {
                 // Only the rows are told: the pane is not notified, so a child that
                 // still drew the clock from before the change would stay that way.
-                _task: on_data_time_zone_change::<Pane>(cx, |this, _, cx| {
+                _subscription: on_data_time_zone_change::<Pane>(cx, |this, _, cx| {
                     this.rows.update(cx, |_, cx| cx.notify());
                 }),
                 rows,
@@ -257,9 +258,14 @@ mod tests {
         assert!(initial > 0, "the rows draw once the window exists");
 
         cx.update(|_, cx| {
-            cx.global_mut::<ConfigManager>().update(|config| {
-                config.data_time_zone =
-                    DataTimeZone::from_hours(9).expect("UTC+9 is an offered offset");
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.data_time_zone =
+                            DataTimeZone::from_hours(9).expect("UTC+9 is an offered offset");
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();

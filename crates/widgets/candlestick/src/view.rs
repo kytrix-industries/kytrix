@@ -43,7 +43,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, Context, CursorStyle, ElementId, Entity, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, base::Disableable, div,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, base::Disableable, div,
     prelude::FluentBuilder, px,
 };
 use i18n::t;
@@ -466,7 +466,7 @@ pub struct CandlestickWidget {
     /// route's own declaration is what answers whether it still is.
     published_adjustments: Rc<dyn Fn(&VenueRoute) -> Result<Vec<Adjustment>, MarketError>>,
     /// Wakes the chart when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for CandlestickWidget {
@@ -612,7 +612,7 @@ impl CandlestickWidget {
             market_reloaded: false,
             published_timeframes,
             published_adjustments,
-            _time_zone_task: notify_on_data_time_zone_change(cx),
+            _time_zone: notify_on_data_time_zone_change(cx),
         }
     }
 

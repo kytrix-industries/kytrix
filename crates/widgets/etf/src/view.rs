@@ -26,16 +26,13 @@
 //! The service serves this data to an account, so a pane with no account behind it
 //! fetches nothing and says so. That is a *waiting* state rather than a failure:
 //! nothing has gone wrong, the pane is just not for an anonymous reader. Nothing is
-//! retried on a timer either — the account watcher re-scopes the pane the moment the
-//! user signs in.
+//! retried on a timer either — the account event subscription re-scopes the pane the
+//! moment the user signs in.
 
 use std::{sync::Arc, time::Duration};
 
-use app_config::{
-    settings::Config,
-    widget::{WidgetConfig, WidgetConfigSchemaVersion},
-};
-use app_config_provider::manager::ConfigManager;
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     button::Button,
     icon::{Icon, IconKind},
@@ -47,14 +44,15 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window,
-    base::Disableable, div, px,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    Window, base::Disableable, div, px,
 };
 use i18n::t;
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
@@ -195,7 +193,8 @@ pub struct EtfWidget {
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     _countdown_task: Task<()>,
-    _account_task: Task<()>,
+    /// Keeps the pane following the account the settings hold.
+    _account: Subscription,
 }
 
 impl WidgetView for EtfWidget {
@@ -278,22 +277,11 @@ impl EtfWidget {
         });
         // The account is the pane's scope, and the user can change it while the pane
         // is open: signing out has to take the data with it, and signing in has to
-        // fetch. Watching the settings is what makes that happen without the pane
-        // having to be reopened.
-        let (initial_account, mut config_changes) = {
-            let manager = cx.global::<ConfigManager>();
-            (account_of(&manager.read()), manager.subscribe())
-        };
-        let account_task = cx.spawn(async move |this, cx| {
-            while config_changes.changed().await.is_ok() {
-                let account = account_of(&config_changes.borrow_and_update());
-                if this
-                    .update(cx, |this, cx| this.reconcile_account(account, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        // fetch. Following the account event is what makes that happen without the
+        // pane having to be reopened.
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
         });
 
         Self {
@@ -312,9 +300,9 @@ impl EtfWidget {
             refresh_pending: false,
             // The pane records the account it was built for, but it does not start
             // anything: the framework calls `load` once construction is done.
-            account_id: initial_account,
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
             _countdown_task: countdown_task,
-            _account_task: account_task,
+            _account: account,
         }
     }
 
@@ -1012,20 +1000,12 @@ fn fund_from_id(id: &str) -> EtfFundSelection {
     }
 }
 
-/// The account a pane follows, as the settings hold it.
-fn account_of(config: &Config) -> Option<SmolStr> {
-    config
-        .account
-        .as_ref()
-        .map(|account| SmolStr::new(account.user_id.as_str()))
-}
-
 #[cfg(test)]
 mod tests {
-    use app_config::settings::{AccountConfig, AccountWalletKind};
+    use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use gpui_kit::{
-        AppContext, Bounds, Entity, IntoElement, Modifiers, Pixels, Render, TestAppContext,
-        VisualTestContext, Window, div, point, px,
+        AppContext, BorrowAppContext, Bounds, Entity, IntoElement, Modifiers, Pixels, Render,
+        TestAppContext, VisualTestContext, Window, div, point, px,
     };
     use i18n::language::codes::LanguageCode;
 
@@ -1063,7 +1043,27 @@ mod tests {
 
     /// Scopes the panes built from here on to `account`, or to nobody.
     fn sign_in(cx: &mut App, account: Option<&str>) {
-        cx.set_global(ConfigManager::in_memory(settings(account)));
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
+    }
+
+    /// Lets the pane and its service run until what the test is waiting for happens.
+    ///
+    /// Two executors are involved: the pane sends its commands from GPUI's own, and the
+    /// service answers on the application runtime. So both are given a turn — the pane
+    /// first, because a command that has not been sent is a service with nothing to answer.
+    fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let handle = cx.update(|cx| global::handle(cx).handle().clone());
+            handle.block_on(async { tokio::task::yield_now().await });
+            if cx.update(|cx| ready(cx)) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what} should happen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// A pane the framework would have built, driven by a fake that never answers.
@@ -1772,6 +1772,46 @@ mod tests {
                 "and the pane asks for an account rather than reporting a failure"
             );
             assert!(!pane.read(cx).has_scope_for_test());
+        });
+    }
+
+    /// Another account is another read, and the pane hears about it from the settings
+    /// rather than from a reload: what the new account is owed is fetched for it.
+    #[gpui_kit::test]
+    fn an_account_change_should_read_the_new_account(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (pane, reads) = cx.update(|cx| {
+            install(cx);
+            sign_in(cx, Some(ACCOUNT));
+            let source = FakeSource::new([FetchPlan::Pending]);
+            let reads = source.clone();
+            let pane = cx.new(|cx| {
+                let mut pane = pane_with_source(source, cx);
+                pane.load(cx);
+                pane
+            });
+            (pane, reads)
+        });
+        settle_until(cx, "the pane to read", |_| reads.fetch_count() == 1);
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(AccountConfig {
+                            user_id: "someone-else".to_owned(),
+                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                    },
+                    cx,
+                );
+            });
+        });
+
+        settle_until(cx, "the replacement read", |_| reads.fetch_count() == 2);
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).account_id.as_deref(), Some("someone-else"));
         });
     }
 

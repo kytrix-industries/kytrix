@@ -1,5 +1,6 @@
 //! Statically registered widgets backed by typed RPC and supervised streams.
 
+pub mod account;
 pub mod any;
 pub mod binding;
 pub mod category;
