@@ -5,7 +5,7 @@
 # config file path itself (cli/config.rs:55-56, reached from cli/config.rs:99), which
 # fails with ENOTDIR / Windows os error 267 and aborts config loading. It is also the
 # package-selection key matched by `--packages`.
-name = "kytrix"
+name = "Kytrix"
 productName = "Kytrix"
 # Local default only. cargo-packager has no version flag, so the release workflow
 # must rewrite this line to the tagged version before packaging; keep it equal to
@@ -13,7 +13,7 @@ productName = "Kytrix"
 version = "0.0.1"
 # Must match CREDENTIAL_SERVICE in crates/kytrix_service_provider/src/auth/constants.rs.
 identifier = "xyz.kytrix.desktop"
-description = "Kytrix desktop terminal"
+description = "Kytrix"
 homepage = "https://kytrix.xyz"
 authors = ["Kytrix Industries"]
 publisher = "Kytrix Industries"
