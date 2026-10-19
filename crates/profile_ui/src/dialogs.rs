@@ -56,6 +56,16 @@ pub(crate) fn show_authorization_failed(window: &mut Window, cx: &mut App, reaso
     });
 }
 
+/// Shows why the account dashboard could not be opened.
+pub(crate) fn show_account_open_failed(window: &mut Window, cx: &mut App, reason: SharedString) {
+    let title = t!(cx, "window.account.open_account");
+    let confirm = t!(cx, "common.confirm");
+
+    window.alert(cx, move |alert, _, _| {
+        alert.ok(title, reason).ok_text(confirm)
+    });
+}
+
 /// Shows the alert that reports the account that was just authorized.
 ///
 /// The message is one line of copy — what the account is, the wallet family it belongs to,

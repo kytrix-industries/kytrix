@@ -786,6 +786,7 @@ window:
     cancel_sign_in: 取消登录
     copy_wallet_address: 复制钱包地址
     menu: 账户菜单
+    open_account: 账号
     plan_unavailable: 订阅档位未知
     sign_in: 登录
     sign_out: 退出登录

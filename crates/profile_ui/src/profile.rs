@@ -34,6 +34,7 @@ use gpui_kit::*;
 use i18n::t;
 use kytrix_service_provider::{
     auth::{
+        constants::ACCOUNT_ORIGIN,
         dpop::DpopKey,
         model::{AuthError, PlanCode, SessionChange},
         session::Revocation,
@@ -98,6 +99,9 @@ pub(crate) trait AccountService: Send + Sync + 'static {
         user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<PlanCode>, AuthError>>;
 
+    /// Creates a one-time code that signs this account into the web dashboard.
+    fn create_dashboard_handoff(&self) -> BoxFuture<'_, Result<String, AuthError>>;
+
     /// What the credential stored on this machine says about its own validity.
     fn local_session(&self) -> BoxFuture<'_, Result<LocalSession, AuthError>>;
 
@@ -149,6 +153,10 @@ impl AccountService for KytrixServiceConnector {
         })
     }
 
+    fn create_dashboard_handoff(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+        Box::pin(self.create_account_dashboard_handoff())
+    }
+
     fn session_changes(&self) -> watch::Receiver<SessionChange> {
         self.subscribe_account_session_changes()
     }
@@ -178,6 +186,7 @@ pub struct ProfileMenu {
     avatar_task: Option<Task<()>>,
     plan_task: Option<Task<()>>,
     sign_in_task: Option<Task<()>>,
+    handoff_task: Option<Task<()>>,
 }
 
 impl ProfileMenu {
@@ -236,6 +245,7 @@ impl ProfileMenu {
             avatar_task: None,
             plan_task: None,
             sign_in_task: None,
+            handoff_task: None,
         };
         menu.refresh_account(cx);
         menu
@@ -510,6 +520,65 @@ impl ProfileMenu {
             sign_in.abort();
         }
     }
+    /// Opens the account dashboard in the browser from the signed-in account.
+    ///
+    /// The browser receives only a one-time code, and the account stays signed in here.
+    /// A failure is reported where the user asked for it, like a failed sign-in.
+    fn open_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(user_id) = self.account.as_ref().map(|account| account.user_id.clone()) else {
+            return;
+        };
+        self.handoff_task.take();
+        let source = Arc::clone(&self.source);
+        let handoff =
+            global::handle(cx).run(async move { source.create_dashboard_handoff().await });
+        let window_handle = window.window_handle();
+        self.handoff_task = Some(cx.spawn(async move |menu, cx| {
+            let result = match handoff.await {
+                Ok(result) => result,
+                Err(error) => {
+                    log::error!("the account dashboard handoff task failed: {error}");
+                    Err(AuthError::Request)
+                }
+            };
+            let _ = cx.update_window(window_handle, move |_, window, cx| {
+                let window = window.window_handle();
+                let _ = menu.update(cx, |menu, cx| {
+                    menu.finish_open_account(user_id, result, window, cx)
+                });
+            });
+        }));
+    }
+
+    /// Opens the dashboard URL, unless the account it was requested for is gone.
+    fn finish_open_account(
+        &mut self,
+        user_id: String,
+        result: Result<String, AuthError>,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        self.handoff_task = None;
+        if self
+            .account
+            .as_ref()
+            .is_none_or(|account| account.user_id != user_id)
+        {
+            return;
+        }
+        match result {
+            Ok(code) => cx.open_url(&format!("{ACCOUNT_ORIGIN}/dashboard#{code}")),
+            Err(error) => {
+                let reason = oauth::service_failure(&error, cx);
+                cx.defer(move |cx| {
+                    let _ = cx.update_window(window, |_, window, cx| {
+                        dialogs::show_account_open_failed(window, cx, reason);
+                    });
+                });
+            }
+        }
+    }
+
     /// Asks whether the account should be signed out.
     fn confirm_sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.account.is_none() {
@@ -566,6 +635,7 @@ impl Render for ProfileMenu {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = cx.entity().downgrade();
         let sign_in = menu.clone();
+        let open_account = menu.clone();
         let sign_out = menu;
 
         AvatarDropDown::new(PROFILE_MENU_ID, t!(cx, "window.account.menu"))
@@ -574,6 +644,9 @@ impl Render for ProfileMenu {
             .plan(self.plan)
             .on_sign_in(move |window, cx| {
                 let _ = sign_in.update(cx, |menu, cx| menu.start_sign_in(window, cx));
+            })
+            .on_open_account(move |window, cx| {
+                let _ = open_account.update(cx, |menu, cx| menu.open_account(window, cx));
             })
             .on_sign_out(move |window, cx| {
                 let _ = sign_out.update(cx, |menu, cx| menu.confirm_sign_out(window, cx));
@@ -614,7 +687,7 @@ mod tests {
     use tokio::sync::watch;
     use widget_tokio_runtime::global;
 
-    use super::{AccountService, LoginError, ProfileMenu};
+    use super::{ACCOUNT_ORIGIN, AccountService, LoginError, ProfileMenu};
     use crate::{
         account::shortened_wallet_address,
         avatar_dropdown::{ProfileAction, profile_action},
@@ -623,6 +696,7 @@ mod tests {
 
     const ETHEREUM: &str = "0x0123456789abcdef0123456789abcdef01234567";
     const SOLANA: &str = "7YttLkHDoNj9wyDur5VjZ9Pd7WZZvnGvWKbxzwfKQnDb";
+    const HANDOFF_CODE: &str = "0123456789012345678901234567890123456789012";
 
     const FAILURE: AuthError = AuthError::MissingCredential;
 
@@ -637,6 +711,8 @@ mod tests {
         exchange: Step,
         plan: Option<Option<PlanCode>>,
         plan_step: Step,
+        handoff: Step,
+        handoff_code: String,
         /// What the credential on disk says; `None` is a query that failed.
         local: Option<SessionAvailability>,
         /// What the session hands over when it is signed out.
@@ -649,6 +725,7 @@ mod tests {
         exchanges: usize,
         discards: usize,
         revocations: usize,
+        handoffs: usize,
     }
 
     impl FakeState {
@@ -658,6 +735,8 @@ mod tests {
                 exchange: Step::Succeed,
                 plan: Some(Some(PlanCode::Plus)),
                 plan_step: Step::Succeed,
+                handoff: Step::Succeed,
+                handoff_code: HANDOFF_CODE.to_owned(),
                 local: Some(SessionAvailability::Available),
                 revocation: Some(Revocation::new(
                     "refresh-token",
@@ -668,6 +747,7 @@ mod tests {
                 exchanges: 0,
                 discards: 0,
                 revocations: 0,
+                handoffs: 0,
             }
         }
     }
@@ -776,6 +856,19 @@ mod tests {
             let result = self.with(|state| match state.local {
                 Some(availability) => Ok(LocalSession::new(availability, SessionChange::default())),
                 None => Err(FAILURE),
+            });
+
+            Box::pin(async move { result })
+        }
+
+        fn create_dashboard_handoff(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+            let result = self.with(|state| {
+                state.handoffs += 1;
+
+                match state.handoff {
+                    Step::Succeed => Ok(state.handoff_code.clone()),
+                    Step::Fail => Err(FAILURE),
+                }
             });
 
             Box::pin(async move { result })
@@ -927,6 +1020,10 @@ mod tests {
     #[test]
     fn every_menu_entry_should_map_to_the_action_it_stands_for() {
         assert_eq!(profile_action("sign-in"), Some(ProfileAction::SignIn));
+        assert_eq!(
+            profile_action("open-account"),
+            Some(ProfileAction::OpenAccount)
+        );
         assert_eq!(profile_action("sign-out"), Some(ProfileAction::SignOut));
         assert_eq!(profile_action("something-else"), None);
     }
@@ -944,6 +1041,7 @@ mod tests {
 
         assert!(shows(&mut harness, "TEST_PROFILE_MENU"));
         assert!(!shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
+        assert!(!shows(&mut harness, "TEST_MENU_ITEM_open-account"));
     }
 
     #[gpui_kit::test]
@@ -957,6 +1055,56 @@ mod tests {
         assert!(shows(&mut harness, "TEST_PROFILE_ADDRESS"));
         assert!(shows(&mut harness, "TEST_PROFILE_BRAND"));
         assert!(shows(&mut harness, "TEST_PROFILE_PLAN_PLUS"));
+        assert!(shows(&mut harness, "TEST_MENU_ITEM_open-account"));
+        assert!(shows(&mut harness, "TEST_MENU_ITEM_sign-out"));
+    }
+
+    fn open_account_entry(harness: &mut Harness) {
+        let entry = harness
+            .cx
+            .debug_bounds("TEST_MENU_ITEM_open-account")
+            .expect("the signed-in menu should draw the account entry");
+        harness.cx.simulate_click(entry.center(), Modifiers::none());
+        for _ in 0..100 {
+            harness.cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+            harness.cx.run_until_parked();
+            if harness.source.count(|state| state.handoffs) > 0 {
+                break;
+            }
+        }
+        for _ in 0..20 {
+            harness.cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_account_entry_should_open_the_dashboard_with_a_one_time_code(cx: &mut TestAppContext) {
+        let mut harness = signed_in_harness(cx);
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+        open_menu(&mut harness);
+
+        open_account_entry(&mut harness);
+
+        let expected = format!("{ACCOUNT_ORIGIN}/dashboard#{HANDOFF_CODE}");
+        assert_eq!(harness.cx.opened_url().as_deref(), Some(expected.as_str()));
+        assert_eq!(harness.source.count(|state| state.handoffs), 1);
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_account_handoff_should_not_open_the_browser(cx: &mut TestAppContext) {
+        let mut harness = signed_in_harness(cx);
+        harness.source.with(|state| state.handoff = Step::Fail);
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+        open_menu(&mut harness);
+
+        open_account_entry(&mut harness);
+
+        assert_eq!(harness.cx.opened_url(), None);
+        assert_eq!(harness.source.count(|state| state.handoffs), 1);
     }
 
     /// The account block is a column: the face with the wallet family's mark on its
@@ -1532,6 +1680,7 @@ mod tests {
             "window.account.cancel_sign_in",
             "window.account.copy_wallet_address",
             "window.account.menu",
+            "window.account.open_account",
             "window.account.plan_unavailable",
             "window.account.sign_in",
             "window.account.sign_out",

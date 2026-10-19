@@ -36,6 +36,7 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
+    handoff::request_dashboard_handoff,
     supervisor::run_service_supervisor,
     wallet::{
         self, WalletApiError, WalletMutationOutcome, WalletMutationUnknown, WalletSelection,
@@ -53,6 +54,7 @@ use crate::service::engine::{ErrorCode, PendingRpc, XProfileEvent};
 use crate::{
     account_profile::AccountProfile,
     auth::{
+        constants::{API_RESOURCE, DASHBOARD_HANDOFF_PATH},
         dpop::DpopKey,
         model::{AccountIdentity, AuthError, LocalSessionStatus, PlanCode, SessionChange},
         session::{AuthSession, Revocation},
@@ -489,6 +491,7 @@ impl KytrixServiceConnector {
                 commands,
                 auth,
                 lifecycle,
+                transport,
                 websocket_url,
                 config,
                 cancellation,
@@ -555,6 +558,37 @@ impl KytrixServiceConnector {
             .begin_operation()
             .map_err(|_| AuthError::SessionClosed)?;
         self.inner().auth.current_plan(expected_user_id).await
+    }
+
+    /// Creates a one-time code that signs this account into the web dashboard.
+    ///
+    /// The request goes to the API host the access token was issued for, carrying the
+    /// same DPoP proof every other authenticated call carries.
+    pub async fn create_account_dashboard_handoff(&self) -> Result<String, AuthError> {
+        let _operation = self
+            .inner()
+            .lifecycle
+            .begin_operation()
+            .map_err(|_| AuthError::SessionClosed)?;
+        let endpoint = Url::parse(API_RESOURCE)
+            .map_err(|_| AuthError::InvalidResponse)?
+            .join(DASHBOARD_HANDOFF_PATH)
+            .map_err(|_| AuthError::InvalidResponse)?;
+        let (_, (access_token, proof)) = self
+            .inner()
+            .auth
+            .authorization_headers_with_profile("POST", endpoint.as_str())
+            .await?;
+        let config = self.inner().config.borrow().clone();
+        request_dashboard_handoff(
+            &config,
+            &self.inner().transport,
+            &self.inner().runtime,
+            &endpoint,
+            &access_token,
+            &proof,
+        )
+        .await
     }
 
     pub fn prepare_account_login(&self) -> Result<DpopKey, AuthError> {

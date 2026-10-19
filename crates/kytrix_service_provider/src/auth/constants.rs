@@ -8,6 +8,7 @@ pub const API_RESOURCE: &str = cfg_select! {
 };
 pub const CLIENT_ID: &str = "kytrix-desktop";
 pub const SCOPE: &str = "realtime";
+pub const DASHBOARD_HANDOFF_PATH: &str = "v1/account/dashboard-handoff";
 
 pub(super) const CREDENTIAL_SERVICE: &str = "xyz.kytrix.desktop";
 pub(super) const CREDENTIAL_USER: &str = "oauth";

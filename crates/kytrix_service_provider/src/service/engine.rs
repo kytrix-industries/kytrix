@@ -16,7 +16,7 @@ use bytes::Bytes;
 use kytrix_proto::{client::request::Request as ClientRequestKind, server as proto_response};
 use network::transport::{
     error::TransportError,
-    hub::{TransportPolicy, TransportScope},
+    hub::{TransportHub, TransportPolicy, TransportScope},
     subscription::{SubscriptionPublisher, SubscriptionSendError},
     websocket::{EndpointAccess, RawWebSocket, WsEndpointId, WsSessionKey},
 };
@@ -601,6 +601,7 @@ pub(super) struct KytrixServiceConnectorInner {
     pub commands: mpsc::Sender<SupervisorCommand>,
     pub auth: AuthSession,
     pub lifecycle: TransportScope,
+    pub transport: Arc<TransportHub>,
     pub websocket_url: Url,
     pub config: watch::Receiver<Arc<Config>>,
     pub cancellation: CancellationToken,

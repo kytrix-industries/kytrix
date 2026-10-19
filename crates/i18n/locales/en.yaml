@@ -786,6 +786,7 @@ window:
     cancel_sign_in: Cancel sign-in
     copy_wallet_address: Copy wallet address
     menu: Account menu
+    open_account: Account
     plan_unavailable: Subscription plan unavailable
     sign_in: Sign in
     sign_out: Sign out

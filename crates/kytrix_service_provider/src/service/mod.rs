@@ -1,6 +1,7 @@
 mod actor;
 pub mod connector;
 pub mod engine;
+mod handoff;
 pub mod protocol;
 mod supervisor;
 #[cfg(test)]

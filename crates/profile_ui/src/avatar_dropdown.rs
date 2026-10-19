@@ -59,6 +59,9 @@ const MENU_WIDTH: f32 = 280.0;
 /// The entry that starts a sign-in.
 pub(crate) const SIGN_IN_ITEM_ID: &str = "sign-in";
 
+/// The entry that opens the account dashboard in the browser.
+pub(crate) const OPEN_ACCOUNT_ITEM_ID: &str = "open-account";
+
 /// The entry that signs the current account out.
 pub(crate) const SIGN_OUT_ITEM_ID: &str = "sign-out";
 
@@ -66,6 +69,7 @@ pub(crate) const SIGN_OUT_ITEM_ID: &str = "sign-out";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProfileAction {
     SignIn,
+    OpenAccount,
     SignOut,
 }
 
@@ -73,6 +77,7 @@ pub(crate) enum ProfileAction {
 pub(crate) fn profile_action(item_id: &str) -> Option<ProfileAction> {
     match item_id {
         SIGN_IN_ITEM_ID => Some(ProfileAction::SignIn),
+        OPEN_ACCOUNT_ITEM_ID => Some(ProfileAction::OpenAccount),
         SIGN_OUT_ITEM_ID => Some(ProfileAction::SignOut),
         _ => None,
     }
@@ -104,6 +109,7 @@ pub struct AvatarDropDown {
     plan: Option<PlanCode>,
     style: StyleRefinement,
     on_sign_in: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_open_account: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_sign_out: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -117,6 +123,7 @@ impl AvatarDropDown {
             plan: None,
             style: StyleRefinement::default(),
             on_sign_in: None,
+            on_open_account: None,
             on_sign_out: None,
         }
     }
@@ -141,6 +148,14 @@ impl AvatarDropDown {
 
     pub fn on_sign_in(mut self, on_sign_in: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_sign_in = Some(Rc::new(on_sign_in));
+        self
+    }
+
+    pub fn on_open_account(
+        mut self,
+        on_open_account: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_account = Some(Rc::new(on_open_account));
         self
     }
 
@@ -317,6 +332,10 @@ impl AvatarDropDown {
                 menu = menu.item(MenuItem::Custom(self.account_block(id, account, cx)));
                 menu = menu.item(MenuItem::Separator);
                 menu = menu.item(MenuItem::Action(MenuItemAction::new(
+                    OPEN_ACCOUNT_ITEM_ID,
+                    t!(cx, "window.account.open_account"),
+                )));
+                menu = menu.item(MenuItem::Action(MenuItemAction::new(
                     SIGN_OUT_ITEM_ID,
                     t!(cx, "window.account.sign_out"),
                 )));
@@ -376,6 +395,7 @@ impl RenderOnce for AvatarDropDown {
         let entries = self.entries(&id, cx);
         let style = self.style;
         let on_sign_in = self.on_sign_in.clone();
+        let on_open_account = self.on_open_account.clone();
         let on_sign_out = self.on_sign_out.clone();
 
         // Whether the menu is open is this control's own, keyed by its id, the way it is for
@@ -417,6 +437,7 @@ impl RenderOnce for AvatarDropDown {
             },
             move |context, _, _| {
                 let on_sign_in = on_sign_in.clone();
+                let on_open_account = on_open_account.clone();
                 let on_sign_out = on_sign_out.clone();
 
                 // The panel closes the menu it belongs to before it reports anything: a
@@ -430,6 +451,11 @@ impl RenderOnce for AvatarDropDown {
                             Some(ProfileAction::SignIn) => {
                                 if let Some(on_sign_in) = on_sign_in.as_ref() {
                                     on_sign_in(window, cx);
+                                }
+                            }
+                            Some(ProfileAction::OpenAccount) => {
+                                if let Some(on_open_account) = on_open_account.as_ref() {
+                                    on_open_account(window, cx);
                                 }
                             }
                             Some(ProfileAction::SignOut) => {
