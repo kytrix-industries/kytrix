@@ -8,11 +8,12 @@
 use std::{sync::Arc, time::Duration};
 
 use app_config::network::Config;
+use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
 use gpui_kit::{Context, Task};
 use i18n::language::codes::LanguageCode;
 use network::transport::hub::TransportHub;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
@@ -279,7 +280,7 @@ impl UpdaterState {
 /// The updater: the state machine, the requests it runs, and the schedule they run on.
 pub(crate) struct Updater {
     transport: Arc<TransportHub>,
-    config: watch::Receiver<Arc<Config>>,
+    config: ConfigNotification<Config>,
     runtime: Runtime,
     state: UpdaterState,
     /// The check in flight, or the one waiting for its delay.
@@ -305,10 +306,10 @@ struct Attempt {
 
 impl Updater {
     /// The updater over the composition root's dependencies.
-    pub(crate) fn new(deps: UpdaterDeps) -> Self {
+    pub(crate) fn new(deps: UpdaterDeps, config: ConfigNotification<Config>) -> Self {
         Self {
             transport: deps.transport,
-            config: deps.config,
+            config,
             runtime: deps.runtime,
             state: UpdaterState::Idle,
             check: None,
@@ -348,7 +349,7 @@ impl Updater {
             }
         };
         let transport = Arc::clone(&self.transport);
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let runtime = self.runtime.clone();
         let resolving = runtime.clone();
         let cancellation = self.transport.cancellation().child_token();
@@ -418,7 +419,7 @@ impl Updater {
         cx.notify();
 
         let transport = Arc::clone(&self.transport);
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let runtime = self.runtime.clone();
         let resolving = runtime.clone();
         let (progress_sender, mut progress) = mpsc::unbounded_channel();
@@ -590,16 +591,13 @@ mod tests {
     }
 
     /// Every attempt at what one entity's dependencies are, without a network.
-    fn deps() -> (UpdaterDeps, watch::Sender<Arc<Config>>) {
-        let (sender, config) = watch::channel(Arc::new(Config::default()));
-
+    fn deps() -> (UpdaterDeps, ConfigNotification<Config>) {
         (
             UpdaterDeps {
                 transport: Arc::new(TransportHub::new(TransportPolicy::default())),
-                config,
                 runtime: Runtime::for_test(),
             },
-            sender,
+            ConfigNotification::new(Arc::new(Config::default())),
         )
     }
 
@@ -810,8 +808,8 @@ mod tests {
     fn a_check_should_offer_what_it_found_and_stay_silent_when_it_found_nothing(
         cx: &mut gpui_kit::TestAppContext,
     ) {
-        let (deps, _config) = deps();
-        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps)));
+        let (deps, config) = deps();
+        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps, config)));
 
         cx.update(|cx| {
             updater.update(cx, |updater, cx| {
@@ -836,8 +834,8 @@ mod tests {
     fn cancelling_after_the_payload_arrived_should_leave_it_ready_to_install(
         cx: &mut gpui_kit::TestAppContext,
     ) {
-        let (deps, _config) = deps();
-        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps)));
+        let (deps, config) = deps();
+        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps, config)));
         cx.update(|cx| {
             updater.update(cx, |updater, cx| {
                 updater.set_state_for_test(
@@ -859,8 +857,8 @@ mod tests {
     fn a_failed_check_should_be_counted_and_scheduled_until_the_attempts_run_out(
         cx: &mut gpui_kit::TestAppContext,
     ) {
-        let (deps, _config) = deps();
-        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps)));
+        let (deps, config) = deps();
+        let updater = cx.update(|cx| cx.new(|_| Updater::new(deps, config)));
 
         for spent in 1..=4 {
             cx.update(|cx| {

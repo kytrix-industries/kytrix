@@ -9995,6 +9995,7 @@ version = "0.0.2"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "bytes",
  "cargo-packager-updater",

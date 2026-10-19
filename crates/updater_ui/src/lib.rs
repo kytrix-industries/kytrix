@@ -7,7 +7,7 @@
 //! against.
 //!
 //! ```text
-//! global::install(cx, UpdaterDeps { transport, config, runtime })
+//! global::install(cx, UpdaterDeps { transport, runtime })
 //!   └─ state::Updater      the state machine and the requests it runs
 //!        ├─ fetch           route resolution, redirects, progress
 //!        ├─ release         latest.json as typed values

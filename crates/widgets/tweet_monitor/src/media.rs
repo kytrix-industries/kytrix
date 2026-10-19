@@ -31,17 +31,13 @@ use std::{
 };
 
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
+use app_config_provider::notification::ConfigNotification;
 use network::transport::{http::HttpClientClass, hub::TransportHub};
 use reqwest::{Client, Response, StatusCode, header::LOCATION};
 use sha2::{Digest, Sha256};
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
-    sync::{OnceCell, watch},
-    time::Instant,
-};
+use tokio::{fs::File, io::AsyncWriteExt, sync::OnceCell, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
@@ -137,7 +133,7 @@ pub(super) trait MediaTransport: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub(super) struct SharedTransport {
     hub: Arc<TransportHub>,
-    config: watch::Receiver<Arc<Config>>,
+    config: ConfigNotification<Config>,
     /// The application runtime the route resolution crosses its blocking boundary on.
     ///
     /// A picture is fetched from the pane's own task, which holds no Tokio context:
@@ -149,7 +145,7 @@ pub(super) struct SharedTransport {
 impl SharedTransport {
     pub(super) fn new(
         hub: Arc<TransportHub>,
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
         runtime: Runtime,
     ) -> Self {
         Self {
@@ -166,7 +162,7 @@ impl MediaTransport for SharedTransport {
         destination: &Url,
         cancellation: &CancellationToken,
     ) -> Result<Client, MediaError> {
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let route = network::proxy::resolve_async_cancellable(
             &config,
             // What a media request is addressed through is the Kytrix service that serves it,

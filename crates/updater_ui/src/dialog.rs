@@ -366,11 +366,10 @@ fn release_page_button(cx: &Context<UpdateDialog>) -> AnyElement {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use app_config::network::Config;
+    use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer, style::theme};
     use gpui_kit::{EmptyView, Modifiers, TestAppContext, VisualTestContext};
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
     use widget_tokio_runtime::runtime::Runtime;
 
@@ -414,12 +413,12 @@ mod tests {
             i18n::global::embedded::install(cx).expect("the embedded locales should load");
         });
         let updater = cx.update(|cx| {
-            let (_sender, config) = watch::channel(Arc::new(Config::default()));
+            let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
+            cx.set_global(manager);
             global::install(
                 cx,
                 UpdaterDeps {
                     transport: Arc::new(TransportHub::new(TransportPolicy::default())),
-                    config,
                     runtime: Runtime::for_test(),
                 },
             );

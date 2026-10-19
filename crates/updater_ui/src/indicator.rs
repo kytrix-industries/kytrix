@@ -78,14 +78,13 @@ impl Render for UpdateIndicator {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use app_config::network::Config;
+    use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use gpui_kit::{
         AppContext as _, Context, IntoElement, Modifiers, Render, Styled as _, TestAppContext,
         VisualTestContext, Window, div,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use tokio::sync::watch;
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::*;
@@ -128,12 +127,12 @@ mod tests {
         cx.update(|cx| {
             base_ui::style::theme::install(cx);
             i18n::global::embedded::install(cx).expect("the embedded locales should load");
-            let (_sender, config) = watch::channel(Arc::new(Config::default()));
+            let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
+            cx.set_global(manager);
             global::install(
                 cx,
                 UpdaterDeps {
                     transport: Arc::new(TransportHub::new(TransportPolicy::default())),
-                    config,
                     runtime: Runtime::for_test(),
                 },
             );

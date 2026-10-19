@@ -59,11 +59,8 @@
 use std::sync::Arc;
 
 use ahash::AHashMap as HashMap;
-use app_config::{
-    settings::Config,
-    widget::{WidgetConfig, WidgetConfigSchemaVersion},
-};
-use app_config_provider::manager::ConfigManager;
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     button::Button,
     deque_unsized_list::DequeUnsizedList,
@@ -77,8 +74,8 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement,
     InteractiveText, IntoElement, ListAlignment, ObjectFit, ParentElement, Render, Role,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, StyledText, Task, WeakEntity,
-    Window, base::Disableable, div, img, px,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, StyledText, Subscription,
+    WeakEntity, Window, base::Disableable, div, img, px,
 };
 use i18n::t;
 use kytrix_service_provider::service::{
@@ -90,6 +87,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use time::OffsetDateTime;
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
@@ -283,9 +281,9 @@ pub struct TweetMonitorWidget {
     hints: Arc<HashMap<SmolStr, SharedString>>,
     /// The open dialog, which is the pane's only way of managing accounts.
     dialog: Option<WeakEntity<TweetDialog>>,
-    _account_task: Task<()>,
+    _account: Subscription,
     /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone_task: Option<Task<()>>,
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for TweetMonitorWidget {
@@ -310,10 +308,9 @@ impl WidgetView for TweetMonitorWidget {
         // Pictures are fetched by this pane rather than by the service, and the transport they
         // are fetched over is the application's own build policy: the two X image origins are
         // the only hosts a picture URL may name, and they are always reached over HTTPS.
-        let manager = cx.global::<ConfigManager>();
         let transport = SharedTransport::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            manager.network_subscribe(),
+            source.network_notification(),
             global::handle(cx),
         );
         Self::new_with_source(
@@ -374,20 +371,9 @@ impl TweetMonitorWidget {
         // The account is the pane's scope, and the user can change it while the pane is open:
         // signing out has to take the timeline with it, and signing in as someone else has to
         // read again.
-        let (initial_account, mut changes) = {
-            let manager = cx.global::<ConfigManager>();
-            (account_of(&manager.read()), manager.subscribe())
-        };
-        let account_task = cx.spawn(async move |this, cx| {
-            while changes.changed().await.is_ok() {
-                let account = account_of(&changes.borrow_and_update());
-                if this
-                    .update(cx, |this, cx| this.reconcile_account(account, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
         });
 
         // The list holds the timeline itself, so what a reader is reading is the list's to keep:
@@ -404,7 +390,7 @@ impl TweetMonitorWidget {
             recovery,
             // The pane records the account it was built for, but it starts nothing: the
             // framework calls `load` once construction is done.
-            account_id: initial_account,
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
             feed: None,
             media: Arc::new(HashMap::new()),
             revision: 0,
@@ -416,10 +402,10 @@ impl TweetMonitorWidget {
             notice: None,
             hints: Arc::new(HashMap::new()),
             dialog: None,
-            _account_task: account_task,
+            _account: account,
             // The rows are built by the list entity, which keeps what it drew until it
             // is told otherwise: moving the display zone has to wake the list itself.
-            _time_zone_task: on_data_time_zone_change(cx, |this, _, cx| {
+            _time_zone: on_data_time_zone_change(cx, |this, _, cx| {
                 this.list.update(cx, |_, cx| cx.notify());
                 cx.notify();
             }),
@@ -1263,14 +1249,6 @@ fn feed_list(widget: WeakEntity<TweetMonitorWidget>) -> DequeUnsizedList<Arc<Twe
     .footer(move |_window, cx| timeline_end(cx))
 }
 
-/// The account a pane follows, as the settings hold it.
-fn account_of(config: &Config) -> Option<SmolStr> {
-    config
-        .account
-        .as_ref()
-        .map(|account| SmolStr::new(account.user_id.as_str()))
-}
-
 /// Whether one search string is one X could be asked about.
 ///
 /// The bound is the service's own, and it counts bytes: a query that is longer is one the
@@ -1999,7 +1977,8 @@ mod tests {
     };
     use base_ui::{input::InputStateBuilder, layer::Layer};
     use gpui_kit::{
-        AppContext, Bounds, IntoElement, Modifiers, Pixels, TestAppContext, VisualTestContext, px,
+        AppContext, BorrowAppContext, Bounds, IntoElement, Modifiers, Pixels, TestAppContext,
+        VisualTestContext, px,
     };
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::{
@@ -2041,7 +2020,8 @@ mod tests {
         base_ui::style::theme::install(cx);
         i18n::global::embedded::install(cx).expect("the embedded locales should load");
         global::install(cx).expect("the test Tokio runtime should build");
-        cx.set_global(ConfigManager::in_memory(settings(account)));
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
     }
 
     /// A pane the framework would have built, driven by a fake account and a fake transport.
@@ -2795,6 +2775,45 @@ mod tests {
             pane.reconcile_account(Some(SmolStr::new_static(OTHER_ACCOUNT)), cx);
         });
         assert!(ids_of(&pane, cx).is_empty());
+        assert!(!has_content(&pane, cx));
+    }
+
+    /// Another account is another timeline, and the pane hears about it from the settings
+    /// rather than from the framework: what it follows and what it was showing move together.
+    #[gpui_kit::test]
+    fn an_account_change_should_start_the_pane_over_on_the_new_account(cx: &mut TestAppContext) {
+        let source = FakeSource::default();
+        let session = source.session(ACCOUNT);
+        let _control = session.subscribe();
+        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
+        assert_eq!(ids_of(&pane, cx), ["1"]);
+
+        // The stream the new account is read through is queued first, so what the pane starts
+        // over with is the account it was told about rather than a refusal to report.
+        let _other = source.session(OTHER_ACCOUNT).subscribe();
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.account = Some(AccountConfig {
+                            user_id: OTHER_ACCOUNT.to_owned(),
+                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            wallet_kind: AccountWalletKind::Ethereum,
+                        });
+                    },
+                    cx,
+                );
+            });
+        });
+
+        settle_until(cx, "the pane to follow the new account", |cx| {
+            pane.read(cx).account_id.as_deref() == Some(OTHER_ACCOUNT)
+        });
+        assert!(
+            ids_of(&pane, cx).is_empty(),
+            "another account is another timeline, so the one it left is dropped"
+        );
         assert!(!has_content(&pane, cx));
     }
 
