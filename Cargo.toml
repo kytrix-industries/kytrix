@@ -38,7 +38,7 @@ members = [
 default-members = ["crates/kytrix"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 publish = false
 edition = "2024"
 

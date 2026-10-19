@@ -10,7 +10,7 @@ productName = "Kytrix"
 # Local default only. cargo-packager has no version flag, so the release workflow
 # must rewrite this line to the tagged version before packaging; keep it equal to
 # [workspace.package] version.
-version = "0.0.1"
+version = "0.0.2"
 # Must match CREDENTIAL_SERVICE in crates/kytrix_service_provider/src/auth/constants.rs.
 identifier = "xyz.kytrix.desktop"
 description = "Kytrix"
