@@ -92,7 +92,7 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
                 "credentials",
                 "凭据",
             ],
-            open: false,
+            open: true,
             children: pages
                 .iter()
                 .filter(|page| page.id.starts_with("market_participants."))
