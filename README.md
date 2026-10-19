@@ -16,10 +16,6 @@ books, trade-by-trade data, candlesticks, X (Twitter) feeds, news, charting, and
 within a single interface. Research the market, watch the tape, and monitor what matters to you without switching
 between browser tabs and trading terminals.
 
-The application is written entirely in Rust, with a GPU-accelerated native interface powered by GPUI. Market data is
-delivered over asynchronous streaming pipelines, so the UI stays smooth even at high update rates. Every pane is a
-composable widget: split and arrange panes freely, save multiple workspaces, and build a trading terminal of your own.
-
 ## Why Kytrix
 
 - **Blazing Fast.** Rust + GPUI, GPU-accelerated native rendering, no WebView.
@@ -29,7 +25,7 @@ composable widget: split and arrange panes freely, save multiple workspaces, and
   the way you trade.
 - **More than price.** News, X monitor, wallet monitor, ETF flows, statistics, and metrics — with more widgets on the
   way.
-- **Local-first and secure.** All configuration data stays on your machine.
+- **Local-first and secure.** All data stays on your machine.
 - **Multilingual, intuitive, and easy to use.** English and Simplified Chinese are supported, with light and dark
   themes.
 
