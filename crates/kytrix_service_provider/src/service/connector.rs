@@ -1270,8 +1270,11 @@ mod tests {
         transport.shutdown().await;
     }
 
+    /// Exercises [`KytrixServiceConnector::install_with_auth`], the test seam: the
+    /// public [`KytrixServiceConnector::install`] is the thin wrapper that spawns the
+    /// auth session before calling it.
     #[gpui_kit::test]
-    fn install_should_bridge_network_writes_and_take_its_config_task_on_shutdown(
+    fn install_with_auth_should_bridge_network_writes_and_take_its_config_task_on_shutdown(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use app_config::settings::Language;

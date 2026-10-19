@@ -33,8 +33,8 @@ pub fn install(cx: &mut App) {
 /// The windows are asked because a GPUI global is not a first-class observable: setting one
 /// notifies the observers registered for its type, it does not mark any window as needing a frame.
 /// Without the refresh the interface would keep the colors of the previous appearance until
-/// something else happened to dirty the window — see `settings_ui`'s language switch, which
-/// refreshes for the same reason.
+/// something else happened to dirty the window — see `kytrix`'s language projection, which
+/// refreshes for the same reason after `LanguageChanged` moves the language global.
 ///
 /// An appearance the application is already drawn in is not a change: it neither replaces the
 /// global nor redraws, so resolving the appearance twice — a window built after a dialog confirmed

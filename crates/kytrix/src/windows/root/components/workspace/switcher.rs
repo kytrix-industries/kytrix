@@ -341,7 +341,8 @@ mod tests {
             widget_registry::catalogue::install(cx).expect("the catalogue should install");
             style::theme::install(cx);
             cx.set_global(language);
-            cx.set_global(ConfigManager::in_memory(config));
+            let manager = ConfigManager::in_memory(config, cx);
+            cx.set_global(manager);
         });
         let workspaces = cx.update(|cx| cx.new(Workspaces::load));
         let (_, cx) = cx.add_window_view({

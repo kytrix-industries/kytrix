@@ -1,19 +1,16 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod language;
 mod windows;
 
 use std::sync::Arc;
 
-use app_config::settings::Language;
 use app_config_provider::{
     manager::{self as config_manager, ConfigManager},
+    notification::ConfigNotification,
     store::ConfigRecovery,
 };
-use i18n::language::codes::LanguageCode;
-use kytrix_service_provider::{
-    auth::{model::AuthError, session::AuthSession},
-    service::connector::KytrixServiceConnector,
-};
+use kytrix_service_provider::{auth::model::AuthError, service::connector::KytrixServiceConnector};
 use market_participants_connector::connector::{
     MarketParticipantsConnector, MarketParticipantsConnectorError,
 };
@@ -55,23 +52,13 @@ fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, Initiali
     widget_tokio_runtime::global::install(cx)?;
     widget_registry::catalogue::install(cx)?;
     let recovery = config_manager::install(cx);
-    apply_startup_language(cx);
+    language::apply_startup(cx);
+    language::install(cx);
     MarketParticipantsConnector::install(cx)?;
     let transport = install_kytrix_service(cx)?;
     let runtime = widget_tokio_runtime::global::try_handle(cx)
         .ok_or(InitializationError::RuntimeUnavailable)?;
-    let config = cx
-        .try_global::<ConfigManager>()
-        .ok_or(InitializationError::ConfigurationUnavailable)?
-        .network_subscribe();
-    updater_ui::global::install(
-        cx,
-        UpdaterDeps {
-            transport,
-            config,
-            runtime,
-        },
-    );
+    updater_ui::global::install(cx, UpdaterDeps { transport, runtime });
 
     Ok(recovery)
 }
@@ -94,18 +81,10 @@ fn install_kytrix_service(
     let manager = cx
         .try_global::<ConfigManager>()
         .ok_or(InitializationError::ConfigurationUnavailable)?;
+    let notification = ConfigNotification::new(Arc::new(manager.read().network_config()));
     let transport = Arc::new(TransportHub::new(transport_policy()));
-    let auth = AuthSession::spawn(
-        manager.network_subscribe(),
-        transport.clone(),
-        runtime.clone(),
-    )?;
-    cx.set_global(KytrixServiceConnector::spawn(
-        &runtime,
-        manager.network_subscribe(),
-        transport.clone(),
-        auth,
-    ));
+    let connector = KytrixServiceConnector::install(cx, &runtime, notification, transport.clone())?;
+    cx.set_global(connector);
 
     Ok(transport)
 }
@@ -124,20 +103,6 @@ const fn transport_policy() -> TransportPolicy {
     TransportPolicy {
         allow_plaintext: !cfg!(feature = "production"),
         extra_root_certificates: Vec::new(),
-    }
-}
-
-/// Applies the persisted display language to the language global.
-fn apply_startup_language(cx: &mut gpui_kit::App) {
-    let language = cx.global::<ConfigManager>().read().language;
-
-    cx.set_global(language_code(language));
-}
-
-const fn language_code(language: Language) -> LanguageCode {
-    match language {
-        Language::ZhCn => LanguageCode::ZhCn,
-        Language::En => LanguageCode::En,
     }
 }
 
@@ -162,14 +127,22 @@ enum InitializationError {
 
 #[cfg(test)]
 mod tests {
+    use app_config::settings::Language;
+    use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::auth::constants::{ACCOUNT_ORIGIN, API_RESOURCE};
 
     use super::*;
 
     #[test]
     fn persisted_languages_should_map_to_the_translator_languages() {
-        assert_eq!(language_code(Language::ZhCn), LanguageCode::ZhCn);
-        assert_eq!(language_code(Language::En), LanguageCode::En);
+        assert_eq!(
+            crate::language::language_code(Language::ZhCn),
+            LanguageCode::ZhCn
+        );
+        assert_eq!(
+            crate::language::language_code(Language::En),
+            LanguageCode::En
+        );
     }
 
     /// The two halves of one switch: where this build sends requests, and whether the

@@ -1,4 +1,6 @@
-use app_config_provider::{manager::ConfigManager, store::ConfigRecovery};
+use app_config_provider::{
+    events::AppearanceChanged, manager::ConfigManager, store::ConfigRecovery,
+};
 use base_ui::{
     button::Button,
     interactive::InteractiveVariantExt,
@@ -70,6 +72,11 @@ struct RootWindow {
     /// held rather than detached because dropping it is what stops the watching — see
     /// [`gpui_kit::Subscription`].
     _system_appearance: Subscription,
+    /// Applies the user's appearance preference for as long as this window lives.
+    ///
+    /// The settings dialog only writes the preference; this subscription applies it as the
+    /// process-wide theme when the write is published, resolving `System` against this window.
+    _appearance: Subscription,
 }
 
 impl RootWindow {
@@ -91,6 +98,12 @@ impl RootWindow {
         // `System` shows the system's appearance from its first frame rather than a light frame
         // followed by the one the user asked for.
         appearance::apply(cx.global::<ConfigManager>().read().appearance, window, cx);
+        let events = cx.global::<ConfigManager>().events().clone();
+        let appearance = cx.subscribe_in(
+            &events,
+            window,
+            |_, _, event: &AppearanceChanged, window, cx| appearance::apply(event.0, window, cx),
+        );
         let system_appearance = cx.observe_window_appearance(window, |_, window, cx| {
             // The preference is read here rather than captured: the user may have moved it since
             // this window was built, and what a system change means is decided against what the
@@ -106,6 +119,7 @@ impl RootWindow {
             updater: cx.new(UpdateIndicator::new),
             profile: cx.new(ProfileMenu::new),
             _system_appearance: system_appearance,
+            _appearance: appearance,
         }
     }
 }

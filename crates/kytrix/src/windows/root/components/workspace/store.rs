@@ -269,8 +269,8 @@ impl Workspaces {
     /// Writes the workspaces out immediately.
     fn persist(&mut self, cx: &mut App) {
         let workspaces = self.workspaces_config();
-        cx.update_global::<ConfigManager, _>(|manager, _| {
-            manager.update(|config| config.workspaces = workspaces);
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(|config| config.workspaces = workspaces, cx);
         });
     }
 
@@ -358,10 +358,10 @@ mod tests {
                 cx.set_global(Theme::default());
                 cx.set_global(language);
 
-                let mut manager = ConfigManager::from_path(&path)
+                let mut manager = ConfigManager::from_path(&path, cx)
                     .expect("a missing settings file starts from defaults");
                 manager
-                    .write(config.clone())
+                    .write(config.clone(), cx)
                     .expect("the injected settings should be stored");
                 cx.set_global(manager);
 
@@ -403,7 +403,8 @@ mod tests {
 
         /// Reads the settings the way a restart would.
         fn stored(&self) -> WorkspacesConfig {
-            ConfigManager::from_path(&self.path)
+            self.cx
+                .update(|cx| ConfigManager::from_path(&self.path, cx))
                 .expect("the settings file should load")
                 .read()
                 .workspaces
