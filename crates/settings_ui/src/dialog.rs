@@ -143,7 +143,25 @@ impl SettingsDialog {
     /// it is about to be shown in has drawn it.
     pub fn new(draft: Entity<SettingsDraft>, cx: &mut Context<Self>) -> Self {
         let venues: VenueView = supported_venues().into();
-        let catalog = catalog(&venues);
+        Self::build(draft, catalog(&venues), cx)
+    }
+
+    /// Builds the dialog over the catalog it draws.
+    ///
+    /// This is the test seam beside [`Self::new`]: a fixture builds the catalog whose groups it
+    /// needs declared and hands it here, so a test draws a catalog the production one is a case
+    /// of without the production catalog having to offer it.
+    #[cfg(test)]
+    fn new_with_catalog(
+        draft: Entity<SettingsDraft>,
+        catalog: Catalog,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(draft, catalog, cx)
+    }
+
+    /// The whole of the settings, over the catalog they draw and the draft the session holds.
+    fn build(draft: Entity<SettingsDraft>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
         let tree = cx.new(|cx| {
             TreeState::new(cx).items(tree_items(&catalog, &filter, catalog.tree.as_slice(), cx))
@@ -921,7 +939,7 @@ mod tests {
     use crate::{
         access::FieldValue,
         appearance,
-        catalog::{FieldAccess, PageDef, VenueView, catalog},
+        catalog::{Catalog, FieldAccess, PageDef, VenueView, catalog},
         draft::SettingsDraft,
         search::SearchFilter,
         table::ProxyRequest,
@@ -938,8 +956,26 @@ mod tests {
     /// The catalog of one venue list, over the fixture settings.
     ///
     /// The catalog of the venues this build speaks.
-    fn test_catalog() -> crate::catalog::Catalog {
+    fn test_catalog() -> Catalog {
         catalog(&venues())
+    }
+
+    /// The fixture catalog with one group closed.
+    ///
+    /// The production catalog opens every group it offers — see `crate::schema` — so a test of
+    /// what a closed group is drawn as closes one here.
+    fn catalog_closing(group: &str) -> Catalog {
+        let mut catalog = test_catalog();
+        let node = catalog
+            .tree
+            .iter_mut()
+            .find(|node| node.id() == group)
+            .unwrap_or_else(|| panic!("{group} should be a group of the fixture catalog"));
+        let crate::catalog::TreeNodeDef::Group { open, .. } = node else {
+            panic!("{group} should be a group of the fixture catalog");
+        };
+        *open = false;
+        catalog
     }
 
     /// The pages of the fixture catalog.
@@ -1002,6 +1038,19 @@ mod tests {
         language: Language,
         cx: &mut TestAppContext,
     ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+        settings_over_catalog(manager, language, test_catalog(), cx)
+    }
+
+    /// Opens the settings over the catalog the dialog is built from.
+    ///
+    /// The catalog is this build's own unless a test asks otherwise: a test of what a group the
+    /// catalog closes is drawn as hands a catalog that closes it here.
+    fn settings_over_catalog(
+        manager: ConfigManager,
+        language: Language,
+        catalog: Catalog,
+        cx: &mut TestAppContext,
+    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
         let panel = cx.update(|cx| {
             // What a window installs before it draws anything, in the order the application
             // installs it: a field that is typed into reads the state base_ui's own fields are
@@ -1022,7 +1071,7 @@ mod tests {
                 SettingsDraft::new(current.as_ref().clone())
             });
 
-            cx.new(|cx| SettingsDialog::new(draft, cx))
+            cx.new(|cx| SettingsDialog::new_with_catalog(draft, catalog, cx))
         });
         let (_, cx) = cx.add_window_view(|_, cx| Layer::new(cx.new(|_| Harness)));
         // The appearance the settings name is applied the way a window applies it when it is
@@ -1049,6 +1098,22 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
         settings_in(config, Language::En, cx)
+    }
+
+    /// Opens the settings over the fixture catalog with the Market participants group closed.
+    ///
+    /// The production catalog opens that group — see `crate::schema` — so this is the fixture a
+    /// test of what a closed group is drawn as is opened over.
+    fn settings_with_a_closed_group(
+        config: Config,
+        cx: &mut TestAppContext,
+    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+        settings_over_catalog(
+            ConfigManager::in_memory(config),
+            Language::En,
+            catalog_closing("market_participants"),
+            cx,
+        )
     }
 
     /// Opens the settings again over a window that already holds them.
@@ -2426,7 +2491,7 @@ mod tests {
     /// the tree reaches it: an entry the tree cannot select is one it draws no page for.
     #[gpui_kit::test]
     fn selecting_a_page_should_move_the_tree_with_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
+        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
 
         panel.update(cx, |dialog, cx| {
             dialog.select("market_participants.okx", cx)
@@ -2475,6 +2540,28 @@ mod tests {
         );
     }
 
+    /// The catalog opens the Market participants group, so the venues under it are drawn on the
+    /// first frame: no page under the group has been drawn yet to open it, so a group the
+    /// catalog closed would leave the venues the release notes promise one click away.
+    ///
+    /// The closed-group test below covers what a closed group hides; this test covers the
+    /// default the catalog actually ships, which is what the release notes describe.
+    #[gpui_kit::test]
+    fn the_market_participants_group_should_be_open_on_the_first_frame(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
+
+        let opening = labels(&panel, cx);
+        assert!(
+            opening.contains(&SharedString::new_static("Market participants")),
+            "the group the catalog ships should be drawn: {opening:?}"
+        );
+        assert!(
+            opening.contains(&SharedString::new_static("OKX")),
+            "a group the catalog opens should draw the venues under it on the first frame: \
+             {opening:?}"
+        );
+    }
+
     /// A group the catalog closes is built closed, and the page drawn under it is what opens
     /// it: what a group declares is the tree it is drawn as, and the page drawn and the entry
     /// the tree selects are one thing.
@@ -2482,7 +2569,7 @@ mod tests {
     fn a_group_the_catalog_closes_should_be_built_closed_and_opened_for_the_page_that_is_drawn(
         cx: &mut TestAppContext,
     ) {
-        let (panel, cx) = settings(configured_settings(), cx);
+        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
 
         let opening = labels(&panel, cx);
         assert!(
@@ -2527,7 +2614,7 @@ mod tests {
     /// pages under a closed group from is the query and not the page the tree was moved to.
     #[gpui_kit::test]
     fn a_query_should_open_the_group_it_matches_in(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
+        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
 
         panel.update(cx, |dialog, cx| dialog.set_query("a".into(), cx));
         settle(cx);
