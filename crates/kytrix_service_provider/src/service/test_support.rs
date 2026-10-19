@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use app_config::network::{Config, KytrixServiceCapability, NetworkRouteGeneration, ServiceTarget};
+use app_config_provider::notification::ConfigNotification;
 use futures::SinkExt as _;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -36,7 +37,7 @@ use crate::{
 
 pub(super) struct TestConfigManager {
     config: Arc<Config>,
-    sender: watch::Sender<Arc<Config>>,
+    notification: ConfigNotification<Config>,
     next_route_generation: u64,
 }
 
@@ -51,10 +52,9 @@ impl TestConfigManager {
             .unwrap_or_default()
             .saturating_add(1);
         let config = Arc::new(config);
-        let (sender, _) = watch::channel(config.clone());
         Self {
+            notification: ConfigNotification::new(config.clone()),
             config,
-            sender,
             next_route_generation,
         }
     }
@@ -63,8 +63,8 @@ impl TestConfigManager {
         self.config.clone()
     }
 
-    pub(super) fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
-        self.sender.subscribe()
+    pub(super) fn notification(&self) -> ConfigNotification<Config> {
+        self.notification.clone()
     }
 
     pub(super) fn update(&mut self, update: impl FnOnce(&mut Config)) {
@@ -124,7 +124,7 @@ impl TestConfigManager {
         }
 
         self.config = Arc::new(config);
-        self.sender.send_replace(self.config.clone());
+        self.notification.publish_for_test(self.config.clone());
     }
 }
 

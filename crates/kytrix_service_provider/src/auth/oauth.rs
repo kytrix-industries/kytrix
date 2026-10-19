@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
+use app_config_provider::notification::ConfigNotification;
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use network::transport::{http::HttpClientClass, hub::TransportHub};
 use serde::de::DeserializeOwned;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -18,7 +18,7 @@ use super::{
 };
 
 pub(super) struct OAuthAuthority {
-    pub config: watch::Receiver<Arc<Config>>,
+    pub config: ConfigNotification<Config>,
     pub transport: Arc<TransportHub>,
     pub account_origin: Url,
     /// The application runtime every route resolution of this authority runs on.
@@ -39,7 +39,7 @@ impl AuthAuthority for OAuthAuthority {
                 .begin_operation()
                 .map_err(|_| AuthError::SessionClosed)?;
             let endpoint = self.endpoint("/oauth/token")?;
-            let config = self.config.borrow().clone();
+            let config = self.config.current();
             let cancellation = self.transport.cancellation().child_token();
             let client = self.client(&config, &endpoint, &cancellation).await?;
             let response = client
@@ -122,7 +122,7 @@ impl OAuthAuthority {
             .begin_operation()
             .map_err(|_| AuthError::SessionClosed)?;
         let endpoint = self.endpoint("/oauth/token")?;
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let cancellation = self.transport.cancellation().child_token();
         let client = self.client(&config, &endpoint, &cancellation).await?;
         refresh_from_authority(client, &endpoint, user_id, refresh_token, key).await
@@ -134,7 +134,7 @@ impl OAuthAuthority {
             .begin_operation()
             .map_err(|_| AuthError::SessionClosed)?;
         let endpoint = self.endpoint("/oauth/revoke")?;
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let cancellation = self.transport.cancellation().child_token();
         let client = self.client(&config, &endpoint, &cancellation).await?;
         revoke_at_authority(client, &endpoint, refresh_token, key).await
@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_authority_should_reuse_the_shared_kytrix_service_client_class() {
-        let (_, config) = watch::channel(Arc::new(Config::default()));
+        let config = ConfigNotification::new(Arc::new(Config::default()));
         let transport = test_transport();
         let authority = OAuthAuthority {
             config,
@@ -316,7 +316,7 @@ mod tests {
             runtime: Runtime::for_test(),
         };
 
-        let config = authority.config.borrow().clone();
+        let config = authority.config.current();
         let cancellation = CancellationToken::new();
         authority
             .client(&config, &authority.account_origin, &cancellation)
@@ -373,7 +373,7 @@ mod tests {
             },
             ProxyRoute::named("missing-proxy"),
         );
-        let (_, config) = watch::channel(Arc::new(config));
+        let config = ConfigNotification::new(Arc::new(config));
         let transport = test_transport();
         let authority = OAuthAuthority {
             config,
@@ -382,7 +382,7 @@ mod tests {
             runtime: Runtime::for_test(),
         };
 
-        let config = authority.config.borrow().clone();
+        let config = authority.config.current();
         assert!(matches!(
             authority
                 .client(
@@ -402,15 +402,15 @@ mod tests {
             proxy_default: ProxyRoute::System,
             ..Config::default()
         };
-        let (_, receiver) = watch::channel(Arc::new(config));
+        let config = ConfigNotification::new(Arc::new(config));
         let transport = test_transport();
         let authority = OAuthAuthority {
-            config: receiver,
+            config,
             transport,
             account_origin: Url::parse(ACCOUNT_ORIGIN).unwrap(),
             runtime: Runtime::for_test(),
         };
-        let config = authority.config.borrow().clone();
+        let config = authority.config.current();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -444,7 +444,7 @@ mod tests {
         };
         let mut config = Config::default();
         config.proxy_applications.insert(target, ProxyRoute::Direct);
-        let (_, config) = watch::channel(Arc::new(config));
+        let config = ConfigNotification::new(Arc::new(config));
         let transport = test_transport();
         let authority = OAuthAuthority {
             config,

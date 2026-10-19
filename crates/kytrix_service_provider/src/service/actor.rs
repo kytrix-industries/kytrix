@@ -10,6 +10,8 @@ use app_config::network::{
     Config, KytrixServiceCapability, NetworkRouteGeneration, ProxyRoute, ResolvedProxy,
     RouteTarget, ServiceTarget,
 };
+#[cfg(test)]
+use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
 use kytrix_proto::{
     client::{
@@ -80,7 +82,7 @@ impl ServiceSessionActor {
         let auth = AuthSession::for_test(test_transport());
         let credential_invalidations = auth.session_changes();
         let session_state = SessionStateRegistry::new();
-        let (_, config) = watch::channel(Arc::new(Config::default()));
+        let config = ConfigNotification::new(Arc::new(Config::default()));
         Self::from_context(
             commands,
             ServiceSessionContext {
@@ -111,7 +113,7 @@ impl ServiceSessionActor {
         credential_invalidations: watch::Receiver<SessionChange>,
     ) -> Self {
         let session_state = SessionStateRegistry::new();
-        let (_, config) = watch::channel(Arc::new(Config::default()));
+        let config = ConfigNotification::new(Arc::new(Config::default()));
         let auth = AuthSession::for_test(test_transport());
         Self::from_context(
             commands,
@@ -161,11 +163,9 @@ impl ServiceSessionActor {
             proxy,
             os_proxy_fingerprint,
             config,
-            config_events_open: true,
             auth,
 
             next_request_id: 1,
-            superseded_subscription_acks: AHashMap::with_capacity(8),
             pending_rpcs: AHashMap::with_capacity(MAX_PENDING_RPCS),
             subscription_route_change_reuses_socket: false,
             subscribers: AHashMap::with_capacity(8),
@@ -240,14 +240,6 @@ impl ServiceSessionActor {
                             self.commit_credential_notification(changed.is_ok());
                             None
                         }
-                        changed = self.config.changed(), if self.config_events_open => {
-                            self.config_events_open = changed.is_ok();
-                            if self.config_events_open {
-                                let config = self.config.borrow().clone();
-                                self.retire_changed_routes(&config);
-                            }
-                            None
-                        }
                         command = self.commands.recv() => {
                             let Some(command) = command else { break };
                             if self.handle_disconnected_command(command).await {
@@ -316,10 +308,6 @@ impl ServiceSessionActor {
                         self.commit_credential_notification(changed.is_ok());
                         continue;
                     }
-                    changed = self.config.changed(), if self.config_events_open => {
-                        self.config_events_open = changed.is_ok();
-                        continue;
-                    }
                     command = self.commands.recv() => command,
                 };
                 let Some(command) = command else { break };
@@ -362,9 +350,6 @@ impl ServiceSessionActor {
                 },
                 changed = self.credential_invalidations.changed(), if self.credential_events_open => {
                     Some(ConnectedAction::CredentialsChanged(changed.is_ok()))
-                }
-                changed = self.config.changed(), if self.config_events_open => {
-                    Some(ConnectedAction::ConfigChanged(changed.is_ok()))
                 }
                 renewal = poll_renewal(&mut self.renewal), if can_poll_renewal => {
                     Some(ConnectedAction::Renewal(renewal))
@@ -475,17 +460,6 @@ impl ServiceSessionActor {
                         self.websocket = Some(websocket);
                     }
                 }
-                ConnectedAction::ConfigChanged(channel_open) => {
-                    if !channel_open {
-                        self.config_events_open = false;
-                        self.websocket = Some(websocket);
-                        continue;
-                    }
-                    let config = self.config.borrow().clone();
-                    self.retire_changed_routes(&config);
-                    self.prune_pending_rpcs();
-                    self.websocket = Some(websocket);
-                }
             }
         }
 
@@ -592,8 +566,6 @@ impl ServiceSessionActor {
                     let _ = respond_to.send(Err(error));
                     if keep_connection {
                         self.websocket = Some(websocket);
-                    } else {
-                        self.superseded_subscription_acks.clear();
                     }
                     return keep_connection;
                 }
@@ -698,6 +670,11 @@ impl ServiceSessionActor {
             }
             Command::RetireCredentials => {
                 self.retire_subscribers(TransportError::CredentialChanged);
+                false
+            }
+            Command::Reconfigure => {
+                let config = self.config.current();
+                self.retire_changed_routes(&config);
                 false
             }
         }
@@ -836,6 +813,12 @@ impl ServiceSessionActor {
                 self.retire_subscribers(TransportError::CredentialChanged);
                 Err(KytrixServiceError::AccountChanged)
             }
+            Command::Reconfigure => {
+                let config = self.config.current();
+                self.retire_changed_routes(&config);
+                self.prune_pending_rpcs();
+                Ok(())
+            }
         }
     }
 
@@ -891,13 +874,20 @@ impl ServiceSessionActor {
     }
 
     pub(super) fn subscription_route_is_current(&self, fence: &SubscriptionRouteFence) -> bool {
-        self.subscribers
-            .get(&fence.subscriber_id)
-            .is_some_and(|subscriber| {
-                subscriber.topics == fence.topics
-                    && subscriber.capability == fence.capability
-                    && subscriber.route_generation == fence.route_generation
-            })
+        // The fence must consult the current configuration, not only the subscriber
+        // map: `Command::Reconfigure` is what retires a route that a publication
+        // changed, and it cannot run while the actor is parked inside `wait_for_ack`
+        // or `await_control_with_routes`. Checking the route here is what turns that
+        // queued retire into a result the waiting operation can observe.
+        self.capability_route_is_current(fence.capability, fence.route_generation)
+            && self
+                .subscribers
+                .get(&fence.subscriber_id)
+                .is_some_and(|subscriber| {
+                    subscriber.topics == fence.topics
+                        && subscriber.capability == fence.capability
+                        && subscriber.route_generation == fence.route_generation
+                })
     }
 
     pub(super) fn profile_is_current(&self, expected: Option<&AccountProfile>) -> bool {
@@ -1177,7 +1167,7 @@ impl ServiceSessionActor {
         if task.is_some() {
             return;
         }
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         let uses_system_route = self.subscribers.values().any(|subscriber| {
             matches!(
                 config.service_proxy_route_for(&ServiceTarget::KytrixService {
@@ -1204,7 +1194,7 @@ impl ServiceSessionActor {
     }
 
     pub(super) fn finish_system_proxy_refresh(&mut self) {
-        let config = self.config.borrow().clone();
+        let config = self.config.current();
         self.retire_changed_routes(&config);
     }
 
@@ -1213,7 +1203,7 @@ impl ServiceSessionActor {
         capability: KytrixServiceCapability,
         route_generation: NetworkRouteGeneration,
     ) -> bool {
-        let config = self.config.borrow();
+        let config = self.config.current();
         let target = ServiceTarget::KytrixService { capability };
         config.service_network_route_generation(&target) == route_generation
             && network::proxy::session_route_matches(
@@ -1223,28 +1213,6 @@ impl ServiceSessionActor {
                 &self.proxy,
                 self.os_proxy_fingerprint,
             )
-    }
-
-    pub(super) fn commit_config_notification(&mut self, channel_open: bool) -> bool {
-        if !channel_open {
-            self.config_events_open = false;
-            return false;
-        }
-        let subscriber_count = self.subscribers.len();
-        let config = self.config.borrow_and_update().clone();
-        self.retire_changed_routes(&config);
-        self.subscribers.len() != subscriber_count
-    }
-
-    pub(super) fn commit_pending_config_notification(&mut self) -> bool {
-        if !self.config_events_open {
-            return false;
-        }
-        match self.config.has_changed() {
-            Ok(false) => false,
-            Ok(true) => self.commit_config_notification(true),
-            Err(_) => self.commit_config_notification(false),
-        }
     }
 
     pub(super) async fn await_control_with_routes<T>(
@@ -1273,23 +1241,16 @@ impl ServiceSessionActor {
                         ));
                     }
                 }
-                changed = self.config.changed(), if self.config_events_open => {
-                    let route_changed = self.commit_config_notification(changed.is_ok());
-                    let subscription_retired = route_changed
-                        && (self.subscribers.is_empty()
-                            || route_fence.is_some_and(|fence| {
-                                !self.subscription_route_is_current(fence)
-                            }));
-                    let rpc_retired = rpc_route_fence.is_some_and(|(capability, generation)| {
+                result = timeout_at(deadline, &mut operation) => {
+                    let result = result.map_err(|_| KytrixServiceError::Timeout)?;
+                    if rpc_route_fence.is_some_and(|(capability, generation)| {
                         !self.capability_route_is_current(capability, generation)
-                    });
-                    if subscription_retired || rpc_retired
+                    }) || route_fence
+                        .is_some_and(|fence| !self.subscription_route_is_current(fence))
                     {
                         return Err(KytrixServiceError::RouteChanged);
                     }
-                }
-                result = timeout_at(deadline, &mut operation) => {
-                    return result.map_err(|_| KytrixServiceError::Timeout)?;
+                    return result;
                 }
             }
         }
@@ -1539,10 +1500,7 @@ impl ServiceSessionActor {
             let renewal_uses_id = self.renewal.as_ref().is_some_and(|renewal| {
                 matches!(&renewal.stage, RenewalStage::AwaitingResponse { request_id } if *request_id == id)
             });
-            if !self.pending_rpcs.contains_key(&id)
-                && !self.superseded_subscription_acks.contains_key(&id)
-                && !renewal_uses_id
-            {
+            if !self.pending_rpcs.contains_key(&id) && !renewal_uses_id {
                 return id;
             }
         }
@@ -1785,20 +1743,6 @@ impl ServiceSessionActor {
                     }
                     continue;
                 }
-                changed = self.config.changed(), if self.config_events_open => {
-                    let route_changed = self.commit_config_notification(changed.is_ok());
-                    if route_changed
-                        && (self.subscribers.is_empty()
-                            || route_fence
-                                .is_some_and(|fence| !self.subscription_route_is_current(fence)))
-                    {
-                        self.superseded_subscription_acks
-                            .insert(expected_id, expected_topics.to_vec());
-                        self.subscription_route_change_reuses_socket = true;
-                        return Err(KytrixServiceError::RouteChanged);
-                    }
-                    continue;
-                }
                 () = self.wake.notified() => {
                     self.prune_subscribers();
                     continue;
@@ -1811,39 +1755,22 @@ impl ServiceSessionActor {
                     result.map_err(|_| KytrixServiceError::Timeout)??
                 }
             };
-            let route_changed = self.commit_pending_config_notification();
-            if route_changed
-                && (self.subscribers.is_empty()
-                    || route_fence.is_some_and(|fence| !self.subscription_route_is_current(fence)))
-            {
-                self.subscription_route_change_reuses_socket = true;
-                if matches!(
-                    &incoming,
-                    IncomingMessage::Response(response) if response.id == expected_id
-                ) {
-                    let IncomingMessage::Response(response) = incoming else {
-                        unreachable!("the response guard matched")
-                    };
-                    validate_response(response, expected_id, expected_topics)?;
-                } else {
-                    self.superseded_subscription_acks
-                        .insert(expected_id, expected_topics.to_vec());
-                    self.publish_frame_after_fence(incoming)?;
-                }
-                return Err(KytrixServiceError::RouteChanged);
-            }
             match incoming {
                 IncomingMessage::Response(response) => {
                     if response.id == expected_id {
                         validate_response(response, expected_id, expected_topics)?;
+                        if route_fence
+                            .is_some_and(|fence| !self.subscription_route_is_current(fence))
+                        {
+                            self.subscription_route_change_reuses_socket = true;
+                            return Err(KytrixServiceError::RouteChanged);
+                        }
                         return Ok(());
                     }
                     if self.complete_pending_rpc(response.clone()) {
                         continue;
                     }
-                    if !self.accept_superseded_subscription_response(response.clone())? {
-                        self.accept_renewal_response(response)?;
-                    }
+                    self.accept_renewal_response(response)?;
                 }
                 IncomingMessage::Event(Some((topic, event))) => {
                     self.publish_topic(topic, Ok(event));
@@ -1894,7 +1821,6 @@ impl ServiceSessionActor {
             self.renewal = None;
             return Ok(FrameDisposition::CredentialsChanged);
         }
-        self.commit_pending_config_notification();
         self.publish_frame_after_fence(decode_binary(payload)?)?;
         Ok(FrameDisposition::Continue)
     }
@@ -1908,11 +1834,7 @@ impl ServiceSessionActor {
                 if self.complete_pending_rpc(response.clone()) {
                     return Ok(());
                 }
-                if self.accept_superseded_subscription_response(response.clone())? {
-                    Ok(())
-                } else {
-                    self.accept_renewal_response(response)
-                }
+                self.accept_renewal_response(response)
             }
             IncomingMessage::Event(Some((topic, event))) => {
                 self.publish_topic(topic, Ok(event));
@@ -1925,18 +1847,6 @@ impl ServiceSessionActor {
             IncomingMessage::AuthChallenge(challenge) => self.start_renewal(challenge),
             IncomingMessage::Event(None) | IncomingMessage::Pong(_) => Ok(()),
         }
-    }
-
-    pub(super) fn accept_superseded_subscription_response(
-        &mut self,
-        response: proto_response::Response,
-    ) -> Result<bool, KytrixServiceError> {
-        let response_id = response.id;
-        let Some(expected_topics) = self.superseded_subscription_acks.remove(&response_id) else {
-            return Ok(false);
-        };
-        validate_response(response, response_id, &expected_topics)?;
-        Ok(true)
     }
 
     pub(super) fn complete_pending_rpc(&mut self, response: proto_response::Response) -> bool {
@@ -2010,7 +1920,6 @@ impl ServiceSessionActor {
             KytrixServiceError::RouteChanged => KytrixServiceError::RouteChanged,
             _ => KytrixServiceError::Disconnected,
         });
-        self.superseded_subscription_acks.clear();
         self.subscription_route_change_reuses_socket = false;
         if matches!(
             error,
@@ -2279,6 +2188,54 @@ mod tests {
     }
 
     #[test]
+    fn subscription_route_fence_should_follow_the_current_configuration() {
+        let (_commands, receiver) = mpsc::channel(1);
+        let mut manager = TestConfigManager::in_memory(Config::default());
+        let mut actor =
+            ServiceSessionActor::new(receiver, CancellationToken::new(), Arc::new(Notify::new()));
+        actor.config = manager.notification();
+        let target = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::News,
+        };
+        let (publisher, _subscription) =
+            network::transport::subscription::subscription_channel(2).unwrap();
+        actor.add_subscriber_inner(
+            1,
+            vec![ServiceTopic::News],
+            SubscriberSink::News(publisher),
+            None,
+            manager.read().service_network_route_generation(&target),
+        );
+        let fence = actor
+            .subscription_route_fence(1)
+            .expect("the subscriber should have a route fence");
+        assert!(actor.subscription_route_is_current(&fence));
+
+        manager.update(|config| {
+            config.proxies.insert(
+                "alternate".into(),
+                app_config::network::ProxyConfig {
+                    addr: "127.0.0.1".into(),
+                    port: 9,
+                    authorization: app_config::network::ProxyAuthorizationConfig::None,
+                    resolve_dns_at_remote: false,
+                },
+            );
+            config
+                .proxy_applications
+                .insert(target, ProxyRoute::named("alternate"));
+        });
+
+        // The subscriber entry is untouched; only the configuration moved. A
+        // fence that read the subscriber map alone would still accept it.
+        assert!(actor.subscribers.contains_key(&1));
+        assert!(
+            !actor.subscription_route_is_current(&fence),
+            "a route that moved while a reconfigure was queued must fail the fence"
+        );
+    }
+
+    #[test]
     fn topic_normalization_should_sort_and_deduplicate_topics() {
         let wti = index_service_topic("WTI");
         let topics = normalize_topics(&[wti.clone(), ServiceTopic::News, wti.clone()]);
@@ -2336,12 +2293,9 @@ mod tests {
         let mut actor =
             ServiceSessionActor::new(receiver, CancellationToken::new(), Arc::new(Notify::new()));
         actor.next_request_id = u32::MAX;
-        actor
-            .superseded_subscription_acks
-            .insert(u32::MAX, Vec::new());
         let (respond_to, _response) = oneshot::channel();
         actor.pending_rpcs.insert(
-            1,
+            u32::MAX,
             PendingRpc {
                 expected_profile: AccountProfile::new(TEST_ACCOUNT_ID, 1, 1),
                 capability: KytrixServiceCapability::Etf,
@@ -2356,12 +2310,11 @@ mod tests {
                 nonce: "request-id-test".to_owned(),
                 expires_at: service_unix_now() + 30,
             },
-            stage: RenewalStage::AwaitingResponse { request_id: 2 },
+            stage: RenewalStage::AwaitingResponse { request_id: 1 },
             deadline: Instant::now() + Duration::from_secs(1),
         });
 
-        assert_eq!(actor.next_request_id(), 3);
-        actor.superseded_subscription_acks.clear();
+        assert_eq!(actor.next_request_id(), 2);
         actor.pending_rpcs.clear();
         actor.renewal = None;
         actor.next_request_id = u32::MAX;

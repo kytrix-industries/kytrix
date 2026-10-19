@@ -12,6 +12,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use app_config::network::{Config, KytrixServiceCapability, NetworkRouteGeneration, ResolvedProxy};
+use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
 use kytrix_proto::{client::request::Request as ClientRequestKind, server as proto_response};
 use network::transport::{
@@ -603,10 +604,16 @@ pub(super) struct KytrixServiceConnectorInner {
     pub lifecycle: TransportScope,
     pub transport: Arc<TransportHub>,
     pub websocket_url: Url,
-    pub config: watch::Receiver<Arc<Config>>,
+    pub config: ConfigNotification<Config>,
     pub cancellation: CancellationToken,
     pub wake: Arc<Notify>,
     pub supervisor_task: Mutex<Option<JoinHandle<()>>>,
+    /// The task that turns one publication of the network projection into a
+    /// [`SupervisorCommand::Reconfigure`] for every live session.
+    ///
+    /// [`KytrixServiceConnector::install`] is the production entry point for
+    /// this task; every `KytrixServiceConnector` constructor starts it.
+    pub config_task: Mutex<Option<JoinHandle<()>>>,
     pub next_subscriber_id: AtomicU64,
     pub session_state: SessionStateRegistry,
     /// The application runtime every route resolution of this connector runs on.
@@ -633,6 +640,9 @@ pub(super) enum SupervisorCommand {
         deadline: Instant,
         respond_to: oneshot::Sender<Result<(), KytrixServiceError>>,
     },
+    /// Tells every live session to re-read the network projection it routes by
+    /// and retire the subscriptions the new projection no longer serves.
+    Reconfigure,
 }
 
 pub(super) enum Command {
@@ -657,6 +667,9 @@ pub(super) enum Command {
         respond_to: oneshot::Sender<Result<proto_response::Response, KytrixServiceError>>,
     },
     RetireCredentials,
+    /// Re-reads the network projection and retires the subscriptions whose
+    /// route generation or resolved route it no longer serves.
+    Reconfigure,
 }
 
 pub(super) struct LocalSubscriber {
@@ -814,7 +827,7 @@ pub(super) struct ServiceSessionExit {
 #[derive(Clone)]
 pub(super) struct ServiceSessionContext {
     pub websocket_url: Url,
-    pub config: watch::Receiver<Arc<Config>>,
+    pub config: ConfigNotification<Config>,
     pub auth: AuthSession,
     pub account_profile: Arc<RwLock<Option<AccountProfile>>>,
     pub credential_invalidations: watch::Receiver<SessionChange>,
@@ -833,12 +846,10 @@ pub(super) struct ServiceSessionActor {
     pub websocket_url: Url,
     pub proxy: ResolvedProxy,
     pub os_proxy_fingerprint: u64,
-    pub config: watch::Receiver<Arc<Config>>,
-    pub config_events_open: bool,
+    pub config: ConfigNotification<Config>,
     pub auth: AuthSession,
 
     pub next_request_id: u32,
-    pub superseded_subscription_acks: AHashMap<u32, Vec<ServiceTopic>>,
     pub pending_rpcs: AHashMap<u32, PendingRpc>,
     pub subscription_route_change_reuses_socket: bool,
     pub subscribers: AHashMap<u64, LocalSubscriber>,
@@ -866,7 +877,6 @@ pub(super) enum ConnectedAction {
     Command(Result<(), KytrixServiceError>),
     Frame(Result<Frame, WebSocketError>),
     CredentialsChanged(bool),
-    ConfigChanged(bool),
     Renewal(RenewalPoll),
     Heartbeat,
     Sweep,

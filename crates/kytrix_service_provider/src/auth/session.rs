@@ -7,6 +7,7 @@ use std::{
 };
 
 use app_config::network::Config;
+use app_config_provider::notification::ConfigNotification;
 use network::transport::hub::TransportHub;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -135,7 +136,7 @@ impl AuthSession {
     /// Starts an OAuth session using the Account capability route from `config`.
     /// A persisted login credential is refreshed once before commands are served.
     pub fn spawn(
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
         runtime: Runtime,
     ) -> Result<Self, AuthError> {

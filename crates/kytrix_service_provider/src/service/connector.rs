@@ -9,6 +9,11 @@ use std::{
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
 #[cfg(test)]
 use app_config::network::{NetworkRouteGeneration, ResolvedProxy};
+use app_config_provider::{
+    events::{ConfigEventBridge, ConfigTopics},
+    notification::ConfigNotification,
+};
+use gpui_kit::App;
 use kytrix_proto::{
     client::{
         GetEtf, GetIndexManifest, WalletAddSelection, WalletDeleteSelection, WalletSelections,
@@ -81,6 +86,18 @@ pub struct KytrixServiceConnector {
 }
 
 impl gpui_kit::Global for KytrixServiceConnector {}
+
+/// Keeps the Kytrix service bridge alive for the life of the application.
+///
+/// The bridge holds `Subscription`s, which are neither `Send` nor `Sync`, while
+/// the connector is an `Arc` shared with background work: the subscription lives
+/// here, owned by the application, and only the notification it publishes into
+/// travels with the connector.
+struct ServiceConfigBridge {
+    _bridge: ConfigEventBridge,
+}
+
+impl gpui_kit::Global for ServiceConfigBridge {}
 
 impl KytrixAccountSession {
     pub fn profile(&self) -> &AccountProfile {
@@ -369,6 +386,14 @@ impl Drop for KytrixServiceConnectorInner {
         self.cancellation.cancel();
         self.wake.notify_waiters();
         if let Some(task) = self
+            .config_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+        if let Some(task) = self
             .supervisor_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -387,23 +412,30 @@ impl KytrixServiceConnector {
     #[cfg(test)]
     pub(super) fn spawn_for_test(
         runtime: &Runtime,
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
     ) -> Self {
         let auth = AuthSession::for_test(Arc::clone(&transport));
-        Self::spawn(runtime, config, transport, auth)
+        let credential_invalidations = auth.session_changes();
+        Self::spawn_with_config(
+            runtime,
+            KYTRIX_SERVICE_WS_URL.clone(),
+            config,
+            credential_invalidations,
+            transport,
+            auth,
+        )
     }
 
     #[cfg(test)]
     pub(super) fn spawn_with_urls(runtime: &Runtime, websocket_url: Url) -> Self {
-        let (_, config) = watch::channel(Arc::new(Config::default()));
         let transport = test_transport();
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
         Self::spawn_with_config(
             runtime,
             websocket_url,
-            config,
+            ConfigNotification::new(Arc::new(Config::default())),
             credential_invalidations,
             transport,
             auth,
@@ -414,7 +446,7 @@ impl KytrixServiceConnector {
     pub(super) fn spawn_with_urls_config(
         runtime: &Runtime,
         websocket_url: Url,
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
         auth: AuthSession,
         credential_invalidations: watch::Receiver<SessionChange>,
@@ -429,12 +461,43 @@ impl KytrixServiceConnector {
         )
     }
 
-    pub fn spawn(
+    /// Connects the application to the Kytrix service.
+    ///
+    /// This is the owner's single install point: it creates the auth session (D1),
+    /// the bridge, and the notification's reconfigure consumer.
+    pub fn install(
+        cx: &mut App,
         runtime: &Runtime,
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
+        transport: Arc<TransportHub>,
+    ) -> Result<Self, AuthError> {
+        let auth = AuthSession::spawn(config.clone(), Arc::clone(&transport), runtime.clone())?;
+        Ok(Self::install_with_auth(
+            cx, runtime, config, transport, auth,
+        ))
+    }
+
+    /// Completes installation over a caller-supplied auth session.
+    ///
+    /// Exists so a test can install the connector without starting the real auth
+    /// session; the only production caller is [`Self::install`].
+    pub(crate) fn install_with_auth(
+        cx: &mut App,
+        runtime: &Runtime,
+        config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
         auth: AuthSession,
     ) -> Self {
+        let bridge = ConfigEventBridge::install(
+            cx,
+            ConfigTopics::NETWORK,
+            config.clone(),
+            Arc::new(
+                |config: &app_config::settings::Config, _previous: &Config| config.network_config(),
+            ),
+        );
+        cx.set_global(ServiceConfigBridge { _bridge: bridge });
+
         let credential_invalidations = auth.session_changes();
         Self::spawn_with_config(
             runtime,
@@ -449,7 +512,7 @@ impl KytrixServiceConnector {
     pub(super) fn spawn_with_config(
         runtime: &Runtime,
         websocket_url: Url,
-        config: watch::Receiver<Arc<Config>>,
+        config: ConfigNotification<Config>,
         credential_invalidations: watch::Receiver<SessionChange>,
         transport: Arc<TransportHub>,
         auth: AuthSession,
@@ -486,6 +549,18 @@ impl KytrixServiceConnector {
             };
             run_service_supervisor(receiver, supervisor_context).await;
         });
+        let config_task = {
+            let notification = config.clone();
+            let commands = commands.clone();
+            runtime.run(async move {
+                loop {
+                    let _ = notification.wait().await;
+                    if commands.send(SupervisorCommand::Reconfigure).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
         Self {
             inner: Arc::new(KytrixServiceConnectorInner {
                 commands,
@@ -497,6 +572,7 @@ impl KytrixServiceConnector {
                 cancellation,
                 wake,
                 supervisor_task: Mutex::new(Some(supervisor_task)),
+                config_task: Mutex::new(Some(config_task)),
                 next_subscriber_id: AtomicU64::new(1),
                 session_state,
                 runtime: runtime.clone(),
@@ -512,6 +588,15 @@ impl KytrixServiceConnector {
     pub(super) async fn shutdown_with_timeout(&self, wait: Duration) {
         self.inner().lifecycle.cancel();
         self.inner().wake.notify_waiters();
+        if let Some(task) = self
+            .inner()
+            .config_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
         let task = self
             .inner()
             .supervisor_task
@@ -530,6 +615,17 @@ impl KytrixServiceConnector {
 
     pub fn subscribe_session_state(&self) -> watch::Receiver<Option<KytrixSessionState>> {
         self.inner().session_state.subscribe()
+    }
+
+    /// Returns a read-only view of the network projection this connector routes with.
+    ///
+    /// The clone observes the same owner state. A caller may read
+    /// [`ConfigNotification::current`] at request time, but must never
+    /// [`ConfigNotification::wait`]: this connector's own forwarding task is the
+    /// single waiter, and a second one would consume the publication that task
+    /// needs to reconfigure the sessions.
+    pub fn network_notification(&self) -> ConfigNotification<Config> {
+        self.inner().config.clone()
     }
 
     pub fn subscribe_account_session_changes(&self) -> watch::Receiver<SessionChange> {
@@ -579,7 +675,7 @@ impl KytrixServiceConnector {
             .auth
             .authorization_headers_with_profile("POST", endpoint.as_str())
             .await?;
-        let config = self.inner().config.borrow().clone();
+        let config = self.inner().config.current();
         request_dashboard_handoff(
             &config,
             &self.inner().transport,
@@ -718,7 +814,7 @@ impl KytrixServiceConnector {
                 profile
             }
         };
-        let config = self.inner().config.borrow().clone();
+        let config = self.inner().config.current();
         let target = ServiceTarget::KytrixService { capability };
         let route_generation = config.service_network_route_generation(&target);
         let target = RouteTarget::Service(target);
@@ -881,7 +977,7 @@ impl KytrixServiceConnector {
                 profile
             }
         };
-        let config = self.inner().config.borrow().clone();
+        let config = self.inner().config.current();
         let target = ServiceTarget::KytrixService { capability };
         let route_generation = config.service_network_route_generation(&target);
         let target = RouteTarget::Service(target);
@@ -1151,7 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn connector_shutdown_completes_and_is_idempotent() {
-        let (_, config) = watch::channel(Arc::new(Config::default()));
+        let config = ConfigNotification::new(Arc::new(Config::default()));
         let transport = test_transport();
         let connector = KytrixServiceConnector::spawn_for_test(
             &Runtime::for_test(),
@@ -1172,6 +1268,98 @@ mod tests {
                 .is_none()
         );
         transport.shutdown().await;
+    }
+
+    #[gpui_kit::test]
+    fn install_should_bridge_network_writes_and_take_its_config_task_on_shutdown(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use app_config::settings::Language;
+        use app_config_provider::manager::ConfigManager;
+        use gpui_kit::BorrowAppContext as _;
+
+        let runtime = Runtime::for_test();
+        let transport = test_transport();
+        let notification = cx.update(|cx| {
+            let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
+            let notification = ConfigNotification::new(Arc::new(manager.read().network_config()));
+            cx.set_global(manager);
+            notification
+        });
+        let connector = cx.update(|cx| {
+            KytrixServiceConnector::install_with_auth(
+                cx,
+                &runtime,
+                notification.clone(),
+                Arc::clone(&transport),
+                AuthSession::for_test(Arc::clone(&transport)),
+            )
+        });
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.proxies.insert(
+                            SmolStr::new_static("install-bridge"),
+                            app_config::network::ProxyConfig {
+                                addr: SmolStr::new_static("127.0.0.1"),
+                                port: 9,
+                                authorization: app_config::network::ProxyAuthorizationConfig::None,
+                                resolve_dns_at_remote: false,
+                            },
+                        );
+                    },
+                    cx,
+                );
+            });
+        });
+        assert!(
+            connector
+                .network_notification()
+                .current()
+                .proxies
+                .contains_key(&SmolStr::new_static("install-bridge")),
+            "a network write should reach the projection the connector routes with"
+        );
+
+        let before_language = connector.network_notification().current();
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| config.language = Language::En, cx);
+            });
+        });
+        assert!(
+            Arc::ptr_eq(
+                &before_language,
+                &connector.network_notification().current()
+            ),
+            "a write outside the network domain must not publish a network projection"
+        );
+
+        assert!(
+            connector
+                .inner()
+                .config_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "install must start the configuration forwarding task"
+        );
+
+        runtime.handle().block_on(async {
+            connector.shutdown().await;
+            transport.shutdown().await;
+        });
+        assert!(
+            connector
+                .inner()
+                .config_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "shutdown must take the configuration forwarding task"
+        );
     }
 
     #[tokio::test]
@@ -1436,14 +1624,14 @@ mod tests {
     #[tokio::test]
     async fn route_change_should_retire_only_the_affected_shared_session_capability() {
         let mut server = TestServiceServer::spawn(false).await;
-        let (config_sender, config) = watch::channel(Arc::new(Config::default()));
+        let notification = ConfigNotification::new(Arc::new(Config::default()));
         let transport = test_transport();
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
         let connector = KytrixServiceConnector::spawn_with_urls_config(
             &Runtime::for_test(),
             server.url.clone(),
-            config,
+            notification.clone(),
             Arc::clone(&transport),
             auth,
             credential_invalidations,
@@ -1489,11 +1677,15 @@ mod tests {
             },
             ProxyRoute::named("alternate"),
         );
-        config_sender.send_replace(Arc::new(updated));
-        server.send_news("stale-old-route");
+        notification.publish_for_test(Arc::new(updated));
 
-        assert_eq!(news.recv().await, Err(TransportError::RouteChanged));
-        assert_eq!(news.recv().await, Err(TransportError::Closed));
+        assert_eq!(
+            timeout(Duration::from_secs(2), news.recv())
+                .await
+                .expect("the route change should retire the News subscription"),
+            Err(TransportError::RouteChanged)
+        );
+        server.send_news("stale-old-route");
         assert_eq!(
             server.next_request().await,
             (1, ObservedRequest::SetSubscriptions(vec![index_service]))
@@ -1512,9 +1704,92 @@ mod tests {
                 .topic,
             index
         );
+        // The Index event is the FIFO barrier for the stale News frame: both
+        // travel over the same socket and the retired frame was sent first, so
+        // the actor has already processed it. `recv` cannot prove that (after a
+        // terminal status it answers `Closed` immediately, whatever was
+        // buffered), so inspect the queue directly: a delivered stale frame
+        // would still be there.
+        assert!(
+            news.try_recv_for_test().is_err(),
+            "a frame published after retirement must not reach the retired subscription"
+        );
+        assert_eq!(
+            news.status(),
+            network::transport::subscription::SubscriptionStatus::Failed(
+                TransportError::RouteChanged
+            )
+        );
 
         drop(indices);
         connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    /// A route change that lands while a subscription acknowledgement is still in
+    /// flight is only visible to the ack fence: the queued reconfigure cannot run
+    /// until the actor leaves `wait_for_ack`. The subscription must fail with
+    /// `RouteChanged` instead of becoming active on the old route.
+    #[tokio::test]
+    async fn withheld_ack_should_fail_the_subscription_when_its_route_changed() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let mut manager = TestConfigManager::in_memory(Config::default());
+        let transport = test_transport();
+        let auth = AuthSession::for_test(Arc::clone(&transport));
+        let credential_invalidations = auth.session_changes();
+        let connector = KytrixServiceConnector::spawn_with_urls_config(
+            &Runtime::for_test(),
+            server.url.clone(),
+            manager.notification(),
+            Arc::clone(&transport),
+            auth,
+            credential_invalidations,
+        );
+
+        server.stall_next_response();
+        let subscribe = tokio::spawn({
+            let connector = connector.clone();
+            async move { connector.subscribe_news().await }
+        });
+        assert_eq!(
+            server.next_request().await,
+            (
+                1,
+                ObservedRequest::SetSubscriptions(vec![ServiceTopic::News])
+            )
+        );
+        server.wait_for_stalled_response().await;
+
+        let target = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::News,
+        };
+        manager.update(|config| {
+            config.proxies.insert(
+                "ack-fence".into(),
+                app_config::network::ProxyConfig {
+                    addr: "127.0.0.1".into(),
+                    port: 9,
+                    authorization: app_config::network::ProxyAuthorizationConfig::None,
+                    resolve_dns_at_remote: false,
+                },
+            );
+            config
+                .proxy_applications
+                .insert(target, ProxyRoute::named("ack-fence"));
+        });
+        server.resume_response();
+
+        let result = timeout(Duration::from_secs(2), subscribe)
+            .await
+            .expect("the released acknowledgement should complete the subscription")
+            .expect("the subscription task should not panic");
+        assert!(
+            matches!(result, Err(KytrixServiceError::RouteChanged)),
+            "an acknowledgement that arrives after its route moved must not activate the sink"
+        );
+
+        connector.shutdown().await;
+        transport.shutdown().await;
         server.shutdown().await;
     }
 
@@ -1528,7 +1803,7 @@ mod tests {
         let connector = KytrixServiceConnector::spawn_with_urls_config(
             &Runtime::for_test(),
             server.url.clone(),
-            manager.subscribe(),
+            manager.notification(),
             Arc::clone(&transport),
             auth,
             credential_invalidations,
@@ -1580,7 +1855,12 @@ mod tests {
             manager.read().service_network_route_generation(&target),
             initial_generation
         );
-        assert_eq!(news.recv().await, Err(TransportError::RouteChanged));
+        assert_eq!(
+            timeout(Duration::from_secs(2), news.recv())
+                .await
+                .expect("the route ABA should retire the News subscription"),
+            Err(TransportError::RouteChanged)
+        );
         assert_eq!(
             server.next_request().await,
             (1, ObservedRequest::SetSubscriptions(Vec::new()))

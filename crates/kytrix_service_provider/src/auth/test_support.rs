@@ -8,6 +8,7 @@ use std::{
 };
 
 pub(crate) use app_config::network::{Config, ProxyRoute};
+pub(crate) use app_config_provider::notification::ConfigNotification;
 pub(crate) use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 pub(crate) use bytes::Bytes;
 pub(crate) use futures::future::BoxFuture;
@@ -311,9 +312,8 @@ pub(super) fn oauth_token_body(refresh_token: &str, access_token: &str) -> Strin
 }
 
 pub(super) fn oauth_authority(origin: Url, transport: Arc<TransportHub>) -> Arc<OAuthAuthority> {
-    let (_, config) = watch::channel(Arc::new(Config::default()));
     Arc::new(OAuthAuthority {
-        config,
+        config: ConfigNotification::new(Arc::new(Config::default())),
         transport,
         account_origin: origin,
         runtime: Runtime::for_test(),

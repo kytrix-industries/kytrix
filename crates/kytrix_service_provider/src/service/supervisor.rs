@@ -74,7 +74,7 @@ pub(super) async fn run_service_supervisor(
                             &key,
                             &command,
                             &websocket_url,
-                            &config.borrow(),
+                            &config.current(),
                         );
                         if let Err(error) = route {
                             reject_session_command(*command, error);
@@ -130,6 +130,21 @@ pub(super) async fn run_service_supervisor(
                             }
                         };
                         let _ = respond_to.send(result);
+                    }
+                    SupervisorCommand::Reconfigure => {
+                        for (key, entry) in &sessions {
+                            if timeout(
+                                OPERATION_TIMEOUT,
+                                entry.commands.send(Command::Reconfigure),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                log::warn!(
+                                    "failed to deliver a Kytrix service configuration change to the session {key:?} within {OPERATION_TIMEOUT:?}; its subscriptions keep the previous routing until the next command"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -247,6 +262,7 @@ fn reject_supervisor_command(command: SupervisorCommand, error: KytrixServiceErr
         SupervisorCommand::AcquireAccount { respond_to, .. } => {
             let _ = respond_to.send(Err(error));
         }
+        SupervisorCommand::Reconfigure => {}
     }
 }
 
@@ -262,6 +278,7 @@ fn reject_session_command(command: Command, error: KytrixServiceError) {
             let _ = respond_to.send(Err(error));
         }
         Command::RetireCredentials => {}
+        Command::Reconfigure => {}
     }
 }
 
