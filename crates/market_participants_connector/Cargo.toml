@@ -67,6 +67,9 @@ yawc.workspace = true
 # real installation may store is one the venue publishes, so this is the only way a
 # test reaches a loopback fixture.
 app_config = { workspace = true, features = ["test-support"] }
+# A test fake drives an owner's shared projection through `publish_for_test`, so the
+# test build needs the provider's own test-support feature.
+app_config_provider = { workspace = true, features = ["test-support"] }
 # The crate's own integration tests drive the seams `test-support` exposes, and a
 # `-p market_participants_connector` build has no other edge that enables the
 # feature: without this self dev-dependency its test targets only compile in a

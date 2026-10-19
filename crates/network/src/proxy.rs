@@ -6,7 +6,6 @@ use app_config::network::{
     Config, ConfigError, NetworkRouteGeneration, ProxyRoute, ResolvedProxy, RouteTarget,
 };
 use market_participants_model::identifier::VenueId;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
@@ -182,14 +181,16 @@ fn resolve_system_proxy(
     })
 }
 
-/// Resolves effective proxy routes and detects route-generation changes.
+/// Resolves effective proxy routes from the owner's current network projection.
 #[derive(Clone)]
 pub struct ProxyResolver {
-    config: watch::Receiver<Arc<Config>>,
+    config: Arc<dyn Fn() -> Arc<Config> + Send + Sync>,
 }
 
 impl ProxyResolver {
-    pub fn new(config: watch::Receiver<Arc<Config>>) -> Self {
+    /// Builds a resolver over `config`, which must answer the owner's latest
+    /// complete network projection.
+    pub fn new(config: Arc<dyn Fn() -> Arc<Config> + Send + Sync>) -> Self {
         Self { config }
     }
 
@@ -225,14 +226,14 @@ impl ProxyResolver {
         destination: &Url,
         runtime: &Runtime,
     ) -> Result<(ResolvedProxy, NetworkRouteGeneration), ConfigError> {
-        let config = self.config.borrow().clone();
+        let config = (self.config)();
         let generation = route_generation(&config, target);
         let proxy = resolve_async(&config, target, destination, runtime).await?;
         Ok((proxy, generation))
     }
 
     pub fn route_generation(&self, target: &RouteTarget) -> NetworkRouteGeneration {
-        route_generation(&self.config.borrow(), target)
+        route_generation(&(self.config)(), target)
     }
 
     pub fn has_proxy_changed(
@@ -241,10 +242,6 @@ impl ProxyResolver {
         generation: NetworkRouteGeneration,
     ) -> bool {
         self.route_generation(target) != generation
-    }
-
-    pub async fn changed(&mut self) -> bool {
-        self.config.changed().await.is_ok()
     }
 }
 
@@ -257,7 +254,6 @@ mod tests {
         ProxyConfig, ProxyRoute, ResolvedProxy, RouteTarget, ServiceTarget,
     };
     use smol_str::SmolStr;
-    use tokio::sync::watch;
     use url::Url;
     use widget_tokio_runtime::runtime::Runtime;
 
@@ -304,8 +300,16 @@ mod tests {
         let destination = Url::parse("https://pbs.twimg.com/media/test.jpg").unwrap();
         let application = Runtime::for_test();
         let mut config = Config::default();
-        let (sender, receiver) = watch::channel(Arc::new(config.clone()));
-        let resolver = ProxyResolver::new(receiver);
+        let current = Arc::new(std::sync::RwLock::new(Arc::new(Config::default())));
+        let resolver = ProxyResolver::new({
+            let current = Arc::clone(&current);
+            Arc::new(move || {
+                current
+                    .read()
+                    .expect("the test lock is not poisoned")
+                    .clone()
+            })
+        });
 
         assert_eq!(
             resolver
@@ -330,7 +334,7 @@ mod tests {
         );
         config.proxy_default = ProxyRoute::named("local");
         config.default_route_generation = NetworkRouteGeneration::new(7);
-        sender.send(Arc::new(config.clone())).unwrap();
+        *current.write().expect("the test lock is not poisoned") = Arc::new(config.clone());
         assert_eq!(
             resolver
                 .resolve_for_target(

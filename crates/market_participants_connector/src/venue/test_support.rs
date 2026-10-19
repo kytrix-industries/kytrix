@@ -24,9 +24,10 @@ use std::{
 };
 
 use app_config::market_participants::fixture::{self, FixtureAddress};
+use app_config_provider::notification::ConfigNotification;
 use gpui_kit::{App, TestAppContext};
 use market_participants_model::identifier::VenueId;
-use tokio::{sync::watch, time::timeout};
+use tokio::time::timeout;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
@@ -69,10 +70,10 @@ pub(crate) fn fixture_connector(
         (venue(HYPERLIQUID_VENUE), FixtureAddress::at(&info)),
         (venue(LONGBRIDGE_VENUE), FixtureAddress::at(&catalogs)),
     ]);
-    let (_, receiver) = watch::channel(Arc::new(MarketParticipantNetworkSnapshot::new(
+    let notification = ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::new(
         fixture_config(&fixture),
     )));
-    connector_over(receiver, plaintext_policy())
+    connector_over(notification, plaintext_policy())
 }
 
 /// One built-in venue identity.

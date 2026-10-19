@@ -731,11 +731,11 @@ impl AnalyticsBuilder<OpenInterestKind> {
 mod tests {
     use std::sync::Arc;
 
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         error::ModelError, instrument::InstrumentKind, routing::CapabilityId,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use tokio::sync::watch;
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::MarketError;
@@ -757,12 +757,12 @@ mod tests {
     /// A market capability whose spot route publishes one fixture listing.
     async fn capability() -> MarketCapability {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-        let (_, receiver) = watch::channel(Arc::clone(&snapshot));
+        let notification = ConfigNotification::new(snapshot);
         let catalog = Arc::new(crate::catalog::store::Catalog::new());
         let connector = MarketParticipantsConnector::new_with_catalog(
             MarketParticipantsConnectorInput::new(
                 Arc::new(TransportHub::new(TransportPolicy::default())),
-                receiver,
+                notification,
             )
             .with_runtime(Runtime::for_test()),
             Arc::clone(&catalog),

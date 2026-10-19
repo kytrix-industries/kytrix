@@ -20,7 +20,11 @@ use std::{
 
 use ahash::AHashMap;
 use app_config::settings::Config;
-use app_config_provider::manager::ConfigManager;
+use app_config_provider::{
+    events::{ConfigEventBridge, ConfigTopics},
+    manager::ConfigManager,
+    notification::ConfigNotification,
+};
 use futures::future::BoxFuture;
 use gpui_kit::{App, AppContext};
 use market_participants_model::{
@@ -30,7 +34,6 @@ use market_participants_model::{
 use network::transport::hub::{TransportHub, TransportPolicy};
 use parking_lot::Mutex;
 use smol_str::SmolStr;
-use tokio::{sync::watch, task::JoinHandle};
 use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
@@ -49,7 +52,7 @@ use crate::{
     connection::ConnectionPool,
     error::MarketParticipantError,
     market, routing,
-    runtime::{MarketParticipantNetworkSnapshot, MarketParticipantNetworkSnapshotReceiver},
+    runtime::MarketParticipantNetworkSnapshot,
     trading,
     venue::{
         config::{LoadCancellation, VenueConfig, VenueConversation},
@@ -66,22 +69,13 @@ use crate::{
 /// absent from this boundary.
 pub struct MarketParticipantsConnectorInput {
     transport: Arc<TransportHub>,
-    snapshot: MarketParticipantNetworkSnapshotReceiver,
-    snapshot_projection_task: Option<JoinHandle<()>>,
+    snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
     runtime: Option<Runtime>,
 }
 
-impl Drop for MarketParticipantsConnectorInput {
-    fn drop(&mut self) {
-        if let Some(task) = self.snapshot_projection_task.take() {
-            task.abort();
-        }
-    }
-}
-
 impl MarketParticipantsConnectorInput {
-    /// Creates MarketParticipantsConnector input from the shared transport and typed runtime
-    /// snapshot receiver.
+    /// Creates MarketParticipantsConnector input from the shared transport and the
+    /// notification carrying the market-participants runtime projection.
     ///
     /// The application runtime must be attached with [`Self::with_runtime`]
     /// before the market participants root is built: every route resolves its proxy through
@@ -89,12 +83,11 @@ impl MarketParticipantsConnectorInput {
     /// it arrived on.
     pub fn new(
         transport: Arc<TransportHub>,
-        snapshot: MarketParticipantNetworkSnapshotReceiver,
+        snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> Self {
         Self {
             transport,
             snapshot,
-            snapshot_projection_task: None,
             runtime: None,
         }
     }
@@ -102,19 +95,6 @@ impl MarketParticipantsConnectorInput {
     /// Attaches the application runtime every market-participant operation runs on.
     pub fn with_runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = Some(runtime);
-        self
-    }
-
-    /// Gives the MarketParticipantsConnector ownership of the task that projects application
-    /// settings into [`crate::runtime::MarketParticipantNetworkSnapshot`] values.
-    ///
-    /// The task is cancelled and awaited by [`MarketParticipantsConnector::shutdown`].
-    /// If construction fails before ownership is transferred, dropping this
-    /// input still aborts the task.
-    pub fn with_snapshot_projection_task(mut self, task: JoinHandle<()>) -> Self {
-        if let Some(previous) = self.snapshot_projection_task.replace(task) {
-            previous.abort();
-        }
         self
     }
 }
@@ -244,6 +224,18 @@ impl MarketParticipantsConnectorError {
 
 impl gpui_kit::Global for MarketParticipantsConnector {}
 
+/// Keeps the market-participants bridge alive for the life of the application.
+///
+/// The bridge holds `Subscription`s, which are neither `Send` nor `Sync`, while
+/// the connector is an `Arc` shared with background work: the subscription lives
+/// here, owned by the application, and only the notification it publishes into
+/// travels with the connector.
+struct MarketParticipantsConfigBridge {
+    _bridge: ConfigEventBridge,
+}
+
+impl gpui_kit::Global for MarketParticipantsConfigBridge {}
+
 /// The state every market-participants capability handle shares.
 ///
 /// The fields are public because the `account`, `market` and `trading` handles are
@@ -282,9 +274,12 @@ pub(crate) struct MarketParticipantsConnectorInner {
     /// The receiver of the boundary this root owns before an application
     /// attaches its own.
     pub event_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<VenuesUpdated>>>,
-    pub snapshot_projection_task: Mutex<Option<OwnedTask>>,
-    pub runtime_snapshot_task: Mutex<Option<OwnedTask>>,
-    pub pool_config_task: Mutex<Option<OwnedTask>>,
+    /// The task that invalidates pooled connections whenever the runtime
+    /// projection is published again.
+    ///
+    /// Only [`MarketParticipantsConnector::install`] starts it: a root built from
+    /// typed runtime inputs has no configuration owner to wait on.
+    pub config_task: Mutex<Option<OwnedTask>>,
     pub closed: AtomicBool,
 }
 
@@ -746,9 +741,11 @@ impl MarketParticipantsConnector {
     /// Builds the shared market participants root from the installed application services
     /// and installs it in GPUI global state.
     ///
-    /// The connector projects the settings manager's configuration into the
-    /// market-participants runtime snapshot, so a settings change reconfigures the
-    /// market-participants runtime without rebuilding the connector.
+    /// The connector subscribes the market-participants runtime projection to the
+    /// settings manager's network and venue events, so a settings change
+    /// reconfigures the market-participants runtime without rebuilding the
+    /// connector; a background task then closes every pooled connection the new
+    /// projection no longer serves.
     ///
     /// # Errors
     ///
@@ -762,47 +759,42 @@ impl MarketParticipantsConnector {
             .try_global::<ConfigManager>()
             .ok_or(MarketParticipantsConnectorError::ConfigurationUnavailable)?;
         let config = manager.read();
-        let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
-        let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(Config::clone(
+        let initial = Arc::new(MarketParticipantNetworkSnapshot::new(Config::clone(
             &config,
         )));
-        let (sender, receiver) = watch::channel(snapshot.clone());
-        let mut config_changes = manager.subscribe();
-        let mut previous = snapshot;
-        let mut published_network = config.network_config();
-        let mut published_venues = config.venues.clone();
-        let snapshot_projection_task = runtime.run(async move {
-            while config_changes.changed().await.is_ok() {
-                let config = config_changes.borrow().clone();
-                // Only a commit that changes what the market-participants runtime is derived
-                // from may publish: the interface language, a workspace layout and
-                // a widget's own setting all leave every route's runtime
-                // generation, and so every catalog revision, as it was.
-                if config.network_config() == published_network && config.venues == published_venues
-                {
-                    continue;
-                }
-                let snapshot = Arc::new(MarketParticipantNetworkSnapshot::from_previous(
-                    Config::clone(&config),
-                    Some(previous.as_ref()),
-                ));
-                sender.send_replace(snapshot.clone());
-                previous = snapshot;
-                published_network = config.network_config();
-                published_venues = config.venues.clone();
+        let notification = ConfigNotification::new(initial);
+        let bridge = ConfigEventBridge::install(
+            cx,
+            ConfigTopics::NETWORK_AND_VENUES,
+            notification.clone(),
+            Arc::new(
+                |config: &Config, previous: &MarketParticipantNetworkSnapshot| {
+                    MarketParticipantNetworkSnapshot::from_previous(
+                        Config::clone(config),
+                        Some(previous),
+                    )
+                },
+            ),
+        );
+
+        let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
+        let connector = Self::new(
+            MarketParticipantsConnectorInput::new(transport, notification.clone())
+                .with_runtime(runtime.clone()),
+        )?;
+        let pool = Arc::clone(&connector.inner.pool);
+        let config_task = runtime.run(async move {
+            loop {
+                let snapshot = notification.wait().await;
+                pool.invalidate_stale(&snapshot).await;
             }
         });
+        *connector.inner.config_task.lock() = Some(OwnedTask::new(config_task));
 
-        let connector = Self::new(
-            MarketParticipantsConnectorInput::new(transport, receiver)
-                .with_runtime(runtime)
-                .with_snapshot_projection_task(snapshot_projection_task),
-        )?;
-        // The venue event boundary belongs to the application: the entity exists
-        // exactly when the root is installed in one, and every later commit is
-        // announced through this one entity.
+        cx.set_global(MarketParticipantsConfigBridge { _bridge: bridge });
         connector.attach_events(cx);
         cx.set_global(connector);
+
         Ok(())
     }
 
@@ -864,7 +856,6 @@ impl MarketParticipantsConnector {
         catalog: Arc<Catalog>,
     ) -> Result<Self, MarketParticipantsConnectorError> {
         let mut input = input;
-        let snapshot_projection_task = input.snapshot_projection_task.take().map(OwnedTask::new);
         let transport = Arc::clone(&input.transport);
         let snapshot = input.snapshot.clone();
         let runtime = input
@@ -873,7 +864,7 @@ impl MarketParticipantsConnector {
             .ok_or(MarketParticipantsConnectorError::RuntimeUnavailable)?;
         drop(input);
         catalog.set_runtime(runtime.clone());
-        let initial_snapshot = snapshot.borrow().clone();
+        let initial_snapshot = snapshot.current();
         let pool = Arc::new(ConnectionPool::with_transport(Arc::clone(&transport)));
         let router = MarketParticipantGateway::adapter_router(&initial_snapshot)
             .map_err(MarketParticipantsConnectorError::from_internal)?;
@@ -882,16 +873,9 @@ impl MarketParticipantsConnector {
             transport,
             Arc::clone(&pool),
             snapshot,
-            true,
             runtime,
         )
         .map_err(MarketParticipantsConnectorError::from_internal)?;
-        let runtime_snapshot_task = gateway
-            .take_snapshot_task()
-            .ok_or(MarketParticipantsConnectorError::RuntimeUnavailable)?;
-        let pool_config_task = gateway
-            .take_pool_config_task()
-            .ok_or(MarketParticipantsConnectorError::RuntimeUnavailable)?;
         // The root owns the venue event boundary from the moment it exists:
         // every commit is announced into it, and an application that installs
         // the root attaches the entity that turns those announcements into
@@ -908,9 +892,7 @@ impl MarketParticipantsConnector {
             cancellations: Mutex::new(AHashMap::new()),
             event_task: Mutex::new(None),
             event_receiver: Mutex::new(Some(event_receiver)),
-            snapshot_projection_task: Mutex::new(snapshot_projection_task),
-            runtime_snapshot_task: Mutex::new(Some(runtime_snapshot_task)),
-            pool_config_task: Mutex::new(Some(pool_config_task)),
+            config_task: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
         Ok(Self { inner })
@@ -960,11 +942,11 @@ impl MarketParticipantsConnector {
 
     /// Returns the runtime snapshot this root's requests resolve against.
     ///
-    /// It is the gateway's own receiver read once: the projection the root publishes is
-    /// the same snapshot every request is resolved with, so an answer about a venue's
+    /// It is the shared projection read once: the snapshot every request is
+    /// resolved with is the one this answers from, so an answer about a venue's
     /// credentials is about the configuration that would serve its next request.
     fn runtime_snapshot(&self) -> Arc<MarketParticipantNetworkSnapshot> {
-        self.inner.gateway.runtime.snapshot.borrow().clone()
+        self.inner.gateway.runtime.snapshot.current()
     }
 
     /// Returns the loaded venues.
@@ -1079,21 +1061,13 @@ impl MarketParticipantsConnector {
         Ok(())
     }
 
-    /// Closes the shared gateway and stops the root-owned projection task.
+    /// Closes the shared gateway and stops the root-owned invalidation task.
     pub async fn shutdown(&self) {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let snapshot_projection_task = self.inner.snapshot_projection_task.lock().take();
-        if let Some(task) = snapshot_projection_task {
-            task.cancel_and_wait().await;
-        }
-        let runtime_snapshot_task = self.inner.runtime_snapshot_task.lock().take();
-        if let Some(task) = runtime_snapshot_task {
-            task.cancel_and_wait().await;
-        }
-        let pool_config_task = self.inner.pool_config_task.lock().take();
-        if let Some(task) = pool_config_task {
+        let config_task = self.inner.config_task.lock().take();
+        if let Some(task) = config_task {
             task.cancel_and_wait().await;
         }
         // The catalogue belongs to this root: shutting the root down drops the
@@ -1105,12 +1079,19 @@ impl MarketParticipantsConnector {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use app_config::{
-        market_participants::{credentials::LongbridgeCredentials, settings::VenueSettings},
+        market_participants::{
+            credentials::LongbridgeCredentials,
+            origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin, OkxRegion},
+            settings::{BinanceOrigins, VenueSettings},
+        },
+        network::ResolvedProxy,
         settings::Config,
     };
+    use app_config_provider::{manager::ConfigManager, notification::ConfigNotification};
+    use gpui_kit::TestAppContext;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::route::VenueRoute,
@@ -1118,11 +1099,17 @@ mod tests {
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
     use smol_str::SmolStr;
-    use tokio::sync::watch;
-    use widget_tokio_runtime::runtime::Runtime;
+    use tokio::time::timeout;
+    use widget_tokio_runtime::{global, runtime::Runtime};
 
     use super::{MarketParticipantsConnector, MarketParticipantsConnectorInput};
-    use crate::runtime::MarketParticipantNetworkSnapshot;
+    use crate::{
+        connection::{
+            Connection, ConnectionKey, ConnectionState, no_response_id,
+            physical::ConnectionProtocol,
+        },
+        runtime::MarketParticipantNetworkSnapshot,
+    };
 
     fn binance() -> VenueId {
         VenueId::Binance
@@ -1138,11 +1125,11 @@ mod tests {
     /// A root with its own catalogue and no venue loaded.
     fn root() -> MarketParticipantsConnector {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-        let (_, receiver) = watch::channel(snapshot);
+        let notification = ConfigNotification::new(snapshot);
         MarketParticipantsConnector::new(
             MarketParticipantsConnectorInput::new(
                 Arc::new(TransportHub::new(TransportPolicy::default())),
-                receiver,
+                notification,
             )
             .with_runtime(Runtime::for_test()),
         )
@@ -1265,11 +1252,11 @@ mod tests {
             access_token: SmolStr::new_static("access-token"),
         };
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config));
-        let (_, receiver) = watch::channel(snapshot);
+        let notification = ConfigNotification::new(snapshot);
         let configured = MarketParticipantsConnector::new(
             MarketParticipantsConnectorInput::new(
                 Arc::new(TransportHub::new(TransportPolicy::default())),
-                receiver,
+                notification,
             )
             .with_runtime(Runtime::for_test()),
         )
@@ -1282,6 +1269,158 @@ mod tests {
 
         unconfigured.shutdown().await;
         configured.shutdown().await;
+    }
+
+    /// How long one publication may take to reach the pool.
+    ///
+    /// The invalidation task is one runtime hop away from the interface, so the bound is
+    /// generous; the wait itself is a poll that returns as soon as the connection it
+    /// watches closes, and this is only what fails a publication that never arrives.
+    const INVALIDATION_BOUND: Duration = Duration::from_secs(5);
+
+    /// The key of one venue connection, carrying what the snapshot serves its scope now.
+    ///
+    /// The origin and the route generation are the transport dimensions invalidation
+    /// re-reads off the published snapshot, so a key built from the installed one is
+    /// exactly what a later publication can move.
+    fn fixture_key(
+        snapshot: &MarketParticipantNetworkSnapshot,
+        route: &VenueRoute,
+        protocol: &ConnectionProtocol,
+    ) -> ConnectionKey {
+        let origins = snapshot
+            .origins(&route.venue, &route.scope)
+            .expect("every venue this build configures resolves its own scopes");
+        ConnectionKey::for_route(
+            origins.websocket,
+            ResolvedProxy::NoProxy,
+            None,
+            route.clone(),
+            snapshot.network_route_generation(&route.venue),
+            protocol,
+        )
+    }
+
+    /// Waits for the invalidation task to close one pooled connection.
+    ///
+    /// The task runs on the application runtime rather than on the executor that owns the
+    /// test, so the wait is a bounded poll on that runtime: it returns as soon as the task
+    /// closed the connection, and names the connection that stayed open when no
+    /// publication reached it.
+    fn wait_for_close(runtime: &Runtime, connection: &Connection, subject: &str) {
+        let closed = runtime.handle().block_on(async {
+            timeout(INVALIDATION_BOUND, async {
+                while !connection.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+        });
+        assert!(
+            closed.is_ok(),
+            "{subject} stayed open after the configuration that no longer serves it was published"
+        );
+    }
+
+    /// The configuration notification has exactly one consumer — the task `install`
+    /// starts — and a publication that moves a venue closes the pooled connections of
+    /// that venue and no other.
+    ///
+    /// Both entries are built from what the installed snapshot serves, so whether each
+    /// survives is decided by the projection the bridge publishes. The first write moves
+    /// OKX's region: the OKX connection closes, which is how the test knows the task
+    /// consumed the publication, and Binance's stays open, which is the negative an
+    /// invalidation that closed every venue would fail. The second write moves Binance's
+    /// stream origin, and Binance's connection closes with it.
+    #[gpui_kit::test]
+    fn installing_the_root_starts_the_task_that_invalidates_connections(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            global::install(cx).expect("the application Tokio runtime installs");
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
+            MarketParticipantsConnector::install(cx)
+                .expect("the root installs over the installed configuration manager");
+        });
+        let connector = cx.update(|cx| cx.global::<MarketParticipantsConnector>().clone());
+        let runtime = cx.update(|cx| global::handle(cx));
+        let snapshot = connector.runtime_snapshot();
+        let binance_venue = binance();
+        let binance_spot = spot();
+        let okx_venue = VenueId::Okx;
+        let okx_spot = VenueRoute::new(
+            okx_venue,
+            VenueScopeId::new("spot").expect("the fixture scope is canonical"),
+        );
+        let protocol = ConnectionProtocol::new(no_response_id);
+        let pool = Arc::clone(&connector.inner.pool);
+        let (binance_connection, okx_connection) = runtime.handle().block_on(async {
+            let binance_connection = pool
+                .get_or_create_fixture(
+                    fixture_key(&snapshot, &binance_spot, &protocol),
+                    ConnectionState::stateless(),
+                )
+                .await;
+            let okx_connection = pool
+                .get_or_create_fixture(
+                    fixture_key(&snapshot, &okx_spot, &protocol),
+                    ConnectionState::stateless(),
+                )
+                .await;
+            (binance_connection, okx_connection)
+        });
+        assert!(
+            !binance_connection.is_closed() && !okx_connection.is_closed(),
+            "both connections are pooled before anything is published"
+        );
+
+        // A write that names OKX's region closes the OKX connection and leaves Binance's:
+        // the task demonstrably consumed the publication, and it invalidated only the
+        // venue the publication moved.
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            let landed = manager.update(
+                |config| config.set_okx_region(&okx_venue, OkxRegion::Europe),
+                cx,
+            );
+            assert!(landed, "the configured OKX row takes a service region");
+        });
+        wait_for_close(
+            &runtime,
+            &okx_connection,
+            "the OKX connection of the moved region",
+        );
+        assert!(
+            !binance_connection.is_closed(),
+            "a configuration write that did not name Binance kept its connection open"
+        );
+
+        // A write that names the venue itself closes that venue's connection.
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            let landed = manager.update(
+                |config| {
+                    config.set_binance_market_origins(
+                        &binance_venue,
+                        BinanceMarket::Spot,
+                        &BinanceOrigins::new(
+                            BinanceMarket::Spot,
+                            BinanceHttpOrigin::Api,
+                            BinanceWebsocketOrigin::StreamAlt,
+                        ),
+                    )
+                },
+                cx,
+            );
+            assert!(
+                landed,
+                "the configured Binance spot market takes its other stream"
+            );
+        });
+        wait_for_close(
+            &runtime,
+            &binance_connection,
+            "the Binance connection of the moved stream origin",
+        );
+
+        runtime.handle().block_on(connector.shutdown());
     }
 }
 #[cfg(test)]
@@ -1297,12 +1436,13 @@ mod venue_connection_tests {
     use std::{sync::Arc, time::Duration};
 
     use app_config::market_participants::fixture::{self, FixtureAddress};
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::route::VenueRoute,
     };
     use network::transport::hub::TransportPolicy;
-    use tokio::{sync::watch, time::timeout};
+    use tokio::time::timeout;
 
     use crate::{
         connector::{MarketParticipantsConnector, VenueLoadError},
@@ -1334,8 +1474,9 @@ mod venue_connection_tests {
 
     /// A root whose catalog wiring is attached and nothing else.
     fn connector() -> MarketParticipantsConnector {
-        let (_, receiver) = watch::channel(Arc::new(MarketParticipantNetworkSnapshot::default()));
-        crate::test_support::connector_over(receiver, TransportPolicy::default()).0
+        let notification =
+            ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::default()));
+        crate::test_support::connector_over(notification, TransportPolicy::default()).0
     }
 
     /// A root whose Hyperliquid published addresses resolve at a local fixture.
@@ -1347,10 +1488,10 @@ mod venue_connection_tests {
     fn discovery_connector(origin: &str, policy: TransportPolicy) -> MarketParticipantsConnector {
         let origin: url::Url = origin.parse().expect("the fixture origin parses");
         let fixture = fixture::venues([(hyperliquid(), FixtureAddress::at(&origin))]);
-        let (_, receiver) = watch::channel(Arc::new(MarketParticipantNetworkSnapshot::new(
-            fixture_config(&fixture),
-        )));
-        crate::test_support::connector_over(receiver, policy).0
+        let notification = ConfigNotification::new(Arc::new(
+            MarketParticipantNetworkSnapshot::new(fixture_config(&fixture)),
+        ));
+        crate::test_support::connector_over(notification, policy).0
     }
 
     /// Registering a venue publishes its declared routes, their catalog source
@@ -2725,12 +2866,13 @@ mod venue_request_tests {
     use std::sync::Arc;
 
     use app_config::market_participants::fixture::{self, FixtureAddress};
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::route::VenueRoute,
     };
     use parking_lot::Mutex;
-    use tokio::{sync::watch, time::timeout};
+    use tokio::time::timeout;
 
     use crate::{
         connector::MarketParticipantsConnector,
@@ -2785,14 +2927,14 @@ mod venue_request_tests {
         )])
     }
 
-    /// A root whose Hyperliquid configuration is the snapshot `receiver` carries.
+    /// A root whose Hyperliquid configuration is the snapshot `notification` carries.
     fn connector(
-        receiver: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
+        notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> (
         MarketParticipantsConnector,
         Arc<crate::catalog::store::Catalog>,
     ) {
-        crate::test_support::connector_over(receiver, crate::test_support::plaintext_policy())
+        crate::test_support::connector_over(notification, crate::test_support::plaintext_policy())
     }
 
     /// One fixture's request log, in arrival order.
@@ -2840,8 +2982,8 @@ mod venue_request_tests {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(fixture_config(
             &fixture,
         )));
-        let (_, receiver) = watch::channel(Arc::clone(&snapshot));
-        let (connector, catalog) = connector(receiver);
+        let notification = ConfigNotification::new(Arc::clone(&snapshot));
+        let (connector, catalog) = connector(notification);
         let hyperliquid = VenueId::Hyperliquid;
         let core_perp =
             VenueScopeId::new(CORE_PERP_SCOPE).expect("the built-in scope identity is canonical");
@@ -2931,8 +3073,8 @@ mod venue_request_tests {
         let initial = Arc::new(MarketParticipantNetworkSnapshot::new(fixture_config(
             &fixture,
         )));
-        let (sender, receiver) = watch::channel(Arc::clone(&initial));
-        let (connector, catalog) = connector(receiver);
+        let notification = ConfigNotification::new(Arc::clone(&initial));
+        let (connector, catalog) = connector(notification.clone());
         let hyperliquid = VenueId::Hyperliquid;
         let deployed = deployed_route();
 
@@ -2990,7 +3132,7 @@ mod venue_request_tests {
                 websocket: socket_b.url().parse().expect("the socket is a URL"),
             },
         )]);
-        sender.send_replace(Arc::new(MarketParticipantNetworkSnapshot::from_previous(
+        notification.publish_for_test(Arc::new(MarketParticipantNetworkSnapshot::from_previous(
             fixture_config(&fixture),
             Some(&initial),
         )));

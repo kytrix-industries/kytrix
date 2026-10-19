@@ -1,21 +1,21 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
+use app_config_provider::notification::ConfigNotification;
 use market_participants_connector::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
     runtime::MarketParticipantNetworkSnapshot,
 };
 use market_participants_model::identifier::VenueId;
 use network::transport::hub::{TransportHub, TransportPolicy};
-use tokio::sync::watch;
 use widget_tokio_runtime::runtime::Runtime;
 
 fn connector() -> MarketParticipantsConnector {
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-    let (_, receiver) = watch::channel(snapshot);
+    let notification = ConfigNotification::new(snapshot);
     MarketParticipantsConnector::new(
         MarketParticipantsConnectorInput::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            receiver,
+            notification,
         )
         .with_runtime(Runtime::for_test()),
     )
@@ -55,12 +55,13 @@ async fn root_constructs_with_an_empty_registry() {
         "a declared venue is not a loaded one"
     );
 
-    // The projection task publishes on the root's own watch channel; a root with
-    // no loaded venue keeps it empty however often that task runs.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // This root was built from typed runtime inputs rather than installed, so it owns no
+    // configuration bridge and no invalidation task: nothing publishes into its snapshot.
+    // With no venue loaded, its venue table is empty either way, and it stays empty across
+    // the reads this test made.
     assert!(
         connector.venues().scopes().is_empty(),
-        "no venue was loaded, so no projection was published"
+        "a root with no loaded venue keeps its own venue table empty"
     );
 
     connector.shutdown().await;

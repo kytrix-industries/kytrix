@@ -31,6 +31,8 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 # The market participants root a test builds from typed runtime inputs names the application
 # settings and the transport hub those inputs are made of.
 app_config.workspace = true
+# The configuration notification the root's snapshot handoff is built from.
+app_config_provider.workspace = true
 network.workspace = true
 # The origin a harness points a venue at is a URL, which is what the venue configuration stores.
 url.workspace = true

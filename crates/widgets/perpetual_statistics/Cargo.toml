@@ -31,6 +31,8 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 # The market participants root a pane reads the route registry from is built from typed
 # runtime inputs, so a view test needs the transport hub those inputs name.
 network = { workspace = true }
+# The configuration notification the root's snapshot handoff is built from.
+app_config_provider.workspace = true
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

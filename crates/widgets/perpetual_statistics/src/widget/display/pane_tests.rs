@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use app_config_provider::notification::ConfigNotification;
 use gpui_kit::{
     App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
     TestAppContext, Window, px, size,
@@ -232,11 +233,11 @@ fn install_connector_with(
     loaded: bool,
 ) {
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-    let (_, receiver) = tokio::sync::watch::channel(snapshot);
+    let notification = ConfigNotification::new(snapshot);
     let connector = MarketParticipantsConnector::new_with_catalog(
         MarketParticipantsConnectorInput::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            receiver,
+            notification,
         )
         .with_runtime(global::handle(cx)),
         Arc::clone(catalog),

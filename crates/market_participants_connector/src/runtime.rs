@@ -168,7 +168,7 @@ struct CredentialRuntime {
 /// outside this crate's boundary.
 #[derive(Clone, Debug)]
 pub struct MarketParticipantNetworkSnapshot {
-    network: app_config::network::Config,
+    network: Arc<app_config::network::Config>,
     venues: BTreeMap<VenueId, VenueSettings>,
     credentials: BTreeMap<VenueId, CredentialRuntime>,
     /// The next counter value this snapshot may hand out.
@@ -189,7 +189,7 @@ impl MarketParticipantNetworkSnapshot {
 
     /// Creates a new snapshot while preserving generations for unchanged values.
     pub fn from_previous(config: Config, previous: Option<&Self>) -> Self {
-        let network = config.network_config();
+        let network = Arc::new(config.network_config());
         let mut snapshot = Self {
             network,
             venues: config.venues,
@@ -232,7 +232,7 @@ impl MarketParticipantNetworkSnapshot {
     }
 
     /// Returns the persisted network configuration.
-    pub fn network(&self) -> &app_config::network::Config {
+    pub fn network(&self) -> &Arc<app_config::network::Config> {
         &self.network
     }
 
@@ -482,9 +482,6 @@ fn binance_market(scope: &str) -> Option<BinanceMarket> {
 fn published_scope(name: &str) -> VenueScopeId {
     VenueScopeId::new(name).expect("a statically published scope name is canonical")
 }
-
-pub type MarketParticipantNetworkSnapshotReceiver =
-    tokio::sync::watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>;
 
 #[cfg(test)]
 mod tests {

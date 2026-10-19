@@ -1277,6 +1277,7 @@ name = "candlestick"
 version = "0.0.2"
 dependencies = [
  "app_config",
+ "app_config_provider",
  "base_ui",
  "futures",
  "gpui-kit",
@@ -5523,6 +5524,7 @@ version = "0.0.2"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "gpui-kit",
  "i18n",
@@ -6645,6 +6647,7 @@ version = "0.0.2"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "futures",
  "gpui-kit",
@@ -6807,6 +6810,7 @@ name = "perpetual_statistics"
 version = "0.0.2"
 dependencies = [
  "app_config",
+ "app_config_provider",
  "base_ui",
  "gpui-kit",
  "i18n",

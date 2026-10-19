@@ -1486,6 +1486,7 @@ mod tests {
     };
 
     use app_config::widget::VersionedWidgetConfig;
+    use app_config_provider::notification::ConfigNotification;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use gpui_kit::{
         AppContext, Entity, Modifiers, Render, TestAppContext, VisualTestContext, WeakEntity,
@@ -1812,11 +1813,11 @@ mod tests {
         loaded: bool,
     ) {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-        let (_, receiver) = tokio::sync::watch::channel(snapshot);
+        let notification = ConfigNotification::new(snapshot);
         let connector = MarketParticipantsConnector::new_with_catalog(
             MarketParticipantsConnectorInput::new(
                 Arc::new(TransportHub::new(TransportPolicy::default())),
-                receiver,
+                notification,
             )
             .with_runtime(global::handle(cx)),
             Arc::clone(catalog),

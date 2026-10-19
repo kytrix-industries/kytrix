@@ -3903,6 +3903,7 @@ mod tests {
     use std::sync::Arc;
 
     use app_config::{market_participants::origins::OriginPair, network::ResolvedProxy};
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         identifier::{IdentifierValue, VenueId, VenueScopeId, WalletAddress},
         listing::route::VenueRoute,
@@ -4018,12 +4019,12 @@ mod tests {
         scope: &str,
         snapshot: &MarketParticipantNetworkSnapshot,
         proxy: ResolvedProxy,
-        receiver: tokio::sync::watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
+        notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> ExecutionContext {
         let resolved = snapshot.network_route_generation(&route(scope).venue);
         fixture_context(identity(scope, CapabilityId::WalletMonitor), None)
             .with_proxy(proxy, resolved)
-            .with_runtime_receiver(receiver)
+            .with_runtime(notification)
     }
 
     /// One public wallet read of one scope, as the pane issues it.
@@ -4054,8 +4055,13 @@ mod tests {
     #[test]
     fn a_connection_is_dialled_at_the_stream_address_the_settings_resolve() {
         let snapshot = MarketParticipantNetworkSnapshot::default();
-        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new(snapshot.clone()));
-        let context = wallet_context(CORE_PERP_SCOPE, &snapshot, ResolvedProxy::NoProxy, receiver);
+        let notification = ConfigNotification::new(Arc::new(snapshot.clone()));
+        let context = wallet_context(
+            CORE_PERP_SCOPE,
+            &snapshot,
+            ResolvedProxy::NoProxy,
+            notification,
+        );
 
         assert_eq!(
             key_of(CORE_PERP_SCOPE, &context).endpoint.as_str(),
@@ -4073,13 +4079,13 @@ mod tests {
     #[test]
     fn a_wallet_scope_dialled_through_its_own_proxy_keeps_its_own_connection() {
         let snapshot = MarketParticipantNetworkSnapshot::default();
-        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new(snapshot.clone()));
+        let notification = ConfigNotification::new(Arc::new(snapshot.clone()));
 
         let spot = wallet_context(
             CORE_SPOT_SCOPE,
             &snapshot,
             ResolvedProxy::NoProxy,
-            receiver.clone(),
+            notification.clone(),
         );
         let proxied = wallet_context(
             CORE_PERP_SCOPE,
@@ -4090,7 +4096,7 @@ mod tests {
                 credentials: None,
                 resolve_dns_at_remote: true,
             },
-            receiver,
+            notification,
         );
 
         assert_ne!(
@@ -4109,9 +4115,14 @@ mod tests {
     #[test]
     fn every_wallet_scope_of_the_venue_shares_one_connection_key() {
         let snapshot = MarketParticipantNetworkSnapshot::default();
-        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new(snapshot.clone()));
+        let notification = ConfigNotification::new(Arc::new(snapshot.clone()));
         let context = |scope: &str| {
-            wallet_context(scope, &snapshot, ResolvedProxy::NoProxy, receiver.clone())
+            wallet_context(
+                scope,
+                &snapshot,
+                ResolvedProxy::NoProxy,
+                notification.clone(),
+            )
         };
 
         let spot = context(CORE_SPOT_SCOPE);
@@ -4155,12 +4166,12 @@ mod tests {
     #[test]
     fn market_data_scopes_keep_their_own_connection_keys() {
         let snapshot = MarketParticipantNetworkSnapshot::default();
-        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new(snapshot.clone()));
+        let notification = ConfigNotification::new(Arc::new(snapshot.clone()));
         let market_context = |scope: &str| {
             let resolved = snapshot.network_route_generation(&route(scope).venue);
             fixture_context(identity(scope, CapabilityId::Tickers), None)
                 .with_proxy(ResolvedProxy::NoProxy, resolved)
-                .with_runtime_receiver(receiver.clone())
+                .with_runtime(notification.clone())
         };
 
         let spot = key_of(CORE_SPOT_SCOPE, &market_context(CORE_SPOT_SCOPE));
@@ -4174,8 +4185,13 @@ mod tests {
     #[test]
     fn a_folded_wallet_key_names_the_canonical_wallet_scope() {
         let snapshot = MarketParticipantNetworkSnapshot::default();
-        let (_sender, receiver) = tokio::sync::watch::channel(Arc::new(snapshot.clone()));
-        let context = wallet_context("perp-dex/xyz", &snapshot, ResolvedProxy::NoProxy, receiver);
+        let notification = ConfigNotification::new(Arc::new(snapshot.clone()));
+        let context = wallet_context(
+            "perp-dex/xyz",
+            &snapshot,
+            ResolvedProxy::NoProxy,
+            notification,
+        );
         let key = key_of("perp-dex/xyz", &context);
 
         assert_eq!(key.route.venue, VenueId::Hyperliquid);
@@ -4983,7 +4999,7 @@ mod tests {
         }));
         let pool = Arc::new(ConnectionPool::with_transport(transport));
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
-        let (_sender, receiver) = tokio::sync::watch::channel(snapshot);
+        let notification = ConfigNotification::new(snapshot);
         ExecutionContext::new(
             identity,
             OriginPair {
@@ -4993,7 +5009,7 @@ mod tests {
             reqwest::Client::new(),
             pool,
         )
-        .with_runtime_receiver(receiver)
+        .with_runtime(notification)
     }
 
     /// A wallet fill read is one venue-wide request decoded against every monitored route.

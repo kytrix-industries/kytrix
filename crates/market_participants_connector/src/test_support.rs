@@ -21,6 +21,8 @@ use ahash::AHashSet;
 use app_config::{market_participants::fixture::FixtureInstallation, settings::Config};
 #[cfg(test)]
 use app_config::{market_participants::origins::OriginPair, network::ResolvedProxy};
+#[cfg(any(test, feature = "test-support"))]
+use app_config_provider::notification::ConfigNotification;
 use market_participants_model::identifier::VenueId;
 #[cfg(test)]
 use network::transport::http::HttpClientClass;
@@ -82,12 +84,12 @@ pub fn install_root(cx: &mut gpui_kit::App, catalog: Arc<Catalog>) -> MarketPart
 
 #[cfg(any(test, feature = "test-support"))]
 fn root_over_with(catalog: Arc<Catalog>, runtime: Runtime) -> MarketParticipantsConnector {
-    let (_sender, receiver) =
-        tokio::sync::watch::channel(Arc::new(MarketParticipantNetworkSnapshot::default()));
+    let notification =
+        ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::default()));
     MarketParticipantsConnector::new_with_catalog(
         MarketParticipantsConnectorInput::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            receiver,
+            notification,
         )
         .with_runtime(runtime),
         catalog,
@@ -121,7 +123,7 @@ pub(crate) fn plaintext_policy() -> TransportPolicy {
     }
 }
 
-/// A fixture root over the snapshot `receiver` carries, with the catalog wiring
+/// A fixture root over the snapshot `notification` carries, with the catalog wiring
 /// attached.
 ///
 /// This is the one place a test root is built: what varies between the fixtures of
@@ -131,12 +133,12 @@ pub(crate) fn plaintext_policy() -> TransportPolicy {
 /// the real gateway, registry, commit and request path.
 #[cfg(test)]
 pub(crate) fn connector_over(
-    receiver: tokio::sync::watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
+    notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
     policy: TransportPolicy,
 ) -> (MarketParticipantsConnector, Arc<Catalog>) {
     let catalog = Arc::new(Catalog::new());
     let connector = MarketParticipantsConnector::new_with_catalog(
-        MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), receiver)
+        MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), notification)
             .with_runtime(Runtime::for_test()),
         Arc::clone(&catalog),
     )

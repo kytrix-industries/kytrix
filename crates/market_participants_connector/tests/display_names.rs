@@ -31,6 +31,7 @@
 use std::{sync::Arc, time::Duration};
 
 use app_config::market_participants::fixture::{self, FixtureAddress};
+use app_config_provider::notification::ConfigNotification;
 use market_participants_connector::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
@@ -50,7 +51,6 @@ use smol_str::SmolStr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::watch,
     task::JoinHandle,
     time::timeout,
 };
@@ -264,7 +264,7 @@ fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(fixture_config(
         &fixture,
     )));
-    let (_, receiver) = watch::channel(snapshot);
+    let notification = ConfigNotification::new(snapshot);
     // The fixture speaks plain HTTP on a loopback socket, so the transport is
     // built with the plaintext policy that a test owns; every other transport
     // decision is the production one, and the venue requests below go through the
@@ -275,7 +275,7 @@ fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector
     };
     let catalog = Arc::new(Catalog::new());
     let connector = MarketParticipantsConnector::new_with_catalog(
-        MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), receiver)
+        MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), notification)
             .with_runtime(Runtime::for_test()),
         Arc::clone(&catalog),
     )

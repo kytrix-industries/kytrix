@@ -13,6 +13,7 @@ use app_config::{
     network::{NetworkRouteGeneration, ResolvedProxy},
     settings::Config,
 };
+use app_config_provider::notification::ConfigNotification;
 use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
     listing::route::VenueRoute,
@@ -23,7 +24,6 @@ use network::transport::{
     hub::{TransportHub, TransportPolicy},
 };
 use smol_str::SmolStr;
-use tokio::sync::watch;
 
 use super::venue::LongbridgeFixture;
 use crate::{
@@ -52,7 +52,7 @@ pub(crate) fn execution(
     };
     settings.credentials = credentials;
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config));
-    let (_, receiver) = watch::channel(Arc::clone(&snapshot));
+    let notification = ConfigNotification::new(Arc::clone(&snapshot));
 
     let transport = Arc::new(TransportHub::new(TransportPolicy {
         allow_plaintext: true,
@@ -72,7 +72,7 @@ pub(crate) fn execution(
     )
     .with_proxy(ResolvedProxy::NoProxy, NetworkRouteGeneration::default())
     .with_credential_generation(snapshot.credential_generation(&VenueId::Longbridge, &route.scope))
-    .with_runtime_receiver(receiver)
+    .with_runtime(notification)
 }
 
 /// One complete Longbridge credential set.

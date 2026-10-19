@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use network::transport::hub::TransportHub;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::physical::{ConnectionConnectOptions, ConnectionProtocol};
@@ -88,8 +88,14 @@ impl ConnectionPool {
         self.transport.cancellation().child_token()
     }
 
+    /// Returns the pool's entry for one fixture connection, inserting one on a miss.
+    ///
+    /// A fixture connection dials nothing, so a test that drives what the pool does to a
+    /// pooled entry — replacement, invalidation — needs no socket behind it. It is
+    /// crate-visible because the root's own tests drive the invalidation task `install`
+    /// starts against the pool `install` built, and that pool is not this module's.
     #[cfg(test)]
-    async fn get_or_create_fixture(
+    pub(crate) async fn get_or_create_fixture(
         &self,
         key: ConnectionKey,
         state: ConnectionState,
@@ -305,7 +311,7 @@ impl ConnectionPool {
     /// Returns the connection a key is answered by, if the pool holds one.
     ///
     /// Health is deliberately not part of the answer. It is the same dial-time judgement
-    /// [`Self::watch_config_changes`] refuses to close on, asked at the other end: a
+    /// [`Self::invalidate_stale`] refuses to close on, asked at the other end: a
     /// connection that is mid-reconnect is still the one its key is answered by, so asking
     /// here would answer nothing for a key the pool holds. A caller that may not use such a
     /// connection asks for itself, which is what the adapter reusing a pooled socket does
@@ -338,16 +344,13 @@ impl ConnectionPool {
         connection
     }
 
-    /// Watches immutable configuration snapshots and closes every connection the
-    /// new snapshot invalidates.
+    /// Closes every connection the new snapshot no longer serves.
     ///
     /// A key is stale when any dimension it was built with no longer matches the
     /// snapshot: the proxy decision of its own venue, the origin that venue's
     /// settings give its scope now, or the credential generation of that scope —
     /// each read back by the same venue and scope the key names, so no connection
     /// survives on a venue-level guess, and no connection dies on another venue's.
-    /// A connection with no route at all is a key the runtime never mints and is
-    /// closed rather than kept.
     ///
     /// Health is deliberately not a fourth dimension. It is a dial-time judgement,
     /// made where a connection is handed out — `connect_or_create_*` refuses an
@@ -360,37 +363,27 @@ impl ConnectionPool {
     /// A configuration write for one venue would therefore tear down the
     /// recovering sockets of every other venue, which is exactly what a snapshot
     /// of one venue's settings must not do.
-    pub async fn watch_config_changes(
-        &self,
-        mut config_changes: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
-    ) -> Result<(), MarketParticipantError> {
-        while config_changes.changed().await.is_ok() {
-            let config = config_changes.borrow_and_update().clone();
-            // An origin is stale when the venue no longer resolves the one the
-            // connection was dialled on: a reconfiguration moves the socket, and a
-            // path the adapter appended does not.
-            let stale = self
-                .connections
-                .read()
-                .await
-                .keys()
-                .filter_map(|key| {
-                    let route = &key.route;
-                    let network_route_generation = config.network_route_generation(&route.venue);
-                    let origin_stale = !config.serves(&route.venue, &route.scope, &key.endpoint);
-                    let credential_generation =
-                        config.credential_generation(&route.venue, &route.scope);
-                    (key.network_route_generation != network_route_generation
-                        || origin_stale
-                        || key.credential_generation != credential_generation)
-                        .then(|| key.clone())
-                })
-                .collect::<Vec<_>>();
-            for key in stale {
-                self.remove(&key).await;
-            }
+    pub async fn invalidate_stale(&self, config: &MarketParticipantNetworkSnapshot) {
+        let stale = self
+            .connections
+            .read()
+            .await
+            .keys()
+            .filter_map(|key| {
+                let route = &key.route;
+                let network_route_generation = config.network_route_generation(&route.venue);
+                let origin_stale = !config.serves(&route.venue, &route.scope, &key.endpoint);
+                let credential_generation =
+                    config.credential_generation(&route.venue, &route.scope);
+                (key.network_route_generation != network_route_generation
+                    || origin_stale
+                    || key.credential_generation != credential_generation)
+                    .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in stale {
+            self.remove(&key).await;
         }
-        Err(MarketParticipantError::ServiceClosed)
     }
 }
 
@@ -564,21 +557,6 @@ mod tests {
             .await
     }
 
-    /// Watches `pool` for configuration changes and answers the task that does.
-    fn watcher(
-        pool: &ConnectionPool,
-        initial: &MarketParticipantNetworkSnapshot,
-    ) -> (
-        tokio::sync::watch::Sender<Arc<MarketParticipantNetworkSnapshot>>,
-        tokio::task::JoinHandle<Result<(), crate::error::MarketParticipantError>>,
-    ) {
-        let watcher_pool = pool.clone();
-        let (sender, config_receiver) = tokio::sync::watch::channel(Arc::new(initial.clone()));
-        let watcher =
-            tokio::spawn(async move { watcher_pool.watch_config_changes(config_receiver).await });
-        (sender, watcher)
-    }
-
     #[tokio::test]
     async fn pool_reuses_healthy_and_replaces_closed_connections() {
         let pool = pool();
@@ -656,42 +634,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_watcher_closes_only_connections_for_changed_venues() {
+    async fn invalidate_stale_closes_only_connections_for_changed_venues() {
         let mut config = Config::default();
         config.set_network_generations(generations([(venue("binance"), 41)]));
         let initial = MarketParticipantNetworkSnapshot::new(config.clone());
         let pool = pool();
         let binance = fixture_connection(&pool, &initial, &binance_route()).await;
         let okx = fixture_connection(&pool, &initial, &okx_route()).await;
-        let (sender, watcher) = watcher(&pool, &initial);
 
         // The Binance venue's proxy decision moves; the OKX venue's does not.
         config.set_network_generations(generations([(venue("binance"), 77)]));
         let updated = MarketParticipantNetworkSnapshot::from_previous(config, Some(&initial));
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(1), async {
-            while !binance.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a changed venue should be closed");
+        assert!(binance.is_closed(), "a changed venue should be closed");
         assert!(
             !okx.is_closed(),
             "another venue keeps its connection: generations are per venue"
         );
-        watcher.abort();
-        let _ = watcher.await;
     }
 
     #[tokio::test]
-    async fn config_watcher_closes_only_the_venue_that_rotated() {
+    async fn invalidate_stale_closes_only_the_venue_that_rotated() {
         let initial = MarketParticipantNetworkSnapshot::new(Config::default());
         let pool = pool();
         let binance = fixture_connection(&pool, &initial, &binance_route()).await;
         let okx = fixture_connection(&pool, &initial, &okx_route()).await;
-        let (sender, watcher) = watcher(&pool, &initial);
 
         // Only the OKX venue moves to another address.
         let installation = fixture::venues([(venue("okx"), fixture_address(9077))]);
@@ -699,18 +667,13 @@ mod tests {
             fixture_config(&installation),
             Some(&initial),
         );
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(1), async {
-            while !okx.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a rotated venue origin should close the connection of that venue");
+        assert!(
+            okx.is_closed(),
+            "a rotated venue origin should close the connection of that venue"
+        );
         assert!(!binance.is_closed(), "another venue keeps its connection");
-        watcher.abort();
-        let _ = watcher.await;
     }
 
     /// A connection is served by the origin of its own role, and only by it.
@@ -722,7 +685,7 @@ mod tests {
     /// exactly this reconfiguration — which is what this pins. Both choices are ones
     /// the venue publishes, so the move is one this build can make.
     #[tokio::test]
-    async fn config_watcher_closes_a_socket_whose_own_role_moved() {
+    async fn invalidate_stale_closes_a_socket_whose_own_role_moved() {
         let route = binance_route();
         let initial = MarketParticipantNetworkSnapshot::new(Config::default());
         let pool = pool();
@@ -744,13 +707,6 @@ mod tests {
                 .expect("the fixture path joins"),
         )
         .await;
-        let (sender, watcher) = watcher(&pool, &initial);
-        // The watcher is on the update before the new snapshot is published, and both
-        // connections are open before it: the assertions below would otherwise be met by
-        // connections that never existed.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
         assert!(
             !socket.is_closed(),
             "the fixture socket is open before the venue's stream host moves"
@@ -770,21 +726,16 @@ mod tests {
             ),
         ));
         let updated = MarketParticipantNetworkSnapshot::from_previous(moved, Some(&initial));
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(5), async {
-            while !socket.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a WebSocket whose own origin moved is closed");
+        assert!(
+            socket.is_closed(),
+            "a WebSocket whose own origin moved is closed"
+        );
         assert!(
             !rest.is_closed(),
             "a request connection whose own origin stayed is kept"
         );
-        watcher.abort();
-        let _ = watcher.await;
     }
 
     /// Opens one fixture connection dialled on `endpoint` for `route`.
@@ -809,11 +760,11 @@ mod tests {
     }
 
     /// A read-only socket that is mid-reconnect is not what a configuration write is
-    /// about, so the watcher leaves it alone: its key did not move, and closing it here
+    /// about, so invalidation leaves it alone: its key did not move, and closing it here
     /// would end the streams waiting for it to come back instead of letting its own
     /// reconnect answer them.
     #[tokio::test]
-    async fn config_watcher_keeps_an_unhealthy_connection_of_a_venue_that_did_not_change() {
+    async fn invalidate_stale_keeps_an_unhealthy_connection_of_a_venue_that_did_not_change() {
         let mut config = Config::default();
         config.set_network_generations(generations([(venue("binance"), 41)]));
         let initial = MarketParticipantNetworkSnapshot::new(config.clone());
@@ -827,29 +778,20 @@ mod tests {
             !okx.is_healthy(),
             "the fixture okx connection is unhealthy before the publication"
         );
-        let (sender, watcher) = watcher(&pool, &initial);
 
         // The Binance venue's proxy decision moves; the OKX venue's does not.
         config.set_network_generations(generations([(venue("binance"), 77)]));
         let updated = MarketParticipantNetworkSnapshot::from_previous(config, Some(&initial));
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(1), async {
-            while !binance.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a changed venue should be closed");
+        assert!(binance.is_closed(), "a changed venue should be closed");
         assert!(
             !okx.is_closed(),
             "an unhealthy connection of an unchanged venue keeps recovering: health is a dial-time judgement, never an invalidation"
         );
-        watcher.abort();
-        let _ = watcher.await;
     }
 
-    /// Health is not what the watcher closes on, so a key that did move is closed whether
+    /// Health is not what invalidation closes on, so a key that did move is closed whether
     /// the connection behind it is healthy or not: an unhealthy connection whose own
     /// venue was reconfigured is one the next dial replaces, and leaving it pooled would
     /// have the pool keep answering the stale key with it.
@@ -859,7 +801,7 @@ mod tests {
     /// expectations, so this pins that the removal above took the health clause with it
     /// rather than the whole close.
     #[tokio::test]
-    async fn config_watcher_closes_a_changed_venues_unhealthy_connection() {
+    async fn invalidate_stale_closes_a_changed_venues_unhealthy_connection() {
         let mut config = Config::default();
         config.set_network_generations(generations([(venue("binance"), 41)]));
         let initial = MarketParticipantNetworkSnapshot::new(config.clone());
@@ -867,30 +809,24 @@ mod tests {
         let binance = fixture_connection(&pool, &initial, &binance_route()).await;
         let okx = fixture_connection(&pool, &initial, &okx_route()).await;
         binance.mark_io_error();
-        let (sender, watcher) = watcher(&pool, &initial);
 
         config.set_network_generations(generations([(venue("binance"), 77)]));
         let updated = MarketParticipantNetworkSnapshot::from_previous(config, Some(&initial));
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(1), async {
-            while !binance.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a changed venue is closed even while its connection is unhealthy");
+        assert!(
+            binance.is_closed(),
+            "a changed venue is closed even while its connection is unhealthy"
+        );
         assert!(!okx.is_closed(), "another venue keeps its connection");
-        watcher.abort();
-        let _ = watcher.await;
     }
 
     /// A connection that is replaced in the pool while a subscriber is reading it stays
     /// open: its subscription outlives the socket it was dialled on, so the replacement
     /// retires it instead of ending the stream under the subscriber.
     ///
-    /// The retired connection is then out of the pool and no longer reachable by the
-    /// watcher; it ends by its own lifecycle — idle collection once its last
+    /// The retired connection is then out of the pool and no longer reachable by
+    /// invalidation; it ends by its own lifecycle — idle collection once its last
     /// subscription drains, or a reconnect policy that gives up. That end is not
     /// asserted here: the idle window is a minute and the fixture's socket actor is the
     /// one that would collect it, so what a unit fixture can pin is the state the pool
@@ -1048,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_watcher_closes_authenticated_connections_when_credentials_change() {
+    async fn invalidate_stale_closes_authenticated_connections_when_credentials_change() {
         let mut config = Config::default();
         binance_credentials(&mut config, "api-a", "private-a");
         let initial = MarketParticipantNetworkSnapshot::new(config.clone());
@@ -1064,21 +1000,15 @@ mod tests {
         let connection = pool
             .get_or_create_fixture(key, ConnectionState::stateful())
             .await;
-        let (sender, watcher) = watcher(&pool, &initial);
 
         binance_credentials(&mut config, "api-b", "private-b");
         let updated = MarketParticipantNetworkSnapshot::from_previous(config, Some(&initial));
-        sender.send_replace(Arc::new(updated));
+        pool.invalidate_stale(&updated).await;
 
-        timeout(Duration::from_secs(1), async {
-            while !connection.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("credential changes should close the old authenticated connection");
-        watcher.abort();
-        let _ = watcher.await;
+        assert!(
+            connection.is_closed(),
+            "credential changes should close the old authenticated connection"
+        );
     }
 
     /// A credential generation belongs to the venue whose credentials it tracks, so

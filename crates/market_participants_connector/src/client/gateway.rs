@@ -12,6 +12,7 @@ use std::sync::Arc;
 use app_config::market_participants::{
     error::MarketParticipantsConfigError, settings::VenueSettings,
 };
+use app_config_provider::notification::ConfigNotification;
 use market_participants_model::{
     identifier::MarketParticipantAccountId, listing::route::VenueRoute,
 };
@@ -19,9 +20,9 @@ use network::{
     proxy::ProxyResolver,
     transport::{http::HttpClientClass, hub::TransportHub},
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use smol_str::{SmolStr, format_smolstr};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::task::JoinHandle;
 use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
@@ -125,15 +126,14 @@ pub struct MarketParticipantRuntime {
     /// own, so the runtime travels with the gateway instead of being discovered
     /// on the thread that happens to be executing.
     pub runtime: Runtime,
-    pub snapshot: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
-    snapshot_task: Arc<Mutex<Option<OwnedTask>>>,
+    pub snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
 }
 
 impl MarketParticipantRuntime {
     pub fn from_shared_resources(
         transport: Arc<TransportHub>,
         connection_pool: Arc<ConnectionPool>,
-        snapshot: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
+        snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
         runtime: Runtime,
     ) -> Result<Self, MarketParticipantError> {
         if !Arc::ptr_eq(&transport, &connection_pool.transport()) {
@@ -142,35 +142,20 @@ impl MarketParticipantRuntime {
                     .into(),
             ));
         }
-        let network_snapshot = Arc::new(snapshot.borrow().network().clone());
-        let (network_sender, network_receiver) = watch::channel(network_snapshot);
-        let mut snapshot_changes = snapshot.clone();
-        let snapshot_task = OwnedTask::new(runtime.run(async move {
-            while snapshot_changes.changed().await.is_ok() {
-                let _ = network_sender
-                    .send_replace(Arc::new(snapshot_changes.borrow().network().clone()));
-            }
+        let resolver_snapshot = snapshot.clone();
+        let proxy_resolver = ProxyResolver::new(Arc::new(move || {
+            Arc::clone(resolver_snapshot.current().network())
         }));
-        let proxy_resolver = ProxyResolver::new(network_receiver);
         Ok(Self {
             connection_pool,
             transport,
             proxy_resolver,
             runtime,
             snapshot,
-            snapshot_task: Arc::new(Mutex::new(Some(snapshot_task))),
         })
     }
 
-    fn take_snapshot_task(&self) -> Option<OwnedTask> {
-        self.snapshot_task.lock().take()
-    }
-
     pub async fn shutdown(&self) {
-        let snapshot_task = self.take_snapshot_task();
-        if let Some(task) = snapshot_task {
-            task.cancel_and_wait().await;
-        }
         self.connection_pool.close_all().await;
     }
 }
@@ -181,7 +166,6 @@ pub struct MarketParticipantGateway {
     pub router: Arc<CapabilityRouter>,
     pub runtime: MarketParticipantRuntime,
     registry: Arc<RwLock<VenueRouteRegistry>>,
-    pool_config_task: Arc<Mutex<Option<OwnedTask>>>,
 }
 
 impl MarketParticipantGateway {
@@ -215,31 +199,20 @@ impl MarketParticipantGateway {
         router: CapabilityRouter,
         transport: Arc<TransportHub>,
         connection_pool: Arc<ConnectionPool>,
-        snapshot: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
-        spawn_pool_watcher: bool,
+        snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
         runtime: Runtime,
     ) -> Result<Self, MarketParticipantError> {
-        let application = runtime.clone();
         let runtime = MarketParticipantRuntime::from_shared_resources(
             transport,
             Arc::clone(&connection_pool),
-            snapshot.clone(),
+            snapshot,
             runtime,
         )?;
         let registry = Arc::new(RwLock::new(VenueRouteRegistry::new()));
-        let pool_config_task = if spawn_pool_watcher {
-            let pool = Arc::clone(&connection_pool);
-            Some(OwnedTask::new(application.run(async move {
-                let _ = pool.watch_config_changes(snapshot).await;
-            })))
-        } else {
-            None
-        };
         Ok(Self {
             router: Arc::new(router),
             runtime,
             registry,
-            pool_config_task: Arc::new(Mutex::new(pool_config_task)),
         })
     }
 
@@ -275,20 +248,8 @@ impl MarketParticipantGateway {
         self.registry.read().plan_venue_routes(venue, descriptors)
     }
 
-    pub(crate) fn take_snapshot_task(&self) -> Option<OwnedTask> {
-        self.runtime.take_snapshot_task()
-    }
-
-    pub(crate) fn take_pool_config_task(&self) -> Option<OwnedTask> {
-        self.pool_config_task.lock().take()
-    }
-
     /// Closes every connection owned by this gateway.
     pub async fn shutdown(&self) {
-        let pool_config_task = self.pool_config_task.lock().take();
-        if let Some(task) = pool_config_task {
-            task.cancel_and_wait().await;
-        }
         self.runtime.shutdown().await;
     }
 
@@ -356,7 +317,7 @@ impl MarketParticipantGateway {
         &self,
         venue: &market_participants_model::identifier::VenueId,
     ) -> Result<VenueReading, MarketParticipantError> {
-        let snapshot = self.runtime.snapshot.borrow().clone();
+        let snapshot = self.runtime.snapshot.current();
         let origins = snapshot
             .venue_settings(venue)
             .and_then(|settings| settings.origins(settings.primary_scope()))
@@ -528,7 +489,7 @@ impl MarketParticipantGateway {
         metadata: Option<Arc<VenueMetadata>>,
     ) -> Result<ExecutionContext, MarketParticipantError> {
         let route = identity.route();
-        let snapshot = self.runtime.snapshot.borrow().clone();
+        let snapshot = self.runtime.snapshot.current();
         // The origins of a request are its venue's connection settings: the scope's
         // own pair where the venue publishes the scope, and the pair the venue
         // reaches a scope it deploys through — a deployed perpetual DEX is reached
@@ -566,7 +527,7 @@ impl MarketParticipantGateway {
         .with_credential_generation(credential_generation)
         .with_venue_metadata(metadata);
         let context = authenticate(&snapshot, context, capability, classified)?;
-        Ok(context.with_runtime_receiver(self.runtime.snapshot.clone()))
+        Ok(context.with_runtime(self.runtime.snapshot.clone()))
     }
 }
 
@@ -764,6 +725,7 @@ mod tests {
         },
         settings::Config,
     };
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::{
@@ -774,7 +736,6 @@ mod tests {
         routing::{CapabilityId, IdentifierNormalizationRule},
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use tokio::sync::watch;
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::{Admission, MarketParticipantGateway, credential_authentication};
@@ -898,7 +859,7 @@ mod tests {
         async fn new(status: ListingStatus, rules: Vec<IdentifierNormalizationRule>) -> Self {
             let fixture = fixture::venues([(route().venue, FixtureAddress::at(&fixture_origin()))]);
             let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(configured(&fixture)));
-            let (_, receiver) = watch::channel(Arc::clone(&snapshot));
+            let notification = ConfigNotification::new(Arc::clone(&snapshot));
             let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
             let pool = Arc::new(ConnectionPool::with_transport(Arc::clone(&transport)));
             let router = MarketParticipantGateway::adapter_router(&snapshot)
@@ -907,8 +868,7 @@ mod tests {
                 router,
                 transport,
                 pool,
-                receiver,
-                false,
+                notification,
                 Runtime::for_test(),
             )
             .expect("the fixture gateway builds");

@@ -634,6 +634,7 @@ mod tests {
         network::ProxyRoute,
         settings::Config,
     };
+    use app_config_provider::notification::ConfigNotification;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use gpui_kit::{
         AppContext as _, Context, Entity, IntoElement, Modifiers, MouseButton, ParentElement as _,
@@ -863,7 +864,7 @@ mod tests {
             settings.credentials = credentials;
         }
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config.clone()));
-        let (_, unreachable) = tokio::sync::watch::channel(snapshot);
+        let notification = ConfigNotification::new(snapshot);
         // A fixture speaks plain HTTP on a loopback socket, which the transport has to be told
         // is allowed; which origin a request addresses is the venue configuration's answer, and
         // the fixture asserts that every venue this build speaks resolves to a loopback address.
@@ -872,8 +873,11 @@ mod tests {
             extra_root_certificates: Vec::new(),
         };
         let connector = MarketParticipantsConnector::new_with_catalog(
-            MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), unreachable)
-                .with_runtime(Runtime::for_test()),
+            MarketParticipantsConnectorInput::new(
+                Arc::new(TransportHub::new(policy)),
+                notification,
+            )
+            .with_runtime(Runtime::for_test()),
             Arc::new(Catalog::new()),
         )
         .expect("the market participants root builds from typed runtime inputs");

@@ -20,6 +20,7 @@ use app_config::{
     network::{Config as NetworkConfig, ProxyAuthorizationConfig, ProxyConfig, ProxyRoute},
     settings::Config,
 };
+use app_config_provider::notification::ConfigNotification;
 use market_participants_connector::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
@@ -32,7 +33,7 @@ use market_participants_model::{
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
 use smol_str::SmolStr;
-use tokio::{sync::watch, time::timeout};
+use tokio::time::timeout;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
@@ -98,10 +99,10 @@ fn mainnet_input() -> MarketParticipantsConnectorInput {
     config.proxy_default = network.proxy_default;
     config.proxy_applications = network.proxy_applications;
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config));
-    let (_, receiver) = watch::channel(snapshot);
+    let notification = ConfigNotification::new(snapshot);
     MarketParticipantsConnectorInput::new(
         Arc::new(TransportHub::new(TransportPolicy::default())),
-        receiver,
+        notification,
     )
     .with_runtime(Runtime::for_test())
 }

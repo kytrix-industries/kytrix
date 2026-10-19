@@ -24,6 +24,7 @@ use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig, ProxyRoute},
     settings::Config,
 };
+use app_config_provider::notification::ConfigNotification;
 use market_participants_connector::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
@@ -34,7 +35,7 @@ use market_participants_connector::{
 use market_participants_model::{identifier::VenueId, listing::route::VenueRoute};
 use network::transport::hub::{TransportHub, TransportPolicy};
 use smol_str::SmolStr;
-use tokio::{sync::watch, time::timeout};
+use tokio::time::timeout;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
@@ -409,12 +410,12 @@ fn live_connector(case: &str, values: &Credentials) -> (MarketParticipantsConnec
     config.proxies = live_proxies();
     config.proxy_default = ProxyRoute::named(PROXY_NAME);
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config));
-    let (_, receiver) = watch::channel(snapshot);
+    let notification = ConfigNotification::new(snapshot);
     let catalog = Arc::new(Catalog::new());
     let connector = MarketParticipantsConnector::new_with_catalog(
         MarketParticipantsConnectorInput::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            receiver,
+            notification,
         )
         .with_runtime(Runtime::for_test()),
         Arc::clone(&catalog),

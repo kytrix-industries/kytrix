@@ -19,12 +19,12 @@ use app_config::{
     market_participants::origins::OriginPair,
     network::{NetworkRouteGeneration, ResolvedProxy},
 };
+use app_config_provider::notification::ConfigNotification;
 use market_participants_model::{
     identifier::VenueId, listing::route::VenueRoute, routing::CapabilityId,
 };
 use reqwest::Client;
 use smol_str::SmolStr;
-use tokio::sync::watch;
 use url::Url;
 
 use crate::{
@@ -134,7 +134,7 @@ pub struct ExecutionContext {
     credential_generation: Option<CredentialGeneration>,
     pub http_client: Client,
     pub connection_pool: Arc<ConnectionPool>,
-    pub runtime: Option<watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>>,
+    pub runtime: Option<ConfigNotification<MarketParticipantNetworkSnapshot>>,
     /// The venue-level route metadata standing behind this execution.
     ///
     /// A request path carries the metadata of the loaded venue it was admitted
@@ -256,18 +256,16 @@ impl ExecutionContext {
         self
     }
 
-    pub(crate) fn with_runtime_receiver(
+    pub(crate) fn with_runtime(
         mut self,
-        runtime: watch::Receiver<Arc<MarketParticipantNetworkSnapshot>>,
+        runtime: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> Self {
         self.runtime = Some(runtime);
         self
     }
 
     pub(crate) fn current_runtime(&self) -> Option<Arc<MarketParticipantNetworkSnapshot>> {
-        self.runtime
-            .as_ref()
-            .map(|receiver| receiver.borrow().clone())
+        self.runtime.as_ref().map(ConfigNotification::current)
     }
 }
 
