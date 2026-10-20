@@ -12,6 +12,7 @@ use base_ui::{
     layer::LayerExt as _,
     markdown::view::{Markdown, MarkdownState},
     progress::Progress,
+    scroll_bar::Scrollbar,
     separator::Separator,
     size::UnifiedSizable as _,
     spinner::Spinner,
@@ -19,8 +20,8 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, DismissEvent, Empty, Entity, EventEmitter,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, base::ScrollbarMode, div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
 use smol_str::SmolStr;
@@ -30,14 +31,28 @@ use crate::{
     state::{Updater, UpdaterState},
 };
 
-/// How wide the panel is.
-const DIALOG_WIDTH: f32 = 520.0;
+/// How wide the panel is while the release notes are read.
+const NOTES_WIDTH: f32 = 1040.0;
+
+/// How wide the panel is for everything that is not the notes.
+///
+/// A download in flight, a payload waiting to be installed and what a failed attempt
+/// says are a line or two of text each: drawn at the notes' width they would be a wide
+/// band of empty panel around two words.
+const STATUS_WIDTH: f32 = 640.0;
 
 /// How tall the release notes are drawn before they scroll.
-const NOTES_MAX_HEIGHT: f32 = 320.0;
+const NOTES_MAX_HEIGHT: f32 = 640.0;
+
+/// How wide the band the notes' scrollbar is drawn in.
+///
+/// The scrollbar paints a 4px thumb hard against its own right edge, so the band is
+/// what keeps the thumb off the notes' text rather than over it.
+const SCROLLBAR_WIDTH: f32 = 8.0;
 
 /// The debug selectors the dialog's parts are drawn with, for the visual tests.
 const UPDATER_DIALOG_NOTES: &str = "UPDATER_DIALOG_NOTES";
+const UPDATER_DIALOG_SCROLLBAR: &str = "UPDATER_DIALOG_SCROLLBAR";
 const UPDATER_DIALOG_DOWNLOAD: &str = "UPDATER_DIALOG_DOWNLOAD";
 const UPDATER_DIALOG_PROGRESS: &str = "UPDATER_DIALOG_PROGRESS";
 const UPDATER_DIALOG_DOWNLOADED: &str = "UPDATER_DIALOG_DOWNLOADED";
@@ -47,12 +62,60 @@ const UPDATER_DIALOG_FAILURE: &str = "UPDATER_DIALOG_FAILURE";
 const UPDATER_DIALOG_CLOSE: &str = "UPDATER_DIALOG_CLOSE";
 const UPDATER_DIALOG_CANCEL: &str = "UPDATER_DIALOG_CANCEL";
 
+/// What the dialog draws, named rather than borrowed from the updater.
+///
+/// The dialog follows the updater for as long as it is open. It is still drawn for the
+/// length of its exit transition after it has been dismissed, and by the first of those
+/// frames the updater has already moved on — cancelling a download puts the release back
+/// on offer, which is the notes again. Reading the live state there would swap the
+/// content out from under the fade, so what the last live frame drew is named here and
+/// drawn unchanged until the panel is gone.
+#[derive(Clone, Copy)]
+enum Shown {
+    /// The release notes, and what a platform that cannot install in place is told.
+    Notes,
+    /// A download in flight: what it has accepted, and the size the response named.
+    Download(u64, Option<u64>),
+    /// The payload is downloaded, waiting for the user.
+    Downloaded,
+    /// Nothing left to press: the application is being replaced underneath it.
+    Installing,
+    /// The last attempt failed, with the catalogue key the interface says it with.
+    Failure(Option<&'static str>),
+}
+
+impl Shown {
+    /// What a state draws, or nothing when it is about no release at all.
+    fn of(state: &UpdaterState) -> Option<Self> {
+        match state {
+            UpdaterState::Idle | UpdaterState::Checking => None,
+            UpdaterState::Available(_) => Some(Self::Notes),
+            // A download in flight is the state itself: what it has accepted and the
+            // size it is measured against are both part of it.
+            UpdaterState::Downloading(download) => {
+                Some(Self::Download(download.accepted(), download.named_total()))
+            }
+            UpdaterState::ReadyToInstall(_) => Some(Self::Downloaded),
+            UpdaterState::Installing(_) => Some(Self::Installing),
+            UpdaterState::Failed(_) => Some(Self::Failure(
+                state.failure().map(|error| error.message_key()),
+            )),
+        }
+    }
+}
+
 /// The dialog the update indicator opens.
 pub(crate) struct UpdateDialog {
     updater: Entity<Updater>,
     /// The release notes, parsed once: one release is offered at a time, so the
     /// text does not change for as long as the dialog lives.
     notes: Entity<MarkdownState>,
+    /// Where the notes are scrolled to, which is also what the scrollbar beside them
+    /// is drawn from.
+    notes_scroll: ScrollHandle,
+    /// What this dialog was drawing when it was dismissed, kept so that the frames of
+    /// its exit transition draw the dialog that left rather than the one that came back.
+    frozen: Option<Shown>,
 }
 
 impl EventEmitter<DismissEvent> for UpdateDialog {}
@@ -86,27 +149,43 @@ impl UpdateDialog {
         Self {
             updater,
             notes: cx.new(|cx| MarkdownState::new(notes.as_deref().unwrap_or_default(), cx)),
+            notes_scroll: ScrollHandle::new(),
+            frozen: None,
         }
     }
 
-    /// What the state has to say below the title.
-    fn body(&self, state: &UpdaterState, cx: &Context<Self>) -> AnyElement {
-        match state {
-            UpdaterState::Downloading(_) => download_body(state, cx),
-            UpdaterState::ReadyToInstall(_) | UpdaterState::Installing(_) => downloaded_body(cx),
-            UpdaterState::Failed(_) => self.failure_body(state, cx),
-            UpdaterState::Available(_) | UpdaterState::Idle | UpdaterState::Checking => {
-                self.notes_body(cx)
-            }
+    /// What this frame draws: the live state, or the frame kept while the dialog fades.
+    fn shown(&self, cx: &Context<Self>) -> Option<Shown> {
+        self.frozen
+            .or_else(|| Shown::of(self.updater.read(cx).state()))
+    }
+
+    /// Keeps the frame the dialog is drawn as while it leaves.
+    ///
+    /// Called before the dismissal asks the updater anything, so what is kept is the
+    /// dialog the user pressed rather than what closing turned the updater into.
+    fn freeze(&mut self, cx: &mut Context<Self>) {
+        if self.frozen.is_none() {
+            self.frozen = Shown::of(self.updater.read(cx).state());
+        }
+    }
+
+    /// What the release notes and the state's own text say.
+    fn body(&self, shown: Shown, cx: &Context<Self>) -> AnyElement {
+        match shown {
+            Shown::Notes => self.notes_body(cx),
+            Shown::Download(downloaded, total) => download_body(downloaded, total, cx),
+            Shown::Downloaded | Shown::Installing => downloaded_body(cx),
+            Shown::Failure(key) => self.failure_body(key, cx),
         }
     }
 
     /// The controls the state offers, the primary one last.
-    fn actions(&self, state: &UpdaterState, cx: &Context<Self>) -> Vec<AnyElement> {
-        match state {
+    fn actions(&self, shown: Shown, cx: &Context<Self>) -> Vec<AnyElement> {
+        match shown {
             // Nothing on this platform can replace the running application, so
             // nothing is downloaded for it: the release page is where its update is.
-            UpdaterState::Available(_) if !install::supported() => vec![
+            Shown::Notes if !install::supported() => vec![
                 self.closing_button(
                     "UpdaterDialogClose",
                     UPDATER_DIALOG_CLOSE,
@@ -116,7 +195,7 @@ impl UpdateDialog {
                 ),
                 release_page_button(cx),
             ],
-            UpdaterState::Available(_) => vec![
+            Shown::Notes => vec![
                 self.closing_button(
                     "UpdaterDialogCancel",
                     UPDATER_DIALOG_CANCEL,
@@ -128,14 +207,14 @@ impl UpdateDialog {
             ],
             // Cancelling a download stops it where it is: the bytes it had are
             // discarded, and the release is on offer again.
-            UpdaterState::Downloading(_) => vec![self.closing_button(
+            Shown::Download(..) => vec![self.closing_button(
                 "UpdaterDialogCancelDownload",
                 UPDATER_DIALOG_CANCEL,
                 t!(cx, "window.updater.cancel"),
                 Some(Updater::cancel_download),
                 cx,
             )],
-            UpdaterState::ReadyToInstall(_) => vec![
+            Shown::Downloaded => vec![
                 self.closing_button(
                     "UpdaterDialogDiscard",
                     UPDATER_DIALOG_CANCEL,
@@ -147,27 +226,53 @@ impl UpdateDialog {
             ],
             // The application is being replaced underneath the dialog: there is
             // nothing left to press.
-            UpdaterState::Installing(_) => Vec::new(),
-            UpdaterState::Failed(_) => vec![self.closing_button(
+            Shown::Installing => Vec::new(),
+            Shown::Failure(_) => vec![self.closing_button(
                 "UpdaterDialogDismiss",
                 UPDATER_DIALOG_CLOSE,
                 t!(cx, "common.close"),
                 Some(Updater::dismiss_failure),
                 cx,
             )],
-            UpdaterState::Idle | UpdaterState::Checking => Vec::new(),
         }
     }
 
     /// The release notes, and what a platform that cannot install in place is told.
+    ///
+    /// The scrollbar is drawn beside the notes rather than inside them, and always:
+    /// the notes are as long as the release wrote them, so whether there is more to
+    /// read is not something the reader should have to find by scrolling first. The
+    /// notes keep clear of the band it is drawn in, so the thumb never sits over the
+    /// text it is measuring.
     fn notes_body(&self, cx: &Context<Self>) -> AnyElement {
         let mut body = div().flex().flex_col().gap_2().child(
             div()
-                .id("UpdaterDialogNotes")
-                .debug_selector(|| UPDATER_DIALOG_NOTES.into())
-                .max_h(px(NOTES_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .child(Markdown::new(&self.notes)),
+                .relative()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("UpdaterDialogNotes")
+                        .debug_selector(|| UPDATER_DIALOG_NOTES.into())
+                        .max_h(px(NOTES_MAX_HEIGHT))
+                        .pr(px(SCROLLBAR_WIDTH))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.notes_scroll)
+                        .child(Markdown::new(&self.notes)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(SCROLLBAR_WIDTH))
+                        .debug_selector(|| UPDATER_DIALOG_SCROLLBAR.into())
+                        .child(
+                            Scrollbar::vertical(self.notes_scroll.clone())
+                                .mode(ScrollbarMode::Always),
+                        ),
+                ),
         );
         if !install::supported() {
             body = body.child(
@@ -181,8 +286,8 @@ impl UpdateDialog {
     }
 
     /// What the last attempt failed with.
-    fn failure_body(&self, state: &UpdaterState, cx: &Context<Self>) -> AnyElement {
-        let Some(error) = state.failure() else {
+    fn failure_body(&self, key: Option<&'static str>, cx: &Context<Self>) -> AnyElement {
+        let Some(key) = key else {
             return Empty.into_any_element();
         };
         let color = cx.theme().roles.status.danger.base.hsla;
@@ -190,7 +295,7 @@ impl UpdateDialog {
         div()
             .debug_selector(|| UPDATER_DIALOG_FAILURE.into())
             .text_color(color)
-            .child(t!(cx, error.message_key()))
+            .child(t!(cx, key))
             .into_any_element()
     }
 
@@ -244,6 +349,7 @@ impl UpdateDialog {
             .debug_selector(move || selector.into())
             .aria_label(label.clone())
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.freeze(cx);
                 if let Some(asked) = asked {
                     let updater = this.updater.clone();
                     updater.update(cx, asked);
@@ -257,20 +363,23 @@ impl UpdateDialog {
 
 impl Render for UpdateDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.updater.read(cx).state();
-        let Some(release) = state.release() else {
+        let Some(shown) = self.shown(cx) else {
             return Empty.into_any_element();
         };
-        let title = t!(cx, "window.updater.dialog_title", version = release.version);
-        let body = self.body(state, cx);
-        let actions = self.actions(state, cx);
+        let width = match shown {
+            Shown::Notes => NOTES_WIDTH,
+            Shown::Download(..) | Shown::Downloaded | Shown::Installing | Shown::Failure(_) => {
+                STATUS_WIDTH
+            }
+        };
+        let body = self.body(shown, cx);
+        let actions = self.actions(shown, cx);
 
         div()
-            .w(px(DIALOG_WIDTH))
+            .w(px(width))
             .flex()
             .flex_col()
-            .gap_3()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+            .gap_2()
             .child(body)
             .child(Separator::horizontal())
             .child(
@@ -287,14 +396,12 @@ impl Render for UpdateDialog {
 
 /// The progress of the download in flight.
 ///
-/// A response that named its length is drawn as a bar against it. One that did
-/// not — a chunked answer — has no total to measure against, so what is drawn is
-/// the fact that something is happening rather than a fraction of it.
-fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement {
+/// A response that named its length is drawn as a bar against it, with the share
+/// accepted so far centred under it. One that did not — a chunked answer — has no total
+/// to measure against, so what is drawn is the fact that something is happening rather
+/// than a fraction of it: a spinner, centred, under the same heading.
+fn download_body(downloaded: u64, total: Option<u64>, cx: &Context<UpdateDialog>) -> AnyElement {
     let heading = t!(cx, "window.updater.downloading");
-    let Some((downloaded, total)) = state.progress() else {
-        return div().child(heading).into_any_element();
-    };
 
     let progress = match total.filter(|total| *total > 0) {
         Some(total) => {
@@ -305,7 +412,7 @@ fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement
                 .flex_col()
                 .gap_2()
                 .child(Progress::new("UpdaterDownloadProgress").value(percent))
-                .child(div().text_xs().child(t!(
+                .child(div().text_xs().text_center().child(t!(
                     cx,
                     "window.updater.download_progress",
                     percent = percent as u32
@@ -314,8 +421,7 @@ fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement
         }
         None => div()
             .flex()
-            .items_center()
-            .gap_2()
+            .justify_center()
             .child(
                 div()
                     .debug_selector(|| UPDATER_DIALOG_PROGRESS.into())
@@ -323,7 +429,6 @@ fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement
                     .size_4()
                     .child(Spinner::new("UpdaterDownloadSpinner")),
             )
-            .child(div().text_xs().child(heading.clone()))
             .into_any_element(),
     };
 
@@ -331,7 +436,7 @@ fn download_body(state: &UpdaterState, cx: &Context<UpdateDialog>) -> AnyElement
         .flex()
         .flex_col()
         .gap_2()
-        .child(heading)
+        .child(div().text_center().child(heading))
         .child(progress)
         .into_any_element()
 }
@@ -343,8 +448,17 @@ fn downloaded_body(cx: &Context<UpdateDialog>) -> AnyElement {
         .flex()
         .flex_col()
         .gap_2()
-        .child(t!(cx, "window.updater.downloaded_message"))
-        .child(div().text_xs().child(t!(cx, "window.updater.restart_hint")))
+        .child(
+            div()
+                .text_center()
+                .child(t!(cx, "window.updater.downloaded_message")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_center()
+                .child(t!(cx, "window.updater.restart_hint")),
+        )
         .into_any_element()
 }
 
@@ -667,5 +781,158 @@ mod tests {
             "closing on a failure leaves the release on offer"
         );
         dismissed(cx, UPDATER_DIALOG_FAILURE);
+    }
+
+    /// The dialog is drawn for the length of its exit transition after it has been
+    /// dismissed, and by then the updater has already moved on. What it drew while it
+    /// was open is what it has to keep drawing, or the last frames show a different
+    /// dialog from the one that is leaving — cancelling a download, for one, puts the
+    /// notes back.
+    #[gpui_kit::test]
+    fn a_dismissed_dialog_should_keep_drawing_the_frame_it_was_dismissed_in(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, updater) = harness(cx);
+        let cancellation = CancellationToken::new();
+        shown(
+            cx,
+            &updater,
+            UpdaterState::downloading_for_test(release(), 4_096, Some(8_192), cancellation.clone()),
+        );
+
+        // Pressed without letting the transition settle, so the frames that follow are
+        // the ones the fade is drawn on.
+        let target = cx
+            .debug_bounds(UPDATER_DIALOG_CANCEL)
+            .expect("a download in flight offers cancelling")
+            .center();
+        cx.simulate_click(target, Modifiers::none());
+
+        assert!(
+            updater.read_with(cx, |updater, _| matches!(
+                updater.state(),
+                UpdaterState::Available(_)
+            )),
+            "cancelling offers the release again straight away"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PROGRESS).is_some(),
+            "the dialog that is still fading is the download it was dismissed in, not the \
+             notes the cancellation returned to"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_NOTES).is_none(),
+            "the notes the release went back to waiting behind is not what the fade draws"
+        );
+    }
+
+    /// The scrollbar beside the notes does not wait for the pointer or for a scroll to
+    /// appear: it is drawn for as long as there are notes taller than the box they are
+    /// drawn in, which is how the reader is told there is more without scrolling first.
+    ///
+    /// Nothing here hovers or scrolls, so a scrollbar that appeared on either would not
+    /// be drawn at all.
+    #[gpui_kit::test]
+    fn the_notes_should_be_drawn_with_their_scrollbar_without_being_scrolled(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, updater) = harness(cx);
+        shown(
+            cx,
+            &updater,
+            UpdaterState::Available(release_with_notes(&[(
+                "en",
+                "## What changed\n\nA paragraph of the release notes, long enough that a few of \
+                 them put the notes past the box they are drawn in.\n\nA paragraph of the release \
+                 notes, long enough that a few of them put the notes past the box they are drawn \
+                 in.\n\nA paragraph of the release notes, long enough that a few of them put the \
+                 notes past the box they are drawn in.\n\nA paragraph of the release notes, long \
+                 enough that a few of them put the notes past the box they are drawn in.\n\nA \
+                 paragraph of the release notes, long enough that a few of them put the notes past \
+                 the box they are drawn in.\n\nA paragraph of the release notes, long enough that a \
+                 few of them put the notes past the box they are drawn in.\n\nA paragraph of the \
+                 release notes, long enough that a few of them put the notes past the box they are \
+                 drawn in.\n\nA paragraph of the release notes, long enough that a few of them put \
+                 the notes past the box they are drawn in.\n\nA paragraph of the release notes, long \
+                 enough that a few of them put the notes past the box they are drawn in.\n\nA \
+                 paragraph of the release notes, long enough that a few of them put the notes past \
+                 the box they are drawn in.",
+            )])),
+        );
+
+        let scrollbar = cx
+            .debug_bounds(UPDATER_DIALOG_SCROLLBAR)
+            .expect("the scrollbar is drawn beside the notes");
+        assert!(
+            scrollbar.size.height > px(100.),
+            "the scrollbar runs the height of the notes it scrolls (scrollbar {scrollbar:?})"
+        );
+    }
+
+    /// The notes are read in a panel twice the width they used to be, and everything
+    /// else in a narrower one: a download's progress and a downloaded payload's two
+    /// lines are not worth a wide band of empty panel.
+    #[gpui_kit::test]
+    fn the_notes_should_be_drawn_wider_than_the_status_the_dialog_turns_into(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, updater) = harness(cx);
+        let notes = shown(cx, &updater, UpdaterState::Available(release()));
+        let notes_width = cx
+            .debug_bounds(UPDATER_DIALOG_NOTES)
+            .expect("the notes are what the dialog is opened for")
+            .size
+            .width;
+        cx.update(|_, cx| {
+            notes.update(cx, |_, cx| cx.emit(DismissEvent));
+        });
+        dismissed(cx, UPDATER_DIALOG_NOTES);
+
+        shown(
+            cx,
+            &updater,
+            UpdaterState::downloading_for_test(
+                release(),
+                4_096,
+                Some(8_192),
+                CancellationToken::new(),
+            ),
+        );
+        let download_width = cx
+            .debug_bounds(UPDATER_DIALOG_PROGRESS)
+            .expect("a download in flight says how far it is")
+            .size
+            .width;
+
+        assert!(
+            notes_width > px(900.),
+            "the notes fill the panel, which is 1040 wide (notes {notes_width:?})"
+        );
+        assert_eq!(
+            download_width,
+            px(STATUS_WIDTH),
+            "a download is drawn in the narrower panel"
+        );
+    }
+
+    /// A failed attempt is as short a message as a download is, so it is drawn in the
+    /// same narrower panel rather than in the notes' width.
+    #[gpui_kit::test]
+    fn a_failure_should_be_drawn_in_the_narrower_panel(cx: &mut TestAppContext) {
+        let (cx, updater) = harness(cx);
+        shown(
+            cx,
+            &updater,
+            UpdaterState::failed_for_test(release(), UpdaterError::UnsupportedPlatform),
+        );
+
+        let failure = cx
+            .debug_bounds(UPDATER_DIALOG_FAILURE)
+            .expect("a failure is what the dialog says instead");
+        assert_eq!(
+            failure.size.width,
+            px(STATUS_WIDTH),
+            "the failure fills the narrower panel rather than the notes' width"
+        );
     }
 }

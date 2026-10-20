@@ -1,12 +1,19 @@
 //! The top bar's update button.
 
 use base_ui::{
-    button::Button, interactive::InteractiveVariantExt as _, size::UnifiedSizable as _,
-    tooltip::TooltipExt as _,
+    animation::ANIMATION_TICK,
+    button::Button,
+    icon::{Icon, IconKind},
+    interactive::InteractiveVariantExt as _,
+    size::UnifiedSizable as _,
+    style::theme::ThemeExt as _,
+    tooltip::Tooltip,
 };
 use gpui_kit::{
-    App, Context, Empty, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Window,
+    App, Context, ElementId, Empty, Entity, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    base::{Easing, Transition, transition},
+    div,
 };
 use i18n::t;
 
@@ -48,28 +55,69 @@ impl UpdateIndicator {
 }
 
 impl Render for UpdateIndicator {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(release) = self.updater.read(cx).state().offered() else {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.updater.read(cx).state().offered().is_none() {
             return Empty.into_any_element();
-        };
+        }
         let label = t!(cx, "window.updater.available");
-        let tooltip = t!(
+        let wrapper = ElementId::from((ElementId::from(UPDATER_INDICATOR), "wrapper"));
+
+        // The colour follows the pointer the way the window's own buttons do: the brand's
+        // three steps, with hover and press latched here rather than taken from GPUI's
+        // `:hover`/`:active` element state, which is scoped to a `div` id and would need
+        // this element to be a `div` instead of the tooltip-wrapped `Button` it is.
+        let hover_state = window.use_keyed_state((wrapper.clone(), "hover"), cx, |_, _| false);
+        let held_state = window.use_keyed_state((wrapper.clone(), "held"), cx, |_, _| false);
+        let color = match (*held_state.read(cx), *hover_state.read(cx)) {
+            (true, _) => cx.theme().roles.brand.active,
+            (false, true) => cx.theme().roles.brand.hover,
+            (false, false) => cx.theme().roles.brand.base,
+        };
+        let color = transition(
+            (wrapper.clone(), "color"),
+            color,
+            Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
+            window,
             cx,
-            "window.updater.available_tooltip",
-            version = release.version
         );
 
-        // The header row is the window's drag area, so the button takes the
-        // pointer explicitly: without it the press starts a window drag instead.
-        Button::new(UPDATER_INDICATOR)
-            .ghost()
-            .medium()
+        // The header row is the window's drag area, so the control takes the pointer
+        // explicitly: without an occluding hitbox the press starts a window drag instead.
+        // The occlusion is on a wrapper rather than on the button, because an occluding
+        // trigger stops the hover its own tooltip opens on.
+        div()
+            .id(wrapper)
             .occlude()
-            .debug_selector(|| UPDATER_INDICATOR.into())
-            .aria_label(label.clone())
-            .with_tooltip(tooltip)
-            .on_click(cx.listener(|this, _, window, cx| this.open(window, cx)))
-            .child(label)
+            .child(
+                Tooltip::new(
+                    UPDATER_INDICATOR,
+                    Button::new(UPDATER_INDICATOR)
+                        .ghost()
+                        .medium()
+                        .rounded_full()
+                        .debug_selector(|| UPDATER_INDICATOR.into())
+                        .aria_label(label.clone())
+                        .on_click(cx.listener(|this, _, window, cx| this.open(window, cx)))
+                        .child(
+                            Icon::new(IconKind::ArrowCircleUpFill)
+                                .size_4()
+                                .text_color(color.hsla),
+                        ),
+                )
+                .content(label),
+            )
+            .on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
+            .on_mouse_down(MouseButton::Left, {
+                let held_state = held_state.clone();
+                move |_, _, cx| held_state.write(cx, true)
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let held_state = held_state.clone();
+                move |_, _, cx| held_state.write(cx, false)
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                held_state.write(cx, false)
+            })
             .into_any_element()
     }
 }
@@ -82,7 +130,7 @@ mod tests {
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use gpui_kit::{
         AppContext as _, Context, IntoElement, Modifiers, Render, Styled as _, TestAppContext,
-        VisualTestContext, Window, div,
+        VisualTestContext, Window, div, px,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
     use widget_tokio_runtime::runtime::Runtime;
@@ -98,14 +146,20 @@ mod tests {
     /// finding them is how these tests see that the dialog opened.
     const UPDATER_DIALOG_NOTES: &str = "UPDATER_DIALOG_NOTES";
 
-    /// A window that draws the indicator and nothing else.
+    /// A window that draws the indicator the way the header row does: a flex row that
+    /// centres it, rather than one that stretches it to the width of the window.
     struct Harness {
         indicator: Entity<UpdateIndicator>,
     }
 
     impl Render for Harness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.indicator.clone())
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.indicator.clone())
         }
     }
 
@@ -238,6 +292,43 @@ mod tests {
         assert!(
             cx.debug_bounds(UPDATER_DIALOG_NOTES).is_some(),
             "pressing the button opens the dialog the update is read about from"
+        );
+    }
+
+    /// The control is the icon alone, and what it says is in its tooltip. Hovering it
+    /// must open that tooltip, which is why the occlusion that keeps a press from
+    /// starting a window drag is on a wrapper rather than on the tooltip's own trigger.
+    #[gpui_kit::test]
+    fn hovering_the_indicator_should_open_the_tooltip_it_is_labelled_with(cx: &mut TestAppContext) {
+        let updater = installed(cx);
+        let cx = window(cx);
+        cx.update(|_, cx| {
+            updater.update(cx, |updater, cx| {
+                updater.set_state_for_test(UpdaterState::Available(release()), cx);
+            });
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        // The icon is all that is drawn, so the control is no wider than it.
+        let control = cx
+            .debug_bounds(UPDATER_INDICATOR)
+            .expect("an offered update is drawn as the button that opens it");
+        assert!(
+            control.size.width < px(48.0),
+            "the control is the icon rather than a line of text (control {:?})",
+            control.size
+        );
+
+        cx.simulate_mouse_move(control.center(), None, Modifiers::none());
+        cx.run_until_parked();
+        for _ in 0..10 {
+            settle(cx);
+        }
+
+        assert!(
+            cx.debug_bounds("BASE_UI_TOOLTIP").is_some(),
+            "an occluding trigger blocks its own tooltip, so the occlusion is on a wrapper"
         );
     }
 }

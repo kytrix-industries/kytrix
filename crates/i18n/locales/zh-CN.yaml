@@ -816,13 +816,11 @@ window:
     quant: 量化
   updater:
     available: 有可用更新
-    available_tooltip: 发现新版本 %{version}
-    dialog_title: 发现新版本 %{version}
     download: 更新
     cancel: 取消
     install: 安装更新
     downloading: 正在下载更新…
-    download_progress: 已下载 %{percent}%
+    download_progress: '%{percent}%'
     downloaded_message: 新版本已下载完成，点击“安装更新”后应用将退出以完成安装。
     restart_hint: 更新完成后请重新启动 Kytrix。
     manual_required: 当前安装方式不支持应用内更新，请在发布页下载安装包。

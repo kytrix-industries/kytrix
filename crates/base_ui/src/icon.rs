@@ -22,6 +22,7 @@ pub enum IconKind {
     CaretLeft,
     ArrowUp,
     ArrowDown,
+    ArrowCircleUpFill,
     Eye,
     EyeClosed,
     Minus,
@@ -72,6 +73,7 @@ impl IconKind {
             IconKind::CaretLeft => "icons/phosphoricons/caret-left.svg",
             IconKind::ArrowUp => "icons/phosphoricons/arrow-up.svg",
             IconKind::ArrowDown => "icons/phosphoricons/arrow-down.svg",
+            IconKind::ArrowCircleUpFill => "icons/phosphoricons/arrow-circle-up-fill.svg",
             IconKind::Eye => "icons/phosphoricons/eye.svg",
             IconKind::EyeClosed => "icons/phosphoricons/eye-closed.svg",
             IconKind::Minus => "icons/phosphoricons/minus.svg",
@@ -157,7 +159,7 @@ mod tests {
     use super::IconKind;
 
     /// 全部变体，顺序与 [`IconKind::path`] 一致。
-    const KINDS: [IconKind; 45] = [
+    const KINDS: [IconKind; 46] = [
         IconKind::X,
         IconKind::XBold,
         IconKind::Circle,
@@ -173,6 +175,7 @@ mod tests {
         IconKind::CaretLeft,
         IconKind::ArrowUp,
         IconKind::ArrowDown,
+        IconKind::ArrowCircleUpFill,
         IconKind::Eye,
         IconKind::EyeClosed,
         IconKind::Minus,

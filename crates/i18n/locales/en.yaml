@@ -816,13 +816,11 @@ window:
     quant: Quant
   updater:
     available: Update available
-    available_tooltip: Version %{version} is available
-    dialog_title: Version %{version} is available
     download: Update
     cancel: Cancel
     install: Install update
     downloading: Downloading the update…
-    download_progress: '%{percent}% downloaded'
+    download_progress: '%{percent}%'
     downloaded_message: The new version has been downloaded. Choosing “Install update” quits the application so the installation can finish.
     restart_hint: Start Kytrix again once the update has finished.
     manual_required: This installation cannot be updated from inside the application. Download the package from the release page.

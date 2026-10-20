@@ -82,6 +82,21 @@ pub(crate) struct Download {
     cancellation: CancellationToken,
 }
 
+impl Download {
+    /// What the response has handed over so far.
+    pub(crate) fn accepted(&self) -> u64 {
+        self.downloaded
+    }
+
+    /// The size the response named, when it named one.
+    ///
+    /// A chunked answer has no length to draw a bar against, so what reports it draws
+    /// something else.
+    pub(crate) fn named_total(&self) -> Option<u64> {
+        self.total
+    }
+}
+
 /// A payload that was downloaded, waiting to be installed.
 #[derive(Debug)]
 pub(crate) struct DownloadedUpdate {
@@ -115,23 +130,6 @@ impl UpdaterState {
             Self::Available(release) | Self::Failed(FailedUpdate { release, .. }) => Some(release),
             _ => None,
         }
-    }
-
-    /// The download in flight, when one is.
-    pub(crate) fn download(&self) -> Option<&Download> {
-        match self {
-            Self::Downloading(download) => Some(download),
-            _ => None,
-        }
-    }
-
-    /// What the download in flight has accepted, and the size it is being measured against.
-    ///
-    /// The size is `None` until a response names one: a chunked answer has no
-    /// length to draw a bar against, so what reports it draws something else.
-    pub(crate) fn progress(&self) -> Option<(u64, Option<u64>)> {
-        self.download()
-            .map(|download| (download.downloaded, download.total))
     }
 
     /// The failure the dialog speaks for, when the last attempt failed.
@@ -645,7 +643,10 @@ mod tests {
 
         let offered = state.offered().expect("the release is on offer");
         assert_eq!(offered.version, semver::Version::new(1, 2, 3));
-        assert!(state.download().is_none(), "nothing is downloading yet");
+        assert!(
+            !matches!(state, UpdaterState::Downloading(_)),
+            "nothing is downloading yet"
+        );
     }
 
     #[test]
@@ -666,9 +667,12 @@ mod tests {
             !state.record_progress(10, Some(100)),
             "a stale report is ignored"
         );
+        let UpdaterState::Downloading(download) = &state else {
+            panic!("a download that started is the state that holds it");
+        };
         assert_eq!(
-            state.progress(),
-            Some((40, Some(100))),
+            (download.accepted(), download.named_total()),
+            (40, Some(100)),
             "what the bar is drawn from is what was accepted"
         );
     }
@@ -684,9 +688,12 @@ mod tests {
         state.record_progress(0, None);
         state.record_progress(4_096, None);
 
+        let UpdaterState::Downloading(download) = &state else {
+            panic!("a download that started is the state that holds it");
+        };
         assert_eq!(
-            state.progress(),
-            Some((4_096, None)),
+            (download.accepted(), download.named_total()),
+            (4_096, None),
             "a chunked response has no length to draw a bar against"
         );
     }
@@ -740,7 +747,7 @@ mod tests {
 
         assert!(matches!(state, UpdaterState::Available(_)));
         assert!(
-            state.progress().is_none(),
+            !matches!(state, UpdaterState::Downloading(_)),
             "the partial bytes went with the attempt"
         );
         assert!(
