@@ -26,7 +26,7 @@ axes / palette / text / paint 分层）。
 **Widget 拥有的**：协议、取数、数据模型、就绪态正文、header 控件、错误类型的本地化实现、子区域的局部状态、
 **自己持久化的那部分配置**。
 
-由此得到九条硬约束：
+由此得到十条硬约束：
 
 1. 不写 `ViewStatus` 一类的状态枚举，也不写 `render` 里的"该画 banner 还是占位"分支。状态只经
    `Entity<WidgetStatus>` 的 `report(WidgetState, cx)` 上报，位置由框架决定。
@@ -43,6 +43,9 @@ axes / palette / text / paint 分层）。
    到 `service.rs`。
 9. 持久化的选项由 widget 自己 **读回**（`config()`）并 **上报**（`config_change.publish(cx)`）；改了字段不上报，改动
    就只活在内存里。见 §4.5。
+10. **应用设置**（语言、外观、数据时区、账户、代理、场所）只经 `ConfigManager` 的**按域事件**得知变化：不自造
+   watch / 轮询，不把快照存进字段当"当时的配置"再定期比较，也不在回调里写配置。widget 能碰的只有时区与账户两域，
+   而且两条接缝已经写好了（`widget::time_zone` / `widget::account`）。见 §4.6。
 
 ---
 
@@ -299,6 +302,44 @@ pane 停在 connecting，不为它另加超时层。
 
 **版本**：所有 widget 的 `SCHEMA_VERSION` 都是 `V1`，由 `catalogue.rs` 的一条测试钉住。不做版本迁移、不写兼容层，
 不兼容的变化直接删旧结构（根 `AGENTS.md` §1.1）。
+
+### 4.6 应用设置的更新：按域事件，不是快照轮询
+
+只管"设置变了我怎么知道"，不管 `config()` 写回（§4.5）。`ConfigManager`（`app_config_provider`，进程级 `Global`）持有当前
+`Config` 快照与无状态的 `Entity<ConfigEvents>`；**一次 `write` / `update` 只算一份 diff**（`ConfigChangeSet`），再摊成按域
+事件发出：
+
+| 事件 | widget 怎么消费 |
+|------|-----------------|
+| `AppearanceChanged` / `LanguageChanged` | **什么都不做**：`base_ui` 换 theme、`kytrix::language` 写 `LanguageCode`，各自 `refresh_windows()`（§5.1） |
+| `DataTimeZoneChanged` | `widget::time_zone`，见下 |
+| `AccountChanged` | `widget::account::account_of` + 自己的 `reconcile_account`（账户与头像合并成一条） |
+| `ProxyCatalogChanged` / `DefaultRouteChanged` / `ServiceRouteChanged` / `VenueChanged` | **不属于 widget**：只由进程 owner 经 `ConfigEventBridge` 消费 |
+
+1. **只有时区与账户两域由 widget 直接订阅**，两者都已写成共享接缝，不要自己 `cx.subscribe(events, …)` 重造：
+   - 时区：**画的那一帧读** `data_time_zone(cx)`（返回 `UtcOffset`，没有 manager 时是 UTC）。要跟随时用
+     `on_data_time_zone_change(cx, |this, offset, cx| …)` 或 `notify_on_data_time_zone_change(cx)`，都返回
+     `Option<Subscription>`（没有 manager 就是 `None`，离线 runtime 与单测就长这样）。**不缓存时区**，也不在数据到达时
+     格式化时间——那会把一个时钟冻进快照。
+   - 账户：`account_of(&cx.global::<ConfigManager>().read())` 是 scope，事件到了就重算并 `reconcile_account`；账户没变
+     （只换了头像）必须原样返回，那一条事件是两者合并发的。
+2. **订阅就是连接，存进字段。** `Subscription` 非 `Send`/`Sync`、`#[must_use]`，**丢掉就是取消**：写
+   `_account: Subscription` / `_time_zone: Option<Subscription>`。`.detach()` 只给没有终点的跟随（`VenuesUpdated`）。
+3. **`refresh_windows` 只管语言与外观。** 时区与账户事件只 notify 被通知到的实体，而正文是 `.cached()` 的，
+   **父层 notify 不会重建被缓存的子实体**：有子实体在画时间戳或账户内容的，回调里要把它一起 notify
+   （`this.list.update(cx, |_, cx| cx.notify())`；`hyperliquid_wallet_monitor` 连 `NavStack` 每一页）。
+   只 notify 自己是"文字变了但屏幕没变"的常见成因。
+4. **回调只读。** 在回调里同步写配置会重入 emitter；要回写就 `cx.defer`。widget 本来也没有写 `Config` 的入口
+   （`write` / `update` 要 `&mut App`，`cx.global_mut::<ConfigManager>()` 编译不过），唯一该写的是自己的
+   `WidgetConfig`（§4.5）。
+
+**不碰的**：`watch` / `network_subscribe` / `cx.observe_global` / `while rx.changed()` 轮询都已被这条事件路径取代。
+`ConfigNotification<P>` 是 owner 与它**后台消费者**之间的单消费者通道（一个 `wait()`），widget 不创建也不 `wait()`；
+要按配置的路由发请求就读 connector 的共享投影 `current()`（`tweet_monitor` 的 `SharedTransport` 即此）。
+
+**测试**：`ConfigManager::in_memory(config, cx)` + `cx.set_global`，再用
+`cx.update_global::<ConfigManager, _>(|manager, cx| manager.update(|config| …, cx))` 驱动**真实事件路径**再断言 pane 的反应；
+直接调 `pane.reconcile_account(..)` 只证明分支在，不证明订阅接上了，两件事各写一条。
 
 ---
 
@@ -719,6 +760,8 @@ cargo build -p kytrix
 - [ ] `has_content()` 不构建元素；正文是 `size_full().min_h_0()` 的 flex 列，`Render` 里没有 `.cached()`，根元素上也没有
   自己的底色 / 圆角 / `overflow_hidden`。
 - [ ] 内容变化时 notify 了自己或持有内容的子实体；滚动 / 交互的 `ElementId` 稳定。
+- [ ] 时区 / 账户只经 §4.6 的两条接缝：`data_time_zone(cx)` + `widget::time_zone`（`_time_zone: Option<Subscription>`）、
+  `widget::account::account_of` + `reconcile_account`；没有 watch / observe_global / 轮询，子实体被一起 notify。
 - [ ] 每个消息入口都校验 `StreamKey` 且检查 `is_failed`。
 - [ ] 前置检查没过时 header 里没有可用的控件：从已加载场所取选项的控件按「有没有东西可选」判定（`InstrumentButton` 读
   `filters.offers_anything()`），作用于当前 scope 的控件读 `awaiting_market`（或由它派生的 `has_scope()` /

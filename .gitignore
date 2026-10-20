@@ -6,3 +6,4 @@ longbridge-test.env
 **/longbridge-test.env
 **/.env.longbridge
 *.longbridge.env
+.docs
