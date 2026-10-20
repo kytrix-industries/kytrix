@@ -1264,6 +1264,12 @@ pub(crate) mod tests {
 
     /// A pane reading an account whose stream is live, with the addresses it read.
     ///
+    /// The read is the stream's, not this fixture's: a pane that has answered readiness reads
+    /// the addresses itself, because until it has them it does not know what it follows. Asking
+    /// again here would put a second read on the wire whenever the first had already answered,
+    /// and that read would be the one to consume whatever a test queued for the change it is
+    /// actually about — so what this waits for is the answer to the read the pane sends.
+    ///
     /// The dialog's own tests build their pane the same way: what a dialog draws and asks for is
     /// read from a pane, and this is the pane a test of either side needs.
     pub(crate) fn live_pane(
@@ -1275,10 +1281,6 @@ pub(crate) mod tests {
     ) -> Entity<WalletMonitorWidget> {
         session.answer_selections(selections(addresses, limit));
         let pane = pane(cx, source);
-        settle_until(cx, "the stream to come up", |cx| pane.read(cx).ready);
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
         settle_until(cx, "the addresses to arrive", |cx| {
             pane.read(cx).selections.is_some()
         });
@@ -1579,29 +1581,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// A feed that lands while the pane is still connecting is content the moment it arrives:
-    /// the pane holds the transfers even though what it is *reporting* is still the read of the
-    /// addresses, and readiness follows once that answers.
+    /// A feed that lands while the pane is still reading its addresses is content the moment it
+    /// arrives: the pane holds the transfers even though what it is *reporting* is still the read
+    /// of the addresses, and readiness follows once that answers.
     ///
-    /// The transfers land before the stream says it is live, which is the order the service
-    /// publishes them in.
+    /// The read is held open, which is what makes the window this test is about a window rather
+    /// than a race: a pane whose answer has already landed is ready, and there is nothing left of
+    /// "the feed came first" to assert.
     #[gpui_kit::test]
     fn a_feed_should_become_content_and_readiness_should_follow_it(cx: &mut TestAppContext) {
         let source = FakeSource::default();
         let session = source.session(ACCOUNT);
         let _control = session.subscribe();
         session.answer_selections(selections(vec![selection(FIRST)], 3));
+        let held = session.block_selections();
         let pane = pane(cx, &source);
-        // The service takes the account before the stream says anything, and it is what has to
-        // hold it for the read the readiness below sends to be answerable at all. The empty feed
-        // the stream publishes first is waited for as well: it is the one snapshot the pane
-        // accepts before this test reports anything, and a transfer reported before it lands is
-        // a transfer that snapshot takes away again.
-        settle_until(
-            cx,
-            "the service to take the account and publish its feed",
-            |cx| source.sessions() == 1 && pane.read(cx).has_content(),
-        );
+        // The service takes the account and publishes the empty feed before it says the stream is
+        // live, and readiness is what sends the read the block above holds.
+        settle_until(cx, "the read of the addresses to be sent", |_| {
+            session.state().fetches == 1
+        });
         let mut feed = FakeFeed::new();
         let live = feed.push("one", 1);
 
@@ -1610,22 +1609,16 @@ pub(crate) mod tests {
             let pane = pane.read(cx);
             assert!(pane.has_content(), "an empty feed is still a feed");
             assert_eq!(event_ids_of(pane), ["one"]);
-            // The transfers landed before the stream said it was live, so which of the two the
-            // pane reports depends on whether readiness reached it first: either the stream it
-            // is still connecting to, or the read of its addresses, which readiness sends.
-            let expected = if pane.ready {
-                WidgetState::Loading
-            } else {
-                WidgetState::Connecting
-            };
-            assert_eq!(pane.status.state(cx), expected);
+            assert_eq!(
+                pane.status.state(cx),
+                WidgetState::Loading,
+                "the pane follows an account it has not been told the addresses of yet"
+            );
         });
 
-        // And readiness follows the feed and the read together: once both have answered, the
-        // pane is idle and the transfers it took are the ones it holds.
-        cx.update(|cx| {
-            report_status(&pane, WalletStatus::Ready, cx);
-        });
+        // And readiness follows both: once the read answers, the pane is idle and the transfers
+        // it took are the ones it holds.
+        held.release();
         settle_until(cx, "the addresses to arrive", |cx| {
             pane.read(cx).selections.is_some()
         });
@@ -2051,10 +2044,12 @@ pub(crate) mod tests {
         let _control = session.subscribe();
         session.refuse_selections(WalletApiError::Unavailable);
         let pane = pane(cx, &source);
-        settle_until(cx, "the stream to come up", |cx| pane.read(cx).ready);
 
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
+        // The read is the pane's own, sent by the readiness that arrives: asking for a second one
+        // here would be a read the session has no answer queued for, and which of the two the
+        // refusal belongs to would depend on which got to the session first.
+        settle_until(cx, "the read to be refused", |cx| {
+            matches!(pane.read(cx).selection_read, SelectionRead::Failed(_))
         });
         settle_until(cx, "the refusal to arrive", |cx| {
             pane.read(cx).pending.is_none()

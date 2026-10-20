@@ -377,7 +377,7 @@ pub struct ConfigRecovery {
 /// Losing the old file is worse than starting over, but not bad enough to refuse
 /// to start, so a failure here is logged and reported as "nothing was kept".
 fn back_up_damaged_config(path: &Path) -> Option<PathBuf> {
-    let Some(backup) = available_backup_path(path) else {
+    let Some(backup) = available_backup_path(path, time::OffsetDateTime::now_utc()) else {
         log::error!("failed to find a free backup name for damaged settings config {path:?}");
 
         return None;
@@ -394,10 +394,14 @@ fn back_up_damaged_config(path: &Path) -> Option<PathBuf> {
 }
 
 /// The first free `config.json.corrupt-<timestamp>[-N]` name next to `path`.
-fn available_backup_path(path: &Path) -> Option<PathBuf> {
+///
+/// The instant is handed in rather than read here, because the name it produces is what two
+/// backups taken in the same second collide on: a caller that asked the clock itself could not
+/// be tested for that collision without waiting for two calls to share a second.
+fn available_backup_path(path: &Path, instant: time::OffsetDateTime) -> Option<PathBuf> {
     let directory = path.parent()?;
     let file_name = path.file_name()?.to_str()?;
-    let backup_name = format!("{file_name}.corrupt-{}", utc_timestamp());
+    let backup_name = format!("{file_name}.corrupt-{}", utc_timestamp(instant));
     let first = directory.join(&backup_name);
     if !first.exists() {
         return Some(first);
@@ -409,17 +413,15 @@ fn available_backup_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// The UTC instant a backup was taken, as `YYYYMMDD-HHMMSS`.
-fn utc_timestamp() -> String {
-    let now = time::OffsetDateTime::now_utc();
-
+fn utc_timestamp(instant: time::OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
+        instant.year(),
+        u8::from(instant.month()),
+        instant.day(),
+        instant.hour(),
+        instant.minute(),
+        instant.second()
     )
 }
 
@@ -1272,32 +1274,30 @@ mod tests {
     fn a_backup_name_should_carry_a_timestamp_and_should_not_overwrite_an_existing_backup() {
         let temporary_directory = test_temp("config");
         let path = temporary_directory.path().join(CONFIG_FILE_NAME);
+        let instant = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+            .expect("the fixture instant should be representable");
 
-        let first = available_backup_path(&path).expect("a backup name should be available");
-        let stamp = first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("config.json.corrupt-"))
-            .expect("the backup name should name the damaged file");
-        assert_eq!(stamp.len(), "YYYYMMDD-HHMMSS".len());
-        assert!(
-            stamp
-                .char_indices()
-                .all(|(index, character)| index == 8 && character == '-'
-                    || character.is_ascii_digit()),
-            "the backup name should carry a UTC timestamp; found {stamp:?}"
+        let first =
+            available_backup_path(&path, instant).expect("a backup name should be available");
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("config.json.corrupt-20231114-221320"),
+            "the backup name is the damaged file's, stamped with the UTC instant it was taken"
         );
         fs::write(&first, b"kept").expect("the first backup should be written");
 
-        let second =
-            available_backup_path(&path).expect("a second backup name should be available");
+        // The same instant is asked about again, which is the collision the rule is about: a
+        // later instant would be a free name and would say nothing about the numbering.
+        let second = available_backup_path(&path, instant)
+            .expect("a second backup name should be available");
 
         assert_ne!(first, second);
         assert!(
             second
-                .to_str()
-                .expect("the backup path should be UTF-8")
-                .ends_with("-2")
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-2")),
+            "a name the same instant already took should be numbered: {second:?}"
         );
         assert_eq!(
             fs::read(&first).expect("the first backup should remain readable"),

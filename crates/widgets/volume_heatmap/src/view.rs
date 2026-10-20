@@ -1986,6 +1986,14 @@ mod tests {
     /// What proves it recovered is that the service behind the binding actually ran a
     /// round: a pane that had cancelled its binding while it waited would be told the
     /// stream is closed, and no fetch would ever reach the source.
+    ///
+    /// What it reports then is one of the two working states and not either one by name:
+    /// `load` reports `Connecting` before the stream is asked for, and the round the
+    /// service starts publishes `Refreshing` the moment the first fetch is under way — a
+    /// status that arrives on the application runtime and reaches the pane on its own
+    /// task. Which of the two a test reads therefore depends on whether that round got
+    /// there first, and both mean the same thing: the pane left the notice and is
+    /// reading.
     #[gpui_kit::test]
     fn loading_the_venues_should_let_the_waiting_pane_start(cx: &mut TestAppContext) {
         let source = FakeSource::pending();
@@ -2027,7 +2035,10 @@ mod tests {
                 "the pane started reading rather than failing: {:?}",
                 status.failure()
             );
-            assert_eq!(status, WidgetState::Connecting);
+            assert!(
+                status.is_busy(),
+                "the pane started reading rather than waiting: {status:?}"
+            );
         });
     }
 

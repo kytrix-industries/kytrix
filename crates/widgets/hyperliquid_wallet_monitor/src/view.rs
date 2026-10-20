@@ -2532,8 +2532,11 @@ mod tests {
         let routes = crate::test_support::test_routes();
         let source = TestSource::new(&routes);
         let pane = pane_with_fake(cx, &source, vec![wallet()]);
-        settle_until(cx, "the wallet to be read", |_| {
-            source.counters().spot_states == 1
+        // The reading reaching the pane is what this test starts from, not the fake's count of
+        // reads: a stream reads the address before what it read is published, so the count is
+        // reached while the pane is still waiting for the snapshot it describes.
+        settle_until(cx, "the wallet to be read", |cx| {
+            source.counters().spot_states == 1 && pane.read(cx).has_content()
         });
         cx.update(|cx| {
             assert!(
@@ -2541,7 +2544,6 @@ mod tests {
                 "the pane is reading the wallet"
             );
         });
-
         // The same venue loads again and the catalog it republishes restates the listing the
         // reading is displayed at, which is the shape a production load has: it re-fetches the
         // catalogs.
@@ -2558,8 +2560,11 @@ mod tests {
                 .expect("the venue loads again");
             source.restate(&restated);
         });
-        settle_until(cx, "the wallet to be read again", |_| {
+        // Both the second read and the reading it produced are waited for: the count says the
+        // stream was opened, and the snapshot says what it read has reached the pane.
+        settle_until(cx, "the wallet to be read again", |cx| {
             source.counters().spot_states == 2
+                && pane.read(cx).overview[&wallet()].snapshot.is_some()
         });
 
         cx.update(|cx| {

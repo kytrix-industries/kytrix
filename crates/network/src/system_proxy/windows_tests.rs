@@ -227,7 +227,10 @@ fn concurrent_wpad_callers_share_one_discovery_result() {
         let start = Arc::clone(&start);
         callers.push(std::thread::spawn(move || {
             start.wait();
-            coordinate_wpad_discovery(coordinator, Duration::from_secs(1), move || {
+            // The bound is what a caller waits for a discovery another one is running, and
+            // none of these callers is the one doing the work: a bound tight enough to be
+            // reached by a machine under load would fail the sharing this test is about.
+            coordinate_wpad_discovery(coordinator, Duration::from_secs(30), move || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(50));
                 WpadSnapshot::Discovered("http://wpad/shared.dat".into())
@@ -257,13 +260,18 @@ fn timed_out_wpad_waiters_do_not_start_another_worker() {
     let first = std::thread::spawn(move || {
         coordinate_wpad_discovery(first_coordinator, Duration::from_millis(50), move || {
             first_calls.fetch_add(1, Ordering::SeqCst);
-            started_sender
-                .send(())
-                .expect("the caller is still waiting");
             let (lock, ready) = &*first_gate;
+            // The gate is taken before the start is announced, so the announcement is the
+            // last thing this worker does before it waits: a test that has read it knows the
+            // worker is inside the closure rather than about to become so, which is what the
+            // 50 ms the caller above allows it to be is there for. Announcing first instead
+            // left the sleep between the announcement and the wait racing that deadline.
             let guard = lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            started_sender
+                .send(())
+                .expect("the caller is still waiting");
             let _guard = ready
                 .wait_while(guard, |released| !*released)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -271,7 +279,7 @@ fn timed_out_wpad_waiters_do_not_start_another_worker() {
         })
     });
     started_receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("the discovery worker must start");
     assert_eq!(
         first.join().expect("the first caller must not panic"),

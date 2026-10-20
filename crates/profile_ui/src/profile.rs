@@ -977,13 +977,56 @@ mod tests {
 
     /// Lets a fade finish and repaints, so what is drawn is what has settled: a popup in
     /// its first frames is painted at zero opacity and cannot be told from one that stays.
+    ///
+    /// Both executors are turned, because the menu's work is split between them: what an
+    /// ending aborts happens on GPUI's queue, and the report of that ending is the aborted
+    /// task resuming on the application runtime and reaching the menu through its window.
+    /// GPUI's queue parks before that task has run, so a test that read the menu straight
+    /// after an ending was reading it before its own end had been reported. A test that waits
+    /// for a particular report says so with [`settle_until`] rather than by settling again.
     fn settle(harness: &mut Harness) {
         harness
             .cx
             .executor()
             .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
+        harness.cx.run_until_parked();
+        turn_application_runtime(harness);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
+    }
+
+    /// Drives both executors until `ready` holds, and fails the test when it does not.
+    ///
+    /// Each round turns the clock, repaints and turns the application runtime, because the
+    /// three things a predicate here can read are produced by three different places: a layer
+    /// leaving animates out on the test clock, a debug selector answers what the last painted
+    /// frame drew (AGENTS.md §10), and a task an ending released resumes on the application
+    /// runtime. The predicate is asked at the top of a round, so a condition that is already
+    /// true costs one round.
+    fn settle_until(harness: &mut Harness, what: &str, ready: impl Fn(&mut Harness) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            harness
+                .cx
+                .executor()
+                .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
+            harness.cx.update(|window, _| window.refresh());
+            harness.cx.run_until_parked();
+            if ready(harness) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what} should happen");
+            turn_application_runtime(harness);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Gives the application runtime one turn, which is where a resumed task runs.
+    fn turn_application_runtime(harness: &mut Harness) {
+        let handle = harness
+            .cx
+            .update(|_, cx| global::handle(cx).handle().clone());
+        handle.block_on(async { tokio::task::yield_now().await });
     }
 
     fn stored_account(harness: &mut Harness) -> Option<AccountConfig> {
@@ -1058,18 +1101,14 @@ mod tests {
             .debug_bounds("TEST_MENU_ITEM_open-account")
             .expect("the signed-in menu should draw the account entry");
         harness.cx.simulate_click(entry.center(), Modifiers::none());
-        for _ in 0..100 {
-            harness.cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(5));
-            harness.cx.run_until_parked();
-            if harness.source.count(|state| state.handoffs) > 0 {
-                break;
-            }
-        }
-        for _ in 0..20 {
-            harness.cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // The handoff is a request to the account service, so it is made on the application
+        // runtime: the fixture's own record of it is what says the request has been made.
+        settle_until(harness, "the handoff to be made", |harness| {
+            harness.source.count(|state| state.handoffs) > 0
+        });
+        // And the answer is drawn on a later frame, so what the entry led to is settled before
+        // a test reads the window.
+        settle(harness);
     }
 
     #[gpui_kit::test]
@@ -1352,6 +1391,12 @@ mod tests {
 
         harness.cx.simulate_click(ok.center(), Modifiers::none());
         settle(&mut harness);
+        // The alert closes itself when its control is read, so its absence says nothing about
+        // the attempt. What says the attempt ended is the menu no longer waiting: that happens
+        // when the task the abort released resumes on the application runtime and reports.
+        settle_until(&mut harness, "the attempt to end", |harness| {
+            !pending_sign_in(harness)
+        });
 
         assert!(!shows(&mut harness, "BASE_UI_ALERT"));
         assert!(
@@ -1406,6 +1451,13 @@ mod tests {
             harness.menu.update(cx, |menu, cx| menu.sign_out(cx));
         });
         settle(&mut harness);
+        // Signing out aborts the attempt and drops its handle here, so the menu stops waiting
+        // at once — and the aborted task reports the ending on the application runtime, which
+        // is where an alert left by it is taken down. The alert leaving is what says that
+        // report has been made; waiting for the attempt to end would already be true.
+        settle_until(&mut harness, "the alert to be taken down", |harness| {
+            !shows(harness, "BASE_UI_ALERT")
+        });
 
         assert!(!pending_sign_in(&mut harness));
         assert!(

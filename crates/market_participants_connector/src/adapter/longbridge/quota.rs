@@ -59,17 +59,24 @@ struct QuotaState {
 impl QuotaState {
     /// Adds the tokens that dripped back since the last refill.
     ///
-    /// Only whole milliseconds are consumed, so the part of a millisecond that has
-    /// not passed yet is accounted for by the next refill rather than lost: a bucket
-    /// asked once per request would otherwise drip slightly slower than the venue's
-    /// own rate, by up to a millisecond per request.
+    /// `per_second` counts thousandths of a token per **second**, so the tokens a span of
+    /// `millis` milliseconds earned are `millis * per_second / 1000` — dividing by the
+    /// second, not only by the thousand, is what makes the bucket drip at the pace the
+    /// venue published instead of a thousand times it. `per_second` is always a whole
+    /// number of tokens (`limit * 1000`), so the division is exact and nothing has to be
+    /// carried between refills.
+    ///
+    /// Only whole milliseconds are consumed, so the part of a millisecond that has not
+    /// passed yet is accounted for by the next refill rather than lost: a bucket asked
+    /// once per request would otherwise drip slightly slower than the venue's own rate,
+    /// by up to a millisecond per request.
     fn refill(&mut self, now: Instant) {
         let millis = u64::try_from(now.saturating_duration_since(self.last_refill).as_millis())
             .unwrap_or(u64::MAX);
         if millis == 0 {
             return;
         }
-        let drip = millis.saturating_mul(self.per_second);
+        let drip = millis.saturating_mul(self.per_second) / MILLI;
         self.available = self.available.saturating_add(drip).min(self.capacity);
         self.last_refill += Duration::from_millis(millis);
     }
@@ -164,6 +171,39 @@ mod tests {
             limit,
             burst,
         }
+    }
+
+    /// A bucket drips at the rate its own table states, not at a thousand times it.
+    ///
+    /// The table counts tokens per second and the bucket counts thousandths, so a refill
+    /// of one millisecond is worth a thousandth of the per-second rate — not the whole
+    /// rate. A bucket that forgot to divide would hand back a whole token after every
+    /// millisecond, which on a real clock is no wait at all: the pace the venue
+    /// published would be measured as satisfied instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_refill_drips_at_the_rate_the_table_states() {
+        let quota = LongbridgeQuota::new(1, 1);
+
+        // The burst is spent, so the next token is the one that has to drip back.
+        quota.acquire_one().await;
+
+        // A tenth of a second is a tenth of a token at one per second, so the request
+        // that wants one is still waiting when that much has passed.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, quota.acquire_one())
+                .await
+                .is_err(),
+            "a tenth of the rate is not a whole token"
+        );
+
+        let started = tokio::time::Instant::now();
+        quota.acquire_one().await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(900),
+            "what the first tenth did not cover is nine tenths of the rate away"
+        );
     }
 
     /// A bucket drips one token a second and hands out its burst at once, so a second

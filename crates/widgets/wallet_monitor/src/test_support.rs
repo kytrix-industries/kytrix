@@ -392,7 +392,7 @@ async fn block_operation(blocked: Option<Arc<OperationBlock>>) {
         block: block.clone(),
     };
     block.started.notify_one();
-    std::future::pending().await
+    block.released.notified().await;
 }
 
 /// One live subscription inside the fake session.
@@ -459,9 +459,14 @@ impl WalletEventSubscription for FakeSubscription {
 }
 
 /// One operation a fake can be held inside.
+///
+/// Holding one is how a test pins the window an operation is open in: a read that is held
+/// is a read that has not answered yet, so what a pane reports while it is in flight is what
+/// the test is looking at rather than a race against the answer.
 #[derive(Default)]
 pub(crate) struct OperationBlock {
     started: Notify,
+    released: Notify,
     dropped: AtomicBool,
     dropped_notify: Notify,
 }
@@ -482,6 +487,14 @@ impl OperationBlock {
         tokio::time::timeout(Duration::from_secs(2), self.started.notified())
             .await
             .expect("the blocked operation should start");
+    }
+
+    /// Lets the operation it holds answer.
+    ///
+    /// A held read answers with what the session was told to answer, so a test that waits
+    /// for one to leave the window it pinned does not have to hand it the answer again.
+    pub(crate) fn release(&self) {
+        self.released.notify_one();
     }
 
     pub(crate) async fn wait_dropped(&self) {
