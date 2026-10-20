@@ -441,7 +441,7 @@ impl OutcomeIdentity {
         Ok(HyperliquidListingIdentifiers::Outcome {
             venue: self.scope.clone(),
             outcome_id: self.outcome_id,
-            side: self.side.clone(),
+            side: self.side,
             asset_id: self.asset_id,
             coin: Some(
                 NativeSymbol::new(self.coin.clone())
@@ -539,7 +539,7 @@ pub(crate) fn outcome_group(
     for side in &spec.side_specs {
         sides.push(OutcomeSide::new(&seed_id, side.name.clone()).map_err(model_error)?);
     }
-    let side_ids: Vec<OutcomeSideId> = sides.iter().map(|side| side.id.clone()).collect();
+    let side_ids: Vec<OutcomeSideId> = sides.iter().map(|side| side.id).collect();
     let member = OutcomeMember::new(&seed_id, spec.name.clone(), side_ids).map_err(model_error)?;
     OutcomeGroup::new(seed, sides, vec![member]).map_err(model_error)
 }
@@ -556,7 +556,7 @@ pub(crate) fn outcome_side_id(
     group
         .sides
         .get(side_index)
-        .map(|side| side.id.clone())
+        .map(|side| side.id)
         .ok_or_else(|| {
             protocol_error(
                 "decode a Hyperliquid outcome side",

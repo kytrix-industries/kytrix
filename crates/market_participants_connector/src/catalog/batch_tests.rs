@@ -8,7 +8,7 @@ use market_participants_model::{
     decimal::{Quantity, Tick},
     identifier::{
         CtfConditionId, CtfTokenId, IdentifierValue, NativeSymbol, PolymarketEventId,
-        PolymarketMarketId, ResolutionSourceId, TradingCalendarId,
+        PolymarketMarketId, ResolutionSourceId,
     },
     instrument::{Instrument, InstrumentTerms, OutcomeTerms},
     listing::{
@@ -17,8 +17,8 @@ use market_participants_model::{
         native::OutcomeGroupIdentifier,
         route::VenueRoute,
         rules::{
-            CommonTradingRules, PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule,
-            SettlementCycle, TradingRules,
+            CommonTradingRules, PriceRule, ProductTradingRules, QuantityRule, TradingRules,
+            VenueTradingPolicy,
         },
         venue::{OkxInstrumentType, PriceBasis},
     },
@@ -191,7 +191,7 @@ fn a_snapshot_of_another_key_is_refused() {
 fn a_listing_whose_terms_produce_another_instrument_is_refused() {
     let (context, route) = context(&spot_route());
     let mut broken = btc_entry(&spot_route());
-    let declared = broken.listing.instrument_id.clone();
+    let declared = broken.listing.instrument_id;
     broken.instrument = eth();
 
     let error = accept(
@@ -206,7 +206,7 @@ fn a_listing_whose_terms_produce_another_instrument_is_refused() {
         CatalogValidationError::InstrumentTermsMismatch {
             listing: Box::new(broken.listing.key),
             declared,
-            computed: eth().id().clone(),
+            computed: *eth().id(),
         }
     );
 }
@@ -230,12 +230,12 @@ fn rules_of_another_quote_asset_are_refused() {
 fn rules_of_another_product_are_refused() {
     let (context, route) = context(&spot_route());
     let mut broken = btc_entry(&spot_route());
-    broken.snapshot.rules.product = ProductTradingRules::Outcome(
+    broken.snapshot.rules.product = std::sync::Arc::new(ProductTradingRules::Outcome(
         market_participants_model::listing::rules::OutcomeTradingRules {
             order_book: true,
             negative_risk_conversion: false,
         },
-    );
+    ));
 
     let error = accept(&context, &base_generation(&route), batch_of(vec![broken]))
         .expect_err("rules of another product are refused");
@@ -618,7 +618,7 @@ fn an_event_without_its_risk_pool_is_refused() {
     let second = binary_group("Will it snow?");
     let pool = risk_pool(&first, &second);
     let event = event_of(
-        &[first.id.clone(), second.id.clone()],
+        &[first.id, second.id],
         std::slice::from_ref(&pool.id),
         "event-1",
     );
@@ -647,7 +647,7 @@ fn a_complete_event_and_pool_are_accepted() {
     let second = binary_group("Will it snow?");
     let pool = risk_pool(&first, &second);
     let event = event_of(
-        &[first.id.clone(), second.id.clone()],
+        &[first.id, second.id],
         std::slice::from_ref(&pool.id),
         "event-1",
     );
@@ -679,7 +679,7 @@ fn a_risk_pool_lineage_without_its_predecessor_is_refused() {
     let successor = risk_pool(&reworded, &second);
     let edge = OutcomeRiskPoolLineageEdge::new(
         successor.id,
-        pool.id.clone(),
+        pool.id,
         OutcomeRiskPoolAdjustment::GroupMembershipChange,
         10,
     )
@@ -743,7 +743,7 @@ fn a_risk_pool_successor_is_accepted_with_its_lineage() {
             ],
             outcome_risk_pool_lineage: vec![
                 OutcomeRiskPoolLineageEdge::new(
-                    old_pool.id.clone(),
+                    old_pool.id,
                     successor.id,
                     OutcomeRiskPoolAdjustment::GroupMembershipChange,
                     10,
@@ -792,7 +792,7 @@ fn a_group_successor_without_a_pool_successor_is_refused() {
             outcome_group_lineage: vec![
                 OutcomeGroupLineageEdge::new(
                     first.id,
-                    reworded.id.clone(),
+                    reworded.id,
                     OutcomeGroupAdjustment::QuestionChange,
                     10,
                 )
@@ -859,7 +859,7 @@ fn a_duplicate_risk_pool_successor_is_refused() {
             outcome_risk_pool_lineage: vec![
                 OutcomeRiskPoolLineageEdge::new(
                     first_pool.id,
-                    successor.id.clone(),
+                    successor.id,
                     OutcomeRiskPoolAdjustment::GroupMembershipChange,
                     10,
                 )
@@ -887,16 +887,16 @@ fn a_duplicate_risk_pool_successor_is_refused() {
 #[test]
 fn an_instrument_lineage_cycle_is_refused() {
     let (context, route) = context(&spot_route());
-    let first = btc().id().clone();
-    let second = eth().id().clone();
+    let first = *btc().id();
+    let second = *eth().id();
     let error = accept(
         &context,
         &base_generation(&route),
         CatalogBatch {
             instrument_lineage: vec![
                 InstrumentLineageEdge::new(
-                    first.clone(),
-                    second.clone(),
+                    first,
+                    second,
                     InstrumentAdjustment::DeliverableAdjustment,
                     10,
                 )
@@ -1066,7 +1066,7 @@ fn a_security_keeps_its_issuer_and_share_class() {
         pending
             .securities
             .get(&security_id)
-            .map(|stored| stored.share_class.clone()),
+            .map(|stored| stored.share_class),
         Some(terms.share_class)
     );
 }
@@ -1124,27 +1124,23 @@ fn binary_group(question: &str) -> OutcomeGroup {
     let seed_id = seed.seed_id();
     let yes = OutcomeSide::new(&seed_id, SmolStr::new_static("yes")).expect("the side is valid");
     let no = OutcomeSide::new(&seed_id, SmolStr::new_static("no")).expect("the side is valid");
-    let member = OutcomeMember::new(
-        &seed_id,
-        SmolStr::new_static("winner"),
-        vec![yes.id.clone(), no.id.clone()],
-    )
-    .expect("the member is valid");
+    let member = OutcomeMember::new(&seed_id, SmolStr::new_static("winner"), vec![yes.id, no.id])
+        .expect("the member is valid");
     OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("the group is valid")
 }
 
 fn risk_pool(first: &OutcomeGroup, second: &OutcomeGroup) -> OutcomeRiskPool {
     let conversion = OutcomeConversion {
         input: OutcomeLegRef {
-            group: first.id.clone(),
-            member: first.members[0].id.clone(),
-            side: first.members[0].sides[0].clone(),
+            group: first.id,
+            member: first.members[0].id,
+            side: first.members[0].sides[0],
         },
         outputs: vec![OutcomeConversionOutput {
             leg: OutcomeLegRef {
-                group: second.id.clone(),
-                member: second.members[0].id.clone(),
-                side: second.members[0].sides[0].clone(),
+                group: second.id,
+                member: second.members[0].id,
+                side: second.members[0].sides[0],
             },
             factor: market_participants_model::decimal::PositiveRatio::new(
                 market_participants_model::decimal::Ratio::from(1_u8),
@@ -1154,7 +1150,7 @@ fn risk_pool(first: &OutcomeGroup, second: &OutcomeGroup) -> OutcomeRiskPool {
     };
     OutcomeRiskPool::new(
         settlement_asset(),
-        vec![first.id.clone(), second.id.clone()],
+        vec![first.id, second.id],
         vec![conversion],
     )
     .expect("the pool is valid")
@@ -1184,16 +1180,14 @@ fn outcome_entry_of_leg(
 ) -> CatalogEntry {
     let mut entry = outcome_entry(route, group, symbol);
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id.clone(),
-        member.id.clone(),
-        side.id.clone(),
+        group.id, member.id, side.id,
     )))
     .expect("the outcome instrument is valid");
-    entry.listing.instrument_id = instrument.id().clone();
+    entry.listing.instrument_id = *instrument.id();
     entry.snapshot.rules.common.quantity.unit = QuantityUnit::OutcomeTokens {
-        group: group.id.clone(),
-        member: member.id.clone(),
-        side: side.id.clone(),
+        group: group.id,
+        member: member.id,
+        side: side.id,
     };
     entry.instrument = instrument;
     entry
@@ -1329,18 +1323,16 @@ fn event_of(groups: &[OutcomeGroupId], pools: &[OutcomeRiskPoolId], native: &str
 }
 
 fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> CatalogEntry {
-    let member = group.members[0].id.clone();
-    let side = group.members[0].sides[0].clone();
+    let member = group.members[0].id;
+    let side = group.members[0].sides[0];
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id.clone(),
-        member.clone(),
-        side.clone(),
+        group.id, member, side,
     )))
     .expect("the outcome instrument is valid");
     let key = listing_key(route, symbol);
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("the fixture symbol is valid")),
         Vec::new(),
         VenueListingIdentifiers::Polymarket(PolymarketListingIdentifiers {
@@ -1374,7 +1366,7 @@ fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> Cata
                 },
                 quantity: QuantityRule {
                     unit: QuantityUnit::OutcomeTokens {
-                        group: group.id.clone(),
+                        group: group.id,
                         member,
                         side,
                     },
@@ -1383,16 +1375,14 @@ fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> Cata
                     maximum: None,
                 },
                 notional: None,
-                sessions: TradingCalendarId::continuous_24x7(),
-                settlement_cycle: SettlementCycle::Immediate,
-                price_limits: PriceLimitRule::None,
+                venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
             },
-            product: ProductTradingRules::Outcome(
+            product: std::sync::Arc::new(ProductTradingRules::Outcome(
                 market_participants_model::listing::rules::OutcomeTradingRules {
                     order_book: true,
                     negative_risk_conversion: true,
                 },
-            ),
+            )),
         },
         ListingStatus::Trading,
         None,
@@ -1585,7 +1575,7 @@ fn a_batch_publishes_its_own_native_event_lookup() {
     let event = OutcomeEvent::new(
         ResolutionSourceId::new("polymarket").expect("the source is valid"),
         IdentifierValue::new("event-1").expect("the event value is valid"),
-        vec![group.id.clone()],
+        vec![group.id],
         Vec::new(),
     )
     .expect("the event is valid");
@@ -1764,9 +1754,9 @@ fn an_outcome_listing_of_a_leg_outside_its_group_is_refused() {
         error,
         CatalogValidationError::OutcomeListingLegUnknown {
             listing: Box::new(listing.listing.key),
-            group: group.id.clone(),
+            group: group.id,
             member: ghost.id,
-            side: group.sides[0].id.clone(),
+            side: group.sides[0].id,
         }
     );
 }
@@ -1778,17 +1768,15 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
     let (context, route) = context(&spot_route());
     let group = binary_group("Will it rain?");
     let mut listing = outcome_entry(&spot_route(), &group, "RAIN-YES");
-    let side = group.sides[1].id.clone();
-    let member = group.members[0].id.clone();
+    let side = group.sides[1].id;
+    let member = group.members[0].id;
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id.clone(),
-        member.clone(),
-        side.clone(),
+        group.id, member, side,
     )))
     .expect("the outcome instrument is valid");
-    listing.listing.instrument_id = instrument.id().clone();
+    listing.listing.instrument_id = *instrument.id();
     listing.snapshot.rules.common.quantity.unit = QuantityUnit::OutcomeTokens {
-        group: group.id.clone(),
+        group: group.id,
         member,
         side,
     };
@@ -1852,8 +1840,8 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
         error,
         CatalogValidationError::OutcomeListingLegUnknown {
             listing: Box::new(listing.listing.key),
-            group: group.id.clone(),
-            member: group.members[0].id.clone(),
+            group: group.id,
+            member: group.members[0].id,
             side: foreign.id,
         }
     );
@@ -1897,7 +1885,7 @@ fn a_batch_publishes_its_own_event_group_index() {
     let first = binary_group("Will it rain?");
     let second = binary_group("Will it snow?");
     let native = PolymarketEventId::new("event-7").expect("the event id is valid");
-    let event = event_of(&[first.id.clone(), second.id.clone()], &[], "event-7");
+    let event = event_of(&[first.id, second.id], &[], "event-7");
     context.staging().with(|staging| {
         let pending: &mut OutcomeRegistryPending = staging.pending_outcomes_mut();
         pending
@@ -2074,8 +2062,8 @@ fn only_the_references_a_batch_tracks_are_published() {
     // happen to be spot listings, so the tracked set a derivative would produce is
     // stated explicitly here and the whole publication path is checked with it.
     let mut referenced = ReferencedTerms::collect(&pending, &base_generation(&route));
-    referenced.indices.insert(tracked_id.clone());
-    referenced.price_references.insert(price_id.clone());
+    referenced.indices.insert(tracked_id);
+    referenced.price_references.insert(price_id);
     let registry = pending.pending_references().publish(
         &crate::catalog::registry::reference::ReferenceRegistry::new(),
         &referenced,
@@ -2127,8 +2115,8 @@ fn the_reference_collector_reads_a_derivative_underlying() {
     let index_id = market_participants_model::asset::IndexId::of_terms(&index);
     let price_id = PriceReferenceId::of_terms(&price_reference_terms());
     let underlying = DerivativeUnderlying::new(
-        market_participants_model::asset::UnderlyingRef::Index(index_id.clone()),
-        price_id.clone(),
+        market_participants_model::asset::UnderlyingRef::Index(index_id),
+        price_id,
     );
     let mut referenced = ReferencedTerms::default();
     crate::catalog::batch::collect_derivative(&underlying, &mut referenced);
@@ -2158,7 +2146,7 @@ fn the_reference_collector_reads_a_derivative_underlying() {
         .reference_id()
         .expect("the external reference terms are valid");
     let underlying = DerivativeUnderlying::new(
-        market_participants_model::asset::UnderlyingRef::External(external_id.clone()),
+        market_participants_model::asset::UnderlyingRef::External(external_id),
         price_id,
     );
     let mut other = ReferencedTerms::default();

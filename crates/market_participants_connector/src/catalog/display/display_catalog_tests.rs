@@ -21,7 +21,6 @@ use market_participants_model::{
         ChainId, ContractCode, CtfConditionId, CtfTokenId, EquityLocalCode, IdentifierNamespace,
         IdentifierValue, MarketParticipantSeriesId, Mic, NativeSymbol, OccSymbol,
         PolymarketMarketId, ReferenceSourceId, ReferenceTermsVersion, TokenIssuerId,
-        TradingCalendarId,
     },
     instrument::{
         FutureTerms, Instrument, InstrumentKind, InstrumentTerms, OptionTerms, OutcomeTerms,
@@ -37,8 +36,8 @@ use market_participants_model::{
         listing_impl::{ListingSnapshot, ListingStatus, VenueListing},
         route::{VenueListingKey, VenueRoute},
         rules::{
-            CommonTradingRules, MarginMode, MarginProfile, OptionTradingRules, PriceLimitRule,
-            PriceRule, ProductTradingRules, QuantityRule, SettlementCycle, TradingRules,
+            CommonTradingRules, MarginMode, MarginProfile, OptionTradingRules, PriceRule,
+            ProductTradingRules, QuantityRule, TradingRules, VenueTradingPolicy,
         },
         venue::{BinanceProduct, HyperliquidAssetId, HyperliquidTokenId, PriceBasis},
     },
@@ -489,8 +488,7 @@ fn crypto_future_entry_of(
     quantity: u32,
     series: FutureSeriesIdentifiers,
 ) -> CatalogEntry {
-    let underlying =
-        DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked.clone());
+    let underlying = DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked);
     let terms = FutureTerms::new(
         underlying,
         token(VENUE, "USD"),
@@ -534,8 +532,7 @@ fn future_entry_with_unit(
     unit: AssetId,
     series: FutureSeriesIdentifiers,
 ) -> CatalogEntry {
-    let underlying =
-        DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked.clone());
+    let underlying = DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked);
     let terms = FutureTerms::new(
         underlying,
         token(VENUE, "USD"),
@@ -620,7 +617,7 @@ fn attribute_changes_do_not_change_the_published_name() {
     // Contract size: `A(1,BTC)` against `A(10,BTC)`.
     let route = future_route();
     let (tracked, reference) = crypto_reference("USD");
-    let small = crypto_future_entry_of(&route, tracked.clone(), 1, future_code_series("ES-1"));
+    let small = crypto_future_entry_of(&route, tracked, 1, future_code_series("ES-1"));
     let large = crypto_future_entry_of(&route, tracked, 10, future_code_series("ES-2"));
     let generation = publish_bare(
         &route,
@@ -657,7 +654,7 @@ fn attribute_changes_do_not_change_the_published_name() {
         .expect("the fixture reference is valid");
     let linear = perpetual_entry(
         &route,
-        perpetual_under(tracked.clone(), "BTC", "BTC", DerivativePnlModel::Linear),
+        perpetual_under(tracked, "BTC", "BTC", DerivativePnlModel::Linear),
         "BTCBTC-L",
         "BTC",
     );
@@ -696,7 +693,7 @@ fn attribute_changes_do_not_change_the_published_name() {
     // Delivery legs: the same physical contract, its legs stated two ways.
     let route = future_route();
     let (tracked, reference) = crypto_reference("USD");
-    let receive = physical_future_entry(&route, tracked.clone(), DeliveryDirection::Receive, "P-1");
+    let receive = physical_future_entry(&route, tracked, DeliveryDirection::Receive, "P-1");
     let deliver = physical_future_entry(&route, tracked, DeliveryDirection::Deliver, "P-2");
     let generation = publish_bare(
         &route,
@@ -1222,7 +1219,7 @@ fn a_conversion_reference_of_the_wrong_direction_is_refused() {
         .reference_id()
         .expect("the fixture reference is valid");
     let instrument = inverse_future(tracked_id, conversion_id, conversion);
-    let payload = future_payload(&instrument, wrong_id.clone());
+    let payload = future_payload(&instrument, wrong_id);
     let instrument: Instrument =
         serde_json::from_str(&payload).expect("the decoded payload is a valid dated contract");
 
@@ -1261,8 +1258,7 @@ fn inverse_future(
     conversion_id: PriceReferenceId,
     conversion: PriceReferenceTerms,
 ) -> Instrument {
-    let underlying =
-        DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked.clone());
+    let underlying = DerivativeUnderlying::new(UnderlyingRef::Asset(token(VENUE, "BTC")), tracked);
     let terms = FutureTerms::new(
         underlying,
         token(VENUE, "USD"),
@@ -1332,11 +1328,11 @@ fn future_payload(instrument: &Instrument, conversion_reference: PriceReferenceI
                             .expect("the fixture settles in cash"),
                     )
                     .expect("the fixture reference serializes"),
-                    "conversion_reference": serde_json::to_value(&conversion_reference)
+                    "conversion_reference": serde_json::to_value(conversion_reference)
                         .expect("the fixture reference serializes"),
                 },
             },
-            "conversion_reference": serde_json::to_value(&conversion_reference)
+            "conversion_reference": serde_json::to_value(conversion_reference)
                 .expect("the fixture reference serializes"),
         },
     });
@@ -1425,7 +1421,7 @@ fn perpetual_entry(
             option_series: None,
         },
     );
-    entry.snapshot.rules.product = perpetual_rules(quote);
+    entry.snapshot.rules.product = std::sync::Arc::new(perpetual_rules(quote));
     entry.snapshot.rules.common.price.quote_asset = token(VENUE, quote);
     entry
 }
@@ -1526,7 +1522,7 @@ fn equity_entry(
     .expect("the fixture equity listing key is valid");
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(ticker).expect("the fixture symbol is valid")),
         Vec::new(),
         VenueListingIdentifiers::Equity(equity_identifiers(mic, ticker, local_code)),
@@ -1599,15 +1595,16 @@ fn derivative_rules(
             maximum: None,
         },
         notional: None,
-        sessions: TradingCalendarId::continuous_24x7(),
-        settlement_cycle: SettlementCycle::Immediate,
-        price_limits: PriceLimitRule::None,
+        venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
     };
     let product = match product {
         Some(product) => product,
         None => future_product_rules(),
     };
-    TradingRules { common, product }
+    TradingRules {
+        common,
+        product: std::sync::Arc::new(product),
+    }
 }
 
 /// The product rules of one fixture option listing.
@@ -1881,9 +1878,9 @@ fn an_index_underlying_without_registered_terms_refuses_the_publication() {
     let (tracked, reference) = crypto_reference("USD");
     let index = market_participants_model::asset::IndexId::of_terms(&index_terms());
     let instrument = perpetual_over(
-        UnderlyingRef::Index(index.clone()),
+        UnderlyingRef::Index(index),
         tracked,
-        index_contract_unit(index.clone()),
+        index_contract_unit(index),
     );
     let error = publish(
         &route,
@@ -1915,7 +1912,7 @@ fn an_external_underlying_without_registered_terms_refuses_the_publication() {
         .reference_id()
         .expect("the fixture external reference is valid");
     let instrument = perpetual_over(
-        UnderlyingRef::External(external.clone()),
+        UnderlyingRef::External(external),
         tracked,
         asset_contract_unit(),
     );
@@ -2006,7 +2003,7 @@ fn index_perpetual_entry(
 ) -> crate::catalog::batch::CatalogEntry {
     let index = match instrument.terms() {
         InstrumentTerms::Perpetual(terms) => match terms.underlying().reference() {
-            UnderlyingRef::Index(index) => index.clone(),
+            UnderlyingRef::Index(index) => *index,
             other => panic!("the fixture tracks an index, got {other:?}"),
         },
         other => panic!("the fixture is a perpetual, got {other:?}"),
@@ -2038,7 +2035,7 @@ fn series_entry(
     }
     .listing_key()
     .expect("the fixture series listing key is valid");
-    let listing = series.listing(key.clone(), instrument.id().clone());
+    let listing = series.listing(key.clone(), *instrument.id());
     let product = match instrument.kind() {
         InstrumentKind::Option => option_product_rules(),
         _ => future_product_rules(),
@@ -2234,7 +2231,7 @@ fn two_listings_of_one_name_are_published() {
     let key = test_support::continuity_key(&spot_route(), "BTC-USDC", BinanceProduct::Spot);
     let second = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTC-USDC").expect("the fixture symbol is valid")),
         Vec::new(),
         VenueListingIdentifiers::Hyperliquid(HyperliquidListingIdentifiers::Spot {
@@ -2314,12 +2311,8 @@ fn outcome_group_of(question: &str) -> OutcomeGroup {
     let seed_id = seed.seed_id();
     let yes = OutcomeSide::new(&seed_id, SmolStr::new_static("yes")).expect("the side is valid");
     let no = OutcomeSide::new(&seed_id, SmolStr::new_static("no")).expect("the side is valid");
-    let member = OutcomeMember::new(
-        &seed_id,
-        SmolStr::new_static("winner"),
-        vec![yes.id.clone(), no.id.clone()],
-    )
-    .expect("the member is valid");
+    let member = OutcomeMember::new(&seed_id, SmolStr::new_static("winner"), vec![yes.id, no.id])
+        .expect("the member is valid");
     OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("the group is valid")
 }
 
@@ -2328,18 +2321,16 @@ fn outcome_group_of(question: &str) -> OutcomeGroup {
 /// the protocol label echoes the registry label of the leg the listing
 /// trades, which is what the batch validator compares.
 fn outcome_entry_of(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> CatalogEntry {
-    let member = group.members[0].id.clone();
-    let side = group.members[0].sides[0].clone();
+    let member = group.members[0].id;
+    let side = group.members[0].sides[0];
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id.clone(),
-        member.clone(),
-        side.clone(),
+        group.id, member, side,
     )))
     .expect("the fixture outcome instrument is valid");
     let key = test_support::continuity_key(route, symbol, BinanceProduct::Spot);
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("the fixture symbol is valid")),
         Vec::new(),
         VenueListingIdentifiers::Polymarket(PolymarketListingIdentifiers {
@@ -2389,7 +2380,7 @@ fn outcome_rules(
             },
             quantity: QuantityRule {
                 unit: QuantityUnit::OutcomeTokens {
-                    group: group.id.clone(),
+                    group: group.id,
                     member,
                     side,
                 },
@@ -2398,16 +2389,14 @@ fn outcome_rules(
                 maximum: None,
             },
             notional: None,
-            sessions: TradingCalendarId::continuous_24x7(),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Outcome(
+        product: std::sync::Arc::new(ProductTradingRules::Outcome(
             market_participants_model::listing::rules::OutcomeTradingRules {
                 order_book: true,
                 negative_risk_conversion: true,
             },
-        ),
+        )),
     }
 }
 
@@ -2737,7 +2726,7 @@ fn security_perpetual(security: &AssetId, reference: &PriceReferenceId) -> Instr
         PerpetualTerms::new(
             market_participants_model::asset::DerivativeUnderlying::new(
                 UnderlyingRef::Asset(security.clone()),
-                reference.clone(),
+                *reference,
             ),
             token(VENUE, "USDT"),
             token(VENUE, "USDT"),

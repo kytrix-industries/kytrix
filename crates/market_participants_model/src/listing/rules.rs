@@ -1,6 +1,8 @@
 //! Venue trading rules: price, quantity, session, margin, funding and
 //! per-product rule families.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
@@ -14,12 +16,29 @@ use crate::{
 };
 
 /// The full rule set of one listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// The two halves of a rule set repeat across a catalogue in very different ways,
+/// which is why neither is stored inline:
+///
+/// - [`Self::product`] is shared through an [`Arc`]. A venue's product rules are a
+///   handful of families — a spot lot policy, a perpetual margin ladder, a funding
+///   schedule — repeated by every listing of that family. Four venues' worth of
+///   catalogs hold about fourteen thousand listings but only a couple of hundred
+///   distinct product rule sets, so storing one per listing is almost entirely
+///   duplication.
+/// - [`Self::common`] keeps only the terms that differ per listing. Its sessions,
+///   settlement cycle and price-limit rule are the *venue's* policy rather than the
+///   listing's and are shared through the same [`Arc`]; the price and quantity terms
+///   stay inline because they genuinely differ per listing.
+///
+/// Sharing changes no value: two listings that stated the same rule set still
+/// compare equal, and the serialized shape is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct TradingRules {
     #[serde(rename = "common")]
     pub common: CommonTradingRules,
     #[serde(rename = "product")]
-    pub product: ProductTradingRules,
+    pub product: Arc<ProductTradingRules>,
 }
 
 impl TradingRules {
@@ -79,7 +98,7 @@ impl<'de> Deserialize<'de> for TradingRules {
         let wire = TradingRulesWire::deserialize(deserializer)?;
         let rules = Self {
             common: wire.common,
-            product: wire.product,
+            product: Arc::new(wire.product),
         };
         rules.validate().map_err(de::Error::custom)?;
         Ok(rules)
@@ -117,7 +136,7 @@ impl ListingPrecision {
 }
 
 /// The rules that apply to every product family.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct CommonTradingRules {
     #[serde(rename = "price")]
     pub price: PriceRule,
@@ -125,12 +144,38 @@ pub struct CommonTradingRules {
     pub quantity: QuantityRule,
     #[serde(rename = "notional")]
     pub notional: Option<NotionalRule>,
+    /// The session, settlement and price-limit policy of the listing's venue.
+    ///
+    /// These three are the venue's policy rather than the listing's: a catalogue
+    /// holds one continuous-24x7 calendar, one `Immediate` settlement cycle and one
+    /// no-limit rule for thousands of listings. They are shared through an [`Arc`]
+    /// so a listing pays one pointer instead of the 96 bytes the trio occupies, and
+    /// the serialized shape is unchanged.
+    #[serde(rename = "venue_policy")]
+    pub venue_policy: Arc<VenueTradingPolicy>,
+}
+
+/// The session, settlement and price-limit policy one venue applies to its listings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct VenueTradingPolicy {
     #[serde(rename = "sessions")]
     pub sessions: TradingCalendarId,
     #[serde(rename = "settlement_cycle")]
     pub settlement_cycle: SettlementCycle,
     #[serde(rename = "price_limits")]
     pub price_limits: PriceLimitRule,
+}
+
+impl VenueTradingPolicy {
+    /// The policy a venue applies to every listing that trades continuously and
+    /// settles immediately, which is what a crypto venue's catalogue states.
+    pub fn continuous() -> Self {
+        Self {
+            sessions: TradingCalendarId::continuous_24x7(),
+            settlement_cycle: SettlementCycle::Immediate,
+            price_limits: PriceLimitRule::None,
+        }
+    }
 }
 
 impl CommonTradingRules {
@@ -141,7 +186,7 @@ impl CommonTradingRules {
         if let Some(notional) = &self.notional {
             notional.validate()?;
         }
-        self.price_limits.validate()
+        self.venue_policy.price_limits.validate()
     }
 }
 
@@ -153,12 +198,8 @@ struct CommonTradingRulesWire {
     quantity: QuantityRule,
     #[serde(rename = "notional")]
     notional: Option<NotionalRule>,
-    #[serde(rename = "sessions")]
-    sessions: TradingCalendarId,
-    #[serde(rename = "settlement_cycle")]
-    settlement_cycle: SettlementCycle,
-    #[serde(rename = "price_limits")]
-    price_limits: PriceLimitRule,
+    #[serde(rename = "venue_policy")]
+    venue_policy: VenueTradingPolicy,
 }
 
 impl<'de> Deserialize<'de> for CommonTradingRules {
@@ -171,9 +212,7 @@ impl<'de> Deserialize<'de> for CommonTradingRules {
             price: wire.price,
             quantity: wire.quantity,
             notional: wire.notional,
-            sessions: wire.sessions,
-            settlement_cycle: wire.settlement_cycle,
-            price_limits: wire.price_limits,
+            venue_policy: Arc::new(wire.venue_policy),
         };
         rules.validate().map_err(de::Error::custom)?;
         Ok(rules)
@@ -181,7 +220,7 @@ impl<'de> Deserialize<'de> for CommonTradingRules {
 }
 
 /// The price constraints of a listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct PriceRule {
     #[serde(rename = "quote_asset")]
     pub quote_asset: AssetId,
@@ -243,7 +282,7 @@ impl<'de> Deserialize<'de> for PriceRule {
 }
 
 /// The quantity constraints of a listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct QuantityRule {
     #[serde(rename = "unit")]
     pub unit: QuantityUnit,
@@ -298,7 +337,7 @@ impl<'de> Deserialize<'de> for QuantityRule {
 }
 
 /// The monetary minimum and maximum of one listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct NotionalRule {
     #[serde(rename = "asset")]
     pub asset: AssetId,
@@ -379,7 +418,7 @@ impl SettlementCycle {
 }
 
 /// The price limit of one listing session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 #[serde(tag = "kind", content = "limits")]
 pub enum PriceLimitRule {
     #[serde(rename = "none")]
@@ -499,7 +538,7 @@ impl TimeWindow {
 }
 
 /// How a spot listing accepts order sizes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 #[serde(tag = "kind", content = "policy")]
 pub enum LotPolicy {
     #[serde(rename = "whole_lots")]
@@ -647,7 +686,7 @@ impl MarginMode {
 }
 
 /// The margin requirements of a derivative listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct MarginProfile {
     #[serde(rename = "mode")]
     pub mode: MarginMode,
@@ -715,7 +754,7 @@ impl<'de> Deserialize<'de> for MarginProfile {
 }
 
 /// One leverage tier of a perpetual listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct LeverageTier {
     #[serde(rename = "notional_cap")]
     pub notional_cap: Quantity,
@@ -808,7 +847,7 @@ impl FundingInterval {
 }
 
 /// The funding schedule of a perpetual listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct FundingSchedule {
     #[serde(rename = "interval")]
     pub interval: FundingInterval,
@@ -874,7 +913,7 @@ impl<'de> Deserialize<'de> for FundingSchedule {
 }
 
 /// The spot-specific rules.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct SpotTradingRules {
     #[serde(rename = "lot_policy")]
     pub lot_policy: LotPolicy,
@@ -916,7 +955,7 @@ impl<'de> Deserialize<'de> for SpotTradingRules {
 /// A venue may publish these outside its instrument record — as the contract's
 /// own position tiers — in which case this build carries the listing with an
 /// unloaded [`PerpetualRisk`] instead of reading them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct PerpetualMarginTerms {
     #[serde(rename = "margin")]
     pub margin: MarginProfile,
@@ -967,7 +1006,7 @@ impl<'de> Deserialize<'de> for PerpetualMarginTerms {
 /// A venue that publishes them separately from the instrument record leaves a
 /// listing that is otherwise complete carrying them not yet read; a venue that
 /// publishes them inline carries them read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(tag = "state", content = "terms")]
 pub enum PerpetualRisk {
     /// The venue publishes them outside the instrument record, not yet read.
@@ -979,7 +1018,7 @@ pub enum PerpetualRisk {
 }
 
 /// The perpetual-specific rules.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct PerpetualTradingRules {
     #[serde(rename = "risk")]
     pub risk: PerpetualRisk,
@@ -1026,7 +1065,7 @@ impl<'de> Deserialize<'de> for PerpetualTradingRules {
 }
 
 /// The future-specific rules.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct FutureTradingRules {
     #[serde(rename = "margin")]
     pub margin: MarginProfile,
@@ -1075,7 +1114,7 @@ impl<'de> Deserialize<'de> for FutureTradingRules {
 }
 
 /// The option-specific rules.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct OptionTradingRules {
     #[serde(rename = "margin")]
     pub margin: MarginProfile,
@@ -1128,7 +1167,7 @@ impl<'de> Deserialize<'de> for OptionTradingRules {
 }
 
 /// The outcome-specific rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct OutcomeTradingRules {
     #[serde(rename = "order_book")]
     pub order_book: bool,
@@ -1137,7 +1176,7 @@ pub struct OutcomeTradingRules {
 }
 
 /// The product-specific rules of one listing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 #[serde(tag = "kind", content = "rules")]
 pub enum ProductTradingRules {
     #[serde(rename = "spot")]

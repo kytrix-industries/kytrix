@@ -116,7 +116,7 @@ fn binance_listing(
     let instrument = binance_spot_instrument();
     let listing = VenueListing::new(
         key.listing_key().expect("listing key should be valid"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("symbol should be valid")),
         aliases
             .iter()
@@ -151,7 +151,7 @@ fn publication_should_refuse_only_a_contradicted_echo() {
     .expect("listing key should be valid");
     let listing = VenueListing::new(
         key,
-        binance_spot_instrument().id().clone(),
+        *binance_spot_instrument().id(),
         Some(NativeSymbol::new("BTC").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Hyperliquid(HyperliquidListingIdentifiers::Perpetual {
@@ -366,7 +366,7 @@ fn equity_continuity_should_use_issuer_share_class_and_mic() {
             route: route.clone(),
             terms: ListingContinuityTerms::Equity {
                 issuer: issuer.clone(),
-                share_class: share_class.clone(),
+                share_class: *share_class,
                 mic: Mic::new(mic).expect("mic should be valid"),
                 local_code: EquityLocalCode::new("AAPL").expect("code should be valid"),
             },
@@ -767,7 +767,7 @@ fn echoed_typed_identifiers_should_match_the_display_symbols() {
     let listing = |symbol: Option<&str>, aliases: &[&str], coin: &str| {
         VenueListing::new(
             key.clone(),
-            binance_spot_instrument().id().clone(),
+            *binance_spot_instrument().id(),
             symbol.map(|symbol| NativeSymbol::new(symbol).expect("symbol should be valid")),
             aliases
                 .iter()
@@ -852,7 +852,7 @@ fn equity_listing_should_report_all_three_echo_states() {
     let listing = |symbol: Option<&str>, local_code: &str, ticker: &str| {
         VenueListing::new(
             key.clone(),
-            binance_spot_instrument().id().clone(),
+            *binance_spot_instrument().id(),
             symbol.map(|symbol| NativeSymbol::new(symbol).expect("symbol should be valid")),
             Vec::new(),
             VenueListingIdentifiers::Equity(identifiers(local_code, ticker)),
@@ -907,7 +907,7 @@ fn series_listing_of(
 
     VenueListing::new(
         key,
-        binance_spot_instrument().id().clone(),
+        *binance_spot_instrument().id(),
         Some(NativeSymbol::new(symbol).expect("symbol should be valid")),
         Vec::new(),
         identifiers,
@@ -1076,13 +1076,13 @@ fn hyperliquid_outcome_listing_should_echo_its_coin_only_when_declared() {
     let listing = |symbol: Option<&str>, coin: Option<NativeSymbol>| {
         VenueListing::new(
             key.clone(),
-            binance_spot_instrument().id().clone(),
+            *binance_spot_instrument().id(),
             symbol.map(|symbol| NativeSymbol::new(symbol).expect("symbol should be valid")),
             Vec::new(),
             VenueListingIdentifiers::Hyperliquid(HyperliquidListingIdentifiers::Outcome {
                 venue: VenueScopeId::new("outcome-venue/ab").expect("scope should be valid"),
                 outcome_id: HyperliquidOutcomeId(7),
-                side: side.clone(),
+                side,
                 asset_id: HyperliquidAssetId(9),
                 coin,
                 token_name: IdentifierValue::new("YES").expect("token name should be valid"),
@@ -1117,7 +1117,7 @@ fn families_without_a_comparable_identifier_should_never_verify() {
         binance_key("BTCUSDT")
             .listing_key()
             .expect("listing key should be valid"),
-        binance_spot_instrument().id().clone(),
+        *binance_spot_instrument().id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         vec![NativeSymbol::new("BTC-USDT").expect("alias should be valid")],
         binance_spot_identifiers(),
@@ -1148,8 +1148,8 @@ fn native_identifier_resolution_should_separate_its_three_levels() {
             .expect("event identity");
     let resolutions = [
         NativeIdentifierResolution::Listing(listing),
-        NativeIdentifierResolution::OutcomeGroup(group.clone()),
-        NativeIdentifierResolution::OutcomeEvent(event.clone()),
+        NativeIdentifierResolution::OutcomeGroup(group),
+        NativeIdentifierResolution::OutcomeEvent(event),
     ];
 
     assert_ne!(resolutions[0], resolutions[1]);
@@ -1291,7 +1291,7 @@ fn listing_publication_should_keep_typed_identifiers_authoritative() {
         binance_key("BTCUSDT")
             .listing_key()
             .expect("listing key should be valid"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Binance(crate::listing::identifiers::BinanceListingIdentifiers {

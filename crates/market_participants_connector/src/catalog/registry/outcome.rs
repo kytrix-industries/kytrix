@@ -114,17 +114,17 @@ impl OutcomeRegistry {
         };
         for (condition, group) in &base.conditions {
             if registry.groups.contains_key(group) {
-                registry.conditions.insert(condition.clone(), group.clone());
+                registry.conditions.insert(condition.clone(), *group);
             }
         }
         for (market, group) in &base.markets {
             if registry.groups.contains_key(group) {
-                registry.markets.insert(market.clone(), group.clone());
+                registry.markets.insert(market.clone(), *group);
             }
         }
         for (question, group) in &base.questions {
             if registry.groups.contains_key(group) {
-                registry.questions.insert(question.clone(), group.clone());
+                registry.questions.insert(question.clone(), *group);
             }
         }
         for lookup in lookups {
@@ -133,26 +133,26 @@ impl OutcomeRegistry {
             }
             match lookup {
                 GroupLookup::Condition { condition, group } => {
-                    registry.conditions.insert(condition.clone(), group.clone());
+                    registry.conditions.insert(condition.clone(), *group);
                 }
                 GroupLookup::Market { market, group } => {
-                    registry.markets.insert(market.clone(), group.clone());
+                    registry.markets.insert(market.clone(), *group);
                 }
                 GroupLookup::Question {
                     question, group, ..
                 } => {
-                    registry.questions.insert(question.clone(), group.clone());
+                    registry.questions.insert(question.clone(), *group);
                 }
             }
         }
         for (native, event) in &base.native_events {
             if registry.events.contains_key(event) {
-                registry.native_events.insert(native.clone(), event.clone());
+                registry.native_events.insert(native.clone(), *event);
             }
         }
         for (native, event) in event_lookups {
             if registry.events.contains_key(event) {
-                registry.native_events.insert(native.clone(), event.clone());
+                registry.native_events.insert(native.clone(), *event);
             }
         }
         registry
@@ -276,27 +276,27 @@ impl OutcomeRegistryPending {
         lookups: &[OutcomeGroupIdentifier],
     ) -> Result<OutcomeGroupId, RegistryError> {
         group.validate().map_err(RegistryError::from)?;
-        let id = group.id.clone();
+        let id = group.id;
         for lookup in lookups {
             self.lookups.push(match lookup {
                 OutcomeGroupIdentifier::HyperliquidQuestion { scope, question } => {
                     GroupLookup::Question {
                         scope: scope.clone(),
                         question: question.clone(),
-                        group: id.clone(),
+                        group: id,
                     }
                 }
                 OutcomeGroupIdentifier::PolymarketMarket(market) => GroupLookup::Market {
                     market: market.clone(),
-                    group: id.clone(),
+                    group: id,
                 },
                 OutcomeGroupIdentifier::PolymarketCondition(condition) => GroupLookup::Condition {
                     condition: condition.clone(),
-                    group: id.clone(),
+                    group: id,
                 },
             });
         }
-        self.groups.insert(id.clone(), group);
+        self.groups.insert(id, group);
         Ok(id)
     }
 
@@ -306,11 +306,11 @@ impl OutcomeRegistryPending {
         event: OutcomeEvent,
         native_event: Option<&PolymarketEventId>,
     ) -> OutcomeEventId {
-        let id = event.id.clone();
+        let id = event.id;
         if let Some(native) = native_event {
-            self.event_lookups.push((native.clone(), id.clone()));
+            self.event_lookups.push((native.clone(), id));
         }
-        self.events.insert(id.clone(), event);
+        self.events.insert(id, event);
         id
     }
 
@@ -339,19 +339,19 @@ impl OutcomeRegistryPending {
         let mut groups: AHashMap<OutcomeGroupId, OutcomeGroup> = base.groups().clone();
         for (id, group) in &self.groups {
             if referenced.groups.contains(id) {
-                groups.insert(id.clone(), group.clone());
+                groups.insert(*id, group.clone());
             }
         }
         let mut pools: AHashMap<OutcomeRiskPoolId, OutcomeRiskPool> = base.risk_pools().clone();
         for (id, pool) in &self.risk_pools {
             if referenced.pools.contains(id) {
-                pools.insert(id.clone(), pool.clone());
+                pools.insert(*id, pool.clone());
             }
         }
         let mut events: AHashMap<OutcomeEventId, OutcomeEvent> = base.events().clone();
         for (id, event) in &self.events {
             if referenced.events.contains(id) {
-                events.insert(id.clone(), event.clone());
+                events.insert(*id, event.clone());
             }
         }
         // A successor replaces its predecessor in the current generation: the

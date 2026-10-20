@@ -138,12 +138,13 @@ fn scopes_and_entries_agree_for_one_venue() {
     let perp = entry(PERPETUAL_SCOPE, true, &[CapabilityId::ForceOrders]);
 
     let generation = Arc::new(CatalogGeneration::empty(&CatalogGenerationPublisher::new()));
+    let generation_id = generation.id();
     let revision = {
         let mut table = venues.lock_for_commit();
         table.replace(
             binance,
             vec![Arc::clone(&spot), Arc::clone(&perp)],
-            Arc::clone(&generation),
+            generation_id,
             Arc::new(VenueMetadata::empty()),
         )
     };
@@ -154,13 +155,9 @@ fn scopes_and_entries_agree_for_one_venue() {
     let entries = venues.entries();
     assert!(committed.metadata().perp_dexes().is_empty());
     assert_eq!(
-        committed.pinned_generation().id(),
-        venues
-            .loaded(&binance)
-            .expect("the committed venue is loaded")
-            .pinned_generation()
-            .id(),
-        "the entry pins the generation the same commit published"
+        committed.generation(),
+        generation_id,
+        "the entry names the generation the same commit published"
     );
     assert_eq!(
         entries.len(),
@@ -208,12 +205,13 @@ fn scopes_and_entries_agree_for_one_venue() {
     assert!(venues.scope(&route(&okx, SWAP_SCOPE)).is_none());
 
     let second_generation = Arc::new(CatalogGeneration::empty(&CatalogGenerationPublisher::new()));
+    let second_generation_id = second_generation.id();
     let second_revision = {
         let mut table = venues.lock_for_commit();
         table.replace(
             binance,
             vec![Arc::clone(&spot)],
-            Arc::clone(&second_generation),
+            second_generation_id,
             Arc::new(VenueMetadata::empty()),
         )
     };

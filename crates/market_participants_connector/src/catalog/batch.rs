@@ -23,7 +23,7 @@ use market_participants_model::{
         listing_impl::{ListingSnapshot, VenueListing},
         native::{ListingIdentifier, OutcomeGroupIdentifier},
         route::{VenueListingKey, VenueRoute},
-        rules::TradingRules,
+        rules::{ProductTradingRules, TradingRules, VenueTradingPolicy},
         venue::{PriceBasis, VenueListingId},
     },
     outcome::{
@@ -197,6 +197,19 @@ impl CatalogPending {
             )
         });
 
+        // One shared rule set per distinct value.
+        //
+        // A venue's product rules and its session / settlement / price-limit policy
+        // repeat by the thousand: a catalogue of four venues holds about fourteen
+        // thousand listings behind a couple of hundred distinct product families and
+        // a single venue policy. The adapters build one rule set per listing because
+        // that is the shape the model states, so the publication is where the
+        // duplicates are folded onto one shared value — the rule set a listing
+        // publishes is the one its venue already published, not a copy of it.
+        let mut shared_products: AHashMap<Arc<ProductTradingRules>, ()> = AHashMap::new();
+        let mut shared_policies: AHashMap<Arc<VenueTradingPolicy>, ()> = AHashMap::new();
+        intern_rules(&mut entries, &mut shared_products, &mut shared_policies);
+
         let mut native_keys: AHashMap<SmolStr, VenueListingKey> =
             AHashMap::with_capacity(entries.len() * 2);
         let mut listing_identifiers: AHashMap<ListingIdentifier, VenueListingKey> =
@@ -204,10 +217,10 @@ impl CatalogPending {
         let mut outcome_listings: AHashMap<OutcomeGroupId, VenueListingKey> = AHashMap::new();
         let mut listing_ids: AHashSet<VenueListingId> = AHashSet::with_capacity(entries.len());
         for entry in &entries {
-            if !listing_ids.insert(entry.listing.key.listing_id.clone()) {
+            if !listing_ids.insert(entry.listing.key.listing_id) {
                 return Err(CatalogValidationError::DuplicateListingId {
                     route: venue_route,
-                    listing_id: entry.listing.key.listing_id.clone(),
+                    listing_id: entry.listing.key.listing_id,
                 });
             }
             index_entry(
@@ -249,7 +262,7 @@ impl CatalogPending {
         // 128 Unicode scalar values on a question, and a group that skipped it
         // would publish a question no formatter may render.
         for group in batch.outcome_groups.clone() {
-            let id = group.id.clone();
+            let id = group.id;
             pending_outcomes
                 .register_group(group, &[])
                 .map_err(|error| CatalogValidationError::OutcomeGroupIncomplete {
@@ -258,14 +271,10 @@ impl CatalogPending {
                 })?;
         }
         for pool in &batch.outcome_risk_pools {
-            pending_outcomes
-                .risk_pools
-                .insert(pool.id.clone(), pool.clone());
+            pending_outcomes.risk_pools.insert(pool.id, pool.clone());
         }
         for event in &batch.outcome_events {
-            pending_outcomes
-                .events
-                .insert(event.id.clone(), event.clone());
+            pending_outcomes.events.insert(event.id, event.clone());
         }
 
         // A successor replaces its predecessor in the *current* generation: the
@@ -276,25 +285,19 @@ impl CatalogPending {
             .outcome_group_lineage()
             .iter()
             .chain(batch.outcome_group_lineage.iter())
-            .map(|edge| edge.predecessor.clone())
+            .map(|edge| edge.predecessor)
             .collect();
         let retired_pools: AHashSet<OutcomeRiskPoolId> = base
             .outcome_risk_pool_lineage()
             .iter()
             .chain(batch.outcome_risk_pool_lineage.iter())
-            .map(|edge| edge.predecessor.clone())
+            .map(|edge| edge.predecessor)
             .collect();
 
-        let batch_group_ids: AHashSet<OutcomeGroupId> = batch
-            .outcome_groups
-            .iter()
-            .map(|group| group.id.clone())
-            .collect();
-        let batch_event_ids: AHashSet<OutcomeEventId> = batch
-            .outcome_events
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
+        let batch_group_ids: AHashSet<OutcomeGroupId> =
+            batch.outcome_groups.iter().map(|group| group.id).collect();
+        let batch_event_ids: AHashSet<OutcomeEventId> =
+            batch.outcome_events.iter().map(|event| event.id).collect();
         // One event set for the whole publication: a batch event is published for
         // the route while one of the route's own listings names it, and an event of
         // an earlier generation stays published only while a listing still names
@@ -322,17 +325,17 @@ impl CatalogPending {
             .lookups
             .iter()
             .filter(|lookup| batch_group_ids.contains(lookup.group()))
-            .map(|lookup| (lookup.identifier(), lookup.group().clone()))
+            .map(|lookup| (lookup.identifier(), *lookup.group()))
             .collect();
         let mut native_events: AHashMap<PolymarketEventId, OutcomeEventId> = AHashMap::new();
         for (native, event) in pending_outcomes.event_lookups.iter() {
             if published_event_ids.contains(event) {
-                native_events.insert(native.clone(), event.clone());
+                native_events.insert(native.clone(), *event);
             }
         }
         for (native, event) in base_outcomes.event_lookups() {
             if published_event_ids.contains(event) {
-                native_events.insert(native.clone(), event.clone());
+                native_events.insert(native.clone(), *event);
             }
         }
         let mut native_event_groups: AHashMap<PolymarketEventId, Vec<OutcomeGroupId>> =
@@ -348,7 +351,7 @@ impl CatalogPending {
             let Some(native) = PolymarketEventId::new(event.native_event.as_str()).ok() else {
                 continue;
             };
-            native_events.insert(native.clone(), event.id.clone());
+            native_events.insert(native.clone(), event.id);
             native_event_groups
                 .entry(native)
                 .or_default()
@@ -419,7 +422,7 @@ impl CatalogPending {
                 group: self
                     .outcome_group_lineage
                     .first()
-                    .map(|edge| edge.successor.clone())
+                    .map(|edge| edge.successor)
                     .unwrap_or_else(|| held.any_group()),
             }
         })?;
@@ -428,7 +431,7 @@ impl CatalogPending {
                 pool: self
                     .outcome_risk_pool_lineage
                     .first()
-                    .map(|edge| edge.successor.clone())
+                    .map(|edge| edge.successor)
                     .unwrap_or_else(|| held.any_pool()),
             }
         })?;
@@ -438,15 +441,15 @@ impl CatalogPending {
             if !held.base_pool(&edge.predecessor) || !held.batch_pool(&edge.successor) {
                 return Err(CatalogValidationError::OutcomeRiskPoolLineageInvalid {
                     pool: if held.base_pool(&edge.predecessor) {
-                        edge.successor.clone()
+                        edge.successor
                     } else {
-                        edge.predecessor.clone()
+                        edge.predecessor
                     },
                 });
             }
             if !successors.insert(&edge.successor) {
                 return Err(CatalogValidationError::OutcomeRiskPoolLineageInvalid {
-                    pool: edge.successor.clone(),
+                    pool: edge.successor,
                 });
             }
         }
@@ -456,15 +459,15 @@ impl CatalogPending {
             if !held.has_group(&edge.successor) || !held.has_group(&edge.predecessor) {
                 return Err(CatalogValidationError::OutcomeGroupLineageInvalid {
                     group: if held.has_group(&edge.successor) {
-                        edge.predecessor.clone()
+                        edge.predecessor
                     } else {
-                        edge.successor.clone()
+                        edge.successor
                     },
                 });
             }
             if !group_successors.insert(&edge.successor) {
                 return Err(CatalogValidationError::OutcomeGroupLineageInvalid {
-                    group: edge.successor.clone(),
+                    group: edge.successor,
                 });
             }
         }
@@ -483,7 +486,7 @@ impl CatalogPending {
             for group in &pool.groups {
                 if held.retired_groups.contains(group) {
                     return Err(CatalogValidationError::OutcomeRiskPoolIncomplete {
-                        pool: pool.id.clone(),
+                        pool: pool.id,
                         error: Box::new(ModelError::OutcomeRiskPoolUnresolved {
                             field: "risk pool references a replaced group",
                         }),
@@ -495,8 +498,8 @@ impl CatalogPending {
             for group in &event.groups {
                 if held.retired_groups.contains(group) {
                     return Err(CatalogValidationError::OutcomeEventIncomplete {
-                        event: event.id.clone(),
-                        group: Some(group.clone()),
+                        event: event.id,
+                        group: Some(*group),
                         pool: None,
                     });
                 }
@@ -504,9 +507,9 @@ impl CatalogPending {
             for pool in &event.risk_pools {
                 if held.retired_pools.contains(pool) {
                     return Err(CatalogValidationError::OutcomeEventIncomplete {
-                        event: event.id.clone(),
+                        event: event.id,
                         group: None,
-                        pool: Some(pool.clone()),
+                        pool: Some(*pool),
                     });
                 }
             }
@@ -681,7 +684,7 @@ impl CatalogPending {
         for group in &self.outcome_groups {
             if let Err(error) = group.validate() {
                 return Err(CatalogValidationError::OutcomeGroupIncomplete {
-                    group: group.id.clone(),
+                    group: group.id,
                     error: Box::new(error),
                 });
             }
@@ -704,23 +707,23 @@ impl CatalogPending {
             {
                 return Err(CatalogValidationError::OutcomeListingLegUnknown {
                     listing: Box::new(entry.listing.key.clone()),
-                    group: terms.group().clone(),
-                    member: terms.member().clone(),
-                    side: terms.side().clone(),
+                    group: *terms.group(),
+                    member: *terms.member(),
+                    side: *terms.side(),
                 });
             }
         }
         for pool in &self.outcome_risk_pools {
             if let Err(error) = pool.validate() {
                 return Err(CatalogValidationError::OutcomeRiskPoolIncomplete {
-                    pool: pool.id.clone(),
+                    pool: pool.id,
                     error: Box::new(error),
                 });
             }
             for group in &pool.groups {
                 if !held.has_group(group) {
                     return Err(CatalogValidationError::OutcomeRiskPoolIncomplete {
-                        pool: pool.id.clone(),
+                        pool: pool.id,
                         error: Box::new(ModelError::OutcomeRiskPoolUnresolved {
                             field: "risk pool member group",
                         }),
@@ -733,7 +736,7 @@ impl CatalogPending {
                 {
                     if !held.has_group(&leg.group) {
                         return Err(CatalogValidationError::OutcomeRiskPoolIncomplete {
-                            pool: pool.id.clone(),
+                            pool: pool.id,
                             error: Box::new(ModelError::OutcomeRiskPoolUnresolved {
                                 field: "conversion leg group",
                             }),
@@ -746,8 +749,8 @@ impl CatalogPending {
             for group in &event.groups {
                 if !held.has_group(group) {
                     return Err(CatalogValidationError::OutcomeEventIncomplete {
-                        event: event.id.clone(),
-                        group: Some(group.clone()),
+                        event: event.id,
+                        group: Some(*group),
                         pool: None,
                     });
                 }
@@ -755,9 +758,9 @@ impl CatalogPending {
             for pool in &event.risk_pools {
                 if !held.has_pool(pool) {
                     return Err(CatalogValidationError::OutcomeEventIncomplete {
-                        event: event.id.clone(),
+                        event: event.id,
                         group: None,
-                        pool: Some(pool.clone()),
+                        pool: Some(*pool),
                     });
                 }
             }
@@ -883,12 +886,12 @@ impl HeldIdentities {
         let batch_groups: AHashSet<OutcomeGroupId> = pending
             .outcome_groups
             .iter()
-            .map(|group| group.id.clone())
+            .map(|group| group.id)
             .collect();
         let batch_pools: AHashSet<OutcomeRiskPoolId> = pending
             .outcome_risk_pools
             .iter()
-            .map(|pool| pool.id.clone())
+            .map(|pool| pool.id)
             .collect();
         let pools: Vec<OutcomeRiskPool> = base
             .outcome_risk_pools()
@@ -909,19 +912,19 @@ impl HeldIdentities {
             first_group: pending
                 .outcome_groups
                 .first()
-                .map(|group| group.id.clone())
+                .map(|group| group.id)
                 .or_else(|| base.outcome_groups().keys().next().cloned()),
             first_pool: pending
                 .outcome_risk_pools
                 .first()
-                .map(|pool| pool.id.clone())
+                .map(|pool| pool.id)
                 .or_else(|| base.outcome_risk_pools().keys().next().cloned()),
             base_groups: base.outcome_groups().keys().cloned().collect(),
             group_terms: {
                 let mut terms: AHashMap<OutcomeGroupId, OutcomeGroup> =
                     base.outcome_groups().clone();
                 for group in &pending.outcome_groups {
-                    terms.insert(group.id.clone(), group.clone());
+                    terms.insert(group.id, group.clone());
                 }
                 terms
             },
@@ -986,18 +989,16 @@ impl HeldIdentities {
                         .iter()
                         .any(|edge| edge.predecessor == pool.id)
             })
-            .map(|pool| pool.id.clone())
+            .map(|pool| pool.id)
     }
 
     fn any_group(&self) -> OutcomeGroupId {
         self.first_group
-            .clone()
             .expect("a refusal always has a batch and a generation to name")
     }
 
     fn any_pool(&self) -> OutcomeRiskPoolId {
         self.first_pool
-            .clone()
             .expect("a refusal always has a batch and a generation to name")
     }
 }
@@ -1082,7 +1083,7 @@ fn validate_reference_roles(
         InstrumentTerms::Perpetual(terms) => {
             if let Some(conversion) = terms.conversion_reference() {
                 checks.push(conversion_direction(
-                    conversion.clone(),
+                    *conversion,
                     terms.settlement_asset(),
                     terms.price_quote(),
                 ));
@@ -1098,7 +1099,7 @@ fn validate_reference_roles(
                 && let Some(asset) = terms.delivery().cash_asset()
             {
                 checks.push(conversion_direction(
-                    conversion.clone(),
+                    *conversion,
                     asset,
                     terms.price_quote(),
                 ));
@@ -1114,7 +1115,7 @@ fn validate_reference_roles(
                 && let Some(asset) = terms.delivery().cash_asset()
             {
                 checks.push(conversion_direction(
-                    conversion.clone(),
+                    *conversion,
                     asset,
                     terms.price_quote(),
                 ));
@@ -1163,7 +1164,7 @@ fn outcome_label_echo(
         return Ok(None);
     };
     let missing = || DisplayError::MissingOutcomeTerms {
-        group: terms.group().clone(),
+        group: *terms.group(),
     };
     let group = outcomes.group(terms.group()).ok_or_else(missing)?;
     let protocol = normalize_component_text(ComponentText::FreeText(label))
@@ -1233,10 +1234,57 @@ fn settlement_direction(
         UnderlyingRef::Index(_) | UnderlyingRef::External(_) => return Vec::new(),
     };
     vec![ReferenceCheck {
-        reference: reference.clone(),
+        reference: *reference,
         direction,
     }]
 }
+/// Folds the rule sets one batch repeats onto one shared value each.
+///
+/// An adapter builds a rule set per listing because the model states rules per
+/// listing, but a venue publishes the same product rules for every contract of a
+/// product family and one session / settlement / price-limit policy for the whole
+/// venue. Handing every listing its own copy would make the publication, rather than
+/// the venue, the thing that decides how much memory a rule set costs: a catalogue of
+/// four venues holds about fourteen thousand listings behind a couple of hundred
+/// distinct product families.
+///
+/// The rule set is the only thing folded. The entry keeps its own key, its own
+/// instrument and its own price and quantity terms, because those genuinely differ per
+/// listing.
+fn intern_rules(
+    entries: &mut [CatalogEntry],
+    products: &mut AHashMap<Arc<ProductTradingRules>, ()>,
+    policies: &mut AHashMap<Arc<VenueTradingPolicy>, ()>,
+) {
+    let mut product_of: AHashMap<ProductTradingRules, Arc<ProductTradingRules>> =
+        AHashMap::with_capacity(products.capacity());
+    let mut policy_of: AHashMap<VenueTradingPolicy, Arc<VenueTradingPolicy>> =
+        AHashMap::with_capacity(policies.capacity());
+    for entry in entries.iter_mut() {
+        let rules = &mut entry.snapshot.rules;
+        let existing = product_of.get(rules.product.as_ref());
+        rules.product = match existing {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let shared = Arc::clone(&rules.product);
+                product_of.insert(shared.as_ref().clone(), Arc::clone(&shared));
+                shared
+            }
+        };
+        let existing = policy_of.get(rules.common.venue_policy.as_ref());
+        rules.common.venue_policy = match existing {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let shared = Arc::clone(&rules.common.venue_policy);
+                policy_of.insert(shared.as_ref().clone(), Arc::clone(&shared));
+                shared
+            }
+        };
+    }
+    products.extend(product_of.into_values().map(|shared| (shared, ())));
+    policies.extend(policy_of.into_values().map(|shared| (shared, ())));
+}
+
 fn validate_entry(
     route: &VenueRoute,
     entry: CatalogEntry,
@@ -1256,8 +1304,8 @@ fn validate_entry(
     if &entry.listing.instrument_id != entry.instrument.id() {
         return Err(CatalogValidationError::InstrumentTermsMismatch {
             listing: Box::new(entry.listing.key.clone()),
-            declared: entry.listing.instrument_id.clone(),
-            computed: entry.instrument.id().clone(),
+            declared: entry.listing.instrument_id,
+            computed: *entry.instrument.id(),
         });
     }
     entry
@@ -1267,8 +1315,8 @@ fn validate_entry(
             ModelError::InstrumentTermsMismatch { .. } => {
                 CatalogValidationError::InstrumentTermsMismatch {
                     listing: Box::new(entry.listing.key.clone()),
-                    declared: entry.listing.instrument_id.clone(),
-                    computed: entry.instrument.id().clone(),
+                    declared: entry.listing.instrument_id,
+                    computed: *entry.instrument.id(),
                 }
             }
             other => CatalogValidationError::InvalidListingIdentifiers {
@@ -1375,7 +1423,7 @@ fn index_entry(
         insert_native_key(&venue_route, native_keys, key, &entry.listing.key)?;
     }
     if let InstrumentTerms::Outcome(terms) = entry.instrument.terms() {
-        outcome_listings.insert(terms.group().clone(), entry.listing.key.clone());
+        outcome_listings.insert(*terms.group(), entry.listing.key.clone());
     }
     Ok(())
 }
@@ -1405,17 +1453,17 @@ pub(crate) fn resolve_declared_event(
 ) -> Option<OutcomeEventId> {
     for (native, id) in pending_events.event_lookups.iter() {
         if native == declared {
-            return Some(id.clone());
+            return Some(*id);
         }
     }
     for (native, id) in base.event_lookups() {
         if native == declared {
-            return Some(id.clone());
+            return Some(*id);
         }
     }
     for candidate in pending_events.events.values().chain(base.events().values()) {
         if candidate.native_event.as_str() == declared.as_str() {
-            return Some(candidate.id.clone());
+            return Some(candidate.id);
         }
     }
     None
@@ -1487,7 +1535,7 @@ impl ReferencedTerms {
             collect_rules(&entry.snapshot.rules, &mut referenced.assets);
         }
         for group in &pending.outcome_groups {
-            referenced.groups.insert(group.id.clone());
+            referenced.groups.insert(group.id);
             referenced.assets.insert(group.settlement_asset.clone());
         }
         for event in &pending.outcome_events {
@@ -1500,16 +1548,16 @@ impl ReferencedTerms {
         referenced.events =
             declared_events(&pending.entries, &pending.pending_outcomes, base.outcomes());
         for pool in &pending.outcome_risk_pools {
-            referenced.pools.insert(pool.id.clone());
+            referenced.pools.insert(pool.id);
             referenced.assets.insert(pool.settlement_asset.clone());
         }
         for edge in &pending.outcome_group_lineage {
-            referenced.groups.insert(edge.predecessor.clone());
-            referenced.groups.insert(edge.successor.clone());
+            referenced.groups.insert(edge.predecessor);
+            referenced.groups.insert(edge.successor);
         }
         for edge in &pending.outcome_risk_pool_lineage {
-            referenced.pools.insert(edge.predecessor.clone());
-            referenced.pools.insert(edge.successor.clone());
+            referenced.pools.insert(edge.predecessor);
+            referenced.pools.insert(edge.successor);
         }
         referenced.retired_groups = pending.retired_groups.clone();
         referenced.retired_pools = pending.retired_pools.clone();
@@ -1534,7 +1582,7 @@ fn collect_instrument(instrument: &Instrument, referenced: &mut ReferencedTerms)
             // instrument whose conversion reference names an identity no registry
             // carries.
             if let Some(conversion) = terms.conversion_reference() {
-                referenced.price_references.insert(conversion.clone());
+                referenced.price_references.insert(*conversion);
             }
         }
         InstrumentTerms::Future(terms) => {
@@ -1552,7 +1600,7 @@ fn collect_instrument(instrument: &Instrument, referenced: &mut ReferencedTerms)
             collect_contract_size(terms.contract_size(), &mut referenced.assets);
             collect_delivery(terms.delivery(), referenced);
             if let Some(conversion) = terms.conversion_reference() {
-                referenced.price_references.insert(conversion.clone());
+                referenced.price_references.insert(*conversion);
             }
         }
         InstrumentTerms::Outcome(_) => {}
@@ -1570,15 +1618,15 @@ pub(crate) fn collect_derivative(
             referenced.assets.insert(asset.clone());
         }
         UnderlyingRef::Index(index) => {
-            referenced.indices.insert(index.clone());
+            referenced.indices.insert(*index);
         }
         UnderlyingRef::External(external) => {
-            referenced.external_references.insert(external.clone());
+            referenced.external_references.insert(*external);
         }
     }
     referenced
         .price_references
-        .insert(underlying.price_reference().clone());
+        .insert(*underlying.price_reference());
 }
 
 fn collect_contract_size(size: &ContractSize, assets: &mut AHashSet<AssetId>) {
@@ -1609,10 +1657,10 @@ fn collect_delivery(
         referenced.assets.insert(leg.asset().clone());
     }
     if let Some(reference) = delivery.cash_reference() {
-        referenced.price_references.insert(reference.clone());
+        referenced.price_references.insert(*reference);
     }
     if let Some(conversion) = delivery.cash_conversion_reference() {
-        referenced.price_references.insert(conversion.clone());
+        referenced.price_references.insert(*conversion);
     }
 }
 
@@ -1641,53 +1689,50 @@ pub fn publish_assets(
         match &asset {
             AssetId::Currency(id) => {
                 if let Some(terms) = base.currency(id) {
-                    currencies.insert(id.clone(), terms.clone());
+                    currencies.insert(*id, terms.clone());
                 }
             }
             AssetId::CryptoToken(id) => {
                 if let Some(terms) = base.crypto_token(id) {
-                    crypto_tokens.insert(id.clone(), terms.clone());
+                    crypto_tokens.insert(*id, terms.clone());
                 }
             }
             AssetId::Security(id) => {
                 if let Some(terms) = base.security(id) {
-                    securities.insert(id.clone(), terms.clone());
+                    securities.insert(*id, terms.clone());
                 }
                 if let Some(terms) = base.share_class(id) {
-                    share_classes.insert(id.clone(), terms.clone());
+                    share_classes.insert(*id, terms.clone());
                 }
             }
             AssetId::Commodity(id) => {
                 if let Some(terms) = base.commodity(id) {
-                    commodities.insert(id.clone(), terms.clone());
+                    commodities.insert(*id, terms.clone());
                 }
             }
         }
     }
     for (id, terms) in &pending.currencies {
-        if referenced.assets.contains(&AssetId::Currency(id.clone())) {
-            currencies.insert(id.clone(), terms.clone());
+        if referenced.assets.contains(&AssetId::Currency(*id)) {
+            currencies.insert(*id, terms.clone());
         }
     }
     for (id, terms) in &pending.crypto_tokens {
-        if referenced
-            .assets
-            .contains(&AssetId::CryptoToken(id.clone()))
-        {
-            crypto_tokens.insert(id.clone(), terms.clone());
+        if referenced.assets.contains(&AssetId::CryptoToken(*id)) {
+            crypto_tokens.insert(*id, terms.clone());
         }
     }
     for (id, terms) in &pending.securities {
-        if referenced.assets.contains(&AssetId::Security(id.clone())) {
-            securities.insert(id.clone(), terms.clone());
+        if referenced.assets.contains(&AssetId::Security(*id)) {
+            securities.insert(*id, terms.clone());
             if let Some(share_class) = pending.share_classes.get(id) {
-                share_classes.insert(id.clone(), share_class.clone());
+                share_classes.insert(*id, share_class.clone());
             }
         }
     }
     for (id, terms) in &pending.commodities {
-        if referenced.assets.contains(&AssetId::Commodity(id.clone())) {
-            commodities.insert(id.clone(), terms.clone());
+        if referenced.assets.contains(&AssetId::Commodity(*id)) {
+            commodities.insert(*id, terms.clone());
         }
     }
     AssetRegistry::from_terms(

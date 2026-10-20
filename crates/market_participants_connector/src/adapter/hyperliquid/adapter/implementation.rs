@@ -27,8 +27,8 @@ pub(super) use market_participants_model::{
         rules::{
             CommonTradingRules, FundingInterval, FundingSchedule, LeverageTier, LotPolicy,
             MarginMode, MarginProfile, PerpetualMarginTerms, PerpetualRisk, PerpetualTradingRules,
-            PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule, SettlementCycle,
-            ShortSalePolicy, SpotTradingRules, TradingRules,
+            PriceRule, ProductTradingRules, QuantityRule, ShortSalePolicy, SpotTradingRules,
+            TradingRules, VenueTradingPolicy,
         },
         venue::HyperliquidAssetId,
     },
@@ -2190,11 +2190,9 @@ fn spot_rules(
                 maximum: None,
             },
             notional: None,
-            sessions: market_participants_model::identifier::TradingCalendarId::continuous_24x7(),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Spot(
+        product: Arc::new(ProductTradingRules::Spot(
             SpotTradingRules::new(
                 LotPolicy::FractionalAllowed {
                     lot_size: step(sz_decimals)?,
@@ -2203,7 +2201,7 @@ fn spot_rules(
                 ShortSalePolicy::NotApplicable,
             )
             .map_err(model_error)?,
-        ),
+        )),
     })
 }
 
@@ -2244,11 +2242,9 @@ fn perpetual_rules(
                 maximum: None,
             },
             notional: None,
-            sessions: market_participants_model::identifier::TradingCalendarId::continuous_24x7(),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Perpetual(PerpetualTradingRules {
+        product: Arc::new(ProductTradingRules::Perpetual(PerpetualTradingRules {
             risk: PerpetualRisk::Published(
                 PerpetualMarginTerms::new(
                     MarginProfile::new(
@@ -2271,7 +2267,7 @@ fn perpetual_rules(
                 asset: collateral_asset,
             },
             open_interest_cap: None,
-        }),
+        })),
     })
 }
 

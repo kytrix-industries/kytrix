@@ -204,16 +204,16 @@ impl AssetRegistryView {
                 + self.commodities.as_ref().map_or(0, |map| map.len()),
         );
         for id in self.currencies.iter().flat_map(|map| map.keys()) {
-            assets.push(AssetId::Currency(id.clone()));
+            assets.push(AssetId::Currency(*id));
         }
         for id in self.crypto_tokens.iter().flat_map(|map| map.keys()) {
-            assets.push(AssetId::CryptoToken(id.clone()));
+            assets.push(AssetId::CryptoToken(*id));
         }
         for id in self.securities.iter().flat_map(|map| map.keys()) {
-            assets.push(AssetId::Security(id.clone()));
+            assets.push(AssetId::Security(*id));
         }
         for id in self.commodities.iter().flat_map(|map| map.keys()) {
-            assets.push(AssetId::Commodity(id.clone()));
+            assets.push(AssetId::Commodity(*id));
         }
         assets
     }
@@ -320,7 +320,7 @@ impl AssetRegistryPending {
     /// Stages a currency identity.
     pub fn register_currency(&mut self, terms: CurrencyTerms) -> CurrencyId {
         let id = CurrencyId::of_terms(&terms);
-        self.currencies.insert(id.clone(), terms);
+        self.currencies.insert(id, terms);
         id
     }
     /// Stages a crypto token identity.
@@ -330,14 +330,14 @@ impl AssetRegistryPending {
     ) -> Result<CryptoTokenId, RegistryError> {
         terms.validate().map_err(RegistryError::from)?;
         let id = CryptoTokenId::of_terms(&terms);
-        self.crypto_tokens.insert(id.clone(), terms);
+        self.crypto_tokens.insert(id, terms);
         Ok(id)
     }
 
     /// Stages a security identity.
     pub fn register_security(&mut self, terms: SecurityTerms) -> SecurityId {
         let id = SecurityId::of_terms(&terms);
-        self.securities.insert(id.clone(), terms);
+        self.securities.insert(id, terms);
         id
     }
 
@@ -368,7 +368,7 @@ impl AssetRegistryPending {
             }
             AssetTerms::Security { terms, share_class } => {
                 let id = SecurityId::of_terms(&terms);
-                self.share_classes.insert(id.clone(), share_class);
+                self.share_classes.insert(id, share_class);
                 self.securities.insert(id, terms);
             }
             AssetTerms::Commodity(terms) => {

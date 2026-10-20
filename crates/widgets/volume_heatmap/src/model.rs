@@ -401,10 +401,7 @@ pub(super) fn combine_market_tickers(
         tickers.sort_by(compare_ticker_freshness);
         tickers.dedup_by(|left, right| left.listing == right.listing);
         for ticker in tickers {
-            let key = (
-                ticker.instrument.id().clone(),
-                ticker.notional_asset.clone(),
-            );
+            let key = (*ticker.instrument.id(), ticker.notional_asset.clone());
             let entry = by_instrument.entry(key).or_insert_with(|| CombinedTicker {
                 instrument: ticker.instrument.clone(),
                 base_asset_label: ticker.base_asset_label.clone(),

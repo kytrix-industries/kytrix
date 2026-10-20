@@ -18,7 +18,7 @@ use crate::{
         ModelError, SettlementAssetRole, require_non_negative_time, require_ordered_time,
         require_strictly_sorted,
     },
-    identifier::{CanonicalEncoder, CanonicalTerms, InstrumentIdentity},
+    identifier::{CanonicalEncoder, CanonicalTerms, IdentityText, InstrumentIdentity},
     listing::venue::PriceBasis,
     market::account::AssetAmount,
     reference::{PriceReferenceId, PriceReferenceTerms},
@@ -654,8 +654,8 @@ impl DeliveryMode {
                 conversion_reference,
             } => Self::build_cash(
                 asset.clone(),
-                reference.clone(),
-                CashConversion::Identity(conversion_reference.clone()),
+                *reference,
+                CashConversion::Identity(*conversion_reference),
             )
             .map(|_| ()),
             Self::Physical { deliveries } => Self::physical(deliveries.clone()).map(|_| ()),
@@ -1273,7 +1273,7 @@ impl StockSplit {
     /// Returns the de-duplication key of this corporate action.
     pub fn dedup_key(&self) -> (SecurityId, UnixMillis, Ratio) {
         (
-            self.security.clone(),
+            self.security,
             self.effective_at,
             self.new_shares_per_old_share.ratio(),
         )
@@ -1282,22 +1282,22 @@ impl StockSplit {
 
 /// A relation between two canonical identities inside a lineage graph.
 pub trait LineageRelation {
-    /// Returns the predecessor identity of this relation.
-    fn predecessor(&self) -> &str;
+    /// Returns the predecessor identity text of this relation.
+    fn predecessor(&self) -> IdentityText;
 
-    /// Returns the successor identity of this relation.
-    fn successor(&self) -> &str;
+    /// Returns the successor identity text of this relation.
+    fn successor(&self) -> IdentityText;
 
     /// Returns the instant at which this relation becomes effective.
     fn effective_at(&self) -> UnixMillis;
 }
 
 impl LineageRelation for InstrumentLineageEdge {
-    fn predecessor(&self) -> &str {
+    fn predecessor(&self) -> IdentityText {
         self.predecessor.as_str()
     }
 
-    fn successor(&self) -> &str {
+    fn successor(&self) -> IdentityText {
         self.successor.as_str()
     }
 
@@ -1799,7 +1799,7 @@ mod tests {
             "a settlement in the price quote converts nothing"
         );
         assert_eq!(
-            DeliveryMode::cash(AssetId::Security(security.clone()), reference(), None),
+            DeliveryMode::cash(AssetId::Security(security), reference(), None),
             Err(ModelError::UnsupportedSettlementAsset {
                 asset: AssetId::Security(security),
                 role: SettlementAssetRole::CashDelivery,
@@ -1953,7 +1953,7 @@ mod tests {
         assert_eq!(
             delivery_statement(CashConversion::Registry(Some(&conversion))),
             instrument_statement(ConversionSource::Registry {
-                carrier: Some(identity.clone()),
+                carrier: Some(identity),
                 terms: Some(&conversion),
             }),
             "a delivery derives its identity from the terms an instrument carries"
@@ -1961,9 +1961,9 @@ mod tests {
         // A delivery has no instrument level, so an identity is the identity alone there,
         // and the two levels agree on what no conversion at all is.
         assert_eq!(
-            delivery_statement(CashConversion::Identity(Some(identity.clone()))),
+            delivery_statement(CashConversion::Identity(Some(identity))),
             instrument_statement(ConversionSource::Identity {
-                carrier: Some(identity.clone()),
+                carrier: Some(identity),
                 mirror: None,
             })
         );
@@ -2118,7 +2118,7 @@ mod tests {
         assert_ne!(b, c);
         assert_ne!(a, c);
         let edges = vec![
-            InstrumentLineageEdge::new(a, b.clone(), InstrumentAdjustment::CorporateAction, 1)
+            InstrumentLineageEdge::new(a, b, InstrumentAdjustment::CorporateAction, 1)
                 .expect("edge should be valid"),
             InstrumentLineageEdge::new(b, c, InstrumentAdjustment::DeliverableAdjustment, 2)
                 .expect("edge should be valid"),
@@ -2150,7 +2150,7 @@ mod tests {
         let b = crypto_spot_identity("BTC", "USDT");
         let c = crypto_spot_identity("ETH", "USDT");
         let edges = vec![
-            InstrumentLineageEdge::new(a, b.clone(), InstrumentAdjustment::CorporateAction, 9)
+            InstrumentLineageEdge::new(a, b, InstrumentAdjustment::CorporateAction, 9)
                 .expect("edge should be valid"),
             InstrumentLineageEdge::new(b, c, InstrumentAdjustment::DeliverableAdjustment, 1)
                 .expect("edge should be valid"),
@@ -2172,40 +2172,20 @@ mod tests {
         let b = crypto_spot_identity("BTC", "USDT");
         let c = crypto_spot_identity("ETH", "USDT");
         let cycle = vec![
-            InstrumentLineageEdge::new(
-                a.clone(),
-                b.clone(),
-                InstrumentAdjustment::CorporateAction,
-                0,
-            )
-            .expect("edge should be valid"),
-            InstrumentLineageEdge::new(
-                b.clone(),
-                a.clone(),
-                InstrumentAdjustment::CorporateAction,
-                0,
-            )
-            .expect("edge should be valid"),
+            InstrumentLineageEdge::new(a, b, InstrumentAdjustment::CorporateAction, 0)
+                .expect("edge should be valid"),
+            InstrumentLineageEdge::new(b, a, InstrumentAdjustment::CorporateAction, 0)
+                .expect("edge should be valid"),
         ];
         let duplicate_successor = vec![
-            InstrumentLineageEdge::new(
-                a.clone(),
-                c.clone(),
-                InstrumentAdjustment::CorporateAction,
-                0,
-            )
-            .expect("edge should be valid"),
-            InstrumentLineageEdge::new(b, c.clone(), InstrumentAdjustment::CorporateAction, 0)
+            InstrumentLineageEdge::new(a, c, InstrumentAdjustment::CorporateAction, 0)
+                .expect("edge should be valid"),
+            InstrumentLineageEdge::new(b, c, InstrumentAdjustment::CorporateAction, 0)
                 .expect("edge should be valid"),
         ];
         let duplicated = vec![
-            InstrumentLineageEdge::new(
-                a.clone(),
-                c.clone(),
-                InstrumentAdjustment::CorporateAction,
-                0,
-            )
-            .expect("edge should be valid"),
+            InstrumentLineageEdge::new(a, c, InstrumentAdjustment::CorporateAction, 0)
+                .expect("edge should be valid"),
             InstrumentLineageEdge::new(a, c, InstrumentAdjustment::CorporateAction, 0)
                 .expect("edge should be valid"),
         ];
@@ -2236,8 +2216,7 @@ mod tests {
         let a = crypto_spot_identity("BTC", "USDT");
 
         assert!(
-            InstrumentLineageEdge::new(a.clone(), a, InstrumentAdjustment::CorporateAction, 0)
-                .is_err()
+            InstrumentLineageEdge::new(a, a, InstrumentAdjustment::CorporateAction, 0).is_err()
         );
     }
 
@@ -2255,7 +2234,7 @@ mod tests {
             .expect("share class should be valid"),
             SecurityForm::CommonStock,
         );
-        let identity = security.clone();
+        let identity = security;
         let split = StockSplit::new(
             security,
             PositiveRatio::new(Ratio::from(4_u8)).expect("ratio should be positive"),
@@ -2297,8 +2276,8 @@ mod tests {
             )
             .expect("split should be valid")
         };
-        let first = split(apple.clone(), 4, 1_700_000_000_000);
-        let repeated = split(apple.clone(), 4, 1_700_000_000_000);
+        let first = split(apple, 4, 1_700_000_000_000);
+        let repeated = split(apple, 4, 1_700_000_000_000);
 
         assert_eq!(
             first.dedup_key(),
@@ -2307,7 +2286,7 @@ mod tests {
         );
         assert_ne!(
             first.dedup_key(),
-            split(apple.clone(), 2, 1_700_000_000_000).dedup_key()
+            split(apple, 2, 1_700_000_000_000).dedup_key()
         );
         assert_ne!(
             first.dedup_key(),

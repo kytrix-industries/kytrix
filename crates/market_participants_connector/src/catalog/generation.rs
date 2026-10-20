@@ -352,19 +352,19 @@ impl CatalogGeneration {
         let mut groups: AHashMap<OutcomeGroupId, OutcomeGroup> = AHashMap::new();
         for (id, group) in self.outcome_events.groups() {
             if reachable.groups.contains(id) {
-                groups.insert(id.clone(), group.clone());
+                groups.insert(*id, group.clone());
             }
         }
         let mut pools: AHashMap<OutcomeRiskPoolId, OutcomeRiskPool> = AHashMap::new();
         for (id, pool) in self.outcome_events.risk_pools() {
             if reachable.pools.contains(id) {
-                pools.insert(id.clone(), pool.clone());
+                pools.insert(*id, pool.clone());
             }
         }
         let mut events: AHashMap<OutcomeEventId, OutcomeEvent> = AHashMap::new();
         for (id, event) in self.outcome_events.events() {
             if reachable.events.contains(id) {
-                events.insert(id.clone(), event.clone());
+                events.insert(*id, event.clone());
             }
         }
         // A surviving snapshot only keeps the event indexes it still publishes, so
@@ -384,7 +384,7 @@ impl CatalogGeneration {
             > = AHashMap::new();
             for (native, id) in &snapshot.native_events {
                 if kept.contains(id) {
-                    native_events.insert(native.clone(), id.clone());
+                    native_events.insert(native.clone(), *id);
                 }
             }
             let mut native_event_groups: AHashMap<
@@ -402,6 +402,18 @@ impl CatalogGeneration {
                         native_event_groups.insert(native.clone(), kept_groups);
                     }
                 }
+            }
+            // A route whose event indexes survive this publication unchanged keeps
+            // the snapshot it already had, `Arc` and all. Rebuilding it would
+            // deep-copy every listing key of the route's lookup maps for no
+            // difference in content, and a venue commit rebuilds *every* surviving
+            // route, so the copy is what one commit costs the whole catalog.
+            let unchanged = kept == snapshot.published_events
+                && native_events == snapshot.native_events
+                && native_event_groups == snapshot.native_event_groups;
+            if unchanged {
+                rebuilt_events.push((route.clone(), Arc::clone(snapshot)));
+                continue;
             }
             let mut next = snapshot.as_ref().clone();
             next.published_events = kept;
@@ -523,10 +535,10 @@ impl ReachableOutcomes {
                     continue;
                 }
                 for group in &event.groups {
-                    grew |= groups.insert(group.clone());
+                    grew |= groups.insert(*group);
                 }
                 for pool in &event.risk_pools {
-                    grew |= pools.insert(pool.clone());
+                    grew |= pools.insert(*pool);
                 }
             }
             for (id, pool) in outcomes.risk_pools() {
@@ -534,7 +546,7 @@ impl ReachableOutcomes {
                     continue;
                 }
                 for group in &pool.groups {
-                    grew |= groups.insert(group.clone());
+                    grew |= groups.insert(*group);
                 }
             }
             if !grew {
@@ -563,7 +575,6 @@ pub struct RouteSnapshot {
     route: VenueRoute,
     route_revision: RouteInputRevision,
     entries: Arc<[CatalogEntry]>,
-    by_listing: AHashMap<VenueListingKey, Arc<CatalogEntry>>,
     native_keys: AHashMap<smol_str::SmolStr, VenueListingKey>,
     listing_identifiers: AHashMap<ListingIdentifier, VenueListingKey>,
     outcome_listings: AHashMap<OutcomeGroupId, VenueListingKey>,
@@ -594,16 +605,10 @@ impl RouteSnapshot {
     /// about to accept, so it builds one and drops it; the publication builds the
     /// real one from the same staged content.
     pub(crate) fn from_pending_ref(pending: &CatalogPending) -> Self {
-        let mut by_listing: AHashMap<VenueListingKey, Arc<CatalogEntry>> =
-            AHashMap::with_capacity(pending.entries().len());
-        for entry in pending.entries().iter() {
-            by_listing.insert(entry.listing.key.clone(), Arc::new(entry.clone()));
-        }
         Self {
             route: pending.route().clone(),
             route_revision: pending.revision(),
             entries: Arc::clone(pending.entries()),
-            by_listing,
             native_keys: pending.native_keys().clone(),
             listing_identifiers: pending.listing_identifiers().clone(),
             outcome_listings: pending.outcome_listings().clone(),
@@ -664,9 +669,24 @@ impl RouteSnapshot {
         &self.entries
     }
 
-    /// Returns the listing of one listing key.
-    pub fn listing(&self, key: &VenueListingKey) -> Option<&Arc<CatalogEntry>> {
-        self.by_listing.get(key)
+    /// Returns the entry of one listing key.
+    ///
+    /// The entries are held in canonical key order — the order
+    /// [`listing_order`](market_participants_model::listing::navigation::listing_order)
+    /// defines, which is the order a batch is staged in and the order every listing
+    /// list is drawn in — so the lookup is a binary search over the snapshot's own
+    /// array. A map from key to position would answer the same question at the cost
+    /// of one more entry per listing, and the array is already the index.
+    pub fn listing(&self, key: &VenueListingKey) -> Option<&CatalogEntry> {
+        self.entries
+            .binary_search_by(|entry| {
+                market_participants_model::listing::navigation::listing_order(
+                    &entry.listing.key,
+                    key,
+                )
+            })
+            .ok()
+            .map(|index| &self.entries[index])
     }
 
     /// Returns the listing a normalized native symbol names.
@@ -904,10 +924,9 @@ pub(crate) fn listing_entry(
     generation: &CatalogGeneration,
     listing: &VenueListingKey,
 ) -> Option<Arc<CatalogEntry>> {
-    generation
-        .route_snapshot(&listing.route)?
-        .listing(listing)
-        .cloned()
+    let snapshot = generation.route_snapshot(&listing.route)?;
+    let entry = snapshot.listing(listing)?;
+    Some(Arc::new(entry.clone()))
 }
 
 /// The entry of one published listing, or the refusal that names it.
@@ -1087,7 +1106,7 @@ fn index_instruments(
     for snapshot in route_snapshots.values() {
         for entry in snapshot.entries.iter() {
             index
-                .entry(entry.listing.instrument_id.clone())
+                .entry(entry.listing.instrument_id)
                 .or_default()
                 .push(entry.listing.key.clone());
         }

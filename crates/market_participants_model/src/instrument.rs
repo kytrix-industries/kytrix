@@ -189,7 +189,7 @@ impl PerpetualTerms {
             self.contract_size.clone(),
             self.pnl_model,
             ConversionSource::Identity {
-                carrier: self.conversion_reference.clone(),
+                carrier: self.conversion_reference,
                 mirror: None,
             },
         )
@@ -1327,7 +1327,7 @@ impl From<&InstrumentTerms> for InstrumentWireDto {
                 settlement_asset: terms.settlement_asset.clone(),
                 contract_size: terms.contract_size.clone(),
                 pnl_model: terms.pnl_model,
-                conversion_reference: terms.conversion_reference.clone(),
+                conversion_reference: terms.conversion_reference,
             },
             InstrumentTerms::Future(terms) => Self::Future {
                 underlying: terms.underlying.clone(),
@@ -1351,9 +1351,9 @@ impl From<&InstrumentTerms> for InstrumentWireDto {
                 conversion_reference: terms.delivery.cash_conversion_reference().cloned(),
             },
             InstrumentTerms::Outcome(terms) => Self::Outcome {
-                group: terms.group.clone(),
-                member: terms.member.clone(),
-                side: terms.side.clone(),
+                group: terms.group,
+                member: terms.member,
+                side: terms.side,
             },
         }
     }
@@ -1442,14 +1442,10 @@ pub(crate) fn expected_price_basis(
     contract_size: &ContractSize,
 ) -> PriceBasis {
     if let Some(index) = contract_size.index() {
-        return PriceBasis::PerIndexPoint {
-            index: index.clone(),
-        };
+        return PriceBasis::PerIndexPoint { index: *index };
     }
     match underlying.reference() {
-        UnderlyingRef::Index(index) => PriceBasis::PerIndexPoint {
-            index: index.clone(),
-        },
+        UnderlyingRef::Index(index) => PriceBasis::PerIndexPoint { index: *index },
         UnderlyingRef::Asset(_) | UnderlyingRef::External(_) => PriceBasis::PerAssetUnit,
     }
 }
@@ -2017,7 +2013,7 @@ mod tests {
             .reference_id()
             .expect("the external reference terms should be valid");
         crate::asset::DerivativeUnderlying {
-            reference: UnderlyingRef::External(id.clone()),
+            reference: UnderlyingRef::External(id),
             price_reference: reference(
                 UnderlyingRef::External(id),
                 usd(),
@@ -2895,7 +2891,7 @@ mod tests {
             option.cash_payoff(
                 Price::from(120_u32),
                 OptionSettlementObservation::converted(
-                    reference_id.clone(),
+                    reference_id,
                     AssetAmount {
                         asset: usd(),
                         value: SignedQuantity::from_inner((Quantity::from(4_u8)).inner() as i128),
@@ -3879,9 +3875,7 @@ mod tests {
         let side = OutcomeSideId::from_identity_value(&format!("v1/{}", "3".repeat(64)))
             .expect("side identity");
         let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-            group.clone(),
-            member.clone(),
-            side.clone(),
+            group, member, side,
         )))
         .expect("instrument should be valid");
 
@@ -4152,9 +4146,7 @@ mod tests {
         assert_eq!(
             encoded["spec"]["conversion_reference"],
             serde_json::to_value(
-                expected_conversion
-                    .clone()
-                    .expect("the cross-asset terms carry a conversion reference")
+                expected_conversion.expect("the cross-asset terms carry a conversion reference")
             )
             .expect("the reference should serialize"),
             "a cross-asset perpetual must state the conversion identity it was built with"

@@ -889,11 +889,11 @@ mod tests {
         let group = OutcomeGroupId::from_identity_value(&format!("v1/{}", "1".repeat(64)))
             .expect("fixture identity");
         let error = ModelError::OutcomeGroupIncomplete {
-            group: group.clone(),
+            group,
             field: "empty question",
         };
 
-        assert!(error.to_string().contains(group.as_str()));
+        assert!(error.to_string().contains(group.as_str().as_str()));
         assert!(
             ModelError::OutcomeGroupUnresolved {
                 field: "unresolved"

@@ -175,7 +175,7 @@ impl RequestedTerms {
                 }
             }
             InstrumentTerms::Outcome(terms) => {
-                self.outcomes.insert(terms.group().clone());
+                self.outcomes.insert(*terms.group());
                 // An outcome instrument names no asset of its own: the group's
                 // settlement asset is the one its name is denominated in, so it is
                 // the asset this publication resolves.
@@ -190,10 +190,10 @@ impl RequestedTerms {
         match underlying {
             UnderlyingRef::Asset(asset) => self.named_asset(asset),
             UnderlyingRef::Index(index) => {
-                self.indices.insert(index.clone());
+                self.indices.insert(*index);
             }
             UnderlyingRef::External(reference) => {
-                self.external_references.insert(reference.clone());
+                self.external_references.insert(*reference);
             }
         }
     }
@@ -230,10 +230,10 @@ fn collect_registered_terms(
         requested.assets.insert(asset);
     }
     for (index, _) in references.indices() {
-        requested.indices.insert(index.clone());
+        requested.indices.insert(*index);
     }
     for (reference, _) in references.external_references() {
-        requested.external_references.insert(reference.clone());
+        requested.external_references.insert(*reference);
     }
 }
 
@@ -273,7 +273,7 @@ impl NameLinks<'_> {
             .get(index)
             .cloned()
             .ok_or_else(|| DisplayError::MissingIndexTerms {
-                index: Box::new(index.clone()),
+                index: Box::new(*index),
             })
     }
 
@@ -286,7 +286,7 @@ impl NameLinks<'_> {
             .get(reference)
             .cloned()
             .ok_or_else(|| DisplayError::MissingExternalReferenceTerms {
-                reference: Box::new(reference.clone()),
+                reference: Box::new(*reference),
             })
     }
 }
@@ -418,13 +418,13 @@ fn resolve_index_codes(
     let mut codes: AHashMap<IndexId, AssetDisplayCode> = AHashMap::with_capacity(requested.len());
     for index in requested {
         let missing = || DisplayError::MissingIndexTerms {
-            index: Box::new(index.clone()),
+            index: Box::new(*index),
         };
         let terms = references.index(index).ok_or_else(missing)?;
         let code = AssetDisplayCode::from_terms(AssetDisplayTerms::Index(terms))
             .map_err(|error| DisplayError::Format { error })?
             .ok_or_else(missing)?;
-        codes.insert(index.clone(), code);
+        codes.insert(*index, code);
     }
     Ok(codes)
 }
@@ -438,7 +438,7 @@ fn resolve_external_reference_codes(
         AHashMap::with_capacity(requested.len());
     for reference in requested {
         let missing = || DisplayError::MissingExternalReferenceTerms {
-            reference: Box::new(reference.clone()),
+            reference: Box::new(*reference),
         };
         let terms = references
             .external_reference(reference)
@@ -446,7 +446,7 @@ fn resolve_external_reference_codes(
         let code = AssetDisplayCode::from_terms(AssetDisplayTerms::External(terms))
             .map_err(|error| DisplayError::Format { error })?
             .ok_or_else(missing)?;
-        codes.insert(reference.clone(), code);
+        codes.insert(*reference, code);
     }
     Ok(codes)
 }
@@ -474,8 +474,8 @@ fn resolve_instruments(
         }
         let rendered = instrument_details(instrument, links, outcomes)?;
         let name = format_instrument(&rendered).map_err(|error| DisplayError::Format { error })?;
-        names.insert(instrument.id().clone(), name);
-        details.insert(instrument.id().clone(), rendered);
+        names.insert(*instrument.id(), name);
+        details.insert(*instrument.id(), rendered);
     }
     Ok((names, details))
 }
@@ -564,9 +564,7 @@ fn outcome_group<'a>(
 ) -> Result<&'a OutcomeGroup, DisplayError> {
     outcomes
         .group(group)
-        .ok_or_else(|| DisplayError::MissingOutcomeTerms {
-            group: group.clone(),
-        })
+        .ok_or(DisplayError::MissingOutcomeTerms { group: *group })
 }
 
 /// Returns the registry label of the member and side one outcome listing trades.
@@ -578,14 +576,11 @@ fn outcome_leg<'a>(
     let member_label = group
         .member(member)
         .map(|found| &found.label)
-        .ok_or_else(|| DisplayError::MissingOutcomeTerms {
-            group: group.id.clone(),
-        })?;
-    let side_label = group.side(side).map(|found| &found.label).ok_or_else(|| {
-        DisplayError::MissingOutcomeTerms {
-            group: group.id.clone(),
-        }
-    })?;
+        .ok_or(DisplayError::MissingOutcomeTerms { group: group.id })?;
+    let side_label = group
+        .side(side)
+        .map(|found| &found.label)
+        .ok_or(DisplayError::MissingOutcomeTerms { group: group.id })?;
     Ok((member_label, side_label))
 }
 
@@ -604,7 +599,7 @@ fn verify_instrument_equality(
             format_instrument(rendered).map_err(|error| DisplayError::Format { error })?;
         if names.get(id) != Some(&formatted) {
             return Err(DisplayError::InstrumentNameMismatch {
-                instrument: Box::new(id.clone()),
+                instrument: Box::new(*id),
             });
         }
     }
@@ -636,7 +631,7 @@ fn resolve_listings(
         let listing = &candidate.listing;
         let name = names.get(&listing.instrument_id).cloned().ok_or_else(|| {
             DisplayError::InstrumentNameMismatch {
-                instrument: Box::new(listing.instrument_id.clone()),
+                instrument: Box::new(listing.instrument_id),
             }
         })?;
         listings.insert(listing.key.clone(), name);
@@ -716,11 +711,11 @@ mod tests {
         let id = instrument_id('a');
         let mut names: AHashMap<InstrumentId, InstrumentDisplayString> = AHashMap::new();
         names.insert(
-            id.clone(),
+            id,
             format_instrument(&spot_details("BTC", "USD")).expect("the other rendering is a name"),
         );
         let mut published: AHashMap<InstrumentId, InstrumentDisplayDetails> = AHashMap::new();
-        published.insert(id.clone(), spot_details("BTC", "USDT"));
+        published.insert(id, spot_details("BTC", "USDT"));
 
         let error = verify_instrument_equality(&names, &published)
             .expect_err("a name that is not its details' rendering is refused");

@@ -22,7 +22,7 @@ use market_participants_model::{
     decimal::{Quantity, Tick, UnixMillis},
     identifier::{
         IdentifierNamespace, IdentifierValue, NativeSymbol, ReferenceSourceId,
-        ReferenceTermsVersion, TokenIssuerId, TradingCalendarId, VenueId, VenueScopeId,
+        ReferenceTermsVersion, TokenIssuerId, VenueId, VenueScopeId,
     },
     instrument::{Instrument, InstrumentKind, InstrumentTerms, SpotTerms},
     listing::{
@@ -31,8 +31,8 @@ use market_participants_model::{
         listing_impl::{ListingSnapshot, ListingStatus, VenueListing},
         route::{VenueListingKey, VenueRoute},
         rules::{
-            CommonTradingRules, LotPolicy, PriceLimitRule, PriceRule, ProductTradingRules,
-            QuantityRule, SettlementCycle, ShortSalePolicy, SpotTradingRules, TradingRules,
+            CommonTradingRules, LotPolicy, PriceRule, ProductTradingRules, QuantityRule,
+            ShortSalePolicy, SpotTradingRules, TradingRules, VenueTradingPolicy,
         },
         venue::{BinanceProduct, PriceBasis, VenueListingId},
     },
@@ -224,11 +224,9 @@ pub fn rules(quote: AssetId, base: AssetId) -> TradingRules {
                 maximum: None,
             },
             notional: None,
-            sessions: TradingCalendarId::continuous_24x7(),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Spot(
+        product: Arc::new(ProductTradingRules::Spot(
             SpotTradingRules::new(
                 LotPolicy::FractionalAllowed {
                     lot_size: Quantity::from(1_u8),
@@ -237,7 +235,7 @@ pub fn rules(quote: AssetId, base: AssetId) -> TradingRules {
                 ShortSalePolicy::Allowed,
             )
             .expect("the fixture spot rules should be valid"),
-        ),
+        )),
     }
 }
 
@@ -281,7 +279,7 @@ pub fn entry_of(
     let (quote, base) = spot_assets(&instrument);
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("the fixture symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Binance(identifiers),
@@ -702,17 +700,17 @@ pub fn fixture_price_reference_terms(instrument: &Instrument) -> Option<PriceRef
         InstrumentTerms::Perpetual(terms) => (
             terms.underlying().reference().clone(),
             terms.price_quote().clone(),
-            terms.underlying().price_reference().clone(),
+            *terms.underlying().price_reference(),
         ),
         InstrumentTerms::Future(terms) => (
             terms.underlying().reference().clone(),
             terms.price_quote().clone(),
-            terms.underlying().price_reference().clone(),
+            *terms.underlying().price_reference(),
         ),
         InstrumentTerms::Option(terms) => (
             terms.underlying().reference().clone(),
             terms.price_quote().clone(),
-            terms.underlying().price_reference().clone(),
+            *terms.underlying().price_reference(),
         ),
         InstrumentTerms::Spot(_) | InstrumentTerms::Outcome(_) => return None,
     };
@@ -732,7 +730,7 @@ pub fn fixture_price_reference_terms(instrument: &Instrument) -> Option<PriceRef
             schema_version: ReferenceTermsVersion::new("v1")
                 .expect("the fixture reference version is valid"),
         };
-        if candidate.reference_id().ok() == Some(wanted.clone()) {
+        if candidate.reference_id().ok() == Some(wanted) {
             return Some(candidate);
         }
     }

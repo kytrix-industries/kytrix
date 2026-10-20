@@ -2093,7 +2093,7 @@ mod tests {
                 "a user-visible route names the venue and upper-cases the scope: {refused}"
             );
             assert!(
-                refused.contains(listing.listing_id.as_str()),
+                refused.contains(listing.listing_id.as_str().as_str()),
                 "the refused listing has to be named: {refused}"
             );
 
@@ -2228,7 +2228,10 @@ mod tests {
             .localized_message(cx)
             .to_string();
 
-            assert!(rendered.contains(listing.listing_id.as_str()), "{rendered}");
+            assert!(
+                rendered.contains(listing.listing_id.as_str().as_str()),
+                "{rendered}"
+            );
             assert!(!rendered.is_empty(), "{rendered}");
         });
     }
@@ -2655,7 +2658,7 @@ mod tests {
 
             assert!(incomplete.contains("load position tiers"), "{incomplete}");
             assert!(
-                !incomplete.contains(listing.listing_id.as_str()),
+                !incomplete.contains(listing.listing_id.as_str().as_str()),
                 "the listing stays a typed diagnostic, not a name: {incomplete}"
             );
 
@@ -2719,7 +2722,10 @@ mod tests {
             .to_string();
 
             assert!(mismatch.contains("Binance/PERPETUAL"), "{mismatch}");
-            assert!(mismatch.contains(listing.listing_id.as_str()), "{mismatch}");
+            assert!(
+                mismatch.contains(listing.listing_id.as_str().as_str()),
+                "{mismatch}"
+            );
 
             let protocol = AccountError::Protocol {
                 operation: "fetch balances",

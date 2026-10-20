@@ -161,7 +161,7 @@ fn equity_listing(
 
     VenueListing::new(
         key,
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(ticker).expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Equity(EquityListingIdentifiers {
@@ -191,24 +191,16 @@ fn polymarket_group(question: &str, labels: &[&str], topology: OutcomeTopology) 
     let members: Vec<OutcomeMember> = if labels.len() == 2 {
         // A binary market is exactly one member with two complementary sides.
         vec![
-            OutcomeMember::new(
-                &seed_id,
-                "winner".into(),
-                vec![sides[0].id.clone(), sides[1].id.clone()],
-            )
-            .expect("member should be valid"),
+            OutcomeMember::new(&seed_id, "winner".into(), vec![sides[0].id, sides[1].id])
+                .expect("member should be valid"),
         ]
     } else {
         sides
             .iter()
             .enumerate()
             .map(|(index, side)| {
-                OutcomeMember::new(
-                    &seed_id,
-                    format!("member-{index}").into(),
-                    vec![side.id.clone()],
-                )
-                .expect("member should be valid")
+                OutcomeMember::new(&seed_id, format!("member-{index}").into(), vec![side.id])
+                    .expect("member should be valid")
             })
             .collect()
     };
@@ -222,11 +214,7 @@ fn polymarket_binary_market_should_model_one_complementary_pair() {
         &["Yes", "No"],
         OutcomeTopology::Binary,
     );
-    let yes = OutcomeTerms::new(
-        group.id.clone(),
-        group.members[0].id.clone(),
-        group.members[0].sides[0].clone(),
-    );
+    let yes = OutcomeTerms::new(group.id, group.members[0].id, group.members[0].sides[0]);
     let instrument =
         Instrument::new(InstrumentTerms::Outcome(yes)).expect("instrument should be valid");
 
@@ -258,18 +246,18 @@ fn polymarket_negative_risk_fixture_should_relate_two_groups_through_a_pool() {
     );
     let pool = OutcomeRiskPool::new(
         usdc(),
-        vec![first.id.clone(), second.id.clone()],
+        vec![first.id, second.id],
         vec![crate::outcome::OutcomeConversion {
             input: crate::outcome::OutcomeLegRef {
-                group: first.id.clone(),
-                member: first.members[0].id.clone(),
-                side: first.members[0].sides[0].clone(),
+                group: first.id,
+                member: first.members[0].id,
+                side: first.members[0].sides[0],
             },
             outputs: vec![crate::outcome::OutcomeConversionOutput {
                 leg: crate::outcome::OutcomeLegRef {
-                    group: second.id.clone(),
-                    member: second.members[0].id.clone(),
-                    side: second.members[0].sides[0].clone(),
+                    group: second.id,
+                    member: second.members[0].id,
+                    side: second.members[0].sides[0],
                 },
                 factor: PositiveRatio::new(Ratio::from(1_u8)).expect("ratio should be valid"),
             }],
@@ -466,10 +454,10 @@ fn adjusted_option_deliverable_should_create_a_successor_instrument() {
         .expect("instrument should be valid");
     let adjusted = Instrument::new(InstrumentTerms::Option(option(150, 150)))
         .expect("instrument should be valid");
-    let original_id = original.id().clone();
+    let original_id = *original.id();
     let edge = InstrumentLineageEdge::new(
-        original_id.clone(),
-        adjusted.id().clone(),
+        original_id,
+        *adjusted.id(),
         InstrumentAdjustment::DeliverableAdjustment,
         2_000,
     )
@@ -498,7 +486,7 @@ fn adjusted_option_deliverable_should_create_a_successor_instrument() {
     );
     assert_eq!(
         InstrumentLineageEdge::new(
-            original_id.clone(),
+            original_id,
             original_id,
             InstrumentAdjustment::DeliverableAdjustment,
             2_000,

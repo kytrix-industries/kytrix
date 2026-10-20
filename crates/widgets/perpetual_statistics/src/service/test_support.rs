@@ -96,7 +96,7 @@ pub(crate) fn perpetual_entry(
     .expect("the fixture perpetual instrument is valid");
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("the fixture symbol is canonical")),
         Vec::new(),
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -126,7 +126,7 @@ pub(crate) fn perpetual_entry(
 fn perpetual_rules(quote: AssetId, base: AssetId) -> TradingRules {
     let mut rules = test_support::rules(quote.clone(), base);
     rules.common.price.basis = PriceBasis::PerAssetUnit;
-    rules.product = ProductTradingRules::Perpetual(PerpetualTradingRules {
+    rules.product = std::sync::Arc::new(ProductTradingRules::Perpetual(PerpetualTradingRules {
         risk: PerpetualRisk::Published(
             PerpetualMarginTerms::new(
                 MarginProfile::new(
@@ -153,7 +153,7 @@ fn perpetual_rules(quote: AssetId, base: AssetId) -> TradingRules {
         )
         .expect("the fixture funding schedule is valid"),
         open_interest_cap: None,
-    });
+    }));
     rules
 }
 

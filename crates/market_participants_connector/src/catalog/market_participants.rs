@@ -216,7 +216,7 @@ fn catalog_entry(entry: NativeCatalogEntry) -> Result<CatalogEntry, ModelError> 
         instrument,
         ..
     } = entry;
-    let instrument_id = instrument.id().clone();
+    let instrument_id = *instrument.id();
     let snapshot_key = listing.clone();
     let listing = VenueListing::new(
         listing,

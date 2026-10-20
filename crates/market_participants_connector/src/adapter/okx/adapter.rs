@@ -24,7 +24,7 @@ use market_participants_model::{
     decimal::{Price, Quantity, Tick, UnixMillis},
     identifier::{
         IdentifierNamespace, IdentifierValue, NativeSymbol, ReferenceSourceId,
-        ReferenceTermsVersion, TokenIssuerId, TradingCalendarId, VenueId,
+        ReferenceTermsVersion, TokenIssuerId, VenueId,
     },
     instrument::{Instrument, InstrumentTerms, PerpetualTerms, SpotTerms},
     listing::{
@@ -33,8 +33,8 @@ use market_participants_model::{
         route::{VenueListingKey, VenueRoute},
         rules::{
             CommonTradingRules, FundingInterval, FundingSchedule, LotPolicy, PerpetualRisk,
-            PerpetualTradingRules, PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule,
-            SettlementCycle, ShortSalePolicy, SpotTradingRules, TradingRules,
+            PerpetualTradingRules, PriceRule, ProductTradingRules, QuantityRule, ShortSalePolicy,
+            SpotTradingRules, TradingRules, VenueTradingPolicy,
         },
         venue::{OkxInstrumentType, PriceBasis},
     },
@@ -1238,11 +1238,9 @@ impl OkxListedInstrument {
                     maximum: self.maximum,
                 },
                 notional: None,
-                sessions: TradingCalendarId::continuous_24x7(),
-                settlement_cycle: SettlementCycle::Immediate,
-                price_limits: PriceLimitRule::None,
+                venue_policy: Arc::new(VenueTradingPolicy::continuous()),
             },
-            product: ProductTradingRules::Spot(
+            product: Arc::new(ProductTradingRules::Spot(
                 SpotTradingRules::new(
                     LotPolicy::FractionalAllowed {
                         lot_size: self.lot_size,
@@ -1251,7 +1249,7 @@ impl OkxListedInstrument {
                     ShortSalePolicy::NotApplicable,
                 )
                 .map_err(|error| model_error("build OKX spot rules", error))?,
-            ),
+            )),
         })
     }
 
@@ -1279,11 +1277,9 @@ impl OkxListedInstrument {
                     maximum: self.maximum,
                 },
                 notional: None,
-                sessions: TradingCalendarId::continuous_24x7(),
-                settlement_cycle: SettlementCycle::Immediate,
-                price_limits: PriceLimitRule::None,
+                venue_policy: Arc::new(VenueTradingPolicy::continuous()),
             },
-            product: ProductTradingRules::Perpetual(PerpetualTradingRules {
+            product: Arc::new(ProductTradingRules::Perpetual(PerpetualTradingRules {
                 risk: PerpetualRisk::Unloaded,
                 funding: FundingSchedule::new(
                     FundingInterval::Adaptive,
@@ -1293,7 +1289,7 @@ impl OkxListedInstrument {
                 )
                 .map_err(|error| model_error("build OKX funding schedule", error))?,
                 open_interest_cap: None,
-            }),
+            })),
         })
     }
 }
@@ -3785,7 +3781,7 @@ mod tests {
             .rules
             .validate_for(&entry.instrument)
             .expect("the catalog rules hold for the instrument they describe");
-        let ProductTradingRules::Perpetual(product) = &entry.rules.product else {
+        let ProductTradingRules::Perpetual(product) = entry.rules.product.as_ref() else {
             panic!("expected perpetual rules");
         };
         assert_eq!(product.risk, PerpetualRisk::Unloaded);

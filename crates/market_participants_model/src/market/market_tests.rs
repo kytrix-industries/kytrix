@@ -98,18 +98,12 @@ fn outcome_fixture() -> (Instrument, OutcomeMember) {
     let seed_id = seed.seed_id();
     let yes = OutcomeSide::new(&seed_id, "Yes".into()).expect("side should be valid");
     let no = OutcomeSide::new(&seed_id, "No".into()).expect("side should be valid");
-    let member = OutcomeMember::new(
-        &seed_id,
-        "winner".into(),
-        vec![yes.id.clone(), no.id.clone()],
-    )
-    .expect("member should be valid");
+    let member = OutcomeMember::new(&seed_id, "winner".into(), vec![yes.id, no.id])
+        .expect("member should be valid");
     let group =
         OutcomeGroup::new(seed, vec![yes.clone(), no], vec![member.clone()]).expect("group");
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id,
-        member.id.clone(),
-        yes.id,
+        group.id, member.id, yes.id,
     )))
     .expect("instrument should be valid");
     (instrument, member)
@@ -240,20 +234,19 @@ fn order_quantity_should_match_the_outcome_instrument_credentials() {
         panic!("fixture must be an outcome instrument")
     };
     let matching = OrderQuantity::OutcomeTokens {
-        group: spec.group().clone(),
-        member: spec.member().clone(),
-        side: spec.side().clone(),
+        group: *spec.group(),
+        member: *spec.member(),
+        side: *spec.side(),
         value: Quantity::from(1_u8),
     };
     let wrong_side = OrderQuantity::OutcomeTokens {
-        group: spec.group().clone(),
-        member: member.id.clone(),
-        side: member
+        group: *spec.group(),
+        member: member.id,
+        side: *member
             .sides
             .iter()
             .find(|side| *side != spec.side())
-            .expect("the fixture must declare a complementary side")
-            .clone(),
+            .expect("the fixture must declare a complementary side"),
         value: Quantity::from(1_u8),
     };
 
@@ -553,14 +546,14 @@ fn reference_price_should_require_a_registered_reference() {
         .expect("reference identity should be well formed");
     let priced = ListingReferencePrice {
         listing: listing_key(),
-        reference: reference.clone(),
+        reference,
         role: Some(ReferencePriceRole::Mark),
         price: price(),
         timestamp: 7,
     };
     let encoded = serde_json::to_string(&priced).expect("reference price should serialize");
 
-    assert!(encoded.contains(reference.as_str()));
+    assert!(encoded.contains(reference.as_str().as_str()));
     assert!(encoded.contains("\"role\":\"mark\""));
     assert_eq!(
         serde_json::from_str::<ListingReferencePrice>(&encoded).expect("should decode"),

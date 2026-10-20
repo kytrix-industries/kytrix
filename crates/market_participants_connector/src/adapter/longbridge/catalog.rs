@@ -7,6 +7,8 @@
 //! derivation happens once, here, so the security a candle request names is the
 //! security the directory published rather than a second reading of the same code.
 
+use std::sync::Arc;
+
 use market_participants_model::{
     asset::{
         CurrencyTerms, Iso4217Code, SecurityForm, SecurityIssuerId, SecurityTerms, ShareClassId,
@@ -24,6 +26,7 @@ use market_participants_model::{
         rules::{
             CommonTradingRules, LotPolicy, PriceLimitRule, PriceRule, ProductTradingRules,
             QuantityRule, SettlementCycle, ShortSalePolicy, SpotTradingRules, TradingRules,
+            VenueTradingPolicy,
         },
         venue::PriceBasis,
     },
@@ -82,7 +85,7 @@ pub(crate) fn catalog_entry(
         .map_err(|error| model_error("build the Longbridge share class", error))?;
     let security_terms = SecurityTerms {
         issuer: issuer.clone(),
-        share_class: share_class.clone(),
+        share_class,
         form: SecurityForm::CommonStock,
     };
     let security = AssetTerms::Security {
@@ -117,12 +120,15 @@ pub(crate) fn catalog_entry(
                 maximum: None,
             },
             notional: None,
-            sessions: TradingCalendarId::new(US_EQUITY_CALENDAR)
-                .map_err(|error| model_error("decode the Longbridge trading calendar", error))?,
-            settlement_cycle: SettlementCycle::TPlus { business_days: 1 },
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy {
+                sessions: TradingCalendarId::new(US_EQUITY_CALENDAR).map_err(|error| {
+                    model_error("decode the Longbridge trading calendar", error)
+                })?,
+                settlement_cycle: SettlementCycle::TPlus { business_days: 1 },
+                price_limits: PriceLimitRule::None,
+            }),
         },
-        product: ProductTradingRules::Spot(
+        product: Arc::new(ProductTradingRules::Spot(
             SpotTradingRules::new(
                 LotPolicy::WholeLots {
                     lot_size: Quantity::from(1_u8),
@@ -130,7 +136,7 @@ pub(crate) fn catalog_entry(
                 ShortSalePolicy::Restricted,
             )
             .map_err(|error| model_error("build the Longbridge spot rules", error))?,
-        ),
+        )),
     };
     rules
         .validate_for(&instrument)
@@ -451,7 +457,7 @@ mod tests {
             route: route(),
             terms: ListingContinuityTerms::Equity {
                 issuer: terms.issuer.clone(),
-                share_class: terms.share_class.clone(),
+                share_class: terms.share_class,
                 mic: identifiers.mic.clone(),
                 local_code: identifiers.local_code.clone(),
             },
@@ -472,7 +478,7 @@ mod tests {
 
         let listing = VenueListing::new(
             entry.listing.clone(),
-            entry.instrument.id().clone(),
+            *entry.instrument.id(),
             Some(entry.native_symbol.clone()),
             entry.aliases.clone(),
             entry.identifiers.clone(),

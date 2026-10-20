@@ -174,7 +174,7 @@ impl CanonicalTerms for ListingContinuityTerms {
                 local_code,
             } => {
                 encoder.write_label(issuer.as_str());
-                encoder.write_label(share_class.as_str());
+                encoder.write_label(share_class.as_str().as_str());
                 encoder.write_label(mic.as_str());
                 encoder.write_label(local_code.as_str());
             }

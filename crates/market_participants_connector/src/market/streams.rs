@@ -227,7 +227,7 @@ mod tests {
     use market_participants_model::{
         asset::{DerivativeUnderlying, UnderlyingRef},
         decimal::{Fraction, Quantity, Ratio},
-        identifier::{NativeSymbol, ReferenceSourceId, ReferenceTermsVersion, TradingCalendarId},
+        identifier::{NativeSymbol, ReferenceSourceId, ReferenceTermsVersion},
         instrument::{Instrument, InstrumentTerms, PerpetualTerms},
         listing::{
             identifiers::{BinanceListingIdentifiers, VenueListingIdentifiers},
@@ -236,8 +236,7 @@ mod tests {
             rules::{
                 CommonTradingRules, FundingInterval, FundingSchedule, LeverageTier, MarginMode,
                 MarginProfile, PerpetualMarginTerms, PerpetualRisk, PerpetualTradingRules,
-                PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule, SettlementCycle,
-                TradingRules,
+                PriceRule, ProductTradingRules, QuantityRule, TradingRules, VenueTradingPolicy,
             },
             venue::{BinanceProduct, PriceBasis},
         },
@@ -313,7 +312,7 @@ mod tests {
         );
         let listing = VenueListing::new(
             key.clone(),
-            instrument.id().clone(),
+            *instrument.id(),
             Some(symbol),
             Vec::new(),
             VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -352,11 +351,9 @@ mod tests {
                     maximum: None,
                 },
                 notional: None,
-                sessions: TradingCalendarId::continuous_24x7(),
-                settlement_cycle: SettlementCycle::Immediate,
-                price_limits: PriceLimitRule::None,
+                venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
             },
-            product: ProductTradingRules::Perpetual(PerpetualTradingRules {
+            product: std::sync::Arc::new(ProductTradingRules::Perpetual(PerpetualTradingRules {
                 risk: PerpetualRisk::Published(
                     PerpetualMarginTerms::new(
                         MarginProfile::new(MarginMode::Cross, initial, maintenance, quote.clone())
@@ -371,7 +368,7 @@ mod tests {
                 funding: FundingSchedule::new(FundingInterval::Adaptive, None, None, quote)
                     .expect("the fixture funding schedule should be valid"),
                 open_interest_cap: None,
-            }),
+            })),
         };
         let snapshot =
             ListingSnapshot::new(key.clone(), rules, ListingStatus::Trading, None, None, 0)

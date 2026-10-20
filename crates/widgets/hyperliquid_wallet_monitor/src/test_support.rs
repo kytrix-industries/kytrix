@@ -54,8 +54,8 @@ use market_participants_model::{
         rules::{
             CommonTradingRules, FundingInterval, FundingSchedule, LeverageTier, LotPolicy,
             MarginMode, MarginProfile, PerpetualMarginTerms, PerpetualRisk, PerpetualTradingRules,
-            PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule, SettlementCycle,
-            ShortSalePolicy, SpotTradingRules, TradingRules,
+            PriceRule, ProductTradingRules, QuantityRule, ShortSalePolicy, SpotTradingRules,
+            TradingRules, VenueTradingPolicy,
         },
         venue::{HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidTokenId, PriceBasis},
     },
@@ -394,11 +394,9 @@ pub(super) fn entry(
                 maximum: None,
             },
             notional: None,
-            sessions: market_participants_model::identifier::TradingCalendarId::continuous_24x7(),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: match instrument.terms() {
+        product: std::sync::Arc::new(match instrument.terms() {
             InstrumentTerms::Spot(_) => ProductTradingRules::Spot(
                 SpotTradingRules::new(
                     LotPolicy::FractionalAllowed {
@@ -447,9 +445,9 @@ pub(super) fn entry(
                     .expect("the test funding schedule should be valid"),
                 open_interest_cap: None,
             }),
-        },
+        }),
     };
-    let instrument_id = instrument.id().clone();
+    let instrument_id = *instrument.id();
     let listing = VenueListing::new(
         key.clone(),
         instrument_id,

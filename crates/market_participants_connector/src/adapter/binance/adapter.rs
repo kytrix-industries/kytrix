@@ -13,7 +13,7 @@ use market_participants_model::{
     decimal::{Fraction, Price, Quantity, Ratio, Tick},
     identifier::{
         IdentifierNamespace, IdentifierValue, NativeSymbol, ReferenceSourceId,
-        ReferenceTermsVersion, TokenIssuerId, TradingCalendarId, VenueId, VenueScopeId,
+        ReferenceTermsVersion, TokenIssuerId, VenueId, VenueScopeId,
     },
     instrument::{Instrument, InstrumentTerms, PerpetualTerms, SpotTerms},
     listing::{
@@ -23,8 +23,8 @@ use market_participants_model::{
         rules::{
             CommonTradingRules, FundingInterval, FundingSchedule, LeverageTier, LotPolicy,
             MarginMode, MarginProfile, NotionalRule, PerpetualMarginTerms, PerpetualRisk,
-            PerpetualTradingRules, PriceLimitRule, PriceRule, ProductTradingRules, QuantityRule,
-            SettlementCycle, ShortSalePolicy, SpotTradingRules, TradingRules,
+            PerpetualTradingRules, PriceRule, ProductTradingRules, QuantityRule, ShortSalePolicy,
+            SpotTradingRules, TradingRules, VenueTradingPolicy,
         },
         venue::{BinanceProduct, PriceBasis},
     },
@@ -2366,12 +2366,10 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
             minimum: Some(minimum),
             maximum: None,
         }),
-        sessions: TradingCalendarId::continuous_24x7(),
-        settlement_cycle: SettlementCycle::Immediate,
         // The venue's own price bands are neither the absolute nor the relative
         // rule this model states, so no bound is published rather than a
         // reinterpreted one.
-        price_limits: PriceLimitRule::None,
+        venue_policy: Arc::new(VenueTradingPolicy::continuous()),
     };
     let product = match venue.product {
         BinanceProduct::Spot => ProductTradingRules::Spot(
@@ -2449,7 +2447,10 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
             ));
         }
     };
-    let rules = TradingRules { common, product };
+    let rules = TradingRules {
+        common,
+        product: Arc::new(product),
+    };
     rules.validate_for(&venue.instrument).map_err(|error| {
         protocol_error("decode Binance trading rules", format_smolstr!("{}", error))
     })?;
@@ -2943,7 +2944,7 @@ mod tests {
         };
         assert_eq!(terms.contract_size().quantity().to_string(), "1");
         assert_eq!(terms.price_quote(), terms.settlement_asset());
-        let ProductTradingRules::Perpetual(rules) = &entry.rules.product else {
+        let ProductTradingRules::Perpetual(rules) = entry.rules.product.as_ref() else {
             panic!("the entry must carry perpetual rules");
         };
         let PerpetualRisk::Published(margin_terms) = &rules.risk else {

@@ -9,7 +9,7 @@ use market_participants_model::{
     decimal::{Quantity, Tick},
     identifier::{
         CtfConditionId, CtfTokenId, HyperliquidQuestionId, IdentifierValue, NativeSymbol,
-        PolymarketEventId, PolymarketMarketId, ResolutionSourceId, TradingCalendarId, VenueScopeId,
+        PolymarketEventId, PolymarketMarketId, ResolutionSourceId, VenueScopeId,
     },
     instrument::{Instrument, InstrumentTerms, OutcomeTerms},
     listing::{
@@ -20,8 +20,8 @@ use market_participants_model::{
         native::{ListingIdentifier, OutcomeEventIdentifier, OutcomeGroupIdentifier},
         route::{VenueListingKey, VenueRoute},
         rules::{
-            CommonTradingRules, OutcomeTradingRules, PriceLimitRule, PriceRule,
-            ProductTradingRules, QuantityRule, SettlementCycle, TradingRules,
+            CommonTradingRules, OutcomeTradingRules, PriceRule, ProductTradingRules, QuantityRule,
+            TradingRules, VenueTradingPolicy,
         },
         venue::{
             BinanceProduct, HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidTokenId,
@@ -1186,7 +1186,7 @@ async fn a_listing_that_declares_another_route_is_refused() {
 #[tokio::test]
 async fn a_listing_that_declares_another_instrument_is_refused() {
     let mut broken = btc_entry();
-    broken.listing.instrument_id = eth().id().clone();
+    broken.listing.instrument_id = *eth().id();
     let fixture = Fixture::new(vec![btc_entry()]);
     fixture
         .ensure()
@@ -1847,12 +1847,8 @@ fn outcome_group(question: &str) -> OutcomeGroup {
     let seed_id = seed.seed_id();
     let yes = OutcomeSide::new(&seed_id, SmolStr::new_static("yes")).expect("the side is valid");
     let no = OutcomeSide::new(&seed_id, SmolStr::new_static("no")).expect("the side is valid");
-    let member = OutcomeMember::new(
-        &seed_id,
-        SmolStr::new_static("winner"),
-        vec![yes.id.clone(), no.id.clone()],
-    )
-    .expect("the member is valid");
+    let member = OutcomeMember::new(&seed_id, SmolStr::new_static("winner"), vec![yes.id, no.id])
+        .expect("the member is valid");
     OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("the group is valid")
 }
 
@@ -1866,15 +1862,13 @@ fn outcome_entry_of(
     symbol: &str,
 ) -> CatalogEntry {
     let instrument = Instrument::new(InstrumentTerms::Outcome(OutcomeTerms::new(
-        group.id.clone(),
-        member.id.clone(),
-        side.id.clone(),
+        group.id, member.id, side.id,
     )))
     .expect("the outcome instrument is valid");
     let key = listing_key(route, symbol);
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new(symbol).expect("the symbol is valid")),
         Vec::new(),
         VenueListingIdentifiers::Polymarket(PolymarketListingIdentifiers {
@@ -1902,23 +1896,21 @@ fn outcome_entry_of(
                 },
                 quantity: QuantityRule {
                     unit: QuantityUnit::OutcomeTokens {
-                        group: group.id.clone(),
-                        member: member.id.clone(),
-                        side: side.id.clone(),
+                        group: group.id,
+                        member: member.id,
+                        side: side.id,
                     },
                     step: Quantity::from(1_u8),
                     minimum: None,
                     maximum: None,
                 },
                 notional: None,
-                sessions: TradingCalendarId::continuous_24x7(),
-                settlement_cycle: SettlementCycle::Immediate,
-                price_limits: PriceLimitRule::None,
+                venue_policy: std::sync::Arc::new(VenueTradingPolicy::continuous()),
             },
-            product: ProductTradingRules::Outcome(OutcomeTradingRules {
+            product: std::sync::Arc::new(ProductTradingRules::Outcome(OutcomeTradingRules {
                 order_book: true,
                 negative_risk_conversion: true,
-            }),
+            })),
         },
         ListingStatus::Trading,
         None,
@@ -1997,7 +1989,7 @@ impl CatalogSource for ScriptedOutcome {
 async fn revoking_the_only_route_removes_its_unreachable_outcome_objects() {
     let group = outcome_group("Will it rain?");
     let listing = outcome_entry(&spot_route(), &group, "RAIN-YES");
-    let instrument = listing.instrument.id().clone();
+    let instrument = *listing.instrument.id();
     let fixture = outcome_fixture(vec![group.clone()], Vec::new(), Vec::new(), vec![listing]);
     fixture
         .ensure()
@@ -2635,7 +2627,7 @@ fn native_event_of(group: &OutcomeGroup, native: &str) -> (OutcomeEvent, Polymar
     let event = OutcomeEvent::new(
         ResolutionSourceId::new("polymarket").expect("the resolution source is valid"),
         IdentifierValue::new(native.as_str()).expect("the event value is valid"),
-        vec![group.id.clone()],
+        vec![group.id],
         Vec::new(),
     )
     .expect("the event is valid");
@@ -2709,7 +2701,7 @@ impl CatalogSource for ForeignAliasSource {
         context: crate::catalog::source::CatalogFetchContext,
     ) -> BoxFuture<'static, Result<CatalogBatch, crate::catalog::error::SourceError>> {
         assert_eq!(context.venue_route(), &self.listing.listing.key.route);
-        let foreign = self.foreign.clone();
+        let foreign = self.foreign;
         let alias = self.alias.clone();
         context.staging().with(|staging| {
             let pending = staging.pending_outcomes_mut();
@@ -2812,7 +2804,7 @@ async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() 
     );
     assert_eq!(
         fixture.catalog().outcome_event_for(&spot_native),
-        Some(spot_event.id.clone()),
+        Some(spot_event.id),
         "the spot native lookup survives another route's publication"
     );
 
@@ -2839,7 +2831,7 @@ async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() 
     );
     assert_eq!(
         fixture.catalog().outcome_event_for(&spot_native),
-        Some(spot_event.id.clone()),
+        Some(spot_event.id),
         "the surviving route keeps its native event lookup"
     );
     assert_eq!(
@@ -2906,7 +2898,7 @@ async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
         event: perp_event.clone(),
         native: perp_native.clone(),
         alias: alias.clone(),
-        foreign: spot_event.id.clone(),
+        foreign: spot_event.id,
     });
     let catalog = Arc::new(Catalog::new());
     catalog
@@ -2949,7 +2941,7 @@ async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
     );
     assert_eq!(
         catalog.outcome_event_for(&alias),
-        Some(spot_event.id.clone()),
+        Some(spot_event.id),
         "the alias the perp route registered names the spot event in the registry"
     );
 

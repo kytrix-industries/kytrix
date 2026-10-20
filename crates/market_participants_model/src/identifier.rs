@@ -78,8 +78,134 @@ pub trait IdentityKind: IdentityFamily + Sized {
 /// A type whose canonical terms determine an identity of one family.
 pub trait CanonicalIdentityTerms: CanonicalTerms + IdentityFamily {}
 
-fn format_identity(label: &str, digest: Digest) -> SmolStr {
-    format_smolstr!("{label}/{}", digest.to_hex())
+/// The longest family label any identity renders under.
+///
+/// [`IDENTITY_VERSION`] is `v1` and [`VENUE_LISTING_IDENTITY_LABEL`] is
+/// `listing-id/v1`, the longest label this build states; the buffer an identity's
+/// text is rendered into is sized from these two constants rather than guessed.
+const IDENTITY_LABEL_MAX: usize = VENUE_LISTING_IDENTITY_LABEL.len();
+
+/// The rendered text buffer of one identity: `<label>/<64 lowercase hex>`.
+const IDENTITY_TEXT_CAPACITY: usize = IDENTITY_LABEL_MAX + 1 + IDENTITY_DIGEST_LENGTH;
+
+/// The rendered text of one identity, held on the stack.
+///
+/// An identity stores only its digest, so its text is rendered when someone asks
+/// for it. This type is that rendering: a fixed buffer plus the length that was
+/// filled, with no allocation and no heap block to free. It dereferences to
+/// `str`, so a caller reads it exactly like the string the identity used to store.
+pub struct IdentityText {
+    buffer: [u8; IDENTITY_TEXT_CAPACITY],
+    length: usize,
+}
+
+impl IdentityText {
+    /// Renders `<label>/<64 lowercase hex digits>` for one digest.
+    #[doc(hidden)]
+    pub fn render(label: &str, digest: Digest) -> Self {
+        let mut buffer = [0_u8; IDENTITY_TEXT_CAPACITY];
+        let label_bytes = label.as_bytes();
+        debug_assert!(label_bytes.len() <= IDENTITY_LABEL_MAX);
+        buffer[..label_bytes.len()].copy_from_slice(label_bytes);
+        let mut at = label_bytes.len();
+        buffer[at] = b'/';
+        at += 1;
+        let mut hex = [0_u8; IDENTITY_DIGEST_LENGTH];
+        digest.write_hex(&mut hex);
+        buffer[at..at + IDENTITY_DIGEST_LENGTH].copy_from_slice(&hex);
+        at += IDENTITY_DIGEST_LENGTH;
+        Self { buffer, length: at }
+    }
+
+    /// Returns the text as a string slice.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buffer[..self.length]).expect("an identity is ASCII")
+    }
+}
+
+impl std::ops::Deref for IdentityText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for IdentityText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for IdentityText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for IdentityText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
+impl PartialEq for IdentityText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for IdentityText {}
+
+impl PartialEq<str> for IdentityText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for IdentityText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<IdentityText> for str {
+    fn eq(&self, other: &IdentityText) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<IdentityText> for &str {
+    fn eq(&self, other: &IdentityText) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialOrd for IdentityText {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IdentityText {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::hash::Hash for IdentityText {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl serde::Serialize for IdentityText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// Appends primitives to a deterministic byte buffer.
@@ -203,6 +329,19 @@ impl Digest {
     pub fn to_hex(self) -> SmolStr {
         format_smolstr!("{}", const_hex::encode(self.0))
     }
+
+    /// Writes the digest as 64 lowercase hexadecimal digits into `out`.
+    ///
+    /// The rendering a display code needs is a `&str` of exactly this length, and
+    /// a digest is the only thing an identity has to render: filling a buffer the
+    /// caller already owns keeps an identity's text off the heap.
+    fn write_hex(self, out: &mut [u8; IDENTITY_DIGEST_LENGTH]) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (index, byte) in self.0.iter().enumerate() {
+            out[index * 2] = HEX[(byte >> 4) as usize];
+            out[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+        }
+    }
 }
 
 /// A versioned canonical identity value such as `v1/<64 lowercase hex digits>`.
@@ -210,14 +349,36 @@ impl Digest {
 /// The digest is not invertible: an identity only ever carries the digest value,
 /// and the associated canonical terms always come from a registry that keeps the
 /// terms-to-identity association.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct CanonicalId(SmolStr);
+///
+/// The value is stored as its **32 digest bytes**, not as its rendered text. The
+/// rendered form is 67 characters, which is past [`SmolStr`]'s 23-byte inline
+/// capacity, so storing text made every identity — and every independently
+/// constructed copy of one — a separate heap allocation. A catalogue of four
+/// venues holds over a hundred thousand identity references whose texts collapse
+/// to a few tens of thousands of distinct digests, and those copies were the
+/// largest cost of a loaded catalogue after the entries themselves. A digest is 32
+/// bytes of plain data, so the value is `Copy` and needs neither an allocation nor
+/// a reference count.
+///
+/// The family label is deliberately **not** part of this value: it is a property
+/// of the identity family, which the checked newtype of that family knows as a
+/// type-level fact. The value is therefore exactly its digest, and the text a
+/// caller sees is rendered by the newtype through [`identity_text`]. Keeping the
+/// label out saves the 16 bytes a `&'static str` would add to every identity in
+/// every structure.
+///
+/// The wire form is unchanged: the rendered text is the same
+/// `<label>/<64 lowercase hex>`, and the canonical encoding of a family's terms is
+/// byte-for-byte what it was, because the encoder is handed that same text.
+/// [`IDENTITY_VERSION`] therefore does not move, and no persisted identity stops
+/// decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalId(Digest);
 
 impl CanonicalId {
-    /// Renders a digest as the identity value of a family.
-    pub fn of_digest(label: &str, digest: Digest) -> Self {
-        Self(format_identity(label, digest))
+    /// Builds the identity of one family from a digest.
+    pub const fn of_digest(digest: Digest) -> Self {
+        Self(digest)
     }
 
     /// Rehydrates an already published identity value of a family.
@@ -234,26 +395,19 @@ impl CanonicalId {
             .strip_prefix(label)
             .and_then(|rest| rest.strip_prefix('/'))
             .ok_or_else(invalid)?;
+        // The canonical spelling is lowercase: a digest written in uppercase is not
+        // the value this build publishes, and `decode_to_slice` would accept it.
         if encoded.len() != IDENTITY_DIGEST_LENGTH || !encoded.bytes().all(is_lowercase_hex_digit) {
             return Err(invalid());
         }
-        Ok(Self(SmolStr::new(value)))
+        let mut digest = [0_u8; 32];
+        const_hex::decode_to_slice(encoded, &mut digest).map_err(|_| invalid())?;
+        Ok(Self(Digest(digest)))
     }
 
-    /// Returns the `v1/<64 lowercase hex digits>` identity string.
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    /// Returns the identity string as a reusable short string.
-    pub fn to_smol_str(&self) -> SmolStr {
-        self.0.clone()
-    }
-}
-
-impl fmt::Display for CanonicalId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+    /// Returns the digest bytes behind this identity.
+    pub const fn digest(&self) -> &Digest {
+        &self.0
     }
 }
 
@@ -290,7 +444,7 @@ pub fn identity_from_encoder<F: IdentityFamily>(encoder: &CanonicalEncoder) -> C
     let mut prelude = CanonicalEncoder::new();
     prelude.write_label(F::namespace());
     prelude.write_bytes(encoder.as_bytes());
-    CanonicalId::of_digest(F::label(), Digest::of_bytes(prelude.as_bytes()))
+    CanonicalId::of_digest(Digest::of_bytes(prelude.as_bytes()))
 }
 
 /// Renders the digest of canonical terms as an identity value of `family`.
@@ -356,8 +510,7 @@ identity_family!(
 macro_rules! identity_type {
     ($name:ident, $family:ident) => {
         #[doc = concat!("A canonical `", stringify!($family), "` identity.")]
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, ::serde::Serialize)]
-        #[serde(transparent)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name($crate::identifier::CanonicalId);
 
         impl $name {
@@ -378,9 +531,17 @@ macro_rules! identity_type {
                 )?))
             }
 
-            /// Returns the identity string.
-            pub fn as_str(&self) -> &str {
-                self.0.as_str()
+            /// Returns the identity text, which is this family's label, a `/` and
+            /// the 64 lowercase hexadecimal digits of the digest.
+            ///
+            /// The text is rendered into a buffer this call owns on the stack and
+            /// returned as a borrow of it, so the identity itself stays 32 bytes
+            /// and nothing is allocated to answer with its spelling.
+            pub fn as_str(&self) -> $crate::identifier::IdentityText {
+                $crate::identifier::IdentityText::render(
+                    <$family as $crate::identifier::IdentityFamily>::label(),
+                    *self.0.digest(),
+                )
             }
         }
 
@@ -406,7 +567,16 @@ macro_rules! identity_type {
 
         impl ::std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                formatter.write_str(self.as_str())
+                formatter.write_str(self.as_str().as_str())
+            }
+        }
+
+        impl ::serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str().as_str())
             }
         }
 
@@ -420,7 +590,7 @@ macro_rules! identity_type {
 
         impl $crate::identifier::CanonicalTerms for $name {
             fn encode(&self, encoder: &mut $crate::identifier::CanonicalEncoder) {
-                encoder.write_label(self.as_str());
+                encoder.write_label(self.as_str().as_str());
             }
         }
 
@@ -1498,10 +1668,8 @@ mod tests {
 
         assert_eq!(decoded, id);
         assert_eq!(
-            CanonicalId::from_str(id.as_str())
-                .expect("identity should parse")
-                .as_str(),
-            id.as_str()
+            CanonicalId::from_str(id.as_str().as_str()).expect("identity should parse"),
+            CanonicalId::from_str(encoded.trim_matches('"')).expect("the wire text parses"),
         );
     }
 

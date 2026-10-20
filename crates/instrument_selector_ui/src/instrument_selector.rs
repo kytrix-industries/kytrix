@@ -2083,7 +2083,7 @@ mod tests {
 
         assert_eq!(label.as_ref(), "BTC/USDT");
         assert!(
-            !label.contains(listed.listing.key.listing_id.as_str())
+            !label.contains(listed.listing.key.listing_id.as_str().as_str())
                 && !label.contains("v1/")
                 && !label.contains("BTCUSDT"),
             "the row is drawn by the display, not by a native symbol, a listing id or a digest: {label}"
@@ -2269,7 +2269,7 @@ mod tests {
         );
         assert!(
             !english.contains("ETHUSDT")
-                && !english.contains(rows[1].entry.listing.key.listing_id.as_str())
+                && !english.contains(rows[1].entry.listing.key.listing_id.as_str().as_str())
                 && !chinese.contains("ETHUSDT"),
             "the fallback never names the listing by its symbol or its id"
         );

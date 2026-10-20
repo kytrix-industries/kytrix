@@ -115,7 +115,7 @@ impl ReferenceRegistryPending {
     /// Stages an index identity.
     pub fn register_index(&mut self, terms: IndexTerms) -> IndexId {
         let id = IndexId::of_terms(&terms);
-        self.indices.insert(id.clone(), terms);
+        self.indices.insert(id, terms);
         id
     }
 
@@ -125,7 +125,7 @@ impl ReferenceRegistryPending {
         terms: ExternalReferenceTerms,
     ) -> Result<ExternalReferenceId, RegistryError> {
         let id = terms.reference_id()?;
-        self.external_references.insert(id.clone(), terms);
+        self.external_references.insert(id, terms);
         Ok(id)
     }
 
@@ -135,7 +135,7 @@ impl ReferenceRegistryPending {
         terms: PriceReferenceTerms,
     ) -> Result<PriceReferenceId, RegistryError> {
         let id = terms.reference_id()?;
-        self.price_references.insert(id.clone(), terms);
+        self.price_references.insert(id, terms);
         Ok(id)
     }
 
@@ -159,19 +159,17 @@ impl ReferenceRegistryPending {
         let mut registry = base.clone();
         for (id, terms) in &self.indices {
             if referenced.indices.contains(id) {
-                registry.indices.insert(id.clone(), terms.clone());
+                registry.indices.insert(*id, terms.clone());
             }
         }
         for (id, terms) in &self.external_references {
             if referenced.external_references.contains(id) {
-                registry
-                    .external_references
-                    .insert(id.clone(), terms.clone());
+                registry.external_references.insert(*id, terms.clone());
             }
         }
         for (id, terms) in &self.price_references {
             if referenced.price_references.contains(id) {
-                registry.price_references.insert(id.clone(), terms.clone());
+                registry.price_references.insert(*id, terms.clone());
             }
         }
         registry

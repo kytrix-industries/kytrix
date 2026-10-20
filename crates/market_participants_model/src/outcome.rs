@@ -19,7 +19,7 @@ use crate::{
         require_sorted_and_unique,
     },
     identifier::{
-        CanonicalEncoder, CanonicalTerms, IdentifierValue, OutcomeEventIdentity,
+        CanonicalEncoder, CanonicalTerms, IdentifierValue, IdentityText, OutcomeEventIdentity,
         OutcomeGroupIdentity, OutcomeMemberIdentity, OutcomeRiskPoolIdentity, OutcomeSideIdentity,
         ResolutionSourceId,
     },
@@ -137,7 +137,7 @@ impl SettlementFractionRule {
     ) -> Result<(), ModelError> {
         if *self == Self::Binary && !fraction.is_binary() {
             return Err(ModelError::OutcomeSettlementFractionInvalid {
-                group: group.clone(),
+                group: *group,
                 fraction_kind: "binary",
             });
         }
@@ -340,7 +340,7 @@ impl OutcomeSide {
             });
         }
         let terms = OutcomeSideTerms {
-            seed: seed.clone(),
+            seed: *seed,
             label: label.clone(),
         };
         Ok(Self {
@@ -385,7 +385,7 @@ impl OutcomeMember {
         side_ids.sort();
         side_ids.dedup();
         let terms = OutcomeMemberTerms {
-            seed: seed.clone(),
+            seed: *seed,
             label: label.clone(),
             sides: side_ids.clone(),
         };
@@ -399,7 +399,7 @@ impl OutcomeMember {
 
 impl CanonicalTerms for OutcomeMember {
     fn encode(&self, encoder: &mut CanonicalEncoder) {
-        encoder.write_label(self.id.as_str());
+        encoder.write_label(self.id.as_str().as_str());
         encoder.write_label(&self.label);
         encoder.write_terms_slice(&self.sides);
     }
@@ -440,11 +440,8 @@ impl OutcomeGroupTerms {
         if self.members.is_empty() {
             return Err(incomplete("group without members"));
         }
-        let member_ids: Vec<OutcomeMemberId> = self
-            .members
-            .iter()
-            .map(|member| member.id.clone())
-            .collect();
+        let member_ids: Vec<OutcomeMemberId> =
+            self.members.iter().map(|member| member.id).collect();
         require_sorted_and_unique(&member_ids, "outcome_group.members")?;
         let known: BTreeSet<&OutcomeSideId> = self
             .members
@@ -539,7 +536,7 @@ impl OutcomeGroup {
         mut members: Vec<OutcomeMember>,
     ) -> Result<Self, ModelError> {
         seed.validate()?;
-        members.sort_by(|left, right| left.id.cmp(&right.id));
+        members.sort_by_key(|left| left.id);
         let terms = OutcomeGroupTerms {
             question: seed.question,
             expiry: seed.expiry,
@@ -552,7 +549,7 @@ impl OutcomeGroup {
         terms.validate_terms()?;
         terms.expiry.validate()?;
         terms.resolution.validate(&terms.expiry)?;
-        let mut side_ids: Vec<OutcomeSideId> = sides.iter().map(|side| side.id.clone()).collect();
+        let mut side_ids: Vec<OutcomeSideId> = sides.iter().map(|side| side.id).collect();
         side_ids.sort();
         require_sorted_and_unique(&side_ids, "outcome_group.sides")?;
         let declared: BTreeSet<&OutcomeSideId> = side_ids.iter().collect();
@@ -593,7 +590,7 @@ impl OutcomeGroup {
         self.resolution.validate(&self.expiry)?;
         if terms.group_id() != self.id {
             return Err(ModelError::OutcomeGroupIncomplete {
-                group: self.id.clone(),
+                group: self.id,
                 field: "group id does not match the canonical terms",
             });
         }
@@ -760,7 +757,7 @@ impl TryFrom<OutcomeGroupWire> for OutcomeGroup {
         let mut by_label: AHashMap<smol_str::SmolStr, OutcomeSideId> =
             AHashMap::with_capacity(sides.len());
         for side in &sides {
-            by_label.insert(side.label.clone(), side.id.clone());
+            by_label.insert(side.label.clone(), side.id);
         }
         let members = wire
             .members
@@ -837,11 +834,11 @@ impl OutcomeGroupLineageEdge {
 }
 
 impl LineageRelation for OutcomeGroupLineageEdge {
-    fn predecessor(&self) -> &str {
+    fn predecessor(&self) -> IdentityText {
         self.predecessor.as_str()
     }
 
-    fn successor(&self) -> &str {
+    fn successor(&self) -> IdentityText {
         self.successor.as_str()
     }
 
@@ -898,11 +895,11 @@ impl OutcomeRiskPoolLineageEdge {
 }
 
 impl LineageRelation for OutcomeRiskPoolLineageEdge {
-    fn predecessor(&self) -> &str {
+    fn predecessor(&self) -> IdentityText {
         self.predecessor.as_str()
     }
 
-    fn successor(&self) -> &str {
+    fn successor(&self) -> IdentityText {
         self.successor.as_str()
     }
 
@@ -1067,7 +1064,7 @@ impl OutcomeRiskPool {
     /// Validates the risk pool invariants.
     pub fn validate(&self) -> Result<(), ModelError> {
         let incomplete = |field: &'static str| ModelError::OutcomeRiskPoolIncomplete {
-            pool: self.id.clone(),
+            pool: self.id,
             field,
         };
         if self.groups.len() < 2 {
@@ -1086,14 +1083,14 @@ impl OutcomeRiskPool {
         for conversion in &self.conversions {
             if !members.contains(&conversion.input.group) {
                 return Err(ModelError::OutcomeConversionUnresolved {
-                    pool: self.id.clone(),
+                    pool: self.id,
                     field: "conversion input group",
                 });
             }
             for output in &conversion.outputs {
                 if !members.contains(&output.leg.group) {
                     return Err(ModelError::OutcomeConversionUnresolved {
-                        pool: self.id.clone(),
+                        pool: self.id,
                         field: "conversion output group",
                     });
                 }
@@ -1249,9 +1246,7 @@ impl OutcomeSettlement {
     pub fn validate_against(&self, group: &OutcomeGroup) -> Result<(), ModelError> {
         require_non_negative_time(self.settled_at, "settled_at")?;
         if self.group != group.id {
-            return Err(ModelError::OutcomeSettlementIncomplete {
-                group: group.id.clone(),
-            });
+            return Err(ModelError::OutcomeSettlementIncomplete { group: group.id });
         }
         for (member, side) in group.tradable_legs() {
             let Some(leg) = self
@@ -1259,24 +1254,18 @@ impl OutcomeSettlement {
                 .iter()
                 .find(|leg| &leg.member == member && &leg.side == side)
             else {
-                return Err(ModelError::OutcomeSettlementIncomplete {
-                    group: group.id.clone(),
-                });
+                return Err(ModelError::OutcomeSettlementIncomplete { group: group.id });
             };
             group
                 .fraction_rule
                 .validate_fraction(&group.id, leg.settle_fraction)?;
         }
         for leg in &self.legs {
-            let member = group.member(&leg.member).ok_or_else(|| {
-                ModelError::OutcomeSettlementIncomplete {
-                    group: group.id.clone(),
-                }
-            })?;
+            let member = group
+                .member(&leg.member)
+                .ok_or(ModelError::OutcomeSettlementIncomplete { group: group.id })?;
             if !member.sides.contains(&leg.side) {
-                return Err(ModelError::OutcomeSettlementIncomplete {
-                    group: group.id.clone(),
-                });
+                return Err(ModelError::OutcomeSettlementIncomplete { group: group.id });
             }
         }
         self.validate_topology(group)
@@ -1299,7 +1288,7 @@ impl OutcomeSettlement {
                 && first.complement() != second
             {
                 return Err(ModelError::OutcomeSettlementFractionInvalid {
-                    group: group.id.clone(),
+                    group: group.id,
                     fraction_kind: "complementary",
                 });
             }
@@ -1318,13 +1307,13 @@ impl OutcomeSettlement {
             match cardinality {
                 SelectionCardinality::ExactlyOne if selected != 1 => {
                     return Err(ModelError::OutcomeSettlementFractionInvalid {
-                        group: group.id.clone(),
+                        group: group.id,
                         fraction_kind: "exactly-one",
                     });
                 }
                 SelectionCardinality::AtMostOne if selected > 1 => {
                     return Err(ModelError::OutcomeSettlementFractionInvalid {
-                        group: group.id.clone(),
+                        group: group.id,
                         fraction_kind: "at-most-one",
                     });
                 }
@@ -1347,7 +1336,7 @@ pub fn validate_risk_pool_membership(pools: &[OutcomeRiskPool]) -> Result<(), Mo
         for group in &pool.groups {
             if owner.insert(group, &pool.id).is_some() {
                 return Err(ModelError::OutcomeRiskPoolIncomplete {
-                    pool: pool.id.clone(),
+                    pool: pool.id,
                     field: "group already belongs to another risk pool",
                 });
             }
@@ -1367,9 +1356,11 @@ pub fn validate_pool_successors(
     pool_edges: &[OutcomeRiskPoolLineageEdge],
     pools: &[OutcomeRiskPool],
 ) -> Result<(), ModelError> {
-    let mut has_successor: AHashSet<&str> = AHashSet::with_capacity(group_edges.len());
+    // The predecessor set is keyed by the identity itself: an identity is a
+    // `Copy` digest now, so a set of them costs no string storage at all.
+    let mut has_successor: AHashSet<OutcomeGroupId> = AHashSet::with_capacity(group_edges.len());
     for edge in group_edges {
-        has_successor.insert(edge.predecessor.as_str());
+        has_successor.insert(edge.predecessor);
     }
     let predecessor_of = |pool: &OutcomeRiskPoolId| {
         pool_edges
@@ -1381,7 +1372,7 @@ pub fn validate_pool_successors(
         if !pool
             .groups
             .iter()
-            .any(|group| has_successor.contains(group.as_str()))
+            .any(|group| has_successor.contains(group))
         {
             continue;
         }
@@ -1472,12 +1463,8 @@ mod tests {
         let seed_id = seed.seed_id();
         let yes = OutcomeSide::new(&seed_id, "Yes".into()).expect("side should be valid");
         let no = OutcomeSide::new(&seed_id, "No".into()).expect("side should be valid");
-        let member = OutcomeMember::new(
-            &seed_id,
-            "winner".into(),
-            vec![yes.id.clone(), no.id.clone()],
-        )
-        .expect("member should be valid");
+        let member = OutcomeMember::new(&seed_id, "winner".into(), vec![yes.id, no.id])
+            .expect("member should be valid");
         OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("group should be valid")
     }
 
@@ -1507,12 +1494,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, side)| {
-                OutcomeMember::new(
-                    &seed_id,
-                    format!("member-{index}").into(),
-                    vec![side.id.clone()],
-                )
-                .expect("member should be valid")
+                OutcomeMember::new(&seed_id, format!("member-{index}").into(), vec![side.id])
+                    .expect("member should be valid")
             })
             .collect();
         OutcomeGroup::new(seed, sides, members).expect("group should be valid")
@@ -1526,15 +1509,15 @@ mod tests {
     ) -> OutcomeConversion {
         OutcomeConversion {
             input: OutcomeLegRef {
-                group: input.id.clone(),
-                member: input.members[0].id.clone(),
-                side: input.members[0].sides[input_side].clone(),
+                group: input.id,
+                member: input.members[0].id,
+                side: input.members[0].sides[input_side],
             },
             outputs: vec![OutcomeConversionOutput {
                 leg: OutcomeLegRef {
-                    group: output.id.clone(),
-                    member: output.members[0].id.clone(),
-                    side: output.members[0].sides[output_side].clone(),
+                    group: output.id,
+                    member: output.members[0].id,
+                    side: output.members[0].sides[output_side],
                 },
                 factor: PositiveRatio::new(Ratio::from(1_u8)).expect("factor should be positive"),
             }],
@@ -1555,14 +1538,14 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(index, side)| OutcomeSettlementLeg {
-                        member: member.id.clone(),
-                        side: side.clone(),
+                        member: member.id,
+                        side: *side,
                         settle_fraction: fractions[index],
                     })
             })
             .collect();
         OutcomeSettlement {
-            group: group.id.clone(),
+            group: group.id,
             legs,
             settled_at,
             source: None,
@@ -1594,7 +1577,7 @@ mod tests {
         };
         let seed_id = seed.seed_id();
         let single_side = OutcomeSide::new(&seed_id, "Yes".into()).expect("side should be valid");
-        let member = OutcomeMember::new(&seed_id, "winner".into(), vec![single_side.id.clone()])
+        let member = OutcomeMember::new(&seed_id, "winner".into(), vec![single_side.id])
             .expect("member should be valid");
 
         assert!(matches!(
@@ -1630,12 +1613,8 @@ mod tests {
         let seed_id = seed.seed_id();
         let yes = OutcomeSide::new(&seed_id, "Yes".into()).expect("side should be valid");
         let no = OutcomeSide::new(&seed_id, "No".into()).expect("side should be valid");
-        let member = OutcomeMember::new(
-            &seed_id,
-            "winner".into(),
-            vec![yes.id.clone(), no.id.clone()],
-        )
-        .expect("member should be valid");
+        let member = OutcomeMember::new(&seed_id, "winner".into(), vec![yes.id, no.id])
+            .expect("member should be valid");
 
         assert!(matches!(
             OutcomeGroup::new(seed, vec![yes, no], vec![member]),
@@ -1657,7 +1636,7 @@ mod tests {
         };
         let seed_id = seed.seed_id();
         let side = OutcomeSide::new(&seed_id, "a".into()).expect("side should be valid");
-        let member = OutcomeMember::new(&seed_id, "member-0".into(), vec![side.id.clone()])
+        let member = OutcomeMember::new(&seed_id, "member-0".into(), vec![side.id])
             .expect("member should be valid");
         assert!(matches!(
             OutcomeGroup::new(seed, vec![side], vec![member]),
@@ -1690,13 +1669,13 @@ mod tests {
     #[test]
     fn side_label_should_change_the_member_identity() {
         let first = binary_group("Will it rain?");
-        let seed_id = first.id.clone();
+        let seed_id = first.id;
         let renamed =
             OutcomeSide::new(&seed_id, "Yes indeed".into()).expect("side should be valid");
         let member = OutcomeMember::new(
             &seed_id,
             "winner".into(),
-            vec![renamed.id, first.members[0].sides[1].clone()],
+            vec![renamed.id, first.members[0].sides[1]],
         )
         .expect("member should be valid");
 
@@ -1743,7 +1722,7 @@ mod tests {
         };
         let seed_id = seed.seed_id();
         let yes = OutcomeSide::new(&seed_id, "Yes".into()).expect("side should be valid");
-        let member = OutcomeMember::new(&seed_id, "main".into(), vec![yes.id.clone()])
+        let member = OutcomeMember::new(&seed_id, "main".into(), vec![yes.id])
             .expect("member should be valid");
 
         assert_eq!(
@@ -1780,8 +1759,8 @@ mod tests {
         let second = binary_group("Will it rain tomorrow?");
         let edges = vec![
             OutcomeGroupLineageEdge::new(
-                first.id.clone(),
-                second.id.clone(),
+                first.id,
+                second.id,
                 OutcomeGroupAdjustment::QuestionChange,
                 0,
             )
@@ -1807,11 +1786,11 @@ mod tests {
     fn risk_pool_should_sort_and_validate_members() {
         let first = binary_group("Will it rain?");
         let second = binary_group("Will it snow?");
-        let mut expected = vec![first.id.clone(), second.id.clone()];
+        let mut expected = vec![first.id, second.id];
         expected.sort();
         let pool = OutcomeRiskPool::new(
             usdc(),
-            vec![second.id.clone(), first.id.clone()],
+            vec![second.id, first.id],
             vec![conversion(&first, 1, &second, 0)],
         )
         .expect("pool should be valid");
@@ -1829,7 +1808,7 @@ mod tests {
         assert!(matches!(
             OutcomeRiskPool::new(
                 usdc(),
-                vec![first.id, second.id.clone()],
+                vec![first.id, second.id],
                 vec![conversion(&third, 0, &second, 0)],
             ),
             Err(ModelError::OutcomeConversionUnresolved { .. })
@@ -1844,7 +1823,7 @@ mod tests {
         assert_eq!(
             OutcomeRiskPool::new(
                 usdc(),
-                vec![first.id.clone(), second.id.clone()],
+                vec![first.id, second.id],
                 vec![
                     conversion(&first, 0, &second, 0),
                     conversion(&second, 0, &first, 0),
@@ -1864,8 +1843,8 @@ mod tests {
             .expect("successor identity");
         let edges = vec![
             OutcomeRiskPoolLineageEdge::new(
-                base.clone(),
-                successor.clone(),
+                base,
+                successor,
                 OutcomeRiskPoolAdjustment::GroupMembershipChange,
                 0,
             )
@@ -1927,7 +1906,7 @@ mod tests {
         );
 
         let missing = OutcomeSettlement {
-            group: group.id.clone(),
+            group: group.id,
             legs: complete.legs[1..].to_vec(),
             settled_at: 1_950,
             source: None,
@@ -1945,13 +1924,13 @@ mod tests {
         let third = binary_group("Will it hail?");
         let left = OutcomeRiskPool::new(
             usdc(),
-            vec![first.id.clone(), second.id.clone()],
+            vec![first.id, second.id],
             vec![conversion(&first, 0, &second, 0)],
         )
         .expect("pool should be valid");
         let right = OutcomeRiskPool::new(
             usdc(),
-            vec![second.id.clone(), third.id.clone()],
+            vec![second.id, third.id],
             vec![conversion(&second, 0, &third, 0)],
         )
         .expect("pool should be valid");
@@ -1973,14 +1952,14 @@ mod tests {
         let successor = binary_group("Will it rain tomorrow?");
         let pool = OutcomeRiskPool::new(
             usdc(),
-            vec![first.id.clone(), second.id.clone()],
+            vec![first.id, second.id],
             vec![conversion(&first, 0, &second, 0)],
         )
         .expect("pool should be valid");
         let group_edges = vec![
             OutcomeGroupLineageEdge::new(
                 first.id,
-                successor.id.clone(),
+                successor.id,
                 OutcomeGroupAdjustment::QuestionChange,
                 10,
             )
@@ -1994,14 +1973,14 @@ mod tests {
 
         let successor_pool = OutcomeRiskPool::new(
             usdc(),
-            vec![successor.id.clone(), second.id.clone()],
+            vec![successor.id, second.id],
             vec![conversion(&successor, 0, &second, 0)],
         )
         .expect("successor pool should be valid");
 
         let pool_edges = vec![
             OutcomeRiskPoolLineageEdge::new(
-                pool.id.clone(),
+                pool.id,
                 successor_pool.id,
                 OutcomeRiskPoolAdjustment::GroupMembershipChange,
                 20,
@@ -2022,7 +2001,7 @@ mod tests {
         assert!(matches!(
             OutcomeRiskPool::new(
                 usdc(),
-                vec![first.id.clone(), second.id.clone()],
+                vec![first.id, second.id],
                 vec![
                     conversion(&first, 0, &second, 0),
                     conversion(&second, 1, &first, 1),
@@ -2037,7 +2016,7 @@ mod tests {
         let group = binary_group("Will it rain?");
         let complete = settlement(&group, &[Fraction::ONE, Fraction::ZERO], 1_950);
         let incomplete = OutcomeSettlement {
-            group: group.id.clone(),
+            group: group.id,
             legs: vec![complete.legs[0].clone()],
             settled_at: 1_950,
             source: None,
@@ -2081,7 +2060,7 @@ mod tests {
             fractions
         };
         let select = |fractions: &[(smol_str::SmolStr, Fraction)]| OutcomeSettlement {
-            group: group.id.clone(),
+            group: group.id,
             legs: group
                 .members
                 .iter()
@@ -2092,8 +2071,8 @@ mod tests {
                         .map(|(_, fraction)| *fraction)
                         .unwrap_or(Fraction::ZERO);
                     OutcomeSettlementLeg {
-                        member: member.id.clone(),
-                        side: member.sides[0].clone(),
+                        member: member.id,
+                        side: member.sides[0],
                         settle_fraction: fraction,
                     }
                 })
@@ -2138,21 +2117,21 @@ mod tests {
         let event = OutcomeEvent::new(
             ResolutionSourceId::new("polymarket").expect("source should be valid"),
             IdentifierValue::new("event-1").expect("event should be valid"),
-            vec![first.id.clone()],
+            vec![first.id],
             Vec::new(),
         )
         .expect("event should be valid");
         let refreshed = OutcomeEvent::new(
             ResolutionSourceId::new("polymarket").expect("source should be valid"),
             IdentifierValue::new("event-1").expect("event should be valid"),
-            vec![second.id.clone(), first.id.clone()],
+            vec![second.id, first.id],
             Vec::new(),
         )
         .expect("event should be valid");
         let duplicated = OutcomeEvent::new(
             ResolutionSourceId::new("polymarket").expect("source should be valid"),
             IdentifierValue::new("event-1").expect("event should be valid"),
-            vec![first.id.clone(), first.id.clone()],
+            vec![first.id, first.id],
             Vec::new(),
         );
 
@@ -2173,12 +2152,8 @@ mod tests {
         let first = binary_group("Will it rain?");
         let second = binary_group("Will it snow?");
         let third = binary_group("Will it hail?");
-        let two_groups = OutcomeRiskPool::new(
-            usdc(),
-            vec![first.id.clone(), second.id.clone()],
-            Vec::new(),
-        )
-        .expect("pool should be valid");
+        let two_groups = OutcomeRiskPool::new(usdc(), vec![first.id, second.id], Vec::new())
+            .expect("pool should be valid");
         let three_groups =
             OutcomeRiskPool::new(usdc(), vec![first.id, second.id, third.id], Vec::new())
                 .expect("pool should be valid");
@@ -2190,9 +2165,9 @@ mod tests {
     fn leg_label_should_render_all_three_identities() {
         let group = binary_group("Will it rain?");
         let leg = OutcomeLegRef {
-            group: group.id.clone(),
-            member: group.members[0].id.clone(),
-            side: group.members[0].sides[0].clone(),
+            group: group.id,
+            member: group.members[0].id,
+            side: group.members[0].sides[0],
         };
         let rendered = super::leg_label(&leg);
 
@@ -2200,8 +2175,8 @@ mod tests {
             rendered.as_str(),
             format!("{}/{}/{}", leg.group, leg.member, leg.side)
         );
-        assert!(rendered.contains(group.id.as_str()));
-        assert!(rendered.contains(group.members[0].id.as_str()));
-        assert!(rendered.contains(group.members[0].sides[0].as_str()));
+        assert!(rendered.contains(group.id.as_str().as_str()));
+        assert!(rendered.contains(group.members[0].id.as_str().as_str()));
+        assert!(rendered.contains(group.members[0].sides[0].as_str().as_str()));
     }
 }

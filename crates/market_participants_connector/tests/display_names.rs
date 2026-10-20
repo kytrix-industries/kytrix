@@ -617,7 +617,7 @@ async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
         else {
             panic!("a Hyperliquid contract is a perpetual");
         };
-        terms.underlying().price_reference().clone()
+        *terms.underlying().price_reference()
     };
     let core_reference = reference_of(&core_listing);
     assert_eq!(

@@ -544,7 +544,7 @@ impl MarketParticipantsConnectorInner {
                     revision.set(venues.replace(
                         venue,
                         scopes,
-                        Arc::clone(generation),
+                        generation.id(),
                         Arc::clone(&staged.metadata),
                     ));
                 },
@@ -668,7 +668,7 @@ impl MarketParticipantsConnectorInner {
                     revision.set(venues.replace(
                         *venue,
                         scopes,
-                        Arc::clone(generation),
+                        generation.id(),
                         Arc::clone(&metadata),
                     ));
                 },
@@ -688,7 +688,7 @@ impl MarketParticipantsConnectorInner {
             log::debug!(
                 "fixture committed {venue} at revision {} generation {} with {} deployments",
                 entry.revision(),
-                entry.pinned_generation().id(),
+                entry.generation(),
                 entry.metadata().perp_dexes().len()
             );
         }
@@ -2170,9 +2170,9 @@ mod venue_load_tests {
 
         // The same holds for a refresh: while its stage is held, every reader
         // still answers the commit before it — the previous entry, the previous
-        // generation it pins and the previous catalogs.
+        // generation it names and the previous catalogs.
         let before = Arc::clone(&entry);
-        let generation_before = Arc::clone(before.pinned_generation());
+        let generation_before = before.generation();
         let scopes_before = connector.venues().scopes();
         let listings_before = catalog
             .cached_listings(&swap)
@@ -2199,9 +2199,10 @@ mod venue_load_tests {
             1,
             "and the previous revision, because nothing committed"
         );
-        assert!(
-            Arc::ptr_eq(&generation_before, during.pinned_generation()),
-            "and the generation the previous commit pinned"
+        assert_eq!(
+            during.generation(),
+            generation_before,
+            "and the generation id the previous commit named"
         );
         assert_eq!(
             connector.venues().scopes(),
@@ -2228,8 +2229,9 @@ mod venue_load_tests {
             .loaded(&okx)
             .expect("the venue stays loaded");
         assert_eq!(after.revision(), 2, "the refresh committed once");
-        assert!(
-            !Arc::ptr_eq(&generation_before, after.pinned_generation()),
+        assert_ne!(
+            after.generation(),
+            generation_before,
             "and published a new generation"
         );
         connector.shutdown().await;
@@ -2555,7 +2557,7 @@ mod venue_load_tests {
             .venues()
             .loaded(&okx)
             .expect("the first commit is visible");
-        let generation = Arc::clone(before.pinned_generation());
+        let generation = before.generation();
         let metadata = Arc::clone(before.metadata());
         let scopes = connector.venues().scopes();
         let registered_before = registered(&connector);
@@ -2574,9 +2576,10 @@ mod venue_load_tests {
             Arc::ptr_eq(&before, &after),
             "the entry is the very value the last commit published"
         );
-        assert!(
-            Arc::ptr_eq(&generation, after.pinned_generation()),
-            "the pinned generation is the same value"
+        assert_eq!(
+            generation,
+            after.generation(),
+            "the generation id is the same one"
         );
         assert!(
             Arc::ptr_eq(&metadata, after.metadata()),

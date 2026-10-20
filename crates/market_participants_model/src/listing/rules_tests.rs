@@ -1,12 +1,14 @@
 //! Unit tests for venue trading rules, listing snapshots and listing aliases.
 
+use std::sync::Arc;
+
 use crate::{
     asset::{AssetId, CryptoTokenId, CryptoTokenOrigin, TokenReference},
     decimal::{Fraction, Price, Quantity, Ratio, Tick},
     error::{ListingPublicationError, ModelError},
     identifier::{
         EquityLocalCode, IdentifierNamespace, IdentifierValue, Mic, NativeSymbol, TokenIssuerId,
-        TradingCalendarId, VenueId, VenueScopeId,
+        VenueId, VenueScopeId,
     },
     instrument::{Instrument, InstrumentTerms, SpotTerms},
     listing::{
@@ -21,8 +23,8 @@ use crate::{
             CommonTradingRules, FundingInterval, FundingSchedule, LeverageTier, ListingPrecision,
             LotPolicy, MarginMode, MarginProfile, NotionalRule, PerpetualMarginTerms,
             PerpetualRisk, PerpetualTradingRules, PriceLimitRule, PriceRule, ProductTradingRules,
-            QuantityRule, SettlementCycle, ShortSalePolicy, SpotTradingRules, TimeWindow,
-            TradingRules,
+            QuantityRule, ShortSalePolicy, SpotTradingRules, TimeWindow, TradingRules,
+            VenueTradingPolicy,
         },
         venue::{BinanceProduct, PriceBasis},
     },
@@ -108,11 +110,9 @@ fn spot_rules() -> TradingRules {
                 minimum: Some(Quantity::from(10_u8)),
                 maximum: None,
             }),
-            sessions: TradingCalendarId::new("continuous-24x7").expect("calendar should be valid"),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Spot(
+        product: Arc::new(ProductTradingRules::Spot(
             SpotTradingRules::new(
                 LotPolicy::FractionalAllowed {
                     lot_size: Quantity::from_inner(1),
@@ -121,7 +121,7 @@ fn spot_rules() -> TradingRules {
                 ShortSalePolicy::NotApplicable,
             )
             .expect("spot rules should be valid"),
-        ),
+        )),
     }
 }
 
@@ -142,11 +142,9 @@ fn perpetual_rules() -> TradingRules {
                 maximum: None,
             },
             notional: None,
-            sessions: TradingCalendarId::new("continuous-24x7").expect("calendar should be valid"),
-            settlement_cycle: SettlementCycle::Immediate,
-            price_limits: PriceLimitRule::None,
+            venue_policy: Arc::new(VenueTradingPolicy::continuous()),
         },
-        product: ProductTradingRules::Perpetual(PerpetualTradingRules {
+        product: Arc::new(ProductTradingRules::Perpetual(PerpetualTradingRules {
             risk: PerpetualRisk::Published(
                 PerpetualMarginTerms::new(
                     MarginProfile::new(
@@ -180,7 +178,7 @@ fn perpetual_rules() -> TradingRules {
             )
             .expect("funding should be valid"),
             open_interest_cap: None,
-        }),
+        })),
     }
 }
 
@@ -404,7 +402,7 @@ fn every_perpetual_risk_state_should_round_trip_through_serde() {
         ),
     ] {
         let mut rules = perpetual_rules();
-        let ProductTradingRules::Perpetual(perpetual) = &mut rules.product else {
+        let ProductTradingRules::Perpetual(perpetual) = Arc::make_mut(&mut rules.product) else {
             panic!("fixture must be a perpetual listing")
         };
         perpetual.risk = risk.clone();
@@ -529,7 +527,7 @@ fn a_snapshot_of_another_listing_should_be_rejected() {
     let instrument = spot_instrument();
     let listing = VenueListing::new(
         listing_key("BTCUSDT"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -588,7 +586,7 @@ fn a_listing_of_another_route_should_be_rejected() {
     let instrument = spot_instrument();
     let listing = VenueListing::new(
         listing_key("BTCUSDT"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -638,7 +636,7 @@ fn a_listing_of_another_instrument_should_be_rejected() {
     .expect("instrument should be valid");
     let listing = VenueListing::new(
         listing_key("BTCUSDT"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -685,7 +683,7 @@ fn publication_should_refuse_a_contradicted_echo_with_its_typed_reason() {
     let key = listing_key("BTCUSDT");
     let listing = VenueListing::new(
         key.clone(),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("AAPL").expect("symbol should be valid")),
         Vec::new(),
         VenueListingIdentifiers::Equity(EquityListingIdentifiers {
@@ -723,7 +721,7 @@ fn listing_should_accept_its_typed_identifiers() {
     let instrument = spot_instrument();
     let listing = VenueListing::new(
         listing_key("BTCUSDT"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         vec![NativeSymbol::new("BTC/USDT").expect("symbol should be valid")],
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {
@@ -743,7 +741,7 @@ fn listing_should_reject_duplicate_aliases() {
     let instrument = spot_instrument();
     let listing = VenueListing::new(
         listing_key("BTCUSDT"),
-        instrument.id().clone(),
+        *instrument.id(),
         Some(NativeSymbol::new("BTCUSDT").expect("symbol should be valid")),
         vec![NativeSymbol::new("BTCUSDT").expect("symbol should be valid")],
         VenueListingIdentifiers::Binance(BinanceListingIdentifiers {

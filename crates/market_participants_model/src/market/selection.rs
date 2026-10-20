@@ -65,9 +65,9 @@ impl OrderQuantity {
                 side,
                 ..
             } => QuantityUnit::OutcomeTokens {
-                group: group.clone(),
-                member: member.clone(),
-                side: side.clone(),
+                group: *group,
+                member: *member,
+                side: *side,
             },
             Self::Notional { asset, .. } => QuantityUnit::Notional {
                 asset: asset.clone(),

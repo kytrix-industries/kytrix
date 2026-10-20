@@ -32,7 +32,7 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    catalog::generation::CatalogGeneration,
+    catalog::generation::CatalogGenerationId,
     venue::{definition::ScopeEntry, metadata::VenueMetadata},
 };
 
@@ -40,7 +40,16 @@ use crate::{
 pub struct LoadedVenue {
     revision: u64,
     scopes: Arc<[Arc<ScopeEntry>]>,
-    pinned_generation: Arc<CatalogGeneration>,
+    /// The identity of the directory generation this commit published.
+    ///
+    /// The generation itself is deliberately **not** held: a `CatalogGeneration`
+    /// owns every route snapshot's index maps and the whole display catalog, so a
+    /// venue that pinned one would retain a complete copy of the directory from its
+    /// own commit — and every commit made after it would leave one more copy alive
+    /// for as long as any venue still pinned it. The id is what this entry has to
+    /// state about its commit, and the catalogue's published generation is the one
+    /// place the content is read from.
+    generation: CatalogGenerationId,
     metadata: Arc<VenueMetadata>,
 }
 
@@ -59,20 +68,22 @@ impl LoadedVenue {
         &self.scopes
     }
 
-    /// Returns the directory generation this commit published.
+    /// Returns the identity of the directory generation this commit published.
     ///
-    /// The generation is pinned rather than read: it is the directory side of the
-    /// same commit the scope set is the routing side of, and it is what a prune of
-    /// the next commit reasons about. Catalog *content* is not answered here — an
-    /// [`crate::connector::MarketParticipantsConnector::catalog`] answers it.
+    /// The id is the commit's own record of which publication it made; the content
+    /// of that publication is read from the catalogue, which holds exactly one. No
+    /// production read names it — a caller that wants content asks the catalogue —
+    /// so the accessor exists for the tests that assert a commit published a new
+    /// generation, which is the same seam [`LoadedVenue`] itself is inspected
+    /// through.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn pinned_generation(&self) -> &Arc<CatalogGeneration> {
-        &self.pinned_generation
+    pub(crate) fn generation(&self) -> CatalogGenerationId {
+        self.generation
     }
 
     /// Returns the route metadata this commit published.
     ///
-    /// Like the pinned generation this is the commit's own record rather than a
+    /// Like the generation id this is the commit's own record rather than a
     /// read face: the gateway hands it to the adapter of an admitted request
     /// through its execution context, and nothing outside this crate can reach it.
     pub(crate) fn metadata(&self) -> &Arc<VenueMetadata> {
@@ -86,7 +97,7 @@ impl std::fmt::Debug for LoadedVenue {
             .debug_struct("LoadedVenue")
             .field("revision", &self.revision)
             .field("scopes", &self.scopes.len())
-            .field("generation", &self.pinned_generation.id())
+            .field("generation", &self.generation)
             .field("perp_dexes", &self.metadata.perp_dexes().len())
             .finish()
     }
@@ -288,7 +299,7 @@ impl VenueCommitGuard<'_> {
         &mut self,
         venue: VenueId,
         scopes: Vec<Arc<ScopeEntry>>,
-        generation: Arc<CatalogGeneration>,
+        generation: CatalogGenerationId,
         metadata: Arc<VenueMetadata>,
     ) -> u64 {
         let revision = self.revisions.get(&venue).map_or(1, |last| last + 1);
@@ -302,7 +313,7 @@ impl VenueCommitGuard<'_> {
             Arc::new(LoadedVenue {
                 revision,
                 scopes: scopes.into(),
-                pinned_generation: generation,
+                generation,
                 metadata,
             }),
         );
