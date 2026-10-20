@@ -1,6 +1,7 @@
 use std::fmt::{Display, Write};
 
 use either::Either;
+use gpui_kit::SharedString;
 use smallvec::SmallVec;
 
 use super::{
@@ -18,11 +19,17 @@ use super::{
 /// ```
 ///
 /// Parsing happens once, while loading a locale file. A template without
-/// placeholders renders by borrowing its own text.
+/// placeholders holds the exact text it hands to callers, so rendering it costs
+/// one clone and no allocation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Template {
-    /// A message without placeholders.
-    Static(Box<str>),
+    /// A message without placeholders, stored as the text handed to callers.
+    ///
+    /// The text is built once while loading the locale, so rendering the message
+    /// only costs a clone of an immutable string: messages up to the inline
+    /// capacity of a short string copy an inline buffer, and longer ones bump a
+    /// reference count. Neither path allocates.
+    Static(SharedString),
     /// A message with at least one placeholder, split into literal and
     /// placeholder parts in source order.
     Interpolated { parts: Box<[TemplatePart]> },
@@ -61,7 +68,7 @@ impl Template {
         }
 
         if parts.is_empty() {
-            return Ok(Template::Static(text.into()));
+            return Ok(Template::Static(SharedString::from(text)));
         }
         push_text(&mut parts, rest);
 
@@ -70,16 +77,11 @@ impl Template {
         })
     }
 
-    /// Returns `true` when the message contains at least one placeholder.
-    pub fn is_interpolated(&self) -> bool {
-        matches!(self, Template::Interpolated { .. })
-    }
-
     /// Returns the whole text of a message that contains no placeholder.
     ///
     /// This is the fast path of rendering: a message without placeholders is one
-    /// string, and nothing has to be rendered or allocated.
-    pub fn text(&self) -> Option<&str> {
+    /// string, and cloning it neither walks a template nor allocates.
+    pub fn text(&self) -> Option<&SharedString> {
         match self {
             Template::Static(text) => Some(text),
             Template::Interpolated { .. } => None,
@@ -99,10 +101,8 @@ impl Template {
     ///
     /// Placeholders without a matching argument render as the empty string.
     pub fn write_with(&self, arguments: &[(&str, &dyn Display)], output: &mut String) {
-        if !self.is_interpolated() {
-            if let Some(text) = self.text() {
-                output.push_str(text);
-            }
+        if let Template::Static(text) = self {
+            output.push_str(text);
             return;
         }
 

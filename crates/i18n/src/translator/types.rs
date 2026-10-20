@@ -167,7 +167,7 @@ impl I18n {
         let template = self.template(language, key)?;
 
         if let Some(text) = template.text() {
-            return Some(text.into());
+            return Some(text.clone());
         }
 
         let arguments = bind_arguments(template, arguments);

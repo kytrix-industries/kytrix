@@ -1,3 +1,5 @@
+use gpui_kit::SharedString;
+
 use super::{error::TemplateError, interpolate::Template, parts::TemplatePart};
 
 fn render(template: &Template, arguments: &[(&str, &dyn std::fmt::Display)]) -> String {
@@ -9,16 +11,14 @@ fn render(template: &Template, arguments: &[(&str, &dyn std::fmt::Display)]) -> 
 #[test]
 fn text_without_placeholders_is_static() {
     let template = Template::parse("Market").expect("valid template");
-    assert!(!template.is_interpolated());
-    assert_eq!(template.text(), Some("Market"));
+    assert_eq!(template.text().map(SharedString::as_str), Some("Market"));
     assert_eq!(render(&template, &[]), "Market");
 }
 
 #[test]
 fn empty_text_is_static() {
     let template = Template::parse("").expect("valid template");
-    assert!(!template.is_interpolated());
-    assert_eq!(template.text(), Some(""));
+    assert_eq!(template.text().map(SharedString::as_str), Some(""));
     assert_eq!(render(&template, &[]), "");
 }
 
@@ -111,7 +111,7 @@ fn placeholders_keep_non_ascii_text_intact() {
 #[test]
 fn dangling_percent_is_literal_text() {
     let template = Template::parse("100% done").expect("valid template");
-    assert!(!template.is_interpolated());
+    assert_eq!(template.text().map(SharedString::as_str), Some("100% done"));
     assert_eq!(render(&template, &[]), "100% done");
 }
 

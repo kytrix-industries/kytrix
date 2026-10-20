@@ -35,7 +35,7 @@ fn placeholders_are_parsed_while_loading() {
     let store = load_str("greeting: \"Hello, %{name}!\"\n", path()).expect("valid locale");
     let template = store.get("greeting").expect("the message exists");
 
-    assert!(template.is_interpolated());
+    assert!(template.text().is_none());
     assert_eq!(template.placeholder_names().collect::<Vec<_>>(), ["name"]);
 }
 
@@ -87,7 +87,8 @@ fn quoted_scalars_keep_their_text() {
         store
             .get("brace")
             .expect("the message exists")
-            .is_interpolated()
+            .text()
+            .is_none()
     );
 }
 
