@@ -129,7 +129,7 @@ mod tests {
     use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use gpui_kit::{
-        AppContext as _, Context, IntoElement, Modifiers, Render, Styled as _, TestAppContext,
+        AppContext as _, Context, IntoElement, Modifiers, Render, TestAppContext,
         VisualTestContext, Window, div, px,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};

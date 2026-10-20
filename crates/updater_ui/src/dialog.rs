@@ -797,7 +797,7 @@ mod tests {
         shown(
             cx,
             &updater,
-            UpdaterState::downloading_for_test(release(), 4_096, Some(8_192), cancellation.clone()),
+            UpdaterState::downloading_for_test(release(), 4_096, Some(8_192), cancellation),
         );
 
         // Pressed without letting the transition settle, so the frames that follow are
