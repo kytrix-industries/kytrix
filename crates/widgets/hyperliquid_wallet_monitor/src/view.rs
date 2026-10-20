@@ -1481,11 +1481,20 @@ impl HyperliquidWalletMonitorWidget {
             return None;
         }
         let widget = cx.entity().downgrade();
-        let label = t!(
-            cx,
-            "widget.hyperliquid_wallet_monitor.retry_failed",
-            value = failed
-        );
+        // The count decides the sentence: one failed wallet is not "1 failed wallets".
+        let label = if failed == 1 {
+            t!(
+                cx,
+                "widget.hyperliquid_wallet_monitor.retry_failed_one",
+                value = failed
+            )
+        } else {
+            t!(
+                cx,
+                "widget.hyperliquid_wallet_monitor.retry_failed",
+                value = failed
+            )
+        };
         Some(
             div()
                 .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MONITOR_RETRY_FAILED".into())

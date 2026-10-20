@@ -47,6 +47,29 @@ impl TimeFrameUnit {
             Self::Year => "widget.candlestick.years",
         }
     }
+
+    /// The i18n key naming one interval of this unit, which is what a picker entry
+    /// counted by `tick` is labelled with.
+    ///
+    /// A catalogue has no plural rule to read, so the count decides the key: one second
+    /// is "1 Second" and never "1 Seconds", and the group heading keeps the plural the
+    /// unit is named under whatever the count of an entry is.
+    pub(crate) const fn label_key(self, tick: u8) -> &'static str {
+        if tick == 1 {
+            match self {
+                Self::Second => "widget.candlestick.seconds_one",
+                Self::Minute => "widget.candlestick.minutes_one",
+                Self::Hour => "widget.candlestick.hours_one",
+                Self::Day => "widget.candlestick.days_one",
+                Self::Week => "widget.candlestick.weeks_one",
+                Self::Month => "widget.candlestick.months_one",
+                Self::Quarter => "widget.candlestick.quarters_one",
+                Self::Year => "widget.candlestick.years_one",
+            }
+        } else {
+            self.group_key()
+        }
+    }
 }
 
 /// The unit groups the interval picker offers, in the order it draws them.
@@ -739,6 +762,31 @@ mod tests {
                 "{timeframe:?} should head its group with a key"
             );
         }
+    }
+
+    /// A catalogue has no plural rule, so the count decides the key: an interval of one
+    /// is named in the singular and a group heading keeps the plural either way.
+    #[test]
+    fn an_interval_of_one_should_be_named_in_the_singular() {
+        for timeframe in TIMEFRAMES {
+            let (tick, unit) = tick_and_unit(timeframe);
+            let expected = if tick == 1 {
+                format!("{}_one", unit.group_key())
+            } else {
+                unit.group_key().to_owned()
+            };
+
+            assert_eq!(unit.label_key(tick), expected, "{timeframe:?}");
+        }
+
+        assert_eq!(
+            TimeFrameUnit::Second.label_key(1),
+            "widget.candlestick.seconds_one"
+        );
+        assert_eq!(
+            TimeFrameUnit::Second.label_key(2),
+            "widget.candlestick.seconds"
+        );
     }
 
     #[test]

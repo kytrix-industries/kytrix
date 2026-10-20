@@ -1026,15 +1026,26 @@ fn render_marker(
         .cloned()
         .unwrap_or_default();
     let side = marker.side;
-    let label = t!(
-        cx,
-        "widget.hyperliquid_wallet_monitor.timeline_marker",
-        side = match side {
-            Side::Buy => t!(cx, "widget.hyperliquid_wallet_monitor.buy"),
-            Side::Sell => t!(cx, "widget.hyperliquid_wallet_monitor.sell"),
-        },
-        value = rows.len()
-    );
+    // The count decides the sentence: a marker holding one fill is not "1 fills".
+    let side_label = match side {
+        Side::Buy => t!(cx, "widget.hyperliquid_wallet_monitor.buy"),
+        Side::Sell => t!(cx, "widget.hyperliquid_wallet_monitor.sell"),
+    };
+    let label = if rows.len() == 1 {
+        t!(
+            cx,
+            "widget.hyperliquid_wallet_monitor.timeline_marker_one",
+            side = side_label,
+            value = rows.len()
+        )
+    } else {
+        t!(
+            cx,
+            "widget.hyperliquid_wallet_monitor.timeline_marker",
+            side = side_label,
+            value = rows.len()
+        )
+    };
     let trigger = div()
         .id(ElementId::Name(SharedString::new_static(
             "HyperliquidTimelineMarkerTrigger",

@@ -1580,12 +1580,24 @@ fn search_result_row(
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme.roles.fg.muted.hsla)
-                                    .child(t!(
-                                        cx,
-                                        "widget.tweet_monitor.followers_following",
-                                        followers = format_follower_count(profile.followers_count),
-                                        following = profile.following_count
-                                    )),
+                                    // A count of one is the singular word: "1 follower".
+                                    .child(if profile.followers_count == 1 {
+                                        t!(
+                                            cx,
+                                            "widget.tweet_monitor.followers_following_one_follower",
+                                            followers =
+                                                format_follower_count(profile.followers_count),
+                                            following = profile.following_count
+                                        )
+                                    } else {
+                                        t!(
+                                            cx,
+                                            "widget.tweet_monitor.followers_following",
+                                            followers =
+                                                format_follower_count(profile.followers_count),
+                                            following = profile.following_count
+                                        )
+                                    }),
                             )
                         },
                     ),

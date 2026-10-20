@@ -158,7 +158,12 @@ impl LocalizedError for IndicesStreamError {
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
             Self::IndexLimit { limit: Some(limit) } => {
-                i18n::t!(cx, "error.indices.index_limit", limit = limit)
+                // A limit of one is a single index, and the sentence says so.
+                if *limit == 1 {
+                    i18n::t!(cx, "error.indices.index_limit_one", limit = limit)
+                } else {
+                    i18n::t!(cx, "error.indices.index_limit", limit = limit)
+                }
             }
             Self::IndexLimit { limit: None } => i18n::t!(cx, "error.indices.index_limit_unknown"),
         }

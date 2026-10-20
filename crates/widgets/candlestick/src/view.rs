@@ -1399,10 +1399,13 @@ impl CandlestickWidget {
                 if intervals.peek().is_none() {
                     continue;
                 }
-                let unit_label = t!(cx, unit.group_key());
-                select = select.menu_item(MenuItem::Group(MenuItemGroup::new(unit_label.clone())));
+                let group_label = t!(cx, unit.group_key());
+                select = select.menu_item(MenuItem::Group(MenuItemGroup::new(group_label)));
                 for timeframe in intervals {
-                    let (tick, _) = tick_and_unit(timeframe);
+                    let tick = tick_and_unit(timeframe).0;
+                    // The unit is named the way this entry's count reads it: one interval
+                    // is "1 Second", and the group above it keeps its plural heading.
+                    let unit_label = t!(cx, unit.label_key(tick));
                     select = select.menu_item(MenuItem::Action(MenuItemAction::new(
                         SharedString::from(timeframe.label()),
                         SharedString::new(format_smolstr!("{tick} {unit_label}").as_str()),

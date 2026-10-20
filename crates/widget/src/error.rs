@@ -450,14 +450,27 @@ impl LocalizedError for CatalogValidationError {
                 count,
             } => {
                 let listing = listing_identity_diagnostic(listing, cx);
-                t!(
-                    cx,
-                    "error.catalog_validation.incomplete_outcome_set",
-                    route = route_display_string(route, cx),
-                    listing = listing,
-                    kind = kind,
-                    count = count
-                )
+                // The sentence has to agree with its count: one missing object is not
+                // "1 missing outcome group objects".
+                if *count == 1 {
+                    t!(
+                        cx,
+                        "error.catalog_validation.incomplete_outcome_set_one",
+                        route = route_display_string(route, cx),
+                        listing = listing,
+                        kind = kind,
+                        count = count
+                    )
+                } else {
+                    t!(
+                        cx,
+                        "error.catalog_validation.incomplete_outcome_set",
+                        route = route_display_string(route, cx),
+                        listing = listing,
+                        kind = kind,
+                        count = count
+                    )
+                }
             }
             Self::OutcomeGroupIncomplete { group, .. } => t!(
                 cx,

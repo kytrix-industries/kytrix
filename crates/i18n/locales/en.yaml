@@ -62,6 +62,7 @@ error:
     duplicate_native_identifier: Route %{route} reuses the normalized native identifier %{identifier}
     identifier_normalization_mismatch: The %{kind} identifiers of listing %{listing} are not normalized as its route declares
     incomplete_outcome_set: Listing %{listing} references %{count} missing %{kind} objects that route %{route} does not carry
+    incomplete_outcome_set_one: Listing %{listing} references %{count} missing %{kind} object that route %{route} does not carry
     instrument_kind_mismatch: Listing %{listing} declares %{declared} but its instrument is %{kind}
     instrument_lineage_invalid: The instrument lineage of the catalog is not a valid graph
     instrument_terms_mismatch: Listing %{listing} declares the instrument %{declared} but its terms produce %{computed}
@@ -154,6 +155,7 @@ error:
     duplicate_category: 'The index manifest repeats the category %{code}'
     duplicate_index: 'The index manifest repeats the index %{code}'
     index_limit: Your current limit is %{limit} indices
+    index_limit_one: Your current limit is %{limit} index
     index_limit_unknown: The selection exceeds your current index limit
     invalid_code: The index manifest carries an invalid code
     manifest_too_large: The index manifest has more entries than the %{limit} it supports
@@ -481,17 +483,25 @@ widget:
     chart: Candlestick chart
     contracts: Contracts
     days: Days
+    days_one: Day
     hours: Hours
+    hours_one: Hour
     minutes: Minutes
+    minutes_one: Minute
     months: Months
+    months_one: Month
     outcome_tokens: Outcome tokens
     quarters: Quarters
+    quarters_one: Quarter
     seconds: Seconds
+    seconds_one: Second
     select_instrument: Select instrument
     select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
     timeframe: Candlestick interval
     weeks: Weeks
+    weeks_one: Week
     years: Years
+    years_one: Year
   categories:
     market: Market
     monitoring: Monitoring
@@ -572,6 +582,7 @@ widget:
     refresh: Refresh current tab
     remove_address: Remove monitored address %{address}
     retry_failed: Retry %{value} failed wallets
+    retry_failed_one: Retry %{value} failed wallet
     scroll_addresses: Scroll monitored addresses
     scroll_rows: Scroll wallet data rows
     sell: Sell
@@ -590,6 +601,7 @@ widget:
     timeline_end: NOW
     timeline_loading: Loading recent fills
     timeline_marker: '%{side} marker, %{value} fills'
+    timeline_marker_one: '%{side} marker, %{value} fill'
     timeline_start: 6H ago
     timeline_title: 'Activity timeline:'
     trigger_price: Trigger price
@@ -700,6 +712,7 @@ widget:
     error_title: Error
     filter_placeholder: Filter accounts
     followers_following: '%{followers} followers · %{following} following'
+    followers_following_one_follower: '%{followers} follower · %{following} following'
     load_failed: Could not load monitored accounts
     loading_accounts: Loading monitored accounts
     logged_out: <p align="center">You need to register or log in to use this feature.</p>
