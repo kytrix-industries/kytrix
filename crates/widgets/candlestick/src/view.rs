@@ -90,6 +90,7 @@ use super::{
         },
         text::HoverLabelCache,
     },
+    indicator::{CandlestickIndicatorConfig, normalize_indicator},
     model::CandlestickSeriesSnapshot,
     service::{
         CandlestickProtocol, CandlestickRequest, CandlestickResponse, CandlestickService,
@@ -126,6 +127,8 @@ pub struct CandlestickConfig {
     selection: Option<InstrumentSelection>,
     timeframe: TimeFrame,
     adjustment: Adjustment,
+    #[serde(deserialize_with = "normalize_indicator")]
+    indicator: CandlestickIndicatorConfig,
 }
 
 impl Default for CandlestickConfig {
@@ -134,6 +137,7 @@ impl Default for CandlestickConfig {
             selection: None,
             timeframe: TimeFrame::Minute1,
             adjustment: Adjustment::None,
+            indicator: CandlestickIndicatorConfig::default(),
         }
     }
 }
@@ -1699,6 +1703,15 @@ impl CandlestickWidget {
         true
     }
 
+    /// How many extra candles the enabled indicators need before their values
+    /// are trustworthy.
+    ///
+    /// The history prefetch adds it to its margin, so the leftmost value the
+    /// chart can show is not still warming up after the page arrives.
+    fn warmup_depth(&self) -> usize {
+        self.config.indicator.warmup_depth()
+    }
+
     /// Asks for the page the user is about to need.
     ///
     /// The margin is measured against the widest the plot can be, so the request
@@ -1725,7 +1738,13 @@ impl CandlestickWidget {
             self.viewport,
             layout.maximum_plot_width(),
         );
-        if range.start <= PREFETCH_MARGIN
+        // Warmup is a history need: the left margin also has to cover it, or a
+        // page that only covered the plot's width would leave the leftmost
+        // trustworthy value outside the buffer once it arrived. The newer side
+        // keeps the plain margin — prefetching further right would push the
+        // chart off the live edge for no warmup gain (design §7.4.2).
+        let margin = PREFETCH_MARGIN.max(self.warmup_depth());
+        if range.start <= margin
             && !snapshot.older_exhausted()
             && !self.fetching_history
             && let Some(before_timestamp) = snapshot.earliest_timestamp()
@@ -2057,6 +2076,7 @@ mod tests {
             selection: Some(selection()),
             timeframe: TimeFrame::Minute1,
             adjustment: Adjustment::None,
+            indicator: CandlestickIndicatorConfig::default(),
         }
     }
 

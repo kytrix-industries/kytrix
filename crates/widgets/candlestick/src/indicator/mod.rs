@@ -4,6 +4,9 @@ mod compute;
 mod config;
 mod definition;
 
+pub(crate) use config::*;
+pub(crate) use definition::*;
+
 #[cfg(test)]
 mod compute_tests;
 
