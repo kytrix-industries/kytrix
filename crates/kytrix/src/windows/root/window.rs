@@ -40,7 +40,12 @@ pub fn open(cx: &mut App, recovered: Option<ConfigRecovery>) {
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.0), px(12.0))),
         }),
-
+        // On macOS the system titlebar is shorter than the header drawn here, so the
+        // window could not be dragged by its lower part. The header takes over the
+        // drag itself via `Window::start_window_move`, and AppKit must stop treating
+        // the native titlebar as a window-move region for that to be the only drag.
+        // Other platforms ignore this and keep using `WindowControlArea::Drag`.
+        app_owns_titlebar_drag: true,
         ..Default::default()
     };
 
@@ -61,6 +66,12 @@ struct RootWindow {
     page_portfolio: Entity<Portfolio>,
     page_quant: Entity<Quant>,
     selected_tab_index: usize,
+    /// Whether a left press on the header should move the window on the next mouse move.
+    ///
+    /// Only macOS reads this: there the header owns the drag instead of AppKit's
+    /// titlebar, which is shorter than the header. Elsewhere the platform drags the
+    /// window from `WindowControlArea::Drag` itself.
+    should_move: bool,
     /// The update button the header draws while a release is on offer.
     updater: Entity<UpdateIndicator>,
     profile: Entity<ProfileMenu>,
@@ -116,6 +127,7 @@ impl RootWindow {
             page_portfolio: cx.new(|_| Portfolio),
             page_quant: cx.new(|_| Quant),
             selected_tab_index: 0,
+            should_move: false,
             updater: cx.new(UpdateIndicator::new),
             profile: cx.new(ProfileMenu::new),
             _system_appearance: system_appearance,
@@ -213,6 +225,7 @@ impl Render for RootWindow {
             .flex_col()
             .child(
                 div()
+                    .id("title-bar")
                     .h_10()
                     .flex()
                     .flex_row()
@@ -239,7 +252,39 @@ impl Render for RootWindow {
                             .justify_end()
                             .child(right_part),
                     )
-                    .window_control_area(WindowControlArea::Drag),
+                    .window_control_area(WindowControlArea::Drag)
+                    // AppKit no longer drags this window from its native titlebar (see
+                    // `WindowOptions::app_owns_titlebar_drag`), so the header moves the
+                    // window itself. The move starts on the first mouse move instead of
+                    // the press, which leaves clicks on the tabs and buttons working.
+                    .when(cfg!(target_os = "macos"), |this| {
+                        this.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.should_move = true;
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.should_move = false;
+                            }),
+                        )
+                        .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                            this.should_move = false;
+                        }))
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
+                            if this.should_move && event.dragging() {
+                                this.should_move = false;
+                                window.start_window_move();
+                            }
+                        }))
+                        .on_click(|event, window, _| {
+                            if event.standard_click() && event.click_count() == 2 {
+                                window.titlebar_double_click();
+                            }
+                        })
+                    }),
             )
             .child(Separator::horizontal())
             .child(
