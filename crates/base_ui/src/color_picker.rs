@@ -1,25 +1,26 @@
-//! A color picker: its state, its events and the panel that presents them.
+//! A color picker: a stateful view, the events it emits and the panel it presents.
 //!
-//! [`ColorPickerState`] owns what the user is editing — the selected color, the active tab, the
-//! localized labels and the hex input the panel draws — and emits [`ColorPickerEvent`]. The split
-//! is the one [`crate::input::InputState`] uses: the caller holds the entity and subscribes to it,
-//! while the entity itself renders the panel, so the picker repaints its own view on a change
-//! instead of the caller having to rebuild it.
+//! [`ColorPicker`] is a view the caller owns. The parent creates it once with `cx.new`, stores
+//! the [`Entity<ColorPicker>`] in its own state and subscribes to [`ColorPickerEvent`]; the
+//! picker then owns the selected color, the active tab, the localized labels and the hex input
+//! the panel draws, so a user action repaints the trigger and the panel without the parent
+//! rebuilding either. This is the split [`crate::input::InputState`] uses: the caller holds the
+//! entity and listens to it.
 //!
-//! Performance is the reason the state is a view of its own. [`ColorPickerState::use_keyed`] keeps
-//! the entity behind a private slot that never notifies, so the observer GPUI's `use_keyed_state`
-//! installs on the caller's view does not fire on every color change. That removes one redundant
-//! notify; it is not a promise that the caller never renders, because GPUI's dirty propagation
-//! still marks the ancestors of a dirty view. The palette and the four HSLA tracks are drawn by
-//! canvases rather than by one element per swatch or slice, which is where the frame cost of a
-//! picker usually comes from.
+//! The popup is not the picker's private machinery: [`crate::overlay::Overlay`] owns when the
+//! panel is mounted, where it is placed and how it fades, and [`crate::input::InputState`] owns
+//! the hex field's editing state. The picker only decides what the trigger and the panel
+//! contain, and builds both on every render of its own view.
+//!
+//! The palette and the four HSLA tracks are drawn by canvases rather than by one element per
+//! swatch or slice, which is where the frame cost of a picker usually comes from.
 //!
 //! Both `gpui-base` and `gpui-component` ship a color picker, and this module deliberately uses
-//! neither: it keeps base_ui's [`crate::input::Input`], [`crate::button::Button`], theme roles and
-//! event naming (`ColorChanged`), reusing only implementation ideas from those components (hex
-//! parsing and formatting, a canvas-drawn palette and canvas-drawn tracks). The imports are
-//! explicit for the same reason: `gpui_kit::base` exports its own `ColorPicker`, `ColorPickerState`
-//! and `ColorPickerEvent`, so a glob import would collide with the types defined here.
+//! neither: it keeps base_ui's [`crate::input::Input`], [`crate::button::Button`], theme roles
+//! and event naming (`ColorChanged`), reusing only implementation ideas from those components
+//! (hex parsing and formatting, a canvas-drawn palette and canvas-drawn tracks). The imports
+//! are explicit for the same reason: `gpui_kit::base` exports its own `ColorPicker` and
+//! `ColorPickerEvent`, so a glob import would collide with the types defined here.
 
 use std::{cell::Cell, rc::Rc, sync::LazyLock};
 
@@ -96,12 +97,12 @@ pub enum ColorPickerTab {
     Hsla,
 }
 
-/// What a [`ColorPickerState`] reports to its subscribers.
+/// What a [`ColorPicker`] reports to its subscribers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColorPickerEvent {
     /// A user action changed the color.
     ///
-    /// [`ColorPickerState::set_color`] does not emit this: a programmatic change is silent.
+    /// [`ColorPicker::set_color`] does not emit this: a programmatic change is silent.
     ColorChanged(Hsla),
 }
 
@@ -135,65 +136,52 @@ impl Default for ColorPickerLabels {
     }
 }
 
-/// The color picker's business state and the view that renders its panel.
-pub struct ColorPickerState {
+/// The color picker: the trigger, the popup and the state they show.
+///
+/// A parent creates the picker once with `cx.new`, keeps the entity in its own state and
+/// subscribes to [`ColorPickerEvent`]:
+///
+/// ```ignore
+/// let picker = cx.new(|cx| ColorPicker::new(accent, UnifiedSize::Small, window, cx));
+/// let subscription = cx.subscribe(&picker, |this, _, event: &ColorPickerEvent, cx| {
+///     let ColorPickerEvent::ColorChanged(color) = event;
+///     this.accent = *color;
+///     cx.notify();
+/// });
+/// ```
+///
+/// The picker owns the selected color, the active tab, the labels and the hex field. The popup's
+/// placement and dismissal belong to [`Overlay`], and the field's editing state belongs to
+/// [`InputState`], so neither is duplicated here. The trigger and the panel are rebuilt on every
+/// render of this view, which means a color change, a tab switch, a theme change or the popup
+/// opening repaints them, and the caller only has to draw the entity it stored.
+pub struct ColorPicker {
     color: Hsla,
     active_tab: ColorPickerTab,
     labels: ColorPickerLabels,
+    size: UnifiedSize,
+    open: Entity<bool>,
     hex_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// Holds the picker state inside `use_keyed_state` without ever notifying it.
-///
-/// The entity is created with `cx.new`, not by `use_keyed_state`, so its own notifies are not
-/// forwarded to the view that called `use_keyed_state`. This slot therefore only keeps the
-/// entity alive across frames; it publishes nothing by itself.
-struct ColorPickerStateSlot {
-    state: Entity<ColorPickerState>,
-}
-
-impl ColorPickerState {
-    /// Creates or reuses the picker state for `id`.
+impl ColorPicker {
+    /// Creates a closed picker showing `default_color` at `size`.
     ///
-    /// This is the creation route a view should use, and it must be called from a rendering
-    /// context that has a [`Window`] — typically the view's `Render` — because it stores the
-    /// state in `window.use_keyed_state`. The state lives in a private
-    /// [`ColorPickerStateSlot`] held by that keyed state; the slot never notifies, so the
-    /// observer `use_keyed_state` registers on the calling view does not fire when the picker
-    /// notifies, and the picker's own view repaints instead. That saves the keyed observer's
-    /// extra notify, not the caller's render: GPUI's dirty propagation still marks ancestors of
-    /// a dirty view.
-    ///
-    /// The same `id` reuses the state created first; `default_color` only applies when the state
-    /// is created.
-    pub fn use_keyed(
-        id: impl Into<ElementId>,
+    /// This needs a window because it builds the hex field and subscribes to it. Call it from a
+    /// context that owns the entity — typically `cx.new` in the parent's first render — and keep
+    /// the returned handle: creating a picker per frame would reset its color, its tab and the
+    /// caret in its hex field.
+    pub fn new(
         default_color: Hsla,
+        size: UnifiedSize,
         window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<Self> {
-        let id: ElementId = id.into();
-        let slot = window.use_keyed_state((id, "color-picker-state-slot"), cx, |window, cx| {
-            ColorPickerStateSlot {
-                state: cx.new(|cx| ColorPickerState::new(default_color, window, cx)),
-            }
-        });
-
-        slot.read(cx).state.clone()
-    }
-
-    /// Creates the state directly, without the keyed slot.
-    ///
-    /// Prefer [`ColorPickerState::use_keyed`] in a view. This constructor does not deduplicate
-    /// itself, so the caller owns whatever reuse it wants; it needs a window because it builds
-    /// the hex input the panel draws.
-    ///
-    /// Do not call it inside `window.use_keyed_state`: that would make the state itself the
-    /// keyed value, so the observer `use_keyed_state` installs on the caller would forward every
-    /// notify of this state to the caller as an extra notify. `cx.new(...)` is the owning
-    /// context this constructor is for — a test, or a subsystem that already owns the entity.
-    pub fn new(default_color: Hsla, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The open flag is a plain entity: the trigger writes it and the picker observes it, so a
+        // click that opens or dismisses the popup repaints the trigger and mounts or unmounts the
+        // panel through the same path a color change takes.
+        let open = cx.new(|_| false);
         let input_id: ElementId = ("color-picker-hex", cx.entity_id()).into();
         let hex_input = cx.new(|cx| {
             InputStateBuilder::new(input_id)
@@ -205,7 +193,7 @@ impl ColorPickerState {
         // The subscription has to outlive `new`: dropping it would leave the field with no one
         // parsing its text. `set_value`, which `write_hex` uses, does not emit a change, so the
         // panel writing the field back never loops through this handler.
-        let subscription = cx.subscribe_in(
+        let hex_subscription = cx.subscribe_in(
             &hex_input,
             window,
             |this, _, event: &InputStateEvent, window, cx| match event {
@@ -215,13 +203,16 @@ impl ColorPickerState {
                 }
             },
         );
+        let open_subscription = cx.observe(&open, |_, _, cx| cx.notify());
 
         Self {
             color: default_color,
             active_tab: ColorPickerTab::default(),
             labels: ColorPickerLabels::default(),
+            size,
+            open,
             hex_input,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![hex_subscription, open_subscription],
         }
     }
 
@@ -249,7 +240,7 @@ impl ColorPickerState {
 
     /// Sets the color programmatically.
     ///
-    /// The hex field is synchronized and the panel repaints, but no
+    /// The hex field is synchronized and the picker repaints, but no
     /// [`ColorPickerEvent::ColorChanged`] is emitted: a programmatic change is not a user action.
     pub fn set_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
         self.color = color;
@@ -298,8 +289,8 @@ impl ColorPickerState {
 
     /// Applies the palette swatch at `index`.
     ///
-    /// This is a user action, so it goes through [`ColorPickerState::set_user_color`]: the event
-    /// is emitted only when the swatch differs from the current color, and the hex field is
+    /// This is a user action, so it goes through [`ColorPicker::set_user_color`]: the event is
+    /// emitted only when the swatch differs from the current color, and the hex field is
     /// synchronized. An index outside the palette is ignored rather than panicking; the only
     /// caller passes an index a hit test from the same palette produced.
     fn select_palette(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -314,7 +305,7 @@ impl ColorPickerState {
     ///
     /// `t` is the fraction a slider's track maps a pointer position to, so it is clamped to the
     /// unit range before it becomes a component. Like every other user path this goes through
-    /// [`ColorPickerState::set_user_color`]: an unchanged color emits nothing, and a change emits
+    /// [`ColorPicker::set_user_color`]: an unchanged color emits nothing, and a change emits
     /// [`ColorPickerEvent::ColorChanged`] and synchronizes the hex field.
     fn set_channel(
         &mut self,
@@ -369,10 +360,11 @@ impl ColorPickerState {
         self.write_hex(color, window, cx);
     }
 
-    /// Builds one of the two tab buttons.
+    /// Builds one of the two tab buttons for `state`.
+    ///
+    /// The panel is built by the overlay with a plain [`App`], so this is an associated function:
+    /// it has no picker borrow to read and routes the click through the entity instead.
     fn tab_button(
-        &self,
-        cx: &mut Context<Self>,
         state: Entity<Self>,
         tab: ColorPickerTab,
         active: ColorPickerTab,
@@ -380,8 +372,8 @@ impl ColorPickerState {
     ) -> Button {
         let selected = tab == active;
         let id: ElementId = match tab {
-            ColorPickerTab::Palette => ("color-picker-tab-palette", cx.entity_id()).into(),
-            ColorPickerTab::Hsla => ("color-picker-tab-hsla", cx.entity_id()).into(),
+            ColorPickerTab::Palette => ("color-picker-tab-palette", state.entity_id()).into(),
+            ColorPickerTab::Hsla => ("color-picker-tab-hsla", state.entity_id()).into(),
         };
 
         Button::new(id)
@@ -402,9 +394,9 @@ impl ColorPickerState {
     }
 }
 
-impl EventEmitter<ColorPickerEvent> for ColorPickerState {}
+impl EventEmitter<ColorPickerEvent> for ColorPicker {}
 
-impl Render for ColorPickerState {
+impl Render for ColorPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Read the theme through Copy values before anything borrows the context mutably; the
         // panel must paint from the values of this frame, not from a cached theme.
@@ -417,235 +409,159 @@ impl Render for ColorPickerState {
             )
         };
 
-        let active = self.active_tab;
-        let state = cx.entity();
-        let content: AnyElement = match active {
-            ColorPickerTab::Palette => {
-                PaletteGrid::new(state.clone(), self.color, self.labels.palette.clone())
-                    .into_any_element()
-            }
-            ColorPickerTab::Hsla => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(HslaSlider::new(
-                    state.clone(),
-                    HslaChannel::Hue,
-                    self.color,
-                    HslaChannel::Hue.label(&self.labels),
-                ))
-                .child(HslaSlider::new(
-                    state.clone(),
-                    HslaChannel::Saturation,
-                    self.color,
-                    HslaChannel::Saturation.label(&self.labels),
-                ))
-                .child(HslaSlider::new(
-                    state.clone(),
-                    HslaChannel::Lightness,
-                    self.color,
-                    HslaChannel::Lightness.label(&self.labels),
-                ))
-                .child(HslaSlider::new(
-                    state.clone(),
-                    HslaChannel::Alpha,
-                    self.color,
-                    HslaChannel::Alpha.label(&self.labels),
-                ))
-                .into_any_element(),
-        };
-
-        div()
-            .p_2()
-            .bg(panel_background)
-            .border_1()
-            .border_color(panel_border)
-            .rounded_sm()
-            .shadow(vec![
-                box_shadow(0., 1., 2., 0., panel_shadow),
-                box_shadow(0., 3., 6., -2., panel_shadow),
-            ])
-            .debug_selector(|| "TEST_COLOR_PICKER_PANEL".into())
-            .child(
-                div()
-                    .w(PANEL_CONTENT_WIDTH)
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        Join::default()
-                            .w_full()
-                            .button(self.tab_button(
-                                cx,
-                                state.clone(),
-                                ColorPickerTab::Palette,
-                                active,
-                                self.labels.palette.clone(),
-                            ))
-                            .button(self.tab_button(
-                                cx,
-                                state,
-                                ColorPickerTab::Hsla,
-                                active,
-                                self.labels.hsla.clone(),
-                            )),
-                    )
-                    .child(content)
-                    .child(Separator::horizontal())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .debug_selector(|| "TEST_COLOR_PICKER_HEX_INPUT".into())
-                            .child(ColorWell::new(self.color).size(px(30.)).radius(px(6.)))
-                            .child(div().flex_1().child(Input::new(&self.hex_input).medium())),
-                    ),
-            )
-    }
-}
-
-/// Holds the trigger inside `use_keyed_state` without ever notifying it.
-///
-/// Like [`ColorPickerStateSlot`], this exists so the observer `use_keyed_state` installs on the
-/// view that draws the picker does not fire on every notification of what it holds. The trigger
-/// is created with `cx.new` and repaints itself from its own observers, so this slot only keeps
-/// that entity alive across frames.
-struct TriggerSlot {
-    trigger: Entity<ColorPickerTrigger>,
-}
-
-/// The picker's trigger: a tonal button whose content is the selected color.
-///
-/// It is a view of its own, so a color change repaints the swatch without the caller having to
-/// rebuild anything: it observes both the picker state and the open state and notifies only
-/// itself. While the panel is open it stays selected and carries no click handler — the press
-/// that closes the panel is a press outside the panel, and a trigger that opened again on the
-/// release of that same press would immediately undo the close.
-struct ColorPickerTrigger {
-    state: Entity<ColorPickerState>,
-    open: Entity<bool>,
-    size: UnifiedSize,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl ColorPickerTrigger {
-    /// Builds a trigger for `state`, showing whether the panel is open at `open`.
-    fn new(
-        state: Entity<ColorPickerState>,
-        open: Entity<bool>,
-        size: UnifiedSize,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        // Both subscriptions are kept: without them the swatch would freeze at the color of the
-        // frame the trigger was created on and the button would never look pressed.
-        let state_subscription = cx.observe(&state, |_, _, cx| cx.notify());
-        let open_subscription = cx.observe(&open, |_, _, cx| cx.notify());
-
-        Self {
-            state,
-            open,
-            size,
-            _subscriptions: vec![state_subscription, open_subscription],
-        }
-    }
-}
-
-impl Render for ColorPickerTrigger {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = self.state.read(cx).color();
         let opened = *self.open.read(cx);
-        let open = self.open.clone();
-
-        Button::new(("color-picker-trigger", self.state.entity_id()))
-            .tonal()
-            // `with_unified_size` fixes the height but leaves the width automatic, so the
-            // horizontal padding and borders were added on top of the swatch and the button was
-            // 22/32/42 wide against a 20/30/40 height. Size the button to the UnifiedSize square
-            // instead, keep the same 2px padding at every size, and let the swatch fill what is
-            // left of the content box.
-            .size(self.size.h())
-            .p_0p5()
-            .selected(opened)
-            .aria_label(hex_string(color).as_str())
-            .debug_selector(|| "TEST_COLOR_PICKER_TRIGGER".into())
-            .child(
-                ColorWell::new(color)
-                    .size_full()
-                    .radius(px(4.))
-                    .debug_selector("TEST_COLOR_PICKER_TRIGGER_WELL"),
-            )
-            .when(!opened, |this| {
-                this.on_click(move |_, _, cx| open.write(cx, true))
-            })
-    }
-}
-
-/// The picker as a caller uses it: a trigger with the panel beside it.
-///
-/// The element is stateless. It looks up — creating them on first render — the open state and the
-/// trigger view by ids derived from the state entity, then hands the trigger to the [`Overlay`]
-/// that places, fades and dismisses the panel, and the state to the panel. The panel is
-/// [`ColorPickerState`]'s own `render`, so a color change repaints the panel and the trigger
-/// without the caller building either of them.
-#[derive(IntoElement)]
-pub struct ColorPicker {
-    state: Entity<ColorPickerState>,
-    size: UnifiedSize,
-}
-
-impl ColorPicker {
-    /// Builds the picker for `state`, at the default size.
-    pub fn new(state: &Entity<ColorPickerState>) -> Self {
-        Self {
-            state: state.clone(),
-            size: UnifiedSize::Medium,
-        }
-    }
-}
-
-impl UnifiedSizable for ColorPicker {
-    fn with_unified_size(mut self, size: UnifiedSize) -> Self {
-        self.size = size;
-        self
-    }
-}
-
-impl RenderOnce for ColorPicker {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self { state, size } = self;
-        let picker_id: ElementId = ("color-picker", state.entity_id()).into();
-        // The open state is the one keyed value whose notifications the caller does want: writing
-        // it is what mounts the panel, so `use_keyed_state` forwarding the change to the view that
-        // draws the picker is the mechanism, not a cost to avoid.
-        let open_state = window.use_keyed_state((picker_id.clone(), "open"), cx, |_, _| false);
-        // `ElementId` only combines two parts, so the size is encoded in this key rather than
-        // nested into a third tuple element.
-        let size_key = match size {
-            UnifiedSize::Small => "trigger-small",
-            UnifiedSize::Medium => "trigger-medium",
-            UnifiedSize::Large => "trigger-large",
-        };
-        let trigger_state = state.clone();
-        let trigger_open = open_state.clone();
-        let slot = window.use_keyed_state((picker_id.clone(), size_key), cx, move |_, cx| {
-            TriggerSlot {
-                trigger: cx
-                    .new(|cx| ColorPickerTrigger::new(trigger_state, trigger_open, size, cx)),
-            }
-        });
-        let trigger = slot.read(cx).trigger.clone();
+        let picker = cx.entity();
+        let picker_entity_id = picker.entity_id();
+        let picker_id: ElementId = ("color-picker", picker_entity_id).into();
+        let color = self.color;
+        let active_tab = self.active_tab;
+        let labels = self.labels.clone();
+        let size = self.size;
+        let hex_input = self.hex_input.clone();
 
         Overlay::new(
             (picker_id, "overlay"),
-            open_state,
-            move |_, _, _| trigger.into_any_element(),
-            move |_, _, _| state.into_any_element(),
+            self.open.clone(),
+            move |open_state, _, _| {
+                Button::new(("color-picker-trigger", picker_entity_id))
+                    .tonal()
+                    // `with_unified_size` fixes the height but leaves the width automatic, so
+                    // the horizontal padding and borders were added on top of the swatch and the
+                    // button was 22/32/42 wide against a 20/30/40 height. Size the button to the
+                    // UnifiedSize square instead, keep the same 2px padding at every size, and
+                    // let the swatch fill what is left of the content box.
+                    .size(size.h())
+                    .p_0p5()
+                    .selected(opened)
+                    .aria_label(hex_string(color).as_str())
+                    .debug_selector(|| "TEST_COLOR_PICKER_TRIGGER".into())
+                    .child(
+                        ColorWell::new(color)
+                            .size_full()
+                            .radius(px(4.))
+                            .debug_selector("TEST_COLOR_PICKER_TRIGGER_WELL"),
+                    )
+                    .when(!opened, |this| {
+                        this.on_click(move |_, _, cx| open_state.write(cx, true))
+                    })
+                    .into_any_element()
+            },
+            move |_, _, _| {
+                render_panel(
+                    picker,
+                    color,
+                    active_tab,
+                    labels,
+                    hex_input,
+                    panel_background,
+                    panel_border,
+                    panel_shadow,
+                )
+            },
         )
         .placement(Placement::Bottom)
         .align(Align::Start)
     }
+}
+
+/// Builds the popup panel: the tabs, the selected tab's content and the hex footer.
+///
+/// This is a free function because the popup is built by the [`Overlay`] with a plain [`App`],
+/// where the picker's own context is not available. Everything the panel draws or calls back
+/// into is handed in: the picker entity routes the interactions, and the hex field is the
+/// [`InputState`] the picker owns.
+fn render_panel(
+    state: Entity<ColorPicker>,
+    color: Hsla,
+    active: ColorPickerTab,
+    labels: ColorPickerLabels,
+    hex_input: Entity<InputState>,
+    panel_background: Hsla,
+    panel_border: Hsla,
+    panel_shadow: Hsla,
+) -> AnyElement {
+    let content: AnyElement = match active {
+        ColorPickerTab::Palette => {
+            PaletteGrid::new(state.clone(), color, labels.palette.clone()).into_any_element()
+        }
+        ColorPickerTab::Hsla => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(HslaSlider::new(
+                state.clone(),
+                HslaChannel::Hue,
+                color,
+                HslaChannel::Hue.label(&labels),
+            ))
+            .child(HslaSlider::new(
+                state.clone(),
+                HslaChannel::Saturation,
+                color,
+                HslaChannel::Saturation.label(&labels),
+            ))
+            .child(HslaSlider::new(
+                state.clone(),
+                HslaChannel::Lightness,
+                color,
+                HslaChannel::Lightness.label(&labels),
+            ))
+            .child(HslaSlider::new(
+                state.clone(),
+                HslaChannel::Alpha,
+                color,
+                HslaChannel::Alpha.label(&labels),
+            ))
+            .into_any_element(),
+    };
+
+    div()
+        .p_2()
+        .bg(panel_background)
+        .border_1()
+        .border_color(panel_border)
+        .rounded_sm()
+        .shadow(vec![
+            box_shadow(0., 1., 2., 0., panel_shadow),
+            box_shadow(0., 3., 6., -2., panel_shadow),
+        ])
+        .debug_selector(|| "TEST_COLOR_PICKER_PANEL".into())
+        .child(
+            div()
+                .w(PANEL_CONTENT_WIDTH)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    Join::default()
+                        .w_full()
+                        .button(ColorPicker::tab_button(
+                            state.clone(),
+                            ColorPickerTab::Palette,
+                            active,
+                            labels.palette.clone(),
+                        ))
+                        .button(ColorPicker::tab_button(
+                            state,
+                            ColorPickerTab::Hsla,
+                            active,
+                            labels.hsla,
+                        )),
+                )
+                .child(content)
+                .child(Separator::horizontal())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .debug_selector(|| "TEST_COLOR_PICKER_HEX_INPUT".into())
+                        .child(ColorWell::new(color).size(px(30.)).radius(px(6.)))
+                        .child(div().flex_1().child(Input::new(&hex_input).medium())),
+                ),
+        )
+        .into_any_element()
 }
 
 /// A small color block: the picker's trigger and its footer preview.
@@ -755,18 +671,19 @@ impl RenderOnce for ColorWell {
 
 /// The 12×12 palette of swatches, drawn by a single canvas.
 ///
-/// The state is only used to route a click back to it; the color it draws and the label it
-/// announces are handed in by the panel, so this element never reads the state while rendering.
+/// The picker entity is only used to route a click back to it; the color it draws and the label
+/// it announces are handed in by the panel, so this element never reads the picker while
+/// rendering.
 #[derive(IntoElement)]
 struct PaletteGrid {
-    state: Entity<ColorPickerState>,
+    state: Entity<ColorPicker>,
     color: Hsla,
     label: SharedString,
 }
 
 impl PaletteGrid {
     /// Builds the grid for `state`, highlighting `color` if it is one of the swatches.
-    fn new(state: Entity<ColorPickerState>, color: Hsla, label: SharedString) -> Self {
+    fn new(state: Entity<ColorPicker>, color: Hsla, label: SharedString) -> Self {
         Self {
             state,
             color,
@@ -938,11 +855,11 @@ impl Render for HslaDragPreview {
 /// One hue, saturation, lightness or alpha slider row.
 ///
 /// The track is a single canvas: [`TRACK_SLICES`] solid slices and one thumb, not a run of
-/// per-slice elements and not a gradient. The state is only used to route pointer events back to
-/// it; the color and the text the row draws are handed in by the panel.
+/// per-slice elements and not a gradient. The picker entity is only used to route pointer events
+/// back to it; the color and the text the row draws are handed in by the panel.
 #[derive(IntoElement)]
 struct HslaSlider {
-    state: Entity<ColorPickerState>,
+    state: Entity<ColorPicker>,
     channel: HslaChannel,
     color: Hsla,
     label: SharedString,
@@ -951,7 +868,7 @@ struct HslaSlider {
 impl HslaSlider {
     /// Builds the row for `channel`, reading the current `color`.
     fn new(
-        state: Entity<ColorPickerState>,
+        state: Entity<ColorPicker>,
         channel: HslaChannel,
         color: Hsla,
         label: SharedString,
@@ -1364,23 +1281,23 @@ mod tests {
     };
 
     use gpui_kit::{
-        AppContext, Bounds, Context, Entity, EntityId, Hsla, IntoElement, KeyDownEvent, Keystroke,
-        Modifiers, MouseButton, ParentElement, Pixels, PlatformInput, Point, Render, SharedString,
-        Styled, Subscription, TestAppContext, VisualTestContext, Window, canvas, div, hsla, point,
-        px, size,
+        AppContext, Bounds, Context, Entity, Hsla, IntoElement, KeyDownEvent, Keystroke, Modifiers,
+        MouseButton, ParentElement, Pixels, PlatformInput, Point, Render, SharedString, Styled,
+        Subscription, TestAppContext, VisualTestContext, Window, canvas, div, hsla, point, px,
+        size,
     };
 
     use super::{
-        ColorPicker, ColorPickerEvent, ColorPickerLabels, ColorPickerState, ColorPickerTab,
-        HslaChannel, PALETTE, PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION,
-        PALETTE_SIZE, PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT,
+        ColorPicker, ColorPickerEvent, ColorPickerLabels, ColorPickerTab, HslaChannel, PALETTE,
+        PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION, PALETTE_SIZE,
+        PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT,
         SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS,
         TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue, palette_index,
         palette_index_at, parse_hex, rgba8, selection_ring_color,
     };
     use crate::{
         animation::ANIMATION_TICK,
-        size::{UnifiedSizable, UnifiedSize},
+        size::UnifiedSize,
         style::{
             palette::Appearance,
             theme::{self, Theme},
@@ -1874,24 +1791,30 @@ mod tests {
 
     const DEFAULT_COLOR: Hsla = hsla(0.2, 0.5, 0.4, 1.0);
 
+    /// A parent that holds one picker entity and records the events it emits.
+    ///
+    /// The picker is created once, in `with_size`, and rendering this harness draws that same
+    /// entity again: that is the lifetime a real parent gives it. The column centers its
+    /// children horizontally, so the trigger keeps the content-sized width a caller gives it
+    /// instead of being stretched to the window's width.
     struct Harness {
-        state: Entity<ColorPickerState>,
+        picker: Entity<ColorPicker>,
         changes: Rc<RefCell<Vec<Hsla>>>,
         _subscription: Subscription,
     }
 
     impl Harness {
-        fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-            let state = cx.new(|cx| ColorPickerState::new(DEFAULT_COLOR, window, cx));
+        fn with_size(size: UnifiedSize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let picker = cx.new(|cx| ColorPicker::new(DEFAULT_COLOR, size, window, cx));
             let changes = Rc::new(RefCell::new(Vec::new()));
             let sink = changes.clone();
-            let subscription = cx.subscribe(&state, move |_, _, event: &ColorPickerEvent, _| {
+            let subscription = cx.subscribe(&picker, move |_, _, event: &ColorPickerEvent, _| {
                 let ColorPickerEvent::ColorChanged(color) = event;
                 sink.borrow_mut().push(*color);
             });
 
             Self {
-                state,
+                picker,
                 changes,
                 _subscription: subscription,
             }
@@ -1900,16 +1823,97 @@ mod tests {
 
     impl Render for Harness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            // The state is the panel: rendering it directly is what the picker's overlay will
-            // do in a later phase, without needing the trigger.
-            div().size_full().child(self.state.clone())
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(self.picker.clone())
         }
     }
 
-    /// Installs the theme and draws the panel in a window large enough for the palette tab.
+    /// A parent that creates its picker lazily on the first render and stores it, like
+    /// `examples/color_picker.rs`.
+    ///
+    /// The picker cannot be built when the harness is constructed because [`ColorPicker::new`]
+    /// needs a window, so it is `None` until the first render fills it in. `creations` counts the
+    /// lazy branch: a later render that rebuilt the picker instead of drawing the stored one
+    /// would increment it and hand the window a new entity, losing the color and the hex field.
+    /// The subscription is installed in that same branch, so it is installed exactly once too.
+    /// `renders` counts every render, so a test can prove the parent really drew again.
+    struct LazyHarness {
+        picker: Option<Entity<ColorPicker>>,
+        creations: Rc<Cell<usize>>,
+        renders: Rc<Cell<usize>>,
+        subscription: Option<Subscription>,
+    }
+
+    impl Render for LazyHarness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+
+            if self.picker.is_none() || self.subscription.is_none() {
+                let picker =
+                    cx.new(|cx| ColorPicker::new(DEFAULT_COLOR, UnifiedSize::Medium, window, cx));
+                self.subscription = Some(cx.subscribe(&picker, |_, _, _: &ColorPickerEvent, _| {}));
+                self.creations.set(self.creations.get() + 1);
+                self.picker = Some(picker);
+            }
+
+            let picker = self
+                .picker
+                .as_ref()
+                .expect("the lazy branch above stores the picker")
+                .clone();
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(picker)
+        }
+    }
+
+    /// Installs the theme and draws the picker at `unified_size` in a window large enough for
+    /// the panel.
+    fn harness_with_size(
+        cx: &mut TestAppContext,
+        unified_size: UnifiedSize,
+    ) -> (Entity<Harness>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            // The hex tests deliver Enter through the real key dispatch, so the input's key
+            // bindings have to be installed; the other tests do not care either way.
+            gpui_kit::base::init(cx);
+            theme::install(cx);
+        });
+        let (harness, cx) =
+            cx.add_window_view(move |window, cx| Harness::with_size(unified_size, window, cx));
+        cx.simulate_resize(size(px(900.), px(800.)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        (harness, cx)
+    }
+
+    /// Draws the picker at the default [`UnifiedSize::Medium`].
     fn harness(cx: &mut TestAppContext) -> (Entity<Harness>, &mut VisualTestContext) {
-        cx.update(theme::install);
-        let (harness, cx) = cx.add_window_view(Harness::new);
+        harness_with_size(cx, UnifiedSize::Medium)
+    }
+
+    /// Draws a parent whose picker is created in its first render, like the example.
+    ///
+    /// The first refresh is what runs that render, so the returned view already holds its picker.
+    fn lazy_harness(cx: &mut TestAppContext) -> (Entity<LazyHarness>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::base::init(cx);
+            theme::install(cx);
+        });
+        let (harness, cx) = cx.add_window_view(|_window, _cx| LazyHarness {
+            picker: None,
+            creations: Rc::new(Cell::new(0)),
+            renders: Rc::new(Cell::new(0)),
+            subscription: None,
+        });
         cx.simulate_resize(size(px(900.), px(800.)));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
@@ -1948,7 +1952,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         let swatch = PALETTE[28].hsla;
 
@@ -1975,187 +1979,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_palette_grid_should_draw_at_284_pixels_and_select_the_clicked_swatch(
-        cx: &mut TestAppContext,
-    ) {
-        let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
-        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-
-        let grid = cx
-            .debug_bounds("TEST_COLOR_PICKER_GRID")
-            .expect("the palette tab draws the grid");
-        assert_eq!(grid.size, size(px(PALETTE_SIZE), px(PALETTE_SIZE)));
-
-        let target = point(
-            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
-            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
-        );
-        cx.simulate_click(target, Modifiers::none());
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let swatch = PALETTE[28].hsla;
-        assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
-        assert_eq!(changes.borrow().as_slice(), &[swatch]);
-    }
-
-    #[gpui_kit::test]
-    fn the_panel_should_switch_between_the_palette_and_the_hsla_tracks(cx: &mut TestAppContext) {
-        let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
-
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_PANEL").is_some());
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
-        for channel in [
-            HslaChannel::Hue,
-            HslaChannel::Saturation,
-            HslaChannel::Lightness,
-            HslaChannel::Alpha,
-        ] {
-            assert!(
-                cx.debug_bounds(channel.debug_selector()).is_none(),
-                "the palette tab draws no {}",
-                channel.id_prefix()
-            );
-        }
-        assert_eq!(
-            state.read_with(cx, |state, _| state.active_tab()),
-            ColorPickerTab::Palette
-        );
-
-        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-
-        assert_eq!(
-            state.read_with(cx, |state, _| state.active_tab()),
-            ColorPickerTab::Hsla
-        );
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_none());
-        for channel in [
-            HslaChannel::Hue,
-            HslaChannel::Saturation,
-            HslaChannel::Lightness,
-            HslaChannel::Alpha,
-        ] {
-            assert!(
-                cx.debug_bounds(channel.debug_selector()).is_some(),
-                "the HSLA tab draws the {}",
-                channel.id_prefix()
-            );
-        }
-        let hue_track = cx
-            .debug_bounds(HslaChannel::Hue.debug_selector())
-            .expect("the HSLA tab draws the hue track");
-        assert_eq!(
-            hue_track.size,
-            size(px(156.), px(TRACK_HEIGHT)),
-            "72 (label) + 8 + 156 (track) + 8 + 40 (value) fills the 284px content width"
-        );
-
-        click_selector(cx, "TEST_COLOR_PICKER_TAB_PALETTE");
-
-        assert_eq!(
-            state.read_with(cx, |state, _| state.active_tab()),
-            ColorPickerTab::Palette
-        );
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
-        assert!(cx.debug_bounds(HslaChannel::Hue.debug_selector()).is_none());
-    }
-
-    #[gpui_kit::test]
-    fn clicking_the_hue_track_should_set_the_hue_and_emit_once(cx: &mut TestAppContext) {
-        let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
-        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-
-        let target = track_point(cx, HslaChannel::Hue, 0.25);
-        cx.simulate_click(target, Modifiers::none());
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let color = state.read_with(cx, |state, _| state.color());
-        assert!(
-            (color.h - 0.25).abs() < 1e-4,
-            "hue is {0}, expected 0.25",
-            color.h
-        );
-        assert_eq!(color.s, DEFAULT_COLOR.s, "saturation must not move");
-        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
-        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
-        assert_eq!(
-            changes.borrow().len(),
-            1,
-            "a click updates the color exactly once"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn dragging_the_saturation_track_should_follow_the_pointer(cx: &mut TestAppContext) {
-        let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
-        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-
-        let start = track_point(cx, HslaChannel::Saturation, 0.2);
-        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
-        let target = track_point(cx, HslaChannel::Saturation, 0.8);
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-        // The first move starts the drag; it only updates the color from the second move on.
-        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
-        cx.simulate_mouse_move(target, Some(MouseButton::Left), Modifiers::none());
-        cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
-
-        let color = state.read_with(cx, |state, _| state.color());
-        assert!(
-            (color.s - 0.8).abs() < 1e-4,
-            "saturation is {0}, expected 0.8",
-            color.s
-        );
-        assert_eq!(color.h, DEFAULT_COLOR.h, "hue must not move");
-        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
-        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
-        assert!(
-            changes.borrow().len() >= 2,
-            "the press and the drag to 80% both change the color, got {} events",
-            changes.borrow().len()
-        );
-    }
-
-    #[gpui_kit::test]
-    fn dragging_past_the_track_should_clamp_to_the_end(cx: &mut TestAppContext) {
-        let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
-        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-
-        let start = track_point(cx, HslaChannel::Saturation, 0.2);
-        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
-        let track = cx
-            .debug_bounds(HslaChannel::Saturation.debug_selector())
-            .expect("the HSLA tab draws the track");
-        let outside = point(
-            track.origin.x + track.size.width + px(50.),
-            track.origin.y + px(track.size.height.as_f32() / 2.0),
-        );
-
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
-        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::none());
-        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            state.read_with(cx, |state, _| state.color().s),
-            1.0,
-            "a pointer beyond the track clamps saturation to its maximum"
-        );
-    }
-
-    #[gpui_kit::test]
     fn set_channel_should_change_only_the_named_component(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
 
         cx.update(|window, cx| {
@@ -2190,7 +2016,7 @@ mod tests {
     #[gpui_kit::test]
     fn set_channel_should_clamp_and_ignore_an_unchanged_value(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
 
         cx.update(|window, cx| {
@@ -2226,72 +2052,6 @@ mod tests {
             2,
             "setting the value already selected is a no-op"
         );
-    }
-
-    /// A second harness: the whole picker, trigger and all, so the tests below exercise the panel
-    /// the way a caller opens it instead of drawing the state directly.
-    struct PickerHarness {
-        state: Entity<ColorPickerState>,
-        changes: Rc<RefCell<Vec<Hsla>>>,
-        size: UnifiedSize,
-        _subscription: Subscription,
-    }
-
-    impl PickerHarness {
-        fn with_size(size: UnifiedSize, window: &mut Window, cx: &mut Context<Self>) -> Self {
-            let state = cx.new(|cx| ColorPickerState::new(DEFAULT_COLOR, window, cx));
-            let changes = Rc::new(RefCell::new(Vec::new()));
-            let sink = changes.clone();
-            let subscription = cx.subscribe(&state, move |_, _, event: &ColorPickerEvent, _| {
-                let ColorPickerEvent::ColorChanged(color) = event;
-                sink.borrow_mut().push(*color);
-            });
-
-            Self {
-                state,
-                changes,
-                size,
-                _subscription: subscription,
-            }
-        }
-    }
-
-    impl Render for PickerHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            // The layout matters: a block-level parent would stretch the trigger to the
-            // window's width and hide the width this test measures. A column that centers its
-            // children gives the trigger the content-sized width real callers give it.
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(ColorPicker::new(&self.state).with_unified_size(self.size))
-        }
-    }
-
-    /// Installs the theme and draws the whole picker in a window large enough for the panel.
-    fn picker_harness(cx: &mut TestAppContext) -> (Entity<PickerHarness>, &mut VisualTestContext) {
-        picker_harness_with_size(cx, UnifiedSize::Medium)
-    }
-
-    /// Installs the theme and draws the whole picker at `unified_size`.
-    fn picker_harness_with_size(
-        cx: &mut TestAppContext,
-        unified_size: UnifiedSize,
-    ) -> (Entity<PickerHarness>, &mut VisualTestContext) {
-        cx.update(|cx| {
-            // The hex tests deliver Enter through the real key dispatch, so the input's key
-            // bindings have to be installed; the other tests do not care either way.
-            gpui_kit::base::init(cx);
-            theme::install(cx);
-        });
-        let (harness, cx) = cx
-            .add_window_view(move |window, cx| PickerHarness::with_size(unified_size, window, cx));
-        cx.simulate_resize(size(px(900.), px(800.)));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        (harness, cx)
     }
 
     /// Presses what `selector` names the way a window delivers a press: down, a frame, up, then
@@ -2332,7 +2092,7 @@ mod tests {
     /// The draw is what makes the field the window's input handler: typing before it would go
     /// nowhere. `update_value` is the panel's own write-back path and emits no change, so
     /// clearing the field does not touch the color.
-    fn clear_and_focus_hex(cx: &mut VisualTestContext, state: &Entity<ColorPickerState>) {
+    fn clear_and_focus_hex(cx: &mut VisualTestContext, state: &Entity<ColorPicker>) {
         cx.update(|window, cx| {
             state.update(cx, |state, cx| {
                 state.hex_input.update(cx, |input, cx| {
@@ -2374,7 +2134,7 @@ mod tests {
     /// can change the color.
     fn set_hex_text_without_change_event(
         cx: &mut VisualTestContext,
-        state: &Entity<ColorPickerState>,
+        state: &Entity<ColorPicker>,
         text: &str,
     ) {
         cx.update(|window, cx| {
@@ -2407,12 +2167,32 @@ mod tests {
         }
     }
 
+    /// Asserts the open panel draws the palette tab and none of the four HSLA tracks.
+    fn assert_palette_tab_is_drawn(cx: &mut VisualTestContext, context: &str) {
+        assert!(
+            cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some(),
+            "{context} must draw the palette grid"
+        );
+        for channel in [
+            HslaChannel::Hue,
+            HslaChannel::Saturation,
+            HslaChannel::Lightness,
+            HslaChannel::Alpha,
+        ] {
+            assert!(
+                cx.debug_bounds(channel.debug_selector()).is_none(),
+                "{context} must not draw the {} track",
+                channel.id_prefix()
+            );
+        }
+    }
+
     #[gpui_kit::test]
     fn the_picker_should_start_closed_on_the_default_color_and_palette_tab(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
 
         let (color, tab, hex) = state.read_with(cx, |state, cx| {
             (
@@ -2429,9 +2209,141 @@ mod tests {
         assert!(!panel_is_drawn(cx), "the panel starts closed");
     }
 
+    /// A parent that already holds its picker keeps drawing that entity across a render.
+    ///
+    /// This covers the state half of the contract only: the picker exists before the first
+    /// render, so this test cannot observe the lazy creation the example performs. The lazy
+    /// harness below covers that path.
+    #[gpui_kit::test]
+    fn an_eagerly_created_picker_should_keep_its_state_across_a_parent_render(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = harness(cx);
+        let picker = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let picker_id = picker.entity_id();
+
+        let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.set_color(blue, window, cx));
+        });
+
+        // A parent render must draw the entity it stored, not build a picker per frame: a new
+        // one would lose the color, the field and the caret.
+        cx.update(|window, cx| {
+            harness.update(cx, |_, cx| cx.notify());
+            window.refresh();
+        });
+        cx.run_until_parked();
+
+        let (id_after, color_after) = harness.read_with(cx, |harness, cx| {
+            (harness.picker.entity_id(), harness.picker.read(cx).color())
+        });
+        assert_eq!(
+            id_after, picker_id,
+            "the picker entity survives a parent render"
+        );
+        assert_eq!(
+            color_after, blue,
+            "the picker's state survives a parent render"
+        );
+        assert_eq!(
+            picker
+                .read_with(cx, |picker, cx| picker.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#0000FF",
+            "the hex field still belongs to the stored picker"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_parent_should_lazily_create_the_picker_once_and_keep_it_across_a_render(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = lazy_harness(cx);
+        let creations = harness.read_with(cx, |harness, _| harness.creations.clone());
+        let renders = harness.read_with(cx, |harness, _| harness.renders.clone());
+        let picker = harness.read_with(cx, |harness, _| {
+            harness
+                .picker
+                .clone()
+                .expect("the first render creates the picker")
+        });
+        let picker_id = picker.entity_id();
+
+        assert_eq!(
+            creations.get(),
+            1,
+            "the first render creates the picker exactly once"
+        );
+        assert!(
+            harness.read_with(cx, |harness, _| harness.subscription.is_some()),
+            "the first render installs the picker's subscription"
+        );
+        assert!(
+            cx.debug_bounds("TEST_COLOR_PICKER_TRIGGER").is_some(),
+            "the parent draws the picker its first render created"
+        );
+
+        let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.set_color(blue, window, cx));
+        });
+
+        // A second parent render must draw the stored entity: a render that re-entered the
+        // lazy branch would replace the picker and reset its color and its hex field.
+        let renders_before = renders.get();
+        cx.update(|window, cx| {
+            harness.update(cx, |_, cx| cx.notify());
+            window.refresh();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            renders.get() > renders_before,
+            "the forced refresh renders the parent again"
+        );
+        assert_eq!(
+            creations.get(),
+            1,
+            "a parent re-render must not create a second picker"
+        );
+        assert!(
+            harness.read_with(cx, |harness, _| harness.subscription.is_some()),
+            "the stored subscription survives the parent re-render"
+        );
+        assert_eq!(
+            harness.read_with(cx, |harness, _| {
+                harness
+                    .picker
+                    .as_ref()
+                    .expect("the parent still stores the picker")
+                    .entity_id()
+            }),
+            picker_id,
+            "the parent keeps the picker entity its first render created"
+        );
+        assert!(
+            cx.debug_bounds("TEST_COLOR_PICKER_TRIGGER").is_some(),
+            "the reused picker entity is still drawn after the parent's second render"
+        );
+
+        let (color, hex) = picker.read_with(cx, |picker, cx| {
+            (picker.color(), picker.hex_input.read(cx).value(cx))
+        });
+        assert_eq!(
+            color, blue,
+            "the color set on the stored picker survives the parent re-render"
+        );
+        assert_eq!(
+            hex.as_str(),
+            "#0000FF",
+            "the hex field still belongs to the picker the first render stored"
+        );
+    }
+
     #[gpui_kit::test]
     fn pressing_the_trigger_should_open_the_panel(cx: &mut TestAppContext) {
-        let (_harness, cx) = picker_harness(cx);
+        let (_harness, cx) = harness(cx);
         assert!(!panel_is_drawn(cx));
 
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
@@ -2445,12 +2357,14 @@ mod tests {
 
     #[gpui_kit::test]
     fn the_trigger_should_be_square_at_every_unified_size(cx: &mut TestAppContext) {
-        for (unified_size, edge) in [
-            (UnifiedSize::Small, 20.),
-            (UnifiedSize::Medium, 30.),
-            (UnifiedSize::Large, 40.),
+        // The well is inset by the button's 2px padding on each side and its 1px border on each
+        // side: 20/30/40 minus 6 is 14/24/34.
+        for (unified_size, edge, well_edge) in [
+            (UnifiedSize::Small, 20., 14.),
+            (UnifiedSize::Medium, 30., 24.),
+            (UnifiedSize::Large, 40., 34.),
         ] {
-            let (_harness, cx) = picker_harness_with_size(cx, unified_size);
+            let (_harness, cx) = harness_with_size(cx, unified_size);
             let bounds = cx
                 .debug_bounds("TEST_COLOR_PICKER_TRIGGER")
                 .expect("the trigger is drawn");
@@ -2469,8 +2383,9 @@ mod tests {
                 .expect("the trigger's color well is drawn");
             assert_eq!(
                 well.size,
-                size(px(edge - 6.), px(edge - 6.)),
-                "{unified_size:?}: the color well must fill the button's padded content box"
+                size(px(well_edge), px(well_edge)),
+                "{unified_size:?}: the color well fills the 2px padding and 1px border of the \
+                 button's content box"
             );
 
             press(cx, "TEST_COLOR_PICKER_TRIGGER");
@@ -2483,7 +2398,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn pressing_outside_the_panel_should_close_it(cx: &mut TestAppContext) {
-        let (_harness, cx) = picker_harness(cx);
+        let (_harness, cx) = harness(cx);
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         assert!(panel_is_drawn(cx));
 
@@ -2504,7 +2419,7 @@ mod tests {
     fn pressing_the_trigger_of_an_open_panel_should_close_it_without_reopening_it(
         cx: &mut TestAppContext,
     ) {
-        let (_harness, cx) = picker_harness(cx);
+        let (_harness, cx) = harness(cx);
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         assert!(panel_is_drawn(cx));
 
@@ -2529,10 +2444,18 @@ mod tests {
     fn the_open_panel_should_switch_between_the_palette_and_the_hsla_tracks(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
+        assert_palette_tab_is_drawn(cx, "the open panel's default palette tab");
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the open panel draws its default palette tab");
+        assert_eq!(
+            grid.size,
+            size(px(PALETTE_SIZE), px(PALETTE_SIZE)),
+            "the palette fills the panel's 284px content width"
+        );
 
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
 
@@ -2553,6 +2476,14 @@ mod tests {
                 channel.id_prefix()
             );
         }
+        let hue_track = cx
+            .debug_bounds(HslaChannel::Hue.debug_selector())
+            .expect("the HSLA tab draws the hue track");
+        assert_eq!(
+            hue_track.size,
+            size(px(156.), px(TRACK_HEIGHT)),
+            "72 (label) + 8 + 156 (track) + 8 + 40 (value) fills the 284px content width"
+        );
 
         click_selector(cx, "TEST_COLOR_PICKER_TAB_PALETTE");
 
@@ -2560,8 +2491,7 @@ mod tests {
             state.read_with(cx, |state, _| state.active_tab()),
             ColorPickerTab::Palette
         );
-        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
-        assert!(cx.debug_bounds(HslaChannel::Hue.debug_selector()).is_none());
+        assert_palette_tab_is_drawn(cx, "switching back to the palette tab");
         assert!(panel_is_drawn(cx), "switching tabs keeps the panel open");
     }
 
@@ -2569,14 +2499,19 @@ mod tests {
     fn clicking_a_palette_cell_in_the_open_panel_should_change_the_color_and_keep_it_open(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
 
         let grid = cx
             .debug_bounds("TEST_COLOR_PICKER_GRID")
             .expect("the palette tab draws the grid");
+        assert_eq!(
+            grid.size,
+            size(px(PALETTE_SIZE), px(PALETTE_SIZE)),
+            "the grid draws at its nominal edge"
+        );
         let cell = point(
             grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
             grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
@@ -2625,8 +2560,8 @@ mod tests {
     fn clicking_the_lightness_and_alpha_tracks_in_the_open_panel_should_edit_those_channels(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
@@ -2670,8 +2605,8 @@ mod tests {
     fn typing_a_legal_hex_in_the_open_panel_should_set_the_color_without_rewriting_the_field(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         clear_and_focus_hex(cx, &state);
@@ -2712,8 +2647,8 @@ mod tests {
     fn an_illegal_hex_in_the_open_panel_should_change_nothing_until_enter_restores_the_field(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         clear_and_focus_hex(cx, &state);
@@ -2766,8 +2701,8 @@ mod tests {
 
     #[gpui_kit::test]
     fn enter_should_apply_the_field_text_and_normalize_it_exactly_once(cx: &mut TestAppContext) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         clear_and_focus_hex(cx, &state);
@@ -2853,8 +2788,8 @@ mod tests {
     fn blurring_the_hex_field_should_apply_the_field_text_and_normalize_it_like_enter(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         // A window has to be active for GPUI to report focus changes: an inactive one blanks
@@ -2919,8 +2854,8 @@ mod tests {
     fn setting_the_color_programmatically_should_be_silent_and_should_not_open_a_closed_panel(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         assert!(panel_is_drawn(cx));
@@ -3014,8 +2949,8 @@ mod tests {
     fn clicking_the_hue_track_in_the_open_panel_should_set_the_hue_and_emit_once(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
@@ -3049,8 +2984,8 @@ mod tests {
     fn dragging_the_saturation_track_in_the_open_panel_should_follow_the_pointer(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
@@ -3098,8 +3033,8 @@ mod tests {
     fn dragging_past_the_track_in_the_open_panel_should_clamp_and_keep_it_open(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
@@ -3143,8 +3078,8 @@ mod tests {
     fn switching_the_theme_should_repaint_the_open_panel_and_keep_its_color(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
         let before = state.read_with(cx, |state, _| state.color());
@@ -3213,7 +3148,7 @@ mod tests {
     #[gpui_kit::test]
     fn set_labels_should_notify_only_when_the_text_changes(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         assert!(
             changes.borrow().is_empty(),
@@ -3276,7 +3211,7 @@ mod tests {
     #[gpui_kit::test]
     fn set_active_tab_should_notify_only_when_the_tab_changes(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         assert!(
             changes.borrow().is_empty(),
@@ -3343,8 +3278,8 @@ mod tests {
     fn the_active_tab_should_persist_across_closing_and_reopening_the_panel(
         cx: &mut TestAppContext,
     ) {
-        let (harness, cx) = picker_harness(cx);
-        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
         assert_eq!(
@@ -3372,53 +3307,6 @@ mod tests {
         assert!(
             cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_none(),
             "the reopened panel does not fall back to the palette tab"
-        );
-    }
-
-    const KEYED_FIRST_COLOR: Hsla = hsla(0.15, 0.35, 0.45, 1.0);
-    const KEYED_SECOND_COLOR: Hsla = hsla(0.85, 0.65, 0.55, 1.0);
-
-    /// Draws two states under one key, recording what each call handed back.
-    struct KeyedReuseHarness {
-        seen: Rc<RefCell<Vec<(EntityId, Hsla)>>>,
-    }
-
-    impl Render for KeyedReuseHarness {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let first = ColorPickerState::use_keyed("same-id", KEYED_FIRST_COLOR, window, cx);
-            let second = ColorPickerState::use_keyed("same-id", KEYED_SECOND_COLOR, window, cx);
-
-            *self.seen.borrow_mut() = vec![
-                (first.entity_id(), first.read(cx).color()),
-                (second.entity_id(), second.read(cx).color()),
-            ];
-
-            div()
-        }
-    }
-
-    #[gpui_kit::test]
-    fn use_keyed_should_reuse_the_state_for_the_same_id_and_keep_its_first_default(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(theme::install);
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let (view, cx) = cx.add_window_view(move |_, _| KeyedReuseHarness { seen });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let seen = view.read_with(cx, |view, _| view.seen.clone());
-        let seen = seen.borrow();
-
-        assert_eq!(seen.len(), 2, "the harness records both lookups");
-        assert_eq!(
-            seen[0].0, seen[1].0,
-            "the same id must return the same entity"
-        );
-        assert_eq!(seen[0].1, KEYED_FIRST_COLOR);
-        assert_eq!(
-            seen[1].1, KEYED_FIRST_COLOR,
-            "the default of a later lookup must not overwrite the state created first"
         );
     }
 

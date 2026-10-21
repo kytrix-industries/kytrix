@@ -2,8 +2,8 @@ mod support;
 
 use base_ui::{
     assets::Assets,
-    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
-    size::UnifiedSizable,
+    color_picker::{ColorPicker, ColorPickerEvent},
+    size::UnifiedSize,
     style::theme::ThemeExt,
 };
 use gpui_kit::{
@@ -16,7 +16,7 @@ const DEFAULT_ACCENT: Hsla = hsla(0.55, 0.8, 0.53, 1.0);
 
 struct ColorPickerExample {
     accent: Hsla,
-    state: Option<Entity<ColorPickerState>>,
+    picker: Option<Entity<ColorPicker>>,
     subscription: Option<Subscription>,
 }
 
@@ -24,7 +24,7 @@ impl ColorPickerExample {
     fn new() -> Self {
         Self {
             accent: DEFAULT_ACCENT,
-            state: None,
+            picker: None,
             subscription: None,
         }
     }
@@ -32,20 +32,21 @@ impl ColorPickerExample {
 
 impl Render for ColorPickerExample {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The picker's state needs a window, so it is created on the first render and reused by
-        // id afterwards; the default only applies to the frame that creates it. The subscription
-        // is stored so the accent survives as long as the window does.
-        let state = ColorPickerState::use_keyed("color-picker-example", self.accent, window, cx);
-        if self.state.as_ref() != Some(&state) || self.subscription.is_none() {
-            self.state = Some(state.clone());
+        // The picker needs a window, so it is created on the first render and stored: every later
+        // render draws the same entity, keeping its color, its tab and the caret in its field.
+        // The subscription is installed with it and kept for the same reason.
+        if self.picker.is_none() || self.subscription.is_none() {
+            let accent = self.accent;
+            let picker = cx.new(|cx| ColorPicker::new(accent, UnifiedSize::Small, window, cx));
             self.subscription = Some(cx.subscribe(
-                &state,
+                &picker,
                 |this, _, event: &ColorPickerEvent, cx| {
                     let ColorPickerEvent::ColorChanged(color) = event;
                     this.accent = *color;
                     cx.notify();
                 },
             ));
+            self.picker = Some(picker);
         }
 
         let theme = cx.theme();
@@ -56,6 +57,11 @@ impl Render for ColorPickerExample {
         } else {
             format!("#{r:02X}{g:02X}{b:02X}")
         };
+        let picker = self
+            .picker
+            .as_ref()
+            .expect("the picker is created above")
+            .clone();
 
         div()
             .size_full()
@@ -65,7 +71,7 @@ impl Render for ColorPickerExample {
             .items_center()
             .justify_center()
             .gap_4()
-            .child(ColorPicker::new(&state).small())
+            .child(picker)
             .child(
                 div()
                     .w(px(160.))
