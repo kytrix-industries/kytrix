@@ -1,10 +1,6 @@
 //! The catalogue's own invariants: its order, the settings each indicator
-//! declares, and the default value it is completed with.
-//!
-//! Two of the design's checks are deliberately not here: the name keys being
-//! present in both languages (§9.2) and the period bounds matching the
-//! `period_invalid` message (§9.1). Both need data the i18n stage adds, and the
-//! note at the end of this file points at them.
+//! declares, the default value it is completed with, the i18n keys it names and
+//! the period bounds the `period_invalid` message repeats.
 
 use super::{
     config::{SettingsShape, expected_shape},
@@ -62,6 +58,24 @@ fn rows_of(shape: SettingsShape) -> &'static [SettingKey] {
 
 fn declared_keys(rows: &[SettingRow]) -> Vec<SettingKey> {
     rows.iter().map(|row| row.key).collect()
+}
+
+/// Every i18n key the catalogue names: each indicator's title and each of its
+/// rows' labels, sorted and deduplicated.
+///
+/// The three line-list indicators share `…indicator.lines`, so the same key is
+/// collected more than once.
+fn catalog_keys() -> Vec<&'static str> {
+    let mut keys: Vec<_> = INDICATOR_CATALOG
+        .iter()
+        .flat_map(|definition| {
+            std::iter::once(definition.name_key)
+                .chain(definition.rows.iter().map(|row| row.label_key))
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 // ① Each `IndicatorId` appears exactly once, in catalogue order.
@@ -145,6 +159,29 @@ fn every_line_list_row_should_require_at_least_one_line() {
     }
 }
 
+// ⑤ Every key the catalogue names is defined by every embedded language and
+// renders to something. A key no locale defines renders as the empty string —
+// a blank title or label in the panel rather than an error anywhere — so this
+// is the only place the omission would surface.
+#[test]
+fn every_catalog_key_should_be_defined_and_non_empty_in_every_language() {
+    let i18n = i18n::global::embedded::load().expect("the embedded locales should load");
+
+    for language in i18n.languages() {
+        let keys = i18n
+            .keys(language)
+            .expect("an embedded language exposes its keys")
+            .collect::<Vec<_>>();
+        for key in catalog_keys() {
+            assert!(keys.contains(&key), "{language} does not define {key}");
+            assert!(
+                !i18n.translate(language, key).is_empty(),
+                "{language} renders {key} empty"
+            );
+        }
+    }
+}
+
 // ⑥ The sub-plot indicators must fit the inline capacity `ChartLayout` stores
 // them in; a seventh one without raising `SUB_PLOT_INLINE` would silently move
 // the boxes to the heap.
@@ -161,5 +198,49 @@ fn the_sub_plot_indicators_should_fit_the_inline_capacity() {
     );
 }
 
-// ⑤ 名称 key 在两种语言都非空 —— 见 implementation-plan §9.2
-// ⑦ Period 的边界与 period_invalid 文案一致 —— 见 implementation-plan §9.1
+// ⑦ Every `Period` row declares the range `period_invalid` names in words. The
+// bounds come from the catalogue while the message is fixed text, so only a
+// test can tie the two together: changing one without the other would leave the
+// panel telling the user a range it does not accept.
+#[test]
+fn every_period_row_should_use_the_bounds_the_message_names() {
+    // `if let` alone would let a row that stopped being a `Period` control drop
+    // out of the check without failing it, so pin the six rows the design
+    // declares: MACD's three periods and KDJ's period and two smoothings.
+    let period_rows: Vec<_> = INDICATOR_CATALOG
+        .iter()
+        .flat_map(|definition| {
+            definition
+                .rows
+                .iter()
+                .filter(|row| matches!(row.control, SettingControl::Period { .. }))
+                .map(|row| (definition.id, row.key))
+        })
+        .collect();
+    assert_eq!(
+        period_rows,
+        [
+            (IndicatorId::Macd, SettingKey::ShortPeriod),
+            (IndicatorId::Macd, SettingKey::LongPeriod),
+            (IndicatorId::Macd, SettingKey::SignalPeriod),
+            (IndicatorId::Kdj, SettingKey::Period),
+            (IndicatorId::Kdj, SettingKey::Smoothing1),
+            (IndicatorId::Kdj, SettingKey::Smoothing2),
+        ],
+        "the catalogue no longer declares the six rows the period_invalid message is for"
+    );
+
+    for definition in INDICATOR_CATALOG {
+        for row in definition.rows {
+            if let SettingControl::Period { min, max } = row.control {
+                assert_eq!(
+                    (min, max),
+                    (1, 500),
+                    "{}::{:?} changes the bounds the period_invalid message names",
+                    definition.name_key,
+                    row.key
+                );
+            }
+        }
+    }
+}
