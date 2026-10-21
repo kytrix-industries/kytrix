@@ -46,17 +46,11 @@ use crate::{
     style::theme::ThemeExt,
 };
 
-/// The panel's outer padding; the content width is what decides the panel's width.
-const PANEL_PADDING: Pixels = px(12.);
 /// The fixed width every row of the panel is laid out in.
 const PANEL_CONTENT_WIDTH: Pixels = px(284.);
-/// The vertical gap between the tabs, the content, the divider and the hex row.
-const PANEL_SECTION_GAP: Pixels = px(12.);
 
 /// The height of one HSLA slider row.
 const SLIDER_ROW_HEIGHT: Pixels = px(24.);
-/// The vertical gap between two HSLA slider rows.
-const SLIDER_ROW_GAP: Pixels = px(10.);
 /// The width of a row's label column.
 const SLIDER_LABEL_WIDTH: Pixels = px(72.);
 /// The width of a row's numeric value column.
@@ -376,9 +370,6 @@ impl ColorPickerState {
     }
 
     /// Builds one of the two tab buttons.
-    ///
-    /// The selected tab is painted with an explicit fill rather than the ghost variant's veil,
-    /// because the veil is a hover wash and cannot express a selected segment.
     fn tab_button(
         &self,
         cx: &mut Context<Self>,
@@ -387,14 +378,6 @@ impl ColorPickerState {
         active: ColorPickerTab,
         label: SharedString,
     ) -> Button {
-        let (fg_default, fg_muted, selected_fill) = {
-            let theme = cx.theme();
-            (
-                theme.roles.fg.default.hsla,
-                theme.roles.fg.muted.hsla,
-                theme.roles.surface.overlay.hsla,
-            )
-        };
         let selected = tab == active;
         let id: ElementId = match tab {
             ColorPickerTab::Palette => ("color-picker-tab-palette", cx.entity_id()).into(),
@@ -402,13 +385,12 @@ impl ColorPickerState {
         };
 
         Button::new(id)
-            .ghost()
+            .tonal()
             .small()
             .flex_1()
             .justify_center()
+            .selected(selected)
             .aria_selected(selected)
-            .text_color(if selected { fg_default } else { fg_muted })
-            .when(selected, |this| this.bg(selected_fill))
             .debug_selector(move || match tab {
                 ColorPickerTab::Palette => "TEST_COLOR_PICKER_TAB_PALETTE".into(),
                 ColorPickerTab::Hsla => "TEST_COLOR_PICKER_TAB_HSLA".into(),
@@ -426,13 +408,12 @@ impl Render for ColorPickerState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Read the theme through Copy values before anything borrows the context mutably; the
         // panel must paint from the values of this frame, not from a cached theme.
-        let (panel_background, panel_border, panel_shadow, tab_track) = {
+        let (panel_background, panel_border, panel_shadow) = {
             let theme = cx.theme();
             (
                 theme.components.menu.background.hsla,
                 theme.roles.line.divider.hsla,
                 theme.components.menu.shadow.hsla,
-                theme.roles.surface.sunken.hsla,
             )
         };
 
@@ -446,7 +427,7 @@ impl Render for ColorPickerState {
             ColorPickerTab::Hsla => div()
                 .flex()
                 .flex_col()
-                .gap(SLIDER_ROW_GAP)
+                .gap_2()
                 .child(HslaSlider::new(
                     state.clone(),
                     HslaChannel::Hue,
@@ -475,7 +456,7 @@ impl Render for ColorPickerState {
         };
 
         div()
-            .p(PANEL_PADDING)
+            .p_2()
             .bg(panel_background)
             .border_1()
             .border_color(panel_border)
@@ -490,13 +471,10 @@ impl Render for ColorPickerState {
                     .w(PANEL_CONTENT_WIDTH)
                     .flex()
                     .flex_col()
-                    .gap(PANEL_SECTION_GAP)
+                    .gap_2()
                     .child(
                         Join::default()
                             .w_full()
-                            .p_1()
-                            .bg(tab_track)
-                            .rounded_sm()
                             .button(self.tab_button(
                                 cx,
                                 state.clone(),
@@ -578,27 +556,26 @@ impl Render for ColorPickerTrigger {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let color = self.state.read(cx).color();
         let opened = *self.open.read(cx);
-        let swatch_size = match self.size {
-            UnifiedSize::Small => px(12.),
-            UnifiedSize::Medium => px(18.),
-            UnifiedSize::Large => px(20.),
-        };
         let open = self.open.clone();
 
         Button::new(("color-picker-trigger", self.state.entity_id()))
             .tonal()
-            .with_unified_size(self.size)
-            // A fixed height resolves as a border-box height, but an auto width grows by the
-            // horizontal padding and both borders on top of the swatch, so the button came out
-            // 22/32/42 wide against a 20/30/40 height. Pin the width to the same height and drop
-            // the horizontal padding; the swatch stays centered in the space that leaves.
-            .w(self.size.h())
-            .px(px(0.))
-            .justify_center()
+            // `with_unified_size` fixes the height but leaves the width automatic, so the
+            // horizontal padding and borders were added on top of the swatch and the button was
+            // 22/32/42 wide against a 20/30/40 height. Size the button to the UnifiedSize square
+            // instead, keep the same 2px padding at every size, and let the swatch fill what is
+            // left of the content box.
+            .size(self.size.h())
+            .p_0p5()
             .selected(opened)
             .aria_label(hex_string(color).as_str())
             .debug_selector(|| "TEST_COLOR_PICKER_TRIGGER".into())
-            .child(ColorWell::new(color).size(swatch_size).radius(px(4.)))
+            .child(
+                ColorWell::new(color)
+                    .size_full()
+                    .radius(px(4.))
+                    .debug_selector("TEST_COLOR_PICKER_TRIGGER_WELL"),
+            )
             .when(!opened, |this| {
                 this.on_click(move |_, _, cx| open.write(cx, true))
             })
@@ -674,33 +651,48 @@ impl RenderOnce for ColorPicker {
 /// A small color block: the picker's trigger and its footer preview.
 ///
 /// It paints everything in one canvas so a swatch costs one element, and a translucent color is
-/// shown over a checkerboard rather than over whatever happens to be behind the block.
+/// shown over a checkerboard rather than over whatever happens to be behind the block. It either
+/// has a fixed size or fills its parent, depending on which builder the caller used.
 #[derive(IntoElement)]
 struct ColorWell {
     color: Hsla,
-    size: Pixels,
+    size: Option<Pixels>,
     radius: Pixels,
+    debug_selector: Option<&'static str>,
 }
 
 impl ColorWell {
-    /// A well showing `color`, at the size the trigger uses.
+    /// A well showing `color`; callers choose a fixed size or let it fill its parent.
     fn new(color: Hsla) -> Self {
         Self {
             color,
-            size: px(18.),
+            size: Some(px(18.)),
             radius: px(4.),
+            debug_selector: None,
         }
     }
 
     /// Sets the size of the block.
     fn size(mut self, size: Pixels) -> Self {
-        self.size = size;
+        self.size = Some(size);
+        self
+    }
+
+    /// Makes the block fill its parent instead of using a fixed size.
+    fn size_full(mut self) -> Self {
+        self.size = None;
         self
     }
 
     /// Sets the corner radius of the block.
     fn radius(mut self, radius: Pixels) -> Self {
         self.radius = radius;
+        self
+    }
+
+    /// Sets the test selector on the block.
+    fn debug_selector(mut self, selector: &'static str) -> Self {
+        self.debug_selector = Some(selector);
         self
     }
 }
@@ -711,6 +703,7 @@ impl RenderOnce for ColorWell {
             color,
             size,
             radius,
+            debug_selector,
         } = self;
         let (base, checker, border) = {
             let theme = cx.theme();
@@ -724,7 +717,16 @@ impl RenderOnce for ColorWell {
         // reads it; the hex field's eight-bit rounding is a display detail, not this test.
         let translucent = color.a < 1.0;
 
-        div().relative().w(size).h(size).child(
+        let well = div().relative();
+        let well = match size {
+            Some(size) => well.w(size).h(size),
+            None => well.size_full(),
+        };
+        let well = well.when_some(debug_selector, |this, selector| {
+            this.debug_selector(move || selector.into())
+        });
+
+        well.child(
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, _| {
@@ -1371,10 +1373,10 @@ mod tests {
     use super::{
         ColorPicker, ColorPickerEvent, ColorPickerLabels, ColorPickerState, ColorPickerTab,
         HslaChannel, PALETTE, PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION,
-        PALETTE_SIZE, PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_GAP,
-        SLIDER_ROW_HEIGHT, SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT,
-        TRACK_RADIUS, TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue,
-        palette_index, palette_index_at, parse_hex, rgba8, selection_ring_color,
+        PALETTE_SIZE, PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT,
+        SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS,
+        TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue, palette_index,
+        palette_index_at, parse_hex, rgba8, selection_ring_color,
     };
     use crate::{
         animation::ANIMATION_TICK,
@@ -1737,7 +1739,6 @@ mod tests {
     #[test]
     fn the_slider_rows_should_fill_the_panel_content_width() {
         assert_eq!(SLIDER_ROW_HEIGHT, px(24.));
-        assert_eq!(SLIDER_ROW_GAP, px(10.));
         assert_eq!(SLIDER_LABEL_WIDTH, px(72.));
         assert_eq!(SLIDER_VALUE_WIDTH, px(40.));
         assert_eq!(SLIDER_ROW_INNER_GAP, px(8.));
@@ -2461,6 +2462,15 @@ mod tests {
                 bounds.size,
                 size(px(edge), px(edge)),
                 "{unified_size:?}: the trigger must be the UnifiedSize square"
+            );
+
+            let well = cx
+                .debug_bounds("TEST_COLOR_PICKER_TRIGGER_WELL")
+                .expect("the trigger's color well is drawn");
+            assert_eq!(
+                well.size,
+                size(px(edge - 6.), px(edge - 6.)),
+                "{unified_size:?}: the color well must fill the button's padded content box"
             );
 
             press(cx, "TEST_COLOR_PICKER_TRIGGER");
