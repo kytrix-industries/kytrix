@@ -211,6 +211,16 @@ impl CandleGeometry {
         px((self.candle_width * 0.68).max(1.0))
     }
 
+    /// The x coordinate at the middle of the candle `offset` slots left of the
+    /// first visible one.
+    ///
+    /// An indicator line draws one candle outside the left edge so the segment
+    /// entering the plot has the right height. That slot is not part of
+    /// `visible_len`, so [`CandleGeometry::center_x`] cannot express it.
+    pub(crate) fn center_x_left_of_first(self, offset: usize) -> Pixels {
+        self.first_x + px((0.5 - offset as f32) * self.candle_width)
+    }
+
     /// The visible slot under an x coordinate, clamped to the visible range.
     pub(crate) fn slot_at(self, x: Pixels) -> Option<usize> {
         if self.visible_len == 0 {

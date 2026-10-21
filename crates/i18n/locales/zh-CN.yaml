@@ -486,6 +486,32 @@ widget:
     days_one: 天
     hours: 小时
     hours_one: 小时
+    indicator:
+      add_line: 新增指标线
+      d: D
+      dea: DEA
+      dif: DIF
+      ema: EMA
+      j: J
+      k: K
+      kdj: KDJ
+      line_color: 线条颜色
+      lines: 指标线
+      long_period: 长周期
+      ma: MA
+      macd: MACD
+      main: 主图
+      period: 周期
+      period_invalid: 周期需为 1–500 的整数
+      remove_line: 删除指标线
+      rsi: RSI
+      settings: 图表设置
+      short_period: 短周期
+      signal_period: 移动平均周期
+      smoothing_1: 移动平均周期 1
+      smoothing_2: 移动平均周期 2
+      sub: 副图
+      vol: VOL
     minutes: 分钟
     minutes_one: 分钟
     months: 月

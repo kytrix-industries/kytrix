@@ -30,6 +30,17 @@ pub(crate) enum IndicatorId {
     Kdj,
 }
 
+/// Which region of the chart an indicator draws in.
+///
+/// The catalogue owns this: both the main-chart drawing loop and the sub-plot
+/// loop filter the enabled series by it, so an indicator cannot be drawn in one
+/// region by one call site and another region by the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndicatorPane {
+    Main,
+    Sub,
+}
+
 /// A full declaration of one indicator.
 ///
 /// `default_settings` is a function pointer rather than a closure: a closure
@@ -38,6 +49,8 @@ pub(crate) enum IndicatorId {
 /// `Vec` inside a line list needs.
 pub(crate) struct IndicatorDefinition {
     pub id: IndicatorId,
+    /// Which region of the chart the indicator draws in.
+    pub pane: IndicatorPane,
     /// Whether a configuration starts with this indicator enabled.
     pub enabled_by_default: bool,
     /// The default settings value. Its shape must be the one `expected_shape`
@@ -142,38 +155,44 @@ fn kdj_default_settings() -> IndicatorSettings {
 pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
     IndicatorDefinition {
         id: IndicatorId::Ma,
+        pane: IndicatorPane::Main,
         enabled_by_default: true,
         default_settings: ma_default_settings,
     },
     IndicatorDefinition {
         id: IndicatorId::Ema,
+        pane: IndicatorPane::Main,
         enabled_by_default: false,
         default_settings: ema_default_settings,
     },
     IndicatorDefinition {
         id: IndicatorId::Vol,
+        pane: IndicatorPane::Sub,
         enabled_by_default: true,
         default_settings: vol_default_settings,
     },
     IndicatorDefinition {
         id: IndicatorId::Macd,
+        pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: macd_default_settings,
     },
     IndicatorDefinition {
         id: IndicatorId::Rsi,
+        pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: rsi_default_settings,
     },
     IndicatorDefinition {
         id: IndicatorId::Kdj,
+        pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: kdj_default_settings,
     },
 ];
 
-// TODO(§3/§6): `IndicatorPane` (which region an indicator draws in) and the
-// panel's settings rows (`SettingRow`, `SettingControl`, `SettingKey` and
-// `IndicatorDefinition::rows`) land with their first readers: the layout in §3
-// and the panel in §6. Declaring them before anything reads them would be dead
-// code, so this stage's catalogue carries only what the configuration uses.
+// TODO(§6): the panel's settings rows (`SettingRow`, `SettingControl`,
+// `SettingKey` and `IndicatorDefinition::rows`) land with their first reader,
+// the panel's editor. Declaring them before anything reads them would be dead
+// code, so this stage's catalogue carries only what the configuration, the
+// computation and the main-chart painter use.

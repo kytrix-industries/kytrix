@@ -15,8 +15,8 @@ use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 
 use base_ui::style::theme::{Theme, ThemeExt};
 use gpui_kit::{
-    App, Bounds, ContentMask, Hsla, IntoElement, Pixels, Point, ShapedLine, SharedString, Styled,
-    TextAlign, TextStyle, Window, canvas, fill, point, px, size,
+    App, Bounds, ContentMask, Hsla, IntoElement, Path, PathBuilder, Pixels, Point, ShapedLine,
+    SharedString, Styled, TextAlign, TextStyle, Window, canvas, fill, point, px, size,
 };
 use i18n::t;
 use market_participants_connector::{
@@ -27,7 +27,7 @@ use market_participants_model::{
     decimal::{Price, Quantity, Tick},
     market::{book::ListingCandlestick, units::QuantityUnit},
 };
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use time::UtcOffset;
 use widget::time_zone::data_time_zone;
 
@@ -38,6 +38,10 @@ use super::{
     text::{ChartTextCache, HOVER_LABEL_LINE_HEIGHT, HoverLabelCache, format_price, format_volume},
 };
 use crate::{
+    indicator::{
+        CandlestickIndicatorConfig, IndicatorInput, IndicatorPane, IndicatorSeries, LineShape,
+        compute_indicators, definition_of,
+    },
     model::{CandlePrices, CandlestickSeriesSnapshot},
     time::{format_axis_time, maximum_countdown_label},
 };
@@ -56,6 +60,13 @@ const PRICE_AXIS_MIN_LABEL_SPACING: f32 = 28.0;
 const MAX_PRICE_AXIS_TARGET_INTERVALS: f64 = 16.0;
 const MAX_PRICE_AXIS_TICKS: usize = 24;
 const HOVER_LABEL_INSET: f32 = 4.0;
+/// The gap between the main-chart legend row and the OHLC hover label below it.
+///
+/// Both used to start at [`HOVER_LABEL_INSET`] from the plot's top-left corner,
+/// so the hover label was painted on top of the legend. The legend's position is
+/// fixed by the design (top-left, inset by `HOVER_LABEL_INSET`); the hover label
+/// is not, so it moves down one line while the legend is shown.
+const HOVER_LABEL_LEGEND_GAP: f32 = 2.0;
 const VOLUME_HEADROOM: f64 = 1.08;
 
 /// Everything one frame of the chart draws from.
@@ -63,6 +74,11 @@ pub(crate) struct ChartCanvasOptions {
     pub viewport: ChartViewport,
     pub interval: TimeFrame,
     pub countdown_label: SharedString,
+    /// The indicator configuration. It keys both the value cache and the
+    /// prepared chart, because it decides the values and the layout.
+    pub indicator_config: CandlestickIndicatorConfig,
+    /// Whether the settings panel is open, which decides the chart's width.
+    pub panel_open: bool,
 }
 
 /// Per-chart caches that survive between frames.
@@ -74,12 +90,14 @@ pub(crate) struct ChartCanvasOptions {
 pub(crate) struct ChartPaintCaches {
     text: RefCell<ChartTextCache>,
     prepared: RefCell<PreparedChartCache>,
+    indicators: RefCell<IndicatorCache>,
 }
 
 impl ChartPaintCaches {
     pub(crate) fn clear(&self) {
         self.text.borrow_mut().clear();
         *self.prepared.borrow_mut() = PreparedChartCache::default();
+        *self.indicators.borrow_mut() = IndicatorCache::default();
     }
 }
 
@@ -100,6 +118,8 @@ pub(crate) fn chart_canvas(
     let prepaint_snapshot = snapshot.clone();
     let prepaint_viewport = options.viewport;
     let prepaint_interval = options.interval;
+    let prepaint_indicator_config = options.indicator_config.clone();
+    let prepaint_panel_open = options.panel_open;
     let paint_hover_label_cache = hover_label_cache;
     let prepaint_caches = paint_caches.clone();
     let paint_caches = paint_caches;
@@ -113,6 +133,8 @@ pub(crate) fn chart_canvas(
                 data_time_zone(cx),
                 bounds,
                 cx.theme().components.chart.axis.hsla,
+                &prepaint_indicator_config,
+                prepaint_panel_open,
                 window,
             );
             // The view hit-tests pointer positions against this, and only the
@@ -144,6 +166,7 @@ pub(crate) fn chart_canvas(
 struct PreparedChart {
     layout: Rc<ChartLayout>,
     visible: Option<PreparedVisibleChart>,
+    indicators: Arc<[IndicatorSeries]>,
 }
 
 #[derive(Clone)]
@@ -195,6 +218,10 @@ struct PreparedChartKey {
     bounds: Bounds<Pixels>,
     text_style: TextStyle,
     text_color: Hsla,
+    /// Decides the layout (how many sub plots) and which lines are drawn.
+    indicator_config: CandlestickIndicatorConfig,
+    /// Decides whether the chart is narrower than the whole body.
+    panel_open: bool,
 }
 
 impl PreparedChartKey {
@@ -207,6 +234,8 @@ impl PreparedChartKey {
         bounds: Bounds<Pixels>,
         text_style: &TextStyle,
         text_color: Hsla,
+        indicator_config: &CandlestickIndicatorConfig,
+        panel_open: bool,
     ) -> bool {
         self.snapshot.shares_chart_data_with(snapshot)
             && self.candle_width == viewport.candle_width
@@ -216,6 +245,8 @@ impl PreparedChartKey {
             && self.bounds == bounds
             && self.text_style == *text_style
             && self.text_color == text_color
+            && self.indicator_config == *indicator_config
+            && self.panel_open == panel_open
     }
 }
 
@@ -228,6 +259,81 @@ struct PreparedChartCache {
     builds: usize,
 }
 
+/// The computed indicator values, keyed only by the snapshot and the
+/// configuration.
+///
+/// Values do not depend on the viewport, so panning and zooming must not rebuild
+/// them: that is why this is a cache of its own rather than a field of
+/// [`PreparedChart`], whose key changes on every pan.
+#[derive(Default)]
+struct IndicatorCache {
+    snapshot: Option<CandlestickSeriesSnapshot>,
+    config: Option<CandlestickIndicatorConfig>,
+    series: Arc<[IndicatorSeries]>,
+    /// Counts real rebuilds, so a test can tell a cache hit from a recompute.
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl IndicatorCache {
+    /// Whether the cache holds the values for this snapshot and configuration.
+    ///
+    /// The snapshot is compared with [`CandlestickSeriesSnapshot::shares_chart_data_with`]
+    /// (an `Arc` pointer comparison), not with `==`: snapshots deliberately have
+    /// no `PartialEq`, which would compare every candle.
+    fn matches(
+        &self,
+        snapshot: &CandlestickSeriesSnapshot,
+        config: &CandlestickIndicatorConfig,
+    ) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|cached| cached.shares_chart_data_with(snapshot))
+            && self.config.as_ref() == Some(config)
+    }
+}
+
+/// The computed series for `snapshot` and `config`, from the cache when possible.
+///
+/// The input columns are built **only** on a miss: allocating them on every frame
+/// would be the per-frame cost this cache exists to avoid.
+fn indicator_series(
+    caches: &ChartPaintCaches,
+    snapshot: &CandlestickSeriesSnapshot,
+    config: &CandlestickIndicatorConfig,
+) -> Arc<[IndicatorSeries]> {
+    {
+        let cache = caches.indicators.borrow();
+        if cache.matches(snapshot, config) {
+            return cache.series.clone();
+        }
+    }
+
+    let inputs: Vec<IndicatorInput> = snapshot
+        .candles()
+        .iter()
+        .map(|candle| {
+            let prices = CandlePrices::of(candle);
+            IndicatorInput {
+                close: prices.close().inner() as f64,
+                high: prices.high().inner() as f64,
+                low: prices.low().inner() as f64,
+            }
+        })
+        .collect();
+    let series: Arc<[IndicatorSeries]> = compute_indicators(&inputs, config).into();
+
+    let mut cache = caches.indicators.borrow_mut();
+    cache.snapshot = Some(snapshot.clone());
+    cache.config = Some(config.clone());
+    cache.series = series.clone();
+    #[cfg(test)]
+    {
+        cache.builds += 1;
+    }
+    series
+}
+
 fn prepare_chart_cached(
     caches: &ChartPaintCaches,
     snapshot: &CandlestickSeriesSnapshot,
@@ -236,6 +342,8 @@ fn prepare_chart_cached(
     zone: UtcOffset,
     bounds: Bounds<Pixels>,
     text_color: Hsla,
+    indicator_config: &CandlestickIndicatorConfig,
+    panel_open: bool,
     window: &Window,
 ) -> Rc<PreparedChart> {
     let text_style = window.text_style();
@@ -250,6 +358,8 @@ fn prepare_chart_cached(
                 bounds,
                 &text_style,
                 text_color,
+                indicator_config,
+                panel_open,
             ) {
                 cache.chart.clone()
             } else {
@@ -261,17 +371,21 @@ fn prepare_chart_cached(
         return chart;
     }
 
+    // The values depend only on the snapshot and the configuration, so they are
+    // computed once and then only re-read by the layout loop and the painter.
+    let indicators = indicator_series(caches, snapshot, indicator_config);
     let layout = resolve_chart_layout(
         snapshot,
         viewport,
         interval,
         bounds,
         text_color,
+        &indicators,
         &caches.text,
         window,
     );
     let prepared = Rc::new(prepare_visible_chart(
-        snapshot, viewport, interval, zone, layout,
+        snapshot, viewport, interval, zone, layout, indicators,
     ));
     let mut cache = caches.prepared.borrow_mut();
     cache.key = Some(PreparedChartKey {
@@ -283,6 +397,8 @@ fn prepare_chart_cached(
         bounds,
         text_style,
         text_color,
+        indicator_config: indicator_config.clone(),
+        panel_open,
     });
     cache.chart = Some(prepared.clone());
     #[cfg(test)]
@@ -298,6 +414,7 @@ fn prepare_visible_chart(
     interval: TimeFrame,
     zone: UtcOffset,
     layout: ChartLayout,
+    indicators: Arc<[IndicatorSeries]>,
 ) -> PreparedChart {
     let range = visible_range(snapshot.candles(), viewport, layout.price_plot.size.width);
     // This stage draws one sub plot, the volume one; the sub-plot series loop
@@ -307,9 +424,11 @@ fn prepare_visible_chart(
         let candles = snapshot.candles();
         let latest = latest_candle_for_indicator(snapshot, range.end);
         let visible = &candles[range.clone()];
-        let (lowest, highest) = price_bounds(
-            visible,
+        let (lowest, highest) = price_bounds_with_indicators(
+            candles,
+            range.clone(),
             latest.map(|candle| CandlePrices::of(candle).close()),
+            &indicators,
         );
         let volume_upper = volume_upper_bound(visible);
         let geometry = CandleGeometry::new(layout.price_plot, range.len(), viewport.candle_width);
@@ -408,6 +527,7 @@ fn prepare_visible_chart(
     PreparedChart {
         layout: Rc::new(layout),
         visible,
+        indicators,
     }
 }
 
@@ -418,6 +538,7 @@ fn resolve_chart_layout(
     interval: TimeFrame,
     bounds: Bounds<Pixels>,
     text_color: Hsla,
+    main_series: &[IndicatorSeries],
     text_cache: &RefCell<ChartTextCache>,
     window: &Window,
 ) -> ChartLayout {
@@ -441,13 +562,14 @@ fn resolve_chart_layout(
     for _ in 0..3 {
         let range = visible_range(snapshot.candles(), viewport, layout.price_plot.size.width);
         let latest = latest_candle_for_indicator(snapshot, range.end);
-        let visible = &snapshot.candles()[range];
         let measured_width = widest_axis_label_width(
-            visible,
+            snapshot.candles(),
+            range,
             latest,
             snapshot.price_tick(),
             layout.price_plot.size.height,
             interval,
+            main_series,
             &text_measurer,
         );
         longest_label_width = longest_label_width.max(measured_width);
@@ -467,18 +589,22 @@ fn resolve_chart_layout(
 }
 
 fn widest_axis_label_width(
-    visible: &[ListingCandlestick],
+    candles: &[ListingCandlestick],
+    range: Range<usize>,
     latest: Option<&ListingCandlestick>,
     price_tick: Tick,
     price_plot_height: Pixels,
     interval: TimeFrame,
+    main_series: &[IndicatorSeries],
     text_measurer: &AxisTextMeasurer<'_>,
 ) -> Pixels {
     let widest_axis_label = axis_label_candidates(
-        visible,
+        candles,
+        range,
         latest.map(|candle| CandlePrices::of(candle).close()),
         price_tick,
         price_plot_height,
+        main_series,
     )
     .into_iter()
     .map(|label| text_measurer.measure(label))
@@ -494,17 +620,23 @@ fn widest_axis_label_width(
 /// The axis is sized once per frame from this list, so it must be a superset: a
 /// label that appears later must not widen the axis, because that would take
 /// width away from the plot and change the very candles it was measured from.
+/// That is also why the price labels are derived from the same
+/// [`price_bounds_with_indicators`] the plot uses: a main-chart line that moved
+/// the bound must move the candidate set with it.
 fn axis_label_candidates(
-    visible: &[ListingCandlestick],
+    candles: &[ListingCandlestick],
+    range: Range<usize>,
     latest_price: Option<Price>,
     price_tick: Tick,
     price_plot_height: Pixels,
+    main_series: &[IndicatorSeries],
 ) -> Vec<SmolStr> {
-    if visible.is_empty() {
+    if range.is_empty() {
         return vec![SmolStr::new_static("0.000")];
     }
 
-    let (lowest, highest) = price_bounds(visible, latest_price);
+    let visible = &candles[range.clone()];
+    let (lowest, highest) = price_bounds_with_indicators(candles, range, latest_price, main_series);
     let volume_upper = volume_upper_bound(visible);
     let mut labels = Vec::with_capacity(28);
     labels.extend(
@@ -569,6 +701,19 @@ struct ChartPainter<'a> {
     context: &'a mut App,
 }
 
+/// Top inset of the OHLC hover label.
+///
+/// The main-chart legend owns the plot's first text row while it is drawn, so
+/// the label starts one line below it (with a small gap). Without a legend it
+/// keeps the original top-left inset.
+fn hover_label_top(has_legend: bool) -> Pixels {
+    if has_legend {
+        px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT + HOVER_LABEL_LEGEND_GAP)
+    } else {
+        px(HOVER_LABEL_INSET)
+    }
+}
+
 fn paint_chart(
     snapshot: &CandlestickSeriesSnapshot,
     options: &ChartCanvasOptions,
@@ -578,7 +723,11 @@ fn paint_chart(
     window: &mut Window,
     context: &mut App,
 ) {
-    let PreparedChart { layout, visible } = prepared;
+    let PreparedChart {
+        layout,
+        visible,
+        indicators,
+    } = prepared;
     let layout = layout.as_ref();
     // No background quad: the pane body is the background, and a quad of our own
     // would be a rectangle drawn over its rounded corners.
@@ -625,6 +774,9 @@ fn paint_chart(
         painter.paint_sub_axis(&visible.volume_ticks, visible.volume_upper, *sub_plot);
     }
     painter.paint_time_axis(&visible.time_ticks, layout);
+    // Main-chart indicator lines sit above the grid and below the candles: a
+    // line drawn after the wicks would cover them (design §8.1).
+    painter.paint_main_indicator_lines(indicators, visible, layout);
     // The candle the crosshair is on, if the pointer is over any plot. Its
     // volume bar is painted at full strength along with it.
     let hovered_candle = options
@@ -642,11 +794,23 @@ fn paint_chart(
     if let Some(latest) = &visible.latest_price {
         painter.paint_latest_price_indicator(latest, options.countdown_label.clone(), layout);
     }
+    // The legend reads the candle under the pointer, or the newest visible one
+    // when the pointer is away. The absolute index is what indexes the values;
+    // a visible slot alone would read another candle's values after a pan.
+    let legend = legend_candle_index(options.viewport.cursor, layout, visible)
+        .map(|absolute| main_indicator_legend(indicators, absolute, snapshot.price_tick()))
+        .unwrap_or_default();
+    if !legend.is_empty() {
+        painter.paint_indicator_legend(&legend, layout.price_plot);
+    }
     if let Some(cursor) = options
         .viewport
         .cursor
         .filter(|cursor| layout.contains_data_point(cursor))
     {
+        // The legend owns the plot's first text row; the OHLC label takes the
+        // next one so the two are both readable.
+        let hover_label_top = hover_label_top(!legend.is_empty());
         painter.paint_crosshair(
             snapshot,
             visible,
@@ -655,10 +819,82 @@ fn paint_chart(
             cursor,
             layout,
             hover_label_cache,
+            hover_label_top,
         );
     }
 }
 impl ChartPainter<'_> {
+    /// Draws every enabled main-chart line.
+    ///
+    /// The path's `PathBuilder` does not clip, so the drawing is wrapped in a
+    /// content mask: a value outside the price bounds can still be produced by
+    /// axis rounding, and the line must not run into the axis.
+    fn paint_main_indicator_lines(
+        &mut self,
+        indicators: &[IndicatorSeries],
+        visible: &PreparedVisibleChart,
+        layout: &ChartLayout,
+    ) {
+        for series in indicators {
+            if definition_of(series.id).pane != IndicatorPane::Main {
+                continue;
+            }
+            for line in &series.lines {
+                if line.shape != LineShape::Line {
+                    continue;
+                }
+                let Some(path) = build_indicator_path(
+                    &line.values,
+                    visible.range.clone(),
+                    visible.geometry,
+                    |value| y_for_price(value, visible.lowest, visible.highest, layout.price_plot),
+                ) else {
+                    continue;
+                };
+                let price_plot = layout.price_plot;
+                self.window.paint_layer(price_plot, |window| {
+                    window.with_content_mask(Some(ContentMask { bounds: price_plot }), |window| {
+                        window.paint_path(path, line.color);
+                    });
+                });
+            }
+        }
+    }
+
+    /// Draws the main-chart legend as one row in the plot's top-left corner,
+    /// each entry in its line's own colour.
+    fn paint_indicator_legend(&mut self, entries: &[LegendEntry], price_plot: Bounds<Pixels>) {
+        let mut x = price_plot.origin.x + px(HOVER_LABEL_INSET);
+        let y = price_plot.origin.y + px(HOVER_LABEL_INSET);
+        let ChartPainter {
+            text_cache,
+            window,
+            context,
+        } = self;
+        window.with_content_mask(Some(ContentMask { bounds: price_plot }), |window| {
+            for entry in entries {
+                if x >= price_plot.right() {
+                    break;
+                }
+                let line = text_cache.borrow_mut().line(
+                    SharedString::new(entry.text.as_str()),
+                    entry.color,
+                    window,
+                );
+                let width = line.width();
+                let _ = line.paint(
+                    point(x, y),
+                    px(HOVER_LABEL_LINE_HEIGHT),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    context,
+                );
+                x += width + px(10.0);
+            }
+        });
+    }
+
     fn paint_price_axis(
         &mut self,
         ticks: &[PreparedAxisTick],
@@ -819,6 +1055,7 @@ impl ChartPainter<'_> {
         cursor: Point<Pixels>,
         layout: &ChartLayout,
         hover_label_cache: &Rc<RefCell<HoverLabelCache>>,
+        hover_label_top: Pixels,
     ) {
         let Some(slot) = visible.geometry.slot_at(cursor.x) else {
             return;
@@ -904,6 +1141,7 @@ impl ChartPainter<'_> {
         paint_hover_label(
             presentation.line.as_ref(),
             layout.price_plot,
+            hover_label_top,
             self.window,
             self.context,
         );
@@ -984,8 +1222,8 @@ pub(crate) fn latest_price_indicator_is_visible(
         && candle_count.saturating_sub(visible_end) <= LATEST_PRICE_MAX_CANDLE_GAP
 }
 
-/// The price range to draw, padded so that candles do not touch the plot edges.
-fn price_bounds(candles: &[ListingCandlestick], latest_price: Option<Price>) -> (f64, f64) {
+/// The raw high/low span of `candles`, with the latest price folded in.
+fn price_extremes(candles: &[ListingCandlestick], latest_price: Option<Price>) -> (f64, f64) {
     let mut highest = candles
         .iter()
         .map(|candle| CandlePrices::of(candle).high().inner() as f64)
@@ -999,8 +1237,184 @@ fn price_bounds(candles: &[ListingCandlestick], latest_price: Option<Price>) -> 
         highest = highest.max(latest_price);
         lowest = lowest.min(latest_price);
     }
+    (lowest, highest)
+}
+
+/// Pads raw extremes so that nothing touches the plot edges.
+///
+/// Every source of a bound has to be folded in **before** this runs, or the
+/// padding is computed from a narrower range than the one being drawn.
+fn padded_price_bounds(lowest: f64, highest: f64) -> (f64, f64) {
     let range = (highest - lowest).max(1.0);
     (lowest - range * 0.04, highest + range * 0.04)
+}
+
+/// The price range to draw, padded so that candles do not touch the plot edges.
+///
+/// The painted chart always goes through [`price_bounds_with_indicators`], even
+/// when no indicator is enabled; this plain form is what the bounds tests pin,
+/// so it stays test-only rather than growing a production caller with the same
+/// body.
+#[cfg(test)]
+fn price_bounds(candles: &[ListingCandlestick], latest_price: Option<Price>) -> (f64, f64) {
+    let (lowest, highest) = price_extremes(candles, latest_price);
+    padded_price_bounds(lowest, highest)
+}
+
+/// The main-chart price range, including every enabled main-chart indicator
+/// value in `range`.
+///
+/// `candles` is the **whole snapshot** and `range` indexes it; the series'
+/// values are indexed the same way. Mixing a relative slice with an absolute
+/// range has no consistency constraint at all (a 200-candle slice with
+/// `1300..1500` would pass unnoticed), which is why the signature only accepts
+/// absolute indices.
+///
+/// The indicators have to be included because a moving average's window can
+/// cross the left edge of the visible range: the MA500 of the leftmost visible
+/// candle averages closes from candles the chart is not drawing, which may be
+/// above every visible high. Merging them after padding would leave the line
+/// outside the range it was padded from — and `with_content_mask` would cut it
+/// off at the plot edge.
+fn price_bounds_with_indicators(
+    candles: &[ListingCandlestick],
+    range: Range<usize>,
+    latest_price: Option<Price>,
+    main_series: &[IndicatorSeries],
+) -> (f64, f64) {
+    debug_assert!(range.start <= range.end);
+    debug_assert!(
+        range.end <= candles.len(),
+        "the range indexes the whole snapshot, got {range:?} for {} candles",
+        candles.len()
+    );
+
+    let (mut lowest, mut highest) = price_extremes(&candles[range.clone()], latest_price);
+    for series in main_series {
+        if definition_of(series.id).pane != IndicatorPane::Main {
+            continue;
+        }
+        for line in &series.lines {
+            debug_assert_eq!(
+                line.values.len(),
+                candles.len(),
+                "an indicator line is indexed like the whole snapshot"
+            );
+            for value in line.values[range.clone()].iter().flatten() {
+                lowest = lowest.min(*value);
+                highest = highest.max(*value);
+            }
+        }
+    }
+    padded_price_bounds(lowest, highest)
+}
+
+/// The absolute candle index the legend reads.
+///
+/// It is the candle under the pointer, or the newest visible one when the
+/// pointer is away. The visible slot alone is not an index into an
+/// `IndicatorLine`: after a pan, slot `n` belongs to another candle, so the
+/// addition of `range.start` is required (design §5.6).
+fn legend_candle_index(
+    cursor: Option<Point<Pixels>>,
+    layout: &ChartLayout,
+    visible: &PreparedVisibleChart,
+) -> Option<usize> {
+    let slot = cursor
+        .filter(|cursor| layout.contains_data_point(cursor))
+        .and_then(|cursor| visible.geometry.slot_at(cursor.x))
+        .unwrap_or(visible.range.len().checked_sub(1)?);
+    Some(visible.range.start + slot)
+}
+
+/// One entry of the main-chart legend.
+struct LegendEntry {
+    text: SmolStr,
+    color: Hsla,
+}
+
+/// The main-chart legend entries for the candle at `absolute`.
+///
+/// A line contributes an entry only once the candle is past its own
+/// `readable_from` threshold: the value is defined earlier for EMA and MACD, but
+/// it is not yet trustworthy.
+fn main_indicator_legend(
+    indicators: &[IndicatorSeries],
+    absolute: usize,
+    price_tick: Tick,
+) -> Vec<LegendEntry> {
+    let mut entries = Vec::new();
+    for series in indicators {
+        if definition_of(series.id).pane != IndicatorPane::Main {
+            continue;
+        }
+        for line in &series.lines {
+            if absolute < line.readable_from {
+                continue;
+            }
+            let Some(value) = line.values.get(absolute).copied().flatten() else {
+                continue;
+            };
+            entries.push(LegendEntry {
+                text: format_smolstr!("{} {}", line.label, format_price(value, price_tick)),
+                color: line.color,
+            });
+        }
+    }
+    entries
+}
+
+/// Builds one indicator line's path over the visible range.
+///
+/// `values` is indexed like the **whole snapshot** and `range` is the visible
+/// absolute range, so the two are one coordinate system. The path takes one
+/// candle from the left of the range as well, so the segment entering the plot
+/// starts at the right height; the right end takes nothing extra, because the
+/// future is not drawn. A `None` value breaks the line there: no segment is
+/// fabricated across a gap.
+fn build_indicator_path(
+    values: &[Option<f64>],
+    range: Range<usize>,
+    geometry: CandleGeometry,
+    y_for: impl Fn(f64) -> Pixels,
+) -> Option<Path<Pixels>> {
+    debug_assert!(range.start <= range.end);
+    debug_assert!(
+        range.end <= values.len(),
+        "the range indexes the whole snapshot, got {range:?} for {} values",
+        values.len()
+    );
+
+    let mut builder = PathBuilder::stroke(px(1.0));
+    let mut started = false;
+    let mut segments = 0usize;
+    let first = range.start.saturating_sub(1);
+    for (index, value) in values.iter().enumerate().take(range.end).skip(first) {
+        match *value {
+            Some(value) => {
+                let x = if index < range.start {
+                    // The extra candle is outside `visible_len`, so `center_x`
+                    // has no slot for it.
+                    geometry.center_x_left_of_first(range.start - index)
+                } else {
+                    geometry.center_x(index - range.start)
+                };
+                let to = point(x, y_for(value));
+                if started {
+                    builder.line_to(to);
+                    segments += 1;
+                } else {
+                    builder.move_to(to);
+                    started = true;
+                }
+            }
+            None => started = false,
+        }
+    }
+    if segments == 0 {
+        return None;
+    }
+    builder.build().ok()
 }
 
 /// The tallest traded size the volume plot has to fit.
@@ -1222,13 +1636,13 @@ fn asset_label(asset: &AssetId, cx: &App) -> SharedString {
         )
 }
 
-fn hover_label_bounds(price_plot: Bounds<Pixels>) -> Bounds<Pixels> {
+fn hover_label_bounds(price_plot: Bounds<Pixels>, top_inset: Pixels) -> Bounds<Pixels> {
     let inset = px(HOVER_LABEL_INSET);
     Bounds::new(
-        point(price_plot.origin.x + inset, price_plot.origin.y + inset),
+        point(price_plot.origin.x + inset, price_plot.origin.y + top_inset),
         size(
             (price_plot.size.width - inset * 2.0).max(px(0.0)),
-            (price_plot.size.height - inset * 2.0)
+            (price_plot.size.height - top_inset - inset)
                 .max(px(0.0))
                 .min(px(HOVER_LABEL_LINE_HEIGHT)),
         ),
@@ -1238,10 +1652,11 @@ fn hover_label_bounds(price_plot: Bounds<Pixels>) -> Bounds<Pixels> {
 fn paint_hover_label(
     line: &ShapedLine,
     price_plot: Bounds<Pixels>,
+    top_inset: Pixels,
     window: &mut Window,
     context: &mut App,
 ) {
-    let bounds = hover_label_bounds(price_plot);
+    let bounds = hover_label_bounds(price_plot, top_inset);
     if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
         return;
     }
@@ -1367,7 +1782,7 @@ fn nearest_nice_step(raw_step: f64) -> f64 {
 mod tests {
     use std::str::FromStr;
 
-    use gpui_kit::TestAppContext;
+    use gpui_kit::{Context, Render, TestAppContext, div};
     use market_participants_connector::catalog::test_support;
     use market_participants_model::{
         decimal::{Price, Quantity},
@@ -1381,6 +1796,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::indicator::IndicatorLine;
 
     fn market_price(value: Price) -> MarketPrice {
         MarketPrice {
@@ -1641,9 +2057,49 @@ mod tests {
     #[test]
     fn hover_label_bounds_should_not_exceed_narrow_price_plot() {
         let plot = Bounds::new(point(px(10.0), px(20.0)), size(px(6.0), px(10.0)));
-        let label = hover_label_bounds(plot);
+        let label = hover_label_bounds(plot, px(HOVER_LABEL_INSET));
 
         assert_eq!((label.size.width, label.size.height), (px(0.0), px(2.0)));
+    }
+
+    /// Without a legend the OHLC label keeps the plot's original top inset.
+    #[test]
+    fn hover_label_top_should_keep_the_original_inset_without_a_legend() {
+        assert_eq!(hover_label_top(false), px(HOVER_LABEL_INSET));
+    }
+
+    /// With a legend the OHLC label starts one legend row (plus the gap) lower.
+    #[test]
+    fn hover_label_top_should_move_below_the_legend_row_when_it_is_drawn() {
+        assert_eq!(
+            hover_label_top(true),
+            px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT + HOVER_LABEL_LEGEND_GAP)
+        );
+        assert!(hover_label_top(true) > hover_label_top(false));
+    }
+
+    /// The legend keeps the plot's top-left corner, and the hover label starts
+    /// below the legend row instead of being painted over it.
+    #[test]
+    fn hover_label_should_start_below_the_legend_row() {
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
+        let without_legend = hover_label_bounds(plot, hover_label_top(false));
+        let with_legend = hover_label_bounds(plot, hover_label_top(true));
+
+        assert_eq!(
+            without_legend.origin.y,
+            plot.origin.y + px(HOVER_LABEL_INSET),
+            "without a legend the label keeps the original top inset"
+        );
+        assert!(
+            with_legend.origin.y >= plot.origin.y + px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT),
+            "the OHLC label must not start inside the legend's line"
+        );
+        assert!(
+            with_legend.origin.y > without_legend.origin.y,
+            "the label moves down only while the legend is drawn"
+        );
+        assert_eq!(with_legend.size.height, px(HOVER_LABEL_LINE_HEIGHT));
     }
 
     #[test]
@@ -1655,7 +2111,7 @@ mod tests {
     fn volume_axis_candidates_should_cover_unit_transition_labels() {
         let candles = [candle_with_volume(1, Quantity::from(1_000_000_u64))];
         let tick = Tick::from_str("1").expect("price tick should parse");
-        let labels = axis_label_candidates(&candles, None, tick, px(300.0));
+        let labels = axis_label_candidates(&candles, 0..candles.len(), None, tick, px(300.0), &[]);
 
         assert!(
             labels.iter().any(|label| label == "999.999K")
@@ -1835,6 +2291,7 @@ mod tests {
         };
         let text_color = gpui_kit::white();
         let other_text_color = gpui_kit::black();
+        let indicator_config = CandlestickIndicatorConfig::default();
         let key = PreparedChartKey {
             snapshot: snapshot.clone(),
             candle_width: viewport.candle_width,
@@ -1844,6 +2301,8 @@ mod tests {
             bounds,
             text_style: TextStyle::default(),
             text_color,
+            indicator_config: indicator_config.clone(),
+            panel_open: false,
         };
         let unchanged = |snapshot: &CandlestickSeriesSnapshot,
                          viewport: ChartViewport,
@@ -1859,6 +2318,8 @@ mod tests {
                 bounds,
                 &TextStyle::default(),
                 text_color,
+                &indicator_config,
+                false,
             )
         };
 
@@ -1953,6 +2414,387 @@ mod tests {
             ),
             "a new snapshot changes the candles"
         );
+        let mut other_config = indicator_config.clone();
+        other_config.entries[0].enabled = false;
+        assert!(
+            !key.matches(
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                &TextStyle::default(),
+                text_color,
+                &other_config,
+                false,
+            ),
+            "switching a main-chart indicator off changes the lines and the bounds"
+        );
+        assert!(
+            !key.matches(
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                &TextStyle::default(),
+                text_color,
+                &indicator_config,
+                true,
+            ),
+            "opening the panel changes the chart width"
+        );
+    }
+
+    /// A two-point run over the left edge proves both halves of the path
+    /// contract: the extra candle is drawn, and a `None` never gets a segment
+    /// fabricated across it.
+    #[test]
+    fn build_indicator_path_should_break_at_a_none_and_take_one_candle_from_the_left() {
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(100.0)));
+        let geometry = CandleGeometry::new(plot, 2, 10.0);
+        let y_for = |value: f64| px(value as f32);
+
+        assert!(
+            build_indicator_path(&[Some(1.0), None, Some(3.0)], 0..3, geometry, y_for).is_none(),
+            "a gap leaves two isolated points, which are not a line"
+        );
+        assert!(
+            build_indicator_path(&[Some(1.0), Some(3.0)], 0..1, geometry, y_for).is_none(),
+            "the right end takes no extra candle"
+        );
+
+        let path = build_indicator_path(&[Some(1.0), Some(3.0)], 1..2, geometry, y_for)
+            .expect("a two-point run is a line");
+        assert!(
+            path.bounds.origin.x < geometry.center_x(0),
+            "the path starts at the candle left of the first visible slot, got {:?}",
+            path.bounds
+        );
+        assert!(
+            path.bounds.right() >= geometry.center_x(0),
+            "the path reaches the first visible slot, got {:?}",
+            path.bounds
+        );
+    }
+
+    /// Passing a relative slice with an absolute range has no consistency
+    /// constraint, so the contract is checked at the entry.
+    #[test]
+    #[should_panic(expected = "the range indexes the whole snapshot")]
+    fn build_indicator_path_should_reject_a_relative_slice() {
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(100.0)));
+        let geometry = CandleGeometry::new(plot, 2, 10.0);
+
+        let _ = build_indicator_path(&[Some(1.0), Some(2.0)], 1..3, geometry, |value| {
+            px(value as f32)
+        });
+    }
+
+    /// The extra candle an indicator path draws is one slot left of the first
+    /// visible one, which `center_x` cannot address because that slot is outside
+    /// `visible_len`. A chart with no visible candle must still answer it.
+    #[test]
+    fn build_indicator_path_should_take_one_candle_width_left_of_the_first_slot() {
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(100.0)));
+        let geometry = CandleGeometry::new(plot, 2, 10.0);
+
+        assert_eq!(
+            geometry.center_x_left_of_first(1),
+            geometry.center_x(0) - px(10.0)
+        );
+        assert_eq!(geometry.center_x_left_of_first(1), px(75.0));
+
+        let empty = CandleGeometry::new(plot, 0, 10.0);
+        assert_eq!(
+            empty.center_x_left_of_first(1),
+            empty.center_x(0) - px(10.0)
+        );
+    }
+
+    /// A range whose start is past its end is not a visible window; the debug
+    /// assertion names it instead of silently producing an empty path.
+    #[test]
+    #[should_panic(expected = "range.start <= range.end")]
+    fn build_indicator_path_should_reject_a_reversed_range() {
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(100.0)));
+        let geometry = CandleGeometry::new(plot, 2, 10.0);
+        // Built from variables so the lint that flags a literal `2..1` does not
+        // fire: the reversed range is the input this test is about.
+        let start = 2;
+        let end = 1;
+
+        let _ = build_indicator_path(&[Some(1.0), Some(2.0)], start..end, geometry, |value| {
+            px(value as f32)
+        });
+    }
+
+    /// The padding is computed once, from the range that already contains the
+    /// indicator values; padding the candle range first and merging afterwards
+    /// would leave the line outside the box it was padded for.
+    #[test]
+    fn price_bounds_with_indicators_should_pad_after_merging_the_values() {
+        let candles = [candle_with_prices(1, 100, 110, 90, 100)];
+        let scale = Price::from(1_u64).inner() as f64;
+        let series = [IndicatorSeries {
+            id: crate::indicator::IndicatorId::Ma,
+            legend: SmolStr::new_static("MA"),
+            lines: vec![IndicatorLine {
+                label: SmolStr::new_static("MA5"),
+                color: gpui_kit::white(),
+                values: vec![Some(Price::from(200_u64).inner() as f64)],
+                readable_from: 0,
+                shape: LineShape::Line,
+            }],
+        }];
+
+        let (lowest, highest) = price_bounds_with_indicators(&candles, 0..1, None, &series);
+
+        // Raw span 90..200, padded by 4% of 110 on each side.
+        assert!((lowest / scale - 85.6).abs() < 1e-9, "lowest was {lowest}");
+        assert!(
+            (highest / scale - 204.4).abs() < 1e-9,
+            "highest was {highest}"
+        );
+        // The plain bounds keep their existing behaviour.
+        let (plain_lowest, plain_highest) = price_bounds(&candles, None);
+        assert!(
+            plain_lowest < Price::from(90_u64).inner() as f64,
+            "plain lowest {plain_lowest}"
+        );
+        assert!(
+            plain_highest > Price::from(110_u64).inner() as f64,
+            "plain highest {plain_highest}"
+        );
+    }
+
+    /// The range indexes the whole snapshot, so a range that reaches past it
+    /// means the caller passed a relative slice; that is a contract violation,
+    /// not an empty chart.
+    #[test]
+    #[should_panic(expected = "the range indexes the whole snapshot")]
+    fn price_bounds_with_indicators_should_reject_a_relative_slice() {
+        let candles = [candle_with_prices(1, 100, 110, 90, 100)];
+
+        let _ = price_bounds_with_indicators(&candles, 0..2, None, &[]);
+    }
+
+    /// Only main-chart lines move the price range; a sub-plot value (here a MACD
+    /// histogram far outside the candles) must leave it alone. No indicators at
+    /// all is the same case as every main indicator switched off.
+    #[test]
+    fn price_bounds_with_indicators_should_ignore_sub_plot_series() {
+        let candles = [
+            candle_with_prices(1, 100, 110, 90, 100),
+            candle_with_prices(2, 100, 104, 96, 100),
+        ];
+        let plain = price_bounds(&candles, None);
+        let sub_series = [IndicatorSeries {
+            id: crate::indicator::IndicatorId::Macd,
+            legend: SmolStr::new_static("MACD(12,26,9)"),
+            lines: vec![IndicatorLine {
+                label: SmolStr::new_static("MACD"),
+                color: gpui_kit::white(),
+                values: vec![Some(1.0e9); candles.len()],
+                readable_from: 0,
+                shape: LineShape::Histogram,
+            }],
+        }];
+
+        assert_eq!(
+            price_bounds_with_indicators(&candles, 0..candles.len(), None, &sub_series),
+            plain,
+            "a sub-plot value is not part of the main-chart price range"
+        );
+        assert_eq!(
+            price_bounds_with_indicators(&candles, 0..candles.len(), None, &[]),
+            plain,
+            "no main-chart series is the same range as the plain candle bounds"
+        );
+    }
+
+    /// The axis is sized from these candidates, so a main-chart line that moved
+    /// the price range must add its own label to the set; otherwise the axis
+    /// could be too narrow for the tick the plot draws.
+    #[test]
+    fn axis_label_candidates_should_include_main_indicator_values() {
+        let candles = [candle_with_prices(1, 100, 110, 90, 100)];
+        let tick = Tick::from_str("0.01").expect("tick should parse");
+        let series = [IndicatorSeries {
+            id: crate::indicator::IndicatorId::Ma,
+            legend: SmolStr::new_static("MA"),
+            lines: vec![IndicatorLine {
+                label: SmolStr::new_static("MA5"),
+                color: gpui_kit::white(),
+                values: vec![Some(Price::from(200_u64).inner() as f64)],
+                readable_from: 0,
+                shape: LineShape::Line,
+            }],
+        }];
+
+        let (_, highest) = price_bounds_with_indicators(&candles, 0..1, None, &series);
+        let with_indicator = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &series);
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[]);
+
+        assert!(
+            with_indicator.contains(&format_price(highest, tick)),
+            "the candidate set must contain the indicator-driven upper bound {highest}"
+        );
+        assert!(
+            !baseline.contains(&format_price(highest, tick)),
+            "the candle-only candidates must not contain the indicator-driven bound"
+        );
+    }
+
+    struct CacheHarness;
+
+    impl Render for CacheHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn snapshot_with_candles(count: usize) -> CandlestickSeriesSnapshot {
+        let mut series = crate::model::CandlestickSeries::new(
+            count,
+            ListingPrecision {
+                price_tick: Tick::from_str("0.01").expect("price tick should parse"),
+                quantity_tick: Tick::from_str("0.001").expect("quantity step should parse"),
+            },
+        );
+        series.merge_initial(
+            (0..count).map(|index| candle_with_prices(index as i64 + 1, 100, 110, 90, 100)),
+        );
+        series.snapshot()
+    }
+
+    /// Panning moves the prepared chart's key but not the inputs of the value
+    /// computation, so the values must be reused. This is the whole reason the
+    /// two caches are separate (design §7.3).
+    #[gpui_kit::test]
+    fn panning_one_candle_should_not_recompute_the_indicator_values(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let (_, cx) = cx.add_window_view(|_, _| CacheHarness);
+        let snapshot = snapshot_with_candles(100);
+        let config = CandlestickIndicatorConfig::default();
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
+        let viewport = ChartViewport::default();
+        let panned = ChartViewport {
+            right_timestamp: Some(snapshot.candles()[79].timestamp),
+            ..viewport
+        };
+
+        cx.update(|window, _| {
+            let caches = ChartPaintCaches::default();
+            let first = prepare_chart_cached(
+                &caches,
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                gpui_kit::white(),
+                &config,
+                false,
+                window,
+            );
+            assert_eq!(caches.indicators.borrow().builds, 1);
+            assert_eq!(caches.prepared.borrow().builds, 1);
+            assert!(!first.indicators.is_empty(), "MA is enabled by default");
+
+            let second = prepare_chart_cached(
+                &caches,
+                &snapshot,
+                panned,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                gpui_kit::white(),
+                &config,
+                false,
+                window,
+            );
+            assert_eq!(
+                caches.indicators.borrow().builds,
+                1,
+                "panning must not recompute the values"
+            );
+            assert_eq!(
+                caches.prepared.borrow().builds,
+                2,
+                "panning must rebuild the layout and the candle boxes"
+            );
+            assert!(Arc::ptr_eq(&first.indicators, &second.indicators));
+        });
+    }
+
+    /// The legend's value is read at the absolute index the crosshair is on,
+    /// and only past that line's own `readable_from`.
+    #[test]
+    fn the_main_legend_should_read_the_candle_under_the_cursor() {
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(0.0),
+                sub_plot_count: 1,
+            },
+        );
+        let geometry = CandleGeometry::new(layout.price_plot, 10, 9.0);
+        let visible = PreparedVisibleChart {
+            range: 10..20,
+            lowest: 0.0,
+            highest: 100.0,
+            volume_upper: 1.0,
+            geometry,
+            candles: Arc::from(Vec::new()),
+            price_ticks: Arc::from(Vec::new()),
+            volume_ticks: Arc::from(Vec::new()),
+            time_ticks: Arc::from(Vec::new()),
+            latest_price: None,
+        };
+        let cursor = point(geometry.center_x(3), layout.price_plot.origin.y + px(5.0));
+
+        assert_eq!(
+            legend_candle_index(Some(cursor), &layout, &visible),
+            Some(13),
+            "slot 3 of a range starting at 10 is candle 13"
+        );
+        assert_eq!(
+            legend_candle_index(None, &layout, &visible),
+            Some(19),
+            "without a cursor the legend reads the newest visible candle"
+        );
+
+        let price = Price::from_str("123.45").expect("price should parse");
+        let tick = Tick::from_str("0.01").expect("tick should parse");
+        let mut values = vec![None; 20];
+        values[13] = Some(price.inner() as f64);
+        let mut series = [IndicatorSeries {
+            id: crate::indicator::IndicatorId::Ma,
+            legend: SmolStr::new_static("MA"),
+            lines: vec![IndicatorLine {
+                label: SmolStr::new_static("MA5"),
+                color: gpui_kit::white(),
+                values,
+                readable_from: 14,
+                shape: LineShape::Line,
+            }],
+        }];
+        let absolute = legend_candle_index(Some(cursor), &layout, &visible)
+            .expect("the cursor is over the plot");
+
+        assert!(
+            main_indicator_legend(&series, absolute, tick).is_empty(),
+            "a candle below readable_from has no trustworthy value"
+        );
+        series[0].lines[0].readable_from = absolute;
+        let entries = main_indicator_legend(&series, absolute, tick);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "MA5 123.45");
     }
 
     fn one_candle_snapshot() -> CandlestickSeriesSnapshot {

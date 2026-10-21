@@ -4,6 +4,7 @@ mod compute;
 mod config;
 mod definition;
 
+pub(crate) use compute::*;
 pub(crate) use config::*;
 pub(crate) use definition::*;
 

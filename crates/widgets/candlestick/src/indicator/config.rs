@@ -143,9 +143,9 @@ impl CandlestickIndicatorConfig {
     /// The longest warmup requirement among the enabled indicators, in candles.
     ///
     /// The history prefetch uses it as its threshold. The numbers come from
-    /// [`line_depth`], the same function that answers an `IndicatorLine`'s
-    /// `readable_from`, so the fetch threshold and the display threshold cannot
-    /// drift apart.
+    /// [`settings_depth`], the same function that answers every one of an
+    /// indicator's `IndicatorLine::readable_from` values, so the fetch threshold
+    /// and the display thresholds cannot drift apart.
     pub(crate) fn warmup_depth(&self) -> usize {
         self.entries
             .iter()
@@ -245,7 +245,7 @@ impl IndicatorSettings {
     /// `Lines` is shared by MA/EMA/RSI and their depths differ, which is why the
     /// indicator identity is a parameter.
     pub(crate) fn warmup_depth(&self, id: IndicatorId) -> usize {
-        line_depth(id, self)
+        settings_depth(id, self)
     }
 }
 
@@ -271,25 +271,42 @@ pub(crate) enum SettingsShape {
     Kdj,
 }
 
-/// How many leading candles `settings` needs before its values are trustworthy.
+/// How many leading candles one line of `id` with `period` needs before its
+/// values are trustworthy.
+///
+/// This is the single-line half of the design's §7.2 depth table: MA and EMA
+/// need `n - 1` leading candles, RSI needs `n`.
+///
+/// The depth is a property of the **line's own period**, not of the indicator:
+/// MA with lines 5/10/20 is readable from 4, 9 and 19 respectively. Taking the
+/// indicator's longest depth for every line would hide MA5 for fifteen extra
+/// candles and, worse, would make the display threshold and the value history
+/// disagree in a way no test could see.
+pub(crate) fn line_depth(id: IndicatorId, period: u32) -> usize {
+    match id {
+        // RSI's first value is the first change, so it needs one more candle
+        // than the moving averages do.
+        IndicatorId::Rsi => period as usize,
+        _ => (period as usize).saturating_sub(1),
+    }
+}
+
+/// How many leading candles the whole `settings` value needs before every one of
+/// its values is trustworthy.
 ///
 /// One function, two call sites: the history prefetch threshold
-/// (`CandlestickIndicatorConfig::warmup_depth`) and an `IndicatorLine`'s
-/// `readable_from`. The numbers are the design's §7.2 table: MA `n - 1`, EMA
-/// `n - 1`, RSI `n`, MACD `max(short, long) - 1`, KDJ
+/// (`CandlestickIndicatorConfig::warmup_depth`) and the per-line
+/// `IndicatorLine::readable_from` values, which are computed by applying
+/// [`line_depth`] to each row. The numbers are the design's §7.2 table: MA
+/// `n - 1`, EMA `n - 1`, RSI `n`, MACD `max(short, long) - 1`, KDJ
 /// `(n - 1) + (m1 - 1) + (m2 - 1)` and VOL `0`.
-pub(crate) fn line_depth(id: IndicatorId, settings: &IndicatorSettings) -> usize {
+pub(crate) fn settings_depth(id: IndicatorId, settings: &IndicatorSettings) -> usize {
     match settings {
         IndicatorSettings::None => 0,
         IndicatorSettings::Lines(lines) => lines
             .rows
             .iter()
-            .map(|row| match id {
-                // RSI's first value is the first change, so it needs one more
-                // candle than the moving averages do.
-                IndicatorId::Rsi => row.period as usize,
-                _ => (row.period as usize).saturating_sub(1),
-            })
+            .map(|row| line_depth(id, row.period))
             .max()
             .unwrap_or(0),
         IndicatorSettings::Macd {

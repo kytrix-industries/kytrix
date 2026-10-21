@@ -1795,6 +1795,8 @@ impl CandlestickWidget {
                 viewport: self.viewport,
                 interval: self.config.timeframe,
                 countdown_label: self.countdown.label.clone(),
+                indicator_config: self.config.indicator.clone(),
+                panel_open: false,
             },
             self.chart_layout.clone(),
             self.hover_label_cache.clone(),
