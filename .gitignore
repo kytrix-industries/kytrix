@@ -7,3 +7,4 @@ longbridge-test.env
 **/.env.longbridge
 *.longbridge.env
 .docs
+**/.DS_Store
