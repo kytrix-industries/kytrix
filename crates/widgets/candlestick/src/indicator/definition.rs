@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{IndicatorLineConfig, IndicatorSettings, LineListConfig};
+use super::config::{
+    IndicatorLineConfig, IndicatorSettings, LineListConfig, PERIOD_MAX, PERIOD_MIN,
+};
 
 /// An indicator's identity in the catalogue.
 ///
@@ -41,6 +43,57 @@ pub(crate) enum IndicatorPane {
     Sub,
 }
 
+/// The identity of one settings row inside its indicator.
+///
+/// An enum rather than a `SmolStr`: which settings an indicator has is a
+/// compile-time fact. It is not persisted — the persisted names are the field
+/// names of [`IndicatorSettings`], which serde owns — so it derives no serde
+/// implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingKey {
+    Period,
+    ShortPeriod,
+    LongPeriod,
+    SignalPeriod,
+    Smoothing1,
+    Smoothing2,
+    Lines,
+    Dif,
+    Dea,
+    K,
+    D,
+    J,
+}
+
+/// The shape of the control a settings row is drawn as.
+///
+/// Three variants and no extension point: every settings item the catalogue
+/// declares is one of these. An indicator that needs another shape adds a
+/// variant and makes the panel handle it, rather than growing an abstraction
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingControl {
+    /// An integer input, for the period-like parameters.
+    Period { min: u32, max: u32 },
+    /// A checkbox, for "draw this line or not".
+    Switch,
+    /// A list of lines: each row is a period, a colour and a delete button, with
+    /// one "+" button under the last row.
+    LineList { min_rows: usize },
+}
+
+/// One settings row as the panel draws it.
+pub(crate) struct SettingRow {
+    /// This row's identity inside its indicator: the key of the input entity it
+    /// owns, the selector a test reads, and half of what pairs the row with the
+    /// settings value it edits. It is not persisted.
+    pub key: SettingKey,
+    /// The i18n key of the row's label.
+    pub label_key: &'static str,
+    /// The control this row is drawn as.
+    pub control: SettingControl,
+}
+
 /// A full declaration of one indicator.
 ///
 /// `default_settings` is a function pointer rather than a closure: a closure
@@ -49,8 +102,14 @@ pub(crate) enum IndicatorPane {
 /// `Vec` inside a line list needs.
 pub(crate) struct IndicatorDefinition {
     pub id: IndicatorId,
+    /// The i18n key of the title the panel lists this indicator under. The chart
+    /// legend spells its own labels; this one is the panel's.
+    pub name_key: &'static str,
     /// Which region of the chart the indicator draws in.
     pub pane: IndicatorPane,
+    /// The settings rows the panel draws under this indicator, top to bottom.
+    /// Empty means the indicator has nothing to configure.
+    pub rows: &'static [SettingRow],
     /// Whether a configuration starts with this indicator enabled.
     pub enabled_by_default: bool,
     /// The default settings value. Its shape must be the one `expected_shape`
@@ -155,44 +214,139 @@ fn kdj_default_settings() -> IndicatorSettings {
 pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
     IndicatorDefinition {
         id: IndicatorId::Ma,
+        name_key: "widget.candlestick.indicator.ma",
         pane: IndicatorPane::Main,
         enabled_by_default: true,
         default_settings: ma_default_settings,
+        rows: &[SettingRow {
+            key: SettingKey::Lines,
+            label_key: "widget.candlestick.indicator.lines",
+            control: SettingControl::LineList { min_rows: 1 },
+        }],
     },
     IndicatorDefinition {
         id: IndicatorId::Ema,
+        name_key: "widget.candlestick.indicator.ema",
         pane: IndicatorPane::Main,
         enabled_by_default: false,
         default_settings: ema_default_settings,
+        rows: &[SettingRow {
+            key: SettingKey::Lines,
+            label_key: "widget.candlestick.indicator.lines",
+            control: SettingControl::LineList { min_rows: 1 },
+        }],
     },
     IndicatorDefinition {
         id: IndicatorId::Vol,
+        name_key: "widget.candlestick.indicator.vol",
         pane: IndicatorPane::Sub,
         enabled_by_default: true,
         default_settings: vol_default_settings,
+        // Volume has nothing to configure, which is what makes it the one
+        // indicator that is neither expandable nor collapsible.
+        rows: &[],
     },
     IndicatorDefinition {
         id: IndicatorId::Macd,
+        name_key: "widget.candlestick.indicator.macd",
         pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: macd_default_settings,
+        rows: &[
+            SettingRow {
+                key: SettingKey::ShortPeriod,
+                label_key: "widget.candlestick.indicator.short_period",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::LongPeriod,
+                label_key: "widget.candlestick.indicator.long_period",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::SignalPeriod,
+                label_key: "widget.candlestick.indicator.signal_period",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::Dif,
+                label_key: "widget.candlestick.indicator.dif",
+                control: SettingControl::Switch,
+            },
+            SettingRow {
+                key: SettingKey::Dea,
+                label_key: "widget.candlestick.indicator.dea",
+                control: SettingControl::Switch,
+            },
+        ],
     },
     IndicatorDefinition {
         id: IndicatorId::Rsi,
+        name_key: "widget.candlestick.indicator.rsi",
         pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: rsi_default_settings,
+        rows: &[SettingRow {
+            key: SettingKey::Lines,
+            label_key: "widget.candlestick.indicator.lines",
+            control: SettingControl::LineList { min_rows: 1 },
+        }],
     },
     IndicatorDefinition {
         id: IndicatorId::Kdj,
+        name_key: "widget.candlestick.indicator.kdj",
         pane: IndicatorPane::Sub,
         enabled_by_default: false,
         default_settings: kdj_default_settings,
+        rows: &[
+            SettingRow {
+                key: SettingKey::Period,
+                label_key: "widget.candlestick.indicator.period",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::Smoothing1,
+                label_key: "widget.candlestick.indicator.smoothing_1",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::Smoothing2,
+                label_key: "widget.candlestick.indicator.smoothing_2",
+                control: SettingControl::Period {
+                    min: PERIOD_MIN,
+                    max: PERIOD_MAX,
+                },
+            },
+            SettingRow {
+                key: SettingKey::K,
+                label_key: "widget.candlestick.indicator.k",
+                control: SettingControl::Switch,
+            },
+            SettingRow {
+                key: SettingKey::D,
+                label_key: "widget.candlestick.indicator.d",
+                control: SettingControl::Switch,
+            },
+            SettingRow {
+                key: SettingKey::J,
+                label_key: "widget.candlestick.indicator.j",
+                control: SettingControl::Switch,
+            },
+        ],
     },
 ];
-
-// TODO(§6): the panel's settings rows (`SettingRow`, `SettingControl`,
-// `SettingKey` and `IndicatorDefinition::rows`) land with their first reader,
-// the panel's editor. Declaring them before anything reads them would be dead
-// code, so this stage's catalogue carries only what the configuration, the
-// computation and the main-chart painter use.

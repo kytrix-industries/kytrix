@@ -1,13 +1,16 @@
-//! The catalogue's own invariants: its order and the default settings value each
-//! indicator is completed with.
+//! The catalogue's own invariants: its order, the settings each indicator
+//! declares, and the default value it is completed with.
 //!
-//! The catalogue's display data (`rows`, `label_key`, `name_key`) is not
-//! declared yet, so the tests that read it belong to the stages that first read
-//! it — see the note at the end of this file.
+//! Two of the design's checks are deliberately not here: the name keys being
+//! present in both languages (§9.2) and the period bounds matching the
+//! `period_invalid` message (§9.1). Both need data the i18n stage adds, and the
+//! note at the end of this file points at them.
 
 use super::{
-    config::expected_shape,
-    definition::{INDICATOR_CATALOG, IndicatorId, IndicatorPane},
+    config::{SettingsShape, expected_shape},
+    definition::{
+        INDICATOR_CATALOG, IndicatorId, IndicatorPane, SettingControl, SettingKey, SettingRow,
+    },
 };
 use crate::chart::geometry::SUB_PLOT_INLINE;
 
@@ -28,6 +31,39 @@ fn catalogue_order() -> Vec<IndicatorId> {
         .collect()
 }
 
+/// The settings rows a value of `shape` is edited through, in the order its
+/// fields are declared.
+///
+/// This is the other half of the correspondence `expected_shape` states: that
+/// function says which variant an indicator holds, this one says which rows edit
+/// it. `Lines` is one row because a line list edits every line through the same
+/// control; the two struct variants name their fields one by one.
+fn rows_of(shape: SettingsShape) -> &'static [SettingKey] {
+    match shape {
+        SettingsShape::None => &[],
+        SettingsShape::Lines => &[SettingKey::Lines],
+        SettingsShape::Macd => &[
+            SettingKey::ShortPeriod,
+            SettingKey::LongPeriod,
+            SettingKey::SignalPeriod,
+            SettingKey::Dif,
+            SettingKey::Dea,
+        ],
+        SettingsShape::Kdj => &[
+            SettingKey::Period,
+            SettingKey::Smoothing1,
+            SettingKey::Smoothing2,
+            SettingKey::K,
+            SettingKey::D,
+            SettingKey::J,
+        ],
+    }
+}
+
+fn declared_keys(rows: &[SettingRow]) -> Vec<SettingKey> {
+    rows.iter().map(|row| row.key).collect()
+}
+
 // ① Each `IndicatorId` appears exactly once, in catalogue order.
 #[test]
 fn every_indicator_should_appear_exactly_once_in_catalogue_order() {
@@ -38,18 +74,74 @@ fn every_indicator_should_appear_exactly_once_in_catalogue_order() {
     );
 }
 
-// ② Every indicator's default settings value holds the shape `expected_shape`
-// declares for it. The catalogue's rows are checked against that same answer in
-// §6, where they are declared.
+// ② The rows an indicator declares are the settings its default value holds:
+// the same shape `expected_shape` names, and the very keys that shape's fields
+// are. A catalogue that says "Lines" while its default is MACD's is caught here
+// rather than by `normalize` quietly repairing it when a configuration is
+// decoded.
 #[test]
-fn every_indicator_should_default_to_its_declared_shape() {
+fn every_indicators_rows_should_edit_the_shape_its_defaults_hold() {
     for definition in INDICATOR_CATALOG {
+        let shape = expected_shape(definition.id);
         assert_eq!(
             (definition.default_settings)().shape(),
-            expected_shape(definition.id),
+            shape,
             "{:?} defaults to the wrong settings shape",
             definition.id
         );
+        assert_eq!(
+            declared_keys(definition.rows),
+            rows_of(shape),
+            "{:?} declares rows that edit another settings shape",
+            definition.id
+        );
+        // Every row's label is part of the element id its panel row is drawn
+        // under, so two rows sharing one would be two rows the window cannot
+        // tell apart.
+        for (index, row) in definition.rows.iter().enumerate() {
+            assert!(
+                definition.rows[..index]
+                    .iter()
+                    .all(|earlier| earlier.label_key != row.label_key),
+                "{:?} declares two rows labelled {}",
+                definition.id,
+                row.label_key
+            );
+        }
+    }
+}
+
+// ③ Every `Period` control declares a range with room in it.
+#[test]
+fn every_period_row_should_declare_a_non_empty_range() {
+    for definition in INDICATOR_CATALOG {
+        for row in definition.rows {
+            if let SettingControl::Period { min, max } = row.control {
+                assert!(
+                    min < max,
+                    "{:?}::{:?} declares {min}..={max}, which accepts no period",
+                    definition.id,
+                    row.key
+                );
+            }
+        }
+    }
+}
+
+// ④ A line list always asks for at least the one line its value has to hold.
+#[test]
+fn every_line_list_row_should_require_at_least_one_line() {
+    for definition in INDICATOR_CATALOG {
+        for row in definition.rows {
+            if let SettingControl::LineList { min_rows } = row.control {
+                assert!(
+                    min_rows >= 1,
+                    "{:?}::{:?} allows an empty line list, which its settings value cannot hold",
+                    definition.id,
+                    row.key
+                );
+            }
+        }
     }
 }
 
@@ -69,7 +161,5 @@ fn the_sub_plot_indicators_should_fit_the_inline_capacity() {
     );
 }
 
-// ③ Period 控件的 min < max 与 ④ LineList 的 min_rows >= 1（以及 ② 中 rows 的
-//    SettingKey 一致性）—— 在 §6 随 rows/control 一起补
 // ⑤ 名称 key 在两种语言都非空 —— 见 implementation-plan §9.2
 // ⑦ Period 的边界与 period_invalid 文案一致 —— 见 implementation-plan §9.1

@@ -6,9 +6,23 @@
 //! different catalogue — so [`CandlestickIndicatorConfig::normalize`] restores
 //! the invariants the type documents.
 
+use gpui_kit::{Rgba, hsla};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{INDICATOR_CATALOG, IndicatorId, IndicatorPane, default_line_color, definition_of};
+use super::{
+    INDICATOR_CATALOG, IndicatorId, IndicatorPane, SettingKey, default_line_color, definition_of,
+};
+
+/// The smallest period a setting may take.
+///
+/// The range is one answer rather than three: [`CandlestickIndicatorConfig::normalize`]
+/// clamps stored values into it, the catalogue's `Period` rows are declared with it, and
+/// the panel rejects typed text outside it. The `period_invalid` message names the same
+/// two numbers, which a test pins.
+pub(crate) const PERIOD_MIN: u32 = 1;
+
+/// The largest period a setting may take.
+pub(crate) const PERIOD_MAX: u32 = 500;
 
 /// One indicator line's settings.
 ///
@@ -93,7 +107,7 @@ pub(crate) struct IndicatorEntry {
 ///    missing entry;
 /// 2. every `settings` has the shape the indicator's catalogue rows edit;
 /// 3. every `Lines.rows` is non-empty;
-/// 4. every period is within `1..=500`.
+/// 4. every period is within [`PERIOD_MIN`]`..=`[`PERIOD_MAX`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CandlestickIndicatorConfig {
     /// One entry per indicator, in catalogue order. The panel's open state is
@@ -154,6 +168,94 @@ impl CandlestickIndicatorConfig {
             .max()
             .unwrap_or(0)
     }
+
+    /// The entry of `id`, if the configuration holds one.
+    pub(crate) fn entry(&self, id: IndicatorId) -> Option<&IndicatorEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    /// Sets the period of one line of `id`'s list.
+    ///
+    /// Returns whether the value was applied: the index is `Some` only for a
+    /// line list the panel drew, and a stale one is a value that is not there.
+    pub(crate) fn set_line_period(&mut self, id: IndicatorId, index: usize, period: u32) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let Some(line) = entry
+            .settings
+            .lines_mut()
+            .and_then(|lines| lines.rows.get_mut(index))
+        else {
+            return false;
+        };
+        line.period = period.clamp(PERIOD_MIN, PERIOD_MAX);
+        true
+    }
+
+    /// Sets the value of one named period setting of `id`, such as MACD's short
+    /// period.
+    pub(crate) fn set_setting_period(
+        &mut self,
+        id: IndicatorId,
+        key: SettingKey,
+        period: u32,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry
+            .settings
+            .set_period(key, period.clamp(PERIOD_MIN, PERIOD_MAX))
+    }
+
+    /// Sets one named switch of `id`, such as MACD's DIF.
+    pub(crate) fn set_switch(&mut self, id: IndicatorId, key: SettingKey, on: bool) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.settings.set_switch(key, on)
+    }
+
+    /// Appends a line to `id`'s list.
+    ///
+    /// The period is the indicator's own default, so a new line starts somewhere
+    /// the user recognizes rather than at an arbitrary value; the colour is the
+    /// random one the design gives a line the user asked for (design §10.2).
+    /// Returns whether the line was added: only a line-list setting has room for
+    /// one.
+    pub(crate) fn add_line(&mut self, id: IndicatorId) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let Some(lines) = entry.settings.lines_mut() else {
+            return false;
+        };
+        lines.rows.push(IndicatorLineConfig {
+            period: default_line_period(id),
+            color: random_line_color(),
+        });
+        true
+    }
+
+    /// Removes one line from `id`'s list.
+    ///
+    /// The last line is never removed: a line list is never empty, and the panel
+    /// disables the button that would ask for it. Returns whether a line was
+    /// removed.
+    pub(crate) fn remove_line(&mut self, id: IndicatorId, index: usize) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let Some(lines) = entry.settings.lines_mut() else {
+            return false;
+        };
+        if lines.rows.len() <= 1 || index >= lines.rows.len() {
+            return false;
+        }
+        lines.rows.remove(index);
+        true
+    }
 }
 
 impl Default for CandlestickIndicatorConfig {
@@ -201,6 +303,77 @@ impl IndicatorSettings {
         }
     }
 
+    /// The line list this value holds, if it holds one.
+    pub(crate) fn lines(&self) -> Option<&LineListConfig> {
+        match self {
+            Self::Lines(lines) => Some(lines),
+            _ => None,
+        }
+    }
+
+    fn lines_mut(&mut self) -> Option<&mut LineListConfig> {
+        match self {
+            Self::Lines(lines) => Some(lines),
+            _ => None,
+        }
+    }
+
+    /// The period one named setting holds.
+    ///
+    /// `None` means this value has no such setting: the panel only asks about
+    /// keys the indicator's catalogue rows declare, so an answer of `None` is a
+    /// row and a value that have drifted apart rather than a user error.
+    pub(crate) fn period(&self, key: SettingKey) -> Option<u32> {
+        match (self, key) {
+            (Self::Macd { short_period, .. }, SettingKey::ShortPeriod) => Some(*short_period),
+            (Self::Macd { long_period, .. }, SettingKey::LongPeriod) => Some(*long_period),
+            (Self::Macd { signal_period, .. }, SettingKey::SignalPeriod) => Some(*signal_period),
+            (Self::Kdj { period, .. }, SettingKey::Period) => Some(*period),
+            (Self::Kdj { smoothing_1, .. }, SettingKey::Smoothing1) => Some(*smoothing_1),
+            (Self::Kdj { smoothing_2, .. }, SettingKey::Smoothing2) => Some(*smoothing_2),
+            _ => None,
+        }
+    }
+
+    /// Writes one named period setting. Returns whether this value has it.
+    fn set_period(&mut self, key: SettingKey, period: u32) -> bool {
+        match (self, key) {
+            (Self::Macd { short_period, .. }, SettingKey::ShortPeriod) => *short_period = period,
+            (Self::Macd { long_period, .. }, SettingKey::LongPeriod) => *long_period = period,
+            (Self::Macd { signal_period, .. }, SettingKey::SignalPeriod) => *signal_period = period,
+            (Self::Kdj { period: value, .. }, SettingKey::Period) => *value = period,
+            (Self::Kdj { smoothing_1, .. }, SettingKey::Smoothing1) => *smoothing_1 = period,
+            (Self::Kdj { smoothing_2, .. }, SettingKey::Smoothing2) => *smoothing_2 = period,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether one named switch is on.
+    pub(crate) fn switch(&self, key: SettingKey) -> Option<bool> {
+        match (self, key) {
+            (Self::Macd { dif, .. }, SettingKey::Dif) => Some(*dif),
+            (Self::Macd { dea, .. }, SettingKey::Dea) => Some(*dea),
+            (Self::Kdj { k, .. }, SettingKey::K) => Some(*k),
+            (Self::Kdj { d, .. }, SettingKey::D) => Some(*d),
+            (Self::Kdj { j, .. }, SettingKey::J) => Some(*j),
+            _ => None,
+        }
+    }
+
+    /// Writes one named switch. Returns whether this value has it.
+    fn set_switch(&mut self, key: SettingKey, on: bool) -> bool {
+        match (self, key) {
+            (Self::Macd { dif, .. }, SettingKey::Dif) => *dif = on,
+            (Self::Macd { dea, .. }, SettingKey::Dea) => *dea = on,
+            (Self::Kdj { k, .. }, SettingKey::K) => *k = on,
+            (Self::Kdj { d, .. }, SettingKey::D) => *d = on,
+            (Self::Kdj { j, .. }, SettingKey::J) => *j = on,
+            _ => return false,
+        }
+        true
+    }
+
     /// Rules 4–6 of [`CandlestickIndicatorConfig::normalize`], in order.
     fn normalized(mut self, id: IndicatorId) -> Self {
         // Rule 4: the value's shape must be the one the catalogue declares for
@@ -230,7 +403,7 @@ impl IndicatorSettings {
             Self::None => {}
             Self::Lines(lines) => {
                 for row in &mut lines.rows {
-                    row.period = row.period.clamp(1, 500);
+                    row.period = row.period.clamp(PERIOD_MIN, PERIOD_MAX);
                 }
             }
             Self::Macd {
@@ -239,9 +412,9 @@ impl IndicatorSettings {
                 signal_period,
                 ..
             } => {
-                *short_period = (*short_period).clamp(1, 500);
-                *long_period = (*long_period).clamp(1, 500);
-                *signal_period = (*signal_period).clamp(1, 500);
+                *short_period = (*short_period).clamp(PERIOD_MIN, PERIOD_MAX);
+                *long_period = (*long_period).clamp(PERIOD_MIN, PERIOD_MAX);
+                *signal_period = (*signal_period).clamp(PERIOD_MIN, PERIOD_MAX);
             }
             Self::Kdj {
                 period,
@@ -249,9 +422,9 @@ impl IndicatorSettings {
                 smoothing_2,
                 ..
             } => {
-                *period = (*period).clamp(1, 500);
-                *smoothing_1 = (*smoothing_1).clamp(1, 500);
-                *smoothing_2 = (*smoothing_2).clamp(1, 500);
+                *period = (*period).clamp(PERIOD_MIN, PERIOD_MAX);
+                *smoothing_1 = (*smoothing_1).clamp(PERIOD_MIN, PERIOD_MAX);
+                *smoothing_2 = (*smoothing_2).clamp(PERIOD_MIN, PERIOD_MAX);
             }
         }
     }
@@ -375,8 +548,23 @@ fn default_line_period(id: IndicatorId) -> u32 {
         .period
 }
 
-// TODO(§6): `random_line_color` — the colour a line the user just added gets —
-// lands together with the panel's "+" button, its first and only caller. The
-// design's §10.2 fixes its shape: a random hue with saturation and lightness
-// clamped to a readable band, converted through `gpui_kit`'s `hsla`/`Rgba`, and
-// stored in `IndicatorLineConfig.color` from then on.
+/// A colour for a line the user just added.
+///
+/// This is the temporary measure the design's §10.2 records: a line the user adds
+/// gets a random colour instead of a theme role, and that colour is stored from
+/// then on. Only the *new* line is unpredictable, which is why the defaults are
+/// fixed constants instead.
+fn random_line_color() -> [u8; 4] {
+    let hue = rand::random_range(0.0_f32..1.0);
+    // Saturation and lightness are clamped to a readable band; the magnitudes
+    // follow the contrast the theme asks of `chart.series[n]` (`roles.rs:556-573`).
+    let saturation = rand::random_range(0.45_f32..=0.75);
+    let lightness = rand::random_range(0.45_f32..=0.70);
+    let rgba = Rgba::from(hsla(hue, saturation, lightness, 1.0));
+    [
+        (rgba.r * 255.0).round() as u8,
+        (rgba.g * 255.0).round() as u8,
+        (rgba.b * 255.0).round() as u8,
+        (rgba.a * 255.0).round() as u8,
+    ]
+}

@@ -4,5 +4,7 @@ mod inputs;
 mod rows;
 mod view;
 
+pub(crate) use view::{IndicatorPanel, PANEL_WIDTH};
+
 #[cfg(test)]
-mod tests;
+mod view_tests;

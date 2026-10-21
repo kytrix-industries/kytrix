@@ -29,17 +29,24 @@ use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
+    button::Button,
     empty_state::EmptyState,
+    icon::{Icon, IconKind},
     interactive::InteractiveVariantExt,
     menu::{MenuItem, MenuItemAction, MenuItemGroup},
     select::Select,
+    separator::Separator,
     size::UnifiedSizable,
+    tooltip::TooltipExt,
 };
 use gpui_kit::{
-    AnyElement, App, Context, CursorStyle, ElementId, Entity, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, base::Disableable, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, CursorStyle, ElementId, Entity, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    base::{Disableable, Selectable},
+    div,
+    prelude::FluentBuilder,
+    px,
 };
 use i18n::t;
 use instrument_selector_ui::{
@@ -87,6 +94,7 @@ use super::{
     },
     indicator::{CandlestickIndicatorConfig, normalize_indicator},
     model::CandlestickSeriesSnapshot,
+    panel::{IndicatorPanel, PANEL_WIDTH},
     service::{
         CandlestickProtocol, CandlestickRequest, CandlestickResponse, CandlestickService,
         CandlestickServiceError, CandlestickSource, CandlestickStatus, CandlestickStreamKey,
@@ -466,6 +474,18 @@ pub struct CandlestickWidget {
     published_adjustments: Rc<dyn Fn(&VenueRoute) -> Result<Vec<Adjustment>, MarketError>>,
     /// Wakes the chart when the zone its timestamps are read in moves.
     _time_zone: Option<Subscription>,
+    /// Whether the settings panel is open.
+    ///
+    /// Not persisted: the panel is a view state, and a pane always starts with it
+    /// closed. It is also half of the chart's own width answer — the panel takes
+    /// its space out of the plot — which is why the canvas options carry it.
+    panel_open: bool,
+    /// The panel entity, and the only strong reference to it.
+    ///
+    /// The panel holds the widget weakly, so this edge is what keeps it alive;
+    /// the reverse edge being weak is what keeps the two from forming a cycle and
+    /// from keeping a closed pane's settings editable forever.
+    panel: Option<Entity<IndicatorPanel>>,
 }
 
 impl WidgetView for CandlestickWidget {
@@ -539,6 +559,7 @@ impl WidgetView for CandlestickWidget {
             .flex()
             .items_center()
             .gap_1()
+            .child(self.indicator_settings_button(cx))
             .children(self.adjustment_select(cx))
             .child(self.timeframe_select(cx));
         WidgetHeader::empty()
@@ -612,6 +633,8 @@ impl CandlestickWidget {
             published_timeframes,
             published_adjustments,
             _time_zone: notify_on_data_time_zone_change(cx),
+            panel_open: false,
+            panel: None,
         }
     }
 
@@ -661,6 +684,11 @@ impl CandlestickWidget {
     fn wait_for_market(&mut self, cx: &mut Context<Self>) {
         self.awaiting_market = true;
         self.clear_loaded_state();
+        // The settings panel edits a configuration that only means something while
+        // a chart is reading a market, so it goes with the chart rather than
+        // floating over the notice. Whether it comes back is the user's choice,
+        // not a state this pane remembers.
+        self.close_indicator_panel();
         self.report_notice(cx);
         cx.notify();
     }
@@ -1430,6 +1458,85 @@ impl CandlestickWidget {
             .into_any_element()
     }
 
+    /// Whether the indicator settings are something the user can open.
+    ///
+    /// The panel edits the settings of the chart that is on screen, so it is only
+    /// offered once there is one: a market this chart can read, and a listing
+    /// chosen in it.
+    fn indicator_settings_available(&self, cx: &App) -> bool {
+        self.market_ready(cx) && self.config.selection.is_some()
+    }
+
+    /// The control that opens and closes the indicator settings panel.
+    ///
+    /// It states whether the panel is open, so the header and the body cannot
+    /// disagree about it. A disabled `Button` only looks disabled — the handler it
+    /// was given still runs — so the unavailable button is given none, and the
+    /// action itself asks again before it changes anything.
+    fn indicator_settings_button(&self, cx: &Context<Self>) -> AnyElement {
+        let available = self.indicator_settings_available(cx);
+        let label = t!(cx, "widget.candlestick.indicator.settings");
+        let widget = cx.entity().downgrade();
+
+        div()
+            .debug_selector(|| "TEST_CANDLESTICK_INDICATOR_SETTINGS".into())
+            // The header is also the pane's drag area; a control in it says so.
+            .occlude()
+            .child(
+                Button::new(ElementId::Name(SharedString::new_static(
+                    "CandlestickIndicatorSettings",
+                )))
+                .ghost()
+                .small()
+                .selected(self.panel_open)
+                .disabled(!available)
+                .aria_label(label.clone())
+                .with_tooltip(label)
+                .when(available, |button| {
+                    button.on_click(move |_, _, cx| {
+                        let Some(widget) = widget.upgrade() else {
+                            return;
+                        };
+                        widget.update(cx, |widget, cx| {
+                            if widget.indicator_settings_available(cx) {
+                                widget.toggle_indicator_panel(cx);
+                            }
+                        });
+                    })
+                })
+                .child(Icon::new(IconKind::Faders).size_3()),
+            )
+            .into_any_element()
+    }
+
+    /// Opens the settings panel, or closes and drops it.
+    ///
+    /// Nothing is published: whether the panel is open is not a persisted option,
+    /// so a pane that is opened again starts with it closed. Closing drops the
+    /// entity, which throws away the panel's own state with it — reopening starts
+    /// from the catalogue's default (every indicator with settings expanded).
+    fn toggle_indicator_panel(&mut self, cx: &mut Context<Self>) {
+        self.panel_open = !self.panel_open;
+        if self.panel_open {
+            let widget = cx.entity().downgrade();
+            self.panel = Some(cx.new(|cx| IndicatorPanel::new(widget, cx)));
+        } else {
+            self.panel = None;
+        }
+        cx.notify();
+    }
+
+    /// Drops the settings panel without publishing anything.
+    ///
+    /// Used when the chart loses its market: the panel edits a configuration that
+    /// only means something while a chart is reading one, so it does not stay
+    /// floating over an empty body. The market coming back does not reopen it —
+    /// the panel's open state is the user's, and nothing remembers it for them.
+    fn close_indicator_panel(&mut self) {
+        self.panel_open = false;
+        self.panel = None;
+    }
+
     /// Keeps the countdown moving without a frame per second of its own.
     ///
     /// The task wakes exactly when the label would change, and repaints only
@@ -1698,6 +1805,36 @@ impl CandlestickWidget {
         true
     }
 
+    /// The indicator settings the panel draws and edits.
+    ///
+    /// Read from the one place that stores them rather than copied into the
+    /// panel: a second copy would be a second thing to keep in step with what was
+    /// published.
+    pub(crate) fn indicator_config(&self) -> &CandlestickIndicatorConfig {
+        &self.config.indicator
+    }
+
+    /// Replaces the indicator settings and writes them back.
+    ///
+    /// One entry point rather than letting the panel assign the field: publishing
+    /// is what makes a change survive a restart, and a second place that assigned
+    /// the field without publishing would be a change that only lives in memory.
+    /// The content comparison comes first because every field of the panel
+    /// commits on blur, and a commit that changed nothing should neither write nor
+    /// repaint the chart.
+    pub(crate) fn set_indicator_config(
+        &mut self,
+        indicator: CandlestickIndicatorConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.indicator == indicator {
+            return;
+        }
+        self.config.indicator = indicator;
+        self.config_change.publish(cx);
+        cx.notify();
+    }
+
     /// How many extra candles the enabled indicators need before their values
     /// are trustworthy.
     ///
@@ -1796,7 +1933,10 @@ impl CandlestickWidget {
                 interval: self.config.timeframe,
                 countdown_label: self.countdown.label.clone(),
                 indicator_config: self.config.indicator.clone(),
-                panel_open: false,
+                // Opening the panel narrows the plot, which is what makes the
+                // canvas re-resolve its layout and ask for the page the wider
+                // chart now needs when the panel closes again.
+                panel_open: self.panel_open,
             },
             self.chart_layout.clone(),
             self.hover_label_cache.clone(),
@@ -1804,91 +1944,88 @@ impl CandlestickWidget {
             on_layout_change,
         );
 
-        div()
-            .id(ElementId::Name(SharedString::new_static(
-                "CandlestickChart",
-            )))
-            .aria_label(t!(cx, "widget.candlestick.chart"))
-            .size_full()
-            .min_h_0()
-            .overflow_hidden()
-            .cursor(if self.dragging {
-                CursorStyle::ClosedHand
-            } else {
-                CursorStyle::Crosshair
-            })
-            .on_mouse_down(MouseButton::Left, {
-                let widget = widget.clone();
-                move |event, _, app| {
-                    widget.update(app, |this, cx| {
-                        if this.begin_drag(event.position.x) {
-                            cx.notify();
-                        }
-                    });
-                    // The pane treats any mouse down as "this pane was clicked";
-                    // a drag inside the chart is not that.
-                    app.stop_propagation();
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let widget = widget.clone();
-                move |event, _, app| {
-                    widget.update(app, |this, cx| {
-                        if this.end_drag(Some(event.position)) {
-                            cx.notify();
-                        }
-                    });
-                }
-            })
-            .on_mouse_up_out(MouseButton::Left, {
-                let widget = widget.clone();
-                move |_, _, app| {
-                    widget.update(app, |this, cx| {
-                        if this.end_drag(None) {
-                            cx.notify();
-                        }
-                    });
-                }
-            })
-            .on_mouse_move({
-                let widget = widget.clone();
-                move |event, window, app| {
-                    widget.update(app, |this, cx| {
-                        this.queue_mouse_move(event.position, event.dragging(), window, cx);
-                    });
-                }
-            })
-            .on_hover({
-                let widget = widget.clone();
-                move |hovering, _, app| {
-                    if !*hovering {
+        let chart =
+            div()
+                .id(ElementId::Name(SharedString::new_static(
+                    "CandlestickChart",
+                )))
+                .aria_label(t!(cx, "widget.candlestick.chart"))
+                .size_full()
+                .min_h_0()
+                .overflow_hidden()
+                .cursor(if self.dragging {
+                    CursorStyle::ClosedHand
+                } else {
+                    CursorStyle::Crosshair
+                })
+                .on_mouse_down(MouseButton::Left, {
+                    let widget = widget.clone();
+                    move |event, _, app| {
+                        widget.update(app, |this, cx| {
+                            if this.begin_drag(event.position.x) {
+                                cx.notify();
+                            }
+                        });
+                        // The pane treats any mouse down as "this pane was clicked";
+                        // a drag inside the chart is not that.
+                        app.stop_propagation();
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, {
+                    let widget = widget.clone();
+                    move |event, _, app| {
+                        widget.update(app, |this, cx| {
+                            if this.end_drag(Some(event.position)) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .on_mouse_up_out(MouseButton::Left, {
+                    let widget = widget.clone();
+                    move |_, _, app| {
                         widget.update(app, |this, cx| {
                             if this.end_drag(None) {
                                 cx.notify();
                             }
                         });
                     }
-                }
-            })
-            .on_scroll_wheel(move |event, window, app| {
-                widget.update(app, |this, cx| {
-                    this.handle_scroll(event, window, cx);
-                });
-                // The chart zooms rather than letting the page scroll.
-                app.stop_propagation();
-            })
-            // A snapshot with no candles draws axes and no series, which leaves the
-            // plot and a chart that failed to load looking the same. The snapshot is
-            // still the pane's content — the venue published it — so the pane says
-            // what it holds over the plot rather than letting the framework's
-            // placeholder speak for it.
-            .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .min_h_0()
-                    .child(chart)
-                    .when(!has_candles, |this| {
+                })
+                .on_mouse_move({
+                    let widget = widget.clone();
+                    move |event, window, app| {
+                        widget.update(app, |this, cx| {
+                            this.queue_mouse_move(event.position, event.dragging(), window, cx);
+                        });
+                    }
+                })
+                .on_hover({
+                    let widget = widget.clone();
+                    move |hovering, _, app| {
+                        if !*hovering {
+                            widget.update(app, |this, cx| {
+                                if this.end_drag(None) {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                })
+                .on_scroll_wheel(move |event, window, app| {
+                    widget.update(app, |this, cx| {
+                        this.handle_scroll(event, window, cx);
+                    });
+                    // The chart zooms rather than letting the page scroll.
+                    app.stop_propagation();
+                })
+                // A snapshot with no candles draws axes and no series, which leaves the
+                // plot and a chart that failed to load looking the same. The snapshot is
+                // still the pane's content — the venue published it — so the pane says
+                // what it holds over the plot rather than letting the framework's
+                // placeholder speak for it.
+                .child(div().relative().size_full().min_h_0().child(chart).when(
+                    !has_candles,
+                    |this| {
                         this.child(
                             div()
                                 .absolute()
@@ -1901,8 +2038,36 @@ impl CandlestickWidget {
                                     t!(cx, "common.no_data"),
                                 )),
                         )
-                    }),
-            )
+                    },
+                ))
+                .into_any_element();
+
+        // The plot and the settings sit in one row: the plot takes whatever the
+        // panel does not. Both sides are decided by this frame alone — the panel
+        // is drawn whenever it is open, however narrow the pane is, because
+        // `Render` cannot measure the box it is given.
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .child(div().flex_1().min_w_0().min_h_0().child(chart))
+            .when(self.panel_open, |this| {
+                this.child(Separator::vertical())
+                    .child(self.panel.as_ref().map_or_else(
+                        // No entity means the panel is being replaced; the width
+                        // stays reserved either way, so the plot does not jump out
+                        // and back in.
+                        || div().w(px(PANEL_WIDTH)).flex_none().into_any_element(),
+                        |panel| {
+                            div()
+                                .w(px(PANEL_WIDTH))
+                                .flex_none()
+                                .h_full()
+                                .child(panel.clone())
+                                .into_any_element()
+                        },
+                    ))
+            })
             .into_any_element()
     }
 }
@@ -1940,7 +2105,7 @@ fn loaded_scopes(cx: &App) -> Arc<[LoadedScope]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         cell::Cell,
         rc::Rc,
@@ -2068,7 +2233,7 @@ mod tests {
     }
 
     /// A config that already follows the fixture route's published listing.
-    fn config() -> CandlestickConfig {
+    pub(crate) fn config() -> CandlestickConfig {
         CandlestickConfig {
             selection: Some(selection()),
             timeframe: TimeFrame::Minute1,
@@ -2720,15 +2885,15 @@ mod tests {
     }
 
     /// Everything one test drives the widget with.
-    struct WidgetUnderTest {
-        widget: Entity<CandlestickWidget>,
+    pub(crate) struct WidgetUnderTest {
+        pub widget: Entity<CandlestickWidget>,
         /// Counts the reports the widget published for its persisted config.
         config_reports: Rc<Cell<usize>>,
     }
 
     impl WidgetUnderTest {
         /// How many times the widget reported its persisted config as changed.
-        fn reports(&self) -> usize {
+        pub(crate) fn reports(&self) -> usize {
             self.config_reports.get()
         }
     }
@@ -2885,7 +3050,7 @@ mod tests {
     }
 
     /// The same, over a directory that publishes the charted listing.
-    fn widget(cx: &mut TestAppContext) -> WidgetUnderTest {
+    pub(crate) fn widget(cx: &mut TestAppContext) -> WidgetUnderTest {
         let built = widget_over(cx, config(), vec![entry(SPOT_SYMBOL)], PendingSource);
         answered(cx, &built.widget);
         built
@@ -5316,7 +5481,13 @@ mod tests {
 
     /// Presses what `selector` names, the way a window delivers a press: the button goes down,
     /// the frame that follows is drawn, and only then does it come up.
-    fn press(window: &mut VisualTestContext, selector: &'static str) {
+    pub(crate) fn press(window: &mut VisualTestContext, selector: &'static str) {
+        // Draw what the press is meant to act on first: both the bounds a click
+        // is aimed at and the handler it reaches come from the last frame, so a
+        // press that follows a change would otherwise act on what the frame
+        // before the change drew.
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
         let target = window
             .debug_bounds(selector)
             .expect("the harness draws what it is asked to press")
@@ -5387,6 +5558,287 @@ mod tests {
 
         assert!(header.left.is_some(), "the instrument control belongs left");
         assert!(header.right.is_some(), "the interval picker belongs right");
+    }
+
+    /// The settings button is offered only where there is a chart to configure:
+    /// until the market is in memory and a listing is chosen, it is drawn disabled
+    /// and carries no handler.
+    #[gpui_kit::test]
+    fn the_settings_button_should_be_dead_until_the_chart_has_a_listing(cx: &mut TestAppContext) {
+        let built = widget_over(
+            cx,
+            CandlestickConfig::default(),
+            vec![entry(SPOT_SYMBOL)],
+            PendingSource,
+        );
+        let (_, window) = cx.add_window_view(|_, _| HeaderHarness {
+            widget: built.widget.clone(),
+        });
+        window.run_until_parked();
+
+        press(window, "TEST_CANDLESTICK_INDICATOR_SETTINGS");
+        assert!(
+            !window.read(|cx| built.widget.read(cx).panel_open),
+            "a chart with nothing chosen has nothing to configure"
+        );
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel.is_none()),
+            "and no panel entity is built for it"
+        );
+
+        // The market is loaded already; choosing a listing is what gives the panel
+        // something to edit. Choosing it is itself a change worth writing back, so
+        // the count the press below is measured against starts after it.
+        window.update(|_, cx| {
+            let _ = built
+                .widget
+                .update(cx, |widget, cx| widget.select_selection(selection(), cx));
+        });
+        let before = built.reports();
+        press(window, "TEST_CANDLESTICK_INDICATOR_SETTINGS");
+
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel_open),
+            "with a market and a listing the button opens the panel"
+        );
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel.is_some()),
+            "and the entity that draws it is built"
+        );
+        assert_eq!(
+            built.reports(),
+            before,
+            "opening the panel writes nothing back"
+        );
+    }
+
+    /// A chosen listing is not enough: the market behind it has to be in memory
+    /// before the settings it would edit mean anything.
+    #[gpui_kit::test]
+    fn the_settings_button_should_be_dead_until_the_market_is_loaded(cx: &mut TestAppContext) {
+        let built = widget_over_unloaded(cx, vec![entry(SPOT_SYMBOL)], PendingSource);
+        let (_, window) = cx.add_window_view(|_, _| HeaderHarness {
+            widget: built.widget.clone(),
+        });
+        window.run_until_parked();
+        assert!(
+            window.read(|cx| built.widget.read(cx).config.selection.is_some()),
+            "the fixture stores a chosen listing it cannot read yet"
+        );
+
+        press(window, "TEST_CANDLESTICK_INDICATOR_SETTINGS");
+        assert!(
+            !window.read(|cx| built.widget.read(cx).panel_open),
+            "a market that is not loaded is a chart with nothing to configure"
+        );
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel.is_none()),
+            "and no panel entity is built for it"
+        );
+    }
+
+    /// The button changes whether the panel is open and nothing else: whether it
+    /// is open is not a persisted option, so it publishes nothing, and closing it
+    /// drops the entity with the state it held.
+    #[gpui_kit::test]
+    fn the_settings_button_should_only_open_and_close_the_panel(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let (_, window) = cx.add_window_view(|_, _| HeaderHarness {
+            widget: built.widget.clone(),
+        });
+        window.run_until_parked();
+        let before = built.reports();
+
+        press(window, "TEST_CANDLESTICK_INDICATOR_SETTINGS");
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel_open),
+            "the button opens the panel"
+        );
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel.is_some()),
+            "and builds the entity that draws it"
+        );
+        assert_eq!(
+            built.reports(),
+            before,
+            "whether the panel is open is not a persisted option"
+        );
+
+        press(window, "TEST_CANDLESTICK_INDICATOR_SETTINGS");
+        assert!(
+            !window.read(|cx| built.widget.read(cx).panel_open),
+            "the button closes it again"
+        );
+        assert!(
+            window.read(|cx| built.widget.read(cx).panel.is_none()),
+            "and drops the entity with it"
+        );
+        assert_eq!(built.reports(), before, "closing writes nothing either");
+    }
+
+    /// The panel is part of the chart's body: the body draws it in the column
+    /// beside the plot, at the fixed width it takes out of the row.
+    #[gpui_kit::test]
+    fn the_open_panel_should_be_drawn_beside_the_chart(cx: &mut TestAppContext) {
+        // The design fixes this width, and every other assertion about it is
+        // relative to the constant: without this line, changing the constant
+        // would change the expectation with it and nothing would fail.
+        assert_eq!(
+            PANEL_WIDTH, 260.0,
+            "the panel's width is the value the design fixes"
+        );
+        let built = widget(cx);
+        let widget = built.widget;
+        cx.update(|cx| accept_snapshot(&widget, page_snapshot(), cx));
+        cx.update(|cx| widget.update(cx, |widget, cx| widget.toggle_indicator_panel(cx)));
+        let (_, window) = cx.add_window_view(move |_, _| BodyHarness(widget));
+        window.run_until_parked();
+
+        let panel = window
+            .debug_bounds("TEST_CANDLESTICK_INDICATOR_PANEL")
+            .expect("the open panel is drawn inside the chart's body");
+        assert_eq!(
+            panel.size.width,
+            px(PANEL_WIDTH),
+            "the panel takes the width the body reserves for it out of the row"
+        );
+        assert!(
+            window.debug_bounds("TEST_PANEL_CARET_MA").is_some(),
+            "and what it draws is its own settings rows"
+        );
+    }
+
+    /// Opening the panel takes its width out of the plot, which is the input the
+    /// canvas' layout is a function of: a changed width is what makes the chart
+    /// re-resolve what fits and ask for the page a wider chart needs when the
+    /// panel closes again. No prefetch of its own is written for this.
+    #[gpui_kit::test]
+    fn opening_the_panel_should_narrow_the_plot(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        cx.update(|cx| accept_snapshot(&widget, page_snapshot(), cx));
+        let (_, window) = cx.add_window_view({
+            let widget = widget.clone();
+            move |_, _| BodyHarness(widget)
+        });
+        window.run_until_parked();
+        let wide = window
+            .read(|cx| {
+                widget
+                    .read(cx)
+                    .chart_layout
+                    .borrow()
+                    .as_ref()
+                    .map(|layout| layout.maximum_plot_width())
+            })
+            .expect("the chart is laid out before the panel opens");
+
+        window.update(|_, cx| {
+            widget.update(cx, |widget, cx| widget.toggle_indicator_panel(cx));
+        });
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
+        let narrow = window
+            .read(|cx| {
+                widget
+                    .read(cx)
+                    .chart_layout
+                    .borrow()
+                    .as_ref()
+                    .map(|layout| layout.maximum_plot_width())
+            })
+            .expect("the chart is laid out with the panel open");
+
+        assert!(
+            narrow < wide,
+            "the open panel takes its width out of the plot: {narrow:?} is not narrower than {wide:?}"
+        );
+    }
+
+    /// A settings change is written back exactly once, and a value that did not
+    /// change is not written at all: every field of the panel commits when it is
+    /// left, and most of those commits change nothing.
+    #[gpui_kit::test]
+    fn changing_the_indicator_settings_should_publish_exactly_once(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let before = built.reports();
+        let changed = cx.update(|cx| {
+            let mut config = built.widget.read(cx).indicator_config().clone();
+            config.entries[0].enabled = false;
+            config
+        });
+
+        cx.update(|cx| {
+            built.widget.update(cx, |widget, cx| {
+                widget.set_indicator_config(changed.clone(), cx)
+            });
+        });
+        assert_eq!(
+            built.reports(),
+            before + 1,
+            "one change is reported once, or the pane never hears about it"
+        );
+
+        cx.update(|cx| {
+            built
+                .widget
+                .update(cx, |widget, cx| widget.set_indicator_config(changed, cx));
+        });
+        assert_eq!(
+            built.reports(),
+            before + 1,
+            "a configuration that did not change is not written again"
+        );
+    }
+
+    /// A chart that loses its market has no settings to show, so the panel goes
+    /// with the chart it belongs to.
+    #[gpui_kit::test]
+    fn taking_the_market_away_should_close_the_settings_panel(cx: &mut TestAppContext) {
+        let source = CountingSource::default();
+        let demands = Arc::clone(&source.subscriptions);
+        let built = widget_over(cx, config(), vec![entry(SPOT_SYMBOL)], source);
+        let widget = built.widget.clone();
+        settle_until(cx, "the chart to read its market", |_| {
+            demands.load(Ordering::Acquire) == 1
+        });
+        cx.update(|cx| {
+            widget.update(cx, |widget, cx| widget.toggle_indicator_panel(cx));
+        });
+        assert!(
+            cx.read(|cx| widget.read(cx).panel_open),
+            "the panel is open before the market goes away"
+        );
+        assert!(cx.read(|cx| widget.read(cx).panel.is_some()));
+
+        let before = built.reports();
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let _probe = cx.update(|cx| {
+            let events = cx.global::<MarketParticipantsConnector>().venues().events();
+            cx.new(|cx| CommitProbe::new(cx, &events, Arc::clone(&deliveries)))
+        });
+        // The venue loads again and publishes no scope at all, which is what a
+        // shrinking commit does: the chart's market is not in memory any more.
+        cx.update(unload_venue);
+        settle_until(cx, "the shrinking commit to reach its subscribers", |_| {
+            deliveries.load(Ordering::Acquire) >= 1
+        });
+
+        cx.update(|cx| {
+            assert!(
+                !widget.read(cx).panel_open,
+                "a chart waiting for its market has nothing to configure"
+            );
+            assert!(
+                widget.read(cx).panel.is_none(),
+                "and the panel entity is dropped with the chart it edited"
+            );
+            assert_eq!(
+                built.reports(),
+                before,
+                "closing the panel for a market that went away writes nothing back"
+            );
+        });
     }
 
     /// The window root the header test renders into.
