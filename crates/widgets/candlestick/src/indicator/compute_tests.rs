@@ -445,6 +445,23 @@ fn computed_series_should_follow_catalogue_order_and_skip_volume() {
     );
 }
 
+// The sub-plot reference lines are a property of the indicator, not of the
+// visible window, so they travel with the cached series.
+#[test]
+fn sub_plot_series_should_carry_their_reference_lines() {
+    let mut config = CandlestickIndicatorConfig::default();
+    for entry in &mut config.entries {
+        entry.enabled = true;
+    }
+    let series = compute_indicators(&flat_inputs(&[1.0; 3]), &config);
+
+    assert_eq!(series_of(&series, IndicatorId::Macd).guides, [0.0]);
+    assert_eq!(series_of(&series, IndicatorId::Rsi).guides, [30.0, 70.0]);
+    assert_eq!(series_of(&series, IndicatorId::Kdj).guides, [20.0, 80.0]);
+    assert!(series_of(&series, IndicatorId::Ma).guides.is_empty());
+    assert!(series_of(&series, IndicatorId::Ema).guides.is_empty());
+}
+
 // The label is the formula name plus the line's period, and the legend keeps
 // the indicator's own parameters.
 #[test]

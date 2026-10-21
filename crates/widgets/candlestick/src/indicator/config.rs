@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{INDICATOR_CATALOG, IndicatorId, default_line_color, definition_of};
+use super::{INDICATOR_CATALOG, IndicatorId, IndicatorPane, default_line_color, definition_of};
 
 /// One indicator line's settings.
 ///
@@ -171,6 +171,23 @@ impl Default for CandlestickIndicatorConfig {
                 .collect(),
         }
     }
+}
+
+/// The enabled sub-plot indicators, in catalogue order.
+///
+/// The entries are normalized to catalogue order, so filtering them preserves the
+/// stacking order. This is the one answer to "how many sub plots are there, and
+/// which indicator owns each". The layout and the painting loop both zip their
+/// boxes against it, so counting sub plots any other way (for example by
+/// filtering the computed series, which never contains VOL) would put the wrong
+/// indicator in a box.
+pub(crate) fn enabled_sub_plot_ids(config: &CandlestickIndicatorConfig) -> Vec<IndicatorId> {
+    config
+        .entries
+        .iter()
+        .filter(|entry| entry.enabled && definition_of(entry.id).pane == IndicatorPane::Sub)
+        .map(|entry| entry.id)
+        .collect()
 }
 
 impl IndicatorSettings {

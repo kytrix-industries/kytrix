@@ -3,7 +3,7 @@
 use super::{
     config::{
         CandlestickIndicatorConfig, IndicatorEntry, IndicatorLineConfig, IndicatorSettings,
-        LineListConfig, expected_shape,
+        LineListConfig, enabled_sub_plot_ids, expected_shape,
     },
     definition::{INDICATOR_CATALOG, IndicatorId, default_line_color},
 };
@@ -375,4 +375,59 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
         entry.enabled = entry.id == IndicatorId::Kdj;
     }
     assert_eq!(only_kdj.warmup_depth(), 12);
+}
+
+// The sub plots come from the configuration, not from the computed series:
+// VOL is enabled by default but has no computed values, so a count derived from
+// the series would draw one sub plot too few. Catalogue order is the stacking
+// order.
+#[test]
+fn enabled_sub_plot_ids_should_follow_catalogue_order() {
+    assert_eq!(
+        enabled_sub_plot_ids(&CandlestickIndicatorConfig::default()),
+        [IndicatorId::Vol]
+    );
+
+    let mut all_off = CandlestickIndicatorConfig::default();
+    for entry in &mut all_off.entries {
+        entry.enabled = false;
+    }
+    assert!(enabled_sub_plot_ids(&all_off).is_empty());
+}
+
+#[test]
+fn enabled_sub_plot_ids_should_keep_the_catalogue_order_when_several_are_on() {
+    let mut config = CandlestickIndicatorConfig::default();
+    for entry in &mut config.entries {
+        entry.enabled = matches!(
+            entry.id,
+            IndicatorId::Vol | IndicatorId::Macd | IndicatorId::Rsi
+        );
+    }
+
+    assert_eq!(
+        enabled_sub_plot_ids(&config),
+        [IndicatorId::Vol, IndicatorId::Macd, IndicatorId::Rsi],
+        "VOL comes before MACD and MACD before RSI because the catalogue does"
+    );
+
+    // A main-chart indicator is never a sub plot, even when it is the only one
+    // enabled.
+    let mut only_ma = CandlestickIndicatorConfig::default();
+    for entry in &mut only_ma.entries {
+        entry.enabled = entry.id == IndicatorId::Ma;
+    }
+    assert!(enabled_sub_plot_ids(&only_ma).is_empty());
+
+    // Turning the default VOL off must leave no empty box behind: MACD becomes
+    // the first sub plot.
+    let mut without_volume = CandlestickIndicatorConfig::default();
+    for entry in &mut without_volume.entries {
+        entry.enabled = entry.id == IndicatorId::Macd;
+    }
+    assert_eq!(
+        enabled_sub_plot_ids(&without_volume),
+        [IndicatorId::Macd],
+        "the disabled VOL must not occupy the first sub plot"
+    );
 }

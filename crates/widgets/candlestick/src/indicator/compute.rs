@@ -38,6 +38,16 @@ pub(crate) enum LineShape {
     Histogram,
 }
 
+/// The y range of one sub plot, derived from the visible window.
+///
+/// It is deliberately not stored on [`IndicatorSeries`]: a range depends on the
+/// visible window (design §6.4), while the values are computed once per snapshot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValueRange {
+    pub lowest: f64,
+    pub highest: f64,
+}
+
 /// One computed line, indexed like the whole snapshot's candle array.
 pub(crate) struct IndicatorLine {
     /// The line's name, e.g. `MA5`, `DIF` or `J`.
@@ -66,6 +76,11 @@ pub(crate) struct IndicatorSeries {
     /// The formula name shown by a sub-plot legend, e.g. `MACD(12,26,9)`.
     pub legend: SmolStr,
     pub lines: Vec<IndicatorLine>,
+    /// The reference lines the sub plot draws at fixed values.
+    ///
+    /// They depend only on the indicator, not on the visible window, so they
+    /// belong to the cached series rather than to a per-frame range.
+    pub guides: Vec<f64>,
 }
 
 /// Computes every enabled line indicator, in catalogue order.
@@ -94,6 +109,7 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             SmolStr::new_static("MA"),
             &lines.rows,
             sma,
+            Vec::new(),
         )),
         (IndicatorId::Ema, IndicatorSettings::Lines(lines)) => Some(lines_series(
             inputs,
@@ -101,6 +117,7 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             SmolStr::new_static("EMA"),
             &lines.rows,
             ema_line,
+            Vec::new(),
         )),
         (IndicatorId::Rsi, IndicatorSettings::Lines(lines)) => Some(lines_series(
             inputs,
@@ -108,6 +125,7 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             SmolStr::new_static("RSI"),
             &lines.rows,
             rsi,
+            vec![30.0, 70.0],
         )),
         (
             IndicatorId::Macd,
@@ -163,11 +181,13 @@ fn lines_series(
     legend: SmolStr,
     rows: &[IndicatorLineConfig],
     formula: fn(&[IndicatorInput], u32) -> Vec<Option<f64>>,
+    guides: Vec<f64>,
 ) -> IndicatorSeries {
     let mut series = IndicatorSeries {
         id,
         legend,
         lines: Vec::with_capacity(rows.len()),
+        guides,
     };
     for row in rows {
         // The line's name is the indicator's formula name followed by its
@@ -242,6 +262,7 @@ fn macd_series(
         id: IndicatorId::Macd,
         legend: format_smolstr!("MACD({short_period},{long_period},{signal_period})"),
         lines,
+        guides: vec![0.0],
     }
 }
 
@@ -290,6 +311,7 @@ fn kdj_series(
         id: IndicatorId::Kdj,
         legend: format_smolstr!("KDJ({period},{smoothing_1},{smoothing_2})"),
         lines,
+        guides: vec![20.0, 80.0],
     }
 }
 

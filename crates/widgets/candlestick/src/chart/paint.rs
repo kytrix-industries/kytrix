@@ -35,12 +35,15 @@ use super::{
     geometry::{
         CandleGeometry, ChartLayout, ChartViewport, LayoutInputs, SubPlotLayout, visible_range,
     },
-    text::{ChartTextCache, HOVER_LABEL_LINE_HEIGHT, HoverLabelCache, format_price, format_volume},
+    text::{
+        ChartTextCache, HOVER_LABEL_LINE_HEIGHT, HoverLabelCache, format_price,
+        format_signed_price, format_volume,
+    },
 };
 use crate::{
     indicator::{
-        CandlestickIndicatorConfig, IndicatorInput, IndicatorPane, IndicatorSeries, LineShape,
-        compute_indicators, definition_of,
+        CandlestickIndicatorConfig, IndicatorId, IndicatorInput, IndicatorPane, IndicatorSeries,
+        LineShape, ValueRange, compute_indicators, definition_of, enabled_sub_plot_ids,
     },
     model::{CandlePrices, CandlestickSeriesSnapshot},
     time::{format_axis_time, maximum_countdown_label},
@@ -68,6 +71,11 @@ const HOVER_LABEL_INSET: f32 = 4.0;
 /// is not, so it moves down one line while the legend is shown.
 const HOVER_LABEL_LEGEND_GAP: f32 = 2.0;
 const VOLUME_HEADROOM: f64 = 1.08;
+/// Below five label rows a sub plot labels three values instead of five.
+///
+/// Five labels need five [`HOVER_LABEL_LINE_HEIGHT`] rows; a shorter plot would
+/// draw the rows on top of each other.
+const SUB_PLOT_COMPACT_HEIGHT: f32 = 5.0 * HOVER_LABEL_LINE_HEIGHT;
 
 /// Everything one frame of the chart draws from.
 pub(crate) struct ChartCanvasOptions {
@@ -198,13 +206,23 @@ struct PreparedVisibleChart {
     range: Range<usize>,
     lowest: f64,
     highest: f64,
-    volume_upper: f64,
     geometry: CandleGeometry,
     candles: Arc<[PreparedCandle]>,
     price_ticks: Arc<[PreparedAxisTick]>,
-    volume_ticks: Arc<[PreparedAxisTick]>,
     time_ticks: Arc<[PreparedTimeTick]>,
     latest_price: Option<PreparedLatestPrice>,
+    /// One entry per sub plot, aligned with [`ChartLayout::sub_plots`].
+    sub_plots: Arc<[PreparedSubPlot]>,
+}
+
+/// One sub plot's identity and visible range.
+///
+/// The axis ticks and labels are derived at paint time from the range and the
+/// plot height, so they are not prepared here; this is what the pointer needs to
+/// answer which indicator a sub plot shows and what value a y coordinate means.
+struct PreparedSubPlot {
+    id: IndicatorId,
+    value_range: ValueRange,
 }
 
 /// The inputs the prepared chart was built from.
@@ -371,6 +389,9 @@ fn prepare_chart_cached(
         return chart;
     }
 
+    // The sub-plot count and their order come from the configuration, not from
+    // the computed series: VOL is a sub plot with no computed values.
+    let sub_plot_ids = enabled_sub_plot_ids(indicator_config);
     // The values depend only on the snapshot and the configuration, so they are
     // computed once and then only re-read by the layout loop and the painter.
     let indicators = indicator_series(caches, snapshot, indicator_config);
@@ -381,11 +402,18 @@ fn prepare_chart_cached(
         bounds,
         text_color,
         &indicators,
+        &sub_plot_ids,
         &caches.text,
         window,
     );
     let prepared = Rc::new(prepare_visible_chart(
-        snapshot, viewport, interval, zone, layout, indicators,
+        snapshot,
+        viewport,
+        interval,
+        zone,
+        layout,
+        indicators,
+        &sub_plot_ids,
     ));
     let mut cache = caches.prepared.borrow_mut();
     cache.key = Some(PreparedChartKey {
@@ -415,11 +443,17 @@ fn prepare_visible_chart(
     zone: UtcOffset,
     layout: ChartLayout,
     indicators: Arc<[IndicatorSeries]>,
+    sub_plot_ids: &[IndicatorId],
 ) -> PreparedChart {
     let range = visible_range(snapshot.candles(), viewport, layout.price_plot.size.width);
-    // This stage draws one sub plot, the volume one; the sub-plot series loop
-    // arrives with the indicator paint stage.
-    let volume_plot = layout.sub_plots.first().map(|sub_plot| sub_plot.plot);
+    // The volume bars live in the VOL sub plot, and only there. When VOL is not
+    // the first enabled sub plot there is no box for them, so no bar is prepared
+    // and the painter draws none.
+    let volume_plot = if sub_plot_ids.first() == Some(&IndicatorId::Vol) {
+        layout.sub_plots.first().map(|sub_plot| sub_plot.plot)
+    } else {
+        None
+    };
     let visible = (!range.is_empty()).then(|| {
         let candles = snapshot.candles();
         let latest = latest_candle_for_indicator(snapshot, range.end);
@@ -431,6 +465,28 @@ fn prepare_visible_chart(
             &indicators,
         );
         let volume_upper = volume_upper_bound(visible);
+        let sub_plots: Arc<[PreparedSubPlot]> = if layout.sub_plots.is_empty() {
+            Vec::new().into()
+        } else {
+            debug_assert_eq!(
+                sub_plot_ids.len(),
+                layout.sub_plots.len(),
+                "the layout draws one box per enabled sub plot"
+            );
+            sub_plot_ids
+                .iter()
+                .map(|id| PreparedSubPlot {
+                    id: *id,
+                    value_range: sub_plot_value_range(
+                        *id,
+                        volume_upper,
+                        range.clone(),
+                        &indicators,
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .into()
+        };
         let geometry = CandleGeometry::new(layout.price_plot, range.len(), viewport.candle_width);
         let body_width = geometry.body_width();
         let prepared_candles: Arc<[PreparedCandle]> = visible
@@ -473,13 +529,6 @@ fn prepare_visible_chart(
             label: SharedString::new(format_price(value, snapshot.price_tick()).as_str()),
         })
         .collect::<Vec<_>>();
-        let volume_ticks = volume_axis_values(volume_upper)
-            .into_iter()
-            .map(|value| PreparedAxisTick {
-                value,
-                label: SharedString::new(format_volume(value).as_str()),
-            })
-            .collect::<Vec<_>>();
         // One label every 70px at most, aligned to a multiple of the stride so
         // that panning does not make the labels crawl.
         let label_stride = ((70.0 / viewport.candle_width).ceil() as usize).max(1);
@@ -515,13 +564,12 @@ fn prepare_visible_chart(
             range,
             lowest,
             highest,
-            volume_upper,
             geometry,
             candles: prepared_candles,
             price_ticks: price_ticks.into(),
-            volume_ticks: volume_ticks.into(),
             time_ticks: time_ticks.into(),
             latest_price,
+            sub_plots,
         }
     });
     PreparedChart {
@@ -539,17 +587,18 @@ fn resolve_chart_layout(
     bounds: Bounds<Pixels>,
     text_color: Hsla,
     main_series: &[IndicatorSeries],
+    sub_plot_ids: &[IndicatorId],
     text_cache: &RefCell<ChartTextCache>,
     window: &Window,
 ) -> ChartLayout {
     let mut longest_label_width = px(0.0);
-    // One sub plot, the volume one: the enabled indicator sub plots arrive with
-    // the indicator configuration.
+    // The number of sub plots is the number of enabled sub-plot indicators, in
+    // catalogue order. VOL is one of them even though it has no computed series.
     let mut layout = ChartLayout::new(
         bounds,
         LayoutInputs {
             longest_label_width,
-            sub_plot_count: 1,
+            sub_plot_count: sub_plot_ids.len(),
         },
     );
     let text_measurer = AxisTextMeasurer {
@@ -570,6 +619,7 @@ fn resolve_chart_layout(
             layout.price_plot.size.height,
             interval,
             main_series,
+            sub_plot_ids,
             &text_measurer,
         );
         longest_label_width = longest_label_width.max(measured_width);
@@ -577,7 +627,7 @@ fn resolve_chart_layout(
             bounds,
             LayoutInputs {
                 longest_label_width,
-                sub_plot_count: 1,
+                sub_plot_count: sub_plot_ids.len(),
             },
         );
         if next.price_axis.size.width <= layout.price_axis.size.width {
@@ -596,6 +646,7 @@ fn widest_axis_label_width(
     price_plot_height: Pixels,
     interval: TimeFrame,
     main_series: &[IndicatorSeries],
+    sub_plot_ids: &[IndicatorId],
     text_measurer: &AxisTextMeasurer<'_>,
 ) -> Pixels {
     let widest_axis_label = axis_label_candidates(
@@ -605,6 +656,7 @@ fn widest_axis_label_width(
         price_tick,
         price_plot_height,
         main_series,
+        sub_plot_ids,
     )
     .into_iter()
     .map(|label| text_measurer.measure(label))
@@ -623,6 +675,9 @@ fn widest_axis_label_width(
 /// That is also why the price labels are derived from the same
 /// [`price_bounds_with_indicators`] the plot uses: a main-chart line that moved
 /// the bound must move the candidate set with it.
+///
+/// The sub plots contribute their labels too: all y-axes share one width, so a
+/// signed MACD tick must be able to widen the price axis as well (design §6.1).
 fn axis_label_candidates(
     candles: &[ListingCandlestick],
     range: Range<usize>,
@@ -630,15 +685,25 @@ fn axis_label_candidates(
     price_tick: Tick,
     price_plot_height: Pixels,
     main_series: &[IndicatorSeries],
+    sub_plot_ids: &[IndicatorId],
 ) -> Vec<SmolStr> {
     if range.is_empty() {
         return vec![SmolStr::new_static("0.000")];
     }
 
     let visible = &candles[range.clone()];
-    let (lowest, highest) = price_bounds_with_indicators(candles, range, latest_price, main_series);
     let volume_upper = volume_upper_bound(visible);
-    let mut labels = Vec::with_capacity(28);
+    let sub_ranges: Vec<(IndicatorId, ValueRange)> = sub_plot_ids
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                sub_plot_value_range(*id, volume_upper, range.clone(), main_series),
+            )
+        })
+        .collect();
+    let (lowest, highest) = price_bounds_with_indicators(candles, range, latest_price, main_series);
+    let mut labels = Vec::with_capacity(32);
     labels.extend(
         price_axis_values(lowest, highest, price_plot_height, price_tick)
             .into_iter()
@@ -649,30 +714,59 @@ fn axis_label_candidates(
     if let Some(latest_price) = latest_price {
         labels.push(latest_price.format_and_round_tick(price_tick));
     }
-    labels.extend(
-        volume_axis_values(volume_upper)
-            .into_iter()
-            .map(format_volume),
-    );
-    labels.push(format_volume(volume_upper));
+    for (id, value_range) in &sub_ranges {
+        match id {
+            IndicatorId::Vol => {
+                labels.extend(
+                    volume_axis_values(value_range.highest)
+                        .into_iter()
+                        .map(format_volume),
+                );
+                labels.push(format_volume(value_range.highest));
 
-    let scale = Quantity::from(1_u64).inner() as f64;
-    let below_thousand = scale * 1_000.0 - scale / 1_000.0;
-    if volume_upper >= below_thousand {
-        labels.push(format_volume(below_thousand));
-    }
-    // Rounding immediately below a unit boundary can add a digit before the suffix changes.
-    let rounded_below_thousand = scale * 1_000.0 - scale / 4_000.0;
-    if volume_upper >= rounded_below_thousand {
-        labels.push(format_volume(rounded_below_thousand));
-    }
-    let below_million = scale * 1_000_000.0 - scale;
-    if volume_upper >= below_million {
-        labels.push(format_volume(below_million));
-    }
-    let rounded_below_million = scale * 1_000_000.0 - scale / 4.0;
-    if volume_upper >= rounded_below_million {
-        labels.push(format_volume(rounded_below_million));
+                let scale = Quantity::from(1_u64).inner() as f64;
+                let below_thousand = scale * 1_000.0 - scale / 1_000.0;
+                if value_range.highest >= below_thousand {
+                    labels.push(format_volume(below_thousand));
+                }
+                // Rounding immediately below a unit boundary can add a digit before the suffix changes.
+                let rounded_below_thousand = scale * 1_000.0 - scale / 4_000.0;
+                if value_range.highest >= rounded_below_thousand {
+                    labels.push(format_volume(rounded_below_thousand));
+                }
+                let below_million = scale * 1_000_000.0 - scale;
+                if value_range.highest >= below_million {
+                    labels.push(format_volume(below_million));
+                }
+                let rounded_below_million = scale * 1_000_000.0 - scale / 4.0;
+                if value_range.highest >= rounded_below_million {
+                    labels.push(format_volume(rounded_below_million));
+                }
+            }
+            IndicatorId::Macd => {
+                labels.extend(
+                    [value_range.lowest, 0.0, value_range.highest]
+                        .into_iter()
+                        .map(|value| format_signed_price(value, price_tick)),
+                );
+            }
+            IndicatorId::Rsi => {
+                labels.extend([0.0, 30.0, 50.0, 70.0, 100.0].map(format_percentage_tick));
+            }
+            IndicatorId::Kdj => {
+                // Cover both height modes: the compact one labels 0/50/100, the
+                // tall one labels the 20/80 guides plus any bound that left the
+                // domain. `kdj_axis_values` is the same chooser the painter uses,
+                // so the axis is never sized for a label it will not draw.
+                labels.extend([0.0, 50.0, 100.0].map(format_percentage_tick));
+                labels.extend(
+                    kdj_axis_values(*value_range)
+                        .into_iter()
+                        .map(format_percentage_tick),
+                );
+            }
+            IndicatorId::Ma | IndicatorId::Ema => {}
+        }
     }
     labels
 }
@@ -699,6 +793,8 @@ struct ChartPainter<'a> {
     text_cache: &'a RefCell<ChartTextCache>,
     window: &'a mut Window,
     context: &'a mut App,
+    /// The snapshot's price tick, which the MACD axis and legend format with.
+    price_tick: Tick,
 }
 
 /// Top inset of the OHLC hover label.
@@ -759,10 +855,12 @@ fn paint_chart(
     // The crosshair's date is read in the zone the settings display data in, and it is
     // read here rather than remembered: a frame after the setting moved paints the new one.
     let zone = data_time_zone(context);
+    let price_tick = snapshot.price_tick();
     let mut painter = ChartPainter {
         text_cache,
         window,
         context,
+        price_tick,
     };
     painter.paint_price_axis(
         &visible.price_ticks,
@@ -770,10 +868,27 @@ fn paint_chart(
         visible.highest,
         layout,
     );
-    if let Some(sub_plot) = layout.sub_plots.first() {
-        painter.paint_sub_axis(&visible.volume_ticks, visible.volume_upper, *sub_plot);
-    }
+    // The vertical grid is painted before every plot's data, so a line or a bar
+    // is drawn on top of it rather than under it.
     painter.paint_time_axis(&visible.time_ticks, layout);
+    // A sub plot draws its own axis, guides and data. The boxes and the prepared
+    // ranges are aligned by index, and both follow catalogue order.
+    for (index, sub_plot) in layout.sub_plots.iter().enumerate() {
+        let Some(prepared_sub_plot) = visible.sub_plots.get(index) else {
+            continue;
+        };
+        let series = indicators
+            .iter()
+            .find(|series| series.id == prepared_sub_plot.id);
+        painter.paint_sub_plot(
+            prepared_sub_plot.id,
+            series,
+            *sub_plot,
+            visible.range.clone(),
+            visible.geometry,
+            prepared_sub_plot.value_range,
+        );
+    }
     // Main-chart indicator lines sit above the grid and below the candles: a
     // line drawn after the wicks would cover them (design §8.1).
     painter.paint_main_indicator_lines(indicators, visible, layout);
@@ -797,11 +912,31 @@ fn paint_chart(
     // The legend reads the candle under the pointer, or the newest visible one
     // when the pointer is away. The absolute index is what indexes the values;
     // a visible slot alone would read another candle's values after a pan.
-    let legend = legend_candle_index(options.viewport.cursor, layout, visible)
-        .map(|absolute| main_indicator_legend(indicators, absolute, snapshot.price_tick()))
+    let absolute = legend_candle_index(options.viewport.cursor, layout, visible);
+    let legend = absolute
+        .map(|absolute| main_indicator_legend(indicators, absolute, price_tick))
         .unwrap_or_default();
     if !legend.is_empty() {
-        painter.paint_indicator_legend(&legend, layout.price_plot);
+        painter.paint_legend(&legend, layout.price_plot);
+    }
+    if let Some(absolute) = absolute {
+        let axis_color = painter.context.theme().components.chart.axis.hsla;
+        for (index, prepared_sub_plot) in visible.sub_plots.iter().enumerate() {
+            let Some(sub_plot) = layout.sub_plots.get(index) else {
+                continue;
+            };
+            let entries = sub_plot_legend(
+                prepared_sub_plot.id,
+                indicators,
+                absolute,
+                snapshot,
+                price_tick,
+                axis_color,
+            );
+            if !entries.is_empty() {
+                painter.paint_legend(&entries, sub_plot.plot);
+            }
+        }
     }
     if let Some(cursor) = options
         .viewport
@@ -823,6 +958,16 @@ fn paint_chart(
         );
     }
 }
+
+/// The colour of one MACD histogram bar.
+///
+/// A non-negative bar points up and takes the bullish colour; a negative one
+/// points down and takes the bearish colour. Zero counts as positive, so a flat
+/// histogram does not flicker between the two colours.
+fn histogram_color(value: f64, bullish: Hsla, bearish: Hsla) -> Hsla {
+    if value >= 0.0 { bullish } else { bearish }
+}
+
 impl ChartPainter<'_> {
     /// Draws every enabled main-chart line.
     ///
@@ -861,19 +1006,20 @@ impl ChartPainter<'_> {
         }
     }
 
-    /// Draws the main-chart legend as one row in the plot's top-left corner,
-    /// each entry in its line's own colour.
-    fn paint_indicator_legend(&mut self, entries: &[LegendEntry], price_plot: Bounds<Pixels>) {
-        let mut x = price_plot.origin.x + px(HOVER_LABEL_INSET);
-        let y = price_plot.origin.y + px(HOVER_LABEL_INSET);
+    /// Draws one legend row in a plot's top-left corner, each entry in its own
+    /// colour.
+    fn paint_legend(&mut self, entries: &[LegendEntry], plot: Bounds<Pixels>) {
+        let mut x = plot.origin.x + px(HOVER_LABEL_INSET);
+        let y = plot.origin.y + px(HOVER_LABEL_INSET);
         let ChartPainter {
             text_cache,
             window,
             context,
+            ..
         } = self;
-        window.with_content_mask(Some(ContentMask { bounds: price_plot }), |window| {
+        window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
             for entry in entries {
-                if x >= price_plot.right() {
+                if x >= plot.right() {
                     break;
                 }
                 let line = text_cache.borrow_mut().line(
@@ -924,27 +1070,126 @@ impl ChartPainter<'_> {
         }
     }
 
-    fn paint_sub_axis(&mut self, ticks: &[PreparedAxisTick], upper: f64, sub_plot: SubPlotLayout) {
-        for tick in ticks {
-            let y = y_for_volume(tick.value, upper, sub_plot.plot);
+    /// Draws one sub plot: its axis, its guides and its data.
+    ///
+    /// `series` is `None` for VOL, whose bars are painted with the candles rather
+    /// than here; the axis is still drawn for every sub plot.
+    ///
+    /// The data is wrapped in a content mask because a path can leave the plot by
+    /// a pixel: the path takes one candle from the left of the range, and a
+    /// histogram bar keeps a one-pixel minimum height.
+    fn paint_sub_plot(
+        &mut self,
+        id: IndicatorId,
+        series: Option<&IndicatorSeries>,
+        layout: SubPlotLayout,
+        range: Range<usize>,
+        geometry: CandleGeometry,
+        value_range: ValueRange,
+    ) {
+        let plot = layout.plot;
+        let grid = self.context.theme().components.chart.grid.hsla;
+        let axis_color = self.context.theme().components.chart.axis.hsla;
+        // The axis plan keeps the labels and the solid grid lines apart: a guide
+        // is labelled and drawn by its own pass, but it must not also get a grid
+        // line, which would fill the gaps of the dashed reference line.
+        let guides = series
+            .map(|series| series.guides.as_slice())
+            .unwrap_or_default();
+        let axis = sub_plot_axis(id, value_range, plot.size.height, guides);
+        for value in axis.grid {
+            let y = y_for_sub_value(value, value_range, plot);
             self.window.paint_quad(fill(
-                Bounds::new(
-                    point(sub_plot.plot.origin.x, y),
-                    size(sub_plot.plot.size.width, px(1.0)),
-                ),
-                self.context.theme().components.chart.grid.hsla,
+                Bounds::new(point(plot.origin.x, y), size(plot.size.width, px(1.0))),
+                grid,
             ));
+        }
+        for value in axis.labels {
+            let y = y_for_sub_value(value, value_range, plot);
+            let label = match id {
+                IndicatorId::Vol => format_volume(value),
+                IndicatorId::Macd => format_signed_price(value, self.price_tick),
+                _ => format_percentage_tick(value),
+            };
             self.paint_text(
-                tick.label.clone(),
-                point(
-                    sub_plot.axis.origin.x + px(7.0),
-                    axis_label_y(y, sub_plot.axis),
-                ),
-                self.context.theme().components.chart.axis.hsla,
+                label,
+                point(layout.axis.origin.x + px(7.0), axis_label_y(y, layout.axis)),
+                axis_color,
                 TextAlign::Left,
-                axis_text_width(sub_plot.axis.size.width, AXIS_TICK_TEXT_INSET),
+                axis_text_width(layout.axis.size.width, AXIS_TICK_TEXT_INSET),
             );
         }
+
+        let Some(series) = series else {
+            return;
+        };
+        for guide in &axis.guides {
+            let y = y_for_sub_value(guide.value, value_range, plot);
+            if guide.solid {
+                // MACD's zero line is a solid axis rather than a reference band.
+                self.window.paint_quad(fill(
+                    Bounds::new(point(plot.origin.x, y), size(plot.size.width, px(1.0))),
+                    grid,
+                ));
+            } else {
+                paint_dashed_horizontal(y, plot, grid, self.window);
+            }
+        }
+
+        let theme = self.context.theme();
+        let bullish = theme.components.chart.bullish.hsla;
+        let bearish = theme.components.chart.bearish.hsla;
+        let body_width = geometry.body_width();
+        let zero_y = y_for_sub_value(0.0, value_range, plot);
+        let start = range.start;
+        let end = range.end;
+        // Histogram bars are painted before the lines so a moving average crossing
+        // a bar stays on top of it.
+        self.window.paint_layer(plot, |window| {
+            window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
+                for line in &series.lines {
+                    if line.shape != LineShape::Histogram {
+                        continue;
+                    }
+                    for (slot, absolute) in (start..end).enumerate() {
+                        let Some(value) = line.values.get(absolute).copied().flatten() else {
+                            continue;
+                        };
+                        let value_y = y_for_sub_value(value, value_range, plot);
+                        let top = value_y.min(zero_y);
+                        let height = (value_y - zero_y).abs().max(px(1.0));
+                        let x = geometry.center_x(slot) - body_width / 2.0;
+                        let color = histogram_color(value, bullish, bearish);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, top), size(body_width, height)),
+                            color,
+                        ));
+                    }
+                }
+            });
+        });
+
+        let paths: Vec<(Path<Pixels>, Hsla)> = series
+            .lines
+            .iter()
+            .filter(|line| line.shape == LineShape::Line)
+            .filter_map(|line| {
+                build_indicator_path(&line.values, range.clone(), geometry, |value| {
+                    y_for_sub_value(value, value_range, plot)
+                })
+                .map(|path| (path, line.color))
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.window.paint_layer(plot, |window| {
+            window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
+                for (path, color) in paths {
+                    window.paint_path(path, color);
+                }
+            });
+        });
     }
 
     fn paint_time_axis(&mut self, ticks: &[PreparedTimeTick], layout: &ChartLayout) {
@@ -1083,10 +1328,11 @@ impl ChartPainter<'_> {
             );
             let price = price_for_y(y, visible.lowest, visible.highest, layout.price_plot);
             self.paint_axis_tag(y, format_price(price, price_tick), layout.price_axis);
-        } else if let Some(sub_plot) = layout
+        } else if let Some((index, sub_plot)) = layout
             .sub_plots
             .iter()
-            .find(|sub_plot| sub_plot.plot.contains(&cursor))
+            .enumerate()
+            .find(|(_, sub_plot)| sub_plot.plot.contains(&cursor))
         {
             let y = cursor
                 .y
@@ -1097,10 +1343,25 @@ impl ChartPainter<'_> {
                 self.context.theme().components.chart.crosshair.hsla,
                 self.window,
             );
-            // The only sub plot in this stage is volume, so that is what a
-            // cursor in a sub plot reads.
-            let volume = volume_for_y(y, visible.volume_upper, sub_plot.plot);
-            self.paint_axis_tag(y, format_volume(volume), sub_plot.axis);
+            if let Some(prepared_sub_plot) = visible.sub_plots.get(index) {
+                let label = match prepared_sub_plot.id {
+                    IndicatorId::Vol => format_volume(volume_for_y(
+                        y,
+                        prepared_sub_plot.value_range.highest,
+                        sub_plot.plot,
+                    )),
+                    IndicatorId::Macd => format_signed_price(
+                        sub_value_from_y(y, prepared_sub_plot.value_range, sub_plot.plot),
+                        price_tick,
+                    ),
+                    _ => format_percentage_value(sub_value_from_y(
+                        y,
+                        prepared_sub_plot.value_range,
+                        sub_plot.plot,
+                    )),
+                };
+                self.paint_axis_tag(y, label, sub_plot.axis);
+            }
         }
 
         let candle = &candles[candle_index];
@@ -1327,7 +1588,7 @@ fn legend_candle_index(
     Some(visible.range.start + slot)
 }
 
-/// One entry of the main-chart legend.
+/// One entry of a chart legend.
 struct LegendEntry {
     text: SmolStr,
     color: Hsla,
@@ -1360,6 +1621,69 @@ fn main_indicator_legend(
                 color: line.color,
             });
         }
+    }
+    entries
+}
+
+/// The legend entries of one sub plot for the candle at `absolute`.
+///
+/// The index is absolute, like the values it reads: a visible slot would read
+/// another candle's values after a pan. A line contributes only past its own
+/// `readable_from`; the formula name is drawn even when no value is defined yet.
+fn sub_plot_legend(
+    id: IndicatorId,
+    indicators: &[IndicatorSeries],
+    absolute: usize,
+    snapshot: &CandlestickSeriesSnapshot,
+    price_tick: Tick,
+    axis_color: Hsla,
+) -> Vec<LegendEntry> {
+    if id == IndicatorId::Vol {
+        let text = snapshot.candles().get(absolute).map_or_else(
+            || SmolStr::new_static("VOL"),
+            |candle| match &candle.traded_quantity {
+                Some(quantity) => {
+                    format_smolstr!("VOL {}", format_volume(quantity.value.inner() as f64))
+                }
+                None => SmolStr::new_static("VOL —"),
+            },
+        );
+        return vec![LegendEntry {
+            text,
+            color: axis_color,
+        }];
+    }
+
+    let Some(series) = indicators.iter().find(|series| series.id == id) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::with_capacity(series.lines.len() + 1);
+    // RSI's line labels already begin with `RSI`, so repeating the series name
+    // would read `RSI RSI6`. The other sub plots show the formula with its
+    // parameters, which a line label does not carry.
+    if id != IndicatorId::Rsi {
+        entries.push(LegendEntry {
+            text: series.legend.clone(),
+            color: axis_color,
+        });
+    }
+    for line in &series.lines {
+        if line.shape != LineShape::Line || absolute < line.readable_from {
+            continue;
+        }
+        let Some(value) = line.values.get(absolute).copied().flatten() else {
+            continue;
+        };
+        let text = match id {
+            IndicatorId::Macd => {
+                format_smolstr!("{} {}", line.label, format_signed_price(value, price_tick))
+            }
+            _ => format_smolstr!("{} {}", line.label, format_percentage_value(value)),
+        };
+        entries.push(LegendEntry {
+            text,
+            color: line.color,
+        });
     }
     entries
 }
@@ -1494,6 +1818,264 @@ fn volume_axis_values(upper: f64) -> Vec<f64> {
         value += step;
     }
     values
+}
+
+/// The y range one sub plot draws for the visible window.
+///
+/// `volume_upper` is passed in because the caller has already read the visible
+/// candles for the axis candidates; recomputing it here would walk them twice.
+fn sub_plot_value_range(
+    id: IndicatorId,
+    volume_upper: f64,
+    range: Range<usize>,
+    indicators: &[IndicatorSeries],
+) -> ValueRange {
+    match id {
+        IndicatorId::Vol => ValueRange {
+            lowest: 0.0,
+            highest: volume_upper,
+        },
+        _ => {
+            let series = indicators
+                .iter()
+                .find(|series| series.id == id)
+                .expect("every enabled sub-plot indicator has a computed series");
+            sub_value_range(series, range)
+        }
+    }
+}
+
+/// The y range of one computed sub plot over the visible window (design §6.4).
+///
+/// It is derived every frame from `range` rather than stored on the series: a
+/// range computed over every loaded candle would flatten the visible curve when
+/// a distant candle moved the extremes.
+fn sub_value_range(series: &IndicatorSeries, range: Range<usize>) -> ValueRange {
+    debug_assert!(range.start <= range.end);
+    let Some(first_line) = series.lines.first() else {
+        // KDJ with every line switched off still owns a sub plot; there is
+        // nothing to measure, so it falls back to the percentage domain.
+        return ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        };
+    };
+    debug_assert!(
+        range.end <= first_line.values.len(),
+        "the range indexes the whole snapshot, got {range:?} for {} values",
+        first_line.values.len()
+    );
+
+    match series.id {
+        IndicatorId::Macd => {
+            let mut magnitude = 0.0_f64;
+            for line in &series.lines {
+                for value in line.values[range.clone()].iter().flatten() {
+                    magnitude = magnitude.max(value.abs());
+                }
+            }
+            // An all-zero MACD collapses onto the middle line; a zero span would
+            // make the y mapping divide by zero.
+            let magnitude = magnitude.max(1e-9);
+            ValueRange {
+                lowest: -magnitude,
+                highest: magnitude,
+            }
+        }
+        IndicatorId::Rsi => ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        },
+        IndicatorId::Kdj => {
+            let mut lowest = 0.0_f64;
+            let mut highest = 100.0_f64;
+            let mut any = false;
+            for line in &series.lines {
+                for value in line.values[range.clone()].iter().flatten() {
+                    any = true;
+                    lowest = lowest.min(*value);
+                    highest = highest.max(*value);
+                }
+            }
+            if !any {
+                return ValueRange {
+                    lowest: 0.0,
+                    highest: 100.0,
+                };
+            }
+            // A negative J is kept: clamping the lower bound at zero would draw
+            // it outside the box (design D11).
+            let padding = (highest - lowest) * 0.05;
+            ValueRange {
+                lowest: lowest - padding,
+                highest: highest + padding,
+            }
+        }
+        // A sub plot only ever shows a computed sub-plot indicator; a percentage
+        // is the only sensible default for a value that is not a price or a size.
+        IndicatorId::Ma | IndicatorId::Ema | IndicatorId::Vol => ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        },
+    }
+}
+
+/// The values a sub plot labels, chosen for its height.
+fn sub_axis_values(id: IndicatorId, value_range: ValueRange, plot_height: Pixels) -> Vec<f64> {
+    let compact = f32::from(plot_height) < SUB_PLOT_COMPACT_HEIGHT;
+    match id {
+        IndicatorId::Vol => volume_axis_values(value_range.highest),
+        IndicatorId::Macd => vec![value_range.lowest, 0.0, value_range.highest],
+        IndicatorId::Rsi => {
+            if compact {
+                vec![30.0, 50.0, 70.0]
+            } else {
+                vec![0.0, 30.0, 50.0, 70.0, 100.0]
+            }
+        }
+        IndicatorId::Kdj => {
+            if compact {
+                vec![0.0, 50.0, 100.0]
+            } else {
+                kdj_axis_values(value_range)
+            }
+        }
+        // The main-chart indicators are never painted in a sub plot; the two
+        // bounds keep the function total for any caller that asks anyway.
+        IndicatorId::Ma | IndicatorId::Ema => vec![value_range.lowest, value_range.highest],
+    }
+}
+
+/// One reference line of a sub plot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SubPlotGuide {
+    value: f64,
+    /// Whether the line is solid (MACD's zero axis) or dashed (a reference band).
+    solid: bool,
+}
+
+/// Everything a sub plot's y-axis draws, with the labels and the solid grid
+/// lines kept apart.
+///
+/// A guide value is labelled by `labels` and painted by `guides`, but it must not
+/// also appear in `grid`: a full-width solid line at the same y would fill the
+/// gaps of the dashed reference line and make it read as an ordinary axis line.
+/// The plan is derived here rather than inside the paint loop so the split is
+/// testable without capturing pixels.
+#[derive(Debug, PartialEq)]
+struct SubPlotAxis {
+    labels: Vec<f64>,
+    grid: Vec<f64>,
+    guides: Vec<SubPlotGuide>,
+}
+
+fn sub_plot_axis(
+    id: IndicatorId,
+    value_range: ValueRange,
+    plot_height: Pixels,
+    guides: &[f64],
+) -> SubPlotAxis {
+    let labels = sub_axis_values(id, value_range, plot_height);
+    let grid = labels
+        .iter()
+        .copied()
+        .filter(|value| {
+            !guides
+                .iter()
+                .any(|guide| (*guide - *value).abs() < f64::EPSILON)
+        })
+        .collect();
+    let guides = guides
+        .iter()
+        .map(|value| SubPlotGuide {
+            value: *value,
+            solid: id == IndicatorId::Macd,
+        })
+        .collect();
+    SubPlotAxis {
+        labels,
+        grid,
+        guides,
+    }
+}
+
+/// KDJ's labels: 0/20/80/100 plus whichever dynamic extreme left the domain.
+///
+/// The design asks for 3–5 labels. [`sub_value_range`] pads the 0..100 domain by
+/// 5% on each side, so a padded span is `1.1x` the data span and `span / 22` is
+/// exactly that padding. A bound that sits one padding step outside 0 / 100 is
+/// therefore the padding itself rather than a J that left the domain; labelling
+/// it would stack a tick on top of the 0 / 100 label.
+///
+/// If J goes below zero *and* above 100 there are six candidates; the fixed
+/// endpoint closer to its neighbour is dropped, because those two labels would
+/// sit on top of each other while the 20 / 80 guides must survive.
+fn kdj_axis_values(value_range: ValueRange) -> Vec<f64> {
+    let span = value_range.highest - value_range.lowest;
+    let padding = span / 22.0;
+    let mut values = vec![0.0, 20.0, 80.0, 100.0];
+    if -value_range.lowest > padding + f64::EPSILON {
+        values.push(value_range.lowest);
+    }
+    if value_range.highest - 100.0 > padding + f64::EPSILON {
+        values.push(value_range.highest);
+    }
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+    if values.len() > 5 {
+        let below_zero = -value_range.lowest;
+        let above_hundred = value_range.highest - 100.0;
+        if below_zero <= above_hundred {
+            values.retain(|value| *value != 0.0);
+        } else {
+            values.retain(|value| *value != 100.0);
+        }
+    }
+    values
+}
+
+/// Formats a 0–100 axis label. Negative zero reads as `0`, not `-0`.
+fn format_percentage_tick(value: f64) -> SmolStr {
+    if value == 0.0 {
+        SmolStr::new_static("0")
+    } else {
+        format_smolstr!("{value:.0}")
+    }
+}
+
+/// Formats a 0–100 readout such as a legend value or a crosshair tag.
+///
+/// A small negative J rounds to `-0.0`, which reads as a negative value that is
+/// not there; the rounded form is normalised instead.
+fn format_percentage_value(value: f64) -> SmolStr {
+    if value == 0.0 {
+        SmolStr::new_static("0.0")
+    } else {
+        let text = format_smolstr!("{value:.1}");
+        if text.as_str() == "-0.0" {
+            SmolStr::new_static("0.0")
+        } else {
+            text
+        }
+    }
+}
+
+/// Maps a sub-plot value to a y coordinate inside `plot`.
+fn y_for_sub_value(value: f64, value_range: ValueRange, plot: Bounds<Pixels>) -> Pixels {
+    let span = (value_range.highest - value_range.lowest).max(f64::MIN_POSITIVE);
+    let ratio = ((value_range.highest - value) / span).clamp(0.0, 1.0);
+    plot.origin.y + plot.size.height * ratio as f32
+}
+
+/// The sub-plot value a y coordinate stands for; the inverse of
+/// [`y_for_sub_value`].
+fn sub_value_from_y(y: Pixels, value_range: ValueRange, plot: Bounds<Pixels>) -> f64 {
+    let ratio = if plot.size.height > px(0.0) {
+        (f32::from(y - plot.origin.y) / f32::from(plot.size.height)) as f64
+    } else {
+        0.0
+    };
+    value_range.highest - (value_range.highest - value_range.lowest) * ratio.clamp(0.0, 1.0)
 }
 
 /// Paints the visible candles' wicks, volume bars and bodies.
@@ -1847,6 +2429,54 @@ mod tests {
         }
     }
 
+    fn test_line(
+        label: &'static str,
+        values: Vec<Option<f64>>,
+        readable_from: usize,
+        shape: LineShape,
+    ) -> IndicatorLine {
+        IndicatorLine {
+            label: SmolStr::new_static(label),
+            color: gpui_kit::white(),
+            values,
+            readable_from,
+            shape,
+        }
+    }
+
+    fn test_series(
+        id: IndicatorId,
+        legend: &'static str,
+        lines: Vec<IndicatorLine>,
+        guides: Vec<f64>,
+    ) -> IndicatorSeries {
+        IndicatorSeries {
+            id,
+            legend: SmolStr::new_static(legend),
+            lines,
+            guides,
+        }
+    }
+
+    fn snapshot_of(
+        candles: impl IntoIterator<Item = ListingCandlestick>,
+    ) -> CandlestickSeriesSnapshot {
+        let candles: Vec<ListingCandlestick> = candles.into_iter().collect();
+        let mut series = crate::model::CandlestickSeries::new(
+            candles.len().max(1),
+            ListingPrecision {
+                price_tick: Tick::from_str("0.01").expect("price tick should parse"),
+                quantity_tick: Tick::from_str("0.001").expect("quantity step should parse"),
+            },
+        );
+        series.merge_initial(candles);
+        series.snapshot()
+    }
+
+    fn test_tick() -> Tick {
+        Tick::from_str("0.01").expect("tick should parse")
+    }
+
     #[test]
     fn candle_series_layers_should_keep_geometry_non_overlapping() {
         let rising = candle(1);
@@ -2111,7 +2741,15 @@ mod tests {
     fn volume_axis_candidates_should_cover_unit_transition_labels() {
         let candles = [candle_with_volume(1, Quantity::from(1_000_000_u64))];
         let tick = Tick::from_str("1").expect("price tick should parse");
-        let labels = axis_label_candidates(&candles, 0..candles.len(), None, tick, px(300.0), &[]);
+        let labels = axis_label_candidates(
+            &candles,
+            0..candles.len(),
+            None,
+            tick,
+            px(300.0),
+            &[],
+            &[IndicatorId::Vol],
+        );
 
         assert!(
             labels.iter().any(|label| label == "999.999K")
@@ -2546,6 +3184,7 @@ mod tests {
                 readable_from: 0,
                 shape: LineShape::Line,
             }],
+            guides: Vec::new(),
         }];
 
         let (lowest, highest) = price_bounds_with_indicators(&candles, 0..1, None, &series);
@@ -2599,6 +3238,7 @@ mod tests {
                 readable_from: 0,
                 shape: LineShape::Histogram,
             }],
+            guides: vec![0.0],
         }];
 
         assert_eq!(
@@ -2630,11 +3270,13 @@ mod tests {
                 readable_from: 0,
                 shape: LineShape::Line,
             }],
+            guides: Vec::new(),
         }];
 
         let (_, highest) = price_bounds_with_indicators(&candles, 0..1, None, &series);
-        let with_indicator = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &series);
-        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[]);
+        let with_indicator =
+            axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &series, &[]);
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
 
         assert!(
             with_indicator.contains(&format_price(highest, tick)),
@@ -2732,6 +3374,100 @@ mod tests {
         });
     }
 
+    /// The sub-plot count and order come from the configuration, not from the
+    /// computed series: VOL has no computed values but is still a sub plot. The
+    /// layout, the prepared data and the painting loop must all agree on that
+    /// answer, and enabling a second indicator has to reach the layout.
+    #[gpui_kit::test]
+    fn the_layout_should_draw_one_box_per_enabled_sub_plot(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let (_, cx) = cx.add_window_view(|_, _| CacheHarness);
+        let snapshot = snapshot_with_candles(100);
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
+        let viewport = ChartViewport::default();
+        let mut with_volume = CandlestickIndicatorConfig::default();
+        with_volume
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == IndicatorId::Macd)
+            .expect("the catalogue declares MACD")
+            .enabled = true;
+
+        cx.update(|window, _| {
+            let caches = ChartPaintCaches::default();
+            let prepared = prepare_chart_cached(
+                &caches,
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                gpui_kit::white(),
+                &with_volume,
+                false,
+                window,
+            );
+
+            assert_eq!(
+                prepared.layout.sub_plots.len(),
+                2,
+                "VOL and MACD are both enabled, so the layout needs two boxes"
+            );
+            let visible = prepared.visible.as_ref().expect("candles are visible");
+            assert_eq!(
+                visible.sub_plots.len(),
+                prepared.layout.sub_plots.len(),
+                "every box has exactly one prepared sub plot"
+            );
+            assert_eq!(visible.sub_plots[0].id, IndicatorId::Vol);
+            assert_eq!(visible.sub_plots[1].id, IndicatorId::Macd);
+            assert!(
+                visible.candles.iter().all(|candle| candle.volume.is_some()),
+                "the VOL box owns the prepared volume bars"
+            );
+        });
+
+        // Turning VOL off leaves MACD as the first and only sub plot; no volume
+        // bar may be prepared for its box.
+        let mut without_volume = CandlestickIndicatorConfig::default();
+        for entry in &mut without_volume.entries {
+            entry.enabled = matches!(entry.id, IndicatorId::Ma | IndicatorId::Macd);
+        }
+
+        cx.update(|window, _| {
+            let caches = ChartPaintCaches::default();
+            let prepared = prepare_chart_cached(
+                &caches,
+                &snapshot,
+                viewport,
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                bounds,
+                gpui_kit::white(),
+                &without_volume,
+                false,
+                window,
+            );
+
+            assert_eq!(prepared.layout.sub_plots.len(), 1, "only MACD is enabled");
+            let visible = prepared.visible.as_ref().expect("candles are visible");
+            assert_eq!(visible.sub_plots.len(), 1);
+            assert_eq!(
+                visible.sub_plots[0].id,
+                IndicatorId::Macd,
+                "MACD takes the first box; no empty box is left for VOL"
+            );
+            assert!(
+                visible.candles.iter().all(|candle| candle.volume.is_none()),
+                "MACD's box must not receive volume bars"
+            );
+        });
+    }
+
     /// The legend's value is read at the absolute index the crosshair is on,
     /// and only past that line's own `readable_from`.
     #[test]
@@ -2748,13 +3484,12 @@ mod tests {
             range: 10..20,
             lowest: 0.0,
             highest: 100.0,
-            volume_upper: 1.0,
             geometry,
             candles: Arc::from(Vec::new()),
             price_ticks: Arc::from(Vec::new()),
-            volume_ticks: Arc::from(Vec::new()),
             time_ticks: Arc::from(Vec::new()),
             latest_price: None,
+            sub_plots: Arc::from(Vec::new()),
         };
         let cursor = point(geometry.center_x(3), layout.price_plot.origin.y + px(5.0));
 
@@ -2783,6 +3518,7 @@ mod tests {
                 readable_from: 14,
                 shape: LineShape::Line,
             }],
+            guides: Vec::new(),
         }];
         let absolute = legend_candle_index(Some(cursor), &layout, &visible)
             .expect("the cursor is over the plot");
@@ -2795,6 +3531,689 @@ mod tests {
         let entries = main_indicator_legend(&series, absolute, tick);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "MA5 123.45");
+    }
+
+    /// A chart with every sub-plot indicator switched off has no sub-plot boxes
+    /// at all: the price plot takes the content and the time axis sits directly
+    /// under it.
+    #[test]
+    fn a_chart_without_enabled_sub_plots_should_have_no_sub_plot_boxes() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
+        let layout = ChartLayout::new(
+            bounds,
+            LayoutInputs {
+                longest_label_width: px(50.0),
+                sub_plot_count: 0,
+            },
+        );
+
+        assert!(layout.sub_plots.is_empty());
+        assert!(layout.separators.is_empty());
+        assert_eq!(layout.time_axis.origin.y, layout.price_plot.bottom());
+        assert_eq!(layout.data_bounds(), layout.price_plot);
+    }
+
+    #[test]
+    fn no_enabled_sub_plot_should_prepare_no_sub_plot_data_or_volume_bars() {
+        let snapshot = snapshot_with_candles(10);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(50.0),
+                sub_plot_count: 0,
+            },
+        );
+        let indicators: Arc<[IndicatorSeries]> = Arc::from(Vec::new());
+
+        let prepared = prepare_visible_chart(
+            &snapshot,
+            ChartViewport::default(),
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+            layout,
+            indicators,
+            &[],
+        );
+        let visible = prepared.visible.expect("ten candles are visible");
+
+        assert!(visible.sub_plots.is_empty());
+        assert!(
+            visible.candles.iter().all(|candle| candle.volume.is_none()),
+            "no VOL sub plot means no volume bars"
+        );
+    }
+
+    /// A pane too short for sub plots keeps the price plot's floor and draws no
+    /// sub-plot box at all. Nothing may be prepared for boxes that do not exist:
+    /// the painter indexes the prepared list by the layout's boxes.
+    #[test]
+    fn a_pane_too_short_for_sub_plots_should_prepare_none() {
+        let snapshot = snapshot_with_candles(10);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(60.0))),
+            LayoutInputs {
+                longest_label_width: px(50.0),
+                sub_plot_count: 4,
+            },
+        );
+        assert!(
+            layout.sub_plots.is_empty(),
+            "60px leaves no room for a sub plot"
+        );
+
+        let prepared = prepare_visible_chart(
+            &snapshot,
+            ChartViewport::default(),
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+            layout,
+            Arc::from(Vec::new()),
+            &[
+                IndicatorId::Vol,
+                IndicatorId::Macd,
+                IndicatorId::Rsi,
+                IndicatorId::Kdj,
+            ],
+        );
+        let visible = prepared.visible.expect("ten candles are visible");
+
+        assert!(visible.sub_plots.is_empty());
+        assert!(
+            visible.candles.iter().all(|candle| candle.volume.is_none()),
+            "a sub plot that is not drawn owns no volume bars"
+        );
+    }
+
+    /// Only a VOL first sub plot owns the volume bars. When MACD is the only
+    /// enabled sub plot the bars must not be drawn into its box.
+    #[test]
+    fn a_first_sub_plot_that_is_not_volume_should_not_prepare_volume_bars() {
+        let snapshot = snapshot_with_candles(10);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(50.0),
+                sub_plot_count: 1,
+            },
+        );
+        let series = test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![test_line(
+                "MACD",
+                vec![Some(1.0); snapshot.candles().len()],
+                0,
+                LineShape::Histogram,
+            )],
+            vec![0.0],
+        );
+        let indicators: Arc<[IndicatorSeries]> = Arc::from(vec![series]);
+
+        let prepared = prepare_visible_chart(
+            &snapshot,
+            ChartViewport::default(),
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+            layout,
+            indicators,
+            &[IndicatorId::Macd],
+        );
+        let visible = prepared.visible.expect("ten candles are visible");
+
+        assert_eq!(visible.sub_plots.len(), 1);
+        assert_eq!(visible.sub_plots[0].id, IndicatorId::Macd);
+        assert!(visible.sub_plots[0].value_range.lowest < 0.0);
+        assert!(
+            visible.candles.iter().all(|candle| candle.volume.is_none()),
+            "the MACD box must not receive volume bars"
+        );
+    }
+
+    /// VOL is the default sub plot: it prepares one box and its bars.
+    #[test]
+    fn the_default_volume_sub_plot_should_prepare_its_bars() {
+        let snapshot = snapshot_with_candles(10);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(50.0),
+                sub_plot_count: 1,
+            },
+        );
+        let indicators: Arc<[IndicatorSeries]> = Arc::from(Vec::new());
+
+        let prepared = prepare_visible_chart(
+            &snapshot,
+            ChartViewport::default(),
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+            layout,
+            indicators,
+            &[IndicatorId::Vol],
+        );
+        let visible = prepared.visible.expect("ten candles are visible");
+
+        assert_eq!(visible.sub_plots.len(), 1);
+        assert_eq!(visible.sub_plots[0].id, IndicatorId::Vol);
+        assert_eq!(visible.sub_plots[0].value_range.lowest, 0.0);
+        assert!(visible.sub_plots[0].value_range.highest > 0.0);
+        assert!(
+            visible.candles.iter().all(|candle| candle.volume.is_some()),
+            "every fixture candle published a traded size"
+        );
+    }
+
+    /// MACD spans are symmetric around zero and include the histogram, which is
+    /// a line like the other two.
+    #[test]
+    fn sub_value_range_should_symmetrise_macd_and_include_the_histogram() {
+        let series = test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![
+                test_line("DIF", vec![Some(-2.0), Some(0.5)], 0, LineShape::Line),
+                test_line("DEA", vec![Some(1.0), Some(0.0)], 0, LineShape::Line),
+                test_line("MACD", vec![Some(-8.0), Some(0.0)], 0, LineShape::Histogram),
+            ],
+            vec![0.0],
+        );
+
+        let value_range = sub_value_range(&series, 0..2);
+
+        assert_eq!(value_range.lowest, -8.0);
+        assert_eq!(value_range.highest, 8.0);
+    }
+
+    /// A MACD bar takes the colour of the direction it points: non-negative is
+    /// bullish (a zero bar included) and negative is bearish. The colours are
+    /// passed in so the test does not need a theme.
+    #[test]
+    fn macd_histogram_bars_should_use_the_direction_they_point() {
+        let bullish = gpui_kit::white();
+        let bearish = gpui_kit::black();
+
+        assert_eq!(histogram_color(0.0, bullish, bearish), bullish);
+        assert_eq!(histogram_color(1.0, bullish, bearish), bullish);
+        assert_eq!(histogram_color(-1.0, bullish, bearish), bearish);
+        assert_eq!(
+            histogram_color(-f64::MIN_POSITIVE, bullish, bearish),
+            bearish,
+            "a tiny negative value is still negative"
+        );
+    }
+
+    #[test]
+    fn sub_value_range_should_keep_rsi_on_the_percentage_domain() {
+        let series = test_series(
+            IndicatorId::Rsi,
+            "RSI",
+            vec![test_line(
+                "RSI6",
+                vec![Some(12.0), Some(88.0)],
+                0,
+                LineShape::Line,
+            )],
+            vec![30.0, 70.0],
+        );
+
+        let value_range = sub_value_range(&series, 0..2);
+
+        assert_eq!(value_range.lowest, 0.0);
+        assert_eq!(value_range.highest, 100.0);
+    }
+
+    /// J can leave the 0..100 domain on either side, and the range has to follow
+    /// it rather than clamp it at zero (design D11). The bounds are checked, not
+    /// just their sign: a range that merely reaches just below zero would still
+    /// cut the negative J off at the bottom of the box.
+    #[test]
+    fn sub_value_range_should_keep_a_negative_kdj_j_visible() {
+        let series = test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![
+                test_line("K", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("D", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("J", vec![Some(-12.5)], 0, LineShape::Line),
+            ],
+            vec![20.0, 80.0],
+        );
+
+        let value_range = sub_value_range(&series, 0..1);
+
+        // [-12.5, 100] padded by 5% of its span (5.625) on each side.
+        assert!(
+            (value_range.lowest - -18.125).abs() < 1.0e-9,
+            "{value_range:?}"
+        );
+        assert!(
+            (value_range.highest - 105.625).abs() < 1.0e-9,
+            "{value_range:?}"
+        );
+
+        let above = test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![
+                test_line("K", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("D", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("J", vec![Some(150.0)], 0, LineShape::Line),
+            ],
+            vec![20.0, 80.0],
+        );
+        let value_range = sub_value_range(&above, 0..1);
+
+        // [0, 150] padded by 5% of its span (7.5) on each side.
+        assert!(
+            (value_range.lowest - -7.5).abs() < 1.0e-9,
+            "{value_range:?}"
+        );
+        assert!(
+            (value_range.highest - 157.5).abs() < 1.0e-9,
+            "{value_range:?}"
+        );
+    }
+
+    /// All-None KDJ data falls back to the percentage domain rather than to an
+    /// empty range.
+    #[test]
+    fn sub_value_range_should_fall_back_to_the_domain_when_kdj_has_no_values() {
+        let series = test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![
+                test_line("K", vec![None, None], 0, LineShape::Line),
+                test_line("D", vec![None, None], 0, LineShape::Line),
+                test_line("J", vec![None, None], 0, LineShape::Line),
+            ],
+            vec![20.0, 80.0],
+        );
+
+        let value_range = sub_value_range(&series, 0..2);
+
+        assert_eq!(value_range.lowest, 0.0);
+        assert_eq!(value_range.highest, 100.0);
+    }
+
+    /// The range is derived from the visible window, so panning to a calmer or
+    /// wilder stretch changes it even though the values did not move.
+    #[test]
+    fn sub_value_range_should_follow_the_visible_window() {
+        let series = test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![test_line(
+                "DIF",
+                vec![Some(0.1), Some(10.0)],
+                0,
+                LineShape::Line,
+            )],
+            vec![0.0],
+        );
+
+        assert_eq!(sub_value_range(&series, 0..1).highest, 0.1);
+        assert_eq!(sub_value_range(&series, 1..2).highest, 10.0);
+    }
+
+    #[test]
+    fn macd_axis_should_label_both_extremes_and_zero() {
+        let value_range = ValueRange {
+            lowest: -5.0,
+            highest: 5.0,
+        };
+
+        assert_eq!(
+            sub_axis_values(IndicatorId::Macd, value_range, px(100.0)),
+            [-5.0, 0.0, 5.0]
+        );
+    }
+
+    /// An all-zero MACD collapses to a 1e-9 span; the axis must still produce
+    /// its three labels instead of panicking on a zero range.
+    #[test]
+    fn macd_axis_should_not_panic_on_an_all_zero_series() {
+        let series = test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![test_line(
+                "DIF",
+                vec![Some(0.0), Some(0.0)],
+                0,
+                LineShape::Line,
+            )],
+            vec![0.0],
+        );
+        let value_range = sub_value_range(&series, 0..2);
+
+        assert_eq!(
+            sub_axis_values(IndicatorId::Macd, value_range, px(100.0)).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn rsi_and_kdj_axes_should_keep_three_to_five_labels() {
+        let domain = ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        };
+        assert_eq!(
+            sub_axis_values(IndicatorId::Rsi, domain, px(40.0)),
+            [30.0, 50.0, 70.0]
+        );
+        assert_eq!(
+            sub_axis_values(IndicatorId::Rsi, domain, px(120.0)),
+            [0.0, 30.0, 50.0, 70.0, 100.0]
+        );
+        assert_eq!(
+            sub_axis_values(IndicatorId::Kdj, domain, px(40.0)),
+            [0.0, 50.0, 100.0]
+        );
+        assert_eq!(
+            sub_axis_values(IndicatorId::Kdj, domain, px(120.0)),
+            [0.0, 20.0, 80.0, 100.0]
+        );
+    }
+
+    /// The first-round regression filled a guide's dashed line with a solid grid
+    /// line. The fix has to keep the guide labelled *and* keep its grid line out;
+    /// both halves are pinned here, together with the line style the guide pass
+    /// draws.
+    #[test]
+    fn sub_plot_axis_should_label_guides_without_drawing_their_grid_line() {
+        let domain = ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        };
+
+        let tall_rsi = sub_plot_axis(IndicatorId::Rsi, domain, px(120.0), &[30.0, 70.0]);
+        assert_eq!(tall_rsi.labels, [0.0, 30.0, 50.0, 70.0, 100.0]);
+        assert_eq!(tall_rsi.grid, [0.0, 50.0, 100.0]);
+        assert_eq!(
+            tall_rsi.guides,
+            [
+                SubPlotGuide {
+                    value: 30.0,
+                    solid: false,
+                },
+                SubPlotGuide {
+                    value: 70.0,
+                    solid: false,
+                },
+            ]
+        );
+
+        // The compact axis labels only 30/50/70, but 30 and 70 are still guides,
+        // so only 50 may get a solid grid line.
+        let compact_rsi = sub_plot_axis(IndicatorId::Rsi, domain, px(40.0), &[30.0, 70.0]);
+        assert_eq!(compact_rsi.labels, [30.0, 50.0, 70.0]);
+        assert_eq!(compact_rsi.grid, [50.0]);
+
+        let tall_kdj = sub_plot_axis(IndicatorId::Kdj, domain, px(120.0), &[20.0, 80.0]);
+        assert_eq!(tall_kdj.labels, [0.0, 20.0, 80.0, 100.0]);
+        assert_eq!(tall_kdj.grid, [0.0, 100.0]);
+
+        let macd = sub_plot_axis(
+            IndicatorId::Macd,
+            ValueRange {
+                lowest: -5.0,
+                highest: 5.0,
+            },
+            px(120.0),
+            &[0.0],
+        );
+        assert_eq!(macd.labels, [-5.0, 0.0, 5.0]);
+        assert_eq!(
+            macd.grid,
+            [-5.0, 5.0],
+            "MACD's zero is a guide, not a grid line"
+        );
+        assert_eq!(
+            macd.guides,
+            [SubPlotGuide {
+                value: 0.0,
+                solid: true,
+            }],
+            "MACD's zero guide is solid, unlike the dashed percentage guides"
+        );
+    }
+
+    /// Five labels need five 14px rows: the tall mode must still be used at
+    /// exactly 70px and drop to three just below that.
+    #[test]
+    fn sub_plot_axis_should_switch_mode_at_five_label_rows() {
+        let domain = ValueRange {
+            lowest: 0.0,
+            highest: 100.0,
+        };
+
+        assert_eq!(
+            sub_axis_values(IndicatorId::Rsi, domain, px(70.0)).len(),
+            5,
+            "five 14px label rows fit exactly in 70px"
+        );
+        assert_eq!(
+            sub_axis_values(IndicatorId::Rsi, domain, px(69.9)).len(),
+            3,
+            "one pixel less cannot fit the five label rows"
+        );
+    }
+
+    /// A KDJ range that leaves the domain on both sides has six candidates; the
+    /// fixed endpoint closer to its extreme is dropped so at most five remain.
+    #[test]
+    fn kdj_axis_should_drop_the_fixed_endpoint_nearest_the_dynamic_extreme() {
+        let value_range = ValueRange {
+            lowest: -18.0,
+            highest: 124.0,
+        };
+
+        let values = sub_axis_values(IndicatorId::Kdj, value_range, px(120.0));
+
+        assert!((3..=5).contains(&values.len()), "got {values:?}");
+        assert_eq!(values, [-18.0, 20.0, 80.0, 100.0, 124.0]);
+    }
+
+    /// An in-domain series still gets the 5% padding, but the padding is not a
+    /// dynamic extremum: labelling it would stack `-5` / `105` on top of `0` /
+    /// `100` and push the fixed labels out of the axis.
+    #[test]
+    fn kdj_axis_should_not_label_the_five_percent_padding() {
+        let series = test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![
+                test_line("K", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("D", vec![Some(50.0)], 0, LineShape::Line),
+                test_line("J", vec![Some(60.0)], 0, LineShape::Line),
+            ],
+            vec![20.0, 80.0],
+        );
+        let value_range = sub_value_range(&series, 0..1);
+
+        assert!(
+            value_range.lowest < 0.0 && value_range.highest > 100.0,
+            "the range is padded beyond the domain: {value_range:?}"
+        );
+        assert_eq!(
+            sub_axis_values(IndicatorId::Kdj, value_range, px(120.0)),
+            [0.0, 20.0, 80.0, 100.0]
+        );
+    }
+
+    /// The signed MACD tick has to be able to widen the shared axis; the
+    /// candidate set is where that width comes from.
+    #[test]
+    fn axis_label_candidates_should_include_signed_macd_ticks() {
+        let candles = [candle_with_prices(1, 100, 110, 90, 100)];
+        let tick = test_tick();
+        let price = Price::from_str("123.45").expect("price should parse");
+        let inner = price.inner() as f64;
+        let series = [test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![test_line("DIF", vec![Some(inner)], 0, LineShape::Line)],
+            vec![0.0],
+        )];
+
+        let labels = axis_label_candidates(
+            &candles,
+            0..1,
+            None,
+            tick,
+            px(300.0),
+            &series,
+            &[IndicatorId::Macd],
+        );
+
+        assert!(
+            labels.contains(&format_signed_price(-inner, tick)),
+            "negative MACD candidates were {labels:?}"
+        );
+        assert!(labels.contains(&format_signed_price(inner, tick)));
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
+        assert!(
+            !baseline.contains(&format_signed_price(-inner, tick)),
+            "without the MACD sub plot the signed tick is not a candidate"
+        );
+    }
+
+    /// The percentage reference lines are axis labels too: the candidate set
+    /// feeds the shared axis width, so it must contain the 30/70 and 20/80 ticks
+    /// even though their solid grid lines are skipped.
+    #[test]
+    fn axis_label_candidates_should_include_percentage_guide_ticks() {
+        let candles = [candle_with_prices(1, 100, 110, 90, 100)];
+        let tick = test_tick();
+        let series = [
+            test_series(
+                IndicatorId::Rsi,
+                "RSI",
+                vec![test_line("RSI6", vec![Some(48.0)], 0, LineShape::Line)],
+                vec![30.0, 70.0],
+            ),
+            test_series(
+                IndicatorId::Kdj,
+                "KDJ(9,3,3)",
+                vec![test_line("J", vec![Some(58.0)], 0, LineShape::Line)],
+                vec![20.0, 80.0],
+            ),
+        ];
+
+        let labels = axis_label_candidates(
+            &candles,
+            0..1,
+            None,
+            tick,
+            px(300.0),
+            &series,
+            &[IndicatorId::Rsi, IndicatorId::Kdj],
+        );
+        for value in [0.0, 30.0, 50.0, 70.0, 100.0, 20.0, 80.0] {
+            assert!(
+                labels.contains(&format_percentage_tick(value)),
+                "the tick {value} is missing from {labels:?}"
+            );
+        }
+
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
+        assert!(
+            !baseline.contains(&format_percentage_tick(30.0)),
+            "without an RSI sub plot the 30 guide is not a candidate"
+        );
+    }
+
+    /// VOL's legend reads the snapshot's traded size at the absolute candle.
+    #[test]
+    fn the_volume_legend_should_read_the_visible_candle() {
+        let snapshot = snapshot_of([candle_with_volume(1, Quantity::from(1_234_u64))]);
+        let entries = sub_plot_legend(
+            IndicatorId::Vol,
+            &[],
+            0,
+            &snapshot,
+            test_tick(),
+            gpui_kit::white(),
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "VOL 1.234K");
+    }
+
+    /// The sub-plot legend indexes the values by absolute candle, and only shows
+    /// a line once that line is readable there.
+    #[test]
+    fn the_macd_legend_should_read_the_absolute_candle_past_readable_from() {
+        let snapshot = snapshot_with_candles(20);
+        let price = Price::from_str("0.52").expect("price should parse");
+        let mut values = vec![None; 20];
+        values[14] = Some(price.inner() as f64);
+        values[15] = Some(price.inner() as f64);
+        let series = [test_series(
+            IndicatorId::Macd,
+            "MACD(12,26,9)",
+            vec![test_line("DIF", values, 15, LineShape::Line)],
+            vec![0.0],
+        )];
+        let tick = test_tick();
+        let axis_color = gpui_kit::white();
+
+        let before = sub_plot_legend(IndicatorId::Macd, &series, 14, &snapshot, tick, axis_color);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].text, "MACD(12,26,9)");
+
+        let after = sub_plot_legend(IndicatorId::Macd, &series, 15, &snapshot, tick, axis_color);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1].text, "DIF 0.52");
+    }
+
+    /// RSI's line labels already carry the formula, so the legend must not
+    /// repeat it as `RSI RSI6`; KDJ reads its three lines in percent.
+    #[test]
+    fn percentage_sub_plot_legends_should_not_repeat_the_formula() {
+        let snapshot = snapshot_with_candles(1);
+        let tick = test_tick();
+        let axis_color = gpui_kit::white();
+        let rsi = [test_series(
+            IndicatorId::Rsi,
+            "RSI",
+            vec![test_line("RSI6", vec![Some(48.26)], 0, LineShape::Line)],
+            vec![30.0, 70.0],
+        )];
+        let entries = sub_plot_legend(IndicatorId::Rsi, &rsi, 0, &snapshot, tick, axis_color);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "RSI6 48.3");
+
+        let kdj = [test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![
+                test_line("K", vec![Some(52.14)], 0, LineShape::Line),
+                test_line("D", vec![Some(48.66)], 0, LineShape::Line),
+                test_line("J", vec![Some(58.9)], 0, LineShape::Line),
+            ],
+            vec![20.0, 80.0],
+        )];
+        let entries = sub_plot_legend(IndicatorId::Kdj, &kdj, 0, &snapshot, tick, axis_color);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["KDJ(9,3,3)", "K 52.1", "D 48.7", "J 58.9"]
+        );
+    }
+
+    /// A J that is a hair below zero has no meaningful negative magnitude, but
+    /// `{:.1}` would print it as `-0.0`; the readout must round to `0.0`.
+    #[test]
+    fn a_tiny_negative_percentage_should_not_read_as_negative_zero() {
+        assert_eq!(format_percentage_value(0.0), "0.0");
+        assert_eq!(format_percentage_value(-0.04), "0.0");
+        assert_eq!(format_percentage_value(-0.06), "-0.1");
+        assert_eq!(format_percentage_value(48.26), "48.3");
+        assert_eq!(format_percentage_tick(-0.0), "0");
+        assert_eq!(format_percentage_tick(0.0), "0");
     }
 
     fn one_candle_snapshot() -> CandlestickSeriesSnapshot {

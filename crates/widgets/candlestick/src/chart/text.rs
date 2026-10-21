@@ -411,6 +411,16 @@ pub(crate) fn format_price(inner: f64, tick: Tick) -> SmolStr {
     Price::from_inner(inner).format_and_round_tick(tick)
 }
 
+/// Formats a signed chart coordinate, rounded to the market's tick.
+///
+/// The MACD sub plot spans `[-m, +m]`, so its axis and legend need a formatter
+/// that keeps the sign: [`format_price`] clamps at zero and would label every
+/// negative tick as `0`. RSI, KDJ and volume are non-negative and do not use it.
+pub(crate) fn format_signed_price(inner: f64, tick: Tick) -> SmolStr {
+    let inner = inner.clamp(i128::MIN as f64, i128::MAX as f64).round() as i128;
+    ProfitOrLoss::from_inner(inner).format_and_round_tick(tick)
+}
+
 /// Formats a chart coordinate as a volume with a `K` / `M` suffix.
 pub(crate) fn format_volume(inner: f64) -> SmolStr {
     let scale = Quantity::from(1_u64).inner();
@@ -672,6 +682,30 @@ mod tests {
         let price = Price::from_str("4523.89562").expect("price should parse");
 
         assert_eq!(format_price(price.inner() as f64, tick("0.01")), "4523.90");
+    }
+
+    /// The MACD axis has a negative half, so the signed formatter has to keep the
+    /// sign. The plain one deliberately keeps clamping prices at zero.
+    #[test]
+    fn format_signed_price_should_keep_a_negative_sign() {
+        let price = Price::from_str("1.234").expect("price should parse");
+        let inner = price.inner() as f64;
+
+        assert_eq!(format_signed_price(-inner, tick("0.01")), "-1.23");
+        assert_eq!(format_signed_price(inner, tick("0.01")), "1.23");
+    }
+
+    #[test]
+    fn format_price_should_clamp_what_format_signed_price_keeps() {
+        let price = Price::from_str("1.234").expect("price should parse");
+        let inner = -(price.inner() as f64);
+
+        assert_eq!(
+            format_price(inner, tick("0.01")),
+            "0.00",
+            "the price formatter clamps at zero"
+        );
+        assert_eq!(format_signed_price(inner, tick("0.01")), "-1.23");
     }
 
     #[test]
