@@ -1876,7 +1876,21 @@ impl CandlestickWidget {
         // keeps the plain margin — prefetching further right would push the
         // chart off the live edge for no warmup gain (design §7.4.2).
         let margin = PREFETCH_MARGIN.max(self.warmup_depth());
+        // Warmup is for a historical window only (design §7.4.2). With the buffer
+        // at capacity the page it asks for evicts the newest candle — the one the
+        // user is watching — through `merge_older`. A first page that has not
+        // filled the buffer yet would not evict anything, but it is still at the
+        // live edge, and only `merge_older` clears that flag: a guard that read
+        // `!snapshot.at_live_edge()` alone would therefore never let the first
+        // history page out, because the request it needs is the one that would
+        // take the series off the live edge.
+        //
+        // The viewport is what says the user is reading history, so it is what
+        // decides. With `right_timestamp == None` the chart still follows the
+        // live edge and no history is asked for; panning sets the anchor, and the
+        // page is fetched then.
         if range.start <= margin
+            && (self.viewport.right_timestamp.is_some() || !snapshot.at_live_edge())
             && !snapshot.older_exhausted()
             && !self.fetching_history
             && let Some(before_timestamp) = snapshot.earliest_timestamp()
@@ -2120,8 +2134,8 @@ pub(crate) mod tests {
     use app_config::widget::VersionedWidgetConfig;
     use app_config_provider::notification::ConfigNotification;
     use gpui_kit::{
-        AppContext, Entity, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext,
-        WeakEntity, Window, div, size,
+        AppContext, Bounds, Entity, Modifiers, MouseButton, Render, TestAppContext,
+        VisualTestContext, WeakEntity, Window, div, point, size,
     };
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::{
@@ -2156,6 +2170,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
+        chart::geometry::LayoutInputs,
+        indicator::IndicatorId,
         model::CandlestickSeries,
         service::{CandlestickEventSubscription, CandlestickPageQuery},
         time::TIMEFRAMES,
@@ -5868,14 +5884,55 @@ pub(crate) mod tests {
         series.snapshot()
     }
 
+    /// A snapshot the user has panned into: full to capacity, then one older
+    /// candle merged in, which is what takes the chart off the live edge.
+    ///
+    /// `merge_older` only leaves the live edge when it actually evicts a candle
+    /// (`model.rs`), and a series below capacity has room for the older candle
+    /// without evicting anything. A snapshot that stayed at the live edge would
+    /// land on the guard this fixture exists to get past, not on the history
+    /// prefetch.
+    fn panned_snapshot() -> CandlestickSeriesSnapshot {
+        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
+        let newest = i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64");
+        series.merge_initial((1..=newest).map(|index| candle(index, 100)));
+        series.merge_older(std::iter::once(candle(0, 100)));
+        series.snapshot()
+    }
+
+    /// The chart's boxes for a body `width` pixels wide.
+    ///
+    /// The prefetch threshold is measured against [`ChartLayout::maximum_plot_width`],
+    /// which the widest possible axis leaves: building the layout directly answers
+    /// the same question the canvas' layout pass answers, without a window to drive
+    /// it.
+    fn layout_of_width(width: f32) -> ChartLayout {
+        ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(width), px(220.0))),
+            LayoutInputs {
+                longest_label_width: px(0.0),
+                sub_plot_count: 1,
+            },
+        )
+    }
+
     /// Widening the chart from the outside — splitting the pane, or dragging a
     /// neighbour's edge — makes room for candles the loaded page does not hold,
     /// and none of that is a gesture inside the chart.
+    ///
+    /// The snapshot is a panned one, and the view is anchored at 300 while the
+    /// chart is widened — close enough to the oldest candle that only the widened
+    /// plot reaches the margin.
     #[gpui_kit::test]
     fn a_widened_chart_should_ask_for_the_history_it_now_needs(cx: &mut TestAppContext) {
         let built = widget(cx);
         let widget = built.widget;
-        cx.update(|cx| accept_snapshot(&widget, page_snapshot(), cx));
+        cx.update(|cx| {
+            accept_snapshot(&widget, panned_snapshot(), cx);
+            widget.update(cx, |widget, _| {
+                widget.viewport.right_timestamp = Some(300);
+            });
+        });
 
         let window = cx.open_window(size(px(320.0), px(220.0)), {
             let widget = widget.clone();
@@ -5911,6 +5968,282 @@ pub(crate) mod tests {
             cx.read(|cx| widget.read(cx).fetching_history),
             "a chart wider than its page has to ask for the candles it now shows"
         );
+    }
+
+    /// The live edge is not a place to warm indicators up: the history page that
+    /// warmup asks for would evict the newest candle through `merge_older`, and at
+    /// the live edge that is the candle the user is watching (design §7.4.2).
+    /// Every other condition for a history request holds here.
+    #[gpui_kit::test]
+    fn a_live_edge_chart_should_not_ask_for_history(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
+        series.merge_initial((1..=200).map(|index| candle(index, 100)));
+        let snapshot = series.snapshot();
+        assert!(
+            snapshot.at_live_edge(),
+            "the fixture has to sit at the live edge"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                // Wider than the loaded page: the visible range starts before the
+                // oldest candle, so it is inside the margin on its own.
+                let layout = layout_of_width(2400.0);
+                let range =
+                    visible_range(snapshot.candles(), widget.viewport, layout.maximum_plot_width());
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the live-edge guard is the only condition left between this chart and a history request"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                // A cancelled load is not this test's subject, and its late failure
+                // would keep the prefetch from running for the wrong reason.
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    !widget.fetching_history,
+                    "warming up at the live edge would push out the newest candle"
+                );
+                assert!(
+                    !widget.fetching_newer,
+                    "and the live edge has nothing newer to fetch either"
+                );
+            });
+        });
+    }
+
+    /// A chart that has panned into its first page is still at the live edge as
+    /// far as the series is concerned: `merge_initial` sets `at_live_edge`, and
+    /// only a history page that actually evicts the newest candle clears it. The
+    /// viewport is what shows the user is reading history, so this must ask for
+    /// the page it needs — reading only `at_live_edge` would make the first
+    /// history page impossible to ask for: the request is what would take the
+    /// series off the live edge.
+    #[gpui_kit::test]
+    fn a_panned_chart_on_a_live_edge_series_should_still_ask_for_history(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
+        series.merge_initial((1..=300).map(|index| candle(index, 100)));
+        let snapshot = series.snapshot();
+        assert!(
+            snapshot.at_live_edge(),
+            "the fixture is the first page the stream loads"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                // Panned as far left as the first page goes: the visible range
+                // starts at the oldest candle the buffer holds.
+                widget.viewport.right_timestamp = Some(1);
+                let layout = layout_of_width(800.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the first page is exhausted on the left"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_history,
+                    "a panned chart must be able to fetch the history its viewport asks for"
+                );
+                assert!(
+                    !widget.fetching_newer,
+                    "the left branch answered this window, not the right one"
+                );
+            });
+        });
+    }
+
+    /// The history threshold grows with the warmup depth of the enabled
+    /// indicators: the same snapshot and viewport ask for nothing under the
+    /// default MA(5,10,20), whose warmup is 19, and ask for a page once MA's first
+    /// line needs 500 candles of warmup (499 leading candles).
+    #[gpui_kit::test]
+    fn a_deeper_indicator_warmup_should_widen_the_history_prefetch_threshold(
+        cx: &mut TestAppContext,
+    ) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = panned_snapshot();
+        assert!(
+            !snapshot.at_live_edge(),
+            "warmup is only fetched for a historical window (design §7.4.2)"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                // A 800px body puts the visible range's start between the plain
+                // margin and MA(500)'s warmup, so only the threshold decides.
+                widget.viewport.right_timestamp = Some(300);
+                let layout = layout_of_width(800.0);
+                let range =
+                    visible_range(snapshot.candles(), widget.viewport, layout.maximum_plot_width());
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                // A cancelled load is not this test's subject, and its late failure
+                // would keep the prefetch from running for the wrong reason.
+                widget.status.report(WidgetState::Ready, context);
+
+                assert_eq!(
+                    widget.warmup_depth(),
+                    19,
+                    "the default configuration's longest warmup is MA(20)'s 19"
+                );
+                assert!(
+                    range.start > PREFETCH_MARGIN,
+                    "the default threshold leaves nothing to ask for at this width"
+                );
+                widget.prefetch_if_needed(context);
+                assert!(
+                    !widget.fetching_history,
+                    "a window this far from the left edge needs no history under the default threshold"
+                );
+
+                let mut deeper = widget.config.indicator.clone();
+                assert!(
+                    deeper.set_line_period(IndicatorId::Ma, 0, 500),
+                    "the fixture configuration holds MA's first line"
+                );
+                widget.set_indicator_config(deeper, context);
+                assert_eq!(
+                    widget.warmup_depth(),
+                    499,
+                    "MA(500) needs 499 leading candles"
+                );
+                assert!(
+                    range.start <= widget.warmup_depth(),
+                    "the same window is inside the widened threshold"
+                );
+
+                widget.prefetch_if_needed(context);
+                assert!(
+                    widget.fetching_history,
+                    "the warmup is what moved the threshold past this visible range"
+                );
+            });
+        });
+    }
+
+    /// Panning towards the right edge asks for the page the loaded range does
+    /// not hold. The left branch must not swallow the window first: its start is
+    /// nowhere near the left margin.
+    #[gpui_kit::test]
+    fn a_panned_chart_near_the_end_should_ask_for_newer_candles(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = panned_snapshot();
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                widget.viewport.right_timestamp = Some(1450);
+                let layout = layout_of_width(800.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start > PREFETCH_MARGIN,
+                    "the left branch must not answer this window"
+                );
+                assert!(
+                    range.end.saturating_add(PREFETCH_MARGIN) >= snapshot.candles().len(),
+                    "the visible window reaches the loaded range's end"
+                );
+                assert!(
+                    !snapshot.at_live_edge(),
+                    "there is a newer page to ask for, so the series is not at the live edge"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_newer,
+                    "a panned chart near the end has to ask for the candles it now shows"
+                );
+                assert!(
+                    !widget.fetching_history,
+                    "the left margin is far from this window"
+                );
+            });
+        });
+    }
+
+    /// The warmup margin belongs to the left branch: measured against the right
+    /// edge it would ask for newer candles the loaded range already covers, and
+    /// moving towards the newest candle is not a warmup need.
+    #[gpui_kit::test]
+    fn warmup_should_not_widen_the_newer_prefetch_margin(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = panned_snapshot();
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                let mut deeper = widget.config.indicator.clone();
+                assert!(
+                    deeper.set_line_period(IndicatorId::Ma, 0, 500),
+                    "the fixture configuration holds MA's first line"
+                );
+                widget.set_indicator_config(deeper, context);
+                assert_eq!(widget.warmup_depth(), 499);
+
+                // `end + 120` is short of the loaded range's end, while
+                // `end + 499` reaches past it: only a right branch that used the
+                // warmup margin instead of the plain one would fetch here.
+                widget.viewport.right_timestamp = Some(1199);
+                let layout = layout_of_width(800.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start > widget.warmup_depth(),
+                    "the left branch's warmed threshold must not answer this window"
+                );
+                assert!(
+                    range.end.saturating_add(PREFETCH_MARGIN) < snapshot.candles().len(),
+                    "the plain margin leaves the loaded range intact"
+                );
+                assert!(
+                    range.end.saturating_add(widget.warmup_depth()) >= snapshot.candles().len(),
+                    "the fixture only differs if the right branch uses the warmup margin"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    !widget.fetching_newer,
+                    "the newer branch keeps the plain margin"
+                );
+                assert!(
+                    !widget.fetching_history,
+                    "the left branch's warmed threshold is still far from this window"
+                );
+            });
+        });
     }
 
     /// Failure is terminal, so a relayout must not trade the failure being
