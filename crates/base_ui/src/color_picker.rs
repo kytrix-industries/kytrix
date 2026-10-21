@@ -10,9 +10,9 @@
 //! the entity behind a private slot that never notifies, so the observer GPUI's `use_keyed_state`
 //! installs on the caller's view does not fire on every color change. That removes one redundant
 //! notify; it is not a promise that the caller never renders, because GPUI's dirty propagation
-//! still marks the ancestors of a dirty view. The palette — and, in a later phase, the HSLA
-//! tracks — is drawn by a canvas rather than by one element per swatch or slice, which is where
-//! the frame cost of a picker usually comes from.
+//! still marks the ancestors of a dirty view. The palette and the four HSLA tracks are drawn by
+//! canvases rather than by one element per swatch or slice, which is where the frame cost of a
+//! picker usually comes from.
 //!
 //! Both `gpui-base` and `gpui-component` ship a color picker, and this module deliberately uses
 //! neither: it keeps base_ui's [`crate::input::Input`], [`crate::button::Button`], theme roles and
@@ -24,11 +24,11 @@
 use std::{cell::Cell, rc::Rc, sync::LazyLock};
 
 use gpui_kit::{
-    AnyElement, App, AppContext, Bounds, Context, ElementId, Entity, EventEmitter, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderOnce,
-    Rgba, Role, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    base::box_shadow, canvas, checkerboard, div, fill, hsla, point, prelude::FluentBuilder, px,
-    rems, size,
+    AnyElement, App, AppContext, Bounds, Context, ElementId, Empty, Entity, EntityId, EventEmitter,
+    Hsla, InteractiveElement, IntoElement, MouseButton, Orientation, ParentElement, Pixels, Point,
+    Render, RenderOnce, Rgba, Role, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    TextAlign, Window, base::box_shadow, canvas, checkerboard, div, fill, hsla, point,
+    prelude::FluentBuilder, px, rems, size,
 };
 use smol_str::{SmolStr, format_smolstr};
 
@@ -48,6 +48,25 @@ const PANEL_PADDING: Pixels = px(12.);
 const PANEL_CONTENT_WIDTH: Pixels = px(284.);
 /// The vertical gap between the tabs, the content, the divider and the hex row.
 const PANEL_SECTION_GAP: Pixels = px(12.);
+
+/// The height of one HSLA slider row.
+const SLIDER_ROW_HEIGHT: Pixels = px(24.);
+/// The vertical gap between two HSLA slider rows.
+const SLIDER_ROW_GAP: Pixels = px(10.);
+/// The width of a row's label column.
+const SLIDER_LABEL_WIDTH: Pixels = px(72.);
+/// The width of a row's numeric value column.
+const SLIDER_VALUE_WIDTH: Pixels = px(40.);
+/// The horizontal gap between a row's label, its track and its value.
+const SLIDER_ROW_INNER_GAP: Pixels = px(8.);
+/// The height of a slider's track.
+const TRACK_HEIGHT: f32 = 14.0;
+/// A track's corner radius; half its height, so its caps are round.
+const TRACK_RADIUS: f32 = 7.0;
+/// How many solid slices a track is drawn with.
+const TRACK_SLICES: usize = 256;
+/// The diameter of a slider's thumb.
+const THUMB_DIAMETER: f32 = 12.0;
 
 /// The palette's columns: one lightness step each.
 const PALETTE_COLS: usize = 12;
@@ -293,6 +312,32 @@ impl ColorPickerState {
         self.set_user_color(swatch.hsla, true, window, cx);
     }
 
+    /// Moves one HSLA channel to `t`, leaving the other three untouched.
+    ///
+    /// `t` is the fraction a slider's track maps a pointer position to, so it is clamped to the
+    /// unit range before it becomes a component. Like every other user path this goes through
+    /// [`ColorPickerState::set_user_color`]: an unchanged color emits nothing, and a change emits
+    /// [`ColorPickerEvent::ColorChanged`] and synchronizes the hex field.
+    fn set_channel(
+        &mut self,
+        channel: HslaChannel,
+        t: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let t = t.clamp(0., 1.);
+        let mut color = self.color;
+
+        match channel {
+            HslaChannel::Hue => color.h = t,
+            HslaChannel::Saturation => color.s = t,
+            HslaChannel::Lightness => color.l = t,
+            HslaChannel::Alpha => color.a = t,
+        }
+
+        self.set_user_color(color, true, window, cx);
+    }
+
     /// Writes `color` into the hex field in its normalized uppercase form.
     fn write_hex(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
         let hex = hex_string(color);
@@ -377,14 +422,13 @@ impl Render for ColorPickerState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Read the theme through Copy values before anything borrows the context mutably; the
         // panel must paint from the values of this frame, not from a cached theme.
-        let (panel_background, panel_border, panel_shadow, tab_track, fg_muted) = {
+        let (panel_background, panel_border, panel_shadow, tab_track) = {
             let theme = cx.theme();
             (
                 theme.components.menu.background.hsla,
                 theme.roles.line.divider.hsla,
                 theme.components.menu.shadow.hsla,
                 theme.roles.surface.sunken.hsla,
-                theme.roles.fg.muted.hsla,
             )
         };
 
@@ -395,18 +439,34 @@ impl Render for ColorPickerState {
                 PaletteGrid::new(state.clone(), self.color, self.labels.palette.clone())
                     .into_any_element()
             }
-            // The HSLA sliders replace this placeholder in the next phase; until then the tab
-            // still exercises the panel's shell and its tab switch.
             ColorPickerTab::Hsla => div()
-                .h(px(120.))
                 .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .bg(tab_track)
-                .text_size(rems(0.75))
-                .text_color(fg_muted)
-                .child(self.labels.hsla.clone())
+                .flex_col()
+                .gap(SLIDER_ROW_GAP)
+                .child(HslaSlider::new(
+                    state.clone(),
+                    HslaChannel::Hue,
+                    self.color,
+                    HslaChannel::Hue.label(&self.labels),
+                ))
+                .child(HslaSlider::new(
+                    state.clone(),
+                    HslaChannel::Saturation,
+                    self.color,
+                    HslaChannel::Saturation.label(&self.labels),
+                ))
+                .child(HslaSlider::new(
+                    state.clone(),
+                    HslaChannel::Lightness,
+                    self.color,
+                    HslaChannel::Lightness.label(&self.labels),
+                ))
+                .child(HslaSlider::new(
+                    state.clone(),
+                    HslaChannel::Alpha,
+                    self.color,
+                    HslaChannel::Alpha.label(&self.labels),
+                ))
                 .into_any_element(),
         };
 
@@ -513,9 +573,9 @@ impl RenderOnce for ColorWell {
                 theme.roles.line.divider.hsla,
             )
         };
-        // An alpha that quantizes to opaque displays as opaque in the hex field, so it must not
-        // show a checkerboard here either.
-        let translucent = rgba8(color)[3] < 255;
+        // A color that is not fully opaque shows the checkerboard, exactly as the alpha slider
+        // reads it; the hex field's eight-bit rounding is a display detail, not this test.
+        let translucent = color.a < 1.0;
 
         div().relative().w(size).h(size).child(
             canvas(
@@ -590,28 +650,42 @@ impl RenderOnce for PaletteGrid {
                 canvas(
                     move |bounds, _, _| prepaint_bounds.set(bounds),
                     move |bounds, (), window, _| {
-                        for (index, swatch) in PALETTE.iter().enumerate() {
-                            let row = index / PALETTE_COLS;
-                            let col = index % PALETTE_COLS;
-                            let origin = point(
-                                bounds.left() + px(PALETTE_STEP * col as f32),
-                                bounds.top() + px(PALETTE_STEP * row as f32),
-                            );
-                            let cell =
-                                Bounds::new(origin, size(px(PALETTE_CELL), px(PALETTE_CELL)));
+                        // The cells are scaled exactly as `palette_index_at` scales its hit test:
+                        // the grid is laid out PALETTE_SIZE wide, but the canvas may be measured
+                        // at another size, and drawing at the nominal geometry would then
+                        // disagree with the hit areas.
+                        let scale = (bounds.size.width.as_f32() / PALETTE_SIZE)
+                            .min(bounds.size.height.as_f32() / PALETTE_SIZE);
+                        let cell_radius = px(4.0 * scale);
+                        let ring_inset = 1.0 * scale;
+                        let ring_width = px(2.0 * scale);
+                        let ring_radius = px(3.0 * scale);
 
-                            window.paint_quad(fill(cell, swatch.hsla).corner_radii(px(4.)));
+                        for (index, swatch) in PALETTE.iter().enumerate() {
+                            let cell = palette_cell_bounds(
+                                bounds,
+                                index / PALETTE_COLS,
+                                index % PALETTE_COLS,
+                            );
+
+                            window.paint_quad(fill(cell, swatch.hsla).corner_radii(cell_radius));
 
                             if selected == Some(index) {
                                 let inner = Bounds::new(
-                                    point(origin.x + px(1.), origin.y + px(1.)),
-                                    size(px(PALETTE_CELL - 2.0), px(PALETTE_CELL - 2.0)),
+                                    point(
+                                        cell.origin.x + px(ring_inset),
+                                        cell.origin.y + px(ring_inset),
+                                    ),
+                                    size(
+                                        cell.size.width - px(ring_inset * 2.0),
+                                        cell.size.height - px(ring_inset * 2.0),
+                                    ),
                                 );
                                 window.paint_quad(
                                     fill(inner, hsla(0., 0., 0., 0.))
-                                        .border_widths(px(2.))
+                                        .border_widths(ring_width)
                                         .border_color(selection_ring_color(swatch.hsla))
-                                        .corner_radii(px(3.)),
+                                        .corner_radii(ring_radius),
                                 );
                             }
                         }
@@ -628,6 +702,332 @@ impl RenderOnce for PaletteGrid {
                 state.update(cx, |state, cx| state.select_palette(index, window, cx));
             })
     }
+}
+
+/// Which component of an [`Hsla`] a slider edits.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum HslaChannel {
+    Hue,
+    Saturation,
+    Lightness,
+    Alpha,
+}
+
+impl HslaChannel {
+    /// The element id prefix of the channel's track.
+    fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Hue => "color-picker-hue-track",
+            Self::Saturation => "color-picker-saturation-track",
+            Self::Lightness => "color-picker-lightness-track",
+            Self::Alpha => "color-picker-alpha-track",
+        }
+    }
+
+    /// The debug selector of the channel's track.
+    fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Hue => "TEST_COLOR_PICKER_HUE_TRACK",
+            Self::Saturation => "TEST_COLOR_PICKER_SATURATION_TRACK",
+            Self::Lightness => "TEST_COLOR_PICKER_LIGHTNESS_TRACK",
+            Self::Alpha => "TEST_COLOR_PICKER_ALPHA_TRACK",
+        }
+    }
+
+    /// The channel's label, taken from the panel's labels.
+    fn label(self, labels: &ColorPickerLabels) -> SharedString {
+        match self {
+            Self::Hue => labels.hue.clone(),
+            Self::Saturation => labels.saturation.clone(),
+            Self::Lightness => labels.lightness.clone(),
+            Self::Alpha => labels.alpha.clone(),
+        }
+    }
+
+    /// The component of `color` the channel edits, as the `0..=1` fraction a track maps to.
+    fn value(self, color: Hsla) -> f32 {
+        match self {
+            Self::Hue => color.h,
+            Self::Saturation => color.s,
+            Self::Lightness => color.l,
+            Self::Alpha => color.a,
+        }
+    }
+
+    /// The number the channel shows and announces: degrees for hue, percent for the rest.
+    fn display_value(self, color: Hsla) -> i32 {
+        match self {
+            Self::Hue => (self.value(color) * 360.0).round() as i32,
+            Self::Saturation | Self::Lightness | Self::Alpha => {
+                (self.value(color) * 100.0).round() as i32
+            }
+        }
+    }
+
+    /// The channel's value text.
+    fn value_text(self, color: Hsla) -> SharedString {
+        SharedString::new(format_smolstr!("{}", self.display_value(color)))
+    }
+}
+
+/// The payload of a track drag, so a drag only updates the track it started on.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct HslaDrag {
+    picker: EntityId,
+    channel: HslaChannel,
+}
+
+/// The preview of a track drag: empty, so dragging a track paints no ghost.
+struct HslaDragPreview;
+
+impl Render for HslaDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// One hue, saturation, lightness or alpha slider row.
+///
+/// The track is a single canvas: [`TRACK_SLICES`] solid slices and one thumb, not a run of
+/// per-slice elements and not a gradient. The state is only used to route pointer events back to
+/// it; the color and the text the row draws are handed in by the panel.
+#[derive(IntoElement)]
+struct HslaSlider {
+    state: Entity<ColorPickerState>,
+    channel: HslaChannel,
+    color: Hsla,
+    label: SharedString,
+}
+
+impl HslaSlider {
+    /// Builds the row for `channel`, reading the current `color`.
+    fn new(
+        state: Entity<ColorPickerState>,
+        channel: HslaChannel,
+        color: Hsla,
+        label: SharedString,
+    ) -> Self {
+        Self {
+            state,
+            channel,
+            color,
+            label,
+        }
+    }
+}
+
+impl RenderOnce for HslaSlider {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Self {
+            state,
+            channel,
+            color,
+            label,
+        } = self;
+        // The track's paint callback has to be `'static`, so the two theme colors it needs are
+        // copied out here rather than borrowed from the theme inside it.
+        let (label_color, thumb_fill) = {
+            let theme = cx.theme();
+            (theme.roles.fg.muted.hsla, theme.roles.surface.overlay.hsla)
+        };
+        let thumb_border = hsla(0., 0., 0., 0.35);
+        let value = channel.value(color);
+        let display_value = channel.display_value(color);
+        let value_text = channel.value_text(color);
+        let max = match channel {
+            HslaChannel::Hue => 360.,
+            HslaChannel::Saturation | HslaChannel::Lightness | HslaChannel::Alpha => 100.,
+        };
+        let bounds = Rc::new(Cell::new(Bounds::default()));
+        let prepaint_bounds = bounds.clone();
+        let picker = state.entity_id();
+        let drag_state = state.clone();
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(SLIDER_ROW_INNER_GAP)
+            .h(SLIDER_ROW_HEIGHT)
+            .child(
+                div()
+                    .w(SLIDER_LABEL_WIDTH)
+                    .text_size(rems(0.75))
+                    .text_color(label_color)
+                    .child(label.clone()),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .h(px(TRACK_HEIGHT))
+                    .id((channel.id_prefix(), picker))
+                    .role(Role::Slider)
+                    .aria_label(label)
+                    .aria_numeric_value(display_value as f64)
+                    .aria_min_numeric_value(0.)
+                    .aria_max_numeric_value(max)
+                    .aria_orientation(Orientation::Horizontal)
+                    .cursor_pointer()
+                    .debug_selector(move || channel.debug_selector().into())
+                    .child(
+                        canvas(
+                            move |bounds, _, _| prepaint_bounds.set(bounds),
+                            move |bounds, (), window, _| {
+                                paint_track(
+                                    window,
+                                    bounds,
+                                    channel,
+                                    color,
+                                    value,
+                                    thumb_fill,
+                                    thumb_border,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        let bounds = bounds.get();
+                        let width = bounds.size.width.as_f32();
+                        if width <= 0.0 {
+                            return;
+                        }
+
+                        let t = ((event.position.x - bounds.left()).as_f32() / width).clamp(0., 1.);
+                        state.update(cx, |state, cx| state.set_channel(channel, t, window, cx));
+                    })
+                    .on_drag(HslaDrag { picker, channel }, |_, _, _, cx| {
+                        cx.new(|_| HslaDragPreview)
+                    })
+                    .on_drag_move::<HslaDrag>(move |event, window, cx| {
+                        let drag = *event.drag(cx);
+                        if drag.picker != picker || drag.channel != channel {
+                            return;
+                        }
+
+                        // The element's own bounds, not the prepaint cell: the pointer may be
+                        // anywhere in the window, and `event.bounds` is where this track was
+                        // laid out.
+                        let bounds = event.bounds;
+                        let width = bounds.size.width.as_f32();
+                        if width <= 0.0 {
+                            return;
+                        }
+
+                        let t = ((event.event.position.x - bounds.left()).as_f32() / width)
+                            .clamp(0., 1.);
+                        drag_state
+                            .update(cx, |state, cx| state.set_channel(channel, t, window, cx));
+                    }),
+            )
+            .child(
+                div()
+                    .w(SLIDER_VALUE_WIDTH)
+                    .text_size(rems(0.75))
+                    .text_color(label_color)
+                    .text_align(TextAlign::Right)
+                    .child(value_text),
+            )
+    }
+}
+
+/// Paints one track: [`TRACK_SLICES`] solid slices with rounded caps, then the thumb.
+///
+/// Every slice is a plain quad, so no gradient shader is involved and the color is exact on every
+/// backend. Near the two ends a slice shrinks from both sides by the sagitta of the track's
+/// radius, which draws the caps without needing a clip.
+fn paint_track(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    channel: HslaChannel,
+    base: Hsla,
+    value: f32,
+    thumb_fill: Hsla,
+    thumb_border: Hsla,
+) {
+    let left = bounds.left().as_f32();
+    let top = bounds.top().as_f32();
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    for index in 0..TRACK_SLICES {
+        let t0 = index as f32 / TRACK_SLICES as f32;
+        let t1 = (index + 1) as f32 / TRACK_SLICES as f32;
+        let t = (t0 + t1) / 2.0;
+        let color = match channel {
+            HslaChannel::Hue => hsla(t, 1.0, 0.5, 1.0),
+            HslaChannel::Saturation => hsla(base.h, t, base.l, 1.0),
+            HslaChannel::Lightness => hsla(base.h, base.s, t, 1.0),
+            HslaChannel::Alpha => hsla(base.h, base.s, base.l, t),
+        };
+        let x0 = left + width * t0;
+        let x1 = left + width * t1;
+        let center = (x0 + x1) / 2.0;
+        let distance = (center - left).min((left + width) - center);
+        let inset = if distance < TRACK_RADIUS {
+            TRACK_RADIUS
+                - (TRACK_RADIUS * TRACK_RADIUS
+                    - (TRACK_RADIUS - distance) * (TRACK_RADIUS - distance))
+                    .sqrt()
+        } else {
+            0.0
+        };
+        let slice_height = height - inset * 2.0;
+
+        if slice_height <= 0.0 {
+            continue;
+        }
+
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x0), px(top + inset)),
+                size(px(x1 - x0), px(slice_height)),
+            ),
+            color,
+        ));
+    }
+
+    let half = THUMB_DIAMETER / 2.0;
+    let x = (left + width * value).clamp(left + half, left + width - half);
+    let y = top + height / 2.0;
+
+    window.paint_quad(
+        fill(
+            Bounds::new(
+                point(px(x - half), px(y - half)),
+                size(px(THUMB_DIAMETER), px(THUMB_DIAMETER)),
+            ),
+            thumb_fill,
+        )
+        .border_widths(px(1.))
+        .border_color(thumb_border)
+        .corner_radii(px(half)),
+    );
+}
+
+/// The bounds of one palette cell inside a canvas measured at `bounds`.
+///
+/// The grid is scaled as a whole, exactly like [`palette_index_at`]: it is laid out
+/// [`PALETTE_SIZE`] wide, and every cell and gap keeps its proportion when the canvas is measured
+/// at another size.
+fn palette_cell_bounds(bounds: Bounds<Pixels>, row: usize, col: usize) -> Bounds<Pixels> {
+    let scale_x = bounds.size.width.as_f32() / PALETTE_SIZE;
+    let scale_y = bounds.size.height.as_f32() / PALETTE_SIZE;
+    let origin = point(
+        bounds.left() + px(PALETTE_STEP * col as f32 * scale_x),
+        bounds.top() + px(PALETTE_STEP * row as f32 * scale_y),
+    );
+
+    Bounds::new(
+        origin,
+        size(px(PALETTE_CELL * scale_x), px(PALETTE_CELL * scale_y)),
+    )
 }
 
 /// Quantizes `color` to the eight-bit sRGB channels the hex notation can express.
@@ -805,14 +1205,18 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use gpui_kit::{
-        AppContext, Bounds, Context, Entity, Hsla, IntoElement, Modifiers, ParentElement, Pixels,
-        Point, Render, Styled, Subscription, TestAppContext, Window, div, hsla, point, px, size,
+        AppContext, Bounds, Context, Entity, Hsla, IntoElement, Modifiers, MouseButton,
+        ParentElement, Pixels, Point, Render, SharedString, Styled, Subscription, TestAppContext,
+        VisualTestContext, Window, div, hsla, point, px, size,
     };
 
     use super::{
-        ColorPickerEvent, ColorPickerState, PALETTE, PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS,
-        PALETTE_SATURATION, PALETTE_SIZE, PALETTE_STEP, PANEL_CONTENT_WIDTH, hex_string,
-        palette_hue, palette_index, palette_index_at, parse_hex, rgba8, selection_ring_color,
+        ColorPickerEvent, ColorPickerLabels, ColorPickerState, ColorPickerTab, HslaChannel,
+        PALETTE, PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION, PALETTE_SIZE,
+        PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_GAP, SLIDER_ROW_HEIGHT,
+        SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS,
+        TRACK_SLICES, hex_string, palette_cell_bounds, palette_hue, palette_index,
+        palette_index_at, parse_hex, rgba8, selection_ring_color,
     };
     use crate::style::theme;
 
@@ -1002,6 +1406,192 @@ mod tests {
     }
 
     #[test]
+    fn palette_index_at_should_pin_the_24_pixel_pitch_to_the_right_edge() {
+        let grid = palette_bounds(point(px(0.), px(0.)), PALETTE_SIZE, PALETTE_SIZE);
+        // The vertical centre of the last row; the last cell spans x = 264..284, so its index is
+        // 11 * 12 + 11 = 143.
+        let y = px(PALETTE_STEP * (PALETTE_ROWS - 1) as f32 + 10.);
+        assert_eq!(y, px(274.));
+
+        assert_eq!(
+            palette_index_at(grid, point(px(263.999), y)),
+            None,
+            "the 4px gap before the last cell ends where 264 starts"
+        );
+        assert_eq!(
+            palette_index_at(grid, point(px(264.0), y)),
+            Some(143),
+            "the last cell starts at 264, not at PALETTE_SIZE / 12 * 11"
+        );
+        assert_eq!(
+            palette_index_at(grid, point(px(283.999), y)),
+            Some(143),
+            "the last cell reaches 284"
+        );
+        assert_eq!(
+            palette_index_at(grid, point(px(284.0), y)),
+            None,
+            "the grid's right edge is exclusive"
+        );
+        // The same boundaries one pitch to the left: column 10 starts at 240.
+        assert_eq!(palette_index_at(grid, point(px(239.999), y)), None);
+        assert_eq!(palette_index_at(grid, point(px(240.0), y)), Some(142));
+    }
+
+    #[test]
+    fn drawn_cells_should_map_back_to_their_own_index_at_any_scale() {
+        for edge in [PALETTE_SIZE, PALETTE_SIZE / 2.0] {
+            let grid = palette_bounds(point(px(100.), px(50.)), edge, edge);
+
+            for (index, _) in PALETTE.iter().enumerate() {
+                let cell = palette_cell_bounds(grid, index / PALETTE_COLS, index % PALETTE_COLS);
+
+                assert_eq!(
+                    palette_index_at(grid, cell.center()),
+                    Some(index),
+                    "the centre of the drawn cell {index} should hit that cell at {edge}px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hsla_channel_should_name_its_track_and_selector() {
+        assert_eq!(HslaChannel::Hue.id_prefix(), "color-picker-hue-track");
+        assert_eq!(
+            HslaChannel::Saturation.id_prefix(),
+            "color-picker-saturation-track"
+        );
+        assert_eq!(
+            HslaChannel::Lightness.id_prefix(),
+            "color-picker-lightness-track"
+        );
+        assert_eq!(HslaChannel::Alpha.id_prefix(), "color-picker-alpha-track");
+
+        assert_eq!(
+            HslaChannel::Hue.debug_selector(),
+            "TEST_COLOR_PICKER_HUE_TRACK"
+        );
+        assert_eq!(
+            HslaChannel::Saturation.debug_selector(),
+            "TEST_COLOR_PICKER_SATURATION_TRACK"
+        );
+        assert_eq!(
+            HslaChannel::Lightness.debug_selector(),
+            "TEST_COLOR_PICKER_LIGHTNESS_TRACK"
+        );
+        assert_eq!(
+            HslaChannel::Alpha.debug_selector(),
+            "TEST_COLOR_PICKER_ALPHA_TRACK"
+        );
+    }
+
+    #[test]
+    fn hsla_channel_should_read_its_label_from_the_panel_labels() {
+        let labels = ColorPickerLabels {
+            palette: SharedString::new_static("palette!"),
+            hsla: SharedString::new_static("hsla!"),
+            hue: SharedString::new_static("hue!"),
+            saturation: SharedString::new_static("saturation!"),
+            lightness: SharedString::new_static("lightness!"),
+            alpha: SharedString::new_static("alpha!"),
+        };
+
+        assert_eq!(HslaChannel::Hue.label(&labels), labels.hue);
+        assert_eq!(HslaChannel::Saturation.label(&labels), labels.saturation);
+        assert_eq!(HslaChannel::Lightness.label(&labels), labels.lightness);
+        assert_eq!(HslaChannel::Alpha.label(&labels), labels.alpha);
+    }
+
+    #[test]
+    fn hsla_channel_should_read_the_component_it_edits() {
+        let color = hsla(0.1, 0.2, 0.3, 0.4);
+
+        assert_eq!(HslaChannel::Hue.value(color), 0.1);
+        assert_eq!(HslaChannel::Saturation.value(color), 0.2);
+        assert_eq!(HslaChannel::Lightness.value(color), 0.3);
+        assert_eq!(HslaChannel::Alpha.value(color), 0.4);
+    }
+
+    #[test]
+    fn hsla_channel_should_render_zero_half_and_full() {
+        let zero = hsla(0., 0., 0., 0.);
+        let half = hsla(0.5, 0.5, 0.5, 0.5);
+        let full = hsla(1., 1., 1., 1.);
+
+        assert_eq!(HslaChannel::Hue.value_text(zero).as_str(), "0");
+        assert_eq!(HslaChannel::Saturation.value_text(zero).as_str(), "0");
+        assert_eq!(HslaChannel::Lightness.value_text(zero).as_str(), "0");
+        assert_eq!(HslaChannel::Alpha.value_text(zero).as_str(), "0");
+
+        assert_eq!(HslaChannel::Hue.value_text(half).as_str(), "180");
+        assert_eq!(HslaChannel::Saturation.value_text(half).as_str(), "50");
+        assert_eq!(HslaChannel::Lightness.value_text(half).as_str(), "50");
+        assert_eq!(HslaChannel::Alpha.value_text(half).as_str(), "50");
+
+        assert_eq!(HslaChannel::Hue.value_text(full).as_str(), "360");
+        assert_eq!(HslaChannel::Saturation.value_text(full).as_str(), "100");
+        assert_eq!(HslaChannel::Lightness.value_text(full).as_str(), "100");
+        assert_eq!(HslaChannel::Alpha.value_text(full).as_str(), "100");
+    }
+
+    #[test]
+    fn hsla_channel_should_round_the_displayed_number() {
+        let almost_full = hsla(0.9999, 0.9999, 0.9999, 0.9999);
+
+        assert_eq!(
+            HslaChannel::Hue.value_text(almost_full).as_str(),
+            "360",
+            "hue rounds up into the 360 the display allows"
+        );
+        assert_eq!(
+            HslaChannel::Saturation.value_text(almost_full).as_str(),
+            "100"
+        );
+        assert_eq!(
+            HslaChannel::Lightness.value_text(almost_full).as_str(),
+            "100"
+        );
+        assert_eq!(HslaChannel::Alpha.value_text(almost_full).as_str(), "100");
+        assert_eq!(
+            HslaChannel::Hue
+                .value_text(hsla(0.0001, 0., 0., 0.))
+                .as_str(),
+            "0",
+            "hue rounds down rather than truncating a tiny value up"
+        );
+        assert_eq!(
+            HslaChannel::Hue
+                .value_text(hsla(0.5555, 0., 0., 0.))
+                .as_str(),
+            "200",
+            "0.5555 * 360 = 199.98"
+        );
+    }
+
+    #[test]
+    fn the_slider_rows_should_fill_the_panel_content_width() {
+        assert_eq!(SLIDER_ROW_HEIGHT, px(24.));
+        assert_eq!(SLIDER_ROW_GAP, px(10.));
+        assert_eq!(SLIDER_LABEL_WIDTH, px(72.));
+        assert_eq!(SLIDER_VALUE_WIDTH, px(40.));
+        assert_eq!(SLIDER_ROW_INNER_GAP, px(8.));
+        assert_eq!(TRACK_HEIGHT, 14.0);
+        assert_eq!(TRACK_RADIUS * 2.0, TRACK_HEIGHT);
+        assert_eq!(TRACK_SLICES, 256);
+        assert_eq!(THUMB_DIAMETER, 12.0);
+        assert_eq!(
+            SLIDER_LABEL_WIDTH.as_f32()
+                + SLIDER_ROW_INNER_GAP.as_f32() * 2.0
+                + SLIDER_VALUE_WIDTH.as_f32()
+                + 156.0,
+            PANEL_CONTENT_WIDTH.as_f32(),
+            "72 (label) + 8 + 156 (track) + 8 + 40 (value) = 284"
+        );
+        assert_eq!(PANEL_CONTENT_WIDTH, px(284.));
+    }
+
+    #[test]
     fn parse_hex_should_accept_every_supported_length() {
         assert_eq!(
             rgba8(parse_hex("#f00").expect("#rgb parses")),
@@ -1118,13 +1708,13 @@ mod tests {
 
     const DEFAULT_COLOR: Hsla = hsla(0.2, 0.5, 0.4, 1.0);
 
-    struct PaletteHarness {
+    struct Harness {
         state: Entity<ColorPickerState>,
         changes: Rc<RefCell<Vec<Hsla>>>,
         _subscription: Subscription,
     }
 
-    impl PaletteHarness {
+    impl Harness {
         fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
             let state = cx.new(|cx| ColorPickerState::new(DEFAULT_COLOR, window, cx));
             let changes = Rc::new(RefCell::new(Vec::new()));
@@ -1142,18 +1732,56 @@ mod tests {
         }
     }
 
-    impl Render for PaletteHarness {
+    impl Render for Harness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            // The state is the panel: rendering it directly is what the picker's overlay will
+            // do in a later phase, without needing the trigger.
             div().size_full().child(self.state.clone())
         }
+    }
+
+    /// Installs the theme and draws the panel in a window large enough for the palette tab.
+    fn harness(cx: &mut TestAppContext) -> (Entity<Harness>, &mut VisualTestContext) {
+        cx.update(theme::install);
+        let (harness, cx) = cx.add_window_view(Harness::new);
+        cx.simulate_resize(size(px(900.), px(800.)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        (harness, cx)
+    }
+
+    /// Clicks the centre of the element with `selector` and redraws the window.
+    fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
+        let target = cx
+            .debug_bounds(selector)
+            .expect("the selector is drawn")
+            .center();
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    /// The window position of `fraction` along a slider's track.
+    fn track_point(
+        cx: &mut VisualTestContext,
+        channel: HslaChannel,
+        fraction: f32,
+    ) -> Point<Pixels> {
+        let bounds = cx
+            .debug_bounds(channel.debug_selector())
+            .expect("the HSLA tab draws the track");
+
+        point(
+            bounds.origin.x + px(bounds.size.width.as_f32() * fraction),
+            bounds.origin.y + px(bounds.size.height.as_f32() / 2.0),
+        )
     }
 
     #[gpui_kit::test]
     fn select_palette_should_apply_the_swatch_emit_once_and_sync_the_hex_field(
         cx: &mut TestAppContext,
     ) {
-        cx.update(theme::install);
-        let (harness, cx) = cx.add_window_view(PaletteHarness::new);
+        let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.state.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         let swatch = PALETTE[28].hsla;
@@ -1184,13 +1812,9 @@ mod tests {
     fn the_palette_grid_should_draw_at_284_pixels_and_select_the_clicked_swatch(
         cx: &mut TestAppContext,
     ) {
-        cx.update(theme::install);
-        let (harness, cx) = cx.add_window_view(PaletteHarness::new);
+        let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.state.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        cx.simulate_resize(size(px(900.), px(800.)));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
 
         let grid = cx
             .debug_bounds("TEST_COLOR_PICKER_GRID")
@@ -1208,5 +1832,233 @@ mod tests {
         let swatch = PALETTE[28].hsla;
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
         assert_eq!(changes.borrow().as_slice(), &[swatch]);
+    }
+
+    #[gpui_kit::test]
+    fn the_panel_should_switch_between_the_palette_and_the_hsla_tracks(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+
+        assert!(cx.debug_bounds("TEST_COLOR_PICKER_PANEL").is_some());
+        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
+        for channel in [
+            HslaChannel::Hue,
+            HslaChannel::Saturation,
+            HslaChannel::Lightness,
+            HslaChannel::Alpha,
+        ] {
+            assert!(
+                cx.debug_bounds(channel.debug_selector()).is_none(),
+                "the palette tab draws no {}",
+                channel.id_prefix()
+            );
+        }
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Palette
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla
+        );
+        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_none());
+        for channel in [
+            HslaChannel::Hue,
+            HslaChannel::Saturation,
+            HslaChannel::Lightness,
+            HslaChannel::Alpha,
+        ] {
+            assert!(
+                cx.debug_bounds(channel.debug_selector()).is_some(),
+                "the HSLA tab draws the {}",
+                channel.id_prefix()
+            );
+        }
+        let hue_track = cx
+            .debug_bounds(HslaChannel::Hue.debug_selector())
+            .expect("the HSLA tab draws the hue track");
+        assert_eq!(
+            hue_track.size,
+            size(px(156.), px(TRACK_HEIGHT)),
+            "72 (label) + 8 + 156 (track) + 8 + 40 (value) fills the 284px content width"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_PALETTE");
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Palette
+        );
+        assert!(cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some());
+        assert!(cx.debug_bounds(HslaChannel::Hue.debug_selector()).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_hue_track_should_set_the_hue_and_emit_once(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let target = track_point(cx, HslaChannel::Hue, 0.25);
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (color.h - 0.25).abs() < 1e-4,
+            "hue is {0}, expected 0.25",
+            color.h
+        );
+        assert_eq!(color.s, DEFAULT_COLOR.s, "saturation must not move");
+        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
+        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
+        assert_eq!(
+            changes.borrow().len(),
+            1,
+            "a click updates the color exactly once"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dragging_the_saturation_track_should_follow_the_pointer(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let start = track_point(cx, HslaChannel::Saturation, 0.2);
+        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
+        let target = track_point(cx, HslaChannel::Saturation, 0.8);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        // The first move starts the drag; it only updates the color from the second move on.
+        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_move(target, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (color.s - 0.8).abs() < 1e-4,
+            "saturation is {0}, expected 0.8",
+            color.s
+        );
+        assert_eq!(color.h, DEFAULT_COLOR.h, "hue must not move");
+        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
+        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
+        assert!(
+            changes.borrow().len() >= 2,
+            "the press and the drag to 80% both change the color, got {} events",
+            changes.borrow().len()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dragging_past_the_track_should_clamp_to_the_end(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let start = track_point(cx, HslaChannel::Saturation, 0.2);
+        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
+        let track = cx
+            .debug_bounds(HslaChannel::Saturation.debug_selector())
+            .expect("the HSLA tab draws the track");
+        let outside = point(
+            track.origin.x + track.size.width + px(50.),
+            track.origin.y + px(track.size.height.as_f32() / 2.0),
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color().s),
+            1.0,
+            "a pointer beyond the track clamps saturation to its maximum"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn set_channel_should_change_only_the_named_component(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Lightness, 0.75, window, cx)
+            });
+        });
+        let lightness = state.read_with(cx, |state, _| state.color());
+        assert!((lightness.l - 0.75).abs() < 1e-6);
+        assert_eq!(lightness.h, DEFAULT_COLOR.h);
+        assert_eq!(lightness.s, DEFAULT_COLOR.s);
+        assert_eq!(lightness.a, DEFAULT_COLOR.a);
+        assert_eq!(changes.borrow().as_slice(), &[lightness]);
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Alpha, 0.25, window, cx)
+            });
+        });
+        let alpha = state.read_with(cx, |state, _| state.color());
+        assert!((alpha.a - 0.25).abs() < 1e-6);
+        assert_eq!(alpha.h, lightness.h);
+        assert_eq!(alpha.s, lightness.s);
+        assert_eq!(alpha.l, lightness.l);
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[lightness, alpha],
+            "each change of the color emits once"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn set_channel_should_clamp_and_ignore_an_unchanged_value(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Saturation, -0.5, window, cx)
+            });
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color().s),
+            0.0,
+            "a fraction below zero clamps to zero"
+        );
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Saturation, 1.5, window, cx)
+            });
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color().s),
+            1.0,
+            "a fraction above one clamps to one"
+        );
+        assert_eq!(changes.borrow().len(), 2);
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Saturation, 1.0, window, cx)
+            });
+        });
+        assert_eq!(
+            changes.borrow().len(),
+            2,
+            "setting the value already selected is a no-op"
+        );
     }
 }
