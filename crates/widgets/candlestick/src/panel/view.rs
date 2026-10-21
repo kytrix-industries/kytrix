@@ -1,0 +1,1 @@
+//! The panel view itself.
