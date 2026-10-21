@@ -1349,12 +1349,16 @@ fn palette_index_at(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<u
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use gpui_kit::{
-        AppContext, Bounds, Context, Entity, EntityId, Hsla, IntoElement, Modifiers, MouseButton,
-        ParentElement, Pixels, Point, Render, SharedString, Styled, Subscription, TestAppContext,
-        VisualTestContext, Window, canvas, div, hsla, point, px, size,
+        AppContext, Bounds, Context, Entity, EntityId, Hsla, IntoElement, KeyDownEvent, Keystroke,
+        Modifiers, MouseButton, ParentElement, Pixels, PlatformInput, Point, Render, SharedString,
+        Styled, Subscription, TestAppContext, VisualTestContext, Window, canvas, div, hsla, point,
+        px, size,
     };
 
     use super::{
@@ -1365,7 +1369,13 @@ mod tests {
         TRACK_RADIUS, TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue,
         palette_index, palette_index_at, parse_hex, rgba8, selection_ring_color,
     };
-    use crate::{animation::ANIMATION_TICK, style::theme};
+    use crate::{
+        animation::ANIMATION_TICK,
+        style::{
+            palette::Appearance,
+            theme::{self, Theme},
+        },
+    };
 
     #[test]
     fn the_palette_should_be_twelve_lightness_steps_by_twelve_rows() {
@@ -2243,7 +2253,12 @@ mod tests {
 
     /// Installs the theme and draws the whole picker in a window large enough for the panel.
     fn picker_harness(cx: &mut TestAppContext) -> (Entity<PickerHarness>, &mut VisualTestContext) {
-        cx.update(theme::install);
+        cx.update(|cx| {
+            // The hex tests deliver Enter through the real key dispatch, so the input's key
+            // bindings have to be installed; the other tests do not care either way.
+            gpui_kit::base::init(cx);
+            theme::install(cx);
+        });
         let (harness, cx) = cx.add_window_view(PickerHarness::new);
         cx.simulate_resize(size(px(900.), px(800.)));
         cx.update(|window, _| window.refresh());
@@ -2252,9 +2267,14 @@ mod tests {
     }
 
     /// Presses what `selector` names the way a window delivers a press: down, a frame, up, then
-    /// the frame the press asked for. The frame in the middle matters: the panel closes while the
-    /// button is down, so the trigger is redrawn without its click handler before the release
-    /// arrives, and the release cannot reopen what the press closed.
+    /// the frame the press asked for.
+    ///
+    /// The frame in the middle is the point. While the panel is open the trigger is rendered
+    /// without an `on_click` listener, and GPUI 0.3.8's `Div` arms its `pending_mouse_down` only
+    /// for an element that has a click or drag listener. This press is therefore recorded only as
+    /// the outside press that closes the panel: the release arrives after the closed trigger has
+    /// been given its listener back, but with no pending press for it to complete, so it cannot
+    /// reopen what the press closed.
     fn press(cx: &mut VisualTestContext, selector: &'static str) {
         let target = cx
             .debug_bounds(selector)
@@ -2277,6 +2297,86 @@ mod tests {
 
     fn panel_is_drawn(cx: &mut VisualTestContext) -> bool {
         cx.debug_bounds("TEST_COLOR_PICKER_PANEL").is_some()
+    }
+
+    /// Empties the hex field and puts the caret in it.
+    ///
+    /// The draw is what makes the field the window's input handler: typing before it would go
+    /// nowhere. `update_value` is the panel's own write-back path and emits no change, so
+    /// clearing the field does not touch the color.
+    fn clear_and_focus_hex(cx: &mut VisualTestContext, state: &Entity<ColorPickerState>) {
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.hex_input.update(cx, |input, cx| {
+                    input.update_value("", window, cx);
+                });
+            });
+            let focus = state.read(cx).hex_input.read(cx).engine_focus_handle(cx);
+            focus.focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// Delivers Enter to the focused field as a real key-down.
+    ///
+    /// `simulate_keystrokes("enter")` also feeds the key's simulated IME text (`"\n"`) to the
+    /// focused input after the key-down. That text-input event emits a `Change` carrying the
+    /// value already in the field, which would apply it through `on_hex_change` before the
+    /// commit runs and hide the commit's own apply branch. This dispatches the same key-down,
+    /// and therefore the same key binding, without the simulated text.
+    fn press_enter(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("enter").expect("enter is a keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// Puts `text` in the hex field the way the panel's own write-back does: no change event.
+    ///
+    /// Typing the text first would let `on_hex_change` apply the color and emit, so a commit test
+    /// has to use this path to leave the apply branch in `on_hex_commit` as the only thing that
+    /// can change the color.
+    fn set_hex_text_without_change_event(
+        cx: &mut VisualTestContext,
+        state: &Entity<ColorPickerState>,
+        text: &str,
+    ) {
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.hex_input.update(cx, |input, cx| {
+                    input.update_value(text, window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    /// Asserts the open panel draws the HSLA tab and none of the palette grid.
+    fn assert_hsla_tab_is_drawn(cx: &mut VisualTestContext, context: &str) {
+        assert!(
+            cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_none(),
+            "{context} must not fall back to the palette grid"
+        );
+        for channel in [
+            HslaChannel::Hue,
+            HslaChannel::Saturation,
+            HslaChannel::Lightness,
+            HslaChannel::Alpha,
+        ] {
+            assert!(
+                cx.debug_bounds(channel.debug_selector()).is_some(),
+                "{context} must draw the {} track",
+                channel.id_prefix()
+            );
+        }
     }
 
     #[gpui_kit::test]
@@ -2498,6 +2598,715 @@ mod tests {
         assert_eq!(alpha.s, lightness.s, "saturation must not move");
         assert_eq!(alpha.l, lightness.l, "lightness must not move");
         assert_eq!(changes.borrow().as_slice(), &[alpha]);
+    }
+
+    #[gpui_kit::test]
+    fn typing_a_legal_hex_in_the_open_panel_should_set_the_color_without_rewriting_the_field(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        clear_and_focus_hex(cx, &state);
+
+        cx.simulate_input("#FF0000");
+        settle(cx);
+
+        let (color, hex) = state.read_with(cx, |state, cx| {
+            (state.color(), state.hex_input.read(cx).value(cx))
+        });
+        assert_eq!(
+            hex_string(color).as_str(),
+            "#FF0000",
+            "the legal text becomes the color"
+        );
+        assert_eq!(
+            hex.as_str(),
+            "#FF0000",
+            "the field shows exactly what was typed: a change during typing must not be \
+             rewritten"
+        );
+        assert!(
+            !changes.borrow().is_empty(),
+            "a legal edit emits at least one ColorChanged"
+        );
+        assert_eq!(
+            changes.borrow().last().copied(),
+            Some(color),
+            "the last event carries the color the field leaves behind"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "typing in the hex field leaves the panel open"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn an_illegal_hex_in_the_open_panel_should_change_nothing_until_enter_restores_the_field(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        clear_and_focus_hex(cx, &state);
+        let before = state.read_with(cx, |state, _| state.color());
+
+        cx.simulate_input("#zz");
+        settle(cx);
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            before,
+            "text that is not hex leaves the color alone"
+        );
+        assert_eq!(
+            changes.borrow().len(),
+            0,
+            "text that is not hex emits nothing"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            "#zz",
+            "an illegal edit is left in the field until it is committed"
+        );
+
+        press_enter(cx);
+        settle(cx);
+
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            hex_string(before).as_str(),
+            "committing an illegal edit restores the current color's hex"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            before,
+            "committing an illegal edit leaves the color alone"
+        );
+        assert_eq!(
+            changes.borrow().len(),
+            0,
+            "committing an illegal edit emits nothing"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "committing in the hex field leaves the panel open"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn enter_should_apply_the_field_text_and_normalize_it_exactly_once(cx: &mut TestAppContext) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        clear_and_focus_hex(cx, &state);
+        assert!(
+            changes.borrow().is_empty(),
+            "opening the panel and focusing the field emit no ColorChanged"
+        );
+        changes.borrow_mut().clear();
+
+        // `update_value` is the panel's own write-back path: it puts text in the field without a
+        // Change event, so the color can only move when Enter delivers the commit.
+        set_hex_text_without_change_event(cx, &state, "#fff");
+        settle(cx);
+
+        assert!(
+            changes.borrow().is_empty(),
+            "writing the field without a change event emits nothing"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "the uncommitted text has not been applied as a color"
+        );
+
+        press_enter(cx);
+        settle(cx);
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert_eq!(
+            rgba8(color),
+            [255, 255, 255, 255],
+            "Enter applies the short form the field holds as white"
+        );
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[color],
+            "the commit applies the color exactly once"
+        );
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#FFFFFF",
+            "committing normalizes the field to the full uppercase hex"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "committing in the hex field leaves the panel open"
+        );
+
+        // The commit normalizes even when the color is already current, and emits nothing then.
+        set_hex_text_without_change_event(cx, &state, "#ffffff");
+        settle(cx);
+        assert_eq!(
+            changes.borrow().len(),
+            1,
+            "rewriting the field without a change event emits nothing either"
+        );
+
+        press_enter(cx);
+        settle(cx);
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            color,
+            "committing an equivalent hex leaves the color alone"
+        );
+        assert_eq!(
+            changes.borrow().len(),
+            1,
+            "committing the color already current emits nothing"
+        );
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#FFFFFF",
+            "even an unchanged commit normalizes the field"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn blurring_the_hex_field_should_apply_the_field_text_and_normalize_it_like_enter(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        // A window has to be active for GPUI to report focus changes: an inactive one blanks
+        // the focus paths it hands its listeners, so the blur would never reach the field.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        clear_and_focus_hex(cx, &state);
+        assert!(
+            changes.borrow().is_empty(),
+            "opening the panel and focusing the field emit no ColorChanged"
+        );
+        changes.borrow_mut().clear();
+
+        // Set the text without a Change event, exactly as the Enter test does: only the blur
+        // commit may apply it.
+        set_hex_text_without_change_event(cx, &state, "#0f0");
+        settle(cx);
+
+        assert!(
+            changes.borrow().is_empty(),
+            "writing the field without a change event emits nothing"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "the uncommitted text has not been applied as a color"
+        );
+
+        // The window is the public test API for taking the caret away from the field; the draw
+        // below delivers the blur, which is the same commit path Enter takes.
+        cx.update(|window, cx| window.blur(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        settle(cx);
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert_eq!(
+            rgba8(color),
+            [0, 255, 0, 255],
+            "losing the caret applies the short form the field holds as green"
+        );
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[color],
+            "the blur commit applies the color exactly once"
+        );
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#00FF00",
+            "losing the caret normalizes the field"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "blurring the field does not close the panel"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn setting_the_color_programmatically_should_be_silent_and_should_not_open_a_closed_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        assert!(panel_is_drawn(cx));
+
+        // Leave the default Palette tab with a real click. On Palette the tab assertions below
+        // could pass by accident, because Palette is exactly what a reset would produce.
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "opening the panel and switching tabs emit no ColorChanged"
+        );
+
+        let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_color(blue, window, cx));
+        });
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().len(),
+            0,
+            "a programmatic change emits no ColorChanged"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.color()), blue);
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#0000FF",
+            "set_color synchronizes the field to the normalized hex"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla,
+            "set_color does not switch the panel's tab"
+        );
+        assert_hsla_tab_is_drawn(cx, "set_color on the open panel");
+        assert!(panel_is_drawn(cx), "set_color leaves an open panel open");
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+        assert!(!panel_is_drawn(cx), "the second press closes the panel");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla,
+            "closing the panel leaves the non-default tab selected"
+        );
+
+        let green = hsla(1.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_color(green, window, cx));
+        });
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().len(),
+            0,
+            "a programmatic change while closed emits nothing"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.color()), green);
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            "#00FF00",
+            "set_color synchronizes the field even while the panel is closed"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla,
+            "a programmatic change while closed must not reset the tab"
+        );
+        assert!(
+            !panel_is_drawn(cx),
+            "set_color must not open a closed panel"
+        );
+
+        // Reopening makes the closed-panel tab assertion visible: the panel has to draw the
+        // HSLA tab it was closed on, not the Palette grid a reset would have selected.
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+        assert!(panel_is_drawn(cx), "the trigger opens the panel again");
+        assert_hsla_tab_is_drawn(cx, "reopening after a programmatic change");
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_hue_track_in_the_open_panel_should_set_the_hue_and_emit_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        changes.borrow_mut().clear();
+
+        let target = track_point(cx, HslaChannel::Hue, 0.25);
+        cx.simulate_click(target, Modifiers::none());
+        settle(cx);
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (color.h - 0.25).abs() < 1e-4,
+            "hue is {}, expected 0.25",
+            color.h
+        );
+        assert_eq!(color.s, DEFAULT_COLOR.s, "saturation must not move");
+        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
+        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[color],
+            "one click on the open panel's hue track emits exactly once"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "editing a channel in the open panel leaves it open"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dragging_the_saturation_track_in_the_open_panel_should_follow_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        changes.borrow_mut().clear();
+
+        let start = track_point(cx, HslaChannel::Saturation, 0.2);
+        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
+        let target = track_point(cx, HslaChannel::Saturation, 0.8);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        // The first move starts the drag; it only updates the color from the second move on.
+        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_move(target, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+        settle(cx);
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (color.s - 0.8).abs() < 1e-4,
+            "saturation is {}, expected 0.8",
+            color.s
+        );
+        assert_eq!(color.h, DEFAULT_COLOR.h, "hue must not move");
+        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
+        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
+        assert!(
+            changes.borrow().len() >= 2,
+            "the press and the drag to 80% both change the color, got {} events",
+            changes.borrow().len()
+        );
+        assert!(
+            changes.borrow().iter().all(|change| {
+                change.h == DEFAULT_COLOR.h
+                    && change.l == DEFAULT_COLOR.l
+                    && change.a == DEFAULT_COLOR.a
+            }),
+            "every drag event only changes saturation"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "dragging a channel in the open panel leaves it open"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dragging_past_the_track_in_the_open_panel_should_clamp_and_keep_it_open(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        changes.borrow_mut().clear();
+
+        let start = track_point(cx, HslaChannel::Saturation, 0.2);
+        let launch = track_point(cx, HslaChannel::Saturation, 0.3);
+        let track = cx
+            .debug_bounds(HslaChannel::Saturation.debug_selector())
+            .expect("the open panel draws the saturation track");
+        let outside = point(
+            track.origin.x + track.size.width + px(50.),
+            track.origin.y + px(track.size.height.as_f32() / 2.0),
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+        settle(cx);
+
+        let color = state.read_with(cx, |state, _| state.color());
+        assert_eq!(
+            color.s, 1.0,
+            "a pointer beyond the open panel's track clamps saturation to its maximum"
+        );
+        assert_eq!(color.h, DEFAULT_COLOR.h, "hue must not move");
+        assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
+        assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
+        assert!(
+            !changes.borrow().is_empty(),
+            "the drag that left the track still changed the color"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "dragging out of the track does not close the panel"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn switching_the_theme_should_repaint_the_open_panel_and_keep_its_color(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        let before = state.read_with(cx, |state, _| state.color());
+        assert_eq!(
+            cx.read_global(|theme: &Theme, _| theme.appearance),
+            Appearance::Light,
+            "the harness starts in the light appearance"
+        );
+
+        cx.update(|_, cx| theme::apply(Appearance::Dark, cx));
+        settle(cx);
+
+        assert_eq!(
+            cx.read_global(|theme: &Theme, _| theme.appearance),
+            Appearance::Dark,
+            "applying the dark appearance installs it in the theme the panel draws with"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "switching to the dark appearance leaves the panel open"
+        );
+        assert_hsla_tab_is_drawn(cx, "the dark panel");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            before,
+            "switching the theme does not change the color"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla,
+            "switching the theme does not change the tab"
+        );
+
+        cx.update(|_, cx| theme::apply(Appearance::Light, cx));
+        settle(cx);
+
+        assert_eq!(
+            cx.read_global(|theme: &Theme, _| theme.appearance),
+            Appearance::Light,
+            "switching back installs the light appearance again"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "switching back to the light appearance leaves the panel open"
+        );
+        assert_hsla_tab_is_drawn(cx, "the light panel");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            before,
+            "switching back does not change the color either"
+        );
+    }
+
+    #[test]
+    fn labels_should_default_to_the_panel_text() {
+        let labels = ColorPickerLabels::default();
+
+        assert_eq!(labels.palette.as_str(), "Palette");
+        assert_eq!(labels.hsla.as_str(), "HSLA");
+        assert_eq!(labels.hue.as_str(), "Hue");
+        assert_eq!(labels.saturation.as_str(), "Saturation");
+        assert_eq!(labels.lightness.as_str(), "Lightness");
+        assert_eq!(labels.alpha.as_str(), "Alpha");
+    }
+
+    #[gpui_kit::test]
+    fn set_labels_should_notify_only_when_the_text_changes(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        assert!(
+            changes.borrow().is_empty(),
+            "building the harness emits no ColorChanged"
+        );
+        // Only the calls below are under test; nothing in this test sets a color.
+        changes.borrow_mut().clear();
+        let notifications = Rc::new(Cell::new(0));
+        let counter = notifications.clone();
+        let _observation = cx.update(|_, cx| {
+            cx.observe(&state, move |_, _| {
+                counter.set(counter.get() + 1);
+            })
+        });
+
+        let labels = state.read_with(cx, |state, _| state.labels.clone());
+        state.update(cx, |state, cx| state.set_labels(labels.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            0,
+            "setting the labels already in place is a no-op"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "setting the labels already in place emits no ColorChanged"
+        );
+
+        let mut changed = labels;
+        changed.palette = SharedString::new_static("Palette!");
+        state.update(cx, |state, cx| state.set_labels(changed.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            1,
+            "new labels notify the panel once so they are drawn"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "new labels repaint the panel without emitting a ColorChanged"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.labels.clone()),
+            changed
+        );
+
+        state.update(cx, |state, cx| state.set_labels(changed.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            1,
+            "setting the same new labels again is a no-op"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "setting the same new labels again emits no ColorChanged"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn set_active_tab_should_notify_only_when_the_tab_changes(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        assert!(
+            changes.borrow().is_empty(),
+            "building the harness emits no ColorChanged"
+        );
+        // Only the calls below are under test; nothing in this test sets a color.
+        changes.borrow_mut().clear();
+        let notifications = Rc::new(Cell::new(0));
+        let counter = notifications.clone();
+        let _observation = cx.update(|_, cx| {
+            cx.observe(&state, move |_, _| {
+                counter.set(counter.get() + 1);
+            })
+        });
+
+        state.update(cx, |state, cx| {
+            state.set_active_tab(ColorPickerTab::Palette, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            0,
+            "selecting the tab already shown is a no-op"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "selecting the tab already shown emits no ColorChanged"
+        );
+
+        state.update(cx, |state, cx| {
+            state.set_active_tab(ColorPickerTab::Hsla, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            1,
+            "selecting another tab notifies the panel once"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "selecting another tab repaints without emitting a ColorChanged"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla
+        );
+
+        state.update(cx, |state, cx| {
+            state.set_active_tab(ColorPickerTab::Hsla, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            1,
+            "selecting the tab already shown again is a no-op"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "selecting the tab already shown again emits no ColorChanged"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_active_tab_should_persist_across_closing_and_reopening_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = picker_harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.state.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla
+        );
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+        assert!(!panel_is_drawn(cx), "the second press closes the panel");
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert!(panel_is_drawn(cx), "the panel opens again");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.active_tab()),
+            ColorPickerTab::Hsla,
+            "the panel opens on the tab it was closed on"
+        );
+        assert!(
+            cx.debug_bounds(HslaChannel::Hue.debug_selector()).is_some(),
+            "the reopened panel draws the HSLA tab the state still selects"
+        );
+        assert!(
+            cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_none(),
+            "the reopened panel does not fall back to the palette tab"
+        );
     }
 
     const KEYED_FIRST_COLOR: Hsla = hsla(0.15, 0.35, 0.45, 1.0);
