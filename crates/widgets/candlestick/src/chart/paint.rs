@@ -11,12 +11,7 @@
 //! - **paint** turns those boxes into quads, plus the crosshair, which is the
 //!   only part that must follow the pointer every frame.
 
-use std::{
-    cell::{Cell, RefCell},
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 
 use base_ui::style::theme::{Theme, ThemeExt};
 use gpui_kit::{
@@ -37,7 +32,9 @@ use time::UtcOffset;
 use widget::time_zone::data_time_zone;
 
 use super::{
-    geometry::{CandleGeometry, ChartLayout, ChartViewport, visible_range},
+    geometry::{
+        CandleGeometry, ChartLayout, ChartViewport, LayoutInputs, SubPlotLayout, visible_range,
+    },
     text::{ChartTextCache, HOVER_LABEL_LINE_HEIGHT, HoverLabelCache, format_price, format_volume},
 };
 use crate::{
@@ -88,14 +85,14 @@ impl ChartPaintCaches {
 
 /// The chart element.
 ///
-/// The five boxes are resolved from the bounds the element is given, and both
+/// The boxes are resolved from the bounds the element is given, and both
 /// the first layout and every later change of width are reported through
 /// `on_layout_change`: how many candles fit is a function of the plot width, so
 /// whoever owns the data has to hear about a pane that grew.
 pub(crate) fn chart_canvas(
     snapshot: CandlestickSeriesSnapshot,
     options: ChartCanvasOptions,
-    layout_cell: Rc<Cell<Option<ChartLayout>>>,
+    layout_cell: Rc<RefCell<Option<Rc<ChartLayout>>>>,
     hover_label_cache: Rc<RefCell<HoverLabelCache>>,
     paint_caches: Rc<ChartPaintCaches>,
     on_layout_change: impl FnOnce(&mut App) + 'static,
@@ -121,7 +118,7 @@ pub(crate) fn chart_canvas(
             // The view hit-tests pointer positions against this, and only the
             // layout pass knows the element's bounds. It is set before the change
             // is reported, because what reacts to it reads the new boxes back.
-            let previous = layout_cell.replace(Some(prepared.layout));
+            let previous = layout_cell.borrow_mut().replace(prepared.layout.clone());
             if previous.is_none_or(|previous| {
                 previous.maximum_plot_width() != prepared.layout.maximum_plot_width()
             }) {
@@ -145,7 +142,7 @@ pub(crate) fn chart_canvas(
 }
 
 struct PreparedChart {
-    layout: ChartLayout,
+    layout: Rc<ChartLayout>,
     visible: Option<PreparedVisibleChart>,
 }
 
@@ -225,7 +222,7 @@ impl PreparedChartKey {
 #[derive(Default)]
 struct PreparedChartCache {
     key: Option<PreparedChartKey>,
-    chart: Option<Arc<PreparedChart>>,
+    chart: Option<Rc<PreparedChart>>,
     /// Counts real rebuilds, so a test can tell a cache hit from a redraw.
     #[cfg(test)]
     builds: usize,
@@ -240,7 +237,7 @@ fn prepare_chart_cached(
     bounds: Bounds<Pixels>,
     text_color: Hsla,
     window: &Window,
-) -> Arc<PreparedChart> {
+) -> Rc<PreparedChart> {
     let text_style = window.text_style();
     let cached = {
         let cache = caches.prepared.borrow();
@@ -273,7 +270,7 @@ fn prepare_chart_cached(
         &caches.text,
         window,
     );
-    let prepared = Arc::new(prepare_visible_chart(
+    let prepared = Rc::new(prepare_visible_chart(
         snapshot, viewport, interval, zone, layout,
     ));
     let mut cache = caches.prepared.borrow_mut();
@@ -303,6 +300,9 @@ fn prepare_visible_chart(
     layout: ChartLayout,
 ) -> PreparedChart {
     let range = visible_range(snapshot.candles(), viewport, layout.price_plot.size.width);
+    // This stage draws one sub plot, the volume one; the sub-plot series loop
+    // arrives with the indicator paint stage.
+    let volume_plot = layout.sub_plots.first().map(|sub_plot| sub_plot.plot);
     let visible = (!range.is_empty()).then(|| {
         let candles = snapshot.candles();
         let latest = latest_candle_for_indicator(snapshot, range.end);
@@ -335,7 +335,7 @@ fn prepare_visible_chart(
                         center_x,
                         body_width,
                         volume_upper,
-                        layout.volume_plot,
+                        volume_plot,
                     ),
                     is_up: prices.is_up(),
                 }
@@ -405,7 +405,10 @@ fn prepare_visible_chart(
             latest_price,
         }
     });
-    PreparedChart { layout, visible }
+    PreparedChart {
+        layout: Rc::new(layout),
+        visible,
+    }
 }
 
 /// Resolves the layout, widening the y-axes until they fit their own labels.
@@ -419,7 +422,15 @@ fn resolve_chart_layout(
     window: &Window,
 ) -> ChartLayout {
     let mut longest_label_width = px(0.0);
-    let mut layout = ChartLayout::new(bounds, longest_label_width);
+    // One sub plot, the volume one: the enabled indicator sub plots arrive with
+    // the indicator configuration.
+    let mut layout = ChartLayout::new(
+        bounds,
+        LayoutInputs {
+            longest_label_width,
+            sub_plot_count: 1,
+        },
+    );
     let text_measurer = AxisTextMeasurer {
         color: text_color,
         cache: text_cache,
@@ -440,7 +451,13 @@ fn resolve_chart_layout(
             &text_measurer,
         );
         longest_label_width = longest_label_width.max(measured_width);
-        let next = ChartLayout::new(bounds, longest_label_width);
+        let next = ChartLayout::new(
+            bounds,
+            LayoutInputs {
+                longest_label_width,
+                sub_plot_count: 1,
+            },
+        );
         if next.price_axis.size.width <= layout.price_axis.size.width {
             break;
         }
@@ -562,32 +579,29 @@ fn paint_chart(
     context: &mut App,
 ) {
     let PreparedChart { layout, visible } = prepared;
-    let layout = *layout;
+    let layout = layout.as_ref();
     // No background quad: the pane body is the background, and a quad of our own
     // would be a rectangle drawn over its rounded corners.
+    let grid = context.theme().components.chart.grid.hsla;
+    let data_bounds = layout.data_bounds();
     window.paint_quad(fill(
         Bounds::new(
             point(layout.price_plot.right(), layout.price_plot.origin.y),
-            size(px(1.0), layout.data_bounds().size.height),
+            size(px(1.0), data_bounds.size.height),
         ),
-        context.theme().components.chart.grid.hsla,
+        grid,
     ));
+    for separator in &layout.separators {
+        window.paint_quad(fill(*separator, grid));
+    }
+    // There is no separator box between the last sub plot and the time axis;
+    // this top edge is where that boundary is drawn.
     window.paint_quad(fill(
         Bounds::new(
-            point(layout.price_plot.origin.x, layout.price_plot.bottom()),
-            size(
-                layout.price_plot.size.width + layout.price_axis.size.width,
-                layout.volume_plot.origin.y - layout.price_plot.bottom(),
-            ),
+            point(data_bounds.origin.x, data_bounds.bottom()),
+            size(data_bounds.size.width, px(1.0)),
         ),
-        context.theme().components.chart.grid.hsla,
-    ));
-    window.paint_quad(fill(
-        Bounds::new(
-            point(layout.volume_plot.origin.x, layout.volume_plot.bottom()),
-            size(layout.volume_plot.size.width, px(1.0)),
-        ),
-        context.theme().components.chart.grid.hsla,
+        grid,
     ));
 
     let Some(visible) = visible else {
@@ -607,9 +621,11 @@ fn paint_chart(
         visible.highest,
         layout,
     );
-    painter.paint_volume_axis(&visible.volume_ticks, visible.volume_upper, layout);
+    if let Some(sub_plot) = layout.sub_plots.first() {
+        painter.paint_sub_axis(&visible.volume_ticks, visible.volume_upper, *sub_plot);
+    }
     painter.paint_time_axis(&visible.time_ticks, layout);
-    // The candle the crosshair is on, if the pointer is over either plot. Its
+    // The candle the crosshair is on, if the pointer is over any plot. Its
     // volume bar is painted at full strength along with it.
     let hovered_candle = options
         .viewport
@@ -648,7 +664,7 @@ impl ChartPainter<'_> {
         ticks: &[PreparedAxisTick],
         lowest: f64,
         highest: f64,
-        layout: ChartLayout,
+        layout: &ChartLayout,
     ) {
         for tick in ticks {
             let y = y_for_price(tick.value, lowest, highest, layout.price_plot);
@@ -672,35 +688,36 @@ impl ChartPainter<'_> {
         }
     }
 
-    fn paint_volume_axis(&mut self, ticks: &[PreparedAxisTick], upper: f64, layout: ChartLayout) {
+    fn paint_sub_axis(&mut self, ticks: &[PreparedAxisTick], upper: f64, sub_plot: SubPlotLayout) {
         for tick in ticks {
-            let y = y_for_volume(tick.value, upper, layout.volume_plot);
+            let y = y_for_volume(tick.value, upper, sub_plot.plot);
             self.window.paint_quad(fill(
                 Bounds::new(
-                    point(layout.volume_plot.origin.x, y),
-                    size(layout.volume_plot.size.width, px(1.0)),
+                    point(sub_plot.plot.origin.x, y),
+                    size(sub_plot.plot.size.width, px(1.0)),
                 ),
                 self.context.theme().components.chart.grid.hsla,
             ));
             self.paint_text(
                 tick.label.clone(),
                 point(
-                    layout.volume_axis.origin.x + px(7.0),
-                    axis_label_y(y, layout.volume_axis),
+                    sub_plot.axis.origin.x + px(7.0),
+                    axis_label_y(y, sub_plot.axis),
                 ),
                 self.context.theme().components.chart.axis.hsla,
                 TextAlign::Left,
-                axis_text_width(layout.volume_axis.size.width, AXIS_TICK_TEXT_INSET),
+                axis_text_width(sub_plot.axis.size.width, AXIS_TICK_TEXT_INSET),
             );
         }
     }
 
-    fn paint_time_axis(&mut self, ticks: &[PreparedTimeTick], layout: ChartLayout) {
+    fn paint_time_axis(&mut self, ticks: &[PreparedTimeTick], layout: &ChartLayout) {
+        let data_bounds = layout.data_bounds();
         for tick in ticks {
             self.window.paint_quad(fill(
                 Bounds::new(
-                    point(tick.x, layout.data_bounds().origin.y),
-                    size(px(1.0), layout.data_bounds().size.height),
+                    point(tick.x, data_bounds.origin.y),
+                    size(px(1.0), data_bounds.size.height),
                 ),
                 self.context.theme().components.chart.grid.hsla,
             ));
@@ -718,7 +735,7 @@ impl ChartPainter<'_> {
         &mut self,
         latest: &PreparedLatestPrice,
         countdown_label: SharedString,
-        layout: ChartLayout,
+        layout: &ChartLayout,
     ) {
         let y = latest.y;
         let color = if latest.is_up {
@@ -800,7 +817,7 @@ impl ChartPainter<'_> {
         interval: TimeFrame,
         zone: UtcOffset,
         cursor: Point<Pixels>,
-        layout: ChartLayout,
+        layout: &ChartLayout,
         hover_label_cache: &Rc<RefCell<HoverLabelCache>>,
     ) {
         let Some(slot) = visible.geometry.slot_at(cursor.x) else {
@@ -829,18 +846,24 @@ impl ChartPainter<'_> {
             );
             let price = price_for_y(y, visible.lowest, visible.highest, layout.price_plot);
             self.paint_axis_tag(y, format_price(price, price_tick), layout.price_axis);
-        } else if layout.volume_plot.contains(&cursor) {
+        } else if let Some(sub_plot) = layout
+            .sub_plots
+            .iter()
+            .find(|sub_plot| sub_plot.plot.contains(&cursor))
+        {
             let y = cursor
                 .y
-                .clamp(layout.volume_plot.origin.y, layout.volume_plot.bottom());
+                .clamp(sub_plot.plot.origin.y, sub_plot.plot.bottom());
             paint_dashed_horizontal(
                 y,
-                layout.volume_plot,
+                sub_plot.plot,
                 self.context.theme().components.chart.crosshair.hsla,
                 self.window,
             );
-            let volume = volume_for_y(y, visible.volume_upper, layout.volume_plot);
-            self.paint_axis_tag(y, format_volume(volume), layout.volume_axis);
+            // The only sub plot in this stage is volume, so that is what a
+            // cursor in a sub plot reads.
+            let volume = volume_for_y(y, visible.volume_upper, sub_plot.plot);
+            self.paint_axis_tag(y, format_volume(volume), sub_plot.axis);
         }
 
         let candle = &candles[candle_index];
@@ -1067,7 +1090,7 @@ fn volume_axis_values(upper: f64) -> Vec<f64> {
 fn paint_candle_series(
     candles: &[PreparedCandle],
     hovered: Option<usize>,
-    layout: ChartLayout,
+    layout: &ChartLayout,
     theme: &Theme,
     window: &mut Window,
 ) {
@@ -1138,8 +1161,9 @@ fn candle_volume_bounds(
     center_x: Pixels,
     body_width: Pixels,
     upper: f64,
-    plot: Bounds<Pixels>,
+    plot: Option<Bounds<Pixels>>,
 ) -> Option<Bounds<Pixels>> {
+    let plot = plot?;
     let quantity = candle.traded_quantity.as_ref()?;
     if quantity.value.is_zero() {
         return None;
@@ -1429,8 +1453,12 @@ mod tests {
         let volume_upper = volume_upper_bound(&candles);
         let layout = ChartLayout::new(
             Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
-            px(0.0),
+            LayoutInputs {
+                longest_label_width: px(0.0),
+                sub_plot_count: 1,
+            },
         );
+        let volume_plot = layout.sub_plots[0].plot;
         let geometry = CandleGeometry::new(layout.price_plot, candles.len(), 5.0);
         let body_width = geometry.body_width();
         let mut wick_and_volume_bounds = Vec::with_capacity(candles.len() * 2);
@@ -1450,7 +1478,7 @@ mod tests {
                 center_x,
                 body_width,
                 volume_upper,
-                layout.volume_plot,
+                Some(volume_plot),
             ));
             body_bounds.push(candle_body_bounds(
                 CandlePrices::of(candle),
@@ -1483,7 +1511,7 @@ mod tests {
                 geometry.center_x(2),
                 body_width,
                 volume_upper,
-                layout.volume_plot,
+                Some(volume_plot),
             )
             .is_none()
         );
@@ -1493,7 +1521,7 @@ mod tests {
                 geometry.center_x(3),
                 body_width,
                 volume_upper,
-                layout.volume_plot,
+                Some(volume_plot),
             )
             .is_none(),
             "a candle that published no traded size has no bar"

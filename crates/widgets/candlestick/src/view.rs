@@ -25,12 +25,7 @@
 //!   because a page arriving changes the candles rather than what the widget is
 //!   reporting.
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    sync::Arc,
-    time::Duration,
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
@@ -424,7 +419,7 @@ pub struct CandlestickWidget {
     viewport: ChartViewport,
     /// Filled in by the chart's layout pass, so that pointer events — which
     /// arrive outside any layout — can be hit-tested.
-    chart_layout: Rc<Cell<Option<ChartLayout>>>,
+    chart_layout: Rc<RefCell<Option<Rc<ChartLayout>>>>,
     hover_label_cache: Rc<RefCell<HoverLabelCache>>,
     chart_paint_caches: Rc<ChartPaintCaches>,
     pointer_frame: PointerFrameState,
@@ -602,7 +597,7 @@ impl CandlestickWidget {
             countdown: CountdownState::default(),
             countdown_task: None,
             viewport: ChartViewport::default(),
-            chart_layout: Rc::new(Cell::new(None)),
+            chart_layout: Rc::new(RefCell::new(None)),
             hover_label_cache: Rc::new(RefCell::new(HoverLabelCache::default())),
             chart_paint_caches: Rc::new(ChartPaintCaches::default()),
             pointer_frame: PointerFrameState::default(),
@@ -772,7 +767,7 @@ impl CandlestickWidget {
         self.countdown.clear();
         self.pointer_frame.clear_pending();
         self.scroll_frame.clear_pending();
-        self.chart_layout.set(None);
+        *self.chart_layout.borrow_mut() = None;
         self.hover_label_cache.borrow_mut().clear();
         self.chart_paint_caches.clear();
         self.viewport.right_timestamp = None;
@@ -1628,7 +1623,7 @@ impl CandlestickWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(layout) = self.chart_layout.get() else {
+        let Some(layout) = self.chart_layout.borrow().clone() else {
             return;
         };
         if self.snapshot.is_none() || !layout.contains_data_point(&event.position) {
@@ -1661,7 +1656,7 @@ impl CandlestickWidget {
     /// anchored after it, so the chart grows away from the pointer instead of
     /// sliding out from under it.
     fn apply_scroll_input(&mut self, input: ScrollInput, cx: &mut Context<Self>) -> bool {
-        let Some(layout) = self.chart_layout.get() else {
+        let Some(layout) = self.chart_layout.borrow().clone() else {
             return false;
         };
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -1727,7 +1722,7 @@ impl CandlestickWidget {
         if self.status.is_failed(cx) {
             return;
         }
-        let Some(layout) = self.chart_layout.get() else {
+        let Some(layout) = self.chart_layout.borrow().clone() else {
             return;
         };
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -5435,7 +5430,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.read(|cx| widget.read(cx).chart_layout.get().is_some()),
+            cx.read(|cx| widget.read(cx).chart_layout.borrow().is_some()),
             "there is no visible range to measure until the chart is laid out"
         );
         assert!(
@@ -5491,7 +5486,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.read(|cx| widget.read(cx).chart_layout.get().is_some()),
+            cx.read(|cx| widget.read(cx).chart_layout.borrow().is_some()),
             "a chart that failed while holding candles is still laid out"
         );
         assert!(
