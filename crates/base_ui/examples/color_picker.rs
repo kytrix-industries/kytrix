@@ -3,6 +3,7 @@ mod support;
 use base_ui::{
     assets::Assets,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
+    size::UnifiedSizable,
     style::theme::ThemeExt,
 };
 use gpui_kit::{
@@ -64,7 +65,7 @@ impl Render for ColorPickerExample {
             .items_center()
             .justify_center()
             .gap_4()
-            .child(ColorPicker::new(&state))
+            .child(ColorPicker::new(&state).small())
             .child(
                 div()
                     .w(px(160.))

@@ -588,6 +588,13 @@ impl Render for ColorPickerTrigger {
         Button::new(("color-picker-trigger", self.state.entity_id()))
             .tonal()
             .with_unified_size(self.size)
+            // A fixed height resolves as a border-box height, but an auto width grows by the
+            // horizontal padding and both borders on top of the swatch, so the button came out
+            // 22/32/42 wide against a 20/30/40 height. Pin the width to the same height and drop
+            // the horizontal padding; the swatch stays centered in the space that leaves.
+            .w(self.size.h())
+            .px(px(0.))
+            .justify_center()
             .selected(opened)
             .aria_label(hex_string(color).as_str())
             .debug_selector(|| "TEST_COLOR_PICKER_TRIGGER".into())
@@ -1371,6 +1378,7 @@ mod tests {
     };
     use crate::{
         animation::ANIMATION_TICK,
+        size::{UnifiedSizable, UnifiedSize},
         style::{
             palette::Appearance,
             theme::{self, Theme},
@@ -2224,11 +2232,12 @@ mod tests {
     struct PickerHarness {
         state: Entity<ColorPickerState>,
         changes: Rc<RefCell<Vec<Hsla>>>,
+        size: UnifiedSize,
         _subscription: Subscription,
     }
 
     impl PickerHarness {
-        fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        fn with_size(size: UnifiedSize, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let state = cx.new(|cx| ColorPickerState::new(DEFAULT_COLOR, window, cx));
             let changes = Rc::new(RefCell::new(Vec::new()));
             let sink = changes.clone();
@@ -2240,6 +2249,7 @@ mod tests {
             Self {
                 state,
                 changes,
+                size,
                 _subscription: subscription,
             }
         }
@@ -2247,19 +2257,36 @@ mod tests {
 
     impl Render for PickerHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(ColorPicker::new(&self.state))
+            // The layout matters: a block-level parent would stretch the trigger to the
+            // window's width and hide the width this test measures. A column that centers its
+            // children gives the trigger the content-sized width real callers give it.
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(ColorPicker::new(&self.state).with_unified_size(self.size))
         }
     }
 
     /// Installs the theme and draws the whole picker in a window large enough for the panel.
     fn picker_harness(cx: &mut TestAppContext) -> (Entity<PickerHarness>, &mut VisualTestContext) {
+        picker_harness_with_size(cx, UnifiedSize::Medium)
+    }
+
+    /// Installs the theme and draws the whole picker at `unified_size`.
+    fn picker_harness_with_size(
+        cx: &mut TestAppContext,
+        unified_size: UnifiedSize,
+    ) -> (Entity<PickerHarness>, &mut VisualTestContext) {
         cx.update(|cx| {
             // The hex tests deliver Enter through the real key dispatch, so the input's key
             // bindings have to be installed; the other tests do not care either way.
             gpui_kit::base::init(cx);
             theme::install(cx);
         });
-        let (harness, cx) = cx.add_window_view(PickerHarness::new);
+        let (harness, cx) = cx
+            .add_window_view(move |window, cx| PickerHarness::with_size(unified_size, window, cx));
         cx.simulate_resize(size(px(900.), px(800.)));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
@@ -2413,6 +2440,35 @@ mod tests {
             cx.debug_bounds("TEST_COLOR_PICKER_GRID").is_some(),
             "the open panel shows its default palette tab"
         );
+    }
+
+    #[gpui_kit::test]
+    fn the_trigger_should_be_square_at_every_unified_size(cx: &mut TestAppContext) {
+        for (unified_size, edge) in [
+            (UnifiedSize::Small, 20.),
+            (UnifiedSize::Medium, 30.),
+            (UnifiedSize::Large, 40.),
+        ] {
+            let (_harness, cx) = picker_harness_with_size(cx, unified_size);
+            let bounds = cx
+                .debug_bounds("TEST_COLOR_PICKER_TRIGGER")
+                .expect("the trigger is drawn");
+            assert_eq!(
+                bounds.size.width, bounds.size.height,
+                "{unified_size:?}: the trigger's width must match its UnifiedSize height"
+            );
+            assert_eq!(
+                bounds.size,
+                size(px(edge), px(edge)),
+                "{unified_size:?}: the trigger must be the UnifiedSize square"
+            );
+
+            press(cx, "TEST_COLOR_PICKER_TRIGGER");
+            assert!(
+                panel_is_drawn(cx),
+                "{unified_size:?}: a square trigger must still open the panel"
+            );
+        }
     }
 
     #[gpui_kit::test]
