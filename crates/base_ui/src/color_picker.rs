@@ -296,22 +296,21 @@ impl ColorPicker {
         cx.notify();
     }
 
-    /// Applies the palette swatch at `index`.
+    /// Applies the palette swatch at `index` and closes the popup.
     ///
     /// This is a user action, so it goes through [`ColorPicker::set_user_color`]: the event is
     /// emitted only when the swatch differs from the current color, and the hex field is
-    /// synchronized. An index outside the palette is ignored rather than panicking; the only
-    /// caller passes an index a hit test from the same palette produced.
+    /// synchronized. Choosing a swatch ends the interaction, so the panel closes (writing the
+    /// open flag also clears the hover preview through the picker's observer). An index outside
+    /// the palette is ignored rather than panicking; the only caller passes an index a hit test
+    /// from the same palette produced.
     fn select_palette(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(swatch) = PALETTE.get(index) else {
             return;
         };
 
         self.set_user_color(*swatch, true, window, cx);
-        // The pointer is still over this swatch, so keep the hover ring after committing. Set the
-        // field after `set_user_color` (which clears it for a real change): the render it queued
-        // then draws the ring, and the footer already shows the committed color.
-        self.hovered_swatch = Some(index);
+        self.open.write(cx, false);
     }
 
     /// Shows the swatch at `index` in the footer and marks it as hovered.
@@ -2508,7 +2507,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_palette_cell_in_the_open_panel_should_change_the_color_and_keep_it_open(
+    fn clicking_a_palette_cell_should_change_the_color_and_close_the_panel(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -2524,32 +2523,6 @@ mod tests {
             size(px(PALETTE_SIZE), px(PALETTE_SIZE)),
             "the grid draws at its nominal edge"
         );
-        let cell = point(
-            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
-            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
-        );
-
-        cx.simulate_click(cell, Modifiers::none());
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let swatch = PALETTE[28];
-        assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
-        assert_eq!(changes.borrow().as_slice(), &[swatch]);
-        assert!(
-            panel_is_drawn(cx),
-            "selecting a swatch leaves the panel open"
-        );
-
-        cx.simulate_click(cell, Modifiers::none());
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert_eq!(
-            changes.borrow().len(),
-            1,
-            "selecting the swatch already selected emits nothing"
-        );
-
         let gap = point(
             grid.origin.x + px(PALETTE_STEP * 4.0 + 22.0),
             grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
@@ -2560,11 +2533,46 @@ mod tests {
 
         assert_eq!(
             changes.borrow().len(),
-            1,
+            0,
             "a press in the gap between swatches emits nothing"
         );
+        assert!(
+            panel_is_drawn(cx),
+            "a press in the gap does not choose a color or close the panel"
+        );
+
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_click(cell, Modifiers::none());
+        settle(cx);
+
+        let swatch = PALETTE[28];
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
-        assert!(panel_is_drawn(cx));
+        assert_eq!(changes.borrow().as_slice(), &[swatch]);
+        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the picker opens the palette again");
+        let same_cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_click(same_cell, Modifiers::none());
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().len(),
+            1,
+            "choosing the swatch already selected emits nothing"
+        );
+        assert!(
+            !panel_is_drawn(cx),
+            "choosing the already selected swatch still closes the panel"
+        );
     }
 
     #[gpui_kit::test]
@@ -2700,7 +2708,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_keep_the_hover(
+    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_close_the_panel(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -2719,8 +2727,7 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         cx.simulate_click(cell, Modifiers::none());
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
+        settle(cx);
 
         let swatch = PALETTE[28];
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
@@ -2728,13 +2735,13 @@ mod tests {
         assert_eq!(
             state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
             hex_string(swatch).as_str(),
-            "committing keeps the hovered color in the field"
+            "committing keeps the chosen color in the field"
         );
-        assert_eq!(
-            state.read_with(cx, |state, _| state.hovered_swatch),
-            Some(28),
-            "the pointer is still over the swatch, so its hover ring stays"
+        assert!(
+            state.read_with(cx, |state, _| state.hovered_swatch.is_none()),
+            "closing the panel clears the hover preview"
         );
+        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
     }
 
     #[gpui_kit::test]
