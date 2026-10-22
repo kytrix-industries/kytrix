@@ -298,7 +298,7 @@ impl ColorPicker {
             return;
         };
 
-        self.set_user_color(swatch.hsla, true, window, cx);
+        self.set_user_color(*swatch, true, window, cx);
     }
 
     /// Moves one HSLA channel to `t`, leaving the other three untouched.
@@ -482,7 +482,7 @@ fn render_panel(
 ) -> AnyElement {
     let content: AnyElement = match active {
         ColorPickerTab::Palette => {
-            PaletteGrid::new(state.clone(), color, labels.palette.clone()).into_any_element()
+            PaletteGrid::new(state.clone(), labels.palette.clone()).into_any_element()
         }
         ColorPickerTab::Hsla => div()
             .flex()
@@ -677,31 +677,21 @@ impl RenderOnce for ColorWell {
 #[derive(IntoElement)]
 struct PaletteGrid {
     state: Entity<ColorPicker>,
-    color: Hsla,
     label: SharedString,
 }
 
 impl PaletteGrid {
-    /// Builds the grid for `state`, highlighting `color` if it is one of the swatches.
-    fn new(state: Entity<ColorPicker>, color: Hsla, label: SharedString) -> Self {
-        Self {
-            state,
-            color,
-            label,
-        }
+    /// Builds the grid for `state`.
+    fn new(state: Entity<ColorPicker>, label: SharedString) -> Self {
+        Self { state, label }
     }
 }
 
 impl RenderOnce for PaletteGrid {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let Self {
-            state,
-            color,
-            label,
-        } = self;
+        let Self { state, label } = self;
         let bounds = Rc::new(Cell::new(Bounds::default()));
         let prepaint_bounds = bounds.clone();
-        let selected = palette_index(color);
 
         div()
             .relative()
@@ -723,37 +713,15 @@ impl RenderOnce for PaletteGrid {
                         let scale = (bounds.size.width.as_f32() / PALETTE_SIZE)
                             .min(bounds.size.height.as_f32() / PALETTE_SIZE);
                         let cell_radius = px(4.0 * scale);
-                        let ring_inset = 1.0 * scale;
-                        let ring_width = px(2.0 * scale);
-                        let ring_radius = px(3.0 * scale);
 
-                        for (index, swatch) in PALETTE.iter().enumerate() {
+                        for (index, color) in PALETTE.iter().enumerate() {
                             let cell = palette_cell_bounds(
                                 bounds,
                                 index / PALETTE_COLS,
                                 index % PALETTE_COLS,
                             );
 
-                            window.paint_quad(fill(cell, swatch.hsla).corner_radii(cell_radius));
-
-                            if selected == Some(index) {
-                                let inner = Bounds::new(
-                                    point(
-                                        cell.origin.x + px(ring_inset),
-                                        cell.origin.y + px(ring_inset),
-                                    ),
-                                    size(
-                                        cell.size.width - px(ring_inset * 2.0),
-                                        cell.size.height - px(ring_inset * 2.0),
-                                    ),
-                                );
-                                window.paint_quad(
-                                    fill(inner, hsla(0., 0., 0., 0.))
-                                        .border_widths(ring_width)
-                                        .border_color(selection_ring_color(swatch.hsla))
-                                        .corner_radii(ring_radius),
-                                );
-                            }
+                            window.paint_quad(fill(cell, *color).corner_radii(cell_radius));
                         }
                     },
                 )
@@ -1169,12 +1137,6 @@ fn parse_hex(text: &str) -> Option<Hsla> {
     }))
 }
 
-/// One palette swatch: the color it draws and its eight-bit sRGB channels.
-struct PaletteSwatch {
-    hsla: Hsla,
-    rgb: [u8; 3],
-}
-
 /// The hue of a palette row, or `None` for the neutral row.
 fn palette_hue(row: usize) -> Option<f32> {
     (row > 0).then(|| (row - 1) as f32 / (PALETTE_ROWS as f32 - 1.0))
@@ -1183,55 +1145,19 @@ fn palette_hue(row: usize) -> Option<f32> {
 /// The twelve by twelve palette, generated once.
 ///
 /// Row 0 is the neutral ramp and each following row is one hue family; each column is one
-/// lightness step. The table is a process-wide static because generating it costs 144 HSL to
-/// RGB conversions, which every picker would otherwise repeat when its palette tab opens.
-static PALETTE: LazyLock<[PaletteSwatch; PALETTE_ROWS * PALETTE_COLS]> = LazyLock::new(|| {
+/// lightness step. The table is a process-wide static because every picker shares the same
+/// generated colors.
+static PALETTE: LazyLock<[Hsla; PALETTE_ROWS * PALETTE_COLS]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         let row = index / PALETTE_COLS;
         let col = index % PALETTE_COLS;
-        let color = match palette_hue(row) {
+
+        match palette_hue(row) {
             Some(hue) => hsla(hue, PALETTE_SATURATION, PALETTE_LIGHTNESS[col], 1.0),
             None => hsla(0., 0., PALETTE_LIGHTNESS[col], 1.0),
-        };
-        let [r, g, b, _] = rgba8(color);
-
-        PaletteSwatch {
-            hsla: color,
-            rgb: [r, g, b],
         }
     })
 });
-
-/// The index of the swatch `color` displays as, if any.
-///
-/// The comparison is on the eight-bit sRGB channels rather than on the float [`Hsla`]: a color
-/// that came from the hex field is eight-bit by construction, and selecting a swatch writes the
-/// very `Hsla` whose `rgb` entry was generated here. Alpha has to quantize to opaque, because
-/// every swatch is opaque and a noticeably translucent color is not the swatch it resembles.
-fn palette_index(color: Hsla) -> Option<usize> {
-    let [r, g, b, a] = rgba8(color);
-
-    if a != 255 {
-        return None;
-    }
-
-    PALETTE.iter().position(|swatch| swatch.rgb == [r, g, b])
-}
-
-/// The color of the ring around the selected swatch.
-///
-/// The ring has to read at both ends of the ramp, so it flips with the swatch's luma rather than
-/// with the theme: a light swatch gets a dark ring and a dark swatch a light one.
-fn selection_ring_color(color: Hsla) -> Hsla {
-    let [r, g, b, _] = rgba8(color);
-    let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-
-    if luma > 140.0 {
-        hsla(0., 0., 0., 0.85)
-    } else {
-        hsla(0., 0., 1., 0.95)
-    }
-}
 
 /// Maps a window position to the palette swatch under it.
 ///
@@ -1292,8 +1218,8 @@ mod tests {
         PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION, PALETTE_SIZE,
         PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT,
         SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS,
-        TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue, palette_index,
-        palette_index_at, parse_hex, rgba8, selection_ring_color,
+        TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue, palette_index_at,
+        parse_hex, rgba8,
     };
     use crate::{
         animation::ANIMATION_TICK,
@@ -1320,13 +1246,11 @@ mod tests {
         );
 
         for col in 0..PALETTE_COLS {
-            let swatch = &PALETTE[col];
+            let color = PALETTE[col];
 
-            assert_eq!(swatch.hsla.s, 0.0, "row 0 is the neutral ramp");
-            assert_eq!(swatch.hsla.l, PALETTE_LIGHTNESS[col]);
-            assert_eq!(swatch.hsla.a, 1.0);
-            assert_eq!(swatch.rgb[0], swatch.rgb[1]);
-            assert_eq!(swatch.rgb[1], swatch.rgb[2]);
+            assert_eq!(color.s, 0.0, "row 0 is the neutral ramp");
+            assert_eq!(color.l, PALETTE_LIGHTNESS[col]);
+            assert_eq!(color.a, 1.0);
         }
 
         for row in 1..PALETTE_ROWS {
@@ -1334,72 +1258,16 @@ mod tests {
             assert!((hue - (row - 1) as f32 / (PALETTE_ROWS - 1) as f32).abs() < 1e-6);
 
             for col in 0..PALETTE_COLS {
-                let swatch = &PALETTE[row * PALETTE_COLS + col];
+                let color = PALETTE[row * PALETTE_COLS + col];
 
-                assert_eq!(swatch.hsla.h, hue);
-                assert_eq!(swatch.hsla.s, PALETTE_SATURATION);
-                assert_eq!(swatch.hsla.l, PALETTE_LIGHTNESS[col]);
-                assert_eq!(swatch.hsla.a, 1.0);
+                assert_eq!(color.h, hue);
+                assert_eq!(color.s, PALETTE_SATURATION);
+                assert_eq!(color.l, PALETTE_LIGHTNESS[col]);
+                assert_eq!(color.a, 1.0);
             }
         }
 
         assert_eq!(palette_hue(0), None);
-    }
-
-    #[test]
-    fn palette_index_should_find_every_swatch() {
-        for (index, swatch) in PALETTE.iter().enumerate() {
-            assert_eq!(palette_index(swatch.hsla), Some(index), "swatch {index}");
-        }
-    }
-
-    #[test]
-    fn palette_index_should_reject_colors_that_are_not_swatches() {
-        assert_eq!(
-            palette_index(hsla(0.5, 0.1, 0.5, 1.0)),
-            None,
-            "a desaturated mid-tone is not one of the saturated or neutral swatches"
-        );
-
-        let mut translucent = PALETTE[28].hsla;
-        translucent.a = 0.5;
-        assert_eq!(
-            palette_index(translucent),
-            None,
-            "a translucent color does not display as the opaque swatch it resembles"
-        );
-
-        let mut almost_opaque = PALETTE[28].hsla;
-        almost_opaque.a = 254.5 / 255.0;
-        assert_eq!(
-            palette_index(almost_opaque),
-            Some(28),
-            "an alpha that quantizes to opaque displays as the swatch"
-        );
-    }
-
-    #[test]
-    fn selection_ring_should_contrast_with_the_swatch() {
-        assert_eq!(
-            selection_ring_color(hsla(0., 0., 1., 1.)),
-            hsla(0., 0., 0., 0.85),
-            "a white swatch gets a dark ring"
-        );
-        assert_eq!(
-            selection_ring_color(hsla(0., 0., 0., 1.)),
-            hsla(0., 0., 1., 0.95),
-            "a black swatch gets a light ring"
-        );
-        assert_eq!(
-            selection_ring_color(PALETTE[PALETTE_COLS - 1].hsla),
-            hsla(0., 0., 0., 0.85),
-            "the light end of the ramp gets a dark ring"
-        );
-        assert_eq!(
-            selection_ring_color(PALETTE[0].hsla),
-            hsla(0., 0., 1., 0.95),
-            "the dark end of the ramp gets a light ring"
-        );
     }
 
     fn palette_bounds(origin: Point<Pixels>, width: f32, height: f32) -> Bounds<Pixels> {
@@ -1954,7 +1822,7 @@ mod tests {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        let swatch = PALETTE[28].hsla;
+        let swatch = PALETTE[28];
 
         cx.update(|window, cx| {
             state.update(cx, |state, cx| state.select_palette(28, window, cx));
@@ -2521,9 +2389,8 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
-        let swatch = PALETTE[28].hsla;
+        let swatch = PALETTE[28];
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
-        assert_eq!(palette_index(swatch), Some(28));
         assert_eq!(changes.borrow().as_slice(), &[swatch]);
         assert!(
             panel_is_drawn(cx),
