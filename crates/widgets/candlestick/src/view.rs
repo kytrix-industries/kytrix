@@ -90,7 +90,7 @@ use super::{
         paint::{
             ChartCanvasOptions, ChartPaintCaches, chart_canvas, latest_price_indicator_is_visible,
         },
-        text::HoverLabelCache,
+        text::ReadoutCache,
     },
     indicator::{CandlestickIndicatorConfig, normalize_indicator},
     model::CandlestickSeriesSnapshot,
@@ -428,7 +428,7 @@ pub struct CandlestickWidget {
     /// Filled in by the chart's layout pass, so that pointer events — which
     /// arrive outside any layout — can be hit-tested.
     chart_layout: Rc<RefCell<Option<Rc<ChartLayout>>>>,
-    hover_label_cache: Rc<RefCell<HoverLabelCache>>,
+    readout_cache: Rc<RefCell<ReadoutCache>>,
     chart_paint_caches: Rc<ChartPaintCaches>,
     pointer_frame: PointerFrameState,
     scroll_frame: ScrollFrameState,
@@ -619,7 +619,7 @@ impl CandlestickWidget {
             countdown_task: None,
             viewport: ChartViewport::default(),
             chart_layout: Rc::new(RefCell::new(None)),
-            hover_label_cache: Rc::new(RefCell::new(HoverLabelCache::default())),
+            readout_cache: Rc::new(RefCell::new(ReadoutCache::default())),
             chart_paint_caches: Rc::new(ChartPaintCaches::default()),
             pointer_frame: PointerFrameState::default(),
             scroll_frame: ScrollFrameState::default(),
@@ -796,7 +796,7 @@ impl CandlestickWidget {
         self.pointer_frame.clear_pending();
         self.scroll_frame.clear_pending();
         *self.chart_layout.borrow_mut() = None;
-        self.hover_label_cache.borrow_mut().clear();
+        self.readout_cache.borrow_mut().clear();
         self.chart_paint_caches.clear();
         self.viewport.right_timestamp = None;
         self.viewport.cursor = None;
@@ -1953,7 +1953,7 @@ impl CandlestickWidget {
                 panel_open: self.panel_open,
             },
             self.chart_layout.clone(),
-            self.hover_label_cache.clone(),
+            self.readout_cache.clone(),
             self.chart_paint_caches.clone(),
             on_layout_change,
         );

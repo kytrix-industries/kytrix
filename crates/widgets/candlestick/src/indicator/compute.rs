@@ -59,7 +59,7 @@ pub(crate) struct IndicatorLine {
     /// The first absolute index whose value is trustworthy.
     ///
     /// The line still has values before this index where the formula defines
-    /// one (EMA and MACD do, from the first candle on); the legend and the hover
+    /// one (EMA and MACD do, from the first candle on); the legend and the readout
     /// read no value before it. It is computed per line from that line's own
     /// settings, not from the indicator's longest depth.
     pub readable_from: usize,

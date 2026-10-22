@@ -8,8 +8,9 @@
 //!   bar. All of it is cached against the exact inputs that produced it, so a
 //!   frame that only moved the pointer re-uses the previous result instead of
 //!   re-deriving hundreds of boxes and shaping dozens of labels.
-//! - **paint** turns those boxes into quads, plus the crosshair, which is the
-//!   only part that must follow the pointer every frame.
+//! - **paint** turns those boxes into quads and draws the text rows on top: the
+//!   OHLCV readout and the indicator legends, which are drawn on every frame,
+//!   and the crosshair, which is the only part that follows the pointer.
 
 use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 
@@ -36,8 +37,8 @@ use super::{
         CandleGeometry, ChartLayout, ChartViewport, LayoutInputs, SubPlotLayout, visible_range,
     },
     text::{
-        ChartTextCache, HOVER_LABEL_LINE_HEIGHT, HoverLabelCache, format_price,
-        format_signed_price, format_volume,
+        ChartTextCache, ReadoutCache, TEXT_ROW_HEIGHT, format_price, format_signed_price,
+        format_volume,
     },
 };
 use crate::{
@@ -62,20 +63,40 @@ const PRICE_AXIS_TARGET_LABEL_SPACING: f32 = 44.0;
 const PRICE_AXIS_MIN_LABEL_SPACING: f32 = 28.0;
 const MAX_PRICE_AXIS_TARGET_INTERVALS: f64 = 16.0;
 const MAX_PRICE_AXIS_TICKS: usize = 24;
-const HOVER_LABEL_INSET: f32 = 4.0;
-/// The gap between the main-chart legend row and the OHLC hover label below it.
+const TEXT_ROW_INSET: f32 = 4.0;
+/// Top inset of the first text row of any plot.
 ///
-/// Both used to start at [`HOVER_LABEL_INSET`] from the plot's top-left corner,
-/// so the hover label was painted on top of the legend. The legend's position is
-/// fixed by the design (top-left, inset by `HOVER_LABEL_INSET`); the hover label
-/// is not, so it moves down one line while the legend is shown.
-const HOVER_LABEL_LEGEND_GAP: f32 = 2.0;
+/// On the price plot that row is the OHLCV readout; on a sub plot it is the
+/// sub-plot legend, because a sub plot has no readout.
+///
+/// A plot shorter than [`TEXT_ROW_HEIGHT`] plus this inset has no room for that
+/// row: [`readout_bounds`] then returns a zero-height box, so [`paint_readout`]
+/// returns without painting instead of drawing over the plot's neighbour.
+const FIRST_TEXT_ROW_TOP: f32 = TEXT_ROW_INSET;
+/// The gap between the readout row and the main-chart legend row below it.
+const READOUT_LEGEND_GAP: f32 = 2.0;
+/// Top inset of the main-chart indicator legend, which takes the second row.
+///
+/// The readout is drawn on every frame, so the legend can never take the first
+/// row back: the two would be painted on top of each other.
+///
+/// The price plot is only guaranteed to be [`crate::chart::geometry::MIN_PLOT_HEIGHT`]
+/// tall while the content height allows it: the layout computes
+/// `price_height = content_height - sub_total`, so a pane shorter than the floor
+/// yields a proportionally shorter price plot (see
+/// [`crate::chart::geometry::ChartLayout`]). Both text rows fit whenever the plot
+/// is at least `MAIN_LEGEND_TOP + TEXT_ROW_HEIGHT` tall, which the floor exceeds;
+/// below roughly 34px the legend's row is cropped from below by the same
+/// `with_content_mask` that clips every row to its plot. That is cosmetic — the
+/// row order is fixed and nothing is drawn outside the plot — so the legend is
+/// deliberately not guarded on height.
+const MAIN_LEGEND_TOP: f32 = FIRST_TEXT_ROW_TOP + TEXT_ROW_HEIGHT + READOUT_LEGEND_GAP;
 const VOLUME_HEADROOM: f64 = 1.08;
 /// Below five label rows a sub plot labels three values instead of five.
 ///
-/// Five labels need five [`HOVER_LABEL_LINE_HEIGHT`] rows; a shorter plot would
+/// Five labels need five [`TEXT_ROW_HEIGHT`] rows; a shorter plot would
 /// draw the rows on top of each other.
-const SUB_PLOT_COMPACT_HEIGHT: f32 = 5.0 * HOVER_LABEL_LINE_HEIGHT;
+const SUB_PLOT_COMPACT_HEIGHT: f32 = 5.0 * TEXT_ROW_HEIGHT;
 
 /// Everything one frame of the chart draws from.
 pub(crate) struct ChartCanvasOptions {
@@ -119,7 +140,7 @@ pub(crate) fn chart_canvas(
     snapshot: CandlestickSeriesSnapshot,
     options: ChartCanvasOptions,
     layout_cell: Rc<RefCell<Option<Rc<ChartLayout>>>>,
-    hover_label_cache: Rc<RefCell<HoverLabelCache>>,
+    readout_cache: Rc<RefCell<ReadoutCache>>,
     paint_caches: Rc<ChartPaintCaches>,
     on_layout_change: impl FnOnce(&mut App) + 'static,
 ) -> impl IntoElement {
@@ -128,7 +149,7 @@ pub(crate) fn chart_canvas(
     let prepaint_interval = options.interval;
     let prepaint_indicator_config = options.indicator_config.clone();
     let prepaint_panel_open = options.panel_open;
-    let paint_hover_label_cache = hover_label_cache;
+    let paint_readout_cache = readout_cache;
     let prepaint_caches = paint_caches.clone();
     let paint_caches = paint_caches;
     canvas(
@@ -161,7 +182,7 @@ pub(crate) fn chart_canvas(
                 &snapshot,
                 &options,
                 prepared.as_ref(),
-                &paint_hover_label_cache,
+                &paint_readout_cache,
                 &paint_caches.text,
                 window,
                 context,
@@ -203,6 +224,11 @@ struct PreparedCandle {
 }
 
 struct PreparedVisibleChart {
+    /// The absolute candles in the viewport.
+    ///
+    /// Never empty while the chart is visible: `paint_chart` returns before it reads
+    /// this when the snapshot has no candles in range. [`readout_candle_index`]'s
+    /// fallback (`range.len() - 1`) depends on that invariant.
     range: Range<usize>,
     lowest: f64,
     highest: f64,
@@ -797,24 +823,11 @@ struct ChartPainter<'a> {
     price_tick: Tick,
 }
 
-/// Top inset of the OHLC hover label.
-///
-/// The main-chart legend owns the plot's first text row while it is drawn, so
-/// the label starts one line below it (with a small gap). Without a legend it
-/// keeps the original top-left inset.
-fn hover_label_top(has_legend: bool) -> Pixels {
-    if has_legend {
-        px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT + HOVER_LABEL_LEGEND_GAP)
-    } else {
-        px(HOVER_LABEL_INSET)
-    }
-}
-
 fn paint_chart(
     snapshot: &CandlestickSeriesSnapshot,
     options: &ChartCanvasOptions,
     prepared: &PreparedChart,
-    hover_label_cache: &Rc<RefCell<HoverLabelCache>>,
+    readout_cache: &Rc<RefCell<ReadoutCache>>,
     text_cache: &RefCell<ChartTextCache>,
     window: &mut Window,
     context: &mut App,
@@ -909,54 +922,76 @@ fn paint_chart(
     if let Some(latest) = &visible.latest_price {
         painter.paint_latest_price_indicator(latest, options.countdown_label.clone(), layout);
     }
-    // The legend reads the candle under the pointer, or the newest visible one
-    // when the pointer is away. The absolute index is what indexes the values;
-    // a visible slot alone would read another candle's values after a pan.
-    let absolute = legend_candle_index(options.viewport.cursor, layout, visible);
-    let legend = absolute
-        .map(|absolute| main_indicator_legend(indicators, absolute, price_tick))
-        .unwrap_or_default();
+    // The text rows read the candle the chart is describing: the one under the
+    // pointer, or the newest visible one while the pointer is away. The absolute
+    // index is what indexes the values; a visible slot alone would read another
+    // candle's values after a pan.
+    let absolute = readout_candle_index(options.viewport.cursor, layout, visible);
+    #[cfg(test)]
+    PAINT_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        log.described = Some(absolute);
+        log.range = Some(visible.range.clone());
+    });
+    // The readout owns the price plot's first text row on every frame, so it is
+    // shaped here — once — and the crosshair's time tag reuses the same label.
+    let readout = {
+        let candles = snapshot.candles();
+        let candle = &candles[absolute];
+        let previous = absolute.checked_sub(1).and_then(|index| candles.get(index));
+        // The label the size is read in is the described candle's own unit, so a
+        // candle that published none carries the missing state instead of a unit.
+        let volume_unit = traded_unit_label(candle, painter.context);
+        readout_cache.borrow_mut().presentation(
+            candle,
+            previous,
+            price_tick,
+            options.interval,
+            zone,
+            &volume_unit,
+            painter.context.theme(),
+            painter.window,
+        )
+    };
+    let legend = main_indicator_legend(indicators, absolute, price_tick);
     if !legend.is_empty() {
-        painter.paint_legend(&legend, layout.price_plot);
+        // Below the readout, which is drawn on every frame and therefore never
+        // gives the first row back.
+        painter.paint_legend(&legend, layout.price_plot, MAIN_LEGEND_TOP);
     }
-    if let Some(absolute) = absolute {
-        let axis_color = painter.context.theme().components.chart.axis.hsla;
-        for (index, prepared_sub_plot) in visible.sub_plots.iter().enumerate() {
-            let Some(sub_plot) = layout.sub_plots.get(index) else {
-                continue;
-            };
-            let entries = sub_plot_legend(
-                prepared_sub_plot.id,
-                indicators,
-                absolute,
-                snapshot,
-                price_tick,
-                axis_color,
-            );
-            if !entries.is_empty() {
-                painter.paint_legend(&entries, sub_plot.plot);
-            }
+    let axis_color = painter.context.theme().components.chart.axis.hsla;
+    for (index, prepared_sub_plot) in visible.sub_plots.iter().enumerate() {
+        let Some(sub_plot) = layout.sub_plots.get(index) else {
+            continue;
+        };
+        let entries = sub_plot_legend(
+            prepared_sub_plot.id,
+            indicators,
+            absolute,
+            snapshot,
+            price_tick,
+            axis_color,
+        );
+        if !entries.is_empty() {
+            // A sub plot has no readout, so its legend keeps the first row.
+            painter.paint_legend(&entries, sub_plot.plot, FIRST_TEXT_ROW_TOP);
         }
     }
+    // Only the crosshair's lines and tags follow the pointer; the readout above
+    // them does not, and is drawn last so the text stays on top of the dashes.
     if let Some(cursor) = options
         .viewport
         .cursor
         .filter(|cursor| layout.contains_data_point(cursor))
     {
-        // The legend owns the plot's first text row; the OHLC label takes the
-        // next one so the two are both readable.
-        let hover_label_top = hover_label_top(!legend.is_empty());
-        painter.paint_crosshair(
-            snapshot,
-            visible,
-            options.interval,
-            zone,
-            cursor,
-            layout,
-            hover_label_cache,
-            hover_label_top,
-        );
+        painter.paint_crosshair(cursor, visible, layout, &readout.time_label);
     }
+    paint_readout(
+        readout.line.as_ref(),
+        layout.price_plot,
+        painter.window,
+        painter.context,
+    );
 }
 
 /// The colour of one MACD histogram bar.
@@ -1008,16 +1043,30 @@ impl ChartPainter<'_> {
 
     /// Draws one legend row in a plot's top-left corner, each entry in its own
     /// colour.
-    fn paint_legend(&mut self, entries: &[LegendEntry], plot: Bounds<Pixels>) {
-        let mut x = plot.origin.x + px(HOVER_LABEL_INSET);
-        let y = plot.origin.y + px(HOVER_LABEL_INSET);
+    ///
+    /// `top` is the row's own inset from the plot's top edge, which is what keeps
+    /// the main-chart legend below the readout while a sub plot's legend — whose
+    /// plot has no readout — keeps the first row.
+    fn paint_legend(&mut self, entries: &[LegendEntry], plot: Bounds<Pixels>, top: f32) {
+        let mut x = plot.origin.x + px(TEXT_ROW_INSET);
+        let y = plot.origin.y + px(top);
         let ChartPainter {
             text_cache,
             window,
             context,
             ..
         } = self;
+        #[cfg(test)]
+        let mut painted_any = false;
+        #[cfg(test)]
+        let mut text = String::new();
+        #[cfg(test)]
+        let mut mask = plot;
         window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
+            #[cfg(test)]
+            {
+                mask = window.content_mask().bounds;
+            }
             for entry in entries {
                 if x >= plot.right() {
                     break;
@@ -1028,17 +1077,42 @@ impl ChartPainter<'_> {
                     window,
                 );
                 let width = line.width();
-                let _ = line.paint(
+                // The line always paints. The test recorder is the only reader of
+                // the outcome; production has nothing to do with a failed paint,
+                // which simply leaves nothing on the frame.
+                let painted = line.paint(
                     point(x, y),
-                    px(HOVER_LABEL_LINE_HEIGHT),
+                    px(TEXT_ROW_HEIGHT),
                     TextAlign::Left,
                     None,
                     window,
                     context,
                 );
+                #[cfg(test)]
+                {
+                    painted_any |= painted.is_ok();
+                    text.push_str(entry.text.as_str());
+                    text.push(' ');
+                }
+                #[cfg(not(test))]
+                drop(painted);
                 x += width + px(10.0);
             }
         });
+        #[cfg(test)]
+        if painted_any {
+            // Recorded after the loop: an entry means at least one entry of this
+            // row painted successfully, and an empty row leaves no trace.
+            PAINT_LOG.with(|log| {
+                log.borrow_mut().rows.push(PaintedRow {
+                    kind: TextRow::Legend,
+                    plot,
+                    top: y,
+                    text: SharedString::new(text.as_str()),
+                    mask,
+                });
+            });
+        }
     }
 
     fn paint_price_axis(
@@ -1263,7 +1337,7 @@ impl ChartPainter<'_> {
                 price_label,
                 point(
                     axis.origin.x + px(5.0),
-                    tag_y + (tag_height - px(HOVER_LABEL_LINE_HEIGHT)).max(px(0.0)) / 2.0,
+                    tag_y + (tag_height - px(TEXT_ROW_HEIGHT)).max(px(0.0)) / 2.0,
                 ),
                 self.context.theme().roles.fg.on_brand.hsla,
                 TextAlign::Left,
@@ -1291,23 +1365,24 @@ impl ChartPainter<'_> {
         );
     }
 
+    /// Draws the crosshair's dashed lines, its axis tag and its bottom time tag.
+    ///
+    /// Only the parts that follow the pointer are drawn here, and only while the
+    /// pointer is over the chart. The OHLCV readout is not one of them: it is
+    /// drawn on every frame, by [`paint_readout`] after this, so the text stays
+    /// on top of the dashes.
     fn paint_crosshair(
         &mut self,
-        snapshot: &CandlestickSeriesSnapshot,
-        visible: &PreparedVisibleChart,
-        interval: TimeFrame,
-        zone: UtcOffset,
         cursor: Point<Pixels>,
+        visible: &PreparedVisibleChart,
         layout: &ChartLayout,
-        hover_label_cache: &Rc<RefCell<HoverLabelCache>>,
-        hover_label_top: Pixels,
+        time_label: &SharedString,
     ) {
         let Some(slot) = visible.geometry.slot_at(cursor.x) else {
             return;
         };
-        let candles = snapshot.candles();
-        let price_tick = snapshot.price_tick();
-        let candle_index = visible.range.start + slot;
+        #[cfg(test)]
+        PAINT_LOG.with(|log| log.borrow_mut().crosshairs.push(cursor));
         let x = visible.geometry.center_x(slot);
         paint_dashed_vertical(
             x,
@@ -1327,7 +1402,7 @@ impl ChartPainter<'_> {
                 self.window,
             );
             let price = price_for_y(y, visible.lowest, visible.highest, layout.price_plot);
-            self.paint_axis_tag(y, format_price(price, price_tick), layout.price_axis);
+            self.paint_axis_tag(y, format_price(price, self.price_tick), layout.price_axis);
         } else if let Some((index, sub_plot)) = layout
             .sub_plots
             .iter()
@@ -1352,7 +1427,7 @@ impl ChartPainter<'_> {
                     )),
                     IndicatorId::Macd => format_signed_price(
                         sub_value_from_y(y, prepared_sub_plot.value_range, sub_plot.plot),
-                        price_tick,
+                        self.price_tick,
                     ),
                     _ => format_percentage_value(sub_value_from_y(
                         y,
@@ -1364,23 +1439,6 @@ impl ChartPainter<'_> {
             }
         }
 
-        let candle = &candles[candle_index];
-        let previous = candle_index
-            .checked_sub(1)
-            .and_then(|index| candles.get(index));
-        // The label the size is read in is the hovered candle's own unit, so a
-        // candle that published none carries the missing state instead of a unit.
-        let volume_unit = traded_unit_label(candle, self.context);
-        let presentation = hover_label_cache.borrow_mut().presentation(
-            candle,
-            previous,
-            price_tick,
-            interval,
-            zone,
-            &volume_unit,
-            self.context.theme(),
-            self.window,
-        );
         let tag_width = px(132.0).min(layout.time_axis.size.width);
         let tag_x = (x - tag_width / 2.0)
             .max(layout.time_axis.origin.x)
@@ -1393,19 +1451,16 @@ impl ChartPainter<'_> {
             self.context.theme().roles.brand.base.hsla,
         ));
         self.paint_text(
-            presentation.time_label,
+            time_label,
             point(tag_x, layout.time_axis.origin.y + px(6.0)),
             self.context.theme().roles.fg.on_brand.hsla,
             TextAlign::Center,
             tag_width,
         );
-        paint_hover_label(
-            presentation.line.as_ref(),
-            layout.price_plot,
-            hover_label_top,
-            self.window,
-            self.context,
-        );
+        #[cfg(test)]
+        PAINT_LOG.with(|log| {
+            log.borrow_mut().time_tag = Some(time_label.clone());
+        });
     }
 
     fn paint_axis_tag(&mut self, y: Pixels, label: impl AsRef<str>, axis: Bounds<Pixels>) {
@@ -1443,7 +1498,7 @@ impl ChartPainter<'_> {
                 .line(SharedString::new(text.as_ref()), color, self.window);
         let _ = line.paint(
             origin,
-            px(HOVER_LABEL_LINE_HEIGHT),
+            px(TEXT_ROW_HEIGHT),
             align,
             Some(width),
             self.window,
@@ -1570,22 +1625,27 @@ fn price_bounds_with_indicators(
     padded_price_bounds(lowest, highest)
 }
 
-/// The absolute candle index the legend reads.
+/// The absolute candle index the readout and the legends read.
 ///
 /// It is the candle under the pointer, or the newest visible one when the
 /// pointer is away. The visible slot alone is not an index into an
 /// `IndicatorLine`: after a pan, slot `n` belongs to another candle, so the
 /// addition of `range.start` is required (design §5.6).
-fn legend_candle_index(
+fn readout_candle_index(
     cursor: Option<Point<Pixels>>,
     layout: &ChartLayout,
     visible: &PreparedVisibleChart,
-) -> Option<usize> {
+) -> usize {
+    debug_assert!(
+        !visible.range.is_empty(),
+        "a visible chart always has at least one candle in range: {:?}",
+        visible.range
+    );
     let slot = cursor
         .filter(|cursor| layout.contains_data_point(cursor))
         .and_then(|cursor| visible.geometry.slot_at(cursor.x))
-        .unwrap_or(visible.range.len().checked_sub(1)?);
-    Some(visible.range.start + slot)
+        .unwrap_or(visible.range.len() - 1);
+    visible.range.start + slot
 }
 
 /// One entry of a chart legend.
@@ -2218,27 +2278,114 @@ fn asset_label(asset: &AssetId, cx: &App) -> SharedString {
         )
 }
 
-fn hover_label_bounds(price_plot: Bounds<Pixels>, top_inset: Pixels) -> Bounds<Pixels> {
-    let inset = px(HOVER_LABEL_INSET);
+/// Which text row a plot paints.
+///
+/// The price plot's first row is the readout and its second the indicator
+/// legend; a sub plot has no readout, so its first row is its own legend.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TextRow {
+    Readout,
+    Legend,
+}
+
+/// What one painted frame drew, as the paint pass itself reported it.
+///
+/// Text leaves the canvas as glyph sprites, which a window does not expose the
+/// way it exposes quads, so the paint-level tests read back this record of what
+/// the production paint pass reported drawing:
+///
+/// - every row is stored with the plot it belongs to, so a test can tell the
+///   price plot's rows from a sub plot's without knowing either box's position;
+/// - a readout row carries the shaped line's text; a legend row carries the
+///   concatenated texts of the entries it drew (a test-only assembly, not one
+///   shaped line);
+/// - a row is recorded only after `line.paint` returned `Ok`, so an entry means
+///   the paint call succeeded — it cannot prove glyph rasterization: on this
+///   Windows test harness no headless renderer is configured, and glyph sprites
+///   live in a `pub(crate)` scene the window does not expose.
+///
+/// Every entry is appended by the paint pass of one frame; the harness clears
+/// the log before each frame it reads.
+#[cfg(test)]
+#[derive(Default)]
+struct PaintLog {
+    /// Text rows, in draw order.
+    rows: Vec<PaintedRow>,
+    /// Every crosshair drawn, with the pointer it was drawn for.
+    crosshairs: Vec<Point<Pixels>>,
+    /// The bottom time tag, when one was drawn: its text.
+    time_tag: Option<SharedString>,
+    /// The absolute candle the readout and the legends described this frame.
+    described: Option<usize>,
+    /// The visible range the frame laid out.
+    ///
+    /// Recorded straight from `paint_chart`, so a test can compute a slot's
+    /// absolute index from its own arithmetic instead of trusting
+    /// [`PaintLog::described`] — which production writes from the same variable
+    /// the readout is shaped with.
+    range: Option<Range<usize>>,
+}
+
+/// One text row a frame painted.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct PaintedRow {
+    kind: TextRow,
+    /// The plot the row belongs to.
+    plot: Bounds<Pixels>,
+    /// The row's own top.
+    top: Pixels,
+    /// The text handed to paint: the shaped line's for a readout, the
+    /// concatenated entry texts for a legend.
+    text: SharedString,
+    /// The box the row was clipped to, as the window reported it while painting.
+    mask: Bounds<Pixels>,
+}
+
+#[cfg(test)]
+impl PaintedRow {
+    /// The row's inset from the top of the plot it is drawn in.
+    fn inset(&self) -> Pixels {
+        self.top - self.plot.origin.y
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PAINT_LOG: RefCell<PaintLog> = RefCell::new(PaintLog::default());
+}
+
+/// The box the OHLCV readout line is painted in.
+///
+/// Zero-sized when the plot has no room for the row, so the caller paints nothing
+/// rather than drawing outside the plot.
+fn readout_bounds(price_plot: Bounds<Pixels>) -> Bounds<Pixels> {
+    let inset = px(TEXT_ROW_INSET);
+    let top = px(FIRST_TEXT_ROW_TOP);
     Bounds::new(
-        point(price_plot.origin.x + inset, price_plot.origin.y + top_inset),
+        point(price_plot.origin.x + inset, price_plot.origin.y + top),
         size(
             (price_plot.size.width - inset * 2.0).max(px(0.0)),
-            (price_plot.size.height - top_inset - inset)
+            (price_plot.size.height - top - inset)
                 .max(px(0.0))
-                .min(px(HOVER_LABEL_LINE_HEIGHT)),
+                .min(px(TEXT_ROW_HEIGHT)),
         ),
     )
 }
 
-fn paint_hover_label(
+/// Draws the OHLCV readout on the price plot's first text row.
+///
+/// It is drawn on every frame, so it is not part of the crosshair: the crosshair's
+/// lines and tags appear only while the pointer is over the chart, while this line
+/// always describes a candle — the one under the pointer, or the newest visible one.
+fn paint_readout(
     line: &ShapedLine,
     price_plot: Bounds<Pixels>,
-    top_inset: Pixels,
     window: &mut Window,
     context: &mut App,
 ) {
-    let bounds = hover_label_bounds(price_plot, top_inset);
+    let bounds = readout_bounds(price_plot);
     if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
         return;
     }
@@ -2246,14 +2393,34 @@ fn paint_hover_label(
     // Clipped to the price plot: the label is as wide as the candle data, which
     // is wider than a narrow pane.
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = line.paint(
+        // The readout always paints; the test recorder is the only reader of the
+        // outcome, and production has nothing to do with a failed paint.
+        let painted = line.paint(
             bounds.origin,
-            px(HOVER_LABEL_LINE_HEIGHT),
+            px(TEXT_ROW_HEIGHT),
             TextAlign::Left,
             Some(bounds.size.width),
             window,
             context,
         );
+        #[cfg(not(test))]
+        drop(painted);
+        #[cfg(test)]
+        if painted.is_ok() {
+            // Recorded only once the text is on the frame, and with the mask the
+            // window itself is clipping to, so this entry is evidence of a draw
+            // and of its clip rather than of an intention to draw.
+            let mask = window.content_mask().bounds;
+            PAINT_LOG.with(|log| {
+                log.borrow_mut().rows.push(PaintedRow {
+                    kind: TextRow::Readout,
+                    plot: price_plot,
+                    top: bounds.origin.y,
+                    text: line.text.clone(),
+                    mask,
+                });
+            });
+        }
     });
 }
 
@@ -2312,7 +2479,7 @@ fn volume_for_y(y: Pixels, upper: f64, plot: Bounds<Pixels>) -> f64 {
 }
 
 fn axis_label_y(y: Pixels, axis: Bounds<Pixels>) -> Pixels {
-    let label_height = px(HOVER_LABEL_LINE_HEIGHT).min(axis.size.height);
+    let label_height = px(TEXT_ROW_HEIGHT).min(axis.size.height);
     (y - label_height / 2.0)
         .max(axis.origin.y)
         .min(axis.bottom() - label_height)
@@ -2364,7 +2531,10 @@ fn nearest_nice_step(raw_step: f64) -> f64 {
 mod tests {
     use std::str::FromStr;
 
-    use gpui_kit::{Context, Render, TestAppContext, div};
+    use gpui_kit::{
+        Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
+        VisualTestContext, div,
+    };
     use market_participants_connector::catalog::test_support;
     use market_participants_model::{
         decimal::{Price, Quantity},
@@ -2685,51 +2855,94 @@ mod tests {
     }
 
     #[test]
-    fn hover_label_bounds_should_not_exceed_narrow_price_plot() {
+    fn readout_bounds_should_not_exceed_narrow_price_plot() {
         let plot = Bounds::new(point(px(10.0), px(20.0)), size(px(6.0), px(10.0)));
-        let label = hover_label_bounds(plot, px(HOVER_LABEL_INSET));
-
-        assert_eq!((label.size.width, label.size.height), (px(0.0), px(2.0)));
-    }
-
-    /// Without a legend the OHLC label keeps the plot's original top inset.
-    #[test]
-    fn hover_label_top_should_keep_the_original_inset_without_a_legend() {
-        assert_eq!(hover_label_top(false), px(HOVER_LABEL_INSET));
-    }
-
-    /// With a legend the OHLC label starts one legend row (plus the gap) lower.
-    #[test]
-    fn hover_label_top_should_move_below_the_legend_row_when_it_is_drawn() {
-        assert_eq!(
-            hover_label_top(true),
-            px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT + HOVER_LABEL_LEGEND_GAP)
-        );
-        assert!(hover_label_top(true) > hover_label_top(false));
-    }
-
-    /// The legend keeps the plot's top-left corner, and the hover label starts
-    /// below the legend row instead of being painted over it.
-    #[test]
-    fn hover_label_should_start_below_the_legend_row() {
-        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
-        let without_legend = hover_label_bounds(plot, hover_label_top(false));
-        let with_legend = hover_label_bounds(plot, hover_label_top(true));
+        let readout = readout_bounds(plot);
 
         assert_eq!(
-            without_legend.origin.y,
-            plot.origin.y + px(HOVER_LABEL_INSET),
-            "without a legend the label keeps the original top inset"
+            (readout.size.width, readout.size.height),
+            (px(0.0), px(2.0))
+        );
+    }
+
+    /// The readout's box is the price plot's first text row: it starts one row
+    /// inset from the plot's top and is exactly one text row tall.
+    ///
+    /// Asserted through the box the painter would use, against a plot of a known
+    /// size, so a change of row, of height or of inset all move it.
+    #[test]
+    fn the_readout_should_take_the_first_text_row() {
+        let plot = Bounds::new(point(px(0.0), px(120.0)), size(px(320.0), px(240.0)));
+        let readout = readout_bounds(plot);
+
+        assert_eq!(
+            readout.origin.y,
+            plot.origin.y + px(FIRST_TEXT_ROW_TOP),
+            "the readout starts at the plot's first text row"
+        );
+        assert_eq!(
+            readout.size.height,
+            px(TEXT_ROW_HEIGHT),
+            "a tall plot shows one whole readout row"
+        );
+    }
+
+    /// The readout's box shrinks when the plot cannot hold a row, so a degenerate
+    /// plot draws no text at all rather than into its neighbour.
+    #[test]
+    fn the_readout_should_have_no_room_in_a_plot_shorter_than_one_row() {
+        let plot = |height: f32| Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(height)));
+
+        assert_eq!(
+            readout_bounds(plot(TEXT_ROW_INSET)).size.height,
+            px(0.0),
+            "a plot exactly one inset tall has no row to give"
+        );
+        assert_eq!(
+            readout_bounds(plot(10.0)).size.height,
+            px(2.0),
+            "a plot 10px tall gives what is left after the inset, clipped to one row"
+        );
+        assert_eq!(
+            readout_bounds(plot(240.0)).size.height,
+            px(TEXT_ROW_HEIGHT),
+            "a plot with room gives exactly one whole row"
+        );
+    }
+
+    /// Both text rows fit a price plot of exactly [`MIN_PLOT_HEIGHT`].
+    ///
+    /// That constant is the height the layout *reserves* for the price plot when
+    /// the content height allows it (`min(MIN_PLOT_HEIGHT, content_height)`);
+    /// a pane shorter than a full pane yields a proportionally shorter price
+    /// plot, so this is not "the smallest price plot the layout can make". It is
+    /// the size the layout is designed around, and both rows fit it — which is
+    /// why the legend needs no height guard. Below roughly 34px the legend row is
+    /// cropped from below by the same content mask that clips every row, which
+    /// is cosmetic and draws nothing outside the plot.
+    #[test]
+    fn the_two_text_rows_should_fit_a_price_plot_at_the_reserved_height() {
+        let floor = crate::chart::geometry::MIN_PLOT_HEIGHT;
+        let plot = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(floor)));
+
+        let readout = readout_bounds(plot);
+        let legend_top = plot.origin.y + px(MAIN_LEGEND_TOP);
+
+        assert_eq!(
+            readout.size.height,
+            px(TEXT_ROW_HEIGHT),
+            "the readout is whole at the floor"
         );
         assert!(
-            with_legend.origin.y >= plot.origin.y + px(HOVER_LABEL_INSET + HOVER_LABEL_LINE_HEIGHT),
-            "the OHLC label must not start inside the legend's line"
+            legend_top >= readout.bottom(),
+            "the legend row starts at or below the readout's bottom at the floor"
         );
         assert!(
-            with_legend.origin.y > without_legend.origin.y,
-            "the label moves down only while the legend is drawn"
+            legend_top + px(TEXT_ROW_HEIGHT) <= plot.bottom(),
+            "both rows fit the price plot the layout reserves: \
+             {legend_top:?} + one row vs {:?}",
+            plot.bottom()
         );
-        assert_eq!(with_legend.size.height, px(HOVER_LABEL_LINE_HEIGHT));
     }
 
     #[test]
@@ -3310,6 +3523,315 @@ mod tests {
         series.snapshot()
     }
 
+    /// The same, with candles `step_seconds` apart, on a realistic epoch base.
+    ///
+    /// Timestamps are milliseconds, which is what a candle carries and what the time
+    /// formatter reads. One minute apart is what a minute chart actually is, and it
+    /// is what a test needs when it compares the crosshair's time tag: the tag's
+    /// resolution follows the interval, so second-spaced candles would all print the
+    /// same minute.
+    ///
+    /// The open price moves with the index, so two candles do not print the same
+    /// OHLCV line: a test that asserts *which* candle was described needs the text to
+    /// tell them apart.
+    fn snapshot_with_spacing(count: usize, step_seconds: i64) -> CandlestickSeriesSnapshot {
+        const BASE_MILLIS: i64 = 1_700_000_000_000;
+        let mut series = crate::model::CandlestickSeries::new(
+            count,
+            ListingPrecision {
+                price_tick: Tick::from_str("0.01").expect("price tick should parse"),
+                quantity_tick: Tick::from_str("0.001").expect("quantity step should parse"),
+            },
+        );
+        series.merge_initial((0..count).map(|index| {
+            let open = 100 + index as u64;
+            // Close differs from open by a position-dependent amount, so the
+            // readout's open-to-close change is a real number that also names the
+            // candle, not a constant `0.00`.
+            let close = open + 1 + index as u64 % 7;
+            candle_with_prices(
+                BASE_MILLIS + index as i64 * step_seconds * 1_000,
+                open,
+                close + 10,
+                open - 10,
+                close,
+            )
+        }));
+        series.snapshot()
+    }
+
+    /// The width of the harness chart, in pixels.
+    ///
+    /// Pins the canvas width so harness frames do not depend on the test
+    /// window's size (which is maximized and varies with the platform). What a
+    /// frame shows is set by `viewport.right_timestamp`, not by this.
+    const HARNESS_WIDTH: f32 = 640.0;
+
+    /// One real chart canvas in a window of its own.
+    ///
+    /// The element is mounted the way the pane mounts it — the view's caches, the
+    /// layout cell and the readout cache all live outside the element — so a
+    /// frame drawn here runs the production prepaint and paint passes.
+    struct ChartHarness {
+        snapshot: CandlestickSeriesSnapshot,
+        viewport: ChartViewport,
+        config: CandlestickIndicatorConfig,
+        layout_cell: Rc<RefCell<Option<Rc<ChartLayout>>>>,
+        readout_cache: Rc<RefCell<ReadoutCache>>,
+        caches: Rc<ChartPaintCaches>,
+    }
+
+    impl Render for ChartHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(HARNESS_WIDTH)).h_full().child(chart_canvas(
+                self.snapshot.clone(),
+                ChartCanvasOptions {
+                    viewport: self.viewport,
+                    interval: TimeFrame::Minute1,
+                    countdown_label: SharedString::new_static("00:30"),
+                    indicator_config: self.config.clone(),
+                    panel_open: false,
+                },
+                self.layout_cell.clone(),
+                self.readout_cache.clone(),
+                self.caches.clone(),
+                |_: &mut App| {},
+            ))
+        }
+    }
+
+    /// What one painted frame reported: the boxes it resolved and what it drew.
+    struct PaintedFrame {
+        layout: Rc<ChartLayout>,
+        log: PaintLog,
+    }
+
+    impl PaintedFrame {
+        /// Every row of one kind, in draw order.
+        fn rows_of(&self, kind: TextRow) -> Vec<&PaintedRow> {
+            self.log
+                .rows
+                .iter()
+                .filter(|row| row.kind == kind)
+                .collect()
+        }
+
+        /// The rows drawn inside `plot`, in draw order.
+        fn rows_in(&self, plot: Bounds<Pixels>) -> Vec<&PaintedRow> {
+            self.log
+                .rows
+                .iter()
+                .filter(|row| row.plot == plot)
+                .collect()
+        }
+
+        /// The insets of every row drawn inside `plot`.
+        fn insets_in(&self, plot: Bounds<Pixels>) -> Vec<Pixels> {
+            let mut insets: Vec<Pixels> = self
+                .rows_in(plot)
+                .into_iter()
+                .map(PaintedRow::inset)
+                .collect();
+            insets.sort_by(|left, right| left.as_f32().total_cmp(&right.as_f32()));
+            insets
+        }
+
+        /// The one readout the frame drew.
+        fn readout(&self) -> &PaintedRow {
+            let readouts = self.rows_of(TextRow::Readout);
+            assert_eq!(readouts.len(), 1, "a frame paints exactly one readout");
+            readouts[0]
+        }
+    }
+
+    /// A visible chart over `range` of `snapshot`, with the geometry `layout`
+    /// implies for a `range`-wide viewport.
+    ///
+    /// Only the fields the index rule reads are set: the prepared candle boxes and
+    /// axes belong to painting, and the paint-level tests run those on the real
+    /// preparation. `range` is checked against the snapshot so a fixture cannot
+    /// silently point past the candles it describes.
+    fn visible_over(
+        snapshot: &CandlestickSeriesSnapshot,
+        range: Range<usize>,
+        layout: &ChartLayout,
+    ) -> PreparedVisibleChart {
+        assert!(
+            range.start < range.end && range.end <= snapshot.candles().len(),
+            "the fixture range {range:?} must lie inside the snapshot's {} candles",
+            snapshot.candles().len()
+        );
+        PreparedVisibleChart {
+            geometry: CandleGeometry::new(layout.price_plot, range.len(), 9.0),
+            range,
+            lowest: 0.0,
+            highest: 100.0,
+            candles: Arc::from(Vec::new()),
+            price_ticks: Arc::from(Vec::new()),
+            time_ticks: Arc::from(Vec::new()),
+            latest_price: None,
+            sub_plots: Arc::from(Vec::new()),
+        }
+    }
+
+    /// A viewport showing up to `timestamp`, which must not be the newest candle.
+    fn panned_to(timestamp: i64) -> ChartViewport {
+        ChartViewport {
+            right_timestamp: Some(timestamp),
+            ..ChartViewport::default()
+        }
+    }
+
+    /// A mounted chart that can be redrawn with a different viewport.
+    ///
+    /// A session keeps one mounted chart for a whole test so the frames it reads are
+    /// a sequence on the same element and share one layout cell; each [`draw`] is a
+    /// complete frame, which is also what makes the thread-local paint log readable
+    /// as "what this one call drew".
+    ///
+    /// [`draw`]: PaintSession::draw
+    struct PaintSession<'a> {
+        harness: Entity<ChartHarness>,
+        window: &'a mut VisualTestContext,
+        layout_cell: Rc<RefCell<Option<Rc<ChartLayout>>>>,
+    }
+
+    impl PaintSession<'_> {
+        /// Draws one frame with `viewport` and returns what it painted.
+        ///
+        /// The canvas resolves its layout in prepaint, so the first frame only
+        /// exists to give it boxes; this draws that frame once when the session is
+        /// built, after which every call here is a complete read.
+        fn draw(&mut self, viewport: ChartViewport) -> PaintedFrame {
+            self.harness.update(&mut **self.window, |harness, cx| {
+                harness.viewport = viewport;
+                cx.notify();
+            });
+            self.window.update(|window, _| {
+                PAINT_LOG.with(|log| *log.borrow_mut() = PaintLog::default());
+                window.refresh();
+            });
+            self.window.run_until_parked();
+            PaintedFrame {
+                layout: self
+                    .layout_cell
+                    .borrow()
+                    .clone()
+                    .expect("the frame resolved the chart's boxes"),
+                log: PAINT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
+            }
+        }
+    }
+
+    /// Mounts one chart in a window and lets a test draw frames on it.
+    fn paint_session(
+        cx: &mut TestAppContext,
+        snapshot: CandlestickSeriesSnapshot,
+        config: CandlestickIndicatorConfig,
+    ) -> PaintSession<'_> {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let layout_cell: Rc<RefCell<Option<Rc<ChartLayout>>>> = Rc::new(RefCell::new(None));
+        let harness = ChartHarness {
+            snapshot,
+            viewport: ChartViewport::default(),
+            config,
+            layout_cell: layout_cell.clone(),
+            readout_cache: Rc::new(RefCell::new(ReadoutCache::default())),
+            caches: Rc::new(ChartPaintCaches::default()),
+        };
+        let (harness, window) = cx.add_window_view(|_, _| harness);
+        // A constructed session starts with an empty log, so no entry a previous
+        // test left on this thread can be mistaken for this one's.
+        PAINT_LOG.with(|log| *log.borrow_mut() = PaintLog::default());
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
+
+        PaintSession {
+            harness,
+            window,
+            layout_cell,
+        }
+    }
+
+    /// One frame of a freshly mounted chart: the common case for a single-frame
+    /// test.
+    fn painted_frame(
+        cx: &mut TestAppContext,
+        snapshot: CandlestickSeriesSnapshot,
+        viewport: ChartViewport,
+        config: CandlestickIndicatorConfig,
+    ) -> PaintedFrame {
+        paint_session(cx, snapshot, config).draw(viewport)
+    }
+
+    /// A canvas whose whole paint pass is one `paint_legend` call.
+    ///
+    /// `paint_legend` may only run inside a paint pass (`with_content_mask`
+    /// asserts that), so a test that wants to hand it an entry slice it chose
+    /// cannot simply call it from `window.update`.
+    struct LegendProbe {
+        plot: Bounds<Pixels>,
+        entries: Vec<SharedString>,
+        text_cache: Rc<RefCell<ChartTextCache>>,
+    }
+
+    impl Render for LegendProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let plot = self.plot;
+            let entries = self
+                .entries
+                .iter()
+                .map(|text| LegendEntry {
+                    text: SmolStr::new(text.as_str()),
+                    color: gpui_kit::white(),
+                })
+                .collect::<Vec<_>>();
+            let text_cache = self.text_cache.clone();
+            gpui_kit::canvas(
+                move |_, _, _| (),
+                move |_, _, window, context| {
+                    let mut painter = ChartPainter {
+                        text_cache: &text_cache,
+                        window,
+                        context,
+                        price_tick: Tick::from_str("0.01").expect("price tick should parse"),
+                    };
+                    painter.paint_legend(&entries, plot, FIRST_TEXT_ROW_TOP);
+                },
+            )
+            .size_full()
+        }
+    }
+
+    /// Paints one `paint_legend` row and returns what it logged.
+    ///
+    /// The caller owns the context: a `TestAppContext` installs its translator
+    /// once, so a probe that installed its own would break the second call in a
+    /// test.
+    fn paint_legend_probe(
+        cx: &mut TestAppContext,
+        plot: Bounds<Pixels>,
+        entries: Vec<&'static str>,
+    ) -> PaintLog {
+        let probe = LegendProbe {
+            plot,
+            entries: entries
+                .into_iter()
+                .map(SharedString::new_static)
+                .collect::<Vec<_>>(),
+            text_cache: Rc::new(RefCell::new(ChartTextCache::default())),
+        };
+        let (_, window) = cx.add_window_view(|_, _| probe);
+        PAINT_LOG.with(|log| *log.borrow_mut() = PaintLog::default());
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
+        PAINT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
+
     /// Panning moves the prepared chart's key but not the inputs of the value
     /// computation, so the values must be reused. This is the whole reason the
     /// two caches are separate (design §7.3).
@@ -3372,6 +3894,453 @@ mod tests {
             );
             assert!(Arc::ptr_eq(&first.indicators, &second.indicators));
         });
+    }
+
+    /// The readout is painted on a frame that has no pointer at all, on the price
+    /// plot's first row, with the legend below it rather than in its place.
+    ///
+    /// The canvas is mounted in a real window, a frame is drawn with
+    /// `viewport.cursor == None`, and the rows the production paint pass reported
+    /// are read back.
+    #[gpui_kit::test]
+    fn a_frame_without_a_pointer_should_still_paint_the_readout_and_its_legend(
+        cx: &mut TestAppContext,
+    ) {
+        // MA is enabled by default, so the main-chart legend has entries.
+        let frame = painted_frame(
+            cx,
+            snapshot_with_candles(60),
+            ChartViewport::default(),
+            CandlestickIndicatorConfig::default(),
+        );
+        let price_plot = frame.layout.price_plot;
+        let sub_plot = frame.layout.sub_plots[0].plot;
+
+        // Per plot, the exact set of rows drawn there: the price plot shows the
+        // readout and its legend, a sub plot shows only its own legend.
+        assert_eq!(
+            frame.insets_in(price_plot),
+            vec![px(FIRST_TEXT_ROW_TOP), px(MAIN_LEGEND_TOP)],
+            "the price plot shows the readout on row 1 and the legend on row 2: {:?}",
+            frame.log.rows
+        );
+        assert_eq!(
+            frame.insets_in(sub_plot),
+            vec![px(FIRST_TEXT_ROW_TOP)],
+            "a sub plot shows its own legend on its first row and no readout: {:?}",
+            frame.log.rows
+        );
+
+        let readout = frame.readout();
+        assert_eq!(
+            readout.plot, price_plot,
+            "the readout belongs to the price plot"
+        );
+        assert_eq!(
+            readout.top,
+            price_plot.origin.y + px(FIRST_TEXT_ROW_TOP),
+            "the readout is on the price plot's first text row"
+        );
+        assert!(
+            !readout.text.is_empty(),
+            "the readout line carries the OHLCV text it drew"
+        );
+    }
+
+    /// The readout's box is clipped to the price plot, which is what keeps a line
+    /// as wide as the candle data inside a narrow pane.
+    ///
+    /// The mask is read from the window while the line was being painted, so it is
+    /// the clip the glyphs were actually drawn under.
+    #[gpui_kit::test]
+    fn the_readout_should_be_clipped_to_its_row(cx: &mut TestAppContext) {
+        let frame = painted_frame(
+            cx,
+            snapshot_with_candles(60),
+            ChartViewport::default(),
+            CandlestickIndicatorConfig::default(),
+        );
+        let readout = frame.readout();
+        let row = readout_bounds(readout.plot);
+
+        assert_eq!(
+            readout.mask, row,
+            "the readout glyphs are clipped to the row's box inside the price plot"
+        );
+        assert!(
+            readout.mask.right() <= readout.plot.right() && readout.mask.bottom() <= row.bottom(),
+            "the clip never reaches past the price plot or below the row"
+        );
+    }
+
+    /// The readout draws nothing at all in a plot too short for one text row — and
+    /// therefore logs nothing, because it returns before the log is reached.
+    ///
+    /// The layout *reserves* [`crate::chart::geometry::MIN_PLOT_HEIGHT`] for the
+    /// price plot only while the content height allows it
+    /// (`price_height = content_height - sub_total`), so a pane shorter than that
+    /// can produce a shorter plot. This test drives [`paint_readout`] directly
+    /// instead of mounting such a pane, because the harness cannot size a pane
+    /// below the layout's reserved height deterministically; the early return is
+    /// what has to hold, and it is the same path a degenerate pane would take — it
+    /// is what keeps text out of a row that has no height to draw into.
+    #[gpui_kit::test]
+    fn a_plot_too_short_for_a_row_should_not_paint_or_log_the_readout(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let (_, window) = cx.add_window_view(|_, _| CacheHarness);
+        PAINT_LOG.with(|log| *log.borrow_mut() = PaintLog::default());
+
+        window.update(|window, cx| {
+            let line = ChartTextCache::default().line(
+                SharedString::new_static("O 1 H 2 L 3 C 4"),
+                gpui_kit::white(),
+                window,
+            );
+            // One pixel tall: less than the readout's own top inset, so the row has
+            // no height to draw into.
+            let squashed = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(1.0)));
+            paint_readout(&line, squashed, window, cx);
+        });
+
+        assert!(
+            PAINT_LOG.with(|log| log.borrow().rows.is_empty()),
+            "a plot with no room for the row must not log a readout it did not draw"
+        );
+    }
+
+    /// A chart with no indicator line at all has an empty main legend, so its
+    /// price plot shows only the readout's row.
+    #[gpui_kit::test]
+    fn a_chart_without_a_legend_should_show_one_row(cx: &mut TestAppContext) {
+        // Every indicator off: no main-chart line, so `main_indicator_legend` is empty.
+        let mut bare = CandlestickIndicatorConfig::default();
+        for entry in &mut bare.entries {
+            entry.enabled = false;
+        }
+        let mut session = paint_session(cx, snapshot_with_candles(60), bare);
+        let frame = session.draw(ChartViewport::default());
+        let price_plot = frame.layout.price_plot;
+
+        assert_eq!(
+            frame.insets_in(price_plot),
+            vec![px(FIRST_TEXT_ROW_TOP)],
+            "a chart with no legend draws only the readout row on its price plot: {:?}",
+            frame.log.rows
+        );
+        assert!(
+            frame.rows_of(TextRow::Legend).is_empty(),
+            "no legend entry means no legend row is logged: {:?}",
+            frame.log.rows
+        );
+    }
+
+    /// `paint_legend` draws nothing and logs nothing for an empty entry slice, and
+    /// logs the row as soon as one entry is painted.
+    ///
+    /// Driven at the painter from inside a real paint pass (a canvas), so the empty
+    /// case is exercised rather than a chart that simply happens not to ask for a
+    /// legend.
+    #[gpui_kit::test]
+    fn paint_legend_should_log_only_what_it_paints(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let plot = Bounds::new(point(px(10.0), px(20.0)), size(px(320.0), px(240.0)));
+
+        let empty = paint_legend_probe(cx, plot, Vec::new());
+        assert!(
+            empty.rows.is_empty(),
+            "an empty legend paints no row, so it must log none: {:?}",
+            empty.rows
+        );
+
+        let one = paint_legend_probe(cx, plot, vec!["MA5 123.45"]);
+        assert_eq!(one.rows.len(), 1, "one entry logs one row: {:?}", one.rows);
+        assert_eq!(one.rows[0].kind, TextRow::Legend);
+        assert_eq!(
+            one.rows[0].text, "MA5 123.45 ",
+            "the logged row carries the entry text that was painted"
+        );
+        assert_eq!(one.rows[0].top, plot.origin.y + px(FIRST_TEXT_ROW_TOP));
+    }
+
+    /// The hovered readout names the candle under the pointer, computed from the
+    /// test's own arithmetic rather than from anything the paint pass reported.
+    ///
+    /// This is what [`PaintLog::described`] cannot prove on its own: production
+    /// writes that field from the same variable it shapes the readout with, so a
+    /// test that trusts it only proves "text matches log". Here the expected index
+    /// is derived from the frame's reported `range`, a slot offset, the plot's
+    /// right edge and the candle width — deliberately not from `described`,
+    /// `readout_candle_index` or `CandleGeometry` — so shifting the described
+    /// index in `paint_chart` fails.
+    #[gpui_kit::test]
+    fn the_hovered_readout_should_name_the_candle_under_the_pointer(cx: &mut TestAppContext) {
+        let snapshot = snapshot_with_spacing(200, 60);
+        let panned = panned_to(snapshot.candles()[149].timestamp);
+        let mut session =
+            paint_session(cx, snapshot.clone(), CandlestickIndicatorConfig::default());
+
+        let away = session.draw(panned);
+        let range = away
+            .log
+            .range
+            .clone()
+            .expect("the paint pass reported its visible range");
+        assert!(
+            range.end < snapshot.candles().len(),
+            "the fixture must pan away from the live edge: {range:?} of {}",
+            snapshot.candles().len()
+        );
+        let away_described = away.log.described.expect("the frame described a candle");
+        assert_eq!(
+            away_described,
+            range.end - 1,
+            "with no pointer the readout describes the newest visible candle"
+        );
+
+        let price_plot = away.layout.price_plot;
+        // Slot 2 of the visible range, placed from the range and the candle width
+        // alone — no geometry object and no log field is consulted.
+        let slot = 2;
+        let expected = range.start + slot;
+        let first_x = price_plot.right() - px(range.len() as f32 * panned.candle_width);
+        let x = first_x + px((slot as f32 + 0.5) * panned.candle_width);
+        let y = price_plot.origin.y + px(40.0);
+
+        let hovered = session.draw(ChartViewport {
+            cursor: Some(point(x, y)),
+            ..panned
+        });
+        assert_eq!(
+            hovered.log.range, away.log.range,
+            "both frames laid out the same visible range"
+        );
+        assert_eq!(
+            hovered.log.described,
+            Some(expected),
+            "the pointer at slot {slot} describes candle {expected}"
+        );
+        assert_ne!(
+            Some(expected),
+            Some(away_described),
+            "the fixture must put a different candle under the pointer than at the \
+             newest visible slot"
+        );
+
+        let candles = snapshot.candles();
+        let tick = snapshot.price_tick();
+        let readout = hovered.readout();
+        let open = CandlePrices::of(&candles[expected])
+            .open()
+            .format_and_round_tick(tick);
+        assert!(
+            readout.text.contains(open.as_str()),
+            "the drawn line shows candle {expected}'s open {open:?}: {:?}",
+            readout.text
+        );
+
+        // The change is the candle's own open-to-close move and takes no
+        // `previous`; the amplitude compares the candle's range against the
+        // previous candle's close, so a readout shaped with `previous = None`
+        // drops the amplitude span and leaves the change span untouched. Both
+        // are computed here from the independently derived `expected` candle.
+        let change = crate::chart::text::format_price_change(&candles[expected], tick);
+        let amplitude =
+            crate::chart::text::format_amplitude(&candles[expected], Some(&candles[expected - 1]))
+                .expect("one-minute candles have a previous close to measure against");
+        assert_ne!(
+            change.as_str(),
+            "0.00",
+            "the fixture must give this candle a non-zero open-to-close move, or the \
+             change assertion below cannot distinguish a real change from a default"
+        );
+        assert!(
+            readout.text.contains(change.as_str()),
+            "the drawn line shows the change {change:?} from the candle's own open: {:?}",
+            readout.text
+        );
+        assert!(
+            readout.text.contains(amplitude.as_str()),
+            "the drawn line shows the amplitude {amplitude:?} against candle {}'s \
+             close: {:?}",
+            expected - 1,
+            readout.text
+        );
+
+        // The bottom time tag follows the same candle.
+        let time = crate::time::format_crosshair_time(
+            candles[expected].timestamp,
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+        );
+        assert_eq!(
+            hovered.log.time_tag.as_deref(),
+            Some(time.as_str()),
+            "the time tag names candle {expected}"
+        );
+
+        // The same x, but inside a sub plot: the crosshair and the readout must
+        // name the same candle there. A sub-plot hover that fell back to the
+        // range start would fail here.
+        let sub_plot = away.layout.sub_plots[0].plot;
+        let sub_hovered = session.draw(ChartViewport {
+            cursor: Some(point(x, sub_plot.center().y)),
+            ..panned
+        });
+        assert!(
+            !sub_hovered.log.crosshairs.is_empty(),
+            "a pointer over a sub plot draws the crosshair"
+        );
+        assert_eq!(
+            sub_hovered.log.described,
+            Some(expected),
+            "a pointer over a sub plot at the same slot describes candle {expected}"
+        );
+        assert!(
+            sub_hovered.readout().text.contains(open.as_str()),
+            "the sub-plot hover draws the same candle's readout: {:?}",
+            sub_hovered.readout().text
+        );
+    }
+
+    /// The readout describes the newest *visible* candle when the pointer is away,
+    /// on a chart panned back so that is not the snapshot's last candle.
+    #[gpui_kit::test]
+    fn the_readout_should_describe_the_newest_visible_candle(cx: &mut TestAppContext) {
+        let snapshot = snapshot_with_spacing(200, 60);
+        let panned = panned_to(snapshot.candles()[149].timestamp);
+        let mut session =
+            paint_session(cx, snapshot.clone(), CandlestickIndicatorConfig::default());
+        let away = session.draw(panned);
+
+        let range = away.log.range.clone().expect("a range was reported");
+        assert!(
+            range.end < snapshot.candles().len(),
+            "the fixture must pan away from the live edge: {range:?} of {}",
+            snapshot.candles().len()
+        );
+        let expected = range.end - 1;
+        assert_eq!(away.log.described, Some(expected));
+
+        let open = CandlePrices::of(&snapshot.candles()[expected])
+            .open()
+            .format_and_round_tick(snapshot.price_tick());
+        assert!(
+            away.readout().text.contains(open.as_str()),
+            "the drawn line shows candle {expected}'s open {open:?}: {:?}",
+            away.readout().text
+        );
+        let snapshot_last_open =
+            CandlePrices::of(&snapshot.candles()[snapshot.candles().len() - 1])
+                .open()
+                .format_and_round_tick(snapshot.price_tick());
+        assert!(
+            !away.readout().text.contains(snapshot_last_open.as_str()),
+            "the readout must not describe the snapshot's last candle: {:?}",
+            away.readout().text
+        );
+    }
+
+    /// The bottom time tag names the candle under the pointer, not the readout's
+    /// fallback: both sides use the same slot, and a frame where those are different
+    /// candles proves it.
+    #[gpui_kit::test]
+    fn the_time_tag_should_name_the_candle_under_the_pointer(cx: &mut TestAppContext) {
+        let snapshot = snapshot_with_spacing(200, 60);
+        let panned = panned_to(snapshot.candles()[149].timestamp);
+        let mut session =
+            paint_session(cx, snapshot.clone(), CandlestickIndicatorConfig::default());
+
+        let away = session.draw(panned);
+        assert_eq!(
+            away.log.time_tag, None,
+            "a frame with no pointer draws no time tag"
+        );
+        let price_plot = away.layout.price_plot;
+        let fallback = away
+            .log
+            .described
+            .expect("the away frame described a candle");
+        // A slot two in from the left edge of the viewport: the fallback is the
+        // rightmost slot, so a left slot is a different candle.
+        let cursor = point(
+            price_plot.origin.x + px(6.0) + px(9.0) * 2.0,
+            price_plot.center().y,
+        );
+        let hovered = session.draw(ChartViewport {
+            cursor: Some(cursor),
+            ..panned
+        });
+
+        let described = hovered.log.described.expect("a candle was described");
+        let expected = crate::time::format_crosshair_time(
+            snapshot.candles()[described].timestamp,
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+        );
+        assert_eq!(
+            hovered.log.time_tag.as_deref(),
+            Some(expected.as_str()),
+            "the bottom tag shows the described candle's time"
+        );
+        let fallback_time = crate::time::format_crosshair_time(
+            snapshot.candles()[fallback].timestamp,
+            TimeFrame::Minute1,
+            UtcOffset::UTC,
+        );
+        assert_ne!(
+            expected, fallback_time,
+            "the fixture must make the hovered candle's time differ from the fallback's"
+        );
+    }
+
+    /// The crosshair stays hover-only while the readout keeps its row, and an axis
+    /// is not data: a pointer over the price axis draws no crosshair.
+    #[gpui_kit::test]
+    fn a_pointer_over_an_axis_should_draw_no_crosshair(cx: &mut TestAppContext) {
+        let mut session = paint_session(
+            cx,
+            snapshot_with_candles(60),
+            CandlestickIndicatorConfig::default(),
+        );
+        let away = session.draw(ChartViewport::default());
+        let axis_cursor = away.layout.price_axis.center();
+        let plot_cursor = away.layout.price_plot.center();
+
+        let over_axis = session.draw(ChartViewport {
+            cursor: Some(axis_cursor),
+            ..ChartViewport::default()
+        });
+        let over_plot = session.draw(ChartViewport {
+            cursor: Some(plot_cursor),
+            ..ChartViewport::default()
+        });
+
+        assert_eq!(
+            away.insets_in(away.layout.price_plot),
+            vec![px(FIRST_TEXT_ROW_TOP), px(MAIN_LEGEND_TOP)],
+            "the price plot shows exactly its two rows and nothing else: {:?}",
+            away.log.rows
+        );
+        assert!(
+            away.log.crosshairs.is_empty(),
+            "a frame with no pointer draws no crosshair"
+        );
+        assert!(
+            over_axis.log.crosshairs.is_empty(),
+            "a pointer over the price axis names no candle, so no crosshair is drawn"
+        );
+        assert!(
+            !over_plot.log.crosshairs.is_empty(),
+            "a pointer over the price plot does draw the crosshair"
+        );
     }
 
     /// The sub-plot count and order come from the configuration, not from the
@@ -3468,10 +4437,10 @@ mod tests {
         });
     }
 
-    /// The legend's value is read at the absolute index the crosshair is on,
+    /// The readout's value is read at the absolute index the crosshair is on,
     /// and only past that line's own `readable_from`.
     #[test]
-    fn the_main_legend_should_read_the_candle_under_the_cursor() {
+    fn the_readout_should_describe_the_candle_under_the_cursor() {
         let layout = ChartLayout::new(
             Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
             LayoutInputs {
@@ -3494,14 +4463,9 @@ mod tests {
         let cursor = point(geometry.center_x(3), layout.price_plot.origin.y + px(5.0));
 
         assert_eq!(
-            legend_candle_index(Some(cursor), &layout, &visible),
-            Some(13),
+            readout_candle_index(Some(cursor), &layout, &visible),
+            13,
             "slot 3 of a range starting at 10 is candle 13"
-        );
-        assert_eq!(
-            legend_candle_index(None, &layout, &visible),
-            Some(19),
-            "without a cursor the legend reads the newest visible candle"
         );
 
         let price = Price::from_str("123.45").expect("price should parse");
@@ -3520,8 +4484,7 @@ mod tests {
             }],
             guides: Vec::new(),
         }];
-        let absolute = legend_candle_index(Some(cursor), &layout, &visible)
-            .expect("the cursor is over the plot");
+        let absolute = readout_candle_index(Some(cursor), &layout, &visible);
 
         assert!(
             main_indicator_legend(&series, absolute, tick).is_empty(),
@@ -3531,6 +4494,80 @@ mod tests {
         let entries = main_indicator_legend(&series, absolute, tick);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "MA5 123.45");
+    }
+
+    /// The readout is drawn whether or not the pointer is over the chart, so its
+    /// index has to be defined when there is no cursor at all: it is the newest
+    /// visible candle — the rightmost one of the current viewport, not the newest
+    /// candle in the snapshot and not the first visible one.
+    ///
+    /// The ranges are hand-chosen and the expected indices are written out, so this
+    /// states the rule rather than restating the expression that implements it. The
+    /// snapshot is real and `range.end` is short of `candles.len()`, which is what
+    /// makes "newest visible" distinguishable from "newest in the snapshot"; the
+    /// production `&candles[absolute]` is exercised by the paint-level tests.
+    #[test]
+    fn the_readout_should_describe_the_newest_visible_candle_without_a_cursor() {
+        let snapshot = snapshot_with_candles(200);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(0.0),
+                sub_plot_count: 1,
+            },
+        );
+        let visible = visible_over(&snapshot, 10..20, &layout);
+        assert!(visible.range.end < snapshot.candles().len());
+
+        assert_eq!(
+            readout_candle_index(None, &layout, &visible),
+            19,
+            "a viewport of 10..20 ends at candle 19: the snapshot's last is not read"
+        );
+
+        // Another range with a different start and length, so the answer tracks the
+        // viewport rather than a position within a ten-wide window.
+        let moved = visible_over(&snapshot, 150..175, &layout);
+        assert_eq!(
+            readout_candle_index(None, &layout, &moved),
+            174,
+            "a viewport of 150..175 ends at candle 174"
+        );
+
+        // A pointer that is over the axes rather than over data is away from the
+        // chart too: it names no candle, so the fallback stands.
+        let over_the_axis = layout.price_axis.center();
+        assert_eq!(
+            readout_candle_index(Some(over_the_axis), &layout, &visible),
+            19,
+            "a pointer over the axis falls back to the newest visible candle"
+        );
+    }
+
+    /// The fallback follows the viewport: after a pan the newest visible candle is
+    /// another one, and the readout must read that candle rather than the one the
+    /// chart happened to be showing before.
+    #[test]
+    fn the_readout_fallback_should_follow_the_viewport_after_a_pan() {
+        let snapshot = snapshot_with_candles(200);
+        let layout = ChartLayout::new(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0))),
+            LayoutInputs {
+                longest_label_width: px(0.0),
+                sub_plot_count: 0,
+            },
+        );
+
+        assert_eq!(
+            readout_candle_index(None, &layout, &visible_over(&snapshot, 4..14, &layout)),
+            13,
+            "the newest visible candle of a viewport of 4..14 is candle 13"
+        );
+        assert_eq!(
+            readout_candle_index(None, &layout, &visible_over(&snapshot, 60..90, &layout)),
+            89,
+            "the same rule on a viewport of 60..90 is candle 89, not 13"
+        );
     }
 
     /// A chart with every sub-plot indicator switched off has no sub-plot boxes
