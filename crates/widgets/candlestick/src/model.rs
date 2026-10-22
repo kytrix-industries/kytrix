@@ -7,10 +7,22 @@
 //! capacity and decides what each merge is allowed to evict:
 //!
 //! - history arriving forwards and live updates evict the **oldest** candle,
-//! - a page fetched by panning left evicts the **newest** one.
+//! - a page fetched by panning left evicts whatever the caller allows: with
+//!   [`NewestCandle::Evicted`] the **newest** one, and only while the buffer is
+//!   full, which is the one case that evicts anything at all; with
+//!   [`NewestCandle::Kept`] nothing, because a page that will not fit is trimmed
+//!   instead.
+//!
+//! Which of the two an older page gets is not this module's decision: whether the
+//! newest candle is on screen is a property of the viewport the chart is drawn
+//! with, and the series cannot see it. So the caller states the intent with every
+//! page it asks for, which is why [`CandlestickSeries::merge_older`] takes one.
 //!
 //! That asymmetry is what keeps a historical window stable: the user is looking
-//! at a fixed range, and a live tick must not push it out from under them.
+//! at a fixed range, and a live tick must not push it out from under them. It is
+//! also why a page merged with the newest candle kept leaves the chart exactly
+//! where it was: nothing is evicted, so nothing is moved, and
+//! [`CandlestickSeries::at_live_edge`] stays true.
 //!
 //! [`CandlestickSeries::snapshot`] hands the chart an immutable
 //! [`CandlestickSeriesSnapshot`]. The candle data is shared rather than copied,
@@ -135,6 +147,41 @@ impl CandlestickSeriesSnapshot {
     }
 }
 
+/// What an older page may do to the newest candle the series holds.
+///
+/// The question belongs to the viewport rather than to the series: whether the
+/// newest candle is on screen is something only the chart that is drawn can
+/// answer, and the series has no way to see it. So the caller states its intent
+/// with the request, and the series applies it when the page lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NewestCandle {
+    /// The chart follows the newest candle, so it is on screen and stays.
+    ///
+    /// A page that does not fit is trimmed to the room left, keeping the candles
+    /// nearest the buffer: they are the ones that join it without a gap.
+    Kept,
+    /// The chart is anchored to a window further back, so the newest candle is
+    /// off screen to the right. Evicting it is what lets the series move back in
+    /// time, and it is also what takes the series off the live edge.
+    Evicted,
+}
+
+/// What merging one older page did to the series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OlderMerge {
+    /// The page added candles before the earliest one held, so the window moved
+    /// back in time.
+    Advanced,
+    /// The page was not empty and none of it fitted, because the buffer was
+    /// full. The buffer is what refused it, so this is not an answer about the
+    /// venue's history.
+    TrimmedByCapacity,
+    /// The page changed nothing: it was empty, or every candle it carried is one
+    /// the series already held. For a fetched, non-empty page this is the venue
+    /// saying there is nothing older.
+    MadeNoProgress,
+}
+
 /// The mutable candle map behind one chart.
 pub(super) struct CandlestickSeries {
     entries: BTreeMap<i64, ListingCandlestick>,
@@ -169,13 +216,21 @@ impl CandlestickSeries {
         self.at_live_edge = true;
     }
 
-    /// Merges a page fetched by panning left.
+    /// Merges a page fetched by panning left, as the caller's intent allows.
     ///
-    /// Evicting the newest candle is what takes the chart off the live edge: the
-    /// user asked to look at the past, so the window must stop following it.
-    pub(super) fn merge_older(&mut self, candles: impl IntoIterator<Item = ListingCandlestick>) {
-        if self.insert_keeping_oldest(candles) {
-            self.at_live_edge = false;
+    /// `newest` says whether the candle at the live edge is on screen. With
+    /// [`NewestCandle::Evicted`] evicting it is what takes the series off the live
+    /// edge: the user asked to look at the past, so the window must stop following
+    /// it. With [`NewestCandle::Kept`] it is on screen and stays, so the page is
+    /// trimmed to the room left instead.
+    pub(super) fn merge_older(
+        &mut self,
+        candles: impl IntoIterator<Item = ListingCandlestick>,
+        newest: NewestCandle,
+    ) -> OlderMerge {
+        match newest {
+            NewestCandle::Kept => self.insert_trimming_to_room(candles),
+            NewestCandle::Evicted => self.insert_keeping_oldest(candles),
         }
     }
 
@@ -290,11 +345,50 @@ impl CandlestickSeries {
         }
     }
 
+    /// Inserts an older page without ever evicting, and says what it did.
+    ///
+    /// The page is trimmed to the room left, keeping the candles nearest the
+    /// buffer: they are the ones that join it without a gap. Nothing else is
+    /// touched — a series at capacity that receives this page stays exactly where
+    /// it was, at the live edge it was following.
+    fn insert_trimming_to_room(
+        &mut self,
+        candles: impl IntoIterator<Item = ListingCandlestick>,
+    ) -> OlderMerge {
+        let page = candles.into_iter().collect::<Vec<_>>();
+        if page.is_empty() {
+            return OlderMerge::MadeNoProgress;
+        }
+        let room = self.maximum_len.saturating_sub(self.entries.len());
+        if room == 0 {
+            // Nothing fits and nothing may be evicted, so the page is dropped
+            // whole. The capacity is what refused it, not the venue.
+            return OlderMerge::TrimmedByCapacity;
+        }
+        let mut inserted = false;
+        for candle in bounded_history(page, room) {
+            if self.replace_existing(&candle) {
+                continue;
+            }
+            self.entries.insert(candle.timestamp, candle);
+            self.snapshot_dirty = true;
+            inserted = true;
+        }
+        if inserted {
+            OlderMerge::Advanced
+        } else {
+            OlderMerge::MadeNoProgress
+        }
+    }
+
+    /// Inserts an older page by evicting the newest candle when the buffer is
+    /// full, and reports what the page did.
     fn insert_keeping_oldest(
         &mut self,
         candles: impl IntoIterator<Item = ListingCandlestick>,
-    ) -> bool {
+    ) -> OlderMerge {
         let mut evicted_newest = false;
+        let mut inserted = false;
         for candle in candles {
             if self.replace_existing(&candle) {
                 continue;
@@ -311,8 +405,19 @@ impl CandlestickSeries {
             }
             self.entries.insert(candle.timestamp, candle);
             self.snapshot_dirty = true;
+            inserted = true;
         }
-        evicted_newest
+        if evicted_newest {
+            // Evicting the newest candle is what takes the series off the live
+            // edge, not the page: a page that fitted below capacity moved the
+            // window back without losing the candle the chart was following.
+            self.at_live_edge = false;
+        }
+        if inserted {
+            OlderMerge::Advanced
+        } else {
+            OlderMerge::MadeNoProgress
+        }
     }
 
     fn replace_existing(&mut self, candle: &ListingCandlestick) -> bool {
@@ -325,6 +430,43 @@ impl CandlestickSeries {
         }
         true
     }
+}
+
+/// Keeps the newest `limit` rows of a page, deduplicated by timestamp.
+///
+/// `limit` must be positive. Both callers take it from a capacity that is clamped
+/// where that capacity enters the module — [`CandlestickSeries::new`] and
+/// `CandlestickService::new` — so a zero here would be a caller bug rather than a
+/// buffer that cannot hold anything, and silently keeping one candle would hide it.
+///
+/// Two callers need the same rule and they must not drift apart: a fetched page
+/// is bounded by the buffer it is going into, and an older page merged with the
+/// newest candle kept is trimmed to the room left. Both keep the candles nearest
+/// the buffer, both let the last value of a repeated timestamp win, and both
+/// answer in ascending timestamp order.
+pub(super) fn bounded_history(
+    history: Vec<ListingCandlestick>,
+    limit: usize,
+) -> Vec<ListingCandlestick> {
+    debug_assert!(limit > 0, "a page keeps at least one candle");
+    let mut bounded = BTreeMap::new();
+    for candle in history {
+        if let Some(current) = bounded.get_mut(&candle.timestamp) {
+            *current = candle;
+            continue;
+        }
+        if bounded.len() == limit {
+            if bounded
+                .first_key_value()
+                .is_some_and(|(&earliest, _)| candle.timestamp < earliest)
+            {
+                continue;
+            }
+            bounded.pop_first();
+        }
+        bounded.insert(candle.timestamp, candle);
+    }
+    bounded.into_values().collect()
 }
 
 #[cfg(test)]
@@ -413,16 +555,19 @@ mod tests {
         let mut series = series(3);
         series.merge_initial([candle(3, 30), candle(4, 40), candle(5, 50)]);
 
-        series.merge_older([candle(1, 10), candle(2, 20)]);
+        let merged = series.merge_older([candle(1, 10), candle(2, 20)], NewestCandle::Evicted);
 
-        assert_eq!(series.snapshot().latest_timestamp(), Some(3));
+        assert_eq!(
+            (merged, series.snapshot().latest_timestamp()),
+            (OlderMerge::Advanced, Some(3))
+        );
     }
 
     #[test]
     fn merge_newer_should_evict_oldest_values_over_the_limit() {
         let mut series = series(3);
         series.merge_initial([candle(1, 10), candle(2, 20), candle(3, 30)]);
-        series.merge_older([candle(0, 5)]);
+        series.merge_older([candle(0, 5)], NewestCandle::Evicted);
 
         series.merge_newer([candle(4, 40), candle(5, 50)]);
 
@@ -443,7 +588,10 @@ mod tests {
         let mut series = series(3);
         series.merge_initial([candle(100, 10)]);
 
-        series.merge_older((1..100).rev().map(|timestamp| candle(timestamp, 10)));
+        series.merge_older(
+            (1..100).rev().map(|timestamp| candle(timestamp, 10)),
+            NewestCandle::Evicted,
+        );
 
         assert_eq!(timestamps(&mut series), vec![1, 2, 3]);
     }
@@ -481,7 +629,7 @@ mod tests {
     fn live_updates_should_not_break_a_historical_window() {
         let mut series = series(2);
         series.merge_initial([candle(2, 20), candle(3, 30)]);
-        series.merge_older([candle(1, 10)]);
+        series.merge_older([candle(1, 10)], NewestCandle::Evicted);
 
         let candle = candle(4, 40);
         let changed = series.upsert_live(&candle);
@@ -497,11 +645,160 @@ mod tests {
         let mut series = series(3);
         series.merge_initial([candle(2, 20), candle(3, 30)]);
 
-        series.merge_older([candle(1, 10)]);
+        series.merge_older([candle(1, 10)], NewestCandle::Kept);
         let changed = series.upsert_live(&candle(4, 40));
 
         assert!(changed && series.at_live_edge());
         assert_eq!(series.snapshot().latest_timestamp(), Some(4));
+    }
+
+    /// A page merged with the newest candle kept never evicts: at capacity it
+    /// fits nothing and says so, and the candle the chart is following is still
+    /// there afterwards.
+    ///
+    /// This is the case that made an eviction policy of its own unsound: the
+    /// newest candle is on screen, so losing it would move the chart out from
+    /// under the user — and the series would leave the live edge, after which a
+    /// live tick is refused forever.
+    #[test]
+    fn a_page_merged_with_the_newest_candle_kept_should_never_evict() {
+        let mut series = series(3);
+        series.merge_initial([candle(3, 30), candle(4, 40), candle(5, 50)]);
+        let before = timestamps(&mut series);
+
+        let merged = series.merge_older([candle(1, 10), candle(2, 20)], NewestCandle::Kept);
+
+        assert_eq!(merged, OlderMerge::TrimmedByCapacity);
+        assert_eq!(
+            timestamps(&mut series),
+            before,
+            "a full buffer refuses the page rather than giving up the newest candle"
+        );
+        assert!(
+            series.at_live_edge(),
+            "nothing was evicted, so the series still follows the live edge"
+        );
+    }
+
+    /// The page is trimmed to the room left, keeping the candles nearest the
+    /// buffer: the ones that join it without a gap.
+    #[test]
+    fn a_page_merged_with_the_newest_candle_kept_should_keep_the_nearest_older_candles() {
+        let mut series = series(5);
+        series.merge_initial([candle(10, 10), candle(11, 11), candle(12, 12)]);
+
+        let merged = series.merge_older(
+            [
+                candle(5, 5),
+                candle(6, 6),
+                candle(7, 7),
+                candle(8, 8),
+                candle(9, 9),
+            ],
+            NewestCandle::Kept,
+        );
+
+        assert_eq!(merged, OlderMerge::Advanced);
+        assert_eq!(
+            timestamps(&mut series),
+            vec![8, 9, 10, 11, 12],
+            "the two that fitted are the two closest to the buffer, not the first two of the page"
+        );
+        assert!(series.at_live_edge());
+    }
+
+    /// The opposite intent: the newest candle is off screen, so evicting it is
+    /// what moves the series back in time — and what takes it off the live edge.
+    #[test]
+    fn a_page_merged_with_the_newest_candle_evicted_should_clear_the_live_edge() {
+        let mut series = series(3);
+        series.merge_initial([candle(3, 30), candle(4, 40), candle(5, 50)]);
+
+        let merged = series.merge_older([candle(2, 20)], NewestCandle::Evicted);
+
+        assert_eq!(merged, OlderMerge::Advanced);
+        assert_eq!(timestamps(&mut series), vec![2, 3, 4]);
+        assert!(!series.at_live_edge());
+    }
+
+    #[test]
+    fn an_empty_older_page_should_make_no_progress_under_either_intent() {
+        let mut kept = series(3);
+        kept.merge_initial([candle(1, 10)]);
+        let mut evicted = series(3);
+        evicted.merge_initial([candle(1, 10)]);
+
+        assert_eq!(
+            kept.merge_older([], NewestCandle::Kept),
+            OlderMerge::MadeNoProgress
+        );
+        assert_eq!(
+            evicted.merge_older([], NewestCandle::Evicted),
+            OlderMerge::MadeNoProgress
+        );
+        assert!(kept.at_live_edge() && evicted.at_live_edge());
+    }
+
+    /// A page carrying only candles the series already holds changed nothing, so
+    /// it is no progress under either intent — and under the evicting one it must
+    /// not move the edge either.
+    #[test]
+    fn a_page_of_candles_already_held_should_make_no_progress() {
+        let mut kept = series(4);
+        kept.merge_initial([candle(1, 10), candle(2, 20)]);
+        let mut evicted = series(4);
+        evicted.merge_initial([candle(1, 10), candle(2, 20)]);
+
+        assert_eq!(
+            kept.merge_older([candle(2, 20), candle(1, 10)], NewestCandle::Kept),
+            OlderMerge::MadeNoProgress
+        );
+        assert_eq!(
+            evicted.merge_older([candle(2, 20), candle(1, 10)], NewestCandle::Evicted),
+            OlderMerge::MadeNoProgress
+        );
+        assert!(kept.at_live_edge() && evicted.at_live_edge());
+    }
+
+    #[test]
+    fn fetched_history_should_keep_only_the_newest_rows_at_the_boundary() {
+        let history = [5, 1, 4, 2, 3]
+            .into_iter()
+            .map(|timestamp| candle(timestamp, timestamp as u64))
+            .collect();
+
+        let bounded = bounded_history(history, 2);
+
+        assert_eq!(
+            bounded
+                .into_iter()
+                .map(|candle| candle.timestamp)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn fetched_history_should_deduplicate_before_applying_the_boundary() {
+        let history = [(1, 1), (2, 2), (2, 20), (3, 3), (3, 30), (4, 4)]
+            .into_iter()
+            .map(|(timestamp, close)| candle(timestamp, close))
+            .collect();
+
+        let bounded = bounded_history(history, 3);
+
+        assert_eq!(
+            bounded
+                .into_iter()
+                .map(|candle| (candle.timestamp, CandlePrices::of(&candle).close()))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Price::from(20_u64)),
+                (3, Price::from(30_u64)),
+                (4, Price::from(4_u64)),
+            ],
+            "the last value of a repeated timestamp wins, as it does when the page is merged"
+        );
     }
 
     #[test]

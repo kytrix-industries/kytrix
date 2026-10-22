@@ -42,7 +42,9 @@ use widget::{
     stream::StreamPublisher,
 };
 
-use super::model::{CandlestickSeries, CandlestickSeriesSnapshot};
+use super::model::{
+    CandlestickSeries, CandlestickSeriesSnapshot, NewestCandle, OlderMerge, bounded_history,
+};
 
 /// Commands the UI may queue for a running stream.
 const STREAM_COMMAND_CAPACITY: usize = 8;
@@ -62,7 +64,13 @@ pub(super) enum CandlestickRequest {
         adjustment: Adjustment,
     },
     /// Fetches the page before the oldest candle the stream currently holds.
-    FetchHistory { before_timestamp: UnixMillis },
+    ///
+    /// The page is older candles, so what it may do to the newest one is the
+    /// caller's decision: only the chart knows whether that candle is on screen.
+    FetchHistory {
+        before_timestamp: UnixMillis,
+        newest: NewestCandle,
+    },
     /// Fetches the page after the newest candle the stream currently holds.
     FetchNewer { after_timestamp: UnixMillis },
 }
@@ -123,11 +131,31 @@ pub(super) enum CandlestickStatus {
     Error(MarketError),
 }
 
+/// Which page a [`CandlestickStreamMessage::PageSettled`] is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PageDirection {
+    /// The page before the oldest candle the stream held.
+    History,
+    /// The page after the newest candle the stream held.
+    Newer,
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum CandlestickStreamMessage {
     Status(CandlestickStatus),
     /// The whole series, merged. Replaces whatever the chart was holding.
     Snapshot(CandlestickSeriesSnapshot),
+    /// One pagination request is finished, with or without a page.
+    ///
+    /// Published for every accepted request, including the ones the stream drops
+    /// as stale or exhausted and the ones whose page turned out to be empty: the
+    /// reply to the RPC only says the command was queued, so this is the only
+    /// thing that tells the chart its request is over. It is deliberately not a
+    /// [`CandlestickStatus`]: a status describes what the widget reports, and a
+    /// pane that is ready stays ready while it fills a wider window.
+    PageSettled {
+        direction: PageDirection,
+    },
 }
 
 pub(super) struct CandlestickProtocol;
@@ -426,7 +454,10 @@ where
                         active_commands = None;
                     }
                 }
-                CandlestickRequest::FetchHistory { before_timestamp } => {
+                CandlestickRequest::FetchHistory {
+                    before_timestamp,
+                    newest,
+                } => {
                     let Some(commands) = active_commands.as_ref() else {
                         let _ = reply.respond(Err(CandlestickServiceError::NoActiveStream));
                         continue;
@@ -438,7 +469,10 @@ where
                             Err(CandlestickServiceError::StreamBusy)
                         }
                         () = reply.cancelled() => continue,
-                        result = commands.send(StreamCommand::FetchHistory { before_timestamp }) => {
+                        result = commands.send(StreamCommand::FetchHistory {
+                            before_timestamp,
+                            newest,
+                        }) => {
                             result
                                 .map(|()| CandlestickResponse::HistoryQueued)
                                 .map_err(|_| CandlestickServiceError::StreamClosed)
@@ -495,8 +529,13 @@ struct StreamSpec {
 }
 
 enum StreamCommand {
-    FetchHistory { before_timestamp: UnixMillis },
-    FetchNewer { after_timestamp: UnixMillis },
+    FetchHistory {
+        before_timestamp: UnixMillis,
+        newest: NewestCandle,
+    },
+    FetchNewer {
+        after_timestamp: UnixMillis,
+    },
 }
 
 /// Runs one stream generation until it fails or is cancelled.
@@ -584,106 +623,142 @@ where
 
     loop {
         tokio::select! {
-                biased;
-                () = publisher.cancelled() => return Ok(()),
-                command = commands.recv() => {
-                    let Some(command) = command else {
-                        return Ok(());
-                    };
-                    let (query, load_older) = match command {
-                        StreamCommand::FetchHistory { before_timestamp } => {
-                            // A duplicate or stale request is dropped here rather
-                            // than passed on: the view may have panned further
-                            // while this one was queued.
-                            if series.older_exhausted()
-                                || series.earliest_timestamp().is_some_and(|earliest| before_timestamp > earliest)
-                            {
-                                continue;
+            biased;
+            () = publisher.cancelled() => return Ok(()),
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    return Ok(());
+                };
+                let (query, direction, newest) = match command {
+                    StreamCommand::FetchHistory {
+                        before_timestamp,
+                        newest,
+                    } => {
+                        // A duplicate or stale request is dropped here rather
+                        // than passed on: the view may have panned further
+                        // while this one was queued. Dropping it still has to
+                        // answer, or the view's in-flight flag would stay set
+                        // and the chart would never ask again — hence the
+                        // settle below, which every accepted command publishes.
+                        if series.older_exhausted()
+                            || series
+                                .earliest_timestamp()
+                                .is_some_and(|earliest| before_timestamp > earliest)
+                        {
+                            if !publish_settled(publisher, PageDirection::History).await {
+                                return Ok(());
                             }
-                            (
-                                CandlestickPageQuery::new(
-                                    listing.clone(),
-                                    timeframe,
-                                    adjustment,
-                                    None,
-                                    Some(before_timestamp.saturating_sub(1)),
-                                    spec.history_limit,
-                                ),
-                                true,
-                            )
+                            continue;
                         }
-                        StreamCommand::FetchNewer { after_timestamp } => {
-                            if series.at_live_edge()
-                                || series.latest_timestamp().is_some_and(|latest| after_timestamp < latest)
-                            {
-                                continue;
+                        (
+                            CandlestickPageQuery::new(
+                                listing.clone(),
+                                timeframe,
+                                adjustment,
+                                None,
+                                Some(before_timestamp.saturating_sub(1)),
+                                spec.history_limit,
+                            ),
+                            PageDirection::History,
+                            Some(newest),
+                        )
+                    }
+                    StreamCommand::FetchNewer { after_timestamp } => {
+                        if series.at_live_edge()
+                            || series
+                                .latest_timestamp()
+                                .is_some_and(|latest| after_timestamp < latest)
+                        {
+                            if !publish_settled(publisher, PageDirection::Newer).await {
+                                return Ok(());
                             }
-                            (
-                                CandlestickPageQuery::new(
-                                    listing.clone(),
-                                    timeframe,
-                                    adjustment,
-                                    Some(after_timestamp.saturating_add(1)),
-                                    None,
-                                    spec.history_limit,
-                                ),
-                                false,
-                            )
+                            continue;
                         }
-                    };
-                    let (page, buffered) = fetch_while_buffering(
-                        source,
-                        query,
-                        &mut subscription,
-                        spec.maximum_candles,
-                        publisher,
-                    )
-                    .await?;
-                    let page_len = page.len();
-                    if load_older {
-                        if page.is_empty() {
-                            series.mark_older_exhausted();
-                        } else {
-                            series.merge_older(page);
+                        (
+                            CandlestickPageQuery::new(
+                                listing.clone(),
+                                timeframe,
+                                adjustment,
+                                Some(after_timestamp.saturating_add(1)),
+                                None,
+                                spec.history_limit,
+                            ),
+                            PageDirection::Newer,
+                            None,
+                        )
+                    }
+                };
+                let (page, buffered) = fetch_while_buffering(
+                    source,
+                    query,
+                    &mut subscription,
+                    spec.maximum_candles,
+                    publisher,
+                )
+                .await?;
+                let page_len = page.len();
+                // `newest` is `Some` exactly for a history request: the match above
+                // builds the intent and the direction together, because which candle
+                // an older page may evict is the only question that has an intent at
+                // all.
+                match newest {
+                    // The intent the page was asked with decides what it may
+                    // do to the candle at the live edge; see
+                    // [`CandlestickSeries::merge_older`].
+                    Some(newest) => {
+                        // What a page that changed nothing means depends on
+                        // why it changed nothing. A fetched, non-empty page
+                        // that added no older candle is the venue answering
+                        // that there is nothing older, so history is
+                        // exhausted. A page the merge could not fit is the
+                        // buffer's own answer, and marking history exhausted
+                        // for it would stop the chart asking for the page it
+                        // still has room for once the buffer moves on.
+                        match series.merge_older(page, newest) {
+                            OlderMerge::MadeNoProgress => series.mark_older_exhausted(),
+                            OlderMerge::Advanced | OlderMerge::TrimmedByCapacity => {}
                         }
-                    } else {
+                    }
+                    None => {
                         series.merge_newer(page);
-                        // A short page means the venue had nothing more to give, so
-                        // the window has reached the newest candle again.
+                        // A short page means the venue had nothing more to
+                        // give, so the window has reached the newest candle
+                        // again.
                         if page_len < usize::from(spec.history_limit) {
                             series.mark_at_live_edge();
                         }
                     }
-                    if series.at_live_edge() {
-                        series.merge_newer(
-                            buffered
-                                .into_values()
-                                .map(|candle| candle.as_ref().clone()),
-                        );
-                    }
-        if !publish_snapshot(publisher, series.snapshot()) {
-                        return Ok(());
-                    }
-                    if !publish_status(publisher, CandlestickStatus::Ready).await {
-                        return Ok(());
-                    }
                 }
-                event = subscription.recv() => {
-                    match event {
-                        Some(Ok(candle)) => {
-                            if series.upsert_live(candle.as_ref())
-                                && !publish_snapshot(publisher, series.snapshot())
-                            {
-                                return Ok(());
-                            }
+                if series.at_live_edge() {
+                    series.merge_newer(
+                        buffered
+                            .into_values()
+                            .map(|candle| candle.as_ref().clone()),
+                    );
+                }
+                if !publish_snapshot(publisher, series.snapshot()) {
+                    return Ok(());
+                }
+                if !publish_settled(publisher, direction).await {
+                    return Ok(());
+                }
+            }
+            event = subscription.recv() => {
+                match event {
+                    Some(Ok(candle)) => {
+                        if series.upsert_live(candle.as_ref())
+                            && !publish_snapshot(publisher, series.snapshot())
+                        {
+                            return Ok(());
                         }
-                        Some(Err(error)) => return Err(error),
-                        None => {
-                            return Err(MarketError::Disconnected(DisconnectReason::Normal));
-                        }
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        return Err(MarketError::Disconnected(DisconnectReason::Normal));
                     }
                 }
             }
+        }
     }
 }
 
@@ -705,6 +780,22 @@ fn publish_snapshot(
 ) -> bool {
     publisher
         .publish_latest(CandlestickStreamMessage::Snapshot(snapshot))
+        .is_ok()
+}
+
+/// Publishes the end of one pagination request, reporting whether the stream is
+/// still alive.
+///
+/// It travels on the reliable channel because it is state rather than a
+/// replaceable snapshot: a chart whose request is already answered must not lose
+/// that answer to a newer one.
+async fn publish_settled(
+    publisher: &StreamPublisher<CandlestickProtocol>,
+    direction: PageDirection,
+) -> bool {
+    publisher
+        .publish_reliable(CandlestickStreamMessage::PageSettled { direction })
+        .await
         .is_ok()
 }
 
@@ -753,32 +844,7 @@ where
     }
 }
 
-/// Keeps the newest `maximum_candles` rows of a fetched page.
-fn bounded_history(
-    history: Vec<ListingCandlestick>,
-    maximum_candles: usize,
-) -> Vec<ListingCandlestick> {
-    let limit = maximum_candles.max(1);
-    let mut bounded = BTreeMap::new();
-    for candle in history {
-        if let Some(current) = bounded.get_mut(&candle.timestamp) {
-            *current = candle;
-            continue;
-        }
-        if bounded.len() == limit {
-            if bounded
-                .first_key_value()
-                .is_some_and(|(&earliest, _)| candle.timestamp < earliest)
-            {
-                continue;
-            }
-            bounded.pop_first();
-        }
-        bounded.insert(candle.timestamp, candle);
-    }
-    bounded.into_values().collect()
-}
-
+/// Buffers one live candle that arrived while a page was in flight.
 fn buffer_candle(
     buffered: &mut BTreeMap<UnixMillis, Arc<ListingCandlestick>>,
     candle: Arc<ListingCandlestick>,
@@ -895,7 +961,9 @@ mod tests {
     fn snapshot_of(message: &CandlestickStreamMessage) -> Option<&CandlestickSeriesSnapshot> {
         match message {
             CandlestickStreamMessage::Snapshot(snapshot) => Some(snapshot),
-            CandlestickStreamMessage::Status(_) => None,
+            CandlestickStreamMessage::Status(_) | CandlestickStreamMessage::PageSettled { .. } => {
+                None
+            }
         }
     }
 
@@ -1052,46 +1120,6 @@ mod tests {
         buffer_candle(&mut buffered, Arc::new(candle(3, 30)), 2);
 
         assert_eq!(buffered.into_keys().collect::<Vec<_>>(), vec![2, 3]);
-    }
-
-    #[test]
-    fn fetched_history_should_keep_only_the_newest_rows_at_the_boundary() {
-        let history = [5, 1, 4, 2, 3]
-            .into_iter()
-            .map(|timestamp| candle(timestamp, timestamp as u64))
-            .collect();
-
-        let bounded = bounded_history(history, 2);
-
-        assert_eq!(
-            bounded
-                .into_iter()
-                .map(|candle| candle.timestamp)
-                .collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-    }
-
-    #[test]
-    fn fetched_history_should_deduplicate_before_applying_the_boundary() {
-        let history = [(1, 1), (2, 2), (2, 20), (3, 3), (3, 30), (4, 4)]
-            .into_iter()
-            .map(|(timestamp, close)| candle(timestamp, close))
-            .collect();
-
-        let bounded = bounded_history(history, 3);
-
-        assert_eq!(
-            bounded
-                .into_iter()
-                .map(|candle| (candle.timestamp, close_of(&candle)))
-                .collect::<Vec<_>>(),
-            vec![
-                (2, Price::from(20_u64)),
-                (3, Price::from(30_u64)),
-                (4, Price::from(4_u64)),
-            ]
-        );
     }
 
     #[tokio::test]
@@ -1379,6 +1407,7 @@ mod tests {
         client
             .call(CandlestickRequest::FetchHistory {
                 before_timestamp: 5,
+                newest: NewestCandle::Evicted,
             })
             .await
             .expect("a page before the window should be fetched");
@@ -1438,6 +1467,376 @@ mod tests {
         assert!(snapshot.candles().is_empty());
         assert!(snapshot.older_exhausted());
         harness.runtime.shutdown().await;
+    }
+
+    /// Both pagination directions are settled on the reliable channel even when the
+    /// stream answers them without fetching anything.
+    ///
+    /// The RPC reply only says the command was queued, so a dropped command that
+    /// published nothing would leave the view's in-flight flag set for its whole
+    /// life and the chart would never ask again. The two drops are reached the way
+    /// production reaches them: an empty first page marks history exhausted, so a
+    /// request before it is redundant, and a series at the live edge has nothing
+    /// newer to fetch.
+    #[tokio::test]
+    async fn a_dropped_pagination_request_should_still_settle_its_direction() {
+        let harness = harness(100, 1_000);
+        let mut runtime = harness.runtime;
+        let mut reliable = runtime
+            .take_reliable_stream()
+            .expect("reliable stream should be available");
+        let mut latest = runtime.latest_stream();
+        let client = runtime.client();
+
+        client
+            .call(load(TimeFrame::Minute1))
+            .await
+            .expect("load request should start a stream");
+        harness.fetch_started.notified().await;
+        harness
+            .history
+            .send(Vec::new())
+            .expect("initial history request should be waiting");
+        latest
+            .changed()
+            .await
+            .expect("the empty first page should be published");
+        // The stream answers its own page with a status; draining the channel past
+        // that status is what makes the reads below the answer to a dropped request
+        // alone.
+        while !matches!(
+            reliable
+                .recv()
+                .await
+                .expect("the load should be reported on the reliable channel")
+                .message()
+                .as_ref(),
+            CandlestickStreamMessage::Status(CandlestickStatus::Ready)
+        ) {}
+        let empty = latest
+            .next_unseen()
+            .and_then(|envelope| snapshot_of(envelope.message().as_ref()).cloned())
+            .expect("the empty page is published before the status that reports it");
+        assert!(
+            empty.older_exhausted() && empty.at_live_edge(),
+            "the fixture is what both historical drops need: nothing older, nothing newer"
+        );
+
+        client
+            .call(CandlestickRequest::FetchHistory {
+                before_timestamp: 0,
+                newest: NewestCandle::Evicted,
+            })
+            .await
+            .expect("the request is accepted; the stream is what drops the page");
+        let history_settled = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
+            .await
+            .expect("a dropped history request has to settle, or the view's flag stays set")
+            .expect("the reliable stream should remain open");
+        assert!(
+            matches!(
+                history_settled.message().as_ref(),
+                CandlestickStreamMessage::PageSettled {
+                    direction: PageDirection::History
+                }
+            ),
+            "the history direction is settled even though no page was fetched"
+        );
+
+        client
+            .call(CandlestickRequest::FetchNewer { after_timestamp: 0 })
+            .await
+            .expect("the request is accepted; the stream is what drops the page");
+        let newer_settled = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
+            .await
+            .expect("a dropped newer request has to settle, or the view's flag stays set")
+            .expect("the reliable stream should remain open");
+        assert!(
+            matches!(
+                newer_settled.message().as_ref(),
+                CandlestickStreamMessage::PageSettled {
+                    direction: PageDirection::Newer
+                }
+            ),
+            "the newer direction is settled even though no page was fetched"
+        );
+        assert!(
+            latest.next_unseen().is_none(),
+            "and a dropped request publishes no snapshot, the one above is the load's own"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A source whose first page is fixed and whose later pages come from a queue.
+    ///
+    /// It is what the history merge outcomes are observed through: whether a page
+    /// advanced the window, was trimmed by the buffer, or added nothing is the
+    /// stream's decision, and only the series it publishes shows that decision.
+    #[derive(Clone)]
+    struct ScriptedSource {
+        subscription: Arc<Mutex<Option<FakeSubscription>>>,
+        initial: Arc<Mutex<Option<Vec<ListingCandlestick>>>>,
+        pages: Arc<Mutex<VecDeque<Vec<ListingCandlestick>>>>,
+    }
+
+    impl ScriptedSource {
+        fn new(
+            subscription: FakeSubscription,
+            initial: Vec<ListingCandlestick>,
+            pages: Vec<Vec<ListingCandlestick>>,
+        ) -> Self {
+            Self {
+                subscription: Arc::new(Mutex::new(Some(subscription))),
+                initial: Arc::new(Mutex::new(Some(initial))),
+                pages: Arc::new(Mutex::new(VecDeque::from(pages))),
+            }
+        }
+    }
+
+    impl CandlestickSource for ScriptedSource {
+        type Subscription = FakeSubscription;
+
+        fn supported_timeframes(&self, _route: &VenueRoute) -> Result<Vec<TimeFrame>, MarketError> {
+            Ok(TIMEFRAMES.to_vec())
+        }
+
+        fn supported_adjustments(
+            &self,
+            _route: &VenueRoute,
+        ) -> Result<Vec<Adjustment>, MarketError> {
+            Ok(vec![Adjustment::None])
+        }
+
+        async fn fetch_candlesticks(
+            &self,
+            _query: CandlestickPageQuery,
+        ) -> Result<Vec<ListingCandlestick>, MarketError> {
+            if let Some(initial) = self.initial.lock().await.take() {
+                return Ok(initial);
+            }
+            let page = self
+                .pages
+                .lock()
+                .await
+                .pop_front()
+                .ok_or(MarketError::ServiceClosed)?;
+            Ok(page)
+        }
+        async fn subscribe_candlesticks(
+            &self,
+            _listing: VenueListingKey,
+            _timeframe: TimeFrame,
+            _adjustment: Adjustment,
+        ) -> Result<Self::Subscription, MarketError> {
+            self.subscription
+                .lock()
+                .await
+                .take()
+                .ok_or(MarketError::ServiceClosed)
+        }
+    }
+
+    /// Runs one stream over a scripted source, delivers the pages in order as answers
+    /// to history requests, and returns the snapshot each of them produced.
+    ///
+    /// Every request goes through the same `FetchHistory` the view sends, so the
+    /// outcome under test is the one production reaches. `newest` is the intent the
+    /// view states with it, and the capacity is what decides whether a page fits.
+    async fn history_pages_over(
+        capacity: usize,
+        initial: Vec<ListingCandlestick>,
+        pages: Vec<Vec<ListingCandlestick>>,
+        newest: NewestCandle,
+    ) -> Vec<CandlestickSeriesSnapshot> {
+        let (events, event_receiver) = mpsc::channel(1);
+        let page_count = pages.len();
+        let source = ScriptedSource::new(idle_subscription(event_receiver), initial, pages);
+        let runtime = WidgetRuntime::spawn(
+            current_test_handle(),
+            CandlestickService::new(source, 2, capacity),
+        );
+        let client = runtime.client();
+        let mut latest = runtime.latest_stream();
+
+        client
+            .call(load(TimeFrame::Minute1))
+            .await
+            .expect("the load should start a stream");
+        let mut produced = Vec::with_capacity(page_count);
+        let mut earliest = latest
+            .changed()
+            .await
+            .map(|()| latest.next_unseen())
+            .ok()
+            .flatten()
+            .and_then(|envelope| snapshot_of(envelope.message().as_ref()).cloned())
+            .expect("the first page should be published")
+            .earliest_timestamp();
+
+        for index in 0..page_count {
+            client
+                .call(CandlestickRequest::FetchHistory {
+                    // One before the oldest candle held, which is what the view asks
+                    // for and what the stream's own guard admits.
+                    before_timestamp: earliest
+                        .map(|earliest| earliest.saturating_sub(1))
+                        .expect("the first page left a candle to page from"),
+                    newest,
+                })
+                .await
+                .expect("the page request should be queued");
+            let snapshot = latest
+                .changed()
+                .await
+                .map(|()| latest.next_unseen())
+                .ok()
+                .flatten()
+                .and_then(|envelope| snapshot_of(envelope.message().as_ref()).cloned())
+                .unwrap_or_else(|| panic!("page {} should be published", index + 1));
+            earliest = snapshot.earliest_timestamp();
+            produced.push(snapshot);
+        }
+
+        drop(events);
+        runtime.shutdown().await;
+        produced
+    }
+
+    /// A page that added nothing older is the venue saying there is nothing older.
+    #[tokio::test]
+    async fn a_history_page_that_makes_no_progress_should_mark_history_exhausted() {
+        let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
+        // The same candles the buffer already holds: deduplicated away, so the
+        // window does not move.
+        let repeat = vec![candle(10, 10), candle(20, 20)];
+        let produced = history_pages_over(10, initial, vec![repeat], NewestCandle::Kept).await;
+
+        assert!(
+            produced[0].older_exhausted(),
+            "a fetched page that added nothing older is the venue's answer, not the buffer's"
+        );
+        assert_eq!(produced[0].earliest_timestamp(), Some(10), "nothing moved");
+    }
+
+    /// A page the buffer could not fit is the buffer's answer, not the venue's.
+    ///
+    /// Marking history exhausted here would stop the chart asking for a page it still
+    /// has room for as soon as the buffer moves on — so the flag must stay clear.
+    #[tokio::test]
+    async fn a_history_page_trimmed_by_capacity_should_not_mark_history_exhausted() {
+        let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
+        let older = vec![candle(1, 1), candle(2, 2)];
+        let produced = history_pages_over(3, initial, vec![older], NewestCandle::Kept).await;
+
+        assert!(
+            !produced[0].older_exhausted(),
+            "a full buffer refused the page, which says nothing about how much history is left"
+        );
+        assert_eq!(
+            produced[0].earliest_timestamp(),
+            Some(10),
+            "and nothing was evicted to make room for it"
+        );
+        assert!(
+            produced[0].at_live_edge(),
+            "keeping the newest candle is what keeps the chart at the live edge"
+        );
+    }
+
+    /// A page that advanced the window is not an answer about running out either.
+    #[tokio::test]
+    async fn a_history_page_that_advances_should_not_mark_history_exhausted() {
+        let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
+        let older = vec![candle(1, 1), candle(2, 2)];
+        let produced = history_pages_over(10, initial, vec![older], NewestCandle::Kept).await;
+
+        assert!(!produced[0].older_exhausted());
+        assert_eq!(
+            produced[0].earliest_timestamp(),
+            Some(1),
+            "the window moved"
+        );
+        assert!(produced[0].at_live_edge());
+    }
+
+    /// An accepted page settles its direction too, not just a dropped one.
+    ///
+    /// The view learns that a request is finished from this message alone — the reply
+    /// to the RPC only says the command was queued — so a fetched page that published
+    /// its snapshot and nothing else would leave the direction's in-flight flag set
+    /// and the chart would never page again.
+    #[tokio::test]
+    async fn a_fetched_page_should_settle_its_direction_after_its_snapshot() {
+        let (events, event_receiver) = mpsc::channel(1);
+        let source = ScriptedSource::new(
+            idle_subscription(event_receiver),
+            vec![candle(10, 10), candle(20, 20), candle(30, 30)],
+            vec![vec![candle(1, 1), candle(2, 2)]],
+        );
+        let mut runtime = WidgetRuntime::spawn(
+            current_test_handle(),
+            CandlestickService::new(source, 2, 10),
+        );
+        let mut reliable = runtime
+            .take_reliable_stream()
+            .expect("reliable stream should be available");
+        let mut latest = runtime.latest_stream();
+        let client = runtime.client();
+
+        client
+            .call(load(TimeFrame::Minute1))
+            .await
+            .expect("the load should start a stream");
+        // The stream's own page is announced by a status; draining past it makes the
+        // reads below the answer to the paging request alone.
+        while !matches!(
+            reliable
+                .recv()
+                .await
+                .expect("the load should be reported")
+                .message()
+                .as_ref(),
+            CandlestickStreamMessage::Status(CandlestickStatus::Ready)
+        ) {}
+        while latest.next_unseen().is_some() {}
+
+        client
+            .call(CandlestickRequest::FetchHistory {
+                before_timestamp: 9,
+                newest: NewestCandle::Kept,
+            })
+            .await
+            .expect("the page request should be queued");
+
+        latest
+            .changed()
+            .await
+            .expect("the fetched page should be published");
+        let page = latest
+            .next_unseen()
+            .and_then(|envelope| snapshot_of(envelope.message().as_ref()).cloned())
+            .expect("the fetched page carries a snapshot");
+        assert_eq!(
+            page.earliest_timestamp(),
+            Some(1),
+            "the page landed before its settle is read"
+        );
+
+        let settled = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
+            .await
+            .expect("a fetched page has to settle its direction too")
+            .expect("the reliable stream should remain open");
+        assert!(
+            matches!(
+                settled.message().as_ref(),
+                CandlestickStreamMessage::PageSettled {
+                    direction: PageDirection::History
+                }
+            ),
+            "the view learns the request is over from this message and nothing else"
+        );
+        drop(events);
+        runtime.shutdown().await;
     }
 
     #[derive(Clone)]
@@ -1528,6 +1927,7 @@ mod tests {
         client
             .call(CandlestickRequest::FetchHistory {
                 before_timestamp: 0,
+                newest: NewestCandle::Evicted,
             })
             .await
             .expect("first history request should start");
@@ -1537,6 +1937,7 @@ mod tests {
             client
                 .call(CandlestickRequest::FetchHistory {
                     before_timestamp: 0,
+                    newest: NewestCandle::Evicted,
                 })
                 .await
                 .expect("history command queue should have capacity");
@@ -1546,6 +1947,7 @@ mod tests {
             .call_with_timeout(
                 CandlestickRequest::FetchHistory {
                     before_timestamp: 0,
+                    newest: NewestCandle::Evicted,
                 },
                 Duration::from_millis(25),
             )
@@ -1612,6 +2014,7 @@ mod tests {
         let error = client
             .call(CandlestickRequest::FetchHistory {
                 before_timestamp: 100,
+                newest: NewestCandle::Evicted,
             })
             .await
             .expect_err("failed stream should reject pagination");

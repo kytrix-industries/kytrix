@@ -21,9 +21,12 @@
 //!   that is following keeps following when a new candle arrives;
 //! - **the countdown**, which ticks once a second and repaints the body only
 //!   when the label it draws actually changes;
-//! - **pagination**, which is a pair of in-flight flags rather than a status,
-//!   because a page arriving changes the candles rather than what the widget is
-//!   reporting.
+//! - **pagination**, which is a pair of in-flight flags plus a last-requested
+//!   marker per direction, rather than a status, because a page arriving changes
+//!   the candles rather than what the widget is reporting. A request is finished
+//!   when the stream says so with a `PageSettled` message, not when a status
+//!   arrives: the candles travel on the latest channel and the settle on the
+//!   reliable one, so neither can stand in for the other.
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
@@ -93,12 +96,12 @@ use super::{
         text::ReadoutCache,
     },
     indicator::{CandlestickIndicatorConfig, normalize_indicator},
-    model::CandlestickSeriesSnapshot,
+    model::{CandlestickSeriesSnapshot, NewestCandle},
     panel::{IndicatorPanel, PANEL_WIDTH},
     service::{
         CandlestickProtocol, CandlestickRequest, CandlestickResponse, CandlestickService,
         CandlestickServiceError, CandlestickSource, CandlestickStatus, CandlestickStreamKey,
-        CandlestickStreamMessage,
+        CandlestickStreamMessage, PageDirection,
     },
     time::{
         TIMEFRAME_GROUPS, countdown_refresh_delay, current_timestamp_millis,
@@ -437,6 +440,22 @@ pub struct CandlestickWidget {
     drag_remainder: f32,
     fetching_history: bool,
     fetching_newer: bool,
+    /// The oldest candle the history page in flight was asked from.
+    ///
+    /// Purely a "do not ask twice for the same page" guard: the in-flight flag says
+    /// a request is out, and this says which page it asked for, so a prefetch that
+    /// runs again before the page lands cannot repeat it. The stream would drop
+    /// such a request as stale, and the settle answering that drop would run the
+    /// prefetch once more — a loop of requests that never moves the buffer.
+    ///
+    /// It is cleared only when the buffer's earliest candle actually moves past it,
+    /// which is the page arriving; a status or a settle says nothing about that,
+    /// because the two channels are independent. Resetting the scope drops it too,
+    /// since the page it names belongs to a generation that will never answer.
+    history_requested_before: Option<i64>,
+    /// The newest candle the newer page in flight was asked from, guarded the same
+    /// way for the other direction.
+    newer_requested_after: Option<i64>,
     /// Whether the chart is waiting for its market rather than reading it.
     ///
     /// The pane keeps its stream while it waits — the alternative is cancelling the
@@ -502,6 +521,21 @@ pub struct CandlestickWidget {
     /// not whether this widget rendered again.
     #[cfg(test)]
     renders: usize,
+    /// The newest-candle policy the last history request carried.
+    ///
+    /// A view test cancels the binding so the snapshot it hands in is the only data
+    /// the chart sees, and a cancelled binding answers every request with a failure.
+    /// What the view decided to *send* therefore has to be recorded here, or the half
+    /// of the prefetch rule that travels with the request would be unobservable.
+    #[cfg(test)]
+    prefetched_history_newest: Option<NewestCandle>,
+    /// How many history pages this view has asked for.
+    ///
+    /// A page asked for twice leaves the marker, the in-flight flag and the request
+    /// that was sent in exactly the state the first ask left them, so only a count
+    /// that accumulates can tell one request from two.
+    #[cfg(test)]
+    history_requests: usize,
 }
 
 impl WidgetView for CandlestickWidget {
@@ -644,6 +678,8 @@ impl CandlestickWidget {
             drag_remainder: 0.0,
             fetching_history: false,
             fetching_newer: false,
+            history_requested_before: None,
+            newer_requested_after: None,
             awaiting_market: false,
             market_reloaded: false,
             published_timeframes,
@@ -654,6 +690,10 @@ impl CandlestickWidget {
             indicator_preview_pending: false,
             #[cfg(test)]
             renders: 0,
+            #[cfg(test)]
+            prefetched_history_newest: None,
+            #[cfg(test)]
+            history_requests: 0,
         }
     }
 
@@ -821,6 +861,8 @@ impl CandlestickWidget {
         self.viewport.cursor = None;
         self.fetching_history = false;
         self.fetching_newer = false;
+        self.history_requested_before = None;
+        self.newer_requested_after = None;
     }
 
     /// Returns the chart to "nothing chosen", reporting it.
@@ -1019,6 +1061,8 @@ impl CandlestickWidget {
             // replaced and will never be answered.
             self.fetching_history = false;
             self.fetching_newer = false;
+            self.history_requested_before = None;
+            self.newer_requested_after = None;
         } else {
             // An explicit load starts over, because the widget cannot vouch for
             // what it was showing.
@@ -1135,11 +1179,11 @@ impl CandlestickWidget {
                 CandlestickStatus::LoadingHistory => {
                     self.status.report(WidgetState::Loading, cx);
                 }
-                // Every page ends with Ready, so this is also where a pagination
-                // request stops being in flight.
+                // The pane is ready; the candles are what it draws. Pagination is
+                // not a status — a page is announced by
+                // [`CandlestickStreamMessage::PageSettled`] — so this arm only
+                // reports the pane's own state and touches nothing else.
                 CandlestickStatus::Ready => {
-                    self.fetching_history = false;
-                    self.fetching_newer = false;
                     self.status.report(WidgetState::Ready, cx);
                 }
                 CandlestickStatus::Error(error) => {
@@ -1179,6 +1223,18 @@ impl CandlestickWidget {
                     );
                 }
             },
+            // One pagination request is over, so its direction's flag can go: the
+            // page either landed or never will. The prefetch then runs again,
+            // because a settle is also the news that the window this chart shows
+            // may still not be covered — a chart that needs several pages asks for
+            // them one after another this way.
+            CandlestickStreamMessage::PageSettled { direction } => {
+                match direction {
+                    PageDirection::History => self.fetching_history = false,
+                    PageDirection::Newer => self.fetching_newer = false,
+                }
+                self.prefetch_if_needed(cx);
+            }
             CandlestickStreamMessage::Snapshot(_) => {}
         }
     }
@@ -1197,12 +1253,38 @@ impl CandlestickWidget {
         }
         if let CandlestickStreamMessage::Snapshot(snapshot) = message.as_ref() {
             self.apply_snapshot(key.venue(), snapshot);
+            // The candles have landed, so the window they leave can be measured
+            // again. This covers the ordering a settle cannot: the two channels are
+            // independent, so a page's settle can arrive before its own candles, and
+            // the view must never act on one as if the other had landed. The check is
+            // a `partition_point` plus a few guards, and it does nothing while a page
+            // is still in flight.
+            self.prefetch_if_needed(cx);
         }
     }
 
     /// Accepts a snapshot as the whole of what the chart draws.
     fn apply_snapshot(&mut self, venue: &VenueId, snapshot: &CandlestickSeriesSnapshot) {
         self.snapshot = Some(snapshot.clone());
+        // A marker names the page that was asked for, so it stops meaning anything
+        // once the buffer has moved past it: that is the only proof a page landed,
+        // and the two channels carrying it are independent. Comparing the buffer to
+        // the marker rather than clearing it on a status is what keeps a repeated
+        // request for the same page out of the stream.
+        if let Some(earliest) = snapshot.earliest_timestamp()
+            && self
+                .history_requested_before
+                .is_some_and(|before_timestamp| earliest < before_timestamp)
+        {
+            self.history_requested_before = None;
+        }
+        if let Some(latest) = snapshot.latest_timestamp()
+            && self
+                .newer_requested_after
+                .is_some_and(|after_timestamp| latest > after_timestamp)
+        {
+            self.newer_requested_after = None;
+        }
         if !snapshot.at_live_edge() {
             // The chart is showing a historical window, so no candle on screen
             // is still being built and there is nothing to count down to.
@@ -1925,8 +2007,10 @@ impl CandlestickWidget {
     /// goes out slightly before the edge is reached rather than after the chart
     /// has already run out of candles.
     ///
-    /// Called after every gesture that moves the viewport, and after every change
-    /// of the chart's width — which needs no gesture at all.
+    /// Called after every gesture that moves the viewport, after every change of
+    /// the chart's width — which needs no gesture at all — after every snapshot
+    /// and after every settled page, so a chart that needs several pages asks for
+    /// them one after another.
     fn prefetch_if_needed(&mut self, cx: &mut Context<Self>) {
         // Failure is terminal: the stream that would answer is gone with it, so
         // asking now would only replace the failure being reported with a cheaper
@@ -1951,37 +2035,88 @@ impl CandlestickWidget {
         // keeps the plain margin — prefetching further right would push the
         // chart off the live edge for no warmup gain (design §7.4.2).
         let margin = PREFETCH_MARGIN.max(self.warmup_depth());
-        // Warmup is for a historical window only (design §7.4.2). With the buffer
-        // at capacity the page it asks for evicts the newest candle — the one the
-        // user is watching — through `merge_older`. A first page that has not
-        // filled the buffer yet would not evict anything, but it is still at the
-        // live edge, and only `merge_older` clears that flag: a guard that read
-        // `!snapshot.at_live_edge()` alone would therefore never let the first
-        // history page out, because the request it needs is the one that would
-        // take the series off the live edge.
+        // A chart that follows the live edge still asks for older candles, and that
+        // is the point of this rule: a window can be wider than the page it holds
+        // without any gesture at all, and nothing else in the widget asks for the
+        // difference — the left of the plot then stays blank however much the user
+        // pans. What it may not do is ask for more than the buffer can take.
         //
-        // The viewport is what says the user is reading history, so it is what
-        // decides. With `right_timestamp == None` the chart still follows the
-        // live edge and no history is asked for; panning sets the anchor, and the
-        // page is fetched then.
+        // The two conditions below answer two different questions, which is why they
+        // are not one:
+        //
+        // - the guard is about whether a fetched page would land. With no anchor the
+        //   request carries `NewestCandle::Kept`, so the merge keeps only what the
+        //   buffer has room for and evicts nothing: with no room at all the page is
+        //   dropped whole, and below a whole page the rest of the fetch is thrown
+        //   away. So the guard waits for a page of room. It is also what keeps a full
+        //   buffer from asking once per live tick, where the marker it compares
+        //   against — the oldest candle — moves forward with every new one. The price
+        //   is a blank strip: at `MIN_CANDLE_WIDTH` the plot shows
+        //   `ceil((width - 42) / 5) + 1` candles, so a full 1500-candle buffer fits a
+        //   body up to about 7537px and a wider one keeps a strip in front of the
+        //   oldest candle. The threshold moves with the buffer — about 6043px at 1201
+        //   candles — and between the two the strip exists only while the buffer sits
+        //   in that band, which a short page or a venue with less history leaves
+        //   behind; live ticks grow the buffer past it, so that strip is transient on
+        //   a trading market and permanent only on an idle one. Evicting the candle
+        //   the user is watching at the live edge would be worse than a strip they can
+        //   pan into.
+        // - the policy is about whether that candle is on screen, which is exactly
+        //   "the viewport has no right anchor". It travels with the request because
+        //   only the chart knows it: the series cannot see a viewport.
+        let following_the_live_edge =
+            self.viewport.right_timestamp.is_none() && snapshot.at_live_edge();
+        let room_for_a_page = MAXIMUM_CANDLES.saturating_sub(snapshot.candles().len())
+            >= usize::from(HISTORY_PAGE_SIZE);
+        // `WidgetBinding::call` owns a single RPC slot and replaces whatever was
+        // pending in it, so each branch is gated on the other's flag: at most one
+        // pagination request is ever out. A second one would cancel the first, and a
+        // cancelled pagination request is one whose settle never comes — the flag it
+        // set would never be cleared, and that direction would stay dead for the life
+        // of the stream.
         if range.start <= margin
-            && (self.viewport.right_timestamp.is_some() || !snapshot.at_live_edge())
+            && (!following_the_live_edge || room_for_a_page)
             && !snapshot.older_exhausted()
             && !self.fetching_history
+            && !self.fetching_newer
             && let Some(before_timestamp) = snapshot.earliest_timestamp()
+            // A page this chart already asked for is not asked for again. The two
+            // channels are independent, so a settle can arrive before the candles it
+            // announces; asking again then would fetch a page the stream has already
+            // answered, and the settle that answer produces would ask once more.
+            && self.history_requested_before != Some(before_timestamp)
         {
             self.fetching_history = true;
+            self.history_requested_before = Some(before_timestamp);
+            // The candle at the live edge is on screen exactly when the viewport
+            // follows it; that is what decides whether the page may evict it.
+            let newest = if self.viewport.right_timestamp.is_none() {
+                NewestCandle::Kept
+            } else {
+                NewestCandle::Evicted
+            };
+            #[cfg(test)]
+            {
+                self.prefetched_history_newest = Some(newest);
+                self.history_requests += 1;
+            }
             self.binding.call(
-                CandlestickRequest::FetchHistory { before_timestamp },
+                CandlestickRequest::FetchHistory {
+                    before_timestamp,
+                    newest,
+                },
                 cx,
                 Self::apply_rpc_result,
             );
         } else if range.end.saturating_add(PREFETCH_MARGIN) >= snapshot.candles().len()
             && !snapshot.at_live_edge()
             && !self.fetching_newer
+            && !self.fetching_history
             && let Some(after_timestamp) = snapshot.latest_timestamp()
+            && self.newer_requested_after != Some(after_timestamp)
         {
             self.fetching_newer = true;
+            self.newer_requested_after = Some(after_timestamp);
             self.binding.call(
                 CandlestickRequest::FetchNewer { after_timestamp },
                 cx,
@@ -6229,19 +6364,46 @@ pub(crate) mod tests {
         series.snapshot()
     }
 
-    /// A snapshot the user has panned into: full to capacity, then one older
-    /// candle merged in, which is what takes the chart off the live edge.
+    /// A live-edge snapshot of `len` candles whose newest one is at `newest`.
     ///
-    /// `merge_older` only leaves the live edge when it actually evicts a candle
-    /// (`model.rs`), and a series below capacity has room for the older candle
-    /// without evicting anything. A snapshot that stayed at the live edge would
-    /// land on the guard this fixture exists to get past, not on the history
-    /// prefetch.
+    /// Growing `len` while `newest` stays put is what a landed history page does to
+    /// the buffer: the same live edge, and candles the chart did not hold before in
+    /// front of the oldest one it did.
+    fn live_edge_snapshot(len: usize, newest: i64) -> CandlestickSeriesSnapshot {
+        let oldest = newest - i64::try_from(len).expect("the fixture length fits an i64") + 1;
+        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
+        series.merge_initial((oldest..=newest).map(|timestamp| candle(timestamp, 100)));
+        series.snapshot()
+    }
+
+    /// A live-edge snapshot of `len` candles whose venue has no more history.
+    ///
+    /// The exhausted flag is what a venue answering with nothing older leaves
+    /// behind, and it says nothing about how much room the buffer has: this fixture
+    /// is deliberately below capacity, so only the flag can keep a prefetch from
+    /// asking.
+    fn exhausted_snapshot(len: usize) -> CandlestickSeriesSnapshot {
+        let newest = i64::try_from(len).expect("the fixture length fits an i64");
+        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
+        series.merge_initial((1..=newest).map(|timestamp| candle(timestamp, 100)));
+        series.mark_older_exhausted();
+        series.snapshot()
+    }
+
+    /// A snapshot of a window the user has wheeled away from the live edge: a full
+    /// buffer with one older candle merged in, which is what moves it off the edge.
+    ///
+    /// The merge carries [`NewestCandle::Evicted`] because that is the intent a
+    /// chart anchored to a historical window asks with: the newest candle is off
+    /// screen to the right, so the page may evict it — and only a page that
+    /// actually does evict it takes the series off the live edge (`model.rs`). A
+    /// buffer with room would have taken the same candle without losing anything
+    /// and stayed at the edge, which is why this fixture fills to capacity first.
     fn panned_snapshot() -> CandlestickSeriesSnapshot {
         let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
         let newest = i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64");
         series.merge_initial((1..=newest).map(|index| candle(index, 100)));
-        series.merge_older(std::iter::once(candle(0, 100)));
+        series.merge_older(std::iter::once(candle(0, 100)), NewestCandle::Evicted);
         series.snapshot()
     }
 
@@ -6265,17 +6427,32 @@ pub(crate) mod tests {
     /// neighbour's edge — makes room for candles the loaded page does not hold,
     /// and none of that is a gesture inside the chart.
     ///
-    /// The snapshot is a panned one, and the view is anchored at 300 while the
-    /// chart is widened — close enough to the oldest candle that only the widened
-    /// plot reaches the margin.
+    /// This is the reported case: the chart follows the live edge with no anchor,
+    /// holding a 300-candle page, and the pane grows until the plot is wider than that
+    /// page. The rows behind the oldest candle are then simply blank, and no wheel or
+    /// drag ever asked for them.
     #[gpui_kit::test]
     fn a_widened_chart_should_ask_for_the_history_it_now_needs(cx: &mut TestAppContext) {
         let built = widget(cx);
         let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let snapshot = live_edge_snapshot(page, i64::try_from(page).expect("the page fits an i64"));
+        let earliest = snapshot.earliest_timestamp();
+        assert!(
+            snapshot.at_live_edge(),
+            "the pane grows while the chart follows the live edge"
+        );
+
         cx.update(|cx| {
-            accept_snapshot(&widget, panned_snapshot(), cx);
+            accept_snapshot(&widget, snapshot, cx);
             widget.update(cx, |widget, _| {
-                widget.viewport.right_timestamp = Some(300);
+                assert!(
+                    widget.viewport.right_timestamp.is_none(),
+                    "the fixture has no anchor, which is the reported scenario"
+                );
+                // Zoomed out to the narrowest candle, so the widened plot really does
+                // show more candles than the buffer holds.
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
             });
         });
 
@@ -6291,7 +6468,7 @@ pub(crate) mod tests {
         );
         assert!(
             !cx.read(|cx| widget.read(cx).fetching_history),
-            "a page that fills the chart leaves nothing to ask for"
+            "the narrow chart shows fewer candles than its page holds, so there is nothing to ask for"
         );
 
         // Cancelling the binding to hand-drive the stream also fails the load it was
@@ -6309,23 +6486,67 @@ pub(crate) mod tests {
         cx.simulate_window_resize(*window, size(px(2400.0), px(220.0)));
         cx.run_until_parked();
 
-        assert!(
-            cx.read(|cx| widget.read(cx).fetching_history),
-            "a chart wider than its page has to ask for the candles it now shows"
-        );
+        cx.read(|cx| {
+            let widget = widget.read(cx);
+            let snapshot = widget
+                .snapshot
+                .as_ref()
+                .expect("the accepted page is what the chart draws");
+            let layout = widget
+                .chart_layout
+                .borrow()
+                .clone()
+                .expect("the resized chart is laid out");
+            assert_eq!(
+                visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width()
+                ),
+                0..snapshot.candles().len(),
+                "the widened plot shows the whole page and no candle behind it"
+            );
+            assert!(
+                widget.fetching_history,
+                "a chart wider than its page has to ask for the candles it now shows"
+            );
+            assert_eq!(
+                widget.history_requested_before, earliest,
+                "the page is asked for from the oldest candle the buffer holds"
+            );
+            assert_eq!(
+                widget.prefetched_history_newest,
+                Some(NewestCandle::Kept),
+                "the chart follows the live edge, so the candle there is on screen and stays"
+            );
+            assert_eq!(
+                widget.history_requests, 1,
+                "the widening asks once, not once per layout pass"
+            );
+            assert!(
+                !widget.fetching_newer,
+                "the wider window needs older candles, not a newer page"
+            );
+        });
     }
 
-    /// The live edge is not a place to warm indicators up: the history page that
-    /// warmup asks for would evict the newest candle through `merge_older`, and at
-    /// the live edge that is the candle the user is watching (design §7.4.2).
-    /// Every other condition for a history request holds here.
+    /// A live-edge chart whose buffer is at capacity does not ask for history: the
+    /// page would have to evict the newest candle — the one the user is watching —
+    /// and that is the one thing a chart following the live edge cannot give up.
+    ///
+    /// The layout is zoomed to the narrowest candle and made wider than a pane, so
+    /// the window starts inside the left margin and a page would be due — while the
+    /// buffer has no room for one. Only the capacity rule can answer that, and it
+    /// refuses: a live-edge request keeps the newest candle, so a page that does not
+    /// fit is trimmed away whole instead of evicting the candle the chart follows.
     #[gpui_kit::test]
-    fn a_live_edge_chart_should_not_ask_for_history(cx: &mut TestAppContext) {
+    fn a_live_edge_chart_at_capacity_should_not_ask_for_history(cx: &mut TestAppContext) {
         let built = widget(cx);
         let widget = built.widget;
-        let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
-        series.merge_initial((1..=200).map(|index| candle(index, 100)));
-        let snapshot = series.snapshot();
+        let snapshot = live_edge_snapshot(
+            MAXIMUM_CANDLES,
+            i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64"),
+        );
         assert!(
             snapshot.at_live_edge(),
             "the fixture has to sit at the live edge"
@@ -6334,14 +6555,18 @@ pub(crate) mod tests {
         cx.update(|cx| {
             accept_snapshot(&widget, snapshot.clone(), cx);
             widget.update(cx, |widget, context| {
-                // Wider than the loaded page: the visible range starts before the
-                // oldest candle, so it is inside the margin on its own.
-                let layout = layout_of_width(2400.0);
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                let layout = layout_of_width(7000.0);
                 let range =
                     visible_range(snapshot.candles(), widget.viewport, layout.maximum_plot_width());
                 assert!(
                     range.start <= PREFETCH_MARGIN,
-                    "the live-edge guard is the only condition left between this chart and a history request"
+                    "the window is inside the margin, so only the capacity rule can answer this"
+                );
+                assert!(
+                    MAXIMUM_CANDLES.saturating_sub(snapshot.candles().len())
+                        < usize::from(HISTORY_PAGE_SIZE),
+                    "the fixture is the buffer with no room for a page, which is the case under test"
                 );
                 *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
                 // A cancelled load is not this test's subject, and its late failure
@@ -6352,11 +6577,745 @@ pub(crate) mod tests {
 
                 assert!(
                     !widget.fetching_history,
-                    "warming up at the live edge would push out the newest candle"
+                    "a page merged at capacity would evict the newest candle the live edge is watching"
+                );
+                assert!(
+                    widget.history_requested_before.is_none(),
+                    "and nothing may be left marked as asked for"
+                );
+                assert!(
+                    widget.prefetched_history_newest.is_none(),
+                    "no request went out at all, so none carried a policy"
                 );
                 assert!(
                     !widget.fetching_newer,
-                    "and the live edge has nothing newer to fetch either"
+                    "the live edge has nothing newer to fetch either"
+                );
+            });
+        });
+    }
+
+    /// A live-edge chart below capacity does ask for the page its window needs, and
+    /// the request says the newest candle is on screen.
+    ///
+    /// Below capacity the page evicts nothing, so it costs the chart neither its live
+    /// edge nor a candle; and without it a window wider than the first page keeps a
+    /// blank strip on its left that no gesture fills — the reported defect. The
+    /// intent travels with the request because only the chart knows whether that
+    /// candle is on screen: with no right anchor it is, so the page may not take it.
+    #[gpui_kit::test]
+    fn a_live_edge_chart_below_capacity_should_ask_for_the_page_its_window_needs(
+        cx: &mut TestAppContext,
+    ) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let snapshot = live_edge_snapshot(page, i64::try_from(page).expect("the page fits an i64"));
+        assert!(
+            snapshot.at_live_edge(),
+            "first page a stream loads, and nothing has taken it off the live edge"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                // Zoomed out to the narrowest candle and widened past what the loaded
+                // page holds: the left of the plot has no candle in the buffer at all.
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                let layout = layout_of_width(4000.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start == 0,
+                    "the window reaches past the oldest candle the buffer holds"
+                );
+                assert!(
+                    MAXIMUM_CANDLES.saturating_sub(snapshot.candles().len())
+                        >= usize::from(HISTORY_PAGE_SIZE),
+                    "the fixture is the buffer with room for a page, which is the case under test"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_history,
+                    "a live-edge chart below capacity must fetch the history its window needs"
+                );
+                assert_eq!(
+                    widget.history_requested_before,
+                    snapshot.earliest_timestamp(),
+                    "the page is asked for from the oldest candle the buffer holds"
+                );
+                assert_eq!(
+                    widget.prefetched_history_newest,
+                    Some(NewestCandle::Kept),
+                    "the chart follows the newest candle, so that candle is on screen and stays"
+                );
+                assert!(
+                    !widget.fetching_newer,
+                    "the left branch answered this window, not the right one"
+                );
+            });
+        });
+    }
+
+    /// A landed page keeps the fill going: one page rarely covers a window, and the
+    /// pages arrive at the live edge where nothing but this loop can ask for the next
+    /// one.
+    ///
+    /// The stream delivers a page as a snapshot on the latest channel and a
+    /// [`CandlestickStreamMessage::PageSettled`] on the reliable one, so both are
+    /// hand-delivered here in that order — no sleeps, no runtime, one page per step.
+    /// At 4000px and the narrowest candle the plot shows 793 candles, so three pages
+    /// (900) are still short of the window and its margin and four (1200) are past
+    /// it: the fill has to ask twice and then stop asking for candles the plot can no
+    /// longer show.
+    ///
+    /// The snapshot alone cannot restart the loop — the flag for the page it answers
+    /// is still set when it lands, which is what the first assertion of each step
+    /// pins — so the request that carries the fill forward is the one the settle
+    /// makes here.
+    #[gpui_kit::test]
+    fn a_landed_page_should_keep_a_wide_chart_filling(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let newest = i64::try_from(page).expect("the page fits an i64");
+        let first_page = live_edge_snapshot(page, newest);
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, first_page.clone(), cx);
+            let key = widget
+                .read(cx)
+                .current_key()
+                .expect("the test config follows a listing");
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout_of_width(4000.0)));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert_eq!(
+                    widget.history_requested_before,
+                    first_page.earliest_timestamp(),
+                    "the first page leaves the left of a window this wide empty"
+                );
+            });
+
+            // Three more pages land, each one behind the oldest candle the buffer
+            // held when the previous request went out.
+            for pages in 2..=4_usize {
+                let landed = live_edge_snapshot(pages * page, newest);
+                accept_snapshot(&widget, landed.clone(), cx);
+                widget.update(cx, |widget, context| {
+                    assert_eq!(
+                        widget
+                            .snapshot
+                            .as_ref()
+                            .and_then(CandlestickSeriesSnapshot::earliest_timestamp),
+                        landed.earliest_timestamp(),
+                        "the page under test is the one that just landed"
+                    );
+                    assert_eq!(
+                        widget.history_requested_before, None,
+                        "the buffer moved past the marker, which is the only proof a page landed"
+                    );
+                    assert!(
+                        widget.fetching_history,
+                        "a snapshot on its own cannot finish the request it answers: the settle \
+                         for it has not arrived yet"
+                    );
+
+                    widget.apply_reliable(
+                        key.clone(),
+                        Arc::new(CandlestickStreamMessage::PageSettled {
+                            direction: PageDirection::History,
+                        }),
+                        context,
+                    );
+                });
+
+                let needs_more = pages < 4;
+                widget.update(cx, |widget, _| {
+                    if needs_more {
+                        assert_eq!(
+                            widget.history_requested_before,
+                            landed.earliest_timestamp(),
+                            "the page landed and the window is still short, so the next one is \
+                             asked for from the new oldest candle"
+                        );
+                        assert!(widget.fetching_history, "and that request is in flight");
+                        assert_eq!(
+                            widget.prefetched_history_newest,
+                            Some(NewestCandle::Kept),
+                            "every page of the fill is still asked for with the live edge on screen"
+                        );
+                    } else {
+                        assert_eq!(
+                            widget.history_requested_before, None,
+                            "the buffer now covers the window past its margin, so the fill stops"
+                        );
+                        assert!(
+                            !widget.fetching_history,
+                            "and with it the only reason to ask for anything older"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    /// A settle that arrives before the candles it announces must not ask for the
+    /// same page again.
+    ///
+    /// The candles travel on the latest channel and the settle on the reliable one,
+    /// so this ordering is not a defect — but it does mean the settle cannot prove
+    /// the page landed. Asking again would be a request for a page the stream has
+    /// already answered, and the settle answering *that* drop would ask once more: an
+    /// endless loop of requests that never grows the buffer. The marker is what
+    /// refuses it, and it is cleared by the candles, not by the settle.
+    #[gpui_kit::test]
+    fn a_settle_before_its_candles_should_not_ask_for_the_same_page_again(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let newest = i64::try_from(page).expect("the page fits an i64");
+        let first_page = live_edge_snapshot(page, newest);
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, first_page.clone(), cx);
+            let key = widget
+                .read(cx)
+                .current_key()
+                .expect("the test config follows a listing");
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout_of_width(4000.0)));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert_eq!(
+                    widget.history_requested_before,
+                    first_page.earliest_timestamp(),
+                    "the window is wider than the page it holds"
+                );
+
+                // The settle arrives before the candles: the buffer has not moved, so
+                // nothing proves the page landed.
+                widget.apply_reliable(
+                    key,
+                    Arc::new(CandlestickStreamMessage::PageSettled {
+                        direction: PageDirection::History,
+                    }),
+                    context,
+                );
+
+                assert!(
+                    !widget.fetching_history,
+                    "the settle is what ends the request, whether or not a page came with it"
+                );
+                assert_eq!(
+                    widget.history_requested_before,
+                    first_page.earliest_timestamp(),
+                    "and the page the buffer already holds is not asked for again"
+                );
+            });
+
+            // The candles that settle announced arrive on the latest channel.
+            let landed = live_edge_snapshot(2 * page, newest);
+            accept_snapshot(&widget, landed.clone(), cx);
+
+            widget.update(cx, |widget, _| {
+                assert_eq!(
+                    widget.history_requested_before,
+                    landed.earliest_timestamp(),
+                    "the next request goes out from the oldest candle the buffer actually holds"
+                );
+                assert!(
+                    widget.fetching_history,
+                    "and the window still needs the page it now asks for"
+                );
+            });
+        });
+    }
+
+    /// A live snapshot that leaves the oldest candle where it was is not proof of a
+    /// landed page, so the marker stays.
+    ///
+    /// The buffer moves in both directions: a live tick appends a candle at the right
+    /// and the oldest one does not budge. Reading "the earliest is the marker" as
+    /// "the page arrived" would clear the marker there and ask for the same page
+    /// again while it is already on its way.
+    #[gpui_kit::test]
+    fn a_snapshot_that_does_not_move_the_oldest_candle_should_keep_the_marker(
+        cx: &mut TestAppContext,
+    ) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let newest = i64::try_from(page).expect("the page fits an i64");
+        let first_page = live_edge_snapshot(page, newest);
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, first_page.clone(), cx);
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout_of_width(4000.0)));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                let requested_from = widget
+                    .history_requested_before
+                    .expect("the wide window needs the page the buffer does not hold");
+
+                // A live tick arrives before the page: the newest candle moves and the
+                // oldest one does not, which is not what a landed page looks like.
+                let ticked = live_edge_snapshot(page + 1, newest + 1);
+                assert_eq!(
+                    ticked.earliest_timestamp(),
+                    first_page.earliest_timestamp(),
+                    "the fixture only grows at the right, which is the case under test"
+                );
+                widget.apply_latest(
+                    widget
+                        .current_key()
+                        .expect("the test config follows a listing"),
+                    Arc::new(CandlestickStreamMessage::Snapshot(ticked)),
+                    context,
+                );
+
+                assert_eq!(
+                    widget.history_requested_before,
+                    Some(requested_from),
+                    "a candle at the right says nothing about the page asked for at the left"
+                );
+            });
+        });
+    }
+
+    /// A `Ready` status says the pane is ready, not that a page landed, so it must
+    /// not re-arm the page the buffer already holds.
+    ///
+    /// Round 1 cleared `history_requested_before` and both in-flight flags in the
+    /// `CandlestickStatus::Ready` arm and ran the prefetch there, reading "every page
+    /// ends with `Ready`" as "the page arrived". A live tick reports `Ready` too: this
+    /// test delivers the same snapshot, a `Ready` status and the page's settle ten
+    /// times over, and that version asked for the same page on every tick — measured
+    /// at 11 requests for 10 ticks, none of which moved the buffer. The marker is
+    /// cleared only by a snapshot that actually moved the buffer past it.
+    #[gpui_kit::test]
+    fn a_ready_should_not_rearm_a_page_the_buffer_already_holds(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let newest = i64::try_from(page).expect("the page fits an i64");
+        let snapshot = live_edge_snapshot(page, newest);
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            let key = widget
+                .read(cx)
+                .current_key()
+                .expect("the test config follows a listing");
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                let layout = layout_of_width(4000.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the window is wider than the page it holds, so a page is due"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert_eq!(
+                    (
+                        widget.fetching_history,
+                        widget.history_requested_before,
+                        widget.history_requests,
+                    ),
+                    (true, snapshot.earliest_timestamp(), 1),
+                    "the window asks for the page it does not hold, once"
+                );
+            });
+
+            for _ in 0..10 {
+                widget.update(cx, |widget, context| {
+                    widget.apply_latest(
+                        key.clone(),
+                        Arc::new(CandlestickStreamMessage::Snapshot(snapshot.clone())),
+                        context,
+                    );
+                    widget.apply_reliable(
+                        key.clone(),
+                        Arc::new(CandlestickStreamMessage::Status(CandlestickStatus::Ready)),
+                        context,
+                    );
+                    widget.apply_reliable(
+                        key.clone(),
+                        Arc::new(CandlestickStreamMessage::PageSettled {
+                            direction: PageDirection::History,
+                        }),
+                        context,
+                    );
+
+                    assert_eq!(
+                        widget.history_requests, 1,
+                        "a tick, a ready status and a settle may not ask for that page again"
+                    );
+                });
+            }
+
+            widget.update(cx, |widget, _| {
+                assert!(
+                    !widget.fetching_history,
+                    "the settle ended the request, and nothing re-armed it"
+                );
+                assert_eq!(
+                    widget.history_requested_before,
+                    snapshot.earliest_timestamp(),
+                    "and the marker still names the page the buffer holds"
+                );
+            });
+        });
+    }
+
+    /// The other half of the guard: a chart anchored to a historical window asks even
+    /// at capacity, because the full buffer there refuses nothing the user is
+    /// watching.
+    ///
+    /// The series here is still at the live edge — the user panned, no older page has
+    /// landed yet — and its buffer is full, so the capacity rule would refuse the
+    /// page on its own. Only the viewport's half of the guard can let the request out,
+    /// which is what this test pins. The request carries [`NewestCandle::Evicted`]:
+    /// the newest candle is off screen to the right, so evicting it is what moves the
+    /// series back in time.
+    #[gpui_kit::test]
+    fn a_chart_anchored_to_history_at_capacity_should_still_ask_with_the_newest_candle_evicted(
+        cx: &mut TestAppContext,
+    ) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = live_edge_snapshot(
+            MAXIMUM_CANDLES,
+            i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64"),
+        );
+        assert!(
+            snapshot.at_live_edge(),
+            "the series has not left the live edge: only the user's pan has"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                widget.viewport.right_timestamp = Some(200);
+                let layout = layout_of_width(800.0);
+                let range =
+                    visible_range(snapshot.candles(), widget.viewport, layout.maximum_plot_width());
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the anchored window sits inside the left margin, which is where history is asked for"
+                );
+                assert_eq!(
+                    MAXIMUM_CANDLES.saturating_sub(snapshot.candles().len()),
+                    0,
+                    "the fixture is a full buffer, so the capacity rule cannot be what lets this through"
+                );
+                assert!(
+                    snapshot.at_live_edge(),
+                    "and the series is still at the live edge, so the guard's own answer has to come from the viewport"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_history,
+                    "a chart reading history keeps reading it, even with the buffer full"
+                );
+                assert_eq!(
+                    widget.history_requested_before,
+                    snapshot.earliest_timestamp(),
+                    "the page is asked for from the oldest candle the buffer holds"
+                );
+                assert_eq!(
+                    widget.prefetched_history_newest,
+                    Some(NewestCandle::Evicted),
+                    "the viewport is anchored, so the newest candle is off screen and may go"
+                );
+            });
+        });
+    }
+
+    /// The room boundary is a whole page: with exactly one page of room the request
+    /// goes out, and with one candle less of room it does not.
+    ///
+    /// The buffer is filled in two steps so the second one moves the marker (and so
+    /// proves the first page landed) while leaving one candle less than a page of
+    /// room. The layout is sized so both windows are inside the left margin: then
+    /// only the room rule can answer the second step.
+    #[gpui_kit::test]
+    fn the_history_prefetch_should_need_a_whole_page_of_room(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let newest = i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64");
+        // 5512px of body leaves 1095 candles of plot at the narrowest candle, so a
+        // buffer of 1200 and one of 1201 both start inside the 120-candle margin.
+        let room_for_exactly_one_page = live_edge_snapshot(MAXIMUM_CANDLES - page, newest);
+        let one_candle_less_of_room = live_edge_snapshot(MAXIMUM_CANDLES - page + 1, newest);
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, room_for_exactly_one_page.clone(), cx);
+            let key = widget
+                .read(cx)
+                .current_key()
+                .expect("the test config follows a listing");
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout_of_width(5512.0)));
+                widget.status.report(WidgetState::Ready, context);
+
+                assert_eq!(
+                    MAXIMUM_CANDLES.saturating_sub(room_for_exactly_one_page.candles().len()),
+                    page,
+                    "the fixture has room for exactly one page"
+                );
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_history,
+                    "a full page of room is enough to ask for that page"
+                );
+            });
+
+            // The page lands and settles, leaving one candle less than a page of room.
+            accept_snapshot(&widget, one_candle_less_of_room.clone(), cx);
+            widget.update(cx, |widget, context| {
+                assert_eq!(
+                    MAXIMUM_CANDLES.saturating_sub(
+                        widget
+                            .snapshot
+                            .as_ref()
+                            .map_or(0, |snapshot| snapshot.candles().len())
+                    ),
+                    page - 1,
+                    "the fixture has one candle less than a page of room"
+                );
+                widget.apply_reliable(
+                    key,
+                    Arc::new(CandlestickStreamMessage::PageSettled {
+                        direction: PageDirection::History,
+                    }),
+                    context,
+                );
+
+                assert!(
+                    !widget.fetching_history,
+                    "one candle less than a page is not room for that page, so no request goes out"
+                );
+            });
+        });
+    }
+
+    /// A venue that has run out of history is not asked again, however much room the
+    /// buffer has and however far into the margin the window reaches.
+    ///
+    /// This is the other condition the guard has to keep: the capacity rule answers
+    /// "may this page take the newest candle", not "is there a page to take".
+    #[gpui_kit::test]
+    fn an_exhausted_series_should_not_be_asked_for_history(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = exhausted_snapshot(usize::from(HISTORY_PAGE_SIZE));
+        assert!(
+            snapshot.older_exhausted(),
+            "the fixture is a venue that answered with nothing older"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                let layout = layout_of_width(4000.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the window is inside the margin, so only the exhausted flag can answer this"
+                );
+                assert!(
+                    MAXIMUM_CANDLES.saturating_sub(snapshot.candles().len())
+                        >= usize::from(HISTORY_PAGE_SIZE),
+                    "and the buffer has room, so only the exhausted flag can answer this"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    !widget.fetching_history,
+                    "history that has run out is not fetched again"
+                );
+                assert!(
+                    widget.history_requested_before.is_none(),
+                    "and nothing is left marked as asked for"
+                );
+            });
+        });
+    }
+
+    /// Both ways a scope starts over drop the last-requested markers: the pages they
+    /// name belonged to a generation that will never answer.
+    ///
+    /// An explicit reload cannot vouch for anything it was showing, so its markers go
+    /// with the candles; a retry keeps the candles the user is still reading, but the
+    /// pages in flight are still gone, so their markers go too.
+    #[gpui_kit::test]
+    fn starting_over_should_drop_the_last_requested_pages(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let page = usize::from(HISTORY_PAGE_SIZE);
+        let snapshot =
+            || live_edge_snapshot(page, i64::try_from(page).expect("the page fits an i64"));
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot(), cx);
+            widget.update(cx, |widget, context| {
+                widget.history_requested_before = Some(7);
+                widget.newer_requested_after = Some(9);
+                widget.fetching_history = true;
+                widget.fetching_newer = true;
+
+                widget.load(context);
+
+                assert_eq!(
+                    (
+                        widget.history_requested_before,
+                        widget.newer_requested_after
+                    ),
+                    (None, None),
+                    "a reload drops the markers of the generations it replaced"
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot(), cx);
+            widget.update(cx, |widget, context| {
+                widget.history_requested_before = Some(7);
+                widget.newer_requested_after = Some(9);
+                widget.fetching_history = true;
+                widget.fetching_newer = true;
+                let recovery = widget.recovery.clone();
+                widget.status.report(
+                    WidgetState::failed(
+                        Arc::new(CandlestickFailure::Market(disconnect())),
+                        recovery,
+                    ),
+                    context,
+                );
+            });
+
+            let recovery = status(&widget, cx)
+                .failure()
+                .map(|failure| failure.action().clone())
+                .expect("a failure should offer a way out");
+            recovery.run(cx);
+
+            let widget = widget.read(cx);
+            assert!(
+                widget.has_content(),
+                "a retry keeps the candles the user is still reading"
+            );
+            assert_eq!(
+                (
+                    widget.history_requested_before,
+                    widget.newer_requested_after
+                ),
+                (None, None),
+                "and drops the markers, whose pages died with the generation they were sent to"
+            );
+        });
+    }
+
+    /// A chart with no anchor is following the newest candle even when the series
+    /// still believes it left the live edge, and the page it asks for must keep that
+    /// candle.
+    ///
+    /// The two questions are not the same one. The guard asks whether the chart still
+    /// *has* a live edge to lose — here it does not, the series left it when a page
+    /// evicted the newest candle earlier — so the request is allowed out with the
+    /// buffer full. The policy asks whether the newest candle is on screen, and with
+    /// no anchor it is: the visible range ends at the last candle the buffer holds.
+    /// Reading the guard's own expression into the policy would evict exactly the
+    /// candle this chart is looking at, which is the defect the policy exists to
+    /// prevent.
+    #[gpui_kit::test]
+    fn a_chart_without_an_anchor_should_keep_the_newest_candle_even_off_the_live_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = panned_snapshot();
+        assert!(
+            !snapshot.at_live_edge(),
+            "the fixture's series has to be off the live edge for this case"
+        );
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                widget.viewport.right_timestamp = None;
+                // With no anchor the window ends at the newest candle, so reaching the
+                // left margin at all means the whole buffer is on screen: 1500 candles
+                // at the narrowest width, which takes a body this wide.
+                let layout = layout_of_width(7000.0);
+                let range =
+                    visible_range(snapshot.candles(), widget.viewport, layout.maximum_plot_width());
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the window starts inside the left margin"
+                );
+                assert_eq!(
+                    range.end,
+                    snapshot.candles().len(),
+                    "and it ends at the newest candle the buffer holds, which is therefore on screen"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(
+                    widget.fetching_history,
+                    "the series left the live edge, so the guard lets this request out"
+                );
+                assert_eq!(
+                    widget.prefetched_history_newest,
+                    Some(NewestCandle::Kept),
+                    "the newest candle is on screen, so the page may not evict it"
                 );
             });
         });
@@ -6364,11 +7323,9 @@ pub(crate) mod tests {
 
     /// A chart that has panned into its first page is still at the live edge as
     /// far as the series is concerned: `merge_initial` sets `at_live_edge`, and
-    /// only a history page that actually evicts the newest candle clears it. The
-    /// viewport is what shows the user is reading history, so this must ask for
-    /// the page it needs — reading only `at_live_edge` would make the first
-    /// history page impossible to ask for: the request is what would take the
-    /// series off the live edge.
+    /// only a history page that actually evicts the newest candle clears it. What
+    /// says the user is reading history is the viewport's anchor, so this asks for
+    /// the page its window needs even though the series has not left the live edge.
     #[gpui_kit::test]
     fn a_panned_chart_on_a_live_edge_series_should_still_ask_for_history(cx: &mut TestAppContext) {
         let built = widget(cx);
@@ -6427,7 +7384,7 @@ pub(crate) mod tests {
         let snapshot = panned_snapshot();
         assert!(
             !snapshot.at_live_edge(),
-            "warmup is only fetched for a historical window (design §7.4.2)"
+            "the warmup fixture is a wheeled-away window, which is where its margin is measurable"
         );
 
         cx.update(|cx| {
@@ -6527,6 +7484,88 @@ pub(crate) mod tests {
                 assert!(
                     !widget.fetching_history,
                     "the left margin is far from this window"
+                );
+            });
+        });
+    }
+
+    /// A page already in flight owns the binding's single RPC slot, so the other
+    /// direction waits instead of replacing it.
+    ///
+    /// `WidgetBinding::call` keeps one task and replaces whatever was pending in it.
+    /// A `FetchNewer` sent while a `FetchHistory` is out therefore cancels the
+    /// history call, and the stream either drops that command without settling it or
+    /// loses it with the cancellation — either way the History flag is never
+    /// cleared, and the left direction stays dead for the life of the stream, the
+    /// widened pane included. Both branches are gated on the other's flag; this
+    /// window is wide enough that both would want out at once.
+    #[gpui_kit::test]
+    fn a_page_in_flight_should_not_be_replaced_by_the_other_direction(cx: &mut TestAppContext) {
+        let built = widget(cx);
+        let widget = built.widget;
+        let snapshot = panned_snapshot();
+
+        cx.update(|cx| {
+            accept_snapshot(&widget, snapshot.clone(), cx);
+            let key = widget
+                .read(cx)
+                .current_key()
+                .expect("the test config follows a listing");
+            widget.update(cx, |widget, context| {
+                widget.viewport.candle_width = MIN_CANDLE_WIDTH;
+                // Anchored deep in the buffer and wide enough to show all of it: the
+                // window reaches the left margin and the right end at the same time.
+                widget.viewport.right_timestamp = Some(1400);
+                let layout = layout_of_width(12_000.0);
+                let range = visible_range(
+                    snapshot.candles(),
+                    widget.viewport,
+                    layout.maximum_plot_width(),
+                );
+                assert!(
+                    range.start <= PREFETCH_MARGIN,
+                    "the history branch has a page to ask for"
+                );
+                assert!(
+                    range.end.saturating_add(PREFETCH_MARGIN) >= snapshot.candles().len(),
+                    "and the newer branch has one too, which is what this test needs"
+                );
+                assert!(
+                    !snapshot.at_live_edge(),
+                    "a newer page exists, so the series is not at the live edge"
+                );
+                *widget.chart_layout.borrow_mut() = Some(Rc::new(layout));
+                widget.status.report(WidgetState::Ready, context);
+
+                widget.prefetch_if_needed(context);
+
+                assert!(widget.fetching_history, "the history branch answered first");
+                assert!(
+                    !widget.fetching_newer,
+                    "and its page is the only request out"
+                );
+                assert_eq!(
+                    widget.prefetched_history_newest,
+                    Some(NewestCandle::Evicted),
+                    "the anchored viewport may give up the candle it is not showing"
+                );
+
+                // Every snapshot and every relayout runs the prefetch again; this is
+                // the second run while the history page is still in flight.
+                widget.apply_latest(
+                    key,
+                    Arc::new(CandlestickStreamMessage::Snapshot(snapshot)),
+                    context,
+                );
+
+                assert_eq!(
+                    (widget.fetching_history, widget.fetching_newer),
+                    (true, false),
+                    "the newer page must not replace the history request that is out"
+                );
+                assert_eq!(
+                    widget.history_requests, 1,
+                    "and the history request is still the one that was sent"
                 );
             });
         });
