@@ -4,6 +4,7 @@ pub mod assets;
 pub mod badge;
 pub mod brand;
 pub mod button;
+pub mod color_picker;
 pub mod deque_sized_list;
 pub mod deque_unsized_list;
 pub mod dialog;
