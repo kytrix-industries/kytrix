@@ -18,7 +18,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
     Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Disableable, div,
-    hsla, prelude::FluentBuilder, px, rgba,
+    hsla, prelude::FluentBuilder, px,
 };
 use i18n::t;
 
@@ -302,7 +302,7 @@ fn line_row(
         ))
         .size(px(SWATCH_SIZE))
         .rounded_sm()
-        .bg(Hsla::from(rgba(u32::from_be_bytes(line.color))))
+        .bg(Hsla::from(line.color))
         .aria_label(color.clone());
     let delete_panel = panel.clone();
 

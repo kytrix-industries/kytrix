@@ -6,8 +6,13 @@
 //! different catalogue — so [`CandlestickIndicatorConfig::normalize`] restores
 //! the invariants the type documents.
 
-use gpui_kit::{Rgba, hsla};
-use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
+
+use gpui_kit::{Hsla, hsla};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+};
 
 use super::{
     INDICATOR_CATALOG, IndicatorId, IndicatorPane, SettingKey, default_line_color, definition_of,
@@ -24,26 +29,130 @@ pub(crate) const PERIOD_MIN: u32 = 1;
 /// The largest period a setting may take.
 pub(crate) const PERIOD_MAX: u32 = 500;
 
+/// One indicator line's colour, as the four HSLA components.
+///
+/// Stored as `f32` rather than eight-bit sRGB so a colour the picker chose round-trips exactly.
+/// Every component is a fraction in `0..=1`; a value read from disk is normalized into that range.
+///
+/// The stored shape is a map with named components. A legacy `[u8; 4]` sRGB array
+/// must not decode: serde's derived struct deserializer would accept a sequence
+/// and read the bytes as four fractions, which is why [`Deserialize`] is
+/// implemented by hand below.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct LineColor {
+    pub h: f32,
+    pub s: f32,
+    pub l: f32,
+    pub a: f32,
+}
+
+impl From<Hsla> for LineColor {
+    fn from(color: Hsla) -> Self {
+        Self {
+            h: color.h,
+            s: color.s,
+            l: color.l,
+            a: color.a,
+        }
+    }
+}
+
+impl From<LineColor> for Hsla {
+    fn from(color: LineColor) -> Self {
+        hsla(color.h, color.s, color.l, color.a)
+    }
+}
+
+impl<'de> Deserialize<'de> for LineColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// The map shape, reached only through a [`MapAccess`].
+        ///
+        /// A derive on [`LineColor`] itself would also accept a sequence — serde
+        /// structs do — and would read the components of a legacy `[u8; 4]` sRGB
+        /// array as four fractions instead of rejecting the old format.
+        #[derive(Deserialize)]
+        struct LineColorMap {
+            h: f32,
+            s: f32,
+            l: f32,
+            a: f32,
+        }
+
+        struct LineColorVisitor;
+
+        impl<'de> Visitor<'de> for LineColorVisitor {
+            type Value = LineColor;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map with `h`, `s`, `l` and `a` components")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<LineColor, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let map = LineColorMap::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(LineColor {
+                    h: map.h,
+                    s: map.s,
+                    l: map.l,
+                    a: map.a,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(LineColorVisitor)
+    }
+}
+
+impl LineColor {
+    /// This colour with every component restored to its documented range.
+    ///
+    /// A value from disk is untrusted. A non-finite component cannot be compared
+    /// meaningfully (equality would poison the panel's "is this a change?" check)
+    /// or painted, so it replaces the whole colour with `fallback`. A finite hue
+    /// outside `0..=1` is the same colour wrapped around the wheel; saturation,
+    /// lightness and alpha are clamped, because their scale has no wrap.
+    pub(crate) fn normalized(self, fallback: Self) -> Self {
+        if ![self.h, self.s, self.l, self.a]
+            .iter()
+            .all(|component| component.is_finite())
+        {
+            return fallback;
+        }
+        Self {
+            h: if (0.0..=1.0).contains(&self.h) {
+                self.h
+            } else {
+                self.h.rem_euclid(1.0)
+            },
+            s: self.s.clamp(0.0, 1.0),
+            l: self.l.clamp(0.0, 1.0),
+            a: self.a.clamp(0.0, 1.0),
+        }
+    }
+}
+
 /// One indicator line's settings.
 ///
-/// `color` stores sRGB rather than `Hsla`: `Hsla` is not a serde type, and sRGB
-/// reads back under either appearance; the painter converts it when drawing.
-///
-/// Where the colour comes from depends on where the line came from (design
-/// §10.2): a default line uses one of the fixed `DEFAULT_LINE_COLORS`, a line
-/// the user added gets one random colour at creation time and keeps it from then
-/// on. This is the recorded temporary deviation, not an oversight.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `color` is the line's own stored colour, never a theme lookup: a default line
+/// starts from [`super::default_line_color`], a line the user adds takes a
+/// snapshot of the appearance's chart-series palette at that moment, and the
+/// stored colour does not follow the theme afterwards.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IndicatorLineConfig {
     pub period: u32,
-    pub color: [u8; 4],
+    pub color: LineColor,
 }
 
 /// A dynamic list of lines.
 ///
 /// `rows` is never empty: the delete button is disabled on the last row, and
 /// both construction and decoding guarantee it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LineListConfig {
     pub rows: Vec<IndicatorLineConfig>,
 }
@@ -55,7 +164,7 @@ pub(crate) struct LineListConfig {
 ///
 /// Every field is renamed explicitly: the workspace forbids
 /// `#[serde(rename_all)]`, so the names are written out rather than inferred.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub(crate) enum IndicatorSettings {
     #[serde(rename = "none")]
@@ -74,6 +183,10 @@ pub(crate) enum IndicatorSettings {
         dif: bool,
         #[serde(rename = "dea")]
         dea: bool,
+        #[serde(rename = "dif_color")]
+        dif_color: LineColor,
+        #[serde(rename = "dea_color")]
+        dea_color: LineColor,
     },
     #[serde(rename = "kdj")]
     Kdj {
@@ -89,11 +202,17 @@ pub(crate) enum IndicatorSettings {
         d: bool,
         #[serde(rename = "j")]
         j: bool,
+        #[serde(rename = "k_color")]
+        k_color: LineColor,
+        #[serde(rename = "d_color")]
+        d_color: LineColor,
+        #[serde(rename = "j_color")]
+        j_color: LineColor,
     },
 }
 
 /// One indicator's entry in a configuration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IndicatorEntry {
     pub id: IndicatorId,
     pub enabled: bool,
@@ -107,8 +226,9 @@ pub(crate) struct IndicatorEntry {
 ///    missing entry;
 /// 2. every `settings` has the shape the indicator's catalogue rows edit;
 /// 3. every `Lines.rows` is non-empty;
-/// 4. every period is within [`PERIOD_MIN`]`..=`[`PERIOD_MAX`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// 4. every period is within [`PERIOD_MIN`]`..=`[`PERIOD_MAX`];
+/// 5. every colour is finite and its components are inside `0..=1`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CandlestickIndicatorConfig {
     /// One entry per indicator, in catalogue order. The panel's open state is
     /// not part of it: the design keeps that out of persistence.
@@ -122,8 +242,8 @@ impl CandlestickIndicatorConfig {
     /// [`normalize_indicator`]); decoding alone would hand back whatever the
     /// payload said.
     ///
-    /// The six rules run in the design's order. Rules 1–3 are one scan of the
-    /// catalogue, rules 4–6 are per entry.
+    /// The seven rules run in the design's order. Rules 1–3 are one scan of the
+    /// catalogue, rules 4–7 are per entry.
     pub(crate) fn normalize(self) -> Self {
         // Rules 1–3: the catalogue is both the order and the set. Looking every
         // id up in the configured entries reorders them and fills in the missing
@@ -220,11 +340,22 @@ impl CandlestickIndicatorConfig {
     /// Appends a line to `id`'s list.
     ///
     /// The period is the indicator's own default, so a new line starts somewhere
-    /// the user recognizes rather than at an arbitrary value; the colour is the
-    /// random one the design gives a line the user asked for (design §10.2).
+    /// the user recognizes rather than at an arbitrary value. The new line's
+    /// colour is `palette[lines.rows.len() % palette.len()]`: `palette` is the
+    /// current appearance's chart-series palette, which the panel reads from the
+    /// theme and passes in. The chosen colour is stored as a snapshot rather than
+    /// looked up from the theme later.
+    ///
     /// Returns whether the line was added: only a line-list setting has room for
     /// one.
-    pub(crate) fn add_line(&mut self, id: IndicatorId) -> bool {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `palette` is empty: the panel always passes the current
+    /// appearance's non-empty palette, and a line added without one would have no
+    /// colour to store.
+    pub(crate) fn add_line(&mut self, id: IndicatorId, palette: &[Hsla]) -> bool {
+        debug_assert!(!palette.is_empty());
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
@@ -233,7 +364,7 @@ impl CandlestickIndicatorConfig {
         };
         lines.rows.push(IndicatorLineConfig {
             period: default_line_period(id),
-            color: random_line_color(),
+            color: LineColor::from(palette[lines.rows.len() % palette.len()]),
         });
         true
     }
@@ -374,7 +505,7 @@ impl IndicatorSettings {
         true
     }
 
-    /// Rules 4–6 of [`CandlestickIndicatorConfig::normalize`], in order.
+    /// Rules 4–7 of [`CandlestickIndicatorConfig::normalize`], in order.
     fn normalized(mut self, id: IndicatorId) -> Self {
         // Rule 4: the value's shape must be the one the catalogue declares for
         // this indicator; anything else is replaced by the whole default value.
@@ -382,8 +513,7 @@ impl IndicatorSettings {
             return (definition_of(id).default_settings)();
         }
         // Rule 5: a line list never stays empty. The replacement row takes the
-        // indicator's default period and the first fixed colour — repairing a
-        // configuration never invents a random colour (design §10.2).
+        // indicator's default period and the first fixed colour.
         if let Self::Lines(lines) = &mut self
             && lines.rows.is_empty()
         {
@@ -395,6 +525,9 @@ impl IndicatorSettings {
         // Rule 6: out-of-range periods are clamped per item; the settings value
         // is not reset wholesale.
         self.clamp_periods();
+        // Rule 7: every colour is normalized against the fixed colour of its own
+        // slot, so a bad component never poisons equality or painting.
+        self.normalize_colors();
         self
     }
 
@@ -425,6 +558,35 @@ impl IndicatorSettings {
                 *period = (*period).clamp(PERIOD_MIN, PERIOD_MAX);
                 *smoothing_1 = (*smoothing_1).clamp(PERIOD_MIN, PERIOD_MAX);
                 *smoothing_2 = (*smoothing_2).clamp(PERIOD_MIN, PERIOD_MAX);
+            }
+        }
+    }
+
+    fn normalize_colors(&mut self) {
+        match self {
+            Self::None => {}
+            Self::Lines(lines) => {
+                for (index, row) in lines.rows.iter_mut().enumerate() {
+                    row.color = row.color.normalized(default_line_color(index));
+                }
+            }
+            Self::Macd {
+                dif_color,
+                dea_color,
+                ..
+            } => {
+                *dif_color = dif_color.normalized(default_line_color(0));
+                *dea_color = dea_color.normalized(default_line_color(1));
+            }
+            Self::Kdj {
+                k_color,
+                d_color,
+                j_color,
+                ..
+            } => {
+                *k_color = k_color.normalized(default_line_color(0));
+                *d_color = d_color.normalized(default_line_color(1));
+                *j_color = j_color.normalized(default_line_color(2));
             }
         }
     }
@@ -546,25 +708,4 @@ fn default_line_period(id: IndicatorId) -> u32 {
         .first()
         .expect("every catalogue line list has a default line")
         .period
-}
-
-/// A colour for a line the user just added.
-///
-/// This is the temporary measure the design's §10.2 records: a line the user adds
-/// gets a random colour instead of a theme role, and that colour is stored from
-/// then on. Only the *new* line is unpredictable, which is why the defaults are
-/// fixed constants instead.
-fn random_line_color() -> [u8; 4] {
-    let hue = rand::random_range(0.0_f32..1.0);
-    // Saturation and lightness are clamped to a readable band; the magnitudes
-    // follow the contrast the theme asks of `chart.series[n]` (`roles.rs:556-573`).
-    let saturation = rand::random_range(0.45_f32..=0.75);
-    let lightness = rand::random_range(0.45_f32..=0.70);
-    let rgba = Rgba::from(hsla(hue, saturation, lightness, 1.0));
-    [
-        (rgba.r * 255.0).round() as u8,
-        (rgba.g * 255.0).round() as u8,
-        (rgba.b * 255.0).round() as u8,
-        (rgba.a * 255.0).round() as u8,
-    ]
 }

@@ -11,12 +11,12 @@
 //! [`IndicatorLine`]'s display threshold feeds the history prefetch, so the two
 //! cannot disagree.
 
-use gpui_kit::{Hsla, rgba};
+use gpui_kit::Hsla;
 use smol_str::{SmolStr, format_smolstr};
 
 use super::{
     CandlestickIndicatorConfig, IndicatorEntry, IndicatorId, IndicatorLineConfig,
-    IndicatorSettings, default_line_color, line_depth, settings_depth,
+    IndicatorSettings, LineColor, default_line_color, line_depth, settings_depth,
 };
 
 /// The prices of one candle that the computations read.
@@ -135,6 +135,8 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
                 signal_period,
                 dif,
                 dea,
+                dif_color,
+                dea_color,
             },
         ) => Some(macd_series(
             inputs,
@@ -143,6 +145,8 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             *signal_period,
             *dif,
             *dea,
+            *dif_color,
+            *dea_color,
             settings_depth(entry.id, &entry.settings),
         )),
         (
@@ -154,6 +158,9 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
                 k,
                 d,
                 j,
+                k_color,
+                d_color,
+                j_color,
             },
         ) => Some(kdj_series(
             inputs,
@@ -163,6 +170,9 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             *k,
             *d,
             *j,
+            *k_color,
+            *d_color,
+            *j_color,
             settings_depth(entry.id, &entry.settings),
         )),
         // VOL has no computed line, and a settings value of the wrong shape
@@ -196,7 +206,7 @@ fn lines_series(
         let label = format_smolstr!("{}{}", series.legend, row.period);
         series.lines.push(IndicatorLine {
             label,
-            color: line_color(row.color),
+            color: Hsla::from(row.color),
             values: formula(inputs, row.period),
             readable_from: line_depth(id, row.period),
             shape: LineShape::Line,
@@ -212,6 +222,8 @@ fn macd_series(
     signal_period: u32,
     draw_dif: bool,
     draw_dea: bool,
+    dif_color: LineColor,
+    dea_color: LineColor,
     readable_from: usize,
 ) -> IndicatorSeries {
     let closes: Vec<f64> = inputs.iter().map(|input| input.close).collect();
@@ -235,7 +247,7 @@ fn macd_series(
     if draw_dif {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("DIF"),
-            color: line_color(default_line_color(0)),
+            color: Hsla::from(dif_color),
             values: dif.into_iter().map(Some).collect(),
             readable_from,
             shape: LineShape::Line,
@@ -244,7 +256,7 @@ fn macd_series(
     if draw_dea {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("DEA"),
-            color: line_color(default_line_color(1)),
+            color: Hsla::from(dea_color),
             values: dea.into_iter().map(Some).collect(),
             readable_from,
             shape: LineShape::Line,
@@ -252,7 +264,7 @@ fn macd_series(
     }
     lines.push(IndicatorLine {
         label: SmolStr::new_static("MACD"),
-        color: line_color(default_line_color(2)),
+        color: Hsla::from(default_line_color(2)),
         values: histogram,
         readable_from,
         shape: LineShape::Histogram,
@@ -274,6 +286,9 @@ fn kdj_series(
     draw_k: bool,
     draw_d: bool,
     draw_j: bool,
+    k_color: LineColor,
+    d_color: LineColor,
+    j_color: LineColor,
     readable_from: usize,
 ) -> IndicatorSeries {
     let (k, d, j) = kdj(inputs, period, smoothing_1, smoothing_2);
@@ -282,7 +297,7 @@ fn kdj_series(
     if draw_k {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("K"),
-            color: line_color(default_line_color(0)),
+            color: Hsla::from(k_color),
             values: k,
             readable_from,
             shape: LineShape::Line,
@@ -291,7 +306,7 @@ fn kdj_series(
     if draw_d {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("D"),
-            color: line_color(default_line_color(1)),
+            color: Hsla::from(d_color),
             values: d,
             readable_from,
             shape: LineShape::Line,
@@ -300,7 +315,7 @@ fn kdj_series(
     if draw_j {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("J"),
-            color: line_color(default_line_color(2)),
+            color: Hsla::from(j_color),
             values: j,
             readable_from,
             shape: LineShape::Line,
@@ -313,10 +328,6 @@ fn kdj_series(
         lines,
         guides: vec![20.0, 80.0],
     }
-}
-
-fn line_color(color: [u8; 4]) -> Hsla {
-    Hsla::from(rgba(u32::from_be_bytes(color)))
 }
 
 /// Simple moving average over the closes, with a sliding sum.

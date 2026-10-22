@@ -173,7 +173,8 @@ impl IndicatorPanel {
         let Some(mut next) = self.indicator_config(cx) else {
             return;
         };
-        if next.add_line(id) {
+        let palette = cx.theme().components.chart.series.map(|color| color.hsla);
+        if next.add_line(id, &palette) {
             self.write(next, cx);
         }
     }

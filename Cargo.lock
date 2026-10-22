@@ -1287,7 +1287,6 @@ dependencies = [
  "market_participants_connector",
  "market_participants_model",
  "network",
- "rand 0.10.2",
  "serde",
  "serde_json",
  "smallvec",

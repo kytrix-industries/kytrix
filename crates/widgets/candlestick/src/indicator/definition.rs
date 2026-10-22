@@ -6,10 +6,11 @@
 //! completed with. Everything here is `const` data — no `OnceLock`, no runtime
 //! lookup table — so a lookup is an array scan over six entries.
 
+use gpui_kit::{Hsla, rgba};
 use serde::{Deserialize, Serialize};
 
 use super::config::{
-    IndicatorLineConfig, IndicatorSettings, LineListConfig, PERIOD_MAX, PERIOD_MIN,
+    IndicatorLineConfig, IndicatorSettings, LineColor, LineListConfig, PERIOD_MAX, PERIOD_MIN,
 };
 
 /// An indicator's identity in the catalogue.
@@ -142,31 +143,35 @@ fn lines_from(periods: &[u32]) -> IndicatorSettings {
             .enumerate()
             .map(|(index, period)| IndicatorLineConfig {
                 period: *period,
-                // The default colour is a fixed constant, not a random one and
-                // not one read from the theme: `Default::default()` must be
-                // idempotent, otherwise the configuration's envelope changes on
-                // every start. Randomness only happens when the user adds a line
-                // — see the design's §10.2.
+                // A fixed snapshot, not a theme lookup and not a random colour:
+                // `Default::default()` must be idempotent, otherwise the
+                // configuration's envelope changes on every start. A line the
+                // user adds later takes the current palette instead — see
+                // `CandlestickIndicatorConfig::add_line`.
                 color: default_line_color(index),
             })
             .collect(),
     })
 }
 
-/// The fixed colours of the default lines.
+/// The fixed colours of the default lines, as big-endian RGBA.
 ///
-/// Deliberately compile-time constants rather than theme roles: `Default` has no
-/// `App` to read a theme from, and `CandlestickConfig::default()` is called
-/// exactly where there is no `cx` (`VersionedWidgetConfig::decode`, tests). This
-/// is the recorded deviation of the design's §10.2, not an oversight.
-pub(crate) const DEFAULT_LINE_COLORS: [[u8; 4]; 3] = [
-    [0xE8, 0xA8, 0x3C, 0xFF],
-    [0x8A, 0x6C, 0xE8, 0xFF],
-    [0x3C, 0xB8, 0xC8, 0xFF],
-];
+/// These are the colours a configuration starts with — the shipped chart's amber,
+/// violet and cyan. A line the user adds takes a snapshot of the current
+/// appearance's chart-series palette instead (see
+/// `CandlestickIndicatorConfig::add_line`), and the stored colour never follows
+/// the theme afterwards.
+///
+/// They are compile-time constants rather than theme roles because `Default` has
+/// no `App` to read a theme from, and `CandlestickConfig::default()` is called
+/// exactly where there is no `cx` (`VersionedWidgetConfig::decode`, tests).
+const DEFAULT_LINE_COLOR_RGBA: [u32; 3] = [0xE8A83CFF, 0x8A6CE8FF, 0x3CB8C8FF];
 
-pub(crate) fn default_line_color(index: usize) -> [u8; 4] {
-    DEFAULT_LINE_COLORS[index % DEFAULT_LINE_COLORS.len()]
+/// The default colour of the line at `index`, cycling through the three fixed
+/// colours.
+pub(crate) fn default_line_color(index: usize) -> LineColor {
+    let color = rgba(DEFAULT_LINE_COLOR_RGBA[index % DEFAULT_LINE_COLOR_RGBA.len()]);
+    LineColor::from(Hsla::from(color))
 }
 
 fn ma_default_settings() -> IndicatorSettings {
@@ -188,6 +193,8 @@ fn macd_default_settings() -> IndicatorSettings {
         signal_period: 9,
         dif: true,
         dea: true,
+        dif_color: default_line_color(0),
+        dea_color: default_line_color(1),
     }
 }
 
@@ -203,6 +210,9 @@ fn kdj_default_settings() -> IndicatorSettings {
         k: true,
         d: true,
         j: true,
+        k_color: default_line_color(0),
+        d_color: default_line_color(1),
+        j_color: default_line_color(2),
     }
 }
 

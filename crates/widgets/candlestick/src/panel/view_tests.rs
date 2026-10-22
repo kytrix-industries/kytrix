@@ -5,7 +5,10 @@
 //! elements it draws, the fields it holds, and the configuration it writes back
 //! through the widget.
 
-use base_ui::input::{InputState, InputStateEvent};
+use base_ui::{
+    input::{InputState, InputStateEvent},
+    style::theme::ThemeExt,
+};
 use gpui_kit::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
     TestAppContext, VisualTestContext, Window, div,
@@ -13,7 +16,9 @@ use gpui_kit::{
 
 use super::{inputs, rows, view::IndicatorPanel};
 use crate::{
-    indicator::{INDICATOR_CATALOG, IndicatorId, SettingControl, SettingKey, definition_of},
+    indicator::{
+        INDICATOR_CATALOG, IndicatorId, LineColor, SettingControl, SettingKey, definition_of,
+    },
     view::{
         CandlestickWidget,
         tests::{WidgetUnderTest, press, widget},
@@ -92,6 +97,24 @@ fn ma_periods(window: &VisualTestContext, widget: &Entity<CandlestickWidget>) ->
             .iter()
             .map(|line| line.period)
             .collect()
+    })
+}
+
+/// The colour of MA's last line in the widget's configuration.
+fn last_ma_color(window: &VisualTestContext, widget: &Entity<CandlestickWidget>) -> LineColor {
+    window.read(|cx| {
+        widget
+            .read(cx)
+            .indicator_config()
+            .entry(IndicatorId::Ma)
+            .expect("the catalogue always has MA")
+            .settings
+            .lines()
+            .expect("MA is a line list")
+            .rows
+            .last()
+            .expect("the button added a line")
+            .color
     })
 }
 
@@ -216,6 +239,27 @@ fn adding_a_line_should_grow_the_list_below_the_last_one(cx: &mut TestAppContext
         built.reports(),
         before_reports + 1,
         "adding a line is written back exactly once"
+    );
+
+    // The palette is read from the theme the harness installed, not hardcoded:
+    // MA had three rows, so the fourth takes the palette's index 3.
+    let expected_color =
+        window.read(|cx| LineColor::from(cx.theme().components.chart.series[3].hsla));
+    let added_color = last_ma_color(window, &built.widget);
+    assert_eq!(
+        added_color, expected_color,
+        "a new line snapshots the next colour of the current appearance's palette"
+    );
+
+    // MA now has four rows, so the next addition takes index 4: the palette is
+    // the six distinct theme colours, not the first one repeated.
+    press(window, "TEST_PANEL_ADD_LINE");
+    let expected_next =
+        window.read(|cx| LineColor::from(cx.theme().components.chart.series[4].hsla));
+    let added_next = last_ma_color(window, &built.widget);
+    assert_eq!(
+        added_next, expected_next,
+        "each addition advances through the palette, not to one fixed colour"
     );
 
     let list = window

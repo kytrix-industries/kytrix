@@ -1,9 +1,11 @@
 //! Tests for the indicator configuration and its normalization.
 
+use gpui_kit::{Hsla, Rgba, hsla};
+
 use super::{
     config::{
         CandlestickIndicatorConfig, IndicatorEntry, IndicatorLineConfig, IndicatorSettings,
-        LineListConfig, enabled_sub_plot_ids, expected_shape,
+        LineColor, LineListConfig, enabled_sub_plot_ids, expected_shape,
     },
     definition::{INDICATOR_CATALOG, IndicatorId, default_line_color},
 };
@@ -20,6 +22,59 @@ fn lines(periods: &[u32]) -> IndicatorSettings {
             })
             .collect(),
     })
+}
+
+/// The line list `id` holds, which every line-list indicator must.
+fn line_list_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> &LineListConfig {
+    entry_of(config, id)
+        .settings
+        .lines()
+        .unwrap_or_else(|| panic!("{id:?} holds a line list"))
+}
+
+/// The eight-bit sRGB bytes `color` quantizes to.
+///
+/// The old format stored exactly these bytes, so this is how the fixed defaults
+/// are compared with the colours the design recorded.
+fn srgba_bytes(color: LineColor) -> [u8; 4] {
+    let color = Rgba::from(Hsla::from(color));
+    [
+        (color.r * 255.0).round() as u8,
+        (color.g * 255.0).round() as u8,
+        (color.b * 255.0).round() as u8,
+        (color.a * 255.0).round() as u8,
+    ]
+}
+
+/// Six clearly distinct colours, deliberately not the theme's six.
+fn synthetic_palette() -> [Hsla; 6] {
+    [
+        hsla(0.0, 0.2, 0.3, 1.0),
+        hsla(0.1, 0.3, 0.4, 0.9),
+        hsla(0.2, 0.4, 0.5, 0.8),
+        hsla(0.3, 0.5, 0.6, 0.7),
+        hsla(0.4, 0.6, 0.7, 0.6),
+        hsla(0.5, 0.7, 0.8, 0.5),
+    ]
+}
+
+/// Every colour `settings` stores.
+fn colors(settings: &IndicatorSettings) -> Vec<LineColor> {
+    match settings {
+        IndicatorSettings::None => Vec::new(),
+        IndicatorSettings::Lines(lines) => lines.rows.iter().map(|row| row.color).collect(),
+        IndicatorSettings::Macd {
+            dif_color,
+            dea_color,
+            ..
+        } => vec![*dif_color, *dea_color],
+        IndicatorSettings::Kdj {
+            k_color,
+            d_color,
+            j_color,
+            ..
+        } => vec![*k_color, *d_color, *j_color],
+    }
 }
 
 fn entry(id: IndicatorId, enabled: bool, settings: IndicatorSettings) -> IndicatorEntry {
@@ -57,7 +112,7 @@ fn periods(settings: &IndicatorSettings) -> Vec<u32> {
     }
 }
 
-// ① The default configuration holds all four invariants of its type.
+// ① The default configuration holds all five invariants of its type.
 #[test]
 fn the_default_configuration_should_satisfy_every_invariant() {
     let config = CandlestickIndicatorConfig::default();
@@ -89,6 +144,15 @@ fn the_default_configuration_should_satisfy_every_invariant() {
                 definition.id
             );
         }
+        assert!(
+            colors(&entry.settings).iter().all(|color| {
+                [color.h, color.s, color.l, color.a]
+                    .iter()
+                    .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+            }),
+            "{:?} defaults to a colour outside 0..=1",
+            definition.id
+        );
     }
 }
 
@@ -122,6 +186,8 @@ fn normalize_should_fill_reorder_dedupe_and_clamp() {
                     signal_period: 501,
                     dif: false,
                     dea: true,
+                    dif_color: default_line_color(0),
+                    dea_color: default_line_color(1),
                 },
             ),
             entry(
@@ -134,6 +200,9 @@ fn normalize_should_fill_reorder_dedupe_and_clamp() {
                     k: false,
                     d: false,
                     j: false,
+                    k_color: default_line_color(0),
+                    d_color: default_line_color(1),
+                    j_color: default_line_color(2),
                 },
             ),
         ],
@@ -275,7 +344,10 @@ fn decoding_a_configuration_should_normalize_the_indicator_field() {
                 "enabled": false,
                 "settings": {
                     "kind": "lines",
-                    "rows": [{"period": 7, "color": [1, 2, 3, 255]}]
+                    "rows": [{
+                        "period": 7,
+                        "color": {"h": 0.1, "s": 0.5, "l": 0.5, "a": 1.0}
+                    }]
                 }
             }]
         }
@@ -327,6 +399,8 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
                 signal_period: 9,
                 dif: true,
                 dea: true,
+                dif_color: default_line_color(0),
+                dea_color: default_line_color(1),
             },
             IndicatorId::Macd,
             25,
@@ -340,6 +414,8 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
                 signal_period: 9,
                 dif: true,
                 dea: true,
+                dif_color: default_line_color(0),
+                dea_color: default_line_color(1),
             },
             IndicatorId::Macd,
             29,
@@ -353,6 +429,9 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
                 k: true,
                 d: true,
                 j: true,
+                k_color: default_line_color(0),
+                d_color: default_line_color(1),
+                j_color: default_line_color(2),
             },
             IndicatorId::Kdj,
             12,
@@ -429,5 +508,390 @@ fn enabled_sub_plot_ids_should_keep_the_catalogue_order_when_several_are_on() {
         enabled_sub_plot_ids(&without_volume),
         [IndicatorId::Macd],
         "the disabled VOL must not occupy the first sub plot"
+    );
+}
+
+#[test]
+fn the_default_line_colours_should_be_the_shipped_amber_violet_and_cyan() {
+    assert_eq!(srgba_bytes(default_line_color(0)), [0xE8, 0xA8, 0x3C, 0xFF]);
+    assert_eq!(srgba_bytes(default_line_color(1)), [0x8A, 0x6C, 0xE8, 0xFF]);
+    assert_eq!(srgba_bytes(default_line_color(2)), [0x3C, 0xB8, 0xC8, 0xFF]);
+    assert_eq!(
+        default_line_color(3),
+        default_line_color(0),
+        "the three fixed colours cycle"
+    );
+}
+
+#[test]
+fn adding_a_line_should_take_the_next_palette_colour() {
+    let palette = synthetic_palette();
+    let mut config = CandlestickIndicatorConfig::default();
+
+    // MA starts with three rows and EMA with one; the next colour is the row
+    // count modulo the palette length.
+    assert!(config.add_line(IndicatorId::Ma, &palette));
+    assert!(config.add_line(IndicatorId::Ema, &palette));
+    assert!(config.add_line(IndicatorId::Ma, &palette));
+    assert!(config.add_line(IndicatorId::Ma, &palette));
+    assert!(config.add_line(IndicatorId::Ma, &palette));
+
+    let ma = line_list_of(&config, IndicatorId::Ma);
+    assert_eq!(ma.rows.len(), 7);
+    assert_eq!(ma.rows[3].color, LineColor::from(palette[3]));
+    assert_eq!(
+        ma.rows[4].color,
+        LineColor::from(palette[4]),
+        "a second addition takes the colour after the first"
+    );
+    assert_eq!(ma.rows[5].color, LineColor::from(palette[5]));
+    assert_eq!(
+        ma.rows[6].color,
+        LineColor::from(palette[0]),
+        "the palette wraps after its last colour"
+    );
+    assert_eq!(
+        periods(&entry_of(&config, IndicatorId::Ma).settings),
+        [5, 10, 20, 5, 5, 5, 5],
+        "a new line starts at MA's own default period"
+    );
+
+    let ema = line_list_of(&config, IndicatorId::Ema);
+    assert_eq!(ema.rows.len(), 2);
+    assert_eq!(ema.rows[1].color, LineColor::from(palette[1]));
+    assert_eq!(
+        periods(&entry_of(&config, IndicatorId::Ema).settings),
+        [12, 12],
+        "a new line starts at EMA's own default period, not MA's"
+    );
+}
+
+#[test]
+fn adding_a_line_should_be_deterministic() {
+    let palette = synthetic_palette();
+    let mut first = CandlestickIndicatorConfig::default();
+    let mut second = CandlestickIndicatorConfig::default();
+
+    first.add_line(IndicatorId::Ma, &palette);
+    second.add_line(IndicatorId::Ma, &palette);
+
+    assert_eq!(
+        first, second,
+        "the same palette produces the same line, with no RNG left"
+    );
+}
+
+#[test]
+fn line_colours_should_normalize_their_components() {
+    let mut config = CandlestickIndicatorConfig::default();
+    let ma = config
+        .entries
+        .iter_mut()
+        .find(|entry| entry.id == IndicatorId::Ma)
+        .expect("the catalogue always has MA");
+    let IndicatorSettings::Lines(lines) = &mut ma.settings else {
+        panic!("MA is a line list");
+    };
+    lines.rows[0].color = LineColor {
+        h: 1.5,
+        s: -0.2,
+        l: 2.0,
+        a: 1.2,
+    };
+    lines.rows[1].color = LineColor {
+        h: f32::NAN,
+        s: 0.5,
+        l: 0.5,
+        a: 1.0,
+    };
+    lines.rows[2].color = LineColor {
+        h: 0.5,
+        s: 0.5,
+        l: 0.5,
+        a: f32::NAN,
+    };
+    let ema = config
+        .entries
+        .iter_mut()
+        .find(|entry| entry.id == IndicatorId::Ema)
+        .expect("the catalogue always has EMA");
+    let IndicatorSettings::Lines(lines) = &mut ema.settings else {
+        panic!("EMA is a line list");
+    };
+    lines.rows[0].color = LineColor {
+        h: 0.25,
+        s: 0.5,
+        l: 0.4,
+        a: 0.75,
+    };
+
+    let normalized = config.normalize();
+    let lines = line_list_of(&normalized, IndicatorId::Ma);
+
+    assert_eq!(
+        lines.rows[0].color,
+        LineColor {
+            h: 0.5,
+            s: 0.0,
+            l: 1.0,
+            a: 1.0,
+        },
+        "a finite hue wraps and the other components clamp"
+    );
+    assert_eq!(
+        lines.rows[1].color,
+        default_line_color(1),
+        "a non-finite hue resets the whole colour to its slot's default"
+    );
+    assert_eq!(
+        lines.rows[2].color,
+        default_line_color(2),
+        "a non-finite alpha also resets the whole colour to its slot's default"
+    );
+    assert_eq!(
+        line_list_of(&normalized, IndicatorId::Ema).rows[0].color,
+        LineColor {
+            h: 0.25,
+            s: 0.5,
+            l: 0.4,
+            a: 0.75,
+        },
+        "a valid colour is kept, alpha included"
+    );
+}
+
+#[test]
+fn macd_and_kdj_colours_should_normalize_with_their_own_fallbacks() {
+    let mut config = CandlestickIndicatorConfig::default();
+    for entry in &mut config.entries {
+        match entry.id {
+            IndicatorId::Macd => {
+                entry.settings = IndicatorSettings::Macd {
+                    short_period: 12,
+                    long_period: 26,
+                    signal_period: 9,
+                    dif: true,
+                    dea: true,
+                    dif_color: LineColor {
+                        h: f32::INFINITY,
+                        s: 0.5,
+                        l: 0.5,
+                        a: 1.0,
+                    },
+                    dea_color: LineColor {
+                        h: -0.25,
+                        s: f32::NAN,
+                        l: 0.5,
+                        a: 1.0,
+                    },
+                };
+            }
+            IndicatorId::Kdj => {
+                entry.settings = IndicatorSettings::Kdj {
+                    period: 9,
+                    smoothing_1: 3,
+                    smoothing_2: 3,
+                    k: true,
+                    d: true,
+                    j: true,
+                    k_color: LineColor {
+                        h: 0.5,
+                        s: 0.5,
+                        l: f32::NAN,
+                        a: 1.0,
+                    },
+                    d_color: LineColor {
+                        h: 0.5,
+                        s: 0.5,
+                        l: 0.5,
+                        a: f32::NAN,
+                    },
+                    j_color: LineColor {
+                        h: f32::NAN,
+                        s: 0.5,
+                        l: 0.5,
+                        a: 1.0,
+                    },
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let normalized = config.normalize();
+
+    let IndicatorSettings::Macd {
+        dif_color,
+        dea_color,
+        ..
+    } = &entry_of(&normalized, IndicatorId::Macd).settings
+    else {
+        panic!("MACD keeps its settings shape");
+    };
+    assert_eq!(*dif_color, default_line_color(0));
+    assert_eq!(
+        *dea_color,
+        default_line_color(1),
+        "DEA falls back to its own slot, not DIF's"
+    );
+
+    let IndicatorSettings::Kdj {
+        k_color,
+        d_color,
+        j_color,
+        ..
+    } = &entry_of(&normalized, IndicatorId::Kdj).settings
+    else {
+        panic!("KDJ keeps its settings shape");
+    };
+    assert_eq!(
+        *k_color,
+        default_line_color(0),
+        "K falls back to its own slot"
+    );
+    assert_eq!(
+        *d_color,
+        default_line_color(1),
+        "D falls back to its own slot"
+    );
+    assert_eq!(
+        *j_color,
+        default_line_color(2),
+        "J falls back to its own slot"
+    );
+}
+
+#[test]
+fn the_legacy_srgb_colour_array_should_not_decode() {
+    assert!(
+        serde_json::from_str::<IndicatorLineConfig>(r#"{"period":5,"color":[1,2,3,255]}"#).is_err(),
+        "the sRGB array shape is gone, so a stored configuration falls back to the defaults"
+    );
+}
+
+#[test]
+fn macd_and_kdj_defaults_should_use_the_fixed_line_colours() {
+    let config = CandlestickIndicatorConfig::default();
+
+    let IndicatorSettings::Macd {
+        dif_color,
+        dea_color,
+        ..
+    } = &entry_of(&config, IndicatorId::Macd).settings
+    else {
+        panic!("MACD's default is a MACD value");
+    };
+    assert_eq!(*dif_color, default_line_color(0));
+    assert_eq!(*dea_color, default_line_color(1));
+
+    let IndicatorSettings::Kdj {
+        k_color,
+        d_color,
+        j_color,
+        ..
+    } = &entry_of(&config, IndicatorId::Kdj).settings
+    else {
+        panic!("KDJ's default is a KDJ value");
+    };
+    assert_eq!(*k_color, default_line_color(0));
+    assert_eq!(*d_color, default_line_color(1));
+    assert_eq!(*j_color, default_line_color(2));
+}
+
+#[test]
+fn line_colour_conversions_should_preserve_alpha() {
+    assert_eq!(
+        LineColor::from(hsla(0.25, 0.5, 0.5, 0.75)),
+        LineColor {
+            h: 0.25,
+            s: 0.5,
+            l: 0.5,
+            a: 0.75,
+        }
+    );
+    assert_eq!(
+        Hsla::from(LineColor {
+            h: 0.25,
+            s: 0.5,
+            l: 0.5,
+            a: 0.75,
+        }),
+        hsla(0.25, 0.5, 0.5, 0.75)
+    );
+}
+
+#[test]
+fn a_persisted_line_colour_should_keep_its_alpha() {
+    let line = IndicatorLineConfig {
+        period: 5,
+        color: LineColor {
+            h: 0.25,
+            s: 0.5,
+            l: 0.4,
+            a: 0.75,
+        },
+    };
+    let encoded = serde_json::to_string(&line).expect("a line colour serializes");
+    let decoded: IndicatorLineConfig =
+        serde_json::from_str(&encoded).expect("the encoded line decodes");
+
+    assert_eq!(decoded, line);
+}
+
+#[test]
+fn a_line_colour_map_should_ignore_unknown_fields() {
+    let decoded: LineColor =
+        serde_json::from_str(r#"{"h":0.25,"s":0.5,"l":0.4,"a":0.75,"extra":1}"#)
+            .expect("an unknown field does not invalidate the colour");
+
+    assert_eq!(
+        decoded,
+        LineColor {
+            h: 0.25,
+            s: 0.5,
+            l: 0.4,
+            a: 0.75,
+        }
+    );
+}
+
+#[test]
+fn a_line_colour_map_should_require_every_component() {
+    assert!(
+        serde_json::from_str::<LineColor>(r#"{"h":0.25,"s":0.5,"l":0.4}"#).is_err(),
+        "a missing alpha must not default"
+    );
+}
+
+#[test]
+fn a_line_colour_map_should_reject_a_duplicate_component() {
+    assert!(
+        serde_json::from_str::<LineColor>(r#"{"h":0.25,"h":0.5,"s":0.5,"l":0.4,"a":0.75}"#)
+            .is_err(),
+        "a duplicate component is ambiguous"
+    );
+}
+
+#[test]
+fn a_stored_configuration_with_the_legacy_colour_array_should_not_decode() {
+    let payload = r#"{
+        "selection": null,
+        "timeframe": "1m",
+        "adjustment": "none",
+        "indicator": {
+            "entries": [{
+                "id": "ma",
+                "enabled": true,
+                "settings": {
+                    "kind": "lines",
+                    "rows": [{"period": 5, "color": [1, 2, 3, 255]}]
+                }
+            }]
+        }
+    }"#;
+
+    assert!(
+        serde_json::from_str::<CandlestickConfig>(payload).is_err(),
+        "an old colour shape fails the whole decode, so the stored configuration resets to defaults"
     );
 }

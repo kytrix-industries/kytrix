@@ -3,10 +3,12 @@
 //! Every expected number below is hand-computed from the design's §7.2
 //! formulas, so a change to a formula fails here rather than on screen.
 
+use gpui_kit::{Hsla, hsla};
+
 use super::{
-    CandlestickIndicatorConfig, IndicatorId, IndicatorInput, IndicatorLine, IndicatorSeries,
-    IndicatorSettings, LineListConfig, LineShape, compute_indicators, default_line_color,
-    line_depth, settings_depth,
+    CandlestickIndicatorConfig, IndicatorId, IndicatorInput, IndicatorLine, IndicatorLineConfig,
+    IndicatorSeries, IndicatorSettings, LineColor, LineListConfig, LineShape, compute_indicators,
+    default_line_color, line_depth, settings_depth,
 };
 
 fn lines(periods: &[u32]) -> IndicatorSettings {
@@ -14,9 +16,21 @@ fn lines(periods: &[u32]) -> IndicatorSettings {
         rows: periods
             .iter()
             .enumerate()
-            .map(|(index, period)| super::IndicatorLineConfig {
+            .map(|(index, period)| IndicatorLineConfig {
                 period: *period,
                 color: default_line_color(index),
+            })
+            .collect(),
+    })
+}
+
+fn lines_with_colors(rows: &[(u32, LineColor)]) -> IndicatorSettings {
+    IndicatorSettings::Lines(LineListConfig {
+        rows: rows
+            .iter()
+            .map(|(period, color)| IndicatorLineConfig {
+                period: *period,
+                color: *color,
             })
             .collect(),
     })
@@ -170,6 +184,8 @@ fn macd_should_use_the_dif_ema_as_its_signal_line() {
             signal_period: 2,
             dif: true,
             dea: true,
+            dif_color: default_line_color(0),
+            dea_color: default_line_color(1),
         },
     );
     let series = compute_indicators(&flat_inputs(&[1.0, 2.0, 3.0]), &config);
@@ -213,6 +229,8 @@ fn macd_should_stay_defined_when_the_short_period_is_longer() {
             signal_period: 3,
             dif: true,
             dea: true,
+            dif_color: default_line_color(0),
+            dea_color: default_line_color(1),
         },
     );
     let normal = config_with(
@@ -223,6 +241,8 @@ fn macd_should_stay_defined_when_the_short_period_is_longer() {
             signal_period: 3,
             dif: true,
             dea: true,
+            dif_color: default_line_color(0),
+            dea_color: default_line_color(1),
         },
     );
     let inputs = flat_inputs(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -259,6 +279,9 @@ fn kdj_should_read_fifty_when_high_equals_low() {
             k: true,
             d: true,
             j: true,
+            k_color: default_line_color(0),
+            d_color: default_line_color(1),
+            j_color: default_line_color(2),
         },
     );
     let series = compute_indicators(&flat_inputs(&[5.0, 5.0, 5.0]), &config);
@@ -282,6 +305,9 @@ fn kdj_should_seed_its_recursion_at_fifty() {
             k: true,
             d: true,
             j: true,
+            k_color: default_line_color(0),
+            d_color: default_line_color(1),
+            j_color: default_line_color(2),
         },
     );
     let series = compute_indicators(&flat_inputs(&[10.0, 11.0, 12.0]), &config);
@@ -311,6 +337,9 @@ fn kdj_should_advance_the_previous_values_only_after_the_first_rsv() {
             k: true,
             d: true,
             j: true,
+            k_color: default_line_color(0),
+            d_color: default_line_color(1),
+            j_color: default_line_color(2),
         },
     );
     let series = compute_indicators(&flat_inputs(&[10.0, 11.0, 12.0, 11.0, 10.0]), &config);
@@ -474,6 +503,8 @@ fn labels_should_name_the_line_and_legend_should_name_the_formula() {
             signal_period: 9,
             dif: true,
             dea: true,
+            dif_color: default_line_color(0),
+            dea_color: default_line_color(1),
         },
     );
     let series = compute_indicators(&flat_inputs(&[1.0; 3]), &config);
@@ -504,6 +535,8 @@ fn macd_switches_should_only_choose_the_dif_and_dea_lines() {
             signal_period: 2,
             dif: false,
             dea: false,
+            dif_color: default_line_color(0),
+            dea_color: default_line_color(1),
         },
     );
     let series = compute_indicators(&flat_inputs(&[1.0, 2.0, 3.0]), &config);
@@ -528,6 +561,9 @@ fn kdj_switches_should_choose_their_lines_one_by_one() {
             k: false,
             d: true,
             j: false,
+            k_color: default_line_color(0),
+            d_color: default_line_color(1),
+            j_color: default_line_color(2),
         },
     );
     let series = compute_indicators(&flat_inputs(&[10.0, 11.0, 12.0]), &config);
@@ -551,6 +587,9 @@ fn kdj_with_every_line_switched_off_should_draw_an_empty_series() {
             k: false,
             d: false,
             j: false,
+            k_color: default_line_color(0),
+            d_color: default_line_color(1),
+            j_color: default_line_color(2),
         },
     );
     let series = compute_indicators(&flat_inputs(&[10.0, 11.0, 12.0]), &config);
@@ -558,4 +597,87 @@ fn kdj_with_every_line_switched_off_should_draw_an_empty_series() {
 
     assert!(series.lines.is_empty());
     assert_eq!(series.legend, "KDJ(3,2,2)");
+}
+
+// Every computed line is painted in the colour its settings store; the MACD
+// histogram is the one line whose colour is not configurable and stays fixed.
+#[test]
+fn computed_lines_should_carry_the_configured_colours() {
+    fn color(h: f32) -> LineColor {
+        LineColor {
+            h,
+            s: 0.5,
+            l: 0.4,
+            a: 0.75,
+        }
+    }
+
+    let (ma_color, ema_color, rsi_color) = (color(0.11), color(0.22), color(0.33));
+    let (dif_color, dea_color) = (color(0.44), color(0.55));
+    let (k_color, d_color, j_color) = (color(0.66), color(0.77), color(0.88));
+
+    let config = config_with(IndicatorId::Ma, lines_with_colors(&[(3, ma_color)]));
+    let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
+    assert_eq!(
+        line_of(series_of(&series, IndicatorId::Ma), "MA3").color,
+        hsla(0.11, 0.5, 0.4, 0.75)
+    );
+
+    let config = config_with(IndicatorId::Ema, lines_with_colors(&[(3, ema_color)]));
+    let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
+    assert_eq!(
+        line_of(series_of(&series, IndicatorId::Ema), "EMA3").color,
+        hsla(0.22, 0.5, 0.4, 0.75)
+    );
+
+    let config = config_with(IndicatorId::Rsi, lines_with_colors(&[(3, rsi_color)]));
+    let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
+    assert_eq!(
+        line_of(series_of(&series, IndicatorId::Rsi), "RSI3").color,
+        hsla(0.33, 0.5, 0.4, 0.75)
+    );
+
+    let mut config = config_with(
+        IndicatorId::Macd,
+        IndicatorSettings::Macd {
+            short_period: 3,
+            long_period: 4,
+            signal_period: 2,
+            dif: true,
+            dea: true,
+            dif_color,
+            dea_color,
+        },
+    );
+    for entry in &mut config.entries {
+        if entry.id == IndicatorId::Kdj {
+            entry.enabled = true;
+            entry.settings = IndicatorSettings::Kdj {
+                period: 3,
+                smoothing_1: 2,
+                smoothing_2: 2,
+                k: true,
+                d: true,
+                j: true,
+                k_color,
+                d_color,
+                j_color,
+            };
+        }
+    }
+    let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
+
+    let macd = series_of(&series, IndicatorId::Macd);
+    assert_eq!(line_of(macd, "DIF").color, hsla(0.44, 0.5, 0.4, 0.75));
+    assert_eq!(line_of(macd, "DEA").color, hsla(0.55, 0.5, 0.4, 0.75));
+    assert_eq!(
+        line_of(macd, "MACD").color,
+        Hsla::from(default_line_color(2)),
+        "the histogram keeps the fixed third colour"
+    );
+
+    let kdj = series_of(&series, IndicatorId::Kdj);
+    assert_eq!(line_of(kdj, "K").color, hsla(0.66, 0.5, 0.4, 0.75));
+    assert_eq!(line_of(kdj, "D").color, hsla(0.77, 0.5, 0.4, 0.75));
+    assert_eq!(line_of(kdj, "J").color, hsla(0.88, 0.5, 0.4, 0.75));
 }
