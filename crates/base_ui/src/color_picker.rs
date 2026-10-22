@@ -157,6 +157,7 @@ impl Default for ColorPickerLabels {
 /// opening repaints them, and the caller only has to draw the entity it stored.
 pub struct ColorPicker {
     color: Hsla,
+    preview: Option<Hsla>,
     active_tab: ColorPickerTab,
     labels: ColorPickerLabels,
     size: UnifiedSize,
@@ -203,10 +204,16 @@ impl ColorPicker {
                 }
             },
         );
-        let open_subscription = cx.observe(&open, |_, _, cx| cx.notify());
+        // Closing the panel has to clear a hover preview as well: the pointer may have left the
+        // palette before the outside press, but the footer should still show the real color.
+        let open_subscription = cx.observe_in(&open, window, |this, _, window, cx| {
+            this.clear_preview(window, cx);
+            cx.notify();
+        });
 
         Self {
             color: default_color,
+            preview: None,
             active_tab: ColorPickerTab::default(),
             labels: ColorPickerLabels::default(),
             size,
@@ -243,6 +250,7 @@ impl ColorPicker {
     /// The hex field is synchronized and the picker repaints, but no
     /// [`ColorPickerEvent::ColorChanged`] is emitted: a programmatic change is not a user action.
     pub fn set_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None;
         self.color = color;
         self.write_hex(color, window, cx);
         cx.notify();
@@ -277,6 +285,7 @@ impl ColorPicker {
             return;
         }
 
+        self.preview = None;
         self.color = color;
 
         if sync_hex {
@@ -298,7 +307,33 @@ impl ColorPicker {
             return;
         };
 
+        self.clear_preview(window, cx);
         self.set_user_color(*swatch, true, window, cx);
+    }
+
+    /// Shows `color` in the footer without making it the picker's color.
+    ///
+    /// This is what a palette hover uses: the large swatch and the hex field follow the pointer,
+    /// but no [`ColorPickerEvent::ColorChanged`] is emitted and [`ColorPicker::color`] stays the
+    /// real selection. Passing `None` restores the footer to the real color.
+    fn set_preview_color(
+        &mut self,
+        color: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview == color {
+            return;
+        }
+
+        self.preview = color;
+        self.write_hex(color.unwrap_or(self.color), window, cx);
+        cx.notify();
+    }
+
+    /// Restores the footer to the real color after a palette hover.
+    fn clear_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_preview_color(None, window, cx);
     }
 
     /// Moves one HSLA channel to `t`, leaving the other three untouched.
@@ -388,8 +423,11 @@ impl ColorPicker {
                 ColorPickerTab::Hsla => "TEST_COLOR_PICKER_TAB_HSLA".into(),
             })
             .child(label)
-            .on_click(move |_, _, cx| {
-                state.update(cx, |state, cx| state.set_active_tab(tab, cx));
+            .on_click(move |_, window, cx| {
+                state.update(cx, |state, cx| {
+                    state.clear_preview(window, cx);
+                    state.set_active_tab(tab, cx);
+                });
             })
     }
 }
@@ -414,6 +452,7 @@ impl Render for ColorPicker {
         let picker_entity_id = picker.entity_id();
         let picker_id: ElementId = ("color-picker", picker_entity_id).into();
         let color = self.color;
+        let preview = self.preview;
         let active_tab = self.active_tab;
         let labels = self.labels.clone();
         let size = self.size;
@@ -450,6 +489,7 @@ impl Render for ColorPicker {
                 render_panel(
                     picker,
                     color,
+                    preview,
                     active_tab,
                     labels,
                     hex_input,
@@ -473,6 +513,7 @@ impl Render for ColorPicker {
 fn render_panel(
     state: Entity<ColorPicker>,
     color: Hsla,
+    preview: Option<Hsla>,
     active: ColorPickerTab,
     labels: ColorPickerLabels,
     hex_input: Entity<InputState>,
@@ -557,7 +598,11 @@ fn render_panel(
                         .items_center()
                         .gap_2()
                         .debug_selector(|| "TEST_COLOR_PICKER_HEX_INPUT".into())
-                        .child(ColorWell::new(color).size(px(30.)).radius(px(6.)))
+                        .child(
+                            ColorWell::new(preview.unwrap_or(color))
+                                .size(px(30.))
+                                .radius(px(6.)),
+                        )
                         .child(div().flex_1().child(Input::new(&hex_input).medium())),
                 ),
         )
@@ -671,9 +716,8 @@ impl RenderOnce for ColorWell {
 
 /// The 12×12 palette of swatches, drawn by a single canvas.
 ///
-/// The picker entity is only used to route a click back to it; the color it draws and the label
-/// it announces are handed in by the panel, so this element never reads the picker while
-/// rendering.
+/// The picker entity only routes hover and click back to it; the label it announces is handed in
+/// by the panel, so this element never reads the picker while rendering.
 #[derive(IntoElement)]
 struct PaletteGrid {
     state: Entity<ColorPicker>,
@@ -728,6 +772,26 @@ impl RenderOnce for PaletteGrid {
                 .absolute()
                 .size_full(),
             )
+            .on_mouse_move({
+                let bounds = bounds.clone();
+                let state = state.clone();
+
+                move |event, window, cx| {
+                    let hovered = palette_index_at(bounds.get(), event.position)
+                        .and_then(|index| PALETTE.get(index).copied());
+
+                    state.update(cx, |state, cx| state.set_preview_color(hovered, window, cx));
+                }
+            })
+            .on_hover({
+                let state = state.clone();
+
+                move |hovered, window, cx| {
+                    if !*hovered {
+                        state.update(cx, |state, cx| state.clear_preview(window, cx));
+                    }
+                }
+            })
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 let Some(index) = palette_index_at(bounds.get(), event.position) else {
                     return;
@@ -2421,6 +2485,159 @@ mod tests {
         );
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
         assert!(panel_is_drawn(cx));
+    }
+
+    #[gpui_kit::test]
+    fn hovering_a_palette_cell_should_preview_the_footer_without_changing_the_color(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        let hovered = PALETTE[28];
+
+        cx.simulate_mouse_move(cell, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(hovered).as_str(),
+            "hover previews the hovered swatch in the hex field"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.preview),
+            Some(hovered),
+            "the footer's color block is driven by the same preview"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "hover must not change the picker's color"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "hover must not emit ColorChanged"
+        );
+        assert!(panel_is_drawn(cx), "hover must not close the panel");
+
+        let gap = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 22.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_mouse_move(gap, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(DEFAULT_COLOR).as_str(),
+            "moving into the gap restores the footer to the real color"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.preview),
+            None,
+            "the footer's color block is restored as well"
+        );
+        assert!(changes.borrow().is_empty());
+
+        cx.simulate_mouse_move(cell, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let outside = point(px(850.), px(750.));
+        cx.simulate_mouse_move(outside, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(DEFAULT_COLOR).as_str(),
+            "leaving the palette restores the footer to the real color"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.preview),
+            None,
+            "leaving the palette clears the preview block too"
+        );
+        assert!(changes.borrow().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_panel_should_clear_a_palette_hover_preview(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_mouse_move(cell, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(PALETTE[28]).as_str()
+        );
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(DEFAULT_COLOR).as_str(),
+            "closing the panel restores the real color in the field"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.color()), DEFAULT_COLOR);
+        assert!(changes.borrow().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_clear_the_preview(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_mouse_move(cell, None, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.simulate_click(cell, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let swatch = PALETTE[28];
+        assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
+        assert_eq!(changes.borrow().as_slice(), &[swatch]);
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(swatch).as_str(),
+            "committing keeps the hovered color in the field"
+        );
+        assert!(
+            state.read_with(cx, |state, _| state.preview.is_none()),
+            "committing clears the preview so the footer shows the real color"
+        );
     }
 
     #[gpui_kit::test]
