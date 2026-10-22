@@ -777,16 +777,27 @@ impl RenderOnce for PaletteGrid {
                 let state = state.clone();
 
                 move |event, window, cx| {
-                    let hovered = palette_index_at(bounds.get(), event.position)
-                        .and_then(|index| PALETTE.get(index).copied());
+                    // A move that is still inside the grid but not over a cell is over a gap.
+                    // Keeping the previous preview there avoids the A -> real color -> B flash
+                    // the pointer would otherwise produce while crossing between two swatches.
+                    let Some(index) = palette_index_at(bounds.get(), event.position) else {
+                        return;
+                    };
+                    let Some(color) = PALETTE.get(index).copied() else {
+                        return;
+                    };
 
-                    state.update(cx, |state, cx| state.set_preview_color(hovered, window, cx));
+                    state.update(cx, |state, cx| {
+                        state.set_preview_color(Some(color), window, cx)
+                    });
                 }
             })
             .on_hover({
                 let state = state.clone();
 
                 move |hovered, window, cx| {
+                    // Leaving the grid is the only pointer move that restores the real color;
+                    // gaps between its cells are still inside this hitbox.
                     if !*hovered {
                         state.update(cx, |state, cx| state.clear_preview(window, cx));
                     }
@@ -2488,7 +2499,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn hovering_a_palette_cell_should_preview_the_footer_without_changing_the_color(
+    fn hovering_a_palette_cell_should_preview_the_footer_and_hold_across_gaps(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -2539,19 +2550,32 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
-            hex_string(DEFAULT_COLOR).as_str(),
-            "moving into the gap restores the footer to the real color"
+            hex_string(hovered).as_str(),
+            "moving into a gap keeps the previous preview instead of flashing the real color"
         );
         assert_eq!(
             state.read_with(cx, |state, _| state.preview),
-            None,
-            "the footer's color block is restored as well"
+            Some(hovered),
+            "the footer's color block also keeps the previous preview"
         );
         assert!(changes.borrow().is_empty());
 
-        cx.simulate_mouse_move(cell, None, Modifiers::none());
+        let next_cell = point(
+            grid.origin.x + px(PALETTE_STEP * 5.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        let next = PALETTE[29];
+        cx.simulate_mouse_move(next_cell, None, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
+        assert_eq!(
+            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
+            hex_string(next).as_str(),
+            "entering the next cell replaces the preview directly"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.preview), Some(next));
+        assert!(changes.borrow().is_empty());
+
         let outside = point(px(850.), px(750.));
         cx.simulate_mouse_move(outside, None, Modifiers::none());
         cx.update(|window, _| window.refresh());
