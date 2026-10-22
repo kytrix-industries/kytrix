@@ -678,12 +678,11 @@ impl RenderOnce for ColorWell {
             radius,
             debug_selector,
         } = self;
-        let (base, checker, border) = {
+        let (base, checker) = {
             let theme = cx.theme();
             (
                 theme.roles.surface.overlay.hsla,
                 theme.roles.surface.sunken.hsla,
-                theme.roles.line.divider.hsla,
             )
         };
         // A color that is not fully opaque shows the checkerboard, exactly as the alpha slider
@@ -712,12 +711,6 @@ impl RenderOnce for ColorWell {
                     }
 
                     window.paint_quad(fill(bounds, color).corner_radii(radius));
-                    window.paint_quad(
-                        fill(bounds, hsla(0., 0., 0., 0.))
-                            .border_widths(px(1.))
-                            .border_color(border)
-                            .corner_radii(radius),
-                    );
                 },
             )
             .absolute()
