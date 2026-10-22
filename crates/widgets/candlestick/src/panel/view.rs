@@ -15,20 +15,22 @@
 
 use base_ui::{scroll_bar::Scrollbar, style::theme::ThemeExt};
 use gpui_kit::{
-    AnyElement, App, Context, ElementId, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
+    AnyElement, App, Context, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, px,
 };
 use i18n::t;
 use smol_str::format_smolstr;
 
 use super::{
+    colors::{self, ColorKey, LinePicker},
     inputs::{self, InputKey, LineInput},
     rows,
 };
 use crate::{
     indicator::{
         CandlestickIndicatorConfig, INDICATOR_CATALOG, IndicatorDefinition, IndicatorId,
-        IndicatorPane, SettingControl, SettingKey,
+        IndicatorPane, LineColor, SettingControl, SettingKey,
     },
     view::CandlestickWidget,
 };
@@ -36,7 +38,7 @@ use crate::{
 /// The width the panel takes out of the pane body.
 ///
 /// Fixed rather than draggable: a settings row is one 16px indent plus a 60px
-/// period field, a 16px colour swatch, a 24px delete button and the gaps between
+/// period field, a 20px colour picker, a 24px delete button and the gaps between
 /// them, and 260 fits that row with room to spare. A pane narrower than this
 /// presses the chart down to its own minimum plot width and the body clips the
 /// panel's right edge — the panel's visibility is decided by whether it is open,
@@ -59,6 +61,8 @@ pub(crate) struct IndicatorPanel {
     expanded: Vec<(IndicatorId, bool)>,
     /// The text fields the period rows edit, one per editable period.
     inputs: Vec<LineInput>,
+    /// The colour pickers the colour settings edit, one per configurable colour.
+    pickers: Vec<LinePicker>,
     /// The field whose text is not a period it may take, if there is one. Draws
     /// the red frame and the hint; nothing is written back while it is set.
     invalid: Option<InputKey>,
@@ -95,6 +99,7 @@ impl IndicatorPanel {
                 .map(|definition| (definition.id, true))
                 .collect(),
             inputs: Vec::new(),
+            pickers: Vec::new(),
             invalid: None,
             pending_reset: None,
             next_slot: 0,
@@ -347,6 +352,109 @@ impl IndicatorPanel {
         self.pending_reset = self.pending_reset.filter(|key| live(key));
     }
 
+    /// Creates, reuses and drops the colour pickers the settings need this frame.
+    ///
+    /// Retention follows the same rule as the inputs': a field drawn again keeps
+    /// its entity, and a field the configuration no longer holds loses it. What
+    /// differs is the colour: a picker whose stored colour moved is written back
+    /// rather than rebuilt, because the picker's own state — the tab it is on,
+    /// the caret in its hex field — belongs to the user, and `set_color` emits no
+    /// change, so writing the stored colour back cannot loop through its handler.
+    fn sync_pickers(
+        &mut self,
+        config: &CandlestickIndicatorConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fields = colors::color_fields(config);
+        let labels = colors::color_labels(cx);
+        self.pickers
+            .retain(|picker| fields.iter().any(|field| field.key() == picker.key()));
+        for field in &fields {
+            let color = Hsla::from(field.color);
+            if let Some(picker) = self
+                .pickers
+                .iter()
+                .find(|picker| picker.key() == field.key())
+            {
+                picker.entity().update(cx, |picker, cx| {
+                    picker.set_labels(labels.clone(), cx);
+                    if picker.color() != color {
+                        picker.set_color(color, window, cx);
+                    }
+                });
+                continue;
+            }
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            self.pickers
+                .push(LinePicker::connect(field, slot, &labels, window, cx));
+        }
+    }
+
+    /// Paints one colour without storing it.
+    ///
+    /// The key says which control the picker edits: a line list applies the
+    /// colour to that line, and a switch row to the one field its colour key
+    /// names. A key the configuration no longer holds is ignored, because the
+    /// picker that reported it is about to be dropped with its line.
+    pub(super) fn preview_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
+        let Some(mut next) = self.indicator_config(cx) else {
+            return;
+        };
+        let applied = match key.row {
+            Some(index) => next.set_line_color(key.id, index, LineColor::from(color)),
+            None => next.set_color(key.id, key.key, LineColor::from(color)),
+        };
+        if applied {
+            self.preview(next, cx);
+        }
+    }
+
+    /// Stores the colour the picker settled on, and publishes it once.
+    ///
+    /// The preview is applied first — a picker may report a commit without a
+    /// change, and one that did change has already travelled that path — so the
+    /// widget is looking at the committed colour before it publishes.
+    pub(super) fn commit_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
+        self.preview_color(key, color, cx);
+        if let Some(widget) = self.widget.upgrade() {
+            widget.update(cx, |widget, cx| widget.commit_indicator_config(cx));
+        }
+    }
+
+    /// Hands a previewed configuration to the widget without publishing it.
+    ///
+    /// The colour is on screen before it is stored: the picker reports every
+    /// change a slider or a palette hover produces, and publishing each one would
+    /// write the pane back once per frame. The widget keeps the preview until the
+    /// panel commits it or closes.
+    ///
+    /// The panel itself is not notified: the only views that show the colour are
+    /// the picker — which repaints its own trigger on every change — and the
+    /// chart, which `preview_indicator_config` notifies. None of the panel's rows
+    /// derives from the colour except the picker, which owns its own state, so a
+    /// panel frame per drag tick would be pure cost; `sync_pickers` still runs on
+    /// whatever frame the panel next draws (a period edit, folding, a commit…),
+    /// which keeps it correct.
+    fn preview(&mut self, next: CandlestickIndicatorConfig, cx: &mut Context<Self>) {
+        if let Some(widget) = self.widget.upgrade() {
+            widget.update(cx, |widget, cx| widget.preview_indicator_config(next, cx));
+        }
+    }
+
+    /// The picker of one colour field, if the panel holds it.
+    fn color_picker(
+        &self,
+        id: IndicatorId,
+        row: Option<usize>,
+        key: SettingKey,
+    ) -> Option<&LinePicker> {
+        self.pickers
+            .iter()
+            .find(|picker| picker.key() == ColorKey { id, row, key })
+    }
+
     /// One indicator's rows: its node row, and its settings while it is open.
     fn indicator_rows(
         &self,
@@ -386,6 +494,7 @@ impl IndicatorPanel {
                         row,
                         lines,
                         &self.inputs,
+                        &self.pickers,
                         self.invalid,
                         panel,
                         cx,
@@ -403,11 +512,21 @@ impl IndicatorPanel {
                     ));
                 }
                 SettingControl::Switch => {
+                    // The catalogue gives every switch row a colour, which is
+                    // what puts a picker on its right. A switch without one
+                    // would be a row the panel cannot draw as designed.
+                    let color_key = row
+                        .color_key
+                        .expect("every switch row declares the colour it controls");
+                    let Some(picker) = self.color_picker(definition.id, None, color_key) else {
+                        continue;
+                    };
                     nodes.push(rows::switch_row(
                         index,
                         definition.id,
                         row,
                         self.switch(definition.id, row.key, cx),
+                        picker,
                         panel,
                         cx,
                     ));
@@ -460,6 +579,7 @@ impl Render for IndicatorPanel {
         };
         self.restore_pending(window, cx);
         self.sync_inputs(&config, window, cx);
+        self.sync_pickers(&config, window, cx);
         let panel = cx.entity().downgrade();
         let mut content = div()
             .w_full()
@@ -533,5 +653,21 @@ impl IndicatorPanel {
     ) -> Option<gpui_kit::Entity<base_ui::input::InputState>> {
         self.line_input(id, row, key)
             .map(|input| input.entity.clone())
+    }
+
+    /// How many colour pickers the panel is holding.
+    pub(super) fn color_picker_count(&self) -> usize {
+        self.pickers.len()
+    }
+
+    /// The picker of one colour field, so that a test can drive what a user does.
+    pub(super) fn color_picker_entity(
+        &self,
+        key: ColorKey,
+    ) -> Option<gpui_kit::Entity<base_ui::color_picker::ColorPicker>> {
+        self.pickers
+            .iter()
+            .find(|picker| picker.key() == key)
+            .map(|picker| picker.entity().clone())
     }
 }

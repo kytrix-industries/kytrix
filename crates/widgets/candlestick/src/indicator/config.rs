@@ -313,6 +313,30 @@ impl CandlestickIndicatorConfig {
         true
     }
 
+    /// Sets the colour of one line of `id`'s list.
+    ///
+    /// Returns whether the value was applied: the index is `Some` only for a
+    /// line list the panel drew, and a stale one is a line that is not there.
+    pub(crate) fn set_line_color(
+        &mut self,
+        id: IndicatorId,
+        index: usize,
+        color: LineColor,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let Some(line) = entry
+            .settings
+            .lines_mut()
+            .and_then(|lines| lines.rows.get_mut(index))
+        else {
+            return false;
+        };
+        line.color = color;
+        true
+    }
+
     /// Sets the value of one named period setting of `id`, such as MACD's short
     /// period.
     pub(crate) fn set_setting_period(
@@ -335,6 +359,18 @@ impl CandlestickIndicatorConfig {
             return false;
         };
         entry.settings.set_switch(key, on)
+    }
+
+    /// Sets one named colour of `id`, such as MACD's DIF colour.
+    ///
+    /// Returns whether the value was applied: a key that is not one of the
+    /// colour settings, or one this indicator's shape does not hold, is a row and
+    /// a value that have drifted apart rather than a colour to write.
+    pub(crate) fn set_color(&mut self, id: IndicatorId, key: SettingKey, color: LineColor) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.settings.set_color(key, color)
     }
 
     /// Appends a line to `id`'s list.
@@ -500,6 +536,36 @@ impl IndicatorSettings {
             (Self::Kdj { k, .. }, SettingKey::K) => *k = on,
             (Self::Kdj { d, .. }, SettingKey::D) => *d = on,
             (Self::Kdj { j, .. }, SettingKey::J) => *j = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// The colour one named setting holds.
+    ///
+    /// Only the switch rows' colours are named settings: a line list's colours
+    /// belong to its rows, not to the list. `None` therefore means this value
+    /// has no such colour, which is the same "the catalogue and the value have
+    /// drifted apart" answer [`IndicatorSettings::period`] gives.
+    pub(crate) fn color(&self, key: SettingKey) -> Option<LineColor> {
+        match (self, key) {
+            (Self::Macd { dif_color, .. }, SettingKey::DifColor) => Some(*dif_color),
+            (Self::Macd { dea_color, .. }, SettingKey::DeaColor) => Some(*dea_color),
+            (Self::Kdj { k_color, .. }, SettingKey::KColor) => Some(*k_color),
+            (Self::Kdj { d_color, .. }, SettingKey::DColor) => Some(*d_color),
+            (Self::Kdj { j_color, .. }, SettingKey::JColor) => Some(*j_color),
+            _ => None,
+        }
+    }
+
+    /// Writes one named colour. Returns whether this value has it.
+    fn set_color(&mut self, key: SettingKey, color: LineColor) -> bool {
+        match (self, key) {
+            (Self::Macd { dif_color, .. }, SettingKey::DifColor) => *dif_color = color,
+            (Self::Macd { dea_color, .. }, SettingKey::DeaColor) => *dea_color = color,
+            (Self::Kdj { k_color, .. }, SettingKey::KColor) => *k_color = color,
+            (Self::Kdj { d_color, .. }, SettingKey::DColor) => *d_color = color,
+            (Self::Kdj { j_color, .. }, SettingKey::JColor) => *j_color = color,
             _ => return false,
         }
         true

@@ -64,6 +64,18 @@ pub(crate) enum SettingKey {
     K,
     D,
     J,
+    /// MACD's DIF colour. A colour key is not persisted — the fields of
+    /// [`IndicatorSettings`] are — it names the colour the switch row it sits on
+    /// controls.
+    DifColor,
+    /// MACD's DEA colour; see [`SettingKey::DifColor`].
+    DeaColor,
+    /// KDJ's K colour; see [`SettingKey::DifColor`].
+    KColor,
+    /// KDJ's D colour; see [`SettingKey::DifColor`].
+    DColor,
+    /// KDJ's J colour; see [`SettingKey::DifColor`].
+    JColor,
 }
 
 /// The shape of the control a settings row is drawn as.
@@ -93,6 +105,13 @@ pub(crate) struct SettingRow {
     pub label_key: &'static str,
     /// The control this row is drawn as.
     pub control: SettingControl,
+    /// The colour setting drawn beside this row's control, or `None` for a row
+    /// without one.
+    ///
+    /// A line list owns no colour of its own — every line has one — and a period
+    /// has none at all, so only a switch row names a colour here. The panel uses
+    /// it to put the picker for that line's colour on the right of the same row.
+    pub color_key: Option<SettingKey>,
 }
 
 /// A full declaration of one indicator.
@@ -232,6 +251,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
             key: SettingKey::Lines,
             label_key: "widget.candlestick.indicator.lines",
             control: SettingControl::LineList { min_rows: 1 },
+            color_key: None,
         }],
     },
     IndicatorDefinition {
@@ -244,6 +264,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
             key: SettingKey::Lines,
             label_key: "widget.candlestick.indicator.lines",
             control: SettingControl::LineList { min_rows: 1 },
+            color_key: None,
         }],
     },
     IndicatorDefinition {
@@ -270,6 +291,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::LongPeriod,
@@ -278,6 +300,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::SignalPeriod,
@@ -286,16 +309,19 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::Dif,
                 label_key: "widget.candlestick.indicator.dif",
                 control: SettingControl::Switch,
+                color_key: Some(SettingKey::DifColor),
             },
             SettingRow {
                 key: SettingKey::Dea,
                 label_key: "widget.candlestick.indicator.dea",
                 control: SettingControl::Switch,
+                color_key: Some(SettingKey::DeaColor),
             },
         ],
     },
@@ -309,6 +335,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
             key: SettingKey::Lines,
             label_key: "widget.candlestick.indicator.lines",
             control: SettingControl::LineList { min_rows: 1 },
+            color_key: None,
         }],
     },
     IndicatorDefinition {
@@ -325,6 +352,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::Smoothing1,
@@ -333,6 +361,7 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::Smoothing2,
@@ -341,21 +370,25 @@ pub(crate) const INDICATOR_CATALOG: &[IndicatorDefinition] = &[
                     min: PERIOD_MIN,
                     max: PERIOD_MAX,
                 },
+                color_key: None,
             },
             SettingRow {
                 key: SettingKey::K,
                 label_key: "widget.candlestick.indicator.k",
                 control: SettingControl::Switch,
+                color_key: Some(SettingKey::KColor),
             },
             SettingRow {
                 key: SettingKey::D,
                 label_key: "widget.candlestick.indicator.d",
                 control: SettingControl::Switch,
+                color_key: Some(SettingKey::DColor),
             },
             SettingRow {
                 key: SettingKey::J,
                 label_key: "widget.candlestick.indicator.j",
                 control: SettingControl::Switch,
+                color_key: Some(SettingKey::JColor),
             },
         ],
     },

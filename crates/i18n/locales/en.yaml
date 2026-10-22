@@ -2,6 +2,13 @@ common:
   amount: Amount
   cancel: Cancel
   close: Close
+  color:
+    palette: Palette
+    hsla: HSLA
+    hue: Hue
+    saturation: Saturation
+    lightness: Lightness
+    alpha: Opacity
   confirm: OK
   connecting: Connecting
   market_participants: Market participant

@@ -6,15 +6,20 @@
 //! through the widget.
 
 use base_ui::{
+    color_picker::{ColorPicker, ColorPickerEvent},
     input::{InputState, InputStateEvent},
     style::theme::ThemeExt,
 };
 use gpui_kit::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    TestAppContext, VisualTestContext, Window, div,
+    AppContext, Context, Entity, Hsla, IntoElement, Modifiers, ParentElement, Render, SharedString,
+    Styled, TestAppContext, VisualTestContext, Window, div, hsla, point, px, size,
 };
 
-use super::{inputs, rows, view::IndicatorPanel};
+use super::{
+    colors::{self, ColorKey},
+    inputs, rows,
+    view::IndicatorPanel,
+};
 use crate::{
     indicator::{
         INDICATOR_CATALOG, IndicatorId, LineColor, SettingControl, SettingKey, definition_of,
@@ -226,6 +231,7 @@ fn adding_a_line_should_grow_the_list_below_the_last_one(cx: &mut TestAppContext
 
     let before = ma_periods(window, &built.widget);
     let before_reports = built.reports();
+    let pickers_before = window.read(|cx| panel.read(cx).color_picker_count());
     press(window, "TEST_PANEL_ADD_LINE");
     let after = ma_periods(window, &built.widget);
 
@@ -239,6 +245,24 @@ fn adding_a_line_should_grow_the_list_below_the_last_one(cx: &mut TestAppContext
         built.reports(),
         before_reports + 1,
         "adding a line is written back exactly once"
+    );
+
+    // The added line is a new colour field: it gets a picker of its own on its
+    // row, and that picker shows the palette colour the line was given.
+    assert_eq!(
+        window.read(|cx| panel.read(cx).color_picker_count()),
+        pickers_before + 1,
+        "the new line gets a picker of its own"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_COLOR_MA_3").is_some(),
+        "the new line's picker is drawn on its row"
+    );
+    let added_picker = picker_of(window, &panel, ma_line_key(3));
+    assert_eq!(
+        window.read(|cx| added_picker.read(cx).color()),
+        Hsla::from(last_ma_color(window, &built.widget)),
+        "the picker shows the colour the new line was given"
     );
 
     // The palette is read from the theme the harness installed, not hardcoded:
@@ -441,5 +465,359 @@ fn every_editable_period_should_have_exactly_one_field(cx: &mut TestAppContext) 
         window.read(|cx| panel.read(cx).input_count()),
         fields.len(),
         "every field the configuration has is an entity the panel holds"
+    );
+}
+
+/// The colour field of MA's line `index`.
+fn ma_line_key(index: usize) -> ColorKey {
+    ColorKey {
+        id: IndicatorId::Ma,
+        row: Some(index),
+        key: SettingKey::Lines,
+    }
+}
+
+/// The colour MA's line `index` holds in the widget's configuration.
+fn ma_line_color(
+    window: &VisualTestContext,
+    widget: &Entity<CandlestickWidget>,
+    index: usize,
+) -> LineColor {
+    window.read(|cx| {
+        widget
+            .read(cx)
+            .indicator_config()
+            .entry(IndicatorId::Ma)
+            .expect("the catalogue always has MA")
+            .settings
+            .lines()
+            .expect("MA is a line list")
+            .rows[index]
+            .color
+    })
+}
+
+/// The picker of one colour field as the panel currently holds it.
+fn picker_of(
+    window: &VisualTestContext,
+    panel: &Entity<IndicatorPanel>,
+    key: ColorKey,
+) -> Entity<ColorPicker> {
+    window
+        .read(|cx| panel.read(cx).color_picker_entity(key))
+        .unwrap_or_else(|| panic!("{key:?} has a picker"))
+}
+
+/// Reports one event of a picker, the way the picker's own interactions do.
+fn emit_picker(
+    window: &mut VisualTestContext,
+    picker: &Entity<ColorPicker>,
+    event: ColorPickerEvent,
+) {
+    window.update(|_, cx| {
+        picker.update(cx, |_, cx| cx.emit(event));
+    });
+    window.run_until_parked();
+    redraw(window);
+}
+
+/// Every colour setting has exactly one picker, keyed by what it edits: two
+/// pickers for one colour would be two controls editing one value.
+#[gpui_kit::test]
+fn every_colour_setting_should_have_exactly_one_picker(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+
+    let config = window
+        .read(|cx| panel.read(cx).indicator_config(cx))
+        .expect("the widget still holds its configuration");
+    let fields = colors::color_fields(&config);
+    assert_eq!(
+        fields.len(),
+        12,
+        "three MA lines, one EMA line, three RSI lines, MACD's two and KDJ's three"
+    );
+    let keys: Vec<ColorKey> = fields.iter().map(|field| field.key()).collect();
+    for (index, key) in keys.iter().enumerate() {
+        assert!(
+            !keys[..index].contains(key),
+            "{key:?} is drawn twice, so two pickers would edit one colour"
+        );
+    }
+    assert_eq!(
+        window.read(|cx| panel.read(cx).color_picker_count()),
+        fields.len(),
+        "every colour field is an entity the panel holds"
+    );
+    assert_eq!(
+        window
+            .debug_bounds("TEST_PANEL_COLOR_MA_0")
+            .map(|bounds| bounds.size),
+        Some(size(px(20.), px(20.))),
+        "the picker is UnifiedSize::Small, the 20px square"
+    );
+}
+
+/// Every picker shows the colour the configuration stores.
+#[gpui_kit::test]
+fn every_picker_should_show_the_stored_colour(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+
+    let config = window
+        .read(|cx| panel.read(cx).indicator_config(cx))
+        .expect("the widget still holds its configuration");
+    for field in colors::color_fields(&config) {
+        let picker = picker_of(window, &panel, field.key());
+        assert_eq!(
+            window.read(|cx| picker.read(cx).color()),
+            Hsla::from(field.color),
+            "{:?} shows the colour the configuration holds",
+            field.key()
+        );
+    }
+}
+
+/// A change while the picker is open is a preview: it reaches the configuration
+/// on screen, not the persisted one.
+#[gpui_kit::test]
+fn a_colour_change_should_preview_without_publishing(cx: &mut TestAppContext) {
+    let (built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let key = ma_line_key(0);
+    let picker = picker_of(window, &panel, key);
+    let before = built.reports();
+    let preview = hsla(0.42, 0.61, 0.37, 0.8);
+
+    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(preview));
+
+    assert_eq!(
+        ma_line_color(window, &built.widget, 0),
+        LineColor::from(preview),
+        "the preview is the colour the chart and the panel now draw"
+    );
+    assert_eq!(
+        built.reports(),
+        before,
+        "a preview is painted, not written back"
+    );
+}
+
+/// The commit is what stores the colour, and it stores it exactly once.
+#[gpui_kit::test]
+fn a_colour_commit_should_publish_exactly_once(cx: &mut TestAppContext) {
+    let (built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let key = ma_line_key(1);
+    let picker = picker_of(window, &panel, key);
+    let before = built.reports();
+    let changed = hsla(0.2, 0.4, 0.6, 1.0);
+    let committed = hsla(0.7, 0.3, 0.5, 0.9);
+
+    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(changed));
+    emit_picker(window, &picker, ColorPickerEvent::ColorCommitted(committed));
+
+    assert_eq!(
+        ma_line_color(window, &built.widget, 1),
+        LineColor::from(committed),
+        "the commit stores the colour the popup closed on"
+    );
+    assert_eq!(
+        window.read(|cx| picker.read(cx).color()),
+        committed,
+        "the picker is written back to the stored colour when the config moves"
+    );
+    assert_eq!(
+        built.reports(),
+        before + 1,
+        "one interaction publishes once, not once per change"
+    );
+
+    // A commit the user produced without moving through the palette still writes
+    // the colour: the panel applies it before it publishes.
+    let standalone = hsla(0.15, 0.25, 0.35, 1.0);
+    emit_picker(
+        window,
+        &picker,
+        ColorPickerEvent::ColorCommitted(standalone),
+    );
+    assert_eq!(
+        ma_line_color(window, &built.widget, 1),
+        LineColor::from(standalone)
+    );
+    assert_eq!(
+        window.read(|cx| picker.read(cx).color()),
+        standalone,
+        "the second colour reaches the picker the same way"
+    );
+    assert_eq!(
+        built.reports(),
+        before + 2,
+        "a second interaction is a second write"
+    );
+}
+
+/// A switch row's picker writes the colour field that row controls, not a line.
+#[gpui_kit::test]
+fn a_switch_picker_should_write_the_colour_of_its_field(cx: &mut TestAppContext) {
+    let (built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let changed = hsla(0.12, 0.34, 0.56, 0.78);
+
+    for (id, key) in [
+        (IndicatorId::Macd, SettingKey::DifColor),
+        (IndicatorId::Kdj, SettingKey::JColor),
+    ] {
+        let color_key = ColorKey { id, row: None, key };
+        let picker = picker_of(window, &panel, color_key);
+        emit_picker(window, &picker, ColorPickerEvent::ColorChanged(changed));
+
+        let stored = window.read(|cx| {
+            built
+                .widget
+                .read(cx)
+                .indicator_config()
+                .entry(id)
+                .expect("the catalogue always has the entry")
+                .settings
+                .color(key)
+        });
+        assert_eq!(
+            stored,
+            Some(LineColor::from(changed)),
+            "{id:?}::{key:?} is the field the picker writes"
+        );
+    }
+}
+
+/// A switch row draws its picker inside the row, at the row's right edge, and the
+/// picker opens the palette when pressed.
+#[gpui_kit::test]
+fn a_macd_switch_row_should_draw_its_picker_on_the_right(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Macd);
+
+    let row = window
+        .debug_bounds("TEST_PANEL_SWITCH_ROW_MACD_DIF")
+        .expect("the DIF switch row is drawn while MACD is open");
+    let picker = window
+        .debug_bounds("TEST_PANEL_COLOR_MACD_DIF")
+        .expect("the DIF row draws its colour picker");
+    assert!(
+        (picker.right() - row.right()).as_f32().abs() <= 1.0,
+        "the picker sits at the row's right edge: {picker:?} vs {row:?}"
+    );
+
+    press(window, "TEST_PANEL_COLOR_MACD_DIF");
+    assert!(
+        window.debug_bounds("TEST_COLOR_PICKER_GRID").is_some(),
+        "pressing the row's picker opens its palette"
+    );
+}
+
+/// KDJ's J row offers its own picker, named after the row it controls.
+#[gpui_kit::test]
+fn a_kdj_switch_row_should_offer_its_picker(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Kdj);
+
+    assert!(
+        window.debug_bounds("TEST_PANEL_SWITCH_ROW_KDJ_J").is_some(),
+        "the J switch row is drawn while KDJ is open"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_COLOR_KDJ_J").is_some(),
+        "the J row draws the picker for J's colour"
+    );
+
+    press(window, "TEST_PANEL_COLOR_KDJ_J");
+    assert!(
+        window.debug_bounds("TEST_COLOR_PICKER_GRID").is_some(),
+        "pressing J's picker opens its palette"
+    );
+}
+
+/// A removed line takes its picker with it, like its input.
+#[gpui_kit::test]
+fn removing_a_line_should_drop_its_picker(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let key = ma_line_key(2);
+    let before = window.read(|cx| panel.read(cx).color_picker_count());
+    assert!(
+        window
+            .read(|cx| panel.read(cx).color_picker_entity(key))
+            .is_some(),
+        "the third line of MA has a picker"
+    );
+
+    window.update(|_, cx| {
+        panel.update(cx, |panel, cx| panel.remove_line(IndicatorId::Ma, 2, cx));
+    });
+    redraw(window);
+
+    assert_eq!(
+        window.read(|cx| panel.read(cx).color_picker_count()),
+        before - 1,
+        "the removed line's picker is dropped with it"
+    );
+    assert!(
+        window
+            .read(|cx| panel.read(cx).color_picker_entity(key))
+            .is_none(),
+        "the third line is no longer colourable"
+    );
+}
+
+/// A picker drawn again is the same entity: rebuilding it would lose the tab the
+/// user left it on and the caret in its hex field.
+#[gpui_kit::test]
+fn a_second_frame_should_reuse_the_same_picker(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let key = ma_line_key(0);
+
+    let first = picker_of(window, &panel, key).entity_id();
+    redraw(window);
+    let second = picker_of(window, &panel, key).entity_id();
+
+    assert_eq!(first, second, "a redrawn panel keeps its picker entity");
+}
+
+/// Choosing a palette cell previews the colour while the popup is open and
+/// publishes it once on the way out.
+///
+/// The popup is drawn as a deferred overlay, so the cell is a window-level
+/// element rather than a child of the row: the click is aimed at the grid's first
+/// cell, which is where the palette starts.
+#[gpui_kit::test]
+fn choosing_a_palette_cell_should_preview_and_publish_the_line_colour(cx: &mut TestAppContext) {
+    let (built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    let before = built.reports();
+    let before_color = ma_line_color(window, &built.widget, 0);
+
+    press(window, "TEST_PANEL_COLOR_MA_0");
+    let grid = window
+        .debug_bounds("TEST_COLOR_PICKER_GRID")
+        .expect("the picker trigger opens the palette tab");
+    window.simulate_click(
+        point(grid.origin.x + px(10.0), grid.origin.y + px(10.0)),
+        Modifiers::none(),
+    );
+    window.run_until_parked();
+    redraw(window);
+
+    assert_ne!(
+        ma_line_color(window, &built.widget, 0),
+        before_color,
+        "the cell the user chose is the line's new colour"
+    );
+    assert_eq!(
+        built.reports(),
+        before + 1,
+        "choosing a colour publishes it once, when the popup closes"
     );
 }

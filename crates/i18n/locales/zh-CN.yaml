@@ -2,6 +2,13 @@ common:
   amount: 数量
   cancel: 取消
   close: 关闭
+  color:
+    palette: 色板
+    hsla: HSLA
+    hue: 色相
+    saturation: 饱和度
+    lightness: 明度
+    alpha: 不透明度
   confirm: 确认
   connecting: 正在连接
   market_participants: 市场参与者

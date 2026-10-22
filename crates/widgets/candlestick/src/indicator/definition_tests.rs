@@ -244,3 +244,46 @@ fn every_period_row_should_use_the_bounds_the_message_names() {
         }
     }
 }
+
+// ⑧ Only a switch row names a colour, and each one names the colour of the line
+// it switches. The pair is what puts the picker on that row's right and what the
+// picker writes when the user chooses a colour, so a swapped DIF/DEA pair would
+// edit the wrong line — which is exactly what this test pins.
+#[test]
+fn every_switch_row_should_name_the_colour_it_controls() {
+    let mut switch_rows = Vec::new();
+    for definition in INDICATOR_CATALOG {
+        for row in definition.rows {
+            match row.control {
+                SettingControl::Switch => {
+                    switch_rows.push((definition.id, row.key, row.color_key));
+                }
+                _ => assert!(
+                    row.color_key.is_none(),
+                    "{:?}::{:?} is not a switch row but names a colour",
+                    definition.id,
+                    row.key
+                ),
+            }
+        }
+    }
+    assert_eq!(
+        switch_rows,
+        [
+            (
+                IndicatorId::Macd,
+                SettingKey::Dif,
+                Some(SettingKey::DifColor)
+            ),
+            (
+                IndicatorId::Macd,
+                SettingKey::Dea,
+                Some(SettingKey::DeaColor)
+            ),
+            (IndicatorId::Kdj, SettingKey::K, Some(SettingKey::KColor)),
+            (IndicatorId::Kdj, SettingKey::D, Some(SettingKey::DColor)),
+            (IndicatorId::Kdj, SettingKey::J, Some(SettingKey::JColor)),
+        ],
+        "a switch row names the colour of the line it switches, one pair per row"
+    );
+}

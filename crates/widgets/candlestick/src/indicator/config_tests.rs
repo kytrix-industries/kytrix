@@ -7,7 +7,7 @@ use super::{
         CandlestickIndicatorConfig, IndicatorEntry, IndicatorLineConfig, IndicatorSettings,
         LineColor, LineListConfig, enabled_sub_plot_ids, expected_shape,
     },
-    definition::{INDICATOR_CATALOG, IndicatorId, default_line_color},
+    definition::{INDICATOR_CATALOG, IndicatorId, SettingKey, default_line_color},
 };
 use crate::view::CandlestickConfig;
 
@@ -893,5 +893,99 @@ fn a_stored_configuration_with_the_legacy_colour_array_should_not_decode() {
     assert!(
         serde_json::from_str::<CandlestickConfig>(payload).is_err(),
         "an old colour shape fails the whole decode, so the stored configuration resets to defaults"
+    );
+}
+
+#[test]
+fn setting_a_line_colour_should_update_only_that_row() {
+    let mut config = CandlestickIndicatorConfig::default();
+    let before: Vec<_> = line_list_of(&config, IndicatorId::Ma)
+        .rows
+        .iter()
+        .map(|row| row.color)
+        .collect();
+    let color = LineColor {
+        h: 0.3,
+        s: 0.4,
+        l: 0.5,
+        a: 0.6,
+    };
+
+    assert!(config.set_line_color(IndicatorId::Ma, 1, color));
+    let rows = &line_list_of(&config, IndicatorId::Ma).rows;
+    assert_eq!(
+        rows[1].color, color,
+        "the edited row is the one that changes"
+    );
+    assert_eq!(rows[0].color, before[0], "the row above keeps its colour");
+    assert_eq!(rows[2].color, before[2], "the row below keeps its colour");
+    assert_eq!(
+        rows[1].color,
+        LineColor {
+            h: 0.3,
+            s: 0.4,
+            l: 0.5,
+            a: 0.6,
+        },
+        "the colour is stored exactly, alpha included"
+    );
+    assert!(
+        !config.set_line_color(IndicatorId::Ma, 3, color),
+        "an index the list does not have is not written"
+    );
+    assert!(
+        !config.set_line_color(IndicatorId::Kdj, 0, color),
+        "an indicator without a line list has no line colour"
+    );
+    assert!(
+        !config.set_line_color(IndicatorId::Vol, 0, color),
+        "an indicator with no settings has no line colour either"
+    );
+}
+
+#[test]
+fn setting_a_switch_colour_should_write_its_own_field() {
+    let mut config = CandlestickIndicatorConfig::default();
+    let cases = [
+        (IndicatorId::Macd, SettingKey::DifColor),
+        (IndicatorId::Macd, SettingKey::DeaColor),
+        (IndicatorId::Kdj, SettingKey::KColor),
+        (IndicatorId::Kdj, SettingKey::DColor),
+        (IndicatorId::Kdj, SettingKey::JColor),
+    ];
+
+    for (index, (id, key)) in cases.iter().enumerate() {
+        let color = LineColor::from(hsla(index as f32 / 10.0, 0.5, 0.5, 0.75));
+        assert!(config.set_color(*id, *key, color));
+        assert_eq!(
+            entry_of(&config, *id).settings.color(*key),
+            Some(color),
+            "{id:?}::{key:?} stores the exact colour, alpha included"
+        );
+    }
+
+    assert!(
+        !config.set_color(
+            IndicatorId::Macd,
+            SettingKey::ShortPeriod,
+            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+        ),
+        "a period key names no colour"
+    );
+    assert!(
+        !config.set_color(
+            IndicatorId::Macd,
+            SettingKey::KColor,
+            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+        ),
+        "a colour field of another shape is not written"
+    );
+    assert!(
+        !config.set_color(
+            IndicatorId::Ma,
+            SettingKey::DifColor,
+            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+        ),
+        "an entry without that colour field is not written"
     );
 }

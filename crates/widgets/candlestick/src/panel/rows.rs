@@ -2,8 +2,10 @@
 //!
 //! Everything here is a free function over the values a row is drawn from: the
 //! panel owns the state and the configuration, and a row only needs to know what
-//! it shows and which panel method an interaction calls. The dimensions the
-//! design fixes live here too, beside the rows that use them.
+//! it shows and which panel method an interaction calls. Every colour is a
+//! `ColorPicker`, never a swatch: a line list draws one per line on that line's
+//! row, and a switch row draws its own for the line colour it controls. The
+//! dimensions the design fixes live here too, beside the rows that use them.
 
 use base_ui::{
     button::Button,
@@ -17,18 +19,21 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Disableable, div,
-    hsla, prelude::FluentBuilder, px,
+    Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    base::{Disableable, Placement},
+    div, hsla,
+    prelude::FluentBuilder,
+    px,
 };
 use i18n::t;
 
 use super::{
+    colors::{ColorKey, LinePicker},
     inputs::{InputKey, LineInput},
     view::IndicatorPanel,
 };
 use crate::indicator::{
-    IndicatorDefinition, IndicatorId, IndicatorLineConfig, LineListConfig, SettingControl,
-    SettingRow,
+    IndicatorDefinition, IndicatorId, LineListConfig, SettingControl, SettingKey, SettingRow,
 };
 
 /// The height of an indicator's node row.
@@ -47,8 +52,6 @@ const INDENT: f32 = 16.0;
 const CARET_SIZE: f32 = 16.0;
 /// The width of one period field.
 const PERIOD_FIELD_WIDTH: f32 = 60.0;
-/// The size of the square that shows a line's colour.
-const SWATCH_SIZE: f32 = 16.0;
 /// The width of a row's delete button.
 const DELETE_BUTTON_WIDTH: f32 = 24.0;
 
@@ -184,35 +187,50 @@ pub(super) fn period_row(
         .into_any_element()
 }
 
-/// One `Switch` row: the checkbox and the name of what it switches.
+/// One `Switch` row: the checkbox and the name of what it switches on the left,
+/// the picker for that line's colour on the right.
+///
+/// The toggle takes the free width and the picker keeps its own, so the picker
+/// sits at the row's right edge rather than beside the label. MACD's histogram is
+/// not configurable, which is why only the rows the catalogue gives a colour have
+/// a picker.
 pub(super) fn switch_row(
     index: usize,
     id: IndicatorId,
     row: &SettingRow,
     on: bool,
+    picker: &LinePicker,
     panel: &WeakEntity<IndicatorPanel>,
     cx: &App,
 ) -> AnyElement {
     let caption = t!(cx, row.label_key);
+    let color = t!(cx, "widget.candlestick.indicator.line_color");
     let key = row.key;
+    let row_selector = switch_row_selector(picker.key());
     let panel = panel.clone();
 
     div()
+        .debug_selector(move || row_selector)
         .h(px(SETTING_ROW_HEIGHT))
         .flex()
         .items_center()
+        .gap_2()
         .pl(px(INDENT))
         .child(
-            Toggle::new((node_id(index), row.label_key))
-                .checkbox()
-                .small()
-                .checked(on)
-                .label(caption.clone())
-                .aria_label(caption)
-                .on_change(move |checked, _, cx| {
-                    let _ = panel.update(cx, |panel, cx| panel.set_switch(id, key, checked, cx));
-                }),
+            div().flex_1().min_w_0().child(
+                Toggle::new((node_id(index), row.label_key))
+                    .checkbox()
+                    .small()
+                    .checked(on)
+                    .label(caption.clone())
+                    .aria_label(caption)
+                    .on_change(move |checked, _, cx| {
+                        let _ =
+                            panel.update(cx, |panel, cx| panel.set_switch(id, key, checked, cx));
+                    }),
+            ),
         )
+        .child(color_control(picker, color_selector(picker.key()), color))
         .into_any_element()
 }
 
@@ -228,6 +246,7 @@ pub(super) fn line_list(
     row: &SettingRow,
     lines: &LineListConfig,
     inputs: &[LineInput],
+    pickers: &[LinePicker],
     invalid: Option<InputKey>,
     panel: &WeakEntity<IndicatorPanel>,
     cx: &App,
@@ -244,12 +263,20 @@ pub(super) fn line_list(
         .flex_col()
         .gap_1()
         .aria_label(t!(cx, row.label_key));
-    for (line_index, line) in lines.rows.iter().enumerate() {
+    for line_index in 0..lines.rows.len() {
         let key = row.key;
+        let color_key = ColorKey {
+            id,
+            row: Some(line_index),
+            key,
+        };
         let Some(input) = inputs
             .iter()
             .find(|input| input.id == id && input.row == Some(line_index) && input.key == key)
         else {
+            continue;
+        };
+        let Some(picker) = pickers.iter().find(|picker| picker.key() == color_key) else {
             continue;
         };
         let line_invalid = invalid
@@ -262,7 +289,7 @@ pub(super) fn line_list(
             line_index,
             id,
             input,
-            line,
+            picker,
             can_remove,
             line_invalid,
             panel,
@@ -276,17 +303,18 @@ pub(super) fn line_list(
     ]
 }
 
-/// One line of a line list: its period field, its colour, and the button that
-/// deletes it.
+/// One line of a line list: its period field, the picker that sets its colour,
+/// and the button that deletes it.
 ///
-/// The colour is a swatch and not a control: it shows which colour the line is
-/// drawn in and does nothing when clicked (design R4 keeps the picker out of
-/// this round).
+/// The picker is the control, not a swatch beside one. A line list draws exactly
+/// one picker per line, on that line's row; MACD's and KDJ's switch rows draw
+/// their own pickers for the colours those rows control. The two never share an
+/// entity, so no colour has two editors.
 fn line_row(
     line_index: usize,
     id: IndicatorId,
     input: &LineInput,
-    line: &IndicatorLineConfig,
+    picker: &LinePicker,
     can_remove: bool,
     invalid: bool,
     panel: &WeakEntity<IndicatorPanel>,
@@ -295,15 +323,6 @@ fn line_row(
     let period = t!(cx, "widget.candlestick.indicator.period");
     let remove = t!(cx, "widget.candlestick.indicator.remove_line");
     let color = t!(cx, "widget.candlestick.indicator.line_color");
-    let swatch = div()
-        .id(ElementId::NamedInteger(
-            SharedString::new_static("CandlestickIndicatorLineColor"),
-            input.slot,
-        ))
-        .size(px(SWATCH_SIZE))
-        .rounded_sm()
-        .bg(Hsla::from(line.color))
-        .aria_label(color.clone());
     let delete_panel = panel.clone();
 
     div()
@@ -328,16 +347,7 @@ fn line_row(
                         .aria_label(period)
                         .child(Input::new(&input.entity).small()),
                 )
-                .child(
-                    Tooltip::new(
-                        ElementId::NamedInteger(
-                            SharedString::new_static("CandlestickIndicatorLineColorTooltip"),
-                            input.slot,
-                        ),
-                        swatch,
-                    )
-                    .content(color),
-                )
+                .child(color_control(picker, color_selector(picker.key()), color))
                 .child(
                     Button::new(ElementId::NamedInteger(
                         SharedString::new_static("CandlestickIndicatorDeleteLine"),
@@ -409,6 +419,29 @@ pub(super) fn can_remove_line(min_rows: usize, rows: usize) -> bool {
     rows > min_rows
 }
 
+/// The picker of one colour setting, wrapped in its tooltip and its test selector.
+///
+/// The tooltip is placed above its trigger because the picker opens its panel
+/// below it: a tooltip below would be covered by the very panel it explains the
+/// moment the user opens the picker.
+fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> AnyElement {
+    div()
+        .debug_selector(move || selector)
+        .flex_none()
+        .child(
+            Tooltip::new(
+                ElementId::NamedInteger(
+                    SharedString::new_static("CandlestickIndicatorColorTooltip"),
+                    picker.slot(),
+                ),
+                picker.entity().clone(),
+            )
+            .placement(Placement::Top)
+            .content(label),
+        )
+        .into_any_element()
+}
+
 /// The hint under a field whose text is not a period it may take.
 fn invalid_hint(cx: &App) -> AnyElement {
     div()
@@ -447,13 +480,51 @@ fn node_id(index: usize) -> ElementId {
 /// from the id's `Debug` spelling: a selector a test reads should not depend on
 /// how a derive happens to print.
 fn caret_selector(id: IndicatorId) -> String {
-    let name = match id {
+    format!("TEST_PANEL_CARET_{}", indicator_name(id))
+}
+
+/// The debug selector of one colour picker.
+///
+/// A line's picker is named after its indicator and its line, and a switch row's
+/// after its indicator and the line key it controls. The indicator name keeps the
+/// selectors apart even though two indicators' line lists both start at row 0.
+fn color_selector(key: ColorKey) -> String {
+    let name = indicator_name(key.id);
+    match key.row {
+        Some(row) => format!("TEST_PANEL_COLOR_{name}_{row}"),
+        None => format!("TEST_PANEL_COLOR_{name}_{}", color_key_name(key.key)),
+    }
+}
+
+/// The debug selector of one `Switch` row.
+///
+/// The row is named after the same key its picker is, so a test can ask whether
+/// the picker is drawn inside the row and where it sits on it.
+fn switch_row_selector(key: ColorKey) -> String {
+    let name = indicator_name(key.id);
+    format!("TEST_PANEL_SWITCH_ROW_{name}_{}", color_key_name(key.key))
+}
+
+/// The name a colour key is written under in a test selector.
+fn color_key_name(key: SettingKey) -> &'static str {
+    match key {
+        SettingKey::DifColor => "DIF",
+        SettingKey::DeaColor => "DEA",
+        SettingKey::KColor => "K",
+        SettingKey::DColor => "D",
+        SettingKey::JColor => "J",
+        _ => panic!("only a colour setting names a colour selector"),
+    }
+}
+
+/// The short name an indicator is written under in a test selector.
+fn indicator_name(id: IndicatorId) -> &'static str {
+    match id {
         IndicatorId::Ma => "MA",
         IndicatorId::Ema => "EMA",
         IndicatorId::Vol => "VOL",
         IndicatorId::Macd => "MACD",
         IndicatorId::Rsi => "RSI",
         IndicatorId::Kdj => "KDJ",
-    };
-    format!("TEST_PANEL_CARET_{name}")
+    }
 }
