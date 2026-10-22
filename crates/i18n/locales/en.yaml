@@ -486,6 +486,32 @@ widget:
     days_one: Day
     hours: Hours
     hours_one: Hour
+    indicator:
+      add_line: Add line
+      d: D
+      dea: DEA
+      dif: DIF
+      ema: EMA
+      j: J
+      k: K
+      kdj: KDJ
+      line_color: Line colour
+      lines: Lines
+      long_period: Long period
+      ma: MA
+      macd: MACD
+      main: Main chart
+      period: Period
+      period_invalid: The period must be an integer from 1 to 500
+      remove_line: Remove line
+      rsi: RSI
+      settings: Chart settings
+      short_period: Short period
+      signal_period: Signal period
+      smoothing_1: Smoothing 1
+      smoothing_2: Smoothing 2
+      sub: Sub chart
+      vol: VOL
     minutes: Minutes
     minutes_one: Minute
     months: Months

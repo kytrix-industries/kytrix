@@ -1,13 +1,14 @@
 //! Everything that turns chart values into shaped text.
 //!
 //! Shaping is the expensive part of drawing this chart: one axis tick is a text
-//! layout, and a frame draws dozens of them plus a hover label whose runs change
-//! with the candle under the cursor. Both are therefore shaped once and reused:
+//! layout, and a frame draws dozens of them plus an OHLCV readout whose runs
+//! change with the candle being described. Both are therefore shaped once and
+//! reused:
 //!
 //! - [`ChartTextCache`] keeps the last [`TEXT_CACHE_CAPACITY`] `(text, colour)`
 //!   layouts, so ticks that did not move are not re-shaped as the chart pans,
-//! - [`HoverLabelCache`] keeps the single most recent label together with every
-//!   input that produced it, so moving the cursor *within* one candle re-uses the
+//! - [`ReadoutCache`] keeps the single most recent line together with every
+//!   input that produced it, so a pointer moving *within* one candle re-uses the
 //!   shaped line instead of re-shaping it on every mouse move.
 //!
 //! Both caches are keyed on the window's text style as well as on their own
@@ -30,9 +31,10 @@ use crate::{model::CandlePrices, time::format_crosshair_time};
 
 /// Font size of every axis and tag label.
 pub(crate) const AXIS_FONT_SIZE: f32 = 10.0;
-/// Font size of the hover label.
-pub(crate) const HOVER_LABEL_FONT_SIZE: f32 = 11.0;
-pub(crate) const HOVER_LABEL_LINE_HEIGHT: f32 = 14.0;
+/// Font size of the OHLCV readout line.
+pub(crate) const READOUT_FONT_SIZE: f32 = 11.0;
+/// Height of one text row: axis ticks, tags, legends and the readout all use it.
+pub(crate) const TEXT_ROW_HEIGHT: f32 = 14.0;
 const TEXT_CACHE_CAPACITY: usize = 256;
 
 /// What a candle's traded size reads as when it published none.
@@ -124,23 +126,23 @@ impl ChartTextCache {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HoverLabelTone {
+enum ReadoutTone {
     Muted,
     Candle,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct HoverLabelSpan {
+struct ReadoutSpan {
     text: SmolStr,
-    tone: HoverLabelTone,
+    tone: ReadoutTone,
     bold: bool,
 }
 
-impl HoverLabelSpan {
+impl ReadoutSpan {
     fn key(text: &'static str) -> Self {
         Self {
             text: SmolStr::new_static(text),
-            tone: HoverLabelTone::Muted,
+            tone: ReadoutTone::Muted,
             bold: true,
         }
     }
@@ -148,7 +150,7 @@ impl HoverLabelSpan {
     fn muted(text: &'static str) -> Self {
         Self {
             text: SmolStr::new_static(text),
-            tone: HoverLabelTone::Muted,
+            tone: ReadoutTone::Muted,
             bold: false,
         }
     }
@@ -156,21 +158,21 @@ impl HoverLabelSpan {
     fn candle(text: impl AsRef<str>) -> Self {
         Self {
             text: SmolStr::new(text.as_ref()),
-            tone: HoverLabelTone::Candle,
+            tone: ReadoutTone::Candle,
             bold: false,
         }
     }
 }
 
-/// The hover label, already shaped.
+/// The readout line and the crosshair's time tag, already shaped.
 #[derive(Clone)]
-pub(crate) struct HoverLabelPresentation {
+pub(crate) struct ReadoutPresentation {
     pub time_label: SharedString,
     pub line: Arc<ShapedLine>,
 }
 
-/// Every input that decides what the hover label looks like.
-struct HoverLabelCacheInput<'a> {
+/// Every input that decides what the readout looks like.
+struct ReadoutCacheInput<'a> {
     candle: &'a ListingCandlestick,
     previous_close: Option<Price>,
     price_tick: Tick,
@@ -183,7 +185,7 @@ struct HoverLabelCacheInput<'a> {
     candle_color: Hsla,
 }
 
-struct HoverLabelCacheEntry {
+struct ReadoutCacheEntry {
     candle: ListingCandlestick,
     previous_close: Option<Price>,
     price_tick: Tick,
@@ -193,11 +195,11 @@ struct HoverLabelCacheEntry {
     text_style: TextStyle,
     muted_color: Hsla,
     candle_color: Hsla,
-    presentation: HoverLabelPresentation,
+    presentation: ReadoutPresentation,
 }
 
-impl HoverLabelCacheEntry {
-    fn matches(&self, input: &HoverLabelCacheInput<'_>) -> bool {
+impl ReadoutCacheEntry {
+    fn matches(&self, input: &ReadoutCacheInput<'_>) -> bool {
         self.candle == *input.candle
             && self.previous_close == input.previous_close
             && self.price_tick == input.price_tick
@@ -210,19 +212,18 @@ impl HoverLabelCacheEntry {
     }
 }
 
-/// The hover label of the candle the cursor is over, shaped at most once per
-/// candle.
+/// The readout of the candle being described, shaped at most once per candle.
 #[derive(Default)]
-pub(crate) struct HoverLabelCache {
-    entry: Option<HoverLabelCacheEntry>,
+pub(crate) struct ReadoutCache {
+    entry: Option<ReadoutCacheEntry>,
 }
 
-impl HoverLabelCache {
+impl ReadoutCache {
     pub(crate) fn clear(&mut self) {
         self.entry = None;
     }
 
-    /// Shapes the label of `candle`, reading its traded size in `volume_unit`.
+    /// Shapes the readout for `candle`, reading its traded size in `volume_unit`.
     ///
     /// The unit is the text the candle's own quantity is labelled with — an asset
     /// name, a contract count — so the size the label shows says what it counts
@@ -237,12 +238,12 @@ impl HoverLabelCache {
         volume_unit: &SharedString,
         theme: &Theme,
         window: &Window,
-    ) -> HoverLabelPresentation {
+    ) -> ReadoutPresentation {
         let previous_close = previous.map(|candle| CandlePrices::of(candle).close());
         let text_style = window.text_style();
         let muted_color = theme.roles.fg.muted.hsla;
         let candle_color = candle_color(candle, &theme.components.chart);
-        let cache_input = HoverLabelCacheInput {
+        let cache_input = ReadoutCacheInput {
             candle,
             previous_close,
             price_tick,
@@ -261,11 +262,11 @@ impl HoverLabelCache {
             return entry.presentation.clone();
         }
 
-        let presentation = HoverLabelPresentation {
+        let presentation = ReadoutPresentation {
             time_label: SharedString::new(
                 format_crosshair_time(candle.timestamp, interval, zone).as_str(),
             ),
-            line: Arc::new(shape_hover_label(
+            line: Arc::new(shape_readout(
                 candle,
                 previous,
                 price_tick,
@@ -276,7 +277,7 @@ impl HoverLabelCache {
                 window,
             )),
         };
-        self.entry = Some(HoverLabelCacheEntry {
+        self.entry = Some(ReadoutCacheEntry {
             candle: candle.clone(),
             previous_close,
             price_tick,
@@ -292,51 +293,46 @@ impl HoverLabelCache {
     }
 }
 
-fn hover_label_spans(
+fn readout_spans(
     candle: &ListingCandlestick,
     previous: Option<&ListingCandlestick>,
     price_tick: Tick,
     volume_unit: &str,
-) -> Vec<HoverLabelSpan> {
+) -> Vec<ReadoutSpan> {
     let prices = CandlePrices::of(candle);
     let mut spans = Vec::with_capacity(23);
-    spans.push(HoverLabelSpan::key("O"));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(
+    spans.push(ReadoutSpan::key("O"));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(
         prices.open().format_and_round_tick(price_tick),
     ));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::key("H"));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::key("H"));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(
         prices.high().format_and_round_tick(price_tick),
     ));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::key("L"));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::key("L"));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(
         prices.low().format_and_round_tick(price_tick),
     ));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::key("C"));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::key("C"));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(
         prices.close().format_and_round_tick(price_tick),
     ));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::key("V"));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(format_traded_size(
-        candle,
-        volume_unit,
-    )));
-    spans.push(HoverLabelSpan::muted(" "));
-    spans.push(HoverLabelSpan::candle(format_price_change(
-        candle, price_tick,
-    )));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::key("V"));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(format_traded_size(candle, volume_unit)));
+    spans.push(ReadoutSpan::muted(" "));
+    spans.push(ReadoutSpan::candle(format_price_change(candle, price_tick)));
     if let Some(amplitude) = format_amplitude(candle, previous) {
-        spans.push(HoverLabelSpan::muted(" "));
-        spans.push(HoverLabelSpan::candle(amplitude));
+        spans.push(ReadoutSpan::muted(" "));
+        spans.push(ReadoutSpan::candle(amplitude));
     }
     spans
 }
@@ -353,7 +349,7 @@ fn format_traded_size(candle: &ListingCandlestick, volume_unit: &str) -> SmolStr
     )
 }
 
-fn shape_hover_label(
+fn shape_readout(
     candle: &ListingCandlestick,
     previous: Option<&ListingCandlestick>,
     price_tick: Tick,
@@ -363,7 +359,7 @@ fn shape_hover_label(
     text_style: &TextStyle,
     window: &Window,
 ) -> ShapedLine {
-    let spans = hover_label_spans(candle, previous, price_tick, volume_unit);
+    let spans = readout_spans(candle, previous, price_tick, volume_unit);
     let text_capacity = spans.iter().map(|span| span.text.len()).sum();
     let mut text = String::with_capacity(text_capacity);
     let mut runs = Vec::with_capacity(spans.len());
@@ -371,8 +367,8 @@ fn shape_hover_label(
     let bold_font = font.clone().bold();
     for span in spans {
         let color = match span.tone {
-            HoverLabelTone::Muted => muted_color,
-            HoverLabelTone::Candle => candle_color,
+            ReadoutTone::Muted => muted_color,
+            ReadoutTone::Candle => candle_color,
         };
         runs.push(TextRun {
             len: span.text.len(),
@@ -389,7 +385,7 @@ fn shape_hover_label(
 
     window.text_system().shape_line(
         SharedString::new(text.as_str()),
-        px(HOVER_LABEL_FONT_SIZE),
+        px(READOUT_FONT_SIZE),
         &runs,
         None,
     )
@@ -411,6 +407,16 @@ pub(crate) fn format_price(inner: f64, tick: Tick) -> SmolStr {
     Price::from_inner(inner).format_and_round_tick(tick)
 }
 
+/// Formats a signed chart coordinate, rounded to the market's tick.
+///
+/// The MACD sub plot spans `[-m, +m]`, so its axis and legend need a formatter
+/// that keeps the sign: [`format_price`] clamps at zero and would label every
+/// negative tick as `0`. RSI, KDJ and volume are non-negative and do not use it.
+pub(crate) fn format_signed_price(inner: f64, tick: Tick) -> SmolStr {
+    let inner = inner.clamp(i128::MIN as f64, i128::MAX as f64).round() as i128;
+    ProfitOrLoss::from_inner(inner).format_and_round_tick(tick)
+}
+
 /// Formats a chart coordinate as a volume with a `K` / `M` suffix.
 pub(crate) fn format_volume(inner: f64) -> SmolStr {
     let scale = Quantity::from(1_u64).inner();
@@ -427,7 +433,7 @@ fn format_volume_inner(inner: u128) -> SmolStr {
     format_volume_with_unit(inner, scale, divisor, suffix)
 }
 
-fn format_price_change(candle: &ListingCandlestick, price_tick: Tick) -> SmolStr {
+pub(crate) fn format_price_change(candle: &ListingCandlestick, price_tick: Tick) -> SmolStr {
     let prices = CandlePrices::of(candle);
     let close = prices.close().inner();
     let open = prices.open().inner();
@@ -441,7 +447,7 @@ fn format_price_change(candle: &ListingCandlestick, price_tick: Tick) -> SmolStr
 
 /// How far the candle moved between its low and its high, against the previous
 /// close. Absent when there is no previous candle to measure against.
-fn format_amplitude(
+pub(crate) fn format_amplitude(
     candle: &ListingCandlestick,
     previous: Option<&ListingCandlestick>,
 ) -> Option<SmolStr> {
@@ -536,13 +542,13 @@ mod tests {
         }
     }
 
-    fn hover_label_text(
+    fn readout_text(
         candle: &ListingCandlestick,
         previous: Option<&ListingCandlestick>,
         tick: Tick,
         volume_unit: &str,
     ) -> String {
-        hover_label_spans(candle, previous, tick, volume_unit)
+        readout_spans(candle, previous, tick, volume_unit)
             .into_iter()
             .map(|span| span.text)
             .map(|text| text.as_str().to_owned())
@@ -554,12 +560,12 @@ mod tests {
     }
 
     #[test]
-    fn hover_label_should_format_ohlcv_change_and_amplitude() {
+    fn readout_should_format_ohlcv_change_and_amplitude() {
         let previous = candle_with_ohlcv(1, "95", "105", "90", "100", "10");
         let candle = candle_with_ohlcv(2, "100", "110", "90", "105", "1234");
 
         assert_eq!(
-            hover_label_text(&candle, Some(&previous), tick("0.01"), "BTC"),
+            readout_text(&candle, Some(&previous), tick("0.01"), "BTC"),
             "O 100.00 H 110.00 L 90.00 C 105.00 V 1.234K BTC 5.00 20.00%"
         );
     }
@@ -567,7 +573,7 @@ mod tests {
     /// A traded size is read in the unit it was published with, and a candle that
     /// published none says so instead of showing a number nobody published.
     #[test]
-    fn hover_label_should_read_the_traded_size_in_its_own_unit() {
+    fn readout_should_read_the_traded_size_in_its_own_unit() {
         let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "12");
         let mut missing = candle.clone();
         missing.traded_quantity = None;
@@ -577,22 +583,22 @@ mod tests {
             unit: QuantityUnit::Contracts,
         });
 
-        assert!(hover_label_text(&candle, None, tick("0.01"), "BTC").contains("V 12.000 BTC"));
+        assert!(readout_text(&candle, None, tick("0.01"), "BTC").contains("V 12.000 BTC"));
         assert!(
-            hover_label_text(&contracts, None, tick("0.01"), "Contracts")
+            readout_text(&contracts, None, tick("0.01"), "Contracts")
                 .contains("V 12.000 Contracts")
         );
-        assert!(hover_label_text(&missing, None, tick("0.01"), "BTC").contains("V —"));
+        assert!(readout_text(&missing, None, tick("0.01"), "BTC").contains("V —"));
     }
 
     #[test]
-    fn hover_label_should_mark_every_numeric_span_as_candle_colored() {
+    fn readout_should_mark_every_numeric_span_as_candle_colored() {
         let previous = candle_with_ohlcv(1, "95", "105", "90", "100", "10");
         let candle = candle_with_ohlcv(2, "100", "110", "90", "105", "1234");
-        let spans = hover_label_spans(&candle, Some(&previous), tick("0.01"), "BTC");
+        let spans = readout_spans(&candle, Some(&previous), tick("0.01"), "BTC");
         let numeric_spans = spans
             .iter()
-            .filter(|span| span.tone == HoverLabelTone::Candle)
+            .filter(|span| span.tone == ReadoutTone::Candle)
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
@@ -611,10 +617,10 @@ mod tests {
     }
 
     #[test]
-    fn hover_label_should_bold_only_ohlcv_keys() {
+    fn readout_should_bold_only_ohlcv_keys() {
         let previous = candle_with_ohlcv(1, "95", "105", "90", "100", "10");
         let candle = candle_with_ohlcv(2, "100", "110", "90", "105", "1234");
-        let spans = hover_label_spans(&candle, Some(&previous), tick("0.01"), "BTC");
+        let spans = readout_spans(&candle, Some(&previous), tick("0.01"), "BTC");
         let bold_spans = spans
             .iter()
             .filter(|span| span.bold)
@@ -625,11 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn hover_label_should_omit_amplitude_when_previous_candle_is_absent() {
+    fn readout_should_omit_amplitude_when_previous_candle_is_absent() {
         let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "1234");
 
         assert_eq!(
-            hover_label_text(&candle, None, tick("0.01"), "BTC"),
+            readout_text(&candle, None, tick("0.01"), "BTC"),
             "O 100.00 H 110.00 L 90.00 C 105.00 V 1.234K BTC 5.00"
         );
     }
@@ -672,6 +678,30 @@ mod tests {
         let price = Price::from_str("4523.89562").expect("price should parse");
 
         assert_eq!(format_price(price.inner() as f64, tick("0.01")), "4523.90");
+    }
+
+    /// The MACD axis has a negative half, so the signed formatter has to keep the
+    /// sign. The plain one deliberately keeps clamping prices at zero.
+    #[test]
+    fn format_signed_price_should_keep_a_negative_sign() {
+        let price = Price::from_str("1.234").expect("price should parse");
+        let inner = price.inner() as f64;
+
+        assert_eq!(format_signed_price(-inner, tick("0.01")), "-1.23");
+        assert_eq!(format_signed_price(inner, tick("0.01")), "1.23");
+    }
+
+    #[test]
+    fn format_price_should_clamp_what_format_signed_price_keeps() {
+        let price = Price::from_str("1.234").expect("price should parse");
+        let inner = -(price.inner() as f64);
+
+        assert_eq!(
+            format_price(inner, tick("0.01")),
+            "0.00",
+            "the price formatter clamps at zero"
+        );
+        assert_eq!(format_signed_price(inner, tick("0.01")), "-1.23");
     }
 
     #[test]
@@ -757,6 +787,136 @@ mod tests {
                 candle_color(&flat, chart),
             ],
             [chart.bullish.hsla, chart.bearish.hsla, chart.bullish.hsla]
+        );
+    }
+
+    /// A minimal view that exists only to give the cache a real window.
+    struct CacheProbe;
+
+    impl gpui_kit::Render for CacheProbe {
+        fn render(
+            &mut self,
+            _window: &mut gpui_kit::Window,
+            _cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            gpui_kit::div()
+        }
+    }
+
+    /// The unit a size is read in is part of the cache key: the same candle with
+    /// two different units must not reuse the first presentation.
+    ///
+    /// Without this, a chart whose quantity unit changes (a relabelled asset, a
+    /// contract renamed) would keep printing the old unit until the candle
+    /// changed.
+    #[gpui_kit::test]
+    fn the_readout_cache_should_key_on_the_volume_unit(cx: &mut gpui_kit::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let (_, window) = cx.add_window_view(|_, _| CacheProbe);
+        let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "1234");
+        let previous = candle_with_ohlcv(0, "95", "105", "90", "100", "10");
+
+        let (first, second) = window.update(|window, _| {
+            let theme = Theme::default();
+            let mut cache = ReadoutCache::default();
+            let first = cache.presentation(
+                &candle,
+                Some(&previous),
+                tick("0.01"),
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                &SharedString::new_static("BTC"),
+                &theme,
+                window,
+            );
+            let second = cache.presentation(
+                &candle,
+                Some(&previous),
+                tick("0.01"),
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                &SharedString::new_static("Contracts"),
+                &theme,
+                window,
+            );
+            (first, second)
+        });
+
+        assert!(
+            first.line.text.contains("BTC"),
+            "the first presentation reads the size in BTC: {:?}",
+            first.line.text
+        );
+        assert!(
+            second.line.text.contains("Contracts"),
+            "the second presentation reads the size in Contracts: {:?}",
+            second.line.text
+        );
+        assert_ne!(
+            first.line.text, second.line.text,
+            "a different unit must produce a different readout text"
+        );
+        assert!(
+            !Arc::ptr_eq(&first.line, &second.line),
+            "the cache must re-shape rather than return the first entry"
+        );
+    }
+
+    /// The cache returns the very same shaped line when every input matches.
+    ///
+    /// This is what makes a pointer moving *within* one candle cheap: the second
+    /// call must not re-shape. It is also the only test that pins the hit path —
+    /// the unit test above pins the miss path.
+    #[gpui_kit::test]
+    fn the_readout_cache_should_reuse_the_same_line_for_the_same_candle(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            base_ui::style::theme::install(cx);
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+        });
+        let (_, window) = cx.add_window_view(|_, _| CacheProbe);
+        let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "1234");
+        let previous = candle_with_ohlcv(0, "95", "105", "90", "100", "10");
+
+        let (first, second) = window.update(|window, _| {
+            let theme = Theme::default();
+            let mut cache = ReadoutCache::default();
+            let first = cache.presentation(
+                &candle,
+                Some(&previous),
+                tick("0.01"),
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                &SharedString::new_static("BTC"),
+                &theme,
+                window,
+            );
+            let second = cache.presentation(
+                &candle,
+                Some(&previous),
+                tick("0.01"),
+                TimeFrame::Minute1,
+                UtcOffset::UTC,
+                &SharedString::new_static("BTC"),
+                &theme,
+                window,
+            );
+            (first, second)
+        });
+
+        assert!(
+            Arc::ptr_eq(&first.line, &second.line),
+            "identical inputs must reuse the shaped line instead of re-shaping it"
+        );
+        assert_eq!(
+            first.time_label, second.time_label,
+            "the reused presentation carries the same time label"
         );
     }
 }

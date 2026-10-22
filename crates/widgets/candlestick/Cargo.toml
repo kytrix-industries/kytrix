@@ -9,7 +9,9 @@ futures = { workspace = true }
 gpui-kit = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
