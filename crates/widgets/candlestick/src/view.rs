@@ -6197,7 +6197,7 @@ pub(crate) mod tests {
             assert_eq!(
                 built.reports(),
                 before,
-                "closing the panel for a market that went away writes nothing back"
+                "closing the panel for a market that went away writes nothing back when no colour preview is pending"
             );
         });
     }

@@ -599,8 +599,12 @@ fn kdj_with_every_line_switched_off_should_draw_an_empty_series() {
     assert_eq!(series.legend, "KDJ(3,2,2)");
 }
 
-// Every computed line is painted in the colour its settings store; the MACD
-// histogram is the one line whose colour is not configurable and stays fixed.
+// Every computed line carries the colour its settings store. A `Line` line is
+// painted in it and its sub-plot legend entry is drawn in it, but not every
+// stored colour is drawn: the MACD histogram's bars use the bullish/bearish
+// market colours, and the sub-plot legend does not list its `Histogram` line.
+// The fixed third colour is therefore only the value the model gives the
+// histogram line, not a colour the user sees.
 #[test]
 fn computed_lines_should_carry_the_configured_colours() {
     fn color(h: f32) -> LineColor {
@@ -673,7 +677,7 @@ fn computed_lines_should_carry_the_configured_colours() {
     assert_eq!(
         line_of(macd, "MACD").color,
         Hsla::from(default_line_color(2)),
-        "the histogram keeps the fixed third colour"
+        "the histogram line keeps the fixed third colour; neither its bars nor the legend draw it"
     );
 
     let kdj = series_of(&series, IndicatorId::Kdj);

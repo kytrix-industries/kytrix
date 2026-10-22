@@ -52,7 +52,13 @@ pub(crate) struct ValueRange {
 pub(crate) struct IndicatorLine {
     /// The line's name, e.g. `MA5`, `DIF` or `J`.
     pub label: SmolStr,
-    /// The colour the line and its legend entry are drawn in.
+    /// The colour a [`LineShape::Line`] is painted in, and the colour its legend
+    /// entry uses.
+    ///
+    /// A [`LineShape::Histogram`] line carries a colour only for the model's
+    /// completeness: its bars are painted in the market's bullish/bearish colours
+    /// and the sub-plot legend does not list it, so its stored colour is never
+    /// drawn.
     pub color: Hsla,
     /// One entry per candle; `None` means the value is not defined there.
     pub values: Vec<Option<f64>>,

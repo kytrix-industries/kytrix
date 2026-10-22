@@ -5241,6 +5241,63 @@ mod tests {
         );
     }
 
+    /// A legend entry is drawn in the colour of the line it describes.
+    ///
+    /// The module's `test_line` helper hardcodes white, so this test builds the
+    /// lines itself with distinctive colours: an entry that inherited the axis
+    /// colour, the theme's default or another line's colour would fail.
+    #[test]
+    fn legend_entries_should_carry_the_line_colour() {
+        let tick = test_tick();
+        let snapshot = snapshot_with_candles(1);
+        let axis_color = gpui_kit::white();
+        let main_color = gpui_kit::hsla(0.2, 0.5, 0.4, 1.0);
+        let sub_color = gpui_kit::hsla(0.6, 0.4, 0.5, 1.0);
+
+        let main = [test_series(
+            IndicatorId::Ma,
+            "MA",
+            vec![IndicatorLine {
+                label: SmolStr::new_static("MA5"),
+                color: main_color,
+                values: vec![Some(42.0)],
+                readable_from: 0,
+                shape: LineShape::Line,
+            }],
+            Vec::new(),
+        )];
+        let entries = main_indicator_legend(&main, 0, tick);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].color, main_color,
+            "the main legend shows the line's own colour"
+        );
+
+        // KDJ's first entry is the formula, so the line's entry is the second.
+        let kdj = [test_series(
+            IndicatorId::Kdj,
+            "KDJ(9,3,3)",
+            vec![IndicatorLine {
+                label: SmolStr::new_static("K"),
+                color: sub_color,
+                values: vec![Some(52.14)],
+                readable_from: 0,
+                shape: LineShape::Line,
+            }],
+            vec![20.0, 80.0],
+        )];
+        let entries = sub_plot_legend(IndicatorId::Kdj, &kdj, 0, &snapshot, tick, axis_color);
+        assert_eq!(entries.len(), 2, "the formula entry then the K line");
+        assert_eq!(
+            entries[0].color, axis_color,
+            "the formula entry belongs to the axis, not to a line"
+        );
+        assert_eq!(
+            entries[1].color, sub_color,
+            "the second entry is the line's, in its own colour"
+        );
+    }
+
     /// A J that is a hair below zero has no meaningful negative magnitude, but
     /// `{:.1}` would print it as `-0.0`; the readout must round to `0.0`.
     #[test]
