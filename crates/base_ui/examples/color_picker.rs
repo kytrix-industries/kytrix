@@ -41,8 +41,10 @@ impl Render for ColorPickerExample {
             self.subscription = Some(cx.subscribe(
                 &picker,
                 |this, _, event: &ColorPickerEvent, cx| {
-                    let ColorPickerEvent::ColorChanged(color) = event;
-                    this.accent = *color;
+                    match event {
+                        ColorPickerEvent::ColorChanged(color) => this.accent = *color,
+                        ColorPickerEvent::ColorCommitted(color) => this.accent = *color,
+                    }
                     cx.notify();
                 },
             ));

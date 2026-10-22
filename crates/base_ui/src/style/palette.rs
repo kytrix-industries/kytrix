@@ -77,8 +77,12 @@ pub struct Palette {
     pub status: StatusPalette,
     /// The two market directions.
     pub market: MarketPalette,
-    /// The three series a multi-line or multi-bar chart is drawn with.
-    pub series: [Oklch; 3],
+    /// The six series a multi-line or multi-bar chart is drawn with, in the order a chart gives
+    /// them to new lines: warm amber, violet, cyan, rose, yellow-green and neutral gray.
+    ///
+    /// The first three are the colors the chart shipped with and do not change; the three after
+    /// them extend the set without moving any of those.
+    pub series: [Oklch; 6],
     /// Text drawn on a saturated fill (`brand`, `status.danger`).
     pub on_brand: Oklch,
     /// Text drawn on the inverse block (a tooltip, a solid neutral badge).
@@ -125,6 +129,9 @@ impl Palette {
                 Oklch::new(0.620, 0.140, 62.0, opacity),
                 Oklch::new(0.500, 0.150, 276.0, opacity),
                 Oklch::new(0.560, 0.130, 194.0, opacity),
+                Oklch::new(0.560, 0.170, 350.0, opacity),
+                Oklch::new(0.540, 0.130, 120.0, opacity),
+                Oklch::new(0.500, 0.010, 0.0, opacity),
             ],
             on_brand: Oklch::new(0.978, 0.0, 0.0, opacity),
             on_inverse: Oklch::new(0.978, 0.0, 0.0, opacity),
@@ -169,6 +176,9 @@ impl Palette {
                 Oklch::new(0.800, 0.150, 78.0, opacity),
                 Oklch::new(0.720, 0.130, 282.0, opacity),
                 Oklch::new(0.780, 0.120, 196.0, opacity),
+                Oklch::new(0.740, 0.170, 350.0, opacity),
+                Oklch::new(0.700, 0.140, 120.0, opacity),
+                Oklch::new(0.660, 0.010, 0.0, opacity),
             ],
             on_brand: Oklch::new(0.176, 0.020, 245.0, opacity),
             on_inverse: Oklch::new(0.176, 0.016, 252.4, opacity),

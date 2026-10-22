@@ -7,6 +7,12 @@
 //! rebuilding either. This is the split [`crate::input::InputState`] uses: the caller holds the
 //! entity and listens to it.
 //!
+//! It reports two events. [`ColorPickerEvent::ColorChanged`] fires on every user change, so a
+//! caller can paint the color live; [`ColorPickerEvent::ColorCommitted`] fires once, when the popup
+//! closes on a color different from the baseline it opened with, so a caller can persist one value
+//! per interaction. [`ColorPicker::set_color`] emits neither: a programmatic change is not a user
+//! action.
+//!
 //! The popup is not the picker's private machinery: [`crate::overlay::Overlay`] owns when the
 //! panel is mounted, where it is placed and how it fades, and [`crate::input::InputState`] owns
 //! the hex field's editing state. The picker only decides what the trigger and the panel
@@ -102,8 +108,16 @@ pub enum ColorPickerTab {
 pub enum ColorPickerEvent {
     /// A user action changed the color.
     ///
+    /// It fires on every user change, so a caller can paint a live preview.
     /// [`ColorPicker::set_color`] does not emit this: a programmatic change is silent.
     ColorChanged(Hsla),
+    /// The popup closed on a color different from the baseline it opened with.
+    ///
+    /// It reports the final color, so a caller can persist once per interaction rather than on
+    /// every [`ColorPickerEvent::ColorChanged`]. The baseline is the color the popup opened with;
+    /// a programmatic [`ColorPicker::set_color`] while the popup is open moves that baseline, so
+    /// closing after only a programmatic change emits nothing.
+    ColorCommitted(Hsla),
 }
 
 /// Every piece of text the panel shows, so a caller can localize it.
@@ -144,9 +158,16 @@ impl Default for ColorPickerLabels {
 /// ```ignore
 /// let picker = cx.new(|cx| ColorPicker::new(accent, UnifiedSize::Small, window, cx));
 /// let subscription = cx.subscribe(&picker, |this, _, event: &ColorPickerEvent, cx| {
-///     let ColorPickerEvent::ColorChanged(color) = event;
-///     this.accent = *color;
-///     cx.notify();
+///     match event {
+///         ColorPickerEvent::ColorChanged(color) => {
+///             this.accent = *color;
+///             cx.notify();
+///         }
+///         ColorPickerEvent::ColorCommitted(color) => {
+///             this.accent = *color;
+///             cx.notify();
+///         }
+///     }
 /// });
 /// ```
 ///
@@ -157,6 +178,10 @@ impl Default for ColorPickerLabels {
 /// opening repaints them, and the caller only has to draw the entity it stored.
 pub struct ColorPicker {
     color: Hsla,
+    /// The baseline the popup opened with, taken back when it closes to decide whether the user
+    /// changed anything worth committing. A programmatic `set_color` while the popup is open moves
+    /// it.
+    opened_with: Option<Hsla>,
     hovered_swatch: Option<usize>,
     active_tab: ColorPickerTab,
     labels: ColorPickerLabels,
@@ -205,14 +230,18 @@ impl ColorPicker {
             },
         );
         // Closing the panel has to clear a hover preview as well: the pointer may have left the
-        // palette before the outside press, but the footer should still show the real color.
+        // palette before the outside press, but the footer should still show the real color. The
+        // same observer records the color the popup opened with and reports the final one when it
+        // closes, so a caller persists once per interaction instead of on every slider tick.
         let open_subscription = cx.observe_in(&open, window, |this, _, window, cx| {
             this.clear_preview(window, cx);
+            this.sync_open_state(cx);
             cx.notify();
         });
 
         Self {
             color: default_color,
+            opened_with: None,
             hovered_swatch: None,
             active_tab: ColorPickerTab::default(),
             labels: ColorPickerLabels::default(),
@@ -249,11 +278,46 @@ impl ColorPicker {
     ///
     /// The hex field is synchronized and the picker repaints, but no
     /// [`ColorPickerEvent::ColorChanged`] is emitted: a programmatic change is not a user action.
+    /// If the popup is open, the color also becomes the one it is considered to have opened with,
+    /// so closing it emits no [`ColorPickerEvent::ColorCommitted`] either.
     pub fn set_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
         self.hovered_swatch = None;
         self.color = color;
+
+        if let Some(opened_with) = self.opened_with.as_mut() {
+            *opened_with = color;
+        }
+
         self.write_hex(color, window, cx);
         cx.notify();
+    }
+
+    /// Records the color the popup opened with, or emits the one it closed on.
+    ///
+    /// The open flag is written by the trigger, by a palette choice and by the overlay's outside
+    /// press (`overlay.rs`), which is the usual close path, so one interaction emits at most one
+    /// [`ColorPickerEvent::ColorCommitted`]: a real open transition stores the color the popup
+    /// starts from (a repeated open notify leaves that baseline alone), and closing takes it back
+    /// and reports the current color only when the two differ. The flag is copied out before
+    /// anything is written, so reading it does not borrow the picker across the mutation.
+    fn sync_open_state(&mut self, cx: &mut Context<Self>) {
+        let opened = *self.open.read(cx);
+
+        if opened {
+            if self.opened_with.is_none() {
+                self.opened_with = Some(self.color);
+            }
+
+            return;
+        }
+
+        let Some(opened_with) = self.opened_with.take() else {
+            return;
+        };
+
+        if self.color != opened_with {
+            cx.emit(ColorPickerEvent::ColorCommitted(self.color));
+        }
     }
 
     /// Switches the panel to `tab`.
@@ -1811,6 +1875,7 @@ mod tests {
     struct Harness {
         picker: Entity<ColorPicker>,
         changes: Rc<RefCell<Vec<Hsla>>>,
+        commits: Rc<RefCell<Vec<Hsla>>>,
         _subscription: Subscription,
     }
 
@@ -1818,15 +1883,26 @@ mod tests {
         fn with_size(size: UnifiedSize, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let picker = cx.new(|cx| ColorPicker::new(DEFAULT_COLOR, size, window, cx));
             let changes = Rc::new(RefCell::new(Vec::new()));
-            let sink = changes.clone();
-            let subscription = cx.subscribe(&picker, move |_, _, event: &ColorPickerEvent, _| {
-                let ColorPickerEvent::ColorChanged(color) = event;
-                sink.borrow_mut().push(*color);
-            });
+            let commits = Rc::new(RefCell::new(Vec::new()));
+            let change_sink = changes.clone();
+            let commit_sink = commits.clone();
+            let subscription =
+                cx.subscribe(
+                    &picker,
+                    move |_, _, event: &ColorPickerEvent, _| match event {
+                        ColorPickerEvent::ColorChanged(color) => {
+                            change_sink.borrow_mut().push(*color);
+                        }
+                        ColorPickerEvent::ColorCommitted(color) => {
+                            commit_sink.borrow_mut().push(*color);
+                        }
+                    },
+                );
 
             Self {
                 picker,
                 changes,
+                commits,
                 _subscription: subscription,
             }
         }
@@ -2742,6 +2818,299 @@ mod tests {
             "closing the panel clears the hover preview"
         );
         assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
+    }
+
+    /// Choosing a swatch is the shortest commit path: the palette selection emits the change and
+    /// closes the popup in one update, so the commit the observer reports carries the final color.
+    #[gpui_kit::test]
+    fn choosing_a_palette_swatch_should_commit_the_final_color_once(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_click(cell, Modifiers::none());
+        settle(cx);
+
+        let swatch = PALETTE[28];
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            swatch,
+            "the chosen swatch is the color the popup closes on"
+        );
+        assert_eq!(changes.borrow().as_slice(), &[swatch]);
+        assert_eq!(
+            commits.borrow().as_slice(),
+            &[swatch],
+            "choosing a swatch emits exactly one commit carrying the final color"
+        );
+        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
+    }
+
+    /// A slider change is a live edit, not a commit: only closing the popup reports the color,
+    /// and the value it reports is the one the interaction ended on.
+    #[gpui_kit::test]
+    fn closing_after_a_slider_change_should_commit_the_final_color_once(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let target = track_point(cx, HslaChannel::Hue, 0.25);
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let changed = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (changed.h - 0.25).abs() < 1e-4,
+            "the slider click changes the color, not just the preview"
+        );
+        assert!(
+            commits.borrow().is_empty(),
+            "an open popup commits nothing while the user is still editing"
+        );
+
+        let outside = point(px(850.), px(750.));
+        cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        settle(cx);
+
+        assert!(!panel_is_drawn(cx), "the outside press closes the panel");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            changed,
+            "closing does not change the color"
+        );
+        assert_eq!(
+            commits.borrow().as_slice(),
+            &[changed],
+            "closing after a slider change emits exactly one commit with the final color"
+        );
+    }
+
+    /// Opening and closing without touching the color is not an interaction to persist.
+    #[gpui_kit::test]
+    fn opening_and_closing_on_the_same_color_should_not_commit(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        assert!(panel_is_drawn(cx));
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert!(!panel_is_drawn(cx), "the second press closes the panel");
+        assert!(changes.borrow().is_empty());
+        assert!(
+            commits.borrow().is_empty(),
+            "a popup closed on the color it opened with commits nothing"
+        );
+    }
+
+    /// `set_color` is silent and does not turn a programmatic change into an interaction.
+    #[gpui_kit::test]
+    fn a_programmatic_change_should_not_commit_when_the_popup_closes(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+
+        let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_color(blue, window, cx));
+        });
+        cx.run_until_parked();
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        let green = hsla(1.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_color(green, window, cx));
+        });
+        settle(cx);
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert!(
+            !panel_is_drawn(cx),
+            "the second trigger press closes the panel"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.color()), green);
+        assert!(
+            changes.borrow().is_empty(),
+            "set_color emits no ColorChanged, whether closed or open"
+        );
+        assert!(
+            commits.borrow().is_empty(),
+            "a programmatic change is not committed when the popup closes"
+        );
+    }
+
+    /// The commit compares the final color with the one the popup opened with, so undoing the
+    /// edit before closing leaves nothing to persist.
+    #[gpui_kit::test]
+    fn restoring_the_opening_color_should_not_commit(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let target = track_point(cx, HslaChannel::Hue, 0.75);
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_ne!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "the edit moves the color away from the one the popup opened with"
+        );
+
+        // A track is addressed in pixels, so a click cannot land on the opening hue exactly; the
+        // channel's own entry point takes the exact fraction a drag back would aim for.
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_channel(HslaChannel::Hue, DEFAULT_COLOR.h, window, cx)
+            });
+        });
+        settle(cx);
+
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "the restored color is exactly the one the popup opened with"
+        );
+        assert!(
+            commits.borrow().is_empty(),
+            "an open popup commits nothing while the user is still editing"
+        );
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert!(!panel_is_drawn(cx));
+        assert_eq!(
+            changes.borrow().len(),
+            2,
+            "the edit and the restore are both ColorChanged events"
+        );
+        assert!(
+            commits.borrow().is_empty(),
+            "closing on the color the popup opened with commits nothing"
+        );
+    }
+
+    /// A repeated open notify must not move the baseline, and every interaction commits its own
+    /// final color: the first commit is not repeated by a no-op reopen, and a later edit commits
+    /// once more.
+    #[gpui_kit::test]
+    fn a_second_interaction_should_commit_on_its_own_after_the_first(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        let cell = point(
+            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        );
+        cx.simulate_click(cell, Modifiers::none());
+        settle(cx);
+
+        let first = PALETTE[28];
+        assert_eq!(commits.borrow().as_slice(), &[first]);
+
+        // Reopen and close without changing anything: the first commit is the only one.
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+        assert!(
+            !panel_is_drawn(cx),
+            "the second trigger press closes the reopened panel"
+        );
+        assert_eq!(
+            commits.borrow().as_slice(),
+            &[first],
+            "closing without a change must not commit the color again"
+        );
+
+        // A third interaction edits the color and commits it once more.
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+        let target = track_point(cx, HslaChannel::Hue, 0.75);
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let second = state.read_with(cx, |state, _| state.color());
+        assert_ne!(second, first, "the hue track moved the color");
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert_eq!(
+            commits.borrow().as_slice(),
+            &[first, second],
+            "each interaction commits exactly its own final color"
+        );
+    }
+
+    /// `Entity::write` notifies even when the open flag already says true; that repeat must not
+    /// reset the baseline and swallow the commit of an edit made before it.
+    #[gpui_kit::test]
+    fn a_repeated_open_notify_should_not_swallow_the_commit(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
+
+        let target = track_point(cx, HslaChannel::Hue, 0.75);
+        cx.simulate_click(target, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let edited = state.read_with(cx, |state, _| state.color());
+        assert!(
+            (edited.h - 0.75).abs() < 1e-4,
+            "the hue track changed the color before the repeated open notify"
+        );
+
+        state.update(cx, |state, cx| state.open.write(cx, true));
+        settle(cx);
+        assert!(
+            panel_is_drawn(cx),
+            "writing the open flag it already holds leaves the panel open"
+        );
+        assert!(
+            commits.borrow().is_empty(),
+            "an open popup commits nothing while the user is still editing"
+        );
+
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        settle(cx);
+
+        assert!(!panel_is_drawn(cx));
+        assert_eq!(
+            commits.borrow().as_slice(),
+            &[edited],
+            "a repeated open notify must not suppress the edit's commit"
+        );
     }
 
     #[gpui_kit::test]

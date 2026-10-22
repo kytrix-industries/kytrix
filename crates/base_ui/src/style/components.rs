@@ -458,8 +458,8 @@ pub struct ChartColors {
     pub bullish: ResolvedColor,
     /// A bearish candle or bar, a falling flow bar, a down tile.
     pub bearish: ResolvedColor,
-    /// The series a multi-line or multi-bar chart is drawn with, in order.
-    pub series: [ResolvedColor; 3],
+    /// The six series a multi-line or multi-bar chart is drawn with, in order.
+    pub series: [ResolvedColor; 6],
 }
 
 impl ChartColors {
