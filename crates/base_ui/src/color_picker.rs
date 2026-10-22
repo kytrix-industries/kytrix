@@ -157,7 +157,7 @@ impl Default for ColorPickerLabels {
 /// opening repaints them, and the caller only has to draw the entity it stored.
 pub struct ColorPicker {
     color: Hsla,
-    preview: Option<Hsla>,
+    hovered_swatch: Option<usize>,
     active_tab: ColorPickerTab,
     labels: ColorPickerLabels,
     size: UnifiedSize,
@@ -213,7 +213,7 @@ impl ColorPicker {
 
         Self {
             color: default_color,
-            preview: None,
+            hovered_swatch: None,
             active_tab: ColorPickerTab::default(),
             labels: ColorPickerLabels::default(),
             size,
@@ -250,7 +250,7 @@ impl ColorPicker {
     /// The hex field is synchronized and the picker repaints, but no
     /// [`ColorPickerEvent::ColorChanged`] is emitted: a programmatic change is not a user action.
     pub fn set_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview = None;
+        self.hovered_swatch = None;
         self.color = color;
         self.write_hex(color, window, cx);
         cx.notify();
@@ -285,7 +285,7 @@ impl ColorPicker {
             return;
         }
 
-        self.preview = None;
+        self.hovered_swatch = None;
         self.color = color;
 
         if sync_hex {
@@ -307,33 +307,40 @@ impl ColorPicker {
             return;
         };
 
-        self.clear_preview(window, cx);
         self.set_user_color(*swatch, true, window, cx);
+        // The pointer is still over this swatch, so keep the hover ring after committing. Set the
+        // field after `set_user_color` (which clears it for a real change): the render it queued
+        // then draws the ring, and the footer already shows the committed color.
+        self.hovered_swatch = Some(index);
     }
 
-    /// Shows `color` in the footer without making it the picker's color.
+    /// Shows the swatch at `index` in the footer and marks it as hovered.
     ///
     /// This is what a palette hover uses: the large swatch and the hex field follow the pointer,
-    /// but no [`ColorPickerEvent::ColorChanged`] is emitted and [`ColorPicker::color`] stays the
-    /// real selection. Passing `None` restores the footer to the real color.
-    fn set_preview_color(
+    /// while the palette draws a ring around the hovered cell. No
+    /// [`ColorPickerEvent::ColorChanged`] is emitted and [`ColorPicker::color`] stays the real
+    /// selection. Passing `None` restores the footer to the real color and removes the ring.
+    fn set_preview_swatch(
         &mut self,
-        color: Option<Hsla>,
+        index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.preview == color {
+        let index = index.filter(|index| *index < PALETTE.len());
+
+        if self.hovered_swatch == index {
             return;
         }
 
-        self.preview = color;
-        self.write_hex(color.unwrap_or(self.color), window, cx);
+        self.hovered_swatch = index;
+        let preview = index.and_then(|index| PALETTE.get(index).copied());
+        self.write_hex(preview.unwrap_or(self.color), window, cx);
         cx.notify();
     }
 
     /// Restores the footer to the real color after a palette hover.
     fn clear_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_preview_color(None, window, cx);
+        self.set_preview_swatch(None, window, cx);
     }
 
     /// Moves one HSLA channel to `t`, leaving the other three untouched.
@@ -452,7 +459,7 @@ impl Render for ColorPicker {
         let picker_entity_id = picker.entity_id();
         let picker_id: ElementId = ("color-picker", picker_entity_id).into();
         let color = self.color;
-        let preview = self.preview;
+        let hovered_swatch = self.hovered_swatch;
         let active_tab = self.active_tab;
         let labels = self.labels.clone();
         let size = self.size;
@@ -489,7 +496,7 @@ impl Render for ColorPicker {
                 render_panel(
                     picker,
                     color,
-                    preview,
+                    hovered_swatch,
                     active_tab,
                     labels,
                     hex_input,
@@ -513,7 +520,7 @@ impl Render for ColorPicker {
 fn render_panel(
     state: Entity<ColorPicker>,
     color: Hsla,
-    preview: Option<Hsla>,
+    hovered_swatch: Option<usize>,
     active: ColorPickerTab,
     labels: ColorPickerLabels,
     hex_input: Entity<InputState>,
@@ -523,7 +530,8 @@ fn render_panel(
 ) -> AnyElement {
     let content: AnyElement = match active {
         ColorPickerTab::Palette => {
-            PaletteGrid::new(state.clone(), labels.palette.clone()).into_any_element()
+            PaletteGrid::new(state.clone(), labels.palette.clone(), hovered_swatch)
+                .into_any_element()
         }
         ColorPickerTab::Hsla => div()
             .flex()
@@ -599,9 +607,13 @@ fn render_panel(
                         .gap_2()
                         .debug_selector(|| "TEST_COLOR_PICKER_HEX_INPUT".into())
                         .child(
-                            ColorWell::new(preview.unwrap_or(color))
-                                .size(px(30.))
-                                .radius(px(6.)),
+                            ColorWell::new(
+                                hovered_swatch
+                                    .and_then(|index| PALETTE.get(index).copied())
+                                    .unwrap_or(color),
+                            )
+                            .size(px(30.))
+                            .radius(px(6.)),
                         )
                         .child(div().flex_1().child(Input::new(&hex_input).medium())),
                 ),
@@ -722,18 +734,27 @@ impl RenderOnce for ColorWell {
 struct PaletteGrid {
     state: Entity<ColorPicker>,
     label: SharedString,
+    hovered: Option<usize>,
 }
 
 impl PaletteGrid {
-    /// Builds the grid for `state`.
-    fn new(state: Entity<ColorPicker>, label: SharedString) -> Self {
-        Self { state, label }
+    /// Builds the grid for `state`, outlining the hovered swatch if there is one.
+    fn new(state: Entity<ColorPicker>, label: SharedString, hovered: Option<usize>) -> Self {
+        Self {
+            state,
+            label,
+            hovered,
+        }
     }
 }
 
 impl RenderOnce for PaletteGrid {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let Self { state, label } = self;
+        let Self {
+            state,
+            label,
+            hovered,
+        } = self;
         let bounds = Rc::new(Cell::new(Bounds::default()));
         let prepaint_bounds = bounds.clone();
 
@@ -757,6 +778,9 @@ impl RenderOnce for PaletteGrid {
                         let scale = (bounds.size.width.as_f32() / PALETTE_SIZE)
                             .min(bounds.size.height.as_f32() / PALETTE_SIZE);
                         let cell_radius = px(4.0 * scale);
+                        let ring_inset = px(scale);
+                        let ring_width = px(2.0 * scale);
+                        let ring_radius = px(3.0 * scale);
 
                         for (index, color) in PALETTE.iter().enumerate() {
                             let cell = palette_cell_bounds(
@@ -766,6 +790,22 @@ impl RenderOnce for PaletteGrid {
                             );
 
                             window.paint_quad(fill(cell, *color).corner_radii(cell_radius));
+
+                            if hovered == Some(index) {
+                                let inner = Bounds::new(
+                                    point(cell.origin.x + ring_inset, cell.origin.y + ring_inset),
+                                    size(
+                                        cell.size.width - ring_inset * 2.0,
+                                        cell.size.height - ring_inset * 2.0,
+                                    ),
+                                );
+                                window.paint_quad(
+                                    fill(inner, hsla(0., 0., 0., 0.))
+                                        .border_widths(ring_width)
+                                        .border_color(hover_ring_color(*color))
+                                        .corner_radii(ring_radius),
+                                );
+                            }
                         }
                     },
                 )
@@ -778,17 +818,14 @@ impl RenderOnce for PaletteGrid {
 
                 move |event, window, cx| {
                     // A move that is still inside the grid but not over a cell is over a gap.
-                    // Keeping the previous preview there avoids the A -> real color -> B flash
-                    // the pointer would otherwise produce while crossing between two swatches.
+                    // Keeping the previous preview and ring there avoids the A -> real color -> B
+                    // flash the pointer would otherwise produce while crossing two swatches.
                     let Some(index) = palette_index_at(bounds.get(), event.position) else {
-                        return;
-                    };
-                    let Some(color) = PALETTE.get(index).copied() else {
                         return;
                     };
 
                     state.update(cx, |state, cx| {
-                        state.set_preview_color(Some(color), window, cx)
+                        state.set_preview_swatch(Some(index), window, cx)
                     });
                 }
             })
@@ -810,6 +847,21 @@ impl RenderOnce for PaletteGrid {
 
                 state.update(cx, |state, cx| state.select_palette(index, window, cx));
             })
+    }
+}
+
+/// The color of the ring around the hovered swatch.
+///
+/// The ring has to read at both ends of the ramp, so it flips with the swatch's luma rather than
+/// with the theme: a light swatch gets a dark ring and a dark swatch a light one.
+fn hover_ring_color(color: Hsla) -> Hsla {
+    let [r, g, b, _] = rgba8(color);
+    let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+
+    if luma > 140.0 {
+        hsla(0., 0., 0., 0.85)
+    } else {
+        hsla(0., 0., 1., 0.95)
     }
 }
 
@@ -1293,8 +1345,8 @@ mod tests {
         PALETTE_COLS, PALETTE_LIGHTNESS, PALETTE_ROWS, PALETTE_SATURATION, PALETTE_SIZE,
         PALETTE_STEP, PANEL_CONTENT_WIDTH, SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT,
         SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH, THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS,
-        TRACK_SLICES, hex_string, paint_track, palette_cell_bounds, palette_hue, palette_index_at,
-        parse_hex, rgba8,
+        TRACK_SLICES, hex_string, hover_ring_color, paint_track, palette_cell_bounds, palette_hue,
+        palette_index_at, parse_hex, rgba8,
     };
     use crate::{
         animation::ANIMATION_TICK,
@@ -1304,6 +1356,30 @@ mod tests {
             theme::{self, Theme},
         },
     };
+
+    #[test]
+    fn the_hover_ring_should_contrast_with_the_swatch() {
+        assert_eq!(
+            hover_ring_color(hsla(0., 0., 1., 1.)),
+            hsla(0., 0., 0., 0.85),
+            "a white swatch gets a dark ring"
+        );
+        assert_eq!(
+            hover_ring_color(hsla(0., 0., 0., 1.)),
+            hsla(0., 0., 1., 0.95),
+            "a black swatch gets a light ring"
+        );
+        assert_eq!(
+            hover_ring_color(PALETTE[PALETTE_COLS - 1]),
+            hsla(0., 0., 0., 0.85),
+            "the light end of the ramp gets a dark ring"
+        );
+        assert_eq!(
+            hover_ring_color(PALETTE[0]),
+            hsla(0., 0., 1., 0.95),
+            "the dark end of the ramp gets a light ring"
+        );
+    }
 
     #[test]
     fn the_palette_should_be_twelve_lightness_steps_by_twelve_rows() {
@@ -2526,9 +2602,9 @@ mod tests {
             "hover previews the hovered swatch in the hex field"
         );
         assert_eq!(
-            state.read_with(cx, |state, _| state.preview),
-            Some(hovered),
-            "the footer's color block is driven by the same preview"
+            state.read_with(cx, |state, _| state.hovered_swatch),
+            Some(28),
+            "the hovered swatch is tracked for the palette ring and footer preview"
         );
         assert_eq!(
             state.read_with(cx, |state, _| state.color()),
@@ -2554,9 +2630,9 @@ mod tests {
             "moving into a gap keeps the previous preview instead of flashing the real color"
         );
         assert_eq!(
-            state.read_with(cx, |state, _| state.preview),
-            Some(hovered),
-            "the footer's color block also keeps the previous preview"
+            state.read_with(cx, |state, _| state.hovered_swatch),
+            Some(28),
+            "the ring and footer keep the previous swatch while crossing the gap"
         );
         assert!(changes.borrow().is_empty());
 
@@ -2573,7 +2649,10 @@ mod tests {
             hex_string(next).as_str(),
             "entering the next cell replaces the preview directly"
         );
-        assert_eq!(state.read_with(cx, |state, _| state.preview), Some(next));
+        assert_eq!(
+            state.read_with(cx, |state, _| state.hovered_swatch),
+            Some(29)
+        );
         assert!(changes.borrow().is_empty());
 
         let outside = point(px(850.), px(750.));
@@ -2586,9 +2665,9 @@ mod tests {
             "leaving the palette restores the footer to the real color"
         );
         assert_eq!(
-            state.read_with(cx, |state, _| state.preview),
+            state.read_with(cx, |state, _| state.hovered_swatch),
             None,
-            "leaving the palette clears the preview block too"
+            "leaving the palette clears the hovered swatch and its ring"
         );
         assert!(changes.borrow().is_empty());
     }
@@ -2628,7 +2707,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_clear_the_preview(
+    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_keep_the_hover(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -2658,9 +2737,10 @@ mod tests {
             hex_string(swatch).as_str(),
             "committing keeps the hovered color in the field"
         );
-        assert!(
-            state.read_with(cx, |state, _| state.preview.is_none()),
-            "committing clears the preview so the footer shows the real color"
+        assert_eq!(
+            state.read_with(cx, |state, _| state.hovered_swatch),
+            Some(28),
+            "the pointer is still over the swatch, so its hover ring stays"
         );
     }
 
