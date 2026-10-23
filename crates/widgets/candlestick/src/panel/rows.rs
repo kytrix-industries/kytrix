@@ -6,6 +6,13 @@
 //! `ColorPicker`, never a swatch: a line list draws one per line on that line's
 //! row, and a switch row draws its own for the line colour it controls. The
 //! dimensions the design fixes live here too, beside the rows that use them.
+//!
+//! A row is not drawn on the panel: it is drawn inside the card of the indicator
+//! it belongs to (see `view::card`). The card's padding is the inset a row starts
+//! from — the node row's left edge sits one card border plus that padding inside
+//! the card — and a settings row is one more [`INDENT`] in from there, which is
+//! why it steps in from the node row above it rather than from the panel's own
+//! edge.
 
 use base_ui::{
     button::Button,
@@ -91,9 +98,11 @@ pub(super) fn section_title(pane: IndicatorPane, label: SharedString, cx: &App) 
 /// One indicator's node row: the caret, the checkbox that enables it and the
 /// indicator's name.
 ///
-/// The row exists for every indicator. The caret exists only for one that has
-/// settings to show, and it is not a control of its own: the whole row is what
-/// opens and folds them, so it is the row that states whether they are open.
+/// The row exists for every indicator, and it is always the first child of that
+/// indicator's card: an indicator with no settings is a card holding this row and
+/// nothing else. The caret exists only for one that has settings to show, and it
+/// is not a control of its own: the whole row is what opens and folds them, so it
+/// is the row that states whether they are open.
 pub(super) fn node_row(
     index: usize,
     definition: &'static IndicatorDefinition,
@@ -264,10 +273,10 @@ pub(super) fn switch_row(
 
 /// One line list: a row per line, and the button that adds another.
 ///
-/// The rows are returned separately so the panel's column can draw them in
-/// order; the "+" button comes last, which is what "at the bottom of the list"
-/// means here. Only an expanded indicator is drawn at all, so the button needs
-/// no visibility of its own.
+/// The rows are returned separately so the card can draw them in order after the
+/// node row; the "+" button comes last, which is what "at the bottom of the list"
+/// means here. Only an expanded indicator draws a line list at all, so the button
+/// needs no visibility of its own.
 pub(super) fn line_list(
     index: usize,
     id: IndicatorId,
@@ -531,6 +540,19 @@ fn border_color(invalid: bool, cx: &App) -> Hsla {
     }
 }
 
+/// The element id of one indicator's card.
+///
+/// A card needs an id of its own because it carries state — the pointer's hover,
+/// and the two transitions that follow it — and because that state must survive the
+/// panel being redrawn: an id that moved with the frame would reset the transition
+/// on every keystroke in a field under it.
+pub(super) fn card_id(index: usize) -> ElementId {
+    ElementId::NamedInteger(
+        SharedString::new_static("CandlestickIndicatorCard"),
+        index as u64,
+    )
+}
+
 /// The element id of one indicator's node row, and of everything named after it.
 fn node_id(index: usize) -> ElementId {
     ElementId::NamedInteger(
@@ -558,6 +580,15 @@ fn caret_selector(id: IndicatorId, icon: IconKind) -> String {
         _ => panic!("only a caret names a caret selector"),
     };
     format!("TEST_PANEL_CARET_{}_{direction}", indicator_name(id))
+}
+
+/// The debug selector of one indicator's card.
+///
+/// The box a test measures the node row and the settings against: everything the
+/// indicator draws is inside this card, which is what lets a test say "these rows
+/// belong to this indicator" rather than "these rows are somewhere in the panel".
+pub(super) fn card_selector(id: IndicatorId) -> String {
+    format!("TEST_PANEL_CARD_{}", indicator_name(id))
 }
 
 /// The debug selector of one indicator's title in its node row.

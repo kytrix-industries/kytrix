@@ -13,11 +13,18 @@
 //! The panel's own dimensions are its business; the width it takes out of the
 //! body is [`PANEL_WIDTH`], and the body decides where it goes.
 
-use base_ui::{scroll_bar::Scrollbar, style::theme::ThemeExt};
+use base_ui::{
+    animation::ANIMATION_TICK,
+    scroll_bar::Scrollbar,
+    style::{roles::Roles, theme::ThemeExt},
+};
 use gpui_kit::{
     AnyElement, App, Context, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement,
     Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, px,
+    base::{Easing, Transition, transition},
+    div,
+    prelude::FluentBuilder,
+    px,
 };
 use i18n::t;
 use smol_str::format_smolstr;
@@ -37,19 +44,29 @@ use crate::{
 
 /// The width the panel takes out of the pane body.
 ///
-/// Fixed rather than draggable: a settings row is one 16px indent plus a 60px
-/// period field, a 20px colour picker, a 24px delete button and the gaps between
-/// them, and 260 fits that row with room to spare. A pane narrower than this
-/// presses the chart down to its own minimum plot width and the body clips the
-/// panel's right edge — the panel's visibility is decided by whether it is open,
-/// not by how wide the pane is, because `Render` cannot measure the box it is
-/// drawn in.
+/// Fixed rather than draggable, and the budget is counted from the widest thing in
+/// it: a line row. The panel's own [`PANEL_PADDING`] leaves 244, a card's 1px
+/// border and [`CARD_PADDING`] leave 234 inside it, and the line row's own 1px
+/// frame and [`rows::INDENT`] leave 216. The row's controls take 104 of those — a
+/// 60px period field, a 20px colour picker and a 24px delete button — and the
+/// three 8px gaps between them take 24, so the spacer that holds the controls at
+/// the right edge still has 88 to give. A pane narrower than this presses the
+/// chart down to its own minimum plot width and the body clips the panel's right
+/// edge — the panel's visibility is decided by whether it is open, not by how wide
+/// the pane is, because `Render` cannot measure the box it is drawn in.
 pub(crate) const PANEL_WIDTH: f32 = 260.0;
 
 /// The padding around the panel's rows.
 const PANEL_PADDING: f32 = 8.0;
-/// The gap between two rows of the panel.
-const ROW_GAP: f32 = 2.0;
+/// The gap between two cards, and between a section heading and the first card
+/// under it.
+///
+/// One gap for both: the column is one flex container whose `gap` places the
+/// headings and the cards alike, so the space above a group of cards is the space
+/// between them.
+const ROW_GAP: f32 = 4.0;
+/// The padding inside one indicator's card, on all four sides.
+const CARD_PADDING: f32 = 4.0;
 
 /// The indicator settings panel.
 pub(crate) struct IndicatorPanel {
@@ -431,89 +448,99 @@ impl IndicatorPanel {
             .find(|picker| picker.key() == ColorKey { id, row, key })
     }
 
-    /// One indicator's rows: its node row, and its settings while it is open.
-    fn indicator_rows(
+    /// One indicator's card: its node row, and its settings while it is open, in
+    /// the one box that holds everything the indicator draws.
+    ///
+    /// The card is returned whole rather than as the rows it is made of, because
+    /// the box is what says "these rows belong to this indicator": an expanded
+    /// card that stopped at the node row would draw the settings of one indicator
+    /// between the cards of two. Its padding is the inset the node row starts
+    /// from; a settings row under it is that much plus `rows::INDENT`, because the
+    /// row is the one that steps itself in and the card does not flatten it.
+    fn indicator_card(
         &self,
         index: usize,
         definition: &'static IndicatorDefinition,
         config: &CandlestickIndicatorConfig,
         panel: &WeakEntity<IndicatorPanel>,
-        cx: &App,
-    ) -> Vec<AnyElement> {
-        let Some(entry) = config.entry(definition.id) else {
-            return Vec::new();
-        };
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let entry = config.entry(definition.id)?;
         let expanded = self.is_expanded(definition.id);
-        let mut nodes = Vec::with_capacity(definition.rows.len() + 2);
-        nodes.push(rows::node_row(
-            index,
-            definition,
-            entry.enabled,
-            expanded,
-            panel,
-            cx,
-        ));
-        // An indicator with nothing to configure has no caret and nothing to
-        // open, so its node row is the whole of it.
-        if !expanded {
-            return nodes;
-        }
-        // Enumerated because a period row is named after its place in the
-        // definition: two of an indicator's rows can both be periods, so the key
-        // alone would not tell their labels apart.
-        for (row_index, row) in definition.rows.iter().enumerate() {
-            match row.control {
-                SettingControl::LineList { .. } => {
-                    let Some(lines) = entry.settings.lines() else {
-                        continue;
-                    };
-                    nodes.extend(rows::line_list(
-                        index,
-                        definition.id,
-                        row,
-                        lines,
-                        &self.inputs,
-                        &self.pickers,
-                        self.invalid,
-                        panel,
-                        cx,
-                    ));
-                }
-                SettingControl::Period { .. } => {
-                    let Some(input) = self.line_input(definition.id, None, row.key) else {
-                        continue;
-                    };
-                    nodes.push(rows::period_row(
-                        row_index,
-                        row,
-                        input,
-                        self.is_invalid(definition.id, None, row.key),
-                        cx,
-                    ));
-                }
-                SettingControl::Switch => {
-                    // The catalogue gives every switch row a colour, which is
-                    // what puts a picker on its right. A switch without one
-                    // would be a row the panel cannot draw as designed.
-                    let color_key = row
-                        .color_key
-                        .expect("every switch row declares the colour it controls");
-                    let Some(picker) = self.color_picker(definition.id, None, color_key) else {
-                        continue;
-                    };
-                    nodes.push(rows::switch_row(
-                        index,
-                        definition.id,
-                        row,
-                        self.switch(definition.id, row.key, cx),
-                        picker,
-                        panel,
-                        cx,
-                    ));
+        // Whether the card is showing anything under its node row. An indicator
+        // with nothing to configure has no caret to open, so its card is its node
+        // row for as long as the panel is on screen: it counts as folded, and it
+        // answers the pointer like every other card that is only a title.
+        let open = expanded && !definition.rows.is_empty();
+        let node = rows::node_row(index, definition, entry.enabled, expanded, panel, cx);
+        let mut settings = Vec::with_capacity(definition.rows.len() + 1);
+        if open {
+            // Enumerated because a period row is named after its place in the
+            // definition: two of an indicator's rows can both be periods, so the
+            // key alone would not tell their labels apart.
+            for (row_index, row) in definition.rows.iter().enumerate() {
+                match row.control {
+                    SettingControl::LineList { .. } => {
+                        let Some(lines) = entry.settings.lines() else {
+                            continue;
+                        };
+                        settings.extend(rows::line_list(
+                            index,
+                            definition.id,
+                            row,
+                            lines,
+                            &self.inputs,
+                            &self.pickers,
+                            self.invalid,
+                            panel,
+                            cx,
+                        ));
+                    }
+                    SettingControl::Period { .. } => {
+                        let Some(input) = self.line_input(definition.id, None, row.key) else {
+                            continue;
+                        };
+                        settings.push(rows::period_row(
+                            row_index,
+                            row,
+                            input,
+                            self.is_invalid(definition.id, None, row.key),
+                            cx,
+                        ));
+                    }
+                    SettingControl::Switch => {
+                        // The catalogue gives every switch row a colour, which is
+                        // what puts a picker on its right. A switch without one
+                        // would be a row the panel cannot draw as designed.
+                        let color_key = row
+                            .color_key
+                            .expect("every switch row declares the colour it controls");
+                        let Some(picker) = self.color_picker(definition.id, None, color_key) else {
+                            continue;
+                        };
+                        settings.push(rows::switch_row(
+                            index,
+                            definition.id,
+                            row,
+                            self.switch(definition.id, row.key, cx),
+                            picker,
+                            panel,
+                            cx,
+                        ));
+                    }
                 }
             }
         }
-        nodes
+        let mut children = Vec::with_capacity(settings.len() + 1);
+        children.push(node);
+        children.extend(settings);
+        // The card answers the pointer while it is folded — which includes an
+        // indicator that has nothing to open, since its card is only ever a title.
+        // An expanded card attaches no listener at all: the settings under the
+        // title are controls of their own, and a box around them that lit up would
+        // say the whole box is one control.
+        Some(card(index, definition.id, !open, children, window, cx))
     }
 
     /// The entity of one field, if the panel drew it this frame.
@@ -546,6 +573,79 @@ fn parse_period(text: &str, min: u32, max: u32) -> Option<u32> {
         .filter(|period| (min..=max).contains(period))
 }
 
+/// The colours one card is painted in, given what it is and whether the pointer is
+/// on it.
+///
+/// A pure function so the three states the user asked for are one piece of logic a
+/// test can call: a folded card under the pointer, a folded card at rest, and a card
+/// whose settings are open (which draws no hover at all). The hover is a veil
+/// composited over the resting surface rather than a colour of its own, so one
+/// recipe darkens a light surface and lightens a dark one by itself.
+pub(super) fn card_colors(roles: &Roles, folded: bool, hovered: bool) -> (Hsla, Hsla) {
+    let background = roles.surface.sunken.hsla;
+    if !folded || !hovered {
+        return (background, roles.line.divider.hsla);
+    }
+    (
+        background.blend(roles.veil.hover.hsla),
+        roles.line.strong.hsla,
+    )
+}
+
+/// One indicator's card: the box holding its node row and everything under it.
+///
+/// A card is drawn in one of two states, and the difference is not only colour:
+/// a folded card answers the pointer (its background and border lift), while an
+/// expanded one draws no hover at all — its listener is not attached, so the
+/// pointer over it lands on nothing that reacts. That is why `on_hover` is
+/// conditional rather than attached always, and why the state it writes lives in
+/// the window under `(card_id, "hover")`: the panel is redrawn on every change, so
+/// a field on it would be a second copy per frame.
+fn card(
+    index: usize,
+    id: IndicatorId,
+    folded: bool,
+    children: Vec<AnyElement>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let card_id = rows::card_id(index);
+    let hover_state = window.use_keyed_state((card_id.clone(), "hover"), cx, |_, _| false);
+    let hovered = *hover_state.read(cx);
+    let (background, border) = card_colors(&cx.theme().roles, folded, hovered);
+    let bg = transition(
+        (card_id.clone(), "bg"),
+        background,
+        Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
+        window,
+        cx,
+    );
+    let border_color = transition(
+        (card_id.clone(), "border"),
+        border,
+        Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
+        window,
+        cx,
+    );
+
+    div()
+        .debug_selector(move || rows::card_selector(id))
+        .id(card_id)
+        .w_full()
+        .flex()
+        .flex_col()
+        .rounded_sm()
+        .border_1()
+        .border_color(border_color)
+        .bg(bg)
+        .p(px(CARD_PADDING))
+        .children(children)
+        .when(folded, |card| {
+            card.on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
+        })
+        .into_any_element()
+}
+
 impl Render for IndicatorPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
@@ -573,8 +673,8 @@ impl Render for IndicatorPanel {
                 if definition.pane != pane {
                     continue;
                 }
-                content =
-                    content.children(self.indicator_rows(index, definition, &config, &panel, cx));
+                let card = self.indicator_card(index, definition, &config, &panel, window, cx);
+                content = content.children(card);
             }
         }
 

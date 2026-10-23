@@ -11,4 +11,7 @@ pub(crate) use view::{IndicatorPanel, PANEL_WIDTH};
 mod colors_tests;
 
 #[cfg(test)]
+mod rows_tests;
+
+#[cfg(test)]
 mod view_tests;

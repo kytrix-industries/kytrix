@@ -5,21 +5,25 @@
 //! elements it draws, the fields it holds, and the configuration it writes back
 //! through the widget.
 
+use std::time::Duration;
+
 use base_ui::{
+    animation::ANIMATION_TICK,
     color_picker::{ColorPicker, ColorPickerEvent},
     icon::IconKind,
     input::{InputState, InputStateEvent},
-    style::theme::ThemeExt,
+    style::{palette::Palette, roles::Roles, theme::ThemeExt},
 };
 use gpui_kit::{
-    AppContext, Context, Entity, Hsla, IntoElement, Modifiers, ParentElement, Render, SharedString,
-    Styled, TestAppContext, VisualTestContext, Window, div, hsla, point, px, size,
+    AppContext, Bounds, Context, Entity, Hsla, IntoElement, Modifiers, ParentElement, Pixels, Quad,
+    Render, SharedString, Styled, TestAppContext, VisualTestContext, Window, div, hsla, point, px,
+    size, test::TestWindowExt as _,
 };
 
 use super::{
     colors::{self, ColorKey},
     inputs, rows,
-    view::{IndicatorPanel, PANEL_WIDTH},
+    view::{IndicatorPanel, PANEL_WIDTH, card_colors},
 };
 use crate::{
     indicator::{
@@ -75,15 +79,131 @@ fn redraw(window: &mut VisualTestContext) {
     window.run_until_parked();
 }
 
+/// Delivers every frame the window has already asked for, and lets whatever asked
+/// for them arrive, so that what a test counts afterwards is what its own change
+/// asked for.
+///
+/// Mounting the panel starts transitions of its own — every card is drawn for the
+/// first time, and a transition that is already at its target still has to be
+/// settled before the count means anything. Settling a transition means giving it
+/// the time it runs for: after each delivered frame the simulated clock is moved
+/// on by [`ANIMATION_TICK`], so a transition that is genuinely in flight reaches
+/// its target on the next frame instead of asking for frames forever at a clock
+/// that never moves. The tick is the longest a transition in this panel runs, so
+/// one of them per frame is enough for all of them.
+///
+/// The loop is bounded by a frame count rather than by time, because a bound that
+/// runs out is a failure of its own: a window still asking for frames after
+/// twenty ticks of a simulated clock is animating something that never converges,
+/// and this helper reports it rather than hanging on it.
+fn settle_frames(window: &mut VisualTestContext) {
+    for _ in 0..20 {
+        if window.update(|window, cx| window.simulate_next_frame(cx)) == 0 {
+            return;
+        }
+        window.update(|window, cx| window.render_frame(cx));
+        window.executor().advance_clock(ANIMATION_TICK);
+    }
+    panic!(
+        "the window is still asking for frames after twenty {ANIMATION_TICK:?} steps: \
+         something it started is not converging on its target"
+    );
+}
+
+/// The two colours one card's box is painted with, read off the frame it was
+/// painted in.
+///
+/// `debug_bounds` says where the box is, in logical pixels; what it is painted
+/// with is the frame's quads, and those are in device pixels after
+/// `Window::snap_bounds` has rounded every edge to the device pixel grid. The
+/// card's box is therefore matched within half a device pixel — the most that
+/// rounding moves an edge — rather than by float equality: at the test window's
+/// scale factor and an integral layout the two agree, but a fractional origin
+/// would put the quad a fraction of a pixel away from the bounds and an exact
+/// comparison would then report "no fill" for a card that is plainly filled.
+///
+/// A card paints two kinds of quad at its own box: its fill, and — because a
+/// border with no background is drawn as four strips around the empty interior —
+/// the strips carrying only the border. The fill is the quad there with a
+/// background that is not transparent, the border the quad there whose background
+/// is transparent and whose border colour is not. Both searches are fatal when
+/// nothing is found, so a card that paints no fill at all still fails.
+fn painted_card(window: &mut VisualTestContext, card: Bounds<Pixels>) -> (Hsla, Hsla) {
+    let (scale, quads) = window.update(|window, _| (window.scale_factor(), window.painted_quads()));
+    let card = card.scale(scale);
+    // Half a device pixel: the furthest `snap_bounds` can move an edge.
+    let at_the_card = |quad: &Quad| {
+        [
+            quad.bounds.left() - card.left(),
+            quad.bounds.top() - card.top(),
+            quad.bounds.right() - card.right(),
+            quad.bounds.bottom() - card.bottom(),
+        ]
+        .into_iter()
+        .all(|inset| inset.as_f32().abs() <= 0.5)
+    };
+    let fill = quads
+        .iter()
+        .filter(|quad| at_the_card(quad))
+        .find(|quad| !quad.background.is_transparent())
+        .and_then(|quad| quad.background.as_solid())
+        .unwrap_or_else(|| {
+            panic!(
+                "the card paints no solid fill at its box: {card:?} is filled by no quad \
+                 within half a device pixel of it (a card with no background at all, or one \
+                 painted with something other than a solid colour)"
+            )
+        });
+    let border = quads
+        .iter()
+        .filter(|quad| at_the_card(quad))
+        .find(|quad| quad.background.is_transparent() && !quad.border_color.is_transparent())
+        .map(|quad| quad.border_color)
+        .unwrap_or_else(|| {
+            panic!(
+                "the card paints no border at its box: {card:?} has no quad within half a \
+                 device pixel of it that carries a border colour around a transparent \
+                 background"
+            )
+        });
+    (fill, border)
+}
+
+/// Whether two colours are the same to the eye.
+///
+/// The paint of a settled transition is the value it interpolated to, and the last
+/// step of that interpolation is float arithmetic: `a + (b - a) * 1.0` is not
+/// `b` for every pair of f32s. The tolerance is far below a colour step (1/1000 of
+/// a channel is invisible) and far above that rounding.
+fn same_color(left: Hsla, right: Hsla) -> bool {
+    (left.h - right.h).abs() < 0.001
+        && (left.s - right.s).abs() < 0.001
+        && (left.l - right.l).abs() < 0.001
+        && (left.a - right.a).abs() < 0.001
+}
+
 /// Folds every indicator but `only`.
 ///
 /// The panel opens with all of them expanded, and every expanded line list draws
 /// the same test selectors; folding the others is what makes one selector name
 /// one list. It is also what lets a test say "this is MA's delete button".
 fn focus_on(window: &mut VisualTestContext, panel: &Entity<IndicatorPanel>, only: IndicatorId) {
+    fold_all_but(window, panel, &[only]);
+}
+
+/// Folds every indicator whose id is not in `kept`.
+///
+/// The panel opens with all of them expanded, and the expanded ones are tall
+/// enough together to push the last cards out of the test window; a test that
+/// measures one card against another has to leave only the two it measures.
+fn fold_all_but(
+    window: &mut VisualTestContext,
+    panel: &Entity<IndicatorPanel>,
+    kept: &[IndicatorId],
+) {
     window.update(|_, cx| {
         for definition in INDICATOR_CATALOG {
-            if definition.id == only {
+            if kept.contains(&definition.id) {
                 continue;
             }
             panel.update(cx, |panel, cx| panel.toggle_expanded(definition.id, cx));
@@ -1121,5 +1241,506 @@ fn choosing_a_palette_cell_should_publish_the_line_colour_once_it_is_confirmed(
         built.reports(),
         before + 1,
         "confirming a colour publishes it once"
+    );
+}
+
+/// A folded card is a box around its indicator's node row: it starts above the
+/// title and ends below it, and its own padding holds the row away from its edges.
+///
+/// Three of the four edges are measured, and the padding is what makes the third
+/// and fourth assertions different from the second. A card that wrapped nothing
+/// would have the title outside it; a card that wrapped only the checkbox would
+/// start below the caret; and a card with no padding would hold the row flush
+/// against its inset edge, which is what the caret's own corner states — the caret
+/// is the node row's first child, so it sits exactly one border plus one padding
+/// inside the card's corner.
+#[gpui_kit::test]
+fn a_folded_card_should_wrap_its_node_row(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // MA itself is folded too: the caret this measures is the right one a folded
+    // card draws, and an expanded MA would draw the down one.
+    fold_all_but(window, &panel, &[]);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("a folded MA is drawn as its card");
+    let title = window
+        .debug_bounds("TEST_PANEL_NODE_TITLE_MA")
+        .expect("the card draws MA's node row");
+    let caret = window
+        .debug_bounds("TEST_PANEL_CARET_MA_RIGHT")
+        .expect("a folded indicator draws a right caret");
+
+    assert!(
+        card.top() < title.top() && card.bottom() > title.bottom(),
+        "the card is the box around the node row, not a line beside it: {card:?} vs {title:?}"
+    );
+    assert!(
+        card.left() < title.left(),
+        "the card's padding places its left edge outside the title it holds: {card:?} vs {title:?}"
+    );
+    // The caret is the node row's first child, so the inset between the card's
+    // corner and the caret's is the card's 1px border plus its 4px padding.
+    assert!(
+        (caret.left() - card.left()).as_f32() > 4.0,
+        "the card's padding holds its content away from its edge: {caret:?} vs {card:?}"
+    );
+    assert!(
+        (caret.top() - card.top()).as_f32() > 4.0,
+        "and the same padding applies on top, so the row is not flush with the border: \
+         {caret:?} vs {card:?}"
+    );
+}
+
+/// An expanded card holds everything its indicator draws, the "+" button last,
+/// and its padding holds that last row away from its own edges.
+///
+/// The bottom is what tells "the card wraps the indicator" from "the card wraps
+/// the title": a card that stopped at the node row would end above the button and
+/// above the next indicator's card, and both of those would still leave the
+/// title inside *a* card.
+///
+/// The "+" row is the card's last child and spans its width, so its bottom and
+/// right edges are the card's inner edges: the gap between the two boxes is the
+/// card's 1px border plus its 4px padding, on the bottom and on the right. Those
+/// are the two insets the folded-card test above cannot reach — its only child
+/// takes its width from its own content and its height from the row it draws — so
+/// padding that went missing on the right or the bottom would leave every other
+/// assertion in this file green.
+#[gpui_kit::test]
+fn an_expanded_card_should_wrap_the_settings_and_the_add_button(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // Only MA is left open, so the "+" button the selector finds is MA's: every
+    // expanded line list draws one under the same selector, and the last one drawn
+    // would otherwise be the one measured. EMA stays on screen as a folded card,
+    // which is all the comparison with the next card needs.
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("an expanded MA is drawn as its card");
+    let add = window
+        .debug_bounds("TEST_PANEL_ADD_LINE_BUTTON")
+        .expect("MA is a line list, so its card draws the button that adds a line");
+    let next = window
+        .debug_bounds("TEST_PANEL_CARD_EMA")
+        .expect("EMA is the card after MA");
+
+    assert!(
+        card.bottom() >= add.bottom(),
+        "the card reaches past the last thing the indicator draws, the + button: \
+         {card:?} vs {add:?}"
+    );
+    assert!(
+        card.bottom() < next.top(),
+        "the card ends before the next indicator's card begins, so the settings \
+         are MA's and not drawn between two cards: {card:?} vs {next:?}"
+    );
+
+    // The "+" row's wrapper, not the button inside it: the button is inset by its
+    // own frame, while the wrapper is what the card lays out and is therefore flush
+    // with the card's inner edges.
+    let row = window
+        .debug_bounds("TEST_PANEL_ADD_LINE")
+        .expect("the + row is drawn with the button");
+    let right_inset = (card.right() - row.right()).as_f32();
+    let bottom_inset = (card.bottom() - row.bottom()).as_f32();
+    assert!(
+        (right_inset - 5.0).abs() < 1.0,
+        "the card's right padding is 4px plus its 1px border, so the row it holds \
+         stops 5px short of its right edge: {row:?} vs {card:?}"
+    );
+    assert!(
+        (bottom_inset - 5.0).abs() < 1.0,
+        "and the same padding is under the row, so the card's last row is not flush \
+         with its bottom edge: {row:?} vs {card:?}"
+    );
+}
+
+/// Two cards are separated by the row gap, and the row gap is 4px.
+///
+/// The number is stated rather than read from a constant because it is the thing
+/// this change fixes: the panel used to be a flat list of rows with a 2px gap, so
+/// a change that left the gap alone would still draw a plausible column of cards
+/// and has to fail here. The tolerance is half a pixel, which is what a 4px gap
+/// needs to survive snapping to the device pixel grid; every other value the code
+/// could plausibly carry is more than that away — 2px was the old flat list's, and
+/// 5px, 6px and 8px are all further from 4 than half a pixel.
+#[gpui_kit::test]
+fn cards_should_be_separated_by_the_row_gap(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    fold_all_but(window, &panel, &[IndicatorId::Ma, IndicatorId::Ema]);
+
+    let ma = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let ema = window
+        .debug_bounds("TEST_PANEL_CARD_EMA")
+        .expect("EMA's card is drawn");
+
+    let gap = (ema.top() - ma.bottom()).as_f32();
+    assert!(
+        (gap - 4.0).abs() < 0.5,
+        "two adjacent cards are one row gap apart, and the gap is 4px: a 2px gap \
+         was the old flat list's and must be gone (gap {gap}px, {ma:?} vs {ema:?})"
+    );
+}
+
+/// A card at rest is the sunken surface with a divider for an edge.
+///
+/// The recipe is pinned against the theme rather than against a literal, so a
+/// theme that moves its sunken surface moves the card with it: a card painted in
+/// a value copied from one appearance would pass here in the appearance it was
+/// copied from and be wrong in the other.
+#[test]
+fn a_card_should_be_painted_in_the_sunken_surface() {
+    for palette in [Palette::light(), Palette::dark()] {
+        let roles = Roles::resolve(&palette);
+        let (background, border) = card_colors(&roles, true, false);
+
+        assert_eq!(
+            background, roles.surface.sunken.hsla,
+            "a resting card is the surface a widget's content sits on"
+        );
+        assert_eq!(
+            border, roles.line.divider.hsla,
+            "a resting card's edge is the non-interactive divider, not a control's border"
+        );
+
+        let (background, border) = card_colors(&roles, false, false);
+        assert_eq!(
+            background, roles.surface.sunken.hsla,
+            "an expanded card is the same surface as a folded one: opening it must \
+             not make it look like a different kind of box"
+        );
+        assert_eq!(
+            border, roles.line.divider.hsla,
+            "and it has the same edge; only the pointer makes either move"
+        );
+    }
+}
+
+/// Only a folded card answers the pointer, and what it answers with is a veil over
+/// its resting surface and the stronger line for its edge.
+///
+/// The third state is the one that is easy to get wrong: an expanded card with a
+/// hover of its own looks exactly like a folded one to this function, and the only
+/// way to tell them apart is to ask what a hovered expanded card returns. It has
+/// to return the resting pair.
+#[test]
+fn only_a_folded_card_should_answer_the_pointer() {
+    for palette in [Palette::light(), Palette::dark()] {
+        let roles = Roles::resolve(&palette);
+
+        assert_ne!(
+            card_colors(&roles, true, true),
+            card_colors(&roles, true, false),
+            "a pointer on a folded card changes both of its colours"
+        );
+        let (hovered_background, hovered_border) = card_colors(&roles, true, true);
+        assert_ne!(
+            hovered_background, roles.surface.sunken.hsla,
+            "the hover is a wash laid over the resting surface, not the surface itself"
+        );
+        assert_eq!(
+            hovered_background,
+            roles.surface.sunken.hsla.blend(roles.veil.hover.hsla),
+            "the wash is the theme's own veil, composited over the resting surface"
+        );
+        assert_eq!(
+            hovered_border, roles.line.strong.hsla,
+            "the edge lifts to the role the pointer is drawn with everywhere else"
+        );
+
+        assert_eq!(
+            card_colors(&roles, false, true),
+            card_colors(&roles, false, false),
+            "an expanded card draws no hover at all, so the pointer cannot change it"
+        );
+    }
+}
+
+/// Hovering a folded card asks the panel for another frame.
+///
+/// This is what proves the listener is attached to the card at all: the state it
+/// writes lives in the window, and the window notifies the view that owns the
+/// element, so a frame the hover causes is a frame the listener caused. It says
+/// nothing about the colour — that is [`only_a_folded_card_should_answer_the_pointer`]'s
+/// job — and it would still pass if the listener wrote the wrong value.
+///
+/// The pointer is moved rather than `TestWindowExt::hover`ed for two reasons: that
+/// helper is implemented for `Window`, which this harness reaches only inside an
+/// `update`, and it draws two frames of its own — it refreshes before and after the
+/// move — which would be counted here whatever the listener did. A bare move draws
+/// only when something in the frame answered it.
+#[gpui_kit::test]
+fn hovering_a_folded_card_should_reach_it(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // Every card is folded, so the pointer has nowhere to land but on a card: an
+    // expanded card would put a control under it, and a control answering the
+    // pointer would draw a frame that says nothing about the card.
+    fold_all_but(window, &panel, &[]);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    // The card's padding: inside the card and outside every control it holds.
+    let inside = point(card.left() + px(1.5), card.top() + px(1.5));
+    let drawn = window.read(|cx| panel.read(cx).rendered_frames());
+
+    window.simulate_mouse_move(inside, None, Modifiers::none());
+    window.run_until_parked();
+
+    assert!(
+        window.read(|cx| panel.read(cx).rendered_frames()) > drawn,
+        "a pointer on a folded card writes its hover state, which the panel draws"
+    );
+}
+
+/// VOL has no settings rows, so it has no caret and can never be opened: its card
+/// is folded for as long as it is drawn, and "every folded card answers the
+/// pointer" has to include it.
+///
+/// This is the case that separates "the card is folded" from "the indicator is
+/// marked expanded": VOL starts marked expanded, because the panel opens with every
+/// indicator open, and a card that read that flag instead of asking whether it
+/// holds anything would draw no hover on the one card that can never hold
+/// anything.
+#[gpui_kit::test]
+fn a_card_with_nothing_to_open_should_still_answer_the_pointer(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // Every indicator but VOL is folded, so VOL keeps the "expanded" flag the
+    // panel opened with and its card is still the only thing there is to it.
+    fold_all_but(window, &panel, &[IndicatorId::Vol]);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_VOL")
+        .expect("VOL's card is drawn");
+    // The pointer settles outside every card first: leaving one is itself a hover
+    // change and draws a frame, and a frame counted straight after the move would
+    // be that change rather than VOL's answer.
+    window.simulate_mouse_move(point(px(0.0), px(0.0)), None, Modifiers::none());
+    window.run_until_parked();
+    let inside = point(card.left() + px(1.5), card.top() + px(1.5));
+    let drawn = window.read(|cx| panel.read(cx).rendered_frames());
+
+    window.simulate_mouse_move(inside, None, Modifiers::none());
+    window.run_until_parked();
+
+    assert!(
+        window.read(|cx| panel.read(cx).rendered_frames()) > drawn,
+        "an indicator with nothing to open is a folded card, so it answers the \
+         pointer like the others"
+    );
+}
+
+/// Hovering an expanded card asks for nothing: it has no listener to hear it.
+///
+/// The count is taken after the redraw and compared without refreshing again,
+/// because a refresh draws everything whether or not anything changed: the
+/// question is only whether the hover itself drew a frame. The point is the
+/// card's padding, not its centre — the centre of an open card is one of its
+/// controls, and a control answering the pointer would draw a frame for a reason
+/// that is not the card.
+#[gpui_kit::test]
+fn an_expanded_card_should_not_be_hoverable(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // MA is the only expanded card, so the pointer lands on an open one.
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let inside = point(card.left() + px(1.5), card.top() + px(1.5));
+    let drawn = window.read(|cx| panel.read(cx).rendered_frames());
+
+    window.simulate_mouse_move(inside, None, Modifiers::none());
+    window.run_until_parked();
+
+    assert_eq!(
+        window.read(|cx| panel.read(cx).rendered_frames()),
+        drawn,
+        "an expanded card attaches no hover listener, so the pointer over it draws \
+         no frame of its own"
+    );
+}
+
+/// The hover colour takes the 150ms it is declared with to arrive, on both of the
+/// card's channels.
+///
+/// The card's two transitions are what this measures: the colour has to travel,
+/// not appear. Nothing about the value or the easing is asked here — that is
+/// [`only_a_folded_card_should_answer_the_pointer`]'s job — only how many frames
+/// the element keeps asking for after the pointer arrives, and whether what the
+/// frames paint is somewhere between the two ends while it does.
+///
+/// The count is pinned to exactly fifteen, because fifteen is what 150ms is in
+/// 10ms steps and the step is deterministic: `advance_clock` moves a simulated
+/// clock by a fixed 10ms, not wall-clock time, so the same code asks for the same
+/// number of frames on every run. An earlier draft of this test admitted a band of
+/// ten to twenty and was wrong to: the band is 100ms to 200ms, so a 120ms
+/// transition (twelve frames) and a 200ms one (twenty) both passed it, and neither
+/// is the 150ms this panel is written against. Fifteen admits neither, and the
+/// neighbouring numbers are far enough away that nothing rounds into it — 100ms is
+/// ten frames and 120ms twelve, 200ms twenty and 210ms twenty-one. A zero-duration
+/// transition is already at its target in the frame the pointer drew, so it asks for
+/// no frame at all and the same count catches it.
+///
+/// The mid-flight read is what keeps the count honest about *both* channels. The
+/// card paints a background and an edge from two separate transitions, and a
+/// window asked for a frame by either of them keeps asking: zeroing one of the two
+/// would leave the count at fifteen while half the hover snapped into place. Half
+/// way through, each painted colour therefore has to be off both of its ends —
+/// which is true of a colour that is travelling and false of one that has already
+/// arrived, whichever transition it came from.
+#[gpui_kit::test]
+fn a_card_should_take_the_animation_tick_to_light_up(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    // Every card is folded, so the pointer has nowhere to land but on a card.
+    fold_all_but(window, &panel, &[]);
+    settle_frames(window);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let (rest_fill, rest_border) = painted_card(window, card);
+    let (washed, strong) = window.read(|cx| {
+        let roles = &cx.theme().roles;
+        (
+            roles.surface.sunken.hsla.blend(roles.veil.hover.hsla),
+            roles.line.strong.hsla,
+        )
+    });
+    // The card's padding: inside the card and outside every control it holds.
+    let inside = point(card.left() + px(1.5), card.top() + px(1.5));
+    window.simulate_mouse_move(inside, None, Modifiers::none());
+    window.run_until_parked();
+
+    let mut steps = 0;
+    let mut midway: Option<(Hsla, Hsla)> = None;
+    for step in 0..40 {
+        window.executor().advance_clock(Duration::from_millis(10));
+        if window.update(|window, cx| window.simulate_next_frame(cx)) == 0 {
+            break;
+        }
+        // A frame is drawn between the reads because what a frame asks for is
+        // asked for by the frame before it: without the draw, the requests counted
+        // are the ones the hover made, over and over.
+        window.update(|window, cx| window.render_frame(cx));
+        steps = step + 1;
+        if steps == 7 {
+            midway = Some(painted_card(window, card));
+        }
+    }
+
+    assert_eq!(
+        steps, 15,
+        "a 150ms transition advanced in 10ms steps asks for fifteen frames, and \
+         asked for {steps}: the clock is simulated, so the count is exact"
+    );
+
+    let (fill, border) = midway.expect("the transition was still running half way through");
+    assert!(
+        !same_color(fill, rest_fill) && !same_color(fill, washed),
+        "half way through, the card's fill is between the two ends of its own \
+         transition rather than at either: {fill:?} against {rest_fill:?} and {washed:?}"
+    );
+    assert!(
+        !same_color(border, rest_border) && !same_color(border, strong),
+        "and its edge is between the two ends of the other one: {border:?} against \
+         {rest_border:?} and {strong:?}"
+    );
+}
+
+/// The colours a card paints are the ones `card_colors` names, in both states the
+/// element can be in without a pointer.
+///
+/// This is the half the pure function cannot state: `card_colors` is what the
+/// recipe *is*, and the tests above pin what it returns, but an element that
+/// computed it and then painted a literal — or lost the background it was given —
+/// would leave those tests green. What is read here is the frame's own quads, so
+/// it is the paint the theme's roles reached, not the call that computed them.
+///
+/// The hovered state is not measured here: reaching it means moving the pointer
+/// and waiting out the transition, which [`a_card_should_take_the_animation_tick_to_light_up`]
+/// and [`hovering_a_folded_card_should_reach_it`] do between them — but the colour
+/// *arrived at* is what [`a_hovered_card_should_paint_its_wash`] reads.
+#[gpui_kit::test]
+fn a_card_should_paint_the_colours_the_theme_gives_it(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    fold_all_but(window, &panel, &[IndicatorId::Ma]);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let (fill, border) = painted_card(window, card);
+    let (surface, divider) = window.read(|cx| {
+        (
+            cx.theme().roles.surface.sunken.hsla,
+            cx.theme().roles.line.divider.hsla,
+        )
+    });
+
+    assert!(
+        same_color(fill, surface),
+        "the card's fill is the sunken surface role, not a literal: {fill:?} against \
+         {surface:?}"
+    );
+    assert!(
+        same_color(border, divider),
+        "and its edge is the divider role: {border:?} against {divider:?}"
+    );
+}
+
+/// A card under the pointer settles on the wash and the stronger line, painted.
+///
+/// The hover is the state the call site has to read for the card to answer at all:
+/// `card_colors` computed from a hover it ignored would look exactly like this one
+/// to every test above, because the resting pair is what it would paint. What is
+/// measured is the paint after the transition has run out, so a card that never
+/// lifted — or that lifted to a colour of its own — fails here.
+#[gpui_kit::test]
+fn a_hovered_card_should_paint_its_wash(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    fold_all_but(window, &panel, &[]);
+    settle_frames(window);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let inside = point(card.left() + px(1.5), card.top() + px(1.5));
+    window.simulate_mouse_move(inside, None, Modifiers::none());
+    window.run_until_parked();
+    // Past the transition's 150ms, so what is read is the colour it arrived at.
+    window.executor().advance_clock(Duration::from_millis(400));
+    window.update(|window, cx| window.render_frame(cx));
+
+    let (fill, border) = painted_card(window, card);
+    let (washed, strong) = window.read(|cx| {
+        let roles = &cx.theme().roles;
+        (
+            roles.surface.sunken.hsla.blend(roles.veil.hover.hsla),
+            roles.line.strong.hsla,
+        )
+    });
+
+    assert!(
+        same_color(fill, washed),
+        "a hovered card is painted in its surface with the theme's veil over it: \
+         {fill:?} against {washed:?}"
+    );
+    assert!(
+        same_color(border, strong),
+        "and its edge is the stronger line, the role the pointer is drawn with \
+         everywhere else: {border:?} against {strong:?}"
     );
 }
