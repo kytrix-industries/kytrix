@@ -884,6 +884,16 @@ fn paint_chart(
     // The vertical grid is painted before every plot's data, so a line or a bar
     // is drawn on top of it rather than under it.
     painter.paint_time_axis(&visible.time_ticks, layout);
+    // The visible slot the pointer is on, if it is over any plot. Every bar this
+    // frame draws reads it: the candle's volume bar and the MACD histogram's bar
+    // both stand at full strength only here, so the bar the crosshair is on is the
+    // one bar that is lit. Computed before the sub plots are painted because they
+    // draw that bar too.
+    let hovered_slot = options
+        .viewport
+        .cursor
+        .filter(|cursor| layout.contains_data_point(cursor))
+        .and_then(|cursor| visible.geometry.slot_at(cursor.x));
     // A sub plot draws its own axis, guides and data. The boxes and the prepared
     // ranges are aligned by index, and both follow catalogue order.
     for (index, sub_plot) in layout.sub_plots.iter().enumerate() {
@@ -900,21 +910,15 @@ fn paint_chart(
             visible.range.clone(),
             visible.geometry,
             prepared_sub_plot.value_range,
+            hovered_slot,
         );
     }
     // Main-chart indicator lines sit above the grid and below the candles: a
     // line drawn after the wicks would cover them (design §8.1).
     painter.paint_main_indicator_lines(indicators, visible, layout);
-    // The candle the crosshair is on, if the pointer is over any plot. Its
-    // volume bar is painted at full strength along with it.
-    let hovered_candle = options
-        .viewport
-        .cursor
-        .filter(|cursor| layout.contains_data_point(cursor))
-        .and_then(|cursor| visible.geometry.slot_at(cursor.x));
     paint_candle_series(
         &visible.candles,
-        hovered_candle,
+        hovered_slot,
         layout,
         painter.context.theme(),
         &mut *painter.window,
@@ -994,13 +998,56 @@ fn paint_chart(
     );
 }
 
+/// The market colours a bar is drawn with, at both of the strengths a bar uses.
+///
+/// A volume bar and a MACD histogram bar are the same kind of mark: its height is
+/// its own value and its colour is the direction it points. Both therefore read the
+/// market roles from here, and both show that direction the same way — a bar at
+/// rest is the weak wash of its direction, and only the bar under the pointer is
+/// drawn at full strength. One value for the two plots is what keeps them from
+/// drifting into two different ideas of what "highlighted" means.
+#[derive(Clone, Copy)]
+struct BarColors {
+    /// A bar pointing up, at the strength the bar under the pointer takes.
+    up: Hsla,
+    /// A bar pointing down, at the same strength.
+    down: Hsla,
+    /// A bar pointing up, as one at rest is washed in.
+    up_resting: Hsla,
+    /// A bar pointing down, as one at rest is washed in.
+    down_resting: Hsla,
+}
+
+impl BarColors {
+    /// The four colours of `theme`.
+    fn of(theme: &Theme) -> Self {
+        Self {
+            up: theme.roles.market.up.hsla,
+            down: theme.roles.market.down.hsla,
+            up_resting: theme.roles.market.up_weak.hsla,
+            down_resting: theme.roles.market.down_weak.hsla,
+        }
+    }
+
+    /// One bar: `up`'s direction, at the strength `hovered` asks for.
+    fn bar(self, up: bool, hovered: bool) -> Hsla {
+        match (up, hovered) {
+            (true, true) => self.up,
+            (true, false) => self.up_resting,
+            (false, true) => self.down,
+            (false, false) => self.down_resting,
+        }
+    }
+}
+
 /// The colour of one MACD histogram bar.
 ///
-/// A non-negative bar points up and takes the bullish colour; a negative one
-/// points down and takes the bearish colour. Zero counts as positive, so a flat
-/// histogram does not flicker between the two colours.
-fn histogram_color(value: f64, bullish: Hsla, bearish: Hsla) -> Hsla {
-    if value >= 0.0 { bullish } else { bearish }
+/// A non-negative bar points up and a negative one points down; zero counts as
+/// positive, so a flat histogram does not flicker between the two directions. The
+/// strength is the pointer's: a bar at rest is washed out like a volume bar, and
+/// only the bar under the pointer is drawn at full strength.
+fn histogram_bar_color(value: f64, hovered: bool, bars: BarColors) -> Hsla {
+    bars.bar(value >= 0.0, hovered)
 }
 
 impl ChartPainter<'_> {
@@ -1149,6 +1196,10 @@ impl ChartPainter<'_> {
     /// `series` is `None` for VOL, whose bars are painted with the candles rather
     /// than here; the axis is still drawn for every sub plot.
     ///
+    /// `hovered_slot` is the visible slot the pointer is on, in the same numbering
+    /// as `range`: a histogram bar there is drawn at full strength while the rest
+    /// of them keep the weaker tone, exactly as the volume bars do.
+    ///
     /// The data is wrapped in a content mask because a path can leave the plot by
     /// a pixel: the path takes one candle from the left of the range, and a
     /// histogram bar keeps a one-pixel minimum height.
@@ -1160,6 +1211,7 @@ impl ChartPainter<'_> {
         range: Range<usize>,
         geometry: CandleGeometry,
         value_range: ValueRange,
+        hovered_slot: Option<usize>,
     ) {
         let plot = layout.plot;
         let grid = self.context.theme().components.chart.grid.hsla;
@@ -1211,8 +1263,7 @@ impl ChartPainter<'_> {
         }
 
         let theme = self.context.theme();
-        let bullish = theme.components.chart.bullish.hsla;
-        let bearish = theme.components.chart.bearish.hsla;
+        let bars = BarColors::of(theme);
         let body_width = geometry.body_width();
         let zero_y = y_for_sub_value(0.0, value_range, plot);
         let start = range.start;
@@ -1233,7 +1284,7 @@ impl ChartPainter<'_> {
                         let top = value_y.min(zero_y);
                         let height = (value_y - zero_y).abs().max(px(1.0));
                         let x = geometry.center_x(slot) - body_width / 2.0;
-                        let color = histogram_color(value, bullish, bearish);
+                        let color = histogram_bar_color(value, hovered_slot == Some(slot), bars);
                         window.paint_quad(fill(
                             Bounds::new(point(x, top), size(body_width, height)),
                             color,
@@ -2152,8 +2203,7 @@ fn paint_candle_series(
 ) {
     let bullish = theme.roles.market.up.hsla;
     let bearish = theme.roles.market.down.hsla;
-    let bullish_weak = theme.roles.market.up_weak.hsla;
-    let bearish_weak = theme.roles.market.down_weak.hsla;
+    let bars = BarColors::of(theme);
     // Wicks and volume bars do not overlap within their respective slot/plot, so
     // they can share one scene order. Bodies overlap their own wicks and
     // therefore require a second layer.
@@ -2162,12 +2212,7 @@ fn paint_candle_series(
             let color = if candle.is_up { bullish } else { bearish };
             window.paint_quad(fill(candle.wick, color));
             if let Some(bounds) = candle.volume {
-                let (weak, strong) = if candle.is_up {
-                    (bullish_weak, bullish)
-                } else {
-                    (bearish_weak, bearish)
-                };
-                let volume = if hovered == Some(index) { strong } else { weak };
+                let volume = bars.bar(candle.is_up, hovered == Some(index));
                 window.paint_quad(fill(bounds, volume));
             }
         }
@@ -2531,6 +2576,7 @@ fn nearest_nice_step(raw_step: f64) -> f64 {
 mod tests {
     use std::str::FromStr;
 
+    use base_ui::style::palette::Appearance;
     use gpui_kit::{
         Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
         VisualTestContext, div,
@@ -2645,6 +2691,33 @@ mod tests {
 
     fn test_tick() -> Tick {
         Tick::from_str("0.01").expect("tick should parse")
+    }
+
+    /// Whether two colours are the same one.
+    ///
+    /// A colour read back off a painted quad has been through the scene's scaling
+    /// and the appearance's conversion, so it is the value that reached the frame
+    /// rather than the one the theme holds: comparing for exact equality would fail
+    /// on a rounding step that is invisible. The tolerance is far below a colour
+    /// step (a thousandth of a channel is not a difference one can see) and far
+    /// above that rounding.
+    fn same_color(left: Hsla, right: Hsla) -> bool {
+        (left.h - right.h).abs() < 0.001
+            && (left.s - right.s).abs() < 0.001
+            && (left.l - right.l).abs() < 0.001
+            && (left.a - right.a).abs() < 0.001
+    }
+
+    /// Whether two boxes are the same one, edge for edge.
+    ///
+    /// Both sides come from the same paint path — the same box before and after a
+    /// pointer moved — so this is an identity check on a rounded device-pixel grid,
+    /// not a tolerance. A bar that moved would be a different bar.
+    fn same_bounds(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
+        left.origin.x == right.origin.x
+            && left.origin.y == right.origin.y
+            && left.size.width == right.size.width
+            && left.size.height == right.size.height
     }
 
     #[test]
@@ -3721,6 +3794,52 @@ mod tests {
                 log: PAINT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
             }
         }
+
+        /// The bars the last drawn frame put inside `plot`, as painted, left to
+        /// right: each one's box and the solid colour it was filled with.
+        ///
+        /// A bar is what the paint path leaves per candle, so this is read off the
+        /// frame's own quads rather than from the values the painter was given: a
+        /// bar drawn in the wrong colour or at the wrong x fails here, which is
+        /// what a test about which bar is lit has to prove.
+        ///
+        /// Two things narrow the quads to bars. The plot's grid lines and its zero
+        /// guide span its whole width while a bar is one candle wide, so a quad
+        /// thinner than half the plot is a bar. And only a quad with a solid
+        /// background is read: `as_solid` returns the colour of a solid fill
+        /// whatever its alpha, so a resting bar's translucent wash is included.
+        ///
+        /// The boxes come back in logical pixels: the scene stores them scaled, and
+        /// `snap_bounds` has already rounded them onto the device grid.
+        fn bars_in(&mut self, plot: Bounds<Pixels>) -> Vec<(Bounds<Pixels>, Hsla)> {
+            let (scale, quads) = self
+                .window
+                .update(|window, _| (window.scale_factor(), window.painted_quads()));
+            let to_logical = |value: f32| px(value / scale);
+            let mut bars: Vec<(Bounds<Pixels>, Hsla)> = quads
+                .into_iter()
+                .filter_map(|quad| quad.background.as_solid().map(|color| (quad, color)))
+                .map(|(quad, color)| {
+                    let bounds = Bounds::new(
+                        point(
+                            to_logical(quad.bounds.origin.x.0),
+                            to_logical(quad.bounds.origin.y.0),
+                        ),
+                        size(
+                            to_logical(quad.bounds.size.width.0),
+                            to_logical(quad.bounds.size.height.0),
+                        ),
+                    );
+                    (bounds, color)
+                })
+                .filter(|(bar, _)| plot.contains(&bar.center()))
+                .filter(|(bar, _)| bar.size.width < plot.size.width * 0.5)
+                .collect();
+            bars.sort_by(|(left, _), (right, _)| {
+                left.origin.x.as_f32().total_cmp(&right.origin.x.as_f32())
+            });
+            bars
+        }
     }
 
     /// Mounts one chart in a window and lets a test draw frames on it.
@@ -4301,6 +4420,199 @@ mod tests {
         );
     }
 
+    /// A MACD histogram bar is lit only under the pointer, exactly as a volume bar
+    /// is: every other bar keeps the resting wash.
+    ///
+    /// This is the acceptance test for "the MACD bars behave like the volume ones",
+    /// so it reads the frame's own quads instead of asking the painter what it
+    /// meant to draw. The colours are what matter: a chart that drew every bar at
+    /// full strength — which is where this started — draws the same number of bars
+    /// at the same boxes, so only the fills can tell the two apart.
+    #[gpui_kit::test]
+    fn only_the_hovered_macd_bar_should_be_drawn_at_full_strength(cx: &mut TestAppContext) {
+        let snapshot = snapshot_with_spacing(120, 60);
+        let mut config = CandlestickIndicatorConfig::default();
+        for entry in &mut config.entries {
+            entry.enabled = entry.id == IndicatorId::Macd;
+        }
+        let mut session = paint_session(cx, snapshot, config);
+        let (up, down, up_resting, down_resting) = session.window.read(|cx| {
+            let bars = BarColors::of(cx.theme());
+            (bars.up, bars.down, bars.up_resting, bars.down_resting)
+        });
+
+        let away = session.draw(ChartViewport::default());
+        let plot = away.layout.sub_plots[0].plot;
+        let resting = session.bars_in(plot);
+        assert!(
+            resting.len() > 3,
+            "the fixture must draw several MACD bars, got {}",
+            resting.len()
+        );
+        let at_rest = |color: Hsla| {
+            [up_resting, down_resting]
+                .into_iter()
+                .any(|resting| same_color(color, resting))
+        };
+        let lit = |color: Hsla| {
+            [up, down]
+                .into_iter()
+                .any(|strong| same_color(color, strong))
+        };
+        assert!(
+            resting.iter().all(|(_, color)| at_rest(*color)),
+            "with no pointer every MACD bar rests on the weak wash: {:?}",
+            resting.iter().map(|(_, color)| *color).collect::<Vec<_>>()
+        );
+
+        // A bar with bars on both sides of it, so a rule that lit the first or the
+        // last bar would not pass by accident.
+        let target = resting[2].0;
+        let hovered = session.draw(ChartViewport {
+            cursor: Some(target.center()),
+            ..ChartViewport::default()
+        });
+        assert!(
+            !hovered.log.crosshairs.is_empty(),
+            "the fixture's pointer must land on the MACD plot, or no bar can be lit"
+        );
+
+        // Each bar is looked up again by its own box rather than by position in the
+        // frame's quad list: the hovered frame also carries the crosshair's dashes,
+        // and a bar is read here as "the quad at this box" so those cannot be
+        // mistaken for bars nor shift an index.
+        let after = session.bars_in(plot);
+        let color_at = |bounds: Bounds<Pixels>| {
+            after
+                .iter()
+                .find(|(bar, _)| same_bounds(*bar, bounds))
+                .map(|(_, color)| *color)
+                .unwrap_or_else(|| panic!("the hovered frame draws no bar at {bounds:?}"))
+        };
+        let lit_bars: Vec<Bounds<Pixels>> = resting
+            .iter()
+            .map(|(bounds, _)| *bounds)
+            .filter(|bounds| lit(color_at(*bounds)))
+            .collect();
+        assert_eq!(
+            lit_bars.len(),
+            1,
+            "exactly one MACD bar is drawn at full strength, not {}: {:?}",
+            lit_bars.len(),
+            resting
+                .iter()
+                .map(|(bounds, _)| color_at(*bounds))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lit_bars[0], target,
+            "the bar drawn at full strength is the one under the pointer"
+        );
+    }
+
+    /// A volume bar and a MACD bar answer the same pointer: both are lit at the
+    /// slot the crosshair is on, and both rest on the weak wash elsewhere.
+    ///
+    /// The two plots are read in one frame, so this proves the rule is shared
+    /// rather than implemented twice and agreeing by coincidence: a pointer over
+    /// the volume plot lights the volume bar and the MACD bar of the same candle,
+    /// and both are at rest in a frame with no pointer.
+    #[gpui_kit::test]
+    fn a_pointer_should_light_the_same_slot_in_both_bar_plots(cx: &mut TestAppContext) {
+        let snapshot = snapshot_with_spacing(120, 60);
+        let mut config = CandlestickIndicatorConfig::default();
+        for entry in &mut config.entries {
+            entry.enabled = matches!(entry.id, IndicatorId::Vol | IndicatorId::Macd);
+        }
+        let mut session = paint_session(cx, snapshot, config);
+        let (up, down, up_resting, down_resting) = session.window.read(|cx| {
+            let bars = BarColors::of(cx.theme());
+            (bars.up, bars.down, bars.up_resting, bars.down_resting)
+        });
+        let lit = |color: Hsla| {
+            [up, down]
+                .into_iter()
+                .any(|strong| same_color(color, strong))
+        };
+
+        let away = session.draw(ChartViewport::default());
+        assert_eq!(
+            away.layout.sub_plots.len(),
+            2,
+            "VOL and MACD are both drawn"
+        );
+        let volume_plot = away.layout.sub_plots[0].plot;
+        let macd_plot = away.layout.sub_plots[1].plot;
+        let resting_volume = session.bars_in(volume_plot);
+        let resting_macd = session.bars_in(macd_plot);
+        assert!(
+            !resting_volume.is_empty() && !resting_macd.is_empty(),
+            "both plots draw bars: {} volume, {} MACD",
+            resting_volume.len(),
+            resting_macd.len()
+        );
+        assert!(
+            resting_volume
+                .iter()
+                .chain(&resting_macd)
+                .all(|(_, color)| !lit(*color)),
+            "with no pointer nothing in either bar plot is lit"
+        );
+
+        // The pointer goes into the volume plot; the MACD bar of that same candle
+        // has to light up with it, which is the whole point of one shared slot.
+        let target = resting_volume[2].0;
+        let hovered = session.draw(ChartViewport {
+            cursor: Some(target.center()),
+            ..ChartViewport::default()
+        });
+        assert!(
+            !hovered.log.crosshairs.is_empty(),
+            "the fixture's pointer must land on the volume plot"
+        );
+        let lit_volume: Vec<Hsla> = session
+            .bars_in(volume_plot)
+            .into_iter()
+            .filter(|(bounds, _)| {
+                resting_volume
+                    .iter()
+                    .any(|(resting, _)| same_bounds(*resting, *bounds))
+            })
+            .map(|(_, color)| color)
+            .filter(|color| lit(*color))
+            .collect();
+        assert_eq!(
+            lit_volume.len(),
+            1,
+            "exactly one volume bar is lit, the one under the pointer"
+        );
+        let lit_macd = session
+            .bars_in(macd_plot)
+            .into_iter()
+            .filter(|(_, color)| lit(*color))
+            .count();
+        assert_eq!(
+            lit_macd, 1,
+            "the MACD bar of the same candle is lit too, so the two plots agree on \
+             which slot the pointer is on"
+        );
+
+        // And the resting washes are the direction's own, in both plots: a bar
+        // whose direction was lost would still be dim but the wrong colour.
+        assert!(
+            [up_resting, down_resting]
+                .into_iter()
+                .any(|wash| same_color(wash, resting_volume[0].1)),
+            "a resting volume bar is a weak market wash"
+        );
+        assert!(
+            [up_resting, down_resting]
+                .into_iter()
+                .any(|wash| same_color(wash, resting_macd[0].1)),
+            "a resting MACD bar is the same weak market wash"
+        );
+    }
+
     /// The crosshair stays hover-only while the readout keeps its row, and an axis
     /// is not data: a pointer over the price axis draws no crosshair.
     #[gpui_kit::test]
@@ -4313,7 +4625,6 @@ mod tests {
         let away = session.draw(ChartViewport::default());
         let axis_cursor = away.layout.price_axis.center();
         let plot_cursor = away.layout.price_plot.center();
-
         let over_axis = session.draw(ChartViewport {
             cursor: Some(axis_cursor),
             ..ChartViewport::default()
@@ -4761,22 +5072,72 @@ mod tests {
         assert_eq!(value_range.highest, 8.0);
     }
 
-    /// A MACD bar takes the colour of the direction it points: non-negative is
-    /// bullish (a zero bar included) and negative is bearish. The colours are
-    /// passed in so the test does not need a theme.
+    /// A MACD bar takes the colour of the direction it points and the strength the
+    /// pointer gives it: non-negative is bullish (a zero bar included) and negative
+    /// is bearish, at the resting wash or — for the bar under the pointer — at full
+    /// strength. The four colours are supplied by the test so it needs no theme.
     #[test]
     fn macd_histogram_bars_should_use_the_direction_they_point() {
-        let bullish = gpui_kit::white();
-        let bearish = gpui_kit::black();
+        let bars = BarColors {
+            up: gpui_kit::white(),
+            down: gpui_kit::black(),
+            up_resting: gpui_kit::hsla(0.0, 0.0, 1.0, 0.22),
+            down_resting: gpui_kit::hsla(0.0, 0.0, 0.0, 0.22),
+        };
 
-        assert_eq!(histogram_color(0.0, bullish, bearish), bullish);
-        assert_eq!(histogram_color(1.0, bullish, bearish), bullish);
-        assert_eq!(histogram_color(-1.0, bullish, bearish), bearish);
+        assert_eq!(histogram_bar_color(0.0, true, bars), bars.up);
+        assert_eq!(histogram_bar_color(1.0, true, bars), bars.up);
+        assert_eq!(histogram_bar_color(-1.0, true, bars), bars.down);
         assert_eq!(
-            histogram_color(-f64::MIN_POSITIVE, bullish, bearish),
-            bearish,
+            histogram_bar_color(-f64::MIN_POSITIVE, true, bars),
+            bars.down,
             "a tiny negative value is still negative"
         );
+        assert_eq!(
+            histogram_bar_color(1.0, false, bars),
+            bars.up_resting,
+            "a bar that is not under the pointer is drawn at the resting wash"
+        );
+        assert_eq!(
+            histogram_bar_color(-1.0, false, bars),
+            bars.down_resting,
+            "and a falling one at its own resting wash"
+        );
+        assert_eq!(
+            histogram_bar_color(0.0, false, bars),
+            bars.up_resting,
+            "a flat bar rests on the side zero counts as"
+        );
+    }
+
+    /// The two strengths a bar is drawn at, and the direction each one belongs to,
+    /// are the market roles themselves. Pinned against the theme so a chart that
+    /// invented its own highlight colour — or a resting tone that was not the
+    /// theme's wash — would fail here rather than only on screen.
+    ///
+    /// Both appearances are checked because the wash is an alpha: a bar drawn in a
+    /// colour copied from one appearance would pass there and be wrong in the other.
+    #[test]
+    fn a_bar_should_be_drawn_in_the_market_roles() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let theme = Theme::of(appearance);
+            let bars = BarColors::of(&theme);
+
+            assert_eq!(bars.up, theme.roles.market.up.hsla);
+            assert_eq!(bars.down, theme.roles.market.down.hsla);
+            assert_eq!(
+                bars.up_resting, theme.roles.market.up_weak.hsla,
+                "a bar at rest is the theme's weak market wash, the same tone a \
+                 volume bar at rest is drawn in"
+            );
+            assert_eq!(bars.down_resting, theme.roles.market.down_weak.hsla);
+            assert_ne!(
+                bars.up, bars.up_resting,
+                "the highlighted bar has to differ from the resting ones, or hovering \
+                 would not show which bar is being read"
+            );
+            assert_ne!(bars.down, bars.down_resting);
+        }
     }
 
     #[test]
