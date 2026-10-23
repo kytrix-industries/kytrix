@@ -12,6 +12,7 @@ use base_ui::{
     color_picker::{ColorPicker, ColorPickerEvent},
     icon::IconKind,
     input::{InputState, InputStateEvent},
+    size::UnifiedSize,
     style::{palette::Palette, roles::Roles, theme::ThemeExt},
 };
 use gpui_kit::{
@@ -433,11 +434,11 @@ fn a_line_row_should_put_its_field_on_the_left_and_its_controls_on_the_right(
         .expect("a list of three lines may lose one");
 
     assert!(
-        (field.origin.x - (row.origin.x + px(rows::INDENT)))
+        (field.origin.x - (row.origin.x + px(rows::SETTING_INSET)))
             .as_f32()
             .abs()
             <= 1.0,
-        "the field starts at the row's left edge plus the indent: {field:?} vs {row:?}"
+        "the field starts at the row's left edge plus the settings inset: {field:?} vs {row:?}"
     );
     assert!(
         (delete.right() - row.right()).as_f32().abs() <= 1.0,
@@ -1742,5 +1743,162 @@ fn a_hovered_card_should_paint_its_wash(cx: &mut TestAppContext) {
         same_color(border, strong),
         "and its edge is the stronger line, the role the pointer is drawn with \
          everywhere else: {border:?} against {strong:?}"
+    );
+}
+
+/// The arrow sits halfway between the card's left border and the square the
+/// checkbox draws, whichever of those two a reader takes for the box's edge.
+///
+/// This is the alignment the user asked for after seeing the panel, and it is not
+/// where the arrow started: centring it in its own 16px slot put its centre 8px
+/// from the slot's left edge, which is 21 in the window and visibly left of the
+/// midpoint. What is measured is the glyph, not the slot — a caret inset inside a
+/// fixed-size slot moves the glyph and leaves the slot exactly where it was, so the
+/// slot's box cannot answer this question.
+///
+/// The two endpoints are the card's own left border (8) and the checkbox's left
+/// edge (33, which is where the square's *box* starts); the midpoint is 20.5. The
+/// square inside the checkbox is 4px further in, at 37, and the midpoint of the
+/// span the eye reads is 22.5 — the number the arrow is actually placed at. Both
+/// are checked, the second one tightly, because a change that moved the arrow back
+/// to the slot's centre would fail it by 1.5px.
+#[gpui_kit::test]
+fn the_caret_should_sit_between_the_cards_edge_and_the_checkbox(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let card = window
+        .debug_bounds("TEST_PANEL_CARD_MA")
+        .expect("MA's card is drawn");
+    let glyph = window
+        .debug_bounds("TEST_PANEL_CARET_GLYPH_MA_DOWN")
+        .expect("an expanded MA draws the down arrow");
+    let toggle = window
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
+        .expect("MA's node row draws the checkbox that enables it");
+
+    let centre = glyph.center().x.as_f32();
+    // The checkbox's own left edge is where its *box* starts; the line the eye
+    // reads on the arrow's right is the square inside it, one `px()` of checkbox
+    // padding further in. That padding is the same `UnifiedSize::Small` the toggle
+    // is drawn at, so it is read from the size the control uses rather than written
+    // out again here.
+    let square_left = toggle.left().as_f32() + UnifiedSize::Small.px().as_f32();
+    let between_lines = (card.left().as_f32() + square_left) / 2.0;
+    assert!(
+        (centre - between_lines).abs() < 0.5,
+        "the arrow is centred at {centre}, and halfway between the card's left \
+         edge and the square the checkbox draws is {between_lines}"
+    );
+
+    // The checkbox draws 4px of its own padding before the square, and the square
+    // is the line the eye reads on the right of the arrow.
+    let glyph_height = glyph.size.height.as_f32();
+    assert!(
+        (glyph_height - 12.0).abs() < 0.5,
+        "the arrow is the 12px glyph its size_3 asks for, not a larger one: \
+         {glyph_height}px"
+    );
+}
+
+/// Every settings row starts its first control on the checkbox's vertical line.
+///
+/// The rows are built by three different functions and two of them draw a 1px
+/// error frame that the third does not, so "the first control of a row is under the
+/// checkbox" is a property of the constants those functions share rather than of
+/// any one of them: a row that counted the frame as padding would be 1px left of
+/// the others, and a row that did not count it would be 1px right.
+///
+/// No single indicator has all three kinds of row — MA has a line list, MACD has
+/// period and switch rows and no list — so the two are measured one after the
+/// other, each against the checkbox in its own node row.
+#[gpui_kit::test]
+fn every_settings_row_should_start_on_the_checkboxs_line(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+
+    // Both indicators are left open in one call: `fold_all_but` toggles every
+    // indicator it is not told to keep, so opening them one at a time would fold
+    // the first while opening the second.
+    fold_all_but(window, &panel, &[IndicatorId::Ma, IndicatorId::Macd]);
+    let ma_toggle = window
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
+        .expect("MA's node row draws the checkbox that enables it");
+    let line_field = window
+        .debug_bounds("TEST_PANEL_PERIOD_FIELD_MA_0")
+        .expect("MA's line list draws a field on its first line");
+    assert!(
+        (line_field.left().as_f32() - ma_toggle.left().as_f32()).abs() <= 1.0,
+        "a line row's field starts at {}, and the checkbox that enables the \
+         indicator starts at {}: a settings row is a column under the title, not \
+         a list indented under it",
+        line_field.left().as_f32(),
+        ma_toggle.left().as_f32()
+    );
+
+    let macd_toggle = window
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MACD")
+        .expect("MACD's node row draws the checkbox that enables it");
+    let period_label = window
+        .debug_bounds("TEST_PANEL_PERIOD_LABEL_MACD_0")
+        .expect("MACD's first period row draws its label");
+    // A switch row's first control is the checkbox it draws; the row's own box
+    // starts one border further out, so the toggle is what has to land on the line.
+    let switch_toggle = window
+        .debug_bounds("TEST_PANEL_SWITCH_TOGGLE_MACD_DIF")
+        .expect("MACD's DIF switch row draws its checkbox");
+
+    let line = macd_toggle.left().as_f32();
+    assert!(
+        (period_label.left().as_f32() - line).abs() <= 1.0,
+        "a period row's label starts at {}, and the checkbox starts at {line}",
+        period_label.left().as_f32()
+    );
+    assert!(
+        (switch_toggle.left().as_f32() - line).abs() <= 1.0,
+        "a switch row's checkbox starts at {}, and the node row's checkbox starts \
+         at {line}",
+        switch_toggle.left().as_f32()
+    );
+}
+
+/// The arrow is drawn on the row's centre line, not above or below the controls
+/// beside it.
+///
+/// The three things on the row are boxes of three different heights — the arrow's
+/// slot, the checkbox's 20px control and the title's line box — so a row that
+/// centred some of them and not others would still look almost right. They all
+/// have to share one centre, which is what makes the arrow read as part of the row
+/// rather than as something floating between two lines.
+#[gpui_kit::test]
+fn the_caret_should_be_drawn_on_the_node_rows_centre_line(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let glyph = window
+        .debug_bounds("TEST_PANEL_CARET_GLYPH_MA_DOWN")
+        .expect("an expanded MA draws the down arrow");
+    let toggle = window
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
+        .expect("MA's node row draws the checkbox that enables it");
+    let title = window
+        .debug_bounds("TEST_PANEL_NODE_TITLE_MA")
+        .expect("MA's node row draws its title");
+
+    let glyph_centre = glyph.center().y.as_f32();
+    let toggle_centre = toggle.center().y.as_f32();
+    let title_centre = title.center().y.as_f32();
+
+    assert!(
+        (glyph_centre - toggle_centre).abs() <= 0.5,
+        "the arrow's centre is {glyph_centre} and the checkbox's is \
+         {toggle_centre}: the row centres them on one line"
+    );
+    assert!(
+        (glyph_centre - title_centre).abs() <= 1.0,
+        "and the title's centre is {title_centre}, half a pixel off at most: the \
+         three boxes are different heights but one centre line"
     );
 }

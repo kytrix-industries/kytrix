@@ -10,9 +10,9 @@
 //! A row is not drawn on the panel: it is drawn inside the card of the indicator
 //! it belongs to (see `view::card`). The card's padding is the inset a row starts
 //! from — the node row's left edge sits one card border plus that padding inside
-//! the card — and a settings row is one more [`INDENT`] in from there, which is
-//! why it steps in from the node row above it rather than from the panel's own
-//! edge.
+//! the card — and a settings row indents its first control by [`SETTING_INSET`] so
+//! that it lands on the same vertical line as the checkbox that enables the
+//! indicator above it.
 
 use base_ui::{
     button::Button,
@@ -51,19 +51,52 @@ const HINT_ROW_HEIGHT: f32 = 18.0;
 const HINT_INSET: f32 = 4.0;
 /// The height of the row holding the "+" button.
 const ADD_ROW_HEIGHT: f32 = 28.0;
-/// One level of indent: a settings row sits one level under its indicator.
-///
-/// `pub(super)` rather than private, which makes it visible to the whole `panel`
-/// module: the panel's tests read it as the offset a line row's field starts at,
-/// and that is what makes "the field is on the left" a measurement rather than a
-/// description. A literal 16.0 in the test would pin the number instead of the
-/// row that places its children by it.
-pub(super) const INDENT: f32 = 16.0;
+/// The gap between the caret and the checkbox that enables an indicator.
+const NODE_GAP: f32 = 4.0;
 /// The size of the caret that opens and folds an indicator's settings.
 const CARET_SIZE: f32 = 16.0;
+/// How far the arrow sits from the left edge of the slot that holds it.
+///
+/// The arrow is centred between the two lines the eye reads around it rather than
+/// between the row's own edges: the card's border on its left, and the square
+/// inside the checkbox on its right.
+///
+/// In the panel's coordinates the card's border is at 8 and the row it draws starts
+/// at 13, one border and one padding later. The checkbox starts four pixels after
+/// the 16px slot — 33 — and draws four pixels of its own padding before its square,
+/// so the square's line is at 37. Halfway between 8 and 37 is 22.5, which is where
+/// the arrow has to be. The slot spans 13 to 29, so a 12px glyph centred in it would
+/// sit at 21: three pixels short. Insetting the slot on its left by three leaves 13
+/// pixels for the glyph to centre in, which puts its centre at 13 + 3 + 6.5 = 22.5.
+///
+/// A padding rather than a width: `.size()` is the outer box, so the slot keeps its
+/// 16px and the toggle after it does not move. Aligning the arrow must not shift the
+/// checkbox the rest of the row is measured against.
+const CARET_INSET: f32 = 3.0;
+/// How far a settings row insets its first control.
+///
+/// The node row puts the checkbox that enables the indicator this far in — a caret
+/// slot, then [`NODE_GAP`] — so a settings row whose first control starts at the
+/// same x reads as a column under one title rather than as a list indented under
+/// it. A text label, an `Input` and a checkbox all line up on this one line.
+///
+/// `pub(super)` rather than private, which makes it visible to the whole `panel`
+/// module: the panel's tests read it as the offset a settings row's first control
+/// starts at, and that is what makes "the control is on the left, and under the
+/// checkbox" a measurement rather than a description. A literal 20.0 in the test
+/// would pin the number instead of the row that places its children by it.
+pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP;
+/// [`SETTING_INSET`] for a row that draws the frame marking a field in error.
+///
+/// One pixel less, because that frame is part of the box the padding is measured
+/// from: a period row and a line row both draw it, and their padding is what is
+/// left of the inset once the frame has taken its pixel. Stating both is what keeps
+/// the first control of every kind of settings row on one vertical line, whatever
+/// each row draws around itself.
+pub(super) const FRAMED_INSET: f32 = SETTING_INSET - 1.0;
 /// The width of one period field.
 ///
-/// `pub(super)` for the same reason [`INDENT`] is: a test measures the field
+/// `pub(super)` for the same reason [`SETTING_INSET`] is: a test measures the field
 /// against the width the row gives it, so the number is stated once, beside the
 /// row that applies it.
 pub(super) const PERIOD_FIELD_WIDTH: f32 = 60.0;
@@ -123,7 +156,16 @@ pub(super) fn node_row(
             .items_center()
             .justify_center()
             .size(px(CARET_SIZE))
-            .child(Icon::new(icon).size_3())
+            // Inside the slot, so the checkbox beside it does not move. The slot
+            // keeps its 16px and the glyph centres itself in what is left, which is
+            // what puts the arrow where the eye reads the row's centre.
+            .pl(px(CARET_INSET))
+            .child(
+                div()
+                    .debug_selector(move || caret_glyph_selector(id, icon))
+                    .flex_none()
+                    .child(Icon::new(icon).size_3()),
+            )
             .into_any_element()
     } else {
         // The title of an indicator without a caret keeps the caret's space, so
@@ -157,6 +199,7 @@ pub(super) fn node_row(
         .child(caret)
         .child(
             Toggle::new((row_id, "enabled"))
+                .debug_selector(move || node_toggle_selector(id))
                 .checkbox()
                 .small()
                 .checked(enabled)
@@ -198,7 +241,10 @@ pub(super) fn period_row(
                 .flex()
                 .items_center()
                 .gap_2()
-                .pl(px(INDENT))
+                // The frame this row draws is part of the inset, so the padding is
+                // what is left of it: the label lands on the checkbox's line either
+                // way, whether or not the row is in error.
+                .pl(px(FRAMED_INSET))
                 .border_1()
                 .border_color(border_color(invalid, cx))
                 .child(
@@ -244,6 +290,7 @@ pub(super) fn switch_row(
     let color = t!(cx, "widget.candlestick.indicator.line_color");
     let key = row.key;
     let row_selector = switch_row_selector(picker.key());
+    let toggle_selector = switch_toggle_selector(picker.key());
     let panel = panel.clone();
 
     div()
@@ -252,10 +299,12 @@ pub(super) fn switch_row(
         .flex()
         .items_center()
         .gap_2()
-        .pl(px(INDENT))
+        // No frame on this row, so the whole inset is padding.
+        .pl(px(SETTING_INSET))
         .child(
             div().flex_1().min_w_0().child(
                 Toggle::new((node_id(index), row.label_key))
+                    .debug_selector(move || toggle_selector)
                     .checkbox()
                     .small()
                     .checked(on)
@@ -382,7 +431,9 @@ fn line_row(
                 .flex()
                 .items_center()
                 .gap_2()
-                .pl(px(INDENT))
+                // The same inset a period row uses, and for the same reason: this
+                // row draws the frame too, so its padding is what is left of it.
+                .pl(px(FRAMED_INSET))
                 .border_1()
                 .border_color(border_color(invalid, cx))
                 .child(
@@ -445,7 +496,9 @@ fn add_line_row(
         .debug_selector(|| "TEST_PANEL_ADD_LINE".into())
         .w_full()
         .h(px(ADD_ROW_HEIGHT))
-        .pl(px(INDENT))
+        // The button is the row's first control, so it starts on the same line as
+        // every other settings row's: the list it grows is read as one column.
+        .pl(px(SETTING_INSET))
         .child(
             Button::new(ElementId::NamedInteger(
                 SharedString::new_static("CandlestickIndicatorAddLine"),
@@ -518,11 +571,15 @@ fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> 
 }
 
 /// The hint under a field whose text is not a period it may take.
+///
+/// It starts [`HINT_INSET`] past the label it explains, which is the row's first
+/// control and therefore begins at [`SETTING_INSET`] from the row's edge — the
+/// frame the row may also draw is already accounted for in that line.
 fn invalid_hint(cx: &App) -> AnyElement {
     div()
         .debug_selector(|| "TEST_PANEL_INVALID_PERIOD".into())
         .h(px(HINT_ROW_HEIGHT))
-        .pl(px(INDENT + HINT_INSET))
+        .pl(px(SETTING_INSET + HINT_INSET))
         .text_xs()
         .text_color(cx.theme().roles.status.danger.base.hsla)
         .child(t!(cx, "widget.candlestick.indicator.period_invalid"))
@@ -591,6 +648,31 @@ pub(super) fn card_selector(id: IndicatorId) -> String {
     format!("TEST_PANEL_CARD_{}", indicator_name(id))
 }
 
+/// The debug selector of the arrow glyph itself, inside the slot that holds it.
+///
+/// The slot is a fixed 16px and the arrow inside it is 12, so the slot's own box
+/// says nothing about where the arrow is: a caret inset within its slot moves the
+/// glyph and leaves the slot exactly where it was. What the alignment is about is
+/// the glyph, so the glyph is what gets the selector.
+fn caret_glyph_selector(id: IndicatorId, icon: IconKind) -> String {
+    let direction = match icon {
+        IconKind::CaretDown => "DOWN",
+        IconKind::CaretRight => "RIGHT",
+        IconKind::CaretLeft => "LEFT",
+        _ => panic!("only a caret names a caret glyph selector"),
+    };
+    format!("TEST_PANEL_CARET_GLYPH_{}_{direction}", indicator_name(id))
+}
+
+/// The debug selector of the checkbox that enables one indicator.
+///
+/// A settings row aligns its first control with this box's left edge, so a test
+/// that says "the parameter starts under the checkbox" has to be able to ask where
+/// the checkbox is.
+fn node_toggle_selector(id: IndicatorId) -> String {
+    format!("TEST_PANEL_NODE_TOGGLE_{}", indicator_name(id))
+}
+
 /// The debug selector of one indicator's title in its node row.
 ///
 /// The title is measured against a section heading: the two captions are the
@@ -638,6 +720,19 @@ fn color_selector(key: ColorKey) -> String {
 fn switch_row_selector(key: ColorKey) -> String {
     let name = indicator_name(key.id);
     format!("TEST_PANEL_SWITCH_ROW_{name}_{}", color_key_name(key.key))
+}
+
+/// The debug selector of the checkbox inside one `Switch` row.
+///
+/// The row and its checkbox are two boxes: the row is what the inset places and the
+/// toggle is what the first-control alignment is about, so a test that asked only
+/// for the row would answer about the wrong box.
+fn switch_toggle_selector(key: ColorKey) -> String {
+    let name = indicator_name(key.id);
+    format!(
+        "TEST_PANEL_SWITCH_TOGGLE_{name}_{}",
+        color_key_name(key.key)
+    )
 }
 
 /// The debug selector of one line of a line list.
