@@ -10,9 +10,14 @@
 //! A row is not drawn on the panel: it is drawn inside the card of the indicator
 //! it belongs to (see `view::card`). The card's padding is the inset a row starts
 //! from — the node row's left edge sits one card border plus that padding inside
-//! the card — and a settings row indents its first control by [`SETTING_INSET`] so
-//! that it lands on the same vertical line as the checkbox that enables the
-//! indicator above it.
+//! the card — and a settings row indents its first control so that what is *drawn*
+//! lands on the vertical line the square inside the indicator's checkbox is on.
+//!
+//! That line is why the inset is not one number: a label or an `Input` paints from
+//! its own left edge and takes [`SETTING_INSET`], while a checkbox paints a square
+//! one padding inside its box and takes [`CHECKBOX_INSET`] so that its square lands
+//! on the same line. The rows line up by what the eye sees, not by the boxes the
+//! drawing is laid out in.
 
 use base_ui::{
     button::Button,
@@ -73,19 +78,27 @@ const CARET_SIZE: f32 = 16.0;
 /// 16px and the toggle after it does not move. Aligning the arrow must not shift the
 /// checkbox the rest of the row is measured against.
 const CARET_INSET: f32 = 3.0;
-/// How far a settings row insets its first control.
+/// The padding an indicator's checkbox draws inside its own box, before its square.
 ///
-/// The node row puts the checkbox that enables the indicator this far in — a caret
-/// slot, then [`NODE_GAP`] — so a settings row whose first control starts at the
-/// same x reads as a column under one title rather than as a list indented under
-/// it. A text label, an `Input` and a checkbox all line up on this one line.
+/// `UnifiedSize::Small`'s `px()`, written as a number because a `const` cannot call
+/// it. `rows_tests` holds the two together: the square this padding leads to is the
+/// line every settings row aligns on, so the number and the control's own size must
+/// not drift apart.
+pub(super) const CHECKBOX_PADDING: f32 = 4.0;
+/// How far a settings row insets a control whose visible edge is its own box.
+///
+/// The node row puts the checkbox that enables the indicator one caret slot and one
+/// [`NODE_GAP`] in, and the square inside that checkbox a further
+/// [`CHECKBOX_PADDING`]. A label or an `Input` has no such padding of its own — its
+/// box is what is seen — so it has to start at the square's line to read as the same
+/// column: a caret slot, the gap, and the checkbox's padding.
 ///
 /// `pub(super)` rather than private, which makes it visible to the whole `panel`
 /// module: the panel's tests read it as the offset a settings row's first control
-/// starts at, and that is what makes "the control is on the left, and under the
-/// checkbox" a measurement rather than a description. A literal 20.0 in the test
-/// would pin the number instead of the row that places its children by it.
-pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP;
+/// starts at, and that is what makes "the control is on the left, and on the
+/// checkbox's line" a measurement rather than a description. A literal 24.0 in the
+/// test would pin the number instead of the row that places its children by it.
+pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP + CHECKBOX_PADDING;
 /// [`SETTING_INSET`] for a row that draws the frame marking a field in error.
 ///
 /// One pixel less, because that frame is part of the box the padding is measured
@@ -94,6 +107,14 @@ pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP;
 /// the first control of every kind of settings row on one vertical line, whatever
 /// each row draws around itself.
 pub(super) const FRAMED_INSET: f32 = SETTING_INSET - 1.0;
+/// How far a settings row insets a checkbox, whose visible edge is its square.
+///
+/// A checkbox draws [`CHECKBOX_PADDING`] of its own before the square, so putting
+/// its *box* on [`SETTING_INSET`] would push its square [`CHECKBOX_PADDING`] past
+/// every label and field above it. It takes one padding less and its square lands on
+/// the same line as the rest: the rows line up by what is drawn, not by the boxes
+/// the drawing is laid out in.
+const CHECKBOX_INSET: f32 = SETTING_INSET - CHECKBOX_PADDING;
 /// The width of one period field.
 ///
 /// `pub(super)` for the same reason [`SETTING_INSET`] is: a test measures the field
@@ -299,8 +320,9 @@ pub(super) fn switch_row(
         .flex()
         .items_center()
         .gap_2()
-        // No frame on this row, so the whole inset is padding.
-        .pl(px(SETTING_INSET))
+        // The checkbox's own box takes one padding less than a label does, so that
+        // the square it draws lands on the same line as every label and field.
+        .pl(px(CHECKBOX_INSET))
         .child(
             div().flex_1().min_w_0().child(
                 Toggle::new((node_id(index), row.label_key))
@@ -496,8 +518,9 @@ fn add_line_row(
         .debug_selector(|| "TEST_PANEL_ADD_LINE".into())
         .w_full()
         .h(px(ADD_ROW_HEIGHT))
-        // The button is the row's first control, so it starts on the same line as
-        // every other settings row's: the list it grows is read as one column.
+        // The button draws its own outline from its outer edge, so the row's inset is
+        // the whole of it: the button's frame lands on the line the labels and the
+        // checkbox's square are on, and the list it grows is read as one column.
         .pl(px(SETTING_INSET))
         .child(
             Button::new(ElementId::NamedInteger(

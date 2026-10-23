@@ -1802,17 +1802,23 @@ fn the_caret_should_sit_between_the_cards_edge_and_the_checkbox(cx: &mut TestApp
     );
 }
 
-/// Every settings row starts its first control on the checkbox's vertical line.
+/// Every settings row draws its first control against the square in the checkbox.
 ///
-/// The rows are built by three different functions and two of them draw a 1px
-/// error frame that the third does not, so "the first control of a row is under the
-/// checkbox" is a property of the constants those functions share rather than of
-/// any one of them: a row that counted the frame as padding would be 1px left of
-/// the others, and a row that did not count it would be 1px right.
+/// The line is stated by what is *drawn*, not by the box the drawing is laid out in:
+/// a label and an `Input` paint from their own left edge, while a checkbox paints a
+/// square inset by its own padding. So the two kinds of row need different insets to
+/// land on one line, and this is the test that holds them together — a row that used
+/// the same inset as a label would push its square four pixels right of everything
+/// above it, which is the mistake this measures for.
 ///
-/// No single indicator has all three kinds of row — MA has a line list, MACD has
-/// period and switch rows and no list — so the two are measured one after the
-/// other, each against the checkbox in its own node row.
+/// The frame is the third thing that moves the line: a period row and a line row both
+/// draw a 1px error frame, a switch row does not, and the frame is inside the box the
+/// padding is measured from. A row that counted it as padding would be a pixel left,
+/// and one that ignored it a pixel right.
+///
+/// No single indicator has every kind of row — MA has a line list, MACD has period
+/// and switch rows and no list — so they are measured against the checkbox in their
+/// own node row.
 #[gpui_kit::test]
 fn every_settings_row_should_start_on_the_checkboxs_line(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -1822,20 +1828,36 @@ fn every_settings_row_should_start_on_the_checkboxs_line(cx: &mut TestAppContext
     // indicator it is not told to keep, so opening them one at a time would fold
     // the first while opening the second.
     fold_all_but(window, &panel, &[IndicatorId::Ma, IndicatorId::Macd]);
+
+    // The line is the square's, so it is read off the checkbox's own box plus the
+    // padding that checkbox draws before it. `UnifiedSize::Small::px()` is that
+    // padding, taken from the control rather than written out again here.
+    let checkbox_padding = UnifiedSize::Small.px().as_f32();
+    let square_of = |toggle: Bounds<gpui_kit::Pixels>| toggle.left().as_f32() + checkbox_padding;
+
     let ma_toggle = window
         .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
         .expect("MA's node row draws the checkbox that enables it");
     let line_field = window
         .debug_bounds("TEST_PANEL_PERIOD_FIELD_MA_0")
         .expect("MA's line list draws a field on its first line");
-    assert!(
-        (line_field.left().as_f32() - ma_toggle.left().as_f32()).abs() <= 1.0,
-        "a line row's field starts at {}, and the checkbox that enables the \
-         indicator starts at {}: a settings row is a column under the title, not \
-         a list indented under it",
-        line_field.left().as_f32(),
-        ma_toggle.left().as_f32()
-    );
+    let add_button = window
+        .debug_bounds("TEST_PANEL_ADD_LINE_BUTTON")
+        .expect("MA's list draws the button that adds a line");
+    let ma_line = square_of(ma_toggle);
+    for (what, left) in [
+        ("a line row's field", line_field.left().as_f32()),
+        // The button's own frame is its visible edge, so it needs no padding taken
+        // off the way a checkbox does.
+        ("the + button's frame", add_button.left().as_f32()),
+    ] {
+        assert!(
+            (left - ma_line).abs() <= 1.0,
+            "{what} draws from {left}, and the square in the checkbox is at \
+             {ma_line}: a settings row is a column under the title, not a list \
+             indented under it"
+        );
+    }
 
     let macd_toggle = window
         .debug_bounds("TEST_PANEL_NODE_TOGGLE_MACD")
@@ -1843,23 +1865,23 @@ fn every_settings_row_should_start_on_the_checkboxs_line(cx: &mut TestAppContext
     let period_label = window
         .debug_bounds("TEST_PANEL_PERIOD_LABEL_MACD_0")
         .expect("MACD's first period row draws its label");
-    // A switch row's first control is the checkbox it draws; the row's own box
-    // starts one border further out, so the toggle is what has to land on the line.
     let switch_toggle = window
         .debug_bounds("TEST_PANEL_SWITCH_TOGGLE_MACD_DIF")
         .expect("MACD's DIF switch row draws its checkbox");
 
-    let line = macd_toggle.left().as_f32();
+    let macd_line = square_of(macd_toggle);
     assert!(
-        (period_label.left().as_f32() - line).abs() <= 1.0,
-        "a period row's label starts at {}, and the checkbox starts at {line}",
+        (period_label.left().as_f32() - macd_line).abs() <= 1.0,
+        "a period row's label draws from {}, and the square is at {macd_line}",
         period_label.left().as_f32()
     );
+    // A switch row's first control is itself a checkbox, so what has to land on the
+    // line is its square, one padding inside the toggle's own box.
+    let switch_square = square_of(switch_toggle);
     assert!(
-        (switch_toggle.left().as_f32() - line).abs() <= 1.0,
-        "a switch row's checkbox starts at {}, and the node row's checkbox starts \
-         at {line}",
-        switch_toggle.left().as_f32()
+        (switch_square - macd_line).abs() <= 1.0,
+        "a switch row's square is at {switch_square}, and the node row's is at \
+         {macd_line}"
     );
 }
 

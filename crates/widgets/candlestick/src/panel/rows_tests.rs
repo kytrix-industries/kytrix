@@ -3,11 +3,35 @@
 //! These are the names the window stores state under, so what is pinned here is
 //! the part that makes that state survive a frame: one card is one name, and the
 //! name is made of nothing that moves.
+//!
+//! The last test is not about an identifier: it holds the padding the rows assume a
+//! checkbox draws to the padding the checkbox actually draws, which is the number
+//! the whole settings column is aligned on.
 
+use base_ui::size::UnifiedSize;
 use gpui_kit::{ElementId, SharedString};
 
-use super::rows::card_id;
+use super::rows::{CHECKBOX_PADDING, card_id};
 use crate::indicator::INDICATOR_CATALOG;
+
+/// The checkbox's padding, as the rows assume it and as the control draws it.
+///
+/// Every settings row aligns on the square inside the indicator's checkbox, and the
+/// square sits one padding inside the checkbox's box. The rows cannot call
+/// `UnifiedSize::Small.px()` — a `const` may not — so the number is written out
+/// beside them; this is what keeps the written number and the control from drifting
+/// apart. A `UnifiedSize::Small` that changed its padding would otherwise move the
+/// square while every label stayed where it was, and the column would be off by the
+/// difference with nothing failing.
+#[test]
+fn the_rows_should_assume_the_padding_a_small_checkbox_draws() {
+    assert_eq!(
+        CHECKBOX_PADDING,
+        UnifiedSize::Small.px().as_f32(),
+        "the row's alignment takes one checkbox padding off its inset, so it has to \
+         be the padding `UnifiedSize::Small` gives a checkbox"
+    );
+}
 
 /// Every card is named after its place in the catalogue, and only that.
 ///

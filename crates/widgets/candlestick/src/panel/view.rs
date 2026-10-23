@@ -47,10 +47,10 @@ use crate::{
 /// Fixed rather than draggable, and the budget is counted from the widest thing in
 /// it: a line row. The panel's own [`PANEL_PADDING`] leaves 244, a card's 1px
 /// border and [`CARD_PADDING`] leave 234 inside it, and the line row's own 1px
-/// frame plus [`rows::SETTING_INSET`] leave 212. The row's controls take 104 of
+/// frame plus [`rows::SETTING_INSET`] leave 208. The row's controls take 104 of
 /// those — a 60px period field, a 20px colour picker and a 24px delete button — and
 /// the three 8px gaps between them take 24, so the spacer that holds the controls
-/// at the right edge still has 84 to give. A pane narrower than this presses the
+/// at the right edge still has 80 to give. A pane narrower than this presses the
 /// chart down to its own minimum plot width and the body clips the panel's right
 /// edge — the panel's visibility is decided by whether it is open, not by how wide
 /// the pane is, because `Render` cannot measure the box it is drawn in.
@@ -456,7 +456,8 @@ impl IndicatorPanel {
     /// card that stopped at the node row would draw the settings of one indicator
     /// between the cards of two. Its padding is the inset the node row starts
     /// from; a settings row under it is that much plus `rows::SETTING_INSET`, so
-    /// that its first control lands under the checkbox the node row draws.
+    /// that its first control lands on the line the square inside that checkbox is
+    /// drawn on.
     fn indicator_card(
         &self,
         index: usize,
