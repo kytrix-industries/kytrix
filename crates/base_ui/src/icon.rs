@@ -20,6 +20,7 @@ pub enum IconKind {
     CircleNotch,
     CaretDown,
     CaretLeft,
+    CaretRight,
     ArrowUp,
     ArrowDown,
     ArrowCircleUpFill,
@@ -71,6 +72,7 @@ impl IconKind {
             IconKind::CircleNotch => "icons/phosphoricons/circle-notch.svg",
             IconKind::CaretDown => "icons/phosphoricons/caret-down.svg",
             IconKind::CaretLeft => "icons/phosphoricons/caret-left.svg",
+            IconKind::CaretRight => "icons/phosphoricons/caret-right.svg",
             IconKind::ArrowUp => "icons/phosphoricons/arrow-up.svg",
             IconKind::ArrowDown => "icons/phosphoricons/arrow-down.svg",
             IconKind::ArrowCircleUpFill => "icons/phosphoricons/arrow-circle-up-fill.svg",
@@ -159,7 +161,7 @@ mod tests {
     use super::IconKind;
 
     /// 全部变体，顺序与 [`IconKind::path`] 一致。
-    const KINDS: [IconKind; 46] = [
+    const KINDS: [IconKind; 47] = [
         IconKind::X,
         IconKind::XBold,
         IconKind::Circle,
@@ -173,6 +175,7 @@ mod tests {
         IconKind::CircleNotch,
         IconKind::CaretDown,
         IconKind::CaretLeft,
+        IconKind::CaretRight,
         IconKind::ArrowUp,
         IconKind::ArrowDown,
         IconKind::ArrowCircleUpFill,

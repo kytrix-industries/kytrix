@@ -150,8 +150,9 @@ pub(crate) struct IndicatorLineConfig {
 
 /// A dynamic list of lines.
 ///
-/// `rows` is never empty: the delete button is disabled on the last row, and
-/// both construction and decoding guarantee it.
+/// `rows` is never empty: the last line cannot be removed, both construction and
+/// decoding refuse an empty list, and at that minimum the panel draws no delete
+/// button at all — so there is no control whose press could ask for the removal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LineListConfig {
     pub rows: Vec<IndicatorLineConfig>,
@@ -407,9 +408,9 @@ impl CandlestickIndicatorConfig {
 
     /// Removes one line from `id`'s list.
     ///
-    /// The last line is never removed: a line list is never empty, and the panel
-    /// disables the button that would ask for it. Returns whether a line was
-    /// removed.
+    /// The last line is never removed: a line list is never empty, and at the
+    /// minimum the panel draws no delete button to ask for it. Returns whether a
+    /// line was removed.
     pub(crate) fn remove_line(&mut self, id: IndicatorId, index: usize) -> bool {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;

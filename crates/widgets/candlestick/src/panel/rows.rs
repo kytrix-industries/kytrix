@@ -19,11 +19,8 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    base::{Disableable, Placement},
-    div, hsla,
-    prelude::FluentBuilder,
-    px,
+    Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Placement, div, hsla,
+    prelude::FluentBuilder, px,
 };
 use i18n::t;
 
@@ -33,7 +30,8 @@ use super::{
     view::IndicatorPanel,
 };
 use crate::indicator::{
-    IndicatorDefinition, IndicatorId, LineListConfig, SettingControl, SettingKey, SettingRow,
+    IndicatorDefinition, IndicatorId, IndicatorPane, LineListConfig, SettingControl, SettingKey,
+    SettingRow,
 };
 
 /// The height of an indicator's node row.
@@ -47,16 +45,34 @@ const HINT_INSET: f32 = 4.0;
 /// The height of the row holding the "+" button.
 const ADD_ROW_HEIGHT: f32 = 28.0;
 /// One level of indent: a settings row sits one level under its indicator.
-const INDENT: f32 = 16.0;
+///
+/// `pub(super)` rather than private, which makes it visible to the whole `panel`
+/// module: the panel's tests read it as the offset a line row's field starts at,
+/// and that is what makes "the field is on the left" a measurement rather than a
+/// description. A literal 16.0 in the test would pin the number instead of the
+/// row that places its children by it.
+pub(super) const INDENT: f32 = 16.0;
 /// The size of the caret that opens and folds an indicator's settings.
 const CARET_SIZE: f32 = 16.0;
 /// The width of one period field.
-const PERIOD_FIELD_WIDTH: f32 = 60.0;
+///
+/// `pub(super)` for the same reason [`INDENT`] is: a test measures the field
+/// against the width the row gives it, so the number is stated once, beside the
+/// row that applies it.
+pub(super) const PERIOD_FIELD_WIDTH: f32 = 60.0;
 /// The width of a row's delete button.
 const DELETE_BUTTON_WIDTH: f32 = 24.0;
 
 /// A section heading: "Main chart" or "Sub chart".
-pub(super) fn section_title(label: SharedString, cx: &App) -> AnyElement {
+///
+/// The caption is its own element so that the box the selector names is the box
+/// the text is laid out in: the row around it is a fixed height, which would say
+/// nothing about the size of the text inside it.
+///
+/// The selector names the pane the heading introduces, because the panel draws
+/// two of them and a test that measured "the section heading" would otherwise
+/// answer about whichever one the frame painted last.
+pub(super) fn section_title(pane: IndicatorPane, label: SharedString, cx: &App) -> AnyElement {
     div()
         .h(px(NODE_ROW_HEIGHT))
         .flex()
@@ -64,7 +80,11 @@ pub(super) fn section_title(label: SharedString, cx: &App) -> AnyElement {
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().roles.fg.muted.hsla)
-        .child(label)
+        .child(
+            div()
+                .debug_selector(move || section_title_selector(pane))
+                .child(label),
+        )
         .into_any_element()
 }
 
@@ -87,20 +107,14 @@ pub(super) fn node_row(
     let id = definition.id;
     let row_id = node_id(index);
     let caret = if expandable {
+        let icon = caret_icon(expanded);
         div()
-            .debug_selector(move || caret_selector(id))
+            .debug_selector(move || caret_selector(id, icon))
             .flex()
             .items_center()
             .justify_center()
             .size(px(CARET_SIZE))
-            .child(
-                Icon::new(if expanded {
-                    IconKind::CaretDown
-                } else {
-                    IconKind::CaretLeft
-                })
-                .size_3(),
-            )
+            .child(Icon::new(icon).size_3())
             .into_any_element()
     } else {
         // The title of an indicator without a caret keeps the caret's space, so
@@ -145,19 +159,26 @@ pub(super) fn node_row(
                     let _ = toggle_panel.update(cx, |panel, cx| panel.set_enabled(id, checked, cx));
                 }),
         )
-        .child(div().text_sm().child(caption))
+        .child(
+            div()
+                .debug_selector(move || node_title_selector(id))
+                .text_xs()
+                .child(caption),
+        )
         .into_any_element()
 }
 
 /// One `Period` row: its label on the left, its field on the right, and the hint
 /// under it while the field does not hold a period.
 pub(super) fn period_row(
+    row_index: usize,
     row: &SettingRow,
     input: &LineInput,
     invalid: bool,
     cx: &App,
 ) -> AnyElement {
     let caption = t!(cx, row.label_key);
+    let label_selector = period_label_selector(input.id, row_index);
 
     div()
         .flex()
@@ -171,7 +192,14 @@ pub(super) fn period_row(
                 .pl(px(INDENT))
                 .border_1()
                 .border_color(border_color(invalid, cx))
-                .child(div().flex_1().min_w_0().text_sm().child(caption.clone()))
+                .child(
+                    div()
+                        .debug_selector(move || label_selector)
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .child(caption.clone()),
+                )
                 .child(
                     div()
                         .id(ElementId::NamedInteger(
@@ -306,6 +334,13 @@ pub(super) fn line_list(
 /// One line of a line list: its period field, the picker that sets its colour,
 /// and the button that deletes it.
 ///
+/// The field sits at the row's left, under the list's indent, and the controls
+/// sit at its right: a spacer takes the width between them, so the picker and the
+/// delete button stay at the edge whether or not the delete button is drawn. A
+/// spacer rather than `justify_between` because the number of controls varies —
+/// the last line of a list has no delete button — and `justify_between` would
+/// move the picker to the middle of the row exactly when the button is missing.
+///
 /// The picker is the control, not a swatch beside one. A line list draws exactly
 /// one picker per line, on that line's row; MACD's and KDJ's switch rows draw
 /// their own pickers for the colours those rows control. The two never share an
@@ -324,12 +359,16 @@ fn line_row(
     let remove = t!(cx, "widget.candlestick.indicator.remove_line");
     let color = t!(cx, "widget.candlestick.indicator.line_color");
     let delete_panel = panel.clone();
+    let row_selector = line_row_selector(id, line_index);
+    let field_selector = period_field_selector(id, line_index);
+    let delete_selector = delete_button_selector(id, line_index);
 
     div()
         .flex()
         .flex_col()
         .child(
             div()
+                .debug_selector(move || row_selector)
                 .h(px(SETTING_ROW_HEIGHT))
                 .flex()
                 .items_center()
@@ -339,38 +378,40 @@ fn line_row(
                 .border_color(border_color(invalid, cx))
                 .child(
                     div()
+                        .debug_selector(move || field_selector)
                         .id(ElementId::NamedInteger(
                             SharedString::new_static("CandlestickIndicatorLineField"),
                             input.slot,
                         ))
+                        .flex_none()
                         .w(px(PERIOD_FIELD_WIDTH))
                         .aria_label(period)
                         .child(Input::new(&input.entity).small()),
                 )
+                .child(div().flex_1())
                 .child(color_control(picker, color_selector(picker.key()), color))
-                .child(
-                    Button::new(ElementId::NamedInteger(
-                        SharedString::new_static("CandlestickIndicatorDeleteLine"),
-                        input.slot,
-                    ))
-                    .debug_selector(|| "TEST_PANEL_DELETE_LINE".into())
-                    .ghost()
-                    .small()
-                    .w(px(DELETE_BUTTON_WIDTH))
-                    .aria_label(remove.clone())
-                    .with_tooltip(remove)
-                    .disabled(!can_remove)
-                    // A disabled `Button` only looks disabled: the handler it was
-                    // given still runs, so the last line's button has none.
-                    .when(can_remove, |button| {
-                        button.on_click(move |_, _, cx| {
+                // The last line of a list has no delete button at all: a drawn
+                // but disabled one would offer a control that can never act.
+                .when(can_remove, |row| {
+                    row.child(
+                        Button::new(ElementId::NamedInteger(
+                            SharedString::new_static("CandlestickIndicatorDeleteLine"),
+                            input.slot,
+                        ))
+                        .debug_selector(move || delete_selector)
+                        .ghost()
+                        .small()
+                        .w(px(DELETE_BUTTON_WIDTH))
+                        .aria_label(remove.clone())
+                        .with_tooltip(remove)
+                        .on_click(move |_, _, cx| {
                             let _ = delete_panel.update(cx, |panel, cx| {
                                 panel.remove_line(id, line_index, cx);
                             });
                         })
-                    })
-                    .child(Icon::new(IconKind::Trash).size_3()),
-                ),
+                        .child(Icon::new(IconKind::Trash).size_3()),
+                    )
+                }),
         )
         .when(invalid, |row| row.child(invalid_hint(cx)))
         .into_any_element()
@@ -378,6 +419,10 @@ fn line_row(
 
 /// The "+" row: one button across the list's width, with no disabled state to
 /// reach — a list has no maximum length.
+///
+/// The caption is centred rather than left at the button's 4px padding: the
+/// button spans the whole row, so a caption at its left edge reads like a field
+/// label instead of the action that adds a line.
 fn add_line_row(
     index: usize,
     id: IndicatorId,
@@ -397,26 +442,47 @@ fn add_line_row(
                 SharedString::new_static("CandlestickIndicatorAddLine"),
                 index as u64,
             ))
+            .debug_selector(|| "TEST_PANEL_ADD_LINE_BUTTON".into())
             .outline()
             .small()
             .w_full()
+            .justify_center()
             .aria_label(label.clone())
             .with_tooltip(label.clone())
             .on_click(move |_, _, cx| {
                 let _ = panel.update(cx, |panel, cx| panel.add_line(id, cx));
             })
-            .child(label),
+            .child(
+                div()
+                    .debug_selector(|| "TEST_PANEL_ADD_LINE_LABEL".into())
+                    .flex_none()
+                    .child(label),
+            ),
         )
         .into_any_element()
 }
 
 /// Whether a line list with `rows` lines may lose one of them.
 ///
-/// A line list never goes below the minimum its catalogue row declares, which is
-/// what makes the last line's delete button a disabled button rather than a
-/// hidden one: hiding it would move the controls of the row as the list shrinks.
+/// A line list never goes below the minimum its catalogue row declares, and at
+/// that minimum the row's delete button is not drawn at all: nothing in the row
+/// can be pressed to empty the list, and the configuration refuses the removal
+/// as well.
 pub(super) fn can_remove_line(min_rows: usize, rows: usize) -> bool {
     rows > min_rows
+}
+
+/// The icon that states whether an indicator's settings are open.
+///
+/// This is the one place the direction is decided: the caret points down while
+/// the settings are drawn and right while they are folded, so the same control
+/// says both "this is open" and "this opens".
+pub(super) fn caret_icon(expanded: bool) -> IconKind {
+    if expanded {
+        IconKind::CaretDown
+    } else {
+        IconKind::CaretRight
+    }
 }
 
 /// The picker of one colour setting, wrapped in its tooltip and its test selector.
@@ -476,11 +542,49 @@ fn node_id(index: usize) -> ElementId {
 /// The debug selector of one indicator's caret.
 ///
 /// An indicator with no settings rows is drawn without a caret, which is what a
-/// test asks this selector for. The names are written out rather than derived
-/// from the id's `Debug` spelling: a selector a test reads should not depend on
-/// how a derive happens to print.
-fn caret_selector(id: IndicatorId) -> String {
-    format!("TEST_PANEL_CARET_{}", indicator_name(id))
+/// test asks this selector for. The direction is part of the name, and it is read
+/// from the icon the row is about to draw rather than from the flag it was given:
+/// a selector that said "right" because the row was folded would still say it
+/// after the row started drawing a left caret, which is the bug the selector is
+/// there to catch.
+///
+/// The names are written out rather than derived from the id's `Debug` spelling:
+/// a selector a test reads should not depend on how a derive happens to print.
+fn caret_selector(id: IndicatorId, icon: IconKind) -> String {
+    let direction = match icon {
+        IconKind::CaretDown => "DOWN",
+        IconKind::CaretRight => "RIGHT",
+        IconKind::CaretLeft => "LEFT",
+        _ => panic!("only a caret names a caret selector"),
+    };
+    format!("TEST_PANEL_CARET_{}_{direction}", indicator_name(id))
+}
+
+/// The debug selector of one indicator's title in its node row.
+///
+/// The title is measured against a section heading: the two captions are the
+/// same kind of text at two sizes, so their boxes are what states the sizes.
+fn node_title_selector(id: IndicatorId) -> String {
+    format!("TEST_PANEL_NODE_TITLE_{}", indicator_name(id))
+}
+
+/// The debug selector of one `Period` row's label.
+///
+/// Named after the indicator and the row's place in its catalogue entry: a
+/// period row has no line index, and two of an indicator's rows can both be
+/// periods (MACD has three), so the position is what tells them apart.
+fn period_label_selector(id: IndicatorId, row_index: usize) -> String {
+    let name = indicator_name(id);
+    format!("TEST_PANEL_PERIOD_LABEL_{name}_{row_index}")
+}
+
+/// The debug selector of the heading that introduces one region of the chart.
+fn section_title_selector(pane: IndicatorPane) -> String {
+    let pane = match pane {
+        IndicatorPane::Main => "MAIN",
+        IndicatorPane::Sub => "SUB",
+    };
+    format!("TEST_PANEL_SECTION_TITLE_{pane}")
 }
 
 /// The debug selector of one colour picker.
@@ -503,6 +607,36 @@ fn color_selector(key: ColorKey) -> String {
 fn switch_row_selector(key: ColorKey) -> String {
     let name = indicator_name(key.id);
     format!("TEST_PANEL_SWITCH_ROW_{name}_{}", color_key_name(key.key))
+}
+
+/// The debug selector of one line of a line list.
+///
+/// The row is what a test measures the controls inside it against: the field's
+/// left edge and the controls' right edge are stated relative to it. The line
+/// index is part of the name because a list draws as many rows as it has lines.
+fn line_row_selector(id: IndicatorId, line_index: usize) -> String {
+    let name = indicator_name(id);
+    format!("TEST_PANEL_LINE_ROW_{name}_{line_index}")
+}
+
+/// The debug selector of the wrapper around one line's period field.
+///
+/// The wrapper, not the field itself: the field is a `base_ui` input whose box a
+/// test already finds under its own selector, and what this row decides is where
+/// the wrapper it was given is placed.
+fn period_field_selector(id: IndicatorId, line_index: usize) -> String {
+    let name = indicator_name(id);
+    format!("TEST_PANEL_PERIOD_FIELD_{name}_{line_index}")
+}
+
+/// The debug selector of one line's delete button.
+///
+/// Named after its line like the row it sits on: a list draws one delete button
+/// per line, so a selector every one of them shares would answer about whichever
+/// of them the frame happened to paint last.
+fn delete_button_selector(id: IndicatorId, line_index: usize) -> String {
+    let name = indicator_name(id);
+    format!("TEST_PANEL_DELETE_LINE_{name}_{line_index}")
 }
 
 /// The name a colour key is written under in a test selector.

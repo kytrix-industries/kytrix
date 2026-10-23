@@ -186,8 +186,9 @@ impl IndicatorPanel {
 
     /// Removes one line from `id`'s list.
     ///
-    /// The last line stays: the panel draws that line's delete button disabled
-    /// and without a handler, and the configuration refuses the removal anyway.
+    /// The last line stays: at the minimum its catalogue row declares the panel
+    /// draws no delete button at all, and the configuration refuses the removal
+    /// anyway, so an action that slipped past the panel cannot empty the list.
     pub(super) fn remove_line(&mut self, id: IndicatorId, index: usize, cx: &mut Context<Self>) {
         let Some(mut next) = self.indicator_config(cx) else {
             return;
@@ -457,7 +458,10 @@ impl IndicatorPanel {
         if !expanded {
             return nodes;
         }
-        for row in definition.rows {
+        // Enumerated because a period row is named after its place in the
+        // definition: two of an indicator's rows can both be periods, so the key
+        // alone would not tell their labels apart.
+        for (row_index, row) in definition.rows.iter().enumerate() {
             match row.control {
                 SettingControl::LineList { .. } => {
                     let Some(lines) = entry.settings.lines() else {
@@ -480,6 +484,7 @@ impl IndicatorPanel {
                         continue;
                     };
                     nodes.push(rows::period_row(
+                        row_index,
                         row,
                         input,
                         self.is_invalid(definition.id, None, row.key),
@@ -563,7 +568,7 @@ impl Render for IndicatorPanel {
             .gap(px(ROW_GAP))
             .p(px(PANEL_PADDING));
         for pane in [IndicatorPane::Main, IndicatorPane::Sub] {
-            content = content.child(rows::section_title(t!(cx, section_key(pane)), cx));
+            content = content.child(rows::section_title(pane, t!(cx, section_key(pane)), cx));
             for (index, definition) in INDICATOR_CATALOG.iter().enumerate() {
                 if definition.pane != pane {
                     continue;

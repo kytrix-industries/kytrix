@@ -5864,7 +5864,7 @@ pub(crate) mod tests {
             "the panel takes the width the body reserves for it out of the row"
         );
         assert!(
-            window.debug_bounds("TEST_PANEL_CARET_MA").is_some(),
+            window.debug_bounds("TEST_PANEL_CARET_MA_DOWN").is_some(),
             "and what it draws is its own settings rows"
         );
     }

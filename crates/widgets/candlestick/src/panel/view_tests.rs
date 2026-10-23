@@ -7,6 +7,7 @@
 
 use base_ui::{
     color_picker::{ColorPicker, ColorPickerEvent},
+    icon::IconKind,
     input::{InputState, InputStateEvent},
     style::theme::ThemeExt,
 };
@@ -18,7 +19,7 @@ use gpui_kit::{
 use super::{
     colors::{self, ColorKey},
     inputs, rows,
-    view::IndicatorPanel,
+    view::{IndicatorPanel, PANEL_WIDTH},
 };
 use crate::{
     indicator::{
@@ -38,7 +39,11 @@ struct PanelHarness {
 
 impl Render for PanelHarness {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.panel.clone())
+        // The panel takes [`PANEL_WIDTH`] out of the body it is drawn in, so the
+        // harness gives it exactly that: a panel laid out in a maximized test
+        // display would fit rows production clips, and a row that overflowed the
+        // real width would still measure as if it fitted.
+        div().w(px(PANEL_WIDTH)).h_full().child(self.panel.clone())
     }
 }
 
@@ -151,28 +156,48 @@ fn notifying_the_panel_should_make_it_draw_again(cx: &mut TestAppContext) {
 
 /// Volume has nothing to configure, so it has no caret and cannot be opened: the
 /// row exists, the settings do not.
+///
+/// MA starts expanded, so the caret it draws is the "down" one; a caret is named
+/// after the direction it points, which is what lets this test say "volume has no
+/// caret at all" rather than "volume has no caret in one of its two states".
 #[gpui_kit::test]
 fn the_volume_indicator_should_have_no_caret(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
     let window = draw(cx, &panel);
 
     assert!(
-        window.debug_bounds("TEST_PANEL_CARET_MA").is_some(),
+        window.debug_bounds("TEST_PANEL_CARET_MA_DOWN").is_some(),
         "an indicator with settings rows is drawn with a caret"
     );
     assert!(
-        window.debug_bounds("TEST_PANEL_CARET_VOL").is_none(),
+        window.debug_bounds("TEST_PANEL_CARET_VOL_DOWN").is_none()
+            && window.debug_bounds("TEST_PANEL_CARET_VOL_RIGHT").is_none(),
         "volume declares no rows, so there is nothing for a caret to open"
     );
 }
 
-/// The last line of a list cannot be removed: its delete button is drawn
-/// disabled and wired to nothing.
+/// The last line of a list cannot be removed, and the row it is on does not
+/// offer a control that says it could: the delete button is drawn only while the
+/// list may still lose a line.
 #[gpui_kit::test]
 fn the_last_line_of_a_list_should_not_be_removable(cx: &mut TestAppContext) {
     let (built, panel) = panel_over(cx);
     let window = draw(cx, &panel);
     focus_on(window, &panel, IndicatorId::Ma);
+
+    assert_eq!(
+        ma_periods(window, &built.widget),
+        vec![5, 10, 20],
+        "MA starts with three lines"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_DELETE_LINE_MA_0").is_some(),
+        "a list that may lose a line draws that line's delete button"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_DELETE_LINE_MA_1").is_some(),
+        "every line of a list above the minimum has a delete button"
+    );
 
     // MA starts with three lines; two removals leave the one the list may not go
     // below.
@@ -186,6 +211,10 @@ fn the_last_line_of_a_list_should_not_be_removable(cx: &mut TestAppContext) {
         ma_periods(window, &built.widget),
         vec![20],
         "two removals leave the last line"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_DELETE_LINE_MA_0").is_none(),
+        "the last line is drawn without a delete button, not with a dead one"
     );
 
     let SettingControl::LineList { min_rows } = definition_of(IndicatorId::Ma).rows[0].control
@@ -201,9 +230,9 @@ fn the_last_line_of_a_list_should_not_be_removable(cx: &mut TestAppContext) {
         "a list of three lines can lose one"
     );
 
-    // The button is disabled and carries no handler, but the configuration
-    // refuses the removal as well: an action that slipped past the button must
-    // not leave a list the settings type says cannot be empty.
+    // The button is not drawn at the minimum, but the configuration refuses the
+    // removal as well: an action that slipped past the panel must not leave a
+    // list the settings type says cannot be empty.
     window.update(|_, cx| {
         panel.update(cx, |panel, cx| panel.remove_line(IndicatorId::Ma, 0, cx));
     });
@@ -213,12 +242,307 @@ fn the_last_line_of_a_list_should_not_be_removable(cx: &mut TestAppContext) {
         vec![20],
         "the configuration refuses to empty the list"
     );
+}
 
-    press(window, "TEST_PANEL_DELETE_LINE");
+/// The delete button of a line actually deletes that line.
+///
+/// The list is above its minimum here, so the button exists: pressing it is the
+/// only thing in the panel that removes a line, and a button whose handler was
+/// dropped would leave the row looking deletable while nothing happened.
+#[gpui_kit::test]
+fn pressing_a_delete_button_should_remove_its_line(cx: &mut TestAppContext) {
+    let (built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
     assert_eq!(
         ma_periods(window, &built.widget),
-        vec![20],
-        "the last line's button does nothing"
+        vec![5, 10, 20],
+        "MA starts with three lines"
+    );
+    let reports_before = built.reports();
+    let inputs_before = window.read(|cx| panel.read(cx).input_count());
+    let pickers_before = window.read(|cx| panel.read(cx).color_picker_count());
+
+    press(window, "TEST_PANEL_DELETE_LINE_MA_1");
+
+    assert_eq!(
+        ma_periods(window, &built.widget),
+        vec![5, 20],
+        "the pressed button removes the line it sits on, and only that line"
+    );
+    assert_eq!(
+        built.reports(),
+        reports_before + 1,
+        "removing a line is written back exactly once"
+    );
+    assert_eq!(
+        window.read(|cx| panel.read(cx).input_count()),
+        inputs_before - 1,
+        "the removed line's field is dropped with it"
+    );
+    assert_eq!(
+        window.read(|cx| panel.read(cx).color_picker_count()),
+        pickers_before - 1,
+        "the removed line's picker is dropped with it"
+    );
+}
+
+/// The field of a line row sits at the row's left and its controls at the row's
+/// right: a row whose children simply follow each other puts the picker and the
+/// delete button in the middle of the panel instead of at its edge.
+#[gpui_kit::test]
+fn a_line_row_should_put_its_field_on_the_left_and_its_controls_on_the_right(
+    cx: &mut TestAppContext,
+) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let row = window
+        .debug_bounds("TEST_PANEL_LINE_ROW_MA_1")
+        .expect("MA's second line is drawn while MA is open");
+    let field = window
+        .debug_bounds("TEST_PANEL_PERIOD_FIELD_MA_1")
+        .expect("the line has a period field");
+    let picker = window
+        .debug_bounds("TEST_PANEL_COLOR_MA_1")
+        .expect("the line has a colour picker");
+    let delete = window
+        .debug_bounds("TEST_PANEL_DELETE_LINE_MA_1")
+        .expect("a list of three lines may lose one");
+
+    assert!(
+        (field.origin.x - (row.origin.x + px(rows::INDENT)))
+            .as_f32()
+            .abs()
+            <= 1.0,
+        "the field starts at the row's left edge plus the indent: {field:?} vs {row:?}"
+    );
+    assert!(
+        (delete.right() - row.right()).as_f32().abs() <= 1.0,
+        "the delete button ends at the row's right edge: {delete:?} vs {row:?}"
+    );
+    assert!(
+        picker.right() <= delete.left(),
+        "the picker sits left of the delete button: {picker:?} vs {delete:?}"
+    );
+}
+
+/// A line row fits the panel the design fixes: the field keeps its width, the
+/// picker keeps its own, and the row's last control still ends inside the panel.
+///
+/// The harness draws the panel at [`PANEL_WIDTH`], which is what production gives
+/// it, so a field wide enough to overflow the real panel is caught here rather
+/// than by a row that only fits the test display. The row's own box would not
+/// catch it: the row is as wide as the panel whatever its children do, so what is
+/// measured is the right edge of the last control on it.
+#[gpui_kit::test]
+fn a_line_row_should_fit_the_panel(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let panel_bounds = window
+        .debug_bounds("TEST_CANDLESTICK_INDICATOR_PANEL")
+        .expect("the panel is drawn");
+    let field = window
+        .debug_bounds("TEST_PANEL_PERIOD_FIELD_MA_1")
+        .expect("the line has a period field");
+    let picker = window
+        .debug_bounds("TEST_PANEL_COLOR_MA_1")
+        .expect("the line has a colour picker");
+    let delete = window
+        .debug_bounds("TEST_PANEL_DELETE_LINE_MA_1")
+        .expect("a list of three lines may lose one");
+
+    assert_eq!(
+        panel_bounds.size.width,
+        px(PANEL_WIDTH),
+        "the harness draws the panel at the width production gives it"
+    );
+    assert!(
+        (field.size.width - px(rows::PERIOD_FIELD_WIDTH))
+            .as_f32()
+            .abs()
+            <= 1.0,
+        "the field keeps its width at {PANEL_WIDTH}px: {field:?}"
+    );
+    assert!(
+        (picker.size.width - px(20.0)).as_f32().abs() <= 1.0,
+        "the picker keeps its 20px square at {PANEL_WIDTH}px: {picker:?}"
+    );
+    assert!(
+        delete.right() <= panel_bounds.right(),
+        "the row's last control ends inside the panel: {delete:?} vs {panel_bounds:?}"
+    );
+}
+
+/// A list at its minimum draws no delete button, so the picker is the row's last
+/// control and has to take its right edge: without the spacer the picker would
+/// stop short of it and leave a gap where the button used to be.
+#[gpui_kit::test]
+fn a_single_line_should_put_its_picker_at_the_rows_right_edge(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    // MA starts with three lines; two removals leave the one the list may not go
+    // below.
+    for _ in 0..2 {
+        window.update(|_, cx| {
+            panel.update(cx, |panel, cx| panel.remove_line(IndicatorId::Ma, 0, cx));
+        });
+    }
+    redraw(window);
+
+    assert!(
+        window.debug_bounds("TEST_PANEL_DELETE_LINE_MA_0").is_none(),
+        "the last line of a list has no delete button"
+    );
+    let row = window
+        .debug_bounds("TEST_PANEL_LINE_ROW_MA_0")
+        .expect("the last line is drawn");
+    let picker = window
+        .debug_bounds("TEST_PANEL_COLOR_MA_0")
+        .expect("the last line keeps its colour picker");
+
+    assert!(
+        (picker.right() - row.right()).as_f32().abs() <= 1.0,
+        "the picker takes the row's right edge once the delete button is gone: \
+         {picker:?} vs {row:?}"
+    );
+}
+
+/// The "+" caption is centred in its button: the small size's 4px horizontal
+/// padding would otherwise leave it at the left edge, where it reads like the
+/// label of the field above it rather than as the action that adds a line.
+#[gpui_kit::test]
+fn the_add_line_caption_should_be_centred(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let button = window
+        .debug_bounds("TEST_PANEL_ADD_LINE_BUTTON")
+        .expect("the button that adds a line is drawn");
+    let caption = window
+        .debug_bounds("TEST_PANEL_ADD_LINE_LABEL")
+        .expect("the button draws its caption");
+
+    assert!(
+        (caption.center().x - button.center().x).as_f32().abs() <= 1.0,
+        "the caption is centred in the button: {caption:?} vs {button:?}"
+    );
+    assert!(
+        caption.size.width < button.size.width / 2.0,
+        "the caption is the width of its text, not of the button: a caption that \
+         filled the button would be centred too, and would not be a caption: \
+         {caption:?} vs {button:?}"
+    );
+}
+
+/// A folded indicator's caret points right, the direction its settings open in;
+/// pointing left says "back", which is not what pressing the row does.
+#[test]
+fn a_folded_caret_should_point_right() {
+    assert_eq!(
+        rows::caret_icon(true),
+        IconKind::CaretDown,
+        "an open indicator's caret points down, at the settings under it"
+    );
+    assert_eq!(
+        rows::caret_icon(false),
+        IconKind::CaretRight,
+        "a folded indicator's caret points right, the direction it opens in"
+    );
+}
+
+/// The caret the panel draws follows the state of the indicator it belongs to.
+///
+/// The helper's answer is only half of it: a row that ignored it, or passed it
+/// the wrong flag, would still draw a caret — just the wrong one. The selector is
+/// named after the direction the row actually drew, so the two states can be told
+/// apart by what is on screen.
+#[gpui_kit::test]
+fn folding_an_indicator_should_draw_a_right_caret(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_DOWN").is_some(),
+        "MA starts open, so its caret points at the settings under it"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_RIGHT").is_none(),
+        "an open indicator draws one caret, not both"
+    );
+
+    window.update(|_, cx| {
+        panel.update(cx, |panel, cx| panel.toggle_expanded(IndicatorId::Ma, cx));
+    });
+    redraw(window);
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_RIGHT").is_some(),
+        "a folded indicator's caret points right, the direction its settings open in"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_DOWN").is_none(),
+        "the open caret is gone once the settings are folded away"
+    );
+
+    window.update(|_, cx| {
+        panel.update(cx, |panel, cx| panel.toggle_expanded(IndicatorId::Ma, cx));
+    });
+    redraw(window);
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_DOWN").is_some(),
+        "opening the settings again turns the caret back down"
+    );
+    assert!(
+        window.debug_bounds("TEST_PANEL_CARET_MA_RIGHT").is_none(),
+        "and the folded caret is gone with it"
+    );
+}
+
+/// The indicator title and the parameter labels are `xs`, one size smaller than
+/// the section headings they sit under.
+///
+/// Measured against a heading the same frame drew rather than against a number:
+/// the captions are the same kind of text, so the difference between their boxes
+/// is the difference between the two sizes, and nothing has to hardcode how tall
+/// a line of either one is.
+#[gpui_kit::test]
+fn the_captions_should_be_smaller_than_a_section_heading(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Macd);
+
+    let heading = window
+        .debug_bounds("TEST_PANEL_SECTION_TITLE_SUB")
+        .expect("the sub chart's heading is drawn");
+    let title = window
+        .debug_bounds("TEST_PANEL_NODE_TITLE_MACD")
+        .expect("MACD's node row draws its title");
+    // MACD's first row is a period row, and its label sits beside the field.
+    let label = window
+        .debug_bounds("TEST_PANEL_PERIOD_LABEL_MACD_0")
+        .expect("MACD's first period row draws its label");
+
+    assert!(
+        title.size.height < heading.size.height,
+        "the indicator title is smaller than a section heading: {title:?} vs {heading:?}"
+    );
+    assert!(
+        label.size.height < heading.size.height,
+        "a parameter label is smaller than a section heading: {label:?} vs {heading:?}"
+    );
+    assert!(
+        window
+            .debug_bounds("TEST_PANEL_SECTION_TITLE_MAIN")
+            .is_some(),
+        "the main chart has a heading of its own, named after its pane"
     );
 }
 
