@@ -121,6 +121,7 @@ pub(super) fn color_labels(cx: &App) -> ColorPickerLabels {
         saturation: t!(cx, "common.color.saturation"),
         lightness: t!(cx, "common.color.lightness"),
         alpha: t!(cx, "common.color.alpha"),
+        confirm: t!(cx, "common.confirm"),
     }
 }
 
@@ -157,10 +158,10 @@ impl LinePicker {
 
     /// Builds `field`'s picker and connects it to `panel`.
     ///
-    /// A change is handed over as a preview, so the chart and the panel follow
-    /// the picker while the user is still choosing; the commit is handed over
-    /// only when the popup closes, which is what makes one interaction publish
-    /// once instead of once per slider tick.
+    /// The picker reports a colour once per interaction — when the user presses the confirm
+    /// button in its panel — and that is exactly the colour to store, so the report is handed
+    /// over as a commit. Nothing is previewed before it: the panel's own footer and trigger show
+    /// the colour the user is choosing, and a panel dismissed without confirming stores nothing.
     pub(super) fn connect(
         field: &ColorField,
         slot: u64,
@@ -172,13 +173,10 @@ impl LinePicker {
             cx.new(|cx| ColorPicker::new(Hsla::from(field.color), UnifiedSize::Small, window, cx));
         entity.update(cx, |picker, cx| picker.set_labels(labels.clone(), cx));
         let key = field.key();
-        let events = cx.subscribe(
-            &entity,
-            move |panel, _, event: &ColorPickerEvent, cx| match event {
-                ColorPickerEvent::ColorChanged(color) => panel.preview_color(key, *color, cx),
-                ColorPickerEvent::ColorCommitted(color) => panel.commit_color(key, *color, cx),
-            },
-        );
+        let events = cx.subscribe(&entity, move |panel, _, event: &ColorPickerEvent, cx| {
+            let ColorPickerEvent::ColorChanged(color) = event;
+            panel.commit_color(key, *color, cx);
+        });
         Self {
             key,
             slot,

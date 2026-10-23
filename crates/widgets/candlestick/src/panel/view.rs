@@ -392,13 +392,17 @@ impl IndicatorPanel {
         }
     }
 
-    /// Paints one colour without storing it.
+    /// Stores the colour the picker confirmed, and publishes it once.
     ///
     /// The key says which control the picker edits: a line list applies the
     /// colour to that line, and a switch row to the one field its colour key
     /// names. A key the configuration no longer holds is ignored, because the
     /// picker that reported it is about to be dropped with its line.
-    pub(super) fn preview_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
+    ///
+    /// The picker reports a colour only when the user confirms it in its panel,
+    /// so this is one write per interaction and the widget's own publish is the
+    /// only one: a panel dismissed without confirming never reaches here.
+    pub(super) fn commit_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
         let Some(mut next) = self.indicator_config(cx) else {
             return;
         };
@@ -406,40 +410,11 @@ impl IndicatorPanel {
             Some(index) => next.set_line_color(key.id, index, LineColor::from(color)),
             None => next.set_color(key.id, key.key, LineColor::from(color)),
         };
-        if applied {
-            self.preview(next, cx);
+        if !applied {
+            return;
         }
-    }
-
-    /// Stores the colour the picker settled on, and publishes it once.
-    ///
-    /// The preview is applied first — a picker may report a commit without a
-    /// change, and one that did change has already travelled that path — so the
-    /// widget is looking at the committed colour before it publishes.
-    pub(super) fn commit_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
-        self.preview_color(key, color, cx);
         if let Some(widget) = self.widget.upgrade() {
-            widget.update(cx, |widget, cx| widget.commit_indicator_config(cx));
-        }
-    }
-
-    /// Hands a previewed configuration to the widget without publishing it.
-    ///
-    /// The colour is on screen before it is stored: the picker reports every
-    /// change a slider or a palette hover produces, and publishing each one would
-    /// write the pane back once per frame. The widget keeps the preview until the
-    /// panel commits it or closes.
-    ///
-    /// The panel itself is not notified: the only views that show the colour are
-    /// the picker — which repaints its own trigger on every change — and the
-    /// chart, which `preview_indicator_config` notifies. None of the panel's rows
-    /// derives from the colour except the picker, which owns its own state, so a
-    /// panel frame per drag tick would be pure cost; `sync_pickers` still runs on
-    /// whatever frame the panel next draws (a period edit, folding, a commit…),
-    /// which keeps it correct.
-    fn preview(&mut self, next: CandlestickIndicatorConfig, cx: &mut Context<Self>) {
-        if let Some(widget) = self.widget.upgrade() {
-            widget.update(cx, |widget, cx| widget.preview_indicator_config(next, cx));
+            widget.update(cx, |widget, cx| widget.set_indicator_config(next, cx));
         }
     }
 

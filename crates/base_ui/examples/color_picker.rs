@@ -29,7 +29,6 @@ impl ColorPickerExample {
         }
     }
 }
-
 impl Render for ColorPickerExample {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The picker needs a window, so it is created on the first render and stored: every later
@@ -41,10 +40,10 @@ impl Render for ColorPickerExample {
             self.subscription = Some(cx.subscribe(
                 &picker,
                 |this, _, event: &ColorPickerEvent, cx| {
-                    match event {
-                        ColorPickerEvent::ColorChanged(color) => this.accent = *color,
-                        ColorPickerEvent::ColorCommitted(color) => this.accent = *color,
-                    }
+                    // The picker reports a color once, when the panel's confirm button is pressed:
+                    // a swatch, a track or a hex edit is only the panel's own preview until then.
+                    let ColorPickerEvent::ColorChanged(color) = event;
+                    this.accent = *color;
                     cx.notify();
                 },
             ));

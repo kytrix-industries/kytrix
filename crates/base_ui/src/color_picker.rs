@@ -7,11 +7,11 @@
 //! rebuilding either. This is the split [`crate::input::InputState`] uses: the caller holds the
 //! entity and listens to it.
 //!
-//! It reports two events. [`ColorPickerEvent::ColorChanged`] fires on every user change, so a
-//! caller can paint the color live; [`ColorPickerEvent::ColorCommitted`] fires once, when the popup
-//! closes on a color different from the baseline it opened with, so a caller can persist one value
-//! per interaction. [`ColorPicker::set_color`] emits neither: a programmatic change is not a user
-//! action.
+//! It reports one event. [`ColorPickerEvent::ColorChanged`] fires once per interaction, when the
+//! user presses the panel's confirm button, and the panel closes with it. Choosing a swatch,
+//! dragging an HSLA track and typing a hex value only repaint the panel while the user is still
+//! choosing, and dismissing the panel without confirming reports nothing.
+//! [`ColorPicker::set_color`] emits nothing either: a programmatic change is not a user action.
 //!
 //! The popup is not the picker's private machinery: [`crate::overlay::Overlay`] owns when the
 //! panel is mounted, where it is placed and how it fades, and [`crate::input::InputState`] owns
@@ -106,18 +106,13 @@ pub enum ColorPickerTab {
 /// What a [`ColorPicker`] reports to its subscribers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColorPickerEvent {
-    /// A user action changed the color.
+    /// The user confirmed a color.
     ///
-    /// It fires on every user change, so a caller can paint a live preview.
+    /// It fires when the panel's confirm button is pressed, and only then: the palette, the HSLA
+    /// tracks and the hex field repaint the panel while the user is still choosing, and dismissing
+    /// the panel reports nothing, so one interaction emits at most one event.
     /// [`ColorPicker::set_color`] does not emit this: a programmatic change is silent.
     ColorChanged(Hsla),
-    /// The popup closed on a color different from the baseline it opened with.
-    ///
-    /// It reports the final color, so a caller can persist once per interaction rather than on
-    /// every [`ColorPickerEvent::ColorChanged`]. The baseline is the color the popup opened with;
-    /// a programmatic [`ColorPicker::set_color`] while the popup is open moves that baseline, so
-    /// closing after only a programmatic change emits nothing.
-    ColorCommitted(Hsla),
 }
 
 /// Every piece of text the panel shows, so a caller can localize it.
@@ -135,6 +130,8 @@ pub struct ColorPickerLabels {
     pub lightness: SharedString,
     /// The alpha slider's label.
     pub alpha: SharedString,
+    /// The confirm button's label.
+    pub confirm: SharedString,
 }
 
 impl Default for ColorPickerLabels {
@@ -146,6 +143,7 @@ impl Default for ColorPickerLabels {
             saturation: SharedString::new_static("Saturation"),
             lightness: SharedString::new_static("Lightness"),
             alpha: SharedString::new_static("Alpha"),
+            confirm: SharedString::new_static("OK"),
         }
     }
 }
@@ -158,30 +156,28 @@ impl Default for ColorPickerLabels {
 /// ```ignore
 /// let picker = cx.new(|cx| ColorPicker::new(accent, UnifiedSize::Small, window, cx));
 /// let subscription = cx.subscribe(&picker, |this, _, event: &ColorPickerEvent, cx| {
-///     match event {
-///         ColorPickerEvent::ColorChanged(color) => {
-///             this.accent = *color;
-///             cx.notify();
-///         }
-///         ColorPickerEvent::ColorCommitted(color) => {
-///             this.accent = *color;
-///             cx.notify();
-///         }
-///     }
+///     let ColorPickerEvent::ColorChanged(color) = event;
+///     this.accent = *color;
+///     cx.notify();
 /// });
 /// ```
 ///
 /// The picker owns the selected color, the active tab, the labels and the hex field. The popup's
 /// placement and dismissal belong to [`Overlay`], and the field's editing state belongs to
 /// [`InputState`], so neither is duplicated here. The trigger and the panel are rebuilt on every
-/// render of this view, which means a color change, a tab switch, a theme change or the popup
+/// render of this view, which means a confirmed color, a tab switch, a theme change or the popup
 /// opening repaints them, and the caller only has to draw the entity it stored.
 pub struct ColorPicker {
+    /// The color the picker holds: what the trigger paints, what [`ColorPicker::color`] reports
+    /// and the only value a caller ever hears about. Only a confirmation moves it.
     color: Hsla,
-    /// The baseline the popup opened with, taken back when it closes to decide whether the user
-    /// changed anything worth committing. A programmatic `set_color` while the popup is open moves
-    /// it.
-    opened_with: Option<Hsla>,
+    /// The color the open panel is editing after the user changed it, held until the confirm
+    /// button lifts it into [`Self::color`].
+    ///
+    /// Choosing a swatch, moving a track or typing a hex value only writes this, so the panel
+    /// paints the edit while the caller hears nothing; dismissing the panel drops it, which is
+    /// why a dismissal reports nothing either.
+    draft: Option<Hsla>,
     hovered_swatch: Option<usize>,
     active_tab: ColorPickerTab,
     labels: ColorPickerLabels,
@@ -229,19 +225,21 @@ impl ColorPicker {
                 }
             },
         );
-        // Closing the panel has to clear a hover preview as well: the pointer may have left the
-        // palette before the outside press, but the footer should still show the real color. The
-        // same observer records the color the popup opened with and reports the final one when it
-        // closes, so a caller persists once per interaction instead of on every slider tick.
+        // A panel that closes without confirming has nothing to report: the edit it was holding is
+        // dropped and the footer goes back to the confirmed color. The flag is written by the
+        // trigger, by the confirm button and by the overlay's outside press (`overlay.rs`), so
+        // this is the one place a dismissal and a confirmation differ.
         let open_subscription = cx.observe_in(&open, window, |this, _, window, cx| {
-            this.clear_preview(window, cx);
-            this.sync_open_state(cx);
+            if !*this.open.read(cx) {
+                this.discard_draft(window, cx);
+            }
+
             cx.notify();
         });
 
         Self {
             color: default_color,
-            opened_with: None,
+            draft: None,
             hovered_swatch: None,
             active_tab: ColorPickerTab::default(),
             labels: ColorPickerLabels::default(),
@@ -253,6 +251,9 @@ impl ColorPicker {
     }
 
     /// The color currently selected.
+    ///
+    /// This is the confirmed color: an edit the open panel is still holding is not part of it
+    /// until the user presses the panel's confirm button.
     pub fn color(&self) -> Hsla {
         self.color
     }
@@ -278,46 +279,14 @@ impl ColorPicker {
     ///
     /// The hex field is synchronized and the picker repaints, but no
     /// [`ColorPickerEvent::ColorChanged`] is emitted: a programmatic change is not a user action.
-    /// If the popup is open, the color also becomes the one it is considered to have opened with,
-    /// so closing it emits no [`ColorPickerEvent::ColorCommitted`] either.
+    /// An edit the open panel is holding is dropped with it, so a caller writing a color back
+    /// never leaves a confirmation pending.
     pub fn set_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
         self.hovered_swatch = None;
         self.color = color;
-
-        if let Some(opened_with) = self.opened_with.as_mut() {
-            *opened_with = color;
-        }
-
         self.write_hex(color, window, cx);
         cx.notify();
-    }
-
-    /// Records the color the popup opened with, or emits the one it closed on.
-    ///
-    /// The open flag is written by the trigger, by a palette choice and by the overlay's outside
-    /// press (`overlay.rs`), which is the usual close path, so one interaction emits at most one
-    /// [`ColorPickerEvent::ColorCommitted`]: a real open transition stores the color the popup
-    /// starts from (a repeated open notify leaves that baseline alone), and closing takes it back
-    /// and reports the current color only when the two differ. The flag is copied out before
-    /// anything is written, so reading it does not borrow the picker across the mutation.
-    fn sync_open_state(&mut self, cx: &mut Context<Self>) {
-        let opened = *self.open.read(cx);
-
-        if opened {
-            if self.opened_with.is_none() {
-                self.opened_with = Some(self.color);
-            }
-
-            return;
-        }
-
-        let Some(opened_with) = self.opened_with.take() else {
-            return;
-        };
-
-        if self.color != opened_with {
-            cx.emit(ColorPickerEvent::ColorCommitted(self.color));
-        }
     }
 
     /// Switches the panel to `tab`.
@@ -332,12 +301,54 @@ impl ColorPicker {
         cx.notify();
     }
 
-    /// Applies a color a user action produced.
+    /// Confirms the edit the open panel is holding: reports it and closes the panel.
     ///
-    /// Every user path converges here, so the event contract lives in one place: the event is
-    /// emitted only when the color actually changes, and `sync_hex` decides whether the field is
-    /// rewritten. Typing in the field passes `false` so the program does not move the caret;
-    /// palette and slider interactions pass `true`.
+    /// This is the only path that emits [`ColorPickerEvent::ColorChanged`]. Every other user path
+    /// only writes the edit, so a caller hears exactly one event per interaction, and it is the
+    /// color the user settled on. Confirming without an edit — or after editing the color back to
+    /// the one the picker holds — reports nothing; the panel closes either way, because pressing
+    /// the button is the end of the interaction.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(color) = self.draft.take() else {
+            self.discard_draft(window, cx);
+            self.open.write(cx, false);
+
+            return;
+        };
+
+        self.color = color;
+        self.hovered_swatch = None;
+        self.write_hex(color, window, cx);
+        cx.emit(ColorPickerEvent::ColorChanged(color));
+        self.open.write(cx, false);
+        cx.notify();
+    }
+
+    /// Drops the edit the panel was holding and shows the confirmed color again.
+    ///
+    /// This is what a dismissal does, whether it came from the outside press, the trigger or a
+    /// confirmation that had nothing to report: the interaction is over, so the footer goes back
+    /// to the color the picker holds and the hover preview clears with it. A confirmation that did
+    /// report a color has already written the field, so with nothing left to drop this is a no-op
+    /// rather than a second write.
+    fn discard_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previewed = self.hovered_swatch.take().is_some();
+        let edited = self.draft.take().is_some();
+
+        if !previewed && !edited {
+            return;
+        }
+
+        let color = self.color;
+        self.write_hex(color, window, cx);
+    }
+
+    /// Applies a color a control of the open panel produced.
+    ///
+    /// This is an edit, not a confirmation: it is written to the draft the panel paints, so the
+    /// caller hears nothing until the user presses the confirm button. `sync_hex` decides whether
+    /// the field is rewritten: typing in the field passes `false` so the program does not move the
+    /// caret; palette and slider interactions pass `true`.
     fn set_user_color(
         &mut self,
         color: Hsla,
@@ -345,44 +356,42 @@ impl ColorPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if color == self.color {
+        let current = self.draft.unwrap_or(self.color);
+        if color == current {
             return;
         }
 
         self.hovered_swatch = None;
-        self.color = color;
+        // An edit that lands back on the confirmed color is not an edit, so it leaves nothing for
+        // the confirm button to report.
+        self.draft = (color != self.color).then_some(color);
 
         if sync_hex {
             self.write_hex(color, window, cx);
         }
 
-        cx.emit(ColorPickerEvent::ColorChanged(color));
         cx.notify();
     }
 
-    /// Applies the palette swatch at `index` and closes the popup.
+    /// Applies the palette swatch at `index` to the open panel's edit.
     ///
-    /// This is a user action, so it goes through [`ColorPicker::set_user_color`]: the event is
-    /// emitted only when the swatch differs from the current color, and the hex field is
-    /// synchronized. Choosing a swatch ends the interaction, so the panel closes (writing the
-    /// open flag also clears the hover preview through the picker's observer). An index outside
-    /// the palette is ignored rather than panicking; the only caller passes an index a hit test
-    /// from the same palette produced.
+    /// Choosing a swatch is an edit like a track drag: the panel shows it, and the color is
+    /// reported only when the user confirms. An index outside the palette is ignored rather than
+    /// panicking; the only caller passes an index a hit test from the same palette produced.
     fn select_palette(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(swatch) = PALETTE.get(index) else {
             return;
         };
 
         self.set_user_color(*swatch, true, window, cx);
-        self.open.write(cx, false);
     }
 
     /// Shows the swatch at `index` in the footer and marks it as hovered.
     ///
     /// This is what a palette hover uses: the large swatch and the hex field follow the pointer,
-    /// while the palette draws a ring around the hovered cell. No
-    /// [`ColorPickerEvent::ColorChanged`] is emitted and [`ColorPicker::color`] stays the real
-    /// selection. Passing `None` restores the footer to the real color and removes the ring.
+    /// while the palette draws a ring around the hovered cell. A hover is not an edit — it writes
+    /// no draft and reports nothing — and [`ColorPicker::color`] stays the confirmed selection.
+    /// Passing `None` restores the footer to the color the panel is editing and removes the ring.
     fn set_preview_swatch(
         &mut self,
         index: Option<usize>,
@@ -396,12 +405,14 @@ impl ColorPicker {
         }
 
         self.hovered_swatch = index;
-        let preview = index.and_then(|index| PALETTE.get(index).copied());
-        self.write_hex(preview.unwrap_or(self.color), window, cx);
+        let preview = index
+            .and_then(|index| PALETTE.get(index).copied())
+            .unwrap_or_else(|| self.draft.unwrap_or(self.color));
+        self.write_hex(preview, window, cx);
         cx.notify();
     }
 
-    /// Restores the footer to the real color after a palette hover.
+    /// Restores the footer to the color the panel is editing after a palette hover.
     fn clear_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_preview_swatch(None, window, cx);
     }
@@ -409,9 +420,9 @@ impl ColorPicker {
     /// Moves one HSLA channel to `t`, leaving the other three untouched.
     ///
     /// `t` is the fraction a slider's track maps a pointer position to, so it is clamped to the
-    /// unit range before it becomes a component. Like every other user path this goes through
-    /// [`ColorPicker::set_user_color`]: an unchanged color emits nothing, and a change emits
-    /// [`ColorPickerEvent::ColorChanged`] and synchronizes the hex field.
+    /// unit range before it becomes a component. The edit starts from the color the panel already
+    /// shows, so dragging a second channel builds on the first one. Like every other user path
+    /// this goes through [`ColorPicker::set_user_color`]: it writes the draft and reports nothing.
     fn set_channel(
         &mut self,
         channel: HslaChannel,
@@ -420,7 +431,7 @@ impl ColorPicker {
         cx: &mut Context<Self>,
     ) {
         let t = t.clamp(0., 1.);
-        let mut color = self.color;
+        let mut color = self.draft.unwrap_or(self.color);
 
         match channel {
             HslaChannel::Hue => color.h = t,
@@ -454,14 +465,15 @@ impl ColorPicker {
 
     /// Handles the end of an edit, whether Enter was pressed or the field lost focus.
     ///
-    /// A legal value is applied and then normalized even when it did not change the color, so
-    /// `#fff` becomes `#FFFFFF`; an illegal value is replaced with the current color's hex.
+    /// A legal value is applied to the draft and then normalized even when it did not change it,
+    /// so `#fff` becomes `#FFFFFF`; an illegal value is replaced with the color the panel shows.
+    /// The edit is still only a draft: the panel's confirm button is what reports it.
     fn on_hex_commit(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(color) = parse_hex(text) {
             self.set_user_color(color, false, window, cx);
         }
 
-        let color = self.color;
+        let color = self.draft.unwrap_or(self.color);
         self.write_hex(color, window, cx);
     }
 
@@ -500,6 +512,26 @@ impl ColorPicker {
                 });
             })
     }
+
+    /// Builds the footer's confirm button for `state`.
+    ///
+    /// Like [`ColorPicker::tab_button`] this is an associated function: the panel is built with a
+    /// plain [`App`], so the click is routed through the entity instead of a borrow. Pressing it
+    /// is the one user action that reports a color. It keeps the default height, which is the
+    /// footer input's, so the row lines up.
+    fn confirm_button(state: Entity<Self>, label: SharedString) -> Button {
+        let id: ElementId = ("color-picker-confirm", state.entity_id()).into();
+
+        Button::new(id)
+            .filled()
+            .justify_center()
+            .debug_selector(|| "TEST_COLOR_PICKER_CONFIRM".into())
+            .aria_label(label.clone())
+            .child(label)
+            .on_click(move |_, window, cx| {
+                state.update(cx, |state, cx| state.confirm(window, cx));
+            })
+    }
 }
 
 impl EventEmitter<ColorPickerEvent> for ColorPicker {}
@@ -522,6 +554,9 @@ impl Render for ColorPicker {
         let picker_entity_id = picker.entity_id();
         let picker_id: ElementId = ("color-picker", picker_entity_id).into();
         let color = self.color;
+        // The panel paints the edit while the user is choosing; the trigger paints what the picker
+        // holds, so a dismissal visibly falls back to the confirmed color.
+        let editing = self.draft.unwrap_or(color);
         let hovered_swatch = self.hovered_swatch;
         let active_tab = self.active_tab;
         let labels = self.labels.clone();
@@ -558,7 +593,7 @@ impl Render for ColorPicker {
             move |_, _, _| {
                 render_panel(
                     picker,
-                    color,
+                    editing,
                     hovered_swatch,
                     active_tab,
                     labels,
@@ -579,7 +614,8 @@ impl Render for ColorPicker {
 /// This is a free function because the popup is built by the [`Overlay`] with a plain [`App`],
 /// where the picker's own context is not available. Everything the panel draws or calls back
 /// into is handed in: the picker entity routes the interactions, and the hex field is the
-/// [`InputState`] the picker owns.
+/// [`InputState`] the picker owns. `color` is the color the panel is editing, which is the
+/// confirmed one plus whatever draft the user has built on it.
 fn render_panel(
     state: Entity<ColorPicker>,
     color: Hsla,
@@ -654,7 +690,7 @@ fn render_panel(
                             labels.palette.clone(),
                         ))
                         .button(ColorPicker::tab_button(
-                            state,
+                            state.clone(),
                             ColorPickerTab::Hsla,
                             active,
                             labels.hsla,
@@ -678,7 +714,11 @@ fn render_panel(
                             .size(px(30.))
                             .radius(px(6.)),
                         )
-                        .child(div().flex_1().child(Input::new(&hex_input).medium())),
+                        .child(div().flex_1().child(Input::new(&hex_input).medium()))
+                        // The confirm button the panel submits with: without it a swatch, a track
+                        // and a typed hex are only the panel's own preview, which is why the
+                        // footer is the row that ends the interaction.
+                        .child(ColorPicker::confirm_button(state, labels.confirm)),
                 ),
         )
         .into_any_element()
@@ -1654,6 +1694,7 @@ mod tests {
             saturation: SharedString::new_static("saturation!"),
             lightness: SharedString::new_static("lightness!"),
             alpha: SharedString::new_static("alpha!"),
+            confirm: SharedString::new_static("confirm!"),
         };
 
         assert_eq!(HslaChannel::Hue.label(&labels), labels.hue);
@@ -1875,7 +1916,6 @@ mod tests {
     struct Harness {
         picker: Entity<ColorPicker>,
         changes: Rc<RefCell<Vec<Hsla>>>,
-        commits: Rc<RefCell<Vec<Hsla>>>,
         _subscription: Subscription,
     }
 
@@ -1883,9 +1923,7 @@ mod tests {
         fn with_size(size: UnifiedSize, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let picker = cx.new(|cx| ColorPicker::new(DEFAULT_COLOR, size, window, cx));
             let changes = Rc::new(RefCell::new(Vec::new()));
-            let commits = Rc::new(RefCell::new(Vec::new()));
             let change_sink = changes.clone();
-            let commit_sink = commits.clone();
             let subscription =
                 cx.subscribe(
                     &picker,
@@ -1893,16 +1931,12 @@ mod tests {
                         ColorPickerEvent::ColorChanged(color) => {
                             change_sink.borrow_mut().push(*color);
                         }
-                        ColorPickerEvent::ColorCommitted(color) => {
-                            commit_sink.borrow_mut().push(*color);
-                        }
                     },
                 );
 
             Self {
                 picker,
                 changes,
-                commits,
                 _subscription: subscription,
             }
         }
@@ -2034,10 +2068,13 @@ mod tests {
         )
     }
 
+    /// The color the open panel is editing: the draft the user built, or the confirmed color.
+    fn edited_color(state: &Entity<ColorPicker>, cx: &mut VisualTestContext) -> Hsla {
+        state.read_with(cx, |state, _| state.draft.unwrap_or(state.color))
+    }
+
     #[gpui_kit::test]
-    fn select_palette_should_apply_the_swatch_emit_once_and_sync_the_hex_field(
-        cx: &mut TestAppContext,
-    ) {
+    fn select_palette_should_edit_the_draft_without_emitting(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
@@ -2047,22 +2084,33 @@ mod tests {
             state.update(cx, |state, cx| state.select_palette(28, window, cx));
         });
 
-        assert_eq!(changes.borrow().as_slice(), &[swatch]);
-
-        let (color, hex) = state.read_with(cx, |state, cx| {
-            (state.color(), state.hex_input.read(cx).value(cx))
-        });
-        assert_eq!(color, swatch);
-        assert_eq!(hex.as_str(), hex_string(swatch).as_str());
+        assert!(
+            changes.borrow().is_empty(),
+            "choosing a swatch is an edit the confirm button reports, not an event of its own"
+        );
+        assert_eq!(edited_color(&state, cx), swatch);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "the picker keeps the confirmed color until it is confirmed"
+        );
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            hex_string(swatch).as_str(),
+            "the footer follows the swatch being edited"
+        );
 
         cx.update(|window, cx| {
             state.update(cx, |state, cx| state.select_palette(28, window, cx));
         });
         assert_eq!(
-            changes.borrow().as_slice(),
-            &[swatch],
-            "selecting the swatch already selected is a no-op"
+            state.read_with(cx, |state, _| state.draft),
+            Some(swatch),
+            "choosing the swatch already edited leaves the draft alone"
         );
+        assert!(changes.borrow().is_empty());
     }
 
     #[gpui_kit::test]
@@ -2076,28 +2124,30 @@ mod tests {
                 state.set_channel(HslaChannel::Lightness, 0.75, window, cx)
             });
         });
-        let lightness = state.read_with(cx, |state, _| state.color());
+        let lightness = edited_color(&state, cx);
         assert!((lightness.l - 0.75).abs() < 1e-6);
         assert_eq!(lightness.h, DEFAULT_COLOR.h);
         assert_eq!(lightness.s, DEFAULT_COLOR.s);
         assert_eq!(lightness.a, DEFAULT_COLOR.a);
-        assert_eq!(changes.borrow().as_slice(), &[lightness]);
+        assert!(
+            changes.borrow().is_empty(),
+            "a slider only edits the draft; the confirm button reports it"
+        );
 
         cx.update(|window, cx| {
             state.update(cx, |state, cx| {
                 state.set_channel(HslaChannel::Alpha, 0.25, window, cx)
             });
         });
-        let alpha = state.read_with(cx, |state, _| state.color());
+        let alpha = edited_color(&state, cx);
         assert!((alpha.a - 0.25).abs() < 1e-6);
         assert_eq!(alpha.h, lightness.h);
         assert_eq!(alpha.s, lightness.s);
-        assert_eq!(alpha.l, lightness.l);
         assert_eq!(
-            changes.borrow().as_slice(),
-            &[lightness, alpha],
-            "each change of the color emits once"
+            alpha.l, lightness.l,
+            "the second channel builds on the draft the first one left"
         );
+        assert!(changes.borrow().is_empty());
     }
 
     #[gpui_kit::test]
@@ -2112,7 +2162,7 @@ mod tests {
             });
         });
         assert_eq!(
-            state.read_with(cx, |state, _| state.color().s),
+            edited_color(&state, cx).s,
             0.0,
             "a fraction below zero clamps to zero"
         );
@@ -2123,11 +2173,10 @@ mod tests {
             });
         });
         assert_eq!(
-            state.read_with(cx, |state, _| state.color().s),
+            edited_color(&state, cx).s,
             1.0,
             "a fraction above one clamps to one"
         );
-        assert_eq!(changes.borrow().len(), 2);
 
         cx.update(|window, cx| {
             state.update(cx, |state, cx| {
@@ -2135,9 +2184,13 @@ mod tests {
             });
         });
         assert_eq!(
-            changes.borrow().len(),
-            2,
-            "setting the value already selected is a no-op"
+            edited_color(&state, cx).s,
+            1.0,
+            "setting the value already edited is a no-op"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "no slider edit emits anything before the confirm button"
         );
     }
 
@@ -2583,7 +2636,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_palette_cell_should_change_the_color_and_close_the_panel(
+    fn clicking_a_palette_cell_should_edit_the_draft_and_keep_the_panel_open(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -2625,9 +2678,22 @@ mod tests {
         settle(cx);
 
         let swatch = PALETTE[28];
+        assert_eq!(edited_color(&state, cx), swatch);
+        assert!(
+            changes.borrow().is_empty(),
+            "choosing a swatch only edits the panel until the confirm button is pressed"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "choosing a swatch leaves the panel open so the user can confirm it"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
         assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
         assert_eq!(changes.borrow().as_slice(), &[swatch]);
-        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
 
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         let grid = cx
@@ -2639,15 +2705,17 @@ mod tests {
         );
         cx.simulate_click(same_cell, Modifiers::none());
         settle(cx);
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
 
         assert_eq!(
             changes.borrow().len(),
             1,
-            "choosing the swatch already selected emits nothing"
+            "confirming the swatch already selected emits nothing"
         );
         assert!(
             !panel_is_drawn(cx),
-            "choosing the already selected swatch still closes the panel"
+            "confirming the already selected swatch still closes the panel"
         );
     }
 
@@ -2780,13 +2848,14 @@ mod tests {
             "closing the panel restores the real color in the field"
         );
         assert_eq!(state.read_with(cx, |state, _| state.color()), DEFAULT_COLOR);
+        assert_eq!(state.read_with(cx, |state, _| state.draft), None);
         assert!(changes.borrow().is_empty());
     }
 
+    /// A dismissal is not a confirmation: the panel's edit goes away and the picker keeps the
+    /// color it had, so the caller hears nothing.
     #[gpui_kit::test]
-    fn clicking_a_previewed_palette_cell_should_commit_the_color_and_close_the_panel(
-        cx: &mut TestAppContext,
-    ) {
+    fn dismissing_the_panel_after_an_edit_should_report_nothing(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
@@ -2800,34 +2869,47 @@ mod tests {
             grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
         );
         cx.simulate_mouse_move(cell, None, Modifiers::none());
+        cx.simulate_click(cell, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        cx.simulate_click(cell, Modifiers::none());
+        assert_eq!(
+            edited_color(&state, cx),
+            PALETTE[28],
+            "the swatch is the panel's edit before the panel closes"
+        );
+
+        let outside = point(px(850.), px(750.));
+        cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
         settle(cx);
 
-        let swatch = PALETTE[28];
-        assert_eq!(state.read_with(cx, |state, _| state.color()), swatch);
-        assert_eq!(changes.borrow().as_slice(), &[swatch]);
+        assert!(!panel_is_drawn(cx), "the outside press dismisses the panel");
         assert_eq!(
-            state.read_with(cx, |state, cx| state.hex_input.read(cx).value(cx)),
-            hex_string(swatch).as_str(),
-            "committing keeps the chosen color in the field"
+            state.read_with(cx, |state, _| state.color()),
+            DEFAULT_COLOR,
+            "a dismissed edit does not become the picker's color"
+        );
+        assert_eq!(state.read_with(cx, |state, _| state.draft), None);
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            hex_string(DEFAULT_COLOR).as_str(),
+            "the footer goes back to the color the picker holds"
         );
         assert!(
-            state.read_with(cx, |state, _| state.hovered_swatch.is_none()),
-            "closing the panel clears the hover preview"
+            changes.borrow().is_empty(),
+            "dismissing the panel emits no ColorChanged"
         );
-        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
     }
 
-    /// Choosing a swatch is the shortest commit path: the palette selection emits the change and
-    /// closes the popup in one update, so the commit the observer reports carries the final color.
+    /// Confirming after a palette click reports the swatch once, and only then.
     #[gpui_kit::test]
-    fn choosing_a_palette_swatch_should_commit_the_final_color_once(cx: &mut TestAppContext) {
+    fn confirming_a_palette_swatch_should_report_the_final_color_once(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
 
         let grid = cx
@@ -2838,30 +2920,46 @@ mod tests {
             grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
         );
         cx.simulate_click(cell, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            changes.borrow().is_empty(),
+            "choosing a swatch reports nothing on its own"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
         let swatch = PALETTE[28];
         assert_eq!(
             state.read_with(cx, |state, _| state.color()),
             swatch,
-            "the chosen swatch is the color the popup closes on"
+            "the confirmed swatch is the color the picker holds"
         );
-        assert_eq!(changes.borrow().as_slice(), &[swatch]);
         assert_eq!(
-            commits.borrow().as_slice(),
+            changes.borrow().as_slice(),
             &[swatch],
-            "choosing a swatch emits exactly one commit carrying the final color"
+            "confirming a swatch emits exactly one event carrying the final color"
         );
-        assert!(!panel_is_drawn(cx), "choosing a swatch closes the panel");
+        assert_eq!(
+            state
+                .read_with(cx, |state, cx| state.hex_input.read(cx).value(cx))
+                .as_str(),
+            hex_string(swatch).as_str(),
+            "confirming keeps the chosen color in the field"
+        );
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
     }
 
-    /// A slider change is a live edit, not a commit: only closing the popup reports the color,
-    /// and the value it reports is the one the interaction ended on.
+    /// A slider change is an edit: the confirmation is what reports it, and the value it reports
+    /// is the one the interaction ended on.
     #[gpui_kit::test]
-    fn closing_after_a_slider_change_should_commit_the_final_color_once(cx: &mut TestAppContext) {
+    fn confirming_after_a_slider_change_should_report_the_final_color_once(
+        cx: &mut TestAppContext,
+    ) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
 
@@ -2870,63 +2968,60 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
-        let changed = state.read_with(cx, |state, _| state.color());
+        let edited = edited_color(&state, cx);
         assert!(
-            (changed.h - 0.25).abs() < 1e-4,
-            "the slider click changes the color, not just the preview"
+            (edited.h - 0.25).abs() < 1e-4,
+            "the slider click edits the hue, not just the preview"
         );
         assert!(
-            commits.borrow().is_empty(),
-            "an open popup commits nothing while the user is still editing"
+            changes.borrow().is_empty(),
+            "an open panel reports nothing while the user is still editing"
+        );
+        assert!(
+            panel_is_drawn(cx),
+            "editing a channel leaves the panel open so the user can confirm it"
         );
 
-        let outside = point(px(850.), px(750.));
-        cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
-        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
-        assert!(!panel_is_drawn(cx), "the outside press closes the panel");
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
         assert_eq!(
             state.read_with(cx, |state, _| state.color()),
-            changed,
-            "closing does not change the color"
+            edited,
+            "confirming makes the edit the picker's color"
         );
         assert_eq!(
-            commits.borrow().as_slice(),
-            &[changed],
-            "closing after a slider change emits exactly one commit with the final color"
+            changes.borrow().as_slice(),
+            &[edited],
+            "confirming after a slider change emits exactly one event with the final color"
         );
     }
 
-    /// Opening and closing without touching the color is not an interaction to persist.
+    /// Opening and confirming without touching the color is not an interaction to report.
     #[gpui_kit::test]
-    fn opening_and_closing_on_the_same_color_should_not_commit(cx: &mut TestAppContext) {
+    fn confirming_without_an_edit_should_report_nothing(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         assert!(panel_is_drawn(cx));
 
-        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
-        assert!(!panel_is_drawn(cx), "the second press closes the panel");
-        assert!(changes.borrow().is_empty());
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
         assert!(
-            commits.borrow().is_empty(),
-            "a popup closed on the color it opened with commits nothing"
+            changes.borrow().is_empty(),
+            "a panel confirmed on the color it opened with reports nothing"
         );
     }
 
-    /// `set_color` is silent and does not turn a programmatic change into an interaction.
+    /// `set_color` is silent and does not turn a programmatic change into a user confirmation.
     #[gpui_kit::test]
-    fn a_programmatic_change_should_not_commit_when_the_popup_closes(cx: &mut TestAppContext) {
+    fn a_programmatic_change_should_not_be_reported_by_a_confirmation(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
 
         let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
         cx.update(|window, cx| {
@@ -2941,32 +3036,67 @@ mod tests {
         });
         settle(cx);
 
-        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
-        assert!(
-            !panel_is_drawn(cx),
-            "the second trigger press closes the panel"
-        );
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
         assert_eq!(state.read_with(cx, |state, _| state.color()), green);
         assert!(
             changes.borrow().is_empty(),
             "set_color emits no ColorChanged, whether closed or open"
         );
-        assert!(
-            commits.borrow().is_empty(),
-            "a programmatic change is not committed when the popup closes"
-        );
     }
 
-    /// The commit compares the final color with the one the popup opened with, so undoing the
-    /// edit before closing leaves nothing to persist.
+    /// A programmatic write drops the edit the panel was holding, so a confirmation after it has
+    /// nothing of the user's left to report.
     #[gpui_kit::test]
-    fn restoring_the_opening_color_should_not_commit(cx: &mut TestAppContext) {
+    fn set_color_should_clear_the_edit_the_panel_is_holding(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+
+        let grid = cx
+            .debug_bounds("TEST_COLOR_PICKER_GRID")
+            .expect("the palette tab draws the grid");
+        cx.simulate_click(
+            point(
+                grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+                grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+            ),
+            Modifiers::none(),
+        );
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(edited_color(&state, cx), PALETTE[28]);
+
+        let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_color(blue, window, cx));
+        });
+        settle(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.draft),
+            None,
+            "the programmatic color replaces the edit"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(state.read_with(cx, |state, _| state.color()), blue);
+        assert!(
+            changes.borrow().is_empty(),
+            "a confirmation with no edit of its own reports nothing"
+        );
+    }
+
+    /// Editing a color back to the one the picker holds leaves nothing to confirm.
+    #[gpui_kit::test]
+    fn restoring_the_confirmed_color_should_leave_nothing_to_confirm(cx: &mut TestAppContext) {
+        let (harness, cx) = harness(cx);
+        let state = harness.read_with(cx, |harness, _| harness.picker.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
 
@@ -2975,12 +3105,12 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert_ne!(
-            state.read_with(cx, |state, _| state.color()),
+            edited_color(&state, cx),
             DEFAULT_COLOR,
-            "the edit moves the color away from the one the popup opened with"
+            "the edit moves the color away from the one the picker holds"
         );
 
-        // A track is addressed in pixels, so a click cannot land on the opening hue exactly; the
+        // A track is addressed in pixels, so a click cannot land on the confirmed hue exactly; the
         // channel's own entry point takes the exact fraction a drag back would aim for.
         cx.update(|window, cx| {
             state.update(cx, |state, cx| {
@@ -2990,54 +3120,57 @@ mod tests {
         settle(cx);
 
         assert_eq!(
-            state.read_with(cx, |state, _| state.color()),
+            edited_color(&state, cx),
             DEFAULT_COLOR,
-            "the restored color is exactly the one the popup opened with"
+            "the restored color is exactly the one the picker holds"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.draft),
+            None,
+            "an edit that lands on the confirmed color leaves no draft behind"
         );
         assert!(
-            commits.borrow().is_empty(),
-            "an open popup commits nothing while the user is still editing"
+            changes.borrow().is_empty(),
+            "an open panel reports nothing while the user is still editing"
         );
 
-        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
         assert!(!panel_is_drawn(cx));
-        assert_eq!(
-            changes.borrow().len(),
-            2,
-            "the edit and the restore are both ColorChanged events"
-        );
         assert!(
-            commits.borrow().is_empty(),
-            "closing on the color the popup opened with commits nothing"
+            changes.borrow().is_empty(),
+            "confirming on the color the picker holds reports nothing"
         );
     }
 
-    /// A repeated open notify must not move the baseline, and every interaction commits its own
-    /// final color: the first commit is not repeated by a no-op reopen, and a later edit commits
-    /// once more.
+    /// Every confirmation reports its own final color, and only once.
     #[gpui_kit::test]
-    fn a_second_interaction_should_commit_on_its_own_after_the_first(cx: &mut TestAppContext) {
+    fn a_second_interaction_should_report_on_its_own_after_the_first(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
 
         let grid = cx
             .debug_bounds("TEST_COLOR_PICKER_GRID")
             .expect("the palette tab draws the grid");
-        let cell = point(
-            grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
-            grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+        cx.simulate_click(
+            point(
+                grid.origin.x + px(PALETTE_STEP * 4.0 + 10.0),
+                grid.origin.y + px(PALETTE_STEP * 2.0 + 10.0),
+            ),
+            Modifiers::none(),
         );
-        cx.simulate_click(cell, Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
         let first = PALETTE[28];
-        assert_eq!(commits.borrow().as_slice(), &[first]);
+        assert_eq!(changes.borrow().as_slice(), &[first]);
 
-        // Reopen and close without changing anything: the first commit is the only one.
+        // Reopen and dismiss without changing anything: the first event is the only one.
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         settle(cx);
@@ -3046,38 +3179,38 @@ mod tests {
             "the second trigger press closes the reopened panel"
         );
         assert_eq!(
-            commits.borrow().as_slice(),
+            changes.borrow().as_slice(),
             &[first],
-            "closing without a change must not commit the color again"
+            "dismissing without an edit must not report the color again"
         );
 
-        // A third interaction edits the color and commits it once more.
+        // A third interaction edits the color and reports it once more.
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
         let target = track_point(cx, HslaChannel::Hue, 0.75);
         cx.simulate_click(target, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        let second = state.read_with(cx, |state, _| state.color());
-        assert_ne!(second, first, "the hue track moved the color");
+        let second = edited_color(&state, cx);
+        assert_ne!(second, first, "the hue track moved the edit");
 
-        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
         assert_eq!(
-            commits.borrow().as_slice(),
+            changes.borrow().as_slice(),
             &[first, second],
-            "each interaction commits exactly its own final color"
+            "each confirmation reports exactly its own final color"
         );
     }
 
     /// `Entity::write` notifies even when the open flag already says true; that repeat must not
-    /// reset the baseline and swallow the commit of an edit made before it.
+    /// drop the edit the panel is holding.
     #[gpui_kit::test]
-    fn a_repeated_open_notify_should_not_swallow_the_commit(cx: &mut TestAppContext) {
+    fn a_repeated_open_notify_should_not_swallow_the_edit(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
-        let commits = harness.read_with(cx, |harness, _| harness.commits.clone());
+        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
 
@@ -3085,10 +3218,10 @@ mod tests {
         cx.simulate_click(target, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        let edited = state.read_with(cx, |state, _| state.color());
+        let edited = edited_color(&state, cx);
         assert!(
             (edited.h - 0.75).abs() < 1e-4,
-            "the hue track changed the color before the repeated open notify"
+            "the hue track edited the color before the repeated open notify"
         );
 
         state.update(cx, |state, cx| state.open.write(cx, true));
@@ -3097,19 +3230,24 @@ mod tests {
             panel_is_drawn(cx),
             "writing the open flag it already holds leaves the panel open"
         );
+        assert_eq!(
+            edited_color(&state, cx),
+            edited,
+            "a repeated open notify keeps the edit"
+        );
         assert!(
-            commits.borrow().is_empty(),
-            "an open popup commits nothing while the user is still editing"
+            changes.borrow().is_empty(),
+            "an open panel reports nothing while the user is still editing"
         );
 
-        press(cx, "TEST_COLOR_PICKER_TRIGGER");
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
         settle(cx);
 
         assert!(!panel_is_drawn(cx));
         assert_eq!(
-            commits.borrow().as_slice(),
+            changes.borrow().as_slice(),
             &[edited],
-            "a repeated open notify must not suppress the edit's commit"
+            "a repeated open notify must not drop the edit's confirmation"
         );
     }
 
@@ -3123,13 +3261,12 @@ mod tests {
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
 
-        changes.borrow_mut().clear();
         let lightness_target = track_point(cx, HslaChannel::Lightness, 0.75);
         cx.simulate_click(lightness_target, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
-        let lightness = state.read_with(cx, |state, _| state.color());
+        let lightness = edited_color(&state, cx);
         assert!(
             (lightness.l - 0.75).abs() < 1e-4,
             "lightness is {}, expected 0.75",
@@ -3138,15 +3275,13 @@ mod tests {
         assert_eq!(lightness.h, DEFAULT_COLOR.h, "hue must not move");
         assert_eq!(lightness.s, DEFAULT_COLOR.s, "saturation must not move");
         assert_eq!(lightness.a, DEFAULT_COLOR.a, "alpha must not move");
-        assert_eq!(changes.borrow().as_slice(), &[lightness]);
 
-        changes.borrow_mut().clear();
         let alpha_target = track_point(cx, HslaChannel::Alpha, 0.25);
         cx.simulate_click(alpha_target, Modifiers::none());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
-        let alpha = state.read_with(cx, |state, _| state.color());
+        let alpha = edited_color(&state, cx);
         assert!(
             (alpha.a - 0.25).abs() < 1e-4,
             "alpha is {}, expected 0.25",
@@ -3154,12 +3289,27 @@ mod tests {
         );
         assert_eq!(alpha.h, lightness.h, "hue must not move");
         assert_eq!(alpha.s, lightness.s, "saturation must not move");
-        assert_eq!(alpha.l, lightness.l, "lightness must not move");
-        assert_eq!(changes.borrow().as_slice(), &[alpha]);
+        assert_eq!(
+            alpha.l, lightness.l,
+            "lightness keeps the value the first track left"
+        );
+        assert!(
+            changes.borrow().is_empty(),
+            "the tracks only edit the panel; confirming is what reports them"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[alpha],
+            "one confirmation reports the color the two tracks left behind"
+        );
     }
 
     #[gpui_kit::test]
-    fn typing_a_legal_hex_in_the_open_panel_should_set_the_color_without_rewriting_the_field(
+    fn typing_a_legal_hex_in_the_open_panel_should_edit_it_without_rewriting_the_field(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -3171,13 +3321,16 @@ mod tests {
         cx.simulate_input("#FF0000");
         settle(cx);
 
-        let (color, hex) = state.read_with(cx, |state, cx| {
-            (state.color(), state.hex_input.read(cx).value(cx))
+        let (edited, hex) = state.read_with(cx, |state, cx| {
+            (
+                state.draft.unwrap_or(state.color),
+                state.hex_input.read(cx).value(cx),
+            )
         });
         assert_eq!(
-            hex_string(color).as_str(),
+            hex_string(edited).as_str(),
             "#FF0000",
-            "the legal text becomes the color"
+            "the legal text becomes the color the panel is editing"
         );
         assert_eq!(
             hex.as_str(),
@@ -3186,18 +3339,20 @@ mod tests {
              rewritten"
         );
         assert!(
-            !changes.borrow().is_empty(),
-            "a legal edit emits at least one ColorChanged"
-        );
-        assert_eq!(
-            changes.borrow().last().copied(),
-            Some(color),
-            "the last event carries the color the field leaves behind"
+            changes.borrow().is_empty(),
+            "typing is only an edit: the confirm button reports it"
         );
         assert!(
             panel_is_drawn(cx),
             "typing in the hex field leaves the panel open"
         );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(changes.borrow().as_slice(), &[edited]);
+        assert_eq!(state.read_with(cx, |state, _| state.color()), edited);
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
     }
 
     #[gpui_kit::test]
@@ -3257,7 +3412,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn enter_should_apply_the_field_text_and_normalize_it_exactly_once(cx: &mut TestAppContext) {
+    fn entering_a_legal_hex_should_edit_the_panel_and_normalize_the_field_exactly_once(
+        cx: &mut TestAppContext,
+    ) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
@@ -3267,10 +3424,9 @@ mod tests {
             changes.borrow().is_empty(),
             "opening the panel and focusing the field emit no ColorChanged"
         );
-        changes.borrow_mut().clear();
 
         // `update_value` is the panel's own write-back path: it puts text in the field without a
-        // Change event, so the color can only move when Enter delivers the commit.
+        // Change event, so the edit can only move when Enter delivers the commit.
         set_hex_text_without_change_event(cx, &state, "#fff");
         settle(cx);
 
@@ -3279,24 +3435,23 @@ mod tests {
             "writing the field without a change event emits nothing"
         );
         assert_eq!(
-            state.read_with(cx, |state, _| state.color()),
-            DEFAULT_COLOR,
+            state.read_with(cx, |state, _| state.draft),
+            None,
             "the uncommitted text has not been applied as a color"
         );
 
         press_enter(cx);
         settle(cx);
 
-        let color = state.read_with(cx, |state, _| state.color());
+        let edited = edited_color(&state, cx);
         assert_eq!(
-            rgba8(color),
+            rgba8(edited),
             [255, 255, 255, 255],
             "Enter applies the short form the field holds as white"
         );
-        assert_eq!(
-            changes.borrow().as_slice(),
-            &[color],
-            "the commit applies the color exactly once"
+        assert!(
+            changes.borrow().is_empty(),
+            "Enter edits the panel; the confirm button is what reports it"
         );
         assert_eq!(
             state
@@ -3310,27 +3465,17 @@ mod tests {
             "committing in the hex field leaves the panel open"
         );
 
-        // The commit normalizes even when the color is already current, and emits nothing then.
+        // The commit normalizes even when the edit is already current, and leaves no draft then.
         set_hex_text_without_change_event(cx, &state, "#ffffff");
         settle(cx);
-        assert_eq!(
-            changes.borrow().len(),
-            1,
-            "rewriting the field without a change event emits nothing either"
-        );
 
         press_enter(cx);
         settle(cx);
 
         assert_eq!(
-            state.read_with(cx, |state, _| state.color()),
-            color,
-            "committing an equivalent hex leaves the color alone"
-        );
-        assert_eq!(
-            changes.borrow().len(),
-            1,
-            "committing the color already current emits nothing"
+            edited_color(&state, cx),
+            edited,
+            "committing an equivalent hex leaves the edit alone"
         );
         assert_eq!(
             state
@@ -3339,10 +3484,21 @@ mod tests {
             "#FFFFFF",
             "even an unchanged commit normalizes the field"
         );
+        assert!(
+            changes.borrow().is_empty(),
+            "no hex commit reports a color on its own"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(changes.borrow().as_slice(), &[edited]);
+        assert_eq!(state.read_with(cx, |state, _| state.color()), edited);
+        assert!(!panel_is_drawn(cx), "confirming closes the panel");
     }
 
     #[gpui_kit::test]
-    fn blurring_the_hex_field_should_apply_the_field_text_and_normalize_it_like_enter(
+    fn blurring_the_hex_field_should_edit_the_panel_and_normalize_it_like_enter(
         cx: &mut TestAppContext,
     ) {
         let (harness, cx) = harness(cx);
@@ -3358,7 +3514,6 @@ mod tests {
             changes.borrow().is_empty(),
             "opening the panel and focusing the field emit no ColorChanged"
         );
-        changes.borrow_mut().clear();
 
         // Set the text without a Change event, exactly as the Enter test does: only the blur
         // commit may apply it.
@@ -3370,8 +3525,8 @@ mod tests {
             "writing the field without a change event emits nothing"
         );
         assert_eq!(
-            state.read_with(cx, |state, _| state.color()),
-            DEFAULT_COLOR,
+            state.read_with(cx, |state, _| state.draft),
+            None,
             "the uncommitted text has not been applied as a color"
         );
 
@@ -3383,16 +3538,15 @@ mod tests {
         });
         settle(cx);
 
-        let color = state.read_with(cx, |state, _| state.color());
+        let edited = edited_color(&state, cx);
         assert_eq!(
-            rgba8(color),
+            rgba8(edited),
             [0, 255, 0, 255],
             "losing the caret applies the short form the field holds as green"
         );
-        assert_eq!(
-            changes.borrow().as_slice(),
-            &[color],
-            "the blur commit applies the color exactly once"
+        assert!(
+            changes.borrow().is_empty(),
+            "losing the caret edits the panel and reports nothing on its own"
         );
         assert_eq!(
             state
@@ -3404,6 +3558,15 @@ mod tests {
         assert!(
             panel_is_drawn(cx),
             "blurring the field does not close the panel"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[edited],
+            "the confirmation reports the color the blur left behind, exactly once"
         );
     }
 
@@ -3503,21 +3666,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_the_hue_track_in_the_open_panel_should_set_the_hue_and_emit_once(
-        cx: &mut TestAppContext,
-    ) {
+    fn clicking_the_hue_track_in_the_open_panel_should_edit_the_hue(cx: &mut TestAppContext) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-        changes.borrow_mut().clear();
 
         let target = track_point(cx, HslaChannel::Hue, 0.25);
         cx.simulate_click(target, Modifiers::none());
         settle(cx);
 
-        let color = state.read_with(cx, |state, _| state.color());
+        let color = edited_color(&state, cx);
         assert!(
             (color.h - 0.25).abs() < 1e-4,
             "hue is {}, expected 0.25",
@@ -3526,10 +3686,9 @@ mod tests {
         assert_eq!(color.s, DEFAULT_COLOR.s, "saturation must not move");
         assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
         assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
-        assert_eq!(
-            changes.borrow().as_slice(),
-            &[color],
-            "one click on the open panel's hue track emits exactly once"
+        assert!(
+            changes.borrow().is_empty(),
+            "one click on the open panel's hue track reports nothing on its own"
         );
         assert!(
             panel_is_drawn(cx),
@@ -3546,19 +3705,18 @@ mod tests {
         let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-        changes.borrow_mut().clear();
 
         let start = track_point(cx, HslaChannel::Saturation, 0.2);
         let launch = track_point(cx, HslaChannel::Saturation, 0.3);
         let target = track_point(cx, HslaChannel::Saturation, 0.8);
         cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-        // The first move starts the drag; it only updates the color from the second move on.
+        // The first move starts the drag; it only updates the edit from the second move on.
         cx.simulate_mouse_move(launch, Some(MouseButton::Left), Modifiers::none());
         cx.simulate_mouse_move(target, Some(MouseButton::Left), Modifiers::none());
         cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
         settle(cx);
 
-        let color = state.read_with(cx, |state, _| state.color());
+        let color = edited_color(&state, cx);
         assert!(
             (color.s - 0.8).abs() < 1e-4,
             "saturation is {}, expected 0.8",
@@ -3568,21 +3726,22 @@ mod tests {
         assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
         assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
         assert!(
-            changes.borrow().len() >= 2,
-            "the press and the drag to 80% both change the color, got {} events",
+            changes.borrow().is_empty(),
+            "a drag reports nothing until the user confirms it, got {} events",
             changes.borrow().len()
-        );
-        assert!(
-            changes.borrow().iter().all(|change| {
-                change.h == DEFAULT_COLOR.h
-                    && change.l == DEFAULT_COLOR.l
-                    && change.a == DEFAULT_COLOR.a
-            }),
-            "every drag event only changes saturation"
         );
         assert!(
             panel_is_drawn(cx),
             "dragging a channel in the open panel leaves it open"
+        );
+
+        click_selector(cx, "TEST_COLOR_PICKER_CONFIRM");
+        settle(cx);
+
+        assert_eq!(
+            changes.borrow().as_slice(),
+            &[color],
+            "confirming a drag reports the color the drag ended on, once"
         );
     }
 
@@ -3592,10 +3751,8 @@ mod tests {
     ) {
         let (harness, cx) = harness(cx);
         let state = harness.read_with(cx, |harness, _| harness.picker.clone());
-        let changes = harness.read_with(cx, |harness, _| harness.changes.clone());
         press(cx, "TEST_COLOR_PICKER_TRIGGER");
         click_selector(cx, "TEST_COLOR_PICKER_TAB_HSLA");
-        changes.borrow_mut().clear();
 
         let start = track_point(cx, HslaChannel::Saturation, 0.2);
         let launch = track_point(cx, HslaChannel::Saturation, 0.3);
@@ -3613,7 +3770,7 @@ mod tests {
         cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
         settle(cx);
 
-        let color = state.read_with(cx, |state, _| state.color());
+        let color = edited_color(&state, cx);
         assert_eq!(
             color.s, 1.0,
             "a pointer beyond the open panel's track clamps saturation to its maximum"
@@ -3621,10 +3778,6 @@ mod tests {
         assert_eq!(color.h, DEFAULT_COLOR.h, "hue must not move");
         assert_eq!(color.l, DEFAULT_COLOR.l, "lightness must not move");
         assert_eq!(color.a, DEFAULT_COLOR.a, "alpha must not move");
-        assert!(
-            !changes.borrow().is_empty(),
-            "the drag that left the track still changed the color"
-        );
         assert!(
             panel_is_drawn(cx),
             "dragging out of the track does not close the panel"
@@ -3700,6 +3853,7 @@ mod tests {
         assert_eq!(labels.saturation.as_str(), "Saturation");
         assert_eq!(labels.lightness.as_str(), "Lightness");
         assert_eq!(labels.alpha.as_str(), "Alpha");
+        assert_eq!(labels.confirm.as_str(), "OK");
     }
 
     #[gpui_kit::test]

@@ -505,22 +505,6 @@ pub struct CandlestickWidget {
     /// the reverse edge being weak is what keeps the two from forming a cycle and
     /// from keeping a closed pane's settings editable forever.
     panel: Option<Entity<IndicatorPanel>>,
-    /// Whether the indicator configuration on screen is a preview that has not
-    /// been published yet.
-    ///
-    /// A colour picker reports every change while the user is still choosing, so
-    /// each one paints without writing the pane back. This flag is what remembers
-    /// that the on-screen configuration is ahead of the stored one: closing the
-    /// panel, or replacing the configuration through a control that does publish,
-    /// has to write it back exactly once.
-    indicator_preview_pending: bool,
-    /// How many frames this widget has drawn.
-    ///
-    /// A test that asks whether a change requested a frame reads this counter:
-    /// the body is drawn as a view, so `debug_bounds` answers what was painted,
-    /// not whether this widget rendered again.
-    #[cfg(test)]
-    renders: usize,
     /// The newest-candle policy the last history request carried.
     ///
     /// A view test cancels the binding so the snapshot it hands in is the only data
@@ -687,9 +671,6 @@ impl CandlestickWidget {
             _time_zone: notify_on_data_time_zone_change(cx),
             panel_open: false,
             panel: None,
-            indicator_preview_pending: false,
-            #[cfg(test)]
-            renders: 0,
             #[cfg(test)]
             prefetched_history_newest: None,
             #[cfg(test)]
@@ -1613,12 +1594,10 @@ impl CandlestickWidget {
     /// Opens the settings panel, or closes and drops it.
     ///
     /// Whether the panel is open is not a persisted option, so opening it writes
-    /// nothing and a pane that is opened again starts with it closed. Closing it
-    /// does write back a colour preview the user left uncommitted, because closing
-    /// the panel ends that interaction; opening it publishes nothing because there
-    /// is nothing to end. Closing also drops the entity, which throws away the
-    /// panel's own state with it — reopening starts from the catalogue's default
-    /// (every indicator with settings expanded).
+    /// nothing and a pane that is opened again starts with it closed. Closing also
+    /// drops the entity, which throws away the panel's own state with it —
+    /// reopening starts from the catalogue's default (every indicator with
+    /// settings expanded).
     fn toggle_indicator_panel(&mut self, cx: &mut Context<Self>) {
         if self.panel_open {
             self.close_indicator_panel(cx);
@@ -1630,19 +1609,20 @@ impl CandlestickWidget {
         cx.notify();
     }
 
-    /// Drops the settings panel, publishing a colour preview it was still showing.
+    /// Drops the settings panel.
     ///
-    /// The open state is not persisted, but a preview the user has not committed is
-    /// published: closing the panel ends the interaction, and the colour on screen
-    /// before it closed is the one to keep. Also used when the chart loses its
-    /// market: the panel edits a configuration that only means something while a
-    /// chart is reading one, so it does not stay floating over an empty body. The
-    /// market coming back does not reopen it — the panel's open state is the
-    /// user's, and nothing remembers it for them.
+    /// The open state is not persisted. Dropping the panel also drops a colour
+    /// picker the user left open, and with it the colour they had chosen but not
+    /// confirmed: a colour only reaches the configuration through the picker's
+    /// confirm button. Also used when the chart loses its market: the panel edits a
+    /// configuration that only means something while a chart is reading one, so it
+    /// does not stay floating over an empty body. The market coming back does not
+    /// reopen it — the panel's open state is the user's, and nothing remembers it
+    /// for them.
     fn close_indicator_panel(&mut self, cx: &mut Context<Self>) {
         self.panel_open = false;
         self.panel = None;
-        self.commit_indicator_config(cx);
+        cx.notify();
     }
 
     /// Keeps the countdown moving without a frame per second of its own.
@@ -1930,10 +1910,6 @@ impl CandlestickWidget {
     /// content comparison comes first because every field of the panel commits on
     /// blur, and a commit that changed nothing should neither write nor repaint
     /// the chart.
-    ///
-    /// A preview the user had not committed is part of `indicator`, so the pending
-    /// flag is cleared before publishing: this write already includes it, and a
-    /// later commit must not publish it again.
     pub(crate) fn set_indicator_config(
         &mut self,
         indicator: CandlestickIndicatorConfig,
@@ -1943,53 +1919,8 @@ impl CandlestickWidget {
             return;
         }
         self.config.indicator = indicator;
-        self.indicator_preview_pending = false;
         self.config_change.publish(cx);
         cx.notify();
-    }
-
-    /// Puts a configuration on screen without writing it back.
-    ///
-    /// What the colour picker needs while the user is still choosing: the chart and
-    /// the panel follow the picker on every change, and the pane is written once —
-    /// by [`Self::commit_indicator_config`] when the popup closes, or by
-    /// [`Self::close_indicator_panel`] when the panel goes away first. An identical
-    /// configuration is not a preview: nothing changed, so nothing is pending.
-    pub(crate) fn preview_indicator_config(
-        &mut self,
-        indicator: CandlestickIndicatorConfig,
-        cx: &mut Context<Self>,
-    ) {
-        if self.config.indicator == indicator {
-            return;
-        }
-        self.config.indicator = indicator;
-        self.indicator_preview_pending = true;
-        cx.notify();
-    }
-
-    /// Writes back the preview on screen, if there is one.
-    ///
-    /// Called once per interaction, not once per change: publishing every preview
-    /// would write the pane back on every slider tick. A commit with nothing
-    /// pending is not a change — closing a popup the user did not move leaves the
-    /// stored configuration untouched.
-    pub(crate) fn commit_indicator_config(&mut self, cx: &mut Context<Self>) {
-        if !self.indicator_preview_pending {
-            return;
-        }
-        self.indicator_preview_pending = false;
-        self.config_change.publish(cx);
-    }
-
-    /// How many frames this widget has drawn.
-    ///
-    /// A test that asks whether a change requested a frame reads this counter:
-    /// the body is drawn as a view, so `debug_bounds` answers what was painted,
-    /// not whether this widget rendered again.
-    #[cfg(test)]
-    pub(crate) fn rendered_frames(&self) -> usize {
-        self.renders
     }
 
     /// How many extra candles the enabled indicators need before their values
@@ -2298,10 +2229,6 @@ impl CandlestickWidget {
 
 impl Render for CandlestickWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.renders += 1;
-        }
         // The body is only embedded while the widget has content, so this is the
         // ready state and nothing else.
         div()
@@ -2349,7 +2276,7 @@ pub(crate) mod tests {
     use app_config_provider::notification::ConfigNotification;
     use gpui_kit::{
         AppContext, Bounds, Entity, Modifiers, MouseButton, Render, TestAppContext,
-        VisualTestContext, WeakEntity, Window, div, hsla, point, size,
+        VisualTestContext, WeakEntity, Window, div, point, size,
     };
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::{
@@ -2385,7 +2312,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         chart::geometry::LayoutInputs,
-        indicator::{IndicatorId, LineColor},
+        indicator::IndicatorId,
         model::CandlestickSeries,
         service::{CandlestickEventSubscription, CandlestickPageQuery},
         time::TIMEFRAMES,
@@ -5868,10 +5795,8 @@ pub(crate) mod tests {
     }
 
     /// The button changes whether the panel is open and nothing else: whether it
-    /// is open is not a persisted option, so with no colour preview pending it
-    /// publishes nothing, and closing it drops the entity with the state it held.
-    /// (A pending preview is published when the panel closes;
-    /// `closing_the_panel_should_publish_the_colour_preview_it_ends` covers that.)
+    /// is open is not a persisted option, so neither opening nor closing publishes
+    /// anything, and closing it drops the entity with the state it held.
     #[gpui_kit::test]
     fn the_settings_button_should_only_open_and_close_the_panel(cx: &mut TestAppContext) {
         let built = widget(cx);
@@ -5908,7 +5833,7 @@ pub(crate) mod tests {
         assert_eq!(
             built.reports(),
             before,
-            "closing writes nothing either when no colour preview is pending"
+            "closing writes nothing either: an unconfirmed colour picker publishes nothing"
         );
     }
 
@@ -6027,266 +5952,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The colour on screen while the picker is open is a preview: it changes what
-    /// the chart draws, and the pane is written only when the interaction ends.
-    #[gpui_kit::test]
-    fn previewing_a_colour_should_not_publish_until_it_is_committed(cx: &mut TestAppContext) {
-        let built = widget(cx);
-        let before = built.reports();
-        let previewed = cx.update(|cx| {
-            let mut config = built.widget.read(cx).indicator_config().clone();
-            assert!(config.set_line_color(
-                IndicatorId::Ma,
-                0,
-                LineColor::from(hsla(0.4, 0.5, 0.6, 1.0))
-            ));
-            config
-        });
-
-        cx.update(|cx| {
-            built.widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(previewed.clone(), cx)
-            });
-        });
-        assert_eq!(
-            built.reports(),
-            before,
-            "a preview is painted, not persisted"
-        );
-        assert_eq!(
-            cx.read(|cx| built.widget.read(cx).indicator_config().clone()),
-            previewed,
-            "the chart draws the previewed colour"
-        );
-
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.commit_indicator_config(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "the commit writes the preview back once"
-        );
-
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.commit_indicator_config(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "a commit with no new preview publishes nothing"
-        );
-
-        // A preview that says what is already stored is not a change, so it does
-        // not arm the pending flag: a commit after it must publish nothing.
-        let current = cx.read(|cx| built.widget.read(cx).indicator_config().clone());
-        cx.update(|cx| {
-            built.widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(current, cx)
-            });
-        });
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.commit_indicator_config(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "an identical preview leaves nothing pending to publish"
-        );
-    }
-
-    /// Closing the panel ends the interaction, so a colour preview it was showing
-    /// is written back and stays on the chart.
-    #[gpui_kit::test]
-    fn closing_the_panel_should_publish_the_colour_preview_it_ends(cx: &mut TestAppContext) {
-        let built = widget(cx);
-        let before = built.reports();
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.toggle_indicator_panel(cx));
-        });
-
-        let previewed = cx.update(|cx| {
-            let mut config = built.widget.read(cx).indicator_config().clone();
-            assert!(config.set_line_color(
-                IndicatorId::Ma,
-                1,
-                LineColor::from(hsla(0.2, 0.7, 0.3, 0.5))
-            ));
-            config
-        });
-        cx.update(|cx| {
-            built.widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(previewed.clone(), cx)
-            });
-        });
-        assert_eq!(
-            built.reports(),
-            before,
-            "previewing while the panel is open writes nothing"
-        );
-
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.toggle_indicator_panel(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "closing the panel publishes the preview it ended"
-        );
-        assert!(
-            cx.read(|cx| !built.widget.read(cx).panel_open),
-            "the panel is closed"
-        );
-        assert_eq!(
-            cx.read(|cx| built.widget.read(cx).indicator_config().clone()),
-            previewed,
-            "the colour on screen when the panel closed is the one the chart keeps"
-        );
-    }
-
-    /// A publishing edit clears the pending preview: the write already includes
-    /// it, so a later commit must not publish it a second time.
-    #[gpui_kit::test]
-    fn a_publishing_edit_should_consume_the_pending_preview(cx: &mut TestAppContext) {
-        let built = widget(cx);
-        let before = built.reports();
-        let previewed = cx.update(|cx| {
-            let mut config = built.widget.read(cx).indicator_config().clone();
-            assert!(config.set_line_color(
-                IndicatorId::Ma,
-                0,
-                LineColor::from(hsla(0.3, 0.6, 0.4, 1.0))
-            ));
-            config
-        });
-        cx.update(|cx| {
-            built.widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(previewed, cx)
-            });
-        });
-
-        let edited = cx.update(|cx| {
-            let mut config = built.widget.read(cx).indicator_config().clone();
-            config.entries[0].enabled = false;
-            config
-        });
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.set_indicator_config(edited, cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "the publishing edit is the one write, and it includes the preview"
-        );
-
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.commit_indicator_config(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "the commit finds nothing pending after the publishing edit"
-        );
-    }
-
-    /// Losing the market closes the panel, which ends the colour interaction: a
-    /// preview pending at that moment is published and kept.
-    #[gpui_kit::test]
-    fn losing_the_market_should_publish_the_preview_it_closes(cx: &mut TestAppContext) {
-        let built = widget(cx);
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.toggle_indicator_panel(cx));
-        });
-        let before = built.reports();
-        let previewed = cx.update(|cx| {
-            let mut config = built.widget.read(cx).indicator_config().clone();
-            assert!(config.set_line_color(
-                IndicatorId::Ma,
-                2,
-                LineColor::from(hsla(0.8, 0.2, 0.6, 0.4))
-            ));
-            config
-        });
-        cx.update(|cx| {
-            built.widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(previewed.clone(), cx)
-            });
-        });
-        assert_eq!(built.reports(), before, "previewing writes nothing");
-
-        cx.update(|cx| {
-            built
-                .widget
-                .update(cx, |widget, cx| widget.wait_for_market(cx));
-        });
-        assert_eq!(
-            built.reports(),
-            before + 1,
-            "losing the market closes the panel and publishes the preview it ended"
-        );
-        assert!(
-            cx.read(|cx| !built.widget.read(cx).panel_open),
-            "the panel goes with the market"
-        );
-        assert_eq!(
-            cx.read(|cx| built.widget.read(cx).indicator_config().clone()),
-            previewed,
-            "the previewed colour survives the market going away"
-        );
-    }
-
-    /// A preview asks the widget for a frame on its own: without the notification
-    /// the chart would keep drawing the old colour.
-    #[gpui_kit::test]
-    fn a_colour_preview_should_ask_the_widget_for_a_frame(cx: &mut TestAppContext) {
-        let built = widget(cx);
-        let widget = built.widget;
-        cx.update(|cx| accept_snapshot(&widget, page_snapshot(), cx));
-        let (_, window) = cx.add_window_view({
-            let widget = widget.clone();
-            move |_, _| BodyHarness(widget)
-        });
-        window.run_until_parked();
-        let drawn = window.read(|cx| widget.read(cx).rendered_frames());
-
-        let previewed = window.read(|cx| {
-            let mut config = widget.read(cx).indicator_config().clone();
-            assert!(config.set_line_color(
-                IndicatorId::Ma,
-                0,
-                LineColor::from(hsla(0.25, 0.5, 0.75, 1.0))
-            ));
-            config
-        });
-        window.update(|_, cx| {
-            widget.update(cx, |widget, cx| {
-                widget.preview_indicator_config(previewed, cx)
-            });
-        });
-        window.run_until_parked();
-
-        assert!(
-            window.read(|cx| widget.read(cx).rendered_frames()) > drawn,
-            "the preview notifies the widget; without it the chart would show a stale colour"
-        );
-    }
-
     /// A chart that loses its market has no settings to show, so the panel goes
     /// with the chart it belongs to.
     #[gpui_kit::test]
@@ -6332,7 +5997,7 @@ pub(crate) mod tests {
             assert_eq!(
                 built.reports(),
                 before,
-                "closing the panel for a market that went away writes nothing back when no colour preview is pending"
+                "closing the panel for a market that went away writes nothing back"
             );
         });
     }

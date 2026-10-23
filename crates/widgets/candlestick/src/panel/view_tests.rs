@@ -578,32 +578,7 @@ fn every_picker_should_show_the_stored_colour(cx: &mut TestAppContext) {
     }
 }
 
-/// A change while the picker is open is a preview: it reaches the configuration
-/// on screen, not the persisted one.
-#[gpui_kit::test]
-fn a_colour_change_should_preview_without_publishing(cx: &mut TestAppContext) {
-    let (built, panel) = panel_over(cx);
-    let window = draw(cx, &panel);
-    let key = ma_line_key(0);
-    let picker = picker_of(window, &panel, key);
-    let before = built.reports();
-    let preview = hsla(0.42, 0.61, 0.37, 0.8);
-
-    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(preview));
-
-    assert_eq!(
-        ma_line_color(window, &built.widget, 0),
-        LineColor::from(preview),
-        "the preview is the colour the chart and the panel now draw"
-    );
-    assert_eq!(
-        built.reports(),
-        before,
-        "a preview is painted, not written back"
-    );
-}
-
-/// The commit is what stores the colour, and it stores it exactly once.
+/// A picker's report is a confirmed colour: it is stored, and published once.
 #[gpui_kit::test]
 fn a_colour_commit_should_publish_exactly_once(cx: &mut TestAppContext) {
     let (built, panel) = panel_over(cx);
@@ -611,36 +586,23 @@ fn a_colour_commit_should_publish_exactly_once(cx: &mut TestAppContext) {
     let key = ma_line_key(1);
     let picker = picker_of(window, &panel, key);
     let before = built.reports();
-    let changed = hsla(0.2, 0.4, 0.6, 1.0);
     let committed = hsla(0.7, 0.3, 0.5, 0.9);
 
-    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(changed));
-    emit_picker(window, &picker, ColorPickerEvent::ColorCommitted(committed));
+    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(committed));
 
     assert_eq!(
         ma_line_color(window, &built.widget, 1),
         LineColor::from(committed),
-        "the commit stores the colour the popup closed on"
-    );
-    assert_eq!(
-        window.read(|cx| picker.read(cx).color()),
-        committed,
-        "the picker is written back to the stored colour when the config moves"
+        "the confirmed colour is the one the configuration stores"
     );
     assert_eq!(
         built.reports(),
         before + 1,
-        "one interaction publishes once, not once per change"
+        "one interaction publishes once"
     );
 
-    // A commit the user produced without moving through the palette still writes
-    // the colour: the panel applies it before it publishes.
     let standalone = hsla(0.15, 0.25, 0.35, 1.0);
-    emit_picker(
-        window,
-        &picker,
-        ColorPickerEvent::ColorCommitted(standalone),
-    );
+    emit_picker(window, &picker, ColorPickerEvent::ColorChanged(standalone));
     assert_eq!(
         ma_line_color(window, &built.widget, 1),
         LineColor::from(standalone)
@@ -648,7 +610,7 @@ fn a_colour_commit_should_publish_exactly_once(cx: &mut TestAppContext) {
     assert_eq!(
         window.read(|cx| picker.read(cx).color()),
         standalone,
-        "the second colour reaches the picker the same way"
+        "the picker is written back to the stored colour when the config moves"
     );
     assert_eq!(
         built.reports(),
@@ -786,14 +748,16 @@ fn a_second_frame_should_reuse_the_same_picker(cx: &mut TestAppContext) {
     assert_eq!(first, second, "a redrawn panel keeps its picker entity");
 }
 
-/// Choosing a palette cell previews the colour while the popup is open and
-/// publishes it once on the way out.
+/// Choosing a palette cell only edits the picker's panel; the cell's colour reaches
+/// the configuration when the user confirms it.
 ///
 /// The popup is drawn as a deferred overlay, so the cell is a window-level
 /// element rather than a child of the row: the click is aimed at the grid's first
 /// cell, which is where the palette starts.
 #[gpui_kit::test]
-fn choosing_a_palette_cell_should_preview_and_publish_the_line_colour(cx: &mut TestAppContext) {
+fn choosing_a_palette_cell_should_publish_the_line_colour_once_it_is_confirmed(
+    cx: &mut TestAppContext,
+) {
     let (built, panel) = panel_over(cx);
     let window = draw(cx, &panel);
     let before = built.reports();
@@ -810,14 +774,28 @@ fn choosing_a_palette_cell_should_preview_and_publish_the_line_colour(cx: &mut T
     window.run_until_parked();
     redraw(window);
 
+    assert_eq!(
+        ma_line_color(window, &built.widget, 0),
+        before_color,
+        "choosing a cell without confirming leaves the stored colour alone"
+    );
+    assert_eq!(
+        built.reports(),
+        before,
+        "an unconfirmed choice publishes nothing"
+    );
+
+    press(window, "TEST_COLOR_PICKER_CONFIRM");
+    redraw(window);
+
     assert_ne!(
         ma_line_color(window, &built.widget, 0),
         before_color,
-        "the cell the user chose is the line's new colour"
+        "the cell the user confirmed is the line's new colour"
     );
     assert_eq!(
         built.reports(),
         before + 1,
-        "choosing a colour publishes it once, when the popup closes"
+        "confirming a colour publishes it once"
     );
 }
