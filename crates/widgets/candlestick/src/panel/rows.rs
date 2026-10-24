@@ -190,19 +190,21 @@ pub(super) fn node_row(
                 .checkbox()
                 .small()
                 .checked(enabled)
-                .aria_label(caption.clone())
+                // The title is the checkbox's own label rather than a text element
+                // beside it: the toggle already lays its label out one `gap` after
+                // the square, and a second element after it would be separated by the
+                // node row's own gap as well — two spaces between two things that are
+                // one control. It also makes the title part of what the checkbox
+                // answers: pressing the name ticks the box, which is what a labelled
+                // checkbox is.
+                .label(caption.clone())
+                .aria_label(caption)
                 .on_change(move |checked, _, cx| {
                     // Clicking the checkbox is not a second way to open the
                     // settings under it.
                     cx.stop_propagation();
                     let _ = toggle_panel.update(cx, |panel, cx| panel.set_enabled(id, checked, cx));
                 }),
-        )
-        .child(
-            div()
-                .debug_selector(move || node_title_selector(id))
-                .text_xs()
-                .child(caption),
         )
         .into_any_element()
 }
@@ -695,14 +697,6 @@ fn caret_glyph_selector(id: IndicatorId, icon: IconKind) -> String {
 /// the checkbox is.
 fn node_toggle_selector(id: IndicatorId) -> String {
     format!("TEST_PANEL_NODE_TOGGLE_{}", indicator_name(id))
-}
-
-/// The debug selector of one indicator's title in its node row.
-///
-/// The title is measured against a section heading: the two captions are the
-/// same kind of text at two sizes, so their boxes are what states the sizes.
-fn node_title_selector(id: IndicatorId) -> String {
-    format!("TEST_PANEL_NODE_TITLE_{}", indicator_name(id))
 }
 
 /// The debug selector of one `Period` row's label.

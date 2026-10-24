@@ -741,13 +741,19 @@ fn folding_an_indicator_should_draw_a_right_caret(cx: &mut TestAppContext) {
     );
 }
 
-/// The indicator title and the parameter labels are `xs`, one size smaller than
-/// the section headings they sit under.
+/// The parameter labels are `xs`, one size smaller than the section headings they
+/// sit under.
 ///
-/// Measured against a heading the same frame drew rather than against a number:
-/// the captions are the same kind of text, so the difference between their boxes
-/// is the difference between the two sizes, and nothing has to hardcode how tall
-/// a line of either one is.
+/// Measured against a heading the same frame drew rather than against a number: the
+/// captions are the same kind of text, so the difference between their boxes is the
+/// difference between the two sizes, and nothing has to hardcode how tall a line of
+/// either one is.
+///
+/// The indicator title is not measured here any more. It is the checkbox's own label
+/// now, so it has no box of its own to read — the size it is drawn at is the one
+/// `UnifiedSize::Small` gives the control, which is the `xs` this test is about. What
+/// says the title is inside the checkbox rather than beside it is the width assertion
+/// below.
 #[gpui_kit::test]
 fn the_captions_should_be_smaller_than_a_section_heading(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -757,21 +763,30 @@ fn the_captions_should_be_smaller_than_a_section_heading(cx: &mut TestAppContext
     let heading = window
         .debug_bounds("TEST_PANEL_SECTION_TITLE_SUB")
         .expect("the sub chart's heading is drawn");
-    let title = window
-        .debug_bounds("TEST_PANEL_NODE_TITLE_MACD")
-        .expect("MACD's node row draws its title");
     // MACD's first row is a period row, and its label sits beside the field.
     let label = window
         .debug_bounds("TEST_PANEL_PERIOD_LABEL_MACD_0")
         .expect("MACD's first period row draws its label");
+    let toggle = window
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MACD")
+        .expect("MACD's node row draws the checkbox that enables it");
 
-    assert!(
-        title.size.height < heading.size.height,
-        "the indicator title is smaller than a section heading: {title:?} vs {heading:?}"
-    );
     assert!(
         label.size.height < heading.size.height,
         "a parameter label is smaller than a section heading: {label:?} vs {heading:?}"
+    );
+    // The checkbox draws its square at `icon_size * 1.8` — 14.4px at the small size —
+    // and pads it on both sides. A box wider than that frame is one that carries the
+    // title as its label; a box only as wide as the frame would be the checkbox alone
+    // with the title drawn beside it, which is the shape this change removed.
+    let square = UnifiedSize::Small.icon_size().as_f32() * 1.8;
+    let frame = square + 2.0 * UnifiedSize::Small.px().as_f32();
+    assert!(
+        toggle.size.width.as_f32() > frame,
+        "the node row's checkbox carries the indicator's title as its label: its box is \
+         {}px wide and its own frame is {frame}px, so anything no wider than that would \
+         be the checkbox with the title somewhere else ({toggle:?})",
+        toggle.size.width.as_f32()
     );
     assert!(
         window
@@ -1402,8 +1417,10 @@ fn a_folded_card_should_wrap_its_node_row(cx: &mut TestAppContext) {
     let card = window
         .debug_bounds("TEST_PANEL_CARD_MA")
         .expect("a folded MA is drawn as its card");
+    // The checkbox that enables the indicator, which now carries the title as its own
+    // label: it is the node row's widest child and the one the card's box has to hold.
     let title = window
-        .debug_bounds("TEST_PANEL_NODE_TITLE_MA")
+        .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
         .expect("the card draws MA's node row");
     let caret = window
         .debug_bounds("TEST_PANEL_CARET_MA_RIGHT")
@@ -2051,11 +2068,11 @@ fn every_settings_row_should_start_on_the_checkboxs_line(cx: &mut TestAppContext
 /// The arrow is drawn on the row's centre line, not above or below the controls
 /// beside it.
 ///
-/// The three things on the row are boxes of three different heights — the arrow's
-/// slot, the checkbox's 20px control and the title's line box — so a row that
-/// centred some of them and not others would still look almost right. They all
-/// have to share one centre, which is what makes the arrow read as part of the row
-/// rather than as something floating between two lines.
+/// The two things on the row are boxes of different heights — the arrow's 16px slot
+/// and the checkbox's 20px control, which now spans the title too — so a row that
+/// centred one of them and not the other would still look almost right. They have to
+/// share one centre, which is what makes the arrow read as part of the row rather than
+/// as something floating between two lines.
 #[gpui_kit::test]
 fn the_caret_should_be_drawn_on_the_node_rows_centre_line(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -2068,22 +2085,15 @@ fn the_caret_should_be_drawn_on_the_node_rows_centre_line(cx: &mut TestAppContex
     let toggle = window
         .debug_bounds("TEST_PANEL_NODE_TOGGLE_MA")
         .expect("MA's node row draws the checkbox that enables it");
-    let title = window
-        .debug_bounds("TEST_PANEL_NODE_TITLE_MA")
-        .expect("MA's node row draws its title");
 
     let glyph_centre = glyph.center().y.as_f32();
     let toggle_centre = toggle.center().y.as_f32();
-    let title_centre = title.center().y.as_f32();
 
     assert!(
         (glyph_centre - toggle_centre).abs() <= 0.5,
         "the arrow's centre is {glyph_centre} and the checkbox's is \
-         {toggle_centre}: the row centres them on one line"
-    );
-    assert!(
-        (glyph_centre - title_centre).abs() <= 1.0,
-        "and the title's centre is {title_centre}, half a pixel off at most: the \
-         three boxes are different heights but one centre line"
+         {toggle_centre}: the row centres them on one line. The title is that \
+         checkbox's label, so its own centre line is this one too — the box \
+         spans both and a label is centred in it ({toggle:?})"
     );
 }
