@@ -137,6 +137,7 @@ fn all_network_targets(
         KytrixServiceCapability::X,
         KytrixServiceCapability::Wallet,
         KytrixServiceCapability::XMedia,
+        KytrixServiceCapability::Cmc,
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
         KytrixServiceCapability::UpdaterDownload,
@@ -578,7 +579,8 @@ mod tests {
 
     use super::{
         CONFIG_DIRECTORY_NAME, CONFIG_FILE_NAME, ConfigLoadError, ConfigPersistenceError,
-        ConfigStore, available_backup_path, back_up_damaged_config, config_file_path,
+        ConfigStore, all_network_targets, available_backup_path, back_up_damaged_config,
+        config_file_path,
     };
     use crate::test_support::test_temp;
 
@@ -921,6 +923,22 @@ mod tests {
             "a write that moves no line rotates no generation"
         );
         assert_eq!(store.read().network_route_generation(&okx), okx_initial);
+    }
+
+    /// Every Kytrix service capability is a target the store stamps, whether or not anything
+    /// has configured a line of its own for it: a capability missing from the list would never
+    /// have its route generation computed, so a proxy change for it would go unnoticed.
+    #[test]
+    fn every_kytrix_service_capability_should_have_a_network_target() {
+        let targets = all_network_targets(&Config::default(), []);
+
+        assert_eq!(targets.len(), 11);
+        assert!(
+            targets.contains(&ServiceTarget::KytrixService {
+                capability: KytrixServiceCapability::Cmc,
+            }),
+            "the CMC capability should be a stamped target"
+        );
     }
 
     /// Within one domain a change set names the map's keys in order: the

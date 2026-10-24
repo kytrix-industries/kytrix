@@ -16,8 +16,8 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetEtf, GetIndexManifest, WalletAddSelection, WalletDeleteSelection, WalletSelections,
-        XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
+        GetCmcFearGreedIndex, GetEtf, GetIndexManifest, WalletAddSelection, WalletDeleteSelection,
+        WalletSelections, XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
         request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
@@ -1099,6 +1099,28 @@ impl KytrixServiceConnector {
         })
     }
 
+    /// Fetches the latest CMC fear and greed snapshot over WebSocket RPC.
+    pub async fn fetch_cmc_fear_greed_index(
+        &self,
+    ) -> Result<proto_types::CmcFearGreedIndex, KytrixServiceError> {
+        let response = self
+            .call_rpc(
+                None,
+                KytrixServiceCapability::Cmc,
+                ClientRequestKind::GetCmcFearGreedIndex(GetCmcFearGreedIndex {}),
+            )
+            .await
+            .map_err(RpcCallError::into_error)?;
+        let proto_response::response::Response::CmcFearGreedIndex(response) = response else {
+            return Err(KytrixServiceError::Protocol(
+                "unexpected fear and greed RPC response".into(),
+            ));
+        };
+        response.cmc_fear_greed_index.ok_or_else(|| {
+            KytrixServiceError::Protocol("fear and greed RPC response is missing data".into())
+        })
+    }
+
     pub(super) fn begin_service_operation(&self) -> Result<TransportPermit, KytrixServiceError> {
         self.inner()
             .lifecycle
@@ -1132,6 +1154,64 @@ mod tests {
         assert_eq!(
             server.next_request().await.1,
             ObservedRequest::Rpc("index_manifest")
+        );
+        assert_eq!(
+            connector.fetch_cmc_fear_greed_index().await.unwrap(),
+            cmc_fear_greed_index()
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("cmc_fear_greed_index")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fear_and_greed_answer_of_another_kind_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(proto_response::response::Response::Etf(
+            proto_response::EtfResponse { etf: None },
+        ));
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+
+        assert_eq!(
+            connector.fetch_cmc_fear_greed_index().await,
+            Err(KytrixServiceError::Protocol(
+                "unexpected fear and greed RPC response".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("cmc_fear_greed_index")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fear_and_greed_answer_without_a_snapshot_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(proto_response::response::Response::CmcFearGreedIndex(
+            proto_response::CmcFearGreedIndexResponse {
+                cmc_fear_greed_index: None,
+            },
+        ));
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+
+        assert_eq!(
+            connector.fetch_cmc_fear_greed_index().await,
+            Err(KytrixServiceError::Protocol(
+                "fear and greed RPC response is missing data".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("cmc_fear_greed_index")
         );
 
         connector.shutdown().await;

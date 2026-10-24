@@ -485,7 +485,20 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
             proxy_targets_field(
                 "proxy-applications.kytrix.cloud",
                 "settings_ui.proxies.kytrix_cloud",
-                &["kytrix", "account", "wallet", "news", "x", "云服务"],
+                &[
+                    "kytrix",
+                    "account",
+                    "wallet",
+                    "news",
+                    "x",
+                    "cmc",
+                    "coinmarketcap",
+                    "fear",
+                    "greed",
+                    "恐惧",
+                    "贪婪",
+                    "云服务",
+                ],
                 KYTRIX_CLOUD,
             ),
             proxy_targets_field(
@@ -1353,6 +1366,9 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::X,
+    },
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::Cmc,
     },
 ];
 

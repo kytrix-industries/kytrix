@@ -1,9 +1,11 @@
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use app_config::network::{Config, KytrixServiceCapability, NetworkRouteGeneration, ServiceTarget};
+use app_config::network::{
+    Config, KytrixServiceCapability, NetworkRouteGeneration, ProxyRoute, ServiceTarget,
+};
 use app_config_provider::notification::ConfigNotification;
 use futures::SinkExt as _;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
@@ -96,6 +98,7 @@ impl TestConfigManager {
             KytrixServiceCapability::X,
             KytrixServiceCapability::Wallet,
             KytrixServiceCapability::XMedia,
+            KytrixServiceCapability::Cmc,
             KytrixServiceCapability::PentagonPizzaIndex,
             KytrixServiceCapability::UpdaterMetadata,
             KytrixServiceCapability::UpdaterDownload,
@@ -174,6 +177,24 @@ pub(super) fn index_manifest() -> proto_types::IndexManifest {
                 zh: "标普500指数".to_owned(),
             }),
         }],
+    }
+}
+
+/// The fear and greed snapshot the service serves, shaped as the collector publishes it.
+pub(super) fn cmc_fear_greed_index() -> proto_types::CmcFearGreedIndex {
+    let point = |date: &str, score: u32| proto_types::CmcFearGreedIndexPoint {
+        date: date.to_owned(),
+        score,
+    };
+    proto_types::CmcFearGreedIndex {
+        current: 46,
+        yesterday: Some(point("2026-10-23", 45)),
+        last_week: Some(point("2026-10-17", 40)),
+        last_month: Some(point("2026-09-24", 28)),
+        last_year: Some(point("2025-10-24", 72)),
+        yearly_high: Some(point("2025-11-20", 88)),
+        yearly_low: Some(point("2026-04-15", 12)),
+        timestamp: 1_790_000_000_000,
     }
 }
 
@@ -313,6 +334,7 @@ pub(super) struct TestServiceServer {
     pub duplicate_topics_next: Arc<AtomicBool>,
     pub unknown_oneof_next: Arc<AtomicBool>,
     pub drop_next_response: Arc<AtomicBool>,
+    pub override_next_response: Arc<Mutex<Option<proto_response::response::Response>>>,
     pub pending_x_add_next: Arc<AtomicBool>,
     pub stall_next_response: Arc<AtomicBool>,
     pub response_stalled: Arc<Notify>,
@@ -351,6 +373,8 @@ impl TestServiceServer {
         let task_authentication_unavailable_next = authentication_unavailable_next;
         let drop_next_response = Arc::new(AtomicBool::new(false));
         let task_drop_next_response = drop_next_response.clone();
+        let override_next_response = Arc::new(Mutex::new(None));
+        let task_override_next_response = override_next_response.clone();
         let pending_x_add_next = Arc::new(AtomicBool::new(false));
         let task_pending_x_add_next = pending_x_add_next.clone();
         let stall_next_response = Arc::new(AtomicBool::new(false));
@@ -381,6 +405,7 @@ impl TestServiceServer {
                 let unknown_oneof_next = task_unknown_oneof_next.clone();
                 let authentication_unavailable_next = task_authentication_unavailable_next.clone();
                 let drop_next_response = task_drop_next_response.clone();
+                let override_next_response = task_override_next_response.clone();
                 let pending_x_add_next = task_pending_x_add_next.clone();
                 let stall_next_response = task_stall_next_response.clone();
                 let response_stalled = task_response_stalled.clone();
@@ -401,6 +426,7 @@ impl TestServiceServer {
                         let authentication_unavailable_next =
                             authentication_unavailable_next.clone();
                         let drop_next_response = drop_next_response.clone();
+                        let override_next_response = override_next_response.clone();
                         let pending_x_add_next = pending_x_add_next.clone();
                         let stall_next_response = stall_next_response.clone();
                         let response_stalled = response_stalled.clone();
@@ -616,6 +642,29 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
+                                        // Nothing in the workspace reads the calendar yet, so the
+                                        // mock answers the valid request with an empty snapshot
+                                        // rather than inventing a failure for it.
+                                        ClientRequestKind::GetFinancialCalendar(_) => (
+                                            ObservedRequest::Rpc("financial_calendar"),
+                                            proto_response::response::Response::FinancialCalendar(
+                                                proto_response::FinancialCalendarResponse {
+                                                    financial_calendar: None,
+                                                },
+                                            ),
+                                            false,
+                                        ),
+                                        ClientRequestKind::GetCmcFearGreedIndex(_) => (
+                                            ObservedRequest::Rpc("cmc_fear_greed_index"),
+                                            proto_response::response::Response::CmcFearGreedIndex(
+                                                proto_response::CmcFearGreedIndexResponse {
+                                                    cmc_fear_greed_index: Some(
+                                                        cmc_fear_greed_index(),
+                                                    ),
+                                                },
+                                            ),
+                                            false,
+                                        ),
                                     };
                                     if request_sender.send((connection_id, observed)).is_err() {
                                         return;
@@ -674,6 +723,11 @@ impl TestServiceServer {
                                             }
                                         }
                                     }
+                                    let response = override_next_response
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .take()
+                                        .unwrap_or(response);
                                     if unknown_oneof_next.swap(false, Ordering::AcqRel) {
                                         let _ = websocket
                                             .send(Frame::binary(UNKNOWN_SERVER_ONEOF_WIRE.to_vec()))
@@ -755,6 +809,7 @@ impl TestServiceServer {
             duplicate_topics_next,
             unknown_oneof_next,
             drop_next_response,
+            override_next_response,
             pending_x_add_next,
             stall_next_response,
             response_stalled,
@@ -845,6 +900,17 @@ impl TestServiceServer {
         self.drop_next_response.store(true, Ordering::Release);
     }
 
+    /// Answers the next request with `response` instead of the one its kind would produce.
+    ///
+    /// This is how a caller is tested against a service that answers a valid request with
+    /// something else: a response of another kind, or one of the same kind without data.
+    pub(super) fn answer_next_request_with(&self, response: proto_response::response::Response) {
+        *self
+            .override_next_response
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(response);
+    }
+
     /// Answers the next X add with the row a first-ever add gets back, which has no profile.
     pub(super) fn answer_x_add_with_pending_selection(&self) {
         self.pending_x_add_next.store(true, Ordering::Release);
@@ -867,5 +933,29 @@ impl TestServiceServer {
     pub(super) async fn shutdown(self) {
         self.cancellation.cancel();
         self.task.await.expect("test service should stop cleanly");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The manager stands in for the application's whole route table in every test that
+    /// routes through it, so a capability missing from this list would silently keep the
+    /// generation a route change must advance.
+    #[test]
+    fn every_kytrix_service_capability_should_be_stamped_when_the_default_line_moves() {
+        let mut manager = TestConfigManager::in_memory(Config::default());
+
+        manager.update(|config| config.proxy_default = ProxyRoute::System);
+
+        let stamped = &manager.read().service_route_generations;
+        assert_eq!(stamped.len(), 11, "every capability is a stamped target");
+        assert!(
+            stamped.contains_key(&ServiceTarget::KytrixService {
+                capability: KytrixServiceCapability::Cmc,
+            }),
+            "the CMC capability should have a route generation"
+        );
     }
 }
