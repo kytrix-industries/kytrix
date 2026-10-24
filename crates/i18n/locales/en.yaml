@@ -89,6 +89,9 @@ error:
     outcome_risk_pool_incomplete: Risk pool %{pool} references a group or conversion the batch does not carry
     outcome_risk_pool_lineage_invalid: Risk pool %{pool} is not a valid lineage successor of a member group
     snapshot_key_mismatch: The snapshot of listing %{listing} does not describe it
+  crypto_fgi:
+    score_out_of_range: 'The fear and greed answer carried an invalid score: %{value}'
+    stream_unavailable: The fear and greed service did not accept the refresh request
   display:
     display_unavailable: Display unavailable
     generation_mismatch: The operation was made for %{expected} but read %{actual}
@@ -548,6 +551,25 @@ widget:
     market: Market
     monitoring: Monitoring
     statistics: Statistics
+  crypto_fgi:
+    info_history: 'Each row is the reading the index service took on its own calendar day: yesterday is the day before, last week is 7 days ago, last month is the same day of the previous calendar month, and last year is the same day a year ago. The data is recorded by UTC day. A dash is shown when the previous calendar month or last year has no such day, or when there is no reading on or before it.'
+    info_yearly: The index service takes the highest and the lowest reading from the past 365 calendar days (not including today), and shows the day each one happened on with the market sentiment level recorded then.
+    last_month: Last Month
+    last_week: Last Week
+    last_year: Last Year
+    level:
+      extreme_fear: Extreme Fear
+      extreme_greed: Extreme Greed
+      fear: Fear
+      greed: Greed
+      neutral: Neutral
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    refresh: Refresh
+    title: Historical Values
+    yearly_extremes: Yearly High and Low
+    yearly_high: 'Yearly High (%{date})'
+    yearly_low: 'Yearly Low (%{date})'
+    yesterday: Yesterday
   empty:
     hint: 'Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button in the upper-right corner to select a widget.'
   etf:
@@ -677,6 +699,7 @@ widget:
     table: Recent market trades
   names:
     candlestick: Candlestick
+    crypto_fgi: Crypto Fear & Greed
     empty: Empty
     etf_flow: ETF Flow
     force_orders: Force Orders Stream

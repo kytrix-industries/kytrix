@@ -89,6 +89,9 @@ error:
     outcome_risk_pool_incomplete: 风险池 %{pool} 引用了批次未携带的结果组或转换
     outcome_risk_pool_lineage_invalid: 风险池 %{pool} 不是成员组合法的谱系后继
     snapshot_key_mismatch: 挂牌 %{listing} 的快照描述的不是该挂牌
+  crypto_fgi:
+    score_out_of_range: 恐惧与贪婪接口返回了无效分值：%{value}
+    stream_unavailable: 恐惧与贪婪服务未接受刷新请求
   display:
     display_unavailable: 显示不可用
     generation_mismatch: '该操作针对 %{expected}，但实际读取到 %{actual}'
@@ -548,6 +551,25 @@ widget:
     market: 行情
     monitoring: 监控
     statistics: 统计
+  crypto_fgi:
+    info_history: 每行由指数服务按对应日历日给出：昨天取前一天、上周取 7 天前、上月取上一个日历月的同一天、去年取去年同一天。数据按 UTC 日记录。若上月或去年没有这一天，或该日及之前没有数据，显示横线。
+    info_yearly: 由指数服务在过去 365 个日历日（不含今天）的记录中取最高与最低，并显示其发生日期与当时的市场情绪档位。
+    last_month: 上月
+    last_week: 上周
+    last_year: 去年
+    level:
+      extreme_fear: 极度恐惧
+      extreme_greed: 极度贪婪
+      fear: 恐惧
+      greed: 贪婪
+      neutral: 中性
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    refresh: 刷新
+    title: 历史数据
+    yearly_extremes: 年度最高与最低值
+    yearly_high: 年度最高值（%{date}）
+    yearly_low: 年度最低值（%{date}）
+    yesterday: 昨天
   empty:
     hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
   etf:
@@ -677,6 +699,7 @@ widget:
     table: 最近市场成交
   names:
     candlestick: K 线
+    crypto_fgi: 加密恐惧与贪婪指数
     empty: 空白
     etf_flow: ETF 资金流
     force_orders: 强平订单流

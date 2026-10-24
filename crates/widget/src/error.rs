@@ -2954,6 +2954,10 @@ mod tests {
             include_str!("../../widgets/candlestick/src/view.rs"),
         ),
         (
+            "crates/widgets/crypto_fgi/src/view.rs",
+            include_str!("../../widgets/crypto_fgi/src/view.rs"),
+        ),
+        (
             "crates/widgets/etf/src/view.rs",
             include_str!("../../widgets/etf/src/view.rs"),
         ),

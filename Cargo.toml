@@ -20,6 +20,7 @@ members = [
     "crates/widget_gallery_ui",
     "crates/widget_registry",
     "crates/widgets/candlestick",
+    "crates/widgets/crypto_fgi",
     "crates/widgets/empty",
     "crates/widgets/etf",
     "crates/widgets/force_orders",
@@ -122,6 +123,7 @@ app_config = { path = "crates/app_config" }
 app_config_provider = { path = "crates/app_config_provider" }
 base_ui = { path = "crates/base_ui" }
 candlestick = { path = "crates/widgets/candlestick" }
+crypto_fgi = { path = "crates/widgets/crypto_fgi" }
 empty = { path = "crates/widgets/empty" }
 etf = { path = "crates/widgets/etf" }
 force_orders = { path = "crates/widgets/force_orders" }

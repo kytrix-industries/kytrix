@@ -2029,6 +2029,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto_fgi"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_proto",
+ "kytrix_service_provider",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
