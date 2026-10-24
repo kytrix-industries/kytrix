@@ -24,7 +24,7 @@ use gpui_kit::{
 use super::{
     colors::{self, ColorKey},
     inputs, rows,
-    view::{IndicatorPanel, PANEL_WIDTH, card_colors},
+    view::{CARD_PADDING, IndicatorPanel, PANEL_WIDTH, card_colors},
 };
 use crate::{
     indicator::{
@@ -409,6 +409,69 @@ fn pressing_a_delete_button_should_remove_its_line(cx: &mut TestAppContext) {
     );
 }
 
+/// The delete button is drawn as an outline: an edge at rest, not a bare glyph.
+///
+/// The two variants this can be are told apart by the border the paint carries and
+/// nothing else — both keep the same box, the same icon and the same hover wash, so a
+/// test that only pressed the button would pass either way. What is read is the frame's
+/// own quads over the button's box: an outlined control paints its edge in the theme's
+/// `line.border` role, while a ghost one paints a transparent border and only shows
+/// something under the pointer — which is the state this change was asked to leave.
+///
+/// The picker beside it is measured too. It is the same kind of control on the same
+/// row, and a delete button that changed variant without its neighbour keeping its own
+/// would leave the row with two different treatments of one edge.
+#[gpui_kit::test]
+fn the_delete_button_should_be_drawn_as_an_outline(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let delete = window
+        .debug_bounds("TEST_PANEL_DELETE_LINE_MA_1")
+        .expect("a list of three lines may lose one");
+    let border = window.read(|cx| {
+        (
+            cx.theme().roles.line.border.hsla,
+            cx.theme().roles.line.strong.hsla,
+        )
+    });
+    let painted = window.update(|window, _| {
+        let (scale, quads) = (window.scale_factor(), window.painted_quads());
+        let delete = delete.scale(scale);
+        quads
+            .iter()
+            .filter(|quad| {
+                quad.bounds.left() >= delete.left()
+                    && quad.bounds.right() <= delete.right()
+                    && quad.bounds.top() >= delete.top()
+                    && quad.bounds.bottom() <= delete.bottom()
+            })
+            .map(|quad| quad.border_color)
+            .filter(|color| !color.is_transparent())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(
+        !painted.is_empty(),
+        "the delete button paints an edge at rest: a ghost button paints only a transparent \
+         border, so finding none is exactly the state this test exists to rule out \
+         ({delete:?})"
+    );
+    // The strips carry the border role the outline variant resolves to. The tolerance
+    // is the same one the card's paint tests use: the colour is reached through the
+    // theme, not written out here.
+    assert!(
+        painted
+            .iter()
+            .any(|color| same_color(*color, border.0) || same_color(*color, border.1)),
+        "the edge is the theme's border role for an outlined control at rest, {0:?} or \
+         {1:?}, and the button painted {painted:?}",
+        border.0,
+        border.1
+    );
+}
+
 /// The field of a line row sits at the row's left and its controls at the row's
 /// right: a row whose children simply follow each other puts the picker and the
 /// delete button in the middle of the panel instead of at its edge.
@@ -731,15 +794,37 @@ fn adding_a_line_should_grow_the_list_below_the_last_one(cx: &mut TestAppContext
         "each addition advances through the palette, not to one fixed colour"
     );
 
-    let list = window
-        .debug_bounds("TEST_PANEL_LINE_LIST")
-        .expect("the list is drawn while its indicator is open");
+    // The list is now one column that holds the "+" row as its last child, so the
+    // question is not whether the button is outside the list but whether it is under
+    // the last line: the column's gap is what places it, and that is the spacing the
+    // button has to share with the lines above it.
+    let last_line = window
+        .debug_bounds("TEST_PANEL_LINE_ROW_MA_4")
+        .expect("the line the first press added is drawn");
     let add = window
         .debug_bounds("TEST_PANEL_ADD_LINE")
         .expect("the button that adds a line is drawn");
     assert!(
-        add.top() >= list.bottom(),
-        "the + button sits under the last line, not among them: {add:?} and {list:?}"
+        add.top() >= last_line.bottom(),
+        "the + button sits under the last line, not among them: {add:?} and {last_line:?}"
+    );
+
+    // And the gap above it is the gap between two lines, not some other number: the
+    // button is a row of this column, so the same `gap` separates it from the line
+    // above as separates that line from the one above it.
+    let list = window
+        .debug_bounds("TEST_PANEL_LINE_LIST")
+        .expect("the list is drawn while its indicator is open");
+    let before_last = window
+        .debug_bounds("TEST_PANEL_LINE_ROW_MA_3")
+        .expect("the fourth line is drawn");
+    let gap_to_button = (add.top() - last_line.bottom()).as_f32();
+    let gap_between_lines = (last_line.top() - before_last.bottom()).as_f32();
+    assert!(
+        (gap_to_button - gap_between_lines).abs() < 0.5,
+        "the + button is one gap below the list it grows, the same gap that separates \
+         two lines ({gap_to_button}px against {gap_between_lines}px), and both are \
+         inside the list: {add:?} vs {last_line:?} vs {list:?}"
     );
 }
 
@@ -1282,33 +1367,33 @@ fn a_folded_card_should_wrap_its_node_row(cx: &mut TestAppContext) {
         "the card's padding places its left edge outside the title it holds: {card:?} vs {title:?}"
     );
     // The caret is the node row's first child, so the inset between the card's
-    // corner and the caret's is the card's 1px border plus its 4px padding.
+    // corner and the caret's is the card's 1px border plus its padding.
     assert!(
-        (caret.left() - card.left()).as_f32() > 4.0,
+        (caret.left() - card.left()).as_f32() > CARD_PADDING,
         "the card's padding holds its content away from its edge: {caret:?} vs {card:?}"
     );
     assert!(
-        (caret.top() - card.top()).as_f32() > 4.0,
+        (caret.top() - card.top()).as_f32() > CARD_PADDING,
         "and the same padding applies on top, so the row is not flush with the border: \
          {caret:?} vs {card:?}"
     );
 }
 
 /// An expanded card holds everything its indicator draws, the "+" button last,
-/// and its padding holds that last row away from its own edges.
+/// and its padding holds that last row equally far from every edge.
 ///
 /// The bottom is what tells "the card wraps the indicator" from "the card wraps
 /// the title": a card that stopped at the node row would end above the button and
 /// above the next indicator's card, and both of those would still leave the
 /// title inside *a* card.
 ///
-/// The "+" row is the card's last child and spans its width, so its bottom and
-/// right edges are the card's inner edges: the gap between the two boxes is the
-/// card's 1px border plus its 4px padding, on the bottom and on the right. Those
-/// are the two insets the folded-card test above cannot reach — its only child
-/// takes its width from its own content and its height from the row it draws — so
-/// padding that went missing on the right or the bottom would leave every other
-/// assertion in this file green.
+/// The two insets are measured against each other rather than against a literal,
+/// because that is the property the eye reads: the space under the last row and the
+/// space beside it are one number. They were not before — the row was flush with the
+/// card's right edge while the "+" button sat in a 28px row of its own inside a 20px
+/// button, which left 13px under the button against 5px beside the rows. A test that
+/// pinned 9.0 alone would go green again the moment both numbers moved together to
+/// some other value.
 #[gpui_kit::test]
 fn an_expanded_card_should_wrap_the_settings_and_the_add_button(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -1340,37 +1425,44 @@ fn an_expanded_card_should_wrap_the_settings_and_the_add_button(cx: &mut TestApp
          are MA's and not drawn between two cards: {card:?} vs {next:?}"
     );
 
-    // The "+" row's wrapper, not the button inside it: the button is inset by its
-    // own frame, while the wrapper is what the card lays out and is therefore flush
-    // with the card's inner edges.
-    let row = window
-        .debug_bounds("TEST_PANEL_ADD_LINE")
-        .expect("the + row is drawn with the button");
-    let right_inset = (card.right() - row.right()).as_f32();
-    let bottom_inset = (card.bottom() - row.bottom()).as_f32();
+    // The button, not the row around it: the button's own frame is the edge the eye
+    // reads, and it is what the card holds away from its border. The wrapper is
+    // wider than the button by the row's left inset, so measuring it would compare
+    // the card's right edge against a box that starts at the column's left.
+    let right_inset = (card.right() - add.right()).as_f32();
+    let bottom_inset = (card.bottom() - add.bottom()).as_f32();
+    let padding = CARD_PADDING + 1.0;
     assert!(
-        (right_inset - 5.0).abs() < 1.0,
-        "the card's right padding is 4px plus its 1px border, so the row it holds \
-         stops 5px short of its right edge: {row:?} vs {card:?}"
+        (right_inset - padding).abs() < 1.0,
+        "the card's right padding is {CARD_PADDING}px plus its 1px border, so the \
+         rows it holds stop {padding}px short of its right edge: {add:?} vs {card:?}"
     );
     assert!(
-        (bottom_inset - 5.0).abs() < 1.0,
-        "and the same padding is under the row, so the card's last row is not flush \
-         with its bottom edge: {row:?} vs {card:?}"
+        (bottom_inset - padding).abs() < 1.0,
+        "and the same padding is under the last row: {add:?} vs {card:?}"
+    );
+    assert!(
+        (right_inset - bottom_inset).abs() < 0.5,
+        "the space under the last row and the space beside it are one number, so the \
+         card reads as evenly padded: {bottom_inset}px under against {right_inset}px \
+         beside, {add:?} vs {card:?}"
     );
 }
 
-/// Two cards are separated by the row gap, and the row gap is 4px.
+/// Two cards are one card-padding apart, and the panel's own margin is the same
+/// number.
 ///
-/// The number is stated rather than read from a constant because it is the thing
-/// this change fixes: the panel used to be a flat list of rows with a 2px gap, so
-/// a change that left the gap alone would still draw a plausible column of cards
-/// and has to fail here. The tolerance is half a pixel, which is what a 4px gap
-/// needs to survive snapping to the device pixel grid; every other value the code
-/// could plausibly carry is more than that away — 2px was the old flat list's, and
-/// 5px, 6px and 8px are all further from 4 than half a pixel.
+/// The property is that the space between two cards equals the space a card holds its
+/// own content by — the two margins the eye compares when it decides whether the
+/// column looks evenly spaced. Stating 8.0 alone would not say that: the two numbers
+/// could both move and stay wrong relative to each other, which is exactly what they
+/// were (a 4px gap between cards, an 8px panel margin).
+///
+/// The second assertion is what pins the value: the panel is inset from the window by
+/// its padding, and the first card starts there — so the margin beside a card and the
+/// gap under it are read off the same frame.
 #[gpui_kit::test]
-fn cards_should_be_separated_by_the_row_gap(cx: &mut TestAppContext) {
+fn cards_should_be_separated_by_the_card_padding(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
     let window = draw(cx, &panel);
     fold_all_but(window, &panel, &[IndicatorId::Ma, IndicatorId::Ema]);
@@ -1384,9 +1476,23 @@ fn cards_should_be_separated_by_the_row_gap(cx: &mut TestAppContext) {
 
     let gap = (ema.top() - ma.bottom()).as_f32();
     assert!(
-        (gap - 4.0).abs() < 0.5,
-        "two adjacent cards are one row gap apart, and the gap is 4px: a 2px gap \
-         was the old flat list's and must be gone (gap {gap}px, {ma:?} vs {ema:?})"
+        (gap - CARD_PADDING).abs() < 0.5,
+        "two adjacent cards are one card padding apart, {CARD_PADDING}px: the gap used \
+         to be 4px while the padding was 8px, and the column read as uneven (gap \
+         {gap}px, {ma:?} vs {ema:?})"
+    );
+    // The panel is the box the column is drawn in, and the cards are inset from its
+    // left edge by the panel's own padding. Reading both off one frame is what makes
+    // "the gap between cards equals the panel's margin" a measurement.
+    let panel_bounds = window
+        .debug_bounds("TEST_CANDLESTICK_INDICATOR_PANEL")
+        .expect("the panel is drawn");
+    let margin = (ma.left() - panel_bounds.left()).as_f32();
+    assert!(
+        (margin - gap).abs() < 0.5,
+        "the panel's margin and the gap between two cards are one number, so the \
+         column reads evenly spaced: {margin}px margin against {gap}px gap, \
+         {panel_bounds:?} vs {ma:?}"
     );
 }
 
@@ -1749,19 +1855,24 @@ fn a_hovered_card_should_paint_its_wash(cx: &mut TestAppContext) {
 /// The arrow sits halfway between the card's left border and the square the
 /// checkbox draws, whichever of those two a reader takes for the box's edge.
 ///
-/// This is the alignment the user asked for after seeing the panel, and it is not
-/// where the arrow started: centring it in its own 16px slot put its centre 8px
-/// from the slot's left edge, which is 21 in the window and visibly left of the
-/// midpoint. What is measured is the glyph, not the slot — a caret inset inside a
-/// fixed-size slot moves the glyph and leaves the slot exactly where it was, so the
-/// slot's box cannot answer this question.
+/// What is measured is the glyph, not the slot: a caret inset inside a fixed-size
+/// slot moves the glyph and leaves the slot exactly where it was, so the slot's box
+/// cannot answer this question.
 ///
-/// The two endpoints are the card's own left border (8) and the checkbox's left
-/// edge (33, which is where the square's *box* starts); the midpoint is 20.5. The
-/// square inside the checkbox is 4px further in, at 37, and the midpoint of the
-/// span the eye reads is 22.5 — the number the arrow is actually placed at. Both
-/// are checked, the second one tightly, because a change that moved the arrow back
-/// to the slot's centre would fail it by 1.5px.
+/// The arithmetic at the panel's current padding: the card's outer left edge is 8,
+/// one border and 8px of padding put the node row at 17, and the 16px caret slot
+/// spans 17 to 33 with the 12px glyph centred at 25. The checkbox's box starts four
+/// pixels after the slot at 37, and its square four pixels into that at 41. Halfway
+/// between 8 and 41 is 24.5, so the arrow's own centring is half a pixel off the
+/// midpoint — below what a device pixel grid can even resolve.
+///
+/// That is why the tolerance is a whole pixel and why the panel no longer insets the
+/// slot: at the old 4px padding the same centring put the arrow 1.5px left of the
+/// midpoint, which is visible, and a 3px inset was what corrected it. The padding
+/// doubling moved both endpoints and left centring sufficient, so the correction went
+/// with the padding rather than staying as a number nothing explained. The tolerance
+/// still catches both of those states: re-adding the 3px inset puts the arrow 2.5px
+/// off, and returning to 4px padding puts it 1.5px off.
 #[gpui_kit::test]
 fn the_caret_should_sit_between_the_cards_edge_and_the_checkbox(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -1787,9 +1898,10 @@ fn the_caret_should_sit_between_the_cards_edge_and_the_checkbox(cx: &mut TestApp
     let square_left = toggle.left().as_f32() + UnifiedSize::Small.px().as_f32();
     let between_lines = (card.left().as_f32() + square_left) / 2.0;
     assert!(
-        (centre - between_lines).abs() < 0.5,
+        (centre - between_lines).abs() <= 1.0,
         "the arrow is centred at {centre}, and halfway between the card's left \
-         edge and the square the checkbox draws is {between_lines}"
+         edge and the square the checkbox draws is {between_lines}: a pixel is the \
+         most this may be off, and the slot's own centring is half of one"
     );
 
     // The checkbox draws 4px of its own padding before the square, and the square

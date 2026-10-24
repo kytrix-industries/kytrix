@@ -30,8 +30,8 @@ use base_ui::{
     tooltip::{Tooltip, TooltipExt},
 };
 use gpui_kit::{
-    AnyElement, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Role, SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Placement, div, hsla,
+    AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Placement, div,
     prelude::FluentBuilder, px,
 };
 use i18n::t;
@@ -54,30 +54,10 @@ const SETTING_ROW_HEIGHT: f32 = 32.0;
 const HINT_ROW_HEIGHT: f32 = 18.0;
 /// How far the hint is inset past the control it explains.
 const HINT_INSET: f32 = 4.0;
-/// The height of the row holding the "+" button.
-const ADD_ROW_HEIGHT: f32 = 28.0;
 /// The gap between the caret and the checkbox that enables an indicator.
 const NODE_GAP: f32 = 4.0;
 /// The size of the caret that opens and folds an indicator's settings.
 const CARET_SIZE: f32 = 16.0;
-/// How far the arrow sits from the left edge of the slot that holds it.
-///
-/// The arrow is centred between the two lines the eye reads around it rather than
-/// between the row's own edges: the card's border on its left, and the square
-/// inside the checkbox on its right.
-///
-/// In the panel's coordinates the card's border is at 8 and the row it draws starts
-/// at 13, one border and one padding later. The checkbox starts four pixels after
-/// the 16px slot — 33 — and draws four pixels of its own padding before its square,
-/// so the square's line is at 37. Halfway between 8 and 37 is 22.5, which is where
-/// the arrow has to be. The slot spans 13 to 29, so a 12px glyph centred in it would
-/// sit at 21: three pixels short. Insetting the slot on its left by three leaves 13
-/// pixels for the glyph to centre in, which puts its centre at 13 + 3 + 6.5 = 22.5.
-///
-/// A padding rather than a width: `.size()` is the outer box, so the slot keeps its
-/// 16px and the toggle after it does not move. Aligning the arrow must not shift the
-/// checkbox the rest of the row is measured against.
-const CARET_INSET: f32 = 3.0;
 /// The padding an indicator's checkbox draws inside its own box, before its square.
 ///
 /// `UnifiedSize::Small`'s `px()`, written as a number because a `const` cannot call
@@ -99,14 +79,6 @@ pub(super) const CHECKBOX_PADDING: f32 = 4.0;
 /// checkbox's line" a measurement rather than a description. A literal 24.0 in the
 /// test would pin the number instead of the row that places its children by it.
 pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP + CHECKBOX_PADDING;
-/// [`SETTING_INSET`] for a row that draws the frame marking a field in error.
-///
-/// One pixel less, because that frame is part of the box the padding is measured
-/// from: a period row and a line row both draw it, and their padding is what is
-/// left of the inset once the frame has taken its pixel. Stating both is what keeps
-/// the first control of every kind of settings row on one vertical line, whatever
-/// each row draws around itself.
-pub(super) const FRAMED_INSET: f32 = SETTING_INSET - 1.0;
 /// How far a settings row insets a checkbox, whose visible edge is its square.
 ///
 /// A checkbox draws [`CHECKBOX_PADDING`] of its own before the square, so putting
@@ -177,10 +149,6 @@ pub(super) fn node_row(
             .items_center()
             .justify_center()
             .size(px(CARET_SIZE))
-            // Inside the slot, so the checkbox beside it does not move. The slot
-            // keeps its 16px and the glyph centres itself in what is left, which is
-            // what puts the arrow where the eye reads the row's centre.
-            .pl(px(CARET_INSET))
             .child(
                 div()
                     .debug_selector(move || caret_glyph_selector(id, icon))
@@ -243,6 +211,13 @@ pub(super) fn node_row(
 
 /// One `Period` row: its label on the left, its field on the right, and the hint
 /// under it while the field does not hold a period.
+///
+/// The error frame is drawn over the row rather than declared as its border. A border
+/// is part of the box the row lays its children out in, so a row that carried one
+/// would hold its controls a pixel further in than a row without one — and its last
+/// control would stop a pixel short of the card's padding however the padding was
+/// stated. An absolutely positioned overlay takes no space in the layout, so a row's
+/// controls sit at the same inset whether or not the field is in error.
 pub(super) fn period_row(
     row_index: usize,
     row: &SettingRow,
@@ -258,16 +233,13 @@ pub(super) fn period_row(
         .flex_col()
         .child(
             div()
+                .relative()
                 .h(px(SETTING_ROW_HEIGHT))
                 .flex()
                 .items_center()
                 .gap_2()
-                // The frame this row draws is part of the inset, so the padding is
-                // what is left of it: the label lands on the checkbox's line either
-                // way, whether or not the row is in error.
-                .pl(px(FRAMED_INSET))
-                .border_1()
-                .border_color(border_color(invalid, cx))
+                .pl(px(SETTING_INSET))
+                .when(invalid, |row| row.child(error_frame(cx)))
                 .child(
                     div()
                         .debug_selector(move || label_selector)
@@ -344,10 +316,11 @@ pub(super) fn switch_row(
 
 /// One line list: a row per line, and the button that adds another.
 ///
-/// The rows are returned separately so the card can draw them in order after the
-/// node row; the "+" button comes last, which is what "at the bottom of the list"
-/// means here. Only an expanded indicator draws a line list at all, so the button
-/// needs no visibility of its own.
+/// The whole list is one element so that the "+" button is a row of the same column
+/// as the lines it grows: the column's `gap` is what separates two lines, and a button
+/// outside the column would be separated by whatever the card put between its children
+/// — nothing, which reads as the button belonging to the last line. Only an expanded
+/// indicator draws a line list at all, so the button needs no visibility of its own.
 pub(super) fn line_list(
     index: usize,
     id: IndicatorId,
@@ -358,9 +331,9 @@ pub(super) fn line_list(
     invalid: Option<InputKey>,
     panel: &WeakEntity<IndicatorPanel>,
     cx: &App,
-) -> Vec<AnyElement> {
+) -> Option<AnyElement> {
     let SettingControl::LineList { min_rows } = row.control else {
-        return Vec::new();
+        return None;
     };
     let can_remove = can_remove_line(min_rows, lines.rows.len());
     let mut column = div()
@@ -405,10 +378,14 @@ pub(super) fn line_list(
         ));
     }
 
-    vec![
-        column.into_any_element(),
-        add_line_row(index, id, panel, cx),
-    ]
+    // The "+" row is the column's last child rather than a sibling of it: the gap it
+    // is separated from the last line by must be the gap between two lines, and only
+    // a child of this container is placed by its `gap`.
+    Some(
+        column
+            .child(add_line_row(index, id, panel, cx))
+            .into_any_element(),
+    )
 }
 
 /// One line of a line list: its period field, the picker that sets its colour,
@@ -449,15 +426,13 @@ fn line_row(
         .child(
             div()
                 .debug_selector(move || row_selector)
+                .relative()
                 .h(px(SETTING_ROW_HEIGHT))
                 .flex()
                 .items_center()
                 .gap_2()
-                // The same inset a period row uses, and for the same reason: this
-                // row draws the frame too, so its padding is what is left of it.
-                .pl(px(FRAMED_INSET))
-                .border_1()
-                .border_color(border_color(invalid, cx))
+                .pl(px(SETTING_INSET))
+                .when(invalid, |row| row.child(error_frame(cx)))
                 .child(
                     div()
                         .debug_selector(move || field_selector)
@@ -481,7 +456,12 @@ fn line_row(
                             input.slot,
                         ))
                         .debug_selector(move || delete_selector)
-                        .ghost()
+                        // An outlined control rather than a bare glyph: this is the
+                        // one row control that destroys something, and a ghost
+                        // button drew nothing until the pointer found it. The edge
+                        // says where the target is, so the trash icon reads as a
+                        // button on every line rather than as decoration.
+                        .outline()
                         .small()
                         .w(px(DELETE_BUTTON_WIDTH))
                         .aria_label(remove.clone())
@@ -505,6 +485,11 @@ fn line_row(
 /// The caption is centred rather than left at the button's 4px padding: the
 /// button spans the whole row, so a caption at its left edge reads like a field
 /// label instead of the action that adds a line.
+///
+/// The row takes its height from the button rather than stating one: the inset the
+/// card holds its last row by is the button's own bottom edge, so a row taller than
+/// the button would leave that edge higher than every other control's, and the
+/// padding under the list would read as larger than the padding beside it.
 fn add_line_row(
     index: usize,
     id: IndicatorId,
@@ -517,7 +502,6 @@ fn add_line_row(
     div()
         .debug_selector(|| "TEST_PANEL_ADD_LINE".into())
         .w_full()
-        .h(px(ADD_ROW_HEIGHT))
         // The button draws its own outline from its outer edge, so the row's inset is
         // the whole of it: the button's frame lands on the line the labels and the
         // checkbox's square are on, and the list it grows is read as one column.
@@ -596,8 +580,7 @@ fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> 
 /// The hint under a field whose text is not a period it may take.
 ///
 /// It starts [`HINT_INSET`] past the label it explains, which is the row's first
-/// control and therefore begins at [`SETTING_INSET`] from the row's edge — the
-/// frame the row may also draw is already accounted for in that line.
+/// control and therefore begins at [`SETTING_INSET`] from the row's edge.
 fn invalid_hint(cx: &App) -> AnyElement {
     div()
         .debug_selector(|| "TEST_PANEL_INVALID_PERIOD".into())
@@ -609,15 +592,20 @@ fn invalid_hint(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The border of a row that holds a period: the error role while the text is
-/// not a period, and a fully transparent line otherwise so that the row does not
-/// move when the frame appears.
-fn border_color(invalid: bool, cx: &App) -> Hsla {
-    if invalid {
-        cx.theme().roles.status.danger.base.hsla
-    } else {
-        hsla(0.0, 0.0, 0.0, 0.0)
-    }
+/// The frame marking a field in error, drawn over the row it belongs to.
+///
+/// An overlay rather than the row's own border: a border is laid out, so a row
+/// carrying one would hold its controls a pixel further in than a row without one.
+/// `inset_0` pins it to the row's edges, and being absolutely positioned it takes no
+/// space in the row's layout — which is what keeps the last control's right edge on
+/// the card's padding whether or not this frame is drawn.
+fn error_frame(cx: &App) -> AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .border_1()
+        .border_color(cx.theme().roles.status.danger.base.hsla)
+        .into_any_element()
 }
 
 /// The element id of one indicator's card.

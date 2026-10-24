@@ -45,28 +45,42 @@ use crate::{
 /// The width the panel takes out of the pane body.
 ///
 /// Fixed rather than draggable, and the budget is counted from the widest thing in
-/// it: a line row. The panel's own [`PANEL_PADDING`] leaves 244, a card's 1px
-/// border and [`CARD_PADDING`] leave 234 inside it, and the line row's own 1px
-/// frame plus [`rows::SETTING_INSET`] leave 208. The row's controls take 104 of
-/// those — a 60px period field, a 20px colour picker and a 24px delete button — and
-/// the three 8px gaps between them take 24, so the spacer that holds the controls
-/// at the right edge still has 80 to give. A pane narrower than this presses the
-/// chart down to its own minimum plot width and the body clips the panel's right
-/// edge — the panel's visibility is decided by whether it is open, not by how wide
-/// the pane is, because `Render` cannot measure the box it is drawn in.
+/// it: a line row. The panel's own [`PANEL_PADDING`] takes 16, a card's 1px border and
+/// [`CARD_PADDING`] take 18 more, and [`rows::SETTING_INSET`] takes 24 inside the row,
+/// which leaves 202 for the row's content. The controls take 104 of those — a 60px
+/// period field, a 20px colour picker and a 24px delete button — and the three 8px gaps
+/// between them take 24, so the spacer that holds the controls at the right edge still
+/// has 74 to give. A pane narrower than this presses the chart down to its own minimum
+/// plot width and the body clips the panel's right edge — the panel's visibility is
+/// decided by whether it is open, not by how wide the pane is, because `Render` cannot
+/// measure the box it is drawn in.
 pub(crate) const PANEL_WIDTH: f32 = 260.0;
 
 /// The padding around the panel's rows.
+///
+/// It is also the margin a card has on every side: the column is inset by this, and
+/// the gap the column puts between two cards is [`ROW_GAP`], which is stated as the
+/// same number. A card inset by less than the gap beside it reads as if the gap were
+/// the card's margin and the padding something else — which is what the panel looked
+/// like while the two numbers were 4 and 8.
 const PANEL_PADDING: f32 = 8.0;
+/// The padding inside one indicator's card, on all four sides.
+///
+/// The same number as [`PANEL_PADDING`]: what the eye compares is a card's own inset
+/// to the space around it, and a card that held its content 4px from its edge while
+/// the next card began 8px below it looked like two different margins.
+pub(super) const CARD_PADDING: f32 = PANEL_PADDING;
 /// The gap between two cards, and between a section heading and the first card
 /// under it.
 ///
 /// One gap for both: the column is one flex container whose `gap` places the
 /// headings and the cards alike, so the space above a group of cards is the space
 /// between them.
-const ROW_GAP: f32 = 4.0;
-/// The padding inside one indicator's card, on all four sides.
-const CARD_PADDING: f32 = 4.0;
+///
+/// The same number as [`CARD_PADDING`]: the gap between two cards and the inset each
+/// card holds its content by are one measure, so no two neighbours in the panel look
+/// further apart than two others.
+const ROW_GAP: f32 = CARD_PADDING;
 
 /// The indicator settings panel.
 pub(crate) struct IndicatorPanel {
@@ -486,7 +500,7 @@ impl IndicatorPanel {
                         let Some(lines) = entry.settings.lines() else {
                             continue;
                         };
-                        settings.extend(rows::line_list(
+                        if let Some(list) = rows::line_list(
                             index,
                             definition.id,
                             row,
@@ -496,7 +510,9 @@ impl IndicatorPanel {
                             self.invalid,
                             panel,
                             cx,
-                        ));
+                        ) {
+                            settings.push(list);
+                        }
                     }
                     SettingControl::Period { .. } => {
                         let Some(input) = self.line_input(definition.id, None, row.key) else {
