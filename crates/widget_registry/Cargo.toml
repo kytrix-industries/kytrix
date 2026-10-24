@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 # Workspace members
 app_config = { workspace = true }
 candlestick = { workspace = true }
+crypto_fgi = { workspace = true }
 empty = { workspace = true }
 etf = { workspace = true }
 force_orders = { workspace = true }

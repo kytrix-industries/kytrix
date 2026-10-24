@@ -10836,6 +10836,7 @@ version = "0.0.2"
 dependencies = [
  "app_config",
  "candlestick",
+ "crypto_fgi",
  "empty",
  "etf",
  "force_orders",

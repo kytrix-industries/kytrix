@@ -27,6 +27,7 @@ pub fn install(cx: &mut App) -> Result<(), WidgetRegistryError> {
 fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
     [
         WidgetRegistration::for_view::<candlestick::view::CandlestickWidget>(),
+        WidgetRegistration::for_view::<crypto_fgi::view::CryptoFgiWidget>(),
         WidgetRegistration::for_view::<empty::view::EmptyWidget>(),
         WidgetRegistration::for_view::<etf::view::EtfWidget>(),
         WidgetRegistration::for_view::<force_orders::view::ForceOrdersWidget>(),
@@ -71,6 +72,7 @@ mod tests {
     use crate::registry::WidgetRegistry;
 
     const CANDLESTICK_ID: &str = "kytrix.market.candlestick";
+    const CRYPTO_FGI_ID: &str = "kytrix.market.crypto_fgi";
     const EMPTY_ID: &str = "kytrix.empty";
     const ETF_ID: &str = "kytrix.market.etf_flow";
     const FORCE_ORDERS_ID: &str = "kytrix.market.force_orders";
@@ -97,8 +99,9 @@ mod tests {
     /// group it is listed under. A widget the framework builds for itself is listed
     /// nowhere, so it is not in this table — the gallery's own tests cover the
     /// widget that is.
-    const CATEGORIES: [(&str, WidgetCategory); 18] = [
+    const CATEGORIES: [(&str, WidgetCategory); 19] = [
         (CANDLESTICK_ID, WidgetCategory::Market),
+        (CRYPTO_FGI_ID, WidgetCategory::Market),
         (ETF_ID, WidgetCategory::Market),
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
         (HYPERLIQUID_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
@@ -126,6 +129,7 @@ mod tests {
             let registry = cx.global::<WidgetRegistry>();
 
             assert!(registry.get(CANDLESTICK_ID).is_some());
+            assert!(registry.get(CRYPTO_FGI_ID).is_some());
             assert!(registry.get(EMPTY_ID).is_some());
             assert!(registry.get(ETF_ID).is_some());
             assert!(registry.get(FORCE_ORDERS_ID).is_some());
@@ -142,7 +146,7 @@ mod tests {
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");
             }
-            assert_eq!(registry.iter().count(), 19);
+            assert_eq!(registry.iter().count(), 20);
         });
     }
 
