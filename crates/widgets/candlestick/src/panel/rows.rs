@@ -566,9 +566,12 @@ pub(super) fn caret_icon(expanded: bool) -> IconKind {
 
 /// The picker of one colour setting, wrapped in its tooltip and its test selector.
 ///
-/// The tooltip is placed above its trigger because the picker opens its panel
-/// below it: a tooltip below would be covered by the very panel it explains the
-/// moment the user opens the picker.
+/// The tooltip is placed below its trigger, which is the direction the panel asks
+/// for. The picker's own panel opens downwards from the same control and covers the
+/// tooltip when it does; that is intended — the panel is what the user is working in,
+/// and the caption has already done its job by the time it is open. Opening the panel
+/// also takes the pointer off the trigger, so in practice the tooltip is gone before
+/// the panel has finished appearing.
 fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> AnyElement {
     div()
         .debug_selector(move || selector)
@@ -581,7 +584,7 @@ fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> 
                 ),
                 picker.entity().clone(),
             )
-            .placement(Placement::Top)
+            .placement(Placement::Bottom)
             .content(label),
         )
         .into_any_element()
