@@ -93,8 +93,6 @@ const CHECKBOX_INSET: f32 = SETTING_INSET - CHECKBOX_PADDING;
 /// against the width the row gives it, so the number is stated once, beside the
 /// row that applies it.
 pub(super) const PERIOD_FIELD_WIDTH: f32 = 60.0;
-/// The width of a row's delete button.
-const DELETE_BUTTON_WIDTH: f32 = 24.0;
 
 /// A section heading: "Main chart" or "Sub chart".
 ///
@@ -463,7 +461,6 @@ fn line_row(
                         // button on every line rather than as decoration.
                         .outline()
                         .small()
-                        .w(px(DELETE_BUTTON_WIDTH))
                         .aria_label(remove.clone())
                         .with_tooltip(remove)
                         .on_click(move |_, _, cx| {
@@ -471,14 +468,14 @@ fn line_row(
                                 panel.remove_line(id, line_index, cx);
                             });
                         })
-                        // The button centres its children on both axes. The
-                        // `Interactive` inside draws `.flex().items_center()`, which
-                        // centres across the row and leaves the main axis at `start`:
-                        // a 24px button holds a 14px content box — 24 less two
-                        // borders and two 4px paddings — so a 12px icon would sit one
-                        // pixel left of the centre and the gap on its right would be
-                        // the only thing the eye could not call padding.
-                        .justify_center()
+                        // No stated width, and no centring: the button is exactly as
+                        // wide as the glyph it draws, so its two paddings are its whole
+                        // frame and the icon has nowhere to sit but the middle. An
+                        // earlier `.w(24px)` made the box 2px wider than the icon and
+                        // the extra pixel landed on one side, which read as the glyph
+                        // being nudged left. That width is gone rather than compensated
+                        // for; a centring call here would only be needed again if
+                        // something made the box wider than its content.
                         .child(
                             div()
                                 .debug_selector(move || delete_icon_selector(id, line_index))

@@ -47,13 +47,15 @@ use crate::{
 /// Fixed rather than draggable, and the budget is counted from the widest thing in
 /// it: a line row. The panel's own [`PANEL_PADDING`] takes 16, a card's 1px border and
 /// [`CARD_PADDING`] take 18 more, and [`rows::SETTING_INSET`] takes 24 inside the row,
-/// which leaves 202 for the row's content. The controls take 104 of those — a 60px
-/// period field, a 20px colour picker and a 24px delete button — and the three 8px gaps
+/// which leaves 202 for the row's content. The controls take 102 of those — a 60px
+/// period field, a 20px colour picker and a 22px delete button — and the three 8px gaps
 /// between them take 24, so the spacer that holds the controls at the right edge still
-/// has 74 to give. A pane narrower than this presses the chart down to its own minimum
-/// plot width and the body clips the panel's right edge — the panel's visibility is
-/// decided by whether it is open, not by how wide the pane is, because `Render` cannot
-/// measure the box it is drawn in.
+/// has 76 to give. The delete button's 22 rather than a stated width is the icon's 12
+/// plus its own two 4px paddings and 1px borders: the button is as wide as what it
+/// draws, so the number tracks the size it is given. A pane narrower than this presses
+/// the chart down to its own minimum plot width and the body clips the panel's right
+/// edge — the panel's visibility is decided by whether it is open, not by how wide the
+/// pane is, because `Render` cannot measure the box it is drawn in.
 pub(crate) const PANEL_WIDTH: f32 = 260.0;
 
 /// The padding around the panel's rows.

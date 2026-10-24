@@ -470,17 +470,18 @@ fn the_delete_button_should_be_drawn_as_an_outline(cx: &mut TestAppContext) {
 
 /// The trash glyph is centred in the button on both axes.
 ///
-/// This was wrong and looked it: `base_ui`'s `Interactive` draws
-/// `.flex().items_center()`, which centres across the row and leaves the main axis at
-/// its `start` default. A 24px button holds a 14px content box — two 1px borders and two
-/// 4px paddings taken off — so a 12px icon was placed at the left of those 14 and the
-/// remaining 2px sat on its right: one pixel off centre, which the eye reads as the
-/// glyph being nudged left rather than as padding. The fix is the button's own
-/// `justify_center()`, and this is what says it stays there.
+/// This was wrong and looked it: the button carried a stated `.w(24px)`, so its box was
+/// 2px wider than the 12px glyph it draws — the remaining space being two 1px borders
+/// and two 4px paddings — and `base_ui`'s `Interactive` places children with
+/// `.flex().items_center()`, which centres across the row while leaving the main axis at
+/// its `start` default. The 2px of slack therefore sat entirely on the glyph's right,
+/// one pixel of it off centre, which the eye reads as the glyph being nudged left.
 ///
-/// A whole pixel of tolerance, because that is the size of the error: the glyph is 12px
-/// and the free space is 2, so the two states are exactly 1px apart and a tighter bound
-/// would fail on device-pixel snapping alone.
+/// The width is gone: the button is now as wide as what it draws and has no slack to
+/// misplace. This test is what says so — and it is the width that had to go, not the
+/// centring that had to be compensated for. A `.justify_center()` was added here first
+/// and then removed once the width was gone, because with no slack it could no longer
+/// change anything; it would have been a line that looked load-bearing and was not.
 #[gpui_kit::test]
 fn the_delete_icon_should_be_centred_in_its_button(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -504,12 +505,21 @@ fn the_delete_icon_should_be_centred_in_its_button(cx: &mut TestAppContext) {
     assert!(
         off_x.abs() < 0.5,
         "the glyph is centred in the button across the row: its centre is {off_x}px from \
-         the button's, and that space is 2px of slack over a 12px glyph so leaving the \
-         main axis at `start` puts it exactly 1px left ({icon:?} vs {button:?})"
+         the button's. The button states no width, so its content box is the glyph's own \
+         12px and there is no slack for the `start` default to leave on one side \
+         ({icon:?} vs {button:?})"
     );
     assert!(
         off_y.abs() < 0.5,
         "and on the other axis too: {off_y}px off centre ({icon:?} vs {button:?})"
+    );
+    // The button is its content plus its own frame: nothing may put the 24px back
+    // without also giving the slack a side to land on.
+    assert_eq!(
+        button.size.width,
+        px(22.0),
+        "the delete button is the 12px glyph plus two 4px paddings and two 1px borders, \
+         and no stated width: {button:?}"
     );
 }
 
