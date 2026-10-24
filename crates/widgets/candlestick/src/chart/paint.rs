@@ -957,11 +957,11 @@ fn paint_chart(
             painter.window,
         )
     };
-    let legend = main_indicator_legend(indicators, absolute, price_tick);
-    if !legend.is_empty() {
+    let legend_rows = main_indicator_legend(indicators, absolute, price_tick);
+    if !legend_rows.is_empty() {
         // Below the readout, which is drawn on every frame and therefore never
         // gives the first row back.
-        painter.paint_legend(&legend, layout.price_plot, MAIN_LEGEND_TOP);
+        painter.paint_legend_rows(&legend_rows, layout.price_plot, MAIN_LEGEND_TOP);
     }
     let axis_color = painter.context.theme().components.chart.axis.hsla;
     for (index, prepared_sub_plot) in visible.sub_plots.iter().enumerate() {
@@ -1095,6 +1095,36 @@ impl ChartPainter<'_> {
     /// the main-chart legend below the readout while a sub plot's legend — whose
     /// plot has no readout — keeps the first row.
     fn paint_legend(&mut self, entries: &[LegendEntry], plot: Bounds<Pixels>, top: f32) {
+        self.paint_legend_row(entries, plot, top);
+    }
+
+    /// Draws several legend rows, one text row apart, each starting at the plot's
+    /// left edge.
+    ///
+    /// This is the main-chart legend, which has one row per indicator. The rows line
+    /// up on that left edge rather than continuing where the row above ended: a row
+    /// that began under the previous row's last entry would shift every time a value
+    /// grew a digit. An empty row is skipped without taking a row of its own, so the
+    /// rows close up rather than leaving a gap where an indicator had nothing to say.
+    fn paint_legend_rows(&mut self, rows: &[Vec<LegendEntry>], plot: Bounds<Pixels>, top: f32) {
+        let mut row_top = top;
+        for entries in rows {
+            if entries.is_empty() {
+                continue;
+            }
+            self.paint_legend_row(entries, plot, row_top);
+            row_top += TEXT_ROW_HEIGHT;
+        }
+    }
+
+    /// Paints one row's entries left to right, and records the row the test recorder
+    /// reads back.
+    ///
+    /// One function rather than a drawing one and a recording one: the recorder has
+    /// to see the same slice the glyphs came from, and the mask the row was actually
+    /// clipped to. An empty slice paints nothing and logs nothing, which is what makes
+    /// "a frame with no legend logs no legend row" measurable.
+    fn paint_legend_row(&mut self, entries: &[LegendEntry], plot: Bounds<Pixels>, top: f32) {
         let mut x = plot.origin.x + px(TEXT_ROW_INSET);
         let y = plot.origin.y + px(top);
         let ChartPainter {
@@ -1705,21 +1735,29 @@ struct LegendEntry {
     color: Hsla,
 }
 
-/// The main-chart legend entries for the candle at `absolute`.
+/// The main-chart legend, one row per indicator, for the candle at `absolute`.
 ///
-/// A line contributes an entry only once the candle is past its own
-/// `readable_from` threshold: the value is defined earlier for EMA and MACD, but
-/// it is not yet trustworthy.
+/// One row per indicator rather than one row for all of them: MA's three lines and
+/// EMA's one are two different formulas, and run together in a single row the values
+/// give the eye no border between them — the numbers read as one series' worth. The
+/// outer vector is the rows, in catalogue order, and each row holds that indicator's
+/// own lines.
+///
+/// A line contributes an entry only once the candle is past its own `readable_from`
+/// threshold: the value is defined earlier for EMA and MACD, but it is not yet
+/// trustworthy. An indicator with no readable line contributes no row at all, so the
+/// rows close up instead of leaving a blank one.
 fn main_indicator_legend(
     indicators: &[IndicatorSeries],
     absolute: usize,
     price_tick: Tick,
-) -> Vec<LegendEntry> {
-    let mut entries = Vec::new();
+) -> Vec<Vec<LegendEntry>> {
+    let mut rows = Vec::new();
     for series in indicators {
         if definition_of(series.id).pane != IndicatorPane::Main {
             continue;
         }
+        let mut row = Vec::new();
         for line in &series.lines {
             if absolute < line.readable_from {
                 continue;
@@ -1727,13 +1765,16 @@ fn main_indicator_legend(
             let Some(value) = line.values.get(absolute).copied().flatten() else {
                 continue;
             };
-            entries.push(LegendEntry {
+            row.push(LegendEntry {
                 text: format_smolstr!("{} {}", line.label, format_price(value, price_tick)),
                 color: line.color,
             });
         }
+        if !row.is_empty() {
+            rows.push(row);
+        }
     }
-    entries
+    rows
 }
 
 /// The legend entries of one sub plot for the candle at `absolute`.
@@ -4157,6 +4198,71 @@ mod tests {
         );
     }
 
+    /// MA and EMA draw one legend row each, not one row between them.
+    ///
+    /// The two are different formulas, and run together on one row their values read
+    /// as a single series' worth of numbers: `MA5 … MA10 … MA20 … EMA12 …` gives the
+    /// eye no border between where MA ends and EMA begins. So each indicator takes a
+    /// row of its own, and the rows are one text row apart.
+    ///
+    /// This is measured on the frame rather than on `main_indicator_legend` alone: the
+    /// grouping is the function's job but the two rows appearing on the frame is the
+    /// painter's, and a painter that flattened the rows again would leave a test on the
+    /// function green.
+    #[gpui_kit::test]
+    fn indicators_of_different_kinds_should_take_a_legend_row_each(cx: &mut TestAppContext) {
+        let mut both = CandlestickIndicatorConfig::default();
+        for id in [IndicatorId::Ma, IndicatorId::Ema] {
+            both.entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .expect("the catalogue declares MA and EMA")
+                .enabled = true;
+        }
+        let frame = painted_frame(
+            cx,
+            snapshot_with_candles(120),
+            ChartViewport::default(),
+            both,
+        );
+
+        let price_plot = frame.layout.price_plot;
+        let rows: Vec<&PaintedRow> = frame
+            .rows_of(TextRow::Legend)
+            .into_iter()
+            .filter(|row| row.plot == price_plot)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "MA and EMA are two kinds, so there are two legend rows on the price plot: \
+             {:?}",
+            frame.log.rows
+        );
+        // MA first, because the catalogue's order is the legend's order.
+        assert!(
+            rows[0].text.contains("MA5"),
+            "the first row is MA's: {:?}",
+            rows[0].text
+        );
+        assert!(
+            !rows[0].text.contains("EMA"),
+            "and EMA is not on it: {:?}",
+            rows[0].text
+        );
+        assert!(
+            rows[1].text.contains("EMA"),
+            "EMA has a row of its own: {:?}",
+            rows[1].text
+        );
+        assert_eq!(
+            (rows[1].top - rows[0].top).as_f32(),
+            TEXT_ROW_HEIGHT,
+            "the second row is one text row below the first, so the rows read as a \
+             column rather than as a list drawn twice"
+        );
+    }
+
     /// `paint_legend` draws nothing and logs nothing for an empty entry slice, and
     /// logs the row as soon as one entry is painted.
     ///
@@ -4802,9 +4908,10 @@ mod tests {
             "a candle below readable_from has no trustworthy value"
         );
         series[0].lines[0].readable_from = absolute;
-        let entries = main_indicator_legend(&series, absolute, tick);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "MA5 123.45");
+        let rows = main_indicator_legend(&series, absolute, tick);
+        assert_eq!(rows.len(), 1, "one indicator, one row");
+        assert_eq!(rows[0].len(), 1, "that indicator has one readable line");
+        assert_eq!(rows[0][0].text, "MA5 123.45");
     }
 
     /// The readout is drawn whether or not the pointer is over the chart, so its
@@ -5627,10 +5734,11 @@ mod tests {
             }],
             Vec::new(),
         )];
-        let entries = main_indicator_legend(&main, 0, tick);
-        assert_eq!(entries.len(), 1);
+        let rows = main_indicator_legend(&main, 0, tick);
+        assert_eq!(rows.len(), 1, "one indicator, one row");
+        assert_eq!(rows[0].len(), 1, "one line, one entry");
         assert_eq!(
-            entries[0].color, main_color,
+            rows[0][0].color, main_color,
             "the main legend shows the line's own colour"
         );
 
