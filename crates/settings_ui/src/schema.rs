@@ -506,6 +506,16 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
             X_MEDIA,
         )],
     ));
+    sections.push(SectionDef::fields(
+        Some(text("settings_ui.proxies.public_feeds_section")),
+        true,
+        vec![proxy_targets_field(
+            "proxy-applications.public-feeds.pizza-index",
+            "settings_ui.proxies.pizza_index_group",
+            &["pizza", "pizzint", "pentagon", "osint", "披萨", "五角大楼"],
+            PUBLIC_FEEDS,
+        )],
+    ));
 
     sections
 }
@@ -1361,6 +1371,12 @@ const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
 }];
 
+/// The public feeds the application reads, which are grouped on their own because
+/// none of them is an account service and none of them carries credentials.
+const PUBLIC_FEEDS: &[ServiceTarget] = &[ServiceTarget::KytrixService {
+    capability: KytrixServiceCapability::PentagonPizzaIndex,
+}];
+
 /// The words one built field is searched by.
 ///
 /// Every word is already a static string — the identities and scope names a field is built from
@@ -2026,6 +2042,7 @@ pub(crate) mod tests {
             "proxy-applications.kytrix.cloud",
             "proxy-applications.kytrix.updates",
             "proxy-applications.x.media",
+            "proxy-applications.public-feeds.pizza-index",
         ] {
             let row = field(applications, id);
             assert!(

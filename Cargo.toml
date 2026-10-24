@@ -29,6 +29,7 @@ members = [
     "crates/widgets/news",
     "crates/widgets/order_book",
     "crates/widgets/perpetual_statistics",
+    "crates/widgets/pentagon_pizza_index",
     "crates/widgets/tweet_monitor",
     "crates/widgets/volume_heatmap",
     "crates/widgets/wallet_monitor",
@@ -137,6 +138,7 @@ network = { path = "crates/network" }
 news = { path = "crates/widgets/news" }
 order_book = { path = "crates/widgets/order_book" }
 perpetual_statistics = { path = "crates/widgets/perpetual_statistics" }
+pentagon_pizza_index = { path = "crates/widgets/pentagon_pizza_index" }
 profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
 tweet_monitor = { path = "crates/widgets/tweet_monitor" }

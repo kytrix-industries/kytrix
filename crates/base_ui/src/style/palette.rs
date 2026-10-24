@@ -29,20 +29,27 @@ pub enum Appearance {
     Dark,
 }
 
-/// The four status colors a palette authors.
+/// The five status colors a palette authors.
 ///
 /// They are told apart from the market colors on purpose: going up is not success and going down
 /// is not an error, so a change to one never moves the other.
+///
+/// The order of the ladder is `success → info → warning → elevated → danger`. Four colors were
+/// enough while a status was a verdict; a five-rung severity scale needs five, because `elevated`
+/// is the step between "a threshold is being approached" and "this failed" and collapsing it into
+/// either neighbour moves a reading by a whole rung.
 #[derive(Debug, Copy, Clone)]
 pub struct StatusPalette {
     /// Errors, failed actions and destructive controls.
     pub danger: Oklch,
-    /// A degraded connection, a threshold being approached.
+    /// A degraded connection, the warmest rung of the scale.
     pub warning: Oklch,
     /// A completed save, a healthy connection.
     pub success: Oklch,
-    /// A neutral notice.
+    /// A neutral notice, and the cool rung above normal.
     pub info: Oklch,
+    /// A step past `warning` and below `danger`: a reading that is no longer merely high.
+    pub elevated: Oklch,
 }
 
 /// The two market directions a palette authors.
@@ -120,6 +127,7 @@ impl Palette {
                 warning: Oklch::new(0.545, 0.116, 76.0, opacity),
                 success: Oklch::new(0.520, 0.124, 154.0, opacity),
                 info: Oklch::new(0.530, 0.104, 232.0, opacity),
+                elevated: Oklch::new(0.545, 0.148, 45.0, opacity),
             },
             market: MarketPalette {
                 up: Oklch::new(0.514, 0.128, 152.0, opacity),
@@ -167,6 +175,7 @@ impl Palette {
                 warning: Oklch::new(0.822, 0.150, 84.0, opacity),
                 success: Oklch::new(0.762, 0.150, 160.0, opacity),
                 info: Oklch::new(0.752, 0.118, 226.0, opacity),
+                elevated: Oklch::new(0.760, 0.150, 52.0, opacity),
             },
             market: MarketPalette {
                 up: Oklch::new(0.782, 0.158, 150.0, opacity),

@@ -32,6 +32,7 @@ enum BadgeColor {
     Info,
     Success,
     Warning,
+    Elevated,
     Error,
 }
 
@@ -111,6 +112,12 @@ impl Badge {
         self
     }
 
+    /// The rung between `warning` and `error`: a reading that is no longer merely high.
+    pub fn elevated(mut self) -> Self {
+        self.color = BadgeColor::Elevated;
+        self
+    }
+
     pub fn error(mut self) -> Self {
         self.color = BadgeColor::Error;
         self
@@ -141,9 +148,11 @@ impl RenderOnce for Badge {
         let roles = &cx.theme().roles;
         let shape = shape.unwrap_or(match color {
             BadgeColor::Neutral => BadgeShape::Solid,
-            BadgeColor::Info | BadgeColor::Success | BadgeColor::Warning | BadgeColor::Error => {
-                BadgeShape::Tonal
-            }
+            BadgeColor::Info
+            | BadgeColor::Success
+            | BadgeColor::Warning
+            | BadgeColor::Elevated
+            | BadgeColor::Error => BadgeShape::Tonal,
         });
 
         let (background, foreground, border) = match color {
@@ -151,6 +160,7 @@ impl RenderOnce for Badge {
             BadgeColor::Info => status_paints(roles, roles.status.info, shape),
             BadgeColor::Success => status_paints(roles, roles.status.success, shape),
             BadgeColor::Warning => status_paints(roles, roles.status.warning, shape),
+            BadgeColor::Elevated => status_paints(roles, roles.status.elevated, shape),
             BadgeColor::Error => status_paints(roles, roles.status.danger, shape),
         };
 
@@ -227,6 +237,7 @@ mod tests {
                 ("warning", roles.status.warning),
                 ("success", roles.status.success),
                 ("info", roles.status.info),
+                ("elevated", roles.status.elevated),
             ] {
                 let (background, foreground, _) = status_paints(&roles, status, BadgeShape::Solid);
                 let ratio = contrast(foreground, background);

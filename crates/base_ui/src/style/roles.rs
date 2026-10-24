@@ -101,7 +101,7 @@ pub struct StatusRole {
     pub border: ResolvedColor,
 }
 
-/// The four status colors.
+/// The five status colors.
 #[derive(Debug, Copy, Clone)]
 pub struct StatusRoles {
     /// Errors, failed actions, destructive controls.
@@ -112,6 +112,9 @@ pub struct StatusRoles {
     pub success: StatusRole,
     /// A neutral notice.
     pub info: StatusRole,
+    /// A reading past `warning` and below `danger`, with the tint and edge its chip is drawn
+    /// from.
+    pub elevated: StatusRole,
 }
 
 /// The market colors, kept apart from the status ones: up is not success and down is not an error.
@@ -245,27 +248,20 @@ impl Roles {
 
         let tint = |color: Oklch| tint(color, canvas, dark);
 
+        // One recipe for every rung of the ladder: the color itself, the chip fill mixed almost
+        // all the way into the page, and the edge between them.
+        let status_role = |color: Oklch| StatusRole {
+            base: resolve(color),
+            surface: resolve(tint(color)),
+            border: resolve(mix(color, canvas, 0.62)),
+        };
+
         let status = StatusRoles {
-            danger: StatusRole {
-                base: resolve(palette.status.danger),
-                surface: resolve(tint(palette.status.danger)),
-                border: resolve(mix(palette.status.danger, canvas, 0.62)),
-            },
-            warning: StatusRole {
-                base: resolve(palette.status.warning),
-                surface: resolve(tint(palette.status.warning)),
-                border: resolve(mix(palette.status.warning, canvas, 0.62)),
-            },
-            success: StatusRole {
-                base: resolve(palette.status.success),
-                surface: resolve(tint(palette.status.success)),
-                border: resolve(mix(palette.status.success, canvas, 0.62)),
-            },
-            info: StatusRole {
-                base: resolve(palette.status.info),
-                surface: resolve(tint(palette.status.info)),
-                border: resolve(mix(palette.status.info, canvas, 0.62)),
-            },
+            danger: status_role(palette.status.danger),
+            warning: status_role(palette.status.warning),
+            success: status_role(palette.status.success),
+            info: status_role(palette.status.info),
+            elevated: status_role(palette.status.elevated),
         };
 
         let market = MarketRoles {
@@ -326,8 +322,9 @@ impl Roles {
     /// forty-five entries are the document's model count for the two appearances: §7.8's pairs
     /// plus the overlay step §7.1 measures, with the overlay held to the raised surface's floor
     /// rather than to the 1.00 it cannot fail. The three series the chart gained for indicator
-    /// lines add three more floors, bringing the table to forty-eight entries.
-    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 48] {
+    /// lines add three more floors, and the fifth status color adds two (its fill and its chip
+    /// tint), bringing the table to fifty entries.
+    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 50] {
         [
             (
                 "fg.default on surface.canvas",
@@ -462,6 +459,12 @@ impl Roles {
                 4.5,
             ),
             (
+                "status.elevated on surface.canvas",
+                self.status.elevated.base,
+                self.surface.canvas,
+                4.5,
+            ),
+            (
                 "brand.base on surface.canvas",
                 self.brand.base,
                 self.surface.canvas,
@@ -507,6 +510,12 @@ impl Roles {
                 "status.info on status.info.surface",
                 self.status.info.base,
                 self.status.info.surface,
+                4.5,
+            ),
+            (
+                "status.elevated on status.elevated.surface",
+                self.status.elevated.base,
+                self.status.elevated.surface,
                 4.5,
             ),
             (
@@ -958,6 +967,9 @@ mod tests {
             ("status.info.base", roles.status.info.base),
             ("status.info.surface", roles.status.info.surface),
             ("status.info.border", roles.status.info.border),
+            ("status.elevated.base", roles.status.elevated.base),
+            ("status.elevated.surface", roles.status.elevated.surface),
+            ("status.elevated.border", roles.status.elevated.border),
             ("market.up", roles.market.up),
             ("market.down", roles.market.down),
             ("market.flat", roles.market.flat),

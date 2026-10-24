@@ -37,6 +37,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<market_trades::view::MarketTradesWidget>(),
         WidgetRegistration::for_view::<news::view::NewsWidget>(),
         WidgetRegistration::for_view::<order_book::view::OrderBookWidget>(),
+        WidgetRegistration::for_view::<pentagon_pizza_index::view::PentagonPizzaIndexWidget>(),
         WidgetRegistration::for_view::<
             perpetual_statistics::widget::open_interest::OpenInterestWidget,
         >(),
@@ -78,6 +79,7 @@ mod tests {
     const MARKET_TRADES_ID: &str = "kytrix.market.market_trades";
     const NEWS_ID: &str = "kytrix.market.news";
     const ORDER_BOOK_ID: &str = "kytrix.market.order_book";
+    const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.monitoring.pentagon_pizza_index";
     const TWEET_MONITOR_ID: &str = "kytrix.market.tweet_monitor";
     const VOLUME_HEAT_MAP_ID: &str = "kytrix.market.volume_heatmap";
     const WALLET_MONITOR_ID: &str = "kytrix.market.wallet_monitor";
@@ -95,7 +97,7 @@ mod tests {
     /// group it is listed under. A widget the framework builds for itself is listed
     /// nowhere, so it is not in this table — the gallery's own tests cover the
     /// widget that is.
-    const CATEGORIES: [(&str, WidgetCategory); 17] = [
+    const CATEGORIES: [(&str, WidgetCategory); 18] = [
         (CANDLESTICK_ID, WidgetCategory::Market),
         (ETF_ID, WidgetCategory::Market),
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
@@ -104,6 +106,7 @@ mod tests {
         (MARKET_TRADES_ID, WidgetCategory::Market),
         (NEWS_ID, WidgetCategory::Monitoring),
         (ORDER_BOOK_ID, WidgetCategory::Market),
+        (PENTAGON_PIZZA_INDEX_ID, WidgetCategory::Monitoring),
         (STATISTICS_IDS[0], WidgetCategory::Statistics),
         (STATISTICS_IDS[1], WidgetCategory::Statistics),
         (STATISTICS_IDS[2], WidgetCategory::Statistics),
@@ -131,6 +134,7 @@ mod tests {
             assert!(registry.get(MARKET_TRADES_ID).is_some());
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());
+            assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
             assert!(registry.get(TWEET_MONITOR_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
             assert!(registry.get(WALLET_MONITOR_ID).is_some());
@@ -138,7 +142,7 @@ mod tests {
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");
             }
-            assert_eq!(registry.iter().count(), 18);
+            assert_eq!(registry.iter().count(), 19);
         });
     }
 

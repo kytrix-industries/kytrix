@@ -22,6 +22,7 @@ market_trades = { workspace = true }
 news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }
+pentagon_pizza_index = { workspace = true }
 tweet_monitor = { workspace = true }
 volume_heatmap = { workspace = true }
 wallet_monitor = { workspace = true }
