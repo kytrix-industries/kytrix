@@ -35,6 +35,15 @@ pub enum KytrixServiceCapability {
     Wallet,
     #[serde(rename = "x_media")]
     XMedia,
+    /// The Pentagon Pizza Index, a public feed read from pizzint.watch.
+    ///
+    /// It is one of Kytrix's own outbound routes rather than a venue's: no market
+    /// participant publishes it, and it has no account, no session and no catalog of
+    /// its own. It is still a capability here because a reader behind a firewall has
+    /// to be able to send it down a line of its own, which is what every other
+    /// outbound address in the application can do.
+    #[serde(rename = "pentagon_pizza_index")]
+    PentagonPizzaIndex,
     #[serde(rename = "updater_metadata")]
     UpdaterMetadata,
     #[serde(rename = "updater_download")]

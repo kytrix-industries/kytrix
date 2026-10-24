@@ -6802,6 +6802,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "pentagon_pizza_index"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "log",
+ "network",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "url",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10802,6 +10827,7 @@ dependencies = [
  "market_trades",
  "news",
  "order_book",
+ "pentagon_pizza_index",
  "perpetual_statistics",
  "serde",
  "serde_json",

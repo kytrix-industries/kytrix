@@ -96,6 +96,7 @@ impl TestConfigManager {
             KytrixServiceCapability::X,
             KytrixServiceCapability::Wallet,
             KytrixServiceCapability::XMedia,
+            KytrixServiceCapability::PentagonPizzaIndex,
             KytrixServiceCapability::UpdaterMetadata,
             KytrixServiceCapability::UpdaterDownload,
         ]
