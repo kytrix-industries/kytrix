@@ -417,10 +417,6 @@ fn pressing_a_delete_button_should_remove_its_line(cx: &mut TestAppContext) {
 /// own quads over the button's box: an outlined control paints its edge in the theme's
 /// `line.border` role, while a ghost one paints a transparent border and only shows
 /// something under the pointer — which is the state this change was asked to leave.
-///
-/// The picker beside it is measured too. It is the same kind of control on the same
-/// row, and a delete button that changed variant without its neighbour keeping its own
-/// would leave the row with two different treatments of one edge.
 #[gpui_kit::test]
 fn the_delete_button_should_be_drawn_as_an_outline(cx: &mut TestAppContext) {
     let (_built, panel) = panel_over(cx);
@@ -469,6 +465,51 @@ fn the_delete_button_should_be_drawn_as_an_outline(cx: &mut TestAppContext) {
          {1:?}, and the button painted {painted:?}",
         border.0,
         border.1
+    );
+}
+
+/// The trash glyph is centred in the button on both axes.
+///
+/// This was wrong and looked it: `base_ui`'s `Interactive` draws
+/// `.flex().items_center()`, which centres across the row and leaves the main axis at
+/// its `start` default. A 24px button holds a 14px content box — two 1px borders and two
+/// 4px paddings taken off — so a 12px icon was placed at the left of those 14 and the
+/// remaining 2px sat on its right: one pixel off centre, which the eye reads as the
+/// glyph being nudged left rather than as padding. The fix is the button's own
+/// `justify_center()`, and this is what says it stays there.
+///
+/// A whole pixel of tolerance, because that is the size of the error: the glyph is 12px
+/// and the free space is 2, so the two states are exactly 1px apart and a tighter bound
+/// would fail on device-pixel snapping alone.
+#[gpui_kit::test]
+fn the_delete_icon_should_be_centred_in_its_button(cx: &mut TestAppContext) {
+    let (_built, panel) = panel_over(cx);
+    let window = draw(cx, &panel);
+    focus_on(window, &panel, IndicatorId::Ma);
+
+    let button = window
+        .debug_bounds("TEST_PANEL_DELETE_LINE_MA_1")
+        .expect("a list of three lines may lose one");
+    let icon = window
+        .debug_bounds("TEST_PANEL_DELETE_ICON_MA_1")
+        .expect("the delete button draws its trash glyph");
+
+    let off_x = (icon.center().x - button.center().x).as_f32();
+    let off_y = (icon.center().y - button.center().y).as_f32();
+    // Half a pixel, not a whole one: the whole one was the tolerance this test was
+    // first written with, and the defect it is for is exactly 1px, so `<= 1.0` passed
+    // on the very behaviour it is meant to catch. What is left has to absorb device
+    // pixel snapping and nothing else — the box is laid out on whole pixels at this
+    // scale, so a correct centring measures 0.
+    assert!(
+        off_x.abs() < 0.5,
+        "the glyph is centred in the button across the row: its centre is {off_x}px from \
+         the button's, and that space is 2px of slack over a 12px glyph so leaving the \
+         main axis at `start` puts it exactly 1px left ({icon:?} vs {button:?})"
+    );
+    assert!(
+        off_y.abs() < 0.5,
+        "and on the other axis too: {off_y}px off centre ({icon:?} vs {button:?})"
     );
 }
 

@@ -471,7 +471,20 @@ fn line_row(
                                 panel.remove_line(id, line_index, cx);
                             });
                         })
-                        .child(Icon::new(IconKind::Trash).size_3()),
+                        // The button centres its children on both axes. The
+                        // `Interactive` inside draws `.flex().items_center()`, which
+                        // centres across the row and leaves the main axis at `start`:
+                        // a 24px button holds a 14px content box — 24 less two
+                        // borders and two 4px paddings — so a 12px icon would sit one
+                        // pixel left of the centre and the gap on its right would be
+                        // the only thing the eye could not call padding.
+                        .justify_center()
+                        .child(
+                            div()
+                                .debug_selector(move || delete_icon_selector(id, line_index))
+                                .flex_none()
+                                .child(Icon::new(IconKind::Trash).size_3()),
+                        ),
                     )
                 }),
         )
@@ -774,6 +787,18 @@ fn period_field_selector(id: IndicatorId, line_index: usize) -> String {
 fn delete_button_selector(id: IndicatorId, line_index: usize) -> String {
     let name = indicator_name(id);
     format!("TEST_PANEL_DELETE_LINE_{name}_{line_index}")
+}
+
+/// The debug selector of the glyph inside one line's delete button.
+///
+/// The wrapper, not the icon: `Icon` is a `RenderOnce` over an `svg()`, which has no
+/// selector of its own, and what a centring test has to measure is the glyph's box
+/// against the button's. A wrapper with no styling of its own is that box: it takes
+/// the icon's size and is placed by the button exactly where the icon is drawn, so the
+/// two agree to the pixel while the wrapper is the thing that can be asked for.
+fn delete_icon_selector(id: IndicatorId, line_index: usize) -> String {
+    let name = indicator_name(id);
+    format!("TEST_PANEL_DELETE_ICON_{name}_{line_index}")
 }
 
 /// The name a colour key is written under in a test selector.
