@@ -38,7 +38,7 @@ pub enum KytrixServiceCapability {
     /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
     #[serde(rename = "cmc")]
     Cmc,
-    /// The Pentagon Pizza Index, a public feed read from pizzint.watch.
+    /// The Pentagon Pizza Index, a snapshot the Kytrix service reads.
     ///
     /// It is one of Kytrix's own outbound routes rather than a venue's: no market
     /// participant publishes it, and it has no account, no session and no catalog of

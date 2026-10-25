@@ -1,96 +1,58 @@
-//! The fake feed several test modules answer through.
+//! The fake index several test modules answer through.
 //!
 //! One fake is shared because every module asks the service the same questions and
 //! answers them with the same document: a second copy per module would be the same
 //! lines with a different name.
+//!
+//! It hands over the answer itself rather than a reading, which is what the
+//! production source does: that is the seam the parse is on, so a fake that answered
+//! with a reading could not say what the service does with an unreadable one.
 
-use std::sync::{
-    Arc, Mutex, PoisonError,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::VecDeque,
+    future::pending,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
+use kytrix_proto::types as proto_types;
+use kytrix_service_provider::service::engine::KytrixServiceError;
+
 use super::{
-    model::{PizzaDataError, PizzaLevel, PizzaReading, WireEnvelope},
+    model::{PizzaLevel, PizzaReading},
     service::{PizzaFetchError, PizzaSource},
 };
 
-/// What a fetch should answer with.
-#[derive(Clone, Debug)]
-enum Answer {
-    /// One document, exactly as the feed publishes it.
-    Document(String),
-    /// One failure, rather than a document.
-    Failure(PizzaFetchError),
-}
+/// The account every fixture pane is scoped to.
+pub(super) const ACCOUNT: &str = "test-account";
 
-/// A feed whose answers, and whose number of reads, a test decides.
-///
-/// With nothing set it fails every read, so a test that forgot to answer gets a
-/// failure rather than a reading nobody published.
-#[derive(Clone, Default)]
-pub(super) struct FakeSource {
-    answer: Arc<Mutex<Option<Answer>>>,
-    fetches: Arc<AtomicUsize>,
-}
-
-impl FakeSource {
-    /// Answers every read with `document`.
-    pub(super) fn answer(&self, document: String) {
-        self.set(Answer::Document(document));
-    }
-
-    /// Answers every read with `error`.
-    pub(super) fn fail(&self, error: PizzaFetchError) {
-        self.set(Answer::Failure(error));
-    }
-
-    /// Answers every read with the feed's own refusal.
-    pub(super) fn refuse(&self) {
-        self.answer(r#"{"success":false,"error":"rate limited"}"#.to_owned());
-    }
-
-    /// How many times the feed has been read.
-    pub(super) fn fetches(&self) -> usize {
-        self.fetches.load(Ordering::Acquire)
-    }
-
-    fn set(&self, answer: Answer) {
-        *self.answer.lock().unwrap_or_else(PoisonError::into_inner) = Some(answer);
-    }
-}
-
-impl PizzaSource for FakeSource {
-    async fn fetch(&self) -> Result<WireEnvelope, PizzaFetchError> {
-        self.fetches.fetch_add(1, Ordering::AcqRel);
-        // The guard is dropped before the answer is used, so nothing is held across
-        // a suspension point.
-        let answer = self
-            .answer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-
-        match answer {
-            Some(Answer::Document(document)) => serde_json::from_str(&document)
-                .map_err(|_| PizzaFetchError::Data(PizzaDataError::Unreadable)),
-            Some(Answer::Failure(error)) => Err(error),
-            None => Err(PizzaFetchError::Data(PizzaDataError::Unreadable)),
-        }
-    }
-}
-
-/// One answer of the feed that states `level`.
-pub(super) fn answer(level: u8) -> String {
-    format!(
-        r#"{{"success":true,"data":{{"timestamp":"{TIMESTAMP}","defcon_level":{level},"defcon_score":0}}}}"#
-    )
-}
-
-/// The moment every fixture answer is stamped with, as the feed publishes it.
-pub(super) const TIMESTAMP: &str = "2026-10-24T06:00:00.000Z";
-
-/// The Unix millisecond [`TIMESTAMP`] names.
+/// The moment every fixture answer is observed at.
 pub(super) const OBSERVED_AT: i64 = 1_792_821_600_000;
+
+/// How the fake answers one fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FetchPlan {
+    /// Answers with a snapshot carrying this level.
+    Snapshot(u32),
+    /// Answers with a level the ladder does not have, which is an answer the pane
+    /// must refuse rather than clamp.
+    UnknownLevel,
+    /// Answers with a service failure.
+    Failure,
+    /// Never answers, so the fetch stays in flight.
+    Pending,
+}
+
+/// The answer one level is published as.
+pub(super) fn answer(level: u32) -> proto_types::PentagonPizzaIndex {
+    proto_types::PentagonPizzaIndex {
+        overall_index: level,
+        observed_at: OBSERVED_AT,
+        timestamp: 1_790_000_000_000,
+    }
+}
 
 /// The reading a fixture answer of `level` stands for.
 pub(super) fn reading(level: u8) -> PizzaReading {
@@ -100,7 +62,97 @@ pub(super) fn reading(level: u8) -> PizzaReading {
     )
 }
 
-/// One document the feed would never publish, for a read that must fail.
-pub(super) fn unreadable() -> String {
-    String::from("<html>not the feed</html>")
+/// A source whose answers, and whose number of reads, a test decides.
+///
+/// With nothing left to answer it never answers again, so a test that expects an
+/// absence can tell "the fetch never happened" from "the answer went somewhere
+/// else" by the count.
+#[derive(Clone)]
+pub(super) struct FakeSource {
+    state: Arc<FakeSourceState>,
+}
+
+struct FakeSourceState {
+    plans: Mutex<VecDeque<FetchPlan>>,
+    fetches: AtomicUsize,
+    cancelled_fetches: AtomicUsize,
+}
+
+impl FakeSource {
+    pub(super) fn new(plans: impl IntoIterator<Item = FetchPlan>) -> Self {
+        Self {
+            state: Arc::new(FakeSourceState {
+                plans: Mutex::new(plans.into_iter().collect()),
+                fetches: AtomicUsize::new(0),
+                cancelled_fetches: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// How many times the index has been read.
+    pub(super) fn fetches(&self) -> usize {
+        self.state.fetches.load(Ordering::Acquire)
+    }
+
+    /// How many reads were dropped before they answered.
+    pub(super) fn cancelled_fetches(&self) -> usize {
+        self.state.cancelled_fetches.load(Ordering::Acquire)
+    }
+
+    /// Takes the next plan, counting the read as started.
+    fn begin(&self) -> (FetchPlan, FetchGuard) {
+        let plan = self
+            .state
+            .plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(FetchPlan::Pending);
+        self.state.fetches.fetch_add(1, Ordering::AcqRel);
+
+        (
+            plan,
+            FetchGuard {
+                state: Arc::clone(&self.state),
+                completed: false,
+            },
+        )
+    }
+}
+
+impl Default for FakeSource {
+    fn default() -> Self {
+        Self::new([])
+    }
+}
+
+impl PizzaSource for FakeSource {
+    async fn fetch(&self) -> Result<proto_types::PentagonPizzaIndex, PizzaFetchError> {
+        let (plan, mut guard) = self.begin();
+        let result = match plan {
+            FetchPlan::Snapshot(level) => Ok(answer(level)),
+            FetchPlan::UnknownLevel => Ok(answer(9)),
+            FetchPlan::Failure => Err(PizzaFetchError::Service(KytrixServiceError::Connect(
+                "the fake source refused".into(),
+            ))),
+            FetchPlan::Pending => pending().await,
+        };
+        guard.completed = true;
+
+        result
+    }
+}
+
+/// Counts the read it belongs to as in flight until it answers or is dropped.
+struct FetchGuard {
+    state: Arc<FakeSourceState>,
+    completed: bool,
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.cancelled_fetches.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }

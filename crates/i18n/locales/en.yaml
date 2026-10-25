@@ -403,14 +403,8 @@ error:
     snapshot_unavailable: The order-book snapshot is unavailable
     subscription_closed: The order-book subscription closed
   pentagon_pizza_index:
-    missing_point: The Pentagon Pizza Index answered without a reading
-    refused: The Pentagon Pizza Index refused the read
-    route: The line the Pentagon Pizza Index is read over is not usable; check the proxy settings
-    timeout: The Pentagon Pizza Index did not answer within %{seconds} seconds
     unavailable: The Pentagon Pizza Index is not connected
     unknown_level: The Pentagon Pizza Index published a level this version cannot read (%{level})
-    unreadable: The Pentagon Pizza Index answer is not readable
-    timestamp: The Pentagon Pizza Index published an unreadable timestamp
   rpc:
     deadline: RPC request %{request_id} exceeded its deadline
     response_dropped: The response for RPC request %{request_id} was lost
@@ -748,6 +742,7 @@ widget:
     level_4: Increased intelligence watch
     level_5: Lowest state of readiness
     level_number: 'Level %{level}'
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
     observed_at: Observed at %{time}
     refresh_now: Read the index now
   perpetual_statistics:
@@ -1018,9 +1013,7 @@ settings_ui:
     no_proxy: Do not use a proxy
     password: Password
     password_required: Enter a password
-    pizza_index_group: Pentagon Pizza Index
     port: Port
-    public_feeds_section: Public feeds
     socks5_address: Socks5 address
     socks5_authorization: Socks5 authentication
     socks5_port: Socks5 port

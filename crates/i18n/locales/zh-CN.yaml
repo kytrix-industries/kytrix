@@ -403,14 +403,8 @@ error:
     snapshot_unavailable: 订单簿快照不可用
     subscription_closed: 订单簿订阅已关闭
   pentagon_pizza_index:
-    missing_point: 五角大楼披萨指数未返回任何读数
-    refused: 五角大楼披萨指数拒绝了这次读取
-    route: 读取五角大楼披萨指数所走的线路不可用，请检查代理设置
-    timeout: 五角大楼披萨指数在 %{seconds} 秒内没有响应
     unavailable: 五角大楼披萨指数未连接
     unknown_level: 五角大楼披萨指数返回了本版本无法识别的等级（%{level}）
-    unreadable: 五角大楼披萨指数的返回内容无法解析
-    timestamp: 五角大楼披萨指数返回了无法解析的时间
   rpc:
     deadline: RPC 请求 %{request_id} 已超时
     response_dropped: RPC 请求 %{request_id} 的响应已丢失
@@ -748,6 +742,7 @@ widget:
     level_4: 加强情报关注
     level_5: 最低戒备
     level_number: 等级 %{level}
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
     observed_at: 观测于 %{time}
     refresh_now: 立即重新读取指数
   perpetual_statistics:
@@ -1018,9 +1013,7 @@ settings_ui:
     no_proxy: 不使用代理
     password: 密码
     password_required: 请输入密码
-    pizza_index_group: 五角大楼披萨指数
     port: 端口
-    public_feeds_section: 公开数据源
     socks5_address: Socks5 地址
     socks5_authorization: Socks5 认证方式
     socks5_port: Socks5 端口

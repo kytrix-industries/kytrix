@@ -5157,7 +5157,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=60e51bb2167f4cc4f4339814d3f12c195b47d74a#60e51bb2167f4cc4f4339814d3f12c195b47d74a"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=11bbb71a728d7e8e8bf43bb84edbab0f0ea029dc#11bbb71a728d7e8e8bf43bb84edbab0f0ea029dc"
 dependencies = [
  "bytes",
  "prost",
@@ -6829,18 +6829,13 @@ dependencies = [
  "base_ui",
  "gpui-kit",
  "i18n",
+ "kytrix_proto",
  "kytrix_service_provider",
- "log",
- "network",
- "reqwest 0.13.5",
  "serde",
- "serde_json",
  "smol_str",
  "thiserror 2.0.20",
  "time",
  "tokio",
- "tokio-util",
- "url",
  "widget",
  "widget_tokio_runtime",
 ]
@@ -7401,7 +7396,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

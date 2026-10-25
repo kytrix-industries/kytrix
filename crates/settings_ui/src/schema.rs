@@ -495,8 +495,14 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                     "coinmarketcap",
                     "fear",
                     "greed",
+                    "pizza",
+                    "pizzint",
+                    "pentagon",
+                    "osint",
                     "恐惧",
                     "贪婪",
+                    "披萨",
+                    "五角大楼",
                     "云服务",
                 ],
                 KYTRIX_CLOUD,
@@ -517,16 +523,6 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
             "settings_ui.proxies.x_media_group",
             &["x", "twitter", "media", "媒体"],
             X_MEDIA,
-        )],
-    ));
-    sections.push(SectionDef::fields(
-        Some(text("settings_ui.proxies.public_feeds_section")),
-        true,
-        vec![proxy_targets_field(
-            "proxy-applications.public-feeds.pizza-index",
-            "settings_ui.proxies.pizza_index_group",
-            &["pizza", "pizzint", "pentagon", "osint", "披萨", "五角大楼"],
-            PUBLIC_FEEDS,
         )],
     ));
 
@@ -1370,6 +1366,9 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::Cmc,
     },
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::PentagonPizzaIndex,
+    },
 ];
 
 /// The application's own updates, which are fetched through their own line.
@@ -1385,12 +1384,6 @@ const APP_UPDATES: &[ServiceTarget] = &[
 /// The media service, which the applications page groups on its own.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
-}];
-
-/// The public feeds the application reads, which are grouped on their own because
-/// none of them is an account service and none of them carries credentials.
-const PUBLIC_FEEDS: &[ServiceTarget] = &[ServiceTarget::KytrixService {
-    capability: KytrixServiceCapability::PentagonPizzaIndex,
 }];
 
 /// The words one built field is searched by.
@@ -2058,7 +2051,6 @@ pub(crate) mod tests {
             "proxy-applications.kytrix.cloud",
             "proxy-applications.kytrix.updates",
             "proxy-applications.x.media",
-            "proxy-applications.public-feeds.pizza-index",
         ] {
             let row = field(applications, id);
             assert!(

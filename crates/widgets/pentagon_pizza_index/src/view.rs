@@ -1,11 +1,15 @@
-//! The Pentagon Pizza Index pane: the reading it draws, the ladder it colours it
-//! with, and the refresh it counts down to.
+//! The Pentagon Pizza Index pane: the account it is scoped to, the reading it draws,
+//! the ladder it colours it with, and the refresh it counts down to.
 //!
 //! # What the pane is scoped to
 //!
-//! Nothing. The feed is global — no account, no venue, no selected instrument — so
-//! the pane has one scope for every reader, and its persisted config carries no
-//! options at all. What a pane shows is what the feed answered last.
+//! The account. The index is the same for every reader, but the answer is served over
+//! an authenticated connection, so it is not one a pane may keep showing after the
+//! account behind it changed. A reader with no account behind them fetches nothing
+//! and says so: that is a *waiting* state rather than a failure, because nothing has
+//! gone wrong — the pane is just not for an anonymous reader. Nothing is retried on a
+//! timer either; the account event subscription re-scopes the pane the moment the
+//! user signs in.
 //!
 //! # What it reports, and what it does not
 //!
@@ -27,12 +31,13 @@
 //!
 //! It is the refresh button's own label rather than a word beside it. The two are
 //! one control's worth of information — when the next read is due, and the way to
-//! bring it forward — so they are one control. The feed publishes one point an
+//! bring it forward — so they are one control. The index publishes one point an
 //! hour, so the countdown is the only thing on screen that moves on its own.
 
 use std::{sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
+use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
     button::Button,
     empty_state::EmptyState,
@@ -43,20 +48,23 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
-    Window, base::Disableable, div, px,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, base::Disableable, div, px,
 };
 use i18n::t;
+use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use time::{OffsetDateTime, UtcOffset};
 use widget::{
+    account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     error::LocalizedError,
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
-    status::{WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
     time_zone::data_time_zone,
     util::{format_countdown, unix_millis},
     view::{WidgetHeader, WidgetView},
@@ -66,8 +74,8 @@ use widget_tokio_runtime::global;
 use crate::{
     model::{PizzaLevel, PizzaReading},
     service::{
-        PizzaFetchError, PizzaProtocol, PizzaRequest, PizzaScope, PizzaService, PizzaServiceError,
-        PizzaSource, PizzaStatus, PizzaStreamMessage, UrlSource,
+        PizzaFetchError, PizzaProtocol, PizzaRequest, PizzaService, PizzaServiceError, PizzaSource,
+        PizzaStatus, PizzaStreamKey, PizzaStreamMessage,
     },
 };
 
@@ -81,7 +89,7 @@ pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_millis(250);
 /// How tall the colour bar under the reading is.
 const LEVEL_BAR_HEIGHT: f32 = 6.0;
 
-/// The pane persists nothing: the feed is the same feed for every reader.
+/// The pane persists nothing: the index is the same index for every reader.
 ///
 /// The type exists because every widget carries the schema version its config is
 /// stored under, and because a widget that later gains an option has somewhere to
@@ -111,7 +119,8 @@ impl LocalizedError for PizzaFailure {
     }
 }
 
-/// One pane: the reading it holds, and the countdown to the next one.
+/// One pane: the account it follows, the reading it holds, and the countdown to the
+/// next one.
 pub struct PentagonPizzaIndexWidget {
     binding: WidgetBinding<PizzaProtocol>,
     status: Entity<WidgetStatus>,
@@ -132,6 +141,10 @@ pub struct PentagonPizzaIndexWidget {
     countdown: Option<SharedString>,
     /// Whether a refresh command this pane sent has not yet been reported on.
     refresh_pending: bool,
+    /// The account this pane is for, or `None` while nobody is signed in.
+    account_id: Option<SmolStr>,
+    /// Keeps the pane following the account the settings hold.
+    _account: Subscription,
     _countdown_task: Task<()>,
 }
 
@@ -154,24 +167,17 @@ impl WidgetView for PentagonPizzaIndexWidget {
         recovery: WidgetAction,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The feed is read by the pane rather than by a service of the application's:
-        // it is a public document on someone else's host, so the transport is the
-        // pane's own and the route it takes is the one the settings give the
-        // capability. The feed is served over HTTPS on a public origin, and nothing
-        // this pane reads is ever plaintext, so the transport refuses plaintext
-        // whatever the build is for.
-        let connector =
-            cx.global::<kytrix_service_provider::service::connector::KytrixServiceConnector>();
-        let transport = Arc::new(network::transport::hub::TransportHub::new(
-            network::transport::hub::TransportPolicy::default(),
-        ));
-        let runtime = global::handle(cx);
-        let source = UrlSource::live(transport, connector.network_notification(), runtime);
+        // The index is read by the Kytrix service and handed to this pane over the
+        // connector's own authenticated connection, so the route it takes is the one
+        // the settings give the capability and this widget opens no socket of its
+        // own.
+        let source = cx.global::<KytrixServiceConnector>().clone();
         Self::new_with_source(config, source, status, recovery, cx)
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
         let retry = self.status.is_failed(cx);
+        self.account_id = account_of(&cx.global::<ConfigManager>().read());
         self.start(retry, cx);
     }
 
@@ -214,6 +220,14 @@ impl PentagonPizzaIndexWidget {
                 cx.background_executor().timer(COUNTDOWN_TICK).await;
             }
         });
+        // The account is the pane's scope, and the user can change it while the
+        // pane is open: signing out has to take the reading with it, and signing in
+        // has to fetch. Following the account event is what makes that happen
+        // without the pane having to be reopened.
+        let events = cx.global::<ConfigManager>().events().clone();
+        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
+            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
+        });
 
         Self {
             binding,
@@ -225,6 +239,10 @@ impl PentagonPizzaIndexWidget {
             next_refresh_at: None,
             countdown: None,
             refresh_pending: false,
+            // The pane records the account it was built for, but it does not start
+            // anything: the framework calls `load` once construction is done.
+            account_id: account_of(&cx.global::<ConfigManager>().read()),
+            _account: account,
             _countdown_task: countdown_task,
         }
     }
@@ -242,6 +260,25 @@ impl PentagonPizzaIndexWidget {
         self.accepted
     }
 
+    /// The account this pane would accept an answer from.
+    fn current_key(&self) -> Option<PizzaStreamKey> {
+        self.account_id
+            .clone()
+            .map(|account_id| PizzaStreamKey { account_id })
+    }
+
+    /// Follows the account the settings now hold.
+    ///
+    /// Another account is another scope: the answer the pane is showing was served
+    /// to the previous one, so it is dropped rather than kept under a new name.
+    fn reconcile_account(&mut self, account: Option<SmolStr>, cx: &mut Context<Self>) {
+        if self.account_id == account {
+            return;
+        }
+        self.account_id = account;
+        self.start(false, cx);
+    }
+
     /// Starts reading, or restarts for a reading the user is retrying.
     ///
     /// A retry keeps the reading the user is still looking at — blanking it to
@@ -254,13 +291,25 @@ impl PentagonPizzaIndexWidget {
         // The command that was in flight belongs to the generation this call
         // replaces, so its answer is not something to wait for any more.
         self.refresh_pending = false;
+        let Some(key) = self.current_key() else {
+            // There is nothing to read for a reader the service does not know, and
+            // nothing has gone wrong, so the pane says what it is waiting for.
+            self.accepted = None;
+            self.reading = None;
+            self.status.report(
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
+                cx,
+            );
+            cx.notify();
+            return;
+        };
         if !retry {
             self.accepted = None;
             self.reading = None;
         }
         self.status.report(WidgetState::Connecting, cx);
         self.binding
-            .call(PizzaRequest::Load, cx, Self::apply_load_result);
+            .call(PizzaRequest::Load(key), cx, Self::apply_load_result);
         cx.notify();
     }
 
@@ -302,11 +351,11 @@ impl PentagonPizzaIndexWidget {
     /// framework around the body, so publishing it is enough.
     pub(crate) fn apply_reliable(
         &mut self,
-        key: PizzaScope,
+        key: PizzaStreamKey,
         message: Arc<PizzaStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if key != PizzaScope || self.status.is_failed(cx) {
+        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
         let PizzaStreamMessage::Status(status) = message.as_ref() else {
@@ -351,11 +400,11 @@ impl PentagonPizzaIndexWidget {
     /// on screen is not worth a frame.
     pub(crate) fn apply_latest(
         &mut self,
-        key: PizzaScope,
+        key: PizzaStreamKey,
         message: Arc<PizzaStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if key != PizzaScope || self.status.is_failed(cx) {
+        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
         let PizzaStreamMessage::Snapshot(snapshot) = message.as_ref() else {
@@ -402,7 +451,7 @@ impl PentagonPizzaIndexWidget {
         self.refresh_pending || self.countdown_deadline(cx).is_none()
     }
 
-    /// The control that reads the feed again, and the time left until the next
+    /// The control that reads the index again, and the time left until the next
     /// automatic read.
     fn refresh_button(&self, cx: &Context<Self>) -> AnyElement {
         let disabled = self.refresh_is_disabled(cx);
@@ -434,7 +483,7 @@ impl PentagonPizzaIndexWidget {
             .into_any_element()
     }
 
-    /// Reads the feed again without waiting for the next interval.
+    /// Reads the index again without waiting for the next interval.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.refresh_is_disabled(cx) {
             return;
@@ -478,8 +527,8 @@ impl Render for PentagonPizzaIndexWidget {
         let zone = data_time_zone(cx);
 
         // The level is the pane's one big statement, so it is drawn at the size of a
-        // heading and coloured by its rung; the number the feed publishes sits beside
-        // it, because that is what the feed's own page reports and what a reader
+        // heading and coloured by its rung; the number the index publishes sits beside
+        // it, because that is what the index's own page reports and what a reader
         // comparing the two will look for.
         div()
             .id(ElementId::Name(SharedString::new_static(
@@ -569,7 +618,7 @@ fn level_role(theme: &base_ui::style::theme::Theme, level: PizzaLevel) -> gpui_k
 /// clock frozen into the snapshot.
 fn format_observed_at(observed_at: i64, zone: UtcOffset) -> SharedString {
     // The offset can move an instant past the last date the calendar holds, and an
-    // instant the feed could not have published is written as a placeholder rather
+    // instant the index could not have published is written as a placeholder rather
     // than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(observed_at) * 1_000_000)
         .ok()
@@ -594,18 +643,42 @@ fn format_observed_at(observed_at: i64, zone: UtcOffset) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use app_config::settings::Config;
+    use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use app_config_provider::manager::ConfigManager;
     use gpui_kit::{App, TestAppContext};
+    use kytrix_service_provider::service::engine::KytrixServiceError;
     use widget::{protocol::RequestId, status::WidgetState};
     use widget_tokio_runtime::global;
 
     use super::*;
     use crate::{
-        model::PizzaLevel,
+        model::{PizzaDataError, PizzaLevel},
         service::PizzaSnapshot,
-        test_support::{FakeSource, OBSERVED_AT, TIMESTAMP, reading},
+        test_support::{ACCOUNT, FakeSource, OBSERVED_AT, reading},
     };
+
+    /// Settings that hold `account` as the signed-in account, or hold nobody.
+    fn settings(account: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.account = account.map(|user_id| AccountConfig {
+            user_id: user_id.to_owned(),
+            wallet_address: "0x0000000000000000000000000000000000000001".to_owned(),
+            wallet_kind: AccountWalletKind::Ethereum,
+        });
+        config
+    }
+
+    fn install(cx: &mut App) {
+        base_ui::style::theme::install(cx);
+        i18n::global::embedded::install(cx).expect("the embedded locales should load");
+        global::install(cx).expect("the test Tokio runtime should build");
+    }
+
+    /// Scopes the panes built from here on to `account`, or to nobody.
+    fn sign_in(cx: &mut App, account: Option<&str>) {
+        let manager = ConfigManager::in_memory(settings(account), cx);
+        cx.set_global(manager);
+    }
 
     /// The pane a test drives, built the way the framework builds one.
     ///
@@ -613,7 +686,10 @@ mod tests {
     /// to the pane, and a service running its own rounds on the application runtime
     /// would race them on another thread. The binding the construction still holds
     /// is cancelled, so nothing else can answer either.
-    fn pane(source: FakeSource, cx: &mut TestAppContext) -> Entity<PentagonPizzaIndexWidget> {
+    fn pane_with(
+        cx: &mut TestAppContext,
+        account: Option<&str>,
+    ) -> Entity<PentagonPizzaIndexWidget> {
         // The countdown task this pane spawns runs on the test's executor and wakes on a
         // timer, and the service's own runtime is a Tokio one: both are work the test does
         // not drive tick by tick, so the executor is told it may park while they settle.
@@ -621,11 +697,8 @@ mod tests {
         // and fails the test as non-deterministic.
         cx.executor().allow_parking();
         cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("the embedded locales should load");
-            global::install(cx).expect("the test Tokio runtime should build");
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
+            install(cx);
+            sign_in(cx, account);
 
             let status = cx.new(|_| WidgetStatus::new());
             let widget = cx.new(move |cx| {
@@ -636,7 +709,7 @@ mod tests {
 
                 PentagonPizzaIndexWidget::new_with_source(
                     PentagonPizzaIndexConfig,
-                    source,
+                    FakeSource::default(),
                     status,
                     recovery,
                     cx,
@@ -648,9 +721,21 @@ mod tests {
         })
     }
 
-    /// A fake that never answers, so what the pane holds is only what a test reports.
-    fn pending(cx: &mut TestAppContext) -> Entity<PentagonPizzaIndexWidget> {
-        pane(FakeSource::default(), cx)
+    /// A pane scoped to the fixture account, holding nothing it was not told.
+    fn pane(cx: &mut TestAppContext) -> Entity<PentagonPizzaIndexWidget> {
+        pane_with(cx, Some(ACCOUNT))
+    }
+
+    fn key() -> PizzaStreamKey {
+        PizzaStreamKey {
+            account_id: SmolStr::new_static(ACCOUNT),
+        }
+    }
+
+    fn other_key() -> PizzaStreamKey {
+        PizzaStreamKey {
+            account_id: SmolStr::new_static("second-account"),
+        }
     }
 
     /// Reports a status as the stream would.
@@ -663,12 +748,19 @@ mod tests {
         status: PizzaStatus,
         cx: &mut App,
     ) -> bool {
-        pane.update(cx, |pane, context| {
-            pane.apply_reliable(
-                PizzaScope,
-                Arc::new(PizzaStreamMessage::Status(status)),
-                context,
-            )
+        report_from(pane, key(), PizzaStreamMessage::Status(status), cx)
+    }
+
+    /// Reports a status the stream addressed to `key`.
+    fn report_from(
+        pane: &Entity<PentagonPizzaIndexWidget>,
+        key: PizzaStreamKey,
+        message: PizzaStreamMessage,
+        cx: &mut App,
+    ) -> bool {
+        pane.update(cx, |pane, context| match message {
+            PizzaStreamMessage::Status(_) => pane.apply_reliable(key, Arc::new(message), context),
+            PizzaStreamMessage::Snapshot(_) => pane.apply_latest(key, Arc::new(message), context),
         })
     }
 
@@ -679,15 +771,12 @@ mod tests {
         reading: PizzaReading,
         cx: &mut App,
     ) -> bool {
-        pane.update(cx, |pane, context| {
-            pane.apply_latest(
-                PizzaScope,
-                Arc::new(PizzaStreamMessage::Snapshot(Arc::new(PizzaSnapshot::new(
-                    revision, reading,
-                )))),
-                context,
-            )
-        })
+        report_from(
+            pane,
+            key(),
+            PizzaStreamMessage::Snapshot(Arc::new(PizzaSnapshot::new(revision, reading))),
+            cx,
+        )
     }
 
     /// The state the pane is reporting.
@@ -707,7 +796,7 @@ mod tests {
     /// what it draws.
     #[gpui_kit::test]
     fn a_reading_should_be_the_panes_content(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_status(
@@ -730,14 +819,14 @@ mod tests {
     /// nothing the framework could draw as content.
     #[gpui_kit::test]
     fn a_failed_round_should_report_a_failure_and_hold_no_reading(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_status(
                 &pane,
-                PizzaStatus::Failed(PizzaFetchError::Data(
-                    crate::model::PizzaDataError::Unreadable,
-                )),
+                PizzaStatus::Failed(PizzaFetchError::Data(PizzaDataError::UnknownLevel {
+                    level: 9,
+                })),
                 cx,
             );
 
@@ -754,12 +843,12 @@ mod tests {
     /// and a pane that has failed is finished until the user recovers it.
     #[gpui_kit::test]
     fn a_late_message_should_not_revive_a_failed_pane(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_status(
                 &pane,
-                PizzaStatus::Failed(PizzaFetchError::Data(crate::model::PizzaDataError::Refused)),
+                PizzaStatus::Failed(PizzaFetchError::Service(KytrixServiceError::Closed)),
                 cx,
             );
             report_reading(&pane, 1, reading(1), cx);
@@ -772,11 +861,40 @@ mod tests {
         });
     }
 
+    /// Another account is another scope: an answer served to the one that just left
+    /// is not one this pane may draw.
+    #[gpui_kit::test]
+    fn a_message_about_another_account_should_not_be_drawn(cx: &mut TestAppContext) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            report_status(
+                &pane,
+                PizzaStatus::Ready {
+                    revision: 1,
+                    next_refresh_at: 0,
+                },
+                cx,
+            );
+            report_from(
+                &pane,
+                other_key(),
+                PizzaStreamMessage::Snapshot(Arc::new(PizzaSnapshot::new(1, reading(1)))),
+                cx,
+            );
+
+            assert!(
+                pane.read(cx).reading.is_none(),
+                "the reading was served to the account this pane is not"
+            );
+        });
+    }
+
     /// A reading the pane has already overtaken is not one it may draw: within one
     /// generation the revision only moves forwards.
     #[gpui_kit::test]
     fn an_older_revision_should_not_replace_the_reading_on_screen(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_status(
@@ -810,7 +928,7 @@ mod tests {
     /// keeps a quiet hour from scheduling a repaint.
     #[gpui_kit::test]
     fn a_reading_that_did_not_change_should_not_ask_for_a_frame(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_status(
@@ -834,7 +952,7 @@ mod tests {
     /// makes it ready.
     #[gpui_kit::test]
     fn the_two_channels_should_meet_at_the_readings_revision(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
 
         cx.update(|cx| {
             report_reading(&pane, 1, reading(2), cx);
@@ -860,7 +978,7 @@ mod tests {
     /// next automatic read of the reading on screen.
     #[gpui_kit::test]
     fn the_countdown_should_belong_to_a_ready_pane(cx: &mut TestAppContext) {
-        let pane = pending(cx);
+        let pane = pane(cx);
         let due = unix_millis().saturating_add(600_000);
 
         cx.update(|cx| {
@@ -884,7 +1002,7 @@ mod tests {
             // A pane that fails has nothing to bring forward.
             report_status(
                 &pane,
-                PizzaStatus::Failed(PizzaFetchError::Timeout(Duration::from_secs(15))),
+                PizzaStatus::Failed(PizzaFetchError::Service(KytrixServiceError::Timeout)),
                 cx,
             );
             pane.update(cx, |pane, cx| pane.tick_countdown(cx));
@@ -893,6 +1011,54 @@ mod tests {
                 "a failed pane is not counting down to anything"
             );
             assert!(pane.read(cx).refresh_is_disabled(cx));
+        });
+    }
+
+    /// Signing out takes the reading with it and asks for an account rather than
+    /// reporting a failure: nothing has gone wrong, the pane is just not for an
+    /// anonymous reader.
+    #[gpui_kit::test]
+    fn signing_out_should_take_the_reading_with_it(cx: &mut TestAppContext) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            report_reading(&pane, 1, reading(3), cx);
+            pane.update(cx, |pane, cx| pane.reconcile_account(None, cx));
+
+            assert!(!pane.read(cx).has_content());
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
+                "a signed-out pane waits for an account"
+            );
+            assert!(pane.read(cx).current_key().is_none());
+        });
+    }
+
+    /// Another account is another read, and the reading of the one that left goes
+    /// with it.
+    #[gpui_kit::test]
+    fn another_account_should_take_the_reading_with_it(cx: &mut TestAppContext) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            report_reading(&pane, 1, reading(3), cx);
+            assert!(pane.read(cx).has_content());
+
+            pane.update(cx, |pane, cx| {
+                pane.reconcile_account(Some(SmolStr::new_static("second-account")), cx);
+            });
+
+            assert!(
+                !pane.read(cx).has_content(),
+                "the reading was served to the account that just left"
+            );
+            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Connecting);
+            assert_eq!(
+                pane.read(cx).current_key(),
+                Some(other_key()),
+                "the pane follows the account the settings now hold"
+            );
         });
     }
 
@@ -952,6 +1118,7 @@ mod tests {
                     "widget.pentagon_pizza_index.refresh_now",
                     "widget.pentagon_pizza_index.observed_at",
                     "widget.pentagon_pizza_index.level_number",
+                    "widget.pentagon_pizza_index.logged_out",
                 ] {
                     assert!(!t!(cx, key).is_empty(), "{key} has no copy in {language}");
                 }
@@ -964,8 +1131,6 @@ mod tests {
     /// place for a missing key.
     #[gpui_kit::test]
     fn every_error_this_pane_reports_should_resolve(cx: &mut TestAppContext) {
-        use crate::{model::PizzaDataError, service::PizzaServiceError};
-
         cx.update(|cx| {
             i18n::global::embedded::install(cx).expect("the embedded locales should load");
 
@@ -976,11 +1141,8 @@ mod tests {
                 cx.set_global(language);
 
                 for error in [
-                    PizzaDataError::Refused,
-                    PizzaDataError::MissingPoint,
                     PizzaDataError::UnknownLevel { level: 9 },
-                    PizzaDataError::Timestamp,
-                    PizzaDataError::Unreadable,
+                    PizzaDataError::UnknownLevel { level: 0 },
                 ] {
                     assert!(
                         !error.localized_message(cx).is_empty(),
@@ -997,8 +1159,8 @@ mod tests {
                     );
                 }
                 for error in [
-                    PizzaFetchError::Timeout(Duration::from_secs(15)),
-                    PizzaFetchError::Data(PizzaDataError::Refused),
+                    PizzaFetchError::Service(KytrixServiceError::Timeout),
+                    PizzaFetchError::Data(PizzaDataError::UnknownLevel { level: 9 }),
                 ] {
                     assert!(
                         !error.localized_message(cx).is_empty(),
@@ -1016,7 +1178,7 @@ mod tests {
         assert_eq!(
             format_observed_at(OBSERVED_AT, UtcOffset::UTC).as_ref(),
             "2026-10-24 06:00",
-            "{TIMESTAMP} read as a wall clock in UTC"
+            "the fixture reading read as a wall clock in UTC"
         );
         assert_eq!(
             format_observed_at(OBSERVED_AT, UtcOffset::from_hms(8, 0, 0).unwrap()).as_ref(),
