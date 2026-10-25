@@ -9,11 +9,15 @@ ahash = { workspace = true }
 app_config = { workspace = true }
 base_ui = { workspace = true }
 gpui-kit = { workspace = true }
+i18n = { workspace = true }
 kytrix_service_provider = { workspace = true }
+network = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+widget = { workspace = true }
 
 [lints]
 workspace = true

@@ -4208,11 +4208,15 @@ dependencies = [
  "app_config",
  "base_ui",
  "gpui-kit",
+ "i18n",
  "kytrix_service_provider",
+ "network",
  "serde",
  "smol_str",
  "thiserror 2.0.20",
  "time",
+ "tokio",
+ "widget",
 ]
 
 [[package]]
