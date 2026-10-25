@@ -46,11 +46,15 @@ pub(super) enum FetchPlan {
 }
 
 /// The answer one level is published as.
+///
+/// The collection time is a moment after the observation it carries rather than an
+/// arbitrary one: a snapshot is taken of a point that already exists, and a fixture
+/// that said otherwise would disagree with any check of that order.
 pub(super) fn answer(level: u32) -> proto_types::PentagonPizzaIndex {
     proto_types::PentagonPizzaIndex {
         overall_index: level,
         observed_at: OBSERVED_AT,
-        timestamp: 1_790_000_000_000,
+        timestamp: OBSERVED_AT + 60_000,
     }
 }
 

@@ -22,7 +22,6 @@ widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
-tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

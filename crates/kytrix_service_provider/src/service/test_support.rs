@@ -200,13 +200,15 @@ pub(super) fn cmc_fear_greed_index() -> proto_types::CmcFearGreedIndex {
 
 /// The Pentagon Pizza Index snapshot the service serves, shaped as its collector publishes it.
 ///
-/// The level is the feed's own rung, which counts *down* as the alert rises: five is
-/// the calmest and one the most severe.
+/// The level is the index's own rung, which counts *down* as the alert rises: five is
+/// the calmest and one the most severe. The collection time follows the moment it
+/// observed rather than preceding it, because a snapshot is taken of a point that
+/// already exists.
 pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
     proto_types::PentagonPizzaIndex {
         overall_index: 3,
         observed_at: 1_792_821_600_000,
-        timestamp: 1_790_000_000_000,
+        timestamp: 1_792_821_660_000,
     }
 }
 

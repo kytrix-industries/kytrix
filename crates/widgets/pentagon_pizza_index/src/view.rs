@@ -5,11 +5,11 @@
 //!
 //! The account. The index is the same for every reader, but the answer is served over
 //! an authenticated connection, so it is not one a pane may keep showing after the
-//! account behind it changed. A reader with no account behind them fetches nothing
-//! and says so: that is a *waiting* state rather than a failure, because nothing has
-//! gone wrong — the pane is just not for an anonymous reader. Nothing is retried on a
-//! timer either; the account event subscription re-scopes the pane the moment the
-//! user signs in.
+//! account behind it changed. A reader with no account behind them stops the read that
+//! belonged to the account that left and says so: that is a *waiting* state rather
+//! than a failure, because nothing has gone wrong — the pane is just not for an
+//! anonymous reader. Nothing is retried on a timer either; the account event
+//! subscription re-scopes the pane the moment the user signs in.
 //!
 //! # What it reports, and what it does not
 //!
@@ -141,6 +141,12 @@ pub struct PentagonPizzaIndexWidget {
     countdown: Option<SharedString>,
     /// Whether a refresh command this pane sent has not yet been reported on.
     refresh_pending: bool,
+    /// Whether the load this pane sent has not been reported on.
+    ///
+    /// A load that answers after the reader behind it signed out is ignored: its
+    /// answer is about a stream the pane no longer follows, and reporting it would
+    /// turn the pane's waiting state into a failure.
+    load_pending: bool,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     /// Keeps the pane following the account the settings hold.
@@ -176,15 +182,23 @@ impl WidgetView for PentagonPizzaIndexWidget {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
-        let retry = self.status.is_failed(cx);
-        self.account_id = account_of(&cx.global::<ConfigManager>().read());
+        let account = account_of(&cx.global::<ConfigManager>().read());
+        // A retry keeps what is on screen only for the account that is showing it:
+        // an account the settings replaced while the pane was failed is another
+        // scope, and the reading belongs to the one that left.
+        let retry = self.status.is_failed(cx) && self.account_id == account;
+        self.account_id = account;
         self.start(retry, cx);
     }
 
     /// The reading is the pane's whole content, and once one has arrived the pane
     /// has something to draw whatever that reading says.
+    ///
+    /// It is the reading alone rather than the revision beside it: a retry drops the
+    /// revision its new stream does not share, and a pane that answered "no content"
+    /// for that would blank the reading it deliberately kept.
     fn has_content(&self) -> bool {
-        self.accepted.is_some() && self.reading.is_some()
+        self.reading.is_some()
     }
 
     /// The refresh control on the right, and the countdown it carries.
@@ -239,6 +253,7 @@ impl PentagonPizzaIndexWidget {
             next_refresh_at: None,
             countdown: None,
             refresh_pending: false,
+            load_pending: false,
             // The pane records the account it was built for, but it does not start
             // anything: the framework calls `load` once construction is done.
             account_id: account_of(&cx.global::<ConfigManager>().read()),
@@ -284,30 +299,41 @@ impl PentagonPizzaIndexWidget {
     /// A retry keeps the reading the user is still looking at — blanking it to
     /// reconnect would flash the answer away — while an explicit load starts over,
     /// because the pane cannot vouch for what it was showing.
+    ///
+    /// The revision is dropped either way. It numbers the readings of **one**
+    /// generation, and a load replaces the generation: the stream that answers next
+    /// counts from one again, so a revision kept from the one it replaced would
+    /// refuse every reading the new one publishes until it happened to catch up.
     fn start(&mut self, retry: bool, cx: &mut Context<Self>) {
         self.ready = None;
         self.next_refresh_at = None;
         self.countdown = None;
+        self.accepted = None;
         // The command that was in flight belongs to the generation this call
         // replaces, so its answer is not something to wait for any more.
         self.refresh_pending = false;
+        self.load_pending = false;
         let Some(key) = self.current_key() else {
             // There is nothing to read for a reader the service does not know, and
-            // nothing has gone wrong, so the pane says what it is waiting for.
-            self.accepted = None;
+            // nothing has gone wrong, so the pane says what it is waiting for. The
+            // stream the pane was reading belongs to the account that left, so it is
+            // stopped rather than left polling for an answer nobody can draw.
             self.reading = None;
             self.status.report(
                 WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
                 cx,
             );
+            // The answer to a stop is nothing the pane reports: it is already
+            // waiting for the account that would start the next read.
+            self.binding.call(PizzaRequest::Unload, cx, |_, _, _| {});
             cx.notify();
             return;
         };
         if !retry {
-            self.accepted = None;
             self.reading = None;
         }
         self.status.report(WidgetState::Connecting, cx);
+        self.load_pending = true;
         self.binding
             .call(PizzaRequest::Load(key), cx, Self::apply_load_result);
         cx.notify();
@@ -318,7 +344,10 @@ impl PentagonPizzaIndexWidget {
         result: WidgetRpcResult<PizzaProtocol>,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_pending = false;
+        if !self.load_pending {
+            return;
+        }
+        self.load_pending = false;
         if let Err(error) = result {
             let recovery = self.recovery.clone();
             self.status.report(
@@ -333,6 +362,9 @@ impl PentagonPizzaIndexWidget {
         result: WidgetRpcResult<PizzaProtocol>,
         cx: &mut Context<Self>,
     ) {
+        if !self.refresh_pending {
+            return;
+        }
         // An accepted command stays pending until the round it started is reported:
         // the acknowledgement and the round are two different messages.
         if let Err(error) = result {
@@ -645,7 +677,7 @@ fn format_observed_at(observed_at: i64, zone: UtcOffset) -> SharedString {
 mod tests {
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use app_config_provider::manager::ConfigManager;
-    use gpui_kit::{App, TestAppContext};
+    use gpui_kit::{App, BorrowAppContext, TestAppContext};
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use widget::{protocol::RequestId, status::WidgetState};
     use widget_tokio_runtime::global;
@@ -868,24 +900,27 @@ mod tests {
         let pane = pane(cx);
 
         cx.update(|cx| {
-            report_status(
-                &pane,
-                PizzaStatus::Ready {
-                    revision: 1,
-                    next_refresh_at: 0,
-                },
-                cx,
-            );
+            // The pane's own account is accepted first, so the assertion below is
+            // about the key rather than about a pane that never took anything.
+            assert!(report_reading(&pane, 1, reading(3), cx));
+            assert_eq!(level_of(&pane, cx), Some(PizzaLevel::RoundHouse));
+
             report_from(
                 &pane,
                 other_key(),
-                PizzaStreamMessage::Snapshot(Arc::new(PizzaSnapshot::new(1, reading(1)))),
+                PizzaStreamMessage::Snapshot(Arc::new(PizzaSnapshot::new(2, reading(1)))),
                 cx,
             );
 
-            assert!(
-                pane.read(cx).reading.is_none(),
-                "the reading was served to the account this pane is not"
+            assert_eq!(
+                level_of(&pane, cx),
+                Some(PizzaLevel::RoundHouse),
+                "the reading served to another account did not replace the one on screen"
+            );
+            assert_eq!(
+                pane.read(cx).accepted_revision(),
+                Some(1),
+                "and it did not take the revision with it either"
             );
         });
     }
@@ -921,6 +956,139 @@ mod tests {
                 Some(PizzaLevel::ExerciseTerm),
                 "the older reading did not replace the one on screen"
             );
+        });
+    }
+
+    /// A retry keeps the reading the user is looking at but not the revision it was
+    /// counted at: a load replaces the stream, and the one that replaces it numbers
+    /// its readings from one again.
+    ///
+    /// A revision kept across that boundary would refuse every reading the new
+    /// stream publishes until its count caught up — the pane would keep a failed
+    /// hour's level on screen and report readiness over it.
+    #[gpui_kit::test]
+    fn a_retry_should_keep_the_reading_and_drop_its_revision(cx: &mut TestAppContext) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            report_reading(&pane, 2, reading(1), cx);
+            report_status(
+                &pane,
+                PizzaStatus::Failed(PizzaFetchError::Service(KytrixServiceError::Closed)),
+                cx,
+            );
+            pane.update(cx, |pane, cx| pane.start(true, cx));
+
+            assert_eq!(
+                pane.read(cx).accepted_revision(),
+                None,
+                "the revision numbers one stream, and this is another one"
+            );
+            assert_eq!(
+                level_of(&pane, cx),
+                Some(PizzaLevel::ExerciseTerm),
+                "the reading the user was looking at is still there"
+            );
+            assert!(
+                pane.read(cx).has_content(),
+                "a pane that kept its reading still has something to draw"
+            );
+
+            assert!(
+                report_reading(&pane, 1, reading(5), cx),
+                "the first reading of the new stream is a change"
+            );
+            assert_eq!(
+                level_of(&pane, cx),
+                Some(PizzaLevel::FadeOut),
+                "and it is what the pane now draws"
+            );
+        });
+    }
+
+    /// A loading reader who signs out is waiting for an account, not for the load it
+    /// no longer follows: the answer belongs to the stream that left with the
+    /// account, and reporting it as a failure would hide the account request.
+    #[gpui_kit::test]
+    fn a_load_answer_for_a_reader_that_signed_out_should_not_fail_the_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.load(cx);
+                pane.reconcile_account(None, cx);
+                pane.apply_load_result(
+                    Err(RpcCallError::ServiceClosed {
+                        request_id: RequestId::new(1),
+                    }),
+                    cx,
+                );
+            });
+
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
+                "the load answered for the account that left"
+            );
+        });
+    }
+
+    /// The same for a refresh: the command belonged to the stream the sign-out
+    /// replaced, so its answer is not one this pane may report.
+    #[gpui_kit::test]
+    fn a_refresh_answer_for_a_reader_that_signed_out_should_not_fail_the_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = pane(cx);
+        let due = unix_millis().saturating_add(600_000);
+
+        cx.update(|cx| {
+            report_reading(&pane, 1, reading(3), cx);
+            report_status(
+                &pane,
+                PizzaStatus::Ready {
+                    revision: 1,
+                    next_refresh_at: due,
+                },
+                cx,
+            );
+            pane.update(cx, |pane, cx| {
+                pane.refresh(cx);
+                assert!(pane.refresh_pending, "the click puts a refresh in flight");
+                pane.reconcile_account(None, cx);
+                pane.apply_refresh_result(
+                    Err(RpcCallError::ServiceClosed {
+                        request_id: RequestId::new(2),
+                    }),
+                    cx,
+                );
+            });
+
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
+                "the refresh answered for the account that left"
+            );
+        });
+    }
+
+    /// A reader the service does not know is told what it is waiting for rather than
+    /// being sent after an answer nobody will serve it.
+    #[gpui_kit::test]
+    fn a_signed_out_load_should_wait_for_an_account(cx: &mut TestAppContext) {
+        let pane = pane_with(cx, None);
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.load(cx));
+
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out"))
+            );
+            assert!(!pane.read(cx).has_content());
+            assert!(pane.read(cx).current_key().is_none());
         });
     }
 
@@ -1014,24 +1182,50 @@ mod tests {
         });
     }
 
-    /// Signing out takes the reading with it and asks for an account rather than
-    /// reporting a failure: nothing has gone wrong, the pane is just not for an
-    /// anonymous reader.
+    /// Signing out takes the reading with it — and the revision, the deadline and the
+    /// countdown counted against it — and asks for an account rather than reporting a
+    /// failure: nothing has gone wrong, the pane is just not for an anonymous reader.
     #[gpui_kit::test]
     fn signing_out_should_take_the_reading_with_it(cx: &mut TestAppContext) {
         let pane = pane(cx);
+        let due = unix_millis().saturating_add(600_000);
 
         cx.update(|cx| {
             report_reading(&pane, 1, reading(3), cx);
+            report_status(
+                &pane,
+                PizzaStatus::Ready {
+                    revision: 1,
+                    next_refresh_at: due,
+                },
+                cx,
+            );
+            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
+            assert!(pane.read(cx).has_content());
+
             pane.update(cx, |pane, cx| pane.reconcile_account(None, cx));
 
             assert!(!pane.read(cx).has_content());
+            assert!(
+                pane.read(cx).reading.is_none(),
+                "the reading was served to an account that just left"
+            );
+            assert_eq!(pane.read(cx).accepted_revision(), None);
             assert_eq!(
                 pane.read(cx).status.state(cx),
                 WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
                 "a signed-out pane waits for an account"
             );
             assert!(pane.read(cx).current_key().is_none());
+            assert!(
+                pane.read(cx).countdown.is_none(),
+                "a pane waiting for an account is not counting down to a read"
+            );
+
+            // The task that rebuilds the label must not revive it out of a deadline
+            // the sign-out was supposed to drop.
+            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
+            assert!(pane.read(cx).countdown.is_none());
         });
     }
 
@@ -1058,6 +1252,53 @@ mod tests {
                 pane.read(cx).current_key(),
                 Some(other_key()),
                 "the pane follows the account the settings now hold"
+            );
+        });
+    }
+
+    /// The pane follows the account through the settings event, not only through a
+    /// reload: a reader who signs in is re-scoped, and one who signs out is asked for
+    /// an account rather than left with the reading of the account that left.
+    ///
+    /// The fixture's binding is cancelled, so the load the new account starts is
+    /// answered by the closed service instead of by a source. That answer is not what
+    /// this test is about: the scope the pane took from the event is.
+    #[gpui_kit::test]
+    fn an_account_change_should_re_scope_the_pane(cx: &mut TestAppContext) {
+        let pane = pane(cx);
+
+        cx.update(|cx| {
+            report_reading(&pane, 1, reading(3), cx);
+            assert!(pane.read(cx).has_content());
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| *config = settings(Some("second-account")), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                pane.read(cx).account_id.as_deref(),
+                Some("second-account"),
+                "the pane hears the account change from the settings"
+            );
+            assert!(
+                !pane.read(cx).has_content(),
+                "the reading was served to the account that left"
+            );
+            assert_eq!(pane.read(cx).current_key(), Some(other_key()));
+
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| *config = settings(None), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
+                "signing out asks for an account"
             );
         });
     }
@@ -1140,9 +1381,12 @@ mod tests {
             ] {
                 cx.set_global(language);
 
+                // One of each failure rather than one per value: every variant is a
+                // key of its own, and a level that renders is the same key whatever
+                // number it names.
                 for error in [
+                    PizzaDataError::MissingObservation,
                     PizzaDataError::UnknownLevel { level: 9 },
-                    PizzaDataError::UnknownLevel { level: 0 },
                 ] {
                     assert!(
                         !error.localized_message(cx).is_empty(),
@@ -1158,15 +1402,27 @@ mod tests {
                         "{error:?} renders empty in {language}"
                     );
                 }
+                // The failures the connector answers with: a closed connection, a
+                // deadline, and the two an answer of the wrong shape produces.
                 for error in [
-                    PizzaFetchError::Service(KytrixServiceError::Timeout),
-                    PizzaFetchError::Data(PizzaDataError::UnknownLevel { level: 9 }),
+                    KytrixServiceError::Closed,
+                    KytrixServiceError::Timeout,
+                    KytrixServiceError::Authentication("expired".into()),
+                    KytrixServiceError::Protocol("missing data".into()),
                 ] {
                     assert!(
-                        !error.localized_message(cx).is_empty(),
+                        !PizzaFetchError::Service(error.clone())
+                            .localized_message(cx)
+                            .is_empty(),
                         "{error:?} renders empty in {language}"
                     );
                 }
+                assert!(
+                    !PizzaFetchError::Data(PizzaDataError::MissingObservation)
+                        .localized_message(cx)
+                        .is_empty(),
+                    "a data failure renders empty in {language}"
+                );
             }
         });
     }
@@ -1190,12 +1446,5 @@ mod tests {
             "--",
             "an instant past the calendar is a placeholder, not a made-up date"
         );
-    }
-
-    /// A request id nobody asked for is not one the pane may act on, which is what
-    /// the binding's own filtering is for; this pins the type the pane reports with.
-    #[test]
-    fn a_request_id_should_identify_one_call() {
-        assert_eq!(RequestId::new(7).get(), 7);
     }
 }

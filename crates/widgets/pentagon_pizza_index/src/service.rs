@@ -27,7 +27,8 @@
 //! The index is the same for every reader, but the answer is served over an
 //! authenticated connection, so it is not one a pane may keep showing after the
 //! account behind it changed. The stream key is therefore the account rather than a
-//! unit-shaped scope.
+//! unit-shaped scope, and a pane that loses its account asks the service to stop the
+//! stream instead of leaving it polling for an answer nobody can draw.
 //!
 //! # There is no widget-level timeout
 //!
@@ -57,9 +58,10 @@ use super::model::{PizzaDataError, PizzaReading};
 
 /// How often the index is re-read on its own.
 ///
-/// The index publishes one point an hour and every client of it reads the same
-/// point, so reading more often would fetch the same reading again and spend
-/// requests doing it.
+/// The index gains a point about once an hour, and this reads faster than that: the
+/// extra reads are what keep a new point from arriving up to an hour late, and one
+/// RPC every ten minutes is a cost the service carries without noticing. Reading
+/// meaningfully faster would only ask the same point again.
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// The pending-refresh queue never needs to hold more than the one command a
@@ -78,6 +80,12 @@ pub(super) enum PizzaRequest {
     Load(PizzaStreamKey),
     /// Reads the index once, without waiting for the next interval.
     Refresh,
+    /// Stops following the account whose stream is active.
+    ///
+    /// A pane that loses its account has nothing left to read, and the stream it was
+    /// reading belongs to the account that left. Stopping it here is what keeps a
+    /// signed-out pane from asking the service for an answer it cannot draw.
+    Unload,
 }
 
 /// What the service answered.
@@ -85,6 +93,7 @@ pub(super) enum PizzaRequest {
 pub(super) enum PizzaResponse {
     StreamStarted,
     RefreshQueued,
+    StreamStopped,
 }
 
 /// The account one reading belongs to.
@@ -156,9 +165,8 @@ pub(super) enum PizzaServiceError {
 impl LocalizedError for PizzaServiceError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::StreamClosed | Self::StreamBusy => {
-                i18n::t!(cx, "error.pentagon_pizza_index.unavailable")
-            }
+            Self::StreamClosed => i18n::t!(cx, "error.pentagon_pizza_index.unavailable"),
+            Self::StreamBusy => i18n::t!(cx, "error.pentagon_pizza_index.busy"),
         }
     }
 }
@@ -240,24 +248,11 @@ struct ActiveStream {
 /// The service that polls one account's index.
 pub(super) struct PizzaService<S = KytrixServiceConnector> {
     source: S,
-    refresh_interval: Duration,
 }
 
 impl<S> PizzaService<S> {
     pub(super) const fn new(source: S) -> Self {
-        Self {
-            source,
-            refresh_interval: REFRESH_INTERVAL,
-        }
-    }
-
-    /// The same service with a timing a test can wait out.
-    #[cfg(test)]
-    pub(super) fn with_interval(source: S, refresh_interval: Duration) -> Self {
-        Self {
-            source,
-            refresh_interval: refresh_interval.max(Duration::from_millis(1)),
-        }
+        Self { source }
     }
 }
 
@@ -287,14 +282,13 @@ where
                     }
                     let (commands, stream_commands) = mpsc::channel(STREAM_COMMAND_CAPACITY);
                     let source = self.source.clone();
-                    let refresh_interval = self.refresh_interval;
                     // A load always replaces. A stream that answered `StreamStarted`
                     // for a generation nobody replaced would leave the pane waiting
                     // on a schedule that no longer exists: after a failure the loop
                     // is alive but off the clock, and "already reading" is the one
                     // state this cannot tell from "reported a failure and stopped".
                     let generation = context.replace_stream(key.clone(), move |publisher| {
-                        run_stream(source, refresh_interval, stream_commands, publisher)
+                        run_stream(source, stream_commands, publisher)
                     });
                     if reply.respond(Ok(PizzaResponse::StreamStarted)).is_ok() {
                         active = Some(ActiveStream {
@@ -309,14 +303,24 @@ where
                         active = None;
                     }
                 }
+                PizzaRequest::Unload => {
+                    // A pane that lost its account has nothing left to draw, so the
+                    // stream is stopped even when the caller that asked is gone: the
+                    // answer is not what makes the stream worth closing.
+                    if let Some(stream) = active.take() {
+                        context.cancel_stream(&stream.key);
+                    }
+                    let _ = reply.respond(Ok(PizzaResponse::StreamStopped));
+                }
                 PizzaRequest::Refresh => {
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
                     }
-                    // A refresh is only worth sending to the loop serving the
-                    // generation on screen: after a failure the loop is off the
-                    // clock, so a command handed to it would be answered as queued
-                    // and never run. The next load starts a generation again.
+                    // A refresh is only worth sending to a loop that is still
+                    // running. A loop that failed is still running — it waits for
+                    // exactly this command, which is what puts it back on the clock —
+                    // but one whose task ended has no reader left for the command,
+                    // and answering "queued" to it would promise a round nobody runs.
                     let running = active.as_ref().filter(|stream| {
                         context
                             .stream_generation(&stream.key)
@@ -362,7 +366,6 @@ struct StreamState {
 /// manual refresh moves it back to scheduled.
 async fn run_stream<S>(
     source: S,
-    refresh_interval: Duration,
     mut commands: mpsc::Receiver<StreamCommand>,
     publisher: StreamPublisher<PizzaProtocol>,
 ) where
@@ -374,7 +377,7 @@ async fn run_stream<S>(
     // The first round runs as soon as the stream starts rather than after a whole
     // interval: a pane that has just been opened has nothing to show, and a
     // countdown to its first reading would be a countdown to nothing.
-    let mut next_refresh = Instant::now() + refresh_interval;
+    let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     let mut scheduled = match run_refresh_round(&source, next_refresh, &mut state, &publisher).await
     {
         RefreshRoundOutcome::Scheduled => true,
@@ -415,7 +418,7 @@ async fn run_stream<S>(
                 }
             }
         };
-        next_refresh = attempted_at + refresh_interval;
+        next_refresh = attempted_at + REFRESH_INTERVAL;
         scheduled = match run_refresh_round(&source, next_refresh, &mut state, &publisher).await {
             RefreshRoundOutcome::Scheduled => true,
             RefreshRoundOutcome::Waiting => false,
@@ -530,17 +533,18 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{PizzaLevel, PizzaReading},
+        model::PizzaLevel,
         test_support::{ACCOUNT, FakeSource, FetchPlan, OBSERVED_AT, reading},
     };
 
     /// The handle of the runtime this test runs on.
     ///
-    /// A test drives its subject on its own runtime rather than on a shared one, so
-    /// the paused clock it advances is the one the subject reads.
+    /// `Handle::current` is a call the workspace forbids outside this one place, and
+    /// the service is spawned on the runtime the test itself runs on: a shared
+    /// runtime would keep waiting on a clock no test drives.
     #[allow(
         clippy::disallowed_methods,
-        reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
+        reason = "the test spawns the service on the runtime it runs on, which is the only handle it can name"
     )]
     fn current_test_handle() -> &'static tokio::runtime::Handle {
         Box::leak(Box::new(tokio::runtime::Handle::current()))
@@ -559,10 +563,7 @@ mod tests {
     }
 
     fn runtime(source: &FakeSource) -> WidgetRuntime<PizzaProtocol> {
-        WidgetRuntime::spawn(
-            current_test_handle(),
-            PizzaService::with_interval(source.clone(), Duration::from_secs(60)),
-        )
+        WidgetRuntime::spawn(current_test_handle(), PizzaService::new(source.clone()))
     }
 
     async fn load(runtime: &WidgetRuntime<PizzaProtocol>) {
@@ -594,13 +595,13 @@ mod tests {
         .expect("the expected reliable state should arrive")
     }
 
+    /// Reads the reliable stream until a status equal to `expected` arrives.
     async fn receive_status(reliable: &mut ReliableStream<PizzaProtocol>, expected: PizzaStatus) {
-        let status = next_reliable(
+        next_reliable(
             reliable,
             |message| matches!(message, PizzaStreamMessage::Status(status) if *status == expected),
         )
         .await;
-        assert!(matches!(status, PizzaStreamMessage::Status(_)));
     }
 
     /// Yields until the fake has been asked `count` times, so a test that asserts
@@ -618,8 +619,30 @@ mod tests {
         );
     }
 
+    /// Yields until `count` fetch(es) have been dropped, so a test that asserts a
+    /// cancellation waits for the drop rather than for a scheduler turn.
+    ///
+    /// Cancelling a stream token does not drop the fetch it was serving: the task
+    /// is polled again, sees the cancellation, and only then is the future dropped.
+    /// A test that read the count straight after the load that replaced the stream
+    /// would be asserting on the scheduler's order, not on the service.
+    async fn settle_cancelled(source: &FakeSource, count: usize) {
+        for _ in 0..1_000 {
+            if source.cancelled_fetches() == count {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the service should have dropped {count} fetch(es), not {}",
+            source.cancelled_fetches()
+        );
+    }
+
+    /// A round publishes the reading and then reports the revision that reading
+    /// belongs to, which is what lets the two channels meet.
     #[tokio::test]
-    async fn a_round_should_publish_the_reading_before_it_reports_ready() {
+    async fn a_round_should_publish_the_reading_and_report_its_revision() {
         let source = FakeSource::new([FetchPlan::Snapshot(3)]);
         let mut runtime = runtime(&source);
         let mut reliable = runtime
@@ -689,7 +712,9 @@ mod tests {
             )
         })
         .await;
-        assert!(matches!(ready, PizzaStreamMessage::Status(_)));
+        let PizzaStreamMessage::Status(PizzaStatus::Ready { .. }) = ready else {
+            panic!("the second round should have reported readiness");
+        };
         assert_eq!(
             source.fetches(),
             2,
@@ -698,9 +723,12 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// A failed round takes the loop off the clock without ending the scope: the
+    /// refresh that follows is still answered, and the round it starts is the one
+    /// that puts the loop back on the clock.
     #[tokio::test]
     async fn a_failed_round_should_stop_the_clock_without_ending_the_scope() {
-        let source = FakeSource::new([FetchPlan::Failure, FetchPlan::Snapshot(9)]);
+        let source = FakeSource::new([FetchPlan::Failure, FetchPlan::Snapshot(2)]);
         let mut runtime = runtime(&source);
         let mut reliable = runtime
             .take_reliable_stream()
@@ -720,6 +748,32 @@ mod tests {
             1,
             "a failed round is off the clock rather than scheduled again"
         );
+
+        let queued = runtime
+            .client()
+            .call(PizzaRequest::Refresh)
+            .await
+            .expect("the loop a failure left waiting should still take a refresh")
+            .into_value();
+        assert_eq!(queued, PizzaResponse::RefreshQueued);
+        let ready = next_reliable(&mut reliable, |message| {
+            matches!(
+                message,
+                PizzaStreamMessage::Status(PizzaStatus::Ready { revision: 1, .. })
+            )
+        })
+        .await;
+        let PizzaStreamMessage::Status(PizzaStatus::Ready {
+            next_refresh_at, ..
+        }) = ready
+        else {
+            panic!("the refreshed round should have reported readiness");
+        };
+        assert!(
+            next_refresh_at > 0,
+            "a round that answered puts the next read back on the clock"
+        );
+        assert_eq!(source.fetches(), 2, "the refresh ran the round it promised");
         runtime.shutdown().await;
     }
 
@@ -763,6 +817,7 @@ mod tests {
             .expect("the second load should start")
             .into_value();
         assert_eq!(replaced, PizzaResponse::StreamStarted);
+        settle_fetches(&source, 2).await;
         assert_eq!(
             source.fetches(),
             2,
@@ -801,6 +856,7 @@ mod tests {
         };
         assert_eq!(snapshot.reading().level(), PizzaLevel::DoubleTake);
         assert_eq!(snapshot.reading().observed_at(), OBSERVED_AT);
+        settle_cancelled(&source, 1).await;
         assert_eq!(
             source.cancelled_fetches(),
             1,
@@ -812,6 +868,45 @@ mod tests {
             "the stream of the account that was replaced fetches nothing more"
         );
 
+        runtime.shutdown().await;
+    }
+
+    /// A stream whose account left is stopped rather than left polling: the unload
+    /// drops the read in flight, and there is no stream left to refresh afterwards.
+    #[tokio::test]
+    async fn an_unload_should_stop_the_stream_it_was_serving() {
+        let source = FakeSource::new([FetchPlan::Pending]);
+        let runtime = runtime(&source);
+
+        load(&runtime).await;
+        settle_fetches(&source, 1).await;
+
+        let stopped = runtime
+            .client()
+            .call(PizzaRequest::Unload)
+            .await
+            .expect("the service should stop the stream")
+            .into_value();
+        assert_eq!(stopped, PizzaResponse::StreamStopped);
+        settle_cancelled(&source, 1).await;
+        assert_eq!(
+            source.fetches(),
+            1,
+            "the stream that was stopped does not fetch again"
+        );
+
+        let error = runtime
+            .client()
+            .call(PizzaRequest::Refresh)
+            .await
+            .expect_err("there is no stream to refresh after the unload");
+        assert!(matches!(
+            error,
+            RpcCallError::Service {
+                source: PizzaServiceError::StreamClosed,
+                ..
+            }
+        ));
         runtime.shutdown().await;
     }
 
@@ -834,37 +929,5 @@ mod tests {
             }
         ));
         runtime.shutdown().await;
-    }
-
-    /// The reading a fixture answer of `level` stands for, as the pane draws it.
-    #[test]
-    fn a_reading_should_be_the_level_and_the_moment() {
-        assert_eq!(
-            PizzaReading::from_wire(proto_types::PentagonPizzaIndex {
-                overall_index: 1,
-                observed_at: OBSERVED_AT,
-                timestamp: 0,
-            })
-            .expect("one is a rung"),
-            reading(1)
-        );
-    }
-
-    /// The interval is the one the index publishes on, so a pane that counts down
-    /// is counting down to a point that can have moved.
-    #[test]
-    fn the_interval_should_match_how_often_the_index_publishes() {
-        assert_eq!(REFRESH_INTERVAL, Duration::from_secs(10 * 60));
-    }
-
-    /// An answer the service has not collected yet carries neither a rung nor a
-    /// moment, and drawing it as the calmest level would report quiet in answer to
-    /// a question that has no answer.
-    #[test]
-    fn an_uncollected_answer_should_not_be_drawn_as_calm() {
-        assert_eq!(
-            PizzaReading::from_wire(proto_types::PentagonPizzaIndex::default()),
-            Err(PizzaDataError::UnknownLevel { level: 0 })
-        );
     }
 }

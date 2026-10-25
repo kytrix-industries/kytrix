@@ -403,6 +403,8 @@ error:
     snapshot_unavailable: 订单簿快照不可用
     subscription_closed: 订单簿订阅已关闭
   pentagon_pizza_index:
+    busy: 五角大楼披萨指数已有一次读取正在进行
+    missing_observation: 五角大楼披萨指数还没有观测到任何点位
     unavailable: 五角大楼披萨指数未连接
     unknown_level: 五角大楼披萨指数返回了本版本无法识别的等级（%{level}）
   rpc:

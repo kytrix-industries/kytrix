@@ -2079,6 +2079,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// The pizza index is read over the Kytrix service, so the cloud line is the one
+    /// that configures it.
+    ///
+    /// A capability no group lists is one the application routes without offering a
+    /// way to change the route — the page would look complete and the line would be
+    /// unreachable. The rows are written rather than read because a group writes
+    /// every target it stands for, so the target read back is what says it is covered.
+    #[test]
+    fn the_pizza_index_should_be_configured_by_a_line_the_page_offers() {
+        let catalog = catalog_of();
+        let applications = page(&catalog, "proxy-applications");
+        let mut config = Config::default();
+        let row = field(applications, "proxy-applications.kytrix.cloud");
+
+        row.access.write(&mut config, &FieldValue::new_static("hk"));
+
+        assert_eq!(
+            crate::access::proxy_route_of(
+                &config,
+                &ServiceTarget::KytrixService {
+                    capability: KytrixServiceCapability::PentagonPizzaIndex,
+                },
+            ),
+            "hk",
+            "the cloud line writes the route of the index"
+        );
+    }
+
     /// One page per venue this build speaks, and the page offers the fields that venue's API has.
     #[test]
     fn one_venue_should_have_one_page() {

@@ -115,9 +115,16 @@ impl PizzaReading {
     /// The answer carries the rung in a `uint32` because the protocol has no enum
     /// for it, so the scale is what decides whether the number is a level at all:
     /// a value above a byte cannot be a rung any more than a zero can.
+    ///
+    /// The moment is checked first, because a zero one is what a collector that has
+    /// not run yet answers with, and no reading was ever observed at the start of
+    /// 1970: reporting the rung of that answer would name a level nothing published.
     pub(super) fn from_wire(
         index: proto_types::PentagonPizzaIndex,
     ) -> Result<Self, PizzaDataError> {
+        if index.observed_at <= 0 {
+            return Err(PizzaDataError::MissingObservation);
+        }
         let level = u8::try_from(index.overall_index)
             .ok()
             .and_then(PizzaLevel::from_number)
@@ -155,6 +162,10 @@ impl PizzaReading {
 /// Why a published answer could not be read as a reading.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum PizzaDataError {
+    /// The answer carries no observation time, which is what a collector that has
+    /// not run yet answers with.
+    #[error("the Pentagon Pizza Index has not observed a point yet")]
+    MissingObservation,
     #[error("the Pentagon Pizza Index published the unknown level {level}")]
     UnknownLevel { level: u32 },
 }
@@ -162,6 +173,7 @@ pub(super) enum PizzaDataError {
 impl LocalizedError for PizzaDataError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
+            Self::MissingObservation => t!(cx, "error.pentagon_pizza_index.missing_observation"),
             // The level is the service's own number and the pane has no name for
             // it: a sentence showing it is the only honest thing to say, and it is
             // still a sentence about what arrived rather than about the service's
@@ -180,16 +192,7 @@ impl LocalizedError for PizzaDataError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One answer of the service, exactly as the index publishes it: the calmest
-    /// rung, observed at a moment of its own.
-    fn answer(level: u32) -> proto_types::PentagonPizzaIndex {
-        proto_types::PentagonPizzaIndex {
-            overall_index: level,
-            observed_at: 1_792_821_600_000,
-            timestamp: 1_790_000_000_000,
-        }
-    }
+    use crate::test_support::{OBSERVED_AT, answer};
 
     /// The answer the pane is built for is one the typed DTO reads, and the two
     /// fields it is drawn from are the ones the answer actually carries.
@@ -200,9 +203,25 @@ mod tests {
         assert_eq!(reading.level(), PizzaLevel::FadeOut);
         assert_eq!(
             reading.observed_at(),
-            1_792_821_600_000,
+            OBSERVED_AT,
             "the moment the index observed the point at"
         );
+    }
+
+    /// A collector that has not run yet answers with a message nothing was filled
+    /// in, and reporting its rung would name a level nothing published.
+    #[test]
+    fn an_answer_without_an_observation_should_not_be_read_as_a_reading() {
+        for observed_at in [0_i64, -1, i64::MIN] {
+            let mut unanswered = answer(5);
+            unanswered.observed_at = observed_at;
+
+            assert_eq!(
+                PizzaReading::from_wire(unanswered),
+                Err(PizzaDataError::MissingObservation),
+                "no point was ever observed at {observed_at}"
+            );
+        }
     }
 
     /// The scale is closed, so a level outside it is refused rather than clamped

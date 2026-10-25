@@ -403,6 +403,8 @@ error:
     snapshot_unavailable: The order-book snapshot is unavailable
     subscription_closed: The order-book subscription closed
   pentagon_pizza_index:
+    busy: A Pentagon Pizza Index read is already in flight
+    missing_observation: The Pentagon Pizza Index has not observed a point yet
     unavailable: The Pentagon Pizza Index is not connected
     unknown_level: The Pentagon Pizza Index published a level this version cannot read (%{level})
   rpc:

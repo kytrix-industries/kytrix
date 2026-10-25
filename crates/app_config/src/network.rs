@@ -41,10 +41,10 @@ pub enum KytrixServiceCapability {
     /// The Pentagon Pizza Index, a snapshot the Kytrix service reads.
     ///
     /// It is one of Kytrix's own outbound routes rather than a venue's: no market
-    /// participant publishes it, and it has no account, no session and no catalog of
-    /// its own. It is still a capability here because a reader behind a firewall has
-    /// to be able to send it down a line of its own, which is what every other
-    /// outbound address in the application can do.
+    /// participant publishes it, and it has no catalog of its own. The index itself
+    /// needs no account, but the service serves it over the authenticated connection
+    /// the pane already holds, so it is configured here like every other capability
+    /// and shares the cloud line with them.
     #[serde(rename = "pentagon_pizza_index")]
     PentagonPizzaIndex,
     #[serde(rename = "updater_metadata")]
