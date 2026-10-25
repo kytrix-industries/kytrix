@@ -125,6 +125,8 @@ error:
     stream_unavailable: The ETF data stream is unavailable
     timeout: The ETF request timed out after %{seconds} seconds
     too_many_rows: The ETF answer exceeds the %{maximum}-day history limit
+  hormuz_vessel_map:
+    map_asset: The map could not be drawn because the packaged coastline could not be read
   market_participants:
     authentication_failed: 'Authentication for the %{venue} market participant account failed: %{cause}'
     capability_mismatch: The protocol request requires the %{expected} capability, but the request context declares %{actual}
@@ -594,6 +596,82 @@ widget:
     value: '%{label}: %{value}'
   force_orders:
     table: Live force orders from %{markets}
+  hormuz_vessel_map:
+    entitlement_required: This account does not include the AIS vessel feed
+    hover:
+      call_sign: Call sign
+      course: Course over ground
+      destination: Destination
+      dimensions: Dimensions
+      draught: Draught
+      eta: ETA
+      flag: Flag state
+      heading: Heading
+      imo: IMO
+      mmsi: MMSI
+      nav_status: Navigation status
+      ship_name: Vessel name
+      ship_type: Vessel type
+      speed: Speed over ground
+      updated: Server receipt time
+    label:
+      city:
+        al_hofuf: Al Hofuf
+        al_jubayl: Al Jubayl
+        bandar_abbas: Bandar Abbas
+        bandar_lengeh: Bandar Lengeh
+        chabahar: Chabahar
+        fujairah: Fujairah
+        khasab: Khasab
+        muscat: Muscat
+        qeshm: Qeshm
+        ras_al_khaimah: Ras Al Khaimah
+        sharjah: Sharjah
+        sur: Sur
+      country:
+        bahrain: Bahrain
+        iran: Iran
+        oman: Oman
+        qatar: Qatar
+        uae: United Arab Emirates
+      water:
+        gulf_of_oman: Gulf of Oman
+        persian_gulf: Persian Gulf
+    legend:
+      bulk: Bulk carrier
+      container: Container ship
+      other: Other vessel
+      tanker: Tanker
+      title: Vessel types
+    nav_status:
+      "0": Under way using engine
+      "1": At anchor
+      "2": Not under command
+      "3": Restricted manoeuvrability
+      "4": Constrained by her draught
+      "5": Moored
+      "6": Aground
+      "7": Engaged in fishing
+      "8": Under way sailing
+      "9": Reserved for a future high-speed craft
+      "10": Reserved for a future wing-in-ground craft
+      "11": Towing astern
+      "12": Pushing ahead or towing alongside
+      "13": Reserved
+      "14": AIS-SART
+    ship_type:
+      bulk: Bulk carrier
+      container: Container ship
+      other: Other vessel
+      tanker: Tanker
+    sign_in: <p align="center">You need to register or log in to see the vessels in the strait.</p>
+    stale: Live updates have stopped
+    stale_seconds: No update received for %{seconds}s
+    unavailable: —
+    vessel_count: '%{count} vessels'
+    vessel_count_one: 1 vessel
+    view_plans: View plans
+    waiting_data: Waiting for the first positions to arrive
   hyperliquid_wallet_monitor:
     add: Add monitored address
     age_days: '%{value}d ago'
@@ -703,6 +781,7 @@ widget:
     empty: Empty
     etf_flow: ETF Flow
     force_orders: Force Orders Stream
+    hormuz_vessel_map: Hormuz Vessel Map
     hyperliquid_wallet_monitor: Hyperliquid Wallet Monitor
     indices: Indices
     long_short_account_ratio: Long/Short Account Ratio

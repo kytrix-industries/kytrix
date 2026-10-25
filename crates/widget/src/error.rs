@@ -2966,6 +2966,10 @@ mod tests {
             include_str!("../../widgets/force_orders/src/view.rs"),
         ),
         (
+            "crates/widgets/hormuz_vessel_map/src/view.rs",
+            include_str!("../../widgets/hormuz_vessel_map/src/view.rs"),
+        ),
+        (
             "crates/widgets/hyperliquid_wallet_monitor/src/view.rs",
             include_str!("../../widgets/hyperliquid_wallet_monitor/src/view.rs"),
         ),

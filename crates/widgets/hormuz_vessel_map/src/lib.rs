@@ -1,3 +1,4 @@
-pub mod model;
-pub mod scene;
-pub mod service;
+mod model;
+mod scene;
+mod service;
+pub mod view;

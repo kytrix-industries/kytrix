@@ -25,7 +25,7 @@
 //! would have to have read the failure before that happened. Nothing here retries or
 //! backs off — a terminal failure stays terminal until the user acts.
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use gpui_kit::{App, SharedString};
 use kytrix_service_provider::service::{
@@ -48,14 +48,14 @@ use super::model::MAX_VESSELS;
 
 /// The account whose AIS picture a stream carries, and the area it covers.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct AisScope {
+pub(super) struct AisScope {
     pub account: SmolStr,
     pub area: AisArea,
 }
 
 impl AisScope {
     /// The scope an account follows. A pane reads the one area the map draws.
-    pub fn new(account: SmolStr) -> Self {
+    pub(super) fn new(account: SmolStr) -> Self {
         Self {
             account,
             area: AisArea::Hormuz,
@@ -65,7 +65,7 @@ impl AisScope {
 
 /// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AisRequest {
+pub(super) enum AisRequest {
     /// Follows the scope's area, replacing whatever stream is running.
     Load { scope: AisScope },
     /// Follows nothing, because nobody is signed in.
@@ -74,7 +74,7 @@ pub enum AisRequest {
 
 /// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AisResponse {
+pub(super) enum AisResponse {
     /// The area's stream is running.
     StreamStarted,
     /// Nothing is followed.
@@ -83,7 +83,7 @@ pub enum AisResponse {
 
 /// Why a stream stopped, or why it never started.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum AisStreamError {
+pub(super) enum AisStreamError {
     /// The account's session could not be taken, or the subscription was refused.
     #[error(transparent)]
     Service(#[from] KytrixServiceError),
@@ -108,15 +108,19 @@ impl LocalizedError for AisStreamError {
 
 /// One message of an area's stream.
 #[derive(Clone, Debug)]
-pub enum AisStreamMessage {
+pub(super) enum AisStreamMessage {
     /// One push from the server: a keyframe, or an increment continuing the picture.
     Update(AisUpdate),
     /// The stream is over; this travels reliably so the pane is told before the entry
     /// that would have carried it is retired.
-    Failed(AisStreamError),
+    ///
+    /// The error is shared rather than cloned into the view's failure state: the view is
+    /// handed the message behind an `Arc`, and what it reports to the framework is also
+    /// an `Arc`, so one failure is one allocation from the stream to the banner.
+    Failed(Arc<AisStreamError>),
 }
 
-pub struct AisProtocol;
+pub(super) struct AisProtocol;
 
 impl WidgetProtocol for AisProtocol {
     type Request = AisRequest;
@@ -130,7 +134,7 @@ impl WidgetProtocol for AisProtocol {
 ///
 /// The service is written against this seam rather than against the connector, so a test
 /// can drive every state a session and a subscription can be in without one.
-pub trait AisSource: Clone + Send + Sync + 'static {
+pub(super) trait AisSource: Clone + Send + Sync + 'static {
     type Session: AisSession;
 
     /// Takes the account's session, which the area's subscription is opened through.
@@ -141,7 +145,7 @@ pub trait AisSource: Clone + Send + Sync + 'static {
 }
 
 /// One account's session.
-pub trait AisSession: Clone + Send + Sync + 'static {
+pub(super) trait AisSession: Clone + Send + Sync + 'static {
     /// The subscription one area is followed through.
     ///
     /// It is an associated type rather than the concrete `Subscription<AisUpdate>` so a
@@ -156,7 +160,7 @@ pub trait AisSession: Clone + Send + Sync + 'static {
 }
 
 /// One live AIS subscription.
-pub trait AisEventSubscription: Send + 'static {
+pub(super) trait AisEventSubscription: Send + 'static {
     fn recv(&mut self) -> impl Future<Output = Result<AisUpdate, TransportError>> + Send;
 }
 
@@ -183,12 +187,12 @@ impl AisEventSubscription for Subscription<AisUpdate> {
 }
 
 /// The service that follows one pane's AIS picture.
-pub struct AisService<S = KytrixServiceConnector> {
+pub(super) struct AisService<S = KytrixServiceConnector> {
     source: S,
 }
 
 impl<S> AisService<S> {
-    pub const fn new(source: S) -> Self {
+    pub(super) const fn new(source: S) -> Self {
         Self { source }
     }
 }
@@ -310,7 +314,7 @@ fn clamp_to_capacity(mut update: AisUpdate) -> AisUpdate {
 /// task that ended retires the key's latest entry before the pane could read it.
 async fn publish_failure(publisher: &StreamPublisher<AisProtocol>, error: AisStreamError) {
     let _ = publisher
-        .publish_reliable(AisStreamMessage::Failed(error))
+        .publish_reliable(AisStreamMessage::Failed(Arc::new(error)))
         .await;
     publisher.cancelled().await;
 }
@@ -441,7 +445,7 @@ mod tests {
         let AisStreamMessage::Failed(error) = message else {
             panic!("the message should be a failure");
         };
-        error
+        (*error).clone()
     }
 
     async fn next_update(latest: &mut LatestStream<AisProtocol>) -> AisUpdate {

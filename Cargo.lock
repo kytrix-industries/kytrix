@@ -4206,6 +4206,7 @@ version = "0.0.2"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "gpui-kit",
  "i18n",
@@ -4217,6 +4218,7 @@ dependencies = [
  "time",
  "tokio",
  "widget",
+ "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -10860,6 +10862,7 @@ dependencies = [
  "etf",
  "force_orders",
  "gpui-kit",
+ "hormuz_vessel_map",
  "hyperliquid_wallet_monitor",
  "i18n",
  "indices",

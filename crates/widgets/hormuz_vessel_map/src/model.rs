@@ -29,52 +29,41 @@
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
-use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::style::theme::Theme;
 use gpui_kit::Hsla;
 use kytrix_service_provider::service::ais::{AisPosition, AisStatic, AisUpdate};
-use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
 /// The west edge of the map, in degrees east.
-pub const MAP_WEST: f32 = 48.0;
+pub(super) const MAP_WEST: f32 = 48.0;
 /// The east edge of the map, in degrees east.
-pub const MAP_EAST: f32 = 62.0;
+pub(super) const MAP_EAST: f32 = 62.0;
 /// The south edge of the map, in degrees north.
-pub const MAP_SOUTH: f32 = 21.5;
+pub(super) const MAP_SOUTH: f32 = 21.5;
 /// The north edge of the map, in degrees north.
-pub const MAP_NORTH: f32 = 28.5;
-
-/// The west edge of the area positions are reported for, in degrees east.
-pub const AIS_WEST: f32 = 53.5;
-/// The east edge of the area positions are reported for, in degrees east.
-pub const AIS_EAST: f32 = 59.0;
-/// The south edge of the area positions are reported for, in degrees north.
-pub const AIS_SOUTH: f32 = 24.0;
-/// The north edge of the area positions are reported for, in degrees north.
-pub const AIS_NORTH: f32 = 28.3;
+pub(super) const MAP_NORTH: f32 = 28.5;
 
 /// The most vessels one picture holds.
 ///
 /// The service picks which vessels those are, by distance; this is only the bound a
 /// keyframe is checked against, because a client that kept every vessel it ever saw
 /// would accumulate a set the service no longer holds.
-pub const MAX_VESSELS: usize = 1_000;
+pub(super) const MAX_VESSELS: usize = 1_000;
 
 /// The furthest out the camera goes: the whole map fitted to the viewport.
-pub const MIN_ZOOM: f32 = 1.0;
+pub(super) const MIN_ZOOM: f32 = 1.0;
 /// The furthest in the camera goes.
-pub const MAX_ZOOM: f32 = 4.0;
+pub(super) const MAX_ZOOM: f32 = 4.0;
 
 /// How far a pointer may be from a vessel and still hit it, in pixels.
-pub const HIT_RADIUS_PX: f32 = 8.0;
+pub(super) const HIT_RADIUS_PX: f32 = 8.0;
 
 /// How long a picture may go without a push and still be called live.
 ///
 /// The service sends an empty delta every second, so silence means a broken link
 /// rather than an empty strait.
-pub const STALE_AFTER: Duration = Duration::from_secs(30);
+pub(super) const STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// The speed-over-ground value that means "not available".
 const SOG_UNAVAILABLE: u32 = 1_023;
@@ -91,7 +80,7 @@ const NAV_STATUS_UNDEFINED: u8 = 15;
 /// a surveyed chart boundary: each line is the middle of a lane and the map dashes
 /// it. The first two run the length of the strait in opposite directions, the third
 /// is the Bandar Abbas approach and the fourth the Fujairah anchorage approach.
-pub const TSS_LANES: &[&[(f32, f32)]] = &[
+pub(super) const TSS_LANES: &[&[(f32, f32)]] = &[
     &[
         (57.35, 25.15),
         (56.72, 25.85),
@@ -113,7 +102,7 @@ pub const TSS_LANES: &[&[(f32, f32)]] = &[
 
 /// One label the map draws: the name it reads in the catalogue and where it sits.
 #[derive(Clone, Copy, Debug)]
-pub struct MapLabel {
+pub(super) struct MapLabel {
     /// The catalogue key, e.g. `widget.hormuz_vessel_map.label.city.fujairah`.
     pub key: &'static str,
     /// The anchor, as longitude and latitude in degrees.
@@ -121,7 +110,7 @@ pub struct MapLabel {
 }
 
 /// The five countries the map names.
-pub const COUNTRY_LABELS: [MapLabel; 5] = [
+pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
     MapLabel {
         key: "widget.hormuz_vessel_map.label.country.iran",
         at: [53.2, 27.85],
@@ -145,7 +134,7 @@ pub const COUNTRY_LABELS: [MapLabel; 5] = [
 ];
 
 /// The twelve cities the map names.
-pub const CITY_LABELS: [MapLabel; 12] = [
+pub(super) const CITY_LABELS: [MapLabel; 12] = [
     MapLabel {
         key: "widget.hormuz_vessel_map.label.city.bandar_abbas",
         at: [56.27, 27.18],
@@ -197,7 +186,7 @@ pub const CITY_LABELS: [MapLabel; 12] = [
 ];
 
 /// The two bodies of water the map names.
-pub const WATER_LABELS: [MapLabel; 2] = [
+pub(super) const WATER_LABELS: [MapLabel; 2] = [
     MapLabel {
         key: "widget.hormuz_vessel_map.label.water.persian_gulf",
         at: [51.5, 26.6],
@@ -212,7 +201,7 @@ pub const WATER_LABELS: [MapLabel; 2] = [
 ///
 /// The map is drawn in this projection, so a vessel's position is converted when the
 /// painted list is built and the frame only applies the camera's affine transform.
-pub fn project(longitude: f32, latitude: f32) -> [f32; 2] {
+pub(super) fn project(longitude: f32, latitude: f32) -> [f32; 2] {
     [
         longitude.to_radians(),
         (std::f32::consts::FRAC_PI_4 + latitude.to_radians() / 2.0)
@@ -221,16 +210,8 @@ pub fn project(longitude: f32, latitude: f32) -> [f32; 2] {
     ]
 }
 
-/// The longitude and latitude in degrees one Mercator point stands for.
-pub fn unproject(x: f32, y: f32) -> [f32; 2] {
-    [
-        x.to_degrees(),
-        (2.0 * y.exp().atan() - std::f32::consts::FRAC_PI_2).to_degrees(),
-    ]
-}
-
 /// The map's Mercator extent, as `[west, south, east, north]`.
-pub fn mercator_bounds() -> [f32; 4] {
+pub(super) fn mercator_bounds() -> [f32; 4] {
     let [west, south] = project(MAP_WEST, MAP_SOUTH);
     let [east, north] = project(MAP_EAST, MAP_NORTH);
     [west, south, east, north]
@@ -241,7 +222,7 @@ pub fn mercator_bounds() -> [f32; 4] {
 /// The camera's scale is this times [`Camera::zoom`]. A viewport with no area — a
 /// pane laid out at zero size, before its first frame — has no fit at all and reads
 /// as zero, which the camera treats as the degenerate viewport it is.
-pub fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
+pub(super) fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
     let [width, height] = viewport;
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return 0.0;
@@ -253,7 +234,7 @@ pub fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
 
 /// Where the map is looking, and how far in.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Camera {
+pub(super) struct Camera {
     /// The Mercator point drawn at the centre of the viewport.
     pub center: [f32; 2],
     /// How far the fitted map is scaled up, between [`MIN_ZOOM`] and [`MAX_ZOOM`].
@@ -325,7 +306,7 @@ fn clamp_center(center: f32, half: f32, low: f32, high: f32) -> f32 {
 /// reachable from a real report, which is what the four colours and every legend
 /// entry need.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ShipClass {
+pub(super) enum ShipClass {
     /// A tanker: the `80–89` range of `ship_type`.
     Tanker,
     /// A container ship: the `70–74` range of `ship_type`.
@@ -337,7 +318,7 @@ pub enum ShipClass {
 }
 
 /// The bucket one AIS `ship_type` is drawn in.
-pub const fn class_of(ship_type: u32) -> ShipClass {
+pub(super) const fn class_of(ship_type: u32) -> ShipClass {
     match ship_type {
         70..=74 => ShipClass::Container,
         75..=79 => ShipClass::Bulk,
@@ -350,7 +331,7 @@ pub const fn class_of(ship_type: u32) -> ShipClass {
 ///
 /// Nothing is cached: the appearance can change between frames, and a cached colour
 /// is a pane that keeps drawing the previous theme's ships.
-pub fn colour_for(theme: &Theme, class: ShipClass) -> Hsla {
+pub(super) fn colour_for(theme: &Theme, class: ShipClass) -> Hsla {
     let series = &theme.roles.chart.series;
     match class {
         ShipClass::Tanker => series[0].hsla,
@@ -504,7 +485,7 @@ const FLAGS: &[(u32, &str)] = &[
 /// letter boxes rather than as a flag, so the code is what every platform shows and
 /// it is what a maritime reader expects beside a vessel. `0` (the report names no
 /// state) and a MID the table does not know both read as `None`.
-pub fn flag_for_mid(mid: u32) -> Option<&'static str> {
+pub(super) fn flag_for_mid(mid: u32) -> Option<&'static str> {
     FLAGS
         .binary_search_by_key(&mid, |(candidate, _)| *candidate)
         .ok()
@@ -517,7 +498,7 @@ pub fn flag_for_mid(mid: u32) -> Option<&'static str> {
 /// through `.14`), and the value the wire carries picks it; no status text lives
 /// here.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NavStatus(u8);
+pub(super) struct NavStatus(u8);
 
 impl NavStatus {
     /// The index the catalogue's key is spelled with.
@@ -530,7 +511,7 @@ impl NavStatus {
 ///
 /// `15` means the report does not know, and any value the table does not define is
 /// treated the same way.
-pub fn nav_status_of(nav_status: u32) -> Option<NavStatus> {
+pub(super) fn nav_status_of(nav_status: u32) -> Option<NavStatus> {
     u8::try_from(nav_status)
         .ok()
         .filter(|status| *status < NAV_STATUS_UNDEFINED)
@@ -539,7 +520,7 @@ pub fn nav_status_of(nav_status: u32) -> Option<NavStatus> {
 
 /// One vessel the map paints.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Vessel {
+pub(super) struct Vessel {
     /// The identity its position and its static part are joined on.
     pub mmsi: u32,
     /// The bucket its ship type falls in, or [`ShipClass::Other`] while the static
@@ -557,6 +538,23 @@ pub struct Vessel {
     pub has_static: bool,
 }
 
+impl Vessel {
+    /// The direction the marker points, in degrees clockwise from north.
+    ///
+    /// A course over ground that is at its sentinel falls back to the true heading, and
+    /// a heading at its own sentinel reads as north: a report that knows neither is
+    /// still drawn, facing the way a report that omitted them would.
+    pub(super) fn facing(self) -> f32 {
+        if self.cog != COG_UNAVAILABLE {
+            self.cog as f32 / 10.0
+        } else if self.heading != HEADING_UNAVAILABLE {
+            self.heading as f32
+        } else {
+            0.0
+        }
+    }
+}
+
 /// The fifteen values a hover card reads, one field per catalogue key.
 ///
 /// The card's labels and its "unavailable" text belong to the view: a field is `None`
@@ -564,7 +562,7 @@ pub struct Vessel {
 /// because the static part has not arrived. The order of the fields is the order the
 /// design lists the items in.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VesselDetails {
+pub(super) struct VesselDetails {
     /// 1. The name, or the MMSI when the report carries an empty one; `None` before
     ///    the static part arrives.
     pub name: Option<SmolStr>,
@@ -698,7 +696,7 @@ fn format_last_update(last_update: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// to draw" — a picture cleared by a keyframe the server stamped with no time is not
 /// one.
 #[derive(Debug)]
-pub struct VesselStore {
+pub(super) struct VesselStore {
     statics: AHashMap<u32, AisStatic>,
     positions: AHashMap<u32, AisPosition>,
     epoch: u64,
@@ -832,6 +830,18 @@ impl VesselStore {
         self.gap || self.received_at.elapsed() > STALE_AFTER
     }
 
+    /// Whether a push did not continue the picture, which is what the stale badge names
+    /// when the link is still delivering.
+    pub fn has_gap(&self) -> bool {
+        self.gap
+    }
+
+    /// How long the store has been silent, which is what the stale badge counts once the
+    /// whole window has gone by without a push.
+    pub fn silent_for(&self) -> Duration {
+        self.received_at.elapsed()
+    }
+
     /// How many vessels the picture holds.
     pub fn vessel_count(&self) -> usize {
         self.positions.len()
@@ -901,7 +911,7 @@ impl VesselStore {
 /// thousand a picture holds. Distances are compared squared, and a point exactly at
 /// [`HIT_RADIUS_PX`] does not count: the radius is "less than", which is what a
 /// pointer at the outer edge of a marker means.
-pub fn hit_test(points: &[(u32, [f32; 2])], at: [f32; 2]) -> Option<u32> {
+pub(super) fn hit_test(points: &[(u32, [f32; 2])], at: [f32; 2]) -> Option<u32> {
     let radius = HIT_RADIUS_PX * HIT_RADIUS_PX;
     points
         .iter()
@@ -915,20 +925,23 @@ pub fn hit_test(points: &[(u32, [f32; 2])], at: [f32; 2]) -> Option<u32> {
         .map(|(_, mmsi)| mmsi)
 }
 
-/// The pane persists nothing about this widget; the type exists because every widget
-/// carries its schema version.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HormuzMapConfig;
-
-impl WidgetConfig for HormuzMapConfig {
-    const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
-}
-
 #[cfg(test)]
 mod tests {
     use base_ui::style::palette::Appearance;
 
     use super::*;
+
+    /// The west edge of the area the service reports positions for, in degrees east.
+    ///
+    /// It belongs to the service's subscription rather than to this module: the map draws
+    /// no boundary for it, so it is only the rectangle the fixtures below are held to.
+    const AIS_WEST: f32 = 53.5;
+    /// The east edge of that area.
+    const AIS_EAST: f32 = 59.0;
+    /// The south edge of that area.
+    const AIS_SOUTH: f32 = 24.0;
+    /// The north edge of that area.
+    const AIS_NORTH: f32 = 28.3;
 
     /// One position in the strait, with every value a report can carry.
     fn position(mmsi: u32) -> AisPosition {
@@ -1129,30 +1142,40 @@ mod tests {
     }
 
     #[test]
-    fn mercator_should_round_trip_every_corner_and_the_strait() {
+    fn mercator_should_map_every_corner_to_the_value_the_formula_names() {
+        // The projection is pinned against its own definition rather than against its
+        // inverse: the map is drawn from these values, so a longitude or a latitude that
+        // arrived at the wrong place would be a coastline in the wrong sea.
+        let project_by_formula = |longitude: f32, latitude: f32| {
+            [
+                longitude.to_radians(),
+                (std::f32::consts::FRAC_PI_4 + latitude.to_radians() / 2.0)
+                    .tan()
+                    .ln(),
+            ]
+        };
+
         for (longitude, latitude) in [
             (MAP_WEST, MAP_SOUTH),
             (MAP_EAST, MAP_SOUTH),
             (MAP_WEST, MAP_NORTH),
             (MAP_EAST, MAP_NORTH),
             (56.3, 26.4),
-            (48.0, 21.5),
-            (62.0, 28.5),
+            (0.0, 0.0),
         ] {
             let [x, y] = project(longitude, latitude);
-            let [back_longitude, back_latitude] = unproject(x, y);
+            let [expected_x, expected_y] = project_by_formula(longitude, latitude);
 
-            // A tenth of a pixel at the closest zoom is about 0.0007°, so this is
-            // tighter than anything the map could show.
-            assert!(
-                (back_longitude - longitude).abs() < 1e-3,
-                "{longitude} came back as {back_longitude}",
-            );
-            assert!(
-                (back_latitude - latitude).abs() < 1e-3,
-                "{latitude} came back as {back_latitude}",
-            );
+            assert_close(x, expected_x, "the x a longitude projects to");
+            assert_close(y, expected_y, "the y a latitude projects to");
         }
+
+        // The prime meridian is the origin of x, and the equator is the origin of y: the
+        // two anchors that say the formula above is the one being used and not merely
+        // its own copy.
+        let [x, y] = project(0.0, 0.0);
+        assert_close(x, 0.0, "the prime meridian");
+        assert_close(y, 0.0, "the equator");
     }
 
     #[test]
@@ -1507,10 +1530,20 @@ mod tests {
             store.is_stale(),
             "no push for the whole window is a broken link, heartbeat included",
         );
+        assert!(
+            store.silent_for() > STALE_AFTER,
+            "the badge counts the silence the link went through",
+        );
+        assert!(
+            !store.has_gap(),
+            "a silent link is silence rather than a picture that was not continued",
+        );
 
         let mut store = VesselStore::new();
         store.apply(&keyframe(7, 1, vec![position(1)]));
         assert!(!store.is_stale(), "a push just arrived");
+        assert!(!store.has_gap());
+        assert!(store.silent_for() < STALE_AFTER);
     }
 
     #[test]
@@ -1899,10 +1932,33 @@ mod tests {
     }
 
     #[test]
-    fn the_config_should_be_at_the_first_schema_version() {
-        assert_eq!(
-            HormuzMapConfig::SCHEMA_VERSION,
-            WidgetConfigSchemaVersion::V1,
+    fn a_marker_should_face_its_course_and_fall_back_to_its_heading() {
+        let mut vessel = Vessel {
+            mmsi: 1,
+            class: ShipClass::Other,
+            position: [0.0, 0.0],
+            cog: 900,
+            heading: 347,
+            has_static: true,
+        };
+        assert_close(
+            vessel.facing(),
+            90.0,
+            "a course over ground is tenths of a degree",
+        );
+
+        vessel.cog = COG_UNAVAILABLE;
+        assert_close(
+            vessel.facing(),
+            347.0,
+            "the heading takes over at the sentinel",
+        );
+
+        vessel.heading = HEADING_UNAVAILABLE;
+        assert_close(
+            vessel.facing(),
+            0.0,
+            "a report that knows neither faces north",
         );
     }
 }

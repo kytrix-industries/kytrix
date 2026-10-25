@@ -17,6 +17,7 @@ crypto_fgi = { workspace = true }
 empty = { workspace = true }
 etf = { workspace = true }
 force_orders = { workspace = true }
+hormuz_vessel_map = { workspace = true }
 hyperliquid_wallet_monitor = { workspace = true }
 indices = { workspace = true }
 market_trades = { workspace = true }

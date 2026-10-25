@@ -8,7 +8,7 @@
 //!    to Web Mercator, and tessellates the whole set as one even-odd fill, so
 //!    lakes and seas cut holes in the land instead of being filled over.
 //! 2. It then keeps the resulting triangles as raw `[f32; 6]` rows (three
-//!    `x, y` pairs) in Mercator space, plus the extent they cover.
+//!    `x, y` pairs) in Mercator space.
 //!
 //! The frame only applies the camera's affine transform to those rows. It must
 //! not tessellate again: rebuilding the path costs several milliseconds while
@@ -53,7 +53,7 @@ const TESSELLATION_TOLERANCE: f32 = 5e-6;
 
 /// Why the packaged coastline could not be turned into a [`Scene`].
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum SceneError {
+pub(super) enum SceneError {
     /// The asset does not start with [`MAGIC`].
     #[error("map asset has an invalid magic")]
     InvalidMagic,
@@ -85,11 +85,9 @@ pub enum SceneError {
 }
 
 /// The coastline, tessellated once and kept in Web Mercator space.
-pub struct Scene {
+pub(super) struct Scene {
     /// Triangle rows: three `x, y` pairs each, in Mercator radians.
     land_triangles: Vec<[f32; 6]>,
-    /// The extent the triangles cover, as `[min, max]` in Mercator radians.
-    bounds: [[f32; 2]; 2],
 }
 
 impl Scene {
@@ -98,7 +96,7 @@ impl Scene {
     /// Every structural error is caught before the tessellator runs, so a
     /// malformed asset never reaches lyon. What remains is lyon rejecting the
     /// geometry, or rings that enclose no area.
-    pub fn parse(bytes: &[u8]) -> Result<Self, SceneError> {
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self, SceneError> {
         if bytes.len() < MAGIC.len() {
             return Err(SceneError::Truncated);
         }
@@ -113,7 +111,6 @@ impl Scene {
         let vertex_count = read_u32(bytes, 8);
         let mut offset = HEADER_LEN;
         let mut remaining_vertices = vertex_count;
-        let mut bounds = [[f32::INFINITY; 2], [f32::NEG_INFINITY; 2]];
 
         let options = FillOptions::default()
             .with_fill_rule(FillRule::EvenOdd)
@@ -143,10 +140,6 @@ impl Scene {
                 if !x.is_finite() || !y.is_finite() {
                     return Err(SceneError::NonFiniteCoordinate);
                 }
-                bounds[0][0] = bounds[0][0].min(x);
-                bounds[0][1] = bounds[0][1].min(y);
-                bounds[1][0] = bounds[1][0].max(x);
-                bounds[1][1] = bounds[1][1].max(y);
                 let at = point(px(x), px(y));
                 if index == 0 {
                     builder.move_to(at);
@@ -181,20 +174,12 @@ impl Scene {
             return Err(SceneError::Empty);
         }
 
-        Ok(Self {
-            land_triangles,
-            bounds,
-        })
+        Ok(Self { land_triangles })
     }
 
     /// The land as triangle rows of three `x, y` Mercator pairs each.
-    pub fn land_triangles(&self) -> &[[f32; 6]] {
+    pub(super) fn land_triangles(&self) -> &[[f32; 6]] {
         &self.land_triangles
-    }
-
-    /// The extent the land covers, as `[min, max]` in Mercator radians.
-    pub fn bounds(&self) -> [[f32; 2]; 2] {
-        self.bounds
     }
 }
 
@@ -202,7 +187,7 @@ impl Scene {
 ///
 /// A failure is cached too: the asset is compiled in, so retrying would walk
 /// the same bytes and reach the same error. Callers get a clone of it.
-pub fn scene() -> Result<&'static Scene, SceneError> {
+pub(super) fn scene() -> Result<&'static Scene, SceneError> {
     static SCENE: OnceLock<Result<Scene, SceneError>> = OnceLock::new();
     SCENE
         .get_or_init(|| Scene::parse(LAND_ASSET))
@@ -270,9 +255,28 @@ mod tests {
         assert_eq!(scene.land_triangles().len(), TRIANGLE_COUNT);
     }
 
+    /// The extent the triangles cover, as `[min, max]` in Mercator radians.
+    ///
+    /// The scene does not keep it: the frame draws every triangle against the map box
+    /// rather than against the land's own extent, so the extent is only ever a fixture
+    /// check — computed here from the triangles it describes.
+    fn land_extent(scene: &Scene) -> [[f32; 2]; 2] {
+        let mut extent = [[f32::INFINITY; 2], [f32::NEG_INFINITY; 2]];
+        for triangle in scene.land_triangles() {
+            for pair in triangle.as_chunks::<2>().0 {
+                let [x, y] = *pair;
+                extent[0][0] = extent[0][0].min(x);
+                extent[0][1] = extent[0][1].min(y);
+                extent[1][0] = extent[1][0].max(x);
+                extent[1][1] = extent[1][1].max(y);
+            }
+        }
+        extent
+    }
+
     #[test]
     fn the_land_covers_the_map_box_and_no_more() {
-        let [min, max] = scene().expect("the checked-in asset parses").bounds();
+        let [min, max] = land_extent(scene().expect("the checked-in asset parses"));
         let [west, south, east, north] = model::mercator_bounds();
         assert!((min[0] - west).abs() <= EPSILON);
         assert!((min[1] - south).abs() <= EPSILON);
@@ -283,7 +287,7 @@ mod tests {
     #[test]
     fn every_triangle_is_finite_and_inside_the_map_box() {
         let scene = scene().expect("the checked-in asset parses");
-        let [min, max] = scene.bounds();
+        let [min, max] = land_extent(scene);
         for triangle in scene.land_triangles() {
             for pair in triangle.as_chunks::<2>().0 {
                 let [x, y] = *pair;

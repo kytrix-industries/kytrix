@@ -125,6 +125,8 @@ error:
     stream_unavailable: ETF 数据流不可用
     timeout: ETF 请求在 %{seconds} 秒后超时
     too_many_rows: ETF 数据超过 %{maximum} 个交易日的历史上限
+  hormuz_vessel_map:
+    map_asset: 内置海岸线数据无法读取，地图无法绘制
   market_participants:
     authentication_failed: '%{venue} 市场参与者账户认证失败：%{cause}'
     capability_mismatch: 协议请求需要 %{expected} 能力，但请求上下文声明的是 %{actual}
@@ -594,6 +596,82 @@ widget:
     value: '%{label}：%{value}'
   force_orders:
     table: 来自 %{markets} 的实时强平订单
+  hormuz_vessel_map:
+    entitlement_required: 当前账户不包含 AIS 船舶数据订阅
+    hover:
+      call_sign: 呼号
+      course: 对地航向
+      destination: 目的港
+      dimensions: 尺寸
+      draught: 吃水
+      eta: 预计到达
+      flag: 船旗国
+      heading: 艏向
+      imo: IMO
+      mmsi: MMSI
+      nav_status: 航行状态
+      ship_name: 船名
+      ship_type: 船型
+      speed: 对地航速
+      updated: 服务端接收时间
+    label:
+      city:
+        al_hofuf: 胡富夫
+        al_jubayl: 朱拜勒
+        bandar_abbas: 阿巴斯港
+        bandar_lengeh: 伦格港
+        chabahar: 恰巴哈尔
+        fujairah: 富查伊拉
+        khasab: 海塞卜
+        muscat: 马斯喀特
+        qeshm: 格什姆
+        ras_al_khaimah: 哈伊马角
+        sharjah: 沙迦
+        sur: 苏尔
+      country:
+        bahrain: 巴林
+        iran: 伊朗
+        oman: 阿曼
+        qatar: 卡塔尔
+        uae: 阿联酋
+      water:
+        gulf_of_oman: 阿曼湾
+        persian_gulf: 波斯湾
+    legend:
+      bulk: 散货船
+      container: 集装箱船
+      other: 其他船舶
+      tanker: 油轮
+      title: 船舶类型
+    nav_status:
+      "0": 在航（机动）
+      "1": 锚泊
+      "2": 失控
+      "3": 操纵能力受限
+      "4": 吃水受限
+      "5": 系泊
+      "6": 搁浅
+      "7": 从事捕鱼
+      "8": 在航（帆船）
+      "9": 保留（高速船）
+      "10": 保留（地效翼船）
+      "11": 尾部拖带
+      "12": 顶推或旁拖
+      "13": 保留
+      "14": AIS-SART（搜救应答器）
+    ship_type:
+      bulk: 散货船
+      container: 集装箱船
+      other: 其他船舶
+      tanker: 油轮
+    sign_in: <p align="center">注册或登录后即可查看海峡内的船舶。</p>
+    stale: 实时更新已停止
+    stale_seconds: 已有 %{seconds} 秒未收到更新
+    unavailable: —
+    vessel_count: '%{count} 艘'
+    vessel_count_one: 1 艘
+    view_plans: 查看订阅方案
+    waiting_data: 等待首批船位数据
   hyperliquid_wallet_monitor:
     add: 添加监控地址
     age_days: '%{value} 天前'
@@ -703,6 +781,7 @@ widget:
     empty: 空白
     etf_flow: ETF 资金流
     force_orders: 强平订单流
+    hormuz_vessel_map: 霍尔木兹海峡船舶地图
     hyperliquid_wallet_monitor: Hyperliquid 钱包监控
     indices: 指数
     long_short_account_ratio: 多空账户比
