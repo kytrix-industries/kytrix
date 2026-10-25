@@ -24,6 +24,7 @@ members = [
     "crates/widgets/empty",
     "crates/widgets/etf",
     "crates/widgets/force_orders",
+    "crates/widgets/hormuz_vessel_map",
     "crates/widgets/hyperliquid_wallet_monitor",
     "crates/widgets/indices",
     "crates/widgets/market_trades",
@@ -127,6 +128,7 @@ crypto_fgi = { path = "crates/widgets/crypto_fgi" }
 empty = { path = "crates/widgets/empty" }
 etf = { path = "crates/widgets/etf" }
 force_orders = { path = "crates/widgets/force_orders" }
+hormuz_vessel_map = { path = "crates/widgets/hormuz_vessel_map" }
 hyperliquid_wallet_monitor = { path = "crates/widgets/hyperliquid_wallet_monitor" }
 i18n = { path = "crates/i18n" }
 indices = { path = "crates/widgets/indices" }

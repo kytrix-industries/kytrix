@@ -1,0 +1,18 @@
+[package]
+name = "hormuz_vessel_map"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash = { workspace = true }
+app_config = { workspace = true }
+base_ui = { workspace = true }
+gpui-kit = { workspace = true }
+kytrix_service_provider = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+smol_str = { workspace = true }
+time = { workspace = true }
+
+[lints]
+workspace = true
