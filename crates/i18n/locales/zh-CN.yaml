@@ -125,6 +125,10 @@ error:
     stream_unavailable: ETF 数据流不可用
     timeout: ETF 请求在 %{seconds} 秒后超时
     too_many_rows: ETF 数据超过 %{maximum} 个交易日的历史上限
+  financial_calendar:
+    invalid_timestamp: '财经日历中包含无法对应日期的时刻：%{value}'
+    refresh_already_waiting: 财经日历已有一次刷新在等待
+    stream_unavailable: 财经日历数据流不可用
   market_participants:
     authentication_failed: '%{venue} 市场参与者账户认证失败：%{cause}'
     capability_mismatch: 协议请求需要 %{expected} 能力，但请求上下文声明的是 %{actual}
@@ -592,6 +596,34 @@ widget:
     time_window: ETF 时间范围
     total_net_assets: 总净资产
     value: '%{label}：%{value}'
+  financial_calendar:
+    country: 国家
+    day_label: '%{year}年%{month}%{day}日 %{weekday}'
+    importance: 重要性
+    logged_out: <p align="center">需要注册或登录后才能使用该功能。</p>
+    month:
+      april: 4月
+      august: 8月
+      december: 12月
+      february: 2月
+      january: 1月
+      july: 7月
+      june: 6月
+      march: 3月
+      may: 5月
+      november: 11月
+      october: 10月
+      september: 9月
+    name: 名称
+    refresh: 刷新
+    weekday:
+      friday: 星期五
+      monday: 星期一
+      saturday: 星期六
+      sunday: 星期日
+      thursday: 星期四
+      tuesday: 星期二
+      wednesday: 星期三
   force_orders:
     table: 来自 %{markets} 的实时强平订单
   hyperliquid_wallet_monitor:
@@ -702,6 +734,7 @@ widget:
     crypto_fgi: 加密恐惧与贪婪指数
     empty: 空白
     etf_flow: ETF 资金流
+    financial_calendar: 财经日历
     force_orders: 强平订单流
     hyperliquid_wallet_monitor: Hyperliquid 钱包监控
     indices: 指数

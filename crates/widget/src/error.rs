@@ -2962,6 +2962,10 @@ mod tests {
             include_str!("../../widgets/etf/src/view.rs"),
         ),
         (
+            "crates/widgets/financial_calendar/src/view.rs",
+            include_str!("../../widgets/financial_calendar/src/view.rs"),
+        ),
+        (
             "crates/widgets/force_orders/src/view.rs",
             include_str!("../../widgets/force_orders/src/view.rs"),
         ),

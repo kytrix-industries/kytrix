@@ -16,9 +16,9 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetCmcFearGreedIndex, GetEtf, GetIndexManifest, WalletAddSelection, WalletDeleteSelection,
-        WalletSelections, XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
-        request::Request as ClientRequestKind,
+        GetCmcFearGreedIndex, GetEtf, GetFinancialCalendar, GetIndexManifest, WalletAddSelection,
+        WalletDeleteSelection, WalletSelections, XAddSelection, XDeleteSelection, XSearch,
+        XSelections, XTweets, request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
     types as proto_types,
@@ -1099,6 +1099,28 @@ impl KytrixServiceConnector {
         })
     }
 
+    /// Fetches the latest financial calendar snapshot over WebSocket RPC.
+    pub async fn fetch_financial_calendar(
+        &self,
+    ) -> Result<proto_types::FinancialCalendar, KytrixServiceError> {
+        let response = self
+            .call_rpc(
+                None,
+                KytrixServiceCapability::FinancialCalendar,
+                ClientRequestKind::GetFinancialCalendar(GetFinancialCalendar {}),
+            )
+            .await
+            .map_err(RpcCallError::into_error)?;
+        let proto_response::response::Response::FinancialCalendar(response) = response else {
+            return Err(KytrixServiceError::Protocol(
+                "unexpected financial calendar RPC response".into(),
+            ));
+        };
+        response.financial_calendar.ok_or_else(|| {
+            KytrixServiceError::Protocol("financial calendar RPC response is missing data".into())
+        })
+    }
+
     /// Fetches the latest CMC fear and greed snapshot over WebSocket RPC.
     pub async fn fetch_cmc_fear_greed_index(
         &self,
@@ -1163,6 +1185,14 @@ mod tests {
             server.next_request().await.1,
             ObservedRequest::Rpc("cmc_fear_greed_index")
         );
+        assert_eq!(
+            connector.fetch_financial_calendar().await.unwrap(),
+            financial_calendar()
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("financial_calendar")
+        );
 
         connector.shutdown().await;
         server.shutdown().await;
@@ -1212,6 +1242,32 @@ mod tests {
         assert_eq!(
             server.next_request().await.1,
             ObservedRequest::Rpc("cmc_fear_greed_index")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_calendar_answer_without_a_snapshot_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(proto_response::response::Response::FinancialCalendar(
+            proto_response::FinancialCalendarResponse {
+                financial_calendar: None,
+            },
+        ));
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+
+        assert_eq!(
+            connector.fetch_financial_calendar().await,
+            Err(KytrixServiceError::Protocol(
+                "financial calendar RPC response is missing data".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("financial_calendar")
         );
 
         connector.shutdown().await;

@@ -99,6 +99,7 @@ impl TestConfigManager {
             KytrixServiceCapability::Wallet,
             KytrixServiceCapability::XMedia,
             KytrixServiceCapability::Cmc,
+            KytrixServiceCapability::FinancialCalendar,
             KytrixServiceCapability::PentagonPizzaIndex,
             KytrixServiceCapability::UpdaterMetadata,
             KytrixServiceCapability::UpdaterDownload,
@@ -195,6 +196,49 @@ pub(super) fn cmc_fear_greed_index() -> proto_types::CmcFearGreedIndex {
         yearly_high: Some(point("2025-11-20", 88)),
         yearly_low: Some(point("2026-04-15", 12)),
         timestamp: 1_790_000_000_000,
+    }
+}
+
+/// The financial calendar the service serves, shaped as the collector publishes it.
+pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
+    let event = |timestamp: i64,
+                 country: &str,
+                 name: &str,
+                 importance: proto_types::EventImportance,
+                 reference: Option<&str>| {
+        proto_types::FinancialCalendarEvent {
+            timestamp,
+            country_code: country.to_owned(),
+            name: name.to_owned(),
+            importance: importance as i32,
+            reference: reference.map(str::to_owned),
+        }
+    };
+    proto_types::FinancialCalendar {
+        events: vec![
+            event(
+                1_790_006_400_000,
+                "US",
+                "Nonfarm Payrolls",
+                proto_types::EventImportance::High,
+                Some("SEP"),
+            ),
+            event(
+                1_790_002_400_000,
+                "DE",
+                "Ifo Business Climate",
+                proto_types::EventImportance::Medium,
+                None,
+            ),
+            event(
+                1_790_000_000_000,
+                "CN",
+                "Industrial Profits (YTD) YoY",
+                proto_types::EventImportance::Low,
+                Some("AUG"),
+            ),
+        ],
+        timestamp: 1_790_000_100_000,
     }
 }
 
@@ -642,14 +686,13 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        // Nothing in the workspace reads the calendar yet, so the
-                                        // mock answers the valid request with an empty snapshot
-                                        // rather than inventing a failure for it.
                                         ClientRequestKind::GetFinancialCalendar(_) => (
                                             ObservedRequest::Rpc("financial_calendar"),
                                             proto_response::response::Response::FinancialCalendar(
                                                 proto_response::FinancialCalendarResponse {
-                                                    financial_calendar: None,
+                                                    financial_calendar: Some(
+                                                        financial_calendar(),
+                                                    ),
                                                 },
                                             ),
                                             false,
@@ -950,7 +993,7 @@ mod tests {
         manager.update(|config| config.proxy_default = ProxyRoute::System);
 
         let stamped = &manager.read().service_route_generations;
-        assert_eq!(stamped.len(), 11, "every capability is a stamped target");
+        assert_eq!(stamped.len(), 12, "every capability is a stamped target");
         assert!(
             stamped.contains_key(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,

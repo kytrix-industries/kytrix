@@ -125,6 +125,10 @@ error:
     stream_unavailable: The ETF data stream is unavailable
     timeout: The ETF request timed out after %{seconds} seconds
     too_many_rows: The ETF answer exceeds the %{maximum}-day history limit
+  financial_calendar:
+    invalid_timestamp: 'The financial calendar carried an instant that is not a date: %{value}'
+    refresh_already_waiting: A financial calendar refresh is already waiting
+    stream_unavailable: The financial calendar stream is unavailable
   market_participants:
     authentication_failed: 'Authentication for the %{venue} market participant account failed: %{cause}'
     capability_mismatch: The protocol request requires the %{expected} capability, but the request context declares %{actual}
@@ -592,6 +596,34 @@ widget:
     time_window: ETF time window
     total_net_assets: Total net assets
     value: '%{label}: %{value}'
+  financial_calendar:
+    country: Country
+    day_label: '%{weekday}, %{month} %{day}, %{year}'
+    importance: Importance
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    month:
+      april: April
+      august: August
+      december: December
+      february: February
+      january: January
+      july: July
+      june: June
+      march: March
+      may: May
+      november: November
+      october: October
+      september: September
+    name: Name
+    refresh: Refresh
+    weekday:
+      friday: Friday
+      monday: Monday
+      saturday: Saturday
+      sunday: Sunday
+      thursday: Thursday
+      tuesday: Tuesday
+      wednesday: Wednesday
   force_orders:
     table: Live force orders from %{markets}
   hyperliquid_wallet_monitor:
@@ -702,6 +734,7 @@ widget:
     crypto_fgi: Crypto Fear & Greed
     empty: Empty
     etf_flow: ETF Flow
+    financial_calendar: Financial Calendar
     force_orders: Force Orders Stream
     hyperliquid_wallet_monitor: Hyperliquid Wallet Monitor
     indices: Indices

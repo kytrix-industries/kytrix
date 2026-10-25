@@ -138,6 +138,7 @@ fn all_network_targets(
         KytrixServiceCapability::Wallet,
         KytrixServiceCapability::XMedia,
         KytrixServiceCapability::Cmc,
+        KytrixServiceCapability::FinancialCalendar,
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
         KytrixServiceCapability::UpdaterDownload,
@@ -932,7 +933,7 @@ mod tests {
     fn every_kytrix_service_capability_should_have_a_network_target() {
         let targets = all_network_targets(&Config::default(), []);
 
-        assert_eq!(targets.len(), 11);
+        assert_eq!(targets.len(), 12);
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,

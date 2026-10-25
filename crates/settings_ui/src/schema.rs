@@ -495,8 +495,10 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                     "coinmarketcap",
                     "fear",
                     "greed",
+                    "calendar",
                     "恐惧",
                     "贪婪",
+                    "日历",
                     "云服务",
                 ],
                 KYTRIX_CLOUD,
@@ -1369,6 +1371,9 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::Cmc,
+    },
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::FinancialCalendar,
     },
 ];
 

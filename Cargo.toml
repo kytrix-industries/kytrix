@@ -23,6 +23,7 @@ members = [
     "crates/widgets/crypto_fgi",
     "crates/widgets/empty",
     "crates/widgets/etf",
+    "crates/widgets/financial_calendar",
     "crates/widgets/force_orders",
     "crates/widgets/hyperliquid_wallet_monitor",
     "crates/widgets/indices",
@@ -126,6 +127,7 @@ candlestick = { path = "crates/widgets/candlestick" }
 crypto_fgi = { path = "crates/widgets/crypto_fgi" }
 empty = { path = "crates/widgets/empty" }
 etf = { path = "crates/widgets/etf" }
+financial_calendar = { path = "crates/widgets/financial_calendar" }
 force_orders = { path = "crates/widgets/force_orders" }
 hyperliquid_wallet_monitor = { path = "crates/widgets/hyperliquid_wallet_monitor" }
 i18n = { path = "crates/i18n" }
