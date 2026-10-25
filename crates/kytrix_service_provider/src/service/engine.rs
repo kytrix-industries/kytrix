@@ -34,7 +34,10 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 use yawc::{Frame, WebSocketError};
 
-use super::connector::KytrixServiceConnector;
+use super::{
+    ais::{AisArea, AisUpdate},
+    connector::KytrixServiceConnector,
+};
 use crate::{
     account_profile::AccountProfile,
     auth::{
@@ -254,6 +257,7 @@ pub(super) enum ServiceTopic {
     Index(IndexTopic),
     X,
     Wallet,
+    Ais(AisArea),
 }
 
 /// A news event received from the service.
@@ -361,6 +365,7 @@ pub(super) enum KytrixServiceEvent {
     XProfile(XProfileEvent),
     Tweet(TweetEvent),
     WalletTransfer(WalletTransfer),
+    Ais(AisUpdate),
     SessionState(KytrixSessionState),
 }
 
@@ -369,6 +374,7 @@ pub(super) enum SubscriberSink {
     Indices(SubscriptionPublisher<IndexEvent>),
     X(SubscriptionPublisher<XSubscriptionEvent>),
     Wallet(SubscriptionPublisher<WalletTransfer>),
+    Ais(SubscriptionPublisher<AisUpdate>),
 }
 
 impl SubscriberSink {
@@ -378,6 +384,7 @@ impl SubscriberSink {
             Self::Indices(_) => KytrixServiceCapability::Indices,
             Self::X(_) => KytrixServiceCapability::X,
             Self::Wallet(_) => KytrixServiceCapability::Wallet,
+            Self::Ais(_) => KytrixServiceCapability::Ais,
         }
     }
 
@@ -387,6 +394,7 @@ impl SubscriberSink {
             Self::Indices(publisher) => publisher.activate(),
             Self::X(publisher) => publisher.activate(),
             Self::Wallet(publisher) => publisher.activate(),
+            Self::Ais(publisher) => publisher.activate(),
         }
     }
 
@@ -396,6 +404,7 @@ impl SubscriberSink {
             Self::Indices(publisher) => publisher.reconnecting(),
             Self::X(publisher) => publisher.reconnecting(),
             Self::Wallet(publisher) => publisher.reconnecting(),
+            Self::Ais(publisher) => publisher.reconnecting(),
         }
     }
 
@@ -405,6 +414,7 @@ impl SubscriberSink {
             Self::Indices(publisher) => publisher.fail(error),
             Self::X(publisher) => publisher.fail(error),
             Self::Wallet(publisher) => publisher.fail(error),
+            Self::Ais(publisher) => publisher.fail(error),
         }
     }
 
@@ -414,6 +424,7 @@ impl SubscriberSink {
             Self::Indices(publisher) => publisher.finish(),
             Self::X(publisher) => publisher.finish(),
             Self::Wallet(publisher) => publisher.finish(),
+            Self::Ais(publisher) => publisher.finish(),
         }
     }
 
@@ -423,6 +434,7 @@ impl SubscriberSink {
             Self::Indices(publisher) => publisher.is_cancelled(),
             Self::X(publisher) => publisher.is_cancelled(),
             Self::Wallet(publisher) => publisher.is_cancelled(),
+            Self::Ais(publisher) => publisher.is_cancelled(),
         }
     }
 
@@ -442,6 +454,9 @@ impl SubscriberSink {
                 .map_err(subscription_send_error),
             (Self::Wallet(publisher), KytrixServiceEvent::WalletTransfer(transfer)) => publisher
                 .try_send(transfer.clone())
+                .map_err(subscription_send_error),
+            (Self::Ais(publisher), KytrixServiceEvent::Ais(update)) => publisher
+                .try_send(update.clone())
                 .map_err(subscription_send_error),
             _ => Ok(()),
         }

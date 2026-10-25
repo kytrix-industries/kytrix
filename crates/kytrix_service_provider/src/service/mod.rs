@@ -1,4 +1,5 @@
 mod actor;
+pub mod ais;
 pub mod connector;
 pub mod engine;
 mod handoff;

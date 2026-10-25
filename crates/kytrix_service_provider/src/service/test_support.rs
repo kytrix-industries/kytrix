@@ -97,6 +97,7 @@ impl TestConfigManager {
             KytrixServiceCapability::Indices,
             KytrixServiceCapability::X,
             KytrixServiceCapability::Wallet,
+            KytrixServiceCapability::Ais,
             KytrixServiceCapability::XMedia,
             KytrixServiceCapability::Cmc,
             KytrixServiceCapability::PentagonPizzaIndex,
@@ -224,6 +225,47 @@ pub(super) fn x_profile() -> proto_types::XProfile {
         followers_count: 10,
         following_count: 2,
         protected: false,
+    }
+}
+
+/// One AIS push as the collector publishes it: one vessel, one position, one departure.
+pub(super) fn ais_delta() -> proto_types::AisDelta {
+    proto_types::AisDelta {
+        area: proto_types::AisArea::Hormuz as i32,
+        epoch: 5,
+        sequence: 7,
+        base: 6,
+        keyframe: false,
+        statics: vec![proto_types::AisStatic {
+            mmsi: 636_000_001,
+            imo: 9_000_001,
+            call_sign: "C6AB1".to_owned(),
+            name: "HORMUZ STAR".to_owned(),
+            destination: "FUJAIRAH".to_owned(),
+            ship_type: 80,
+            flag_mid: 636,
+            draught: 123,
+            dim_to_bow: 100,
+            dim_to_stern: 20,
+            dim_to_port: 10,
+            dim_to_starboard: 11,
+            eta_month: 6,
+            eta_day: 15,
+            eta_hour: 12,
+            eta_minute: 30,
+        }],
+        positions: vec![proto_types::AisPosition {
+            mmsi: 636_000_001,
+            latitude: 26_566_000,
+            longitude: 56_250_000,
+            sog: 123,
+            cog: 456,
+            heading: 47,
+            nav_status: 0,
+            last_update: 1_700_000_000_000,
+        }],
+        removed: vec![636_000_002],
+        timestamp: 1_700_000_000_000,
     }
 }
 
@@ -461,6 +503,7 @@ impl TestServiceServer {
                                             index_topic_limit: 3,
                                             wallet_address_limit: 3,
                                             next_change_at: None,
+                                            ais_read: true,
                                         },
                                     )),
                                 };
@@ -665,6 +708,17 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
+                                        // Nothing in the workspace reads the pizza index over
+                                        // the service yet, so the mock answers an empty snapshot.
+                                        ClientRequestKind::GetPentagonPizzaIndex(_) => (
+                                            ObservedRequest::Rpc("pentagon_pizza_index"),
+                                            proto_response::response::Response::PentagonPizzaIndex(
+                                                proto_response::PentagonPizzaIndexResponse {
+                                                    pentagon_pizza_index: None,
+                                                },
+                                            ),
+                                            false,
+                                        ),
                                     };
                                     if request_sender.send((connection_id, observed)).is_err() {
                                         return;
@@ -848,6 +902,10 @@ impl TestServiceServer {
         ));
     }
 
+    pub(super) fn send_ais_delta(&self) {
+        self.send_event(proto_event::event::Event::Ais(ais_delta()));
+    }
+
     pub(super) fn send_news(&self, content: &str) {
         self.send_event(proto_event::event::Event::News(proto_types::News {
             timestamp: 1,
@@ -950,7 +1008,7 @@ mod tests {
         manager.update(|config| config.proxy_default = ProxyRoute::System);
 
         let stamped = &manager.read().service_route_generations;
-        assert_eq!(stamped.len(), 11, "every capability is a stamped target");
+        assert_eq!(stamped.len(), 12, "every capability is a stamped target");
         assert!(
             stamped.contains_key(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,

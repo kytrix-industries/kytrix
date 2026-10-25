@@ -19,6 +19,7 @@ use url::Url;
 use yawc::{Frame, OpCode, WebSocketError};
 
 use crate::service::{
+    ais::{AisArea, AisUpdate},
     engine::{
         ErrorCode, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage, IndexEvent,
         IndexTopic, KytrixServiceError, KytrixServiceEvent, KytrixSessionState, NewsEvent,
@@ -136,6 +137,16 @@ pub(super) fn decode_event(
             ServiceTopic::Wallet,
             KytrixServiceEvent::WalletTransfer(decode_wallet_transfer(transfer)?),
         ))),
+        proto_event::event::Event::Ais(delta) => {
+            let area = AisArea::try_from(delta.area)
+                .ok()
+                .filter(|area| *area != AisArea::Unspecified)
+                .ok_or_else(|| KytrixServiceError::Protocol("AIS event area is invalid".into()))?;
+            Ok(Some((
+                ServiceTopic::Ais(area),
+                KytrixServiceEvent::Ais(AisUpdate::from_proto(delta)),
+            )))
+        }
     }
 }
 
@@ -524,6 +535,9 @@ impl From<&ServiceTopic> for proto_topic::Topic {
             }
             ServiceTopic::X => proto_topic::topic::Topic::X(proto_topic::TopicX {}),
             ServiceTopic::Wallet => proto_topic::topic::Topic::Wallet(proto_topic::WalletTopic {}),
+            ServiceTopic::Ais(area) => {
+                proto_topic::topic::Topic::Ais(proto_topic::AisTopic { area: *area as i32 })
+            }
         };
         Self { topic: Some(topic) }
     }
@@ -543,6 +557,11 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
                 .ok_or_else(|| "index topic is invalid".into()),
             proto_topic::topic::Topic::X(_) => Ok(ServiceTopic::X),
             proto_topic::topic::Topic::Wallet(_) => Ok(ServiceTopic::Wallet),
+            proto_topic::topic::Topic::Ais(value) => match AisArea::try_from(value.area) {
+                Ok(AisArea::Hormuz) => Ok(ServiceTopic::Ais(AisArea::Hormuz)),
+                Ok(AisArea::Unspecified) => Err("AIS area is unspecified".into()),
+                Err(_) => Err("AIS area is invalid".into()),
+            },
         }
     }
 }
@@ -550,6 +569,7 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
 #[cfg(test)]
 mod tests {
     use super::{super::test_support::*, *};
+    use crate::service::ais::{AisPosition, AisStatic};
 
     #[test]
     fn literal_set_subscriptions_wire_should_preserve_schema_tags() {
@@ -665,9 +685,22 @@ mod tests {
             index_service_topic("REMOTE_ONLY_INDEX"),
             ServiceTopic::X,
             ServiceTopic::Wallet,
+            ServiceTopic::Ais(AisArea::Hormuz),
         ] {
             let encoded = proto_topic::Topic::from(&topic);
             assert_eq!(ServiceTopic::try_from(&encoded), Ok(topic));
+        }
+    }
+
+    #[test]
+    fn ais_topic_should_reject_unspecified_and_unknown_areas() {
+        for area in [AisArea::Unspecified as i32, 9] {
+            let topic = proto_topic::Topic {
+                topic: Some(proto_topic::topic::Topic::Ais(proto_topic::AisTopic {
+                    area,
+                })),
+            };
+            assert!(ServiceTopic::try_from(&topic).is_err());
         }
     }
 
@@ -883,6 +916,82 @@ mod tests {
     }
 
     #[test]
+    fn ais_delta_should_decode_the_area_and_every_part_of_the_update() {
+        let message = ServerMessage {
+            message: Some(server_message::Message::Event(proto_event::Event {
+                event: Some(proto_event::event::Event::Ais(ais_delta())),
+            })),
+        };
+
+        let decoded = decode_binary(&message.encode_to_vec()).unwrap();
+        let IncomingMessage::Event(Some((
+            ServiceTopic::Ais(AisArea::Hormuz),
+            KytrixServiceEvent::Ais(update),
+        ))) = decoded
+        else {
+            panic!("expected an AIS update");
+        };
+        assert_eq!(update, AisUpdate::from_proto(ais_delta()));
+        assert_eq!(update.epoch, 5);
+        assert!(!update.keyframe);
+        assert_eq!(update.sequence, 7);
+        assert_eq!(update.base, 6);
+        assert_eq!(
+            update.statics,
+            [AisStatic {
+                mmsi: 636_000_001,
+                imo: 9_000_001,
+                call_sign: "C6AB1".into(),
+                name: "HORMUZ STAR".into(),
+                destination: "FUJAIRAH".into(),
+                ship_type: 80,
+                flag_mid: 636,
+                draught: 123,
+                dim_to_bow: 100,
+                dim_to_stern: 20,
+                dim_to_port: 10,
+                dim_to_starboard: 11,
+                eta_month: 6,
+                eta_day: 15,
+                eta_hour: 12,
+                eta_minute: 30,
+            }]
+        );
+        assert_eq!(
+            update.positions,
+            [AisPosition {
+                mmsi: 636_000_001,
+                latitude: 26_566_000,
+                longitude: 56_250_000,
+                sog: 123,
+                cog: 456,
+                heading: 47,
+                nav_status: 0,
+                last_update: 1_700_000_000_000,
+            }]
+        );
+        assert_eq!(update.removed, [636_000_002]);
+        assert_eq!(update.timestamp, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn ais_event_without_a_known_area_should_be_a_protocol_error() {
+        for area in [AisArea::Unspecified as i32, 9] {
+            let mut delta = ais_delta();
+            delta.area = area;
+            let message = ServerMessage {
+                message: Some(server_message::Message::Event(proto_event::Event {
+                    event: Some(proto_event::event::Event::Ais(delta)),
+                })),
+            };
+            assert!(matches!(
+                decode_binary(&message.encode_to_vec()),
+                Err(KytrixServiceError::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
     fn invalid_tweet_ids_timestamps_and_reference_depth_should_be_protocol_errors() {
         let mut invalid_id = tweet("bad", 1);
         let mut invalid_timestamp = tweet("1", 0);
@@ -950,6 +1059,7 @@ mod tests {
                     index_topic_limit: 3,
                     wallet_address_limit: 9,
                     next_change_at: Some(1_800_000_000),
+                    ais_read: true,
                 },
             )),
         };

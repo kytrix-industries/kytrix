@@ -502,6 +502,12 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                 KYTRIX_CLOUD,
             ),
             proxy_targets_field(
+                "proxy-applications.kytrix.ais",
+                "settings_ui.proxies.ais_group",
+                &["ais", "vessel", "vessels", "ship", "ships", "船舶", "船只"],
+                AIS_VESSELS,
+            ),
+            proxy_targets_field(
                 "proxy-applications.kytrix.updates",
                 "settings_ui.proxies.app_updates",
                 &["updater", "update", "更新"],
@@ -1372,6 +1378,13 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     },
 ];
 
+/// The AIS vessel feed, which is reached through a line of its own: a reader who wants the
+/// vessel map's traffic down a proxy does not have to route every account service with it,
+/// and the row names the feed so the page shows which line it binds.
+const AIS_VESSELS: &[ServiceTarget] = &[ServiceTarget::KytrixService {
+    capability: KytrixServiceCapability::Ais,
+}];
+
 /// The application's own updates, which are fetched through their own line.
 const APP_UPDATES: &[ServiceTarget] = &[
     ServiceTarget::KytrixService {
@@ -2056,6 +2069,7 @@ pub(crate) mod tests {
 
         for id in [
             "proxy-applications.kytrix.cloud",
+            "proxy-applications.kytrix.ais",
             "proxy-applications.kytrix.updates",
             "proxy-applications.x.media",
             "proxy-applications.public-feeds.pizza-index",
@@ -2084,6 +2098,45 @@ pub(crate) mod tests {
                 .current(&config),
             PROXY_DIRECT,
             "and the default line is no proxy"
+        );
+    }
+
+    /// The AIS feed is reached through a line of its own: the row names the feed, so a reader
+    /// behind a firewall can tell which line the vessel map uses, and routing it leaves the
+    /// account and cloud services where they were.
+    #[test]
+    fn the_ais_row_should_bind_the_ais_service_on_its_own() {
+        let catalog = catalog_of();
+        let applications = page(&catalog, "proxy-applications");
+        let row = field(applications, "proxy-applications.kytrix.ais");
+        let mut config = configured();
+
+        assert_eq!(
+            row.label.key(),
+            Some("settings_ui.proxies.ais_group"),
+            "the AIS row names the feed rather than sharing the cloud group's label"
+        );
+        assert_eq!(row.access.current(&config), PROXY_INHERIT);
+
+        row.access.write(&mut config, &FieldValue::new_static("hk"));
+
+        assert_eq!(
+            config
+                .proxy_applications
+                .get(&ServiceTarget::KytrixService {
+                    capability: KytrixServiceCapability::Ais,
+                }),
+            Some(&app_config::network::ProxyRoute::named("hk")),
+            "the AIS row should bind the AIS service"
+        );
+        assert_eq!(
+            config
+                .proxy_applications
+                .get(&ServiceTarget::KytrixService {
+                    capability: KytrixServiceCapability::Account,
+                }),
+            None,
+            "the AIS row should leave the account and cloud services alone"
         );
     }
 

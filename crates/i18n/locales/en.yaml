@@ -989,6 +989,7 @@ settings_ui:
   proxies:
     add: Add proxy
     address: Address
+    ais_group: AIS vessels
     app_updates: App updates
     applications: Proxy applications
     authorization: Authentication

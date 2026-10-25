@@ -51,6 +51,9 @@ pub enum KytrixServiceCapability {
     UpdaterMetadata,
     #[serde(rename = "updater_download")]
     UpdaterDownload,
+    /// The AIS vessel feed the Kytrix service pushes for one area.
+    #[serde(rename = "ais")]
+    Ais,
 }
 
 /// Generic outbound route identity.
@@ -857,6 +860,21 @@ mod tests {
             }))
             .expect("the Kytrix target should decode"),
             target()
+        );
+        let ais = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::Ais,
+        };
+        assert_eq!(
+            serde_json::to_value(&ais).expect("the AIS target should serialize"),
+            json!({ "kind": "kytrix_service", "capability": "ais" })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceTarget>(json!({
+                "kind": "kytrix_service",
+                "capability": "ais",
+            }))
+            .expect("the AIS target should decode"),
+            ais
         );
     }
 

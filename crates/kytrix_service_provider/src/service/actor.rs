@@ -1126,7 +1126,10 @@ impl ServiceSessionActor {
             .iter()
             .filter_map(|topic| match topic {
                 ServiceTopic::Index(topic) => self.latest_indices.get(topic).cloned(),
-                ServiceTopic::News | ServiceTopic::X | ServiceTopic::Wallet => None,
+                ServiceTopic::News
+                | ServiceTopic::X
+                | ServiceTopic::Wallet
+                | ServiceTopic::Ais(_) => None,
             })
             .collect::<Vec<_>>();
         for event in events {

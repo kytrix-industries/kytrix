@@ -41,6 +41,7 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
+    ais::{AisArea, AisUpdate},
     handoff::request_dashboard_handoff,
     supervisor::run_service_supervisor,
     wallet::{
@@ -117,6 +118,25 @@ impl KytrixAccountSession {
                 &self.profile,
                 &[ServiceTopic::Wallet],
                 SubscriberSink::Wallet(publisher),
+            )
+            .await?;
+        Ok(subscription)
+    }
+
+    pub async fn subscribe_ais(
+        &self,
+        area: AisArea,
+    ) -> Result<Subscription<AisUpdate>, KytrixServiceError> {
+        let (publisher, subscription) = subscription_channel_with_wake(
+            SUBSCRIBER_CAPACITY,
+            self.connector.inner().wake.clone(),
+        )
+        .map_err(subscription_setup_error)?;
+        self.connector
+            .subscribe_topics_for_profile(
+                &self.profile,
+                &[ServiceTopic::Ais(area)],
+                SubscriberSink::Ais(publisher),
             )
             .await?;
         Ok(subscription)
@@ -1515,12 +1535,30 @@ mod tests {
                 ])
             )
         );
+        let mut ais = session
+            .subscribe_ais(AisArea::Hormuz)
+            .await
+            .expect("AIS should subscribe");
+        assert_eq!(
+            server.next_request().await,
+            (
+                1,
+                ObservedRequest::SetSubscriptions(vec![
+                    ServiceTopic::News,
+                    ServiceTopic::Index(index_topic("SPX")),
+                    ServiceTopic::X,
+                    ServiceTopic::Wallet,
+                    ServiceTopic::Ais(AisArea::Hormuz),
+                ])
+            )
+        );
         assert_eq!(server.connection_count.load(Ordering::Acquire), 1);
 
         server.send_news("typed-news");
         server.send_index("SPX");
         server.send_x_profile();
         server.send_wallet_transfer("typed-wallet");
+        server.send_ais_delta();
 
         assert_eq!(
             timeout(Duration::from_secs(2), news.recv())
@@ -1554,12 +1592,52 @@ mod tests {
                 .event_id,
             "typed-wallet"
         );
+        assert_eq!(
+            timeout(Duration::from_secs(2), ais.recv())
+                .await
+                .expect("AIS event should arrive")
+                .expect("AIS subscription should remain active"),
+            AisUpdate::from_proto(ais_delta())
+        );
         assert!(news.try_recv_for_test().is_err());
         assert!(indices.try_recv_for_test().is_err());
         assert!(x.try_recv_for_test().is_err());
         assert!(wallet.try_recv_for_test().is_err());
+        assert!(ais.try_recv_for_test().is_err());
 
-        drop((news, indices, x, wallet));
+        drop((news, indices, x, wallet, ais));
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ais_subscription_should_release_the_remote_topic_when_dropped() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .expect("test account should resolve");
+
+        let ais = session
+            .subscribe_ais(AisArea::Hormuz)
+            .await
+            .expect("AIS should subscribe");
+        assert_eq!(
+            server.next_request().await,
+            (
+                1,
+                ObservedRequest::SetSubscriptions(vec![ServiceTopic::Ais(AisArea::Hormuz)])
+            )
+        );
+
+        drop(ais);
+        assert_eq!(
+            server.next_request().await,
+            (1, ObservedRequest::SetSubscriptions(Vec::new()))
+        );
+
         connector.shutdown().await;
         server.shutdown().await;
     }

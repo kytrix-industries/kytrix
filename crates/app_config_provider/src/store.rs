@@ -141,6 +141,7 @@ fn all_network_targets(
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
         KytrixServiceCapability::UpdaterDownload,
+        KytrixServiceCapability::Ais,
     ]
     .into_iter()
     .map(|capability| ServiceTarget::KytrixService { capability })
@@ -932,12 +933,18 @@ mod tests {
     fn every_kytrix_service_capability_should_have_a_network_target() {
         let targets = all_network_targets(&Config::default(), []);
 
-        assert_eq!(targets.len(), 11);
+        assert_eq!(targets.len(), 12);
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,
             }),
             "the CMC capability should be a stamped target"
+        );
+        assert!(
+            targets.contains(&ServiceTarget::KytrixService {
+                capability: KytrixServiceCapability::Ais,
+            }),
+            "the AIS capability should be a stamped target"
         );
     }
 
