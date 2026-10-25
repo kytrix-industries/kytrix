@@ -269,6 +269,18 @@ pub(super) fn ais_delta() -> proto_types::AisDelta {
     }
 }
 
+/// The keyframe the collector publishes once it has a picture.
+///
+/// A keyframe is the whole picture and therefore carries no departures.
+pub(super) fn ais_keyframe() -> proto_types::AisDelta {
+    proto_types::AisDelta {
+        keyframe: true,
+        base: 0,
+        removed: Vec::new(),
+        ..ais_delta()
+    }
+}
+
 pub(super) fn test_x_selection() -> proto_types::XSelection {
     proto_types::XSelection {
         x_user_id: "42".to_owned(),
@@ -904,6 +916,10 @@ impl TestServiceServer {
 
     pub(super) fn send_ais_delta(&self) {
         self.send_event(proto_event::event::Event::Ais(ais_delta()));
+    }
+
+    pub(super) fn send_ais_keyframe(&self) {
+        self.send_event(proto_event::event::Event::Ais(ais_keyframe()));
     }
 
     pub(super) fn send_news(&self, content: &str) {

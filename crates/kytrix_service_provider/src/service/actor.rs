@@ -171,6 +171,7 @@ impl ServiceSessionActor {
             subscribers: AHashMap::with_capacity(8),
             topics: AHashMap::with_capacity(4),
             latest_indices: AHashMap::with_capacity(8),
+            latest_ais_keyframes: AHashMap::with_capacity(2),
             session_state: None,
             subscriptions_dirty: false,
             websocket: None,
@@ -475,6 +476,7 @@ impl ServiceSessionActor {
         self.subscribers.clear();
         self.topics.clear();
         self.latest_indices.clear();
+        self.latest_ais_keyframes.clear();
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
         self.renewal = None;
@@ -853,6 +855,7 @@ impl ServiceSessionActor {
             self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::SessionState(state)));
         }
         self.replay_latest_indices(id, &topics);
+        self.replay_latest_ais(id, &topics, &new_topics);
         new_topics
     }
 
@@ -1060,6 +1063,7 @@ impl ServiceSessionActor {
         self.subscribers.clear();
         self.topics.clear();
         self.latest_indices.clear();
+        self.latest_ais_keyframes.clear();
         self.subscriptions_dirty = false;
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
@@ -1116,8 +1120,14 @@ impl ServiceSessionActor {
     }
 
     pub(super) fn clear_cached_topic(&mut self, topic: &ServiceTopic) {
-        if let ServiceTopic::Index(topic) = topic {
-            self.latest_indices.remove(topic);
+        match topic {
+            ServiceTopic::Index(topic) => {
+                self.latest_indices.remove(topic);
+            }
+            ServiceTopic::Ais(area) => {
+                self.latest_ais_keyframes.remove(area);
+            }
+            ServiceTopic::News | ServiceTopic::X | ServiceTopic::Wallet => {}
         }
     }
 
@@ -1134,6 +1144,34 @@ impl ServiceSessionActor {
             .collect::<Vec<_>>();
         for event in events {
             self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::Index(event)));
+        }
+    }
+
+    /// Hands a joining subscriber the keyframe of each AIS area the session already follows.
+    ///
+    /// The server replays an area's keyframe only when a connection adds that topic, and
+    /// two panes of one account share this session's connection. Without this, the second
+    /// pane would receive only the deltas after its arrival — none of which it can apply
+    /// without the baseline — until the server's fallback keyframe, up to 300 s later. The
+    /// topic had no subscribers before this one only when it is new, so a new topic is left
+    /// to the server's own replay rather than being given a keyframe of unknown age.
+    pub(super) fn replay_latest_ais(
+        &mut self,
+        id: u64,
+        topics: &[ServiceTopic],
+        new_topics: &[ServiceTopic],
+    ) {
+        for topic in topics {
+            let ServiceTopic::Ais(area) = topic else {
+                continue;
+            };
+            if new_topics.contains(topic) {
+                continue;
+            }
+            let Some(keyframe) = self.latest_ais_keyframes.get(area).cloned() else {
+                continue;
+            };
+            self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::Ais(keyframe)));
         }
     }
 
@@ -1946,6 +1984,7 @@ impl ServiceSessionActor {
             subscriber.sink.reconnecting();
         }
         self.latest_indices.clear();
+        self.latest_ais_keyframes.clear();
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
@@ -1974,6 +2013,12 @@ impl ServiceSessionActor {
         topic: ServiceTopic,
         message: Result<KytrixServiceEvent, KytrixServiceError>,
     ) {
+        if let ServiceTopic::Ais(area) = &topic
+            && let Ok(KytrixServiceEvent::Ais(update)) = &message
+            && update.keyframe
+        {
+            self.latest_ais_keyframes.insert(*area, update.clone());
+        }
         if self.topics.contains_key(&topic)
             && let (ServiceTopic::Index(index_topic), Ok(KytrixServiceEvent::Index(event))) =
                 (&topic, &message)
@@ -2151,6 +2196,76 @@ mod tests {
             late_news_events.try_recv_for_test(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn a_second_ais_subscriber_should_be_handed_the_keyframe_it_missed() {
+        use crate::service::ais::{AisArea, AisPosition, AisUpdate};
+
+        let (_commands, receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
+        let topic = ServiceTopic::Ais(AisArea::Hormuz);
+
+        let keyframe = AisUpdate {
+            epoch: 7,
+            keyframe: true,
+            sequence: 3,
+            base: 0,
+            statics: Vec::new(),
+            positions: vec![AisPosition {
+                mmsi: 42,
+                latitude: 26_500_000,
+                longitude: 56_300_000,
+                sog: 100,
+                cog: 900,
+                heading: 90,
+                nav_status: 0,
+                last_update: 1_700_000_000_000,
+            }],
+            removed: Vec::new(),
+            timestamp: 1_700_000_000_000,
+        };
+
+        let (first_publisher, mut first_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        actor.add_subscriber_inner(
+            1,
+            vec![topic.clone()],
+            SubscriberSink::Ais(first_publisher),
+            None,
+            NetworkRouteGeneration::default(),
+        );
+        actor.publish_topic(topic.clone(), Ok(KytrixServiceEvent::Ais(keyframe.clone())));
+        assert_eq!(first_events.try_recv_for_test(), Ok(keyframe.clone()));
+
+        // The topic was already subscribed, so the server is not told the second pane
+        // joined and will not replay its keyframe: this session has to.
+        let (second_publisher, mut second_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        actor.add_subscriber_inner(
+            2,
+            vec![topic.clone()],
+            SubscriberSink::Ais(second_publisher),
+            None,
+            NetworkRouteGeneration::default(),
+        );
+        assert_eq!(
+            second_events.try_recv_for_test(),
+            Ok(keyframe),
+            "the joining pane should start from the picture already held",
+        );
+
+        assert!(actor.remove_subscriber(1).is_empty());
+        assert!(
+            actor.latest_ais_keyframes.contains_key(&AisArea::Hormuz),
+            "the pane still reading the area keeps its keyframe",
+        );
+        assert_eq!(actor.remove_subscriber(2), vec![topic]);
+        assert!(
+            !actor.latest_ais_keyframes.contains_key(&AisArea::Hormuz),
+            "the last subscriber taking the area away takes its keyframe too",
+        );
     }
 
     #[test]

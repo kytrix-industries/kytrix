@@ -870,6 +870,14 @@ pub(super) struct ServiceSessionActor {
     pub subscribers: AHashMap<u64, LocalSubscriber>,
     pub topics: AHashMap<ServiceTopic, AHashSet<u64>>,
     pub latest_indices: AHashMap<IndexTopic, IndexEvent>,
+    /// The last keyframe a session delivered for each AIS area.
+    ///
+    /// A later local subscriber of an area the session is already subscribed to would
+    /// otherwise join the stream after its keyframe: the server replays a keyframe only
+    /// for a topic a connection adds, and this session is one connection. The pane would
+    /// be left without a baseline until the server's next keyframe (up to its 300 s
+    /// fallback), so the session hands the joining subscriber the last keyframe it saw.
+    pub latest_ais_keyframes: AHashMap<AisArea, AisUpdate>,
     pub session_state: Option<KytrixSessionState>,
     pub subscriptions_dirty: bool,
     pub websocket: Option<RawWebSocket>,

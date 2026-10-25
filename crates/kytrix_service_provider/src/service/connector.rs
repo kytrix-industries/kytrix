@@ -1642,6 +1642,59 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// A second pane of the same account joins a topic this session already follows.
+    ///
+    /// The server replays an area's keyframe only when a connection adds its topic, and
+    /// both panes share this connection: without the session's own replay the second pane
+    /// would receive only deltas it cannot apply until the server's fallback keyframe.
+    #[tokio::test]
+    async fn a_second_ais_subscription_should_start_from_the_keyframe_the_session_holds() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .expect("test account should resolve");
+
+        let mut first = session
+            .subscribe_ais(AisArea::Hormuz)
+            .await
+            .expect("AIS should subscribe");
+        assert_eq!(
+            server.next_request().await,
+            (
+                1,
+                ObservedRequest::SetSubscriptions(vec![ServiceTopic::Ais(AisArea::Hormuz)])
+            )
+        );
+
+        server.send_ais_keyframe();
+        let keyframe = timeout(Duration::from_secs(2), first.recv())
+            .await
+            .expect("the keyframe should arrive")
+            .expect("the first subscription should remain active");
+        assert!(keyframe.keyframe);
+
+        let mut second = session
+            .subscribe_ais(AisArea::Hormuz)
+            .await
+            .expect("AIS should subscribe a second time");
+        assert_eq!(
+            timeout(Duration::from_secs(2), second.recv())
+                .await
+                .expect("the replayed keyframe should arrive")
+                .expect("the second subscription should remain active"),
+            keyframe,
+            "the joining pane should start from the picture already held",
+        );
+        assert!(second.try_recv_for_test().is_err());
+
+        drop((first, second));
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn replacing_typed_subscriptions_should_update_the_remote_topic_set() {
         let mut server = TestServiceServer::spawn(false).await;
