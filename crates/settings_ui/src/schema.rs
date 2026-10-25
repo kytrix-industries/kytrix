@@ -495,8 +495,14 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                     "coinmarketcap",
                     "fear",
                     "greed",
+                    "pizza",
+                    "pizzint",
+                    "pentagon",
+                    "osint",
                     "恐惧",
                     "贪婪",
+                    "披萨",
+                    "五角大楼",
                     "云服务",
                 ],
                 KYTRIX_CLOUD,
@@ -523,16 +529,6 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
             "settings_ui.proxies.x_media_group",
             &["x", "twitter", "media", "媒体"],
             X_MEDIA,
-        )],
-    ));
-    sections.push(SectionDef::fields(
-        Some(text("settings_ui.proxies.public_feeds_section")),
-        true,
-        vec![proxy_targets_field(
-            "proxy-applications.public-feeds.pizza-index",
-            "settings_ui.proxies.pizza_index_group",
-            &["pizza", "pizzint", "pentagon", "osint", "披萨", "五角大楼"],
-            PUBLIC_FEEDS,
         )],
     ));
 
@@ -1376,6 +1372,9 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::Cmc,
     },
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::PentagonPizzaIndex,
+    },
 ];
 
 /// The AIS vessel feed, which is reached through a line of its own: a reader who wants the
@@ -1398,12 +1397,6 @@ const APP_UPDATES: &[ServiceTarget] = &[
 /// The media service, which the applications page groups on its own.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
-}];
-
-/// The public feeds the application reads, which are grouped on their own because
-/// none of them is an account service and none of them carries credentials.
-const PUBLIC_FEEDS: &[ServiceTarget] = &[ServiceTarget::KytrixService {
-    capability: KytrixServiceCapability::PentagonPizzaIndex,
 }];
 
 /// The words one built field is searched by.
@@ -2072,7 +2065,6 @@ pub(crate) mod tests {
             "proxy-applications.kytrix.ais",
             "proxy-applications.kytrix.updates",
             "proxy-applications.x.media",
-            "proxy-applications.public-feeds.pizza-index",
         ] {
             let row = field(applications, id);
             assert!(
@@ -2137,6 +2129,34 @@ pub(crate) mod tests {
                 }),
             None,
             "the AIS row should leave the account and cloud services alone"
+        );
+    }
+
+    /// The pizza index is read over the Kytrix service, so the cloud line is the one
+    /// that configures it.
+    ///
+    /// A capability no group lists is one the application routes without offering a
+    /// way to change the route — the page would look complete and the line would be
+    /// unreachable. The rows are written rather than read because a group writes
+    /// every target it stands for, so the target read back is what says it is covered.
+    #[test]
+    fn the_pizza_index_should_be_configured_by_a_line_the_page_offers() {
+        let catalog = catalog_of();
+        let applications = page(&catalog, "proxy-applications");
+        let mut config = Config::default();
+        let row = field(applications, "proxy-applications.kytrix.cloud");
+
+        row.access.write(&mut config, &FieldValue::new_static("hk"));
+
+        assert_eq!(
+            crate::access::proxy_route_of(
+                &config,
+                &ServiceTarget::KytrixService {
+                    capability: KytrixServiceCapability::PentagonPizzaIndex,
+                },
+            ),
+            "hk",
+            "the cloud line writes the route of the index"
         );
     }
 

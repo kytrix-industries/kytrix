@@ -16,9 +16,9 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetCmcFearGreedIndex, GetEtf, GetIndexManifest, WalletAddSelection, WalletDeleteSelection,
-        WalletSelections, XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
-        request::Request as ClientRequestKind,
+        GetCmcFearGreedIndex, GetEtf, GetIndexManifest, GetPentagonPizzaIndex, WalletAddSelection,
+        WalletDeleteSelection, WalletSelections, XAddSelection, XDeleteSelection, XSearch,
+        XSelections, XTweets, request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
     types as proto_types,
@@ -1141,6 +1141,28 @@ impl KytrixServiceConnector {
         })
     }
 
+    /// Fetches the latest Pentagon Pizza Index snapshot over WebSocket RPC.
+    pub async fn fetch_pentagon_pizza_index(
+        &self,
+    ) -> Result<proto_types::PentagonPizzaIndex, KytrixServiceError> {
+        let response = self
+            .call_rpc(
+                None,
+                KytrixServiceCapability::PentagonPizzaIndex,
+                ClientRequestKind::GetPentagonPizzaIndex(GetPentagonPizzaIndex {}),
+            )
+            .await
+            .map_err(RpcCallError::into_error)?;
+        let proto_response::response::Response::PentagonPizzaIndex(response) = response else {
+            return Err(KytrixServiceError::Protocol(
+                "unexpected Pentagon Pizza Index RPC response".into(),
+            ));
+        };
+        response.pentagon_pizza_index.ok_or_else(|| {
+            KytrixServiceError::Protocol("Pentagon Pizza Index RPC response is missing data".into())
+        })
+    }
+
     pub(super) fn begin_service_operation(&self) -> Result<TransportPermit, KytrixServiceError> {
         self.inner()
             .lifecycle
@@ -1182,6 +1204,64 @@ mod tests {
         assert_eq!(
             server.next_request().await.1,
             ObservedRequest::Rpc("cmc_fear_greed_index")
+        );
+        assert_eq!(
+            connector.fetch_pentagon_pizza_index().await.unwrap(),
+            pentagon_pizza_index()
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("pentagon_pizza_index")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_pizza_index_answer_of_another_kind_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(proto_response::response::Response::Etf(
+            proto_response::EtfResponse { etf: None },
+        ));
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+
+        assert_eq!(
+            connector.fetch_pentagon_pizza_index().await,
+            Err(KytrixServiceError::Protocol(
+                "unexpected Pentagon Pizza Index RPC response".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("pentagon_pizza_index")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_pizza_index_answer_without_a_snapshot_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(proto_response::response::Response::PentagonPizzaIndex(
+            proto_response::PentagonPizzaIndexResponse {
+                pentagon_pizza_index: None,
+            },
+        ));
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+
+        assert_eq!(
+            connector.fetch_pentagon_pizza_index().await,
+            Err(KytrixServiceError::Protocol(
+                "Pentagon Pizza Index RPC response is missing data".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("pentagon_pizza_index")
         );
 
         connector.shutdown().await;

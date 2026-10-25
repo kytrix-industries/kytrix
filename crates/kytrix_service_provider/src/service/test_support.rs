@@ -199,6 +199,20 @@ pub(super) fn cmc_fear_greed_index() -> proto_types::CmcFearGreedIndex {
     }
 }
 
+/// The Pentagon Pizza Index snapshot the service serves, shaped as its collector publishes it.
+///
+/// The level is the index's own rung, which counts *down* as the alert rises: five is
+/// the calmest and one the most severe. The collection time follows the moment it
+/// observed rather than preceding it, because a snapshot is taken of a point that
+/// already exists.
+pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
+    proto_types::PentagonPizzaIndex {
+        overall_index: 3,
+        observed_at: 1_792_821_600_000,
+        timestamp: 1_792_821_660_000,
+    }
+}
+
 pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::Tweet {
     proto_types::Tweet {
         tweet_id: tweet_id.to_owned(),
@@ -715,6 +729,17 @@ impl TestServiceServer {
                                                 proto_response::CmcFearGreedIndexResponse {
                                                     cmc_fear_greed_index: Some(
                                                         cmc_fear_greed_index(),
+                                                    ),
+                                                },
+                                            ),
+                                            false,
+                                        ),
+                                        ClientRequestKind::GetPentagonPizzaIndex(_) => (
+                                            ObservedRequest::Rpc("pentagon_pizza_index"),
+                                            proto_response::response::Response::PentagonPizzaIndex(
+                                                proto_response::PentagonPizzaIndexResponse {
+                                                    pentagon_pizza_index: Some(
+                                                        pentagon_pizza_index(),
                                                     ),
                                                 },
                                             ),

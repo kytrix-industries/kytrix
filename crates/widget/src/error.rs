@@ -2990,6 +2990,10 @@ mod tests {
             include_str!("../../widgets/order_book/src/view.rs"),
         ),
         (
+            "crates/widgets/pentagon_pizza_index/src/view.rs",
+            include_str!("../../widgets/pentagon_pizza_index/src/view.rs"),
+        ),
+        (
             "crates/widgets/perpetual_statistics/src/widget/display/pane.rs",
             include_str!("../../widgets/perpetual_statistics/src/widget/display/pane.rs"),
         ),
