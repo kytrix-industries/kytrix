@@ -430,6 +430,7 @@ impl WidgetView for HormuzVesselMapWidget {
     const DISPLAY_NAME: &'static str = "widget.names.hormuz_vessel_map";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Live AIS vessel positions in the Strait of Hormuz";
+    const ICON: Option<&'static str> = Some("widgets/hormuz_vessel_map.png");
 
     fn new(
         _instance_id: WidgetInstanceId,

@@ -645,8 +645,8 @@ impl VesselDetails {
                     .then(|| format_smolstr!("{}.{} m", statics.draught / 10, statics.draught % 10))
             }),
             dimensions: statics.and_then(|statics| {
-                let length = statics.dim_to_bow + statics.dim_to_stern;
-                let breadth = statics.dim_to_port + statics.dim_to_starboard;
+                let length = statics.dim_to_bow.saturating_add(statics.dim_to_stern);
+                let breadth = statics.dim_to_port.saturating_add(statics.dim_to_starboard);
                 (length != 0 || breadth != 0).then(|| format_smolstr!("{length} × {breadth} m"))
             }),
             speed: (position.sog != SOG_UNAVAILABLE)
@@ -1696,6 +1696,30 @@ mod tests {
         assert!(details.nav_status.is_none(), "navigation status 15");
         assert!(details.updated.is_none(), "receipt time zero");
         assert_eq!(details.mmsi.as_str(), "7");
+    }
+
+    #[test]
+    fn dimensions_that_would_overflow_should_saturate_rather_than_panic() {
+        // The dimensions are two independent u32 halves of a length and a breadth. A
+        // malformed report can make each pair sum past u32::MAX, and the card is drawn for
+        // whatever the wire carries: clamping keeps a bad report from panicking the pane.
+        let mut store = VesselStore::new();
+        let mut frame = keyframe(7, 1, vec![position(42)]);
+        let mut reported = statics(42);
+        reported.dim_to_bow = u32::MAX;
+        reported.dim_to_stern = 1;
+        reported.dim_to_port = u32::MAX;
+        reported.dim_to_starboard = 2;
+        frame.statics = vec![reported];
+        store.apply(&frame);
+
+        let details = store
+            .display(42, UtcOffset::UTC)
+            .expect("the vessel is on the map");
+        assert_eq!(
+            details.dimensions.as_deref(),
+            Some("4294967295 × 4294967295 m"),
+        );
     }
 
     #[test]
