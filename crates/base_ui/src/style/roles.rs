@@ -145,6 +145,10 @@ pub struct ChartRoles {
     pub axis: ResolvedColor,
     /// The crosshair a pointer draws.
     pub crosshair: ResolvedColor,
+    /// The sea a map is drawn on: the water fill under the land.
+    pub map_ocean: ResolvedColor,
+    /// The land a map fills, held one visible step off `map_ocean` so a coastline reads.
+    pub map_land: ResolvedColor,
     /// The six series a multi-line or multi-bar chart is drawn with, in order.
     pub series: [ResolvedColor; 6],
 }
@@ -280,6 +284,11 @@ impl Roles {
             grid: resolve(mix(text, palette.surface_sunken, 0.86)),
             axis: fg.subtle,
             crosshair: resolve(mix(text, palette.surface_sunken, 0.45)),
+            // The map's two fills are authored, not mixed: the sea sits within a step of the
+            // content face so the series drawn over it keep the contrast they are held to there,
+            // and the land is the palette's own step away from it (§10).
+            map_ocean: resolve(palette.map_ocean),
+            map_land: resolve(palette.map_land),
             series: [
                 resolve(palette.series[0]),
                 resolve(palette.series[1]),
@@ -315,16 +324,21 @@ impl Roles {
         roles
     }
 
-    /// Every contrast floor §7.8 states, as the pair of roles it is read across.
+    /// Every contrast floor, as the pair of roles it is read across.
     ///
     /// This is the one table both the debug-time check and the acceptance test read, so a role
-    /// that falls under its floor is reported once, as the pair that fails it. The first
-    /// forty-five entries are the document's model count for the two appearances: §7.8's pairs
-    /// plus the overlay step §7.1 measures, with the overlay held to the raised surface's floor
-    /// rather than to the 1.00 it cannot fail. The three series the chart gained for indicator
-    /// lines add three more floors, and the fifth status color adds two (its fill and its chip
-    /// tint), bringing the table to fifty entries.
-    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 50] {
+    /// that falls under its floor is reported once, as the pair that fails it. It holds §7.8's
+    /// pairs plus the overlay step §7.1 measures, with the overlay held to the raised surface's
+    /// floor rather than to the 1.00 it cannot fail. The three series the chart gained for
+    /// indicator lines add three more floors, and the fifth status color adds two (its fill and
+    /// its chip tint). The map adds two more. §10 holds its coastline — `chart.map_land` against
+    /// `chart.map_ocean` — to 1.5:1, stricter than either surface step, because a map is drawn
+    /// from exactly those two fills and nothing else. The land is read against `surface.sunken`
+    /// as well, the chart face the map is drawn on, so a land fill cannot dissolve into the face
+    /// behind it while the sea stays close enough to that face for the chart series to read.
+    /// That is fifty-two entries; the acceptance test resolves each appearance separately and
+    /// checks its own table.
+    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 52] {
         [
             (
                 "fg.default on surface.canvas",
@@ -601,6 +615,26 @@ impl Roles {
                 self.chart.series[5],
                 self.surface.sunken,
                 3.0,
+            ),
+            // §10's coastline floor: a map is drawn from exactly two fills, so the pair a reader
+            // follows the shore with is held to 1.5:1 — the map's own floor, stricter than the
+            // surface steps (1.02/1.05). The acceptance test resolves each appearance and
+            // checks its own table, so both coastlines are read.
+            (
+                "chart.map_land on chart.map_ocean",
+                self.chart.map_land,
+                self.chart.map_ocean,
+                1.5,
+            ),
+            // The land is also the fill that has to hold against `surface.sunken`, the chart face
+            // the map is drawn on: the sea deliberately sits within a step of that face so the
+            // chart series keep their contrast on it, which leaves the land as the shape the map
+            // reads by. Held to the same 1.5:1 visible step as the coastline.
+            (
+                "chart.map_land on surface.sunken",
+                self.chart.map_land,
+                self.surface.sunken,
+                1.5,
             ),
             (
                 "surface.raised on surface.canvas",
@@ -933,6 +967,27 @@ mod tests {
         }
     }
 
+    /// A6: a map's two fills are far enough apart to draw a coastline in both appearances.
+    ///
+    /// This is the widget's own floor rather than §7.8's: the surface steps are 1.02–1.05, which
+    /// on a map made of exactly two colors would leave no coastline at all. It reads the pair
+    /// directly instead of going through `contrast_floors`, so the floor is asserted here even if
+    /// the table loses its entries.
+    #[test]
+    fn map_land_and_map_ocean_should_stay_apart_in_both_appearances() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+            let ratio = contrast(roles.chart.map_land, roles.chart.map_ocean);
+
+            assert!(
+                ratio >= 1.5,
+                "{:?}: chart.map_land reads {ratio:.2}:1 on chart.map_ocean, where the map floor \
+                 is 1.50:1",
+                palette.appearance
+            );
+        }
+    }
+
     /// Every role with a name, so a check can be written once and run against all of them.
     fn roles_with_names(roles: &Roles) -> Vec<(&'static str, ResolvedColor)> {
         vec![
@@ -980,6 +1035,8 @@ mod tests {
             ("chart.grid", roles.chart.grid),
             ("chart.axis", roles.chart.axis),
             ("chart.crosshair", roles.chart.crosshair),
+            ("chart.map_ocean", roles.chart.map_ocean),
+            ("chart.map_land", roles.chart.map_land),
             ("chart.series[0]", roles.chart.series[0]),
             ("chart.series[1]", roles.chart.series[1]),
             ("chart.series[2]", roles.chart.series[2]),

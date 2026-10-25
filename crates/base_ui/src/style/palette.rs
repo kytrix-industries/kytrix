@@ -5,11 +5,13 @@
 //! replacing this data and no drawing code changes with it. The two built-in palettes are two
 //! instances of the same shape: they differ in value, never in meaning.
 //!
-//! Every value is the one the design document's §7 table spells for the role it is the source of.
-//! Surfaces are the six z-axis values, `text` is the foreground every other text step is mixed
-//! from, and `brand`, the four status colors and the two market directions are the saturated
-//! colors a theme author would actually tune. The alphas at the end are the transparent things a
-//! theme owns: the two interaction veils and the scrim behind a modal.
+//! Every value but the two map fills is the one the design document's §7 table spells for the role
+//! it is the source of. Surfaces are the six z-axis values, `text` is the foreground every other
+//! text step is mixed from, and `brand`, the four status colors and the two market directions are
+//! the saturated colors a theme author would actually tune. The two map fills are authored here
+//! instead (§10): a map is drawn from exactly two colors, so they cannot be mixed from a surface.
+//! The alphas at the end are the transparent things a theme owns: the two interaction veils and
+//! the scrim behind a modal.
 //!
 //! [`Roles::resolve`]: crate::style::roles::Roles::resolve
 
@@ -90,6 +92,10 @@ pub struct Palette {
     /// The first three are the colors the chart shipped with and do not change; the three after
     /// them extend the set without moving any of those.
     pub series: [Oklch; 6],
+    /// The sea a map is drawn on: the water fill under the land.
+    pub map_ocean: Oklch,
+    /// The land a map fills, one visible step away from the sea so a coastline reads.
+    pub map_land: Oklch,
     /// Text drawn on a saturated fill (`brand`, `status.danger`).
     pub on_brand: Oklch,
     /// Text drawn on the inverse block (a tooltip, a solid neutral badge).
@@ -141,6 +147,12 @@ impl Palette {
                 Oklch::new(0.540, 0.130, 120.0, opacity),
                 Oklch::new(0.500, 0.010, 0.0, opacity),
             ],
+            // A chart's sea is the content face with the water's blue barely in it, because the
+            // ships on it are the chart's series and those are held to their contrast on that
+            // face; the shore is buff, the color a paper chart gives land, and it is the one
+            // pair on a map that has to read as a coastline, so it carries the 1.5:1 of §10.
+            map_ocean: Oklch::new(0.938, 0.028, 235.0, opacity),
+            map_land: Oklch::new(0.800, 0.045, 85.0, opacity),
             on_brand: Oklch::new(0.978, 0.0, 0.0, opacity),
             on_inverse: Oklch::new(0.978, 0.0, 0.0, opacity),
             scrim_alpha: 0.42,
@@ -189,6 +201,11 @@ impl Palette {
                 Oklch::new(0.700, 0.140, 120.0, opacity),
                 Oklch::new(0.660, 0.010, 0.0, opacity),
             ],
+            // The night chart: the sea is the content face's blue lifted a little, and the land is
+            // a dark sand above it — the same coastline floor as the light appearance, with the
+            // sea kept near the face the chart series were checked on.
+            map_ocean: Oklch::new(0.200, 0.032, 245.0, opacity),
+            map_land: Oklch::new(0.350, 0.024, 85.0, opacity),
             on_brand: Oklch::new(0.176, 0.020, 245.0, opacity),
             on_inverse: Oklch::new(0.176, 0.016, 252.4, opacity),
             scrim_alpha: 0.55,
