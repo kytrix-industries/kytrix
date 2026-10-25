@@ -30,6 +30,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<crypto_fgi::view::CryptoFgiWidget>(),
         WidgetRegistration::for_view::<empty::view::EmptyWidget>(),
         WidgetRegistration::for_view::<etf::view::EtfWidget>(),
+        WidgetRegistration::for_view::<financial_calendar::view::FinancialCalendarWidget>(),
         WidgetRegistration::for_view::<force_orders::view::ForceOrdersWidget>(),
         WidgetRegistration::for_view::<hormuz_vessel_map::view::HormuzVesselMapWidget>(),
         WidgetRegistration::for_view::<
@@ -76,6 +77,7 @@ mod tests {
     const CRYPTO_FGI_ID: &str = "kytrix.market.crypto_fgi";
     const EMPTY_ID: &str = "kytrix.empty";
     const ETF_ID: &str = "kytrix.market.etf_flow";
+    const FINANCIAL_CALENDAR_ID: &str = "kytrix.monitoring.financial_calendar";
     const FORCE_ORDERS_ID: &str = "kytrix.market.force_orders";
     const HYPERLIQUID_WALLET_MONITOR_ID: &str = "kytrix.market.hyperliquid_wallet_monitor";
     const HORMUZ_VESSEL_MAP_ID: &str = "kytrix.maritime.hormuz_vessel_map";
@@ -105,6 +107,7 @@ mod tests {
         (CANDLESTICK_ID, WidgetCategory::Market),
         (CRYPTO_FGI_ID, WidgetCategory::Market),
         (ETF_ID, WidgetCategory::Market),
+        (FINANCIAL_CALENDAR_ID, WidgetCategory::Monitoring),
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
         (HORMUZ_VESSEL_MAP_ID, WidgetCategory::Monitoring),
         (HYPERLIQUID_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
@@ -135,6 +138,7 @@ mod tests {
             assert!(registry.get(CRYPTO_FGI_ID).is_some());
             assert!(registry.get(EMPTY_ID).is_some());
             assert!(registry.get(ETF_ID).is_some());
+            assert!(registry.get(FINANCIAL_CALENDAR_ID).is_some());
             assert!(registry.get(FORCE_ORDERS_ID).is_some());
             assert!(registry.get(HORMUZ_VESSEL_MAP_ID).is_some());
             assert!(registry.get(HYPERLIQUID_WALLET_MONITOR_ID).is_some());

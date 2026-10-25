@@ -138,6 +138,7 @@ fn all_network_targets(
         KytrixServiceCapability::Wallet,
         KytrixServiceCapability::XMedia,
         KytrixServiceCapability::Cmc,
+        KytrixServiceCapability::FinancialCalendar,
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
         KytrixServiceCapability::UpdaterDownload,

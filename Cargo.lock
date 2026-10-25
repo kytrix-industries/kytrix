@@ -2814,6 +2814,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "financial_calendar"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_proto",
+ "kytrix_service_provider",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10855,6 +10875,7 @@ dependencies = [
  "crypto_fgi",
  "empty",
  "etf",
+ "financial_calendar",
  "force_orders",
  "gpui-kit",
  "hormuz_vessel_map",

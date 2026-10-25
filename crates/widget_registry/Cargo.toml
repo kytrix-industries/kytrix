@@ -16,6 +16,7 @@ candlestick = { workspace = true }
 crypto_fgi = { workspace = true }
 empty = { workspace = true }
 etf = { workspace = true }
+financial_calendar = { workspace = true }
 force_orders = { workspace = true }
 hormuz_vessel_map = { workspace = true }
 hyperliquid_wallet_monitor = { workspace = true }

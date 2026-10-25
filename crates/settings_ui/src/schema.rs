@@ -495,12 +495,14 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                     "coinmarketcap",
                     "fear",
                     "greed",
+                    "calendar",
                     "pizza",
                     "pizzint",
                     "pentagon",
                     "osint",
                     "恐惧",
                     "贪婪",
+                    "日历",
                     "披萨",
                     "五角大楼",
                     "云服务",
@@ -1374,6 +1376,9 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::PentagonPizzaIndex,
+    },
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::FinancialCalendar,
     },
 ];
 
