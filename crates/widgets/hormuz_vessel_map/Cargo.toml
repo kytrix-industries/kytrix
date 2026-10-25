@@ -12,6 +12,7 @@ gpui-kit = { workspace = true }
 kytrix_service_provider = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
+thiserror = { workspace = true }
 time = { workspace = true }
 
 [lints]

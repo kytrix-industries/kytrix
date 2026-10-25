@@ -4211,6 +4211,7 @@ dependencies = [
  "kytrix_service_provider",
  "serde",
  "smol_str",
+ "thiserror 2.0.20",
  "time",
 ]
 
