@@ -103,7 +103,7 @@ mod tests {
     /// group it is listed under. A widget the framework builds for itself is listed
     /// nowhere, so it is not in this table — the gallery's own tests cover the
     /// widget that is.
-    const CATEGORIES: [(&str, WidgetCategory); 20] = [
+    const CATEGORIES: [(&str, WidgetCategory); 21] = [
         (CANDLESTICK_ID, WidgetCategory::Market),
         (CRYPTO_FGI_ID, WidgetCategory::Market),
         (ETF_ID, WidgetCategory::Market),
@@ -154,7 +154,7 @@ mod tests {
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");
             }
-            assert_eq!(registry.iter().count(), 21);
+            assert_eq!(registry.iter().count(), 22);
         });
     }
 

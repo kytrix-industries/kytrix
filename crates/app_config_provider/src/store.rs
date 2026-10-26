@@ -934,7 +934,7 @@ mod tests {
     fn every_kytrix_service_capability_should_have_a_network_target() {
         let targets = all_network_targets(&Config::default(), []);
 
-        assert_eq!(targets.len(), 12);
+        assert_eq!(targets.len(), 13);
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,

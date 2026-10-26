@@ -788,17 +788,6 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        // Nothing in the workspace reads the pizza index over
-                                        // the service yet, so the mock answers an empty snapshot.
-                                        ClientRequestKind::GetPentagonPizzaIndex(_) => (
-                                            ObservedRequest::Rpc("pentagon_pizza_index"),
-                                            proto_response::response::Response::PentagonPizzaIndex(
-                                                proto_response::PentagonPizzaIndexResponse {
-                                                    pentagon_pizza_index: None,
-                                                },
-                                            ),
-                                            false,
-                                        ),
                                     };
                                     if request_sender.send((connection_id, observed)).is_err() {
                                         return;
@@ -1092,7 +1081,7 @@ mod tests {
         manager.update(|config| config.proxy_default = ProxyRoute::System);
 
         let stamped = &manager.read().service_route_generations;
-        assert_eq!(stamped.len(), 12, "every capability is a stamped target");
+        assert_eq!(stamped.len(), 13, "every capability is a stamped target");
         assert!(
             stamped.contains_key(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Cmc,

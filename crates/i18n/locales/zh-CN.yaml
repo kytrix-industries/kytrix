@@ -1098,7 +1098,6 @@ settings_ui:
   proxies:
     add: 新增代理
     address: 地址
-    ais_group: AIS 船舶
     app_updates: 应用更新
     applications: 代理应用
     authorization: 认证方式

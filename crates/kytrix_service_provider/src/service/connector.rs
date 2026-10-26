@@ -16,9 +16,10 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetCmcFearGreedIndex, GetEtf, GetFinancialCalendar, GetIndexManifest, GetPentagonPizzaIndex, WalletAddSelection,
-        WalletDeleteSelection, WalletSelections, XAddSelection, XDeleteSelection, XSearch,
-        XSelections, XTweets, request::Request as ClientRequestKind,
+        GetCmcFearGreedIndex, GetEtf, GetFinancialCalendar, GetIndexManifest,
+        GetPentagonPizzaIndex, WalletAddSelection, WalletDeleteSelection, WalletSelections,
+        XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
+        request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
     types as proto_types,

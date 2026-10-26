@@ -311,7 +311,7 @@ mod tests {
         );
         assert_eq!(
             workspace_crates(&crates).len(),
-            35,
+            36,
             "the walk must have found every workspace crate: {:?}",
             workspace_crates(&crates)
         );
