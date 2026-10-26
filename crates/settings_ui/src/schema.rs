@@ -65,7 +65,6 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
             id: "general",
             label: text("settings_ui.general.title"),
             keywords: &["general", "通用", "设置"],
-            open: true,
             children: vec![
                 TreeNodeDef::Page(SharedString::new_static("appearance")),
                 TreeNodeDef::Page(SharedString::new_static("time-zone")),
@@ -75,7 +74,6 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
             id: "proxy",
             label: text("settings_ui.proxies.title"),
             keywords: &["proxy", "代理", "socks5", "网络"],
-            open: true,
             children: vec![
                 TreeNodeDef::Page(SharedString::new_static("proxy-management")),
                 TreeNodeDef::Page(SharedString::new_static("proxy-applications")),
@@ -92,7 +90,6 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
                 "credentials",
                 "凭据",
             ],
-            open: true,
             children: pages
                 .iter()
                 .filter(|page| page.id.starts_with("market_participants."))

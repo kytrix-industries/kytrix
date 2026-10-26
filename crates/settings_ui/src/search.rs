@@ -1,6 +1,6 @@
 //! What a search query answers, over the tree and the fields in it.
 //!
-//! A query is answered once, into a filter the tree and the page are drawn against. What is
+//! A query is answered once, into a filter the sidebar and the page are drawn against. What is
 //! matched is the normalized text of every label, description and declared keyword: the
 //! caller builds that text for the language it is drawn in, so a user looking for "代理" and
 //! a user looking for "proxy" find the same setting.
@@ -79,6 +79,10 @@ impl SearchFilter {
     }
 
     /// Whether anything is filtered out at all.
+    ///
+    /// Only the tests ask this: the dialog draws from what a filter admits rather than from
+    /// whether the query narrowed anything.
+    #[cfg(test)]
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }

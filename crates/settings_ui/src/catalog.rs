@@ -2,7 +2,7 @@
 //!
 //! This is a declaration rather than a database. Nothing here reads the settings or draws
 //! anything: a page says what it holds and how each control converts to and from the stored
-//! value, and the dialog is what turns that into a tree and a form.
+//! value, and the dialog is what turns that into a sidebar and a form.
 //!
 //! Ids are the identity of a setting. A field id is what a value is remembered under while
 //! it is being typed and what a search matches it against, so it is not a rendering detail
@@ -284,15 +284,13 @@ pub(crate) struct PageDef {
     pub sections: Vec<SectionDef>,
 }
 
-/// One entry of the settings tree.
+/// One entry of the settings tree: a page, or a group of them under one heading.
 pub(crate) enum TreeNodeDef {
     Page(SharedString),
     Group {
         id: &'static str,
         label: Text,
         keywords: &'static [&'static str],
-        /// Whether the group is open when the dialog is drawn without a search.
-        open: bool,
         children: Vec<TreeNodeDef>,
     },
 }
@@ -305,39 +303,20 @@ impl TreeNodeDef {
             Self::Group { id, .. } => id,
         }
     }
-
-    /// The label the tree draws for this entry.
-    pub fn label<'a>(&'a self, catalog: &'a Catalog) -> PageTitle {
-        match self {
-            Self::Page(id) => catalog.page_label(id.as_str()),
-            Self::Group { label, .. } => PageTitle::Key(label.clone()),
-        }
-    }
 }
 
 /// Everything the settings offer, indexed for lookup.
 pub(crate) struct Catalog {
-    /// The tree in the order it is drawn.
+    /// The tree in the order the sidebar draws it.
     pub tree: Vec<TreeNodeDef>,
-    /// Every page, in the order the tree draws them.
+    /// Every page, in the order the sidebar draws them.
     pub pages: Vec<PageDef>,
 }
 
 impl Catalog {
-    /// The page drawn behind one tree entry.
+    /// The page drawn behind one sidebar entry.
     pub fn page(&self, id: &str) -> Option<&PageDef> {
         self.pages.iter().find(|page| page.id == id)
-    }
-
-    /// The id of the page behind one tree entry, or `None` when the entry is a group.
-    ///
-    /// It answers with the page's own id rather than with what was asked for, so the id a
-    /// page is selected and compared by is always the one the catalog declares.
-    pub fn page_id(&self, id: &str) -> Option<SharedString> {
-        self.pages
-            .iter()
-            .find(|page| page.id == id)
-            .map(|page| page.id.clone())
     }
 
     /// The label a page is drawn with, or an empty label for an id that names none.

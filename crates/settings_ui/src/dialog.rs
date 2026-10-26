@@ -1,22 +1,27 @@
-//! The settings dialog: the search field above the tree of settings in one column, the page
+//! The settings dialog: the search field above the sidebar of settings in one column, the page
 //! behind the selected entry beside it.
 //!
-//! The dialog owns what outlives a frame: the tree's selection, the state of every text field
-//! on the selected page, and the scroll position of that page. Everything else — what a page
-//! holds, what a control writes — belongs to the catalog and to the draft.
+//! The dialog owns what outlives a frame: the page that is drawn, the state of every text field
+//! on it, and the scroll position of that page. Everything else — what a page holds, what a
+//! control writes — belongs to the catalog and to the draft.
+//!
+//! The sidebar does not fold: a group is the heading over the pages under it, and a page is the
+//! one kind of row that opens anything. What a page opens is the page drawn beside the list, so
+//! the two are one thing and move together.
 //!
 //! A control writes the draft rather than the settings, so the settings are the ones the user
 //! confirmed and nothing else: what leaves this dialog is one commit, made when the user asks
 //! for it, and a commit that cannot be stored leaves the dialog open with what the user had.
 //!
-//! A search rebuilds the tree rather than dimming it: an entry that matches neither by its own
-//! label nor by a field on it is not drawn at all, and a group with a match under it is drawn
-//! open, so what is left is the way to what was searched for. What it narrows is the tree, so it
-//! is drawn above the tree rather than across the whole dialog. A query that matches nothing is
-//! answered in both columns rather than leaving the page that was open behind.
+//! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its
+//! own label nor by a field on it is not drawn at all, and a group with none of its pages left
+//! is not drawn either, so what is left is the way to what was searched for. What it narrows is
+//! the sidebar, so it is drawn above the sidebar rather than across the whole dialog. A query
+//! that matches nothing is answered in both columns rather than leaving the page that was open
+//! behind.
 //!
 //! A page is drawn from the catalog on every frame, so it follows the language the window is
-//! showing by itself. What the dialog holds across frames — the labels of the tree, the words
+//! showing by itself. What the dialog holds across frames — the rows of the sidebar, the words
 //! the search is answered over, the placeholder of a field built before — does not, so it is
 //! built again when the language moves on — see [`SettingsDialog::adopt_language`].
 //!
@@ -32,20 +37,20 @@ use std::borrow::BorrowMut as _;
 use app_config_provider::manager::ConfigManager;
 use base_ui::{
     button::Button,
+    icon::{Icon, IconKind},
     input::{Input, InputState, InputStateBuilder, InputStateEvent},
     interactive::InteractiveVariantExt,
     layer::LayerExt,
+    scroll_bar::Scrollbar,
     separator::Separator,
     size::UnifiedSizable,
     style::theme::ThemeExt,
-    tree::Tree,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, DismissEvent, Entity,
-    EventEmitter, InteractiveElement as _, IntoElement, ParentElement, Render, ScrollHandle,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    base::{TreeItem, TreeState},
-    div, px,
+    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, DismissEvent, ElementId,
+    Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    base::Selectable as _, div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
 use market_participants_connector::venue::definition::supported_venues;
@@ -66,7 +71,7 @@ use crate::{
 const WIDTH: f32 = 1080.0;
 const HEIGHT: f32 = 760.0;
 
-/// How tall the search row is, which is what the tree starts below.
+/// How tall the search row is, which is what the sidebar starts below.
 const SEARCH_HEIGHT: f32 = 32.0;
 
 /// The element id of the search field, which is also the key of its state.
@@ -107,23 +112,27 @@ pub(crate) struct SettingsDialog {
     /// The language the text this dialog holds was built in.
     ///
     /// A page is drawn from the catalog afresh on every frame, so what it shows is the text of
-    /// the frame's language. What is held across frames is not, so this is what the tree, the
+    /// the frame's language. What is held across frames is not, so this is what the sidebar, the
     /// filter and the placeholder of a field are compared against.
     language: LanguageCode,
-    /// The query the tree was last built for, so it is rebuilt when the answer changed rather
+    /// The query the sidebar was last built for, so it is rebuilt when the answer changed rather
     /// than on every frame.
-    tree_query: Option<SharedString>,
+    sidebar_query: Option<SharedString>,
+    /// The rows of the sidebar, in the order they are drawn.
+    ///
+    /// A page the search took away is not a row, and neither is a heading left over nothing:
+    /// what a heading names is the pages under it.
+    sidebar: Vec<SidebarEntry>,
+    sidebar_scroll: ScrollHandle,
     /// The search field, which is built the first time the dialog is drawn: a text field is
     /// filled in by a window, and a dialog is built before there is one to draw it in.
     search_input: Option<Entity<InputState>>,
-    tree: Entity<TreeState>,
     inputs: Vec<FieldInput>,
     page_scroll: ScrollHandle,
     proxies: Entity<ProxyTable>,
     /// Held because the subscription is what answers the search: dropping it would leave a
     /// field that is typed into and never searched by.
     search_events: Option<Subscription>,
-    _selection: Subscription,
 }
 
 /// The settings take themselves off the layer by emitting the dismissal their dialog listens
@@ -163,27 +172,6 @@ impl SettingsDialog {
     /// The whole of the settings, over the catalog they draw and the draft the session holds.
     fn build(draft: Entity<SettingsDraft>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
-        let tree = cx.new(|cx| {
-            TreeState::new(cx).items(tree_items(&catalog, &filter, catalog.tree.as_slice(), cx))
-        });
-        let first_page = SharedString::new_static(default_page());
-        tree.update(cx, |tree, cx| {
-            // The page the dialog opens on is selected the way any other page is: the tree opens
-            // what hides it, rather than opening with no entry selected because a group is closed
-            // over the page it draws.
-            tree.reveal_item(&first_page, ScrollStrategy::Top, cx);
-            let index = tree.index_of(&first_page);
-            tree.set_selected_index(index, cx);
-        });
-        let selection = cx.observe(&tree, |dialog, tree, cx| {
-            if let Some(id) = tree
-                .read(cx)
-                .selected_item()
-                .map(|item| item.id.to_string())
-            {
-                dialog.select(&id, cx);
-            }
-        });
         let proxies = cx.new(|cx| ProxyTable::new(draft.clone(), cx));
 
         Self {
@@ -193,14 +181,14 @@ impl SettingsDialog {
             query: SharedString::default(),
             filter,
             language: *cx.global::<LanguageCode>(),
-            tree_query: None,
+            sidebar_query: None,
+            sidebar: Vec::new(),
+            sidebar_scroll: ScrollHandle::new(),
             search_input: None,
-            tree,
             inputs: Vec::new(),
             page_scroll: ScrollHandle::new(),
             proxies,
             search_events: None,
-            _selection: selection,
         }
     }
 
@@ -251,7 +239,7 @@ impl SettingsDialog {
         // The filter answers over the rendered text of every label, so the words it holds are
         // of the language it was answered in.
         self.filter = SearchFilter::new(&self.query, &search_nodes(&self.catalog, cx));
-        self.build_tree(cx);
+        self.rebuild_sidebar(cx);
         if let Some(input) = self.search_input.as_ref() {
             let placeholder = t!(cx, "settings_ui.search.placeholder");
             input.update(cx, |input, cx| {
@@ -412,40 +400,27 @@ impl SettingsDialog {
         }
     }
 
-    /// Selects the page behind one tree entry.
+    /// Selects the page one sidebar row names.
     ///
-    /// The page drawn is the page behind the entry the tree selects, so the two are one thing
-    /// and are moved together: a page moved on its own would be put back by the tree the next
-    /// time it notified, and the field the user is typing into would stop being drawn under
-    /// the caret that is still in it.
-    ///
-    /// A group is not a page, so selecting one leaves the page alone: what a group does is
-    /// open and close.
+    /// The page drawn and the row that names it are one thing: the row is drawn selected from
+    /// the page the dialog is on, so a page moved on its own would leave the row behind it, and
+    /// the field the user is typing into would stop being drawn under the caret that is still
+    /// in it.
     fn select(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(selected) = self.catalog.page_id(id) else {
-            return;
-        };
-        if selected == self.current_page {
+        if self.current_page == id {
             return;
         }
 
-        self.current_page = selected;
+        self.current_page = SharedString::from(id);
         self.page_scroll = ScrollHandle::new();
-        let selected = self.current_page.clone();
-        self.tree.update(cx, |tree, cx| {
-            // The page may sit under a group that is closed: the tree opens what hides it
-            // rather than losing the entry it is on.
-            tree.reveal_item(&selected, ScrollStrategy::Top, cx);
-            let index = tree.index_of(&selected);
-            tree.set_selected_index(index, cx);
-        });
+        self.reveal_current_page();
         cx.notify();
     }
 
     /// Answers a new query.
     ///
-    /// The tree and the page are rebuilt while they are drawn, so nothing is built here but
-    /// the answer itself; what is selected follows the answer, because a page with neither a
+    /// The sidebar is rebuilt from the answer while the dialog is drawn, so nothing is built
+    /// here but the answer itself; the page follows the answer, because a page with neither a
     /// matching label nor a matching field is a page that is no longer drawn.
     fn set_query(&mut self, query: SharedString, cx: &mut Context<Self>) {
         if self.query == query {
@@ -462,8 +437,8 @@ impl SettingsDialog {
             .flatten();
         if let Some(page) = next {
             // The page moves the way a selection moves rather than on its own: the page drawn
-            // and the entry the tree selects are one thing, so a page moved without the tree
-            // is a page the tree puts back the next time it notifies.
+            // and the row that names it are one thing, so a page moved without the sidebar is
+            // a page the sidebar has no row for.
             self.select(page.as_str(), cx);
         }
         cx.notify();
@@ -474,36 +449,44 @@ impl SettingsDialog {
         self.catalog.page(self.current_page.as_str())
     }
 
-    /// Gives the tree the entries the current answer admits.
+    /// Gives the sidebar the rows the current answer admits.
     ///
-    /// The tree is given its items again only when the answer changed: rebuilding them every
-    /// frame would throw away which folders the user opened.
-    fn sync_tree(&mut self, cx: &mut Context<Self>) {
-        if self.tree_query.as_ref() == Some(&self.query) {
+    /// The rows are built again only when the answer changed: a frame that did not move the
+    /// query would build the same rows, and the scroll position would be asked to follow them
+    /// again.
+    fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_query.as_ref() == Some(&self.query) {
             return;
         }
 
-        self.build_tree(cx);
+        self.rebuild_sidebar(cx);
     }
 
-    /// Builds the tree the filter admits, labelled in the language the dialog is holding.
-    fn build_tree(&mut self, cx: &mut Context<Self>) {
-        let items = tree_items(
+    /// Builds the rows the filter admits, labelled in the language the dialog is holding.
+    fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar = sidebar_entries(
             &self.catalog,
             &self.filter,
             self.catalog.tree.as_slice(),
+            true,
             cx,
         );
-        let selected = self.current_page.clone();
-        self.tree.update(cx, |tree, cx| {
-            tree.set_items(items, cx);
-            // The page may sit under a group that is closed: the tree opens what hides it
-            // rather than losing the entry it is on.
-            tree.reveal_item(&selected, ScrollStrategy::Top, cx);
-            let index = tree.index_of(&selected);
-            tree.set_selected_index(index, cx);
-        });
-        self.tree_query = Some(self.query.clone());
+        self.sidebar_query = Some(self.query.clone());
+        self.reveal_current_page();
+    }
+
+    /// Scrolls the sidebar to the row of the page that is drawn.
+    ///
+    /// A page the dialog moved to by itself is not necessarily one the user can see: what it
+    /// moves to is moved into view, the way a row the user clicked already is.
+    fn reveal_current_page(&self) {
+        if let Some(index) = self
+            .sidebar
+            .iter()
+            .position(|entry| entry.page_id() == Some(&self.current_page))
+        {
+            self.sidebar_scroll.scroll_to_item(index);
+        }
     }
 
     /// Opens the form a proxy row asked for, or asks again about the one thing a row can do that
@@ -557,7 +540,7 @@ impl SettingsDialog {
     ///
     /// The field is as wide as the column it filters, and the way to stop looking is the
     /// field's own: it is drawn inside the input rather than beside it, so the row and the
-    /// tree below it are the same width and line up.
+    /// sidebar below it are the same width and line up.
     fn search_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let input = self.search_input(window, cx);
 
@@ -576,18 +559,95 @@ impl SettingsDialog {
             )
             .into_any_element()
     }
+
+    /// The sidebar: the rows the current answer admits, inside the viewport that scrolls them.
+    ///
+    /// A heading is drawn as text rather than as a control, because a group is not something a
+    /// user opens: what it does is name the pages that follow it. A page is a button, and the
+    /// one the dialog is on is drawn selected.
+    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = div()
+            .id("settings-sidebar-scroll")
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll);
+
+        for entry in &self.sidebar {
+            rows = rows.child(match entry {
+                SidebarEntry::Heading(label) => div()
+                    .flex_none()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(cx.theme().roles.fg.muted.hsla)
+                    .child(label.clone())
+                    .into_any_element(),
+                SidebarEntry::Separator => div()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .debug_selector(|| "SETTINGS_SIDEBAR_SEPARATOR".into())
+                    .child(Separator::horizontal())
+                    .into_any_element(),
+                SidebarEntry::Page { id, label } => {
+                    let page = id.clone();
+                    let element_id: ElementId = (
+                        ElementId::Name(SharedString::new_static("settings-sidebar")),
+                        id.clone(),
+                    )
+                        .into();
+
+                    Button::new(element_id)
+                        .ghost()
+                        .selected(id == &self.current_page)
+                        .flex_none()
+                        .w_full()
+                        .justify_start()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("SETTINGS_ENTRY_{id}")
+                        })
+                        .child(Icon::new(IconKind::GearSix).size_4())
+                        .child(label.clone())
+                        .on_click(cx.listener(move |dialog, _, _, cx| {
+                            dialog.select(page.as_str(), cx);
+                        }))
+                        .into_any_element()
+                }
+            });
+        }
+
+        div()
+            .relative()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(rows)
+            .child(Scrollbar::vertical(self.sidebar_scroll.clone()))
+            .into_any_element()
+    }
 }
 
 impl Render for SettingsDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.adopt_language(window, cx);
-        self.sync_tree(cx);
+        self.sync_sidebar(cx);
         self.open_requested_form(window, cx);
         let foreground = cx.theme().roles.fg.default.hsla;
         let dialog = cx.entity();
         let search = self.search_row(window, cx);
         // A page with neither its own label nor one of its fields admitted by the query is a
-        // page the search took away: what is left is the message, in this column as in the tree.
+        // page the search took away: what is left is the message, in this column as in the
+        // sidebar.
         let selected = self
             .page()
             .filter(|page| page_is_reachable(page, &self.filter))
@@ -625,11 +685,11 @@ impl Render for SettingsDialog {
                 .child(no_matches(cx))
                 .into_any_element(),
         };
-        // A query that admitted nothing leaves the tree empty as well: the column says so
+        // A query that admitted nothing leaves the sidebar empty as well: the column says so
         // instead of drawing an empty list, so both columns answer the search the same way.
-        let tree = if self.filter.is_nothing() {
+        let sidebar = if self.filter.is_nothing() {
             div()
-                .debug_selector(|| "SETTINGS_TREE_NO_MATCHES".into())
+                .debug_selector(|| "SETTINGS_SIDEBAR_NO_MATCHES".into())
                 .size_full()
                 .flex()
                 .items_center()
@@ -637,10 +697,10 @@ impl Render for SettingsDialog {
                 .child(no_matches(cx))
                 .into_any_element()
         } else {
-            Tree::new("settings-tree".into(), self.tree.clone()).into_any_element()
+            self.sidebar(cx)
         };
-        // The search narrows the tree and nothing else, so the two are one column: the field
-        // sits above what it filters, and the column is as wide as the tree it holds.
+        // The search narrows the sidebar and nothing else, so the two are one column: the field
+        // sits above what it filters, and the column is as wide as the list it holds.
         let entries = div()
             .w_64()
             .flex_none()
@@ -653,8 +713,8 @@ impl Render for SettingsDialog {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .debug_selector(|| "SETTINGS_TREE".into())
-                    .child(tree),
+                    .debug_selector(|| "SETTINGS_SIDEBAR".into())
+                    .child(sidebar),
             );
 
         div()
@@ -715,7 +775,7 @@ fn no_matches(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The tree the search is answered over.
+/// The catalog the search is answered over.
 ///
 /// One node per entry, with the text the entry is found by: what it renders as now, plus the
 /// words the catalog declares beside it — which is what makes a setting reachable in either
@@ -792,10 +852,10 @@ fn page_search(page: &PageDef, cx: &App) -> PageSearch {
 
 /// Whether the query leaves one page reachable.
 ///
-/// A page is reachable by its own label, exactly the way the tree has always answered a query,
+/// A page is reachable by its own label, exactly the way the search has always answered a query,
 /// or through any field it holds: a query that names a setting on a page is a query that can
 /// open that page, even when the page's own name says nothing about what was searched for. A
-/// page reached the second way is listed in the tree, and [`SearchFilter::admits_field`] draws
+/// page reached the second way is listed in the sidebar, and [`SearchFilter::admits_field`] draws
 /// only the fields that matched on it.
 fn page_is_reachable(page: &PageDef, filter: &SearchFilter) -> bool {
     filter.admits_page(&page.id)
@@ -806,7 +866,7 @@ fn page_is_reachable(page: &PageDef, filter: &SearchFilter) -> bool {
             .any(|field| filter.admits_field(&page.id, &field.id))
 }
 
-/// The first page a filter leaves reachable, in the order the tree draws them.
+/// The first page a filter leaves reachable, in the order the sidebar draws them.
 fn first_admitted_page(catalog: &Catalog, filter: &SearchFilter) -> Option<SharedString> {
     catalog
         .tree
@@ -830,43 +890,79 @@ fn first_admitted_in(
     }
 }
 
-/// The tree as the framework draws it, holding only what the filter leaves reachable.
+/// One row of the settings sidebar.
+pub(crate) enum SidebarEntry {
+    /// A group's name over the pages that follow it: text, because a group is not something a
+    /// user opens.
+    Heading(SharedString),
+    /// A page, which is the one kind of row that opens something.
+    Page {
+        id: SharedString,
+        label: SharedString,
+    },
+    /// A divider between one part of the sidebar and the next.
+    ///
+    /// A page at the top of the catalog is a part of its own rather than another page of the
+    /// group above it, and the divider is what says so.
+    Separator,
+}
+
+impl SidebarEntry {
+    /// The page this row opens, or `None` for anything else.
+    fn page_id(&self) -> Option<&SharedString> {
+        match self {
+            Self::Heading(_) | Self::Separator => None,
+            Self::Page { id, .. } => Some(id),
+        }
+    }
+}
+
+/// The sidebar as it is drawn, holding only what the filter leaves reachable.
 ///
 /// A page is reached by its label or by a field on it — see [`page_is_reachable`] — and a group
-/// with nothing under it is not drawn at all, which is what keeps an unmatched part of the tree
-/// out of the way instead of dimming it.
-fn tree_items(
+/// with none of its pages left is not drawn at all, which is what keeps an unmatched part of the
+/// settings out of the way instead of dimming it.
+///
+/// `top_level` is what tells the catalog's own pages from the pages of a group: only the former
+/// are their own part of the sidebar, so only they are divided from what precedes them.
+fn sidebar_entries(
     catalog: &Catalog,
     filter: &SearchFilter,
     nodes: &[TreeNodeDef],
+    top_level: bool,
     cx: &App,
-) -> Vec<TreeItem> {
-    nodes
-        .iter()
-        .filter_map(|node| match node {
-            TreeNodeDef::Page(id) => catalog
-                .page(id)
-                .filter(|page| page_is_reachable(page, filter))
-                .map(|_| TreeItem::new(id.clone(), catalog.page_label(id.as_str()).label(cx))),
+) -> Vec<SidebarEntry> {
+    let mut entries = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match node {
+            TreeNodeDef::Page(id) => {
+                if catalog
+                    .page(id)
+                    .is_some_and(|page| page_is_reachable(page, filter))
+                {
+                    if top_level && !entries.is_empty() {
+                        entries.push(SidebarEntry::Separator);
+                    }
+                    entries.push(SidebarEntry::Page {
+                        id: id.clone(),
+                        label: catalog.page_label(id.as_str()).label(cx),
+                    });
+                }
+            }
             TreeNodeDef::Group {
-                id, open, children, ..
+                label, children, ..
             } => {
-                let items = tree_items(catalog, filter, children, cx);
-                if items.is_empty() {
-                    return None;
+                let pages = sidebar_entries(catalog, filter, children, false, cx);
+                if pages.is_empty() {
+                    continue;
                 }
 
-                Some(
-                    TreeItem::new(SharedString::new_static(id), node.label(catalog).label(cx))
-                        // A group is open when it says it is, and open whenever a query is
-                        // narrowing the tree, because a match under a closed group is a match
-                        // the user cannot see.
-                        .expanded(*open || !filter.is_all())
-                        .children(items),
-                )
+                entries.push(SidebarEntry::Heading(label.label(cx)));
+                entries.extend(pages);
             }
-        })
-        .collect()
+        }
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -906,7 +1002,7 @@ mod tests {
     use tempfile::TempDir;
     use widget_tokio_runtime::global;
 
-    use super::{SettingsDialog, default_page};
+    use super::{SettingsDialog, SidebarEntry, default_page};
     use crate::{
         access::FieldValue,
         appearance,
@@ -931,24 +1027,6 @@ mod tests {
         catalog(&venues())
     }
 
-    /// The fixture catalog with one group closed.
-    ///
-    /// The production catalog opens every group it offers — see `crate::schema` — so a test of
-    /// what a closed group is drawn as closes one here.
-    fn catalog_closing(group: &str) -> Catalog {
-        let mut catalog = test_catalog();
-        let node = catalog
-            .tree
-            .iter_mut()
-            .find(|node| node.id() == group)
-            .unwrap_or_else(|| panic!("{group} should be a group of the fixture catalog"));
-        let crate::catalog::TreeNodeDef::Group { open, .. } = node else {
-            panic!("{group} should be a group of the fixture catalog");
-        };
-        *open = false;
-        catalog
-    }
-
     /// The pages of the fixture catalog.
     fn pages() -> Vec<PageDef> {
         test_catalog().pages
@@ -957,7 +1035,7 @@ mod tests {
     /// The label one page of the fixture catalog is drawn with.
     ///
     /// A page is named by the message key it declares or by the identity it stands
-    /// for, and the tree draws whichever the catalog carries.
+    /// for, and the sidebar draws whichever the catalog carries.
     fn page_title(page: &str, cx: &TestAppContext) -> SharedString {
         cx.read(|cx| {
             test_catalog()
@@ -1110,24 +1188,6 @@ mod tests {
         settings_in(config, Language::En, cx)
     }
 
-    /// Opens the settings over the fixture catalog with the Market participants group closed.
-    ///
-    /// The production catalog opens that group — see `crate::schema` — so this is the fixture a
-    /// test of what a closed group is drawn as is opened over.
-    fn settings_with_a_closed_group(
-        config: Config,
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
-        let manager = cx.update(|cx| ConfigManager::in_memory(config, cx));
-
-        settings_over_catalog(
-            manager,
-            Language::En,
-            catalog_closing("market_participants"),
-            cx,
-        )
-    }
-
     /// Opens the settings again over a window that already holds them.
     ///
     /// Opening the settings installs the globals a session is built on, which a test can only do
@@ -1275,15 +1335,18 @@ mod tests {
         cx.read(|cx| panel.read_with(cx, |dialog, _| dialog.current_page.clone()))
     }
 
-    /// The labels the tree draws, in the order it draws them.
+    /// The labels the sidebar draws, in the order it draws them.
     fn labels(panel: &Entity<SettingsDialog>, cx: &VisualTestContext) -> Vec<SharedString> {
         cx.read(|cx| {
-            panel.read_with(cx, |dialog, cx| {
-                let tree = dialog.tree.read(cx);
-
-                (0..)
-                    .map_while(|index| tree.entry(index))
-                    .map(|entry| entry.item().label.clone())
+            panel.read_with(cx, |dialog, _| {
+                dialog
+                    .sidebar
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        SidebarEntry::Heading(label) => Some(label.clone()),
+                        SidebarEntry::Page { label, .. } => Some(label.clone()),
+                        SidebarEntry::Separator => None,
+                    })
                     .collect()
             })
         })
@@ -2339,16 +2402,16 @@ mod tests {
         );
     }
 
-    /// A page follows the language by being drawn again, but the tree holds the labels it was
-    /// built with and nothing draws it again: a tree that kept them would be the one part of
+    /// A page follows the language by being drawn again, but the sidebar holds the labels it was
+    /// built with and nothing draws it again: a sidebar that kept them would be the one part of
     /// the settings still written in the language the user just left.
     #[gpui_kit::test]
-    fn the_tree_should_be_labelled_in_the_language_the_user_confirms(cx: &mut TestAppContext) {
+    fn the_sidebar_should_be_labelled_in_the_language_the_user_confirms(cx: &mut TestAppContext) {
         let (panel, cx) = settings_in(Config::default(), Language::ZhCn, cx);
 
         assert!(
             labels(&panel, cx).contains(&SharedString::new_static("外观")),
-            "the tree should open in the language the window opened in"
+            "the sidebar should open in the language the window opened in"
         );
 
         write_draft_field(&panel, "appearance", "language", "en", cx);
@@ -2368,7 +2431,7 @@ mod tests {
         let translated = labels(&panel, cx);
         assert!(
             translated.contains(&SharedString::new_static("Appearance")),
-            "the tree should be labelled in the language the user confirmed: {translated:?}"
+            "the sidebar should be labelled in the language the user confirmed: {translated:?}"
         );
     }
 
@@ -2376,56 +2439,57 @@ mod tests {
     fn the_dialog_should_open_on_the_default_page(cx: &mut TestAppContext) {
         let (dialog, cx) = settings(Config::default(), cx);
 
-        dialog.read_with(cx, |dialog, cx| {
+        dialog.read_with(cx, |dialog, _| {
             assert_eq!(dialog.current_page, default_page());
             assert_eq!(dialog.query, gpui_kit::SharedString::default());
             assert!(dialog.filter.is_all());
-            // The tree is selected on the page it shows, so the two columns say the same
-            // thing from the first frame.
-            let selected = dialog
-                .tree
-                .read(cx)
-                .selected_item()
-                .map(|item| item.id.to_string());
-            assert_eq!(selected.as_deref(), Some(default_page()));
+            // The row of the page the dialog shows is a row of the sidebar, so the two columns
+            // say the same thing from the first frame.
+            assert!(
+                dialog
+                    .sidebar
+                    .iter()
+                    .any(|entry| entry.page_id().is_some_and(|id| id == default_page())),
+                "the sidebar should list the page the dialog opens on"
+            );
         });
     }
 
-    /// The search narrows the tree and nothing else, so the two are one column: the field is as
-    /// wide as the tree it filters, sits directly above it, and leaves the rest of the dialog
+    /// The search narrows the sidebar and nothing else, so the two are one column: the field is
+    /// as wide as the list it filters, sits directly above it, and leaves the rest of the dialog
     /// to the page.
     #[gpui_kit::test]
-    fn the_search_should_sit_in_the_column_of_the_tree_it_filters(cx: &mut TestAppContext) {
+    fn the_search_should_sit_in_the_column_of_the_sidebar_it_filters(cx: &mut TestAppContext) {
         let (_, cx) = settings(Config::default(), cx);
 
         let search = cx
             .debug_bounds("SETTINGS_SEARCH")
             .expect("the search field should be drawn");
-        let tree = cx
-            .debug_bounds("SETTINGS_TREE")
-            .expect("the tree should be drawn");
+        let sidebar = cx
+            .debug_bounds("SETTINGS_SIDEBAR")
+            .expect("the sidebar should be drawn");
         let dialog = cx
             .debug_bounds("SETTINGS_DIALOG")
             .expect("the dialog should be drawn");
 
         assert_eq!(search.size.width, px(256.0), "the search field is w_64");
         assert_eq!(
-            tree.size.width, search.size.width,
-            "the tree should be as wide as the field above it"
+            sidebar.size.width, search.size.width,
+            "the sidebar should be as wide as the field above it"
         );
-        assert_eq!(tree.left(), search.left(), "the two should line up");
+        assert_eq!(sidebar.left(), search.left(), "the two should line up");
         assert!(
-            tree.top() >= search.bottom(),
-            "the search should sit above the tree it filters"
+            sidebar.top() >= search.bottom(),
+            "the search should sit above the list it filters"
         );
         assert!(
-            tree.right() < dialog.right(),
+            sidebar.right() < dialog.right(),
             "the column should leave the rest of the dialog to the page"
         );
     }
 
     /// The clear control is the field's own, and clearing the field is what brings the whole
-    /// tree back: the field and the answer are one thing, so emptying one empties the other.
+    /// sidebar back: the field and the answer are one thing, so emptying one empties the other.
     #[gpui_kit::test]
     fn the_field_should_clear_the_search_it_was_filtered_by(cx: &mut TestAppContext) {
         let (dialog, cx) = settings(Config::default(), cx);
@@ -2439,7 +2503,7 @@ mod tests {
 
         assert!(
             !dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
-            "typing into the field should narrow the tree"
+            "typing into the field should narrow the sidebar"
         );
 
         // The control is drawn inside the field, at the end of the row the field fills.
@@ -2453,20 +2517,6 @@ mod tests {
             dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
             "clearing the field should admit everything again"
         );
-    }
-
-    /// A group is not a page: selecting one leaves the page behind it where it was, which is
-    /// what makes opening and closing a folder harmless.
-    #[gpui_kit::test]
-    fn selecting_a_group_should_leave_the_page_alone(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-        cx.run_until_parked();
-
-        dialog.update(cx, |dialog, cx| dialog.select("proxy", cx));
-
-        dialog.read_with(cx, |dialog, _| {
-            assert_eq!(dialog.current_page, default_page());
-        });
     }
 
     #[gpui_kit::test]
@@ -2483,47 +2533,57 @@ mod tests {
         });
     }
 
-    /// The page drawn is the page behind the entry the tree selects, so a selection moves the
-    /// two together: a page moved on its own is one the tree puts back the next time it
-    /// notifies, which is what leaves a field the user is typing into undrawn.
-    ///
-    /// The page selected here sits under a group the catalog closes, so this is also what says
-    /// the tree reaches it: an entry the tree cannot select is one it draws no page for.
+    /// The page drawn and the row that names it are one thing: the rows are drawn from the page
+    /// the dialog is on, so a page moved on its own would leave the row behind it, and a row
+    /// that moved the page back would take the field the user is typing into off the screen.
     #[gpui_kit::test]
-    fn selecting_a_page_should_move_the_tree_with_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
+    fn selecting_a_page_should_move_the_sidebar_with_it(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
 
         panel.update(cx, |dialog, cx| {
             dialog.select("market_participants.okx", cx)
         });
         settle(cx);
 
-        let selected = panel.read_with(cx, |dialog, cx| {
-            dialog
-                .tree
-                .read(cx)
-                .selected_item()
-                .map(|item| item.id.to_string())
-        });
         assert_eq!(
-            selected.as_deref(),
-            Some("market_participants.okx"),
-            "the page and the entry the tree selects are one thing"
+            current_page(&panel, cx),
+            "market_participants.okx",
+            "the page selected and the page drawn are one thing"
         );
 
-        // Working in the page is what the tree used to answer with its own selection: the caret
-        // goes into the field, and a tree that disagreed put its own page back under it.
+        // Working in the page is what the sidebar used to answer with its own selection: the
+        // caret goes into the field, and a sidebar that disagreed put its own page back under
+        // it.
         click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
         assert_eq!(
             current_page(&panel, cx),
             "market_participants.okx",
-            "the tree must not be able to move the page back off the page it is on"
+            "the sidebar must not be able to move the page back off the page it is on"
         );
     }
 
-    /// A venue's page is named by the venue it configures, and the tree entry is what opens it:
-    /// every venue this build speaks is one page, so a shared label would make two venues tell
-    /// apart by nothing the user can read.
+    /// A row is what opens the page it names: the rows are the only way into a page besides
+    /// the search, so a row that does not reach its page is a page with no way in.
+    #[gpui_kit::test]
+    fn clicking_a_sidebar_row_should_open_its_page(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
+
+        let row = cx
+            .debug_bounds("SETTINGS_ENTRY_market_participants.okx")
+            .expect("the sidebar should list the OKX page");
+        cx.simulate_click(row.center(), Modifiers::none());
+        settle(cx);
+
+        assert_eq!(
+            current_page(&panel, cx),
+            "market_participants.okx",
+            "the row that was clicked should be the page that is drawn"
+        );
+    }
+
+    /// A venue's page is named by the venue it configures, and the sidebar row is what opens
+    /// it: every venue this build speaks is one page, so a shared label would make two venues
+    /// tell apart by nothing the user can read.
     #[gpui_kit::test]
     fn a_venue_page_should_be_named_by_the_venue_it_configures(cx: &mut TestAppContext) {
         let (_panel, cx) = settings(Config::default(), cx);
@@ -2540,81 +2600,56 @@ mod tests {
         );
     }
 
-    /// The catalog opens the Market participants group, so the venues under it are drawn on the
-    /// first frame: no page under the group has been drawn yet to open it, so a group the
-    /// catalog closed would leave the venues the release notes promise one click away.
-    ///
-    /// The closed-group test below covers what a closed group hides; this test covers the
-    /// default the catalog actually ships, which is what the release notes describe.
+    /// A group is a heading over the pages under it, and every page under it is drawn: nothing
+    /// a group declares hides one of them, so the venues the release notes promise are one
+    /// click away from the first frame.
     #[gpui_kit::test]
-    fn the_market_participants_group_should_be_open_on_the_first_frame(cx: &mut TestAppContext) {
+    fn a_group_should_draw_every_page_under_it(cx: &mut TestAppContext) {
         let (panel, cx) = settings(configured_settings(), cx);
 
         let opening = labels(&panel, cx);
         assert!(
             opening.contains(&SharedString::new_static("Market participants")),
-            "the group the catalog ships should be drawn: {opening:?}"
+            "the group should be drawn as a heading: {opening:?}"
         );
         assert!(
             opening.contains(&SharedString::new_static("OKX")),
-            "a group the catalog opens should draw the venues under it on the first frame: \
-             {opening:?}"
+            "every venue under the group should be drawn on the first frame: {opening:?}"
         );
     }
 
-    /// A group the catalog closes is built closed, and the page drawn under it is what opens
-    /// it: what a group declares is the tree it is drawn as, and the page drawn and the entry
-    /// the tree selects are one thing.
+    /// A page at the top of the catalog is a part of its own rather than another page of the
+    /// group above it: the divider is what says so, and a page with nothing before it is not
+    /// divided from anything.
     #[gpui_kit::test]
-    fn a_group_the_catalog_closes_should_be_built_closed_and_opened_for_the_page_that_is_drawn(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
+    fn a_root_page_should_be_divided_from_the_group_above_it(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
 
-        let opening = labels(&panel, cx);
         assert!(
-            opening.contains(&SharedString::new_static("Appearance"))
-                && opening.contains(&SharedString::new_static("Market participants")),
-            "the root page and the group should be drawn: {opening:?}"
-        );
-        assert!(
-            !opening.contains(&SharedString::new_static("OKX")),
-            "a group that is not open should hide what is under it: {opening:?}"
+            cx.debug_bounds("SETTINGS_SIDEBAR_SEPARATOR").is_some(),
+            "About should be divided from the group above it"
         );
 
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx)
-        });
+        panel.update(cx, |dialog, cx| dialog.set_query("about".into(), cx));
         settle(cx);
 
-        let opened = labels(&panel, cx);
         assert!(
-            opened.contains(&SharedString::new_static("OKX")),
-            "the tree should open what hides the page it is on: {opened:?}"
+            cx.debug_bounds("SETTINGS_SIDEBAR_SEPARATOR").is_none(),
+            "a page with nothing before it should not be divided from anything"
         );
-        let selected = panel.read_with(cx, |dialog, cx| {
-            dialog
-                .tree
-                .read(cx)
-                .selected_item()
-                .map(|item| item.id.to_string())
-        });
         assert_eq!(
-            selected.as_deref(),
-            Some("market_participants.okx"),
-            "the page that is drawn should be the page the tree shows: {opened:?}"
+            labels(&panel, cx),
+            [SharedString::new_static("About")],
+            "the query should leave the page the divider belonged to"
         );
     }
 
-    /// A query opens the groups it matches in: a match under a closed group is a match the
-    /// user cannot see, which is what makes the search a way to a page rather than a way to
-    /// its name.
-    ///
-    /// The page drawn is left where it is by the query used here, so what the tree draws the
-    /// pages under a closed group from is the query and not the page the tree was moved to.
+    /// A query keeps the heading of a group a page under it matches in: the rows are the pages,
+    /// and a page drawn without the heading over it would be a page whose group the search
+    /// left behind.
     #[gpui_kit::test]
-    fn a_query_should_open_the_group_it_matches_in(cx: &mut TestAppContext) {
-        let (panel, cx) = settings_with_a_closed_group(configured_settings(), cx);
+    fn a_query_should_keep_the_group_of_a_page_it_matches(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
 
         panel.update(cx, |dialog, cx| dialog.set_query("a".into(), cx));
         settle(cx);
@@ -2627,12 +2662,11 @@ mod tests {
         let narrowed = labels(&panel, cx);
         assert!(
             narrowed.contains(&SharedString::new_static("Market participants")),
-            "the query should keep the group it matches in: {narrowed:?}"
+            "the query should keep the heading it matches in: {narrowed:?}"
         );
         assert!(
             narrowed.contains(&SharedString::new_static("OKX")),
-            "a group drawn for a query should be drawn open, or the match is one the user \
-             cannot see: {narrowed:?}"
+            "the pages the query admits should be listed under the heading: {narrowed:?}"
         );
     }
 
@@ -2660,8 +2694,8 @@ mod tests {
     }
 
     /// A page whose own label the query does not match but one of whose fields it does is a
-    /// page the query reaches: it is listed in the tree, opened as the page that is drawn, and
-    /// only the fields that matched are drawn on it.
+    /// page the query reaches: it is listed in the sidebar, opened as the page that is drawn,
+    /// and only the fields that matched are drawn on it.
     #[gpui_kit::test]
     fn a_query_that_matches_a_field_should_open_the_page_that_holds_it(cx: &mut TestAppContext) {
         let (panel, cx) = settings(configured_settings(), cx);
@@ -2700,9 +2734,9 @@ mod tests {
         );
     }
 
-    /// A query that matches nothing is answered in both columns: the tree has no entry left and
-    /// the page that was open is not drawn behind it, so the two do not disagree the way they
-    /// would if the page stayed selected while the tree went empty.
+    /// A query that matches nothing is answered in both columns: the sidebar has no row left
+    /// and the page that was open is not drawn behind it, so the two do not disagree the way
+    /// they would if the page stayed selected while the sidebar went empty.
     #[gpui_kit::test]
     fn a_query_that_matches_nothing_should_say_so_in_both_columns(cx: &mut TestAppContext) {
         let (panel, cx) = settings(configured_settings(), cx);
@@ -2720,11 +2754,11 @@ mod tests {
         });
         assert!(
             labels(&panel, cx).is_empty(),
-            "the tree should draw no entry for a query that admits nothing"
+            "the sidebar should draw no row for a query that admits nothing"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_TREE_NO_MATCHES").is_some(),
-            "the tree column should say that nothing matched"
+            cx.debug_bounds("SETTINGS_SIDEBAR_NO_MATCHES").is_some(),
+            "the sidebar column should say that nothing matched"
         );
         assert!(
             cx.debug_bounds("SETTINGS_PAGE_NO_MATCHES").is_some(),
@@ -2732,14 +2766,14 @@ mod tests {
         );
         assert!(
             cx.debug_bounds("SETTINGS_PROXY_PAGE").is_none(),
-            "the page the query took away must not be drawn behind the empty tree"
+            "the page the query took away must not be drawn behind the empty sidebar"
         );
 
         panel.update(cx, |dialog, cx| dialog.set_query("".into(), cx));
         settle(cx);
 
         assert!(
-            cx.debug_bounds("SETTINGS_TREE_NO_MATCHES").is_none()
+            cx.debug_bounds("SETTINGS_SIDEBAR_NO_MATCHES").is_none()
                 && cx.debug_bounds("SETTINGS_PAGE_NO_MATCHES").is_none(),
             "clearing the query should take the message away"
         );
@@ -2749,7 +2783,7 @@ mod tests {
         );
     }
 
-    /// Clearing a query brings the whole tree back, and with it the page that was drawn.
+    /// Clearing a query brings the whole sidebar back, and with it the page that was drawn.
     #[gpui_kit::test]
     fn clearing_a_query_should_admit_everything_again(cx: &mut TestAppContext) {
         let (dialog, cx) = settings(Config::default(), cx);
@@ -2991,11 +3025,12 @@ mod tests {
         let table = cx
             .debug_bounds("SETTINGS_PROXY_TABLE")
             .expect("the page should draw the frame the table is drawn in");
-        // The tree is the foot of the column beside the page, so where it ends is where the body
-        // the page is drawn in ends: a page that stopped at its own two rows would end higher.
+        // The sidebar is the foot of the column beside the page, so where it ends is where the
+        // body the page is drawn in ends: a page that stopped at its own two rows would end
+        // higher.
         let column = cx
-            .debug_bounds("SETTINGS_TREE")
-            .expect("the dialog should draw the tree beside the page");
+            .debug_bounds("SETTINGS_SIDEBAR")
+            .expect("the dialog should draw the sidebar beside the page");
 
         assert_eq!(
             add.size.height,
@@ -3055,11 +3090,11 @@ mod tests {
         );
     }
 
-    /// Every page the catalog declares is reachable from the tree, and every entry of the
-    /// tree leads to one: a page nobody can select is a page that does not exist, and an
-    /// entry that selects nothing is a dead end.
+    /// Every page the catalog declares is reachable from the sidebar, and every row leads to
+    /// one: a page nobody can select is a page that does not exist, and a row that opens
+    /// nothing is a dead end.
     #[test]
-    fn the_tree_and_the_pages_should_name_each_other() {
+    fn the_sidebar_and_the_pages_should_name_each_other() {
         let catalog = test_catalog();
         let mut reachable = catalog.tree.iter().flat_map(leaves).collect::<Vec<_>>();
         reachable.sort_unstable();
@@ -3211,7 +3246,7 @@ mod tests {
 
         assert!(
             !labels(&panel, cx).is_empty(),
-            "the tree should draw at least one entry"
+            "the sidebar should draw at least one row"
         );
 
         panel.update(cx, |dialog, cx| {
