@@ -388,8 +388,8 @@ where
     };
     // The limit travels with the catalogue rather than as a read of its own: a selector
     // draws the two together, and two reads could disagree about the account they
-    // describe. A session that published none leaves the selector nothing to draw, and an
-    // account the service does not know is exactly that.
+    // describe. Only a pane the service has no session for leaves the selector nothing to
+    // draw: a feature the session does not carry is off, so a session always names a limit.
     let limit = session_limit(&source.session_state());
 
     Some(
@@ -607,11 +607,23 @@ fn stream_error(error: &KytrixServiceError, limit: Option<u32>) -> IndicesStream
 }
 
 /// The number of indices the signed-in account may follow, as the session holds it.
+///
+/// A session that exists always names a limit, because the entitlement contract makes a
+/// feature the session does not carry off: a missing `indices` entry, or one that is not
+/// a limit, is an account that may follow no indices rather than one whose limit nobody
+/// knows. `None` is only for a pane there is no session for at all.
 fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Option<u32> {
-    session
-        .borrow()
-        .as_ref()
-        .map(|state| state.index_topic_limit)
+    let session = session.borrow();
+    let state = session.as_ref()?;
+    let limit = state
+        .entitlements
+        .get("indices")
+        .and_then(|entitlement| entitlement.value.as_ref())
+        .map_or(0, |value| match value {
+            proto_types::entitlement_value::Value::Limit(limit) => *limit,
+            proto_types::entitlement_value::Value::Enabled(_) => 0,
+        });
+    Some(limit)
 }
 
 /// Answers the request that opened one stream.
@@ -700,7 +712,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::test_support::{ACCOUNT, FakeSource, event, manifest, selected, topic};
+    use crate::test_support::{ACCOUNT, FakeSource, event, manifest, selected, session, topic};
 
     fn scope(codes: &[&str]) -> IndicesScope {
         let selection = codes.iter().map(|code| selected(code)).collect::<Vec<_>>();
@@ -1162,6 +1174,62 @@ mod tests {
 
         assert_eq!(error, IndicesStreamError::IndexLimit { limit: None });
         runtime.shutdown().await;
+    }
+
+    /// A session that exists always names a limit: the contract makes a feature the
+    /// session does not carry off, so a missing entry is an account that may follow no
+    /// indices rather than one whose limit nobody knows.
+    #[test]
+    fn a_session_without_an_indices_entitlement_should_follow_no_indices() {
+        let mut state = session(3);
+        state.entitlements.remove("indices");
+        let (_sender, receiver) = watch::channel(Some(state));
+
+        assert_eq!(session_limit(&receiver), Some(0));
+    }
+
+    /// A feature whose value is a flag is not a number, so it cannot be a limit either;
+    /// an enabled flag still says nothing about how many indices may be followed.
+    #[test]
+    fn an_indices_entitlement_that_is_a_flag_should_follow_no_indices() {
+        let mut state = session(3);
+        state.entitlements.insert(
+            "indices".to_owned(),
+            proto_types::EntitlementValue {
+                value: Some(proto_types::entitlement_value::Value::Enabled(true)),
+            },
+        );
+        let (_sender, receiver) = watch::channel(Some(state));
+
+        assert_eq!(session_limit(&receiver), Some(0));
+    }
+
+    /// An entitlement with neither branch set is not a message a session should publish,
+    /// and the contract reads what it does not know as off.
+    #[test]
+    fn an_indices_entitlement_without_a_value_should_follow_no_indices() {
+        let mut state = session(3);
+        state.entitlements.insert(
+            "indices".to_owned(),
+            proto_types::EntitlementValue::default(),
+        );
+        let (_sender, receiver) = watch::channel(Some(state));
+
+        assert_eq!(session_limit(&receiver), Some(0));
+    }
+
+    #[test]
+    fn no_session_should_leave_the_index_limit_unknown() {
+        let (_sender, receiver) = watch::channel(None);
+
+        assert_eq!(session_limit(&receiver), None);
+    }
+
+    #[test]
+    fn a_session_should_name_the_index_limit_it_carries() {
+        let (_sender, receiver) = watch::channel(Some(session(5)));
+
+        assert_eq!(session_limit(&receiver), Some(5));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ mod actor;
 pub mod ais;
 pub mod connector;
 pub mod engine;
+pub mod entitlements;
 mod handoff;
 pub mod protocol;
 mod supervisor;

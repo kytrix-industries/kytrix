@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex, RwLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use app_config::network::{
@@ -159,6 +162,35 @@ pub(super) fn index_topic(code: &str) -> IndexTopic {
 
 pub(super) fn index_service_topic(code: &str) -> ServiceTopic {
     ServiceTopic::Index(index_topic(code))
+}
+
+pub(super) fn enabled_entitlement(enabled: bool) -> proto_types::EntitlementValue {
+    proto_types::EntitlementValue {
+        value: Some(proto_types::entitlement_value::Value::Enabled(enabled)),
+    }
+}
+
+pub(super) fn limit_entitlement(limit: u32) -> proto_types::EntitlementValue {
+    proto_types::EntitlementValue {
+        value: Some(proto_types::entitlement_value::Value::Limit(limit)),
+    }
+}
+
+pub(super) fn feature_definition(
+    key: &str,
+    value_type: proto_types::FeatureValueType,
+) -> proto_types::FeatureDefinition {
+    proto_types::FeatureDefinition {
+        key: key.to_owned(),
+        display_name_zh: key.to_owned(),
+        display_name_en: key.to_owned(),
+        description: String::new(),
+        value_type: value_type as i32,
+        unit: String::new(),
+        min_value: 0,
+        max_value: 0,
+        sort_order: 0,
+    }
 }
 
 pub(super) fn index_manifest() -> proto_types::IndexManifest {
@@ -569,11 +601,32 @@ impl TestServiceServer {
                                     message: Some(server_message::Message::SessionState(
                                         proto_response::SessionState {
                                             entitlement_revision: 1,
-                                            news_read: true,
-                                            index_topic_limit: 3,
-                                            wallet_address_limit: 3,
+                                            plan_code: proto_types::PlanCode::Free as i32,
+                                            entitlements: HashMap::from([
+                                                ("news".to_owned(), enabled_entitlement(true)),
+                                                ("ais".to_owned(), enabled_entitlement(true)),
+                                                ("indices".to_owned(), limit_entitlement(3)),
+                                                ("wallet".to_owned(), limit_entitlement(3)),
+                                            ]),
+                                            catalog: vec![
+                                                feature_definition(
+                                                    "news",
+                                                    proto_types::FeatureValueType::Bool,
+                                                ),
+                                                feature_definition(
+                                                    "ais",
+                                                    proto_types::FeatureValueType::Bool,
+                                                ),
+                                                feature_definition(
+                                                    "indices",
+                                                    proto_types::FeatureValueType::Limit,
+                                                ),
+                                                feature_definition(
+                                                    "wallet",
+                                                    proto_types::FeatureValueType::Limit,
+                                                ),
+                                            ],
                                             next_change_at: None,
-                                            ais_read: true,
                                         },
                                     )),
                                 };

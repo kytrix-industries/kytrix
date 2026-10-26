@@ -5,7 +5,7 @@
 //! control is the same session the service's tests refuse, delay and close.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -84,12 +84,17 @@ pub(crate) fn event(topic: IndexTopic, latest: u32, timestamp: i64) -> IndexEven
     }
 }
 
-pub(crate) fn session(index_topic_limit: u32) -> KytrixSessionState {
+pub(crate) fn session(limit: u32) -> KytrixSessionState {
     KytrixSessionState {
         entitlement_revision: 1,
-        news_read: false,
-        index_topic_limit,
-        wallet_address_limit: 0,
+        plan_code: proto_types::PlanCode::Free,
+        entitlements: BTreeMap::from([(
+            "indices".to_owned(),
+            proto_types::EntitlementValue {
+                value: Some(proto_types::entitlement_value::Value::Limit(limit)),
+            },
+        )]),
+        catalog: Vec::new(),
         next_change_at: None,
     }
 }
@@ -247,12 +252,10 @@ impl Default for FakeSource {
 }
 
 impl FakeSource {
-    /// A source holding a session that may follow `index_topic_limit` indices.
-    pub(crate) fn with_session(index_topic_limit: u32) -> Self {
+    /// A source holding a session that may follow `limit` indices.
+    pub(crate) fn with_session(limit: u32) -> Self {
         let source = Self::default();
-        source
-            .session
-            .send_replace(Some(session(index_topic_limit)));
+        source.session.send_replace(Some(session(limit)));
         source
     }
 

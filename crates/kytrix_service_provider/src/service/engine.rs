@@ -14,7 +14,9 @@ use ahash::{AHashMap, AHashSet};
 use app_config::network::{Config, KytrixServiceCapability, NetworkRouteGeneration, ResolvedProxy};
 use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
-use kytrix_proto::{client::request::Request as ClientRequestKind, server as proto_response};
+use kytrix_proto::{
+    client::request::Request as ClientRequestKind, server as proto_response, types as proto_types,
+};
 use network::transport::{
     error::TransportError,
     hub::{TransportHub, TransportPolicy, TransportScope},
@@ -251,8 +253,9 @@ impl fmt::Display for IndexTopic {
     }
 }
 
+/// A topic a Kytrix service subscription follows.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(super) enum ServiceTopic {
+pub enum ServiceTopic {
     News,
     Index(IndexTopic),
     X,
@@ -358,7 +361,7 @@ pub struct WalletTransfer {
     pub timestamp: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum KytrixServiceEvent {
     News(NewsEvent),
     Index(IndexEvent),
@@ -470,12 +473,19 @@ pub(super) fn subscription_send_error<T>(error: SubscriptionSendError<T>) -> Tra
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The entitlement value the Kytrix service publishes for one feature.
+pub type KytrixEntitlementValue = proto_types::EntitlementValue;
+
+/// One catalogue entry, as the Kytrix service publishes it.
+pub type KytrixFeatureDefinition = proto_types::FeatureDefinition;
+
+/// The entitlements the Kytrix service published for one session.
+#[derive(Clone, Debug, PartialEq)]
 pub struct KytrixSessionState {
     pub entitlement_revision: u64,
-    pub news_read: bool,
-    pub index_topic_limit: u32,
-    pub wallet_address_limit: u32,
+    pub plan_code: proto_types::PlanCode,
+    pub entitlements: BTreeMap<String, KytrixEntitlementValue>,
+    pub catalog: Vec<KytrixFeatureDefinition>,
     pub next_change_at: Option<i64>,
 }
 
@@ -950,16 +960,16 @@ mod tests {
         let observed = registry.subscribe();
         let first = KytrixSessionState {
             entitlement_revision: 1,
-            news_read: false,
-            index_topic_limit: 2,
-            wallet_address_limit: 3,
+            plan_code: proto_types::PlanCode::Free,
+            entitlements: BTreeMap::from([("news".to_owned(), enabled_value(false))]),
+            catalog: Vec::new(),
             next_change_at: None,
         };
         let second = KytrixSessionState {
             entitlement_revision: 4,
-            news_read: true,
-            index_topic_limit: 5,
-            wallet_address_limit: 6,
+            plan_code: proto_types::PlanCode::Pro,
+            entitlements: BTreeMap::from([("news".to_owned(), enabled_value(true))]),
+            catalog: Vec::new(),
             next_change_at: Some(7),
         };
 
@@ -974,6 +984,12 @@ mod tests {
 
         registry.clear(1);
         assert_eq!(*observed.borrow(), None);
+    }
+
+    fn enabled_value(enabled: bool) -> KytrixEntitlementValue {
+        KytrixEntitlementValue {
+            value: Some(proto_types::entitlement_value::Value::Enabled(enabled)),
+        }
     }
 
     #[tokio::test(start_paused = true)]

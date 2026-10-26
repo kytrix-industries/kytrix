@@ -68,11 +68,18 @@ pub(super) fn decode_binary(payload: &[u8]) -> Result<IncomingMessage, KytrixSer
             Ok(IncomingMessage::Event(decode_event(event)?))
         }
         Some(server_message::Message::SessionState(state)) => {
+            let plan_code = proto_types::PlanCode::try_from(state.plan_code).unwrap_or_else(|_| {
+                log::warn!(
+                    "unknown Kytrix service plan code {}; showing it as unspecified",
+                    state.plan_code
+                );
+                proto_types::PlanCode::Unspecified
+            });
             Ok(IncomingMessage::SessionState(KytrixSessionState {
                 entitlement_revision: state.entitlement_revision,
-                news_read: state.news_read,
-                index_topic_limit: state.index_topic_limit,
-                wallet_address_limit: state.wallet_address_limit,
+                plan_code,
+                entitlements: state.entitlements.into_iter().collect(),
+                catalog: state.catalog,
                 next_change_at: state.next_change_at,
             }))
         }
@@ -568,6 +575,8 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{super::test_support::*, *};
     use crate::service::ais::{AisPosition, AisStatic};
 
@@ -1051,30 +1060,58 @@ mod tests {
 
     #[test]
     fn server_envelope_should_decode_session_state() {
+        let catalog = feature_definition("news", proto_types::FeatureValueType::Bool);
         let message = ServerMessage {
             message: Some(server_message::Message::SessionState(
                 proto_response::SessionState {
                     entitlement_revision: 7,
-                    news_read: false,
-                    index_topic_limit: 3,
-                    wallet_address_limit: 9,
+                    plan_code: proto_types::PlanCode::Plus as i32,
+                    entitlements: std::collections::HashMap::from([
+                        ("news".to_owned(), enabled_entitlement(true)),
+                        ("indices".to_owned(), limit_entitlement(3)),
+                    ]),
+                    catalog: vec![catalog.clone()],
                     next_change_at: Some(1_800_000_000),
-                    ais_read: true,
                 },
             )),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).expect("session state should decode");
-        assert!(matches!(
-            decoded,
-            IncomingMessage::SessionState(KytrixSessionState {
-                entitlement_revision: 7,
-                news_read: false,
-                index_topic_limit: 3,
-                wallet_address_limit: 9,
-                next_change_at: Some(1_800_000_000),
-            })
-        ));
+        let IncomingMessage::SessionState(state) = decoded else {
+            panic!("expected a session state");
+        };
+        assert_eq!(state.entitlement_revision, 7);
+        assert_eq!(state.plan_code, proto_types::PlanCode::Plus);
+        assert_eq!(
+            state.entitlements,
+            BTreeMap::from([
+                ("indices".to_owned(), limit_entitlement(3)),
+                ("news".to_owned(), enabled_entitlement(true)),
+            ])
+        );
+        assert_eq!(state.catalog, vec![catalog]);
+        assert_eq!(state.next_change_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn an_unknown_plan_code_should_decode_as_unspecified() {
+        let message = ServerMessage {
+            message: Some(server_message::Message::SessionState(
+                proto_response::SessionState {
+                    entitlement_revision: 7,
+                    plan_code: 99,
+                    entitlements: std::collections::HashMap::new(),
+                    catalog: Vec::new(),
+                    next_change_at: None,
+                },
+            )),
+        };
+
+        let decoded = decode_binary(&message.encode_to_vec()).expect("session state should decode");
+        let IncomingMessage::SessionState(state) = decoded else {
+            panic!("expected a session state");
+        };
+        assert_eq!(state.plan_code, proto_types::PlanCode::Unspecified);
     }
 
     #[test]
