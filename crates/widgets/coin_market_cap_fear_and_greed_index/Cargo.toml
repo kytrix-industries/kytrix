@@ -1,5 +1,5 @@
 [package]
-name = "crypto_fgi"
+name = "coin_market_cap_fear_and_greed_index"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

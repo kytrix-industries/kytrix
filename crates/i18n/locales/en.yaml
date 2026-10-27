@@ -89,7 +89,7 @@ error:
     outcome_risk_pool_incomplete: Risk pool %{pool} references a group or conversion the batch does not carry
     outcome_risk_pool_lineage_invalid: Risk pool %{pool} is not a valid lineage successor of a member group
     snapshot_key_mismatch: The snapshot of listing %{listing} does not describe it
-  crypto_fgi:
+  coin_market_cap_fear_and_greed_index:
     score_out_of_range: 'The fear and greed answer carried an invalid score: %{value}'
     stream_unavailable: The fear and greed service did not accept the refresh request
   display:
@@ -553,7 +553,7 @@ widget:
     market: Market
     monitoring: Monitoring
     statistics: Statistics
-  crypto_fgi:
+  coin_market_cap_fear_and_greed_index:
     info_history: 'Each row is the reading the index service took on its own calendar day: yesterday is the day before, last week is 7 days ago, last month is the same day of the previous calendar month, and last year is the same day a year ago. The data is recorded by UTC day. A dash is shown when the previous calendar month or last year has no such day, or when there is no reading on or before it.'
     info_yearly: The index service takes the highest and the lowest reading from the past 365 calendar days (not including today), and shows the day each one happened on with the market sentiment level recorded then.
     last_month: Last Month
@@ -805,7 +805,7 @@ widget:
     table: Recent market trades
   names:
     candlestick: Candlestick
-    crypto_fgi: Crypto Fear & Greed
+    coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
     empty: Empty
     etf_flow: ETF Flow
     financial_calendar: Financial Calendar

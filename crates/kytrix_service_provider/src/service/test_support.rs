@@ -102,7 +102,7 @@ impl TestConfigManager {
             KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
             KytrixServiceCapability::XAccountMonitoringMedia,
-            KytrixServiceCapability::Cmc,
+            KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
             KytrixServiceCapability::FinancialCalendar,
             KytrixServiceCapability::PentagonPizzaIndex,
             KytrixServiceCapability::UpdaterMetadata,
@@ -215,12 +215,13 @@ pub(super) fn financial_index_manifest() -> proto_types::FinancialIndexManifest 
 }
 
 /// The fear and greed snapshot the service serves, shaped as the collector publishes it.
-pub(super) fn cmc_fear_greed_index() -> proto_types::CmcFearGreedIndex {
-    let point = |date: &str, score: u32| proto_types::CmcFearGreedIndexPoint {
+pub(super) fn coin_market_cap_fear_and_greed_index() -> proto_types::CoinMarketCapFearAndGreedIndex
+{
+    let point = |date: &str, score: u32| proto_types::CoinMarketCapFearAndGreedIndexPoint {
         date: date.to_owned(),
         score,
     };
-    proto_types::CmcFearGreedIndex {
+    proto_types::CoinMarketCapFearAndGreedIndex {
         current: 46,
         yesterday: Some(point("2026-10-23", 45)),
         last_week: Some(point("2026-10-17", 40)),
@@ -838,12 +839,12 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetCmcFearGreedIndex(_) => (
-                                            ObservedRequest::Rpc("cmc_fear_greed_index"),
-                                            proto_response::response::Response::CmcFearGreedIndex(
-                                                proto_response::CmcFearGreedIndexResponse {
-                                                    cmc_fear_greed_index: Some(
-                                                        cmc_fear_greed_index(),
+                                        ClientRequestKind::GetCoinMarketCapFearAndGreedIndex(_) => (
+                                            ObservedRequest::Rpc("coin_market_cap_fear_and_greed_index"),
+                                            proto_response::response::Response::CoinMarketCapFearAndGreedIndex(
+                                                proto_response::CoinMarketCapFearAndGreedIndexResponse {
+                                                    coin_market_cap_fear_and_greed_index: Some(
+                                                        coin_market_cap_fear_and_greed_index(),
                                                     ),
                                                 },
                                             ),
@@ -1170,7 +1171,7 @@ mod tests {
         assert_eq!(stamped.len(), 13, "every capability is a stamped target");
         assert!(
             stamped.contains_key(&ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::Cmc,
+                capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
             }),
             "the CMC capability should have a route generation"
         );

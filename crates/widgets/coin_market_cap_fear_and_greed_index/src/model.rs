@@ -23,7 +23,7 @@ use thiserror::Error;
 
 /// One daily point of the index.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FgiRow {
+pub(crate) struct CoinMarketCapFearAndGreedIndexRow {
     /// The UTC calendar day the point belongs to, exactly as the service wrote it.
     pub date: SmolStr,
     /// The index value of that day, `0..=100`.
@@ -32,20 +32,20 @@ pub(crate) struct FgiRow {
 
 /// One complete answer of the index service.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FgiSnapshot {
+pub(crate) struct CoinMarketCapFearAndGreedIndexSnapshot {
     pub current: u8,
-    pub yesterday: Option<FgiRow>,
-    pub last_week: Option<FgiRow>,
-    pub last_month: Option<FgiRow>,
-    pub last_year: Option<FgiRow>,
-    pub yearly_high: Option<FgiRow>,
-    pub yearly_low: Option<FgiRow>,
+    pub yesterday: Option<CoinMarketCapFearAndGreedIndexRow>,
+    pub last_week: Option<CoinMarketCapFearAndGreedIndexRow>,
+    pub last_month: Option<CoinMarketCapFearAndGreedIndexRow>,
+    pub last_year: Option<CoinMarketCapFearAndGreedIndexRow>,
+    pub yearly_high: Option<CoinMarketCapFearAndGreedIndexRow>,
+    pub yearly_low: Option<CoinMarketCapFearAndGreedIndexRow>,
     /// When the collector took the snapshot, in Unix milliseconds; `0` means it has
     /// not collected anything yet.
     pub collected_at: i64,
 }
 
-impl FgiSnapshot {
+impl CoinMarketCapFearAndGreedIndexSnapshot {
     /// Whether the service has not collected a single reading yet.
     ///
     /// It is the only emptiness the snapshot has: a current value of zero is a
@@ -76,7 +76,9 @@ impl FgiSnapshot {
     }
 
     /// Reads one answer of the service, refusing scores the scale does not have.
-    pub(crate) fn parse(index: proto_types::CmcFearGreedIndex) -> Result<Self, FgiParseError> {
+    pub(crate) fn parse(
+        index: proto_types::CoinMarketCapFearAndGreedIndex,
+    ) -> Result<Self, CoinMarketCapFearAndGreedIndexParseError> {
         Ok(Self {
             current: score(index.current)?,
             yesterday: index.yesterday.map(row).transpose()?,
@@ -91,19 +93,21 @@ impl FgiSnapshot {
 }
 
 /// One optional point of an answer, refused when its score is not a reading.
-fn row(point: proto_types::CmcFearGreedIndexPoint) -> Result<FgiRow, FgiParseError> {
-    Ok(FgiRow {
+fn row(
+    point: proto_types::CoinMarketCapFearAndGreedIndexPoint,
+) -> Result<CoinMarketCapFearAndGreedIndexRow, CoinMarketCapFearAndGreedIndexParseError> {
+    Ok(CoinMarketCapFearAndGreedIndexRow {
         date: SmolStr::new(point.date),
         score: score(point.score)?,
     })
 }
 
 /// One score of the scale, or the failure of an answer that carried something else.
-fn score(value: u32) -> Result<u8, FgiParseError> {
+fn score(value: u32) -> Result<u8, CoinMarketCapFearAndGreedIndexParseError> {
     u8::try_from(value)
         .ok()
         .filter(|score| *score <= 100)
-        .ok_or(FgiParseError::ScoreOutOfRange { value })
+        .ok_or(CoinMarketCapFearAndGreedIndexParseError::ScoreOutOfRange { value })
 }
 
 /// The band of the scale a reading belongs to.
@@ -135,39 +139,41 @@ impl Level {
     /// The message key the level is named by.
     pub(crate) const fn key(self) -> &'static str {
         match self {
-            Self::ExtremeFear => "widget.crypto_fgi.level.extreme_fear",
-            Self::Fear => "widget.crypto_fgi.level.fear",
-            Self::Neutral => "widget.crypto_fgi.level.neutral",
-            Self::Greed => "widget.crypto_fgi.level.greed",
-            Self::ExtremeGreed => "widget.crypto_fgi.level.extreme_greed",
+            Self::ExtremeFear => "widget.coin_market_cap_fear_and_greed_index.level.extreme_fear",
+            Self::Fear => "widget.coin_market_cap_fear_and_greed_index.level.fear",
+            Self::Neutral => "widget.coin_market_cap_fear_and_greed_index.level.neutral",
+            Self::Greed => "widget.coin_market_cap_fear_and_greed_index.level.greed",
+            Self::ExtremeGreed => "widget.coin_market_cap_fear_and_greed_index.level.extreme_greed",
         }
     }
 }
 
 /// Why an answer could not be read as a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub(crate) enum FgiParseError {
+pub(crate) enum CoinMarketCapFearAndGreedIndexParseError {
     #[error("the fear and greed snapshot carried score {value}, above 100")]
     ScoreOutOfRange { value: u32 },
 }
 
 #[cfg(test)]
 mod tests {
-    use kytrix_proto::types::{CmcFearGreedIndex, CmcFearGreedIndexPoint};
+    use kytrix_proto::types::{
+        CoinMarketCapFearAndGreedIndex, CoinMarketCapFearAndGreedIndexPoint,
+    };
 
     use super::*;
 
     /// One point of a fixture answer.
-    fn point(date: &str, score: u32) -> CmcFearGreedIndexPoint {
-        CmcFearGreedIndexPoint {
+    fn point(date: &str, score: u32) -> CoinMarketCapFearAndGreedIndexPoint {
+        CoinMarketCapFearAndGreedIndexPoint {
             date: date.to_owned(),
             score,
         }
     }
 
     /// The answer the service gives once it has collected.
-    fn collected() -> CmcFearGreedIndex {
-        CmcFearGreedIndex {
+    fn collected() -> CoinMarketCapFearAndGreedIndex {
+        CoinMarketCapFearAndGreedIndex {
             current: 46,
             yesterday: Some(point("2026-10-23", 45)),
             last_week: Some(point("2026-10-17", 40)),
@@ -180,16 +186,16 @@ mod tests {
     }
 
     /// An answer carrying only the current reading.
-    fn current_only(current: u32) -> CmcFearGreedIndex {
-        CmcFearGreedIndex {
+    fn current_only(current: u32) -> CoinMarketCapFearAndGreedIndex {
+        CoinMarketCapFearAndGreedIndex {
             current,
             timestamp: 1_790_000_000_000,
-            ..CmcFearGreedIndex::default()
+            ..CoinMarketCapFearAndGreedIndex::default()
         }
     }
 
-    fn row_of(date: &str, score: u8) -> Option<FgiRow> {
-        Some(FgiRow {
+    fn row_of(date: &str, score: u8) -> Option<CoinMarketCapFearAndGreedIndexRow> {
+        Some(CoinMarketCapFearAndGreedIndexRow {
             date: SmolStr::new(date),
             score,
         })
@@ -199,11 +205,12 @@ mod tests {
     /// label rather than a calendar value, so it is neither parsed nor reformatted.
     #[test]
     fn a_complete_answer_should_map_every_field() {
-        let snapshot = FgiSnapshot::parse(collected()).expect("a complete answer should parse");
+        let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
+            .expect("a complete answer should parse");
 
         assert_eq!(
             snapshot,
-            FgiSnapshot {
+            CoinMarketCapFearAndGreedIndexSnapshot {
                 current: 46,
                 yesterday: row_of("2026-10-23", 45),
                 last_week: row_of("2026-10-17", 40),
@@ -220,8 +227,8 @@ mod tests {
     /// absent field is not filled in with anything.
     #[test]
     fn an_answer_without_history_should_parse_with_every_row_missing() {
-        let snapshot =
-            FgiSnapshot::parse(current_only(47)).expect("an answer without history should parse");
+        let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(current_only(47))
+            .expect("an answer without history should parse");
 
         assert_eq!(snapshot.current, 47);
         assert_eq!(snapshot.yesterday, None);
@@ -239,16 +246,18 @@ mod tests {
     fn a_score_above_the_scale_should_be_refused() {
         for value in [101_u32, 255, 1_000] {
             assert_eq!(
-                FgiSnapshot::parse(current_only(value)).expect_err("a score above 100 is refused"),
-                FgiParseError::ScoreOutOfRange { value },
+                CoinMarketCapFearAndGreedIndexSnapshot::parse(current_only(value))
+                    .expect_err("a score above 100 is refused"),
+                CoinMarketCapFearAndGreedIndexParseError::ScoreOutOfRange { value },
                 "the failure has to name the value it refused"
             );
 
             let mut answer = collected();
             answer.yesterday = Some(point("2026-10-23", value));
             assert_eq!(
-                FgiSnapshot::parse(answer).expect_err("a point above 100 is refused"),
-                FgiParseError::ScoreOutOfRange { value }
+                CoinMarketCapFearAndGreedIndexSnapshot::parse(answer)
+                    .expect_err("a point above 100 is refused"),
+                CoinMarketCapFearAndGreedIndexParseError::ScoreOutOfRange { value }
             );
         }
     }
@@ -258,8 +267,8 @@ mod tests {
     #[test]
     fn the_ends_of_the_scale_should_parse_and_name_their_levels() {
         for (score, level) in [(0_u32, Level::ExtremeFear), (100, Level::ExtremeGreed)] {
-            let snapshot =
-                FgiSnapshot::parse(current_only(score)).expect("an end of the scale should parse");
+            let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(current_only(score))
+                .expect("an end of the scale should parse");
             let score = u8::try_from(score).expect("the ends fit a byte");
 
             assert_eq!(snapshot.current, score);
@@ -307,7 +316,9 @@ mod tests {
 
         for level in levels {
             assert!(
-                level.key().starts_with("widget.crypto_fgi.level."),
+                level
+                    .key()
+                    .starts_with("widget.coin_market_cap_fear_and_greed_index.level."),
                 "{level:?} should name a level key: {}",
                 level.key()
             );
@@ -327,13 +338,13 @@ mod tests {
         let mut uncollected = collected();
         uncollected.timestamp = 0;
         assert!(
-            FgiSnapshot::parse(uncollected)
+            CoinMarketCapFearAndGreedIndexSnapshot::parse(uncollected)
                 .expect("an uncollected answer still parses")
                 .is_empty(),
             "a collection time of zero means nothing has been collected yet"
         );
 
-        let zero = FgiSnapshot::parse(current_only(0))
+        let zero = CoinMarketCapFearAndGreedIndexSnapshot::parse(current_only(0))
             .expect("a current value of zero is a reading rather than a missing one");
         assert!(!zero.is_empty());
         assert_eq!(zero.current, 0);
@@ -343,7 +354,8 @@ mod tests {
     /// without moving is the same picture: the pane must not redraw it.
     #[test]
     fn two_answers_collected_at_different_times_should_draw_the_same() {
-        let snapshot = FgiSnapshot::parse(collected()).expect("a complete answer should parse");
+        let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
+            .expect("a complete answer should parse");
         let mut polled_again = snapshot.clone();
         polled_again.collected_at += 60_000;
 
@@ -361,14 +373,15 @@ mod tests {
     /// each of the six rows, down to the day a row is labelled with.
     #[test]
     fn a_changed_reading_or_row_should_be_a_different_display() {
-        let reference = FgiSnapshot::parse(collected()).expect("a complete answer should parse");
-        let mut variants: Vec<(&str, FgiSnapshot)> = Vec::new();
+        let reference = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
+            .expect("a complete answer should parse");
+        let mut variants: Vec<(&str, CoinMarketCapFearAndGreedIndexSnapshot)> = Vec::new();
 
         let mut current = reference.clone();
         current.current = 47;
         variants.push(("current reading", current));
 
-        let changes: [(&str, fn(&mut FgiSnapshot)); 6] = [
+        let changes: [(&str, fn(&mut CoinMarketCapFearAndGreedIndexSnapshot)); 6] = [
             ("yesterday", |snapshot| {
                 snapshot.yesterday = row_of("2026-10-22", 45)
             }),
@@ -415,8 +428,10 @@ mod tests {
     /// different displays when only one of them has a collection.
     #[test]
     fn an_uncollected_answer_should_never_read_the_same_as_a_collected_one() {
-        let uncollected = FgiSnapshot::parse(CmcFearGreedIndex::default())
-            .expect("the service's cold answer should parse");
+        let uncollected = CoinMarketCapFearAndGreedIndexSnapshot::parse(
+            CoinMarketCapFearAndGreedIndex::default(),
+        )
+        .expect("the service's cold answer should parse");
         assert!(uncollected.is_empty());
 
         let mut collected_with_the_same_rows = uncollected.clone();
@@ -439,7 +454,8 @@ mod tests {
         let mut answer = collected();
         answer.yearly_high = None;
         answer.yearly_low = None;
-        let snapshot = FgiSnapshot::parse(answer).expect("a normal answer should parse");
+        let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(answer)
+            .expect("a normal answer should parse");
 
         assert_eq!(snapshot.yearly_high, None);
         assert_eq!(snapshot.yearly_low, None);

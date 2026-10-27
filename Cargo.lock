@@ -1571,6 +1571,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "coin_market_cap_fear_and_greed_index"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_proto",
+ "kytrix_service_provider",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2026,25 +2045,6 @@ dependencies = [
  "getrandom 0.4.3",
  "hybrid-array",
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "crypto_fgi"
-version = "0.0.2"
-dependencies = [
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_proto",
- "kytrix_service_provider",
- "serde",
- "smol_str",
- "thiserror 2.0.20",
- "tokio",
- "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=6e4cdb95cec407171f6368cc0e0a2aa8100324f0#6e4cdb95cec407171f6368cc0e0a2aa8100324f0"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=9ce459179ff35d9dfdfe82ecb9da952f657882e7#9ce459179ff35d9dfdfe82ecb9da952f657882e7"
 dependencies = [
  "bytes",
  "prost",
@@ -10842,7 +10842,7 @@ version = "0.0.2"
 dependencies = [
  "app_config",
  "candlestick",
- "crypto_fgi",
+ "coin_market_cap_fear_and_greed_index",
  "cryptocurrency_wallet_monitoring",
  "empty",
  "etf",

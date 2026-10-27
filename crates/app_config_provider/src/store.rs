@@ -137,7 +137,7 @@ fn all_network_targets(
         KytrixServiceCapability::XAccountMonitoring,
         KytrixServiceCapability::CryptocurrencyWalletMonitoring,
         KytrixServiceCapability::XAccountMonitoringMedia,
-        KytrixServiceCapability::Cmc,
+        KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
         KytrixServiceCapability::FinancialCalendar,
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
@@ -937,7 +937,7 @@ mod tests {
         assert_eq!(targets.len(), 13);
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::Cmc,
+                capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
             }),
             "the CMC capability should be a stamped target"
         );

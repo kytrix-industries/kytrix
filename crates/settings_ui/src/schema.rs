@@ -490,7 +490,7 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                     "monitoring",
                     "news",
                     "x",
-                    "cmc",
+                    "coin_market_cap_fear_and_greed_index",
                     "coinmarketcap",
                     "fear",
                     "greed",
@@ -1365,7 +1365,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::XAccountMonitoring,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::Cmc,
+        capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::PentagonPizzaIndex,

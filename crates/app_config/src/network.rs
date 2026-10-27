@@ -36,8 +36,8 @@ pub enum KytrixServiceCapability {
     #[serde(rename = "x_account_monitoring_media")]
     XAccountMonitoringMedia,
     /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
-    #[serde(rename = "cmc")]
-    Cmc,
+    #[serde(rename = "coin_market_cap_fear_and_greed_index")]
+    CoinMarketCapFearAndGreedIndex,
     /// The financial calendar, a snapshot of scheduled economic events.
     #[serde(rename = "financial_calendar")]
     FinancialCalendar,

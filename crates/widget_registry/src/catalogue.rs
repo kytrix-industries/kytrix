@@ -27,7 +27,7 @@ pub fn install(cx: &mut App) -> Result<(), WidgetRegistryError> {
 fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
     [
         WidgetRegistration::for_view::<candlestick::view::CandlestickWidget>(),
-        WidgetRegistration::for_view::<crypto_fgi::view::CryptoFgiWidget>(),
+        WidgetRegistration::for_view::<coin_market_cap_fear_and_greed_index::view::CoinMarketCapFearAndGreedIndexWidget>(),
         WidgetRegistration::for_view::<empty::view::EmptyWidget>(),
         WidgetRegistration::for_view::<etf::view::EtfWidget>(),
         WidgetRegistration::for_view::<financial_calendar::view::FinancialCalendarWidget>(),
@@ -74,7 +74,8 @@ mod tests {
     use crate::registry::WidgetRegistry;
 
     const CANDLESTICK_ID: &str = "kytrix.market.candlestick";
-    const CRYPTO_FGI_ID: &str = "kytrix.market.crypto_fgi";
+    const COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID: &str =
+        "kytrix.market.coin_market_cap_fear_and_greed_index";
     const EMPTY_ID: &str = "kytrix.empty";
     const ETF_ID: &str = "kytrix.market.etf_flow";
     const FINANCIAL_CALENDAR_ID: &str = "kytrix.monitoring.financial_calendar";
@@ -106,7 +107,10 @@ mod tests {
     /// widget that is.
     const CATEGORIES: [(&str, WidgetCategory); 21] = [
         (CANDLESTICK_ID, WidgetCategory::Market),
-        (CRYPTO_FGI_ID, WidgetCategory::Market),
+        (
+            COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID,
+            WidgetCategory::Market,
+        ),
         (ETF_ID, WidgetCategory::Market),
         (FINANCIAL_CALENDAR_ID, WidgetCategory::Monitoring),
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
@@ -139,7 +143,11 @@ mod tests {
             let registry = cx.global::<WidgetRegistry>();
 
             assert!(registry.get(CANDLESTICK_ID).is_some());
-            assert!(registry.get(CRYPTO_FGI_ID).is_some());
+            assert!(
+                registry
+                    .get(COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID)
+                    .is_some()
+            );
             assert!(registry.get(EMPTY_ID).is_some());
             assert!(registry.get(ETF_ID).is_some());
             assert!(registry.get(FINANCIAL_CALENDAR_ID).is_some());

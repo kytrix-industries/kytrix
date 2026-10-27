@@ -89,7 +89,7 @@ error:
     outcome_risk_pool_incomplete: 风险池 %{pool} 引用了批次未携带的结果组或转换
     outcome_risk_pool_lineage_invalid: 风险池 %{pool} 不是成员组合法的谱系后继
     snapshot_key_mismatch: 挂牌 %{listing} 的快照描述的不是该挂牌
-  crypto_fgi:
+  coin_market_cap_fear_and_greed_index:
     score_out_of_range: 恐惧与贪婪接口返回了无效分值：%{value}
     stream_unavailable: 恐惧与贪婪服务未接受刷新请求
   display:
@@ -553,7 +553,7 @@ widget:
     market: 行情
     monitoring: 监控
     statistics: 统计
-  crypto_fgi:
+  coin_market_cap_fear_and_greed_index:
     info_history: 每行由指数服务按对应日历日给出：昨天取前一天、上周取 7 天前、上月取上一个日历月的同一天、去年取去年同一天。数据按 UTC 日记录。若上月或去年没有这一天，或该日及之前没有数据，显示横线。
     info_yearly: 由指数服务在过去 365 个日历日（不含今天）的记录中取最高与最低，并显示其发生日期与当时的市场情绪档位。
     last_month: 上月
@@ -805,7 +805,7 @@ widget:
     table: 最近市场成交
   names:
     candlestick: K 线
-    crypto_fgi: 加密恐惧与贪婪指数
+    coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
     empty: 空白
     etf_flow: ETF 资金流
     financial_calendar: 财经日历

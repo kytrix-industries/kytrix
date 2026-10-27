@@ -72,10 +72,16 @@ use widget_tokio_runtime::global;
 
 use crate::{
     gauge::{Gauge, level_color},
-    model::{FgiParseError, FgiRow, FgiSnapshot, Level},
+    model::{
+        CoinMarketCapFearAndGreedIndexParseError, CoinMarketCapFearAndGreedIndexRow,
+        CoinMarketCapFearAndGreedIndexSnapshot, Level,
+    },
     service::{
-        FgiFetchError, FgiProtocol, FgiRequest, FgiResponse, FgiService, FgiServiceError,
-        FgiSource, FgiStreamKey, FgiStreamMessage,
+        CoinMarketCapFearAndGreedIndexFetchError, CoinMarketCapFearAndGreedIndexProtocol,
+        CoinMarketCapFearAndGreedIndexRequest, CoinMarketCapFearAndGreedIndexResponse,
+        CoinMarketCapFearAndGreedIndexService, CoinMarketCapFearAndGreedIndexServiceError,
+        CoinMarketCapFearAndGreedIndexSource, CoinMarketCapFearAndGreedIndexStreamKey,
+        CoinMarketCapFearAndGreedIndexStreamMessage,
     },
 };
 
@@ -91,29 +97,29 @@ const MISSING: &str = "—";
 /// carries is what says a dash was drawn — and which row drew it. Every row has its
 /// own, so a test can tell an absent row that still drew its dash from one that
 /// silently stopped drawing it.
-const MISSING_YESTERDAY: &str = "TEST_CRYPTO_FGI_MISSING_YESTERDAY";
-const MISSING_LAST_WEEK: &str = "TEST_CRYPTO_FGI_MISSING_LAST_WEEK";
-const MISSING_LAST_MONTH: &str = "TEST_CRYPTO_FGI_MISSING_LAST_MONTH";
-const MISSING_LAST_YEAR: &str = "TEST_CRYPTO_FGI_MISSING_LAST_YEAR";
-const MISSING_YEARLY_HIGH: &str = "TEST_CRYPTO_FGI_MISSING_YEARLY_HIGH";
-const MISSING_YEARLY_LOW: &str = "TEST_CRYPTO_FGI_MISSING_YEARLY_LOW";
+const MISSING_YESTERDAY: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_YESTERDAY";
+const MISSING_LAST_WEEK: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_LAST_WEEK";
+const MISSING_LAST_MONTH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_LAST_MONTH";
+const MISSING_LAST_YEAR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_LAST_YEAR";
+const MISSING_YEARLY_HIGH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_YEARLY_HIGH";
+const MISSING_YEARLY_LOW: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_YEARLY_LOW";
 
 /// The pane has nothing to persist, so its config carries the schema version alone.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CryptoFgiConfig;
+pub struct CoinMarketCapFearAndGreedIndexConfig;
 
-impl WidgetConfig for CryptoFgiConfig {
+impl WidgetConfig for CoinMarketCapFearAndGreedIndexConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
 /// A failure a pane reports that is not already a stream error.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum FgiFailure {
-    Fetch(FgiFetchError),
-    Rpc(RpcCallError<FgiServiceError>),
+enum CoinMarketCapFearAndGreedIndexFailure {
+    Fetch(CoinMarketCapFearAndGreedIndexFetchError),
+    Rpc(RpcCallError<CoinMarketCapFearAndGreedIndexServiceError>),
 }
 
-impl LocalizedError for FgiFailure {
+impl LocalizedError for CoinMarketCapFearAndGreedIndexFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Fetch(error) => error.localized_message(cx),
@@ -122,7 +128,7 @@ impl LocalizedError for FgiFailure {
     }
 }
 
-impl LocalizedError for FgiFetchError {
+impl LocalizedError for CoinMarketCapFearAndGreedIndexFetchError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
@@ -131,21 +137,28 @@ impl LocalizedError for FgiFetchError {
     }
 }
 
-impl LocalizedError for FgiParseError {
+impl LocalizedError for CoinMarketCapFearAndGreedIndexParseError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::ScoreOutOfRange { value } => {
-                t!(cx, "error.crypto_fgi.score_out_of_range", value = value)
+                t!(
+                    cx,
+                    "error.coin_market_cap_fear_and_greed_index.score_out_of_range",
+                    value = value
+                )
             }
         }
     }
 }
 
-impl LocalizedError for FgiServiceError {
+impl LocalizedError for CoinMarketCapFearAndGreedIndexServiceError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::StreamClosed | Self::StreamBusy => {
-                t!(cx, "error.crypto_fgi.stream_unavailable")
+                t!(
+                    cx,
+                    "error.coin_market_cap_fear_and_greed_index.stream_unavailable"
+                )
             }
         }
     }
@@ -153,13 +166,13 @@ impl LocalizedError for FgiServiceError {
 
 /// One fear and greed pane: the account it follows, the reading it draws, and its
 /// refresh control.
-pub struct CryptoFgiWidget {
-    binding: WidgetBinding<FgiProtocol>,
+pub struct CoinMarketCapFearAndGreedIndexWidget {
+    binding: WidgetBinding<CoinMarketCapFearAndGreedIndexProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     gauge: Gauge,
     /// The answer the body is drawn from, or nothing before the first one arrives.
-    snapshot: Option<Arc<FgiSnapshot>>,
+    snapshot: Option<Arc<CoinMarketCapFearAndGreedIndexSnapshot>>,
     /// Whether a refresh this pane sent is still waiting for the reading it asked
     /// for. It closes the window between the click and the answer, during which the
     /// service would refuse a second command.
@@ -170,14 +183,14 @@ pub struct CryptoFgiWidget {
     _account: Subscription,
 }
 
-impl WidgetView for CryptoFgiWidget {
-    type Config = CryptoFgiConfig;
+impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
+    type Config = CoinMarketCapFearAndGreedIndexConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.crypto_fgi");
-    const DISPLAY_NAME: &'static str = "widget.names.crypto_fgi";
+    const ID: WidgetId = WidgetId::new_static("kytrix.market.coin_market_cap_fear_and_greed_index");
+    const DISPLAY_NAME: &'static str = "widget.names.coin_market_cap_fear_and_greed_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "CoinMarketCap crypto fear and greed index";
-    const ICON: Option<&'static str> = Some("widgets/crypto_fgi.png");
+    const ICON: Option<&'static str> = Some("widgets/coin_market_cap_fear_and_greed_index.png");
     const SELECTABLE: bool = true;
 
     fn new(
@@ -215,7 +228,7 @@ impl WidgetView for CryptoFgiWidget {
     }
 }
 
-impl CryptoFgiWidget {
+impl CoinMarketCapFearAndGreedIndexWidget {
     /// The seam a test can answer through: `new` only picks the production source.
     fn new_with_source<S>(
         source: S,
@@ -224,11 +237,11 @@ impl CryptoFgiWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: FgiSource,
+        S: CoinMarketCapFearAndGreedIndexSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            FgiService::new(source),
+            CoinMarketCapFearAndGreedIndexService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
@@ -257,10 +270,10 @@ impl CryptoFgiWidget {
     }
 
     /// The account this pane would accept an answer from.
-    fn current_key(&self) -> Option<FgiStreamKey> {
+    fn current_key(&self) -> Option<CoinMarketCapFearAndGreedIndexStreamKey> {
         self.account_id
             .clone()
-            .map(|account_id| FgiStreamKey { account_id })
+            .map(|account_id| CoinMarketCapFearAndGreedIndexStreamKey { account_id })
     }
 
     /// Whether the refresh control has nothing to do.
@@ -295,7 +308,9 @@ impl CryptoFgiWidget {
             // nothing has gone wrong, so the pane says what it is waiting for.
             self.clear_snapshot(cx);
             self.status.report(
-                WidgetState::waiting(Notice::message("widget.crypto_fgi.logged_out")),
+                WidgetState::waiting(Notice::message(
+                    "widget.coin_market_cap_fear_and_greed_index.logged_out",
+                )),
                 cx,
             );
             cx.notify();
@@ -307,9 +322,9 @@ impl CryptoFgiWidget {
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
             if retry {
-                FgiRequest::Retry(key)
+                CoinMarketCapFearAndGreedIndexRequest::Retry(key)
             } else {
-                FgiRequest::Load(key)
+                CoinMarketCapFearAndGreedIndexRequest::Load(key)
             },
             cx,
             Self::apply_rpc_result,
@@ -334,8 +349,11 @@ impl CryptoFgiWidget {
         }
         self.refresh_pending = true;
         cx.notify();
-        self.binding
-            .call(FgiRequest::Refresh, cx, Self::apply_refresh_result);
+        self.binding.call(
+            CoinMarketCapFearAndGreedIndexRequest::Refresh,
+            cx,
+            Self::apply_refresh_result,
+        );
     }
 
     /// Applies the answer to a load or a retry.
@@ -343,16 +361,26 @@ impl CryptoFgiWidget {
     /// A failure is terminal, so an answer that arrives after one is dropped: the
     /// recovery reports `Connecting` before it asks for anything, which is what
     /// makes the next answer one this pane still wants.
-    fn apply_rpc_result(&mut self, result: WidgetRpcResult<FgiProtocol>, cx: &mut Context<Self>) {
+    fn apply_rpc_result(
+        &mut self,
+        result: WidgetRpcResult<CoinMarketCapFearAndGreedIndexProtocol>,
+        cx: &mut Context<Self>,
+    ) {
         if self.status.is_failed(cx) {
             return;
         }
         match result {
-            Ok(FgiResponse::StreamStarted | FgiResponse::RefreshQueued) => {}
+            Ok(
+                CoinMarketCapFearAndGreedIndexResponse::StreamStarted
+                | CoinMarketCapFearAndGreedIndexResponse::RefreshQueued,
+            ) => {}
             Err(error) => {
                 let recovery = self.recovery.clone();
                 self.status.report(
-                    WidgetState::failed(Arc::new(FgiFailure::Rpc(error)), recovery),
+                    WidgetState::failed(
+                        Arc::new(CoinMarketCapFearAndGreedIndexFailure::Rpc(error)),
+                        recovery,
+                    ),
                     cx,
                 );
             }
@@ -366,7 +394,7 @@ impl CryptoFgiWidget {
     /// service refuses a second command in between.
     fn apply_refresh_result(
         &mut self,
-        result: WidgetRpcResult<FgiProtocol>,
+        result: WidgetRpcResult<CoinMarketCapFearAndGreedIndexProtocol>,
         cx: &mut Context<Self>,
     ) {
         if result.is_err() {
@@ -381,20 +409,23 @@ impl CryptoFgiWidget {
     /// framework around the body, so reporting it is enough.
     fn apply_reliable(
         &mut self,
-        key: FgiStreamKey,
-        message: Arc<FgiStreamMessage>,
+        key: CoinMarketCapFearAndGreedIndexStreamKey,
+        message: Arc<CoinMarketCapFearAndGreedIndexStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let FgiStreamMessage::Failed { error } = message.as_ref() else {
+        let CoinMarketCapFearAndGreedIndexStreamMessage::Failed { error } = message.as_ref() else {
             return false;
         };
         self.refresh_pending = false;
         let recovery = self.recovery.clone();
         self.status.report(
-            WidgetState::failed(Arc::new(FgiFailure::Fetch(error.clone())), recovery),
+            WidgetState::failed(
+                Arc::new(CoinMarketCapFearAndGreedIndexFailure::Fetch(error.clone())),
+                recovery,
+            ),
             cx,
         );
         false
@@ -405,7 +436,7 @@ impl CryptoFgiWidget {
     /// Returns whether anything a frame draws changed, which is what the framework
     /// turns into a repaint: the body is cached, and an answer that folds into the
     /// same pixels is not worth a frame. The comparison is the snapshot's
-    /// [`same_display`](FgiSnapshot::same_display) rather than the whole answer,
+    /// [`same_display`](CoinMarketCapFearAndGreedIndexSnapshot::same_display) rather than the whole answer,
     /// because the collection time is never drawn.
     ///
     /// Two things still count as a change even when a frame would draw the same: an
@@ -416,14 +447,15 @@ impl CryptoFgiWidget {
     /// discarded as a no-op.
     fn apply_latest(
         &mut self,
-        key: FgiStreamKey,
-        message: Arc<FgiStreamMessage>,
+        key: CoinMarketCapFearAndGreedIndexStreamKey,
+        message: Arc<CoinMarketCapFearAndGreedIndexStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let FgiStreamMessage::Snapshot(snapshot) = message.as_ref() else {
+        let CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(snapshot) = message.as_ref()
+        else {
             return false;
         };
         let no_op = self
@@ -460,15 +492,18 @@ impl CryptoFgiWidget {
             .gap_1()
             .child(
                 div()
-                    .debug_selector(|| "TEST_CRYPTO_FGI_REFRESH".into())
+                    .debug_selector(|| "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH".into())
                     .child(
                         Button::new(ElementId::Name(SharedString::new_static(
-                            "CryptoFgiRefresh",
+                            "CoinMarketCapFearAndGreedIndexRefresh",
                         )))
                         .ghost()
                         .small()
                         .disabled(disabled)
-                        .aria_label(t!(cx, "widget.crypto_fgi.refresh"))
+                        .aria_label(t!(
+                            cx,
+                            "widget.coin_market_cap_fear_and_greed_index.refresh"
+                        ))
                         .child(Icon::new(IconKind::ArrowsClockwise).size_3())
                         // A disabled button is only drawn as disabled, so the click
                         // handler is not attached at all — and the action guards
@@ -485,7 +520,11 @@ impl CryptoFgiWidget {
 
     /// The reading's card: the gauge, the four history rows and the two yearly
     /// extremes.
-    fn card(&self, snapshot: &FgiSnapshot, cx: &Context<Self>) -> AnyElement {
+    fn card(
+        &self,
+        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let level = Level::of(snapshot.current);
 
         div()
@@ -497,7 +536,7 @@ impl CryptoFgiWidget {
             .p_3()
             .child(
                 div()
-                    .debug_selector(|| "TEST_CRYPTO_FGI_GAUGE".into())
+                    .debug_selector(|| "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE".into())
                     .flex_1()
                     .min_h_0()
                     .child(
@@ -506,16 +545,19 @@ impl CryptoFgiWidget {
                     ),
             )
             .child(self.section(
-                t!(cx, "widget.crypto_fgi.title"),
-                "widget.crypto_fgi.info_history",
-                "CryptoFgiHistoryInfo",
+                t!(cx, "widget.coin_market_cap_fear_and_greed_index.title"),
+                "widget.coin_market_cap_fear_and_greed_index.info_history",
+                "CoinMarketCapFearAndGreedIndexHistoryInfo",
                 cx,
             ))
             .child(self.history_rows(snapshot, cx))
             .child(self.section(
-                t!(cx, "widget.crypto_fgi.yearly_extremes"),
-                "widget.crypto_fgi.info_yearly",
-                "CryptoFgiYearlyInfo",
+                t!(
+                    cx,
+                    "widget.coin_market_cap_fear_and_greed_index.yearly_extremes"
+                ),
+                "widget.coin_market_cap_fear_and_greed_index.info_yearly",
+                "CoinMarketCapFearAndGreedIndexYearlyInfo",
                 cx,
             ))
             .child(self.extreme_rows(snapshot, cx))
@@ -558,32 +600,36 @@ impl CryptoFgiWidget {
     }
 
     /// Yesterday, last week, last month and last year.
-    fn history_rows(&self, snapshot: &FgiSnapshot, cx: &Context<Self>) -> AnyElement {
+    fn history_rows(
+        &self,
+        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let label_color = theme.roles.fg.muted.hsla;
         let value_color = theme.roles.fg.default.hsla;
         let rows = [
             (
-                "widget.crypto_fgi.yesterday",
-                "TEST_CRYPTO_FGI_ROW_YESTERDAY",
+                "widget.coin_market_cap_fear_and_greed_index.yesterday",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY",
                 MISSING_YESTERDAY,
                 snapshot.yesterday.as_ref(),
             ),
             (
-                "widget.crypto_fgi.last_week",
-                "TEST_CRYPTO_FGI_ROW_LAST_WEEK",
+                "widget.coin_market_cap_fear_and_greed_index.last_week",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK",
                 MISSING_LAST_WEEK,
                 snapshot.last_week.as_ref(),
             ),
             (
-                "widget.crypto_fgi.last_month",
-                "TEST_CRYPTO_FGI_ROW_LAST_MONTH",
+                "widget.coin_market_cap_fear_and_greed_index.last_month",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH",
                 MISSING_LAST_MONTH,
                 snapshot.last_month.as_ref(),
             ),
             (
-                "widget.crypto_fgi.last_year",
-                "TEST_CRYPTO_FGI_ROW_LAST_YEAR",
+                "widget.coin_market_cap_fear_and_greed_index.last_year",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR",
                 MISSING_LAST_YEAR,
                 snapshot.last_year.as_ref(),
             ),
@@ -608,20 +654,24 @@ impl CryptoFgiWidget {
 
     /// The highest and the lowest reading of the past year, each with the day it
     /// happened and the level it sat in.
-    fn extreme_rows(&self, snapshot: &FgiSnapshot, cx: &Context<Self>) -> AnyElement {
+    fn extreme_rows(
+        &self,
+        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let label_color = theme.roles.fg.muted.hsla;
         let value_color = theme.roles.fg.default.hsla;
         let rows = [
             (
-                "widget.crypto_fgi.yearly_high",
-                "TEST_CRYPTO_FGI_ROW_YEARLY_HIGH",
+                "widget.coin_market_cap_fear_and_greed_index.yearly_high",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH",
                 MISSING_YEARLY_HIGH,
                 snapshot.yearly_high.as_ref(),
             ),
             (
-                "widget.crypto_fgi.yearly_low",
-                "TEST_CRYPTO_FGI_ROW_YEARLY_LOW",
+                "widget.coin_market_cap_fear_and_greed_index.yearly_low",
+                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW",
                 MISSING_YEARLY_LOW,
                 snapshot.yearly_low.as_ref(),
             ),
@@ -672,7 +722,7 @@ impl CryptoFgiWidget {
     }
 }
 
-impl Render for CryptoFgiWidget {
+impl Render for CoinMarketCapFearAndGreedIndexWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is only embedded while the pane has content, so this is the ready
         // state and nothing else. Everything the pane is *doing* is drawn by the
@@ -689,7 +739,9 @@ impl Render for CryptoFgiWidget {
                 .items_center()
                 .justify_center()
                 .child(EmptyState::new(
-                    ElementId::Name(SharedString::new_static("CryptoFgiEmpty")),
+                    ElementId::Name(SharedString::new_static(
+                        "CoinMarketCapFearAndGreedIndexEmpty",
+                    )),
                     t!(cx, "common.no_data"),
                 ))
                 .into_any_element()
@@ -715,7 +767,7 @@ fn value_row(
     selector: &'static str,
     missing: &'static str,
     label: SharedString,
-    row: Option<&FgiRow>,
+    row: Option<&CoinMarketCapFearAndGreedIndexRow>,
     label_color: Hsla,
     value_color: Hsla,
 ) -> AnyElement {
@@ -745,12 +797,16 @@ fn value_row(
 /// A row without a reading names the dash as its day rather than dropping the
 /// parenthesis: `Yearly High (—)` says the row exists and has no value, while a
 /// second label without a date would be a second message to translate.
-fn yearly_label(key: &'static str, row: Option<&FgiRow>, cx: &App) -> SharedString {
+fn yearly_label(
+    key: &'static str,
+    row: Option<&CoinMarketCapFearAndGreedIndexRow>,
+    cx: &App,
+) -> SharedString {
     t!(cx, key, date = date_text(row))
 }
 
 /// The value of a row, or the dash that says there is none.
-fn value_text(row: Option<&FgiRow>) -> SharedString {
+fn value_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SharedString {
     row.map_or_else(
         || SharedString::new_static(MISSING),
         |row| SharedString::new(format_smolstr!("{}", row.score).as_str()),
@@ -758,7 +814,7 @@ fn value_text(row: Option<&FgiRow>) -> SharedString {
 }
 
 /// The day a row happened on, or the dash that says there is no reading.
-fn date_text(row: Option<&FgiRow>) -> SharedString {
+fn date_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SharedString {
     row.map_or_else(
         || SharedString::new_static(MISSING),
         |row| SharedString::new(row.date.as_str()),
@@ -834,23 +890,26 @@ mod tests {
 
     /// A pane the framework would have built, driven by the source a test answers
     /// through.
-    fn pane_with_source<S>(source: S, cx: &mut Context<CryptoFgiWidget>) -> CryptoFgiWidget
+    fn pane_with_source<S>(
+        source: S,
+        cx: &mut Context<CoinMarketCapFearAndGreedIndexWidget>,
+    ) -> CoinMarketCapFearAndGreedIndexWidget
     where
-        S: FgiSource,
+        S: CoinMarketCapFearAndGreedIndexSource,
     {
         let status = cx.new(|_| WidgetStatus::new());
         let weak = cx.weak_entity();
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        CryptoFgiWidget::new_with_source(source, status, recovery, cx)
+        CoinMarketCapFearAndGreedIndexWidget::new_with_source(source, status, recovery, cx)
     }
 
     fn pane_with(
         cx: &mut TestAppContext,
         account: Option<&str>,
         source: FakeSource,
-    ) -> Entity<CryptoFgiWidget> {
+    ) -> Entity<CoinMarketCapFearAndGreedIndexWidget> {
         cx.update(install);
         pane_over(cx, account, source)
     }
@@ -860,7 +919,7 @@ mod tests {
         cx: &mut TestAppContext,
         account: Option<&str>,
         source: FakeSource,
-    ) -> Entity<CryptoFgiWidget> {
+    ) -> Entity<CoinMarketCapFearAndGreedIndexWidget> {
         cx.executor().allow_parking();
         cx.update(|cx| {
             sign_in(cx, account);
@@ -872,8 +931,8 @@ mod tests {
         })
     }
 
-    fn key() -> FgiStreamKey {
-        FgiStreamKey {
+    fn key() -> CoinMarketCapFearAndGreedIndexStreamKey {
+        CoinMarketCapFearAndGreedIndexStreamKey {
             account_id: SmolStr::new_static(ACCOUNT),
         }
     }
@@ -882,8 +941,8 @@ mod tests {
     ///
     /// The collector publishes again every minute, so an index that has not moved
     /// arrives as a new answer carrying the same drawing and a new collection time.
-    fn recollected(current: u8, collected_at: i64) -> Arc<FgiSnapshot> {
-        Arc::new(FgiSnapshot {
+    fn recollected(current: u8, collected_at: i64) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
+        Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
             collected_at,
             ..(*snapshot(current)).clone()
         })
@@ -896,14 +955,16 @@ mod tests {
     /// `true` answer. Mirroring that one line is what lets a test count the frames
     /// the pane asks for, rather than only the answer its handler returns.
     fn report_snapshot(
-        pane: &Entity<CryptoFgiWidget>,
-        snapshot: Arc<FgiSnapshot>,
+        pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>,
+        snapshot: Arc<CoinMarketCapFearAndGreedIndexSnapshot>,
         cx: &mut App,
     ) -> bool {
         pane.update(cx, |pane, context| {
             let changed = pane.apply_latest(
                 key(),
-                Arc::new(FgiStreamMessage::Snapshot(snapshot)),
+                Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(
+                    snapshot,
+                )),
                 context,
             );
             if changed {
@@ -918,12 +979,14 @@ mod tests {
     /// A failure is drawn by the framework around the body, so the handler answers
     /// that nothing a frame draws changed and the pane is not notified; the state
     /// cell it writes is what the surface redraws from.
-    fn report_failure(pane: &Entity<CryptoFgiWidget>, cx: &mut App) -> bool {
+    fn report_failure(pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>, cx: &mut App) -> bool {
         pane.update(cx, |pane, context| {
             pane.apply_reliable(
                 key(),
-                Arc::new(FgiStreamMessage::Failed {
-                    error: FgiFetchError::Service(KytrixServiceError::Disconnected),
+                Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Failed {
+                    error: CoinMarketCapFearAndGreedIndexFetchError::Service(
+                        KytrixServiceError::Disconnected,
+                    ),
                 }),
                 context,
             )
@@ -931,7 +994,7 @@ mod tests {
     }
 
     /// The failure the pane published.
-    fn published_failure(pane: &Entity<CryptoFgiWidget>, cx: &App) -> Failure {
+    fn published_failure(pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>, cx: &App) -> Failure {
         pane.read(cx)
             .status
             .state(cx)
@@ -948,7 +1011,9 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(
                 pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message("widget.crypto_fgi.logged_out")),
+                WidgetState::waiting(Notice::message(
+                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
+                )),
                 "a pane nobody is signed in for says what it is waiting for"
             );
             assert!(!pane.read(cx).has_content());
@@ -1074,7 +1139,7 @@ mod tests {
                 "the pane holds the uncollected answer"
             );
 
-            let collected = Arc::new(FgiSnapshot {
+            let collected = Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
                 collected_at: COLLECTED_AT,
                 ..(*uncollected).clone()
             });
@@ -1207,12 +1272,12 @@ mod tests {
         );
 
         for selector in [
-            "TEST_CRYPTO_FGI_ROW_YESTERDAY",
-            "TEST_CRYPTO_FGI_ROW_LAST_WEEK",
-            "TEST_CRYPTO_FGI_ROW_LAST_MONTH",
-            "TEST_CRYPTO_FGI_ROW_LAST_YEAR",
-            "TEST_CRYPTO_FGI_ROW_YEARLY_HIGH",
-            "TEST_CRYPTO_FGI_ROW_YEARLY_LOW",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH",
+            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW",
         ] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -1237,7 +1302,8 @@ mod tests {
             );
         }
         assert!(
-            cx.debug_bounds("TEST_CRYPTO_FGI_GAUGE").is_some(),
+            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
+                .is_some(),
             "the gauge is drawn beside the rows"
         );
 
@@ -1250,13 +1316,18 @@ mod tests {
                 "2026-10-23"
             );
             assert_eq!(
-                yearly_label("widget.crypto_fgi.yearly_high", None, cx).as_ref(),
+                yearly_label(
+                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
+                    None,
+                    cx
+                )
+                .as_ref(),
                 "Yearly High (—)",
                 "a missing day is named by the same dash as a missing value"
             );
             assert_eq!(
                 yearly_label(
-                    "widget.crypto_fgi.yearly_high",
+                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
                     Some(&row("2025-11-20", 88)),
                     cx
                 )
@@ -1342,10 +1413,12 @@ mod tests {
         cx.update(|cx| {
             let changed = pane.update(cx, |pane, context| {
                 pane.apply_latest(
-                    FgiStreamKey {
+                    CoinMarketCapFearAndGreedIndexStreamKey {
                         account_id: SmolStr::new_static("another-account"),
                     },
-                    Arc::new(FgiStreamMessage::Snapshot(snapshot(46))),
+                    Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(
+                        snapshot(46),
+                    )),
                     context,
                 )
             });
@@ -1380,7 +1453,9 @@ mod tests {
             assert!(!pane.read(cx).has_content());
             assert_eq!(
                 pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message("widget.crypto_fgi.logged_out")),
+                WidgetState::waiting(Notice::message(
+                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
+                )),
                 "signing out asks for an account rather than reporting a failure"
             );
             assert!(pane.read(cx).current_key().is_none());
@@ -1439,7 +1514,9 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(
                 pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message("widget.crypto_fgi.logged_out"))
+                WidgetState::waiting(Notice::message(
+                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
+                ))
             );
             assert!(
                 !pane.read(cx).has_content(),
@@ -1513,7 +1590,7 @@ mod tests {
                 pane.apply_refresh_result(
                     Err(RpcCallError::Service {
                         request_id: RequestId::new(1),
-                        source: FgiServiceError::StreamBusy,
+                        source: CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
                     }),
                     cx,
                 );
@@ -1558,7 +1635,10 @@ mod tests {
         let (english_level, english_note, frames_before) = cx.update(|_, cx| {
             (
                 t!(cx, Level::Greed.key()),
-                t!(cx, "widget.crypto_fgi.info_history"),
+                t!(
+                    cx,
+                    "widget.coin_market_cap_fear_and_greed_index.info_history"
+                ),
                 harness.read(cx).frames.get(),
             )
         });
@@ -1598,12 +1678,20 @@ mod tests {
             );
             assert_eq!(t!(cx, Level::Greed.key()).as_ref(), "贪婪");
             assert_ne!(
-                t!(cx, "widget.crypto_fgi.info_history"),
+                t!(
+                    cx,
+                    "widget.coin_market_cap_fear_and_greed_index.info_history"
+                ),
                 english_note,
                 "the note beside the heading is resolved in the language showing now"
             );
             assert_eq!(
-                yearly_label("widget.crypto_fgi.yearly_high", None, cx).as_ref(),
+                yearly_label(
+                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
+                    None,
+                    cx
+                )
+                .as_ref(),
                 "年度最高值（—）"
             );
         });
@@ -1611,13 +1699,13 @@ mod tests {
 
     /// One pane mounted in a window of its own, which is what paints its body.
     struct BodyHarness {
-        pane: Entity<CryptoFgiWidget>,
+        pane: Entity<CoinMarketCapFearAndGreedIndexWidget>,
         /// How many frames the window has drawn the pane in.
         frames: Rc<Cell<usize>>,
     }
 
     impl BodyHarness {
-        fn new(pane: Entity<CryptoFgiWidget>) -> Self {
+        fn new(pane: Entity<CoinMarketCapFearAndGreedIndexWidget>) -> Self {
             Self {
                 pane,
                 frames: Rc::new(Cell::new(0)),
@@ -1655,7 +1743,8 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("TEST_CRYPTO_FGI_GAUGE").is_some(),
+            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
+                .is_some(),
             "a collected reading is drawn as a gauge"
         );
         assert!(cx.debug_bounds("EMPTY_STATE").is_none());
@@ -1666,7 +1755,8 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("TEST_CRYPTO_FGI_GAUGE").is_some(),
+            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
+                .is_some(),
             "a collected zero is a reading at the bottom of the scale, not an empty snapshot"
         );
         assert!(cx.debug_bounds("EMPTY_STATE").is_none());
@@ -1693,7 +1783,8 @@ mod tests {
             "an uncollected snapshot says there is no data"
         );
         assert!(
-            cx.debug_bounds("TEST_CRYPTO_FGI_GAUGE").is_none(),
+            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
+                .is_none(),
             "nothing is drawn from a reading nobody collected"
         );
     }
@@ -1704,7 +1795,7 @@ mod tests {
     /// part of this crate; the harness stands in for it, so the control is built and
     /// painted exactly the way a frame builds it.
     struct HeaderHarness {
-        pane: Entity<CryptoFgiWidget>,
+        pane: Entity<CoinMarketCapFearAndGreedIndexWidget>,
     }
 
     impl Render for HeaderHarness {
@@ -1715,13 +1806,17 @@ mod tests {
                 .flex()
                 .child(
                     div()
-                        .debug_selector(|| "TEST_CRYPTO_FGI_HEADER_LEFT".into())
+                        .debug_selector(|| {
+                            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_HEADER_LEFT".into()
+                        })
                         .children(header.left),
                 )
                 .child(div().flex_1())
                 .child(
                     div()
-                        .debug_selector(|| "TEST_CRYPTO_FGI_HEADER_RIGHT".into())
+                        .debug_selector(|| {
+                            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_HEADER_RIGHT".into()
+                        })
                         .children(header.right),
                 )
         }
@@ -1761,7 +1856,7 @@ mod tests {
         cx.run_until_parked();
 
         let button = cx
-            .debug_bounds("TEST_CRYPTO_FGI_REFRESH")
+            .debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH")
             .expect("the header should draw its refresh control");
         cx.simulate_click(button.center(), Modifiers::none());
         settle_until(cx, "the refresh to fetch", |_| source.fetch_count() == 2);
@@ -1826,7 +1921,7 @@ mod tests {
         cx.run_until_parked();
 
         let button = cx
-            .debug_bounds("TEST_CRYPTO_FGI_REFRESH")
+            .debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH")
             .expect("the header draws its refresh control even while it is disabled");
         cx.simulate_click(button.center(), Modifiers::none());
         cx.run_until_parked();

@@ -2982,8 +2982,8 @@ mod tests {
             include_str!("../../widgets/candlestick/src/view.rs"),
         ),
         (
-            "crates/widgets/crypto_fgi/src/view.rs",
-            include_str!("../../widgets/crypto_fgi/src/view.rs"),
+            "crates/widgets/coin_market_cap_fear_and_greed_index/src/view.rs",
+            include_str!("../../widgets/coin_market_cap_fear_and_greed_index/src/view.rs"),
         ),
         (
             "crates/widgets/etf/src/view.rs",

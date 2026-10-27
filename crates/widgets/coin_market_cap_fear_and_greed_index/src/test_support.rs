@@ -20,8 +20,8 @@ use smol_str::SmolStr;
 use tokio::sync::Notify;
 
 use crate::{
-    model::{FgiRow, FgiSnapshot},
-    service::{FgiFetchError, FgiSource},
+    model::{CoinMarketCapFearAndGreedIndexRow, CoinMarketCapFearAndGreedIndexSnapshot},
+    service::{CoinMarketCapFearAndGreedIndexFetchError, CoinMarketCapFearAndGreedIndexSource},
 };
 
 /// The account every fixture pane is scoped to.
@@ -45,16 +45,16 @@ pub(crate) enum FetchPlan {
 }
 
 /// One point of a fixture snapshot.
-pub(crate) fn row(date: &str, score: u8) -> FgiRow {
-    FgiRow {
+pub(crate) fn row(date: &str, score: u8) -> CoinMarketCapFearAndGreedIndexRow {
+    CoinMarketCapFearAndGreedIndexRow {
         date: SmolStr::new(date),
         score,
     }
 }
 
 /// A complete snapshot of one current value.
-pub(crate) fn snapshot(current: u8) -> Arc<FgiSnapshot> {
-    Arc::new(FgiSnapshot {
+pub(crate) fn snapshot(current: u8) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
+    Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
         current,
         yesterday: Some(row("2026-10-23", 45)),
         last_week: Some(row("2026-10-17", 40)),
@@ -67,8 +67,8 @@ pub(crate) fn snapshot(current: u8) -> Arc<FgiSnapshot> {
 }
 
 /// The answer the service gives before its collector has run.
-pub(crate) fn empty_snapshot() -> Arc<FgiSnapshot> {
-    Arc::new(FgiSnapshot {
+pub(crate) fn empty_snapshot() -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
+    Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
         current: 0,
         yesterday: None,
         last_week: None,
@@ -152,14 +152,17 @@ impl FakeSource {
     }
 }
 
-impl FgiSource for FakeSource {
-    async fn fetch_snapshot(&self) -> Result<Arc<FgiSnapshot>, FgiFetchError> {
+impl CoinMarketCapFearAndGreedIndexSource for FakeSource {
+    async fn fetch_snapshot(
+        &self,
+    ) -> Result<Arc<CoinMarketCapFearAndGreedIndexSnapshot>, CoinMarketCapFearAndGreedIndexFetchError>
+    {
         let (plan, mut guard) = self.begin();
         let result = match plan {
             FetchPlan::Snapshot(current) => Ok(snapshot(current)),
-            FetchPlan::Failure => Err(FgiFetchError::Service(KytrixServiceError::Connect(
-                "the fake source refused".into(),
-            ))),
+            FetchPlan::Failure => Err(CoinMarketCapFearAndGreedIndexFetchError::Service(
+                KytrixServiceError::Connect("the fake source refused".into()),
+            )),
             FetchPlan::Pending => pending().await,
             FetchPlan::Held(current) => {
                 self.state.release.notified().await;

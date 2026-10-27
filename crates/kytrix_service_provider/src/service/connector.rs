@@ -17,9 +17,9 @@ use gpui_kit::App;
 use kytrix_proto::{
     client::{
         CryptocurrencyWalletMonitoringAddSelection, CryptocurrencyWalletMonitoringDeleteSelection,
-        CryptocurrencyWalletMonitoringSelections, GetCmcFearGreedIndex, GetCryptocurrencyEtf,
-        GetFinancialCalendar, GetFinancialIndexManifest, GetPentagonPizzaIndex,
-        XAccountMonitoringAddSelection, XAccountMonitoringDeleteSelection,
+        CryptocurrencyWalletMonitoringSelections, GetCoinMarketCapFearAndGreedIndex,
+        GetCryptocurrencyEtf, GetFinancialCalendar, GetFinancialIndexManifest,
+        GetPentagonPizzaIndex, XAccountMonitoringAddSelection, XAccountMonitoringDeleteSelection,
         XAccountMonitoringSearch, XAccountMonitoringSelections, XAccountMonitoringTweets,
         request::Request as ClientRequestKind,
     },
@@ -1212,25 +1212,30 @@ impl KytrixServiceConnector {
     }
 
     /// Fetches the latest CMC fear and greed snapshot over WebSocket RPC.
-    pub async fn fetch_cmc_fear_greed_index(
+    pub async fn fetch_coin_market_cap_fear_and_greed_index(
         &self,
-    ) -> Result<proto_types::CmcFearGreedIndex, KytrixServiceError> {
+    ) -> Result<proto_types::CoinMarketCapFearAndGreedIndex, KytrixServiceError> {
         let response = self
             .call_rpc(
                 None,
-                KytrixServiceCapability::Cmc,
-                ClientRequestKind::GetCmcFearGreedIndex(GetCmcFearGreedIndex {}),
+                KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
+                ClientRequestKind::GetCoinMarketCapFearAndGreedIndex(
+                    GetCoinMarketCapFearAndGreedIndex {},
+                ),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::CmcFearGreedIndex(response) = response else {
+        let proto_response::response::Response::CoinMarketCapFearAndGreedIndex(response) = response
+        else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected fear and greed RPC response".into(),
             ));
         };
-        response.cmc_fear_greed_index.ok_or_else(|| {
-            KytrixServiceError::Protocol("fear and greed RPC response is missing data".into())
-        })
+        response
+            .coin_market_cap_fear_and_greed_index
+            .ok_or_else(|| {
+                KytrixServiceError::Protocol("fear and greed RPC response is missing data".into())
+            })
     }
 
     /// Fetches the latest Pentagon Pizza Index snapshot over WebSocket RPC.
@@ -1296,12 +1301,15 @@ mod tests {
             ObservedRequest::Rpc("index_manifest")
         );
         assert_eq!(
-            connector.fetch_cmc_fear_greed_index().await.unwrap(),
-            cmc_fear_greed_index()
+            connector
+                .fetch_coin_market_cap_fear_and_greed_index()
+                .await
+                .unwrap(),
+            coin_market_cap_fear_and_greed_index()
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("cmc_fear_greed_index")
+            ObservedRequest::Rpc("coin_market_cap_fear_and_greed_index")
         );
         assert_eq!(
             connector.fetch_financial_calendar().await.unwrap(),
@@ -1388,14 +1396,14 @@ mod tests {
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
 
         assert_eq!(
-            connector.fetch_cmc_fear_greed_index().await,
+            connector.fetch_coin_market_cap_fear_and_greed_index().await,
             Err(KytrixServiceError::Protocol(
                 "unexpected fear and greed RPC response".into()
             ))
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("cmc_fear_greed_index")
+            ObservedRequest::Rpc("coin_market_cap_fear_and_greed_index")
         );
 
         connector.shutdown().await;
@@ -1405,23 +1413,25 @@ mod tests {
     #[tokio::test]
     async fn a_fear_and_greed_answer_without_a_snapshot_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::CmcFearGreedIndex(
-            proto_response::CmcFearGreedIndexResponse {
-                cmc_fear_greed_index: None,
-            },
-        ));
+        server.answer_next_request_with(
+            proto_response::response::Response::CoinMarketCapFearAndGreedIndex(
+                proto_response::CoinMarketCapFearAndGreedIndexResponse {
+                    coin_market_cap_fear_and_greed_index: None,
+                },
+            ),
+        );
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
 
         assert_eq!(
-            connector.fetch_cmc_fear_greed_index().await,
+            connector.fetch_coin_market_cap_fear_and_greed_index().await,
             Err(KytrixServiceError::Protocol(
                 "fear and greed RPC response is missing data".into()
             ))
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("cmc_fear_greed_index")
+            ObservedRequest::Rpc("coin_market_cap_fear_and_greed_index")
         );
 
         connector.shutdown().await;

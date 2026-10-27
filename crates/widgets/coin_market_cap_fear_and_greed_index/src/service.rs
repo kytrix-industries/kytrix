@@ -40,7 +40,9 @@ use widget::{
     stream::StreamPublisher,
 };
 
-use crate::model::{FgiParseError, FgiSnapshot};
+use crate::model::{
+    CoinMarketCapFearAndGreedIndexParseError, CoinMarketCapFearAndGreedIndexSnapshot,
+};
 
 /// How often the pane re-reads the index on its own.
 ///
@@ -55,12 +57,12 @@ pub(crate) const STREAM_COMMAND_CAPACITY: usize = 1;
 
 /// What the pane asks the service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FgiRequest {
+pub(crate) enum CoinMarketCapFearAndGreedIndexRequest {
     /// Starts following an account, or replaces the stream that was following
     /// another one.
-    Load(FgiStreamKey),
+    Load(CoinMarketCapFearAndGreedIndexStreamKey),
     /// The same, for an account the user recovered from a failure.
-    Retry(FgiStreamKey),
+    Retry(CoinMarketCapFearAndGreedIndexStreamKey),
     /// Fetches the current account's snapshot once, without waiting for the next
     /// interval.
     Refresh,
@@ -68,51 +70,53 @@ pub(crate) enum FgiRequest {
 
 /// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FgiResponse {
+pub(crate) enum CoinMarketCapFearAndGreedIndexResponse {
     StreamStarted,
     RefreshQueued,
 }
 
 /// The account one snapshot belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct FgiStreamKey {
+pub(crate) struct CoinMarketCapFearAndGreedIndexStreamKey {
     pub account_id: SmolStr,
 }
 
 /// Everything the stream publishes: a failure on the reliable channel, a snapshot
 /// on the latest-value one.
 #[derive(Clone, Debug)]
-pub(crate) enum FgiStreamMessage {
-    Failed { error: FgiFetchError },
-    Snapshot(Arc<FgiSnapshot>),
+pub(crate) enum CoinMarketCapFearAndGreedIndexStreamMessage {
+    Failed {
+        error: CoinMarketCapFearAndGreedIndexFetchError,
+    },
+    Snapshot(Arc<CoinMarketCapFearAndGreedIndexSnapshot>),
 }
 
 /// Why a fetch produced no snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub(crate) enum FgiFetchError {
+pub(crate) enum CoinMarketCapFearAndGreedIndexFetchError {
     #[error("the fear and greed request failed: {0}")]
     Service(#[from] KytrixServiceError),
     #[error("the fear and greed snapshot could not be read: {0}")]
-    Parse(#[from] FgiParseError),
+    Parse(#[from] CoinMarketCapFearAndGreedIndexParseError),
 }
 
 /// Why a request could not be accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub(crate) enum FgiServiceError {
+pub(crate) enum CoinMarketCapFearAndGreedIndexServiceError {
     #[error("the fear and greed stream is closed")]
     StreamClosed,
     #[error("a fear and greed refresh is already waiting")]
     StreamBusy,
 }
 
-pub(crate) struct FgiProtocol;
+pub(crate) struct CoinMarketCapFearAndGreedIndexProtocol;
 
-impl WidgetProtocol for FgiProtocol {
-    type Request = FgiRequest;
-    type Response = FgiResponse;
-    type StreamKey = FgiStreamKey;
-    type StreamMessage = FgiStreamMessage;
-    type Error = FgiServiceError;
+impl WidgetProtocol for CoinMarketCapFearAndGreedIndexProtocol {
+    type Request = CoinMarketCapFearAndGreedIndexRequest;
+    type Response = CoinMarketCapFearAndGreedIndexResponse;
+    type StreamKey = CoinMarketCapFearAndGreedIndexStreamKey;
+    type StreamMessage = CoinMarketCapFearAndGreedIndexStreamMessage;
+    type Error = CoinMarketCapFearAndGreedIndexServiceError;
 }
 
 /// The seam between this widget and the service that answers it, so a test can
@@ -121,18 +125,30 @@ impl WidgetProtocol for FgiProtocol {
 /// It stays crate-private, together with the snapshot it hands over: nothing
 /// outside this crate constructs a widget from a source, so there is no reason for
 /// the model to become part of the crate's public surface.
-pub(crate) trait FgiSource: Clone + Send + Sync + 'static {
+pub(crate) trait CoinMarketCapFearAndGreedIndexSource:
+    Clone + Send + Sync + 'static
+{
     /// One fetch: one RPC, answered with a snapshot that has been parsed and
     /// validated.
     fn fetch_snapshot(
         &self,
-    ) -> impl Future<Output = Result<Arc<FgiSnapshot>, FgiFetchError>> + Send;
+    ) -> impl Future<
+        Output = Result<
+            Arc<CoinMarketCapFearAndGreedIndexSnapshot>,
+            CoinMarketCapFearAndGreedIndexFetchError,
+        >,
+    > + Send;
 }
 
-impl FgiSource for KytrixServiceConnector {
-    async fn fetch_snapshot(&self) -> Result<Arc<FgiSnapshot>, FgiFetchError> {
-        let index = self.fetch_cmc_fear_greed_index().await?;
-        Ok(Arc::new(FgiSnapshot::parse(index)?))
+impl CoinMarketCapFearAndGreedIndexSource for KytrixServiceConnector {
+    async fn fetch_snapshot(
+        &self,
+    ) -> Result<Arc<CoinMarketCapFearAndGreedIndexSnapshot>, CoinMarketCapFearAndGreedIndexFetchError>
+    {
+        let index = self.fetch_coin_market_cap_fear_and_greed_index().await?;
+        Ok(Arc::new(CoinMarketCapFearAndGreedIndexSnapshot::parse(
+            index,
+        )?))
     }
 }
 
@@ -143,32 +159,34 @@ enum StreamCommand {
 
 /// The stream this service is currently following.
 struct ActiveStream {
-    key: FgiStreamKey,
+    key: CoinMarketCapFearAndGreedIndexStreamKey,
     generation: StreamGeneration,
     commands: mpsc::Sender<StreamCommand>,
 }
 
-pub(crate) struct FgiService<S = KytrixServiceConnector> {
+pub(crate) struct CoinMarketCapFearAndGreedIndexService<S = KytrixServiceConnector> {
     source: S,
 }
 
-impl<S> FgiService<S> {
+impl<S> CoinMarketCapFearAndGreedIndexService<S> {
     pub(crate) const fn new(source: S) -> Self {
         Self { source }
     }
 }
 
-impl<S> WidgetService<FgiProtocol> for FgiService<S>
+impl<S> WidgetService<CoinMarketCapFearAndGreedIndexProtocol>
+    for CoinMarketCapFearAndGreedIndexService<S>
 where
-    S: FgiSource,
+    S: CoinMarketCapFearAndGreedIndexSource,
 {
-    async fn run(self, mut context: ServiceContext<FgiProtocol>) {
+    async fn run(self, mut context: ServiceContext<CoinMarketCapFearAndGreedIndexProtocol>) {
         let mut active: Option<ActiveStream> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             match request {
-                FgiRequest::Load(key) | FgiRequest::Retry(key) => {
+                CoinMarketCapFearAndGreedIndexRequest::Load(key)
+                | CoinMarketCapFearAndGreedIndexRequest::Retry(key) => {
                     // The answer is worth less than the request it belongs to: a
                     // caller that has already given up is not waiting for it.
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
@@ -191,7 +209,10 @@ where
                     let generation = context.replace_stream(key.clone(), move |publisher| {
                         run_stream(source, stream_commands, publisher)
                     });
-                    if reply.respond(Ok(FgiResponse::StreamStarted)).is_ok() {
+                    if reply
+                        .respond(Ok(CoinMarketCapFearAndGreedIndexResponse::StreamStarted))
+                        .is_ok()
+                    {
                         active = Some(ActiveStream {
                             key,
                             generation,
@@ -204,7 +225,7 @@ where
                         active = None;
                     }
                 }
-                FgiRequest::Refresh => {
+                CoinMarketCapFearAndGreedIndexRequest::Refresh => {
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
                     }
@@ -219,18 +240,25 @@ where
                             .is_some_and(|generation| generation == stream.generation)
                     });
                     let Some(stream) = running else {
-                        let _ = reply.respond(Err(FgiServiceError::StreamClosed));
+                        let _ = reply.respond(Err(
+                            CoinMarketCapFearAndGreedIndexServiceError::StreamClosed,
+                        ));
                         continue;
                     };
                     match stream.commands.try_send(StreamCommand::Refresh) {
                         Ok(()) => {
-                            let _ = reply.respond(Ok(FgiResponse::RefreshQueued));
+                            let _ = reply
+                                .respond(Ok(CoinMarketCapFearAndGreedIndexResponse::RefreshQueued));
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            let _ = reply.respond(Err(FgiServiceError::StreamBusy));
+                            let _ = reply.respond(Err(
+                                CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
+                            ));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            let _ = reply.respond(Err(FgiServiceError::StreamClosed));
+                            let _ = reply.respond(Err(
+                                CoinMarketCapFearAndGreedIndexServiceError::StreamClosed,
+                            ));
                         }
                     }
                 }
@@ -250,9 +278,9 @@ where
 async fn run_stream<S>(
     source: S,
     mut commands: mpsc::Receiver<StreamCommand>,
-    publisher: StreamPublisher<FgiProtocol>,
+    publisher: StreamPublisher<CoinMarketCapFearAndGreedIndexProtocol>,
 ) where
-    S: FgiSource,
+    S: CoinMarketCapFearAndGreedIndexSource,
 {
     let mut next_refresh = Instant::now();
 
@@ -277,7 +305,9 @@ async fn run_stream<S>(
         match result {
             Ok(snapshot) => {
                 if publisher
-                    .publish_latest(FgiStreamMessage::Snapshot(snapshot))
+                    .publish_latest(CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(
+                        snapshot,
+                    ))
                     .is_err()
                 {
                     return;
@@ -288,7 +318,7 @@ async fn run_stream<S>(
                 // cancellation-aware, so a failure is either delivered or the
                 // publisher it belonged to is gone.
                 let _ = publisher
-                    .publish_reliable(FgiStreamMessage::Failed { error })
+                    .publish_reliable(CoinMarketCapFearAndGreedIndexStreamMessage::Failed { error })
                     .await;
                 return;
             }
@@ -326,26 +356,26 @@ mod tests {
             .expect("a test runs inside the runtime whose clock it advances")
     }
 
-    fn account() -> FgiStreamKey {
-        FgiStreamKey {
+    fn account() -> CoinMarketCapFearAndGreedIndexStreamKey {
+        CoinMarketCapFearAndGreedIndexStreamKey {
             account_id: SmolStr::new_static("test-account"),
         }
     }
 
-    fn another_account() -> FgiStreamKey {
-        FgiStreamKey {
+    fn another_account() -> CoinMarketCapFearAndGreedIndexStreamKey {
+        CoinMarketCapFearAndGreedIndexStreamKey {
             account_id: SmolStr::new_static("second-account"),
         }
     }
 
-    fn service(source: FakeSource) -> FgiService<FakeSource> {
-        FgiService::new(source)
+    fn service(source: FakeSource) -> CoinMarketCapFearAndGreedIndexService<FakeSource> {
+        CoinMarketCapFearAndGreedIndexService::new(source)
     }
 
     async fn receive_failure(
-        reliable: &mut ReliableStream<FgiProtocol>,
-        key: &FgiStreamKey,
-    ) -> FgiFetchError {
+        reliable: &mut ReliableStream<CoinMarketCapFearAndGreedIndexProtocol>,
+        key: &CoinMarketCapFearAndGreedIndexStreamKey,
+    ) -> CoinMarketCapFearAndGreedIndexFetchError {
         let envelope = reliable
             .recv()
             .await
@@ -355,16 +385,18 @@ mod tests {
             key,
             "a failure names the account it is about"
         );
-        let FgiStreamMessage::Failed { error } = envelope.message().as_ref() else {
+        let CoinMarketCapFearAndGreedIndexStreamMessage::Failed { error } =
+            envelope.message().as_ref()
+        else {
             panic!("the reliable channel should only carry failures");
         };
         error.clone()
     }
 
     async fn receive_snapshot(
-        latest: &mut LatestStream<FgiProtocol>,
-        key: &FgiStreamKey,
-    ) -> Arc<FgiSnapshot> {
+        latest: &mut LatestStream<CoinMarketCapFearAndGreedIndexProtocol>,
+        key: &CoinMarketCapFearAndGreedIndexStreamKey,
+    ) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
         latest
             .changed()
             .await
@@ -377,20 +409,28 @@ mod tests {
             key,
             "a snapshot names the account it is about"
         );
-        let FgiStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+        let CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(snapshot) =
+            envelope.message().as_ref()
+        else {
             panic!("the latest channel should only carry snapshots");
         };
         snapshot.clone()
     }
 
     /// Loads `key` and answers `StreamStarted`.
-    async fn load(service: &WidgetRuntime<FgiProtocol>, key: FgiStreamKey) {
+    async fn load(
+        service: &WidgetRuntime<CoinMarketCapFearAndGreedIndexProtocol>,
+        key: CoinMarketCapFearAndGreedIndexStreamKey,
+    ) {
         let response = service
             .client()
-            .call(FgiRequest::Load(key))
+            .call(CoinMarketCapFearAndGreedIndexRequest::Load(key))
             .await
             .expect("the load should be accepted");
-        assert_eq!(response.into_value(), FgiResponse::StreamStarted);
+        assert_eq!(
+            response.into_value(),
+            CoinMarketCapFearAndGreedIndexResponse::StreamStarted
+        );
     }
 
     /// Yields until the fake has been asked `count` times, so a test that asserts
@@ -521,7 +561,7 @@ mod tests {
         load(&runtime, account()).await;
         let error = receive_failure(&mut reliable, &account()).await;
         assert!(
-            matches!(&error, FgiFetchError::Service(_)),
+            matches!(&error, CoinMarketCapFearAndGreedIndexFetchError::Service(_)),
             "the failure names what the source refused with: {error:?}"
         );
         assert!(
@@ -563,10 +603,13 @@ mod tests {
         advance(Duration::from_secs(30)).await;
         let response = runtime
             .client()
-            .call(FgiRequest::Refresh)
+            .call(CoinMarketCapFearAndGreedIndexRequest::Refresh)
             .await
             .expect("a refresh should be queued");
-        assert_eq!(response.into_value(), FgiResponse::RefreshQueued);
+        assert_eq!(
+            response.into_value(),
+            CoinMarketCapFearAndGreedIndexResponse::RefreshQueued
+        );
 
         // The bounded wait would give up at 31 seconds: the fetch has to happen now
         // rather than wait out the rest of the interval.
@@ -604,14 +647,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(FgiRequest::Refresh)
+            .call(CoinMarketCapFearAndGreedIndexRequest::Refresh)
             .await
             .expect_err("there is nothing to refresh yet");
         assert!(
             matches!(
                 &error,
                 RpcCallError::Service {
-                    source: FgiServiceError::StreamClosed,
+                    source: CoinMarketCapFearAndGreedIndexServiceError::StreamClosed,
                     ..
                 }
             ),
@@ -632,21 +675,24 @@ mod tests {
 
         let response = runtime
             .client()
-            .call(FgiRequest::Refresh)
+            .call(CoinMarketCapFearAndGreedIndexRequest::Refresh)
             .await
             .expect("the first refresh should be queued");
-        assert_eq!(response.into_value(), FgiResponse::RefreshQueued);
+        assert_eq!(
+            response.into_value(),
+            CoinMarketCapFearAndGreedIndexResponse::RefreshQueued
+        );
 
         let error = runtime
             .client()
-            .call(FgiRequest::Refresh)
+            .call(CoinMarketCapFearAndGreedIndexRequest::Refresh)
             .await
             .expect_err("a second refresh should be refused");
         assert!(
             matches!(
                 &error,
                 RpcCallError::Service {
-                    source: FgiServiceError::StreamBusy,
+                    source: CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
                     ..
                 }
             ),

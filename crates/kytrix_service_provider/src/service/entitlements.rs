@@ -33,7 +33,9 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
             Some("strategic_maritime_chokepoints_tracking")
         }
         KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
-        KytrixServiceCapability::Cmc => Some("cmc_fear_greed"),
+        KytrixServiceCapability::CoinMarketCapFearAndGreedIndex => {
+            Some("coin_market_cap_fear_and_greed_index")
+        }
         KytrixServiceCapability::FinancialCalendar => Some("financial_calendar"),
         KytrixServiceCapability::PentagonPizzaIndex => Some("pentagon_pizza_index"),
         KytrixServiceCapability::Account
@@ -101,7 +103,10 @@ mod tests {
                 Some("cryptocurrency_wallet_monitoring"),
             ),
             (KytrixServiceCapability::XAccountMonitoringMedia, None),
-            (KytrixServiceCapability::Cmc, Some("cmc_fear_greed")),
+            (
+                KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
+                Some("coin_market_cap_fear_and_greed_index"),
+            ),
             (
                 KytrixServiceCapability::FinancialCalendar,
                 Some("financial_calendar"),
