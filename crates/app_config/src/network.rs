@@ -54,9 +54,9 @@ pub enum KytrixServiceCapability {
     UpdaterMetadata,
     #[serde(rename = "updater_download")]
     UpdaterDownload,
-    /// The AIS vessel feed the Kytrix service pushes for one area.
-    #[serde(rename = "ais")]
-    Ais,
+    /// The strategic maritime chokepoints vessel feed the Kytrix service pushes for one area.
+    #[serde(rename = "strategic_maritime_chokepoints_tracking")]
+    StrategicMaritimeChokepointsTracking,
 }
 
 /// Generic outbound route identity.
@@ -864,20 +864,21 @@ mod tests {
             .expect("the Kytrix target should decode"),
             target()
         );
-        let ais = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::Ais,
+        let strategic_maritime_chokepoints_tracking = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
         };
         assert_eq!(
-            serde_json::to_value(&ais).expect("the AIS target should serialize"),
-            json!({ "kind": "kytrix_service", "capability": "ais" })
+            serde_json::to_value(&strategic_maritime_chokepoints_tracking)
+                .expect("the AIS target should serialize"),
+            json!({ "kind": "kytrix_service", "capability": "strategic_maritime_chokepoints_tracking" })
         );
         assert_eq!(
             serde_json::from_value::<ServiceTarget>(json!({
                 "kind": "kytrix_service",
-                "capability": "ais",
+                "capability": "strategic_maritime_chokepoints_tracking",
             }))
             .expect("the AIS target should decode"),
-            ais
+            strategic_maritime_chokepoints_tracking
         );
     }
 

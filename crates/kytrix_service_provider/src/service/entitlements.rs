@@ -11,7 +11,9 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
         ServiceTopic::FinancialIndex(_) => Some("financial_indices"),
         ServiceTopic::XAccountMonitoring => Some("x_account_monitoring"),
         ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
-        ServiceTopic::Ais(_) => Some("ais"),
+        ServiceTopic::StrategicMaritimeChokepointsTracking(_) => {
+            Some("strategic_maritime_chokepoints_tracking")
+        }
     }
 }
 
@@ -27,7 +29,9 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
             Some("cryptocurrency_wallet_monitoring")
         }
-        KytrixServiceCapability::Ais => Some("ais"),
+        KytrixServiceCapability::StrategicMaritimeChokepointsTracking => {
+            Some("strategic_maritime_chokepoints_tracking")
+        }
         KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
         KytrixServiceCapability::Cmc => Some("cmc_fear_greed"),
         KytrixServiceCapability::FinancialCalendar => Some("financial_calendar"),
@@ -43,8 +47,8 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
 mod tests {
     use super::*;
     use crate::service::{
-        ais::AisArea,
         engine::{FinancialIndexTopic, ServiceTopic},
+        strategic_maritime_chokepoints_tracking::StrategicMaritimeChokepointsTrackingArea,
     };
 
     #[test]
@@ -62,7 +66,12 @@ mod tests {
                 ServiceTopic::CryptocurrencyWalletMonitoring,
                 "cryptocurrency_wallet_monitoring",
             ),
-            (ServiceTopic::Ais(AisArea::Hormuz), "ais"),
+            (
+                ServiceTopic::StrategicMaritimeChokepointsTracking(
+                    StrategicMaritimeChokepointsTrackingArea::Hormuz,
+                ),
+                "strategic_maritime_chokepoints_tracking",
+            ),
         ];
 
         for (topic, key) in topics {
@@ -103,7 +112,10 @@ mod tests {
             ),
             (KytrixServiceCapability::UpdaterMetadata, None),
             (KytrixServiceCapability::UpdaterDownload, None),
-            (KytrixServiceCapability::Ais, Some("ais")),
+            (
+                KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
+                Some("strategic_maritime_chokepoints_tracking"),
+            ),
         ];
 
         for (capability, key) in capabilities {

@@ -44,7 +44,6 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
-    ais::{AisArea, AisUpdate},
     cryptocurrency_wallet_monitoring::{
         self, CryptocurrencyWalletMonitoringApiError,
         CryptocurrencyWalletMonitoringMutationOutcome,
@@ -52,6 +51,9 @@ use super::{
         CryptocurrencyWalletMonitoringSelectionsResponse,
     },
     handoff::request_dashboard_handoff,
+    strategic_maritime_chokepoints_tracking::{
+        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
+    },
     supervisor::run_service_supervisor,
     x::{
         self, TweetsResponse, XAccountMonitoringApiError, XAccountMonitoringMutationOutcome,
@@ -130,10 +132,10 @@ impl KytrixAccountSession {
         Ok(subscription)
     }
 
-    pub async fn subscribe_ais(
+    pub async fn subscribe_strategic_maritime_chokepoints_tracking(
         &self,
-        area: AisArea,
-    ) -> Result<Subscription<AisUpdate>, KytrixServiceError> {
+        area: StrategicMaritimeChokepointsTrackingArea,
+    ) -> Result<Subscription<StrategicMaritimeChokepointsTrackingUpdate>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -142,8 +144,8 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::Ais(area)],
-                SubscriberSink::Ais(publisher),
+                &[ServiceTopic::StrategicMaritimeChokepointsTracking(area)],
+                SubscriberSink::StrategicMaritimeChokepointsTracking(publisher),
             )
             .await?;
         Ok(subscription)
@@ -1759,8 +1761,10 @@ mod tests {
                 ])
             )
         );
-        let mut ais = session
-            .subscribe_ais(AisArea::Hormuz)
+        let mut strategic_maritime_chokepoints_tracking = session
+            .subscribe_strategic_maritime_chokepoints_tracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            )
             .await
             .expect("AIS should subscribe");
         assert_eq!(
@@ -1772,7 +1776,9 @@ mod tests {
                     ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
                     ServiceTopic::XAccountMonitoring,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
-                    ServiceTopic::Ais(AisArea::Hormuz),
+                    ServiceTopic::StrategicMaritimeChokepointsTracking(
+                        StrategicMaritimeChokepointsTrackingArea::Hormuz
+                    ),
                 ])
             )
         );
@@ -1784,7 +1790,7 @@ mod tests {
         server.send_cryptocurrency_wallet_monitoring_transfer(
             "typed-cryptocurrency_wallet_monitoring",
         );
-        server.send_ais_delta();
+        server.send_strategic_maritime_chokepoints_tracking_delta();
 
         assert_eq!(
             timeout(Duration::from_secs(2), news.recv())
@@ -1822,11 +1828,16 @@ mod tests {
             "typed-cryptocurrency_wallet_monitoring"
         );
         assert_eq!(
-            timeout(Duration::from_secs(2), ais.recv())
-                .await
-                .expect("AIS event should arrive")
-                .expect("AIS subscription should remain active"),
-            AisUpdate::from_proto(ais_delta())
+            timeout(
+                Duration::from_secs(2),
+                strategic_maritime_chokepoints_tracking.recv()
+            )
+            .await
+            .expect("AIS event should arrive")
+            .expect("AIS subscription should remain active"),
+            StrategicMaritimeChokepointsTrackingUpdate::from_proto(
+                strategic_maritime_chokepoints_tracking_delta()
+            )
         );
         assert!(news.try_recv_for_test().is_err());
         assert!(indices.try_recv_for_test().is_err());
@@ -1836,15 +1847,26 @@ mod tests {
                 .try_recv_for_test()
                 .is_err()
         );
-        assert!(ais.try_recv_for_test().is_err());
+        assert!(
+            strategic_maritime_chokepoints_tracking
+                .try_recv_for_test()
+                .is_err()
+        );
 
-        drop((news, indices, x, cryptocurrency_wallet_monitoring, ais));
+        drop((
+            news,
+            indices,
+            x,
+            cryptocurrency_wallet_monitoring,
+            strategic_maritime_chokepoints_tracking,
+        ));
         connector.shutdown().await;
         server.shutdown().await;
     }
 
     #[tokio::test]
-    async fn ais_subscription_should_release_the_remote_topic_when_dropped() {
+    async fn strategic_maritime_chokepoints_tracking_subscription_should_release_the_remote_topic_when_dropped()
+     {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
@@ -1853,19 +1875,25 @@ mod tests {
             .await
             .expect("test account should resolve");
 
-        let ais = session
-            .subscribe_ais(AisArea::Hormuz)
+        let strategic_maritime_chokepoints_tracking = session
+            .subscribe_strategic_maritime_chokepoints_tracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            )
             .await
             .expect("AIS should subscribe");
         assert_eq!(
             server.next_request().await,
             (
                 1,
-                ObservedRequest::SetSubscriptions(vec![ServiceTopic::Ais(AisArea::Hormuz)])
+                ObservedRequest::SetSubscriptions(vec![
+                    ServiceTopic::StrategicMaritimeChokepointsTracking(
+                        StrategicMaritimeChokepointsTrackingArea::Hormuz
+                    )
+                ])
             )
         );
 
-        drop(ais);
+        drop(strategic_maritime_chokepoints_tracking);
         assert_eq!(
             server.next_request().await,
             (1, ObservedRequest::SetSubscriptions(Vec::new()))
@@ -1881,7 +1909,8 @@ mod tests {
     /// both panes share this connection: without the session's own replay the second pane
     /// would receive only deltas it cannot apply until the server's fallback keyframe.
     #[tokio::test]
-    async fn a_second_ais_subscription_should_start_from_the_keyframe_the_session_holds() {
+    async fn a_second_strategic_maritime_chokepoints_tracking_subscription_should_start_from_the_keyframe_the_session_holds()
+     {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
@@ -1891,18 +1920,24 @@ mod tests {
             .expect("test account should resolve");
 
         let mut first = session
-            .subscribe_ais(AisArea::Hormuz)
+            .subscribe_strategic_maritime_chokepoints_tracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            )
             .await
             .expect("AIS should subscribe");
         assert_eq!(
             server.next_request().await,
             (
                 1,
-                ObservedRequest::SetSubscriptions(vec![ServiceTopic::Ais(AisArea::Hormuz)])
+                ObservedRequest::SetSubscriptions(vec![
+                    ServiceTopic::StrategicMaritimeChokepointsTracking(
+                        StrategicMaritimeChokepointsTrackingArea::Hormuz
+                    )
+                ])
             )
         );
 
-        server.send_ais_keyframe();
+        server.send_strategic_maritime_chokepoints_tracking_keyframe();
         let keyframe = timeout(Duration::from_secs(2), first.recv())
             .await
             .expect("the keyframe should arrive")
@@ -1910,7 +1945,9 @@ mod tests {
         assert!(keyframe.keyframe);
 
         let mut second = session
-            .subscribe_ais(AisArea::Hormuz)
+            .subscribe_strategic_maritime_chokepoints_tracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            )
             .await
             .expect("AIS should subscribe a second time");
         assert_eq!(

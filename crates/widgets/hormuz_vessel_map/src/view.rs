@@ -43,9 +43,11 @@ use i18n::t;
 use kytrix_service_provider::{
     auth::constants::ACCOUNT_ORIGIN,
     service::{
-        ais::{AisArea, AisUpdate},
         connector::KytrixServiceConnector,
         engine::{ErrorCode, KytrixServiceError},
+        strategic_maritime_chokepoints_tracking::{
+            StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
+        },
     },
 };
 use serde::{Deserialize, Serialize};
@@ -70,7 +72,9 @@ use crate::{
     },
     scene::{self, Scene, SceneError},
     service::{
-        AisProtocol, AisRequest, AisScope, AisService, AisSource, AisStreamError, AisStreamMessage,
+        AisStreamError, AisStreamMessage, StrategicMaritimeChokepointsTrackingProtocol,
+        StrategicMaritimeChokepointsTrackingRequest, StrategicMaritimeChokepointsTrackingScope,
+        StrategicMaritimeChokepointsTrackingService, StrategicMaritimeChokepointsTrackingSource,
     },
 };
 
@@ -387,7 +391,7 @@ fn viewport_of(bounds: Bounds<Pixels>) -> [f32; 2] {
 /// One pane: the picture an AIS subscription publishes, the camera it is drawn with, and
 /// the vessel the pointer is on.
 pub struct HormuzVesselMapWidget {
-    binding: WidgetBinding<AisProtocol>,
+    binding: WidgetBinding<StrategicMaritimeChokepointsTrackingProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     /// The account the picture belongs to, which is what an account change is compared
@@ -459,8 +463,8 @@ impl WidgetView for HormuzVesselMapWidget {
         }
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
-            AisRequest::Load {
-                scope: AisScope::new(account),
+            StrategicMaritimeChokepointsTrackingRequest::Load {
+                scope: StrategicMaritimeChokepointsTrackingScope::new(account),
             },
             cx,
             Self::on_load_result,
@@ -489,11 +493,11 @@ impl HormuzVesselMapWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: AisSource,
+        S: StrategicMaritimeChokepointsTrackingSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            AisService::new(source),
+            StrategicMaritimeChokepointsTrackingService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
@@ -583,10 +587,14 @@ impl HormuzVesselMapWidget {
             None => {
                 self.clear_picture();
                 self.report_sign_in(cx);
-                self.binding.call(AisRequest::Stop, cx, |this, _, cx| {
-                    this.clear_picture();
-                    cx.notify();
-                });
+                self.binding.call(
+                    StrategicMaritimeChokepointsTrackingRequest::Stop,
+                    cx,
+                    |this, _, cx| {
+                        this.clear_picture();
+                        cx.notify();
+                    },
+                );
             }
         }
     }
@@ -602,7 +610,11 @@ impl HormuzVesselMapWidget {
         self.hit_points.clear();
     }
 
-    fn on_load_result(&mut self, result: WidgetRpcResult<AisProtocol>, cx: &mut Context<Self>) {
+    fn on_load_result(
+        &mut self,
+        result: WidgetRpcResult<StrategicMaritimeChokepointsTrackingProtocol>,
+        cx: &mut Context<Self>,
+    ) {
         // The answer says the service took the request; what the subscription then reports
         // about itself arrives on the stream, which is where a failure to subscribe is
         // drawn from.
@@ -623,11 +635,14 @@ impl HormuzVesselMapWidget {
     /// back on screen.
     fn apply_latest(
         &mut self,
-        area: AisArea,
+        area: StrategicMaritimeChokepointsTrackingArea,
         message: Arc<AisStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if area != AisArea::Hormuz || self.account_id.is_none() || self.status.is_failed(cx) {
+        if area != StrategicMaritimeChokepointsTrackingArea::Hormuz
+            || self.account_id.is_none()
+            || self.status.is_failed(cx)
+        {
             return false;
         }
         let AisStreamMessage::Update(update) = message.as_ref() else {
@@ -640,11 +655,14 @@ impl HormuzVesselMapWidget {
     /// Reports the failure the reliable stream carried.
     fn apply_reliable(
         &mut self,
-        area: AisArea,
+        area: StrategicMaritimeChokepointsTrackingArea,
         message: Arc<AisStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if area != AisArea::Hormuz || self.account_id.is_none() || self.status.is_failed(cx) {
+        if area != StrategicMaritimeChokepointsTrackingArea::Hormuz
+            || self.account_id.is_none()
+            || self.status.is_failed(cx)
+        {
             return false;
         }
         let AisStreamMessage::Failed(error) = message.as_ref() else {
@@ -668,7 +686,11 @@ impl HormuzVesselMapWidget {
     }
 
     /// Folds one push into the picture and arms the staleness clock.
-    fn apply_update(&mut self, update: &AisUpdate, cx: &mut Context<Self>) {
+    fn apply_update(
+        &mut self,
+        update: &StrategicMaritimeChokepointsTrackingUpdate,
+        cx: &mut Context<Self>,
+    ) {
         self.vessels.apply(update);
         self.painted = self.vessels.vessels().into();
         // A keyframe the server stamped with no time says it holds no state: the picture
@@ -1638,8 +1660,11 @@ mod tests {
     };
     use i18n::{language::codes::LanguageCode, t};
     use kytrix_service_provider::service::{
-        ais::{AisArea, AisPosition, AisStatic, AisUpdate},
         engine::{ErrorCode, KytrixServiceError},
+        strategic_maritime_chokepoints_tracking::{
+            StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingPosition,
+            StrategicMaritimeChokepointsTrackingStatic, StrategicMaritimeChokepointsTrackingUpdate,
+        },
     };
     use network::transport::error::TransportError;
     use smol_str::SmolStr;
@@ -1651,7 +1676,11 @@ mod tests {
     use super::*;
     use crate::{
         model::HIT_RADIUS_PX,
-        service::{AisEventSubscription, AisSession, AisStreamError, AisStreamMessage},
+        service::{
+            AisStreamError, AisStreamMessage,
+            StrategicMaritimeChokepointsTrackingEventSubscription,
+            StrategicMaritimeChokepointsTrackingSession,
+        },
     };
 
     /// The account every fixture pane is signed in as.
@@ -1700,7 +1729,7 @@ mod tests {
         }
     }
 
-    impl AisSource for RecordingSource {
+    impl StrategicMaritimeChokepointsTrackingSource for RecordingSource {
         type Session = PendingSession;
 
         async fn acquire_session(
@@ -1719,12 +1748,12 @@ mod tests {
     #[derive(Clone)]
     struct PendingSession;
 
-    impl AisSession for PendingSession {
+    impl StrategicMaritimeChokepointsTrackingSession for PendingSession {
         type Subscription = PendingSubscription;
 
-        async fn subscribe_ais(
+        async fn subscribe_strategic_maritime_chokepoints_tracking(
             &self,
-            _area: AisArea,
+            _area: StrategicMaritimeChokepointsTrackingArea,
         ) -> Result<Self::Subscription, KytrixServiceError> {
             std::future::pending().await
         }
@@ -1733,8 +1762,10 @@ mod tests {
     /// A subscription that never delivers anything.
     struct PendingSubscription;
 
-    impl AisEventSubscription for PendingSubscription {
-        async fn recv(&mut self) -> Result<AisUpdate, TransportError> {
+    impl StrategicMaritimeChokepointsTrackingEventSubscription for PendingSubscription {
+        async fn recv(
+            &mut self,
+        ) -> Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError> {
             std::future::pending().await
         }
     }
@@ -1770,8 +1801,8 @@ mod tests {
     }
 
     /// The vertices of one position in the strait, as a report carries them.
-    fn position(mmsi: u32) -> AisPosition {
-        AisPosition {
+    fn position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
+        StrategicMaritimeChokepointsTrackingPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -1784,8 +1815,8 @@ mod tests {
     }
 
     /// One vessel's static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> AisStatic {
-        AisStatic {
+    fn statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
+        StrategicMaritimeChokepointsTrackingStatic {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -1806,8 +1837,12 @@ mod tests {
     }
 
     /// A keyframe of `positions`.
-    fn keyframe(epoch: u64, sequence: u64, positions: Vec<AisPosition>) -> AisUpdate {
-        AisUpdate {
+    fn keyframe(
+        epoch: u64,
+        sequence: u64,
+        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
+    ) -> StrategicMaritimeChokepointsTrackingUpdate {
+        StrategicMaritimeChokepointsTrackingUpdate {
             epoch,
             keyframe: true,
             sequence,
@@ -1820,8 +1855,13 @@ mod tests {
     }
 
     /// A delta continuing `base` with nothing in it but the removals.
-    fn removal(epoch: u64, base: u64, sequence: u64, mmsi: u32) -> AisUpdate {
-        AisUpdate {
+    fn removal(
+        epoch: u64,
+        base: u64,
+        sequence: u64,
+        mmsi: u32,
+    ) -> StrategicMaritimeChokepointsTrackingUpdate {
+        StrategicMaritimeChokepointsTrackingUpdate {
             epoch,
             keyframe: false,
             sequence,
@@ -1836,12 +1876,12 @@ mod tests {
     /// Reports one push as the latest stream would.
     fn report_update(
         pane: &Entity<HormuzVesselMapWidget>,
-        update: AisUpdate,
+        update: StrategicMaritimeChokepointsTrackingUpdate,
         cx: &mut App,
     ) -> bool {
         pane.update(cx, |pane, cx| {
             pane.apply_latest(
-                AisArea::Hormuz,
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
                 Arc::new(AisStreamMessage::Update(update)),
                 cx,
             )
@@ -1856,7 +1896,7 @@ mod tests {
     ) -> bool {
         pane.update(cx, |pane, cx| {
             pane.apply_reliable(
-                AisArea::Hormuz,
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
                 Arc::new(AisStreamMessage::Failed(Arc::new(error))),
                 cx,
             )
@@ -2223,14 +2263,22 @@ mod tests {
         cx.update(|cx| {
             let update = Arc::new(AisStreamMessage::Update(keyframe(7, 1, vec![position(1)])));
             assert!(!pane.update(cx, |pane, cx| {
-                pane.apply_latest(AisArea::Unspecified, update, cx)
+                pane.apply_latest(
+                    StrategicMaritimeChokepointsTrackingArea::Unspecified,
+                    update,
+                    cx,
+                )
             }));
 
             let failure = Arc::new(AisStreamMessage::Failed(Arc::new(
                 AisStreamError::Transport(TransportError::Closed),
             )));
             assert!(!pane.update(cx, |pane, cx| {
-                pane.apply_reliable(AisArea::Unspecified, failure, cx)
+                pane.apply_reliable(
+                    StrategicMaritimeChokepointsTrackingArea::Unspecified,
+                    failure,
+                    cx,
+                )
             }));
 
             let pane = pane.read(cx);

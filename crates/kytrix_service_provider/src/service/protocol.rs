@@ -19,7 +19,6 @@ use url::Url;
 use yawc::{Frame, OpCode, WebSocketError};
 
 use crate::service::{
-    ais::{AisArea, AisUpdate},
     cryptocurrency_wallet_monitoring,
     engine::{
         CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexEvent,
@@ -28,6 +27,9 @@ use crate::service::{
         ServiceTopic, TweetReference, WRITE_TIMEOUT, XAccountMonitoringProfileEvent,
         XAccountMonitoringTweetEvent, XAccountMonitoringTweetMedia,
         XAccountMonitoringTweetTextSegment,
+    },
+    strategic_maritime_chokepoints_tracking::{
+        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
     },
 };
 
@@ -148,14 +150,16 @@ pub(super) fn decode_event(
                 decode_cryptocurrency_wallet_monitoring_transfer(transfer)?,
             ),
         ))),
-        proto_event::event::Event::Ais(delta) => {
-            let area = AisArea::try_from(delta.area)
+        proto_event::event::Event::StrategicMaritimeChokepointsTracking(delta) => {
+            let area = StrategicMaritimeChokepointsTrackingArea::try_from(delta.area)
                 .ok()
-                .filter(|area| *area != AisArea::Unspecified)
+                .filter(|area| *area != StrategicMaritimeChokepointsTrackingArea::Unspecified)
                 .ok_or_else(|| KytrixServiceError::Protocol("AIS event area is invalid".into()))?;
             Ok(Some((
-                ServiceTopic::Ais(area),
-                KytrixServiceEvent::Ais(AisUpdate::from_proto(delta)),
+                ServiceTopic::StrategicMaritimeChokepointsTracking(area),
+                KytrixServiceEvent::StrategicMaritimeChokepointsTracking(
+                    StrategicMaritimeChokepointsTrackingUpdate::from_proto(delta),
+                ),
             )))
         }
     }
@@ -564,8 +568,10 @@ impl From<&ServiceTopic> for proto_topic::Topic {
                     proto_topic::CryptocurrencyWalletMonitoringTopic {},
                 )
             }
-            ServiceTopic::Ais(area) => {
-                proto_topic::topic::Topic::Ais(proto_topic::AisTopic { area: *area as i32 })
+            ServiceTopic::StrategicMaritimeChokepointsTracking(area) => {
+                proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
+                    proto_topic::StrategicMaritimeChokepointsTrackingTopic { area: *area as i32 },
+                )
             }
         };
         Self { topic: Some(topic) }
@@ -592,11 +598,19 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
             proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
                 Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
             }
-            proto_topic::topic::Topic::Ais(value) => match AisArea::try_from(value.area) {
-                Ok(AisArea::Hormuz) => Ok(ServiceTopic::Ais(AisArea::Hormuz)),
-                Ok(AisArea::Unspecified) => Err("AIS area is unspecified".into()),
-                Err(_) => Err("AIS area is invalid".into()),
-            },
+            proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(value) => {
+                match StrategicMaritimeChokepointsTrackingArea::try_from(value.area) {
+                    Ok(StrategicMaritimeChokepointsTrackingArea::Hormuz) => {
+                        Ok(ServiceTopic::StrategicMaritimeChokepointsTracking(
+                            StrategicMaritimeChokepointsTrackingArea::Hormuz,
+                        ))
+                    }
+                    Ok(StrategicMaritimeChokepointsTrackingArea::Unspecified) => {
+                        Err("AIS area is unspecified".into())
+                    }
+                    Err(_) => Err("AIS area is invalid".into()),
+                }
+            }
         }
     }
 }
@@ -606,7 +620,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{super::test_support::*, *};
-    use crate::service::ais::{AisPosition, AisStatic};
+    use crate::service::strategic_maritime_chokepoints_tracking::{
+        StrategicMaritimeChokepointsTrackingPosition, StrategicMaritimeChokepointsTrackingStatic,
+    };
 
     #[test]
     fn literal_set_subscriptions_wire_should_preserve_schema_tags() {
@@ -725,7 +741,9 @@ mod tests {
             index_service_topic("REMOTE_ONLY_INDEX"),
             ServiceTopic::XAccountMonitoring,
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            ServiceTopic::Ais(AisArea::Hormuz),
+            ServiceTopic::StrategicMaritimeChokepointsTracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            ),
         ] {
             let encoded = proto_topic::Topic::from(&topic);
             assert_eq!(ServiceTopic::try_from(&encoded), Ok(topic));
@@ -733,12 +751,17 @@ mod tests {
     }
 
     #[test]
-    fn ais_topic_should_reject_unspecified_and_unknown_areas() {
-        for area in [AisArea::Unspecified as i32, 9] {
+    fn strategic_maritime_chokepoints_tracking_topic_should_reject_unspecified_and_unknown_areas() {
+        for area in [
+            StrategicMaritimeChokepointsTrackingArea::Unspecified as i32,
+            9,
+        ] {
             let topic = proto_topic::Topic {
-                topic: Some(proto_topic::topic::Topic::Ais(proto_topic::AisTopic {
-                    area,
-                })),
+                topic: Some(
+                    proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
+                        proto_topic::StrategicMaritimeChokepointsTrackingTopic { area },
+                    ),
+                ),
             };
             assert!(ServiceTopic::try_from(&topic).is_err());
         }
@@ -972,29 +995,41 @@ mod tests {
     }
 
     #[test]
-    fn ais_delta_should_decode_the_area_and_every_part_of_the_update() {
+    fn strategic_maritime_chokepoints_tracking_delta_should_decode_the_area_and_every_part_of_the_update()
+     {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::Ais(ais_delta())),
+                event: Some(
+                    proto_event::event::Event::StrategicMaritimeChokepointsTracking(
+                        strategic_maritime_chokepoints_tracking_delta(),
+                    ),
+                ),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::Ais(AisArea::Hormuz),
-            KytrixServiceEvent::Ais(update),
+            ServiceTopic::StrategicMaritimeChokepointsTracking(
+                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            ),
+            KytrixServiceEvent::StrategicMaritimeChokepointsTracking(update),
         ))) = decoded
         else {
             panic!("expected an AIS update");
         };
-        assert_eq!(update, AisUpdate::from_proto(ais_delta()));
+        assert_eq!(
+            update,
+            StrategicMaritimeChokepointsTrackingUpdate::from_proto(
+                strategic_maritime_chokepoints_tracking_delta()
+            )
+        );
         assert_eq!(update.epoch, 5);
         assert!(!update.keyframe);
         assert_eq!(update.sequence, 7);
         assert_eq!(update.base, 6);
         assert_eq!(
             update.statics,
-            [AisStatic {
+            [StrategicMaritimeChokepointsTrackingStatic {
                 mmsi: 636_000_001,
                 imo: 9_000_001,
                 call_sign: "C6AB1".into(),
@@ -1015,7 +1050,7 @@ mod tests {
         );
         assert_eq!(
             update.positions,
-            [AisPosition {
+            [StrategicMaritimeChokepointsTrackingPosition {
                 mmsi: 636_000_001,
                 latitude: 26_566_000,
                 longitude: 56_250_000,
@@ -1031,13 +1066,19 @@ mod tests {
     }
 
     #[test]
-    fn ais_event_without_a_known_area_should_be_a_protocol_error() {
-        for area in [AisArea::Unspecified as i32, 9] {
-            let mut delta = ais_delta();
+    fn strategic_maritime_chokepoints_tracking_event_without_a_known_area_should_be_a_protocol_error()
+     {
+        for area in [
+            StrategicMaritimeChokepointsTrackingArea::Unspecified as i32,
+            9,
+        ] {
+            let mut delta = strategic_maritime_chokepoints_tracking_delta();
             delta.area = area;
             let message = ServerMessage {
                 message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(proto_event::event::Event::Ais(delta)),
+                    event: Some(
+                        proto_event::event::Event::StrategicMaritimeChokepointsTracking(delta),
+                    ),
                 })),
             };
             assert!(matches!(

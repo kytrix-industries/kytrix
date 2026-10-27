@@ -5,15 +5,16 @@
 //! domain types a widget holds between pushes; the proto envelope stays at the protocol
 //! boundary, and the only exception is the area a subscription is keyed by.
 
-use kytrix_proto::types::AisDelta;
+use kytrix_proto::types::StrategicMaritimeChokepointsTrackingDelta;
 use smol_str::SmolStr;
 
 /// The area one AIS subscription covers.
-pub type AisArea = kytrix_proto::types::AisArea;
+pub type StrategicMaritimeChokepointsTrackingArea =
+    kytrix_proto::types::StrategicMaritimeChokepointsTrackingArea;
 
 /// One AIS push for an area.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AisUpdate {
+pub struct StrategicMaritimeChokepointsTrackingUpdate {
     /// The API process the delta was produced by. A new epoch means every sequence the
     /// client holds belongs to a process that no longer exists.
     pub epoch: u64,
@@ -24,9 +25,9 @@ pub struct AisUpdate {
     /// The sequence the server expects the client to have applied before this push.
     pub base: u64,
     /// The static part of every vessel the push describes.
-    pub statics: Vec<AisStatic>,
+    pub statics: Vec<StrategicMaritimeChokepointsTrackingStatic>,
     /// The positions the push describes.
-    pub positions: Vec<AisPosition>,
+    pub positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
     /// The MMSIs that left the area.
     pub removed: Vec<u32>,
     /// The server's generation time in milliseconds; `0` means it holds no state yet.
@@ -35,7 +36,7 @@ pub struct AisUpdate {
 
 /// The low-frequency part of one vessel.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AisStatic {
+pub struct StrategicMaritimeChokepointsTrackingStatic {
     pub mmsi: u32,
     pub imo: u32,
     pub call_sign: SmolStr,
@@ -56,7 +57,7 @@ pub struct AisStatic {
 
 /// The high-frequency part of one vessel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AisPosition {
+pub struct StrategicMaritimeChokepointsTrackingPosition {
     pub mmsi: u32,
     /// Latitude in 1e-6 degrees.
     pub latitude: i32,
@@ -74,9 +75,9 @@ pub struct AisPosition {
     pub last_update: i64,
 }
 
-impl AisUpdate {
+impl StrategicMaritimeChokepointsTrackingUpdate {
     /// Converts one proto delta into the domain update.
-    pub fn from_proto(delta: AisDelta) -> Self {
+    pub fn from_proto(delta: StrategicMaritimeChokepointsTrackingDelta) -> Self {
         Self {
             epoch: delta.epoch,
             keyframe: delta.keyframe,
@@ -85,7 +86,7 @@ impl AisUpdate {
             statics: delta
                 .statics
                 .into_iter()
-                .map(|vessel| AisStatic {
+                .map(|vessel| StrategicMaritimeChokepointsTrackingStatic {
                     mmsi: vessel.mmsi,
                     imo: vessel.imo,
                     call_sign: SmolStr::new(vessel.call_sign),
@@ -107,7 +108,7 @@ impl AisUpdate {
             positions: delta
                 .positions
                 .into_iter()
-                .map(|position| AisPosition {
+                .map(|position| StrategicMaritimeChokepointsTrackingPosition {
                     mmsi: position.mmsi,
                     latitude: position.latitude,
                     longitude: position.longitude,

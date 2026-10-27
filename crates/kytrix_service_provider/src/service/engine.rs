@@ -37,8 +37,10 @@ use widget_tokio_runtime::runtime::Runtime;
 use yawc::{Frame, WebSocketError};
 
 use super::{
-    ais::{AisArea, AisUpdate},
     connector::KytrixServiceConnector,
+    strategic_maritime_chokepoints_tracking::{
+        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
+    },
 };
 use crate::{
     account_profile::AccountProfile,
@@ -260,7 +262,7 @@ pub enum ServiceTopic {
     FinancialIndex(FinancialIndexTopic),
     XAccountMonitoring,
     CryptocurrencyWalletMonitoring,
-    Ais(AisArea),
+    StrategicMaritimeChokepointsTracking(StrategicMaritimeChokepointsTrackingArea),
 }
 
 /// A news event received from the service.
@@ -368,7 +370,7 @@ pub(super) enum KytrixServiceEvent {
     XAccountMonitoringProfile(XAccountMonitoringProfileEvent),
     XAccountMonitoringTweet(XAccountMonitoringTweetEvent),
     CryptocurrencyWalletMonitoringTransfer(CryptocurrencyWalletMonitoringTransfer),
-    Ais(AisUpdate),
+    StrategicMaritimeChokepointsTracking(StrategicMaritimeChokepointsTrackingUpdate),
     SessionState(KytrixSessionState),
 }
 
@@ -377,7 +379,9 @@ pub(super) enum SubscriberSink {
     FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
     XAccountMonitoring(SubscriptionPublisher<XAccountMonitoringSubscriptionEvent>),
     CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitoringTransfer>),
-    Ais(SubscriptionPublisher<AisUpdate>),
+    StrategicMaritimeChokepointsTracking(
+        SubscriptionPublisher<StrategicMaritimeChokepointsTrackingUpdate>,
+    ),
 }
 
 impl SubscriberSink {
@@ -389,7 +393,9 @@ impl SubscriberSink {
             Self::CryptocurrencyWalletMonitoring(_) => {
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring
             }
-            Self::Ais(_) => KytrixServiceCapability::Ais,
+            Self::StrategicMaritimeChokepointsTracking(_) => {
+                KytrixServiceCapability::StrategicMaritimeChokepointsTracking
+            }
         }
     }
 
@@ -399,7 +405,7 @@ impl SubscriberSink {
             Self::FinancialIndices(publisher) => publisher.activate(),
             Self::XAccountMonitoring(publisher) => publisher.activate(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
-            Self::Ais(publisher) => publisher.activate(),
+            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.activate(),
         }
     }
 
@@ -409,7 +415,7 @@ impl SubscriberSink {
             Self::FinancialIndices(publisher) => publisher.reconnecting(),
             Self::XAccountMonitoring(publisher) => publisher.reconnecting(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
-            Self::Ais(publisher) => publisher.reconnecting(),
+            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.reconnecting(),
         }
     }
 
@@ -419,7 +425,7 @@ impl SubscriberSink {
             Self::FinancialIndices(publisher) => publisher.fail(error),
             Self::XAccountMonitoring(publisher) => publisher.fail(error),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
-            Self::Ais(publisher) => publisher.fail(error),
+            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.fail(error),
         }
     }
 
@@ -429,7 +435,7 @@ impl SubscriberSink {
             Self::FinancialIndices(publisher) => publisher.finish(),
             Self::XAccountMonitoring(publisher) => publisher.finish(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
-            Self::Ais(publisher) => publisher.finish(),
+            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.finish(),
         }
     }
 
@@ -439,7 +445,7 @@ impl SubscriberSink {
             Self::FinancialIndices(publisher) => publisher.is_cancelled(),
             Self::XAccountMonitoring(publisher) => publisher.is_cancelled(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
-            Self::Ais(publisher) => publisher.is_cancelled(),
+            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.is_cancelled(),
         }
     }
 
@@ -475,7 +481,10 @@ impl SubscriberSink {
             ) => publisher
                 .try_send(transfer.clone())
                 .map_err(subscription_send_error),
-            (Self::Ais(publisher), KytrixServiceEvent::Ais(update)) => publisher
+            (
+                Self::StrategicMaritimeChokepointsTracking(publisher),
+                KytrixServiceEvent::StrategicMaritimeChokepointsTracking(update),
+            ) => publisher
                 .try_send(update.clone())
                 .map_err(subscription_send_error),
             _ => Ok(()),
@@ -904,7 +913,10 @@ pub(super) struct ServiceSessionActor {
     /// for a topic a connection adds, and this session is one connection. The pane would
     /// be left without a baseline until the server's next keyframe (up to its 300 s
     /// fallback), so the session hands the joining subscriber the last keyframe it saw.
-    pub latest_ais_keyframes: AHashMap<AisArea, AisUpdate>,
+    pub latest_strategic_maritime_chokepoints_tracking_keyframes: AHashMap<
+        StrategicMaritimeChokepointsTrackingArea,
+        StrategicMaritimeChokepointsTrackingUpdate,
+    >,
     pub session_state: Option<KytrixSessionState>,
     pub subscriptions_dirty: bool,
     pub websocket: Option<RawWebSocket>,

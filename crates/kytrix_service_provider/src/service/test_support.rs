@@ -100,7 +100,7 @@ impl TestConfigManager {
             KytrixServiceCapability::FinancialIndices,
             KytrixServiceCapability::XAccountMonitoring,
             KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-            KytrixServiceCapability::Ais,
+            KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
             KytrixServiceCapability::XAccountMonitoringMedia,
             KytrixServiceCapability::Cmc,
             KytrixServiceCapability::FinancialCalendar,
@@ -319,14 +319,15 @@ pub(super) fn x_profile() -> proto_types::XAccountMonitoringProfile {
 }
 
 /// One AIS push as the collector publishes it: one vessel, one position, one departure.
-pub(super) fn ais_delta() -> proto_types::AisDelta {
-    proto_types::AisDelta {
-        area: proto_types::AisArea::Hormuz as i32,
+pub(super) fn strategic_maritime_chokepoints_tracking_delta()
+-> proto_types::StrategicMaritimeChokepointsTrackingDelta {
+    proto_types::StrategicMaritimeChokepointsTrackingDelta {
+        area: proto_types::StrategicMaritimeChokepointsTrackingArea::Hormuz as i32,
         epoch: 5,
         sequence: 7,
         base: 6,
         keyframe: false,
-        statics: vec![proto_types::AisStatic {
+        statics: vec![proto_types::StrategicMaritimeChokepointsTrackingStatic {
             mmsi: 636_000_001,
             imo: 9_000_001,
             call_sign: "C6AB1".to_owned(),
@@ -344,7 +345,7 @@ pub(super) fn ais_delta() -> proto_types::AisDelta {
             eta_hour: 12,
             eta_minute: 30,
         }],
-        positions: vec![proto_types::AisPosition {
+        positions: vec![proto_types::StrategicMaritimeChokepointsTrackingPosition {
             mmsi: 636_000_001,
             latitude: 26_566_000,
             longitude: 56_250_000,
@@ -362,12 +363,13 @@ pub(super) fn ais_delta() -> proto_types::AisDelta {
 /// The keyframe the collector publishes once it has a picture.
 ///
 /// A keyframe is the whole picture and therefore carries no departures.
-pub(super) fn ais_keyframe() -> proto_types::AisDelta {
-    proto_types::AisDelta {
+pub(super) fn strategic_maritime_chokepoints_tracking_keyframe()
+-> proto_types::StrategicMaritimeChokepointsTrackingDelta {
+    proto_types::StrategicMaritimeChokepointsTrackingDelta {
         keyframe: true,
         base: 0,
         removed: Vec::new(),
-        ..ais_delta()
+        ..strategic_maritime_chokepoints_tracking_delta()
     }
 }
 
@@ -609,7 +611,11 @@ impl TestServiceServer {
                                             plan_code: proto_types::PlanCode::Free as i32,
                                             entitlements: HashMap::from([
                                                 ("news".to_owned(), enabled_entitlement(true)),
-                                                ("ais".to_owned(), enabled_entitlement(true)),
+                                                (
+                                                    "strategic_maritime_chokepoints_tracking"
+                                                        .to_owned(),
+                                                    enabled_entitlement(true),
+                                                ),
                                                 (
                                                     "financial_indices".to_owned(),
                                                     limit_entitlement(3),
@@ -625,7 +631,7 @@ impl TestServiceServer {
                                                     proto_types::FeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
-                                                    "ais",
+                                                    "strategic_maritime_chokepoints_tracking",
                                                     proto_types::FeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
@@ -1039,12 +1045,20 @@ impl TestServiceServer {
         );
     }
 
-    pub(super) fn send_ais_delta(&self) {
-        self.send_event(proto_event::event::Event::Ais(ais_delta()));
+    pub(super) fn send_strategic_maritime_chokepoints_tracking_delta(&self) {
+        self.send_event(
+            proto_event::event::Event::StrategicMaritimeChokepointsTracking(
+                strategic_maritime_chokepoints_tracking_delta(),
+            ),
+        );
     }
 
-    pub(super) fn send_ais_keyframe(&self) {
-        self.send_event(proto_event::event::Event::Ais(ais_keyframe()));
+    pub(super) fn send_strategic_maritime_chokepoints_tracking_keyframe(&self) {
+        self.send_event(
+            proto_event::event::Event::StrategicMaritimeChokepointsTracking(
+                strategic_maritime_chokepoints_tracking_keyframe(),
+            ),
+        );
     }
 
     pub(super) fn send_news(&self, content: &str) {

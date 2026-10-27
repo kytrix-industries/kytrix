@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 use ahash::AHashMap;
 use base_ui::style::theme::Theme;
 use gpui_kit::Hsla;
-use kytrix_service_provider::service::ais::{AisPosition, AisStatic, AisUpdate};
+use kytrix_service_provider::service::strategic_maritime_chokepoints_tracking::{
+    StrategicMaritimeChokepointsTrackingPosition, StrategicMaritimeChokepointsTrackingStatic,
+    StrategicMaritimeChokepointsTrackingUpdate,
+};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
@@ -601,8 +604,8 @@ pub(super) struct VesselDetails {
 impl VesselDetails {
     fn new(
         mmsi: u32,
-        statics: Option<&AisStatic>,
-        position: &AisPosition,
+        statics: Option<&StrategicMaritimeChokepointsTrackingStatic>,
+        position: &StrategicMaritimeChokepointsTrackingPosition,
         zone: UtcOffset,
     ) -> Self {
         Self {
@@ -697,8 +700,8 @@ fn format_last_update(last_update: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// one.
 #[derive(Debug)]
 pub(super) struct VesselStore {
-    statics: AHashMap<u32, AisStatic>,
-    positions: AHashMap<u32, AisPosition>,
+    statics: AHashMap<u32, StrategicMaritimeChokepointsTrackingStatic>,
+    positions: AHashMap<u32, StrategicMaritimeChokepointsTrackingPosition>,
     epoch: u64,
     applied: u64,
     gap: bool,
@@ -750,7 +753,7 @@ impl VesselStore {
     /// against [`MAX_VESSELS`]. Deltas are not trimmed: which vessels the picture
     /// holds is the service's decision, and a client that trimmed its own set would
     /// drift from the set the server is tracking.
-    pub fn apply(&mut self, update: &AisUpdate) {
+    pub fn apply(&mut self, update: &StrategicMaritimeChokepointsTrackingUpdate) {
         if update.keyframe {
             assert!(
                 update.positions.len() <= MAX_VESSELS,
@@ -944,8 +947,8 @@ mod tests {
     const AIS_NORTH: f32 = 28.3;
 
     /// One position in the strait, with every value a report can carry.
-    fn position(mmsi: u32) -> AisPosition {
-        AisPosition {
+    fn position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
+        StrategicMaritimeChokepointsTrackingPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -958,8 +961,8 @@ mod tests {
     }
 
     /// One static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> AisStatic {
-        AisStatic {
+    fn statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
+        StrategicMaritimeChokepointsTrackingStatic {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -980,8 +983,8 @@ mod tests {
     }
 
     /// A static part that carries nothing, as a report with every sentinel set.
-    fn empty_statics(mmsi: u32) -> AisStatic {
-        AisStatic {
+    fn empty_statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
+        StrategicMaritimeChokepointsTrackingStatic {
             mmsi,
             imo: 0,
             call_sign: SmolStr::new_static(""),
@@ -1002,8 +1005,8 @@ mod tests {
     }
 
     /// A position that carries nothing, as a report with every sentinel set.
-    fn empty_position(mmsi: u32) -> AisPosition {
-        AisPosition {
+    fn empty_position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
+        StrategicMaritimeChokepointsTrackingPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -1016,8 +1019,12 @@ mod tests {
     }
 
     /// A keyframe of `positions`, stamped with a time the server holds.
-    fn keyframe(epoch: u64, sequence: u64, positions: Vec<AisPosition>) -> AisUpdate {
-        AisUpdate {
+    fn keyframe(
+        epoch: u64,
+        sequence: u64,
+        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
+    ) -> StrategicMaritimeChokepointsTrackingUpdate {
+        StrategicMaritimeChokepointsTrackingUpdate {
             epoch,
             keyframe: true,
             sequence,
@@ -1030,8 +1037,13 @@ mod tests {
     }
 
     /// A delta of `positions`, continuing sequence `base`.
-    fn delta(epoch: u64, base: u64, sequence: u64, positions: Vec<AisPosition>) -> AisUpdate {
-        AisUpdate {
+    fn delta(
+        epoch: u64,
+        base: u64,
+        sequence: u64,
+        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
+    ) -> StrategicMaritimeChokepointsTrackingUpdate {
+        StrategicMaritimeChokepointsTrackingUpdate {
             epoch,
             keyframe: false,
             sequence,
@@ -1842,20 +1854,28 @@ mod tests {
     }
 
     #[test]
-    fn the_ais_area_should_sit_inside_the_map() {
+    fn the_strategic_maritime_chokepoints_tracking_area_should_sit_inside_the_map() {
         // Projected rather than compared as constants: the comparison is then also
         // the check that both rectangles go through the same projection.
-        let [ais_west, ais_south] = project(AIS_WEST, AIS_SOUTH);
-        let [ais_east, ais_north] = project(AIS_EAST, AIS_NORTH);
+        let [
+            strategic_maritime_chokepoints_tracking_west,
+            strategic_maritime_chokepoints_tracking_south,
+        ] = project(AIS_WEST, AIS_SOUTH);
+        let [
+            strategic_maritime_chokepoints_tracking_east,
+            strategic_maritime_chokepoints_tracking_north,
+        ] = project(AIS_EAST, AIS_NORTH);
         let [map_west, map_south] = project(MAP_WEST, MAP_SOUTH);
         let [map_east, map_north] = project(MAP_EAST, MAP_NORTH);
 
         assert!(
-            map_west <= ais_west && ais_east <= map_east,
+            map_west <= strategic_maritime_chokepoints_tracking_west
+                && strategic_maritime_chokepoints_tracking_east <= map_east,
             "the reported area runs past the map east to west",
         );
         assert!(
-            map_south <= ais_south && ais_north <= map_north,
+            map_south <= strategic_maritime_chokepoints_tracking_south
+                && strategic_maritime_chokepoints_tracking_north <= map_north,
             "and north to south",
         );
     }

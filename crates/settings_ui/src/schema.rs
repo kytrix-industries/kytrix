@@ -1374,7 +1374,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::FinancialCalendar,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::Ais,
+        capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
     },
 ];
 
@@ -2089,11 +2089,12 @@ pub(crate) mod tests {
     /// The AIS vessel feed is a Kytrix cloud service, so the cloud line is the one that
     /// configures it: the page offers no separate row for the feed.
     #[test]
-    fn the_ais_feed_should_be_configured_by_the_cloud_line() {
+    fn the_strategic_maritime_chokepoints_tracking_feed_should_be_configured_by_the_cloud_line() {
         let catalog = catalog_of();
         let applications = page(&catalog, "proxy-applications");
         assert!(
-            !field_ids(applications).contains(&"proxy-applications.kytrix.ais"),
+            !field_ids(applications)
+                .contains(&"proxy-applications.kytrix.strategic_maritime_chokepoints_tracking"),
             "the page offers no separate row for the feed"
         );
         let row = field(applications, "proxy-applications.kytrix.cloud");
@@ -2105,7 +2106,7 @@ pub(crate) mod tests {
             crate::access::proxy_route_of(
                 &config,
                 &ServiceTarget::KytrixService {
-                    capability: KytrixServiceCapability::Ais,
+                    capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
                 },
             ),
             "hk",

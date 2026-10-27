@@ -142,7 +142,7 @@ fn all_network_targets(
         KytrixServiceCapability::PentagonPizzaIndex,
         KytrixServiceCapability::UpdaterMetadata,
         KytrixServiceCapability::UpdaterDownload,
-        KytrixServiceCapability::Ais,
+        KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
     ]
     .into_iter()
     .map(|capability| ServiceTarget::KytrixService { capability })
@@ -943,7 +943,7 @@ mod tests {
         );
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::Ais,
+                capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
             }),
             "the AIS capability should be a stamped target"
         );
