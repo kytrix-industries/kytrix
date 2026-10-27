@@ -243,7 +243,9 @@ const HYPE_FUNDS: [&str; 3] = ["BHYP", "THYP", "HYPG"];
 /// It is all or nothing: an answer that cannot be read for one asset is not used
 /// for the other three either, because a snapshot is a single reading of the
 /// market and half of one would be a chart that disagrees with itself.
-pub(crate) fn parse_etf(snapshot: proto_types::Etf) -> Result<EtfSnapshot, EtfParseError> {
+pub(crate) fn parse_etf(
+    snapshot: proto_types::CryptocurrencyEtf,
+) -> Result<EtfSnapshot, EtfParseError> {
     let btc = parse_rows(
         EtfAsset::Btc,
         &BTC_FUNDS,
@@ -456,7 +458,7 @@ fn parse_number(value: &str) -> Option<f64> {
 mod tests {
     use std::collections::HashMap;
 
-    use kytrix_proto::types::etf;
+    use kytrix_proto::types::cryptocurrency_etf;
 
     use super::*;
 
@@ -464,11 +466,11 @@ mod tests {
         Date::from_calendar_date(year, month, day).expect("fixture date should be valid")
     }
 
-    fn valid_snapshot() -> proto_types::Etf {
+    fn valid_snapshot() -> proto_types::CryptocurrencyEtf {
         let mut btc = HashMap::new();
         btc.insert(
             "2024-01-03".into(),
-            etf::Btc {
+            cryptocurrency_etf::Btc {
                 ibit: "(50.0)".into(),
                 fbtc: "-".into(),
                 ..Default::default()
@@ -476,17 +478,17 @@ mod tests {
         );
         btc.insert(
             "2024-01-02".into(),
-            etf::Btc {
+            cryptocurrency_etf::Btc {
                 ibit: "1,200.5".into(),
                 fbtc: "-200.5".into(),
                 ..Default::default()
             },
         );
-        proto_types::Etf {
+        proto_types::CryptocurrencyEtf {
             btc,
-            eth: HashMap::from([("2024-01-04".into(), etf::Eth::default())]),
-            sol: HashMap::from([("2024-01-05".into(), etf::Sol::default())]),
-            hype: HashMap::from([("2024-01-06".into(), etf::Hype::default())]),
+            eth: HashMap::from([("2024-01-04".into(), cryptocurrency_etf::Eth::default())]),
+            sol: HashMap::from([("2024-01-05".into(), cryptocurrency_etf::Sol::default())]),
+            hype: HashMap::from([("2024-01-06".into(), cryptocurrency_etf::Hype::default())]),
             timestamp: 0,
         }
     }
@@ -523,7 +525,7 @@ mod tests {
     #[test]
     fn parse_should_reject_invalid_dates_numbers_and_empty_maps() {
         let mut snapshot = valid_snapshot();
-        snapshot.btc = HashMap::from([("2024-02-30".into(), etf::Btc::default())]);
+        snapshot.btc = HashMap::from([("2024-02-30".into(), cryptocurrency_etf::Btc::default())]);
         assert!(matches!(
             parse_etf(snapshot.clone()),
             Err(EtfParseError::InvalidDate {
@@ -534,7 +536,7 @@ mod tests {
 
         snapshot.btc = HashMap::from([(
             "2024-01-01".into(),
-            etf::Btc {
+            cryptocurrency_etf::Btc {
                 ibit: "NaN".into(),
                 ..Default::default()
             },
@@ -561,7 +563,7 @@ mod tests {
         let mut snapshot = valid_snapshot();
         snapshot.btc = HashMap::from([(
             "2024-01-01".into(),
-            etf::Btc {
+            cryptocurrency_etf::Btc {
                 ibit: "1e308".into(),
                 fbtc: "1e308".into(),
                 ..Default::default()
@@ -578,14 +580,14 @@ mod tests {
         snapshot.btc = HashMap::from([
             (
                 "2024-01-01".into(),
-                etf::Btc {
+                cryptocurrency_etf::Btc {
                     ibit: "1e308".into(),
                     ..Default::default()
                 },
             ),
             (
                 "2024-01-02".into(),
-                etf::Btc {
+                cryptocurrency_etf::Btc {
                     ibit: "1e308".into(),
                     ..Default::default()
                 },

@@ -2425,7 +2425,7 @@ mod tests {
             u32::MAX,
             PendingRpc {
                 expected_profile: AccountProfile::new(TEST_ACCOUNT_ID, 1, 1),
-                capability: KytrixServiceCapability::Etf,
+                capability: KytrixServiceCapability::CryptocurrencyEtf,
                 route_generation: NetworkRouteGeneration::default(),
                 cancellation: CancellationToken::new(),
                 deadline: Instant::now() + Duration::from_secs(1),

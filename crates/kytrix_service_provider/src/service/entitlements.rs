@@ -26,7 +26,7 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::X => Some("x"),
         KytrixServiceCapability::Wallet => Some("wallet"),
         KytrixServiceCapability::Ais => Some("ais"),
-        KytrixServiceCapability::Etf => Some("etf"),
+        KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
         KytrixServiceCapability::Cmc => Some("cmc_fear_greed"),
         KytrixServiceCapability::FinancialCalendar => Some("financial_calendar"),
         KytrixServiceCapability::PentagonPizzaIndex => Some("pentagon_pizza_index"),
@@ -67,7 +67,10 @@ mod tests {
     fn every_outbound_capability_should_map_to_its_feature_or_none() {
         let capabilities = [
             (KytrixServiceCapability::Account, None),
-            (KytrixServiceCapability::Etf, Some("etf")),
+            (
+                KytrixServiceCapability::CryptocurrencyEtf,
+                Some("cryptocurrency_etf"),
+            ),
             (KytrixServiceCapability::News, Some("news")),
             (KytrixServiceCapability::Indices, Some("indices")),
             (KytrixServiceCapability::X, Some("x")),

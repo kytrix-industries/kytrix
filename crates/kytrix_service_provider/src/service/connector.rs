@@ -16,7 +16,7 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetCmcFearGreedIndex, GetEtf, GetFinancialCalendar, GetIndexManifest,
+        GetCmcFearGreedIndex, GetCryptocurrencyEtf, GetFinancialCalendar, GetIndexManifest,
         GetPentagonPizzaIndex, WalletAddSelection, WalletDeleteSelection, WalletSelections,
         XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
         request::Request as ClientRequestKind,
@@ -1078,24 +1078,24 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the current ETF snapshot over WebSocket RPC.
-    pub async fn fetch_etf(&self) -> Result<proto_types::Etf, KytrixServiceError> {
+    /// Fetches the current cryptocurrency ETF snapshot over WebSocket RPC.
+    pub async fn fetch_etf(&self) -> Result<proto_types::CryptocurrencyEtf, KytrixServiceError> {
         let response = self
             .call_rpc(
                 None,
-                KytrixServiceCapability::Etf,
-                ClientRequestKind::GetEtf(GetEtf {}),
+                KytrixServiceCapability::CryptocurrencyEtf,
+                ClientRequestKind::GetCryptocurrencyEtf(GetCryptocurrencyEtf {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::Etf(response) = response else {
+        let proto_response::response::Response::CryptocurrencyEtf(response) = response else {
             return Err(KytrixServiceError::Protocol(
-                "unexpected ETF RPC response".into(),
+                "unexpected cryptocurrency ETF RPC response".into(),
             ));
         };
-        response
-            .etf
-            .ok_or_else(|| KytrixServiceError::Protocol("ETF RPC response is missing data".into()))
+        response.cryptocurrency_etf.ok_or_else(|| {
+            KytrixServiceError::Protocol("cryptocurrency ETF RPC response is missing data".into())
+        })
     }
 
     /// Fetches the current index manifest over WebSocket RPC.
@@ -1211,7 +1211,10 @@ mod tests {
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
 
         assert_eq!(connector.fetch_etf().await.unwrap().timestamp, 42);
-        assert_eq!(server.next_request().await.1, ObservedRequest::Rpc("etf"));
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("cryptocurrency_etf")
+        );
         assert_eq!(
             connector.fetch_index_manifest().await.unwrap(),
             index_manifest()
@@ -1252,8 +1255,10 @@ mod tests {
     #[tokio::test]
     async fn a_pizza_index_answer_of_another_kind_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::Etf(
-            proto_response::EtfResponse { etf: None },
+        server.answer_next_request_with(proto_response::response::Response::CryptocurrencyEtf(
+            proto_response::CryptocurrencyEtfResponse {
+                cryptocurrency_etf: None,
+            },
         ));
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
@@ -1302,8 +1307,10 @@ mod tests {
     #[tokio::test]
     async fn a_fear_and_greed_answer_of_another_kind_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::Etf(
-            proto_response::EtfResponse { etf: None },
+        server.answer_next_request_with(proto_response::response::Response::CryptocurrencyEtf(
+            proto_response::CryptocurrencyEtfResponse {
+                cryptocurrency_etf: None,
+            },
         ));
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());

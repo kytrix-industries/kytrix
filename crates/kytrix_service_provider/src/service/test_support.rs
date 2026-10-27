@@ -95,7 +95,7 @@ impl TestConfigManager {
 
         let mut targets = [
             KytrixServiceCapability::Account,
-            KytrixServiceCapability::Etf,
+            KytrixServiceCapability::CryptocurrencyEtf,
             KytrixServiceCapability::News,
             KytrixServiceCapability::Indices,
             KytrixServiceCapability::X,
@@ -715,14 +715,16 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetEtf(_) => (
-                                            ObservedRequest::Rpc("etf"),
-                                            proto_response::response::Response::Etf(
-                                                proto_response::EtfResponse {
-                                                    etf: Some(proto_types::Etf {
-                                                        timestamp: 42,
-                                                        ..proto_types::Etf::default()
-                                                    }),
+                                        ClientRequestKind::GetCryptocurrencyEtf(_) => (
+                                            ObservedRequest::Rpc("cryptocurrency_etf"),
+                                            proto_response::response::Response::CryptocurrencyEtf(
+                                                proto_response::CryptocurrencyEtfResponse {
+                                                    cryptocurrency_etf: Some(
+                                                        proto_types::CryptocurrencyEtf {
+                                                            timestamp: 42,
+                                                            ..proto_types::CryptocurrencyEtf::default()
+                                                        },
+                                                    ),
                                                 },
                                             ),
                                             false,

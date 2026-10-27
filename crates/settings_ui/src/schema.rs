@@ -1351,7 +1351,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::Wallet,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::Etf,
+        capability: KytrixServiceCapability::CryptocurrencyEtf,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::News,

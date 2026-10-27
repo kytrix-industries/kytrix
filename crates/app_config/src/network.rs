@@ -23,8 +23,8 @@ use url::{Host, Url};
 pub enum KytrixServiceCapability {
     #[serde(rename = "account")]
     Account,
-    #[serde(rename = "etf")]
-    Etf,
+    #[serde(rename = "cryptocurrency_etf")]
+    CryptocurrencyEtf,
     #[serde(rename = "news")]
     News,
     #[serde(rename = "indices")]

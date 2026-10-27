@@ -131,7 +131,7 @@ fn all_network_targets(
 ) -> BTreeSet<ServiceTarget> {
     let mut targets = [
         KytrixServiceCapability::Account,
-        KytrixServiceCapability::Etf,
+        KytrixServiceCapability::CryptocurrencyEtf,
         KytrixServiceCapability::News,
         KytrixServiceCapability::Indices,
         KytrixServiceCapability::X,
