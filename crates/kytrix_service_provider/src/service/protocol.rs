@@ -25,8 +25,9 @@ use crate::service::{
         CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexEvent,
         FinancialIndexTopic, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage,
         KytrixServiceError, KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind,
-        ServiceTopic, TweetEvent, TweetMedia, TweetReference, TweetTextSegment, WRITE_TIMEOUT,
-        XProfileEvent,
+        ServiceTopic, TweetReference, WRITE_TIMEOUT, XAccountMonitoringProfileEvent,
+        XAccountMonitoringTweetEvent, XAccountMonitoringTweetMedia,
+        XAccountMonitoringTweetTextSegment,
     },
 };
 
@@ -133,13 +134,13 @@ pub(super) fn decode_event(
                 }),
             )))
         }
-        proto_event::event::Event::XProfile(profile) => Ok(Some((
-            ServiceTopic::X,
-            KytrixServiceEvent::XProfile(decode_x_profile(profile)?),
+        proto_event::event::Event::XAccountMonitoringProfile(profile) => Ok(Some((
+            ServiceTopic::XAccountMonitoring,
+            KytrixServiceEvent::XAccountMonitoringProfile(decode_x_profile(profile)?),
         ))),
-        proto_event::event::Event::Tweet(tweet) => Ok(Some((
-            ServiceTopic::X,
-            KytrixServiceEvent::Tweet(decode_tweet(tweet)?),
+        proto_event::event::Event::XAccountMonitoringTweet(tweet) => Ok(Some((
+            ServiceTopic::XAccountMonitoring,
+            KytrixServiceEvent::XAccountMonitoringTweet(decode_tweet(tweet)?),
         ))),
         proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(transfer) => Ok(Some((
             ServiceTopic::CryptocurrencyWalletMonitoring,
@@ -198,15 +199,17 @@ pub(super) fn decode_cryptocurrency_wallet_monitoring_transfer(
     })
 }
 
-pub(super) fn decode_tweet(tweet: proto_types::Tweet) -> Result<TweetEvent, KytrixServiceError> {
+pub(super) fn decode_tweet(
+    tweet: proto_types::XAccountMonitoringTweet,
+) -> Result<XAccountMonitoringTweetEvent, KytrixServiceError> {
     decode_tweet_at_depth(tweet, 0)
 }
 
 pub(super) fn decode_tweet_at_depth(
-    tweet: proto_types::Tweet,
+    tweet: proto_types::XAccountMonitoringTweet,
     depth: usize,
-) -> Result<TweetEvent, KytrixServiceError> {
-    let proto_types::Tweet {
+) -> Result<XAccountMonitoringTweetEvent, KytrixServiceError> {
+    let proto_types::XAccountMonitoringTweet {
         tweet_id,
         timestamp,
         text_segments,
@@ -244,7 +247,7 @@ pub(super) fn decode_tweet_at_depth(
             text_code_points = text_code_points
                 .checked_add(segment.text.chars().count())
                 .ok_or_else(|| KytrixServiceError::Protocol("Tweet text size overflowed".into()))?;
-            Ok(TweetTextSegment {
+            Ok(XAccountMonitoringTweetTextSegment {
                 text: segment.text.into(),
                 url: segment.url.map(Into::into),
             })
@@ -274,17 +277,19 @@ pub(super) fn decode_tweet_at_depth(
         .collect::<Result<Vec<_>, _>>()?;
     let reference = reference
         .map(|reference| match reference {
-            proto_types::tweet::Reference::Repost(tweet) => {
+            proto_types::x_account_monitoring_tweet::Reference::Repost(tweet) => {
                 decode_tweet_at_depth(*tweet, depth + 1)
                     .map(Box::new)
                     .map(TweetReference::Repost)
             }
-            proto_types::tweet::Reference::Quote(tweet) => decode_tweet_at_depth(*tweet, depth + 1)
-                .map(Box::new)
-                .map(TweetReference::Quote),
+            proto_types::x_account_monitoring_tweet::Reference::Quote(tweet) => {
+                decode_tweet_at_depth(*tweet, depth + 1)
+                    .map(Box::new)
+                    .map(TweetReference::Quote)
+            }
         })
         .transpose()?;
-    Ok(TweetEvent {
+    Ok(XAccountMonitoringTweetEvent {
         tweet_id: tweet_id.into(),
         timestamp,
         x_user_id: x_user_id.into(),
@@ -295,16 +300,16 @@ pub(super) fn decode_tweet_at_depth(
 }
 
 pub(super) fn decode_tweet_media(
-    media: proto_types::TweetMedia,
-) -> Result<TweetMedia, KytrixServiceError> {
-    use proto_types::tweet_media::Content;
+    media: proto_types::XAccountMonitoringTweetMedia,
+) -> Result<XAccountMonitoringTweetMedia, KytrixServiceError> {
+    use proto_types::x_account_monitoring_tweet_media::Content;
 
     let media = match media.content {
         Some(Content::Image(image))
             if valid_https_url(&image.image_url)
                 && valid_media_dimensions(image.width, image.height) =>
         {
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url: image.image_url.into(),
                 width: image.width,
                 height: image.height,
@@ -315,7 +320,7 @@ pub(super) fn decode_tweet_media(
                 && valid_https_url(&video.thumbnail_url)
                 && valid_media_dimensions(video.width, video.height) =>
         {
-            TweetMedia::Video {
+            XAccountMonitoringTweetMedia::Video {
                 playback_url: video.playback_url.into(),
                 thumbnail_url: video.thumbnail_url.into(),
                 width: video.width,
@@ -327,7 +332,7 @@ pub(super) fn decode_tweet_media(
                 && valid_https_url(&gif.image_url)
                 && valid_media_dimensions(gif.width, gif.height) =>
         {
-            TweetMedia::Gif {
+            XAccountMonitoringTweetMedia::Gif {
                 animation_url: gif.animation_url.into(),
                 image_url: gif.image_url.into(),
                 width: gif.width,
@@ -373,8 +378,8 @@ const fn valid_media_dimensions(width: u32, height: u32) -> bool {
 }
 
 pub(super) fn decode_x_profile(
-    profile: proto_types::XProfile,
-) -> Result<XProfileEvent, KytrixServiceError> {
+    profile: proto_types::XAccountMonitoringProfile,
+) -> Result<XAccountMonitoringProfileEvent, KytrixServiceError> {
     if !valid_x_id(&profile.x_user_id)
         || !valid_x_username(&profile.username)
         || profile.display_name.is_empty()
@@ -386,7 +391,7 @@ pub(super) fn decode_x_profile(
             "X profile contained invalid fields".into(),
         ));
     }
-    Ok(XProfileEvent {
+    Ok(XAccountMonitoringProfileEvent {
         x_user_id: profile.x_user_id.into(),
         username: profile.username.into(),
         display_name: profile.display_name.into(),
@@ -551,7 +556,9 @@ impl From<&ServiceTopic> for proto_topic::Topic {
                     code: topic.code().into(),
                 })
             }
-            ServiceTopic::X => proto_topic::topic::Topic::X(proto_topic::TopicX {}),
+            ServiceTopic::XAccountMonitoring => proto_topic::topic::Topic::XAccountMonitoring(
+                proto_topic::XAccountMonitoringTopic {},
+            ),
             ServiceTopic::CryptocurrencyWalletMonitoring => {
                 proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(
                     proto_topic::CryptocurrencyWalletMonitoringTopic {},
@@ -579,7 +586,9 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
                     .map(ServiceTopic::FinancialIndex)
                     .ok_or_else(|| "index topic is invalid".into())
             }
-            proto_topic::topic::Topic::X(_) => Ok(ServiceTopic::X),
+            proto_topic::topic::Topic::XAccountMonitoring(_) => {
+                Ok(ServiceTopic::XAccountMonitoring)
+            }
             proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
                 Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
             }
@@ -668,8 +677,10 @@ mod tests {
 
     #[test]
     fn literal_x_event_wire_should_preserve_schema_tags() {
-        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::XProfile(profile)))) =
-            decode_binary(X_PROFILE_EVENT_WIRE).expect("literal X profile event should decode")
+        let IncomingMessage::Event(Some((
+            ServiceTopic::XAccountMonitoring,
+            KytrixServiceEvent::XAccountMonitoringProfile(profile),
+        ))) = decode_binary(X_PROFILE_EVENT_WIRE).expect("literal X profile event should decode")
         else {
             panic!("literal frame should contain an X profile event");
         };
@@ -712,7 +723,7 @@ mod tests {
         for topic in [
             ServiceTopic::News,
             index_service_topic("REMOTE_ONLY_INDEX"),
-            ServiceTopic::X,
+            ServiceTopic::XAccountMonitoring,
             ServiceTopic::CryptocurrencyWalletMonitoring,
             ServiceTopic::Ais(AisArea::Hormuz),
         ] {
@@ -829,20 +840,24 @@ mod tests {
     fn tweet_event_should_decode_milliseconds_and_one_repost() {
         let mut root = tweet("100", 1_700_000_000);
         let mut nested = tweet("99", 1_699_999_999);
-        nested.text_segments = vec![proto_types::TweetTextSegment {
+        nested.text_segments = vec![proto_types::XAccountMonitoringTweetTextSegment {
             text: "example.test/nested".to_owned(),
             url: Some("https://t.co/nested".to_owned()),
         }];
-        root.reference = Some(proto_types::tweet::Reference::Repost(Box::new(nested)));
+        root.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Repost(
+            Box::new(nested),
+        ));
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::Tweet(root)),
+                event: Some(proto_event::event::Event::XAccountMonitoringTweet(root)),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).expect("Tweet should decode");
-        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::Tweet(tweet)))) =
-            decoded
+        let IncomingMessage::Event(Some((
+            ServiceTopic::XAccountMonitoring,
+            KytrixServiceEvent::XAccountMonitoringTweet(tweet),
+        ))) = decoded
         else {
             panic!("expected a Tweet event");
         };
@@ -851,7 +866,7 @@ mod tests {
         assert_eq!(tweet.x_user_id, "42");
         assert_eq!(
             tweet.text_segments,
-            [TweetTextSegment {
+            [XAccountMonitoringTweetTextSegment {
                 text: "hello".into(),
                 url: None,
             }]
@@ -864,7 +879,7 @@ mod tests {
         assert_eq!(repost.timestamp, 1_699_999_999_000);
         assert_eq!(
             repost.text_segments,
-            [TweetTextSegment {
+            [XAccountMonitoringTweetTextSegment {
                 text: "example.test/nested".into(),
                 url: Some("https://t.co/nested".into()),
             }]
@@ -875,13 +890,17 @@ mod tests {
     fn x_profile_event_should_decode_verified_state() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::XProfile(x_profile())),
+                event: Some(proto_event::event::Event::XAccountMonitoringProfile(
+                    x_profile(),
+                )),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
-        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::XProfile(profile)))) =
-            decoded
+        let IncomingMessage::Event(Some((
+            ServiceTopic::XAccountMonitoring,
+            KytrixServiceEvent::XAccountMonitoringProfile(profile),
+        ))) = decoded
         else {
             panic!("expected an X profile event");
         };
@@ -1036,22 +1055,26 @@ mod tests {
         missing_author_id.x_user_id.clear();
         let mut two_references = tweet("1", 1);
         let mut nested = tweet("2", 1);
-        nested.reference = Some(proto_types::tweet::Reference::Quote(Box::new(tweet(
-            "3", 1,
-        ))));
-        two_references.reference = Some(proto_types::tweet::Reference::Repost(Box::new(nested)));
+        nested.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Quote(
+            Box::new(tweet("3", 1)),
+        ));
+        two_references.reference = Some(
+            proto_types::x_account_monitoring_tweet::Reference::Repost(Box::new(nested)),
+        );
         assert!(decode_tweet(two_references.clone()).is_ok());
-        let proto_types::tweet::Reference::Repost(nested) =
+        let proto_types::x_account_monitoring_tweet::Reference::Repost(nested) =
             two_references.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        let proto_types::tweet::Reference::Quote(leaf) = nested.reference.as_mut().unwrap() else {
+        let proto_types::x_account_monitoring_tweet::Reference::Quote(leaf) =
+            nested.reference.as_mut().unwrap()
+        else {
             unreachable!()
         };
-        leaf.reference = Some(proto_types::tweet::Reference::Quote(Box::new(tweet(
-            "4", 1,
-        ))));
+        leaf.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Quote(
+            Box::new(tweet("4", 1)),
+        ));
         invalid_id.timestamp = 1;
         invalid_timestamp.tweet_id = "1".to_owned();
 

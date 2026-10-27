@@ -18,8 +18,10 @@ use kytrix_proto::{
     client::{
         CryptocurrencyWalletMonitoringAddSelection, CryptocurrencyWalletMonitoringDeleteSelection,
         CryptocurrencyWalletMonitoringSelections, GetCmcFearGreedIndex, GetCryptocurrencyEtf,
-        GetFinancialCalendar, GetFinancialIndexManifest, GetPentagonPizzaIndex, XAddSelection,
-        XDeleteSelection, XSearch, XSelections, XTweets, request::Request as ClientRequestKind,
+        GetFinancialCalendar, GetFinancialIndexManifest, GetPentagonPizzaIndex,
+        XAccountMonitoringAddSelection, XAccountMonitoringDeleteSelection,
+        XAccountMonitoringSearch, XAccountMonitoringSelections, XAccountMonitoringTweets,
+        request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
     types as proto_types,
@@ -52,14 +54,15 @@ use super::{
     handoff::request_dashboard_handoff,
     supervisor::run_service_supervisor,
     x::{
-        self, TweetsResponse, XApiError, XMutationOutcome, XMutationUnknown, XProfile, XSelection,
-        XSelectionsResponse,
+        self, TweetsResponse, XAccountMonitoringApiError, XAccountMonitoringMutationOutcome,
+        XAccountMonitoringMutationUnknown, XAccountMonitoringProfile, XAccountMonitoringSelection,
+        XAccountMonitoringSelectionsResponse,
     },
 };
 #[cfg(test)]
 use crate::auth::test_support::test_transport;
 #[cfg(test)]
-use crate::service::engine::{ErrorCode, PendingRpc, XProfileEvent};
+use crate::service::engine::{ErrorCode, PendingRpc, XAccountMonitoringProfileEvent};
 use crate::{
     account_profile::AccountProfile,
     auth::{
@@ -75,8 +78,8 @@ use crate::{
             KytrixServiceConnectorInner, KytrixServiceError, KytrixSessionState, NewsEvent,
             OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT, SUBSCRIBER_CAPACITY,
             ServiceSessionContext, ServiceTopic, SessionStateRegistry, SubscriberSink,
-            SupervisorCommand, TweetBatch, XSubscriptionEvent, authorization_url,
-            await_account_operation, kytrix_service_endpoint, normalize_topics,
+            SupervisorCommand, XAccountMonitoringSubscriptionEvent, XAccountMonitoringTweetBatch,
+            authorization_url, await_account_operation, kytrix_service_endpoint, normalize_topics,
             service_account_profile, service_authorization_headers_with_profile,
             subscription_setup_error,
         },
@@ -148,7 +151,7 @@ impl KytrixAccountSession {
 
     pub async fn subscribe_x(
         &self,
-    ) -> Result<Subscription<XSubscriptionEvent>, KytrixServiceError> {
+    ) -> Result<Subscription<XAccountMonitoringSubscriptionEvent>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -157,8 +160,8 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::X],
-                SubscriberSink::X(publisher),
+                &[ServiceTopic::XAccountMonitoring],
+                SubscriberSink::XAccountMonitoring(publisher),
             )
             .await?;
         Ok(subscription)
@@ -289,21 +292,25 @@ impl KytrixAccountSession {
         }
     }
 
-    pub async fn search_x_users(&self, query: &str) -> Result<Vec<XProfile>, XApiError> {
-        let query = x::normalize_search_query(query).ok_or(XApiError::InvalidSearchQuery)?;
+    pub async fn search_x_users(
+        &self,
+        query: &str,
+    ) -> Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError> {
+        let query = x::normalize_search_query(query)
+            .ok_or(XAccountMonitoringApiError::InvalidSearchQuery)?;
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::X,
-                ClientRequestKind::XSearch(XSearch {
+                KytrixServiceCapability::XAccountMonitoring,
+                ClientRequestKind::XAccountMonitoringSearch(XAccountMonitoringSearch {
                     query: query.to_owned(),
                 }),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XSearch(response) = response else {
-            return Err(XApiError::Protocol(
+        let ServerResponseKind::XAccountMonitoringSearch(response) = response else {
+            return Err(XAccountMonitoringApiError::Protocol(
                 "unexpected X search RPC response".into(),
             ));
         };
@@ -316,18 +323,20 @@ impl KytrixAccountSession {
         Ok(profiles)
     }
 
-    pub async fn fetch_x_selections(&self) -> Result<XSelectionsResponse, XApiError> {
+    pub async fn fetch_x_selections(
+        &self,
+    ) -> Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError> {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::X,
-                ClientRequestKind::XSelections(XSelections {}),
+                KytrixServiceCapability::XAccountMonitoring,
+                ClientRequestKind::XAccountMonitoringSelections(XAccountMonitoringSelections {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XSelections(response) = response else {
-            return Err(XApiError::Protocol(
+        let ServerResponseKind::XAccountMonitoringSelections(response) = response else {
+            return Err(XAccountMonitoringApiError::Protocol(
                 "unexpected X selections RPC response".into(),
             ));
         };
@@ -336,7 +345,7 @@ impl KytrixAccountSession {
             .into_iter()
             .map(x::decode_x_selection)
             .collect::<Result<Vec<_>, _>>()?;
-        let value = XSelectionsResponse {
+        let value = XAccountMonitoringSelectionsResponse {
             selections,
             x_account_limit: response.x_account_limit as usize,
         };
@@ -344,40 +353,47 @@ impl KytrixAccountSession {
         Ok(value)
     }
 
-    pub async fn fetch_x_tweets(&self) -> Result<TweetBatch, XApiError> {
+    pub async fn fetch_x_tweets(
+        &self,
+    ) -> Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError> {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::X,
-                ClientRequestKind::XTweets(XTweets {}),
+                KytrixServiceCapability::XAccountMonitoring,
+                ClientRequestKind::XAccountMonitoringTweets(XAccountMonitoringTweets {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XTweets(response) = response else {
-            return Err(XApiError::Protocol(
+        let ServerResponseKind::XAccountMonitoringTweets(response) = response else {
+            return Err(XAccountMonitoringApiError::Protocol(
                 "unexpected X tweets RPC response".into(),
             ));
         };
-        let batch = response
-            .batch
-            .ok_or_else(|| XApiError::Protocol("X tweets RPC response is missing data".into()))?;
+        let batch = response.batch.ok_or_else(|| {
+            XAccountMonitoringApiError::Protocol("X tweets RPC response is missing data".into())
+        })?;
         x::decode_tweets_response(TweetsResponse {
             tweets: batch.tweets,
             profiles: batch.profiles,
         })
     }
 
-    pub async fn add_x_selection(&self, username: &str) -> XMutationOutcome<XSelection> {
+    pub async fn add_x_selection(
+        &self,
+        username: &str,
+    ) -> XAccountMonitoringMutationOutcome<XAccountMonitoringSelection> {
         if !valid_x_username(username) {
-            return XMutationOutcome::Rejected(XApiError::InvalidUsername);
+            return XAccountMonitoringMutationOutcome::Rejected(
+                XAccountMonitoringApiError::InvalidUsername,
+            );
         }
         let response = match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::X,
-                ClientRequestKind::XAddSelection(XAddSelection {
+                KytrixServiceCapability::XAccountMonitoring,
+                ClientRequestKind::XAccountMonitoringAddSelection(XAccountMonitoringAddSelection {
                     username: username.to_owned(),
                 }),
             )
@@ -389,11 +405,15 @@ impl KytrixAccountSession {
                 return x::mutation_rpc_error(error, possibly_submitted);
             }
         };
-        let ServerResponseKind::XAddSelection(response) = response else {
-            return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
+        let ServerResponseKind::XAccountMonitoringAddSelection(response) = response else {
+            return XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::InvalidResponse,
+            );
         };
         let Some(selection) = response.selection else {
-            return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
+            return XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::InvalidResponse,
+            );
         };
         match x::decode_x_selection(selection) {
             // A profile is what the service sends once the account is active, so an answer
@@ -405,29 +425,42 @@ impl KytrixAccountSession {
                     .as_ref()
                     .is_none_or(|profile| profile.username.eq_ignore_ascii_case(username)) =>
             {
-                XMutationOutcome::Confirmed(selection)
+                XAccountMonitoringMutationOutcome::Confirmed(selection)
             }
-            Ok(_) | Err(_) => XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse),
+            Ok(_) | Err(_) => XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::InvalidResponse,
+            ),
         }
     }
 
-    pub async fn delete_x_selection(&self, x_user_id: &str) -> XMutationOutcome<()> {
+    pub async fn delete_x_selection(
+        &self,
+        x_user_id: &str,
+    ) -> XAccountMonitoringMutationOutcome<()> {
         if !valid_x_id(x_user_id) {
-            return XMutationOutcome::Rejected(XApiError::Protocol("X user ID is invalid".into()));
+            return XAccountMonitoringMutationOutcome::Rejected(
+                XAccountMonitoringApiError::Protocol("X user ID is invalid".into()),
+            );
         }
         match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::X,
-                ClientRequestKind::XDeleteSelection(XDeleteSelection {
-                    x_user_id: x_user_id.to_owned(),
-                }),
+                KytrixServiceCapability::XAccountMonitoring,
+                ClientRequestKind::XAccountMonitoringDeleteSelection(
+                    XAccountMonitoringDeleteSelection {
+                        x_user_id: x_user_id.to_owned(),
+                    },
+                ),
             )
             .await
         {
-            Ok(ServerResponseKind::XDeleteSelection(_)) => XMutationOutcome::Confirmed(()),
-            Ok(_) => XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse),
+            Ok(ServerResponseKind::XAccountMonitoringDeleteSelection(_)) => {
+                XAccountMonitoringMutationOutcome::Confirmed(())
+            }
+            Ok(_) => XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::InvalidResponse,
+            ),
             Err(error) => {
                 let (error, possibly_submitted) = error.into_parts();
                 x::mutation_rpc_error(error, possibly_submitted)
@@ -1238,7 +1271,7 @@ mod tests {
             CryptocurrencyWalletMonitoringMutationOutcome,
             CryptocurrencyWalletMonitoringMutationUnknown,
         },
-        x::XSelectionStatus,
+        x::XAccountMonitoringSelectionStatus,
     };
 
     #[tokio::test]
@@ -1465,10 +1498,12 @@ mod tests {
             .await
             .unwrap();
 
-        let XMutationOutcome::Confirmed(selection) = session.add_x_selection("kytrix").await else {
+        let XAccountMonitoringMutationOutcome::Confirmed(selection) =
+            session.add_x_selection("kytrix").await
+        else {
             panic!("an add the service confirmed should be confirmed");
         };
-        assert_eq!(selection.status, XSelectionStatus::Pending);
+        assert_eq!(selection.status, XAccountMonitoringSelectionStatus::Pending);
         assert_eq!(selection.profile, None);
         assert_eq!(
             server.next_request().await.1,
@@ -1704,7 +1739,7 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(index.clone()),
-                    ServiceTopic::X,
+                    ServiceTopic::XAccountMonitoring,
                 ])
             )
         );
@@ -1719,7 +1754,7 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(index),
-                    ServiceTopic::X,
+                    ServiceTopic::XAccountMonitoring,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
                 ])
             )
@@ -1735,7 +1770,7 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
-                    ServiceTopic::X,
+                    ServiceTopic::XAccountMonitoring,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
                     ServiceTopic::Ais(AisArea::Hormuz),
                 ])
@@ -1773,7 +1808,7 @@ mod tests {
             .expect("X subscription should remain active");
         assert!(matches!(
             x_event,
-            XSubscriptionEvent::Profile(XProfileEvent { username, .. }) if username == "kytrix"
+            XAccountMonitoringSubscriptionEvent::Profile(XAccountMonitoringProfileEvent { username, .. }) if username == "kytrix"
         ));
         assert_eq!(
             timeout(

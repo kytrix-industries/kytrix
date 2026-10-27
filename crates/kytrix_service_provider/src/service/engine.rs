@@ -258,7 +258,7 @@ impl fmt::Display for FinancialIndexTopic {
 pub enum ServiceTopic {
     News,
     FinancialIndex(FinancialIndexTopic),
-    X,
+    XAccountMonitoring,
     CryptocurrencyWalletMonitoring,
     Ais(AisArea),
 }
@@ -287,7 +287,7 @@ pub struct FinancialIndexEvent {
 
 /// A validated X profile received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XProfileEvent {
+pub struct XAccountMonitoringProfileEvent {
     pub x_user_id: SmolStr,
     pub username: SmolStr,
     pub display_name: SmolStr,
@@ -296,16 +296,16 @@ pub struct XProfileEvent {
     pub revision: u64,
 }
 
-/// A validated Tweet reference received from the service.
+/// A validated XAccountMonitoringTweet reference received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TweetReference {
-    Repost(Box<TweetEvent>),
-    Quote(Box<TweetEvent>),
+    Repost(Box<XAccountMonitoringTweetEvent>),
+    Quote(Box<XAccountMonitoringTweetEvent>),
 }
 
-/// Validated media attached to a Tweet.
+/// Validated media attached to a XAccountMonitoringTweet.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TweetMedia {
+pub enum XAccountMonitoringTweetMedia {
     Image {
         image_url: SmolStr,
         width: u32,
@@ -325,29 +325,29 @@ pub enum TweetMedia {
     },
 }
 
-/// A validated text segment in a Tweet received from the service.
+/// A validated text segment in a XAccountMonitoringTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TweetTextSegment {
+pub struct XAccountMonitoringTweetTextSegment {
     pub text: SmolStr,
     pub url: Option<SmolStr>,
 }
 
-/// A validated Tweet received from the service.
+/// A validated XAccountMonitoringTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TweetEvent {
+pub struct XAccountMonitoringTweetEvent {
     pub tweet_id: SmolStr,
     pub timestamp: i64,
     pub x_user_id: SmolStr,
-    pub text_segments: Vec<TweetTextSegment>,
+    pub text_segments: Vec<XAccountMonitoringTweetTextSegment>,
     pub reference: Option<TweetReference>,
-    pub media: Vec<TweetMedia>,
+    pub media: Vec<XAccountMonitoringTweetMedia>,
 }
 
 /// A validated X timeline snapshot received over HTTP.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TweetBatch {
-    pub tweets: Vec<TweetEvent>,
-    pub profiles: Vec<XProfileEvent>,
+pub struct XAccountMonitoringTweetBatch {
+    pub tweets: Vec<XAccountMonitoringTweetEvent>,
+    pub profiles: Vec<XAccountMonitoringProfileEvent>,
 }
 
 /// A validated cryptocurrency_wallet_monitoring transfer received from the service.
@@ -365,8 +365,8 @@ pub struct CryptocurrencyWalletMonitoringTransfer {
 pub(super) enum KytrixServiceEvent {
     News(NewsEvent),
     FinancialIndex(FinancialIndexEvent),
-    XProfile(XProfileEvent),
-    Tweet(TweetEvent),
+    XAccountMonitoringProfile(XAccountMonitoringProfileEvent),
+    XAccountMonitoringTweet(XAccountMonitoringTweetEvent),
     CryptocurrencyWalletMonitoringTransfer(CryptocurrencyWalletMonitoringTransfer),
     Ais(AisUpdate),
     SessionState(KytrixSessionState),
@@ -375,7 +375,7 @@ pub(super) enum KytrixServiceEvent {
 pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
     FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
-    X(SubscriptionPublisher<XSubscriptionEvent>),
+    XAccountMonitoring(SubscriptionPublisher<XAccountMonitoringSubscriptionEvent>),
     CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitoringTransfer>),
     Ais(SubscriptionPublisher<AisUpdate>),
 }
@@ -385,7 +385,7 @@ impl SubscriberSink {
         match self {
             Self::News(_) => KytrixServiceCapability::News,
             Self::FinancialIndices(_) => KytrixServiceCapability::FinancialIndices,
-            Self::X(_) => KytrixServiceCapability::X,
+            Self::XAccountMonitoring(_) => KytrixServiceCapability::XAccountMonitoring,
             Self::CryptocurrencyWalletMonitoring(_) => {
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring
             }
@@ -397,7 +397,7 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.activate(),
             Self::FinancialIndices(publisher) => publisher.activate(),
-            Self::X(publisher) => publisher.activate(),
+            Self::XAccountMonitoring(publisher) => publisher.activate(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
             Self::Ais(publisher) => publisher.activate(),
         }
@@ -407,7 +407,7 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.reconnecting(),
             Self::FinancialIndices(publisher) => publisher.reconnecting(),
-            Self::X(publisher) => publisher.reconnecting(),
+            Self::XAccountMonitoring(publisher) => publisher.reconnecting(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
             Self::Ais(publisher) => publisher.reconnecting(),
         }
@@ -417,7 +417,7 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.fail(error),
             Self::FinancialIndices(publisher) => publisher.fail(error),
-            Self::X(publisher) => publisher.fail(error),
+            Self::XAccountMonitoring(publisher) => publisher.fail(error),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
             Self::Ais(publisher) => publisher.fail(error),
         }
@@ -427,7 +427,7 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.finish(),
             Self::FinancialIndices(publisher) => publisher.finish(),
-            Self::X(publisher) => publisher.finish(),
+            Self::XAccountMonitoring(publisher) => publisher.finish(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
             Self::Ais(publisher) => publisher.finish(),
         }
@@ -437,7 +437,7 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.is_cancelled(),
             Self::FinancialIndices(publisher) => publisher.is_cancelled(),
-            Self::X(publisher) => publisher.is_cancelled(),
+            Self::XAccountMonitoring(publisher) => publisher.is_cancelled(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
             Self::Ais(publisher) => publisher.is_cancelled(),
         }
@@ -453,11 +453,21 @@ impl SubscriberSink {
                     .try_send(event.clone())
                     .map_err(subscription_send_error)
             }
-            (Self::X(publisher), KytrixServiceEvent::XProfile(profile)) => publisher
-                .try_send(XSubscriptionEvent::Profile(profile.clone()))
+            (
+                Self::XAccountMonitoring(publisher),
+                KytrixServiceEvent::XAccountMonitoringProfile(profile),
+            ) => publisher
+                .try_send(XAccountMonitoringSubscriptionEvent::Profile(
+                    profile.clone(),
+                ))
                 .map_err(subscription_send_error),
-            (Self::X(publisher), KytrixServiceEvent::Tweet(tweet)) => publisher
-                .try_send(XSubscriptionEvent::Tweet(tweet.clone()))
+            (
+                Self::XAccountMonitoring(publisher),
+                KytrixServiceEvent::XAccountMonitoringTweet(tweet),
+            ) => publisher
+                .try_send(
+                    XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet.clone()),
+                )
                 .map_err(subscription_send_error),
             (
                 Self::CryptocurrencyWalletMonitoring(publisher),
@@ -653,9 +663,9 @@ pub(super) struct KytrixServiceConnectorInner {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum XSubscriptionEvent {
-    Profile(XProfileEvent),
-    Tweet(TweetEvent),
+pub enum XAccountMonitoringSubscriptionEvent {
+    Profile(XAccountMonitoringProfileEvent),
+    XAccountMonitoringTweet(XAccountMonitoringTweetEvent),
 }
 
 pub(super) enum SupervisorCommand {

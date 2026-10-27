@@ -33,10 +33,10 @@ members = [
     "crates/widgets/order_book",
     "crates/widgets/perpetual_statistics",
     "crates/widgets/pentagon_pizza_index",
-    "crates/widgets/tweet_monitor",
     "crates/widgets/volume_heatmap",
     "crates/widgets/cryptocurrency_wallet_monitoring",
     "crates/widgets/watch_list",
+    "crates/widgets/x_account_monitoring",
     "xtask",
 ]
 default-members = ["crates/kytrix"]
@@ -84,7 +84,7 @@ image = { version = "0.25.10", default-features = false, features = [
 jiff = "0.2.38"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
-kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "c6cdf5f4454d5871b56675387ad8b7adadea3ee0" }
+kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "5ffe659c426a3f26b39ef8a10c1b62260c33eab5" }
 log = "0.4.34"
 longbridge-proto = "5.2.0"
 nucleo = "0.5.0"
@@ -147,11 +147,11 @@ perpetual_statistics = { path = "crates/widgets/perpetual_statistics" }
 pentagon_pizza_index = { path = "crates/widgets/pentagon_pizza_index" }
 profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
-tweet_monitor = { path = "crates/widgets/tweet_monitor" }
 updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
 cryptocurrency_wallet_monitoring = { path = "crates/widgets/cryptocurrency_wallet_monitoring" }
 watch_list = { path = "crates/widgets/watch_list" }
+x_account_monitoring = { path = "crates/widgets/x_account_monitoring" }
 widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }
 widget = { path = "crates/widget" }
 widget_gallery_ui = { path = "crates/widget_gallery_ui" }

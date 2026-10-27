@@ -1,6 +1,7 @@
 use ahash::AHashSet;
 use kytrix_proto::types::{
-    Tweet, XProfile as ProtoXProfile, XSelectionStatus as ProtoSelectionStatus,
+    XAccountMonitoringProfile as ProtoXProfile,
+    XAccountMonitoringSelectionStatus as ProtoSelectionStatus, XAccountMonitoringTweet,
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -8,7 +9,10 @@ use smol_str::SmolStr;
 use thiserror::Error;
 
 use crate::service::{
-    engine::{ErrorCode, KytrixServiceError, TweetBatch, TweetEvent, TweetReference},
+    engine::{
+        ErrorCode, KytrixServiceError, TweetReference, XAccountMonitoringTweetBatch,
+        XAccountMonitoringTweetEvent,
+    },
     protocol::{decode_tweet, decode_x_profile, valid_https_url, valid_x_id, valid_x_username},
 };
 
@@ -17,7 +21,7 @@ pub const MAX_X_SEARCH_PROFILES: usize = 10;
 const MAX_X_SEARCH_QUERY_BYTES: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct XProfile {
+pub struct XAccountMonitoringProfile {
     pub x_user_id: SmolStr,
     pub username: SmolStr,
     pub display_name: SmolStr,
@@ -30,7 +34,7 @@ pub struct XProfile {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-pub enum XSelectionStatus {
+pub enum XAccountMonitoringSelectionStatus {
     #[serde(rename = "pending")]
     Pending,
     #[serde(rename = "active")]
@@ -40,22 +44,22 @@ pub enum XSelectionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct XSelection {
+pub struct XAccountMonitoringSelection {
     pub x_user_id: SmolStr,
-    pub status: XSelectionStatus,
+    pub status: XAccountMonitoringSelectionStatus,
     pub created_at: i64,
     pub updated_at: i64,
-    pub profile: Option<XProfile>,
+    pub profile: Option<XAccountMonitoringProfile>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct XSelectionsResponse {
-    pub selections: Vec<XSelection>,
+pub struct XAccountMonitoringSelectionsResponse {
+    pub selections: Vec<XAccountMonitoringSelection>,
     pub x_account_limit: usize,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum XApiError {
+pub enum XAccountMonitoringApiError {
     #[error("the X search query is invalid")]
     InvalidSearchQuery,
     #[error("the X username is invalid")]
@@ -85,7 +89,7 @@ pub enum XApiError {
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum XMutationUnknown {
+pub enum XAccountMonitoringMutationUnknown {
     #[error("the X mutation timed out")]
     Timeout,
     #[error("the X mutation transport result is unknown")]
@@ -103,22 +107,25 @@ pub enum XMutationUnknown {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum XMutationOutcome<T> {
+pub enum XAccountMonitoringMutationOutcome<T> {
     Confirmed(T),
-    Rejected(XApiError),
-    Unknown(XMutationUnknown),
+    Rejected(XAccountMonitoringApiError),
+    Unknown(XAccountMonitoringMutationUnknown),
 }
 
 #[derive(Deserialize)]
 pub(super) struct TweetsResponse {
-    pub tweets: Vec<Tweet>,
+    pub tweets: Vec<XAccountMonitoringTweet>,
     pub profiles: Vec<ProtoXProfile>,
 }
 
-pub(super) fn decode_search_profile(profile: ProtoXProfile) -> Result<XProfile, XApiError> {
-    let event = decode_x_profile(profile.clone())
-        .map_err(|error| XApiError::Protocol(smol_str::format_smolstr!("{}", error)))?;
-    Ok(XProfile {
+pub(super) fn decode_search_profile(
+    profile: ProtoXProfile,
+) -> Result<XAccountMonitoringProfile, XAccountMonitoringApiError> {
+    let event = decode_x_profile(profile.clone()).map_err(|error| {
+        XAccountMonitoringApiError::Protocol(smol_str::format_smolstr!("{}", error))
+    })?;
+    Ok(XAccountMonitoringProfile {
         x_user_id: event.x_user_id,
         username: event.username,
         display_name: event.display_name,
@@ -132,20 +139,24 @@ pub(super) fn decode_search_profile(profile: ProtoXProfile) -> Result<XProfile, 
 }
 
 pub(super) fn decode_x_selection(
-    selection: kytrix_proto::types::XSelection,
-) -> Result<XSelection, XApiError> {
+    selection: kytrix_proto::types::XAccountMonitoringSelection,
+) -> Result<XAccountMonitoringSelection, XAccountMonitoringApiError> {
     let status = match ProtoSelectionStatus::try_from(selection.status)
-        .map_err(|_| XApiError::Protocol("X selection status is invalid".into()))?
+        .map_err(|_| XAccountMonitoringApiError::Protocol("X selection status is invalid".into()))?
     {
-        ProtoSelectionStatus::XPending => XSelectionStatus::Pending,
-        ProtoSelectionStatus::XActive => XSelectionStatus::Active,
-        ProtoSelectionStatus::XPaused => XSelectionStatus::Paused,
+        ProtoSelectionStatus::XAccountMonitoringPending => {
+            XAccountMonitoringSelectionStatus::Pending
+        }
+        ProtoSelectionStatus::XAccountMonitoringActive => XAccountMonitoringSelectionStatus::Active,
+        ProtoSelectionStatus::XAccountMonitoringPaused => XAccountMonitoringSelectionStatus::Paused,
         ProtoSelectionStatus::Unspecified => {
-            return Err(XApiError::Protocol("X selection status is invalid".into()));
+            return Err(XAccountMonitoringApiError::Protocol(
+                "X selection status is invalid".into(),
+            ));
         }
     };
     let profile = selection.profile.map(decode_search_profile).transpose()?;
-    let value = XSelection {
+    let value = XAccountMonitoringSelection {
         x_user_id: selection.x_user_id.into(),
         status,
         created_at: selection.created_at,
@@ -156,56 +167,72 @@ pub(super) fn decode_x_selection(
     Ok(value)
 }
 
-pub(super) fn map_rpc_error(error: KytrixServiceError) -> XApiError {
+pub(super) fn map_rpc_error(error: KytrixServiceError) -> XAccountMonitoringApiError {
     match error {
         KytrixServiceError::Server(ErrorCode::RateLimit) => {
-            XApiError::Server(StatusCode::TOO_MANY_REQUESTS)
+            XAccountMonitoringApiError::Server(StatusCode::TOO_MANY_REQUESTS)
         }
-        KytrixServiceError::Server(ErrorCode::NotReady) => XApiError::NotReady,
+        KytrixServiceError::Server(ErrorCode::NotReady) => XAccountMonitoringApiError::NotReady,
         KytrixServiceError::Server(ErrorCode::InvalidArgument) => {
-            XApiError::Protocol("invalid X request".into())
+            XAccountMonitoringApiError::Protocol("invalid X request".into())
         }
-        KytrixServiceError::Server(ErrorCode::NotFound) => XApiError::AccountNotFound,
-        KytrixServiceError::Server(ErrorCode::QuotaExceeded) => XApiError::QuotaExceeded,
-        KytrixServiceError::Server(ErrorCode::ProtectedAccount) => XApiError::ProtectedAccount,
+        KytrixServiceError::Server(ErrorCode::NotFound) => {
+            XAccountMonitoringApiError::AccountNotFound
+        }
+        KytrixServiceError::Server(ErrorCode::QuotaExceeded) => {
+            XAccountMonitoringApiError::QuotaExceeded
+        }
+        KytrixServiceError::Server(ErrorCode::ProtectedAccount) => {
+            XAccountMonitoringApiError::ProtectedAccount
+        }
         KytrixServiceError::Server(ErrorCode::Timeout) | KytrixServiceError::Timeout => {
-            XApiError::Timeout
+            XAccountMonitoringApiError::Timeout
         }
-        KytrixServiceError::Server(code) => XApiError::Service(KytrixServiceError::Server(code)),
+        KytrixServiceError::Server(code) => {
+            XAccountMonitoringApiError::Service(KytrixServiceError::Server(code))
+        }
         KytrixServiceError::Authentication(_) | KytrixServiceError::AccountChanged => {
-            XApiError::Authentication
+            XAccountMonitoringApiError::Authentication
         }
-        KytrixServiceError::Closed => XApiError::Closed,
-        other => XApiError::Service(other),
+        KytrixServiceError::Closed => XAccountMonitoringApiError::Closed,
+        other => XAccountMonitoringApiError::Service(other),
     }
 }
 
 pub(super) fn mutation_rpc_error<T>(
     error: KytrixServiceError,
     possibly_submitted: bool,
-) -> XMutationOutcome<T> {
+) -> XAccountMonitoringMutationOutcome<T> {
     if !possibly_submitted {
-        return XMutationOutcome::Rejected(map_rpc_error(error));
+        return XAccountMonitoringMutationOutcome::Rejected(map_rpc_error(error));
     }
     match error {
         KytrixServiceError::Server(ErrorCode::Timeout) | KytrixServiceError::Timeout => {
-            XMutationOutcome::Unknown(XMutationUnknown::Timeout)
+            XAccountMonitoringMutationOutcome::Unknown(XAccountMonitoringMutationUnknown::Timeout)
         }
-        KytrixServiceError::Closed => XMutationOutcome::Unknown(XMutationUnknown::ServiceClosed),
+        KytrixServiceError::Closed => XAccountMonitoringMutationOutcome::Unknown(
+            XAccountMonitoringMutationUnknown::ServiceClosed,
+        ),
         KytrixServiceError::AccountChanged | KytrixServiceError::Authentication(_) => {
-            XMutationOutcome::Unknown(XMutationUnknown::AccountChanged)
+            XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::AccountChanged,
+            )
         }
         KytrixServiceError::Server(ErrorCode::MutationUnknown) => {
-            XMutationOutcome::Unknown(XMutationUnknown::ResponseLost)
+            XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::ResponseLost,
+            )
         }
         KytrixServiceError::Disconnected
         | KytrixServiceError::Read(_)
         | KytrixServiceError::Protocol(_)
-        | KytrixServiceError::RouteChanged => {
-            XMutationOutcome::Unknown(XMutationUnknown::ResponseLost)
+        | KytrixServiceError::RouteChanged => XAccountMonitoringMutationOutcome::Unknown(
+            XAccountMonitoringMutationUnknown::ResponseLost,
+        ),
+        KytrixServiceError::Write(_) => {
+            XAccountMonitoringMutationOutcome::Unknown(XAccountMonitoringMutationUnknown::Transport)
         }
-        KytrixServiceError::Write(_) => XMutationOutcome::Unknown(XMutationUnknown::Transport),
-        error => XMutationOutcome::Rejected(map_rpc_error(error)),
+        error => XAccountMonitoringMutationOutcome::Rejected(map_rpc_error(error)),
     }
 }
 
@@ -217,9 +244,11 @@ pub(super) fn normalize_search_query(value: &str) -> Option<&str> {
     .then_some(query)
 }
 
-pub(super) fn decode_tweets_response(response: TweetsResponse) -> Result<TweetBatch, XApiError> {
+pub(super) fn decode_tweets_response(
+    response: TweetsResponse,
+) -> Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError> {
     if response.tweets.len() > 50 || response.profiles.len() > 150 {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned too much timeline data".into(),
         ));
     }
@@ -227,14 +256,15 @@ pub(super) fn decode_tweets_response(response: TweetsResponse) -> Result<TweetBa
         .profiles
         .into_iter()
         .map(|profile| {
-            decode_x_profile(profile)
-                .map_err(|error| XApiError::Protocol(smol_str::format_smolstr!("{}", error)))
+            decode_x_profile(profile).map_err(|error| {
+                XAccountMonitoringApiError::Protocol(smol_str::format_smolstr!("{}", error))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut profile_ids = AHashSet::with_capacity(profiles.len());
     profile_ids.extend(profiles.iter().map(|profile| profile.x_user_id.as_str()));
     if profile_ids.len() != profiles.len() {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned duplicate profiles".into(),
         ));
     }
@@ -244,12 +274,13 @@ pub(super) fn decode_tweets_response(response: TweetsResponse) -> Result<TweetBa
         .into_iter()
         .map(|tweet| {
             if !ids.insert(tweet.tweet_id.clone()) {
-                return Err(XApiError::Protocol(
+                return Err(XAccountMonitoringApiError::Protocol(
                     "X API returned duplicate Tweets".into(),
                 ));
             }
-            decode_tweet(tweet)
-                .map_err(|error| XApiError::Protocol(smol_str::format_smolstr!("{}", error)))
+            decode_tweet(tweet).map_err(|error| {
+                XAccountMonitoringApiError::Protocol(smol_str::format_smolstr!("{}", error))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut author_ids = AHashSet::with_capacity(tweets.len());
@@ -257,14 +288,14 @@ pub(super) fn decode_tweets_response(response: TweetsResponse) -> Result<TweetBa
         collect_author_ids(tweet, &mut author_ids);
     }
     if author_ids != profile_ids || profiles.iter().any(|profile| profile.revision == 0) {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API profiles did not cover Tweet authors".into(),
         ));
     }
-    Ok(TweetBatch { tweets, profiles })
+    Ok(XAccountMonitoringTweetBatch { tweets, profiles })
 }
 
-fn collect_author_ids<'a>(tweet: &'a TweetEvent, ids: &mut AHashSet<&'a str>) {
+fn collect_author_ids<'a>(tweet: &'a XAccountMonitoringTweetEvent, ids: &mut AHashSet<&'a str>) {
     ids.insert(tweet.x_user_id.as_str());
     let referenced = match tweet.reference.as_ref() {
         Some(TweetReference::Repost(tweet) | TweetReference::Quote(tweet)) => tweet,
@@ -273,11 +304,13 @@ fn collect_author_ids<'a>(tweet: &'a TweetEvent, ids: &mut AHashSet<&'a str>) {
     collect_author_ids(referenced, ids);
 }
 
-pub(super) fn validate_selections(response: &XSelectionsResponse) -> Result<(), XApiError> {
+pub(super) fn validate_selections(
+    response: &XAccountMonitoringSelectionsResponse,
+) -> Result<(), XAccountMonitoringApiError> {
     if !(0..=MAX_X_SELECTIONS).contains(&response.x_account_limit)
         || response.selections.len() > MAX_X_SELECTIONS
     {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned an invalid account limit".into(),
         ));
     }
@@ -285,7 +318,7 @@ pub(super) fn validate_selections(response: &XSelectionsResponse) -> Result<(), 
     for selection in &response.selections {
         validate_selection(selection)?;
         if !ids.insert(selection.x_user_id.as_str()) {
-            return Err(XApiError::Protocol(
+            return Err(XAccountMonitoringApiError::Protocol(
                 "X API returned duplicate selections".into(),
             ));
         }
@@ -293,9 +326,11 @@ pub(super) fn validate_selections(response: &XSelectionsResponse) -> Result<(), 
     Ok(())
 }
 
-pub(super) fn validate_search_profiles(profiles: &[XProfile]) -> Result<(), XApiError> {
+pub(super) fn validate_search_profiles(
+    profiles: &[XAccountMonitoringProfile],
+) -> Result<(), XAccountMonitoringApiError> {
     if profiles.len() > MAX_X_SEARCH_PROFILES {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned too many search profiles".into(),
         ));
     }
@@ -303,7 +338,7 @@ pub(super) fn validate_search_profiles(profiles: &[XProfile]) -> Result<(), XApi
     for profile in profiles {
         validate_profile(profile, &profile.x_user_id)?;
         if !ids.insert(profile.x_user_id.as_str()) {
-            return Err(XApiError::Protocol(
+            return Err(XAccountMonitoringApiError::Protocol(
                 "X API returned duplicate search profiles".into(),
             ));
         }
@@ -311,27 +346,35 @@ pub(super) fn validate_search_profiles(profiles: &[XProfile]) -> Result<(), XApi
     Ok(())
 }
 
-pub(super) fn validate_selection(selection: &XSelection) -> Result<(), XApiError> {
+pub(super) fn validate_selection(
+    selection: &XAccountMonitoringSelection,
+) -> Result<(), XAccountMonitoringApiError> {
     if !valid_x_id(&selection.x_user_id)
         || selection.created_at <= 0
         || selection.updated_at < selection.created_at
     {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned an invalid selection".into(),
         ));
     }
     match (selection.status, selection.profile.as_ref()) {
-        (XSelectionStatus::Active, Some(profile)) => {
+        (XAccountMonitoringSelectionStatus::Active, Some(profile)) => {
             validate_profile(profile, &selection.x_user_id)
         }
-        (XSelectionStatus::Pending | XSelectionStatus::Paused, None) => Ok(()),
-        _ => Err(XApiError::Protocol(
+        (
+            XAccountMonitoringSelectionStatus::Pending | XAccountMonitoringSelectionStatus::Paused,
+            None,
+        ) => Ok(()),
+        _ => Err(XAccountMonitoringApiError::Protocol(
             "X API returned a selection with an invalid profile".into(),
         )),
     }
 }
 
-fn validate_profile(profile: &XProfile, x_user_id: &str) -> Result<(), XApiError> {
+fn validate_profile(
+    profile: &XAccountMonitoringProfile,
+    x_user_id: &str,
+) -> Result<(), XAccountMonitoringApiError> {
     if profile.x_user_id != x_user_id
         || !valid_x_id(&profile.x_user_id)
         || !valid_x_username(&profile.username)
@@ -342,7 +385,7 @@ fn validate_profile(profile: &XProfile, x_user_id: &str) -> Result<(), XApiError
         || profile.description.chars().count() > 160
         || (!profile.avatar_url.is_empty() && !valid_https_url(&profile.avatar_url))
     {
-        return Err(XApiError::Protocol(
+        return Err(XAccountMonitoringApiError::Protocol(
             "X API returned an invalid profile".into(),
         ));
     }
@@ -351,7 +394,9 @@ fn validate_profile(profile: &XProfile, x_user_id: &str) -> Result<(), XApiError
 
 #[cfg(test)]
 mod tests {
-    use kytrix_proto::types::{Tweet, XProfile as ProtoXProfile};
+    use kytrix_proto::types::{
+        XAccountMonitoringProfile as ProtoXProfile, XAccountMonitoringTweet,
+    };
 
     use super::{
         super::engine::{ErrorCode, KytrixServiceError},
@@ -362,20 +407,22 @@ mod tests {
     fn rpc_errors_preserve_quota_and_unknown_mutation_semantics() {
         assert_eq!(
             map_rpc_error(KytrixServiceError::Server(ErrorCode::QuotaExceeded)),
-            XApiError::QuotaExceeded
+            XAccountMonitoringApiError::QuotaExceeded
         );
         assert_eq!(
             mutation_rpc_error::<()>(KytrixServiceError::Server(ErrorCode::MutationUnknown), true,),
-            XMutationOutcome::Unknown(XMutationUnknown::ResponseLost)
+            XAccountMonitoringMutationOutcome::Unknown(
+                XAccountMonitoringMutationUnknown::ResponseLost
+            )
         );
         assert_eq!(
             mutation_rpc_error::<()>(KytrixServiceError::Timeout, false),
-            XMutationOutcome::Rejected(XApiError::Timeout)
+            XAccountMonitoringMutationOutcome::Rejected(XAccountMonitoringApiError::Timeout)
         );
     }
 
-    fn tweet(id: &str, author: &str) -> Tweet {
-        Tweet {
+    fn tweet(id: &str, author: &str) -> XAccountMonitoringTweet {
+        XAccountMonitoringTweet {
             tweet_id: id.to_owned(),
             timestamp: 1,
             x_user_id: author.to_owned(),
@@ -400,8 +447,8 @@ mod tests {
         }
     }
 
-    fn profile() -> XProfile {
-        XProfile {
+    fn profile() -> XAccountMonitoringProfile {
+        XAccountMonitoringProfile {
             x_user_id: "42".into(),
             username: "kytrix".into(),
             display_name: "Kytrix".into(),
@@ -414,10 +461,10 @@ mod tests {
         }
     }
 
-    fn active_selection() -> XSelection {
-        XSelection {
+    fn active_selection() -> XAccountMonitoringSelection {
+        XAccountMonitoringSelection {
             x_user_id: "42".into(),
-            status: XSelectionStatus::Active,
+            status: XAccountMonitoringSelectionStatus::Active,
             created_at: 1,
             updated_at: 2,
             profile: Some(profile()),
@@ -430,11 +477,11 @@ mod tests {
         active.profile = None;
         assert!(matches!(
             validate_selection(&active),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
 
         let mut pending = active_selection();
-        pending.status = XSelectionStatus::Pending;
+        pending.status = XAccountMonitoringSelectionStatus::Pending;
         pending.profile = None;
         assert_eq!(validate_selection(&pending), Ok(()));
     }
@@ -442,20 +489,20 @@ mod tests {
     #[test]
     fn selections_contract_rejects_duplicates() {
         let selection = active_selection();
-        let duplicate = XSelectionsResponse {
+        let duplicate = XAccountMonitoringSelectionsResponse {
             selections: vec![selection.clone(), selection],
             x_account_limit: 1,
         };
         assert!(matches!(
             validate_selections(&duplicate),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
     }
 
     #[test]
     fn selections_contract_accepts_a_zero_limit() {
         assert_eq!(
-            validate_selections(&XSelectionsResponse {
+            validate_selections(&XAccountMonitoringSelectionsResponse {
                 selections: Vec::new(),
                 x_account_limit: 0,
             }),
@@ -466,11 +513,11 @@ mod tests {
     #[test]
     fn selections_contract_rejects_a_limit_above_the_process_bound() {
         assert!(matches!(
-            validate_selections(&XSelectionsResponse {
+            validate_selections(&XAccountMonitoringSelectionsResponse {
                 selections: Vec::new(),
                 x_account_limit: MAX_X_SELECTIONS + 1,
             }),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
     }
 
@@ -486,11 +533,11 @@ mod tests {
         let duplicate = profile();
         assert!(matches!(
             validate_search_profiles(&[duplicate.clone(), duplicate]),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
         assert!(matches!(
             validate_search_profiles(&vec![profile(); MAX_X_SEARCH_PROFILES + 1]),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
     }
 
@@ -502,17 +549,19 @@ mod tests {
         };
         assert!(matches!(
             decode_tweets_response(duplicate),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
 
         let mut deep = tweet("1", "42");
         let mut nested = tweet("2", "43");
-        nested.reference = Some(kytrix_proto::types::tweet::Reference::Quote(Box::new(
-            tweet("3", "44"),
-        )));
-        deep.reference = Some(kytrix_proto::types::tweet::Reference::Repost(Box::new(
-            nested,
-        )));
+        nested.reference = Some(
+            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
+                "3", "44",
+            ))),
+        );
+        deep.reference = Some(
+            kytrix_proto::types::x_account_monitoring_tweet::Reference::Repost(Box::new(nested)),
+        );
         assert!(
             decode_tweets_response(TweetsResponse {
                 tweets: vec![deep.clone()],
@@ -520,18 +569,21 @@ mod tests {
             })
             .is_ok()
         );
-        let kytrix_proto::types::tweet::Reference::Repost(nested) =
+        let kytrix_proto::types::x_account_monitoring_tweet::Reference::Repost(nested) =
             deep.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        let kytrix_proto::types::tweet::Reference::Quote(leaf) = nested.reference.as_mut().unwrap()
+        let kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(leaf) =
+            nested.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        leaf.reference = Some(kytrix_proto::types::tweet::Reference::Quote(Box::new(
-            tweet("4", "45"),
-        )));
+        leaf.reference = Some(
+            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
+                "4", "45",
+            ))),
+        );
         assert!(matches!(
             decode_tweets_response(TweetsResponse {
                 tweets: vec![deep],
@@ -542,7 +594,7 @@ mod tests {
                     wire_profile("45"),
                 ],
             }),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
 
         assert!(matches!(
@@ -550,13 +602,15 @@ mod tests {
                 tweets: vec![tweet("1", "42")],
                 profiles: Vec::new(),
             }),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
 
         let mut root = tweet("1", "42");
-        root.reference = Some(kytrix_proto::types::tweet::Reference::Quote(Box::new(
-            tweet("2", "43"),
-        )));
+        root.reference = Some(
+            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
+                "2", "43",
+            ))),
+        );
         let mut unversioned = wire_profile("43");
         unversioned.revision = 0;
         assert!(matches!(
@@ -564,7 +618,7 @@ mod tests {
                 tweets: vec![root],
                 profiles: vec![wire_profile("42"), unversioned],
             }),
-            Err(XApiError::Protocol(_))
+            Err(XAccountMonitoringApiError::Protocol(_))
         ));
     }
 

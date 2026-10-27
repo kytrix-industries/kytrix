@@ -98,10 +98,10 @@ impl TestConfigManager {
             KytrixServiceCapability::CryptocurrencyEtf,
             KytrixServiceCapability::News,
             KytrixServiceCapability::FinancialIndices,
-            KytrixServiceCapability::X,
+            KytrixServiceCapability::XAccountMonitoring,
             KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             KytrixServiceCapability::Ais,
-            KytrixServiceCapability::XMedia,
+            KytrixServiceCapability::XAccountMonitoringMedia,
             KytrixServiceCapability::Cmc,
             KytrixServiceCapability::FinancialCalendar,
             KytrixServiceCapability::PentagonPizzaIndex,
@@ -289,12 +289,12 @@ pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
     }
 }
 
-pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::Tweet {
-    proto_types::Tweet {
+pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::XAccountMonitoringTweet {
+    proto_types::XAccountMonitoringTweet {
         tweet_id: tweet_id.to_owned(),
         timestamp,
         x_user_id: "42".to_owned(),
-        text_segments: vec![proto_types::TweetTextSegment {
+        text_segments: vec![proto_types::XAccountMonitoringTweetTextSegment {
             text: "hello".to_owned(),
             url: None,
         }],
@@ -303,8 +303,8 @@ pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::Tweet {
     }
 }
 
-pub(super) fn x_profile() -> proto_types::XProfile {
-    proto_types::XProfile {
+pub(super) fn x_profile() -> proto_types::XAccountMonitoringProfile {
+    proto_types::XAccountMonitoringProfile {
         x_user_id: "42".to_owned(),
         username: "kytrix".to_owned(),
         display_name: "Kytrix".to_owned(),
@@ -371,10 +371,10 @@ pub(super) fn ais_keyframe() -> proto_types::AisDelta {
     }
 }
 
-pub(super) fn test_x_selection() -> proto_types::XSelection {
-    proto_types::XSelection {
+pub(super) fn test_x_selection() -> proto_types::XAccountMonitoringSelection {
+    proto_types::XAccountMonitoringSelection {
         x_user_id: "42".to_owned(),
-        status: proto_types::XSelectionStatus::XActive as i32,
+        status: proto_types::XAccountMonitoringSelectionStatus::XAccountMonitoringActive as i32,
         created_at: 1,
         updated_at: 2,
         profile: Some(x_profile()),
@@ -386,10 +386,10 @@ pub(super) fn test_x_selection() -> proto_types::XSelection {
 ///
 /// Both timestamps are the one the service wrote the row with, because adding a selection
 /// stamps `created_at` and `updated_at` from the same reading of the clock.
-pub(super) fn pending_x_selection() -> proto_types::XSelection {
-    proto_types::XSelection {
+pub(super) fn pending_x_selection() -> proto_types::XAccountMonitoringSelection {
+    proto_types::XAccountMonitoringSelection {
         x_user_id: "42".to_owned(),
-        status: proto_types::XSelectionStatus::XPending as i32,
+        status: proto_types::XAccountMonitoringSelectionStatus::XAccountMonitoringPending as i32,
         created_at: 4,
         updated_at: 4,
         profile: None,
@@ -749,46 +749,46 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XSearch(_) => (
+                                        ClientRequestKind::XAccountMonitoringSearch(_) => (
                                             ObservedRequest::Rpc("x_search"),
-                                            proto_response::response::Response::XSearch(
-                                                proto_response::XSearchResponse {
+                                            proto_response::response::Response::XAccountMonitoringSearch(
+                                                proto_response::XAccountMonitoringSearchResponse {
                                                     profiles: vec![x_profile()],
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XSelections(_) => (
+                                        ClientRequestKind::XAccountMonitoringSelections(_) => (
                                             ObservedRequest::Rpc("x_selections"),
-                                            proto_response::response::Response::XSelections(
-                                                proto_response::XSelectionsResponse {
+                                            proto_response::response::Response::XAccountMonitoringSelections(
+                                                proto_response::XAccountMonitoringSelectionsResponse {
                                                     selections: vec![test_x_selection()],
                                                     x_account_limit: 3,
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAddSelection(_) => (
+                                        ClientRequestKind::XAccountMonitoringAddSelection(_) => (
                                             ObservedRequest::Rpc("x_add_selection"),
-                                            proto_response::response::Response::XAddSelection(
-                                                proto_response::XAddSelectionResponse {
+                                            proto_response::response::Response::XAccountMonitoringAddSelection(
+                                                proto_response::XAccountMonitoringAddSelectionResponse {
                                                     selection: Some(test_x_selection()),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XDeleteSelection(_) => (
+                                        ClientRequestKind::XAccountMonitoringDeleteSelection(_) => (
                                             ObservedRequest::Rpc("x_delete_selection"),
-                                            proto_response::response::Response::XDeleteSelection(
-                                                proto_response::XDeleteSelectionResponse {},
+                                            proto_response::response::Response::XAccountMonitoringDeleteSelection(
+                                                proto_response::XAccountMonitoringDeleteSelectionResponse {},
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XTweets(_) => (
+                                        ClientRequestKind::XAccountMonitoringTweets(_) => (
                                             ObservedRequest::Rpc("x_tweets"),
-                                            proto_response::response::Response::XTweets(
-                                                proto_response::XTweetsResponse {
-                                                    batch: Some(proto_types::TweetBatch::default()),
+                                            proto_response::response::Response::XAccountMonitoringTweets(
+                                                proto_response::XAccountMonitoringTweetsResponse {
+                                                    batch: Some(proto_types::XAccountMonitoringTweetBatch::default()),
                                                 },
                                             ),
                                             false,
@@ -952,7 +952,7 @@ impl TestServiceServer {
                                         subscriptions.topics.push(topic);
                                     }
                                     if pending_x_add_next.swap(false, Ordering::AcqRel)
-                                        && let proto_response::response::Response::XAddSelection(
+                                        && let proto_response::response::Response::XAccountMonitoringAddSelection(
                                             add,
                                         ) = &mut response
                                     {
@@ -1072,7 +1072,9 @@ impl TestServiceServer {
     }
 
     pub(super) fn send_x_profile(&self) {
-        self.send_event(proto_event::event::Event::XProfile(x_profile()));
+        self.send_event(proto_event::event::Event::XAccountMonitoringProfile(
+            x_profile(),
+        ));
     }
 
     pub(super) fn send_event(&self, event: proto_event::event::Event) {

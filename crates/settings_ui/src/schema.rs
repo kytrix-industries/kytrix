@@ -521,7 +521,7 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
         true,
         vec![proxy_targets_field(
             "proxy-applications.x.media",
-            "settings_ui.proxies.x_media_group",
+            "settings_ui.proxies.x_account_monitoring_media_group",
             &["x", "twitter", "media", "媒体"],
             X_MEDIA,
         )],
@@ -1362,7 +1362,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::FinancialIndices,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::X,
+        capability: KytrixServiceCapability::XAccountMonitoring,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::Cmc,
@@ -1390,7 +1390,7 @@ const APP_UPDATES: &[ServiceTarget] = &[
 
 /// The media service, which the applications page groups on its own.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
-    capability: KytrixServiceCapability::XMedia,
+    capability: KytrixServiceCapability::XAccountMonitoringMedia,
 }];
 
 /// The words one built field is searched by.

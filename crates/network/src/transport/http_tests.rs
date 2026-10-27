@@ -70,8 +70,11 @@ fn client_classes_have_fixed_body_and_redirect_limits() {
         assert_eq!(class.response_body_limit(), 30 * MIB, "{class:?}");
         assert_eq!(class.redirect_limit(), 0, "{class:?}");
     }
-    assert_eq!(HttpClientClass::XMedia.response_body_limit(), 64 * MIB);
-    assert_eq!(HttpClientClass::XMedia.redirect_limit(), 5);
+    assert_eq!(
+        HttpClientClass::XAccountMonitoringMedia.response_body_limit(),
+        64 * MIB
+    );
+    assert_eq!(HttpClientClass::XAccountMonitoringMedia.redirect_limit(), 5);
     assert_eq!(HttpClientClass::UpdaterDownload.redirect_limit(), 10);
     assert_eq!(
         HttpClientClass::UpdaterDownload.response_body_limit(),

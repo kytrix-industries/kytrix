@@ -168,7 +168,7 @@ impl MediaTransport for SharedTransport {
             // What a media request is addressed through is the Kytrix service that serves it,
             // which is what its line is configured under — see the applications page.
             &RouteTarget::Service(ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::XMedia,
+                capability: KytrixServiceCapability::XAccountMonitoringMedia,
             }),
             destination,
             cancellation.child_token(),
@@ -178,7 +178,7 @@ impl MediaTransport for SharedTransport {
         .map_err(|error| MediaError::Route(format_smolstr!("{error}")))?;
         self.hub
             .http()
-            .client(&route, HttpClientClass::XMedia)
+            .client(&route, HttpClientClass::XAccountMonitoringMedia)
             .map_err(|error| MediaError::Route(format_smolstr!("{error}")))
     }
 }
@@ -257,7 +257,7 @@ where
         cancellation: &CancellationToken,
     ) -> Result<Response, MediaError> {
         let mut current = initial_url.clone();
-        let limit = HttpClientClass::XMedia.redirect_limit();
+        let limit = HttpClientClass::XAccountMonitoringMedia.redirect_limit();
         for hop in 0..limit {
             let client = tokio::select! {
                 biased;

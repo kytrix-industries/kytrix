@@ -26,7 +26,7 @@ news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
-tweet_monitor = { workspace = true }
+x_account_monitoring = { workspace = true }
 volume_heatmap = { workspace = true }
 cryptocurrency_wallet_monitoring = { workspace = true }
 watch_list = { workspace = true }

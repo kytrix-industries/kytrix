@@ -7,7 +7,7 @@ use kytrix_service_provider::service::{
         CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationUnknown,
     },
     engine::{ErrorCode, KytrixServiceError},
-    x::{XApiError, XMutationUnknown},
+    x::{XAccountMonitoringApiError, XAccountMonitoringMutationUnknown},
 };
 use market_participants_connector::{
     account::error::{AccountCatalogError, AccountError, AccountNetworkError},
@@ -1874,7 +1874,7 @@ fn localized_server_error(cx: &App, code: ErrorCode) -> SharedString {
     }
 }
 
-impl LocalizedError for XApiError {
+impl LocalizedError for XAccountMonitoringApiError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::InvalidSearchQuery => t!(cx, "widget.x_monitor.invalid_search_query"),
@@ -1894,7 +1894,7 @@ impl LocalizedError for XApiError {
     }
 }
 
-impl LocalizedError for XMutationUnknown {
+impl LocalizedError for XAccountMonitoringMutationUnknown {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Timeout => t!(cx, "error.mutation.timeout"),
@@ -3030,8 +3030,8 @@ mod tests {
             include_str!("../../widgets/perpetual_statistics/src/widget/display/pane.rs"),
         ),
         (
-            "crates/widgets/tweet_monitor/src/view.rs",
-            include_str!("../../widgets/tweet_monitor/src/view.rs"),
+            "crates/widgets/x_account_monitoring/src/view.rs",
+            include_str!("../../widgets/x_account_monitoring/src/view.rs"),
         ),
         (
             "crates/widgets/volume_heatmap/src/view.rs",

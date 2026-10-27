@@ -822,10 +822,10 @@ widget:
     taker_volume: Taker Buy/Sell Volume
     top_trader_account_ratio: Top Trader Account Ratio
     top_trader_position_ratio: Top Trader Position Ratio
-    tweet_monitor: Tweet Monitor
     volume_heatmap: Volume Heat Map
     cryptocurrency_wallet_monitoring: Cryptocurrency Wallet Monitoring
     watch_list: Watch List
+    x_account_monitoring: Tweet Monitor
   news:
     crypto: Crypto
     disable_sound: Mute notification sound
@@ -877,7 +877,7 @@ widget:
     position_ratio: Position Ratio
     value: Value
     volume: Volume
-  tweet_monitor:
+  x_account_monitoring:
     account_id: 'X user ID: %{id}'
     active: Active
     add_account: Add new account
@@ -1138,7 +1138,7 @@ settings_ui:
     username_required: Enter a username
     venue_description: This venue's requests use this line; until it names one, they follow the default line
     venue_section: Venue
-    x_media_group: Media
+    x_account_monitoring_media_group: Media
     x_section: X (Twitter)
   save_failed:
     message: '<p align="center">The settings were not written to disk: %{reason}</p>'

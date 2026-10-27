@@ -822,10 +822,10 @@ widget:
     taker_volume: 主动买卖量
     top_trader_account_ratio: 大户账户多空比
     top_trader_position_ratio: 大户持仓多空比
-    tweet_monitor: 推文监控
     volume_heatmap: 成交量热力图
     cryptocurrency_wallet_monitoring: 加密货币钱包监控
     watch_list: 自选列表
+    x_account_monitoring: 推文监控
   news:
     crypto: 加密货币
     disable_sound: 禁止提示音
@@ -877,7 +877,7 @@ widget:
     short_positions: 空头持仓
     value: 价值
     volume: 成交量
-  tweet_monitor:
+  x_account_monitoring:
     account_id: 'X 用户 ID：%{id}'
     active: 已激活
     add_account: 增加新账号
@@ -1138,7 +1138,7 @@ settings_ui:
     username_required: 请输入用户名
     venue_description: 该场所的请求走这条线路，未指定时跟随默认线路
     venue_section: 场所
-    x_media_group: 媒体
+    x_account_monitoring_media_group: 媒体
     x_section: X（Twitter）
   save_failed:
     message: <p align="center">设置未能写入磁盘：%{reason}</p>

@@ -19,10 +19,15 @@ use std::{
 use gpui_kit::{App, TestAppContext};
 use kytrix_service_provider::service::{
     engine::{
-        KytrixServiceError, TweetBatch, TweetEvent, TweetMedia, TweetTextSegment, XProfileEvent,
-        XSubscriptionEvent,
+        KytrixServiceError, XAccountMonitoringProfileEvent, XAccountMonitoringSubscriptionEvent,
+        XAccountMonitoringTweetBatch, XAccountMonitoringTweetEvent, XAccountMonitoringTweetMedia,
+        XAccountMonitoringTweetTextSegment,
     },
-    x::{XApiError, XMutationOutcome, XProfile, XSelection, XSelectionStatus, XSelectionsResponse},
+    x::{
+        XAccountMonitoringApiError, XAccountMonitoringMutationOutcome, XAccountMonitoringProfile,
+        XAccountMonitoringSelection, XAccountMonitoringSelectionStatus,
+        XAccountMonitoringSelectionsResponse,
+    },
 };
 use network::transport::{error::TransportError, subscription::SubscriptionStatus};
 use reqwest::Client;
@@ -60,12 +65,12 @@ pub(super) fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&
 }
 
 /// One tweet at one time, with nothing on it.
-pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> TweetEvent {
-    TweetEvent {
+pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> XAccountMonitoringTweetEvent {
+    XAccountMonitoringTweetEvent {
         tweet_id: tweet_id.into(),
         timestamp,
         x_user_id: SmolStr::new_static("42"),
-        text_segments: vec![TweetTextSegment {
+        text_segments: vec![XAccountMonitoringTweetTextSegment {
             text: SmolStr::new(format!("tweet {tweet_id}")),
             url: None,
         }],
@@ -75,9 +80,13 @@ pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> TweetEvent {
 }
 
 /// One tweet carrying one picture.
-pub(super) fn tweet_with_media(tweet_id: &str, timestamp: i64, url: &str) -> TweetEvent {
+pub(super) fn tweet_with_media(
+    tweet_id: &str,
+    timestamp: i64,
+    url: &str,
+) -> XAccountMonitoringTweetEvent {
     let mut event = tweet(tweet_id, timestamp);
-    event.media = vec![TweetMedia::Image {
+    event.media = vec![XAccountMonitoringTweetMedia::Image {
         image_url: SmolStr::new(url),
         width: 100,
         height: 100,
@@ -86,8 +95,8 @@ pub(super) fn tweet_with_media(tweet_id: &str, timestamp: i64, url: &str) -> Twe
 }
 
 /// The profile one author is read with.
-pub(super) fn profile(x_user_id: &str, username: &str) -> XProfileEvent {
-    XProfileEvent {
+pub(super) fn profile(x_user_id: &str, username: &str) -> XAccountMonitoringProfileEvent {
+    XAccountMonitoringProfileEvent {
         x_user_id: x_user_id.into(),
         username: username.into(),
         display_name: SmolStr::new(format!("{username} display")),
@@ -98,10 +107,10 @@ pub(super) fn profile(x_user_id: &str, username: &str) -> XProfileEvent {
 }
 
 /// One account being monitored.
-pub(super) fn selection(x_user_id: &str, username: &str) -> XSelection {
-    XSelection {
+pub(super) fn selection(x_user_id: &str, username: &str) -> XAccountMonitoringSelection {
+    XAccountMonitoringSelection {
         x_user_id: x_user_id.into(),
-        status: XSelectionStatus::Active,
+        status: XAccountMonitoringSelectionStatus::Active,
         created_at: 1,
         updated_at: 2,
         profile: Some(search_profile(x_user_id, username)),
@@ -109,8 +118,8 @@ pub(super) fn selection(x_user_id: &str, username: &str) -> XSelection {
 }
 
 /// One account X was searched for.
-pub(super) fn search_profile(x_user_id: &str, username: &str) -> XProfile {
-    XProfile {
+pub(super) fn search_profile(x_user_id: &str, username: &str) -> XAccountMonitoringProfile {
+    XAccountMonitoringProfile {
         x_user_id: x_user_id.into(),
         username: username.into(),
         display_name: SmolStr::new(format!("{username} display")),
@@ -124,8 +133,11 @@ pub(super) fn search_profile(x_user_id: &str, username: &str) -> XProfile {
 }
 
 /// One answer to a read of the monitored accounts.
-pub(super) fn selections(selections: Vec<XSelection>, limit: usize) -> XSelectionsResponse {
-    XSelectionsResponse {
+pub(super) fn selections(
+    selections: Vec<XAccountMonitoringSelection>,
+    limit: usize,
+) -> XAccountMonitoringSelectionsResponse {
+    XAccountMonitoringSelectionsResponse {
         selections,
         x_account_limit: limit,
     }
@@ -252,11 +264,12 @@ pub(super) struct FakeSession {
 
 pub(super) struct FakeSessionState {
     pub subscriptions: VecDeque<Result<FakeSubscription, KytrixServiceError>>,
-    pub history: VecDeque<Result<TweetBatch, XApiError>>,
-    pub selections: VecDeque<Result<XSelectionsResponse, XApiError>>,
-    pub searches: VecDeque<Result<Vec<XProfile>, XApiError>>,
-    pub adds: VecDeque<XMutationOutcome<XSelection>>,
-    pub deletes: VecDeque<XMutationOutcome<()>>,
+    pub history: VecDeque<Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError>>,
+    pub selections:
+        VecDeque<Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError>>,
+    pub searches: VecDeque<Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError>>,
+    pub adds: VecDeque<XAccountMonitoringMutationOutcome<XAccountMonitoringSelection>>,
+    pub deletes: VecDeque<XAccountMonitoringMutationOutcome<()>>,
     pub subscribes: usize,
     /// How many times the timeline already published was read.
     pub history_reads: usize,
@@ -320,39 +333,46 @@ impl FakeSession {
     }
 
     /// Queues what the timeline already published holds.
-    pub(super) fn answer_history(&self, tweets: Vec<TweetEvent>, profiles: Vec<XProfileEvent>) {
+    pub(super) fn answer_history(
+        &self,
+        tweets: Vec<XAccountMonitoringTweetEvent>,
+        profiles: Vec<XAccountMonitoringProfileEvent>,
+    ) {
         self.state()
             .history
-            .push_back(Ok(TweetBatch { tweets, profiles }));
+            .push_back(Ok(XAccountMonitoringTweetBatch { tweets, profiles }));
     }
 
     /// Queues a history the account is refused.
-    pub(super) fn refuse_history(&self, error: XApiError) {
+    pub(super) fn refuse_history(&self, error: XAccountMonitoringApiError) {
         self.state().history.push_back(Err(error));
     }
 
     /// Queues what a read of the monitored accounts answers with.
-    pub(super) fn answer_selections(&self, response: XSelectionsResponse) {
+    pub(super) fn answer_selections(&self, response: XAccountMonitoringSelectionsResponse) {
         self.state().selections.push_back(Ok(response));
     }
 
     /// Queues a read the account is refused.
-    pub(super) fn refuse_selections(&self, error: XApiError) {
+    pub(super) fn refuse_selections(&self, error: XAccountMonitoringApiError) {
         self.state().selections.push_back(Err(error));
     }
 
     /// Queues what a search answers with.
-    pub(super) fn answer_search(&self, profiles: Vec<XProfile>) {
+    pub(super) fn answer_search(&self, profiles: Vec<XAccountMonitoringProfile>) {
         self.state().searches.push_back(Ok(profiles));
     }
 
     /// Queues a change X was asked to make.
-    pub(super) fn answer_add(&self, outcome: XMutationOutcome<XSelection>) {
+    pub(super) fn answer_add(
+        &self,
+        outcome: XAccountMonitoringMutationOutcome<XAccountMonitoringSelection>,
+    ) {
         self.state().adds.push_back(outcome);
     }
 
     /// Queues a change X was asked to make.
-    pub(super) fn answer_delete(&self, outcome: XMutationOutcome<()>) {
+    pub(super) fn answer_delete(&self, outcome: XAccountMonitoringMutationOutcome<()>) {
         self.state().deletes.push_back(outcome);
     }
 
@@ -396,25 +416,32 @@ impl TweetSession for FakeSession {
             .unwrap_or(Err(KytrixServiceError::Closed))
     }
 
-    async fn fetch_tweets(&self) -> Result<TweetBatch, XApiError> {
+    async fn fetch_tweets(
+        &self,
+    ) -> Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError> {
         let mut state = self.state();
         state.history_reads += 1;
         state
             .history
             .pop_front()
-            .unwrap_or(Err(XApiError::NotReady))
+            .unwrap_or(Err(XAccountMonitoringApiError::NotReady))
     }
 
-    async fn fetch_selections(&self) -> Result<XSelectionsResponse, XApiError> {
+    async fn fetch_selections(
+        &self,
+    ) -> Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError> {
         let mut state = self.state();
         state.fetches += 1;
         state
             .selections
             .pop_front()
-            .unwrap_or(Err(XApiError::NotReady))
+            .unwrap_or(Err(XAccountMonitoringApiError::NotReady))
     }
 
-    async fn search_users(&self, _: &str) -> Result<Vec<XProfile>, XApiError> {
+    async fn search_users(
+        &self,
+        _: &str,
+    ) -> Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError> {
         let (answer, blocked) = {
             let mut state = self.state();
             state.searches_made += 1;
@@ -422,7 +449,7 @@ impl TweetSession for FakeSession {
                 state
                     .searches
                     .pop_front()
-                    .unwrap_or(Err(XApiError::NotReady)),
+                    .unwrap_or(Err(XAccountMonitoringApiError::NotReady)),
                 state.blocked_search.take(),
             )
         };
@@ -430,7 +457,10 @@ impl TweetSession for FakeSession {
         answer
     }
 
-    async fn add_selection(&self, _: &str) -> XMutationOutcome<XSelection> {
+    async fn add_selection(
+        &self,
+        _: &str,
+    ) -> XAccountMonitoringMutationOutcome<XAccountMonitoringSelection> {
         let (outcome, blocked) = {
             let mut state = self.state();
             state.add_calls += 1;
@@ -438,7 +468,9 @@ impl TweetSession for FakeSession {
                 state
                     .adds
                     .pop_front()
-                    .unwrap_or(XMutationOutcome::Rejected(XApiError::NotReady)),
+                    .unwrap_or(XAccountMonitoringMutationOutcome::Rejected(
+                        XAccountMonitoringApiError::NotReady,
+                    )),
                 state.blocked_mutation.take(),
             )
         };
@@ -446,7 +478,7 @@ impl TweetSession for FakeSession {
         outcome
     }
 
-    async fn delete_selection(&self, _: &str) -> XMutationOutcome<()> {
+    async fn delete_selection(&self, _: &str) -> XAccountMonitoringMutationOutcome<()> {
         let (outcome, blocked) = {
             let mut state = self.state();
             state.delete_calls += 1;
@@ -454,7 +486,9 @@ impl TweetSession for FakeSession {
                 state
                     .deletes
                     .pop_front()
-                    .unwrap_or(XMutationOutcome::Rejected(XApiError::NotReady)),
+                    .unwrap_or(XAccountMonitoringMutationOutcome::Rejected(
+                        XAccountMonitoringApiError::NotReady,
+                    )),
                 state.blocked_mutation.take(),
             )
         };
@@ -481,7 +515,7 @@ async fn hold(blocked: Option<Arc<OperationBlock>>) {
 
 /// One live subscription inside the fake session.
 pub(super) struct FakeSubscription {
-    events: mpsc::Receiver<Result<XSubscriptionEvent, TransportError>>,
+    events: mpsc::Receiver<Result<XAccountMonitoringSubscriptionEvent, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
     drops: Arc<AtomicUsize>,
     /// The status this subscription takes on as it hands the next event over, which is how a
@@ -497,7 +531,7 @@ impl Drop for FakeSubscription {
 
 /// One live subscription, as a test drives it.
 pub(super) struct FakeSubscriptionControl {
-    pub events: mpsc::Sender<Result<XSubscriptionEvent, TransportError>>,
+    pub events: mpsc::Sender<Result<XAccountMonitoringSubscriptionEvent, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
     /// How many times this subscription has been dropped, which is how a test sees the service
     /// let go of an account it no longer follows.
@@ -520,7 +554,7 @@ impl TweetEventSubscription for FakeSubscription {
         self.status.subscribe()
     }
 
-    async fn recv(&mut self) -> Result<XSubscriptionEvent, TransportError> {
+    async fn recv(&mut self) -> Result<XAccountMonitoringSubscriptionEvent, TransportError> {
         let event = self
             .events
             .recv()

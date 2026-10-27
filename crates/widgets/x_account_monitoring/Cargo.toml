@@ -1,5 +1,5 @@
 [package]
-name = "tweet_monitor"
+name = "x_account_monitoring"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

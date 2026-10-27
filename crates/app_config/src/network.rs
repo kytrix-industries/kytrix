@@ -29,12 +29,12 @@ pub enum KytrixServiceCapability {
     News,
     #[serde(rename = "financial_indices")]
     FinancialIndices,
-    #[serde(rename = "x")]
-    X,
+    #[serde(rename = "x_account_monitoring")]
+    XAccountMonitoring,
     #[serde(rename = "cryptocurrency_wallet_monitoring")]
     CryptocurrencyWalletMonitoring,
-    #[serde(rename = "x_media")]
-    XMedia,
+    #[serde(rename = "x_account_monitoring_media")]
+    XAccountMonitoringMedia,
     /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
     #[serde(rename = "cmc")]
     Cmc,
@@ -556,7 +556,7 @@ mod tests {
 
     fn target() -> ServiceTarget {
         ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XMedia,
+            capability: KytrixServiceCapability::XAccountMonitoringMedia,
         }
     }
 
@@ -854,12 +854,12 @@ mod tests {
     fn service_target_should_use_the_explicit_wire_shape() {
         assert_eq!(
             serde_json::to_value(target()).expect("the Kytrix target should serialize"),
-            json!({ "kind": "kytrix_service", "capability": "x_media" })
+            json!({ "kind": "kytrix_service", "capability": "x_account_monitoring_media" })
         );
         assert_eq!(
             serde_json::from_value::<ServiceTarget>(json!({
                 "kind": "kytrix_service",
-                "capability": "x_media",
+                "capability": "x_account_monitoring_media",
             }))
             .expect("the Kytrix target should decode"),
             target()
@@ -909,7 +909,7 @@ mod tests {
     fn service_target_should_keep_a_stable_order_as_a_btree_key() {
         let targets = [
             ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::XMedia,
+                capability: KytrixServiceCapability::XAccountMonitoringMedia,
             },
             ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Account,

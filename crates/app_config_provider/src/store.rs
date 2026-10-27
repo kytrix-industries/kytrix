@@ -134,9 +134,9 @@ fn all_network_targets(
         KytrixServiceCapability::CryptocurrencyEtf,
         KytrixServiceCapability::News,
         KytrixServiceCapability::FinancialIndices,
-        KytrixServiceCapability::X,
+        KytrixServiceCapability::XAccountMonitoring,
         KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-        KytrixServiceCapability::XMedia,
+        KytrixServiceCapability::XAccountMonitoringMedia,
         KytrixServiceCapability::Cmc,
         KytrixServiceCapability::FinancialCalendar,
         KytrixServiceCapability::PentagonPizzaIndex,
@@ -590,9 +590,9 @@ mod tests {
         VenueId::from_name(name).expect("the venue should be canonical")
     }
 
-    fn x_media_target() -> ServiceTarget {
+    fn x_account_monitoring_media_target() -> ServiceTarget {
         ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XMedia,
+            capability: KytrixServiceCapability::XAccountMonitoringMedia,
         }
     }
 
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn a_change_set_should_name_each_domain_in_map_order() {
         let mut store = ConfigStore::in_memory(configured_settings());
-        let x_media = x_media_target();
+        let x_account_monitoring_media = x_account_monitoring_media_target();
         let account = ServiceTarget::KytrixService {
             capability: KytrixServiceCapability::Account,
         };
@@ -972,7 +972,7 @@ mod tests {
             .insert(account.clone(), ProxyRoute::Direct);
         candidate
             .proxy_applications
-            .insert(x_media.clone(), ProxyRoute::Direct);
+            .insert(x_account_monitoring_media.clone(), ProxyRoute::Direct);
         assert!(candidate.set_venue_proxy(&venue("okx"), Some(ProxyRoute::Direct)));
         assert!(candidate.set_venue_proxy(&venue("binance"), Some(ProxyRoute::System)));
 
@@ -983,7 +983,7 @@ mod tests {
 
         assert_eq!(
             changes.proxy_applications,
-            [account, x_media, download],
+            [account, x_account_monitoring_media, download],
             "service routes are named in target key order, not insertion order"
         );
         assert_eq!(
@@ -1004,7 +1004,7 @@ mod tests {
         let news = ServiceTarget::KytrixService {
             capability: KytrixServiceCapability::News,
         };
-        let x_media = x_media_target();
+        let x_account_monitoring_media = x_account_monitoring_media_target();
         let download = ServiceTarget::KytrixService {
             capability: KytrixServiceCapability::UpdaterDownload,
         };
@@ -1022,7 +1022,7 @@ mod tests {
         candidate.proxy_applications.remove(&news);
         candidate
             .proxy_applications
-            .insert(x_media.clone(), ProxyRoute::Direct);
+            .insert(x_account_monitoring_media.clone(), ProxyRoute::Direct);
         candidate
             .proxy_applications
             .insert(download.clone(), ProxyRoute::System);
@@ -1037,7 +1037,7 @@ mod tests {
 
         assert_eq!(
             changes.proxy_applications,
-            [x_media, download, account, news],
+            [x_account_monitoring_media, download, account, news],
             "the edited and added service routes come in key order, then the removed ones"
         );
         assert_eq!(
@@ -1645,9 +1645,10 @@ mod tests {
                 resolve_dns_at_remote: true,
             },
         );
-        config
-            .proxy_applications
-            .extend([(x_media_target(), ProxyRoute::named("local"))]);
+        config.proxy_applications.extend([(
+            x_account_monitoring_media_target(),
+            ProxyRoute::named("local"),
+        )]);
         config.set_venue_proxy(&venue("binance"), Some(ProxyRoute::named("local")));
         config.set_venue_proxy(&venue("okx"), Some(ProxyRoute::named("local")));
         {

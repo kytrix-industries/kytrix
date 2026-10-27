@@ -56,7 +56,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<
             perpetual_statistics::widget::taker_volume::TakerVolumeWidget,
         >(),
-        WidgetRegistration::for_view::<tweet_monitor::view::TweetMonitorWidget>(),
+        WidgetRegistration::for_view::<x_account_monitoring::view::XAccountMonitoringWidget>(),
         WidgetRegistration::for_view::<volume_heatmap::view::VolumeHeatMapWidget>(),
         WidgetRegistration::for_view::<cryptocurrency_wallet_monitoring::view::CryptocurrencyWalletMonitoringWidget>(),
         WidgetRegistration::for_view::<watch_list::view::WatchListWidget>(),
@@ -86,7 +86,7 @@ mod tests {
     const NEWS_ID: &str = "kytrix.market.news";
     const ORDER_BOOK_ID: &str = "kytrix.market.order_book";
     const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.monitoring.pentagon_pizza_index";
-    const TWEET_MONITOR_ID: &str = "kytrix.market.tweet_monitor";
+    const X_ACCOUNT_MONITORING_ID: &str = "kytrix.market.x_account_monitoring";
     const VOLUME_HEAT_MAP_ID: &str = "kytrix.market.volume_heatmap";
     const CRYPTOCURRENCY_WALLET_MONITORING_ID: &str =
         "kytrix.market.cryptocurrency_wallet_monitoring";
@@ -122,7 +122,7 @@ mod tests {
         (STATISTICS_IDS[2], WidgetCategory::Statistics),
         (STATISTICS_IDS[3], WidgetCategory::Statistics),
         (STATISTICS_IDS[4], WidgetCategory::Statistics),
-        (TWEET_MONITOR_ID, WidgetCategory::Monitoring),
+        (X_ACCOUNT_MONITORING_ID, WidgetCategory::Monitoring),
         (VOLUME_HEAT_MAP_ID, WidgetCategory::Statistics),
         (
             CRYPTOCURRENCY_WALLET_MONITORING_ID,
@@ -151,7 +151,7 @@ mod tests {
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
-            assert!(registry.get(TWEET_MONITOR_ID).is_some());
+            assert!(registry.get(X_ACCOUNT_MONITORING_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
             assert!(registry.get(CRYPTOCURRENCY_WALLET_MONITORING_ID).is_some());
             assert!(registry.get(WATCH_LIST_ID).is_some());

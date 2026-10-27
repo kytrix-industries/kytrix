@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=c6cdf5f4454d5871b56675387ad8b7adadea3ee0#c6cdf5f4454d5871b56675387ad8b7adadea3ee0"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=5ffe659c426a3f26b39ef8a10c1b62260c33eab5#5ffe659c426a3f26b39ef8a10c1b62260c33eab5"
 dependencies = [
  "bytes",
  "prost",
@@ -9917,36 +9917,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tweet_monitor"
-version = "0.0.2"
-dependencies = [
- "ahash",
- "app_config",
- "app_config_provider",
- "base_ui",
- "const-hex",
- "dirs 7.0.0",
- "gpui-kit",
- "i18n",
- "kytrix_service_provider",
- "log",
- "network",
- "reqwest 0.13.5",
- "serde",
- "sha2 0.11.0",
- "smol_str",
- "tempfile",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
- "widget",
- "widget_tokio_runtime",
-]
-
-[[package]]
 name = "typed-arena"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10892,10 +10862,10 @@ dependencies = [
  "serde_json",
  "smol_str",
  "thiserror 2.0.20",
- "tweet_monitor",
  "volume_heatmap",
  "watch_list",
  "widget",
+ "x_account_monitoring",
 ]
 
 [[package]]
@@ -11713,6 +11683,36 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x_account_monitoring"
+version = "0.0.2"
+dependencies = [
+ "ahash",
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "const-hex",
+ "dirs 7.0.0",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "log",
+ "network",
+ "reqwest 0.13.5",
+ "serde",
+ "sha2 0.11.0",
+ "smol_str",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+ "widget",
+ "widget_tokio_runtime",
+]
 
 [[package]]
 name = "xattr"

@@ -1127,8 +1127,9 @@ impl ServiceSessionActor {
             ServiceTopic::Ais(area) => {
                 self.latest_ais_keyframes.remove(area);
             }
-            ServiceTopic::News | ServiceTopic::X | ServiceTopic::CryptocurrencyWalletMonitoring => {
-            }
+            ServiceTopic::News
+            | ServiceTopic::XAccountMonitoring
+            | ServiceTopic::CryptocurrencyWalletMonitoring => {}
         }
     }
 
@@ -1140,7 +1141,7 @@ impl ServiceSessionActor {
                     self.latest_financial_indices.get(topic).cloned()
                 }
                 ServiceTopic::News
-                | ServiceTopic::X
+                | ServiceTopic::XAccountMonitoring
                 | ServiceTopic::CryptocurrencyWalletMonitoring
                 | ServiceTopic::Ais(_) => None,
             })

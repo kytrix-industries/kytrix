@@ -36,9 +36,16 @@ use std::{collections::VecDeque, future::Future, path::PathBuf, sync::Arc};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    engine::{KytrixAccountSession, KytrixServiceError, TweetBatch, XSubscriptionEvent},
+    engine::{
+        KytrixAccountSession, KytrixServiceError, XAccountMonitoringSubscriptionEvent,
+        XAccountMonitoringTweetBatch,
+    },
     protocol::{valid_x_id, valid_x_username},
-    x::{MAX_X_SELECTIONS, XApiError, XMutationOutcome, XProfile, XSelection, XSelectionsResponse},
+    x::{
+        MAX_X_SELECTIONS, XAccountMonitoringApiError, XAccountMonitoringMutationOutcome,
+        XAccountMonitoringProfile, XAccountMonitoringSelection,
+        XAccountMonitoringSelectionsResponse,
+    },
 };
 use network::transport::{
     error::TransportError,
@@ -116,11 +123,11 @@ pub(super) enum TweetResponse {
     /// The dialog's avatars are, or are no longer, being fetched.
     SelectionsWatched,
     /// What the search found.
-    SearchResults(Arc<[XProfile]>),
+    SearchResults(Arc<[XAccountMonitoringProfile]>),
     /// What became of an account the pane asked to monitor.
-    Added(XMutationOutcome<XSelection>),
+    Added(XAccountMonitoringMutationOutcome<XAccountMonitoringSelection>),
     /// What became of an account the pane asked to stop monitoring.
-    Deleted(XMutationOutcome<()>),
+    Deleted(XAccountMonitoringMutationOutcome<()>),
     /// One picture is being fetched again.
     MediaRetried,
 }
@@ -166,7 +173,7 @@ pub(super) enum TweetStreamError {
     /// The account's session could not be taken, or the subscription was refused.
     Service(KytrixServiceError),
     /// The timeline already published could not be read.
-    Api(XApiError),
+    Api(XAccountMonitoringApiError),
     Transport(TransportError),
 }
 
@@ -228,7 +235,7 @@ impl WidgetProtocol for TweetProtocol {
     type Response = TweetResponse;
     type StreamKey = TweetScope;
     type StreamMessage = TweetStreamMessage;
-    type Error = XApiError;
+    type Error = XAccountMonitoringApiError;
 }
 
 /// The X account a pane reads through.
@@ -259,33 +266,39 @@ pub(super) trait TweetSession: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 
     /// The timeline already published for the accounts being monitored.
-    fn fetch_tweets(&self) -> impl Future<Output = Result<TweetBatch, XApiError>> + Send;
+    fn fetch_tweets(
+        &self,
+    ) -> impl Future<Output = Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError>> + Send;
 
     fn fetch_selections(
         &self,
-    ) -> impl Future<Output = Result<XSelectionsResponse, XApiError>> + Send;
+    ) -> impl Future<
+        Output = Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError>,
+    > + Send;
 
     fn search_users(
         &self,
         query: &str,
-    ) -> impl Future<Output = Result<Vec<XProfile>, XApiError>> + Send;
+    ) -> impl Future<Output = Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError>> + Send;
 
     fn add_selection(
         &self,
         username: &str,
-    ) -> impl Future<Output = XMutationOutcome<XSelection>> + Send;
+    ) -> impl Future<Output = XAccountMonitoringMutationOutcome<XAccountMonitoringSelection>> + Send;
 
     fn delete_selection(
         &self,
         x_user_id: &str,
-    ) -> impl Future<Output = XMutationOutcome<()>> + Send;
+    ) -> impl Future<Output = XAccountMonitoringMutationOutcome<()>> + Send;
 }
 
 /// One live event subscription.
 pub(super) trait TweetEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
-    fn recv(&mut self) -> impl Future<Output = Result<XSubscriptionEvent, TransportError>> + Send;
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Result<XAccountMonitoringSubscriptionEvent, TransportError>> + Send;
 }
 
 impl TweetSource for KytrixServiceConnector {
@@ -297,7 +310,7 @@ impl TweetSource for KytrixServiceConnector {
 }
 
 impl TweetSession for KytrixAccountSession {
-    type Subscription = Subscription<XSubscriptionEvent>;
+    type Subscription = Subscription<XAccountMonitoringSubscriptionEvent>;
 
     fn account_id(&self) -> &str {
         self.profile().account_id()
@@ -307,33 +320,43 @@ impl TweetSession for KytrixAccountSession {
         KytrixAccountSession::subscribe_x(self).await
     }
 
-    async fn fetch_tweets(&self) -> Result<TweetBatch, XApiError> {
+    async fn fetch_tweets(
+        &self,
+    ) -> Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError> {
         self.fetch_x_tweets().await
     }
 
-    async fn fetch_selections(&self) -> Result<XSelectionsResponse, XApiError> {
+    async fn fetch_selections(
+        &self,
+    ) -> Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError> {
         self.fetch_x_selections().await
     }
 
-    async fn search_users(&self, query: &str) -> Result<Vec<XProfile>, XApiError> {
+    async fn search_users(
+        &self,
+        query: &str,
+    ) -> Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError> {
         self.search_x_users(query).await
     }
 
-    async fn add_selection(&self, username: &str) -> XMutationOutcome<XSelection> {
+    async fn add_selection(
+        &self,
+        username: &str,
+    ) -> XAccountMonitoringMutationOutcome<XAccountMonitoringSelection> {
         KytrixAccountSession::add_x_selection(self, username).await
     }
 
-    async fn delete_selection(&self, x_user_id: &str) -> XMutationOutcome<()> {
+    async fn delete_selection(&self, x_user_id: &str) -> XAccountMonitoringMutationOutcome<()> {
         KytrixAccountSession::delete_x_selection(self, x_user_id).await
     }
 }
 
-impl TweetEventSubscription for Subscription<XSubscriptionEvent> {
+impl TweetEventSubscription for Subscription<XAccountMonitoringSubscriptionEvent> {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         Subscription::observe_status(self)
     }
 
-    async fn recv(&mut self) -> Result<XSubscriptionEvent, TransportError> {
+    async fn recv(&mut self) -> Result<XAccountMonitoringSubscriptionEvent, TransportError> {
         Subscription::recv(self).await
     }
 }
@@ -437,7 +460,7 @@ where
                     // turned out to be for another one is answered rather than streamed: a
                     // tweet is not data a pane may show under a name it does not belong to.
                     if session.account_id() != scope.account_id() {
-                        let _ = reply.respond(Err(XApiError::AccountChanged));
+                        let _ = reply.respond(Err(XAccountMonitoringApiError::AccountChanged));
                         continue;
                     }
 
@@ -520,7 +543,7 @@ where
                 TweetRequest::WatchSelections { scope, watched } => {
                     let Some(active) = active.as_ref().filter(|active| active.scope == scope)
                     else {
-                        let _ = reply.respond(Err(XApiError::NotReady));
+                        let _ = reply.respond(Err(XAccountMonitoringApiError::NotReady));
                         continue;
                     };
                     selections_watched = watched;
@@ -576,7 +599,9 @@ where
                     };
                     if !valid_x_username(&username) {
                         let _ = reply.respond(Ok(TweetResponse::Added(
-                            XMutationOutcome::Rejected(XApiError::InvalidUsername),
+                            XAccountMonitoringMutationOutcome::Rejected(
+                                XAccountMonitoringApiError::InvalidUsername,
+                            ),
                         )));
                         continue;
                     }
@@ -590,7 +615,7 @@ where
                         () = reply.cancelled() => continue,
                         outcome = &mut add => outcome,
                     };
-                    if let XMutationOutcome::Confirmed(selection) = &outcome
+                    if let XAccountMonitoringMutationOutcome::Confirmed(selection) = &outcome
                         && let Some(profile) = selection.profile.as_ref()
                         && !profile.avatar_url.is_empty()
                     {
@@ -616,10 +641,11 @@ where
                         }
                     };
                     if !valid_x_id(&x_user_id) {
-                        let _ =
-                            reply.respond(Ok(TweetResponse::Deleted(XMutationOutcome::Rejected(
-                                XApiError::Protocol("X user ID is invalid".into()),
-                            ))));
+                        let _ = reply.respond(Ok(TweetResponse::Deleted(
+                            XAccountMonitoringMutationOutcome::Rejected(
+                                XAccountMonitoringApiError::Protocol("X user ID is invalid".into()),
+                            ),
+                        )));
                         continue;
                     }
                     let delete = session.delete_selection(&x_user_id);
@@ -629,7 +655,7 @@ where
                         () = reply.cancelled() => continue,
                         outcome = &mut delete => outcome,
                     };
-                    if matches!(&outcome, XMutationOutcome::Confirmed(())) {
+                    if matches!(&outcome, XAccountMonitoringMutationOutcome::Confirmed(())) {
                         selection_avatars.remove(&x_user_id);
                         if let Some(active) = active.as_ref().filter(|active| active.scope == scope)
                         {
@@ -651,15 +677,16 @@ where
                         }
                     };
                     if !super::media::plausible_media_url(&url) {
-                        let _ = reply
-                            .respond(Err(XApiError::Protocol("X media URL is invalid".into())));
+                        let _ = reply.respond(Err(XAccountMonitoringApiError::Protocol(
+                            "X media URL is invalid".into(),
+                        )));
                         continue;
                     }
                     // What is on screen is the stream's to say, so a retry is handed to the
                     // stream that owns the picture: it decides whether the picture is one it
                     // is still fetching, and publishes what comes of it.
                     if active.retries.try_send(url).is_err() {
-                        let _ = reply.respond(Err(XApiError::NotReady));
+                        let _ = reply.respond(Err(XAccountMonitoringApiError::NotReady));
                         continue;
                     }
                     let _ = reply.respond(Ok(TweetResponse::MediaRetried));
@@ -691,12 +718,12 @@ fn auxiliary_urls(
 fn matching_session<'a, S>(
     active: &'a Option<ActiveSession<S>>,
     scope: &TweetScope,
-) -> Result<&'a ActiveSession<S>, XApiError> {
+) -> Result<&'a ActiveSession<S>, XAccountMonitoringApiError> {
     let Some(active) = active.as_ref() else {
-        return Err(XApiError::NotReady);
+        return Err(XAccountMonitoringApiError::NotReady);
     };
     if &active.scope != scope {
-        return Err(XApiError::AccountChanged);
+        return Err(XAccountMonitoringApiError::AccountChanged);
     }
     Ok(active)
 }
@@ -706,13 +733,13 @@ fn matching_session<'a, S>(
 /// The four that name a condition of their own are named as themselves: an expired login, a
 /// changed account, a timeout and a closed service all read differently to a user than a
 /// service error does.
-fn session_failure(error: KytrixServiceError) -> XApiError {
+fn session_failure(error: KytrixServiceError) -> XAccountMonitoringApiError {
     match error {
-        KytrixServiceError::Authentication(_) => XApiError::Authentication,
-        KytrixServiceError::AccountChanged => XApiError::AccountChanged,
-        KytrixServiceError::Timeout => XApiError::Timeout,
-        KytrixServiceError::Closed => XApiError::Closed,
-        error => XApiError::Service(error),
+        KytrixServiceError::Authentication(_) => XAccountMonitoringApiError::Authentication,
+        KytrixServiceError::AccountChanged => XAccountMonitoringApiError::AccountChanged,
+        KytrixServiceError::Timeout => XAccountMonitoringApiError::Timeout,
+        KytrixServiceError::Closed => XAccountMonitoringApiError::Closed,
+        error => XAccountMonitoringApiError::Service(error),
     }
 }
 
@@ -816,7 +843,7 @@ where
 }
 
 /// Files everything one history read holds, in the order that keeps authors resolvable.
-fn accept_history(state: &mut TweetState, batch: TweetBatch) {
+fn accept_history(state: &mut TweetState, batch: XAccountMonitoringTweetBatch) {
     for tweet in batch.tweets {
         state.push(tweet);
     }
@@ -924,8 +951,12 @@ where
                     Err(error) => return StreamExit::Failed(TweetStreamError::Transport(error)),
                 };
                 let changed = match event {
-                    XSubscriptionEvent::Profile(profile) => state.upsert_profile(profile),
-                    XSubscriptionEvent::Tweet(tweet) => state.push(tweet),
+                    XAccountMonitoringSubscriptionEvent::Profile(profile) => {
+                        state.upsert_profile(profile)
+                    }
+                    XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet) => {
+                        state.push(tweet)
+                    }
                 };
                 let pruned = state.prune_profiles();
                 if !changed && !pruned {
@@ -952,7 +983,7 @@ enum StreamInput {
     Wanted(bool),
     /// The subscription's status changed, or its sender was dropped.
     Status(bool),
-    Event(Result<XSubscriptionEvent, TransportError>),
+    Event(Result<XAccountMonitoringSubscriptionEvent, TransportError>),
     Retry(SmolStr),
     Media(MediaTaskResult),
 }
@@ -1288,7 +1319,7 @@ mod tests {
     async fn fetch(
         runtime: &WidgetRuntime<TweetProtocol>,
         scope: TweetScope,
-    ) -> Result<TweetResponse, RpcCallError<XApiError>> {
+    ) -> Result<TweetResponse, RpcCallError<XAccountMonitoringApiError>> {
         runtime
             .client()
             .call(TweetRequest::FetchSelections(scope))
@@ -1299,7 +1330,7 @@ mod tests {
     async fn call(
         runtime: &WidgetRuntime<TweetProtocol>,
         request: TweetRequest,
-    ) -> Result<TweetResponse, RpcCallError<XApiError>> {
+    ) -> Result<TweetResponse, RpcCallError<XAccountMonitoringApiError>> {
         runtime
             .client()
             .call(request)
@@ -1459,7 +1490,9 @@ mod tests {
 
         control
             .events
-            .send(Ok(XSubscriptionEvent::Tweet(tweet("3", 3))))
+            .send(Ok(
+                XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet("3", 3)),
+            ))
             .await
             .expect("the live subscription should accept a tweet");
         let update = next_update(&mut latest, |update| contents(update).len() == 3).await;
@@ -1471,14 +1504,14 @@ mod tests {
         let source = FakeSource::default();
         let session = source.session(ACCOUNT);
         session.subscribe();
-        session.refuse_history(XApiError::Closed);
+        session.refuse_history(XAccountMonitoringApiError::Closed);
 
         let (_runtime, mut reliable, _) =
             live(&source, FakeTransport::default(), media_cache().0).await;
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            TweetStreamError::Api(XApiError::Closed)
+            TweetStreamError::Api(XAccountMonitoringApiError::Closed)
         );
     }
 
@@ -1507,7 +1540,7 @@ mod tests {
 
         match refused.expect_err("another account is not this one") {
             RpcCallError::Service { source, .. } => {
-                assert_eq!(source, XApiError::AccountChanged);
+                assert_eq!(source, XAccountMonitoringApiError::AccountChanged);
             }
             other => panic!("the refusal should be the account, not {other:?}"),
         }
@@ -1543,8 +1576,10 @@ mod tests {
     async fn a_change_should_be_answered_with_what_became_of_it() {
         let (_, session, _control, runtime, _reliable, _latest) =
             subscribed(FakeTransport::default(), media_cache().0).await;
-        session.answer_add(XMutationOutcome::Confirmed(selection("1", "one")));
-        session.answer_delete(XMutationOutcome::Confirmed(()));
+        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
+            "1", "one",
+        )));
+        session.answer_delete(XAccountMonitoringMutationOutcome::Confirmed(()));
 
         let added = call(
             &runtime,
@@ -1557,7 +1592,7 @@ mod tests {
         .expect("the change should be answered");
         assert!(matches!(
             added,
-            TweetResponse::Added(XMutationOutcome::Confirmed(_))
+            TweetResponse::Added(XAccountMonitoringMutationOutcome::Confirmed(_))
         ));
 
         let deleted = call(
@@ -1571,7 +1606,7 @@ mod tests {
         .expect("the change should be answered");
         assert_eq!(
             deleted,
-            TweetResponse::Deleted(XMutationOutcome::Confirmed(()))
+            TweetResponse::Deleted(XAccountMonitoringMutationOutcome::Confirmed(()))
         );
     }
 
@@ -1591,7 +1626,9 @@ mod tests {
         .expect("the refusal should be an answer");
         assert_eq!(
             added,
-            TweetResponse::Added(XMutationOutcome::Rejected(XApiError::InvalidUsername))
+            TweetResponse::Added(XAccountMonitoringMutationOutcome::Rejected(
+                XAccountMonitoringApiError::InvalidUsername
+            ))
         );
 
         let deleted = call(
@@ -1605,7 +1642,9 @@ mod tests {
         .expect("the refusal should be an answer");
         assert!(matches!(
             deleted,
-            TweetResponse::Deleted(XMutationOutcome::Rejected(XApiError::Protocol(_)))
+            TweetResponse::Deleted(XAccountMonitoringMutationOutcome::Rejected(
+                XAccountMonitoringApiError::Protocol(_)
+            ))
         ));
         assert_eq!(session.state().add_calls, 0);
         assert_eq!(session.state().delete_calls, 0);
@@ -1659,7 +1698,9 @@ mod tests {
             .expect("the read should answer");
         control
             .events
-            .send(Ok(XSubscriptionEvent::Tweet(tweet("2", 2))))
+            .send(Ok(
+                XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet("2", 2)),
+            ))
             .await
             .expect("the subscription should accept a tweet");
         let update = next_update(&mut latest, |update| contents(update).len() == 2).await;
@@ -1760,7 +1801,7 @@ mod tests {
 
         match refused.expect_err("a URL this pane may not fetch is not a picture") {
             RpcCallError::Service { source, .. } => {
-                assert!(matches!(source, XApiError::Protocol(_)));
+                assert!(matches!(source, XAccountMonitoringApiError::Protocol(_)));
             }
             other => panic!("the refusal should be a protocol error, not {other:?}"),
         }
@@ -1828,10 +1869,12 @@ mod tests {
         for index in 2..MAX_TWEETS + 2 {
             control
                 .events
-                .send(Ok(XSubscriptionEvent::Tweet(tweet(
-                    &index.to_string(),
-                    index as i64,
-                ))))
+                .send(Ok(
+                    XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet(
+                        &index.to_string(),
+                        index as i64,
+                    )),
+                ))
                 .await
                 .expect("the subscription should accept a tweet");
         }
@@ -1918,7 +1961,9 @@ mod tests {
         control.fail_on_delivery(TransportError::CredentialChanged);
         control
             .events
-            .send(Ok(XSubscriptionEvent::Tweet(tweet("1", 1))))
+            .send(Ok(
+                XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet("1", 1)),
+            ))
             .await
             .expect("the subscription should accept a tweet");
 

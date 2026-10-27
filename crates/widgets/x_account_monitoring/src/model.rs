@@ -28,8 +28,14 @@ use std::{collections::VecDeque, ops::Range, path::PathBuf, sync::Arc};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use gpui_kit::SharedString;
 use kytrix_service_provider::service::{
-    engine::{TweetEvent, TweetMedia, TweetReference, TweetTextSegment, XProfileEvent},
-    x::{MAX_X_SEARCH_PROFILES, MAX_X_SELECTIONS, XSelection, XSelectionsResponse},
+    engine::{
+        TweetReference, XAccountMonitoringProfileEvent, XAccountMonitoringTweetEvent,
+        XAccountMonitoringTweetMedia, XAccountMonitoringTweetTextSegment,
+    },
+    x::{
+        MAX_X_SEARCH_PROFILES, MAX_X_SELECTIONS, XAccountMonitoringSelection,
+        XAccountMonitoringSelectionsResponse,
+    },
 };
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
@@ -70,8 +76,8 @@ pub(super) struct TweetAuthor {
     revision: u64,
 }
 
-impl From<XProfileEvent> for TweetAuthor {
-    fn from(profile: XProfileEvent) -> Self {
+impl From<XAccountMonitoringProfileEvent> for TweetAuthor {
+    fn from(profile: XAccountMonitoringProfileEvent) -> Self {
         Self {
             username: SharedString::new(profile.username.as_str()),
             display_name: SharedString::new(profile.display_name.as_str()),
@@ -153,10 +159,10 @@ impl TweetMediaItem {
     }
 }
 
-impl From<TweetMedia> for TweetMediaItem {
-    fn from(media: TweetMedia) -> Self {
+impl From<XAccountMonitoringTweetMedia> for TweetMediaItem {
+    fn from(media: XAccountMonitoringTweetMedia) -> Self {
         match media {
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url,
                 width,
                 height,
@@ -165,7 +171,7 @@ impl From<TweetMedia> for TweetMediaItem {
                 width,
                 height,
             },
-            TweetMedia::Video {
+            XAccountMonitoringTweetMedia::Video {
                 thumbnail_url,
                 width,
                 height,
@@ -175,7 +181,7 @@ impl From<TweetMedia> for TweetMediaItem {
                 width,
                 height,
             },
-            TweetMedia::Gif {
+            XAccountMonitoringTweetMedia::Gif {
                 animation_url,
                 image_url,
                 width,
@@ -210,7 +216,7 @@ pub(super) struct TweetText {
 }
 
 impl TweetText {
-    fn from_segments(segments: Vec<TweetTextSegment>) -> Self {
+    fn from_segments(segments: Vec<XAccountMonitoringTweetTextSegment>) -> Self {
         let mut text =
             String::with_capacity(segments.iter().map(|segment| segment.text.len()).sum());
         let mut links = Vec::with_capacity(segments.len());
@@ -283,8 +289,8 @@ impl TweetItem {
     }
 }
 
-impl From<TweetEvent> for TweetItem {
-    fn from(tweet: TweetEvent) -> Self {
+impl From<XAccountMonitoringTweetEvent> for TweetItem {
+    fn from(tweet: XAccountMonitoringTweetEvent) -> Self {
         Self {
             tweet_id: tweet.tweet_id,
             timestamp: tweet.timestamp,
@@ -365,7 +371,7 @@ impl TweetState {
     /// A tweet the feed already holds is dropped by id, and a tweet older than the oldest one
     /// a full feed holds is dropped as well: what a full feed keeps is the newest
     /// [`MAX_TWEETS`] of them, and one that belongs past the end is not one of those.
-    pub(super) fn push(&mut self, tweet: TweetEvent) -> bool {
+    pub(super) fn push(&mut self, tweet: XAccountMonitoringTweetEvent) -> bool {
         if self
             .items
             .iter()
@@ -400,7 +406,7 @@ impl TweetState {
     /// of zero is the service saying it has no revision for this profile, which is what a
     /// profile read outside the timeline stream looks like, and one of those replaces
     /// whatever is held.
-    pub(super) fn upsert_profile(&mut self, profile: XProfileEvent) -> bool {
+    pub(super) fn upsert_profile(&mut self, profile: XAccountMonitoringProfileEvent) -> bool {
         let x_user_id = profile.x_user_id.clone();
         let profile = TweetAuthor::from(profile);
         let evicted = if self
@@ -669,7 +675,7 @@ pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SharedString {
 /// drawn as, whether an account is already monitored, which rows a filter matches — is asked
 /// here, so no two answers can disagree about one row.
 pub(super) fn selection_name<'a>(
-    selection: &'a XSelection,
+    selection: &'a XAccountMonitoringSelection,
     hints: &'a HashMap<SmolStr, SharedString>,
 ) -> Option<&'a str> {
     match selection.profile.as_ref() {
@@ -688,7 +694,7 @@ pub(super) fn selection_name<'a>(
 /// keeps a name from outliving the row it belongs to.
 pub(super) fn retained_hints(
     hints: &HashMap<SmolStr, SharedString>,
-    selections: &[XSelection],
+    selections: &[XAccountMonitoringSelection],
 ) -> HashMap<SmolStr, SharedString> {
     let mut retained = HashMap::with_capacity(hints.len());
     retained.extend(hints.iter().filter_map(|(x_user_id, name)| {
@@ -703,7 +709,7 @@ pub(super) fn retained_hints(
 /// The accounts one account monitors, as the service last answered them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionData {
-    selections: Arc<[XSelection]>,
+    selections: Arc<[XAccountMonitoringSelection]>,
     limit: usize,
 }
 
@@ -712,20 +718,20 @@ impl SelectionData {
     ///
     /// The answer has already been checked by the service client, so this is what it said
     /// rather than a second opinion about it.
-    pub(super) fn new(response: XSelectionsResponse) -> Self {
+    pub(super) fn new(response: XAccountMonitoringSelectionsResponse) -> Self {
         Self {
             selections: response.selections.into(),
             limit: response.x_account_limit,
         }
     }
 
-    pub(super) fn selections(&self) -> &[XSelection] {
+    pub(super) fn selections(&self) -> &[XAccountMonitoringSelection] {
         &self.selections
     }
 
     /// The rows themselves, for a list that is told which of them to draw: what the list was
     /// given is what it draws, so a set that is the same set is not given to it again.
-    pub(super) fn shared_selections(&self) -> Arc<[XSelection]> {
+    pub(super) fn shared_selections(&self) -> Arc<[XAccountMonitoringSelection]> {
         self.selections.clone()
     }
 
@@ -761,7 +767,7 @@ impl SelectionData {
     /// A confirmation for an account already in the set replaces that row: an account that
     /// was waiting to be activated has a profile now, and the confirmed row is the newer of
     /// the two.
-    pub(super) fn with_added(&self, selection: XSelection) -> Self {
+    pub(super) fn with_added(&self, selection: XAccountMonitoringSelection) -> Self {
         let mut selections = Vec::with_capacity(self.selections.len() + 1);
         selections.extend(
             self.selections
@@ -822,16 +828,18 @@ pub(super) fn unshown(held: &[Arc<TweetItem>], next: &[Arc<TweetItem>]) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use kytrix_service_provider::service::x::{XProfile, XSelectionStatus};
+    use kytrix_service_provider::service::x::{
+        XAccountMonitoringProfile, XAccountMonitoringSelectionStatus,
+    };
 
     use super::*;
 
-    fn tweet(id: &str, timestamp: i64) -> TweetEvent {
-        TweetEvent {
+    fn tweet(id: &str, timestamp: i64) -> XAccountMonitoringTweetEvent {
+        XAccountMonitoringTweetEvent {
             tweet_id: id.into(),
             timestamp,
             x_user_id: "42".into(),
-            text_segments: vec![TweetTextSegment {
+            text_segments: vec![XAccountMonitoringTweetTextSegment {
                 text: "hello".into(),
                 url: None,
             }],
@@ -840,8 +848,12 @@ mod tests {
         }
     }
 
-    fn profile(display_name: &str, verified: bool, revision: u64) -> XProfileEvent {
-        XProfileEvent {
+    fn profile(
+        display_name: &str,
+        verified: bool,
+        revision: u64,
+    ) -> XAccountMonitoringProfileEvent {
+        XAccountMonitoringProfileEvent {
             x_user_id: "42".into(),
             username: "kytrix".into(),
             display_name: display_name.into(),
@@ -1015,24 +1027,24 @@ mod tests {
 
     #[test]
     fn tweet_text_should_join_segments_and_keep_link_byte_ranges() {
-        let item = TweetItem::from(TweetEvent {
+        let item = TweetItem::from(XAccountMonitoringTweetEvent {
             tweet_id: "1".into(),
             timestamp: 1,
             x_user_id: "42".into(),
             text_segments: vec![
-                TweetTextSegment {
+                XAccountMonitoringTweetTextSegment {
                     text: "😀 ".into(),
                     url: None,
                 },
-                TweetTextSegment {
+                XAccountMonitoringTweetTextSegment {
                     text: "@a".into(),
                     url: Some("https://x.com/a".into()),
                 },
-                TweetTextSegment {
+                XAccountMonitoringTweetTextSegment {
                     text: " ".into(),
                     url: None,
                 },
-                TweetTextSegment {
+                XAccountMonitoringTweetTextSegment {
                     text: "x.test".into(),
                     url: Some("https://t.co/a".into()),
                 },
@@ -1057,18 +1069,18 @@ mod tests {
         let mut state = TweetState::new();
         let mut root = tweet("1", 1);
         root.media = vec![
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url: "https://pbs.twimg.com/media/one.jpg".into(),
                 width: 10,
                 height: 10,
             },
-            TweetMedia::Video {
+            XAccountMonitoringTweetMedia::Video {
                 playback_url: "https://video.twimg.com/playback.mp4".into(),
                 thumbnail_url: "https://pbs.twimg.com/media/thumb.jpg".into(),
                 width: 10,
                 height: 10,
             },
-            TweetMedia::Gif {
+            XAccountMonitoringTweetMedia::Gif {
                 animation_url: "https://video.twimg.com/animation.mp4".into(),
                 image_url: "https://pbs.twimg.com/media/poster.jpg".into(),
                 width: 10,
@@ -1076,7 +1088,7 @@ mod tests {
             },
         ];
         let mut quoted = tweet("2", 1);
-        quoted.media = vec![TweetMedia::Image {
+        quoted.media = vec![XAccountMonitoringTweetMedia::Image {
             image_url: "https://pbs.twimg.com/media/one.jpg".into(),
             width: 10,
             height: 10,
@@ -1102,17 +1114,17 @@ mod tests {
         let mut state = TweetState::new();
         let mut root = tweet("1", 1);
         root.media = vec![
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url: "https://example.com/one.jpg".into(),
                 width: 10,
                 height: 10,
             },
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url: "http://pbs.twimg.com/media/insecure.jpg".into(),
                 width: 10,
                 height: 10,
             },
-            TweetMedia::Image {
+            XAccountMonitoringTweetMedia::Image {
                 image_url: "".into(),
                 width: 10,
                 height: 10,
@@ -1287,7 +1299,7 @@ mod tests {
 
     #[test]
     fn selection_projection_should_add_replace_and_remove_rows() {
-        let data = SelectionData::new(XSelectionsResponse {
+        let data = SelectionData::new(XAccountMonitoringSelectionsResponse {
             selections: vec![selection("1", Some("one")), selection("2", None)],
             x_account_limit: 3,
         });
@@ -1335,7 +1347,7 @@ mod tests {
     /// activated by the name the pane remembers under that id.
     #[test]
     fn contains_username_should_name_pending_rows_by_the_remembered_hint() {
-        let data = SelectionData::new(XSelectionsResponse {
+        let data = SelectionData::new(XAccountMonitoringSelectionsResponse {
             selections: vec![
                 selection("1", Some("one")),
                 pending_selection("2"),
@@ -1520,13 +1532,13 @@ mod tests {
         assert_eq!(unshown(&held, &next), None);
     }
 
-    fn selection(x_user_id: &str, username: Option<&str>) -> XSelection {
-        XSelection {
+    fn selection(x_user_id: &str, username: Option<&str>) -> XAccountMonitoringSelection {
+        XAccountMonitoringSelection {
             x_user_id: x_user_id.into(),
-            status: XSelectionStatus::Active,
+            status: XAccountMonitoringSelectionStatus::Active,
             created_at: 1,
             updated_at: 2,
-            profile: username.map(|username| XProfile {
+            profile: username.map(|username| XAccountMonitoringProfile {
                 x_user_id: x_user_id.into(),
                 username: username.into(),
                 display_name: username.into(),
@@ -1541,9 +1553,9 @@ mod tests {
     }
 
     /// A row the service has not activated yet, which by contract carries no profile.
-    fn pending_selection(x_user_id: &str) -> XSelection {
-        XSelection {
-            status: XSelectionStatus::Pending,
+    fn pending_selection(x_user_id: &str) -> XAccountMonitoringSelection {
+        XAccountMonitoringSelection {
+            status: XAccountMonitoringSelectionStatus::Pending,
             ..selection(x_user_id, None)
         }
     }

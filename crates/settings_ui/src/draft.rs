@@ -150,7 +150,7 @@ mod tests {
 
     fn x_media() -> ServiceTarget {
         ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XMedia,
+            capability: KytrixServiceCapability::XAccountMonitoringMedia,
         }
     }
 

@@ -9,7 +9,7 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
     match topic {
         ServiceTopic::News => Some("news"),
         ServiceTopic::FinancialIndex(_) => Some("financial_indices"),
-        ServiceTopic::X => Some("x"),
+        ServiceTopic::XAccountMonitoring => Some("x_account_monitoring"),
         ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
         ServiceTopic::Ais(_) => Some("ais"),
     }
@@ -17,13 +17,13 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
 
 /// The entitlement feature an outbound capability is gated by.
 ///
-/// `Account`, `XMedia` and the two updater capabilities are not user
+/// `Account`, `XAccountMonitoringMedia` and the two updater capabilities are not user
 /// entitlements and therefore have no feature.
 pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'static str> {
     match capability {
         KytrixServiceCapability::News => Some("news"),
         KytrixServiceCapability::FinancialIndices => Some("financial_indices"),
-        KytrixServiceCapability::X => Some("x"),
+        KytrixServiceCapability::XAccountMonitoring => Some("x_account_monitoring"),
         KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
             Some("cryptocurrency_wallet_monitoring")
         }
@@ -33,7 +33,7 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::FinancialCalendar => Some("financial_calendar"),
         KytrixServiceCapability::PentagonPizzaIndex => Some("pentagon_pizza_index"),
         KytrixServiceCapability::Account
-        | KytrixServiceCapability::XMedia
+        | KytrixServiceCapability::XAccountMonitoringMedia
         | KytrixServiceCapability::UpdaterMetadata
         | KytrixServiceCapability::UpdaterDownload => None,
     }
@@ -57,7 +57,7 @@ mod tests {
                 ),
                 "financial_indices",
             ),
-            (ServiceTopic::X, "x"),
+            (ServiceTopic::XAccountMonitoring, "x_account_monitoring"),
             (
                 ServiceTopic::CryptocurrencyWalletMonitoring,
                 "cryptocurrency_wallet_monitoring",
@@ -83,12 +83,15 @@ mod tests {
                 KytrixServiceCapability::FinancialIndices,
                 Some("financial_indices"),
             ),
-            (KytrixServiceCapability::X, Some("x")),
+            (
+                KytrixServiceCapability::XAccountMonitoring,
+                Some("x_account_monitoring"),
+            ),
             (
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring,
                 Some("cryptocurrency_wallet_monitoring"),
             ),
-            (KytrixServiceCapability::XMedia, None),
+            (KytrixServiceCapability::XAccountMonitoringMedia, None),
             (KytrixServiceCapability::Cmc, Some("cmc_fear_greed")),
             (
                 KytrixServiceCapability::FinancialCalendar,
