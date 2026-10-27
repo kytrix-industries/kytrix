@@ -259,7 +259,7 @@ pub enum ServiceTopic {
     News,
     Index(IndexTopic),
     X,
-    Wallet,
+    CryptocurrencyWalletMonitoring,
     Ais(AisArea),
 }
 
@@ -350,9 +350,9 @@ pub struct TweetBatch {
     pub profiles: Vec<XProfileEvent>,
 }
 
-/// A validated wallet transfer received from the service.
+/// A validated cryptocurrency_wallet_monitoring transfer received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletTransfer {
+pub struct CryptocurrencyWalletMonitoringTransfer {
     pub event_id: SmolStr,
     pub from_address: SmolStr,
     pub to_address: SmolStr,
@@ -367,7 +367,7 @@ pub(super) enum KytrixServiceEvent {
     Index(IndexEvent),
     XProfile(XProfileEvent),
     Tweet(TweetEvent),
-    WalletTransfer(WalletTransfer),
+    CryptocurrencyWalletMonitoringTransfer(CryptocurrencyWalletMonitoringTransfer),
     Ais(AisUpdate),
     SessionState(KytrixSessionState),
 }
@@ -376,7 +376,7 @@ pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
     Indices(SubscriptionPublisher<IndexEvent>),
     X(SubscriptionPublisher<XSubscriptionEvent>),
-    Wallet(SubscriptionPublisher<WalletTransfer>),
+    CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitoringTransfer>),
     Ais(SubscriptionPublisher<AisUpdate>),
 }
 
@@ -386,7 +386,9 @@ impl SubscriberSink {
             Self::News(_) => KytrixServiceCapability::News,
             Self::Indices(_) => KytrixServiceCapability::Indices,
             Self::X(_) => KytrixServiceCapability::X,
-            Self::Wallet(_) => KytrixServiceCapability::Wallet,
+            Self::CryptocurrencyWalletMonitoring(_) => {
+                KytrixServiceCapability::CryptocurrencyWalletMonitoring
+            }
             Self::Ais(_) => KytrixServiceCapability::Ais,
         }
     }
@@ -396,7 +398,7 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.activate(),
             Self::Indices(publisher) => publisher.activate(),
             Self::X(publisher) => publisher.activate(),
-            Self::Wallet(publisher) => publisher.activate(),
+            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
             Self::Ais(publisher) => publisher.activate(),
         }
     }
@@ -406,7 +408,7 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.reconnecting(),
             Self::Indices(publisher) => publisher.reconnecting(),
             Self::X(publisher) => publisher.reconnecting(),
-            Self::Wallet(publisher) => publisher.reconnecting(),
+            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
             Self::Ais(publisher) => publisher.reconnecting(),
         }
     }
@@ -416,7 +418,7 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.fail(error),
             Self::Indices(publisher) => publisher.fail(error),
             Self::X(publisher) => publisher.fail(error),
-            Self::Wallet(publisher) => publisher.fail(error),
+            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
             Self::Ais(publisher) => publisher.fail(error),
         }
     }
@@ -426,7 +428,7 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.finish(),
             Self::Indices(publisher) => publisher.finish(),
             Self::X(publisher) => publisher.finish(),
-            Self::Wallet(publisher) => publisher.finish(),
+            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
             Self::Ais(publisher) => publisher.finish(),
         }
     }
@@ -436,7 +438,7 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.is_cancelled(),
             Self::Indices(publisher) => publisher.is_cancelled(),
             Self::X(publisher) => publisher.is_cancelled(),
-            Self::Wallet(publisher) => publisher.is_cancelled(),
+            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
             Self::Ais(publisher) => publisher.is_cancelled(),
         }
     }
@@ -455,7 +457,10 @@ impl SubscriberSink {
             (Self::X(publisher), KytrixServiceEvent::Tweet(tweet)) => publisher
                 .try_send(XSubscriptionEvent::Tweet(tweet.clone()))
                 .map_err(subscription_send_error),
-            (Self::Wallet(publisher), KytrixServiceEvent::WalletTransfer(transfer)) => publisher
+            (
+                Self::CryptocurrencyWalletMonitoring(publisher),
+                KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
+            ) => publisher
                 .try_send(transfer.clone())
                 .map_err(subscription_send_error),
             (Self::Ais(publisher), KytrixServiceEvent::Ais(update)) => publisher

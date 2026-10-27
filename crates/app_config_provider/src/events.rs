@@ -358,7 +358,7 @@ mod tests {
         install_manager(cx);
         let (_bridge, notification) = install_bridge(cx, ConfigTopics::NETWORK_AND_VENUES);
         let target = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::Wallet,
+            capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
         };
 
         add_proxy(cx, "local");

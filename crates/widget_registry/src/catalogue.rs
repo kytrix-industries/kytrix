@@ -58,7 +58,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         >(),
         WidgetRegistration::for_view::<tweet_monitor::view::TweetMonitorWidget>(),
         WidgetRegistration::for_view::<volume_heatmap::view::VolumeHeatMapWidget>(),
-        WidgetRegistration::for_view::<wallet_monitor::view::WalletMonitorWidget>(),
+        WidgetRegistration::for_view::<cryptocurrency_wallet_monitoring::view::CryptocurrencyWalletMonitoringWidget>(),
         WidgetRegistration::for_view::<watch_list::view::WatchListWidget>(),
     ]
     .into_iter()
@@ -88,7 +88,8 @@ mod tests {
     const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.monitoring.pentagon_pizza_index";
     const TWEET_MONITOR_ID: &str = "kytrix.market.tweet_monitor";
     const VOLUME_HEAT_MAP_ID: &str = "kytrix.market.volume_heatmap";
-    const WALLET_MONITOR_ID: &str = "kytrix.market.wallet_monitor";
+    const CRYPTOCURRENCY_WALLET_MONITORING_ID: &str =
+        "kytrix.market.cryptocurrency_wallet_monitoring";
     const WATCH_LIST_ID: &str = "kytrix.market.watch_list";
     /// The five perpetual-statistics panes, which are one widget per series.
     const STATISTICS_IDS: [&str; 5] = [
@@ -123,7 +124,10 @@ mod tests {
         (STATISTICS_IDS[4], WidgetCategory::Statistics),
         (TWEET_MONITOR_ID, WidgetCategory::Monitoring),
         (VOLUME_HEAT_MAP_ID, WidgetCategory::Statistics),
-        (WALLET_MONITOR_ID, WidgetCategory::Monitoring),
+        (
+            CRYPTOCURRENCY_WALLET_MONITORING_ID,
+            WidgetCategory::Monitoring,
+        ),
         (WATCH_LIST_ID, WidgetCategory::Market),
     ];
 
@@ -149,7 +153,7 @@ mod tests {
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
             assert!(registry.get(TWEET_MONITOR_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
-            assert!(registry.get(WALLET_MONITOR_ID).is_some());
+            assert!(registry.get(CRYPTOCURRENCY_WALLET_MONITORING_ID).is_some());
             assert!(registry.get(WATCH_LIST_ID).is_some());
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");

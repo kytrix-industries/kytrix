@@ -135,7 +135,7 @@ fn all_network_targets(
         KytrixServiceCapability::News,
         KytrixServiceCapability::Indices,
         KytrixServiceCapability::X,
-        KytrixServiceCapability::Wallet,
+        KytrixServiceCapability::CryptocurrencyWalletMonitoring,
         KytrixServiceCapability::XMedia,
         KytrixServiceCapability::Cmc,
         KytrixServiceCapability::FinancialCalendar,

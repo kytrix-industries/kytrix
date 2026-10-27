@@ -39,15 +39,16 @@ use gpui_kit::{
     StatefulInteractiveElement, Styled, WeakEntity, Window, base::Disableable, div, px,
 };
 use i18n::t;
-use kytrix_service_provider::service::wallet::{
-    WalletNetwork, WalletSelection, WalletSelectionStatus, wallet_network,
+use kytrix_service_provider::service::cryptocurrency_wallet_monitoring::{
+    CryptocurrencyWalletMonitoringNetwork, CryptocurrencyWalletMonitoringSelection,
+    CryptocurrencyWalletMonitoringSelectionStatus, cryptocurrency_wallet_monitoring_network,
 };
 use smol_str::{SmolStr, format_smolstr};
 use widget::{error::LocalizedError, status::WidgetAction};
 
 use super::{
     model::SelectionData,
-    view::{SelectionNotice, SelectionOperation, WalletMonitorWidget},
+    view::{CryptocurrencyWalletMonitoringWidget, SelectionNotice, SelectionOperation},
 };
 
 /// The size of the address dialog's panel.
@@ -58,10 +59,10 @@ const DIALOG_HEIGHT: f32 = 480.0;
 ///
 /// Shared with the tests that build a dialog by hand, so that what they build the field under is the
 /// id production uses rather than a copy of it.
-pub(super) const ADDRESS_INPUT_ID: &str = "wallet-monitor-address";
+pub(super) const ADDRESS_INPUT_ID: &str = "cryptocurrency_wallet_monitoring-monitor-address";
 
 /// The list the dialog draws the addresses with.
-const ADDRESS_LIST_ID: &str = "wallet-monitor-address-list";
+const ADDRESS_LIST_ID: &str = "cryptocurrency_wallet_monitoring-monitor-address-list";
 
 /// The height one address of that list is drawn at.
 ///
@@ -76,18 +77,18 @@ const ADDRESS_ROW_HEIGHT: f32 = 60.0;
 /// The dialog says it is done by emitting [`DismissEvent`], which is the signal the layer that
 /// hosts it subscribes to: it needs no window to be handed and no way of being the dialog on
 /// top, and a dismissal taken from the window instead would close whatever happens to be on top.
-pub(super) struct WalletMonitorDialog {
-    widget: WeakEntity<WalletMonitorWidget>,
+pub(super) struct CryptocurrencyWalletMonitoringDialog {
+    widget: WeakEntity<CryptocurrencyWalletMonitoringWidget>,
     address: Entity<InputState>,
     /// What the field holds.
     ///
     /// The input element is rebuilt every frame and its state exposes no value, so what is
     /// typed is followed through the events the input emits rather than read back off it.
     typed: Option<SmolStr>,
-    list: Entity<StaticSizedList<WalletSelection>>,
+    list: Entity<StaticSizedList<CryptocurrencyWalletMonitoringSelection>>,
     /// The addresses the list was last told to draw, which is how a frame knows whether what
     /// the pane holds is something the list has not been shown.
-    shown: Option<Arc<[WalletSelection]>>,
+    shown: Option<Arc<[CryptocurrencyWalletMonitoringSelection]>>,
     /// The document the body's own message is drawn from when there is nothing to list.
     ///
     /// The sentence is catalogue copy — the same copy the pane's placeholder draws — and it is
@@ -98,14 +99,18 @@ pub(super) struct WalletMonitorDialog {
     message: Entity<MarkdownState>,
 }
 
-impl EventEmitter<DismissEvent> for WalletMonitorDialog {}
+impl EventEmitter<DismissEvent> for CryptocurrencyWalletMonitoringDialog {}
 
-impl WalletMonitorDialog {
+impl CryptocurrencyWalletMonitoringDialog {
     /// Opens the dialog over the window, for the pane the control belongs to.
     ///
     /// Nothing happens when it is already open: the control is the dialog's only entrance,
     /// and replacing the open one would throw away what the user has typed.
-    pub(super) fn show(widget: WeakEntity<WalletMonitorWidget>, window: &mut Window, cx: &mut App) {
+    pub(super) fn show(
+        widget: WeakEntity<CryptocurrencyWalletMonitoringWidget>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let Some(pane) = widget.upgrade() else {
             return;
         };
@@ -117,7 +122,10 @@ impl WalletMonitorDialog {
         // it was given until the user replaces or clears it.
         let address = cx.new(|cx| {
             InputStateBuilder::new(ADDRESS_INPUT_ID)
-                .placeholder(t!(cx, "widget.wallet_monitor.address_placeholder"))
+                .placeholder(t!(
+                    cx,
+                    "widget.cryptocurrency_wallet_monitoring.address_placeholder"
+                ))
                 .build(window, cx)
         });
         let dialog = cx.new(|cx| Self::new(widget.clone(), address, cx));
@@ -134,7 +142,7 @@ impl WalletMonitorDialog {
     /// The tests on either side of it build one this way too: `show` needs the window layer the
     /// application installs, and what a test is about is what the dialog draws and asks for.
     pub(super) fn new(
-        widget: WeakEntity<WalletMonitorWidget>,
+        widget: WeakEntity<CryptocurrencyWalletMonitoringWidget>,
         address: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -163,7 +171,7 @@ impl WalletMonitorDialog {
         let list = cx.new(|_| {
             StaticSizedList::new(
                 ElementId::Name(SharedString::new_static(ADDRESS_LIST_ID)),
-                move |_index, selection: &WalletSelection, _window, cx| {
+                move |_index, selection: &CryptocurrencyWalletMonitoringSelection, _window, cx| {
                     address_row(selection, &dialog, cx)
                 },
             )
@@ -233,22 +241,22 @@ impl WalletMonitorDialog {
     /// What the account monitors, and the way to read it again.
     fn header(&self, state: &DialogState, dialog: &Entity<Self>, cx: &Context<Self>) -> AnyElement {
         let count = state.selections.as_ref().map_or_else(
-            || t!(cx, "widget.wallet_monitor.dialog_title"),
+            || t!(cx, "widget.cryptocurrency_wallet_monitoring.dialog_title"),
             |data| {
                 t!(
                     cx,
-                    "widget.wallet_monitor.monitored_addresses",
+                    "widget.cryptocurrency_wallet_monitoring.monitored_addresses",
                     current = data.selections().len(),
                     limit = data.limit()
                 )
             },
         );
-        let refresh = Button::new("wallet-monitor-refresh")
+        let refresh = Button::new("cryptocurrency_wallet_monitoring-monitor-refresh")
             .ghost()
             .medium()
             .disabled(state.operation.is_some() || !state.ready)
-            .aria_label(t!(cx, "widget.wallet_monitor.refresh"))
-            .with_tooltip(t!(cx, "widget.wallet_monitor.refresh"))
+            .aria_label(t!(cx, "widget.cryptocurrency_wallet_monitoring.refresh"))
+            .with_tooltip(t!(cx, "widget.cryptocurrency_wallet_monitoring.refresh"))
             .on_click({
                 let dialog = dialog.clone();
                 move |_, _, cx| {
@@ -291,12 +299,18 @@ impl WalletMonitorDialog {
         dialog: &Entity<Self>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let add = Button::new("wallet-monitor-add")
+        let add = Button::new("cryptocurrency_wallet_monitoring-monitor-add")
             .filled()
             .medium()
             .disabled(state.addable_address(self.typed.as_ref()).is_none())
-            .aria_label(t!(cx, "widget.wallet_monitor.add_address"))
-            .with_tooltip(t!(cx, "widget.wallet_monitor.add_address"))
+            .aria_label(t!(
+                cx,
+                "widget.cryptocurrency_wallet_monitoring.add_address"
+            ))
+            .with_tooltip(t!(
+                cx,
+                "widget.cryptocurrency_wallet_monitoring.add_address"
+            ))
             .on_click({
                 let dialog = dialog.clone();
                 move |_, _, cx| {
@@ -313,14 +327,14 @@ impl WalletMonitorDialog {
             .gap_2()
             .child(
                 div()
-                    .debug_selector(|| "TEST_WALLET_ADDRESS_FIELD".into())
+                    .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_FIELD".into())
                     .min_w_0()
                     .flex_1()
                     .child(Input::new(&self.address).medium().clearable(true)),
             )
             .child(
                 div()
-                    .debug_selector(|| "TEST_WALLET_ADD_ADDRESS".into())
+                    .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADD_ADDRESS".into())
                     .flex_none()
                     .child(add),
             )
@@ -332,7 +346,7 @@ impl WalletMonitorDialog {
         let theme = cx.theme();
         let (text, color) = match state.notice.as_ref()? {
             SelectionNotice::Added => (
-                t!(cx, "widget.wallet_monitor.add_success"),
+                t!(cx, "widget.cryptocurrency_wallet_monitoring.add_success"),
                 theme.roles.status.success.base.hsla,
             ),
             SelectionNotice::Problem(failure) => (
@@ -375,12 +389,15 @@ impl WalletMonitorDialog {
                 // out is the recovery the pane itself offers, which is the same control the
                 // pane is showing behind this dialog.
                 _ if !state.ready => message_with_action(
-                    t!(cx, "widget.wallet_monitor.stream_unavailable"),
+                    t!(
+                        cx,
+                        "widget.cryptocurrency_wallet_monitoring.stream_unavailable"
+                    ),
                     recovery_button(&state.recovery, cx),
                 ),
                 // The read was answered with a failure, which the notice above names.
                 _ => message_with_action(
-                    t!(cx, "widget.wallet_monitor.load_failed"),
+                    t!(cx, "widget.cryptocurrency_wallet_monitoring.load_failed"),
                     self.retry_button(dialog, cx),
                 ),
             };
@@ -400,10 +417,13 @@ impl WalletMonitorDialog {
     /// pane behind the dialog and the dialog itself say one thing rather than two.
     fn message_text(state: &DialogState, cx: &App) -> SharedString {
         if !state.signed_in {
-            return t!(cx, "widget.wallet_monitor.logged_out");
+            return t!(cx, "widget.cryptocurrency_wallet_monitoring.logged_out");
         }
 
-        t!(cx, "widget.wallet_monitor.empty_addresses")
+        t!(
+            cx,
+            "widget.cryptocurrency_wallet_monitoring.empty_addresses"
+        )
     }
 
     /// Reads the body's sentence into this dialog's document, if it is not the one already there.
@@ -422,7 +442,11 @@ impl WalletMonitorDialog {
     /// A list draws what it was given and remembers where the reader is, so it is told about a
     /// new set of addresses rather than rebuilt every frame: being told would put the reader
     /// back at the top of a list that had not changed.
-    fn show_addresses(&mut self, selections: &Arc<[WalletSelection]>, cx: &mut Context<Self>) {
+    fn show_addresses(
+        &mut self,
+        selections: &Arc<[CryptocurrencyWalletMonitoringSelection]>,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .shown
             .as_ref()
@@ -440,7 +464,7 @@ impl WalletMonitorDialog {
     /// The addresses of the account, each a row that can be left.
     fn address_list(&self) -> AnyElement {
         div()
-            .debug_selector(|| "TEST_WALLET_ADDRESS_LIST".into())
+            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_LIST".into())
             .size_full()
             .min_h_0()
             .child(self.list.clone())
@@ -449,7 +473,7 @@ impl WalletMonitorDialog {
 
     /// The way to read the addresses again, for a read that was answered with a failure.
     fn retry_button(&self, dialog: &Entity<Self>, cx: &Context<Self>) -> AnyElement {
-        Button::new("wallet-monitor-retry")
+        Button::new("cryptocurrency_wallet_monitoring-monitor-retry")
             .outline()
             .small()
             .aria_label(t!(cx, "common.retry"))
@@ -477,10 +501,12 @@ impl WalletMonitorDialog {
             .child(Separator::horizontal())
             .child(
                 div().w_full().flex().items_center().justify_end().child(
-                    Button::new("wallet-monitor-close")
+                    Button::new("cryptocurrency_wallet_monitoring-monitor-close")
                         .tonal()
                         .medium()
-                        .debug_selector(|| "TEST_WALLET_DIALOG_CLOSE".into())
+                        .debug_selector(|| {
+                            "TEST_CRYPTOCURRENCY_WALLET_MONITORING_DIALOG_CLOSE".into()
+                        })
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
                         .child(t!(cx, "common.close")),
                 ),
@@ -489,7 +515,7 @@ impl WalletMonitorDialog {
     }
 }
 
-impl Render for WalletMonitorDialog {
+impl Render for CryptocurrencyWalletMonitoringDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(pane) = self.widget.upgrade() else {
             return div().into_any_element();
@@ -577,7 +603,7 @@ impl DialogState {
             return None;
         }
         let typed = canonical_address(typed?)?;
-        wallet_network(&typed)?;
+        cryptocurrency_wallet_monitoring_network(&typed)?;
         let data = self.selections.as_ref()?;
         if data.quota_full()
             || data
@@ -593,10 +619,10 @@ impl DialogState {
 
 /// The address a reader typed, as the address it names.
 ///
-/// An Ethereum address is the same address in either case: a wallet writes one in mixed case
+/// An Ethereum address is the same address in either case: a cryptocurrency_wallet_monitoring writes one in mixed case
 /// to carry a checksum over its digits, and the service holds the addresses it is asked about
 /// in one case, so what is typed is folded to that case before anything reads it — a reader
-/// pasting the address their wallet shows is pasting the address they meant. A Solana address
+/// pasting the address their cryptocurrency_wallet_monitoring shows is pasting the address they meant. A Solana address
 /// is base58, where the case *is* the address, and is left as it was typed; no base58 address
 /// begins `0x`, so folding only what does cannot reach one.
 fn canonical_address(typed: &str) -> Option<SmolStr> {
@@ -620,8 +646,8 @@ fn canonical_address(typed: &str) -> Option<SmolStr> {
 /// that a row drawn by the list reads what the pane holds now: a list draws its rows again on
 /// every frame of the dialog, and what a row draws is the frame it is drawn in.
 fn address_row(
-    selection: &WalletSelection,
-    dialog: &WeakEntity<WalletMonitorDialog>,
+    selection: &CryptocurrencyWalletMonitoringSelection,
+    dialog: &WeakEntity<CryptocurrencyWalletMonitoringDialog>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -629,9 +655,11 @@ fn address_row(
     let enabled = dialog
         .upgrade()
         .is_some_and(|dialog| dialog.read_with(cx, |dialog, cx| dialog.may_change(cx)));
-    let label = t!(cx, "widget.wallet_monitor.delete_address");
+    let label = t!(cx, "widget.cryptocurrency_wallet_monitoring.delete_address");
     let delete = Button::new((
-        ElementId::Name(SharedString::new_static("WalletMonitorAddressDelete")),
+        ElementId::Name(SharedString::new_static(
+            "CryptocurrencyWalletMonitoringAddressDelete",
+        )),
         selection.address.as_str(),
     ))
     .ghost()
@@ -652,7 +680,9 @@ fn address_row(
     .child(Icon::new(IconKind::Trash).size_3());
 
     Interactive::new((
-        ElementId::Name(SharedString::new_static("WalletMonitorAddressRow")),
+        ElementId::Name(SharedString::new_static(
+            "CryptocurrencyWalletMonitoringAddressRow",
+        )),
         selection.address.as_str(),
     ))
     .rounded_sm()
@@ -662,10 +692,10 @@ fn address_row(
     // of a control: a control is one line tall, and this row is an address with what the account
     // is doing with it below it, so a row sized as a control is a row its own content overflows.
     .h(px(ADDRESS_ROW_HEIGHT))
-    .debug_selector(|| "TEST_WALLET_ADDRESS_ROW".into())
+    .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_ROW".into())
     .child(
         div()
-            .debug_selector(|| "TEST_WALLET_ADDRESS_ROW_CONTENT".into())
+            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_ROW_CONTENT".into())
             .min_w_0()
             .flex_1()
             .flex()
@@ -704,23 +734,31 @@ fn address_row(
     .into_any_element()
 }
 
-fn network_label(network: WalletNetwork, cx: &App) -> SharedString {
+fn network_label(network: CryptocurrencyWalletMonitoringNetwork, cx: &App) -> SharedString {
     match network {
-        WalletNetwork::Ethereum => t!(cx, "widget.wallet_monitor.ethereum"),
-        WalletNetwork::Solana => t!(cx, "widget.wallet_monitor.solana"),
+        CryptocurrencyWalletMonitoringNetwork::Ethereum => {
+            t!(cx, "widget.cryptocurrency_wallet_monitoring.ethereum")
+        }
+        CryptocurrencyWalletMonitoringNetwork::Solana => {
+            t!(cx, "widget.cryptocurrency_wallet_monitoring.solana")
+        }
     }
 }
 
-fn status_label(status: WalletSelectionStatus, cx: &App) -> SharedString {
+fn status_label(status: CryptocurrencyWalletMonitoringSelectionStatus, cx: &App) -> SharedString {
     match status {
-        WalletSelectionStatus::Active => t!(cx, "widget.wallet_monitor.active"),
-        WalletSelectionStatus::Paused => t!(cx, "widget.wallet_monitor.paused"),
+        CryptocurrencyWalletMonitoringSelectionStatus::Active => {
+            t!(cx, "widget.cryptocurrency_wallet_monitoring.active")
+        }
+        CryptocurrencyWalletMonitoringSelectionStatus::Paused => {
+            t!(cx, "widget.cryptocurrency_wallet_monitoring.paused")
+        }
     }
 }
 
 /// The recovery the pane itself offers, as the dialog's way out of having no stream.
 fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
-    Button::new("wallet-monitor-recover")
+    Button::new("cryptocurrency_wallet_monitoring-monitor-recover")
         .outline()
         .small()
         .disabled(!action.is_enabled())
@@ -733,9 +771,9 @@ fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
 }
 
 /// The addresses are being read.
-fn loading_addresses(cx: &Context<WalletMonitorDialog>) -> AnyElement {
+fn loading_addresses(cx: &Context<CryptocurrencyWalletMonitoringDialog>) -> AnyElement {
     div()
-        .id("wallet-monitor-address-loading")
+        .id("cryptocurrency_wallet_monitoring-monitor-address-loading")
         .size_full()
         .flex()
         .flex_col()
@@ -743,17 +781,21 @@ fn loading_addresses(cx: &Context<WalletMonitorDialog>) -> AnyElement {
         .justify_center()
         .gap_2()
         .role(Role::ProgressIndicator)
-        .aria_label(t!(cx, "widget.wallet_monitor.loading_addresses"))
-        .child(
-            div()
-                .size_5()
-                .child(Spinner::new("wallet-monitor-address-spinner")),
-        )
+        .aria_label(t!(
+            cx,
+            "widget.cryptocurrency_wallet_monitoring.loading_addresses"
+        ))
+        .child(div().size_5().child(Spinner::new(
+            "cryptocurrency_wallet_monitoring-monitor-address-spinner",
+        )))
         .child(
             div()
                 .text_xs()
                 .text_color(cx.theme().roles.fg.muted.hsla)
-                .child(t!(cx, "widget.wallet_monitor.loading_addresses")),
+                .child(t!(
+                    cx,
+                    "widget.cryptocurrency_wallet_monitoring.loading_addresses"
+                )),
         )
         .into_any_element()
 }
@@ -801,7 +843,9 @@ mod tests {
 
     use base_ui::{animation::ANIMATION_TICK, layer::Layer, size::UnifiedSize, style::theme};
     use gpui_kit::{AppContext, EmptyView, TestAppContext, VisualTestContext, WeakEntity};
-    use kytrix_service_provider::service::wallet::{WalletNetwork, WalletSelection};
+    use kytrix_service_provider::service::cryptocurrency_wallet_monitoring::{
+        CryptocurrencyWalletMonitoringNetwork, CryptocurrencyWalletMonitoringSelection,
+    };
 
     use super::*;
     use crate::{
@@ -812,7 +856,7 @@ mod tests {
     const FIRST: &str = "0x1111111111111111111111111111111111111111";
     const SECOND: &str = "0x2222222222222222222222222222222222222222";
 
-    /// One address, in the two cases a wallet may write it in: the mixed case is the checksum
+    /// One address, in the two cases a cryptocurrency_wallet_monitoring may write it in: the mixed case is the checksum
     /// the address is displayed with, and the lowercase one is the address itself.
     const CHECKSUMMED: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
     const CANONICAL: &str = "0x52908400098527886e0f7030069857d2e4169ee7";
@@ -824,7 +868,7 @@ mod tests {
     const SOLANA: &str = "So11111111111111111111111111111111111111112";
 
     /// The state of a pane that is live, holds `addresses`, and is waiting for nothing.
-    fn state(addresses: Vec<WalletSelection>, limit: usize) -> DialogState {
+    fn state(addresses: Vec<CryptocurrencyWalletMonitoringSelection>, limit: usize) -> DialogState {
         DialogState::new(
             true,
             true,
@@ -860,13 +904,13 @@ mod tests {
     #[test]
     fn an_address_should_be_read_as_the_address_it_names() {
         assert_eq!(
-            wallet_network(CHECKSUMMED),
+            cryptocurrency_wallet_monitoring_network(CHECKSUMMED),
             None,
             "the checksum case is not the case the service holds an address in"
         );
         assert_eq!(
-            wallet_network(SOLANA),
-            Some(WalletNetwork::Solana),
+            cryptocurrency_wallet_monitoring_network(SOLANA),
+            Some(CryptocurrencyWalletMonitoringNetwork::Solana),
             "the base58 address is one, so the case it is written in is load-bearing"
         );
 
@@ -943,13 +987,13 @@ mod tests {
     /// `show` needs the window layer the application installs, and what these tests are about is
     /// what the dialog draws and asks the pane for rather than how it was opened.
     fn attach(
-        pane: &Entity<WalletMonitorWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
         cx: &mut TestAppContext,
-    ) -> Entity<WalletMonitorDialog> {
+    ) -> Entity<CryptocurrencyWalletMonitoringDialog> {
         let window = cx.add_empty_window();
         let dialog = window.update(|window, cx| {
             let address = cx.new(|cx| InputStateBuilder::new(ADDRESS_INPUT_ID).build(window, cx));
-            cx.new(|cx| WalletMonitorDialog::new(pane.downgrade(), address, cx))
+            cx.new(|cx| CryptocurrencyWalletMonitoringDialog::new(pane.downgrade(), address, cx))
         });
         pane.update(cx, |pane, cx| pane.attach_dialog(dialog.downgrade(), cx));
 
@@ -958,7 +1002,10 @@ mod tests {
 
     /// Waits for the read the pane sends when it takes a dialog over, which is the one thing
     /// that stands between opening a dialog and being able to ask it for a change.
-    fn settle_attached(pane: &Entity<WalletMonitorWidget>, cx: &mut TestAppContext) {
+    fn settle_attached(
+        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        cx: &mut TestAppContext,
+    ) {
         settle_until(cx, "the read the dialog asked for to be answered", |cx| {
             pane.read(cx).dialog_state().operation.is_none()
         });
@@ -992,7 +1039,7 @@ mod tests {
             assert_eq!(
                 asked_for(&pane, cx).as_deref(),
                 Some(CANONICAL),
-                "the address the wallet wrote in mixed case is the one that was asked for"
+                "the address the cryptocurrency_wallet_monitoring wrote in mixed case is the one that was asked for"
             );
         });
 
@@ -1064,14 +1111,16 @@ mod tests {
         });
         window.run_until_parked();
         assert!(
-            window.debug_bounds("TEST_WALLET_ADDRESS_LIST").is_some(),
+            window
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_LIST")
+                .is_some(),
             "the dialog should draw the addresses the pane holds"
         );
         let row = window
-            .debug_bounds("TEST_WALLET_ADDRESS_ROW")
+            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_ROW")
             .expect("a row is drawn from the pane while the list draws it");
         let content = window
-            .debug_bounds("TEST_WALLET_ADDRESS_ROW_CONTENT")
+            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_ROW_CONTENT")
             .expect("the row draws the address and what the account is doing with it");
         assert_eq!(
             row.size.height,
@@ -1105,10 +1154,10 @@ mod tests {
         );
 
         let field = window
-            .debug_bounds("TEST_WALLET_ADDRESS_FIELD")
+            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_FIELD")
             .expect("the toolbar should draw the field an address is typed into");
         let add = window
-            .debug_bounds("TEST_WALLET_ADD_ADDRESS")
+            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADD_ADDRESS")
             .expect("the toolbar should draw the control that adds what the field holds");
         assert_eq!(
             add.size.height,
@@ -1129,7 +1178,7 @@ mod tests {
 
     /// A frame of its own for a dialog, which the window layer would otherwise hold.
     struct DialogHarness {
-        dialog: Entity<WalletMonitorDialog>,
+        dialog: Entity<CryptocurrencyWalletMonitoringDialog>,
     }
 
     impl Render for DialogHarness {
@@ -1149,8 +1198,13 @@ mod tests {
         let cx = harness(cx);
         let (dialog, field, list) = cx.update(|window, cx| {
             let field = cx.new(|cx| InputStateBuilder::new(ADDRESS_INPUT_ID).build(window, cx));
-            let dialog =
-                cx.new(|cx| WalletMonitorDialog::new(WeakEntity::new_invalid(), field.clone(), cx));
+            let dialog = cx.new(|cx| {
+                CryptocurrencyWalletMonitoringDialog::new(
+                    WeakEntity::new_invalid(),
+                    field.clone(),
+                    cx,
+                )
+            });
             let list = dialog.read(cx).list.clone();
 
             window.dialog(cx, dialog.clone());

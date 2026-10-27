@@ -28,8 +28,11 @@ use std::{
 
 use gpui_kit::{App, SharedString};
 use kytrix_service_provider::service::{
-    engine::WalletTransfer,
-    wallet::{WalletSelection, WalletSelectionsResponse, compare_wallet_selections},
+    cryptocurrency_wallet_monitoring::{
+        CryptocurrencyWalletMonitoringSelection, CryptocurrencyWalletMonitoringSelectionsResponse,
+        compare_cryptocurrency_wallet_monitoring_selections,
+    },
+    engine::CryptocurrencyWalletMonitoringTransfer,
 };
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
@@ -55,7 +58,7 @@ pub(super) struct TransferItem {
 }
 
 impl TransferItem {
-    fn new(transfer: WalletTransfer) -> Self {
+    fn new(transfer: CryptocurrencyWalletMonitoringTransfer) -> Self {
         Self {
             event_id: transfer.event_id,
             timestamp: transfer.timestamp,
@@ -155,7 +158,7 @@ impl TransferState {
     /// Returns whether the feed changed: a transfer the feed already holds is the same
     /// event reported twice, and one older than everything a full feed holds is refused
     /// rather than displacing transfers that are newer than it.
-    pub(super) fn push(&mut self, transfer: WalletTransfer) -> bool {
+    pub(super) fn push(&mut self, transfer: CryptocurrencyWalletMonitoringTransfer) -> bool {
         if self
             .items
             .iter()
@@ -226,7 +229,7 @@ pub(super) fn unshown(held: &[Arc<TransferItem>], next: &[Arc<TransferItem>]) ->
 /// The addresses one account monitors, as the service last answered them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionData {
-    selections: Arc<[WalletSelection]>,
+    selections: Arc<[CryptocurrencyWalletMonitoringSelection]>,
     limit: usize,
 }
 
@@ -235,19 +238,19 @@ impl SelectionData {
     ///
     /// The answer has already been checked and ordered by the service client, so this is
     /// what it said rather than a second opinion about it.
-    pub(super) fn new(response: WalletSelectionsResponse) -> Self {
+    pub(super) fn new(response: CryptocurrencyWalletMonitoringSelectionsResponse) -> Self {
         Self {
             selections: response.selections.into(),
-            limit: response.wallet_address_limit,
+            limit: response.cryptocurrency_wallet_monitoring_address_limit,
         }
     }
 
-    pub(super) fn selections(&self) -> &[WalletSelection] {
+    pub(super) fn selections(&self) -> &[CryptocurrencyWalletMonitoringSelection] {
         &self.selections
     }
 
     /// The rows themselves, for a list that is built once and read on every frame.
-    pub(super) fn shared_selections(&self) -> Arc<[WalletSelection]> {
+    pub(super) fn shared_selections(&self) -> Arc<[CryptocurrencyWalletMonitoringSelection]> {
         self.selections.clone()
     }
 
@@ -272,8 +275,8 @@ impl SelectionData {
     pub(super) fn with_added(
         &self,
         requested: &str,
-        selection: WalletSelection,
-    ) -> Result<Self, WalletMonitorDataError> {
+        selection: CryptocurrencyWalletMonitoringSelection,
+    ) -> Result<Self, CryptocurrencyWalletMonitoringDataError> {
         if selection.address != requested
             || self.quota_full()
             || self
@@ -281,7 +284,7 @@ impl SelectionData {
                 .iter()
                 .any(|current| current.address == selection.address)
         {
-            return Err(WalletMonitorDataError::InconsistentSelections);
+            return Err(CryptocurrencyWalletMonitoringDataError::InconsistentSelections);
         }
 
         let mut selections = Vec::with_capacity(self.selections.len() + 1);
@@ -289,7 +292,7 @@ impl SelectionData {
         selections.push(selection);
         // The order is the account's recency order, which is the one a fresh read
         // returns: a list the pane projects itself must read like the one it fetches.
-        selections.sort_by(compare_wallet_selections);
+        selections.sort_by(compare_cryptocurrency_wallet_monitoring_selections);
         Ok(Self {
             selections: selections.into(),
             limit: self.limit,
@@ -316,16 +319,21 @@ impl SelectionData {
 
 /// Why a confirmed change cannot be applied to the addresses a pane is holding.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(super) enum WalletMonitorDataError {
-    #[error("the confirmed wallet address does not fit the list it was added to")]
+pub(super) enum CryptocurrencyWalletMonitoringDataError {
+    #[error(
+        "the confirmed cryptocurrency_wallet_monitoring address does not fit the list it was added to"
+    )]
     InconsistentSelections,
 }
 
-impl LocalizedError for WalletMonitorDataError {
+impl LocalizedError for CryptocurrencyWalletMonitoringDataError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::InconsistentSelections => {
-                i18n::t!(cx, "widget.wallet_monitor.inconsistent_selections")
+                i18n::t!(
+                    cx,
+                    "widget.cryptocurrency_wallet_monitoring.inconsistent_selections"
+                )
             }
         }
     }
@@ -363,8 +371,9 @@ fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use kytrix_service_provider::service::wallet::{
-        WalletNetwork, WalletSelectionStatus, compare_wallet_selections,
+    use kytrix_service_provider::service::cryptocurrency_wallet_monitoring::{
+        CryptocurrencyWalletMonitoringNetwork, CryptocurrencyWalletMonitoringSelectionStatus,
+        compare_cryptocurrency_wallet_monitoring_selections,
     };
     use smol_str::SmolStr;
 
@@ -377,8 +386,8 @@ mod tests {
     const THIRD: &str = "0x3333333333333333333333333333333333333333";
     const FOURTH: &str = "0x4444444444444444444444444444444444444444";
 
-    fn transfer(event_id: &str, timestamp: i64) -> WalletTransfer {
-        WalletTransfer {
+    fn transfer(event_id: &str, timestamp: i64) -> CryptocurrencyWalletMonitoringTransfer {
+        CryptocurrencyWalletMonitoringTransfer {
             event_id: SmolStr::new(event_id),
             from_address: SmolStr::new_static(FROM),
             to_address: SmolStr::new_static(TO),
@@ -388,27 +397,30 @@ mod tests {
         }
     }
 
-    fn selection(address: &str, updated_at: i64) -> WalletSelection {
-        WalletSelection {
-            network: WalletNetwork::Ethereum,
+    fn selection(address: &str, updated_at: i64) -> CryptocurrencyWalletMonitoringSelection {
+        CryptocurrencyWalletMonitoringSelection {
+            network: CryptocurrencyWalletMonitoringNetwork::Ethereum,
             address: SmolStr::new(address),
-            status: WalletSelectionStatus::Active,
+            status: CryptocurrencyWalletMonitoringSelectionStatus::Active,
             created_at: updated_at,
             updated_at,
         }
     }
 
-    fn paused(address: &str, updated_at: i64) -> WalletSelection {
-        WalletSelection {
-            status: WalletSelectionStatus::Paused,
+    fn paused(address: &str, updated_at: i64) -> CryptocurrencyWalletMonitoringSelection {
+        CryptocurrencyWalletMonitoringSelection {
+            status: CryptocurrencyWalletMonitoringSelectionStatus::Paused,
             ..selection(address, updated_at)
         }
     }
 
-    fn response(selections: Vec<WalletSelection>, limit: usize) -> WalletSelectionsResponse {
-        WalletSelectionsResponse {
+    fn response(
+        selections: Vec<CryptocurrencyWalletMonitoringSelection>,
+        limit: usize,
+    ) -> CryptocurrencyWalletMonitoringSelectionsResponse {
+        CryptocurrencyWalletMonitoringSelectionsResponse {
             selections,
-            wallet_address_limit: limit,
+            cryptocurrency_wallet_monitoring_address_limit: limit,
         }
     }
 
@@ -604,7 +616,7 @@ mod tests {
 
         assert_eq!(
             data.with_added(SECOND, selection(SECOND, 2)),
-            Err(WalletMonitorDataError::InconsistentSelections),
+            Err(CryptocurrencyWalletMonitoringDataError::InconsistentSelections),
             "a paused address still counts against the quota"
         );
     }
@@ -615,7 +627,7 @@ mod tests {
 
         assert_eq!(
             data.with_added(FIRST, selection(FIRST, 2)),
-            Err(WalletMonitorDataError::InconsistentSelections)
+            Err(CryptocurrencyWalletMonitoringDataError::InconsistentSelections)
         );
     }
 
@@ -625,7 +637,7 @@ mod tests {
 
         assert_eq!(
             data.with_added(SECOND, selection(THIRD, 2)),
-            Err(WalletMonitorDataError::InconsistentSelections),
+            Err(CryptocurrencyWalletMonitoringDataError::InconsistentSelections),
             "a confirmation about a different address is not the one that was asked for"
         );
     }
@@ -698,7 +710,7 @@ mod tests {
     #[test]
     fn a_projection_should_order_ties_the_way_the_service_does() {
         let mut expected = [selection(SECOND, 5), selection(FIRST, 5)];
-        expected.sort_by(compare_wallet_selections);
+        expected.sort_by(compare_cryptocurrency_wallet_monitoring_selections);
         let data = SelectionData::new(response(vec![selection(SECOND, 5)], 3));
 
         let projected = data

@@ -2048,6 +2048,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cryptocurrency_wallet_monitoring"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "network",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5198,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=f07e530e6fe04d813a8e360c994b3fb24c37bd71#f07e530e6fe04d813a8e360c994b3fb24c37bd71"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=ab381c298b342d7d654d6e8e373324984ad3107a#ab381c298b342d7d654d6e8e373324984ad3107a"
 dependencies = [
  "bytes",
  "prost",
@@ -7437,7 +7457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -10341,26 +10361,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wallet_monitor"
-version = "0.0.2"
-dependencies = [
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_service_provider",
- "network",
- "serde",
- "smol_str",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "widget",
- "widget_tokio_runtime",
-]
-
-[[package]]
 name = "want"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10873,6 +10873,7 @@ dependencies = [
  "app_config",
  "candlestick",
  "crypto_fgi",
+ "cryptocurrency_wallet_monitoring",
  "empty",
  "etf",
  "financial_calendar",
@@ -10893,7 +10894,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tweet_monitor",
  "volume_heatmap",
- "wallet_monitor",
  "watch_list",
  "widget",
 ]

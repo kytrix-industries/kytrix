@@ -469,7 +469,7 @@ error:
     stream_unavailable: 成交量热力图数据流不可用
     timeout: 成交量热力图请求在 %{seconds} 秒后超时
     too_many_tickers: '%{route} 返回了 %{count} 条 ticker，超过热力图可用的 %{limit} 条上限'
-  wallet:
+  cryptocurrency_wallet_monitoring:
     account_changed: 钱包账户会话已变更
     closed: 钱包账户会话已关闭
     invalid_response: 钱包 API 返回了无效数据
@@ -824,7 +824,7 @@ widget:
     top_trader_position_ratio: 大户持仓多空比
     tweet_monitor: 推文监控
     volume_heatmap: 成交量热力图
-    wallet_monitor: 钱包监控
+    cryptocurrency_wallet_monitoring: 加密货币钱包监控
     watch_list: 自选列表
   news:
     crypto: 加密货币
@@ -921,7 +921,7 @@ widget:
   volume_heatmap:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
-  wallet_monitor:
+  cryptocurrency_wallet_monitoring:
     active: 已激活
     add_address: 添加钱包地址
     add_success: 钱包地址添加成功

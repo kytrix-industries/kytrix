@@ -20,13 +20,13 @@ use yawc::{Frame, OpCode, WebSocketError};
 
 use crate::service::{
     ais::{AisArea, AisUpdate},
+    cryptocurrency_wallet_monitoring,
     engine::{
-        ErrorCode, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage, IndexEvent,
-        IndexTopic, KytrixServiceError, KytrixServiceEvent, KytrixSessionState, NewsEvent,
-        NewsKind, ServiceTopic, TweetEvent, TweetMedia, TweetReference, TweetTextSegment,
-        WRITE_TIMEOUT, WalletTransfer, XProfileEvent,
+        CryptocurrencyWalletMonitoringTransfer, ErrorCode, HEARTBEAT_MAX_SECONDS,
+        HEARTBEAT_MIN_SECONDS, IncomingMessage, IndexEvent, IndexTopic, KytrixServiceError,
+        KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind, ServiceTopic, TweetEvent,
+        TweetMedia, TweetReference, TweetTextSegment, WRITE_TIMEOUT, XProfileEvent,
     },
-    wallet,
 };
 
 pub(super) async fn next_server_message(
@@ -140,9 +140,11 @@ pub(super) fn decode_event(
             ServiceTopic::X,
             KytrixServiceEvent::Tweet(decode_tweet(tweet)?),
         ))),
-        proto_event::event::Event::WalletTransfer(transfer) => Ok(Some((
-            ServiceTopic::Wallet,
-            KytrixServiceEvent::WalletTransfer(decode_wallet_transfer(transfer)?),
+        proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(transfer) => Ok(Some((
+            ServiceTopic::CryptocurrencyWalletMonitoring,
+            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(
+                decode_cryptocurrency_wallet_monitoring_transfer(transfer)?,
+            ),
         ))),
         proto_event::event::Event::Ais(delta) => {
             let area = AisArea::try_from(delta.area)
@@ -157,27 +159,35 @@ pub(super) fn decode_event(
     }
 }
 
-pub(super) fn decode_wallet_transfer(
-    transfer: proto_types::WalletTransfer,
-) -> Result<WalletTransfer, KytrixServiceError> {
-    let network = wallet::wallet_network(&transfer.from_address);
+pub(super) fn decode_cryptocurrency_wallet_monitoring_transfer(
+    transfer: proto_types::CryptocurrencyWalletMonitoringTransfer,
+) -> Result<CryptocurrencyWalletMonitoringTransfer, KytrixServiceError> {
+    let network = cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(
+        &transfer.from_address,
+    );
     if transfer.event_id.is_empty()
         || transfer.event_id.len() > 512
         || network.is_none()
-        || wallet::wallet_network(&transfer.to_address) != network
-        || !network.is_some_and(|network| wallet::valid_transfer_amount(&transfer.amount, network))
+        || cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(
+            &transfer.to_address,
+        ) != network
+        || !network.is_some_and(|network| {
+            cryptocurrency_wallet_monitoring::valid_transfer_amount(&transfer.amount, network)
+        })
         || transfer.token_symbol.is_empty()
         || transfer.token_symbol.len() > 64
         || transfer.timestamp <= 0
     {
         return Err(KytrixServiceError::Protocol(
-            "wallet transfer is invalid".into(),
+            "cryptocurrency_wallet_monitoring transfer is invalid".into(),
         ));
     }
     let timestamp = transfer.timestamp.checked_mul(1_000).ok_or_else(|| {
-        KytrixServiceError::Protocol("wallet timestamp exceeded UTC milliseconds".into())
+        KytrixServiceError::Protocol(
+            "cryptocurrency_wallet_monitoring timestamp exceeded UTC milliseconds".into(),
+        )
     })?;
-    Ok(WalletTransfer {
+    Ok(CryptocurrencyWalletMonitoringTransfer {
         event_id: transfer.event_id.into(),
         from_address: transfer.from_address.into(),
         to_address: transfer.to_address.into(),
@@ -541,7 +551,11 @@ impl From<&ServiceTopic> for proto_topic::Topic {
                 })
             }
             ServiceTopic::X => proto_topic::topic::Topic::X(proto_topic::TopicX {}),
-            ServiceTopic::Wallet => proto_topic::topic::Topic::Wallet(proto_topic::WalletTopic {}),
+            ServiceTopic::CryptocurrencyWalletMonitoring => {
+                proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(
+                    proto_topic::CryptocurrencyWalletMonitoringTopic {},
+                )
+            }
             ServiceTopic::Ais(area) => {
                 proto_topic::topic::Topic::Ais(proto_topic::AisTopic { area: *area as i32 })
             }
@@ -563,7 +577,9 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
                 .map(ServiceTopic::Index)
                 .ok_or_else(|| "index topic is invalid".into()),
             proto_topic::topic::Topic::X(_) => Ok(ServiceTopic::X),
-            proto_topic::topic::Topic::Wallet(_) => Ok(ServiceTopic::Wallet),
+            proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
+                Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
+            }
             proto_topic::topic::Topic::Ais(value) => match AisArea::try_from(value.area) {
                 Ok(AisArea::Hormuz) => Ok(ServiceTopic::Ais(AisArea::Hormuz)),
                 Ok(AisArea::Unspecified) => Err("AIS area is unspecified".into()),
@@ -663,13 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn literal_wallet_event_wire_should_preserve_schema_tags() {
+    fn literal_cryptocurrency_wallet_monitoring_event_wire_should_preserve_schema_tags() {
         let IncomingMessage::Event(Some((
-            ServiceTopic::Wallet,
-            KytrixServiceEvent::WalletTransfer(transfer),
-        ))) = decode_binary(WALLET_EVENT_WIRE).expect("literal Wallet event should decode")
+            ServiceTopic::CryptocurrencyWalletMonitoring,
+            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
+        ))) = decode_binary(CRYPTOCURRENCY_WALLET_MONITORING_EVENT_WIRE)
+            .expect("literal CryptocurrencyWalletMonitoring event should decode")
         else {
-            panic!("literal frame should contain a Wallet event");
+            panic!("literal frame should contain a CryptocurrencyWalletMonitoring event");
         };
         assert_eq!(transfer.event_id, "e");
         assert_eq!(transfer.from_address, "11111111111111111111111111111111");
@@ -693,7 +710,7 @@ mod tests {
             ServiceTopic::News,
             index_service_topic("REMOTE_ONLY_INDEX"),
             ServiceTopic::X,
-            ServiceTopic::Wallet,
+            ServiceTopic::CryptocurrencyWalletMonitoring,
             ServiceTopic::Ais(AisArea::Hormuz),
         ] {
             let encoded = proto_topic::Topic::from(&topic);
@@ -866,29 +883,31 @@ mod tests {
     }
 
     #[test]
-    fn wallet_transfer_should_decode_exact_amount_and_milliseconds() {
+    fn cryptocurrency_wallet_monitoring_transfer_should_decode_exact_amount_and_milliseconds() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::WalletTransfer(
-                    proto_types::WalletTransfer {
-                        event_id: "ethereum:0xabc:2".to_owned(),
-                        from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                        to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                        amount: "1.000001".to_owned(),
-                        token_symbol: "USDC".to_owned(),
-                        timestamp: 1_786_665_600,
-                    },
-                )),
+                event: Some(
+                    proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
+                        proto_types::CryptocurrencyWalletMonitoringTransfer {
+                            event_id: "ethereum:0xabc:2".to_owned(),
+                            from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                            to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            amount: "1.000001".to_owned(),
+                            token_symbol: "USDC".to_owned(),
+                            timestamp: 1_786_665_600,
+                        },
+                    ),
+                ),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::Wallet,
-            KytrixServiceEvent::WalletTransfer(transfer),
+            ServiceTopic::CryptocurrencyWalletMonitoring,
+            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a wallet transfer");
+            panic!("expected a cryptocurrency_wallet_monitoring transfer");
         };
         assert_eq!(transfer.event_id, "ethereum:0xabc:2");
         assert_eq!(transfer.amount, "1.000001");
@@ -897,29 +916,31 @@ mod tests {
     }
 
     #[test]
-    fn wallet_transfer_should_decode_zero_amount() {
+    fn cryptocurrency_wallet_monitoring_transfer_should_decode_zero_amount() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::WalletTransfer(
-                    proto_types::WalletTransfer {
-                        event_id: "ethereum:0xabc:3".to_owned(),
-                        from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                        to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                        amount: "0".to_owned(),
-                        token_symbol: "ETH".to_owned(),
-                        timestamp: 1_786_665_600,
-                    },
-                )),
+                event: Some(
+                    proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
+                        proto_types::CryptocurrencyWalletMonitoringTransfer {
+                            event_id: "ethereum:0xabc:3".to_owned(),
+                            from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                            to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                            amount: "0".to_owned(),
+                            token_symbol: "ETH".to_owned(),
+                            timestamp: 1_786_665_600,
+                        },
+                    ),
+                ),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::Wallet,
-            KytrixServiceEvent::WalletTransfer(transfer),
+            ServiceTopic::CryptocurrencyWalletMonitoring,
+            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a wallet transfer");
+            panic!("expected a cryptocurrency_wallet_monitoring transfer");
         };
         assert_eq!(transfer.amount, "0");
     }

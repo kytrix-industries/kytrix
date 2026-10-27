@@ -1127,7 +1127,8 @@ impl ServiceSessionActor {
             ServiceTopic::Ais(area) => {
                 self.latest_ais_keyframes.remove(area);
             }
-            ServiceTopic::News | ServiceTopic::X | ServiceTopic::Wallet => {}
+            ServiceTopic::News | ServiceTopic::X | ServiceTopic::CryptocurrencyWalletMonitoring => {
+            }
         }
     }
 
@@ -1138,7 +1139,7 @@ impl ServiceSessionActor {
                 ServiceTopic::Index(topic) => self.latest_indices.get(topic).cloned(),
                 ServiceTopic::News
                 | ServiceTopic::X
-                | ServiceTopic::Wallet
+                | ServiceTopic::CryptocurrencyWalletMonitoring
                 | ServiceTopic::Ais(_) => None,
             })
             .collect::<Vec<_>>();

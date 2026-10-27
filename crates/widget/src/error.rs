@@ -3,8 +3,10 @@ use std::convert::Infallible;
 use gpui_kit::{App, SharedString};
 use i18n::t;
 use kytrix_service_provider::service::{
+    cryptocurrency_wallet_monitoring::{
+        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationUnknown,
+    },
     engine::{ErrorCode, KytrixServiceError},
-    wallet::{WalletApiError, WalletMutationUnknown},
     x::{XApiError, XMutationUnknown},
 };
 use market_participants_connector::{
@@ -1906,30 +1908,56 @@ impl LocalizedError for XMutationUnknown {
     }
 }
 
-impl LocalizedError for WalletApiError {
+impl LocalizedError for CryptocurrencyWalletMonitoringApiError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidAddress => t!(cx, "widget.wallet_monitor.invalid_address"),
-            Self::Conflict => t!(cx, "widget.wallet_monitor.conflict"),
-            Self::NotFound => t!(cx, "widget.wallet_monitor.not_found"),
-            Self::Unavailable => t!(cx, "widget.wallet_monitor.unavailable"),
-            Self::Authentication => t!(cx, "widget.wallet_monitor.authentication_failed"),
-            Self::Network(detail) => t!(cx, "error.wallet.network", detail = detail),
+            Self::InvalidAddress => t!(
+                cx,
+                "widget.cryptocurrency_wallet_monitoring.invalid_address"
+            ),
+            Self::Conflict => t!(cx, "widget.cryptocurrency_wallet_monitoring.conflict"),
+            Self::NotFound => t!(cx, "widget.cryptocurrency_wallet_monitoring.not_found"),
+            Self::Unavailable => t!(cx, "widget.cryptocurrency_wallet_monitoring.unavailable"),
+            Self::Authentication => t!(
+                cx,
+                "widget.cryptocurrency_wallet_monitoring.authentication_failed"
+            ),
+            Self::Network(detail) => t!(
+                cx,
+                "error.cryptocurrency_wallet_monitoring.network",
+                detail = detail
+            ),
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
-            Self::Protocol(detail) => t!(cx, "error.wallet.protocol", detail = detail),
-            Self::ResponseTooLarge => t!(cx, "error.wallet.response_too_large"),
-            Self::InvalidResponse => t!(cx, "error.wallet.invalid_response"),
-            Self::Server(status) => t!(cx, "error.wallet.server", status = status.as_u16()),
-            Self::Timeout => t!(cx, "error.wallet.timeout"),
-            Self::Closed => t!(cx, "error.wallet.closed"),
-            Self::AccountChanged => t!(cx, "error.wallet.account_changed"),
-            Self::NotReady => t!(cx, "error.wallet.not_ready"),
+            Self::Protocol(detail) => t!(
+                cx,
+                "error.cryptocurrency_wallet_monitoring.protocol",
+                detail = detail
+            ),
+            Self::ResponseTooLarge => t!(
+                cx,
+                "error.cryptocurrency_wallet_monitoring.response_too_large"
+            ),
+            Self::InvalidResponse => t!(
+                cx,
+                "error.cryptocurrency_wallet_monitoring.invalid_response"
+            ),
+            Self::Server(status) => t!(
+                cx,
+                "error.cryptocurrency_wallet_monitoring.server",
+                status = status.as_u16()
+            ),
+            Self::Timeout => t!(cx, "error.cryptocurrency_wallet_monitoring.timeout"),
+            Self::Closed => t!(cx, "error.cryptocurrency_wallet_monitoring.closed"),
+            Self::AccountChanged => {
+                t!(cx, "error.cryptocurrency_wallet_monitoring.account_changed")
+            }
+            Self::NotReady => t!(cx, "error.cryptocurrency_wallet_monitoring.not_ready"),
         }
     }
 }
 
-impl LocalizedError for WalletMutationUnknown {
+impl LocalizedError for CryptocurrencyWalletMonitoringMutationUnknown {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Timeout => t!(cx, "error.mutation.timeout"),
@@ -3010,8 +3038,8 @@ mod tests {
             include_str!("../../widgets/volume_heatmap/src/view.rs"),
         ),
         (
-            "crates/widgets/wallet_monitor/src/view.rs",
-            include_str!("../../widgets/wallet_monitor/src/view.rs"),
+            "crates/widgets/cryptocurrency_wallet_monitoring/src/view.rs",
+            include_str!("../../widgets/cryptocurrency_wallet_monitoring/src/view.rs"),
         ),
         (
             "crates/widgets/watch_list/src/view.rs",

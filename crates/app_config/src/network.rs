@@ -31,8 +31,8 @@ pub enum KytrixServiceCapability {
     Indices,
     #[serde(rename = "x")]
     X,
-    #[serde(rename = "wallet")]
-    Wallet,
+    #[serde(rename = "cryptocurrency_wallet_monitoring")]
+    CryptocurrencyWalletMonitoring,
     #[serde(rename = "x_media")]
     XMedia,
     /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
@@ -915,7 +915,7 @@ mod tests {
                 capability: KytrixServiceCapability::Account,
             },
             ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::Wallet,
+                capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             },
         ];
         let mut applications = BTreeMap::new();
@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(applications.len(), targets.len());
         assert_eq!(
             applications.get(&ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::Wallet,
+                capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             }),
             Some(&ProxyRoute::named("hk")),
             "a separate but equal target addresses the same entry"

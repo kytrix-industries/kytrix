@@ -16,10 +16,10 @@ use app_config_provider::{
 use gpui_kit::App;
 use kytrix_proto::{
     client::{
-        GetCmcFearGreedIndex, GetCryptocurrencyEtf, GetFinancialCalendar, GetIndexManifest,
-        GetPentagonPizzaIndex, WalletAddSelection, WalletDeleteSelection, WalletSelections,
-        XAddSelection, XDeleteSelection, XSearch, XSelections, XTweets,
-        request::Request as ClientRequestKind,
+        CryptocurrencyWalletMonitoringAddSelection, CryptocurrencyWalletMonitoringDeleteSelection,
+        CryptocurrencyWalletMonitoringSelections, GetCmcFearGreedIndex, GetCryptocurrencyEtf,
+        GetFinancialCalendar, GetIndexManifest, GetPentagonPizzaIndex, XAddSelection,
+        XDeleteSelection, XSearch, XSelections, XTweets, request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
     types as proto_types,
@@ -43,12 +43,14 @@ use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
     ais::{AisArea, AisUpdate},
+    cryptocurrency_wallet_monitoring::{
+        self, CryptocurrencyWalletMonitoringApiError,
+        CryptocurrencyWalletMonitoringMutationOutcome,
+        CryptocurrencyWalletMonitoringMutationUnknown, CryptocurrencyWalletMonitoringSelection,
+        CryptocurrencyWalletMonitoringSelectionsResponse,
+    },
     handoff::request_dashboard_handoff,
     supervisor::run_service_supervisor,
-    wallet::{
-        self, WalletApiError, WalletMutationOutcome, WalletMutationUnknown, WalletSelection,
-        WalletSelectionsResponse,
-    },
     x::{
         self, TweetsResponse, XApiError, XMutationOutcome, XMutationUnknown, XProfile, XSelection,
         XSelectionsResponse,
@@ -68,12 +70,13 @@ use crate::{
     },
     service::{
         engine::{
-            COMMAND_CAPACITY, CancelOnDrop, Command, IndexEvent, IndexTopic, KYTRIX_SERVICE_WS_URL,
-            KytrixAccountSession, KytrixServiceConnectorInner, KytrixServiceError,
-            KytrixSessionState, NewsEvent, OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT,
-            SUBSCRIBER_CAPACITY, ServiceSessionContext, ServiceTopic, SessionStateRegistry,
-            SubscriberSink, SupervisorCommand, TweetBatch, WalletTransfer, XSubscriptionEvent,
-            authorization_url, await_account_operation, kytrix_service_endpoint, normalize_topics,
+            COMMAND_CAPACITY, CancelOnDrop, Command, CryptocurrencyWalletMonitoringTransfer,
+            IndexEvent, IndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
+            KytrixServiceConnectorInner, KytrixServiceError, KytrixSessionState, NewsEvent,
+            OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT, SUBSCRIBER_CAPACITY,
+            ServiceSessionContext, ServiceTopic, SessionStateRegistry, SubscriberSink,
+            SupervisorCommand, TweetBatch, XSubscriptionEvent, authorization_url,
+            await_account_operation, kytrix_service_endpoint, normalize_topics,
             service_account_profile, service_authorization_headers_with_profile,
             subscription_setup_error,
         },
@@ -106,9 +109,9 @@ impl KytrixAccountSession {
         &self.profile
     }
 
-    pub async fn subscribe_wallet(
+    pub async fn subscribe_cryptocurrency_wallet_monitoring(
         &self,
-    ) -> Result<Subscription<WalletTransfer>, KytrixServiceError> {
+    ) -> Result<Subscription<CryptocurrencyWalletMonitoringTransfer>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -117,8 +120,8 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::Wallet],
-                SubscriberSink::Wallet(publisher),
+                &[ServiceTopic::CryptocurrencyWalletMonitoring],
+                SubscriberSink::CryptocurrencyWalletMonitoring(publisher),
             )
             .await?;
         Ok(subscription)
@@ -165,93 +168,124 @@ impl KytrixAccountSession {
         self.connector.subscribe_session_state()
     }
 
-    pub async fn fetch_wallet_selections(
+    pub async fn fetch_cryptocurrency_wallet_monitoring_selections(
         &self,
-    ) -> Result<WalletSelectionsResponse, WalletApiError> {
+    ) -> Result<
+        CryptocurrencyWalletMonitoringSelectionsResponse,
+        CryptocurrencyWalletMonitoringApiError,
+    > {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::Wallet,
-                ClientRequestKind::WalletSelections(WalletSelections {}),
+                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                ClientRequestKind::CryptocurrencyWalletMonitoringSelections(
+                    CryptocurrencyWalletMonitoringSelections {},
+                ),
             )
             .await
-            .map_err(|error| wallet::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::WalletSelections(response) = response else {
-            return Err(WalletApiError::Protocol(
-                "unexpected wallet selections RPC response".into(),
+            .map_err(|error| cryptocurrency_wallet_monitoring::map_rpc_error(error.into_error()))?;
+        let ServerResponseKind::CryptocurrencyWalletMonitoringSelections(response) = response
+        else {
+            return Err(CryptocurrencyWalletMonitoringApiError::Protocol(
+                "unexpected cryptocurrency_wallet_monitoring selections RPC response".into(),
             ));
         };
-        let mut value = WalletSelectionsResponse {
+        let mut value = CryptocurrencyWalletMonitoringSelectionsResponse {
             selections: response
                 .selections
                 .into_iter()
-                .map(wallet::decode_wallet_selection)
+                .map(cryptocurrency_wallet_monitoring::decode_cryptocurrency_wallet_monitoring_selection)
                 .collect::<Result<Vec<_>, _>>()?,
-            wallet_address_limit: response.wallet_address_limit as usize,
+            cryptocurrency_wallet_monitoring_address_limit: response.cryptocurrency_wallet_monitoring_address_limit as usize,
         };
-        wallet::validate_selections(&value)?;
-        wallet::sort_selections(&mut value.selections);
+        cryptocurrency_wallet_monitoring::validate_selections(&value)?;
+        cryptocurrency_wallet_monitoring::sort_selections(&mut value.selections);
         Ok(value)
     }
 
-    pub async fn add_wallet_selection(
+    pub async fn add_cryptocurrency_wallet_monitoring_selection(
         &self,
         address: &str,
-    ) -> WalletMutationOutcome<WalletSelection> {
-        if wallet::wallet_network(address).is_none() {
-            return WalletMutationOutcome::Rejected(WalletApiError::InvalidAddress);
+    ) -> CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>
+    {
+        if cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(address)
+            .is_none()
+        {
+            return CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitoringApiError::InvalidAddress,
+            );
         }
         let response = match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::Wallet,
-                ClientRequestKind::WalletAddSelection(WalletAddSelection {
-                    address: address.to_owned(),
-                }),
+                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                ClientRequestKind::CryptocurrencyWalletMonitoringAddSelection(
+                    CryptocurrencyWalletMonitoringAddSelection {
+                        address: address.to_owned(),
+                    },
+                ),
             )
             .await
         {
             Ok(response) => response,
-            Err(error) => return wallet::mutation_rpc_error(error),
+            Err(error) => return cryptocurrency_wallet_monitoring::mutation_rpc_error(error),
         };
-        let ServerResponseKind::WalletAddSelection(response) = response else {
-            return WalletMutationOutcome::Unknown(WalletMutationUnknown::InvalidResponse);
+        let ServerResponseKind::CryptocurrencyWalletMonitoringAddSelection(response) = response
+        else {
+            return CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            );
         };
         let Some(selection) = response.selection else {
-            return WalletMutationOutcome::Unknown(WalletMutationUnknown::InvalidResponse);
+            return CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            );
         };
-        match wallet::decode_wallet_selection(selection) {
+        match cryptocurrency_wallet_monitoring::decode_cryptocurrency_wallet_monitoring_selection(
+            selection,
+        ) {
             Ok(selection) if selection.address == address => {
-                WalletMutationOutcome::Confirmed(selection)
+                CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(selection)
             }
-            Ok(_) | Err(_) => {
-                WalletMutationOutcome::Unknown(WalletMutationUnknown::InvalidResponse)
-            }
+            Ok(_) | Err(_) => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            ),
         }
     }
 
-    pub async fn delete_wallet_selection(&self, address: &str) -> WalletMutationOutcome<()> {
-        if wallet::wallet_network(address).is_none() {
-            return WalletMutationOutcome::Rejected(WalletApiError::InvalidAddress);
+    pub async fn delete_cryptocurrency_wallet_monitoring_selection(
+        &self,
+        address: &str,
+    ) -> CryptocurrencyWalletMonitoringMutationOutcome<()> {
+        if cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(address)
+            .is_none()
+        {
+            return CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitoringApiError::InvalidAddress,
+            );
         }
         match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::Wallet,
-                ClientRequestKind::WalletDeleteSelection(WalletDeleteSelection {
-                    address: address.to_owned(),
-                }),
+                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                ClientRequestKind::CryptocurrencyWalletMonitoringDeleteSelection(
+                    CryptocurrencyWalletMonitoringDeleteSelection {
+                        address: address.to_owned(),
+                    },
+                ),
             )
             .await
         {
-            Ok(ServerResponseKind::WalletDeleteSelection(_)) => {
-                WalletMutationOutcome::Confirmed(())
+            Ok(ServerResponseKind::CryptocurrencyWalletMonitoringDeleteSelection(_)) => {
+                CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(())
             }
-            Ok(_) => WalletMutationOutcome::Unknown(WalletMutationUnknown::InvalidResponse),
-            Err(error) => wallet::mutation_rpc_error(error),
+            Ok(_) => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            ),
+            Err(error) => cryptocurrency_wallet_monitoring::mutation_rpc_error(error),
         }
     }
 
@@ -1200,7 +1234,10 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::service::{
-        wallet::{WalletMutationOutcome, WalletMutationUnknown},
+        cryptocurrency_wallet_monitoring::{
+            CryptocurrencyWalletMonitoringMutationOutcome,
+            CryptocurrencyWalletMonitoringMutationUnknown,
+        },
         x::XSelectionStatus,
     };
 
@@ -1383,7 +1420,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_mutation_response_loss_is_unknown_and_is_not_retried() {
+    async fn cryptocurrency_wallet_monitoring_mutation_response_loss_is_unknown_and_is_not_retried()
+    {
         let mut server = TestServiceServer::spawn(false).await;
         server.drop_next_response();
         let connector =
@@ -1395,12 +1433,16 @@ mod tests {
         let address = "0x0000000000000000000000000000000000000001";
 
         assert_eq!(
-            session.add_wallet_selection(address).await,
-            WalletMutationOutcome::Unknown(WalletMutationUnknown::ResponseLost)
+            session
+                .add_cryptocurrency_wallet_monitoring_selection(address)
+                .await,
+            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitoringMutationUnknown::ResponseLost
+            )
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("wallet_add_selection")
+            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_add_selection")
         );
         server.assert_no_request().await;
 
@@ -1440,7 +1482,8 @@ mod tests {
     #[tokio::test]
     async fn pending_rpc_responses_can_complete_out_of_order_and_cancel_independently() {
         let (_invalidations, invalidations) = credential_change_watch();
-        let (mut actor, _subscription) = actor_with_wallet_subscriber(invalidations);
+        let (mut actor, _subscription) =
+            actor_with_cryptocurrency_wallet_monitoring_subscriber(invalidations);
         let profile = actor
             .account_profile
             .read()
@@ -1454,7 +1497,7 @@ mod tests {
                 id,
                 PendingRpc {
                     expected_profile: profile.clone(),
-                    capability: KytrixServiceCapability::Wallet,
+                    capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
                     route_generation: NetworkRouteGeneration::default(),
                     cancellation: CancellationToken::new(),
                     deadline: Instant::now() + Duration::from_secs(1),
@@ -1464,9 +1507,11 @@ mod tests {
         }
         let response = |id| proto_response::Response {
             id,
-            response: Some(proto_response::response::Response::WalletDeleteSelection(
-                proto_response::WalletDeleteSelectionResponse {},
-            )),
+            response: Some(
+                proto_response::response::Response::CryptocurrencyWalletMonitoringDeleteSelection(
+                    proto_response::CryptocurrencyWalletMonitoringDeleteSelectionResponse {},
+                ),
+            ),
         };
 
         assert!(actor.complete_pending_rpc(response(2)));
@@ -1480,7 +1525,7 @@ mod tests {
             3,
             PendingRpc {
                 expected_profile: profile,
-                capability: KytrixServiceCapability::Wallet,
+                capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
                 route_generation: NetworkRouteGeneration::default(),
                 cancellation: cancellation.clone(),
                 deadline: Instant::now() + Duration::from_secs(1),
@@ -1663,10 +1708,10 @@ mod tests {
                 ])
             )
         );
-        let mut wallet = session
-            .subscribe_wallet()
+        let mut cryptocurrency_wallet_monitoring = session
+            .subscribe_cryptocurrency_wallet_monitoring()
             .await
-            .expect("wallet should subscribe");
+            .expect("cryptocurrency_wallet_monitoring should subscribe");
         assert_eq!(
             server.next_request().await,
             (
@@ -1675,7 +1720,7 @@ mod tests {
                     ServiceTopic::News,
                     ServiceTopic::Index(index),
                     ServiceTopic::X,
-                    ServiceTopic::Wallet,
+                    ServiceTopic::CryptocurrencyWalletMonitoring,
                 ])
             )
         );
@@ -1691,7 +1736,7 @@ mod tests {
                     ServiceTopic::News,
                     ServiceTopic::Index(index_topic("SPX")),
                     ServiceTopic::X,
-                    ServiceTopic::Wallet,
+                    ServiceTopic::CryptocurrencyWalletMonitoring,
                     ServiceTopic::Ais(AisArea::Hormuz),
                 ])
             )
@@ -1701,7 +1746,9 @@ mod tests {
         server.send_news("typed-news");
         server.send_index("SPX");
         server.send_x_profile();
-        server.send_wallet_transfer("typed-wallet");
+        server.send_cryptocurrency_wallet_monitoring_transfer(
+            "typed-cryptocurrency_wallet_monitoring",
+        );
         server.send_ais_delta();
 
         assert_eq!(
@@ -1729,12 +1776,15 @@ mod tests {
             XSubscriptionEvent::Profile(XProfileEvent { username, .. }) if username == "kytrix"
         ));
         assert_eq!(
-            timeout(Duration::from_secs(2), wallet.recv())
-                .await
-                .expect("wallet event should arrive")
-                .expect("wallet subscription should remain active")
-                .event_id,
-            "typed-wallet"
+            timeout(
+                Duration::from_secs(2),
+                cryptocurrency_wallet_monitoring.recv()
+            )
+            .await
+            .expect("cryptocurrency_wallet_monitoring event should arrive")
+            .expect("cryptocurrency_wallet_monitoring subscription should remain active")
+            .event_id,
+            "typed-cryptocurrency_wallet_monitoring"
         );
         assert_eq!(
             timeout(Duration::from_secs(2), ais.recv())
@@ -1746,10 +1796,14 @@ mod tests {
         assert!(news.try_recv_for_test().is_err());
         assert!(indices.try_recv_for_test().is_err());
         assert!(x.try_recv_for_test().is_err());
-        assert!(wallet.try_recv_for_test().is_err());
+        assert!(
+            cryptocurrency_wallet_monitoring
+                .try_recv_for_test()
+                .is_err()
+        );
         assert!(ais.try_recv_for_test().is_err());
 
-        drop((news, indices, x, wallet, ais));
+        drop((news, indices, x, cryptocurrency_wallet_monitoring, ais));
         connector.shutdown().await;
         server.shutdown().await;
     }

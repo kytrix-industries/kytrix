@@ -485,7 +485,9 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                 &[
                     "kytrix",
                     "account",
+                    "cryptocurrency",
                     "wallet",
+                    "monitoring",
                     "news",
                     "x",
                     "cmc",
@@ -1348,7 +1350,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::Account,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::Wallet,
+        capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::CryptocurrencyEtf,

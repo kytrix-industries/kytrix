@@ -28,7 +28,7 @@ perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
 tweet_monitor = { workspace = true }
 volume_heatmap = { workspace = true }
-wallet_monitor = { workspace = true }
+cryptocurrency_wallet_monitoring = { workspace = true }
 watch_list = { workspace = true }
 widget = { workspace = true }
 

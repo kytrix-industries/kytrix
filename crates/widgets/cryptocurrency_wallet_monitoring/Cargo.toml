@@ -1,5 +1,5 @@
 [package]
-name = "wallet_monitor"
+name = "cryptocurrency_wallet_monitoring"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

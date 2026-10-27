@@ -10,7 +10,7 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
         ServiceTopic::News => Some("news"),
         ServiceTopic::Index(_) => Some("indices"),
         ServiceTopic::X => Some("x"),
-        ServiceTopic::Wallet => Some("wallet"),
+        ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
         ServiceTopic::Ais(_) => Some("ais"),
     }
 }
@@ -24,7 +24,9 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::News => Some("news"),
         KytrixServiceCapability::Indices => Some("indices"),
         KytrixServiceCapability::X => Some("x"),
-        KytrixServiceCapability::Wallet => Some("wallet"),
+        KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
+            Some("cryptocurrency_wallet_monitoring")
+        }
         KytrixServiceCapability::Ais => Some("ais"),
         KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
         KytrixServiceCapability::Cmc => Some("cmc_fear_greed"),
@@ -54,7 +56,10 @@ mod tests {
                 "indices",
             ),
             (ServiceTopic::X, "x"),
-            (ServiceTopic::Wallet, "wallet"),
+            (
+                ServiceTopic::CryptocurrencyWalletMonitoring,
+                "cryptocurrency_wallet_monitoring",
+            ),
             (ServiceTopic::Ais(AisArea::Hormuz), "ais"),
         ];
 
@@ -74,7 +79,10 @@ mod tests {
             (KytrixServiceCapability::News, Some("news")),
             (KytrixServiceCapability::Indices, Some("indices")),
             (KytrixServiceCapability::X, Some("x")),
-            (KytrixServiceCapability::Wallet, Some("wallet")),
+            (
+                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                Some("cryptocurrency_wallet_monitoring"),
+            ),
             (KytrixServiceCapability::XMedia, None),
             (KytrixServiceCapability::Cmc, Some("cmc_fear_greed")),
             (

@@ -35,8 +35,8 @@ use crate::{
     account_profile::AccountProfile,
     auth::model::{SessionAvailability, SessionChange},
     service::engine::{
-        ErrorCode, IndexTopic, KYTRIX_SERVICE_WS_URL, ServiceSessionActor, ServiceTopic,
-        SubscriberSink, WalletTransfer,
+        CryptocurrencyWalletMonitoringTransfer, ErrorCode, IndexTopic, KYTRIX_SERVICE_WS_URL,
+        ServiceSessionActor, ServiceTopic, SubscriberSink,
     },
 };
 
@@ -99,7 +99,7 @@ impl TestConfigManager {
             KytrixServiceCapability::News,
             KytrixServiceCapability::Indices,
             KytrixServiceCapability::X,
-            KytrixServiceCapability::Wallet,
+            KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             KytrixServiceCapability::Ais,
             KytrixServiceCapability::XMedia,
             KytrixServiceCapability::Cmc,
@@ -151,7 +151,7 @@ pub(super) const INDEX_EVENT_WIRE: &[u8] = &[
 ];
 pub(super) const X_PROFILE_EVENT_WIRE: &[u8] =
     b"\x12\x24\x2a\x22\x0a\x02\x34\x32\x12\x02ky\x1a\x02Ky\x22\x10https://x.test/a\x28\x01\x30\x07";
-pub(super) const WALLET_EVENT_WIRE: &[u8] = b"\x12\x5c\x22\x5a\x0a\x01e\x12\x2011111111111111111111111111111111\x1a\x2011111111111111111111111111111111\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
+pub(super) const CRYPTOCURRENCY_WALLET_MONITORING_EVENT_WIRE: &[u8] = b"\x12\x5c\x22\x5a\x0a\x01e\x12\x2011111111111111111111111111111111\x1a\x2011111111111111111111111111111111\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
 pub(super) const UNKNOWN_SERVER_ONEOF_WIRE: &[u8] = &[0x2a, 0x00];
 
 pub(super) const TEST_ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -396,11 +396,13 @@ pub(super) fn pending_x_selection() -> proto_types::XSelection {
     }
 }
 
-pub(super) fn test_wallet_selection(address: String) -> proto_types::WalletSelection {
-    proto_types::WalletSelection {
-        network: proto_types::WalletNetwork::Ethereum as i32,
+pub(super) fn test_cryptocurrency_wallet_monitoring_selection(
+    address: String,
+) -> proto_types::CryptocurrencyWalletMonitoringSelection {
+    proto_types::CryptocurrencyWalletMonitoringSelection {
+        network: proto_types::CryptocurrencyWalletMonitoringNetwork::Ethereum as i32,
         address,
-        status: proto_types::WalletSelectionStatus::Active as i32,
+        status: proto_types::CryptocurrencyWalletMonitoringSelectionStatus::Active as i32,
         created_at: 1,
         updated_at: 1,
     }
@@ -425,9 +427,12 @@ pub(super) fn error_response(id: u32, code: i32) -> proto_response::Response {
     }
 }
 
-pub(super) fn actor_with_wallet_subscriber(
+pub(super) fn actor_with_cryptocurrency_wallet_monitoring_subscriber(
     invalidations: watch::Receiver<SessionChange>,
-) -> (ServiceSessionActor, Subscription<WalletTransfer>) {
+) -> (
+    ServiceSessionActor,
+    Subscription<CryptocurrencyWalletMonitoringTransfer>,
+) {
     let (_commands, receiver) = mpsc::channel(1);
     let wake = Arc::new(Notify::new());
     let mut actor = ServiceSessionActor::with_url(
@@ -446,8 +451,8 @@ pub(super) fn actor_with_wallet_subscriber(
         .expect("the test subscription should have positive capacity");
     actor.add_subscriber_inner(
         1,
-        vec![ServiceTopic::Wallet],
-        SubscriberSink::Wallet(publisher),
+        vec![ServiceTopic::CryptocurrencyWalletMonitoring],
+        SubscriberSink::CryptocurrencyWalletMonitoring(publisher),
         Some(profile),
         NetworkRouteGeneration::default(),
     );
@@ -606,7 +611,10 @@ impl TestServiceServer {
                                                 ("news".to_owned(), enabled_entitlement(true)),
                                                 ("ais".to_owned(), enabled_entitlement(true)),
                                                 ("indices".to_owned(), limit_entitlement(3)),
-                                                ("wallet".to_owned(), limit_entitlement(3)),
+                                                (
+                                                    "cryptocurrency_wallet_monitoring".to_owned(),
+                                                    limit_entitlement(3),
+                                                ),
                                             ]),
                                             catalog: vec![
                                                 feature_definition(
@@ -622,7 +630,7 @@ impl TestServiceServer {
                                                     proto_types::FeatureValueType::Limit,
                                                 ),
                                                 feature_definition(
-                                                    "wallet",
+                                                    "cryptocurrency_wallet_monitoring",
                                                     proto_types::FeatureValueType::Limit,
                                                 ),
                                             ],
@@ -782,31 +790,31 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::WalletSelections(_) => (
-                                            ObservedRequest::Rpc("wallet_selections"),
-                                            proto_response::response::Response::WalletSelections(
-                                                proto_response::WalletSelectionsResponse {
+                                        ClientRequestKind::CryptocurrencyWalletMonitoringSelections(_) => (
+                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_selections"),
+                                            proto_response::response::Response::CryptocurrencyWalletMonitoringSelections(
+                                                proto_response::CryptocurrencyWalletMonitoringSelectionsResponse {
                                                     selections: Vec::new(),
-                                                    wallet_address_limit: 3,
+                                                    cryptocurrency_wallet_monitoring_address_limit: 3,
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::WalletAddSelection(request) => (
-                                            ObservedRequest::Rpc("wallet_add_selection"),
-                                            proto_response::response::Response::WalletAddSelection(
-                                                proto_response::WalletAddSelectionResponse {
-                                                    selection: Some(test_wallet_selection(
+                                        ClientRequestKind::CryptocurrencyWalletMonitoringAddSelection(request) => (
+                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_add_selection"),
+                                            proto_response::response::Response::CryptocurrencyWalletMonitoringAddSelection(
+                                                proto_response::CryptocurrencyWalletMonitoringAddSelectionResponse {
+                                                    selection: Some(test_cryptocurrency_wallet_monitoring_selection(
                                                         request.address,
                                                     )),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::WalletDeleteSelection(_) => (
-                                            ObservedRequest::Rpc("wallet_delete_selection"),
-                                            proto_response::response::Response::WalletDeleteSelection(
-                                                proto_response::WalletDeleteSelectionResponse {},
+                                        ClientRequestKind::CryptocurrencyWalletMonitoringDeleteSelection(_) => (
+                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_delete_selection"),
+                                            proto_response::response::Response::CryptocurrencyWalletMonitoringDeleteSelection(
+                                                proto_response::CryptocurrencyWalletMonitoringDeleteSelectionResponse {},
                                             ),
                                             false,
                                         ),
@@ -877,8 +885,8 @@ impl TestServiceServer {
                                                     server_message::Message::Event(
                                                         proto_event::Event {
                                                             event: Some(
-                                                                proto_event::event::Event::WalletTransfer(
-                                                                    proto_types::WalletTransfer {
+                                                                proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
+                                                                    proto_types::CryptocurrencyWalletMonitoringTransfer {
                                                                         event_id: "old-session-event".to_owned(),
                                                                         from_address: "0x0000000000000000000000000000000000000001".to_owned(),
                                                                         to_address: "0x0000000000000000000000000000000000000002".to_owned(),
@@ -1013,17 +1021,19 @@ impl TestServiceServer {
         );
     }
 
-    pub(super) fn send_wallet_transfer(&self, event_id: &str) {
-        self.send_event(proto_event::event::Event::WalletTransfer(
-            proto_types::WalletTransfer {
-                event_id: event_id.to_owned(),
-                from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                amount: "1".to_owned(),
-                token_symbol: "ETH".to_owned(),
-                timestamp: 1,
-            },
-        ));
+    pub(super) fn send_cryptocurrency_wallet_monitoring_transfer(&self, event_id: &str) {
+        self.send_event(
+            proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
+                proto_types::CryptocurrencyWalletMonitoringTransfer {
+                    event_id: event_id.to_owned(),
+                    from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                    to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                    amount: "1".to_owned(),
+                    token_symbol: "ETH".to_owned(),
+                    timestamp: 1,
+                },
+            ),
+        );
     }
 
     pub(super) fn send_ais_delta(&self) {

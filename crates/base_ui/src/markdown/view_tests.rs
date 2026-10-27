@@ -66,8 +66,8 @@ const PLACEHOLDER_MESSAGES: &[&str] = &[
     "widget.perpetual_statistics.select_instrument_prompt",
     "widget.tweet_monitor.logged_out",
     "widget.tweet_monitor.waiting",
-    "widget.wallet_monitor.empty_addresses",
-    "widget.wallet_monitor.logged_out",
+    "widget.cryptocurrency_wallet_monitoring.empty_addresses",
+    "widget.cryptocurrency_wallet_monitoring.logged_out",
 ];
 
 /// 安装产品自己的目录，与启动时装的是同一份。

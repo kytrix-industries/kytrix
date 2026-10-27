@@ -469,7 +469,7 @@ error:
     stream_unavailable: The volume heat map stream is not available
     timeout: The volume heat map did not answer within %{seconds} seconds
     too_many_tickers: 'The %{route} ticker answer contains %{count} entries, which is more than the %{limit} a heat map is built from'
-  wallet:
+  cryptocurrency_wallet_monitoring:
     account_changed: The Wallet API account session changed
     closed: The Wallet API account session is closed
     invalid_response: The Wallet API returned invalid data
@@ -824,7 +824,7 @@ widget:
     top_trader_position_ratio: Top Trader Position Ratio
     tweet_monitor: Tweet Monitor
     volume_heatmap: Volume Heat Map
-    wallet_monitor: Wallet Monitor
+    cryptocurrency_wallet_monitoring: Cryptocurrency Wallet Monitoring
     watch_list: Watch List
   news:
     crypto: Crypto
@@ -921,7 +921,7 @@ widget:
   volume_heatmap:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now
-  wallet_monitor:
+  cryptocurrency_wallet_monitoring:
     active: Active
     add_address: Add wallet address
     add_success: Wallet address added successfully
