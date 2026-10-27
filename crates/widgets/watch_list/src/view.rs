@@ -869,7 +869,7 @@ pub struct WatchListWidget {
 impl WidgetView for WatchListWidget {
     type Config = WatchListConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.watch_list");
+    const ID: WidgetId = WidgetId::new_static("kytrix.watch_list");
     const DISPLAY_NAME: &'static str = "widget.names.watch_list";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Live 24-hour statistics for followed listings";

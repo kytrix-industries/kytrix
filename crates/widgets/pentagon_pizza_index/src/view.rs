@@ -157,7 +157,7 @@ pub struct PentagonPizzaIndexWidget {
 impl WidgetView for PentagonPizzaIndexWidget {
     type Config = PentagonPizzaIndexConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.monitoring.pentagon_pizza_index");
+    const ID: WidgetId = WidgetId::new_static("kytrix.pentagon_pizza_index");
     const DISPLAY_NAME: &'static str = "widget.names.pentagon_pizza_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str =

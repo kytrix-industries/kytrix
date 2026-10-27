@@ -12,7 +12,10 @@ use smol_str::SmolStr;
 use time::{Date, Month};
 
 use super::{axes::ChartLayout, data::PreparedData};
-use crate::model::{EtfAsset, EtfDataset, EtfDay, EtfFundSelection, EtfWindow};
+use crate::model::{
+    CryptocurrencyEtfAsset, CryptocurrencyEtfDataset, CryptocurrencyEtfDay,
+    CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow,
+};
 
 /// The funds a fixture asset has, in the order its rows carry them.
 pub(crate) const FUNDS: [&str; 2] = ["AAA", "BBB"];
@@ -21,7 +24,7 @@ pub(crate) const FUNDS: [&str; 2] = ["AAA", "BBB"];
 ///
 /// Net assets are accumulated the way the model accumulates them, so a fixture is
 /// the same shape as an answer.
-pub(crate) fn dataset(flows: &[f64]) -> Arc<EtfDataset> {
+pub(crate) fn dataset(flows: &[f64]) -> Arc<CryptocurrencyEtfDataset> {
     // Julian days rather than ordinals of one year: a fixture is allowed to be
     // longer than a year, and an ordinal is not.
     let first = Date::from_calendar_date(2024, Month::January, 1)
@@ -33,7 +36,7 @@ pub(crate) fn dataset(flows: &[f64]) -> Arc<EtfDataset> {
         .enumerate()
         .map(|(index, flow)| {
             net_assets += flow;
-            EtfDay {
+            CryptocurrencyEtfDay {
                 date: Date::from_julian_day(first + i32::try_from(index).unwrap_or(i32::MAX))
                     .expect("fixture date should be valid"),
                 fund_flows: Arc::from([*flow, 0.0]),
@@ -42,8 +45,8 @@ pub(crate) fn dataset(flows: &[f64]) -> Arc<EtfDataset> {
             }
         })
         .collect::<Vec<_>>();
-    Arc::new(EtfDataset {
-        asset: EtfAsset::Btc,
+    Arc::new(CryptocurrencyEtfDataset {
+        asset: CryptocurrencyEtfAsset::Btc,
         funds: Arc::from(FUNDS.map(SmolStr::new_static)),
         days: days.into(),
     })
@@ -53,15 +56,20 @@ pub(crate) fn dataset(flows: &[f64]) -> Arc<EtfDataset> {
 pub(crate) fn prepared(
     cx: &App,
     flows: &[f64],
-    selection: EtfFundSelection,
-    window: EtfWindow,
+    selection: CryptocurrencyEtfFundSelection,
+    window: CryptocurrencyEtfWindow,
 ) -> PreparedData {
     PreparedData::new(cx, dataset(flows), selection, window)
 }
 
 /// The whole complex of a history, which is the view every chart opens with.
 pub(crate) fn prepared_all(cx: &App, flows: &[f64]) -> PreparedData {
-    prepared(cx, flows, EtfFundSelection::All, EtfWindow::All)
+    prepared(
+        cx,
+        flows,
+        CryptocurrencyEtfFundSelection::All,
+        CryptocurrencyEtfWindow::All,
+    )
 }
 
 /// A plot laid out in a chart of this size.

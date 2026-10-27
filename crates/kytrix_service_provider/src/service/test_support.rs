@@ -35,8 +35,8 @@ use crate::{
     account_profile::AccountProfile,
     auth::model::{SessionAvailability, SessionChange},
     service::engine::{
-        CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexTopic,
-        KYTRIX_SERVICE_WS_URL, ServiceSessionActor, ServiceTopic, SubscriberSink,
+        CryptocurrencyWalletMonitorTransfer, ErrorCode, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL,
+        ServiceSessionActor, ServiceTopic, SubscriberSink,
     },
 };
 
@@ -98,10 +98,10 @@ impl TestConfigManager {
             KytrixServiceCapability::CryptocurrencyEtf,
             KytrixServiceCapability::News,
             KytrixServiceCapability::FinancialIndices,
-            KytrixServiceCapability::XAccountMonitoring,
+            KytrixServiceCapability::X,
             KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-            KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
-            KytrixServiceCapability::XAccountMonitoringMedia,
+            KytrixServiceCapability::GlobalShippingChokepoint,
+            KytrixServiceCapability::XMedia,
             KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
             KytrixServiceCapability::FinancialCalendar,
             KytrixServiceCapability::PentagonPizzaIndex,
@@ -151,7 +151,7 @@ pub(super) const INDEX_EVENT_WIRE: &[u8] = &[
 ];
 pub(super) const X_PROFILE_EVENT_WIRE: &[u8] =
     b"\x12\x24\x2a\x22\x0a\x02\x34\x32\x12\x02ky\x1a\x02Ky\x22\x10https://x.test/a\x28\x01\x30\x07";
-pub(super) const CRYPTOCURRENCY_WALLET_MONITORING_EVENT_WIRE: &[u8] = b"\x12\x5c\x22\x5a\x0a\x01e\x12\x2011111111111111111111111111111111\x1a\x2011111111111111111111111111111111\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
+pub(super) const CRYPTOCURRENCY_WALLET_MONITOR_EVENT_WIRE: &[u8] = b"\x12\x5c\x22\x5a\x0a\x01e\x12\x2011111111111111111111111111111111\x1a\x2011111111111111111111111111111111\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
 pub(super) const UNKNOWN_SERVER_ONEOF_WIRE: &[u8] = &[0x2a, 0x00];
 
 pub(super) const TEST_ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -320,7 +320,7 @@ pub(super) fn x_profile() -> proto_types::XAccountMonitoringProfile {
 }
 
 /// One AIS push as the collector publishes it: one vessel, one position, one departure.
-pub(super) fn strategic_maritime_chokepoints_tracking_delta()
+pub(super) fn global_shipping_chokepoint_delta()
 -> proto_types::StrategicMaritimeChokepointsTrackingDelta {
     proto_types::StrategicMaritimeChokepointsTrackingDelta {
         area: proto_types::StrategicMaritimeChokepointsTrackingArea::Hormuz as i32,
@@ -364,13 +364,13 @@ pub(super) fn strategic_maritime_chokepoints_tracking_delta()
 /// The keyframe the collector publishes once it has a picture.
 ///
 /// A keyframe is the whole picture and therefore carries no departures.
-pub(super) fn strategic_maritime_chokepoints_tracking_keyframe()
+pub(super) fn global_shipping_chokepoint_keyframe()
 -> proto_types::StrategicMaritimeChokepointsTrackingDelta {
     proto_types::StrategicMaritimeChokepointsTrackingDelta {
         keyframe: true,
         base: 0,
         removed: Vec::new(),
-        ..strategic_maritime_chokepoints_tracking_delta()
+        ..global_shipping_chokepoint_delta()
     }
 }
 
@@ -399,7 +399,7 @@ pub(super) fn pending_x_selection() -> proto_types::XAccountMonitoringSelection 
     }
 }
 
-pub(super) fn test_cryptocurrency_wallet_monitoring_selection(
+pub(super) fn test_cryptocurrency_wallet_monitor_selection(
     address: String,
 ) -> proto_types::CryptocurrencyWalletMonitoringSelection {
     proto_types::CryptocurrencyWalletMonitoringSelection {
@@ -430,11 +430,11 @@ pub(super) fn error_response(id: u32, code: i32) -> proto_response::Response {
     }
 }
 
-pub(super) fn actor_with_cryptocurrency_wallet_monitoring_subscriber(
+pub(super) fn actor_with_cryptocurrency_wallet_monitor_subscriber(
     invalidations: watch::Receiver<SessionChange>,
 ) -> (
     ServiceSessionActor,
-    Subscription<CryptocurrencyWalletMonitoringTransfer>,
+    Subscription<CryptocurrencyWalletMonitorTransfer>,
 ) {
     let (_commands, receiver) = mpsc::channel(1);
     let wake = Arc::new(Notify::new());
@@ -613,8 +613,7 @@ impl TestServiceServer {
                                             entitlements: HashMap::from([
                                                 ("news".to_owned(), enabled_entitlement(true)),
                                                 (
-                                                    "strategic_maritime_chokepoints_tracking"
-                                                        .to_owned(),
+                                                    "global_shipping_chokepoint".to_owned(),
                                                     enabled_entitlement(true),
                                                 ),
                                                 (
@@ -632,7 +631,7 @@ impl TestServiceServer {
                                                     proto_types::FeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
-                                                    "strategic_maritime_chokepoints_tracking",
+                                                    "global_shipping_chokepoint",
                                                     proto_types::FeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
@@ -814,7 +813,7 @@ impl TestServiceServer {
                                             ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_add_selection"),
                                             proto_response::response::Response::CryptocurrencyWalletMonitoringAddSelection(
                                                 proto_response::CryptocurrencyWalletMonitoringAddSelectionResponse {
-                                                    selection: Some(test_cryptocurrency_wallet_monitoring_selection(
+                                                    selection: Some(test_cryptocurrency_wallet_monitor_selection(
                                                         request.address,
                                                     )),
                                                 },
@@ -1031,7 +1030,7 @@ impl TestServiceServer {
         );
     }
 
-    pub(super) fn send_cryptocurrency_wallet_monitoring_transfer(&self, event_id: &str) {
+    pub(super) fn send_cryptocurrency_wallet_monitor_transfer(&self, event_id: &str) {
         self.send_event(
             proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
                 proto_types::CryptocurrencyWalletMonitoringTransfer {
@@ -1046,18 +1045,18 @@ impl TestServiceServer {
         );
     }
 
-    pub(super) fn send_strategic_maritime_chokepoints_tracking_delta(&self) {
+    pub(super) fn send_global_shipping_chokepoint_delta(&self) {
         self.send_event(
             proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                strategic_maritime_chokepoints_tracking_delta(),
+                global_shipping_chokepoint_delta(),
             ),
         );
     }
 
-    pub(super) fn send_strategic_maritime_chokepoints_tracking_keyframe(&self) {
+    pub(super) fn send_global_shipping_chokepoint_keyframe(&self) {
         self.send_event(
             proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                strategic_maritime_chokepoints_tracking_keyframe(),
+                global_shipping_chokepoint_keyframe(),
             ),
         );
     }

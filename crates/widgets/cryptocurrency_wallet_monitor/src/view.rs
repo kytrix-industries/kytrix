@@ -1,4 +1,4 @@
-//! The cryptocurrency_wallet_monitoring-monitor pane: the transfers it follows, and the addresses it manages.
+//! The cryptocurrency_wallet_monitor-monitor pane: the transfers it follows, and the addresses it manages.
 //!
 //! # What a pane is scoped to
 //!
@@ -58,9 +58,9 @@ use gpui_kit::{
 use i18n::t;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    cryptocurrency_wallet_monitoring::{
-        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationOutcome,
-        CryptocurrencyWalletMonitoringMutationUnknown, cryptocurrency_wallet_monitoring_network,
+    cryptocurrency_wallet_monitor::{
+        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
+        CryptocurrencyWalletMonitorMutationUnknown, cryptocurrency_wallet_monitor_network,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -80,17 +80,17 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use super::{
-    dialog::{CryptocurrencyWalletMonitoringDialog, DialogState},
+    dialog::{CryptocurrencyWalletMonitorDialog, DialogState},
     model::{
-        CryptocurrencyWalletMonitoringDataError, MAX_TRANSFERS, SelectionData, TransferItem,
+        CryptocurrencyWalletMonitorDataError, MAX_TRANSFERS, SelectionData, TransferItem,
         TransferSnapshot, unshown,
     },
     service::{
-        CryptocurrencyWalletMonitoringProtocol, CryptocurrencyWalletMonitoringRequest,
-        CryptocurrencyWalletMonitoringResponse, CryptocurrencyWalletMonitoringScope,
-        CryptocurrencyWalletMonitoringService, CryptocurrencyWalletMonitoringSource,
-        CryptocurrencyWalletMonitoringStatus, CryptocurrencyWalletMonitoringStreamError,
-        CryptocurrencyWalletMonitoringStreamMessage,
+        CryptocurrencyWalletMonitorProtocol, CryptocurrencyWalletMonitorRequest,
+        CryptocurrencyWalletMonitorResponse, CryptocurrencyWalletMonitorScope,
+        CryptocurrencyWalletMonitorService, CryptocurrencyWalletMonitorSource,
+        CryptocurrencyWalletMonitorStatus, CryptocurrencyWalletMonitorStreamError,
+        CryptocurrencyWalletMonitorStreamMessage,
     },
 };
 
@@ -103,26 +103,26 @@ const LIST_OVERDRAW: f32 = 150.0;
 /// The width of the "from"/"to" label column of a transfer row.
 const ADDRESS_LABEL_WIDTH: f32 = 32.0;
 
-/// A cryptocurrency_wallet_monitoring monitor carries no options.
+/// A cryptocurrency_wallet_monitor monitor carries no options.
 ///
 /// What a pane follows is the account's own list of monitored addresses, which is read from
 /// the service rather than configured here, so there is nothing to persist but the schema
 /// version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CryptocurrencyWalletMonitoringConfig;
+pub struct CryptocurrencyWalletMonitorConfig;
 
-impl WidgetConfig for CryptocurrencyWalletMonitoringConfig {
+impl WidgetConfig for CryptocurrencyWalletMonitorConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
 /// A failure a pane reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CryptocurrencyWalletMonitoringFailure {
-    Stream(CryptocurrencyWalletMonitoringStreamError),
-    Rpc(RpcCallError<CryptocurrencyWalletMonitoringApiError>),
+enum CryptocurrencyWalletMonitorFailure {
+    Stream(CryptocurrencyWalletMonitorStreamError),
+    Rpc(RpcCallError<CryptocurrencyWalletMonitorApiError>),
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitoringFailure {
+impl LocalizedError for CryptocurrencyWalletMonitorFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Stream(error) => error.localized_message(cx),
@@ -179,15 +179,15 @@ pub(super) enum SelectionNotice {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionFailure {
     /// The service refused the change.
-    Rejected(CryptocurrencyWalletMonitoringApiError),
+    Rejected(CryptocurrencyWalletMonitorApiError),
     /// The change may or may not have been made, which is what the service answers when it
     /// could not tell.
-    Unknown(CryptocurrencyWalletMonitoringMutationUnknown),
+    Unknown(CryptocurrencyWalletMonitorMutationUnknown),
     /// The confirmed change is not one the list the pane holds can describe, which means the
     /// list and the account have gone out of step.
-    Inconsistent(CryptocurrencyWalletMonitoringDataError),
+    Inconsistent(CryptocurrencyWalletMonitorDataError),
     /// The call itself failed.
-    Rpc(RpcCallError<CryptocurrencyWalletMonitoringApiError>),
+    Rpc(RpcCallError<CryptocurrencyWalletMonitorApiError>),
 }
 
 impl LocalizedError for SelectionFailure {
@@ -214,12 +214,12 @@ enum SelectionRead {
     /// The list arrived, and it is what the pane follows.
     Known,
     /// The read failed, and this is why. A read that failed is not a list with nothing in it.
-    Failed(RpcCallError<CryptocurrencyWalletMonitoringApiError>),
+    Failed(RpcCallError<CryptocurrencyWalletMonitorApiError>),
 }
 
 /// One pane: the transfers it holds, and the addresses it manages.
-pub struct CryptocurrencyWalletMonitoringWidget {
-    binding: WidgetBinding<CryptocurrencyWalletMonitoringProtocol>,
+pub struct CryptocurrencyWalletMonitorWidget {
+    binding: WidgetBinding<CryptocurrencyWalletMonitorProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     /// The account the pane reads for, which is its whole scope.
@@ -247,22 +247,21 @@ pub struct CryptocurrencyWalletMonitoringWidget {
     /// failure the user is told about rather than one the pane sits on.
     selection_read: SelectionRead,
     /// The open dialog, which is the pane's only way of managing addresses.
-    dialog: Option<WeakEntity<CryptocurrencyWalletMonitoringDialog>>,
+    dialog: Option<WeakEntity<CryptocurrencyWalletMonitorDialog>>,
     /// Keeps the pane following the account the settings hold.
     _account: Subscription,
     /// Keeps the pane, and the list that draws its rows, following the display time zone.
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for CryptocurrencyWalletMonitoringWidget {
-    type Config = CryptocurrencyWalletMonitoringConfig;
+impl WidgetView for CryptocurrencyWalletMonitorWidget {
+    type Config = CryptocurrencyWalletMonitorConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.cryptocurrency_wallet_monitoring");
-    const DISPLAY_NAME: &'static str = "widget.names.cryptocurrency_wallet_monitoring";
+    const ID: WidgetId = WidgetId::new_static("kytrix.cryptocurrency_wallet_monitor");
+    const DISPLAY_NAME: &'static str = "widget.names.cryptocurrency_wallet_monitor";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str =
-        "Live transfers of the cryptocurrency_wallet_monitoring addresses an account monitors";
-    const ICON: Option<&'static str> = Some("widgets/cryptocurrency_wallet_monitoring.png");
+    const DESCRIPTION: &'static str = "Live transfers of the wallet addresses an account monitors";
+    const ICON: Option<&'static str> = Some("widgets/cryptocurrency_wallet_monitor.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -300,7 +299,7 @@ impl WidgetView for CryptocurrencyWalletMonitoringWidget {
     }
 }
 
-impl CryptocurrencyWalletMonitoringWidget {
+impl CryptocurrencyWalletMonitorWidget {
     /// Says what a pane with nothing to follow waits for.
     ///
     /// This is the only place the pane's two waiting references are produced: the paths that
@@ -309,9 +308,9 @@ impl CryptocurrencyWalletMonitoringWidget {
     /// it, in the language showing then.
     fn report_no_content_notice(&mut self, cx: &mut Context<Self>) {
         let notice = if self.current_scope().is_none() {
-            Notice::message("widget.cryptocurrency_wallet_monitoring.logged_out")
+            Notice::message("widget.cryptocurrency_wallet_monitor.logged_out")
         } else if !self.account_has_addresses() {
-            Notice::message("widget.cryptocurrency_wallet_monitoring.empty_addresses")
+            Notice::message("widget.cryptocurrency_wallet_monitor.empty_addresses")
         } else {
             return;
         };
@@ -320,7 +319,7 @@ impl CryptocurrencyWalletMonitoringWidget {
 
     /// The seam a test can answer through: `new` only picks the production source.
     fn new_with_source<S>(
-        _config: CryptocurrencyWalletMonitoringConfig,
+        _config: CryptocurrencyWalletMonitorConfig,
         source: S,
         status: Entity<WidgetStatus>,
         _config_change: WidgetConfigChange,
@@ -328,11 +327,11 @@ impl CryptocurrencyWalletMonitoringWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: CryptocurrencyWalletMonitoringSource,
+        S: CryptocurrencyWalletMonitorSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            CryptocurrencyWalletMonitoringService::new(source),
+            CryptocurrencyWalletMonitorService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
@@ -375,8 +374,8 @@ impl CryptocurrencyWalletMonitoringWidget {
     }
 
     /// The scope this pane follows, which is the account it reads as.
-    fn current_scope(&self) -> Option<CryptocurrencyWalletMonitoringScope> {
-        CryptocurrencyWalletMonitoringScope::new(self.account_id.as_ref())
+    fn current_scope(&self) -> Option<CryptocurrencyWalletMonitorScope> {
+        CryptocurrencyWalletMonitorScope::new(self.account_id.as_ref())
     }
 
     /// Follows the account the settings now hold.
@@ -405,11 +404,8 @@ impl CryptocurrencyWalletMonitoringWidget {
             self.report_no_content_notice(cx);
             // Nothing is followed, so nothing should stay subscribed on this pane's behalf:
             // an account that signed out must not keep a seat it is not using.
-            self.binding.call(
-                CryptocurrencyWalletMonitoringRequest::Stop,
-                cx,
-                |_, _, _| {},
-            );
+            self.binding
+                .call(CryptocurrencyWalletMonitorRequest::Stop, cx, |_, _, _| {});
             cx.notify();
             return;
         };
@@ -425,9 +421,9 @@ impl CryptocurrencyWalletMonitoringWidget {
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
             if retry {
-                CryptocurrencyWalletMonitoringRequest::Retry(scope)
+                CryptocurrencyWalletMonitorRequest::Retry(scope)
             } else {
-                CryptocurrencyWalletMonitoringRequest::Load(scope)
+                CryptocurrencyWalletMonitorRequest::Load(scope)
             },
             cx,
             Self::apply_load_result,
@@ -457,7 +453,7 @@ impl CryptocurrencyWalletMonitoringWidget {
 
     fn apply_load_result(
         &mut self,
-        result: WidgetRpcResult<CryptocurrencyWalletMonitoringProtocol>,
+        result: WidgetRpcResult<CryptocurrencyWalletMonitorProtocol>,
         cx: &mut Context<Self>,
     ) {
         // The answer says the service took the account; what the subscription then reports
@@ -472,7 +468,7 @@ impl CryptocurrencyWalletMonitoringWidget {
             let recovery = self.recovery.clone();
             self.status.report(
                 WidgetState::failed(
-                    Arc::new(CryptocurrencyWalletMonitoringFailure::Rpc(error)),
+                    Arc::new(CryptocurrencyWalletMonitorFailure::Rpc(error)),
                     recovery,
                 ),
                 cx,
@@ -486,8 +482,8 @@ impl CryptocurrencyWalletMonitoringWidget {
     /// publishes it when a transfer moved it.
     fn apply_latest(
         &mut self,
-        key: CryptocurrencyWalletMonitoringScope,
-        message: Arc<CryptocurrencyWalletMonitoringStreamMessage>,
+        key: CryptocurrencyWalletMonitorScope,
+        message: Arc<CryptocurrencyWalletMonitorStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_scope().as_ref() != Some(&key)
@@ -496,8 +492,7 @@ impl CryptocurrencyWalletMonitoringWidget {
         {
             return false;
         }
-        let CryptocurrencyWalletMonitoringStreamMessage::Snapshot(snapshot) = message.as_ref()
-        else {
+        let CryptocurrencyWalletMonitorStreamMessage::Snapshot(snapshot) = message.as_ref() else {
             return false;
         };
 
@@ -540,7 +535,7 @@ impl CryptocurrencyWalletMonitoringWidget {
                 let recovery = self.recovery.clone();
                 self.status.report(
                     WidgetState::failed(
-                        Arc::new(CryptocurrencyWalletMonitoringFailure::Rpc(error)),
+                        Arc::new(CryptocurrencyWalletMonitorFailure::Rpc(error)),
                         recovery,
                     ),
                     cx,
@@ -578,8 +573,8 @@ impl CryptocurrencyWalletMonitoringWidget {
     /// the subscription it arrived on.
     fn apply_reliable(
         &mut self,
-        key: CryptocurrencyWalletMonitoringScope,
-        message: Arc<CryptocurrencyWalletMonitoringStreamMessage>,
+        key: CryptocurrencyWalletMonitorScope,
+        message: Arc<CryptocurrencyWalletMonitorStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_scope().as_ref() != Some(&key)
@@ -588,19 +583,19 @@ impl CryptocurrencyWalletMonitoringWidget {
         {
             return false;
         }
-        let CryptocurrencyWalletMonitoringStreamMessage::Status(status) = message.as_ref() else {
+        let CryptocurrencyWalletMonitorStreamMessage::Status(status) = message.as_ref() else {
             return false;
         };
 
         match status {
-            CryptocurrencyWalletMonitoringStatus::Connecting => {
+            CryptocurrencyWalletMonitorStatus::Connecting => {
                 self.ready = false;
                 // The transfers already read stay: a reconnecting feed is not a reason to
                 // blank what a reader was looking at.
                 self.status.report(WidgetState::Connecting, cx);
                 self.notify_dialog(cx);
             }
-            CryptocurrencyWalletMonitoringStatus::Ready => {
+            CryptocurrencyWalletMonitorStatus::Ready => {
                 self.ready = true;
                 // What a pane shows is only as true as the read it came from, and a change
                 // the pane stopped waiting for was never read back. The stream coming up is
@@ -615,7 +610,7 @@ impl CryptocurrencyWalletMonitoringWidget {
                 }
                 self.report(cx);
             }
-            CryptocurrencyWalletMonitoringStatus::Failed(error) => {
+            CryptocurrencyWalletMonitorStatus::Failed(error) => {
                 self.ready = false;
                 // A read that never went out has nothing left to wait for: the stream it was
                 // waiting for failed, and the dialog says so rather than spinning.
@@ -631,8 +626,8 @@ impl CryptocurrencyWalletMonitoringWidget {
     }
 
     /// Reports why a subscription stopped.
-    fn fail(&mut self, error: &CryptocurrencyWalletMonitoringStreamError, cx: &mut Context<Self>) {
-        let failure = CryptocurrencyWalletMonitoringFailure::Stream(error.clone());
+    fn fail(&mut self, error: &CryptocurrencyWalletMonitorStreamError, cx: &mut Context<Self>) {
+        let failure = CryptocurrencyWalletMonitorFailure::Stream(error.clone());
         let recovery = self.recovery.clone();
         self.status
             .report(WidgetState::failed(Arc::new(failure), recovery), cx);
@@ -691,12 +686,12 @@ impl CryptocurrencyWalletMonitoringWidget {
     fn list_body(&self, cx: &Context<Self>) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
-                "CryptocurrencyWalletMonitoringFrame",
+                "CryptocurrencyWalletMonitorFrame",
             )))
-            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_TRANSFER_LIST".into())
+            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITOR_TRANSFER_LIST".into())
             .aria_label(t!(
                 cx,
-                "widget.cryptocurrency_wallet_monitoring.scroll_transfers"
+                "widget.cryptocurrency_wallet_monitor.scroll_transfers"
             ))
             .relative()
             .size_full()
@@ -716,22 +711,22 @@ impl CryptocurrencyWalletMonitoringWidget {
         let widget = cx.entity().downgrade();
 
         div()
-            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_MONITOR_MANAGE".into())
+            .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITOR_MONITOR_MANAGE".into())
             .flex_none()
             // A control in the header row has to take its own clicks: the row is the pane's
             // drag area as well.
             .occlude()
             .child(
                 Button::new(ElementId::Name(SharedString::new_static(
-                    "CryptocurrencyWalletMonitoringManage",
+                    "CryptocurrencyWalletMonitorManage",
                 )))
                 .filled()
                 .small()
                 .disabled(self.account_id.is_none())
-                .aria_label(t!(cx, "widget.cryptocurrency_wallet_monitoring.manage"))
-                .with_tooltip(t!(cx, "widget.cryptocurrency_wallet_monitoring.manage"))
+                .aria_label(t!(cx, "widget.cryptocurrency_wallet_monitor.manage"))
+                .with_tooltip(t!(cx, "widget.cryptocurrency_wallet_monitor.manage"))
                 .on_click(move |_, window, cx| {
-                    CryptocurrencyWalletMonitoringDialog::show(widget.clone(), window, cx);
+                    CryptocurrencyWalletMonitorDialog::show(widget.clone(), window, cx);
                 })
                 .child(Icon::new(IconKind::Faders).size_3()),
             )
@@ -753,7 +748,7 @@ impl CryptocurrencyWalletMonitoringWidget {
     /// own state goes with it when it closes.
     pub(super) fn attach_dialog(
         &mut self,
-        dialog: WeakEntity<CryptocurrencyWalletMonitoringDialog>,
+        dialog: WeakEntity<CryptocurrencyWalletMonitorDialog>,
         cx: &mut Context<Self>,
     ) {
         self.dialog = Some(dialog);
@@ -834,16 +829,12 @@ impl CryptocurrencyWalletMonitoringWidget {
         }
     }
 
-    fn send_selections(
-        &mut self,
-        scope: CryptocurrencyWalletMonitoringScope,
-        cx: &mut Context<Self>,
-    ) {
+    fn send_selections(&mut self, scope: CryptocurrencyWalletMonitorScope, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending.as_mut() {
             pending.sent = true;
         }
         self.binding.call(
-            CryptocurrencyWalletMonitoringRequest::FetchSelections(scope),
+            CryptocurrencyWalletMonitorRequest::FetchSelections(scope),
             cx,
             Self::apply_selections_result,
         );
@@ -854,12 +845,12 @@ impl CryptocurrencyWalletMonitoringWidget {
         let Some(scope) = self.current_scope() else {
             return false;
         };
-        if !self.may_change(cx) || cryptocurrency_wallet_monitoring_network(&address).is_none() {
+        if !self.may_change(cx) || cryptocurrency_wallet_monitor_network(&address).is_none() {
             return false;
         }
         self.begin_change(SelectionOperation::Adding, Some(address.clone()), cx);
         self.binding.call(
-            CryptocurrencyWalletMonitoringRequest::AddSelection { scope, address },
+            CryptocurrencyWalletMonitorRequest::AddSelection { scope, address },
             cx,
             Self::apply_add_result,
         );
@@ -876,7 +867,7 @@ impl CryptocurrencyWalletMonitoringWidget {
         }
         self.begin_change(SelectionOperation::Deleting, Some(address.clone()), cx);
         self.binding.call(
-            CryptocurrencyWalletMonitoringRequest::DeleteSelection { scope, address },
+            CryptocurrencyWalletMonitorRequest::DeleteSelection { scope, address },
             cx,
             Self::apply_delete_result,
         );
@@ -911,12 +902,12 @@ impl CryptocurrencyWalletMonitoringWidget {
 
     fn apply_selections_result(
         &mut self,
-        result: WidgetRpcResult<CryptocurrencyWalletMonitoringProtocol>,
+        result: WidgetRpcResult<CryptocurrencyWalletMonitorProtocol>,
         cx: &mut Context<Self>,
     ) {
         self.pending = None;
         match result {
-            Ok(CryptocurrencyWalletMonitoringResponse::Selections(data)) => {
+            Ok(CryptocurrencyWalletMonitorResponse::Selections(data)) => {
                 self.selections = Some(data);
                 self.notice = None;
                 self.selection_read = SelectionRead::Known;
@@ -945,12 +936,12 @@ impl CryptocurrencyWalletMonitoringWidget {
 
     fn apply_add_result(
         &mut self,
-        result: WidgetRpcResult<CryptocurrencyWalletMonitoringProtocol>,
+        result: WidgetRpcResult<CryptocurrencyWalletMonitorProtocol>,
         cx: &mut Context<Self>,
     ) {
         let requested = self.pending.take().and_then(|pending| pending.address);
         let outcome = match result {
-            Ok(CryptocurrencyWalletMonitoringResponse::Added(outcome)) => outcome,
+            Ok(CryptocurrencyWalletMonitorResponse::Added(outcome)) => outcome,
             Ok(_) => return,
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
@@ -961,7 +952,7 @@ impl CryptocurrencyWalletMonitoringWidget {
         self.notice = match outcome {
             // What the list becomes is the confirmation applied to it, and only a
             // confirmation of the address that was asked about is one of those.
-            CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(selection) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Confirmed(selection) => {
                 let grown = requested.as_ref().and_then(|address| {
                     self.selections
                         .as_ref()?
@@ -976,12 +967,12 @@ impl CryptocurrencyWalletMonitoringWidget {
                     None => Some(inconsistent()),
                 }
             }
-            CryptocurrencyWalletMonitoringMutationOutcome::Rejected(error) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
             // The change may or may not have been made, so the list the pane holds is not one
             // it can change: it is left as it was, and the next read settles it.
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(unknown) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
@@ -990,12 +981,12 @@ impl CryptocurrencyWalletMonitoringWidget {
 
     fn apply_delete_result(
         &mut self,
-        result: WidgetRpcResult<CryptocurrencyWalletMonitoringProtocol>,
+        result: WidgetRpcResult<CryptocurrencyWalletMonitorProtocol>,
         cx: &mut Context<Self>,
     ) {
         let requested = self.pending.take().and_then(|pending| pending.address);
         let outcome = match result {
-            Ok(CryptocurrencyWalletMonitoringResponse::Deleted(outcome)) => outcome,
+            Ok(CryptocurrencyWalletMonitorResponse::Deleted(outcome)) => outcome,
             Ok(_) => return,
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
@@ -1004,7 +995,7 @@ impl CryptocurrencyWalletMonitoringWidget {
             }
         };
         self.notice = match outcome {
-            CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(()) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Confirmed(()) => {
                 let shrunk = requested.as_ref().and_then(|address| {
                     self.selections
                         .as_ref()
@@ -1018,10 +1009,10 @@ impl CryptocurrencyWalletMonitoringWidget {
                     None => Some(inconsistent()),
                 }
             }
-            CryptocurrencyWalletMonitoringMutationOutcome::Rejected(error) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(unknown) => {
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
@@ -1029,7 +1020,7 @@ impl CryptocurrencyWalletMonitoringWidget {
     }
 }
 
-impl Render for CryptocurrencyWalletMonitoringWidget {
+impl Render for CryptocurrencyWalletMonitorWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A snapshot that arrived and holds no transfer is the fact "nothing has moved", and it
         // reads exactly like a list that failed to load unless the pane says which it is. The
@@ -1045,7 +1036,7 @@ impl Render for CryptocurrencyWalletMonitoringWidget {
                 .items_center()
                 .justify_center()
                 .child(EmptyState::new(
-                    "CryptocurrencyWalletMonitoringEmpty",
+                    "CryptocurrencyWalletMonitorEmpty",
                     t!(cx, "common.no_data"),
                 ))
                 .into_any_element(),
@@ -1059,7 +1050,7 @@ impl Render for CryptocurrencyWalletMonitoringWidget {
 /// What the dialog says about a confirmation the list cannot hold.
 fn inconsistent() -> SelectionNotice {
     SelectionNotice::Problem(SelectionFailure::Inconsistent(
-        CryptocurrencyWalletMonitoringDataError::InconsistentSelections,
+        CryptocurrencyWalletMonitorDataError::InconsistentSelections,
     ))
 }
 
@@ -1072,7 +1063,7 @@ fn inconsistent() -> SelectionNotice {
 fn feed_list() -> DequeUnsizedList<Arc<TransferItem>> {
     DequeUnsizedList::new(
         ElementId::Name(SharedString::new_static(
-            "CryptocurrencyWalletMonitoringTransferList",
+            "CryptocurrencyWalletMonitorTransferList",
         )),
         ListAlignment::Top,
         MAX_TRANSFERS,
@@ -1084,7 +1075,7 @@ fn feed_list() -> DequeUnsizedList<Arc<TransferItem>> {
     .keep_on_newest()
 }
 
-/// One row of the feed: what moved, when, and between which cryptocurrency_wallet_monitorings.
+/// One row of the feed: what moved, when, and between which cryptocurrency_wallet_monitors.
 ///
 /// A row is separated from the one above it rather than framed: a feed is read as a list, and
 /// the newest transfer is the row a reader starts at.
@@ -1093,14 +1084,14 @@ fn transfer_row(item: &TransferItem, index: usize, cx: &App) -> AnyElement {
     let display = item.display(data_time_zone(cx));
     let row = div()
         .id(ElementId::NamedInteger(
-            SharedString::new_static("CryptocurrencyWalletMonitoringTransferRow"),
+            SharedString::new_static("CryptocurrencyWalletMonitorTransferRow"),
             index as u64,
         ))
-        .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITORING_TRANSFER_ROW".into())
+        .debug_selector(|| "TEST_CRYPTOCURRENCY_WALLET_MONITOR_TRANSFER_ROW".into())
         .role(Role::ListItem)
         .aria_label(t!(
             cx,
-            "widget.cryptocurrency_wallet_monitoring.transfer",
+            "widget.cryptocurrency_wallet_monitor.transfer",
             amount = display.amount.clone(),
             time = display.time.clone()
         ))
@@ -1139,19 +1130,19 @@ fn transfer_row(item: &TransferItem, index: usize, cx: &App) -> AnyElement {
             ),
     )
     .child(address_line(
-        t!(cx, "widget.cryptocurrency_wallet_monitoring.from"),
+        t!(cx, "widget.cryptocurrency_wallet_monitor.from"),
         item.origin().clone(),
         theme,
     ))
     .child(address_line(
-        t!(cx, "widget.cryptocurrency_wallet_monitoring.to"),
+        t!(cx, "widget.cryptocurrency_wallet_monitor.to"),
         item.destination().clone(),
         theme,
     ))
     .into_any_element()
 }
 
-/// One end of a transfer: which cryptocurrency_wallet_monitoring, under the label that says which end it is.
+/// One end of a transfer: which cryptocurrency_wallet_monitor, under the label that says which end it is.
 fn address_line(label: SharedString, address: SharedString, theme: &Theme) -> AnyElement {
     div()
         .min_w_0()
@@ -1198,7 +1189,7 @@ pub(crate) mod tests {
     };
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::{
-        cryptocurrency_wallet_monitoring::CryptocurrencyWalletMonitoringSelection,
+        cryptocurrency_wallet_monitor::CryptocurrencyWalletMonitorSelection,
         engine::KytrixServiceError,
     };
     use network::transport::error::TransportError;
@@ -1236,21 +1227,21 @@ pub(crate) mod tests {
         cx.set_global(manager);
     }
 
-    /// A pane the framework would have built, driven by a fake cryptocurrency_wallet_monitoring.
+    /// A pane the framework would have built, driven by a fake cryptocurrency_wallet_monitor.
     fn pane_with_source<S>(
         source: S,
-        cx: &mut Context<CryptocurrencyWalletMonitoringWidget>,
-    ) -> CryptocurrencyWalletMonitoringWidget
+        cx: &mut Context<CryptocurrencyWalletMonitorWidget>,
+    ) -> CryptocurrencyWalletMonitorWidget
     where
-        S: CryptocurrencyWalletMonitoringSource,
+        S: CryptocurrencyWalletMonitorSource,
     {
         let status = cx.new(|_| WidgetStatus::new());
         let weak = cx.weak_entity();
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        CryptocurrencyWalletMonitoringWidget::new_with_source(
-            CryptocurrencyWalletMonitoringConfig,
+        CryptocurrencyWalletMonitorWidget::new_with_source(
+            CryptocurrencyWalletMonitorConfig,
             source,
             status,
             WidgetConfigChange::default(),
@@ -1264,7 +1255,7 @@ pub(crate) mod tests {
     fn quiet_pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-    ) -> Entity<CryptocurrencyWalletMonitoringWidget> {
+    ) -> Entity<CryptocurrencyWalletMonitorWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, Some(ACCOUNT));
@@ -1280,7 +1271,7 @@ pub(crate) mod tests {
     fn signed_out_pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-    ) -> Entity<CryptocurrencyWalletMonitoringWidget> {
+    ) -> Entity<CryptocurrencyWalletMonitorWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, None);
@@ -1294,7 +1285,7 @@ pub(crate) mod tests {
     fn pane(
         cx: &mut TestAppContext,
         source: &FakeSource,
-    ) -> Entity<CryptocurrencyWalletMonitoringWidget> {
+    ) -> Entity<CryptocurrencyWalletMonitorWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, Some(ACCOUNT));
@@ -1318,9 +1309,9 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
         source: &FakeSource,
         session: &FakeSession,
-        addresses: Vec<CryptocurrencyWalletMonitoringSelection>,
+        addresses: Vec<CryptocurrencyWalletMonitorSelection>,
         limit: usize,
-    ) -> Entity<CryptocurrencyWalletMonitoringWidget> {
+    ) -> Entity<CryptocurrencyWalletMonitorWidget> {
         session.answer_selections(selections(addresses, limit));
         let pane = pane(cx, source);
         settle_until(cx, "the addresses to arrive", |cx| {
@@ -1336,13 +1327,13 @@ pub(crate) mod tests {
     /// same dialog the way the pane would hold it: the field is built here, under the id the
     /// dialog's own one is built with, and nothing is left holding the dialog but this handle.
     fn attach_dialog(
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
         cx: &mut TestAppContext,
-    ) -> Entity<CryptocurrencyWalletMonitoringDialog> {
+    ) -> Entity<CryptocurrencyWalletMonitorDialog> {
         let window = cx.add_empty_window();
         let dialog = window.update(|window, cx| {
             let address = cx.new(|cx| InputStateBuilder::new(ADDRESS_INPUT_ID).build(window, cx));
-            cx.new(|cx| CryptocurrencyWalletMonitoringDialog::new(pane.downgrade(), address, cx))
+            cx.new(|cx| CryptocurrencyWalletMonitorDialog::new(pane.downgrade(), address, cx))
         });
         pane.update(cx, |pane, _| pane.dialog = Some(dialog.downgrade()));
         dialog
@@ -1350,7 +1341,7 @@ pub(crate) mod tests {
 
     /// Reports a feed as the stream would.
     fn report_feed(
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
         feed: TransferSnapshot,
         cx: &mut App,
     ) -> bool {
@@ -1361,7 +1352,7 @@ pub(crate) mod tests {
         pane.update(cx, |pane, cx| {
             pane.apply_latest(
                 scope,
-                Arc::new(CryptocurrencyWalletMonitoringStreamMessage::Snapshot(feed)),
+                Arc::new(CryptocurrencyWalletMonitorStreamMessage::Snapshot(feed)),
                 cx,
             )
         })
@@ -1369,8 +1360,8 @@ pub(crate) mod tests {
 
     /// Reports a status as the stream would.
     fn report_status(
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
-        status: CryptocurrencyWalletMonitoringStatus,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
+        status: CryptocurrencyWalletMonitorStatus,
         cx: &mut App,
     ) -> bool {
         let scope = pane
@@ -1380,7 +1371,7 @@ pub(crate) mod tests {
         pane.update(cx, |pane, cx| {
             pane.apply_reliable(
                 scope,
-                Arc::new(CryptocurrencyWalletMonitoringStreamMessage::Status(status)),
+                Arc::new(CryptocurrencyWalletMonitorStreamMessage::Status(status)),
                 cx,
             )
         })
@@ -1390,7 +1381,7 @@ pub(crate) mod tests {
     ///
     /// The list is not read: what it holds is the list's own, and what a reader sees of it is
     /// asserted by drawing the pane.
-    fn event_ids_of(pane: &CryptocurrencyWalletMonitoringWidget) -> Vec<String> {
+    fn event_ids_of(pane: &CryptocurrencyWalletMonitorWidget) -> Vec<String> {
         pane.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
             snapshot
                 .items()
@@ -1401,7 +1392,7 @@ pub(crate) mod tests {
     }
 
     /// The addresses the pane holds.
-    fn addresses_of(pane: &CryptocurrencyWalletMonitoringWidget) -> Vec<String> {
+    fn addresses_of(pane: &CryptocurrencyWalletMonitorWidget) -> Vec<String> {
         pane.selections.as_ref().map_or_else(Vec::new, |data| {
             data.selections()
                 .iter()
@@ -1415,7 +1406,7 @@ pub(crate) mod tests {
     /// This is how a dialog's test reads back what the dialog asked the pane for, which is the
     /// pane's own state rather than the dialog's.
     pub(crate) fn asked_for(
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
         cx: &App,
     ) -> Option<String> {
         pane.read(cx)
@@ -1430,7 +1421,7 @@ pub(crate) mod tests {
     /// A test that asks the pane for two changes in a row says with this that the first one was
     /// answered: a pane still waiting for one refuses the next, which is a rule of its own.
     pub(crate) fn forget_last_change(
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
         cx: &mut App,
     ) {
         pane.update(cx, |pane, _| {
@@ -1447,37 +1438,37 @@ pub(crate) mod tests {
             install(cx, Some(ACCOUNT));
 
             for key in [
-                "widget.names.cryptocurrency_wallet_monitoring",
-                "widget.cryptocurrency_wallet_monitoring.active",
-                "widget.cryptocurrency_wallet_monitoring.add_address",
-                "widget.cryptocurrency_wallet_monitoring.add_success",
-                "widget.cryptocurrency_wallet_monitoring.address_placeholder",
-                "widget.cryptocurrency_wallet_monitoring.delete_address",
-                "widget.cryptocurrency_wallet_monitoring.dialog_title",
-                "widget.cryptocurrency_wallet_monitoring.empty_addresses",
-                "widget.cryptocurrency_wallet_monitoring.ethereum",
-                "widget.cryptocurrency_wallet_monitoring.from",
-                "widget.cryptocurrency_wallet_monitoring.load_failed",
-                "widget.cryptocurrency_wallet_monitoring.loading_addresses",
-                "widget.cryptocurrency_wallet_monitoring.logged_out",
-                "widget.cryptocurrency_wallet_monitoring.manage",
-                "widget.cryptocurrency_wallet_monitoring.paused",
-                "widget.cryptocurrency_wallet_monitoring.refresh",
-                "widget.cryptocurrency_wallet_monitoring.scroll_transfers",
-                "widget.cryptocurrency_wallet_monitoring.solana",
-                "widget.cryptocurrency_wallet_monitoring.stream_unavailable",
-                "widget.cryptocurrency_wallet_monitoring.to",
-                "widget.cryptocurrency_wallet_monitoring.transfer",
-                "widget.cryptocurrency_wallet_monitoring.inconsistent_selections",
+                "widget.names.cryptocurrency_wallet_monitor",
+                "widget.cryptocurrency_wallet_monitor.active",
+                "widget.cryptocurrency_wallet_monitor.add_address",
+                "widget.cryptocurrency_wallet_monitor.add_success",
+                "widget.cryptocurrency_wallet_monitor.address_placeholder",
+                "widget.cryptocurrency_wallet_monitor.delete_address",
+                "widget.cryptocurrency_wallet_monitor.dialog_title",
+                "widget.cryptocurrency_wallet_monitor.empty_addresses",
+                "widget.cryptocurrency_wallet_monitor.ethereum",
+                "widget.cryptocurrency_wallet_monitor.from",
+                "widget.cryptocurrency_wallet_monitor.load_failed",
+                "widget.cryptocurrency_wallet_monitor.loading_addresses",
+                "widget.cryptocurrency_wallet_monitor.logged_out",
+                "widget.cryptocurrency_wallet_monitor.manage",
+                "widget.cryptocurrency_wallet_monitor.paused",
+                "widget.cryptocurrency_wallet_monitor.refresh",
+                "widget.cryptocurrency_wallet_monitor.scroll_transfers",
+                "widget.cryptocurrency_wallet_monitor.solana",
+                "widget.cryptocurrency_wallet_monitor.stream_unavailable",
+                "widget.cryptocurrency_wallet_monitor.to",
+                "widget.cryptocurrency_wallet_monitor.transfer",
+                "widget.cryptocurrency_wallet_monitor.inconsistent_selections",
             ] {
                 assert!(!t!(cx, key).is_empty(), "{key} has no copy");
             }
 
             for failure in [
-                SelectionFailure::Rejected(CryptocurrencyWalletMonitoringApiError::Conflict),
-                SelectionFailure::Unknown(CryptocurrencyWalletMonitoringMutationUnknown::Timeout),
+                SelectionFailure::Rejected(CryptocurrencyWalletMonitorApiError::Conflict),
+                SelectionFailure::Unknown(CryptocurrencyWalletMonitorMutationUnknown::Timeout),
                 SelectionFailure::Inconsistent(
-                    CryptocurrencyWalletMonitoringDataError::InconsistentSelections,
+                    CryptocurrencyWalletMonitorDataError::InconsistentSelections,
                 ),
                 SelectionFailure::Rpc(RpcCallError::DeadlineExceeded {
                     request_id: RequestId::new(2),
@@ -1490,13 +1481,13 @@ pub(crate) mod tests {
             }
 
             for failure in [
-                CryptocurrencyWalletMonitoringFailure::Stream(
-                    CryptocurrencyWalletMonitoringStreamError::Service(KytrixServiceError::Closed),
+                CryptocurrencyWalletMonitorFailure::Stream(
+                    CryptocurrencyWalletMonitorStreamError::Service(KytrixServiceError::Closed),
                 ),
-                CryptocurrencyWalletMonitoringFailure::Stream(
-                    CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::Closed),
+                CryptocurrencyWalletMonitorFailure::Stream(
+                    CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed),
                 ),
-                CryptocurrencyWalletMonitoringFailure::Rpc(RpcCallError::ServiceClosed {
+                CryptocurrencyWalletMonitorFailure::Rpc(RpcCallError::ServiceClosed {
                     request_id: RequestId::new(3),
                 }),
             ] {
@@ -1511,32 +1502,32 @@ pub(crate) mod tests {
     #[test]
     fn the_widget_should_have_a_stable_identity() {
         assert_eq!(
-            CryptocurrencyWalletMonitoringWidget::ID.as_str(),
-            "kytrix.market.cryptocurrency_wallet_monitoring"
+            CryptocurrencyWalletMonitorWidget::ID.as_str(),
+            "kytrix.cryptocurrency_wallet_monitor"
         );
         assert_eq!(
-            CryptocurrencyWalletMonitoringWidget::DISPLAY_NAME,
-            "widget.names.cryptocurrency_wallet_monitoring"
+            CryptocurrencyWalletMonitorWidget::DISPLAY_NAME,
+            "widget.names.cryptocurrency_wallet_monitor"
         );
         assert_eq!(
-            CryptocurrencyWalletMonitoringConfig::SCHEMA_VERSION,
+            CryptocurrencyWalletMonitorConfig::SCHEMA_VERSION,
             WidgetConfigSchemaVersion::V1
         );
     }
 
     #[test]
     fn the_config_should_round_trip_through_its_envelope() {
-        let stored = VersionedWidgetConfig::encode(&CryptocurrencyWalletMonitoringConfig)
-            .expect("a cryptocurrency_wallet_monitoring monitor config should encode");
+        let stored = VersionedWidgetConfig::encode(&CryptocurrencyWalletMonitorConfig)
+            .expect("a cryptocurrency_wallet_monitor monitor config should encode");
 
         assert_eq!(stored.schema_version(), WidgetConfigSchemaVersion::V1);
         assert_eq!(
-            stored.decode::<CryptocurrencyWalletMonitoringConfig>(),
-            CryptocurrencyWalletMonitoringConfig
+            stored.decode::<CryptocurrencyWalletMonitorConfig>(),
+            CryptocurrencyWalletMonitorConfig
         );
         assert_eq!(
-            decode_or_default::<CryptocurrencyWalletMonitoringConfig>(None),
-            CryptocurrencyWalletMonitoringConfig
+            decode_or_default::<CryptocurrencyWalletMonitorConfig>(None),
+            CryptocurrencyWalletMonitorConfig
         );
     }
 
@@ -1552,7 +1543,7 @@ pub(crate) mod tests {
             assert_eq!(
                 pane.status.state(cx).notice(),
                 Some(&Notice::message(
-                    "widget.cryptocurrency_wallet_monitoring.logged_out"
+                    "widget.cryptocurrency_wallet_monitor.logged_out"
                 )),
                 "a pane nobody signed in for is not a failure"
             );
@@ -1571,7 +1562,7 @@ pub(crate) mod tests {
     /// nothing again: the frame that draws it resolves the words in the language showing then.
     fn the_waiting_copy_should_follow_the_language(
         cx: &mut TestAppContext,
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
         key: &'static str,
     ) {
         let (notice, english) = cx.update(|cx| {
@@ -1624,7 +1615,7 @@ pub(crate) mod tests {
         the_waiting_copy_should_follow_the_language(
             cx,
             &pane,
-            "widget.cryptocurrency_wallet_monitoring.logged_out",
+            "widget.cryptocurrency_wallet_monitor.logged_out",
         );
     }
 
@@ -1646,7 +1637,7 @@ pub(crate) mod tests {
         the_waiting_copy_should_follow_the_language(
             cx,
             &pane,
-            "widget.cryptocurrency_wallet_monitoring.empty_addresses",
+            "widget.cryptocurrency_wallet_monitor.empty_addresses",
         );
     }
 
@@ -1712,7 +1703,7 @@ pub(crate) mod tests {
 
         cx.update(|cx| {
             report_feed(&pane, feed.snapshot(), cx);
-            report_status(&pane, CryptocurrencyWalletMonitoringStatus::Ready, cx);
+            report_status(&pane, CryptocurrencyWalletMonitorStatus::Ready, cx);
         });
         settle_until(cx, "the addresses to arrive", |cx| {
             pane.read(cx).selections.is_some()
@@ -1753,14 +1744,14 @@ pub(crate) mod tests {
             assert_eq!(
                 pane.status.state(cx).notice(),
                 Some(&Notice::message(
-                    "widget.cryptocurrency_wallet_monitoring.empty_addresses"
+                    "widget.cryptocurrency_wallet_monitor.empty_addresses"
                 )),
                 "an account that monitors nothing says so rather than drawing an empty feed"
             );
             assert_eq!(
                 pane.status.state(cx),
                 WidgetState::waiting(Notice::message(
-                    "widget.cryptocurrency_wallet_monitoring.empty_addresses"
+                    "widget.cryptocurrency_wallet_monitor.empty_addresses"
                 ))
             );
             assert!(!pane.status.state(cx).is_failed());
@@ -1784,7 +1775,7 @@ pub(crate) mod tests {
         repaint(window);
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_TRANSFER_LIST")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_TRANSFER_LIST")
                 .is_none(),
             "an account with no addresses has no feed to draw"
         );
@@ -1833,7 +1824,7 @@ pub(crate) mod tests {
         let source = FakeSource::default();
         let session = source.session(ACCOUNT);
         let _control = session.subscribe();
-        session.refuse_selections(CryptocurrencyWalletMonitoringApiError::Unavailable);
+        session.refuse_selections(CryptocurrencyWalletMonitorApiError::Unavailable);
         let pane = pane(cx, &source);
 
         // Waiting on the read itself rather than on `pending`: a pane that has not got round
@@ -1899,8 +1890,8 @@ pub(crate) mod tests {
             report_feed(&pane, live, cx);
             report_status(
                 &pane,
-                CryptocurrencyWalletMonitoringStatus::Failed(
-                    CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::Closed),
+                CryptocurrencyWalletMonitorStatus::Failed(
+                    CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed),
                 ),
                 cx,
             );
@@ -1913,7 +1904,7 @@ pub(crate) mod tests {
             assert_eq!(
                 status.failure().map(|failure| failure.text(cx).to_string()),
                 Some(
-                    CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::Closed)
+                    CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed)
                         .localized_message(cx)
                         .to_string()
                 )
@@ -1942,8 +1933,8 @@ pub(crate) mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                CryptocurrencyWalletMonitoringStatus::Failed(
-                    CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::Closed),
+                CryptocurrencyWalletMonitorStatus::Failed(
+                    CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed),
                 ),
                 cx,
             );
@@ -1965,14 +1956,14 @@ pub(crate) mod tests {
         let mut feed = FakeFeed::new();
         let live = feed.push("one", 1);
         let other =
-            CryptocurrencyWalletMonitoringScope::new(Some(&SmolStr::new_static("somebody-else")))
+            CryptocurrencyWalletMonitorScope::new(Some(&SmolStr::new_static("somebody-else")))
                 .expect("an account is a scope");
 
         let changed = cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 pane.apply_latest(
                     other,
-                    Arc::new(CryptocurrencyWalletMonitoringStreamMessage::Snapshot(live)),
+                    Arc::new(CryptocurrencyWalletMonitorStreamMessage::Snapshot(live)),
                     cx,
                 )
             })
@@ -2107,8 +2098,8 @@ pub(crate) mod tests {
         session.answer_selections(selections(vec![selection(FIRST), selection(SECOND)], 3));
 
         cx.update(|cx| {
-            report_status(&pane, CryptocurrencyWalletMonitoringStatus::Connecting, cx);
-            report_status(&pane, CryptocurrencyWalletMonitoringStatus::Ready, cx);
+            report_status(&pane, CryptocurrencyWalletMonitorStatus::Connecting, cx);
+            report_status(&pane, CryptocurrencyWalletMonitorStatus::Ready, cx);
         });
 
         settle_until(cx, "the addresses to be read again", |cx| {
@@ -2126,7 +2117,7 @@ pub(crate) mod tests {
         let source = FakeSource::default();
         let session = source.session(ACCOUNT);
         let _control = session.subscribe();
-        session.refuse_selections(CryptocurrencyWalletMonitoringApiError::Unavailable);
+        session.refuse_selections(CryptocurrencyWalletMonitorApiError::Unavailable);
         let pane = pane(cx, &source);
 
         // The read is the pane's own, sent by the readiness that arrives: asking for a second one
@@ -2146,7 +2137,7 @@ pub(crate) mod tests {
                 pane.notice,
                 Some(SelectionNotice::Problem(SelectionFailure::Rpc(
                     RpcCallError::Service {
-                        source: CryptocurrencyWalletMonitoringApiError::Unavailable,
+                        source: CryptocurrencyWalletMonitorApiError::Unavailable,
                         ..
                     }
                 )))
@@ -2176,7 +2167,7 @@ pub(crate) mod tests {
     /// drops it once its exit transition is over.
     fn dialog_window<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: &Entity<CryptocurrencyWalletMonitorWidget>,
     ) -> &'a mut VisualTestContext {
         let pane = pane.clone();
         let (_, window) =
@@ -2217,13 +2208,13 @@ pub(crate) mod tests {
 
         let window = dialog_window(cx, &pane);
         window.update(|window, cx| {
-            CryptocurrencyWalletMonitoringDialog::show(pane.downgrade(), window, cx)
+            CryptocurrencyWalletMonitorDialog::show(pane.downgrade(), window, cx)
         });
         settle_dialog(window);
 
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_FIELD")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_FIELD")
                 .is_some(),
             "the dialog should be drawn over the layer once it is opened"
         );
@@ -2240,7 +2231,7 @@ pub(crate) mod tests {
                 .expect("the pane should hold the dialog it opened")
         });
         let close = window
-            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_DIALOG_CLOSE")
+            .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_DIALOG_CLOSE")
             .expect("the dialog should draw the control at its foot")
             .center();
         // The handle the test holds goes first: the layer is what holds the last strong
@@ -2262,7 +2253,7 @@ pub(crate) mod tests {
         );
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_FIELD")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_FIELD")
                 .is_none(),
             "the dialog should have left the tree once its exit transition was over"
         );
@@ -2270,12 +2261,12 @@ pub(crate) mod tests {
         // And the pane opens another one: what it was holding was the dialog that left rather
         // than one kept alive by the pane itself.
         window.update(|window, cx| {
-            CryptocurrencyWalletMonitoringDialog::show(pane.downgrade(), window, cx)
+            CryptocurrencyWalletMonitorDialog::show(pane.downgrade(), window, cx)
         });
         settle_dialog(window);
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_FIELD")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_FIELD")
                 .is_some(),
             "a pane whose dialog has left should open another one"
         );
@@ -2290,7 +2281,7 @@ pub(crate) mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Confirmed(
                 selection_at(SECOND, 2),
             ));
 
@@ -2324,8 +2315,8 @@ pub(crate) mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitoringApiError::Conflict,
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitorApiError::Conflict,
             ));
 
         cx.update(|cx| {
@@ -2342,7 +2333,7 @@ pub(crate) mod tests {
             assert_eq!(
                 pane.notice,
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(
-                    CryptocurrencyWalletMonitoringApiError::Conflict
+                    CryptocurrencyWalletMonitorApiError::Conflict
                 )))
             );
             assert_eq!(
@@ -2366,8 +2357,8 @@ pub(crate) mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::Timeout,
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::Timeout,
             ));
 
         cx.update(|cx| {
@@ -2384,7 +2375,7 @@ pub(crate) mod tests {
             assert_eq!(
                 pane.notice,
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(
-                    CryptocurrencyWalletMonitoringMutationUnknown::Timeout
+                    CryptocurrencyWalletMonitorMutationUnknown::Timeout
                 )))
             );
             assert_eq!(addresses_of(pane), [FIRST.to_owned()]);
@@ -2406,7 +2397,7 @@ pub(crate) mod tests {
         session
             .state()
             .deletes
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(()));
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Confirmed(()));
 
         assert!(cx.update(|cx| {
             pane.update(cx, |pane, cx| {
@@ -2431,7 +2422,7 @@ pub(crate) mod tests {
         let _control = session.subscribe();
         let pane = live_pane(cx, &source, &session, vec![selection(FIRST)], 3);
         cx.update(|cx| {
-            report_status(&pane, CryptocurrencyWalletMonitoringStatus::Connecting, cx);
+            report_status(&pane, CryptocurrencyWalletMonitorStatus::Connecting, cx);
         });
 
         assert!(
@@ -2509,7 +2500,7 @@ pub(crate) mod tests {
         repaint(window);
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_TRANSFER_LIST")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_TRANSFER_LIST")
                 .is_some(),
             "the body should draw the list it holds"
         );
@@ -2585,7 +2576,7 @@ pub(crate) mod tests {
         );
         assert!(
             window
-                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITORING_TRANSFER_LIST")
+                .debug_bounds("TEST_CRYPTOCURRENCY_WALLET_MONITOR_TRANSFER_LIST")
                 .is_none(),
             "a list with no rows in it is not drawn at all"
         );
@@ -2602,7 +2593,7 @@ pub(crate) mod tests {
 
     /// A frame of its own, so a pane can be drawn without the pane the framework builds.
     struct PaneHarness {
-        pane: Entity<CryptocurrencyWalletMonitoringWidget>,
+        pane: Entity<CryptocurrencyWalletMonitorWidget>,
     }
 
     impl Render for PaneHarness {

@@ -1,4 +1,4 @@
-//! What a Hyperliquid wallet monitor holds and what it means.
+//! What a Hyperliquid wallet holds and what it means.
 //!
 //! # Prices are only as precise as the catalog says
 //!
@@ -160,7 +160,7 @@ impl LocalizedError for WalletDataError {
         match self {
             Self::RouteMismatch { route } => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_route_mismatch",
+                "widget.hyperliquid_wallet.error_route_mismatch",
                 market = market,
                 route = route_display_string(route, cx)
             ),
@@ -170,13 +170,13 @@ impl LocalizedError for WalletDataError {
             // naming a listing by a key that has no published name here.
             Self::ListingMissing { route, .. } => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_listing_missing",
+                "widget.hyperliquid_wallet.error_listing_missing",
                 market = market,
                 route = route_display_string(route, cx)
             ),
             Self::Codec { operation } => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_codec",
+                "widget.hyperliquid_wallet.error_codec",
                 market = market,
                 operation = operation
             ),

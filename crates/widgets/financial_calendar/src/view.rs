@@ -177,7 +177,7 @@ pub struct FinancialCalendarWidget {
 impl WidgetView for FinancialCalendarWidget {
     type Config = FinancialCalendarConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.monitoring.financial_calendar");
+    const ID: WidgetId = WidgetId::new_static("kytrix.financial_calendar");
     const DISPLAY_NAME: &'static str = "widget.names.financial_calendar";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Scheduled economic events, grouped by the day they fall on";

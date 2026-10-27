@@ -17,8 +17,11 @@ use kytrix_service_provider::service::engine::KytrixServiceError;
 use smol_str::SmolStr;
 use time::{Date, Month};
 
-use super::stream::{EtfFetchError, EtfSource};
-use crate::model::{EtfAsset, EtfDataset, EtfDay, EtfSnapshot};
+use super::stream::{CryptocurrencyEtfFetchError, CryptocurrencyEtfSource};
+use crate::model::{
+    CryptocurrencyEtfAsset, CryptocurrencyEtfDataset, CryptocurrencyEtfDay,
+    CryptocurrencyEtfSnapshot,
+};
 
 /// How the fake answers one fetch.
 ///
@@ -38,7 +41,7 @@ pub(crate) enum FetchPlan {
 /// The answer one fetch is given.
 #[derive(Clone, Debug, PartialEq)]
 enum Answer {
-    Snapshot(Arc<EtfSnapshot>),
+    Snapshot(Arc<CryptocurrencyEtfSnapshot>),
     Failure,
     Pending,
 }
@@ -103,13 +106,13 @@ impl FakeSource {
         )
     }
 
-    async fn execute(&self) -> Result<Arc<EtfSnapshot>, EtfFetchError> {
+    async fn execute(&self) -> Result<Arc<CryptocurrencyEtfSnapshot>, CryptocurrencyEtfFetchError> {
         let (answer, mut guard) = self.begin();
         let result = match answer {
             Answer::Snapshot(snapshot) => Ok(snapshot),
-            Answer::Failure => Err(EtfFetchError::Service(KytrixServiceError::Connect(
-                "test failure".into(),
-            ))),
+            Answer::Failure => Err(CryptocurrencyEtfFetchError::Service(
+                KytrixServiceError::Connect("test failure".into()),
+            )),
             Answer::Pending => pending().await,
         };
         guard.completed = true;
@@ -134,8 +137,10 @@ impl FakeSource {
     }
 }
 
-impl EtfSource for FakeSource {
-    async fn fetch_snapshot(&self) -> Result<Arc<EtfSnapshot>, EtfFetchError> {
+impl CryptocurrencyEtfSource for FakeSource {
+    async fn fetch_snapshot(
+        &self,
+    ) -> Result<Arc<CryptocurrencyEtfSnapshot>, CryptocurrencyEtfFetchError> {
         self.execute().await
     }
 }
@@ -155,20 +160,29 @@ impl Drop for FetchGuard {
 }
 
 /// A whole snapshot whose every asset has the same one-day history.
-pub(crate) fn snapshot(flow: f64) -> Arc<EtfSnapshot> {
+pub(crate) fn snapshot(flow: f64) -> Arc<CryptocurrencyEtfSnapshot> {
     snapshot_of(core::array::from_fn(|index| {
         asset(ALL[index], &[flow], DEFAULT_FUNDS)
     }))
 }
 
 /// The assets a snapshot carries, in the order the model stores them.
-const ALL: [EtfAsset; 4] = [EtfAsset::Btc, EtfAsset::Eth, EtfAsset::Sol, EtfAsset::Hyp];
+const ALL: [CryptocurrencyEtfAsset; 4] = [
+    CryptocurrencyEtfAsset::Btc,
+    CryptocurrencyEtfAsset::Eth,
+    CryptocurrencyEtfAsset::Sol,
+    CryptocurrencyEtfAsset::Hyp,
+];
 
 /// The funds a fixture asset has when a test does not name its own.
 pub(crate) const DEFAULT_FUNDS: &[&str] = &["FUND"];
 
 /// One asset's history: a fund list, and one day per flow.
-pub(crate) fn asset(asset: EtfAsset, flows: &[f64], funds: &[&str]) -> Arc<EtfDataset> {
+pub(crate) fn asset(
+    asset: CryptocurrencyEtfAsset,
+    flows: &[f64],
+    funds: &[&str],
+) -> Arc<CryptocurrencyEtfDataset> {
     // Julian days from a fixed start rather than ordinals of one year: a fixture is
     // allowed to be longer than a year, and an ordinal is not.
     let first = Date::from_calendar_date(2024, Month::January, 1)
@@ -180,7 +194,7 @@ pub(crate) fn asset(asset: EtfAsset, flows: &[f64], funds: &[&str]) -> Arc<EtfDa
         .enumerate()
         .map(|(index, flow)| {
             net_assets += flow;
-            EtfDay {
+            CryptocurrencyEtfDay {
                 date: Date::from_julian_day(first + i32::try_from(index).unwrap_or(i32::MAX))
                     .expect("fixture date should be valid"),
                 fund_flows: Arc::from([*flow]),
@@ -189,7 +203,7 @@ pub(crate) fn asset(asset: EtfAsset, flows: &[f64], funds: &[&str]) -> Arc<EtfDa
             }
         })
         .collect::<Vec<_>>();
-    Arc::new(EtfDataset {
+    Arc::new(CryptocurrencyEtfDataset {
         asset,
         funds: funds
             .iter()
@@ -201,6 +215,8 @@ pub(crate) fn asset(asset: EtfAsset, flows: &[f64], funds: &[&str]) -> Arc<EtfDa
 }
 
 /// A whole snapshot from four assets' histories.
-pub(crate) fn snapshot_of(datasets: [Arc<EtfDataset>; 4]) -> Arc<EtfSnapshot> {
-    Arc::new(EtfSnapshot { datasets })
+pub(crate) fn snapshot_of(
+    datasets: [Arc<CryptocurrencyEtfDataset>; 4],
+) -> Arc<CryptocurrencyEtfSnapshot> {
+    Arc::new(CryptocurrencyEtfSnapshot { datasets })
 }

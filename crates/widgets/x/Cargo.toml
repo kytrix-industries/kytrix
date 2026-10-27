@@ -1,5 +1,5 @@
 [package]
-name = "x_account_monitoring"
+name = "x"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

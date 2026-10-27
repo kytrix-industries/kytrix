@@ -474,7 +474,7 @@ common:
         type Config = TestConfig;
 
         const ID: WidgetId = BETA_ID;
-        const DISPLAY_NAME: &'static str = "widget.names.etf_flow";
+        const DISPLAY_NAME: &'static str = "widget.names.cryptocurrency_etf";
         const CATEGORY: WidgetCategory = WidgetCategory::Statistics;
 
         fn new(

@@ -41,7 +41,7 @@ use market_participants_model::identifier::WalletAddress;
 use smol_str::SmolStr;
 use widget::error::LocalizedError;
 
-use super::{view::HyperliquidWalletMonitorWidget, watch::MAX_WALLET_ADDRESSES};
+use super::{view::HyperliquidWalletWidget, watch::MAX_WALLET_ADDRESSES};
 
 /// The size of the dialog's panel.
 pub(super) const DIALOG_WIDTH: f32 = 620.0;
@@ -66,16 +66,16 @@ pub(super) enum AddressDialogError {
 impl LocalizedError for AddressDialogError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::Invalid => t!(cx, "widget.hyperliquid_wallet_monitor.invalid_address"),
-            Self::Duplicate => t!(cx, "widget.hyperliquid_wallet_monitor.already_monitored"),
-            Self::Limit => t!(cx, "widget.hyperliquid_wallet_monitor.limit_reached"),
+            Self::Invalid => t!(cx, "widget.hyperliquid_wallet.invalid_address"),
+            Self::Duplicate => t!(cx, "widget.hyperliquid_wallet.already_monitored"),
+            Self::Limit => t!(cx, "widget.hyperliquid_wallet.limit_reached"),
         }
     }
 }
 
 /// The dialog a pane opens to manage the wallets it monitors.
 pub(super) struct WalletAddressDialog {
-    pane: WeakEntity<HyperliquidWalletMonitorWidget>,
+    pane: WeakEntity<HyperliquidWalletWidget>,
     address: Entity<InputState>,
     /// What the field holds.
     ///
@@ -100,7 +100,7 @@ impl WalletAddressDialog {
     /// Nothing happens when it is already open: the control is the dialog's only entrance, and
     /// replacing the open one would throw away what the user has typed.
     pub(super) fn show(
-        pane: WeakEntity<HyperliquidWalletMonitorWidget>,
+        pane: WeakEntity<HyperliquidWalletWidget>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -112,7 +112,7 @@ impl WalletAddressDialog {
         }
         let address = cx.new(|cx| {
             InputStateBuilder::new(ADDRESS_INPUT_ID)
-                .placeholder(t!(cx, "widget.hyperliquid_wallet_monitor.placeholder"))
+                .placeholder(t!(cx, "widget.hyperliquid_wallet.placeholder"))
                 .build(window, cx)
         });
         let dialog = cx.new(|cx| Self::new(pane.clone(), address, cx));
@@ -130,7 +130,7 @@ impl WalletAddressDialog {
     ///
     /// The pane's own tests build one this way too, to answer it the way a submission does.
     pub(super) fn new(
-        pane: WeakEntity<HyperliquidWalletMonitorWidget>,
+        pane: WeakEntity<HyperliquidWalletWidget>,
         address: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -248,7 +248,7 @@ impl WalletAddressDialog {
                     .min_w_0()
                     .truncate()
                     .text_sm()
-                    .child(t!(cx, "widget.hyperliquid_wallet_monitor.manage_addresses")),
+                    .child(t!(cx, "widget.hyperliquid_wallet.manage_addresses")),
             )
             .child(
                 div()
@@ -257,7 +257,7 @@ impl WalletAddressDialog {
                     .text_color(theme.roles.fg.muted.hsla)
                     .child(t!(
                         cx,
-                        "widget.hyperliquid_wallet_monitor.monitored_count",
+                        "widget.hyperliquid_wallet.monitored_count",
                         current = count,
                         limit = MAX_WALLET_ADDRESSES
                     )),
@@ -274,8 +274,8 @@ impl WalletAddressDialog {
             .filled()
             .medium()
             .disabled(self.addable(followed).is_none())
-            .aria_label(t!(cx, "widget.hyperliquid_wallet_monitor.add"))
-            .with_tooltip(t!(cx, "widget.hyperliquid_wallet_monitor.add"))
+            .aria_label(t!(cx, "widget.hyperliquid_wallet.add"))
+            .with_tooltip(t!(cx, "widget.hyperliquid_wallet.add"))
             .on_click({
                 let dialog = dialog.clone();
                 move |_, _, cx| dialog.update(cx, |dialog, cx| dialog.add(cx))
@@ -354,7 +354,7 @@ impl WalletAddressDialog {
                 .text_center()
                 .text_xs()
                 .text_color(theme.roles.fg.muted.hsla)
-                .child(t!(cx, "widget.hyperliquid_wallet_monitor.empty_monitored"))
+                .child(t!(cx, "widget.hyperliquid_wallet.empty_monitored"))
                 .into_any_element();
         }
         self.address_list().into_any_element()
@@ -428,7 +428,7 @@ fn address_row(
 ) -> AnyElement {
     let label = t!(
         cx,
-        "widget.hyperliquid_wallet_monitor.remove_address",
+        "widget.hyperliquid_wallet.remove_address",
         address = SharedString::new(address.as_str())
     );
     let remove = Button::new((

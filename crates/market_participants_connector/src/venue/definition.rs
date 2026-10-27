@@ -433,7 +433,7 @@ const HYPERLIQUID_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::Tickers,
     CapabilityId::AllTickers,
     CapabilityId::OrderBook,
-    CapabilityId::WalletMonitor,
+    CapabilityId::Wallet,
     CapabilityId::AuthenticatedTrading,
     CapabilityId::AccountOrders,
     CapabilityId::AccountPositions,

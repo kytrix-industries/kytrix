@@ -9,29 +9,25 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
     match topic {
         ServiceTopic::News => Some("news"),
         ServiceTopic::FinancialIndex(_) => Some("financial_indices"),
-        ServiceTopic::XAccountMonitoring => Some("x_account_monitoring"),
+        ServiceTopic::X => Some("x"),
         ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
-        ServiceTopic::StrategicMaritimeChokepointsTracking(_) => {
-            Some("strategic_maritime_chokepoints_tracking")
-        }
+        ServiceTopic::GlobalShippingChokepoint(_) => Some("global_shipping_chokepoint"),
     }
 }
 
 /// The entitlement feature an outbound capability is gated by.
 ///
-/// `Account`, `XAccountMonitoringMedia` and the two updater capabilities are not user
+/// `Account`, `XMedia` and the two updater capabilities are not user
 /// entitlements and therefore have no feature.
 pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'static str> {
     match capability {
         KytrixServiceCapability::News => Some("news"),
         KytrixServiceCapability::FinancialIndices => Some("financial_indices"),
-        KytrixServiceCapability::XAccountMonitoring => Some("x_account_monitoring"),
+        KytrixServiceCapability::X => Some("x"),
         KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
             Some("cryptocurrency_wallet_monitoring")
         }
-        KytrixServiceCapability::StrategicMaritimeChokepointsTracking => {
-            Some("strategic_maritime_chokepoints_tracking")
-        }
+        KytrixServiceCapability::GlobalShippingChokepoint => Some("global_shipping_chokepoint"),
         KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
         KytrixServiceCapability::CoinMarketCapFearAndGreedIndex => {
             Some("coin_market_cap_fear_and_greed_index")
@@ -39,7 +35,7 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::FinancialCalendar => Some("financial_calendar"),
         KytrixServiceCapability::PentagonPizzaIndex => Some("pentagon_pizza_index"),
         KytrixServiceCapability::Account
-        | KytrixServiceCapability::XAccountMonitoringMedia
+        | KytrixServiceCapability::XMedia
         | KytrixServiceCapability::UpdaterMetadata
         | KytrixServiceCapability::UpdaterDownload => None,
     }
@@ -50,7 +46,7 @@ mod tests {
     use super::*;
     use crate::service::{
         engine::{FinancialIndexTopic, ServiceTopic},
-        strategic_maritime_chokepoints_tracking::StrategicMaritimeChokepointsTrackingArea,
+        global_shipping_chokepoint::GlobalShippingChokepointArea,
     };
 
     #[test]
@@ -63,16 +59,14 @@ mod tests {
                 ),
                 "financial_indices",
             ),
-            (ServiceTopic::XAccountMonitoring, "x_account_monitoring"),
+            (ServiceTopic::X, "x"),
             (
                 ServiceTopic::CryptocurrencyWalletMonitoring,
                 "cryptocurrency_wallet_monitoring",
             ),
             (
-                ServiceTopic::StrategicMaritimeChokepointsTracking(
-                    StrategicMaritimeChokepointsTrackingArea::Hormuz,
-                ),
-                "strategic_maritime_chokepoints_tracking",
+                ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
+                "global_shipping_chokepoint",
             ),
         ];
 
@@ -94,15 +88,12 @@ mod tests {
                 KytrixServiceCapability::FinancialIndices,
                 Some("financial_indices"),
             ),
-            (
-                KytrixServiceCapability::XAccountMonitoring,
-                Some("x_account_monitoring"),
-            ),
+            (KytrixServiceCapability::X, Some("x")),
             (
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring,
                 Some("cryptocurrency_wallet_monitoring"),
             ),
-            (KytrixServiceCapability::XAccountMonitoringMedia, None),
+            (KytrixServiceCapability::XMedia, None),
             (
                 KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
                 Some("coin_market_cap_fear_and_greed_index"),
@@ -118,8 +109,8 @@ mod tests {
             (KytrixServiceCapability::UpdaterMetadata, None),
             (KytrixServiceCapability::UpdaterDownload, None),
             (
-                KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
-                Some("strategic_maritime_chokepoints_tracking"),
+                KytrixServiceCapability::GlobalShippingChokepoint,
+                Some("global_shipping_chokepoint"),
             ),
         ];
 

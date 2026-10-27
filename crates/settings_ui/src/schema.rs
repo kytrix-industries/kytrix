@@ -521,7 +521,7 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
         true,
         vec![proxy_targets_field(
             "proxy-applications.x.media",
-            "settings_ui.proxies.x_account_monitoring_media_group",
+            "settings_ui.proxies.x_media_group",
             &["x", "twitter", "media", "媒体"],
             X_MEDIA,
         )],
@@ -1362,7 +1362,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::FinancialIndices,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::XAccountMonitoring,
+        capability: KytrixServiceCapability::X,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
@@ -1374,7 +1374,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::FinancialCalendar,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
+        capability: KytrixServiceCapability::GlobalShippingChokepoint,
     },
 ];
 
@@ -1390,7 +1390,7 @@ const APP_UPDATES: &[ServiceTarget] = &[
 
 /// The media service, which the applications page groups on its own.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
-    capability: KytrixServiceCapability::XAccountMonitoringMedia,
+    capability: KytrixServiceCapability::XMedia,
 }];
 
 /// The words one built field is searched by.
@@ -2089,12 +2089,12 @@ pub(crate) mod tests {
     /// The AIS vessel feed is a Kytrix cloud service, so the cloud line is the one that
     /// configures it: the page offers no separate row for the feed.
     #[test]
-    fn the_strategic_maritime_chokepoints_tracking_feed_should_be_configured_by_the_cloud_line() {
+    fn the_global_shipping_chokepoint_feed_should_be_configured_by_the_cloud_line() {
         let catalog = catalog_of();
         let applications = page(&catalog, "proxy-applications");
         assert!(
             !field_ids(applications)
-                .contains(&"proxy-applications.kytrix.strategic_maritime_chokepoints_tracking"),
+                .contains(&"proxy-applications.kytrix.global_shipping_chokepoint"),
             "the page offers no separate row for the feed"
         );
         let row = field(applications, "proxy-applications.kytrix.cloud");
@@ -2106,7 +2106,7 @@ pub(crate) mod tests {
             crate::access::proxy_route_of(
                 &config,
                 &ServiceTarget::KytrixService {
-                    capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
+                    capability: KytrixServiceCapability::GlobalShippingChokepoint,
                 },
             ),
             "hk",

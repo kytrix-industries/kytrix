@@ -15,7 +15,7 @@ const MAX_WIDGET_ID_LEN: usize = 128;
 ///
 /// IDs are persisted and must not depend on Rust type or module names. They use
 /// the grammar `[a-z][a-z0-9_-]*(.[a-z][a-z0-9_-]*)*` and are capped at 128
-/// bytes. A namespaced ID such as `kytrix.market.candlestick` is recommended.
+/// bytes. A namespaced ID such as `kytrix.candlestick` is recommended.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WidgetId(SmolStr);
 
@@ -233,11 +233,11 @@ mod tests {
 
     use super::*;
 
-    const STATIC_ID: WidgetId = WidgetId::new_static("kytrix.market.candlestick-chart");
+    const STATIC_ID: WidgetId = WidgetId::new_static("kytrix.candlestick-chart");
 
     #[test]
     fn widget_id_should_support_const_static_construction() {
-        assert_eq!(STATIC_ID.as_str(), "kytrix.market.candlestick-chart");
+        assert_eq!(STATIC_ID.as_str(), "kytrix.candlestick-chart");
     }
 
     #[test]

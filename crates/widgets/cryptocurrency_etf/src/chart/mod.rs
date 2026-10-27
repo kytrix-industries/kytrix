@@ -27,7 +27,7 @@ mod paint;
 mod palette;
 mod text;
 
-pub(crate) use canvas::EtfChart;
+pub(crate) use canvas::CryptocurrencyEtfChart;
 pub(crate) use data::Metrics;
 pub(crate) use palette::flow;
 

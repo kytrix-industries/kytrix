@@ -15,10 +15,10 @@ use i18n::language::codes::LanguageCode;
 
 use super::{
     axes::point_x,
-    canvas::{ChartState, EtfChart},
+    canvas::{ChartState, CryptocurrencyEtfChart},
     test_support::dataset,
 };
-use crate::model::{EtfFundSelection, EtfWindow};
+use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
 /// How many days the chart in these tests is drawn from.
 const DAYS: usize = 12;
@@ -29,7 +29,7 @@ const DAYS: usize = 12;
 /// pointer position a move queued before it builds the frame, because two things in
 /// that frame are drawn from it — the chart, and the row of readings above it.
 struct Harness {
-    chart: EtfChart,
+    chart: CryptocurrencyEtfChart,
 }
 
 impl Render for Harness {
@@ -57,11 +57,11 @@ fn chart_window(
         i18n::global::embedded::install(cx).expect("the embedded locales should load");
     });
     let (harness, cx) = cx.add_window_view(|_, cx| {
-        let chart = EtfChart::new(
+        let chart = CryptocurrencyEtfChart::new(
             cx,
             dataset(&[1_000.0; DAYS]),
-            EtfFundSelection::All,
-            EtfWindow::All,
+            CryptocurrencyEtfFundSelection::All,
+            CryptocurrencyEtfWindow::All,
         );
         Harness { chart }
     });
@@ -340,8 +340,8 @@ fn the_pointer_should_be_kept_out_of_a_window_it_is_no_longer_over(cx: &mut Test
             harness.chart.set_view(
                 cx,
                 dataset(&[1_000.0]),
-                EtfFundSelection::All,
-                EtfWindow::All,
+                CryptocurrencyEtfFundSelection::All,
+                CryptocurrencyEtfWindow::All,
             );
         });
         window.refresh();

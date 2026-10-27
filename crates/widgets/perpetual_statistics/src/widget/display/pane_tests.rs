@@ -1730,7 +1730,7 @@ fn only_a_route_that_declares_the_series_should_be_readable(cx: &mut TestAppCont
             "a scope the registry does not declare is not readable"
         );
         assert!(
-            !route_serves_statistics(cx, &perpetual_route(), CapabilityId::WalletMonitor),
+            !route_serves_statistics(cx, &perpetual_route(), CapabilityId::Wallet),
             "the route declares one series per capability"
         );
     });

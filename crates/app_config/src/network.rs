@@ -29,12 +29,12 @@ pub enum KytrixServiceCapability {
     News,
     #[serde(rename = "financial_indices")]
     FinancialIndices,
-    #[serde(rename = "x_account_monitoring")]
-    XAccountMonitoring,
+    #[serde(rename = "x")]
+    X,
     #[serde(rename = "cryptocurrency_wallet_monitoring")]
     CryptocurrencyWalletMonitoring,
-    #[serde(rename = "x_account_monitoring_media")]
-    XAccountMonitoringMedia,
+    #[serde(rename = "x_media")]
+    XMedia,
     /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
     #[serde(rename = "coin_market_cap_fear_and_greed_index")]
     CoinMarketCapFearAndGreedIndex,
@@ -55,8 +55,8 @@ pub enum KytrixServiceCapability {
     #[serde(rename = "updater_download")]
     UpdaterDownload,
     /// The strategic maritime chokepoints vessel feed the Kytrix service pushes for one area.
-    #[serde(rename = "strategic_maritime_chokepoints_tracking")]
-    StrategicMaritimeChokepointsTracking,
+    #[serde(rename = "global_shipping_chokepoint")]
+    GlobalShippingChokepoint,
 }
 
 /// Generic outbound route identity.
@@ -556,7 +556,7 @@ mod tests {
 
     fn target() -> ServiceTarget {
         ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XAccountMonitoringMedia,
+            capability: KytrixServiceCapability::XMedia,
         }
     }
 
@@ -854,31 +854,31 @@ mod tests {
     fn service_target_should_use_the_explicit_wire_shape() {
         assert_eq!(
             serde_json::to_value(target()).expect("the Kytrix target should serialize"),
-            json!({ "kind": "kytrix_service", "capability": "x_account_monitoring_media" })
+            json!({ "kind": "kytrix_service", "capability": "x_media" })
         );
         assert_eq!(
             serde_json::from_value::<ServiceTarget>(json!({
                 "kind": "kytrix_service",
-                "capability": "x_account_monitoring_media",
+                "capability": "x_media",
             }))
             .expect("the Kytrix target should decode"),
             target()
         );
-        let strategic_maritime_chokepoints_tracking = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::StrategicMaritimeChokepointsTracking,
+        let global_shipping_chokepoint = ServiceTarget::KytrixService {
+            capability: KytrixServiceCapability::GlobalShippingChokepoint,
         };
         assert_eq!(
-            serde_json::to_value(&strategic_maritime_chokepoints_tracking)
+            serde_json::to_value(&global_shipping_chokepoint)
                 .expect("the AIS target should serialize"),
-            json!({ "kind": "kytrix_service", "capability": "strategic_maritime_chokepoints_tracking" })
+            json!({ "kind": "kytrix_service", "capability": "global_shipping_chokepoint" })
         );
         assert_eq!(
             serde_json::from_value::<ServiceTarget>(json!({
                 "kind": "kytrix_service",
-                "capability": "strategic_maritime_chokepoints_tracking",
+                "capability": "global_shipping_chokepoint",
             }))
             .expect("the AIS target should decode"),
-            strategic_maritime_chokepoints_tracking
+            global_shipping_chokepoint
         );
     }
 
@@ -910,7 +910,7 @@ mod tests {
     fn service_target_should_keep_a_stable_order_as_a_btree_key() {
         let targets = [
             ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::XAccountMonitoringMedia,
+                capability: KytrixServiceCapability::XMedia,
             },
             ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::Account,

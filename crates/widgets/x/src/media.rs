@@ -168,7 +168,7 @@ impl MediaTransport for SharedTransport {
             // What a media request is addressed through is the Kytrix service that serves it,
             // which is what its line is configured under — see the applications page.
             &RouteTarget::Service(ServiceTarget::KytrixService {
-                capability: KytrixServiceCapability::XAccountMonitoringMedia,
+                capability: KytrixServiceCapability::XMedia,
             }),
             destination,
             cancellation.child_token(),
@@ -178,7 +178,7 @@ impl MediaTransport for SharedTransport {
         .map_err(|error| MediaError::Route(format_smolstr!("{error}")))?;
         self.hub
             .http()
-            .client(&route, HttpClientClass::XAccountMonitoringMedia)
+            .client(&route, HttpClientClass::XMedia)
             .map_err(|error| MediaError::Route(format_smolstr!("{error}")))
     }
 }
@@ -257,7 +257,7 @@ where
         cancellation: &CancellationToken,
     ) -> Result<Response, MediaError> {
         let mut current = initial_url.clone();
-        let limit = HttpClientClass::XAccountMonitoringMedia.redirect_limit();
+        let limit = HttpClientClass::XMedia.redirect_limit();
         for hop in 0..limit {
             let client = tokio::select! {
                 biased;
@@ -393,7 +393,7 @@ struct MediaCacheInner {
 impl MediaCache {
     /// The application's cache directory.
     pub(super) fn new() -> Self {
-        let root = dirs::cache_dir().map(|root| root.join("kytrix").join("tweet-monitor"));
+        let root = dirs::cache_dir().map(|root| root.join("kytrix").join("x"));
         Self::with_options(root, CACHE_FILE_LIMIT, CACHE_BYTE_LIMIT)
     }
 

@@ -1,5 +1,5 @@
 [package]
-name = "hyperliquid_wallet_monitor"
+name = "hyperliquid_wallet"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

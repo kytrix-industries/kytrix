@@ -356,7 +356,7 @@ pub struct VolumeHeatMapWidget {
 impl WidgetView for VolumeHeatMapWidget {
     type Config = VolumeHeatMapConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.volume_heatmap");
+    const ID: WidgetId = WidgetId::new_static("kytrix.volume_heatmap");
     const DISPLAY_NAME: &'static str = "widget.names.volume_heatmap";
     const CATEGORY: WidgetCategory = WidgetCategory::Statistics;
     const DESCRIPTION: &'static str = "One market participant's spot quote volume, as a heat map";
@@ -2362,10 +2362,7 @@ mod tests {
 
     #[test]
     fn the_widget_should_have_a_stable_identity() {
-        assert_eq!(
-            VolumeHeatMapWidget::ID.as_str(),
-            "kytrix.market.volume_heatmap"
-        );
+        assert_eq!(VolumeHeatMapWidget::ID.as_str(), "kytrix.volume_heatmap");
         assert_eq!(
             VolumeHeatMapWidget::DISPLAY_NAME,
             "widget.names.volume_heatmap"

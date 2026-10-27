@@ -2048,7 +2048,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "cryptocurrency_wallet_monitoring"
+name = "cryptocurrency_etf"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_proto",
+ "kytrix_service_provider",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
+name = "cryptocurrency_wallet_monitor"
 version = "0.0.2"
 dependencies = [
  "app_config",
@@ -2670,26 +2690,6 @@ checksum = "fc89bf99e5dc15954a60f707c1e09d7540e5cd9af85fa75caa0b510bc08c5342"
 dependencies = [
  "euclid",
  "svg_fmt",
-]
-
-[[package]]
-name = "etf"
-version = "0.0.2"
-dependencies = [
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_proto",
- "kytrix_service_provider",
- "serde",
- "smol_str",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -3353,6 +3353,27 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "global_shipping_chokepoint"
+version = "0.0.2"
+dependencies = [
+ "ahash",
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "network",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
 
 [[package]]
 name = "globset"
@@ -4264,27 +4285,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hormuz_vessel_map"
-version = "0.0.2"
-dependencies = [
- "ahash",
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_service_provider",
- "network",
- "serde",
- "smol_str",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "widget",
- "widget_tokio_runtime",
-]
-
-[[package]]
 name = "hound"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4422,7 +4422,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyperliquid_wallet_monitor"
+name = "hyperliquid_wallet"
 version = "0.0.2"
 dependencies = [
  "ahash",
@@ -10843,15 +10843,15 @@ dependencies = [
  "app_config",
  "candlestick",
  "coin_market_cap_fear_and_greed_index",
- "cryptocurrency_wallet_monitoring",
+ "cryptocurrency_etf",
+ "cryptocurrency_wallet_monitor",
  "empty",
- "etf",
  "financial_calendar",
  "financial_indices",
  "force_orders",
+ "global_shipping_chokepoint",
  "gpui-kit",
- "hormuz_vessel_map",
- "hyperliquid_wallet_monitor",
+ "hyperliquid_wallet",
  "i18n",
  "market_trades",
  "news",
@@ -10865,7 +10865,7 @@ dependencies = [
  "volume_heatmap",
  "watch_list",
  "widget",
- "x_account_monitoring",
+ "x",
 ]
 
 [[package]]
@@ -11655,6 +11655,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
+name = "x"
+version = "0.0.2"
+dependencies = [
+ "ahash",
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "const-hex",
+ "dirs 7.0.0",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "log",
+ "network",
+ "reqwest 0.13.5",
+ "serde",
+ "sha2 0.11.0",
+ "smol_str",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "x11"
 version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11683,36 +11713,6 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
-
-[[package]]
-name = "x_account_monitoring"
-version = "0.0.2"
-dependencies = [
- "ahash",
- "app_config",
- "app_config_provider",
- "base_ui",
- "const-hex",
- "dirs 7.0.0",
- "gpui-kit",
- "i18n",
- "kytrix_service_provider",
- "log",
- "network",
- "reqwest 0.13.5",
- "serde",
- "sha2 0.11.0",
- "smol_str",
- "tempfile",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
- "widget",
- "widget_tokio_runtime",
-]
 
 [[package]]
 name = "xattr"

@@ -36,7 +36,9 @@ use super::{
     paint::{CacheKey, Hover, Measurements, PaintContext, PreparedFrame, measure, paint, prepare},
     text::ChartTextCache,
 };
-use crate::model::{EtfDataset, EtfFundSelection, EtfWindow};
+use crate::model::{
+    CryptocurrencyEtfDataset, CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow,
+};
 
 /// How close to the end a scroll offset has to be to count as following it.
 const SCROLL_END_TOLERANCE: f32 = 1.0;
@@ -213,7 +215,7 @@ pub(crate) struct PreparedCache {
 
 /// One ETF chart: the view it resolved, the caches a frame reuses, and the
 /// viewport it scrolls in.
-pub(crate) struct EtfChart {
+pub(crate) struct CryptocurrencyEtfChart {
     data: Rc<RefCell<PreparedData>>,
     /// Moves whenever `data` is rebuilt, which is how a prepared frame knows the
     /// window under it changed.
@@ -221,13 +223,13 @@ pub(crate) struct EtfChart {
     state: Rc<ChartState>,
 }
 
-impl EtfChart {
+impl CryptocurrencyEtfChart {
     /// Resolves one history into the view a chart draws.
     pub(crate) fn new(
         cx: &App,
-        dataset: Arc<EtfDataset>,
-        selection: EtfFundSelection,
-        window: EtfWindow,
+        dataset: Arc<CryptocurrencyEtfDataset>,
+        selection: CryptocurrencyEtfFundSelection,
+        window: CryptocurrencyEtfWindow,
     ) -> Self {
         Self {
             data: Rc::new(RefCell::new(PreparedData::new(
@@ -250,9 +252,9 @@ impl EtfChart {
     pub(crate) fn set_view(
         &mut self,
         cx: &App,
-        dataset: Arc<EtfDataset>,
-        selection: EtfFundSelection,
-        window: EtfWindow,
+        dataset: Arc<CryptocurrencyEtfDataset>,
+        selection: CryptocurrencyEtfFundSelection,
+        window: CryptocurrencyEtfWindow,
     ) -> bool {
         let locale = *cx.global::<LanguageCode>();
         {
@@ -378,12 +380,12 @@ fn hover_at(data: &PreparedData, layout: ChartLayout, cursor: Point<Pixels>) -> 
 
 /// The chart's own name, for assistive technology that reaches it.
 fn aria_label(cx: &App) -> SharedString {
-    t!(cx, "widget.etf.chart")
+    t!(cx, "widget.cryptocurrency_etf.chart")
 }
 
 /// Builds the element of a chart from the things its frame needs.
 ///
-/// The element is built from a pair of `Rc`s rather than from a [`EtfChart`],
+/// The element is built from a pair of `Rc`s rather than from a [`CryptocurrencyEtfChart`],
 /// because the pane reaches its chart without a `Context` for it: the same pair is
 /// what a frame of either closure below captures.
 fn chart_element(
@@ -447,7 +449,9 @@ fn chart_element(
     // height — a `size_full()` there resolves to the floor and the chart would keep
     // its minimum height for ever, drawing in the top of a pane ten times taller.
     let content = div()
-        .id(ElementId::Name(SharedString::new_static("EtfChartContent")))
+        .id(ElementId::Name(SharedString::new_static(
+            "CryptocurrencyEtfChartContent",
+        )))
         .relative()
         .min_w(content_min.width)
         .min_h(content_min.height)
@@ -465,7 +469,7 @@ fn chart_element(
         })
         .child(element)
         .on_mouse_move(move |event: &MouseMoveEvent, window, _| {
-            let chart = EtfChart {
+            let chart = CryptocurrencyEtfChart {
                 data: pointer_data.clone(),
                 revision,
                 state: pointer_state.clone(),
@@ -474,7 +478,7 @@ fn chart_element(
         })
         .on_hover(move |hovering, window, _| {
             if !*hovering {
-                let chart = EtfChart {
+                let chart = CryptocurrencyEtfChart {
                     data: leave_data.clone(),
                     revision,
                     state: leave_state.clone(),
@@ -491,7 +495,7 @@ fn chart_element(
     let vertical = content_state.vertical.clone();
     div()
         .id(ElementId::Name(SharedString::new_static(
-            "EtfChartVertical",
+            "CryptocurrencyEtfChartVertical",
         )))
         .relative()
         .size_full()
@@ -505,7 +509,7 @@ fn chart_element(
         .child(
             div()
                 .id(ElementId::Name(SharedString::new_static(
-                    "EtfChartHorizontal",
+                    "CryptocurrencyEtfChartHorizontal",
                 )))
                 .min_h(content_min.height)
                 // The horizontal box has to claim the height the frame draws in. A

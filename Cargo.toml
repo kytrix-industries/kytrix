@@ -21,22 +21,22 @@ members = [
     "crates/widget_registry",
     "crates/widgets/candlestick",
     "crates/widgets/coin_market_cap_fear_and_greed_index",
+    "crates/widgets/cryptocurrency_etf",
     "crates/widgets/empty",
-    "crates/widgets/etf",
     "crates/widgets/financial_calendar",
     "crates/widgets/financial_indices",
     "crates/widgets/force_orders",
-    "crates/widgets/hormuz_vessel_map",
-    "crates/widgets/hyperliquid_wallet_monitor",
+    "crates/widgets/global_shipping_chokepoint",
+    "crates/widgets/hyperliquid_wallet",
     "crates/widgets/market_trades",
     "crates/widgets/news",
     "crates/widgets/order_book",
     "crates/widgets/perpetual_statistics",
     "crates/widgets/pentagon_pizza_index",
     "crates/widgets/volume_heatmap",
-    "crates/widgets/cryptocurrency_wallet_monitoring",
+    "crates/widgets/cryptocurrency_wallet_monitor",
     "crates/widgets/watch_list",
-    "crates/widgets/x_account_monitoring",
+    "crates/widgets/x",
     "xtask",
 ]
 default-members = ["crates/kytrix"]
@@ -126,13 +126,13 @@ app_config_provider = { path = "crates/app_config_provider" }
 base_ui = { path = "crates/base_ui" }
 candlestick = { path = "crates/widgets/candlestick" }
 coin_market_cap_fear_and_greed_index = { path = "crates/widgets/coin_market_cap_fear_and_greed_index" }
+cryptocurrency_etf = { path = "crates/widgets/cryptocurrency_etf" }
 empty = { path = "crates/widgets/empty" }
-etf = { path = "crates/widgets/etf" }
 financial_calendar = { path = "crates/widgets/financial_calendar" }
 financial_indices = { path = "crates/widgets/financial_indices" }
 force_orders = { path = "crates/widgets/force_orders" }
-hormuz_vessel_map = { path = "crates/widgets/hormuz_vessel_map" }
-hyperliquid_wallet_monitor = { path = "crates/widgets/hyperliquid_wallet_monitor" }
+global_shipping_chokepoint = { path = "crates/widgets/global_shipping_chokepoint" }
+hyperliquid_wallet = { path = "crates/widgets/hyperliquid_wallet" }
 i18n = { path = "crates/i18n" }
 instrument_selector_ui = { path = "crates/instrument_selector_ui" }
 kytrix_service_provider = { path = "crates/kytrix_service_provider" }
@@ -149,9 +149,9 @@ profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
 updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
-cryptocurrency_wallet_monitoring = { path = "crates/widgets/cryptocurrency_wallet_monitoring" }
+cryptocurrency_wallet_monitor = { path = "crates/widgets/cryptocurrency_wallet_monitor" }
 watch_list = { path = "crates/widgets/watch_list" }
-x_account_monitoring = { path = "crates/widgets/x_account_monitoring" }
+x = { path = "crates/widgets/x" }
 widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }
 widget = { path = "crates/widget" }
 widget_gallery_ui = { path = "crates/widget_gallery_ui" }

@@ -1,6 +1,6 @@
-//! The fake cryptocurrency_wallet_monitoring the cryptocurrency_wallet_monitoring-monitor tests answer through.
+//! The fake cryptocurrency_wallet_monitor the cryptocurrency_wallet_monitor-monitor tests answer through.
 //!
-//! It is the seam both the service and the pane read cryptocurrency_wallet_monitorings through, so it is shared
+//! It is the seam both the service and the pane read cryptocurrency_wallet_monitors through, so it is shared
 //! rather than copied: what a pane's tests need to control is the same session the
 //! service's tests take, refuse and hold, and the same subscription they hand transfers
 //! to.
@@ -16,13 +16,12 @@ use std::{
 
 use gpui_kit::{App, TestAppContext};
 use kytrix_service_provider::service::{
-    cryptocurrency_wallet_monitoring::{
-        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationOutcome,
-        CryptocurrencyWalletMonitoringNetwork, CryptocurrencyWalletMonitoringSelection,
-        CryptocurrencyWalletMonitoringSelectionStatus,
-        CryptocurrencyWalletMonitoringSelectionsResponse,
+    cryptocurrency_wallet_monitor::{
+        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
+        CryptocurrencyWalletMonitorNetwork, CryptocurrencyWalletMonitorSelection,
+        CryptocurrencyWalletMonitorSelectionStatus, CryptocurrencyWalletMonitorSelectionsResponse,
     },
-    engine::{CryptocurrencyWalletMonitoringTransfer, KytrixServiceError},
+    engine::{CryptocurrencyWalletMonitorTransfer, KytrixServiceError},
 };
 use network::transport::{error::TransportError, subscription::SubscriptionStatus};
 use smol_str::SmolStr;
@@ -31,8 +30,8 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::{
     model::{TransferSnapshot, TransferState},
     service::{
-        CryptocurrencyWalletMonitoringEventSubscription, CryptocurrencyWalletMonitoringSession,
-        CryptocurrencyWalletMonitoringSource,
+        CryptocurrencyWalletMonitorEventSubscription, CryptocurrencyWalletMonitorSession,
+        CryptocurrencyWalletMonitorSource,
     },
 };
 
@@ -64,8 +63,8 @@ fn runtime_handle(cx: &mut App) -> tokio::runtime::Handle {
 }
 
 /// One reported transfer.
-pub(crate) fn transfer(event_id: &str, timestamp: i64) -> CryptocurrencyWalletMonitoringTransfer {
-    CryptocurrencyWalletMonitoringTransfer {
+pub(crate) fn transfer(event_id: &str, timestamp: i64) -> CryptocurrencyWalletMonitorTransfer {
+    CryptocurrencyWalletMonitorTransfer {
         event_id: SmolStr::new(event_id),
         from_address: SmolStr::new_static("0x0123456789abcdef0123456789abcdef01234567"),
         to_address: SmolStr::new_static("0x89abcdef0123456789abcdef0123456789abcdef"),
@@ -76,7 +75,7 @@ pub(crate) fn transfer(event_id: &str, timestamp: i64) -> CryptocurrencyWalletMo
 }
 
 /// One monitored address.
-pub(crate) fn selection(address: &str) -> CryptocurrencyWalletMonitoringSelection {
+pub(crate) fn selection(address: &str) -> CryptocurrencyWalletMonitorSelection {
     selection_at(address, 1)
 }
 
@@ -84,14 +83,11 @@ pub(crate) fn selection(address: &str) -> CryptocurrencyWalletMonitoringSelectio
 ///
 /// The list is read in the account's recency order, so a test that cares which of two
 /// addresses reads first says when each was last changed.
-pub(crate) fn selection_at(
-    address: &str,
-    updated_at: i64,
-) -> CryptocurrencyWalletMonitoringSelection {
-    CryptocurrencyWalletMonitoringSelection {
-        network: CryptocurrencyWalletMonitoringNetwork::Ethereum,
+pub(crate) fn selection_at(address: &str, updated_at: i64) -> CryptocurrencyWalletMonitorSelection {
+    CryptocurrencyWalletMonitorSelection {
+        network: CryptocurrencyWalletMonitorNetwork::Ethereum,
         address: SmolStr::new(address),
-        status: CryptocurrencyWalletMonitoringSelectionStatus::Active,
+        status: CryptocurrencyWalletMonitorSelectionStatus::Active,
         created_at: 1,
         updated_at,
     }
@@ -99,10 +95,10 @@ pub(crate) fn selection_at(
 
 /// What a read of the monitored addresses answers with.
 pub(crate) fn selections(
-    selections: Vec<CryptocurrencyWalletMonitoringSelection>,
+    selections: Vec<CryptocurrencyWalletMonitorSelection>,
     limit: usize,
-) -> CryptocurrencyWalletMonitoringSelectionsResponse {
-    CryptocurrencyWalletMonitoringSelectionsResponse {
+) -> CryptocurrencyWalletMonitorSelectionsResponse {
+    CryptocurrencyWalletMonitorSelectionsResponse {
         selections,
         cryptocurrency_wallet_monitoring_address_limit: limit,
     }
@@ -198,7 +194,7 @@ impl FakeSource {
     }
 }
 
-impl CryptocurrencyWalletMonitoringSource for FakeSource {
+impl CryptocurrencyWalletMonitorSource for FakeSource {
     type Session = FakeSession;
 
     async fn acquire_session(&self, account_id: &str) -> Result<Self::Session, KytrixServiceError> {
@@ -237,15 +233,11 @@ pub(crate) struct FakeSession {
 pub(crate) struct FakeSessionState {
     pub subscriptions: VecDeque<Result<FakeSubscription, KytrixServiceError>>,
     pub selections: VecDeque<
-        Result<
-            CryptocurrencyWalletMonitoringSelectionsResponse,
-            CryptocurrencyWalletMonitoringApiError,
-        >,
+        Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>,
     >,
-    pub adds: VecDeque<
-        CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>,
-    >,
-    pub deletes: VecDeque<CryptocurrencyWalletMonitoringMutationOutcome<()>>,
+    pub adds:
+        VecDeque<CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection>>,
+    pub deletes: VecDeque<CryptocurrencyWalletMonitorMutationOutcome<()>>,
     pub subscribes: usize,
     pub fetches: usize,
     pub add_calls: usize,
@@ -302,13 +294,13 @@ impl FakeSession {
     /// Queues what a read of the monitored addresses answers with.
     pub(crate) fn answer_selections(
         &self,
-        response: CryptocurrencyWalletMonitoringSelectionsResponse,
+        response: CryptocurrencyWalletMonitorSelectionsResponse,
     ) {
         self.state().selections.push_back(Ok(response));
     }
 
     /// Queues a read the account is refused.
-    pub(crate) fn refuse_selections(&self, error: CryptocurrencyWalletMonitoringApiError) {
+    pub(crate) fn refuse_selections(&self, error: CryptocurrencyWalletMonitorApiError) {
         self.state().selections.push_back(Err(error));
     }
 
@@ -336,14 +328,14 @@ impl FakeSession {
     }
 }
 
-impl CryptocurrencyWalletMonitoringSession for FakeSession {
+impl CryptocurrencyWalletMonitorSession for FakeSession {
     type Subscription = FakeSubscription;
 
     fn account_id(&self) -> &str {
         &self.account_id
     }
 
-    async fn subscribe_cryptocurrency_wallet_monitoring(
+    async fn subscribe_cryptocurrency_wallet_monitor(
         &self,
     ) -> Result<Self::Subscription, KytrixServiceError> {
         let mut state = self.state();
@@ -356,10 +348,8 @@ impl CryptocurrencyWalletMonitoringSession for FakeSession {
 
     async fn fetch_selections(
         &self,
-    ) -> Result<
-        CryptocurrencyWalletMonitoringSelectionsResponse,
-        CryptocurrencyWalletMonitoringApiError,
-    > {
+    ) -> Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>
+    {
         let (response, blocked) = {
             let mut state = self.state();
             state.fetches += 1;
@@ -367,7 +357,7 @@ impl CryptocurrencyWalletMonitoringSession for FakeSession {
                 state
                     .selections
                     .pop_front()
-                    .unwrap_or(Err(CryptocurrencyWalletMonitoringApiError::NotReady)),
+                    .unwrap_or(Err(CryptocurrencyWalletMonitorApiError::NotReady)),
                 state.blocked_selections.take(),
             )
         };
@@ -378,15 +368,14 @@ impl CryptocurrencyWalletMonitoringSession for FakeSession {
     async fn add_selection(
         &self,
         _: &str,
-    ) -> CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>
-    {
+    ) -> CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection> {
         let (outcome, blocked) = {
             let mut state = self.state();
             state.add_calls += 1;
             (
                 state.adds.pop_front().unwrap_or(
-                    CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                        CryptocurrencyWalletMonitoringApiError::NotReady,
+                    CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                        CryptocurrencyWalletMonitorApiError::NotReady,
                     ),
                 ),
                 state.blocked_mutation.take(),
@@ -396,14 +385,14 @@ impl CryptocurrencyWalletMonitoringSession for FakeSession {
         outcome
     }
 
-    async fn delete_selection(&self, _: &str) -> CryptocurrencyWalletMonitoringMutationOutcome<()> {
+    async fn delete_selection(&self, _: &str) -> CryptocurrencyWalletMonitorMutationOutcome<()> {
         let (outcome, blocked) = {
             let mut state = self.state();
             state.delete_calls += 1;
             (
                 state.deletes.pop_front().unwrap_or(
-                    CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                        CryptocurrencyWalletMonitoringApiError::NotReady,
+                    CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                        CryptocurrencyWalletMonitorApiError::NotReady,
                     ),
                 ),
                 state.blocked_mutation.take(),
@@ -428,7 +417,7 @@ async fn block_operation(blocked: Option<Arc<OperationBlock>>) {
 
 /// One live subscription inside the fake session.
 pub(crate) struct FakeSubscription {
-    events: mpsc::Receiver<Result<CryptocurrencyWalletMonitoringTransfer, TransportError>>,
+    events: mpsc::Receiver<Result<CryptocurrencyWalletMonitorTransfer, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
     drops: Arc<AtomicUsize>,
     /// The status this subscription takes on as it hands the next event over, which is how
@@ -444,7 +433,7 @@ impl Drop for FakeSubscription {
 
 /// One live subscription, as a test drives it.
 pub(crate) struct FakeSubscriptionControl {
-    pub events: mpsc::Sender<Result<CryptocurrencyWalletMonitoringTransfer, TransportError>>,
+    pub events: mpsc::Sender<Result<CryptocurrencyWalletMonitorTransfer, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
     /// How many times this subscription has been dropped, which is how a test sees the
     /// service let go of an account it no longer follows.
@@ -466,12 +455,12 @@ impl FakeSubscriptionControl {
     }
 }
 
-impl CryptocurrencyWalletMonitoringEventSubscription for FakeSubscription {
+impl CryptocurrencyWalletMonitorEventSubscription for FakeSubscription {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         self.status.subscribe()
     }
 
-    async fn recv(&mut self) -> Result<CryptocurrencyWalletMonitoringTransfer, TransportError> {
+    async fn recv(&mut self) -> Result<CryptocurrencyWalletMonitorTransfer, TransportError> {
         let event = self
             .events
             .recv()

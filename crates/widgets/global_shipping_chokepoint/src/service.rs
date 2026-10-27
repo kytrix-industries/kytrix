@@ -31,9 +31,7 @@ use gpui_kit::{App, SharedString};
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{ErrorCode, KytrixAccountSession, KytrixServiceError},
-    strategic_maritime_chokepoints_tracking::{
-        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
-    },
+    global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
 };
 use network::transport::{error::TransportError, subscription::Subscription};
 use smol_str::SmolStr;
@@ -50,27 +48,27 @@ use super::model::MAX_VESSELS;
 
 /// The account whose AIS picture a stream carries, and the area it covers.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct StrategicMaritimeChokepointsTrackingScope {
+pub(super) struct GlobalShippingChokepointScope {
     pub account: SmolStr,
-    pub area: StrategicMaritimeChokepointsTrackingArea,
+    pub area: GlobalShippingChokepointArea,
 }
 
-impl StrategicMaritimeChokepointsTrackingScope {
+impl GlobalShippingChokepointScope {
     /// The scope an account follows. A pane reads the one area the map draws.
     pub(super) fn new(account: SmolStr) -> Self {
         Self {
             account,
-            area: StrategicMaritimeChokepointsTrackingArea::Hormuz,
+            area: GlobalShippingChokepointArea::Hormuz,
         }
     }
 }
 
 /// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum StrategicMaritimeChokepointsTrackingRequest {
+pub(super) enum GlobalShippingChokepointRequest {
     /// Follows the scope's area, replacing whatever stream is running.
     Load {
-        scope: StrategicMaritimeChokepointsTrackingScope,
+        scope: GlobalShippingChokepointScope,
     },
     /// Follows nothing, because nobody is signed in.
     Stop,
@@ -78,7 +76,7 @@ pub(super) enum StrategicMaritimeChokepointsTrackingRequest {
 
 /// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum StrategicMaritimeChokepointsTrackingResponse {
+pub(super) enum GlobalShippingChokepointResponse {
     /// The area's stream is running.
     StreamStarted,
     /// Nothing is followed.
@@ -102,7 +100,7 @@ impl LocalizedError for AisStreamError {
             // An account without AIS access is a refusal about the subscription, not a
             // connection failure that asking again would fix, so it is named as itself.
             Self::Service(KytrixServiceError::Server(ErrorCode::EntitlementRequired)) => {
-                i18n::t!(cx, "widget.hormuz_vessel_map.entitlement_required")
+                i18n::t!(cx, "widget.global_shipping_chokepoint.entitlement_required")
             }
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
@@ -114,7 +112,7 @@ impl LocalizedError for AisStreamError {
 #[derive(Clone, Debug)]
 pub(super) enum AisStreamMessage {
     /// One push from the server: a keyframe, or an increment continuing the picture.
-    Update(StrategicMaritimeChokepointsTrackingUpdate),
+    Update(GlobalShippingChokepointUpdate),
     /// The stream is over; this travels reliably so the pane is told before the entry
     /// that would have carried it is retired.
     ///
@@ -124,12 +122,12 @@ pub(super) enum AisStreamMessage {
     Failed(Arc<AisStreamError>),
 }
 
-pub(super) struct StrategicMaritimeChokepointsTrackingProtocol;
+pub(super) struct GlobalShippingChokepointProtocol;
 
-impl WidgetProtocol for StrategicMaritimeChokepointsTrackingProtocol {
-    type Request = StrategicMaritimeChokepointsTrackingRequest;
-    type Response = StrategicMaritimeChokepointsTrackingResponse;
-    type StreamKey = StrategicMaritimeChokepointsTrackingArea;
+impl WidgetProtocol for GlobalShippingChokepointProtocol {
+    type Request = GlobalShippingChokepointRequest;
+    type Response = GlobalShippingChokepointResponse;
+    type StreamKey = GlobalShippingChokepointArea;
     type StreamMessage = AisStreamMessage;
     type Error = AisStreamError;
 }
@@ -138,10 +136,8 @@ impl WidgetProtocol for StrategicMaritimeChokepointsTrackingProtocol {
 ///
 /// The service is written against this seam rather than against the connector, so a test
 /// can drive every state a session and a subscription can be in without one.
-pub(super) trait StrategicMaritimeChokepointsTrackingSource:
-    Clone + Send + Sync + 'static
-{
-    type Session: StrategicMaritimeChokepointsTrackingSession;
+pub(super) trait GlobalShippingChokepointSource: Clone + Send + Sync + 'static {
+    type Session: GlobalShippingChokepointSession;
 
     /// Takes the account's session, which the area's subscription is opened through.
     fn acquire_session(
@@ -151,32 +147,28 @@ pub(super) trait StrategicMaritimeChokepointsTrackingSource:
 }
 
 /// One account's session.
-pub(super) trait StrategicMaritimeChokepointsTrackingSession:
-    Clone + Send + Sync + 'static
-{
+pub(super) trait GlobalShippingChokepointSession: Clone + Send + Sync + 'static {
     /// The subscription one area is followed through.
     ///
-    /// It is an associated type rather than the concrete `Subscription<StrategicMaritimeChokepointsTrackingUpdate>` so a
+    /// It is an associated type rather than the concrete `Subscription<GlobalShippingChokepointUpdate>` so a
     /// test can hand in a subscription it drives and counts the drops of: releasing a
     /// replaced stream's subscription is what keeps the pane off an account it has left.
-    type Subscription: StrategicMaritimeChokepointsTrackingEventSubscription;
+    type Subscription: GlobalShippingChokepointEventSubscription;
 
-    fn subscribe_strategic_maritime_chokepoints_tracking(
+    fn subscribe_global_shipping_chokepoint(
         &self,
-        area: StrategicMaritimeChokepointsTrackingArea,
+        area: GlobalShippingChokepointArea,
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 }
 
 /// One live AIS subscription.
-pub(super) trait StrategicMaritimeChokepointsTrackingEventSubscription:
-    Send + 'static
-{
+pub(super) trait GlobalShippingChokepointEventSubscription: Send + 'static {
     fn recv(
         &mut self,
-    ) -> impl Future<Output = Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError>> + Send;
+    ) -> impl Future<Output = Result<GlobalShippingChokepointUpdate, TransportError>> + Send;
 }
 
-impl StrategicMaritimeChokepointsTrackingSource for KytrixServiceConnector {
+impl GlobalShippingChokepointSource for KytrixServiceConnector {
     type Session = KytrixAccountSession;
 
     async fn acquire_session(&self, account_id: &str) -> Result<Self::Session, KytrixServiceError> {
@@ -184,56 +176,52 @@ impl StrategicMaritimeChokepointsTrackingSource for KytrixServiceConnector {
     }
 }
 
-impl StrategicMaritimeChokepointsTrackingSession for KytrixAccountSession {
-    type Subscription = Subscription<StrategicMaritimeChokepointsTrackingUpdate>;
+impl GlobalShippingChokepointSession for KytrixAccountSession {
+    type Subscription = Subscription<GlobalShippingChokepointUpdate>;
 
-    async fn subscribe_strategic_maritime_chokepoints_tracking(
+    async fn subscribe_global_shipping_chokepoint(
         &self,
-        area: StrategicMaritimeChokepointsTrackingArea,
+        area: GlobalShippingChokepointArea,
     ) -> Result<Self::Subscription, KytrixServiceError> {
-        KytrixAccountSession::subscribe_strategic_maritime_chokepoints_tracking(self, area).await
+        KytrixAccountSession::subscribe_global_shipping_chokepoint(self, area).await
     }
 }
 
-impl StrategicMaritimeChokepointsTrackingEventSubscription
-    for Subscription<StrategicMaritimeChokepointsTrackingUpdate>
-{
-    async fn recv(&mut self) -> Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError> {
+impl GlobalShippingChokepointEventSubscription for Subscription<GlobalShippingChokepointUpdate> {
+    async fn recv(&mut self) -> Result<GlobalShippingChokepointUpdate, TransportError> {
         Subscription::recv(self).await
     }
 }
 
 /// The service that follows one pane's AIS picture.
-pub(super) struct StrategicMaritimeChokepointsTrackingService<S = KytrixServiceConnector> {
+pub(super) struct GlobalShippingChokepointService<S = KytrixServiceConnector> {
     source: S,
 }
 
-impl<S> StrategicMaritimeChokepointsTrackingService<S> {
+impl<S> GlobalShippingChokepointService<S> {
     pub(super) const fn new(source: S) -> Self {
         Self { source }
     }
 }
 
-impl<S> WidgetService<StrategicMaritimeChokepointsTrackingProtocol>
-    for StrategicMaritimeChokepointsTrackingService<S>
+impl<S> WidgetService<GlobalShippingChokepointProtocol> for GlobalShippingChokepointService<S>
 where
-    S: StrategicMaritimeChokepointsTrackingSource,
+    S: GlobalShippingChokepointSource,
 {
-    async fn run(self, mut context: ServiceContext<StrategicMaritimeChokepointsTrackingProtocol>) {
-        let mut active: Option<StrategicMaritimeChokepointsTrackingArea> = None;
+    async fn run(self, mut context: ServiceContext<GlobalShippingChokepointProtocol>) {
+        let mut active: Option<GlobalShippingChokepointArea> = None;
         let source = self.source.clone();
 
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             match request {
-                StrategicMaritimeChokepointsTrackingRequest::Stop => {
+                GlobalShippingChokepointRequest::Stop => {
                     if let Some(area) = active.take() {
                         context.cancel_stream(&area);
                     }
-                    let _ =
-                        reply.respond(Ok(StrategicMaritimeChokepointsTrackingResponse::Stopped));
+                    let _ = reply.respond(Ok(GlobalShippingChokepointResponse::Stopped));
                 }
-                StrategicMaritimeChokepointsTrackingRequest::Load { scope } => {
+                GlobalShippingChokepointRequest::Load { scope } => {
                     // The key is the area, so it is taken before the scope is moved into
                     // the stream task, which needs the account as well.
                     let key = scope.area;
@@ -244,9 +232,7 @@ where
                     // starting anything, so a caller that went away cannot leave a
                     // stream behind.
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
-                        let _ = reply.respond(Ok(
-                            StrategicMaritimeChokepointsTrackingResponse::StreamStarted,
-                        ));
+                        let _ = reply.respond(Ok(GlobalShippingChokepointResponse::StreamStarted));
                         continue;
                     }
                     let source = source.clone();
@@ -256,9 +242,7 @@ where
                     context.start_stream(key, move |publisher| async move {
                         run_stream(source, scope, publisher).await;
                     });
-                    let _ = reply.respond(Ok(
-                        StrategicMaritimeChokepointsTrackingResponse::StreamStarted,
-                    ));
+                    let _ = reply.respond(Ok(GlobalShippingChokepointResponse::StreamStarted));
                 }
             }
         }
@@ -268,10 +252,10 @@ where
 /// Runs one area's subscription until it fails or is replaced.
 async fn run_stream<S>(
     source: S,
-    scope: StrategicMaritimeChokepointsTrackingScope,
-    publisher: StreamPublisher<StrategicMaritimeChokepointsTrackingProtocol>,
+    scope: GlobalShippingChokepointScope,
+    publisher: StreamPublisher<GlobalShippingChokepointProtocol>,
 ) where
-    S: StrategicMaritimeChokepointsTrackingSource,
+    S: GlobalShippingChokepointSource,
 {
     // Slow operations all live here, each one interruptible by a replacement or a stop,
     // and each failure reported on the stream that asked for it.
@@ -288,7 +272,7 @@ async fn run_stream<S>(
     let subscription = tokio::select! {
         biased;
         () = publisher.cancelled() => return,
-        result = session.subscribe_strategic_maritime_chokepoints_tracking(scope.area) => result,
+        result = session.subscribe_global_shipping_chokepoint(scope.area) => result,
     };
     let mut subscription = match subscription {
         Ok(subscription) => subscription,
@@ -326,9 +310,7 @@ async fn run_stream<S>(
 /// picture may still hold. Which vessels the picture holds is never decided here: deltas
 /// are passed through rather than evicted against a running set the client would then
 /// have picked itself.
-fn clamp_to_capacity(
-    mut update: StrategicMaritimeChokepointsTrackingUpdate,
-) -> StrategicMaritimeChokepointsTrackingUpdate {
+fn clamp_to_capacity(mut update: GlobalShippingChokepointUpdate) -> GlobalShippingChokepointUpdate {
     if update.positions.len() > MAX_VESSELS {
         update.positions.truncate(MAX_VESSELS);
     }
@@ -341,7 +323,7 @@ fn clamp_to_capacity(
 /// the recovery. Until then the task stays where it is rather than returning, because a
 /// task that ended retires the key's latest entry before the pane could read it.
 async fn publish_failure(
-    publisher: &StreamPublisher<StrategicMaritimeChokepointsTrackingProtocol>,
+    publisher: &StreamPublisher<GlobalShippingChokepointProtocol>,
     error: AisStreamError,
 ) {
     let _ = publisher
@@ -374,7 +356,7 @@ mod tests {
         time::Duration,
     };
 
-    use kytrix_service_provider::service::strategic_maritime_chokepoints_tracking::StrategicMaritimeChokepointsTrackingPosition;
+    use kytrix_service_provider::service::global_shipping_chokepoint::GlobalShippingChokepointPosition;
     use tokio::sync::{Notify, mpsc};
     use widget::{
         runtime::WidgetRuntime,
@@ -386,41 +368,41 @@ mod tests {
     /// The account every fixture scope belongs to.
     const ACCOUNT: &str = "test-account";
 
-    fn scope() -> StrategicMaritimeChokepointsTrackingScope {
-        StrategicMaritimeChokepointsTrackingScope::new(SmolStr::new_static(ACCOUNT))
+    fn scope() -> GlobalShippingChokepointScope {
+        GlobalShippingChokepointScope::new(SmolStr::new_static(ACCOUNT))
     }
 
-    fn runtime(source: &FakeSource) -> WidgetRuntime<StrategicMaritimeChokepointsTrackingProtocol> {
+    fn runtime(source: &FakeSource) -> WidgetRuntime<GlobalShippingChokepointProtocol> {
         WidgetRuntime::spawn(
             current_test_handle(),
-            StrategicMaritimeChokepointsTrackingService::new(source.clone()),
+            GlobalShippingChokepointService::new(source.clone()),
         )
     }
 
     async fn load(
-        runtime: &WidgetRuntime<StrategicMaritimeChokepointsTrackingProtocol>,
-    ) -> StrategicMaritimeChokepointsTrackingResponse {
+        runtime: &WidgetRuntime<GlobalShippingChokepointProtocol>,
+    ) -> GlobalShippingChokepointResponse {
         runtime
             .client()
-            .call(StrategicMaritimeChokepointsTrackingRequest::Load { scope: scope() })
+            .call(GlobalShippingChokepointRequest::Load { scope: scope() })
             .await
             .expect("the stream should start")
             .into_value()
     }
 
     async fn stop(
-        runtime: &WidgetRuntime<StrategicMaritimeChokepointsTrackingProtocol>,
-    ) -> StrategicMaritimeChokepointsTrackingResponse {
+        runtime: &WidgetRuntime<GlobalShippingChokepointProtocol>,
+    ) -> GlobalShippingChokepointResponse {
         runtime
             .client()
-            .call(StrategicMaritimeChokepointsTrackingRequest::Stop)
+            .call(GlobalShippingChokepointRequest::Stop)
             .await
             .expect("stopping should be answered")
             .into_value()
     }
 
-    fn position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
-        StrategicMaritimeChokepointsTrackingPosition {
+    fn position(mmsi: u32) -> GlobalShippingChokepointPosition {
+        GlobalShippingChokepointPosition {
             mmsi,
             latitude: 0,
             longitude: 0,
@@ -434,9 +416,9 @@ mod tests {
 
     fn update(
         sequence: u64,
-        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
-        StrategicMaritimeChokepointsTrackingUpdate {
+        positions: Vec<GlobalShippingChokepointPosition>,
+    ) -> GlobalShippingChokepointUpdate {
+        GlobalShippingChokepointUpdate {
             epoch: 7,
             keyframe: false,
             sequence,
@@ -460,7 +442,7 @@ mod tests {
     }
 
     async fn next_reliable(
-        reliable: &mut ReliableStream<StrategicMaritimeChokepointsTrackingProtocol>,
+        reliable: &mut ReliableStream<GlobalShippingChokepointProtocol>,
         predicate: impl Fn(&AisStreamMessage) -> bool,
     ) -> AisStreamMessage {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -479,7 +461,7 @@ mod tests {
     }
 
     async fn receive_failure(
-        reliable: &mut ReliableStream<StrategicMaritimeChokepointsTrackingProtocol>,
+        reliable: &mut ReliableStream<GlobalShippingChokepointProtocol>,
     ) -> AisStreamError {
         let message = next_reliable(reliable, |message| {
             matches!(message, AisStreamMessage::Failed(_))
@@ -492,8 +474,8 @@ mod tests {
     }
 
     async fn next_update(
-        latest: &mut LatestStream<StrategicMaritimeChokepointsTrackingProtocol>,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
+        latest: &mut LatestStream<GlobalShippingChokepointProtocol>,
+    ) -> GlobalShippingChokepointUpdate {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 latest
@@ -521,7 +503,7 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
 
         control
@@ -534,7 +516,7 @@ mod tests {
         assert_eq!(source.requested(), [SmolStr::new_static(ACCOUNT)]);
         assert_eq!(
             session.state().areas.as_slice(),
-            [StrategicMaritimeChokepointsTrackingArea::Hormuz]
+            [GlobalShippingChokepointArea::Hormuz]
         );
         assert_eq!(session.state().subscribes, 1);
         runtime.shutdown().await;
@@ -597,7 +579,7 @@ mod tests {
 
         assert_eq!(
             stop(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::Stopped
+            GlobalShippingChokepointResponse::Stopped
         );
         wait_for("the stopped stream should let its subscription go", || {
             control.drops.load(Ordering::SeqCst) == 1
@@ -605,7 +587,7 @@ mod tests {
         .await;
         assert_eq!(
             stop(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::Stopped,
+            GlobalShippingChokepointResponse::Stopped,
             "stopping nothing is still an answer"
         );
         assert!(
@@ -625,13 +607,13 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
         block.wait_started().await;
 
         assert_eq!(
             stop(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::Stopped
+            GlobalShippingChokepointResponse::Stopped
         );
         block.wait_dropped().await;
         runtime.shutdown().await;
@@ -647,13 +629,13 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
         block.wait_started().await;
 
         assert_eq!(
             stop(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::Stopped
+            GlobalShippingChokepointResponse::Stopped
         );
         block.wait_dropped().await;
         runtime.shutdown().await;
@@ -671,7 +653,7 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
         assert_eq!(
             receive_failure(&mut reliable).await,
@@ -697,7 +679,7 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
         assert_eq!(
             receive_failure(&mut reliable).await,
@@ -752,7 +734,7 @@ mod tests {
 
         assert_eq!(
             load(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::StreamStarted
+            GlobalShippingChokepointResponse::StreamStarted
         );
         control
             .events
@@ -782,7 +764,7 @@ mod tests {
 
         assert_eq!(
             stop(&runtime).await,
-            StrategicMaritimeChokepointsTrackingResponse::Stopped
+            GlobalShippingChokepointResponse::Stopped
         );
         wait_for("the replaced stream should let its subscription go", || {
             control.drops.load(Ordering::SeqCst) == 1
@@ -932,7 +914,7 @@ mod tests {
         }
     }
 
-    impl StrategicMaritimeChokepointsTrackingSource for FakeSource {
+    impl GlobalShippingChokepointSource for FakeSource {
         type Session = FakeSession;
 
         async fn acquire_session(
@@ -971,10 +953,10 @@ mod tests {
     struct FakeSessionState {
         subscriptions: VecDeque<FakeSubscribe>,
         subscribes: usize,
-        areas: Vec<StrategicMaritimeChokepointsTrackingArea>,
+        areas: Vec<GlobalShippingChokepointArea>,
     }
 
-    /// What the next `subscribe_strategic_maritime_chokepoints_tracking` call finds.
+    /// What the next `subscribe_global_shipping_chokepoint` call finds.
     enum FakeSubscribe {
         /// A subscription the test drives.
         Ready(FakeSubscription),
@@ -1027,12 +1009,12 @@ mod tests {
         }
     }
 
-    impl StrategicMaritimeChokepointsTrackingSession for FakeSession {
+    impl GlobalShippingChokepointSession for FakeSession {
         type Subscription = FakeSubscription;
 
-        async fn subscribe_strategic_maritime_chokepoints_tracking(
+        async fn subscribe_global_shipping_chokepoint(
             &self,
-            area: StrategicMaritimeChokepointsTrackingArea,
+            area: GlobalShippingChokepointArea,
         ) -> Result<Self::Subscription, KytrixServiceError> {
             let next = {
                 let mut state = self.state();
@@ -1059,7 +1041,7 @@ mod tests {
 
     /// One live subscription inside the fake session.
     struct FakeSubscription {
-        events: mpsc::Receiver<Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError>>,
+        events: mpsc::Receiver<Result<GlobalShippingChokepointUpdate, TransportError>>,
         drops: Arc<AtomicUsize>,
     }
 
@@ -1069,10 +1051,8 @@ mod tests {
         }
     }
 
-    impl StrategicMaritimeChokepointsTrackingEventSubscription for FakeSubscription {
-        async fn recv(
-            &mut self,
-        ) -> Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError> {
+    impl GlobalShippingChokepointEventSubscription for FakeSubscription {
+        async fn recv(&mut self) -> Result<GlobalShippingChokepointUpdate, TransportError> {
             self.events
                 .recv()
                 .await
@@ -1082,7 +1062,7 @@ mod tests {
 
     /// One live subscription, as a test drives it.
     struct FakeSubscriptionControl {
-        events: mpsc::Sender<Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError>>,
+        events: mpsc::Sender<Result<GlobalShippingChokepointUpdate, TransportError>>,
         /// How many times this subscription has been dropped, which is how a test sees
         /// the service let go of a stream it no longer follows.
         drops: Arc<AtomicUsize>,

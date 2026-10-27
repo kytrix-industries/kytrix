@@ -16,7 +16,7 @@ use crate::{
         SetLeverageCommand, SetMarginModeCommand, SetPositionModeCommand, TickerQuery,
         TickersQuery, TradingSettingsQuery,
     },
-    protocol::{AuthenticatedTarget, WalletMonitorTarget},
+    protocol::{AuthenticatedTarget, WalletTarget},
 };
 
 /// One protocol request.
@@ -129,7 +129,7 @@ impl ProtocolRequest {
     }
 
     /// Returns the wallet-monitor target this request reads, when it reads one.
-    pub fn wallet_target(&self) -> Option<&WalletMonitorTarget> {
+    pub fn wallet_target(&self) -> Option<&WalletTarget> {
         match self {
             Self::FetchHyperliquidSpotState(query)
             | Self::FetchHyperliquidPerpetualState(query)

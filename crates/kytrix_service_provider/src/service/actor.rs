@@ -171,7 +171,7 @@ impl ServiceSessionActor {
             subscribers: AHashMap::with_capacity(8),
             topics: AHashMap::with_capacity(4),
             latest_financial_indices: AHashMap::with_capacity(8),
-            latest_strategic_maritime_chokepoints_tracking_keyframes: AHashMap::with_capacity(2),
+            latest_global_shipping_chokepoint_keyframes: AHashMap::with_capacity(2),
             session_state: None,
             subscriptions_dirty: false,
             websocket: None,
@@ -476,8 +476,7 @@ impl ServiceSessionActor {
         self.subscribers.clear();
         self.topics.clear();
         self.latest_financial_indices.clear();
-        self.latest_strategic_maritime_chokepoints_tracking_keyframes
-            .clear();
+        self.latest_global_shipping_chokepoint_keyframes.clear();
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
         self.renewal = None;
@@ -856,7 +855,7 @@ impl ServiceSessionActor {
             self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::SessionState(state)));
         }
         self.replay_latest_indices(id, &topics);
-        self.replay_latest_strategic_maritime_chokepoints_tracking(id, &topics, &new_topics);
+        self.replay_latest_global_shipping_chokepoint(id, &topics, &new_topics);
         new_topics
     }
 
@@ -1064,8 +1063,7 @@ impl ServiceSessionActor {
         self.subscribers.clear();
         self.topics.clear();
         self.latest_financial_indices.clear();
-        self.latest_strategic_maritime_chokepoints_tracking_keyframes
-            .clear();
+        self.latest_global_shipping_chokepoint_keyframes.clear();
         self.subscriptions_dirty = false;
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
@@ -1126,13 +1124,12 @@ impl ServiceSessionActor {
             ServiceTopic::FinancialIndex(topic) => {
                 self.latest_financial_indices.remove(topic);
             }
-            ServiceTopic::StrategicMaritimeChokepointsTracking(area) => {
-                self.latest_strategic_maritime_chokepoints_tracking_keyframes
+            ServiceTopic::GlobalShippingChokepoint(area) => {
+                self.latest_global_shipping_chokepoint_keyframes
                     .remove(area);
             }
-            ServiceTopic::News
-            | ServiceTopic::XAccountMonitoring
-            | ServiceTopic::CryptocurrencyWalletMonitoring => {}
+            ServiceTopic::News | ServiceTopic::X | ServiceTopic::CryptocurrencyWalletMonitoring => {
+            }
         }
     }
 
@@ -1144,9 +1141,9 @@ impl ServiceSessionActor {
                     self.latest_financial_indices.get(topic).cloned()
                 }
                 ServiceTopic::News
-                | ServiceTopic::XAccountMonitoring
+                | ServiceTopic::X
                 | ServiceTopic::CryptocurrencyWalletMonitoring
-                | ServiceTopic::StrategicMaritimeChokepointsTracking(_) => None,
+                | ServiceTopic::GlobalShippingChokepoint(_) => None,
             })
             .collect::<Vec<_>>();
         for event in events {
@@ -1162,21 +1159,21 @@ impl ServiceSessionActor {
     /// without the baseline — until the server's fallback keyframe, up to 300 s later. The
     /// topic had no subscribers before this one only when it is new, so a new topic is left
     /// to the server's own replay rather than being given a keyframe of unknown age.
-    pub(super) fn replay_latest_strategic_maritime_chokepoints_tracking(
+    pub(super) fn replay_latest_global_shipping_chokepoint(
         &mut self,
         id: u64,
         topics: &[ServiceTopic],
         new_topics: &[ServiceTopic],
     ) {
         for topic in topics {
-            let ServiceTopic::StrategicMaritimeChokepointsTracking(area) = topic else {
+            let ServiceTopic::GlobalShippingChokepoint(area) = topic else {
                 continue;
             };
             if new_topics.contains(topic) {
                 continue;
             }
             let Some(keyframe) = self
-                .latest_strategic_maritime_chokepoints_tracking_keyframes
+                .latest_global_shipping_chokepoint_keyframes
                 .get(area)
                 .cloned()
             else {
@@ -1184,9 +1181,7 @@ impl ServiceSessionActor {
             };
             self.publish_to_ids(
                 vec![id],
-                Ok(KytrixServiceEvent::StrategicMaritimeChokepointsTracking(
-                    keyframe,
-                )),
+                Ok(KytrixServiceEvent::GlobalShippingChokepoint(keyframe)),
             );
         }
     }
@@ -2000,8 +1995,7 @@ impl ServiceSessionActor {
             subscriber.sink.reconnecting();
         }
         self.latest_financial_indices.clear();
-        self.latest_strategic_maritime_chokepoints_tracking_keyframes
-            .clear();
+        self.latest_global_shipping_chokepoint_keyframes.clear();
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
@@ -2030,11 +2024,11 @@ impl ServiceSessionActor {
         topic: ServiceTopic,
         message: Result<KytrixServiceEvent, KytrixServiceError>,
     ) {
-        if let ServiceTopic::StrategicMaritimeChokepointsTracking(area) = &topic
-            && let Ok(KytrixServiceEvent::StrategicMaritimeChokepointsTracking(update)) = &message
+        if let ServiceTopic::GlobalShippingChokepoint(area) = &topic
+            && let Ok(KytrixServiceEvent::GlobalShippingChokepoint(update)) = &message
             && update.keyframe
         {
-            self.latest_strategic_maritime_chokepoints_tracking_keyframes
+            self.latest_global_shipping_chokepoint_keyframes
                 .insert(*area, update.clone());
         }
         if self.topics.contains_key(&topic)
@@ -2222,27 +2216,24 @@ mod tests {
     }
 
     #[test]
-    fn a_second_strategic_maritime_chokepoints_tracking_subscriber_should_be_handed_the_keyframe_it_missed()
-     {
-        use crate::service::strategic_maritime_chokepoints_tracking::{
-            StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingPosition,
-            StrategicMaritimeChokepointsTrackingUpdate,
+    fn a_second_global_shipping_chokepoint_subscriber_should_be_handed_the_keyframe_it_missed() {
+        use crate::service::global_shipping_chokepoint::{
+            GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
+            GlobalShippingChokepointUpdate,
         };
 
         let (_commands, receiver) = mpsc::channel(1);
         let cancellation = CancellationToken::new();
         let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
-        let topic = ServiceTopic::StrategicMaritimeChokepointsTracking(
-            StrategicMaritimeChokepointsTrackingArea::Hormuz,
-        );
+        let topic = ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz);
 
-        let keyframe = StrategicMaritimeChokepointsTrackingUpdate {
+        let keyframe = GlobalShippingChokepointUpdate {
             epoch: 7,
             keyframe: true,
             sequence: 3,
             base: 0,
             statics: Vec::new(),
-            positions: vec![StrategicMaritimeChokepointsTrackingPosition {
+            positions: vec![GlobalShippingChokepointPosition {
                 mmsi: 42,
                 latitude: 26_500_000,
                 longitude: 56_300_000,
@@ -2261,13 +2252,13 @@ mod tests {
         actor.add_subscriber_inner(
             1,
             vec![topic.clone()],
-            SubscriberSink::StrategicMaritimeChokepointsTracking(first_publisher),
+            SubscriberSink::GlobalShippingChokepoint(first_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
         actor.publish_topic(
             topic.clone(),
-            Ok(KytrixServiceEvent::StrategicMaritimeChokepointsTracking(
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(
                 keyframe.clone(),
             )),
         );
@@ -2280,7 +2271,7 @@ mod tests {
         actor.add_subscriber_inner(
             2,
             vec![topic.clone()],
-            SubscriberSink::StrategicMaritimeChokepointsTracking(second_publisher),
+            SubscriberSink::GlobalShippingChokepoint(second_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
@@ -2293,15 +2284,15 @@ mod tests {
         assert!(actor.remove_subscriber(1).is_empty());
         assert!(
             actor
-                .latest_strategic_maritime_chokepoints_tracking_keyframes
-                .contains_key(&StrategicMaritimeChokepointsTrackingArea::Hormuz),
+                .latest_global_shipping_chokepoint_keyframes
+                .contains_key(&GlobalShippingChokepointArea::Hormuz),
             "the pane still reading the area keeps its keyframe",
         );
         assert_eq!(actor.remove_subscriber(2), vec![topic]);
         assert!(
             !actor
-                .latest_strategic_maritime_chokepoints_tracking_keyframes
-                .contains_key(&StrategicMaritimeChokepointsTrackingArea::Hormuz),
+                .latest_global_shipping_chokepoint_keyframes
+                .contains_key(&GlobalShippingChokepointArea::Hormuz),
             "the last subscriber taking the area away takes its keyframe too",
         );
     }

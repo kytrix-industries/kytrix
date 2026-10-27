@@ -303,7 +303,7 @@ pub struct ForceOrdersWidget {
 impl WidgetView for ForceOrdersWidget {
     type Config = ForceOrdersConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.force_orders");
+    const ID: WidgetId = WidgetId::new_static("kytrix.force_orders");
     const DISPLAY_NAME: &'static str = "widget.names.force_orders";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Live liquidation orders across Binance and OKX";

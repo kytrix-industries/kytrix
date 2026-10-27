@@ -252,22 +252,22 @@ fn amount_tone(value: SignedQuantity) -> CellTone {
 fn position_cell(direction: PositionDirection, cx: &App) -> DisplayCell {
     match direction {
         PositionDirection::Long => {
-            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet_monitor.long"))
-                .tone(CellTone::Positive)
+            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet.long")).tone(CellTone::Positive)
         }
         PositionDirection::Short => {
-            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet_monitor.short"))
-                .tone(CellTone::Negative)
+            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet.short")).tone(CellTone::Negative)
         }
     }
 }
 
 fn side_cell(side: Side, cx: &App) -> DisplayCell {
     match side {
-        Side::Buy => DisplayCell::text(t!(cx, "widget.hyperliquid_wallet_monitor.buy"))
-            .tone(CellTone::Positive),
-        Side::Sell => DisplayCell::text(t!(cx, "widget.hyperliquid_wallet_monitor.sell"))
-            .tone(CellTone::Negative),
+        Side::Buy => {
+            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet.buy")).tone(CellTone::Positive)
+        }
+        Side::Sell => {
+            DisplayCell::text(t!(cx, "widget.hyperliquid_wallet.sell")).tone(CellTone::Negative)
+        }
     }
 }
 
@@ -760,10 +760,10 @@ impl TableDataSet<5> for SpotTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 5] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.asset"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.asset_share"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.quantity"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.value"),
+            t!(cx, "widget.hyperliquid_wallet.asset"),
+            t!(cx, "widget.hyperliquid_wallet.asset_share"),
+            t!(cx, "widget.hyperliquid_wallet.quantity"),
+            t!(cx, "widget.hyperliquid_wallet.value"),
             t!(cx, "common.price"),
         ]
     }
@@ -792,15 +792,15 @@ impl TableDataSet<9> for PerpetualTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 9] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.coin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.side"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.position_value"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.unrealized_pnl"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.entry"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.mark"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.liquidation"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.margin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.funding"),
+            t!(cx, "widget.hyperliquid_wallet.coin"),
+            t!(cx, "widget.hyperliquid_wallet.side"),
+            t!(cx, "widget.hyperliquid_wallet.position_value"),
+            t!(cx, "widget.hyperliquid_wallet.unrealized_pnl"),
+            t!(cx, "widget.hyperliquid_wallet.entry"),
+            t!(cx, "widget.hyperliquid_wallet.mark"),
+            t!(cx, "widget.hyperliquid_wallet.liquidation"),
+            t!(cx, "widget.hyperliquid_wallet.margin"),
+            t!(cx, "widget.hyperliquid_wallet.funding"),
         ]
     }
 
@@ -838,14 +838,14 @@ impl TableDataSet<9> for OpenOrdersTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 9] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.coin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.collateral"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.side"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.quantity"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.value"),
+            t!(cx, "widget.hyperliquid_wallet.coin"),
+            t!(cx, "widget.hyperliquid_wallet.collateral"),
+            t!(cx, "widget.hyperliquid_wallet.side"),
+            t!(cx, "widget.hyperliquid_wallet.quantity"),
+            t!(cx, "widget.hyperliquid_wallet.value"),
             t!(cx, "common.price"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.trigger_price"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.reduce_only"),
+            t!(cx, "widget.hyperliquid_wallet.trigger_price"),
+            t!(cx, "widget.hyperliquid_wallet.reduce_only"),
             t!(cx, "common.time"),
         ]
     }
@@ -884,13 +884,13 @@ impl TableDataSet<8> for TradesTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 8] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.coin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.side"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.quantity"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.position"),
+            t!(cx, "widget.hyperliquid_wallet.coin"),
+            t!(cx, "widget.hyperliquid_wallet.side"),
+            t!(cx, "widget.hyperliquid_wallet.quantity"),
+            t!(cx, "widget.hyperliquid_wallet.position"),
             t!(cx, "common.price"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.realized_pnl"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.fee"),
+            t!(cx, "widget.hyperliquid_wallet.realized_pnl"),
+            t!(cx, "widget.hyperliquid_wallet.fee"),
             t!(cx, "common.time"),
         ]
     }
@@ -928,14 +928,14 @@ impl TableDataSet<9> for HistoricalOrdersTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 9] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.coin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.side"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.quantity"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.value"),
+            t!(cx, "widget.hyperliquid_wallet.coin"),
+            t!(cx, "widget.hyperliquid_wallet.side"),
+            t!(cx, "widget.hyperliquid_wallet.quantity"),
+            t!(cx, "widget.hyperliquid_wallet.value"),
             t!(cx, "common.price"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.trigger_price"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.reduce_only"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.status"),
+            t!(cx, "widget.hyperliquid_wallet.trigger_price"),
+            t!(cx, "widget.hyperliquid_wallet.reduce_only"),
+            t!(cx, "widget.hyperliquid_wallet.status"),
             t!(cx, "common.time"),
         ]
     }
@@ -974,10 +974,10 @@ impl TableDataSet<5> for LedgerTable {
 
     fn headers(&self, cx: &App) -> [SharedString; 5] {
         [
-            t!(cx, "widget.hyperliquid_wallet_monitor.coin"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.kind"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.quantity"),
-            t!(cx, "widget.hyperliquid_wallet_monitor.value"),
+            t!(cx, "widget.hyperliquid_wallet.coin"),
+            t!(cx, "widget.hyperliquid_wallet.kind"),
+            t!(cx, "widget.hyperliquid_wallet.quantity"),
+            t!(cx, "widget.hyperliquid_wallet.value"),
             t!(cx, "common.time"),
         ]
     }

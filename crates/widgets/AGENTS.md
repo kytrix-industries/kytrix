@@ -76,7 +76,7 @@ crates/widgets/<widget_name>/
   dialog 是职责独立的视图，这是上面那条规则的一个实例，不是例外。
   widget 与 dialog 之间 **只走弱引用**：widget 持 `WeakEntity<XxxDialog>`，dialog 持 `WeakEntity<XxxWidget>`；
   任何一侧持有对方的强引用都会让 dialog 关不掉、或让它的状态永不释放。参考实现：
-  `tweet_monitor/src/dialog.rs`、`hyperliquid_wallet_monitor/src/dialog.rs`。
+  `x/src/dialog.rs`、`hyperliquid_wallet/src/dialog.rs`。
   一个 crate 出多个 widget 且各自有 dialog 时，放 `src/dialog/<widget>.rs`，`src/dialog/mod.rs` 只声明模块。
 - 不使用 `#[path = "..."]`；按 Rust 标准模块布局。
 - **一个 crate 出多个 widget 时**，把共用的那个视图放 `widget/display/pane.rs`（或同类共用文件），每个 widget 一个
@@ -226,7 +226,7 @@ route 都读不到的 pane 没有正文可画（见 §8）。
   「有没有东西可选」判定（`InstrumentButton` 自己读 `filters.offers_anything()`，没有就不挂 click），**作用于当前 scope
   的**控件读组件自己的等待状态（`awaiting_market`，以及由它派生的 `has_scope()` / `refresh_is_disabled()` /
   `venue_picker_is_disabled()`），同一状态的另一面就是正文里那条「去加载市场」的句子。没有与市场参与者无关的例外：`kytrix.empty`
-  这类没有 header 的组件不在此列，`etf` / `indices` / `wallet_monitor` / `tweet_monitor` 读的是账户而不是市场参与者，
+  这类没有 header 的组件不在此列，`etf` / `indices` / `wallet_monitor` / `x` 读的是账户而不是市场参与者，
   它们的禁用条件仍由各自的前置条件决定。
 - **禁用要真的禁用**：`Button` 的 `disabled` 在本仓库里只**画**成禁用，挂上去的 handler 照样会跑（`Dropdown` / `Select`
   自己会挡住打开动作），所以禁用的 Button 要么不挂 click（`.when(!disabled, |button| button.on_click(..))`），要么在动作
@@ -327,7 +327,7 @@ pane 停在 connecting，不为它另加超时层。
    `_account: Subscription` / `_time_zone: Option<Subscription>`。`.detach()` 只给没有终点的跟随（`VenuesUpdated`）。
 3. **`refresh_windows` 只管语言与外观。** 时区与账户事件只 notify 被通知到的实体，而正文是 `.cached()` 的，
    **父层 notify 不会重建被缓存的子实体**：有子实体在画时间戳或账户内容的，回调里要把它一起 notify
-   （`this.list.update(cx, |_, cx| cx.notify())`；`hyperliquid_wallet_monitor` 连 `NavStack` 每一页）。
+   （`this.list.update(cx, |_, cx| cx.notify())`；`hyperliquid_wallet` 连 `NavStack` 每一页）。
    只 notify 自己是"文字变了但屏幕没变"的常见成因。
 4. **回调只读。** 在回调里同步写配置会重入 emitter；要回写就 `cx.defer`。widget 本来也没有写 `Config` 的入口
    （`write` / `update` 要 `&mut App`，`cx.global_mut::<ConfigManager>()` 编译不过），唯一该写的是自己的
@@ -335,7 +335,7 @@ pane 停在 connecting，不为它另加超时层。
 
 **不碰的**：`watch` / `network_subscribe` / `cx.observe_global` / `while rx.changed()` 轮询都已被这条事件路径取代。
 `ConfigNotification<P>` 是 owner 与它**后台消费者**之间的单消费者通道（一个 `wait()`），widget 不创建也不 `wait()`；
-要按配置的路由发请求就读 connector 的共享投影 `current()`（`tweet_monitor` 的 `SharedTransport` 即此）。
+要按配置的路由发请求就读 connector 的共享投影 `current()`（`x` 的 `SharedTransport` 即此）。
 
 **测试**：`ConfigManager::in_memory(config, cx)` + `cx.set_global`，再用
 `cx.update_global::<ConfigManager, _>(|manager, cx| manager.update(|config| …, cx))` 驱动**真实事件路径**再断言 pane 的反应；
@@ -555,15 +555,15 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
     - **提交落在 pane 正在读的那个场所上**（用户刷新或重新加载了这个场所）→ pane **从头开始**：清掉手里那批它无法再担保的内容，
       并发出 **替换流的那个请求**。原因是流本身：每条流在打开时就把它要读的东西解析好并一直拿着（listing 的 rules / precision /
       units，以及它当时的成员与终态判断），而这次提交换掉的正是它当初解析的那一代目录；只有替换请求会让服务丢掉这条流、按现在的
-      那一代重新解析（各协议的 `Retry`；`watch_list` 是 `MarketReloaded`，`hyperliquid_wallet_monitor` 是 `Reload`）。所以每个这样的 pane
+      那一代重新解析（各协议的 `Retry`；`watch_list` 是 `MarketReloaded`，`hyperliquid_wallet` 是 `Reload`）。所以每个这样的 pane
       多一个布尔字段（`market_reloaded`），由 `on_venues_updated` 在判据成立时置上、由 `load()` 在 **前置检查之后** 取用——被打回等待时它要留着，市场回来后的那次加载
       同样必须重开流（那条流仍是在被换掉的那一代上解析的）。判据是"这个场所上有没有我正在读的东西"：选定 scope 的 pane 看
       `config.selection` 的 route 场所，`watch_list` 看 `config.entries`，`force_orders` 看自己在读的 `routes`，
-      `hyperliquid_wallet_monitor` 看自己在读的 `markets`；`perpetual_statistics` 是例外，它的 `Load` 本身就走
+      `hyperliquid_wallet` 看自己在读的 `markets`；`perpetual_statistics` 是例外，它的 `Load` 本身就走
       `replace_stream`，所以它只需要重跑 `load()`，不记这个字段。**两个请求状态不能混用**：`retry` 决定"保留用户正在看的内容"，
       替换请求决定"重开流"，重新加载是"清内容 + 替换请求"（`crates/widgets/*/src/view.rs` 里那些 `start` / `start_current` 的
       两个参数就是这两件事）。替换请求自己带着它要跟的那组 key：`watch_list` 的 `MarketReloaded` 与
-      `hyperliquid_wallet_monitor` 的 `Reload` 都像 `Replace` / `Load` 一样按这份集合跟随（退掉离开的、跟上新出现的），
+      `hyperliquid_wallet` 的 `Reload` 都像 `Replace` / `Load` 一样按这份集合跟随（退掉离开的、跟上新出现的），
       并把其中每一条流重开一遍——取代掉一个还在飞的请求因此是无害的，不需要把重新加载推迟到那个回答到达之后。
       轮询型、每次取数都重读当前目录代的 pane（`volume_heatmap`）不在此列：它没有"打开时解析一次"的流。
     - 两个答案都没变（别的场所提交，而 pane 读的 scope 不在其中）→ 只重查前置条件， **不重跑 `load()`、不重启流**：
@@ -577,8 +577,8 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
     `perpetual_statistics`）就用它自己维护着的这两件事判断：`awaiting_market`（因为缺一个市场而没在读）与
     `market_ready(cx)`（现在要读的都在内存里）合起来就是"我要读的那组 market"，它们跟着选择一起变，所以不会过期。
     读的是"已加载场所里自己认下的那一部分"的 pane（`force_orders` 读所有已加载的强平 route，`volume_heatmap` 读它选中
-    场所的那组 route，`hyperliquid_wallet_monitor` 读 Hyperliquid 的全部已加载 scope）判断只能靠它们已经在读的那组
-    `routes`（`hyperliquid_wallet_monitor` 的那个字段叫 `markets`，`volume_heatmap` 记的是选中的场所连同它的 route）：
+    场所的那组 route，`hyperliquid_wallet` 读 Hyperliquid 的全部已加载 scope）判断只能靠它们已经在读的那组
+    `routes`（`hyperliquid_wallet` 的那个字段叫 `markets`，`volume_heatmap` 记的是选中的场所连同它的 route）：
     与现在要读的不同就是集合变了；集合没变时还有上面那条"提交落在自己读的场所上"的规则，所以这个比较要在它之后问。
     - **`WidgetState::failed` 是终态（§5.2）**：已经失败的 pane 不因 `VenuesUpdated` 复活，事件到达时先
       `status.is_failed(cx)` 守卫、直接返回，只有用户触发恢复才重新开始 —— 这个守卫与"要不要重跑"的判断都在
@@ -719,7 +719,7 @@ global::install(cx).expect("test Tokio runtime should build");
 
 ## 11. 新 Widget 检查清单
 
-1. `WidgetId` 用 `WidgetId::new_static("kytrix.<域>.<名字>")`，命名空间小写、点分段；持久化后不可改。
+1. `WidgetId` 用 `WidgetId::new_static("kytrix.<名字>")`，`kytrix` 之后只有一段、小写、点分段；持久化后不可改。
 2. Config 必须实现 `WidgetConfig` 并给 `SCHEMA_VERSION`，当前一律 `WidgetConfigSchemaVersion::V1`。没有可持久化选项也要
    一个空的 config 类型，不要用 `()` 把 schema 版本糊过去。不兼容变更就直接删旧结构， **不写 migration、不写兼容层、
    不写 fallback**。每一项都要有 `Default`。

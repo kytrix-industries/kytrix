@@ -636,9 +636,9 @@ mod tests {
         let route = config.venue(venue)?.proxy()?;
         route.named_name().map(SmolStr::new)
     }
-    fn x_account_monitoring_media_target() -> ServiceTarget {
+    fn x_media_target() -> ServiceTarget {
         ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XAccountMonitoringMedia,
+            capability: KytrixServiceCapability::XMedia,
         }
     }
 
@@ -648,10 +648,7 @@ mod tests {
         NetworkRuntimeGenerations {
             default_route: NetworkRouteGeneration::new(7),
             venues: BTreeMap::from([(venue("binance"), NetworkRouteGeneration::new(8))]),
-            services: BTreeMap::from([(
-                x_account_monitoring_media_target(),
-                NetworkRouteGeneration::new(9),
-            )]),
+            services: BTreeMap::from([(x_media_target(), NetworkRouteGeneration::new(9))]),
         }
     }
 
@@ -754,10 +751,9 @@ mod tests {
         config
             .proxies
             .insert(SmolStr::new_static("local"), local_proxy());
-        config.proxy_applications.extend([(
-            x_account_monitoring_media_target(),
-            ProxyRoute::named("local"),
-        )]);
+        config
+            .proxy_applications
+            .extend([(x_media_target(), ProxyRoute::named("local"))]);
         config.venues = configured_venues();
 
         config
@@ -1402,10 +1398,9 @@ mod tests {
     #[test]
     fn proxy_applications_should_use_an_array_and_reject_old_object_wire() {
         let mut config = Config::default();
-        config.proxy_applications.insert(
-            x_account_monitoring_media_target(),
-            ProxyRoute::named("local"),
-        );
+        config
+            .proxy_applications
+            .insert(x_media_target(), ProxyRoute::named("local"));
         let serialized = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(
             serialized["proxy_default"],
@@ -1416,7 +1411,7 @@ mod tests {
             serde_json::json!([{
                 "target": {
                     "kind": "kytrix_service",
-                    "capability": "x_account_monitoring_media",
+                    "capability": "x_media",
                 },
                 "route": { "kind": "named", "name": "local" },
             }])
@@ -1486,7 +1481,7 @@ mod tests {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
         let target = serde_json::json!({
             "kind": "kytrix_service",
-            "capability": "x_account_monitoring_media",
+            "capability": "x_media",
         });
         json["proxy_applications"] = serde_json::json!([
             { "target": target, "route": { "kind": "named", "name": "local" } },
@@ -1499,7 +1494,7 @@ mod tests {
             {
                 "target": {
                     "kind": "kytrix_service",
-                    "capability": "x_account_monitoring_media",
+                    "capability": "x_media",
                     "unexpected": true,
                 },
                 "route": { "kind": "named", "name": "local" },
@@ -1563,7 +1558,7 @@ mod tests {
             "another venue keeps following the default"
         );
         assert_eq!(
-            network.service_proxy_route_for(&x_account_monitoring_media_target()),
+            network.service_proxy_route_for(&x_media_target()),
             ProxyRoute::named("anonymous"),
             "and a Kytrix service without an override follows it too"
         );
@@ -1659,10 +1654,9 @@ mod tests {
             .expect("configured settings should contain local proxy")
             .clone();
         config.proxies.insert(SmolStr::new_static("backup"), backup);
-        config.proxy_applications.insert(
-            x_account_monitoring_media_target(),
-            ProxyRoute::named("backup"),
-        );
+        config
+            .proxy_applications
+            .insert(x_media_target(), ProxyRoute::named("backup"));
         config.set_venue_proxy(&venue("binance"), Some(ProxyRoute::named("backup")));
         config.set_venue_proxy(&venue("okx"), Some(ProxyRoute::named("backup")));
 
@@ -1756,10 +1750,9 @@ mod tests {
             .expect("configured settings should contain local proxy")
             .clone();
         config.proxies.insert(SmolStr::new_static("backup"), backup);
-        config.proxy_applications.insert(
-            x_account_monitoring_media_target(),
-            ProxyRoute::named("local"),
-        );
+        config
+            .proxy_applications
+            .insert(x_media_target(), ProxyRoute::named("local"));
         config.set_venue_proxy(&venue("binance"), Some(ProxyRoute::named("backup")));
         config.set_venue_proxy(&venue("okx"), Some(ProxyRoute::named("backup")));
 
@@ -1770,7 +1763,7 @@ mod tests {
                 result,
                 venue_named_route(&config, &venue("binance")),
                 venue_named_route(&config, &venue("okx")),
-                config.proxy_applications[&x_account_monitoring_media_target()].named_name(),
+                config.proxy_applications[&x_media_target()].named_name(),
             ),
             (
                 Ok(()),
@@ -2328,11 +2321,11 @@ mod tests {
         let mut edited = previous.clone();
         edited
             .proxy_applications
-            .insert(x_account_monitoring_media_target(), ProxyRoute::Direct);
+            .insert(x_media_target(), ProxyRoute::Direct);
         assert_eq!(
             edited.changes_since(&previous),
             ConfigChangeSet {
-                proxy_applications: vec![x_account_monitoring_media_target()],
+                proxy_applications: vec![x_media_target()],
                 ..ConfigChangeSet::default()
             },
             "an edited application is its target once"
@@ -2340,16 +2333,14 @@ mod tests {
 
         let mut removed = previous.clone();
         assert_eq!(
-            removed
-                .proxy_applications
-                .remove(&x_account_monitoring_media_target()),
+            removed.proxy_applications.remove(&x_media_target()),
             Some(ProxyRoute::named("local")),
             "the fixture removes the application it added"
         );
         assert_eq!(
             removed.changes_since(&previous),
             ConfigChangeSet {
-                proxy_applications: vec![x_account_monitoring_media_target()],
+                proxy_applications: vec![x_media_target()],
                 ..ConfigChangeSet::default()
             },
             "a removed application is its target once"
@@ -2518,7 +2509,7 @@ mod tests {
                 with_change(|config| {
                     config
                         .proxy_applications
-                        .insert(x_account_monitoring_media_target(), ProxyRoute::Direct);
+                        .insert(x_media_target(), ProxyRoute::Direct);
                 }),
             ),
             (

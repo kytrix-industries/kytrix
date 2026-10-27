@@ -9,7 +9,7 @@ use crate::model::MetricKind;
 pub struct TopTraderAccountRatioWidgetSeries;
 
 impl StatisticsMetric for TopTraderAccountRatioWidgetSeries {
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.top_trader_account_ratio");
+    const ID: WidgetId = WidgetId::new_static("kytrix.top_trader_account_ratio");
     const DISPLAY_NAME: &'static str = "widget.names.top_trader_account_ratio";
     const DESCRIPTION: &'static str = "Top traders' long and short account ratio";
     const ICON: &'static str = "widgets/top_trader_account_ratio.png";

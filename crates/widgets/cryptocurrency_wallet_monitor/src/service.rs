@@ -1,4 +1,4 @@
-//! The cryptocurrency_wallet_monitoring protocol, its background service, and the seams a test drives it through.
+//! The cryptocurrency_wallet_monitor protocol, its background service, and the seams a test drives it through.
 //!
 //! # One account, two things a pane does with it
 //!
@@ -27,7 +27,7 @@
 //!
 //! # Transfers are account data
 //!
-//! A transfer names two cryptocurrency_wallet_monitorings and an amount, and which of them a cryptocurrency_wallet_monitoring is watching is
+//! A transfer names two cryptocurrency_wallet_monitors and an amount, and which of them a cryptocurrency_wallet_monitor is watching is
 //! the account's business. A transfer that was already on the wire when the credentials
 //! behind the subscription changed therefore belongs to an account the pane is no longer
 //! reading as, and is dropped rather than shown: the subscription's own status is what
@@ -37,11 +37,11 @@ use std::future::Future;
 
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    cryptocurrency_wallet_monitoring::{
-        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationOutcome,
-        CryptocurrencyWalletMonitoringSelection, CryptocurrencyWalletMonitoringSelectionsResponse,
+    cryptocurrency_wallet_monitor::{
+        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
+        CryptocurrencyWalletMonitorSelection, CryptocurrencyWalletMonitorSelectionsResponse,
     },
-    engine::{CryptocurrencyWalletMonitoringTransfer, KytrixAccountSession, KytrixServiceError},
+    engine::{CryptocurrencyWalletMonitorTransfer, KytrixAccountSession, KytrixServiceError},
 };
 use network::transport::{
     error::TransportError,
@@ -60,30 +60,30 @@ use super::model::{SelectionData, TransferSnapshot, TransferState};
 
 /// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitoringRequest {
+pub(super) enum CryptocurrencyWalletMonitorRequest {
     /// Follows an account's transfers, keeping the stream that already follows it.
-    Load(CryptocurrencyWalletMonitoringScope),
+    Load(CryptocurrencyWalletMonitorScope),
     /// Reopens an account's stream, for one whose stream has failed.
-    Retry(CryptocurrencyWalletMonitoringScope),
+    Retry(CryptocurrencyWalletMonitorScope),
     /// Follows nothing, because nobody is signed in.
     Stop,
     /// Reads the addresses the account monitors.
-    FetchSelections(CryptocurrencyWalletMonitoringScope),
+    FetchSelections(CryptocurrencyWalletMonitorScope),
     /// Monitors one more address.
     AddSelection {
-        scope: CryptocurrencyWalletMonitoringScope,
+        scope: CryptocurrencyWalletMonitorScope,
         address: SmolStr,
     },
     /// Stops monitoring one address.
     DeleteSelection {
-        scope: CryptocurrencyWalletMonitoringScope,
+        scope: CryptocurrencyWalletMonitorScope,
         address: SmolStr,
     },
 }
 
 /// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitoringResponse {
+pub(super) enum CryptocurrencyWalletMonitorResponse {
     /// The account's stream is running.
     StreamStarted,
     /// Nothing is followed.
@@ -91,9 +91,9 @@ pub(super) enum CryptocurrencyWalletMonitoringResponse {
     /// The addresses the account monitors.
     Selections(SelectionData),
     /// What became of an address the pane asked to monitor.
-    Added(CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>),
+    Added(CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection>),
     /// What became of an address the pane asked to stop monitoring.
-    Deleted(CryptocurrencyWalletMonitoringMutationOutcome<()>),
+    Deleted(CryptocurrencyWalletMonitorMutationOutcome<()>),
 }
 
 /// The account whose transfers a stream carries.
@@ -102,11 +102,11 @@ pub(super) enum CryptocurrencyWalletMonitoringResponse {
 /// account can change while a dialog is still open, and an answer about the account the
 /// pane has left is not one the pane may act on.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct CryptocurrencyWalletMonitoringScope {
+pub(super) struct CryptocurrencyWalletMonitorScope {
     account_id: SmolStr,
 }
 
-impl CryptocurrencyWalletMonitoringScope {
+impl CryptocurrencyWalletMonitorScope {
     /// The scope an account follows, or `None` when nobody is signed in.
     pub(super) fn new(account_id: Option<&SmolStr>) -> Option<Self> {
         let account_id = account_id.filter(|account_id| !account_id.is_empty())?;
@@ -122,24 +122,24 @@ impl CryptocurrencyWalletMonitoringScope {
 
 /// What a subscription the pane holds is doing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitoringStatus {
+pub(super) enum CryptocurrencyWalletMonitorStatus {
     /// The subscription is being established.
     Connecting,
     /// The subscription is live.
     Ready,
     /// The subscription ended; the pane is finished until the user recovers it.
-    Failed(CryptocurrencyWalletMonitoringStreamError),
+    Failed(CryptocurrencyWalletMonitorStreamError),
 }
 
 /// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitoringStreamError {
+pub(super) enum CryptocurrencyWalletMonitorStreamError {
     /// The account's session could not be taken, or the subscription was refused.
     Service(KytrixServiceError),
     Transport(TransportError),
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitoringStreamError {
+impl LocalizedError for CryptocurrencyWalletMonitorStreamError {
     fn localized_message(&self, cx: &gpui_kit::App) -> gpui_kit::SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
@@ -150,30 +150,28 @@ impl LocalizedError for CryptocurrencyWalletMonitoringStreamError {
 
 /// One message of an account's stream.
 #[derive(Clone, Debug)]
-pub(super) enum CryptocurrencyWalletMonitoringStreamMessage {
-    Status(CryptocurrencyWalletMonitoringStatus),
+pub(super) enum CryptocurrencyWalletMonitorStreamMessage {
+    Status(CryptocurrencyWalletMonitorStatus),
     /// Every transfer the subscription retains, newest first.
     Snapshot(TransferSnapshot),
 }
 
-pub(super) struct CryptocurrencyWalletMonitoringProtocol;
+pub(super) struct CryptocurrencyWalletMonitorProtocol;
 
-impl WidgetProtocol for CryptocurrencyWalletMonitoringProtocol {
-    type Request = CryptocurrencyWalletMonitoringRequest;
-    type Response = CryptocurrencyWalletMonitoringResponse;
-    type StreamKey = CryptocurrencyWalletMonitoringScope;
-    type StreamMessage = CryptocurrencyWalletMonitoringStreamMessage;
-    type Error = CryptocurrencyWalletMonitoringApiError;
+impl WidgetProtocol for CryptocurrencyWalletMonitorProtocol {
+    type Request = CryptocurrencyWalletMonitorRequest;
+    type Response = CryptocurrencyWalletMonitorResponse;
+    type StreamKey = CryptocurrencyWalletMonitorScope;
+    type StreamMessage = CryptocurrencyWalletMonitorStreamMessage;
+    type Error = CryptocurrencyWalletMonitorApiError;
 }
 
-/// The cryptocurrency_wallet_monitoring an account reads through.
+/// The cryptocurrency_wallet_monitor an account reads through.
 ///
 /// The service is written against this seam rather than against the connector, so a test
 /// can drive every state a session and a subscription can be in without one.
-pub(super) trait CryptocurrencyWalletMonitoringSource:
-    Clone + Send + Sync + 'static
-{
-    type Session: CryptocurrencyWalletMonitoringSession;
+pub(super) trait CryptocurrencyWalletMonitorSource: Clone + Send + Sync + 'static {
+    type Session: CryptocurrencyWalletMonitorSession;
 
     /// Takes the account's session, which answers both the stream and every request the
     /// pane makes about the addresses it monitors.
@@ -184,16 +182,14 @@ pub(super) trait CryptocurrencyWalletMonitoringSource:
 }
 
 /// One account's session.
-pub(super) trait CryptocurrencyWalletMonitoringSession:
-    Clone + Send + Sync + 'static
-{
-    type Subscription: CryptocurrencyWalletMonitoringEventSubscription;
+pub(super) trait CryptocurrencyWalletMonitorSession: Clone + Send + Sync + 'static {
+    type Subscription: CryptocurrencyWalletMonitorEventSubscription;
 
     /// The account this session is for, which is what a stream keyed by another one is
     /// checked against.
     fn account_id(&self) -> &str;
 
-    fn subscribe_cryptocurrency_wallet_monitoring(
+    fn subscribe_cryptocurrency_wallet_monitor(
         &self,
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 
@@ -201,8 +197,8 @@ pub(super) trait CryptocurrencyWalletMonitoringSession:
         &self,
     ) -> impl Future<
         Output = Result<
-            CryptocurrencyWalletMonitoringSelectionsResponse,
-            CryptocurrencyWalletMonitoringApiError,
+            CryptocurrencyWalletMonitorSelectionsResponse,
+            CryptocurrencyWalletMonitorApiError,
         >,
     > + Send;
 
@@ -210,27 +206,25 @@ pub(super) trait CryptocurrencyWalletMonitoringSession:
         &self,
         address: &str,
     ) -> impl Future<
-        Output = CryptocurrencyWalletMonitoringMutationOutcome<
-            CryptocurrencyWalletMonitoringSelection,
-        >,
+        Output = CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection>,
     > + Send;
 
     fn delete_selection(
         &self,
         address: &str,
-    ) -> impl Future<Output = CryptocurrencyWalletMonitoringMutationOutcome<()>> + Send;
+    ) -> impl Future<Output = CryptocurrencyWalletMonitorMutationOutcome<()>> + Send;
 }
 
 /// One live transfer subscription.
-pub(super) trait CryptocurrencyWalletMonitoringEventSubscription: Send + 'static {
+pub(super) trait CryptocurrencyWalletMonitorEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
     fn recv(
         &mut self,
-    ) -> impl Future<Output = Result<CryptocurrencyWalletMonitoringTransfer, TransportError>> + Send;
+    ) -> impl Future<Output = Result<CryptocurrencyWalletMonitorTransfer, TransportError>> + Send;
 }
 
-impl CryptocurrencyWalletMonitoringSource for KytrixServiceConnector {
+impl CryptocurrencyWalletMonitorSource for KytrixServiceConnector {
     type Session = KytrixAccountSession;
 
     async fn acquire_session(&self, account_id: &str) -> Result<Self::Session, KytrixServiceError> {
@@ -238,62 +232,59 @@ impl CryptocurrencyWalletMonitoringSource for KytrixServiceConnector {
     }
 }
 
-impl CryptocurrencyWalletMonitoringSession for KytrixAccountSession {
-    type Subscription = Subscription<CryptocurrencyWalletMonitoringTransfer>;
+impl CryptocurrencyWalletMonitorSession for KytrixAccountSession {
+    type Subscription = Subscription<CryptocurrencyWalletMonitorTransfer>;
 
     fn account_id(&self) -> &str {
         self.profile().account_id()
     }
 
-    async fn subscribe_cryptocurrency_wallet_monitoring(
+    async fn subscribe_cryptocurrency_wallet_monitor(
         &self,
     ) -> Result<Self::Subscription, KytrixServiceError> {
-        KytrixAccountSession::subscribe_cryptocurrency_wallet_monitoring(self).await
+        KytrixAccountSession::subscribe_cryptocurrency_wallet_monitor(self).await
     }
 
     async fn fetch_selections(
         &self,
-    ) -> Result<
-        CryptocurrencyWalletMonitoringSelectionsResponse,
-        CryptocurrencyWalletMonitoringApiError,
-    > {
-        KytrixAccountSession::fetch_cryptocurrency_wallet_monitoring_selections(self).await
+    ) -> Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>
+    {
+        KytrixAccountSession::fetch_cryptocurrency_wallet_monitor_selections(self).await
     }
 
     async fn add_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>
-    {
-        KytrixAccountSession::add_cryptocurrency_wallet_monitoring_selection(self, address).await
+    ) -> CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection> {
+        KytrixAccountSession::add_cryptocurrency_wallet_monitor_selection(self, address).await
     }
 
     async fn delete_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitoringMutationOutcome<()> {
-        KytrixAccountSession::delete_cryptocurrency_wallet_monitoring_selection(self, address).await
+    ) -> CryptocurrencyWalletMonitorMutationOutcome<()> {
+        KytrixAccountSession::delete_cryptocurrency_wallet_monitor_selection(self, address).await
     }
 }
 
-impl CryptocurrencyWalletMonitoringEventSubscription
-    for Subscription<CryptocurrencyWalletMonitoringTransfer>
+impl CryptocurrencyWalletMonitorEventSubscription
+    for Subscription<CryptocurrencyWalletMonitorTransfer>
 {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         Subscription::observe_status(self)
     }
 
-    async fn recv(&mut self) -> Result<CryptocurrencyWalletMonitoringTransfer, TransportError> {
+    async fn recv(&mut self) -> Result<CryptocurrencyWalletMonitorTransfer, TransportError> {
         Subscription::recv(self).await
     }
 }
 
-/// The service that follows one pane's cryptocurrency_wallet_monitoring.
-pub(super) struct CryptocurrencyWalletMonitoringService<S = KytrixServiceConnector> {
+/// The service that follows one pane's cryptocurrency_wallet_monitor.
+pub(super) struct CryptocurrencyWalletMonitorService<S = KytrixServiceConnector> {
     source: S,
 }
 
-impl<S> CryptocurrencyWalletMonitoringService<S> {
+impl<S> CryptocurrencyWalletMonitorService<S> {
     pub(super) const fn new(source: S) -> Self {
         Self { source }
     }
@@ -301,36 +292,35 @@ impl<S> CryptocurrencyWalletMonitoringService<S> {
 
 /// The session the account a stream belongs to is answered with.
 struct ActiveSession<S> {
-    scope: CryptocurrencyWalletMonitoringScope,
+    scope: CryptocurrencyWalletMonitorScope,
     session: S,
 }
 
-impl<S> WidgetService<CryptocurrencyWalletMonitoringProtocol>
-    for CryptocurrencyWalletMonitoringService<S>
+impl<S> WidgetService<CryptocurrencyWalletMonitorProtocol> for CryptocurrencyWalletMonitorService<S>
 where
-    S: CryptocurrencyWalletMonitoringSource,
+    S: CryptocurrencyWalletMonitorSource,
 {
-    async fn run(self, mut context: ServiceContext<CryptocurrencyWalletMonitoringProtocol>) {
+    async fn run(self, mut context: ServiceContext<CryptocurrencyWalletMonitorProtocol>) {
         let mut active: Option<ActiveSession<S::Session>> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (mut reply, request) = request.into_parts();
             match request {
-                CryptocurrencyWalletMonitoringRequest::Stop => {
+                CryptocurrencyWalletMonitorRequest::Stop => {
                     if let Some(active) = active.take() {
                         context.cancel_stream(&active.scope);
                     }
-                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitoringResponse::Stopped));
+                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Stopped));
                 }
-                request @ (CryptocurrencyWalletMonitoringRequest::Load(_)
-                | CryptocurrencyWalletMonitoringRequest::Retry(_)) => {
+                request @ (CryptocurrencyWalletMonitorRequest::Load(_)
+                | CryptocurrencyWalletMonitorRequest::Retry(_)) => {
                     let (scope, retry) = match request {
-                        CryptocurrencyWalletMonitoringRequest::Load(scope) => (scope, false),
-                        CryptocurrencyWalletMonitoringRequest::Retry(scope) => (scope, true),
-                        CryptocurrencyWalletMonitoringRequest::Stop
-                        | CryptocurrencyWalletMonitoringRequest::FetchSelections(_)
-                        | CryptocurrencyWalletMonitoringRequest::AddSelection { .. }
-                        | CryptocurrencyWalletMonitoringRequest::DeleteSelection { .. } => continue,
+                        CryptocurrencyWalletMonitorRequest::Load(scope) => (scope, false),
+                        CryptocurrencyWalletMonitorRequest::Retry(scope) => (scope, true),
+                        CryptocurrencyWalletMonitorRequest::Stop
+                        | CryptocurrencyWalletMonitorRequest::FetchSelections(_)
+                        | CryptocurrencyWalletMonitorRequest::AddSelection { .. }
+                        | CryptocurrencyWalletMonitorRequest::DeleteSelection { .. } => continue,
                     };
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
@@ -345,8 +335,8 @@ where
                         && active.as_ref().is_some_and(|active| active.scope == scope)
                         && context.stream_generation(&scope).is_some()
                     {
-                        let _ = reply
-                            .respond(Ok(CryptocurrencyWalletMonitoringResponse::StreamStarted));
+                        let _ =
+                            reply.respond(Ok(CryptocurrencyWalletMonitorResponse::StreamStarted));
                         continue;
                     }
 
@@ -368,8 +358,8 @@ where
                     // streamed: a transfer is not data a pane may show under a name it
                     // does not belong to.
                     if session.account_id() != scope.account_id() {
-                        let _ = reply
-                            .respond(Err(CryptocurrencyWalletMonitoringApiError::AccountChanged));
+                        let _ =
+                            reply.respond(Err(CryptocurrencyWalletMonitorApiError::AccountChanged));
                         continue;
                     }
 
@@ -385,7 +375,7 @@ where
                         session,
                     });
                     if reply
-                        .respond(Ok(CryptocurrencyWalletMonitoringResponse::StreamStarted))
+                        .respond(Ok(CryptocurrencyWalletMonitorResponse::StreamStarted))
                         .is_err()
                     {
                         // Nobody is waiting for this stream any more, so it is nobody's
@@ -395,7 +385,7 @@ where
                         active = None;
                     }
                 }
-                CryptocurrencyWalletMonitoringRequest::FetchSelections(scope) => {
+                CryptocurrencyWalletMonitorRequest::FetchSelections(scope) => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -416,11 +406,11 @@ where
                             }
                         },
                     };
-                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitoringResponse::Selections(
+                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Selections(
                         SelectionData::new(response),
                     )));
                 }
-                CryptocurrencyWalletMonitoringRequest::AddSelection { scope, address } => {
+                CryptocurrencyWalletMonitorRequest::AddSelection { scope, address } => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -439,10 +429,9 @@ where
                         () = reply.cancelled() => continue,
                         outcome = &mut add => outcome,
                     };
-                    let _ =
-                        reply.respond(Ok(CryptocurrencyWalletMonitoringResponse::Added(outcome)));
+                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Added(outcome)));
                 }
-                CryptocurrencyWalletMonitoringRequest::DeleteSelection { scope, address } => {
+                CryptocurrencyWalletMonitorRequest::DeleteSelection { scope, address } => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -458,7 +447,7 @@ where
                         outcome = &mut delete => outcome,
                     };
                     let _ =
-                        reply.respond(Ok(CryptocurrencyWalletMonitoringResponse::Deleted(outcome)));
+                        reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Deleted(outcome)));
                 }
             }
         }
@@ -473,13 +462,13 @@ where
 /// under it.
 fn matching_session<'a, S>(
     active: &'a Option<ActiveSession<S>>,
-    scope: &CryptocurrencyWalletMonitoringScope,
-) -> Result<&'a S, CryptocurrencyWalletMonitoringApiError> {
+    scope: &CryptocurrencyWalletMonitorScope,
+) -> Result<&'a S, CryptocurrencyWalletMonitorApiError> {
     let Some(active) = active.as_ref() else {
-        return Err(CryptocurrencyWalletMonitoringApiError::NotReady);
+        return Err(CryptocurrencyWalletMonitorApiError::NotReady);
     };
     if &active.scope != scope {
-        return Err(CryptocurrencyWalletMonitoringApiError::AccountChanged);
+        return Err(CryptocurrencyWalletMonitorApiError::AccountChanged);
     }
     Ok(&active.session)
 }
@@ -489,29 +478,25 @@ fn matching_session<'a, S>(
 /// The four that name a condition of their own are named as themselves: an expired login,
 /// a changed account, a timeout and a closed service all read differently to a user than
 /// a service error does.
-fn session_failure(error: KytrixServiceError) -> CryptocurrencyWalletMonitoringApiError {
+fn session_failure(error: KytrixServiceError) -> CryptocurrencyWalletMonitorApiError {
     match error {
         KytrixServiceError::Authentication(_) => {
-            CryptocurrencyWalletMonitoringApiError::Authentication
+            CryptocurrencyWalletMonitorApiError::Authentication
         }
-        KytrixServiceError::AccountChanged => {
-            CryptocurrencyWalletMonitoringApiError::AccountChanged
-        }
-        KytrixServiceError::Timeout => CryptocurrencyWalletMonitoringApiError::Timeout,
-        KytrixServiceError::Closed => CryptocurrencyWalletMonitoringApiError::Closed,
-        error => CryptocurrencyWalletMonitoringApiError::Service(error),
+        KytrixServiceError::AccountChanged => CryptocurrencyWalletMonitorApiError::AccountChanged,
+        KytrixServiceError::Timeout => CryptocurrencyWalletMonitorApiError::Timeout,
+        KytrixServiceError::Closed => CryptocurrencyWalletMonitorApiError::Closed,
+        error => CryptocurrencyWalletMonitorApiError::Service(error),
     }
 }
 
 /// Runs the account's subscription.
-async fn run_stream<S>(
-    session: S,
-    publisher: StreamPublisher<CryptocurrencyWalletMonitoringProtocol>,
-) where
-    S: CryptocurrencyWalletMonitoringSession,
+async fn run_stream<S>(session: S, publisher: StreamPublisher<CryptocurrencyWalletMonitorProtocol>)
+where
+    S: CryptocurrencyWalletMonitorSession,
 {
-    let mut published = CryptocurrencyWalletMonitoringStatus::Connecting;
-    if publish_status(&publisher, CryptocurrencyWalletMonitoringStatus::Connecting)
+    let mut published = CryptocurrencyWalletMonitorStatus::Connecting;
+    if publish_status(&publisher, CryptocurrencyWalletMonitorStatus::Connecting)
         .await
         .is_err()
     {
@@ -521,14 +506,14 @@ async fn run_stream<S>(
     let subscription = tokio::select! {
         biased;
         () = publisher.cancelled() => return,
-        result = session.subscribe_cryptocurrency_wallet_monitoring() => result,
+        result = session.subscribe_cryptocurrency_wallet_monitor() => result,
     };
     let mut subscription = match subscription {
         Ok(subscription) => subscription,
         Err(error) => {
             publish_failure(
                 &publisher,
-                CryptocurrencyWalletMonitoringStreamError::Service(error),
+                CryptocurrencyWalletMonitorStreamError::Service(error),
             )
             .await;
             return;
@@ -593,7 +578,7 @@ async fn run_stream<S>(
                 let transfer = match event {
                     Ok(transfer) => transfer,
                     Err(error) => {
-                        publish_failure(&publisher, CryptocurrencyWalletMonitoringStreamError::Transport(error)).await;
+                        publish_failure(&publisher, CryptocurrencyWalletMonitorStreamError::Transport(error)).await;
                         return;
                     }
                 };
@@ -601,7 +586,7 @@ async fn run_stream<S>(
                     continue;
                 }
                 if publisher
-                    .publish_latest(CryptocurrencyWalletMonitoringStreamMessage::Snapshot(state.snapshot()))
+                    .publish_latest(CryptocurrencyWalletMonitorStreamMessage::Snapshot(state.snapshot()))
                     .is_err()
                 {
                     return;
@@ -617,11 +602,11 @@ async fn run_stream<S>(
 /// Returns whether the stream may keep running: a status that ended it has already
 /// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitoringProtocol>,
+    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
     status: &SubscriptionStatus,
     state: &TransferState,
     feed_published: &mut bool,
-    published: &mut CryptocurrencyWalletMonitoringStatus,
+    published: &mut CryptocurrencyWalletMonitorStatus,
 ) -> bool {
     if let Some(error) = ended_subscription(status) {
         publish_failure(publisher, error).await;
@@ -634,7 +619,7 @@ async fn apply_subscription_status(
         SubscriptionStatus::Closing => true,
         SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => publish_change(
             publisher,
-            CryptocurrencyWalletMonitoringStatus::Connecting,
+            CryptocurrencyWalletMonitorStatus::Connecting,
             published,
         )
         .await
@@ -645,7 +630,7 @@ async fn apply_subscription_status(
             // not make the transfers the pane already has new again.
             if !*feed_published {
                 if publisher
-                    .publish_latest(CryptocurrencyWalletMonitoringStreamMessage::Snapshot(
+                    .publish_latest(CryptocurrencyWalletMonitorStreamMessage::Snapshot(
                         state.snapshot(),
                     ))
                     .is_err()
@@ -656,7 +641,7 @@ async fn apply_subscription_status(
             }
             publish_change(
                 publisher,
-                CryptocurrencyWalletMonitoringStatus::Ready,
+                CryptocurrencyWalletMonitorStatus::Ready,
                 published,
             )
             .await
@@ -670,13 +655,13 @@ async fn apply_subscription_status(
 /// Why a subscription is no longer one a transfer may be read from.
 fn ended_subscription(
     status: &SubscriptionStatus,
-) -> Option<CryptocurrencyWalletMonitoringStreamError> {
+) -> Option<CryptocurrencyWalletMonitorStreamError> {
     match status {
-        SubscriptionStatus::Closed => Some(CryptocurrencyWalletMonitoringStreamError::Transport(
+        SubscriptionStatus::Closed => Some(CryptocurrencyWalletMonitorStreamError::Transport(
             TransportError::Closed,
         )),
         SubscriptionStatus::Failed(error) => Some(
-            CryptocurrencyWalletMonitoringStreamError::Transport(error.clone()),
+            CryptocurrencyWalletMonitorStreamError::Transport(error.clone()),
         ),
         SubscriptionStatus::Connecting
         | SubscriptionStatus::Active
@@ -687,19 +672,19 @@ fn ended_subscription(
 
 /// Publishes a status the pane has not been told yet.
 async fn publish_status(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitoringProtocol>,
-    status: CryptocurrencyWalletMonitoringStatus,
+    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
+    status: CryptocurrencyWalletMonitorStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(CryptocurrencyWalletMonitoringStreamMessage::Status(status))
+        .publish_reliable(CryptocurrencyWalletMonitorStreamMessage::Status(status))
         .await
 }
 
 /// Publishes a status change, if it is one.
 async fn publish_change(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitoringProtocol>,
-    status: CryptocurrencyWalletMonitoringStatus,
-    published: &mut CryptocurrencyWalletMonitoringStatus,
+    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
+    status: CryptocurrencyWalletMonitorStatus,
+    published: &mut CryptocurrencyWalletMonitorStatus,
 ) -> Result<(), StreamPublishError> {
     if *published == status {
         return Ok(());
@@ -716,14 +701,10 @@ async fn publish_change(
 /// the account as taken — and so the addresses the account monitors can still be read
 /// and changed, which is the other half of what the session was taken for.
 async fn publish_failure(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitoringProtocol>,
-    error: CryptocurrencyWalletMonitoringStreamError,
+    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
+    error: CryptocurrencyWalletMonitorStreamError,
 ) {
-    let _ = publish_status(
-        publisher,
-        CryptocurrencyWalletMonitoringStatus::Failed(error),
-    )
-    .await;
+    let _ = publish_status(publisher, CryptocurrencyWalletMonitorStatus::Failed(error)).await;
     publisher.cancelled().await;
 }
 
@@ -746,7 +727,7 @@ mod tests {
     }
     use std::{sync::atomic::Ordering, time::Duration};
 
-    use kytrix_service_provider::service::cryptocurrency_wallet_monitoring::CryptocurrencyWalletMonitoringMutationUnknown;
+    use kytrix_service_provider::service::cryptocurrency_wallet_monitor::CryptocurrencyWalletMonitorMutationUnknown;
     use widget::{
         rpc::RpcCallError,
         runtime::WidgetRuntime,
@@ -756,72 +737,64 @@ mod tests {
     use super::*;
     use crate::test_support::{ACCOUNT, FakeSource, selection, selections, transfer};
 
-    fn account(name: &'static str) -> CryptocurrencyWalletMonitoringScope {
-        CryptocurrencyWalletMonitoringScope::new(Some(&SmolStr::new_static(name)))
+    fn account(name: &'static str) -> CryptocurrencyWalletMonitorScope {
+        CryptocurrencyWalletMonitorScope::new(Some(&SmolStr::new_static(name)))
             .expect("an account should be a scope")
     }
 
-    fn scope() -> CryptocurrencyWalletMonitoringScope {
+    fn scope() -> CryptocurrencyWalletMonitorScope {
         account(ACCOUNT)
     }
 
-    fn runtime(source: &FakeSource) -> WidgetRuntime<CryptocurrencyWalletMonitoringProtocol> {
+    fn runtime(source: &FakeSource) -> WidgetRuntime<CryptocurrencyWalletMonitorProtocol> {
         WidgetRuntime::spawn(
             current_test_handle(),
-            CryptocurrencyWalletMonitoringService::new(source.clone()),
+            CryptocurrencyWalletMonitorService::new(source.clone()),
         )
     }
 
     async fn load(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitoringProtocol>,
-        scope: CryptocurrencyWalletMonitoringScope,
+        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
+        scope: CryptocurrencyWalletMonitorScope,
     ) {
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::Load(scope))
+            .call(CryptocurrencyWalletMonitorRequest::Load(scope))
             .await
             .expect("the stream should start")
             .into_value();
-        assert_eq!(
-            response,
-            CryptocurrencyWalletMonitoringResponse::StreamStarted
-        );
+        assert_eq!(response, CryptocurrencyWalletMonitorResponse::StreamStarted);
     }
 
     async fn retry(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitoringProtocol>,
-        scope: CryptocurrencyWalletMonitoringScope,
+        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
+        scope: CryptocurrencyWalletMonitorScope,
     ) {
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::Retry(scope))
+            .call(CryptocurrencyWalletMonitorRequest::Retry(scope))
             .await
             .expect("the stream should start again")
             .into_value();
-        assert_eq!(
-            response,
-            CryptocurrencyWalletMonitoringResponse::StreamStarted
-        );
+        assert_eq!(response, CryptocurrencyWalletMonitorResponse::StreamStarted);
     }
 
     async fn fetch(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitoringProtocol>,
-        scope: CryptocurrencyWalletMonitoringScope,
+        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
+        scope: CryptocurrencyWalletMonitorScope,
     ) -> Result<
-        CryptocurrencyWalletMonitoringResponse,
-        RpcCallError<CryptocurrencyWalletMonitoringApiError>,
+        CryptocurrencyWalletMonitorResponse,
+        RpcCallError<CryptocurrencyWalletMonitorApiError>,
     > {
         runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::FetchSelections(
-                scope,
-            ))
+            .call(CryptocurrencyWalletMonitorRequest::FetchSelections(scope))
             .await
             .map(widget::rpc::RpcResponse::into_value)
     }
 
-    fn addresses(response: &CryptocurrencyWalletMonitoringResponse) -> Vec<&str> {
-        let CryptocurrencyWalletMonitoringResponse::Selections(data) = response else {
+    fn addresses(response: &CryptocurrencyWalletMonitorResponse) -> Vec<&str> {
+        let CryptocurrencyWalletMonitorResponse::Selections(data) = response else {
             panic!("the answer should be the addresses");
         };
         data.selections()
@@ -831,9 +804,9 @@ mod tests {
     }
 
     async fn next_reliable(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitoringProtocol>,
-        predicate: impl Fn(&CryptocurrencyWalletMonitoringStreamMessage) -> bool,
-    ) -> CryptocurrencyWalletMonitoringStreamMessage {
+        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
+        predicate: impl Fn(&CryptocurrencyWalletMonitorStreamMessage) -> bool,
+    ) -> CryptocurrencyWalletMonitorStreamMessage {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let envelope = reliable
@@ -850,34 +823,34 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitoringProtocol>,
-        expected: CryptocurrencyWalletMonitoringStatus,
+        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
+        expected: CryptocurrencyWalletMonitorStatus,
     ) {
         let status = next_reliable(
             reliable,
-            |message| matches!(message, CryptocurrencyWalletMonitoringStreamMessage::Status(status) if *status == expected),
+            |message| matches!(message, CryptocurrencyWalletMonitorStreamMessage::Status(status) if *status == expected),
         )
         .await;
         assert!(matches!(
             status,
-            CryptocurrencyWalletMonitoringStreamMessage::Status(_)
+            CryptocurrencyWalletMonitorStreamMessage::Status(_)
         ));
     }
 
     async fn receive_failure(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitoringProtocol>,
-    ) -> CryptocurrencyWalletMonitoringStreamError {
+        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
+    ) -> CryptocurrencyWalletMonitorStreamError {
         let failure = next_reliable(reliable, |message| {
             matches!(
                 message,
-                CryptocurrencyWalletMonitoringStreamMessage::Status(
-                    CryptocurrencyWalletMonitoringStatus::Failed(_)
+                CryptocurrencyWalletMonitorStreamMessage::Status(
+                    CryptocurrencyWalletMonitorStatus::Failed(_)
                 )
             )
         })
         .await;
-        let CryptocurrencyWalletMonitoringStreamMessage::Status(
-            CryptocurrencyWalletMonitoringStatus::Failed(error),
+        let CryptocurrencyWalletMonitorStreamMessage::Status(
+            CryptocurrencyWalletMonitorStatus::Failed(error),
         ) = failure
         else {
             panic!("the stream should have reported a failure");
@@ -886,7 +859,7 @@ mod tests {
     }
 
     async fn next_feed(
-        latest: &mut LatestStream<CryptocurrencyWalletMonitoringProtocol>,
+        latest: &mut LatestStream<CryptocurrencyWalletMonitorProtocol>,
         predicate: impl Fn(&TransferSnapshot) -> bool,
     ) -> TransferSnapshot {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -896,7 +869,7 @@ mod tests {
                     .await
                     .expect("the latest stream should stay open");
                 while let Some(envelope) = latest.next_unseen() {
-                    if let CryptocurrencyWalletMonitoringStreamMessage::Snapshot(snapshot) =
+                    if let CryptocurrencyWalletMonitorStreamMessage::Snapshot(snapshot) =
                         envelope.message().as_ref()
                         && predicate(snapshot)
                     {
@@ -921,9 +894,9 @@ mod tests {
     async fn live(
         source: &FakeSource,
     ) -> (
-        WidgetRuntime<CryptocurrencyWalletMonitoringProtocol>,
-        ReliableStream<CryptocurrencyWalletMonitoringProtocol>,
-        LatestStream<CryptocurrencyWalletMonitoringProtocol>,
+        WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
+        ReliableStream<CryptocurrencyWalletMonitorProtocol>,
+        LatestStream<CryptocurrencyWalletMonitorProtocol>,
     ) {
         let mut runtime = runtime(source);
         let reliable = runtime
@@ -941,14 +914,14 @@ mod tests {
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
 
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
         // Readiness describes the transfers that came with it, not a feed still on its
         // way: by the time the pane is told the subscription is live, the feed is on the
         // stream.
         let live = latest
             .next_unseen()
             .expect("a live feed is published with the readiness it comes with");
-        let CryptocurrencyWalletMonitoringStreamMessage::Snapshot(live) = live.message().as_ref()
+        let CryptocurrencyWalletMonitorStreamMessage::Snapshot(live) = live.message().as_ref()
         else {
             panic!("the latest stream should hold the feed");
         };
@@ -979,7 +952,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         control
             .events
@@ -1008,7 +981,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, _) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         control.status.send_replace(SubscriptionStatus::Active);
 
@@ -1031,14 +1004,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::Load(scope()))
+            .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
             .await
             .expect_err("an account whose credentials are gone cannot be streamed");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitoringApiError::Authentication,
+                source: CryptocurrencyWalletMonitorApiError::Authentication,
                 ..
             }
         ));
@@ -1054,7 +1027,7 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitoringStreamError::Service(KytrixServiceError::Closed)
+            CryptocurrencyWalletMonitorStreamError::Service(KytrixServiceError::Closed)
         );
         assert!(
             latest.next_unseen().is_none(),
@@ -1073,13 +1046,13 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::Closed)
+            CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed)
         );
         assert!(latest.next_unseen().is_none());
         runtime.shutdown().await;
     }
 
-    /// A cryptocurrency_wallet_monitoring transfer names the cryptocurrency_wallet_monitorings an account is watching, so one that was already
+    /// A cryptocurrency_wallet_monitor transfer names the cryptocurrency_wallet_monitors an account is watching, so one that was already
     /// on the wire when the credentials behind the subscription changed is not data the
     /// pane may be shown: the subscription's own status is checked before it is converted.
     #[tokio::test]
@@ -1088,7 +1061,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
         // The empty feed a live subscription publishes is read before the stale transfer
         // is sent, so what is left on the latest stream is only what came after it.
         let _ = next_feed(&mut latest, |snapshot| snapshot.items().is_empty()).await;
@@ -1104,7 +1077,7 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitoringStreamError::Transport(TransportError::CredentialChanged)
+            CryptocurrencyWalletMonitorStreamError::Transport(TransportError::CredentialChanged)
         );
         assert!(
             latest.next_unseen().is_none(),
@@ -1119,16 +1092,16 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, _) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         for _ in 0..2 {
             let response = runtime
                 .client()
-                .call(CryptocurrencyWalletMonitoringRequest::Stop)
+                .call(CryptocurrencyWalletMonitorRequest::Stop)
                 .await
                 .expect("stopping should be answered")
                 .into_value();
-            assert_eq!(response, CryptocurrencyWalletMonitoringResponse::Stopped);
+            assert_eq!(response, CryptocurrencyWalletMonitorResponse::Stopped);
         }
 
         assert_eq!(
@@ -1152,9 +1125,9 @@ mod tests {
             .expect("the reliable stream should be available");
 
         load(&runtime, account("first")).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
         load(&runtime, account("second")).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         assert_eq!(source.sessions(), 2);
         assert_eq!(
@@ -1202,11 +1175,11 @@ mod tests {
         load(&runtime, scope()).await;
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitoringStreamError::Service(KytrixServiceError::Closed)
+            CryptocurrencyWalletMonitorStreamError::Service(KytrixServiceError::Closed)
         );
 
         retry(&runtime, scope()).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         assert_eq!(source.sessions(), 2, "a retry takes the account again");
         assert_eq!(control.drops.load(Ordering::SeqCst), 0);
@@ -1222,14 +1195,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::Load(scope()))
+            .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
             .await
             .expect_err("a stream is keyed by the account it was asked for");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitoringApiError::AccountChanged,
+                source: CryptocurrencyWalletMonitorApiError::AccountChanged,
                 ..
             }
         ));
@@ -1272,7 +1245,7 @@ mod tests {
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitoringApiError::NotReady,
+                source: CryptocurrencyWalletMonitorApiError::NotReady,
                 ..
             }
         ));
@@ -1289,7 +1262,7 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::DeleteSelection {
+            .call(CryptocurrencyWalletMonitorRequest::DeleteSelection {
                 scope: account("other"),
                 address: SmolStr::new_static("0x1"),
             })
@@ -1299,7 +1272,7 @@ mod tests {
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitoringApiError::AccountChanged,
+                source: CryptocurrencyWalletMonitorApiError::AccountChanged,
                 ..
             }
         ));
@@ -1320,13 +1293,13 @@ mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Confirmed(
                 selection("0x1"),
             ));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::AddSelection {
+            .call(CryptocurrencyWalletMonitorRequest::AddSelection {
                 scope: scope(),
                 address: SmolStr::new_static("0x1"),
             })
@@ -1336,8 +1309,8 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitoringResponse::Added(
-                CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(selection("0x1"))
+            CryptocurrencyWalletMonitorResponse::Added(
+                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(selection("0x1"))
             )
         );
         assert_eq!(session.state().add_calls, 1);
@@ -1353,13 +1326,13 @@ mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitoringApiError::Conflict,
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitorApiError::Conflict,
             ));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::AddSelection {
+            .call(CryptocurrencyWalletMonitorRequest::AddSelection {
                 scope: scope(),
                 address: SmolStr::new_static("0x1"),
             })
@@ -1369,9 +1342,9 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitoringResponse::Added(
-                CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                    CryptocurrencyWalletMonitoringApiError::Conflict
+            CryptocurrencyWalletMonitorResponse::Added(
+                CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                    CryptocurrencyWalletMonitorApiError::Conflict
                 )
             )
         );
@@ -1392,7 +1365,7 @@ mod tests {
         let client = runtime.client();
         let pending = tokio::spawn(async move {
             client
-                .call(CryptocurrencyWalletMonitoringRequest::AddSelection {
+                .call(CryptocurrencyWalletMonitorRequest::AddSelection {
                     scope: scope(),
                     address: SmolStr::new_static("0x1"),
                 })
@@ -1424,7 +1397,7 @@ mod tests {
         let client = runtime.client();
         let pending = tokio::spawn(async move {
             client
-                .call(CryptocurrencyWalletMonitoringRequest::Load(scope()))
+                .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
                 .await
         });
         block.wait_started().await;
@@ -1454,7 +1427,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         control
             .events
@@ -1466,13 +1439,9 @@ mod tests {
         control
             .status
             .send_replace(SubscriptionStatus::Reconnecting);
-        receive_status(
-            &mut reliable,
-            CryptocurrencyWalletMonitoringStatus::Connecting,
-        )
-        .await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Connecting).await;
         control.status.send_replace(SubscriptionStatus::Active);
-        receive_status(&mut reliable, CryptocurrencyWalletMonitoringStatus::Ready).await;
+        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(100), latest.changed())
@@ -1492,13 +1461,13 @@ mod tests {
         session
             .state()
             .deletes
-            .push_back(CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::Timeout,
+            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::Timeout,
             ));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitoringRequest::DeleteSelection {
+            .call(CryptocurrencyWalletMonitorRequest::DeleteSelection {
                 scope: scope(),
                 address: SmolStr::new_static("0x1"),
             })
@@ -1508,9 +1477,9 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitoringResponse::Deleted(
-                CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                    CryptocurrencyWalletMonitoringMutationUnknown::Timeout
+            CryptocurrencyWalletMonitorResponse::Deleted(
+                CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                    CryptocurrencyWalletMonitorMutationUnknown::Timeout
                 )
             )
         );
@@ -1532,7 +1501,7 @@ mod tests {
         }
         assert_eq!(
             ended_subscription(&SubscriptionStatus::Closed),
-            Some(CryptocurrencyWalletMonitoringStreamError::Transport(
+            Some(CryptocurrencyWalletMonitorStreamError::Transport(
                 TransportError::Closed
             ))
         );
@@ -1540,7 +1509,7 @@ mod tests {
             ended_subscription(&SubscriptionStatus::Failed(
                 TransportError::CredentialChanged
             )),
-            Some(CryptocurrencyWalletMonitoringStreamError::Transport(
+            Some(CryptocurrencyWalletMonitorStreamError::Transport(
                 TransportError::CredentialChanged
             ))
         );

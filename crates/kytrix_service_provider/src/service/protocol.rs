@@ -19,18 +19,14 @@ use url::Url;
 use yawc::{Frame, OpCode, WebSocketError};
 
 use crate::service::{
-    cryptocurrency_wallet_monitoring,
+    cryptocurrency_wallet_monitor,
     engine::{
-        CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexEvent,
-        FinancialIndexTopic, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage,
-        KytrixServiceError, KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind,
-        ServiceTopic, TweetReference, WRITE_TIMEOUT, XAccountMonitoringProfileEvent,
-        XAccountMonitoringTweetEvent, XAccountMonitoringTweetMedia,
-        XAccountMonitoringTweetTextSegment,
+        CryptocurrencyWalletMonitorTransfer, ErrorCode, FinancialIndexEvent, FinancialIndexTopic,
+        HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage, KytrixServiceError,
+        KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind, ServiceTopic, TweetReference,
+        WRITE_TIMEOUT, XProfileEvent, XTweetEvent, XTweetMedia, XTweetTextSegment,
     },
-    strategic_maritime_chokepoints_tracking::{
-        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
-    },
+    global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
 };
 
 pub(super) async fn next_server_message(
@@ -137,63 +133,63 @@ pub(super) fn decode_event(
             )))
         }
         proto_event::event::Event::XAccountMonitoringProfile(profile) => Ok(Some((
-            ServiceTopic::XAccountMonitoring,
-            KytrixServiceEvent::XAccountMonitoringProfile(decode_x_profile(profile)?),
+            ServiceTopic::X,
+            KytrixServiceEvent::XProfile(decode_x_profile(profile)?),
         ))),
         proto_event::event::Event::XAccountMonitoringTweet(tweet) => Ok(Some((
-            ServiceTopic::XAccountMonitoring,
-            KytrixServiceEvent::XAccountMonitoringTweet(decode_tweet(tweet)?),
+            ServiceTopic::X,
+            KytrixServiceEvent::XTweet(decode_tweet(tweet)?),
         ))),
         proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(transfer) => Ok(Some((
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(
-                decode_cryptocurrency_wallet_monitoring_transfer(transfer)?,
+            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(
+                decode_cryptocurrency_wallet_monitor_transfer(transfer)?,
             ),
         ))),
         proto_event::event::Event::StrategicMaritimeChokepointsTracking(delta) => {
-            let area = StrategicMaritimeChokepointsTrackingArea::try_from(delta.area)
+            let area = GlobalShippingChokepointArea::try_from(delta.area)
                 .ok()
-                .filter(|area| *area != StrategicMaritimeChokepointsTrackingArea::Unspecified)
+                .filter(|area| *area != GlobalShippingChokepointArea::Unspecified)
                 .ok_or_else(|| KytrixServiceError::Protocol("AIS event area is invalid".into()))?;
             Ok(Some((
-                ServiceTopic::StrategicMaritimeChokepointsTracking(area),
-                KytrixServiceEvent::StrategicMaritimeChokepointsTracking(
-                    StrategicMaritimeChokepointsTrackingUpdate::from_proto(delta),
+                ServiceTopic::GlobalShippingChokepoint(area),
+                KytrixServiceEvent::GlobalShippingChokepoint(
+                    GlobalShippingChokepointUpdate::from_proto(delta),
                 ),
             )))
         }
     }
 }
 
-pub(super) fn decode_cryptocurrency_wallet_monitoring_transfer(
+pub(super) fn decode_cryptocurrency_wallet_monitor_transfer(
     transfer: proto_types::CryptocurrencyWalletMonitoringTransfer,
-) -> Result<CryptocurrencyWalletMonitoringTransfer, KytrixServiceError> {
-    let network = cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(
+) -> Result<CryptocurrencyWalletMonitorTransfer, KytrixServiceError> {
+    let network = cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(
         &transfer.from_address,
     );
     if transfer.event_id.is_empty()
         || transfer.event_id.len() > 512
         || network.is_none()
-        || cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(
+        || cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(
             &transfer.to_address,
         ) != network
         || !network.is_some_and(|network| {
-            cryptocurrency_wallet_monitoring::valid_transfer_amount(&transfer.amount, network)
+            cryptocurrency_wallet_monitor::valid_transfer_amount(&transfer.amount, network)
         })
         || transfer.token_symbol.is_empty()
         || transfer.token_symbol.len() > 64
         || transfer.timestamp <= 0
     {
         return Err(KytrixServiceError::Protocol(
-            "cryptocurrency_wallet_monitoring transfer is invalid".into(),
+            "cryptocurrency_wallet_monitor transfer is invalid".into(),
         ));
     }
     let timestamp = transfer.timestamp.checked_mul(1_000).ok_or_else(|| {
         KytrixServiceError::Protocol(
-            "cryptocurrency_wallet_monitoring timestamp exceeded UTC milliseconds".into(),
+            "cryptocurrency_wallet_monitor timestamp exceeded UTC milliseconds".into(),
         )
     })?;
-    Ok(CryptocurrencyWalletMonitoringTransfer {
+    Ok(CryptocurrencyWalletMonitorTransfer {
         event_id: transfer.event_id.into(),
         from_address: transfer.from_address.into(),
         to_address: transfer.to_address.into(),
@@ -205,14 +201,14 @@ pub(super) fn decode_cryptocurrency_wallet_monitoring_transfer(
 
 pub(super) fn decode_tweet(
     tweet: proto_types::XAccountMonitoringTweet,
-) -> Result<XAccountMonitoringTweetEvent, KytrixServiceError> {
+) -> Result<XTweetEvent, KytrixServiceError> {
     decode_tweet_at_depth(tweet, 0)
 }
 
 pub(super) fn decode_tweet_at_depth(
     tweet: proto_types::XAccountMonitoringTweet,
     depth: usize,
-) -> Result<XAccountMonitoringTweetEvent, KytrixServiceError> {
+) -> Result<XTweetEvent, KytrixServiceError> {
     let proto_types::XAccountMonitoringTweet {
         tweet_id,
         timestamp,
@@ -251,7 +247,7 @@ pub(super) fn decode_tweet_at_depth(
             text_code_points = text_code_points
                 .checked_add(segment.text.chars().count())
                 .ok_or_else(|| KytrixServiceError::Protocol("Tweet text size overflowed".into()))?;
-            Ok(XAccountMonitoringTweetTextSegment {
+            Ok(XTweetTextSegment {
                 text: segment.text.into(),
                 url: segment.url.map(Into::into),
             })
@@ -293,7 +289,7 @@ pub(super) fn decode_tweet_at_depth(
             }
         })
         .transpose()?;
-    Ok(XAccountMonitoringTweetEvent {
+    Ok(XTweetEvent {
         tweet_id: tweet_id.into(),
         timestamp,
         x_user_id: x_user_id.into(),
@@ -305,7 +301,7 @@ pub(super) fn decode_tweet_at_depth(
 
 pub(super) fn decode_tweet_media(
     media: proto_types::XAccountMonitoringTweetMedia,
-) -> Result<XAccountMonitoringTweetMedia, KytrixServiceError> {
+) -> Result<XTweetMedia, KytrixServiceError> {
     use proto_types::x_account_monitoring_tweet_media::Content;
 
     let media = match media.content {
@@ -313,7 +309,7 @@ pub(super) fn decode_tweet_media(
             if valid_https_url(&image.image_url)
                 && valid_media_dimensions(image.width, image.height) =>
         {
-            XAccountMonitoringTweetMedia::Image {
+            XTweetMedia::Image {
                 image_url: image.image_url.into(),
                 width: image.width,
                 height: image.height,
@@ -324,7 +320,7 @@ pub(super) fn decode_tweet_media(
                 && valid_https_url(&video.thumbnail_url)
                 && valid_media_dimensions(video.width, video.height) =>
         {
-            XAccountMonitoringTweetMedia::Video {
+            XTweetMedia::Video {
                 playback_url: video.playback_url.into(),
                 thumbnail_url: video.thumbnail_url.into(),
                 width: video.width,
@@ -336,7 +332,7 @@ pub(super) fn decode_tweet_media(
                 && valid_https_url(&gif.image_url)
                 && valid_media_dimensions(gif.width, gif.height) =>
         {
-            XAccountMonitoringTweetMedia::Gif {
+            XTweetMedia::Gif {
                 animation_url: gif.animation_url.into(),
                 image_url: gif.image_url.into(),
                 width: gif.width,
@@ -383,7 +379,7 @@ const fn valid_media_dimensions(width: u32, height: u32) -> bool {
 
 pub(super) fn decode_x_profile(
     profile: proto_types::XAccountMonitoringProfile,
-) -> Result<XAccountMonitoringProfileEvent, KytrixServiceError> {
+) -> Result<XProfileEvent, KytrixServiceError> {
     if !valid_x_id(&profile.x_user_id)
         || !valid_x_username(&profile.username)
         || profile.display_name.is_empty()
@@ -395,7 +391,7 @@ pub(super) fn decode_x_profile(
             "X profile contained invalid fields".into(),
         ));
     }
-    Ok(XAccountMonitoringProfileEvent {
+    Ok(XProfileEvent {
         x_user_id: profile.x_user_id.into(),
         username: profile.username.into(),
         display_name: profile.display_name.into(),
@@ -560,7 +556,7 @@ impl From<&ServiceTopic> for proto_topic::Topic {
                     code: topic.code().into(),
                 })
             }
-            ServiceTopic::XAccountMonitoring => proto_topic::topic::Topic::XAccountMonitoring(
+            ServiceTopic::X => proto_topic::topic::Topic::XAccountMonitoring(
                 proto_topic::XAccountMonitoringTopic {},
             ),
             ServiceTopic::CryptocurrencyWalletMonitoring => {
@@ -568,7 +564,7 @@ impl From<&ServiceTopic> for proto_topic::Topic {
                     proto_topic::CryptocurrencyWalletMonitoringTopic {},
                 )
             }
-            ServiceTopic::StrategicMaritimeChokepointsTracking(area) => {
+            ServiceTopic::GlobalShippingChokepoint(area) => {
                 proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
                     proto_topic::StrategicMaritimeChokepointsTrackingTopic { area: *area as i32 },
                 )
@@ -592,20 +588,18 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
                     .map(ServiceTopic::FinancialIndex)
                     .ok_or_else(|| "index topic is invalid".into())
             }
-            proto_topic::topic::Topic::XAccountMonitoring(_) => {
-                Ok(ServiceTopic::XAccountMonitoring)
-            }
+            proto_topic::topic::Topic::XAccountMonitoring(_) => Ok(ServiceTopic::X),
             proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
                 Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
             }
             proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(value) => {
-                match StrategicMaritimeChokepointsTrackingArea::try_from(value.area) {
-                    Ok(StrategicMaritimeChokepointsTrackingArea::Hormuz) => {
-                        Ok(ServiceTopic::StrategicMaritimeChokepointsTracking(
-                            StrategicMaritimeChokepointsTrackingArea::Hormuz,
+                match GlobalShippingChokepointArea::try_from(value.area) {
+                    Ok(GlobalShippingChokepointArea::Hormuz) => {
+                        Ok(ServiceTopic::GlobalShippingChokepoint(
+                            GlobalShippingChokepointArea::Hormuz,
                         ))
                     }
-                    Ok(StrategicMaritimeChokepointsTrackingArea::Unspecified) => {
+                    Ok(GlobalShippingChokepointArea::Unspecified) => {
                         Err("AIS area is unspecified".into())
                     }
                     Err(_) => Err("AIS area is invalid".into()),
@@ -620,8 +614,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{super::test_support::*, *};
-    use crate::service::strategic_maritime_chokepoints_tracking::{
-        StrategicMaritimeChokepointsTrackingPosition, StrategicMaritimeChokepointsTrackingStatic,
+    use crate::service::global_shipping_chokepoint::{
+        GlobalShippingChokepointPosition, GlobalShippingChokepointStatic,
     };
 
     #[test]
@@ -693,10 +687,8 @@ mod tests {
 
     #[test]
     fn literal_x_event_wire_should_preserve_schema_tags() {
-        let IncomingMessage::Event(Some((
-            ServiceTopic::XAccountMonitoring,
-            KytrixServiceEvent::XAccountMonitoringProfile(profile),
-        ))) = decode_binary(X_PROFILE_EVENT_WIRE).expect("literal X profile event should decode")
+        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::XProfile(profile)))) =
+            decode_binary(X_PROFILE_EVENT_WIRE).expect("literal X profile event should decode")
         else {
             panic!("literal frame should contain an X profile event");
         };
@@ -709,11 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn literal_cryptocurrency_wallet_monitoring_event_wire_should_preserve_schema_tags() {
+    fn literal_cryptocurrency_wallet_monitor_event_wire_should_preserve_schema_tags() {
         let IncomingMessage::Event(Some((
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
-        ))) = decode_binary(CRYPTOCURRENCY_WALLET_MONITORING_EVENT_WIRE)
+            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
+        ))) = decode_binary(CRYPTOCURRENCY_WALLET_MONITOR_EVENT_WIRE)
             .expect("literal CryptocurrencyWalletMonitoring event should decode")
         else {
             panic!("literal frame should contain a CryptocurrencyWalletMonitoring event");
@@ -739,11 +731,9 @@ mod tests {
         for topic in [
             ServiceTopic::News,
             index_service_topic("REMOTE_ONLY_INDEX"),
-            ServiceTopic::XAccountMonitoring,
+            ServiceTopic::X,
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            ServiceTopic::StrategicMaritimeChokepointsTracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            ),
+            ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
         ] {
             let encoded = proto_topic::Topic::from(&topic);
             assert_eq!(ServiceTopic::try_from(&encoded), Ok(topic));
@@ -751,11 +741,8 @@ mod tests {
     }
 
     #[test]
-    fn strategic_maritime_chokepoints_tracking_topic_should_reject_unspecified_and_unknown_areas() {
-        for area in [
-            StrategicMaritimeChokepointsTrackingArea::Unspecified as i32,
-            9,
-        ] {
+    fn global_shipping_chokepoint_topic_should_reject_unspecified_and_unknown_areas() {
+        for area in [GlobalShippingChokepointArea::Unspecified as i32, 9] {
             let topic = proto_topic::Topic {
                 topic: Some(
                     proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
@@ -877,10 +864,8 @@ mod tests {
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).expect("Tweet should decode");
-        let IncomingMessage::Event(Some((
-            ServiceTopic::XAccountMonitoring,
-            KytrixServiceEvent::XAccountMonitoringTweet(tweet),
-        ))) = decoded
+        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::XTweet(tweet)))) =
+            decoded
         else {
             panic!("expected a Tweet event");
         };
@@ -889,7 +874,7 @@ mod tests {
         assert_eq!(tweet.x_user_id, "42");
         assert_eq!(
             tweet.text_segments,
-            [XAccountMonitoringTweetTextSegment {
+            [XTweetTextSegment {
                 text: "hello".into(),
                 url: None,
             }]
@@ -902,7 +887,7 @@ mod tests {
         assert_eq!(repost.timestamp, 1_699_999_999_000);
         assert_eq!(
             repost.text_segments,
-            [XAccountMonitoringTweetTextSegment {
+            [XTweetTextSegment {
                 text: "example.test/nested".into(),
                 url: Some("https://t.co/nested".into()),
             }]
@@ -920,10 +905,8 @@ mod tests {
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
-        let IncomingMessage::Event(Some((
-            ServiceTopic::XAccountMonitoring,
-            KytrixServiceEvent::XAccountMonitoringProfile(profile),
-        ))) = decoded
+        let IncomingMessage::Event(Some((ServiceTopic::X, KytrixServiceEvent::XProfile(profile)))) =
+            decoded
         else {
             panic!("expected an X profile event");
         };
@@ -932,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitoring_transfer_should_decode_exact_amount_and_milliseconds() {
+    fn cryptocurrency_wallet_monitor_transfer_should_decode_exact_amount_and_milliseconds() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
                 event: Some(
@@ -953,10 +936,10 @@ mod tests {
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
+            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a cryptocurrency_wallet_monitoring transfer");
+            panic!("expected a cryptocurrency_wallet_monitor transfer");
         };
         assert_eq!(transfer.event_id, "ethereum:0xabc:2");
         assert_eq!(transfer.amount, "1.000001");
@@ -965,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitoring_transfer_should_decode_zero_amount() {
+    fn cryptocurrency_wallet_monitor_transfer_should_decode_zero_amount() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
                 event: Some(
@@ -986,22 +969,21 @@ mod tests {
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
             ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
+            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a cryptocurrency_wallet_monitoring transfer");
+            panic!("expected a cryptocurrency_wallet_monitor transfer");
         };
         assert_eq!(transfer.amount, "0");
     }
 
     #[test]
-    fn strategic_maritime_chokepoints_tracking_delta_should_decode_the_area_and_every_part_of_the_update()
-     {
+    fn global_shipping_chokepoint_delta_should_decode_the_area_and_every_part_of_the_update() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
                 event: Some(
                     proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                        strategic_maritime_chokepoints_tracking_delta(),
+                        global_shipping_chokepoint_delta(),
                     ),
                 ),
             })),
@@ -1009,19 +991,15 @@ mod tests {
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::StrategicMaritimeChokepointsTracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            ),
-            KytrixServiceEvent::StrategicMaritimeChokepointsTracking(update),
+            ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
+            KytrixServiceEvent::GlobalShippingChokepoint(update),
         ))) = decoded
         else {
             panic!("expected an AIS update");
         };
         assert_eq!(
             update,
-            StrategicMaritimeChokepointsTrackingUpdate::from_proto(
-                strategic_maritime_chokepoints_tracking_delta()
-            )
+            GlobalShippingChokepointUpdate::from_proto(global_shipping_chokepoint_delta())
         );
         assert_eq!(update.epoch, 5);
         assert!(!update.keyframe);
@@ -1029,7 +1007,7 @@ mod tests {
         assert_eq!(update.base, 6);
         assert_eq!(
             update.statics,
-            [StrategicMaritimeChokepointsTrackingStatic {
+            [GlobalShippingChokepointStatic {
                 mmsi: 636_000_001,
                 imo: 9_000_001,
                 call_sign: "C6AB1".into(),
@@ -1050,7 +1028,7 @@ mod tests {
         );
         assert_eq!(
             update.positions,
-            [StrategicMaritimeChokepointsTrackingPosition {
+            [GlobalShippingChokepointPosition {
                 mmsi: 636_000_001,
                 latitude: 26_566_000,
                 longitude: 56_250_000,
@@ -1066,13 +1044,9 @@ mod tests {
     }
 
     #[test]
-    fn strategic_maritime_chokepoints_tracking_event_without_a_known_area_should_be_a_protocol_error()
-     {
-        for area in [
-            StrategicMaritimeChokepointsTrackingArea::Unspecified as i32,
-            9,
-        ] {
-            let mut delta = strategic_maritime_chokepoints_tracking_delta();
+    fn global_shipping_chokepoint_event_without_a_known_area_should_be_a_protocol_error() {
+        for area in [GlobalShippingChokepointArea::Unspecified as i32, 9] {
+            let mut delta = global_shipping_chokepoint_delta();
             delta.area = area;
             let message = ServerMessage {
                 message: Some(server_message::Message::Event(proto_event::Event {

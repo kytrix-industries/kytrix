@@ -123,12 +123,12 @@ const PAGE_DEPTH_DRIFT: f32 = 0.3;
 /// what it was left showing rather than a setting every pane shares. No route is persisted,
 /// because which partitions the venue publishes is not a user's choice.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, serde::Serialize)]
-pub struct HyperliquidWalletMonitorConfig {
+pub struct HyperliquidWalletConfig {
     #[serde(deserialize_with = "deserialize_addresses")]
     addresses: Vec<WalletAddress>,
 }
 
-impl HyperliquidWalletMonitorConfig {
+impl HyperliquidWalletConfig {
     /// A config that follows exactly these addresses, in the order given.
     #[cfg(test)]
     pub(super) fn monitoring(addresses: Vec<WalletAddress>) -> Self {
@@ -136,20 +136,20 @@ impl HyperliquidWalletMonitorConfig {
     }
 }
 
-impl WidgetConfig for HyperliquidWalletMonitorConfig {
+impl WidgetConfig for HyperliquidWalletConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
 /// A failure a pane reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum HyperliquidWalletMonitorFailure {
+enum HyperliquidWalletFailure {
     /// A stream stopped.
     Stream(WalletStreamError),
     /// The request that would have started the streams failed.
     Rpc(RpcCallError<Infallible>),
 }
 
-impl LocalizedError for HyperliquidWalletMonitorFailure {
+impl LocalizedError for HyperliquidWalletFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Stream(error) => error.localized_message(cx),
@@ -166,10 +166,10 @@ impl LocalizedError for HyperliquidWalletMonitorFailure {
 /// is what does it. It is a wait, not a failure: loading the market again is
 /// what puts the catalog back. A reading reaches the pane as an account error, and
 /// the account layer is where the directory's typed answer travels.
-fn is_waiting_for_a_catalog(failure: &HyperliquidWalletMonitorFailure) -> bool {
+fn is_waiting_for_a_catalog(failure: &HyperliquidWalletFailure) -> bool {
     matches!(
         failure,
-        HyperliquidWalletMonitorFailure::Stream(WalletStreamError::Account(error))
+        HyperliquidWalletFailure::Stream(WalletStreamError::Account(error))
             if account_is_catalog_not_loaded(error)
     )
 }
@@ -180,7 +180,7 @@ enum ScopeStatus {
     #[default]
     Loading,
     Ready,
-    Failed(Arc<HyperliquidWalletMonitorFailure>),
+    Failed(Arc<HyperliquidWalletFailure>),
 }
 
 /// One wallet's account line, as the list draws it.
@@ -225,7 +225,7 @@ struct DetailEntry {
 
 /// Which arm of the open wallet's body one tab is drawn as, with what that arm needs.
 ///
-/// See [`HyperliquidWalletMonitorWidget::detail_arm`]: the body is a match over this, so which of
+/// See [`HyperliquidWalletWidget::detail_arm`]: the body is a match over this, so which of
 /// the three a frame draws is one decision rather than two that could disagree.
 enum DetailArm<'a> {
     /// The reading's table, with the entry it belongs to.
@@ -233,7 +233,7 @@ enum DetailArm<'a> {
     /// The loading message, which is also what a tab with no reading yet draws.
     Loading,
     /// The failure message.
-    Failed(&'a HyperliquidWalletMonitorFailure),
+    Failed(&'a HyperliquidWalletFailure),
 }
 
 /// One row of the list: the account line and the timeline under it.
@@ -274,7 +274,7 @@ enum PanePage {
 /// other. What a page reads it reads from the pane, which owns every reading either page shows;
 /// what it holds is which page it is, and what it was left showing.
 struct WalletPage {
-    pane: WeakEntity<HyperliquidWalletMonitorWidget>,
+    pane: WeakEntity<HyperliquidWalletWidget>,
     page: PanePage,
 }
 
@@ -340,8 +340,8 @@ enum Pending {
 }
 
 /// One pane: the addresses it follows, and the wallet it has opened.
-pub struct HyperliquidWalletMonitorWidget {
-    config: HyperliquidWalletMonitorConfig,
+pub struct HyperliquidWalletWidget {
+    config: HyperliquidWalletConfig,
     binding: WidgetBinding<WalletProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
@@ -401,14 +401,14 @@ pub struct HyperliquidWalletMonitorWidget {
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for HyperliquidWalletMonitorWidget {
-    type Config = HyperliquidWalletMonitorConfig;
+impl WidgetView for HyperliquidWalletWidget {
+    type Config = HyperliquidWalletConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.hyperliquid_wallet_monitor");
-    const DISPLAY_NAME: &'static str = "widget.names.hyperliquid_wallet_monitor";
+    const ID: WidgetId = WidgetId::new_static("kytrix.hyperliquid_wallet");
+    const DISPLAY_NAME: &'static str = "widget.names.hyperliquid_wallet";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Monitor Hyperliquid wallet activity";
-    const ICON: Option<&'static str> = Some("widgets/hyperliquid_wallet_monitor.png");
+    const ICON: Option<&'static str> = Some("widgets/hyperliquid_wallet.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -520,10 +520,10 @@ impl WidgetView for HyperliquidWalletMonitorWidget {
     }
 }
 
-impl HyperliquidWalletMonitorWidget {
+impl HyperliquidWalletWidget {
     /// The seam a test can answer through: `new` only picks the production source.
     fn new_with_source<S>(
-        config: HyperliquidWalletMonitorConfig,
+        config: HyperliquidWalletConfig,
         source: S,
         status: Entity<WidgetStatus>,
         config_change: WidgetConfigChange,
@@ -660,16 +660,14 @@ impl HyperliquidWalletMonitorWidget {
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![VenueId::Hyperliquid],
                     supported: market_participants_connector::venue::definition::venues_supporting(
-                        CapabilityId::WalletMonitor,
+                        CapabilityId::Wallet,
                     ),
                 }),
                 cx,
             );
         } else if self.config.addresses.is_empty() {
             self.status.report(
-                WidgetState::waiting(Notice::message(
-                    "widget.hyperliquid_wallet_monitor.empty_addresses",
-                )),
+                WidgetState::waiting(Notice::message("widget.hyperliquid_wallet.empty_addresses")),
                 cx,
             );
         }
@@ -868,7 +866,7 @@ impl HyperliquidWalletMonitorWidget {
         let Err(error) = result else {
             return;
         };
-        let failure = Arc::new(HyperliquidWalletMonitorFailure::Rpc(error));
+        let failure = Arc::new(HyperliquidWalletFailure::Rpc(error));
         match pending {
             Pending::Scope => {
                 for row in self.overview.values_mut() {
@@ -965,7 +963,7 @@ impl HyperliquidWalletMonitorWidget {
                     Err(error) => {
                         entry.snapshot = None;
                         entry.status = ScopeStatus::Failed(Arc::new(
-                            HyperliquidWalletMonitorFailure::Stream(error.into()),
+                            HyperliquidWalletFailure::Stream(error.into()),
                         ));
                     }
                 }
@@ -1118,7 +1116,7 @@ impl HyperliquidWalletMonitorWidget {
     }
 
     /// The failure of the whole list, once every address in it has one.
-    fn every_wallet_failed(&self) -> Option<Arc<HyperliquidWalletMonitorFailure>> {
+    fn every_wallet_failed(&self) -> Option<Arc<HyperliquidWalletFailure>> {
         let mut failure = None;
         for address in &self.config.addresses {
             match self.overview.get(address) {
@@ -1425,7 +1423,7 @@ impl HyperliquidWalletMonitorWidget {
         let disabled = self.awaiting_market && !self.config.addresses.is_empty();
         let widget = cx.entity().downgrade();
         div()
-            .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MONITOR_MANAGE".into())
+            .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MANAGE".into())
             .flex_none()
             // A control in the header row has to take its own clicks: the row is the pane's
             // drag area as well.
@@ -1437,8 +1435,8 @@ impl HyperliquidWalletMonitorWidget {
                 .filled()
                 .small()
                 .disabled(disabled)
-                .aria_label(t!(cx, "widget.hyperliquid_wallet_monitor.manage_addresses"))
-                .with_tooltip(t!(cx, "widget.hyperliquid_wallet_monitor.manage_addresses"))
+                .aria_label(t!(cx, "widget.hyperliquid_wallet.manage_addresses"))
+                .with_tooltip(t!(cx, "widget.hyperliquid_wallet.manage_addresses"))
                 .when(!disabled, |button| {
                     button.on_click(move |_, window, cx| {
                         WalletAddressDialog::show(widget.clone(), window, cx);
@@ -1453,7 +1451,7 @@ impl HyperliquidWalletMonitorWidget {
     fn back_button(&self, cx: &Context<Self>) -> AnyElement {
         let widget = cx.entity().downgrade();
         div()
-            .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MONITOR_BACK".into())
+            .debug_selector(|| "TEST_HYPERLIQUID_WALLET_BACK".into())
             .flex_none()
             .occlude()
             .child(
@@ -1462,8 +1460,8 @@ impl HyperliquidWalletMonitorWidget {
                 )))
                 .filled()
                 .small()
-                .aria_label(t!(cx, "widget.hyperliquid_wallet_monitor.back"))
-                .with_tooltip(t!(cx, "widget.hyperliquid_wallet_monitor.back"))
+                .aria_label(t!(cx, "widget.hyperliquid_wallet.back"))
+                .with_tooltip(t!(cx, "widget.hyperliquid_wallet.back"))
                 .on_click(move |_, _, cx| {
                     if let Some(widget) = widget.upgrade() {
                         widget.update(cx, |widget, cx| widget.back(cx));
@@ -1485,19 +1483,15 @@ impl HyperliquidWalletMonitorWidget {
         let label = if failed == 1 {
             t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.retry_failed_one",
+                "widget.hyperliquid_wallet.retry_failed_one",
                 value = failed
             )
         } else {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.retry_failed",
-                value = failed
-            )
+            t!(cx, "widget.hyperliquid_wallet.retry_failed", value = failed)
         };
         Some(
             div()
-                .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MONITOR_RETRY_FAILED".into())
+                .debug_selector(|| "TEST_HYPERLIQUID_WALLET_RETRY_FAILED".into())
                 .flex_none()
                 .occlude()
                 .child(
@@ -1535,10 +1529,10 @@ impl HyperliquidWalletMonitorWidget {
             .get(&(address.clone(), tab))
             .is_none_or(|entry| entry.snapshot.is_none());
         let widget = cx.entity().downgrade();
-        let label = t!(cx, "widget.hyperliquid_wallet_monitor.refresh");
+        let label = t!(cx, "widget.hyperliquid_wallet.refresh");
         Some(
             div()
-                .debug_selector(|| "TEST_HYPERLIQUID_WALLET_MONITOR_REFRESH".into())
+                .debug_selector(|| "TEST_HYPERLIQUID_WALLET_REFRESH".into())
                 .flex_none()
                 .occlude()
                 .child(
@@ -1713,7 +1707,7 @@ impl HyperliquidWalletMonitorWidget {
     }
 }
 
-impl Render for HyperliquidWalletMonitorWidget {
+impl Render for HyperliquidWalletWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The colour a page covers the one under it with is the pane's own surface, read once:
         // a page is the whole of what is drawn in the body, so it is the surface the framework
@@ -1786,9 +1780,8 @@ fn apply_status(status: &mut ScopeStatus, ready: &mut bool, reported: &WalletSta
         }
         WalletStatus::Failed(error) => {
             *ready = false;
-            *status = ScopeStatus::Failed(Arc::new(HyperliquidWalletMonitorFailure::Stream(
-                error.clone(),
-            )));
+            *status =
+                ScopeStatus::Failed(Arc::new(HyperliquidWalletFailure::Stream(error.clone())));
             true
         }
     }
@@ -1815,7 +1808,7 @@ fn centered_message(message: SharedString, color: Hsla) -> AnyElement {
 fn detail_tab_button(
     candidate: DetailTab,
     selected: DetailTab,
-    cx: &Context<HyperliquidWalletMonitorWidget>,
+    cx: &Context<HyperliquidWalletWidget>,
 ) -> Button {
     let index = candidate.index();
     let label = tab_label(candidate, cx);
@@ -1845,17 +1838,14 @@ fn detail_tab_button(
 /// The label of one detail tab.
 fn tab_label(tab: DetailTab, cx: &App) -> SharedString {
     match tab {
-        DetailTab::Spot => t!(cx, "widget.hyperliquid_wallet_monitor.tab_spot"),
-        DetailTab::Perpetual => t!(cx, "widget.hyperliquid_wallet_monitor.tab_perpetual"),
-        DetailTab::OpenOrders => t!(cx, "widget.hyperliquid_wallet_monitor.tab_open_orders"),
-        DetailTab::Trades => t!(cx, "widget.hyperliquid_wallet_monitor.tab_trades"),
+        DetailTab::Spot => t!(cx, "widget.hyperliquid_wallet.tab_spot"),
+        DetailTab::Perpetual => t!(cx, "widget.hyperliquid_wallet.tab_perpetual"),
+        DetailTab::OpenOrders => t!(cx, "widget.hyperliquid_wallet.tab_open_orders"),
+        DetailTab::Trades => t!(cx, "widget.hyperliquid_wallet.tab_trades"),
         DetailTab::HistoricalOrders => {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.tab_historical_orders"
-            )
+            t!(cx, "widget.hyperliquid_wallet.tab_historical_orders")
         }
-        DetailTab::Ledger => t!(cx, "widget.hyperliquid_wallet_monitor.tab_ledger"),
+        DetailTab::Ledger => t!(cx, "widget.hyperliquid_wallet.tab_ledger"),
     }
 }
 
@@ -1868,7 +1858,7 @@ fn tab_label(tab: DetailTab, cx: &App) -> SharedString {
 fn wallet_row(
     index: usize,
     row: &WalletRow,
-    widget: &WeakEntity<HyperliquidWalletMonitorWidget>,
+    widget: &WeakEntity<HyperliquidWalletWidget>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -1894,7 +1884,7 @@ fn wallet_row(
 /// One wallet's account line: which wallet it is, and what it is worth.
 fn account_row(
     row: &AccountRow,
-    widget: &WeakEntity<HyperliquidWalletMonitorWidget>,
+    widget: &WeakEntity<HyperliquidWalletWidget>,
     cx: &mut App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -1961,7 +1951,7 @@ fn account_row(
                                     addresses: vec![address],
                                 },
                                 cx,
-                                HyperliquidWalletMonitorWidget::apply_rpc_result,
+                                HyperliquidWalletWidget::apply_rpc_result,
                             );
                             widget.report(cx);
                         });
@@ -2056,7 +2046,7 @@ fn account_row(
                     div().min_w_0().w_full().truncate().child(SharedString::new(
                         format_smolstr!(
                             "{}: {value_text}",
-                            t!(cx, "widget.hyperliquid_wallet_monitor.spot_value")
+                            t!(cx, "widget.hyperliquid_wallet.spot_value")
                         )
                         .as_str(),
                     )),
@@ -2072,7 +2062,7 @@ fn account_row(
                         .child(SharedString::new(
                             format_smolstr!(
                                 "{}: {perpetual_text}",
-                                t!(cx, "widget.hyperliquid_wallet_monitor.perpetual_value")
+                                t!(cx, "widget.hyperliquid_wallet.perpetual_value")
                             )
                             .as_str(),
                         ))
@@ -2081,7 +2071,7 @@ fn account_row(
                                 SharedString::new(
                                     format_smolstr!(
                                         "{}: {pnl_text}",
-                                        t!(cx, "widget.hyperliquid_wallet_monitor.unrealized_pnl")
+                                        t!(cx, "widget.hyperliquid_wallet.unrealized_pnl")
                                     )
                                     .as_str(),
                                 ),
@@ -2094,7 +2084,7 @@ fn account_row(
                         .min_w_0()
                         .w_full()
                         .truncate()
-                        .child(t!(cx, "widget.hyperliquid_wallet_monitor.timeline_title")),
+                        .child(t!(cx, "widget.hyperliquid_wallet.timeline_title")),
                 ),
         )
         .into_any_element()
@@ -2103,7 +2093,7 @@ fn account_row(
 /// One wallet's timeline, with what its own stream is doing.
 fn timeline_row(
     row: &WalletRow,
-    widget: &WeakEntity<HyperliquidWalletMonitorWidget>,
+    widget: &WeakEntity<HyperliquidWalletWidget>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -2134,7 +2124,7 @@ fn timeline_row(
                 .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.precision.clone()),
-            loading: t!(cx, "widget.hyperliquid_wallet_monitor.timeline_loading"),
+            loading: t!(cx, "widget.hyperliquid_wallet.timeline_loading"),
             failure: failure.map(|error| error.localized_message(cx)),
             retry,
             on_measure: std::rc::Rc::new(move |width, plot_width, cx| {
@@ -2271,8 +2261,8 @@ mod tests {
         addresses: Vec<WalletAddress>,
         source: S,
         config_change: WidgetConfigChange,
-        cx: &mut Context<HyperliquidWalletMonitorWidget>,
-    ) -> HyperliquidWalletMonitorWidget
+        cx: &mut Context<HyperliquidWalletWidget>,
+    ) -> HyperliquidWalletWidget
     where
         S: WalletSource,
     {
@@ -2281,7 +2271,7 @@ mod tests {
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        let mut pane = HyperliquidWalletMonitorWidget::new_with_source(
+        let mut pane = HyperliquidWalletWidget::new_with_source(
             config(addresses),
             source,
             status,
@@ -2304,7 +2294,7 @@ mod tests {
     fn quiet_pane(
         cx: &mut TestAppContext,
         addresses: Vec<WalletAddress>,
-    ) -> Entity<HyperliquidWalletMonitorWidget> {
+    ) -> Entity<HyperliquidWalletWidget> {
         cx.executor().allow_parking();
         // The market is installed and its commit is flushed before the pane is built, which is the
         // order production has: the user loads the market, and a pane opened afterwards reads the
@@ -2324,7 +2314,7 @@ mod tests {
     fn pane(
         cx: &mut TestAppContext,
         addresses: Vec<WalletAddress>,
-    ) -> Entity<HyperliquidWalletMonitorWidget> {
+    ) -> Entity<HyperliquidWalletWidget> {
         let pane = quiet_pane(cx, addresses);
         pane.update(cx, |pane, cx| pane.load(cx));
         pane
@@ -2334,7 +2324,7 @@ mod tests {
     fn pane_over_unloaded_venue(
         cx: &mut TestAppContext,
         addresses: Vec<WalletAddress>,
-    ) -> Entity<HyperliquidWalletMonitorWidget> {
+    ) -> Entity<HyperliquidWalletWidget> {
         cx.executor().allow_parking();
         cx.update(|cx| install_market(cx, crate::test_support::test_routes(), false));
         cx.run_until_parked();
@@ -2366,7 +2356,7 @@ mod tests {
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![VenueId::Hyperliquid],
                     supported: market_participants_connector::venue::definition::venues_supporting(
-                        CapabilityId::WalletMonitor,
+                        CapabilityId::Wallet,
                     ),
                 }),
                 "waiting is not working"
@@ -2397,7 +2387,7 @@ mod tests {
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![VenueId::Hyperliquid],
                     supported: market_participants_connector::venue::definition::venues_supporting(
-                        CapabilityId::WalletMonitor,
+                        CapabilityId::Wallet,
                     ),
                 }),
                 "the market sentence is what the pane waits with, not the empty-list one"
@@ -2428,7 +2418,7 @@ mod tests {
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![VenueId::Hyperliquid],
                     supported: market_participants_connector::venue::definition::venues_supporting(
-                        CapabilityId::WalletMonitor,
+                        CapabilityId::Wallet,
                     ),
                 }),
                 "the pane keeps the neutral notice"
@@ -2750,7 +2740,7 @@ mod tests {
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![VenueId::Hyperliquid],
                     supported: market_participants_connector::venue::definition::venues_supporting(
-                        CapabilityId::WalletMonitor,
+                        CapabilityId::Wallet,
                     ),
                 }),
                 "waiting is not working"
@@ -2772,7 +2762,7 @@ mod tests {
         cx: &mut TestAppContext,
         source: &TestSource,
         addresses: Vec<WalletAddress>,
-    ) -> Entity<HyperliquidWalletMonitorWidget> {
+    ) -> Entity<HyperliquidWalletWidget> {
         cx.executor().allow_parking();
         cx.update(install);
         cx.run_until_parked();
@@ -2786,13 +2776,13 @@ mod tests {
     }
 
     /// The addresses a pane is following.
-    fn addresses_of_pane(pane: &HyperliquidWalletMonitorWidget) -> Vec<WalletAddress> {
+    fn addresses_of_pane(pane: &HyperliquidWalletWidget) -> Vec<WalletAddress> {
         pane.addresses().to_vec()
     }
 
     /// Reports one wallet's totals as its stream would.
     fn report_overview(
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
         address: &WalletAddress,
         snapshot: Arc<WalletOverviewSnapshot>,
         cx: &mut App,
@@ -2808,7 +2798,7 @@ mod tests {
 
     /// Reports one wallet's timeline as its stream would.
     fn report_timeline(
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
         address: &WalletAddress,
         snapshot: Arc<crate::model::TimelineSnapshot>,
         cx: &mut App,
@@ -2824,7 +2814,7 @@ mod tests {
 
     /// Reports one wallet's tab as its stream would.
     fn report_detail(
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
         address: &WalletAddress,
         tab: DetailTab,
         snapshot: Arc<DetailSnapshot>,
@@ -2841,7 +2831,7 @@ mod tests {
 
     /// Reports what one stream says about itself.
     fn report_status(
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
         key: WalletStreamKey,
         reported: WalletStatus,
         cx: &mut App,
@@ -2883,7 +2873,7 @@ mod tests {
         assert_eq!(
             VersionedWidgetConfig::encode(&configured)
                 .expect("a wallet monitor config should encode")
-                .decode::<HyperliquidWalletMonitorConfig>()
+                .decode::<HyperliquidWalletConfig>()
                 .addresses,
             vec![address("1"), address("2")]
         );
@@ -2895,78 +2885,78 @@ mod tests {
             install(cx);
 
             for key in [
-                "widget.names.hyperliquid_wallet_monitor",
-                "widget.hyperliquid_wallet_monitor.add",
-                "widget.hyperliquid_wallet_monitor.age_days",
-                "widget.hyperliquid_wallet_monitor.age_hours",
-                "widget.hyperliquid_wallet_monitor.age_minutes",
-                "widget.hyperliquid_wallet_monitor.age_seconds",
-                "widget.hyperliquid_wallet_monitor.already_monitored",
-                "widget.hyperliquid_wallet_monitor.asset",
-                "widget.hyperliquid_wallet_monitor.asset_share",
-                "widget.hyperliquid_wallet_monitor.back",
-                "widget.hyperliquid_wallet_monitor.buy",
-                "widget.hyperliquid_wallet_monitor.close_long",
-                "widget.hyperliquid_wallet_monitor.close_short",
-                "widget.hyperliquid_wallet_monitor.coin",
-                "widget.hyperliquid_wallet_monitor.collateral",
-                "widget.hyperliquid_wallet_monitor.detail_tabs",
-                "widget.hyperliquid_wallet_monitor.empty_addresses",
-                "widget.hyperliquid_wallet_monitor.empty_monitored",
-                "widget.hyperliquid_wallet_monitor.entry",
-                "widget.hyperliquid_wallet_monitor.error_codec",
-                "widget.hyperliquid_wallet_monitor.error_dex_read",
-                "widget.hyperliquid_wallet_monitor.error_listing_missing",
-                "widget.hyperliquid_wallet_monitor.error_route_mismatch",
-                "widget.hyperliquid_wallet_monitor.error_stream_closed",
-                "widget.hyperliquid_wallet_monitor.error_subscription_buffer_full",
-                "widget.hyperliquid_wallet_monitor.error_subscription_closed",
-                "widget.hyperliquid_wallet_monitor.fee",
-                "widget.hyperliquid_wallet_monitor.funding",
-                "widget.hyperliquid_wallet_monitor.invalid_address",
-                "widget.hyperliquid_wallet_monitor.kind",
-                "widget.hyperliquid_wallet_monitor.limit_reached",
-                "widget.hyperliquid_wallet_monitor.liquidation",
-                "widget.hyperliquid_wallet_monitor.long",
-                "widget.hyperliquid_wallet_monitor.manage_addresses",
-                "widget.hyperliquid_wallet_monitor.margin",
-                "widget.hyperliquid_wallet_monitor.mark",
-                "widget.hyperliquid_wallet_monitor.monitored_count",
-                "widget.hyperliquid_wallet_monitor.open_long",
-                "widget.hyperliquid_wallet_monitor.open_short",
-                "widget.hyperliquid_wallet_monitor.perpetual_value",
-                "widget.hyperliquid_wallet_monitor.placeholder",
-                "widget.hyperliquid_wallet_monitor.position",
-                "widget.hyperliquid_wallet_monitor.position_value",
-                "widget.hyperliquid_wallet_monitor.quantity",
-                "widget.hyperliquid_wallet_monitor.realized_pnl",
-                "widget.hyperliquid_wallet_monitor.reduce_only",
-                "widget.hyperliquid_wallet_monitor.refresh",
-                "widget.hyperliquid_wallet_monitor.remove_address",
-                "widget.hyperliquid_wallet_monitor.retry_failed",
-                "widget.hyperliquid_wallet_monitor.scroll_addresses",
-                "widget.hyperliquid_wallet_monitor.scroll_rows",
-                "widget.hyperliquid_wallet_monitor.sell",
-                "widget.hyperliquid_wallet_monitor.short",
-                "widget.hyperliquid_wallet_monitor.side",
-                "widget.hyperliquid_wallet_monitor.spot",
-                "widget.hyperliquid_wallet_monitor.spot_value",
-                "widget.hyperliquid_wallet_monitor.status",
-                "widget.hyperliquid_wallet_monitor.tab_historical_orders",
-                "widget.hyperliquid_wallet_monitor.tab_ledger",
-                "widget.hyperliquid_wallet_monitor.tab_open_orders",
-                "widget.hyperliquid_wallet_monitor.tab_perpetual",
-                "widget.hyperliquid_wallet_monitor.tab_spot",
-                "widget.hyperliquid_wallet_monitor.tab_trades",
-                "widget.hyperliquid_wallet_monitor.timeline_end",
-                "widget.hyperliquid_wallet_monitor.timeline_loading",
-                "widget.hyperliquid_wallet_monitor.timeline_marker",
-                "widget.hyperliquid_wallet_monitor.timeline_start",
-                "widget.hyperliquid_wallet_monitor.timeline_title",
-                "widget.hyperliquid_wallet_monitor.trigger_price",
-                "widget.hyperliquid_wallet_monitor.unknown",
-                "widget.hyperliquid_wallet_monitor.unrealized_pnl",
-                "widget.hyperliquid_wallet_monitor.value",
+                "widget.names.hyperliquid_wallet",
+                "widget.hyperliquid_wallet.add",
+                "widget.hyperliquid_wallet.age_days",
+                "widget.hyperliquid_wallet.age_hours",
+                "widget.hyperliquid_wallet.age_minutes",
+                "widget.hyperliquid_wallet.age_seconds",
+                "widget.hyperliquid_wallet.already_monitored",
+                "widget.hyperliquid_wallet.asset",
+                "widget.hyperliquid_wallet.asset_share",
+                "widget.hyperliquid_wallet.back",
+                "widget.hyperliquid_wallet.buy",
+                "widget.hyperliquid_wallet.close_long",
+                "widget.hyperliquid_wallet.close_short",
+                "widget.hyperliquid_wallet.coin",
+                "widget.hyperliquid_wallet.collateral",
+                "widget.hyperliquid_wallet.detail_tabs",
+                "widget.hyperliquid_wallet.empty_addresses",
+                "widget.hyperliquid_wallet.empty_monitored",
+                "widget.hyperliquid_wallet.entry",
+                "widget.hyperliquid_wallet.error_codec",
+                "widget.hyperliquid_wallet.error_dex_read",
+                "widget.hyperliquid_wallet.error_listing_missing",
+                "widget.hyperliquid_wallet.error_route_mismatch",
+                "widget.hyperliquid_wallet.error_stream_closed",
+                "widget.hyperliquid_wallet.error_subscription_buffer_full",
+                "widget.hyperliquid_wallet.error_subscription_closed",
+                "widget.hyperliquid_wallet.fee",
+                "widget.hyperliquid_wallet.funding",
+                "widget.hyperliquid_wallet.invalid_address",
+                "widget.hyperliquid_wallet.kind",
+                "widget.hyperliquid_wallet.limit_reached",
+                "widget.hyperliquid_wallet.liquidation",
+                "widget.hyperliquid_wallet.long",
+                "widget.hyperliquid_wallet.manage_addresses",
+                "widget.hyperliquid_wallet.margin",
+                "widget.hyperliquid_wallet.mark",
+                "widget.hyperliquid_wallet.monitored_count",
+                "widget.hyperliquid_wallet.open_long",
+                "widget.hyperliquid_wallet.open_short",
+                "widget.hyperliquid_wallet.perpetual_value",
+                "widget.hyperliquid_wallet.placeholder",
+                "widget.hyperliquid_wallet.position",
+                "widget.hyperliquid_wallet.position_value",
+                "widget.hyperliquid_wallet.quantity",
+                "widget.hyperliquid_wallet.realized_pnl",
+                "widget.hyperliquid_wallet.reduce_only",
+                "widget.hyperliquid_wallet.refresh",
+                "widget.hyperliquid_wallet.remove_address",
+                "widget.hyperliquid_wallet.retry_failed",
+                "widget.hyperliquid_wallet.scroll_addresses",
+                "widget.hyperliquid_wallet.scroll_rows",
+                "widget.hyperliquid_wallet.sell",
+                "widget.hyperliquid_wallet.short",
+                "widget.hyperliquid_wallet.side",
+                "widget.hyperliquid_wallet.spot",
+                "widget.hyperliquid_wallet.spot_value",
+                "widget.hyperliquid_wallet.status",
+                "widget.hyperliquid_wallet.tab_historical_orders",
+                "widget.hyperliquid_wallet.tab_ledger",
+                "widget.hyperliquid_wallet.tab_open_orders",
+                "widget.hyperliquid_wallet.tab_perpetual",
+                "widget.hyperliquid_wallet.tab_spot",
+                "widget.hyperliquid_wallet.tab_trades",
+                "widget.hyperliquid_wallet.timeline_end",
+                "widget.hyperliquid_wallet.timeline_loading",
+                "widget.hyperliquid_wallet.timeline_marker",
+                "widget.hyperliquid_wallet.timeline_start",
+                "widget.hyperliquid_wallet.timeline_title",
+                "widget.hyperliquid_wallet.trigger_price",
+                "widget.hyperliquid_wallet.unknown",
+                "widget.hyperliquid_wallet.unrealized_pnl",
+                "widget.hyperliquid_wallet.value",
                 "common.price",
                 "common.time",
                 "common.yes",
@@ -2985,19 +2975,19 @@ mod tests {
                 );
             }
             for failure in [
-                HyperliquidWalletMonitorFailure::Stream(WalletStreamError::SubscriptionClosed),
-                HyperliquidWalletMonitorFailure::Stream(WalletStreamError::StreamClosed),
-                HyperliquidWalletMonitorFailure::Stream(WalletStreamError::Data(
+                HyperliquidWalletFailure::Stream(WalletStreamError::SubscriptionClosed),
+                HyperliquidWalletFailure::Stream(WalletStreamError::StreamClosed),
+                HyperliquidWalletFailure::Stream(WalletStreamError::Data(
                     crate::model::WalletDataError::Codec { operation: "test" },
                 )),
-                HyperliquidWalletMonitorFailure::Stream(WalletStreamError::Account(
+                HyperliquidWalletFailure::Stream(WalletStreamError::Account(
                     AccountError::Protocol { operation: "test" },
                 )),
-                HyperliquidWalletMonitorFailure::Stream(WalletStreamError::DexRead {
+                HyperliquidWalletFailure::Stream(WalletStreamError::DexRead {
                     route: perpetual_route(),
                     source: AccountError::Protocol { operation: "test" },
                 }),
-                HyperliquidWalletMonitorFailure::Rpc(RpcCallError::DeadlineExceeded {
+                HyperliquidWalletFailure::Rpc(RpcCallError::DeadlineExceeded {
                     request_id: RequestId::new(1),
                 }),
             ] {
@@ -3022,15 +3012,15 @@ mod tests {
     #[test]
     fn the_widget_should_have_a_stable_identity() {
         assert_eq!(
-            HyperliquidWalletMonitorWidget::ID.as_str(),
-            "kytrix.market.hyperliquid_wallet_monitor"
+            HyperliquidWalletWidget::ID.as_str(),
+            "kytrix.hyperliquid_wallet"
         );
         assert_eq!(
-            HyperliquidWalletMonitorWidget::DISPLAY_NAME,
-            "widget.names.hyperliquid_wallet_monitor"
+            HyperliquidWalletWidget::DISPLAY_NAME,
+            "widget.names.hyperliquid_wallet"
         );
         assert_eq!(
-            HyperliquidWalletMonitorConfig::SCHEMA_VERSION,
+            HyperliquidWalletConfig::SCHEMA_VERSION,
             WidgetConfigSchemaVersion::V1
         );
     }
@@ -3042,12 +3032,12 @@ mod tests {
 
         assert_eq!(stored.schema_version(), WidgetConfigSchemaVersion::V1);
         assert_eq!(
-            stored.decode::<HyperliquidWalletMonitorConfig>(),
+            stored.decode::<HyperliquidWalletConfig>(),
             config(vec![address("1")])
         );
         assert_eq!(
-            decode_or_default::<HyperliquidWalletMonitorConfig>(None),
-            HyperliquidWalletMonitorConfig::default()
+            decode_or_default::<HyperliquidWalletConfig>(None),
+            HyperliquidWalletConfig::default()
         );
     }
 
@@ -3094,13 +3084,13 @@ mod tests {
             addresses_that_are_not_a_list,
         ] {
             assert!(
-                serde_json::from_value::<HyperliquidWalletMonitorConfig>(payload.clone()).is_err(),
+                serde_json::from_value::<HyperliquidWalletConfig>(payload.clone()).is_err(),
                 "{payload} must be refused rather than decoded into a list this build can use"
             );
             assert_eq!(
-                serde_json::from_value::<HyperliquidWalletMonitorConfig>(payload.clone())
+                serde_json::from_value::<HyperliquidWalletConfig>(payload.clone())
                     .unwrap_or_default(),
-                HyperliquidWalletMonitorConfig::default(),
+                HyperliquidWalletConfig::default(),
                 "{payload} must leave the pane on its default list"
             );
         }
@@ -3117,7 +3107,7 @@ mod tests {
                 .state(cx)
                 .notice()
                 .is_some_and(|notice| {
-                    notice == &Notice::message("widget.hyperliquid_wallet_monitor.empty_addresses")
+                    notice == &Notice::message("widget.hyperliquid_wallet.empty_addresses")
                 })
         });
 
@@ -3128,7 +3118,7 @@ mod tests {
             assert_eq!(
                 pane.status.state(cx).notice(),
                 Some(&Notice::message(
-                    "widget.hyperliquid_wallet_monitor.empty_addresses"
+                    "widget.hyperliquid_wallet.empty_addresses"
                 )),
                 "a pane with nothing to monitor is not a failure"
             );
@@ -3161,7 +3151,7 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(
                 notice.resolve(cx),
-                t!(cx, "widget.hyperliquid_wallet_monitor.empty_addresses"),
+                t!(cx, "widget.hyperliquid_wallet.empty_addresses"),
                 "the sentence is the one the catalogue answers with now"
             );
             assert_ne!(
@@ -3791,7 +3781,7 @@ mod tests {
             assert!(
                 matches!(
                     failure.as_ref(),
-                    HyperliquidWalletMonitorFailure::Stream(WalletStreamError::DexRead {
+                    HyperliquidWalletFailure::Stream(WalletStreamError::DexRead {
                         route,
                         ..
                     }) if route == &deployed
@@ -3851,7 +3841,7 @@ mod tests {
 
     /// A dialog attached to `pane`, which is what the pane reaches to repaint it.
     fn open_dialog(
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
         cx: &mut TestAppContext,
     ) -> AttachedDialog {
         let window = cx.add_empty_window();
@@ -5019,7 +5009,7 @@ mod tests {
     /// while the newer reading is waited for in the table area, and the table comes back when the
     /// newer reading lands.
     ///
-    /// Which body a frame draws is asked of the pane's own decision — [`HyperliquidWalletMonitorWidget::detail_arm`],
+    /// Which body a frame draws is asked of the pane's own decision — [`HyperliquidWalletWidget::detail_arm`],
     /// the one `detail_body` matches — rather than of a rule restated here: a copy of the rule
     /// would keep passing after the rule moved, which is exactly what this case is here to catch.
     /// What that decision led to being *painted* is then read off a frame whose cache was
@@ -5232,7 +5222,7 @@ mod tests {
     /// body is drawn again only when the pane itself is notified, so it is what makes a frame
     /// drawn without refreshing the window a question about what the pane asked for.
     struct PaneHarness {
-        pane: Entity<HyperliquidWalletMonitorWidget>,
+        pane: Entity<HyperliquidWalletWidget>,
     }
 
     impl Render for PaneHarness {
@@ -5249,7 +5239,7 @@ mod tests {
     /// drops it once its exit transition is over.
     fn dialog_window<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
     ) -> &'a mut VisualTestContext {
         let pane = pane.clone();
         let (_, window) =
@@ -5579,7 +5569,7 @@ mod tests {
             assert_eq!(
                 pane.status.state(cx).notice(),
                 Some(&Notice::message(
-                    "widget.hyperliquid_wallet_monitor.empty_addresses"
+                    "widget.hyperliquid_wallet.empty_addresses"
                 ))
             );
         });
@@ -5639,7 +5629,7 @@ mod tests {
         window.run_until_parked();
 
         let back = window
-            .debug_bounds("TEST_HYPERLIQUID_WALLET_MONITOR_BACK")
+            .debug_bounds("TEST_HYPERLIQUID_WALLET_BACK")
             .expect("an open wallet offers the way back in the header's own corner")
             .center();
         window.simulate_click(back, Modifiers::none());
@@ -5663,7 +5653,7 @@ mod tests {
     /// header is never cached, so a control in it is as fresh as the state behind it. It is mounted
     /// under the layer the application draws dialogs in, because the address control opens one.
     struct HeaderHarness {
-        pane: Entity<HyperliquidWalletMonitorWidget>,
+        pane: Entity<HyperliquidWalletWidget>,
     }
 
     impl Render for HeaderHarness {
@@ -5679,7 +5669,7 @@ mod tests {
     /// A window over a pane's own header, under the layer dialogs are drawn in.
     fn header_window<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<HyperliquidWalletMonitorWidget>,
+        pane: &Entity<HyperliquidWalletWidget>,
     ) -> &'a mut VisualTestContext {
         let pane = pane.clone();
         let (_, window) =
@@ -5708,7 +5698,7 @@ mod tests {
         let pane = pane(cx, vec![wallet()]);
         let window = header_window(cx, &pane);
 
-        press_control(window, "TEST_HYPERLIQUID_WALLET_MONITOR_MANAGE");
+        press_control(window, "TEST_HYPERLIQUID_WALLET_MANAGE");
         settle_dialog(window);
 
         assert!(
@@ -5734,12 +5724,12 @@ mod tests {
         );
         assert!(
             window
-                .debug_bounds("TEST_HYPERLIQUID_WALLET_MONITOR_MANAGE")
+                .debug_bounds("TEST_HYPERLIQUID_WALLET_MANAGE")
                 .is_some(),
             "the control is still what the header draws"
         );
 
-        press_control(window, "TEST_HYPERLIQUID_WALLET_MONITOR_MANAGE");
+        press_control(window, "TEST_HYPERLIQUID_WALLET_MANAGE");
         settle_dialog(window);
 
         assert!(

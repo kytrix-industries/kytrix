@@ -1,6 +1,6 @@
 //! Hyperliquid wallet-monitor requests and their native payloads.
 //!
-//! The position a wallet request reads is the one its `WalletMonitorTarget`
+//! The position a wallet request reads is the one its `WalletTarget`
 //! name: a public address read never resolves a trading credential, and a
 //! route-level stream carries no address at all.
 
@@ -15,7 +15,7 @@ use market_participants_model::{
 
 use crate::{
     account::shared::{OrderKind, OrderStatus},
-    protocol::WalletMonitorTarget,
+    protocol::WalletTarget,
 };
 
 /// Hyperliquid wallet query identity.
@@ -27,7 +27,7 @@ use crate::{
 /// query ever does need to travel as data, the boundary has to refuse an empty set too.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HyperliquidWalletQuery {
-    pub target: WalletMonitorTarget,
+    pub target: WalletTarget,
     /// The routes whose published catalogs may decode this query's answer.
     ///
     /// `target` decides what is validated and where the request goes; this set decides
@@ -49,7 +49,7 @@ impl HyperliquidWalletQuery {
     /// Builds a query about one public wallet address on one route.
     pub fn public(route: VenueRoute, address: WalletAddress) -> Self {
         Self {
-            target: WalletMonitorTarget::Public {
+            target: WalletTarget::Public {
                 route: route.clone(),
                 address,
             },
@@ -79,7 +79,7 @@ impl HyperliquidWalletQuery {
             });
         };
         Ok(Self {
-            target: WalletMonitorTarget::Public { route, address },
+            target: WalletTarget::Public { route, address },
             decoding_routes,
         })
     }
@@ -99,7 +99,7 @@ impl HyperliquidWalletQuery {
             });
         };
         Ok(Self {
-            target: WalletMonitorTarget::Route { route },
+            target: WalletTarget::Route { route },
             decoding_routes,
         })
     }
@@ -115,7 +115,7 @@ impl HyperliquidWalletQuery {
     }
 
     /// Returns the wallet-monitor target this query reads.
-    pub const fn wallet_target(&self) -> &WalletMonitorTarget {
+    pub const fn wallet_target(&self) -> &WalletTarget {
         &self.target
     }
 }
@@ -126,7 +126,7 @@ impl HyperliquidWalletQuery {
 /// and carries no serde derive: that is what keeps its route set unrepresentable as empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HyperliquidUserFillsByTimeQuery {
-    pub target: WalletMonitorTarget,
+    pub target: WalletTarget,
     /// The routes whose published catalogs may decode this window's answer, on the same
     /// terms as [`HyperliquidWalletQuery::decoding_routes`]: a fills window is a
     /// venue-wide read, so every monitored route's listings may appear in it. Private for
@@ -160,7 +160,7 @@ impl HyperliquidUserFillsByTimeQuery {
             });
         };
         Ok(Self {
-            target: WalletMonitorTarget::Public { route, address },
+            target: WalletTarget::Public { route, address },
             decoding_routes,
             start_timestamp,
             end_timestamp,
@@ -200,7 +200,7 @@ impl HyperliquidUserFillsByTimeQuery {
     }
 
     /// Returns the wallet-monitor target this query reads.
-    pub const fn wallet_target(&self) -> &WalletMonitorTarget {
+    pub const fn wallet_target(&self) -> &WalletTarget {
         &self.target
     }
 }

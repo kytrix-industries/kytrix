@@ -1,4 +1,4 @@
-//! What a Hyperliquid wallet monitor asks the venue for, and how it keeps the answer current.
+//! What a Hyperliquid wallet asks the venue for, and how it keeps the answer current.
 //!
 //! # What one stream is about
 //!
@@ -159,26 +159,26 @@ impl LocalizedError for WalletStreamError {
                 capacity,
             } => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_subscription_buffer_full",
+                "widget.hyperliquid_wallet.error_subscription_buffer_full",
                 market = market,
                 operation = operation,
                 capacity = capacity
             ),
             Self::DexRead { route, source } => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_dex_read",
+                "widget.hyperliquid_wallet.error_dex_read",
                 market = market,
                 dex = route_display_string(route, cx),
                 cause = source.localized_message(cx)
             ),
             Self::SubscriptionClosed => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_subscription_closed",
+                "widget.hyperliquid_wallet.error_subscription_closed",
                 market = market
             ),
             Self::StreamClosed => t!(
                 cx,
-                "widget.hyperliquid_wallet_monitor.error_stream_closed",
+                "widget.hyperliquid_wallet.error_stream_closed",
                 market = market
             ),
         }
@@ -404,7 +404,7 @@ pub(crate) fn loaded_scopes(venues: &LoadedVenues) -> Vec<WalletScope> {
             monitors_wallets: entry
                 .capabilities
                 .iter()
-                .any(|support| support.capability == CapabilityId::WalletMonitor),
+                .any(|support| support.capability == CapabilityId::Wallet),
             provides_catalog: entry.catalog_source.is_some(),
         })
         .collect()

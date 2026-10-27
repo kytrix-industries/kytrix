@@ -92,6 +92,15 @@ error:
   coin_market_cap_fear_and_greed_index:
     score_out_of_range: 恐惧与贪婪接口返回了无效分值：%{value}
     stream_unavailable: 恐惧与贪婪服务未接受刷新请求
+  cryptocurrency_etf:
+    duplicate_date: 'ETF 日期重复：%{value}'
+    invalid_date: 'ETF 日期无效：%{value}'
+    invalid_number: 'ETF 数值无效：%{value}'
+    no_data: ETF 数据中没有交易日
+    non_finite: ETF 数据中包含非有限值
+    stream_unavailable: ETF 数据流不可用
+    timeout: ETF 请求在 %{seconds} 秒后超时
+    too_many_rows: ETF 数据超过 %{maximum} 个交易日的历史上限
   display:
     display_unavailable: 显示不可用
     generation_mismatch: '该操作针对 %{expected}，但实际读取到 %{actual}'
@@ -116,20 +125,11 @@ error:
     normal: 远端正常关闭连接
     proxy_changed: 代理配置已改变
     server_closed: 服务器关闭连接（%{code}）：%{reason}
-  etf:
-    duplicate_date: 'ETF 日期重复：%{value}'
-    invalid_date: 'ETF 日期无效：%{value}'
-    invalid_number: 'ETF 数值无效：%{value}'
-    no_data: ETF 数据中没有交易日
-    non_finite: ETF 数据中包含非有限值
-    stream_unavailable: ETF 数据流不可用
-    timeout: ETF 请求在 %{seconds} 秒后超时
-    too_many_rows: ETF 数据超过 %{maximum} 个交易日的历史上限
   financial_calendar:
     invalid_timestamp: '财经日历中包含无法对应日期的时刻：%{value}'
     refresh_already_waiting: 财经日历已有一次刷新在等待
     stream_unavailable: 财经日历数据流不可用
-  hormuz_vessel_map:
+  global_shipping_chokepoint:
     map_asset: 内置海岸线数据无法读取，地图无法绘制
   market_participants:
     authentication_failed: '%{venue} 市场参与者账户认证失败：%{cause}'
@@ -469,7 +469,7 @@ error:
     stream_unavailable: 成交量热力图数据流不可用
     timeout: 成交量热力图请求在 %{seconds} 秒后超时
     too_many_tickers: '%{route} 返回了 %{count} 条 ticker，超过热力图可用的 %{limit} 条上限'
-  cryptocurrency_wallet_monitoring:
+  cryptocurrency_wallet_monitor:
     account_changed: 钱包账户会话已变更
     closed: 钱包账户会话已关闭
     invalid_response: 钱包 API 返回了无效数据
@@ -572,9 +572,7 @@ widget:
     yearly_high: 年度最高值（%{date}）
     yearly_low: 年度最低值（%{date}）
     yesterday: 昨天
-  empty:
-    hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
-  etf:
+  cryptocurrency_etf:
     all: 全部
     asset: ETF 币种
     chart: ETF 图表
@@ -594,6 +592,8 @@ widget:
     time_window: ETF 时间范围
     total_net_assets: 总净资产
     value: '%{label}：%{value}'
+  empty:
+    hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
   financial_calendar:
     country: 国家
     day_label: '%{year}年%{month}%{day}日 %{weekday}'
@@ -624,7 +624,7 @@ widget:
       wednesday: 星期三
   force_orders:
     table: 来自 %{markets} 的实时强平订单
-  hormuz_vessel_map:
+  global_shipping_chokepoint:
     entitlement_required: 当前账户不包含 AIS 船舶数据订阅
     hover:
       call_sign: 呼号
@@ -700,7 +700,7 @@ widget:
     vessel_count_one: 1 艘
     view_plans: 查看订阅方案
     waiting_data: 等待首批船位数据
-  hyperliquid_wallet_monitor:
+  hyperliquid_wallet:
     add: 添加监控地址
     age_days: '%{value} 天前'
     age_hours: '%{value} 小时前'
@@ -806,13 +806,13 @@ widget:
   names:
     candlestick: K 线
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
+    cryptocurrency_etf: 加密货币ETF
     empty: 空白
-    etf_flow: ETF 资金流
     financial_calendar: 财经日历
     financial_indices: 指数
     force_orders: 强平订单流
-    hormuz_vessel_map: 霍尔木兹海峡船舶地图
-    hyperliquid_wallet_monitor: Hyperliquid 钱包监控
+    global_shipping_chokepoint: 全球关键航道
+    hyperliquid_wallet: Hyperliquid 钱包
     long_short_account_ratio: 多空账户比
     market_trades: 市场成交
     news: 新闻
@@ -823,9 +823,9 @@ widget:
     top_trader_account_ratio: 大户账户多空比
     top_trader_position_ratio: 大户持仓多空比
     volume_heatmap: 成交量热力图
-    cryptocurrency_wallet_monitoring: 加密货币钱包监控
+    cryptocurrency_wallet_monitor: 加密货币钱包监控
     watch_list: 自选列表
-    x_account_monitoring: 推文监控
+    x: X
   news:
     crypto: 加密货币
     disable_sound: 禁止提示音
@@ -877,7 +877,7 @@ widget:
     short_positions: 空头持仓
     value: 价值
     volume: 成交量
-  x_account_monitoring:
+  x:
     account_id: 'X 用户 ID：%{id}'
     active: 已激活
     add_account: 增加新账号
@@ -921,7 +921,7 @@ widget:
   volume_heatmap:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
-  cryptocurrency_wallet_monitoring:
+  cryptocurrency_wallet_monitor:
     active: 已激活
     add_address: 添加钱包地址
     add_success: 钱包地址添加成功
@@ -1138,7 +1138,7 @@ settings_ui:
     username_required: 请输入用户名
     venue_description: 该场所的请求走这条线路，未指定时跟随默认线路
     venue_section: 场所
-    x_account_monitoring_media_group: 媒体
+    x_media_group: 媒体
     x_section: X（Twitter）
   save_failed:
     message: <p align="center">设置未能写入磁盘：%{reason}</p>

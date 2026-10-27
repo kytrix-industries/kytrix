@@ -78,7 +78,7 @@ use super::{
         WalletProtocol, WalletSource, WalletStatus, WalletStreamKey, WalletStreamMessage,
         WalletSubscription,
     },
-    view::HyperliquidWalletMonitorConfig,
+    view::HyperliquidWalletConfig,
 };
 
 /// The venue every test route belongs to.
@@ -1543,8 +1543,8 @@ pub(super) fn deployed_route() -> VenueRoute {
 }
 
 /// The config that follows the given addresses.
-pub(super) fn config(addresses: Vec<WalletAddress>) -> HyperliquidWalletMonitorConfig {
-    HyperliquidWalletMonitorConfig::monitoring(addresses)
+pub(super) fn config(addresses: Vec<WalletAddress>) -> HyperliquidWalletConfig {
+    HyperliquidWalletConfig::monitoring(addresses)
 }
 
 /// One overview reading a test can hand to a pane.

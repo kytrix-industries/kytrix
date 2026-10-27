@@ -160,7 +160,7 @@ pub struct NewsWidget {
 impl WidgetView for NewsWidget {
     type Config = NewsConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.news");
+    const ID: WidgetId = WidgetId::new_static("kytrix.news");
     const DISPLAY_NAME: &'static str = "widget.names.news";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Live news from the local NewsStream service";
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn the_widget_should_have_a_stable_identity() {
-        assert_eq!(NewsWidget::ID.as_str(), "kytrix.market.news");
+        assert_eq!(NewsWidget::ID.as_str(), "kytrix.news");
         assert_eq!(NewsWidget::DISPLAY_NAME, "widget.names.news");
         assert_eq!(NewsConfig::SCHEMA_VERSION, WidgetConfigSchemaVersion::V1);
     }

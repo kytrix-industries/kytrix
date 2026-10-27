@@ -13,8 +13,8 @@ use smol_str::SmolStr;
 use thiserror::Error;
 
 use crate::service::engine::{ErrorCode, KytrixServiceError, RpcCallError};
-pub const MAX_CRYPTOCURRENCY_WALLET_MONITORING_SELECTIONS: usize = 5_000;
-pub const MAX_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_BYTES: usize = 44;
+pub const MAX_CRYPTOCURRENCY_WALLET_MONITOR_SELECTIONS: usize = 5_000;
+pub const MAX_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_BYTES: usize = 44;
 pub(super) const MAX_TRANSFER_AMOUNT_BYTES: usize = 334;
 const MAX_TRANSFER_FRACTION_DIGITS: usize = 255;
 pub(super) const MAX_ETHEREUM_INTEGER: &str =
@@ -22,7 +22,7 @@ pub(super) const MAX_ETHEREUM_INTEGER: &str =
 pub(super) const MAX_SOLANA_INTEGER: &str = "18446744073709551615";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CryptocurrencyWalletMonitoringNetwork {
+pub enum CryptocurrencyWalletMonitorNetwork {
     #[serde(rename = "ethereum")]
     Ethereum,
     #[serde(rename = "solana")]
@@ -30,7 +30,7 @@ pub enum CryptocurrencyWalletMonitoringNetwork {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-pub enum CryptocurrencyWalletMonitoringSelectionStatus {
+pub enum CryptocurrencyWalletMonitorSelectionStatus {
     #[serde(rename = "active")]
     Active,
     #[serde(rename = "paused")]
@@ -38,114 +38,112 @@ pub enum CryptocurrencyWalletMonitoringSelectionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct CryptocurrencyWalletMonitoringSelection {
-    pub network: CryptocurrencyWalletMonitoringNetwork,
+pub struct CryptocurrencyWalletMonitorSelection {
+    pub network: CryptocurrencyWalletMonitorNetwork,
     pub address: SmolStr,
-    pub status: CryptocurrencyWalletMonitoringSelectionStatus,
+    pub status: CryptocurrencyWalletMonitorSelectionStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct CryptocurrencyWalletMonitoringSelectionsResponse {
-    pub selections: Vec<CryptocurrencyWalletMonitoringSelection>,
+pub struct CryptocurrencyWalletMonitorSelectionsResponse {
+    pub selections: Vec<CryptocurrencyWalletMonitorSelection>,
     pub cryptocurrency_wallet_monitoring_address_limit: usize,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum CryptocurrencyWalletMonitoringApiError {
-    #[error("the cryptocurrency_wallet_monitoring address is invalid")]
+pub enum CryptocurrencyWalletMonitorApiError {
+    #[error("the cryptocurrency_wallet_monitor address is invalid")]
     InvalidAddress,
-    #[error(
-        "the cryptocurrency_wallet_monitoring address is already selected or the quota is full"
-    )]
+    #[error("the cryptocurrency_wallet_monitor address is already selected or the quota is full")]
     Conflict,
-    #[error("the cryptocurrency_wallet_monitoring selection was not found")]
+    #[error("the cryptocurrency_wallet_monitor selection was not found")]
     NotFound,
-    #[error("cryptocurrency_wallet_monitoring monitoring is unavailable")]
+    #[error("cryptocurrency_wallet_monitor is unavailable")]
     Unavailable,
-    #[error("CryptocurrencyWalletMonitoring API authentication failed")]
+    #[error("CryptocurrencyWalletMonitor API authentication failed")]
     Authentication,
-    #[error("CryptocurrencyWalletMonitoring API request failed: {0}")]
+    #[error("CryptocurrencyWalletMonitor API request failed: {0}")]
     Network(SmolStr),
-    #[error("CryptocurrencyWalletMonitoring API service error: {0}")]
+    #[error("CryptocurrencyWalletMonitor API service error: {0}")]
     Service(KytrixServiceError),
-    #[error("CryptocurrencyWalletMonitoring API transport error: {0}")]
+    #[error("CryptocurrencyWalletMonitor API transport error: {0}")]
     Transport(TransportError),
-    #[error("CryptocurrencyWalletMonitoring API protocol error: {0}")]
+    #[error("CryptocurrencyWalletMonitor API protocol error: {0}")]
     Protocol(SmolStr),
-    #[error("CryptocurrencyWalletMonitoring API response is too large")]
+    #[error("CryptocurrencyWalletMonitor API response is too large")]
     ResponseTooLarge,
-    #[error("CryptocurrencyWalletMonitoring API returned invalid data")]
+    #[error("CryptocurrencyWalletMonitor API returned invalid data")]
     InvalidResponse,
-    #[error("CryptocurrencyWalletMonitoring API returned HTTP {0}")]
+    #[error("CryptocurrencyWalletMonitor API returned HTTP {0}")]
     Server(StatusCode),
-    #[error("CryptocurrencyWalletMonitoring API request timed out")]
+    #[error("CryptocurrencyWalletMonitor API request timed out")]
     Timeout,
-    #[error("CryptocurrencyWalletMonitoring API account session is closed")]
+    #[error("CryptocurrencyWalletMonitor API account session is closed")]
     Closed,
-    #[error("CryptocurrencyWalletMonitoring API account session changed")]
+    #[error("CryptocurrencyWalletMonitor API account session changed")]
     AccountChanged,
-    #[error("cryptocurrency_wallet_monitoring monitor account session is not ready")]
+    #[error("cryptocurrency_wallet_monitor account session is not ready")]
     NotReady,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum CryptocurrencyWalletMonitoringMutationUnknown {
-    #[error("the cryptocurrency_wallet_monitoring mutation timed out")]
+pub enum CryptocurrencyWalletMonitorMutationUnknown {
+    #[error("the cryptocurrency_wallet_monitor mutation timed out")]
     Timeout,
-    #[error("the cryptocurrency_wallet_monitoring mutation transport result is unknown")]
+    #[error("the cryptocurrency_wallet_monitor mutation transport result is unknown")]
     Transport,
-    #[error("the cryptocurrency_wallet_monitoring mutation response was lost")]
+    #[error("the cryptocurrency_wallet_monitor mutation response was lost")]
     ResponseLost,
-    #[error("the cryptocurrency_wallet_monitoring mutation response was invalid")]
+    #[error("the cryptocurrency_wallet_monitor mutation response was invalid")]
     InvalidResponse,
-    #[error("the cryptocurrency_wallet_monitoring mutation returned HTTP {0}")]
+    #[error("the cryptocurrency_wallet_monitor mutation returned HTTP {0}")]
     Server(StatusCode),
-    #[error("the cryptocurrency_wallet_monitoring mutation account session changed")]
+    #[error("the cryptocurrency_wallet_monitor mutation account session changed")]
     AccountChanged,
-    #[error("the cryptocurrency_wallet_monitoring mutation service closed")]
+    #[error("the cryptocurrency_wallet_monitor mutation service closed")]
     ServiceClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CryptocurrencyWalletMonitoringMutationOutcome<T> {
+pub enum CryptocurrencyWalletMonitorMutationOutcome<T> {
     Confirmed(T),
-    Rejected(CryptocurrencyWalletMonitoringApiError),
-    Unknown(CryptocurrencyWalletMonitoringMutationUnknown),
+    Rejected(CryptocurrencyWalletMonitorApiError),
+    Unknown(CryptocurrencyWalletMonitorMutationUnknown),
 }
 
-pub(super) fn decode_cryptocurrency_wallet_monitoring_selection(
+pub(super) fn decode_cryptocurrency_wallet_monitor_selection(
     selection: ProtoCryptocurrencyWalletMonitoringSelection,
-) -> Result<CryptocurrencyWalletMonitoringSelection, CryptocurrencyWalletMonitoringApiError> {
+) -> Result<CryptocurrencyWalletMonitorSelection, CryptocurrencyWalletMonitorApiError> {
     let network = match ProtoCryptocurrencyWalletMonitoringNetwork::try_from(selection.network)
-        .map_err(|_| CryptocurrencyWalletMonitoringApiError::InvalidResponse)?
+        .map_err(|_| CryptocurrencyWalletMonitorApiError::InvalidResponse)?
     {
         ProtoCryptocurrencyWalletMonitoringNetwork::Ethereum => {
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         }
         ProtoCryptocurrencyWalletMonitoringNetwork::Solana => {
-            CryptocurrencyWalletMonitoringNetwork::Solana
+            CryptocurrencyWalletMonitorNetwork::Solana
         }
         ProtoCryptocurrencyWalletMonitoringNetwork::Unspecified => {
-            return Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse);
+            return Err(CryptocurrencyWalletMonitorApiError::InvalidResponse);
         }
     };
     let status =
         match ProtoCryptocurrencyWalletMonitoringSelectionStatus::try_from(selection.status)
-            .map_err(|_| CryptocurrencyWalletMonitoringApiError::InvalidResponse)?
+            .map_err(|_| CryptocurrencyWalletMonitorApiError::InvalidResponse)?
         {
             ProtoCryptocurrencyWalletMonitoringSelectionStatus::Active => {
-                CryptocurrencyWalletMonitoringSelectionStatus::Active
+                CryptocurrencyWalletMonitorSelectionStatus::Active
             }
             ProtoCryptocurrencyWalletMonitoringSelectionStatus::Paused => {
-                CryptocurrencyWalletMonitoringSelectionStatus::Paused
+                CryptocurrencyWalletMonitorSelectionStatus::Paused
             }
             ProtoCryptocurrencyWalletMonitoringSelectionStatus::Unspecified => {
-                return Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse);
+                return Err(CryptocurrencyWalletMonitorApiError::InvalidResponse);
             }
         };
-    let value = CryptocurrencyWalletMonitoringSelection {
+    let value = CryptocurrencyWalletMonitorSelection {
         network,
         address: selection.address.into(),
         status,
@@ -156,114 +154,112 @@ pub(super) fn decode_cryptocurrency_wallet_monitoring_selection(
     Ok(value)
 }
 
-pub(super) fn map_rpc_error(error: KytrixServiceError) -> CryptocurrencyWalletMonitoringApiError {
+pub(super) fn map_rpc_error(error: KytrixServiceError) -> CryptocurrencyWalletMonitorApiError {
     match error {
         KytrixServiceError::Server(ErrorCode::RateLimit) => {
-            CryptocurrencyWalletMonitoringApiError::Server(StatusCode::TOO_MANY_REQUESTS)
+            CryptocurrencyWalletMonitorApiError::Server(StatusCode::TOO_MANY_REQUESTS)
         }
         KytrixServiceError::Server(ErrorCode::InvalidArgument) => {
-            CryptocurrencyWalletMonitoringApiError::InvalidAddress
+            CryptocurrencyWalletMonitorApiError::InvalidAddress
         }
         KytrixServiceError::Server(ErrorCode::NotFound) => {
-            CryptocurrencyWalletMonitoringApiError::NotFound
+            CryptocurrencyWalletMonitorApiError::NotFound
         }
         KytrixServiceError::Server(ErrorCode::QuotaExceeded) => {
-            CryptocurrencyWalletMonitoringApiError::Conflict
+            CryptocurrencyWalletMonitorApiError::Conflict
         }
         KytrixServiceError::Server(ErrorCode::Timeout) | KytrixServiceError::Timeout => {
-            CryptocurrencyWalletMonitoringApiError::Timeout
+            CryptocurrencyWalletMonitorApiError::Timeout
         }
         KytrixServiceError::Server(ErrorCode::NotReady) => {
-            CryptocurrencyWalletMonitoringApiError::NotReady
+            CryptocurrencyWalletMonitorApiError::NotReady
         }
-        KytrixServiceError::Server(_) => CryptocurrencyWalletMonitoringApiError::Unavailable,
+        KytrixServiceError::Server(_) => CryptocurrencyWalletMonitorApiError::Unavailable,
         KytrixServiceError::Authentication(_) | KytrixServiceError::AccountChanged => {
-            CryptocurrencyWalletMonitoringApiError::Authentication
+            CryptocurrencyWalletMonitorApiError::Authentication
         }
-        KytrixServiceError::Closed => CryptocurrencyWalletMonitoringApiError::Closed,
-        other => CryptocurrencyWalletMonitoringApiError::Service(other),
+        KytrixServiceError::Closed => CryptocurrencyWalletMonitorApiError::Closed,
+        other => CryptocurrencyWalletMonitorApiError::Service(other),
     }
 }
 
 pub(super) fn mutation_rpc_error<T>(
     error: RpcCallError,
-) -> CryptocurrencyWalletMonitoringMutationOutcome<T> {
+) -> CryptocurrencyWalletMonitorMutationOutcome<T> {
     let (error, possibly_submitted) = error.into_parts();
     if !possibly_submitted {
-        return CryptocurrencyWalletMonitoringMutationOutcome::Rejected(map_rpc_error(error));
+        return CryptocurrencyWalletMonitorMutationOutcome::Rejected(map_rpc_error(error));
     }
     match error {
         KytrixServiceError::Server(ErrorCode::Timeout) | KytrixServiceError::Timeout => {
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::Timeout,
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::Timeout,
             )
         }
-        KytrixServiceError::Closed => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-            CryptocurrencyWalletMonitoringMutationUnknown::ServiceClosed,
+        KytrixServiceError::Closed => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+            CryptocurrencyWalletMonitorMutationUnknown::ServiceClosed,
         ),
         KytrixServiceError::AccountChanged | KytrixServiceError::Authentication(_) => {
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::AccountChanged,
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::AccountChanged,
             )
         }
         KytrixServiceError::Server(ErrorCode::MutationUnknown) => {
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::ResponseLost,
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::ResponseLost,
             )
         }
         KytrixServiceError::Disconnected
         | KytrixServiceError::Read(_)
         | KytrixServiceError::Protocol(_)
-        | KytrixServiceError::RouteChanged => {
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::ResponseLost,
-            )
-        }
-        KytrixServiceError::Write(_) => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-            CryptocurrencyWalletMonitoringMutationUnknown::Transport,
+        | KytrixServiceError::RouteChanged => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+            CryptocurrencyWalletMonitorMutationUnknown::ResponseLost,
         ),
-        error => CryptocurrencyWalletMonitoringMutationOutcome::Rejected(map_rpc_error(error)),
+        KytrixServiceError::Write(_) => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+            CryptocurrencyWalletMonitorMutationUnknown::Transport,
+        ),
+        error => CryptocurrencyWalletMonitorMutationOutcome::Rejected(map_rpc_error(error)),
     }
 }
 
 pub(super) fn validate_selections(
-    response: &CryptocurrencyWalletMonitoringSelectionsResponse,
-) -> Result<(), CryptocurrencyWalletMonitoringApiError> {
-    if !(0..=MAX_CRYPTOCURRENCY_WALLET_MONITORING_SELECTIONS)
+    response: &CryptocurrencyWalletMonitorSelectionsResponse,
+) -> Result<(), CryptocurrencyWalletMonitorApiError> {
+    if !(0..=MAX_CRYPTOCURRENCY_WALLET_MONITOR_SELECTIONS)
         .contains(&response.cryptocurrency_wallet_monitoring_address_limit)
-        || response.selections.len() > MAX_CRYPTOCURRENCY_WALLET_MONITORING_SELECTIONS
+        || response.selections.len() > MAX_CRYPTOCURRENCY_WALLET_MONITOR_SELECTIONS
     {
-        return Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse);
+        return Err(CryptocurrencyWalletMonitorApiError::InvalidResponse);
     }
     let mut addresses = AHashSet::with_capacity(response.selections.len());
     for selection in &response.selections {
         validate_selection(selection)?;
         if !addresses.insert((selection.network, selection.address.as_str())) {
-            return Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse);
+            return Err(CryptocurrencyWalletMonitorApiError::InvalidResponse);
         }
     }
     Ok(())
 }
 
 fn validate_selection(
-    selection: &CryptocurrencyWalletMonitoringSelection,
-) -> Result<(), CryptocurrencyWalletMonitoringApiError> {
-    if cryptocurrency_wallet_monitoring_network(&selection.address) != Some(selection.network)
+    selection: &CryptocurrencyWalletMonitorSelection,
+) -> Result<(), CryptocurrencyWalletMonitorApiError> {
+    if cryptocurrency_wallet_monitor_network(&selection.address) != Some(selection.network)
         || selection.created_at <= 0
         || selection.updated_at < selection.created_at
     {
-        return Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse);
+        return Err(CryptocurrencyWalletMonitorApiError::InvalidResponse);
     }
     Ok(())
 }
 
-pub(super) fn sort_selections(selections: &mut [CryptocurrencyWalletMonitoringSelection]) {
-    selections.sort_by(compare_cryptocurrency_wallet_monitoring_selections);
+pub(super) fn sort_selections(selections: &mut [CryptocurrencyWalletMonitorSelection]) {
+    selections.sort_by(compare_cryptocurrency_wallet_monitor_selections);
 }
 
-pub fn compare_cryptocurrency_wallet_monitoring_selections(
-    left: &CryptocurrencyWalletMonitoringSelection,
-    right: &CryptocurrencyWalletMonitoringSelection,
+pub fn compare_cryptocurrency_wallet_monitor_selections(
+    left: &CryptocurrencyWalletMonitorSelection,
+    right: &CryptocurrencyWalletMonitorSelection,
 ) -> Ordering {
     right
         .updated_at
@@ -273,10 +269,10 @@ pub fn compare_cryptocurrency_wallet_monitoring_selections(
         .then_with(|| left.address.cmp(&right.address))
 }
 
-pub fn cryptocurrency_wallet_monitoring_network(
+pub fn cryptocurrency_wallet_monitor_network(
     value: &str,
-) -> Option<CryptocurrencyWalletMonitoringNetwork> {
-    if value.len() > MAX_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_BYTES {
+) -> Option<CryptocurrencyWalletMonitorNetwork> {
+    if value.len() > MAX_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_BYTES {
         return None;
     }
     if value.len() == 42
@@ -285,17 +281,17 @@ pub fn cryptocurrency_wallet_monitoring_network(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        return Some(CryptocurrencyWalletMonitoringNetwork::Ethereum);
+        return Some(CryptocurrencyWalletMonitorNetwork::Ethereum);
     }
     let mut key = [0_u8; 32];
     (bs58::decode(value).onto(&mut key).ok() == Some(key.len())
         && bs58::encode(key).into_string() == value)
-        .then_some(CryptocurrencyWalletMonitoringNetwork::Solana)
+        .then_some(CryptocurrencyWalletMonitorNetwork::Solana)
 }
 
 pub(super) fn valid_transfer_amount(
     value: &str,
-    network: CryptocurrencyWalletMonitoringNetwork,
+    network: CryptocurrencyWalletMonitorNetwork,
 ) -> bool {
     if value.is_empty() || value.len() > MAX_TRANSFER_AMOUNT_BYTES || value.starts_with('-') {
         return false;
@@ -311,8 +307,8 @@ pub(super) fn valid_transfer_amount(
         return false;
     }
     let maximum = match network {
-        CryptocurrencyWalletMonitoringNetwork::Ethereum => MAX_ETHEREUM_INTEGER,
-        CryptocurrencyWalletMonitoringNetwork::Solana => MAX_SOLANA_INTEGER,
+        CryptocurrencyWalletMonitorNetwork::Ethereum => MAX_ETHEREUM_INTEGER,
+        CryptocurrencyWalletMonitorNetwork::Solana => MAX_SOLANA_INTEGER,
     };
     if integer.len() > maximum.len()
         || (integer.len() == maximum.len() && integer > maximum)
@@ -332,22 +328,22 @@ pub(super) fn valid_transfer_amount(
 #[cfg(test)]
 mod tests {
     use super::{
-        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationOutcome,
-        CryptocurrencyWalletMonitoringMutationUnknown, CryptocurrencyWalletMonitoringNetwork,
-        CryptocurrencyWalletMonitoringSelection, CryptocurrencyWalletMonitoringSelectionStatus,
-        CryptocurrencyWalletMonitoringSelectionsResponse, ErrorCode, KytrixServiceError,
-        MAX_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_BYTES,
-        MAX_CRYPTOCURRENCY_WALLET_MONITORING_SELECTIONS, MAX_ETHEREUM_INTEGER, MAX_SOLANA_INTEGER,
-        RpcCallError, cryptocurrency_wallet_monitoring_network, map_rpc_error, mutation_rpc_error,
+        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
+        CryptocurrencyWalletMonitorMutationUnknown, CryptocurrencyWalletMonitorNetwork,
+        CryptocurrencyWalletMonitorSelection, CryptocurrencyWalletMonitorSelectionStatus,
+        CryptocurrencyWalletMonitorSelectionsResponse, ErrorCode, KytrixServiceError,
+        MAX_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_BYTES,
+        MAX_CRYPTOCURRENCY_WALLET_MONITOR_SELECTIONS, MAX_ETHEREUM_INTEGER, MAX_SOLANA_INTEGER,
+        RpcCallError, cryptocurrency_wallet_monitor_network, map_rpc_error, mutation_rpc_error,
         sort_selections, valid_transfer_amount, validate_selections,
     };
 
     fn selection(
         address: &str,
-        status: CryptocurrencyWalletMonitoringSelectionStatus,
-    ) -> CryptocurrencyWalletMonitoringSelection {
-        CryptocurrencyWalletMonitoringSelection {
-            network: CryptocurrencyWalletMonitoringNetwork::Ethereum,
+        status: CryptocurrencyWalletMonitorSelectionStatus,
+    ) -> CryptocurrencyWalletMonitorSelection {
+        CryptocurrencyWalletMonitorSelection {
+            network: CryptocurrencyWalletMonitorNetwork::Ethereum,
             address: address.into(),
             status,
             created_at: 1,
@@ -359,72 +355,72 @@ mod tests {
     fn rpc_errors_preserve_conflict_and_unknown_mutation_semantics() {
         assert_eq!(
             map_rpc_error(KytrixServiceError::Server(ErrorCode::QuotaExceeded)),
-            CryptocurrencyWalletMonitoringApiError::Conflict
+            CryptocurrencyWalletMonitorApiError::Conflict
         );
         assert_eq!(
             mutation_rpc_error::<()>(RpcCallError {
                 error: KytrixServiceError::Server(ErrorCode::MutationUnknown),
                 possibly_submitted: true,
             }),
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::ResponseLost
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::ResponseLost
             )
         );
         assert_eq!(
             mutation_rpc_error::<()>(RpcCallError::not_submitted(KytrixServiceError::Timeout)),
-            CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitoringApiError::Timeout
+            CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitorApiError::Timeout
             )
         );
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitoring_contract_validates_canonical_addresses_and_amounts() {
+    fn cryptocurrency_wallet_monitor_contract_validates_canonical_addresses_and_amounts() {
         assert_eq!(
-            cryptocurrency_wallet_monitoring_network("0x0123456789abcdef0123456789abcdef01234567"),
-            Some(CryptocurrencyWalletMonitoringNetwork::Ethereum)
+            cryptocurrency_wallet_monitor_network("0x0123456789abcdef0123456789abcdef01234567"),
+            Some(CryptocurrencyWalletMonitorNetwork::Ethereum)
         );
         assert_eq!(
-            cryptocurrency_wallet_monitoring_network("11111111111111111111111111111111"),
-            Some(CryptocurrencyWalletMonitoringNetwork::Solana)
+            cryptocurrency_wallet_monitor_network("11111111111111111111111111111111"),
+            Some(CryptocurrencyWalletMonitorNetwork::Solana)
         );
         assert!(
-            cryptocurrency_wallet_monitoring_network(
-                &"1".repeat(MAX_CRYPTOCURRENCY_WALLET_MONITORING_ADDRESS_BYTES + 1)
+            cryptocurrency_wallet_monitor_network(
+                &"1".repeat(MAX_CRYPTOCURRENCY_WALLET_MONITOR_ADDRESS_BYTES + 1)
             )
             .is_none()
         );
         assert!(
-            cryptocurrency_wallet_monitoring_network("0x0123456789ABCDEF0123456789abcdef01234567")
+            cryptocurrency_wallet_monitor_network("0x0123456789ABCDEF0123456789abcdef01234567")
                 .is_none()
         );
         assert!(valid_transfer_amount(
             "100.000001",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
         assert!(!valid_transfer_amount(
             "1e6",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
         assert!(!valid_transfer_amount(
             "01",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
         assert!(!valid_transfer_amount(
             "1.0",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
         assert!(!valid_transfer_amount(
             "-1",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitoring_contract_accepts_canonical_zero_amount() {
+    fn cryptocurrency_wallet_monitor_contract_accepts_canonical_zero_amount() {
         assert!(valid_transfer_amount(
             "0",
-            CryptocurrencyWalletMonitoringNetwork::Ethereum
+            CryptocurrencyWalletMonitorNetwork::Ethereum
         ));
     }
 
@@ -432,7 +428,7 @@ mod tests {
     fn ethereum_maximum_integer_rejects_a_fraction() {
         assert!(!valid_transfer_amount(
             &format!("{MAX_ETHEREUM_INTEGER}.1"),
-            CryptocurrencyWalletMonitoringNetwork::Ethereum,
+            CryptocurrencyWalletMonitorNetwork::Ethereum,
         ));
     }
 
@@ -440,14 +436,14 @@ mod tests {
     fn solana_maximum_integer_rejects_a_fraction() {
         assert!(!valid_transfer_amount(
             &format!("{MAX_SOLANA_INTEGER}.1"),
-            CryptocurrencyWalletMonitoringNetwork::Solana,
+            CryptocurrencyWalletMonitorNetwork::Solana,
         ));
     }
 
     #[test]
     fn selection_contract_accepts_a_zero_limit() {
         assert_eq!(
-            validate_selections(&CryptocurrencyWalletMonitoringSelectionsResponse {
+            validate_selections(&CryptocurrencyWalletMonitorSelectionsResponse {
                 selections: Vec::new(),
                 cryptocurrency_wallet_monitoring_address_limit: 0,
             }),
@@ -458,15 +454,15 @@ mod tests {
     #[test]
     fn selection_contract_accepts_paused_history_above_the_current_limit() {
         assert_eq!(
-            validate_selections(&CryptocurrencyWalletMonitoringSelectionsResponse {
+            validate_selections(&CryptocurrencyWalletMonitorSelectionsResponse {
                 selections: vec![
                     selection(
                         "0x0123456789abcdef0123456789abcdef01234567",
-                        CryptocurrencyWalletMonitoringSelectionStatus::Paused,
+                        CryptocurrencyWalletMonitorSelectionStatus::Paused,
                     ),
                     selection(
                         "0x89abcdef0123456789abcdef0123456789abcdef",
-                        CryptocurrencyWalletMonitoringSelectionStatus::Paused,
+                        CryptocurrencyWalletMonitorSelectionStatus::Paused,
                     ),
                 ],
                 cryptocurrency_wallet_monitoring_address_limit: 1,
@@ -478,22 +474,22 @@ mod tests {
     #[test]
     fn selection_contract_rejects_a_limit_above_the_process_bound() {
         assert_eq!(
-            validate_selections(&CryptocurrencyWalletMonitoringSelectionsResponse {
+            validate_selections(&CryptocurrencyWalletMonitorSelectionsResponse {
                 selections: Vec::new(),
                 cryptocurrency_wallet_monitoring_address_limit:
-                    MAX_CRYPTOCURRENCY_WALLET_MONITORING_SELECTIONS + 1,
+                    MAX_CRYPTOCURRENCY_WALLET_MONITOR_SELECTIONS + 1,
             }),
-            Err(CryptocurrencyWalletMonitoringApiError::InvalidResponse)
+            Err(CryptocurrencyWalletMonitorApiError::InvalidResponse)
         );
     }
 
     #[test]
     fn selections_are_ordered_by_recency_then_stable_identity() {
         let selection =
-            |address: &str, created_at, updated_at| CryptocurrencyWalletMonitoringSelection {
-                network: CryptocurrencyWalletMonitoringNetwork::Ethereum,
+            |address: &str, created_at, updated_at| CryptocurrencyWalletMonitorSelection {
+                network: CryptocurrencyWalletMonitorNetwork::Ethereum,
                 address: address.into(),
-                status: CryptocurrencyWalletMonitoringSelectionStatus::Active,
+                status: CryptocurrencyWalletMonitorSelectionStatus::Active,
                 created_at,
                 updated_at,
             };

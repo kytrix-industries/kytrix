@@ -20,7 +20,7 @@ use super::{
     stream::*,
     test_support::{FakeSource, FetchPlan},
 };
-use crate::model::EtfSnapshot;
+use crate::model::CryptocurrencyEtfSnapshot;
 
 /// The handle of the runtime this test runs on.
 ///
@@ -37,29 +37,31 @@ fn current_test_handle() -> &'static tokio::runtime::Handle {
     Box::leak(Box::new(tokio::runtime::Handle::current()))
 }
 
-fn stream_key(account_id: &str) -> EtfStreamKey {
-    EtfStreamKey {
+fn stream_key(account_id: &str) -> CryptocurrencyEtfStreamKey {
+    CryptocurrencyEtfStreamKey {
         account_id: SmolStr::new(account_id),
     }
 }
 
-fn account() -> EtfStreamKey {
+fn account() -> CryptocurrencyEtfStreamKey {
     stream_key("test-account")
 }
 
-fn test_service(source: FakeSource) -> EtfService<FakeSource> {
-    EtfService::with_timing(source, REFRESH_INTERVAL, ATTEMPT_TIMEOUT)
+fn test_service(source: FakeSource) -> CryptocurrencyEtfService<FakeSource> {
+    CryptocurrencyEtfService::with_timing(source, REFRESH_INTERVAL, ATTEMPT_TIMEOUT)
 }
 
-async fn receive_status(reliable: &mut ReliableStream<EtfProtocol>) -> EtfStatus {
+async fn receive_status(
+    reliable: &mut ReliableStream<CryptocurrencyEtfProtocol>,
+) -> CryptocurrencyEtfStatus {
     receive_status_for(reliable, &account()).await
 }
 
 /// Reads one status, asserting it belongs to `key`.
 async fn receive_status_for(
-    reliable: &mut ReliableStream<EtfProtocol>,
-    key: &EtfStreamKey,
-) -> EtfStatus {
+    reliable: &mut ReliableStream<CryptocurrencyEtfProtocol>,
+    key: &CryptocurrencyEtfStreamKey,
+) -> CryptocurrencyEtfStatus {
     let envelope = reliable
         .recv()
         .await
@@ -69,13 +71,15 @@ async fn receive_status_for(
         key,
         "a status names the account it is about"
     );
-    let EtfStreamMessage::Status(status) = envelope.message().as_ref() else {
+    let CryptocurrencyEtfStreamMessage::Status(status) = envelope.message().as_ref() else {
         panic!("the reliable channel should only carry statuses");
     };
     status.clone()
 }
 
-async fn receive_snapshot(latest: &mut LatestStream<EtfProtocol>) -> Arc<EtfSnapshot> {
+async fn receive_snapshot(
+    latest: &mut LatestStream<CryptocurrencyEtfProtocol>,
+) -> Arc<CryptocurrencyEtfSnapshot> {
     latest
         .changed()
         .await
@@ -83,7 +87,8 @@ async fn receive_snapshot(latest: &mut LatestStream<EtfProtocol>) -> Arc<EtfSnap
     let envelope = latest
         .next_unseen()
         .expect("the published snapshot should be unseen");
-    let EtfStreamMessage::Snapshot { snapshot, .. } = envelope.message().as_ref() else {
+    let CryptocurrencyEtfStreamMessage::Snapshot { snapshot, .. } = envelope.message().as_ref()
+    else {
         panic!("the latest channel should only carry snapshots");
     };
     snapshot.clone()
@@ -91,9 +96,9 @@ async fn receive_snapshot(latest: &mut LatestStream<EtfProtocol>) -> Arc<EtfSnap
 
 /// The flow of the one day the fake's snapshot carries, which is how two answers
 /// are told apart.
-fn flow(snapshot: &EtfSnapshot) -> f64 {
+fn flow(snapshot: &CryptocurrencyEtfSnapshot) -> f64 {
     snapshot
-        .dataset(crate::model::EtfAsset::Btc)
+        .dataset(crate::model::CryptocurrencyEtfAsset::Btc)
         .days
         .first()
         .expect("the fake answers with one day")
@@ -103,28 +108,31 @@ fn flow(snapshot: &EtfSnapshot) -> f64 {
 /// Starts a runtime watching `account()` and consumes the four messages one
 /// successful load publishes.
 async fn load_and_settle(
-    runtime: &WidgetRuntime<EtfProtocol>,
-    reliable: &mut ReliableStream<EtfProtocol>,
-    latest: &mut LatestStream<EtfProtocol>,
+    runtime: &WidgetRuntime<CryptocurrencyEtfProtocol>,
+    reliable: &mut ReliableStream<CryptocurrencyEtfProtocol>,
+    latest: &mut LatestStream<CryptocurrencyEtfProtocol>,
 ) {
     let response = runtime
         .client()
-        .call(EtfRequest::Load(account()))
+        .call(CryptocurrencyEtfRequest::Load(account()))
         .await
         .expect("the load should be accepted");
-    assert_eq!(response.into_value(), EtfResponse::StreamStarted);
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::StreamStarted
+    );
     assert!(matches!(
         receive_status(reliable).await,
-        EtfStatus::Connecting
+        CryptocurrencyEtfStatus::Connecting
     ));
     assert!(matches!(
         receive_status(reliable).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
     let _ = receive_snapshot(latest).await;
     assert!(matches!(
         receive_status(reliable).await,
-        EtfStatus::Ready { .. }
+        CryptocurrencyEtfStatus::Ready { .. }
     ));
 }
 
@@ -176,22 +184,27 @@ async fn a_load_should_fetch_at_once_and_publish_the_snapshot_then_readiness() {
 
     let response = runtime
         .client()
-        .call(EtfRequest::Load(account()))
+        .call(CryptocurrencyEtfRequest::Load(account()))
         .await
         .expect("the load should be accepted");
-    assert_eq!(response.into_value(), EtfResponse::StreamStarted);
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::StreamStarted
+    );
 
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Connecting
+        CryptocurrencyEtfStatus::Connecting
     ));
-    let EtfStatus::Refreshing { next_refresh_at } = receive_status(&mut reliable).await else {
+    let CryptocurrencyEtfStatus::Refreshing { next_refresh_at } =
+        receive_status(&mut reliable).await
+    else {
         panic!("a fetch should be reported before it starts");
     };
     let snapshot = receive_snapshot(&mut latest).await;
     assert_eq!(flow(snapshot.as_ref()), 7.0);
     match receive_status(&mut reliable).await {
-        EtfStatus::Ready {
+        CryptocurrencyEtfStatus::Ready {
             revision,
             next_refresh_at: ready_at,
         } => {
@@ -227,10 +240,10 @@ async fn an_unchanged_answer_should_not_bump_the_revision() {
     advance(REFRESH_INTERVAL).await;
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
     match receive_status(&mut reliable).await {
-        EtfStatus::Ready { revision, .. } => {
+        CryptocurrencyEtfStatus::Ready { revision, .. } => {
             assert_eq!(revision, 1, "an unchanged answer is not a new revision");
         }
         other => panic!("expected readiness, found {other:?}"),
@@ -256,17 +269,22 @@ async fn a_manual_refresh_should_fetch_again_and_reset_the_schedule() {
     advance(Duration::from_secs(60)).await;
     let response = runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect("a refresh should be queued");
-    assert_eq!(response.into_value(), EtfResponse::RefreshQueued);
-    let EtfStatus::Refreshing { next_refresh_at } = receive_status(&mut reliable).await else {
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::RefreshQueued
+    );
+    let CryptocurrencyEtfStatus::Refreshing { next_refresh_at } =
+        receive_status(&mut reliable).await
+    else {
         panic!("a manual refresh reports its fetch like any other");
     };
     let snapshot = receive_snapshot(&mut latest).await;
     assert_eq!(flow(snapshot.as_ref()), 9.0);
     match receive_status(&mut reliable).await {
-        EtfStatus::Ready {
+        CryptocurrencyEtfStatus::Ready {
             revision,
             next_refresh_at: ready_at,
         } => {
@@ -306,12 +324,12 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
     advance(REFRESH_INTERVAL).await;
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
-    let EtfStatus::Failed { error } = receive_status(&mut reliable).await else {
+    let CryptocurrencyEtfStatus::Failed { error } = receive_status(&mut reliable).await else {
         panic!("a refused fetch is reported");
     };
-    assert!(matches!(error, EtfFetchError::Service(_)));
+    assert!(matches!(error, CryptocurrencyEtfFetchError::Service(_)));
     assert!(
         latest.next_unseen().is_none(),
         "a failed fetch publishes no snapshot"
@@ -320,7 +338,8 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
     let envelope = retained
         .next_unseen()
         .expect("the last good snapshot stays available");
-    let EtfStreamMessage::Snapshot { snapshot, .. } = envelope.message().as_ref() else {
+    let CryptocurrencyEtfStreamMessage::Snapshot { snapshot, .. } = envelope.message().as_ref()
+    else {
         panic!("the latest channel should only carry snapshots");
     };
     assert_eq!(
@@ -344,19 +363,22 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
     // The recovery is a refresh on the same account rather than a new one.
     let response = runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect("the waiting loop should still accept a refresh");
-    assert_eq!(response.into_value(), EtfResponse::RefreshQueued);
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::RefreshQueued
+    );
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
     let recovered = receive_snapshot(&mut latest).await;
     assert_eq!(flow(recovered.as_ref()), 9.0);
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Ready { revision: 2, .. }
+        CryptocurrencyEtfStatus::Ready { revision: 2, .. }
     ));
 
     runtime.shutdown().await;
@@ -372,7 +394,7 @@ async fn a_fetch_that_does_not_answer_should_time_out_and_stop_the_schedule() {
 
     runtime
         .client()
-        .call(EtfRequest::Load(account()))
+        .call(CryptocurrencyEtfRequest::Load(account()))
         .await
         .expect("the load should be accepted");
     let _ = receive_status(&mut reliable).await;
@@ -380,10 +402,10 @@ async fn a_fetch_that_does_not_answer_should_time_out_and_stop_the_schedule() {
 
     advance(ATTEMPT_TIMEOUT).await;
     match receive_status(&mut reliable).await {
-        EtfStatus::Failed { error } => {
+        CryptocurrencyEtfStatus::Failed { error } => {
             assert_eq!(
                 error,
-                EtfFetchError::Timeout(ATTEMPT_TIMEOUT),
+                CryptocurrencyEtfFetchError::Timeout(ATTEMPT_TIMEOUT),
                 "the failure names the timeout it hit"
             );
             assert_eq!(source.cancelled_fetches(), 1, "the attempt was dropped");
@@ -410,26 +432,29 @@ async fn another_account_should_replace_the_stream() {
     let second = stream_key("second-account");
     let response = runtime
         .client()
-        .call(EtfRequest::Load(second.clone()))
+        .call(CryptocurrencyEtfRequest::Load(second.clone()))
         .await
         .expect("another account should replace the stream");
-    assert_eq!(response.into_value(), EtfResponse::StreamStarted);
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::StreamStarted
+    );
 
     // The replacement announces itself from the beginning, and every message it
     // publishes says which account it is about.
     assert!(matches!(
         receive_status_for(&mut reliable, &second).await,
-        EtfStatus::Connecting
+        CryptocurrencyEtfStatus::Connecting
     ));
     assert!(matches!(
         receive_status_for(&mut reliable, &second).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
     let snapshot = receive_snapshot(&mut latest).await;
     assert_eq!(flow(snapshot.as_ref()), 2.0);
     assert!(matches!(
         receive_status_for(&mut reliable, &second).await,
-        EtfStatus::Ready { revision: 1, .. }
+        CryptocurrencyEtfStatus::Ready { revision: 1, .. }
     ));
 
     runtime.shutdown().await;
@@ -442,13 +467,13 @@ async fn a_refresh_without_a_stream_should_be_refused() {
 
     let error = runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect_err("there is nothing to refresh yet");
     assert!(matches!(
         error,
         RpcCallError::Service {
-            source: EtfServiceError::StreamClosed,
+            source: CryptocurrencyEtfServiceError::StreamClosed,
             ..
         }
     ));
@@ -466,7 +491,7 @@ async fn a_refresh_while_one_is_in_flight_should_be_refused() {
 
     runtime
         .client()
-        .call(EtfRequest::Load(account()))
+        .call(CryptocurrencyEtfRequest::Load(account()))
         .await
         .expect("the load should be accepted");
     let _ = receive_status(&mut reliable).await;
@@ -474,22 +499,25 @@ async fn a_refresh_while_one_is_in_flight_should_be_refused() {
 
     let response = runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect("a refresh is accepted while a fetch is in flight");
-    assert_eq!(response.into_value(), EtfResponse::RefreshQueued);
+    assert_eq!(
+        response.into_value(),
+        CryptocurrencyEtfResponse::RefreshQueued
+    );
 
     // The one that was queued is the fetch in flight, so the gate refuses a second
     // click rather than piling it up behind the first.
     let error = runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect_err("a second refresh should be refused");
     assert!(matches!(
         error,
         RpcCallError::Service {
-            source: EtfServiceError::StreamBusy,
+            source: CryptocurrencyEtfServiceError::StreamBusy,
             ..
         }
     ));
@@ -509,12 +537,12 @@ async fn a_shut_down_service_should_fetch_nothing_and_drop_what_is_in_flight() {
 
     runtime
         .client()
-        .call(EtfRequest::Refresh)
+        .call(CryptocurrencyEtfRequest::Refresh)
         .await
         .expect("a refresh should be queued");
     assert!(matches!(
         receive_status(&mut reliable).await,
-        EtfStatus::Refreshing { .. }
+        CryptocurrencyEtfStatus::Refreshing { .. }
     ));
 
     runtime.shutdown().await;
@@ -536,16 +564,16 @@ async fn a_shut_down_service_should_fetch_nothing_and_drop_what_is_in_flight() {
 
 #[test]
 fn a_status_should_name_the_deadline_it_scheduled() {
-    assert_eq!(EtfStatus::Connecting.next_refresh_at(), None);
+    assert_eq!(CryptocurrencyEtfStatus::Connecting.next_refresh_at(), None);
     assert_eq!(
-        EtfStatus::Refreshing {
+        CryptocurrencyEtfStatus::Refreshing {
             next_refresh_at: 1_000
         }
         .next_refresh_at(),
         Some(1_000)
     );
     assert_eq!(
-        EtfStatus::Ready {
+        CryptocurrencyEtfStatus::Ready {
             revision: 3,
             next_refresh_at: 2_000
         }
@@ -553,8 +581,8 @@ fn a_status_should_name_the_deadline_it_scheduled() {
         Some(2_000)
     );
     assert_eq!(
-        EtfStatus::Failed {
-            error: EtfFetchError::Timeout(Duration::from_secs(1))
+        CryptocurrencyEtfStatus::Failed {
+            error: CryptocurrencyEtfFetchError::Timeout(Duration::from_secs(1))
         }
         .next_refresh_at(),
         None,

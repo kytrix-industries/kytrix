@@ -317,7 +317,7 @@ mod tests {
                         orientation: WorkspaceOrientation::Horizontal,
                         head_fraction: 0.35,
                         head: Box::new(pane(widget(
-                            "kytrix.market.candlestick",
+                            "kytrix.candlestick",
                             Some(
                                 VersionedWidgetConfig::encode(&TestConfig { interval: 1 })
                                     .expect("a test config should encode"),
@@ -327,7 +327,7 @@ mod tests {
                             orientation: WorkspaceOrientation::Vertical,
                             head_fraction: 0.75,
                             head: Box::new(default_pane()),
-                            tail: Box::new(pane(widget("kytrix.market.order-book", None))),
+                            tail: Box::new(pane(widget("kytrix.order-book", None))),
                         }),
                     },
                 },
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(first["layout"]["tail"]["orientation"], "vertical");
         assert_eq!(
             first["layout"]["head"]["widget"]["id"],
-            "kytrix.market.candlestick"
+            "kytrix.candlestick"
         );
         assert_eq!(
             first["layout"]["head"]["widget"]["config"]["schema_version"],
@@ -633,7 +633,7 @@ mod tests {
                 "layout": {
                     "kind": "pane",
                     "widget": {
-                        "id": "kytrix.market.candlestick",
+                        "id": "kytrix.candlestick",
                         "config": { "schema_version": 0, "payload": "{}" },
                     },
                 },
@@ -652,7 +652,7 @@ mod tests {
                 "layout": {
                     "kind": "pane",
                     "widget": {
-                        "id": "kytrix.market.candlestick",
+                        "id": "kytrix.candlestick",
                         "config": { "schema_version": 2, "payload": "{}" },
                     },
                 },
@@ -739,7 +739,7 @@ mod tests {
         let saved = WorkspacesConfig {
             entries: vec![WorkspaceConfig {
                 name: SmolStr::new_static("Workspace 1"),
-                layout: pane(widget("kytrix.market.candlestick", Some(stored))),
+                layout: pane(widget("kytrix.candlestick", Some(stored))),
             }],
             active: Some(SmolStr::new_static("Workspace 1")),
         };

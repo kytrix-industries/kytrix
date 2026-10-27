@@ -11,7 +11,7 @@
 //! language change visible: the locale a chart was prepared in is kept, so the pane
 //! can tell that the labels on screen are the ones of the language it just left.
 //!
-//! Net assets are read from [`EtfDataset::days_for_window`]'s rows, but they are
+//! Net assets are read from [`CryptocurrencyEtfDataset::days_for_window`]'s rows, but they are
 //! *accumulated* over the whole history by the model: the total is a level the
 //! funds hold, not a sum over the window a chart happens to show.
 
@@ -25,7 +25,9 @@ use super::{
     axes::{AxisScale, flow_domain, net_assets_domain},
     text::{format_axis_value, format_date, format_header_date, format_money, format_signed_money},
 };
-use crate::model::{EtfDataset, EtfFundSelection, EtfWindow};
+use crate::model::{
+    CryptocurrencyEtfDataset, CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow,
+};
 
 /// One trading day, as the frame draws it.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,9 +61,9 @@ pub(crate) struct PreparedPoint {
 pub(crate) struct PreparedData {
     /// The history this was read from, kept so a caller can tell one dataset from
     /// another by pointer.
-    pub source: Arc<EtfDataset>,
-    pub selection: EtfFundSelection,
-    pub window: EtfWindow,
+    pub source: Arc<CryptocurrencyEtfDataset>,
+    pub selection: CryptocurrencyEtfFundSelection,
+    pub window: CryptocurrencyEtfWindow,
     /// The language the labels were written in.
     pub locale: LanguageCode,
     /// What each axis counts, and the unit its numbers are read in. The numbers on
@@ -94,19 +96,21 @@ impl PreparedData {
     /// Resolves one view of one history.
     pub(crate) fn new(
         cx: &App,
-        source: Arc<EtfDataset>,
-        selection: EtfFundSelection,
-        window: EtfWindow,
+        source: Arc<CryptocurrencyEtfDataset>,
+        selection: CryptocurrencyEtfFundSelection,
+        window: CryptocurrencyEtfWindow,
     ) -> Self {
         let locale = *cx.global::<i18n::language::codes::LanguageCode>();
-        let left_axis_title = t!(cx, "widget.etf.flow_axis");
-        let right_axis_title = t!(cx, "widget.etf.net_assets_axis");
+        let left_axis_title = t!(cx, "widget.cryptocurrency_etf.flow_axis");
+        let right_axis_title = t!(cx, "widget.cryptocurrency_etf.net_assets_axis");
         // A fund the asset does not have is a view of no data rather than of the
         // total: showing the total under a fund's name would report a number the
         // user did not ask for and cannot tell apart from the one they did.
         let selection_valid = match &selection {
-            EtfFundSelection::All => true,
-            EtfFundSelection::Named(name) => source.fund_index(name.as_str()).is_some(),
+            CryptocurrencyEtfFundSelection::All => true,
+            CryptocurrencyEtfFundSelection::Named(name) => {
+                source.fund_index(name.as_str()).is_some()
+            }
         };
         let visible = if selection_valid {
             source.days_for_window(window)
@@ -114,10 +118,10 @@ impl PreparedData {
             &[]
         };
         let flow_name = match &selection {
-            EtfFundSelection::All => SharedString::new_static("ETF"),
-            EtfFundSelection::Named(name) => SharedString::new(name.as_str()),
+            CryptocurrencyEtfFundSelection::All => SharedString::new_static("ETF"),
+            CryptocurrencyEtfFundSelection::Named(name) => SharedString::new(name.as_str()),
         };
-        let show_net_assets = matches!(&selection, EtfFundSelection::All);
+        let show_net_assets = matches!(&selection, CryptocurrencyEtfFundSelection::All);
 
         let mut points = Vec::with_capacity(visible.len());
         for day in visible {
@@ -131,7 +135,7 @@ impl PreparedData {
             let net_assets_tooltip = if show_net_assets {
                 t!(
                     cx,
-                    "widget.etf.value",
+                    "widget.cryptocurrency_etf.value",
                     label = right_axis_title.as_ref(),
                     value = net_assets_label.as_str()
                 )
@@ -149,7 +153,7 @@ impl PreparedData {
                 // are read together, with the amount left off.
                 flow_tooltip_caption: t!(
                     cx,
-                    "widget.etf.value",
+                    "widget.cryptocurrency_etf.value",
                     label = day_caption(cx, flow).as_str(),
                     value = ""
                 ),
@@ -213,11 +217,11 @@ impl PreparedData {
 /// it does not.
 fn flow_caption(cx: &App, value: f64, name: &str) -> SharedString {
     if value > 0.0 {
-        t!(cx, "widget.etf.net_inflow", name = name)
+        t!(cx, "widget.cryptocurrency_etf.net_inflow", name = name)
     } else if value < 0.0 {
-        t!(cx, "widget.etf.net_outflow", name = name)
+        t!(cx, "widget.cryptocurrency_etf.net_outflow", name = name)
     } else {
-        t!(cx, "widget.etf.net_flow", name = name)
+        t!(cx, "widget.cryptocurrency_etf.net_flow", name = name)
     }
 }
 
@@ -230,10 +234,10 @@ fn flow_caption(cx: &App, value: f64, name: &str) -> SharedString {
 /// which way that day went.
 fn day_caption(cx: &App, value: f64) -> SharedString {
     if value > 0.0 {
-        t!(cx, "widget.etf.day_net_inflow")
+        t!(cx, "widget.cryptocurrency_etf.day_net_inflow")
     } else if value < 0.0 {
-        t!(cx, "widget.etf.day_net_outflow")
+        t!(cx, "widget.cryptocurrency_etf.day_net_outflow")
     } else {
-        t!(cx, "widget.etf.day_net_flow")
+        t!(cx, "widget.cryptocurrency_etf.day_net_flow")
     }
 }

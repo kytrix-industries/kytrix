@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 use ahash::AHashMap;
 use base_ui::style::theme::Theme;
 use gpui_kit::Hsla;
-use kytrix_service_provider::service::strategic_maritime_chokepoints_tracking::{
-    StrategicMaritimeChokepointsTrackingPosition, StrategicMaritimeChokepointsTrackingStatic,
-    StrategicMaritimeChokepointsTrackingUpdate,
+use kytrix_service_provider::service::global_shipping_chokepoint::{
+    GlobalShippingChokepointPosition, GlobalShippingChokepointStatic,
+    GlobalShippingChokepointUpdate,
 };
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
@@ -106,7 +106,7 @@ pub(super) const TSS_LANES: &[&[(f32, f32)]] = &[
 /// One label the map draws: the name it reads in the catalogue and where it sits.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLabel {
-    /// The catalogue key, e.g. `widget.hormuz_vessel_map.label.city.fujairah`.
+    /// The catalogue key, e.g. `widget.global_shipping_chokepoint.label.city.fujairah`.
     pub key: &'static str,
     /// The anchor, as longitude and latitude in degrees.
     pub at: [f32; 2],
@@ -115,23 +115,23 @@ pub(super) struct MapLabel {
 /// The five countries the map names.
 pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.country.iran",
+        key: "widget.global_shipping_chokepoint.label.country.iran",
         at: [53.2, 27.85],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.country.oman",
+        key: "widget.global_shipping_chokepoint.label.country.oman",
         at: [56.6, 22.9],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.country.uae",
+        key: "widget.global_shipping_chokepoint.label.country.uae",
         at: [54.4, 23.6],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.country.qatar",
+        key: "widget.global_shipping_chokepoint.label.country.qatar",
         at: [51.2, 25.15],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.country.bahrain",
+        key: "widget.global_shipping_chokepoint.label.country.bahrain",
         at: [50.55, 26.05],
     },
 ];
@@ -139,51 +139,51 @@ pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
 /// The twelve cities the map names.
 pub(super) const CITY_LABELS: [MapLabel; 12] = [
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.bandar_abbas",
+        key: "widget.global_shipping_chokepoint.label.city.bandar_abbas",
         at: [56.27, 27.18],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.qeshm",
+        key: "widget.global_shipping_chokepoint.label.city.qeshm",
         at: [55.95, 26.95],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.bandar_lengeh",
+        key: "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
         at: [55.45, 26.55],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.khasab",
+        key: "widget.global_shipping_chokepoint.label.city.khasab",
         at: [56.25, 26.18],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.fujairah",
+        key: "widget.global_shipping_chokepoint.label.city.fujairah",
         at: [56.35, 25.12],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.ras_al_khaimah",
+        key: "widget.global_shipping_chokepoint.label.city.ras_al_khaimah",
         at: [55.95, 25.79],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.sharjah",
+        key: "widget.global_shipping_chokepoint.label.city.sharjah",
         at: [55.40, 25.35],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.al_jubayl",
+        key: "widget.global_shipping_chokepoint.label.city.al_jubayl",
         at: [49.65, 27.00],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.al_hofuf",
+        key: "widget.global_shipping_chokepoint.label.city.al_hofuf",
         at: [49.59, 25.36],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.chabahar",
+        key: "widget.global_shipping_chokepoint.label.city.chabahar",
         at: [60.62, 25.29],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.muscat",
+        key: "widget.global_shipping_chokepoint.label.city.muscat",
         at: [58.40, 23.60],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.city.sur",
+        key: "widget.global_shipping_chokepoint.label.city.sur",
         at: [59.53, 22.57],
     },
 ];
@@ -191,11 +191,11 @@ pub(super) const CITY_LABELS: [MapLabel; 12] = [
 /// The two bodies of water the map names.
 pub(super) const WATER_LABELS: [MapLabel; 2] = [
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.water.persian_gulf",
+        key: "widget.global_shipping_chokepoint.label.water.persian_gulf",
         at: [51.5, 26.6],
     },
     MapLabel {
-        key: "widget.hormuz_vessel_map.label.water.gulf_of_oman",
+        key: "widget.global_shipping_chokepoint.label.water.gulf_of_oman",
         at: [58.6, 24.9],
     },
 ];
@@ -497,7 +497,7 @@ pub(super) fn flag_for_mid(mid: u32) -> Option<&'static str> {
 
 /// One AIS navigation status, as the index the catalogue names it by.
 ///
-/// The catalogue has one key per status (`widget.hormuz_vessel_map.nav_status.0`
+/// The catalogue has one key per status (`widget.global_shipping_chokepoint.nav_status.0`
 /// through `.14`), and the value the wire carries picks it; no status text lives
 /// here.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -604,8 +604,8 @@ pub(super) struct VesselDetails {
 impl VesselDetails {
     fn new(
         mmsi: u32,
-        statics: Option<&StrategicMaritimeChokepointsTrackingStatic>,
-        position: &StrategicMaritimeChokepointsTrackingPosition,
+        statics: Option<&GlobalShippingChokepointStatic>,
+        position: &GlobalShippingChokepointPosition,
         zone: UtcOffset,
     ) -> Self {
         Self {
@@ -700,8 +700,8 @@ fn format_last_update(last_update: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// one.
 #[derive(Debug)]
 pub(super) struct VesselStore {
-    statics: AHashMap<u32, StrategicMaritimeChokepointsTrackingStatic>,
-    positions: AHashMap<u32, StrategicMaritimeChokepointsTrackingPosition>,
+    statics: AHashMap<u32, GlobalShippingChokepointStatic>,
+    positions: AHashMap<u32, GlobalShippingChokepointPosition>,
     epoch: u64,
     applied: u64,
     gap: bool,
@@ -753,7 +753,7 @@ impl VesselStore {
     /// against [`MAX_VESSELS`]. Deltas are not trimmed: which vessels the picture
     /// holds is the service's decision, and a client that trimmed its own set would
     /// drift from the set the server is tracking.
-    pub fn apply(&mut self, update: &StrategicMaritimeChokepointsTrackingUpdate) {
+    pub fn apply(&mut self, update: &GlobalShippingChokepointUpdate) {
         if update.keyframe {
             assert!(
                 update.positions.len() <= MAX_VESSELS,
@@ -947,8 +947,8 @@ mod tests {
     const AIS_NORTH: f32 = 28.3;
 
     /// One position in the strait, with every value a report can carry.
-    fn position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
-        StrategicMaritimeChokepointsTrackingPosition {
+    fn position(mmsi: u32) -> GlobalShippingChokepointPosition {
+        GlobalShippingChokepointPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -961,8 +961,8 @@ mod tests {
     }
 
     /// One static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
-        StrategicMaritimeChokepointsTrackingStatic {
+    fn statics(mmsi: u32) -> GlobalShippingChokepointStatic {
+        GlobalShippingChokepointStatic {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -983,8 +983,8 @@ mod tests {
     }
 
     /// A static part that carries nothing, as a report with every sentinel set.
-    fn empty_statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
-        StrategicMaritimeChokepointsTrackingStatic {
+    fn empty_statics(mmsi: u32) -> GlobalShippingChokepointStatic {
+        GlobalShippingChokepointStatic {
             mmsi,
             imo: 0,
             call_sign: SmolStr::new_static(""),
@@ -1005,8 +1005,8 @@ mod tests {
     }
 
     /// A position that carries nothing, as a report with every sentinel set.
-    fn empty_position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
-        StrategicMaritimeChokepointsTrackingPosition {
+    fn empty_position(mmsi: u32) -> GlobalShippingChokepointPosition {
+        GlobalShippingChokepointPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -1022,9 +1022,9 @@ mod tests {
     fn keyframe(
         epoch: u64,
         sequence: u64,
-        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
-        StrategicMaritimeChokepointsTrackingUpdate {
+        positions: Vec<GlobalShippingChokepointPosition>,
+    ) -> GlobalShippingChokepointUpdate {
+        GlobalShippingChokepointUpdate {
             epoch,
             keyframe: true,
             sequence,
@@ -1041,9 +1041,9 @@ mod tests {
         epoch: u64,
         base: u64,
         sequence: u64,
-        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
-        StrategicMaritimeChokepointsTrackingUpdate {
+        positions: Vec<GlobalShippingChokepointPosition>,
+    ) -> GlobalShippingChokepointUpdate {
+        GlobalShippingChokepointUpdate {
             epoch,
             keyframe: false,
             sequence,
@@ -1854,28 +1854,28 @@ mod tests {
     }
 
     #[test]
-    fn the_strategic_maritime_chokepoints_tracking_area_should_sit_inside_the_map() {
+    fn the_global_shipping_chokepoint_area_should_sit_inside_the_map() {
         // Projected rather than compared as constants: the comparison is then also
         // the check that both rectangles go through the same projection.
         let [
-            strategic_maritime_chokepoints_tracking_west,
-            strategic_maritime_chokepoints_tracking_south,
+            global_shipping_chokepoint_west,
+            global_shipping_chokepoint_south,
         ] = project(AIS_WEST, AIS_SOUTH);
         let [
-            strategic_maritime_chokepoints_tracking_east,
-            strategic_maritime_chokepoints_tracking_north,
+            global_shipping_chokepoint_east,
+            global_shipping_chokepoint_north,
         ] = project(AIS_EAST, AIS_NORTH);
         let [map_west, map_south] = project(MAP_WEST, MAP_SOUTH);
         let [map_east, map_north] = project(MAP_EAST, MAP_NORTH);
 
         assert!(
-            map_west <= strategic_maritime_chokepoints_tracking_west
-                && strategic_maritime_chokepoints_tracking_east <= map_east,
+            map_west <= global_shipping_chokepoint_west
+                && global_shipping_chokepoint_east <= map_east,
             "the reported area runs past the map east to west",
         );
         assert!(
-            map_south <= strategic_maritime_chokepoints_tracking_south
-                && strategic_maritime_chokepoints_tracking_north <= map_north,
+            map_south <= global_shipping_chokepoint_south
+                && global_shipping_chokepoint_north <= map_north,
             "and north to south",
         );
     }
@@ -1907,35 +1907,35 @@ mod tests {
         assert_eq!(
             COUNTRY_LABELS.map(|label| label.key),
             [
-                "widget.hormuz_vessel_map.label.country.iran",
-                "widget.hormuz_vessel_map.label.country.oman",
-                "widget.hormuz_vessel_map.label.country.uae",
-                "widget.hormuz_vessel_map.label.country.qatar",
-                "widget.hormuz_vessel_map.label.country.bahrain",
+                "widget.global_shipping_chokepoint.label.country.iran",
+                "widget.global_shipping_chokepoint.label.country.oman",
+                "widget.global_shipping_chokepoint.label.country.uae",
+                "widget.global_shipping_chokepoint.label.country.qatar",
+                "widget.global_shipping_chokepoint.label.country.bahrain",
             ],
         );
         assert_eq!(
             CITY_LABELS.map(|label| label.key),
             [
-                "widget.hormuz_vessel_map.label.city.bandar_abbas",
-                "widget.hormuz_vessel_map.label.city.qeshm",
-                "widget.hormuz_vessel_map.label.city.bandar_lengeh",
-                "widget.hormuz_vessel_map.label.city.khasab",
-                "widget.hormuz_vessel_map.label.city.fujairah",
-                "widget.hormuz_vessel_map.label.city.ras_al_khaimah",
-                "widget.hormuz_vessel_map.label.city.sharjah",
-                "widget.hormuz_vessel_map.label.city.al_jubayl",
-                "widget.hormuz_vessel_map.label.city.al_hofuf",
-                "widget.hormuz_vessel_map.label.city.chabahar",
-                "widget.hormuz_vessel_map.label.city.muscat",
-                "widget.hormuz_vessel_map.label.city.sur",
+                "widget.global_shipping_chokepoint.label.city.bandar_abbas",
+                "widget.global_shipping_chokepoint.label.city.qeshm",
+                "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
+                "widget.global_shipping_chokepoint.label.city.khasab",
+                "widget.global_shipping_chokepoint.label.city.fujairah",
+                "widget.global_shipping_chokepoint.label.city.ras_al_khaimah",
+                "widget.global_shipping_chokepoint.label.city.sharjah",
+                "widget.global_shipping_chokepoint.label.city.al_jubayl",
+                "widget.global_shipping_chokepoint.label.city.al_hofuf",
+                "widget.global_shipping_chokepoint.label.city.chabahar",
+                "widget.global_shipping_chokepoint.label.city.muscat",
+                "widget.global_shipping_chokepoint.label.city.sur",
             ],
         );
         assert_eq!(
             WATER_LABELS.map(|label| label.key),
             [
-                "widget.hormuz_vessel_map.label.water.persian_gulf",
-                "widget.hormuz_vessel_map.label.water.gulf_of_oman",
+                "widget.global_shipping_chokepoint.label.water.persian_gulf",
+                "widget.global_shipping_chokepoint.label.water.gulf_of_oman",
             ],
         );
     }

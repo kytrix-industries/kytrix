@@ -982,8 +982,8 @@ pub(super) fn retry_button(
 /// The two labels the axis is drawn between.
 fn axis_labels(cx: &App) -> (SharedString, SharedString) {
     (
-        t!(cx, "widget.hyperliquid_wallet_monitor.timeline_start"),
-        t!(cx, "widget.hyperliquid_wallet_monitor.timeline_end"),
+        t!(cx, "widget.hyperliquid_wallet.timeline_start"),
+        t!(cx, "widget.hyperliquid_wallet.timeline_end"),
     )
 }
 
@@ -1028,20 +1028,20 @@ fn render_marker(
     let side = marker.side;
     // The count decides the sentence: a marker holding one fill is not "1 fills".
     let side_label = match side {
-        Side::Buy => t!(cx, "widget.hyperliquid_wallet_monitor.buy"),
-        Side::Sell => t!(cx, "widget.hyperliquid_wallet_monitor.sell"),
+        Side::Buy => t!(cx, "widget.hyperliquid_wallet.buy"),
+        Side::Sell => t!(cx, "widget.hyperliquid_wallet.sell"),
     };
     let label = if rows.len() == 1 {
         t!(
             cx,
-            "widget.hyperliquid_wallet_monitor.timeline_marker_one",
+            "widget.hyperliquid_wallet.timeline_marker_one",
             side = side_label,
             value = rows.len()
         )
     } else {
         t!(
             cx,
-            "widget.hyperliquid_wallet_monitor.timeline_marker",
+            "widget.hyperliquid_wallet.timeline_marker",
             side = side_label,
             value = rows.len()
         )
@@ -1219,32 +1219,16 @@ fn tooltip_row(
 pub(super) fn age_text(cx: &App, now: i64, timestamp: i64) -> SharedString {
     match age_bucket(now, timestamp) {
         AgeBucket::Seconds(value) => {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.age_seconds",
-                value = value
-            )
+            t!(cx, "widget.hyperliquid_wallet.age_seconds", value = value)
         }
         AgeBucket::Minutes(value) => {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.age_minutes",
-                value = value
-            )
+            t!(cx, "widget.hyperliquid_wallet.age_minutes", value = value)
         }
         AgeBucket::Hours(value) => {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.age_hours",
-                value = value
-            )
+            t!(cx, "widget.hyperliquid_wallet.age_hours", value = value)
         }
         AgeBucket::Days(value) => {
-            t!(
-                cx,
-                "widget.hyperliquid_wallet_monitor.age_days",
-                value = value
-            )
+            t!(cx, "widget.hyperliquid_wallet.age_days", value = value)
         }
     }
 }
@@ -1362,49 +1346,49 @@ fn fill_label(row: &TooltipRow, side: Side, cx: &App) -> (SharedString, gpui_kit
     let theme = cx.theme();
     match row.kind {
         InstrumentKind::Spot => (
-            t!(cx, "widget.hyperliquid_wallet_monitor.spot"),
+            t!(cx, "widget.hyperliquid_wallet.spot"),
             theme.roles.fg.default.hsla,
         ),
         InstrumentKind::Perpetual => match (side, row.direction) {
             (_, FillDirection::LongToShort) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.long_to_short"),
+                t!(cx, "widget.hyperliquid_wallet.long_to_short"),
                 theme.roles.market.down.hsla,
             ),
             (_, FillDirection::ShortToLong) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.short_to_long"),
+                t!(cx, "widget.hyperliquid_wallet.short_to_long"),
                 theme.roles.market.up.hsla,
             ),
             (_, FillDirection::Liquidated) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.liquidated"),
+                t!(cx, "widget.hyperliquid_wallet.liquidated"),
                 theme.roles.market.down.hsla,
             ),
             (_, FillDirection::AutoDeleveraged) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.auto_deleveraged"),
+                t!(cx, "widget.hyperliquid_wallet.auto_deleveraged"),
                 theme.roles.fg.default.hsla,
             ),
             (Side::Buy, FillDirection::Long) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.open_long"),
+                t!(cx, "widget.hyperliquid_wallet.open_long"),
                 theme.roles.market.up.hsla,
             ),
             (Side::Buy, FillDirection::Short) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.close_short"),
+                t!(cx, "widget.hyperliquid_wallet.close_short"),
                 theme.roles.market.down.hsla,
             ),
             (Side::Sell, FillDirection::Long) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.close_long"),
+                t!(cx, "widget.hyperliquid_wallet.close_long"),
                 theme.roles.market.up.hsla,
             ),
             (Side::Sell, FillDirection::Short) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.open_short"),
+                t!(cx, "widget.hyperliquid_wallet.open_short"),
                 theme.roles.market.down.hsla,
             ),
             (_, FillDirection::Unknown) => (
-                t!(cx, "widget.hyperliquid_wallet_monitor.unknown"),
+                t!(cx, "widget.hyperliquid_wallet.unknown"),
                 theme.roles.fg.default.hsla,
             ),
         },
         InstrumentKind::Future | InstrumentKind::Option | InstrumentKind::Outcome => (
-            t!(cx, "widget.hyperliquid_wallet_monitor.unknown"),
+            t!(cx, "widget.hyperliquid_wallet.unknown"),
             theme.roles.fg.default.hsla,
         ),
     }

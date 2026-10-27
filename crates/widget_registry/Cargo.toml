@@ -14,21 +14,21 @@ thiserror = { workspace = true }
 app_config = { workspace = true }
 candlestick = { workspace = true }
 coin_market_cap_fear_and_greed_index = { workspace = true }
+cryptocurrency_etf = { workspace = true }
 empty = { workspace = true }
-etf = { workspace = true }
 financial_calendar = { workspace = true }
 force_orders = { workspace = true }
-hormuz_vessel_map = { workspace = true }
-hyperliquid_wallet_monitor = { workspace = true }
+global_shipping_chokepoint = { workspace = true }
+hyperliquid_wallet = { workspace = true }
 financial_indices = { workspace = true }
 market_trades = { workspace = true }
 news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
-x_account_monitoring = { workspace = true }
+x = { workspace = true }
 volume_heatmap = { workspace = true }
-cryptocurrency_wallet_monitoring = { workspace = true }
+cryptocurrency_wallet_monitor = { workspace = true }
 watch_list = { workspace = true }
 widget = { workspace = true }
 

@@ -1,4 +1,4 @@
-//! The Hormuz pane: the strait's coastline, its lanes, and the vessels an AIS
+//! The Strait of Hormuz pane: its coastline, its lanes, and the vessels an AIS
 //! subscription reports in it.
 //!
 //! # What the frame draws
@@ -20,7 +20,7 @@
 //! # The body is the ready state
 //!
 //! The framework draws the placeholder, the banner and the spinner, and it only embeds
-//! this body when [`HormuzVesselMapWidget::has_content`] is true. So there is no state
+//! this body when [`GlobalShippingChokepointWidget::has_content`] is true. So there is no state
 //! branch here: the body is what a pane with a picture draws, and an empty sea is drawn
 //! as a map with the catalogue's own "no data" on it.
 
@@ -45,8 +45,8 @@ use kytrix_service_provider::{
     service::{
         connector::KytrixServiceConnector,
         engine::{ErrorCode, KytrixServiceError},
-        strategic_maritime_chokepoints_tracking::{
-            StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
+        global_shipping_chokepoint::{
+            GlobalShippingChokepointArea, GlobalShippingChokepointUpdate,
         },
     },
 };
@@ -72,9 +72,9 @@ use crate::{
     },
     scene::{self, Scene, SceneError},
     service::{
-        AisStreamError, AisStreamMessage, StrategicMaritimeChokepointsTrackingProtocol,
-        StrategicMaritimeChokepointsTrackingRequest, StrategicMaritimeChokepointsTrackingScope,
-        StrategicMaritimeChokepointsTrackingService, StrategicMaritimeChokepointsTrackingSource,
+        AisStreamError, AisStreamMessage, GlobalShippingChokepointProtocol,
+        GlobalShippingChokepointRequest, GlobalShippingChokepointScope,
+        GlobalShippingChokepointService, GlobalShippingChokepointSource,
     },
 };
 
@@ -151,64 +151,64 @@ const CLASSES: [ShipClass; 4] = [
 
 /// The catalogue keys of the four class names, in [`CLASSES`] order.
 const SHIP_TYPE_KEYS: [&str; 4] = [
-    "widget.hormuz_vessel_map.ship_type.tanker",
-    "widget.hormuz_vessel_map.ship_type.container",
-    "widget.hormuz_vessel_map.ship_type.bulk",
-    "widget.hormuz_vessel_map.ship_type.other",
+    "widget.global_shipping_chokepoint.ship_type.tanker",
+    "widget.global_shipping_chokepoint.ship_type.container",
+    "widget.global_shipping_chokepoint.ship_type.bulk",
+    "widget.global_shipping_chokepoint.ship_type.other",
 ];
 
 /// The catalogue keys of the four legend entries, in [`CLASSES`] order.
 const LEGEND_KEYS: [&str; 4] = [
-    "widget.hormuz_vessel_map.legend.tanker",
-    "widget.hormuz_vessel_map.legend.container",
-    "widget.hormuz_vessel_map.legend.bulk",
-    "widget.hormuz_vessel_map.legend.other",
+    "widget.global_shipping_chokepoint.legend.tanker",
+    "widget.global_shipping_chokepoint.legend.container",
+    "widget.global_shipping_chokepoint.legend.bulk",
+    "widget.global_shipping_chokepoint.legend.other",
 ];
 
 /// The fifteen labels of the hover card, in the order the design lists the items in.
 const HOVER_KEYS: [&str; 15] = [
-    "widget.hormuz_vessel_map.hover.ship_name",
-    "widget.hormuz_vessel_map.hover.mmsi",
-    "widget.hormuz_vessel_map.hover.imo",
-    "widget.hormuz_vessel_map.hover.call_sign",
-    "widget.hormuz_vessel_map.hover.ship_type",
-    "widget.hormuz_vessel_map.hover.flag",
-    "widget.hormuz_vessel_map.hover.destination",
-    "widget.hormuz_vessel_map.hover.eta",
-    "widget.hormuz_vessel_map.hover.draught",
-    "widget.hormuz_vessel_map.hover.dimensions",
-    "widget.hormuz_vessel_map.hover.speed",
-    "widget.hormuz_vessel_map.hover.course",
-    "widget.hormuz_vessel_map.hover.heading",
-    "widget.hormuz_vessel_map.hover.nav_status",
-    "widget.hormuz_vessel_map.hover.updated",
+    "widget.global_shipping_chokepoint.hover.ship_name",
+    "widget.global_shipping_chokepoint.hover.mmsi",
+    "widget.global_shipping_chokepoint.hover.imo",
+    "widget.global_shipping_chokepoint.hover.call_sign",
+    "widget.global_shipping_chokepoint.hover.ship_type",
+    "widget.global_shipping_chokepoint.hover.flag",
+    "widget.global_shipping_chokepoint.hover.destination",
+    "widget.global_shipping_chokepoint.hover.eta",
+    "widget.global_shipping_chokepoint.hover.draught",
+    "widget.global_shipping_chokepoint.hover.dimensions",
+    "widget.global_shipping_chokepoint.hover.speed",
+    "widget.global_shipping_chokepoint.hover.course",
+    "widget.global_shipping_chokepoint.hover.heading",
+    "widget.global_shipping_chokepoint.hover.nav_status",
+    "widget.global_shipping_chokepoint.hover.updated",
 ];
 
 /// The catalogue keys naming the fifteen navigation statuses, by their AIS index.
 const NAV_STATUS_KEYS: [&str; 15] = [
-    "widget.hormuz_vessel_map.nav_status.0",
-    "widget.hormuz_vessel_map.nav_status.1",
-    "widget.hormuz_vessel_map.nav_status.2",
-    "widget.hormuz_vessel_map.nav_status.3",
-    "widget.hormuz_vessel_map.nav_status.4",
-    "widget.hormuz_vessel_map.nav_status.5",
-    "widget.hormuz_vessel_map.nav_status.6",
-    "widget.hormuz_vessel_map.nav_status.7",
-    "widget.hormuz_vessel_map.nav_status.8",
-    "widget.hormuz_vessel_map.nav_status.9",
-    "widget.hormuz_vessel_map.nav_status.10",
-    "widget.hormuz_vessel_map.nav_status.11",
-    "widget.hormuz_vessel_map.nav_status.12",
-    "widget.hormuz_vessel_map.nav_status.13",
-    "widget.hormuz_vessel_map.nav_status.14",
+    "widget.global_shipping_chokepoint.nav_status.0",
+    "widget.global_shipping_chokepoint.nav_status.1",
+    "widget.global_shipping_chokepoint.nav_status.2",
+    "widget.global_shipping_chokepoint.nav_status.3",
+    "widget.global_shipping_chokepoint.nav_status.4",
+    "widget.global_shipping_chokepoint.nav_status.5",
+    "widget.global_shipping_chokepoint.nav_status.6",
+    "widget.global_shipping_chokepoint.nav_status.7",
+    "widget.global_shipping_chokepoint.nav_status.8",
+    "widget.global_shipping_chokepoint.nav_status.9",
+    "widget.global_shipping_chokepoint.nav_status.10",
+    "widget.global_shipping_chokepoint.nav_status.11",
+    "widget.global_shipping_chokepoint.nav_status.12",
+    "widget.global_shipping_chokepoint.nav_status.13",
+    "widget.global_shipping_chokepoint.nav_status.14",
 ];
 
 /// The pane persists nothing about this widget; the type exists because every widget
 /// carries its schema version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HormuzMapConfig;
+pub struct GlobalShippingChokepointConfig;
 
-impl WidgetConfig for HormuzMapConfig {
+impl WidgetConfig for GlobalShippingChokepointConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
@@ -223,7 +223,7 @@ struct MapAssetInvalid(#[from] SceneError);
 
 impl LocalizedError for MapAssetInvalid {
     fn localized_message(&self, cx: &App) -> SharedString {
-        t!(cx, "error.hormuz_vessel_map.map_asset")
+        t!(cx, "error.global_shipping_chokepoint.map_asset")
     }
 }
 
@@ -390,8 +390,8 @@ fn viewport_of(bounds: Bounds<Pixels>) -> [f32; 2] {
 
 /// One pane: the picture an AIS subscription publishes, the camera it is drawn with, and
 /// the vessel the pointer is on.
-pub struct HormuzVesselMapWidget {
-    binding: WidgetBinding<StrategicMaritimeChokepointsTrackingProtocol>,
+pub struct GlobalShippingChokepointWidget {
+    binding: WidgetBinding<GlobalShippingChokepointProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     /// The account the picture belongs to, which is what an account change is compared
@@ -427,14 +427,15 @@ pub struct HormuzVesselMapWidget {
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for HormuzVesselMapWidget {
-    type Config = HormuzMapConfig;
+impl WidgetView for GlobalShippingChokepointWidget {
+    type Config = GlobalShippingChokepointConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.maritime.hormuz_vessel_map");
-    const DISPLAY_NAME: &'static str = "widget.names.hormuz_vessel_map";
+    const ID: WidgetId = WidgetId::new_static("kytrix.global_shipping_chokepoint");
+    const DISPLAY_NAME: &'static str = "widget.names.global_shipping_chokepoint";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Live AIS vessel positions in the Strait of Hormuz";
-    const ICON: Option<&'static str> = Some("widgets/hormuz_vessel_map.png");
+    const DESCRIPTION: &'static str =
+        "Live AIS vessel positions across strategic shipping chokepoints";
+    const ICON: Option<&'static str> = Some("widgets/global_shipping_chokepoint.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -463,8 +464,8 @@ impl WidgetView for HormuzVesselMapWidget {
         }
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
-            StrategicMaritimeChokepointsTrackingRequest::Load {
-                scope: StrategicMaritimeChokepointsTrackingScope::new(account),
+            GlobalShippingChokepointRequest::Load {
+                scope: GlobalShippingChokepointScope::new(account),
             },
             cx,
             Self::on_load_result,
@@ -482,10 +483,10 @@ impl WidgetView for HormuzVesselMapWidget {
     }
 }
 
-impl HormuzVesselMapWidget {
+impl GlobalShippingChokepointWidget {
     /// The seam a test can answer through: `new` only picks the production source.
     fn new_with_source<S>(
-        _config: HormuzMapConfig,
+        _config: GlobalShippingChokepointConfig,
         source: S,
         status: Entity<WidgetStatus>,
         _config_change: WidgetConfigChange,
@@ -493,11 +494,11 @@ impl HormuzVesselMapWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: StrategicMaritimeChokepointsTrackingSource,
+        S: GlobalShippingChokepointSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            StrategicMaritimeChokepointsTrackingService::new(source),
+            GlobalShippingChokepointService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
@@ -539,7 +540,7 @@ impl HormuzVesselMapWidget {
     /// the language showing then.
     fn report_sign_in(&mut self, cx: &mut Context<Self>) {
         self.status.report(
-            WidgetState::waiting(Notice::message("widget.hormuz_vessel_map.sign_in")),
+            WidgetState::waiting(Notice::message("widget.global_shipping_chokepoint.sign_in")),
             cx,
         );
     }
@@ -587,14 +588,11 @@ impl HormuzVesselMapWidget {
             None => {
                 self.clear_picture();
                 self.report_sign_in(cx);
-                self.binding.call(
-                    StrategicMaritimeChokepointsTrackingRequest::Stop,
-                    cx,
-                    |this, _, cx| {
+                self.binding
+                    .call(GlobalShippingChokepointRequest::Stop, cx, |this, _, cx| {
                         this.clear_picture();
                         cx.notify();
-                    },
-                );
+                    });
             }
         }
     }
@@ -612,7 +610,7 @@ impl HormuzVesselMapWidget {
 
     fn on_load_result(
         &mut self,
-        result: WidgetRpcResult<StrategicMaritimeChokepointsTrackingProtocol>,
+        result: WidgetRpcResult<GlobalShippingChokepointProtocol>,
         cx: &mut Context<Self>,
     ) {
         // The answer says the service took the request; what the subscription then reports
@@ -635,11 +633,11 @@ impl HormuzVesselMapWidget {
     /// back on screen.
     fn apply_latest(
         &mut self,
-        area: StrategicMaritimeChokepointsTrackingArea,
+        area: GlobalShippingChokepointArea,
         message: Arc<AisStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if area != StrategicMaritimeChokepointsTrackingArea::Hormuz
+        if area != GlobalShippingChokepointArea::Hormuz
             || self.account_id.is_none()
             || self.status.is_failed(cx)
         {
@@ -655,11 +653,11 @@ impl HormuzVesselMapWidget {
     /// Reports the failure the reliable stream carried.
     fn apply_reliable(
         &mut self,
-        area: StrategicMaritimeChokepointsTrackingArea,
+        area: GlobalShippingChokepointArea,
         message: Arc<AisStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if area != StrategicMaritimeChokepointsTrackingArea::Hormuz
+        if area != GlobalShippingChokepointArea::Hormuz
             || self.account_id.is_none()
             || self.status.is_failed(cx)
         {
@@ -686,11 +684,7 @@ impl HormuzVesselMapWidget {
     }
 
     /// Folds one push into the picture and arms the staleness clock.
-    fn apply_update(
-        &mut self,
-        update: &StrategicMaritimeChokepointsTrackingUpdate,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_update(&mut self, update: &GlobalShippingChokepointUpdate, cx: &mut Context<Self>) {
         self.vessels.apply(update);
         self.painted = self.vessels.vessels().into();
         // A keyframe the server stamped with no time says it holds no state: the picture
@@ -982,9 +976,13 @@ impl HormuzVesselMapWidget {
     fn vessel_count_text(&self, cx: &App) -> SharedString {
         let count = self.vessels.vessel_count();
         if count == 1 {
-            t!(cx, "widget.hormuz_vessel_map.vessel_count_one")
+            t!(cx, "widget.global_shipping_chokepoint.vessel_count_one")
         } else {
-            t!(cx, "widget.hormuz_vessel_map.vessel_count", count = count)
+            t!(
+                cx,
+                "widget.global_shipping_chokepoint.vessel_count",
+                count = count
+            )
         }
     }
 
@@ -1012,7 +1010,7 @@ impl HormuzVesselMapWidget {
             .collect::<Vec<_>>();
 
         div()
-            .debug_selector(|| "TEST_HORMUZ_LEGEND".into())
+            .debug_selector(|| "TEST_CHOKEPOINT_LEGEND".into())
             .absolute()
             .right(px(8.0))
             .bottom(px(8.0))
@@ -1029,7 +1027,7 @@ impl HormuzVesselMapWidget {
             .child(
                 div()
                     .text_color(colors.muted)
-                    .child(t!(cx, "widget.hormuz_vessel_map.legend.title")),
+                    .child(t!(cx, "widget.global_shipping_chokepoint.legend.title")),
             )
             .children(entries)
             .child(div().text_color(colors.muted).child(count_text))
@@ -1043,17 +1041,17 @@ impl HormuzVesselMapWidget {
     /// leave the vessels on the map: what is stale is the update, not what was received.
     fn stale_badge(&self, colors: MapColors, cx: &App) -> AnyElement {
         let text = if self.vessels.has_gap() {
-            t!(cx, "widget.hormuz_vessel_map.stale")
+            t!(cx, "widget.global_shipping_chokepoint.stale")
         } else {
             t!(
                 cx,
-                "widget.hormuz_vessel_map.stale_seconds",
+                "widget.global_shipping_chokepoint.stale_seconds",
                 seconds = self.vessels.silent_for().as_secs()
             )
         };
 
         div()
-            .debug_selector(|| "TEST_HORMUZ_STALE".into())
+            .debug_selector(|| "TEST_CHOKEPOINT_STALE".into())
             .absolute()
             .top(px(8.0))
             .left(px(8.0))
@@ -1083,14 +1081,14 @@ impl HormuzVesselMapWidget {
             .justify_center()
             .gap(px(4.0))
             .child(EmptyState::new(
-                "HormuzVesselMapEmpty",
+                "GlobalShippingChokepointEmpty",
                 t!(cx, "common.no_data"),
             ))
             .child(
                 div()
                     .text_xs()
                     .text_color(colors.muted)
-                    .child(t!(cx, "widget.hormuz_vessel_map.waiting_data")),
+                    .child(t!(cx, "widget.global_shipping_chokepoint.waiting_data")),
             )
             .into_any_element()
     }
@@ -1105,7 +1103,7 @@ impl HormuzVesselMapWidget {
         cx: &App,
     ) -> AnyElement {
         let size = UnifiedSize::Small;
-        let unavailable = t!(cx, "widget.hormuz_vessel_map.unavailable");
+        let unavailable = t!(cx, "widget.global_shipping_chokepoint.unavailable");
         let text = |value: Option<&SmolStr>| {
             value.map_or_else(
                 || unavailable.clone(),
@@ -1179,7 +1177,7 @@ impl HormuzVesselMapWidget {
         );
 
         div()
-            .debug_selector(|| "TEST_HORMUZ_CARD".into())
+            .debug_selector(|| "TEST_CHOKEPOINT_CARD".into())
             .absolute()
             .left(px(left))
             .top(px(top))
@@ -1199,7 +1197,7 @@ impl HormuzVesselMapWidget {
     }
 }
 
-impl Render for HormuzVesselMapWidget {
+impl Render for GlobalShippingChokepointWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = MapColors::resolve(cx.theme());
         let zone = data_time_zone(cx);
@@ -1277,8 +1275,10 @@ impl Render for HormuzVesselMapWidget {
         let pinch = cx.entity().downgrade();
 
         div()
-            .id(ElementId::Name(SharedString::new_static("HormuzVesselMap")))
-            .debug_selector(|| "TEST_HORMUZ_MAP".into())
+            .id(ElementId::Name(SharedString::new_static(
+                "GlobalShippingChokepoint",
+            )))
+            .debug_selector(|| "TEST_CHOKEPOINT_MAP".into())
             .relative()
             .size_full()
             .min_h_0()
@@ -1314,7 +1314,7 @@ impl Render for HormuzVesselMapWidget {
 ///
 /// The subscription is what is missing, so the control goes where one is bought.
 fn view_plans() -> WidgetAction {
-    WidgetAction::new("widget.hormuz_vessel_map.view_plans", |cx| {
+    WidgetAction::new("widget.global_shipping_chokepoint.view_plans", |cx| {
         cx.open_url(ACCOUNT_ORIGIN);
     })
 }
@@ -1661,9 +1661,9 @@ mod tests {
     use i18n::{language::codes::LanguageCode, t};
     use kytrix_service_provider::service::{
         engine::{ErrorCode, KytrixServiceError},
-        strategic_maritime_chokepoints_tracking::{
-            StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingPosition,
-            StrategicMaritimeChokepointsTrackingStatic, StrategicMaritimeChokepointsTrackingUpdate,
+        global_shipping_chokepoint::{
+            GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
+            GlobalShippingChokepointStatic, GlobalShippingChokepointUpdate,
         },
     };
     use network::transport::error::TransportError;
@@ -1677,9 +1677,8 @@ mod tests {
     use crate::{
         model::HIT_RADIUS_PX,
         service::{
-            AisStreamError, AisStreamMessage,
-            StrategicMaritimeChokepointsTrackingEventSubscription,
-            StrategicMaritimeChokepointsTrackingSession,
+            AisStreamError, AisStreamMessage, GlobalShippingChokepointEventSubscription,
+            GlobalShippingChokepointSession,
         },
     };
 
@@ -1729,7 +1728,7 @@ mod tests {
         }
     }
 
-    impl StrategicMaritimeChokepointsTrackingSource for RecordingSource {
+    impl GlobalShippingChokepointSource for RecordingSource {
         type Session = PendingSession;
 
         async fn acquire_session(
@@ -1748,12 +1747,12 @@ mod tests {
     #[derive(Clone)]
     struct PendingSession;
 
-    impl StrategicMaritimeChokepointsTrackingSession for PendingSession {
+    impl GlobalShippingChokepointSession for PendingSession {
         type Subscription = PendingSubscription;
 
-        async fn subscribe_strategic_maritime_chokepoints_tracking(
+        async fn subscribe_global_shipping_chokepoint(
             &self,
-            _area: StrategicMaritimeChokepointsTrackingArea,
+            _area: GlobalShippingChokepointArea,
         ) -> Result<Self::Subscription, KytrixServiceError> {
             std::future::pending().await
         }
@@ -1762,10 +1761,8 @@ mod tests {
     /// A subscription that never delivers anything.
     struct PendingSubscription;
 
-    impl StrategicMaritimeChokepointsTrackingEventSubscription for PendingSubscription {
-        async fn recv(
-            &mut self,
-        ) -> Result<StrategicMaritimeChokepointsTrackingUpdate, TransportError> {
+    impl GlobalShippingChokepointEventSubscription for PendingSubscription {
+        async fn recv(&mut self) -> Result<GlobalShippingChokepointUpdate, TransportError> {
             std::future::pending().await
         }
     }
@@ -1775,18 +1772,18 @@ mod tests {
         cx: &mut TestAppContext,
         source: RecordingSource,
         account: Option<&str>,
-    ) -> Entity<HormuzVesselMapWidget> {
+    ) -> Entity<GlobalShippingChokepointWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, account);
             cx.new(move |cx| {
                 let status = cx.new(|_| WidgetStatus::new());
-                let weak: WeakEntity<HormuzVesselMapWidget> = cx.weak_entity();
+                let weak: WeakEntity<GlobalShippingChokepointWidget> = cx.weak_entity();
                 let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
                     let _ = weak.update(cx, |pane, cx| pane.load(cx));
                 });
-                HormuzVesselMapWidget::new_with_source(
-                    HormuzMapConfig,
+                GlobalShippingChokepointWidget::new_with_source(
+                    GlobalShippingChokepointConfig,
                     source,
                     status,
                     WidgetConfigChange::default(),
@@ -1801,8 +1798,8 @@ mod tests {
     }
 
     /// The vertices of one position in the strait, as a report carries them.
-    fn position(mmsi: u32) -> StrategicMaritimeChokepointsTrackingPosition {
-        StrategicMaritimeChokepointsTrackingPosition {
+    fn position(mmsi: u32) -> GlobalShippingChokepointPosition {
+        GlobalShippingChokepointPosition {
             mmsi,
             latitude: 26_500_000,
             longitude: 56_300_000,
@@ -1815,8 +1812,8 @@ mod tests {
     }
 
     /// One vessel's static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> StrategicMaritimeChokepointsTrackingStatic {
-        StrategicMaritimeChokepointsTrackingStatic {
+    fn statics(mmsi: u32) -> GlobalShippingChokepointStatic {
+        GlobalShippingChokepointStatic {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -1840,9 +1837,9 @@ mod tests {
     fn keyframe(
         epoch: u64,
         sequence: u64,
-        positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
-        StrategicMaritimeChokepointsTrackingUpdate {
+        positions: Vec<GlobalShippingChokepointPosition>,
+    ) -> GlobalShippingChokepointUpdate {
+        GlobalShippingChokepointUpdate {
             epoch,
             keyframe: true,
             sequence,
@@ -1855,13 +1852,8 @@ mod tests {
     }
 
     /// A delta continuing `base` with nothing in it but the removals.
-    fn removal(
-        epoch: u64,
-        base: u64,
-        sequence: u64,
-        mmsi: u32,
-    ) -> StrategicMaritimeChokepointsTrackingUpdate {
-        StrategicMaritimeChokepointsTrackingUpdate {
+    fn removal(epoch: u64, base: u64, sequence: u64, mmsi: u32) -> GlobalShippingChokepointUpdate {
+        GlobalShippingChokepointUpdate {
             epoch,
             keyframe: false,
             sequence,
@@ -1875,13 +1867,13 @@ mod tests {
 
     /// Reports one push as the latest stream would.
     fn report_update(
-        pane: &Entity<HormuzVesselMapWidget>,
-        update: StrategicMaritimeChokepointsTrackingUpdate,
+        pane: &Entity<GlobalShippingChokepointWidget>,
+        update: GlobalShippingChokepointUpdate,
         cx: &mut App,
     ) -> bool {
         pane.update(cx, |pane, cx| {
             pane.apply_latest(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+                GlobalShippingChokepointArea::Hormuz,
                 Arc::new(AisStreamMessage::Update(update)),
                 cx,
             )
@@ -1890,13 +1882,13 @@ mod tests {
 
     /// Reports one failure as the reliable stream would.
     fn report_failure(
-        pane: &Entity<HormuzVesselMapWidget>,
+        pane: &Entity<GlobalShippingChokepointWidget>,
         error: AisStreamError,
         cx: &mut App,
     ) -> bool {
         pane.update(cx, |pane, cx| {
             pane.apply_reliable(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
+                GlobalShippingChokepointArea::Hormuz,
                 Arc::new(AisStreamMessage::Failed(Arc::new(error))),
                 cx,
             )
@@ -1905,7 +1897,7 @@ mod tests {
 
     /// A window whose body is one pane, which is how the framework mounts it.
     struct MapHarness {
-        pane: Entity<HormuzVesselMapWidget>,
+        pane: Entity<GlobalShippingChokepointWidget>,
     }
 
     impl Render for MapHarness {
@@ -1924,7 +1916,7 @@ mod tests {
     /// Mounts one pane in a window of its own, already drawn once.
     fn map_window<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<HormuzVesselMapWidget>,
+        pane: &Entity<GlobalShippingChokepointWidget>,
     ) -> &'a mut VisualTestContext {
         let pane = pane.clone();
         let (_, window) = cx.add_window_view(move |_, _| MapHarness { pane });
@@ -1945,7 +1937,10 @@ mod tests {
     }
 
     /// The window position one canvas point is drawn at.
-    fn window_point(pane: &HormuzVesselMapWidget, canvas: [f32; 2]) -> Option<Point<Pixels>> {
+    fn window_point(
+        pane: &GlobalShippingChokepointWidget,
+        canvas: [f32; 2],
+    ) -> Option<Point<Pixels>> {
         let bounds = pane.frame.bounds.get()?;
         Some(point(
             bounds.origin.x + px(canvas[0]),
@@ -1954,7 +1949,7 @@ mod tests {
     }
 
     /// The canvas position one vessel's marker is drawn at.
-    fn hull_of(pane: &HormuzVesselMapWidget, mmsi: u32) -> Option<[f32; 2]> {
+    fn hull_of(pane: &GlobalShippingChokepointWidget, mmsi: u32) -> Option<[f32; 2]> {
         let bounds = pane.frame.bounds.get()?;
         let projection = Projection::new(pane.frame.camera.get(), viewport_of(bounds));
         pane.painted
@@ -2018,7 +2013,9 @@ mod tests {
             assert!(!pane.has_content());
             assert_eq!(
                 pane.status.state(cx).notice(),
-                Some(&Notice::message("widget.hormuz_vessel_map.sign_in")),
+                Some(&Notice::message(
+                    "widget.global_shipping_chokepoint.sign_in"
+                )),
                 "a pane without an account is waiting rather than failed",
             );
             assert!(!pane.status.state(cx).is_failed());
@@ -2097,11 +2094,11 @@ mod tests {
             "a picture with no vessel says it holds none",
         );
         assert!(
-            window.debug_bounds("TEST_HORMUZ_MAP").is_some(),
+            window.debug_bounds("TEST_CHOKEPOINT_MAP").is_some(),
             "the map stays behind the empty state",
         );
         assert!(
-            window.debug_bounds("TEST_HORMUZ_LEGEND").is_some(),
+            window.debug_bounds("TEST_CHOKEPOINT_LEGEND").is_some(),
             "the legend is part of the ready body",
         );
     }
@@ -2117,7 +2114,7 @@ mod tests {
             assert_eq!(pane.read(cx).vessels.vessel_count(), 1);
             assert_eq!(
                 pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(cx, "widget.hormuz_vessel_map.vessel_count_one").as_ref(),
+                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
                 "one vessel is singular",
             );
 
@@ -2129,14 +2126,24 @@ mod tests {
             assert_eq!(pane.read(cx).vessels.vessel_count(), 2);
             assert_eq!(
                 pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(cx, "widget.hormuz_vessel_map.vessel_count", count = 2).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 2
+                )
+                .as_ref(),
                 "two vessels are plural and interpolated",
             );
 
             assert!(report_update(&pane, keyframe(7, 3, Vec::new()), cx));
             assert_eq!(
                 pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(cx, "widget.hormuz_vessel_map.vessel_count", count = 0).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 0
+                )
+                .as_ref(),
                 "an empty picture is plural",
             );
         });
@@ -2166,10 +2173,10 @@ mod tests {
 
         let window = map_window(cx, &pane);
         assert!(
-            window.debug_bounds("TEST_HORMUZ_STALE").is_some(),
+            window.debug_bounds("TEST_CHOKEPOINT_STALE").is_some(),
             "a picture that is not being continued is drawn under its badge",
         );
-        assert!(window.debug_bounds("TEST_HORMUZ_LEGEND").is_some());
+        assert!(window.debug_bounds("TEST_CHOKEPOINT_LEGEND").is_some());
     }
 
     #[gpui_kit::test]
@@ -2211,7 +2218,7 @@ mod tests {
 
             assert_eq!(
                 text.as_ref(),
-                t!(cx, "widget.hormuz_vessel_map.entitlement_required").as_ref(),
+                t!(cx, "widget.global_shipping_chokepoint.entitlement_required").as_ref(),
             );
             assert!(
                 !text.contains('<'),
@@ -2219,7 +2226,7 @@ mod tests {
             );
             assert_eq!(
                 failure.action().label(cx).as_ref(),
-                t!(cx, "widget.hormuz_vessel_map.view_plans").as_ref(),
+                t!(cx, "widget.global_shipping_chokepoint.view_plans").as_ref(),
             );
             failure.action().clone()
         });
@@ -2263,22 +2270,14 @@ mod tests {
         cx.update(|cx| {
             let update = Arc::new(AisStreamMessage::Update(keyframe(7, 1, vec![position(1)])));
             assert!(!pane.update(cx, |pane, cx| {
-                pane.apply_latest(
-                    StrategicMaritimeChokepointsTrackingArea::Unspecified,
-                    update,
-                    cx,
-                )
+                pane.apply_latest(GlobalShippingChokepointArea::Unspecified, update, cx)
             }));
 
             let failure = Arc::new(AisStreamMessage::Failed(Arc::new(
                 AisStreamError::Transport(TransportError::Closed),
             )));
             assert!(!pane.update(cx, |pane, cx| {
-                pane.apply_reliable(
-                    StrategicMaritimeChokepointsTrackingArea::Unspecified,
-                    failure,
-                    cx,
-                )
+                pane.apply_reliable(GlobalShippingChokepointArea::Unspecified, failure, cx)
             }));
 
             let pane = pane.read(cx);
@@ -2302,7 +2301,7 @@ mod tests {
 
             assert_eq!(
                 failure.text(cx).as_ref(),
-                t!(cx, "error.hormuz_vessel_map.map_asset").as_ref(),
+                t!(cx, "error.global_shipping_chokepoint.map_asset").as_ref(),
                 "the sentence is the error type's own",
             );
             assert_eq!(failure.action().label_key(), "common.retry");
@@ -2359,7 +2358,9 @@ mod tests {
             assert_eq!(pane.hovered, None);
             assert_eq!(
                 pane.status.state(cx).notice(),
-                Some(&Notice::message("widget.hormuz_vessel_map.sign_in")),
+                Some(&Notice::message(
+                    "widget.global_shipping_chokepoint.sign_in"
+                )),
             );
         });
     }
@@ -2385,7 +2386,9 @@ mod tests {
             assert!(!state.is_failed());
             assert_eq!(
                 state.notice(),
-                Some(&Notice::message("widget.hormuz_vessel_map.sign_in")),
+                Some(&Notice::message(
+                    "widget.global_shipping_chokepoint.sign_in"
+                )),
             );
         });
     }
@@ -2569,7 +2572,7 @@ mod tests {
             "the pointer moved onto the vessel",
         );
         assert!(
-            window.debug_bounds("TEST_HORMUZ_CARD").is_some(),
+            window.debug_bounds("TEST_CHOKEPOINT_CARD").is_some(),
             "the vessel under the pointer has a card",
         );
 
@@ -2583,7 +2586,7 @@ mod tests {
             None,
             "a vessel the picture dropped has no card",
         );
-        assert!(window.debug_bounds("TEST_HORMUZ_CARD").is_none());
+        assert!(window.debug_bounds("TEST_CHOKEPOINT_CARD").is_none());
     }
 
     /// A pointer that leaves the map is on no vessel any more: the card it was showing is
@@ -2630,7 +2633,7 @@ mod tests {
             None,
             "a pointer outside the map is on no vessel",
         );
-        assert!(window.debug_bounds("TEST_HORMUZ_CARD").is_none());
+        assert!(window.debug_bounds("TEST_CHOKEPOINT_CARD").is_none());
     }
 
     /// A card over a vessel near the bottom of the pane stays inside it: the card is placed
@@ -2658,10 +2661,10 @@ mod tests {
         repaint(window);
 
         let card = window
-            .debug_bounds("TEST_HORMUZ_CARD")
+            .debug_bounds("TEST_CHOKEPOINT_CARD")
             .expect("the vessel under the pointer has a card");
         let map = window
-            .debug_bounds("TEST_HORMUZ_MAP")
+            .debug_bounds("TEST_CHOKEPOINT_MAP")
             .expect("the map is drawn");
         assert!(
             f32::from(card.size.height) <= CARD_HEIGHT,
@@ -2687,17 +2690,17 @@ mod tests {
 
             let mut keys = vec![
                 "common.no_data",
-                "error.hormuz_vessel_map.map_asset",
-                "widget.names.hormuz_vessel_map",
-                "widget.hormuz_vessel_map.entitlement_required",
-                "widget.hormuz_vessel_map.sign_in",
-                "widget.hormuz_vessel_map.stale",
-                "widget.hormuz_vessel_map.stale_seconds",
-                "widget.hormuz_vessel_map.unavailable",
-                "widget.hormuz_vessel_map.vessel_count",
-                "widget.hormuz_vessel_map.vessel_count_one",
-                "widget.hormuz_vessel_map.view_plans",
-                "widget.hormuz_vessel_map.waiting_data",
+                "error.global_shipping_chokepoint.map_asset",
+                "widget.names.global_shipping_chokepoint",
+                "widget.global_shipping_chokepoint.entitlement_required",
+                "widget.global_shipping_chokepoint.sign_in",
+                "widget.global_shipping_chokepoint.stale",
+                "widget.global_shipping_chokepoint.stale_seconds",
+                "widget.global_shipping_chokepoint.unavailable",
+                "widget.global_shipping_chokepoint.vessel_count",
+                "widget.global_shipping_chokepoint.vessel_count_one",
+                "widget.global_shipping_chokepoint.view_plans",
+                "widget.global_shipping_chokepoint.waiting_data",
             ];
             keys.extend(HOVER_KEYS);
             keys.extend(SHIP_TYPE_KEYS);
@@ -2716,11 +2719,21 @@ mod tests {
                     );
                 }
                 assert!(
-                    !t!(cx, "widget.hormuz_vessel_map.vessel_count", count = 3).contains("%{"),
+                    !t!(
+                        cx,
+                        "widget.global_shipping_chokepoint.vessel_count",
+                        count = 3
+                    )
+                    .contains("%{"),
                     "the count is supplied in {language:?}",
                 );
                 assert!(
-                    !t!(cx, "widget.hormuz_vessel_map.stale_seconds", seconds = 42).contains("%{"),
+                    !t!(
+                        cx,
+                        "widget.global_shipping_chokepoint.stale_seconds",
+                        seconds = 42
+                    )
+                    .contains("%{"),
                     "the silence is supplied in {language:?}",
                 );
             }
@@ -2747,7 +2760,7 @@ mod tests {
     #[test]
     fn the_config_should_be_at_the_first_schema_version() {
         assert_eq!(
-            HormuzMapConfig::SCHEMA_VERSION,
+            GlobalShippingChokepointConfig::SCHEMA_VERSION,
             WidgetConfigSchemaVersion::V1,
         );
     }

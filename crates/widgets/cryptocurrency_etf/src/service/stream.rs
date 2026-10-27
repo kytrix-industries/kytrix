@@ -42,7 +42,7 @@ use widget::{
     util::deadline_millis,
 };
 
-use super::super::model::{EtfParseError, EtfSnapshot, parse_etf};
+use super::super::model::{CryptocurrencyEtfParseError, CryptocurrencyEtfSnapshot, parse_etf};
 
 /// How often the pane re-reads the snapshot on its own.
 ///
@@ -61,12 +61,12 @@ pub(crate) const STREAM_COMMAND_CAPACITY: usize = 1;
 
 /// What the pane asks the service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EtfRequest {
+pub(crate) enum CryptocurrencyEtfRequest {
     /// Starts following an account, or replaces the stream that was following
     /// another one.
-    Load(EtfStreamKey),
+    Load(CryptocurrencyEtfStreamKey),
     /// The same, for an account the user recovered from a failure.
-    Retry(EtfStreamKey),
+    Retry(CryptocurrencyEtfStreamKey),
     /// Fetches the current account's snapshot once, without waiting for the next
     /// interval.
     Refresh,
@@ -74,7 +74,7 @@ pub(crate) enum EtfRequest {
 
 /// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EtfResponse {
+pub(crate) enum CryptocurrencyEtfResponse {
     StreamStarted,
     RefreshQueued,
 }
@@ -85,13 +85,13 @@ pub(crate) enum EtfResponse {
 /// authenticated account, so it is not one a pane may keep showing after the
 /// account behind it changed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct EtfStreamKey {
+pub(crate) struct CryptocurrencyEtfStreamKey {
     pub account_id: SmolStr,
 }
 
 /// Where the poll loop is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EtfStatus {
+pub(crate) enum CryptocurrencyEtfStatus {
     /// The stream is starting.
     Connecting,
     /// A fetch is in flight; `next_refresh_at` is the Unix millisecond the
@@ -101,10 +101,10 @@ pub(crate) enum EtfStatus {
     /// `next_refresh_at`.
     Ready { revision: u64, next_refresh_at: i64 },
     /// The last fetch produced no snapshot.
-    Failed { error: EtfFetchError },
+    Failed { error: CryptocurrencyEtfFetchError },
 }
 
-impl EtfStatus {
+impl CryptocurrencyEtfStatus {
     /// When the next automatic fetch is due, if one is scheduled.
     ///
     /// A failure takes the loop off the clock, so it is also what a pane reads to
@@ -122,11 +122,11 @@ impl EtfStatus {
 
 /// Why a fetch produced no snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub(crate) enum EtfFetchError {
+pub(crate) enum CryptocurrencyEtfFetchError {
     #[error("the ETF request failed: {0}")]
     Service(#[from] KytrixServiceError),
     #[error("the ETF snapshot could not be read: {0}")]
-    Parse(#[from] EtfParseError),
+    Parse(#[from] CryptocurrencyEtfParseError),
     #[error("the ETF request did not answer within {0:?}")]
     Timeout(Duration),
 }
@@ -134,31 +134,31 @@ pub(crate) enum EtfFetchError {
 /// Everything the service publishes: state on the reliable channel, snapshots on
 /// the latest-value one.
 #[derive(Clone, Debug)]
-pub(crate) enum EtfStreamMessage {
-    Status(EtfStatus),
+pub(crate) enum CryptocurrencyEtfStreamMessage {
+    Status(CryptocurrencyEtfStatus),
     Snapshot {
         revision: u64,
-        snapshot: Arc<EtfSnapshot>,
+        snapshot: Arc<CryptocurrencyEtfSnapshot>,
     },
 }
 
 /// Why a request could not be accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub(crate) enum EtfServiceError {
+pub(crate) enum CryptocurrencyEtfServiceError {
     #[error("the ETF refresh queue is closed")]
     StreamClosed,
     #[error("an ETF refresh is already in flight")]
     StreamBusy,
 }
 
-pub(crate) struct EtfProtocol;
+pub(crate) struct CryptocurrencyEtfProtocol;
 
-impl WidgetProtocol for EtfProtocol {
-    type Request = EtfRequest;
-    type Response = EtfResponse;
-    type StreamKey = EtfStreamKey;
-    type StreamMessage = EtfStreamMessage;
-    type Error = EtfServiceError;
+impl WidgetProtocol for CryptocurrencyEtfProtocol {
+    type Request = CryptocurrencyEtfRequest;
+    type Response = CryptocurrencyEtfResponse;
+    type StreamKey = CryptocurrencyEtfStreamKey;
+    type StreamMessage = CryptocurrencyEtfStreamMessage;
+    type Error = CryptocurrencyEtfServiceError;
 }
 
 /// The seam between this widget and the service that answers it, so a test can
@@ -167,14 +167,16 @@ impl WidgetProtocol for EtfProtocol {
 /// It stays crate-private, together with the snapshot it hands over: nothing
 /// outside this crate constructs a widget from a source, so there is no reason for
 /// the model to become part of the crate's public surface.
-pub(crate) trait EtfSource: Clone + Send + Sync + 'static {
+pub(crate) trait CryptocurrencyEtfSource: Clone + Send + Sync + 'static {
     fn fetch_snapshot(
         &self,
-    ) -> impl Future<Output = Result<Arc<EtfSnapshot>, EtfFetchError>> + Send;
+    ) -> impl Future<Output = Result<Arc<CryptocurrencyEtfSnapshot>, CryptocurrencyEtfFetchError>> + Send;
 }
 
-impl EtfSource for KytrixServiceConnector {
-    async fn fetch_snapshot(&self) -> Result<Arc<EtfSnapshot>, EtfFetchError> {
+impl CryptocurrencyEtfSource for KytrixServiceConnector {
+    async fn fetch_snapshot(
+        &self,
+    ) -> Result<Arc<CryptocurrencyEtfSnapshot>, CryptocurrencyEtfFetchError> {
         parse_etf(self.fetch_etf().await?)
             .map(Arc::new)
             .map_err(Into::into)
@@ -220,7 +222,7 @@ impl Drop for RefreshPermit {
 }
 
 pub(crate) struct ActiveStream {
-    key: EtfStreamKey,
+    key: CryptocurrencyEtfStreamKey,
     generation: StreamGeneration,
     commands: mpsc::Sender<StreamCommand>,
     gate: RefreshGate,
@@ -229,17 +231,17 @@ pub(crate) struct ActiveStream {
 /// What the poll loop carries between cycles.
 #[derive(Default)]
 pub(crate) struct StreamState {
-    latest: Option<Arc<EtfSnapshot>>,
+    latest: Option<Arc<CryptocurrencyEtfSnapshot>>,
     revision: u64,
 }
 
-pub(crate) struct EtfService<S = KytrixServiceConnector> {
+pub(crate) struct CryptocurrencyEtfService<S = KytrixServiceConnector> {
     source: S,
     refresh_interval: Duration,
     attempt_timeout: Duration,
 }
 
-impl<S> EtfService<S> {
+impl<S> CryptocurrencyEtfService<S> {
     pub(crate) const fn new(source: S) -> Self {
         Self {
             source,
@@ -263,17 +265,17 @@ impl<S> EtfService<S> {
     }
 }
 
-impl<S> WidgetService<EtfProtocol> for EtfService<S>
+impl<S> WidgetService<CryptocurrencyEtfProtocol> for CryptocurrencyEtfService<S>
 where
-    S: EtfSource,
+    S: CryptocurrencyEtfSource,
 {
-    async fn run(self, mut context: ServiceContext<EtfProtocol>) {
+    async fn run(self, mut context: ServiceContext<CryptocurrencyEtfProtocol>) {
         let mut active: Option<ActiveStream> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             match request {
-                EtfRequest::Load(key) | EtfRequest::Retry(key) => {
+                CryptocurrencyEtfRequest::Load(key) | CryptocurrencyEtfRequest::Retry(key) => {
                     // The answer is worth less than the request it belongs to: a
                     // caller that has already given up is not waiting for it.
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
@@ -296,7 +298,10 @@ where
                             publisher,
                         )
                     });
-                    if reply.respond(Ok(EtfResponse::StreamStarted)).is_ok() {
+                    if reply
+                        .respond(Ok(CryptocurrencyEtfResponse::StreamStarted))
+                        .is_ok()
+                    {
                         active = Some(ActiveStream {
                             key,
                             generation,
@@ -310,7 +315,7 @@ where
                         active = None;
                     }
                 }
-                EtfRequest::Refresh => {
+                CryptocurrencyEtfRequest::Refresh => {
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
                     }
@@ -325,27 +330,27 @@ where
                             .is_some_and(|generation| generation == stream.generation)
                     });
                     let Some(stream) = running else {
-                        let _ = reply.respond(Err(EtfServiceError::StreamClosed));
+                        let _ = reply.respond(Err(CryptocurrencyEtfServiceError::StreamClosed));
                         continue;
                     };
                     // The gate spans the whole round trip: a second click while
                     // the first fetch is in flight is refused here rather than
                     // queued behind it.
                     let Some(permit) = stream.gate.try_acquire() else {
-                        let _ = reply.respond(Err(EtfServiceError::StreamBusy));
+                        let _ = reply.respond(Err(CryptocurrencyEtfServiceError::StreamBusy));
                         continue;
                     };
                     match stream.commands.try_send(StreamCommand::Refresh) {
                         Ok(()) => {
-                            let _ = reply.respond(Ok(EtfResponse::RefreshQueued));
+                            let _ = reply.respond(Ok(CryptocurrencyEtfResponse::RefreshQueued));
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             drop(permit);
-                            let _ = reply.respond(Err(EtfServiceError::StreamBusy));
+                            let _ = reply.respond(Err(CryptocurrencyEtfServiceError::StreamBusy));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             drop(permit);
-                            let _ = reply.respond(Err(EtfServiceError::StreamClosed));
+                            let _ = reply.respond(Err(CryptocurrencyEtfServiceError::StreamClosed));
                         }
                     }
                 }
@@ -367,13 +372,13 @@ async fn run_stream<S>(
     refresh_interval: Duration,
     attempt_timeout: Duration,
     mut commands: mpsc::Receiver<StreamCommand>,
-    publisher: StreamPublisher<EtfProtocol>,
+    publisher: StreamPublisher<CryptocurrencyEtfProtocol>,
 ) where
-    S: EtfSource,
+    S: CryptocurrencyEtfSource,
 {
     let mut state = StreamState::default();
     let mut next_refresh = Instant::now() + refresh_interval;
-    let _ = publish_status(&publisher, EtfStatus::Connecting).await;
+    let _ = publish_status(&publisher, CryptocurrencyEtfStatus::Connecting).await;
 
     // The first fetch happens as soon as the stream starts rather than after eight
     // hours: a pane that has just been opened has nothing to show, and a countdown
@@ -469,14 +474,14 @@ async fn run_refresh_cycle<S>(
     attempt_timeout: Duration,
     next_refresh: Instant,
     state: &mut StreamState,
-    publisher: &StreamPublisher<EtfProtocol>,
+    publisher: &StreamPublisher<CryptocurrencyEtfProtocol>,
 ) -> RefreshCycleOutcome
 where
-    S: EtfSource,
+    S: CryptocurrencyEtfSource,
 {
     let next_refresh_at = deadline_millis(next_refresh);
 
-    let status = EtfStatus::Refreshing { next_refresh_at };
+    let status = CryptocurrencyEtfStatus::Refreshing { next_refresh_at };
     if publish_status(publisher, status).await.is_err() {
         return RefreshCycleOutcome::Stop;
     }
@@ -491,7 +496,7 @@ where
         Ok(Ok((snapshot, changed))) => {
             if changed {
                 state.revision = state.revision.saturating_add(1);
-                let published = EtfStreamMessage::Snapshot {
+                let published = CryptocurrencyEtfStreamMessage::Snapshot {
                     revision: state.revision,
                     snapshot: snapshot.clone(),
                 };
@@ -502,7 +507,7 @@ where
             }
             if publish_status(
                 publisher,
-                EtfStatus::Ready {
+                CryptocurrencyEtfStatus::Ready {
                     revision: state.revision,
                     next_refresh_at,
                 },
@@ -519,7 +524,11 @@ where
             RefreshCycleOutcome::Waiting
         }
         Err(_) => {
-            publish_failure(publisher, EtfFetchError::Timeout(attempt_timeout)).await;
+            publish_failure(
+                publisher,
+                CryptocurrencyEtfFetchError::Timeout(attempt_timeout),
+            )
+            .await;
             RefreshCycleOutcome::Waiting
         }
     }
@@ -527,18 +536,23 @@ where
 
 /// Publishes a failed cycle, ignoring the outcome: the caller only needs to know
 /// the loop is still alive, and a closed publisher is noticed by the next write.
-async fn publish_failure(publisher: &StreamPublisher<EtfProtocol>, error: EtfFetchError) {
+async fn publish_failure(
+    publisher: &StreamPublisher<CryptocurrencyEtfProtocol>,
+    error: CryptocurrencyEtfFetchError,
+) {
     let _ = publisher
-        .publish_reliable(EtfStreamMessage::Status(EtfStatus::Failed { error }))
+        .publish_reliable(CryptocurrencyEtfStreamMessage::Status(
+            CryptocurrencyEtfStatus::Failed { error },
+        ))
         .await;
 }
 
 async fn publish_status(
-    publisher: &StreamPublisher<EtfProtocol>,
-    status: EtfStatus,
+    publisher: &StreamPublisher<CryptocurrencyEtfProtocol>,
+    status: CryptocurrencyEtfStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(EtfStreamMessage::Status(status))
+        .publish_reliable(CryptocurrencyEtfStreamMessage::Status(status))
         .await
 }
 
@@ -549,10 +563,10 @@ async fn publish_status(
 /// did not move is what says so.
 pub(crate) async fn fetch_changed_snapshot<S>(
     source: &S,
-    previous: Option<&Arc<EtfSnapshot>>,
-) -> Result<(Arc<EtfSnapshot>, bool), EtfFetchError>
+    previous: Option<&Arc<CryptocurrencyEtfSnapshot>>,
+) -> Result<(Arc<CryptocurrencyEtfSnapshot>, bool), CryptocurrencyEtfFetchError>
 where
-    S: EtfSource,
+    S: CryptocurrencyEtfSource,
 {
     let snapshot = source.fetch_snapshot().await?;
     if let Some(previous) = previous

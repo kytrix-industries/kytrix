@@ -44,27 +44,23 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
-    cryptocurrency_wallet_monitoring::{
-        self, CryptocurrencyWalletMonitoringApiError,
-        CryptocurrencyWalletMonitoringMutationOutcome,
-        CryptocurrencyWalletMonitoringMutationUnknown, CryptocurrencyWalletMonitoringSelection,
-        CryptocurrencyWalletMonitoringSelectionsResponse,
+    cryptocurrency_wallet_monitor::{
+        self, CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
+        CryptocurrencyWalletMonitorMutationUnknown, CryptocurrencyWalletMonitorSelection,
+        CryptocurrencyWalletMonitorSelectionsResponse,
     },
+    global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
     handoff::request_dashboard_handoff,
-    strategic_maritime_chokepoints_tracking::{
-        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
-    },
     supervisor::run_service_supervisor,
     x::{
-        self, TweetsResponse, XAccountMonitoringApiError, XAccountMonitoringMutationOutcome,
-        XAccountMonitoringMutationUnknown, XAccountMonitoringProfile, XAccountMonitoringSelection,
-        XAccountMonitoringSelectionsResponse,
+        self, TweetsResponse, XApiError, XMutationOutcome, XMutationUnknown, XProfile, XSelection,
+        XSelectionsResponse,
     },
 };
 #[cfg(test)]
 use crate::auth::test_support::test_transport;
 #[cfg(test)]
-use crate::service::engine::{ErrorCode, PendingRpc, XAccountMonitoringProfileEvent};
+use crate::service::engine::{ErrorCode, PendingRpc, XProfileEvent};
 use crate::{
     account_profile::AccountProfile,
     auth::{
@@ -75,13 +71,13 @@ use crate::{
     },
     service::{
         engine::{
-            COMMAND_CAPACITY, CancelOnDrop, Command, CryptocurrencyWalletMonitoringTransfer,
+            COMMAND_CAPACITY, CancelOnDrop, Command, CryptocurrencyWalletMonitorTransfer,
             FinancialIndexEvent, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
             KytrixServiceConnectorInner, KytrixServiceError, KytrixSessionState, NewsEvent,
             OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT, SUBSCRIBER_CAPACITY,
             ServiceSessionContext, ServiceTopic, SessionStateRegistry, SubscriberSink,
-            SupervisorCommand, XAccountMonitoringSubscriptionEvent, XAccountMonitoringTweetBatch,
-            authorization_url, await_account_operation, kytrix_service_endpoint, normalize_topics,
+            SupervisorCommand, XSubscriptionEvent, XTweetBatch, authorization_url,
+            await_account_operation, kytrix_service_endpoint, normalize_topics,
             service_account_profile, service_authorization_headers_with_profile,
             subscription_setup_error,
         },
@@ -114,9 +110,9 @@ impl KytrixAccountSession {
         &self.profile
     }
 
-    pub async fn subscribe_cryptocurrency_wallet_monitoring(
+    pub async fn subscribe_cryptocurrency_wallet_monitor(
         &self,
-    ) -> Result<Subscription<CryptocurrencyWalletMonitoringTransfer>, KytrixServiceError> {
+    ) -> Result<Subscription<CryptocurrencyWalletMonitorTransfer>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -132,10 +128,10 @@ impl KytrixAccountSession {
         Ok(subscription)
     }
 
-    pub async fn subscribe_strategic_maritime_chokepoints_tracking(
+    pub async fn subscribe_global_shipping_chokepoint(
         &self,
-        area: StrategicMaritimeChokepointsTrackingArea,
-    ) -> Result<Subscription<StrategicMaritimeChokepointsTrackingUpdate>, KytrixServiceError> {
+        area: GlobalShippingChokepointArea,
+    ) -> Result<Subscription<GlobalShippingChokepointUpdate>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -144,8 +140,8 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::StrategicMaritimeChokepointsTracking(area)],
-                SubscriberSink::StrategicMaritimeChokepointsTracking(publisher),
+                &[ServiceTopic::GlobalShippingChokepoint(area)],
+                SubscriberSink::GlobalShippingChokepoint(publisher),
             )
             .await?;
         Ok(subscription)
@@ -153,7 +149,7 @@ impl KytrixAccountSession {
 
     pub async fn subscribe_x(
         &self,
-    ) -> Result<Subscription<XAccountMonitoringSubscriptionEvent>, KytrixServiceError> {
+    ) -> Result<Subscription<XSubscriptionEvent>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -162,8 +158,8 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::XAccountMonitoring],
-                SubscriberSink::XAccountMonitoring(publisher),
+                &[ServiceTopic::X],
+                SubscriberSink::X(publisher),
             )
             .await?;
         Ok(subscription)
@@ -173,12 +169,10 @@ impl KytrixAccountSession {
         self.connector.subscribe_session_state()
     }
 
-    pub async fn fetch_cryptocurrency_wallet_monitoring_selections(
+    pub async fn fetch_cryptocurrency_wallet_monitor_selections(
         &self,
-    ) -> Result<
-        CryptocurrencyWalletMonitoringSelectionsResponse,
-        CryptocurrencyWalletMonitoringApiError,
-    > {
+    ) -> Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>
+    {
         let response = self
             .connector
             .call_rpc(
@@ -189,36 +183,35 @@ impl KytrixAccountSession {
                 ),
             )
             .await
-            .map_err(|error| cryptocurrency_wallet_monitoring::map_rpc_error(error.into_error()))?;
+            .map_err(|error| cryptocurrency_wallet_monitor::map_rpc_error(error.into_error()))?;
         let ServerResponseKind::CryptocurrencyWalletMonitoringSelections(response) = response
         else {
-            return Err(CryptocurrencyWalletMonitoringApiError::Protocol(
-                "unexpected cryptocurrency_wallet_monitoring selections RPC response".into(),
+            return Err(CryptocurrencyWalletMonitorApiError::Protocol(
+                "unexpected cryptocurrency_wallet_monitor selections RPC response".into(),
             ));
         };
-        let mut value = CryptocurrencyWalletMonitoringSelectionsResponse {
+        let mut value = CryptocurrencyWalletMonitorSelectionsResponse {
             selections: response
                 .selections
                 .into_iter()
-                .map(cryptocurrency_wallet_monitoring::decode_cryptocurrency_wallet_monitoring_selection)
+                .map(cryptocurrency_wallet_monitor::decode_cryptocurrency_wallet_monitor_selection)
                 .collect::<Result<Vec<_>, _>>()?,
-            cryptocurrency_wallet_monitoring_address_limit: response.cryptocurrency_wallet_monitoring_address_limit as usize,
+            cryptocurrency_wallet_monitoring_address_limit: response
+                .cryptocurrency_wallet_monitoring_address_limit
+                as usize,
         };
-        cryptocurrency_wallet_monitoring::validate_selections(&value)?;
-        cryptocurrency_wallet_monitoring::sort_selections(&mut value.selections);
+        cryptocurrency_wallet_monitor::validate_selections(&value)?;
+        cryptocurrency_wallet_monitor::sort_selections(&mut value.selections);
         Ok(value)
     }
 
-    pub async fn add_cryptocurrency_wallet_monitoring_selection(
+    pub async fn add_cryptocurrency_wallet_monitor_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitoringMutationOutcome<CryptocurrencyWalletMonitoringSelection>
-    {
-        if cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(address)
-            .is_none()
-        {
-            return CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitoringApiError::InvalidAddress,
+    ) -> CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection> {
+        if cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(address).is_none() {
+            return CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitorApiError::InvalidAddress,
             );
         }
         let response = match self
@@ -235,40 +228,38 @@ impl KytrixAccountSession {
             .await
         {
             Ok(response) => response,
-            Err(error) => return cryptocurrency_wallet_monitoring::mutation_rpc_error(error),
+            Err(error) => return cryptocurrency_wallet_monitor::mutation_rpc_error(error),
         };
         let ServerResponseKind::CryptocurrencyWalletMonitoringAddSelection(response) = response
         else {
-            return CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            return CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
             );
         };
         let Some(selection) = response.selection else {
-            return CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            return CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
             );
         };
-        match cryptocurrency_wallet_monitoring::decode_cryptocurrency_wallet_monitoring_selection(
+        match cryptocurrency_wallet_monitor::decode_cryptocurrency_wallet_monitor_selection(
             selection,
         ) {
             Ok(selection) if selection.address == address => {
-                CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(selection)
+                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(selection)
             }
-            Ok(_) | Err(_) => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            Ok(_) | Err(_) => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
             ),
         }
     }
 
-    pub async fn delete_cryptocurrency_wallet_monitoring_selection(
+    pub async fn delete_cryptocurrency_wallet_monitor_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitoringMutationOutcome<()> {
-        if cryptocurrency_wallet_monitoring::cryptocurrency_wallet_monitoring_network(address)
-            .is_none()
-        {
-            return CryptocurrencyWalletMonitoringMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitoringApiError::InvalidAddress,
+    ) -> CryptocurrencyWalletMonitorMutationOutcome<()> {
+        if cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(address).is_none() {
+            return CryptocurrencyWalletMonitorMutationOutcome::Rejected(
+                CryptocurrencyWalletMonitorApiError::InvalidAddress,
             );
         }
         match self
@@ -285,26 +276,22 @@ impl KytrixAccountSession {
             .await
         {
             Ok(ServerResponseKind::CryptocurrencyWalletMonitoringDeleteSelection(_)) => {
-                CryptocurrencyWalletMonitoringMutationOutcome::Confirmed(())
+                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(())
             }
-            Ok(_) => CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::InvalidResponse,
+            Ok(_) => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
             ),
-            Err(error) => cryptocurrency_wallet_monitoring::mutation_rpc_error(error),
+            Err(error) => cryptocurrency_wallet_monitor::mutation_rpc_error(error),
         }
     }
 
-    pub async fn search_x_users(
-        &self,
-        query: &str,
-    ) -> Result<Vec<XAccountMonitoringProfile>, XAccountMonitoringApiError> {
-        let query = x::normalize_search_query(query)
-            .ok_or(XAccountMonitoringApiError::InvalidSearchQuery)?;
+    pub async fn search_x_users(&self, query: &str) -> Result<Vec<XProfile>, XApiError> {
+        let query = x::normalize_search_query(query).ok_or(XApiError::InvalidSearchQuery)?;
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::XAccountMonitoring,
+                KytrixServiceCapability::X,
                 ClientRequestKind::XAccountMonitoringSearch(XAccountMonitoringSearch {
                     query: query.to_owned(),
                 }),
@@ -312,7 +299,7 @@ impl KytrixAccountSession {
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
         let ServerResponseKind::XAccountMonitoringSearch(response) = response else {
-            return Err(XAccountMonitoringApiError::Protocol(
+            return Err(XApiError::Protocol(
                 "unexpected X search RPC response".into(),
             ));
         };
@@ -325,20 +312,18 @@ impl KytrixAccountSession {
         Ok(profiles)
     }
 
-    pub async fn fetch_x_selections(
-        &self,
-    ) -> Result<XAccountMonitoringSelectionsResponse, XAccountMonitoringApiError> {
+    pub async fn fetch_x_selections(&self) -> Result<XSelectionsResponse, XApiError> {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::XAccountMonitoring,
+                KytrixServiceCapability::X,
                 ClientRequestKind::XAccountMonitoringSelections(XAccountMonitoringSelections {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
         let ServerResponseKind::XAccountMonitoringSelections(response) = response else {
-            return Err(XAccountMonitoringApiError::Protocol(
+            return Err(XApiError::Protocol(
                 "unexpected X selections RPC response".into(),
             ));
         };
@@ -347,7 +332,7 @@ impl KytrixAccountSession {
             .into_iter()
             .map(x::decode_x_selection)
             .collect::<Result<Vec<_>, _>>()?;
-        let value = XAccountMonitoringSelectionsResponse {
+        let value = XSelectionsResponse {
             selections,
             x_account_limit: response.x_account_limit as usize,
         };
@@ -355,46 +340,39 @@ impl KytrixAccountSession {
         Ok(value)
     }
 
-    pub async fn fetch_x_tweets(
-        &self,
-    ) -> Result<XAccountMonitoringTweetBatch, XAccountMonitoringApiError> {
+    pub async fn fetch_x_tweets(&self) -> Result<XTweetBatch, XApiError> {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::XAccountMonitoring,
+                KytrixServiceCapability::X,
                 ClientRequestKind::XAccountMonitoringTweets(XAccountMonitoringTweets {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
         let ServerResponseKind::XAccountMonitoringTweets(response) = response else {
-            return Err(XAccountMonitoringApiError::Protocol(
+            return Err(XApiError::Protocol(
                 "unexpected X tweets RPC response".into(),
             ));
         };
-        let batch = response.batch.ok_or_else(|| {
-            XAccountMonitoringApiError::Protocol("X tweets RPC response is missing data".into())
-        })?;
+        let batch = response
+            .batch
+            .ok_or_else(|| XApiError::Protocol("X tweets RPC response is missing data".into()))?;
         x::decode_tweets_response(TweetsResponse {
             tweets: batch.tweets,
             profiles: batch.profiles,
         })
     }
 
-    pub async fn add_x_selection(
-        &self,
-        username: &str,
-    ) -> XAccountMonitoringMutationOutcome<XAccountMonitoringSelection> {
+    pub async fn add_x_selection(&self, username: &str) -> XMutationOutcome<XSelection> {
         if !valid_x_username(username) {
-            return XAccountMonitoringMutationOutcome::Rejected(
-                XAccountMonitoringApiError::InvalidUsername,
-            );
+            return XMutationOutcome::Rejected(XApiError::InvalidUsername);
         }
         let response = match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::XAccountMonitoring,
+                KytrixServiceCapability::X,
                 ClientRequestKind::XAccountMonitoringAddSelection(XAccountMonitoringAddSelection {
                     username: username.to_owned(),
                 }),
@@ -408,14 +386,10 @@ impl KytrixAccountSession {
             }
         };
         let ServerResponseKind::XAccountMonitoringAddSelection(response) = response else {
-            return XAccountMonitoringMutationOutcome::Unknown(
-                XAccountMonitoringMutationUnknown::InvalidResponse,
-            );
+            return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
         };
         let Some(selection) = response.selection else {
-            return XAccountMonitoringMutationOutcome::Unknown(
-                XAccountMonitoringMutationUnknown::InvalidResponse,
-            );
+            return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
         };
         match x::decode_x_selection(selection) {
             // A profile is what the service sends once the account is active, so an answer
@@ -427,28 +401,21 @@ impl KytrixAccountSession {
                     .as_ref()
                     .is_none_or(|profile| profile.username.eq_ignore_ascii_case(username)) =>
             {
-                XAccountMonitoringMutationOutcome::Confirmed(selection)
+                XMutationOutcome::Confirmed(selection)
             }
-            Ok(_) | Err(_) => XAccountMonitoringMutationOutcome::Unknown(
-                XAccountMonitoringMutationUnknown::InvalidResponse,
-            ),
+            Ok(_) | Err(_) => XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse),
         }
     }
 
-    pub async fn delete_x_selection(
-        &self,
-        x_user_id: &str,
-    ) -> XAccountMonitoringMutationOutcome<()> {
+    pub async fn delete_x_selection(&self, x_user_id: &str) -> XMutationOutcome<()> {
         if !valid_x_id(x_user_id) {
-            return XAccountMonitoringMutationOutcome::Rejected(
-                XAccountMonitoringApiError::Protocol("X user ID is invalid".into()),
-            );
+            return XMutationOutcome::Rejected(XApiError::Protocol("X user ID is invalid".into()));
         }
         match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::XAccountMonitoring,
+                KytrixServiceCapability::X,
                 ClientRequestKind::XAccountMonitoringDeleteSelection(
                     XAccountMonitoringDeleteSelection {
                         x_user_id: x_user_id.to_owned(),
@@ -458,11 +425,9 @@ impl KytrixAccountSession {
             .await
         {
             Ok(ServerResponseKind::XAccountMonitoringDeleteSelection(_)) => {
-                XAccountMonitoringMutationOutcome::Confirmed(())
+                XMutationOutcome::Confirmed(())
             }
-            Ok(_) => XAccountMonitoringMutationOutcome::Unknown(
-                XAccountMonitoringMutationUnknown::InvalidResponse,
-            ),
+            Ok(_) => XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse),
             Err(error) => {
                 let (error, possibly_submitted) = error.into_parts();
                 x::mutation_rpc_error(error, possibly_submitted)
@@ -1274,11 +1239,10 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::service::{
-        cryptocurrency_wallet_monitoring::{
-            CryptocurrencyWalletMonitoringMutationOutcome,
-            CryptocurrencyWalletMonitoringMutationUnknown,
+        cryptocurrency_wallet_monitor::{
+            CryptocurrencyWalletMonitorMutationOutcome, CryptocurrencyWalletMonitorMutationUnknown,
         },
-        x::XAccountMonitoringSelectionStatus,
+        x::XSelectionStatus,
     };
 
     #[tokio::test]
@@ -1465,8 +1429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cryptocurrency_wallet_monitoring_mutation_response_loss_is_unknown_and_is_not_retried()
-    {
+    async fn cryptocurrency_wallet_monitor_mutation_response_loss_is_unknown_and_is_not_retried() {
         let mut server = TestServiceServer::spawn(false).await;
         server.drop_next_response();
         let connector =
@@ -1479,10 +1442,10 @@ mod tests {
 
         assert_eq!(
             session
-                .add_cryptocurrency_wallet_monitoring_selection(address)
+                .add_cryptocurrency_wallet_monitor_selection(address)
                 .await,
-            CryptocurrencyWalletMonitoringMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitoringMutationUnknown::ResponseLost
+            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
+                CryptocurrencyWalletMonitorMutationUnknown::ResponseLost
             )
         );
         assert_eq!(
@@ -1510,12 +1473,10 @@ mod tests {
             .await
             .unwrap();
 
-        let XAccountMonitoringMutationOutcome::Confirmed(selection) =
-            session.add_x_selection("kytrix").await
-        else {
+        let XMutationOutcome::Confirmed(selection) = session.add_x_selection("kytrix").await else {
             panic!("an add the service confirmed should be confirmed");
         };
-        assert_eq!(selection.status, XAccountMonitoringSelectionStatus::Pending);
+        assert_eq!(selection.status, XSelectionStatus::Pending);
         assert_eq!(selection.profile, None);
         assert_eq!(
             server.next_request().await.1,
@@ -1530,7 +1491,7 @@ mod tests {
     async fn pending_rpc_responses_can_complete_out_of_order_and_cancel_independently() {
         let (_invalidations, invalidations) = credential_change_watch();
         let (mut actor, _subscription) =
-            actor_with_cryptocurrency_wallet_monitoring_subscriber(invalidations);
+            actor_with_cryptocurrency_wallet_monitor_subscriber(invalidations);
         let profile = actor
             .account_profile
             .read()
@@ -1751,14 +1712,14 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(index.clone()),
-                    ServiceTopic::XAccountMonitoring,
+                    ServiceTopic::X,
                 ])
             )
         );
-        let mut cryptocurrency_wallet_monitoring = session
-            .subscribe_cryptocurrency_wallet_monitoring()
+        let mut cryptocurrency_wallet_monitor = session
+            .subscribe_cryptocurrency_wallet_monitor()
             .await
-            .expect("cryptocurrency_wallet_monitoring should subscribe");
+            .expect("cryptocurrency_wallet_monitor should subscribe");
         assert_eq!(
             server.next_request().await,
             (
@@ -1766,15 +1727,13 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(index),
-                    ServiceTopic::XAccountMonitoring,
+                    ServiceTopic::X,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
                 ])
             )
         );
-        let mut strategic_maritime_chokepoints_tracking = session
-            .subscribe_strategic_maritime_chokepoints_tracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            )
+        let mut global_shipping_chokepoint = session
+            .subscribe_global_shipping_chokepoint(GlobalShippingChokepointArea::Hormuz)
             .await
             .expect("AIS should subscribe");
         assert_eq!(
@@ -1784,11 +1743,9 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
-                    ServiceTopic::XAccountMonitoring,
+                    ServiceTopic::X,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
-                    ServiceTopic::StrategicMaritimeChokepointsTracking(
-                        StrategicMaritimeChokepointsTrackingArea::Hormuz
-                    ),
+                    ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
                 ])
             )
         );
@@ -1797,10 +1754,8 @@ mod tests {
         server.send_news("typed-news");
         server.send_financial_index("SPX");
         server.send_x_profile();
-        server.send_cryptocurrency_wallet_monitoring_transfer(
-            "typed-cryptocurrency_wallet_monitoring",
-        );
-        server.send_strategic_maritime_chokepoints_tracking_delta();
+        server.send_cryptocurrency_wallet_monitor_transfer("typed-cryptocurrency_wallet_monitor");
+        server.send_global_shipping_chokepoint_delta();
 
         assert_eq!(
             timeout(Duration::from_secs(2), news.recv())
@@ -1824,59 +1779,43 @@ mod tests {
             .expect("X subscription should remain active");
         assert!(matches!(
             x_event,
-            XAccountMonitoringSubscriptionEvent::Profile(XAccountMonitoringProfileEvent { username, .. }) if username == "kytrix"
+            XSubscriptionEvent::Profile(XProfileEvent { username, .. }) if username == "kytrix"
         ));
         assert_eq!(
-            timeout(
-                Duration::from_secs(2),
-                cryptocurrency_wallet_monitoring.recv()
-            )
-            .await
-            .expect("cryptocurrency_wallet_monitoring event should arrive")
-            .expect("cryptocurrency_wallet_monitoring subscription should remain active")
-            .event_id,
-            "typed-cryptocurrency_wallet_monitoring"
+            timeout(Duration::from_secs(2), cryptocurrency_wallet_monitor.recv())
+                .await
+                .expect("cryptocurrency_wallet_monitor event should arrive")
+                .expect("cryptocurrency_wallet_monitor subscription should remain active")
+                .event_id,
+            "typed-cryptocurrency_wallet_monitor"
         );
         assert_eq!(
-            timeout(
-                Duration::from_secs(2),
-                strategic_maritime_chokepoints_tracking.recv()
-            )
-            .await
-            .expect("AIS event should arrive")
-            .expect("AIS subscription should remain active"),
-            StrategicMaritimeChokepointsTrackingUpdate::from_proto(
-                strategic_maritime_chokepoints_tracking_delta()
-            )
+            timeout(Duration::from_secs(2), global_shipping_chokepoint.recv())
+                .await
+                .expect("AIS event should arrive")
+                .expect("AIS subscription should remain active"),
+            GlobalShippingChokepointUpdate::from_proto(global_shipping_chokepoint_delta())
         );
         assert!(news.try_recv_for_test().is_err());
         assert!(indices.try_recv_for_test().is_err());
         assert!(x.try_recv_for_test().is_err());
-        assert!(
-            cryptocurrency_wallet_monitoring
-                .try_recv_for_test()
-                .is_err()
-        );
-        assert!(
-            strategic_maritime_chokepoints_tracking
-                .try_recv_for_test()
-                .is_err()
-        );
+        assert!(cryptocurrency_wallet_monitor.try_recv_for_test().is_err());
+        assert!(global_shipping_chokepoint.try_recv_for_test().is_err());
 
         drop((
             news,
             indices,
             x,
-            cryptocurrency_wallet_monitoring,
-            strategic_maritime_chokepoints_tracking,
+            cryptocurrency_wallet_monitor,
+            global_shipping_chokepoint,
         ));
         connector.shutdown().await;
         server.shutdown().await;
     }
 
     #[tokio::test]
-    async fn strategic_maritime_chokepoints_tracking_subscription_should_release_the_remote_topic_when_dropped()
-     {
+    async fn global_shipping_chokepoint_subscription_should_release_the_remote_topic_when_dropped()
+    {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
@@ -1885,25 +1824,21 @@ mod tests {
             .await
             .expect("test account should resolve");
 
-        let strategic_maritime_chokepoints_tracking = session
-            .subscribe_strategic_maritime_chokepoints_tracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            )
+        let global_shipping_chokepoint = session
+            .subscribe_global_shipping_chokepoint(GlobalShippingChokepointArea::Hormuz)
             .await
             .expect("AIS should subscribe");
         assert_eq!(
             server.next_request().await,
             (
                 1,
-                ObservedRequest::SetSubscriptions(vec![
-                    ServiceTopic::StrategicMaritimeChokepointsTracking(
-                        StrategicMaritimeChokepointsTrackingArea::Hormuz
-                    )
-                ])
+                ObservedRequest::SetSubscriptions(vec![ServiceTopic::GlobalShippingChokepoint(
+                    GlobalShippingChokepointArea::Hormuz
+                )])
             )
         );
 
-        drop(strategic_maritime_chokepoints_tracking);
+        drop(global_shipping_chokepoint);
         assert_eq!(
             server.next_request().await,
             (1, ObservedRequest::SetSubscriptions(Vec::new()))
@@ -1919,7 +1854,7 @@ mod tests {
     /// both panes share this connection: without the session's own replay the second pane
     /// would receive only deltas it cannot apply until the server's fallback keyframe.
     #[tokio::test]
-    async fn a_second_strategic_maritime_chokepoints_tracking_subscription_should_start_from_the_keyframe_the_session_holds()
+    async fn a_second_global_shipping_chokepoint_subscription_should_start_from_the_keyframe_the_session_holds()
      {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
@@ -1930,24 +1865,20 @@ mod tests {
             .expect("test account should resolve");
 
         let mut first = session
-            .subscribe_strategic_maritime_chokepoints_tracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            )
+            .subscribe_global_shipping_chokepoint(GlobalShippingChokepointArea::Hormuz)
             .await
             .expect("AIS should subscribe");
         assert_eq!(
             server.next_request().await,
             (
                 1,
-                ObservedRequest::SetSubscriptions(vec![
-                    ServiceTopic::StrategicMaritimeChokepointsTracking(
-                        StrategicMaritimeChokepointsTrackingArea::Hormuz
-                    )
-                ])
+                ObservedRequest::SetSubscriptions(vec![ServiceTopic::GlobalShippingChokepoint(
+                    GlobalShippingChokepointArea::Hormuz
+                )])
             )
         );
 
-        server.send_strategic_maritime_chokepoints_tracking_keyframe();
+        server.send_global_shipping_chokepoint_keyframe();
         let keyframe = timeout(Duration::from_secs(2), first.recv())
             .await
             .expect("the keyframe should arrive")
@@ -1955,9 +1886,7 @@ mod tests {
         assert!(keyframe.keyframe);
 
         let mut second = session
-            .subscribe_strategic_maritime_chokepoints_tracking(
-                StrategicMaritimeChokepointsTrackingArea::Hormuz,
-            )
+            .subscribe_global_shipping_chokepoint(GlobalShippingChokepointArea::Hormuz)
             .await
             .expect("AIS should subscribe a second time");
         assert_eq!(

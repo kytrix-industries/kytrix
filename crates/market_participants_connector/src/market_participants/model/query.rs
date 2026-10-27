@@ -4,7 +4,7 @@
 //! listing-scoped request names the exact `VenueListingKey` it is about, a
 //! route-scoped request names its `VenueRoute`, an authenticated request names
 //! its `AuthenticatedTarget`, and a wallet request names its
-//! `WalletMonitorTarget`. No request is identified by a bare native symbol: the
+//! `WalletTarget`. No request is identified by a bare native symbol: the
 //! symbol a venue's wire needs is one field of the resolved listing, not a
 //! substitute for it.
 

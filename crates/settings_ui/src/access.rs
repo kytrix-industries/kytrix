@@ -262,10 +262,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(
-            proxy_route_of(
-                &config,
-                &target(KytrixServiceCapability::XAccountMonitoringMedia)
-            ),
+            proxy_route_of(&config, &target(KytrixServiceCapability::XMedia)),
             PROXY_INHERIT
         );
     }
@@ -274,7 +271,7 @@ mod tests {
     fn binding_a_group_should_reach_every_target_in_it() {
         let mut config = Config::default();
         let targets = [
-            target(KytrixServiceCapability::XAccountMonitoringMedia),
+            target(KytrixServiceCapability::XMedia),
             target(KytrixServiceCapability::News),
         ];
 
@@ -288,13 +285,13 @@ mod tests {
     fn targets_that_disagree_should_report_a_mixed_group() {
         let mut config = Config::default();
         let targets = [
-            target(KytrixServiceCapability::XAccountMonitoringMedia),
+            target(KytrixServiceCapability::XMedia),
             target(KytrixServiceCapability::News),
         ];
 
         set_proxy_route_of_group(
             &mut config,
-            [target(KytrixServiceCapability::XAccountMonitoringMedia)],
+            [target(KytrixServiceCapability::XMedia)],
             &FieldValue::new_static("hk"),
         );
 
@@ -304,7 +301,7 @@ mod tests {
     #[test]
     fn unbinding_a_group_should_follow_the_default_again() {
         let mut config = Config::default();
-        let targets = [target(KytrixServiceCapability::XAccountMonitoringMedia)];
+        let targets = [target(KytrixServiceCapability::XMedia)];
 
         set_proxy_route_of_group(&mut config, targets.clone(), &FieldValue::new_static("hk"));
         set_proxy_route_of_group(&mut config, targets, &FieldValue::new_static(PROXY_INHERIT));
@@ -321,7 +318,7 @@ mod tests {
         for value in [PROXY_MIXED, "@none", ""] {
             set_proxy_route_of_group(
                 &mut config,
-                [target(KytrixServiceCapability::XAccountMonitoringMedia)],
+                [target(KytrixServiceCapability::XMedia)],
                 &FieldValue::new_static(value),
             );
             assert!(

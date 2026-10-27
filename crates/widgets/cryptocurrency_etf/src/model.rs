@@ -37,7 +37,7 @@ pub(crate) const MAX_ETF_DAYS_PER_ASSET: usize = 16_384;
 
 /// The asset whose ETF complex a chart is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum EtfAsset {
+pub(crate) enum CryptocurrencyEtfAsset {
     #[default]
     #[serde(rename = "btc")]
     Btc,
@@ -49,7 +49,7 @@ pub(crate) enum EtfAsset {
     Hyp,
 }
 
-impl EtfAsset {
+impl CryptocurrencyEtfAsset {
     /// Every asset the service publishes, in the order the tabs offer them.
     pub(crate) const ALL: [Self; 4] = [Self::Btc, Self::Eth, Self::Sol, Self::Hyp];
 
@@ -76,7 +76,7 @@ impl EtfAsset {
 
 /// How much of the history a chart shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum EtfWindow {
+pub(crate) enum CryptocurrencyEtfWindow {
     #[default]
     #[serde(rename = "days_30")]
     Days30,
@@ -90,7 +90,7 @@ pub(crate) enum EtfWindow {
     All,
 }
 
-impl EtfWindow {
+impl CryptocurrencyEtfWindow {
     /// Every window the picker offers, in the order it offers them.
     pub(crate) const ALL: [Self; 5] = [
         Self::Days30,
@@ -119,7 +119,7 @@ impl EtfWindow {
 
 /// Which funds a chart is showing together.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum EtfFundSelection {
+pub(crate) enum CryptocurrencyEtfFundSelection {
     /// Every fund of the asset, which is what its total flow is.
     #[default]
     #[serde(rename = "all")]
@@ -131,7 +131,7 @@ pub(crate) enum EtfFundSelection {
 
 /// One trading day of one asset.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct EtfDay {
+pub(crate) struct CryptocurrencyEtfDay {
     pub date: Date,
     /// One flow per fund, in the asset's own fund order, in millions of dollars.
     pub fund_flows: Arc<[f64]>,
@@ -143,17 +143,20 @@ pub(crate) struct EtfDay {
 
 /// The history of one asset.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct EtfDataset {
-    pub asset: EtfAsset,
+pub(crate) struct CryptocurrencyEtfDataset {
+    pub asset: CryptocurrencyEtfAsset,
     /// The funds the rows are read in, in the order they were read.
     pub funds: Arc<[SmolStr]>,
     /// The rows, oldest first.
-    pub days: Arc<[EtfDay]>,
+    pub days: Arc<[CryptocurrencyEtfDay]>,
 }
 
-impl EtfDataset {
+impl CryptocurrencyEtfDataset {
     /// The most recent rows a window keeps, borrowed from the same history.
-    pub(crate) fn days_for_window(&self, window: EtfWindow) -> &[EtfDay] {
+    pub(crate) fn days_for_window(
+        &self,
+        window: CryptocurrencyEtfWindow,
+    ) -> &[CryptocurrencyEtfDay] {
         let start = window
             .day_limit()
             .map_or(0, |limit| self.days.len().saturating_sub(limit));
@@ -169,10 +172,14 @@ impl EtfDataset {
     ///
     /// A named fund the asset does not have has no flow rather than a zero one:
     /// the two are different readings, and only one of them is a number.
-    pub(crate) fn flow_for(&self, day: &EtfDay, selection: &EtfFundSelection) -> Option<f64> {
+    pub(crate) fn flow_for(
+        &self,
+        day: &CryptocurrencyEtfDay,
+        selection: &CryptocurrencyEtfFundSelection,
+    ) -> Option<f64> {
         match selection {
-            EtfFundSelection::All => Some(day.total_flow),
-            EtfFundSelection::Named(name) => self
+            CryptocurrencyEtfFundSelection::All => Some(day.total_flow),
+            CryptocurrencyEtfFundSelection::Named(name) => self
                 .fund_index(name.as_str())
                 .and_then(|index| day.fund_flows.get(index).copied()),
         }
@@ -181,13 +188,13 @@ impl EtfDataset {
 
 /// Every asset's history, which is what one service answer becomes.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct EtfSnapshot {
-    /// One history per asset, in [`EtfAsset::ALL`] order.
-    pub datasets: [Arc<EtfDataset>; 4],
+pub(crate) struct CryptocurrencyEtfSnapshot {
+    /// One history per asset, in [`CryptocurrencyEtfAsset::ALL`] order.
+    pub datasets: [Arc<CryptocurrencyEtfDataset>; 4],
 }
 
-impl EtfSnapshot {
-    pub(crate) fn dataset(&self, asset: EtfAsset) -> Arc<EtfDataset> {
+impl CryptocurrencyEtfSnapshot {
+    pub(crate) fn dataset(&self, asset: CryptocurrencyEtfAsset) -> Arc<CryptocurrencyEtfDataset> {
         self.datasets[asset.index()].clone()
     }
 }
@@ -198,26 +205,41 @@ impl EtfSnapshot {
 /// whole answer, and a message that did not say which asset it was about would
 /// leave the reader looking through four of them.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub(crate) enum EtfParseError {
+pub(crate) enum CryptocurrencyEtfParseError {
     #[error("{asset:?} ETF response contains no dated rows")]
-    EmptyAssetMap { asset: EtfAsset },
+    EmptyAssetMap { asset: CryptocurrencyEtfAsset },
     #[error("invalid {asset:?} ETF trading date `{value}`; expected `YYYY-MM-DD`")]
-    InvalidDate { asset: EtfAsset, value: SmolStr },
+    InvalidDate {
+        asset: CryptocurrencyEtfAsset,
+        value: SmolStr,
+    },
     #[error("{asset:?} ETF response contains duplicate trading date `{date}`")]
-    DuplicateDate { asset: EtfAsset, date: Date },
+    DuplicateDate {
+        asset: CryptocurrencyEtfAsset,
+        date: Date,
+    },
     #[error("{asset:?} ETF response exceeds the {maximum}-day safety limit")]
-    TooManyRows { asset: EtfAsset, maximum: usize },
+    TooManyRows {
+        asset: CryptocurrencyEtfAsset,
+        maximum: usize,
+    },
     #[error("invalid {asset:?} ETF number `{value}` on `{date}` for `{fund}`")]
     InvalidNumber {
-        asset: EtfAsset,
+        asset: CryptocurrencyEtfAsset,
         date: SmolStr,
         fund: SmolStr,
         value: SmolStr,
     },
     #[error("{asset:?} ETF total flow became non-finite on `{date}`")]
-    NonFiniteTotal { asset: EtfAsset, date: Date },
+    NonFiniteTotal {
+        asset: CryptocurrencyEtfAsset,
+        date: Date,
+    },
     #[error("{asset:?} ETF net assets became non-finite at `{date}`")]
-    NonFiniteAssets { asset: EtfAsset, date: Date },
+    NonFiniteAssets {
+        asset: CryptocurrencyEtfAsset,
+        date: Date,
+    },
 }
 
 /// One row before the running total is folded into it.
@@ -245,9 +267,9 @@ const HYPE_FUNDS: [&str; 3] = ["BHYP", "THYP", "HYPG"];
 /// market and half of one would be a chart that disagrees with itself.
 pub(crate) fn parse_etf(
     snapshot: proto_types::CryptocurrencyEtf,
-) -> Result<EtfSnapshot, EtfParseError> {
+) -> Result<CryptocurrencyEtfSnapshot, CryptocurrencyEtfParseError> {
     let btc = parse_rows(
-        EtfAsset::Btc,
+        CryptocurrencyEtfAsset::Btc,
         &BTC_FUNDS,
         snapshot.btc.iter().map(|(date, row)| {
             (
@@ -270,7 +292,7 @@ pub(crate) fn parse_etf(
         }),
     )?;
     let eth = parse_rows(
-        EtfAsset::Eth,
+        CryptocurrencyEtfAsset::Eth,
         &ETH_FUNDS,
         snapshot.eth.iter().map(|(date, row)| {
             (
@@ -291,7 +313,7 @@ pub(crate) fn parse_etf(
         }),
     )?;
     let sol = parse_rows(
-        EtfAsset::Sol,
+        CryptocurrencyEtfAsset::Sol,
         &SOL_FUNDS,
         snapshot.sol.iter().map(|(date, row)| {
             (
@@ -308,7 +330,7 @@ pub(crate) fn parse_etf(
         }),
     )?;
     let hype = parse_rows(
-        EtfAsset::Hyp,
+        CryptocurrencyEtfAsset::Hyp,
         &HYPE_FUNDS,
         snapshot.hype.iter().map(|(date, row)| {
             (
@@ -318,17 +340,17 @@ pub(crate) fn parse_etf(
         }),
     )?;
 
-    Ok(EtfSnapshot {
+    Ok(CryptocurrencyEtfSnapshot {
         datasets: [Arc::new(btc), Arc::new(eth), Arc::new(sol), Arc::new(hype)],
     })
 }
 
 /// Reads the dated rows of one asset into its history.
 fn parse_rows<'a, I, const N: usize>(
-    asset: EtfAsset,
+    asset: CryptocurrencyEtfAsset,
     funds: &[&'static str; N],
     rows: I,
-) -> Result<EtfDataset, EtfParseError>
+) -> Result<CryptocurrencyEtfDataset, CryptocurrencyEtfParseError>
 where
     I: IntoIterator<Item = (&'a str, [&'a str; N])>,
 {
@@ -338,15 +360,16 @@ where
         let mut fund_flows = Vec::with_capacity(funds.len());
         let mut total_flow = 0.0;
         for (fund, value) in funds.iter().zip(values) {
-            let flow = parse_number(value).ok_or_else(|| EtfParseError::InvalidNumber {
-                asset,
-                date: date_text.into(),
-                fund: (*fund).into(),
-                value: value.into(),
-            })?;
+            let flow =
+                parse_number(value).ok_or_else(|| CryptocurrencyEtfParseError::InvalidNumber {
+                    asset,
+                    date: date_text.into(),
+                    fund: (*fund).into(),
+                    value: value.into(),
+                })?;
             total_flow += flow;
             if !total_flow.is_finite() {
-                return Err(EtfParseError::NonFiniteTotal { asset, date });
+                return Err(CryptocurrencyEtfParseError::NonFiniteTotal { asset, date });
             }
             fund_flows.push(flow);
         }
@@ -354,10 +377,12 @@ where
         // that is too large is refused instead of being built and then measured.
         let at_capacity = parsed_days.len() == MAX_ETF_DAYS_PER_ASSET;
         match parsed_days.entry(date) {
-            Entry::Occupied(_) => return Err(EtfParseError::DuplicateDate { asset, date }),
+            Entry::Occupied(_) => {
+                return Err(CryptocurrencyEtfParseError::DuplicateDate { asset, date });
+            }
             Entry::Vacant(entry) => {
                 if at_capacity {
-                    return Err(EtfParseError::TooManyRows {
+                    return Err(CryptocurrencyEtfParseError::TooManyRows {
                         asset,
                         maximum: MAX_ETF_DAYS_PER_ASSET,
                     });
@@ -370,7 +395,7 @@ where
         }
     }
     if parsed_days.is_empty() {
-        return Err(EtfParseError::EmptyAssetMap { asset });
+        return Err(CryptocurrencyEtfParseError::EmptyAssetMap { asset });
     }
 
     let mut net_assets = 0.0;
@@ -378,9 +403,9 @@ where
     for (date, parsed) in parsed_days {
         net_assets += parsed.total_flow;
         if !net_assets.is_finite() {
-            return Err(EtfParseError::NonFiniteAssets { asset, date });
+            return Err(CryptocurrencyEtfParseError::NonFiniteAssets { asset, date });
         }
-        days.push(EtfDay {
+        days.push(CryptocurrencyEtfDay {
             date,
             fund_flows: parsed.fund_flows,
             total_flow: parsed.total_flow,
@@ -388,7 +413,7 @@ where
         });
     }
 
-    Ok(EtfDataset {
+    Ok(CryptocurrencyEtfDataset {
         asset,
         funds: Arc::from((*funds).map(SmolStr::new_static)),
         days: days.into(),
@@ -396,8 +421,11 @@ where
 }
 
 /// Reads an ISO trading date, refusing anything a `Date` would have to guess at.
-fn parse_date(asset: EtfAsset, value: &str) -> Result<Date, EtfParseError> {
-    let invalid_date = || EtfParseError::InvalidDate {
+fn parse_date(
+    asset: CryptocurrencyEtfAsset,
+    value: &str,
+) -> Result<Date, CryptocurrencyEtfParseError> {
+    let invalid_date = || CryptocurrencyEtfParseError::InvalidDate {
         asset,
         value: value.into(),
     };
@@ -496,7 +524,7 @@ mod tests {
     #[test]
     fn parse_should_use_fixed_ticker_order_and_sorted_dates() {
         let snapshot = parse_etf(valid_snapshot()).expect("valid protobuf snapshot should parse");
-        let btc = snapshot.dataset(EtfAsset::Btc);
+        let btc = snapshot.dataset(CryptocurrencyEtfAsset::Btc);
 
         assert_eq!(
             btc.funds.as_ref(),
@@ -509,9 +537,18 @@ mod tests {
         assert_eq!(btc.days[0].net_assets, 1_000.0);
         assert_eq!(btc.days[1].date, date(2024, Month::January, 3));
         assert_eq!(btc.days[1].net_assets, 950.0);
-        assert_eq!(snapshot.dataset(EtfAsset::Eth).funds[0], "ETHA");
-        assert_eq!(snapshot.dataset(EtfAsset::Sol).funds[0], "BSOL");
-        assert_eq!(snapshot.dataset(EtfAsset::Hyp).funds[0], "BHYP");
+        assert_eq!(
+            snapshot.dataset(CryptocurrencyEtfAsset::Eth).funds[0],
+            "ETHA"
+        );
+        assert_eq!(
+            snapshot.dataset(CryptocurrencyEtfAsset::Sol).funds[0],
+            "BSOL"
+        );
+        assert_eq!(
+            snapshot.dataset(CryptocurrencyEtfAsset::Hyp).funds[0],
+            "BHYP"
+        );
     }
 
     #[test]
@@ -528,8 +565,8 @@ mod tests {
         snapshot.btc = HashMap::from([("2024-02-30".into(), cryptocurrency_etf::Btc::default())]);
         assert!(matches!(
             parse_etf(snapshot.clone()),
-            Err(EtfParseError::InvalidDate {
-                asset: EtfAsset::Btc,
+            Err(CryptocurrencyEtfParseError::InvalidDate {
+                asset: CryptocurrencyEtfAsset::Btc,
                 ..
             })
         ));
@@ -543,8 +580,8 @@ mod tests {
         )]);
         assert!(matches!(
             parse_etf(snapshot.clone()),
-            Err(EtfParseError::InvalidNumber {
-                asset: EtfAsset::Btc,
+            Err(CryptocurrencyEtfParseError::InvalidNumber {
+                asset: CryptocurrencyEtfAsset::Btc,
                 ..
             })
         ));
@@ -552,8 +589,8 @@ mod tests {
         snapshot.btc.clear();
         assert!(matches!(
             parse_etf(snapshot),
-            Err(EtfParseError::EmptyAssetMap {
-                asset: EtfAsset::Btc
+            Err(CryptocurrencyEtfParseError::EmptyAssetMap {
+                asset: CryptocurrencyEtfAsset::Btc
             })
         ));
     }
@@ -571,8 +608,8 @@ mod tests {
         )]);
         assert!(matches!(
             parse_etf(snapshot.clone()),
-            Err(EtfParseError::NonFiniteTotal {
-                asset: EtfAsset::Btc,
+            Err(CryptocurrencyEtfParseError::NonFiniteTotal {
+                asset: CryptocurrencyEtfAsset::Btc,
                 ..
             })
         ));
@@ -595,8 +632,8 @@ mod tests {
         ]);
         assert!(matches!(
             parse_etf(snapshot),
-            Err(EtfParseError::NonFiniteAssets {
-                asset: EtfAsset::Btc,
+            Err(CryptocurrencyEtfParseError::NonFiniteAssets {
+                asset: CryptocurrencyEtfAsset::Btc,
                 ..
             })
         ));
@@ -615,7 +652,7 @@ mod tests {
         };
         let accepted_dates = dates(MAX_ETF_DAYS_PER_ASSET);
         let accepted = parse_rows(
-            EtfAsset::Hyp,
+            CryptocurrencyEtfAsset::Hyp,
             &HYPE_FUNDS,
             accepted_dates
                 .iter()
@@ -627,14 +664,14 @@ mod tests {
         let oversized_dates = dates(MAX_ETF_DAYS_PER_ASSET + 1);
         assert!(matches!(
             parse_rows(
-                EtfAsset::Hyp,
+                CryptocurrencyEtfAsset::Hyp,
                 &HYPE_FUNDS,
                 oversized_dates
                     .iter()
                     .map(|date| (date.as_str(), ["0"; HYPE_FUNDS.len()])),
             ),
-            Err(EtfParseError::TooManyRows {
-                asset: EtfAsset::Hyp,
+            Err(CryptocurrencyEtfParseError::TooManyRows {
+                asset: CryptocurrencyEtfAsset::Hyp,
                 maximum: MAX_ETF_DAYS_PER_ASSET,
             })
         ));
@@ -643,20 +680,20 @@ mod tests {
     #[test]
     fn days_for_window_should_take_latest_rows_without_allocating() {
         let days = (1..=35)
-            .map(|ordinal| EtfDay {
+            .map(|ordinal| CryptocurrencyEtfDay {
                 date: Date::from_ordinal_date(2024, ordinal).expect("test ordinal should be valid"),
                 fund_flows: Arc::from([f64::from(ordinal)]),
                 total_flow: f64::from(ordinal),
                 net_assets: f64::from(ordinal),
             })
             .collect::<Vec<_>>();
-        let dataset = EtfDataset {
-            asset: EtfAsset::Btc,
+        let dataset = CryptocurrencyEtfDataset {
+            asset: CryptocurrencyEtfAsset::Btc,
             funds: Arc::from([SmolStr::new_static("IBIT")]),
             days: days.into(),
         };
 
-        let window = dataset.days_for_window(EtfWindow::Days30);
+        let window = dataset.days_for_window(CryptocurrencyEtfWindow::Days30);
         assert_eq!(
             (window.len(), window.first().map(|day| day.date.ordinal())),
             (30, Some(6))
@@ -665,10 +702,10 @@ mod tests {
 
     #[test]
     fn a_named_fund_the_asset_does_not_have_should_have_no_flow() {
-        let dataset = EtfDataset {
-            asset: EtfAsset::Btc,
+        let dataset = CryptocurrencyEtfDataset {
+            asset: CryptocurrencyEtfAsset::Btc,
             funds: Arc::from([SmolStr::new_static("IBIT")]),
-            days: Arc::from([EtfDay {
+            days: Arc::from([CryptocurrencyEtfDay {
                 date: date(2024, Month::January, 2),
                 fund_flows: Arc::from([3.0]),
                 total_flow: 3.0,
@@ -677,13 +714,22 @@ mod tests {
         };
         let day = &dataset.days[0];
 
-        assert_eq!(dataset.flow_for(day, &EtfFundSelection::All), Some(3.0));
         assert_eq!(
-            dataset.flow_for(day, &EtfFundSelection::Named(SmolStr::new_static("IBIT"))),
+            dataset.flow_for(day, &CryptocurrencyEtfFundSelection::All),
             Some(3.0)
         );
         assert_eq!(
-            dataset.flow_for(day, &EtfFundSelection::Named(SmolStr::new_static("FBTC"))),
+            dataset.flow_for(
+                day,
+                &CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("IBIT"))
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            dataset.flow_for(
+                day,
+                &CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("FBTC"))
+            ),
             None
         );
     }

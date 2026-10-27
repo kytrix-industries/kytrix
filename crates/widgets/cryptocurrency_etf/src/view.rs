@@ -66,11 +66,16 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use crate::{
-    chart::{EtfChart, flow},
-    model::{EtfAsset, EtfFundSelection, EtfParseError, EtfWindow},
+    chart::{CryptocurrencyEtfChart, flow},
+    model::{
+        CryptocurrencyEtfAsset, CryptocurrencyEtfFundSelection, CryptocurrencyEtfParseError,
+        CryptocurrencyEtfWindow,
+    },
     service::{
-        EtfFetchError, EtfProtocol, EtfRequest, EtfResponse, EtfService, EtfServiceError,
-        EtfSource, EtfStatus, EtfStreamKey, EtfStreamMessage,
+        CryptocurrencyEtfFetchError, CryptocurrencyEtfProtocol, CryptocurrencyEtfRequest,
+        CryptocurrencyEtfResponse, CryptocurrencyEtfService, CryptocurrencyEtfServiceError,
+        CryptocurrencyEtfSource, CryptocurrencyEtfStatus, CryptocurrencyEtfStreamKey,
+        CryptocurrencyEtfStreamMessage,
     },
 };
 
@@ -90,20 +95,20 @@ const METRICS_HEIGHT: f32 = 58.0;
 /// pane does. Nothing here is part of a stream's scope either, so the widget persists no
 /// options at all and carries this type for its schema version alone.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct EtfConfig;
+pub struct CryptocurrencyEtfConfig;
 
-impl WidgetConfig for EtfConfig {
+impl WidgetConfig for CryptocurrencyEtfConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
 /// A failure a pane reports that is not already a stream error.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum EtfFailure {
-    Fetch(EtfFetchError),
-    Rpc(RpcCallError<EtfServiceError>),
+enum CryptocurrencyEtfFailure {
+    Fetch(CryptocurrencyEtfFetchError),
+    Rpc(RpcCallError<CryptocurrencyEtfServiceError>),
 }
 
-impl LocalizedError for EtfFailure {
+impl LocalizedError for CryptocurrencyEtfFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Fetch(error) => error.localized_message(cx),
@@ -112,65 +117,71 @@ impl LocalizedError for EtfFailure {
     }
 }
 
-impl LocalizedError for EtfFetchError {
+impl LocalizedError for CryptocurrencyEtfFetchError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
             Self::Parse(error) => error.localized_message(cx),
             Self::Timeout(timeout) => {
-                t!(cx, "error.etf.timeout", seconds = timeout.as_secs())
+                t!(
+                    cx,
+                    "error.cryptocurrency_etf.timeout",
+                    seconds = timeout.as_secs()
+                )
             }
         }
     }
 }
 
-impl LocalizedError for EtfServiceError {
+impl LocalizedError for CryptocurrencyEtfServiceError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::StreamClosed | Self::StreamBusy => t!(cx, "error.etf.stream_unavailable"),
+            Self::StreamClosed | Self::StreamBusy => {
+                t!(cx, "error.cryptocurrency_etf.stream_unavailable")
+            }
         }
     }
 }
 
-impl LocalizedError for EtfParseError {
+impl LocalizedError for CryptocurrencyEtfParseError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::EmptyAssetMap { .. } => t!(cx, "error.etf.no_data"),
+            Self::EmptyAssetMap { .. } => t!(cx, "error.cryptocurrency_etf.no_data"),
             Self::InvalidDate { value, .. } => {
-                t!(cx, "error.etf.invalid_date", value = value)
+                t!(cx, "error.cryptocurrency_etf.invalid_date", value = value)
             }
             Self::DuplicateDate { date, .. } => {
-                t!(cx, "error.etf.duplicate_date", value = date)
+                t!(cx, "error.cryptocurrency_etf.duplicate_date", value = date)
             }
             Self::TooManyRows { maximum, .. } => t!(
                 cx,
-                "error.etf.too_many_rows",
+                "error.cryptocurrency_etf.too_many_rows",
                 maximum = maximum,
                 value = maximum.saturating_add(1)
             ),
             Self::InvalidNumber { value, .. } => {
-                t!(cx, "error.etf.invalid_number", value = value)
+                t!(cx, "error.cryptocurrency_etf.invalid_number", value = value)
             }
             Self::NonFiniteTotal { .. } | Self::NonFiniteAssets { .. } => {
-                t!(cx, "error.etf.non_finite")
+                t!(cx, "error.cryptocurrency_etf.non_finite")
             }
         }
     }
 }
 
 /// One ETF flow pane: the account it follows, the chart it draws, and its controls.
-pub struct EtfWidget {
+pub struct CryptocurrencyEtfWidget {
     /// The asset, window and fund this pane is showing, which it starts at the defaults.
-    asset: EtfAsset,
-    window: EtfWindow,
-    fund: EtfFundSelection,
-    binding: WidgetBinding<EtfProtocol>,
+    asset: CryptocurrencyEtfAsset,
+    window: CryptocurrencyEtfWindow,
+    fund: CryptocurrencyEtfFundSelection,
+    binding: WidgetBinding<CryptocurrencyEtfProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     /// The chart, which exists once an answer has been read and is dropped with the
     /// account it belonged to.
-    chart: Option<EtfChart>,
-    snapshot: Option<Arc<crate::model::EtfSnapshot>>,
+    chart: Option<CryptocurrencyEtfChart>,
+    snapshot: Option<Arc<crate::model::CryptocurrencyEtfSnapshot>>,
     /// The revision of the answer the chart is showing, which is what makes the pane
     /// content rather than a place waiting for something.
     accepted: Option<u64>,
@@ -197,15 +208,15 @@ pub struct EtfWidget {
     _account: Subscription,
 }
 
-impl WidgetView for EtfWidget {
-    type Config = EtfConfig;
+impl WidgetView for CryptocurrencyEtfWidget {
+    type Config = CryptocurrencyEtfConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.etf_flow");
-    const DISPLAY_NAME: &'static str = "widget.names.etf_flow";
+    const ID: WidgetId = WidgetId::new_static("kytrix.cryptocurrency_etf");
+    const DISPLAY_NAME: &'static str = "widget.names.cryptocurrency_etf";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str =
-        "Daily net flows of the spot ETF complexes, and the assets they hold";
-    const ICON: Option<&'static str> = Some("widgets/etf_flow.png");
+        "Daily net flows of the cryptocurrency spot ETF complexes, and the assets they hold";
+    const ICON: Option<&'static str> = Some("widgets/cryptocurrency_etf.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -242,10 +253,10 @@ impl WidgetView for EtfWidget {
     }
 }
 
-impl EtfWidget {
+impl CryptocurrencyEtfWidget {
     /// The seam a test can answer through: `new` only picks the production source.
     fn new_with_source<S>(
-        _config: EtfConfig,
+        _config: CryptocurrencyEtfConfig,
         source: S,
         status: Entity<WidgetStatus>,
         _config_change: WidgetConfigChange,
@@ -253,11 +264,11 @@ impl EtfWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: EtfSource,
+        S: CryptocurrencyEtfSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            EtfService::new(source),
+            CryptocurrencyEtfService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
@@ -285,9 +296,9 @@ impl EtfWidget {
         });
 
         Self {
-            asset: EtfAsset::default(),
-            window: EtfWindow::default(),
-            fund: EtfFundSelection::default(),
+            asset: CryptocurrencyEtfAsset::default(),
+            window: CryptocurrencyEtfWindow::default(),
+            fund: CryptocurrencyEtfFundSelection::default(),
             binding,
             status,
             recovery,
@@ -307,10 +318,10 @@ impl EtfWidget {
     }
 
     /// The account this pane would accept an answer from.
-    fn current_key(&self) -> Option<EtfStreamKey> {
+    fn current_key(&self) -> Option<CryptocurrencyEtfStreamKey> {
         self.account_id
             .clone()
-            .map(|account_id| EtfStreamKey { account_id })
+            .map(|account_id| CryptocurrencyEtfStreamKey { account_id })
     }
 
     /// Whether this pane has anything to read.
@@ -391,7 +402,7 @@ impl EtfWidget {
             // nothing has gone wrong, so the pane says what it is waiting for.
             self.clear_answer(cx);
             self.status.report(
-                WidgetState::waiting(Notice::message("widget.etf.logged_out")),
+                WidgetState::waiting(Notice::message("widget.cryptocurrency_etf.logged_out")),
                 cx,
             );
             cx.notify();
@@ -403,9 +414,9 @@ impl EtfWidget {
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
             if retry {
-                EtfRequest::Retry(key)
+                CryptocurrencyEtfRequest::Retry(key)
             } else {
-                EtfRequest::Load(key)
+                CryptocurrencyEtfRequest::Load(key)
             },
             cx,
             Self::apply_load_result,
@@ -421,14 +432,18 @@ impl EtfWidget {
         cx.notify();
     }
 
-    fn apply_load_result(&mut self, result: WidgetRpcResult<EtfProtocol>, cx: &mut Context<Self>) {
+    fn apply_load_result(
+        &mut self,
+        result: WidgetRpcResult<CryptocurrencyEtfProtocol>,
+        cx: &mut Context<Self>,
+    ) {
         self.refresh_pending = false;
         self.apply_rpc_result(result, cx);
     }
 
     fn apply_refresh_result(
         &mut self,
-        result: WidgetRpcResult<EtfProtocol>,
+        result: WidgetRpcResult<CryptocurrencyEtfProtocol>,
         cx: &mut Context<Self>,
     ) {
         // An accepted command stays pending until the round it started is reported:
@@ -442,13 +457,19 @@ impl EtfWidget {
 
     /// Reported one way, whichever request it answers: the two differ in what they
     /// asked for, not in what a failure means to the reader.
-    fn apply_rpc_result(&mut self, result: WidgetRpcResult<EtfProtocol>, cx: &mut Context<Self>) {
+    fn apply_rpc_result(
+        &mut self,
+        result: WidgetRpcResult<CryptocurrencyEtfProtocol>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
-            Ok(EtfResponse::StreamStarted | EtfResponse::RefreshQueued) => {}
+            Ok(
+                CryptocurrencyEtfResponse::StreamStarted | CryptocurrencyEtfResponse::RefreshQueued,
+            ) => {}
             Err(error) => {
                 let recovery = self.recovery.clone();
                 self.status.report(
-                    WidgetState::failed(Arc::new(EtfFailure::Rpc(error)), recovery),
+                    WidgetState::failed(Arc::new(CryptocurrencyEtfFailure::Rpc(error)), recovery),
                     cx,
                 );
             }
@@ -461,24 +482,24 @@ impl EtfWidget {
     /// framework around the body, so publishing it is enough.
     fn apply_reliable(
         &mut self,
-        key: EtfStreamKey,
-        message: Arc<EtfStreamMessage>,
+        key: CryptocurrencyEtfStreamKey,
+        message: Arc<CryptocurrencyEtfStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let EtfStreamMessage::Status(status) = message.as_ref() else {
+        let CryptocurrencyEtfStreamMessage::Status(status) = message.as_ref() else {
             return false;
         };
         self.next_refresh_at = status.next_refresh_at();
         match status {
-            EtfStatus::Connecting => self.status.report(WidgetState::Connecting, cx),
-            EtfStatus::Refreshing { .. } => {
+            CryptocurrencyEtfStatus::Connecting => self.status.report(WidgetState::Connecting, cx),
+            CryptocurrencyEtfStatus::Refreshing { .. } => {
                 self.refresh_pending = false;
                 self.status.report(WidgetState::Loading, cx);
             }
-            EtfStatus::Ready { revision, .. } => {
+            CryptocurrencyEtfStatus::Ready { revision, .. } => {
                 self.refresh_pending = false;
                 self.ready = Some(*revision);
                 // The reliable channel and the latest one have no order between
@@ -490,11 +511,14 @@ impl EtfWidget {
                     self.status.report(WidgetState::Loading, cx);
                 }
             }
-            EtfStatus::Failed { error } => {
+            CryptocurrencyEtfStatus::Failed { error } => {
                 self.refresh_pending = false;
                 let recovery = self.recovery.clone();
                 self.status.report(
-                    WidgetState::failed(Arc::new(EtfFailure::Fetch(error.clone())), recovery),
+                    WidgetState::failed(
+                        Arc::new(CryptocurrencyEtfFailure::Fetch(error.clone())),
+                        recovery,
+                    ),
                     cx,
                 );
             }
@@ -509,14 +533,15 @@ impl EtfWidget {
     /// same pixels is not worth a frame.
     fn apply_latest(
         &mut self,
-        key: EtfStreamKey,
-        message: Arc<EtfStreamMessage>,
+        key: CryptocurrencyEtfStreamKey,
+        message: Arc<CryptocurrencyEtfStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let EtfStreamMessage::Snapshot { revision, snapshot } = message.as_ref() else {
+        let CryptocurrencyEtfStreamMessage::Snapshot { revision, snapshot } = message.as_ref()
+        else {
             return false;
         };
         // An answer the pane has already overtaken would only make the chart jump
@@ -556,7 +581,7 @@ impl EtfWidget {
                 chart.set_view(cx, dataset, selection, window);
             }
             None => {
-                self.chart = Some(EtfChart::new(cx, dataset, selection, window));
+                self.chart = Some(CryptocurrencyEtfChart::new(cx, dataset, selection, window));
             }
         }
         cx.notify();
@@ -572,15 +597,15 @@ impl EtfWidget {
             return;
         };
         let dataset = snapshot.dataset(self.asset);
-        let EtfFundSelection::Named(name) = &self.fund else {
+        let CryptocurrencyEtfFundSelection::Named(name) = &self.fund else {
             return;
         };
         if dataset.fund_index(name.as_str()).is_none() {
-            self.fund = EtfFundSelection::All;
+            self.fund = CryptocurrencyEtfFundSelection::All;
         }
     }
 
-    fn select_asset(&mut self, asset: EtfAsset, cx: &mut Context<Self>) {
+    fn select_asset(&mut self, asset: CryptocurrencyEtfAsset, cx: &mut Context<Self>) {
         if self.asset == asset {
             return;
         }
@@ -589,7 +614,7 @@ impl EtfWidget {
         self.sync_chart(cx);
     }
 
-    fn select_window(&mut self, window: EtfWindow, cx: &mut Context<Self>) {
+    fn select_window(&mut self, window: CryptocurrencyEtfWindow, cx: &mut Context<Self>) {
         if self.window == window {
             return;
         }
@@ -597,7 +622,7 @@ impl EtfWidget {
         self.sync_chart(cx);
     }
 
-    fn select_fund(&mut self, fund: EtfFundSelection, cx: &mut Context<Self>) {
+    fn select_fund(&mut self, fund: CryptocurrencyEtfFundSelection, cx: &mut Context<Self>) {
         if self.fund == fund {
             return;
         }
@@ -614,8 +639,11 @@ impl EtfWidget {
             return;
         }
         self.refresh_pending = true;
-        self.binding
-            .call(EtfRequest::Refresh, cx, Self::apply_refresh_result);
+        self.binding.call(
+            CryptocurrencyEtfRequest::Refresh,
+            cx,
+            Self::apply_refresh_result,
+        );
         cx.notify();
     }
 
@@ -654,16 +682,18 @@ impl EtfWidget {
     /// as if the others were broken.
     fn asset_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
         let selected = SharedString::new_static(self.asset.label());
-        EtfAsset::ALL
+        CryptocurrencyEtfAsset::ALL
             .iter()
             .fold(
-                Select::new(ElementId::Name(SharedString::new_static("EtfAsset")))
-                    .placeholder(selected.clone())
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected_item(Some(selected))
-                    .aria_label(t!(cx, "widget.etf.asset")),
+                Select::new(ElementId::Name(SharedString::new_static(
+                    "CryptocurrencyEtfAsset",
+                )))
+                .placeholder(selected.clone())
+                .ghost()
+                .small()
+                .disabled(disabled)
+                .selected_item(Some(selected))
+                .aria_label(t!(cx, "widget.cryptocurrency_etf.asset")),
                 |select, asset| {
                     // A fund's ticker is its name and its id at once: `HYPE` reads the
                     // same in every locale, so there is nothing to keep apart the way the
@@ -678,7 +708,7 @@ impl EtfWidget {
                 let widget = cx.entity();
                 move |selected, _, app| {
                     let Some(asset) = selected.as_deref().and_then(|selected| {
-                        EtfAsset::ALL
+                        CryptocurrencyEtfAsset::ALL
                             .into_iter()
                             .find(|asset| asset.label() == selected)
                     }) else {
@@ -720,16 +750,18 @@ impl EtfWidget {
     /// nothing.
     fn window_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
         let selected = window_id(self.window);
-        EtfWindow::ALL
+        CryptocurrencyEtfWindow::ALL
             .iter()
             .fold(
-                Select::new(ElementId::Name(SharedString::new_static("EtfWindow")))
-                    .placeholder(SharedString::new(window_label(cx, self.window)))
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected_item(Some(SharedString::new_static(selected)))
-                    .aria_label(t!(cx, "widget.etf.time_window")),
+                Select::new(ElementId::Name(SharedString::new_static(
+                    "CryptocurrencyEtfWindow",
+                )))
+                .placeholder(SharedString::new(window_label(cx, self.window)))
+                .ghost()
+                .small()
+                .disabled(disabled)
+                .selected_item(Some(SharedString::new_static(selected)))
+                .aria_label(t!(cx, "widget.cryptocurrency_etf.time_window")),
                 |select, window| {
                     select.menu_item(MenuItem::Action(MenuItemAction::new(
                         SharedString::new_static(window_id(*window)),
@@ -762,18 +794,20 @@ impl EtfWidget {
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot.dataset(self.asset).funds.clone());
-        let all_label = t!(cx, "widget.etf.all");
-        let mut select = Select::new(ElementId::Name(SharedString::new_static("EtfFund")))
-            .placeholder(all_label.clone())
-            .ghost()
-            .small()
-            .disabled(disabled)
-            .selected_item(Some(fund_id(&self.fund)))
-            .aria_label(t!(cx, "widget.etf.fund"))
-            .menu_item(MenuItem::Action(MenuItemAction::new(
-                SharedString::new_static(ALL_FUNDS_ID),
-                all_label,
-            )));
+        let all_label = t!(cx, "widget.cryptocurrency_etf.all");
+        let mut select = Select::new(ElementId::Name(SharedString::new_static(
+            "CryptocurrencyEtfFund",
+        )))
+        .placeholder(all_label.clone())
+        .ghost()
+        .small()
+        .disabled(disabled)
+        .selected_item(Some(fund_id(&self.fund)))
+        .aria_label(t!(cx, "widget.cryptocurrency_etf.fund"))
+        .menu_item(MenuItem::Action(MenuItemAction::new(
+            SharedString::new_static(ALL_FUNDS_ID),
+            all_label,
+        )));
         if let Some(funds) = funds {
             for fund in funds.iter() {
                 select = select.menu_item(MenuItem::Action(MenuItemAction::new(
@@ -802,19 +836,21 @@ impl EtfWidget {
     /// schedule to count down to, so the button is bare and disabled.
     fn refresh_button(&self, cx: &Context<Self>) -> Button {
         let disabled = self.refresh_is_disabled(cx);
-        Button::new(ElementId::Name(SharedString::new_static("EtfRefresh")))
-            .ghost()
-            .small()
-            .disabled(disabled)
-            .aria_label(t!(cx, "widget.etf.refresh_now"))
-            .child(Icon::new(IconKind::ArrowsClockwise).size_3())
-            .children(self.countdown.clone())
-            .on_click({
-                let widget = cx.entity();
-                move |_, _, app| {
-                    widget.update(app, |this, cx| this.refresh(cx));
-                }
-            })
+        Button::new(ElementId::Name(SharedString::new_static(
+            "CryptocurrencyEtfRefresh",
+        )))
+        .ghost()
+        .small()
+        .disabled(disabled)
+        .aria_label(t!(cx, "widget.cryptocurrency_etf.refresh_now"))
+        .child(Icon::new(IconKind::ArrowsClockwise).size_3())
+        .children(self.countdown.clone())
+        .on_click({
+            let widget = cx.entity();
+            move |_, _, app| {
+                widget.update(app, |this, cx| this.refresh(cx));
+            }
+        })
     }
 
     /// The row of readings above the chart: the hovered day, and what it says.
@@ -839,7 +875,7 @@ impl EtfWidget {
             .border_b_1()
             .border_color(theme.roles.line.divider.hsla);
         row = row.child(metric(
-            t!(cx, "widget.etf.date"),
+            t!(cx, "widget.cryptocurrency_etf.date"),
             metrics.date,
             muted,
             foreground,
@@ -853,7 +889,7 @@ impl EtfWidget {
                     flow(theme, metrics.flow_value, muted),
                 ))
                 .child(metric(
-                    t!(cx, "widget.etf.total_net_assets"),
+                    t!(cx, "widget.cryptocurrency_etf.total_net_assets"),
                     net_assets,
                     muted,
                     foreground,
@@ -870,7 +906,7 @@ impl EtfWidget {
     }
 }
 
-impl Render for EtfWidget {
+impl Render for CryptocurrencyEtfWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is only embedded while the pane has content, so this is the ready
         // state and nothing else. Everything the pane is *doing* is drawn by the
@@ -957,46 +993,46 @@ const FUND_ID_PREFIX: &str = "fund:";
 
 /// The id a window is chosen by, which is persisted in the picker rather than in the
 /// config: it is what keeps a choice readable across a change of language.
-fn window_id(window: EtfWindow) -> &'static str {
+fn window_id(window: CryptocurrencyEtfWindow) -> &'static str {
     match window {
-        EtfWindow::Days30 => "days_30",
-        EtfWindow::Days90 => "days_90",
-        EtfWindow::Days180 => "days_180",
-        EtfWindow::Days360 => "days_360",
-        EtfWindow::All => "all",
+        CryptocurrencyEtfWindow::Days30 => "days_30",
+        CryptocurrencyEtfWindow::Days90 => "days_90",
+        CryptocurrencyEtfWindow::Days180 => "days_180",
+        CryptocurrencyEtfWindow::Days360 => "days_360",
+        CryptocurrencyEtfWindow::All => "all",
     }
 }
 
-fn window_from_id(id: &str) -> Option<EtfWindow> {
-    EtfWindow::ALL
+fn window_from_id(id: &str) -> Option<CryptocurrencyEtfWindow> {
+    CryptocurrencyEtfWindow::ALL
         .into_iter()
         .find(|window| window_id(*window) == id)
 }
 
 /// How a window is named: a number of trading days, or all of them.
-fn window_label(cx: &App, window: EtfWindow) -> SharedString {
+fn window_label(cx: &App, window: CryptocurrencyEtfWindow) -> SharedString {
     match window {
-        EtfWindow::Days30 => t!(cx, "widget.etf.days", count = 30),
-        EtfWindow::Days90 => t!(cx, "widget.etf.days", count = 90),
-        EtfWindow::Days180 => t!(cx, "widget.etf.days", count = 180),
-        EtfWindow::Days360 => t!(cx, "widget.etf.days", count = 360),
-        EtfWindow::All => t!(cx, "widget.etf.all"),
+        CryptocurrencyEtfWindow::Days30 => t!(cx, "widget.cryptocurrency_etf.days", count = 30),
+        CryptocurrencyEtfWindow::Days90 => t!(cx, "widget.cryptocurrency_etf.days", count = 90),
+        CryptocurrencyEtfWindow::Days180 => t!(cx, "widget.cryptocurrency_etf.days", count = 180),
+        CryptocurrencyEtfWindow::Days360 => t!(cx, "widget.cryptocurrency_etf.days", count = 360),
+        CryptocurrencyEtfWindow::All => t!(cx, "widget.cryptocurrency_etf.all"),
     }
 }
 
-fn fund_id(fund: &EtfFundSelection) -> SharedString {
+fn fund_id(fund: &CryptocurrencyEtfFundSelection) -> SharedString {
     match fund {
-        EtfFundSelection::All => SharedString::new_static(ALL_FUNDS_ID),
-        EtfFundSelection::Named(name) => {
+        CryptocurrencyEtfFundSelection::All => SharedString::new_static(ALL_FUNDS_ID),
+        CryptocurrencyEtfFundSelection::Named(name) => {
             SharedString::new(format_smolstr!("{FUND_ID_PREFIX}{name}").as_str())
         }
     }
 }
 
-fn fund_from_id(id: &str) -> EtfFundSelection {
+fn fund_from_id(id: &str) -> CryptocurrencyEtfFundSelection {
     match id.strip_prefix(FUND_ID_PREFIX) {
-        Some(name) => EtfFundSelection::Named(SmolStr::new(name)),
-        None => EtfFundSelection::All,
+        Some(name) => CryptocurrencyEtfFundSelection::Named(SmolStr::new(name)),
+        None => CryptocurrencyEtfFundSelection::All,
     }
 }
 
@@ -1011,7 +1047,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::EtfSnapshot,
+        model::CryptocurrencyEtfSnapshot,
         service::test_support::{DEFAULT_FUNDS, FakeSource, FetchPlan, asset, snapshot_of},
     };
 
@@ -1071,17 +1107,20 @@ mod tests {
     /// The fake never answers because the tests below are the only thing that reports
     /// to the pane: a source that answered would race them, since its service
     /// publishes on a task of its own.
-    fn pane_with_source<S>(source: S, cx: &mut Context<EtfWidget>) -> EtfWidget
+    fn pane_with_source<S>(
+        source: S,
+        cx: &mut Context<CryptocurrencyEtfWidget>,
+    ) -> CryptocurrencyEtfWidget
     where
-        S: EtfSource,
+        S: CryptocurrencyEtfSource,
     {
         let status = cx.new(|_| WidgetStatus::new());
         let weak = cx.weak_entity();
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        EtfWidget::new_with_source(
-            EtfConfig,
+        CryptocurrencyEtfWidget::new_with_source(
+            CryptocurrencyEtfConfig,
             source,
             status,
             WidgetConfigChange::default(),
@@ -1090,14 +1129,20 @@ mod tests {
         )
     }
 
-    fn pane_with(cx: &mut TestAppContext, account: Option<&str>) -> Entity<EtfWidget> {
+    fn pane_with(
+        cx: &mut TestAppContext,
+        account: Option<&str>,
+    ) -> Entity<CryptocurrencyEtfWidget> {
         cx.update(install);
         pane_over(cx, account)
     }
 
     /// The same pane over the state [`install`] already put in place: what a test
     /// building two panes for two accounts builds its second one with.
-    fn pane_over(cx: &mut TestAppContext, account: Option<&str>) -> Entity<EtfWidget> {
+    fn pane_over(
+        cx: &mut TestAppContext,
+        account: Option<&str>,
+    ) -> Entity<CryptocurrencyEtfWidget> {
         cx.executor().allow_parking();
         cx.update(|cx| {
             sign_in(cx, account);
@@ -1109,12 +1154,12 @@ mod tests {
         })
     }
 
-    fn pane(cx: &mut TestAppContext) -> Entity<EtfWidget> {
+    fn pane(cx: &mut TestAppContext) -> Entity<CryptocurrencyEtfWidget> {
         pane_with(cx, Some(ACCOUNT))
     }
 
-    fn key() -> EtfStreamKey {
-        EtfStreamKey {
+    fn key() -> CryptocurrencyEtfStreamKey {
+        CryptocurrencyEtfStreamKey {
             account_id: SmolStr::new_static(ACCOUNT),
         }
     }
@@ -1123,58 +1168,66 @@ mod tests {
     ///
     /// Cancelling the binding first is what makes the reported message the only input
     /// the pane has: the load it was still holding is dropped with the runtime.
-    fn report_status(pane: &Entity<EtfWidget>, status: EtfStatus, cx: &mut App) -> bool {
+    fn report_status(
+        pane: &Entity<CryptocurrencyEtfWidget>,
+        status: CryptocurrencyEtfStatus,
+        cx: &mut App,
+    ) -> bool {
         pane.update(cx, |pane, context| {
             pane.binding.cancel();
-            pane.apply_reliable(key(), Arc::new(EtfStreamMessage::Status(status)), context)
+            pane.apply_reliable(
+                key(),
+                Arc::new(CryptocurrencyEtfStreamMessage::Status(status)),
+                context,
+            )
         })
     }
 
     /// Reports an answer as the stream would.
     fn report_snapshot(
-        pane: &Entity<EtfWidget>,
+        pane: &Entity<CryptocurrencyEtfWidget>,
         revision: u64,
-        snapshot: Arc<EtfSnapshot>,
+        snapshot: Arc<CryptocurrencyEtfSnapshot>,
         cx: &mut App,
     ) -> bool {
         pane.update(cx, |pane, context| {
             pane.binding.cancel();
             pane.apply_latest(
                 key(),
-                Arc::new(EtfStreamMessage::Snapshot { revision, snapshot }),
+                Arc::new(CryptocurrencyEtfStreamMessage::Snapshot { revision, snapshot }),
                 context,
             )
         })
     }
 
-    fn ready(revision: u64) -> EtfStatus {
-        EtfStatus::Ready {
+    fn ready(revision: u64) -> CryptocurrencyEtfStatus {
+        CryptocurrencyEtfStatus::Ready {
             revision,
             next_refresh_at: i64::MAX,
         }
     }
 
-    fn failed() -> EtfStatus {
-        EtfStatus::Failed {
-            error: EtfFetchError::Service(
+    fn failed() -> CryptocurrencyEtfStatus {
+        CryptocurrencyEtfStatus::Failed {
+            error: CryptocurrencyEtfFetchError::Service(
                 kytrix_service_provider::service::engine::KytrixServiceError::Disconnected,
             ),
         }
     }
 
-    fn refreshing() -> EtfStatus {
-        EtfStatus::Refreshing {
+    fn refreshing() -> CryptocurrencyEtfStatus {
+        CryptocurrencyEtfStatus::Refreshing {
             next_refresh_at: i64::MAX,
         }
     }
 
     /// An answer whose first asset has the funds a test names.
-    fn snapshot_with(funds: &[&str]) -> Arc<EtfSnapshot> {
+    fn snapshot_with(funds: &[&str]) -> Arc<CryptocurrencyEtfSnapshot> {
         snapshot_of([
-            asset(EtfAsset::Btc, &[1.0, 2.0], funds),
-            asset(EtfAsset::Eth, &[1.0, 2.0], DEFAULT_FUNDS),
-            asset(EtfAsset::Sol, &[1.0, 2.0], DEFAULT_FUNDS),
-            asset(EtfAsset::Hyp, &[1.0, 2.0], DEFAULT_FUNDS),
+            asset(CryptocurrencyEtfAsset::Btc, &[1.0, 2.0], funds),
+            asset(CryptocurrencyEtfAsset::Eth, &[1.0, 2.0], DEFAULT_FUNDS),
+            asset(CryptocurrencyEtfAsset::Sol, &[1.0, 2.0], DEFAULT_FUNDS),
+            asset(CryptocurrencyEtfAsset::Hyp, &[1.0, 2.0], DEFAULT_FUNDS),
         ])
     }
 
@@ -1185,7 +1238,7 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(
                 pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message("widget.etf.logged_out")),
+                WidgetState::waiting(Notice::message("widget.cryptocurrency_etf.logged_out")),
                 "a pane nobody is signed in for says what it is waiting for"
             );
             assert!(!pane.read(cx).has_content());
@@ -1204,7 +1257,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let pane = pane_with(cx, None);
-        let english = cx.update(|cx| t!(cx, "widget.etf.logged_out"));
+        let english = cx.update(|cx| t!(cx, "widget.cryptocurrency_etf.logged_out"));
 
         let notice = cx.update(|cx| {
             let notice = pane
@@ -1214,7 +1267,10 @@ mod tests {
                 .notice()
                 .cloned()
                 .expect("a pane nobody signed in for waits");
-            assert_eq!(notice, Notice::message("widget.etf.logged_out"));
+            assert_eq!(
+                notice,
+                Notice::message("widget.cryptocurrency_etf.logged_out")
+            );
             assert_eq!(
                 notice.resolve(cx),
                 english,
@@ -1228,7 +1284,7 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|cx| {
-            let chinese = t!(cx, "widget.etf.logged_out");
+            let chinese = t!(cx, "widget.cryptocurrency_etf.logged_out");
             assert_ne!(chinese, english, "the two locales have to differ");
             assert_eq!(
                 notice.resolve(cx),
@@ -1295,7 +1351,7 @@ mod tests {
                 );
                 // The service acknowledges the command before it runs the round it
                 // started, so the acknowledgement is not the end of the window.
-                pane.apply_refresh_result(Ok(EtfResponse::RefreshQueued), cx);
+                pane.apply_refresh_result(Ok(CryptocurrencyEtfResponse::RefreshQueued), cx);
                 assert!(
                     pane.refresh_is_disabled(cx),
                     "a queued read is still a read in flight"
@@ -1378,7 +1434,7 @@ mod tests {
     #[gpui_kit::test]
     fn the_countdown_should_only_run_while_the_pane_is_ready(cx: &mut TestAppContext) {
         let pane = pane(cx);
-        let tick = |pane: &Entity<EtfWidget>, cx: &mut App| {
+        let tick = |pane: &Entity<CryptocurrencyEtfWidget>, cx: &mut App| {
             pane.update(cx, |pane, cx| pane.tick_countdown(cx));
         };
 
@@ -1386,7 +1442,7 @@ mod tests {
             report_snapshot(&pane, 1, snapshot_with(DEFAULT_FUNDS), cx);
             report_status(
                 &pane,
-                EtfStatus::Ready {
+                CryptocurrencyEtfStatus::Ready {
                     revision: 1,
                     next_refresh_at: unix_millis() + 8 * 60 * 60 * 1_000,
                 },
@@ -1419,7 +1475,7 @@ mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                EtfStatus::Ready {
+                CryptocurrencyEtfStatus::Ready {
                     revision: 2,
                     next_refresh_at: unix_millis() + 60_000,
                 },
@@ -1553,10 +1609,10 @@ mod tests {
             let changed = pane.update(cx, |pane, context| {
                 pane.binding.cancel();
                 pane.apply_latest(
-                    EtfStreamKey {
+                    CryptocurrencyEtfStreamKey {
                         account_id: SmolStr::new_static("another-account"),
                     },
-                    Arc::new(EtfStreamMessage::Snapshot {
+                    Arc::new(CryptocurrencyEtfStreamMessage::Snapshot {
                         revision: 1,
                         snapshot: snapshot_with(DEFAULT_FUNDS),
                     }),
@@ -1613,7 +1669,7 @@ mod tests {
             report_status(&pane, failed(), cx);
             assert!(pane.read(cx).status.is_failed(cx));
 
-            let status_changed = report_status(&pane, EtfStatus::Connecting, cx);
+            let status_changed = report_status(&pane, CryptocurrencyEtfStatus::Connecting, cx);
             let answer_changed = report_snapshot(&pane, 7, snapshot_with(DEFAULT_FUNDS), cx);
 
             assert!(!status_changed, "a failed pane takes no more statuses");
@@ -1636,7 +1692,7 @@ mod tests {
             report_snapshot(&pane, 1, snapshot_with(DEFAULT_FUNDS), cx);
             report_status(
                 &pane,
-                EtfStatus::Ready {
+                CryptocurrencyEtfStatus::Ready {
                     revision: 1,
                     next_refresh_at: unix_millis() + 8 * 60 * 60 * 1_000,
                 },
@@ -1690,12 +1746,14 @@ mod tests {
             let reads_before = reads.fetch_count();
 
             pane.update(cx, |pane, cx| {
-                pane.select_window(EtfWindow::Days90, cx);
-                pane.select_fund(EtfFundSelection::All, cx);
+                pane.select_window(CryptocurrencyEtfWindow::Days90, cx);
+                pane.select_fund(CryptocurrencyEtfFundSelection::All, cx);
             });
-            pane.update(cx, |pane, cx| pane.select_window(EtfWindow::Days90, cx));
+            pane.update(cx, |pane, cx| {
+                pane.select_window(CryptocurrencyEtfWindow::Days90, cx)
+            });
 
-            assert_eq!(pane.read(cx).window, EtfWindow::Days90);
+            assert_eq!(pane.read(cx).window, CryptocurrencyEtfWindow::Days90);
             assert!(
                 pane.read(cx).has_content(),
                 "another window is the same answer drawn differently"
@@ -1717,19 +1775,24 @@ mod tests {
         cx.update(|cx| {
             report_snapshot(&pane, 1, snapshot_with(&["IBIT", "FBTC"]), cx);
             pane.update(cx, |pane, cx| {
-                pane.select_fund(EtfFundSelection::Named(SmolStr::new_static("IBIT")), cx);
+                pane.select_fund(
+                    CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("IBIT")),
+                    cx,
+                );
             });
             assert_eq!(
                 pane.read(cx).fund,
-                EtfFundSelection::Named(SmolStr::new_static("IBIT"))
+                CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("IBIT"))
             );
 
-            pane.update(cx, |pane, cx| pane.select_asset(EtfAsset::Eth, cx));
+            pane.update(cx, |pane, cx| {
+                pane.select_asset(CryptocurrencyEtfAsset::Eth, cx)
+            });
 
-            assert_eq!(pane.read(cx).asset, EtfAsset::Eth);
+            assert_eq!(pane.read(cx).asset, CryptocurrencyEtfAsset::Eth);
             assert_eq!(
                 pane.read(cx).fund,
-                EtfFundSelection::All,
+                CryptocurrencyEtfFundSelection::All,
                 "a fund belongs to one asset's complex, so a choice under BTC is not one under ETH"
             );
             assert!(pane.read(cx).has_content());
@@ -1753,7 +1816,11 @@ mod tests {
                 "the answer was served to the account that just left"
             );
             assert_eq!(pane.read(cx).status.state(cx), WidgetState::Connecting);
-            assert_eq!(pane.read(cx).asset, EtfAsset::Btc, "the view is kept");
+            assert_eq!(
+                pane.read(cx).asset,
+                CryptocurrencyEtfAsset::Btc,
+                "the view is kept"
+            );
         });
     }
 
@@ -1768,7 +1835,7 @@ mod tests {
             assert!(!pane.read(cx).has_content());
             assert_eq!(
                 pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message("widget.etf.logged_out")),
+                WidgetState::waiting(Notice::message("widget.cryptocurrency_etf.logged_out")),
                 "and the pane asks for an account rather than reporting a failure"
             );
             assert!(!pane.read(cx).has_scope_for_test());
@@ -1817,7 +1884,7 @@ mod tests {
 
     /// One pane mounted in a window of its own, which is what paints it.
     struct Harness {
-        pane: Entity<EtfWidget>,
+        pane: Entity<CryptocurrencyEtfWidget>,
     }
 
     impl Render for Harness {
@@ -1872,7 +1939,7 @@ mod tests {
     /// part of this crate; the harness stands in for it, so the controls are built
     /// and painted exactly the way a frame builds them.
     struct HeaderHarness {
-        pane: Entity<EtfWidget>,
+        pane: Entity<CryptocurrencyEtfWidget>,
     }
 
     impl Render for HeaderHarness {
@@ -2023,7 +2090,7 @@ mod tests {
 
     #[test]
     fn a_window_should_round_trip_through_the_id_its_picker_uses() {
-        for window in EtfWindow::ALL {
+        for window in CryptocurrencyEtfWindow::ALL {
             assert_eq!(window_from_id(window_id(window)), Some(window));
         }
         assert_eq!(window_from_id("not a window"), None);
@@ -2031,15 +2098,15 @@ mod tests {
 
     #[test]
     fn a_fund_choice_should_round_trip_through_the_id_its_picker_uses() {
-        let all = EtfFundSelection::All;
-        let named = EtfFundSelection::Named(SmolStr::new_static("IBIT"));
+        let all = CryptocurrencyEtfFundSelection::All;
+        let named = CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("IBIT"));
 
         assert_eq!(fund_from_id(&fund_id(&all)), all);
         assert_eq!(fund_from_id(&fund_id(&named)), named);
         assert_ne!(fund_id(&all), fund_id(&named));
         assert_eq!(
             fund_from_id(ALL_FUNDS_ID),
-            EtfFundSelection::All,
+            CryptocurrencyEtfFundSelection::All,
             "the picker's own id for the whole complex is what it opens with"
         );
     }
@@ -2054,14 +2121,17 @@ mod tests {
 
         cx.update(|cx| {
             let pane = pane.read(cx);
-            assert_eq!(pane.asset, EtfAsset::Btc);
-            assert_eq!(pane.window, EtfWindow::Days30);
-            assert_eq!(pane.fund, EtfFundSelection::All);
+            assert_eq!(pane.asset, CryptocurrencyEtfAsset::Btc);
+            assert_eq!(pane.window, CryptocurrencyEtfWindow::Days30);
+            assert_eq!(pane.fund, CryptocurrencyEtfFundSelection::All);
         });
         assert_eq!(
-            <EtfConfig as WidgetConfig>::SCHEMA_VERSION,
+            <CryptocurrencyEtfConfig as WidgetConfig>::SCHEMA_VERSION,
             WidgetConfigSchemaVersion::V1
         );
-        assert_eq!(EtfWidget::ID.as_str(), "kytrix.market.etf_flow");
+        assert_eq!(
+            CryptocurrencyEtfWidget::ID.as_str(),
+            "kytrix.cryptocurrency_etf"
+        );
     }
 }

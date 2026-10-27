@@ -304,7 +304,7 @@ pub struct MarketTradesWidget {
 impl WidgetView for MarketTradesWidget {
     type Config = MarketTradesConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.market_trades");
+    const ID: WidgetId = WidgetId::new_static("kytrix.market_trades");
     const DISPLAY_NAME: &'static str = "widget.names.market_trades";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Recent native market executions";

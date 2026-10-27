@@ -186,7 +186,7 @@ pub struct CoinMarketCapFearAndGreedIndexWidget {
 impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
     type Config = CoinMarketCapFearAndGreedIndexConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.coin_market_cap_fear_and_greed_index");
+    const ID: WidgetId = WidgetId::new_static("kytrix.coin_market_cap_fear_and_greed_index");
     const DISPLAY_NAME: &'static str = "widget.names.coin_market_cap_fear_and_greed_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "CoinMarketCap crypto fear and greed index";

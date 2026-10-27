@@ -560,7 +560,7 @@ pub struct FinancialIndicesWidget {
 impl WidgetView for FinancialIndicesWidget {
     type Config = FinancialIndicesConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.financial_indices");
+    const ID: WidgetId = WidgetId::new_static("kytrix.financial_indices");
     const DISPLAY_NAME: &'static str = "widget.names.financial_indices";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Global market and commodity indices";
@@ -1729,7 +1729,7 @@ mod tests {
     fn the_widget_should_have_a_stable_identity() {
         assert_eq!(
             FinancialIndicesWidget::ID.as_str(),
-            "kytrix.market.financial_indices"
+            "kytrix.financial_indices"
         );
         assert_eq!(
             FinancialIndicesWidget::DISPLAY_NAME,

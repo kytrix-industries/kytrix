@@ -9,7 +9,7 @@ use super::{
     data::{Metrics, PreparedData, PreparedPoint},
     test_support::{FUNDS, prepared, prepared_all},
 };
-use crate::model::{EtfFundSelection, EtfWindow};
+use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
 /// Installs the translator and hands the test an application to resolve a view in.
 fn with_locales(cx: &mut TestAppContext, test: impl FnOnce(&mut App)) {
@@ -129,8 +129,8 @@ fn the_tooltip_should_name_the_direction_the_flow_went(cx: &mut TestAppContext) 
 #[gpui_kit::test]
 fn a_named_fund_should_have_a_flow_but_no_assets_of_its_own(cx: &mut TestAppContext) {
     with_locales(cx, |cx| {
-        let fund = EtfFundSelection::Named(SmolStr::new_static(FUNDS[0]));
-        let data = prepared(cx, &[1_000.0, 2_000.0], fund, EtfWindow::All);
+        let fund = CryptocurrencyEtfFundSelection::Named(SmolStr::new_static(FUNDS[0]));
+        let data = prepared(cx, &[1_000.0, 2_000.0], fund, CryptocurrencyEtfWindow::All);
 
         assert!(!data.show_net_assets);
         assert!(data.net_assets.is_none(), "one fund has no level to plot");
@@ -152,8 +152,13 @@ fn a_named_fund_should_have_a_flow_but_no_assets_of_its_own(cx: &mut TestAppCont
 #[gpui_kit::test]
 fn a_fund_the_asset_does_not_have_should_resolve_to_no_days_at_all(cx: &mut TestAppContext) {
     with_locales(cx, |cx| {
-        let missing = EtfFundSelection::Named(SmolStr::new_static("NOPE"));
-        let data = prepared(cx, &[1_000.0, 2_000.0], missing, EtfWindow::All);
+        let missing = CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("NOPE"));
+        let data = prepared(
+            cx,
+            &[1_000.0, 2_000.0],
+            missing,
+            CryptocurrencyEtfWindow::All,
+        );
 
         assert!(
             data.points.is_empty(),
@@ -169,7 +174,12 @@ fn a_window_should_keep_the_most_recent_days(cx: &mut TestAppContext) {
     with_locales(cx, |cx| {
         let flows = vec![1.0; 35];
         let all = prepared_all(cx, &flows);
-        let month = prepared(cx, &flows, EtfFundSelection::All, EtfWindow::Days30);
+        let month = prepared(
+            cx,
+            &flows,
+            CryptocurrencyEtfFundSelection::All,
+            CryptocurrencyEtfWindow::Days30,
+        );
 
         assert_eq!(all.points.len(), 35);
         assert_eq!(month.points.len(), 30);
@@ -228,8 +238,8 @@ fn the_row_should_follow_the_pointer_and_fall_back_to_the_last_day(cx: &mut Test
 #[gpui_kit::test]
 fn a_rows_net_assets_should_be_absent_for_a_single_fund(cx: &mut TestAppContext) {
     with_locales(cx, |cx| {
-        let fund = EtfFundSelection::Named(SmolStr::new_static(FUNDS[1]));
-        let data = prepared(cx, &[1_000.0], fund, EtfWindow::All);
+        let fund = CryptocurrencyEtfFundSelection::Named(SmolStr::new_static(FUNDS[1]));
+        let data = prepared(cx, &[1_000.0], fund, CryptocurrencyEtfWindow::All);
 
         assert!(metrics(&data, None).net_assets.is_none());
     });

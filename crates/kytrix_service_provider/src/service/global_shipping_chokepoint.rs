@@ -9,12 +9,12 @@ use kytrix_proto::types::StrategicMaritimeChokepointsTrackingDelta;
 use smol_str::SmolStr;
 
 /// The area one AIS subscription covers.
-pub type StrategicMaritimeChokepointsTrackingArea =
+pub type GlobalShippingChokepointArea =
     kytrix_proto::types::StrategicMaritimeChokepointsTrackingArea;
 
 /// One AIS push for an area.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StrategicMaritimeChokepointsTrackingUpdate {
+pub struct GlobalShippingChokepointUpdate {
     /// The API process the delta was produced by. A new epoch means every sequence the
     /// client holds belongs to a process that no longer exists.
     pub epoch: u64,
@@ -25,9 +25,9 @@ pub struct StrategicMaritimeChokepointsTrackingUpdate {
     /// The sequence the server expects the client to have applied before this push.
     pub base: u64,
     /// The static part of every vessel the push describes.
-    pub statics: Vec<StrategicMaritimeChokepointsTrackingStatic>,
+    pub statics: Vec<GlobalShippingChokepointStatic>,
     /// The positions the push describes.
-    pub positions: Vec<StrategicMaritimeChokepointsTrackingPosition>,
+    pub positions: Vec<GlobalShippingChokepointPosition>,
     /// The MMSIs that left the area.
     pub removed: Vec<u32>,
     /// The server's generation time in milliseconds; `0` means it holds no state yet.
@@ -36,7 +36,7 @@ pub struct StrategicMaritimeChokepointsTrackingUpdate {
 
 /// The low-frequency part of one vessel.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StrategicMaritimeChokepointsTrackingStatic {
+pub struct GlobalShippingChokepointStatic {
     pub mmsi: u32,
     pub imo: u32,
     pub call_sign: SmolStr,
@@ -57,7 +57,7 @@ pub struct StrategicMaritimeChokepointsTrackingStatic {
 
 /// The high-frequency part of one vessel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StrategicMaritimeChokepointsTrackingPosition {
+pub struct GlobalShippingChokepointPosition {
     pub mmsi: u32,
     /// Latitude in 1e-6 degrees.
     pub latitude: i32,
@@ -75,7 +75,7 @@ pub struct StrategicMaritimeChokepointsTrackingPosition {
     pub last_update: i64,
 }
 
-impl StrategicMaritimeChokepointsTrackingUpdate {
+impl GlobalShippingChokepointUpdate {
     /// Converts one proto delta into the domain update.
     pub fn from_proto(delta: StrategicMaritimeChokepointsTrackingDelta) -> Self {
         Self {
@@ -86,7 +86,7 @@ impl StrategicMaritimeChokepointsTrackingUpdate {
             statics: delta
                 .statics
                 .into_iter()
-                .map(|vessel| StrategicMaritimeChokepointsTrackingStatic {
+                .map(|vessel| GlobalShippingChokepointStatic {
                     mmsi: vessel.mmsi,
                     imo: vessel.imo,
                     call_sign: SmolStr::new(vessel.call_sign),
@@ -108,7 +108,7 @@ impl StrategicMaritimeChokepointsTrackingUpdate {
             positions: delta
                 .positions
                 .into_iter()
-                .map(|position| StrategicMaritimeChokepointsTrackingPosition {
+                .map(|position| GlobalShippingChokepointPosition {
                     mmsi: position.mmsi,
                     latitude: position.latitude,
                     longitude: position.longitude,

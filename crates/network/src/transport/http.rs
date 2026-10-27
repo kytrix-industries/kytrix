@@ -24,7 +24,7 @@ pub enum HttpClientClass {
     Public,
     Private,
     KytrixService,
-    XAccountMonitoringMedia,
+    XMedia,
     UpdaterMetadata,
     UpdaterDownload,
 }
@@ -62,7 +62,7 @@ impl HttpClientClass {
                 response_body_limit: STANDARD_RESPONSE_BODY_LIMIT,
                 user_agent: concat!("Kytrix/", env!("CARGO_PKG_VERSION")),
             },
-            Self::XAccountMonitoringMedia => HttpClientProfile {
+            Self::XMedia => HttpClientProfile {
                 connect_timeout: Duration::from_secs(10),
                 request_timeout: Some(Duration::from_secs(30)),
                 redirect_limit: 5,

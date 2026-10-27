@@ -28,13 +28,15 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
     [
         WidgetRegistration::for_view::<candlestick::view::CandlestickWidget>(),
         WidgetRegistration::for_view::<coin_market_cap_fear_and_greed_index::view::CoinMarketCapFearAndGreedIndexWidget>(),
+        WidgetRegistration::for_view::<cryptocurrency_etf::view::CryptocurrencyEtfWidget>(),
         WidgetRegistration::for_view::<empty::view::EmptyWidget>(),
-        WidgetRegistration::for_view::<etf::view::EtfWidget>(),
         WidgetRegistration::for_view::<financial_calendar::view::FinancialCalendarWidget>(),
         WidgetRegistration::for_view::<force_orders::view::ForceOrdersWidget>(),
-        WidgetRegistration::for_view::<hormuz_vessel_map::view::HormuzVesselMapWidget>(),
         WidgetRegistration::for_view::<
-            hyperliquid_wallet_monitor::view::HyperliquidWalletMonitorWidget,
+            global_shipping_chokepoint::view::GlobalShippingChokepointWidget,
+        >(),
+        WidgetRegistration::for_view::<
+            hyperliquid_wallet::view::HyperliquidWalletWidget,
         >(),
         WidgetRegistration::for_view::<financial_indices::view::FinancialIndicesWidget>(),
         WidgetRegistration::for_view::<market_trades::view::MarketTradesWidget>(),
@@ -56,9 +58,9 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<
             perpetual_statistics::widget::taker_volume::TakerVolumeWidget,
         >(),
-        WidgetRegistration::for_view::<x_account_monitoring::view::XAccountMonitoringWidget>(),
+        WidgetRegistration::for_view::<x::view::XWidget>(),
         WidgetRegistration::for_view::<volume_heatmap::view::VolumeHeatMapWidget>(),
-        WidgetRegistration::for_view::<cryptocurrency_wallet_monitoring::view::CryptocurrencyWalletMonitoringWidget>(),
+        WidgetRegistration::for_view::<cryptocurrency_wallet_monitor::view::CryptocurrencyWalletMonitorWidget>(),
         WidgetRegistration::for_view::<watch_list::view::WatchListWidget>(),
     ]
     .into_iter()
@@ -73,32 +75,31 @@ mod tests {
     use super::install;
     use crate::registry::WidgetRegistry;
 
-    const CANDLESTICK_ID: &str = "kytrix.market.candlestick";
+    const CANDLESTICK_ID: &str = "kytrix.candlestick";
     const COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID: &str =
-        "kytrix.market.coin_market_cap_fear_and_greed_index";
+        "kytrix.coin_market_cap_fear_and_greed_index";
+    const CRYPTOCURRENCY_ETF_ID: &str = "kytrix.cryptocurrency_etf";
     const EMPTY_ID: &str = "kytrix.empty";
-    const ETF_ID: &str = "kytrix.market.etf_flow";
-    const FINANCIAL_CALENDAR_ID: &str = "kytrix.monitoring.financial_calendar";
-    const FORCE_ORDERS_ID: &str = "kytrix.market.force_orders";
-    const HYPERLIQUID_WALLET_MONITOR_ID: &str = "kytrix.market.hyperliquid_wallet_monitor";
-    const HORMUZ_VESSEL_MAP_ID: &str = "kytrix.maritime.hormuz_vessel_map";
-    const FINANCIAL_INDICES_ID: &str = "kytrix.market.financial_indices";
-    const MARKET_TRADES_ID: &str = "kytrix.market.market_trades";
-    const NEWS_ID: &str = "kytrix.market.news";
-    const ORDER_BOOK_ID: &str = "kytrix.market.order_book";
-    const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.monitoring.pentagon_pizza_index";
-    const X_ACCOUNT_MONITORING_ID: &str = "kytrix.market.x_account_monitoring";
-    const VOLUME_HEAT_MAP_ID: &str = "kytrix.market.volume_heatmap";
-    const CRYPTOCURRENCY_WALLET_MONITORING_ID: &str =
-        "kytrix.market.cryptocurrency_wallet_monitoring";
-    const WATCH_LIST_ID: &str = "kytrix.market.watch_list";
+    const FINANCIAL_CALENDAR_ID: &str = "kytrix.financial_calendar";
+    const FORCE_ORDERS_ID: &str = "kytrix.force_orders";
+    const GLOBAL_SHIPPING_CHOKEPOINT_ID: &str = "kytrix.global_shipping_chokepoint";
+    const HYPERLIQUID_WALLET_ID: &str = "kytrix.hyperliquid_wallet";
+    const FINANCIAL_INDICES_ID: &str = "kytrix.financial_indices";
+    const MARKET_TRADES_ID: &str = "kytrix.market_trades";
+    const NEWS_ID: &str = "kytrix.news";
+    const ORDER_BOOK_ID: &str = "kytrix.order_book";
+    const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.pentagon_pizza_index";
+    const X_ID: &str = "kytrix.x";
+    const VOLUME_HEAT_MAP_ID: &str = "kytrix.volume_heatmap";
+    const CRYPTOCURRENCY_WALLET_MONITOR_ID: &str = "kytrix.cryptocurrency_wallet_monitor";
+    const WATCH_LIST_ID: &str = "kytrix.watch_list";
     /// The five perpetual-statistics panes, which are one widget per series.
     const STATISTICS_IDS: [&str; 5] = [
-        "kytrix.market.open_interest",
-        "kytrix.market.top_trader_account_ratio",
-        "kytrix.market.top_trader_position_ratio",
-        "kytrix.market.long_short_account_ratio",
-        "kytrix.market.taker_volume",
+        "kytrix.open_interest",
+        "kytrix.top_trader_account_ratio",
+        "kytrix.top_trader_position_ratio",
+        "kytrix.long_short_account_ratio",
+        "kytrix.taker_volume",
     ];
 
     /// The category every widget a selection surface lists declares, which is the
@@ -111,11 +112,11 @@ mod tests {
             COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID,
             WidgetCategory::Market,
         ),
-        (ETF_ID, WidgetCategory::Market),
+        (CRYPTOCURRENCY_ETF_ID, WidgetCategory::Market),
         (FINANCIAL_CALENDAR_ID, WidgetCategory::Monitoring),
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
-        (HORMUZ_VESSEL_MAP_ID, WidgetCategory::Monitoring),
-        (HYPERLIQUID_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
+        (GLOBAL_SHIPPING_CHOKEPOINT_ID, WidgetCategory::Monitoring),
+        (HYPERLIQUID_WALLET_ID, WidgetCategory::Monitoring),
         (FINANCIAL_INDICES_ID, WidgetCategory::Market),
         (MARKET_TRADES_ID, WidgetCategory::Market),
         (NEWS_ID, WidgetCategory::Monitoring),
@@ -126,12 +127,9 @@ mod tests {
         (STATISTICS_IDS[2], WidgetCategory::Statistics),
         (STATISTICS_IDS[3], WidgetCategory::Statistics),
         (STATISTICS_IDS[4], WidgetCategory::Statistics),
-        (X_ACCOUNT_MONITORING_ID, WidgetCategory::Monitoring),
+        (X_ID, WidgetCategory::Monitoring),
         (VOLUME_HEAT_MAP_ID, WidgetCategory::Statistics),
-        (
-            CRYPTOCURRENCY_WALLET_MONITORING_ID,
-            WidgetCategory::Monitoring,
-        ),
+        (CRYPTOCURRENCY_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
         (WATCH_LIST_ID, WidgetCategory::Market),
     ];
 
@@ -149,19 +147,19 @@ mod tests {
                     .is_some()
             );
             assert!(registry.get(EMPTY_ID).is_some());
-            assert!(registry.get(ETF_ID).is_some());
+            assert!(registry.get(CRYPTOCURRENCY_ETF_ID).is_some());
             assert!(registry.get(FINANCIAL_CALENDAR_ID).is_some());
             assert!(registry.get(FORCE_ORDERS_ID).is_some());
-            assert!(registry.get(HORMUZ_VESSEL_MAP_ID).is_some());
-            assert!(registry.get(HYPERLIQUID_WALLET_MONITOR_ID).is_some());
+            assert!(registry.get(GLOBAL_SHIPPING_CHOKEPOINT_ID).is_some());
+            assert!(registry.get(HYPERLIQUID_WALLET_ID).is_some());
             assert!(registry.get(FINANCIAL_INDICES_ID).is_some());
             assert!(registry.get(MARKET_TRADES_ID).is_some());
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
-            assert!(registry.get(X_ACCOUNT_MONITORING_ID).is_some());
+            assert!(registry.get(X_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
-            assert!(registry.get(CRYPTOCURRENCY_WALLET_MONITORING_ID).is_some());
+            assert!(registry.get(CRYPTOCURRENCY_WALLET_MONITOR_ID).is_some());
             assert!(registry.get(WATCH_LIST_ID).is_some());
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");

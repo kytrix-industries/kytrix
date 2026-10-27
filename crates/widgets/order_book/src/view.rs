@@ -374,7 +374,7 @@ pub struct OrderBookWidget {
 impl WidgetView for OrderBookWidget {
     type Config = OrderBookConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.order_book");
+    const ID: WidgetId = WidgetId::new_static("kytrix.order_book");
     const DISPLAY_NAME: &'static str = "widget.names.order_book";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Live grouped market depth";

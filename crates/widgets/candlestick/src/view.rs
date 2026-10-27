@@ -525,7 +525,7 @@ pub struct CandlestickWidget {
 impl WidgetView for CandlestickWidget {
     type Config = CandlestickConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.candlestick");
+    const ID: WidgetId = WidgetId::new_static("kytrix.candlestick");
     const DISPLAY_NAME: &'static str = "widget.names.candlestick";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Live and historical OHLCV chart";

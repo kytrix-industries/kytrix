@@ -224,7 +224,7 @@ fn a_definition_carries_its_capability_names() {
         "every venue answers candlesticks"
     );
     assert_eq!(
-        venues_supporting(CapabilityId::WalletMonitor),
+        venues_supporting(CapabilityId::Wallet),
         vec![venue("hyperliquid")],
         "only Hyperliquid monitors a wallet"
     );

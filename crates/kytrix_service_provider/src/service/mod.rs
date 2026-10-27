@@ -1,11 +1,11 @@
 mod actor;
 pub mod connector;
-pub mod cryptocurrency_wallet_monitoring;
+pub mod cryptocurrency_wallet_monitor;
 pub mod engine;
 pub mod entitlements;
+pub mod global_shipping_chokepoint;
 mod handoff;
 pub mod protocol;
-pub mod strategic_maritime_chokepoints_tracking;
 mod supervisor;
 #[cfg(test)]
 mod test_support;

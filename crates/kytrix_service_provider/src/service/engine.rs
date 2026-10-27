@@ -38,9 +38,7 @@ use yawc::{Frame, WebSocketError};
 
 use super::{
     connector::KytrixServiceConnector,
-    strategic_maritime_chokepoints_tracking::{
-        StrategicMaritimeChokepointsTrackingArea, StrategicMaritimeChokepointsTrackingUpdate,
-    },
+    global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
 };
 use crate::{
     account_profile::AccountProfile,
@@ -260,9 +258,9 @@ impl fmt::Display for FinancialIndexTopic {
 pub enum ServiceTopic {
     News,
     FinancialIndex(FinancialIndexTopic),
-    XAccountMonitoring,
+    X,
     CryptocurrencyWalletMonitoring,
-    StrategicMaritimeChokepointsTracking(StrategicMaritimeChokepointsTrackingArea),
+    GlobalShippingChokepoint(GlobalShippingChokepointArea),
 }
 
 /// A news event received from the service.
@@ -289,7 +287,7 @@ pub struct FinancialIndexEvent {
 
 /// A validated X profile received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XAccountMonitoringProfileEvent {
+pub struct XProfileEvent {
     pub x_user_id: SmolStr,
     pub username: SmolStr,
     pub display_name: SmolStr,
@@ -298,16 +296,16 @@ pub struct XAccountMonitoringProfileEvent {
     pub revision: u64,
 }
 
-/// A validated XAccountMonitoringTweet reference received from the service.
+/// A validated XTweet reference received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TweetReference {
-    Repost(Box<XAccountMonitoringTweetEvent>),
-    Quote(Box<XAccountMonitoringTweetEvent>),
+    Repost(Box<XTweetEvent>),
+    Quote(Box<XTweetEvent>),
 }
 
-/// Validated media attached to a XAccountMonitoringTweet.
+/// Validated media attached to a XTweet.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum XAccountMonitoringTweetMedia {
+pub enum XTweetMedia {
     Image {
         image_url: SmolStr,
         width: u32,
@@ -327,34 +325,34 @@ pub enum XAccountMonitoringTweetMedia {
     },
 }
 
-/// A validated text segment in a XAccountMonitoringTweet received from the service.
+/// A validated text segment in a XTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XAccountMonitoringTweetTextSegment {
+pub struct XTweetTextSegment {
     pub text: SmolStr,
     pub url: Option<SmolStr>,
 }
 
-/// A validated XAccountMonitoringTweet received from the service.
+/// A validated XTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XAccountMonitoringTweetEvent {
+pub struct XTweetEvent {
     pub tweet_id: SmolStr,
     pub timestamp: i64,
     pub x_user_id: SmolStr,
-    pub text_segments: Vec<XAccountMonitoringTweetTextSegment>,
+    pub text_segments: Vec<XTweetTextSegment>,
     pub reference: Option<TweetReference>,
-    pub media: Vec<XAccountMonitoringTweetMedia>,
+    pub media: Vec<XTweetMedia>,
 }
 
 /// A validated X timeline snapshot received over HTTP.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XAccountMonitoringTweetBatch {
-    pub tweets: Vec<XAccountMonitoringTweetEvent>,
-    pub profiles: Vec<XAccountMonitoringProfileEvent>,
+pub struct XTweetBatch {
+    pub tweets: Vec<XTweetEvent>,
+    pub profiles: Vec<XProfileEvent>,
 }
 
-/// A validated cryptocurrency_wallet_monitoring transfer received from the service.
+/// A validated cryptocurrency_wallet_monitor transfer received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CryptocurrencyWalletMonitoringTransfer {
+pub struct CryptocurrencyWalletMonitorTransfer {
     pub event_id: SmolStr,
     pub from_address: SmolStr,
     pub to_address: SmolStr,
@@ -367,21 +365,19 @@ pub struct CryptocurrencyWalletMonitoringTransfer {
 pub(super) enum KytrixServiceEvent {
     News(NewsEvent),
     FinancialIndex(FinancialIndexEvent),
-    XAccountMonitoringProfile(XAccountMonitoringProfileEvent),
-    XAccountMonitoringTweet(XAccountMonitoringTweetEvent),
-    CryptocurrencyWalletMonitoringTransfer(CryptocurrencyWalletMonitoringTransfer),
-    StrategicMaritimeChokepointsTracking(StrategicMaritimeChokepointsTrackingUpdate),
+    XProfile(XProfileEvent),
+    XTweet(XTweetEvent),
+    CryptocurrencyWalletMonitorTransfer(CryptocurrencyWalletMonitorTransfer),
+    GlobalShippingChokepoint(GlobalShippingChokepointUpdate),
     SessionState(KytrixSessionState),
 }
 
 pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
     FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
-    XAccountMonitoring(SubscriptionPublisher<XAccountMonitoringSubscriptionEvent>),
-    CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitoringTransfer>),
-    StrategicMaritimeChokepointsTracking(
-        SubscriptionPublisher<StrategicMaritimeChokepointsTrackingUpdate>,
-    ),
+    X(SubscriptionPublisher<XSubscriptionEvent>),
+    CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitorTransfer>),
+    GlobalShippingChokepoint(SubscriptionPublisher<GlobalShippingChokepointUpdate>),
 }
 
 impl SubscriberSink {
@@ -389,13 +385,11 @@ impl SubscriberSink {
         match self {
             Self::News(_) => KytrixServiceCapability::News,
             Self::FinancialIndices(_) => KytrixServiceCapability::FinancialIndices,
-            Self::XAccountMonitoring(_) => KytrixServiceCapability::XAccountMonitoring,
+            Self::X(_) => KytrixServiceCapability::X,
             Self::CryptocurrencyWalletMonitoring(_) => {
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring
             }
-            Self::StrategicMaritimeChokepointsTracking(_) => {
-                KytrixServiceCapability::StrategicMaritimeChokepointsTracking
-            }
+            Self::GlobalShippingChokepoint(_) => KytrixServiceCapability::GlobalShippingChokepoint,
         }
     }
 
@@ -403,9 +397,9 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.activate(),
             Self::FinancialIndices(publisher) => publisher.activate(),
-            Self::XAccountMonitoring(publisher) => publisher.activate(),
+            Self::X(publisher) => publisher.activate(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
-            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.activate(),
+            Self::GlobalShippingChokepoint(publisher) => publisher.activate(),
         }
     }
 
@@ -413,9 +407,9 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.reconnecting(),
             Self::FinancialIndices(publisher) => publisher.reconnecting(),
-            Self::XAccountMonitoring(publisher) => publisher.reconnecting(),
+            Self::X(publisher) => publisher.reconnecting(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
-            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.reconnecting(),
+            Self::GlobalShippingChokepoint(publisher) => publisher.reconnecting(),
         }
     }
 
@@ -423,9 +417,9 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.fail(error),
             Self::FinancialIndices(publisher) => publisher.fail(error),
-            Self::XAccountMonitoring(publisher) => publisher.fail(error),
+            Self::X(publisher) => publisher.fail(error),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
-            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.fail(error),
+            Self::GlobalShippingChokepoint(publisher) => publisher.fail(error),
         }
     }
 
@@ -433,9 +427,9 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.finish(),
             Self::FinancialIndices(publisher) => publisher.finish(),
-            Self::XAccountMonitoring(publisher) => publisher.finish(),
+            Self::X(publisher) => publisher.finish(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
-            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.finish(),
+            Self::GlobalShippingChokepoint(publisher) => publisher.finish(),
         }
     }
 
@@ -443,9 +437,9 @@ impl SubscriberSink {
         match self {
             Self::News(publisher) => publisher.is_cancelled(),
             Self::FinancialIndices(publisher) => publisher.is_cancelled(),
-            Self::XAccountMonitoring(publisher) => publisher.is_cancelled(),
+            Self::X(publisher) => publisher.is_cancelled(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
-            Self::StrategicMaritimeChokepointsTracking(publisher) => publisher.is_cancelled(),
+            Self::GlobalShippingChokepoint(publisher) => publisher.is_cancelled(),
         }
     }
 
@@ -459,31 +453,21 @@ impl SubscriberSink {
                     .try_send(event.clone())
                     .map_err(subscription_send_error)
             }
-            (
-                Self::XAccountMonitoring(publisher),
-                KytrixServiceEvent::XAccountMonitoringProfile(profile),
-            ) => publisher
-                .try_send(XAccountMonitoringSubscriptionEvent::Profile(
-                    profile.clone(),
-                ))
+            (Self::X(publisher), KytrixServiceEvent::XProfile(profile)) => publisher
+                .try_send(XSubscriptionEvent::Profile(profile.clone()))
                 .map_err(subscription_send_error),
-            (
-                Self::XAccountMonitoring(publisher),
-                KytrixServiceEvent::XAccountMonitoringTweet(tweet),
-            ) => publisher
-                .try_send(
-                    XAccountMonitoringSubscriptionEvent::XAccountMonitoringTweet(tweet.clone()),
-                )
+            (Self::X(publisher), KytrixServiceEvent::XTweet(tweet)) => publisher
+                .try_send(XSubscriptionEvent::XTweet(tweet.clone()))
                 .map_err(subscription_send_error),
             (
                 Self::CryptocurrencyWalletMonitoring(publisher),
-                KytrixServiceEvent::CryptocurrencyWalletMonitoringTransfer(transfer),
+                KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
             ) => publisher
                 .try_send(transfer.clone())
                 .map_err(subscription_send_error),
             (
-                Self::StrategicMaritimeChokepointsTracking(publisher),
-                KytrixServiceEvent::StrategicMaritimeChokepointsTracking(update),
+                Self::GlobalShippingChokepoint(publisher),
+                KytrixServiceEvent::GlobalShippingChokepoint(update),
             ) => publisher
                 .try_send(update.clone())
                 .map_err(subscription_send_error),
@@ -672,9 +656,9 @@ pub(super) struct KytrixServiceConnectorInner {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum XAccountMonitoringSubscriptionEvent {
-    Profile(XAccountMonitoringProfileEvent),
-    XAccountMonitoringTweet(XAccountMonitoringTweetEvent),
+pub enum XSubscriptionEvent {
+    Profile(XProfileEvent),
+    XTweet(XTweetEvent),
 }
 
 pub(super) enum SupervisorCommand {
@@ -913,10 +897,8 @@ pub(super) struct ServiceSessionActor {
     /// for a topic a connection adds, and this session is one connection. The pane would
     /// be left without a baseline until the server's next keyframe (up to its 300 s
     /// fallback), so the session hands the joining subscriber the last keyframe it saw.
-    pub latest_strategic_maritime_chokepoints_tracking_keyframes: AHashMap<
-        StrategicMaritimeChokepointsTrackingArea,
-        StrategicMaritimeChokepointsTrackingUpdate,
-    >,
+    pub latest_global_shipping_chokepoint_keyframes:
+        AHashMap<GlobalShippingChokepointArea, GlobalShippingChokepointUpdate>,
     pub session_state: Option<KytrixSessionState>,
     pub subscriptions_dirty: bool,
     pub websocket: Option<RawWebSocket>,

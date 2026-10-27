@@ -16,7 +16,7 @@ use super::{
     test_support::{FUNDS, layout, prepared, prepared_all},
     text::ChartTextCache,
 };
-use crate::model::{EtfFundSelection, EtfWindow};
+use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
 fn bar_values(prepared: &PreparedFrame) -> Vec<f64> {
     prepared.bars.iter().map(|bar| bar.value).collect()
@@ -115,8 +115,8 @@ fn a_named_fund_should_have_no_line_and_no_second_reading(cx: &mut TestAppContex
         let data = prepared(
             cx,
             &[1.0, 2.0],
-            EtfFundSelection::Named(SmolStr::new_static(FUNDS[0])),
-            EtfWindow::All,
+            CryptocurrencyEtfFundSelection::Named(SmolStr::new_static(FUNDS[0])),
+            CryptocurrencyEtfWindow::All,
         );
         let prepared = prepare(&data, layout(640.0, 360.0));
 

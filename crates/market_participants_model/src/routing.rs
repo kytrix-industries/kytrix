@@ -132,8 +132,8 @@ pub enum CapabilityId {
     AccountTrades,
     #[serde(rename = "account_history")]
     AccountHistory,
-    #[serde(rename = "wallet_monitor")]
-    WalletMonitor,
+    #[serde(rename = "wallet")]
+    Wallet,
 }
 
 impl CapabilityId {
@@ -158,7 +158,7 @@ impl CapabilityId {
             Self::AccountBalances => "account_balances",
             Self::AccountTrades => "account_trades",
             Self::AccountHistory => "account_history",
-            Self::WalletMonitor => "wallet_monitor",
+            Self::Wallet => "wallet",
         }
     }
 }

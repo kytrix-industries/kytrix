@@ -3,11 +3,11 @@ use std::convert::Infallible;
 use gpui_kit::{App, SharedString};
 use i18n::t;
 use kytrix_service_provider::service::{
-    cryptocurrency_wallet_monitoring::{
-        CryptocurrencyWalletMonitoringApiError, CryptocurrencyWalletMonitoringMutationUnknown,
+    cryptocurrency_wallet_monitor::{
+        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationUnknown,
     },
     engine::{ErrorCode, KytrixServiceError},
-    x::{XAccountMonitoringApiError, XAccountMonitoringMutationUnknown},
+    x::{XApiError, XMutationUnknown},
 };
 use market_participants_connector::{
     account::error::{AccountCatalogError, AccountError, AccountNetworkError},
@@ -1874,7 +1874,7 @@ fn localized_server_error(cx: &App, code: ErrorCode) -> SharedString {
     }
 }
 
-impl LocalizedError for XAccountMonitoringApiError {
+impl LocalizedError for XApiError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::InvalidSearchQuery => t!(cx, "widget.x_monitor.invalid_search_query"),
@@ -1894,7 +1894,7 @@ impl LocalizedError for XAccountMonitoringApiError {
     }
 }
 
-impl LocalizedError for XAccountMonitoringMutationUnknown {
+impl LocalizedError for XMutationUnknown {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Timeout => t!(cx, "error.mutation.timeout"),
@@ -1908,56 +1908,49 @@ impl LocalizedError for XAccountMonitoringMutationUnknown {
     }
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitoringApiError {
+impl LocalizedError for CryptocurrencyWalletMonitorApiError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidAddress => t!(
-                cx,
-                "widget.cryptocurrency_wallet_monitoring.invalid_address"
-            ),
-            Self::Conflict => t!(cx, "widget.cryptocurrency_wallet_monitoring.conflict"),
-            Self::NotFound => t!(cx, "widget.cryptocurrency_wallet_monitoring.not_found"),
-            Self::Unavailable => t!(cx, "widget.cryptocurrency_wallet_monitoring.unavailable"),
+            Self::InvalidAddress => t!(cx, "widget.cryptocurrency_wallet_monitor.invalid_address"),
+            Self::Conflict => t!(cx, "widget.cryptocurrency_wallet_monitor.conflict"),
+            Self::NotFound => t!(cx, "widget.cryptocurrency_wallet_monitor.not_found"),
+            Self::Unavailable => t!(cx, "widget.cryptocurrency_wallet_monitor.unavailable"),
             Self::Authentication => t!(
                 cx,
-                "widget.cryptocurrency_wallet_monitoring.authentication_failed"
+                "widget.cryptocurrency_wallet_monitor.authentication_failed"
             ),
             Self::Network(detail) => t!(
                 cx,
-                "error.cryptocurrency_wallet_monitoring.network",
+                "error.cryptocurrency_wallet_monitor.network",
                 detail = detail
             ),
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
             Self::Protocol(detail) => t!(
                 cx,
-                "error.cryptocurrency_wallet_monitoring.protocol",
+                "error.cryptocurrency_wallet_monitor.protocol",
                 detail = detail
             ),
-            Self::ResponseTooLarge => t!(
-                cx,
-                "error.cryptocurrency_wallet_monitoring.response_too_large"
-            ),
-            Self::InvalidResponse => t!(
-                cx,
-                "error.cryptocurrency_wallet_monitoring.invalid_response"
-            ),
+            Self::ResponseTooLarge => {
+                t!(cx, "error.cryptocurrency_wallet_monitor.response_too_large")
+            }
+            Self::InvalidResponse => t!(cx, "error.cryptocurrency_wallet_monitor.invalid_response"),
             Self::Server(status) => t!(
                 cx,
-                "error.cryptocurrency_wallet_monitoring.server",
+                "error.cryptocurrency_wallet_monitor.server",
                 status = status.as_u16()
             ),
-            Self::Timeout => t!(cx, "error.cryptocurrency_wallet_monitoring.timeout"),
-            Self::Closed => t!(cx, "error.cryptocurrency_wallet_monitoring.closed"),
+            Self::Timeout => t!(cx, "error.cryptocurrency_wallet_monitor.timeout"),
+            Self::Closed => t!(cx, "error.cryptocurrency_wallet_monitor.closed"),
             Self::AccountChanged => {
-                t!(cx, "error.cryptocurrency_wallet_monitoring.account_changed")
+                t!(cx, "error.cryptocurrency_wallet_monitor.account_changed")
             }
-            Self::NotReady => t!(cx, "error.cryptocurrency_wallet_monitoring.not_ready"),
+            Self::NotReady => t!(cx, "error.cryptocurrency_wallet_monitor.not_ready"),
         }
     }
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitoringMutationUnknown {
+impl LocalizedError for CryptocurrencyWalletMonitorMutationUnknown {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Timeout => t!(cx, "error.mutation.timeout"),
@@ -2898,8 +2891,8 @@ mod tests {
     /// therefore names every key where it uses it.
     const WIDGET_MESSAGE_SOURCES: &[&str] = &[
         include_str!("../../widgets/force_orders/src/view.rs"),
-        include_str!("../../widgets/hyperliquid_wallet_monitor/src/model.rs"),
-        include_str!("../../widgets/hyperliquid_wallet_monitor/src/service.rs"),
+        include_str!("../../widgets/hyperliquid_wallet/src/model.rs"),
+        include_str!("../../widgets/hyperliquid_wallet/src/service.rs"),
         include_str!("../../widgets/watch_list/src/view.rs"),
     ];
 
@@ -2986,8 +2979,8 @@ mod tests {
             include_str!("../../widgets/coin_market_cap_fear_and_greed_index/src/view.rs"),
         ),
         (
-            "crates/widgets/etf/src/view.rs",
-            include_str!("../../widgets/etf/src/view.rs"),
+            "crates/widgets/cryptocurrency_etf/src/view.rs",
+            include_str!("../../widgets/cryptocurrency_etf/src/view.rs"),
         ),
         (
             "crates/widgets/financial_calendar/src/view.rs",
@@ -2998,12 +2991,12 @@ mod tests {
             include_str!("../../widgets/force_orders/src/view.rs"),
         ),
         (
-            "crates/widgets/hormuz_vessel_map/src/view.rs",
-            include_str!("../../widgets/hormuz_vessel_map/src/view.rs"),
+            "crates/widgets/global_shipping_chokepoint/src/view.rs",
+            include_str!("../../widgets/global_shipping_chokepoint/src/view.rs"),
         ),
         (
-            "crates/widgets/hyperliquid_wallet_monitor/src/view.rs",
-            include_str!("../../widgets/hyperliquid_wallet_monitor/src/view.rs"),
+            "crates/widgets/hyperliquid_wallet/src/view.rs",
+            include_str!("../../widgets/hyperliquid_wallet/src/view.rs"),
         ),
         (
             "crates/widgets/financial_indices/src/view.rs",
@@ -3030,16 +3023,16 @@ mod tests {
             include_str!("../../widgets/perpetual_statistics/src/widget/display/pane.rs"),
         ),
         (
-            "crates/widgets/x_account_monitoring/src/view.rs",
-            include_str!("../../widgets/x_account_monitoring/src/view.rs"),
+            "crates/widgets/x/src/view.rs",
+            include_str!("../../widgets/x/src/view.rs"),
         ),
         (
             "crates/widgets/volume_heatmap/src/view.rs",
             include_str!("../../widgets/volume_heatmap/src/view.rs"),
         ),
         (
-            "crates/widgets/cryptocurrency_wallet_monitoring/src/view.rs",
-            include_str!("../../widgets/cryptocurrency_wallet_monitoring/src/view.rs"),
+            "crates/widgets/cryptocurrency_wallet_monitor/src/view.rs",
+            include_str!("../../widgets/cryptocurrency_wallet_monitor/src/view.rs"),
         ),
         (
             "crates/widgets/watch_list/src/view.rs",
@@ -3380,7 +3373,7 @@ mod tests {
     /// Both readers of the widget sources skip the accessor a test drives rather than the
     /// mappings written after it.
     ///
-    /// `hyperliquid_wallet_monitor` marks such an accessor in the middle of its production half,
+    /// `hyperliquid_wallet` marks such an accessor in the middle of its production half,
     /// and both readers sliced each source at the first `#[cfg(test)]` until this rule was
     /// written down: every `t!` invocation below that accessor was read by nothing, so a mapping
     /// there could lose a placeholder — or name a key no locale defines — with both guards

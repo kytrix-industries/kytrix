@@ -86,7 +86,7 @@ impl AuthenticatedTarget {
 /// the type carries no serde derive: nothing outside this crate builds one, so there
 /// is no wire form a target could be decoded from either.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum WalletMonitorTarget {
+pub enum WalletTarget {
     /// A public address read, which never requires a trading credential.
     Public {
         route: VenueRoute,
@@ -96,7 +96,7 @@ pub enum WalletMonitorTarget {
     Route { route: VenueRoute },
 }
 
-impl WalletMonitorTarget {
+impl WalletTarget {
     /// Returns the route this target reads, whichever access mode it uses.
     pub fn route(&self) -> &VenueRoute {
         match self {
@@ -132,7 +132,7 @@ pub enum RequestTarget {
     /// An authenticated request about the account of one route.
     Account(AuthenticatedTarget),
     /// A wallet-monitor request.
-    Wallet(WalletMonitorTarget),
+    Wallet(WalletTarget),
 }
 
 impl RequestTarget {
@@ -362,7 +362,7 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
         Request::SubscribeHyperliquidUserFills(query) => wallet_request(query.wallet_target()),
         Request::SubscribeHyperliquidUserLedger(query) => wallet_request(query.wallet_target()),
         Request::SubscribeHyperliquidFastContexts(query) => {
-            wallet_route_request(Capability::WalletMonitor, query.route())
+            wallet_route_request(Capability::Wallet, query.route())
         }
     }
 }
@@ -407,9 +407,9 @@ fn account_request(
 }
 
 /// Classifies a wallet-monitor request.
-fn wallet_request(target: &WalletMonitorTarget) -> ClassifiedRequest {
+fn wallet_request(target: &WalletTarget) -> ClassifiedRequest {
     ClassifiedRequest::new(
-        CapabilityId::WalletMonitor,
+        CapabilityId::Wallet,
         RequestTarget::Wallet(target.clone()),
         None,
         None,
@@ -420,7 +420,7 @@ fn wallet_request(target: &WalletMonitorTarget) -> ClassifiedRequest {
 fn wallet_route_request(capability: CapabilityId, route: &VenueRoute) -> ClassifiedRequest {
     ClassifiedRequest::new(
         capability,
-        RequestTarget::Wallet(WalletMonitorTarget::Route {
+        RequestTarget::Wallet(WalletTarget::Route {
             route: route.clone(),
         }),
         None,
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(wallet.listing(), None);
         assert_eq!(
             wallet.capability(),
-            market_participants_model::routing::CapabilityId::WalletMonitor
+            market_participants_model::routing::CapabilityId::Wallet
         );
     }
 }

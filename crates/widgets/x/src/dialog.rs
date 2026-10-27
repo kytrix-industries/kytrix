@@ -78,16 +78,14 @@ use gpui_kit::{
     px, relative,
 };
 use i18n::t;
-use kytrix_service_provider::service::x::{
-    XAccountMonitoringApiError, XAccountMonitoringProfile, XAccountMonitoringSelection,
-};
+use kytrix_service_provider::service::x::{XApiError, XProfile, XSelection};
 use smol_str::{SmolStr, format_smolstr};
 use widget::{error::LocalizedError, rpc::RpcCallError, status::WidgetAction};
 
 use super::{
     model::{MediaStates, SelectionData, selection_name},
     view::{
-        SelectionNotice, SelectionOperation, XAccountMonitoringWidget, avatar, centered_message,
+        SelectionNotice, SelectionOperation, XWidget, avatar, centered_message,
         message_with_action, recovery_button, status_label, valid_search_query,
     },
 };
@@ -107,17 +105,17 @@ pub(super) const PAGE_TRANSITION: Duration = Duration::from_millis(220);
 const PAGE_DEPTH_DRIFT: f32 = 0.3;
 
 /// The list the dialog draws the monitored accounts with.
-const ACCOUNT_LIST_ID: &str = "tweet-monitor-account-list";
+const ACCOUNT_LIST_ID: &str = "x-account-list";
 
 /// The list the dialog draws search results with.
-const RESULT_LIST_ID: &str = "tweet-monitor-result-list";
+const RESULT_LIST_ID: &str = "x-result-list";
 
 /// The field the monitored accounts are filtered by, which filters nothing but what is on
 /// screen: the service is never asked about it.
-const FILTER_INPUT_ID: &str = "tweet-monitor-filter";
+const FILTER_INPUT_ID: &str = "x-filter";
 
 /// The field X is searched with.
-const QUERY_INPUT_ID: &str = "tweet-monitor-query";
+const QUERY_INPUT_ID: &str = "x-query";
 
 /// The size of the face one row of either list is drawn with.
 const ROW_AVATAR_SIZE: f32 = 42.0;
@@ -163,9 +161,9 @@ enum DialogPage {
 /// page holding no answer.
 pub(super) enum SearchAnswer {
     /// The accounts the search found, which may be none of them.
-    Found(Arc<[XAccountMonitoringProfile]>),
+    Found(Arc<[XProfile]>),
     /// Why the search could not be answered.
-    Failed(RpcCallError<XAccountMonitoringApiError>),
+    Failed(RpcCallError<XApiError>),
 }
 
 /// One dialog over a pane.
@@ -175,7 +173,7 @@ pub(super) enum SearchAnswer {
 /// reader is in each of them, and the document the body's own sentence is drawn from — and draws
 /// everything else from the pane, which is what holds the service that answers a read or a change.
 pub(super) struct TweetDialog {
-    widget: WeakEntity<XAccountMonitoringWidget>,
+    widget: WeakEntity<XWidget>,
     /// The pages, of which the top one is showing.
     stack: Entity<NavStackState>,
     /// The page X is searched for one more account on, which is the one pushed over the
@@ -198,13 +196,13 @@ pub(super) struct TweetDialog {
     /// query it does not stand for.
     search: Option<SearchAnswer>,
     /// The accounts the account monitors, of the ones the filter shows.
-    accounts: Entity<StaticSizedList<XAccountMonitoringSelection>>,
+    accounts: Entity<StaticSizedList<XSelection>>,
     /// The pane's rows the monitored list was last told to draw, and which of them those were.
-    shown_accounts: Option<(Arc<[XAccountMonitoringSelection]>, Vec<usize>)>,
+    shown_accounts: Option<(Arc<[XSelection]>, Vec<usize>)>,
     /// The accounts one search found.
-    results: Entity<StaticSizedList<XAccountMonitoringProfile>>,
+    results: Entity<StaticSizedList<XProfile>>,
     /// What the search list was last told to draw.
-    shown_results: Option<Arc<[XAccountMonitoringProfile]>>,
+    shown_results: Option<Arc<[XProfile]>>,
     /// What the last change said the last time the dialog reported it.
     ///
     /// The pane holds what a change said until another change replaces it, so the same report
@@ -237,11 +235,7 @@ impl TweetDialog {
     ///
     /// Nothing happens when it is already open: the control is the dialog's only entrance, and
     /// replacing the open one would throw away what the user has typed.
-    pub(super) fn show(
-        widget: WeakEntity<XAccountMonitoringWidget>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    pub(super) fn show(widget: WeakEntity<XWidget>, window: &mut Window, cx: &mut App) {
         let Some(pane) = widget.upgrade() else {
             return;
         };
@@ -250,12 +244,12 @@ impl TweetDialog {
         }
         let filter = cx.new(|cx| {
             InputStateBuilder::new(FILTER_INPUT_ID)
-                .placeholder(t!(cx, "widget.x_account_monitoring.filter_placeholder"))
+                .placeholder(t!(cx, "widget.x.filter_placeholder"))
                 .build(window, cx)
         });
         let query = cx.new(|cx| {
             InputStateBuilder::new(QUERY_INPUT_ID)
-                .placeholder(t!(cx, "widget.x_account_monitoring.search_placeholder"))
+                .placeholder(t!(cx, "widget.x.search_placeholder"))
                 .build(window, cx)
         });
         let dialog = cx.new(|cx| Self::new(widget.clone(), filter, query, cx));
@@ -295,7 +289,7 @@ impl TweetDialog {
     }
 
     pub(super) fn new(
-        widget: WeakEntity<XAccountMonitoringWidget>,
+        widget: WeakEntity<XWidget>,
         filter: Entity<InputState>,
         query: Entity<InputState>,
         cx: &mut Context<Self>,
@@ -348,7 +342,7 @@ impl TweetDialog {
                 {
                     let pane = pane.clone();
                     let dialog = rows.clone();
-                    move |_index, selection: &XAccountMonitoringSelection, _window, cx| {
+                    move |_index, selection: &XSelection, _window, cx| {
                         account_row(selection, &pane, &dialog, cx)
                     }
                 },
@@ -357,7 +351,7 @@ impl TweetDialog {
         let results = cx.new(|_| {
             StaticSizedList::new(
                 ElementId::Name(SharedString::new_static(RESULT_LIST_ID)),
-                move |_index, profile: &XAccountMonitoringProfile, _window, cx| {
+                move |_index, profile: &XProfile, _window, cx| {
                     search_result_row(profile, &pane, &rows, cx)
                 },
             )
@@ -411,7 +405,7 @@ impl TweetDialog {
     /// language did, is parsed exactly once. The document is drawn under the branch
     /// [`Self::list`] takes instead of that sentence, so what it holds while there is a list to
     /// draw costs nothing.
-    fn resolve_message(&mut self, pane: &Entity<XAccountMonitoringWidget>, cx: &mut Context<Self>) {
+    fn resolve_message(&mut self, pane: &Entity<XWidget>, cx: &mut Context<Self>) {
         let state = pane.read(cx).dialog_state();
         let Some(message) = self.message_text(&state, cx) else {
             return;
@@ -427,11 +421,11 @@ impl TweetDialog {
     /// cannot disagree about whether there is anything to show.
     fn message_text(&self, state: &DialogState, cx: &App) -> Option<SharedString> {
         if !state.signed_in {
-            return Some(t!(cx, "widget.x_account_monitoring.logged_out"));
+            return Some(t!(cx, "widget.x.logged_out"));
         }
         let data = state.selections.as_ref()?;
         if data.selections().is_empty() {
-            return Some(t!(cx, "widget.x_account_monitoring.empty_accounts"));
+            return Some(t!(cx, "widget.x.empty_accounts"));
         }
 
         filtered_selection_indices(
@@ -549,11 +543,11 @@ impl TweetDialog {
         cx: &Context<Self>,
     ) -> AnyElement {
         let count = state.selections.as_ref().map_or_else(
-            || t!(cx, "widget.x_account_monitoring.dialog_title"),
+            || t!(cx, "widget.x.dialog_title"),
             |data| {
                 t!(
                     cx,
-                    "widget.x_account_monitoring.monitored_accounts",
+                    "widget.x.monitored_accounts",
                     current = data.selections().len(),
                     limit = data.limit()
                 )
@@ -568,12 +562,12 @@ impl TweetDialog {
             .gap_2();
         if page == DialogPage::Add {
             row = row.child(
-                Button::new("tweet-monitor-back")
+                Button::new("x-back")
                     .ghost()
                     .medium()
                     .debug_selector(|| "TEST_TWEET_BACK".into())
-                    .aria_label(t!(cx, "widget.x_account_monitoring.back"))
-                    .with_tooltip(t!(cx, "widget.x_account_monitoring.back"))
+                    .aria_label(t!(cx, "widget.x.back"))
+                    .with_tooltip(t!(cx, "widget.x.back"))
                     .on_click({
                         let dialog = dialog.clone();
                         move |_, _, cx| {
@@ -601,13 +595,13 @@ impl TweetDialog {
             row = row
                 .child(
                     div().flex_none().child(
-                        Button::new("tweet-monitor-add-account")
+                        Button::new("x-add-account")
                             .filled()
                             .medium()
                             .debug_selector(|| "TEST_TWEET_ADD_ACCOUNT".into())
                             .disabled(state.selections.is_none())
-                            .aria_label(t!(cx, "widget.x_account_monitoring.add_account"))
-                            .with_tooltip(t!(cx, "widget.x_account_monitoring.add_account"))
+                            .aria_label(t!(cx, "widget.x.add_account"))
+                            .with_tooltip(t!(cx, "widget.x.add_account"))
                             .on_click({
                                 let dialog = dialog.clone();
                                 move |_, _, cx| {
@@ -615,12 +609,12 @@ impl TweetDialog {
                                 }
                             })
                             .child(Icon::new(IconKind::Plus).size_3())
-                            .child(t!(cx, "widget.x_account_monitoring.add_account")),
+                            .child(t!(cx, "widget.x.add_account")),
                     ),
                 )
                 .child(
                     div().flex_none().child(
-                        Button::new("tweet-monitor-refresh")
+                        Button::new("x-refresh")
                             .tonal()
                             .medium()
                             .debug_selector(|| "TEST_TWEET_REFRESH".into())
@@ -629,8 +623,8 @@ impl TweetDialog {
                                     || state.searching.is_some()
                                     || !state.ready,
                             )
-                            .aria_label(t!(cx, "widget.x_account_monitoring.refresh"))
-                            .with_tooltip(t!(cx, "widget.x_account_monitoring.refresh"))
+                            .aria_label(t!(cx, "widget.x.refresh"))
+                            .with_tooltip(t!(cx, "widget.x.refresh"))
                             .on_click({
                                 let dialog = dialog.clone();
                                 move |_, _, cx| {
@@ -670,13 +664,13 @@ impl TweetDialog {
                 // so a search that is out is a search this control does not send again, and one
                 // that cannot be sent while the accounts are being read or changed.
                 let busy = state.operation.is_some() || state.searching.is_some() || !state.ready;
-                let search = Button::new("tweet-monitor-search")
+                let search = Button::new("x-search")
                     .ghost()
                     .medium()
                     .debug_selector(|| "TEST_TWEET_SEARCH".into())
                     .disabled(busy || !self.typed_query.as_deref().is_some_and(valid_search_query))
-                    .aria_label(t!(cx, "widget.x_account_monitoring.search_users"))
-                    .with_tooltip(t!(cx, "widget.x_account_monitoring.search_users"))
+                    .aria_label(t!(cx, "widget.x.search_users"))
+                    .with_tooltip(t!(cx, "widget.x.search_users"))
                     .on_click({
                         let dialog = dialog.clone();
                         move |_, _, cx| {
@@ -759,7 +753,7 @@ impl TweetDialog {
     fn over(
         &mut self,
         page: DialogPage,
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         dialog: &Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -792,7 +786,7 @@ impl TweetDialog {
     fn list(
         &mut self,
         page: DialogPage,
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         dialog: &Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -818,7 +812,7 @@ impl TweetDialog {
             return match state.operation {
                 // A read is on its way, whether it is out or waiting for the stream.
                 Some(operation) if operation.is_read() => loading_message(
-                    t!(cx, "widget.x_account_monitoring.loading_accounts"),
+                    t!(cx, "widget.x.loading_accounts"),
                     "TEST_TWEET_LOADING_ACCOUNTS",
                     cx,
                 ),
@@ -826,13 +820,13 @@ impl TweetDialog {
                 // out is the recovery the pane itself offers, which is the same control the
                 // pane is showing behind this dialog.
                 _ if !state.ready => message_with_action(
-                    t!(cx, "widget.x_account_monitoring.stream_unavailable"),
+                    t!(cx, "widget.x.stream_unavailable"),
                     recovery_button(&state.recovery, cx),
                 ),
                 // The read was answered with a failure, which the alert over the dialog names:
                 // what is left to draw here is the way to read the accounts again.
                 _ => message_with_action(
-                    t!(cx, "widget.x_account_monitoring.load_failed"),
+                    t!(cx, "widget.x.load_failed"),
                     self.retry_button(dialog, cx),
                 ),
             };
@@ -870,7 +864,7 @@ impl TweetDialog {
         let theme = cx.theme();
         if state.searching.is_some() {
             return loading_message(
-                t!(cx, "widget.x_account_monitoring.searching_users"),
+                t!(cx, "widget.x.searching_users"),
                 "TEST_TWEET_SEARCHING",
                 cx,
             );
@@ -898,7 +892,7 @@ impl TweetDialog {
                 .debug_selector(|| "TEST_TWEET_NO_SEARCH_RESULTS".into())
                 .size_full()
                 .child(centered_message(
-                    t!(cx, "widget.x_account_monitoring.no_search_results"),
+                    t!(cx, "widget.x.no_search_results"),
                     theme.roles.fg.muted.hsla,
                 ))
                 .into_any_element();
@@ -924,7 +918,7 @@ impl TweetDialog {
     /// rows again leaves the list — and the reader — alone.
     fn show_accounts(
         &mut self,
-        selections: Arc<[XAccountMonitoringSelection]>,
+        selections: Arc<[XSelection]>,
         filtered: &[usize],
         cx: &mut Context<Self>,
     ) {
@@ -936,7 +930,7 @@ impl TweetDialog {
             return;
         }
 
-        let accounts: Vec<XAccountMonitoringSelection> = filtered
+        let accounts: Vec<XSelection> = filtered
             .iter()
             .filter_map(|index| selections.get(*index).cloned())
             .collect();
@@ -948,7 +942,7 @@ impl TweetDialog {
     }
 
     /// Shows what a search found, if it is not what the list holds.
-    fn show_results(&mut self, results: &Arc<[XAccountMonitoringProfile]>, cx: &mut Context<Self>) {
+    fn show_results(&mut self, results: &Arc<[XProfile]>, cx: &mut Context<Self>) {
         if self
             .shown_results
             .as_ref()
@@ -966,7 +960,7 @@ impl TweetDialog {
 
     /// The way to read the accounts again, for a read that was answered with a failure.
     fn retry_button(&self, dialog: &Entity<Self>, cx: &Context<Self>) -> AnyElement {
-        Button::new("tweet-monitor-retry")
+        Button::new("x-retry")
             .outline()
             .small()
             .aria_label(t!(cx, "common.retry"))
@@ -997,7 +991,7 @@ impl TweetDialog {
             .child(Separator::horizontal())
             .child(
                 div().w_full().flex().items_center().justify_end().child(
-                    Button::new("tweet-monitor-close")
+                    Button::new("x-close")
                         .ghost()
                         .medium()
                         .debug_selector(|| "TEST_TWEET_CLOSE".into())
@@ -1080,11 +1074,11 @@ impl Render for TweetDialog {
 fn report_text(notice: &SelectionNotice, cx: &App) -> (SharedString, SharedString) {
     match notice {
         SelectionNotice::Added => (
-            t!(cx, "widget.x_account_monitoring.success_title"),
-            t!(cx, "widget.x_account_monitoring.add_success"),
+            t!(cx, "widget.x.success_title"),
+            t!(cx, "widget.x.add_success"),
         ),
         SelectionNotice::Problem(failure) => (
-            t!(cx, "widget.x_account_monitoring.error_title"),
+            t!(cx, "widget.x.error_title"),
             failure.localized_message(cx),
         ),
     }
@@ -1118,17 +1112,13 @@ fn centered_document(message: &Entity<MarkdownState>, color: Hsla) -> AnyElement
 /// dialog that owns what the user is typing — it reads through weak handles, so a page never
 /// keeps either of them alive.
 struct PageView {
-    widget: WeakEntity<XAccountMonitoringWidget>,
+    widget: WeakEntity<XWidget>,
     dialog: WeakEntity<TweetDialog>,
     page: DialogPage,
 }
 
 impl PageView {
-    fn new(
-        widget: WeakEntity<XAccountMonitoringWidget>,
-        dialog: WeakEntity<TweetDialog>,
-        page: DialogPage,
-    ) -> Self {
+    fn new(widget: WeakEntity<XWidget>, dialog: WeakEntity<TweetDialog>, page: DialogPage) -> Self {
         Self {
             widget,
             dialog,
@@ -1314,7 +1304,7 @@ impl SearchProfileAction {
 /// username, its display name, the username it is waiting to be activated under, or any part
 /// of its numeric id.
 fn filtered_selection_indices(
-    selections: &[XAccountMonitoringSelection],
+    selections: &[XSelection],
     hints: &HashMap<SmolStr, SharedString>,
     filter: Option<&str>,
 ) -> Vec<usize> {
@@ -1352,8 +1342,8 @@ fn filtered_selection_indices(
 /// by the list reads what the pane holds now: a list draws its rows again on every frame of the
 /// dialog, and what a row draws is the frame it is drawn in.
 fn account_row(
-    selection: &XAccountMonitoringSelection,
-    pane: &WeakEntity<XAccountMonitoringWidget>,
+    selection: &XSelection,
+    pane: &WeakEntity<XWidget>,
     dialog: &WeakEntity<TweetDialog>,
     cx: &App,
 ) -> AnyElement {
@@ -1364,13 +1354,9 @@ fn account_row(
     let theme = cx.theme();
     let x_user_id = selection.x_user_id.clone();
     let name = account_name(selection, &state.hints);
-    let label = t!(
-        cx,
-        "widget.x_account_monitoring.delete_account",
-        account = name
-    );
+    let label = t!(cx, "widget.x.delete_account", account = name);
     let delete = Button::new((
-        ElementId::Name(SharedString::new_static("TweetMonitorAccountDelete")),
+        ElementId::Name(SharedString::new_static("XAccountDelete")),
         selection.x_user_id.as_str(),
     ))
     .ghost()
@@ -1431,7 +1417,7 @@ fn account_row(
                         .text_color(theme.roles.fg.muted.hsla)
                         .child(t!(
                             cx,
-                            "widget.x_account_monitoring.account_id",
+                            "widget.x.account_id",
                             id = selection.x_user_id.clone()
                         )),
                 );
@@ -1439,7 +1425,7 @@ fn account_row(
     }
 
     Interactive::new((
-        ElementId::Name(SharedString::new_static("TweetMonitorAccountRow")),
+        ElementId::Name(SharedString::new_static("XAccountRow")),
         selection.x_user_id.as_str(),
     ))
     .rounded_sm()
@@ -1489,8 +1475,8 @@ fn account_row(
 /// service confirmed is one the row beside it stops offering: the list draws its rows again on
 /// every frame of the dialog.
 fn search_result_row(
-    profile: &XAccountMonitoringProfile,
-    pane: &WeakEntity<XAccountMonitoringWidget>,
+    profile: &XProfile,
+    pane: &WeakEntity<XWidget>,
     dialog: &WeakEntity<TweetDialog>,
     cx: &App,
 ) -> AnyElement {
@@ -1503,15 +1489,15 @@ fn search_result_row(
     let action = rows.action(profile.username.as_str());
     let username = SmolStr::new(profile.username.as_str());
     let label = match action {
-        SearchProfileAction::Selected => t!(cx, "widget.x_account_monitoring.already_monitored"),
+        SearchProfileAction::Selected => t!(cx, "widget.x.already_monitored"),
         SearchProfileAction::Add { .. } => t!(
             cx,
-            "widget.x_account_monitoring.add_search_result",
+            "widget.x.add_search_result",
             username = profile.username.clone()
         ),
     };
     let control = Button::new((
-        ElementId::Name(SharedString::new_static("TweetMonitorSearchAdd")),
+        ElementId::Name(SharedString::new_static("XSearchAdd")),
         profile.x_user_id.as_str(),
     ))
     .ghost()
@@ -1532,7 +1518,7 @@ fn search_result_row(
     .child(Icon::new(action.icon()).size_3());
 
     Interactive::new((
-        ElementId::Name(SharedString::new_static("TweetMonitorSearchRow")),
+        ElementId::Name(SharedString::new_static("XSearchRow")),
         profile.x_user_id.as_str(),
     ))
     .rounded_sm()
@@ -1594,7 +1580,7 @@ fn search_result_row(
                                     .child(if profile.followers_count == 1 {
                                         t!(
                                             cx,
-                                            "widget.x_account_monitoring.followers_following_one_follower",
+                                            "widget.x.followers_following_one_follower",
                                             followers =
                                                 format_follower_count(profile.followers_count),
                                             following = profile.following_count
@@ -1602,7 +1588,7 @@ fn search_result_row(
                                     } else {
                                         t!(
                                             cx,
-                                            "widget.x_account_monitoring.followers_following",
+                                            "widget.x.followers_following",
                                             followers =
                                                 format_follower_count(profile.followers_count),
                                             following = profile.following_count
@@ -1618,7 +1604,7 @@ fn search_result_row(
 }
 
 /// The name line of one account: what it is called, and whether X vouches for it.
-fn profile_line(profile: &XAccountMonitoringProfile, cx: &App) -> AnyElement {
+fn profile_line(profile: &XProfile, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let mut line = div().min_w_0().flex().items_center().gap_2().child(
         div()
@@ -1646,7 +1632,7 @@ fn profile_line(profile: &XAccountMonitoringProfile, cx: &App) -> AnyElement {
                 .flex_none()
                 .text_xs()
                 .text_color(theme.roles.fg.muted.hsla)
-                .child(t!(cx, "widget.x_account_monitoring.protected")),
+                .child(t!(cx, "widget.x.protected")),
         );
     }
 
@@ -1670,10 +1656,7 @@ fn profile_line(profile: &XAccountMonitoringProfile, cx: &App) -> AnyElement {
 /// A row is named by what is known about it — its profile, or the username it was added under
 /// while it waits to be activated — which is the same rule that decides whether an account is
 /// already monitored, asked in the same place.
-fn account_name(
-    selection: &XAccountMonitoringSelection,
-    hints: &HashMap<SmolStr, SharedString>,
-) -> SharedString {
+fn account_name(selection: &XSelection, hints: &HashMap<SmolStr, SharedString>) -> SharedString {
     match selection_name(selection, hints) {
         Some(name) => SharedString::new(format_smolstr!("@{name}")),
         None => SharedString::new(selection.x_user_id.as_str()),
@@ -1727,7 +1710,7 @@ fn loading_message(
     cx: &Context<TweetDialog>,
 ) -> AnyElement {
     div()
-        .id("tweet-monitor-loading")
+        .id("x-loading")
         .debug_selector(move || selector.into())
         .size_full()
         .flex()
@@ -1737,7 +1720,7 @@ fn loading_message(
         .gap_2()
         .role(Role::ProgressIndicator)
         .aria_label(message.clone())
-        .child(div().size_5().child(Spinner::new("tweet-monitor-spinner")))
+        .child(div().size_5().child(Spinner::new("x-spinner")))
         .child(
             div()
                 .text_xs()
@@ -1752,8 +1735,7 @@ mod tests {
     use gpui_kit::TestAppContext;
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::x::{
-        XAccountMonitoringApiError, XAccountMonitoringProfile, XAccountMonitoringSelection,
-        XAccountMonitoringSelectionStatus, XAccountMonitoringSelectionsResponse,
+        XApiError, XProfile, XSelection, XSelectionStatus, XSelectionsResponse,
     };
 
     use super::*;
@@ -1778,9 +1760,7 @@ mod tests {
 
             let (problem, reason, success, joined) = cx.read(|cx| {
                 let (problem, reason) = report_text(
-                    &SelectionNotice::Problem(SelectionFailure::Rejected(
-                        XAccountMonitoringApiError::QuotaExceeded,
-                    )),
+                    &SelectionNotice::Problem(SelectionFailure::Rejected(XApiError::QuotaExceeded)),
                     cx,
                 );
                 let (success, joined) = report_text(&SelectionNotice::Added, cx);
@@ -1810,13 +1790,13 @@ mod tests {
     }
 
     /// One monitored account, under an id and a name of the test's choosing.
-    fn monitored(x_user_id: &str, username: Option<&str>) -> XAccountMonitoringSelection {
-        XAccountMonitoringSelection {
+    fn monitored(x_user_id: &str, username: Option<&str>) -> XSelection {
+        XSelection {
             x_user_id: x_user_id.into(),
-            status: XAccountMonitoringSelectionStatus::Active,
+            status: XSelectionStatus::Active,
             created_at: 1,
             updated_at: 2,
-            profile: username.map(|username| XAccountMonitoringProfile {
+            profile: username.map(|username| XProfile {
                 x_user_id: x_user_id.into(),
                 username: username.into(),
                 display_name: SmolStr::new(format!("{username} display")),
@@ -1901,7 +1881,7 @@ mod tests {
                 SharedString::new_static("pending"),
             ),
         ]);
-        let data = SelectionData::new(XAccountMonitoringSelectionsResponse {
+        let data = SelectionData::new(XSelectionsResponse {
             selections: vec![
                 monitored("42", Some("kytrix")),
                 monitored("43", None),

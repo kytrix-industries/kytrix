@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn resolve_should_materialize_direct_and_named_routes() {
         let target = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XAccountMonitoringMedia,
+            capability: KytrixServiceCapability::XMedia,
         };
         let destination = Url::parse("https://pbs.twimg.com/media/test.jpg").unwrap();
         let mut config = Config::default();
@@ -295,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn resolver_materializes_direct_and_named_routes() {
         let target = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::XAccountMonitoringMedia,
+            capability: KytrixServiceCapability::XMedia,
         };
         let destination = Url::parse("https://pbs.twimg.com/media/test.jpg").unwrap();
         let application = Runtime::for_test();

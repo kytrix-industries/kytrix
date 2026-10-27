@@ -92,6 +92,15 @@ error:
   coin_market_cap_fear_and_greed_index:
     score_out_of_range: 'The fear and greed answer carried an invalid score: %{value}'
     stream_unavailable: The fear and greed service did not accept the refresh request
+  cryptocurrency_etf:
+    duplicate_date: 'Duplicate ETF trading date: %{value}'
+    invalid_date: 'Invalid ETF trading date: %{value}'
+    invalid_number: 'Invalid ETF number: %{value}'
+    no_data: The ETF answer contained no trading days
+    non_finite: The ETF answer contains a number that is not finite
+    stream_unavailable: The ETF data stream is unavailable
+    timeout: The ETF request timed out after %{seconds} seconds
+    too_many_rows: The ETF answer exceeds the %{maximum}-day history limit
   display:
     display_unavailable: Display unavailable
     generation_mismatch: The operation was made for %{expected} but read %{actual}
@@ -116,20 +125,11 @@ error:
     normal: The remote endpoint closed the connection normally
     proxy_changed: The proxy configuration changed
     server_closed: 'The server closed the connection (%{code}): %{reason}'
-  etf:
-    duplicate_date: 'Duplicate ETF trading date: %{value}'
-    invalid_date: 'Invalid ETF trading date: %{value}'
-    invalid_number: 'Invalid ETF number: %{value}'
-    no_data: The ETF answer contained no trading days
-    non_finite: The ETF answer contains a number that is not finite
-    stream_unavailable: The ETF data stream is unavailable
-    timeout: The ETF request timed out after %{seconds} seconds
-    too_many_rows: The ETF answer exceeds the %{maximum}-day history limit
   financial_calendar:
     invalid_timestamp: 'The financial calendar carried an instant that is not a date: %{value}'
     refresh_already_waiting: A financial calendar refresh is already waiting
     stream_unavailable: The financial calendar stream is unavailable
-  hormuz_vessel_map:
+  global_shipping_chokepoint:
     map_asset: The map could not be drawn because the packaged coastline could not be read
   market_participants:
     authentication_failed: 'Authentication for the %{venue} market participant account failed: %{cause}'
@@ -469,12 +469,12 @@ error:
     stream_unavailable: The volume heat map stream is not available
     timeout: The volume heat map did not answer within %{seconds} seconds
     too_many_tickers: 'The %{route} ticker answer contains %{count} entries, which is more than the %{limit} a heat map is built from'
-  cryptocurrency_wallet_monitoring:
+  cryptocurrency_wallet_monitor:
     account_changed: The Wallet API account session changed
     closed: The Wallet API account session is closed
     invalid_response: The Wallet API returned invalid data
     network: 'The Wallet API request failed: %{detail}'
-    not_ready: Wallet monitoring is not ready
+    not_ready: The wallet monitor is not ready
     protocol: 'Wallet API protocol error: %{detail}'
     response_too_large: The Wallet API response is too large
     server: The Wallet API returned HTTP %{status}
@@ -486,7 +486,7 @@ error:
   x:
     account_changed: The X account session changed
     closed: The X account session is closed
-    not_ready: X monitoring is not ready
+    not_ready: The X monitor is not ready
     protocol: 'X API protocol error: %{detail}'
     server: The X API returned HTTP %{status}
     timeout: The X API request timed out
@@ -572,9 +572,7 @@ widget:
     yearly_high: 'Yearly High (%{date})'
     yearly_low: 'Yearly Low (%{date})'
     yesterday: Yesterday
-  empty:
-    hint: 'Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button in the upper-right corner to select a widget.'
-  etf:
+  cryptocurrency_etf:
     all: All
     asset: ETF asset
     chart: ETF chart
@@ -594,6 +592,8 @@ widget:
     time_window: ETF time window
     total_net_assets: Total net assets
     value: '%{label}: %{value}'
+  empty:
+    hint: 'Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button in the upper-right corner to select a widget.'
   financial_calendar:
     country: Country
     day_label: '%{weekday}, %{month} %{day}, %{year}'
@@ -624,7 +624,7 @@ widget:
       wednesday: Wednesday
   force_orders:
     table: Live force orders from %{markets}
-  hormuz_vessel_map:
+  global_shipping_chokepoint:
     entitlement_required: This account does not include the AIS vessel feed
     hover:
       call_sign: Call sign
@@ -700,7 +700,7 @@ widget:
     vessel_count_one: 1 vessel
     view_plans: View plans
     waiting_data: Waiting for the first positions to arrive
-  hyperliquid_wallet_monitor:
+  hyperliquid_wallet:
     add: Add monitored address
     age_days: '%{value}d ago'
     age_hours: '%{value}h ago'
@@ -806,13 +806,13 @@ widget:
   names:
     candlestick: Candlestick
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
+    cryptocurrency_etf: Crypto Currency ETF
     empty: Empty
-    etf_flow: ETF Flow
     financial_calendar: Financial Calendar
     financial_indices: Indices
     force_orders: Force Orders Stream
-    hormuz_vessel_map: Hormuz Vessel Map
-    hyperliquid_wallet_monitor: Hyperliquid Wallet Monitor
+    global_shipping_chokepoint: Global Shipping Chokepoint
+    hyperliquid_wallet: Hyperliquid Wallet
     long_short_account_ratio: Long/Short Account Ratio
     market_trades: Market Trades
     news: News
@@ -823,9 +823,9 @@ widget:
     top_trader_account_ratio: Top Trader Account Ratio
     top_trader_position_ratio: Top Trader Position Ratio
     volume_heatmap: Volume Heat Map
-    cryptocurrency_wallet_monitoring: Cryptocurrency Wallet Monitoring
+    cryptocurrency_wallet_monitor: Cryptocurrency Wallet Monitor
     watch_list: Watch List
-    x_account_monitoring: Tweet Monitor
+    x: X
   news:
     crypto: Crypto
     disable_sound: Mute notification sound
@@ -877,7 +877,7 @@ widget:
     position_ratio: Position Ratio
     value: Value
     volume: Volume
-  x_account_monitoring:
+  x:
     account_id: 'X user ID: %{id}'
     active: Active
     add_account: Add new account
@@ -921,7 +921,7 @@ widget:
   volume_heatmap:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now
-  cryptocurrency_wallet_monitoring:
+  cryptocurrency_wallet_monitor:
     active: Active
     add_address: Add wallet address
     add_success: Wallet address added successfully
@@ -948,7 +948,7 @@ widget:
     stream_unavailable: The wallet transfer stream is not connected
     to: To
     transfer: '%{amount} transfer at %{time}'
-    unavailable: Wallet monitoring is not configured or is unavailable
+    unavailable: The wallet monitor is not configured or is unavailable
   watch_list:
     add: Add instrument
     change_24h: 24h Change
@@ -1138,7 +1138,7 @@ settings_ui:
     username_required: Enter a username
     venue_description: This venue's requests use this line; until it names one, they follow the default line
     venue_section: Venue
-    x_account_monitoring_media_group: Media
+    x_media_group: Media
     x_section: X (Twitter)
   save_failed:
     message: '<p align="center">The settings were not written to disk: %{reason}</p>'

@@ -79,7 +79,7 @@ pub(super) use crate::{
         NativeHyperliquidUserFill, NativeHyperliquidWalletUpdate, NativeOrder,
         NativeOrderBookLevel, NativePosition, PlaceOrderCommand, TimeFrame,
     },
-    protocol::WalletMonitorTarget,
+    protocol::WalletTarget,
     routing::{CORE_PERP_SCOPE, CORE_SPOT_SCOPE, HYPERLIQUID_WALLET_SCOPE},
     runtime::MarketParticipantNetworkSnapshot,
     venue::metadata::{
@@ -890,7 +890,7 @@ impl HyperliquidAdapter {
         &self,
         context: &ExecutionContext,
         request: &ProtocolRequest,
-        target: &WalletMonitorTarget,
+        target: &WalletTarget,
         decoding_routes: &[VenueRoute],
         aggregate_by_time: bool,
         window: Option<(i64, i64)>,
@@ -945,7 +945,7 @@ impl HyperliquidAdapter {
         &self,
         context: &ExecutionContext,
         request: &ProtocolRequest,
-        target: &WalletMonitorTarget,
+        target: &WalletTarget,
         decoding_routes: &[VenueRoute],
         start_time: i64,
     ) -> Result<Vec<NativeHyperliquidLedgerEvent>, MarketParticipantError> {
@@ -1737,7 +1737,7 @@ fn connection_protocol() -> ConnectionProtocol {
 /// another — and every other capability keeps its own scope in the key because its
 /// socket serves different wire parameters over the same origin.
 fn shared_socket_route(route: &VenueRoute, capability: CapabilityId) -> VenueRoute {
-    if capability != CapabilityId::WalletMonitor {
+    if capability != CapabilityId::Wallet {
         return route.clone();
     }
     VenueRoute::new(
@@ -1765,7 +1765,7 @@ fn shared_socket_generation(
     context: &ExecutionContext,
     route: &VenueRoute,
 ) -> Result<NetworkRouteGeneration, MarketParticipantError> {
-    if context.capability() != CapabilityId::WalletMonitor {
+    if context.capability() != CapabilityId::Wallet {
         return Ok(context.network_route_generation());
     }
     let runtime = context.current_runtime().ok_or_else(|| {
@@ -1789,7 +1789,7 @@ fn connection_auth(
 ) -> Result<Option<SmolStr>, MarketParticipantError> {
     if matches!(
         request.wallet_target(),
-        Some(WalletMonitorTarget::Public { .. } | WalletMonitorTarget::Route { .. })
+        Some(WalletTarget::Public { .. } | WalletTarget::Route { .. })
     ) {
         return Ok(None);
     }
@@ -2501,13 +2501,13 @@ pub(super) fn current_timestamp_millis() -> Result<i64, MarketParticipantError> 
 /// A public target reads the address it names; a route-level target names no wallet at
 /// all, and says so rather than being read as some account.
 pub(super) fn wallet_user(
-    target: &WalletMonitorTarget,
+    target: &WalletTarget,
     context: &ExecutionContext,
 ) -> Result<SmolStr, MarketParticipantError> {
     let _ = context;
     match target {
-        WalletMonitorTarget::Public { address, .. } => Ok(SmolStr::new(address.as_str())),
-        WalletMonitorTarget::Route { .. } => Err(protocol_error(
+        WalletTarget::Public { address, .. } => Ok(SmolStr::new(address.as_str())),
+        WalletTarget::Route { .. } => Err(protocol_error(
             "read a Hyperliquid wallet",
             SmolStr::new_static("a route-level target names no wallet"),
         )),
@@ -2516,7 +2516,7 @@ pub(super) fn wallet_user(
 
 /// The wallet address one wallet request is identified by.
 pub(super) fn wallet_address(
-    target: &WalletMonitorTarget,
+    target: &WalletTarget,
     context: &ExecutionContext,
 ) -> Result<WalletAddress, MarketParticipantError> {
     let user = wallet_user(target, context)?;
@@ -2529,7 +2529,7 @@ pub(super) fn wallet_address(
 /// A spot read is not DEX-scoped: the first perpetual DEX is where the venue
 /// publishes spot orders, so the field stays absent there.
 pub(super) fn wallet_dex(
-    _target: &WalletMonitorTarget,
+    _target: &WalletTarget,
     route: &VenueRoute,
 ) -> Result<Option<SmolStr>, MarketParticipantError> {
     if route.scope.as_str() == CORE_SPOT_SCOPE {
@@ -4018,7 +4018,7 @@ mod tests {
         notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> ExecutionContext {
         let resolved = snapshot.network_route_generation(&route(scope).venue);
-        fixture_context(identity(scope, CapabilityId::WalletMonitor), None)
+        fixture_context(identity(scope, CapabilityId::Wallet), None)
             .with_proxy(proxy, resolved)
             .with_runtime(notification)
     }
@@ -4144,7 +4144,7 @@ mod tests {
     /// the internal contract violation it is, not as something the user could fix.
     #[test]
     fn a_wallet_connection_without_a_runtime_snapshot_is_refused() {
-        let context = fixture_context(identity(CORE_SPOT_SCOPE, CapabilityId::WalletMonitor), None);
+        let context = fixture_context(identity(CORE_SPOT_SCOPE, CapabilityId::Wallet), None);
 
         let error = connection_key(&context, &wallet_request(CORE_SPOT_SCOPE))
             .expect_err("a folded key cannot be built without the runtime snapshot");
@@ -4341,11 +4341,8 @@ mod tests {
         )
         .await;
         let adapter = HyperliquidAdapter::new();
-        let context = fixture_context_at(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
-            &origin,
-        )
-        .with_venue_metadata(Some(fixture_reading(&origin).await));
+        let context = fixture_context_at(identity(CORE_PERP_SCOPE, CapabilityId::Wallet), &origin)
+            .with_venue_metadata(Some(fixture_reading(&origin).await));
 
         let union = adapter
             .route_listings_across(&context, &[route(CORE_PERP_SCOPE), route("perp-dex/xyz")])
@@ -4397,11 +4394,8 @@ mod tests {
             )],
         )
         .await;
-        let context = fixture_context_at(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
-            &origin,
-        )
-        .with_venue_metadata(Some(fixture_reading(&origin).await));
+        let context = fixture_context_at(identity(CORE_PERP_SCOPE, CapabilityId::Wallet), &origin)
+            .with_venue_metadata(Some(fixture_reading(&origin).await));
 
         let error = HyperliquidAdapter::new()
             .route_listings_across(&context, &[route(CORE_PERP_SCOPE), route("perp-dex/xyz")])
@@ -5036,7 +5030,7 @@ mod tests {
             HyperliquidWalletQuery::public_across(vec![core.clone(), deployed], address.clone())
                 .expect("the monitored routes decode the answer");
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             socket.url(),
         )
@@ -5109,7 +5103,7 @@ mod tests {
         let deployed = route("perp-dex/xyz");
         let adapter = HyperliquidAdapter::new();
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             "https://api.hyperliquid.xyz",
             socket.url(),
         );
@@ -5169,7 +5163,7 @@ mod tests {
             HyperliquidWalletQuery::public_across(vec![core.clone(), deployed], address.clone())
                 .expect("the monitored routes decode the answer");
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             socket.url(),
         )
@@ -5244,7 +5238,7 @@ mod tests {
             HyperliquidWalletQuery::public_across(vec![core.clone(), deployed], address.clone())
                 .expect("the monitored routes decode the answer");
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             socket.url(),
         )
@@ -5323,7 +5317,7 @@ mod tests {
         ])
         .expect("the monitored routes decode the stream");
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             socket.url(),
         )
@@ -5390,7 +5384,7 @@ mod tests {
         ])
         .expect("the monitored routes decode the stream");
         let context = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             socket.url(),
         )
@@ -5486,11 +5480,11 @@ mod tests {
     /// no wallet at all.
     #[test]
     fn a_wallet_target_reads_exactly_what_it_names() {
-        let context = fixture_context(identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor), None);
+        let context = fixture_context(identity(CORE_PERP_SCOPE, CapabilityId::Wallet), None);
         let address = "0x1111111111111111111111111111111111111111"
             .parse::<WalletAddress>()
             .expect("the fixture address is valid");
-        let public = WalletMonitorTarget::Public {
+        let public = WalletTarget::Public {
             route: route(CORE_PERP_SCOPE),
             address,
         };
@@ -5501,7 +5495,7 @@ mod tests {
             "0x1111111111111111111111111111111111111111"
         );
 
-        let route_level = WalletMonitorTarget::Route {
+        let route_level = WalletTarget::Route {
             route: route(CORE_PERP_SCOPE),
         };
         assert!(wallet_user(&route_level, &context).is_err());
@@ -5516,10 +5510,7 @@ mod tests {
             api_key: SmolStr::new_static("api-key"),
             secret: SmolStr::new_static("secret"),
         };
-        let context = fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
-            Some(auth),
-        );
+        let context = fixture_context(identity(CORE_PERP_SCOPE, CapabilityId::Wallet), Some(auth));
         let public = ProtocolRequest::FetchHyperliquidOpenOrders(HyperliquidWalletQuery::public(
             route(CORE_PERP_SCOPE),
             "0x1111111111111111111111111111111111111111"
@@ -5823,7 +5814,7 @@ mod tests {
         *reading.lock() = 0;
         let opening_socket = InfoSocket::spawn("null".to_owned(), Vec::new()).await;
         let opening = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             opening_socket.url(),
         )
@@ -5846,7 +5837,7 @@ mod tests {
         *reading.lock() = 1;
         let fresh_socket = InfoSocket::spawn("null".to_owned(), Vec::new()).await;
         let reread = wallet_fixture_context(
-            identity(CORE_PERP_SCOPE, CapabilityId::WalletMonitor),
+            identity(CORE_PERP_SCOPE, CapabilityId::Wallet),
             &http_origin,
             fresh_socket.url(),
         )

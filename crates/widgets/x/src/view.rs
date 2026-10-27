@@ -1,4 +1,4 @@
-//! The tweet-monitor pane: the timeline it follows, and the accounts it manages.
+//! The X pane: the timeline it follows, and the accounts it manages.
 //!
 //! # What a pane is scoped to
 //!
@@ -80,10 +80,7 @@ use gpui_kit::{
 use i18n::t;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    x::{
-        XAccountMonitoringApiError, XAccountMonitoringMutationOutcome,
-        XAccountMonitoringMutationUnknown, XAccountMonitoringSelectionStatus,
-    },
+    x::{XApiError, XMutationOutcome, XMutationUnknown, XSelectionStatus},
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
 use serde::{Deserialize, Serialize};
@@ -134,25 +131,25 @@ const GALLERY_WIDE_HEIGHT: f32 = 510.0;
 const GALLERY_COMPACT_WIDTH: f32 = 420.0;
 const GALLERY_COMPACT_HEIGHT: f32 = 320.0;
 
-/// A tweet monitor carries no options.
+/// The X widget carries no options.
 ///
 /// What a pane follows is the account's own list of monitored accounts, which is read from the
 /// service rather than configured here, so there is nothing to persist but the schema version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TweetMonitorConfig;
+pub struct XConfig;
 
-impl WidgetConfig for TweetMonitorConfig {
+impl WidgetConfig for XConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
 /// A failure a pane reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum TweetMonitorFailure {
+enum XFailure {
     Stream(TweetStreamError),
-    Rpc(RpcCallError<XAccountMonitoringApiError>),
+    Rpc(RpcCallError<XApiError>),
 }
 
-impl LocalizedError for TweetMonitorFailure {
+impl LocalizedError for XFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Stream(error) => error.localized_message(cx),
@@ -217,12 +214,12 @@ pub(super) enum SelectionNotice {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionFailure {
     /// The service refused the change.
-    Rejected(XAccountMonitoringApiError),
+    Rejected(XApiError),
     /// The change may or may not have been made, which is what the service answers when it
     /// could not tell.
-    Unknown(XAccountMonitoringMutationUnknown),
+    Unknown(XMutationUnknown),
     /// The call itself failed.
-    Rpc(RpcCallError<XAccountMonitoringApiError>),
+    Rpc(RpcCallError<XApiError>),
 }
 
 impl LocalizedError for SelectionFailure {
@@ -236,7 +233,7 @@ impl LocalizedError for SelectionFailure {
 }
 
 /// One pane: the timeline it holds, and the accounts it manages.
-pub struct XAccountMonitoringWidget {
+pub struct XWidget {
     binding: WidgetBinding<TweetProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
@@ -289,14 +286,14 @@ pub struct XAccountMonitoringWidget {
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for XAccountMonitoringWidget {
-    type Config = TweetMonitorConfig;
+impl WidgetView for XWidget {
+    type Config = XConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.x_account_monitoring");
-    const DISPLAY_NAME: &'static str = "widget.names.x_account_monitoring";
+    const ID: WidgetId = WidgetId::new_static("kytrix.x");
+    const DISPLAY_NAME: &'static str = "widget.names.x";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Live posts from monitored X accounts";
-    const ICON: Option<&'static str> = Some("widgets/x_account_monitoring.png");
+    const ICON: Option<&'static str> = Some("widgets/x.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -348,11 +345,11 @@ impl WidgetView for XAccountMonitoringWidget {
     }
 }
 
-impl XAccountMonitoringWidget {
+impl XWidget {
     /// The seam a test can answer through: `new` only picks the production source and
     /// transport.
     fn new_with_source<S, T>(
-        _config: TweetMonitorConfig,
+        _config: XConfig,
         source: S,
         downloader: MediaDownloader<T>,
         status: Entity<WidgetStatus>,
@@ -444,9 +441,9 @@ impl XAccountMonitoringWidget {
         let notice = if self.current_scope().is_none() {
             // Nobody is signed in: what stands in is the sentence that sends the reader to
             // the account settings, which is the one `start` reports for the same state.
-            Notice::message("widget.x_account_monitoring.logged_out")
+            Notice::message("widget.x.logged_out")
         } else {
-            Notice::message("widget.x_account_monitoring.waiting")
+            Notice::message("widget.x.waiting")
         };
         self.status.report(WidgetState::waiting(notice), cx);
     }
@@ -531,7 +528,7 @@ impl XAccountMonitoringWidget {
             self.notify_dialog(cx);
             let recovery = self.recovery.clone();
             self.status.report(
-                WidgetState::failed(Arc::new(TweetMonitorFailure::Rpc(error)), recovery),
+                WidgetState::failed(Arc::new(XFailure::Rpc(error)), recovery),
                 cx,
             );
         }
@@ -642,7 +639,7 @@ impl XAccountMonitoringWidget {
 
     /// Reports why a subscription stopped.
     fn fail(&mut self, error: &TweetStreamError, cx: &mut Context<Self>) {
-        let failure = TweetMonitorFailure::Stream(error.clone());
+        let failure = XFailure::Stream(error.clone());
         let recovery = self.recovery.clone();
         self.status
             .report(WidgetState::failed(Arc::new(failure), recovery), cx);
@@ -702,11 +699,9 @@ impl XAccountMonitoringWidget {
     /// The list, which draws the tweets the pane holds.
     fn list_body(&self, cx: &Context<Self>) -> AnyElement {
         div()
-            .id(ElementId::Name(SharedString::new_static(
-                "TweetMonitorFrame",
-            )))
+            .id(ElementId::Name(SharedString::new_static("XFrame")))
             .debug_selector(|| "TEST_TWEET_LIST".into())
-            .aria_label(t!(cx, "widget.x_account_monitoring.scroll_tweets"))
+            .aria_label(t!(cx, "widget.x.scroll_tweets"))
             .relative()
             .size_full()
             .min_w_0()
@@ -731,18 +726,16 @@ impl XAccountMonitoringWidget {
             // drag area as well.
             .occlude()
             .child(
-                Button::new(ElementId::Name(SharedString::new_static(
-                    "TweetMonitorManage",
-                )))
-                .filled()
-                .small()
-                .disabled(self.account_id.is_none())
-                .aria_label(t!(cx, "widget.x_account_monitoring.manage"))
-                .with_tooltip(t!(cx, "widget.x_account_monitoring.manage"))
-                .on_click(move |_, window, cx| {
-                    TweetDialog::show(widget.clone(), window, cx);
-                })
-                .child(Icon::new(IconKind::Faders).size_3()),
+                Button::new(ElementId::Name(SharedString::new_static("XManage")))
+                    .filled()
+                    .small()
+                    .disabled(self.account_id.is_none())
+                    .aria_label(t!(cx, "widget.x.manage"))
+                    .with_tooltip(t!(cx, "widget.x.manage"))
+                    .on_click(move |_, window, cx| {
+                        TweetDialog::show(widget.clone(), window, cx);
+                    })
+                    .child(Icon::new(IconKind::Faders).size_3()),
             )
             .into_any_element()
     }
@@ -1136,7 +1129,7 @@ impl XAccountMonitoringWidget {
         self.notice = match outcome {
             // What the list becomes is the confirmation applied to it, and an account that
             // came back without a profile is named by what was asked for rather than numbered.
-            XAccountMonitoringMutationOutcome::Confirmed(selection) => {
+            XMutationOutcome::Confirmed(selection) => {
                 let grown = self
                     .selections
                     .as_ref()
@@ -1155,12 +1148,12 @@ impl XAccountMonitoringWidget {
                     None => None,
                 }
             }
-            XAccountMonitoringMutationOutcome::Rejected(error) => {
+            XMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
             // The change may or may not have been made, so the list the pane holds is not one
             // it can change: it is left as it was, and the next read settles it.
-            XAccountMonitoringMutationOutcome::Unknown(unknown) => {
+            XMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
@@ -1183,7 +1176,7 @@ impl XAccountMonitoringWidget {
             }
         };
         self.notice = match outcome {
-            XAccountMonitoringMutationOutcome::Confirmed(()) => match requested {
+            XMutationOutcome::Confirmed(()) => match requested {
                 Some(x_user_id) => {
                     self.selections = self
                         .selections
@@ -1194,10 +1187,10 @@ impl XAccountMonitoringWidget {
                 }
                 None => None,
             },
-            XAccountMonitoringMutationOutcome::Rejected(error) => {
+            XMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
-            XAccountMonitoringMutationOutcome::Unknown(unknown) => {
+            XMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
@@ -1205,7 +1198,7 @@ impl XAccountMonitoringWidget {
     }
 }
 
-impl Render for XAccountMonitoringWidget {
+impl Render for XWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
@@ -1224,7 +1217,7 @@ impl Render for XAccountMonitoringWidget {
 ///
 /// The row it draws is built once here while what it shows is rebuilt for every frame, which is
 /// why the pane is read inside the closure rather than captured with it.
-fn feed_list(widget: WeakEntity<XAccountMonitoringWidget>) -> DequeUnsizedList<Arc<TweetItem>> {
+fn feed_list(widget: WeakEntity<XWidget>) -> DequeUnsizedList<Arc<TweetItem>> {
     DequeUnsizedList::new(
         ElementId::Name(SharedString::new_static("TweetList")),
         ListAlignment::Top,
@@ -1271,7 +1264,7 @@ const MAX_SEARCH_QUERY_BYTES: usize = 100;
 /// The picture is the service's to describe, so the request only names it: which stream the
 /// picture belongs to is the pane's current scope, which is what the pane sends it with.
 struct MediaRetry {
-    widget: Entity<XAccountMonitoringWidget>,
+    widget: Entity<XWidget>,
 }
 
 /// One row of the timeline: one tweet, and everything it carries.
@@ -1293,14 +1286,14 @@ fn tweet_row(
 
     let mut row = div()
         .id(ElementId::NamedInteger(
-            SharedString::new_static("TweetMonitorRow"),
+            SharedString::new_static("XRow"),
             index as u64,
         ))
         .debug_selector(|| "TEST_TWEET_ROW".into())
         .role(Role::ListItem)
         .aria_label(t!(
             cx,
-            "widget.x_account_monitoring.tweet",
+            "widget.x.tweet",
             author = author.username,
             time = age_text(age, cx)
         ))
@@ -1340,7 +1333,7 @@ fn repost_line(author: &super::model::TweetAuthor, cx: &App) -> AnyElement {
         )
         .child(div().min_w_0().truncate().child(t!(
             cx,
-            "widget.x_account_monitoring.reposted",
+            "widget.x.reposted",
             name = author.display_name.clone()
         )))
         .into_any_element()
@@ -1793,7 +1786,7 @@ fn media_failed(
                 .size_5()
                 .text_color(muted),
         )
-        .child(t!(cx, "widget.x_account_monitoring.media_load_failed"));
+        .child(t!(cx, "widget.x.media_load_failed"));
     if let Some(retry) = retry {
         let widget = retry.widget.clone();
         tile = tile.child(
@@ -1818,9 +1811,7 @@ fn media_failed(
 /// The row that says the timeline has no more tweets to show.
 fn timeline_end(cx: &App) -> AnyElement {
     div()
-        .id(ElementId::Name(SharedString::new_static(
-            "TweetMonitorTimelineEnd",
-        )))
+        .id(ElementId::Name(SharedString::new_static("XTimelineEnd")))
         .debug_selector(|| "TEST_TWEET_TIMELINE_END".into())
         .role(Role::ListItem)
         .w_full()
@@ -1829,7 +1820,7 @@ fn timeline_end(cx: &App) -> AnyElement {
         .text_center()
         .text_xs()
         .text_color(cx.theme().roles.fg.muted.hsla)
-        .child(t!(cx, "widget.x_account_monitoring.timeline_end"))
+        .child(t!(cx, "widget.x.timeline_end"))
         .into_any_element()
 }
 
@@ -1913,7 +1904,7 @@ pub(super) fn message_with_action(message: SharedString, action: AnyElement) -> 
 
 /// The recovery the pane itself offers, as a dialog's way out of having no stream.
 pub(super) fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
-    Button::new("tweet-monitor-recover")
+    Button::new("x-recover")
         .outline()
         .small()
         .disabled(!action.is_enabled())
@@ -1925,11 +1916,11 @@ pub(super) fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-pub(super) fn status_label(status: XAccountMonitoringSelectionStatus, cx: &App) -> SharedString {
+pub(super) fn status_label(status: XSelectionStatus, cx: &App) -> SharedString {
     match status {
-        XAccountMonitoringSelectionStatus::Active => t!(cx, "widget.x_account_monitoring.active"),
-        XAccountMonitoringSelectionStatus::Paused => t!(cx, "widget.x_account_monitoring.paused"),
-        XAccountMonitoringSelectionStatus::Pending => t!(cx, "widget.x_account_monitoring.pending"),
+        XSelectionStatus::Active => t!(cx, "widget.x.active"),
+        XSelectionStatus::Paused => t!(cx, "widget.x.paused"),
+        XSelectionStatus::Pending => t!(cx, "widget.x.pending"),
     }
 }
 
@@ -1942,29 +1933,16 @@ fn tweet_url(username: &str, tweet_id: &str) -> String {
 fn age_text(age: TweetAge, cx: &App) -> SharedString {
     match age {
         TweetAge::Seconds(seconds) => {
-            t!(
-                cx,
-                "widget.x_account_monitoring.age_seconds",
-                count = seconds
-            )
+            t!(cx, "widget.x.age_seconds", count = seconds)
         }
         TweetAge::Minutes(minutes) => {
-            t!(
-                cx,
-                "widget.x_account_monitoring.age_minutes",
-                count = minutes
-            )
+            t!(cx, "widget.x.age_minutes", count = minutes)
         }
-        TweetAge::Hours(hours) => t!(cx, "widget.x_account_monitoring.age_hours", count = hours),
-        TweetAge::Date { month, day } => t!(
-            cx,
-            "widget.x_account_monitoring.age_date",
-            month = month,
-            day = day
-        ),
+        TweetAge::Hours(hours) => t!(cx, "widget.x.age_hours", count = hours),
+        TweetAge::Date { month, day } => t!(cx, "widget.x.age_date", month = month, day = day),
         TweetAge::FullDate { year, month, day } => t!(
             cx,
-            "widget.x_account_monitoring.age_full_date",
+            "widget.x.age_full_date",
             year = year,
             month = month,
             day = day
@@ -1993,8 +1971,8 @@ mod tests {
     };
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::{
-        engine::{KytrixServiceError, XAccountMonitoringTweetEvent},
-        x::XAccountMonitoringMutationUnknown,
+        engine::{KytrixServiceError, XTweetEvent},
+        x::XMutationUnknown,
     };
     use network::transport::error::TransportError;
     use widget::protocol::RequestId;
@@ -2039,8 +2017,8 @@ mod tests {
     fn pane_with_source<S, T>(
         source: S,
         downloader: MediaDownloader<T>,
-        cx: &mut Context<XAccountMonitoringWidget>,
-    ) -> XAccountMonitoringWidget
+        cx: &mut Context<XWidget>,
+    ) -> XWidget
     where
         S: TweetSource,
         T: crate::media::MediaTransport,
@@ -2050,8 +2028,8 @@ mod tests {
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        XAccountMonitoringWidget::new_with_source(
-            TweetMonitorConfig,
+        XWidget::new_with_source(
+            XConfig,
             source,
             downloader,
             status,
@@ -2068,7 +2046,7 @@ mod tests {
         source: FakeSource,
         transport: FakeTransport,
         cache: crate::media::MediaCache,
-    ) -> Entity<XAccountMonitoringWidget> {
+    ) -> Entity<XWidget> {
         cx.executor().allow_parking();
         cx.update(|cx| {
             install(cx, account);
@@ -2085,7 +2063,7 @@ mod tests {
     fn quiet_pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         let (cache, root) = media_cache();
         let pane = pane_with(cx, Some(ACCOUNT), source, FakeTransport::failing(), cache);
         pane.update(cx, |pane, _| {
@@ -2098,7 +2076,7 @@ mod tests {
     fn signed_out_pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         let (cache, root) = media_cache();
         let pane = pane_with(cx, None, source, FakeTransport::failing(), cache);
         pane.update(cx, |pane, cx| pane.load(cx));
@@ -2106,10 +2084,7 @@ mod tests {
     }
 
     /// A pane reading an account, with the stream the framework starts left running.
-    fn pane(
-        cx: &mut TestAppContext,
-        source: &FakeSource,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    fn pane(cx: &mut TestAppContext, source: &FakeSource) -> (Entity<XWidget>, tempfile::TempDir) {
         let (cache, root) = media_cache();
         let pane = pane_with(
             cx,
@@ -2127,8 +2102,8 @@ mod tests {
         cx: &mut TestAppContext,
         source: &FakeSource,
         session: &FakeSession,
-        tweets: Vec<XAccountMonitoringTweetEvent>,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+        tweets: Vec<XTweetEvent>,
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         let (cache, root) = media_cache();
         live_pane_over(cx, source, session, tweets, cache, root)
     }
@@ -2139,10 +2114,10 @@ mod tests {
         cx: &mut TestAppContext,
         source: &FakeSource,
         session: &FakeSession,
-        tweets: Vec<XAccountMonitoringTweetEvent>,
+        tweets: Vec<XTweetEvent>,
         cache: crate::media::MediaCache,
         root: tempfile::TempDir,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         session.answer_history(tweets, vec![profile("42", "kytrix")]);
         let pane = pane_with(
             cx,
@@ -2166,7 +2141,7 @@ mod tests {
         source: &FakeSource,
         session: &FakeSession,
         count: usize,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         let tweets = (0..count)
             .map(|index| tweet(&index.to_string(), index as i64))
             .collect();
@@ -2178,9 +2153,9 @@ mod tests {
         cx: &mut TestAppContext,
         source: &FakeSource,
         session: &FakeSession,
-        accounts: Vec<kytrix_service_provider::service::x::XAccountMonitoringSelection>,
+        accounts: Vec<kytrix_service_provider::service::x::XSelection>,
         limit: usize,
-    ) -> (Entity<XAccountMonitoringWidget>, tempfile::TempDir) {
+    ) -> (Entity<XWidget>, tempfile::TempDir) {
         let (pane, root) = live_pane(cx, source, session, vec![tweet("1", 1)]);
         session.answer_selections(selections(accounts, limit));
         pane.update(cx, |pane, cx| {
@@ -2197,10 +2172,7 @@ mod tests {
     ///
     /// `show` itself needs the window layer the application installs, so a test attaches the
     /// same dialog the way the pane would hold it.
-    fn attach_dialog(
-        pane: &Entity<XAccountMonitoringWidget>,
-        cx: &mut TestAppContext,
-    ) -> Entity<TweetDialog> {
+    fn attach_dialog(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Entity<TweetDialog> {
         let window = cx.add_empty_window();
         let dialog = window.update(|window, cx| {
             let filter = cx.new(|cx| InputStateBuilder::new("tweet-filter").build(window, cx));
@@ -2217,7 +2189,7 @@ mod tests {
     /// The page is what a search belongs to, so this is the whole way in — and a query is typed
     /// rather than set because an answer belongs to the query that asked for it.
     fn search_from_page(
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         dialog: &Entity<TweetDialog>,
         typed: &str,
         window: &mut VisualTestContext,
@@ -2245,7 +2217,7 @@ mod tests {
 
     /// Reports one timeline as a stream would, at the revision after the last one.
     fn report_update(
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         feed: TweetSnapshot,
         media: MediaStates,
         cx: &mut TestAppContext,
@@ -2269,11 +2241,7 @@ mod tests {
     }
 
     /// Reports a status as a stream would.
-    fn report_status(
-        pane: &Entity<XAccountMonitoringWidget>,
-        status: TweetStatus,
-        cx: &mut TestAppContext,
-    ) -> bool {
+    fn report_status(pane: &Entity<XWidget>, status: TweetStatus, cx: &mut TestAppContext) -> bool {
         cx.update(|cx| {
             let scope = pane
                 .read(cx)
@@ -2286,20 +2254,17 @@ mod tests {
     }
 
     /// What the pane reports, as a frame would read it.
-    fn state_of(pane: &Entity<XAccountMonitoringWidget>, cx: &mut TestAppContext) -> WidgetState {
+    fn state_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> WidgetState {
         cx.update(|cx| pane.read(cx).status.state(cx))
     }
 
     /// The notice the pane is standing in with.
-    fn notice_of(
-        pane: &Entity<XAccountMonitoringWidget>,
-        cx: &mut TestAppContext,
-    ) -> Option<Notice> {
+    fn notice_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Option<Notice> {
         cx.update(|cx| pane.read(cx).status.state(cx).notice().cloned())
     }
 
     /// Whether the pane has a body to draw.
-    fn has_content(pane: &Entity<XAccountMonitoringWidget>, cx: &mut TestAppContext) -> bool {
+    fn has_content(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> bool {
         cx.update(|cx| pane.read(cx).has_content())
     }
 
@@ -2307,7 +2272,7 @@ mod tests {
     ///
     /// The list is not read: what it holds is the list's own, and what a reader sees of it is
     /// asserted by drawing the pane.
-    fn feed_ids(pane: &XAccountMonitoringWidget) -> Vec<String> {
+    fn feed_ids(pane: &XWidget) -> Vec<String> {
         pane.feed
             .as_ref()
             .map(|snapshot| {
@@ -2321,16 +2286,14 @@ mod tests {
     }
 
     /// The tweet ids the pane a test is holding has.
-    fn ids_of(pane: &Entity<XAccountMonitoringWidget>, cx: &mut TestAppContext) -> Vec<String> {
+    fn ids_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Vec<String> {
         cx.update(|cx| feed_ids(pane.read(cx)))
     }
 
     /// One row the service has not activated yet, which by contract carries no profile.
-    fn pending(
-        x_user_id: &str,
-    ) -> kytrix_service_provider::service::x::XAccountMonitoringSelection {
+    fn pending(x_user_id: &str) -> kytrix_service_provider::service::x::XSelection {
         let mut selection = selection(x_user_id, "");
-        selection.status = XAccountMonitoringSelectionStatus::Pending;
+        selection.status = XSelectionStatus::Pending;
         selection.profile = None;
         selection
     }
@@ -2338,17 +2301,14 @@ mod tests {
     /// What the pane remembers about the names of the rows it holds, which is what a row
     /// waiting to be activated is drawn with.
     fn remembered_names(
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         cx: &mut TestAppContext,
     ) -> HashMap<SmolStr, SharedString> {
         cx.update(|cx| (*pane.read(cx).hints).clone())
     }
 
     /// The usernames of the accounts the pane holds.
-    fn usernames_of(
-        pane: &Entity<XAccountMonitoringWidget>,
-        cx: &mut TestAppContext,
-    ) -> Vec<String> {
+    fn usernames_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Vec<String> {
         cx.update(|cx| {
             pane.read(cx)
                 .selections
@@ -2369,31 +2329,18 @@ mod tests {
 
     #[test]
     fn the_widget_should_have_a_stable_identity() {
-        assert_eq!(
-            XAccountMonitoringWidget::ID.as_str(),
-            "kytrix.market.x_account_monitoring"
-        );
-        assert_eq!(
-            XAccountMonitoringWidget::DISPLAY_NAME,
-            "widget.names.x_account_monitoring"
-        );
-        assert_eq!(
-            TweetMonitorConfig::SCHEMA_VERSION,
-            WidgetConfigSchemaVersion::V1
-        );
+        assert_eq!(XWidget::ID.as_str(), "kytrix.x");
+        assert_eq!(XWidget::DISPLAY_NAME, "widget.names.x");
+        assert_eq!(XConfig::SCHEMA_VERSION, WidgetConfigSchemaVersion::V1);
     }
 
     #[test]
     fn the_config_should_round_trip_through_its_envelope() {
-        let stored = VersionedWidgetConfig::encode(&TweetMonitorConfig)
-            .expect("a tweet monitor config should encode");
+        let stored = VersionedWidgetConfig::encode(&XConfig).expect("an X config should encode");
 
         assert_eq!(stored.schema_version(), WidgetConfigSchemaVersion::V1);
-        assert_eq!(stored.decode::<TweetMonitorConfig>(), TweetMonitorConfig);
-        assert_eq!(
-            decode_or_default::<TweetMonitorConfig>(None),
-            TweetMonitorConfig
-        );
+        assert_eq!(stored.decode::<XConfig>(), XConfig);
+        assert_eq!(decode_or_default::<XConfig>(None), XConfig);
     }
 
     /// A missing key is an empty string on screen rather than an error, so a gap in the
@@ -2404,53 +2351,53 @@ mod tests {
             install(cx, Some(ACCOUNT));
 
             for key in [
-                "widget.names.x_account_monitoring",
-                "widget.x_account_monitoring.account_id",
-                "widget.x_account_monitoring.active",
-                "widget.x_account_monitoring.add_account",
-                "widget.x_account_monitoring.add_search_result",
-                "widget.x_account_monitoring.add_success",
-                "widget.x_account_monitoring.age_date",
-                "widget.x_account_monitoring.age_full_date",
-                "widget.x_account_monitoring.age_hours",
-                "widget.x_account_monitoring.age_minutes",
-                "widget.x_account_monitoring.age_seconds",
-                "widget.x_account_monitoring.already_monitored",
-                "widget.x_account_monitoring.back",
-                "widget.x_account_monitoring.delete_account",
-                "widget.x_account_monitoring.dialog_title",
-                "widget.x_account_monitoring.empty_accounts",
-                "widget.x_account_monitoring.error_title",
-                "widget.x_account_monitoring.filter_placeholder",
-                "widget.x_account_monitoring.followers_following",
-                "widget.x_account_monitoring.load_failed",
-                "widget.x_account_monitoring.loading_accounts",
-                "widget.x_account_monitoring.logged_out",
-                "widget.x_account_monitoring.manage",
-                "widget.x_account_monitoring.media_load_failed",
-                "widget.x_account_monitoring.monitored_accounts",
-                "widget.x_account_monitoring.no_search_results",
-                "widget.x_account_monitoring.paused",
-                "widget.x_account_monitoring.pending",
-                "widget.x_account_monitoring.protected",
-                "widget.x_account_monitoring.refresh",
-                "widget.x_account_monitoring.reposted",
-                "widget.x_account_monitoring.scroll_tweets",
-                "widget.x_account_monitoring.search_placeholder",
-                "widget.x_account_monitoring.search_users",
-                "widget.x_account_monitoring.searching_users",
-                "widget.x_account_monitoring.stream_unavailable",
-                "widget.x_account_monitoring.success_title",
-                "widget.x_account_monitoring.timeline_end",
-                "widget.x_account_monitoring.tweet",
-                "widget.x_account_monitoring.waiting",
+                "widget.names.x",
+                "widget.x.account_id",
+                "widget.x.active",
+                "widget.x.add_account",
+                "widget.x.add_search_result",
+                "widget.x.add_success",
+                "widget.x.age_date",
+                "widget.x.age_full_date",
+                "widget.x.age_hours",
+                "widget.x.age_minutes",
+                "widget.x.age_seconds",
+                "widget.x.already_monitored",
+                "widget.x.back",
+                "widget.x.delete_account",
+                "widget.x.dialog_title",
+                "widget.x.empty_accounts",
+                "widget.x.error_title",
+                "widget.x.filter_placeholder",
+                "widget.x.followers_following",
+                "widget.x.load_failed",
+                "widget.x.loading_accounts",
+                "widget.x.logged_out",
+                "widget.x.manage",
+                "widget.x.media_load_failed",
+                "widget.x.monitored_accounts",
+                "widget.x.no_search_results",
+                "widget.x.paused",
+                "widget.x.pending",
+                "widget.x.protected",
+                "widget.x.refresh",
+                "widget.x.reposted",
+                "widget.x.scroll_tweets",
+                "widget.x.search_placeholder",
+                "widget.x.search_users",
+                "widget.x.searching_users",
+                "widget.x.stream_unavailable",
+                "widget.x.success_title",
+                "widget.x.timeline_end",
+                "widget.x.tweet",
+                "widget.x.waiting",
             ] {
                 assert!(!t!(cx, key).is_empty(), "{key} has no copy");
             }
 
             for failure in [
-                SelectionFailure::Rejected(XAccountMonitoringApiError::Authentication),
-                SelectionFailure::Unknown(XAccountMonitoringMutationUnknown::Timeout),
+                SelectionFailure::Rejected(XApiError::Authentication),
+                SelectionFailure::Unknown(XMutationUnknown::Timeout),
                 SelectionFailure::Rpc(RpcCallError::DeadlineExceeded {
                     request_id: RequestId::new(2),
                 }),
@@ -2464,7 +2411,7 @@ mod tests {
             for failure in [
                 RpcCallError::Service {
                     request_id: RequestId::new(3),
-                    source: XAccountMonitoringApiError::NotReady,
+                    source: XApiError::NotReady,
                 },
                 RpcCallError::ServiceClosed {
                     request_id: RequestId::new(4),
@@ -2476,16 +2423,14 @@ mod tests {
                 assert!(!failure.localized_message(cx).is_empty());
             }
             assert!(
-                !TweetMonitorFailure::Stream(TweetStreamError::Transport(TransportError::Closed))
+                !XFailure::Stream(TweetStreamError::Transport(TransportError::Closed))
                     .localized_message(cx)
                     .is_empty()
             );
             assert!(
-                !TweetMonitorFailure::Stream(TweetStreamError::Service(
-                    KytrixServiceError::Timeout
-                ))
-                .localized_message(cx)
-                .is_empty()
+                !XFailure::Stream(TweetStreamError::Service(KytrixServiceError::Timeout))
+                    .localized_message(cx)
+                    .is_empty()
             );
         });
     }
@@ -2501,7 +2446,7 @@ mod tests {
         assert!(!has_content(&pane, cx));
         assert_eq!(
             state_of(&pane, cx),
-            WidgetState::waiting(Notice::message("widget.x_account_monitoring.logged_out")),
+            WidgetState::waiting(Notice::message("widget.x.logged_out")),
             "a pane nobody is signed in for waits rather than working"
         );
         // A sign-out takes the subscription with it: nothing is followed for an account the
@@ -2555,7 +2500,7 @@ mod tests {
         assert!(!has_content(&pane, cx));
         assert_eq!(
             notice_of(&pane, cx),
-            Some(Notice::message("widget.x_account_monitoring.waiting")),
+            Some(Notice::message("widget.x.waiting")),
             "a live stream with nothing to show says so"
         );
     }
@@ -2575,14 +2520,11 @@ mod tests {
         let (pane, _root) = live_pane(cx, &source, &session, Vec::new());
 
         let notice = notice_of(&pane, cx).expect("a live stream with nothing to show stands in");
-        assert_eq!(
-            notice,
-            Notice::message("widget.x_account_monitoring.waiting")
-        );
+        assert_eq!(notice, Notice::message("widget.x.waiting"));
         let english = cx.update(|cx| notice.resolve(cx));
         assert_eq!(
             english,
-            cx.update(|cx| t!(cx, "widget.x_account_monitoring.waiting")),
+            cx.update(|cx| t!(cx, "widget.x.waiting")),
             "the pane starts out in the language showing now"
         );
 
@@ -2612,12 +2554,12 @@ mod tests {
         assert_ne!(chinese, english, "the two locales differ");
         assert_eq!(
             notice_of(&pane, cx),
-            Some(Notice::message("widget.x_account_monitoring.waiting")),
+            Some(Notice::message("widget.x.waiting")),
             "and the pane still stands in with the same reference"
         );
         assert_eq!(
             chinese,
-            cx.update(|cx| t!(cx, "widget.x_account_monitoring.waiting")),
+            cx.update(|cx| t!(cx, "widget.x.waiting")),
             "which is what the pane says in the language showing now"
         );
     }
@@ -2634,14 +2576,11 @@ mod tests {
             pane.read(cx).status.state(cx).notice().is_some()
         });
         let notice = notice_of(&pane, cx).expect("a pane nobody is signed in for stands in");
-        assert_eq!(
-            notice,
-            Notice::message("widget.x_account_monitoring.logged_out")
-        );
+        assert_eq!(notice, Notice::message("widget.x.logged_out"));
         let logged_out = cx.update(|cx| notice.resolve(cx));
         assert_eq!(
             logged_out,
-            cx.update(|cx| t!(cx, "widget.x_account_monitoring.logged_out")),
+            cx.update(|cx| t!(cx, "widget.x.logged_out")),
             "a pane nobody is signed in for says so"
         );
 
@@ -2651,7 +2590,7 @@ mod tests {
         assert_ne!(signed_out_now, logged_out, "the two locales differ");
         assert_eq!(
             signed_out_now,
-            cx.update(|cx| t!(cx, "widget.x_account_monitoring.logged_out")),
+            cx.update(|cx| t!(cx, "widget.x.logged_out")),
             "and the same reference resolves in the language showing now"
         );
     }
@@ -3040,9 +2979,7 @@ mod tests {
         let _control = session.subscribe();
         session.answer_selections(selections(vec![selection("7", "seven")], 3));
         session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
-            "8", "eight",
-        )));
+        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
         // The search this dialog is dismissed over is one the service never answers, so it is
         // still out for as long as the pane is waiting for it.
         let _held = session.block_search();
@@ -3637,7 +3574,7 @@ mod tests {
     /// also where an alert a change is reported in is opened, over the dialog it is about.
     fn draw_dialog<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
     ) -> (Entity<TweetDialog>, &'a mut VisualTestContext) {
         let dialog = attach_dialog(pane, cx);
         let (_, window) = cx.add_window_view({
@@ -3656,7 +3593,7 @@ mod tests {
     /// once it has left — which is the only thing that tells the pane its dialog is gone.
     fn dialog_window<'a>(
         cx: &'a mut TestAppContext,
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
     ) -> &'a mut VisualTestContext {
         let pane = pane.clone();
         let (_, window) =
@@ -3667,10 +3604,7 @@ mod tests {
     }
 
     /// Opens the pane's dialog over the layer, as the pane's own control does.
-    fn open_dialog(
-        pane: &Entity<XAccountMonitoringWidget>,
-        window: &mut VisualTestContext,
-    ) -> Entity<TweetDialog> {
+    fn open_dialog(pane: &Entity<XWidget>, window: &mut VisualTestContext) -> Entity<TweetDialog> {
         window.update(|window, cx| TweetDialog::show(pane.downgrade(), window, cx));
         settle_pages(window);
 
@@ -3696,7 +3630,7 @@ mod tests {
     /// pane it is gone — would never run.
     fn close_dialog_from_its_footer(
         dialog: Entity<TweetDialog>,
-        pane: &Entity<XAccountMonitoringWidget>,
+        pane: &Entity<XWidget>,
         window: &mut VisualTestContext,
     ) {
         let close = window
@@ -3765,9 +3699,7 @@ mod tests {
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
         let (_, window) = draw_dialog(cx, &pane);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Rejected(
-            XAccountMonitoringApiError::QuotaExceeded,
-        ));
+        session.answer_add(XMutationOutcome::Rejected(XApiError::QuotaExceeded));
         pane.update(&mut window.cx, |pane, cx| {
             pane.add_selection(SmolStr::new_static("eight"), cx);
         });
@@ -3805,9 +3737,7 @@ mod tests {
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
         let (_, window) = draw_dialog(cx, &pane);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
-            "8", "eight",
-        )));
+        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
         pane.update(&mut window.cx, |pane, cx| {
             pane.add_selection(SmolStr::new_static("eight"), cx);
         });
@@ -3863,9 +3793,7 @@ mod tests {
 
         // A change that was answered while no dialog was open: the pane holds what it said, and
         // nobody was there to be told.
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
-            "8", "eight",
-        )));
+        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
         pane.update(cx, |pane, cx| {
             assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
         });
@@ -3899,9 +3827,7 @@ mod tests {
         settle_until(&mut window.cx, "the accounts to be read", |cx| {
             pane.read(cx).pending.is_none()
         });
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
-            "8", "eight",
-        )));
+        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
         pane.update(&mut window.cx, |pane, cx| {
             pane.add_selection(SmolStr::new_static("eight"), cx);
         });
@@ -3975,9 +3901,7 @@ mod tests {
         let (pane, _root) =
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(selection(
-            "8", "eight",
-        )));
+        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
         pane.update(cx, |pane, cx| {
             assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
         });
@@ -4002,9 +3926,7 @@ mod tests {
         let (pane, _root) =
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Rejected(
-            XAccountMonitoringApiError::QuotaExceeded,
-        ));
+        session.answer_add(XMutationOutcome::Rejected(XApiError::QuotaExceeded));
         pane.update(cx, |pane, cx| {
             pane.add_selection(SmolStr::new_static("eight"), cx);
         });
@@ -4015,7 +3937,7 @@ mod tests {
         assert!(matches!(
             cx.update(|cx| pane.read(cx).notice.clone()),
             Some(SelectionNotice::Problem(SelectionFailure::Rejected(
-                XAccountMonitoringApiError::QuotaExceeded
+                XApiError::QuotaExceeded
             )))
         ));
         assert_eq!(usernames_of(&pane, cx), ["seven"]);
@@ -4029,9 +3951,7 @@ mod tests {
         let (pane, _root) =
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Unknown(
-            XAccountMonitoringMutationUnknown::Timeout,
-        ));
+        session.answer_add(XMutationOutcome::Unknown(XMutationUnknown::Timeout));
         pane.update(cx, |pane, cx| {
             pane.add_selection(SmolStr::new_static("eight"), cx);
         });
@@ -4042,7 +3962,7 @@ mod tests {
         assert!(matches!(
             cx.update(|cx| pane.read(cx).notice.clone()),
             Some(SelectionNotice::Problem(SelectionFailure::Unknown(
-                XAccountMonitoringMutationUnknown::Timeout
+                XMutationUnknown::Timeout
             )))
         ));
         assert_eq!(usernames_of(&pane, cx), ["seven"]);
@@ -4061,7 +3981,7 @@ mod tests {
             3,
         );
 
-        session.answer_delete(XAccountMonitoringMutationOutcome::Confirmed(()));
+        session.answer_delete(XMutationOutcome::Confirmed(()));
         pane.update(cx, |pane, cx| {
             pane.delete_selection(SmolStr::new_static("7"), cx);
         });
@@ -4082,7 +4002,7 @@ mod tests {
         let _control = session.subscribe();
         let (pane, _root) = live_pane_reading(cx, &source, &session, Vec::new(), 3);
 
-        session.refuse_selections(XAccountMonitoringApiError::Closed);
+        session.refuse_selections(XApiError::Closed);
         pane.update(cx, |pane, cx| {
             pane.load_selections(cx);
         });
@@ -4436,7 +4356,7 @@ mod tests {
         let (pane, _root) =
             live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
 
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(pending("8")));
+        session.answer_add(XMutationOutcome::Confirmed(pending("8")));
         pane.update(cx, |pane, cx| {
             assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
         });
@@ -4495,7 +4415,7 @@ mod tests {
 
         // Another account is another list of rows, and a name remembered for one of them is not
         // a name for the other.
-        session.answer_add(XAccountMonitoringMutationOutcome::Confirmed(pending("8")));
+        session.answer_add(XMutationOutcome::Confirmed(pending("8")));
         pane.update(cx, |pane, cx| {
             assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
         });
@@ -4576,7 +4496,7 @@ mod tests {
     /// what a row draws is read from the pane while the list draws it: a frame is the only
     /// thing that puts those two in an order.
     struct PaneHarness {
-        pane: Entity<XAccountMonitoringWidget>,
+        pane: Entity<XWidget>,
     }
 
     impl Render for PaneHarness {

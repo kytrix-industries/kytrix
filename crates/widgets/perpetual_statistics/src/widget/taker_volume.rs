@@ -9,7 +9,7 @@ use crate::model::MetricKind;
 pub struct TakerVolumeWidgetSeries;
 
 impl StatisticsMetric for TakerVolumeWidgetSeries {
-    const ID: WidgetId = WidgetId::new_static("kytrix.market.taker_volume");
+    const ID: WidgetId = WidgetId::new_static("kytrix.taker_volume");
     const DISPLAY_NAME: &'static str = "widget.names.taker_volume";
     const DESCRIPTION: &'static str = "Perpetual taker buy and sell volume";
     const ICON: &'static str = "widgets/taker_volume.png";
