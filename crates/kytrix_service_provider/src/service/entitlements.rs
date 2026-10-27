@@ -8,7 +8,7 @@ use super::engine::ServiceTopic;
 pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
     match topic {
         ServiceTopic::News => Some("news"),
-        ServiceTopic::Index(_) => Some("indices"),
+        ServiceTopic::FinancialIndex(_) => Some("financial_indices"),
         ServiceTopic::X => Some("x"),
         ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
         ServiceTopic::Ais(_) => Some("ais"),
@@ -22,7 +22,7 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
 pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'static str> {
     match capability {
         KytrixServiceCapability::News => Some("news"),
-        KytrixServiceCapability::Indices => Some("indices"),
+        KytrixServiceCapability::FinancialIndices => Some("financial_indices"),
         KytrixServiceCapability::X => Some("x"),
         KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
             Some("cryptocurrency_wallet_monitoring")
@@ -44,7 +44,7 @@ mod tests {
     use super::*;
     use crate::service::{
         ais::AisArea,
-        engine::{IndexTopic, ServiceTopic},
+        engine::{FinancialIndexTopic, ServiceTopic},
     };
 
     #[test]
@@ -52,8 +52,10 @@ mod tests {
         let topics = [
             (ServiceTopic::News, "news"),
             (
-                ServiceTopic::Index(IndexTopic::from_code("SPX").expect("valid index code")),
-                "indices",
+                ServiceTopic::FinancialIndex(
+                    FinancialIndexTopic::from_code("SPX").expect("valid index code"),
+                ),
+                "financial_indices",
             ),
             (ServiceTopic::X, "x"),
             (
@@ -77,7 +79,10 @@ mod tests {
                 Some("cryptocurrency_etf"),
             ),
             (KytrixServiceCapability::News, Some("news")),
-            (KytrixServiceCapability::Indices, Some("indices")),
+            (
+                KytrixServiceCapability::FinancialIndices,
+                Some("financial_indices"),
+            ),
             (KytrixServiceCapability::X, Some("x")),
             (
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring,

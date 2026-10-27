@@ -498,7 +498,7 @@ mod tests {
         type Config = TestConfig;
 
         const ID: WidgetId = WidgetId::new_static("kytrix.test.configured");
-        const DISPLAY_NAME: &'static str = "widget.names.indices";
+        const DISPLAY_NAME: &'static str = "widget.names.financial_indices";
         const CATEGORY: WidgetCategory = WidgetCategory::Market;
 
         fn new(

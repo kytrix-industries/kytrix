@@ -1856,7 +1856,7 @@ fn localized_server_error(cx: &App, code: ErrorCode) -> SharedString {
         ErrorCode::Unspecified => t!(cx, "error.kytrix.server_unspecified"),
         ErrorCode::RateLimit => t!(cx, "error.kytrix.server_rate_limit"),
         ErrorCode::EntitlementRequired => t!(cx, "error.kytrix.server_entitlement_required"),
-        ErrorCode::IndexTopicLimitExceeded => t!(cx, "error.kytrix.server_index_limit"),
+        ErrorCode::FinancialIndexTopicLimitExceeded => t!(cx, "error.kytrix.server_index_limit"),
         ErrorCode::InvalidTopic => t!(cx, "error.kytrix.server_invalid_topic"),
         ErrorCode::AuthenticationUnavailable => {
             t!(cx, "error.kytrix.server_authentication_unavailable")
@@ -3006,8 +3006,8 @@ mod tests {
             include_str!("../../widgets/hyperliquid_wallet_monitor/src/view.rs"),
         ),
         (
-            "crates/widgets/indices/src/view.rs",
-            include_str!("../../widgets/indices/src/view.rs"),
+            "crates/widgets/financial_indices/src/view.rs",
+            include_str!("../../widgets/financial_indices/src/view.rs"),
         ),
         (
             "crates/widgets/market_trades/src/view.rs",

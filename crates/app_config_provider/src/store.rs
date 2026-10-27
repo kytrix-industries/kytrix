@@ -133,7 +133,7 @@ fn all_network_targets(
         KytrixServiceCapability::Account,
         KytrixServiceCapability::CryptocurrencyEtf,
         KytrixServiceCapability::News,
-        KytrixServiceCapability::Indices,
+        KytrixServiceCapability::FinancialIndices,
         KytrixServiceCapability::X,
         KytrixServiceCapability::CryptocurrencyWalletMonitoring,
         KytrixServiceCapability::XMedia,

@@ -167,7 +167,7 @@ error:
     listing_route_mismatch: 挂牌 %{listing} 不属于路由 %{route}
     protocol: 执行 %{operation} 时账户协议返回了无效响应
     unknown_asset: 身份为 %{asset} 的资产不在 %{route} 的账户目录中
-  indices:
+  financial_indices:
     duplicate_category: 指数清单包含重复分类 `%{code}`
     duplicate_index: 指数清单包含重复指数 `%{code}`
     index_limit: 当前最多可选择 %{limit} 个指数
@@ -778,7 +778,7 @@ widget:
     unknown: 未知
     unrealized_pnl: 未实现盈亏
     value: 价值
-  indices:
+  financial_indices:
     change: 涨跌
     change_percent: 涨跌幅
     choose: 选择指数
@@ -809,10 +809,10 @@ widget:
     empty: 空白
     etf_flow: ETF 资金流
     financial_calendar: 财经日历
+    financial_indices: 指数
     force_orders: 强平订单流
     hormuz_vessel_map: 霍尔木兹海峡船舶地图
     hyperliquid_wallet_monitor: Hyperliquid 钱包监控
-    indices: 指数
     long_short_account_ratio: 多空账户比
     market_trades: 市场成交
     news: 新闻

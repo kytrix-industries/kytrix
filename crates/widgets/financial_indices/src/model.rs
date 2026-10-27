@@ -21,7 +21,7 @@ use ahash::{HashSet, HashSetExt};
 use gpui_kit::{App, SharedString};
 use i18n::{language::codes::LanguageCode, t};
 use kytrix_proto::types as proto_types;
-use kytrix_service_provider::service::engine::{IndexEvent, IndexTopic};
+use kytrix_service_provider::service::engine::{FinancialIndexEvent, FinancialIndexTopic};
 use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
@@ -39,7 +39,7 @@ const MAX_MANIFEST_CATEGORIES: usize = 256;
 const MAX_MANIFEST_INDICES: usize = 4_096;
 /// The longest code a manifest entry may carry, counted in characters.
 ///
-/// It is the service's own limit — the one `IndexTopic` accepts — so a manifest
+/// It is the service's own limit — the one `FinancialIndexTopic` accepts — so a manifest
 /// that carries a code this pane keeps is a code the subscription can name.
 const MAX_CODE_CHARS: usize = 64;
 /// The longest name one manifest entry may carry, counted in characters.
@@ -47,13 +47,13 @@ pub(super) const MAX_NAME_CHARS: usize = 120;
 
 /// A failure of the data a pane was asked to draw.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(super) enum IndicesDataError {
+pub(super) enum FinancialIndicesDataError {
     #[error("the selection holds more than {limit} indices")]
     SelectionCapacity { limit: usize },
     #[error("the manifest holds more than {limit} entries")]
     ManifestCapacity { limit: usize },
     #[error("invalid index data: {0}")]
-    Invalid(IndicesInvalidReason),
+    Invalid(FinancialIndicesInvalidReason),
 }
 
 /// Why a manifest entry could not be accepted.
@@ -63,13 +63,13 @@ pub(super) enum IndicesDataError {
 /// category the manifest does not define. A reader cannot act on which of the
 /// three codes of an entry was empty, so nothing here says.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(super) enum IndicesInvalidReason {
+pub(super) enum FinancialIndicesInvalidReason {
     #[error("the manifest carries an invalid code")]
     InvalidCode,
     #[error("the manifest repeats the category {code}")]
     DuplicateCategory { code: SmolStr },
     #[error("the manifest repeats the index {code}")]
-    DuplicateIndex { code: SmolStr },
+    DuplicateFinancialIndex { code: SmolStr },
     #[error("index {index} references the undefined category {category}")]
     UnknownCategory { index: SmolStr, category: SmolStr },
     #[error("a manifest entry has no name")]
@@ -78,37 +78,55 @@ pub(super) enum IndicesInvalidReason {
     NameFormat,
 }
 
-impl LocalizedError for IndicesDataError {
+impl LocalizedError for FinancialIndicesDataError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::SelectionCapacity { limit } => {
-                t!(cx, "error.indices.selection_capacity", limit = limit)
+                t!(
+                    cx,
+                    "error.financial_indices.selection_capacity",
+                    limit = limit
+                )
             }
             Self::ManifestCapacity { limit } => {
-                t!(cx, "error.indices.manifest_too_large", limit = limit)
+                t!(
+                    cx,
+                    "error.financial_indices.manifest_too_large",
+                    limit = limit
+                )
             }
             Self::Invalid(reason) => reason.localized_message(cx),
         }
     }
 }
 
-impl LocalizedError for IndicesInvalidReason {
+impl LocalizedError for FinancialIndicesInvalidReason {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidCode => t!(cx, "error.indices.invalid_code"),
+            Self::InvalidCode => t!(cx, "error.financial_indices.invalid_code"),
             Self::DuplicateCategory { code } => {
-                t!(cx, "error.indices.duplicate_category", code = code)
+                t!(
+                    cx,
+                    "error.financial_indices.duplicate_category",
+                    code = code
+                )
             }
-            Self::DuplicateIndex { code } => t!(cx, "error.indices.duplicate_index", code = code),
+            Self::DuplicateFinancialIndex { code } => {
+                t!(cx, "error.financial_indices.duplicate_index", code = code)
+            }
             Self::UnknownCategory { index, category } => t!(
                 cx,
-                "error.indices.unknown_category",
+                "error.financial_indices.unknown_category",
                 index = index,
                 category = category
             ),
-            Self::MissingName => t!(cx, "error.indices.missing_name"),
+            Self::MissingName => t!(cx, "error.financial_indices.missing_name"),
             Self::NameFormat => {
-                t!(cx, "error.indices.name_format", limit = MAX_NAME_CHARS)
+                t!(
+                    cx,
+                    "error.financial_indices.name_format",
+                    limit = MAX_NAME_CHARS
+                )
             }
         }
     }
@@ -120,12 +138,12 @@ impl LocalizedError for IndicesInvalidReason {
 /// published in, so the name travels with the index rather than being resolved
 /// from a key: the catalogue is data, and a name is part of it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub(super) struct LocalizedIndexName {
+pub(super) struct LocalizedFinancialIndexName {
     pub en: SmolStr,
     pub zh: SmolStr,
 }
 
-impl LocalizedIndexName {
+impl LocalizedFinancialIndexName {
     /// The name in the language the interface is reading.
     ///
     /// The manifest carries two names, so every locale other than Chinese reads
@@ -137,13 +155,13 @@ impl LocalizedIndexName {
         }
     }
 
-    fn validate(&self) -> Result<(), IndicesDataError> {
+    fn validate(&self) -> Result<(), FinancialIndicesDataError> {
         validate_name(&self.en)?;
         validate_name(&self.zh)
     }
 }
 
-impl<'de> Deserialize<'de> for LocalizedIndexName {
+impl<'de> Deserialize<'de> for LocalizedFinancialIndexName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -166,33 +184,33 @@ impl<'de> Deserialize<'de> for LocalizedIndexName {
 
 /// One index a pane follows, with the name the manifest gave it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub(super) struct SelectedIndex {
-    pub topic: IndexTopic,
-    pub name: LocalizedIndexName,
+pub(super) struct SelectedFinancialIndex {
+    pub topic: FinancialIndexTopic,
+    pub name: LocalizedFinancialIndexName,
 }
 
 /// One category of a manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IndexCategory {
+pub(super) struct FinancialIndexCategory {
     pub code: SmolStr,
-    pub name: LocalizedIndexName,
+    pub name: LocalizedFinancialIndexName,
 }
 
 /// One index of a manifest, and the category it belongs to.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IndexDescriptor {
-    pub index: SelectedIndex,
+pub(super) struct FinancialIndexDescriptor {
+    pub index: SelectedFinancialIndex,
     pub category: SmolStr,
 }
 
 /// A manifest that has been validated, in the order it was published in.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IndexCatalog {
-    pub categories: Arc<[IndexCategory]>,
-    pub indices: Arc<[IndexDescriptor]>,
+pub(super) struct FinancialIndexCatalog {
+    pub categories: Arc<[FinancialIndexCategory]>,
+    pub indices: Arc<[FinancialIndexDescriptor]>,
 }
 
-impl IndexCatalog {
+impl FinancialIndexCatalog {
     /// The indices of one category a search leaves, in manifest order.
     ///
     /// A catalogue with no category selected offers nothing: a selector opens on
@@ -208,7 +226,7 @@ impl IndexCatalog {
         &self,
         category: Option<&SmolStr>,
         filter: Option<&str>,
-    ) -> Arc<[IndexDescriptor]> {
+    ) -> Arc<[FinancialIndexDescriptor]> {
         let Some(category) = category else {
             return Arc::from([]);
         };
@@ -235,7 +253,7 @@ impl IndexCatalog {
 ///
 /// The fields are the ones a row of the selector draws: its code, and the names the
 /// manifest published for it.
-fn matches_filter(descriptor: &IndexDescriptor, filter: &str) -> bool {
+fn matches_filter(descriptor: &FinancialIndexDescriptor, filter: &str) -> bool {
     let index = &descriptor.index;
     [
         index.topic.code(),
@@ -248,7 +266,7 @@ fn matches_filter(descriptor: &IndexDescriptor, filter: &str) -> bool {
 
 /// Which way an index moved against its open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum IndexDirection {
+pub(super) enum FinancialIndexDirection {
     Down,
     Flat,
     Up,
@@ -256,7 +274,7 @@ pub(super) enum IndexDirection {
 
 /// One complete quote. All prices are integer cents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct IndexQuote {
+pub(super) struct FinancialIndexQuote {
     pub latest: u32,
     pub open: u32,
     pub is_trading: bool,
@@ -264,7 +282,7 @@ pub(super) struct IndexQuote {
     pub timestamp: i64,
 }
 
-impl IndexQuote {
+impl FinancialIndexQuote {
     /// The move against the open, in cents.
     pub(super) const fn change(self) -> i64 {
         self.latest as i64 - self.open as i64
@@ -275,17 +293,17 @@ impl IndexQuote {
         (self.open != 0).then(|| self.change() as f64 * 100.0 / f64::from(self.open))
     }
 
-    pub(super) const fn direction(self) -> IndexDirection {
+    pub(super) const fn direction(self) -> FinancialIndexDirection {
         if self.latest < self.open {
-            IndexDirection::Down
+            FinancialIndexDirection::Down
         } else if self.latest > self.open {
-            IndexDirection::Up
+            FinancialIndexDirection::Up
         } else {
-            IndexDirection::Flat
+            FinancialIndexDirection::Flat
         }
     }
 
-    pub(super) const fn from_event(event: &IndexEvent) -> Self {
+    pub(super) const fn from_event(event: &FinancialIndexEvent) -> Self {
         Self {
             latest: event.last_price,
             open: event.open_price,
@@ -297,8 +315,8 @@ impl IndexQuote {
 
 /// Validates a manifest into the catalogue a selector lists.
 pub(super) fn prepare_catalog(
-    manifest: proto_types::IndexManifest,
-) -> Result<IndexCatalog, IndicesDataError> {
+    manifest: proto_types::FinancialIndexManifest,
+) -> Result<FinancialIndexCatalog, FinancialIndicesDataError> {
     ensure_manifest_capacity(manifest.categories.len(), MAX_MANIFEST_CATEGORIES)?;
     ensure_manifest_capacity(manifest.indices.len(), MAX_MANIFEST_INDICES)?;
 
@@ -307,9 +325,11 @@ pub(super) fn prepare_catalog(
     for category in manifest.categories {
         let code = validate_code(&category.code)?;
         if !category_codes.insert(code.clone()) {
-            return Err(invalid(IndicesInvalidReason::DuplicateCategory { code }));
+            return Err(invalid(FinancialIndicesInvalidReason::DuplicateCategory {
+                code,
+            }));
         }
-        categories.push(IndexCategory {
+        categories.push(FinancialIndexCategory {
             code,
             name: parse_name(category.name)?,
         });
@@ -319,22 +339,24 @@ pub(super) fn prepare_catalog(
     let mut indices = Vec::with_capacity(manifest.indices.len());
     for index in manifest.indices {
         validate_code(&index.request_code)?;
-        let topic = IndexTopic::from_code(&index.code)
-            .ok_or_else(|| invalid(IndicesInvalidReason::InvalidCode))?;
+        let topic = FinancialIndexTopic::from_code(&index.code)
+            .ok_or_else(|| invalid(FinancialIndicesInvalidReason::InvalidCode))?;
         if !index_codes.insert(topic.clone()) {
-            return Err(invalid(IndicesInvalidReason::DuplicateIndex {
-                code: SmolStr::new(topic.code()),
-            }));
+            return Err(invalid(
+                FinancialIndicesInvalidReason::DuplicateFinancialIndex {
+                    code: SmolStr::new(topic.code()),
+                },
+            ));
         }
         let category = validate_code(&index.category)?;
         if !category_codes.contains(&category) {
-            return Err(invalid(IndicesInvalidReason::UnknownCategory {
+            return Err(invalid(FinancialIndicesInvalidReason::UnknownCategory {
                 index: SmolStr::new(topic.code()),
                 category,
             }));
         }
-        indices.push(IndexDescriptor {
-            index: SelectedIndex {
+        indices.push(FinancialIndexDescriptor {
+            index: SelectedFinancialIndex {
                 topic,
                 name: parse_name(index.name)?,
             },
@@ -342,7 +364,7 @@ pub(super) fn prepare_catalog(
         });
     }
 
-    Ok(IndexCatalog {
+    Ok(FinancialIndexCatalog {
         categories: categories.into(),
         indices: indices.into(),
     })
@@ -351,10 +373,10 @@ pub(super) fn prepare_catalog(
 /// Normalizes a persisted or chosen selection: the hard limit, then the names,
 /// then the duplicates, which keep the first entry they appeared as.
 pub(super) fn normalize_selection(
-    selection: &[SelectedIndex],
-) -> Result<Vec<SelectedIndex>, IndicesDataError> {
+    selection: &[SelectedFinancialIndex],
+) -> Result<Vec<SelectedFinancialIndex>, FinancialIndicesDataError> {
     if selection.len() > MAX_SELECTED_INDICES {
-        return Err(IndicesDataError::SelectionCapacity {
+        return Err(FinancialIndicesDataError::SelectionCapacity {
             limit: MAX_SELECTED_INDICES,
         });
     }
@@ -373,7 +395,7 @@ pub(super) fn normalize_selection(
 }
 
 /// The topics a selection subscribes to, in selection order.
-pub(super) fn selection_topics(selection: &[SelectedIndex]) -> Arc<[IndexTopic]> {
+pub(super) fn selection_topics(selection: &[SelectedFinancialIndex]) -> Arc<[FinancialIndexTopic]> {
     let mut topics = Vec::with_capacity(selection.len());
     topics.extend(selection.iter().map(|index| index.topic.clone()));
     topics.into()
@@ -410,37 +432,37 @@ pub(super) fn format_percent(percent: Option<f64>) -> SharedString {
     }
 }
 
-fn ensure_manifest_capacity(len: usize, limit: usize) -> Result<(), IndicesDataError> {
+fn ensure_manifest_capacity(len: usize, limit: usize) -> Result<(), FinancialIndicesDataError> {
     if len > limit {
-        Err(IndicesDataError::ManifestCapacity { limit })
+        Err(FinancialIndicesDataError::ManifestCapacity { limit })
     } else {
         Ok(())
     }
 }
 
-fn invalid(reason: IndicesInvalidReason) -> IndicesDataError {
-    IndicesDataError::Invalid(reason)
+fn invalid(reason: FinancialIndicesInvalidReason) -> FinancialIndicesDataError {
+    FinancialIndicesDataError::Invalid(reason)
 }
 
-fn validate_code(code: &str) -> Result<SmolStr, IndicesDataError> {
+fn validate_code(code: &str) -> Result<SmolStr, FinancialIndicesDataError> {
     if code.is_empty() || code.trim() != code || code.chars().count() > MAX_CODE_CHARS {
-        return Err(invalid(IndicesInvalidReason::InvalidCode));
+        return Err(invalid(FinancialIndicesInvalidReason::InvalidCode));
     }
     Ok(SmolStr::new(code))
 }
 
-fn validate_name(value: &str) -> Result<(), IndicesDataError> {
+fn validate_name(value: &str) -> Result<(), FinancialIndicesDataError> {
     if value.is_empty() || value.trim() != value || value.chars().count() > MAX_NAME_CHARS {
-        return Err(invalid(IndicesInvalidReason::NameFormat));
+        return Err(invalid(FinancialIndicesInvalidReason::NameFormat));
     }
     Ok(())
 }
 
 fn parse_name(
     name: Option<proto_types::LocalizedName>,
-) -> Result<LocalizedIndexName, IndicesDataError> {
-    let name = name.ok_or_else(|| invalid(IndicesInvalidReason::MissingName))?;
-    let name = LocalizedIndexName {
+) -> Result<LocalizedFinancialIndexName, FinancialIndicesDataError> {
+    let name = name.ok_or_else(|| invalid(FinancialIndicesInvalidReason::MissingName))?;
+    let name = LocalizedFinancialIndexName {
         en: SmolStr::new(name.en),
         zh: SmolStr::new(name.zh),
     };
@@ -452,8 +474,8 @@ fn parse_name(
 mod tests {
     use super::*;
 
-    fn topic(code: &str) -> IndexTopic {
-        IndexTopic::from_code(code).expect("a test index code should be valid")
+    fn topic(code: &str) -> FinancialIndexTopic {
+        FinancialIndexTopic::from_code(code).expect("a test index code should be valid")
     }
 
     fn name(en: &str, zh: &str) -> Option<proto_types::LocalizedName> {
@@ -463,13 +485,13 @@ mod tests {
         })
     }
 
-    fn manifest() -> proto_types::IndexManifest {
-        proto_types::IndexManifest {
-            categories: vec![proto_types::IndexCategory {
+    fn manifest() -> proto_types::FinancialIndexManifest {
+        proto_types::FinancialIndexManifest {
+            categories: vec![proto_types::FinancialIndexCategory {
                 code: "asia".to_owned(),
                 name: name("Asia", "亚洲"),
             }],
-            indices: vec![proto_types::IndexDefinition {
+            indices: vec![proto_types::FinancialIndexDefinition {
                 code: "HSI".to_owned(),
                 category: "asia".to_owned(),
                 name: name("Hang Seng Index", "恒生指数"),
@@ -478,18 +500,18 @@ mod tests {
         }
     }
 
-    fn selected(code: &str) -> SelectedIndex {
-        SelectedIndex {
+    fn selected(code: &str) -> SelectedFinancialIndex {
+        SelectedFinancialIndex {
             topic: topic(code),
-            name: LocalizedIndexName {
+            name: LocalizedFinancialIndexName {
                 en: SmolStr::new(format_smolstr!("{code} English")),
                 zh: SmolStr::new(format_smolstr!("{code} Chinese")),
             },
         }
     }
 
-    fn quote(latest: u32, open: u32) -> IndexQuote {
-        IndexQuote {
+    fn quote(latest: u32, open: u32) -> FinancialIndexQuote {
+        FinancialIndexQuote {
             latest,
             open,
             is_trading: true,
@@ -499,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_quote_should_measure_its_move_against_the_open() {
-        let event = IndexEvent {
+        let event = FinancialIndexEvent {
             topic: topic("HSI"),
             last_price: 10_500,
             open_price: 10_000,
@@ -509,11 +531,11 @@ mod tests {
             is_trading: true,
             timestamp: 123,
         };
-        let quote = IndexQuote::from_event(&event);
+        let quote = FinancialIndexQuote::from_event(&event);
 
         assert_eq!(
             quote,
-            IndexQuote {
+            FinancialIndexQuote {
                 latest: 10_500,
                 open: 10_000,
                 is_trading: true,
@@ -522,7 +544,7 @@ mod tests {
         );
         assert_eq!(quote.change(), 500);
         assert_eq!(quote.change_percent(), Some(5.0));
-        assert_eq!(quote.direction(), IndexDirection::Up);
+        assert_eq!(quote.direction(), FinancialIndexDirection::Up);
     }
 
     #[test]
@@ -530,9 +552,9 @@ mod tests {
         let flat = quote(1, 0);
 
         assert_eq!(flat.change_percent(), None);
-        assert_eq!(flat.direction(), IndexDirection::Up);
-        assert_eq!(quote(0, 0).direction(), IndexDirection::Flat);
-        assert_eq!(quote(0, 1).direction(), IndexDirection::Down);
+        assert_eq!(flat.direction(), FinancialIndexDirection::Up);
+        assert_eq!(quote(0, 0).direction(), FinancialIndexDirection::Flat);
+        assert_eq!(quote(0, 1).direction(), FinancialIndexDirection::Down);
     }
 
     #[test]
@@ -550,8 +572,8 @@ mod tests {
         duplicate.indices.push(duplicate.indices[0].clone());
         assert!(matches!(
             prepare_catalog(duplicate),
-            Err(IndicesDataError::Invalid(
-                IndicesInvalidReason::DuplicateIndex { code }
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::DuplicateFinancialIndex { code }
             )) if code == "HSI"
         ));
 
@@ -559,22 +581,22 @@ mod tests {
         unknown.indices[0].category = "missing".to_owned();
         assert!(matches!(
             prepare_catalog(unknown),
-            Err(IndicesDataError::Invalid(
-                IndicesInvalidReason::UnknownCategory { index, category }
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::UnknownCategory { index, category }
             )) if index == "HSI" && category == "missing"
         ));
 
         let mut duplicate_category = manifest();
         duplicate_category
             .categories
-            .push(proto_types::IndexCategory {
+            .push(proto_types::FinancialIndexCategory {
                 code: "asia".to_owned(),
                 name: name("Asia again", "亚洲"),
             });
         assert!(matches!(
             prepare_catalog(duplicate_category),
-            Err(IndicesDataError::Invalid(
-                IndicesInvalidReason::DuplicateCategory { code }
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::DuplicateCategory { code }
             )) if code == "asia"
         ));
     }
@@ -585,14 +607,18 @@ mod tests {
         untrimmed.indices[0].request_code = " .HSI".to_owned();
         assert!(matches!(
             prepare_catalog(untrimmed),
-            Err(IndicesDataError::Invalid(IndicesInvalidReason::InvalidCode))
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::InvalidCode
+            ))
         ));
 
         let mut overlong = manifest();
         overlong.indices[0].code = "x".repeat(MAX_CODE_CHARS + 1);
         assert!(matches!(
             prepare_catalog(overlong),
-            Err(IndicesDataError::Invalid(IndicesInvalidReason::InvalidCode))
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::InvalidCode
+            ))
         ));
     }
 
@@ -602,26 +628,30 @@ mod tests {
         missing.indices[0].name = None;
         assert!(matches!(
             prepare_catalog(missing),
-            Err(IndicesDataError::Invalid(IndicesInvalidReason::MissingName))
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::MissingName
+            ))
         ));
 
         let mut overlong = manifest();
         overlong.indices[0].name = name(&"x".repeat(MAX_NAME_CHARS + 1), "valid");
         assert!(matches!(
             prepare_catalog(overlong),
-            Err(IndicesDataError::Invalid(IndicesInvalidReason::NameFormat))
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::NameFormat
+            ))
         ));
     }
 
     #[test]
     fn catalog_should_accept_the_category_limit_and_reject_the_next_item() {
         let categories = (0..MAX_MANIFEST_CATEGORIES)
-            .map(|index| proto_types::IndexCategory {
+            .map(|index| proto_types::FinancialIndexCategory {
                 code: format!("category_{index}"),
                 name: name("Category", "分类"),
             })
             .collect::<Vec<_>>();
-        let at_limit = prepare_catalog(proto_types::IndexManifest {
+        let at_limit = prepare_catalog(proto_types::FinancialIndexManifest {
             categories: categories.clone(),
             indices: Vec::new(),
         })
@@ -629,16 +659,16 @@ mod tests {
         assert_eq!(at_limit.categories.len(), MAX_MANIFEST_CATEGORIES);
 
         let mut over_limit = categories;
-        over_limit.push(proto_types::IndexCategory {
+        over_limit.push(proto_types::FinancialIndexCategory {
             code: "one_too_many".to_owned(),
             name: name("Category", "分类"),
         });
         assert_eq!(
-            prepare_catalog(proto_types::IndexManifest {
+            prepare_catalog(proto_types::FinancialIndexManifest {
                 categories: over_limit,
                 indices: Vec::new(),
             }),
-            Err(IndicesDataError::ManifestCapacity {
+            Err(FinancialIndicesDataError::ManifestCapacity {
                 limit: MAX_MANIFEST_CATEGORIES,
             })
         );
@@ -664,7 +694,7 @@ mod tests {
         assert_eq!(
             selection_topics(&normalized)
                 .iter()
-                .map(IndexTopic::code)
+                .map(FinancialIndexTopic::code)
                 .collect::<Vec<_>>(),
             ["SPX", "HSI", "GOLD"]
         );
@@ -686,7 +716,7 @@ mod tests {
         over_limit.push(selected("ONE_TOO_MANY"));
         assert_eq!(
             normalize_selection(&over_limit),
-            Err(IndicesDataError::SelectionCapacity {
+            Err(FinancialIndicesDataError::SelectionCapacity {
                 limit: MAX_SELECTED_INDICES,
             })
         );
@@ -699,23 +729,29 @@ mod tests {
 
         assert!(matches!(
             normalize_selection(&[broken]),
-            Err(IndicesDataError::Invalid(IndicesInvalidReason::NameFormat))
+            Err(FinancialIndicesDataError::Invalid(
+                FinancialIndicesInvalidReason::NameFormat
+            ))
         ));
     }
 
     #[test]
     fn catalog_should_list_only_the_indices_of_the_selected_category() {
         let mut manifest = manifest();
-        manifest.categories.push(proto_types::IndexCategory {
-            code: "america".to_owned(),
-            name: name("America", "美洲"),
-        });
-        manifest.indices.push(proto_types::IndexDefinition {
-            code: "SPX".to_owned(),
-            category: "america".to_owned(),
-            name: name("S&P 500", "标普 500"),
-            request_code: ".SPX".to_owned(),
-        });
+        manifest
+            .categories
+            .push(proto_types::FinancialIndexCategory {
+                code: "america".to_owned(),
+                name: name("America", "美洲"),
+            });
+        manifest
+            .indices
+            .push(proto_types::FinancialIndexDefinition {
+                code: "SPX".to_owned(),
+                category: "america".to_owned(),
+                name: name("S&P 500", "标普 500"),
+                request_code: ".SPX".to_owned(),
+            });
         let catalog = prepare_catalog(manifest).expect("the fixture manifest should be valid");
 
         let america = catalog.descriptors_for(Some(&SmolStr::new_static("america")), None);

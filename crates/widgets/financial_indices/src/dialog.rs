@@ -55,7 +55,9 @@ use gpui_kit::{
     div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
-use kytrix_service_provider::service::{connector::KytrixServiceConnector, engine::IndexTopic};
+use kytrix_service_provider::service::{
+    connector::KytrixServiceConnector, engine::FinancialIndexTopic,
+};
 use smol_str::SmolStr;
 use widget::{
     binding::{WidgetBinding, WidgetRpcResult},
@@ -65,10 +67,13 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use super::{
-    model::{IndexCatalog, IndexDescriptor, IndicesDataError, MAX_SELECTED_INDICES},
+    model::{
+        FinancialIndexCatalog, FinancialIndexDescriptor, FinancialIndicesDataError,
+        MAX_SELECTED_INDICES,
+    },
     service::{
-        IndicesProtocol, IndicesRequest, IndicesResponse, IndicesScope, IndicesService,
-        IndicesStreamMessage,
+        FinancialIndicesProtocol, FinancialIndicesRequest, FinancialIndicesResponse,
+        FinancialIndicesScope, FinancialIndicesService, FinancialIndicesStreamMessage,
     },
 };
 
@@ -89,24 +94,25 @@ const FILTER_FIELD_SELECTOR: &str = "TEST_INDICES_SELECTOR_FILTER";
 const COUNT_LABEL_SELECTOR: &str = "TEST_INDICES_SELECTOR_COUNT";
 
 /// Runs after the user confirms a selection.
-type ConfirmHandler = Rc<dyn Fn(Vec<super::model::SelectedIndex>, &mut Window, &mut App) + 'static>;
+type ConfirmHandler =
+    Rc<dyn Fn(Vec<super::model::SelectedFinancialIndex>, &mut Window, &mut App) + 'static>;
 
 /// What the dialog has of the catalogue.
 enum ManifestState {
     /// The catalogue is being read.
     Loading,
     /// The catalogue, as the service published it.
-    Ready(IndexCatalog),
+    Ready(FinancialIndexCatalog),
     /// Why it could not be listed, already localized.
     Failed(SharedString),
 }
 
 /// One open selector.
-pub(super) struct IndicesSelector {
-    binding: WidgetBinding<IndicesProtocol>,
+pub(super) struct FinancialIndicesSelector {
+    binding: WidgetBinding<FinancialIndicesProtocol>,
     /// The topics the user has chosen so far, which is what the rows are checked
     /// against.
-    selected: HashSet<IndexTopic>,
+    selected: HashSet<FinancialIndexTopic>,
     manifest: ManifestState,
     /// The category the list is showing.
     ///
@@ -125,7 +131,7 @@ pub(super) struct IndicesSelector {
     typed_filter: SmolStr,
     /// The indices of that category a search leaves, resolved when the catalogue, the
     /// category or the search changes rather than on every frame.
-    visible: Arc<[IndexDescriptor]>,
+    visible: Arc<[FinancialIndexDescriptor]>,
     /// The number of indices the account may follow, as the read of the catalogue carried
     /// it.
     ///
@@ -133,7 +139,7 @@ pub(super) struct IndicesSelector {
     /// published a limit: a number nobody gave is not one to draw beside the count.
     limit: Option<u32>,
     /// What the last attempt to change the selection refused, if it did.
-    selection_error: Option<IndicesDataError>,
+    selection_error: Option<FinancialIndicesDataError>,
     /// The column of categories, which the tree draws and keeps the selection of.
     categories: Entity<TreeState>,
     /// The language the rows of the column were labelled in.
@@ -142,10 +148,10 @@ pub(super) struct IndicesSelector {
     /// have to be built again.
     language: LanguageCode,
     /// The indices of the category on show, as rows a reader can choose.
-    list: Entity<StaticSizedList<IndexDescriptor>>,
+    list: Entity<StaticSizedList<FinancialIndexDescriptor>>,
     /// The indices the list was last told to draw, which is how a frame knows whether the
     /// category on show is one the list has not been given.
-    shown: Option<Arc<[IndexDescriptor]>>,
+    shown: Option<Arc<[FinancialIndexDescriptor]>>,
     on_confirm: ConfirmHandler,
     /// Held because the subscription is what follows the column: dropping it would leave
     /// a row that is clicked and never read.
@@ -156,9 +162,9 @@ pub(super) struct IndicesSelector {
 /// run — are a [`DismissEvent`] the dialog it was opened in subscribes to, so the dialog
 /// leaves without the selector having to be the one on top of the layer or to hold a
 /// window to say so.
-impl EventEmitter<DismissEvent> for IndicesSelector {}
+impl EventEmitter<DismissEvent> for FinancialIndicesSelector {}
 
-impl IndicesSelector {
+impl FinancialIndicesSelector {
     /// Presents the selector over the window, and calls `on_confirm` with the
     /// selection the user confirmed.
     ///
@@ -166,8 +172,8 @@ impl IndicesSelector {
     /// service's business rather than the pane's, so the dialog reads through the same
     /// connector the pane does.
     pub(super) fn show(
-        current: &[super::model::SelectedIndex],
-        on_confirm: impl Fn(Vec<super::model::SelectedIndex>, &mut Window, &mut App) + 'static,
+        current: &[super::model::SelectedFinancialIndex],
+        on_confirm: impl Fn(Vec<super::model::SelectedFinancialIndex>, &mut Window, &mut App) + 'static,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -179,7 +185,7 @@ impl IndicesSelector {
     /// seam a test drives the catalogue through.
     fn show_with_service(
         source: KytrixServiceConnector,
-        current: &[super::model::SelectedIndex],
+        current: &[super::model::SelectedFinancialIndex],
         on_confirm: ConfirmHandler,
         window: &mut Window,
         cx: &mut App,
@@ -189,11 +195,21 @@ impl IndicesSelector {
         // holds one.
         let filter = cx.new(|cx| {
             InputStateBuilder::new(FILTER_INPUT_ID)
-                .placeholder(t!(cx, "widget.indices.selector.filter_placeholder"))
+                .placeholder(t!(
+                    cx,
+                    "widget.financial_indices.selector.filter_placeholder"
+                ))
                 .build(window, cx)
         });
-        let selector =
-            cx.new(|cx| Self::new(IndicesService::new(source), current, filter, on_confirm, cx));
+        let selector = cx.new(|cx| {
+            Self::new(
+                FinancialIndicesService::new(source),
+                current,
+                filter,
+                on_confirm,
+                cx,
+            )
+        });
         // The read the dialog is opened to show starts before the dialog itself: the push is
         // deferred to the end of the effect cycle, so either way the first frame the panel draws
         // is a frame of a selector that has already asked.
@@ -203,13 +219,13 @@ impl IndicesSelector {
 
     fn new<S>(
         service: S,
-        current: &[super::model::SelectedIndex],
+        current: &[super::model::SelectedFinancialIndex],
         filter: Entity<InputState>,
         on_confirm: ConfirmHandler,
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: WidgetService<IndicesProtocol>,
+        S: WidgetService<FinancialIndicesProtocol>,
     {
         let mut selected = HashSet::with_capacity(current.len());
         selected.extend(current.iter().map(|index| index.topic.clone()));
@@ -256,7 +272,7 @@ impl IndicesSelector {
         let list = cx.new(|_| {
             StaticSizedList::new(
                 ElementId::Name(SharedString::new_static(LIST_ID)),
-                move |_index, descriptor: &IndexDescriptor, _window, cx| {
+                move |_index, descriptor: &FinancialIndexDescriptor, _window, cx| {
                     index_row(descriptor, &selector, cx)
                 },
             )
@@ -291,14 +307,21 @@ impl IndicesSelector {
         // The column goes with the catalogue it was built from: a category of the read
         // that failed is not a category of the read that is starting.
         self.show_category_rows(Vec::new(), cx);
-        self.binding
-            .call(IndicesRequest::FetchManifest, cx, Self::apply_manifest);
+        self.binding.call(
+            FinancialIndicesRequest::FetchManifest,
+            cx,
+            Self::apply_manifest,
+        );
         cx.notify();
     }
 
-    fn apply_manifest(&mut self, result: WidgetRpcResult<IndicesProtocol>, cx: &mut Context<Self>) {
+    fn apply_manifest(
+        &mut self,
+        result: WidgetRpcResult<FinancialIndicesProtocol>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
-            Ok(IndicesResponse::Manifest { catalog, limit }) => {
+            Ok(FinancialIndicesResponse::Manifest { catalog, limit }) => {
                 // The column is the catalogue's own categories, and the list opens on the
                 // first of them: a selector that opened on none would be a dialog with a
                 // blank half.
@@ -314,7 +337,7 @@ impl IndicesSelector {
             }
             // The protocol types the answer, so this is a service that answered the
             // wrong question rather than a shape a reader could describe.
-            Ok(_) => self.fail(t!(cx, "widget.indices.selector.load_failed"), cx),
+            Ok(_) => self.fail(t!(cx, "widget.financial_indices.selector.load_failed"), cx),
             Err(error) => self.fail(error.localized_message(cx), cx),
         }
         cx.notify();
@@ -331,8 +354,8 @@ impl IndicesSelector {
     /// The selector has no stream of its own: it reads a catalogue and nothing else.
     fn ignore_stream(
         &mut self,
-        _: IndicesScope,
-        _: Arc<IndicesStreamMessage>,
+        _: FinancialIndicesScope,
+        _: Arc<FinancialIndicesStreamMessage>,
         _: &mut Context<Self>,
     ) -> bool {
         false
@@ -381,7 +404,7 @@ impl IndicesSelector {
         };
     }
 
-    fn toggle(&mut self, topic: &IndexTopic, cx: &mut Context<Self>) {
+    fn toggle(&mut self, topic: &FinancialIndexTopic, cx: &mut Context<Self>) {
         let checked = !self.selected.contains(topic);
         match update_selection(&mut self.selected, topic, checked) {
             Ok(true) => {
@@ -401,7 +424,7 @@ impl IndicesSelector {
     /// The order is the catalogue's rather than the order the user clicked in: a pane's
     /// grid is read as a list of markets, and the catalogue is the only order that
     /// means anything to a reader of it.
-    fn selection(&self) -> Option<Vec<super::model::SelectedIndex>> {
+    fn selection(&self) -> Option<Vec<super::model::SelectedFinancialIndex>> {
         let ManifestState::Ready(catalog) = &self.manifest else {
             return None;
         };
@@ -481,7 +504,7 @@ impl IndicesSelector {
                     div()
                         .text_sm()
                         .text_color(cx.theme().roles.fg.default.hsla)
-                        .child(t!(cx, "widget.indices.selector.loading")),
+                        .child(t!(cx, "widget.financial_indices.selector.loading")),
                 )
                 .into_any_element(),
             ManifestState::Failed(detail) => self.load_failure(detail.clone(), cx),
@@ -496,7 +519,7 @@ impl IndicesSelector {
                 )
             }
             ManifestState::Ready(_) if self.visible.is_empty() => centered_message(
-                t!(cx, "widget.indices.selector.empty"),
+                t!(cx, "widget.financial_indices.selector.empty"),
                 cx.theme().roles.fg.muted.hsla,
                 "TEST_INDICES_SELECTOR_EMPTY",
             ),
@@ -521,7 +544,7 @@ impl IndicesSelector {
                 div()
                     .text_sm()
                     .text_color(theme.roles.status.danger.base.hsla)
-                    .child(t!(cx, "widget.indices.selector.load_failed")),
+                    .child(t!(cx, "widget.financial_indices.selector.load_failed")),
             )
             .child(
                 div()
@@ -617,7 +640,7 @@ impl IndicesSelector {
                 .text_color(cx.theme().roles.fg.muted.hsla)
                 .child(t!(
                     cx,
-                    "widget.indices.selector.selection_count",
+                    "widget.financial_indices.selector.selection_count",
                     current = current,
                     limit = limit
                 ))
@@ -713,7 +736,7 @@ impl IndicesSelector {
     }
 }
 
-impl Render for IndicesSelector {
+impl Render for FinancialIndicesSelector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.adopt_language(cx);
         // A category is chosen from the tree's own selection, which is reported to this view
@@ -781,7 +804,7 @@ impl Render for IndicesSelector {
 ///
 /// The hard limit is what a set can hold, so what fits in one is a count: a selection the
 /// selector will accept is a selection whose length is the number drawn beside it.
-fn selection_count(selected: &HashSet<IndexTopic>) -> u32 {
+fn selection_count(selected: &HashSet<FinancialIndexTopic>) -> u32 {
     u32::try_from(selected.len()).unwrap_or(u32::MAX)
 }
 
@@ -790,10 +813,10 @@ fn selection_count(selected: &HashSet<IndexTopic>) -> u32 {
 /// Removing is always allowed and adding is refused past the hard limit rather than
 /// silently dropped: a user who cannot check another box is owed the reason.
 fn update_selection(
-    selected: &mut HashSet<IndexTopic>,
-    topic: &IndexTopic,
+    selected: &mut HashSet<FinancialIndexTopic>,
+    topic: &FinancialIndexTopic,
     checked: bool,
-) -> Result<bool, IndicesDataError> {
+) -> Result<bool, FinancialIndicesDataError> {
     if !checked {
         return Ok(selected.remove(topic));
     }
@@ -801,7 +824,7 @@ fn update_selection(
         return Ok(false);
     }
     if selected.len() >= MAX_SELECTED_INDICES {
-        return Err(IndicesDataError::SelectionCapacity {
+        return Err(FinancialIndicesDataError::SelectionCapacity {
             limit: MAX_SELECTED_INDICES,
         });
     }
@@ -813,7 +836,7 @@ fn update_selection(
 /// A row is named after the category's code, which is what the catalogue calls it and
 /// what the selector reads back when the tree reports a row: a row is not a position, so
 /// it keeps meaning the same category when the catalogue is listed again.
-fn category_rows(catalog: &IndexCatalog, cx: &App) -> Vec<TreeItem> {
+fn category_rows(catalog: &FinancialIndexCatalog, cx: &App) -> Vec<TreeItem> {
     let language = *cx.global::<LanguageCode>();
 
     catalog
@@ -831,7 +854,7 @@ fn category_rows(catalog: &IndexCatalog, cx: &App) -> Vec<TreeItem> {
 /// The element id of one row's checkbox.
 fn row_id(code: &str) -> ElementId {
     (
-        ElementId::Name(SharedString::new_static("IndicesSelectorRow")),
+        ElementId::Name(SharedString::new_static("FinancialIndicesSelectorRow")),
         code,
     )
         .into()
@@ -849,8 +872,8 @@ fn row_id(code: &str) -> ElementId {
 /// the ghost variant draws as a tint over the row rather than as a button that stands out of
 /// the list.
 fn index_row(
-    descriptor: &IndexDescriptor,
-    selector: &WeakEntity<IndicesSelector>,
+    descriptor: &FinancialIndexDescriptor,
+    selector: &WeakEntity<FinancialIndicesSelector>,
     cx: &App,
 ) -> AnyElement {
     let topic = descriptor.index.topic.clone();
@@ -926,20 +949,20 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::SelectedIndex,
+        model::SelectedFinancialIndex,
         test_support::{FakeSource, selected, settle_until},
     };
 
     /// What a confirmation carried, as the pane would see it.
-    type Confirmed = Rc<RefCell<Option<Vec<SelectedIndex>>>>;
+    type Confirmed = Rc<RefCell<Option<Vec<SelectedFinancialIndex>>>>;
 
     /// A selector opened over a fake session, with nothing signed in but the read
     /// itself.
     fn selector(
         cx: &mut TestAppContext,
         source: FakeSource,
-        current: &[SelectedIndex],
-    ) -> (Entity<IndicesSelector>, Confirmed) {
+        current: &[SelectedFinancialIndex],
+    ) -> (Entity<FinancialIndicesSelector>, Confirmed) {
         cx.executor().allow_parking();
         let confirmed: Confirmed = Rc::new(RefCell::new(None));
         let sink = confirmed.clone();
@@ -959,12 +982,15 @@ mod tests {
         let selector = window.update(|window, cx| {
             let filter = cx.new(|cx| {
                 InputStateBuilder::new(FILTER_INPUT_ID)
-                    .placeholder(t!(cx, "widget.indices.selector.filter_placeholder"))
+                    .placeholder(t!(
+                        cx,
+                        "widget.financial_indices.selector.filter_placeholder"
+                    ))
                     .build(window, cx)
             });
             cx.new(|cx| {
-                IndicesSelector::new(
-                    IndicesService::new(source),
+                FinancialIndicesSelector::new(
+                    FinancialIndicesService::new(source),
                     &current,
                     filter,
                     Rc::new(move |selection, _, _| {
@@ -979,14 +1005,14 @@ mod tests {
     }
 
     /// Waits for the catalogue the selector asked for to arrive.
-    fn wait_for_manifest(cx: &mut TestAppContext, selector: &Entity<IndicesSelector>) {
+    fn wait_for_manifest(cx: &mut TestAppContext, selector: &Entity<FinancialIndicesSelector>) {
         settle_until(cx, "the catalogue to arrive", |cx| {
             !matches!(selector.read(cx).manifest, ManifestState::Loading)
         });
     }
 
     /// Confirms through the same path the button takes, short of dismissing the dialog.
-    fn confirm(cx: &mut TestAppContext, selector: &Entity<IndicesSelector>) {
+    fn confirm(cx: &mut TestAppContext, selector: &Entity<FinancialIndicesSelector>) {
         let window = cx.add_empty_window();
         window.update(|window, cx| {
             let confirmation = selector.update(cx, |this, _| {
@@ -1000,7 +1026,7 @@ mod tests {
         });
     }
 
-    fn visible_codes(selector: &Entity<IndicesSelector>, cx: &App) -> Vec<String> {
+    fn visible_codes(selector: &Entity<FinancialIndicesSelector>, cx: &App) -> Vec<String> {
         selector
             .read(cx)
             .visible
@@ -1011,7 +1037,10 @@ mod tests {
 
     /// The rows of the column as the tree draws them: what each row is named, and what it
     /// reads.
-    fn column(selector: &Entity<IndicesSelector>, cx: &TestAppContext) -> Vec<(String, String)> {
+    fn column(
+        selector: &Entity<FinancialIndicesSelector>,
+        cx: &TestAppContext,
+    ) -> Vec<(String, String)> {
         cx.read(|cx| {
             let categories = selector.read(cx).categories.clone();
             let tree = categories.read(cx);
@@ -1024,7 +1053,10 @@ mod tests {
     }
 
     /// The row of the column the tree has highlighted.
-    fn highlighted(selector: &Entity<IndicesSelector>, cx: &TestAppContext) -> Option<String> {
+    fn highlighted(
+        selector: &Entity<FinancialIndicesSelector>,
+        cx: &TestAppContext,
+    ) -> Option<String> {
         cx.read(|cx| {
             selector
                 .read(cx)
@@ -1070,7 +1102,7 @@ mod tests {
 
     /// A frame of its own for a selector, which the window layer would otherwise hold.
     struct SelectorHarness {
-        selector: Entity<IndicesSelector>,
+        selector: Entity<FinancialIndicesSelector>,
     }
 
     impl Render for SelectorHarness {
@@ -1082,13 +1114,16 @@ mod tests {
     /// The field the list is searched with, as the selector holds it.
     fn filter_field(
         cx: &mut TestAppContext,
-        selector: &Entity<IndicesSelector>,
+        selector: &Entity<FinancialIndicesSelector>,
     ) -> Entity<InputState> {
         cx.update(|cx| selector.read(cx).filter.clone())
     }
 
     /// The codes the list is holding, read where the frame that drew them is.
-    fn listed(window: &mut VisualTestContext, selector: &Entity<IndicesSelector>) -> Vec<String> {
+    fn listed(
+        window: &mut VisualTestContext,
+        selector: &Entity<FinancialIndicesSelector>,
+    ) -> Vec<String> {
         window.update(|_, cx| visible_codes(selector, cx))
     }
 
@@ -1315,11 +1350,11 @@ mod tests {
         let (selector, _) = selector(cx, source, &[selected("HSI")]);
         wait_for_manifest(cx, &selector);
 
-        let rendered = |selector: &Entity<IndicesSelector>, cx: &mut TestAppContext| {
+        let rendered = |selector: &Entity<FinancialIndicesSelector>, cx: &mut TestAppContext| {
             cx.update(|cx| {
                 t!(
                     cx,
-                    "widget.indices.selector.selection_count",
+                    "widget.financial_indices.selector.selection_count",
                     current = selection_count(&selector.read(cx).selected),
                     limit = selector.read(cx).limit.unwrap_or_default()
                 )
@@ -1356,19 +1391,19 @@ mod tests {
     fn adding_past_the_hard_limit_should_report_it_rather_than_drop_the_click() {
         let mut selected = HashSet::with_capacity(MAX_SELECTED_INDICES);
         for index in 0..MAX_SELECTED_INDICES {
-            let topic = IndexTopic::from_code(&format!("INDEX_{index}"))
+            let topic = FinancialIndexTopic::from_code(&format!("INDEX_{index}"))
                 .expect("a test index code should be valid");
             assert!(
                 update_selection(&mut selected, &topic, true)
                     .expect("the limit should be accepted")
             );
         }
-        let one_too_many =
-            IndexTopic::from_code("ONE_TOO_MANY").expect("a test index code should be valid");
+        let one_too_many = FinancialIndexTopic::from_code("ONE_TOO_MANY")
+            .expect("a test index code should be valid");
 
         assert_eq!(
             update_selection(&mut selected, &one_too_many, true),
-            Err(IndicesDataError::SelectionCapacity {
+            Err(FinancialIndicesDataError::SelectionCapacity {
                 limit: MAX_SELECTED_INDICES,
             })
         );
@@ -1379,11 +1414,12 @@ mod tests {
     fn removing_should_stay_possible_at_the_hard_limit() {
         let mut selected = (0..MAX_SELECTED_INDICES)
             .map(|index| {
-                IndexTopic::from_code(&format!("INDEX_{index}"))
+                FinancialIndexTopic::from_code(&format!("INDEX_{index}"))
                     .expect("a test index code should be valid")
             })
             .collect::<HashSet<_>>();
-        let first = IndexTopic::from_code("INDEX_0").expect("a test index code should be valid");
+        let first =
+            FinancialIndexTopic::from_code("INDEX_0").expect("a test index code should be valid");
 
         assert!(
             update_selection(&mut selected, &first, false)
@@ -1578,7 +1614,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_catalogue_with_no_categories_should_list_nothing(cx: &mut TestAppContext) {
         let source = FakeSource::default();
-        source.set_manifest(kytrix_proto::types::IndexManifest {
+        source.set_manifest(kytrix_proto::types::FinancialIndexManifest {
             categories: Vec::new(),
             indices: Vec::new(),
         });
@@ -1608,7 +1644,7 @@ mod tests {
 
     /// Opens the selector in the window's dialog layer, the way the pane's choose control
     /// does.
-    fn open_selector(window: &mut VisualTestContext, selector: &Entity<IndicesSelector>) {
+    fn open_selector(window: &mut VisualTestContext, selector: &Entity<FinancialIndicesSelector>) {
         window.update(|window, cx| window.dialog(cx, selector.clone()));
     }
 

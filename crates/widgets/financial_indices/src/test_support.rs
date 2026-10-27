@@ -15,15 +15,15 @@ use std::{
 
 use kytrix_proto::types as proto_types;
 use kytrix_service_provider::service::engine::{
-    ErrorCode, IndexEvent, IndexTopic, KytrixServiceError, KytrixSessionState,
+    ErrorCode, FinancialIndexEvent, FinancialIndexTopic, KytrixServiceError, KytrixSessionState,
 };
 use network::transport::{error::TransportError, subscription::SubscriptionStatus};
 use smol_str::{SmolStr, format_smolstr};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
-    model::{LocalizedIndexName, SelectedIndex},
-    service::{IndexEventSubscription, IndicesSource},
+    model::{LocalizedFinancialIndexName, SelectedFinancialIndex},
+    service::{FinancialIndexEventSubscription, FinancialIndicesSource},
 };
 
 /// The account every fixture scope belongs to.
@@ -57,22 +57,26 @@ fn runtime_handle(cx: &mut gpui_kit::App) -> tokio::runtime::Handle {
     widget_tokio_runtime::global::handle(cx).handle().clone()
 }
 
-pub(crate) fn topic(code: &str) -> IndexTopic {
-    IndexTopic::from_code(code).expect("a test index code should be valid")
+pub(crate) fn topic(code: &str) -> FinancialIndexTopic {
+    FinancialIndexTopic::from_code(code).expect("a test index code should be valid")
 }
 
-pub(crate) fn selected(code: &str) -> SelectedIndex {
-    SelectedIndex {
+pub(crate) fn selected(code: &str) -> SelectedFinancialIndex {
+    SelectedFinancialIndex {
         topic: topic(code),
-        name: LocalizedIndexName {
+        name: LocalizedFinancialIndexName {
             en: SmolStr::new(format_smolstr!("{code} English")),
             zh: SmolStr::new(format_smolstr!("{code} Chinese")),
         },
     }
 }
 
-pub(crate) fn event(topic: IndexTopic, latest: u32, timestamp: i64) -> IndexEvent {
-    IndexEvent {
+pub(crate) fn event(
+    topic: FinancialIndexTopic,
+    latest: u32,
+    timestamp: i64,
+) -> FinancialIndexEvent {
+    FinancialIndexEvent {
         topic,
         last_price: latest,
         open_price: 100,
@@ -89,7 +93,7 @@ pub(crate) fn session(limit: u32) -> KytrixSessionState {
         entitlement_revision: 1,
         plan_code: proto_types::PlanCode::Free,
         entitlements: BTreeMap::from([(
-            "indices".to_owned(),
+            "financial_indices".to_owned(),
             proto_types::EntitlementValue {
                 value: Some(proto_types::entitlement_value::Value::Limit(limit)),
             },
@@ -100,8 +104,8 @@ pub(crate) fn session(limit: u32) -> KytrixSessionState {
 }
 
 /// A manifest of two categories, each with one index.
-pub(crate) fn manifest() -> proto_types::IndexManifest {
-    proto_types::IndexManifest {
+pub(crate) fn manifest() -> proto_types::FinancialIndexManifest {
+    proto_types::FinancialIndexManifest {
         categories: vec![
             category("asia", "Asia", "亚洲"),
             category("america", "America", "美洲"),
@@ -113,15 +117,15 @@ pub(crate) fn manifest() -> proto_types::IndexManifest {
     }
 }
 
-fn category(code: &str, en: &str, zh: &str) -> proto_types::IndexCategory {
-    proto_types::IndexCategory {
+fn category(code: &str, en: &str, zh: &str) -> proto_types::FinancialIndexCategory {
+    proto_types::FinancialIndexCategory {
         code: code.to_owned(),
         name: Some(localized(en, zh)),
     }
 }
 
-fn index(code: &str, category: &str, en: &str, zh: &str) -> proto_types::IndexDefinition {
-    proto_types::IndexDefinition {
+fn index(code: &str, category: &str, en: &str, zh: &str) -> proto_types::FinancialIndexDefinition {
+    proto_types::FinancialIndexDefinition {
         code: code.to_owned(),
         category: category.to_owned(),
         name: Some(localized(en, zh)),
@@ -146,12 +150,12 @@ pub(crate) struct FakeSource {
 #[derive(Default)]
 struct FakeState {
     setups: VecDeque<FakeSetup>,
-    subscribed: Vec<Vec<IndexTopic>>,
-    manifest: proto_types::IndexManifest,
+    subscribed: Vec<Vec<FinancialIndexTopic>>,
+    manifest: proto_types::FinancialIndexManifest,
     manifest_calls: usize,
 }
 
-/// What the next `subscribe_indices` call finds.
+/// What the next `subscribe_financial_indices` call finds.
 enum FakeSetup {
     /// A live subscription, and the drop counter of the subscription it replaces —
     /// which the service is expected to have released already.
@@ -166,7 +170,7 @@ enum FakeSetup {
 /// It is named by the crate because it is the associated type the source's own
 /// seam publishes it as.
 pub(crate) struct FakeSubscription {
-    events: mpsc::Receiver<Result<IndexEvent, TransportError>>,
+    events: mpsc::Receiver<Result<FinancialIndexEvent, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
     drops: Arc<AtomicUsize>,
     /// Held when the venue is to take its time letting go of this subscription.
@@ -187,7 +191,7 @@ impl Drop for FakeSubscription {
 
 /// One live subscription, as a test drives it.
 pub(crate) struct FakeSubscriptionControl {
-    pub events: mpsc::Sender<Result<IndexEvent, TransportError>>,
+    pub events: mpsc::Sender<Result<FinancialIndexEvent, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
     /// How many times this subscription has been dropped, which is what a
     /// replacement has to have happened before.
@@ -317,7 +321,7 @@ impl FakeSource {
     /// index limit is refused.
     pub(crate) fn refuse_selection(&self) {
         self.refuse(KytrixServiceError::Server(
-            ErrorCode::IndexTopicLimitExceeded,
+            ErrorCode::FinancialIndexTopicLimitExceeded,
         ));
     }
 
@@ -340,7 +344,7 @@ impl FakeSource {
         block
     }
 
-    pub(crate) fn set_manifest(&self, manifest: proto_types::IndexManifest) {
+    pub(crate) fn set_manifest(&self, manifest: proto_types::FinancialIndexManifest) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -348,7 +352,7 @@ impl FakeSource {
     }
 
     /// The topics every subscription has been asked for, in order.
-    pub(crate) fn subscribed(&self) -> Vec<Vec<IndexTopic>> {
+    pub(crate) fn subscribed(&self) -> Vec<Vec<FinancialIndexTopic>> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -364,14 +368,16 @@ impl FakeSource {
     }
 }
 
-impl IndicesSource for FakeSource {
+impl FinancialIndicesSource for FakeSource {
     type Subscription = FakeSubscription;
 
     fn session_state(&self) -> watch::Receiver<Option<KytrixSessionState>> {
         self.session.subscribe()
     }
 
-    async fn fetch_manifest(&self) -> Result<proto_types::IndexManifest, KytrixServiceError> {
+    async fn fetch_manifest(
+        &self,
+    ) -> Result<proto_types::FinancialIndexManifest, KytrixServiceError> {
         let mut state = self
             .state
             .lock()
@@ -380,9 +386,9 @@ impl IndicesSource for FakeSource {
         Ok(state.manifest.clone())
     }
 
-    async fn subscribe_indices(
+    async fn subscribe_financial_indices(
         &self,
-        topics: Arc<[IndexTopic]>,
+        topics: Arc<[FinancialIndexTopic]>,
     ) -> Result<Self::Subscription, KytrixServiceError> {
         let setup = {
             let mut state = self
@@ -402,7 +408,7 @@ impl IndicesSource for FakeSource {
                 // is still live is the refusal a real session answers.
                 if previous.is_some_and(|drops| drops.load(Ordering::SeqCst) == 0) {
                     Err(KytrixServiceError::Server(
-                        ErrorCode::IndexTopicLimitExceeded,
+                        ErrorCode::FinancialIndexTopicLimitExceeded,
                     ))
                 } else {
                     Ok(subscription)
@@ -420,12 +426,12 @@ impl IndicesSource for FakeSource {
     }
 }
 
-impl IndexEventSubscription for FakeSubscription {
+impl FinancialIndexEventSubscription for FakeSubscription {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         self.status.subscribe()
     }
 
-    async fn recv(&mut self) -> Result<IndexEvent, TransportError> {
+    async fn recv(&mut self) -> Result<FinancialIndexEvent, TransportError> {
         self.events
             .recv()
             .await

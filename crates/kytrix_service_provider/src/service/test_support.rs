@@ -35,8 +35,8 @@ use crate::{
     account_profile::AccountProfile,
     auth::model::{SessionAvailability, SessionChange},
     service::engine::{
-        CryptocurrencyWalletMonitoringTransfer, ErrorCode, IndexTopic, KYTRIX_SERVICE_WS_URL,
-        ServiceSessionActor, ServiceTopic, SubscriberSink,
+        CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexTopic,
+        KYTRIX_SERVICE_WS_URL, ServiceSessionActor, ServiceTopic, SubscriberSink,
     },
 };
 
@@ -97,7 +97,7 @@ impl TestConfigManager {
             KytrixServiceCapability::Account,
             KytrixServiceCapability::CryptocurrencyEtf,
             KytrixServiceCapability::News,
-            KytrixServiceCapability::Indices,
+            KytrixServiceCapability::FinancialIndices,
             KytrixServiceCapability::X,
             KytrixServiceCapability::CryptocurrencyWalletMonitoring,
             KytrixServiceCapability::Ais,
@@ -156,12 +156,12 @@ pub(super) const UNKNOWN_SERVER_ONEOF_WIRE: &[u8] = &[0x2a, 0x00];
 
 pub(super) const TEST_ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
 
-pub(super) fn index_topic(code: &str) -> IndexTopic {
-    IndexTopic::from_code(code).expect("test index code should be valid")
+pub(super) fn financial_index_topic(code: &str) -> FinancialIndexTopic {
+    FinancialIndexTopic::from_code(code).expect("test index code should be valid")
 }
 
 pub(super) fn index_service_topic(code: &str) -> ServiceTopic {
-    ServiceTopic::Index(index_topic(code))
+    ServiceTopic::FinancialIndex(financial_index_topic(code))
 }
 
 pub(super) fn enabled_entitlement(enabled: bool) -> proto_types::EntitlementValue {
@@ -193,16 +193,16 @@ pub(super) fn feature_definition(
     }
 }
 
-pub(super) fn index_manifest() -> proto_types::IndexManifest {
-    proto_types::IndexManifest {
-        categories: vec![proto_types::IndexCategory {
+pub(super) fn financial_index_manifest() -> proto_types::FinancialIndexManifest {
+    proto_types::FinancialIndexManifest {
+        categories: vec![proto_types::FinancialIndexCategory {
             code: "americas".to_owned(),
             name: Some(proto_types::LocalizedName {
                 en: "Americas".to_owned(),
                 zh: "美洲".to_owned(),
             }),
         }],
-        indices: vec![proto_types::IndexDefinition {
+        indices: vec![proto_types::FinancialIndexDefinition {
             request_code: ".SPX".to_owned(),
             code: "SPX".to_owned(),
             category: "americas".to_owned(),
@@ -610,7 +610,10 @@ impl TestServiceServer {
                                             entitlements: HashMap::from([
                                                 ("news".to_owned(), enabled_entitlement(true)),
                                                 ("ais".to_owned(), enabled_entitlement(true)),
-                                                ("indices".to_owned(), limit_entitlement(3)),
+                                                (
+                                                    "financial_indices".to_owned(),
+                                                    limit_entitlement(3),
+                                                ),
                                                 (
                                                     "cryptocurrency_wallet_monitoring".to_owned(),
                                                     limit_entitlement(3),
@@ -626,7 +629,7 @@ impl TestServiceServer {
                                                     proto_types::FeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
-                                                    "indices",
+                                                    "financial_indices",
                                                     proto_types::FeatureValueType::Limit,
                                                 ),
                                                 feature_definition(
@@ -737,11 +740,11 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetIndexManifest(_) => (
+                                        ClientRequestKind::GetFinancialIndexManifest(_) => (
                                             ObservedRequest::Rpc("index_manifest"),
-                                            proto_response::response::Response::IndexManifest(
-                                                proto_response::IndexManifestResponse {
-                                                    manifest: Some(index_manifest()),
+                                            proto_response::response::Response::FinancialIndexManifest(
+                                                proto_response::FinancialIndexManifestResponse {
+                                                    manifest: Some(financial_index_manifest()),
                                                 },
                                             ),
                                             false,
@@ -1053,17 +1056,19 @@ impl TestServiceServer {
         }));
     }
 
-    pub(super) fn send_index(&self, code: &str) {
-        self.send_event(proto_event::event::Event::Index(proto_types::Index {
-            code: code.to_owned(),
-            last_price: 101,
-            open_price: 100,
-            high_price: 102,
-            low_price: 99,
-            close_price: 100,
-            is_trading: true,
-            timestamp: 1,
-        }));
+    pub(super) fn send_financial_index(&self, code: &str) {
+        self.send_event(proto_event::event::Event::FinancialIndex(
+            proto_types::FinancialIndex {
+                code: code.to_owned(),
+                last_price: 101,
+                open_price: 100,
+                high_price: 102,
+                low_price: 99,
+                close_price: 100,
+                is_trading: true,
+                timestamp: 1,
+            },
+        ));
     }
 
     pub(super) fn send_x_profile(&self) {

@@ -1,5 +1,5 @@
 [package]
-name = "indices"
+name = "financial_indices"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

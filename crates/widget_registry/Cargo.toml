@@ -20,7 +20,7 @@ financial_calendar = { workspace = true }
 force_orders = { workspace = true }
 hormuz_vessel_map = { workspace = true }
 hyperliquid_wallet_monitor = { workspace = true }
-indices = { workspace = true }
+financial_indices = { workspace = true }
 market_trades = { workspace = true }
 news = { workspace = true }
 order_book = { workspace = true }

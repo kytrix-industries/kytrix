@@ -18,7 +18,7 @@ use kytrix_proto::{
     client::{
         CryptocurrencyWalletMonitoringAddSelection, CryptocurrencyWalletMonitoringDeleteSelection,
         CryptocurrencyWalletMonitoringSelections, GetCmcFearGreedIndex, GetCryptocurrencyEtf,
-        GetFinancialCalendar, GetIndexManifest, GetPentagonPizzaIndex, XAddSelection,
+        GetFinancialCalendar, GetFinancialIndexManifest, GetPentagonPizzaIndex, XAddSelection,
         XDeleteSelection, XSearch, XSelections, XTweets, request::Request as ClientRequestKind,
     },
     server::{self as proto_response, response::Response as ServerResponseKind},
@@ -71,7 +71,7 @@ use crate::{
     service::{
         engine::{
             COMMAND_CAPACITY, CancelOnDrop, Command, CryptocurrencyWalletMonitoringTransfer,
-            IndexEvent, IndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
+            FinancialIndexEvent, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
             KytrixServiceConnectorInner, KytrixServiceError, KytrixSessionState, NewsEvent,
             OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT, SUBSCRIBER_CAPACITY,
             ServiceSessionContext, ServiceTopic, SessionStateRegistry, SubscriberSink,
@@ -805,19 +805,19 @@ impl KytrixServiceConnector {
         Ok(subscription)
     }
 
-    pub async fn subscribe_indices(
+    pub async fn subscribe_financial_indices(
         &self,
-        topics: &[IndexTopic],
-    ) -> Result<Subscription<IndexEvent>, KytrixServiceError> {
+        topics: &[FinancialIndexTopic],
+    ) -> Result<Subscription<FinancialIndexEvent>, KytrixServiceError> {
         let topics = topics
             .iter()
             .cloned()
-            .map(ServiceTopic::Index)
+            .map(ServiceTopic::FinancialIndex)
             .collect::<Vec<_>>();
         let (publisher, subscription) =
             subscription_channel_with_wake(SUBSCRIBER_CAPACITY, self.inner().wake.clone())
                 .map_err(subscription_setup_error)?;
-        self.subscribe_topics(&topics, SubscriberSink::Indices(publisher))
+        self.subscribe_topics(&topics, SubscriberSink::FinancialIndices(publisher))
             .await?;
         Ok(subscription)
     }
@@ -1133,18 +1133,18 @@ impl KytrixServiceConnector {
     }
 
     /// Fetches the current index manifest over WebSocket RPC.
-    pub async fn fetch_index_manifest(
+    pub async fn fetch_financial_index_manifest(
         &self,
-    ) -> Result<proto_types::IndexManifest, KytrixServiceError> {
+    ) -> Result<proto_types::FinancialIndexManifest, KytrixServiceError> {
         let response = self
             .call_rpc(
                 None,
-                KytrixServiceCapability::Indices,
-                ClientRequestKind::GetIndexManifest(GetIndexManifest {}),
+                KytrixServiceCapability::FinancialIndices,
+                ClientRequestKind::GetFinancialIndexManifest(GetFinancialIndexManifest {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::IndexManifest(response) = response else {
+        let proto_response::response::Response::FinancialIndexManifest(response) = response else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected index manifest RPC response".into(),
             ));
@@ -1253,8 +1253,8 @@ mod tests {
             ObservedRequest::Rpc("cryptocurrency_etf")
         );
         assert_eq!(
-            connector.fetch_index_manifest().await.unwrap(),
-            index_manifest()
+            connector.fetch_financial_index_manifest().await.unwrap(),
+            financial_index_manifest()
         );
         assert_eq!(
             server.next_request().await.1,
@@ -1665,7 +1665,7 @@ mod tests {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
-        let index = index_topic("SPX");
+        let index = financial_index_topic("SPX");
 
         let mut news = connector
             .subscribe_news()
@@ -1679,7 +1679,7 @@ mod tests {
             )
         );
         let mut indices = connector
-            .subscribe_indices(std::slice::from_ref(&index))
+            .subscribe_financial_indices(std::slice::from_ref(&index))
             .await
             .expect("indices should subscribe");
         assert_eq!(
@@ -1688,7 +1688,7 @@ mod tests {
                 1,
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
-                    ServiceTopic::Index(index.clone()),
+                    ServiceTopic::FinancialIndex(index.clone()),
                 ])
             )
         );
@@ -1703,7 +1703,7 @@ mod tests {
                 1,
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
-                    ServiceTopic::Index(index.clone()),
+                    ServiceTopic::FinancialIndex(index.clone()),
                     ServiceTopic::X,
                 ])
             )
@@ -1718,7 +1718,7 @@ mod tests {
                 1,
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
-                    ServiceTopic::Index(index),
+                    ServiceTopic::FinancialIndex(index),
                     ServiceTopic::X,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
                 ])
@@ -1734,7 +1734,7 @@ mod tests {
                 1,
                 ObservedRequest::SetSubscriptions(vec![
                     ServiceTopic::News,
-                    ServiceTopic::Index(index_topic("SPX")),
+                    ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
                     ServiceTopic::X,
                     ServiceTopic::CryptocurrencyWalletMonitoring,
                     ServiceTopic::Ais(AisArea::Hormuz),
@@ -1744,7 +1744,7 @@ mod tests {
         assert_eq!(server.connection_count.load(Ordering::Acquire), 1);
 
         server.send_news("typed-news");
-        server.send_index("SPX");
+        server.send_financial_index("SPX");
         server.send_x_profile();
         server.send_cryptocurrency_wallet_monitoring_transfer(
             "typed-cryptocurrency_wallet_monitoring",
@@ -1765,7 +1765,7 @@ mod tests {
                 .expect("index event should arrive")
                 .expect("index subscription should remain active")
                 .topic,
-            index_topic("SPX")
+            financial_index_topic("SPX")
         );
         let x_event = timeout(Duration::from_secs(2), x.recv())
             .await
@@ -1914,7 +1914,10 @@ mod tests {
         );
 
         let indices = connector
-            .subscribe_indices(&[index_topic("SPX"), index_topic("DJI")])
+            .subscribe_financial_indices(&[
+                financial_index_topic("SPX"),
+                financial_index_topic("DJI"),
+            ])
             .await
             .expect("index batch should subscribe");
         assert_eq!(
@@ -1931,7 +1934,11 @@ mod tests {
             (1, ObservedRequest::SetSubscriptions(news.clone()))
         );
         let indices = connector
-            .subscribe_indices(&[index_topic("RUT"), index_topic("DJI"), index_topic("NDX")])
+            .subscribe_financial_indices(&[
+                financial_index_topic("RUT"),
+                financial_index_topic("DJI"),
+                financial_index_topic("NDX"),
+            ])
             .await
             .expect("replacement index selection should subscribe");
         assert_eq!(
@@ -2065,10 +2072,10 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![ServiceTopic::News])
             )
         );
-        let index = index_topic("SPX");
-        let index_service = ServiceTopic::Index(index.clone());
+        let index = financial_index_topic("SPX");
+        let index_service = ServiceTopic::FinancialIndex(index.clone());
         let mut indices = connector
-            .subscribe_indices(std::slice::from_ref(&index))
+            .subscribe_financial_indices(std::slice::from_ref(&index))
             .await
             .expect("indices should share the direct session");
         assert_eq!(
@@ -2113,7 +2120,7 @@ mod tests {
             network::transport::subscription::SubscriptionStatus::Active
         );
         assert_eq!(server.connection_count.load(Ordering::Acquire), 1);
-        server.send_index("SPX");
+        server.send_financial_index("SPX");
         assert_eq!(
             timeout(Duration::from_secs(2), indices.recv())
                 .await
@@ -2122,7 +2129,7 @@ mod tests {
                 .topic,
             index
         );
-        // The Index event is the FIFO barrier for the stale News frame: both
+        // The FinancialIndex event is the FIFO barrier for the stale News frame: both
         // travel over the same socket and the retired frame was sent first, so
         // the actor has already processed it. `recv` cannot prove that (after a
         // terminal status it answers `Closed` immediately, whatever was
@@ -2374,11 +2381,11 @@ mod tests {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
-        let index = index_topic("SPX");
-        let service_topic = ServiceTopic::Index(index.clone());
+        let index = financial_index_topic("SPX");
+        let service_topic = ServiceTopic::FinancialIndex(index.clone());
 
         let mut first = connector
-            .subscribe_indices(std::slice::from_ref(&index))
+            .subscribe_financial_indices(std::slice::from_ref(&index))
             .await
             .expect("first index subscriber should register");
         assert_eq!(
@@ -2388,7 +2395,7 @@ mod tests {
                 ObservedRequest::SetSubscriptions(vec![service_topic.clone()])
             )
         );
-        server.send_index("SPX");
+        server.send_financial_index("SPX");
         let cached = timeout(Duration::from_secs(2), first.recv())
             .await
             .expect("first index event should arrive")
@@ -2397,7 +2404,7 @@ mod tests {
         assert_eq!(cached.last_price, 101);
 
         let mut second = connector
-            .subscribe_indices(std::slice::from_ref(&index))
+            .subscribe_financial_indices(std::slice::from_ref(&index))
             .await
             .expect("second index subscriber should share the topic");
         assert_eq!(
@@ -2423,7 +2430,7 @@ mod tests {
         assert_eq!(server.connection_count.load(Ordering::Acquire), 1);
 
         let mut fresh = connector
-            .subscribe_indices(std::slice::from_ref(&index))
+            .subscribe_financial_indices(std::slice::from_ref(&index))
             .await
             .expect("fresh index subscriber should register");
         assert_eq!(
@@ -2439,7 +2446,7 @@ mod tests {
                 .is_err(),
             "a topic with zero references must not retain its old cached value"
         );
-        server.send_index("SPX");
+        server.send_financial_index("SPX");
         assert_eq!(
             timeout(Duration::from_secs(2), fresh.recv())
                 .await

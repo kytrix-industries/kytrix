@@ -2854,6 +2854,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "financial_indices"
+version = "0.0.2"
+dependencies = [
+ "ahash",
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_proto",
+ "kytrix_service_provider",
+ "log",
+ "network",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror 2.0.20",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4690,29 +4713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indices"
-version = "0.0.2"
-dependencies = [
- "ahash",
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_proto",
- "kytrix_service_provider",
- "log",
- "network",
- "serde",
- "serde_json",
- "smol_str",
- "thiserror 2.0.20",
- "tokio",
- "widget",
- "widget_tokio_runtime",
-]
-
-[[package]]
 name = "inotify"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=ab381c298b342d7d654d6e8e373324984ad3107a#ab381c298b342d7d654d6e8e373324984ad3107a"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=c6cdf5f4454d5871b56675387ad8b7adadea3ee0#c6cdf5f4454d5871b56675387ad8b7adadea3ee0"
 dependencies = [
  "bytes",
  "prost",
@@ -10877,12 +10877,12 @@ dependencies = [
  "empty",
  "etf",
  "financial_calendar",
+ "financial_indices",
  "force_orders",
  "gpui-kit",
  "hormuz_vessel_map",
  "hyperliquid_wallet_monitor",
  "i18n",
- "indices",
  "market_trades",
  "news",
  "order_book",

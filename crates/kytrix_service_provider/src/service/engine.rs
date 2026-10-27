@@ -218,9 +218,9 @@ pub enum NewsKind {
 /// A validated index code exposed by the Kytrix service.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub struct IndexTopic(SmolStr);
+pub struct FinancialIndexTopic(SmolStr);
 
-impl IndexTopic {
+impl FinancialIndexTopic {
     /// Returns the wire/API code for this topic.
     pub fn code(&self) -> &str {
         &self.0
@@ -233,7 +233,7 @@ impl IndexTopic {
     }
 }
 
-impl<'de> Deserialize<'de> for IndexTopic {
+impl<'de> Deserialize<'de> for FinancialIndexTopic {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -247,7 +247,7 @@ impl<'de> Deserialize<'de> for IndexTopic {
     }
 }
 
-impl fmt::Display for IndexTopic {
+impl fmt::Display for FinancialIndexTopic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.code())
     }
@@ -257,7 +257,7 @@ impl fmt::Display for IndexTopic {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ServiceTopic {
     News,
-    Index(IndexTopic),
+    FinancialIndex(FinancialIndexTopic),
     X,
     CryptocurrencyWalletMonitoring,
     Ais(AisArea),
@@ -274,8 +274,8 @@ pub struct NewsEvent {
 
 /// An index event received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IndexEvent {
-    pub topic: IndexTopic,
+pub struct FinancialIndexEvent {
+    pub topic: FinancialIndexTopic,
     pub last_price: u32,
     pub open_price: u32,
     pub high_price: u32,
@@ -364,7 +364,7 @@ pub struct CryptocurrencyWalletMonitoringTransfer {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum KytrixServiceEvent {
     News(NewsEvent),
-    Index(IndexEvent),
+    FinancialIndex(FinancialIndexEvent),
     XProfile(XProfileEvent),
     Tweet(TweetEvent),
     CryptocurrencyWalletMonitoringTransfer(CryptocurrencyWalletMonitoringTransfer),
@@ -374,7 +374,7 @@ pub(super) enum KytrixServiceEvent {
 
 pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
-    Indices(SubscriptionPublisher<IndexEvent>),
+    FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
     X(SubscriptionPublisher<XSubscriptionEvent>),
     CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitoringTransfer>),
     Ais(SubscriptionPublisher<AisUpdate>),
@@ -384,7 +384,7 @@ impl SubscriberSink {
     pub(super) const fn capability(&self) -> KytrixServiceCapability {
         match self {
             Self::News(_) => KytrixServiceCapability::News,
-            Self::Indices(_) => KytrixServiceCapability::Indices,
+            Self::FinancialIndices(_) => KytrixServiceCapability::FinancialIndices,
             Self::X(_) => KytrixServiceCapability::X,
             Self::CryptocurrencyWalletMonitoring(_) => {
                 KytrixServiceCapability::CryptocurrencyWalletMonitoring
@@ -396,7 +396,7 @@ impl SubscriberSink {
     pub(super) fn activate(&self) {
         match self {
             Self::News(publisher) => publisher.activate(),
-            Self::Indices(publisher) => publisher.activate(),
+            Self::FinancialIndices(publisher) => publisher.activate(),
             Self::X(publisher) => publisher.activate(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
             Self::Ais(publisher) => publisher.activate(),
@@ -406,7 +406,7 @@ impl SubscriberSink {
     pub(super) fn reconnecting(&self) {
         match self {
             Self::News(publisher) => publisher.reconnecting(),
-            Self::Indices(publisher) => publisher.reconnecting(),
+            Self::FinancialIndices(publisher) => publisher.reconnecting(),
             Self::X(publisher) => publisher.reconnecting(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
             Self::Ais(publisher) => publisher.reconnecting(),
@@ -416,7 +416,7 @@ impl SubscriberSink {
     pub(super) fn fail(&self, error: TransportError) {
         match self {
             Self::News(publisher) => publisher.fail(error),
-            Self::Indices(publisher) => publisher.fail(error),
+            Self::FinancialIndices(publisher) => publisher.fail(error),
             Self::X(publisher) => publisher.fail(error),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
             Self::Ais(publisher) => publisher.fail(error),
@@ -426,7 +426,7 @@ impl SubscriberSink {
     pub(super) fn finish(&self) {
         match self {
             Self::News(publisher) => publisher.finish(),
-            Self::Indices(publisher) => publisher.finish(),
+            Self::FinancialIndices(publisher) => publisher.finish(),
             Self::X(publisher) => publisher.finish(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
             Self::Ais(publisher) => publisher.finish(),
@@ -436,7 +436,7 @@ impl SubscriberSink {
     pub(super) fn is_cancelled(&self) -> bool {
         match self {
             Self::News(publisher) => publisher.is_cancelled(),
-            Self::Indices(publisher) => publisher.is_cancelled(),
+            Self::FinancialIndices(publisher) => publisher.is_cancelled(),
             Self::X(publisher) => publisher.is_cancelled(),
             Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
             Self::Ais(publisher) => publisher.is_cancelled(),
@@ -448,9 +448,11 @@ impl SubscriberSink {
             (Self::News(publisher), KytrixServiceEvent::News(event)) => publisher
                 .try_send(event.clone())
                 .map_err(subscription_send_error),
-            (Self::Indices(publisher), KytrixServiceEvent::Index(event)) => publisher
-                .try_send(event.clone())
-                .map_err(subscription_send_error),
+            (Self::FinancialIndices(publisher), KytrixServiceEvent::FinancialIndex(event)) => {
+                publisher
+                    .try_send(event.clone())
+                    .map_err(subscription_send_error)
+            }
             (Self::X(publisher), KytrixServiceEvent::XProfile(profile)) => publisher
                 .try_send(XSubscriptionEvent::Profile(profile.clone()))
                 .map_err(subscription_send_error),
@@ -582,7 +584,7 @@ pub(super) const fn server_error_name(code: ErrorCode) -> &'static str {
         ErrorCode::Unspecified => "UNSPECIFIED",
         ErrorCode::RateLimit => "RATE_LIMIT",
         ErrorCode::EntitlementRequired => "ENTITLEMENT_REQUIRED",
-        ErrorCode::IndexTopicLimitExceeded => "INDEX_TOPIC_LIMIT_EXCEEDED",
+        ErrorCode::FinancialIndexTopicLimitExceeded => "INDEX_TOPIC_LIMIT_EXCEEDED",
         ErrorCode::InvalidTopic => "INVALID_TOPIC",
         ErrorCode::AuthenticationUnavailable => "AUTHENTICATION_UNAVAILABLE",
         ErrorCode::InvalidRequest => "INVALID_REQUEST",
@@ -884,7 +886,7 @@ pub(super) struct ServiceSessionActor {
     pub subscription_route_change_reuses_socket: bool,
     pub subscribers: AHashMap<u64, LocalSubscriber>,
     pub topics: AHashMap<ServiceTopic, AHashSet<u64>>,
-    pub latest_indices: AHashMap<IndexTopic, IndexEvent>,
+    pub latest_financial_indices: AHashMap<FinancialIndexTopic, FinancialIndexEvent>,
     /// The last keyframe a session delivered for each AIS area.
     ///
     /// A later local subscriber of an area the session is already subscribed to would

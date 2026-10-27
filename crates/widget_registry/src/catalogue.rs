@@ -36,7 +36,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<
             hyperliquid_wallet_monitor::view::HyperliquidWalletMonitorWidget,
         >(),
-        WidgetRegistration::for_view::<indices::view::IndicesWidget>(),
+        WidgetRegistration::for_view::<financial_indices::view::FinancialIndicesWidget>(),
         WidgetRegistration::for_view::<market_trades::view::MarketTradesWidget>(),
         WidgetRegistration::for_view::<news::view::NewsWidget>(),
         WidgetRegistration::for_view::<order_book::view::OrderBookWidget>(),
@@ -81,7 +81,7 @@ mod tests {
     const FORCE_ORDERS_ID: &str = "kytrix.market.force_orders";
     const HYPERLIQUID_WALLET_MONITOR_ID: &str = "kytrix.market.hyperliquid_wallet_monitor";
     const HORMUZ_VESSEL_MAP_ID: &str = "kytrix.maritime.hormuz_vessel_map";
-    const INDICES_ID: &str = "kytrix.market.indices";
+    const FINANCIAL_INDICES_ID: &str = "kytrix.market.financial_indices";
     const MARKET_TRADES_ID: &str = "kytrix.market.market_trades";
     const NEWS_ID: &str = "kytrix.market.news";
     const ORDER_BOOK_ID: &str = "kytrix.market.order_book";
@@ -112,7 +112,7 @@ mod tests {
         (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
         (HORMUZ_VESSEL_MAP_ID, WidgetCategory::Monitoring),
         (HYPERLIQUID_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
-        (INDICES_ID, WidgetCategory::Market),
+        (FINANCIAL_INDICES_ID, WidgetCategory::Market),
         (MARKET_TRADES_ID, WidgetCategory::Market),
         (NEWS_ID, WidgetCategory::Monitoring),
         (ORDER_BOOK_ID, WidgetCategory::Market),
@@ -146,7 +146,7 @@ mod tests {
             assert!(registry.get(FORCE_ORDERS_ID).is_some());
             assert!(registry.get(HORMUZ_VESSEL_MAP_ID).is_some());
             assert!(registry.get(HYPERLIQUID_WALLET_MONITOR_ID).is_some());
-            assert!(registry.get(INDICES_ID).is_some());
+            assert!(registry.get(FINANCIAL_INDICES_ID).is_some());
             assert!(registry.get(MARKET_TRADES_ID).is_some());
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());

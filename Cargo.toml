@@ -24,10 +24,10 @@ members = [
     "crates/widgets/empty",
     "crates/widgets/etf",
     "crates/widgets/financial_calendar",
+    "crates/widgets/financial_indices",
     "crates/widgets/force_orders",
     "crates/widgets/hormuz_vessel_map",
     "crates/widgets/hyperliquid_wallet_monitor",
-    "crates/widgets/indices",
     "crates/widgets/market_trades",
     "crates/widgets/news",
     "crates/widgets/order_book",
@@ -84,7 +84,7 @@ image = { version = "0.25.10", default-features = false, features = [
 jiff = "0.2.38"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
-kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "ab381c298b342d7d654d6e8e373324984ad3107a" }
+kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "c6cdf5f4454d5871b56675387ad8b7adadea3ee0" }
 log = "0.4.34"
 longbridge-proto = "5.2.0"
 nucleo = "0.5.0"
@@ -129,11 +129,11 @@ crypto_fgi = { path = "crates/widgets/crypto_fgi" }
 empty = { path = "crates/widgets/empty" }
 etf = { path = "crates/widgets/etf" }
 financial_calendar = { path = "crates/widgets/financial_calendar" }
+financial_indices = { path = "crates/widgets/financial_indices" }
 force_orders = { path = "crates/widgets/force_orders" }
 hormuz_vessel_map = { path = "crates/widgets/hormuz_vessel_map" }
 hyperliquid_wallet_monitor = { path = "crates/widgets/hyperliquid_wallet_monitor" }
 i18n = { path = "crates/i18n" }
-indices = { path = "crates/widgets/indices" }
 instrument_selector_ui = { path = "crates/instrument_selector_ui" }
 kytrix_service_provider = { path = "crates/kytrix_service_provider" }
 market_participants_connector = { path = "crates/market_participants_connector" }

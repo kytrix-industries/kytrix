@@ -22,10 +22,11 @@ use crate::service::{
     ais::{AisArea, AisUpdate},
     cryptocurrency_wallet_monitoring,
     engine::{
-        CryptocurrencyWalletMonitoringTransfer, ErrorCode, HEARTBEAT_MAX_SECONDS,
-        HEARTBEAT_MIN_SECONDS, IncomingMessage, IndexEvent, IndexTopic, KytrixServiceError,
-        KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind, ServiceTopic, TweetEvent,
-        TweetMedia, TweetReference, TweetTextSegment, WRITE_TIMEOUT, XProfileEvent,
+        CryptocurrencyWalletMonitoringTransfer, ErrorCode, FinancialIndexEvent,
+        FinancialIndexTopic, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage,
+        KytrixServiceError, KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind,
+        ServiceTopic, TweetEvent, TweetMedia, TweetReference, TweetTextSegment, WRITE_TIMEOUT,
+        XProfileEvent,
     },
 };
 
@@ -113,14 +114,14 @@ pub(super) fn decode_event(
                 }),
             )))
         }
-        proto_event::event::Event::Index(index) => {
-            let Some(topic) = IndexTopic::from_code(&index.code) else {
+        proto_event::event::Event::FinancialIndex(index) => {
+            let Some(topic) = FinancialIndexTopic::from_code(&index.code) else {
                 return Ok(None);
             };
-            let service_topic = ServiceTopic::Index(topic.clone());
+            let service_topic = ServiceTopic::FinancialIndex(topic.clone());
             Ok(Some((
                 service_topic,
-                KytrixServiceEvent::Index(IndexEvent {
+                KytrixServiceEvent::FinancialIndex(FinancialIndexEvent {
                     topic,
                     last_price: index.last_price,
                     open_price: index.open_price,
@@ -545,8 +546,8 @@ impl From<&ServiceTopic> for proto_topic::Topic {
     fn from(topic: &ServiceTopic) -> Self {
         let topic = match topic {
             ServiceTopic::News => proto_topic::topic::Topic::News(proto_topic::NewsTopic {}),
-            ServiceTopic::Index(topic) => {
-                proto_topic::topic::Topic::Index(proto_topic::IndexTopic {
+            ServiceTopic::FinancialIndex(topic) => {
+                proto_topic::topic::Topic::FinancialIndex(proto_topic::FinancialIndexTopic {
                     code: topic.code().into(),
                 })
             }
@@ -573,9 +574,11 @@ impl TryFrom<&proto_topic::Topic> for ServiceTopic {
         };
         match topic {
             proto_topic::topic::Topic::News(_) => Ok(ServiceTopic::News),
-            proto_topic::topic::Topic::Index(value) => IndexTopic::from_code(&value.code)
-                .map(ServiceTopic::Index)
-                .ok_or_else(|| "index topic is invalid".into()),
+            proto_topic::topic::Topic::FinancialIndex(value) => {
+                FinancialIndexTopic::from_code(&value.code)
+                    .map(ServiceTopic::FinancialIndex)
+                    .ok_or_else(|| "index topic is invalid".into())
+            }
             proto_topic::topic::Topic::X(_) => Ok(ServiceTopic::X),
             proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
                 Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
@@ -641,13 +644,13 @@ mod tests {
     #[test]
     fn literal_index_event_wire_should_preserve_schema_tags() {
         let IncomingMessage::Event(Some((
-            ServiceTopic::Index(topic),
-            KytrixServiceEvent::Index(index),
+            ServiceTopic::FinancialIndex(topic),
+            KytrixServiceEvent::FinancialIndex(index),
         ))) = decode_binary(INDEX_EVENT_WIRE).expect("literal Index event should decode")
         else {
             panic!("literal frame should contain an Index event");
         };
-        assert_eq!(topic, index_topic("SPX"));
+        assert_eq!(topic, financial_index_topic("SPX"));
         assert_eq!(index.topic, topic);
         assert_eq!(
             (
@@ -735,10 +738,12 @@ mod tests {
         for code in ["", " INVALID", "INVALID "] {
             let message = ServerMessage {
                 message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(proto_event::event::Event::Index(proto_types::Index {
-                        code: code.to_owned(),
-                        ..Default::default()
-                    })),
+                    event: Some(proto_event::event::Event::FinancialIndex(
+                        proto_types::FinancialIndex {
+                            code: code.to_owned(),
+                            ..Default::default()
+                        },
+                    )),
                 })),
             };
             let decoded = decode_binary(&message.encode_to_vec()).expect("event should decode");
@@ -753,9 +758,11 @@ mod tests {
             response: Some(proto_response::response::Response::SetSubscriptions(
                 proto_response::SetSubscriptionsResponse {
                     topics: vec![proto_topic::Topic {
-                        topic: Some(proto_topic::topic::Topic::Index(proto_topic::IndexTopic {
-                            code: String::new(),
-                        })),
+                        topic: Some(proto_topic::topic::Topic::FinancialIndex(
+                            proto_topic::FinancialIndexTopic {
+                                code: String::new(),
+                            },
+                        )),
                     }],
                 },
             )),
@@ -1089,7 +1096,7 @@ mod tests {
                     plan_code: proto_types::PlanCode::Plus as i32,
                     entitlements: std::collections::HashMap::from([
                         ("news".to_owned(), enabled_entitlement(true)),
-                        ("indices".to_owned(), limit_entitlement(3)),
+                        ("financial_indices".to_owned(), limit_entitlement(3)),
                     ]),
                     catalog: vec![catalog.clone()],
                     next_change_at: Some(1_800_000_000),
@@ -1106,7 +1113,7 @@ mod tests {
         assert_eq!(
             state.entitlements,
             BTreeMap::from([
-                ("indices".to_owned(), limit_entitlement(3)),
+                ("financial_indices".to_owned(), limit_entitlement(3)),
                 ("news".to_owned(), enabled_entitlement(true)),
             ])
         );
@@ -1180,20 +1187,23 @@ mod tests {
     fn index_event_should_decode_all_wire_prices() {
         let message = ServerMessage {
             message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::Index(proto_types::Index {
-                    code: "REMOTE_ONLY_INDEX".to_owned(),
-                    last_price: 101,
-                    open_price: 77,
-                    high_price: 202,
-                    low_price: 33,
-                    close_price: 88,
-                    is_trading: false,
-                    timestamp: 1_234,
-                })),
+                event: Some(proto_event::event::Event::FinancialIndex(
+                    proto_types::FinancialIndex {
+                        code: "REMOTE_ONLY_INDEX".to_owned(),
+                        last_price: 101,
+                        open_price: 77,
+                        high_price: 202,
+                        low_price: 33,
+                        close_price: 88,
+                        is_trading: false,
+                        timestamp: 1_234,
+                    },
+                )),
             })),
         };
         let decoded = decode_binary(&message.encode_to_vec()).expect("index should decode");
-        let IncomingMessage::Event(Some((topic, KytrixServiceEvent::Index(index)))) = decoded
+        let IncomingMessage::Event(Some((topic, KytrixServiceEvent::FinancialIndex(index)))) =
+            decoded
         else {
             panic!("expected an index event");
         };

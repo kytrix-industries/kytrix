@@ -167,7 +167,7 @@ error:
     listing_route_mismatch: Listing %{listing} does not belong to route %{route}
     protocol: The account protocol returned an invalid response while performing %{operation}
     unknown_asset: The asset with identity %{asset} is absent from the %{route} account catalog
-  indices:
+  financial_indices:
     duplicate_category: 'The index manifest repeats the category %{code}'
     duplicate_index: 'The index manifest repeats the index %{code}'
     index_limit: Your current limit is %{limit} indices
@@ -778,7 +778,7 @@ widget:
     unknown: Unknown
     unrealized_pnl: Unrealized PnL
     value: Value
-  indices:
+  financial_indices:
     change: Change
     change_percent: Change %
     choose: Choose indices
@@ -809,10 +809,10 @@ widget:
     empty: Empty
     etf_flow: ETF Flow
     financial_calendar: Financial Calendar
+    financial_indices: Indices
     force_orders: Force Orders Stream
     hormuz_vessel_map: Hormuz Vessel Map
     hyperliquid_wallet_monitor: Hyperliquid Wallet Monitor
-    indices: Indices
     long_short_account_ratio: Long/Short Account Ratio
     market_trades: Market Trades
     news: News

@@ -67,7 +67,7 @@ use crate::{
 use crate::{
     auth::{model::SessionChange, session::AuthSession},
     service::engine::{
-        CancelOnDrop, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IndexEvent,
+        CancelOnDrop, FinancialIndexEvent, HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS,
         KYTRIX_SERVICE_WS_URL, NewsEvent, NewsKind, SessionStateRegistry,
     },
 };
@@ -170,7 +170,7 @@ impl ServiceSessionActor {
             subscription_route_change_reuses_socket: false,
             subscribers: AHashMap::with_capacity(8),
             topics: AHashMap::with_capacity(4),
-            latest_indices: AHashMap::with_capacity(8),
+            latest_financial_indices: AHashMap::with_capacity(8),
             latest_ais_keyframes: AHashMap::with_capacity(2),
             session_state: None,
             subscriptions_dirty: false,
@@ -475,7 +475,7 @@ impl ServiceSessionActor {
         }
         self.subscribers.clear();
         self.topics.clear();
-        self.latest_indices.clear();
+        self.latest_financial_indices.clear();
         self.latest_ais_keyframes.clear();
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
@@ -1062,7 +1062,7 @@ impl ServiceSessionActor {
         }
         self.subscribers.clear();
         self.topics.clear();
-        self.latest_indices.clear();
+        self.latest_financial_indices.clear();
         self.latest_ais_keyframes.clear();
         self.subscriptions_dirty = false;
         self.session_state = None;
@@ -1121,8 +1121,8 @@ impl ServiceSessionActor {
 
     pub(super) fn clear_cached_topic(&mut self, topic: &ServiceTopic) {
         match topic {
-            ServiceTopic::Index(topic) => {
-                self.latest_indices.remove(topic);
+            ServiceTopic::FinancialIndex(topic) => {
+                self.latest_financial_indices.remove(topic);
             }
             ServiceTopic::Ais(area) => {
                 self.latest_ais_keyframes.remove(area);
@@ -1136,7 +1136,9 @@ impl ServiceSessionActor {
         let events = topics
             .iter()
             .filter_map(|topic| match topic {
-                ServiceTopic::Index(topic) => self.latest_indices.get(topic).cloned(),
+                ServiceTopic::FinancialIndex(topic) => {
+                    self.latest_financial_indices.get(topic).cloned()
+                }
                 ServiceTopic::News
                 | ServiceTopic::X
                 | ServiceTopic::CryptocurrencyWalletMonitoring
@@ -1144,7 +1146,7 @@ impl ServiceSessionActor {
             })
             .collect::<Vec<_>>();
         for event in events {
-            self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::Index(event)));
+            self.publish_to_ids(vec![id], Ok(KytrixServiceEvent::FinancialIndex(event)));
         }
     }
 
@@ -1984,7 +1986,7 @@ impl ServiceSessionActor {
         for subscriber in self.subscribers.values() {
             subscriber.sink.reconnecting();
         }
-        self.latest_indices.clear();
+        self.latest_financial_indices.clear();
         self.latest_ais_keyframes.clear();
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
@@ -2021,12 +2023,14 @@ impl ServiceSessionActor {
             self.latest_ais_keyframes.insert(*area, update.clone());
         }
         if self.topics.contains_key(&topic)
-            && let (ServiceTopic::Index(index_topic), Ok(KytrixServiceEvent::Index(event))) =
-                (&topic, &message)
-            && &event.topic == index_topic
+            && let (
+                ServiceTopic::FinancialIndex(financial_index_topic),
+                Ok(KytrixServiceEvent::FinancialIndex(event)),
+            ) = (&topic, &message)
+            && &event.topic == financial_index_topic
         {
-            self.latest_indices
-                .insert(index_topic.clone(), event.clone());
+            self.latest_financial_indices
+                .insert(financial_index_topic.clone(), event.clone());
         }
         let ids = self
             .topics
@@ -2127,9 +2131,9 @@ mod tests {
         let (_commands, receiver) = mpsc::channel(1);
         let cancellation = CancellationToken::new();
         let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
-        let index = index_topic("HSI");
-        let topic = ServiceTopic::Index(index.clone());
-        let event = IndexEvent {
+        let index = financial_index_topic("HSI");
+        let topic = ServiceTopic::FinancialIndex(index.clone());
+        let event = FinancialIndexEvent {
             topic: index.clone(),
             last_price: 100,
             open_price: 90,
@@ -2144,11 +2148,14 @@ mod tests {
         actor.add_subscriber_inner(
             1,
             vec![topic.clone()],
-            SubscriberSink::Indices(first_publisher),
+            SubscriberSink::FinancialIndices(first_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
-        actor.publish_topic(topic.clone(), Ok(KytrixServiceEvent::Index(event.clone())));
+        actor.publish_topic(
+            topic.clone(),
+            Ok(KytrixServiceEvent::FinancialIndex(event.clone())),
+        );
         assert_eq!(first_events.try_recv_for_test(), Ok(event.clone()));
 
         let (second_publisher, mut second_events) =
@@ -2156,15 +2163,15 @@ mod tests {
         actor.add_subscriber_inner(
             2,
             vec![topic.clone()],
-            SubscriberSink::Indices(second_publisher),
+            SubscriberSink::FinancialIndices(second_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
         assert_eq!(second_events.try_recv_for_test(), Ok(event));
         assert!(actor.remove_subscriber(1).is_empty());
-        assert!(actor.latest_indices.contains_key(&index));
+        assert!(actor.latest_financial_indices.contains_key(&index));
         assert_eq!(actor.remove_subscriber(2), vec![topic]);
-        assert!(!actor.latest_indices.contains_key(&index));
+        assert!(!actor.latest_financial_indices.contains_key(&index));
 
         let news_topic = ServiceTopic::News;
         let news = KytrixServiceEvent::News(NewsEvent {
@@ -2276,18 +2283,18 @@ mod tests {
         let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
         let (publisher, mut events) =
             network::transport::subscription::subscription_channel(2).unwrap();
-        let old_index = index_topic("DJI");
-        let old_topic = ServiceTopic::Index(old_index.clone());
+        let old_index = financial_index_topic("DJI");
+        let old_topic = ServiceTopic::FinancialIndex(old_index.clone());
         actor.add_subscriber_inner(
             1,
             vec![old_topic.clone()],
-            SubscriberSink::Indices(publisher),
+            SubscriberSink::FinancialIndices(publisher),
             None,
             NetworkRouteGeneration::default(),
         );
         actor.publish_topic(
             old_topic.clone(),
-            Ok(KytrixServiceEvent::Index(IndexEvent {
+            Ok(KytrixServiceEvent::FinancialIndex(FinancialIndexEvent {
                 topic: old_index.clone(),
                 last_price: 100,
                 open_price: 90,
@@ -2299,7 +2306,7 @@ mod tests {
             })),
         );
         assert!(events.try_recv_for_test().is_ok());
-        assert!(actor.latest_indices.contains_key(&old_index));
+        assert!(actor.latest_financial_indices.contains_key(&old_index));
         actor.subscriptions_dirty = true;
 
         actor.prepare_reconnect(KytrixServiceError::Read("network reset".into()));
@@ -2311,7 +2318,7 @@ mod tests {
         assert_eq!(actor.subscribers.len(), 1);
         assert_eq!(actor.topics.len(), 1);
         assert!(actor.topics.contains_key(&old_topic));
-        assert!(actor.latest_indices.is_empty());
+        assert!(actor.latest_financial_indices.is_empty());
         assert!(!actor.subscriptions_dirty);
     }
 

@@ -33,7 +33,9 @@ use gpui_kit::{App, SharedString};
 use kytrix_proto::types as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    engine::{ErrorCode, IndexEvent, IndexTopic, KytrixServiceError, KytrixSessionState},
+    engine::{
+        ErrorCode, FinancialIndexEvent, FinancialIndexTopic, KytrixServiceError, KytrixSessionState,
+    },
 };
 use network::transport::{
     error::TransportError,
@@ -54,17 +56,17 @@ use widget::{
 };
 
 use super::model::{
-    IndexCatalog, IndexQuote, MAX_SELECTED_INDICES, SelectedIndex, prepare_catalog,
-    selection_topics,
+    FinancialIndexCatalog, FinancialIndexQuote, MAX_SELECTED_INDICES, SelectedFinancialIndex,
+    prepare_catalog, selection_topics,
 };
 
 /// What a pane asks its service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum IndicesRequest {
+pub(super) enum FinancialIndicesRequest {
     /// Follows this scope, keeping the stream that already follows it.
-    Load(IndicesScope),
+    Load(FinancialIndicesScope),
     /// Reopens the scope's stream, for a scope whose stream has failed.
-    Retry(IndicesScope),
+    Retry(FinancialIndicesScope),
     /// Follows nothing: nobody is signed in, or nothing is selected.
     Stop,
     /// Reads the catalogue a selector lists.
@@ -73,14 +75,14 @@ pub(super) enum IndicesRequest {
 
 /// What the service did.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum IndicesResponse {
+pub(super) enum FinancialIndicesResponse {
     /// The scope's stream is running.
     StreamStarted,
     /// Nothing is followed.
     Stopped,
     /// The catalogue a selector lists, and the number of indices the account may follow.
     Manifest {
-        catalog: IndexCatalog,
+        catalog: FinancialIndexCatalog,
         limit: Option<u32>,
     },
 }
@@ -90,18 +92,21 @@ pub(super) enum IndicesResponse {
 /// It is the request's subject and the stream's key at once: a scope *is* what a
 /// stream is about.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct IndicesScope {
+pub(super) struct FinancialIndicesScope {
     account_id: SmolStr,
-    topics: Arc<[IndexTopic]>,
+    topics: Arc<[FinancialIndexTopic]>,
 }
 
-impl IndicesScope {
+impl FinancialIndicesScope {
     /// The scope a selection follows, or `None` when there is nothing to follow.
     ///
     /// Both halves are needed. A selection with nobody signed in is a pane the
     /// service would refuse, and an account with nothing selected is a pane that has
     /// asked for nothing; neither is a scope, so neither gets a stream.
-    pub(super) fn new(account_id: Option<&SmolStr>, selection: &[SelectedIndex]) -> Option<Self> {
+    pub(super) fn new(
+        account_id: Option<&SmolStr>,
+        selection: &[SelectedFinancialIndex],
+    ) -> Option<Self> {
         if selection.is_empty() {
             return None;
         }
@@ -117,10 +122,10 @@ impl IndicesScope {
     /// The selection is normalized where it is accepted — persisted config and the
     /// selector both cap it — so this is the second of the two places the limit is
     /// enforced rather than a check that a caller is trusted to have made.
-    fn validate(&self) -> Result<(), IndicesServiceError> {
+    fn validate(&self) -> Result<(), FinancialIndicesServiceError> {
         if self.topics.len() > MAX_SELECTED_INDICES {
-            return Err(IndicesServiceError::Data(
-                super::model::IndicesDataError::SelectionCapacity {
+            return Err(FinancialIndicesServiceError::Data(
+                super::model::FinancialIndicesDataError::SelectionCapacity {
                     limit: MAX_SELECTED_INDICES,
                 },
             ));
@@ -131,73 +136,75 @@ impl IndicesScope {
 
 /// What one subscription is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum IndicesStatus {
+pub(super) enum FinancialIndicesStatus {
     /// The subscription is being established, or has not quoted every index yet.
     Connecting,
     /// Every index of the scope has quoted.
     Ready,
     /// The subscription ended; the pane is finished until the user recovers it.
-    Failed(IndicesStreamError),
+    Failed(FinancialIndicesStreamError),
 }
 
 /// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum IndicesStreamError {
+pub(super) enum FinancialIndicesStreamError {
     Service(KytrixServiceError),
     Transport(TransportError),
     /// The service refused the selection because the account may follow fewer
     /// indices, with the account's own limit when the session has published one.
-    IndexLimit {
+    FinancialIndexLimit {
         limit: Option<u32>,
     },
 }
 
-impl LocalizedError for IndicesStreamError {
+impl LocalizedError for FinancialIndicesStreamError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
-            Self::IndexLimit { limit: Some(limit) } => {
+            Self::FinancialIndexLimit { limit: Some(limit) } => {
                 // A limit of one is a single index, and the sentence says so.
                 if *limit == 1 {
-                    i18n::t!(cx, "error.indices.index_limit_one", limit = limit)
+                    i18n::t!(cx, "error.financial_indices.index_limit_one", limit = limit)
                 } else {
-                    i18n::t!(cx, "error.indices.index_limit", limit = limit)
+                    i18n::t!(cx, "error.financial_indices.index_limit", limit = limit)
                 }
             }
-            Self::IndexLimit { limit: None } => i18n::t!(cx, "error.indices.index_limit_unknown"),
+            Self::FinancialIndexLimit { limit: None } => {
+                i18n::t!(cx, "error.financial_indices.index_limit_unknown")
+            }
         }
     }
 }
 
 /// One message of the scope's stream.
 #[derive(Clone, Debug)]
-pub(super) enum IndicesStreamMessage {
-    Status(IndicesStatus),
+pub(super) enum FinancialIndicesStreamMessage {
+    Status(FinancialIndicesStatus),
     /// Every quote the subscription holds, which only ever grows within a scope.
-    Quotes(Arc<HashMap<IndexTopic, IndexQuote>>),
+    Quotes(Arc<HashMap<FinancialIndexTopic, FinancialIndexQuote>>),
 }
 
-pub(super) struct IndicesProtocol;
+pub(super) struct FinancialIndicesProtocol;
 
-impl WidgetProtocol for IndicesProtocol {
-    type Request = IndicesRequest;
-    type Response = IndicesResponse;
-    type StreamKey = IndicesScope;
-    type StreamMessage = IndicesStreamMessage;
-    type Error = IndicesServiceError;
+impl WidgetProtocol for FinancialIndicesProtocol {
+    type Request = FinancialIndicesRequest;
+    type Response = FinancialIndicesResponse;
+    type StreamKey = FinancialIndicesScope;
+    type StreamMessage = FinancialIndicesStreamMessage;
+    type Error = FinancialIndicesServiceError;
 }
 
 /// Why a request could not be answered.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(super) enum IndicesServiceError {
+pub(super) enum FinancialIndicesServiceError {
     #[error(transparent)]
     Service(#[from] KytrixServiceError),
     #[error(transparent)]
-    Data(#[from] super::model::IndicesDataError),
+    Data(#[from] super::model::FinancialIndicesDataError),
 }
 
-impl LocalizedError for IndicesServiceError {
+impl LocalizedError for FinancialIndicesServiceError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
@@ -210,31 +217,31 @@ impl LocalizedError for IndicesServiceError {
 ///
 /// The service is written against this seam rather than against the connector, so a
 /// test can drive every ordering a session can produce without a session.
-pub(super) trait IndicesSource: Clone + Send + Sync + 'static {
-    type Subscription: IndexEventSubscription;
+pub(super) trait FinancialIndicesSource: Clone + Send + Sync + 'static {
+    type Subscription: FinancialIndexEventSubscription;
 
     /// The account's session state, which names the index limit it may follow.
     fn session_state(&self) -> watch::Receiver<Option<KytrixSessionState>>;
 
     fn fetch_manifest(
         &self,
-    ) -> impl Future<Output = Result<proto_types::IndexManifest, KytrixServiceError>> + Send;
+    ) -> impl Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>> + Send;
 
-    fn subscribe_indices(
+    fn subscribe_financial_indices(
         &self,
-        topics: Arc<[IndexTopic]>,
+        topics: Arc<[FinancialIndexTopic]>,
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 }
 
 /// One live index subscription.
-pub(super) trait IndexEventSubscription: Send + 'static {
+pub(super) trait FinancialIndexEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
-    fn recv(&mut self) -> impl Future<Output = Result<IndexEvent, TransportError>> + Send;
+    fn recv(&mut self) -> impl Future<Output = Result<FinancialIndexEvent, TransportError>> + Send;
 }
 
-impl IndicesSource for KytrixServiceConnector {
-    type Subscription = Subscription<IndexEvent>;
+impl FinancialIndicesSource for KytrixServiceConnector {
+    type Subscription = Subscription<FinancialIndexEvent>;
 
     fn session_state(&self) -> watch::Receiver<Option<KytrixSessionState>> {
         KytrixServiceConnector::subscribe_session_state(self)
@@ -242,64 +249,68 @@ impl IndicesSource for KytrixServiceConnector {
 
     fn fetch_manifest(
         &self,
-    ) -> impl Future<Output = Result<proto_types::IndexManifest, KytrixServiceError>> + Send {
-        KytrixServiceConnector::fetch_index_manifest(self)
+    ) -> impl Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>> + Send
+    {
+        KytrixServiceConnector::fetch_financial_index_manifest(self)
     }
 
-    async fn subscribe_indices(
+    async fn subscribe_financial_indices(
         &self,
-        topics: Arc<[IndexTopic]>,
+        topics: Arc<[FinancialIndexTopic]>,
     ) -> Result<Self::Subscription, KytrixServiceError> {
-        KytrixServiceConnector::subscribe_indices(self, &topics).await
+        KytrixServiceConnector::subscribe_financial_indices(self, &topics).await
     }
 }
 
-impl IndexEventSubscription for Subscription<IndexEvent> {
+impl FinancialIndexEventSubscription for Subscription<FinancialIndexEvent> {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         Subscription::observe_status(self)
     }
 
-    fn recv(&mut self) -> impl Future<Output = Result<IndexEvent, TransportError>> + Send {
+    fn recv(&mut self) -> impl Future<Output = Result<FinancialIndexEvent, TransportError>> + Send {
         Subscription::recv(self)
     }
 }
 
 /// The service that follows one pane's indices.
-pub(super) struct IndicesService<S = KytrixServiceConnector> {
+pub(super) struct FinancialIndicesService<S = KytrixServiceConnector> {
     source: S,
 }
 
-impl<S> IndicesService<S> {
+impl<S> FinancialIndicesService<S> {
     pub(super) const fn new(source: S) -> Self {
         Self { source }
     }
 }
 
-impl<S> WidgetService<IndicesProtocol> for IndicesService<S>
+impl<S> WidgetService<FinancialIndicesProtocol> for FinancialIndicesService<S>
 where
-    S: IndicesSource,
+    S: FinancialIndicesSource,
 {
-    async fn run(self, mut context: ServiceContext<IndicesProtocol>) {
+    async fn run(self, mut context: ServiceContext<FinancialIndicesProtocol>) {
         let mut active: Option<ActiveStream> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (mut reply, request) = request.into_parts();
             match request {
-                IndicesRequest::FetchManifest => {
+                FinancialIndicesRequest::FetchManifest => {
                     if let Some(result) = fetch_manifest(&self.source, &mut reply).await {
                         let _ = reply.respond(result);
                     }
                 }
-                IndicesRequest::Stop => {
+                FinancialIndicesRequest::Stop => {
                     if retire(&mut context, &mut active, &mut reply).await {
-                        let _ = reply.respond(Ok(IndicesResponse::Stopped));
+                        let _ = reply.respond(Ok(FinancialIndicesResponse::Stopped));
                     }
                 }
-                request @ (IndicesRequest::Load(_) | IndicesRequest::Retry(_)) => {
+                request
+                @ (FinancialIndicesRequest::Load(_) | FinancialIndicesRequest::Retry(_)) => {
                     let (scope, retry) = match request {
-                        IndicesRequest::Load(scope) => (scope, false),
-                        IndicesRequest::Retry(scope) => (scope, true),
-                        IndicesRequest::Stop | IndicesRequest::FetchManifest => continue,
+                        FinancialIndicesRequest::Load(scope) => (scope, false),
+                        FinancialIndicesRequest::Retry(scope) => (scope, true),
+                        FinancialIndicesRequest::Stop | FinancialIndicesRequest::FetchManifest => {
+                            continue;
+                        }
                     };
                     if let Err(error) = scope.validate() {
                         let _ = reply.respond(Err(error));
@@ -318,7 +329,7 @@ where
                         continue;
                     }
                     if context.stream_generation(&scope).is_some() {
-                        let _ = reply.respond(Ok(IndicesResponse::StreamStarted));
+                        let _ = reply.respond(Ok(FinancialIndicesResponse::StreamStarted));
                         continue;
                     }
 
@@ -337,7 +348,7 @@ where
 
 /// The stream the service is running, and the way it says its subscription is gone.
 struct ActiveStream {
-    scope: IndicesScope,
+    scope: FinancialIndicesScope,
     retired: oneshot::Receiver<()>,
 }
 
@@ -347,9 +358,9 @@ struct ActiveStream {
 /// request's deadline leaves the old subscription in a state nobody can vouch for,
 /// and opening a second one on top of it is exactly what the wait exists to prevent.
 async fn retire(
-    context: &mut ServiceContext<IndicesProtocol>,
+    context: &mut ServiceContext<FinancialIndicesProtocol>,
     active: &mut Option<ActiveStream>,
-    reply: &mut RpcRequestContext<IndicesProtocol>,
+    reply: &mut RpcRequestContext<FinancialIndicesProtocol>,
 ) -> bool {
     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
         return false;
@@ -374,10 +385,10 @@ async fn retire(
 
 async fn fetch_manifest<S>(
     source: &S,
-    reply: &mut RpcRequestContext<IndicesProtocol>,
-) -> Option<Result<IndicesResponse, IndicesServiceError>>
+    reply: &mut RpcRequestContext<FinancialIndicesProtocol>,
+) -> Option<Result<FinancialIndicesResponse, FinancialIndicesServiceError>>
 where
-    S: IndicesSource,
+    S: FinancialIndicesSource,
 {
     let deadline = reply.deadline();
     let manifest = tokio::select! {
@@ -394,9 +405,11 @@ where
 
     Some(
         manifest
-            .map_err(IndicesServiceError::from)
-            .and_then(|manifest| prepare_catalog(manifest).map_err(IndicesServiceError::from))
-            .map(|catalog| IndicesResponse::Manifest { catalog, limit }),
+            .map_err(FinancialIndicesServiceError::from)
+            .and_then(|manifest| {
+                prepare_catalog(manifest).map_err(FinancialIndicesServiceError::from)
+            })
+            .map(|catalog| FinancialIndicesResponse::Manifest { catalog, limit }),
     )
 }
 
@@ -410,19 +423,19 @@ where
 /// where the failures a pane shows already live.
 async fn run_stream<S>(
     source: S,
-    scope: IndicesScope,
-    publisher: StreamPublisher<IndicesProtocol>,
-    mut reply: RpcRequestContext<IndicesProtocol>,
+    scope: FinancialIndicesScope,
+    publisher: StreamPublisher<FinancialIndicesProtocol>,
+    mut reply: RpcRequestContext<FinancialIndicesProtocol>,
     retirement: oneshot::Sender<()>,
 ) where
-    S: IndicesSource,
+    S: FinancialIndicesSource,
 {
     // Declared before everything else, so that the subscription and the setup that
     // produced it are dropped before the service is told they are gone: the signal
     // is what a replacement waits on, and it has to mean what it says.
     let _retirement = StreamRetirement(Some(retirement));
-    let mut published = IndicesStatus::Connecting;
-    if publish_status(&publisher, IndicesStatus::Connecting)
+    let mut published = FinancialIndicesStatus::Connecting;
+    if publish_status(&publisher, FinancialIndicesStatus::Connecting)
         .await
         .is_err()
     {
@@ -437,25 +450,26 @@ async fn run_stream<S>(
         () = publisher.cancelled() => return,
         () = reply.cancelled() => return,
         () = tokio::time::sleep_until(deadline) => return,
-        result = source.subscribe_indices(topics.clone()) => result,
+        result = source.subscribe_financial_indices(topics.clone()) => result,
     };
     let mut subscription = match setup {
         Ok(subscription) => subscription,
         Err(error) => {
             let error = stream_error(&error, session_limit(&session));
-            respond(reply, Ok(IndicesResponse::StreamStarted));
+            respond(reply, Ok(FinancialIndicesResponse::StreamStarted));
             publish_failure(&publisher, error).await;
             return;
         }
     };
-    if !respond(reply, Ok(IndicesResponse::StreamStarted)) {
+    if !respond(reply, Ok(FinancialIndicesResponse::StreamStarted)) {
         return;
     }
 
     let mut status = subscription.observe_status();
     let mut membership = HashSet::with_capacity(topics.len());
     membership.extend(topics.iter().cloned());
-    let mut quotes: HashMap<IndexTopic, IndexQuote> = HashMap::with_capacity(topics.len());
+    let mut quotes: HashMap<FinancialIndexTopic, FinancialIndexQuote> =
+        HashMap::with_capacity(topics.len());
     let mut quoted = HashSet::with_capacity(topics.len());
     let mut connected = false;
 
@@ -502,14 +516,14 @@ async fn run_stream<S>(
                 let event = match event {
                     Ok(event) => event,
                     Err(error) => {
-                        publish_failure(&publisher, IndicesStreamError::Transport(error)).await;
+                        publish_failure(&publisher, FinancialIndicesStreamError::Transport(error)).await;
                         return;
                     }
                 };
                 if !membership.contains(&event.topic) {
                     continue;
                 }
-                let quote = IndexQuote::from_event(&event);
+                let quote = FinancialIndexQuote::from_event(&event);
                 match quotes.get(&event.topic) {
                     // The venue's own clock orders two quotes of one index, so an
                     // older one is not a correction of a newer one.
@@ -520,7 +534,7 @@ async fn run_stream<S>(
                 quotes.insert(event.topic.clone(), quote);
                 quoted.insert(event.topic);
                 if publisher
-                    .publish_latest(IndicesStreamMessage::Quotes(Arc::new(quotes.clone())))
+                    .publish_latest(FinancialIndicesStreamMessage::Quotes(Arc::new(quotes.clone())))
                     .is_err()
                 {
                     return;
@@ -544,18 +558,18 @@ async fn run_stream<S>(
 /// Returns whether the stream may keep running: a status that ended it has already
 /// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
-    publisher: &StreamPublisher<IndicesProtocol>,
+    publisher: &StreamPublisher<FinancialIndicesProtocol>,
     status: SubscriptionStatus,
-    topics: &Arc<[IndexTopic]>,
-    quoted: &mut HashSet<IndexTopic>,
+    topics: &Arc<[FinancialIndexTopic]>,
+    quoted: &mut HashSet<FinancialIndexTopic>,
     connected: &mut bool,
-    published: &mut IndicesStatus,
+    published: &mut FinancialIndicesStatus,
 ) -> bool {
     match status {
         SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => {
             quoted.clear();
             *connected = false;
-            publish_change(publisher, IndicesStatus::Connecting, published)
+            publish_change(publisher, FinancialIndicesStatus::Connecting, published)
                 .await
                 .is_ok()
         }
@@ -570,24 +584,24 @@ async fn apply_subscription_status(
         SubscriptionStatus::Closed => {
             publish_failure(
                 publisher,
-                IndicesStreamError::Transport(TransportError::Closed),
+                FinancialIndicesStreamError::Transport(TransportError::Closed),
             )
             .await;
             false
         }
         SubscriptionStatus::Failed(error) => {
-            publish_failure(publisher, IndicesStreamError::Transport(error)).await;
+            publish_failure(publisher, FinancialIndicesStreamError::Transport(error)).await;
             false
         }
     }
 }
 
 /// The status a subscription that is up has: ready once every index has quoted.
-fn connected_status(connected: bool, quoted: usize, selected: usize) -> IndicesStatus {
+fn connected_status(connected: bool, quoted: usize, selected: usize) -> FinancialIndicesStatus {
     if connected && selected > 0 && quoted == selected {
-        IndicesStatus::Ready
+        FinancialIndicesStatus::Ready
     } else {
-        IndicesStatus::Connecting
+        FinancialIndicesStatus::Connecting
     }
 }
 
@@ -597,12 +611,12 @@ fn connected_status(connected: bool, quoted: usize, selected: usize) -> IndicesS
 /// selection rather than about the connection, so it carries the number of indices
 /// the account may follow — the number the session state published, when it has
 /// published one.
-fn stream_error(error: &KytrixServiceError, limit: Option<u32>) -> IndicesStreamError {
+fn stream_error(error: &KytrixServiceError, limit: Option<u32>) -> FinancialIndicesStreamError {
     match error {
-        KytrixServiceError::Server(ErrorCode::IndexTopicLimitExceeded) => {
-            IndicesStreamError::IndexLimit { limit }
+        KytrixServiceError::Server(ErrorCode::FinancialIndexTopicLimitExceeded) => {
+            FinancialIndicesStreamError::FinancialIndexLimit { limit }
         }
-        _ => IndicesStreamError::Service(error.clone()),
+        _ => FinancialIndicesStreamError::Service(error.clone()),
     }
 }
 
@@ -617,7 +631,7 @@ fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Optio
     let state = session.as_ref()?;
     let limit = state
         .entitlements
-        .get("indices")
+        .get("financial_indices")
         .and_then(|entitlement| entitlement.value.as_ref())
         .map_or(0, |value| match value {
             proto_types::entitlement_value::Value::Limit(limit) => *limit,
@@ -632,8 +646,8 @@ fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Optio
 /// gets no answer, and everything the answer was for — the subscription included —
 /// goes with it rather than being left for a pane that has moved on.
 fn respond(
-    reply: RpcRequestContext<IndicesProtocol>,
-    response: Result<IndicesResponse, IndicesServiceError>,
+    reply: RpcRequestContext<FinancialIndicesProtocol>,
+    response: Result<FinancialIndicesResponse, FinancialIndicesServiceError>,
 ) -> bool {
     reply.respond(response).is_ok()
 }
@@ -654,19 +668,19 @@ impl Drop for StreamRetirement {
 
 /// Publishes a status the pane has not been told yet.
 async fn publish_status(
-    publisher: &StreamPublisher<IndicesProtocol>,
-    status: IndicesStatus,
+    publisher: &StreamPublisher<FinancialIndicesProtocol>,
+    status: FinancialIndicesStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(IndicesStreamMessage::Status(status))
+        .publish_reliable(FinancialIndicesStreamMessage::Status(status))
         .await
 }
 
 /// Publishes a status change, if it is one.
 async fn publish_change(
-    publisher: &StreamPublisher<IndicesProtocol>,
-    status: IndicesStatus,
-    published: &mut IndicesStatus,
+    publisher: &StreamPublisher<FinancialIndicesProtocol>,
+    status: FinancialIndicesStatus,
+    published: &mut FinancialIndicesStatus,
 ) -> Result<(), StreamPublishError> {
     if *published == status {
         return Ok(());
@@ -681,8 +695,11 @@ async fn publish_change(
 /// A terminal failure is not retried: the pane asks for a new stream when the user
 /// takes the recovery, and until then this task stays where it is so the framework
 /// still sees the scope as taken.
-async fn publish_failure(publisher: &StreamPublisher<IndicesProtocol>, error: IndicesStreamError) {
-    let _ = publish_status(publisher, IndicesStatus::Failed(error)).await;
+async fn publish_failure(
+    publisher: &StreamPublisher<FinancialIndicesProtocol>,
+    error: FinancialIndicesStreamError,
+) {
+    let _ = publish_status(publisher, FinancialIndicesStatus::Failed(error)).await;
     publisher.cancelled().await;
 }
 
@@ -714,30 +731,33 @@ mod tests {
     use super::*;
     use crate::test_support::{ACCOUNT, FakeSource, event, manifest, selected, session, topic};
 
-    fn scope(codes: &[&str]) -> IndicesScope {
+    fn scope(codes: &[&str]) -> FinancialIndicesScope {
         let selection = codes.iter().map(|code| selected(code)).collect::<Vec<_>>();
-        IndicesScope::new(Some(&SmolStr::new_static(ACCOUNT)), &selection)
+        FinancialIndicesScope::new(Some(&SmolStr::new_static(ACCOUNT)), &selection)
             .expect("a selection for an account should be a scope")
     }
 
-    fn runtime(source: &FakeSource) -> WidgetRuntime<IndicesProtocol> {
-        WidgetRuntime::spawn(current_test_handle(), IndicesService::new(source.clone()))
+    fn runtime(source: &FakeSource) -> WidgetRuntime<FinancialIndicesProtocol> {
+        WidgetRuntime::spawn(
+            current_test_handle(),
+            FinancialIndicesService::new(source.clone()),
+        )
     }
 
-    async fn load(runtime: &WidgetRuntime<IndicesProtocol>, scope: IndicesScope) {
+    async fn load(runtime: &WidgetRuntime<FinancialIndicesProtocol>, scope: FinancialIndicesScope) {
         let response = runtime
             .client()
-            .call(IndicesRequest::Load(scope))
+            .call(FinancialIndicesRequest::Load(scope))
             .await
             .expect("the stream should start")
             .into_value();
-        assert_eq!(response, IndicesResponse::StreamStarted);
+        assert_eq!(response, FinancialIndicesResponse::StreamStarted);
     }
 
     async fn next_reliable(
-        reliable: &mut ReliableStream<IndicesProtocol>,
-        predicate: impl Fn(&IndicesStreamMessage) -> bool,
-    ) -> IndicesStreamMessage {
+        reliable: &mut ReliableStream<FinancialIndicesProtocol>,
+        predicate: impl Fn(&FinancialIndicesStreamMessage) -> bool,
+    ) -> FinancialIndicesStreamMessage {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let envelope = reliable
@@ -754,9 +774,9 @@ mod tests {
     }
 
     async fn next_quotes(
-        latest: &mut LatestStream<IndicesProtocol>,
-        predicate: impl Fn(&HashMap<IndexTopic, IndexQuote>) -> bool,
-    ) -> HashMap<IndexTopic, IndexQuote> {
+        latest: &mut LatestStream<FinancialIndicesProtocol>,
+        predicate: impl Fn(&HashMap<FinancialIndexTopic, FinancialIndexQuote>) -> bool,
+    ) -> HashMap<FinancialIndexTopic, FinancialIndexQuote> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 latest
@@ -764,7 +784,8 @@ mod tests {
                     .await
                     .expect("the latest stream should stay open");
                 while let Some(envelope) = latest.next_unseen() {
-                    if let IndicesStreamMessage::Quotes(quotes) = envelope.message().as_ref()
+                    if let FinancialIndicesStreamMessage::Quotes(quotes) =
+                        envelope.message().as_ref()
                         && predicate(quotes)
                     {
                         return quotes.as_ref().clone();
@@ -777,14 +798,14 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut ReliableStream<IndicesProtocol>,
-        expected: IndicesStatus,
+        reliable: &mut ReliableStream<FinancialIndicesProtocol>,
+        expected: FinancialIndicesStatus,
     ) {
         let status = next_reliable(reliable, |message| {
-            matches!(message, IndicesStreamMessage::Status(status) if *status == expected)
+            matches!(message, FinancialIndicesStreamMessage::Status(status) if *status == expected)
         })
         .await;
-        assert!(matches!(status, IndicesStreamMessage::Status(_)));
+        assert!(matches!(status, FinancialIndicesStreamMessage::Status(_)));
     }
 
     #[test]
@@ -792,10 +813,10 @@ mod tests {
         let selection = [selected("HSI")];
         let account = SmolStr::new_static(ACCOUNT);
 
-        assert!(IndicesScope::new(Some(&account), &selection).is_some());
-        assert!(IndicesScope::new(None, &selection).is_none());
-        assert!(IndicesScope::new(Some(&account), &[]).is_none());
-        assert!(IndicesScope::new(Some(&SmolStr::new_static("")), &selection).is_none());
+        assert!(FinancialIndicesScope::new(Some(&account), &selection).is_some());
+        assert!(FinancialIndicesScope::new(None, &selection).is_none());
+        assert!(FinancialIndicesScope::new(Some(&account), &[]).is_none());
+        assert!(FinancialIndicesScope::new(Some(&SmolStr::new_static("")), &selection).is_none());
     }
 
     #[tokio::test]
@@ -806,11 +827,11 @@ mod tests {
 
         let response = runtime
             .client()
-            .call(IndicesRequest::FetchManifest)
+            .call(FinancialIndicesRequest::FetchManifest)
             .await
             .expect("the manifest should load")
             .into_value();
-        let IndicesResponse::Manifest { catalog, limit } = response else {
+        let FinancialIndicesResponse::Manifest { catalog, limit } = response else {
             panic!("the manifest request should answer with a catalogue");
         };
 
@@ -833,11 +854,11 @@ mod tests {
 
         let response = runtime
             .client()
-            .call(IndicesRequest::FetchManifest)
+            .call(FinancialIndicesRequest::FetchManifest)
             .await
             .expect("the manifest should load")
             .into_value();
-        let IndicesResponse::Manifest { limit, .. } = response else {
+        let FinancialIndicesResponse::Manifest { limit, .. } = response else {
             panic!("the manifest request should answer with a catalogue");
         };
 
@@ -855,14 +876,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(IndicesRequest::FetchManifest)
+            .call(FinancialIndicesRequest::FetchManifest)
             .await
             .expect_err("a manifest without a name should be refused");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: IndicesServiceError::Data(_),
+                source: FinancialIndicesServiceError::Data(_),
                 ..
             }
         ));
@@ -882,7 +903,7 @@ mod tests {
         let spx = topic("SPX");
 
         load(&runtime, scope(&["HSI", "SPX"])).await;
-        receive_status(&mut reliable, IndicesStatus::Connecting).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Connecting).await;
         control
             .events
             .send(Ok(event(hsi.clone(), 101, 2)))
@@ -910,7 +931,7 @@ mod tests {
             .send(Ok(event(spx.clone(), 201, 3)))
             .await
             .expect("the second index should quote");
-        receive_status(&mut reliable, IndicesStatus::Ready).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Ready).await;
         let quotes = next_quotes(&mut latest, |quotes| quotes.len() == 2).await;
 
         assert_eq!(
@@ -936,7 +957,7 @@ mod tests {
         let mut latest = runtime.latest_stream();
 
         load(&runtime, scope(&["HSI", "SPX"])).await;
-        receive_status(&mut reliable, IndicesStatus::Connecting).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Connecting).await;
 
         control
             .events
@@ -955,7 +976,7 @@ mod tests {
             .send(Ok(event(topic("SPX"), 201, 2)))
             .await
             .expect("the second index should quote");
-        receive_status(&mut reliable, IndicesStatus::Ready).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Ready).await;
         let quotes = next_quotes(&mut latest, |quotes| quotes.len() == 2).await;
 
         assert_eq!(quotes.len(), 2);
@@ -979,12 +1000,12 @@ mod tests {
             .await
             .expect("the index should quote");
         let quotes = next_quotes(&mut latest, |quotes| !quotes.is_empty()).await;
-        receive_status(&mut reliable, IndicesStatus::Ready).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Ready).await;
 
         control
             .status
             .send_replace(SubscriptionStatus::Reconnecting);
-        receive_status(&mut reliable, IndicesStatus::Connecting).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Connecting).await;
 
         control.status.send_replace(SubscriptionStatus::Active);
         control
@@ -992,7 +1013,7 @@ mod tests {
             .send(Ok(event(topic("HSI"), 102, 2)))
             .await
             .expect("the re-established subscription should quote");
-        receive_status(&mut reliable, IndicesStatus::Ready).await;
+        receive_status(&mut reliable, FinancialIndicesStatus::Ready).await;
         let recovered = next_quotes(&mut latest, |quotes| {
             quotes
                 .get(&topic("HSI"))
@@ -1027,7 +1048,7 @@ mod tests {
             let client = runtime.client();
             async move {
                 client
-                    .call(IndicesRequest::Load(scope(&["HSI", "SPX"])))
+                    .call(FinancialIndicesRequest::Load(scope(&["HSI", "SPX"])))
                     .await
             }
         });
@@ -1081,25 +1102,26 @@ mod tests {
         let failed = next_reliable(&mut reliable, |message| {
             matches!(
                 message,
-                IndicesStreamMessage::Status(IndicesStatus::Failed(_))
+                FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(_))
             )
         })
         .await;
-        let IndicesStreamMessage::Status(IndicesStatus::Failed(error)) = failed else {
+        let FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(error)) = failed
+        else {
             panic!("the stream should have reported a failure");
         };
         assert_eq!(
             error,
-            IndicesStreamError::Service(KytrixServiceError::Closed)
+            FinancialIndicesStreamError::Service(KytrixServiceError::Closed)
         );
 
         let response = runtime
             .client()
-            .call(IndicesRequest::Retry(scope(&["HSI"])))
+            .call(FinancialIndicesRequest::Retry(scope(&["HSI"])))
             .await
             .expect("the retry should open a new stream")
             .into_value();
-        assert_eq!(response, IndicesResponse::StreamStarted);
+        assert_eq!(response, FinancialIndicesResponse::StreamStarted);
         assert_eq!(source.subscribed(), vec![vec![topic("HSI")]; 2]);
         assert_eq!(recovered.drops.load(Ordering::SeqCst), 0);
         runtime.shutdown().await;
@@ -1115,11 +1137,11 @@ mod tests {
         for _ in 0..2 {
             let response = runtime
                 .client()
-                .call(IndicesRequest::Stop)
+                .call(FinancialIndicesRequest::Stop)
                 .await
                 .expect("stopping should be answered")
                 .into_value();
-            assert_eq!(response, IndicesResponse::Stopped);
+            assert_eq!(response, FinancialIndicesResponse::Stopped);
         }
 
         assert_eq!(control.drops.load(Ordering::SeqCst), 1);
@@ -1139,15 +1161,19 @@ mod tests {
         let failed = next_reliable(&mut reliable, |message| {
             matches!(
                 message,
-                IndicesStreamMessage::Status(IndicesStatus::Failed(_))
+                FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(_))
             )
         })
         .await;
-        let IndicesStreamMessage::Status(IndicesStatus::Failed(error)) = failed else {
+        let FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(error)) = failed
+        else {
             panic!("the stream should have reported a failure");
         };
 
-        assert_eq!(error, IndicesStreamError::IndexLimit { limit: Some(3) });
+        assert_eq!(
+            error,
+            FinancialIndicesStreamError::FinancialIndexLimit { limit: Some(3) }
+        );
         runtime.shutdown().await;
     }
 
@@ -1164,15 +1190,19 @@ mod tests {
         let failed = next_reliable(&mut reliable, |message| {
             matches!(
                 message,
-                IndicesStreamMessage::Status(IndicesStatus::Failed(_))
+                FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(_))
             )
         })
         .await;
-        let IndicesStreamMessage::Status(IndicesStatus::Failed(error)) = failed else {
+        let FinancialIndicesStreamMessage::Status(FinancialIndicesStatus::Failed(error)) = failed
+        else {
             panic!("the stream should have reported a failure");
         };
 
-        assert_eq!(error, IndicesStreamError::IndexLimit { limit: None });
+        assert_eq!(
+            error,
+            FinancialIndicesStreamError::FinancialIndexLimit { limit: None }
+        );
         runtime.shutdown().await;
     }
 
@@ -1182,7 +1212,7 @@ mod tests {
     #[test]
     fn a_session_without_an_indices_entitlement_should_follow_no_indices() {
         let mut state = session(3);
-        state.entitlements.remove("indices");
+        state.entitlements.remove("financial_indices");
         let (_sender, receiver) = watch::channel(Some(state));
 
         assert_eq!(session_limit(&receiver), Some(0));
@@ -1194,7 +1224,7 @@ mod tests {
     fn an_indices_entitlement_that_is_a_flag_should_follow_no_indices() {
         let mut state = session(3);
         state.entitlements.insert(
-            "indices".to_owned(),
+            "financial_indices".to_owned(),
             proto_types::EntitlementValue {
                 value: Some(proto_types::entitlement_value::Value::Enabled(true)),
             },
@@ -1210,7 +1240,7 @@ mod tests {
     fn an_indices_entitlement_without_a_value_should_follow_no_indices() {
         let mut state = session(3);
         state.entitlements.insert(
-            "indices".to_owned(),
+            "financial_indices".to_owned(),
             proto_types::EntitlementValue::default(),
         );
         let (_sender, receiver) = watch::channel(Some(state));
@@ -1239,19 +1269,19 @@ mod tests {
         let selection = (0..=MAX_SELECTED_INDICES)
             .map(|index| selected(&format!("INDEX_{index}")))
             .collect::<Vec<_>>();
-        let oversized = IndicesScope::new(Some(&SmolStr::new_static(ACCOUNT)), &selection)
+        let oversized = FinancialIndicesScope::new(Some(&SmolStr::new_static(ACCOUNT)), &selection)
             .expect("an oversized selection is still a scope");
 
         let error = runtime
             .client()
-            .call(IndicesRequest::Load(oversized))
+            .call(FinancialIndicesRequest::Load(oversized))
             .await
             .expect_err("an oversized scope should be refused");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: IndicesServiceError::Data(_),
+                source: FinancialIndicesServiceError::Data(_),
                 ..
             }
         ));
@@ -1272,7 +1302,7 @@ mod tests {
         let client = runtime.client();
         let pending = tokio::spawn(async move {
             client
-                .call(IndicesRequest::Load(scope(&["HSI", "SPX"])))
+                .call(FinancialIndicesRequest::Load(scope(&["HSI", "SPX"])))
                 .await
         });
         block.wait_started().await;
