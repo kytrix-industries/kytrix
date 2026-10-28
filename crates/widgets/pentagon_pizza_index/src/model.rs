@@ -112,9 +112,9 @@ pub(super) struct PizzaReading {
 impl PizzaReading {
     /// The reading one service answer states, or why it states none.
     ///
-    /// The answer carries the rung in a `uint32` because the protocol has no enum
-    /// for it, so the scale is what decides whether the number is a level at all:
-    /// a value above a byte cannot be a rung any more than a zero can.
+    /// The answer carries the DEFCON level in a `uint32` because the protocol has
+    /// no enum for it, so the scale is what decides whether the number is a level
+    /// at all: a value above a byte cannot be a rung any more than a zero can.
     ///
     /// The moment is checked first, because a zero one is what a collector that has
     /// not run yet answers with, and no reading was ever observed at the start of
@@ -125,11 +125,11 @@ impl PizzaReading {
         if index.observed_at <= 0 {
             return Err(PizzaDataError::MissingObservation);
         }
-        let level = u8::try_from(index.overall_index)
+        let level = u8::try_from(index.defcon_level)
             .ok()
             .and_then(PizzaLevel::from_number)
             .ok_or(PizzaDataError::UnknownLevel {
-                level: index.overall_index,
+                level: index.defcon_level,
             })?;
 
         Ok(Self {

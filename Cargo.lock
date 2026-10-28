@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=b29d0edeca28864392730c84683e284462727faf#b29d0edeca28864392730c84683e284462727faf"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=d5a6f93eede7fa74edcf4273eb97370202bf1acd#d5a6f93eede7fa74edcf4273eb97370202bf1acd"
 dependencies = [
  "bytes",
  "prost",

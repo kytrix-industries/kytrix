@@ -85,7 +85,7 @@ image = { version = "0.25.10", default-features = false, features = [
 jiff = "0.2.38"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
-kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "b29d0edeca28864392730c84683e284462727faf" }
+kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "d5a6f93eede7fa74edcf4273eb97370202bf1acd" }
 log = "0.4.34"
 longbridge-proto = "5.2.0"
 nucleo = "0.5.0"

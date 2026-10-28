@@ -244,7 +244,7 @@ pub(super) fn coin_market_cap_fear_and_greed_index() -> proto_types::CoinMarketC
 /// already exists.
 pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
     proto_types::PentagonPizzaIndex {
-        overall_index: 3,
+        defcon_level: 3,
         observed_at: 1_792_821_600_000,
         timestamp: 1_792_821_660_000,
     }
