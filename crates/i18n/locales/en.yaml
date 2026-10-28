@@ -126,7 +126,8 @@ error:
     proxy_changed: The proxy configuration changed
     server_closed: 'The server closed the connection (%{code}): %{reason}'
   financial_calendar:
-    invalid_timestamp: 'The financial calendar carried an instant that is not a date: %{value}'
+    invalid_date: 'The financial calendar carried a date that is not one: %{year}-%{month}-%{day}'
+    invalid_time_of_day: 'The financial calendar carried a time of day that is not one: %{seconds} seconds'
     refresh_already_waiting: A financial calendar refresh is already waiting
     stream_unavailable: The financial calendar stream is unavailable
   global_shipping_chokepoint:
@@ -605,9 +606,17 @@ widget:
   empty:
     hint: 'Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button in the upper-right corner to select a widget.'
   financial_calendar:
+    all: ALL
     country: Country
     day_label: '%{weekday}, %{month} %{day}, %{year}'
+    filter_choice: '%{filter}: %{value}'
+    filter_tooltip: Filter by %{filter}
     importance: Importance
+    importance_level:
+      high: High
+      low: Low
+      medium: Medium
+      unspecified: Unspecified
     logged_out: <p align="center">You need to register or log in to use this feature.</p>
     month:
       april: April
@@ -624,6 +633,7 @@ widget:
       september: September
     name: Name
     refresh: Refresh
+    reset: Reset
     weekday:
       friday: Friday
       monday: Monday

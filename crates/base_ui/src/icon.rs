@@ -49,6 +49,7 @@ pub enum IconKind {
     WarningCircle,
     User,
     Faders,
+    FunnelX,
     Graph,
     Plugs,
     PlugsConnected,
@@ -101,6 +102,7 @@ impl IconKind {
             IconKind::WarningCircle => "icons/phosphoricons/warning-circle.svg",
             IconKind::User => "icons/phosphoricons/user.svg",
             IconKind::Faders => "icons/phosphoricons/faders.svg",
+            IconKind::FunnelX => "icons/phosphoricons/funnel-x.svg",
             IconKind::Graph => "icons/phosphoricons/graph.svg",
             IconKind::Plugs => "icons/phosphoricons/plugs.svg",
             IconKind::PlugsConnected => "icons/phosphoricons/plugs-connected.svg",
@@ -161,7 +163,7 @@ mod tests {
     use super::IconKind;
 
     /// 全部变体，顺序与 [`IconKind::path`] 一致。
-    const KINDS: [IconKind; 47] = [
+    const KINDS: [IconKind; 48] = [
         IconKind::X,
         IconKind::XBold,
         IconKind::Circle,
@@ -204,6 +206,7 @@ mod tests {
         IconKind::WarningCircle,
         IconKind::User,
         IconKind::Faders,
+        IconKind::FunnelX,
         IconKind::Graph,
         IconKind::Plugs,
         IconKind::PlugsConnected,

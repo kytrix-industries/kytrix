@@ -252,13 +252,16 @@ pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
 
 /// The financial calendar the service serves, shaped as the collector publishes it.
 pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
-    let event = |timestamp: i64,
+    let event = |seconds_of_day: u32,
                  country: &str,
                  name: &str,
                  importance: proto_types::FinancialCalendarEventImportance,
                  reference: Option<&str>| {
         proto_types::FinancialCalendarEvent {
-            timestamp,
+            year: 2026,
+            month: 9,
+            day: 21,
+            seconds_of_day: Some(seconds_of_day),
             country_code: country.to_owned(),
             name: name.to_owned(),
             importance: importance as i32,
@@ -268,24 +271,24 @@ pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
     proto_types::FinancialCalendar {
         events: vec![
             event(
-                1_790_006_400_000,
+                57_600,
                 "US",
                 "Nonfarm Payrolls",
-                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceHigh,
+                proto_types::FinancialCalendarEventImportance::High,
                 Some("SEP"),
             ),
             event(
-                1_790_002_400_000,
+                53_600,
                 "DE",
                 "Ifo Business Climate",
-                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceMedium,
+                proto_types::FinancialCalendarEventImportance::Medium,
                 None,
             ),
             event(
-                1_790_000_000_000,
+                51_200,
                 "CN",
                 "Industrial Profits (YTD) YoY",
-                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceLow,
+                proto_types::FinancialCalendarEventImportance::Low,
                 Some("AUG"),
             ),
         ],

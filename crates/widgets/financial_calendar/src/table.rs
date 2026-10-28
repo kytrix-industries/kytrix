@@ -3,14 +3,19 @@
 //! The whole answer is the table's only input, so a read that answers again replaces
 //! every row rather than patching the ones that moved: a calendar is scheduled ahead,
 //! and a revision can add an event in the middle of a day that is already drawn. What
-//! the table keeps between reads is nothing but its snapshot and the rows it was
-//! grouped into.
+//! the table keeps between reads is nothing but its snapshot, the choices the header
+//! narrows it with, and the rows it was grouped into.
 //!
 //! Grouping is recomputed whenever the zone the settings display data in moves, which
 //! is the one thing outside the data that decides where a day begins. The *text* of
 //! each row is resolved by the frame that draws it — the time from the zone showing
 //! now, the day label from the language showing now — so moving either is a redraw
 //! rather than a new answer.
+//!
+//! The header's choices are kept here rather than in the frame because they decide
+//! which rows exist, and because every answer has to be checked against them: the
+//! options are the answer's own, so a choice it no longer offers is not a filter any
+//! more.
 
 use std::sync::Arc;
 
@@ -20,34 +25,37 @@ use gpui_kit::{
     SharedString, Styled, base::Align, div, px, relative,
 };
 use i18n::t;
+use smol_str::SmolStr;
 use time::{Date, Month, UtcOffset, Weekday};
 use widget::time_zone::data_time_zone;
 
 use crate::model::{
-    CalendarEvent, CalendarRow, CalendarSnapshot, Importance, format_time, rows_of,
+    CalendarEvent, CalendarFilter, CalendarRow, CalendarSnapshot, Importance, countries_of,
+    dates_of, format_time, rows_of,
 };
 
-/// The columns, in the order a reader takes a calendar in: when, where, what, and how
-/// much it matters.
+/// The columns, in the order a reader takes a calendar in: how much it matters, when,
+/// where, and what.
 const COLUMN_COUNT: usize = 4;
 
 /// The column a cell belongs to, named so a draw reads as the column it is.
-const TIME: usize = 0;
-const COUNTRY: usize = 1;
-const NAME: usize = 2;
-const IMPORTANCE: usize = 3;
+const IMPORTANCE: usize = 0;
+const TIME: usize = 1;
+const COUNTRY: usize = 2;
+const NAME: usize = 3;
 
 /// Column widths in header order.
 ///
-/// The name is what a row is read for, so it takes most of the width; the time, the
-/// country and the marks are fixed small parts of it. Every width is a share of the
+/// The name is what a row is read for, so it takes most of the width; the marks, the
+/// time and the country are fixed small parts of it. Every width is a share of the
 /// pane, so a narrow pane narrows the name rather than clipping a neighbouring column
-/// — the time keeps room for a five-character clock, and the marks for three dots.
+/// — the marks take the narrowest share that still holds three dots, and the time room
+/// for a five-character clock.
 const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
+    Length::Definite(relative(0.09)),
     Length::Definite(relative(0.14)),
     Length::Definite(relative(0.09)),
-    Length::Definite(relative(0.59)),
-    Length::Definite(relative(0.18)),
+    Length::Definite(relative(0.68)),
 ];
 
 /// The mark an importance is drawn with.
@@ -56,12 +64,19 @@ const MARK_SIZE: f32 = 6.0;
 /// The day label's debug selector, which is what says a frame drew the head of a day.
 const DAY_SELECTOR: &str = "TEST_FINANCIAL_CALENDAR_DAY";
 
-/// The rows of one answer, grouped by the day each event falls on.
+/// The rows of one answer, narrowed by the choices the header holds.
 ///
-/// A table with no answer yet is the default one: no snapshot, and no row to draw.
+/// A table with no answer yet is the default one: no snapshot, no choice, and no row
+/// to draw.
 #[derive(Default)]
 pub(crate) struct CalendarTable {
     snapshot: Arc<CalendarSnapshot>,
+    /// The choices the header offers, which decide which of the events are rows.
+    filter: CalendarFilter,
+    /// The days the answer holds, which is what the header's time control offers.
+    dates: Vec<Date>,
+    /// The country codes the answer holds, which is what its country control offers.
+    countries: Vec<SmolStr>,
     /// The days and events of the answer, in the order they are drawn.
     rows: Vec<CalendarRow>,
 }
@@ -73,13 +88,59 @@ impl CalendarTable {
     /// matched against the ones already there: a day may have gained an event, lost
     /// one, or moved to another day as the setting moved.
     pub(crate) fn rebuild(&mut self, snapshot: Arc<CalendarSnapshot>, zone: UtcOffset) {
-        self.rows = rows_of(snapshot.events(), zone);
         self.snapshot = snapshot;
+        self.regroup(zone);
     }
 
     /// Groups the answer the table already holds for another zone.
+    ///
+    /// The days an answer holds move with the zone as well, so the options the header
+    /// offers are rebuilt here too — and a choice that is no longer one of them goes
+    /// back to "all".
     pub(crate) fn regroup(&mut self, zone: UtcOffset) {
-        self.rows = rows_of(self.snapshot.events(), zone);
+        self.dates = dates_of(self.snapshot.events(), zone);
+        self.countries = countries_of(self.snapshot.events());
+        self.filter.retain_offered(&self.dates, &self.countries);
+        self.rows = rows_of(self.snapshot.events(), zone, &self.filter);
+    }
+
+    /// Narrows the rows to one importance level, or to every level.
+    pub(crate) fn select_importance(&mut self, importance: Option<Importance>, zone: UtcOffset) {
+        self.filter.importance = importance;
+        self.regroup(zone);
+    }
+
+    /// Narrows the rows to one day, or to every day.
+    pub(crate) fn select_date(&mut self, date: Option<Date>, zone: UtcOffset) {
+        self.filter.date = date;
+        self.regroup(zone);
+    }
+
+    /// Narrows the rows to one country, or to every country.
+    pub(crate) fn select_country(&mut self, country: Option<SmolStr>, zone: UtcOffset) {
+        self.filter.country = country;
+        self.regroup(zone);
+    }
+
+    /// Puts every choice back to "all".
+    pub(crate) fn reset_filter(&mut self, zone: UtcOffset) {
+        self.filter = CalendarFilter::default();
+        self.regroup(zone);
+    }
+
+    /// The choices the header draws.
+    pub(crate) fn filter(&self) -> &CalendarFilter {
+        &self.filter
+    }
+
+    /// The days the time control offers, earliest first.
+    pub(crate) fn dates(&self) -> &[Date] {
+        &self.dates
+    }
+
+    /// The countries the country control offers, in code order.
+    pub(crate) fn countries(&self) -> &[SmolStr] {
+        &self.countries
     }
 
     /// Drops everything the table draws, which is what a pane that can no longer vouch
@@ -96,10 +157,10 @@ impl TableDataSet<COLUMN_COUNT> for CalendarTable {
 
     fn headers(&self, cx: &App) -> [SharedString; COLUMN_COUNT] {
         [
+            t!(cx, "widget.financial_calendar.importance"),
             t!(cx, "common.time"),
             t!(cx, "widget.financial_calendar.country"),
             t!(cx, "widget.financial_calendar.name"),
-            t!(cx, "widget.financial_calendar.importance"),
         ]
     }
 
@@ -115,7 +176,7 @@ impl TableDataSet<COLUMN_COUNT> for CalendarTable {
     /// below it rather than saying anything about one of the columns.
     fn column_span(&self, row_index: usize, column_index: usize) -> usize {
         match self.rows.get(row_index) {
-            Some(CalendarRow::Day(_)) if column_index == TIME => COLUMN_COUNT,
+            Some(CalendarRow::Day(_)) if column_index == IMPORTANCE => COLUMN_COUNT,
             _ => 1,
         }
     }
@@ -144,7 +205,22 @@ impl TableDataSet<COLUMN_COUNT> for CalendarTable {
     /// A calendar with nothing in it is a fact rather than a state: the table says so
     /// under its headers instead of leaving the body blank.
     fn empty(&self, cx: &App) -> Option<AnyElement> {
-        Some(EmptyState::new("FinancialCalendarEmpty", t!(cx, "common.no_data")).into_any_element())
+        let key = empty_message_key(&self.filter);
+
+        Some(EmptyState::new("FinancialCalendarEmpty", t!(cx, key)).into_any_element())
+    }
+}
+
+/// The message a table with no row states.
+///
+/// An answer that carried no event and an answer the header narrowed to nothing are
+/// two different facts, and a reader who chose a filter is owed the second one: "no
+/// data" would read as if the calendar itself were empty.
+fn empty_message_key(filter: &CalendarFilter) -> &'static str {
+    if filter.is_all() {
+        "common.no_data"
+    } else {
+        "common.no_matches"
     }
 }
 
@@ -152,8 +228,6 @@ impl TableDataSet<COLUMN_COUNT> for CalendarTable {
 /// now.
 fn day_label(date: Date, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let weekday = t!(cx, weekday_key(date.weekday()));
-    let month = t!(cx, month_key(date.month()));
 
     div()
         .debug_selector(|| DAY_SELECTOR.into())
@@ -162,15 +236,26 @@ fn day_label(date: Date, cx: &App) -> AnyElement {
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.roles.fg.muted.hsla)
-        .child(t!(
-            cx,
-            "widget.financial_calendar.day_label",
-            weekday = weekday,
-            month = month,
-            day = date.day(),
-            year = date.year()
-        ))
+        .child(day_label_text(date, cx))
         .into_any_element()
+}
+
+/// The day a label heads, written the way the language showing writes a date.
+///
+/// The header's time control offers the same days and draws them with this, so the day
+/// a reader picks above the table is the day the table heads its events with.
+pub(crate) fn day_label_text(date: Date, cx: &App) -> SharedString {
+    let weekday = t!(cx, weekday_key(date.weekday()));
+    let month = t!(cx, month_key(date.month()));
+
+    t!(
+        cx,
+        "widget.financial_calendar.day_label",
+        weekday = weekday,
+        month = month,
+        day = date.day(),
+        year = date.year()
+    )
 }
 
 /// When an event is due, on the clock the settings display data in.
@@ -237,7 +322,7 @@ fn importance_cell(event: &CalendarEvent, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let color = match event.importance {
         Importance::Unspecified => theme.roles.fg.subtle.hsla,
-        Importance::Low => theme.roles.fg.subtle.hsla,
+        Importance::Low => theme.roles.status.success.base.hsla,
         Importance::Medium => theme.roles.status.warning.base.hsla,
         Importance::High => theme.roles.status.danger.base.hsla,
     };
@@ -303,6 +388,11 @@ mod tests {
         table
     }
 
+    /// The day of October 2026 a test filters by.
+    fn day(day: u8) -> Date {
+        Date::from_calendar_date(2026, Month::October, day).expect("a day of October 2026")
+    }
+
     #[test]
     fn a_table_of_one_day_should_head_it_once() {
         let table = table(snapshot(3), UtcOffset::UTC);
@@ -342,18 +432,145 @@ mod tests {
         );
     }
 
+    /// The header's options are the answer's own: a country or a day a reader can
+    /// choose is one the calendar holds, and narrowing the rows does not take the
+    /// others away.
+    #[test]
+    fn the_options_a_table_offers_should_come_from_the_whole_answer() {
+        let mut table = table(boundary_snapshot(), UtcOffset::UTC);
+        assert_eq!(table.dates(), [day(25), day(26)]);
+        assert_eq!(
+            table.countries(),
+            [SmolStr::new_static("CN"), SmolStr::new_static("US")]
+        );
+
+        table.select_country(Some(SmolStr::new_static("CN")), UtcOffset::UTC);
+
+        assert_eq!(table.rows_count(), 2, "one label and the one event left");
+        assert_eq!(
+            table.dates(),
+            [day(25), day(26)],
+            "the days the answer holds do not depend on the rows drawn"
+        );
+        assert_eq!(table.countries().len(), 2);
+    }
+
+    /// A choice the new answer no longer offers is dropped rather than left filtering
+    /// every row away: a table that drew nothing would read as an empty calendar.
+    #[test]
+    fn a_choice_the_new_answer_no_longer_offers_should_be_dropped() {
+        let mut table = table(snapshot(2), UtcOffset::UTC);
+        table.select_country(Some(SmolStr::new_static("DE")), UtcOffset::UTC);
+        assert_eq!(table.rows_count(), 2, "one label and the one German event");
+
+        table.rebuild(boundary_snapshot(), UtcOffset::UTC);
+
+        assert_eq!(
+            table.filter().country,
+            None,
+            "the new answer holds no German event"
+        );
+        assert_eq!(
+            table.rows_count(),
+            4,
+            "so every event of the new answer is drawn again"
+        );
+    }
+
+    /// The days an answer holds move with the zone, so a day the new grouping does not
+    /// hold is a choice it cannot keep either.
+    #[test]
+    fn a_day_the_zone_takes_away_should_be_dropped() {
+        let mut table = table(boundary_snapshot(), UtcOffset::UTC);
+        table.select_date(Some(day(25)), UtcOffset::UTC);
+        assert_eq!(table.rows_count(), 2, "the late event of the 25th alone");
+
+        table.regroup(UtcOffset::from_hms(8, 0, 0).expect("an offered offset"));
+
+        assert_eq!(table.filter().date, None);
+        assert_eq!(
+            table.rows_count(),
+            3,
+            "both events are the next day eight hours east"
+        );
+    }
+
+    /// A pane that can no longer vouch for its answer leaves no choice behind either:
+    /// the options went with the data the choice was about.
+    #[test]
+    fn clearing_the_table_should_clear_its_choices() {
+        let mut table = table(boundary_snapshot(), UtcOffset::UTC);
+        table.select_country(Some(SmolStr::new_static("US")), UtcOffset::UTC);
+        table.select_importance(Some(Importance::High), UtcOffset::UTC);
+
+        table.clear();
+
+        assert!(table.filter().is_all());
+        assert_eq!(table.rows_count(), 0);
+        assert!(table.dates().is_empty());
+        assert!(table.countries().is_empty());
+    }
+
+    #[test]
+    fn resetting_the_choices_should_draw_every_event_again() {
+        let mut table = table(snapshot(3), UtcOffset::UTC);
+        table.select_country(Some(SmolStr::new_static("US")), UtcOffset::UTC);
+        assert_eq!(
+            table.rows_count(),
+            3,
+            "one label and the two American events"
+        );
+
+        table.reset_filter(UtcOffset::UTC);
+
+        assert!(table.filter().is_all());
+        assert_eq!(table.rows_count(), 4);
+    }
+
+    /// A table narrowed to nothing says the filter matched nothing; one whose answer
+    /// carried nothing says there is no data. The two are different facts.
+    #[test]
+    fn an_empty_table_should_name_the_reason_it_is_empty() {
+        assert_eq!(
+            empty_message_key(&CalendarFilter::default()),
+            "common.no_data"
+        );
+        assert_eq!(
+            empty_message_key(&CalendarFilter {
+                country: Some(SmolStr::new_static("US")),
+                ..CalendarFilter::default()
+            }),
+            "common.no_matches"
+        );
+    }
+
+    #[test]
+    fn every_message_an_empty_table_names_should_be_in_every_locale() {
+        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+
+        for key in ["common.no_data", "common.no_matches"] {
+            for language in i18n.languages() {
+                assert!(
+                    i18n.try_translate(language, key)
+                        .is_some_and(|text| !text.is_empty()),
+                    "{key} should be named in {language}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_label_of_a_day_should_stand_for_every_column() {
         let table = table(snapshot(1), UtcOffset::UTC);
 
-        assert_eq!(table.column_span(0, TIME), COLUMN_COUNT);
+        assert_eq!(table.column_span(0, IMPORTANCE), COLUMN_COUNT);
         assert_eq!(
-            table.column_span(0, COUNTRY),
+            table.column_span(0, TIME),
             1,
             "only the first column is asked"
         );
         assert_eq!(
-            table.column_span(1, TIME),
+            table.column_span(1, IMPORTANCE),
             1,
             "an event is a row of its own"
         );

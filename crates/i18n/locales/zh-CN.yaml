@@ -126,7 +126,8 @@ error:
     proxy_changed: 代理配置已改变
     server_closed: 服务器关闭连接（%{code}）：%{reason}
   financial_calendar:
-    invalid_timestamp: '财经日历中包含无法对应日期的时刻：%{value}'
+    invalid_date: '财经日历中包含不存在的日期：%{year}-%{month}-%{day}'
+    invalid_time_of_day: '财经日历中包含不存在的时间：%{seconds} 秒'
     refresh_already_waiting: 财经日历已有一次刷新在等待
     stream_unavailable: 财经日历数据流不可用
   global_shipping_chokepoint:
@@ -605,9 +606,17 @@ widget:
   empty:
     hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
   financial_calendar:
+    all: 全部
     country: 国家
     day_label: '%{year}年%{month}%{day}日 %{weekday}'
+    filter_choice: '%{filter}：%{value}'
+    filter_tooltip: 按%{filter}筛选
     importance: 重要性
+    importance_level:
+      high: 高
+      low: 低
+      medium: 中
+      unspecified: 未指定
     logged_out: <p align="center">需要注册或登录后才能使用该功能。</p>
     month:
       april: 4月
@@ -624,6 +633,7 @@ widget:
       september: 9月
     name: 名称
     refresh: 刷新
+    reset: 重置
     weekday:
       friday: 星期五
       monday: 星期一

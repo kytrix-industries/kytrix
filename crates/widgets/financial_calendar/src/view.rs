@@ -43,8 +43,11 @@ use base_ui::{
     button::Button,
     icon::{Icon, IconKind},
     interactive::InteractiveVariantExt,
+    menu::{MenuItem, MenuItemAction},
+    select::Select,
     size::UnifiedSizable,
     table::Table,
+    tooltip::TooltipExt,
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement,
@@ -54,7 +57,8 @@ use gpui_kit::{
 use i18n::t;
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
+use time::Date;
 use widget::{
     account::account_of,
     binding::{WidgetBinding, WidgetRpcResult},
@@ -71,12 +75,12 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use crate::{
-    model::{CalendarParseError, CalendarSnapshot},
+    model::{CalendarParseError, CalendarSnapshot, Importance},
     service::{
         CalendarFetchError, CalendarProtocol, CalendarRequest, CalendarResponse, CalendarService,
         CalendarServiceError, CalendarSource, CalendarStreamKey, CalendarStreamMessage,
     },
-    table::CalendarTable,
+    table::{CalendarTable, day_label_text},
 };
 
 /// How often the pane re-reads the clock behind its countdown.
@@ -121,13 +125,18 @@ impl LocalizedError for CalendarFetchError {
 impl LocalizedError for CalendarParseError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidTimestamp { value } => {
-                t!(
-                    cx,
-                    "error.financial_calendar.invalid_timestamp",
-                    value = value
-                )
-            }
+            Self::InvalidDate { year, month, day } => t!(
+                cx,
+                "error.financial_calendar.invalid_date",
+                year = year,
+                month = month,
+                day = day
+            ),
+            Self::InvalidTimeOfDay { seconds } => t!(
+                cx,
+                "error.financial_calendar.invalid_time_of_day",
+                seconds = seconds
+            ),
         }
     }
 }
@@ -213,9 +222,12 @@ impl WidgetView for FinancialCalendarWidget {
         self.snapshot.is_some()
     }
 
-    /// The refresh control, with the time left until the next read on it.
+    /// The filters that narrow the calendar, and the refresh control with the time
+    /// left until the next read on it.
     fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
-        WidgetHeader::empty().right(self.refresh_control(cx))
+        WidgetHeader::empty()
+            .left(self.filter_controls(cx))
+            .right(self.refresh_control(cx))
     }
 }
 
@@ -570,6 +582,340 @@ impl FinancialCalendarWidget {
             )
             .into_any_element()
     }
+
+    /// The three filters and the control that clears them, in the order a reader
+    /// narrows a calendar down: how much it matters, when, and where.
+    ///
+    /// A trigger states the column it narrows and the choice it holds — "Importance:
+    /// ALL" — while its menu keeps the choices themselves, because those are what a
+    /// reader picks.
+    ///
+    /// They are greyed while there is no calendar at all: a choice only says which of
+    /// the rows on screen to draw, so with no rows to narrow it would change nothing,
+    /// and a live control that changes nothing reads as a broken one.
+    fn filter_controls(&self, cx: &Context<Self>) -> AnyElement {
+        let disabled = self.snapshot.is_none();
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(control(
+                "TEST_FINANCIAL_CALENDAR_IMPORTANCE",
+                self.importance_select(cx, disabled),
+            ))
+            .child(control(
+                "TEST_FINANCIAL_CALENDAR_TIME",
+                self.time_select(cx, disabled),
+            ))
+            .child(control(
+                "TEST_FINANCIAL_CALENDAR_COUNTRY",
+                self.country_select(cx, disabled),
+            ))
+            .child(control(
+                "TEST_FINANCIAL_CALENDAR_RESET",
+                self.reset_control(cx, disabled),
+            ))
+            .into_any_element()
+    }
+
+    /// The importance filter.
+    ///
+    /// The levels are the page's own fixed scale, so all of them are offered whether or
+    /// not the answer holds an event of that level: an option that came and went with
+    /// the data would move the others under the reader's hand.
+    fn importance_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
+        let name = t!(cx, "widget.financial_calendar.importance");
+        let all = t!(cx, "widget.financial_calendar.all");
+        let chosen = self.table.read(cx).filter().importance.map_or_else(
+            || all.clone(),
+            |importance| importance_label(importance, cx),
+        );
+        let mut select = Select::new(ElementId::Name(SharedString::new_static(
+            "FinancialCalendarImportance",
+        )))
+        .placeholder(t!(
+            cx,
+            "widget.financial_calendar.filter_choice",
+            filter = name.clone(),
+            value = chosen
+        ))
+        .ghost()
+        .small()
+        .disabled(disabled)
+        .aria_label(name.clone())
+        .with_tooltip(t!(
+            cx,
+            "widget.financial_calendar.filter_tooltip",
+            filter = name
+        ))
+        .menu_item(MenuItem::Action(MenuItemAction::new(
+            SharedString::new_static(ALL_CHOICE),
+            all,
+        )));
+
+        for importance in Importance::LEVELS {
+            select = select.menu_item(MenuItem::Action(MenuItemAction::new(
+                SharedString::new_static(importance_choice(importance)),
+                importance_label(importance, cx),
+            )));
+        }
+
+        select.on_change({
+            let widget = cx.entity();
+            move |selected, _, app| {
+                let Some(choice) = selected.as_deref() else {
+                    return;
+                };
+                let importance = importance_of_choice(choice);
+                widget.update(app, |this, cx| this.select_importance(importance, cx));
+            }
+        })
+    }
+
+    /// The day filter.
+    ///
+    /// The days are the ones the answer holds, drawn the way the table heads them, so a
+    /// reader picks the label they see over the rows they want. A day is chosen by the
+    /// date itself rather than by its label: the label is a word of the language
+    /// showing now, and a choice has to survive a change of it.
+    fn time_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
+        let name = t!(cx, "common.time");
+        let all = t!(cx, "widget.financial_calendar.all");
+        let table = self.table.read(cx);
+        let chosen = table
+            .filter()
+            .date
+            .map_or_else(|| all.clone(), |date| day_label_text(date, cx));
+        let select = table.dates().iter().fold(
+            Select::new(ElementId::Name(SharedString::new_static(
+                "FinancialCalendarTime",
+            )))
+            .placeholder(t!(
+                cx,
+                "widget.financial_calendar.filter_choice",
+                filter = name.clone(),
+                value = chosen
+            ))
+            .ghost()
+            .small()
+            .disabled(disabled)
+            .aria_label(name.clone())
+            .with_tooltip(t!(
+                cx,
+                "widget.financial_calendar.filter_tooltip",
+                filter = name
+            ))
+            .menu_item(MenuItem::Action(MenuItemAction::new(
+                SharedString::new_static(ALL_CHOICE),
+                all,
+            ))),
+            |select, date| {
+                select.menu_item(MenuItem::Action(MenuItemAction::new(
+                    date_choice(*date),
+                    day_label_text(*date, cx),
+                )))
+            },
+        );
+
+        select.on_change({
+            let widget = cx.entity();
+            move |selected, _, app| {
+                let Some(choice) = selected.as_deref() else {
+                    return;
+                };
+                widget.update(app, |this, cx| this.select_date(choice, cx));
+            }
+        })
+    }
+
+    /// The country filter.
+    ///
+    /// A country is drawn as the code the answer publishes, which is what the table's
+    /// country column draws: a reader scanning the rows for one code finds that same
+    /// code in the menu.
+    fn country_select(&self, cx: &Context<Self>, disabled: bool) -> Select {
+        let name = t!(cx, "widget.financial_calendar.country");
+        let all = t!(cx, "widget.financial_calendar.all");
+        let table = self.table.read(cx);
+        let chosen = table.filter().country.as_ref().map_or_else(
+            || all.clone(),
+            |country| SharedString::new(country.as_str()),
+        );
+        let select = table.countries().iter().fold(
+            Select::new(ElementId::Name(SharedString::new_static(
+                "FinancialCalendarCountry",
+            )))
+            .placeholder(t!(
+                cx,
+                "widget.financial_calendar.filter_choice",
+                filter = name.clone(),
+                value = chosen
+            ))
+            .ghost()
+            .small()
+            .disabled(disabled)
+            .aria_label(name.clone())
+            .with_tooltip(t!(
+                cx,
+                "widget.financial_calendar.filter_tooltip",
+                filter = name
+            ))
+            .menu_item(MenuItem::Action(MenuItemAction::new(
+                SharedString::new_static(ALL_CHOICE),
+                all,
+            ))),
+            |select, country| {
+                select.menu_item(MenuItem::Action(MenuItemAction::new(
+                    SharedString::new(country.as_str()),
+                    SharedString::new(country.as_str()),
+                )))
+            },
+        );
+
+        select.on_change({
+            let widget = cx.entity();
+            move |selected, _, app| {
+                let Some(choice) = selected.as_deref() else {
+                    return;
+                };
+                let country = country_of_choice(choice);
+                widget.update(app, |this, cx| this.select_country(country, cx));
+            }
+        })
+    }
+
+    /// The control that puts every filter back to "all".
+    ///
+    /// It is greyed while there is nothing to clear, and — like every other disabled
+    /// control of this pane — it carries no click handler at all.
+    fn reset_control(&self, cx: &Context<Self>, disabled: bool) -> Button {
+        let resettable = !self.table.read(cx).filter().is_all();
+        let disabled = disabled || !resettable;
+        let label = t!(cx, "widget.financial_calendar.reset");
+        let widget = cx.entity();
+
+        Button::new(ElementId::Name(SharedString::new_static(
+            "FinancialCalendarReset",
+        )))
+        .ghost()
+        .small()
+        .disabled(disabled)
+        .aria_label(label.clone())
+        .with_tooltip(label)
+        .child(Icon::new(IconKind::FunnelX).size_3())
+        .when(!disabled, |button| {
+            button.on_click(move |_, _, app| {
+                widget.update(app, |this, cx| this.reset_filters(cx));
+            })
+        })
+    }
+
+    /// Narrows the rows to one importance level, or to every level.
+    fn select_importance(&mut self, importance: Option<Importance>, cx: &mut Context<Self>) {
+        let zone = data_time_zone(cx);
+        self.table
+            .update(cx, |table, _| table.select_importance(importance, zone));
+        cx.notify();
+    }
+
+    /// Narrows the rows to the day a menu entry names, or to every day.
+    ///
+    /// A choice the answer does not hold — a menu left open while a read replaced the
+    /// calendar under it — names no day, which is the "all" option.
+    fn select_date(&mut self, choice: &str, cx: &mut Context<Self>) {
+        let date = if choice == ALL_CHOICE {
+            None
+        } else {
+            let table = self.table.read(cx);
+            table
+                .dates()
+                .iter()
+                .copied()
+                .find(|date| date_choice(*date).as_str() == choice)
+        };
+        let zone = data_time_zone(cx);
+        self.table
+            .update(cx, |table, _| table.select_date(date, zone));
+        cx.notify();
+    }
+
+    /// Narrows the rows to one country, or to every country.
+    fn select_country(&mut self, country: Option<SmolStr>, cx: &mut Context<Self>) {
+        let zone = data_time_zone(cx);
+        self.table
+            .update(cx, |table, _| table.select_country(country, zone));
+        cx.notify();
+    }
+
+    /// Puts every filter back to "all", which is what the reset control does.
+    fn reset_filters(&mut self, cx: &mut Context<Self>) {
+        let zone = data_time_zone(cx);
+        self.table.update(cx, |table, _| table.reset_filter(zone));
+        cx.notify();
+    }
+}
+
+/// The stable id of the "all" option every filter offers.
+const ALL_CHOICE: &str = "all";
+
+/// The id an importance level is chosen by.
+///
+/// It is the level's name rather than its label, so the choice survives a change of
+/// language the way a day's does.
+fn importance_choice(importance: Importance) -> &'static str {
+    match importance {
+        Importance::Low => "low",
+        Importance::Medium => "medium",
+        Importance::High => "high",
+        Importance::Unspecified => "unspecified",
+    }
+}
+
+/// The level a menu entry names, or every level when it names none of them.
+fn importance_of_choice(choice: &str) -> Option<Importance> {
+    Importance::LEVELS
+        .into_iter()
+        .find(|importance| importance_choice(*importance) == choice)
+}
+
+/// The label of one importance level.
+fn importance_label(importance: Importance, cx: &App) -> SharedString {
+    let key = match importance {
+        Importance::Low => "widget.financial_calendar.importance_level.low",
+        Importance::Medium => "widget.financial_calendar.importance_level.medium",
+        Importance::High => "widget.financial_calendar.importance_level.high",
+        Importance::Unspecified => "widget.financial_calendar.importance_level.unspecified",
+    };
+
+    t!(cx, key)
+}
+
+/// The id a day is chosen by.
+///
+/// It is the date itself, written the way a date is read from an answer rather than the
+/// way it is drawn: the label is a word of the language showing now, and a choice has
+/// to survive a change of it.
+fn date_choice(date: Date) -> SharedString {
+    SharedString::new(format_smolstr!("{date}").as_str())
+}
+
+/// The country a menu entry names, or every country when it names the "all" option.
+fn country_of_choice(choice: &str) -> Option<SmolStr> {
+    (choice != ALL_CHOICE).then(|| SmolStr::new(choice))
+}
+
+/// One header control, in a box of its own.
+///
+/// The controls themselves are `base_ui` elements and carry no debug selector, and the
+/// order they sit in is part of what this pane promises: a box per control is what lets
+/// a test tell them apart and measure that order.
+fn control(selector: &'static str, control: impl IntoElement) -> AnyElement {
+    div()
+        .debug_selector(move || selector.into())
+        .child(control)
+        .into_any_element()
 }
 
 impl Render for FinancialCalendarWidget {
@@ -599,10 +945,12 @@ mod tests {
         settings::{AccountConfig, AccountWalletKind, Config},
         time_zone::DataTimeZone,
     };
-    use base_ui::table::TableDataSet;
+    use base_ui::{animation::ANIMATION_TICK, table::TableDataSet};
     use gpui_kit::{
-        AppContext, BorrowAppContext, IntoElement, Render, TestAppContext, Window, div,
+        AppContext, BorrowAppContext, IntoElement, Modifiers, Render, TestAppContext,
+        VisualTestContext, Window, div,
     };
+    use i18n::language::codes::LanguageCode;
     use widget::protocol::RequestId;
 
     use super::*;
@@ -1393,13 +1741,30 @@ mod tests {
     }
 
     /// One pane mounted in a window of its own, which is what paints it.
+    ///
+    /// The header is built by the workspace around the widget, so a harness that drew
+    /// the body alone would never paint the controls the header carries: this one draws
+    /// the widget's own groups above the body.
     struct Harness {
         pane: Entity<FinancialCalendarWidget>,
     }
 
     impl Render for Harness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.pane.clone())
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let header = self.pane.update(cx, |pane, cx| pane.header(window, cx));
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .children(header.left)
+                        .children(header.right),
+                )
+                .child(div().flex_1().min_h_0().child(self.pane.clone()))
         }
     }
 
@@ -1478,10 +1843,10 @@ mod tests {
         );
     }
 
-    /// The header carries the refresh control and nothing else, and the countdown is
-    /// that control's own label rather than a word beside it.
+    /// The header carries the filters on the left and the refresh on the right, and the
+    /// countdown is that control's own label rather than a word beside it.
     #[gpui_kit::test]
-    fn the_header_should_carry_the_refresh_and_its_countdown(cx: &mut TestAppContext) {
+    fn the_header_should_carry_the_filters_the_refresh_and_its_countdown(cx: &mut TestAppContext) {
         let (pane, cx) = windowed(cx);
 
         cx.update(|_, cx| {
@@ -1498,12 +1863,12 @@ mod tests {
             let header = pane.update(cx, |pane, cx| pane.header(window, cx));
 
             assert!(
-                header.right.is_some(),
-                "the refresh is the header's right group"
+                header.left.is_some(),
+                "the filters are the header's left group"
             );
             assert!(
-                header.left.is_none(),
-                "and the drag area of the header is left to the pane"
+                header.right.is_some(),
+                "the refresh is the header's right group"
             );
         });
 
@@ -1521,6 +1886,330 @@ mod tests {
                     .is_some_and(|due| due > unix_millis()),
                 "the pane counts down to a read that is still ahead of it"
             );
+        });
+    }
+
+    /// The four controls the header's left group is made of, in the order a reader
+    /// narrows a calendar down: how much it matters, when, where, and the control that
+    /// clears all three.
+    #[gpui_kit::test]
+    fn the_header_should_draw_the_filters_in_order_and_the_reset_last(cx: &mut TestAppContext) {
+        let (pane, cx) = windowed(cx);
+        cx.update(|_, cx| {
+            report_snapshot(&pane, &test_support::boundary_snapshot(), i64::MAX, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let selectors = [
+            "TEST_FINANCIAL_CALENDAR_IMPORTANCE",
+            "TEST_FINANCIAL_CALENDAR_TIME",
+            "TEST_FINANCIAL_CALENDAR_COUNTRY",
+            "TEST_FINANCIAL_CALENDAR_RESET",
+        ]
+        .map(|selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("the header should draw {selector}"))
+        });
+
+        for (one, next) in selectors.iter().zip(selectors.iter().skip(1)) {
+            assert!(
+                one.right() <= next.left(),
+                "each filter sits left of the one after it: {one:?} then {next:?}"
+            );
+        }
+    }
+
+    /// Every filter says what it narrows while it is hovered, which is what a reader
+    /// needs when the header is too narrow to show a whole choice.
+    #[gpui_kit::test]
+    fn every_filter_should_say_what_it_narrows_on_hover(cx: &mut TestAppContext) {
+        let (pane, cx) = windowed(cx);
+        cx.update(|_, cx| {
+            report_snapshot(&pane, &test_support::boundary_snapshot(), i64::MAX, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        for selector in [
+            "TEST_FINANCIAL_CALENDAR_IMPORTANCE",
+            "TEST_FINANCIAL_CALENDAR_TIME",
+            "TEST_FINANCIAL_CALENDAR_COUNTRY",
+        ] {
+            hover(cx, selector);
+            assert!(
+                cx.debug_bounds("BASE_UI_TOOLTIP").is_some(),
+                "{selector} should explain itself while it is hovered"
+            );
+
+            // The day label belongs to the body rather than to the header, so pointing
+            // at it leaves the control the tooltip was opened from.
+            hover(cx, "TEST_FINANCIAL_CALENDAR_DAY");
+            assert!(
+                cx.debug_bounds("BASE_UI_TOOLTIP").is_none(),
+                "the tooltip belongs to the control it was opened from"
+            );
+        }
+    }
+
+    /// Moves the pointer onto what `selector` names and lets the tooltip it opens
+    /// appear.
+    fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+        let target = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("the harness should draw {selector}"))
+            .center();
+        cx.simulate_mouse_move(target, None, Modifiers::none());
+        cx.run_until_parked();
+        for _ in 0..10 {
+            cx.executor()
+                .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+    }
+
+    /// A filter's trigger names the column it narrows and the choice it holds, while the
+    /// menu keeps the choices themselves.
+    #[test]
+    fn a_filter_trigger_should_name_its_filter_and_its_choice() {
+        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+
+        for (language, expected) in [
+            (LanguageCode::En, "Importance: ALL"),
+            (LanguageCode::ZhCn, "重要性：全部"),
+        ] {
+            let filter = i18n.translate(language, "widget.financial_calendar.importance");
+            let value = i18n.translate(language, "widget.financial_calendar.all");
+            let trigger = i18n.translate_with(
+                language,
+                "widget.financial_calendar.filter_choice",
+                &[("filter", &filter), ("value", &value)],
+            );
+
+            assert_eq!(trigger.as_ref(), expected);
+        }
+    }
+
+    /// Every filter's tooltip says what the control narrows, in the language showing
+    /// now.
+    #[test]
+    fn a_filter_tooltip_should_say_what_the_filter_narrows() {
+        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+
+        for (language, expected) in [
+            (LanguageCode::En, "Filter by Country"),
+            (LanguageCode::ZhCn, "按国家筛选"),
+        ] {
+            let filter = i18n.translate(language, "widget.financial_calendar.country");
+            let tooltip = i18n.translate_with(
+                language,
+                "widget.financial_calendar.filter_tooltip",
+                &[("filter", &filter)],
+            );
+
+            assert_eq!(tooltip.as_ref(), expected);
+        }
+    }
+
+    /// A choice narrows the rows without reading the calendar again, and the reset
+    /// control is what brings every row back.
+    #[gpui_kit::test]
+    fn a_choice_should_narrow_the_rows_and_the_reset_should_bring_them_back(
+        cx: &mut TestAppContext,
+    ) {
+        let source = FakeSource::new([FetchPlan::Pending]);
+        let reads = source.clone();
+        let pane = pane_with(cx, Some(ACCOUNT), source);
+
+        cx.update(|cx| {
+            report_snapshot(&pane, &test_support::snapshot(2), i64::MAX, cx);
+            let reads_before = reads.fetch_count();
+            assert_eq!(rows(&pane, cx), 3, "one label and the two events");
+
+            pane.update(cx, |pane, cx| {
+                pane.select_country(Some(SmolStr::new_static("US")), cx);
+            });
+            assert_eq!(rows(&pane, cx), 2, "one label and the one American event");
+            assert_eq!(
+                reads.fetch_count(),
+                reads_before,
+                "a filter is about the rows already on screen, not a reason to read again"
+            );
+
+            pane.update(cx, |pane, cx| {
+                pane.select_importance(Some(Importance::High), cx);
+            });
+            assert_eq!(
+                rows(&pane, cx),
+                0,
+                "the two choices narrow the calendar together: the fixture events are \
+                 medium, so no row is left"
+            );
+
+            pane.update(cx, |pane, cx| pane.reset_filters(cx));
+            assert_eq!(rows(&pane, cx), 3, "the reset brings every row back");
+            assert!(
+                pane.read(cx).table.read(cx).filter().is_all(),
+                "and leaves every filter on its \"all\" option"
+            );
+        });
+    }
+
+    /// The reset is a control rather than a method the tests call: the click it carries
+    /// is what clears the choices, and it is the same click a reader makes.
+    #[gpui_kit::test]
+    fn clicking_the_reset_control_should_clear_every_choice(cx: &mut TestAppContext) {
+        let (pane, cx) = windowed(cx);
+        cx.update(|_, cx| {
+            report_snapshot(&pane, &test_support::snapshot(2), i64::MAX, cx);
+            pane.update(cx, |pane, cx| {
+                pane.select_country(Some(SmolStr::new_static("US")), cx);
+            });
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| rows(&pane, cx)), 2);
+
+        let target = cx
+            .debug_bounds("TEST_FINANCIAL_CALENDAR_RESET")
+            .expect("the header draws the reset control")
+            .center();
+        cx.simulate_click(target, Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, cx| rows(&pane, cx)),
+            3,
+            "the click put the choice back to \"all\""
+        );
+        assert!(cx.update(|_, cx| pane.read(cx).table.read(cx).filter().is_all()));
+    }
+
+    /// The options belong to the answer, so a choice the new one no longer offers goes
+    /// back to "all" rather than emptying the table.
+    #[gpui_kit::test]
+    fn a_choice_the_new_answer_no_longer_offers_should_be_reset(cx: &mut TestAppContext) {
+        let pane = pane(cx, Some(ACCOUNT));
+
+        cx.update(|cx| {
+            report_snapshot(&pane, &test_support::snapshot(2), i64::MAX, cx);
+            pane.update(cx, |pane, cx| {
+                pane.select_country(Some(SmolStr::new_static("DE")), cx);
+            });
+            assert_eq!(rows(&pane, cx), 2, "one label and the one German event");
+
+            report_snapshot(&pane, &test_support::boundary_snapshot(), i64::MAX, cx);
+
+            assert_eq!(
+                pane.read(cx).table.read(cx).filter().country,
+                None,
+                "the new answer holds no German event, so the choice is not one to keep"
+            );
+            assert_eq!(rows(&pane, cx), 4, "and every event of it is drawn again");
+        });
+    }
+
+    /// The importance scale is the page's own rather than the answer's, so a level the
+    /// new answer happens to have no event of is still a choice a reader may keep — and
+    /// the table says the filter matched nothing.
+    #[gpui_kit::test]
+    fn an_importance_choice_should_outlive_an_answer_with_no_event_of_that_level(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx) = windowed(cx);
+
+        cx.update(|_, cx| {
+            report_snapshot(&pane, &test_support::boundary_snapshot(), i64::MAX, cx);
+            pane.update(cx, |pane, cx| {
+                pane.select_importance(Some(Importance::High), cx);
+            });
+            assert_eq!(
+                rows(&pane, cx),
+                2,
+                "one label and the one event of that level"
+            );
+
+            report_snapshot(&pane, &test_support::snapshot(2), i64::MAX, cx);
+
+            assert_eq!(
+                pane.read(cx).table.read(cx).filter().importance,
+                Some(Importance::High),
+                "the levels are fixed, so the answer cannot take one away"
+            );
+            assert_eq!(rows(&pane, cx), 0, "and nothing of the new answer is of it");
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("EMPTY_STATE").is_some(),
+            "the table says it is empty rather than drawing nothing"
+        );
+    }
+
+    /// The days an answer holds move with the zone, so a day the new grouping does not
+    /// hold is a choice it cannot keep either.
+    #[gpui_kit::test]
+    fn a_day_the_zone_takes_away_should_reset_the_choice(cx: &mut TestAppContext) {
+        let pane = pane(cx, Some(ACCOUNT));
+
+        cx.update(|cx| {
+            report_snapshot(&pane, &test_support::boundary_snapshot(), i64::MAX, cx);
+            let date =
+                Date::from_calendar_date(2026, time::Month::October, 25).expect("a real date");
+            pane.update(cx, |pane, cx| pane.select_date("2026-10-25", cx));
+            assert_eq!(rows(&pane, cx), 2, "the late event of the 25th alone");
+            assert_eq!(pane.read(cx).table.read(cx).filter().date, Some(date));
+        });
+
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| {
+                        config.data_time_zone =
+                            DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset");
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                pane.read(cx).table.read(cx).filter().date,
+                None,
+                "eight hours east the answer holds no 25th to filter by"
+            );
+            assert_eq!(
+                rows(&pane, cx),
+                3,
+                "so both events are drawn under the one day they fall on"
+            );
+        });
+    }
+
+    /// A pane that can no longer vouch for its answer leaves no filter behind either:
+    /// the options went with the data the filter was about.
+    #[gpui_kit::test]
+    fn signing_out_should_reset_the_filters(cx: &mut TestAppContext) {
+        let pane = pane(cx, Some(ACCOUNT));
+
+        cx.update(|cx| {
+            report_snapshot(&pane, &test_support::snapshot(2), i64::MAX, cx);
+            pane.update(cx, |pane, cx| {
+                pane.select_country(Some(SmolStr::new_static("US")), cx);
+            });
+            assert!(!pane.read(cx).table.read(cx).filter().is_all());
+
+            pane.update(cx, |pane, cx| pane.reconcile_account(None, cx));
+
+            assert!(
+                pane.read(cx).table.read(cx).filter().is_all(),
+                "the signed-out pane holds no option a filter could name"
+            );
+            assert_eq!(rows(&pane, cx), 0);
         });
     }
 

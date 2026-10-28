@@ -17,7 +17,7 @@ use std::{
 
 use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::KytrixServiceError;
-use time::{Date, Month};
+use time::{Date, Month, OffsetDateTime, UtcOffset};
 
 use crate::{
     model::{CalendarSnapshot, Importance},
@@ -41,7 +41,7 @@ pub(crate) fn at(day: u8, hour: u8) -> i64 {
         * 1_000
 }
 
-/// One event of a fixture answer.
+/// One event of a fixture answer, due at `at` — a clock, even at midnight.
 pub(crate) fn proto_event(
     at: i64,
     country: &str,
@@ -50,22 +50,24 @@ pub(crate) fn proto_event(
     reference: Option<&str>,
 ) -> proto_types::FinancialCalendarEvent {
     let importance = match importance {
-        Importance::Unspecified => {
-            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceUnspecified
-        }
-        Importance::Low => {
-            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceLow
-        }
-        Importance::Medium => {
-            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceMedium
-        }
-        Importance::High => {
-            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceHigh
-        }
+        Importance::Unspecified => proto_types::FinancialCalendarEventImportance::Unspecified,
+        Importance::Low => proto_types::FinancialCalendarEventImportance::Low,
+        Importance::Medium => proto_types::FinancialCalendarEventImportance::Medium,
+        Importance::High => proto_types::FinancialCalendarEventImportance::High,
     };
+    let datetime = OffsetDateTime::from_unix_timestamp_nanos(i128::from(at) * 1_000_000)
+        .expect("a fixture instant is one the calendar holds")
+        .to_offset(UtcOffset::UTC);
 
     proto_types::FinancialCalendarEvent {
-        timestamp: at,
+        year: datetime.year() as u32,
+        month: datetime.month() as u32,
+        day: datetime.day() as u32,
+        seconds_of_day: Some(
+            u32::from(datetime.hour()) * 3_600
+                + u32::from(datetime.minute()) * 60
+                + u32::from(datetime.second()),
+        ),
         country_code: country.to_owned(),
         name: name.to_owned(),
         importance: importance as i32,

@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=d5a6f93eede7fa74edcf4273eb97370202bf1acd#d5a6f93eede7fa74edcf4273eb97370202bf1acd"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=22a7ce4584cd560ccf0c975197638979c973cd67#22a7ce4584cd560ccf0c975197638979c973cd67"
 dependencies = [
  "bytes",
  "prost",
@@ -7457,7 +7457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
