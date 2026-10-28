@@ -3,9 +3,10 @@
 //! The gauge is vector geometry rather than a picture: a picture would bake one
 //! theme's colours into it and be rasterized at one scale, and this pane has to be
 //! drawn in both appearances at every display density. So each of the five bands is
-//! a filled annulus sector, the ends are drawn as circles over the cuts to give them
-//! round caps, and the current reading is a dot on the centre line of the band — all
-//! from the semantic roles, none of it from a palette value or a literal colour.
+//! a filled annulus sector, each end of a sector is rounded by a circle centred on
+//! that sector's own end, and the current reading is a dot on the centre line of the
+//! band — all from the semantic roles, none of it from a palette value or a literal
+//! colour.
 //!
 //! The canvas has two states, and both draw the reading:
 //!
@@ -49,11 +50,14 @@ const SWEEP: f32 = 180.0;
 /// The band's thickness, as a share of the canvas' shorter side.
 const BAND_RATIO: f32 = 0.09;
 
-/// How much of the canvas' height is left below the arc.
-const BOTTOM_INSET_RATIO: f32 = 0.10;
-
-/// The gap at each end of a band, as a share of the band's thickness.
-const GAP_RATIO: f32 = 0.4;
+/// How far each end of a band is pulled back from its boundary, as a share of the
+/// band's thickness.
+///
+/// A cap's radius is half the band, so an end has to be pulled back more than half a
+/// band for the two caps at a boundary to sit apart instead of on top of each other.
+/// The reference's value is 0.65: it leaves a visible gap of 0.3 of the band between
+/// the two caps.
+const GAP_RATIO: f32 = 0.65;
 
 /// The narrowest canvas a gauge is drawn on.
 const MIN_CANVAS_WIDTH: f32 = 96.0;
@@ -61,8 +65,17 @@ const MIN_CANVAS_WIDTH: f32 = 96.0;
 /// The shortest canvas a gauge is drawn on.
 const MIN_CANVAS_HEIGHT: f32 = 72.0;
 
-/// The score's font size, as a share of the canvas' height.
-const SCORE_TEXT_RATIO: f32 = 0.28;
+/// The score's font size, as a share of the band's radius.
+///
+/// The gauge's radius is what the text has to fit inside, and a narrow pane limits
+/// that radius by its width while the canvas keeps its height. Sizing the text from
+/// the height would leave it at full size while the arc shrinks under it, which is
+/// exactly the overlap a narrow pane used to draw.
+const SCORE_TEXT_RADIUS_RATIO: f32 = 0.35;
+
+/// The score's font size, as a share of the canvas' shorter side, when the canvas
+/// is too small to draw a gauge and only the words are left.
+const SCORE_TEXT_FALLBACK_RATIO: f32 = 0.28;
 
 /// The level's font size, as a share of the score's.
 const LEVEL_TEXT_RATIO: f32 = 0.55;
@@ -84,10 +97,28 @@ const TEXT_LINE_GAP_RATIO: f32 = 0.15;
 const TEXT_ABOVE_DIAMETER_RATIO: f32 = 0.1;
 
 /// The indicator's radius, as a share of a band end's.
-const INDICATOR_RATIO: f32 = 1.15;
+///
+/// The reference's marker is a circle whose diameter is a third wider than the band:
+/// it covers the band it sits on and reads as a marker rather than as another cap.
+const INDICATOR_RATIO: f32 = 1.33;
 
-/// The width of the ring the indicator is seated in, in pixels.
-const INDICATOR_HALO: f32 = 2.0;
+/// The indicator ring's width, as a share of the band's thickness.
+///
+/// The ring has to grow with the gauge: a fixed width is a hairline on a large
+/// gauge and swallows a small one. Twenty percent of the band is the width the
+/// narrow reference-sized gauge wanted — 8px at a 40px band.
+const INDICATOR_HALO_RATIO: f32 = 0.2;
+
+/// The narrowest the indicator ring is allowed to be, in pixels.
+///
+/// Below this the ring stops separating the marker from the band at all.
+const MIN_INDICATOR_HALO: f32 = 2.0;
+
+/// The widest the indicator ring is allowed to be, in pixels.
+///
+/// Above this the ring starts to read as a second circle rather than as a gap
+/// around the marker.
+const MAX_INDICATOR_HALO: f32 = 16.0;
 
 /// Where every piece of the gauge goes, for one canvas box.
 ///
@@ -106,16 +137,25 @@ struct GaugeGeometry {
     outer_radius: Pixels,
     /// The inner edge of the band.
     inner_radius: Pixels,
+    /// The radius of the reading's dot. Its ring adds `indicator_halo` past it, and
+    /// that reach is what the geometry keeps room for.
+    indicator_radius: Pixels,
+    /// The width of the ring around the reading's dot, in pixels. It follows the
+    /// band between [`MIN_INDICATOR_HALO`] and [`MAX_INDICATOR_HALO`].
+    indicator_halo: Pixels,
     /// How far each end of a band is pulled back from its boundary, in degrees.
     gap_half: f32,
 }
 
 impl GaugeGeometry {
-    /// Places the gauge in `bounds`, or answers nothing when the box is too small
-    /// to hold one.
+    /// Places the gauge and its reading as one block, centred on both axes, or
+    /// answers nothing when the box is too small to hold one.
     ///
-    /// The band's radius keeps room for its own thickness and for the ends' caps, so
-    /// the outermost point of the drawing is exactly the radius the box allows.
+    /// The block is the arc's outer edge plus the indicator's ring above the
+    /// diameter, and the indicator's ring below it; the caps at the ends reach less
+    /// far down than the indicator does. Sizing the band from both the width and
+    /// that block's height is what keeps the gauge inside the canvas, and centring
+    /// the block is what keeps a tall pane from pinning the gauge to its bottom.
     fn compute(bounds: Bounds<Pixels>) -> Option<Self> {
         let width = f32::from(bounds.size.width);
         let height = f32::from(bounds.size.height);
@@ -125,19 +165,25 @@ impl GaugeGeometry {
 
         let band = (height * BAND_RATIO).min(width * BAND_RATIO);
         let cap_radius = band / 2.0;
-        let bottom_inset = height * BOTTOM_INSET_RATIO;
-        let limit = (width / 2.0).min(height - bottom_inset);
-        // The ends' caps reach one cap radius past the band's centre line, so the
-        // band's radius gives back the whole band's thickness rather than half of it.
-        let band_radius = limit - band;
+        let indicator_radius = cap_radius * INDICATOR_RATIO;
+        let indicator_halo =
+            (band * INDICATOR_HALO_RATIO).clamp(MIN_INDICATOR_HALO, MAX_INDICATOR_HALO);
+        let indicator_reach = indicator_radius + indicator_halo;
+        let band_radius = (width / 2.0 - indicator_reach).min(height - 2.0 * indicator_reach);
+        if band_radius <= 0.0 {
+            return None;
+        }
         let gap_half = ((band * GAP_RATIO) / band_radius).to_degrees();
+        let center_y = bounds.top() + px((height + band_radius) / 2.0);
 
         Some(Self {
-            center: point(bounds.center().x, bounds.bottom() - px(bottom_inset)),
+            center: point(bounds.center().x, center_y),
             cap_radius: px(cap_radius),
             band_radius: px(band_radius),
             outer_radius: px(band_radius + cap_radius),
             inner_radius: px(band_radius - cap_radius),
+            indicator_radius: px(indicator_radius),
+            indicator_halo: px(indicator_halo),
             gap_half,
         })
     }
@@ -168,14 +214,16 @@ impl GaugeGeometry {
 
     /// The ten end circles, each with the band it caps.
     ///
-    /// The centres sit on the boundaries the bands were assigned rather than on the
-    /// trimmed arcs, so a cap covers the straight cut its own band was drawn with.
+    /// The centres sit on the ends of the trimmed arcs, not on the boundaries the
+    /// bands were assigned: a cap rounds the cut its own band was drawn with, and a
+    /// cap left on the boundary would sit in the gap and reach into its neighbour.
     fn cap_centers(&self) -> [(Point<Pixels>, usize); CAP_COUNT] {
         std::array::from_fn(|index| {
             let segment = index / 2;
-            let boundary = self.segment_span(segment).0 + SEGMENT_SWEEP * (index % 2) as f32;
+            let (start, end) = self.arc_span(segment);
+            let angle = if index % 2 == 0 { start } else { end };
 
-            (self.point_at(boundary, self.band_radius), segment)
+            (self.point_at(angle, self.band_radius), segment)
         })
     }
 
@@ -198,16 +246,16 @@ impl GaugeGeometry {
 
     /// The reading's dot and the ring it is seated in.
     ///
-    /// The ring is wider than the dot by [`INDICATOR_HALO`] on every side, so its
+    /// The ring is wider than the dot by `indicator_halo` on every side, so its
     /// corner radius is the dot's radius plus that enlargement — the radius that
     /// rounds it is the radius it is drawn at, not the dot's.
     fn indicator_quads(&self, score: u8, colors: &GaugeColors) -> (PaintQuad, PaintQuad) {
         let center = self.indicator_center(score);
-        let radius = self.cap_radius * INDICATOR_RATIO;
+        let radius = self.indicator_radius;
 
         (
-            circle_quad(center, radius + px(INDICATOR_HALO), colors.halo),
-            circle_quad(center, radius, colors.indicator),
+            circle_quad(center, radius + self.indicator_halo, colors.halo),
+            circle_quad(center, radius, colors.text),
         )
     }
 
@@ -247,16 +295,14 @@ impl GaugeGeometry {
 struct GaugeColors {
     /// One colour per band, in the order the bands are drawn.
     segments: [Hsla; SEGMENT_COUNT],
-    /// The indicator, which is the colour of the band the reading is in.
-    indicator: Hsla,
     /// The ring the indicator is seated in.
     halo: Hsla,
-    /// The score and the level's name.
+    /// The score, the level's name and the reading's dot.
     text: Hsla,
 }
 
 impl GaugeColors {
-    fn resolve(theme: &Theme, level: Level) -> Self {
+    fn resolve(theme: &Theme) -> Self {
         Self {
             segments: [
                 level_color(theme, Level::ExtremeFear),
@@ -265,26 +311,28 @@ impl GaugeColors {
                 level_color(theme, Level::Greed),
                 level_color(theme, Level::ExtremeGreed),
             ],
-            indicator: level_color(theme, level),
+            // The framework draws every widget body on `surface.sunken`, so the
+            // ring is the body's own background: it reads as a cut-out in the band
+            // rather than as an outline drawn around the dot.
             halo: theme.roles.surface.sunken.hsla,
             text: theme.roles.fg.default.hsla,
         }
     }
 }
 
-/// The colour one level of the scale is drawn in.
+/// The colour one level of the fear-and-greed scale is drawn in.
 ///
-/// Every colour is a resolved role: the two market roles say "down" and "up" rather
-/// than "bad" and "good", and the two status roles are the extremes the market ones
-/// do not reach. The two pairs are close in hue but never adjacent on the scale —
-/// neutral sits between them — so the five bands stay distinguishable side by side.
+/// The scale reads the theme's own five-step ramp rather than the status and market
+/// roles: the two market colours are deliberately close to their status neighbours,
+/// which is right for a price and wrong for five bands that have to be told apart
+/// side by side.
 pub(crate) fn level_color(theme: &Theme, level: Level) -> Hsla {
     match level {
-        Level::ExtremeFear => theme.roles.status.danger.base.hsla,
-        Level::Fear => theme.roles.market.down.hsla,
-        Level::Neutral => theme.roles.status.warning.base.hsla,
-        Level::Greed => theme.roles.market.up.hsla,
-        Level::ExtremeGreed => theme.roles.status.success.base.hsla,
+        Level::ExtremeFear => theme.roles.fear_greed.extreme_fear.hsla,
+        Level::Fear => theme.roles.fear_greed.fear.hsla,
+        Level::Neutral => theme.roles.fear_greed.neutral.hsla,
+        Level::Greed => theme.roles.fear_greed.greed.hsla,
+        Level::ExtremeGreed => theme.roles.fear_greed.extreme_greed.hsla,
     }
 }
 
@@ -348,7 +396,7 @@ impl Gauge {
     /// The level's name is resolved by the caller, in the language the frame draws
     /// in, which is also what makes a language change a new prepared frame.
     pub(crate) fn element(&self, score: u8, level: SharedString, cx: &App) -> impl IntoElement {
-        let colors = GaugeColors::resolve(cx.theme(), Level::of(score));
+        let colors = GaugeColors::resolve(cx.theme());
         let prepared = self.prepared.clone();
 
         canvas(
@@ -396,8 +444,7 @@ fn prepare(
     }
 
     let geometry = GaugeGeometry::compute(bounds);
-    let score_size = px(f32::from(bounds.size.height) * SCORE_TEXT_RATIO);
-    let level_size = score_size * LEVEL_TEXT_RATIO;
+    let (score_size, level_size) = text_sizes(bounds, geometry);
     let score_height = score_size * LINE_HEIGHT_RATIO;
     let level_height = level_size * LINE_HEIGHT_RATIO;
     let (score_box, level_box) = text_boxes(bounds, geometry, score_height, level_height);
@@ -458,6 +505,24 @@ fn shape(
         }],
         None,
     )
+}
+
+/// The score and level font sizes for one canvas.
+///
+/// With a gauge, the text is sized from the band's radius: that is the space the
+/// text has to fit inside, and a narrow pane limits the radius by its width while
+/// the canvas keeps its height. Without a gauge there is no radius, so the shorter
+/// side of the canvas is the measure that cannot overflow it.
+fn text_sizes(bounds: Bounds<Pixels>, geometry: Option<GaugeGeometry>) -> (Pixels, Pixels) {
+    let score_size = match geometry {
+        Some(geometry) => geometry.band_radius * SCORE_TEXT_RADIUS_RATIO,
+        None => px(
+            f32::from(bounds.size.width).min(f32::from(bounds.size.height))
+                * SCORE_TEXT_FALLBACK_RATIO,
+        ),
+    };
+
+    (score_size, score_size * LEVEL_TEXT_RATIO)
 }
 
 /// The two boxes the reading is drawn in, one above the other.
@@ -533,8 +598,8 @@ fn paint(prepared: &PreparedGauge, bounds: Bounds<Pixels>, window: &mut Window, 
 /// Draws the reading's dot on the band's centre line.
 fn paint_indicator(geometry: &GaugeGeometry, score: u8, colors: &GaugeColors, window: &mut Window) {
     let (halo, dot) = geometry.indicator_quads(score, colors);
-    // The ring is the content face's own colour: on a dark theme it is what keeps
-    // the dot apart from the band it covers.
+    // The ring is the content face's own colour: it is what keeps the foreground
+    // dot apart from the band it covers in either appearance.
     window.paint_quad(halo);
     window.paint_quad(dot);
 }
@@ -634,6 +699,57 @@ mod tests {
         }
     }
 
+    /// Every cap is centred on the end of the arc it rounds, not on the boundary the
+    /// band was assigned: a cap left on the boundary would sit in the gap and reach
+    /// into the neighbouring band.
+    #[test]
+    fn every_end_cap_should_sit_at_its_own_arc_end() {
+        let geometry = geometry();
+        let caps = geometry.cap_centers();
+
+        for index in 0..SEGMENT_COUNT {
+            let (start, end) = geometry.arc_span(index);
+            let start_cap = caps[index * 2].0;
+            let end_cap = caps[index * 2 + 1].0;
+
+            assert!(
+                distance(start_cap, geometry.point_at(start, geometry.band_radius)) < 0.01,
+                "the start cap of band {index} belongs at the start of its own arc"
+            );
+            assert!(
+                distance(end_cap, geometry.point_at(end, geometry.band_radius)) < 0.01,
+                "the end cap of band {index} belongs at the end of its own arc"
+            );
+        }
+    }
+
+    /// The two caps that meet at a boundary are separated by a visible gap, which is
+    /// what keeps one band's cap from painting over the other band's end.
+    #[test]
+    fn the_caps_of_two_bands_should_leave_a_visible_gap() {
+        let geometry = geometry();
+        let caps = geometry.cap_centers();
+        let cap_diameter = f32::from(geometry.cap_radius) * 2.0;
+
+        for index in 0..SEGMENT_COUNT - 1 {
+            let left = caps[index * 2 + 1].0;
+            let right = caps[(index + 1) * 2].0;
+            let separation = distance(left, right);
+
+            assert!(
+                separation > cap_diameter,
+                "the caps of bands {index} and {} overlap by {:.2} px",
+                index + 1,
+                cap_diameter - separation
+            );
+            assert!(
+                separation - cap_diameter > cap_diameter * 0.2,
+                "the gap between bands {index} and {} is narrower than a fifth of a cap",
+                index + 1
+            );
+        }
+    }
+
     /// Every end circle is centred on the line the band is drawn around, which is
     /// what makes its outer point land exactly on the band's outer edge.
     #[test]
@@ -650,23 +766,58 @@ mod tests {
         }
     }
 
-    /// The drawing fits the box it was given, which is what lets the canvas clip
-    /// without cutting anything.
+    /// The drawing fits the box it was given and is centred in it on both axes.
+    ///
+    /// The block is the arc's outer edge plus the indicator's ring above the
+    /// diameter, and the indicator's ring below it; the indicator is the part that
+    /// reaches furthest at the top and at both ends of the scale.
     #[test]
-    fn the_bands_and_their_caps_should_stay_inside_the_canvas() {
+    fn the_gauge_should_stay_inside_the_canvas_and_be_centred() {
         let canvas = canvas();
         let geometry = GaugeGeometry::compute(canvas).expect("the fixture canvas holds a gauge");
+        let reach = f32::from(geometry.band_radius)
+            + f32::from(geometry.indicator_radius)
+            + f32::from(geometry.indicator_halo);
+        let top = geometry.center.y - px(reach);
+        let bottom = geometry.center.y + geometry.indicator_radius + geometry.indicator_halo;
+        let left = geometry.center.x - px(reach);
+        let right = geometry.center.x + px(reach);
 
         assert!(
             (f32::from(geometry.outer_radius)
                 - (f32::from(geometry.band_radius) + f32::from(geometry.cap_radius)))
             .abs()
                 < 0.01,
-            "the outermost point of the drawing is the band plus one cap"
+            "the band's outermost point is the band plus one cap"
         );
         assert!(
-            geometry.center.y - geometry.outer_radius >= canvas.top(),
-            "the top of the arc stays below the top of the canvas"
+            top >= canvas.top(),
+            "the top of the indicator stays below the top of the canvas"
+        );
+        assert!(
+            bottom <= canvas.bottom(),
+            "the indicator at either end of the scale stays above the bottom"
+        );
+        assert!(
+            left >= canvas.left(),
+            "the left end of the indicator stays inside the canvas"
+        );
+        assert!(
+            right <= canvas.right(),
+            "the right end of the indicator stays inside the canvas"
+        );
+
+        let top_margin = f32::from(top - canvas.top());
+        let bottom_margin = f32::from(canvas.bottom() - bottom);
+        let left_margin = f32::from(left - canvas.left());
+        let right_margin = f32::from(canvas.right() - right);
+        assert!(
+            (top_margin - bottom_margin).abs() < 0.01,
+            "the gauge block is centred vertically in the canvas"
+        );
+        assert!(
+            (left_margin - right_margin).abs() < 0.01,
+            "the gauge block is centred horizontally in the canvas"
         );
 
         for (center, _) in geometry.cap_centers() {
@@ -741,7 +892,7 @@ mod tests {
     }
 
     /// Each level of the scale is drawn in a colour of its own, taken from the
-    /// theme's roles rather than from a literal.
+    /// theme's fear-and-greed roles rather than from a literal.
     #[test]
     fn every_level_should_be_drawn_in_a_colour_of_its_own() {
         let theme = Theme::of(Appearance::Light);
@@ -761,6 +912,108 @@ mod tests {
                 levels[index]
             );
         }
+        assert_eq!(
+            colors,
+            [
+                theme.roles.fear_greed.extreme_fear.hsla,
+                theme.roles.fear_greed.fear.hsla,
+                theme.roles.fear_greed.neutral.hsla,
+                theme.roles.fear_greed.greed.hsla,
+                theme.roles.fear_greed.extreme_greed.hsla,
+            ],
+            "the gauge reads the scale's own roles"
+        );
+    }
+
+    /// The bands, the reading's dot and its ring are the frame's colours: the bands
+    /// are the scale's five roles, and the dot is the foreground so it reads as a
+    /// marker rather than as another band end.
+    #[test]
+    fn the_gauge_should_take_its_colours_from_the_scale_and_the_foreground() {
+        let theme = Theme::of(Appearance::Light);
+        let colors = GaugeColors::resolve(&theme);
+
+        assert_eq!(
+            colors.segments,
+            [
+                theme.roles.fear_greed.extreme_fear.hsla,
+                theme.roles.fear_greed.fear.hsla,
+                theme.roles.fear_greed.neutral.hsla,
+                theme.roles.fear_greed.greed.hsla,
+                theme.roles.fear_greed.extreme_greed.hsla,
+            ]
+        );
+        assert_eq!(colors.text, theme.roles.fg.default.hsla);
+        assert_eq!(colors.halo, theme.roles.surface.sunken.hsla);
+    }
+
+    /// The indicator is a marker, not a band end: its diameter is wider than the
+    /// band and it is seated in a ring of the content face.
+    #[test]
+    fn the_indicator_should_be_wider_than_the_band() {
+        let theme = Theme::of(Appearance::Light);
+        let colors = GaugeColors::resolve(&theme);
+        let geometry = geometry();
+        let band = f32::from(geometry.cap_radius) * 2.0;
+
+        assert!(
+            f32::from(geometry.indicator_radius) * 2.0 > band,
+            "the marker's diameter is wider than the band"
+        );
+        assert!(
+            (f32::from(geometry.indicator_radius)
+                - f32::from(geometry.cap_radius) * INDICATOR_RATIO)
+                .abs()
+                < 0.01,
+            "the marker's radius is the band end's radius times the reference's ratio"
+        );
+
+        let (halo, dot) = geometry.indicator_quads(46, &colors);
+        assert_eq!(dot.background, colors.text.into());
+        assert_eq!(halo.background, colors.halo.into());
+        assert_eq!(
+            halo.corner_radii,
+            Corners::all(geometry.indicator_radius + geometry.indicator_halo),
+            "the ring is rounded by its own radius, enlargement included"
+        );
+    }
+
+    /// The ring follows the band, with a floor for tiny gauges and a ceiling for
+    /// huge ones: a fixed width is a hairline on a large gauge and swallows a small
+    /// one.
+    #[test]
+    fn the_indicator_ring_should_follow_the_band_with_a_floor_and_a_ceiling() {
+        let geometry_of = |width: f32, height: f32| {
+            GaugeGeometry::compute(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(width), px(height)),
+            ))
+            .expect("the fixture canvas holds a gauge")
+        };
+
+        let tiny = geometry_of(96.0, 72.0);
+        let medium = geometry_of(400.0, 240.0);
+        let large = geometry_of(1600.0, 800.0);
+        let huge = geometry_of(2400.0, 1200.0);
+
+        assert_eq!(
+            tiny.indicator_halo,
+            px(MIN_INDICATOR_HALO),
+            "a tiny gauge keeps the ring at its floor"
+        );
+        assert!(
+            (f32::from(medium.indicator_halo) - 4.32).abs() < 0.01,
+            "a middle-sized gauge gets twenty percent of its band"
+        );
+        assert!(
+            (f32::from(large.indicator_halo) - 14.4).abs() < 0.01,
+            "a large gauge still gets twenty percent of its band"
+        );
+        assert_eq!(
+            huge.indicator_halo,
+            px(MAX_INDICATOR_HALO),
+            "a huge gauge keeps the ring at its ceiling"
+        );
     }
 
     /// The caps, the reading's dot and its ring are circles: every corner of each
@@ -772,7 +1025,7 @@ mod tests {
     #[test]
     fn every_circle_should_be_painted_with_corner_radii_of_its_own_radius() {
         let theme = Theme::of(Appearance::Light);
-        let colors = GaugeColors::resolve(&theme, Level::Greed);
+        let colors = GaugeColors::resolve(&theme);
         let geometry = geometry();
 
         let cap_quads = geometry.cap_quads(&colors);
@@ -795,7 +1048,7 @@ mod tests {
         }
 
         let (halo, dot) = geometry.indicator_quads(46, &colors);
-        let dot_radius = geometry.cap_radius * INDICATOR_RATIO;
+        let dot_radius = geometry.indicator_radius;
         assert_eq!(
             dot.bounds,
             circle_bounds(geometry.indicator_center(46), dot_radius),
@@ -808,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             halo.corner_radii,
-            Corners::all(dot_radius + px(INDICATOR_HALO)),
+            Corners::all(dot_radius + geometry.indicator_halo),
             "the ring is rounded by its own radius, enlargement included"
         );
         assert!(
@@ -835,24 +1088,28 @@ mod tests {
         );
 
         for (bounds, geometry) in [(gauge_canvas, gauge), (words_only, no_gauge)] {
-            let score_size = px(f32::from(bounds.size.height) * SCORE_TEXT_RATIO);
-            let level_size = score_size * LEVEL_TEXT_RATIO;
+            let (score_size, level_size) = text_sizes(bounds, geometry);
             let (score_box, level_box) = text_boxes(
                 bounds,
                 geometry,
                 score_size * LINE_HEIGHT_RATIO,
                 level_size * LINE_HEIGHT_RATIO,
             );
-            let cy = bounds.bottom() - px(f32::from(bounds.size.height) * BOTTOM_INSET_RATIO);
 
             assert!(
                 score_box.bottom() < level_box.top(),
                 "the level's name must not be painted over the score"
             );
-            assert!(
-                level_box.bottom() < cy,
-                "the reading stays above the arc's centre"
-            );
+            match geometry {
+                Some(geometry) => assert!(
+                    level_box.bottom() < geometry.center.y,
+                    "the reading stays above the arc's centre"
+                ),
+                None => assert!(
+                    level_box.bottom() <= bounds.bottom(),
+                    "the reading stays inside a canvas with no arc"
+                ),
+            }
             assert!(
                 score_box.top() >= bounds.top(),
                 "the reading starts inside the canvas"
@@ -868,5 +1125,38 @@ mod tests {
                 "and so is the level's name"
             );
         }
+    }
+
+    /// A narrow canvas limits the gauge by its width, so the reading has to shrink
+    /// with the band's radius instead of keeping the size the canvas height gives it.
+    #[test]
+    fn a_narrow_canvas_should_shrink_the_reading_with_the_band() {
+        let wide = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(800.0)));
+        let narrow = Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), px(800.0)));
+        let wide_geometry = GaugeGeometry::compute(wide).expect("the wide canvas holds a gauge");
+        let narrow_geometry =
+            GaugeGeometry::compute(narrow).expect("the narrow canvas holds a gauge");
+        let (wide_score, _) = text_sizes(wide, Some(wide_geometry));
+        let (narrow_score, narrow_level) = text_sizes(narrow, Some(narrow_geometry));
+
+        assert!(
+            narrow_score < wide_score,
+            "the narrow gauge's score shrinks with its band"
+        );
+        assert_eq!(
+            narrow_score,
+            narrow_geometry.band_radius * SCORE_TEXT_RADIUS_RATIO,
+            "the score is sized from the band's radius"
+        );
+
+        let score_height = narrow_score * LINE_HEIGHT_RATIO;
+        let level_height = narrow_level * LINE_HEIGHT_RATIO;
+        let (score_box, _) = text_boxes(narrow, Some(narrow_geometry), score_height, level_height);
+        let inner_top = narrow_geometry.center.y - narrow_geometry.inner_radius;
+
+        assert!(
+            score_box.top() >= inner_top,
+            "the reading stays inside the arc's inner edge on a narrow canvas"
+        );
     }
 }

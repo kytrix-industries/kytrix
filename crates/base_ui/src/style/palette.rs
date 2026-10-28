@@ -5,10 +5,11 @@
 //! replacing this data and no drawing code changes with it. The two built-in palettes are two
 //! instances of the same shape: they differ in value, never in meaning.
 //!
-//! Every value but the two map fills is the one the design document's §7 table spells for the role
-//! it is the source of. Surfaces are the six z-axis values, `text` is the foreground every other
-//! text step is mixed from, and `brand`, the four status colors and the two market directions are
-//! the saturated colors a theme author would actually tune. The two map fills are authored here
+//! Every value but the two map fills and the fear-and-greed ramp is the one the design document's
+//! §7 table spells for the role it is the source of. Surfaces are the six z-axis values, `text` is
+//! the foreground every other text step is mixed from, and `brand`, the five status colors, the two
+//! market directions and the five fear-and-greed steps are the saturated colors a theme author
+//! would actually tune. The two map fills are authored here
 //! instead (§10): a map is drawn from exactly two colors, so they cannot be mixed from a surface.
 //! The alphas at the end are the transparent things a theme owns: the two interaction veils and
 //! the scrim behind a modal.
@@ -63,6 +64,31 @@ pub struct MarketPalette {
     pub down: Oklch,
 }
 
+/// The five colors a fear-and-greed scale is drawn with, from fear to greed.
+///
+/// The scale is not a status ladder and not a pair of market directions: it is one
+/// reading whose five steps have to be told apart side by side. The status and
+/// market palettes cannot do that — their reds and greens are deliberately close in
+/// hue — so the scale authors its own ramp.
+///
+/// The light appearance is the CMC index's own five colors. The dark appearance
+/// keeps the middle three, which already read on a dark page, and lifts only the two
+/// ends that would otherwise sit too close to it; that keeps the scale recognizable
+/// as the CMC one while leaving every band legible.
+#[derive(Debug, Copy, Clone)]
+pub struct FearGreedPalette {
+    /// The bottom of the scale: the most fearful reading.
+    pub extreme_fear: Oklch,
+    /// The step above the bottom.
+    pub fear: Oklch,
+    /// The middle of the scale.
+    pub neutral: Oklch,
+    /// The step below the top.
+    pub greed: Oklch,
+    /// The top of the scale: the most greedy reading.
+    pub extreme_greed: Oklch,
+}
+
 /// One appearance, as the values a theme author writes by hand.
 #[derive(Debug, Copy, Clone)]
 pub struct Palette {
@@ -86,6 +112,8 @@ pub struct Palette {
     pub status: StatusPalette,
     /// The two market directions.
     pub market: MarketPalette,
+    /// The five colors of a fear-and-greed scale.
+    pub fear_greed: FearGreedPalette,
     /// The six series a multi-line or multi-bar chart is drawn with, in the order a chart gives
     /// them to new lines: warm amber, violet, cyan, rose, yellow-green and neutral gray.
     ///
@@ -138,6 +166,15 @@ impl Palette {
             market: MarketPalette {
                 up: Oklch::new(0.514, 0.128, 152.0, opacity),
                 down: Oklch::new(0.542, 0.180, 22.0, opacity),
+            },
+            // The CMC fear-and-greed palette, authored as the index's own five colors:
+            // deep red, red, yellow, mint and deep green.
+            fear_greed: FearGreedPalette {
+                extreme_fear: Oklch::new(0.4958, 0.1905, 22.83, opacity),
+                fear: Oklch::new(0.6529, 0.2110, 18.20, opacity),
+                neutral: Oklch::new(0.8724, 0.1636, 94.59, opacity),
+                greed: Oklch::new(0.8148, 0.1705, 161.41, opacity),
+                extreme_greed: Oklch::new(0.6306, 0.1263, 162.21, opacity),
             },
             series: [
                 Oklch::new(0.620, 0.140, 62.0, opacity),
@@ -192,6 +229,16 @@ impl Palette {
             market: MarketPalette {
                 up: Oklch::new(0.782, 0.158, 150.0, opacity),
                 down: Oklch::new(0.702, 0.186, 20.0, opacity),
+            },
+            // The same scale on a dark page: the middle three already read there, so
+            // only the two ends move. Their lifted values keep every pair at least
+            // 0.14 apart in Oklab and every band at least 3.6:1 on `surface.sunken`.
+            fear_greed: FearGreedPalette {
+                extreme_fear: Oklch::new(0.5600, 0.1900, 22.83, opacity),
+                fear: Oklch::new(0.7000, 0.1800, 18.20, opacity),
+                neutral: Oklch::new(0.8724, 0.1636, 94.59, opacity),
+                greed: Oklch::new(0.8148, 0.1705, 161.41, opacity),
+                extreme_greed: Oklch::new(0.6800, 0.1263, 162.21, opacity),
             },
             series: [
                 Oklch::new(0.800, 0.150, 78.0, opacity),

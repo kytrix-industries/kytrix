@@ -45,11 +45,11 @@ use base_ui::{
     icon::{Icon, IconKind},
     interactive::InteractiveVariantExt,
     size::UnifiedSizable,
-    style::theme::ThemeExt,
+    style::theme::{Theme, ThemeExt},
     tooltip::Tooltip,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement,
+    AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, base::Disableable, div, prelude::FluentBuilder, px,
 };
@@ -91,6 +91,20 @@ use crate::{
 /// exist, while the pane may well have everything else to show.
 const MISSING: &str = "—";
 
+/// The diameter of the dot that marks a row's level.
+///
+/// The dot carries the level's colour; the level's name beside it stays in the
+/// default text colour, because the scale's yellow is a fill and not readable as a
+/// label on a light surface.
+const LEVEL_MARKER_SIZE: f32 = 8.0;
+
+/// The width of a row's value column, so the level names beside it line up.
+///
+/// The values are `0..=100`, so the column is wide enough for three digits. It is
+/// fixed rather than a minimum: a one- or two-digit value must not move the level's
+/// name, which is what makes the level names read as one column down the card.
+const VALUE_COLUMN_WIDTH: f32 = 28.0;
+
 /// The debug selectors of the dash each row draws when it has no reading.
 ///
 /// A painted frame's text is not readable from a test, so the selector a value
@@ -103,6 +117,23 @@ const MISSING_LAST_MONTH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISS
 const MISSING_LAST_YEAR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_LAST_YEAR";
 const MISSING_YEARLY_HIGH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_YEARLY_HIGH";
 const MISSING_YEARLY_LOW: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_MISSING_YEARLY_LOW";
+
+/// The debug selectors of the dots that mark a row's level.
+///
+/// A painted dot is not readable from a test, so the selector says whether the
+/// marker was drawn and which row drew it.
+const LEVEL_MARKER_YESTERDAY: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_YESTERDAY";
+const LEVEL_MARKER_LAST_WEEK: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_LAST_WEEK";
+const LEVEL_MARKER_LAST_MONTH: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_LAST_MONTH";
+const LEVEL_MARKER_LAST_YEAR: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_LAST_YEAR";
+const LEVEL_MARKER_YEARLY_HIGH: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_YEARLY_HIGH";
+const LEVEL_MARKER_YEARLY_LOW: &str =
+    "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_YEARLY_LOW";
 
 /// The pane has nothing to persist, so its config carries the schema version alone.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -599,37 +630,39 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .into_any_element()
     }
 
-    /// Yesterday, last week, last month and last year.
+    /// Yesterday, last week, last month and last year, each with the level it sat in.
     fn history_rows(
         &self,
         snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let label_color = theme.roles.fg.muted.hsla;
-        let value_color = theme.roles.fg.default.hsla;
         let rows = [
             (
                 "widget.coin_market_cap_fear_and_greed_index.yesterday",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY",
+                LEVEL_MARKER_YESTERDAY,
                 MISSING_YESTERDAY,
                 snapshot.yesterday.as_ref(),
             ),
             (
                 "widget.coin_market_cap_fear_and_greed_index.last_week",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK",
+                LEVEL_MARKER_LAST_WEEK,
                 MISSING_LAST_WEEK,
                 snapshot.last_week.as_ref(),
             ),
             (
                 "widget.coin_market_cap_fear_and_greed_index.last_month",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH",
+                LEVEL_MARKER_LAST_MONTH,
                 MISSING_LAST_MONTH,
                 snapshot.last_month.as_ref(),
             ),
             (
                 "widget.coin_market_cap_fear_and_greed_index.last_year",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR",
+                LEVEL_MARKER_LAST_YEAR,
                 MISSING_LAST_YEAR,
                 snapshot.last_year.as_ref(),
             ),
@@ -639,39 +672,40 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .flex()
             .flex_col()
             .gap_1()
-            .children(rows.map(|(key, selector, missing, row)| {
+            .children(rows.map(|(key, selector, marker_selector, missing, row)| {
                 value_row(
                     selector,
+                    marker_selector,
                     missing,
                     t!(cx, key),
                     row,
-                    label_color,
-                    value_color,
+                    theme,
+                    cx,
                 )
             }))
             .into_any_element()
     }
 
     /// The highest and the lowest reading of the past year, each with the day it
-    /// happened and the level it sat in.
+    /// happened, the level it sat in and the dot that carries the level's colour.
     fn extreme_rows(
         &self,
         snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let label_color = theme.roles.fg.muted.hsla;
-        let value_color = theme.roles.fg.default.hsla;
         let rows = [
             (
                 "widget.coin_market_cap_fear_and_greed_index.yearly_high",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH",
+                LEVEL_MARKER_YEARLY_HIGH,
                 MISSING_YEARLY_HIGH,
                 snapshot.yearly_high.as_ref(),
             ),
             (
                 "widget.coin_market_cap_fear_and_greed_index.yearly_low",
                 "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW",
+                LEVEL_MARKER_YEARLY_LOW,
                 MISSING_YEARLY_LOW,
                 snapshot.yearly_low.as_ref(),
             ),
@@ -681,42 +715,16 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .flex()
             .flex_col()
             .gap_1()
-            .children(rows.map(|(key, selector, missing, row)| {
-                let level = row.map(|row| Level::of(row.score));
-                let mut value = div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(value_color)
-                    .child(value_text(row));
-                if row.is_none() {
-                    value = value.debug_selector(move || missing.into());
-                }
-                div()
-                    .debug_selector(move || selector.into())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(label_color)
-                            .child(yearly_label(key, row, cx)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .children(level.map(|level| {
-                                div()
-                                    .text_xs()
-                                    .text_color(level_color(theme, level))
-                                    .child(t!(cx, level.key()))
-                            }))
-                            .child(value),
-                    )
-                    .into_any_element()
+            .children(rows.map(|(key, selector, marker_selector, missing, row)| {
+                value_row(
+                    selector,
+                    marker_selector,
+                    missing,
+                    yearly_label(key, row, cx),
+                    row,
+                    theme,
+                    cx,
+                )
             }))
             .into_any_element()
     }
@@ -759,22 +767,30 @@ impl Render for CoinMarketCapFearAndGreedIndexWidget {
     }
 }
 
-/// One row of the history: what it is, then the number or a dash.
+/// One row of the history or of the yearly extremes: what it is, the level it sat
+/// in, and the number or a dash.
 ///
-/// A row without a reading marks its value with `missing`, so a test can assert from
-/// the painted frame that the dash was drawn and which row drew it.
+/// The level is carried by an 8px dot and a default-coloured name; the dot is what
+/// makes five levels tellable apart without using the scale's yellow as text. A row
+/// without a reading has no level and marks its value with `missing`, so a test can
+/// assert from the painted frame that the dash was drawn and which row drew it.
 fn value_row(
     selector: &'static str,
+    marker_selector: &'static str,
     missing: &'static str,
     label: SharedString,
     row: Option<&CoinMarketCapFearAndGreedIndexRow>,
-    label_color: Hsla,
-    value_color: Hsla,
+    theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
+    let level = row.map(|row| Level::of(row.score));
     let mut value = div()
+        .w(px(VALUE_COLUMN_WIDTH))
+        .flex_none()
+        .text_right()
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(value_color)
+        .text_color(theme.roles.fg.default.hsla)
         .child(value_text(row));
 
     if row.is_none() {
@@ -787,8 +803,39 @@ fn value_row(
         .items_center()
         .justify_between()
         .gap_2()
-        .child(div().text_sm().text_color(label_color).child(label))
-        .child(value)
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.roles.fg.muted.hsla)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .children(level.map(|level| {
+                    div()
+                        .debug_selector(move || marker_selector.into())
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .size(px(LEVEL_MARKER_SIZE))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(level_color(theme, level)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.roles.fg.default.hsla)
+                                .child(t!(cx, level.key())),
+                        )
+                }))
+                .child(value),
+        )
         .into_any_element()
 }
 
@@ -1306,6 +1353,23 @@ mod tests {
                 .is_some(),
             "the gauge is drawn beside the rows"
         );
+        for selector in [LEVEL_MARKER_YESTERDAY, LEVEL_MARKER_YEARLY_HIGH] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector}: a row without a reading draws no level dot"
+            );
+        }
+        for selector in [
+            LEVEL_MARKER_LAST_WEEK,
+            LEVEL_MARKER_LAST_MONTH,
+            LEVEL_MARKER_LAST_YEAR,
+            LEVEL_MARKER_YEARLY_LOW,
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector}: a row with a reading draws its level dot"
+            );
+        }
 
         cx.update(|_, cx| {
             assert_eq!(value_text(None).as_ref(), "—");

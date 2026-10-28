@@ -136,6 +136,27 @@ pub struct MarketRoles {
     pub down_weak: ResolvedColor,
 }
 
+/// The five fills a fear-and-greed scale is drawn with.
+///
+/// The scale is its own ramp rather than a row of status colors: the five steps are
+/// read side by side, and the status and market palettes deliberately keep their
+/// reds and greens close in hue. These are fills, not text — a band is read as one
+/// of five positions on the arc — so they are held apart by the Oklab-distance test
+/// at the bottom of this file rather than by a text contrast floor.
+#[derive(Debug, Copy, Clone)]
+pub struct FearGreedRoles {
+    /// The bottom of the scale.
+    pub extreme_fear: ResolvedColor,
+    /// The step above the bottom.
+    pub fear: ResolvedColor,
+    /// The middle of the scale.
+    pub neutral: ResolvedColor,
+    /// The step below the top.
+    pub greed: ResolvedColor,
+    /// The top of the scale.
+    pub extreme_greed: ResolvedColor,
+}
+
 /// The chart's furniture.
 #[derive(Debug, Copy, Clone)]
 pub struct ChartRoles {
@@ -186,6 +207,8 @@ pub struct Roles {
     pub status: StatusRoles,
     /// The market colors, decoupled from the status ones.
     pub market: MarketRoles,
+    /// The five-step fear-and-greed scale.
+    pub fear_greed: FearGreedRoles,
     /// The chart's own furniture.
     pub chart: ChartRoles,
     /// The text selection a field or a selectable text paints.
@@ -278,6 +301,14 @@ impl Roles {
             down_weak: resolve(palette.market.down.with_alpha(0.22)),
         };
 
+        let fear_greed = FearGreedRoles {
+            extreme_fear: resolve(palette.fear_greed.extreme_fear),
+            fear: resolve(palette.fear_greed.fear),
+            neutral: resolve(palette.fear_greed.neutral),
+            greed: resolve(palette.fear_greed.greed),
+            extreme_greed: resolve(palette.fear_greed.extreme_greed),
+        };
+
         let chart = ChartRoles {
             // Furniture is read on the content face, not on the page: a chart is drawn on
             // `surface.sunken`, so its grid and crosshair are mixed against that.
@@ -313,6 +344,7 @@ impl Roles {
             brand,
             status,
             market,
+            fear_greed,
             chart,
             selection,
             veil,
@@ -931,6 +963,116 @@ mod tests {
         assert_eq!(Palette::dark().series, dark);
     }
 
+    /// The fear-and-greed scale is the CMC index's own five colors in the light
+    /// appearance, and the dark appearance moves only the two ends.
+    #[test]
+    fn the_fear_greed_scale_should_keep_the_cmc_colors() {
+        let light = Palette::light().fear_greed;
+        assert_eq!(light.extreme_fear, Oklch::new(0.4958, 0.1905, 22.83, 1.0));
+        assert_eq!(light.fear, Oklch::new(0.6529, 0.2110, 18.20, 1.0));
+        assert_eq!(light.neutral, Oklch::new(0.8724, 0.1636, 94.59, 1.0));
+        assert_eq!(light.greed, Oklch::new(0.8148, 0.1705, 161.41, 1.0));
+        assert_eq!(light.extreme_greed, Oklch::new(0.6306, 0.1263, 162.21, 1.0));
+
+        let dark = Palette::dark().fear_greed;
+        assert_eq!(dark.extreme_fear, Oklch::new(0.5600, 0.1900, 22.83, 1.0));
+        assert_eq!(dark.fear, Oklch::new(0.7000, 0.1800, 18.20, 1.0));
+        assert_eq!(dark.neutral, light.neutral);
+        assert_eq!(dark.greed, light.greed);
+        assert_eq!(dark.extreme_greed, Oklch::new(0.6800, 0.1263, 162.21, 1.0));
+    }
+
+    /// The light appearance paints the CMC index's own five colors, and the dark
+    /// appearance paints the two lifted ends the palette authors.
+    #[test]
+    fn the_fear_greed_scale_should_paint_its_authored_hex_colors() {
+        use gpui_kit::Rgba;
+
+        let hex = |color: ResolvedColor| {
+            let rgba = Rgba::from(color.hsla);
+
+            [rgba.r, rgba.g, rgba.b].map(|channel| (channel * 255.0).round() as u8)
+        };
+
+        let light = Roles::resolve(&Palette::light()).fear_greed;
+        assert_eq!(hex(light.extreme_fear), [0xB6, 0x14, 0x29]);
+        assert_eq!(hex(light.fear), [0xF6, 0x46, 0x5D]);
+        assert_eq!(hex(light.neutral), [0xF8, 0xD3, 0x3A]);
+        assert_eq!(hex(light.greed), [0x2F, 0xE4, 0x9F]);
+        assert_eq!(hex(light.extreme_greed), [0x27, 0xA1, 0x72]);
+
+        let dark = Roles::resolve(&Palette::dark()).fear_greed;
+        assert_eq!(hex(dark.extreme_fear), [0xCC, 0x32, 0x3C]);
+        assert_eq!(hex(dark.fear), [0xFA, 0x67, 0x73]);
+        assert_eq!(hex(dark.neutral), [0xF8, 0xD3, 0x3A]);
+        assert_eq!(hex(dark.greed), [0x2F, 0xE4, 0x9F]);
+        assert_eq!(hex(dark.extreme_greed), [0x3C, 0xB0, 0x80]);
+    }
+
+    /// The five fear-and-greed steps can be told apart by more than their hue.
+    ///
+    /// They are read side by side on one arc, so every pair is held to the same
+    /// Oklab distance the six chart series are: a reader has to see five bands, not
+    /// three colours and two near-misses.
+    #[test]
+    fn the_fear_greed_scale_should_be_told_apart_by_oklab_distance() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+            let scale = [
+                roles.fear_greed.extreme_fear,
+                roles.fear_greed.fear,
+                roles.fear_greed.neutral,
+                roles.fear_greed.greed,
+                roles.fear_greed.extreme_greed,
+            ];
+
+            for (first, first_color) in scale.iter().enumerate() {
+                for (second, second_color) in scale.iter().enumerate().skip(first + 1) {
+                    let [first_lightness, first_a, first_b] = first_color.oklch.oklab();
+                    let [second_lightness, second_a, second_b] = second_color.oklch.oklab();
+                    let distance = ((first_lightness - second_lightness).powi(2)
+                        + (first_a - second_a).powi(2)
+                        + (first_b - second_b).powi(2))
+                    .sqrt();
+
+                    assert!(
+                        distance >= 0.13,
+                        "{:?}: fear-greed steps {first} and {second} are {distance:.3} apart in \
+                         Oklab, where the scale holds every pair to 0.13",
+                        palette.appearance
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dark appearance's five fills are read on the content face, and the two
+    /// ends are lifted until they clear it.
+    ///
+    /// The light appearance's CMC colors are authored fills rather than text, so they
+    /// are not held to the text floor; the dark ones are, because the two ends would
+    /// otherwise sit close to a near-black page.
+    #[test]
+    fn the_dark_fear_greed_scale_should_read_on_the_sunken_surface() {
+        let roles = Roles::resolve(&Palette::dark());
+
+        for (name, color) in [
+            ("extreme_fear", roles.fear_greed.extreme_fear),
+            ("fear", roles.fear_greed.fear),
+            ("neutral", roles.fear_greed.neutral),
+            ("greed", roles.fear_greed.greed),
+            ("extreme_greed", roles.fear_greed.extreme_greed),
+        ] {
+            let ratio = contrast(color, roles.surface.sunken);
+
+            assert!(
+                ratio >= 3.0,
+                "fear_greed.{name} reads {ratio:.2}:1 on surface.sunken in the dark appearance, \
+                 where the floor is 3.00:1"
+            );
+        }
+    }
+
     /// A5: only the roles that have to be see-through are.
     ///
     /// The veils, the scrim and the weak market washes are layered over what is behind them, so
@@ -1032,6 +1174,11 @@ mod tests {
             ("market.down_surface", roles.market.down_surface),
             ("market.up_weak", roles.market.up_weak),
             ("market.down_weak", roles.market.down_weak),
+            ("fear_greed.extreme_fear", roles.fear_greed.extreme_fear),
+            ("fear_greed.fear", roles.fear_greed.fear),
+            ("fear_greed.neutral", roles.fear_greed.neutral),
+            ("fear_greed.greed", roles.fear_greed.greed),
+            ("fear_greed.extreme_greed", roles.fear_greed.extreme_greed),
             ("chart.grid", roles.chart.grid),
             ("chart.axis", roles.chart.axis),
             ("chart.crosshair", roles.chart.crosshair),
