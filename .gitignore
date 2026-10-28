@@ -11,3 +11,7 @@ longbridge-test.env
 # OSM source data is downloaded on demand; see the widget's assets/download_map.py.
 crates/widgets/global_shipping_chokepoint/assets/*.pbf
 crates/widgets/global_shipping_chokepoint/assets/*.zip
+# An interrupted download leaves a `.part` behind; never commit a partial download.
+crates/widgets/global_shipping_chokepoint/assets/*.part
+# An interrupted build leaves a `.tmp` behind; never commit a half-written asset.
+crates/widgets/global_shipping_chokepoint/assets/*.tmp
