@@ -8,3 +8,6 @@ longbridge-test.env
 *.longbridge.env
 .docs
 **/.DS_Store
+# OSM source data is downloaded on demand; see the widget's assets/download_map.py.
+crates/widgets/global_shipping_chokepoint/assets/*.pbf
+crates/widgets/global_shipping_chokepoint/assets/*.zip
