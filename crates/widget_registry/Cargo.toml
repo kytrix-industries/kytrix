@@ -16,6 +16,7 @@ candlestick = { workspace = true }
 coin_market_cap_fear_and_greed_index = { workspace = true }
 cryptocurrency_etf = { workspace = true }
 empty = { workspace = true }
+ethereum_wallet = { workspace = true }
 financial_calendar = { workspace = true }
 force_orders = { workspace = true }
 global_shipping_chokepoint = { workspace = true }
@@ -26,9 +27,9 @@ news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
+solana_wallet = { workspace = true }
 x = { workspace = true }
 volume_heatmap = { workspace = true }
-cryptocurrency_wallet_monitor = { workspace = true }
 watch_list = { workspace = true }
 widget = { workspace = true }
 

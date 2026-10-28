@@ -17,7 +17,7 @@
 //! second classification in the answer, and keeping one beside the score would be a
 //! second thing that can disagree with it.
 
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use smol_str::SmolStr;
 use thiserror::Error;
 
@@ -157,7 +157,7 @@ pub(crate) enum CoinMarketCapFearAndGreedIndexParseError {
 
 #[cfg(test)]
 mod tests {
-    use kytrix_proto::types::{
+    use kytrix_proto::types::v1::{
         CoinMarketCapFearAndGreedIndex, CoinMarketCapFearAndGreedIndexPoint,
     };
 

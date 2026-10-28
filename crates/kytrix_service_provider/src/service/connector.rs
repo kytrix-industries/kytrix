@@ -14,17 +14,16 @@ use app_config_provider::{
     notification::ConfigNotification,
 };
 use gpui_kit::App;
+use kytrix_proto as proto_response;
 use kytrix_proto::{
-    client::{
-        CryptocurrencyWalletMonitoringAddSelection, CryptocurrencyWalletMonitoringDeleteSelection,
-        CryptocurrencyWalletMonitoringSelections, GetCoinMarketCapFearAndGreedIndex,
-        GetCryptocurrencyEtf, GetFinancialCalendar, GetFinancialIndexManifest,
-        GetPentagonPizzaIndex, XAccountMonitoringAddSelection, XAccountMonitoringDeleteSelection,
-        XAccountMonitoringSearch, XAccountMonitoringSelections, XAccountMonitoringTweets,
-        request::Request as ClientRequestKind,
-    },
-    server::{self as proto_response, response::Response as ServerResponseKind},
-    types as proto_types,
+    AddEthereumWalletSelectionRequest, AddSolanaWalletSelectionRequest, AddXUserSelectionRequest,
+    GetCoinMarketCapFearAndGreedIndexRequest, GetCryptocurrencyEtfRequest,
+    GetEthereumWalletSelectionsRequest, GetFinancialCalendarRequest, GetFinancialIndicesRequest,
+    GetPentagonPizzaIndexRequest, GetSolanaWalletSelectionsRequest, GetXPostsRequest,
+    GetXUserSelectionsRequest, RemoveEthereumWalletSelectionRequest,
+    RemoveSolanaWalletSelectionRequest, RemoveXUserSelectionRequest, SearchXUserRequest,
+    request::Request as ClientRequestKind, response::Response as ServerResponseKind,
+    types::v1 as proto_types,
 };
 #[cfg(test)]
 use network::transport::error::TransportError;
@@ -44,13 +43,16 @@ use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
-    cryptocurrency_wallet_monitor::{
-        self, CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
-        CryptocurrencyWalletMonitorMutationUnknown, CryptocurrencyWalletMonitorSelection,
-        CryptocurrencyWalletMonitorSelectionsResponse,
+    ethereum_wallet::{
+        self, EthereumWalletApiError, EthereumWalletMutationOutcome, EthereumWalletMutationUnknown,
+        EthereumWalletSelection, EthereumWalletSelectionsResponse,
     },
     global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
     handoff::request_dashboard_handoff,
+    solana_wallet::{
+        self, SolanaWalletApiError, SolanaWalletMutationOutcome, SolanaWalletMutationUnknown,
+        SolanaWalletSelection, SolanaWalletSelectionsResponse,
+    },
     supervisor::run_service_supervisor,
     x::{
         self, TweetsResponse, XApiError, XMutationOutcome, XMutationUnknown, XProfile, XSelection,
@@ -71,12 +73,12 @@ use crate::{
     },
     service::{
         engine::{
-            COMMAND_CAPACITY, CancelOnDrop, Command, CryptocurrencyWalletMonitorTransfer,
-            FinancialIndexEvent, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
+            COMMAND_CAPACITY, CancelOnDrop, Command, EthereumWalletTransfer, FinancialIndexEvent,
+            FinancialIndexTopic, KYTRIX_SERVICE_WS_URL, KytrixAccountSession,
             KytrixServiceConnectorInner, KytrixServiceError, KytrixSessionState, NewsEvent,
             OPERATION_TIMEOUT, RpcCallError, SHUTDOWN_TIMEOUT, SUBSCRIBER_CAPACITY,
-            ServiceSessionContext, ServiceTopic, SessionStateRegistry, SubscriberSink,
-            SupervisorCommand, XSubscriptionEvent, XTweetBatch, authorization_url,
+            ServiceSessionContext, ServiceTopic, SessionStateRegistry, SolanaWalletTransfer,
+            SubscriberSink, SupervisorCommand, XSubscriptionEvent, XTweetBatch, authorization_url,
             await_account_operation, kytrix_service_endpoint, normalize_topics,
             service_account_profile, service_authorization_headers_with_profile,
             subscription_setup_error,
@@ -110,9 +112,9 @@ impl KytrixAccountSession {
         &self.profile
     }
 
-    pub async fn subscribe_cryptocurrency_wallet_monitor(
+    pub async fn subscribe_ethereum_wallet(
         &self,
-    ) -> Result<Subscription<CryptocurrencyWalletMonitorTransfer>, KytrixServiceError> {
+    ) -> Result<Subscription<EthereumWalletTransfer>, KytrixServiceError> {
         let (publisher, subscription) = subscription_channel_with_wake(
             SUBSCRIBER_CAPACITY,
             self.connector.inner().wake.clone(),
@@ -121,8 +123,26 @@ impl KytrixAccountSession {
         self.connector
             .subscribe_topics_for_profile(
                 &self.profile,
-                &[ServiceTopic::CryptocurrencyWalletMonitoring],
-                SubscriberSink::CryptocurrencyWalletMonitoring(publisher),
+                &[ServiceTopic::EthereumWallet],
+                SubscriberSink::EthereumWallet(publisher),
+            )
+            .await?;
+        Ok(subscription)
+    }
+
+    pub async fn subscribe_solana_wallet(
+        &self,
+    ) -> Result<Subscription<SolanaWalletTransfer>, KytrixServiceError> {
+        let (publisher, subscription) = subscription_channel_with_wake(
+            SUBSCRIBER_CAPACITY,
+            self.connector.inner().wake.clone(),
+        )
+        .map_err(subscription_setup_error)?;
+        self.connector
+            .subscribe_topics_for_profile(
+                &self.profile,
+                &[ServiceTopic::SolanaWallet],
+                SubscriberSink::SolanaWallet(publisher),
             )
             .await?;
         Ok(subscription)
@@ -169,58 +189,53 @@ impl KytrixAccountSession {
         self.connector.subscribe_session_state()
     }
 
-    pub async fn fetch_cryptocurrency_wallet_monitor_selections(
+    pub async fn fetch_ethereum_wallet_selections(
         &self,
-    ) -> Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>
-    {
+    ) -> Result<EthereumWalletSelectionsResponse, EthereumWalletApiError> {
         let response = self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-                ClientRequestKind::CryptocurrencyWalletMonitoringSelections(
-                    CryptocurrencyWalletMonitoringSelections {},
+                KytrixServiceCapability::EthereumWallet,
+                ClientRequestKind::GetEthereumWalletSelectionsRequest(
+                    GetEthereumWalletSelectionsRequest {},
                 ),
             )
             .await
-            .map_err(|error| cryptocurrency_wallet_monitor::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::CryptocurrencyWalletMonitoringSelections(response) = response
-        else {
-            return Err(CryptocurrencyWalletMonitorApiError::Protocol(
-                "unexpected cryptocurrency_wallet_monitor selections RPC response".into(),
+            .map_err(|error| ethereum_wallet::map_rpc_error(error.into_error()))?;
+        let ServerResponseKind::GetEthereumWalletSelectionsResponse(response) = response else {
+            return Err(EthereumWalletApiError::Protocol(
+                "unexpected Ethereum wallet selections RPC response".into(),
             ));
         };
-        let mut value = CryptocurrencyWalletMonitorSelectionsResponse {
+        let mut value = EthereumWalletSelectionsResponse {
             selections: response
                 .selections
                 .into_iter()
-                .map(cryptocurrency_wallet_monitor::decode_cryptocurrency_wallet_monitor_selection)
+                .map(ethereum_wallet::decode_ethereum_wallet_selection)
                 .collect::<Result<Vec<_>, _>>()?,
-            cryptocurrency_wallet_monitoring_address_limit: response
-                .cryptocurrency_wallet_monitoring_address_limit
+            ethereum_wallet_monitor_address_limit: response.ethereum_wallet_monitor_address_limit
                 as usize,
         };
-        cryptocurrency_wallet_monitor::validate_selections(&value)?;
-        cryptocurrency_wallet_monitor::sort_selections(&mut value.selections);
+        ethereum_wallet::validate_ethereum_wallet_selections(&value)?;
+        ethereum_wallet::sort_ethereum_wallet_selections(&mut value.selections);
         Ok(value)
     }
 
-    pub async fn add_cryptocurrency_wallet_monitor_selection(
+    pub async fn add_ethereum_wallet_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection> {
-        if cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(address).is_none() {
-            return CryptocurrencyWalletMonitorMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitorApiError::InvalidAddress,
-            );
+    ) -> EthereumWalletMutationOutcome<EthereumWalletSelection> {
+        if ethereum_wallet::ethereum_wallet_address(address).is_none() {
+            return EthereumWalletMutationOutcome::Rejected(EthereumWalletApiError::InvalidAddress);
         }
         let response = match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-                ClientRequestKind::CryptocurrencyWalletMonitoringAddSelection(
-                    CryptocurrencyWalletMonitoringAddSelection {
+                KytrixServiceCapability::EthereumWallet,
+                ClientRequestKind::AddEthereumWalletSelectionRequest(
+                    AddEthereumWalletSelectionRequest {
                         address: address.to_owned(),
                     },
                 ),
@@ -228,60 +243,161 @@ impl KytrixAccountSession {
             .await
         {
             Ok(response) => response,
-            Err(error) => return cryptocurrency_wallet_monitor::mutation_rpc_error(error),
+            Err(error) => return ethereum_wallet::mutation_rpc_error(error),
         };
-        let ServerResponseKind::CryptocurrencyWalletMonitoringAddSelection(response) = response
-        else {
-            return CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
+        let ServerResponseKind::AddEthereumWalletSelectionResponse(response) = response else {
+            return EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::InvalidResponse,
             );
         };
         let Some(selection) = response.selection else {
-            return CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
+            return EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::InvalidResponse,
             );
         };
-        match cryptocurrency_wallet_monitor::decode_cryptocurrency_wallet_monitor_selection(
-            selection,
-        ) {
+        match ethereum_wallet::decode_ethereum_wallet_selection(selection) {
             Ok(selection) if selection.address == address => {
-                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(selection)
+                EthereumWalletMutationOutcome::Confirmed(selection)
             }
-            Ok(_) | Err(_) => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
+            Ok(_) | Err(_) => EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::InvalidResponse,
             ),
         }
     }
 
-    pub async fn delete_cryptocurrency_wallet_monitor_selection(
+    pub async fn delete_ethereum_wallet_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitorMutationOutcome<()> {
-        if cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(address).is_none() {
-            return CryptocurrencyWalletMonitorMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitorApiError::InvalidAddress,
-            );
+    ) -> EthereumWalletMutationOutcome<()> {
+        if ethereum_wallet::ethereum_wallet_address(address).is_none() {
+            return EthereumWalletMutationOutcome::Rejected(EthereumWalletApiError::InvalidAddress);
         }
         match self
             .connector
             .call_rpc(
                 Some(&self.profile),
-                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-                ClientRequestKind::CryptocurrencyWalletMonitoringDeleteSelection(
-                    CryptocurrencyWalletMonitoringDeleteSelection {
+                KytrixServiceCapability::EthereumWallet,
+                ClientRequestKind::RemoveEthereumWalletSelectionRequest(
+                    RemoveEthereumWalletSelectionRequest {
                         address: address.to_owned(),
                     },
                 ),
             )
             .await
         {
-            Ok(ServerResponseKind::CryptocurrencyWalletMonitoringDeleteSelection(_)) => {
-                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(())
+            Ok(ServerResponseKind::RemoveEthereumWalletSelectionResponse(_)) => {
+                EthereumWalletMutationOutcome::Confirmed(())
             }
-            Ok(_) => CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::InvalidResponse,
+            Ok(_) => EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::InvalidResponse,
             ),
-            Err(error) => cryptocurrency_wallet_monitor::mutation_rpc_error(error),
+            Err(error) => ethereum_wallet::mutation_rpc_error(error),
+        }
+    }
+
+    pub async fn fetch_solana_wallet_selections(
+        &self,
+    ) -> Result<SolanaWalletSelectionsResponse, SolanaWalletApiError> {
+        let response = self
+            .connector
+            .call_rpc(
+                Some(&self.profile),
+                KytrixServiceCapability::SolanaWallet,
+                ClientRequestKind::GetSolanaWalletSelectionsRequest(
+                    GetSolanaWalletSelectionsRequest {},
+                ),
+            )
+            .await
+            .map_err(|error| solana_wallet::map_rpc_error(error.into_error()))?;
+        let ServerResponseKind::GetSolanaWalletSelectionsResponse(response) = response else {
+            return Err(SolanaWalletApiError::Protocol(
+                "unexpected Solana wallet selections RPC response".into(),
+            ));
+        };
+        let mut value = SolanaWalletSelectionsResponse {
+            selections: response
+                .selections
+                .into_iter()
+                .map(solana_wallet::decode_solana_wallet_selection)
+                .collect::<Result<Vec<_>, _>>()?,
+            solana_wallet_monitor_address_limit: response.solana_wallet_monitor_address_limit
+                as usize,
+        };
+        solana_wallet::validate_solana_wallet_selections(&value)?;
+        solana_wallet::sort_solana_wallet_selections(&mut value.selections);
+        Ok(value)
+    }
+
+    pub async fn add_solana_wallet_selection(
+        &self,
+        address: &str,
+    ) -> SolanaWalletMutationOutcome<SolanaWalletSelection> {
+        if solana_wallet::solana_wallet_address(address).is_none() {
+            return SolanaWalletMutationOutcome::Rejected(SolanaWalletApiError::InvalidAddress);
+        }
+        let response = match self
+            .connector
+            .call_rpc(
+                Some(&self.profile),
+                KytrixServiceCapability::SolanaWallet,
+                ClientRequestKind::AddSolanaWalletSelectionRequest(
+                    AddSolanaWalletSelectionRequest {
+                        address: address.to_owned(),
+                    },
+                ),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return solana_wallet::mutation_rpc_error(error),
+        };
+        let ServerResponseKind::AddSolanaWalletSelectionResponse(response) = response else {
+            return SolanaWalletMutationOutcome::Unknown(
+                SolanaWalletMutationUnknown::InvalidResponse,
+            );
+        };
+        let Some(selection) = response.selection else {
+            return SolanaWalletMutationOutcome::Unknown(
+                SolanaWalletMutationUnknown::InvalidResponse,
+            );
+        };
+        match solana_wallet::decode_solana_wallet_selection(selection) {
+            Ok(selection) if selection.address == address => {
+                SolanaWalletMutationOutcome::Confirmed(selection)
+            }
+            Ok(_) | Err(_) => {
+                SolanaWalletMutationOutcome::Unknown(SolanaWalletMutationUnknown::InvalidResponse)
+            }
+        }
+    }
+
+    pub async fn delete_solana_wallet_selection(
+        &self,
+        address: &str,
+    ) -> SolanaWalletMutationOutcome<()> {
+        if solana_wallet::solana_wallet_address(address).is_none() {
+            return SolanaWalletMutationOutcome::Rejected(SolanaWalletApiError::InvalidAddress);
+        }
+        match self
+            .connector
+            .call_rpc(
+                Some(&self.profile),
+                KytrixServiceCapability::SolanaWallet,
+                ClientRequestKind::RemoveSolanaWalletSelectionRequest(
+                    RemoveSolanaWalletSelectionRequest {
+                        address: address.to_owned(),
+                    },
+                ),
+            )
+            .await
+        {
+            Ok(ServerResponseKind::RemoveSolanaWalletSelectionResponse(_)) => {
+                SolanaWalletMutationOutcome::Confirmed(())
+            }
+            Ok(_) => {
+                SolanaWalletMutationOutcome::Unknown(SolanaWalletMutationUnknown::InvalidResponse)
+            }
+            Err(error) => solana_wallet::mutation_rpc_error(error),
         }
     }
 
@@ -292,13 +408,13 @@ impl KytrixAccountSession {
             .call_rpc(
                 Some(&self.profile),
                 KytrixServiceCapability::X,
-                ClientRequestKind::XAccountMonitoringSearch(XAccountMonitoringSearch {
+                ClientRequestKind::SearchXUserRequest(SearchXUserRequest {
                     query: query.to_owned(),
                 }),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XAccountMonitoringSearch(response) = response else {
+        let ServerResponseKind::SearchXUserResponse(response) = response else {
             return Err(XApiError::Protocol(
                 "unexpected X search RPC response".into(),
             ));
@@ -318,11 +434,11 @@ impl KytrixAccountSession {
             .call_rpc(
                 Some(&self.profile),
                 KytrixServiceCapability::X,
-                ClientRequestKind::XAccountMonitoringSelections(XAccountMonitoringSelections {}),
+                ClientRequestKind::GetXUserSelectionsRequest(GetXUserSelectionsRequest {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XAccountMonitoringSelections(response) = response else {
+        let ServerResponseKind::GetXUserSelectionsResponse(response) = response else {
             return Err(XApiError::Protocol(
                 "unexpected X selections RPC response".into(),
             ));
@@ -346,21 +462,21 @@ impl KytrixAccountSession {
             .call_rpc(
                 Some(&self.profile),
                 KytrixServiceCapability::X,
-                ClientRequestKind::XAccountMonitoringTweets(XAccountMonitoringTweets {}),
+                ClientRequestKind::GetXPostsRequest(GetXPostsRequest {}),
             )
             .await
             .map_err(|error| x::map_rpc_error(error.into_error()))?;
-        let ServerResponseKind::XAccountMonitoringTweets(response) = response else {
+        let ServerResponseKind::GetXPostsResponse(response) = response else {
             return Err(XApiError::Protocol(
-                "unexpected X tweets RPC response".into(),
+                "unexpected X posts RPC response".into(),
             ));
         };
-        let batch = response
-            .batch
-            .ok_or_else(|| XApiError::Protocol("X tweets RPC response is missing data".into()))?;
+        let posts = response
+            .posts
+            .ok_or_else(|| XApiError::Protocol("X posts RPC response is missing data".into()))?;
         x::decode_tweets_response(TweetsResponse {
-            tweets: batch.tweets,
-            profiles: batch.profiles,
+            tweets: posts.posts,
+            profiles: posts.profiles,
         })
     }
 
@@ -373,7 +489,7 @@ impl KytrixAccountSession {
             .call_rpc(
                 Some(&self.profile),
                 KytrixServiceCapability::X,
-                ClientRequestKind::XAccountMonitoringAddSelection(XAccountMonitoringAddSelection {
+                ClientRequestKind::AddXUserSelectionRequest(AddXUserSelectionRequest {
                     username: username.to_owned(),
                 }),
             )
@@ -385,7 +501,7 @@ impl KytrixAccountSession {
                 return x::mutation_rpc_error(error, possibly_submitted);
             }
         };
-        let ServerResponseKind::XAccountMonitoringAddSelection(response) = response else {
+        let ServerResponseKind::AddXUserSelectionResponse(response) = response else {
             return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
         };
         let Some(selection) = response.selection else {
@@ -416,15 +532,13 @@ impl KytrixAccountSession {
             .call_rpc(
                 Some(&self.profile),
                 KytrixServiceCapability::X,
-                ClientRequestKind::XAccountMonitoringDeleteSelection(
-                    XAccountMonitoringDeleteSelection {
-                        x_user_id: x_user_id.to_owned(),
-                    },
-                ),
+                ClientRequestKind::RemoveXUserSelectionRequest(RemoveXUserSelectionRequest {
+                    x_user_id: x_user_id.to_owned(),
+                }),
             )
             .await
         {
-            Ok(ServerResponseKind::XAccountMonitoringDeleteSelection(_)) => {
+            Ok(ServerResponseKind::RemoveXUserSelectionResponse(_)) => {
                 XMutationOutcome::Confirmed(())
             }
             Ok(_) => XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse),
@@ -1118,11 +1232,12 @@ impl KytrixServiceConnector {
             .call_rpc(
                 None,
                 KytrixServiceCapability::CryptocurrencyEtf,
-                ClientRequestKind::GetCryptocurrencyEtf(GetCryptocurrencyEtf {}),
+                ClientRequestKind::GetCryptocurrencyEtfRequest(GetCryptocurrencyEtfRequest {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::CryptocurrencyEtf(response) = response else {
+        let proto_response::response::Response::GetCryptocurrencyEtfResponse(response) = response
+        else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected cryptocurrency ETF RPC response".into(),
             ));
@@ -1132,25 +1247,26 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the current index manifest over WebSocket RPC.
-    pub async fn fetch_financial_index_manifest(
+    /// Fetches the current financial indices over WebSocket RPC.
+    pub async fn fetch_financial_indices(
         &self,
-    ) -> Result<proto_types::FinancialIndexManifest, KytrixServiceError> {
+    ) -> Result<proto_types::FinancialIndices, KytrixServiceError> {
         let response = self
             .call_rpc(
                 None,
                 KytrixServiceCapability::FinancialIndices,
-                ClientRequestKind::GetFinancialIndexManifest(GetFinancialIndexManifest {}),
+                ClientRequestKind::GetFinancialIndicesRequest(GetFinancialIndicesRequest {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::FinancialIndexManifest(response) = response else {
+        let proto_response::response::Response::GetFinancialIndicesResponse(response) = response
+        else {
             return Err(KytrixServiceError::Protocol(
-                "unexpected index manifest RPC response".into(),
+                "unexpected financial indices RPC response".into(),
             ));
         };
-        response.manifest.ok_or_else(|| {
-            KytrixServiceError::Protocol("index manifest RPC response is missing data".into())
+        response.indices.ok_or_else(|| {
+            KytrixServiceError::Protocol("financial indices RPC response is missing data".into())
         })
     }
 
@@ -1162,11 +1278,11 @@ impl KytrixServiceConnector {
             .call_rpc(
                 None,
                 KytrixServiceCapability::FinancialCalendar,
-                ClientRequestKind::GetFinancialCalendar(GetFinancialCalendar {}),
+                ClientRequestKind::GetFinancialCalendarRequest(GetFinancialCalendarRequest {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::FinancialCalendar(response) = response else {
+        let proto_response::response::Response::GetFinancialCalendar(response) = response else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected financial calendar RPC response".into(),
             ));
@@ -1184,13 +1300,14 @@ impl KytrixServiceConnector {
             .call_rpc(
                 None,
                 KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
-                ClientRequestKind::GetCoinMarketCapFearAndGreedIndex(
-                    GetCoinMarketCapFearAndGreedIndex {},
+                ClientRequestKind::GetCoinMarketCapFearAndGreedIndexRequest(
+                    GetCoinMarketCapFearAndGreedIndexRequest {},
                 ),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::CoinMarketCapFearAndGreedIndex(response) = response
+        let proto_response::response::Response::GetCoinMarketCapFearAndGreedIndex(response) =
+            response
         else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected fear and greed RPC response".into(),
@@ -1211,11 +1328,11 @@ impl KytrixServiceConnector {
             .call_rpc(
                 None,
                 KytrixServiceCapability::PentagonPizzaIndex,
-                ClientRequestKind::GetPentagonPizzaIndex(GetPentagonPizzaIndex {}),
+                ClientRequestKind::GetPentagonPizzaIndexRequest(GetPentagonPizzaIndexRequest {}),
             )
             .await
             .map_err(RpcCallError::into_error)?;
-        let proto_response::response::Response::PentagonPizzaIndex(response) = response else {
+        let proto_response::response::Response::GetPentagonPizzaIndex(response) = response else {
             return Err(KytrixServiceError::Protocol(
                 "unexpected Pentagon Pizza Index RPC response".into(),
             ));
@@ -1239,9 +1356,8 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::service::{
-        cryptocurrency_wallet_monitor::{
-            CryptocurrencyWalletMonitorMutationOutcome, CryptocurrencyWalletMonitorMutationUnknown,
-        },
+        ethereum_wallet::{EthereumWalletMutationOutcome, EthereumWalletMutationUnknown},
+        solana_wallet::{SolanaWalletMutationOutcome, SolanaWalletMutationUnknown},
         x::XSelectionStatus,
     };
 
@@ -1257,12 +1373,12 @@ mod tests {
             ObservedRequest::Rpc("cryptocurrency_etf")
         );
         assert_eq!(
-            connector.fetch_financial_index_manifest().await.unwrap(),
-            financial_index_manifest()
+            connector.fetch_financial_indices().await.unwrap(),
+            financial_indices()
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("index_manifest")
+            ObservedRequest::Rpc("financial_indices")
         );
         assert_eq!(
             connector
@@ -1299,11 +1415,13 @@ mod tests {
     #[tokio::test]
     async fn a_pizza_index_answer_of_another_kind_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::CryptocurrencyEtf(
-            proto_response::CryptocurrencyEtfResponse {
-                cryptocurrency_etf: None,
-            },
-        ));
+        server.answer_next_request_with(
+            proto_response::response::Response::GetCryptocurrencyEtfResponse(
+                proto_response::GetCryptocurrencyEtfResponse {
+                    cryptocurrency_etf: None,
+                },
+            ),
+        );
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
 
@@ -1325,8 +1443,8 @@ mod tests {
     #[tokio::test]
     async fn a_pizza_index_answer_without_a_snapshot_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::PentagonPizzaIndex(
-            proto_response::PentagonPizzaIndexResponse {
+        server.answer_next_request_with(proto_response::response::Response::GetPentagonPizzaIndex(
+            proto_response::GetPentagonPizzaIndexResponse {
                 pentagon_pizza_index: None,
             },
         ));
@@ -1351,11 +1469,13 @@ mod tests {
     #[tokio::test]
     async fn a_fear_and_greed_answer_of_another_kind_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::CryptocurrencyEtf(
-            proto_response::CryptocurrencyEtfResponse {
-                cryptocurrency_etf: None,
-            },
-        ));
+        server.answer_next_request_with(
+            proto_response::response::Response::GetCryptocurrencyEtfResponse(
+                proto_response::GetCryptocurrencyEtfResponse {
+                    cryptocurrency_etf: None,
+                },
+            ),
+        );
         let connector =
             KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
 
@@ -1378,8 +1498,8 @@ mod tests {
     async fn a_fear_and_greed_answer_without_a_snapshot_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
         server.answer_next_request_with(
-            proto_response::response::Response::CoinMarketCapFearAndGreedIndex(
-                proto_response::CoinMarketCapFearAndGreedIndexResponse {
+            proto_response::response::Response::GetCoinMarketCapFearAndGreedIndex(
+                proto_response::GetCoinMarketCapFearAndGreedIndexResponse {
                     coin_market_cap_fear_and_greed_index: None,
                 },
             ),
@@ -1405,8 +1525,8 @@ mod tests {
     #[tokio::test]
     async fn a_calendar_answer_without_a_snapshot_is_a_protocol_error() {
         let mut server = TestServiceServer::spawn(false).await;
-        server.answer_next_request_with(proto_response::response::Response::FinancialCalendar(
-            proto_response::FinancialCalendarResponse {
+        server.answer_next_request_with(proto_response::response::Response::GetFinancialCalendar(
+            proto_response::GetFinancialCalendarResponse {
                 financial_calendar: None,
             },
         ));
@@ -1429,7 +1549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cryptocurrency_wallet_monitor_mutation_response_loss_is_unknown_and_is_not_retried() {
+    async fn ethereum_wallet_mutation_response_loss_is_unknown_and_is_not_retried() {
         let mut server = TestServiceServer::spawn(false).await;
         server.drop_next_response();
         let connector =
@@ -1441,18 +1561,580 @@ mod tests {
         let address = "0x0000000000000000000000000000000000000001";
 
         assert_eq!(
-            session
-                .add_cryptocurrency_wallet_monitor_selection(address)
-                .await,
-            CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::ResponseLost
-            )
+            session.add_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Unknown(EthereumWalletMutationUnknown::ResponseLost)
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_add_selection")
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_add_selection")
         );
         server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ethereum_wallet_selections_map_the_service_response() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_ethereum_wallet_selections().await.unwrap(),
+            EthereumWalletSelectionsResponse {
+                selections: Vec::new(),
+                ethereum_wallet_monitor_address_limit: 3,
+            }
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn solana_wallet_selections_map_the_service_response() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_solana_wallet_selections().await.unwrap(),
+            SolanaWalletSelectionsResponse {
+                selections: Vec::new(),
+                solana_wallet_monitor_address_limit: 3,
+            }
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ethereum_wallet_selections_answer_of_another_kind_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::GetSolanaWalletSelectionsResponse(
+                proto_response::GetSolanaWalletSelectionsResponse {
+                    selections: Vec::new(),
+                    solana_wallet_monitor_address_limit: 3,
+                },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_ethereum_wallet_selections().await,
+            Err(EthereumWalletApiError::Protocol(
+                "unexpected Ethereum wallet selections RPC response".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_solana_wallet_selections_answer_of_another_kind_is_a_protocol_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::GetEthereumWalletSelectionsResponse(
+                proto_response::GetEthereumWalletSelectionsResponse {
+                    selections: Vec::new(),
+                    ethereum_wallet_monitor_address_limit: 3,
+                },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_solana_wallet_selections().await,
+            Err(SolanaWalletApiError::Protocol(
+                "unexpected Solana wallet selections RPC response".into()
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ethereum_wallet_selections_server_error_maps_to_the_api_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.fail_next_request();
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_ethereum_wallet_selections().await,
+            Err(EthereumWalletApiError::Server(
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_solana_wallet_selections_server_error_maps_to_the_api_error() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.fail_next_request();
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.fetch_solana_wallet_selections().await,
+            Err(SolanaWalletApiError::Server(
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_selections")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ethereum_wallet_selection_add_is_confirmed() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "0x0000000000000000000000000000000000000001";
+
+        assert_eq!(
+            session.add_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Confirmed(EthereumWalletSelection {
+                address: address.into(),
+                status: ethereum_wallet::EthereumWalletSelectionStatus::Active,
+                created_at: 1,
+                updated_at: 1,
+            })
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn solana_wallet_selection_add_is_confirmed() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.add_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Confirmed(SolanaWalletSelection {
+                address: address.into(),
+                status: solana_wallet::SolanaWalletSelectionStatus::Active,
+                created_at: 1,
+                updated_at: 1,
+            })
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_ethereum_wallet_address_is_rejected_before_the_service_is_called() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .add_ethereum_wallet_selection("not-an-ethereum-address")
+                .await,
+            EthereumWalletMutationOutcome::Rejected(EthereumWalletApiError::InvalidAddress)
+        );
+        server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_solana_wallet_address_is_rejected_before_the_service_is_called() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .add_solana_wallet_selection("not-a-solana-address")
+                .await,
+            SolanaWalletMutationOutcome::Rejected(SolanaWalletApiError::InvalidAddress)
+        );
+        server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ethereum_wallet_add_answer_of_another_kind_is_unknown() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::GetEthereumWalletSelectionsResponse(
+                proto_response::GetEthereumWalletSelectionsResponse {
+                    selections: Vec::new(),
+                    ethereum_wallet_monitor_address_limit: 3,
+                },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "0x0000000000000000000000000000000000000001";
+
+        assert_eq!(
+            session.add_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Unknown(EthereumWalletMutationUnknown::InvalidResponse)
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_solana_wallet_add_answer_of_another_kind_is_unknown() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::GetSolanaWalletSelectionsResponse(
+                proto_response::GetSolanaWalletSelectionsResponse {
+                    selections: Vec::new(),
+                    solana_wallet_monitor_address_limit: 3,
+                },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.add_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Unknown(SolanaWalletMutationUnknown::InvalidResponse)
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ethereum_wallet_add_server_error_is_rejected() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.fail_next_request();
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "0x0000000000000000000000000000000000000001";
+
+        assert_eq!(
+            session.add_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Rejected(EthereumWalletApiError::Server(
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_solana_wallet_add_server_error_is_rejected() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.fail_next_request();
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.add_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Rejected(SolanaWalletApiError::Server(
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ))
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_add_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn solana_wallet_mutation_response_loss_is_unknown_and_is_not_retried() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.drop_next_response();
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.add_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Unknown(SolanaWalletMutationUnknown::ResponseLost)
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_add_selection")
+        );
+        server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ethereum_wallet_selection_delete_is_confirmed() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "0x0000000000000000000000000000000000000001";
+
+        assert_eq!(
+            session.delete_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Confirmed(())
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_delete_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn solana_wallet_selection_delete_is_confirmed() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.delete_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Confirmed(())
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_delete_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_ethereum_wallet_delete_address_is_rejected_before_the_service_is_called() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .delete_ethereum_wallet_selection("not-an-ethereum-address")
+                .await,
+            EthereumWalletMutationOutcome::Rejected(EthereumWalletApiError::InvalidAddress)
+        );
+        server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_solana_wallet_delete_address_is_rejected_before_the_service_is_called() {
+        let mut server = TestServiceServer::spawn(false).await;
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .delete_solana_wallet_selection("not-a-solana-address")
+                .await,
+            SolanaWalletMutationOutcome::Rejected(SolanaWalletApiError::InvalidAddress)
+        );
+        server.assert_no_request().await;
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ethereum_wallet_delete_answer_of_another_kind_is_unknown() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::AddEthereumWalletSelectionResponse(
+                proto_response::AddEthereumWalletSelectionResponse { selection: None },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "0x0000000000000000000000000000000000000001";
+
+        assert_eq!(
+            session.delete_ethereum_wallet_selection(address).await,
+            EthereumWalletMutationOutcome::Unknown(EthereumWalletMutationUnknown::InvalidResponse)
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("ethereum_wallet_monitoring_delete_selection")
+        );
+
+        connector.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_solana_wallet_delete_answer_of_another_kind_is_unknown() {
+        let mut server = TestServiceServer::spawn(false).await;
+        server.answer_next_request_with(
+            proto_response::response::Response::AddSolanaWalletSelectionResponse(
+                proto_response::AddSolanaWalletSelectionResponse { selection: None },
+            ),
+        );
+        let connector =
+            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let session = connector
+            .acquire_account_session(TEST_ACCOUNT_ID)
+            .await
+            .unwrap();
+        let address = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+
+        assert_eq!(
+            session.delete_solana_wallet_selection(address).await,
+            SolanaWalletMutationOutcome::Unknown(SolanaWalletMutationUnknown::InvalidResponse)
+        );
+        assert_eq!(
+            server.next_request().await.1,
+            ObservedRequest::Rpc("solana_wallet_monitoring_delete_selection")
+        );
 
         connector.shutdown().await;
         server.shutdown().await;
@@ -1490,8 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn pending_rpc_responses_can_complete_out_of_order_and_cancel_independently() {
         let (_invalidations, invalidations) = credential_change_watch();
-        let (mut actor, _subscription) =
-            actor_with_cryptocurrency_wallet_monitor_subscriber(invalidations);
+        let (mut actor, _subscription) = actor_with_ethereum_wallet_subscriber(invalidations);
         let profile = actor
             .account_profile
             .read()
@@ -1505,7 +2186,7 @@ mod tests {
                 id,
                 PendingRpc {
                     expected_profile: profile.clone(),
-                    capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                    capability: KytrixServiceCapability::EthereumWallet,
                     route_generation: NetworkRouteGeneration::default(),
                     cancellation: CancellationToken::new(),
                     deadline: Instant::now() + Duration::from_secs(1),
@@ -1516,8 +2197,8 @@ mod tests {
         let response = |id| proto_response::Response {
             id,
             response: Some(
-                proto_response::response::Response::CryptocurrencyWalletMonitoringDeleteSelection(
-                    proto_response::CryptocurrencyWalletMonitoringDeleteSelectionResponse {},
+                proto_response::response::Response::RemoveEthereumWalletSelectionResponse(
+                    proto_response::RemoveEthereumWalletSelectionResponse {},
                 ),
             ),
         };
@@ -1533,7 +2214,7 @@ mod tests {
             3,
             PendingRpc {
                 expected_profile: profile,
-                capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+                capability: KytrixServiceCapability::EthereumWallet,
                 route_generation: NetworkRouteGeneration::default(),
                 cancellation: cancellation.clone(),
                 deadline: Instant::now() + Duration::from_secs(1),
@@ -1716,10 +2397,10 @@ mod tests {
                 ])
             )
         );
-        let mut cryptocurrency_wallet_monitor = session
-            .subscribe_cryptocurrency_wallet_monitor()
+        let mut ethereum_wallet = session
+            .subscribe_ethereum_wallet()
             .await
-            .expect("cryptocurrency_wallet_monitor should subscribe");
+            .expect("Ethereum wallet should subscribe");
         assert_eq!(
             server.next_request().await,
             (
@@ -1728,7 +2409,24 @@ mod tests {
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(index),
                     ServiceTopic::X,
-                    ServiceTopic::CryptocurrencyWalletMonitoring,
+                    ServiceTopic::EthereumWallet,
+                ])
+            )
+        );
+        let mut solana_wallet = session
+            .subscribe_solana_wallet()
+            .await
+            .expect("Solana wallet should subscribe");
+        assert_eq!(
+            server.next_request().await,
+            (
+                1,
+                ObservedRequest::SetSubscriptions(vec![
+                    ServiceTopic::News,
+                    ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
+                    ServiceTopic::X,
+                    ServiceTopic::EthereumWallet,
+                    ServiceTopic::SolanaWallet,
                 ])
             )
         );
@@ -1744,7 +2442,8 @@ mod tests {
                     ServiceTopic::News,
                     ServiceTopic::FinancialIndex(financial_index_topic("SPX")),
                     ServiceTopic::X,
-                    ServiceTopic::CryptocurrencyWalletMonitoring,
+                    ServiceTopic::EthereumWallet,
+                    ServiceTopic::SolanaWallet,
                     ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
                 ])
             )
@@ -1754,7 +2453,8 @@ mod tests {
         server.send_news("typed-news");
         server.send_financial_index("SPX");
         server.send_x_profile();
-        server.send_cryptocurrency_wallet_monitor_transfer("typed-cryptocurrency_wallet_monitor");
+        server.send_ethereum_wallet_transfer("typed-ethereum-wallet");
+        server.send_solana_wallet_transfer("typed-solana-wallet");
         server.send_global_shipping_chokepoint_delta();
 
         assert_eq!(
@@ -1782,12 +2482,20 @@ mod tests {
             XSubscriptionEvent::Profile(XProfileEvent { username, .. }) if username == "kytrix"
         ));
         assert_eq!(
-            timeout(Duration::from_secs(2), cryptocurrency_wallet_monitor.recv())
+            timeout(Duration::from_secs(2), ethereum_wallet.recv())
                 .await
-                .expect("cryptocurrency_wallet_monitor event should arrive")
-                .expect("cryptocurrency_wallet_monitor subscription should remain active")
+                .expect("Ethereum wallet event should arrive")
+                .expect("Ethereum wallet subscription should remain active")
                 .event_id,
-            "typed-cryptocurrency_wallet_monitor"
+            "typed-ethereum-wallet"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), solana_wallet.recv())
+                .await
+                .expect("Solana wallet event should arrive")
+                .expect("Solana wallet subscription should remain active")
+                .event_id,
+            "typed-solana-wallet"
         );
         assert_eq!(
             timeout(Duration::from_secs(2), global_shipping_chokepoint.recv())
@@ -1799,14 +2507,16 @@ mod tests {
         assert!(news.try_recv_for_test().is_err());
         assert!(indices.try_recv_for_test().is_err());
         assert!(x.try_recv_for_test().is_err());
-        assert!(cryptocurrency_wallet_monitor.try_recv_for_test().is_err());
+        assert!(ethereum_wallet.try_recv_for_test().is_err());
+        assert!(solana_wallet.try_recv_for_test().is_err());
         assert!(global_shipping_chokepoint.try_recv_for_test().is_err());
 
         drop((
             news,
             indices,
             x,
-            cryptocurrency_wallet_monitor,
+            ethereum_wallet,
+            solana_wallet,
             global_shipping_chokepoint,
         ));
         connector.shutdown().await;

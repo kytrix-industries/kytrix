@@ -14,9 +14,8 @@ use ahash::{AHashMap, AHashSet};
 use app_config::network::{Config, KytrixServiceCapability, NetworkRouteGeneration, ResolvedProxy};
 use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
-use kytrix_proto::{
-    client::request::Request as ClientRequestKind, server as proto_response, types as proto_types,
-};
+use kytrix_proto as proto_response;
+use kytrix_proto::{request::Request as ClientRequestKind, types::v1 as proto_types};
 use network::transport::{
     error::TransportError,
     hub::{TransportHub, TransportPolicy, TransportScope},
@@ -48,7 +47,7 @@ use crate::{
     },
 };
 
-pub type ErrorCode = kytrix_proto::server::ErrorCode;
+pub type ErrorCode = kytrix_proto::ErrorCode;
 
 pub(super) static KYTRIX_SERVICE_WS_URL: LazyLock<Url> = LazyLock::new(|| {
     cfg_select! {
@@ -259,7 +258,8 @@ pub enum ServiceTopic {
     News,
     FinancialIndex(FinancialIndexTopic),
     X,
-    CryptocurrencyWalletMonitoring,
+    EthereumWallet,
+    SolanaWallet,
     GlobalShippingChokepoint(GlobalShippingChokepointArea),
 }
 
@@ -350,9 +350,20 @@ pub struct XTweetBatch {
     pub profiles: Vec<XProfileEvent>,
 }
 
-/// A validated cryptocurrency_wallet_monitor transfer received from the service.
+/// A validated Ethereum wallet transfer received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CryptocurrencyWalletMonitorTransfer {
+pub struct EthereumWalletTransfer {
+    pub event_id: SmolStr,
+    pub from_address: SmolStr,
+    pub to_address: SmolStr,
+    pub amount: SmolStr,
+    pub token_symbol: SmolStr,
+    pub timestamp: i64,
+}
+
+/// A validated Solana wallet transfer received from the service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SolanaWalletTransfer {
     pub event_id: SmolStr,
     pub from_address: SmolStr,
     pub to_address: SmolStr,
@@ -367,7 +378,8 @@ pub(super) enum KytrixServiceEvent {
     FinancialIndex(FinancialIndexEvent),
     XProfile(XProfileEvent),
     XTweet(XTweetEvent),
-    CryptocurrencyWalletMonitorTransfer(CryptocurrencyWalletMonitorTransfer),
+    EthereumWalletTransfer(EthereumWalletTransfer),
+    SolanaWalletTransfer(SolanaWalletTransfer),
     GlobalShippingChokepoint(GlobalShippingChokepointUpdate),
     SessionState(KytrixSessionState),
 }
@@ -376,7 +388,8 @@ pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
     FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
     X(SubscriptionPublisher<XSubscriptionEvent>),
-    CryptocurrencyWalletMonitoring(SubscriptionPublisher<CryptocurrencyWalletMonitorTransfer>),
+    EthereumWallet(SubscriptionPublisher<EthereumWalletTransfer>),
+    SolanaWallet(SubscriptionPublisher<SolanaWalletTransfer>),
     GlobalShippingChokepoint(SubscriptionPublisher<GlobalShippingChokepointUpdate>),
 }
 
@@ -386,9 +399,8 @@ impl SubscriberSink {
             Self::News(_) => KytrixServiceCapability::News,
             Self::FinancialIndices(_) => KytrixServiceCapability::FinancialIndices,
             Self::X(_) => KytrixServiceCapability::X,
-            Self::CryptocurrencyWalletMonitoring(_) => {
-                KytrixServiceCapability::CryptocurrencyWalletMonitoring
-            }
+            Self::EthereumWallet(_) => KytrixServiceCapability::EthereumWallet,
+            Self::SolanaWallet(_) => KytrixServiceCapability::SolanaWallet,
             Self::GlobalShippingChokepoint(_) => KytrixServiceCapability::GlobalShippingChokepoint,
         }
     }
@@ -398,7 +410,8 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.activate(),
             Self::FinancialIndices(publisher) => publisher.activate(),
             Self::X(publisher) => publisher.activate(),
-            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.activate(),
+            Self::EthereumWallet(publisher) => publisher.activate(),
+            Self::SolanaWallet(publisher) => publisher.activate(),
             Self::GlobalShippingChokepoint(publisher) => publisher.activate(),
         }
     }
@@ -408,7 +421,8 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.reconnecting(),
             Self::FinancialIndices(publisher) => publisher.reconnecting(),
             Self::X(publisher) => publisher.reconnecting(),
-            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.reconnecting(),
+            Self::EthereumWallet(publisher) => publisher.reconnecting(),
+            Self::SolanaWallet(publisher) => publisher.reconnecting(),
             Self::GlobalShippingChokepoint(publisher) => publisher.reconnecting(),
         }
     }
@@ -418,7 +432,8 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.fail(error),
             Self::FinancialIndices(publisher) => publisher.fail(error),
             Self::X(publisher) => publisher.fail(error),
-            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.fail(error),
+            Self::EthereumWallet(publisher) => publisher.fail(error),
+            Self::SolanaWallet(publisher) => publisher.fail(error),
             Self::GlobalShippingChokepoint(publisher) => publisher.fail(error),
         }
     }
@@ -428,7 +443,8 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.finish(),
             Self::FinancialIndices(publisher) => publisher.finish(),
             Self::X(publisher) => publisher.finish(),
-            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.finish(),
+            Self::EthereumWallet(publisher) => publisher.finish(),
+            Self::SolanaWallet(publisher) => publisher.finish(),
             Self::GlobalShippingChokepoint(publisher) => publisher.finish(),
         }
     }
@@ -438,7 +454,8 @@ impl SubscriberSink {
             Self::News(publisher) => publisher.is_cancelled(),
             Self::FinancialIndices(publisher) => publisher.is_cancelled(),
             Self::X(publisher) => publisher.is_cancelled(),
-            Self::CryptocurrencyWalletMonitoring(publisher) => publisher.is_cancelled(),
+            Self::EthereumWallet(publisher) => publisher.is_cancelled(),
+            Self::SolanaWallet(publisher) => publisher.is_cancelled(),
             Self::GlobalShippingChokepoint(publisher) => publisher.is_cancelled(),
         }
     }
@@ -460,11 +477,16 @@ impl SubscriberSink {
                 .try_send(XSubscriptionEvent::XTweet(tweet.clone()))
                 .map_err(subscription_send_error),
             (
-                Self::CryptocurrencyWalletMonitoring(publisher),
-                KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
+                Self::EthereumWallet(publisher),
+                KytrixServiceEvent::EthereumWalletTransfer(transfer),
             ) => publisher
                 .try_send(transfer.clone())
                 .map_err(subscription_send_error),
+            (Self::SolanaWallet(publisher), KytrixServiceEvent::SolanaWalletTransfer(transfer)) => {
+                publisher
+                    .try_send(transfer.clone())
+                    .map_err(subscription_send_error)
+            }
             (
                 Self::GlobalShippingChokepoint(publisher),
                 KytrixServiceEvent::GlobalShippingChokepoint(update),
@@ -484,18 +506,21 @@ pub(super) fn subscription_send_error<T>(error: SubscriptionSendError<T>) -> Tra
 }
 
 /// The entitlement value the Kytrix service publishes for one feature.
-pub type KytrixEntitlementValue = proto_types::EntitlementValue;
+pub type KytrixEntitlementFeatureValue = proto_types::EntitlementFeatureValue;
 
 /// One catalogue entry, as the Kytrix service publishes it.
-pub type KytrixFeatureDefinition = proto_types::FeatureDefinition;
+pub type KytrixEntitlementFeature = proto_types::EntitlementFeature;
+
+/// The plan the Kytrix service published for one session.
+pub type KytrixEntitlementPlanCode = proto_types::EntitlementPlanCode;
 
 /// The entitlements the Kytrix service published for one session.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KytrixSessionState {
     pub entitlement_revision: u64,
-    pub plan_code: proto_types::PlanCode,
-    pub entitlements: BTreeMap<String, KytrixEntitlementValue>,
-    pub catalog: Vec<KytrixFeatureDefinition>,
+    pub plan_code: KytrixEntitlementPlanCode,
+    pub entitlements: BTreeMap<String, KytrixEntitlementFeatureValue>,
+    pub catalog: Vec<KytrixEntitlementFeature>,
     pub next_change_at: Option<i64>,
 }
 
@@ -971,14 +996,14 @@ mod tests {
         let observed = registry.subscribe();
         let first = KytrixSessionState {
             entitlement_revision: 1,
-            plan_code: proto_types::PlanCode::Free,
+            plan_code: proto_types::EntitlementPlanCode::Free,
             entitlements: BTreeMap::from([("news".to_owned(), enabled_value(false))]),
             catalog: Vec::new(),
             next_change_at: None,
         };
         let second = KytrixSessionState {
             entitlement_revision: 4,
-            plan_code: proto_types::PlanCode::Pro,
+            plan_code: proto_types::EntitlementPlanCode::Pro,
             entitlements: BTreeMap::from([("news".to_owned(), enabled_value(true))]),
             catalog: Vec::new(),
             next_change_at: Some(7),
@@ -997,9 +1022,11 @@ mod tests {
         assert_eq!(*observed.borrow(), None);
     }
 
-    fn enabled_value(enabled: bool) -> KytrixEntitlementValue {
-        KytrixEntitlementValue {
-            value: Some(proto_types::entitlement_value::Value::Enabled(enabled)),
+    fn enabled_value(enabled: bool) -> KytrixEntitlementFeatureValue {
+        KytrixEntitlementFeatureValue {
+            value: Some(proto_types::entitlement_feature_value::Value::Enabled(
+                enabled,
+            )),
         }
     }
 

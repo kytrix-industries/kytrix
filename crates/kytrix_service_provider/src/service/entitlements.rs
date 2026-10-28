@@ -10,7 +10,8 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
         ServiceTopic::News => Some("news"),
         ServiceTopic::FinancialIndex(_) => Some("financial_indices"),
         ServiceTopic::X => Some("x"),
-        ServiceTopic::CryptocurrencyWalletMonitoring => Some("cryptocurrency_wallet_monitoring"),
+        ServiceTopic::EthereumWallet => Some("ethereum_wallet_monitoring"),
+        ServiceTopic::SolanaWallet => Some("solana_wallet_monitoring"),
         ServiceTopic::GlobalShippingChokepoint(_) => Some("global_shipping_chokepoint"),
     }
 }
@@ -24,9 +25,8 @@ pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'s
         KytrixServiceCapability::News => Some("news"),
         KytrixServiceCapability::FinancialIndices => Some("financial_indices"),
         KytrixServiceCapability::X => Some("x"),
-        KytrixServiceCapability::CryptocurrencyWalletMonitoring => {
-            Some("cryptocurrency_wallet_monitoring")
-        }
+        KytrixServiceCapability::EthereumWallet => Some("ethereum_wallet_monitoring"),
+        KytrixServiceCapability::SolanaWallet => Some("solana_wallet_monitoring"),
         KytrixServiceCapability::GlobalShippingChokepoint => Some("global_shipping_chokepoint"),
         KytrixServiceCapability::CryptocurrencyEtf => Some("cryptocurrency_etf"),
         KytrixServiceCapability::CoinMarketCapFearAndGreedIndex => {
@@ -60,10 +60,8 @@ mod tests {
                 "financial_indices",
             ),
             (ServiceTopic::X, "x"),
-            (
-                ServiceTopic::CryptocurrencyWalletMonitoring,
-                "cryptocurrency_wallet_monitoring",
-            ),
+            (ServiceTopic::EthereumWallet, "ethereum_wallet_monitoring"),
+            (ServiceTopic::SolanaWallet, "solana_wallet_monitoring"),
             (
                 ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
                 "global_shipping_chokepoint",
@@ -90,8 +88,12 @@ mod tests {
             ),
             (KytrixServiceCapability::X, Some("x")),
             (
-                KytrixServiceCapability::CryptocurrencyWalletMonitoring,
-                Some("cryptocurrency_wallet_monitoring"),
+                KytrixServiceCapability::EthereumWallet,
+                Some("ethereum_wallet_monitoring"),
+            ),
+            (
+                KytrixServiceCapability::SolanaWallet,
+                Some("solana_wallet_monitoring"),
             ),
             (KytrixServiceCapability::XMedia, None),
             (

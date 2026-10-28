@@ -66,8 +66,10 @@ const PLACEHOLDER_MESSAGES: &[&str] = &[
     "widget.perpetual_statistics.select_instrument_prompt",
     "widget.x.logged_out",
     "widget.x.waiting",
-    "widget.cryptocurrency_wallet_monitor.empty_addresses",
-    "widget.cryptocurrency_wallet_monitor.logged_out",
+    "widget.ethereum_wallet.empty_addresses",
+    "widget.ethereum_wallet.logged_out",
+    "widget.solana_wallet.empty_addresses",
+    "widget.solana_wallet.logged_out",
 ];
 
 /// 安装产品自己的目录，与启动时装的是同一份。

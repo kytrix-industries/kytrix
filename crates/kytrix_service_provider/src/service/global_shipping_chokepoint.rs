@@ -5,12 +5,11 @@
 //! domain types a widget holds between pushes; the proto envelope stays at the protocol
 //! boundary, and the only exception is the area a subscription is keyed by.
 
-use kytrix_proto::types::StrategicMaritimeChokepointsTrackingDelta;
+use kytrix_proto::types::v1::GlobalShippingChokepointEvent;
 use smol_str::SmolStr;
 
 /// The area one AIS subscription covers.
-pub type GlobalShippingChokepointArea =
-    kytrix_proto::types::StrategicMaritimeChokepointsTrackingArea;
+pub type GlobalShippingChokepointArea = kytrix_proto::types::v1::GlobalShippingChokepointArea;
 
 /// One AIS push for an area.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,14 +17,14 @@ pub struct GlobalShippingChokepointUpdate {
     /// The API process the delta was produced by. A new epoch means every sequence the
     /// client holds belongs to a process that no longer exists.
     pub epoch: u64,
-    /// Whether `statics` and `positions` are the whole picture.
+    /// Whether `ships` and `positions` are the whole picture.
     pub keyframe: bool,
     /// The sequence this push assigns.
     pub sequence: u64,
     /// The sequence the server expects the client to have applied before this push.
     pub base: u64,
     /// The static part of every vessel the push describes.
-    pub statics: Vec<GlobalShippingChokepointStatic>,
+    pub ships: Vec<GlobalShippingChokepointShip>,
     /// The positions the push describes.
     pub positions: Vec<GlobalShippingChokepointPosition>,
     /// The MMSIs that left the area.
@@ -36,7 +35,7 @@ pub struct GlobalShippingChokepointUpdate {
 
 /// The low-frequency part of one vessel.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GlobalShippingChokepointStatic {
+pub struct GlobalShippingChokepointShip {
     pub mmsi: u32,
     pub imo: u32,
     pub call_sign: SmolStr,
@@ -77,16 +76,16 @@ pub struct GlobalShippingChokepointPosition {
 
 impl GlobalShippingChokepointUpdate {
     /// Converts one proto delta into the domain update.
-    pub fn from_proto(delta: StrategicMaritimeChokepointsTrackingDelta) -> Self {
+    pub fn from_proto(delta: GlobalShippingChokepointEvent) -> Self {
         Self {
             epoch: delta.epoch,
             keyframe: delta.keyframe,
             sequence: delta.sequence,
             base: delta.base,
-            statics: delta
-                .statics
+            ships: delta
+                .ships
                 .into_iter()
-                .map(|vessel| GlobalShippingChokepointStatic {
+                .map(|vessel| GlobalShippingChokepointShip {
                     mmsi: vessel.mmsi,
                     imo: vessel.imo,
                     call_sign: SmolStr::new(vessel.call_sign),

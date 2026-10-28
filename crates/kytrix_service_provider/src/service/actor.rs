@@ -13,12 +13,10 @@ use app_config::network::{
 #[cfg(test)]
 use app_config_provider::notification::ConfigNotification;
 use bytes::Bytes;
+use kytrix_proto as proto_response;
 use kytrix_proto::{
-    client::{
-        Reauthenticate, Request as ClientRequest, SetSubscriptions,
-        request::Request as ClientRequestKind,
-    },
-    server as proto_response,
+    ReauthenticateRequest, Request as ClientRequest, SetSubscriptionsRequest,
+    request::Request as ClientRequestKind,
 };
 use network::transport::{error::TransportError, websocket::RawWebSocket};
 use prost::Message;
@@ -1128,8 +1126,10 @@ impl ServiceSessionActor {
                 self.latest_global_shipping_chokepoint_keyframes
                     .remove(area);
             }
-            ServiceTopic::News | ServiceTopic::X | ServiceTopic::CryptocurrencyWalletMonitoring => {
-            }
+            ServiceTopic::News
+            | ServiceTopic::X
+            | ServiceTopic::EthereumWallet
+            | ServiceTopic::SolanaWallet => {}
         }
     }
 
@@ -1142,7 +1142,8 @@ impl ServiceSessionActor {
                 }
                 ServiceTopic::News
                 | ServiceTopic::X
-                | ServiceTopic::CryptocurrencyWalletMonitoring
+                | ServiceTopic::EthereumWallet
+                | ServiceTopic::SolanaWallet
                 | ServiceTopic::GlobalShippingChokepoint(_) => None,
             })
             .collect::<Vec<_>>();
@@ -1464,9 +1465,11 @@ impl ServiceSessionActor {
         // connection-level reauthentication response.
         let request = ClientRequest {
             id,
-            request: Some(ClientRequestKind::SetSubscriptions(SetSubscriptions {
-                topics: topics.iter().map(Into::into).collect(),
-            })),
+            request: Some(ClientRequestKind::SetSubscriptionsRequest(
+                SetSubscriptionsRequest {
+                    topics: topics.iter().map(Into::into).collect(),
+                },
+            )),
         };
         let operation_cancellation = cancellation.clone();
         self.await_control_with_routes(
@@ -1691,10 +1694,12 @@ impl ServiceSessionActor {
                 let id = self.next_request_id();
                 let request = ClientRequest {
                     id,
-                    request: Some(ClientRequestKind::Reauthenticate(Reauthenticate {
-                        access_token,
-                        dpop_proof,
-                    })),
+                    request: Some(ClientRequestKind::ReauthenticateRequest(
+                        ReauthenticateRequest {
+                            access_token,
+                            dpop_proof,
+                        },
+                    )),
                 };
                 let deadline =
                     (Instant::now() + WRITE_TIMEOUT).min(service_unix_deadline(expires_at));
@@ -1761,7 +1766,7 @@ impl ServiceSessionActor {
             ));
         }
         match response.response {
-            Some(proto_response::response::Response::Reauthenticate(_)) => {
+            Some(proto_response::response::Response::ReauthenticateResponse(_)) => {
                 self.renewal = None;
                 Ok(())
             }
@@ -2232,7 +2237,7 @@ mod tests {
             keyframe: true,
             sequence: 3,
             base: 0,
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions: vec![GlobalShippingChokepointPosition {
                 mmsi: 42,
                 latitude: 26_500_000,
@@ -2531,7 +2536,7 @@ mod tests {
         assert!(matches!(
             actor.accept_renewal_response(proto_response::Response {
                 id: 8,
-                response: Some(proto_response::response::Response::Reauthenticate(
+                response: Some(proto_response::response::Response::ReauthenticateResponse(
                     proto_response::ReauthenticateResponse {},
                 )),
             }),

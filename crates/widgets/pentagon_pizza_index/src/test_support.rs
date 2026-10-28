@@ -17,7 +17,7 @@ use std::{
     },
 };
 
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::KytrixServiceError;
 
 use super::{

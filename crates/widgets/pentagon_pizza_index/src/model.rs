@@ -26,7 +26,7 @@
 
 use gpui_kit::{App, SharedString};
 use i18n::t;
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use thiserror::Error;
 use widget::error::LocalizedError;
 

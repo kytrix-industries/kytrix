@@ -23,6 +23,7 @@ members = [
     "crates/widgets/coin_market_cap_fear_and_greed_index",
     "crates/widgets/cryptocurrency_etf",
     "crates/widgets/empty",
+    "crates/widgets/ethereum_wallet",
     "crates/widgets/financial_calendar",
     "crates/widgets/financial_indices",
     "crates/widgets/force_orders",
@@ -33,8 +34,8 @@ members = [
     "crates/widgets/order_book",
     "crates/widgets/perpetual_statistics",
     "crates/widgets/pentagon_pizza_index",
+    "crates/widgets/solana_wallet",
     "crates/widgets/volume_heatmap",
-    "crates/widgets/cryptocurrency_wallet_monitor",
     "crates/widgets/watch_list",
     "crates/widgets/x",
     "xtask",
@@ -84,7 +85,7 @@ image = { version = "0.25.10", default-features = false, features = [
 jiff = "0.2.38"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
-kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "9ce459179ff35d9dfdfe82ecb9da952f657882e7" }
+kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "b29d0edeca28864392730c84683e284462727faf" }
 log = "0.4.34"
 longbridge-proto = "5.2.0"
 nucleo = "0.5.0"
@@ -128,6 +129,7 @@ candlestick = { path = "crates/widgets/candlestick" }
 coin_market_cap_fear_and_greed_index = { path = "crates/widgets/coin_market_cap_fear_and_greed_index" }
 cryptocurrency_etf = { path = "crates/widgets/cryptocurrency_etf" }
 empty = { path = "crates/widgets/empty" }
+ethereum_wallet = { path = "crates/widgets/ethereum_wallet" }
 financial_calendar = { path = "crates/widgets/financial_calendar" }
 financial_indices = { path = "crates/widgets/financial_indices" }
 force_orders = { path = "crates/widgets/force_orders" }
@@ -147,9 +149,9 @@ perpetual_statistics = { path = "crates/widgets/perpetual_statistics" }
 pentagon_pizza_index = { path = "crates/widgets/pentagon_pizza_index" }
 profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
+solana_wallet = { path = "crates/widgets/solana_wallet" }
 updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
-cryptocurrency_wallet_monitor = { path = "crates/widgets/cryptocurrency_wallet_monitor" }
 watch_list = { path = "crates/widgets/watch_list" }
 x = { path = "crates/widgets/x" }
 widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }

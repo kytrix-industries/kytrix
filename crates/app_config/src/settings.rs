@@ -2302,7 +2302,7 @@ mod tests {
     fn a_service_application_edit_should_report_the_target_once() {
         let previous = configured_settings();
         let wallet = ServiceTarget::KytrixService {
-            capability: KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+            capability: KytrixServiceCapability::EthereumWallet,
         };
 
         let mut added = previous.clone();

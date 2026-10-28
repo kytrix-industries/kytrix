@@ -3,10 +3,9 @@ use std::convert::Infallible;
 use gpui_kit::{App, SharedString};
 use i18n::t;
 use kytrix_service_provider::service::{
-    cryptocurrency_wallet_monitor::{
-        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationUnknown,
-    },
     engine::{ErrorCode, KytrixServiceError},
+    ethereum_wallet::{EthereumWalletApiError, EthereumWalletMutationUnknown},
+    solana_wallet::{SolanaWalletApiError, SolanaWalletMutationUnknown},
     x::{XApiError, XMutationUnknown},
 };
 use market_participants_connector::{
@@ -1908,49 +1907,71 @@ impl LocalizedError for XMutationUnknown {
     }
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitorApiError {
+impl LocalizedError for EthereumWalletApiError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidAddress => t!(cx, "widget.cryptocurrency_wallet_monitor.invalid_address"),
-            Self::Conflict => t!(cx, "widget.cryptocurrency_wallet_monitor.conflict"),
-            Self::NotFound => t!(cx, "widget.cryptocurrency_wallet_monitor.not_found"),
-            Self::Unavailable => t!(cx, "widget.cryptocurrency_wallet_monitor.unavailable"),
-            Self::Authentication => t!(
-                cx,
-                "widget.cryptocurrency_wallet_monitor.authentication_failed"
-            ),
-            Self::Network(detail) => t!(
-                cx,
-                "error.cryptocurrency_wallet_monitor.network",
-                detail = detail
-            ),
+            Self::InvalidAddress => t!(cx, "widget.ethereum_wallet.invalid_address"),
+            Self::Conflict => t!(cx, "widget.ethereum_wallet.conflict"),
+            Self::NotFound => t!(cx, "widget.ethereum_wallet.not_found"),
+            Self::Unavailable => t!(cx, "widget.ethereum_wallet.unavailable"),
+            Self::Authentication => t!(cx, "widget.ethereum_wallet.authentication_failed"),
+            Self::Network(detail) => t!(cx, "error.ethereum_wallet.network", detail = detail),
             Self::Service(error) => error.localized_message(cx),
             Self::Transport(error) => error.localized_message(cx),
-            Self::Protocol(detail) => t!(
-                cx,
-                "error.cryptocurrency_wallet_monitor.protocol",
-                detail = detail
-            ),
-            Self::ResponseTooLarge => {
-                t!(cx, "error.cryptocurrency_wallet_monitor.response_too_large")
+            Self::Protocol(detail) => t!(cx, "error.ethereum_wallet.protocol", detail = detail),
+            Self::ResponseTooLarge => t!(cx, "error.ethereum_wallet.response_too_large"),
+            Self::InvalidResponse => t!(cx, "error.ethereum_wallet.invalid_response"),
+            Self::Server(status) => {
+                t!(cx, "error.ethereum_wallet.server", status = status.as_u16())
             }
-            Self::InvalidResponse => t!(cx, "error.cryptocurrency_wallet_monitor.invalid_response"),
-            Self::Server(status) => t!(
-                cx,
-                "error.cryptocurrency_wallet_monitor.server",
-                status = status.as_u16()
-            ),
-            Self::Timeout => t!(cx, "error.cryptocurrency_wallet_monitor.timeout"),
-            Self::Closed => t!(cx, "error.cryptocurrency_wallet_monitor.closed"),
-            Self::AccountChanged => {
-                t!(cx, "error.cryptocurrency_wallet_monitor.account_changed")
-            }
-            Self::NotReady => t!(cx, "error.cryptocurrency_wallet_monitor.not_ready"),
+            Self::Timeout => t!(cx, "error.ethereum_wallet.timeout"),
+            Self::Closed => t!(cx, "error.ethereum_wallet.closed"),
+            Self::AccountChanged => t!(cx, "error.ethereum_wallet.account_changed"),
+            Self::NotReady => t!(cx, "error.ethereum_wallet.not_ready"),
         }
     }
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitorMutationUnknown {
+impl LocalizedError for EthereumWalletMutationUnknown {
+    fn localized_message(&self, cx: &App) -> SharedString {
+        match self {
+            Self::Timeout => t!(cx, "error.mutation.timeout"),
+            Self::Transport => t!(cx, "error.mutation.transport"),
+            Self::ResponseLost => t!(cx, "error.mutation.response_lost"),
+            Self::InvalidResponse => t!(cx, "error.mutation.invalid_response"),
+            Self::Server(status) => t!(cx, "error.mutation.server", status = status.as_u16()),
+            Self::AccountChanged => t!(cx, "error.mutation.account_changed"),
+            Self::ServiceClosed => t!(cx, "error.mutation.service_closed"),
+        }
+    }
+}
+
+impl LocalizedError for SolanaWalletApiError {
+    fn localized_message(&self, cx: &App) -> SharedString {
+        match self {
+            Self::InvalidAddress => t!(cx, "widget.solana_wallet.invalid_address"),
+            Self::Conflict => t!(cx, "widget.solana_wallet.conflict"),
+            Self::NotFound => t!(cx, "widget.solana_wallet.not_found"),
+            Self::Unavailable => t!(cx, "widget.solana_wallet.unavailable"),
+            Self::Authentication => t!(cx, "widget.solana_wallet.authentication_failed"),
+            Self::Network(detail) => t!(cx, "error.solana_wallet.network", detail = detail),
+            Self::Service(error) => error.localized_message(cx),
+            Self::Transport(error) => error.localized_message(cx),
+            Self::Protocol(detail) => t!(cx, "error.solana_wallet.protocol", detail = detail),
+            Self::ResponseTooLarge => t!(cx, "error.solana_wallet.response_too_large"),
+            Self::InvalidResponse => t!(cx, "error.solana_wallet.invalid_response"),
+            Self::Server(status) => {
+                t!(cx, "error.solana_wallet.server", status = status.as_u16())
+            }
+            Self::Timeout => t!(cx, "error.solana_wallet.timeout"),
+            Self::Closed => t!(cx, "error.solana_wallet.closed"),
+            Self::AccountChanged => t!(cx, "error.solana_wallet.account_changed"),
+            Self::NotReady => t!(cx, "error.solana_wallet.not_ready"),
+        }
+    }
+}
+
+impl LocalizedError for SolanaWalletMutationUnknown {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Timeout => t!(cx, "error.mutation.timeout"),
@@ -3031,8 +3052,12 @@ mod tests {
             include_str!("../../widgets/volume_heatmap/src/view.rs"),
         ),
         (
-            "crates/widgets/cryptocurrency_wallet_monitor/src/view.rs",
-            include_str!("../../widgets/cryptocurrency_wallet_monitor/src/view.rs"),
+            "crates/widgets/ethereum_wallet/src/view.rs",
+            include_str!("../../widgets/ethereum_wallet/src/view.rs"),
+        ),
+        (
+            "crates/widgets/solana_wallet/src/view.rs",
+            include_str!("../../widgets/solana_wallet/src/view.rs"),
         ),
         (
             "crates/widgets/watch_list/src/view.rs",

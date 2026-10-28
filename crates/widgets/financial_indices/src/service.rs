@@ -30,7 +30,7 @@ use std::{future::Future, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use gpui_kit::{App, SharedString};
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{
@@ -225,7 +225,7 @@ pub(super) trait FinancialIndicesSource: Clone + Send + Sync + 'static {
 
     fn fetch_manifest(
         &self,
-    ) -> impl Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>> + Send;
+    ) -> impl Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>> + Send;
 
     fn subscribe_financial_indices(
         &self,
@@ -249,9 +249,9 @@ impl FinancialIndicesSource for KytrixServiceConnector {
 
     fn fetch_manifest(
         &self,
-    ) -> impl Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>> + Send
+    ) -> impl Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>> + Send
     {
-        KytrixServiceConnector::fetch_financial_index_manifest(self)
+        KytrixServiceConnector::fetch_financial_indices(self)
     }
 
     async fn subscribe_financial_indices(
@@ -634,8 +634,8 @@ fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Optio
         .get("financial_indices")
         .and_then(|entitlement| entitlement.value.as_ref())
         .map_or(0, |value| match value {
-            proto_types::entitlement_value::Value::Limit(limit) => *limit,
-            proto_types::entitlement_value::Value::Enabled(_) => 0,
+            proto_types::entitlement_feature_value::Value::Limit(limit) => *limit,
+            proto_types::entitlement_feature_value::Value::Enabled(_) => 0,
         });
     Some(limit)
 }
@@ -1225,8 +1225,8 @@ mod tests {
         let mut state = session(3);
         state.entitlements.insert(
             "financial_indices".to_owned(),
-            proto_types::EntitlementValue {
-                value: Some(proto_types::entitlement_value::Value::Enabled(true)),
+            proto_types::EntitlementFeatureValue {
+                value: Some(proto_types::entitlement_feature_value::Value::Enabled(true)),
             },
         );
         let (_sender, receiver) = watch::channel(Some(state));
@@ -1241,7 +1241,7 @@ mod tests {
         let mut state = session(3);
         state.entitlements.insert(
             "financial_indices".to_owned(),
-            proto_types::EntitlementValue::default(),
+            proto_types::EntitlementFeatureValue::default(),
         );
         let (_sender, receiver) = watch::channel(Some(state));
 

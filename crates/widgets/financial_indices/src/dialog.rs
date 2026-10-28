@@ -1614,7 +1614,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_catalogue_with_no_categories_should_list_nothing(cx: &mut TestAppContext) {
         let source = FakeSource::default();
-        source.set_manifest(kytrix_proto::types::FinancialIndexManifest {
+        source.set_manifest(kytrix_proto::types::v1::FinancialIndices {
             categories: Vec::new(),
             indices: Vec::new(),
         });

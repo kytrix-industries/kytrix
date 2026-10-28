@@ -2068,26 +2068,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cryptocurrency_wallet_monitor"
-version = "0.0.2"
-dependencies = [
- "app_config",
- "app_config_provider",
- "base_ui",
- "gpui-kit",
- "i18n",
- "kytrix_service_provider",
- "network",
- "serde",
- "smol_str",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "widget",
- "widget_tokio_runtime",
-]
-
-[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2690,6 +2670,26 @@ checksum = "fc89bf99e5dc15954a60f707c1e09d7540e5cd9af85fa75caa0b510bc08c5342"
 dependencies = [
  "euclid",
  "svg_fmt",
+]
+
+[[package]]
+name = "ethereum_wallet"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "network",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "kytrix_proto"
 version = "0.1.0"
-source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=9ce459179ff35d9dfdfe82ecb9da952f657882e7#9ce459179ff35d9dfdfe82ecb9da952f657882e7"
+source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=b29d0edeca28864392730c84683e284462727faf#b29d0edeca28864392730c84683e284462727faf"
 dependencies = [
  "bytes",
  "prost",
@@ -9013,6 +9013,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana_wallet"
+version = "0.0.2"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "gpui-kit",
+ "i18n",
+ "kytrix_service_provider",
+ "network",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10844,8 +10864,8 @@ dependencies = [
  "candlestick",
  "coin_market_cap_fear_and_greed_index",
  "cryptocurrency_etf",
- "cryptocurrency_wallet_monitor",
  "empty",
+ "ethereum_wallet",
  "financial_calendar",
  "financial_indices",
  "force_orders",
@@ -10861,6 +10881,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+ "solana_wallet",
  "thiserror 2.0.20",
  "volume_heatmap",
  "watch_list",

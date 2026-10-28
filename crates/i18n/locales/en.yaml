@@ -469,16 +469,26 @@ error:
     stream_unavailable: The volume heat map stream is not available
     timeout: The volume heat map did not answer within %{seconds} seconds
     too_many_tickers: 'The %{route} ticker answer contains %{count} entries, which is more than the %{limit} a heat map is built from'
-  cryptocurrency_wallet_monitor:
-    account_changed: The Wallet API account session changed
-    closed: The Wallet API account session is closed
-    invalid_response: The Wallet API returned invalid data
-    network: 'The Wallet API request failed: %{detail}'
-    not_ready: The wallet monitor is not ready
-    protocol: 'Wallet API protocol error: %{detail}'
-    response_too_large: The Wallet API response is too large
-    server: The Wallet API returned HTTP %{status}
-    timeout: The Wallet API request timed out
+  ethereum_wallet:
+    account_changed: The Ethereum wallet API account session changed
+    closed: The Ethereum wallet API account session is closed
+    invalid_response: The Ethereum wallet API returned invalid data
+    network: 'The Ethereum wallet API request failed: %{detail}'
+    not_ready: Ethereum wallet monitoring is not ready
+    protocol: 'Ethereum wallet API protocol error: %{detail}'
+    response_too_large: The Ethereum wallet API response is too large
+    server: The Ethereum wallet API returned HTTP %{status}
+    timeout: The Ethereum wallet API request timed out
+  solana_wallet:
+    account_changed: The Solana wallet API account session changed
+    closed: The Solana wallet API account session is closed
+    invalid_response: The Solana wallet API returned invalid data
+    network: 'The Solana wallet API request failed: %{detail}'
+    not_ready: Solana wallet monitoring is not ready
+    protocol: 'Solana wallet API protocol error: %{detail}'
+    response_too_large: The Solana wallet API response is too large
+    server: The Solana wallet API returned HTTP %{status}
+    timeout: The Solana wallet API request timed out
   watch_list:
     capacity: The watch list already follows %{maximum} instruments
     duplicate_entry: The instrument is already in the watch list
@@ -808,6 +818,7 @@ widget:
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
     cryptocurrency_etf: Crypto Currency ETF
     empty: Empty
+    ethereum_wallet: Ethereum Wallet Monitor
     financial_calendar: Financial Calendar
     financial_indices: Indices
     force_orders: Force Orders Stream
@@ -819,11 +830,11 @@ widget:
     open_interest: Open Interest
     order_book: Order Book
     pentagon_pizza_index: Pentagon Pizza Index
+    solana_wallet: Solana Wallet Monitor
     taker_volume: Taker Buy/Sell Volume
     top_trader_account_ratio: Top Trader Account Ratio
     top_trader_position_ratio: Top Trader Position Ratio
     volume_heatmap: Volume Heat Map
-    cryptocurrency_wallet_monitor: Cryptocurrency Wallet Monitor
     watch_list: Watch List
     x: X
   news:
@@ -921,34 +932,58 @@ widget:
   volume_heatmap:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now
-  cryptocurrency_wallet_monitor:
+  ethereum_wallet:
     active: Active
     add_address: Add wallet address
     add_success: Wallet address added successfully
-    address_placeholder: Ethereum or Solana address
+    address_placeholder: Ethereum address
     authentication_failed: Your login has expired. Please log in again.
     conflict: The address already exists or the current quota is full
     delete_address: Delete current wallet
-    dialog_title: Monitored wallet addresses
+    dialog_title: Monitored Ethereum addresses
     empty_addresses: <p align="center">No monitored wallet addresses</p>
-    ethereum: Ethereum
     from: From
     inconsistent_selections: The confirmed wallet address does not fit the list it was added to
-    invalid_address: The wallet address is invalid
+    invalid_address: The Ethereum wallet address is invalid
     load_failed: Could not load wallet addresses
     loading_addresses: Loading wallet addresses
     logged_out: <p align="center">You need to register or log in to use this feature.</p>
     manage: Manage monitored wallet addresses
     monitored_addresses: 'Selected addresses: %{current}/%{limit}'
-    not_found: The wallet address was not found
+    not_found: The Ethereum wallet address was not found
     paused: Paused
     refresh: Refresh wallet addresses
     scroll_transfers: Scroll wallet transfers
-    solana: Solana
     stream_unavailable: The wallet transfer stream is not connected
     to: To
     transfer: '%{amount} transfer at %{time}'
-    unavailable: The wallet monitor is not configured or is unavailable
+    unavailable: Ethereum wallet monitoring is not configured or is unavailable
+  solana_wallet:
+    active: Active
+    add_address: Add wallet address
+    add_success: Wallet address added successfully
+    address_placeholder: Solana address
+    authentication_failed: Your login has expired. Please log in again.
+    conflict: The address already exists or the current quota is full
+    delete_address: Delete current wallet
+    dialog_title: Monitored Solana addresses
+    empty_addresses: <p align="center">No monitored wallet addresses</p>
+    from: From
+    inconsistent_selections: The confirmed wallet address does not fit the list it was added to
+    invalid_address: The Solana wallet address is invalid
+    load_failed: Could not load wallet addresses
+    loading_addresses: Loading wallet addresses
+    logged_out: <p align="center">You need to register or log in to use this feature.</p>
+    manage: Manage monitored wallet addresses
+    monitored_addresses: 'Selected addresses: %{current}/%{limit}'
+    not_found: The Solana wallet address was not found
+    paused: Paused
+    refresh: Refresh wallet addresses
+    scroll_transfers: Scroll wallet transfers
+    stream_unavailable: The wallet transfer stream is not connected
+    to: To
+    transfer: '%{amount} transfer at %{time}'
+    unavailable: Solana wallet monitoring is not configured or is unavailable
   watch_list:
     add: Add instrument
     change_24h: 24h Change

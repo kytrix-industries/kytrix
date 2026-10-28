@@ -60,7 +60,8 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         >(),
         WidgetRegistration::for_view::<x::view::XWidget>(),
         WidgetRegistration::for_view::<volume_heatmap::view::VolumeHeatMapWidget>(),
-        WidgetRegistration::for_view::<cryptocurrency_wallet_monitor::view::CryptocurrencyWalletMonitorWidget>(),
+        WidgetRegistration::for_view::<ethereum_wallet::view::EthereumWalletWidget>(),
+        WidgetRegistration::for_view::<solana_wallet::view::SolanaWalletWidget>(),
         WidgetRegistration::for_view::<watch_list::view::WatchListWidget>(),
     ]
     .into_iter()
@@ -91,7 +92,8 @@ mod tests {
     const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.pentagon_pizza_index";
     const X_ID: &str = "kytrix.x";
     const VOLUME_HEAT_MAP_ID: &str = "kytrix.volume_heatmap";
-    const CRYPTOCURRENCY_WALLET_MONITOR_ID: &str = "kytrix.cryptocurrency_wallet_monitor";
+    const ETHEREUM_WALLET_ID: &str = "kytrix.ethereum_wallet";
+    const SOLANA_WALLET_ID: &str = "kytrix.solana_wallet";
     const WATCH_LIST_ID: &str = "kytrix.watch_list";
     /// The five perpetual-statistics panes, which are one widget per series.
     const STATISTICS_IDS: [&str; 5] = [
@@ -106,7 +108,7 @@ mod tests {
     /// group it is listed under. A widget the framework builds for itself is listed
     /// nowhere, so it is not in this table — the gallery's own tests cover the
     /// widget that is.
-    const CATEGORIES: [(&str, WidgetCategory); 21] = [
+    const CATEGORIES: [(&str, WidgetCategory); 22] = [
         (CANDLESTICK_ID, WidgetCategory::Market),
         (
             COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID,
@@ -129,7 +131,8 @@ mod tests {
         (STATISTICS_IDS[4], WidgetCategory::Statistics),
         (X_ID, WidgetCategory::Monitoring),
         (VOLUME_HEAT_MAP_ID, WidgetCategory::Statistics),
-        (CRYPTOCURRENCY_WALLET_MONITOR_ID, WidgetCategory::Monitoring),
+        (ETHEREUM_WALLET_ID, WidgetCategory::Monitoring),
+        (SOLANA_WALLET_ID, WidgetCategory::Monitoring),
         (WATCH_LIST_ID, WidgetCategory::Market),
     ];
 
@@ -159,12 +162,13 @@ mod tests {
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
             assert!(registry.get(X_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
-            assert!(registry.get(CRYPTOCURRENCY_WALLET_MONITOR_ID).is_some());
+            assert!(registry.get(ETHEREUM_WALLET_ID).is_some());
+            assert!(registry.get(SOLANA_WALLET_ID).is_some());
             assert!(registry.get(WATCH_LIST_ID).is_some());
             for id in STATISTICS_IDS {
                 assert!(registry.get(id).is_some(), "{id} should be registered");
             }
-            assert_eq!(registry.iter().count(), 22);
+            assert_eq!(registry.iter().count(), 23);
         });
     }
 

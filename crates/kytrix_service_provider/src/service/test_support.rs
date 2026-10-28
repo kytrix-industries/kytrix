@@ -13,11 +13,10 @@ use app_config_provider::notification::ConfigNotification;
 use futures::SinkExt as _;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use kytrix_proto as proto_response;
 use kytrix_proto::{
-    client::{Request as ClientRequest, request::Request as ClientRequestKind},
-    event as proto_event,
-    server::{self as proto_response, ServerMessage, server_message},
-    types as proto_types,
+    Event, Request as ClientRequest, ServerMessage, event as proto_event,
+    request::Request as ClientRequestKind, server_message, types::v1 as proto_types,
 };
 use network::transport::subscription::{Subscription, subscription_channel_with_wake};
 use prost::Message;
@@ -35,7 +34,7 @@ use crate::{
     account_profile::AccountProfile,
     auth::model::{SessionAvailability, SessionChange},
     service::engine::{
-        CryptocurrencyWalletMonitorTransfer, ErrorCode, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL,
+        ErrorCode, EthereumWalletTransfer, FinancialIndexTopic, KYTRIX_SERVICE_WS_URL,
         ServiceSessionActor, ServiceTopic, SubscriberSink,
     },
 };
@@ -99,7 +98,8 @@ impl TestConfigManager {
             KytrixServiceCapability::News,
             KytrixServiceCapability::FinancialIndices,
             KytrixServiceCapability::X,
-            KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+            KytrixServiceCapability::EthereumWallet,
+            KytrixServiceCapability::SolanaWallet,
             KytrixServiceCapability::GlobalShippingChokepoint,
             KytrixServiceCapability::XMedia,
             KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
@@ -151,7 +151,8 @@ pub(super) const INDEX_EVENT_WIRE: &[u8] = &[
 ];
 pub(super) const X_PROFILE_EVENT_WIRE: &[u8] =
     b"\x12\x24\x2a\x22\x0a\x02\x34\x32\x12\x02ky\x1a\x02Ky\x22\x10https://x.test/a\x28\x01\x30\x07";
-pub(super) const CRYPTOCURRENCY_WALLET_MONITOR_EVENT_WIRE: &[u8] = b"\x12\x5c\x22\x5a\x0a\x01e\x12\x2011111111111111111111111111111111\x1a\x2011111111111111111111111111111111\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
+pub(super) const ETHEREUM_WALLET_EVENT_WIRE: &[u8] = b"\x12\x70\x22\x6e\x0a\x01e\x12\x2a0x0000000000000000000000000000000000000001\x1a\x2a0x0000000000000000000000000000000000000002\x22\x031.5\x2a\x03ETH\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
+pub(super) const SOLANA_WALLET_EVENT_WIRE: &[u8] = b"\x12\x72\x3a\x70\x0a\x01s\x12\x2b4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi\x1a\x2b8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR\x22\x031.5\x2a\x03SOL\x31\xd2\x04\x00\x00\x00\x00\x00\x00";
 pub(super) const UNKNOWN_SERVER_ONEOF_WIRE: &[u8] = &[0x2a, 0x00];
 
 pub(super) const TEST_ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -164,23 +165,25 @@ pub(super) fn index_service_topic(code: &str) -> ServiceTopic {
     ServiceTopic::FinancialIndex(financial_index_topic(code))
 }
 
-pub(super) fn enabled_entitlement(enabled: bool) -> proto_types::EntitlementValue {
-    proto_types::EntitlementValue {
-        value: Some(proto_types::entitlement_value::Value::Enabled(enabled)),
+pub(super) fn enabled_entitlement(enabled: bool) -> proto_types::EntitlementFeatureValue {
+    proto_types::EntitlementFeatureValue {
+        value: Some(proto_types::entitlement_feature_value::Value::Enabled(
+            enabled,
+        )),
     }
 }
 
-pub(super) fn limit_entitlement(limit: u32) -> proto_types::EntitlementValue {
-    proto_types::EntitlementValue {
-        value: Some(proto_types::entitlement_value::Value::Limit(limit)),
+pub(super) fn limit_entitlement(limit: u32) -> proto_types::EntitlementFeatureValue {
+    proto_types::EntitlementFeatureValue {
+        value: Some(proto_types::entitlement_feature_value::Value::Limit(limit)),
     }
 }
 
 pub(super) fn feature_definition(
     key: &str,
-    value_type: proto_types::FeatureValueType,
-) -> proto_types::FeatureDefinition {
-    proto_types::FeatureDefinition {
+    value_type: proto_types::EntitlementFeatureValueType,
+) -> proto_types::EntitlementFeature {
+    proto_types::EntitlementFeature {
         key: key.to_owned(),
         display_name_zh: key.to_owned(),
         display_name_en: key.to_owned(),
@@ -193,11 +196,11 @@ pub(super) fn feature_definition(
     }
 }
 
-pub(super) fn financial_index_manifest() -> proto_types::FinancialIndexManifest {
-    proto_types::FinancialIndexManifest {
+pub(super) fn financial_indices() -> proto_types::FinancialIndices {
+    proto_types::FinancialIndices {
         categories: vec![proto_types::FinancialIndexCategory {
             code: "americas".to_owned(),
-            name: Some(proto_types::LocalizedName {
+            name: Some(proto_types::FinancialIndexLocalizedName {
                 en: "Americas".to_owned(),
                 zh: "美洲".to_owned(),
             }),
@@ -206,7 +209,7 @@ pub(super) fn financial_index_manifest() -> proto_types::FinancialIndexManifest 
             request_code: ".SPX".to_owned(),
             code: "SPX".to_owned(),
             category: "americas".to_owned(),
-            name: Some(proto_types::LocalizedName {
+            name: Some(proto_types::FinancialIndexLocalizedName {
                 en: "S&P 500 Index".to_owned(),
                 zh: "标普500指数".to_owned(),
             }),
@@ -252,7 +255,7 @@ pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
     let event = |timestamp: i64,
                  country: &str,
                  name: &str,
-                 importance: proto_types::EventImportance,
+                 importance: proto_types::FinancialCalendarEventImportance,
                  reference: Option<&str>| {
         proto_types::FinancialCalendarEvent {
             timestamp,
@@ -268,21 +271,21 @@ pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
                 1_790_006_400_000,
                 "US",
                 "Nonfarm Payrolls",
-                proto_types::EventImportance::High,
+                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceHigh,
                 Some("SEP"),
             ),
             event(
                 1_790_002_400_000,
                 "DE",
                 "Ifo Business Climate",
-                proto_types::EventImportance::Medium,
+                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceMedium,
                 None,
             ),
             event(
                 1_790_000_000_000,
                 "CN",
                 "Industrial Profits (YTD) YoY",
-                proto_types::EventImportance::Low,
+                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceLow,
                 Some("AUG"),
             ),
         ],
@@ -290,12 +293,12 @@ pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
     }
 }
 
-pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::XAccountMonitoringTweet {
-    proto_types::XAccountMonitoringTweet {
-        tweet_id: tweet_id.to_owned(),
+pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::XPost {
+    proto_types::XPost {
+        post_id: tweet_id.to_owned(),
         timestamp,
         x_user_id: "42".to_owned(),
-        text_segments: vec![proto_types::XAccountMonitoringTweetTextSegment {
+        text_segments: vec![proto_types::XPostTextSegment {
             text: "hello".to_owned(),
             url: None,
         }],
@@ -304,8 +307,8 @@ pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> proto_types::XAccountMoni
     }
 }
 
-pub(super) fn x_profile() -> proto_types::XAccountMonitoringProfile {
-    proto_types::XAccountMonitoringProfile {
+pub(super) fn x_profile() -> proto_types::XUserProfile {
+    proto_types::XUserProfile {
         x_user_id: "42".to_owned(),
         username: "kytrix".to_owned(),
         display_name: "Kytrix".to_owned(),
@@ -320,15 +323,14 @@ pub(super) fn x_profile() -> proto_types::XAccountMonitoringProfile {
 }
 
 /// One AIS push as the collector publishes it: one vessel, one position, one departure.
-pub(super) fn global_shipping_chokepoint_delta()
--> proto_types::StrategicMaritimeChokepointsTrackingDelta {
-    proto_types::StrategicMaritimeChokepointsTrackingDelta {
-        area: proto_types::StrategicMaritimeChokepointsTrackingArea::Hormuz as i32,
+pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingChokepointEvent {
+    proto_types::GlobalShippingChokepointEvent {
+        area: proto_types::GlobalShippingChokepointArea::Hormuz as i32,
         epoch: 5,
         sequence: 7,
         base: 6,
         keyframe: false,
-        statics: vec![proto_types::StrategicMaritimeChokepointsTrackingStatic {
+        ships: vec![proto_types::GlobalShippingChokepointShip {
             mmsi: 636_000_001,
             imo: 9_000_001,
             call_sign: "C6AB1".to_owned(),
@@ -346,7 +348,7 @@ pub(super) fn global_shipping_chokepoint_delta()
             eta_hour: 12,
             eta_minute: 30,
         }],
-        positions: vec![proto_types::StrategicMaritimeChokepointsTrackingPosition {
+        positions: vec![proto_types::GlobalShippingChokepointPosition {
             mmsi: 636_000_001,
             latitude: 26_566_000,
             longitude: 56_250_000,
@@ -364,9 +366,8 @@ pub(super) fn global_shipping_chokepoint_delta()
 /// The keyframe the collector publishes once it has a picture.
 ///
 /// A keyframe is the whole picture and therefore carries no departures.
-pub(super) fn global_shipping_chokepoint_keyframe()
--> proto_types::StrategicMaritimeChokepointsTrackingDelta {
-    proto_types::StrategicMaritimeChokepointsTrackingDelta {
+pub(super) fn global_shipping_chokepoint_keyframe() -> proto_types::GlobalShippingChokepointEvent {
+    proto_types::GlobalShippingChokepointEvent {
         keyframe: true,
         base: 0,
         removed: Vec::new(),
@@ -374,10 +375,10 @@ pub(super) fn global_shipping_chokepoint_keyframe()
     }
 }
 
-pub(super) fn test_x_selection() -> proto_types::XAccountMonitoringSelection {
-    proto_types::XAccountMonitoringSelection {
+pub(super) fn test_x_selection() -> proto_types::XUserSelection {
+    proto_types::XUserSelection {
         x_user_id: "42".to_owned(),
-        status: proto_types::XAccountMonitoringSelectionStatus::XAccountMonitoringActive as i32,
+        selection_status: proto_types::XUserSelectionStatus::Active as i32,
         created_at: 1,
         updated_at: 2,
         profile: Some(x_profile()),
@@ -389,23 +390,31 @@ pub(super) fn test_x_selection() -> proto_types::XAccountMonitoringSelection {
 ///
 /// Both timestamps are the one the service wrote the row with, because adding a selection
 /// stamps `created_at` and `updated_at` from the same reading of the clock.
-pub(super) fn pending_x_selection() -> proto_types::XAccountMonitoringSelection {
-    proto_types::XAccountMonitoringSelection {
+pub(super) fn pending_x_selection() -> proto_types::XUserSelection {
+    proto_types::XUserSelection {
         x_user_id: "42".to_owned(),
-        status: proto_types::XAccountMonitoringSelectionStatus::XAccountMonitoringPending as i32,
+        selection_status: proto_types::XUserSelectionStatus::Pending as i32,
         created_at: 4,
         updated_at: 4,
         profile: None,
     }
 }
 
-pub(super) fn test_cryptocurrency_wallet_monitor_selection(
+pub(super) fn test_ethereum_wallet_selection(
     address: String,
-) -> proto_types::CryptocurrencyWalletMonitoringSelection {
-    proto_types::CryptocurrencyWalletMonitoringSelection {
-        network: proto_types::CryptocurrencyWalletMonitoringNetwork::Ethereum as i32,
+) -> proto_types::EthereumWalletSelection {
+    proto_types::EthereumWalletSelection {
         address,
-        status: proto_types::CryptocurrencyWalletMonitoringSelectionStatus::Active as i32,
+        status: proto_types::EthereumWalletSelectionStatus::Active as i32,
+        created_at: 1,
+        updated_at: 1,
+    }
+}
+
+pub(super) fn test_solana_wallet_selection(address: String) -> proto_types::SolanaWalletSelection {
+    proto_types::SolanaWalletSelection {
+        address,
+        status: proto_types::SolanaWalletSelectionStatus::Active as i32,
         created_at: 1,
         updated_at: 1,
     }
@@ -415,9 +424,11 @@ pub(super) fn control_response(id: u32, topics: &[ServiceTopic]) -> proto_respon
     let topics = topics.iter().map(Into::into).collect();
     proto_response::Response {
         id,
-        response: Some(proto_response::response::Response::SetSubscriptions(
-            proto_response::SetSubscriptionsResponse { topics },
-        )),
+        response: Some(
+            proto_response::response::Response::SetSubscriptionsResponse(
+                proto_response::SetSubscriptionsResponse { topics },
+            ),
+        ),
     }
 }
 
@@ -430,12 +441,9 @@ pub(super) fn error_response(id: u32, code: i32) -> proto_response::Response {
     }
 }
 
-pub(super) fn actor_with_cryptocurrency_wallet_monitor_subscriber(
+pub(super) fn actor_with_ethereum_wallet_subscriber(
     invalidations: watch::Receiver<SessionChange>,
-) -> (
-    ServiceSessionActor,
-    Subscription<CryptocurrencyWalletMonitorTransfer>,
-) {
+) -> (ServiceSessionActor, Subscription<EthereumWalletTransfer>) {
     let (_commands, receiver) = mpsc::channel(1);
     let wake = Arc::new(Notify::new());
     let mut actor = ServiceSessionActor::with_url(
@@ -454,8 +462,8 @@ pub(super) fn actor_with_cryptocurrency_wallet_monitor_subscriber(
         .expect("the test subscription should have positive capacity");
     actor.add_subscriber_inner(
         1,
-        vec![ServiceTopic::CryptocurrencyWalletMonitoring],
-        SubscriberSink::CryptocurrencyWalletMonitoring(publisher),
+        vec![ServiceTopic::EthereumWallet],
+        SubscriberSink::EthereumWallet(publisher),
         Some(profile),
         NetworkRouteGeneration::default(),
     );
@@ -609,8 +617,9 @@ impl TestServiceServer {
                                     message: Some(server_message::Message::SessionState(
                                         proto_response::SessionState {
                                             entitlement_revision: 1,
-                                            plan_code: proto_types::PlanCode::Free as i32,
-                                            entitlements: HashMap::from([
+                                            entitlement_plan_code:
+                                                proto_types::EntitlementPlanCode::Free as i32,
+                                            entitlement_values: HashMap::from([
                                                 ("news".to_owned(), enabled_entitlement(true)),
                                                 (
                                                     "global_shipping_chokepoint".to_owned(),
@@ -621,26 +630,34 @@ impl TestServiceServer {
                                                     limit_entitlement(3),
                                                 ),
                                                 (
-                                                    "cryptocurrency_wallet_monitoring".to_owned(),
+                                                    "ethereum_wallet_monitoring".to_owned(),
+                                                    limit_entitlement(3),
+                                                ),
+                                                (
+                                                    "solana_wallet_monitoring".to_owned(),
                                                     limit_entitlement(3),
                                                 ),
                                             ]),
-                                            catalog: vec![
+                                            entitlement_features: vec![
                                                 feature_definition(
                                                     "news",
-                                                    proto_types::FeatureValueType::Bool,
+                                                    proto_types::EntitlementFeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
                                                     "global_shipping_chokepoint",
-                                                    proto_types::FeatureValueType::Bool,
+                                                    proto_types::EntitlementFeatureValueType::Bool,
                                                 ),
                                                 feature_definition(
                                                     "financial_indices",
-                                                    proto_types::FeatureValueType::Limit,
+                                                    proto_types::EntitlementFeatureValueType::Limit,
                                                 ),
                                                 feature_definition(
-                                                    "cryptocurrency_wallet_monitoring",
-                                                    proto_types::FeatureValueType::Limit,
+                                                    "ethereum_wallet_monitoring",
+                                                    proto_types::EntitlementFeatureValueType::Limit,
+                                                ),
+                                                feature_definition(
+                                                    "solana_wallet_monitoring",
+                                                    proto_types::EntitlementFeatureValueType::Limit,
                                                 ),
                                             ],
                                             next_change_at: None,
@@ -700,7 +717,7 @@ impl TestServiceServer {
                                         return;
                                     };
                                     let (observed, response, disconnect) = match request_kind {
-                                        ClientRequestKind::SetSubscriptions(set) => {
+                                        ClientRequestKind::SetSubscriptionsRequest(set) => {
                                             let Ok(observed_topics) = set
                                                 .topics
                                                 .iter()
@@ -713,7 +730,7 @@ impl TestServiceServer {
                                                 ObservedRequest::SetSubscriptions(
                                                     observed_topics,
                                                 ),
-                                                proto_response::response::Response::SetSubscriptions(
+                                                proto_response::response::Response::SetSubscriptionsResponse(
                                                     proto_response::SetSubscriptionsResponse {
                                                         topics: set.topics,
                                                     },
@@ -722,20 +739,20 @@ impl TestServiceServer {
                                                     && connection_id == 1,
                                             )
                                         }
-                                        ClientRequestKind::Reauthenticate(reauthenticate) => (
+                                        ClientRequestKind::ReauthenticateRequest(reauthenticate) => (
                                             ObservedRequest::Reauthenticate {
                                                 access_token: reauthenticate.access_token,
                                                 dpop_proof: reauthenticate.dpop_proof,
                                             },
-                                            proto_response::response::Response::Reauthenticate(
+                                            proto_response::response::Response::ReauthenticateResponse(
                                                 proto_response::ReauthenticateResponse {},
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetCryptocurrencyEtf(_) => (
+                                        ClientRequestKind::GetCryptocurrencyEtfRequest(_) => (
                                             ObservedRequest::Rpc("cryptocurrency_etf"),
-                                            proto_response::response::Response::CryptocurrencyEtf(
-                                                proto_response::CryptocurrencyEtfResponse {
+                                            proto_response::response::Response::GetCryptocurrencyEtfResponse(
+                                                proto_response::GetCryptocurrencyEtfResponse {
                                                     cryptocurrency_etf: Some(
                                                         proto_types::CryptocurrencyEtf {
                                                             timestamp: 42,
@@ -746,91 +763,119 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetFinancialIndexManifest(_) => (
-                                            ObservedRequest::Rpc("index_manifest"),
-                                            proto_response::response::Response::FinancialIndexManifest(
-                                                proto_response::FinancialIndexManifestResponse {
-                                                    manifest: Some(financial_index_manifest()),
+                                        ClientRequestKind::GetFinancialIndicesRequest(_) => (
+                                            ObservedRequest::Rpc("financial_indices"),
+                                            proto_response::response::Response::GetFinancialIndicesResponse(
+                                                proto_response::GetFinancialIndicesResponse {
+                                                    indices: Some(financial_indices()),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAccountMonitoringSearch(_) => (
+                                        ClientRequestKind::SearchXUserRequest(_) => (
                                             ObservedRequest::Rpc("x_search"),
-                                            proto_response::response::Response::XAccountMonitoringSearch(
-                                                proto_response::XAccountMonitoringSearchResponse {
+                                            proto_response::response::Response::SearchXUserResponse(
+                                                proto_response::SearchXUserResponse {
                                                     profiles: vec![x_profile()],
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAccountMonitoringSelections(_) => (
+                                        ClientRequestKind::GetXUserSelectionsRequest(_) => (
                                             ObservedRequest::Rpc("x_selections"),
-                                            proto_response::response::Response::XAccountMonitoringSelections(
-                                                proto_response::XAccountMonitoringSelectionsResponse {
+                                            proto_response::response::Response::GetXUserSelectionsResponse(
+                                                proto_response::GetXUserSelectionsResponse {
                                                     selections: vec![test_x_selection()],
                                                     x_account_limit: 3,
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAccountMonitoringAddSelection(_) => (
+                                        ClientRequestKind::AddXUserSelectionRequest(_) => (
                                             ObservedRequest::Rpc("x_add_selection"),
-                                            proto_response::response::Response::XAccountMonitoringAddSelection(
-                                                proto_response::XAccountMonitoringAddSelectionResponse {
+                                            proto_response::response::Response::AddXUserSelectionResponse(
+                                                proto_response::AddXUserSelectionResponse {
                                                     selection: Some(test_x_selection()),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAccountMonitoringDeleteSelection(_) => (
+                                        ClientRequestKind::RemoveXUserSelectionRequest(_) => (
                                             ObservedRequest::Rpc("x_delete_selection"),
-                                            proto_response::response::Response::XAccountMonitoringDeleteSelection(
-                                                proto_response::XAccountMonitoringDeleteSelectionResponse {},
+                                            proto_response::response::Response::RemoveXUserSelectionResponse(
+                                                proto_response::RemoveXUserSelectionResponse {},
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::XAccountMonitoringTweets(_) => (
-                                            ObservedRequest::Rpc("x_tweets"),
-                                            proto_response::response::Response::XAccountMonitoringTweets(
-                                                proto_response::XAccountMonitoringTweetsResponse {
-                                                    batch: Some(proto_types::XAccountMonitoringTweetBatch::default()),
+                                        ClientRequestKind::GetXPostsRequest(_) => (
+                                            ObservedRequest::Rpc("x_posts"),
+                                            proto_response::response::Response::GetXPostsResponse(
+                                                proto_response::GetXPostsResponse {
+                                                    posts: Some(proto_types::XPosts::default()),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::CryptocurrencyWalletMonitoringSelections(_) => (
-                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_selections"),
-                                            proto_response::response::Response::CryptocurrencyWalletMonitoringSelections(
-                                                proto_response::CryptocurrencyWalletMonitoringSelectionsResponse {
+                                        ClientRequestKind::GetEthereumWalletSelectionsRequest(_) => (
+                                            ObservedRequest::Rpc("ethereum_wallet_monitoring_selections"),
+                                            proto_response::response::Response::GetEthereumWalletSelectionsResponse(
+                                                proto_response::GetEthereumWalletSelectionsResponse {
                                                     selections: Vec::new(),
-                                                    cryptocurrency_wallet_monitoring_address_limit: 3,
+                                                    ethereum_wallet_monitor_address_limit: 3,
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::CryptocurrencyWalletMonitoringAddSelection(request) => (
-                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_add_selection"),
-                                            proto_response::response::Response::CryptocurrencyWalletMonitoringAddSelection(
-                                                proto_response::CryptocurrencyWalletMonitoringAddSelectionResponse {
-                                                    selection: Some(test_cryptocurrency_wallet_monitor_selection(
+                                        ClientRequestKind::AddEthereumWalletSelectionRequest(request) => (
+                                            ObservedRequest::Rpc("ethereum_wallet_monitoring_add_selection"),
+                                            proto_response::response::Response::AddEthereumWalletSelectionResponse(
+                                                proto_response::AddEthereumWalletSelectionResponse {
+                                                    selection: Some(test_ethereum_wallet_selection(
                                                         request.address,
                                                     )),
                                                 },
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::CryptocurrencyWalletMonitoringDeleteSelection(_) => (
-                                            ObservedRequest::Rpc("cryptocurrency_wallet_monitoring_delete_selection"),
-                                            proto_response::response::Response::CryptocurrencyWalletMonitoringDeleteSelection(
-                                                proto_response::CryptocurrencyWalletMonitoringDeleteSelectionResponse {},
+                                        ClientRequestKind::RemoveEthereumWalletSelectionRequest(_) => (
+                                            ObservedRequest::Rpc("ethereum_wallet_monitoring_delete_selection"),
+                                            proto_response::response::Response::RemoveEthereumWalletSelectionResponse(
+                                                proto_response::RemoveEthereumWalletSelectionResponse {},
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetFinancialCalendar(_) => (
+                                        ClientRequestKind::GetSolanaWalletSelectionsRequest(_) => (
+                                            ObservedRequest::Rpc("solana_wallet_monitoring_selections"),
+                                            proto_response::response::Response::GetSolanaWalletSelectionsResponse(
+                                                proto_response::GetSolanaWalletSelectionsResponse {
+                                                    selections: Vec::new(),
+                                                    solana_wallet_monitor_address_limit: 3,
+                                                },
+                                            ),
+                                            false,
+                                        ),
+                                        ClientRequestKind::AddSolanaWalletSelectionRequest(request) => (
+                                            ObservedRequest::Rpc("solana_wallet_monitoring_add_selection"),
+                                            proto_response::response::Response::AddSolanaWalletSelectionResponse(
+                                                proto_response::AddSolanaWalletSelectionResponse {
+                                                    selection: Some(test_solana_wallet_selection(
+                                                        request.address,
+                                                    )),
+                                                },
+                                            ),
+                                            false,
+                                        ),
+                                        ClientRequestKind::RemoveSolanaWalletSelectionRequest(_) => (
+                                            ObservedRequest::Rpc("solana_wallet_monitoring_delete_selection"),
+                                            proto_response::response::Response::RemoveSolanaWalletSelectionResponse(
+                                                proto_response::RemoveSolanaWalletSelectionResponse {},
+                                            ),
+                                            false,
+                                        ),
+                                        ClientRequestKind::GetFinancialCalendarRequest(_) => (
                                             ObservedRequest::Rpc("financial_calendar"),
-                                            proto_response::response::Response::FinancialCalendar(
-                                                proto_response::FinancialCalendarResponse {
+                                            proto_response::response::Response::GetFinancialCalendar(
+                                                proto_response::GetFinancialCalendarResponse {
                                                     financial_calendar: Some(
                                                         financial_calendar(),
                                                     ),
@@ -838,10 +883,10 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetCoinMarketCapFearAndGreedIndex(_) => (
+                                        ClientRequestKind::GetCoinMarketCapFearAndGreedIndexRequest(_) => (
                                             ObservedRequest::Rpc("coin_market_cap_fear_and_greed_index"),
-                                            proto_response::response::Response::CoinMarketCapFearAndGreedIndex(
-                                                proto_response::CoinMarketCapFearAndGreedIndexResponse {
+                                            proto_response::response::Response::GetCoinMarketCapFearAndGreedIndex(
+                                                proto_response::GetCoinMarketCapFearAndGreedIndexResponse {
                                                     coin_market_cap_fear_and_greed_index: Some(
                                                         coin_market_cap_fear_and_greed_index(),
                                                     ),
@@ -849,10 +894,10 @@ impl TestServiceServer {
                                             ),
                                             false,
                                         ),
-                                        ClientRequestKind::GetPentagonPizzaIndex(_) => (
+                                        ClientRequestKind::GetPentagonPizzaIndexRequest(_) => (
                                             ObservedRequest::Rpc("pentagon_pizza_index"),
-                                            proto_response::response::Response::PentagonPizzaIndex(
-                                                proto_response::PentagonPizzaIndexResponse {
+                                            proto_response::response::Response::GetPentagonPizzaIndex(
+                                                proto_response::GetPentagonPizzaIndexResponse {
                                                     pentagon_pizza_index: Some(
                                                         pentagon_pizza_index(),
                                                     ),
@@ -892,10 +937,10 @@ impl TestServiceServer {
                                             let old_event = ServerMessage {
                                                 message: Some(
                                                     server_message::Message::Event(
-                                                        proto_event::Event {
+                                                        Event {
                                                             event: Some(
-                                                                proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
-                                                                    proto_types::CryptocurrencyWalletMonitoringTransfer {
+                                                                proto_event::Event::EthereumWalletEvent(
+                                                                    proto_types::EthereumWalletEvent {
                                                                         event_id: "old-session-event".to_owned(),
                                                                         from_address: "0x0000000000000000000000000000000000000001".to_owned(),
                                                                         to_address: "0x0000000000000000000000000000000000000002".to_owned(),
@@ -931,7 +976,9 @@ impl TestServiceServer {
                                     }
                                     let mut response = if matches!(
                                         &response,
-                                        proto_response::response::Response::Reauthenticate(_)
+                                        proto_response::response::Response::ReauthenticateResponse(
+                                            _
+                                        )
                                     ) && authentication_unavailable_next
                                         .swap(false, Ordering::AcqRel)
                                     {
@@ -950,7 +997,7 @@ impl TestServiceServer {
                                         response
                                     };
                                     if duplicate_topics_next.swap(false, Ordering::AcqRel)
-                                        && let proto_response::response::Response::SetSubscriptions(
+                                        && let proto_response::response::Response::SetSubscriptionsResponse(
                                             subscriptions,
                                         ) = &mut response
                                         && let Some(topic) = subscriptions.topics.first().cloned()
@@ -958,7 +1005,7 @@ impl TestServiceServer {
                                         subscriptions.topics.push(topic);
                                     }
                                     if pending_x_add_next.swap(false, Ordering::AcqRel)
-                                        && let proto_response::response::Response::XAccountMonitoringAddSelection(
+                                        && let proto_response::response::Response::AddXUserSelectionResponse(
                                             add,
                                         ) = &mut response
                                     {
@@ -1030,39 +1077,46 @@ impl TestServiceServer {
         );
     }
 
-    pub(super) fn send_cryptocurrency_wallet_monitor_transfer(&self, event_id: &str) {
-        self.send_event(
-            proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
-                proto_types::CryptocurrencyWalletMonitoringTransfer {
-                    event_id: event_id.to_owned(),
-                    from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                    to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                    amount: "1".to_owned(),
-                    token_symbol: "ETH".to_owned(),
-                    timestamp: 1,
-                },
-            ),
-        );
+    pub(super) fn send_ethereum_wallet_transfer(&self, event_id: &str) {
+        self.send_event(proto_event::Event::EthereumWalletEvent(
+            proto_types::EthereumWalletEvent {
+                event_id: event_id.to_owned(),
+                from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                amount: "1".to_owned(),
+                token_symbol: "ETH".to_owned(),
+                timestamp: 1,
+            },
+        ));
+    }
+
+    pub(super) fn send_solana_wallet_transfer(&self, event_id: &str) {
+        self.send_event(proto_event::Event::SolanaWalletEvent(
+            proto_types::SolanaWalletEvent {
+                event_id: event_id.to_owned(),
+                from_address: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_owned(),
+                to_address: "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR".to_owned(),
+                amount: "1".to_owned(),
+                token_symbol: "SOL".to_owned(),
+                timestamp: 1,
+            },
+        ));
     }
 
     pub(super) fn send_global_shipping_chokepoint_delta(&self) {
-        self.send_event(
-            proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                global_shipping_chokepoint_delta(),
-            ),
-        );
+        self.send_event(proto_event::Event::GlobalShippingChokepointEvent(
+            global_shipping_chokepoint_delta(),
+        ));
     }
 
     pub(super) fn send_global_shipping_chokepoint_keyframe(&self) {
-        self.send_event(
-            proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                global_shipping_chokepoint_keyframe(),
-            ),
-        );
+        self.send_event(proto_event::Event::GlobalShippingChokepointEvent(
+            global_shipping_chokepoint_keyframe(),
+        ));
     }
 
     pub(super) fn send_news(&self, content: &str) {
-        self.send_event(proto_event::event::Event::News(proto_types::News {
+        self.send_event(proto_event::Event::News(proto_types::News {
             timestamp: 1,
             title: None,
             content: content.to_owned(),
@@ -1071,7 +1125,7 @@ impl TestServiceServer {
     }
 
     pub(super) fn send_financial_index(&self, code: &str) {
-        self.send_event(proto_event::event::Event::FinancialIndex(
+        self.send_event(proto_event::Event::FinancialIndex(
             proto_types::FinancialIndex {
                 code: code.to_owned(),
                 last_price: 101,
@@ -1086,17 +1140,13 @@ impl TestServiceServer {
     }
 
     pub(super) fn send_x_profile(&self) {
-        self.send_event(proto_event::event::Event::XAccountMonitoringProfile(
-            x_profile(),
-        ));
+        self.send_event(proto_event::Event::XUserProfile(x_profile()));
     }
 
-    pub(super) fn send_event(&self, event: proto_event::event::Event) {
+    pub(super) fn send_event(&self, event: proto_event::Event) {
         self.challenge_sender
             .send(ServerMessage {
-                message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(event),
-                })),
+                message: Some(server_message::Message::Event(Event { event: Some(event) })),
             })
             .expect("connected service should receive the event");
     }
@@ -1167,7 +1217,7 @@ mod tests {
         manager.update(|config| config.proxy_default = ProxyRoute::System);
 
         let stamped = &manager.read().service_route_generations;
-        assert_eq!(stamped.len(), 13, "every capability is a stamped target");
+        assert_eq!(stamped.len(), 14, "every capability is a stamped target");
         assert!(
             stamped.contains_key(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,

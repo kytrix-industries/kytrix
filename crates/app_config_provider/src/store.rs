@@ -135,7 +135,8 @@ fn all_network_targets(
         KytrixServiceCapability::News,
         KytrixServiceCapability::FinancialIndices,
         KytrixServiceCapability::X,
-        KytrixServiceCapability::CryptocurrencyWalletMonitoring,
+        KytrixServiceCapability::EthereumWallet,
+        KytrixServiceCapability::SolanaWallet,
         KytrixServiceCapability::XMedia,
         KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
         KytrixServiceCapability::FinancialCalendar,
@@ -934,7 +935,7 @@ mod tests {
     fn every_kytrix_service_capability_should_have_a_network_target() {
         let targets = all_network_targets(&Config::default(), []);
 
-        assert_eq!(targets.len(), 13);
+        assert_eq!(targets.len(), 14);
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,

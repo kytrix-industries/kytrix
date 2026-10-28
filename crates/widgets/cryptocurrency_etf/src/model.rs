@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -486,7 +486,7 @@ fn parse_number(value: &str) -> Option<f64> {
 mod tests {
     use std::collections::HashMap;
 
-    use kytrix_proto::types::cryptocurrency_etf;
+    use kytrix_proto::types::v1::cryptocurrency_etf;
 
     use super::*;
 

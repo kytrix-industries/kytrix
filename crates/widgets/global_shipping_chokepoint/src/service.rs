@@ -306,7 +306,7 @@ async fn run_stream<S>(
 ///
 /// The server already selects at most [`MAX_VESSELS`] vessels by distance, so this is
 /// the defence against a malformed push rather than the way the set is chosen. Only the
-/// positions are trimmed; the statics are left alone, because they describe vessels the
+/// positions are trimmed; the ships are left alone, because they describe vessels the
 /// picture may still hold. Which vessels the picture holds is never decided here: deltas
 /// are passed through rather than evicted against a running set the client would then
 /// have picked itself.
@@ -423,7 +423,7 @@ mod tests {
             keyframe: false,
             sequence,
             base: sequence.saturating_sub(1),
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions,
             removed: Vec::new(),
             timestamp: 1,

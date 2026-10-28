@@ -469,16 +469,26 @@ error:
     stream_unavailable: 成交量热力图数据流不可用
     timeout: 成交量热力图请求在 %{seconds} 秒后超时
     too_many_tickers: '%{route} 返回了 %{count} 条 ticker，超过热力图可用的 %{limit} 条上限'
-  cryptocurrency_wallet_monitor:
-    account_changed: 钱包账户会话已变更
-    closed: 钱包账户会话已关闭
-    invalid_response: 钱包 API 返回了无效数据
-    network: 钱包 API 请求失败：%{detail}
-    not_ready: 钱包监控尚未就绪
-    protocol: 钱包 API 协议错误：%{detail}
-    response_too_large: 钱包 API 响应过大
-    server: 钱包 API 返回 HTTP %{status}
-    timeout: 钱包 API 请求超时
+  ethereum_wallet:
+    account_changed: Ethereum 钱包账户会话已变更
+    closed: Ethereum 钱包账户会话已关闭
+    invalid_response: Ethereum 钱包 API 返回了无效数据
+    network: Ethereum 钱包 API 请求失败：%{detail}
+    not_ready: Ethereum 钱包监控尚未就绪
+    protocol: Ethereum 钱包 API 协议错误：%{detail}
+    response_too_large: Ethereum 钱包 API 响应过大
+    server: Ethereum 钱包 API 返回 HTTP %{status}
+    timeout: Ethereum 钱包 API 请求超时
+  solana_wallet:
+    account_changed: Solana 钱包账户会话已变更
+    closed: Solana 钱包账户会话已关闭
+    invalid_response: Solana 钱包 API 返回了无效数据
+    network: Solana 钱包 API 请求失败：%{detail}
+    not_ready: Solana 钱包监控尚未就绪
+    protocol: Solana 钱包 API 协议错误：%{detail}
+    response_too_large: Solana 钱包 API 响应过大
+    server: Solana 钱包 API 返回 HTTP %{status}
+    timeout: Solana 钱包 API 请求超时
   watch_list:
     capacity: 自选列表最多只能关注 %{maximum} 个标的
     duplicate_entry: 该标的已在自选列表中
@@ -808,6 +818,7 @@ widget:
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
     cryptocurrency_etf: 加密货币ETF
     empty: 空白
+    ethereum_wallet: Ethereum 钱包监控
     financial_calendar: 财经日历
     financial_indices: 指数
     force_orders: 强平订单流
@@ -819,11 +830,11 @@ widget:
     open_interest: 持仓量
     order_book: 订单簿
     pentagon_pizza_index: 五角大楼披萨指数
+    solana_wallet: Solana 钱包监控
     taker_volume: 主动买卖量
     top_trader_account_ratio: 大户账户多空比
     top_trader_position_ratio: 大户持仓多空比
     volume_heatmap: 成交量热力图
-    cryptocurrency_wallet_monitor: 加密货币钱包监控
     watch_list: 自选列表
     x: X
   news:
@@ -921,34 +932,58 @@ widget:
   volume_heatmap:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
-  cryptocurrency_wallet_monitor:
+  ethereum_wallet:
     active: 已激活
     add_address: 添加钱包地址
     add_success: 钱包地址添加成功
-    address_placeholder: Ethereum 或 Solana 地址
+    address_placeholder: Ethereum 地址
     authentication_failed: 登录状态已失效，请重新登录
     conflict: 地址已存在或当前额度已满
     delete_address: 删除当前钱包
-    dialog_title: 监控钱包地址
+    dialog_title: 监控 Ethereum 地址
     empty_addresses: <p align="center">暂无监控钱包地址</p>
-    ethereum: Ethereum
     from: 从
     inconsistent_selections: 服务端确认的钱包地址无法并入当前地址列表
-    invalid_address: 钱包地址无效
+    invalid_address: Ethereum 钱包地址无效
     load_failed: 无法加载钱包地址
     loading_addresses: 正在加载钱包地址
     logged_out: <p align="center">需要注册/登陆后才可以使用</p>
     manage: 管理监控钱包地址
     monitored_addresses: '已选择地址：%{current}/%{limit}'
-    not_found: 未找到该钱包地址
+    not_found: 未找到该 Ethereum 钱包地址
     paused: 已暂停
     refresh: 刷新钱包地址
     scroll_transfers: 垂直滚动钱包转账
-    solana: Solana
     stream_unavailable: 钱包转账推送未连接
     to: 至
     transfer: '%{amount} 转账，时间 %{time}'
-    unavailable: 钱包监控尚未配置或暂不可用
+    unavailable: Ethereum 钱包监控尚未配置或暂不可用
+  solana_wallet:
+    active: 已激活
+    add_address: 添加钱包地址
+    add_success: 钱包地址添加成功
+    address_placeholder: Solana 地址
+    authentication_failed: 登录状态已失效，请重新登录
+    conflict: 地址已存在或当前额度已满
+    delete_address: 删除当前钱包
+    dialog_title: 监控 Solana 地址
+    empty_addresses: <p align="center">暂无监控钱包地址</p>
+    from: 从
+    inconsistent_selections: 服务端确认的钱包地址无法并入当前地址列表
+    invalid_address: Solana 钱包地址无效
+    load_failed: 无法加载钱包地址
+    loading_addresses: 正在加载钱包地址
+    logged_out: <p align="center">需要注册/登陆后才可以使用</p>
+    manage: 管理监控钱包地址
+    monitored_addresses: '已选择地址：%{current}/%{limit}'
+    not_found: 未找到该 Solana 钱包地址
+    paused: 已暂停
+    refresh: 刷新钱包地址
+    scroll_transfers: 垂直滚动钱包转账
+    stream_unavailable: 钱包转账推送未连接
+    to: 至
+    transfer: '%{amount} 转账，时间 %{time}'
+    unavailable: Solana 钱包监控尚未配置或暂不可用
   watch_list:
     add: 添加标的
     change_24h: 24h 涨跌额

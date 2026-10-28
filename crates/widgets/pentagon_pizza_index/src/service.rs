@@ -39,7 +39,7 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use gpui_kit::{App, SharedString};
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector, engine::KytrixServiceError,
 };

@@ -63,7 +63,7 @@ use gpui_kit::{
     px, relative, size,
 };
 use i18n::{language::codes::LanguageCode, t};
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{FinancialIndexTopic, KytrixServiceError},
@@ -487,10 +487,7 @@ pub(super) trait ManifestSource {
     fn fetch_manifest(
         &self,
     ) -> Pin<
-        Box<
-            dyn Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>>
-                + Send,
-        >,
+        Box<dyn Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>> + Send>,
     >;
 }
 
@@ -507,10 +504,7 @@ impl ManifestSource for RuntimeManifestSource {
     fn fetch_manifest(
         &self,
     ) -> Pin<
-        Box<
-            dyn Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>>
-                + Send,
-        >,
+        Box<dyn Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>> + Send>,
     > {
         let connector = self.connector.clone();
         let task = self
@@ -633,7 +627,7 @@ impl FinancialIndicesWidget {
     fn settle_selection(
         &mut self,
         asked: Vec<SelectedFinancialIndex>,
-        manifest: Result<proto_types::FinancialIndexManifest, KytrixServiceError>,
+        manifest: Result<proto_types::FinancialIndices, KytrixServiceError>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.account_id.is_none() || self.config.selection != asked {
@@ -1495,7 +1489,7 @@ mod tests {
             &self,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>>
+                dyn Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>>
                     + Send,
             >,
         > {
@@ -1529,7 +1523,7 @@ mod tests {
             &self,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<proto_types::FinancialIndexManifest, KytrixServiceError>>
+                dyn Future<Output = Result<proto_types::FinancialIndices, KytrixServiceError>>
                     + Send,
             >,
         > {
@@ -1545,7 +1539,7 @@ mod tests {
                 })
                 .collect();
             Box::pin(async move {
-                Ok(proto_types::FinancialIndexManifest {
+                Ok(proto_types::FinancialIndices {
                     categories: Vec::new(),
                     indices,
                 })
@@ -2494,7 +2488,7 @@ mod tests {
             pane.update(cx, |pane, cx| {
                 pane.settle_selection(
                     pane.config.selection.clone(),
-                    Ok(proto_types::FinancialIndexManifest {
+                    Ok(proto_types::FinancialIndices {
                         categories: Vec::new(),
                         indices: vec![proto_types::FinancialIndexDefinition {
                             request_code: ".SPX".to_owned(),

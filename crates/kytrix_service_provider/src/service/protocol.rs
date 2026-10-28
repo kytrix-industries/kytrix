@@ -2,14 +2,14 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, future::poll_fn};
-#[cfg(test)]
-use kytrix_proto::client::{
-    Request as ClientRequest, SetSubscriptions, request::Request as ClientRequestKind,
-};
+use kytrix_proto as proto_response;
 use kytrix_proto::{
-    event as proto_event,
-    server::{self as proto_response, ServerMessage, server_message},
-    topic as proto_topic, types as proto_types,
+    Event, ServerMessage, Topic, event as proto_event, server_message, topic as proto_topic,
+    types::v1 as proto_types,
+};
+#[cfg(test)]
+use kytrix_proto::{
+    Request as ClientRequest, SetSubscriptionsRequest, request::Request as ClientRequestKind,
 };
 use network::transport::websocket::RawWebSocket;
 use prost::Message;
@@ -19,14 +19,16 @@ use url::Url;
 use yawc::{Frame, OpCode, WebSocketError};
 
 use crate::service::{
-    cryptocurrency_wallet_monitor,
     engine::{
-        CryptocurrencyWalletMonitorTransfer, ErrorCode, FinancialIndexEvent, FinancialIndexTopic,
+        ErrorCode, EthereumWalletTransfer, FinancialIndexEvent, FinancialIndexTopic,
         HEARTBEAT_MAX_SECONDS, HEARTBEAT_MIN_SECONDS, IncomingMessage, KytrixServiceError,
-        KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind, ServiceTopic, TweetReference,
-        WRITE_TIMEOUT, XProfileEvent, XTweetEvent, XTweetMedia, XTweetTextSegment,
+        KytrixServiceEvent, KytrixSessionState, NewsEvent, NewsKind, ServiceTopic,
+        SolanaWalletTransfer, TweetReference, WRITE_TIMEOUT, XProfileEvent, XTweetEvent,
+        XTweetMedia, XTweetTextSegment,
     },
+    ethereum_wallet,
     global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
+    solana_wallet,
 };
 
 pub(super) async fn next_server_message(
@@ -68,18 +70,19 @@ pub(super) fn decode_binary(payload: &[u8]) -> Result<IncomingMessage, KytrixSer
             Ok(IncomingMessage::Event(decode_event(event)?))
         }
         Some(server_message::Message::SessionState(state)) => {
-            let plan_code = proto_types::PlanCode::try_from(state.plan_code).unwrap_or_else(|_| {
-                log::warn!(
-                    "unknown Kytrix service plan code {}; showing it as unspecified",
-                    state.plan_code
-                );
-                proto_types::PlanCode::Unspecified
-            });
+            let plan_code = proto_types::EntitlementPlanCode::try_from(state.entitlement_plan_code)
+                .unwrap_or_else(|_| {
+                    log::warn!(
+                        "unknown Kytrix service plan code {}; showing it as unspecified",
+                        state.entitlement_plan_code
+                    );
+                    proto_types::EntitlementPlanCode::Unspecified
+                });
             Ok(IncomingMessage::SessionState(KytrixSessionState {
                 entitlement_revision: state.entitlement_revision,
                 plan_code,
-                entitlements: state.entitlements.into_iter().collect(),
-                catalog: state.catalog,
+                entitlements: state.entitlement_values.into_iter().collect(),
+                catalog: state.entitlement_features,
                 next_change_at: state.next_change_at,
             }))
         }
@@ -93,13 +96,13 @@ pub(super) fn decode_binary(payload: &[u8]) -> Result<IncomingMessage, KytrixSer
 }
 
 pub(super) fn decode_event(
-    event: proto_event::Event,
+    event: Event,
 ) -> Result<Option<(ServiceTopic, KytrixServiceEvent)>, KytrixServiceError> {
     let Some(event) = event.event else {
         return Ok(None);
     };
     match event {
-        proto_event::event::Event::News(news) => {
+        proto_event::Event::News(news) => {
             let Some(category) = NewsKind::from_proto(news.kind) else {
                 return Ok(None);
             };
@@ -113,7 +116,7 @@ pub(super) fn decode_event(
                 }),
             )))
         }
-        proto_event::event::Event::FinancialIndex(index) => {
+        proto_event::Event::FinancialIndex(index) => {
             let Some(topic) = FinancialIndexTopic::from_code(&index.code) else {
                 return Ok(None);
             };
@@ -132,21 +135,23 @@ pub(super) fn decode_event(
                 }),
             )))
         }
-        proto_event::event::Event::XAccountMonitoringProfile(profile) => Ok(Some((
+        proto_event::Event::XUserProfile(profile) => Ok(Some((
             ServiceTopic::X,
             KytrixServiceEvent::XProfile(decode_x_profile(profile)?),
         ))),
-        proto_event::event::Event::XAccountMonitoringTweet(tweet) => Ok(Some((
+        proto_event::Event::XPost(post) => Ok(Some((
             ServiceTopic::X,
-            KytrixServiceEvent::XTweet(decode_tweet(tweet)?),
+            KytrixServiceEvent::XTweet(decode_tweet(post)?),
         ))),
-        proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(transfer) => Ok(Some((
-            ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(
-                decode_cryptocurrency_wallet_monitor_transfer(transfer)?,
-            ),
+        proto_event::Event::EthereumWalletEvent(transfer) => Ok(Some((
+            ServiceTopic::EthereumWallet,
+            KytrixServiceEvent::EthereumWalletTransfer(decode_ethereum_wallet_transfer(transfer)?),
         ))),
-        proto_event::event::Event::StrategicMaritimeChokepointsTracking(delta) => {
+        proto_event::Event::SolanaWalletEvent(transfer) => Ok(Some((
+            ServiceTopic::SolanaWallet,
+            KytrixServiceEvent::SolanaWalletTransfer(decode_solana_wallet_transfer(transfer)?),
+        ))),
+        proto_event::Event::GlobalShippingChokepointEvent(delta) => {
             let area = GlobalShippingChokepointArea::try_from(delta.area)
                 .ok()
                 .filter(|area| *area != GlobalShippingChokepointArea::Unspecified)
@@ -161,35 +166,26 @@ pub(super) fn decode_event(
     }
 }
 
-pub(super) fn decode_cryptocurrency_wallet_monitor_transfer(
-    transfer: proto_types::CryptocurrencyWalletMonitoringTransfer,
-) -> Result<CryptocurrencyWalletMonitorTransfer, KytrixServiceError> {
-    let network = cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(
-        &transfer.from_address,
-    );
+pub(super) fn decode_ethereum_wallet_transfer(
+    transfer: proto_types::EthereumWalletEvent,
+) -> Result<EthereumWalletTransfer, KytrixServiceError> {
     if transfer.event_id.is_empty()
         || transfer.event_id.len() > 512
-        || network.is_none()
-        || cryptocurrency_wallet_monitor::cryptocurrency_wallet_monitor_network(
-            &transfer.to_address,
-        ) != network
-        || !network.is_some_and(|network| {
-            cryptocurrency_wallet_monitor::valid_transfer_amount(&transfer.amount, network)
-        })
+        || ethereum_wallet::ethereum_wallet_address(&transfer.from_address).is_none()
+        || ethereum_wallet::ethereum_wallet_address(&transfer.to_address).is_none()
+        || !ethereum_wallet::valid_ethereum_wallet_transfer_amount(&transfer.amount)
         || transfer.token_symbol.is_empty()
         || transfer.token_symbol.len() > 64
         || transfer.timestamp <= 0
     {
         return Err(KytrixServiceError::Protocol(
-            "cryptocurrency_wallet_monitor transfer is invalid".into(),
+            "Ethereum wallet transfer is invalid".into(),
         ));
     }
     let timestamp = transfer.timestamp.checked_mul(1_000).ok_or_else(|| {
-        KytrixServiceError::Protocol(
-            "cryptocurrency_wallet_monitor timestamp exceeded UTC milliseconds".into(),
-        )
+        KytrixServiceError::Protocol("Ethereum wallet timestamp exceeded UTC milliseconds".into())
     })?;
-    Ok(CryptocurrencyWalletMonitorTransfer {
+    Ok(EthereumWalletTransfer {
         event_id: transfer.event_id.into(),
         from_address: transfer.from_address.into(),
         to_address: transfer.to_address.into(),
@@ -199,31 +195,58 @@ pub(super) fn decode_cryptocurrency_wallet_monitor_transfer(
     })
 }
 
-pub(super) fn decode_tweet(
-    tweet: proto_types::XAccountMonitoringTweet,
-) -> Result<XTweetEvent, KytrixServiceError> {
+pub(super) fn decode_solana_wallet_transfer(
+    transfer: proto_types::SolanaWalletEvent,
+) -> Result<SolanaWalletTransfer, KytrixServiceError> {
+    if transfer.event_id.is_empty()
+        || transfer.event_id.len() > 512
+        || solana_wallet::solana_wallet_address(&transfer.from_address).is_none()
+        || solana_wallet::solana_wallet_address(&transfer.to_address).is_none()
+        || !solana_wallet::valid_solana_wallet_transfer_amount(&transfer.amount)
+        || transfer.token_symbol.is_empty()
+        || transfer.token_symbol.len() > 64
+        || transfer.timestamp <= 0
+    {
+        return Err(KytrixServiceError::Protocol(
+            "Solana wallet transfer is invalid".into(),
+        ));
+    }
+    let timestamp = transfer.timestamp.checked_mul(1_000).ok_or_else(|| {
+        KytrixServiceError::Protocol("Solana wallet timestamp exceeded UTC milliseconds".into())
+    })?;
+    Ok(SolanaWalletTransfer {
+        event_id: transfer.event_id.into(),
+        from_address: transfer.from_address.into(),
+        to_address: transfer.to_address.into(),
+        amount: transfer.amount.into(),
+        token_symbol: transfer.token_symbol.into(),
+        timestamp,
+    })
+}
+
+pub(super) fn decode_tweet(tweet: proto_types::XPost) -> Result<XTweetEvent, KytrixServiceError> {
     decode_tweet_at_depth(tweet, 0)
 }
 
 pub(super) fn decode_tweet_at_depth(
-    tweet: proto_types::XAccountMonitoringTweet,
+    tweet: proto_types::XPost,
     depth: usize,
 ) -> Result<XTweetEvent, KytrixServiceError> {
-    let proto_types::XAccountMonitoringTweet {
-        tweet_id,
+    let proto_types::XPost {
+        post_id,
         timestamp,
         text_segments,
         reference,
         x_user_id,
         media,
     } = tweet;
-    if !valid_x_id(&tweet_id)
+    if !valid_x_id(&post_id)
         || !valid_x_id(&x_user_id)
         || timestamp <= 0
         || text_segments.len() > 1_000
     {
         return Err(KytrixServiceError::Protocol(
-            "Tweet contained an invalid ID, author ID, timestamp, or segment count".into(),
+            "Post contained an invalid ID, author ID, timestamp, or segment count".into(),
         ));
     }
     let mut text_bytes = 0_usize;
@@ -238,15 +261,15 @@ pub(super) fn decode_tweet_at_depth(
                     .is_some_and(|url| !valid_http_url(url))
             {
                 return Err(KytrixServiceError::Protocol(
-                    "Tweet contained an invalid text segment".into(),
+                    "Post contained an invalid text segment".into(),
                 ));
             }
             text_bytes = text_bytes
                 .checked_add(segment.text.len())
-                .ok_or_else(|| KytrixServiceError::Protocol("Tweet text size overflowed".into()))?;
+                .ok_or_else(|| KytrixServiceError::Protocol("Post text size overflowed".into()))?;
             text_code_points = text_code_points
                 .checked_add(segment.text.chars().count())
-                .ok_or_else(|| KytrixServiceError::Protocol("Tweet text size overflowed".into()))?;
+                .ok_or_else(|| KytrixServiceError::Protocol("Post text size overflowed".into()))?;
             Ok(XTweetTextSegment {
                 text: segment.text.into(),
                 url: segment.url.map(Into::into),
@@ -255,20 +278,20 @@ pub(super) fn decode_tweet_at_depth(
         .collect::<Result<Vec<_>, _>>()?;
     if text_bytes > 100_000 || text_code_points > 25_000 {
         return Err(KytrixServiceError::Protocol(
-            "Tweet contained too much text".into(),
+            "Post contained too much text".into(),
         ));
     }
     let timestamp = timestamp.checked_mul(1_000).ok_or_else(|| {
-        KytrixServiceError::Protocol("Tweet timestamp exceeded UTC milliseconds".into())
+        KytrixServiceError::Protocol("Post timestamp exceeded UTC milliseconds".into())
     })?;
     if depth >= 2 && reference.is_some() {
         return Err(KytrixServiceError::Protocol(
-            "Tweet contained more than one nested reference".into(),
+            "Post contained more than one nested reference".into(),
         ));
     }
     if media.len() > 4 {
         return Err(KytrixServiceError::Protocol(
-            "Tweet contained too many media items".into(),
+            "Post contained too many media items".into(),
         ));
     }
     let media = media
@@ -277,12 +300,12 @@ pub(super) fn decode_tweet_at_depth(
         .collect::<Result<Vec<_>, _>>()?;
     let reference = reference
         .map(|reference| match reference {
-            proto_types::x_account_monitoring_tweet::Reference::Repost(tweet) => {
+            proto_types::x_post::Reference::Repost(tweet) => {
                 decode_tweet_at_depth(*tweet, depth + 1)
                     .map(Box::new)
                     .map(TweetReference::Repost)
             }
-            proto_types::x_account_monitoring_tweet::Reference::Quote(tweet) => {
+            proto_types::x_post::Reference::Quote(tweet) => {
                 decode_tweet_at_depth(*tweet, depth + 1)
                     .map(Box::new)
                     .map(TweetReference::Quote)
@@ -290,7 +313,7 @@ pub(super) fn decode_tweet_at_depth(
         })
         .transpose()?;
     Ok(XTweetEvent {
-        tweet_id: tweet_id.into(),
+        tweet_id: post_id.into(),
         timestamp,
         x_user_id: x_user_id.into(),
         text_segments,
@@ -300,9 +323,9 @@ pub(super) fn decode_tweet_at_depth(
 }
 
 pub(super) fn decode_tweet_media(
-    media: proto_types::XAccountMonitoringTweetMedia,
+    media: proto_types::XPostMedia,
 ) -> Result<XTweetMedia, KytrixServiceError> {
-    use proto_types::x_account_monitoring_tweet_media::Content;
+    use proto_types::x_post_media::Content;
 
     let media = match media.content {
         Some(Content::Image(image))
@@ -341,7 +364,7 @@ pub(super) fn decode_tweet_media(
         }
         _ => {
             return Err(KytrixServiceError::Protocol(
-                "Tweet contained invalid media".into(),
+                "Post contained invalid media".into(),
             ));
         }
     };
@@ -378,7 +401,7 @@ const fn valid_media_dimensions(width: u32, height: u32) -> bool {
 }
 
 pub(super) fn decode_x_profile(
-    profile: proto_types::XAccountMonitoringProfile,
+    profile: proto_types::XUserProfile,
 ) -> Result<XProfileEvent, KytrixServiceError> {
     if !valid_x_id(&profile.x_user_id)
         || !valid_x_username(&profile.username)
@@ -420,7 +443,7 @@ pub(super) fn validate_response(
 ) -> Result<(), KytrixServiceError> {
     let response = validate_response_envelope(response, expected_id)?;
     let topics = match response {
-        proto_response::response::Response::SetSubscriptions(response) => response.topics,
+        proto_response::response::Response::SetSubscriptionsResponse(response) => response.topics,
         _ => {
             return Err(KytrixServiceError::Protocol(
                 "unexpected response to set_subscriptions request".into(),
@@ -542,31 +565,30 @@ impl NewsKind {
             proto_types::NewsKind::General => Some(Self::General),
             proto_types::NewsKind::Crypto => Some(Self::Crypto),
             proto_types::NewsKind::Political => Some(Self::Political),
-            proto_types::NewsKind::NewsCategoryUnspecified => None,
+            proto_types::NewsKind::Unspecified => None,
         }
     }
 }
 
-impl From<&ServiceTopic> for proto_topic::Topic {
+impl From<&ServiceTopic> for Topic {
     fn from(topic: &ServiceTopic) -> Self {
         let topic = match topic {
-            ServiceTopic::News => proto_topic::topic::Topic::News(proto_topic::NewsTopic {}),
+            ServiceTopic::News => proto_topic::Topic::News(kytrix_proto::NewsTopic {}),
             ServiceTopic::FinancialIndex(topic) => {
-                proto_topic::topic::Topic::FinancialIndex(proto_topic::FinancialIndexTopic {
+                proto_topic::Topic::FinancialIndex(kytrix_proto::FinancialIndexTopic {
                     code: topic.code().into(),
                 })
             }
-            ServiceTopic::X => proto_topic::topic::Topic::XAccountMonitoring(
-                proto_topic::XAccountMonitoringTopic {},
-            ),
-            ServiceTopic::CryptocurrencyWalletMonitoring => {
-                proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(
-                    proto_topic::CryptocurrencyWalletMonitoringTopic {},
-                )
+            ServiceTopic::X => proto_topic::Topic::X(kytrix_proto::XTopic {}),
+            ServiceTopic::EthereumWallet => {
+                proto_topic::Topic::EthereumWallet(kytrix_proto::EthereumWalletTopic {})
+            }
+            ServiceTopic::SolanaWallet => {
+                proto_topic::Topic::SolanaWallet(kytrix_proto::SolanaWalletTopic {})
             }
             ServiceTopic::GlobalShippingChokepoint(area) => {
-                proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
-                    proto_topic::StrategicMaritimeChokepointsTrackingTopic { area: *area as i32 },
+                proto_topic::Topic::GlobalShippingChokepoint(
+                    kytrix_proto::GlobalShippingChokepointTopic { area: *area as i32 },
                 )
             }
         };
@@ -574,25 +596,24 @@ impl From<&ServiceTopic> for proto_topic::Topic {
     }
 }
 
-impl TryFrom<&proto_topic::Topic> for ServiceTopic {
+impl TryFrom<&Topic> for ServiceTopic {
     type Error = SmolStr;
 
-    fn try_from(topic: &proto_topic::Topic) -> Result<Self, Self::Error> {
+    fn try_from(topic: &Topic) -> Result<Self, Self::Error> {
         let Some(topic) = topic.topic.as_ref() else {
             return Err("topic oneof is required".into());
         };
         match topic {
-            proto_topic::topic::Topic::News(_) => Ok(ServiceTopic::News),
-            proto_topic::topic::Topic::FinancialIndex(value) => {
+            proto_topic::Topic::News(_) => Ok(ServiceTopic::News),
+            proto_topic::Topic::FinancialIndex(value) => {
                 FinancialIndexTopic::from_code(&value.code)
                     .map(ServiceTopic::FinancialIndex)
                     .ok_or_else(|| "index topic is invalid".into())
             }
-            proto_topic::topic::Topic::XAccountMonitoring(_) => Ok(ServiceTopic::X),
-            proto_topic::topic::Topic::CryptocurrencyWalletMonitoring(_) => {
-                Ok(ServiceTopic::CryptocurrencyWalletMonitoring)
-            }
-            proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(value) => {
+            proto_topic::Topic::X(_) => Ok(ServiceTopic::X),
+            proto_topic::Topic::EthereumWallet(_) => Ok(ServiceTopic::EthereumWallet),
+            proto_topic::Topic::SolanaWallet(_) => Ok(ServiceTopic::SolanaWallet),
+            proto_topic::Topic::GlobalShippingChokepoint(value) => {
                 match GlobalShippingChokepointArea::try_from(value.area) {
                     Ok(GlobalShippingChokepointArea::Hormuz) => {
                         Ok(ServiceTopic::GlobalShippingChokepoint(
@@ -615,7 +636,7 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::service::global_shipping_chokepoint::{
-        GlobalShippingChokepointPosition, GlobalShippingChokepointStatic,
+        GlobalShippingChokepointPosition, GlobalShippingChokepointShip,
     };
 
     #[test]
@@ -623,7 +644,8 @@ mod tests {
         let request = ClientRequest::decode(SET_SUBSCRIPTIONS_WIRE)
             .expect("literal subscription request should decode");
         assert_eq!(request.id, 7);
-        let Some(ClientRequestKind::SetSubscriptions(subscriptions)) = request.request else {
+        let Some(ClientRequestKind::SetSubscriptionsRequest(subscriptions)) = request.request
+        else {
             panic!("literal request should contain set_subscriptions");
         };
         assert_eq!(
@@ -637,12 +659,14 @@ mod tests {
 
         let outbound = ClientRequest {
             id: 7,
-            request: Some(ClientRequestKind::SetSubscriptions(SetSubscriptions {
-                topics: vec![
-                    proto_topic::Topic::from(&ServiceTopic::News),
-                    proto_topic::Topic::from(&index_service_topic("SPX")),
-                ],
-            })),
+            request: Some(ClientRequestKind::SetSubscriptionsRequest(
+                SetSubscriptionsRequest {
+                    topics: vec![
+                        Topic::from(&ServiceTopic::News),
+                        Topic::from(&index_service_topic("SPX")),
+                    ],
+                },
+            )),
         };
         assert_eq!(outbound.encode_to_vec(), SET_SUBSCRIPTIONS_WIRE);
     }
@@ -701,18 +725,48 @@ mod tests {
     }
 
     #[test]
-    fn literal_cryptocurrency_wallet_monitor_event_wire_should_preserve_schema_tags() {
+    fn literal_ethereum_wallet_event_wire_should_preserve_schema_tags() {
         let IncomingMessage::Event(Some((
-            ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
-        ))) = decode_binary(CRYPTOCURRENCY_WALLET_MONITOR_EVENT_WIRE)
-            .expect("literal CryptocurrencyWalletMonitoring event should decode")
+            ServiceTopic::EthereumWallet,
+            KytrixServiceEvent::EthereumWalletTransfer(transfer),
+        ))) = decode_binary(ETHEREUM_WALLET_EVENT_WIRE)
+            .expect("literal Ethereum wallet event should decode")
         else {
-            panic!("literal frame should contain a CryptocurrencyWalletMonitoring event");
+            panic!("literal frame should contain an Ethereum wallet event");
         };
         assert_eq!(transfer.event_id, "e");
-        assert_eq!(transfer.from_address, "11111111111111111111111111111111");
-        assert_eq!(transfer.to_address, transfer.from_address);
+        assert_eq!(
+            transfer.from_address,
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            transfer.to_address,
+            "0x0000000000000000000000000000000000000002"
+        );
+        assert_eq!(transfer.amount, "1.5");
+        assert_eq!(transfer.token_symbol, "ETH");
+        assert_eq!(transfer.timestamp, 1_234_000);
+    }
+
+    #[test]
+    fn literal_solana_wallet_event_wire_should_preserve_schema_tags() {
+        let IncomingMessage::Event(Some((
+            ServiceTopic::SolanaWallet,
+            KytrixServiceEvent::SolanaWalletTransfer(transfer),
+        ))) = decode_binary(SOLANA_WALLET_EVENT_WIRE)
+            .expect("literal Solana wallet event should decode")
+        else {
+            panic!("literal frame should contain a Solana wallet event");
+        };
+        assert_eq!(transfer.event_id, "s");
+        assert_eq!(
+            transfer.from_address,
+            "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+        );
+        assert_eq!(
+            transfer.to_address,
+            "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR"
+        );
         assert_eq!(transfer.amount, "1.5");
         assert_eq!(transfer.token_symbol, "SOL");
         assert_eq!(transfer.timestamp, 1_234_000);
@@ -732,10 +786,11 @@ mod tests {
             ServiceTopic::News,
             index_service_topic("REMOTE_ONLY_INDEX"),
             ServiceTopic::X,
-            ServiceTopic::CryptocurrencyWalletMonitoring,
+            ServiceTopic::EthereumWallet,
+            ServiceTopic::SolanaWallet,
             ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz),
         ] {
-            let encoded = proto_topic::Topic::from(&topic);
+            let encoded = Topic::from(&topic);
             assert_eq!(ServiceTopic::try_from(&encoded), Ok(topic));
         }
     }
@@ -743,12 +798,10 @@ mod tests {
     #[test]
     fn global_shipping_chokepoint_topic_should_reject_unspecified_and_unknown_areas() {
         for area in [GlobalShippingChokepointArea::Unspecified as i32, 9] {
-            let topic = proto_topic::Topic {
-                topic: Some(
-                    proto_topic::topic::Topic::StrategicMaritimeChokepointsTracking(
-                        proto_topic::StrategicMaritimeChokepointsTrackingTopic { area },
-                    ),
-                ),
+            let topic = Topic {
+                topic: Some(proto_topic::Topic::GlobalShippingChokepoint(
+                    kytrix_proto::GlobalShippingChokepointTopic { area },
+                )),
             };
             assert!(ServiceTopic::try_from(&topic).is_err());
         }
@@ -758,8 +811,8 @@ mod tests {
     fn invalid_index_event_codes_should_not_be_delivered() {
         for code in ["", " INVALID", "INVALID "] {
             let message = ServerMessage {
-                message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(proto_event::event::Event::FinancialIndex(
+                message: Some(server_message::Message::Event(Event {
+                    event: Some(proto_event::Event::FinancialIndex(
                         proto_types::FinancialIndex {
                             code: code.to_owned(),
                             ..Default::default()
@@ -776,17 +829,19 @@ mod tests {
     fn invalid_index_topic_in_a_response_should_be_a_protocol_error() {
         let response = proto_response::Response {
             id: 7,
-            response: Some(proto_response::response::Response::SetSubscriptions(
-                proto_response::SetSubscriptionsResponse {
-                    topics: vec![proto_topic::Topic {
-                        topic: Some(proto_topic::topic::Topic::FinancialIndex(
-                            proto_topic::FinancialIndexTopic {
-                                code: String::new(),
-                            },
-                        )),
-                    }],
-                },
-            )),
+            response: Some(
+                proto_response::response::Response::SetSubscriptionsResponse(
+                    proto_response::SetSubscriptionsResponse {
+                        topics: vec![Topic {
+                            topic: Some(proto_topic::Topic::FinancialIndex(
+                                kytrix_proto::FinancialIndexTopic {
+                                    code: String::new(),
+                                },
+                            )),
+                        }],
+                    },
+                ),
+            ),
         };
 
         assert!(matches!(
@@ -800,14 +855,16 @@ mod tests {
         let topics = vec![ServiceTopic::News, index_service_topic("SPX")];
         let request = ClientRequest {
             id: 7,
-            request: Some(ClientRequestKind::SetSubscriptions(SetSubscriptions {
-                topics: topics.iter().map(Into::into).collect(),
-            })),
+            request: Some(ClientRequestKind::SetSubscriptionsRequest(
+                SetSubscriptionsRequest {
+                    topics: topics.iter().map(Into::into).collect(),
+                },
+            )),
         };
         let encoded = request.encode_to_vec();
         let decoded = ClientRequest::decode(encoded.as_slice()).expect("request should decode");
         assert_eq!(decoded.id, 7);
-        let Some(ClientRequestKind::SetSubscriptions(set)) = decoded.request else {
+        let Some(ClientRequestKind::SetSubscriptionsRequest(set)) = decoded.request else {
             panic!("expected a set_subscriptions request");
         };
         assert_eq!(
@@ -827,8 +884,8 @@ mod tests {
             (proto_types::NewsKind::Political, NewsKind::Political),
         ] {
             let message = ServerMessage {
-                message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(proto_event::event::Event::News(proto_types::News {
+                message: Some(server_message::Message::Event(Event {
+                    event: Some(proto_event::Event::News(proto_types::News {
                         timestamp: 12,
                         title: Some("title".to_owned()),
                         content: "content".to_owned(),
@@ -850,16 +907,14 @@ mod tests {
     fn tweet_event_should_decode_milliseconds_and_one_repost() {
         let mut root = tweet("100", 1_700_000_000);
         let mut nested = tweet("99", 1_699_999_999);
-        nested.text_segments = vec![proto_types::XAccountMonitoringTweetTextSegment {
+        nested.text_segments = vec![proto_types::XPostTextSegment {
             text: "example.test/nested".to_owned(),
             url: Some("https://t.co/nested".to_owned()),
         }];
-        root.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Repost(
-            Box::new(nested),
-        ));
+        root.reference = Some(proto_types::x_post::Reference::Repost(Box::new(nested)));
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::XAccountMonitoringTweet(root)),
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::XPost(root)),
             })),
         };
 
@@ -897,10 +952,8 @@ mod tests {
     #[test]
     fn x_profile_event_should_decode_verified_state() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::XAccountMonitoringProfile(
-                    x_profile(),
-                )),
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::XUserProfile(x_profile())),
             })),
         };
 
@@ -915,31 +968,29 @@ mod tests {
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitor_transfer_should_decode_exact_amount_and_milliseconds() {
+    fn ethereum_wallet_transfer_should_decode_exact_amount_and_milliseconds() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(
-                    proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
-                        proto_types::CryptocurrencyWalletMonitoringTransfer {
-                            event_id: "ethereum:0xabc:2".to_owned(),
-                            from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                            to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                            amount: "1.000001".to_owned(),
-                            token_symbol: "USDC".to_owned(),
-                            timestamp: 1_786_665_600,
-                        },
-                    ),
-                ),
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::EthereumWalletEvent(
+                    proto_types::EthereumWalletEvent {
+                        event_id: "ethereum:0xabc:2".to_owned(),
+                        from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                        to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                        amount: "1.000001".to_owned(),
+                        token_symbol: "USDC".to_owned(),
+                        timestamp: 1_786_665_600,
+                    },
+                )),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
+            ServiceTopic::EthereumWallet,
+            KytrixServiceEvent::EthereumWalletTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a cryptocurrency_wallet_monitor transfer");
+            panic!("expected an Ethereum wallet transfer");
         };
         assert_eq!(transfer.event_id, "ethereum:0xabc:2");
         assert_eq!(transfer.amount, "1.000001");
@@ -948,44 +999,94 @@ mod tests {
     }
 
     #[test]
-    fn cryptocurrency_wallet_monitor_transfer_should_decode_zero_amount() {
+    fn ethereum_wallet_transfer_should_decode_zero_amount() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(
-                    proto_event::event::Event::CryptocurrencyWalletMonitoringTransfer(
-                        proto_types::CryptocurrencyWalletMonitoringTransfer {
-                            event_id: "ethereum:0xabc:3".to_owned(),
-                            from_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                            to_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                            amount: "0".to_owned(),
-                            token_symbol: "ETH".to_owned(),
-                            timestamp: 1_786_665_600,
-                        },
-                    ),
-                ),
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::EthereumWalletEvent(
+                    proto_types::EthereumWalletEvent {
+                        event_id: "ethereum:0xabc:3".to_owned(),
+                        from_address: "0x0000000000000000000000000000000000000001".to_owned(),
+                        to_address: "0x0000000000000000000000000000000000000002".to_owned(),
+                        amount: "0".to_owned(),
+                        token_symbol: "ETH".to_owned(),
+                        timestamp: 1_786_665_600,
+                    },
+                )),
             })),
         };
 
         let decoded = decode_binary(&message.encode_to_vec()).unwrap();
         let IncomingMessage::Event(Some((
-            ServiceTopic::CryptocurrencyWalletMonitoring,
-            KytrixServiceEvent::CryptocurrencyWalletMonitorTransfer(transfer),
+            ServiceTopic::EthereumWallet,
+            KytrixServiceEvent::EthereumWalletTransfer(transfer),
         ))) = decoded
         else {
-            panic!("expected a cryptocurrency_wallet_monitor transfer");
+            panic!("expected an Ethereum wallet transfer");
         };
         assert_eq!(transfer.amount, "0");
     }
 
     #[test]
+    fn solana_wallet_transfer_should_decode_exact_amount_and_milliseconds() {
+        let message = ServerMessage {
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::SolanaWalletEvent(
+                    proto_types::SolanaWalletEvent {
+                        event_id: "solana:111:2".to_owned(),
+                        from_address: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_owned(),
+                        to_address: "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR".to_owned(),
+                        amount: "1.000001".to_owned(),
+                        token_symbol: "SOL".to_owned(),
+                        timestamp: 1_786_665_600,
+                    },
+                )),
+            })),
+        };
+
+        let decoded = decode_binary(&message.encode_to_vec()).unwrap();
+        let IncomingMessage::Event(Some((
+            ServiceTopic::SolanaWallet,
+            KytrixServiceEvent::SolanaWalletTransfer(transfer),
+        ))) = decoded
+        else {
+            panic!("expected a Solana wallet transfer");
+        };
+        assert_eq!(transfer.event_id, "solana:111:2");
+        assert_eq!(transfer.amount, "1.000001");
+        assert_eq!(transfer.token_symbol, "SOL");
+        assert_eq!(transfer.timestamp, 1_786_665_600_000);
+    }
+
+    #[test]
+    fn wallet_transfers_reject_the_other_networks_addresses() {
+        let message = ServerMessage {
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::EthereumWalletEvent(
+                    proto_types::EthereumWalletEvent {
+                        event_id: "ethereum:0xabc:4".to_owned(),
+                        from_address: "11111111111111111111111111111111".to_owned(),
+                        to_address: "22222222222222222222222222222222".to_owned(),
+                        amount: "1".to_owned(),
+                        token_symbol: "ETH".to_owned(),
+                        timestamp: 1_786_665_600,
+                    },
+                )),
+            })),
+        };
+
+        assert!(matches!(
+            decode_binary(&message.encode_to_vec()),
+            Err(KytrixServiceError::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn global_shipping_chokepoint_delta_should_decode_the_area_and_every_part_of_the_update() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(
-                    proto_event::event::Event::StrategicMaritimeChokepointsTracking(
-                        global_shipping_chokepoint_delta(),
-                    ),
-                ),
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::GlobalShippingChokepointEvent(
+                    global_shipping_chokepoint_delta(),
+                )),
             })),
         };
 
@@ -1006,8 +1107,8 @@ mod tests {
         assert_eq!(update.sequence, 7);
         assert_eq!(update.base, 6);
         assert_eq!(
-            update.statics,
-            [GlobalShippingChokepointStatic {
+            update.ships,
+            [GlobalShippingChokepointShip {
                 mmsi: 636_000_001,
                 imo: 9_000_001,
                 call_sign: "C6AB1".into(),
@@ -1049,10 +1150,8 @@ mod tests {
             let mut delta = global_shipping_chokepoint_delta();
             delta.area = area;
             let message = ServerMessage {
-                message: Some(server_message::Message::Event(proto_event::Event {
-                    event: Some(
-                        proto_event::event::Event::StrategicMaritimeChokepointsTracking(delta),
-                    ),
+                message: Some(server_message::Message::Event(Event {
+                    event: Some(proto_event::Event::GlobalShippingChokepointEvent(delta)),
                 })),
             };
             assert!(matches!(
@@ -1070,28 +1169,24 @@ mod tests {
         missing_author_id.x_user_id.clear();
         let mut two_references = tweet("1", 1);
         let mut nested = tweet("2", 1);
-        nested.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Quote(
-            Box::new(tweet("3", 1)),
-        ));
-        two_references.reference = Some(
-            proto_types::x_account_monitoring_tweet::Reference::Repost(Box::new(nested)),
-        );
+        nested.reference = Some(proto_types::x_post::Reference::Quote(Box::new(tweet(
+            "3", 1,
+        ))));
+        two_references.reference = Some(proto_types::x_post::Reference::Repost(Box::new(nested)));
         assert!(decode_tweet(two_references.clone()).is_ok());
-        let proto_types::x_account_monitoring_tweet::Reference::Repost(nested) =
+        let proto_types::x_post::Reference::Repost(nested) =
             two_references.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        let proto_types::x_account_monitoring_tweet::Reference::Quote(leaf) =
-            nested.reference.as_mut().unwrap()
-        else {
+        let proto_types::x_post::Reference::Quote(leaf) = nested.reference.as_mut().unwrap() else {
             unreachable!()
         };
-        leaf.reference = Some(proto_types::x_account_monitoring_tweet::Reference::Quote(
-            Box::new(tweet("4", 1)),
-        ));
+        leaf.reference = Some(proto_types::x_post::Reference::Quote(Box::new(tweet(
+            "4", 1,
+        ))));
         invalid_id.timestamp = 1;
-        invalid_timestamp.tweet_id = "1".to_owned();
+        invalid_timestamp.post_id = "1".to_owned();
 
         for value in [
             invalid_id,
@@ -1126,17 +1221,17 @@ mod tests {
 
     #[test]
     fn server_envelope_should_decode_session_state() {
-        let catalog = feature_definition("news", proto_types::FeatureValueType::Bool);
+        let catalog = feature_definition("news", proto_types::EntitlementFeatureValueType::Bool);
         let message = ServerMessage {
             message: Some(server_message::Message::SessionState(
                 proto_response::SessionState {
                     entitlement_revision: 7,
-                    plan_code: proto_types::PlanCode::Plus as i32,
-                    entitlements: std::collections::HashMap::from([
+                    entitlement_plan_code: proto_types::EntitlementPlanCode::Plus as i32,
+                    entitlement_values: std::collections::HashMap::from([
                         ("news".to_owned(), enabled_entitlement(true)),
                         ("financial_indices".to_owned(), limit_entitlement(3)),
                     ]),
-                    catalog: vec![catalog.clone()],
+                    entitlement_features: vec![catalog.clone()],
                     next_change_at: Some(1_800_000_000),
                 },
             )),
@@ -1147,7 +1242,7 @@ mod tests {
             panic!("expected a session state");
         };
         assert_eq!(state.entitlement_revision, 7);
-        assert_eq!(state.plan_code, proto_types::PlanCode::Plus);
+        assert_eq!(state.plan_code, proto_types::EntitlementPlanCode::Plus);
         assert_eq!(
             state.entitlements,
             BTreeMap::from([
@@ -1165,9 +1260,9 @@ mod tests {
             message: Some(server_message::Message::SessionState(
                 proto_response::SessionState {
                     entitlement_revision: 7,
-                    plan_code: 99,
-                    entitlements: std::collections::HashMap::new(),
-                    catalog: Vec::new(),
+                    entitlement_plan_code: 99,
+                    entitlement_values: std::collections::HashMap::new(),
+                    entitlement_features: Vec::new(),
                     next_change_at: None,
                 },
             )),
@@ -1177,7 +1272,10 @@ mod tests {
         let IncomingMessage::SessionState(state) = decoded else {
             panic!("expected a session state");
         };
-        assert_eq!(state.plan_code, proto_types::PlanCode::Unspecified);
+        assert_eq!(
+            state.plan_code,
+            proto_types::EntitlementPlanCode::Unspecified
+        );
     }
 
     #[test]
@@ -1205,9 +1303,7 @@ mod tests {
     #[test]
     fn unknown_event_variant_should_be_ignored() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: None,
-            })),
+            message: Some(server_message::Message::Event(Event { event: None })),
         };
         let decoded = decode_binary(&message.encode_to_vec()).expect("unknown event should decode");
         assert!(matches!(decoded, IncomingMessage::Event(None)));
@@ -1224,8 +1320,8 @@ mod tests {
     #[test]
     fn index_event_should_decode_all_wire_prices() {
         let message = ServerMessage {
-            message: Some(server_message::Message::Event(proto_event::Event {
-                event: Some(proto_event::event::Event::FinancialIndex(
+            message: Some(server_message::Message::Event(Event {
+                event: Some(proto_event::Event::FinancialIndex(
                     proto_types::FinancialIndex {
                         code: "REMOTE_ONLY_INDEX".to_owned(),
                         last_price: 101,
@@ -1259,11 +1355,13 @@ mod tests {
     fn response_validation_should_reject_wrong_id_and_topic() {
         let response = proto_response::Response {
             id: 8,
-            response: Some(proto_response::response::Response::SetSubscriptions(
-                proto_response::SetSubscriptionsResponse {
-                    topics: vec![proto_topic::Topic::from(&ServiceTopic::News)],
-                },
-            )),
+            response: Some(
+                proto_response::response::Response::SetSubscriptionsResponse(
+                    proto_response::SetSubscriptionsResponse {
+                        topics: vec![Topic::from(&ServiceTopic::News)],
+                    },
+                ),
+            ),
         };
         assert!(matches!(
             validate_response(response.clone(), 7, &[ServiceTopic::News]),

@@ -102,7 +102,7 @@ const MARKER_LENGTH_FAR: f32 = 12.0;
 /// How wide a marker is against its length.
 const MARKER_WIDTH_RATIO: f32 = 0.7;
 
-/// The radius of the dot a vessel whose static part has not arrived is drawn as.
+/// The radius of the dot a vessel whose ship record has not arrived is drawn as.
 const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 
 /// How many segments the dot and the hover ring are drawn with.
@@ -252,7 +252,7 @@ struct MapColors {
     lane: Hsla,
     /// One colour per class in [`CLASSES`] order.
     ships: [Hsla; 4],
-    /// The dot a vessel without a static part is drawn as.
+    /// The dot a vessel without a ship record is drawn as.
     unknown: Hsla,
     /// The ring around the vessel under the pointer.
     hover: Hsla,
@@ -1355,7 +1355,7 @@ fn paint_map(
     paint_path(window, lane_path(projection, origin), colors.lane);
 
     let ships = ship_paths(vessels, projection, origin);
-    // The unknown dots go down first: a vessel whose static part has arrived is a report
+    // The unknown dots go down first: a vessel whose ship record has arrived is a report
     // that says more about it, and its marker should not be hidden under a neighbour's dot.
     paint_path(window, ships.unknown, colors.unknown);
     for (index, path) in ships.classes.into_iter().enumerate() {
@@ -1497,13 +1497,13 @@ fn push_dashes(
 struct ShipPaths {
     /// One path per class in [`CLASSES`] order.
     classes: [Path<Pixels>; 4],
-    /// The dots of the vessels a static part has not arrived for.
+    /// The dots of the vessels a ship record has not arrived for.
     unknown: Path<Pixels>,
 }
 
 /// Splits the painted vessels into the paths one frame draws.
 ///
-/// A vessel whose static part has not arrived is a grey dot rather than a coloured marker:
+/// A vessel whose ship record has not arrived is a grey dot rather than a coloured marker:
 /// the bucket is a fact about its type, and the report has not said one yet. Its position is
 /// still a position, so it is drawn — a map that hid it would be reporting fewer vessels
 /// than the service does.
@@ -1523,7 +1523,7 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
         if !projection.near_screen(position, length) {
             continue;
         }
-        if !vessel.has_static {
+        if !vessel.has_ship {
             push_disc(
                 &mut unknown,
                 position,
@@ -1663,7 +1663,7 @@ mod tests {
         engine::{ErrorCode, KytrixServiceError},
         global_shipping_chokepoint::{
             GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
-            GlobalShippingChokepointStatic, GlobalShippingChokepointUpdate,
+            GlobalShippingChokepointShip, GlobalShippingChokepointUpdate,
         },
     };
     use network::transport::error::TransportError;
@@ -1811,9 +1811,9 @@ mod tests {
         }
     }
 
-    /// One vessel's static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> GlobalShippingChokepointStatic {
-        GlobalShippingChokepointStatic {
+    /// One vessel's ship record, with every value a report can carry.
+    fn ships(mmsi: u32) -> GlobalShippingChokepointShip {
+        GlobalShippingChokepointShip {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -1844,7 +1844,7 @@ mod tests {
             keyframe: true,
             sequence,
             base: 0,
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions,
             removed: Vec::new(),
             timestamp: 1_700_000_000_000,
@@ -1858,7 +1858,7 @@ mod tests {
             keyframe: false,
             sequence,
             base,
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions: Vec::new(),
             removed: vec![mmsi],
             timestamp: 1_700_000_000_000,
@@ -2155,7 +2155,7 @@ mod tests {
 
         cx.update(|cx| {
             let mut frame = keyframe(7, 10, vec![position(1)]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
             // A delta that does not continue the applied sequence is a gap rather than a
             // push to apply.
@@ -2243,7 +2243,7 @@ mod tests {
 
         cx.update(|cx| {
             let mut frame = keyframe(7, 1, vec![position(1)]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
             assert!(report_failure(
                 &pane,
@@ -2341,7 +2341,7 @@ mod tests {
 
         cx.update(|cx| {
             let mut frame = keyframe(7, 1, vec![position(1)]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
             assert!(pane.read(cx).has_content());
 
@@ -2553,7 +2553,7 @@ mod tests {
         let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
         cx.update(|cx| {
             let mut frame = keyframe(7, 1, vec![position(1)]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
         });
         let window = map_window(cx, &pane);
@@ -2596,7 +2596,7 @@ mod tests {
         let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
         cx.update(|cx| {
             let mut frame = keyframe(7, 1, vec![position(1)]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
         });
         let window = map_window(cx, &pane);
@@ -2647,7 +2647,7 @@ mod tests {
             let mut low = position(1);
             low.latitude = 22_500_000;
             let mut frame = keyframe(7, 1, vec![low]);
-            frame.statics = vec![statics(1)];
+            frame.ships = vec![ships(1)];
             assert!(report_update(&pane, frame, cx));
         });
         let window = map_window(cx, &pane);
@@ -2791,7 +2791,7 @@ mod tests {
             position: model::project(56.3, 26.5),
             cog: 900,
             heading: 87,
-            has_static: true,
+            has_ship: true,
         };
         let at = projection.screen(vessel.position);
         hit_points.push((vessel.mmsi, at));
@@ -2847,7 +2847,7 @@ mod tests {
             position: model::project(56.0, 26.0),
             cog: 0,
             heading: 0,
-            has_static: true,
+            has_ship: true,
         };
         let ships = ship_paths(&[vessel], projection, origin);
         let tip = ships.classes[0].vertices[0].xy_position;

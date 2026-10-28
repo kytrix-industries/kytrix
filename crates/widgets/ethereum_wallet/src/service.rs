@@ -1,4 +1,4 @@
-//! The cryptocurrency_wallet_monitor protocol, its background service, and the seams a test drives it through.
+//! The Ethereum wallet protocol, its background service, and the seams a test drives it through.
 //!
 //! # One account, two things a pane does with it
 //!
@@ -27,7 +27,7 @@
 //!
 //! # Transfers are account data
 //!
-//! A transfer names two cryptocurrency_wallet_monitors and an amount, and which of them a cryptocurrency_wallet_monitor is watching is
+//! A transfer names two Ethereum wallets and an amount, and which of them an Ethereum wallet is watching is
 //! the account's business. A transfer that was already on the wire when the credentials
 //! behind the subscription changed therefore belongs to an account the pane is no longer
 //! reading as, and is dropped rather than shown: the subscription's own status is what
@@ -37,11 +37,11 @@ use std::future::Future;
 
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
-    cryptocurrency_wallet_monitor::{
-        CryptocurrencyWalletMonitorApiError, CryptocurrencyWalletMonitorMutationOutcome,
-        CryptocurrencyWalletMonitorSelection, CryptocurrencyWalletMonitorSelectionsResponse,
+    engine::{EthereumWalletTransfer, KytrixAccountSession, KytrixServiceError},
+    ethereum_wallet::{
+        EthereumWalletApiError, EthereumWalletMutationOutcome, EthereumWalletSelection,
+        EthereumWalletSelectionsResponse,
     },
-    engine::{CryptocurrencyWalletMonitorTransfer, KytrixAccountSession, KytrixServiceError},
 };
 use network::transport::{
     error::TransportError,
@@ -60,30 +60,30 @@ use super::model::{SelectionData, TransferSnapshot, TransferState};
 
 /// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitorRequest {
+pub(super) enum EthereumWalletRequest {
     /// Follows an account's transfers, keeping the stream that already follows it.
-    Load(CryptocurrencyWalletMonitorScope),
+    Load(EthereumWalletScope),
     /// Reopens an account's stream, for one whose stream has failed.
-    Retry(CryptocurrencyWalletMonitorScope),
+    Retry(EthereumWalletScope),
     /// Follows nothing, because nobody is signed in.
     Stop,
     /// Reads the addresses the account monitors.
-    FetchSelections(CryptocurrencyWalletMonitorScope),
+    FetchSelections(EthereumWalletScope),
     /// Monitors one more address.
     AddSelection {
-        scope: CryptocurrencyWalletMonitorScope,
+        scope: EthereumWalletScope,
         address: SmolStr,
     },
     /// Stops monitoring one address.
     DeleteSelection {
-        scope: CryptocurrencyWalletMonitorScope,
+        scope: EthereumWalletScope,
         address: SmolStr,
     },
 }
 
 /// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitorResponse {
+pub(super) enum EthereumWalletResponse {
     /// The account's stream is running.
     StreamStarted,
     /// Nothing is followed.
@@ -91,9 +91,9 @@ pub(super) enum CryptocurrencyWalletMonitorResponse {
     /// The addresses the account monitors.
     Selections(SelectionData),
     /// What became of an address the pane asked to monitor.
-    Added(CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection>),
+    Added(EthereumWalletMutationOutcome<EthereumWalletSelection>),
     /// What became of an address the pane asked to stop monitoring.
-    Deleted(CryptocurrencyWalletMonitorMutationOutcome<()>),
+    Deleted(EthereumWalletMutationOutcome<()>),
 }
 
 /// The account whose transfers a stream carries.
@@ -102,11 +102,11 @@ pub(super) enum CryptocurrencyWalletMonitorResponse {
 /// account can change while a dialog is still open, and an answer about the account the
 /// pane has left is not one the pane may act on.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct CryptocurrencyWalletMonitorScope {
+pub(super) struct EthereumWalletScope {
     account_id: SmolStr,
 }
 
-impl CryptocurrencyWalletMonitorScope {
+impl EthereumWalletScope {
     /// The scope an account follows, or `None` when nobody is signed in.
     pub(super) fn new(account_id: Option<&SmolStr>) -> Option<Self> {
         let account_id = account_id.filter(|account_id| !account_id.is_empty())?;
@@ -122,24 +122,24 @@ impl CryptocurrencyWalletMonitorScope {
 
 /// What a subscription the pane holds is doing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitorStatus {
+pub(super) enum EthereumWalletStatus {
     /// The subscription is being established.
     Connecting,
     /// The subscription is live.
     Ready,
     /// The subscription ended; the pane is finished until the user recovers it.
-    Failed(CryptocurrencyWalletMonitorStreamError),
+    Failed(EthereumWalletStreamError),
 }
 
 /// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CryptocurrencyWalletMonitorStreamError {
+pub(super) enum EthereumWalletStreamError {
     /// The account's session could not be taken, or the subscription was refused.
     Service(KytrixServiceError),
     Transport(TransportError),
 }
 
-impl LocalizedError for CryptocurrencyWalletMonitorStreamError {
+impl LocalizedError for EthereumWalletStreamError {
     fn localized_message(&self, cx: &gpui_kit::App) -> gpui_kit::SharedString {
         match self {
             Self::Service(error) => error.localized_message(cx),
@@ -150,28 +150,28 @@ impl LocalizedError for CryptocurrencyWalletMonitorStreamError {
 
 /// One message of an account's stream.
 #[derive(Clone, Debug)]
-pub(super) enum CryptocurrencyWalletMonitorStreamMessage {
-    Status(CryptocurrencyWalletMonitorStatus),
+pub(super) enum EthereumWalletStreamMessage {
+    Status(EthereumWalletStatus),
     /// Every transfer the subscription retains, newest first.
     Snapshot(TransferSnapshot),
 }
 
-pub(super) struct CryptocurrencyWalletMonitorProtocol;
+pub(super) struct EthereumWalletProtocol;
 
-impl WidgetProtocol for CryptocurrencyWalletMonitorProtocol {
-    type Request = CryptocurrencyWalletMonitorRequest;
-    type Response = CryptocurrencyWalletMonitorResponse;
-    type StreamKey = CryptocurrencyWalletMonitorScope;
-    type StreamMessage = CryptocurrencyWalletMonitorStreamMessage;
-    type Error = CryptocurrencyWalletMonitorApiError;
+impl WidgetProtocol for EthereumWalletProtocol {
+    type Request = EthereumWalletRequest;
+    type Response = EthereumWalletResponse;
+    type StreamKey = EthereumWalletScope;
+    type StreamMessage = EthereumWalletStreamMessage;
+    type Error = EthereumWalletApiError;
 }
 
-/// The cryptocurrency_wallet_monitor an account reads through.
+/// The Ethereum wallet an account reads through.
 ///
 /// The service is written against this seam rather than against the connector, so a test
 /// can drive every state a session and a subscription can be in without one.
-pub(super) trait CryptocurrencyWalletMonitorSource: Clone + Send + Sync + 'static {
-    type Session: CryptocurrencyWalletMonitorSession;
+pub(super) trait EthereumWalletSource: Clone + Send + Sync + 'static {
+    type Session: EthereumWalletSession;
 
     /// Takes the account's session, which answers both the stream and every request the
     /// pane makes about the addresses it monitors.
@@ -182,49 +182,42 @@ pub(super) trait CryptocurrencyWalletMonitorSource: Clone + Send + Sync + 'stati
 }
 
 /// One account's session.
-pub(super) trait CryptocurrencyWalletMonitorSession: Clone + Send + Sync + 'static {
-    type Subscription: CryptocurrencyWalletMonitorEventSubscription;
+pub(super) trait EthereumWalletSession: Clone + Send + Sync + 'static {
+    type Subscription: EthereumWalletEventSubscription;
 
     /// The account this session is for, which is what a stream keyed by another one is
     /// checked against.
     fn account_id(&self) -> &str;
 
-    fn subscribe_cryptocurrency_wallet_monitor(
+    fn subscribe_ethereum_wallet(
         &self,
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 
     fn fetch_selections(
         &self,
-    ) -> impl Future<
-        Output = Result<
-            CryptocurrencyWalletMonitorSelectionsResponse,
-            CryptocurrencyWalletMonitorApiError,
-        >,
-    > + Send;
+    ) -> impl Future<Output = Result<EthereumWalletSelectionsResponse, EthereumWalletApiError>> + Send;
 
     fn add_selection(
         &self,
         address: &str,
-    ) -> impl Future<
-        Output = CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection>,
-    > + Send;
+    ) -> impl Future<Output = EthereumWalletMutationOutcome<EthereumWalletSelection>> + Send;
 
     fn delete_selection(
         &self,
         address: &str,
-    ) -> impl Future<Output = CryptocurrencyWalletMonitorMutationOutcome<()>> + Send;
+    ) -> impl Future<Output = EthereumWalletMutationOutcome<()>> + Send;
 }
 
 /// One live transfer subscription.
-pub(super) trait CryptocurrencyWalletMonitorEventSubscription: Send + 'static {
+pub(super) trait EthereumWalletEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
     fn recv(
         &mut self,
-    ) -> impl Future<Output = Result<CryptocurrencyWalletMonitorTransfer, TransportError>> + Send;
+    ) -> impl Future<Output = Result<EthereumWalletTransfer, TransportError>> + Send;
 }
 
-impl CryptocurrencyWalletMonitorSource for KytrixServiceConnector {
+impl EthereumWalletSource for KytrixServiceConnector {
     type Session = KytrixAccountSession;
 
     async fn acquire_session(&self, account_id: &str) -> Result<Self::Session, KytrixServiceError> {
@@ -232,59 +225,51 @@ impl CryptocurrencyWalletMonitorSource for KytrixServiceConnector {
     }
 }
 
-impl CryptocurrencyWalletMonitorSession for KytrixAccountSession {
-    type Subscription = Subscription<CryptocurrencyWalletMonitorTransfer>;
+impl EthereumWalletSession for KytrixAccountSession {
+    type Subscription = Subscription<EthereumWalletTransfer>;
 
     fn account_id(&self) -> &str {
         self.profile().account_id()
     }
 
-    async fn subscribe_cryptocurrency_wallet_monitor(
-        &self,
-    ) -> Result<Self::Subscription, KytrixServiceError> {
-        KytrixAccountSession::subscribe_cryptocurrency_wallet_monitor(self).await
+    async fn subscribe_ethereum_wallet(&self) -> Result<Self::Subscription, KytrixServiceError> {
+        KytrixAccountSession::subscribe_ethereum_wallet(self).await
     }
 
     async fn fetch_selections(
         &self,
-    ) -> Result<CryptocurrencyWalletMonitorSelectionsResponse, CryptocurrencyWalletMonitorApiError>
-    {
-        KytrixAccountSession::fetch_cryptocurrency_wallet_monitor_selections(self).await
+    ) -> Result<EthereumWalletSelectionsResponse, EthereumWalletApiError> {
+        KytrixAccountSession::fetch_ethereum_wallet_selections(self).await
     }
 
     async fn add_selection(
         &self,
         address: &str,
-    ) -> CryptocurrencyWalletMonitorMutationOutcome<CryptocurrencyWalletMonitorSelection> {
-        KytrixAccountSession::add_cryptocurrency_wallet_monitor_selection(self, address).await
+    ) -> EthereumWalletMutationOutcome<EthereumWalletSelection> {
+        KytrixAccountSession::add_ethereum_wallet_selection(self, address).await
     }
 
-    async fn delete_selection(
-        &self,
-        address: &str,
-    ) -> CryptocurrencyWalletMonitorMutationOutcome<()> {
-        KytrixAccountSession::delete_cryptocurrency_wallet_monitor_selection(self, address).await
+    async fn delete_selection(&self, address: &str) -> EthereumWalletMutationOutcome<()> {
+        KytrixAccountSession::delete_ethereum_wallet_selection(self, address).await
     }
 }
 
-impl CryptocurrencyWalletMonitorEventSubscription
-    for Subscription<CryptocurrencyWalletMonitorTransfer>
-{
+impl EthereumWalletEventSubscription for Subscription<EthereumWalletTransfer> {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus> {
         Subscription::observe_status(self)
     }
 
-    async fn recv(&mut self) -> Result<CryptocurrencyWalletMonitorTransfer, TransportError> {
+    async fn recv(&mut self) -> Result<EthereumWalletTransfer, TransportError> {
         Subscription::recv(self).await
     }
 }
 
-/// The service that follows one pane's cryptocurrency_wallet_monitor.
-pub(super) struct CryptocurrencyWalletMonitorService<S = KytrixServiceConnector> {
+/// The service that follows one pane's Ethereum wallet.
+pub(super) struct EthereumWalletService<S = KytrixServiceConnector> {
     source: S,
 }
 
-impl<S> CryptocurrencyWalletMonitorService<S> {
+impl<S> EthereumWalletService<S> {
     pub(super) const fn new(source: S) -> Self {
         Self { source }
     }
@@ -292,35 +277,34 @@ impl<S> CryptocurrencyWalletMonitorService<S> {
 
 /// The session the account a stream belongs to is answered with.
 struct ActiveSession<S> {
-    scope: CryptocurrencyWalletMonitorScope,
+    scope: EthereumWalletScope,
     session: S,
 }
 
-impl<S> WidgetService<CryptocurrencyWalletMonitorProtocol> for CryptocurrencyWalletMonitorService<S>
+impl<S> WidgetService<EthereumWalletProtocol> for EthereumWalletService<S>
 where
-    S: CryptocurrencyWalletMonitorSource,
+    S: EthereumWalletSource,
 {
-    async fn run(self, mut context: ServiceContext<CryptocurrencyWalletMonitorProtocol>) {
+    async fn run(self, mut context: ServiceContext<EthereumWalletProtocol>) {
         let mut active: Option<ActiveSession<S::Session>> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (mut reply, request) = request.into_parts();
             match request {
-                CryptocurrencyWalletMonitorRequest::Stop => {
+                EthereumWalletRequest::Stop => {
                     if let Some(active) = active.take() {
                         context.cancel_stream(&active.scope);
                     }
-                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Stopped));
+                    let _ = reply.respond(Ok(EthereumWalletResponse::Stopped));
                 }
-                request @ (CryptocurrencyWalletMonitorRequest::Load(_)
-                | CryptocurrencyWalletMonitorRequest::Retry(_)) => {
+                request @ (EthereumWalletRequest::Load(_) | EthereumWalletRequest::Retry(_)) => {
                     let (scope, retry) = match request {
-                        CryptocurrencyWalletMonitorRequest::Load(scope) => (scope, false),
-                        CryptocurrencyWalletMonitorRequest::Retry(scope) => (scope, true),
-                        CryptocurrencyWalletMonitorRequest::Stop
-                        | CryptocurrencyWalletMonitorRequest::FetchSelections(_)
-                        | CryptocurrencyWalletMonitorRequest::AddSelection { .. }
-                        | CryptocurrencyWalletMonitorRequest::DeleteSelection { .. } => continue,
+                        EthereumWalletRequest::Load(scope) => (scope, false),
+                        EthereumWalletRequest::Retry(scope) => (scope, true),
+                        EthereumWalletRequest::Stop
+                        | EthereumWalletRequest::FetchSelections(_)
+                        | EthereumWalletRequest::AddSelection { .. }
+                        | EthereumWalletRequest::DeleteSelection { .. } => continue,
                     };
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
@@ -335,8 +319,7 @@ where
                         && active.as_ref().is_some_and(|active| active.scope == scope)
                         && context.stream_generation(&scope).is_some()
                     {
-                        let _ =
-                            reply.respond(Ok(CryptocurrencyWalletMonitorResponse::StreamStarted));
+                        let _ = reply.respond(Ok(EthereumWalletResponse::StreamStarted));
                         continue;
                     }
 
@@ -358,8 +341,7 @@ where
                     // streamed: a transfer is not data a pane may show under a name it
                     // does not belong to.
                     if session.account_id() != scope.account_id() {
-                        let _ =
-                            reply.respond(Err(CryptocurrencyWalletMonitorApiError::AccountChanged));
+                        let _ = reply.respond(Err(EthereumWalletApiError::AccountChanged));
                         continue;
                     }
 
@@ -375,7 +357,7 @@ where
                         session,
                     });
                     if reply
-                        .respond(Ok(CryptocurrencyWalletMonitorResponse::StreamStarted))
+                        .respond(Ok(EthereumWalletResponse::StreamStarted))
                         .is_err()
                     {
                         // Nobody is waiting for this stream any more, so it is nobody's
@@ -385,7 +367,7 @@ where
                         active = None;
                     }
                 }
-                CryptocurrencyWalletMonitorRequest::FetchSelections(scope) => {
+                EthereumWalletRequest::FetchSelections(scope) => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -406,11 +388,11 @@ where
                             }
                         },
                     };
-                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Selections(
+                    let _ = reply.respond(Ok(EthereumWalletResponse::Selections(
                         SelectionData::new(response),
                     )));
                 }
-                CryptocurrencyWalletMonitorRequest::AddSelection { scope, address } => {
+                EthereumWalletRequest::AddSelection { scope, address } => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -429,9 +411,9 @@ where
                         () = reply.cancelled() => continue,
                         outcome = &mut add => outcome,
                     };
-                    let _ = reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Added(outcome)));
+                    let _ = reply.respond(Ok(EthereumWalletResponse::Added(outcome)));
                 }
-                CryptocurrencyWalletMonitorRequest::DeleteSelection { scope, address } => {
+                EthereumWalletRequest::DeleteSelection { scope, address } => {
                     let session = match matching_session(&active, &scope) {
                         Ok(session) => session,
                         Err(error) => {
@@ -446,8 +428,7 @@ where
                         () = reply.cancelled() => continue,
                         outcome = &mut delete => outcome,
                     };
-                    let _ =
-                        reply.respond(Ok(CryptocurrencyWalletMonitorResponse::Deleted(outcome)));
+                    let _ = reply.respond(Ok(EthereumWalletResponse::Deleted(outcome)));
                 }
             }
         }
@@ -462,13 +443,13 @@ where
 /// under it.
 fn matching_session<'a, S>(
     active: &'a Option<ActiveSession<S>>,
-    scope: &CryptocurrencyWalletMonitorScope,
-) -> Result<&'a S, CryptocurrencyWalletMonitorApiError> {
+    scope: &EthereumWalletScope,
+) -> Result<&'a S, EthereumWalletApiError> {
     let Some(active) = active.as_ref() else {
-        return Err(CryptocurrencyWalletMonitorApiError::NotReady);
+        return Err(EthereumWalletApiError::NotReady);
     };
     if &active.scope != scope {
-        return Err(CryptocurrencyWalletMonitorApiError::AccountChanged);
+        return Err(EthereumWalletApiError::AccountChanged);
     }
     Ok(&active.session)
 }
@@ -478,25 +459,23 @@ fn matching_session<'a, S>(
 /// The four that name a condition of their own are named as themselves: an expired login,
 /// a changed account, a timeout and a closed service all read differently to a user than
 /// a service error does.
-fn session_failure(error: KytrixServiceError) -> CryptocurrencyWalletMonitorApiError {
+fn session_failure(error: KytrixServiceError) -> EthereumWalletApiError {
     match error {
-        KytrixServiceError::Authentication(_) => {
-            CryptocurrencyWalletMonitorApiError::Authentication
-        }
-        KytrixServiceError::AccountChanged => CryptocurrencyWalletMonitorApiError::AccountChanged,
-        KytrixServiceError::Timeout => CryptocurrencyWalletMonitorApiError::Timeout,
-        KytrixServiceError::Closed => CryptocurrencyWalletMonitorApiError::Closed,
-        error => CryptocurrencyWalletMonitorApiError::Service(error),
+        KytrixServiceError::Authentication(_) => EthereumWalletApiError::Authentication,
+        KytrixServiceError::AccountChanged => EthereumWalletApiError::AccountChanged,
+        KytrixServiceError::Timeout => EthereumWalletApiError::Timeout,
+        KytrixServiceError::Closed => EthereumWalletApiError::Closed,
+        error => EthereumWalletApiError::Service(error),
     }
 }
 
 /// Runs the account's subscription.
-async fn run_stream<S>(session: S, publisher: StreamPublisher<CryptocurrencyWalletMonitorProtocol>)
+async fn run_stream<S>(session: S, publisher: StreamPublisher<EthereumWalletProtocol>)
 where
-    S: CryptocurrencyWalletMonitorSession,
+    S: EthereumWalletSession,
 {
-    let mut published = CryptocurrencyWalletMonitorStatus::Connecting;
-    if publish_status(&publisher, CryptocurrencyWalletMonitorStatus::Connecting)
+    let mut published = EthereumWalletStatus::Connecting;
+    if publish_status(&publisher, EthereumWalletStatus::Connecting)
         .await
         .is_err()
     {
@@ -506,16 +485,12 @@ where
     let subscription = tokio::select! {
         biased;
         () = publisher.cancelled() => return,
-        result = session.subscribe_cryptocurrency_wallet_monitor() => result,
+        result = session.subscribe_ethereum_wallet() => result,
     };
     let mut subscription = match subscription {
         Ok(subscription) => subscription,
         Err(error) => {
-            publish_failure(
-                &publisher,
-                CryptocurrencyWalletMonitorStreamError::Service(error),
-            )
-            .await;
+            publish_failure(&publisher, EthereumWalletStreamError::Service(error)).await;
             return;
         }
     };
@@ -578,7 +553,7 @@ where
                 let transfer = match event {
                     Ok(transfer) => transfer,
                     Err(error) => {
-                        publish_failure(&publisher, CryptocurrencyWalletMonitorStreamError::Transport(error)).await;
+                        publish_failure(&publisher, EthereumWalletStreamError::Transport(error)).await;
                         return;
                     }
                 };
@@ -586,7 +561,7 @@ where
                     continue;
                 }
                 if publisher
-                    .publish_latest(CryptocurrencyWalletMonitorStreamMessage::Snapshot(state.snapshot()))
+                    .publish_latest(EthereumWalletStreamMessage::Snapshot(state.snapshot()))
                     .is_err()
                 {
                     return;
@@ -602,11 +577,11 @@ where
 /// Returns whether the stream may keep running: a status that ended it has already
 /// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
+    publisher: &StreamPublisher<EthereumWalletProtocol>,
     status: &SubscriptionStatus,
     state: &TransferState,
     feed_published: &mut bool,
-    published: &mut CryptocurrencyWalletMonitorStatus,
+    published: &mut EthereumWalletStatus,
 ) -> bool {
     if let Some(error) = ended_subscription(status) {
         publish_failure(publisher, error).await;
@@ -617,35 +592,27 @@ async fn apply_subscription_status(
         // A closing subscription is on its way to a terminal status of its own, and that
         // is where the failure is reported from.
         SubscriptionStatus::Closing => true,
-        SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => publish_change(
-            publisher,
-            CryptocurrencyWalletMonitorStatus::Connecting,
-            published,
-        )
-        .await
-        .is_ok(),
+        SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => {
+            publish_change(publisher, EthereumWalletStatus::Connecting, published)
+                .await
+                .is_ok()
+        }
         SubscriptionStatus::Active => {
             // The transfers are published with the readiness they come with, once: a pane
             // that becomes ready holds what the subscription holds, and a reconnect does
             // not make the transfers the pane already has new again.
             if !*feed_published {
                 if publisher
-                    .publish_latest(CryptocurrencyWalletMonitorStreamMessage::Snapshot(
-                        state.snapshot(),
-                    ))
+                    .publish_latest(EthereumWalletStreamMessage::Snapshot(state.snapshot()))
                     .is_err()
                 {
                     return false;
                 }
                 *feed_published = true;
             }
-            publish_change(
-                publisher,
-                CryptocurrencyWalletMonitorStatus::Ready,
-                published,
-            )
-            .await
-            .is_ok()
+            publish_change(publisher, EthereumWalletStatus::Ready, published)
+                .await
+                .is_ok()
         }
         // Handled above, where the failure they carry is published.
         SubscriptionStatus::Closed | SubscriptionStatus::Failed(_) => false,
@@ -653,16 +620,14 @@ async fn apply_subscription_status(
 }
 
 /// Why a subscription is no longer one a transfer may be read from.
-fn ended_subscription(
-    status: &SubscriptionStatus,
-) -> Option<CryptocurrencyWalletMonitorStreamError> {
+fn ended_subscription(status: &SubscriptionStatus) -> Option<EthereumWalletStreamError> {
     match status {
-        SubscriptionStatus::Closed => Some(CryptocurrencyWalletMonitorStreamError::Transport(
-            TransportError::Closed,
-        )),
-        SubscriptionStatus::Failed(error) => Some(
-            CryptocurrencyWalletMonitorStreamError::Transport(error.clone()),
-        ),
+        SubscriptionStatus::Closed => {
+            Some(EthereumWalletStreamError::Transport(TransportError::Closed))
+        }
+        SubscriptionStatus::Failed(error) => {
+            Some(EthereumWalletStreamError::Transport(error.clone()))
+        }
         SubscriptionStatus::Connecting
         | SubscriptionStatus::Active
         | SubscriptionStatus::Reconnecting
@@ -672,19 +637,19 @@ fn ended_subscription(
 
 /// Publishes a status the pane has not been told yet.
 async fn publish_status(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
-    status: CryptocurrencyWalletMonitorStatus,
+    publisher: &StreamPublisher<EthereumWalletProtocol>,
+    status: EthereumWalletStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(CryptocurrencyWalletMonitorStreamMessage::Status(status))
+        .publish_reliable(EthereumWalletStreamMessage::Status(status))
         .await
 }
 
 /// Publishes a status change, if it is one.
 async fn publish_change(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
-    status: CryptocurrencyWalletMonitorStatus,
-    published: &mut CryptocurrencyWalletMonitorStatus,
+    publisher: &StreamPublisher<EthereumWalletProtocol>,
+    status: EthereumWalletStatus,
+    published: &mut EthereumWalletStatus,
 ) -> Result<(), StreamPublishError> {
     if *published == status {
         return Ok(());
@@ -701,10 +666,10 @@ async fn publish_change(
 /// the account as taken — and so the addresses the account monitors can still be read
 /// and changed, which is the other half of what the session was taken for.
 async fn publish_failure(
-    publisher: &StreamPublisher<CryptocurrencyWalletMonitorProtocol>,
-    error: CryptocurrencyWalletMonitorStreamError,
+    publisher: &StreamPublisher<EthereumWalletProtocol>,
+    error: EthereumWalletStreamError,
 ) {
-    let _ = publish_status(publisher, CryptocurrencyWalletMonitorStatus::Failed(error)).await;
+    let _ = publish_status(publisher, EthereumWalletStatus::Failed(error)).await;
     publisher.cancelled().await;
 }
 
@@ -727,7 +692,7 @@ mod tests {
     }
     use std::{sync::atomic::Ordering, time::Duration};
 
-    use kytrix_service_provider::service::cryptocurrency_wallet_monitor::CryptocurrencyWalletMonitorMutationUnknown;
+    use kytrix_service_provider::service::ethereum_wallet::EthereumWalletMutationUnknown;
     use widget::{
         rpc::RpcCallError,
         runtime::WidgetRuntime,
@@ -737,64 +702,55 @@ mod tests {
     use super::*;
     use crate::test_support::{ACCOUNT, FakeSource, selection, selections, transfer};
 
-    fn account(name: &'static str) -> CryptocurrencyWalletMonitorScope {
-        CryptocurrencyWalletMonitorScope::new(Some(&SmolStr::new_static(name)))
+    fn account(name: &'static str) -> EthereumWalletScope {
+        EthereumWalletScope::new(Some(&SmolStr::new_static(name)))
             .expect("an account should be a scope")
     }
 
-    fn scope() -> CryptocurrencyWalletMonitorScope {
+    fn scope() -> EthereumWalletScope {
         account(ACCOUNT)
     }
 
-    fn runtime(source: &FakeSource) -> WidgetRuntime<CryptocurrencyWalletMonitorProtocol> {
+    fn runtime(source: &FakeSource) -> WidgetRuntime<EthereumWalletProtocol> {
         WidgetRuntime::spawn(
             current_test_handle(),
-            CryptocurrencyWalletMonitorService::new(source.clone()),
+            EthereumWalletService::new(source.clone()),
         )
     }
 
-    async fn load(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
-        scope: CryptocurrencyWalletMonitorScope,
-    ) {
+    async fn load(runtime: &WidgetRuntime<EthereumWalletProtocol>, scope: EthereumWalletScope) {
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::Load(scope))
+            .call(EthereumWalletRequest::Load(scope))
             .await
             .expect("the stream should start")
             .into_value();
-        assert_eq!(response, CryptocurrencyWalletMonitorResponse::StreamStarted);
+        assert_eq!(response, EthereumWalletResponse::StreamStarted);
     }
 
-    async fn retry(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
-        scope: CryptocurrencyWalletMonitorScope,
-    ) {
+    async fn retry(runtime: &WidgetRuntime<EthereumWalletProtocol>, scope: EthereumWalletScope) {
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::Retry(scope))
+            .call(EthereumWalletRequest::Retry(scope))
             .await
             .expect("the stream should start again")
             .into_value();
-        assert_eq!(response, CryptocurrencyWalletMonitorResponse::StreamStarted);
+        assert_eq!(response, EthereumWalletResponse::StreamStarted);
     }
 
     async fn fetch(
-        runtime: &WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
-        scope: CryptocurrencyWalletMonitorScope,
-    ) -> Result<
-        CryptocurrencyWalletMonitorResponse,
-        RpcCallError<CryptocurrencyWalletMonitorApiError>,
-    > {
+        runtime: &WidgetRuntime<EthereumWalletProtocol>,
+        scope: EthereumWalletScope,
+    ) -> Result<EthereumWalletResponse, RpcCallError<EthereumWalletApiError>> {
         runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::FetchSelections(scope))
+            .call(EthereumWalletRequest::FetchSelections(scope))
             .await
             .map(widget::rpc::RpcResponse::into_value)
     }
 
-    fn addresses(response: &CryptocurrencyWalletMonitorResponse) -> Vec<&str> {
-        let CryptocurrencyWalletMonitorResponse::Selections(data) = response else {
+    fn addresses(response: &EthereumWalletResponse) -> Vec<&str> {
+        let EthereumWalletResponse::Selections(data) = response else {
             panic!("the answer should be the addresses");
         };
         data.selections()
@@ -804,9 +760,9 @@ mod tests {
     }
 
     async fn next_reliable(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
-        predicate: impl Fn(&CryptocurrencyWalletMonitorStreamMessage) -> bool,
-    ) -> CryptocurrencyWalletMonitorStreamMessage {
+        reliable: &mut ReliableStream<EthereumWalletProtocol>,
+        predicate: impl Fn(&EthereumWalletStreamMessage) -> bool,
+    ) -> EthereumWalletStreamMessage {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let envelope = reliable
@@ -823,35 +779,28 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
-        expected: CryptocurrencyWalletMonitorStatus,
+        reliable: &mut ReliableStream<EthereumWalletProtocol>,
+        expected: EthereumWalletStatus,
     ) {
         let status = next_reliable(
             reliable,
-            |message| matches!(message, CryptocurrencyWalletMonitorStreamMessage::Status(status) if *status == expected),
+            |message| matches!(message, EthereumWalletStreamMessage::Status(status) if *status == expected),
         )
         .await;
-        assert!(matches!(
-            status,
-            CryptocurrencyWalletMonitorStreamMessage::Status(_)
-        ));
+        assert!(matches!(status, EthereumWalletStreamMessage::Status(_)));
     }
 
     async fn receive_failure(
-        reliable: &mut ReliableStream<CryptocurrencyWalletMonitorProtocol>,
-    ) -> CryptocurrencyWalletMonitorStreamError {
+        reliable: &mut ReliableStream<EthereumWalletProtocol>,
+    ) -> EthereumWalletStreamError {
         let failure = next_reliable(reliable, |message| {
             matches!(
                 message,
-                CryptocurrencyWalletMonitorStreamMessage::Status(
-                    CryptocurrencyWalletMonitorStatus::Failed(_)
-                )
+                EthereumWalletStreamMessage::Status(EthereumWalletStatus::Failed(_))
             )
         })
         .await;
-        let CryptocurrencyWalletMonitorStreamMessage::Status(
-            CryptocurrencyWalletMonitorStatus::Failed(error),
-        ) = failure
+        let EthereumWalletStreamMessage::Status(EthereumWalletStatus::Failed(error)) = failure
         else {
             panic!("the stream should have reported a failure");
         };
@@ -859,7 +808,7 @@ mod tests {
     }
 
     async fn next_feed(
-        latest: &mut LatestStream<CryptocurrencyWalletMonitorProtocol>,
+        latest: &mut LatestStream<EthereumWalletProtocol>,
         predicate: impl Fn(&TransferSnapshot) -> bool,
     ) -> TransferSnapshot {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -869,7 +818,7 @@ mod tests {
                     .await
                     .expect("the latest stream should stay open");
                 while let Some(envelope) = latest.next_unseen() {
-                    if let CryptocurrencyWalletMonitorStreamMessage::Snapshot(snapshot) =
+                    if let EthereumWalletStreamMessage::Snapshot(snapshot) =
                         envelope.message().as_ref()
                         && predicate(snapshot)
                     {
@@ -894,9 +843,9 @@ mod tests {
     async fn live(
         source: &FakeSource,
     ) -> (
-        WidgetRuntime<CryptocurrencyWalletMonitorProtocol>,
-        ReliableStream<CryptocurrencyWalletMonitorProtocol>,
-        LatestStream<CryptocurrencyWalletMonitorProtocol>,
+        WidgetRuntime<EthereumWalletProtocol>,
+        ReliableStream<EthereumWalletProtocol>,
+        LatestStream<EthereumWalletProtocol>,
     ) {
         let mut runtime = runtime(source);
         let reliable = runtime
@@ -914,15 +863,14 @@ mod tests {
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
 
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
         // Readiness describes the transfers that came with it, not a feed still on its
         // way: by the time the pane is told the subscription is live, the feed is on the
         // stream.
         let live = latest
             .next_unseen()
             .expect("a live feed is published with the readiness it comes with");
-        let CryptocurrencyWalletMonitorStreamMessage::Snapshot(live) = live.message().as_ref()
-        else {
+        let EthereumWalletStreamMessage::Snapshot(live) = live.message().as_ref() else {
             panic!("the latest stream should hold the feed");
         };
         assert!(
@@ -952,7 +900,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         control
             .events
@@ -981,7 +929,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, _) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         control.status.send_replace(SubscriptionStatus::Active);
 
@@ -1004,14 +952,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
+            .call(EthereumWalletRequest::Load(scope()))
             .await
             .expect_err("an account whose credentials are gone cannot be streamed");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitorApiError::Authentication,
+                source: EthereumWalletApiError::Authentication,
                 ..
             }
         ));
@@ -1027,7 +975,7 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitorStreamError::Service(KytrixServiceError::Closed)
+            EthereumWalletStreamError::Service(KytrixServiceError::Closed)
         );
         assert!(
             latest.next_unseen().is_none(),
@@ -1046,13 +994,13 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitorStreamError::Transport(TransportError::Closed)
+            EthereumWalletStreamError::Transport(TransportError::Closed)
         );
         assert!(latest.next_unseen().is_none());
         runtime.shutdown().await;
     }
 
-    /// A cryptocurrency_wallet_monitor transfer names the cryptocurrency_wallet_monitors an account is watching, so one that was already
+    /// An Ethereum wallet transfer names the Ethereum wallets an account is watching, so one that was already
     /// on the wire when the credentials behind the subscription changed is not data the
     /// pane may be shown: the subscription's own status is checked before it is converted.
     #[tokio::test]
@@ -1061,7 +1009,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
         // The empty feed a live subscription publishes is read before the stale transfer
         // is sent, so what is left on the latest stream is only what came after it.
         let _ = next_feed(&mut latest, |snapshot| snapshot.items().is_empty()).await;
@@ -1077,7 +1025,7 @@ mod tests {
 
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitorStreamError::Transport(TransportError::CredentialChanged)
+            EthereumWalletStreamError::Transport(TransportError::CredentialChanged)
         );
         assert!(
             latest.next_unseen().is_none(),
@@ -1092,16 +1040,16 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, _) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         for _ in 0..2 {
             let response = runtime
                 .client()
-                .call(CryptocurrencyWalletMonitorRequest::Stop)
+                .call(EthereumWalletRequest::Stop)
                 .await
                 .expect("stopping should be answered")
                 .into_value();
-            assert_eq!(response, CryptocurrencyWalletMonitorResponse::Stopped);
+            assert_eq!(response, EthereumWalletResponse::Stopped);
         }
 
         assert_eq!(
@@ -1125,9 +1073,9 @@ mod tests {
             .expect("the reliable stream should be available");
 
         load(&runtime, account("first")).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
         load(&runtime, account("second")).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         assert_eq!(source.sessions(), 2);
         assert_eq!(
@@ -1175,11 +1123,11 @@ mod tests {
         load(&runtime, scope()).await;
         assert_eq!(
             receive_failure(&mut reliable).await,
-            CryptocurrencyWalletMonitorStreamError::Service(KytrixServiceError::Closed)
+            EthereumWalletStreamError::Service(KytrixServiceError::Closed)
         );
 
         retry(&runtime, scope()).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         assert_eq!(source.sessions(), 2, "a retry takes the account again");
         assert_eq!(control.drops.load(Ordering::SeqCst), 0);
@@ -1195,14 +1143,14 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
+            .call(EthereumWalletRequest::Load(scope()))
             .await
             .expect_err("a stream is keyed by the account it was asked for");
 
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitorApiError::AccountChanged,
+                source: EthereumWalletApiError::AccountChanged,
                 ..
             }
         ));
@@ -1221,13 +1169,19 @@ mod tests {
         let session = source.session(ACCOUNT);
         let _control = session.subscribe();
         let (runtime, _, _) = live(&source).await;
-        session.answer_selections(selections(vec![selection("0x1")], 3));
+        session.answer_selections(selections(
+            vec![selection("0x1111111111111111111111111111111111111111")],
+            3,
+        ));
 
         let response = fetch(&runtime, scope())
             .await
             .expect("the account is taken, so a read is answered");
 
-        assert_eq!(addresses(&response), ["0x1"]);
+        assert_eq!(
+            addresses(&response),
+            ["0x1111111111111111111111111111111111111111"]
+        );
         assert_eq!(session.state().fetches, 1);
         runtime.shutdown().await;
     }
@@ -1245,7 +1199,7 @@ mod tests {
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitorApiError::NotReady,
+                source: EthereumWalletApiError::NotReady,
                 ..
             }
         ));
@@ -1262,9 +1216,9 @@ mod tests {
 
         let error = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::DeleteSelection {
+            .call(EthereumWalletRequest::DeleteSelection {
                 scope: account("other"),
-                address: SmolStr::new_static("0x1"),
+                address: SmolStr::new_static("0x1111111111111111111111111111111111111111"),
             })
             .await
             .expect_err("another account's addresses are not this pane's to change");
@@ -1272,7 +1226,7 @@ mod tests {
         assert!(matches!(
             error,
             RpcCallError::Service {
-                source: CryptocurrencyWalletMonitorApiError::AccountChanged,
+                source: EthereumWalletApiError::AccountChanged,
                 ..
             }
         ));
@@ -1293,15 +1247,15 @@ mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Confirmed(
-                selection("0x1"),
-            ));
+            .push_back(EthereumWalletMutationOutcome::Confirmed(selection(
+                "0x1111111111111111111111111111111111111111",
+            )));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::AddSelection {
+            .call(EthereumWalletRequest::AddSelection {
                 scope: scope(),
-                address: SmolStr::new_static("0x1"),
+                address: SmolStr::new_static("0x1111111111111111111111111111111111111111"),
             })
             .await
             .expect("the account is taken, so the change is sent")
@@ -1309,9 +1263,9 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitorResponse::Added(
-                CryptocurrencyWalletMonitorMutationOutcome::Confirmed(selection("0x1"))
-            )
+            EthereumWalletResponse::Added(EthereumWalletMutationOutcome::Confirmed(selection(
+                "0x1111111111111111111111111111111111111111"
+            )))
         );
         assert_eq!(session.state().add_calls, 1);
         runtime.shutdown().await;
@@ -1326,15 +1280,15 @@ mod tests {
         session
             .state()
             .adds
-            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Rejected(
-                CryptocurrencyWalletMonitorApiError::Conflict,
+            .push_back(EthereumWalletMutationOutcome::Rejected(
+                EthereumWalletApiError::Conflict,
             ));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::AddSelection {
+            .call(EthereumWalletRequest::AddSelection {
                 scope: scope(),
-                address: SmolStr::new_static("0x1"),
+                address: SmolStr::new_static("0x1111111111111111111111111111111111111111"),
             })
             .await
             .expect("a refusal is an answer rather than a failed call")
@@ -1342,11 +1296,9 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitorResponse::Added(
-                CryptocurrencyWalletMonitorMutationOutcome::Rejected(
-                    CryptocurrencyWalletMonitorApiError::Conflict
-                )
-            )
+            EthereumWalletResponse::Added(EthereumWalletMutationOutcome::Rejected(
+                EthereumWalletApiError::Conflict
+            ))
         );
         runtime.shutdown().await;
     }
@@ -1365,9 +1317,9 @@ mod tests {
         let client = runtime.client();
         let pending = tokio::spawn(async move {
             client
-                .call(CryptocurrencyWalletMonitorRequest::AddSelection {
+                .call(EthereumWalletRequest::AddSelection {
                     scope: scope(),
-                    address: SmolStr::new_static("0x1"),
+                    address: SmolStr::new_static("0x1111111111111111111111111111111111111111"),
                 })
                 .await
         });
@@ -1395,11 +1347,8 @@ mod tests {
         let mut latest = runtime.latest_stream();
 
         let client = runtime.client();
-        let pending = tokio::spawn(async move {
-            client
-                .call(CryptocurrencyWalletMonitorRequest::Load(scope()))
-                .await
-        });
+        let pending =
+            tokio::spawn(async move { client.call(EthereumWalletRequest::Load(scope())).await });
         block.wait_started().await;
         pending.abort();
         let _ = pending.await;
@@ -1427,7 +1376,7 @@ mod tests {
         let session = source.session(ACCOUNT);
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         control
             .events
@@ -1439,9 +1388,9 @@ mod tests {
         control
             .status
             .send_replace(SubscriptionStatus::Reconnecting);
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Connecting).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Connecting).await;
         control.status.send_replace(SubscriptionStatus::Active);
-        receive_status(&mut reliable, CryptocurrencyWalletMonitorStatus::Ready).await;
+        receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(100), latest.changed())
@@ -1461,15 +1410,15 @@ mod tests {
         session
             .state()
             .deletes
-            .push_back(CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                CryptocurrencyWalletMonitorMutationUnknown::Timeout,
+            .push_back(EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::Timeout,
             ));
 
         let response = runtime
             .client()
-            .call(CryptocurrencyWalletMonitorRequest::DeleteSelection {
+            .call(EthereumWalletRequest::DeleteSelection {
                 scope: scope(),
-                address: SmolStr::new_static("0x1"),
+                address: SmolStr::new_static("0x1111111111111111111111111111111111111111"),
             })
             .await
             .expect("an unknown outcome is an answer rather than a failed call")
@@ -1477,11 +1426,9 @@ mod tests {
 
         assert_eq!(
             response,
-            CryptocurrencyWalletMonitorResponse::Deleted(
-                CryptocurrencyWalletMonitorMutationOutcome::Unknown(
-                    CryptocurrencyWalletMonitorMutationUnknown::Timeout
-                )
-            )
+            EthereumWalletResponse::Deleted(EthereumWalletMutationOutcome::Unknown(
+                EthereumWalletMutationUnknown::Timeout
+            ))
         );
         runtime.shutdown().await;
     }
@@ -1501,15 +1448,13 @@ mod tests {
         }
         assert_eq!(
             ended_subscription(&SubscriptionStatus::Closed),
-            Some(CryptocurrencyWalletMonitorStreamError::Transport(
-                TransportError::Closed
-            ))
+            Some(EthereumWalletStreamError::Transport(TransportError::Closed))
         );
         assert_eq!(
             ended_subscription(&SubscriptionStatus::Failed(
                 TransportError::CredentialChanged
             )),
-            Some(CryptocurrencyWalletMonitorStreamError::Transport(
+            Some(EthereumWalletStreamError::Transport(
                 TransportError::CredentialChanged
             ))
         );

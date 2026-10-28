@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use app_config::time_zone::DataTimeZone;
 use gpui_kit::SharedString;
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 use time::{Date, OffsetDateTime, UtcOffset};
@@ -67,11 +67,20 @@ pub(crate) enum Importance {
 impl Importance {
     /// The level a code on the wire names.
     fn of(code: i32) -> Self {
-        match proto_types::EventImportance::try_from(code) {
-            Ok(proto_types::EventImportance::Low) => Self::Low,
-            Ok(proto_types::EventImportance::Medium) => Self::Medium,
-            Ok(proto_types::EventImportance::High) => Self::High,
-            Ok(proto_types::EventImportance::Unspecified) | Err(_) => Self::Unspecified,
+        match proto_types::FinancialCalendarEventImportance::try_from(code) {
+            Ok(proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceLow) => {
+                Self::Low
+            }
+            Ok(
+                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceMedium,
+            ) => Self::Medium,
+            Ok(proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceHigh) => {
+                Self::High
+            }
+            Ok(
+                proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceUnspecified,
+            )
+            | Err(_) => Self::Unspecified,
         }
     }
 

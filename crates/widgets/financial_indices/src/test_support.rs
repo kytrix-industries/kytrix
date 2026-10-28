@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::{
     ErrorCode, FinancialIndexEvent, FinancialIndexTopic, KytrixServiceError, KytrixSessionState,
 };
@@ -91,11 +91,11 @@ pub(crate) fn event(
 pub(crate) fn session(limit: u32) -> KytrixSessionState {
     KytrixSessionState {
         entitlement_revision: 1,
-        plan_code: proto_types::PlanCode::Free,
+        plan_code: proto_types::EntitlementPlanCode::Free,
         entitlements: BTreeMap::from([(
             "financial_indices".to_owned(),
-            proto_types::EntitlementValue {
-                value: Some(proto_types::entitlement_value::Value::Limit(limit)),
+            proto_types::EntitlementFeatureValue {
+                value: Some(proto_types::entitlement_feature_value::Value::Limit(limit)),
             },
         )]),
         catalog: Vec::new(),
@@ -104,8 +104,8 @@ pub(crate) fn session(limit: u32) -> KytrixSessionState {
 }
 
 /// A manifest of two categories, each with one index.
-pub(crate) fn manifest() -> proto_types::FinancialIndexManifest {
-    proto_types::FinancialIndexManifest {
+pub(crate) fn manifest() -> proto_types::FinancialIndices {
+    proto_types::FinancialIndices {
         categories: vec![
             category("asia", "Asia", "亚洲"),
             category("america", "America", "美洲"),
@@ -134,8 +134,8 @@ fn index(code: &str, category: &str, en: &str, zh: &str) -> proto_types::Financi
     }
 }
 
-fn localized(en: &str, zh: &str) -> proto_types::LocalizedName {
-    proto_types::LocalizedName {
+fn localized(en: &str, zh: &str) -> proto_types::FinancialIndexLocalizedName {
+    proto_types::FinancialIndexLocalizedName {
         en: en.to_owned(),
         zh: zh.to_owned(),
     }
@@ -151,7 +151,7 @@ pub(crate) struct FakeSource {
 struct FakeState {
     setups: VecDeque<FakeSetup>,
     subscribed: Vec<Vec<FinancialIndexTopic>>,
-    manifest: proto_types::FinancialIndexManifest,
+    manifest: proto_types::FinancialIndices,
     manifest_calls: usize,
 }
 
@@ -344,7 +344,7 @@ impl FakeSource {
         block
     }
 
-    pub(crate) fn set_manifest(&self, manifest: proto_types::FinancialIndexManifest) {
+    pub(crate) fn set_manifest(&self, manifest: proto_types::FinancialIndices) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -375,9 +375,7 @@ impl FinancialIndicesSource for FakeSource {
         self.session.subscribe()
     }
 
-    async fn fetch_manifest(
-        &self,
-    ) -> Result<proto_types::FinancialIndexManifest, KytrixServiceError> {
+    async fn fetch_manifest(&self) -> Result<proto_types::FinancialIndices, KytrixServiceError> {
         let mut state = self
             .state
             .lock()

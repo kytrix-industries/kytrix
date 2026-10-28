@@ -1,5 +1,5 @@
 [package]
-name = "cryptocurrency_wallet_monitor"
+name = "ethereum_wallet"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

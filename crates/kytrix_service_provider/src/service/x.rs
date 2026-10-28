@@ -1,7 +1,7 @@
 use ahash::AHashSet;
-use kytrix_proto::types::{
-    XAccountMonitoringProfile as ProtoXProfile,
-    XAccountMonitoringSelectionStatus as ProtoSelectionStatus, XAccountMonitoringTweet,
+use kytrix_proto::types::v1::{
+    XPost as ProtoXPost, XUserProfile as ProtoXProfile,
+    XUserSelectionStatus as ProtoSelectionStatus,
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -112,7 +112,7 @@ pub enum XMutationOutcome<T> {
 
 #[derive(Deserialize)]
 pub(super) struct TweetsResponse {
-    pub tweets: Vec<XAccountMonitoringTweet>,
+    pub tweets: Vec<ProtoXPost>,
     pub profiles: Vec<ProtoXProfile>,
 }
 
@@ -133,14 +133,14 @@ pub(super) fn decode_search_profile(profile: ProtoXProfile) -> Result<XProfile, 
 }
 
 pub(super) fn decode_x_selection(
-    selection: kytrix_proto::types::XAccountMonitoringSelection,
+    selection: kytrix_proto::types::v1::XUserSelection,
 ) -> Result<XSelection, XApiError> {
-    let status = match ProtoSelectionStatus::try_from(selection.status)
+    let status = match ProtoSelectionStatus::try_from(selection.selection_status)
         .map_err(|_| XApiError::Protocol("X selection status is invalid".into()))?
     {
-        ProtoSelectionStatus::XAccountMonitoringPending => XSelectionStatus::Pending,
-        ProtoSelectionStatus::XAccountMonitoringActive => XSelectionStatus::Active,
-        ProtoSelectionStatus::XAccountMonitoringPaused => XSelectionStatus::Paused,
+        ProtoSelectionStatus::Pending => XSelectionStatus::Pending,
+        ProtoSelectionStatus::Active => XSelectionStatus::Active,
+        ProtoSelectionStatus::Paused => XSelectionStatus::Paused,
         ProtoSelectionStatus::Unspecified => {
             return Err(XApiError::Protocol("X selection status is invalid".into()));
         }
@@ -244,7 +244,7 @@ pub(super) fn decode_tweets_response(response: TweetsResponse) -> Result<XTweetB
         .tweets
         .into_iter()
         .map(|tweet| {
-            if !ids.insert(tweet.tweet_id.clone()) {
+            if !ids.insert(tweet.post_id.clone()) {
                 return Err(XApiError::Protocol(
                     "X API returned duplicate Tweets".into(),
                 ));
@@ -352,9 +352,7 @@ fn validate_profile(profile: &XProfile, x_user_id: &str) -> Result<(), XApiError
 
 #[cfg(test)]
 mod tests {
-    use kytrix_proto::types::{
-        XAccountMonitoringProfile as ProtoXProfile, XAccountMonitoringTweet,
-    };
+    use kytrix_proto::types::v1::{XPost as ProtoXPost, XUserProfile as ProtoXProfile};
 
     use super::{
         super::engine::{ErrorCode, KytrixServiceError},
@@ -377,9 +375,9 @@ mod tests {
         );
     }
 
-    fn tweet(id: &str, author: &str) -> XAccountMonitoringTweet {
-        XAccountMonitoringTweet {
-            tweet_id: id.to_owned(),
+    fn tweet(id: &str, author: &str) -> ProtoXPost {
+        ProtoXPost {
+            post_id: id.to_owned(),
             timestamp: 1,
             x_user_id: author.to_owned(),
             text_segments: Vec::new(),
@@ -510,14 +508,12 @@ mod tests {
 
         let mut deep = tweet("1", "42");
         let mut nested = tweet("2", "43");
-        nested.reference = Some(
-            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
-                "3", "44",
-            ))),
-        );
-        deep.reference = Some(
-            kytrix_proto::types::x_account_monitoring_tweet::Reference::Repost(Box::new(nested)),
-        );
+        nested.reference = Some(kytrix_proto::types::v1::x_post::Reference::Quote(Box::new(
+            tweet("3", "44"),
+        )));
+        deep.reference = Some(kytrix_proto::types::v1::x_post::Reference::Repost(
+            Box::new(nested),
+        ));
         assert!(
             decode_tweets_response(TweetsResponse {
                 tweets: vec![deep.clone()],
@@ -525,21 +521,19 @@ mod tests {
             })
             .is_ok()
         );
-        let kytrix_proto::types::x_account_monitoring_tweet::Reference::Repost(nested) =
+        let kytrix_proto::types::v1::x_post::Reference::Repost(nested) =
             deep.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        let kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(leaf) =
+        let kytrix_proto::types::v1::x_post::Reference::Quote(leaf) =
             nested.reference.as_mut().unwrap()
         else {
             unreachable!()
         };
-        leaf.reference = Some(
-            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
-                "4", "45",
-            ))),
-        );
+        leaf.reference = Some(kytrix_proto::types::v1::x_post::Reference::Quote(Box::new(
+            tweet("4", "45"),
+        )));
         assert!(matches!(
             decode_tweets_response(TweetsResponse {
                 tweets: vec![deep],
@@ -562,11 +556,9 @@ mod tests {
         ));
 
         let mut root = tweet("1", "42");
-        root.reference = Some(
-            kytrix_proto::types::x_account_monitoring_tweet::Reference::Quote(Box::new(tweet(
-                "2", "43",
-            ))),
-        );
+        root.reference = Some(kytrix_proto::types::v1::x_post::Reference::Quote(Box::new(
+            tweet("2", "43"),
+        )));
         let mut unversioned = wire_profile("43");
         unversioned.revision = 0;
         assert!(matches!(

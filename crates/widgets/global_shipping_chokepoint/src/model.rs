@@ -32,8 +32,7 @@ use ahash::AHashMap;
 use base_ui::style::theme::Theme;
 use gpui_kit::Hsla;
 use kytrix_service_provider::service::global_shipping_chokepoint::{
-    GlobalShippingChokepointPosition, GlobalShippingChokepointStatic,
-    GlobalShippingChokepointUpdate,
+    GlobalShippingChokepointPosition, GlobalShippingChokepointShip, GlobalShippingChokepointUpdate,
 };
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
@@ -524,10 +523,10 @@ pub(super) fn nav_status_of(nav_status: u32) -> Option<NavStatus> {
 /// One vessel the map paints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Vessel {
-    /// The identity its position and its static part are joined on.
+    /// The identity its position and its ship record are joined on.
     pub mmsi: u32,
-    /// The bucket its ship type falls in, or [`ShipClass::Other`] while the static
-    /// part has not arrived.
+    /// The bucket its ship type falls in, or [`ShipClass::Other`] while the ship
+    /// record has not arrived.
     pub class: ShipClass,
     /// Its last position, in Mercator coordinates.
     pub position: [f32; 2],
@@ -536,9 +535,9 @@ pub(super) struct Vessel {
     pub cog: u32,
     /// True heading in degrees, as the wire carries it.
     pub heading: u32,
-    /// Whether the static part has arrived. A vessel without one is still painted —
+    /// Whether the ship record has arrived. A vessel without one is still painted —
     /// as an unknown — because its position is enough to draw a dot.
-    pub has_static: bool,
+    pub has_ship: bool,
 }
 
 impl Vessel {
@@ -562,12 +561,12 @@ impl Vessel {
 ///
 /// The card's labels and its "unavailable" text belong to the view: a field is `None`
 /// when the report does not carry the value, either because its sentinel says so or
-/// because the static part has not arrived. The order of the fields is the order the
+/// because the ship record has not arrived. The order of the fields is the order the
 /// design lists the items in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct VesselDetails {
     /// 1. The name, or the MMSI when the report carries an empty one; `None` before
-    ///    the static part arrives.
+    ///    the ship record arrives.
     pub name: Option<SmolStr>,
     /// 2. The MMSI, which every vessel has.
     pub mmsi: SmolStr,
@@ -604,52 +603,49 @@ pub(super) struct VesselDetails {
 impl VesselDetails {
     fn new(
         mmsi: u32,
-        statics: Option<&GlobalShippingChokepointStatic>,
+        ship: Option<&GlobalShippingChokepointShip>,
         position: &GlobalShippingChokepointPosition,
         zone: UtcOffset,
     ) -> Self {
         Self {
-            name: statics.map(|statics| {
-                if statics.name.is_empty() {
+            name: ship.map(|ship| {
+                if ship.name.is_empty() {
                     format_smolstr!("{mmsi}")
                 } else {
-                    statics.name.clone()
+                    ship.name.clone()
                 }
             }),
             mmsi: format_smolstr!("{mmsi}"),
-            imo: statics
-                .and_then(|statics| (statics.imo != 0).then(|| format_smolstr!("{}", statics.imo))),
-            call_sign: statics.and_then(|statics| {
-                (!statics.call_sign.is_empty()).then(|| statics.call_sign.clone())
-            }),
-            ship_class: statics
-                .and_then(|statics| (statics.ship_type != 0).then(|| class_of(statics.ship_type))),
-            flag: statics.and_then(|statics| flag_for_mid(statics.flag_mid)),
-            destination: statics.and_then(|statics| {
-                (!statics.destination.is_empty()).then(|| statics.destination.clone())
-            }),
-            eta: statics.and_then(|statics| {
-                let carries_eta = statics.eta_month != 0
-                    || statics.eta_day != 0
-                    || statics.eta_hour != 0
-                    || statics.eta_minute != 0;
+            imo: ship.and_then(|ship| (ship.imo != 0).then(|| format_smolstr!("{}", ship.imo))),
+            call_sign: ship
+                .and_then(|ship| (!ship.call_sign.is_empty()).then(|| ship.call_sign.clone())),
+            ship_class: ship
+                .and_then(|ship| (ship.ship_type != 0).then(|| class_of(ship.ship_type))),
+            flag: ship.and_then(|ship| flag_for_mid(ship.flag_mid)),
+            destination: ship
+                .and_then(|ship| (!ship.destination.is_empty()).then(|| ship.destination.clone())),
+            eta: ship.and_then(|ship| {
+                let carries_eta = ship.eta_month != 0
+                    || ship.eta_day != 0
+                    || ship.eta_hour != 0
+                    || ship.eta_minute != 0;
                 carries_eta.then(|| {
                     format_smolstr!(
                         "{:02}-{:02} {:02}:{:02}",
-                        statics.eta_month,
-                        statics.eta_day,
-                        statics.eta_hour,
-                        statics.eta_minute
+                        ship.eta_month,
+                        ship.eta_day,
+                        ship.eta_hour,
+                        ship.eta_minute
                     )
                 })
             }),
-            draught: statics.and_then(|statics| {
-                (statics.draught != 0)
-                    .then(|| format_smolstr!("{}.{} m", statics.draught / 10, statics.draught % 10))
+            draught: ship.and_then(|ship| {
+                (ship.draught != 0)
+                    .then(|| format_smolstr!("{}.{} m", ship.draught / 10, ship.draught % 10))
             }),
-            dimensions: statics.and_then(|statics| {
-                let length = statics.dim_to_bow.saturating_add(statics.dim_to_stern);
-                let breadth = statics.dim_to_port.saturating_add(statics.dim_to_starboard);
+            dimensions: ship.and_then(|ship| {
+                let length = ship.dim_to_bow.saturating_add(ship.dim_to_stern);
+                let breadth = ship.dim_to_port.saturating_add(ship.dim_to_starboard);
                 (length != 0 || breadth != 0).then(|| format_smolstr!("{length} × {breadth} m"))
             }),
             speed: (position.sog != SOG_UNAVAILABLE)
@@ -700,7 +696,7 @@ fn format_last_update(last_update: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// one.
 #[derive(Debug)]
 pub(super) struct VesselStore {
-    statics: AHashMap<u32, GlobalShippingChokepointStatic>,
+    ships: AHashMap<u32, GlobalShippingChokepointShip>,
     positions: AHashMap<u32, GlobalShippingChokepointPosition>,
     epoch: u64,
     applied: u64,
@@ -719,7 +715,7 @@ impl VesselStore {
     /// An empty picture, waiting for its first keyframe.
     pub fn new() -> Self {
         Self {
-            statics: AHashMap::with_capacity(MAX_VESSELS),
+            ships: AHashMap::with_capacity(MAX_VESSELS),
             positions: AHashMap::with_capacity(MAX_VESSELS),
             epoch: 0,
             applied: 0,
@@ -759,7 +755,7 @@ impl VesselStore {
                 update.positions.len() <= MAX_VESSELS,
                 "a keyframe holds at most {MAX_VESSELS} positions",
             );
-            self.statics.clear();
+            self.ships.clear();
             self.positions.clear();
             self.epoch = update.epoch;
 
@@ -775,12 +771,8 @@ impl VesselStore {
                 return;
             }
 
-            self.statics.extend(
-                update
-                    .statics
-                    .iter()
-                    .map(|entry| (entry.mmsi, entry.clone())),
-            );
+            self.ships
+                .extend(update.ships.iter().map(|entry| (entry.mmsi, entry.clone())));
             self.positions
                 .extend(update.positions.iter().map(|entry| (entry.mmsi, *entry)));
             self.applied = update.sequence;
@@ -791,14 +783,14 @@ impl VesselStore {
         }
 
         if update.epoch == self.epoch && update.base == self.applied {
-            for statics in &update.statics {
-                self.statics.insert(statics.mmsi, statics.clone());
+            for ship in &update.ships {
+                self.ships.insert(ship.mmsi, ship.clone());
             }
             for position in &update.positions {
                 self.positions.insert(position.mmsi, *position);
             }
             for mmsi in &update.removed {
-                self.statics.remove(mmsi);
+                self.ships.remove(mmsi);
                 self.positions.remove(mmsi);
             }
             self.applied = update.sequence;
@@ -857,7 +849,7 @@ impl VesselStore {
     /// store holds. A store that was cleared is not stale — it is empty — so the gap
     /// goes back to its initial value too.
     pub fn clear(&mut self) {
-        self.statics.clear();
+        self.ships.clear();
         self.positions.clear();
         self.epoch = 0;
         self.applied = 0;
@@ -866,10 +858,10 @@ impl VesselStore {
         self.received_at = Instant::now();
     }
 
-    /// Every vessel that has a position, joined with its static part by MMSI.
+    /// Every vessel that has a position, joined with its ship record by MMSI.
     ///
-    /// A vessel whose static part has not arrived is still painted — as an unknown
-    /// dot — while one that has only a static part is not painted at all, because
+    /// A vessel whose ship record has not arrived is still painted — as an unknown
+    /// dot — while one that has only a ship record is not painted at all, because
     /// there is nowhere to paint it. The order is the store's, not a ranking.
     ///
     /// Building the list projects every position, so a painter keeps it between
@@ -877,17 +869,17 @@ impl VesselStore {
     pub fn vessels(&self) -> Vec<Vessel> {
         let mut vessels = Vec::with_capacity(self.positions.len());
         for position in self.positions.values() {
-            let statics = self.statics.get(&position.mmsi);
+            let ship = self.ships.get(&position.mmsi);
             vessels.push(Vessel {
                 mmsi: position.mmsi,
-                class: statics.map_or(ShipClass::Other, |statics| class_of(statics.ship_type)),
+                class: ship.map_or(ShipClass::Other, |ship| class_of(ship.ship_type)),
                 position: project(
                     position.longitude as f32 / 1_000_000.0,
                     position.latitude as f32 / 1_000_000.0,
                 ),
                 cog: position.cog,
                 heading: position.heading,
-                has_static: statics.is_some(),
+                has_ship: ship.is_some(),
             });
         }
         vessels
@@ -901,7 +893,7 @@ impl VesselStore {
         let position = self.positions.get(&mmsi)?;
         Some(VesselDetails::new(
             position.mmsi,
-            self.statics.get(&mmsi),
+            self.ships.get(&mmsi),
             position,
             zone,
         ))
@@ -960,9 +952,9 @@ mod tests {
         }
     }
 
-    /// One static part, with every value a report can carry.
-    fn statics(mmsi: u32) -> GlobalShippingChokepointStatic {
-        GlobalShippingChokepointStatic {
+    /// One ship record, with every value a report can carry.
+    fn ships(mmsi: u32) -> GlobalShippingChokepointShip {
+        GlobalShippingChokepointShip {
             mmsi,
             imo: 9_074_729,
             call_sign: SmolStr::new_static("A8AB2"),
@@ -982,9 +974,9 @@ mod tests {
         }
     }
 
-    /// A static part that carries nothing, as a report with every sentinel set.
-    fn empty_statics(mmsi: u32) -> GlobalShippingChokepointStatic {
-        GlobalShippingChokepointStatic {
+    /// A ship record that carries nothing, as a report with every sentinel set.
+    fn empty_ship(mmsi: u32) -> GlobalShippingChokepointShip {
+        GlobalShippingChokepointShip {
             mmsi,
             imo: 0,
             call_sign: SmolStr::new_static(""),
@@ -1029,7 +1021,7 @@ mod tests {
             keyframe: true,
             sequence,
             base: 0,
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions,
             removed: Vec::new(),
             timestamp: 1_700_000_000_000,
@@ -1048,7 +1040,7 @@ mod tests {
             keyframe: false,
             sequence,
             base,
-            statics: Vec::new(),
+            ships: Vec::new(),
             positions,
             removed: Vec::new(),
             timestamp: 1_700_000_000_000,
@@ -1366,7 +1358,7 @@ mod tests {
     fn a_keyframe_should_replace_the_whole_picture() {
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![position(1), position(2)]);
-        frame.statics = vec![statics(1), statics(2)];
+        frame.ships = vec![ships(1), ships(2)];
         store.apply(&frame);
         assert!(store.has_state());
         assert_eq!(store.vessel_count(), 2);
@@ -1380,7 +1372,7 @@ mod tests {
             1,
             "the picture is exactly the keyframe"
         );
-        assert!(!store.statics.contains_key(&1));
+        assert!(!store.ships.contains_key(&1));
         assert!(!store.positions.contains_key(&1));
     }
 
@@ -1390,7 +1382,7 @@ mod tests {
         store.apply(&keyframe(7, 10, vec![position(1)]));
 
         let mut update = delta(7, 10, 11, vec![position(2)]);
-        update.statics = vec![statics(2)];
+        update.ships = vec![ships(2)];
         store.apply(&update);
 
         assert!(store.has_state());
@@ -1400,14 +1392,14 @@ mod tests {
             2,
             "the delta is laid over the keyframe"
         );
-        assert!(store.statics.contains_key(&2));
+        assert!(store.ships.contains_key(&2));
     }
 
     #[test]
     fn a_removal_should_empty_both_tables() {
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![position(1), position(2)]);
-        frame.statics = vec![statics(1), statics(2)];
+        frame.ships = vec![ships(1), ships(2)];
         store.apply(&frame);
 
         let mut update = delta(7, 1, 2, Vec::new());
@@ -1415,8 +1407,8 @@ mod tests {
         store.apply(&update);
 
         assert_eq!(store.vessel_count(), 1);
-        assert!(!store.statics.contains_key(&1), "the static part goes too");
-        assert!(store.statics.contains_key(&2));
+        assert!(!store.ships.contains_key(&1), "the ship record goes too");
+        assert!(store.ships.contains_key(&2));
     }
 
     #[test]
@@ -1494,7 +1486,7 @@ mod tests {
     fn a_keyframe_without_a_time_should_clear_the_picture_and_not_establish_a_baseline() {
         let mut store = VesselStore::new();
         let mut seeded = keyframe(7, 10, vec![position(1)]);
-        seeded.statics = vec![statics(1)];
+        seeded.ships = vec![ships(1)];
         store.apply(&seeded);
         assert_eq!(
             store.vessel_count(),
@@ -1503,7 +1495,7 @@ mod tests {
         );
 
         let mut frame = keyframe(8, 11, vec![position(2)]);
-        frame.statics = vec![statics(2)];
+        frame.ships = vec![ships(2)];
         frame.timestamp = 0;
         store.apply(&frame);
 
@@ -1511,8 +1503,8 @@ mod tests {
         assert!(store.is_stale(), "and it is not a live picture either");
         assert_eq!(store.vessel_count(), 0, "the stale picture was cleared");
         assert!(
-            store.statics.is_empty(),
-            "the static part was cleared with it",
+            store.ships.is_empty(),
+            "the ship record was cleared with it",
         );
         assert_eq!(
             store.applied, 0,
@@ -1615,20 +1607,20 @@ mod tests {
     fn the_picture_should_be_joined_by_mmsi() {
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![position(1)]);
-        frame.statics = vec![statics(1), statics(2)];
+        frame.ships = vec![ships(1), ships(2)];
         store.apply(&frame);
 
         assert_eq!(
             store.vessel_count(),
             1,
-            "a static part without a position has nowhere to be painted",
+            "a ship record without a position has nowhere to be painted",
         );
         let vessels = store.vessels();
         let vessel = vessels
             .iter()
             .find(|vessel| vessel.mmsi == 1)
             .expect("the vessel with a position is painted");
-        assert!(vessel.has_static);
+        assert!(vessel.has_ship);
         assert_eq!(vessel.class, ShipClass::Tanker);
         assert_eq!(vessel.position, project(56.3, 26.5));
         assert_eq!(vessel.cog, 456);
@@ -1641,8 +1633,8 @@ mod tests {
             .vessels()
             .into_iter()
             .find(|vessel| vessel.mmsi == 3)
-            .expect("a position without a static part is still a vessel");
-        assert!(!vessel.has_static);
+            .expect("a position without a ship record is still a vessel");
+        assert!(!vessel.has_ship);
         assert_eq!(
             vessel.class,
             ShipClass::Other,
@@ -1654,7 +1646,7 @@ mod tests {
     fn every_value_the_report_carries_should_read_as_a_reader_expects_it() {
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![position(42)]);
-        frame.statics = vec![statics(42)];
+        frame.ships = vec![ships(42)];
         store.apply(&frame);
 
         let details = store
@@ -1682,7 +1674,7 @@ mod tests {
     fn a_report_without_a_value_should_read_as_unavailable() {
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![empty_position(7)]);
-        frame.statics = vec![empty_statics(7)];
+        frame.ships = vec![empty_ship(7)];
         store.apply(&frame);
 
         let details = store
@@ -1717,12 +1709,12 @@ mod tests {
         // whatever the wire carries: clamping keeps a bad report from panicking the pane.
         let mut store = VesselStore::new();
         let mut frame = keyframe(7, 1, vec![position(42)]);
-        let mut reported = statics(42);
+        let mut reported = ships(42);
         reported.dim_to_bow = u32::MAX;
         reported.dim_to_stern = 1;
         reported.dim_to_port = u32::MAX;
         reported.dim_to_starboard = 2;
-        frame.statics = vec![reported];
+        frame.ships = vec![reported];
         store.apply(&frame);
 
         let details = store
@@ -1735,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vessel_without_a_static_part_should_read_only_what_its_position_carries() {
+    fn a_vessel_without_a_ship_record_should_read_only_what_its_position_carries() {
         let mut store = VesselStore::new();
         store.apply(&keyframe(7, 1, vec![position(9)]));
 
@@ -1983,7 +1975,7 @@ mod tests {
             position: [0.0, 0.0],
             cog: 900,
             heading: 347,
-            has_static: true,
+            has_ship: true,
         };
         assert_close(
             vessel.facing(),

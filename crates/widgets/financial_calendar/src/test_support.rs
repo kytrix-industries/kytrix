@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::KytrixServiceError;
 use time::{Date, Month};
 
@@ -50,10 +50,18 @@ pub(crate) fn proto_event(
     reference: Option<&str>,
 ) -> proto_types::FinancialCalendarEvent {
     let importance = match importance {
-        Importance::Unspecified => proto_types::EventImportance::Unspecified,
-        Importance::Low => proto_types::EventImportance::Low,
-        Importance::Medium => proto_types::EventImportance::Medium,
-        Importance::High => proto_types::EventImportance::High,
+        Importance::Unspecified => {
+            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceUnspecified
+        }
+        Importance::Low => {
+            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceLow
+        }
+        Importance::Medium => {
+            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceMedium
+        }
+        Importance::High => {
+            proto_types::FinancialCalendarEventImportance::FinancialCAlendarEventImportanceHigh
+        }
     };
 
     proto_types::FinancialCalendarEvent {

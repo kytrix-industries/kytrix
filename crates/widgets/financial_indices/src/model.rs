@@ -20,7 +20,7 @@ use std::sync::Arc;
 use ahash::{HashSet, HashSetExt};
 use gpui_kit::{App, SharedString};
 use i18n::{language::codes::LanguageCode, t};
-use kytrix_proto::types as proto_types;
+use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::{FinancialIndexEvent, FinancialIndexTopic};
 use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::{SmolStr, format_smolstr};
@@ -315,7 +315,7 @@ impl FinancialIndexQuote {
 
 /// Validates a manifest into the catalogue a selector lists.
 pub(super) fn prepare_catalog(
-    manifest: proto_types::FinancialIndexManifest,
+    manifest: proto_types::FinancialIndices,
 ) -> Result<FinancialIndexCatalog, FinancialIndicesDataError> {
     ensure_manifest_capacity(manifest.categories.len(), MAX_MANIFEST_CATEGORIES)?;
     ensure_manifest_capacity(manifest.indices.len(), MAX_MANIFEST_INDICES)?;
@@ -459,7 +459,7 @@ fn validate_name(value: &str) -> Result<(), FinancialIndicesDataError> {
 }
 
 fn parse_name(
-    name: Option<proto_types::LocalizedName>,
+    name: Option<proto_types::FinancialIndexLocalizedName>,
 ) -> Result<LocalizedFinancialIndexName, FinancialIndicesDataError> {
     let name = name.ok_or_else(|| invalid(FinancialIndicesInvalidReason::MissingName))?;
     let name = LocalizedFinancialIndexName {
@@ -478,15 +478,15 @@ mod tests {
         FinancialIndexTopic::from_code(code).expect("a test index code should be valid")
     }
 
-    fn name(en: &str, zh: &str) -> Option<proto_types::LocalizedName> {
-        Some(proto_types::LocalizedName {
+    fn name(en: &str, zh: &str) -> Option<proto_types::FinancialIndexLocalizedName> {
+        Some(proto_types::FinancialIndexLocalizedName {
             en: en.to_owned(),
             zh: zh.to_owned(),
         })
     }
 
-    fn manifest() -> proto_types::FinancialIndexManifest {
-        proto_types::FinancialIndexManifest {
+    fn manifest() -> proto_types::FinancialIndices {
+        proto_types::FinancialIndices {
             categories: vec![proto_types::FinancialIndexCategory {
                 code: "asia".to_owned(),
                 name: name("Asia", "亚洲"),
@@ -651,7 +651,7 @@ mod tests {
                 name: name("Category", "分类"),
             })
             .collect::<Vec<_>>();
-        let at_limit = prepare_catalog(proto_types::FinancialIndexManifest {
+        let at_limit = prepare_catalog(proto_types::FinancialIndices {
             categories: categories.clone(),
             indices: Vec::new(),
         })
@@ -664,7 +664,7 @@ mod tests {
             name: name("Category", "分类"),
         });
         assert_eq!(
-            prepare_catalog(proto_types::FinancialIndexManifest {
+            prepare_catalog(proto_types::FinancialIndices {
                 categories: over_limit,
                 indices: Vec::new(),
             }),
