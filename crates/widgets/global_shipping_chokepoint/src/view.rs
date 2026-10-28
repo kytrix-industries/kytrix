@@ -119,6 +119,12 @@ const CARD_MARGIN: f32 = 12.0;
 /// overestimate only lifts the card a little.
 const CARD_HEIGHT: f32 = 15.0 * 20.0 + 14.0 * 4.0 + 2.0 * 4.0 + 10.0;
 
+/// The page the map's ODbL credit opens.
+///
+/// OSMF's guidance asks for "OpenStreetMap" to be reachable from the credit itself, so the
+/// label is a link to the copyright page rather than plain text.
+const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
+
 /// The order the four vessel classes are drawn and listed in.
 pub(super) const CLASSES: [ShipClass; 4] = [
     ShipClass::Tanker,
@@ -261,14 +267,9 @@ impl MapColors {
         Self {
             ocean: roles.chart.map_ocean.hsla,
             land: roles.chart.map_land.hsla,
-            // The theme has no map-border or map-road roles, so these three borrow opaque
-            // ones: the strong line for the borders, the sixth chart series for motorways
-            // and the line border for primary roads. Each has to read on both fills — a
-            // road survives the bridge or causeway that carries it over the sea — which is
-            // what `the_map_border_and_roads_read_on_both_fills` pins.
-            map_border: roles.line.strong.hsla,
-            road: roles.chart.series[5].hsla,
-            road_minor: roles.line.border.hsla,
+            map_border: roles.chart.map_border.hsla,
+            road: roles.chart.map_road.hsla,
+            road_minor: roles.chart.map_road_minor.hsla,
             lane: roles.chart.series[3].hsla.opacity(DASH_ALPHA),
             ships: CLASSES.map(|class| colour_for(theme, class)),
             unknown: roles.fg.muted.hsla,
@@ -1001,6 +1002,10 @@ impl GlobalShippingChokepointWidget {
     }
 
     /// The legend in the pane's bottom-right corner: the four classes and the count.
+    ///
+    /// It is lifted clear of the ODbL credit's line rather than sharing the bottom edge with it:
+    /// a pane narrower than the two together would otherwise have the card painted over the
+    /// credit, which is the one thing on the map that has to stay readable.
     fn legend(&self, colors: MapColors, cx: &App) -> AnyElement {
         let size = UnifiedSize::Small;
         let count_text = self.vessel_count_text(cx);
@@ -1027,7 +1032,9 @@ impl GlobalShippingChokepointWidget {
             .debug_selector(|| "TEST_CHOKEPOINT_LEGEND".into())
             .absolute()
             .right(px(8.0))
-            .bottom(px(8.0))
+            // Above the credit's line (6px inset + one `text_xs` line), so the two never overlap
+            // however narrow the pane is.
+            .bottom(px(32.0))
             .flex()
             .flex_col()
             .gap(size.gap())
@@ -1045,6 +1052,30 @@ impl GlobalShippingChokepointWidget {
             )
             .children(entries)
             .child(div().text_color(colors.muted).child(count_text))
+            .into_any_element()
+    }
+
+    /// The ODbL credit the map is drawn under, in the pane's bottom-left corner.
+    ///
+    /// The text is the default foreground rather than `fg.muted`: it is drawn straight on the
+    /// land, and small text on the buff fill has to clear the 4.5:1 a paragraph is held to,
+    /// which the muted step does not. The corner is the one the legend (raised above it in the
+    /// bottom-right) and the stale badge (top-left) leave free, and the label is a link so
+    /// "OpenStreetMap" is reachable from the credit, which is what OSMF's guidance asks for.
+    fn attribution(&self, colors: MapColors, cx: &App) -> AnyElement {
+        div()
+            .id(ElementId::Name(SharedString::new_static(
+                "GlobalShippingChokepointAttribution",
+            )))
+            .debug_selector(|| "TEST_CHOKEPOINT_ATTRIBUTION".into())
+            .absolute()
+            .left(px(8.0))
+            .bottom(px(6.0))
+            .text_xs()
+            .text_color(colors.text)
+            .cursor_pointer()
+            .on_click(|_, _, cx| cx.open_url(ATTRIBUTION_URL))
+            .child(t!(cx, "widget.global_shipping_chokepoint.attribution"))
             .into_any_element()
     }
 
@@ -1268,6 +1299,7 @@ impl Render for GlobalShippingChokepointWidget {
         let labels =
             projection.map_or_else(Vec::new, |projection| self.labels(projection, colors, cx));
         let legend = self.legend(colors, cx);
+        let attribution = self.attribution(colors, cx);
         let stale = self
             .vessels
             .is_stale()
@@ -1317,6 +1349,7 @@ impl Render for GlobalShippingChokepointWidget {
             }))
             .child(map)
             .children(labels)
+            .child(attribution)
             .child(legend)
             .when_some(stale, |this, stale| this.child(stale))
             .when_some(card, |this, card| this.child(card))
@@ -2398,6 +2431,7 @@ mod tests {
                 "common.no_data",
                 "error.global_shipping_chokepoint.map_asset",
                 "widget.names.global_shipping_chokepoint",
+                "widget.global_shipping_chokepoint.attribution",
                 "widget.global_shipping_chokepoint.entitlement_required",
                 "widget.global_shipping_chokepoint.sign_in",
                 "widget.global_shipping_chokepoint.stale",
@@ -2446,61 +2480,98 @@ mod tests {
         });
     }
 
-    /// The country names are the one label drawn straight on the fill, so they have to
-    /// clear the contrast a paragraph is held to in both appearances — `fg.subtle` does not
-    /// (about 2:1 on the land), which is why the body uses the default foreground.
+    /// The words drawn straight on the map fills clear the contrast a paragraph is held to in
+    /// both appearances: the country names and the ODbL credit take the default foreground,
+    /// which is the only text step that does — `fg.subtle` reads about 2:1 on the land.
     #[test]
-    fn the_country_labels_should_read_on_both_map_fills() {
+    fn the_attribution_reads_on_both_map_fills() {
         for appearance in [Appearance::Light, Appearance::Dark] {
             let colors = MapColors::resolve(&Theme::of(appearance));
             for (what, background) in [("the land", colors.land), ("the sea", colors.ocean)] {
                 let ratio = wcag_contrast(colors.text, background);
                 assert!(
                     ratio >= 4.5,
-                    "{appearance:?}: the country labels read {ratio:.2}:1 on {what}",
+                    "{appearance:?}: the attribution reads {ratio:.2}:1 on {what}",
                 );
             }
         }
     }
 
-    /// The borders and roads are drawn over both map fills, so each is opaque and each
-    /// reads where it lands: a border and a motorway on the land and on the sea, and a
-    /// primary road on the land it is mostly on.
-    #[test]
-    fn the_map_border_and_roads_read_on_both_fills() {
-        for appearance in [Appearance::Light, Appearance::Dark] {
-            let colors = MapColors::resolve(&Theme::of(appearance));
-            for (what, color) in [
-                ("the map border", colors.map_border),
-                ("a motorway", colors.road),
-                ("a primary road", colors.road_minor),
-            ] {
-                assert_eq!(color.a, 1.0, "{appearance:?}: {what} is translucent");
-            }
+    /// The map is drawn under its ODbL credit: the label sits in the bottom-left corner of the
+    /// map's box, below the legend and clear of the stale badge in the top-left.
+    ///
+    /// The body is the cached layer, so the frame that answers `debug_bounds` has to be a
+    /// forced full repaint — which is what `repaint` is (`crates/widgets/AGENTS.md` §10, trap 5).
+    ///
+    /// `debug_bounds` records where an element was painted, not what was painted over it, so this
+    /// pins presence and place; what keeps the credit above the map is its place in `render`
+    /// (after the canvas), and no assertion here can observe that order.
+    #[gpui_kit::test]
+    fn the_attribution_is_drawn_on_the_map(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            assert!(report_update(&pane, keyframe(7, 1, vec![position(1)]), cx));
+        });
+        let window = map_window(cx, &pane);
+        repaint(window);
 
-            for (what, background) in [("the land", colors.land), ("the sea", colors.ocean)] {
-                let ratio = wcag_contrast(colors.map_border, background);
-                assert!(
-                    ratio >= 3.0,
-                    "{appearance:?}: the map border reads {ratio:.2}:1 on {what}",
-                );
-            }
-            let on_land = wcag_contrast(colors.road, colors.land);
-            assert!(
-                on_land >= 3.0,
-                "{appearance:?}: a motorway reads {on_land:.2}:1 on the land",
-            );
-            let on_sea = wcag_contrast(colors.road, colors.ocean);
-            assert!(
-                on_sea >= 2.0,
-                "{appearance:?}: a motorway reads {on_sea:.2}:1 on the sea",
-            );
-            let minor = wcag_contrast(colors.road_minor, colors.land);
-            assert!(
-                minor >= 1.5,
-                "{appearance:?}: a primary road reads {minor:.2}:1 on the land",
-            );
-        }
+        let attribution = window
+            .debug_bounds("TEST_CHOKEPOINT_ATTRIBUTION")
+            .expect("the map is drawn under its credit");
+        let map = window
+            .debug_bounds("TEST_CHOKEPOINT_MAP")
+            .expect("the map is drawn");
+        let legend = window
+            .debug_bounds("TEST_CHOKEPOINT_LEGEND")
+            .expect("the legend is drawn");
+
+        assert!(
+            attribution.left() >= map.left()
+                && attribution.right() <= map.right()
+                && attribution.top() >= map.top()
+                && attribution.bottom() <= map.bottom(),
+            "the credit is inside the map's box: {attribution:?} in {map:?}",
+        );
+        assert!(
+            attribution.right() <= map.center().x && attribution.top() >= map.center().y,
+            "the credit sits in the bottom-left corner: {attribution:?} in {map:?}",
+        );
+        assert!(
+            legend.bottom() <= attribution.top(),
+            "the legend clears the credit's line: {legend:?} above {attribution:?}",
+        );
+    }
+
+    /// The credit is a link rather than a label: pressing it opens the copyright page OSMF's
+    /// guidance points at.
+    #[gpui_kit::test]
+    fn the_attribution_should_open_the_copyright_page(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            assert!(report_update(&pane, keyframe(7, 1, vec![position(1)]), cx));
+        });
+        let window = map_window(cx, &pane);
+        repaint(window);
+
+        let attribution = window
+            .debug_bounds("TEST_CHOKEPOINT_ATTRIBUTION")
+            .expect("the map is drawn under its credit");
+        let map = window
+            .debug_bounds("TEST_CHOKEPOINT_MAP")
+            .expect("the map is drawn");
+        window.simulate_click(map.center(), Modifiers::none());
+        assert_eq!(
+            window.opened_url(),
+            None,
+            "a press on the map itself opens nothing",
+        );
+        window.simulate_click(attribution.center(), Modifiers::none());
+
+        assert_eq!(
+            window.opened_url().as_deref(),
+            Some(ATTRIBUTION_URL),
+            "the credit opens the page the ODbL attribution points at",
+        );
     }
 
     #[test]

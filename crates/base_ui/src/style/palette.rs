@@ -5,12 +5,13 @@
 //! replacing this data and no drawing code changes with it. The two built-in palettes are two
 //! instances of the same shape: they differ in value, never in meaning.
 //!
-//! Every value but the two map fills and the fear-and-greed ramp is the one the design document's
+//! Every value but the five map colors and the fear-and-greed ramp is the one the design document's
 //! §7 table spells for the role it is the source of. Surfaces are the six z-axis values, `text` is
 //! the foreground every other text step is mixed from, and `brand`, the five status colors, the two
 //! market directions and the five fear-and-greed steps are the saturated colors a theme author
-//! would actually tune. The two map fills are authored here
-//! instead (§10): a map is drawn from exactly two colors, so they cannot be mixed from a surface.
+//! would actually tune. The five map colors are authored here instead (§10): a map is drawn from
+//! two fills and the three strokes laid over them, and those are read against each other rather
+//! than against a surface, so they cannot be mixed from one.
 //! The alphas at the end are the transparent things a theme owns: the two interaction veils and
 //! the scrim behind a modal.
 //!
@@ -124,6 +125,12 @@ pub struct Palette {
     pub map_ocean: Oklch,
     /// The land a map fills, one visible step away from the sea so a coastline reads.
     pub map_land: Oklch,
+    /// The land borders drawn over the land and the sea.
+    pub map_border: Oklch,
+    /// Motorways and trunks, the wider of the map's two road strokes.
+    pub map_road: Oklch,
+    /// Primary roads, the finer of the two road strokes.
+    pub map_road_minor: Oklch,
     /// Text drawn on a saturated fill (`brand`, `status.danger`).
     pub on_brand: Oklch,
     /// Text drawn on the inverse block (a tooltip, a solid neutral badge).
@@ -190,6 +197,13 @@ impl Palette {
             // pair on a map that has to read as a coastline, so it carries the 1.5:1 of §10.
             map_ocean: Oklch::new(0.938, 0.028, 235.0, opacity),
             map_land: Oklch::new(0.800, 0.045, 85.0, opacity),
+            // The three strokes laid over those fills, authored at the colors the map was first
+            // drawn with so the two appearances read as they did. Each carries the floor §10
+            // gives it: a border 3:1 on both fills, a motorway 3:1 on the land and 2:1 over the
+            // water it bridges, and a primary road 1.5:1 on the land it is mostly on.
+            map_border: Oklch::new(0.465, 0.020, 278.0, opacity),
+            map_road: Oklch::new(0.490, 0.010, 0.0, opacity),
+            map_road_minor: Oklch::new(0.648, 0.013, 278.0, opacity),
             on_brand: Oklch::new(0.978, 0.0, 0.0, opacity),
             on_inverse: Oklch::new(0.978, 0.0, 0.0, opacity),
             scrim_alpha: 0.42,
@@ -253,6 +267,11 @@ impl Palette {
             // sea kept near the face the chart series were checked on.
             map_ocean: Oklch::new(0.200, 0.032, 245.0, opacity),
             map_land: Oklch::new(0.350, 0.024, 85.0, opacity),
+            // The same three strokes on the night chart, lifted with the page: a stroke left at
+            // the light appearance's value would be the one thing on the map that went missing.
+            map_border: Oklch::new(0.635, 0.014, 253.6, opacity),
+            map_road: Oklch::new(0.660, 0.010, 0.0, opacity),
+            map_road_minor: Oklch::new(0.548, 0.014, 253.4, opacity),
             on_brand: Oklch::new(0.176, 0.020, 245.0, opacity),
             on_inverse: Oklch::new(0.176, 0.016, 252.4, opacity),
             scrim_alpha: 0.55,

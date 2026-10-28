@@ -645,6 +645,7 @@ widget:
   force_order:
     table: 来自 %{markets} 的实时强平订单
   global_shipping_chokepoint:
+    attribution: © OpenStreetMap 贡献者
     entitlement_required: 当前账户不包含 AIS 船舶数据订阅
     hover:
       call_sign: 呼号

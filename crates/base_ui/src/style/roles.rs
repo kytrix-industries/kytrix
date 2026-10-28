@@ -170,6 +170,12 @@ pub struct ChartRoles {
     pub map_ocean: ResolvedColor,
     /// The land a map fills, held one visible step off `map_ocean` so a coastline reads.
     pub map_land: ResolvedColor,
+    /// The land borders drawn over both map fills.
+    pub map_border: ResolvedColor,
+    /// Motorways and trunks, drawn over the land and over the water a bridge carries them.
+    pub map_road: ResolvedColor,
+    /// Primary roads, the finer of the map's two road strokes.
+    pub map_road_minor: ResolvedColor,
     /// The six series a multi-line or multi-bar chart is drawn with, in order.
     pub series: [ResolvedColor; 6],
 }
@@ -320,6 +326,11 @@ impl Roles {
             // and the land is the palette's own step away from it (§10).
             map_ocean: resolve(palette.map_ocean),
             map_land: resolve(palette.map_land),
+            // The three strokes over the map's fills are authored for the same reason the fills
+            // are: they are read against the land and the sea rather than against a surface.
+            map_border: resolve(palette.map_border),
+            map_road: resolve(palette.map_road),
+            map_road_minor: resolve(palette.map_road_minor),
             series: [
                 resolve(palette.series[0]),
                 resolve(palette.series[1]),
@@ -363,14 +374,18 @@ impl Roles {
     /// pairs plus the overlay step §7.1 measures, with the overlay held to the raised surface's
     /// floor rather than to the 1.00 it cannot fail. The three series the chart gained for
     /// indicator lines add three more floors, and the fifth status color adds two (its fill and
-    /// its chip tint). The map adds two more. §10 holds its coastline — `chart.map_land` against
-    /// `chart.map_ocean` — to 1.5:1, stricter than either surface step, because a map is drawn
-    /// from exactly those two fills and nothing else. The land is read against `surface.sunken`
+    /// its chip tint). The map adds seven. §10 holds its coastline — `chart.map_land` against
+    /// `chart.map_ocean` — to 1.5:1, stricter than either surface step, because those two fills
+    /// are the base the whole map is drawn on. The land is read against `surface.sunken`
     /// as well, the chart face the map is drawn on, so a land fill cannot dissolve into the face
-    /// behind it while the sea stays close enough to that face for the chart series to read.
-    /// That is fifty-two entries; the acceptance test resolves each appearance separately and
+    /// behind it while the sea stays close enough to that face for the chart series to read. The
+    /// three strokes over those fills carry the floors their job gives them: a border reads on
+    /// both fills, a motorway reads on both because a bridge or a causeway carries it over the
+    /// water, and a primary road is a texture on the land rather than a line to follow, so it is
+    /// held to the 1.5:1 of a visible step.
+    /// That is fifty-seven entries; the acceptance test resolves each appearance separately and
     /// checks its own table.
-    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 52] {
+    fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 57] {
         [
             (
                 "fg.default on surface.canvas",
@@ -648,10 +663,10 @@ impl Roles {
                 self.surface.sunken,
                 3.0,
             ),
-            // §10's coastline floor: a map is drawn from exactly two fills, so the pair a reader
-            // follows the shore with is held to 1.5:1 — the map's own floor, stricter than the
-            // surface steps (1.02/1.05). The acceptance test resolves each appearance and
-            // checks its own table, so both coastlines are read.
+            // §10's coastline floor: the two fills are the base the whole map is drawn on, so the
+            // pair a reader follows the shore with is held to 1.5:1 — the map's own floor,
+            // stricter than the surface steps (1.02/1.05). The acceptance test resolves each
+            // appearance and checks its own table, so both coastlines are read.
             (
                 "chart.map_land on chart.map_ocean",
                 self.chart.map_land,
@@ -666,6 +681,42 @@ impl Roles {
                 "chart.map_land on surface.sunken",
                 self.chart.map_land,
                 self.surface.sunken,
+                1.5,
+            ),
+            // The strokes laid over the fills. A border and a motorway are lines a reader follows
+            // across the whole map, so each is held to 3:1 on the land it crosses; the motorway
+            // also reads at 2:1 over the water, where a bridge or a causeway carries it and where
+            // a thinner reading is still a road rather than a gap. A primary road is the finer
+            // texture below them, so it carries the 1.5:1 of a visible step on the land it is
+            // mostly drawn on.
+            (
+                "chart.map_border on chart.map_land",
+                self.chart.map_border,
+                self.chart.map_land,
+                3.0,
+            ),
+            (
+                "chart.map_border on chart.map_ocean",
+                self.chart.map_border,
+                self.chart.map_ocean,
+                3.0,
+            ),
+            (
+                "chart.map_road on chart.map_land",
+                self.chart.map_road,
+                self.chart.map_land,
+                3.0,
+            ),
+            (
+                "chart.map_road on chart.map_ocean",
+                self.chart.map_road,
+                self.chart.map_ocean,
+                2.0,
+            ),
+            (
+                "chart.map_road_minor on chart.map_land",
+                self.chart.map_road_minor,
+                self.chart.map_land,
                 1.5,
             ),
             (
@@ -1130,6 +1181,81 @@ mod tests {
         }
     }
 
+    /// A border is drawn over both map fills, so it is read on both.
+    ///
+    /// Like the coastline test above, this reads the pair directly rather than through
+    /// `contrast_floors`, so the floor is asserted here even if the table loses its entry.
+    #[test]
+    fn map_border_reads_on_both_map_fills() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+
+            for (fill_name, fill) in [
+                ("chart.map_land", roles.chart.map_land),
+                ("chart.map_ocean", roles.chart.map_ocean),
+            ] {
+                let ratio = contrast(roles.chart.map_border, fill);
+
+                assert!(
+                    ratio >= 3.0,
+                    "{:?}: chart.map_border reads {ratio:.2}:1 on {fill_name}, where the map \
+                     floor is 3.00:1",
+                    palette.appearance
+                );
+            }
+        }
+    }
+
+    /// A motorway is a line a reader follows across the land, so it is held to 3:1 there.
+    #[test]
+    fn map_road_reads_on_the_land_fill() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+            let ratio = contrast(roles.chart.map_road, roles.chart.map_land);
+
+            assert!(
+                ratio >= 3.0,
+                "{:?}: chart.map_road reads {ratio:.2}:1 on chart.map_land, where the map floor \
+                 is 3.00:1",
+                palette.appearance
+            );
+        }
+    }
+
+    /// A bridge or a causeway carries a motorway over the water, so the same stroke is read on
+    /// the sea as well — at 2:1, the floor a line that only crosses water has to clear.
+    #[test]
+    fn map_road_reads_on_the_ocean_fill() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+            let ratio = contrast(roles.chart.map_road, roles.chart.map_ocean);
+
+            assert!(
+                ratio >= 2.0,
+                "{:?}: chart.map_road reads {ratio:.2}:1 on chart.map_ocean, where the map floor \
+                 is 2.00:1",
+                palette.appearance
+            );
+        }
+    }
+
+    /// A primary road is the finer texture below the motorways, so it carries the 1.5:1 of a
+    /// visible step on the land it is mostly drawn on.
+    #[test]
+    fn map_road_minor_reads_on_the_land_fill() {
+        for palette in palettes() {
+            let roles = Roles::resolve(&palette);
+            let ratio = contrast(roles.chart.map_road_minor, roles.chart.map_land);
+
+            assert!(
+                ratio >= 1.5,
+                "{:?}: chart.map_road_minor reads {ratio:.2}:1 on chart.map_land, where the map \
+                 floor is 1.50:1",
+                palette.appearance
+            );
+        }
+    }
+
     /// Every role with a name, so a check can be written once and run against all of them.
     fn roles_with_names(roles: &Roles) -> Vec<(&'static str, ResolvedColor)> {
         vec![
@@ -1184,6 +1310,9 @@ mod tests {
             ("chart.crosshair", roles.chart.crosshair),
             ("chart.map_ocean", roles.chart.map_ocean),
             ("chart.map_land", roles.chart.map_land),
+            ("chart.map_border", roles.chart.map_border),
+            ("chart.map_road", roles.chart.map_road),
+            ("chart.map_road_minor", roles.chart.map_road_minor),
             ("chart.series[0]", roles.chart.series[0]),
             ("chart.series[1]", roles.chart.series[1]),
             ("chart.series[2]", roles.chart.series[2]),

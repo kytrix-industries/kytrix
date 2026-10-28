@@ -645,6 +645,7 @@ widget:
   force_order:
     table: Live force orders from %{markets}
   global_shipping_chokepoint:
+    attribution: © OpenStreetMap contributors
     entitlement_required: This account does not include the AIS vessel feed
     hover:
       call_sign: Call sign
