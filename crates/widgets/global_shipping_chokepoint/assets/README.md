@@ -183,8 +183,10 @@ triangle count; it is the only build statistic the parser's tolerance depends
 on. The rings are 24,700 points in 844 closed rings; a tessellator that drops
 each ring's repeated closing point would emit `24,700 - 3 × 844 = 22,168`
 triangles, and lyon emits **22,158** at `1e-6` — the count `src/scene.rs` pins.
-At 1× that is ≈22.2k land + 2.3k borders + 19.9k `E_MIN` roads + 1.8k
-ships/TSS, about 46k triangles, well under the 75k budget.
+At 1× one frame draws **52,532** triangles with a full picture of 1,000 vessels:
+22,158 land + 2,278 borders + 19,898 `E_MIN` roads + 150 lane dashes + 8,000
+vessel dots + a 48-triangle hover ring, against the 75,000 ceiling. See
+"Runtime contract" below.
 
 ## Format: KHL2
 
@@ -249,6 +251,67 @@ to `f64`) is bit-equal and any epsilon passes. Compared against the *decimal*
 literals instead, the west edge is off by **1.862e-6°** (south 7.9e-7°, east 0,
 north 1.8e-7°), which is more than plan §4.1's 1e-6°: a comparison against `f64`
 literals needs an epsilon above 1.9e-6° (use 1e-5°).
+
+## Runtime contract
+
+`src/scene.rs` parses the file once (a `OnceLock`), projects every point to Web
+Mercator radians and tessellates the land; `src/paint.rs` builds the frame's ten
+paths from it. What the widget does with this asset:
+
+**Road LOD.** There is one D+E section; `model::road_filter` picks the level
+from the clamped zoom, so no rebuild is needed when a threshold moves:
+
+| zoom | filter | rule | triangles in the asset |
+|---|---|---|---|
+| `< 1.6` | `EMin` | class 0 (motorway/trunk), has `ref`, `length_m >= 1000` | 19,898 |
+| `1.6 .. < 2.8` | `EAll` | class 0 | 46,962 |
+| `>= 2.8` | `De` | everything, cut to the viewport by the cell table | 92,328 |
+
+The two thresholds are a visual-density choice, not a performance limit. Roads
+and borders are screen-space ribbons: 1.0 px for a border, 1.2 px for a
+motorway or trunk, 1.0 px for a primary road; two triangles per segment, and no
+casing.
+
+**Land culling.** The rings tessellate into 22,158 triangles at `1e-6`. A frame
+visits the cells its viewport touches plus one cell of margin, which covers
+every triangle whose box spans at most two cells on each axis. The tessellator
+also emits triangles spanning most of the map — the widest covers 51×18 cells,
+23.4% of the map box — and those are 98.8% of the land's area, so bucketing
+them by centroid would hide nearly all of it. The 3,267 too-wide triangles are
+kept aside (`LandLayer::wide`) and tested against the viewport's own rectangle
+every frame. Grid rows are latitude bands in the build **and** in the parser:
+reading the row off Mercator `y` would land up to a quarter row away from the
+cell the build wrote.
+
+**Budget.** One frame with a full picture of 1,000 vessels — each at its most
+expensive, an 8-segment dot for a vessel whose ship record has not arrived — and
+the hover ring:
+
+| view | triangles |
+|---|---|
+| fitted 1×, whole map, `EMin` | 52,532 |
+| 1.6× at 53.5°E 25.3°N, `EAll` (the densest view found) | 63,426 |
+| 4× over Dubai, `De` | 44,373 |
+
+The ceiling is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`): 8.58 ms of fixed
+frame cost plus 107 ns per triangle still fits a 16.65 ms frame.
+`the_visible_triangle_budget_is_under_the_frame_budget` pins all three counts.
+They are model values from that budget, not frame times measured on a machine.
+
+**Theme.** Five map roles, all opaque and all read from the theme every frame by
+`MapColors::resolve`: `chart.map_ocean`, `chart.map_land`, `chart.map_border`,
+`chart.map_road` (motorway/trunk) and `chart.map_road_minor` (primary). Their
+floors are in `roles.rs::contrast_floors`: border on land and on ocean 3:1, road
+on land 3:1 and on ocean 2:1 (a bridge or causeway over the water), minor road
+on land 1.5:1, land on ocean 1.5:1. No map colour is hard-coded in the widget.
+
+**Attribution.** The widget draws `© OpenStreetMap contributors`
+(`© OpenStreetMap 贡献者` in Chinese) in the map's bottom-left corner, in
+`text_xs` and `colors.text` — the muted step does not reach the 4.5:1 a
+paragraph is held to on the land — and a click opens
+<https://www.openstreetmap.org/copyright>. The legend is raised to 32 px above
+the map's bottom edge so the credit has its own line, and the stale badge in the
+top-left is nowhere near it.
 
 ## Licence and attribution (ODbL)
 

@@ -108,6 +108,7 @@ class Collector(osmium.SimpleHandler):
         self.roads: dict[int, tuple[str, bool, list[tuple[float, float]]]] = {}
         self.admin_level_2 = 0
         self.maritime_rejected = 0
+        self.maritime_ids: set[int] = set()
         self.border_duplicates = 0
         self.road_duplicates = 0
 
@@ -131,6 +132,7 @@ class Collector(osmium.SimpleHandler):
         self.admin_level_2 += 1
         if tags.get("maritime") == "yes":
             self.maritime_rejected += 1
+            self.maritime_ids.add(handler.id)
             return
         coords = way_coords(handler)
         if coords is None:
@@ -241,6 +243,19 @@ def read_pbfs(paths: list[Path]) -> Collector:
         f"border, {collector.road_duplicates:,} road",
         flush=True,
     )
+    # The maritime filter is the one border rule the runtime cannot check, so the build
+    # asserts it here: a way tagged `maritime=yes` must never reach the packed border
+    # set, and the extracts must contain some, or the filter is never exercised.
+    leaked = collector.maritime_ids.intersection(collector.borders)
+    if leaked:
+        raise SystemExit(
+            f"error: {len(leaked):,} ways tagged maritime=yes were packed as borders"
+        )
+    if not collector.maritime_ids:
+        raise SystemExit(
+            "error: no boundary=administrative + admin_level=2 way is tagged "
+            "maritime=yes, so the maritime filter was never exercised"
+        )
     return collector
 
 
