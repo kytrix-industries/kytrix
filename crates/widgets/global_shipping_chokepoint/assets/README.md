@@ -4,9 +4,7 @@ The OSM vector base map the Hormuz vessel widget draws under its vessels: the
 coastline, the land borders and the motorway/trunk/primary roads around the
 Strait of Hormuz, packed into one KHL2 file and embedded with `include_bytes!`.
 
-`hormuz_land.bin` next to it is the previous KHL1 asset (Natural Earth, one
-section, no borders or roads); `src/scene.rs` still embeds it until the KHL2
-parser lands. This README describes the replacement.
+`src/scene.rs` parses it as KHL2; it is the only asset here.
 
 ## Two steps: download, then build
 
@@ -21,8 +19,7 @@ root `.gitignore` ignores
 `crates/widgets/global_shipping_chokepoint/assets/*.zip`,
 `crates/widgets/global_shipping_chokepoint/assets/*.part` and
 `crates/widgets/global_shipping_chokepoint/assets/*.tmp`; the tracked files
-here are this README, the two scripts, the old `hormuz_land.bin` and the
-generated `hormuz_map.bin`.
+here are this README, the two scripts and the generated `hormuz_map.bin`.
 
 `download_map.py` downloads with the system `curl`
 (`-L --fail --retry 3 -C -`), each file into `<name>.part`, renamed with
@@ -183,11 +180,11 @@ reads badly at 1×, plan §8/R4 widens `E_MIN` to "has `ref` or `length_m >=
 12 land segments are shorter than 16 m. Plan §4.1 makes that the trigger for
 lowering `TESSELLATION_TOLERANCE` from `5e-6` to `1e-6` and re-pinning the land
 triangle count; it is the only build statistic the parser's tolerance depends
-on. The rings are 24,700 points in 844 closed rings, so a tessellator that drops
-each ring's repeated closing point emits about `24,700 - 3 × 844 = 22,168`
-triangles (the KHL1 asset's pinned 5,518 was 5 above its own `V - 3R`); pin what
-lyon actually emits. At 1× that is ≈22.2k land + 2.3k borders + 19.9k `E_MIN`
-roads + 1.8k ships/TSS, about 46k triangles, well under the 75k budget.
+on. The rings are 24,700 points in 844 closed rings; a tessellator that drops
+each ring's repeated closing point would emit `24,700 - 3 × 844 = 22,168`
+triangles, and lyon emits **22,158** at `1e-6` — the count `src/scene.rs` pins.
+At 1× that is ≈22.2k land + 2.3k borders + 19.9k `E_MIN` roads + 1.8k
+ships/TSS, about 46k triangles, well under the 75k budget.
 
 ## Format: KHL2
 

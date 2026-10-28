@@ -38,13 +38,18 @@ use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
 /// The west edge of the map, in degrees east.
-pub(super) const MAP_WEST: f32 = 48.0;
+pub(super) const MAP_WEST: f32 = 47.802;
 /// The east edge of the map, in degrees east.
-pub(super) const MAP_EAST: f32 = 62.0;
+pub(super) const MAP_EAST: f32 = 61.875;
 /// The south edge of the map, in degrees north.
-pub(super) const MAP_SOUTH: f32 = 21.5;
+pub(super) const MAP_SOUTH: f32 = 21.943;
 /// The north edge of the map, in degrees north.
-pub(super) const MAP_NORTH: f32 = 28.5;
+pub(super) const MAP_NORTH: f32 = 29.542;
+
+/// The culling grid's columns, west to east.
+pub(super) const GRID_COLS: u32 = 64;
+/// The culling grid's rows, south to north.
+pub(super) const GRID_ROWS: u32 = 32;
 
 /// The most vessels one picture holds.
 ///
@@ -219,6 +224,16 @@ pub(super) fn mercator_bounds() -> [f32; 4] {
     [west, south, east, north]
 }
 
+/// The latitude a Mercator `y` stands for, in degrees.
+///
+/// The culling grid's rows are latitude bands: the build cut them in degrees, so the
+/// row axis is read back through the projection instead of off the Mercator `y`.
+/// Over this box the two differ by up to a quarter of a row, which is enough to put a
+/// piece in the cell beside the one the asset's own cell table put it in.
+pub(super) fn latitude_of(mercator_y: f32) -> f32 {
+    (2.0 * mercator_y.exp().atan() - std::f32::consts::FRAC_PI_2).to_degrees()
+}
+
 /// The pixels one Mercator unit is drawn at when the whole map is fitted.
 ///
 /// The camera's scale is this times [`Camera::zoom`]. A viewport with no area — a
@@ -232,6 +247,123 @@ pub(super) fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
 
     let [west, south, east, north] = mercator_bounds();
     (width / (east - west)).min(height / (north - south))
+}
+
+/// The grid cells a viewport touches, as inclusive column and row indices.
+///
+/// A span rather than a `RangeInclusive` pair because the frame hands it to the land
+/// layer and, once the line layers are drawn, to those too: `RangeInclusive` is not
+/// `Copy`, so it could not be passed three times. A span whose start is past its end
+/// covers nothing — what a viewport entirely off the map reads as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CellSpan {
+    /// The first column the viewport touches, west to east.
+    pub col_start: u32,
+    /// The last column the viewport touches.
+    pub col_end: u32,
+    /// The first row the viewport touches, south to north.
+    pub row_start: u32,
+    /// The last row the viewport touches.
+    pub row_end: u32,
+}
+
+impl CellSpan {
+    /// The span that covers no cell at all.
+    const EMPTY: Self = Self {
+        col_start: 1,
+        col_end: 0,
+        row_start: 1,
+        row_end: 0,
+    };
+
+    /// Whether the span covers no cell.
+    pub(super) fn is_empty(self) -> bool {
+        self.col_start > self.col_end || self.row_start > self.row_end
+    }
+
+    /// The grid index of every cell the span covers, in row-major order.
+    ///
+    /// The index is `row * GRID_COLS + col`, which is what the asset's cell tables
+    /// and the land layer's buckets are keyed by.
+    pub(super) fn indices(self) -> impl Iterator<Item = u32> {
+        (self.row_start..=self.row_end).flat_map(move |row| {
+            (self.col_start..=self.col_end).map(move |col| row * GRID_COLS + col)
+        })
+    }
+
+    /// The span grown by one cell on every side, clamped to the grid.
+    ///
+    /// The land is bucketed by triangle centroid, so a triangle whose centroid falls
+    /// just outside the viewport can still reach into it. The line layers are cut per
+    /// cell by the build and need no margin. An empty span stays empty: growing it
+    /// would invent a cell a viewport off the map never touched.
+    pub(super) fn grown(self) -> Self {
+        if self.is_empty() {
+            return self;
+        }
+        Self {
+            col_start: self.col_start.saturating_sub(1),
+            col_end: self.col_end.saturating_add(1).min(GRID_COLS - 1),
+            row_start: self.row_start.saturating_sub(1),
+            row_end: self.row_end.saturating_add(1).min(GRID_ROWS - 1),
+        }
+    }
+}
+
+/// The cells a Mercator rectangle touches, clamped to the grid.
+///
+/// `visible` is `[west, south, east, north]` in Mercator radians. A rectangle that
+/// does not overlap the map at all reads as an empty span, whose start is past its
+/// end, so every layer it is handed to draws nothing.
+pub(super) fn visible_cells(visible: [f32; 4]) -> CellSpan {
+    let [west, _, east, _] = mercator_bounds();
+    if !visible.iter().all(|edge| edge.is_finite()) {
+        return CellSpan::EMPTY;
+    }
+    let Some((col_start, col_end)) = cell_range(visible[0], visible[2], west, east, GRID_COLS)
+    else {
+        return CellSpan::EMPTY;
+    };
+    // The rows are latitude bands, not Mercator bands: the build cut the asset's cell
+    // table in degrees, so the viewport's Mercator edges are converted back first.
+    let Some((row_start, row_end)) = cell_range(
+        latitude_of(visible[1]),
+        latitude_of(visible[3]),
+        MAP_SOUTH,
+        MAP_NORTH,
+        GRID_ROWS,
+    ) else {
+        return CellSpan::EMPTY;
+    };
+    CellSpan {
+        col_start,
+        col_end,
+        row_start,
+        row_end,
+    }
+}
+
+/// The inclusive cells one axis of a rectangle touches, or `None` when it misses the map.
+///
+/// The low edge selects the cell it falls in and the high edge the last cell it
+/// reaches into, so a rectangle ending exactly on a grid line does not claim the cell
+/// past it. Both are clamped: a viewport wider than the map touches every cell, not
+/// cells that do not exist, and a degenerate one on the far edge still touches the
+/// edge cell.
+fn cell_range(low: f32, high: f32, map_low: f32, map_high: f32, cells: u32) -> Option<(u32, u32)> {
+    if !low.is_finite() || !high.is_finite() || high < low {
+        return None;
+    }
+    if low > map_high || high < map_low {
+        return None;
+    }
+
+    let last = cells as f32 - 1.0;
+    let per_cell = cells as f32 / (map_high - map_low);
+    let first = ((low - map_low) * per_cell).floor().clamp(0.0, last);
+    let reached = (((high - map_low) * per_cell).ceil() - 1.0).clamp(0.0, last);
+    let reached = reached.max(first);
+    Some((first as u32, reached as u32))
 }
 
 /// Where the map is looking, and how far in.
@@ -1995,6 +2127,306 @@ mod tests {
             vessel.facing(),
             0.0,
             "a report that knows neither faces north",
+        );
+    }
+
+    /// The rectangle a camera at `zoom` shows through a `viewport`, in Mercator radians.
+    fn visible_rect(viewport: [f32; 2], zoom: f32) -> [f32; 4] {
+        let scale = fit_px_per_merc(viewport) * zoom;
+        let centre = map_centre();
+        let half = [viewport[0] / (2.0 * scale), viewport[1] / (2.0 * scale)];
+        [
+            centre[0] - half[0],
+            centre[1] - half[1],
+            centre[0] + half[0],
+            centre[1] + half[1],
+        ]
+    }
+
+    /// The whole grid, which is what a span that covers every cell reads as.
+    fn whole_grid() -> CellSpan {
+        CellSpan {
+            col_start: 0,
+            col_end: GRID_COLS - 1,
+            row_start: 0,
+            row_end: GRID_ROWS - 1,
+        }
+    }
+
+    #[test]
+    fn the_visible_cells_cover_the_whole_map_at_the_fitted_zoom() {
+        // The fitted camera shows the whole map: one axis exactly, the other with
+        // margin to spare. Both are clamped to the grid, so the span is every cell.
+        for viewport in [[1_600.0, 866.0], [866.0, 1_600.0], [800.0, 600.0]] {
+            assert_eq!(
+                visible_cells(visible_rect(viewport, MIN_ZOOM)),
+                whole_grid(),
+                "a fitted {viewport:?} viewport must cull nothing",
+            );
+        }
+
+        // A viewport wider than the map on both axes does not invent cells either.
+        let [west, south, east, north] = mercator_bounds();
+        let margin = (east - west) / 4.0;
+        assert_eq!(
+            visible_cells([west - margin, south - margin, east + margin, north + margin,]),
+            whole_grid(),
+        );
+    }
+
+    #[test]
+    fn the_visible_cells_are_roughly_a_thirteenth_to_a_sixteenth_at_four_times() {
+        // The design measures the culling win on a 1,600×866 pane at four times the
+        // fitted zoom. The map's Mercator aspect is about 1.67, so the viewport is
+        // wider than it is tall and the height is what the fit is read from.
+        let span = visible_cells(visible_rect([1_600.0, 866.0], MAX_ZOOM));
+        let columns = span.col_end - span.col_start + 1;
+        let rows = span.row_end - span.row_start + 1;
+        let visible = f64::from(columns) * f64::from(rows);
+        let ratio = f64::from(GRID_COLS * GRID_ROWS) / visible;
+
+        assert!(
+            (12.0..=20.0).contains(&ratio),
+            "four times the fitted zoom should show about 1/13 of the grid, not 1/{ratio:.1} \
+             ({columns} columns × {rows} rows)",
+        );
+    }
+
+    #[test]
+    fn a_viewport_outside_the_map_box_covers_no_cell() {
+        let [west, south, east, north] = mercator_bounds();
+        for outside in [
+            [west - 1.0, south, west - 0.9, north],
+            [east + 0.1, south, east + 1.0, north],
+            [west, south - 1.0, east, south - 0.9],
+            [west, north + 0.1, east, north + 1.0],
+        ] {
+            let span = visible_cells(outside);
+            assert!(span.is_empty(), "{outside:?} is off the map");
+            assert_eq!(span.indices().count(), 0, "an empty span draws nothing");
+        }
+
+        assert!(
+            visible_cells([east, south, west, north]).is_empty(),
+            "west past east"
+        );
+        assert!(visible_cells([f32::NAN, south, east, north]).is_empty());
+    }
+
+    #[test]
+    fn a_degenerate_viewport_covers_one_cell_and_a_far_edge_still_counts() {
+        let [west, south, east, north] = mercator_bounds();
+        let centre = map_centre();
+
+        // No area at all: one cell, and its start equals its end.
+        let point = visible_cells([centre[0], centre[1], centre[0], centre[1]]);
+        assert_eq!(point.col_start, point.col_end);
+        assert_eq!(point.row_start, point.row_end);
+        assert_eq!(
+            point.indices().count(),
+            1,
+            "a point covers exactly one cell"
+        );
+
+        // Zero width: one column, every row.
+        let column = visible_cells([centre[0], south, centre[0], north]);
+        assert_eq!(column.col_start, column.col_end);
+        assert_eq!((column.row_start, column.row_end), (0, GRID_ROWS - 1));
+
+        // Zero height: one row, every column.
+        let row = visible_cells([west, centre[1], east, centre[1]]);
+        assert_eq!((row.col_start, row.col_end), (0, GRID_COLS - 1));
+        assert_eq!(row.row_start, row.row_end);
+
+        // The far edges are grid lines: a viewport sitting on one touches the edge cell.
+        let far = visible_cells([east, south, east, north]);
+        assert!(!far.is_empty());
+        assert_eq!(far.col_start, GRID_COLS - 1);
+        let top = visible_cells([west, north, east, north]);
+        assert!(!top.is_empty());
+        assert_eq!(top.row_end, GRID_ROWS - 1);
+    }
+
+    #[test]
+    fn a_viewport_with_no_finite_edge_covers_no_cell() {
+        let [west, south, east, north] = mercator_bounds();
+        for edge in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for slot in 0..4 {
+                let mut visible = [west, south, east, north];
+                visible[slot] = edge;
+                assert!(
+                    visible_cells(visible).is_empty(),
+                    "{visible:?} has a {edge} edge",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_range_stops_at_the_cell_the_high_edge_ends_in() {
+        // One cell per unit over `0..10`, so every edge below is exact in `f32`: this is
+        // the arithmetic the row and column axes are both read with, without the
+        // projection's rounding on top of it.
+        assert_eq!(cell_range(0.0, 5.0, 0.0, 10.0, 10), Some((0, 4)));
+        assert_eq!(cell_range(5.0, 10.0, 0.0, 10.0, 10), Some((5, 9)));
+        // A degenerate range on a grid line is the cell before it, and on the far edge
+        // the edge cell itself — never one that does not exist.
+        assert_eq!(cell_range(5.0, 5.0, 0.0, 10.0, 10), Some((5, 5)));
+        assert_eq!(cell_range(10.0, 10.0, 0.0, 10.0, 10), Some((9, 9)));
+        // A range that reaches in from outside is clamped to the edge cell.
+        assert_eq!(cell_range(-5.0, 0.0, 0.0, 10.0, 10), Some((0, 0)));
+        assert_eq!(cell_range(9.0, 15.0, 0.0, 10.0, 10), Some((9, 9)));
+        // A range that misses the map, or runs backwards, covers nothing.
+        assert_eq!(cell_range(-5.0, -1.0, 0.0, 10.0, 10), None);
+        assert_eq!(cell_range(10.5, 11.0, 0.0, 10.0, 10), None);
+        assert_eq!(cell_range(4.0, 3.0, 0.0, 10.0, 10), None);
+        assert_eq!(cell_range(f32::NAN, 3.0, 0.0, 10.0, 10), None);
+        assert_eq!(cell_range(0.0, f32::INFINITY, 0.0, 10.0, 10), None);
+    }
+
+    #[test]
+    fn an_empty_span_draws_nothing_and_stays_empty_when_grown() {
+        assert!(CellSpan::EMPTY.is_empty());
+        assert_eq!(CellSpan::EMPTY.indices().count(), 0);
+        assert_eq!(CellSpan::EMPTY.grown(), CellSpan::EMPTY);
+
+        for empty in [
+            CellSpan {
+                col_start: 5,
+                col_end: 4,
+                row_start: 0,
+                row_end: 3,
+            },
+            CellSpan {
+                col_start: 0,
+                col_end: 3,
+                row_start: 5,
+                row_end: 4,
+            },
+        ] {
+            assert!(empty.is_empty(), "a start past its end covers nothing");
+            assert_eq!(empty.indices().count(), 0);
+            assert_eq!(empty.grown(), empty);
+        }
+
+        // `start == end` is one cell, not none.
+        let one = CellSpan {
+            col_start: 7,
+            col_end: 7,
+            row_start: 9,
+            row_end: 9,
+        };
+        assert!(!one.is_empty());
+        assert_eq!(one.indices().collect::<Vec<_>>(), [9 * GRID_COLS + 7]);
+    }
+
+    #[test]
+    fn the_rows_are_latitude_bands_not_mercator_bands() {
+        // The asset's cell table was cut in degrees, so the row axis is read through
+        // the projection. Over this box the two axes differ by up to a quarter of a
+        // row, which is what the conversion is for.
+        let [west, south, east, north] = mercator_bounds();
+        let visible = [
+            west,
+            project(MAP_WEST, 25.0)[1],
+            east,
+            project(MAP_WEST, 26.0)[1],
+        ];
+        let span = visible_cells(visible);
+        let first =
+            ((25.0 - MAP_SOUTH) / (MAP_NORTH - MAP_SOUTH) * GRID_ROWS as f32).floor() as u32;
+        let last =
+            (((26.0 - MAP_SOUTH) / (MAP_NORTH - MAP_SOUTH) * GRID_ROWS as f32).ceil() - 1.0) as u32;
+        assert_eq!((span.row_start, span.row_end), (first, last));
+        assert_eq!((span.col_start, span.col_end), (0, GRID_COLS - 1));
+
+        let mut worst = 0.0f32;
+        for step in 0..=100 {
+            let latitude = MAP_SOUTH + (MAP_NORTH - MAP_SOUTH) * step as f32 / 100.0;
+            let by_latitude = (latitude - MAP_SOUTH) / (MAP_NORTH - MAP_SOUTH) * GRID_ROWS as f32;
+            let by_mercator =
+                (project(MAP_WEST, latitude)[1] - south) / (north - south) * GRID_ROWS as f32;
+            worst = worst.max((by_mercator - by_latitude).abs());
+        }
+        assert!(
+            worst > 0.2,
+            "the two row axes only differ by {worst} rows; the conversion is untested",
+        );
+    }
+
+    #[test]
+    fn the_latitude_axis_inverts_the_projection() {
+        // `visible_cells` reads the row axis back through the projection, so the
+        // conversion has to be the exact inverse at both edges of the box and monotone in
+        // between: a step that went backwards would drop a row from a viewport.
+        for latitude in [MAP_SOUTH, MAP_NORTH] {
+            let [_, y] = project(MAP_WEST, latitude);
+            let back = latitude_of(y);
+            assert!(
+                (back - latitude).abs() < 1e-5,
+                "{latitude}° projects to {y} and reads back as {back}°",
+            );
+        }
+
+        let mut previous = f32::NEG_INFINITY;
+        let mut worst = 0.0f32;
+        for step in 0..=1_000 {
+            let latitude = MAP_SOUTH + (MAP_NORTH - MAP_SOUTH) * step as f32 / 1_000.0;
+            let [_, y] = project(MAP_WEST, latitude);
+            let back = latitude_of(y);
+            assert!(
+                back > previous,
+                "the inverse Mercator goes backwards at {latitude}°",
+            );
+            previous = back;
+            worst = worst.max((back - latitude).abs());
+        }
+        // 7.6e-6° measured: a three-hundredth of the 0.2375° a row spans, and far below\n        // the 0.2199° a column spans, so no edge can fall on the wrong side of a line.\n        assert!(worst < 2e-5, "the inverse Mercator is {worst}° off");
+    }
+
+    #[test]
+    fn a_span_grows_by_one_cell_and_clamps_to_the_grid() {
+        let span = CellSpan {
+            col_start: 10,
+            col_end: 20,
+            row_start: 5,
+            row_end: 6,
+        };
+        assert_eq!(
+            span.grown(),
+            CellSpan {
+                col_start: 9,
+                col_end: 21,
+                row_start: 4,
+                row_end: 7,
+            },
+        );
+
+        assert_eq!(
+            whole_grid().grown(),
+            whole_grid(),
+            "the margin cannot leave the grid"
+        );
+        assert_eq!(CellSpan::EMPTY.grown(), CellSpan::EMPTY);
+    }
+
+    #[test]
+    fn the_span_indices_are_row_major() {
+        let span = CellSpan {
+            col_start: 62,
+            col_end: 63,
+            row_start: 30,
+            row_end: 31,
+        };
+        assert_eq!(
+            span.indices().collect::<Vec<_>>(),
+            [
+                30 * GRID_COLS + 62,
+                30 * GRID_COLS + 63,
+                31 * GRID_COLS + 62,
+                31 * GRID_COLS + 63,
+            ],
+            "the asset's cell tables are keyed row-major",
         );
     }
 }

@@ -67,8 +67,9 @@ use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, CITY_LABELS, COUNTRY_LABELS, Camera, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, STALE_AFTER,
-        ShipClass, TSS_LANES, Vessel, VesselDetails, VesselStore, WATER_LABELS, colour_for,
+        self, CITY_LABELS, COUNTRY_LABELS, Camera, CellSpan, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM,
+        STALE_AFTER, ShipClass, TSS_LANES, Vessel, VesselDetails, VesselStore, WATER_LABELS,
+        colour_for,
     },
     scene::{self, Scene, SceneError},
     service::{
@@ -341,6 +342,25 @@ impl Projection {
         [
             self.center[0] + (canvas[0] - self.viewport[0] / 2.0) / self.scale,
             self.center[1] - (canvas[1] - self.viewport[1] / 2.0) / self.scale,
+        ]
+    }
+
+    /// The Mercator rectangle the canvas shows, as `[west, south, east, north]`.
+    ///
+    /// This is what the culling grid is read from: a layer indexes only the cells this
+    /// rectangle touches. Only meaningful for a drawable projection — a pane with no
+    /// size has no scale to divide by, and every painter checks [`Self::drawable`]
+    /// before it asks.
+    fn visible_mercator(self) -> [f32; 4] {
+        let half = [
+            self.viewport[0] / (2.0 * self.scale),
+            self.viewport[1] / (2.0 * self.scale),
+        ];
+        [
+            self.center[0] - half[0],
+            self.center[1] - half[1],
+            self.center[0] + half[0],
+            self.center[1] + half[1],
         ]
     }
 
@@ -1348,9 +1368,18 @@ fn paint_map(
     // and the hit test deliberately stay in canvas coordinates, because they are laid out by
     // the element tree around the same box.
     let origin = [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
+    // The cells the frame's viewport touches. The land is binned by triangle centroid,
+    // so its span is grown by one cell: a triangle whose centroid falls just outside
+    // the viewport can still reach into it.
+    let visible = projection.visible_mercator();
+    let cells = model::visible_cells(visible);
 
     if let Some(scene) = scene {
-        paint_path(window, land_path(scene, projection, origin), colors.land);
+        paint_path(
+            window,
+            land_path(scene, projection, origin, cells.grown(), visible),
+            colors.land,
+        );
     }
     paint_path(window, lane_path(projection, origin), colors.lane);
 
@@ -1381,14 +1410,24 @@ fn paint_path(window: &mut Window, path: Path<Pixels>, color: Hsla) {
     window.paint_path(path, color);
 }
 
-/// The coastline as one fill, every triangle transformed into the frame's camera.
+/// The coastline as one fill, every visible triangle transformed into the frame's camera.
 ///
-/// The triangles were tessellated once, when the asset was parsed: this is the only step
-/// that runs per frame, and it is an affine transform per vertex.
-fn land_path(scene: &Scene, projection: Projection, origin: [f32; 2]) -> Path<Pixels> {
+/// The triangles were tessellated once, when the asset was parsed, and bucketed into the
+/// culling grid: this walks the cells the viewport touches and applies an affine
+/// transform per vertex. That is the land's only per-frame cost, and it is why a cell
+/// the viewport does not touch costs nothing. `cells` is the viewport's span grown by the
+/// one-cell margin; `visible` is the viewport itself, which the layer needs for the
+/// triangles too wide to bucket by centroid.
+fn land_path(
+    scene: &Scene,
+    projection: Projection,
+    origin: [f32; 2],
+    cells: CellSpan,
+    visible: [f32; 4],
+) -> Path<Pixels> {
     let mut path = Path::new(point(px(0.0), px(0.0)));
     let texture = point(0.0, 1.0);
-    for triangle in scene.land_triangles() {
+    for triangle in scene.land.visible(cells, visible) {
         let [ax, ay, bx, by, cx, cy] = *triangle;
         path.push_triangle(
             (
@@ -2317,9 +2356,15 @@ mod tests {
         // refused keeps its own sentence rather than collapsing into one.
         for error in [
             SceneError::InvalidMagic,
+            SceneError::UnsupportedVersion,
             SceneError::Truncated,
+            SceneError::BboxMismatch,
+            SceneError::GridMismatch,
+            SceneError::MissingSection,
             SceneError::PointCountOverflow,
-            SceneError::VertexCountMismatch,
+            SceneError::BadCellRange,
+            SceneError::PieceNotInAnyCell,
+            SceneError::BadPiece,
             SceneError::TrailingBytes,
             SceneError::Empty,
             SceneError::NonFiniteCoordinate,
@@ -2826,8 +2871,14 @@ mod tests {
         let origin = [41.0, 67.0];
 
         let scene = scene::scene().expect("the checked-in asset parses");
-        let land = land_path(scene, projection, origin);
-        let [ax, ay, _, _, _, _] = scene.land_triangles()[0];
+        let visible = projection.visible_mercator();
+        let cells = model::visible_cells(visible).grown();
+        let land = land_path(scene, projection, origin, cells, visible);
+        let [ax, ay, _, _, _, _] = *scene
+            .land
+            .visible(cells, visible)
+            .next()
+            .expect("the land covers the map box");
         let expected = projection.screen([ax, ay]);
         assert_close(
             f32::from(land.vertices[0].xy_position.x),
