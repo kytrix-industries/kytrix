@@ -85,16 +85,16 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use super::{
-    dialog::FinancialIndicesSelector,
+    dialog::FinancialIndexSelector,
     model::{
-        FinancialIndexDirection, FinancialIndexQuote, FinancialIndicesDataError,
+        FinancialIndexDataError, FinancialIndexDirection, FinancialIndexQuote,
         SelectedFinancialIndex, format_percent, format_price, format_signed_cents,
         normalize_selection,
     },
     service::{
-        FinancialIndicesProtocol, FinancialIndicesRequest, FinancialIndicesScope,
-        FinancialIndicesService, FinancialIndicesServiceError, FinancialIndicesSource,
-        FinancialIndicesStatus, FinancialIndicesStreamError, FinancialIndicesStreamMessage,
+        FinancialIndexProtocol, FinancialIndexRequest, FinancialIndexScope, FinancialIndexService,
+        FinancialIndexServiceError, FinancialIndexSource, FinancialIndexStatus,
+        FinancialIndexStreamError, FinancialIndexStreamMessage,
     },
 };
 
@@ -122,13 +122,13 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
 
 /// Which of the two ways of drawing an answer a pane uses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FinancialIndicesDisplayMode {
+pub enum FinancialIndexDisplayMode {
     #[default]
     Grid,
     Table,
 }
 
-impl FinancialIndicesDisplayMode {
+impl FinancialIndexDisplayMode {
     /// The glyph this mode is drawn as.
     ///
     /// The two are the halves of one switch, so they are drawn as a filled grid of
@@ -144,8 +144,8 @@ impl FinancialIndicesDisplayMode {
     /// The element id of the control that selects this mode.
     const fn control_id(self) -> &'static str {
         match self {
-            Self::Grid => "FinancialIndicesGridMode",
-            Self::Table => "FinancialIndicesTableMode",
+            Self::Grid => "FinancialIndexGridMode",
+            Self::Table => "FinancialIndexTableMode",
         }
     }
 }
@@ -156,25 +156,25 @@ impl FinancialIndicesDisplayMode {
 /// the service applies: a persisted selection is either a selection the service can
 /// follow or a configuration error the framework reports.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct FinancialIndicesConfig {
+pub struct FinancialIndexConfig {
     selection: Vec<SelectedFinancialIndex>,
-    mode: FinancialIndicesDisplayMode,
+    mode: FinancialIndexDisplayMode,
 }
 
-impl Default for FinancialIndicesConfig {
+impl Default for FinancialIndexConfig {
     fn default() -> Self {
         Self {
             selection: Vec::new(),
-            mode: FinancialIndicesDisplayMode::Grid,
+            mode: FinancialIndexDisplayMode::Grid,
         }
     }
 }
 
-impl WidgetConfig for FinancialIndicesConfig {
+impl WidgetConfig for FinancialIndexConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-impl<'de> Deserialize<'de> for FinancialIndicesConfig {
+impl<'de> Deserialize<'de> for FinancialIndexConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -182,7 +182,7 @@ impl<'de> Deserialize<'de> for FinancialIndicesConfig {
         #[derive(Deserialize)]
         struct Wire {
             selection: Vec<SelectedFinancialIndex>,
-            mode: FinancialIndicesDisplayMode,
+            mode: FinancialIndexDisplayMode,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -196,13 +196,13 @@ impl<'de> Deserialize<'de> for FinancialIndicesConfig {
 
 /// A failure a pane reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum FinancialIndicesFailure {
-    Stream(FinancialIndicesStreamError),
-    Rpc(RpcCallError<FinancialIndicesServiceError>),
-    Selection(FinancialIndicesDataError),
+enum FinancialIndexFailure {
+    Stream(FinancialIndexStreamError),
+    Rpc(RpcCallError<FinancialIndexServiceError>),
+    Selection(FinancialIndexDataError),
 }
 
-impl LocalizedError for FinancialIndicesFailure {
+impl LocalizedError for FinancialIndexFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::Stream(error) => error.localized_message(cx),
@@ -214,7 +214,7 @@ impl LocalizedError for FinancialIndicesFailure {
 
 /// One index as a frame draws it: what the pane follows, and what it holds for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FinancialIndicesRow {
+struct FinancialIndexRow {
     index: SelectedFinancialIndex,
     quote: Option<FinancialIndexQuote>,
 }
@@ -237,14 +237,14 @@ impl QuoteFlash {
 }
 
 /// The rows the table draws, which is where the shared table reads them from.
-struct FinancialIndicesTable {
-    rows: Arc<[FinancialIndicesRow]>,
+struct FinancialIndexTable {
+    rows: Arc<[FinancialIndexRow]>,
     /// Whether the pane behind the rows is working, which is what a row without a
     /// quote says instead of a number.
     busy: bool,
 }
 
-impl FinancialIndicesTable {
+impl FinancialIndexTable {
     fn empty() -> Self {
         Self {
             rows: Arc::from([]),
@@ -253,17 +253,17 @@ impl FinancialIndicesTable {
     }
 }
 
-impl TableDataSet<COLUMN_COUNT> for FinancialIndicesTable {
+impl TableDataSet<COLUMN_COUNT> for FinancialIndexTable {
     fn rows_count(&self) -> usize {
         self.rows.len()
     }
 
     fn headers(&self, cx: &App) -> [SharedString; COLUMN_COUNT] {
         [
-            t!(cx, "widget.financial_indices.index"),
-            t!(cx, "widget.financial_indices.latest"),
-            t!(cx, "widget.financial_indices.change"),
-            t!(cx, "widget.financial_indices.change_percent"),
+            t!(cx, "widget.financial_index.index"),
+            t!(cx, "widget.financial_index.latest"),
+            t!(cx, "widget.financial_index.change"),
+            t!(cx, "widget.financial_index.change_percent"),
         ]
     }
 
@@ -280,7 +280,7 @@ impl TableDataSet<COLUMN_COUNT> for FinancialIndicesTable {
             return Empty.into_any_element();
         };
 
-        FinancialIndicesCell {
+        FinancialIndexCell {
             row: row.clone(),
             column: column_index,
             busy: self.busy,
@@ -292,7 +292,7 @@ impl TableDataSet<COLUMN_COUNT> for FinancialIndicesTable {
     /// than a state: the table says so instead of leaving the body under its headers
     /// blank.
     fn empty(&self, cx: &App) -> Option<AnyElement> {
-        Some(EmptyState::new("FinancialIndicesEmpty", t!(cx, "common.no_data")).into_any_element())
+        Some(EmptyState::new("FinancialIndexEmpty", t!(cx, "common.no_data")).into_any_element())
     }
 }
 
@@ -302,13 +302,13 @@ impl TableDataSet<COLUMN_COUNT> for FinancialIndicesTable {
 /// cell that needs a color or a translation is an element of its own, rendered later,
 /// where both are available.
 #[derive(IntoElement)]
-struct FinancialIndicesCell {
-    row: FinancialIndicesRow,
+struct FinancialIndexCell {
+    row: FinancialIndexRow,
     column: usize,
     busy: bool,
 }
 
-impl RenderOnce for FinancialIndicesCell {
+impl RenderOnce for FinancialIndexCell {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let quote = self.row.quote;
@@ -362,11 +362,11 @@ fn number_cell(text: Option<SharedString>, color: Hsla) -> AnyElement {
 /// A row that is reconnecting keeps the price it has, so its state is only named when
 /// it has nothing to show; a market that is closed is a fact about the index rather
 /// than about the pane, so it is named either way.
-fn name_cell(row: &FinancialIndicesRow, busy: bool, cx: &App) -> AnyElement {
+fn name_cell(row: &FinancialIndexRow, busy: bool, cx: &App) -> AnyElement {
     let content = cx.theme().roles.fg.default.hsla;
     let note_color = cx.theme().roles.fg.muted.hsla;
     let note = match row.quote {
-        Some(quote) if !quote.is_trading => Some(t!(cx, "widget.financial_indices.market_closed")),
+        Some(quote) if !quote.is_trading => Some(t!(cx, "widget.financial_index.market_closed")),
         Some(_) => None,
         None => Some(pending_text(busy, cx)),
     };
@@ -420,9 +420,9 @@ fn interface_language(cx: &App) -> LanguageCode {
 fn rows_of(
     selection: &[SelectedFinancialIndex],
     quotes: Option<&HashMap<FinancialIndexTopic, FinancialIndexQuote>>,
-) -> Arc<[FinancialIndicesRow]> {
+) -> Arc<[FinancialIndexRow]> {
     let mut rows = Vec::with_capacity(selection.len());
-    rows.extend(selection.iter().map(|index| FinancialIndicesRow {
+    rows.extend(selection.iter().map(|index| FinancialIndexRow {
         quote: quotes.and_then(|quotes| quotes.get(&index.topic)).copied(),
         index: index.clone(),
     }));
@@ -444,10 +444,10 @@ fn flash_opacity(elapsed: Duration) -> f32 {
 }
 
 /// The label of one display mode.
-fn mode_label(mode: FinancialIndicesDisplayMode, cx: &App) -> SharedString {
+fn mode_label(mode: FinancialIndexDisplayMode, cx: &App) -> SharedString {
     match mode {
-        FinancialIndicesDisplayMode::Grid => t!(cx, "widget.financial_indices.grid"),
-        FinancialIndicesDisplayMode::Table => t!(cx, "widget.financial_indices.table"),
+        FinancialIndexDisplayMode::Grid => t!(cx, "widget.financial_index.grid"),
+        FinancialIndexDisplayMode::Table => t!(cx, "widget.financial_index.table"),
     }
 }
 
@@ -458,9 +458,9 @@ fn mode_label(mode: FinancialIndicesDisplayMode, cx: &App) -> SharedString {
 /// on screen. Selecting one is what unselects the other — both read the pane's mode —
 /// so there is nothing here to keep in step.
 fn mode_button(
-    mode: FinancialIndicesDisplayMode,
-    current: FinancialIndicesDisplayMode,
-    widget: &Entity<FinancialIndicesWidget>,
+    mode: FinancialIndexDisplayMode,
+    current: FinancialIndexDisplayMode,
+    widget: &Entity<FinancialIndexWidget>,
     cx: &App,
 ) -> Button {
     let label = mode_label(mode, cx);
@@ -509,20 +509,20 @@ impl ManifestSource for RuntimeManifestSource {
         let connector = self.connector.clone();
         let task = self
             .runtime
-            .spawn(async move { FinancialIndicesSource::fetch_manifest(&connector).await });
+            .spawn(async move { FinancialIndexSource::fetch_manifest(&connector).await });
         Box::pin(async move { task.await.unwrap_or(Err(KytrixServiceError::Closed)) })
     }
 }
 
 /// One pane: the rows it draws, the scope it follows, and its two ways of drawing.
-pub struct FinancialIndicesWidget {
-    config: FinancialIndicesConfig,
+pub struct FinancialIndexWidget {
+    config: FinancialIndexConfig,
     /// Reads what the service currently carries.
     ///
     /// The pane asks it for the manifest before it subscribes, so a selected index the
     /// service no longer carries goes back to having nothing chosen.
     manifest: Rc<dyn ManifestSource>,
-    binding: WidgetBinding<FinancialIndicesProtocol>,
+    binding: WidgetBinding<FinancialIndexProtocol>,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
@@ -534,14 +534,14 @@ pub struct FinancialIndicesWidget {
     ///
     /// It is also what makes the pane content: quotes for a selection the user has
     /// left are not this pane's to draw.
-    accepted: Option<FinancialIndicesScope>,
+    accepted: Option<FinancialIndexScope>,
     /// Whether the scope's subscription has reported itself ready.
     ready: bool,
     /// The rows a frame draws.
-    rows: Arc<[FinancialIndicesRow]>,
+    rows: Arc<[FinancialIndexRow]>,
     /// The table, which the pane keeps because the shared table reads its rows from
     /// an entity rather than from the widget's own state.
-    table: Entity<FinancialIndicesTable>,
+    table: Entity<FinancialIndexTable>,
     /// Whether the table was last told a row without a quote is working.
     synced_busy: bool,
     /// The flash each index left behind the last time its price moved.
@@ -551,11 +551,11 @@ pub struct FinancialIndicesWidget {
     _account: Subscription,
 }
 
-impl WidgetView for FinancialIndicesWidget {
-    type Config = FinancialIndicesConfig;
+impl WidgetView for FinancialIndexWidget {
+    type Config = FinancialIndexConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.financial_indices");
-    const DISPLAY_NAME: &'static str = "widget.names.financial_indices";
+    const ID: WidgetId = WidgetId::new_static("kytrix.financial_index");
+    const DISPLAY_NAME: &'static str = "widget.names.financial_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Global market and commodity indices";
     const ICON: Option<&'static str> = Some("widgets/indices.png");
@@ -615,7 +615,7 @@ impl WidgetView for FinancialIndicesWidget {
     }
 }
 
-impl FinancialIndicesWidget {
+impl FinancialIndexWidget {
     /// Drops the selected indices the manifest no longer carries.
     ///
     /// Returns whether this answer still describes the selection the pane follows, which is
@@ -666,7 +666,7 @@ impl FinancialIndicesWidget {
     /// them separately: the fake session answers subscriptions, and the manifest is
     /// whatever the test says the service carries.
     fn new_with_source<S>(
-        config: FinancialIndicesConfig,
+        config: FinancialIndexConfig,
         source: S,
         manifest: Rc<dyn ManifestSource>,
         status: Entity<WidgetStatus>,
@@ -675,16 +675,16 @@ impl FinancialIndicesWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: FinancialIndicesSource,
+        S: FinancialIndexSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            FinancialIndicesService::new(source),
+            FinancialIndexService::new(source),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
         );
-        let table = cx.new(|_| FinancialIndicesTable::empty());
+        let table = cx.new(|_| FinancialIndexTable::empty());
         // The account is the pane's scope, and the user can change it while the pane
         // is open: signing out has to take the indices with it, and signing in has to
         // read again.
@@ -716,8 +716,8 @@ impl FinancialIndicesWidget {
     }
 
     /// The scope this pane follows, which is its account and its selection.
-    fn current_scope(&self) -> Option<FinancialIndicesScope> {
-        FinancialIndicesScope::new(self.account_id.as_ref(), &self.config.selection)
+    fn current_scope(&self) -> Option<FinancialIndexScope> {
+        FinancialIndexScope::new(self.account_id.as_ref(), &self.config.selection)
     }
 
     /// Follows the account the settings now hold.
@@ -779,24 +779,24 @@ impl FinancialIndicesWidget {
             // nobody signed in the pane sends the reader to the account settings, and with
             // an account it asks for a selection.
             let notice = if self.account_id.is_none() {
-                Notice::message("widget.financial_indices.logged_out")
+                Notice::message("widget.financial_index.logged_out")
             } else {
-                Notice::message("widget.financial_indices.select_at_least_one")
+                Notice::message("widget.financial_index.select_at_least_one")
             };
             self.status.report(WidgetState::waiting(notice), cx);
             // Nothing is followed, so nothing should stay subscribed on this pane's
             // behalf: an account that signed out must not keep a seat it is not using.
             self.binding
-                .call(FinancialIndicesRequest::Stop, cx, |_, _, _| {});
+                .call(FinancialIndexRequest::Stop, cx, |_, _, _| {});
             cx.notify();
             return;
         };
         self.status.report(WidgetState::Connecting, cx);
         self.binding.call(
             if retry {
-                FinancialIndicesRequest::Retry(scope)
+                FinancialIndexRequest::Retry(scope)
             } else {
-                FinancialIndicesRequest::Load(scope)
+                FinancialIndexRequest::Load(scope)
             },
             cx,
             Self::apply_load_result,
@@ -815,7 +815,7 @@ impl FinancialIndicesWidget {
 
     fn apply_load_result(
         &mut self,
-        result: WidgetRpcResult<FinancialIndicesProtocol>,
+        result: WidgetRpcResult<FinancialIndexProtocol>,
         cx: &mut Context<Self>,
     ) {
         // The answer says the service took the scope; what the subscription then
@@ -824,7 +824,7 @@ impl FinancialIndicesWidget {
         if let Err(error) = result {
             let recovery = self.recovery.clone();
             self.status.report(
-                WidgetState::failed(Arc::new(FinancialIndicesFailure::Rpc(error)), recovery),
+                WidgetState::failed(Arc::new(FinancialIndexFailure::Rpc(error)), recovery),
                 cx,
             );
         }
@@ -837,23 +837,23 @@ impl FinancialIndicesWidget {
     /// say what they are still waiting for, and those are the widget's.
     fn apply_reliable(
         &mut self,
-        key: FinancialIndicesScope,
-        message: Arc<FinancialIndicesStreamMessage>,
+        key: FinancialIndexScope,
+        message: Arc<FinancialIndexStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let FinancialIndicesStreamMessage::Status(status) = message.as_ref() else {
+        let FinancialIndexStreamMessage::Status(status) = message.as_ref() else {
             return false;
         };
 
         match status {
-            FinancialIndicesStatus::Connecting => {
+            FinancialIndexStatus::Connecting => {
                 self.ready = false;
                 self.status.report(WidgetState::Connecting, cx);
             }
-            FinancialIndicesStatus::Ready => {
+            FinancialIndexStatus::Ready => {
                 self.ready = true;
                 // Readiness is published at the protocol's own boundary: a ready
                 // subscription is not the same thing as the quotes it describes having
@@ -864,12 +864,12 @@ impl FinancialIndicesWidget {
                     self.status.report(WidgetState::Loading, cx);
                 }
             }
-            FinancialIndicesStatus::Failed(error) => {
+            FinancialIndexStatus::Failed(error) => {
                 self.ready = false;
                 let recovery = self.recovery.clone();
                 self.status.report(
                     WidgetState::failed(
-                        Arc::new(FinancialIndicesFailure::Stream(error.clone())),
+                        Arc::new(FinancialIndexFailure::Stream(error.clone())),
                         recovery,
                     ),
                     cx,
@@ -886,14 +886,14 @@ impl FinancialIndicesWidget {
     /// service publishes them when one of them moved.
     fn apply_latest(
         &mut self,
-        key: FinancialIndicesScope,
-        message: Arc<FinancialIndicesStreamMessage>,
+        key: FinancialIndexScope,
+        message: Arc<FinancialIndexStreamMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx) {
             return false;
         }
-        let FinancialIndicesStreamMessage::Quotes(quotes) = message.as_ref() else {
+        let FinancialIndexStreamMessage::Quotes(quotes) = message.as_ref() else {
             return false;
         };
 
@@ -921,7 +921,7 @@ impl FinancialIndicesWidget {
         let Some(previous) = self.quotes.as_deref() else {
             return;
         };
-        if cx.reduce_motion() || self.config.mode != FinancialIndicesDisplayMode::Grid {
+        if cx.reduce_motion() || self.config.mode != FinancialIndexDisplayMode::Grid {
             return;
         }
         let now = Instant::now();
@@ -974,7 +974,7 @@ impl FinancialIndicesWidget {
                 let recovery = self.recovery.clone();
                 self.status.report(
                     WidgetState::failed(
-                        Arc::new(FinancialIndicesFailure::Selection(error)),
+                        Arc::new(FinancialIndexFailure::Selection(error)),
                         recovery,
                     ),
                     cx,
@@ -990,7 +990,7 @@ impl FinancialIndicesWidget {
         self.start(false, cx);
     }
 
-    fn set_mode(&mut self, mode: FinancialIndicesDisplayMode, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: FinancialIndexDisplayMode, cx: &mut Context<Self>) {
         if self.config.mode == mode {
             return;
         }
@@ -1030,13 +1030,13 @@ impl FinancialIndicesWidget {
             .occlude()
             .child(
                 Button::new(ElementId::Name(SharedString::new_static(
-                    "FinancialIndicesChoose",
+                    "FinancialIndexChoose",
                 )))
                 .filled()
                 .small()
                 .disabled(self.account_id.is_none())
-                .aria_label(t!(cx, "widget.financial_indices.choose"))
-                .with_tooltip(t!(cx, "widget.financial_indices.choose"))
+                .aria_label(t!(cx, "widget.financial_index.choose"))
+                .with_tooltip(t!(cx, "widget.financial_index.choose"))
                 .on_click(move |_, window, cx| {
                     let Some(current) = widget.upgrade() else {
                         return;
@@ -1044,11 +1044,11 @@ impl FinancialIndicesWidget {
                     let selection = current.read(cx).config.selection.clone();
                     // What the selector is handed is weak, so a pane closed with its picker still up
                     // is released rather than held by it. Unlike the other panes' pickers, this one
-                    // has no test that says so: `FinancialIndicesSelector::show` reads its service from a
+                    // has no test that says so: `FinancialIndexSelector::show` reads its service from a
                     // global that only a production `AuthSession` can install, so the path this
                     // callback is reached by cannot be driven here.
                     let widget_for_choice = widget.clone();
-                    FinancialIndicesSelector::show(
+                    FinancialIndexSelector::show(
                         &selection,
                         move |selection, _, cx| {
                             // The selector does not keep the pane alive: a pane gone by the time a
@@ -1076,8 +1076,8 @@ impl FinancialIndicesWidget {
         let current = self.config.mode;
 
         (
-            mode_button(FinancialIndicesDisplayMode::Grid, current, &widget, cx),
-            mode_button(FinancialIndicesDisplayMode::Table, current, &widget, cx),
+            mode_button(FinancialIndexDisplayMode::Grid, current, &widget, cx),
+            mode_button(FinancialIndexDisplayMode::Table, current, &widget, cx),
         )
     }
 
@@ -1101,16 +1101,16 @@ impl FinancialIndicesWidget {
     fn table_body(&self, cx: &Context<Self>) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
-                "FinancialIndicesTableFrame",
+                "FinancialIndexTableFrame",
             )))
             .debug_selector(|| "TEST_INDICES_TABLE".into())
-            .aria_label(t!(cx, "widget.financial_indices.table"))
+            .aria_label(t!(cx, "widget.financial_index.table"))
             .size_full()
             .min_h_0()
             .child(Table::new(
                 // The table keeps its own scroll position in state keyed by this id, so
                 // it has to stay stable across frames.
-                ElementId::Name(SharedString::new_static("FinancialIndicesTable")),
+                ElementId::Name(SharedString::new_static("FinancialIndexTable")),
                 &self.table,
             ))
             .into_any_element()
@@ -1150,15 +1150,15 @@ impl FinancialIndicesWidget {
     }
 }
 
-impl Render for FinancialIndicesWidget {
+impl Render for FinancialIndexWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is only embedded while the pane has content, so this is the ready
         // state and nothing else. Everything the pane is *doing* is drawn by the
         // framework around this.
         self.settle_flashes(window);
         match self.config.mode {
-            FinancialIndicesDisplayMode::Grid => self.grid_body(cx),
-            FinancialIndicesDisplayMode::Table => self.table_body(cx),
+            FinancialIndexDisplayMode::Grid => self.grid_body(cx),
+            FinancialIndexDisplayMode::Table => self.table_body(cx),
         }
     }
 }
@@ -1216,7 +1216,7 @@ pub(crate) fn grid_layout(
 /// built during prepaint, where the box it was given is known: the number of columns a
 /// frame has room for is a property of that frame rather than of the pane.
 fn grid_viewport(
-    rows: Arc<[FinancialIndicesRow]>,
+    rows: Arc<[FinancialIndexRow]>,
     flashes: HashMap<FinancialIndexTopic, QuoteFlash>,
     busy: bool,
     cell_width: Pixels,
@@ -1247,7 +1247,7 @@ fn grid_viewport(
             });
             let content = div()
                 .id(ElementId::Name(SharedString::new_static(
-                    "FinancialIndicesGridContent",
+                    "FinancialIndexGridContent",
                 )))
                 .debug_selector(|| "TEST_INDICES_GRID_CONTENT".into())
                 .relative()
@@ -1265,7 +1265,7 @@ fn grid_viewport(
                 .child(content);
             let mut viewport = div()
                 .id(ElementId::Name(SharedString::new_static(
-                    "FinancialIndicesGridViewport",
+                    "FinancialIndexGridViewport",
                 )))
                 .size_full()
                 .min_w_0()
@@ -1287,7 +1287,7 @@ fn grid_viewport(
 
 /// One cell of the grid, at the place the layout gave it.
 fn grid_cell(
-    row: &FinancialIndicesRow,
+    row: &FinancialIndexRow,
     flash: Option<QuoteFlash>,
     origin: Point<Pixels>,
     cell: Size<Pixels>,
@@ -1311,7 +1311,7 @@ fn grid_cell(
     // another is the index it draws.
     let cell_id = ElementId::NamedChild(
         Arc::new(ElementId::Name(SharedString::new_static(
-            "FinancialIndicesGridCell",
+            "FinancialIndexGridCell",
         ))),
         SharedString::new(row.index.topic.code()),
     );
@@ -1335,7 +1335,7 @@ fn grid_cell(
                     .px_1()
                     .truncate()
                     .text_color(muted)
-                    .child(t!(cx, "widget.financial_indices.market_closed"))
+                    .child(t!(cx, "widget.financial_index.market_closed"))
             }))
             .child(
                 div()
@@ -1445,10 +1445,10 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            FinancialIndicesInvalidReason, LocalizedFinancialIndexName, MAX_NAME_CHARS,
+            FinancialIndexInvalidReason, LocalizedFinancialIndexName, MAX_NAME_CHARS,
             MAX_SELECTED_INDICES,
         },
-        service::FinancialIndicesStreamError,
+        service::FinancialIndexStreamError,
         test_support::{ACCOUNT, FakeSource, event, selected, topic},
     };
 
@@ -1472,11 +1472,11 @@ mod tests {
         cx.set_global(manager);
     }
 
-    fn config(selection: &[SelectedFinancialIndex]) -> FinancialIndicesConfig {
-        FinancialIndicesConfig {
+    fn config(selection: &[SelectedFinancialIndex]) -> FinancialIndexConfig {
+        FinancialIndexConfig {
             selection: normalize_selection(selection)
                 .expect("the fixture selection should be valid"),
-            ..FinancialIndicesConfig::default()
+            ..FinancialIndexConfig::default()
         }
     }
 
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     /// A catalogue carrying exactly the indices a pane was configured with.
-    fn configured_manifest(config: &FinancialIndicesConfig) -> Rc<dyn ManifestSource> {
+    fn configured_manifest(config: &FinancialIndexConfig) -> Rc<dyn ManifestSource> {
         Rc::new(Manifest(RefCell::new(
             config
                 .selection
@@ -1565,11 +1565,11 @@ mod tests {
     /// task of its own.
     fn pane_with_source<S>(
         source: S,
-        config: FinancialIndicesConfig,
-        cx: &mut Context<FinancialIndicesWidget>,
-    ) -> FinancialIndicesWidget
+        config: FinancialIndexConfig,
+        cx: &mut Context<FinancialIndexWidget>,
+    ) -> FinancialIndexWidget
     where
-        S: FinancialIndicesSource,
+        S: FinancialIndexSource,
     {
         let manifest = configured_manifest(&config);
         pane_with_manifest(source, manifest, config, cx)
@@ -1579,18 +1579,18 @@ mod tests {
     fn pane_with_manifest<S>(
         source: S,
         manifest: Rc<dyn ManifestSource>,
-        config: FinancialIndicesConfig,
-        cx: &mut Context<FinancialIndicesWidget>,
-    ) -> FinancialIndicesWidget
+        config: FinancialIndexConfig,
+        cx: &mut Context<FinancialIndexWidget>,
+    ) -> FinancialIndexWidget
     where
-        S: FinancialIndicesSource,
+        S: FinancialIndexSource,
     {
         let status = cx.new(|_| WidgetStatus::new());
         let weak = cx.weak_entity();
         let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
             let _ = weak.update(cx, |pane, cx| pane.load(cx));
         });
-        FinancialIndicesWidget::new_with_source(
+        FinancialIndexWidget::new_with_source(
             config,
             source,
             manifest,
@@ -1604,8 +1604,8 @@ mod tests {
     fn pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-        config: FinancialIndicesConfig,
-    ) -> Entity<FinancialIndicesWidget> {
+        config: FinancialIndexConfig,
+    ) -> Entity<FinancialIndexWidget> {
         let manifest = configured_manifest(&config);
         loaded(cx, source, manifest, config)
     }
@@ -1615,8 +1615,8 @@ mod tests {
         cx: &mut TestAppContext,
         source: FakeSource,
         manifest: Rc<dyn ManifestSource>,
-        config: FinancialIndicesConfig,
-    ) -> Entity<FinancialIndicesWidget> {
+        config: FinancialIndexConfig,
+    ) -> Entity<FinancialIndexWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, Some(ACCOUNT));
@@ -1630,7 +1630,7 @@ mod tests {
     fn signed_out_pane(
         cx: &mut TestAppContext,
         source: FakeSource,
-    ) -> Entity<FinancialIndicesWidget> {
+    ) -> Entity<FinancialIndexWidget> {
         cx.executor().allow_parking();
         let pane = cx.update(|cx| {
             install(cx, None);
@@ -1649,7 +1649,7 @@ mod tests {
     /// The binding is cancelled first, which is what makes the reported message the
     /// only input the pane has.
     fn report_quotes(
-        pane: &Entity<FinancialIndicesWidget>,
+        pane: &Entity<FinancialIndexWidget>,
         quotes: &[(&str, u32)],
         cx: &mut App,
     ) -> bool {
@@ -1667,7 +1667,7 @@ mod tests {
             pane.binding.cancel();
             pane.apply_latest(
                 scope,
-                Arc::new(FinancialIndicesStreamMessage::Quotes(Arc::new(published))),
+                Arc::new(FinancialIndexStreamMessage::Quotes(Arc::new(published))),
                 cx,
             )
         })
@@ -1675,8 +1675,8 @@ mod tests {
 
     /// Reports a status as the stream would.
     fn report_status(
-        pane: &Entity<FinancialIndicesWidget>,
-        status: FinancialIndicesStatus,
+        pane: &Entity<FinancialIndexWidget>,
+        status: FinancialIndexStatus,
         cx: &mut App,
     ) -> bool {
         let scope = pane
@@ -1686,13 +1686,13 @@ mod tests {
         pane.update(cx, |pane, cx| {
             pane.apply_reliable(
                 scope,
-                Arc::new(FinancialIndicesStreamMessage::Status(status)),
+                Arc::new(FinancialIndexStreamMessage::Status(status)),
                 cx,
             )
         })
     }
 
-    fn failure_of(pane: &Entity<FinancialIndicesWidget>, cx: &App) -> SharedString {
+    fn failure_of(pane: &Entity<FinancialIndexWidget>, cx: &App) -> SharedString {
         pane.read(cx)
             .status
             .state(cx)
@@ -1711,7 +1711,7 @@ mod tests {
         crate::test_support::settle_until(cx, what, ready);
     }
 
-    fn latest_of(pane: &Entity<FinancialIndicesWidget>, cx: &App) -> Vec<Option<u32>> {
+    fn latest_of(pane: &Entity<FinancialIndexWidget>, cx: &App) -> Vec<Option<u32>> {
         pane.read(cx)
             .rows
             .iter()
@@ -1721,16 +1721,13 @@ mod tests {
 
     #[test]
     fn the_widget_should_have_a_stable_identity() {
+        assert_eq!(FinancialIndexWidget::ID.as_str(), "kytrix.financial_index");
         assert_eq!(
-            FinancialIndicesWidget::ID.as_str(),
-            "kytrix.financial_indices"
+            FinancialIndexWidget::DISPLAY_NAME,
+            "widget.names.financial_index"
         );
         assert_eq!(
-            FinancialIndicesWidget::DISPLAY_NAME,
-            "widget.names.financial_indices"
-        );
-        assert_eq!(
-            FinancialIndicesConfig::SCHEMA_VERSION,
+            FinancialIndexConfig::SCHEMA_VERSION,
             WidgetConfigSchemaVersion::V1
         );
     }
@@ -1745,13 +1742,13 @@ mod tests {
             assert_eq!(pane.current_scope(), None);
             assert_eq!(
                 pane.status.state(cx).notice(),
-                Some(&Notice::message("widget.financial_indices.logged_out")),
+                Some(&Notice::message("widget.financial_index.logged_out")),
                 "a pane nobody signed in for is not a failure"
             );
             assert!(!pane.status.state(cx).is_failed());
             assert_eq!(
                 pane.status.state(cx),
-                WidgetState::waiting(Notice::message("widget.financial_indices.logged_out")),
+                WidgetState::waiting(Notice::message("widget.financial_index.logged_out")),
                 "and it is waiting rather than working"
             );
         });
@@ -1776,10 +1773,10 @@ mod tests {
                 .expect("a pane nobody signed in for is waiting");
             assert_eq!(
                 waiting,
-                Notice::message("widget.financial_indices.logged_out")
+                Notice::message("widget.financial_index.logged_out")
             );
             let english = waiting.resolve(cx);
-            assert_eq!(english, t!(cx, "widget.financial_indices.logged_out"));
+            assert_eq!(english, t!(cx, "widget.financial_index.logged_out"));
 
             cx.set_global(LanguageCode::ZhCn);
             english
@@ -1796,19 +1793,19 @@ mod tests {
                 .expect("the pane is still waiting");
             assert_eq!(
                 waiting,
-                Notice::message("widget.financial_indices.logged_out"),
+                Notice::message("widget.financial_index.logged_out"),
                 "the pane still stands in with the same reference"
             );
             let chinese = waiting.resolve(cx);
             assert_ne!(chinese, english, "the copy follows the language");
-            assert_eq!(chinese, t!(cx, "widget.financial_indices.logged_out"));
+            assert_eq!(chinese, t!(cx, "widget.financial_index.logged_out"));
         });
     }
 
     #[gpui_kit::test]
     fn a_pane_with_nothing_selected_should_ask_for_a_selection(cx: &mut TestAppContext) {
         let source = FakeSource::default();
-        let pane = pane(cx, source.clone(), FinancialIndicesConfig::default());
+        let pane = pane(cx, source.clone(), FinancialIndexConfig::default());
 
         cx.update(|cx| {
             let pane = pane.read(cx);
@@ -1816,7 +1813,7 @@ mod tests {
             assert_eq!(
                 pane.status.state(cx).notice(),
                 Some(&Notice::message(
-                    "widget.financial_indices.select_at_least_one"
+                    "widget.financial_index.select_at_least_one"
                 ))
             );
         });
@@ -1899,7 +1896,7 @@ mod tests {
 
         cx.update(|cx| {
             assert!(
-                !report_status(&pane, FinancialIndicesStatus::Ready, cx),
+                !report_status(&pane, FinancialIndexStatus::Ready, cx),
                 "a row without a quote says it is working either way, so the body it is in \
                  has nothing to redraw for the pane having moved from connecting to loading"
             );
@@ -1998,7 +1995,7 @@ mod tests {
     }
 
     /// Draws a pane in a frame of its own, which is where its own frame work runs.
-    fn draw_pane(window: &mut VisualTestContext, pane: &Entity<FinancialIndicesWidget>) {
+    fn draw_pane(window: &mut VisualTestContext, pane: &Entity<FinancialIndexWidget>) {
         let pane = pane.clone();
         window.draw(
             point(Pixels::ZERO, Pixels::ZERO),
@@ -2034,7 +2031,7 @@ mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                FinancialIndicesStatus::Failed(FinancialIndicesStreamError::Transport(
+                FinancialIndexStatus::Failed(FinancialIndexStreamError::Transport(
                     TransportError::Closed,
                 )),
                 cx,
@@ -2061,7 +2058,7 @@ mod tests {
             report_quotes(&pane, &[("HSI", 101)], cx);
             report_status(
                 &pane,
-                FinancialIndicesStatus::Failed(FinancialIndicesStreamError::Transport(
+                FinancialIndexStatus::Failed(FinancialIndexStreamError::Transport(
                     TransportError::Closed,
                 )),
                 cx,
@@ -2071,7 +2068,7 @@ mod tests {
                 !report_quotes(&pane, &[("HSI", 102)], cx),
                 "a late quote is not a change"
             );
-            assert!(!report_status(&pane, FinancialIndicesStatus::Ready, cx));
+            assert!(!report_status(&pane, FinancialIndexStatus::Ready, cx));
             assert!(pane.read(cx).status.is_failed(cx));
             assert_eq!(
                 latest_of(&pane, cx),
@@ -2094,7 +2091,7 @@ mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                FinancialIndicesStatus::Failed(FinancialIndicesStreamError::FinancialIndexLimit {
+                FinancialIndexStatus::Failed(FinancialIndexStreamError::FinancialIndexLimit {
                     limit: Some(3),
                 }),
                 cx,
@@ -2102,7 +2099,7 @@ mod tests {
 
             assert_eq!(
                 failure_of(&pane, cx).as_ref(),
-                t!(cx, "error.financial_indices.index_limit", limit = 3).as_ref()
+                t!(cx, "error.financial_index.index_limit", limit = 3).as_ref()
             );
         });
     }
@@ -2116,7 +2113,7 @@ mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                FinancialIndicesStatus::Failed(FinancialIndicesStreamError::FinancialIndexLimit {
+                FinancialIndexStatus::Failed(FinancialIndexStreamError::FinancialIndexLimit {
                     limit: None,
                 }),
                 cx,
@@ -2124,7 +2121,7 @@ mod tests {
 
             assert_eq!(
                 failure_of(&pane, cx).as_ref(),
-                t!(cx, "error.financial_indices.index_limit_unknown").as_ref()
+                t!(cx, "error.financial_index.index_limit_unknown").as_ref()
             );
         });
     }
@@ -2228,7 +2225,7 @@ mod tests {
             assert_eq!(pane.current_scope(), None);
             assert_eq!(
                 pane.status.state(cx).notice(),
-                Some(&Notice::message("widget.financial_indices.logged_out"))
+                Some(&Notice::message("widget.financial_index.logged_out"))
             );
         });
         settle_until(cx, "the subscription to be released", |_| {
@@ -2294,7 +2291,7 @@ mod tests {
         cx.update(|cx| {
             report_status(
                 &pane,
-                FinancialIndicesStatus::Failed(FinancialIndicesStreamError::Service(
+                FinancialIndexStatus::Failed(FinancialIndexStreamError::Service(
                     KytrixServiceError::Closed,
                 )),
                 cx,
@@ -2323,7 +2320,7 @@ mod tests {
 
         cx.update(|cx| {
             assert_eq!(pane.read(cx).table.read(cx).rows.len(), 1);
-            report_status(&pane, FinancialIndicesStatus::Ready, cx);
+            report_status(&pane, FinancialIndexStatus::Ready, cx);
             report_quotes(&pane, &[("HSI", 101)], cx);
 
             let table = pane.read(cx).table.clone();
@@ -2368,7 +2365,7 @@ mod tests {
             assert!(
                 report_status(
                     &pane,
-                    FinancialIndicesStatus::Failed(FinancialIndicesStreamError::Transport(
+                    FinancialIndexStatus::Failed(FinancialIndexStreamError::Transport(
                         TransportError::Closed
                     )),
                     cx
@@ -2391,13 +2388,10 @@ mod tests {
         cx.update(|cx| {
             report_quotes(&pane, &[("HSI", 101)], cx);
             pane.update(cx, |pane, cx| {
-                pane.set_mode(FinancialIndicesDisplayMode::Table, cx)
+                pane.set_mode(FinancialIndexDisplayMode::Table, cx)
             });
 
-            assert_eq!(
-                pane.read(cx).config.mode,
-                FinancialIndicesDisplayMode::Table
-            );
+            assert_eq!(pane.read(cx).config.mode, FinancialIndexDisplayMode::Table);
             assert!(pane.read(cx).has_content());
             assert_eq!(latest_of(&pane, cx), [Some(101)]);
         });
@@ -2417,7 +2411,7 @@ mod tests {
             assert!(!table.is_selected(), "and not the table");
 
             pane.update(cx, |pane, cx| {
-                pane.set_mode(FinancialIndicesDisplayMode::Table, cx)
+                pane.set_mode(FinancialIndexDisplayMode::Table, cx)
             });
             let (grid, table) = pane.update(cx, |pane, cx| pane.mode_controls(cx));
             assert!(!grid.is_selected(), "picking one mode unselects the other");
@@ -2427,15 +2421,15 @@ mod tests {
 
     #[test]
     fn the_default_config_should_be_a_grid_with_nothing_selected() {
-        let config = FinancialIndicesConfig::default();
+        let config = FinancialIndexConfig::default();
 
-        assert_eq!(config.mode, FinancialIndicesDisplayMode::Grid);
+        assert_eq!(config.mode, FinancialIndexDisplayMode::Grid);
         assert!(config.selection.is_empty());
     }
 
     #[test]
     fn a_config_should_reject_missing_fields() {
-        assert!(serde_json::from_str::<FinancialIndicesConfig>("{}").is_err());
+        assert!(serde_json::from_str::<FinancialIndexConfig>("{}").is_err());
     }
 
     #[test]
@@ -2445,7 +2439,7 @@ mod tests {
             "selection": vec![value.clone(); MAX_SELECTED_INDICES],
             "mode": "Grid",
         });
-        let config: FinancialIndicesConfig =
+        let config: FinancialIndexConfig =
             serde_json::from_value(at_limit).expect("the limit should decode");
         assert_eq!(config.selection.len(), 1, "duplicates should normalize");
 
@@ -2453,7 +2447,7 @@ mod tests {
             "selection": vec![value; MAX_SELECTED_INDICES + 1],
             "mode": "Grid",
         });
-        assert!(serde_json::from_value::<FinancialIndicesConfig>(over_limit).is_err());
+        assert!(serde_json::from_value::<FinancialIndexConfig>(over_limit).is_err());
     }
 
     #[test]
@@ -2466,7 +2460,7 @@ mod tests {
             "mode": "Grid",
         });
 
-        assert!(serde_json::from_value::<FinancialIndicesConfig>(value).is_err());
+        assert!(serde_json::from_value::<FinancialIndexConfig>(value).is_err());
     }
 
     /// A selected index the service no longer carries is dropped, and the pane is told
@@ -2605,7 +2599,7 @@ mod tests {
                 .state(cx)
                 .notice()
                 .is_some_and(|notice| {
-                    notice == &Notice::message("widget.financial_indices.select_at_least_one")
+                    notice == &Notice::message("widget.financial_index.select_at_least_one")
                 })
         });
         cx.update(|cx| {
@@ -2625,18 +2619,18 @@ mod tests {
     #[test]
     fn a_missing_config_should_use_the_default_and_a_present_one_should_decode() {
         assert_eq!(
-            decode_or_default::<FinancialIndicesConfig>(None),
-            FinancialIndicesConfig::default()
+            decode_or_default::<FinancialIndexConfig>(None),
+            FinancialIndexConfig::default()
         );
 
-        let stored = VersionedWidgetConfig::encode(&FinancialIndicesConfig {
-            mode: FinancialIndicesDisplayMode::Table,
-            ..FinancialIndicesConfig::default()
+        let stored = VersionedWidgetConfig::encode(&FinancialIndexConfig {
+            mode: FinancialIndexDisplayMode::Table,
+            ..FinancialIndexConfig::default()
         })
         .expect("the config should encode");
         assert_eq!(
-            stored.decode::<FinancialIndicesConfig>().mode,
-            FinancialIndicesDisplayMode::Table
+            stored.decode::<FinancialIndexConfig>().mode,
+            FinancialIndexDisplayMode::Table
         );
     }
 
@@ -2731,7 +2725,7 @@ mod tests {
     /// A view that draws nothing but the grid, so what the grid is worth drawing can
     /// be asserted without a pane's own state around it.
     struct GridTestView {
-        rows: Arc<[FinancialIndicesRow]>,
+        rows: Arc<[FinancialIndexRow]>,
         flashes: HashMap<FinancialIndexTopic, QuoteFlash>,
         scroll: ScrollHandle,
         cell_width: Pixels,
@@ -2755,7 +2749,7 @@ mod tests {
         }
     }
 
-    fn grid_rows(item_count: usize) -> Arc<[FinancialIndicesRow]> {
+    fn grid_rows(item_count: usize) -> Arc<[FinancialIndexRow]> {
         let selection = (0..item_count)
             .map(|index| selected(&format!("INDEX_{index}")))
             .collect::<Vec<_>>();
@@ -2916,41 +2910,41 @@ mod tests {
             install(cx, Some(ACCOUNT));
 
             for key in [
-                "widget.names.financial_indices",
-                "widget.financial_indices.change",
-                "widget.financial_indices.change_percent",
-                "widget.financial_indices.choose",
-                "widget.financial_indices.grid",
-                "widget.financial_indices.index",
-                "widget.financial_indices.latest",
-                "widget.financial_indices.logged_out",
-                "widget.financial_indices.market_closed",
-                "widget.financial_indices.select_at_least_one",
-                "widget.financial_indices.selector.empty",
-                "widget.financial_indices.selector.load_failed",
-                "widget.financial_indices.selector.loading",
-                "widget.financial_indices.table",
+                "widget.names.financial_index",
+                "widget.financial_index.change",
+                "widget.financial_index.change_percent",
+                "widget.financial_index.choose",
+                "widget.financial_index.grid",
+                "widget.financial_index.index",
+                "widget.financial_index.latest",
+                "widget.financial_index.logged_out",
+                "widget.financial_index.market_closed",
+                "widget.financial_index.select_at_least_one",
+                "widget.financial_index.selector.empty",
+                "widget.financial_index.selector.load_failed",
+                "widget.financial_index.selector.loading",
+                "widget.financial_index.table",
             ] {
                 assert!(!t!(cx, key).is_empty(), "{key} has no copy");
             }
 
             let failures = [
-                FinancialIndicesFailure::Stream(FinancialIndicesStreamError::Service(
+                FinancialIndexFailure::Stream(FinancialIndexStreamError::Service(
                     KytrixServiceError::Closed,
                 )),
-                FinancialIndicesFailure::Stream(FinancialIndicesStreamError::Transport(
+                FinancialIndexFailure::Stream(FinancialIndexStreamError::Transport(
                     TransportError::Closed,
                 )),
-                FinancialIndicesFailure::Stream(FinancialIndicesStreamError::FinancialIndexLimit {
+                FinancialIndexFailure::Stream(FinancialIndexStreamError::FinancialIndexLimit {
                     limit: Some(3),
                 }),
-                FinancialIndicesFailure::Stream(FinancialIndicesStreamError::FinancialIndexLimit {
+                FinancialIndexFailure::Stream(FinancialIndexStreamError::FinancialIndexLimit {
                     limit: None,
                 }),
-                FinancialIndicesFailure::Rpc(RpcCallError::Service {
+                FinancialIndexFailure::Rpc(RpcCallError::Service {
                     request_id: RequestId::new(1),
-                    source: FinancialIndicesServiceError::Data(
-                        FinancialIndicesDataError::SelectionCapacity {
+                    source: FinancialIndexServiceError::Data(
+                        FinancialIndexDataError::SelectionCapacity {
                             limit: MAX_SELECTED_INDICES,
                         },
                     ),
@@ -2964,29 +2958,29 @@ mod tests {
             }
 
             let reasons = [
-                FinancialIndicesInvalidReason::InvalidCode,
-                FinancialIndicesInvalidReason::DuplicateCategory {
+                FinancialIndexInvalidReason::InvalidCode,
+                FinancialIndexInvalidReason::DuplicateCategory {
                     code: SmolStr::new_static("asia"),
                 },
-                FinancialIndicesInvalidReason::DuplicateFinancialIndex {
+                FinancialIndexInvalidReason::DuplicateFinancialIndex {
                     code: SmolStr::new_static("HSI"),
                 },
-                FinancialIndicesInvalidReason::UnknownCategory {
+                FinancialIndexInvalidReason::UnknownCategory {
                     index: SmolStr::new_static("HSI"),
                     category: SmolStr::new_static("missing"),
                 },
-                FinancialIndicesInvalidReason::MissingName,
-                FinancialIndicesInvalidReason::NameFormat,
+                FinancialIndexInvalidReason::MissingName,
+                FinancialIndexInvalidReason::NameFormat,
             ];
             for reason in reasons {
-                let error = FinancialIndicesDataError::Invalid(reason);
+                let error = FinancialIndexDataError::Invalid(reason);
                 assert!(
                     !error.localized_message(cx).is_empty(),
                     "{error:?} has no copy"
                 );
             }
             assert!(
-                !FinancialIndicesDataError::ManifestCapacity { limit: 4_096 }
+                !FinancialIndexDataError::ManifestCapacity { limit: 4_096 }
                     .localized_message(cx)
                     .is_empty()
             );

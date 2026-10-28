@@ -47,13 +47,13 @@ pub(super) const MAX_NAME_CHARS: usize = 120;
 
 /// A failure of the data a pane was asked to draw.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(super) enum FinancialIndicesDataError {
+pub(super) enum FinancialIndexDataError {
     #[error("the selection holds more than {limit} indices")]
     SelectionCapacity { limit: usize },
     #[error("the manifest holds more than {limit} entries")]
     ManifestCapacity { limit: usize },
     #[error("invalid index data: {0}")]
-    Invalid(FinancialIndicesInvalidReason),
+    Invalid(FinancialIndexInvalidReason),
 }
 
 /// Why a manifest entry could not be accepted.
@@ -63,7 +63,7 @@ pub(super) enum FinancialIndicesDataError {
 /// category the manifest does not define. A reader cannot act on which of the
 /// three codes of an entry was empty, so nothing here says.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(super) enum FinancialIndicesInvalidReason {
+pub(super) enum FinancialIndexInvalidReason {
     #[error("the manifest carries an invalid code")]
     InvalidCode,
     #[error("the manifest repeats the category {code}")]
@@ -78,20 +78,20 @@ pub(super) enum FinancialIndicesInvalidReason {
     NameFormat,
 }
 
-impl LocalizedError for FinancialIndicesDataError {
+impl LocalizedError for FinancialIndexDataError {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
             Self::SelectionCapacity { limit } => {
                 t!(
                     cx,
-                    "error.financial_indices.selection_capacity",
+                    "error.financial_index.selection_capacity",
                     limit = limit
                 )
             }
             Self::ManifestCapacity { limit } => {
                 t!(
                     cx,
-                    "error.financial_indices.manifest_too_large",
+                    "error.financial_index.manifest_too_large",
                     limit = limit
                 )
             }
@@ -100,31 +100,27 @@ impl LocalizedError for FinancialIndicesDataError {
     }
 }
 
-impl LocalizedError for FinancialIndicesInvalidReason {
+impl LocalizedError for FinancialIndexInvalidReason {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
-            Self::InvalidCode => t!(cx, "error.financial_indices.invalid_code"),
+            Self::InvalidCode => t!(cx, "error.financial_index.invalid_code"),
             Self::DuplicateCategory { code } => {
-                t!(
-                    cx,
-                    "error.financial_indices.duplicate_category",
-                    code = code
-                )
+                t!(cx, "error.financial_index.duplicate_category", code = code)
             }
             Self::DuplicateFinancialIndex { code } => {
-                t!(cx, "error.financial_indices.duplicate_index", code = code)
+                t!(cx, "error.financial_index.duplicate_index", code = code)
             }
             Self::UnknownCategory { index, category } => t!(
                 cx,
-                "error.financial_indices.unknown_category",
+                "error.financial_index.unknown_category",
                 index = index,
                 category = category
             ),
-            Self::MissingName => t!(cx, "error.financial_indices.missing_name"),
+            Self::MissingName => t!(cx, "error.financial_index.missing_name"),
             Self::NameFormat => {
                 t!(
                     cx,
-                    "error.financial_indices.name_format",
+                    "error.financial_index.name_format",
                     limit = MAX_NAME_CHARS
                 )
             }
@@ -155,7 +151,7 @@ impl LocalizedFinancialIndexName {
         }
     }
 
-    fn validate(&self) -> Result<(), FinancialIndicesDataError> {
+    fn validate(&self) -> Result<(), FinancialIndexDataError> {
         validate_name(&self.en)?;
         validate_name(&self.zh)
     }
@@ -316,7 +312,7 @@ impl FinancialIndexQuote {
 /// Validates a manifest into the catalogue a selector lists.
 pub(super) fn prepare_catalog(
     manifest: proto_types::FinancialIndices,
-) -> Result<FinancialIndexCatalog, FinancialIndicesDataError> {
+) -> Result<FinancialIndexCatalog, FinancialIndexDataError> {
     ensure_manifest_capacity(manifest.categories.len(), MAX_MANIFEST_CATEGORIES)?;
     ensure_manifest_capacity(manifest.indices.len(), MAX_MANIFEST_INDICES)?;
 
@@ -325,7 +321,7 @@ pub(super) fn prepare_catalog(
     for category in manifest.categories {
         let code = validate_code(&category.code)?;
         if !category_codes.insert(code.clone()) {
-            return Err(invalid(FinancialIndicesInvalidReason::DuplicateCategory {
+            return Err(invalid(FinancialIndexInvalidReason::DuplicateCategory {
                 code,
             }));
         }
@@ -340,17 +336,17 @@ pub(super) fn prepare_catalog(
     for index in manifest.indices {
         validate_code(&index.request_code)?;
         let topic = FinancialIndexTopic::from_code(&index.code)
-            .ok_or_else(|| invalid(FinancialIndicesInvalidReason::InvalidCode))?;
+            .ok_or_else(|| invalid(FinancialIndexInvalidReason::InvalidCode))?;
         if !index_codes.insert(topic.clone()) {
             return Err(invalid(
-                FinancialIndicesInvalidReason::DuplicateFinancialIndex {
+                FinancialIndexInvalidReason::DuplicateFinancialIndex {
                     code: SmolStr::new(topic.code()),
                 },
             ));
         }
         let category = validate_code(&index.category)?;
         if !category_codes.contains(&category) {
-            return Err(invalid(FinancialIndicesInvalidReason::UnknownCategory {
+            return Err(invalid(FinancialIndexInvalidReason::UnknownCategory {
                 index: SmolStr::new(topic.code()),
                 category,
             }));
@@ -374,9 +370,9 @@ pub(super) fn prepare_catalog(
 /// then the duplicates, which keep the first entry they appeared as.
 pub(super) fn normalize_selection(
     selection: &[SelectedFinancialIndex],
-) -> Result<Vec<SelectedFinancialIndex>, FinancialIndicesDataError> {
+) -> Result<Vec<SelectedFinancialIndex>, FinancialIndexDataError> {
     if selection.len() > MAX_SELECTED_INDICES {
-        return Err(FinancialIndicesDataError::SelectionCapacity {
+        return Err(FinancialIndexDataError::SelectionCapacity {
             limit: MAX_SELECTED_INDICES,
         });
     }
@@ -432,36 +428,36 @@ pub(super) fn format_percent(percent: Option<f64>) -> SharedString {
     }
 }
 
-fn ensure_manifest_capacity(len: usize, limit: usize) -> Result<(), FinancialIndicesDataError> {
+fn ensure_manifest_capacity(len: usize, limit: usize) -> Result<(), FinancialIndexDataError> {
     if len > limit {
-        Err(FinancialIndicesDataError::ManifestCapacity { limit })
+        Err(FinancialIndexDataError::ManifestCapacity { limit })
     } else {
         Ok(())
     }
 }
 
-fn invalid(reason: FinancialIndicesInvalidReason) -> FinancialIndicesDataError {
-    FinancialIndicesDataError::Invalid(reason)
+fn invalid(reason: FinancialIndexInvalidReason) -> FinancialIndexDataError {
+    FinancialIndexDataError::Invalid(reason)
 }
 
-fn validate_code(code: &str) -> Result<SmolStr, FinancialIndicesDataError> {
+fn validate_code(code: &str) -> Result<SmolStr, FinancialIndexDataError> {
     if code.is_empty() || code.trim() != code || code.chars().count() > MAX_CODE_CHARS {
-        return Err(invalid(FinancialIndicesInvalidReason::InvalidCode));
+        return Err(invalid(FinancialIndexInvalidReason::InvalidCode));
     }
     Ok(SmolStr::new(code))
 }
 
-fn validate_name(value: &str) -> Result<(), FinancialIndicesDataError> {
+fn validate_name(value: &str) -> Result<(), FinancialIndexDataError> {
     if value.is_empty() || value.trim() != value || value.chars().count() > MAX_NAME_CHARS {
-        return Err(invalid(FinancialIndicesInvalidReason::NameFormat));
+        return Err(invalid(FinancialIndexInvalidReason::NameFormat));
     }
     Ok(())
 }
 
 fn parse_name(
     name: Option<proto_types::FinancialIndexLocalizedName>,
-) -> Result<LocalizedFinancialIndexName, FinancialIndicesDataError> {
-    let name = name.ok_or_else(|| invalid(FinancialIndicesInvalidReason::MissingName))?;
+) -> Result<LocalizedFinancialIndexName, FinancialIndexDataError> {
+    let name = name.ok_or_else(|| invalid(FinancialIndexInvalidReason::MissingName))?;
     let name = LocalizedFinancialIndexName {
         en: SmolStr::new(name.en),
         zh: SmolStr::new(name.zh),
@@ -572,8 +568,8 @@ mod tests {
         duplicate.indices.push(duplicate.indices[0].clone());
         assert!(matches!(
             prepare_catalog(duplicate),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::DuplicateFinancialIndex { code }
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::DuplicateFinancialIndex { code }
             )) if code == "HSI"
         ));
 
@@ -581,8 +577,8 @@ mod tests {
         unknown.indices[0].category = "missing".to_owned();
         assert!(matches!(
             prepare_catalog(unknown),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::UnknownCategory { index, category }
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::UnknownCategory { index, category }
             )) if index == "HSI" && category == "missing"
         ));
 
@@ -595,8 +591,8 @@ mod tests {
             });
         assert!(matches!(
             prepare_catalog(duplicate_category),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::DuplicateCategory { code }
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::DuplicateCategory { code }
             )) if code == "asia"
         ));
     }
@@ -607,8 +603,8 @@ mod tests {
         untrimmed.indices[0].request_code = " .HSI".to_owned();
         assert!(matches!(
             prepare_catalog(untrimmed),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::InvalidCode
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::InvalidCode
             ))
         ));
 
@@ -616,8 +612,8 @@ mod tests {
         overlong.indices[0].code = "x".repeat(MAX_CODE_CHARS + 1);
         assert!(matches!(
             prepare_catalog(overlong),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::InvalidCode
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::InvalidCode
             ))
         ));
     }
@@ -628,8 +624,8 @@ mod tests {
         missing.indices[0].name = None;
         assert!(matches!(
             prepare_catalog(missing),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::MissingName
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::MissingName
             ))
         ));
 
@@ -637,8 +633,8 @@ mod tests {
         overlong.indices[0].name = name(&"x".repeat(MAX_NAME_CHARS + 1), "valid");
         assert!(matches!(
             prepare_catalog(overlong),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::NameFormat
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::NameFormat
             ))
         ));
     }
@@ -668,7 +664,7 @@ mod tests {
                 categories: over_limit,
                 indices: Vec::new(),
             }),
-            Err(FinancialIndicesDataError::ManifestCapacity {
+            Err(FinancialIndexDataError::ManifestCapacity {
                 limit: MAX_MANIFEST_CATEGORIES,
             })
         );
@@ -716,7 +712,7 @@ mod tests {
         over_limit.push(selected("ONE_TOO_MANY"));
         assert_eq!(
             normalize_selection(&over_limit),
-            Err(FinancialIndicesDataError::SelectionCapacity {
+            Err(FinancialIndexDataError::SelectionCapacity {
                 limit: MAX_SELECTED_INDICES,
             })
         );
@@ -729,8 +725,8 @@ mod tests {
 
         assert!(matches!(
             normalize_selection(&[broken]),
-            Err(FinancialIndicesDataError::Invalid(
-                FinancialIndicesInvalidReason::NameFormat
+            Err(FinancialIndexDataError::Invalid(
+                FinancialIndexInvalidReason::NameFormat
             ))
         ));
     }

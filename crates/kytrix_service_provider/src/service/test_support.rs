@@ -96,7 +96,7 @@ impl TestConfigManager {
             KytrixServiceCapability::Account,
             KytrixServiceCapability::CryptocurrencyEtf,
             KytrixServiceCapability::News,
-            KytrixServiceCapability::FinancialIndices,
+            KytrixServiceCapability::FinancialIndex,
             KytrixServiceCapability::X,
             KytrixServiceCapability::EthereumWallet,
             KytrixServiceCapability::SolanaWallet,
@@ -196,7 +196,7 @@ pub(super) fn feature_definition(
     }
 }
 
-pub(super) fn financial_indices() -> proto_types::FinancialIndices {
+pub(super) fn financial_index() -> proto_types::FinancialIndices {
     proto_types::FinancialIndices {
         categories: vec![proto_types::FinancialIndexCategory {
             code: "americas".to_owned(),
@@ -764,10 +764,10 @@ impl TestServiceServer {
                                             false,
                                         ),
                                         ClientRequestKind::GetFinancialIndicesRequest(_) => (
-                                            ObservedRequest::Rpc("financial_indices"),
+                                            ObservedRequest::Rpc("financial_index"),
                                             proto_response::response::Response::GetFinancialIndicesResponse(
                                                 proto_response::GetFinancialIndicesResponse {
-                                                    indices: Some(financial_indices()),
+                                                    indices: Some(financial_index()),
                                                 },
                                             ),
                                             false,

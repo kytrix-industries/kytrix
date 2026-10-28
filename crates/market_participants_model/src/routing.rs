@@ -93,8 +93,8 @@ pub enum CapabilityId {
     MarketCatalog,
     #[serde(rename = "candlesticks")]
     Candlesticks,
-    #[serde(rename = "market_trades")]
-    MarketTrades,
+    #[serde(rename = "market_trade")]
+    MarketTrade,
     #[serde(rename = "tickers")]
     Tickers,
     /// The route-level read of every ticker of a scope.
@@ -118,8 +118,8 @@ pub enum CapabilityId {
     TopTraderPositionRatio,
     #[serde(rename = "taker_volume")]
     TakerVolume,
-    #[serde(rename = "force_orders")]
-    ForceOrders,
+    #[serde(rename = "force_order")]
+    ForceOrder,
     #[serde(rename = "authenticated_trading")]
     AuthenticatedTrading,
     #[serde(rename = "account_orders")]
@@ -142,7 +142,7 @@ impl CapabilityId {
         match self {
             Self::MarketCatalog => "market_catalog",
             Self::Candlesticks => "candlesticks",
-            Self::MarketTrades => "market_trades",
+            Self::MarketTrade => "market_trade",
             Self::Tickers => "tickers",
             Self::AllTickers => "all_tickers",
             Self::OrderBook => "order_book",
@@ -151,7 +151,7 @@ impl CapabilityId {
             Self::TopTraderAccountRatio => "top_trader_account_ratio",
             Self::TopTraderPositionRatio => "top_trader_position_ratio",
             Self::TakerVolume => "taker_volume",
-            Self::ForceOrders => "force_orders",
+            Self::ForceOrder => "force_order",
             Self::AuthenticatedTrading => "authenticated_trading",
             Self::AccountOrders => "account_orders",
             Self::AccountPositions => "account_positions",

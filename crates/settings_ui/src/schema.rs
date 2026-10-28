@@ -1362,7 +1362,7 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
         capability: KytrixServiceCapability::News,
     },
     ServiceTarget::KytrixService {
-        capability: KytrixServiceCapability::FinancialIndices,
+        capability: KytrixServiceCapability::FinancialIndex,
     },
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::X,

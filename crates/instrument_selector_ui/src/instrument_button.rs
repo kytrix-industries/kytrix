@@ -257,7 +257,7 @@ mod tests {
     /// caller requires: it is loaded, so the snapshot is not empty, and still none of
     /// its scopes is one the selector may offer.
     fn loaded_without_the_required_capability() -> Arc<[LoadedScope]> {
-        loaded(vec![scope(fixture_route(), &[CapabilityId::MarketTrades])])
+        loaded(vec![scope(fixture_route(), &[CapabilityId::MarketTrade])])
     }
 
     /// The control states the name the publication gave the listing and the route it

@@ -185,7 +185,7 @@ impl OrderBookQuery {
 
 /// WebSocket liquidation-order subscription query.
 ///
-/// Only a route whose descriptor declares `ForceOrders` can serve it, and each
+/// Only a route whose descriptor declares `ForceOrder` can serve it, and each
 /// accepted event is published only when its listing is a perpetual: the query
 /// itself carries no product, because authority over products is the capability
 /// descriptor's, not a request's.

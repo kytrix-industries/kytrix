@@ -334,10 +334,10 @@ async fn the_two_refusals_are_decided_against_the_loaded_venues_alone() {
     let served = catalogs.served().len();
 
     assert_eq!(
-        market.limits(&spot, CapabilityId::ForceOrders),
+        market.limits(&spot, CapabilityId::ForceOrder),
         Err(MarketError::UnsupportedCapability {
             route: spot.clone(),
-            capability: CapabilityId::ForceOrders,
+            capability: CapabilityId::ForceOrder,
         }),
         "a scope that loaded without the capability is the refusal this build makes"
     );

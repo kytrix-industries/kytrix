@@ -4682,7 +4682,7 @@ pub(crate) mod tests {
     ///
     /// What this does not pin is *where* the flag is read. The predicate that sets it is the venue
     /// behind the stored selection, and a wait does not clear that selection, so the commit that
-    /// brings the market back sets the flag again by itself. `force_orders`' twin is the one whose
+    /// brings the market back sets the flag again by itself. `force_order`'s twin is the one whose
     /// returning commit cannot — waiting empties the set it compares — and it is there that reading
     /// the flag past the gate is load-bearing.
     #[gpui_kit::test]

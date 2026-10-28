@@ -919,7 +919,7 @@ impl KytrixServiceConnector {
         Ok(subscription)
     }
 
-    pub async fn subscribe_financial_indices(
+    pub async fn subscribe_financial_index(
         &self,
         topics: &[FinancialIndexTopic],
     ) -> Result<Subscription<FinancialIndexEvent>, KytrixServiceError> {
@@ -931,7 +931,7 @@ impl KytrixServiceConnector {
         let (publisher, subscription) =
             subscription_channel_with_wake(SUBSCRIBER_CAPACITY, self.inner().wake.clone())
                 .map_err(subscription_setup_error)?;
-        self.subscribe_topics(&topics, SubscriberSink::FinancialIndices(publisher))
+        self.subscribe_topics(&topics, SubscriberSink::FinancialIndex(publisher))
             .await?;
         Ok(subscription)
     }
@@ -1248,13 +1248,13 @@ impl KytrixServiceConnector {
     }
 
     /// Fetches the current financial indices over WebSocket RPC.
-    pub async fn fetch_financial_indices(
+    pub async fn fetch_financial_index(
         &self,
     ) -> Result<proto_types::FinancialIndices, KytrixServiceError> {
         let response = self
             .call_rpc(
                 None,
-                KytrixServiceCapability::FinancialIndices,
+                KytrixServiceCapability::FinancialIndex,
                 ClientRequestKind::GetFinancialIndicesRequest(GetFinancialIndicesRequest {}),
             )
             .await
@@ -1373,12 +1373,12 @@ mod tests {
             ObservedRequest::Rpc("cryptocurrency_etf")
         );
         assert_eq!(
-            connector.fetch_financial_indices().await.unwrap(),
-            financial_indices()
+            connector.fetch_financial_index().await.unwrap(),
+            financial_index()
         );
         assert_eq!(
             server.next_request().await.1,
-            ObservedRequest::Rpc("financial_indices")
+            ObservedRequest::Rpc("financial_index")
         );
         assert_eq!(
             connector
@@ -2368,7 +2368,7 @@ mod tests {
             )
         );
         let mut indices = connector
-            .subscribe_financial_indices(std::slice::from_ref(&index))
+            .subscribe_financial_index(std::slice::from_ref(&index))
             .await
             .expect("indices should subscribe");
         assert_eq!(
@@ -2635,7 +2635,7 @@ mod tests {
         );
 
         let indices = connector
-            .subscribe_financial_indices(&[
+            .subscribe_financial_index(&[
                 financial_index_topic("SPX"),
                 financial_index_topic("DJI"),
             ])
@@ -2655,7 +2655,7 @@ mod tests {
             (1, ObservedRequest::SetSubscriptions(news.clone()))
         );
         let indices = connector
-            .subscribe_financial_indices(&[
+            .subscribe_financial_index(&[
                 financial_index_topic("RUT"),
                 financial_index_topic("DJI"),
                 financial_index_topic("NDX"),
@@ -2796,7 +2796,7 @@ mod tests {
         let index = financial_index_topic("SPX");
         let index_service = ServiceTopic::FinancialIndex(index.clone());
         let mut indices = connector
-            .subscribe_financial_indices(std::slice::from_ref(&index))
+            .subscribe_financial_index(std::slice::from_ref(&index))
             .await
             .expect("indices should share the direct session");
         assert_eq!(
@@ -3106,7 +3106,7 @@ mod tests {
         let service_topic = ServiceTopic::FinancialIndex(index.clone());
 
         let mut first = connector
-            .subscribe_financial_indices(std::slice::from_ref(&index))
+            .subscribe_financial_index(std::slice::from_ref(&index))
             .await
             .expect("first index subscriber should register");
         assert_eq!(
@@ -3125,7 +3125,7 @@ mod tests {
         assert_eq!(cached.last_price, 101);
 
         let mut second = connector
-            .subscribe_financial_indices(std::slice::from_ref(&index))
+            .subscribe_financial_index(std::slice::from_ref(&index))
             .await
             .expect("second index subscriber should share the topic");
         assert_eq!(
@@ -3151,7 +3151,7 @@ mod tests {
         assert_eq!(server.connection_count.load(Ordering::Acquire), 1);
 
         let mut fresh = connector
-            .subscribe_financial_indices(std::slice::from_ref(&index))
+            .subscribe_financial_index(std::slice::from_ref(&index))
             .await
             .expect("fresh index subscriber should register");
         assert_eq!(

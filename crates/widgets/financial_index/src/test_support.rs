@@ -23,7 +23,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
     model::{LocalizedFinancialIndexName, SelectedFinancialIndex},
-    service::{FinancialIndexEventSubscription, FinancialIndicesSource},
+    service::{FinancialIndexEventSubscription, FinancialIndexSource},
 };
 
 /// The account every fixture scope belongs to.
@@ -155,7 +155,7 @@ struct FakeState {
     manifest_calls: usize,
 }
 
-/// What the next `subscribe_financial_indices` call finds.
+/// What the next `subscribe_financial_index` call finds.
 enum FakeSetup {
     /// A live subscription, and the drop counter of the subscription it replaces —
     /// which the service is expected to have released already.
@@ -368,7 +368,7 @@ impl FakeSource {
     }
 }
 
-impl FinancialIndicesSource for FakeSource {
+impl FinancialIndexSource for FakeSource {
     type Subscription = FakeSubscription;
 
     fn session_state(&self) -> watch::Receiver<Option<KytrixSessionState>> {
@@ -384,7 +384,7 @@ impl FinancialIndicesSource for FakeSource {
         Ok(state.manifest.clone())
     }
 
-    async fn subscribe_financial_indices(
+    async fn subscribe_financial_index(
         &self,
         topics: Arc<[FinancialIndexTopic]>,
     ) -> Result<Self::Subscription, KytrixServiceError> {

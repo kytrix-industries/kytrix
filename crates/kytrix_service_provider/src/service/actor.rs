@@ -168,7 +168,7 @@ impl ServiceSessionActor {
             subscription_route_change_reuses_socket: false,
             subscribers: AHashMap::with_capacity(8),
             topics: AHashMap::with_capacity(4),
-            latest_financial_indices: AHashMap::with_capacity(8),
+            latest_financial_index: AHashMap::with_capacity(8),
             latest_global_shipping_chokepoint_keyframes: AHashMap::with_capacity(2),
             session_state: None,
             subscriptions_dirty: false,
@@ -473,7 +473,7 @@ impl ServiceSessionActor {
         }
         self.subscribers.clear();
         self.topics.clear();
-        self.latest_financial_indices.clear();
+        self.latest_financial_index.clear();
         self.latest_global_shipping_chokepoint_keyframes.clear();
         self.observed_session_state.clear(self.session_generation);
         self.subscriptions_dirty = false;
@@ -1060,7 +1060,7 @@ impl ServiceSessionActor {
         }
         self.subscribers.clear();
         self.topics.clear();
-        self.latest_financial_indices.clear();
+        self.latest_financial_index.clear();
         self.latest_global_shipping_chokepoint_keyframes.clear();
         self.subscriptions_dirty = false;
         self.session_state = None;
@@ -1120,7 +1120,7 @@ impl ServiceSessionActor {
     pub(super) fn clear_cached_topic(&mut self, topic: &ServiceTopic) {
         match topic {
             ServiceTopic::FinancialIndex(topic) => {
-                self.latest_financial_indices.remove(topic);
+                self.latest_financial_index.remove(topic);
             }
             ServiceTopic::GlobalShippingChokepoint(area) => {
                 self.latest_global_shipping_chokepoint_keyframes
@@ -1138,7 +1138,7 @@ impl ServiceSessionActor {
             .iter()
             .filter_map(|topic| match topic {
                 ServiceTopic::FinancialIndex(topic) => {
-                    self.latest_financial_indices.get(topic).cloned()
+                    self.latest_financial_index.get(topic).cloned()
                 }
                 ServiceTopic::News
                 | ServiceTopic::X
@@ -1999,7 +1999,7 @@ impl ServiceSessionActor {
         for subscriber in self.subscribers.values() {
             subscriber.sink.reconnecting();
         }
-        self.latest_financial_indices.clear();
+        self.latest_financial_index.clear();
         self.latest_global_shipping_chokepoint_keyframes.clear();
         self.session_state = None;
         self.observed_session_state.clear(self.session_generation);
@@ -2043,7 +2043,7 @@ impl ServiceSessionActor {
             ) = (&topic, &message)
             && &event.topic == financial_index_topic
         {
-            self.latest_financial_indices
+            self.latest_financial_index
                 .insert(financial_index_topic.clone(), event.clone());
         }
         let ids = self
@@ -2162,7 +2162,7 @@ mod tests {
         actor.add_subscriber_inner(
             1,
             vec![topic.clone()],
-            SubscriberSink::FinancialIndices(first_publisher),
+            SubscriberSink::FinancialIndex(first_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
@@ -2177,15 +2177,15 @@ mod tests {
         actor.add_subscriber_inner(
             2,
             vec![topic.clone()],
-            SubscriberSink::FinancialIndices(second_publisher),
+            SubscriberSink::FinancialIndex(second_publisher),
             None,
             NetworkRouteGeneration::default(),
         );
         assert_eq!(second_events.try_recv_for_test(), Ok(event));
         assert!(actor.remove_subscriber(1).is_empty());
-        assert!(actor.latest_financial_indices.contains_key(&index));
+        assert!(actor.latest_financial_index.contains_key(&index));
         assert_eq!(actor.remove_subscriber(2), vec![topic]);
-        assert!(!actor.latest_financial_indices.contains_key(&index));
+        assert!(!actor.latest_financial_index.contains_key(&index));
 
         let news_topic = ServiceTopic::News;
         let news = KytrixServiceEvent::News(NewsEvent {
@@ -2314,7 +2314,7 @@ mod tests {
         actor.add_subscriber_inner(
             1,
             vec![old_topic.clone()],
-            SubscriberSink::FinancialIndices(publisher),
+            SubscriberSink::FinancialIndex(publisher),
             None,
             NetworkRouteGeneration::default(),
         );
@@ -2332,7 +2332,7 @@ mod tests {
             })),
         );
         assert!(events.try_recv_for_test().is_ok());
-        assert!(actor.latest_financial_indices.contains_key(&old_index));
+        assert!(actor.latest_financial_index.contains_key(&old_index));
         actor.subscriptions_dirty = true;
 
         actor.prepare_reconnect(KytrixServiceError::Read("network reset".into()));
@@ -2344,7 +2344,7 @@ mod tests {
         assert_eq!(actor.subscribers.len(), 1);
         assert_eq!(actor.topics.len(), 1);
         assert!(actor.topics.contains_key(&old_topic));
-        assert!(actor.latest_financial_indices.is_empty());
+        assert!(actor.latest_financial_index.is_empty());
         assert!(!actor.subscriptions_dirty);
     }
 

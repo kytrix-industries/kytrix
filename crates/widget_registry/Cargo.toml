@@ -18,11 +18,11 @@ cryptocurrency_etf = { workspace = true }
 empty = { workspace = true }
 ethereum_wallet = { workspace = true }
 financial_calendar = { workspace = true }
-force_orders = { workspace = true }
+force_order = { workspace = true }
 global_shipping_chokepoint = { workspace = true }
 hyperliquid_wallet = { workspace = true }
-financial_indices = { workspace = true }
-market_trades = { workspace = true }
+financial_index = { workspace = true }
+market_trade = { workspace = true }
 news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }

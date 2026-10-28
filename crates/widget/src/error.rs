@@ -2350,7 +2350,7 @@ mod tests {
                 .to_string(),
                 MarketError::UnsupportedCapability {
                     route: spot.clone(),
-                    capability: market_participants_model::routing::CapabilityId::MarketTrades,
+                    capability: market_participants_model::routing::CapabilityId::MarketTrade,
                 }
                 .localized_message(cx)
                 .to_string(),
@@ -2911,7 +2911,7 @@ mod tests {
     /// of that constant, which no locale defines and nothing checks. A listed source
     /// therefore names every key where it uses it.
     const WIDGET_MESSAGE_SOURCES: &[&str] = &[
-        include_str!("../../widgets/force_orders/src/view.rs"),
+        include_str!("../../widgets/force_order/src/view.rs"),
         include_str!("../../widgets/hyperliquid_wallet/src/model.rs"),
         include_str!("../../widgets/hyperliquid_wallet/src/service.rs"),
         include_str!("../../widgets/watch_list/src/view.rs"),
@@ -3008,8 +3008,8 @@ mod tests {
             include_str!("../../widgets/financial_calendar/src/view.rs"),
         ),
         (
-            "crates/widgets/force_orders/src/view.rs",
-            include_str!("../../widgets/force_orders/src/view.rs"),
+            "crates/widgets/force_order/src/view.rs",
+            include_str!("../../widgets/force_order/src/view.rs"),
         ),
         (
             "crates/widgets/global_shipping_chokepoint/src/view.rs",
@@ -3020,12 +3020,12 @@ mod tests {
             include_str!("../../widgets/hyperliquid_wallet/src/view.rs"),
         ),
         (
-            "crates/widgets/financial_indices/src/view.rs",
-            include_str!("../../widgets/financial_indices/src/view.rs"),
+            "crates/widgets/financial_index/src/view.rs",
+            include_str!("../../widgets/financial_index/src/view.rs"),
         ),
         (
-            "crates/widgets/market_trades/src/view.rs",
-            include_str!("../../widgets/market_trades/src/view.rs"),
+            "crates/widgets/market_trade/src/view.rs",
+            include_str!("../../widgets/market_trade/src/view.rs"),
         ),
         (
             "crates/widgets/news/src/view.rs",

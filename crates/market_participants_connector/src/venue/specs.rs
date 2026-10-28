@@ -186,7 +186,7 @@ const BINANCE_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
@@ -203,11 +203,11 @@ const BINANCE_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
-            public(CapabilityId::ForceOrders),
+            public(CapabilityId::ForceOrder),
             public(CapabilityId::OpenInterest),
             public(CapabilityId::LongShortAccountRatio),
             public(CapabilityId::TopTraderAccountRatio),
@@ -231,7 +231,7 @@ const OKX_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
@@ -248,11 +248,11 @@ const OKX_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
-            public(CapabilityId::ForceOrders),
+            public(CapabilityId::ForceOrder),
             public(CapabilityId::OpenInterest),
             public(CapabilityId::LongShortAccountRatio),
             public(CapabilityId::TopTraderAccountRatio),
@@ -276,7 +276,7 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),
@@ -293,7 +293,7 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
         capabilities: &[
             public(CapabilityId::MarketCatalog),
             public(CapabilityId::Candlesticks),
-            public(CapabilityId::MarketTrades),
+            public(CapabilityId::MarketTrade),
             public(CapabilityId::Tickers),
             public(CapabilityId::AllTickers),
             public(CapabilityId::OrderBook),

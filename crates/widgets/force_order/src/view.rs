@@ -33,10 +33,10 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use super::{
-    model::{ForceOrdersSnapshot, MAX_FORCE_ORDERS},
+    model::{ForceOrderSnapshot, MAX_FORCE_ORDERS},
     service::{
-        ForceOrdersProtocol, ForceOrdersRequest, ForceOrdersResponse, ForceOrdersService,
-        ForceOrdersSource, ForceOrdersStatus, ForceOrdersStreamKey, ForceOrdersStreamMessage,
+        ForceOrderProtocol, ForceOrderRequest, ForceOrderResponse, ForceOrderService,
+        ForceOrderSource, ForceOrderStatus, ForceOrderStreamKey, ForceOrderStreamMessage,
     },
 };
 
@@ -58,9 +58,9 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
 /// The config exists so the persisted schema version is owned by the widget
 /// rather than inferred from the absence of a config.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForceOrdersConfig;
+pub struct ForceOrderConfig;
 
-impl WidgetConfig for ForceOrdersConfig {
+impl WidgetConfig for ForceOrderConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
@@ -75,7 +75,7 @@ fn needed_routes(cx: &App) -> Arc<[VenueRoute]> {
 
     loaded_routes_carrying(
         connector,
-        market_participants_model::routing::CapabilityId::ForceOrders,
+        market_participants_model::routing::CapabilityId::ForceOrder,
     )
     .into()
 }
@@ -143,7 +143,7 @@ fn routes_changed(held: &[VenueRoute], needed: &[VenueRoute]) -> bool {
 /// framework, in the language showing on the frame that draws it.
 fn market_venues() -> Vec<VenueId> {
     market_participants_connector::venue::definition::venues_supporting(
-        market_participants_model::routing::CapabilityId::ForceOrders,
+        market_participants_model::routing::CapabilityId::ForceOrder,
     )
 }
 
@@ -153,25 +153,25 @@ fn market_venues() -> Vec<VenueId> {
 /// [`Entity`]; it keeps its own invalidation source, so a snapshot that changes
 /// nothing the table draws does not rebuild it. It is the body's only expensive
 /// region, so it is the region the body caches.
-struct ForceOrdersTable {
-    snapshot: ForceOrdersSnapshot,
+struct ForceOrderTable {
+    snapshot: ForceOrderSnapshot,
     /// Direction colors, resolved once because `TableDataSet::cell` renders
     /// without a window or application context.
     long: Hsla,
     short: Hsla,
 }
 
-impl ForceOrdersTable {
+impl ForceOrderTable {
     fn new(theme: &Theme) -> Self {
         Self {
-            snapshot: ForceOrdersSnapshot::default(),
+            snapshot: ForceOrderSnapshot::default(),
             long: theme.roles.market.up.hsla,
             short: theme.roles.market.down.hsla,
         }
     }
 }
 
-impl TableDataSet<COLUMN_COUNT> for ForceOrdersTable {
+impl TableDataSet<COLUMN_COUNT> for ForceOrderTable {
     fn rows_count(&self) -> usize {
         self.snapshot.len()
     }
@@ -236,7 +236,7 @@ impl TableDataSet<COLUMN_COUNT> for ForceOrdersTable {
     /// An accepted snapshot with no orders in it is the fact "there are none right
     /// now", so the table says so instead of leaving the body under its headers blank.
     fn empty(&self, cx: &App) -> Option<AnyElement> {
-        Some(EmptyState::new("ForceOrdersEmpty", t!(cx, "common.no_data")).into_any_element())
+        Some(EmptyState::new("ForceOrderEmpty", t!(cx, "common.no_data")).into_any_element())
     }
 }
 
@@ -261,9 +261,9 @@ impl RenderOnce for ForceOrderListingCell {
     }
 }
 
-pub struct ForceOrdersWidget {
-    binding: WidgetBinding<ForceOrdersProtocol>,
-    table: Entity<ForceOrdersTable>,
+pub struct ForceOrderWidget {
+    binding: WidgetBinding<ForceOrderProtocol>,
+    table: Entity<ForceOrderTable>,
     status: Entity<WidgetStatus>,
     /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
@@ -274,8 +274,8 @@ pub struct ForceOrdersWidget {
     /// rather than taken once. Empty means no market this pane reads is loaded,
     /// which is what keeps [`Self::has_content`] false while the pane waits.
     routes: Arc<[VenueRoute]>,
-    snapshot: Option<ForceOrdersSnapshot>,
-    pending_snapshot: Option<ForceOrdersSnapshot>,
+    snapshot: Option<ForceOrderSnapshot>,
+    pending_snapshot: Option<ForceOrderSnapshot>,
     ready_received: bool,
     awaiting_snapshot: bool,
     /// Whether a venue this pane is reading was loaded or refreshed again.
@@ -300,14 +300,14 @@ pub struct ForceOrdersWidget {
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for ForceOrdersWidget {
-    type Config = ForceOrdersConfig;
+impl WidgetView for ForceOrderWidget {
+    type Config = ForceOrderConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.force_orders");
-    const DISPLAY_NAME: &'static str = "widget.names.force_orders";
+    const ID: WidgetId = WidgetId::new_static("kytrix.force_order");
+    const DISPLAY_NAME: &'static str = "widget.names.force_order";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
     const DESCRIPTION: &'static str = "Live liquidation orders across Binance and OKX";
-    const ICON: Option<&'static str> = Some("widgets/force_orders.png");
+    const ICON: Option<&'static str> = Some("widgets/force_order.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -373,15 +373,15 @@ impl WidgetView for ForceOrdersWidget {
         // The two decisions are separate: a reload still drops the rows — they were written at the
         // generation behind the commit — while the request is the replacing one.
         let request = if retry || market_reloaded {
-            ForceOrdersRequest::Retry { routes }
+            ForceOrderRequest::Retry { routes }
         } else {
-            ForceOrdersRequest::Load { routes }
+            ForceOrderRequest::Load { routes }
         };
         self.binding.call(request, cx, Self::apply_rpc_result);
     }
 }
 
-impl ForceOrdersWidget {
+impl ForceOrderWidget {
     fn new_with_source<S>(
         source: S,
         display: Arc<Catalog>,
@@ -390,9 +390,9 @@ impl ForceOrdersWidget {
         context: &mut Context<Self>,
     ) -> Self
     where
-        S: ForceOrdersSource,
+        S: ForceOrderSource,
     {
-        let service = ForceOrdersService::new(source, display, MAX_FORCE_ORDERS);
+        let service = ForceOrderService::new(source, display, MAX_FORCE_ORDERS);
         let binding = WidgetBinding::spawn(
             global::handle(context).handle(),
             service,
@@ -400,7 +400,7 @@ impl ForceOrdersWidget {
             Self::apply_reliable,
             Self::apply_latest,
         );
-        let table = context.new(|cx| ForceOrdersTable::new(cx.theme()));
+        let table = context.new(|cx| ForceOrderTable::new(cx.theme()));
         // The pane recovers from the markets it waits for without polling: a venue commit is
         // the one event that can change what may be read, and a change that arrives while the
         // pane has nothing to show is a reason to load again.
@@ -568,7 +568,7 @@ impl ForceOrdersWidget {
         self.status.report(WidgetState::Ready, context);
     }
 
-    fn apply_snapshot(&mut self, snapshot: ForceOrdersSnapshot, context: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, snapshot: ForceOrderSnapshot, context: &mut Context<Self>) {
         self.snapshot = Some(snapshot);
         self.awaiting_snapshot = false;
         self.report_snapshot_state(context);
@@ -577,11 +577,11 @@ impl ForceOrdersWidget {
 
     fn apply_reliable(
         &mut self,
-        key: ForceOrdersStreamKey,
-        message: Arc<ForceOrdersStreamMessage>,
+        key: ForceOrderStreamKey,
+        message: Arc<ForceOrderStreamMessage>,
         context: &mut Context<Self>,
     ) {
-        if key != ForceOrdersStreamKey::AllMarkets
+        if key != ForceOrderStreamKey::AllMarkets
             || self.status.is_failed(context)
             || self.awaiting_market
         {
@@ -589,13 +589,13 @@ impl ForceOrdersWidget {
         }
 
         match message.as_ref() {
-            ForceOrdersStreamMessage::Status(status) => match status {
-                ForceOrdersStatus::Connecting => {
+            ForceOrderStreamMessage::Status(status) => match status {
+                ForceOrderStatus::Connecting => {
                     if self.snapshot.is_none() {
                         self.status.report(WidgetState::Connecting, context);
                     }
                 }
-                ForceOrdersStatus::Ready => {
+                ForceOrderStatus::Ready => {
                     self.ready_received = true;
                     if let Some(snapshot) = self.pending_snapshot.take() {
                         self.apply_snapshot(snapshot, context);
@@ -603,7 +603,7 @@ impl ForceOrdersWidget {
                         self.report_snapshot_state(context);
                     }
                 }
-                ForceOrdersStatus::Error(error) => {
+                ForceOrderStatus::Error(error) => {
                     if self.report_waiting_for_directory(error, context) {
                         return;
                     }
@@ -614,24 +614,24 @@ impl ForceOrdersWidget {
                     );
                 }
             },
-            ForceOrdersStreamMessage::Snapshot(_) => {}
+            ForceOrderStreamMessage::Snapshot(_) => {}
         }
     }
 
     fn apply_latest(
         &mut self,
-        key: ForceOrdersStreamKey,
-        message: Arc<ForceOrdersStreamMessage>,
+        key: ForceOrderStreamKey,
+        message: Arc<ForceOrderStreamMessage>,
         context: &mut Context<Self>,
     ) {
-        if key != ForceOrdersStreamKey::AllMarkets
+        if key != ForceOrderStreamKey::AllMarkets
             || self.status.is_failed(context)
             || self.awaiting_market
         {
             return;
         }
 
-        if let ForceOrdersStreamMessage::Snapshot(snapshot) = message.as_ref() {
+        if let ForceOrderStreamMessage::Snapshot(snapshot) = message.as_ref() {
             if self.ready_received {
                 self.apply_snapshot(snapshot.clone(), context);
             } else {
@@ -642,11 +642,11 @@ impl ForceOrdersWidget {
 
     fn apply_rpc_result(
         &mut self,
-        result: WidgetRpcResult<ForceOrdersProtocol>,
+        result: WidgetRpcResult<ForceOrderProtocol>,
         context: &mut Context<Self>,
     ) {
         match result {
-            Ok(ForceOrdersResponse::StreamStarted) => {}
+            Ok(ForceOrderResponse::StreamStarted) => {}
             Err(error) => {
                 let recovery = self.recovery.clone();
                 self.status
@@ -664,11 +664,11 @@ impl ForceOrdersWidget {
     fn ready_body(&self, cx: &App) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
-                "ForceOrdersTableFrame",
+                "ForceOrderTableFrame",
             )))
             .aria_label(t!(
                 cx,
-                "widget.force_orders.table",
+                "widget.force_order.table",
                 markets = widget::venue::joined_names(
                     cx,
                     &market_venues()
@@ -682,14 +682,14 @@ impl ForceOrdersWidget {
             .child(Table::new(
                 // The table keeps its own scroll position in state keyed by this
                 // id, so it has to stay stable across frames.
-                ElementId::Name(SharedString::new_static("ForceOrdersTable")),
+                ElementId::Name(SharedString::new_static("ForceOrderTable")),
                 &self.table,
             ))
             .into_any_element()
     }
 }
 
-impl Render for ForceOrdersWidget {
+impl Render for ForceOrderWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is only embedded while the widget has content, so this is the
         // ready state and nothing else. Everything the widget is *doing* is drawn
@@ -731,8 +731,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{ForceOrderEntry, ForceOrderListing, ForceOrdersState},
-        service::{ForceOrderEventSubscription, ForceOrdersSource},
+        model::{ForceOrderEntry, ForceOrderListing, ForceOrderState},
+        service::{ForceOrderEventSubscription, ForceOrderSource},
     };
 
     fn venue() -> VenueId {
@@ -778,11 +778,11 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct PendingForceOrdersSource;
+    struct PendingForceOrderSource;
 
     struct PendingForceOrderSubscription;
 
-    impl ForceOrdersSource for PendingForceOrdersSource {
+    impl ForceOrderSource for PendingForceOrderSource {
         type Subscription = PendingForceOrderSubscription;
 
         async fn perpetual_listings(
@@ -792,7 +792,7 @@ mod tests {
             std::future::pending().await
         }
 
-        fn subscribe_force_orders(
+        fn subscribe_force_order(
             &self,
             _route: VenueRoute,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -816,12 +816,12 @@ mod tests {
     /// count is what says the pane did not start one; the listing count is what says the service
     /// was not told to resolve the markets again either.
     #[derive(Clone, Default)]
-    struct CountingForceOrdersSource {
+    struct CountingForceOrderSource {
         subscriptions: Arc<std::sync::atomic::AtomicUsize>,
         listings: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl ForceOrdersSource for CountingForceOrdersSource {
+    impl ForceOrderSource for CountingForceOrderSource {
         type Subscription = PendingForceOrderSubscription;
 
         async fn perpetual_listings(
@@ -833,7 +833,7 @@ mod tests {
             Ok(vec![test_support::listing_key(route, "BTCUSDT")])
         }
 
-        fn subscribe_force_orders(
+        fn subscribe_force_order(
             &self,
             _route: VenueRoute,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -850,7 +850,7 @@ mod tests {
     /// both that the pane asked for a new stream and which generation's rules that stream resolved
     /// its markets at: this is the one seam where the two are a single record.
     #[derive(Clone)]
-    struct ResolvingForceOrdersSource {
+    struct ResolvingForceOrderSource {
         catalog: Arc<Catalog>,
         resolutions: Arc<std::sync::Mutex<Vec<Vec<ListingPrecision>>>>,
     }
@@ -866,7 +866,7 @@ mod tests {
             .clone()
     }
 
-    impl ForceOrdersSource for ResolvingForceOrdersSource {
+    impl ForceOrderSource for ResolvingForceOrderSource {
         type Subscription = PendingForceOrderSubscription;
 
         async fn perpetual_listings(
@@ -889,7 +889,7 @@ mod tests {
                 .collect())
         }
 
-        fn subscribe_force_orders(
+        fn subscribe_force_order(
             &self,
             _route: VenueRoute,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -908,7 +908,7 @@ mod tests {
         resolutions: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl ForceOrdersSource for ListingResolvingSource {
+    impl ForceOrderSource for ListingResolvingSource {
         type Subscription = PendingForceOrderSubscription;
 
         async fn perpetual_listings(
@@ -920,7 +920,7 @@ mod tests {
             Ok(vec![restated_entry("0.01").listing.key])
         }
 
-        fn subscribe_force_orders(
+        fn subscribe_force_order(
             &self,
             _route: VenueRoute,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -999,14 +999,14 @@ mod tests {
         restated
     }
 
-    fn snapshot(timestamp: i64) -> ForceOrdersSnapshot {
-        let mut state = ForceOrdersState::new(1);
+    fn snapshot(timestamp: i64) -> ForceOrderSnapshot {
+        let mut state = ForceOrderState::new(1);
         state.merge(&[entry(timestamp)]);
         state.snapshot()
     }
 
-    fn empty_snapshot() -> ForceOrdersSnapshot {
-        ForceOrdersState::new(1).snapshot()
+    fn empty_snapshot() -> ForceOrderSnapshot {
+        ForceOrderState::new(1).snapshot()
     }
 
     fn disconnect() -> MarketError {
@@ -1014,8 +1014,8 @@ mod tests {
     }
 
     /// Creates a widget the way the framework does: state first, then one load.
-    fn widget(cx: &mut TestAppContext) -> Entity<ForceOrdersWidget> {
-        widget_over(cx, PendingForceOrdersSource, Arc::new(Catalog::new()), true)
+    fn widget(cx: &mut TestAppContext) -> Entity<ForceOrderWidget> {
+        widget_over(cx, PendingForceOrderSource, Arc::new(Catalog::new()), true)
     }
 
     /// The same, over a source a test drives, a directory it arranges and a market
@@ -1025,9 +1025,9 @@ mod tests {
         source: S,
         display: Arc<Catalog>,
         loaded: bool,
-    ) -> Entity<ForceOrdersWidget>
+    ) -> Entity<ForceOrderWidget>
     where
-        S: ForceOrdersSource,
+        S: ForceOrderSource,
     {
         widget_over_with(cx, loaded, move |_| (source, display))
     }
@@ -1042,9 +1042,9 @@ mod tests {
         cx: &mut TestAppContext,
         loaded: bool,
         build: impl FnOnce(&Arc<Catalog>) -> (S, Arc<Catalog>),
-    ) -> Entity<ForceOrdersWidget>
+    ) -> Entity<ForceOrderWidget>
     where
-        S: ForceOrdersSource,
+        S: ForceOrderSource,
     {
         cx.executor().allow_parking();
         // The market is installed and its commit flushed before the pane is built, which is the
@@ -1059,19 +1059,19 @@ mod tests {
             let (source, display) = build(&catalog);
             let widget = cx.new(|cx| {
                 let status = cx.new(|_| WidgetStatus::new());
-                let weak: WeakEntity<ForceOrdersWidget> = cx.weak_entity();
+                let weak: WeakEntity<ForceOrderWidget> = cx.weak_entity();
                 let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
                     let _ = weak.update(cx, |widget, cx| widget.load(cx));
                 });
 
-                ForceOrdersWidget::new_with_source(source, display, status, recovery, cx)
+                ForceOrderWidget::new_with_source(source, display, status, recovery, cx)
             });
             widget.update(cx, |widget, cx| widget.load(cx));
             widget
         })
     }
 
-    fn status(widget: &Entity<ForceOrdersWidget>, cx: &App) -> WidgetState {
+    fn status(widget: &Entity<ForceOrderWidget>, cx: &App) -> WidgetState {
         let status = widget.read(cx).status.clone();
         status.state(cx)
     }
@@ -1096,14 +1096,14 @@ mod tests {
     }
 
     /// The same read, for the places where the widget is already borrowed.
-    fn reported(widget: &ForceOrdersWidget, cx: &App) -> WidgetState {
+    fn reported(widget: &ForceOrderWidget, cx: &App) -> WidgetState {
         widget.status.state(cx)
     }
 
     /// Reports a ready snapshot as the stream would, then returns the widget.
     fn accept_snapshot(
-        widget: &Entity<ForceOrdersWidget>,
-        snapshot: ForceOrdersSnapshot,
+        widget: &Entity<ForceOrderWidget>,
+        snapshot: ForceOrderSnapshot,
         cx: &mut App,
     ) {
         widget.update(cx, |widget, context| {
@@ -1131,12 +1131,7 @@ mod tests {
     /// (⑰).
     #[gpui_kit::test]
     fn an_unloaded_market_should_leave_the_pane_waiting(cx: &mut TestAppContext) {
-        let widget = widget_over(
-            cx,
-            PendingForceOrdersSource,
-            Arc::new(Catalog::new()),
-            false,
-        );
+        let widget = widget_over(cx, PendingForceOrderSource, Arc::new(Catalog::new()), false);
 
         cx.update(|cx| {
             let status = status(&widget, cx);
@@ -1180,12 +1175,7 @@ mod tests {
     /// nothing again: nothing but the frame that draws it resolves the words.
     #[gpui_kit::test]
     fn a_language_change_should_re_report_the_market_notice(cx: &mut TestAppContext) {
-        let widget = widget_over(
-            cx,
-            PendingForceOrdersSource,
-            Arc::new(Catalog::new()),
-            false,
-        );
+        let widget = widget_over(cx, PendingForceOrderSource, Arc::new(Catalog::new()), false);
 
         let (notice, english) = cx.update(|cx| {
             let notice = status(&widget, cx)
@@ -1221,12 +1211,7 @@ mod tests {
     /// without a poll (⑯).
     #[gpui_kit::test]
     fn loading_the_venue_should_let_the_waiting_pane_start(cx: &mut TestAppContext) {
-        let widget = widget_over(
-            cx,
-            PendingForceOrdersSource,
-            Arc::new(Catalog::new()),
-            false,
-        );
+        let widget = widget_over(cx, PendingForceOrderSource, Arc::new(Catalog::new()), false);
         cx.update(|cx| {
             assert!(status(&widget, cx).notice().is_some());
             cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
@@ -1277,10 +1262,10 @@ mod tests {
             );
 
             widget.update(cx, |widget, context| {
-                let key = ForceOrdersStreamKey::AllMarkets;
+                let key = ForceOrderStreamKey::AllMarkets;
                 widget.apply_reliable(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Status(ForceOrdersStatus::Error(
+                    Arc::new(ForceOrderStreamMessage::Status(ForceOrderStatus::Error(
                         MarketError::Catalog(Box::new(
                             market_participants_connector::catalog::error::CatalogError::CatalogNotLoaded {
                                 route: route(),
@@ -1331,7 +1316,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let widget = widget(cx);
-        let key = ForceOrdersStreamKey::AllMarkets;
+        let key = ForceOrderStreamKey::AllMarkets;
 
         cx.update(|cx| {
             // The pane is reading, which is the state a revocation interrupts.
@@ -1355,7 +1340,7 @@ mod tests {
             widget.update(cx, |widget, context| {
                 widget.apply_latest(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Snapshot(snapshot(9))),
+                    Arc::new(ForceOrderStreamMessage::Snapshot(snapshot(9))),
                     context,
                 );
             });
@@ -1371,7 +1356,7 @@ mod tests {
             widget.update(cx, |widget, context| {
                 widget.apply_reliable(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Status(ForceOrdersStatus::Ready)),
+                    Arc::new(ForceOrderStreamMessage::Status(ForceOrderStatus::Ready)),
                     context,
                 );
             });
@@ -1498,7 +1483,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_late_stream_message_after_a_failure_should_not_change_the_status(cx: &mut TestAppContext) {
         let widget = widget(cx);
-        let key = ForceOrdersStreamKey::AllMarkets;
+        let key = ForceOrderStreamKey::AllMarkets;
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
@@ -1512,12 +1497,12 @@ mod tests {
 
                 widget.apply_reliable(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Status(ForceOrdersStatus::Ready)),
+                    Arc::new(ForceOrderStreamMessage::Status(ForceOrderStatus::Ready)),
                     context,
                 );
                 widget.apply_latest(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Snapshot(snapshot(1))),
+                    Arc::new(ForceOrderStreamMessage::Snapshot(snapshot(1))),
                     context,
                 );
 
@@ -1531,14 +1516,14 @@ mod tests {
     #[gpui_kit::test]
     fn a_snapshot_before_the_ready_boundary_should_await_it(cx: &mut TestAppContext) {
         let widget = widget(cx);
-        let key = ForceOrdersStreamKey::AllMarkets;
+        let key = ForceOrderStreamKey::AllMarkets;
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
                 widget.binding.cancel();
                 widget.apply_latest(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Snapshot(snapshot(1))),
+                    Arc::new(ForceOrderStreamMessage::Snapshot(snapshot(1))),
                     context,
                 );
                 assert!(widget.snapshot.is_none());
@@ -1546,12 +1531,12 @@ mod tests {
 
                 widget.apply_reliable(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Status(ForceOrdersStatus::Ready)),
+                    Arc::new(ForceOrderStreamMessage::Status(ForceOrderStatus::Ready)),
                     context,
                 );
 
                 assert_eq!(
-                    widget.snapshot.as_ref().map(ForceOrdersSnapshot::len),
+                    widget.snapshot.as_ref().map(ForceOrderSnapshot::len),
                     Some(1)
                 );
                 assert!(widget.has_content());
@@ -1563,14 +1548,14 @@ mod tests {
     #[gpui_kit::test]
     fn a_stream_failure_should_become_the_reported_state(cx: &mut TestAppContext) {
         let widget = widget(cx);
-        let key = ForceOrdersStreamKey::AllMarkets;
+        let key = ForceOrderStreamKey::AllMarkets;
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
                 widget.binding.cancel();
                 widget.apply_reliable(
                     key,
-                    Arc::new(ForceOrdersStreamMessage::Status(ForceOrdersStatus::Error(
+                    Arc::new(ForceOrderStreamMessage::Status(ForceOrderStatus::Error(
                         disconnect(),
                     ))),
                     context,
@@ -1610,12 +1595,7 @@ mod tests {
     /// stays is against restarting a stream that already reads the same set.
     #[gpui_kit::test]
     fn a_venue_loaded_after_the_rows_arrived_should_be_read_too(cx: &mut TestAppContext) {
-        let widget = widget_over(
-            cx,
-            PendingForceOrdersSource,
-            Arc::new(Catalog::new()),
-            false,
-        );
+        let widget = widget_over(cx, PendingForceOrderSource, Arc::new(Catalog::new()), false);
         cx.update(|cx| {
             cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
                 .load_fixture(
@@ -1696,7 +1676,7 @@ mod tests {
     /// leave the count where it was and never read the venue that had just loaded.
     #[gpui_kit::test]
     fn a_whole_market_pane_wakes_when_its_routes_change(cx: &mut TestAppContext) {
-        let source = CountingForceOrdersSource::default();
+        let source = CountingForceOrderSource::default();
         let demands = Arc::clone(&source.subscriptions);
         let widget = widget_over(cx, source, Arc::new(Catalog::new()), false);
         let okx = VenueId::Okx;
@@ -1867,7 +1847,7 @@ mod tests {
             let resolutions = Arc::clone(&resolutions);
             move |catalog| {
                 (
-                    ResolvingForceOrdersSource {
+                    ResolvingForceOrderSource {
                         catalog: Arc::clone(catalog),
                         resolutions,
                     },
@@ -1937,7 +1917,7 @@ mod tests {
     /// where the user left it, with the stream count unmoved.
     #[gpui_kit::test]
     fn a_venue_commit_should_not_revive_a_failed_pane(cx: &mut TestAppContext) {
-        let source = CountingForceOrdersSource::default();
+        let source = CountingForceOrderSource::default();
         let demands = Arc::clone(&source.subscriptions);
         let widget = widget_over(cx, source, Arc::new(Catalog::new()), false);
         let okx = VenueId::Okx;
@@ -2046,7 +2026,7 @@ mod tests {
                     .read(cx)
                     .snapshot
                     .as_ref()
-                    .map(ForceOrdersSnapshot::len),
+                    .map(ForceOrderSnapshot::len),
                 Some(1),
                 "a retry must not blank data the user is still reading"
             );
@@ -2073,7 +2053,7 @@ mod tests {
     /// between two frames is never served stale out of a cache.
     #[test]
     fn force_order_display_should_fill_every_cached_column() {
-        let table = ForceOrdersTable {
+        let table = ForceOrderTable {
             snapshot: snapshot(1),
             long: gpui_kit::green(),
             short: gpui_kit::red(),
@@ -2112,7 +2092,7 @@ mod tests {
     /// that exists only for the test.
     #[gpui_kit::test]
     fn a_force_order_row_should_offer_the_user_visible_route(cx: &mut TestAppContext) {
-        let table = ForceOrdersTable {
+        let table = ForceOrderTable {
             snapshot: snapshot(1),
             long: gpui_kit::green(),
             short: gpui_kit::red(),

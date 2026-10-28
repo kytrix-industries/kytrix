@@ -23,7 +23,7 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
 pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'static str> {
     match capability {
         KytrixServiceCapability::News => Some("news"),
-        KytrixServiceCapability::FinancialIndices => Some("financial_indices"),
+        KytrixServiceCapability::FinancialIndex => Some("financial_indices"),
         KytrixServiceCapability::X => Some("x"),
         KytrixServiceCapability::EthereumWallet => Some("ethereum_wallet_monitoring"),
         KytrixServiceCapability::SolanaWallet => Some("solana_wallet_monitoring"),
@@ -83,7 +83,7 @@ mod tests {
             ),
             (KytrixServiceCapability::News, Some("news")),
             (
-                KytrixServiceCapability::FinancialIndices,
+                KytrixServiceCapability::FinancialIndex,
                 Some("financial_indices"),
             ),
             (KytrixServiceCapability::X, Some("x")),

@@ -1481,7 +1481,7 @@ mod tests {
             ),
             scope(
                 route("binance", "usd-m-perp"),
-                &[CapabilityId::Candlesticks, CapabilityId::ForceOrders],
+                &[CapabilityId::Candlesticks, CapabilityId::ForceOrder],
             ),
             scope(route("okx", "spot"), &[CapabilityId::Candlesticks]),
         ])
@@ -1647,10 +1647,10 @@ mod tests {
 
     #[test]
     fn capability_filter_should_exclude_routes_that_do_not_declare_it() {
-        let force_orders = filters(InstrumentKindFilter::Perpetual, CapabilityId::ForceOrders);
+        let force_order = filters(InstrumentKindFilter::Perpetual, CapabilityId::ForceOrder);
 
         assert_eq!(
-            force_orders
+            force_order
                 .offered()
                 .iter()
                 .map(|scope| scope.route.clone())
@@ -1666,7 +1666,7 @@ mod tests {
         assert_eq!(
             initial_route(
                 Some(&okx_spot),
-                &filters(InstrumentKindFilter::Spot, CapabilityId::ForceOrders)
+                &filters(InstrumentKindFilter::Spot, CapabilityId::ForceOrder)
             )
             .as_ref(),
             Some(&route("binance", "usd-m-perp"))
@@ -2695,7 +2695,7 @@ mod tests {
     fn a_venue_without_an_offered_scope_should_not_be_a_row(cx: &mut TestAppContext) {
         let column = column(
             cx,
-            &filters(InstrumentKindFilter::All, CapabilityId::ForceOrders),
+            &filters(InstrumentKindFilter::All, CapabilityId::ForceOrder),
         );
 
         assert_eq!(
@@ -2722,7 +2722,7 @@ mod tests {
         assert_eq!(
             route_of_row(
                 scope_row_name(route("okx", "swap")).as_str(),
-                &filters(InstrumentKindFilter::All, CapabilityId::ForceOrders),
+                &filters(InstrumentKindFilter::All, CapabilityId::ForceOrder),
             ),
             None
         );

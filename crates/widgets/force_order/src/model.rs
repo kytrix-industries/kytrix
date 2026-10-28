@@ -54,11 +54,11 @@ pub(super) struct ForceOrderEntry {
 
 /// An immutable, cheap-to-clone view of the retained force orders.
 #[derive(Clone, Debug, Default)]
-pub(super) struct ForceOrdersSnapshot {
+pub(super) struct ForceOrderSnapshot {
     orders: Arc<[Arc<ForceOrderRow>]>,
 }
 
-impl ForceOrdersSnapshot {
+impl ForceOrderSnapshot {
     pub(super) fn orders(&self) -> &[Arc<ForceOrderRow>] {
         &self.orders
     }
@@ -139,7 +139,7 @@ impl ForceOrderDisplay {
     }
 }
 
-pub(super) struct ForceOrdersState {
+pub(super) struct ForceOrderState {
     orders: BTreeMap<(i64, u64), Arc<ForceOrderRow>>,
     snapshot_orders: Arc<[Arc<ForceOrderRow>]>,
     snapshot_dirty: bool,
@@ -147,7 +147,7 @@ pub(super) struct ForceOrdersState {
     maximum_orders: usize,
 }
 
-impl ForceOrdersState {
+impl ForceOrderState {
     pub(super) fn new(maximum_orders: usize) -> Self {
         Self {
             orders: BTreeMap::new(),
@@ -198,14 +198,14 @@ impl ForceOrdersState {
         retained
     }
 
-    pub(super) fn snapshot(&mut self) -> ForceOrdersSnapshot {
+    pub(super) fn snapshot(&mut self) -> ForceOrderSnapshot {
         if self.snapshot_dirty {
             let mut orders = Vec::with_capacity(self.orders.len());
             orders.extend(self.orders.values().cloned());
             self.snapshot_orders = orders.into();
             self.snapshot_dirty = false;
         }
-        ForceOrdersSnapshot {
+        ForceOrderSnapshot {
             orders: self.snapshot_orders.clone(),
         }
     }
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn merge_should_keep_only_the_newest_orders_in_chronological_order() {
-        let mut state = ForceOrdersState::new(2);
+        let mut state = ForceOrderState::new(2);
 
         state.merge(&[
             entry("perpetual", "BTCUSDT", 3),
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn stale_batch_should_not_invalidate_a_full_snapshot() {
-        let mut state = ForceOrdersState::new(2);
+        let mut state = ForceOrderState::new(2);
         state.merge(&[
             entry("perpetual", "BTCUSDT", 2),
             entry("perpetual", "BTCUSDT", 3),
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn identical_orders_should_remain_distinct_without_a_source_identity() {
-        let mut state = ForceOrdersState::new(2);
+        let mut state = ForceOrderState::new(2);
         let order = entry("perpetual", "BTCUSDT", 1);
 
         let retained = state.merge(&[order.clone(), order]);
@@ -340,7 +340,7 @@ mod tests {
     /// instrument it implements.
     #[test]
     fn two_listings_of_one_instrument_should_stay_distinct_rows() {
-        let mut state = ForceOrdersState::new(2);
+        let mut state = ForceOrderState::new(2);
         state.merge(&[
             entry("perpetual", "BTCUSDT", 1),
             entry("core-perp", "BTCUSDT", 1),
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn row_display_should_be_built_once_per_zone() {
-        let mut state = ForceOrdersState::new(1);
+        let mut state = ForceOrderState::new(1);
         state.merge(&[entry("perpetual", "BTCUSDT", 1)]);
         let snapshot = state.snapshot();
         let row = &snapshot.orders()[0];
@@ -418,7 +418,7 @@ mod tests {
     /// whole price keeps the decimals its tick states.
     #[test]
     fn row_display_should_write_the_numbers_at_the_listings_precision() {
-        let mut state = ForceOrdersState::new(1);
+        let mut state = ForceOrderState::new(1);
         let mut order = entry("perpetual", "BTCUSDT", 1);
         order.order.price.value = Price::from(90_000_u64);
         state.merge(&[order]);
@@ -435,7 +435,7 @@ mod tests {
     /// back the liquidation: the row states the number it was given.
     #[test]
     fn row_display_should_state_the_number_without_a_published_precision() {
-        let mut state = ForceOrdersState::new(1);
+        let mut state = ForceOrderState::new(1);
         let mut order = entry("perpetual", "BTCUSDT", 1);
         order.listing.precision = None;
         state.merge(&[order]);
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_should_be_ready_for_use_before_the_first_batch() {
-        let mut state = ForceOrdersState::new(1);
+        let mut state = ForceOrderState::new(1);
         let snapshot = state.snapshot();
 
         assert_eq!(snapshot.len(), 0);

@@ -251,14 +251,12 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
             listing_request(Capability::OrderBook, &query.listing, None)
         }
         Request::FetchTrades(query) => {
-            listing_request(Capability::MarketTrades, &query.listing, None)
+            listing_request(Capability::MarketTrade, &query.listing, None)
         }
         Request::SubscribeTrades(query) => {
-            listing_request(Capability::MarketTrades, &query.listing, None)
+            listing_request(Capability::MarketTrade, &query.listing, None)
         }
-        Request::SubscribeForceOrders(query) => {
-            route_request(Capability::ForceOrders, query.route())
-        }
+        Request::SubscribeForceOrder(query) => route_request(Capability::ForceOrder, query.route()),
         Request::FetchOpenInterest(query) => {
             listing_request(Capability::OpenInterest, &query.listing, None)
         }

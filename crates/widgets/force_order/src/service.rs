@@ -37,11 +37,11 @@ use widget::{
 };
 
 use super::model::{
-    ForceOrderEntry, ForceOrderListing, ForceOrdersSnapshot, ForceOrdersState, MAX_FORCE_ORDERS,
+    ForceOrderEntry, ForceOrderListing, ForceOrderSnapshot, ForceOrderState, MAX_FORCE_ORDERS,
 };
 
 #[derive(Debug)]
-pub(super) enum ForceOrdersRequest {
+pub(super) enum ForceOrderRequest {
     /// Starts the stream for these routes. Idempotent while one is already live.
     Load { routes: Arc<[VenueRoute]> },
     /// Replaces the current generation, for a route set that changed under the
@@ -50,40 +50,40 @@ pub(super) enum ForceOrdersRequest {
 }
 
 #[derive(Debug)]
-pub(super) enum ForceOrdersResponse {
+pub(super) enum ForceOrderResponse {
     StreamStarted,
 }
 
 /// Every route that reports liquidations publishes into one stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum ForceOrdersStreamKey {
+pub(super) enum ForceOrderStreamKey {
     AllMarkets,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ForceOrdersStatus {
+pub(super) enum ForceOrderStatus {
     Connecting,
     Ready,
     Error(MarketError),
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum ForceOrdersStreamMessage {
-    Status(ForceOrdersStatus),
-    Snapshot(ForceOrdersSnapshot),
+pub(super) enum ForceOrderStreamMessage {
+    Status(ForceOrderStatus),
+    Snapshot(ForceOrderSnapshot),
 }
 
-pub(super) struct ForceOrdersProtocol;
+pub(super) struct ForceOrderProtocol;
 
-impl WidgetProtocol for ForceOrdersProtocol {
-    type Request = ForceOrdersRequest;
-    type Response = ForceOrdersResponse;
-    type StreamKey = ForceOrdersStreamKey;
-    type StreamMessage = ForceOrdersStreamMessage;
+impl WidgetProtocol for ForceOrderProtocol {
+    type Request = ForceOrderRequest;
+    type Response = ForceOrderResponse;
+    type StreamKey = ForceOrderStreamKey;
+    type StreamMessage = ForceOrderStreamMessage;
     type Error = Infallible;
 }
 
-pub(super) trait ForceOrdersSource: Clone + Send + Sync + 'static {
+pub(super) trait ForceOrderSource: Clone + Send + Sync + 'static {
     type Subscription: ForceOrderEventSubscription;
 
     /// The perpetual listings one route publishes, as their canonical identities.
@@ -98,7 +98,7 @@ pub(super) trait ForceOrdersSource: Clone + Send + Sync + 'static {
         route: &VenueRoute,
     ) -> impl Future<Output = Result<Vec<VenueListingKey>, MarketError>> + Send;
 
-    fn subscribe_force_orders(
+    fn subscribe_force_order(
         &self,
         route: VenueRoute,
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
@@ -110,7 +110,7 @@ pub(super) trait ForceOrderEventSubscription: Send + 'static {
     ) -> impl Future<Output = Option<Result<Arc<Vec<ListingForceOrder>>, MarketError>>> + Send;
 }
 
-impl ForceOrdersSource for MarketCapability {
+impl ForceOrderSource for MarketCapability {
     type Subscription = ClientForceOrderSubscription;
 
     async fn perpetual_listings(
@@ -129,13 +129,13 @@ impl ForceOrdersSource for MarketCapability {
         Ok(listings)
     }
 
-    fn subscribe_force_orders(
+    fn subscribe_force_order(
         &self,
         route: VenueRoute,
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
         let market = self.clone();
         async move {
-            let inner = market.subscribe_force_orders_on(route).await?;
+            let inner = market.subscribe_force_order_on(route).await?;
             Ok(ClientForceOrderSubscription { inner })
         }
     }
@@ -154,7 +154,7 @@ impl ForceOrderEventSubscription for ClientForceOrderSubscription {
     }
 }
 
-pub(super) struct ForceOrdersService<S = MarketCapability> {
+pub(super) struct ForceOrderService<S = MarketCapability> {
     source: S,
     /// The display context every row's listing name is read from.
     ///
@@ -165,7 +165,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
     maximum_orders: usize,
 }
 
-impl<S> ForceOrdersService<S> {
+impl<S> ForceOrderService<S> {
     pub(super) fn new(source: S, display: Arc<Catalog>, maximum_orders: usize) -> Self {
         Self {
             source,
@@ -175,24 +175,24 @@ impl<S> ForceOrdersService<S> {
     }
 }
 
-impl<S> WidgetService<ForceOrdersProtocol> for ForceOrdersService<S>
+impl<S> WidgetService<ForceOrderProtocol> for ForceOrderService<S>
 where
-    S: ForceOrdersSource,
+    S: ForceOrderSource,
 {
-    async fn run(self, mut context: ServiceContext<ForceOrdersProtocol>) {
+    async fn run(self, mut context: ServiceContext<ForceOrderProtocol>) {
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             let (routes, retry) = match request {
-                ForceOrdersRequest::Load { routes } => (routes, false),
-                ForceOrdersRequest::Retry { routes } => (routes, true),
+                ForceOrderRequest::Load { routes } => (routes, false),
+                ForceOrderRequest::Retry { routes } => (routes, true),
             };
-            let key = ForceOrdersStreamKey::AllMarkets;
+            let key = ForceOrderStreamKey::AllMarkets;
             // A repeated load of what is already running is answered without
             // touching the live stream: the caller has not asked for anything new.
             // A route set that changed arrives as a retry, because another venue's
             // liquidations are another scope rather than a repeat of this one.
             if !retry && context.stream_generation(&key).is_some() {
-                let _ = reply.respond(Ok(ForceOrdersResponse::StreamStarted));
+                let _ = reply.respond(Ok(ForceOrderResponse::StreamStarted));
                 continue;
             }
             // `next_rpc` already dropped expired requests; re-check before
@@ -217,7 +217,7 @@ where
             if reply.deadline() <= Instant::now()
                 || reply.is_cancelled()
                 || reply
-                    .respond(Ok(ForceOrdersResponse::StreamStarted))
+                    .respond(Ok(ForceOrderResponse::StreamStarted))
                     .is_err()
             {
                 context.cancel_stream(&key);
@@ -231,11 +231,11 @@ async fn run_stream<S>(
     routes: Arc<[VenueRoute]>,
     display: Arc<Catalog>,
     maximum_orders: usize,
-    publisher: StreamPublisher<ForceOrdersProtocol>,
+    publisher: StreamPublisher<ForceOrderProtocol>,
 ) where
-    S: ForceOrdersSource,
+    S: ForceOrderSource,
 {
-    if publish_status(&publisher, ForceOrdersStatus::Connecting)
+    if publish_status(&publisher, ForceOrderStatus::Connecting)
         .await
         .is_err()
     {
@@ -256,10 +256,10 @@ async fn run_stream_once<S>(
     routes: &[VenueRoute],
     display: &Catalog,
     maximum_orders: usize,
-    publisher: &StreamPublisher<ForceOrdersProtocol>,
+    publisher: &StreamPublisher<ForceOrderProtocol>,
 ) -> Result<(), MarketError>
 where
-    S: ForceOrdersSource,
+    S: ForceOrderSource,
 {
     // What each route actually liquidates is the first question: a route whose
     // published catalog holds no perpetual listing has nothing to subscribe to.
@@ -309,20 +309,20 @@ where
         result = try_join_all(
             subscribed
                 .into_iter()
-                .map(|route| source.subscribe_force_orders(route)),
+                .map(|route| source.subscribe_force_order(route)),
         ) => result?,
     };
     let mut subscription_queue = VecDeque::with_capacity(subscriptions.len());
     subscription_queue.extend(subscriptions);
 
-    let mut orders = ForceOrdersState::new(maximum_orders);
+    let mut orders = ForceOrderState::new(maximum_orders);
     if publisher
-        .publish_latest(ForceOrdersStreamMessage::Snapshot(orders.snapshot()))
+        .publish_latest(ForceOrderStreamMessage::Snapshot(orders.snapshot()))
         .is_err()
     {
         return Ok(());
     }
-    if publish_status(publisher, ForceOrdersStatus::Ready)
+    if publish_status(publisher, ForceOrderStatus::Ready)
         .await
         .is_err()
     {
@@ -353,7 +353,7 @@ where
                     continue;
                 }
                 if publisher
-                    .publish_latest(ForceOrdersStreamMessage::Snapshot(orders.snapshot()))
+                    .publish_latest(ForceOrderStreamMessage::Snapshot(orders.snapshot()))
                     .is_err()
                 {
                     return Ok(());
@@ -366,7 +366,7 @@ where
 fn merge_event(
     event: Option<Result<Arc<Vec<ListingForceOrder>>, MarketError>>,
     listings: &AHashMap<VenueListingKey, ForceOrderListing>,
-    orders: &mut ForceOrdersState,
+    orders: &mut ForceOrderState,
 ) -> Result<bool, MarketError> {
     match event {
         Some(Ok(batch)) => {
@@ -390,16 +390,16 @@ fn merge_event(
 }
 
 async fn publish_status(
-    publisher: &StreamPublisher<ForceOrdersProtocol>,
-    status: ForceOrdersStatus,
+    publisher: &StreamPublisher<ForceOrderProtocol>,
+    status: ForceOrderStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(ForceOrdersStreamMessage::Status(status))
+        .publish_reliable(ForceOrderStreamMessage::Status(status))
         .await
 }
 
-async fn publish_error(publisher: &StreamPublisher<ForceOrdersProtocol>, error: MarketError) {
-    let _ = publish_status(publisher, ForceOrdersStatus::Error(error)).await;
+async fn publish_error(publisher: &StreamPublisher<ForceOrderProtocol>, error: MarketError) {
+    let _ = publish_status(publisher, ForceOrderStatus::Error(error)).await;
 }
 
 #[cfg(test)]
@@ -510,7 +510,7 @@ mod tests {
         }
     }
 
-    impl ForceOrdersSource for FakeSource {
+    impl ForceOrderSource for FakeSource {
         type Subscription = FakeSubscription;
 
         async fn perpetual_listings(
@@ -525,7 +525,7 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        async fn subscribe_force_orders(
+        async fn subscribe_force_order(
             &self,
             route: VenueRoute,
         ) -> Result<Self::Subscription, MarketError> {
@@ -537,7 +537,7 @@ mod tests {
             } else {
                 return Err(MarketError::UnsupportedCapability {
                     route,
-                    capability: market_participants_model::routing::CapabilityId::ForceOrders,
+                    capability: market_participants_model::routing::CapabilityId::ForceOrder,
                 });
             };
             let setup = setups
@@ -601,15 +601,15 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut widget::stream::ReliableStream<ForceOrdersProtocol>,
-        expected: ForceOrdersStatus,
+        reliable: &mut widget::stream::ReliableStream<ForceOrderProtocol>,
+        expected: ForceOrderStatus,
     ) {
         loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
                 .await
                 .expect("status should arrive")
                 .expect("reliable stream should remain open");
-            if let ForceOrdersStreamMessage::Status(status) = envelope.message().as_ref()
+            if let ForceOrderStreamMessage::Status(status) = envelope.message().as_ref()
                 && status == &expected
             {
                 return;
@@ -642,7 +642,7 @@ mod tests {
         );
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source.clone(), unnamed_display(), 10),
+            ForceOrderService::new(source.clone(), unnamed_display(), 10),
         );
         let mut reliable = runtime
             .take_reliable_stream()
@@ -650,13 +650,13 @@ mod tests {
 
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .expect("initial stream should start");
         wait_for_attempts(&source, 2).await;
         runtime
             .client()
-            .call(ForceOrdersRequest::Retry { routes: routes() })
+            .call(ForceOrderRequest::Retry { routes: routes() })
             .await
             .expect("replacement stream should start");
 
@@ -664,7 +664,7 @@ mod tests {
             .await
             .expect("pending setup should be cancelled promptly");
         wait_for_attempts(&source, 4).await;
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         runtime.shutdown().await;
     }
 
@@ -690,22 +690,22 @@ mod tests {
         );
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source, unnamed_display(), 10),
+            ForceOrderService::new(source, unnamed_display(), 10),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let _ = latest.next_unseen();
         runtime
             .client()
-            .call(ForceOrdersRequest::Retry { routes: routes() })
+            .call(ForceOrderRequest::Retry { routes: routes() })
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), first_binance_dropped)
@@ -726,7 +726,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let _ = latest.next_unseen();
 
@@ -743,8 +743,8 @@ mod tests {
             .expect("replacement event should publish")
             .unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         assert_eq!(snapshot.orders()[0].order().timestamp, 2);
         runtime.shutdown().await;
@@ -760,16 +760,16 @@ mod tests {
         okx_setup_sender.send(Ok(okx)).unwrap();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source([binance_setup], [okx_setup]), unnamed_display(), 2),
+            ForceOrderService::new(source([binance_setup], [okx_setup]), unnamed_display(), 2),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let _ = latest.next_unseen();
 
@@ -786,8 +786,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let envelope = latest.next_unseen().unwrap();
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         assert_eq!(
             snapshot
@@ -816,16 +816,16 @@ mod tests {
         okx_setup_sender.send(Ok(okx)).unwrap();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source([binance_setup], [okx_setup]), unnamed_display(), 2),
+            ForceOrderService::new(source([binance_setup], [okx_setup]), unnamed_display(), 2),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         while latest.next_unseen().is_some() {}
 
         binance_events
@@ -870,8 +870,8 @@ mod tests {
             .expect("the stream should still publish what does change")
             .unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         assert_eq!(
             snapshot
@@ -896,16 +896,16 @@ mod tests {
         okx_setup_sender.send(Ok(okx)).unwrap();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source([binance_setup], [okx_setup]), unnamed_display(), 10),
+            ForceOrderService::new(source([binance_setup], [okx_setup]), unnamed_display(), 10),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         while latest.next_unseen().is_some() {}
 
         binance_events
@@ -920,8 +920,8 @@ mod tests {
             .expect("the published listing's event should publish")
             .unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         assert_eq!(snapshot.len(), 1);
         assert_eq!(
@@ -943,7 +943,7 @@ mod tests {
         batch: Option<Arc<Vec<ListingForceOrder>>>,
     }
 
-    impl ForceOrdersSource for NamingSource {
+    impl ForceOrderSource for NamingSource {
         type Subscription = NamingSubscription;
 
         async fn perpetual_listings(
@@ -953,7 +953,7 @@ mod tests {
             Ok(self.listings.as_ref().clone())
         }
 
-        async fn subscribe_force_orders(
+        async fn subscribe_force_order(
             &self,
             _route: VenueRoute,
         ) -> Result<Self::Subscription, MarketError> {
@@ -996,7 +996,7 @@ mod tests {
 
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(
+            ForceOrderService::new(
                 NamingSource {
                     listings: Arc::new(vec![key.clone()]),
                     batch: Arc::new(vec![force_order(&route, "BTCUSDT", 1)]),
@@ -1010,14 +1010,14 @@ mod tests {
 
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         let label = snapshot.orders()[0]
             .display(time::UtcOffset::UTC)
@@ -1061,7 +1061,7 @@ mod tests {
 
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(
+            ForceOrderService::new(
                 NamingSource {
                     listings: Arc::new(vec![key]),
                     batch: Arc::new(vec![force_order(&route, "BTCUSDT", 1)]),
@@ -1075,14 +1075,14 @@ mod tests {
 
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
         let display = snapshot.orders()[0].display(time::UtcOffset::UTC);
 
@@ -1113,7 +1113,7 @@ mod tests {
 
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(
+            ForceOrderService::new(
                 NamingSource {
                     listings: Arc::new(vec![key.clone(), unnamed.clone()]),
                     batch: Arc::new(vec![force_order(&route, "ETHUSDT", 1)]),
@@ -1127,14 +1127,14 @@ mod tests {
 
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
-        let ForceOrdersStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a force-orders snapshot");
+        let ForceOrderStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a force-order snapshot");
         };
 
         assert!(
@@ -1165,15 +1165,15 @@ mod tests {
         let source = source([binance_setup], [okx_setup]);
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            ForceOrdersService::new(source.clone(), unnamed_display(), 10),
+            ForceOrderService::new(source.clone(), unnamed_display(), 10),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
-        receive_status(&mut reliable, ForceOrdersStatus::Ready).await;
+        receive_status(&mut reliable, ForceOrderStatus::Ready).await;
 
         binance_events
             .send(Err(MarketError::Disconnected(DisconnectReason::Normal)))
@@ -1181,7 +1181,7 @@ mod tests {
             .unwrap();
         receive_status(
             &mut reliable,
-            ForceOrdersStatus::Error(MarketError::Disconnected(DisconnectReason::Normal)),
+            ForceOrderStatus::Error(MarketError::Disconnected(DisconnectReason::Normal)),
         )
         .await;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1205,12 +1205,12 @@ mod tests {
         );
         let runtime = WidgetRuntime::spawn_with_config(
             current_test_handle(),
-            ForceOrdersService::new(source.clone(), unnamed_display(), 10),
+            ForceOrderService::new(source.clone(), unnamed_display(), 10),
             config,
         );
         runtime
             .client()
-            .call(ForceOrdersRequest::Load { routes: routes() })
+            .call(ForceOrderRequest::Load { routes: routes() })
             .await
             .unwrap();
         wait_for_attempts(&source, 2).await;

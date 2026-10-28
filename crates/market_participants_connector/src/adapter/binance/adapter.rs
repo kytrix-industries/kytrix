@@ -1186,7 +1186,7 @@ impl BinanceAdapter {
                     StreamPath::Public,
                 )
             }
-            ProtocolRequest::SubscribeForceOrders(query) => {
+            ProtocolRequest::SubscribeForceOrder(query) => {
                 query.validate().map_err(|error| {
                     MarketParticipantError::Configuration(format_smolstr!("{}", error))
                 })?;

@@ -209,7 +209,7 @@ fn the_definition_table_covers_every_venue_this_build_serves() {
 #[test]
 fn a_definition_carries_its_capability_names() {
     assert_eq!(
-        venues_supporting(CapabilityId::ForceOrders),
+        venues_supporting(CapabilityId::ForceOrder),
         vec![venue("binance"), venue("okx")],
         "Hyperliquid publishes no liquidation stream"
     );

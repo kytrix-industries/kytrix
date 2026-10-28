@@ -2337,7 +2337,7 @@ fn subscription(
                 false,
             )
         }
-        ProtocolRequest::SubscribeForceOrders(query) => {
+        ProtocolRequest::SubscribeForceOrder(query) => {
             query.validate().map_err(configuration)?;
             // The liquidation channel is selected by instrument type rather than
             // by instrument, and OKX refuses the subscription when the type is
@@ -2349,7 +2349,7 @@ fn subscription(
                 .filter(|instrument_type| instrument_type != &OkxInstrumentType::Spot)
                 .ok_or_else(|| MarketParticipantError::UnsupportedCapability {
                     route: query.route().clone(),
-                    capability: CapabilityId::ForceOrders,
+                    capability: CapabilityId::ForceOrder,
                 })?;
             (
                 vec![OkxArg {
@@ -3283,11 +3283,11 @@ mod tests {
     /// than for one hard-coded product.
     #[test]
     fn a_force_order_subscription_should_select_the_scope_instrument_type() {
-        let context = context(SWAP_SCOPE, CapabilityId::ForceOrders, &fixture_origin());
+        let context = context(SWAP_SCOPE, CapabilityId::ForceOrder, &fixture_origin());
         let (args, kind, socket, authenticated) = subscription(
             &context,
             None,
-            ProtocolRequest::SubscribeForceOrders(
+            ProtocolRequest::SubscribeForceOrder(
                 crate::market_participants::model::ForceOrderSubscriptionQuery {
                     route: route(SWAP_SCOPE),
                 },
@@ -3314,11 +3314,11 @@ mod tests {
     /// address a perpetual instrument type cannot open it.
     #[test]
     fn a_force_order_subscription_of_a_spot_scope_is_not_opened() {
-        let context = context(SPOT_SCOPE, CapabilityId::ForceOrders, &fixture_origin());
+        let context = context(SPOT_SCOPE, CapabilityId::ForceOrder, &fixture_origin());
         let error = subscription(
             &context,
             None,
-            ProtocolRequest::SubscribeForceOrders(
+            ProtocolRequest::SubscribeForceOrder(
                 crate::market_participants::model::ForceOrderSubscriptionQuery {
                     route: route(SPOT_SCOPE),
                 },
@@ -3329,7 +3329,7 @@ mod tests {
         assert!(matches!(
             error,
             MarketParticipantError::UnsupportedCapability {
-                capability: CapabilityId::ForceOrders,
+                capability: CapabilityId::ForceOrder,
                 ..
             }
         ));

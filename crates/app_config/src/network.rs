@@ -27,8 +27,8 @@ pub enum KytrixServiceCapability {
     CryptocurrencyEtf,
     #[serde(rename = "news")]
     News,
-    #[serde(rename = "financial_indices")]
-    FinancialIndices,
+    #[serde(rename = "financial_index")]
+    FinancialIndex,
     #[serde(rename = "x")]
     X,
     #[serde(rename = "ethereum_wallet")]

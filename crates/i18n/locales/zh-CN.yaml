@@ -167,7 +167,7 @@ error:
     listing_route_mismatch: 挂牌 %{listing} 不属于路由 %{route}
     protocol: 执行 %{operation} 时账户协议返回了无效响应
     unknown_asset: 身份为 %{asset} 的资产不在 %{route} 的账户目录中
-  financial_indices:
+  financial_index:
     duplicate_category: 指数清单包含重复分类 `%{code}`
     duplicate_index: 指数清单包含重复指数 `%{code}`
     index_limit: 当前最多可选择 %{limit} 个指数
@@ -632,7 +632,7 @@ widget:
       thursday: 星期四
       tuesday: 星期二
       wednesday: 星期三
-  force_orders:
+  force_order:
     table: 来自 %{markets} 的实时强平订单
   global_shipping_chokepoint:
     entitlement_required: 当前账户不包含 AIS 船舶数据订阅
@@ -788,7 +788,7 @@ widget:
     unknown: 未知
     unrealized_pnl: 未实现盈亏
     value: 价值
-  financial_indices:
+  financial_index:
     change: 涨跌
     change_percent: 涨跌幅
     choose: 选择指数
@@ -805,7 +805,7 @@ widget:
       loading: 正在加载指数清单...
       selection_count: '已添加/限额：%{current}/%{limit}'
     table: 表格
-  market_trades:
+  market_trade:
     amount_with_unit: 数量（%{unit}）
     contracts: 合约
     outcome_tokens: 结果代币
@@ -820,12 +820,12 @@ widget:
     empty: 空白
     ethereum_wallet: Ethereum 钱包监控
     financial_calendar: 财经日历
-    financial_indices: 指数
-    force_orders: 强平订单流
+    financial_index: 指数
+    force_order: 强平订单流
     global_shipping_chokepoint: 全球关键航道
     hyperliquid_wallet: Hyperliquid 钱包
     long_short_account_ratio: 多空账户比
-    market_trades: 市场成交
+    market_trade: 市场成交
     news: 新闻
     open_interest: 持仓量
     order_book: 订单簿

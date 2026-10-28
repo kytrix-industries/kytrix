@@ -1,4 +1,4 @@
-//! The market-trades tape widget.
+//! The market-trade tape widget.
 //!
 //! The widget owns one listing, and draws whatever the live trade stream
 //! publishes for it. Everything the tape *does* around a frame — connecting,
@@ -55,10 +55,10 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use super::{
-    model::{MAX_TRADES, MarketTradesSnapshot},
+    model::{MAX_TRADES, MarketTradeSnapshot},
     service::{
-        MarketTradesProtocol, MarketTradesRequest, MarketTradesResponse, MarketTradesService,
-        MarketTradesSource, MarketTradesStatus, MarketTradesStreamKey, MarketTradesStreamMessage,
+        MarketTradeProtocol, MarketTradeRequest, MarketTradeResponse, MarketTradeService,
+        MarketTradeSource, MarketTradeStatus, MarketTradeStreamKey, MarketTradeStreamMessage,
     },
 };
 
@@ -81,11 +81,11 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
 /// anything: it then asks for a listing instead of streaming a default nobody
 /// asked for.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MarketTradesConfig {
+pub struct MarketTradeConfig {
     selection: Option<InstrumentSelection>,
 }
 
-impl WidgetConfig for MarketTradesConfig {
+impl WidgetConfig for MarketTradeConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
@@ -101,7 +101,7 @@ struct MarketTradeUnits {
 }
 
 impl MarketTradeUnits {
-    fn of(snapshot: &MarketTradesSnapshot, cx: &App) -> Option<Self> {
+    fn of(snapshot: &MarketTradeSnapshot, cx: &App) -> Option<Self> {
         let trade = snapshot.rows().last()?.trade();
         // One capture names both headers, so they are read from the same
         // publication. It is taken when the table accepts a snapshot, not once per
@@ -141,8 +141,8 @@ fn quantity_unit_label(display: &DisplaySnapshot, unit: &QuantityUnit, cx: &App)
         QuantityUnit::AssetUnits { asset } | QuantityUnit::Notional { asset } => {
             asset_display(display, asset, cx)
         }
-        QuantityUnit::Contracts => t!(cx, "widget.market_trades.contracts"),
-        QuantityUnit::OutcomeTokens { .. } => t!(cx, "widget.market_trades.outcome_tokens"),
+        QuantityUnit::Contracts => t!(cx, "widget.market_trade.contracts"),
+        QuantityUnit::OutcomeTokens { .. } => t!(cx, "widget.market_trade.outcome_tokens"),
     }
 }
 
@@ -152,9 +152,9 @@ fn quantity_unit_label(display: &DisplaySnapshot, unit: &QuantityUnit, cx: &App)
 /// [`Entity`]; it keeps its own invalidation source, so a snapshot that changes
 /// nothing the table draws does not rebuild it. It is the body's only expensive
 /// region, so it is the region the body caches.
-struct MarketTradesTable {
+struct MarketTradeTable {
     /// The accepted snapshot, or nothing before the first one arrives.
-    snapshot: Option<MarketTradesSnapshot>,
+    snapshot: Option<MarketTradeSnapshot>,
     /// The units the column headers name, taken from the snapshot they describe.
     units: Option<MarketTradeUnits>,
     /// Direction colors, resolved once because `TableDataSet::cell` renders
@@ -163,7 +163,7 @@ struct MarketTradesTable {
     sell: Hsla,
 }
 
-impl MarketTradesTable {
+impl MarketTradeTable {
     fn new(theme: &Theme) -> Self {
         Self {
             snapshot: None,
@@ -174,9 +174,9 @@ impl MarketTradesTable {
     }
 }
 
-impl TableDataSet<COLUMN_COUNT> for MarketTradesTable {
+impl TableDataSet<COLUMN_COUNT> for MarketTradeTable {
     fn rows_count(&self) -> usize {
-        self.snapshot.as_ref().map_or(0, MarketTradesSnapshot::len)
+        self.snapshot.as_ref().map_or(0, MarketTradeSnapshot::len)
     }
 
     /// Each column is named with the unit it is measured in.
@@ -197,12 +197,12 @@ impl TableDataSet<COLUMN_COUNT> for MarketTradesTable {
                 [
                     t!(
                         cx,
-                        "widget.market_trades.price_with_unit",
+                        "widget.market_trade.price_with_unit",
                         unit = units.price.clone()
                     ),
                     t!(
                         cx,
-                        "widget.market_trades.amount_with_unit",
+                        "widget.market_trade.amount_with_unit",
                         unit = units.quantity.clone()
                     ),
                     t!(cx, "common.time"),
@@ -258,20 +258,20 @@ impl TableDataSet<COLUMN_COUNT> for MarketTradesTable {
     /// rather than a state: the table says so instead of leaving the body under its
     /// headers blank.
     fn empty(&self, cx: &App) -> Option<AnyElement> {
-        Some(EmptyState::new("MarketTradesEmpty", t!(cx, "common.no_data")).into_any_element())
+        Some(EmptyState::new("MarketTradeEmpty", t!(cx, "common.no_data")).into_any_element())
     }
 }
 
-pub struct MarketTradesWidget {
-    config: MarketTradesConfig,
-    binding: WidgetBinding<MarketTradesProtocol>,
-    table: Entity<MarketTradesTable>,
+pub struct MarketTradeWidget {
+    config: MarketTradeConfig,
+    binding: WidgetBinding<MarketTradeProtocol>,
+    table: Entity<MarketTradeTable>,
     status: Entity<WidgetStatus>,
     /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
-    snapshot: Option<MarketTradesSnapshot>,
-    pending_snapshot: Option<MarketTradesSnapshot>,
+    snapshot: Option<MarketTradeSnapshot>,
+    pending_snapshot: Option<MarketTradeSnapshot>,
     ready_received: bool,
     awaiting_snapshot: bool,
     /// Whether the tape is waiting for its market rather than reading it.
@@ -301,14 +301,14 @@ pub struct MarketTradesWidget {
     _time_zone: Option<Subscription>,
 }
 
-impl WidgetView for MarketTradesWidget {
-    type Config = MarketTradesConfig;
+impl WidgetView for MarketTradeWidget {
+    type Config = MarketTradeConfig;
 
-    const ID: WidgetId = WidgetId::new_static("kytrix.market_trades");
-    const DISPLAY_NAME: &'static str = "widget.names.market_trades";
+    const ID: WidgetId = WidgetId::new_static("kytrix.market_trade");
+    const DISPLAY_NAME: &'static str = "widget.names.market_trade";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
     const DESCRIPTION: &'static str = "Recent native market executions";
-    const ICON: Option<&'static str> = Some("widgets/market_trades.png");
+    const ICON: Option<&'static str> = Some("widgets/market_trade.png");
 
     fn new(
         _instance_id: WidgetInstanceId,
@@ -374,9 +374,9 @@ impl WidgetView for MarketTradesWidget {
     }
 }
 
-impl MarketTradesWidget {
+impl MarketTradeWidget {
     fn new_with_source<S>(
-        config: MarketTradesConfig,
+        config: MarketTradeConfig,
         source: S,
         status: Entity<WidgetStatus>,
         config_change: WidgetConfigChange,
@@ -384,9 +384,9 @@ impl MarketTradesWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: MarketTradesSource,
+        S: MarketTradeSource,
     {
-        let service = MarketTradesService::new(source, HISTORY_LIMIT, MAX_TRADES);
+        let service = MarketTradeService::new(source, HISTORY_LIMIT, MAX_TRADES);
         let binding = WidgetBinding::spawn(
             global::handle(cx).handle(),
             service,
@@ -394,7 +394,7 @@ impl MarketTradesWidget {
             Self::apply_reliable,
             Self::apply_latest,
         );
-        let table = cx.new(|cx| MarketTradesTable::new(cx.theme()));
+        let table = cx.new(|cx| MarketTradeTable::new(cx.theme()));
         // The pane recovers from the market it waits for without polling: a venue commit is
         // the one event that can change what may be read, and a change that arrives while the
         // pane has nothing to show is a reason to load again.
@@ -509,7 +509,7 @@ impl MarketTradesWidget {
     fn report_nothing_chosen(&self, cx: &mut Context<Self>) {
         self.status.report(
             WidgetState::waiting(Notice::message(
-                "widget.market_trades.select_instrument_prompt",
+                "widget.market_trade.select_instrument_prompt",
             )),
             cx,
         );
@@ -586,7 +586,7 @@ impl MarketTradesWidget {
     /// or not anything is loaded and whichever instrument is followed.
     fn listed_venues() -> Vec<VenueId> {
         market_participants_connector::venue::definition::venues_supporting(
-            CapabilityId::MarketTrades,
+            CapabilityId::MarketTrade,
         )
     }
 
@@ -611,11 +611,11 @@ impl MarketTradesWidget {
     ///
     /// Absent until a listing is chosen: nothing is streaming, so nothing is in
     /// scope.
-    fn current_key(&self) -> Option<MarketTradesStreamKey> {
+    fn current_key(&self) -> Option<MarketTradeStreamKey> {
         self.config
             .selection
             .as_ref()
-            .map(|selection| MarketTradesStreamKey::new(selection.listing.clone()))
+            .map(|selection| MarketTradeStreamKey::new(selection.listing.clone()))
     }
 
     /// Puts the stored selection back to "nothing chosen" when the listing cannot be
@@ -686,7 +686,7 @@ impl MarketTradesWidget {
         self.sync_table(cx);
     }
 
-    fn apply_snapshot(&mut self, snapshot: MarketTradesSnapshot, cx: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, snapshot: MarketTradeSnapshot, cx: &mut Context<Self>) {
         self.snapshot = Some(snapshot);
         self.awaiting_snapshot = false;
         self.status.report(WidgetState::Ready, cx);
@@ -720,11 +720,7 @@ impl MarketTradesWidget {
         let routes = LoadedScope::all(cx.global::<MarketParticipantsConnector>().venues());
         // A route that is not loaded cannot be asked anything at all, so it is
         // settled without a lookup: the catalog would answer with the same refusal.
-        if !offers_route(
-            &routes,
-            &selection.listing.route,
-            CapabilityId::MarketTrades,
-        ) {
+        if !offers_route(&routes, &selection.listing.route, CapabilityId::MarketTrade) {
             self.withdraw(&selection.listing, "is no longer a loaded route", cx);
             return;
         }
@@ -758,9 +754,9 @@ impl MarketTradesWidget {
     fn load_trades(&mut self, selection: InstrumentSelection, retry: bool, cx: &mut Context<Self>) {
         let listing = selection.listing;
         let request = if retry {
-            MarketTradesRequest::Retry { listing }
+            MarketTradeRequest::Retry { listing }
         } else {
-            MarketTradesRequest::Load { listing }
+            MarketTradeRequest::Load { listing }
         };
         self.binding.call(request, cx, Self::apply_rpc_result);
         cx.notify();
@@ -782,11 +778,11 @@ impl MarketTradesWidget {
 
     fn apply_rpc_result(
         &mut self,
-        result: WidgetRpcResult<MarketTradesProtocol>,
+        result: WidgetRpcResult<MarketTradeProtocol>,
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(MarketTradesResponse::StreamStarted) => {}
+            Ok(MarketTradeResponse::StreamStarted) => {}
             Err(error) => {
                 let recovery = self.recovery.clone();
                 self.status
@@ -797,8 +793,8 @@ impl MarketTradesWidget {
 
     fn apply_reliable(
         &mut self,
-        key: MarketTradesStreamKey,
-        message: Arc<MarketTradesStreamMessage>,
+        key: MarketTradeStreamKey,
+        message: Arc<MarketTradeStreamMessage>,
         cx: &mut Context<Self>,
     ) {
         if self.current_key().as_ref() != Some(&key)
@@ -809,18 +805,18 @@ impl MarketTradesWidget {
         }
 
         match message.as_ref() {
-            MarketTradesStreamMessage::Status(status) => match status {
-                MarketTradesStatus::Connecting => {
+            MarketTradeStreamMessage::Status(status) => match status {
+                MarketTradeStatus::Connecting => {
                     if self.snapshot.is_none() {
                         self.status.report(WidgetState::Connecting, cx);
                     }
                 }
-                MarketTradesStatus::LoadingHistory => {
+                MarketTradeStatus::LoadingHistory => {
                     if self.snapshot.is_none() {
                         self.status.report(WidgetState::Loading, cx);
                     }
                 }
-                MarketTradesStatus::Ready => {
+                MarketTradeStatus::Ready => {
                     self.ready_received = true;
                     if let Some(snapshot) = self.pending_snapshot.take() {
                         self.apply_snapshot(snapshot, cx);
@@ -828,7 +824,7 @@ impl MarketTradesWidget {
                         self.status.report(WidgetState::Ready, cx);
                     }
                 }
-                MarketTradesStatus::Error(error) => {
+                MarketTradeStatus::Error(error) => {
                     if self.report_waiting_for_directory(error, cx) {
                         return;
                     }
@@ -837,14 +833,14 @@ impl MarketTradesWidget {
                         .report(WidgetState::failed(Arc::new(error.clone()), recovery), cx);
                 }
             },
-            MarketTradesStreamMessage::Snapshot(_) => {}
+            MarketTradeStreamMessage::Snapshot(_) => {}
         }
     }
 
     fn apply_latest(
         &mut self,
-        key: MarketTradesStreamKey,
-        message: Arc<MarketTradesStreamMessage>,
+        key: MarketTradeStreamKey,
+        message: Arc<MarketTradeStreamMessage>,
         cx: &mut Context<Self>,
     ) {
         if self.current_key().as_ref() != Some(&key)
@@ -854,7 +850,7 @@ impl MarketTradesWidget {
             return;
         }
 
-        if let MarketTradesStreamMessage::Snapshot(snapshot) = message.as_ref() {
+        if let MarketTradeStreamMessage::Snapshot(snapshot) = message.as_ref() {
             if self.ready_received {
                 self.apply_snapshot(snapshot.clone(), cx);
             } else {
@@ -892,7 +888,7 @@ impl MarketTradesWidget {
         InstrumentFilters {
             kind_filter: InstrumentKindFilter::All,
             status_filter: InstrumentStatusFilter::Any,
-            required_capability: CapabilityId::MarketTrades,
+            required_capability: CapabilityId::MarketTrade,
             entry_predicate: None,
             routes: LoadedScope::all(cx.global::<MarketParticipantsConnector>().venues()),
         }
@@ -909,10 +905,10 @@ impl MarketTradesWidget {
         let widget = cx.entity().downgrade();
 
         InstrumentButton::new(
-            ElementId::Name(SharedString::new_static("MarketTradesInstrument")),
+            ElementId::Name(SharedString::new_static("MarketTradeInstrument")),
             self.config.selection.clone(),
             self.instrument_filters(cx),
-            "widget.market_trades.select_instrument",
+            "widget.market_trade.select_instrument",
             move |selection, _, app| {
                 // The selector does not keep the pane alive: a pane gone by the
                 // time a listing is confirmed has nothing left to select into.
@@ -933,22 +929,22 @@ impl MarketTradesWidget {
     fn ready_body(&self, cx: &App) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
-                "MarketTradesTableFrame",
+                "MarketTradeTableFrame",
             )))
-            .aria_label(t!(cx, "widget.market_trades.table"))
+            .aria_label(t!(cx, "widget.market_trade.table"))
             .size_full()
             .min_h_0()
             .child(Table::new(
                 // The table keeps its own scroll position in state keyed by this
                 // id, so it has to stay stable across frames.
-                ElementId::Name(SharedString::new_static("MarketTradesTable")),
+                ElementId::Name(SharedString::new_static("MarketTradeTable")),
                 &self.table,
             ))
             .into_any_element()
     }
 }
 
-impl Render for MarketTradesWidget {
+impl Render for MarketTradeWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is only embedded while the widget has content, so this is the
         // ready state and nothing else. Everything the widget is *doing* is drawn
@@ -1059,8 +1055,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::MarketTradesState,
-        service::{MarketTradeEventSubscription, MarketTradesSource},
+        model::MarketTradeState,
+        service::{MarketTradeEventSubscription, MarketTradeSource},
     };
 
     /// The route and listings every fixture is built on.
@@ -1151,14 +1147,14 @@ mod tests {
     /// yet — the framework loads once construction is done, and a test decides when
     /// that is.
     fn tape<S>(
-        config: MarketTradesConfig,
+        config: MarketTradeConfig,
         source: S,
         directory: Fixture,
         change: WidgetConfigChange,
         cx: &mut TestAppContext,
-    ) -> Entity<MarketTradesWidget>
+    ) -> Entity<MarketTradeWidget>
     where
-        S: MarketTradesSource + Clone,
+        S: MarketTradeSource + Clone,
     {
         tape_market(cx, config, source, directory, change, true)
     }
@@ -1166,14 +1162,14 @@ mod tests {
     /// The same, with the fixture venue loaded or left out of the loaded venues.
     fn tape_market<S>(
         cx: &mut TestAppContext,
-        config: MarketTradesConfig,
+        config: MarketTradeConfig,
         source: S,
         directory: Fixture,
         change: WidgetConfigChange,
         loaded: bool,
-    ) -> Entity<MarketTradesWidget>
+    ) -> Entity<MarketTradeWidget>
     where
-        S: MarketTradesSource + Clone,
+        S: MarketTradeSource + Clone,
     {
         cx.executor().allow_parking();
         let entries = directory.entries().to_vec();
@@ -1195,12 +1191,12 @@ mod tests {
             }
             cx.new(|cx| {
                 let status = cx.new(|_| WidgetStatus::new());
-                let weak: WeakEntity<MarketTradesWidget> = cx.weak_entity();
+                let weak: WeakEntity<MarketTradeWidget> = cx.weak_entity();
                 let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
                     let _ = weak.update(cx, |widget, cx| widget.load(cx));
                 });
 
-                MarketTradesWidget::new_with_source(config, source, status, change, recovery, cx)
+                MarketTradeWidget::new_with_source(config, source, status, change, recovery, cx)
             })
         })
     }
@@ -1239,15 +1235,15 @@ mod tests {
     /// from the widget itself and a report it can count.
     fn widgets(
         cx: &mut TestAppContext,
-        config: MarketTradesConfig,
+        config: MarketTradeConfig,
         published: Rc<Cell<usize>>,
-    ) -> Entity<MarketTradesWidget> {
+    ) -> Entity<MarketTradeWidget> {
         let change = WidgetConfigChange::new(move |_| {
             published.set(published.get() + 1);
         });
         tape(
             config,
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             change,
             cx,
@@ -1307,14 +1303,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct PendingMarketTradesSource;
+    struct PendingMarketTradeSource;
 
     struct PendingMarketTradeSubscription;
 
-    impl MarketTradesSource for PendingMarketTradesSource {
+    impl MarketTradeSource for PendingMarketTradeSource {
         type Subscription = PendingMarketTradeSubscription;
 
-        fn fetch_market_trades(
+        fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -1322,7 +1318,7 @@ mod tests {
             std::future::pending()
         }
 
-        fn subscribe_market_trades(
+        fn subscribe_market_trade(
             &self,
             _listing: VenueListingKey,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -1332,12 +1328,12 @@ mod tests {
 
     /// A route that answers, and a record of what the tape subscribed to.
     #[derive(Clone, Default)]
-    struct AnsweringMarketTradesSource {
+    struct AnsweringMarketTradeSource {
         /// The listings the tape subscribed to, in order.
         subscribed: Arc<Mutex<Vec<VenueListingKey>>>,
     }
 
-    impl AnsweringMarketTradesSource {
+    impl AnsweringMarketTradeSource {
         /// The listings the tape subscribed to, in order.
         fn subscribed(&self) -> Vec<VenueListingKey> {
             self.subscribed
@@ -1354,15 +1350,15 @@ mod tests {
     /// both that the tape asked for a new stream and which generation's increments that stream was
     /// opened at: this is the one seam where the two are a single record.
     #[derive(Clone)]
-    struct ResolvingMarketTradesSource {
+    struct ResolvingMarketTradeSource {
         catalog: Arc<Catalog>,
         resolutions: Arc<Mutex<Vec<ListingPrecision>>>,
     }
 
-    impl MarketTradesSource for ResolvingMarketTradesSource {
+    impl MarketTradeSource for ResolvingMarketTradeSource {
         type Subscription = PendingMarketTradeSubscription;
 
-        fn fetch_market_trades(
+        fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -1370,7 +1366,7 @@ mod tests {
             std::future::pending()
         }
 
-        fn subscribe_market_trades(
+        fn subscribe_market_trade(
             &self,
             listing: VenueListingKey,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -1394,10 +1390,10 @@ mod tests {
             .clone()
     }
 
-    impl MarketTradesSource for AnsweringMarketTradesSource {
+    impl MarketTradeSource for AnsweringMarketTradeSource {
         type Subscription = PendingMarketTradeSubscription;
 
-        fn fetch_market_trades(
+        fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -1405,7 +1401,7 @@ mod tests {
             std::future::pending()
         }
 
-        fn subscribe_market_trades(
+        fn subscribe_market_trade(
             &self,
             listing: VenueListingKey,
         ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -1443,8 +1439,8 @@ mod tests {
     fn snapshot_of_listing(
         listing: VenueListingKey,
         trades: &[(u64, UnixMillis, u64)],
-    ) -> MarketTradesSnapshot {
-        let mut state = MarketTradesState::new(trades.len(), precision());
+    ) -> MarketTradeSnapshot {
+        let mut state = MarketTradeState::new(trades.len(), precision());
         state.merge(trades.iter().map(|&(id, timestamp, price)| ListingTrade {
             listing: listing.clone(),
             id: MarketTradeId::Numeric(id),
@@ -1456,22 +1452,22 @@ mod tests {
         state.snapshot()
     }
 
-    fn snapshot(timestamp: UnixMillis) -> MarketTradesSnapshot {
+    fn snapshot(timestamp: UnixMillis) -> MarketTradeSnapshot {
         snapshot_of_listing(listing(), &[(1, timestamp, 100)])
     }
 
-    fn empty_snapshot() -> MarketTradesSnapshot {
-        MarketTradesState::new(1, precision()).snapshot()
+    fn empty_snapshot() -> MarketTradeSnapshot {
+        MarketTradeState::new(1, precision()).snapshot()
     }
 
     /// Creates a widget the way the framework does: state first, then one load.
     fn widget_with(
-        config: MarketTradesConfig,
+        config: MarketTradeConfig,
         cx: &mut TestAppContext,
-    ) -> Entity<MarketTradesWidget> {
+    ) -> Entity<MarketTradeWidget> {
         let widget = tape(
             config,
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             WidgetConfigChange::default(),
             cx,
@@ -1481,35 +1477,35 @@ mod tests {
     }
 
     /// A widget the framework created before anything was chosen.
-    fn widget(cx: &mut TestAppContext) -> Entity<MarketTradesWidget> {
-        widget_with(MarketTradesConfig::default(), cx)
+    fn widget(cx: &mut TestAppContext) -> Entity<MarketTradeWidget> {
+        widget_with(MarketTradeConfig::default(), cx)
     }
 
     /// A widget that already follows one listing, so stream messages belong to
     /// its scope.
-    fn scoped_widget(cx: &mut TestAppContext) -> Entity<MarketTradesWidget> {
+    fn scoped_widget(cx: &mut TestAppContext) -> Entity<MarketTradeWidget> {
         widget_with(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             cx,
         )
     }
 
-    fn status(widget: &Entity<MarketTradesWidget>, cx: &App) -> WidgetState {
+    fn status(widget: &Entity<MarketTradeWidget>, cx: &App) -> WidgetState {
         let status = widget.read(cx).status.clone();
         status.state(cx)
     }
 
     /// The same read, for the places where the widget is already borrowed.
-    fn reported(widget: &MarketTradesWidget, cx: &App) -> WidgetState {
+    fn reported(widget: &MarketTradeWidget, cx: &App) -> WidgetState {
         widget.status.state(cx)
     }
 
     /// Reports a ready snapshot as the stream would, then returns the widget.
     fn accept_snapshot(
-        widget: &Entity<MarketTradesWidget>,
-        snapshot: MarketTradesSnapshot,
+        widget: &Entity<MarketTradeWidget>,
+        snapshot: MarketTradeSnapshot,
         cx: &mut App,
     ) {
         widget.update(cx, |widget, context| {
@@ -1534,7 +1530,7 @@ mod tests {
             assert_eq!(
                 status.notice(),
                 Some(&Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 ))
             );
         });
@@ -1549,8 +1545,8 @@ mod tests {
     ) {
         let widget = tape_market(
             cx,
-            MarketTradesConfig::default(),
-            PendingMarketTradesSource,
+            MarketTradeConfig::default(),
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             WidgetConfigChange::default(),
             false,
@@ -1569,8 +1565,8 @@ mod tests {
             assert_eq!(
                 status(&widget, cx),
                 WidgetState::waiting(Notice::MarketNotLoaded {
-                    venues: MarketTradesWidget::listed_venues(),
-                    supported: MarketTradesWidget::listed_venues(),
+                    venues: MarketTradeWidget::listed_venues(),
+                    supported: MarketTradeWidget::listed_venues(),
                 }),
                 "a tape nobody could choose from waits for the market participant's metadata"
             );
@@ -1590,8 +1586,8 @@ mod tests {
         )];
         let widget = tape_market(
             cx,
-            MarketTradesConfig::default(),
-            PendingMarketTradesSource,
+            MarketTradeConfig::default(),
+            PendingMarketTradeSource,
             Fixture::new(entries.clone()),
             WidgetConfigChange::default(),
             false,
@@ -1627,7 +1623,7 @@ mod tests {
             assert_eq!(
                 status(&widget, cx),
                 WidgetState::waiting(Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 )),
                 "a market the user can choose from asks for a listing"
             );
@@ -1651,9 +1647,9 @@ mod tests {
             test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
             "BTCUSDT",
         )];
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let widget = tape(
-            MarketTradesConfig::default(),
+            MarketTradeConfig::default(),
             source.clone(),
             Fixture::new(entries),
             WidgetConfigChange::default(),
@@ -1747,12 +1743,12 @@ mod tests {
     fn a_refresh_of_the_tapes_own_venue_should_reopen_its_stream(cx: &mut TestAppContext) {
         let resolutions = Arc::new(Mutex::new(Vec::new()));
         let directory = Fixture::new(vec![listing_entry("1")]);
-        let source = ResolvingMarketTradesSource {
+        let source = ResolvingMarketTradeSource {
             catalog: Arc::clone(directory.catalog_arc()),
             resolutions: Arc::clone(&resolutions),
         };
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             source,
@@ -1828,9 +1824,9 @@ mod tests {
             test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
             "BTCUSDT",
         )];
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let widget = tape(
-            MarketTradesConfig::default(),
+            MarketTradeConfig::default(),
             source.clone(),
             Fixture::new(entries),
             WidgetConfigChange::default(),
@@ -1865,7 +1861,7 @@ mod tests {
                 !offers_route(
                     &widget.read(cx).instrument_filters(cx).routes,
                     &okx_spot_route(),
-                    CapabilityId::MarketTrades
+                    CapabilityId::MarketTrade
                 ),
                 "the venue is not loaded before the commit below"
             );
@@ -1905,7 +1901,7 @@ mod tests {
                 offers_route(
                     &filters.routes,
                     &okx_spot_route(),
-                    CapabilityId::MarketTrades
+                    CapabilityId::MarketTrade
                 ),
                 "a scope loaded after the tape started reading is one its picker offers"
             );
@@ -1947,9 +1943,9 @@ mod tests {
             test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
             "BTCUSDT",
         )];
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             source.clone(),
@@ -1978,7 +1974,7 @@ mod tests {
                 !offers_route(
                     &widget.read(cx).instrument_filters(cx).routes,
                     &okx_spot_route(),
-                    CapabilityId::MarketTrades
+                    CapabilityId::MarketTrade
                 ),
                 "the venue is not loaded before the commit below"
             );
@@ -2042,7 +2038,7 @@ mod tests {
             assert_ne!(
                 status(&widget, cx),
                 WidgetState::waiting(Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 )),
                 "the pane must not report the prompt a tape with nothing chosen reports"
             );
@@ -2079,10 +2075,10 @@ mod tests {
             "BTCUSDT",
         )];
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::new(entries),
             WidgetConfigChange::default(),
             cx,
@@ -2130,7 +2126,7 @@ mod tests {
                 status(&widget, cx),
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![route().venue],
-                    supported: MarketTradesWidget::listed_venues(),
+                    supported: MarketTradeWidget::listed_venues(),
                 }),
                 "waiting is not working"
             );
@@ -2152,10 +2148,10 @@ mod tests {
             "BTCUSDT",
         )];
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::new(entries),
             WidgetConfigChange::default(),
             cx,
@@ -2352,7 +2348,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_late_stream_message_after_a_failure_should_not_change_the_status(cx: &mut TestAppContext) {
         let widget = scoped_widget(cx);
-        let key = MarketTradesStreamKey::new(listing());
+        let key = MarketTradeStreamKey::new(listing());
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
@@ -2366,12 +2362,12 @@ mod tests {
 
                 widget.apply_reliable(
                     key.clone(),
-                    Arc::new(MarketTradesStreamMessage::Status(MarketTradesStatus::Ready)),
+                    Arc::new(MarketTradeStreamMessage::Status(MarketTradeStatus::Ready)),
                     context,
                 );
                 widget.apply_latest(
                     key,
-                    Arc::new(MarketTradesStreamMessage::Snapshot(snapshot(1))),
+                    Arc::new(MarketTradeStreamMessage::Snapshot(snapshot(1))),
                     context,
                 );
 
@@ -2392,11 +2388,11 @@ mod tests {
             widget.update(cx, |widget, context| {
                 widget.binding.cancel();
                 widget.ready_received = true;
-                let other = MarketTradesStreamKey::new(other_listing());
+                let other = MarketTradeStreamKey::new(other_listing());
 
                 widget.apply_latest(
                     other,
-                    Arc::new(MarketTradesStreamMessage::Snapshot(snapshot(1))),
+                    Arc::new(MarketTradeStreamMessage::Snapshot(snapshot(1))),
                     context,
                 );
 
@@ -2421,7 +2417,7 @@ mod tests {
         );
         assert_ne!(first.listing.key, second.listing.key);
         let widget = widget_with(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(first.listing.key.clone())),
             },
             cx,
@@ -2435,12 +2431,12 @@ mod tests {
             );
             assert_eq!(
                 widget.current_key(),
-                Some(MarketTradesStreamKey::new(first.listing.key.clone())),
+                Some(MarketTradeStreamKey::new(first.listing.key.clone())),
                 "the stream key names the exact listing, not the instrument"
             );
             assert_ne!(
                 widget.current_key(),
-                Some(MarketTradesStreamKey::new(second.listing.key.clone()))
+                Some(MarketTradeStreamKey::new(second.listing.key.clone()))
             );
         });
     }
@@ -2448,14 +2444,14 @@ mod tests {
     #[gpui_kit::test]
     fn a_snapshot_before_the_ready_boundary_should_await_it(cx: &mut TestAppContext) {
         let widget = scoped_widget(cx);
-        let key = MarketTradesStreamKey::new(listing());
+        let key = MarketTradeStreamKey::new(listing());
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
                 widget.binding.cancel();
                 widget.apply_latest(
                     key.clone(),
-                    Arc::new(MarketTradesStreamMessage::Snapshot(snapshot(1))),
+                    Arc::new(MarketTradeStreamMessage::Snapshot(snapshot(1))),
                     context,
                 );
                 assert!(widget.snapshot.is_none());
@@ -2463,12 +2459,12 @@ mod tests {
 
                 widget.apply_reliable(
                     key,
-                    Arc::new(MarketTradesStreamMessage::Status(MarketTradesStatus::Ready)),
+                    Arc::new(MarketTradeStreamMessage::Status(MarketTradeStatus::Ready)),
                     context,
                 );
 
                 assert_eq!(
-                    widget.snapshot.as_ref().map(MarketTradesSnapshot::len),
+                    widget.snapshot.as_ref().map(MarketTradeSnapshot::len),
                     Some(1)
                 );
                 assert!(widget.has_content());
@@ -2480,16 +2476,16 @@ mod tests {
     #[gpui_kit::test]
     fn a_stream_failure_should_become_the_reported_state(cx: &mut TestAppContext) {
         let widget = scoped_widget(cx);
-        let key = MarketTradesStreamKey::new(listing());
+        let key = MarketTradeStreamKey::new(listing());
 
         cx.update(|cx| {
             widget.update(cx, |widget, context| {
                 widget.binding.cancel();
                 widget.apply_reliable(
                     key,
-                    Arc::new(MarketTradesStreamMessage::Status(
-                        MarketTradesStatus::Error(disconnect()),
-                    )),
+                    Arc::new(MarketTradeStreamMessage::Status(MarketTradeStatus::Error(
+                        disconnect(),
+                    ))),
                     context,
                 );
 
@@ -2547,7 +2543,7 @@ mod tests {
                     .read(cx)
                     .snapshot
                     .as_ref()
-                    .map(MarketTradesSnapshot::len),
+                    .map(MarketTradeSnapshot::len),
                 Some(1),
                 "a retry must not blank data the user is still reading"
             );
@@ -2598,7 +2594,7 @@ mod tests {
             );
             assert_eq!(
                 widget.read(cx).current_key(),
-                Some(MarketTradesStreamKey::new(other_listing()))
+                Some(MarketTradeStreamKey::new(other_listing()))
             );
         });
     }
@@ -2643,7 +2639,7 @@ mod tests {
                 Arc::clone(directory.catalog_arc()),
             );
             let snapshot = snapshot_of_listing(listing(), &[(1, 1, 100)]);
-            let table = MarketTradesTable {
+            let table = MarketTradeTable {
                 units: MarketTradeUnits::of(&snapshot, cx),
                 snapshot: Some(snapshot),
                 buy: gpui_kit::green(),
@@ -2721,10 +2717,10 @@ mod tests {
                 value: Quantity::from(3_u64),
                 unit: QuantityUnit::Contracts,
             };
-            let mut state = MarketTradesState::new(1, precision());
+            let mut state = MarketTradeState::new(1, precision());
             state.merge([trade]);
             let snapshot = state.snapshot();
-            let table = MarketTradesTable {
+            let table = MarketTradeTable {
                 units: MarketTradeUnits::of(&snapshot, cx),
                 snapshot: Some(snapshot),
                 buy: gpui_kit::green(),
@@ -2747,7 +2743,7 @@ mod tests {
 
     #[test]
     fn market_trade_display_should_fill_every_column() {
-        let table = MarketTradesTable {
+        let table = MarketTradeTable {
             snapshot: Some(snapshot(1)),
             units: None,
             buy: gpui_kit::green(),
@@ -2773,17 +2769,17 @@ mod tests {
     /// config envelope the framework stores it in.
     #[test]
     fn the_selected_listing_should_survive_a_config_round_trip() {
-        let config = MarketTradesConfig {
+        let config = MarketTradeConfig {
             selection: Some(selection(listing())),
         };
 
         let stored = VersionedWidgetConfig::encode(&config).expect("config should encode");
-        let decoded = stored.decode::<MarketTradesConfig>();
+        let decoded = stored.decode::<MarketTradeConfig>();
 
         assert_eq!(decoded.selection, config.selection);
         // A tape created without a scope decodes with none either: it asks for a
         // listing rather than inventing one.
-        assert!(MarketTradesConfig::default().selection.is_none());
+        assert!(MarketTradeConfig::default().selection.is_none());
     }
 
     /// The previous build persisted a route and an instrument; the listing key is what
@@ -2800,7 +2796,7 @@ mod tests {
         }))
         .expect("the stored envelope should decode");
 
-        let decoded = stored.decode::<MarketTradesConfig>();
+        let decoded = stored.decode::<MarketTradeConfig>();
 
         assert!(
             decoded.selection.is_none(),
@@ -2817,7 +2813,7 @@ mod tests {
         let published = Rc::new(Cell::new(0));
         let widget = widgets(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             published.clone(),
@@ -2833,7 +2829,7 @@ mod tests {
             assert_eq!(
                 status(&widget, cx).notice(),
                 Some(&Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 ))
             );
         });
@@ -2851,7 +2847,7 @@ mod tests {
         let published = Rc::new(Cell::new(0));
         let widget = widgets(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             published.clone(),
@@ -2882,7 +2878,7 @@ mod tests {
         let published = Rc::new(Cell::new(0));
         let widget = widgets(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             published.clone(),
@@ -2916,10 +2912,10 @@ mod tests {
         });
         let widget = tape_market(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             change,
             false,
@@ -2937,7 +2933,7 @@ mod tests {
                 status,
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues: vec![listing().route.venue],
-                    supported: MarketTradesWidget::listed_venues(),
+                    supported: MarketTradeWidget::listed_venues(),
                 }),
                 "the pane waits"
             );
@@ -2959,7 +2955,7 @@ mod tests {
     /// without being reopened (⑯).
     #[gpui_kit::test]
     fn loading_the_venue_should_let_the_waiting_pane_subscribe(cx: &mut TestAppContext) {
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let entries = vec![test_support::entry(
             &route(),
             test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
@@ -2967,7 +2963,7 @@ mod tests {
         )];
         let widget = tape_market(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             source.clone(),
@@ -3025,10 +3021,10 @@ mod tests {
             move |_| published.set(published.get() + 1)
         });
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             change,
             cx,
@@ -3063,10 +3059,10 @@ mod tests {
             "BTCUSDT",
         )];
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::new(entries),
             change,
             cx,
@@ -3129,10 +3125,10 @@ mod tests {
         )];
         let widget = tape_market(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::new(entries),
             change,
             false,
@@ -3167,10 +3163,10 @@ mod tests {
     fn a_pane_waiting_for_its_market_should_follow_the_language(cx: &mut TestAppContext) {
         let widget = tape_market(
             cx,
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             Fixture::unanswering(),
             WidgetConfigChange::default(),
             false,
@@ -3224,10 +3220,10 @@ mod tests {
             ListingStatus::Delisted,
         )]);
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
-            PendingMarketTradesSource,
+            PendingMarketTradeSource,
             directory,
             change,
             cx,
@@ -3245,7 +3241,7 @@ mod tests {
             assert_eq!(
                 status(&widget, cx).notice(),
                 Some(&Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 ))
             );
         });
@@ -3256,9 +3252,9 @@ mod tests {
     /// it no longer publishes is never followed, not followed and then dropped.
     #[gpui_kit::test]
     fn a_listing_the_route_dropped_should_never_be_subscribed_to(cx: &mut TestAppContext) {
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             source.clone(),
@@ -3284,7 +3280,7 @@ mod tests {
             assert_eq!(
                 status(&widget, cx).notice(),
                 Some(&Notice::message(
-                    "widget.market_trades.select_instrument_prompt"
+                    "widget.market_trade.select_instrument_prompt"
                 ))
             );
         });
@@ -3298,9 +3294,9 @@ mod tests {
     /// is what makes the settle a step before the subscription rather than instead of it.
     #[gpui_kit::test]
     fn a_listing_the_route_still_offers_should_be_subscribed_to(cx: &mut TestAppContext) {
-        let source = AnsweringMarketTradesSource::default();
+        let source = AnsweringMarketTradeSource::default();
         let widget = tape(
-            MarketTradesConfig {
+            MarketTradeConfig {
                 selection: Some(selection(listing())),
             },
             source.clone(),

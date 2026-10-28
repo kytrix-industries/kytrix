@@ -2854,7 +2854,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "financial_indices"
+name = "financial_index"
 version = "0.0.2"
 dependencies = [
  "ahash",
@@ -3025,7 +3025,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "force_orders"
+name = "force_order"
 version = "0.0.2"
 dependencies = [
  "ahash",
@@ -5623,7 +5623,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "market_trades"
+name = "market_trade"
 version = "0.0.2"
 dependencies = [
  "app_config",
@@ -10867,13 +10867,13 @@ dependencies = [
  "empty",
  "ethereum_wallet",
  "financial_calendar",
- "financial_indices",
- "force_orders",
+ "financial_index",
+ "force_order",
  "global_shipping_chokepoint",
  "gpui-kit",
  "hyperliquid_wallet",
  "i18n",
- "market_trades",
+ "market_trade",
  "news",
  "order_book",
  "pentagon_pizza_index",

@@ -188,7 +188,7 @@ impl MarketCapability {
         Ok(listings)
     }
 
-    pub async fn subscribe_force_orders(
+    pub async fn subscribe_force_order(
         &self,
         query: ForceOrderSubscriptionQuery,
     ) -> Result<ForceOrderStream, MarketError> {
@@ -200,7 +200,7 @@ impl MarketCapability {
         let handle = subscribe(
             self,
             route,
-            crate::adapter::ProtocolRequest::SubscribeForceOrders(query),
+            crate::adapter::ProtocolRequest::SubscribeForceOrder(query),
         )
         .await?;
         Ok(ForceOrderStream::from_handle(handle, ensured))
@@ -213,11 +213,11 @@ impl MarketCapability {
     /// stream resolves each of them against the published catalog. This is the
     /// entry a caller outside this crate uses, because the request type it builds
     /// the subscription from is this crate's own protocol boundary.
-    pub async fn subscribe_force_orders_on(
+    pub async fn subscribe_force_order_on(
         &self,
         route: VenueRoute,
     ) -> Result<ForceOrderStream, MarketError> {
-        self.subscribe_force_orders(ForceOrderSubscriptionQuery { route })
+        self.subscribe_force_order(ForceOrderSubscriptionQuery { route })
             .await
     }
 }

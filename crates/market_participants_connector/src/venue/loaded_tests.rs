@@ -135,7 +135,7 @@ fn scopes_and_entries_agree_for_one_venue() {
         true,
         &[CapabilityId::MarketCatalog, CapabilityId::Candlesticks],
     );
-    let perp = entry(PERPETUAL_SCOPE, true, &[CapabilityId::ForceOrders]);
+    let perp = entry(PERPETUAL_SCOPE, true, &[CapabilityId::ForceOrder]);
 
     let generation = Arc::new(CatalogGeneration::empty(&CatalogGenerationPublisher::new()));
     let generation_id = generation.id();
@@ -366,12 +366,12 @@ async fn a_request_for_an_unloaded_scope_is_refused_without_a_request() {
         .await
         .expect("the venue loads from the fixture reading");
     let core_perp = route(&hyperliquid, CORE_PERP_SCOPE);
-    let identity = RequestIdentity::new(core_perp.clone(), CapabilityId::ForceOrders);
+    let identity = RequestIdentity::new(core_perp.clone(), CapabilityId::ForceOrder);
     let refused = market
         .gateway()
         .subscribe(
             connector.venues(),
-            ProtocolRequest::SubscribeForceOrders(ForceOrderSubscriptionQuery { route: core_perp }),
+            ProtocolRequest::SubscribeForceOrder(ForceOrderSubscriptionQuery { route: core_perp }),
             identity,
             market.catalog(),
         )

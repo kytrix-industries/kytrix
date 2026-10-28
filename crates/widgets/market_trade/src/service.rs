@@ -7,7 +7,7 @@
 //! already left can be recognized and dropped by both sides.
 //!
 //! The service keeps the whole tape it publishes. The opening page and every live
-//! trade end up in the same [`MarketTradesState`], which is why the table never
+//! trade end up in the same [`MarketTradeState`], which is why the table never
 //! sees the seam between history and realtime: by the time a snapshot is
 //! published, the two are already merged and deduplicated.
 
@@ -29,10 +29,10 @@ use widget::{
     stream::StreamPublisher,
 };
 
-use super::model::{MAX_TRADES, MarketTradesSnapshot, MarketTradesState};
+use super::model::{MAX_TRADES, MarketTradeSnapshot, MarketTradeState};
 
 #[derive(Debug)]
-pub(super) enum MarketTradesRequest {
+pub(super) enum MarketTradeRequest {
     /// Starts the stream for this listing. Idempotent while one is already live.
     Load { listing: VenueListingKey },
     /// Replaces the current generation, for a listing the user is retrying.
@@ -40,17 +40,17 @@ pub(super) enum MarketTradesRequest {
 }
 
 #[derive(Debug)]
-pub(super) enum MarketTradesResponse {
+pub(super) enum MarketTradeResponse {
     StreamStarted,
 }
 
 /// The listing one live tape belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct MarketTradesStreamKey {
+pub(super) struct MarketTradeStreamKey {
     listing: VenueListingKey,
 }
 
-impl MarketTradesStreamKey {
+impl MarketTradeStreamKey {
     pub(super) const fn new(listing: VenueListingKey) -> Self {
         Self { listing }
     }
@@ -58,7 +58,7 @@ impl MarketTradesStreamKey {
 
 /// What the stream is doing, as far as the tape needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum MarketTradesStatus {
+pub(super) enum MarketTradeStatus {
     /// Subscribing to the live trade stream.
     Connecting,
     /// Subscribed, and waiting for the opening page.
@@ -70,40 +70,40 @@ pub(super) enum MarketTradesStatus {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum MarketTradesStreamMessage {
-    Status(MarketTradesStatus),
+pub(super) enum MarketTradeStreamMessage {
+    Status(MarketTradeStatus),
     /// The whole tape, merged. Replaces whatever the table was holding.
-    Snapshot(MarketTradesSnapshot),
+    Snapshot(MarketTradeSnapshot),
 }
 
-pub(super) struct MarketTradesProtocol;
+pub(super) struct MarketTradeProtocol;
 
-impl WidgetProtocol for MarketTradesProtocol {
-    type Request = MarketTradesRequest;
-    type Response = MarketTradesResponse;
-    type StreamKey = MarketTradesStreamKey;
-    type StreamMessage = MarketTradesStreamMessage;
+impl WidgetProtocol for MarketTradeProtocol {
+    type Request = MarketTradeRequest;
+    type Response = MarketTradeResponse;
+    type StreamKey = MarketTradeStreamKey;
+    type StreamMessage = MarketTradeStreamMessage;
     type Error = Infallible;
 }
 
-/// The market data one market-trades service reads through.
+/// The market data one market-trade service reads through.
 ///
 /// What a route *offers* is a different question, asked by the widget through its
 /// own directory seam: the service subscribes and fetches, while the widget only
 /// needs to know whether a stored listing still exists. Both calls are
 /// listing-scoped, and the market participants connector resolves the listing — its rules, its
 /// status and its native identifiers — inside the generation it is served from.
-pub(super) trait MarketTradesSource: Clone + Send + Sync + 'static {
+pub(super) trait MarketTradeSource: Clone + Send + Sync + 'static {
     type Subscription: MarketTradeEventSubscription;
 
     /// The opening page of `listing`, as the venue printed it.
-    fn fetch_market_trades(
+    fn fetch_market_trade(
         &self,
         listing: VenueListingKey,
         limit: u16,
     ) -> impl Future<Output = Result<Vec<ListingTrade>, MarketError>> + Send;
 
-    fn subscribe_market_trades(
+    fn subscribe_market_trade(
         &self,
         listing: VenueListingKey,
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
@@ -123,10 +123,10 @@ pub(super) trait MarketTradeEventSubscription: Send + 'static {
     ) -> impl Future<Output = Option<Result<Arc<ListingTrade>, MarketError>>> + Send;
 }
 
-impl MarketTradesSource for MarketCapability {
+impl MarketTradeSource for MarketCapability {
     type Subscription = ClientMarketTradeSubscription;
 
-    fn fetch_market_trades(
+    fn fetch_market_trade(
         &self,
         listing: VenueListingKey,
         limit: u16,
@@ -143,7 +143,7 @@ impl MarketTradesSource for MarketCapability {
         }
     }
 
-    fn subscribe_market_trades(
+    fn subscribe_market_trade(
         &self,
         listing: VenueListingKey,
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
@@ -179,13 +179,13 @@ impl MarketTradeEventSubscription for ClientMarketTradeSubscription {
     }
 }
 
-pub(super) struct MarketTradesService<S = MarketCapability> {
+pub(super) struct MarketTradeService<S = MarketCapability> {
     source: S,
     history_limit: u16,
     maximum_trades: usize,
 }
 
-impl<S> MarketTradesService<S> {
+impl<S> MarketTradeService<S> {
     /// Creates a service that opens each tape with `history_limit` trades and
     /// keeps at most `maximum_trades` of them.
     ///
@@ -200,25 +200,25 @@ impl<S> MarketTradesService<S> {
     }
 }
 
-impl<S> WidgetService<MarketTradesProtocol> for MarketTradesService<S>
+impl<S> WidgetService<MarketTradeProtocol> for MarketTradeService<S>
 where
-    S: MarketTradesSource,
+    S: MarketTradeSource,
 {
-    async fn run(self, mut context: ServiceContext<MarketTradesProtocol>) {
-        let mut active_key: Option<MarketTradesStreamKey> = None;
+    async fn run(self, mut context: ServiceContext<MarketTradeProtocol>) {
+        let mut active_key: Option<MarketTradeStreamKey> = None;
 
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             let (listing, retry) = match request {
-                MarketTradesRequest::Load { listing } => (listing, false),
-                MarketTradesRequest::Retry { listing } => (listing, true),
+                MarketTradeRequest::Load { listing } => (listing, false),
+                MarketTradeRequest::Retry { listing } => (listing, true),
             };
-            let key = MarketTradesStreamKey::new(listing.clone());
+            let key = MarketTradeStreamKey::new(listing.clone());
             // A repeated load for the listing that is already running is answered
             // without touching the live stream: the caller has not asked for
             // anything new.
             if !retry && active_key.as_ref() == Some(&key) {
-                let _ = reply.respond(Ok(MarketTradesResponse::StreamStarted));
+                let _ = reply.respond(Ok(MarketTradeResponse::StreamStarted));
                 continue;
             }
             // `next_rpc` already dropped expired requests; re-check before
@@ -236,7 +236,7 @@ where
             }
 
             let source = self.source.clone();
-            let spec = MarketTradesSpec {
+            let spec = MarketTradeSpec {
                 listing,
                 history_limit: self.history_limit,
                 maximum_trades: self.maximum_trades,
@@ -252,7 +252,7 @@ where
             }
             active_key = Some(key);
             if reply
-                .respond(Ok(MarketTradesResponse::StreamStarted))
+                .respond(Ok(MarketTradeResponse::StreamStarted))
                 .is_err()
                 && let Some(previous) = active_key.take()
             {
@@ -264,7 +264,7 @@ where
 
 /// Everything one tape generation was started for.
 #[derive(Clone)]
-struct MarketTradesSpec {
+struct MarketTradeSpec {
     listing: VenueListingKey,
     history_limit: u16,
     maximum_trades: usize,
@@ -273,18 +273,18 @@ struct MarketTradesSpec {
 /// Runs one stream generation until it fails or is cancelled.
 async fn run_stream<S>(
     source: S,
-    spec: MarketTradesSpec,
-    publisher: StreamPublisher<MarketTradesProtocol>,
+    spec: MarketTradeSpec,
+    publisher: StreamPublisher<MarketTradeProtocol>,
 ) where
-    S: MarketTradesSource,
+    S: MarketTradeSource,
 {
-    if !publish_status(&publisher, MarketTradesStatus::Connecting).await {
+    if !publish_status(&publisher, MarketTradeStatus::Connecting).await {
         return;
     }
     if let Err(error) = run_stream_once(&source, &spec, &publisher).await {
         // A terminal failure must not retry on its own: the view decides when to
         // ask for a replacement generation, so the task stays alive until then.
-        if publish_status(&publisher, MarketTradesStatus::Error(error)).await {
+        if publish_status(&publisher, MarketTradeStatus::Error(error)).await {
             publisher.cancelled().await;
         }
     }
@@ -292,16 +292,16 @@ async fn run_stream<S>(
 
 async fn run_stream_once<S>(
     source: &S,
-    spec: &MarketTradesSpec,
-    publisher: &StreamPublisher<MarketTradesProtocol>,
+    spec: &MarketTradeSpec,
+    publisher: &StreamPublisher<MarketTradeProtocol>,
 ) -> Result<(), MarketError>
 where
-    S: MarketTradesSource,
+    S: MarketTradeSource,
 {
     // The request that opens the stream is also what resolves the listing: a
     // catalog or network failure therefore reaches the user as the failure it is
     // instead of being dressed up as a listing nobody lists.
-    let subscription = source.subscribe_market_trades(spec.listing.clone());
+    let subscription = source.subscribe_market_trade(spec.listing.clone());
     tokio::pin!(subscription);
     let mut subscription = tokio::select! {
         biased;
@@ -309,7 +309,7 @@ where
         result = &mut subscription => result?,
     };
 
-    if !publish_status(publisher, MarketTradesStatus::LoadingHistory).await {
+    if !publish_status(publisher, MarketTradeStatus::LoadingHistory).await {
         return Ok(());
     }
 
@@ -325,7 +325,7 @@ where
     )
     .await?;
 
-    let mut trades = MarketTradesState::new(spec.maximum_trades, subscription.precision());
+    let mut trades = MarketTradeState::new(spec.maximum_trades, subscription.precision());
     // The buffered live trades go in first, so when the page and the stream both
     // report one execution the live copy is the one the tape keeps.
     trades.merge(buffered.into_values().map(|trade| trade.as_ref().clone()));
@@ -334,7 +334,7 @@ where
     if !publish_snapshot(publisher, trades.snapshot()) {
         return Ok(());
     }
-    if !publish_status(publisher, MarketTradesStatus::Ready).await {
+    if !publish_status(publisher, MarketTradeStatus::Ready).await {
         return Ok(());
     }
 
@@ -375,7 +375,7 @@ async fn fetch_while_buffering<S>(
     limit: u16,
     subscription: &mut S::Subscription,
     maximum_trades: usize,
-    publisher: &StreamPublisher<MarketTradesProtocol>,
+    publisher: &StreamPublisher<MarketTradeProtocol>,
 ) -> Result<
     (
         Vec<ListingTrade>,
@@ -384,9 +384,9 @@ async fn fetch_while_buffering<S>(
     MarketError,
 >
 where
-    S: MarketTradesSource,
+    S: MarketTradeSource,
 {
-    let fetch = source.fetch_market_trades(listing, limit);
+    let fetch = source.fetch_market_trade(listing, limit);
     tokio::pin!(fetch);
     let mut buffered = BTreeMap::new();
 
@@ -438,22 +438,22 @@ fn validate_trade(trade: &ListingTrade) -> Result<(), MarketError> {
 
 /// Publishes a status, reporting whether the stream is still alive.
 async fn publish_status(
-    publisher: &StreamPublisher<MarketTradesProtocol>,
-    status: MarketTradesStatus,
+    publisher: &StreamPublisher<MarketTradeProtocol>,
+    status: MarketTradeStatus,
 ) -> bool {
     publisher
-        .publish_reliable(MarketTradesStreamMessage::Status(status))
+        .publish_reliable(MarketTradeStreamMessage::Status(status))
         .await
         .is_ok()
 }
 
 /// Publishes a snapshot, reporting whether the stream is still alive.
 fn publish_snapshot(
-    publisher: &StreamPublisher<MarketTradesProtocol>,
-    snapshot: MarketTradesSnapshot,
+    publisher: &StreamPublisher<MarketTradeProtocol>,
+    snapshot: MarketTradeSnapshot,
 ) -> bool {
     publisher
-        .publish_latest(MarketTradesStreamMessage::Snapshot(snapshot))
+        .publish_latest(MarketTradeStreamMessage::Snapshot(snapshot))
         .is_ok()
 }
 
@@ -619,10 +619,10 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
 
-    impl MarketTradesSource for FakeSource {
+    impl MarketTradeSource for FakeSource {
         type Subscription = FakeSubscription;
 
-        async fn fetch_market_trades(
+        async fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -637,7 +637,7 @@ mod tests {
             page.await.map_err(|_| MarketError::ServiceClosed)
         }
 
-        async fn subscribe_market_trades(
+        async fn subscribe_market_trade(
             &self,
             _listing: VenueListingKey,
         ) -> Result<Self::Subscription, MarketError> {
@@ -695,10 +695,10 @@ mod tests {
         }
     }
 
-    impl MarketTradesSource for ResolvingSource {
+    impl MarketTradeSource for ResolvingSource {
         type Subscription = ResolvingSubscription;
 
-        async fn fetch_market_trades(
+        async fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -706,7 +706,7 @@ mod tests {
             Ok(vec![trade(1, 1, 100)])
         }
 
-        async fn subscribe_market_trades(
+        async fn subscribe_market_trade(
             &self,
             _listing: VenueListingKey,
         ) -> Result<Self::Subscription, MarketError> {
@@ -733,12 +733,9 @@ mod tests {
 
     /// The prices of one published snapshot, written at the increments its stream resolved.
     fn published_prices(
-        envelope: &widget::protocol::StreamEnvelope<
-            MarketTradesStreamKey,
-            MarketTradesStreamMessage,
-        >,
+        envelope: &widget::protocol::StreamEnvelope<MarketTradeStreamKey, MarketTradeStreamMessage>,
     ) -> Vec<String> {
-        let MarketTradesStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+        let MarketTradeStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
             panic!("the latest stream should carry a snapshot");
         };
         snapshot
@@ -771,15 +768,15 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut widget::stream::ReliableStream<MarketTradesProtocol>,
-        expected: MarketTradesStatus,
+        reliable: &mut widget::stream::ReliableStream<MarketTradeProtocol>,
+        expected: MarketTradeStatus,
     ) {
         loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
                 .await
                 .expect("status should arrive")
                 .expect("reliable stream should remain open");
-            if let MarketTradesStreamMessage::Status(status) = envelope.message().as_ref()
+            if let MarketTradeStreamMessage::Status(status) = envelope.message().as_ref()
                 && status == &expected
             {
                 return;
@@ -788,13 +785,10 @@ mod tests {
     }
 
     fn snapshot_of(
-        envelope: &widget::protocol::StreamEnvelope<
-            MarketTradesStreamKey,
-            MarketTradesStreamMessage,
-        >,
+        envelope: &widget::protocol::StreamEnvelope<MarketTradeStreamKey, MarketTradeStreamMessage>,
     ) -> Vec<(MarketTradeId, Price)> {
-        let MarketTradesStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
-            panic!("latest value should be a market-trades snapshot");
+        let MarketTradeStreamMessage::Snapshot(snapshot) = envelope.message().as_ref() else {
+            panic!("latest value should be a market-trade snapshot");
         };
         snapshot
             .rows()
@@ -824,7 +818,7 @@ mod tests {
         let (_page_sender, page) = page();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source([setup], [page]), 200, MAX_TRADES),
+            MarketTradeService::new(source([setup], [page]), 200, MAX_TRADES),
         );
         let mut reliable = runtime
             .take_reliable_stream()
@@ -832,12 +826,12 @@ mod tests {
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .expect("load request should start the stream");
 
-        receive_status(&mut reliable, MarketTradesStatus::Connecting).await;
-        receive_status(&mut reliable, MarketTradesStatus::LoadingHistory).await;
+        receive_status(&mut reliable, MarketTradeStatus::Connecting).await;
+        receive_status(&mut reliable, MarketTradeStatus::LoadingHistory).await;
         runtime.shutdown().await;
     }
 
@@ -858,13 +852,13 @@ mod tests {
         let fetch_started = source.fetch_started.clone();
         let runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source, 200, MAX_TRADES),
+            MarketTradeService::new(source, 200, MAX_TRADES),
         );
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .expect("load request should start the stream");
         fetch_started.notified().await;
@@ -916,14 +910,14 @@ mod tests {
         let fetch_started = source.fetch_started.clone();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source, 200, 2),
+            MarketTradeService::new(source, 200, 2),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
         fetch_started.notified().await;
@@ -947,8 +941,8 @@ mod tests {
         loop {
             let status = reliable.recv().await.expect("a status should be published");
             match status.message().as_ref() {
-                MarketTradesStreamMessage::Status(MarketTradesStatus::Ready) => break,
-                MarketTradesStreamMessage::Status(MarketTradesStatus::Error(error)) => {
+                MarketTradeStreamMessage::Status(MarketTradeStatus::Ready) => break,
+                MarketTradeStreamMessage::Status(MarketTradeStatus::Error(error)) => {
                     panic!("a buffered overflow must not fail the stream: {error:?}");
                 }
                 _ => {}
@@ -975,17 +969,17 @@ mod tests {
             .expect("the page request should be waiting");
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source([setup], [page]), 200, MAX_TRADES),
+            MarketTradeService::new(source([setup], [page]), 200, MAX_TRADES),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         while latest.next_unseen().is_some() {}
 
         for (id, expected) in [
@@ -1025,17 +1019,17 @@ mod tests {
             .expect("the page request should be waiting");
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source([setup], [page]), 200, 2),
+            MarketTradeService::new(source([setup], [page]), 200, 2),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         while latest.next_unseen().is_some() {}
 
         // A trade the tape already holds, and one older than everything it holds.
@@ -1087,21 +1081,21 @@ mod tests {
         let source = source([setup], [page]);
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source.clone(), 200, MAX_TRADES),
+            MarketTradeService::new(source.clone(), 200, MAX_TRADES),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
 
         drop(events);
         receive_status(
             &mut reliable,
-            MarketTradesStatus::Error(MarketError::Disconnected(DisconnectReason::Normal)),
+            MarketTradeStatus::Error(MarketError::Disconnected(DisconnectReason::Normal)),
         )
         .await;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1125,17 +1119,17 @@ mod tests {
         let source = source([first_setup, second_setup], [page]);
         let runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source.clone(), 200, MAX_TRADES),
+            MarketTradeService::new(source.clone(), 200, MAX_TRADES),
         );
         let client = runtime.client();
 
         client
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .expect("the first load should start a stream");
         wait_for_attempts(&source, 1).await;
         client
-            .call(MarketTradesRequest::Load {
+            .call(MarketTradeRequest::Load {
                 listing: other_listing(),
             })
             .await
@@ -1173,19 +1167,19 @@ mod tests {
         let source = source([first_setup, second_setup], [first_page, second_page]);
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source.clone(), 200, MAX_TRADES),
+            MarketTradeService::new(source.clone(), 200, MAX_TRADES),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
         let client = runtime.client();
 
         client
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         client
-            .call(MarketTradesRequest::Load {
+            .call(MarketTradeRequest::Load {
                 listing: other_listing(),
             })
             .await
@@ -1235,7 +1229,7 @@ mod tests {
         second_page_sender.send(vec![trade(2, 2, 2)]).unwrap();
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(
+            MarketTradeService::new(
                 source([first_setup, second_setup], [first_page, second_page]),
                 200,
                 MAX_TRADES,
@@ -1246,16 +1240,16 @@ mod tests {
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         latest.changed().await.unwrap();
         let _ = latest.next_unseen();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Retry { listing: listing() })
+            .call(MarketTradeRequest::Retry { listing: listing() })
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), first_dropped)
@@ -1268,7 +1262,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
         assert_eq!(snapshot_of(&envelope), expected_rows(&[(2, 2)]));
@@ -1303,17 +1297,17 @@ mod tests {
         };
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source.clone(), 200, MAX_TRADES),
+            MarketTradeService::new(source.clone(), 200, MAX_TRADES),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
         assert_eq!(published_prices(&envelope), vec!["100.00"]);
@@ -1325,7 +1319,7 @@ mod tests {
         source.publish_at("0.5");
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
         tokio::task::yield_now().await;
@@ -1335,10 +1329,10 @@ mod tests {
         // this load produced: its rows are written at the tick that load published.
         runtime
             .client()
-            .call(MarketTradesRequest::Retry { listing: listing() })
+            .call(MarketTradeRequest::Retry { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         latest.changed().await.unwrap();
         let envelope = latest.next_unseen().expect("snapshot should be unseen");
         assert_eq!(published_prices(&envelope), vec!["100.0"]);
@@ -1364,12 +1358,12 @@ mod tests {
         );
         let runtime = WidgetRuntime::spawn_with_config(
             current_test_handle(),
-            MarketTradesService::new(source.clone(), 200, MAX_TRADES),
+            MarketTradeService::new(source.clone(), 200, MAX_TRADES),
             config,
         );
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
         wait_for_attempts(&source, 1).await;
@@ -1400,17 +1394,17 @@ mod tests {
             .expect("the page request should be waiting");
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(source([setup], [page]), 200, MAX_TRADES),
+            MarketTradeService::new(source([setup], [page]), 200, MAX_TRADES),
         );
         let mut reliable = runtime.take_reliable_stream().unwrap();
         let mut latest = runtime.latest_stream();
 
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .unwrap();
-        receive_status(&mut reliable, MarketTradesStatus::Ready).await;
+        receive_status(&mut reliable, MarketTradeStatus::Ready).await;
         while latest.next_unseen().is_some() {}
 
         let mut amount = trade(2, 2, 2);
@@ -1427,7 +1421,7 @@ mod tests {
 
         let reported = loop {
             let envelope = reliable.recv().await.expect("a status should arrive");
-            if let MarketTradesStreamMessage::Status(MarketTradesStatus::Error(error)) =
+            if let MarketTradeStreamMessage::Status(MarketTradeStatus::Error(error)) =
                 envelope.message().as_ref()
             {
                 break error.clone();
@@ -1456,10 +1450,10 @@ mod tests {
         failure: MarketError,
     }
 
-    impl MarketTradesSource for UnresolvableSource {
+    impl MarketTradeSource for UnresolvableSource {
         type Subscription = FakeSubscription;
 
-        async fn fetch_market_trades(
+        async fn fetch_market_trade(
             &self,
             _listing: VenueListingKey,
             _limit: u16,
@@ -1467,7 +1461,7 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn subscribe_market_trades(
+        async fn subscribe_market_trade(
             &self,
             _listing: VenueListingKey,
         ) -> Result<Self::Subscription, MarketError> {
@@ -1486,7 +1480,7 @@ mod tests {
         });
         let mut runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            MarketTradesService::new(
+            MarketTradeService::new(
                 UnresolvableSource {
                     failure: failure.clone(),
                 },
@@ -1499,7 +1493,7 @@ mod tests {
             .expect("reliable stream should be available");
         runtime
             .client()
-            .call(MarketTradesRequest::Load { listing: listing() })
+            .call(MarketTradeRequest::Load { listing: listing() })
             .await
             .expect("load request should start a stream");
 
@@ -1508,7 +1502,7 @@ mod tests {
                 .await
                 .expect("the failure should be published")
                 .expect("the reliable stream should remain open");
-            if let MarketTradesStreamMessage::Status(MarketTradesStatus::Error(error)) =
+            if let MarketTradeStreamMessage::Status(MarketTradeStatus::Error(error)) =
                 envelope.message().as_ref()
             {
                 break error.clone();

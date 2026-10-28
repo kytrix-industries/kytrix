@@ -25,11 +25,11 @@ members = [
     "crates/widgets/empty",
     "crates/widgets/ethereum_wallet",
     "crates/widgets/financial_calendar",
-    "crates/widgets/financial_indices",
-    "crates/widgets/force_orders",
+    "crates/widgets/financial_index",
+    "crates/widgets/force_order",
     "crates/widgets/global_shipping_chokepoint",
     "crates/widgets/hyperliquid_wallet",
-    "crates/widgets/market_trades",
+    "crates/widgets/market_trade",
     "crates/widgets/news",
     "crates/widgets/order_book",
     "crates/widgets/perpetual_statistics",
@@ -131,8 +131,8 @@ cryptocurrency_etf = { path = "crates/widgets/cryptocurrency_etf" }
 empty = { path = "crates/widgets/empty" }
 ethereum_wallet = { path = "crates/widgets/ethereum_wallet" }
 financial_calendar = { path = "crates/widgets/financial_calendar" }
-financial_indices = { path = "crates/widgets/financial_indices" }
-force_orders = { path = "crates/widgets/force_orders" }
+financial_index = { path = "crates/widgets/financial_index" }
+force_order = { path = "crates/widgets/force_order" }
 global_shipping_chokepoint = { path = "crates/widgets/global_shipping_chokepoint" }
 hyperliquid_wallet = { path = "crates/widgets/hyperliquid_wallet" }
 i18n = { path = "crates/i18n" }
@@ -141,7 +141,7 @@ kytrix_service_provider = { path = "crates/kytrix_service_provider" }
 market_participants_connector = { path = "crates/market_participants_connector" }
 market_participants_model = { path = "crates/market_participants_model" }
 market_participants_ui = { path = "crates/market_participants_ui" }
-market_trades = { path = "crates/widgets/market_trades" }
+market_trade = { path = "crates/widgets/market_trade" }
 network = { path = "crates/network" }
 news = { path = "crates/widgets/news" }
 order_book = { path = "crates/widgets/order_book" }

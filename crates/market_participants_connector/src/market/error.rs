@@ -168,14 +168,14 @@ mod tests {
     fn unsupported_network_capability_maps_to_a_market_capability_error() {
         let error = crate::error::MarketParticipantError::UnsupportedCapability {
             route: route(),
-            capability: CapabilityId::ForceOrders,
+            capability: CapabilityId::ForceOrder,
         };
 
         assert_eq!(
             MarketError::from(error),
             MarketError::UnsupportedCapability {
                 route: route(),
-                capability: CapabilityId::ForceOrders,
+                capability: CapabilityId::ForceOrder,
             }
         );
     }

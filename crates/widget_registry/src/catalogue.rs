@@ -31,15 +31,15 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<cryptocurrency_etf::view::CryptocurrencyEtfWidget>(),
         WidgetRegistration::for_view::<empty::view::EmptyWidget>(),
         WidgetRegistration::for_view::<financial_calendar::view::FinancialCalendarWidget>(),
-        WidgetRegistration::for_view::<force_orders::view::ForceOrdersWidget>(),
+        WidgetRegistration::for_view::<force_order::view::ForceOrderWidget>(),
         WidgetRegistration::for_view::<
             global_shipping_chokepoint::view::GlobalShippingChokepointWidget,
         >(),
         WidgetRegistration::for_view::<
             hyperliquid_wallet::view::HyperliquidWalletWidget,
         >(),
-        WidgetRegistration::for_view::<financial_indices::view::FinancialIndicesWidget>(),
-        WidgetRegistration::for_view::<market_trades::view::MarketTradesWidget>(),
+        WidgetRegistration::for_view::<financial_index::view::FinancialIndexWidget>(),
+        WidgetRegistration::for_view::<market_trade::view::MarketTradeWidget>(),
         WidgetRegistration::for_view::<news::view::NewsWidget>(),
         WidgetRegistration::for_view::<order_book::view::OrderBookWidget>(),
         WidgetRegistration::for_view::<pentagon_pizza_index::view::PentagonPizzaIndexWidget>(),
@@ -82,11 +82,11 @@ mod tests {
     const CRYPTOCURRENCY_ETF_ID: &str = "kytrix.cryptocurrency_etf";
     const EMPTY_ID: &str = "kytrix.empty";
     const FINANCIAL_CALENDAR_ID: &str = "kytrix.financial_calendar";
-    const FORCE_ORDERS_ID: &str = "kytrix.force_orders";
+    const FORCE_ORDER_ID: &str = "kytrix.force_order";
     const GLOBAL_SHIPPING_CHOKEPOINT_ID: &str = "kytrix.global_shipping_chokepoint";
     const HYPERLIQUID_WALLET_ID: &str = "kytrix.hyperliquid_wallet";
-    const FINANCIAL_INDICES_ID: &str = "kytrix.financial_indices";
-    const MARKET_TRADES_ID: &str = "kytrix.market_trades";
+    const FINANCIAL_INDEX_ID: &str = "kytrix.financial_index";
+    const MARKET_TRADE_ID: &str = "kytrix.market_trade";
     const NEWS_ID: &str = "kytrix.news";
     const ORDER_BOOK_ID: &str = "kytrix.order_book";
     const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.pentagon_pizza_index";
@@ -116,11 +116,11 @@ mod tests {
         ),
         (CRYPTOCURRENCY_ETF_ID, WidgetCategory::Market),
         (FINANCIAL_CALENDAR_ID, WidgetCategory::Monitoring),
-        (FORCE_ORDERS_ID, WidgetCategory::Monitoring),
+        (FORCE_ORDER_ID, WidgetCategory::Monitoring),
         (GLOBAL_SHIPPING_CHOKEPOINT_ID, WidgetCategory::Monitoring),
         (HYPERLIQUID_WALLET_ID, WidgetCategory::Monitoring),
-        (FINANCIAL_INDICES_ID, WidgetCategory::Market),
-        (MARKET_TRADES_ID, WidgetCategory::Market),
+        (FINANCIAL_INDEX_ID, WidgetCategory::Market),
+        (MARKET_TRADE_ID, WidgetCategory::Market),
         (NEWS_ID, WidgetCategory::Monitoring),
         (ORDER_BOOK_ID, WidgetCategory::Market),
         (PENTAGON_PIZZA_INDEX_ID, WidgetCategory::Monitoring),
@@ -152,11 +152,11 @@ mod tests {
             assert!(registry.get(EMPTY_ID).is_some());
             assert!(registry.get(CRYPTOCURRENCY_ETF_ID).is_some());
             assert!(registry.get(FINANCIAL_CALENDAR_ID).is_some());
-            assert!(registry.get(FORCE_ORDERS_ID).is_some());
+            assert!(registry.get(FORCE_ORDER_ID).is_some());
             assert!(registry.get(GLOBAL_SHIPPING_CHOKEPOINT_ID).is_some());
             assert!(registry.get(HYPERLIQUID_WALLET_ID).is_some());
-            assert!(registry.get(FINANCIAL_INDICES_ID).is_some());
-            assert!(registry.get(MARKET_TRADES_ID).is_some());
+            assert!(registry.get(FINANCIAL_INDEX_ID).is_some());
+            assert!(registry.get(MARKET_TRADE_ID).is_some());
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());

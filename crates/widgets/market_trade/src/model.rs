@@ -17,11 +17,11 @@ pub(super) const MAX_TRADES: usize = 200;
 
 /// An immutable, cheap-to-clone view of the retained trades, oldest first.
 #[derive(Clone, Debug)]
-pub(super) struct MarketTradesSnapshot {
+pub(super) struct MarketTradeSnapshot {
     rows: Arc<[Arc<MarketTradeRow>]>,
 }
 
-impl MarketTradesSnapshot {
+impl MarketTradeSnapshot {
     pub(super) fn rows(&self) -> &[Arc<MarketTradeRow>] {
         &self.rows
     }
@@ -108,7 +108,7 @@ impl MarketTradeDisplay {
 }
 
 /// The trades the tape holds, kept in the order they printed.
-pub(super) struct MarketTradesState {
+pub(super) struct MarketTradeState {
     /// Keyed by chronological position rather than by the venue id.
     ///
     /// A trade id is unique for a venue and listing but is not required to increase
@@ -133,7 +133,7 @@ pub(super) struct MarketTradesState {
     precision: ListingPrecision,
 }
 
-impl MarketTradesState {
+impl MarketTradeState {
     pub(super) fn new(maximum_trades: usize, precision: ListingPrecision) -> Self {
         Self {
             trades: BTreeMap::new(),
@@ -198,7 +198,7 @@ impl MarketTradesState {
     ///
     /// A snapshot that nothing invalidated shares its row storage with the
     /// previous one, so publishing it again costs a reference count.
-    pub(super) fn snapshot(&mut self) -> MarketTradesSnapshot {
+    pub(super) fn snapshot(&mut self) -> MarketTradeSnapshot {
         if self.snapshot_dirty {
             let mut rows = Vec::with_capacity(self.trades.len());
             rows.extend(self.trades.values().cloned());
@@ -206,7 +206,7 @@ impl MarketTradesState {
             self.snapshot_dirty = false;
         }
 
-        MarketTradesSnapshot {
+        MarketTradeSnapshot {
             rows: self.snapshot_rows.clone(),
         }
     }
@@ -287,8 +287,8 @@ mod tests {
         }
     }
 
-    fn state(maximum_trades: usize) -> MarketTradesState {
-        MarketTradesState::new(maximum_trades, precision())
+    fn state(maximum_trades: usize) -> MarketTradeState {
+        MarketTradeState::new(maximum_trades, precision())
     }
 
     /// A price tick of one cent and a quantity step of one thousandth, so a label
@@ -302,7 +302,7 @@ mod tests {
         }
     }
 
-    fn ordered_ids(trades: &mut MarketTradesState) -> Vec<MarketTradeId> {
+    fn ordered_ids(trades: &mut MarketTradeState) -> Vec<MarketTradeId> {
         trades
             .snapshot()
             .rows()

@@ -25,7 +25,7 @@ pub enum ProtocolRequest {
     // ---- route-scoped -------------------------------------------------
     FetchMarkets(MarketCatalogQuery),
     FetchAllTickers(TickersQuery),
-    SubscribeForceOrders(ForceOrderSubscriptionQuery),
+    SubscribeForceOrder(ForceOrderSubscriptionQuery),
     FetchHyperliquidSpotPairs(MarketCatalogQuery),
     SubscribeHyperliquidFastContexts(HyperliquidWalletQuery),
 
@@ -98,7 +98,7 @@ impl ProtocolRequest {
             | Self::SubscribePositions(query) => Some(&query.target),
             Self::FetchMarkets(_)
             | Self::FetchAllTickers(_)
-            | Self::SubscribeForceOrders(_)
+            | Self::SubscribeForceOrder(_)
             | Self::FetchCandlesticks(_)
             | Self::SubscribeCandlesticks(_)
             | Self::FetchTicker(_)

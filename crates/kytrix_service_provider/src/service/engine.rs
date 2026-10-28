@@ -386,7 +386,7 @@ pub(super) enum KytrixServiceEvent {
 
 pub(super) enum SubscriberSink {
     News(SubscriptionPublisher<NewsEvent>),
-    FinancialIndices(SubscriptionPublisher<FinancialIndexEvent>),
+    FinancialIndex(SubscriptionPublisher<FinancialIndexEvent>),
     X(SubscriptionPublisher<XSubscriptionEvent>),
     EthereumWallet(SubscriptionPublisher<EthereumWalletTransfer>),
     SolanaWallet(SubscriptionPublisher<SolanaWalletTransfer>),
@@ -397,7 +397,7 @@ impl SubscriberSink {
     pub(super) const fn capability(&self) -> KytrixServiceCapability {
         match self {
             Self::News(_) => KytrixServiceCapability::News,
-            Self::FinancialIndices(_) => KytrixServiceCapability::FinancialIndices,
+            Self::FinancialIndex(_) => KytrixServiceCapability::FinancialIndex,
             Self::X(_) => KytrixServiceCapability::X,
             Self::EthereumWallet(_) => KytrixServiceCapability::EthereumWallet,
             Self::SolanaWallet(_) => KytrixServiceCapability::SolanaWallet,
@@ -408,7 +408,7 @@ impl SubscriberSink {
     pub(super) fn activate(&self) {
         match self {
             Self::News(publisher) => publisher.activate(),
-            Self::FinancialIndices(publisher) => publisher.activate(),
+            Self::FinancialIndex(publisher) => publisher.activate(),
             Self::X(publisher) => publisher.activate(),
             Self::EthereumWallet(publisher) => publisher.activate(),
             Self::SolanaWallet(publisher) => publisher.activate(),
@@ -419,7 +419,7 @@ impl SubscriberSink {
     pub(super) fn reconnecting(&self) {
         match self {
             Self::News(publisher) => publisher.reconnecting(),
-            Self::FinancialIndices(publisher) => publisher.reconnecting(),
+            Self::FinancialIndex(publisher) => publisher.reconnecting(),
             Self::X(publisher) => publisher.reconnecting(),
             Self::EthereumWallet(publisher) => publisher.reconnecting(),
             Self::SolanaWallet(publisher) => publisher.reconnecting(),
@@ -430,7 +430,7 @@ impl SubscriberSink {
     pub(super) fn fail(&self, error: TransportError) {
         match self {
             Self::News(publisher) => publisher.fail(error),
-            Self::FinancialIndices(publisher) => publisher.fail(error),
+            Self::FinancialIndex(publisher) => publisher.fail(error),
             Self::X(publisher) => publisher.fail(error),
             Self::EthereumWallet(publisher) => publisher.fail(error),
             Self::SolanaWallet(publisher) => publisher.fail(error),
@@ -441,7 +441,7 @@ impl SubscriberSink {
     pub(super) fn finish(&self) {
         match self {
             Self::News(publisher) => publisher.finish(),
-            Self::FinancialIndices(publisher) => publisher.finish(),
+            Self::FinancialIndex(publisher) => publisher.finish(),
             Self::X(publisher) => publisher.finish(),
             Self::EthereumWallet(publisher) => publisher.finish(),
             Self::SolanaWallet(publisher) => publisher.finish(),
@@ -452,7 +452,7 @@ impl SubscriberSink {
     pub(super) fn is_cancelled(&self) -> bool {
         match self {
             Self::News(publisher) => publisher.is_cancelled(),
-            Self::FinancialIndices(publisher) => publisher.is_cancelled(),
+            Self::FinancialIndex(publisher) => publisher.is_cancelled(),
             Self::X(publisher) => publisher.is_cancelled(),
             Self::EthereumWallet(publisher) => publisher.is_cancelled(),
             Self::SolanaWallet(publisher) => publisher.is_cancelled(),
@@ -465,7 +465,7 @@ impl SubscriberSink {
             (Self::News(publisher), KytrixServiceEvent::News(event)) => publisher
                 .try_send(event.clone())
                 .map_err(subscription_send_error),
-            (Self::FinancialIndices(publisher), KytrixServiceEvent::FinancialIndex(event)) => {
+            (Self::FinancialIndex(publisher), KytrixServiceEvent::FinancialIndex(event)) => {
                 publisher
                     .try_send(event.clone())
                     .map_err(subscription_send_error)
@@ -914,7 +914,7 @@ pub(super) struct ServiceSessionActor {
     pub subscription_route_change_reuses_socket: bool,
     pub subscribers: AHashMap<u64, LocalSubscriber>,
     pub topics: AHashMap<ServiceTopic, AHashSet<u64>>,
-    pub latest_financial_indices: AHashMap<FinancialIndexTopic, FinancialIndexEvent>,
+    pub latest_financial_index: AHashMap<FinancialIndexTopic, FinancialIndexEvent>,
     /// The last keyframe a session delivered for each AIS area.
     ///
     /// A later local subscriber of an area the session is already subscribed to would

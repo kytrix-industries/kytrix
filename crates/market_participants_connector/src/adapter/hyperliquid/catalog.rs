@@ -573,7 +573,7 @@ fn perp_dex_capabilities() -> Vec<RouteCapabilityDescriptor> {
     vec![
         RouteCapabilityDescriptor::new(CapabilityId::MarketCatalog, false),
         RouteCapabilityDescriptor::new(CapabilityId::Candlesticks, false),
-        RouteCapabilityDescriptor::new(CapabilityId::MarketTrades, false),
+        RouteCapabilityDescriptor::new(CapabilityId::MarketTrade, false),
         RouteCapabilityDescriptor::new(CapabilityId::Tickers, false),
         RouteCapabilityDescriptor::new(CapabilityId::AllTickers, false),
         RouteCapabilityDescriptor::new(CapabilityId::OrderBook, false),
@@ -847,7 +847,7 @@ mod tests {
         for expected in [
             CapabilityId::MarketCatalog,
             CapabilityId::Candlesticks,
-            CapabilityId::MarketTrades,
+            CapabilityId::MarketTrade,
             CapabilityId::Tickers,
             CapabilityId::AllTickers,
             CapabilityId::OrderBook,
@@ -863,7 +863,7 @@ mod tests {
                 "{expected:?} should be declared"
             );
         }
-        for absent in [CapabilityId::AccountHistory, CapabilityId::ForceOrders] {
+        for absent in [CapabilityId::AccountHistory, CapabilityId::ForceOrder] {
             assert!(!declared.contains(&absent), "{absent:?} is not implemented");
         }
         assert_eq!(declared.len(), 12);

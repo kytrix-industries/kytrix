@@ -1,7 +1,7 @@
 # Widget 开发规范
 
 本文件适用于 `crates/widgets/**`。规则以当前代码实现为准：框架接口看 `crates/widget`，装配与展示规则看
-`crates/widget/src/surface.rs`，参考实现看 `crates/widgets/force_orders`（表格与状态上报）、
+`crates/widget/src/surface.rs`，参考实现看 `crates/widgets/force_order`（表格与状态上报）、
 `crates/widgets/order_book`（canvas 自绘、正文内动画、header 里的下拉控件）与
 `crates/widgets/perpetual_statistics`（一个 crate 出多个 widget 的目录布局、轮询型 service、canvas 图表的
 axes / palette / text / paint 分层）。
@@ -63,7 +63,7 @@ crates/widgets/<widget_name>/
 
 - `lib.rs` 只做模块声明，不写实现、不写测试。对外只 `pub` 注册要用的那个模块（单 widget 的 crate 是 `pub mod view`，
   一个 crate 出多个 widget 时是 `pub mod widget`，见下）：注册需要 `W::ID` 等常量，其余模块对外不可见。
-- 协议数据类型与 `ForceOrdersSource` 这类接缝 trait 都写成 `pub(super)`（要跨同级子模块复用时写 `pub(crate)` / `pub`，
+- 协议数据类型与 `ForceOrderSource` 这类接缝 trait 都写成 `pub(super)`（要跨同级子模块复用时写 `pub(crate)` / `pub`，
   例如 `etf` 的 `EtfSource` 与 `perpetual_statistics` / `volume_heatmap` 的 `service/stream.rs`）。`service` / `model`
   本身不是 `pub`，所以 crate 外的可见面只有注册要用的那些类型：单 widget 的 crate 是 `pub mod view` 里的 Widget，一个
   crate 出多个 widget 时还有 `pub mod widget` 的别名，以及别名写出来就必须可见的通用视图与 series 类型。
@@ -195,9 +195,9 @@ fn load(&mut self, cx: &mut Context<Self>) {
     self.routes = routes.clone();
     self.status.report(WidgetState::Connecting, cx);
     let request = if retry {
-        ForceOrdersRequest::Retry { routes }
+        ForceOrderRequest::Retry { routes }
     } else {
-        ForceOrdersRequest::Load { routes }
+        ForceOrderRequest::Load { routes }
     };
     self.binding.call(request, cx, Self::apply_rpc_result);
 }
@@ -212,7 +212,7 @@ fn load(&mut self, cx: &mut Context<Self>) {
 
 便宜谓词， **不许构建元素**：框架是"问它"而不是"渲染完再看有没有"。`false` 时框架放占位，正文 view 根本不被嵌入。
 
-`force_orders` 的答案是 `!self.routes.is_empty() && self.snapshot.is_some()` —— 拿到过快照就是有内容， **空快照也算**；一个
+`force_order` 的答案是 `!self.routes.is_empty() && self.snapshot.is_some()` —— 拿到过快照就是有内容， **空快照也算**；一个
 route 都读不到的 pane 没有正文可画（见 §8）。
 
 ### `header`
@@ -385,8 +385,8 @@ pane 停在 connecting，不为它另加超时层。
 失败后框架 **不会**自动重试，也不会拦住迟到的 stream / RPC 结果。每个消息入口都要自己守卫：
 
 ```rust
-fn apply_reliable(&mut self, key: ForceOrdersStreamKey, message: Arc<… >, context: &mut Context<Self>) {
-    if key != ForceOrdersStreamKey::AllMarkets || self.status.is_failed(context) {
+fn apply_reliable(&mut self, key: ForceOrderStreamKey, message: Arc<… >, context: &mut Context<Self>) {
+    if key != ForceOrderStreamKey::AllMarkets || self.status.is_failed(context) {
         return;
     }
     …
@@ -403,7 +403,7 @@ fn apply_reliable(&mut self, key: ForceOrdersStreamKey, message: Arc<… >, cont
 - 变化发生在 widget 自己身上 → `cx.notify()`（写状态时框架已经 `notify` 了状态 cell，pane 读它会重画；但如果只是
   绘制内容变了而状态没变，要自己 notify）。
 - 变化发生在持有内容的子实体上 → notify 那个子实体，它会沿祖先链把正文标脏。
-  `force_orders` 的 `sync_table` 就是这条：只在"被接受的快照发生变化"的那两处边界更新并 `notify` 表格实体。
+  `force_order` 的 `sync_table` 就是这条：只在"被接受的快照发生变化"的那两处边界更新并 `notify` 表格实体。
 - 表格 / 列表的滚动位置按 `ElementId` 存在 GPUI 的 state 里， **每帧必须用同一个 id**，否则滚动位置每帧归零。
 
 ---
@@ -439,7 +439,7 @@ fn apply_reliable(&mut self, key: ForceOrdersStreamKey, message: Arc<… >, cont
 - 文案一律用共用的 `common.no_data`，不要每个 widget 自己造 key。
 - `WidgetState::waiting` 仍然只用于"没有 scope"这类 **中性引导**（"请选择标的"），它和空快照是两件事：前者是"还没开始
   看"，后者是"看过了，是空的"。
-- 反例仍然是反例：`force_orders` 当年那个"等待强平订单" `waiting` 占位不该回来——本条要的是正文里的一块「暂无数据」，
+- 反例仍然是反例：`force_order` 当年那个"等待强平订单" `waiting` 占位不该回来——本条要的是正文里的一块「暂无数据」，
   不是一条上报给框架的中性状态。`etf` 的空窗口在合法路径上不可达（解析层就把它判成 `EmptyAssetMap` 失败），所以它
   不需要空态。
 
@@ -488,7 +488,7 @@ fn apply_reliable(&mut self, key: ForceOrdersStreamKey, message: Arc<… >, cont
 **数据通道分工**：可靠流传不能丢的状态与错误，最新流传可覆盖的快照。
 
 - `WidgetProtocol::StreamKey` 必须包含所有会使旧数据失效的业务维度；handler 里再校验一次当前 key。
-- 不假设两条流之间存在全局顺序：需要原子一致的字段放在同一条消息里。`force_orders` 的做法是 **Ready 严格晚于首个
+- 不假设两条流之间存在全局顺序：需要原子一致的字段放在同一条消息里。`force_order` 的做法是 **Ready 严格晚于首个
   快照**，widget 用 `pending_snapshot` + `ready_received` 把"快照到了但还没 Ready"和"Ready 了但快照还没到"两种情况
   都接住。
 - **Ready 水位自己管**。框架不提供这套机制：拿一个完整快照不等于业务成功，必须等到协议定义的边界。
@@ -501,17 +501,17 @@ fn apply_reliable(&mut self, key: ForceOrdersStreamKey, message: Arc<… >, cont
 **依赖注入的具体形状**（照抄参考实现）：
 
 ```rust
-pub(super) trait ForceOrdersSource: Clone + Send + Sync + 'static {
+pub(super) trait ForceOrderSource: Clone + Send + Sync + 'static {
     type Subscription: ForceOrderEventSubscription;
 
     fn perpetual_listings(&self, route: &VenueRoute)
                           -> impl Future<Output=Result<Vec<VenueListingKey>, MarketError>> + Send;
-    fn subscribe_force_orders(&self, route: VenueRoute)
+    fn subscribe_force_order(&self, route: VenueRoute)
                               -> impl Future<Output=Result<Self::Subscription, MarketError>> + Send;
 }
 
-impl ForceOrdersSource for MarketCapability { … }          // 生产实现，同文件
-pub(super) struct ForceOrdersService<S = MarketCapability> {
+impl ForceOrderSource for MarketCapability { … }          // 生产实现，同文件
+pub(super) struct ForceOrderService<S = MarketCapability> {
     source: S,
     …
 }
@@ -549,7 +549,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
   `MarketParticipantsConnector::install` 建一次），订阅随实体建立一次，不轮询。处理器叫 `on_venues_updated`，它问的是两件事：
   这次提交有没有让 **"自己要读的东西在不在内存里"** 这个答案变掉，以及这次提交有没有落在 **自己正在读的那个场所** 上：
     - 答案变得能读了（pane 正等着，`market_ready(cx)` 现在为真）→ 重跑 `load()`。等待中的 pane 等的是前置条件，
-      场所加载后事件到达就重新开始（"加载后已打开的 pane 自动恢复"就是这样实现的）；读整个市场的 pane（`force_orders`、
+      场所加载后事件到达就重新开始（"加载后已打开的 pane 自动恢复"就是这样实现的）；读整个市场的 pane（`force_order`、
       `volume_heatmap`）也靠这一条才能把后加载的场所读进来。
     - 答案变得读不了了（pane 正在读，`market_ready(cx)` 为假）→ `wait_for_market(cx)`：pane 读的那个 scope 被一次收缩提交剪除了。
     - **提交落在 pane 正在读的那个场所上**（用户刷新或重新加载了这个场所）→ pane **从头开始**：清掉手里那批它无法再担保的内容，
@@ -558,7 +558,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
       那一代重新解析（各协议的 `Retry`；`watch_list` 是 `MarketReloaded`，`hyperliquid_wallet` 是 `Reload`）。所以每个这样的 pane
       多一个布尔字段（`market_reloaded`），由 `on_venues_updated` 在判据成立时置上、由 `load()` 在 **前置检查之后** 取用——被打回等待时它要留着，市场回来后的那次加载
       同样必须重开流（那条流仍是在被换掉的那一代上解析的）。判据是"这个场所上有没有我正在读的东西"：选定 scope 的 pane 看
-      `config.selection` 的 route 场所，`watch_list` 看 `config.entries`，`force_orders` 看自己在读的 `routes`，
+      `config.selection` 的 route 场所，`watch_list` 看 `config.entries`，`force_order` 看自己在读的 `routes`，
       `hyperliquid_wallet` 看自己在读的 `markets`；`perpetual_statistics` 是例外，它的 `Load` 本身就走
       `replace_stream`，所以它只需要重跑 `load()`，不记这个字段。**两个请求状态不能混用**：`retry` 决定"保留用户正在看的内容"，
       替换请求决定"重开流"，重新加载是"清内容 + 替换请求"（`crates/widgets/*/src/view.rs` 里那些 `start` / `start_current` 的
@@ -569,14 +569,14 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
     - 两个答案都没变（别的场所提交，而 pane 读的 scope 不在其中）→ 只重查前置条件， **不重跑 `load()`、不重启流**：
       否则每一次提交都会把用户正在看的内容清掉重来。所以 **选择器画什么不能取自那一次 `load()`**：凡是从已加载场所里取选项的
       pane，都必须在 **构建控件的那一刻** 读一次：`LoadedScope::all(cx.global::<MarketParticipantsConnector>().venues())`
-      ——本文件里五个这样的 pane（`candlestick` / `watch_list` / `market_trades` / `order_book` /
+      ——本文件里五个这样的 pane（`candlestick` / `watch_list` / `market_trade` / `order_book` /
       `perpetual_statistics`）现在都这样读——不把这组 scope 存进字段——存下来的那份只在 `load()` 时更新，
       而用户后来加载的场所按上面这条规则不会再触发 `load()`，那些场所于是既不出现在选择器的场所列里，它的目录也不出现在
       选择器读的目录里。
-    读 **自己选定的那几个** scope 的 pane（`candlestick` / `watch_list` / `market_trades` / `order_book` /
+    读 **自己选定的那几个** scope 的 pane（`candlestick` / `watch_list` / `market_trade` / `order_book` /
     `perpetual_statistics`）就用它自己维护着的这两件事判断：`awaiting_market`（因为缺一个市场而没在读）与
     `market_ready(cx)`（现在要读的都在内存里）合起来就是"我要读的那组 market"，它们跟着选择一起变，所以不会过期。
-    读的是"已加载场所里自己认下的那一部分"的 pane（`force_orders` 读所有已加载的强平 route，`volume_heatmap` 读它选中
+    读的是"已加载场所里自己认下的那一部分"的 pane（`force_order` 读所有已加载的强平 route，`volume_heatmap` 读它选中
     场所的那组 route，`hyperliquid_wallet` 读 Hyperliquid 的全部已加载 scope）判断只能靠它们已经在读的那组
     `routes`（`hyperliquid_wallet` 的那个字段叫 `markets`，`volume_heatmap` 记的是选中的场所连同它的 route）：
     与现在要读的不同就是集合变了；集合没变时还有上面那条"提交落在自己读的场所上"的规则，所以这个比较要在它之后问。
@@ -587,7 +587,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
 - 等待中的 pane 仍然活着的流会迟到：`wait_for_market` 清空内存里的内容，但不清空流，所以 **每个消息入口除了 `StreamKey`
   与 `is_failed` 之外还要挡"我正在等市场"**（各 pane 的 `awaiting_market`）。否则一条在途快照会把 `has_content()` 变回
   真，框架于是画正文而不是那条提示。
-- "没有所需 route 就画不出正文"的两个 pane（`force_orders`、`volume_heatmap`）必须同时让 `has_content()` 在所需 route
+- "没有所需 route 就画不出正文"的两个 pane（`force_order`、`volume_heatmap`）必须同时让 `has_content()` 在所需 route
   缺失时返回 `false`：`has_content()` 为假时框架根本不调用正文 `Render`，提示只能由 `WidgetState::waiting` 的占位画出来。
 
 ---
@@ -605,7 +605,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
 
 **i18n**
 
-- 用户可见的文案一律 `t!(cx, "…")`；`DISPLAY_NAME` 是 **key**（如 `widget.names.force_orders`）。
+- 用户可见的文案一律 `t!(cx, "…")`；`DISPLAY_NAME` 是 **key**（如 `widget.names.force_order`）。
 - **新增 key 必须同时加到 `crates/i18n/locales/en.yaml` 与 `zh-CN.yaml`。** 缺失的 key 翻译成空串——界面上一块空白，
   不是崩溃，所以很容易漏掉。
 - `common.*` 是 **跨 widget 共用**的：`connecting` / `loading` / `retry` 由框架在 surface 里解析，`no_data` 由 widget
@@ -676,7 +676,7 @@ pub(super) struct ForceOrdersService<S = MarketCapability> {
 - 跨 crate 才用 `tests/` integration test。
 - `src/lib.rs` 里不写测试。不为了测试私有实现而把 unit test 改成 integration test。
 
-**widget 测试的最小装置**（照 `force_orders/src/view.rs` 的 `widget(cx)`）：
+**widget 测试的最小装置**（照 `force_order/src/view.rs` 的 `widget(cx)`）：
 
 ```rust
 cx.executor().allow_parking();
