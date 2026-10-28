@@ -3,10 +3,11 @@
 //!
 //! # What the frame draws
 //!
-//! One canvas, under elements that carry the words: the land is a triangle list parsed
-//! once by [`crate::scene`], the lanes and the vessel markers are built for the frame's
-//! camera, and the labels, the legend, the hover card, the stale badge and the empty state
-//! are absolutely positioned over it. Nothing here tessellates: a frame only applies the
+//! One canvas, under elements that carry the words. The base map's coastline, borders and
+//! roads are layers parsed once by [`crate::scene`]; [`crate::paint`] turns them, the
+//! lanes and the vessel markers into the paths the canvas paints for the frame's camera,
+//! and the labels, the legend, the hover card, the stale badge and the empty state are
+//! absolutely positioned over it. Nothing tessellates per frame: a frame only applies the
 //! camera's affine transform to geometry that was prepared once.
 //!
 //! # What the pane reports, and what it holds
@@ -35,9 +36,9 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, Bounds, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseMoveEvent, ParentElement, Path, PinchEvent, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, canvas, div, point, prelude::FluentBuilder, px,
+    IntoElement, MouseButton, MouseMoveEvent, ParentElement, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 use i18n::t;
 use kytrix_service_provider::{
@@ -67,10 +68,10 @@ use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, CITY_LABELS, COUNTRY_LABELS, Camera, CellSpan, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM,
-        STALE_AFTER, ShipClass, TSS_LANES, Vessel, VesselDetails, VesselStore, WATER_LABELS,
-        colour_for,
+        self, CITY_LABELS, COUNTRY_LABELS, Camera, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, STALE_AFTER,
+        ShipClass, Vessel, VesselDetails, VesselStore, WATER_LABELS, colour_for,
     },
+    paint::paint_map,
     scene::{self, Scene, SceneError},
     service::{
         AisStreamError, AisStreamMessage, GlobalShippingChokepointProtocol,
@@ -100,30 +101,6 @@ const MARKER_LENGTH_NEAR: f32 = 10.0;
 /// The marker length at [`MAX_ZOOM`].
 const MARKER_LENGTH_FAR: f32 = 12.0;
 
-/// How wide a marker is against its length.
-const MARKER_WIDTH_RATIO: f32 = 0.7;
-
-/// The radius of the dot a vessel whose ship record has not arrived is drawn as.
-const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
-
-/// How many segments the dot and the hover ring are drawn with.
-const ROUND_SEGMENTS: usize = 8;
-/// How many segments the hover ring is drawn with.
-const RING_SEGMENTS: usize = 24;
-
-/// The inner and outer radius of the ring around the vessel under the pointer.
-const HOVER_RING_INNER: f32 = 7.0;
-/// The outer radius of the ring around the vessel under the pointer.
-const HOVER_RING_OUTER: f32 = 9.0;
-
-/// The length of one dash of a lane, and of the gap after it, in pixels.
-const DASH_ON: f32 = 6.0;
-/// The gap between two dashes of a lane, in pixels.
-const DASH_OFF: f32 = 6.0;
-
-/// How wide a lane's dashes are drawn, in pixels.
-const DASH_WIDTH: f32 = 1.5;
-
 /// How opaque a lane is drawn over the sea.
 const DASH_ALPHA: f32 = 0.55;
 
@@ -143,7 +120,7 @@ const CARD_MARGIN: f32 = 12.0;
 const CARD_HEIGHT: f32 = 15.0 * 20.0 + 14.0 * 4.0 + 2.0 * 4.0 + 10.0;
 
 /// The order the four vessel classes are drawn and listed in.
-const CLASSES: [ShipClass; 4] = [
+pub(super) const CLASSES: [ShipClass; 4] = [
     ShipClass::Tanker,
     ShipClass::Container,
     ShipClass::Bulk,
@@ -243,20 +220,29 @@ struct MapFrame {
 ///
 /// Nothing is kept between frames: the appearance can change while the pane is open, and
 /// a colour cached onto the widget would be a map that kept drawing the old theme.
+///
+/// [`crate::paint`] reads the map fields; the struct's own `pub(super)` keeps them inside
+/// the crate even though the fields themselves are `pub`.
 #[derive(Clone, Copy)]
-struct MapColors {
+pub(super) struct MapColors {
     /// The sea, which is also the canvas' own fill.
     ocean: Hsla,
     /// The land the coastline is filled with.
-    land: Hsla,
+    pub land: Hsla,
+    /// The land borders drawn over the land.
+    pub map_border: Hsla,
+    /// Motorways and trunks, drawn over the land and the sea.
+    pub road: Hsla,
+    /// Primary roads, the finer of the two road strokes.
+    pub road_minor: Hsla,
     /// The lanes, already at their opacity.
-    lane: Hsla,
+    pub lane: Hsla,
     /// One colour per class in [`CLASSES`] order.
-    ships: [Hsla; 4],
+    pub ships: [Hsla; 4],
     /// The dot a vessel without a ship record is drawn as.
-    unknown: Hsla,
+    pub unknown: Hsla,
     /// The ring around the vessel under the pointer.
-    hover: Hsla,
+    pub hover: Hsla,
     /// The fill of the labels' chips and the card.
     overlay: Hsla,
     /// The edge of those chips and of the card.
@@ -270,11 +256,19 @@ struct MapColors {
 }
 
 impl MapColors {
-    fn resolve(theme: &Theme) -> Self {
+    pub(super) fn resolve(theme: &Theme) -> Self {
         let roles = &theme.roles;
         Self {
             ocean: roles.chart.map_ocean.hsla,
             land: roles.chart.map_land.hsla,
+            // The theme has no map-border or map-road roles, so these three borrow opaque
+            // ones: the strong line for the borders, the sixth chart series for motorways
+            // and the line border for primary roads. Each has to read on both fills — a
+            // road survives the bridge or causeway that carries it over the sea — which is
+            // what `the_map_border_and_roads_read_on_both_fills` pins.
+            map_border: roles.line.strong.hsla,
+            road: roles.chart.series[5].hsla,
+            road_minor: roles.line.border.hsla,
             lane: roles.chart.series[3].hsla.opacity(DASH_ALPHA),
             ships: CLASSES.map(|class| colour_for(theme, class)),
             unknown: roles.fg.muted.hsla,
@@ -290,19 +284,19 @@ impl MapColors {
 
 /// Where the map's Mercator points land in the canvas.
 #[derive(Clone, Copy, Debug)]
-struct Projection {
+pub(super) struct Projection {
     /// The Mercator point drawn at the centre of the canvas.
     center: [f32; 2],
     /// The pixels one Mercator unit is drawn at.
     scale: f32,
     /// The canvas' size.
-    viewport: [f32; 2],
+    pub viewport: [f32; 2],
     /// The camera's zoom, which is what the marker size is read from.
-    zoom: f32,
+    pub zoom: f32,
 }
 
 impl Projection {
-    fn new(camera: Camera, viewport: [f32; 2]) -> Self {
+    pub(super) fn new(camera: Camera, viewport: [f32; 2]) -> Self {
         Self {
             center: camera.center,
             scale: model::fit_px_per_merc(viewport) * camera.zoom,
@@ -315,7 +309,7 @@ impl Projection {
     ///
     /// A pane laid out at zero size has no fit, and a marker drawn through a zero scale is
     /// a degenerate triangle rather than a vessel.
-    fn drawable(self) -> bool {
+    pub(super) fn drawable(self) -> bool {
         self.scale.is_finite()
             && self.scale > 0.0
             && self.viewport[0] > 0.0
@@ -327,7 +321,7 @@ impl Projection {
     /// A Mercator `y` grows north and a canvas `y` grows down, so the two run in opposite
     /// directions: the centre is subtracted the other way round for `y`, which is what puts
     /// the Arabian side under the Iranian one rather than over it.
-    fn screen(self, mercator: [f32; 2]) -> [f32; 2] {
+    pub(super) fn screen(self, mercator: [f32; 2]) -> [f32; 2] {
         [
             (mercator[0] - self.center[0]) * self.scale + self.viewport[0] / 2.0,
             (self.center[1] - mercator[1]) * self.scale + self.viewport[1] / 2.0,
@@ -335,7 +329,7 @@ impl Projection {
     }
 
     /// The Mercator point drawn at one canvas point, which is what a zoom keeps fixed.
-    fn mercator(self, canvas: [f32; 2]) -> [f32; 2] {
+    pub(super) fn mercator(self, canvas: [f32; 2]) -> [f32; 2] {
         if !self.drawable() {
             return self.center;
         }
@@ -351,7 +345,7 @@ impl Projection {
     /// rectangle touches. Only meaningful for a drawable projection — a pane with no
     /// size has no scale to divide by, and every painter checks [`Self::drawable`]
     /// before it asks.
-    fn visible_mercator(self) -> [f32; 4] {
+    pub(super) fn visible_mercator(self) -> [f32; 4] {
         let half = [
             self.viewport[0] / (2.0 * self.scale),
             self.viewport[1] / (2.0 * self.scale),
@@ -373,7 +367,7 @@ impl Projection {
     }
 
     /// Whether a canvas point is inside the canvas grown by `margin` on every side.
-    fn near_screen(self, canvas: [f32; 2], margin: f32) -> bool {
+    pub(super) fn near_screen(self, canvas: [f32; 2], margin: f32) -> bool {
         canvas[0] >= -margin
             && canvas[0] <= self.viewport[0] + margin
             && canvas[1] >= -margin
@@ -384,7 +378,7 @@ impl Projection {
     ///
     /// The endpoints of a segment are not enough: a lane's segment can leave the canvas on
     /// both ends while crossing it.
-    fn segment_near(self, start: [f32; 2], end: [f32; 2], margin: f32) -> bool {
+    pub(super) fn segment_near(self, start: [f32; 2], end: [f32; 2], margin: f32) -> bool {
         let left = start[0].min(end[0]);
         let right = start[0].max(end[0]);
         let top = start[1].min(end[1]);
@@ -397,14 +391,14 @@ impl Projection {
     }
 
     /// The length one vessel marker is drawn at, which grows with the camera.
-    fn marker_length(self) -> f32 {
+    pub(super) fn marker_length(self) -> f32 {
         let fraction = ((self.zoom - MIN_ZOOM) / (MAX_ZOOM - MIN_ZOOM)).clamp(0.0, 1.0);
         MARKER_LENGTH_NEAR + (MARKER_LENGTH_FAR - MARKER_LENGTH_NEAR) * fraction
     }
 }
 
 /// The canvas' size as the number the projection is built from.
-fn viewport_of(bounds: Bounds<Pixels>) -> [f32; 2] {
+pub(super) fn viewport_of(bounds: Bounds<Pixels>) -> [f32; 2] {
     [f32::from(bounds.size.width), f32::from(bounds.size.height)]
 }
 
@@ -1340,346 +1334,13 @@ fn view_plans() -> WidgetAction {
 }
 
 /// The index one class occupies in [`CLASSES`], [`MapColors::ships`] and the legend.
-const fn class_index(class: ShipClass) -> usize {
+pub(super) const fn class_index(class: ShipClass) -> usize {
     match class {
         ShipClass::Tanker => 0,
         ShipClass::Container => 1,
         ShipClass::Bulk => 2,
         ShipClass::Other => 3,
     }
-}
-
-/// Draws one frame of the map: land, lanes, vessels, and the ring around the hovered one.
-fn paint_map(
-    bounds: Bounds<Pixels>,
-    camera: Camera,
-    scene: Option<&'static Scene>,
-    vessels: &[Vessel],
-    hovered: Option<u32>,
-    colors: MapColors,
-    window: &mut Window,
-) {
-    let projection = Projection::new(camera, viewport_of(bounds));
-    if !projection.drawable() {
-        return;
-    }
-    // A canvas paints in window coordinates, while the projection is relative to the canvas
-    // box: every vertex is brought together with the box's corner here. The labels, the card
-    // and the hit test deliberately stay in canvas coordinates, because they are laid out by
-    // the element tree around the same box.
-    let origin = [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
-    // The cells the frame's viewport touches. The land is binned by triangle centroid,
-    // so its span is grown by one cell: a triangle whose centroid falls just outside
-    // the viewport can still reach into it.
-    let visible = projection.visible_mercator();
-    let cells = model::visible_cells(visible);
-
-    if let Some(scene) = scene {
-        paint_path(
-            window,
-            land_path(scene, projection, origin, cells.grown(), visible),
-            colors.land,
-        );
-    }
-    paint_path(window, lane_path(projection, origin), colors.lane);
-
-    let ships = ship_paths(vessels, projection, origin);
-    // The unknown dots go down first: a vessel whose ship record has arrived is a report
-    // that says more about it, and its marker should not be hidden under a neighbour's dot.
-    paint_path(window, ships.unknown, colors.unknown);
-    for (index, path) in ships.classes.into_iter().enumerate() {
-        paint_path(window, path, colors.ships[index]);
-    }
-
-    if let Some(mmsi) = hovered
-        && let Some(vessel) = vessels.iter().find(|vessel| vessel.mmsi == mmsi)
-    {
-        paint_path(
-            window,
-            ring_path(projection.screen(vessel.position), origin),
-            colors.hover,
-        );
-    }
-}
-
-/// Hands one path to the frame, skipping the ones that hold no triangle.
-fn paint_path(window: &mut Window, path: Path<Pixels>, color: Hsla) {
-    if path.vertices.is_empty() {
-        return;
-    }
-    window.paint_path(path, color);
-}
-
-/// The coastline as one fill, every visible triangle transformed into the frame's camera.
-///
-/// The triangles were tessellated once, when the asset was parsed, and bucketed into the
-/// culling grid: this walks the cells the viewport touches and applies an affine
-/// transform per vertex. That is the land's only per-frame cost, and it is why a cell
-/// the viewport does not touch costs nothing. `cells` is the viewport's span grown by the
-/// one-cell margin; `visible` is the viewport itself, which the layer needs for the
-/// triangles too wide to bucket by centroid.
-fn land_path(
-    scene: &Scene,
-    projection: Projection,
-    origin: [f32; 2],
-    cells: CellSpan,
-    visible: [f32; 4],
-) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    for triangle in scene.land.visible(cells, visible) {
-        let [ax, ay, bx, by, cx, cy] = *triangle;
-        path.push_triangle(
-            (
-                canvas_point(origin, projection.screen([ax, ay])),
-                canvas_point(origin, projection.screen([bx, by])),
-                canvas_point(origin, projection.screen([cx, cy])),
-            ),
-            (texture, texture, texture),
-        );
-    }
-    path
-}
-
-/// The lanes as dashes in screen space.
-///
-/// The dash pattern is walked along each lane rather than handed to a path builder: a
-/// builder's `dash_array` is sampled when the path is built, which would either tessellate
-/// every frame or make a 6 px dash scale with the camera. A dash's phase is anchored at the
-/// lane's first vertex, so panning moves the dashes with the lane instead of crawling them.
-fn lane_path(projection: Projection, origin: [f32; 2]) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    for lane in TSS_LANES {
-        let mut previous: Option<[f32; 2]> = None;
-        let mut along = 0.0f32;
-        for &(longitude, latitude) in lane.iter() {
-            let next = projection.screen(model::project(longitude, latitude));
-            if let Some(start) = previous {
-                let length = ((next[0] - start[0]).powi(2) + (next[1] - start[1]).powi(2)).sqrt();
-                // A lane is a long line: at four times the fitted zoom most of it is off
-                // screen, and walking the dashes of a segment nothing draws is the work
-                // this skips.
-                if length > 0.0 && projection.segment_near(start, next, DASH_WIDTH) {
-                    push_dashes(&mut path, start, next, along, length, origin, texture);
-                }
-                along += length;
-            }
-            previous = Some(next);
-        }
-    }
-    path
-}
-
-/// Appends the dashes of one screen-space segment of a lane.
-fn push_dashes(
-    path: &mut Path<Pixels>,
-    start: [f32; 2],
-    end: [f32; 2],
-    along: f32,
-    length: f32,
-    origin: [f32; 2],
-    texture: Point<f32>,
-) {
-    let direction = [(end[0] - start[0]) / length, (end[1] - start[1]) / length];
-    let normal = [
-        -direction[1] * DASH_WIDTH / 2.0,
-        direction[0] * DASH_WIDTH / 2.0,
-    ];
-    let period = DASH_ON + DASH_OFF;
-    let first = (along / period).floor() as i64;
-    let last = ((along + length) / period).ceil() as i64;
-    for cycle in first..=last {
-        let from = (cycle as f32 * period).max(along);
-        let to = (cycle as f32 * period + DASH_ON).min(along + length);
-        if to <= from {
-            continue;
-        }
-        let at = |distance: f32| {
-            let travelled = distance - along;
-            [
-                start[0] + direction[0] * travelled,
-                start[1] + direction[1] * travelled,
-            ]
-        };
-        let [ax, ay] = at(from);
-        let [bx, by] = at(to);
-        let a = [
-            [ax + normal[0], ay + normal[1]],
-            [ax - normal[0], ay - normal[1]],
-        ];
-        let b = [
-            [bx + normal[0], by + normal[1]],
-            [bx - normal[0], by - normal[1]],
-        ];
-        path.push_triangle(
-            (
-                canvas_point(origin, a[0]),
-                canvas_point(origin, b[0]),
-                canvas_point(origin, b[1]),
-            ),
-            (texture, texture, texture),
-        );
-        path.push_triangle(
-            (
-                canvas_point(origin, a[0]),
-                canvas_point(origin, b[1]),
-                canvas_point(origin, a[1]),
-            ),
-            (texture, texture, texture),
-        );
-    }
-}
-
-/// The vessels of one frame, one path per class plus one for the vessels without a static
-/// part.
-struct ShipPaths {
-    /// One path per class in [`CLASSES`] order.
-    classes: [Path<Pixels>; 4],
-    /// The dots of the vessels a ship record has not arrived for.
-    unknown: Path<Pixels>,
-}
-
-/// Splits the painted vessels into the paths one frame draws.
-///
-/// A vessel whose ship record has not arrived is a grey dot rather than a coloured marker:
-/// the bucket is a fact about its type, and the report has not said one yet. Its position is
-/// still a position, so it is drawn — a map that hid it would be reporting fewer vessels
-/// than the service does.
-fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> ShipPaths {
-    let mut classes = [
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-    ];
-    let mut unknown = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    let length = projection.marker_length();
-
-    for vessel in vessels {
-        let position = projection.screen(vessel.position);
-        if !projection.near_screen(position, length) {
-            continue;
-        }
-        if !vessel.has_ship {
-            push_disc(
-                &mut unknown,
-                position,
-                UNKNOWN_VESSEL_RADIUS,
-                ROUND_SEGMENTS,
-                origin,
-                texture,
-            );
-            continue;
-        }
-        let path = &mut classes[class_index(vessel.class)];
-        let radians = vessel.facing().to_radians();
-        let (sin, cos) = radians.sin_cos();
-        // North is up in canvas coordinates, so the course turns a direction whose y is
-        // negated.
-        let direction = [sin, -cos];
-        let normal = [-direction[1], direction[0]];
-        let half = length / 2.0;
-        let half_width = length * MARKER_WIDTH_RATIO / 2.0;
-        let tip = [
-            position[0] + direction[0] * half,
-            position[1] + direction[1] * half,
-        ];
-        let base = [
-            position[0] - direction[0] * half,
-            position[1] - direction[1] * half,
-        ];
-        let left = [
-            base[0] + normal[0] * half_width,
-            base[1] + normal[1] * half_width,
-        ];
-        let right = [
-            base[0] - normal[0] * half_width,
-            base[1] - normal[1] * half_width,
-        ];
-        path.push_triangle(
-            (
-                canvas_point(origin, tip),
-                canvas_point(origin, left),
-                canvas_point(origin, right),
-            ),
-            (texture, texture, texture),
-        );
-    }
-
-    ShipPaths { classes, unknown }
-}
-
-/// Appends a filled circle centred on `center`, as a fan of triangles.
-fn push_disc(
-    path: &mut Path<Pixels>,
-    center: [f32; 2],
-    radius: f32,
-    segments: usize,
-    origin: [f32; 2],
-    texture: Point<f32>,
-) {
-    let hub = canvas_point(origin, center);
-    for segment in 0..segments {
-        let first = segment as f32 / segments as f32 * std::f32::consts::TAU;
-        let second = (segment + 1) as f32 / segments as f32 * std::f32::consts::TAU;
-        let a = canvas_point(
-            origin,
-            [
-                center[0] + first.cos() * radius,
-                center[1] + first.sin() * radius,
-            ],
-        );
-        let b = canvas_point(
-            origin,
-            [
-                center[0] + second.cos() * radius,
-                center[1] + second.sin() * radius,
-            ],
-        );
-        path.push_triangle((hub, a, b), (texture, texture, texture));
-    }
-}
-
-/// The ring around the vessel under the pointer, as an annulus of triangles.
-fn ring_path(center: [f32; 2], origin: [f32; 2]) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    let at = |angle: f32, radius: f32| {
-        canvas_point(
-            origin,
-            [
-                center[0] + angle.cos() * radius,
-                center[1] + angle.sin() * radius,
-            ],
-        )
-    };
-    for segment in 0..RING_SEGMENTS {
-        let first = segment as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-        let second = (segment + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-        let inner_first = at(first, HOVER_RING_INNER);
-        let inner_second = at(second, HOVER_RING_INNER);
-        let outer_first = at(first, HOVER_RING_OUTER);
-        let outer_second = at(second, HOVER_RING_OUTER);
-        path.push_triangle(
-            (inner_first, outer_first, outer_second),
-            (texture, texture, texture),
-        );
-        path.push_triangle(
-            (inner_first, outer_second, inner_second),
-            (texture, texture, texture),
-        );
-    }
-    path
-}
-
-/// One canvas point as the window point the paths are drawn at.
-///
-/// A canvas' paint pass draws in window coordinates while a projection is relative to the
-/// canvas, so the box's corner is added to every vertex here.
-fn canvas_point(origin: [f32; 2], canvas: [f32; 2]) -> Point<Pixels> {
-    point(px(origin[0] + canvas[0]), px(origin[1] + canvas[1]))
 }
 
 #[cfg(test)]
@@ -2802,6 +2463,46 @@ mod tests {
         }
     }
 
+    /// The borders and roads are drawn over both map fills, so each is opaque and each
+    /// reads where it lands: a border and a motorway on the land and on the sea, and a
+    /// primary road on the land it is mostly on.
+    #[test]
+    fn the_map_border_and_roads_read_on_both_fills() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = MapColors::resolve(&Theme::of(appearance));
+            for (what, color) in [
+                ("the map border", colors.map_border),
+                ("a motorway", colors.road),
+                ("a primary road", colors.road_minor),
+            ] {
+                assert_eq!(color.a, 1.0, "{appearance:?}: {what} is translucent");
+            }
+
+            for (what, background) in [("the land", colors.land), ("the sea", colors.ocean)] {
+                let ratio = wcag_contrast(colors.map_border, background);
+                assert!(
+                    ratio >= 3.0,
+                    "{appearance:?}: the map border reads {ratio:.2}:1 on {what}",
+                );
+            }
+            let on_land = wcag_contrast(colors.road, colors.land);
+            assert!(
+                on_land >= 3.0,
+                "{appearance:?}: a motorway reads {on_land:.2}:1 on the land",
+            );
+            let on_sea = wcag_contrast(colors.road, colors.ocean);
+            assert!(
+                on_sea >= 2.0,
+                "{appearance:?}: a motorway reads {on_sea:.2}:1 on the sea",
+            );
+            let minor = wcag_contrast(colors.road_minor, colors.land);
+            assert!(
+                minor >= 1.5,
+                "{appearance:?}: a primary road reads {minor:.2}:1 on the land",
+            );
+        }
+    }
+
     #[test]
     fn the_config_should_be_at_the_first_schema_version() {
         assert_eq!(
@@ -2854,77 +2555,6 @@ mod tests {
         assert!(projection.near_screen([-4.0, 200.0], 8.0));
         assert!(projection.segment_near([-40.0, 10.0], [10.0, 10.0], 0.0));
         assert!(!projection.segment_near([-40.0, 10.0], [-10.0, 10.0], 0.0));
-    }
-
-    /// The paths a canvas paints are in window coordinates, while the projection and the
-    /// labels are relative to the canvas box: a vertex that does not carry the box's corner
-    /// draws the whole map at the window's corner, under labels laid out somewhere else.
-    #[test]
-    fn the_painted_geometry_should_be_offset_by_the_canvas_box() {
-        let projection = Projection::new(
-            Camera {
-                center: model::project(56.0, 26.0),
-                zoom: 1.0,
-            },
-            [600.0, 400.0],
-        );
-        let origin = [41.0, 67.0];
-
-        let scene = scene::scene().expect("the checked-in asset parses");
-        let visible = projection.visible_mercator();
-        let cells = model::visible_cells(visible).grown();
-        let land = land_path(scene, projection, origin, cells, visible);
-        let [ax, ay, _, _, _, _] = *scene
-            .land
-            .visible(cells, visible)
-            .next()
-            .expect("the land covers the map box");
-        let expected = projection.screen([ax, ay]);
-        assert_close(
-            f32::from(land.vertices[0].xy_position.x),
-            origin[0] + expected[0],
-            "the land keeps the canvas box's x",
-        );
-        assert_close(
-            f32::from(land.vertices[0].xy_position.y),
-            origin[1] + expected[1],
-            "the land keeps the canvas box's y",
-        );
-
-        let centre = projection.screen(model::project(56.0, 26.0));
-        let vessel = Vessel {
-            mmsi: 7,
-            class: ShipClass::Tanker,
-            position: model::project(56.0, 26.0),
-            cog: 0,
-            heading: 0,
-            has_ship: true,
-        };
-        let ships = ship_paths(&[vessel], projection, origin);
-        let tip = ships.classes[0].vertices[0].xy_position;
-        assert_close(
-            f32::from(tip.x),
-            origin[0] + centre[0],
-            "the marker's tip keeps the canvas box's x",
-        );
-        assert_close(
-            f32::from(tip.y),
-            origin[1] + centre[1] - projection.marker_length() / 2.0,
-            "the marker points north from its hull inside the canvas box",
-        );
-
-        let ring = ring_path(centre, origin);
-        let first = ring.vertices[0].xy_position;
-        assert_close(
-            f32::from(first.x),
-            origin[0] + centre[0] + HOVER_RING_INNER,
-            "the ring keeps the canvas box's x",
-        );
-        assert_close(
-            f32::from(first.y),
-            origin[1] + centre[1],
-            "the ring keeps the canvas box's y",
-        );
     }
 
     /// A Mercator `y` grows north while a canvas `y` grows down, so the projection has to

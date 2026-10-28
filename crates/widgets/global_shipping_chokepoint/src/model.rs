@@ -37,6 +37,8 @@ use kytrix_service_provider::service::global_shipping_chokepoint::{
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::scene::Piece;
+
 /// The west edge of the map, in degrees east.
 pub(super) const MAP_WEST: f32 = 47.802;
 /// The east edge of the map, in degrees east.
@@ -50,6 +52,66 @@ pub(super) const MAP_NORTH: f32 = 29.542;
 pub(super) const GRID_COLS: u32 = 64;
 /// The culling grid's rows, south to north.
 pub(super) const GRID_ROWS: u32 = 32;
+
+/// The zooms the road detail switches at, as `[E_ALL, DE]`.
+///
+/// They are a visual-density choice rather than a performance boundary: the whole D+E
+/// network at twice the fitted zoom still costs a few milliseconds, but below these
+/// thresholds it is a haze of parallel lines rather than a road network.
+pub(super) const ROAD_LOD_ZOOM: [f32; 2] = [1.6, 2.8];
+
+/// The shortest road piece the fitted zoom keeps, in metres.
+///
+/// At the fitted zoom a pixel is about a kilometre, so a shorter piece is a smudge
+/// rather than a road. The length is the build's, measured after the cell cut.
+const ROAD_MIN_LENGTH_M: u32 = 1_000;
+
+/// The flag bit a road piece sets when the way is a primary road.
+///
+/// Bit 0 of the build's flags; a motorway or a trunk leaves it clear.
+pub(super) const ROAD_PRIMARY: u8 = 1 << 0;
+
+/// The flag bit a road piece sets when its way carries a `ref`.
+pub(super) const ROAD_REF: u8 = 1 << 1;
+
+/// How much of the road network one camera zoom draws.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RoadFilter {
+    /// Motorways and trunks that carry a `ref` and are at least a kilometre long.
+    EMin,
+    /// Every motorway and trunk.
+    EAll,
+    /// Every piece: motorways, trunks and primary roads.
+    De,
+}
+
+/// The filter a camera at `zoom` draws with.
+pub(super) fn road_filter(zoom: f32) -> RoadFilter {
+    if zoom < ROAD_LOD_ZOOM[0] {
+        RoadFilter::EMin
+    } else if zoom < ROAD_LOD_ZOOM[1] {
+        RoadFilter::EAll
+    } else {
+        RoadFilter::De
+    }
+}
+
+/// The path one road piece is drawn in under `filter`, or `None` when the filter drops it.
+///
+/// Path 0 holds motorways and trunks and path 1 the primary roads. Both flag bits are
+/// decoded here, and the filter and the painter's split are the same answer, so a piece
+/// cannot be drawn in a path the filter had already dropped.
+pub(super) fn road_path(filter: RoadFilter, piece: &Piece) -> Option<usize> {
+    if piece.flags & ROAD_PRIMARY != 0 {
+        return (filter == RoadFilter::De).then_some(1);
+    }
+    match filter {
+        RoadFilter::EMin => {
+            (piece.flags & ROAD_REF != 0 && piece.length_m >= ROAD_MIN_LENGTH_M).then_some(0)
+        }
+        RoadFilter::EAll | RoadFilter::De => Some(0),
+    }
+}
 
 /// The most vessels one picture holds.
 ///
@@ -2427,6 +2489,99 @@ mod tests {
                 31 * GRID_COLS + 63,
             ],
             "the asset's cell tables are keyed row-major",
+        );
+    }
+
+    /// A road piece with the given flags and length, for the filter tests.
+    fn road_piece(flags: u8, length_m: u32) -> Piece {
+        Piece {
+            start: 0,
+            len: 2,
+            flags,
+            length_m,
+        }
+    }
+
+    #[test]
+    fn the_road_filter_switches_at_the_two_thresholds() {
+        assert_eq!(ROAD_LOD_ZOOM, [1.6, 2.8]);
+
+        assert_eq!(road_filter(MIN_ZOOM), RoadFilter::EMin);
+        assert_eq!(road_filter(1.5), RoadFilter::EMin);
+        assert_eq!(road_filter(1.599_999), RoadFilter::EMin);
+        assert_eq!(
+            road_filter(ROAD_LOD_ZOOM[0]),
+            RoadFilter::EAll,
+            "the threshold itself belongs to the denser class",
+        );
+        assert_eq!(road_filter(2.0), RoadFilter::EAll);
+        assert_eq!(road_filter(2.799_999), RoadFilter::EAll);
+        assert_eq!(
+            road_filter(ROAD_LOD_ZOOM[1]),
+            RoadFilter::De,
+            "and the second one to the densest",
+        );
+        assert_eq!(road_filter(3.0), RoadFilter::De);
+        assert_eq!(road_filter(MAX_ZOOM), RoadFilter::De);
+    }
+
+    #[test]
+    fn each_road_filter_keeps_the_pieces_it_names() {
+        let motorway_with_ref = road_piece(ROAD_REF, 2_000);
+        let motorway_without_ref = road_piece(0, 2_000);
+        let short_motorway_with_ref = road_piece(ROAD_REF, ROAD_MIN_LENGTH_M - 1);
+        let primary_with_ref = road_piece(ROAD_PRIMARY | ROAD_REF, 5_000);
+        let primary_without_ref = road_piece(ROAD_PRIMARY, 0);
+
+        assert_eq!(road_path(RoadFilter::EMin, &motorway_with_ref), Some(0));
+        assert_eq!(
+            road_path(RoadFilter::EMin, &road_piece(ROAD_REF, ROAD_MIN_LENGTH_M)),
+            Some(0),
+            "a kilometre is long enough",
+        );
+        assert_eq!(
+            road_path(RoadFilter::EMin, &motorway_without_ref),
+            None,
+            "E_MIN keeps only the ways that carry a ref",
+        );
+        assert_eq!(
+            road_path(RoadFilter::EMin, &short_motorway_with_ref),
+            None,
+            "and only the pieces a kilometre long",
+        );
+        assert_eq!(
+            road_path(RoadFilter::EMin, &primary_with_ref),
+            None,
+            "E_MIN is class 0 only",
+        );
+
+        assert_eq!(road_path(RoadFilter::EAll, &motorway_with_ref), Some(0));
+        assert_eq!(
+            road_path(RoadFilter::EAll, &motorway_without_ref),
+            Some(0),
+            "E_ALL drops the ref and length tests",
+        );
+        assert_eq!(
+            road_path(RoadFilter::EAll, &short_motorway_with_ref),
+            Some(0)
+        );
+        assert_eq!(
+            road_path(RoadFilter::EAll, &primary_with_ref),
+            None,
+            "E_ALL is class 0 only",
+        );
+
+        assert_eq!(road_path(RoadFilter::De, &motorway_without_ref), Some(0));
+        assert_eq!(road_path(RoadFilter::De, &short_motorway_with_ref), Some(0));
+        assert_eq!(
+            road_path(RoadFilter::De, &primary_with_ref),
+            Some(1),
+            "D+E draws primary roads in the second path",
+        );
+        assert_eq!(
+            road_path(RoadFilter::De, &primary_without_ref),
+            Some(1),
+            "with neither a length nor a ref test",
         );
     }
 }
