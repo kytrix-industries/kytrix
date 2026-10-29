@@ -8,16 +8,16 @@
 //! and nothing is cached: a camera change is a different set of vertices, not a different
 //! picture.
 //!
-//! [`MapColors`] and [`Projection`] stay in the view, because the labels, the hover card
-//! and the hit test read the same palette and the same transform; this module is what turns
-//! them into the paths the canvas paints.
+//! [`MapColors`] stays in the view, because the labels, the hover card and the hit test
+//! read the same palette; this module is what turns the model's [`Projection`] into the
+//! paths the canvas paints.
 
 use gpui_kit::{Bounds, Hsla, Path, Pixels, Point, Window, point, px};
 
 use crate::{
-    model::{self, Camera, CellSpan, RoadFilter, TSS_LANES, Vessel},
+    model::{self, Camera, CellSpan, Projection, RoadFilter, TSS_LANES, Vessel},
     scene::{LineLayer, Piece, Scene},
-    view::{MapColors, Projection, class_index, viewport_of},
+    view::{MapColors, class_index, viewport_of},
 };
 
 /// How wide a marker is against its length.
@@ -45,13 +45,22 @@ const DASH_OFF: f32 = 6.0;
 const DASH_WIDTH: f32 = 1.5;
 
 /// How wide a land border is drawn, in pixels.
-const BORDER_WIDTH: f32 = 1.0;
+///
+/// The border is the one stroke drawn over both land and sea. At one pixel it vanished
+/// into the light land fill, so it carries one and a half pixels plus a colour that
+/// clears its floor on both fills by ten percent (see `roles.rs`).
+const BORDER_WIDTH: f32 = 1.6;
 
 /// How wide a motorway or trunk is drawn, in pixels.
 const ROAD_WIDTH: f32 = 1.2;
 
 /// How wide a primary road is drawn, in pixels.
 const ROAD_MINOR_WIDTH: f32 = 1.0;
+
+/// The marker length at the fitted zoom, and at the closest one, in pixels.
+const MARKER_LENGTH_NEAR: f32 = 10.0;
+/// The marker length at [`MAX_ZOOM`].
+const MARKER_LENGTH_FAR: f32 = 12.0;
 
 /// Draws one frame of the map: the ten paths of [`MapLayers`] in their stacking order,
 /// then the ring around the hovered vessel.
@@ -420,7 +429,11 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
     ];
     let mut unknown = Path::new(point(px(0.0), px(0.0)));
     let texture = point(0.0, 1.0);
-    let length = projection.marker_length();
+    // The marker grows from ten pixels at the fitted zoom to twelve at the closest one,
+    // so a hull stays visible while the sea around it gains detail.
+    let zoom =
+        ((projection.zoom - model::MIN_ZOOM) / (model::MAX_ZOOM - model::MIN_ZOOM)).clamp(0.0, 1.0);
+    let length = MARKER_LENGTH_NEAR + (MARKER_LENGTH_FAR - MARKER_LENGTH_NEAR) * zoom;
 
     for vessel in vessels {
         let position = projection.screen(vessel.position);
@@ -620,7 +633,7 @@ mod tests {
         );
         assert_close(
             f32::from(tip.y),
-            origin[1] + centre[1] - projection.marker_length() / 2.0,
+            origin[1] + centre[1] - MARKER_LENGTH_NEAR / 2.0,
             "the marker points north from its hull inside the canvas box",
         );
 
@@ -952,6 +965,12 @@ mod tests {
     /// plus 107 ns per triangle has to stay inside the 16.65 ms a 60 Hz frame has.
     const FRAME_TRIANGLE_BUDGET: usize = 75_000;
 
+    /// The worst frame the viewport and zoom sweep found, in triangles.
+    ///
+    /// Pinned so an asset or palette change that makes a view heavier has to be measured
+    /// again rather than absorbed silently into the budget.
+    const WORST_FRAME_TRIANGLES: usize = 57_707;
+
     /// The triangles the ten paths of one frame hold.
     fn layer_triangles(layers: &MapLayers) -> usize {
         let paths = [
@@ -1019,70 +1038,70 @@ mod tests {
             .collect()
     }
 
-    /// The picture has to fit a 60 Hz frame at every end of the camera: the whole map at
-    /// the fitted zoom, the densest view at the E_ALL threshold, and the busiest road view
-    /// at four times the fitted zoom.
+    /// The picture has to fit a 60 Hz frame in the worst view the camera can be left in.
     ///
     /// The totals are the triangles the frame really draws: every path of [`MapLayers`]
     /// plus the hover ring, with a full picture of [`MAX_VESSELS`] unknown vessels — the
     /// worst each vessel can cost. Nothing is set aside as an allowance.
+    ///
+    /// The fit covers the viewport, so 1× no longer shows the whole map and the old
+    /// "fitted zoom draws everything" case is not the busiest one. The sweep below covers
+    /// the user's 1.56:1 pane, a wide one and a tall one, at the fitted zoom and at every
+    /// zoom the road detail switches at, over the map's middle, Dubai and the strait —
+    /// the shots the design's budget was first measured on.
     #[test]
     fn the_visible_triangle_budget_is_under_the_frame_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
-        let viewport = [1_600.0, 866.0];
         let origin = [0.0, 0.0];
         let ring = ring_path([100.0, 100.0], origin);
-        let layers = |camera: Camera| {
-            let projection = Projection::new(camera, viewport);
-            map_layers(Some(scene), projection, origin, &a_full_picture(projection))
-        };
 
-        // The fitted camera shows the whole map, so nothing is culled.
-        let fitted_layers = layers(Camera::default());
+        let viewports = [
+            ("1.56", [1_404.0, 900.0]),
+            ("wide", [1_600.0, 866.0]),
+            ("tall", [900.0, 1_400.0]),
+        ];
+        let zooms = [
+            model::MIN_ZOOM,
+            model::ROAD_LOD_ZOOM[0],
+            model::ROAD_LOD_ZOOM[1],
+            MAX_ZOOM,
+        ];
+        let centres = [
+            ("the middle", Camera::default().center),
+            ("Dubai", model::project(55.30, 25.27)),
+            ("the strait", model::project(56.35, 26.30)),
+        ];
+
+        let mut worst = (0usize, "no view".to_string());
+        for (pane, viewport) in viewports {
+            for zoom in zooms {
+                for (place, center) in centres {
+                    let projection =
+                        Projection::new(Camera { center, zoom }.clamped(viewport), viewport);
+                    let layers =
+                        map_layers(Some(scene), projection, origin, &a_full_picture(projection));
+                    assert_eq!(
+                        layers.ships.unknown.vertices.len() / 3,
+                        MAX_VESSELS * ROUND_SEGMENTS,
+                        "the full picture is in frame, so the worst case is the one counted",
+                    );
+                    let triangles = frame_triangles(&layers, &ring);
+                    assert!(
+                        triangles <= FRAME_TRIANGLE_BUDGET,
+                        "{pane} pane at {zoom}× over {place} draws {triangles} triangles, over \
+                         the {FRAME_TRIANGLE_BUDGET} budget",
+                    );
+                    if triangles > worst.0 {
+                        worst = (triangles, format!("{pane} pane at {zoom}× over {place}"));
+                    }
+                }
+            }
+        }
+
         assert_eq!(
-            fitted_layers.ships.unknown.vertices.len() / 3,
-            MAX_VESSELS * ROUND_SEGMENTS,
-            "the full picture is in frame, so the worst case is the one counted",
-        );
-        let fitted = frame_triangles(&fitted_layers, &ring);
-        assert!(
-            fitted <= FRAME_TRIANGLE_BUDGET,
-            "the fitted zoom draws {fitted} triangles, over the {FRAME_TRIANGLE_BUDGET} budget",
-        );
-
-        // The densest view: the E_ALL threshold draws every motorway and trunk while the
-        // land is still mostly in frame. This is the maximum a sweep of the camera over
-        // the box at the LOD switches found.
-        let densest = frame_triangles(
-            &layers(
-                Camera {
-                    center: model::project(53.5, 25.3),
-                    zoom: model::ROAD_LOD_ZOOM[0],
-                }
-                .clamped(viewport),
-            ),
-            &ring,
-        );
-        assert!(
-            densest <= FRAME_TRIANGLE_BUDGET,
-            "the densest view draws {densest} triangles, over the {FRAME_TRIANGLE_BUDGET} budget",
-        );
-
-        // Four times the fitted zoom over Dubai: the busiest road view the map has.
-        let detailed = frame_triangles(
-            &layers(
-                Camera {
-                    center: model::project(55.30, 25.27),
-                    zoom: MAX_ZOOM,
-                }
-                .clamped(viewport),
-            ),
-            &ring,
-        );
-        assert!(
-            detailed <= FRAME_TRIANGLE_BUDGET,
-            "four times the fitted zoom over Dubai draws {detailed} triangles, over the \
-             {FRAME_TRIANGLE_BUDGET} budget",
+            worst.0, WORST_FRAME_TRIANGLES,
+            "the sweep's worst frame is {} triangles ({})",
+            worst.0, worst.1,
         );
     }
 

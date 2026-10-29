@@ -68,8 +68,8 @@ use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, CITY_LABELS, COUNTRY_LABELS, Camera, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, STALE_AFTER,
-        ShipClass, Vessel, VesselDetails, VesselStore, WATER_LABELS, colour_for,
+        self, Camera, LabelKind, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, Projection, STALE_AFTER,
+        ShipClass, Vessel, VesselDetails, VesselStore, colour_for, place_labels,
     },
     paint::paint_map,
     scene::{self, Scene, SceneError},
@@ -79,12 +79,6 @@ use crate::{
         GlobalShippingChokepointService, GlobalShippingChokepointSource,
     },
 };
-
-/// The zoom at which the cities are named.
-///
-/// At the fitted zoom the whole strait is on screen and twelve city names would be a
-/// haze over it; the countries and the two seas are what a reader needs then.
-const CITY_LABEL_ZOOM: f32 = 1.6;
 
 /// How much one wheel notch scales the camera.
 const WHEEL_ZOOM_STEP: f32 = 1.15;
@@ -96,10 +90,12 @@ const WHEEL_ZOOM_STEP: f32 = 1.15;
 /// slack is the difference between a badge that appears and one that never does.
 const STALE_TIMER_SLACK: Duration = Duration::from_millis(100);
 
-/// The marker length at the fitted zoom, and at the closest one, in pixels.
-const MARKER_LENGTH_NEAR: f32 = 10.0;
-/// The marker length at [`MAX_ZOOM`].
-const MARKER_LENGTH_FAR: f32 = 12.0;
+/// The width and height of the box each label is centred in, in pixels.
+///
+/// Wider than any name this map draws at the small size, and one line tall, so the text
+/// sits at the centre of the box and the box at the anchor.
+const LABEL_BOX_WIDTH: f32 = 240.0;
+const LABEL_BOX_HEIGHT: f32 = 20.0;
 
 /// How opaque a lane is drawn over the sea.
 const DASH_ALPHA: f32 = 0.55;
@@ -280,121 +276,6 @@ impl MapColors {
             muted: roles.fg.muted.hsla,
             warning: roles.status.warning.base.hsla,
         }
-    }
-}
-
-/// Where the map's Mercator points land in the canvas.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Projection {
-    /// The Mercator point drawn at the centre of the canvas.
-    center: [f32; 2],
-    /// The pixels one Mercator unit is drawn at.
-    scale: f32,
-    /// The canvas' size.
-    pub viewport: [f32; 2],
-    /// The camera's zoom, which is what the marker size is read from.
-    pub zoom: f32,
-}
-
-impl Projection {
-    pub(super) fn new(camera: Camera, viewport: [f32; 2]) -> Self {
-        Self {
-            center: camera.center,
-            scale: model::fit_px_per_merc(viewport) * camera.zoom,
-            viewport,
-            zoom: camera.zoom,
-        }
-    }
-
-    /// Whether the projection can draw anything at all.
-    ///
-    /// A pane laid out at zero size has no fit, and a marker drawn through a zero scale is
-    /// a degenerate triangle rather than a vessel.
-    pub(super) fn drawable(self) -> bool {
-        self.scale.is_finite()
-            && self.scale > 0.0
-            && self.viewport[0] > 0.0
-            && self.viewport[1] > 0.0
-    }
-
-    /// The canvas point one Mercator point is drawn at.
-    ///
-    /// A Mercator `y` grows north and a canvas `y` grows down, so the two run in opposite
-    /// directions: the centre is subtracted the other way round for `y`, which is what puts
-    /// the Arabian side under the Iranian one rather than over it.
-    pub(super) fn screen(self, mercator: [f32; 2]) -> [f32; 2] {
-        [
-            (mercator[0] - self.center[0]) * self.scale + self.viewport[0] / 2.0,
-            (self.center[1] - mercator[1]) * self.scale + self.viewport[1] / 2.0,
-        ]
-    }
-
-    /// The Mercator point drawn at one canvas point, which is what a zoom keeps fixed.
-    pub(super) fn mercator(self, canvas: [f32; 2]) -> [f32; 2] {
-        if !self.drawable() {
-            return self.center;
-        }
-        [
-            self.center[0] + (canvas[0] - self.viewport[0] / 2.0) / self.scale,
-            self.center[1] - (canvas[1] - self.viewport[1] / 2.0) / self.scale,
-        ]
-    }
-
-    /// The Mercator rectangle the canvas shows, as `[west, south, east, north]`.
-    ///
-    /// This is what the culling grid is read from: a layer indexes only the cells this
-    /// rectangle touches. Only meaningful for a drawable projection — a pane with no
-    /// size has no scale to divide by, and every painter checks [`Self::drawable`]
-    /// before it asks.
-    pub(super) fn visible_mercator(self) -> [f32; 4] {
-        let half = [
-            self.viewport[0] / (2.0 * self.scale),
-            self.viewport[1] / (2.0 * self.scale),
-        ];
-        [
-            self.center[0] - half[0],
-            self.center[1] - half[1],
-            self.center[0] + half[0],
-            self.center[1] + half[1],
-        ]
-    }
-
-    /// Whether a canvas point is inside the canvas.
-    fn on_screen(self, canvas: [f32; 2]) -> bool {
-        canvas[0] >= 0.0
-            && canvas[0] <= self.viewport[0]
-            && canvas[1] >= 0.0
-            && canvas[1] <= self.viewport[1]
-    }
-
-    /// Whether a canvas point is inside the canvas grown by `margin` on every side.
-    pub(super) fn near_screen(self, canvas: [f32; 2], margin: f32) -> bool {
-        canvas[0] >= -margin
-            && canvas[0] <= self.viewport[0] + margin
-            && canvas[1] >= -margin
-            && canvas[1] <= self.viewport[1] + margin
-    }
-
-    /// Whether the box one screen-space segment covers reaches the canvas.
-    ///
-    /// The endpoints of a segment are not enough: a lane's segment can leave the canvas on
-    /// both ends while crossing it.
-    pub(super) fn segment_near(self, start: [f32; 2], end: [f32; 2], margin: f32) -> bool {
-        let left = start[0].min(end[0]);
-        let right = start[0].max(end[0]);
-        let top = start[1].min(end[1]);
-        let bottom = start[1].max(end[1]);
-
-        right >= -margin
-            && left <= self.viewport[0] + margin
-            && bottom >= -margin
-            && top <= self.viewport[1] + margin
-    }
-
-    /// The length one vessel marker is drawn at, which grows with the camera.
-    pub(super) fn marker_length(self) -> f32 {
-        let fraction = ((self.zoom - MIN_ZOOM) / (MAX_ZOOM - MIN_ZOOM)).clamp(0.0, 1.0);
-        MARKER_LENGTH_NEAR + (MARKER_LENGTH_FAR - MARKER_LENGTH_NEAR) * fraction
     }
 }
 
@@ -902,85 +783,56 @@ impl GlobalShippingChokepointWidget {
         cx.notify();
     }
 
-    /// The map's labels: five countries, the cities once zoomed in, and two seas.
+    /// The map's labels: five countries, the cities, and two seas.
     ///
-    /// They are elements rather than glyphs drawn on the canvas: each one goes through the
-    /// catalogue, the platform's font fallback and the display's scale factor. A label
-    /// whose anchor is off screen is not built at all.
+    /// [`place_labels`] decides which anchors a frame draws and in what order, so the
+    /// crowded cities at the fitted zoom are decluttered the same way on every frame and
+    /// in every language.
+    ///
+    /// A label is positioned by its anchor, and GPUI lays an absolute child out by its
+    /// top-left corner with no transform to shift it by half its own size. Each label is
+    /// therefore a box of a fixed size that is centred on the anchor, with the text
+    /// centred inside it: the text's own box lands on the anchor rather than hanging
+    /// down-right of it, which is what the old corner-anchored labels did.
     ///
     /// The countries are drawn in the default foreground rather than the design's
     /// `fg.subtle`: subtle reads about 2:1 on the land, and these are the only words drawn
     /// straight on the fill, so they take the readable colour and clear 4.5:1 in both
     /// appearances (pinned by the test below).
     fn labels(&self, projection: Projection, colors: MapColors, cx: &App) -> Vec<AnyElement> {
-        let mut labels =
-            Vec::with_capacity(COUNTRY_LABELS.len() + CITY_LABELS.len() + WATER_LABELS.len());
-        for label in COUNTRY_LABELS {
-            let [x, y] = projection.screen(model::project(label.at[0], label.at[1]));
-            if !projection.on_screen([x, y]) {
-                continue;
-            }
-            labels.push(
+        place_labels(projection)
+            .into_iter()
+            .map(|label| {
+                let [x, y] = label.at;
+                let text = match label.kind {
+                    LabelKind::Country => div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.text)
+                        .child(SharedString::from(t!(cx, label.key).to_uppercase())),
+                    LabelKind::Water => div()
+                        .text_xs()
+                        .italic()
+                        .text_color(colors.muted)
+                        .child(t!(cx, label.key)),
+                    LabelKind::City => div()
+                        .text_xs()
+                        .text_color(colors.text)
+                        .child(t!(cx, label.key)),
+                };
                 div()
                     .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.text)
-                    .child(SharedString::from(t!(cx, label.key).to_uppercase()))
-                    .into_any_element(),
-            );
-        }
-        if projection.zoom >= CITY_LABEL_ZOOM {
-            for label in CITY_LABELS {
-                let [x, y] = projection.screen(model::project(label.at[0], label.at[1]));
-                if !projection.on_screen([x, y]) {
-                    continue;
-                }
-                labels.push(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .flex()
-                        .items_center()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(3.0))
-                                .rounded_full()
-                                .bg(colors.text),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(colors.text)
-                                .child(t!(cx, label.key)),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        for label in WATER_LABELS {
-            let [x, y] = projection.screen(model::project(label.at[0], label.at[1]));
-            if !projection.on_screen([x, y]) {
-                continue;
-            }
-            labels.push(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .text_xs()
-                    .italic()
-                    .text_color(colors.muted)
-                    .child(t!(cx, label.key))
-                    .into_any_element(),
-            );
-        }
-        labels
+                    .left(px(x - LABEL_BOX_WIDTH / 2.0))
+                    .top(px(y - LABEL_BOX_HEIGHT / 2.0))
+                    .w(px(LABEL_BOX_WIDTH))
+                    .h(px(LABEL_BOX_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(text)
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// The legend's line for the size of the picture.
@@ -1296,8 +1148,9 @@ impl Render for GlobalShippingChokepointWidget {
             .bounds
             .get()
             .map(|bounds| Projection::new(self.frame.camera.get(), viewport_of(bounds)));
-        let labels =
-            projection.map_or_else(Vec::new, |projection| self.labels(projection, colors, cx));
+        let labels = projection
+            .filter(|projection| projection.drawable())
+            .map_or_else(Vec::new, |projection| self.labels(projection, colors, cx));
         let legend = self.legend(colors, cx);
         let attribution = self.attribution(colors, cx);
         let stale = self
@@ -1408,7 +1261,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::HIT_RADIUS_PX,
+        model::{CITY_LABELS, COUNTRY_LABELS, HIT_RADIUS_PX, WATER_LABELS},
         service::{
             AisStreamError, AisStreamMessage, GlobalShippingChokepointEventSubscription,
             GlobalShippingChokepointSession,
@@ -2622,7 +2475,7 @@ mod tests {
             None,
         );
         assert_close(vessel.facing(), 90.0, "the marker faces its course");
-        assert!(projection.on_screen(at));
+        assert!(projection.near_screen(at, 0.0));
         assert!(projection.near_screen([-4.0, 200.0], 8.0));
         assert!(projection.segment_near([-40.0, 10.0], [10.0, 10.0], 0.0));
         assert!(!projection.segment_near([-40.0, 10.0], [-10.0, 10.0], 0.0));

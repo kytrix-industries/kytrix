@@ -675,34 +675,34 @@ mod tests {
     use super::*;
 
     /// The land's stored points, as the checked-in asset declares them.
-    const LAND_POINTS: u32 = 24_700;
+    const LAND_POINTS: u32 = 25_446;
     /// The land rings, as the checked-in asset declares them.
-    const LAND_PIECES: u32 = 844;
+    const LAND_PIECES: u32 = 854;
     /// The border points, as the checked-in asset declares them.
-    const BORDER_POINTS: u32 = 1_242;
+    const BORDER_POINTS: u32 = 1_320;
     /// The border pieces, as the checked-in asset declares them.
-    const BORDER_PIECES: u32 = 103;
+    const BORDER_PIECES: u32 = 120;
     /// The road points, as the checked-in asset declares them.
-    const ROAD_POINTS: u32 = 81_687;
+    const ROAD_POINTS: u32 = 87_790;
     /// The road pieces, as the checked-in asset declares them.
-    const ROAD_PIECES: u32 = 35_523;
+    const ROAD_PIECES: u32 = 38_025;
     /// The cells each line layer's table holds.
     const CELLS: u32 = GRID_COLS * GRID_ROWS;
 
     /// The triangles the land rings tessellate into at [`TESSELLATION_TOLERANCE`].
-    const LAND_TRIANGLES: usize = 22_158;
+    const LAND_TRIANGLES: usize = 22_876;
     /// The land triangles the culling grid can bucket by centroid.
-    const LAND_CELL_TRIANGLES: usize = 18_891;
+    const LAND_CELL_TRIANGLES: usize = 19_487;
     /// The land triangles too wide to bucket by centroid.
-    const LAND_WIDE_TRIANGLES: usize = 3_267;
-    /// The distinct ring points: 24,700 stored points less one closing point per ring.
-    const LAND_RING_POINTS: usize = 23_856;
+    const LAND_WIDE_TRIANGLES: usize = 3_389;
+    /// The distinct ring points: 25,446 stored points less one closing point per ring.
+    const LAND_RING_POINTS: usize = 24_592;
     /// The distinct points the triangles are built from.
     ///
     /// Two ring points are not in them: lyon skips a vertex that sits within the
     /// tessellation tolerance of the straight line between its neighbours, which both
     /// of them do (see `no_ring_point_is_merged_away_by_the_tessellator`).
-    const LAND_TRIANGLE_POINTS: usize = 23_854;
+    const LAND_TRIANGLE_POINTS: usize = 24_590;
     /// How many ring points the tessellator skipped for that reason.
     const LAND_SKIPPED_POINTS: usize = LAND_RING_POINTS - LAND_TRIANGLE_POINTS;
 
@@ -723,7 +723,7 @@ mod tests {
     /// The build's edges come from the decimal constants, not from the `f32` header:
     /// deriving them from the header's west edge would move the westmost column by
     /// 1.862e-6° and read as an overshoot twice as large as it is.
-    const GRID_BOX: [f64; 4] = [47.802, 21.943, 61.875, 29.542];
+    const GRID_BOX: [f64; 4] = [47.802, 21.443, 61.875, 30.042];
 
     /// One section a fixture asset is packed from.
     #[derive(Default)]
@@ -1056,17 +1056,17 @@ mod tests {
             lod(&roads.pieces, |piece| piece.flags & 1 == 0
                 && piece.flags & 2 != 0
                 && piece.length_m >= 1_000),
-            (4_814, 14_763, 19_898),
+            (5_148, 16_107, 21_918),
             "E_MIN: class 0, with a ref, at least 1 km",
         );
         assert_eq!(
             lod(&roads.pieces, |piece| piece.flags & 1 == 0),
-            (17_556, 41_037, 46_962),
+            (18_914, 44_560, 51_292),
             "E_ALL: class 0",
         );
         assert_eq!(
             lod(&roads.pieces, |_| true),
-            (35_523, 81_687, 92_328),
+            (38_025, 87_790, 99_530),
             "DE: every piece",
         );
     }
@@ -1849,12 +1849,18 @@ mod tests {
         // The asset's own cell table is the oracle for the row convention. The build cut
         // the rows in degrees, with row 0 at the south edge, so the runtime has to read
         // the row through `latitude_of` rather than off the Mercator `y`: the two axes
-        // differ by up to a quarter of a row, and reading the `y` would put 7,884 of
-        // these 35,626 pieces in the cell beside the one the build wrote.
+        // differ by up to a quarter of a row, and reading the `y` would put most of these
+        // pieces in the cell beside the one the build wrote.
         //
-        // Six road pieces have a centroid within 2e-6° of a grid line (cells 304, 427,
-        // 866 twice, 934 and 1,984). All six still land in the cell they were packed
-        // into, because the centroid is on the inside of the line.
+        // The centroid is recomputed here the way the build saw it (the mean of the f64
+        // degrees, then the projection the runtime reads back), and that round trip is
+        // only the identity to within `f32` noise. A piece the build clipped along a row
+        // line has a centroid a hair on one side of it — one road piece in cell 734 sits
+        // 5.3e-6 rows north of the row 10/11 line — and the noise can put it on the other
+        // side. Such a piece must still be read as one of the two rows the line joins,
+        // never as a cell further away.
+        const ROUND_TRIP_EPSILON_ROWS: f64 = 5e-5;
+
         let scene = scene().expect("the checked-in asset parses");
         let raw = raw_sections();
         let [west, _, east, _] = model::mercator_bounds();
@@ -1877,9 +1883,20 @@ mod tests {
                     let count = f64::from(piece.len);
                     let [x, y] =
                         model::project((longitude / count) as f32, (latitude / count) as f32);
-                    assert_eq!(
-                        row_of(y) * GRID_COLS + column_of(x, west, east),
-                        cell as u32,
+                    let row = row_of(y);
+                    let packed_row = cell as u32 / GRID_COLS;
+                    let row_is_the_packed_one_or_its_neighbour = if row == packed_row {
+                        true
+                    } else {
+                        let fraction = (latitude / count - f64::from(model::MAP_SOUTH))
+                            / f64::from(model::MAP_NORTH - model::MAP_SOUTH)
+                            * f64::from(GRID_ROWS);
+                        (fraction - fraction.round()).abs() <= ROUND_TRIP_EPSILON_ROWS
+                            && row.abs_diff(packed_row) == 1
+                    };
+                    assert!(
+                        row_is_the_packed_one_or_its_neighbour
+                            && column_of(x, west, east) == cell as u32 % GRID_COLS,
                         "{name} piece in cell {cell} is read as another cell",
                     );
                 }

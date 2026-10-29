@@ -45,8 +45,9 @@ sys.dont_write_bytecode = True
 
 import download_map  # noqa: E402  (after the bytecode switch above)
 
-#: The map box: the user's screenshot, in degrees east and north.
-WEST, SOUTH, EAST, NORTH = 47.802, 21.943, 61.875, 29.542
+#: The map box: the user's screenshot, extended half a degree north and south so
+#: a cover fit never leaves an ocean-coloured band above or below the viewport.
+WEST, SOUTH, EAST, NORTH = 47.802, 21.443, 61.875, 30.042
 
 #: The asset grid. Cell `row * GRID_COLS + col`, column 0 at the west edge and
 #: row 0 at the south edge.

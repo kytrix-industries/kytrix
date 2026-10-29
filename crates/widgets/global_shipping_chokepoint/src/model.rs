@@ -44,9 +44,13 @@ pub(super) const MAP_WEST: f32 = 47.802;
 /// The east edge of the map, in degrees east.
 pub(super) const MAP_EAST: f32 = 61.875;
 /// The south edge of the map, in degrees north.
-pub(super) const MAP_SOUTH: f32 = 21.943;
+///
+/// Half a degree below the screenshot's box: the fitted scale covers the viewport
+/// rather than fitting inside it, so a pane wider than the map's own aspect crops
+/// the top and bottom instead of showing an ocean-coloured band there.
+pub(super) const MAP_SOUTH: f32 = 21.443;
 /// The north edge of the map, in degrees north.
-pub(super) const MAP_NORTH: f32 = 29.542;
+pub(super) const MAP_NORTH: f32 = 30.042;
 
 /// The culling grid's columns, west to east.
 pub(super) const GRID_COLS: u32 = 64;
@@ -120,7 +124,7 @@ pub(super) fn road_path(filter: RoadFilter, piece: &Piece) -> Option<usize> {
 /// would accumulate a set the service no longer holds.
 pub(super) const MAX_VESSELS: usize = 1_000;
 
-/// The furthest out the camera goes: the whole map fitted to the viewport.
+/// The furthest out the camera goes: the fitted scale, which covers the viewport.
 pub(super) const MIN_ZOOM: f32 = 1.0;
 /// The furthest in the camera goes.
 pub(super) const MAX_ZOOM: f32 = 4.0;
@@ -296,8 +300,12 @@ pub(super) fn latitude_of(mercator_y: f32) -> f32 {
     (2.0 * mercator_y.exp().atan() - std::f32::consts::FRAC_PI_2).to_degrees()
 }
 
-/// The pixels one Mercator unit is drawn at when the whole map is fitted.
+/// The pixels one Mercator unit is drawn at when the map is fitted to the viewport.
 ///
+/// The fit **covers** the viewport: the larger of the two axis ratios, so the map
+/// always fills the pane and the axis it is proportionally longer than is cropped.
+/// A `contain` fit (the smaller ratio) left an ocean-coloured band above and below on
+/// a pane wider than the map's aspect, which is the defect this replaced.
 /// The camera's scale is this times [`Camera::zoom`]. A viewport with no area — a
 /// pane laid out at zero size, before its first frame — has no fit at all and reads
 /// as zero, which the camera treats as the degenerate viewport it is.
@@ -308,7 +316,7 @@ pub(super) fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
     }
 
     let [west, south, east, north] = mercator_bounds();
-    (width / (east - west)).min(height / (north - south))
+    (width / (east - west)).max(height / (north - south))
 }
 
 /// The grid cells a viewport touches, as inclusive column and row indices.
@@ -449,11 +457,14 @@ impl Default for Camera {
 impl Camera {
     /// The camera kept on the map for a viewport of `viewport` pixels.
     ///
-    /// An axis the map is narrower than is centred on the map rather than left free
-    /// to drag into empty space; an axis the map fills is clamped so the map's edge
-    /// never comes inside the viewport. A viewport with no fit at all (see
-    /// [`fit_px_per_merc`]) centres the whole map. Zoom is clamped here because it is
-    /// the one field a scroll wheel writes.
+    /// The fit covers the viewport (see [`fit_px_per_merc`]), so at every zoom the
+    /// map is at least as large as the pane on both axes: the centre is clamped to
+    /// keep the map's edge outside the viewport, and a drag can never expose the
+    /// canvas colour behind the sea. An axis whose half-extent does not fit (only
+    /// reachable when the pane's aspect matches the map's, so both edges coincide)
+    /// centres the map instead of clamping a degenerate interval. A viewport with no
+    /// fit at all centres the whole map. Zoom is clamped here because it is the one
+    /// field a scroll wheel writes.
     pub fn clamped(self, viewport: [f32; 2]) -> Self {
         let zoom = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         let scale = fit_px_per_merc(viewport) * zoom;
@@ -483,7 +494,12 @@ fn map_centre() -> [f32; 2] {
     [(west + east) / 2.0, (south + north) / 2.0]
 }
 
-/// One axis of [`Camera::clamped`]: centred when the map is narrower than the view.
+/// One axis of [`Camera::clamped`]: clamped so the map covers the viewport.
+///
+/// `half` is the visible half-extent in Mercator units. A cover fit keeps
+/// `low + half <= high - half` on both axes; the equality case (a pane whose aspect
+/// exactly matches the map's, possibly off by one rounding step) has no interval to
+/// clamp into, so it reads as the map's centre rather than as an inverted `f32::clamp`.
 fn clamp_center(center: f32, half: f32, low: f32, high: f32) -> f32 {
     let (low_edge, high_edge) = (low + half, high - half);
     if low_edge >= high_edge {
@@ -491,6 +507,206 @@ fn clamp_center(center: f32, half: f32, low: f32, high: f32) -> f32 {
     } else {
         center.clamp(low_edge, high_edge)
     }
+}
+
+/// Where the map's Mercator points land in the canvas.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Projection {
+    /// The Mercator point drawn at the centre of the canvas.
+    center: [f32; 2],
+    /// The pixels one Mercator unit is drawn at.
+    scale: f32,
+    /// The canvas' size.
+    pub viewport: [f32; 2],
+    /// The camera's zoom, which is what the road detail and the marker size read.
+    pub zoom: f32,
+}
+
+impl Projection {
+    /// The projection a camera lays over a canvas of `viewport` pixels.
+    pub(super) fn new(camera: Camera, viewport: [f32; 2]) -> Self {
+        Self {
+            center: camera.center,
+            scale: fit_px_per_merc(viewport) * camera.zoom,
+            viewport,
+            zoom: camera.zoom,
+        }
+    }
+
+    /// Whether the projection can draw anything at all.
+    ///
+    /// A pane laid out at zero size has no fit, and a marker drawn through a zero scale is
+    /// a degenerate triangle rather than a vessel.
+    pub(super) fn drawable(self) -> bool {
+        self.scale.is_finite()
+            && self.scale > 0.0
+            && self.viewport[0] > 0.0
+            && self.viewport[1] > 0.0
+    }
+
+    /// The canvas point one Mercator point is drawn at.
+    ///
+    /// A Mercator `y` grows north and a canvas `y` grows down, so the two run in opposite
+    /// directions: the centre is subtracted the other way round for `y`, which is what puts
+    /// the Arabian side under the Iranian one rather than over it.
+    pub(super) fn screen(self, mercator: [f32; 2]) -> [f32; 2] {
+        [
+            (mercator[0] - self.center[0]) * self.scale + self.viewport[0] / 2.0,
+            (self.center[1] - mercator[1]) * self.scale + self.viewport[1] / 2.0,
+        ]
+    }
+
+    /// The Mercator point drawn at one canvas point, which is what a zoom keeps fixed.
+    pub(super) fn mercator(self, canvas: [f32; 2]) -> [f32; 2] {
+        if !self.drawable() {
+            return self.center;
+        }
+        [
+            self.center[0] + (canvas[0] - self.viewport[0] / 2.0) / self.scale,
+            self.center[1] - (canvas[1] - self.viewport[1] / 2.0) / self.scale,
+        ]
+    }
+
+    /// The Mercator rectangle the canvas shows, as `[west, south, east, north]`.
+    ///
+    /// This is what the culling grid is read from: a layer indexes only the cells this
+    /// rectangle touches. Only meaningful for a drawable projection — a pane with no
+    /// size has no scale to divide by, and every painter checks [`Self::drawable`]
+    /// before it asks.
+    pub(super) fn visible_mercator(self) -> [f32; 4] {
+        let half = [
+            self.viewport[0] / (2.0 * self.scale),
+            self.viewport[1] / (2.0 * self.scale),
+        ];
+        [
+            self.center[0] - half[0],
+            self.center[1] - half[1],
+            self.center[0] + half[0],
+            self.center[1] + half[1],
+        ]
+    }
+
+    /// Whether a canvas point is inside the canvas grown by `margin` on every side.
+    pub(super) fn near_screen(self, canvas: [f32; 2], margin: f32) -> bool {
+        canvas[0] >= -margin
+            && canvas[0] <= self.viewport[0] + margin
+            && canvas[1] >= -margin
+            && canvas[1] <= self.viewport[1] + margin
+    }
+
+    /// Whether the box one screen-space segment covers reaches the canvas.
+    ///
+    /// The endpoints of a segment are not enough: a lane's segment can leave the canvas on
+    /// both ends while crossing it.
+    pub(super) fn segment_near(self, start: [f32; 2], end: [f32; 2], margin: f32) -> bool {
+        let left = start[0].min(end[0]);
+        let right = start[0].max(end[0]);
+        let top = start[1].min(end[1]);
+        let bottom = start[1].max(end[1]);
+
+        right >= -margin
+            && left <= self.viewport[0] + margin
+            && bottom >= -margin
+            && top <= self.viewport[1] + margin
+    }
+}
+
+/// The label layers, in the order the map places them when two anchors collide.
+///
+/// Countries and seas are large areas the reader orients by; a city is a point inside
+/// them. That order is also the priority: a city name never displaces a country or a sea
+/// name, and every list keeps its authored order, so the same camera always places the
+/// same labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LabelKind {
+    /// A country name, drawn upper case over the land.
+    Country,
+    /// A body of water's name, drawn italic over the sea.
+    Water,
+    /// A city name, drawn at its anchor.
+    City,
+}
+
+/// One label as the frame places it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PlacedLabel {
+    /// Which layer the label belongs to.
+    pub kind: LabelKind,
+    /// The catalogue key the name is read from.
+    pub key: &'static str,
+    /// The canvas point the text is centred on.
+    pub at: [f32; 2],
+}
+
+/// The zoom the cities are named from: the fitted zoom itself.
+///
+/// A city is a point, so its name is only worth drawing once the map is at least as
+/// detailed as the fitted view; lowering this from 1.6 to the fit is what shows the
+/// strait's cities at 1×. The declutter rule below keeps them from piling up there.
+pub(super) const CITY_LABEL_ZOOM: f32 = MIN_ZOOM;
+
+/// How close two placed anchors may sit before the later label is dropped, in pixels.
+///
+/// The cities around the strait are the crowded case: at the fitted zoom their anchors are
+/// a few dozen pixels apart while their centred names are up to a hundred pixels wide, so
+/// drawing every one of them would print a single unreadable pile. The rule is
+/// anchor-to-anchor rather than text-to-text because the names come from the catalogue and
+/// change with the language: a fixed screen distance is deterministic and
+/// language-independent, and at this distance no two names this map draws overlap (the
+/// test below measures the boxes on the 1× view).
+pub(super) const LABEL_MIN_SEPARATION_PX: f32 = 72.0;
+
+/// How far inside the canvas a label's anchor has to sit for the name to fit, in pixels.
+///
+/// A label is centred on its anchor, so half of it hangs to each side: an anchor nearer the
+/// canvas edge than half the name's width would have that half cut off by the pane. The
+/// widest name this map draws is `UNITED ARAB EMIRATES`, 141 px at the small size in the
+/// longer of the two shipped locales (`en`); half of it, rounded up, is this margin. A
+/// label that cannot fit is not drawn — a name cut in half at the pane's edge reads as a
+/// defect, while a name that appears when the map is panned away from the edge does not.
+pub(super) const LABEL_EDGE_MARGIN_PX: f32 = 80.0;
+
+/// The labels one frame draws, in priority order.
+///
+/// A label whose anchor is too close to the canvas edge for its name to fit (see
+/// [`LABEL_EDGE_MARGIN_PX`]) is not built at all, and one whose anchor is closer than
+/// [`LABEL_MIN_SEPARATION_PX`] to a label already placed is skipped: the first of a crowded
+/// pair is the higher-priority one, because the layers are visited in that order.
+pub(super) fn place_labels(projection: Projection) -> Vec<PlacedLabel> {
+    let mut placed: Vec<PlacedLabel> =
+        Vec::with_capacity(COUNTRY_LABELS.len() + WATER_LABELS.len() + CITY_LABELS.len());
+    for (kind, labels) in [
+        (LabelKind::Country, &COUNTRY_LABELS[..]),
+        (LabelKind::Water, &WATER_LABELS[..]),
+        (LabelKind::City, &CITY_LABELS[..]),
+    ] {
+        if kind == LabelKind::City && projection.zoom < CITY_LABEL_ZOOM {
+            continue;
+        }
+        for label in labels {
+            let at = projection.screen(project(label.at[0], label.at[1]));
+            let [width, height] = projection.viewport;
+            if at[0] < LABEL_EDGE_MARGIN_PX
+                || at[0] > width - LABEL_EDGE_MARGIN_PX
+                || at[1] < LABEL_EDGE_MARGIN_PX
+                || at[1] > height - LABEL_EDGE_MARGIN_PX
+            {
+                continue;
+            }
+            let crowded = placed.iter().any(|other| {
+                let [dx, dy] = [other.at[0] - at[0], other.at[1] - at[1]];
+                dx * dx + dy * dy < LABEL_MIN_SEPARATION_PX * LABEL_MIN_SEPARATION_PX
+            });
+            if !crowded {
+                placed.push(PlacedLabel {
+                    kind,
+                    key: label.key,
+                    at,
+                });
+            }
+        }
+    }
+    placed
 }
 
 /// The four buckets vessels are drawn in.
@@ -1459,31 +1675,58 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_should_centre_an_axis_the_map_cannot_fill() {
-        // A portrait viewport: the map's height is narrower than the visible height,
-        // so that axis is centred while the width is still clamped.
-        let viewport = [400.0, 1_200.0];
-        let zoom = 2.0;
+    fn a_camera_should_keep_the_map_over_the_viewport_on_every_edge() {
+        // The fit covers the pane, so a drag can never pull an edge of the map inside
+        // it and show the canvas colour behind the sea. Checked on a wide, a portrait
+        // and a square-ish pane: the cover fit picks a different axis on each.
         let bounds = mercator_bounds();
-        let scale = fit_px_per_merc(viewport) * zoom;
-        let half_width = viewport[0] / (2.0 * scale);
+        for viewport in [[800.0, 600.0], [400.0, 1_200.0], [1_600.0, 866.0]] {
+            let zoom = 2.0;
+            let scale = fit_px_per_merc(viewport) * zoom;
+            let half = [viewport[0] / (2.0 * scale), viewport[1] / (2.0 * scale)];
+            assert!(
+                half[0] * 2.0 <= bounds[2] - bounds[0] + 1e-6
+                    && half[1] * 2.0 <= bounds[3] - bounds[1] + 1e-6,
+                "a fitted {viewport:?} pane is never larger than the map on either axis",
+            );
 
-        let camera = Camera {
-            center: [bounds[0] + half_width, bounds[1] - 100.0],
-            zoom,
+            for center in [
+                [bounds[0] - 5.0, bounds[1] - 5.0],
+                [bounds[2] + 5.0, bounds[3] + 5.0],
+                [bounds[0] + 0.1, bounds[3] - 0.1],
+                [bounds[2] - 0.1, bounds[1] + 0.1],
+            ] {
+                let camera = Camera { center, zoom }.clamped(viewport);
+                let visible_west = camera.center[0] - half[0];
+                let visible_east = camera.center[0] + half[0];
+                let visible_south = camera.center[1] - half[1];
+                let visible_north = camera.center[1] + half[1];
+
+                assert!(
+                    visible_west >= bounds[0] - 1e-6 && visible_east <= bounds[2] + 1e-6,
+                    "{viewport:?} from {center:?} shows {visible_west}..{visible_east} \
+                     horizontally, outside {}..{}",
+                    bounds[0],
+                    bounds[2],
+                );
+                assert!(
+                    visible_south >= bounds[1] - 1e-6 && visible_north <= bounds[3] + 1e-6,
+                    "{viewport:?} from {center:?} shows {visible_south}..{visible_north} \
+                     vertically, outside {}..{}",
+                    bounds[1],
+                    bounds[3],
+                );
+            }
+
+            // And the extreme drag lands exactly on the map's edge, not past it.
+            let dragged = Camera {
+                center: [bounds[0] - 5.0, bounds[1] - 5.0],
+                zoom,
+            }
+            .clamped(viewport);
+            assert_close(dragged.center[0], bounds[0] + half[0], "the west edge");
+            assert_close(dragged.center[1], bounds[1] + half[1], "the south edge");
         }
-        .clamped(viewport);
-
-        assert_close(
-            camera.center[0],
-            bounds[0] + half_width,
-            "the width is still clamped",
-        );
-        assert_close(
-            camera.center[1],
-            map_centre()[1],
-            "the height is centred on the map",
-        );
     }
 
     #[test]
@@ -1518,7 +1761,10 @@ mod tests {
             zoom: 0.5,
         }
         .clamped(viewport);
-        assert_eq!(too_far_out.zoom, MIN_ZOOM, "nor closer than the whole map");
+        assert_eq!(
+            too_far_out.zoom, MIN_ZOOM,
+            "nor closer than the fitted view that covers the pane"
+        );
     }
 
     #[test]
@@ -2162,6 +2408,142 @@ mod tests {
     }
 
     #[test]
+    fn the_fitted_zoom_names_the_cities_without_printing_them_over_each_other() {
+        // The pane the labels were reported on: the user's 1.56:1 viewport at the fitted
+        // zoom, where the strait's seven cities sit a few dozen pixels apart.
+        let viewport = [1_404.0, 900.0];
+        let projection = Projection::new(Camera::default(), viewport);
+        let distance = |left: [f32; 2], right: [f32; 2]| {
+            ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2)).sqrt()
+        };
+        let placed = place_labels(projection);
+        let keys: Vec<&str> = placed.iter().map(|label| label.key).collect();
+        assert_eq!(
+            placed,
+            place_labels(projection),
+            "the order is deterministic"
+        );
+
+        // Every label that is in its zoom band and has room for its name but not placed was
+        // skipped by a *higher-priority* label within the minimum distance. Countries and
+        // seas are never dropped for crowding: nothing on this map sits that close.
+        //
+        // The labels nearer the canvas edge than [`LABEL_EDGE_MARGIN_PX`] are skipped too,
+        // and are the one exception: their centred name would be cut by the pane.
+        let [width, height] = viewport;
+        let fits = |at: [f32; 2]| {
+            at[0] >= LABEL_EDGE_MARGIN_PX
+                && at[0] <= width - LABEL_EDGE_MARGIN_PX
+                && at[1] >= LABEL_EDGE_MARGIN_PX
+                && at[1] <= height - LABEL_EDGE_MARGIN_PX
+        };
+        let candidates: Vec<(LabelKind, &'static str, [f32; 2])> = [
+            (LabelKind::Country, &COUNTRY_LABELS[..]),
+            (LabelKind::Water, &WATER_LABELS[..]),
+            (LabelKind::City, &CITY_LABELS[..]),
+        ]
+        .into_iter()
+        .flat_map(|(kind, labels)| {
+            labels.iter().map(move |label| {
+                (
+                    kind,
+                    label.key,
+                    projection.screen(project(label.at[0], label.at[1])),
+                )
+            })
+        })
+        .collect();
+        for (index, (kind, key, at)) in candidates.iter().enumerate() {
+            if !fits(*at) || (*kind == LabelKind::City && projection.zoom < CITY_LABEL_ZOOM) {
+                continue;
+            }
+            if keys.contains(key) {
+                continue;
+            }
+            let crowded = candidates[..index].iter().any(|(_, earlier, earlier_at)| {
+                keys.contains(earlier) && distance(*earlier_at, *at) < LABEL_MIN_SEPARATION_PX
+            });
+            assert!(
+                crowded,
+                "{key} was skipped without a higher-priority label near its anchor",
+            );
+        }
+
+        // A conservative box around each anchor: wider than twice the widest city name
+        // at the small text size, and one line tall. No two placed labels may overlap it.
+        const HALF_WIDTH: f32 = 90.0;
+        const HALF_HEIGHT: f32 = 10.0;
+        for (index, label) in placed.iter().enumerate() {
+            for other in &placed[..index] {
+                assert!(
+                    (other.at[0] - label.at[0]).abs() >= 2.0 * HALF_WIDTH
+                        || (other.at[1] - label.at[1]).abs() >= 2.0 * HALF_HEIGHT,
+                    "{} and {} would print over each other",
+                    other.key,
+                    label.key,
+                );
+            }
+        }
+
+        // The two names the crowded strait drops, and the larger zoom that restores them:
+        // Qeshm sits inside Bandar Abbas's name, Ras al Khaimah inside Khasab's.
+        let bandar_abbas = "widget.global_shipping_chokepoint.label.city.bandar_abbas";
+        let qeshm = "widget.global_shipping_chokepoint.label.city.qeshm";
+        let khasab = "widget.global_shipping_chokepoint.label.city.khasab";
+        let ras_al_khaimah = "widget.global_shipping_chokepoint.label.city.ras_al_khaimah";
+        assert!(keys.contains(&bandar_abbas) && keys.contains(&khasab));
+        assert!(!keys.contains(&qeshm), "Qeshm is inside Bandar Abbas");
+        assert!(
+            !keys.contains(&ras_al_khaimah),
+            "Ras al Khaimah is inside Khasab"
+        );
+
+        let zoomed = place_labels(Projection::new(
+            Camera {
+                center: map_centre(),
+                zoom: 2.0,
+            },
+            viewport,
+        ));
+        let zoomed_keys: Vec<&str> = zoomed.iter().map(|label| label.key).collect();
+        assert!(
+            zoomed_keys.contains(&qeshm) && zoomed_keys.contains(&ras_al_khaimah),
+            "twice the fitted zoom separates the crowded cities",
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_drops_the_labels_it_cannot_fit_rather_than_cutting_them() {
+        // A 320 px column is the narrowest pane a widget is laid out in. A label is
+        // centred on its anchor, so one whose anchor is nearer the edge than half its name
+        // is dropped instead of printed in halves — Qatar's and the Gulf of Oman's are the
+        // two that would be cut at this width, and they are the two that go.
+        let viewport = [320.0, 400.0];
+        let placed = place_labels(Projection::new(Camera::default(), viewport));
+        assert!(!placed.is_empty(), "the pane still names what it can");
+        for label in &placed {
+            assert!(
+                label.at[0] >= LABEL_EDGE_MARGIN_PX
+                    && label.at[0] <= viewport[0] - LABEL_EDGE_MARGIN_PX
+                    && label.at[1] >= LABEL_EDGE_MARGIN_PX
+                    && label.at[1] <= viewport[1] - LABEL_EDGE_MARGIN_PX,
+                "{} sits {} px from the edge of a {viewport:?} pane, where half its name \
+                 would be cut",
+                label.key,
+                label.at[0].min(viewport[0] - label.at[0]),
+            );
+        }
+        let keys: Vec<&str> = placed.iter().map(|label| label.key).collect();
+        assert!(!keys.contains(&"widget.global_shipping_chokepoint.label.country.qatar"));
+        assert!(!keys.contains(&"widget.global_shipping_chokepoint.label.water.gulf_of_oman"));
+
+        // The same anchors on the user's pane are all far enough inside it, so the rule
+        // costs the fitted view nothing.
+        let wide = place_labels(Projection::new(Camera::default(), [1_404.0, 900.0]));
+        assert_eq!(wide.len(), 17, "ten cities, five countries and two seas");
+    }
+
+    #[test]
     fn a_marker_should_face_its_course_and_fall_back_to_its_heading() {
         let mut vessel = Vessel {
             mmsi: 1,
@@ -2216,19 +2598,29 @@ mod tests {
     }
 
     #[test]
-    fn the_visible_cells_cover_the_whole_map_at_the_fitted_zoom() {
-        // The fitted camera shows the whole map: one axis exactly, the other with
-        // margin to spare. Both are clamped to the grid, so the span is every cell.
-        for viewport in [[1_600.0, 866.0], [866.0, 1_600.0], [800.0, 600.0]] {
-            assert_eq!(
-                visible_cells(visible_rect(viewport, MIN_ZOOM)),
-                whole_grid(),
-                "a fitted {viewport:?} viewport must cull nothing",
-            );
-        }
+    fn the_fitted_camera_covers_the_viewport_and_crops_one_axis() {
+        // The fit covers rather than contains: at 1× one axis shows exactly the map's
+        // span and the other is cropped, so no pane ever sees a band of ocean colour
+        // where the map ended. Which axis depends on the pane's aspect against the
+        // map's (about 1.48 here).
+        let [west, south, east, north] = mercator_bounds();
+        let wide = visible_rect([1_600.0, 866.0], MIN_ZOOM);
+        assert_close(wide[0], west, "a wide pane shows the west edge exactly");
+        assert_close(wide[2], east, "and the east edge exactly");
+        assert!(
+            wide[1] > south && wide[3] < north,
+            "a wide pane crops the rows: {wide:?} inside {south}..{north}",
+        );
+
+        let tall = visible_rect([866.0, 1_600.0], MIN_ZOOM);
+        assert_close(tall[1], south, "a tall pane shows the south edge exactly");
+        assert_close(tall[3], north, "and the north edge exactly");
+        assert!(
+            tall[0] > west && tall[2] < east,
+            "a tall pane crops the columns: {tall:?} inside {west}..{east}",
+        );
 
         // A viewport wider than the map on both axes does not invent cells either.
-        let [west, south, east, north] = mercator_bounds();
         let margin = (east - west) / 4.0;
         assert_eq!(
             visible_cells([west - margin, south - margin, east + margin, north + margin,]),
@@ -2239,8 +2631,9 @@ mod tests {
     #[test]
     fn the_visible_cells_are_roughly_a_thirteenth_to_a_sixteenth_at_four_times() {
         // The design measures the culling win on a 1,600×866 pane at four times the
-        // fitted zoom. The map's Mercator aspect is about 1.67, so the viewport is
-        // wider than it is tall and the height is what the fit is read from.
+        // fitted zoom. The map's Mercator aspect is about 1.47, so the viewport is wider
+        // than the map and the cover fit reads its scale from the width; the height is
+        // what gets cropped at 1×, and at 4× the visible grid is about 16 columns × 7 rows.
         let span = visible_cells(visible_rect([1_600.0, 866.0], MAX_ZOOM));
         let columns = span.col_end - span.col_start + 1;
         let rows = span.row_end - span.row_start + 1;

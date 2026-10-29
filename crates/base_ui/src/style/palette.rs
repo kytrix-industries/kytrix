@@ -191,19 +191,24 @@ impl Palette {
                 Oklch::new(0.540, 0.130, 120.0, opacity),
                 Oklch::new(0.500, 0.010, 0.0, opacity),
             ],
-            // A chart's sea is the content face with the water's blue barely in it, because the
-            // ships on it are the chart's series and those are held to their contrast on that
-            // face; the shore is buff, the color a paper chart gives land, and it is the one
-            // pair on a map that has to read as a coastline, so it carries the 1.5:1 of §10.
-            map_ocean: Oklch::new(0.938, 0.028, 235.0, opacity),
-            map_land: Oklch::new(0.800, 0.045, 85.0, opacity),
-            // The three strokes laid over those fills, authored at the colors the map was first
-            // drawn with so the two appearances read as they did. Each carries the floor §10
-            // gives it: a border 3:1 on both fills, a motorway 3:1 on the land and 2:1 over the
-            // water it bridges, and a primary road 1.5:1 on the land it is mostly on.
-            map_border: Oklch::new(0.465, 0.020, 278.0, opacity),
-            map_road: Oklch::new(0.490, 0.010, 0.0, opacity),
-            map_road_minor: Oklch::new(0.648, 0.013, 278.0, opacity),
+            // The map follows the OSM Carto transport layer's palette: the paper land and
+            // the water blue are its two fills. The sea is deepened from OSM's #aad3df to
+            // keep the coastline at the 1.5:1 of §10 (the literal pair reads 1.40:1). A
+            // paper-white land cannot also clear a step from the chart face — it reads
+            // 1.02:1 there — so the sea is the fill held against `surface.sunken`; see the
+            // entry in `roles.rs` for what that leaves uncovered at the pane's edges.
+            map_ocean: Oklch::new(0.786, 0.046, 217.5, opacity),
+            map_land: Oklch::new(0.953, 0.009, 84.6, opacity),
+            // The three strokes are the transport layer's own colours, darkened until each
+            // clears §10's floor with the margin its thin line needs: the border is the
+            // admin purple #a875c9 darkened on the way toward its casing (it must read
+            // 3:1 on both fills, and a mid-tone purple does not on the sea), the motorway
+            // is #e892a2 taken most of the way to its casing #dc2a67, and a primary road is
+            // #fcd6a4 taken toward #a06b00. All three stay opaque, and every floor is
+            // cleared by at least ten percent (pinned in `roles.rs`).
+            map_border: Oklch::new(0.479, 0.130, 311.0, opacity),
+            map_road: Oklch::new(0.562, 0.150, 7.5, opacity),
+            map_road_minor: Oklch::new(0.752, 0.100, 74.5, opacity),
             on_brand: Oklch::new(0.978, 0.0, 0.0, opacity),
             on_inverse: Oklch::new(0.978, 0.0, 0.0, opacity),
             scrim_alpha: 0.42,
@@ -262,16 +267,18 @@ impl Palette {
                 Oklch::new(0.700, 0.140, 120.0, opacity),
                 Oklch::new(0.660, 0.010, 0.0, opacity),
             ],
-            // The night chart: the sea is the content face's blue lifted a little, and the land is
-            // a dark sand above it — the same coastline floor as the light appearance, with the
-            // sea kept near the face the chart series were checked on.
-            map_ocean: Oklch::new(0.200, 0.032, 245.0, opacity),
-            map_land: Oklch::new(0.350, 0.024, 85.0, opacity),
-            // The same three strokes on the night chart, lifted with the page: a stroke left at
-            // the light appearance's value would be the one thing on the map that went missing.
-            map_border: Oklch::new(0.635, 0.014, 253.6, opacity),
-            map_road: Oklch::new(0.660, 0.010, 0.0, opacity),
-            map_road_minor: Oklch::new(0.548, 0.014, 253.4, opacity),
+            // The night transport map: the same two OSM hues at dark lightnesses, lifted
+            // until the sea reads on the near-black chart face and the land reads on the
+            // sea (both at the 1.5:1 of §10). The land is higher than a neutral night grey
+            // would be because the sea below it has to stay above that face.
+            map_ocean: Oklch::new(0.352, 0.040, 217.5, opacity),
+            map_land: Oklch::new(0.479, 0.020, 84.6, opacity),
+            // The same three strokes lifted with the page: the purple and the rose are the
+            // pale ends of the light appearance's own hues, and the amber is the same
+            // mustard. Each still clears its floor by ten percent against the night fills.
+            map_border: Oklch::new(0.813, 0.090, 311.0, opacity),
+            map_road: Oklch::new(0.814, 0.080, 7.5, opacity),
+            map_road_minor: Oklch::new(0.673, 0.090, 74.5, opacity),
             on_brand: Oklch::new(0.176, 0.020, 245.0, opacity),
             on_inverse: Oklch::new(0.176, 0.016, 252.4, opacity),
             scrim_alpha: 0.55,

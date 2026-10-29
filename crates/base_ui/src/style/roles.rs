@@ -376,13 +376,15 @@ impl Roles {
     /// indicator lines add three more floors, and the fifth status color adds two (its fill and
     /// its chip tint). The map adds seven. §10 holds its coastline — `chart.map_land` against
     /// `chart.map_ocean` — to 1.5:1, stricter than either surface step, because those two fills
-    /// are the base the whole map is drawn on. The land is read against `surface.sunken`
-    /// as well, the chart face the map is drawn on, so a land fill cannot dissolve into the face
-    /// behind it while the sea stays close enough to that face for the chart series to read. The
-    /// three strokes over those fills carry the floors their job gives them: a border reads on
-    /// both fills, a motorway reads on both because a bridge or a causeway carries it over the
-    /// water, and a primary road is a texture on the land rather than a line to follow, so it is
-    /// held to the 1.5:1 of a visible step.
+    /// are the base the whole map is drawn on. The sea is read against `surface.sunken` as well,
+    /// the chart face the map is drawn on: since the map follows the OSM transport layer its land
+    /// is paper-white, which cannot clear a visible step from a near-white face, so the sea — the
+    /// fill that identifies the map and carries the vessel series — is the one held to 1.5:1
+    /// there (the entry's comment records what that leaves uncovered). The three strokes over
+    /// those fills carry the floors their job gives them: a border reads on both fills, a motorway
+    /// reads on both because a bridge or a causeway carries it over the water, and a primary
+    /// road is a texture on the land rather than a line to follow, so it is held to the 1.5:1
+    /// of a visible step.
     /// That is fifty-seven entries; the acceptance test resolves each appearance separately and
     /// checks its own table.
     fn contrast_floors(&self) -> [(&'static str, ResolvedColor, ResolvedColor, f32); 57] {
@@ -673,13 +675,24 @@ impl Roles {
                 self.chart.map_ocean,
                 1.5,
             ),
-            // The land is also the fill that has to hold against `surface.sunken`, the chart face
-            // the map is drawn on: the sea deliberately sits within a step of that face so the
-            // chart series keep their contrast on it, which leaves the land as the shape the map
-            // reads by. Held to the same 1.5:1 visible step as the coastline.
+            // The sea is also the fill that has to hold against `surface.sunken`, the chart face
+            // the map is drawn on. This replaces the old land-on-face entry: the OSM palette makes
+            // the land paper-white (#f2efe9), which on a near-white face reads 1.02:1 — no floor
+            // can fix that without abandoning the palette the map is asked to have. The sea is
+            // held to the same 1.5:1 visible step as the coastline instead.
+            //
+            // What that costs, measured on the 1× 1,404 × 900 view: 81% of the top edge is land,
+            // 82% of the bottom, 96% of the left and 55% of the right, so the fill a reader
+            // actually sees against the face is usually the land, at 1.02:1 in the light
+            // appearance (2.88:1 in the dark one, which is unchanged). The map covers its pane —
+            // `fit_px_per_merc` is a cover fit — so no band of the face shows inside the map's own
+            // rect; what the sea floor guarantees is that the water, the fill that identifies the
+            // map and carries the vessel series, still separates it from the face wherever water
+            // reaches the pane's edge. Restoring a land-on-face floor would mean moving the face or
+            // giving up the paper land, and neither is this widget's to decide.
             (
-                "chart.map_land on surface.sunken",
-                self.chart.map_land,
+                "chart.map_ocean on surface.sunken",
+                self.chart.map_ocean,
                 self.surface.sunken,
                 1.5,
             ),
@@ -1181,7 +1194,8 @@ mod tests {
         }
     }
 
-    /// A border is drawn over both map fills, so it is read on both.
+    /// A border is drawn over both map fills, so it is read on both, with the ten percent
+    /// margin a thin stroke needs to stay visible over a fill whose hue is close to it.
     ///
     /// Like the coastline test above, this reads the pair directly rather than through
     /// `contrast_floors`, so the floor is asserted here even if the table loses its entry.
@@ -1197,16 +1211,17 @@ mod tests {
                 let ratio = contrast(roles.chart.map_border, fill);
 
                 assert!(
-                    ratio >= 3.0,
+                    ratio >= 3.3,
                     "{:?}: chart.map_border reads {ratio:.2}:1 on {fill_name}, where the map \
-                     floor is 3.00:1",
+                     floor is 3.00:1 and a stroke carries at least 3.30:1",
                     palette.appearance
                 );
             }
         }
     }
 
-    /// A motorway is a line a reader follows across the land, so it is held to 3:1 there.
+    /// A motorway is a line a reader follows across the land, so it is held to 3:1 there,
+    /// plus the ten percent margin a thin stroke needs.
     #[test]
     fn map_road_reads_on_the_land_fill() {
         for palette in palettes() {
@@ -1214,16 +1229,16 @@ mod tests {
             let ratio = contrast(roles.chart.map_road, roles.chart.map_land);
 
             assert!(
-                ratio >= 3.0,
+                ratio >= 3.3,
                 "{:?}: chart.map_road reads {ratio:.2}:1 on chart.map_land, where the map floor \
-                 is 3.00:1",
+                 is 3.00:1 and a stroke carries at least 3.30:1",
                 palette.appearance
             );
         }
     }
 
     /// A bridge or a causeway carries a motorway over the water, so the same stroke is read on
-    /// the sea as well — at 2:1, the floor a line that only crosses water has to clear.
+    /// the sea as well — at 2:1 plus the ten percent margin of a thin stroke.
     #[test]
     fn map_road_reads_on_the_ocean_fill() {
         for palette in palettes() {
@@ -1231,16 +1246,16 @@ mod tests {
             let ratio = contrast(roles.chart.map_road, roles.chart.map_ocean);
 
             assert!(
-                ratio >= 2.0,
+                ratio >= 2.2,
                 "{:?}: chart.map_road reads {ratio:.2}:1 on chart.map_ocean, where the map floor \
-                 is 2.00:1",
+                 is 2.00:1 and a stroke carries at least 2.20:1",
                 palette.appearance
             );
         }
     }
 
     /// A primary road is the finer texture below the motorways, so it carries the 1.5:1 of a
-    /// visible step on the land it is mostly drawn on.
+    /// visible step on the land it is mostly drawn on, with the same ten percent margin.
     #[test]
     fn map_road_minor_reads_on_the_land_fill() {
         for palette in palettes() {
@@ -1248,9 +1263,9 @@ mod tests {
             let ratio = contrast(roles.chart.map_road_minor, roles.chart.map_land);
 
             assert!(
-                ratio >= 1.5,
+                ratio >= 1.65,
                 "{:?}: chart.map_road_minor reads {ratio:.2}:1 on chart.map_land, where the map \
-                 floor is 1.50:1",
+                 floor is 1.50:1 and a stroke carries at least 1.65:1",
                 palette.appearance
             );
         }
