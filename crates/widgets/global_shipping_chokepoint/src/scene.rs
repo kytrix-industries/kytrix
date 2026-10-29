@@ -1,13 +1,13 @@
 //! The map under the vessels: the packaged OSM base map and the layers it draws.
 //!
 //! The base map is a checked-in binary ([`MAP_ASSET`]) because it is data, not an
-//! icon: one file, read once, embedded by [`include_bytes!`]. It holds five
-//! sections — three resolutions of the coastline, the land borders and the road
+//! icon: one file, read once, embedded by [`include_bytes!`]. It holds six
+//! sections — four resolutions of the coastline, the land borders and the road
 //! network — in the KHL2 format `assets/README.md` documents.
 //!
 //! Loading is the only expensive step, and it happens once per process:
 //!
-//! 1. [`Scene::parse`] walks the header and the five sections, checks every
+//! 1. [`Scene::parse`] walks the header and the six sections, checks every
 //!    declared count against the bytes that are actually there, and checks each
 //!    line layer's cell table.
 //! 2. Each land tier's rings are projected to Web Mercator and tessellated as one
@@ -15,8 +15,9 @@
 //!    filled over. The triangles are then bucketed by centroid into the culling
 //!    grid, so a frame emits only the cells its viewport touches; the few that
 //!    are too wide for a bucket are kept apart and tested against the viewport.
-//!    The three tiers are the same coastline at 111 m, 333 m and 1 km, and a frame
-//!    draws exactly one of them, chosen by metres per pixel (`model::land_tier`).
+//!    The four tiers are the same coastline at 111 m, 222 m, 333 m and 1 km, and
+//!    a frame draws exactly one of them, chosen by metres per pixel
+//!    (`model::land_tier`).
 //! 3. The borders and roads are kept as projected polylines cut into pieces, with
 //!    the per-cell piece ranges the build wrote.
 //!
@@ -30,7 +31,7 @@ use gpui_kit::{FillOptions, FillRule, PathBuilder, PathStyle, point, px};
 
 use crate::model::{self, CellSpan, GRID_COLS, GRID_ROWS, LAND_TIERS};
 
-/// The packaged base map: KHL2, three land tiers and two line sections.
+/// The packaged base map: KHL2, four land tiers and two line sections.
 ///
 /// See `assets/README.md` for where it came from and how it was packed. A `static`
 /// rather than a `const`: a const is inlined at every use, and this one is 1.8 MB —
@@ -44,13 +45,13 @@ const MAGIC: [u8; 4] = *b"KHL2";
 
 /// The only KHL2 version this parser knows.
 ///
-/// Version 1 held one land section; version 2 holds one per tier. A version 1
+/// Version 1 held one land section, version 2 three and version 3 four. An older
 /// asset is not migrated — it is rejected, because the asset is rebuilt from the
 /// script in the same commit that changes this number.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// The sections the format defines, in the order they are stored.
-const SECTION_COUNT: u32 = 5;
+const SECTION_COUNT: u32 = 6;
 
 /// `magic | version | bbox | grid_cols | grid_rows | section_count`.
 const HEADER_LEN: usize = 36;
@@ -78,10 +79,11 @@ const MIN_RING_POINTS: usize = 3;
 /// edge 1.862e-6° off, so the tolerance has to clear that.
 const BBOX_EPSILON: f32 = 1e-5;
 
-/// The flags a road piece may carry: bit 0 primary, bit 2 a piece of the coarse copy
-/// of class 0, bit 3 a piece of a short chain that is drawn only once a pixel is fine
-/// enough. Bit 1 is unused and must be 0; the parser rejects it.
-const ROAD_FLAGS: u8 = 0b1101;
+/// The flags a road piece may carry: bit 0 primary, bit 1 a piece of the middle copy
+/// of class 0, bit 2 a piece of the coarse copy, bit 3 a piece of a short chain that
+/// is drawn only once a pixel is fine enough. Every other bit is undefined and the
+/// parser rejects it.
+const ROAD_FLAGS: u8 = 0b1111;
 
 /// The flattening tolerance handed to lyon, in Mercator radians.
 ///
@@ -101,7 +103,7 @@ const ROAD_FLAGS: u8 = 0b1101;
 /// line. The triangle count is pinned too, because changing the tolerance changes
 /// how lyon joins nearly touching edges.
 ///
-/// The three tiers are tessellated at this same tolerance rather than at one
+/// The four tiers are tessellated at this same tolerance rather than at one
 /// scaled to their simplification: a coarser tier's ring points are hundreds of
 /// metres apart, so the value only decides how lyon joins a ring against itself,
 /// and keeping it fixed keeps tier 0's triangles exactly the ones the map drew
@@ -166,7 +168,7 @@ pub(super) enum SceneError {
 
 /// The base map, parsed once and kept in Web Mercator space.
 pub(super) struct Scene {
-    /// The coastline at each tier, coarsest last: index 0 is 0.001°, index 2 is
+    /// The coastline at each tier, coarsest last: index 0 is 0.001°, index 3 is
     /// 0.006°. A frame draws exactly one of them — see [`Self::land`].
     pub land: [LandLayer; LAND_TIERS],
     /// The land borders, cut into per-cell pieces by the build.
@@ -214,8 +216,9 @@ pub(super) struct Piece {
     /// The format stores this as a `u16`, which is the build's 65,535-point bound: a
     /// piece can never declare more points than the field can hold.
     pub len: u16,
-    /// Bit 0 primary, bit 2 a piece of the coarse copy of the motorways and trunks,
-    /// bit 3 a piece of a short class-0 chain; zero on borders. Bit 1 is unused.
+    /// Bit 0 primary, bit 1 a piece of the middle copy of the motorways and trunks,
+    /// bit 2 a piece of the coarse copy, bit 3 a piece of a short class-0 chain; zero
+    /// on borders. Bits the format does not define are rejected.
     pub flags: u8,
     /// The piece's length in metres, as the build measured it; zero on borders.
     pub length_m: u32,
@@ -237,9 +240,10 @@ impl Scene {
         // declares: a file whose sections are reordered, duplicated or missing fails
         // here rather than being read as a different map.
         let mut offset = HEADER_LEN;
-        let land_0 = RawSection::parse(bytes, &mut offset, SectionKind::LandFine)?;
-        let land_1 = RawSection::parse(bytes, &mut offset, SectionKind::LandMiddle)?;
-        let land_2 = RawSection::parse(bytes, &mut offset, SectionKind::LandCoarse)?;
+        let land_0 = RawSection::parse(bytes, &mut offset, SectionKind::LandFinest)?;
+        let land_1 = RawSection::parse(bytes, &mut offset, SectionKind::LandFine)?;
+        let land_2 = RawSection::parse(bytes, &mut offset, SectionKind::LandMiddle)?;
+        let land_3 = RawSection::parse(bytes, &mut offset, SectionKind::LandCoarse)?;
         let borders = RawSection::parse(bytes, &mut offset, SectionKind::Borders)?;
         let roads = RawSection::parse(bytes, &mut offset, SectionKind::Roads)?;
         if offset != bytes.len() {
@@ -247,8 +251,8 @@ impl Scene {
         }
 
         // The line layers are checked before the land is tessellated: a malformed cell
-        // table is a cheaper failure than 44,000 ring points through lyon, and the
-        // three tiers are the most expensive thing this parser does.
+        // table is a cheaper failure than 61,000 ring points through lyon, and the
+        // four tiers are the most expensive thing this parser does.
         let borders = LineLayer::parse(&borders)?;
         let roads = LineLayer::parse(&roads)?;
         borders.validate(LineKind::Borders)?;
@@ -259,6 +263,7 @@ impl Scene {
                 LandLayer::parse(&land_0)?,
                 LandLayer::parse(&land_1)?,
                 LandLayer::parse(&land_2)?,
+                LandLayer::parse(&land_3)?,
             ],
             borders,
             roads,
@@ -466,31 +471,34 @@ pub(super) fn scene() -> Result<&'static Scene, SceneError> {
 
 /// The sections a KHL2 asset stores, in the order it stores them.
 ///
-/// The three land tiers come first, coarsest last: the parser tessellates each into
+/// The four land tiers come first, coarsest last: the parser tessellates each into
 /// its own [`LandLayer`], and a frame draws the one [`model::land_tier`] picks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SectionKind {
     /// Closed coastline rings at 0.001°, tessellated at run time.
-    LandFine = 1,
+    LandFinest = 1,
+    /// Closed coastline rings at 0.002°, tessellated at run time.
+    LandFine = 2,
     /// Closed coastline rings at 0.003°, tessellated at run time.
-    LandMiddle = 2,
+    LandMiddle = 3,
     /// Closed coastline rings at 0.006°, tessellated at run time.
-    LandCoarse = 3,
+    LandCoarse = 4,
     /// Land borders, cut into per-cell pieces by the build.
-    Borders = 4,
+    Borders = 5,
     /// Roads, cut into per-cell pieces by the build.
-    Roads = 5,
+    Roads = 6,
 }
 
 impl SectionKind {
     /// The kind one stored `u32` names, or `None` when it names no section.
     fn from_u32(value: u32) -> Option<Self> {
         match value {
-            1 => Some(Self::LandFine),
-            2 => Some(Self::LandMiddle),
-            3 => Some(Self::LandCoarse),
-            4 => Some(Self::Borders),
-            5 => Some(Self::Roads),
+            1 => Some(Self::LandFinest),
+            2 => Some(Self::LandFine),
+            3 => Some(Self::LandMiddle),
+            4 => Some(Self::LandCoarse),
+            5 => Some(Self::Borders),
+            6 => Some(Self::Roads),
             _ => None,
         }
     }
@@ -717,33 +725,33 @@ mod tests {
     use super::*;
 
     /// The land's stored points, tier by tier, as the checked-in asset declares them.
-    const LAND_POINTS: [u32; LAND_TIERS] = [25_446, 12_113, 8_099];
+    const LAND_POINTS: [u32; LAND_TIERS] = [25_446, 15_767, 12_113, 8_099];
     /// The land rings, tier by tier.
-    const LAND_PIECES: [u32; LAND_TIERS] = [854, 790, 785];
+    const LAND_PIECES: [u32; LAND_TIERS] = [854, 805, 790, 785];
     /// The border points, as the checked-in asset declares them.
     const BORDER_POINTS: u32 = 1_630;
     /// The border pieces, as the checked-in asset declares them.
     const BORDER_PIECES: u32 = 201;
     /// The road points, as the checked-in asset declares them.
-    const ROAD_POINTS: u32 = 47_647;
+    const ROAD_POINTS: u32 = 60_240;
     /// The road pieces, as the checked-in asset declares them.
-    const ROAD_PIECES: u32 = 17_359;
+    const ROAD_PIECES: u32 = 21_748;
     /// The cells each line layer's table holds.
     const CELLS: u32 = GRID_COLS * GRID_ROWS;
 
     /// The triangles each land tier tessellates into at [`TESSELLATION_TOLERANCE`].
     ///
     /// The 0.001° tier is the count the map drew before the tiers existed and is
-    /// pinned to the triangle; the two coarser ones are pinned to the same standard,
+    /// pinned to the triangle; the coarser ones are pinned to the same standard,
     /// because they are the whole point of the change — the fitted zoom draws 5,744
     /// triangles, not 22,876. The build's own estimate (`points - 3 × rings`) reads
-    /// 22,884 / 9,743 / 5,744: lyon skips the ring points that are collinear with
-    /// their neighbours, and a simplified ring has a few of those.
-    const LAND_TRIANGLES: [usize; LAND_TIERS] = [22_876, 9_736, 5_744];
+    /// 22,884 / 13,352 / 9,743 / 5,744: lyon skips the ring points that are collinear
+    /// with their neighbours, and a simplified ring has a few of those.
+    const LAND_TRIANGLES: [usize; LAND_TIERS] = [22_876, 13_347, 9_736, 5_744];
     /// The triangles of each tier the culling grid can bucket by centroid.
-    const LAND_CELL_TRIANGLES: [usize; LAND_TIERS] = [19_487, 8_145, 4_786];
+    const LAND_CELL_TRIANGLES: [usize; LAND_TIERS] = [19_487, 11_277, 8_145, 4_786];
     /// The triangles of each tier too wide to bucket by centroid.
-    const LAND_WIDE_TRIANGLES: [usize; LAND_TIERS] = [3_389, 1_591, 958];
+    const LAND_WIDE_TRIANGLES: [usize; LAND_TIERS] = [3_389, 2_070, 1_591, 958];
     /// The distinct ring points of tier 0: 25,446 stored points less one closing point
     /// per ring.
     const LAND_RING_POINTS: usize = 24_592;
@@ -800,11 +808,12 @@ mod tests {
         }
     }
 
-    /// The same rings at all three tiers, which is what a fixture needs: the parser
-    /// tessellates each section on its own, and a fixture's rings do not have three
+    /// The same rings at all four tiers, which is what a fixture needs: the parser
+    /// tessellates each section on its own, and a fixture's rings do not have four
     /// resolutions.
     fn land_tiers(points: &[[f32; 2]], pieces: &[(u32, u16)]) -> [SectionSpec; LAND_TIERS] {
         [
+            land_section(SectionKind::LandFinest, points, pieces),
             land_section(SectionKind::LandFine, points, pieces),
             land_section(SectionKind::LandMiddle, points, pieces),
             land_section(SectionKind::LandCoarse, points, pieces),
@@ -837,7 +846,7 @@ mod tests {
         line_section(kind, &[], &[], vec![(0, 0); CELLS as usize])
     }
 
-    /// Packs a header and the five sections into a KHL2 asset.
+    /// Packs a header and the six sections into a KHL2 asset.
     fn asset(land: [SectionSpec; LAND_TIERS], borders: SectionSpec, roads: SectionSpec) -> Vec<u8> {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&VERSION.to_le_bytes());
@@ -924,6 +933,7 @@ mod tests {
 
     /// The sections the checked-in asset stores, in the order the file stores them.
     const ALL: [SectionKind; SECTION_COUNT as usize] = [
+        SectionKind::LandFinest,
         SectionKind::LandFine,
         SectionKind::LandMiddle,
         SectionKind::LandCoarse,
@@ -931,7 +941,7 @@ mod tests {
         SectionKind::Roads,
     ];
 
-    /// The five raw sections of the checked-in asset, in the file's order.
+    /// The six raw sections of the checked-in asset, in the file's order.
     fn raw_sections() -> [RawSection<'static>; SECTION_COUNT as usize] {
         let mut offset = HEADER_LEN;
         ALL.map(|kind| {
@@ -986,12 +996,12 @@ mod tests {
             assert_eq!(section.pieces.len() / PIECE_LEN, LAND_PIECES[tier] as usize);
             assert_eq!(section.cells.len(), 0, "the land is binned at run time");
         }
-        assert_eq!(raw[3].points.len() / POINT_LEN, BORDER_POINTS as usize);
-        assert_eq!(raw[3].pieces.len() / PIECE_LEN, BORDER_PIECES as usize);
-        assert_eq!(raw[3].cells.len() / CELL_LEN, CELLS as usize);
-        assert_eq!(raw[4].points.len() / POINT_LEN, ROAD_POINTS as usize);
-        assert_eq!(raw[4].pieces.len() / PIECE_LEN, ROAD_PIECES as usize);
+        assert_eq!(raw[4].points.len() / POINT_LEN, BORDER_POINTS as usize);
+        assert_eq!(raw[4].pieces.len() / PIECE_LEN, BORDER_PIECES as usize);
         assert_eq!(raw[4].cells.len() / CELL_LEN, CELLS as usize);
+        assert_eq!(raw[5].points.len() / POINT_LEN, ROAD_POINTS as usize);
+        assert_eq!(raw[5].pieces.len() / PIECE_LEN, ROAD_PIECES as usize);
+        assert_eq!(raw[5].cells.len() / CELL_LEN, CELLS as usize);
 
         let scene = scene().expect("the checked-in asset parses");
         for (tier, land) in scene.land.iter().enumerate() {
@@ -1119,8 +1129,8 @@ mod tests {
         let scene = scene().expect("the checked-in asset parses");
         let raw = raw_sections();
         for (layer, section, name) in [
-            (&scene.borders, &raw[3], "borders"),
-            (&scene.roads, &raw[4], "roads"),
+            (&scene.borders, &raw[4], "borders"),
+            (&scene.roads, &raw[5], "roads"),
         ] {
             for (index, range) in layer.cells.iter().enumerate() {
                 let [west, south, east, north] = cell_box(index as u32);
@@ -1159,19 +1169,18 @@ mod tests {
         }
 
         // Every flag bit the format defines is set and cleared somewhere in the asset:
-        // bit 0 by the primary roads, bit 2 by the coarse copy and bit 3 by the fine
-        // copy's short chains. Bit 1 is unused and must be 0 everywhere.
-        let mut bits = [[false; 2]; 3];
+        // bit 0 by the primary roads, bit 1 by the middle copy, bit 2 by the coarse copy
+        // and bit 3 by the fine copy's short chains.
+        let mut bits = [[false; 2]; 4];
         let mut longest = 0;
         for piece in &roads.pieces {
-            for (slot, bit) in [0usize, 2, 3].into_iter().enumerate() {
+            for (slot, bit) in [0usize, 1, 2, 3].into_iter().enumerate() {
                 bits[slot][usize::from(piece.flags >> bit & 1)] = true;
             }
-            assert_eq!(piece.flags & 0b10, 0, "bit 1 is unused");
             longest = longest.max(piece.length_m);
         }
         assert_eq!(
-            bits, [[true; 2]; 3],
+            bits, [[true; 2]; 4],
             "every defined road bit is set and cleared",
         );
         assert!(
@@ -1179,7 +1188,7 @@ mod tests {
             "length_m is metres, not kilometres: the longest piece is {longest}",
         );
 
-        // The three runtime LODs the design filters to, counted straight from the
+        // The four runtime LODs the design filters to, counted straight from the
         // packed flags. A piece of `n` points is `n - 1` segments and each segment is
         // two triangles, so a LOD is `2 × (points - pieces)`.
         fn lod(pieces: &[Piece], keep: fn(&Piece) -> bool) -> (usize, u32, usize) {
@@ -1198,12 +1207,17 @@ mod tests {
             "COARSE: the chains at least the build's 0.3 km threshold long",
         );
         assert_eq!(
-            lod(&roads.pieces, |piece| piece.flags & 0b101 == 0),
+            lod(&roads.pieces, |piece| piece.flags & 0b10 != 0),
+            (4_389, 12_593, 16_408),
+            "MIDDLE: the same chains at 0.004°",
+        );
+        assert_eq!(
+            lod(&roads.pieces, |piece| piece.flags & 0b111 == 0),
             (7_728, 22_283, 29_110),
             "FINE: every class-0 chain, including the short ones the runtime gates",
         );
         assert_eq!(
-            lod(&roads.pieces, |piece| piece.flags & 0b100 == 0),
+            lod(&roads.pieces, |piece| piece.flags & 0b110 == 0),
             (13_071, 37_051, 47_960),
             "DE: the fine copy plus the primary roads",
         );
@@ -1535,11 +1549,11 @@ mod tests {
 
     #[test]
     fn an_unknown_version_is_rejected() {
-        // A version 1 asset is the shape this parser used to read: it holds a single
-        // land section. It is not migrated — the asset is rebuilt in the same change
-        // that bumps the version — so the next version and the previous one both fail
+        // Version 3 is the shape this parser reads. The earlier versions held one and
+        // three land sections; they are not migrated — the asset is rebuilt in the same
+        // change that bumps the version — so the previous ones and the next one both fail
         // here, as does any other number.
-        for version in [1u32, 3, u32::MAX] {
+        for version in [1u32, 2, 4, u32::MAX] {
             let mut bytes = triangle_asset();
             bytes[4..8].copy_from_slice(&version.to_le_bytes());
             assert_eq!(
@@ -1568,15 +1582,15 @@ mod tests {
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::GridMismatch));
     }
 
-    /// A version 1 asset is a different file shape — one land section, not three — and
-    /// this parser does not migrate it: the checked-in asset is rebuilt by
-    /// `assets/build_map.py` in the same change that moves the version. Rewriting the
-    /// version byte of the real asset therefore has to be rejected before any section is
-    /// read, not read as a five-section file that happens to start with three land
-    /// sections.
+    /// A previous asset version is a different file shape — one land section in version
+    /// 1, three in version 2, four in version 3 — and this parser does not migrate it:
+    /// the checked-in asset is rebuilt by `assets/build_map.py` in the same change that
+    /// moves the version. Rewriting the version byte of the real asset therefore has to
+    /// be rejected before any section is read, not read as a six-section file that
+    /// happens to start with four land sections.
     #[test]
     fn the_previous_asset_version_is_rejected_at_the_header() {
-        for version in [1u32, 3, 0] {
+        for version in [1u32, 2, 0] {
             let mut bytes = MAP_ASSET.to_vec();
             bytes[4..8].copy_from_slice(&version.to_le_bytes());
             assert_eq!(
@@ -1612,9 +1626,9 @@ mod tests {
             );
         }
 
-        // The header declares a sixth section the format does not define.
+        // The header declares a seventh section the format does not define.
         let mut bytes = triangle_asset();
-        bytes[32..36].copy_from_slice(&6u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&7u32.to_le_bytes());
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::MissingSection));
     }
 
@@ -1636,7 +1650,7 @@ mod tests {
 
     #[test]
     fn a_physically_missing_section_is_rejected() {
-        // The header still declares five sections; the bytes hold four. Removing one from
+        // The header still declares six sections; the bytes hold five. Removing one from
         // the middle shifts every later section under the wrong expected kind, which the
         // kind check catches; removing the last runs out of bytes, which is truncation.
         let ranges = section_ranges();
@@ -1651,11 +1665,11 @@ mod tests {
         );
 
         let mut missing_last = MAP_ASSET.to_vec();
-        missing_last.truncate(ranges[4].start);
+        missing_last.truncate(ranges[5].start);
         assert_eq!(
             Scene::parse(&missing_last).err(),
             Some(SceneError::Truncated),
-            "a file that ends before its fifth section was never packed whole",
+            "a file that ends before its sixth section was never packed whole",
         );
     }
 
@@ -1865,9 +1879,9 @@ mod tests {
         );
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::BadPiece));
 
-        // A road carries only the three flag bits the format defines (0, 2, 3); bit 1
-        // is unused and bit 4+ is undefined.
-        for flags in [2, 16] {
+        // A road carries only the four flag bits the format defines (0, 1, 2, 3); bits
+        // 4 and above are undefined.
+        for flags in [16, 32] {
             let roads = line_section(
                 SectionKind::Roads,
                 &[[50.0, 25.0], [51.0, 25.0]],
@@ -2106,8 +2120,8 @@ mod tests {
         let [west, _, east, _] = model::mercator_bounds();
         let mut pieces = 0;
         for (layer, section, name) in [
-            (&scene.borders, &raw[3], "borders"),
-            (&scene.roads, &raw[4], "roads"),
+            (&scene.borders, &raw[4], "borders"),
+            (&scene.roads, &raw[5], "roads"),
         ] {
             for (cell, range) in layer.cells.iter().enumerate() {
                 for piece in &layer.pieces[range.start as usize..range.end as usize] {

@@ -7,23 +7,24 @@ and fails with an actionable message when one is missing.
 
 What is packed (all little-endian, see `README.md` for the format):
 
-1. **land, three tiers** — OSM land polygons, clipped to the map box once, then
+1. **land, four tiers** — OSM land polygons, clipped to the map box once, then
    simplified at 0.001° (~100 m on the ground here, the visual reference),
-   0.003° (~300 m) and 0.006° (~600 m). Each tier is simplified from the same
-   clipped geometry with `preserve_topology=True`, drops islands under 0.01 km²
-   on its own and packs one closed ring per polygon ring. The fitted zoom draws
-   the coarsest tier, where one pixel is about a kilometre.
+   0.002° (~200 m), 0.003° (~300 m) and 0.006° (~600 m). Each tier is simplified
+   from the same clipped geometry with `preserve_topology=True`, drops islands
+   under 0.01 km² on its own and packs one closed ring per polygon ring. The
+   fitted zoom draws the coarsest tier, where one pixel is about a kilometre.
 2. **borders** — the member ways of the `boundary=administrative` +
    `admin_level=2` relations, plus any such way that belongs to no relation,
    without `maritime=yes` or `natural=coastline` and with at least one point on
    the drawn land, clipped and simplified to ~55 m, cut per grid cell. The land
    mask is the **tier 0** geometry, so the borders stay where they were.
 3. **roads** — `highway=motorway|trunk|primary`. The motorways and trunks are
-   joined into the chains their shared endpoints allow and stored twice: a
-   **fine copy** of every chain at 0.002° (~200 m) and a **coarse copy** of the
-   chains at least `SHORT_CHAIN_KM` long at 0.008° (~800 m). The fine copy marks
-   a short chain with `FLAG_SHORT_CHAIN`, so the runtime draws it only once a
-   pixel is fine enough; the coarse copy leaves it out. Primary roads are packed
+   joined into the chains their shared endpoints allow and stored **three** times:
+   a **fine copy** of every chain at 0.002° (~200 m), a **middle copy** of the
+   chains at least `SHORT_CHAIN_KM` long at 0.004° (~400 m), and a **coarse copy**
+   of the same long chains at 0.008° (~800 m). The fine copy marks a short chain
+   with `FLAG_SHORT_CHAIN`, so the runtime draws it only once a pixel is fine
+   enough; the middle and coarse copies leave it out. Primary roads are packed
    once at 0.002°. Every layer is cut per grid cell, with the flag bits the
    runtime LOD filter reads.
 
@@ -69,37 +70,43 @@ WEST, SOUTH, EAST, NORTH = 47.802, 21.443, 61.875, 30.042
 GRID_COLS, GRID_ROWS = 64, 32
 
 #: The KHL2 version this script writes, and how many sections it packs.
-VERSION = 2
-SECTION_COUNT = 5
+#:
+#: Version 3 adds the 0.002° land tier to version 2's three tiers, so the section
+#: count and the kinds after the land both move. The parser rejects every other
+#: version: there is no migration and no second layout to maintain.
+VERSION = 3
+SECTION_COUNT = 6
 
-#: Section kinds of the KHL2 asset, in the order the file stores them: the three
+#: Section kinds of the KHL2 asset, in the order the file stores them: the four
 #: land tiers coarse-last, then the two line layers. `LAND_KINDS` is the single
 #: source for the land kinds; `KIND_BORDERS`/`KIND_ROADS` follow them.
-LAND_KINDS = (1, 2, 3)
+LAND_KINDS = (1, 2, 3, 4)
 KIND_BORDERS = LAND_KINDS[-1] + 1
 KIND_ROADS = KIND_BORDERS + 1
 
-#: Road flags: bit 0 is "primary", bit 2 is "this piece belongs to the coarse
-#: copy", bit 3 is "this piece belongs to a class-0 chain shorter than
-#: `SHORT_CHAIN_KM`". Bit 1 is unused and must be 0; the runtime rejects it.
+#: Road flags: bit 0 is "primary", bit 1 is "this piece belongs to the middle
+#: copy", bit 2 is "this piece belongs to the coarse copy", bit 3 is "this piece
+#: belongs to a class-0 chain shorter than `SHORT_CHAIN_KM`". The runtime rejects a
+#: piece whose flags hold any other bit.
 FLAG_PRIMARY = 1 << 0
+FLAG_MIDDLE = 1 << 1
 FLAG_COARSE = 1 << 2
 FLAG_SHORT_CHAIN = 1 << 3
 
 #: The road classes the asset keeps, as `highway` tag values.
 ROAD_CLASSES = frozenset({"motorway", "trunk", "primary"})
 
-#: The three land tiers, one per section, coarsest last, in degrees.
+#: The four land tiers, one per section, coarsest last, in degrees.
 #:
-#: Every tier is simplified from the *same* clipped land, so the three are the
-#: same coastline at three resolutions rather than three independent readings of
+#: Every tier is simplified from the *same* clipped land, so the four are the
+#: same coastline at four resolutions rather than four independent readings of
 #: the source. `0.001` is about 100 m on the ground at this latitude, which is
 #: what the map drew before the tiers existed and stays the visual reference;
 #: `0.006` is about 600 m, and its worst deviation from tier 0 measures 1.04
 #: pixels at the fitted zoom (see `src/model.rs`, where the runtime's thresholds
-#: are derived from the same measurement). The runtime picks a tier by metres per
-#: pixel, never by zoom.
-LAND_TIERS = (0.001, 0.003, 0.006)
+#: are derived from the same measurements). The runtime picks a tier by metres
+#: per pixel, never by zoom.
+LAND_TIERS = (0.001, 0.002, 0.003, 0.006)
 #: Islands smaller than this are dropped, in every tier. The area is converted to
 #: km² first: a raw square degree is about 11,200 km² here and would drop almost
 #: every island.
@@ -131,9 +138,16 @@ ROAD_SIMPLIFY = 0.002
 #: under a pixel off where it is drawn, and its vertices are the only ones a 1×
 #: frame pays for.
 COARSE_ROAD_SIMPLIFY = 0.008
+#: The middle copy is simplified to 0.004° (about 400 m), for the scales between
+#: the coarse copy's 742 m/px threshold and the fine copy: 0.004° is 445.3 m on the
+#: latitude axis, and 445.3 / 1.2 = 371 m/px is the coarsest scale at which it is
+#: still inside the runtime's 1.2 px budget. It is built from the same long chains
+#: as the coarse copy, so a short chain is drawn only by the fine copy — at the
+#: scales the middle copy covers it would be under a pixel wide.
+MIDDLE_ROAD_SIMPLIFY = 0.004
 #: Chains shorter than this many kilometres are feature-dropped: the class-0
-#: coarse copy leaves them out and the fine copy marks them so the runtime draws
-#: them only once a pixel is finer than
+#: middle and coarse copies leave them out and the fine copy marks them so the
+#: runtime draws them only once a pixel is finer than
 #: `model::ROAD_SHORT_CHAIN_METRES_PER_PIXEL`; the primary copy leaves them out
 #: at build time, because it only draws at the closest zoom. A chain is a whole
 #: road between junctions, so dropping one keeps every drawn road continuous;
@@ -166,8 +180,8 @@ FITTED_METRES_PER_PIXEL = 1_003.95
 PBF_MIN_BYTES = 20 * 1024**2
 LAND_ZIP_MIN_BYTES = 500 * 1024**2
 
-#: The asset budget from the plan: 2 MiB for the whole base map. The two extra
-#: land tiers add about 0.16 MiB of points, so three tiers still fit.
+#: The asset budget from the plan: 2 MiB for the whole base map. The three extra
+#: land tiers add about 0.2 MiB of points, so four tiers still fit.
 MAX_ASSET_BYTES = 2 * 1024 * 1024
 
 
@@ -213,7 +227,7 @@ class LandTier:
 
 @dataclass
 class Land:
-    """The three land tiers and the land the border mask tests against."""
+    """The four land tiers and the land the border mask tests against."""
 
     #: Coarsest last, in the order the asset stores them.
     tiers: list[LandTier]
@@ -223,7 +237,7 @@ class Land:
 
 @dataclass
 class RoadChain:
-    """One merged class-0 chain and the two resolutions the asset stores it at."""
+    """One merged class-0 chain and the three resolutions the asset stores it at."""
 
     #: The chain's true length in metres, measured on its source geometry.
     length_m: float
@@ -233,6 +247,8 @@ class RoadChain:
     source_segments: int
     #: The geometry the fine copy stores, simplified at `ROAD_SIMPLIFY`.
     fine: list[tuple[float, float]]
+    #: The geometry the middle copy stores, simplified at `MIDDLE_ROAD_SIMPLIFY`.
+    middle: list[tuple[float, float]]
     #: The geometry the coarse copy stores, simplified at `COARSE_ROAD_SIMPLIFY`.
     coarse: list[tuple[float, float]]
 
@@ -537,11 +553,11 @@ def read_pbfs(paths: list[Path]) -> Collector:
 
 
 def load_land(zip_path: Path, clip_box) -> Land:
-    """The three land tiers, and the drawn land the border mask tests against.
+    """The four land tiers, and the drawn land the border mask tests against.
 
     The map box is read, unioned, clipped and made valid **once**; every tier is
-    then a `simplify` of that same geometry, so the three are one coastline at
-    three resolutions. The mask is the tier 0 land, which is the geometry the map
+    then a `simplify` of that same geometry, so the four are one coastline at
+    four resolutions. The mask is the tier 0 land, which is the geometry the map
     drew before the tiers existed: deriving it from a coarser tier would move the
     drawn coast by up to a kilometre and drag the borders with it.
     """
@@ -639,8 +655,8 @@ def load_land(zip_path: Path, clip_box) -> Land:
         metres = tier.hausdorff_deg * DEGREE_M * math.cos(math.radians(SCALE_LATITUDE))
         print(
             f"  worst deviation from tier 0 at {tier.tolerance}: "
-            f"{tier.hausdorff_deg:.6f} deg = {metres:.0f} m = "
-            f"{metres / FITTED_METRES_PER_PIXEL:.2f} px at the fitted zoom",
+            f"{tier.hausdorff_deg:.6f} deg = {metres:.1f} m = "
+            f"{metres / FITTED_METRES_PER_PIXEL:.3f} px at the fitted zoom",
             flush=True,
         )
 
@@ -871,10 +887,17 @@ def lod_pieces(pieces: list[Piece]) -> dict[str, list[Piece]]:
     """The pieces each runtime road LOD keeps."""
     return {
         "COARSE": [piece for piece in pieces if piece.flags & FLAG_COARSE],
+        "MIDDLE": [piece for piece in pieces if piece.flags & FLAG_MIDDLE],
         "FINE": [
-            piece for piece in pieces if not piece.flags & (FLAG_COARSE | FLAG_PRIMARY)
+            piece
+            for piece in pieces
+            if not piece.flags & (FLAG_COARSE | FLAG_MIDDLE | FLAG_PRIMARY)
         ],
-        "DE": [piece for piece in pieces if not piece.flags & FLAG_COARSE],
+        "DE": [
+            piece
+            for piece in pieces
+            if not piece.flags & (FLAG_COARSE | FLAG_MIDDLE)
+        ],
     }
 
 
@@ -991,12 +1014,13 @@ def build(assets: Path, out: Path) -> None:
                 continue
             class_zero.append(part)
 
-    # Both copies of class 0 are the network joined into the chains its shared endpoints
-    # allow. A per-way simplification cannot thin a two-node way, and most of the
-    # network's ways are exactly that, so joining them first is what makes the coarse copy
-    # coarse at all. Building the fine copy from the same chains is what lets the short
-    # ones be dropped as whole roads: the two copies then carry the same chain identity,
-    # and a chain is either entirely drawn or entirely absent at a given scale.
+    # All three copies of class 0 are the network joined into the chains its shared
+    # endpoints allow. A per-way simplification cannot thin a two-node way, and most of
+    # the network's ways are exactly that, so joining them first is what makes the
+    # coarser copies coarse at all. Building the fine copy from the same chains is what
+    # lets the short ones be dropped as whole roads: the copies then carry the same
+    # chain identity, and a chain is either entirely drawn or entirely absent at a
+    # given scale.
     coarse_chains = merge_lines(class_zero)
     chains: list[RoadChain] = []
     for chain in coarse_chains:
@@ -1005,6 +1029,9 @@ def build(assets: Path, out: Path) -> None:
         fine = clean_coords(
             chain.simplify(ROAD_SIMPLIFY, preserve_topology=False).coords
         )
+        middle = clean_coords(
+            chain.simplify(MIDDLE_ROAD_SIMPLIFY, preserve_topology=False).coords
+        )
         coarse = clean_coords(
             chain.simplify(COARSE_ROAD_SIMPLIFY, preserve_topology=False).coords
         )
@@ -1012,6 +1039,8 @@ def build(assets: Path, out: Path) -> None:
         # own geometry rather than dropping it: a chain that is drawn must be complete.
         if len(fine) < 2:
             fine = source
+        if len(middle) < 2:
+            middle = source
         if len(coarse) < 2:
             coarse = source
         chains.append(
@@ -1020,10 +1049,14 @@ def build(assets: Path, out: Path) -> None:
                 reference,
                 len(source) - 1,
                 fine,
+                middle,
                 coarse,
             )
         )
-    if any(len(chain.fine) < 2 or len(chain.coarse) < 2 for chain in chains):
+    if any(
+        len(chain.fine) < 2 or len(chain.middle) < 2 or len(chain.coarse) < 2
+        for chain in chains
+    ):
         raise SystemExit("error: a class-0 chain has no geometry")
 
     # The chain-length distribution is what the low-zoom feature dropping is chosen
@@ -1081,6 +1114,10 @@ def build(assets: Path, out: Path) -> None:
         )
         for index, chain in enumerate(chains)
     ]
+    middle_pieces = [
+        Piece(chain.middle, FLAG_MIDDLE, 0, chain.reference_latitude, index)
+        for index, chain in enumerate(kept)
+    ]
     coarse_pieces = [
         Piece(chain.coarse, FLAG_COARSE, 0, chain.reference_latitude, index)
         for index, chain in enumerate(kept)
@@ -1124,13 +1161,16 @@ def build(assets: Path, out: Path) -> None:
         flush=True,
     )
 
-    road_pieces = [*primary_pieces, *fine_class_zero, *coarse_pieces]
+    road_pieces = [*primary_pieces, *fine_class_zero, *middle_pieces, *coarse_pieces]
     fine_points = sum(len(piece.coords) for piece in fine_class_zero)
+    middle_points = sum(len(piece.coords) for piece in middle_pieces)
     coarse_points = sum(len(piece.coords) for piece in coarse_pieces)
     print(
         f"  class-0 fine {len(fine_class_zero):,} chains, {fine_points:,} points, "
         f"{2 * (fine_points - len(fine_class_zero)):,} triangles "
         f"({len(short):,} short chains flagged); "
+        f"middle {len(middle_pieces):,} chains, {middle_points:,} points, "
+        f"{2 * (middle_points - len(middle_pieces)):,} triangles; "
         f"coarse {len(coarse_pieces):,} chains, {coarse_points:,} points, "
         f"{2 * (coarse_points - len(coarse_pieces)):,} triangles "
         f"({len(short):,} short chains dropped); "
@@ -1145,6 +1185,11 @@ def build(assets: Path, out: Path) -> None:
     road_pieces, road_cells = cut_per_cell(road_pieces, "roads", measure_lengths=True)
     # The 1× coarse copy has to be the kept chains, not a sample of their pieces:
     # prove the cell cut left every chain joined end to end before packing it.
+    assert_chain_partition(
+        [piece for piece in road_pieces if piece.flags & FLAG_MIDDLE],
+        [(chain.middle, chain.reference_latitude) for chain in kept],
+        "middle",
+    )
     assert_chain_partition(
         [piece for piece in road_pieces if piece.flags & FLAG_COARSE],
         [(chain.coarse, chain.reference_latitude) for chain in kept],
@@ -1208,8 +1253,9 @@ def build(assets: Path, out: Path) -> None:
             f"triangles {2 * (vertices - len(selected)):9,d}"
         )
     print(
-        f"  class-0 pieces: fine all {len(lods['FINE']):,} + coarse kept "
-        f"{len(lods['COARSE']):,} (the coarse copy is a subset of the fine one)"
+        f"  class-0 pieces: fine all {len(lods['FINE']):,}, middle kept "
+        f"{len(lods['MIDDLE']):,}, coarse kept {len(lods['COARSE']):,} "
+        "(the middle and coarse copies are subsets of the fine one)"
     )
     # The coarse copy is the long chains at the fitted zoom; the short ones are
     # feature-dropped and come back through the fine copy. The dangling endpoints are
@@ -1225,6 +1271,7 @@ def build(assets: Path, out: Path) -> None:
         f"{', '.join(f'land tier {index} {short_segments(tier.rings):,}' for index, tier in enumerate(land.tiers))}, "
         f"borders {short_segments(border_pieces):,}, "
         f"roads {short_segments(lods['FINE']):,}, "
+        f"middle {short_segments(lods['MIDDLE']):,}, "
         f"coarse {short_segments(lods['COARSE']):,}"
     )
 

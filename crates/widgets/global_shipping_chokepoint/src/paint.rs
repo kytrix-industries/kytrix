@@ -26,8 +26,14 @@ const MARKER_WIDTH_RATIO: f32 = 0.7;
 /// The radius of the dot a vessel whose ship record has not arrived is drawn as.
 const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 
-/// How many segments the dot and the hover ring are drawn with.
-const ROUND_SEGMENTS: usize = 8;
+/// How many segments the unknown-vessel dot is drawn with.
+///
+/// Six rather than eight: the dot is 2.5 px in radius, so a segment spans about
+/// 2.6 px of its circumference — still round at the fitted zoom — and a full picture
+/// of [`MAX_VESSELS`](crate::model::MAX_VESSELS) dots costs 6,000 triangles instead of
+/// 8,000. That saving is part of what took the worst frame from 39,438 to 29,992; see
+/// [`WORST_FRAME_TRIANGLES`].
+const ROUND_SEGMENTS: usize = 6;
 /// How many segments the hover ring is drawn with.
 const RING_SEGMENTS: usize = 24;
 
@@ -863,9 +869,9 @@ mod tests {
         let projection = Projection::new(Camera::default(), [600.0, 400.0]);
         let origin = [0.0, 0.0];
         let cells = model::visible_cells(projection.visible_mercator());
-        let motorway = one_piece_layer(&points, 1 << 1, 2_000);
+        let motorway = one_piece_layer(&points, 0, 2_000);
         let coarse = one_piece_layer(&points, model::ROAD_COARSE, 0);
-        let primary = one_piece_layer(&points, model::ROAD_PRIMARY | 1 << 1, 2_000);
+        let primary = one_piece_layer(&points, model::ROAD_PRIMARY, 2_000);
 
         let roads = road_paths(&motorway, projection, origin, cells, RoadFilter::FineCopy);
         assert_eq!(roads[0].vertices.len(), 6, "one segment is two triangles");
@@ -1074,14 +1080,19 @@ mod tests {
     /// are absent here and come back through the fine copy at 1.6× on the design pane.
     const CLASS_ZERO_COARSE_PIECES: usize = 4_288;
 
+    /// The class-0 pieces the middle copy holds: the same long chains at 0.004°.
+    const CLASS_ZERO_MIDDLE_PIECES: usize = 4_389;
+
     /// The class-0 pieces the fine copy holds: every chain, including the short ones the
     /// runtime gates below [`model::ROAD_SHORT_CHAIN_METRES_PER_PIXEL`].
     const CLASS_ZERO_FINE_PIECES: usize = 7_728;
 
-    /// The class-0 records of both copies. Not a partition of the roads: the coarse copy
-    /// is a second geometry of the long chains the fine copy also holds, so the two
-    /// counts overlap in what they represent even though no record is in both.
-    const CLASS_ZERO_PIECES: usize = CLASS_ZERO_COARSE_PIECES + CLASS_ZERO_FINE_PIECES;
+    /// The class-0 records of all three copies. Not a partition of the roads: the middle
+    /// and coarse copies are second and third geometries of the long chains the fine copy
+    /// also holds, so the counts overlap in what they represent even though no record is
+    /// in more than one copy.
+    const CLASS_ZERO_PIECES: usize =
+        CLASS_ZERO_COARSE_PIECES + CLASS_ZERO_MIDDLE_PIECES + CLASS_ZERO_FINE_PIECES;
 
     /// The plan's §8 targets for the fitted frame: triangles and vertices.
     ///
@@ -1093,30 +1104,34 @@ mod tests {
 
     /// The plan's §8 target for the worst frame, in triangles.
     ///
-    /// **P2's acceptance does not include this frame**: it is moved to P4, which adds a
-    /// 0.002° land tier and the six-segment vessel dots. P2 pins the measured frame and
-    /// documents the gap; see [`WORST_FRAME_TRIANGLES`].
+    /// **Not met by P4.** P4 adds the 0.002° land tier, the six-segment vessel dots and a
+    /// 0.004° middle road copy; the worst frame falls from 39,438 to 29,992, still 2,992
+    /// over. See [`WORST_FRAME_TRIANGLES`] for the measured frame and the layer that owns
+    /// the gap.
     const WORST_FRAME_TARGET_TRIANGLES: usize = 27_000;
 
     /// The worst frame the viewport and zoom sweep found, in triangles.
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
     /// again rather than absorbed silently into the budget. The busiest view is the
-    /// **2,048 px wide pane at 1.539×**, just past the land tier's 450 m/px switch: the
-    /// land is the 0.001° tier there (18,126 triangles), the fine roads 11,988, the
-    /// borders 974, the lanes 302, the full vessel picture 8,000 and the ring 48 —
-    /// 39,438 in all, 12,438 over the plan's 27,000.
+    /// **2,048 px wide pane at 1× over the strait**: land 9,298 (the 0.003° tier), borders
+    /// 1,854, middle roads 12,590, lanes 202, the full vessel picture 6,000 and the ring
+    /// 48 — **29,992 in all, 2,992 over the plan's 27,000**.
     ///
-    /// The 2,048 pane is 688 m/px at 1×, below the coarse copy's 742 m/px threshold, so
-    /// it draws the fine copy at every zoom; its 1× frame is 35,267. The design pane's
-    /// 4× frame is 26,222 (under the target), 3.49× is 26,494, 2.8× is 30,135
-    /// ([`REFERENCE_FRAME_2_8_TRIANGLES`]). The remaining gap is land tier 0 plus the
-    /// vessel layer, and P4 owns it: a 0.002° land tier would cut the 18,126, and the
-    /// six-segment dots turn the 8,000 into 6,000. A middle road tier could cut the
-    /// 11,988 fine triangles, but the land term alone keeps the frame in 2^17, so road
-    /// thinning would save CPU only, not the instance-buffer step. P2 therefore records
-    /// the frame instead of closing it.
-    const WORST_FRAME_TRIANGLES: usize = 39_438;
+    /// It is not the frame P2 pinned. P4's 0.002° land tier and six-segment dots took the
+    /// old 2,048 × 1.539× frame from 39,438 to 24,310, and the 0.004° middle road copy
+    /// took the 2,048 × 1× frame from 33,267 to 28,945 over the middle and 29,992 over
+    /// the strait. The remaining gap is the middle road copy at 688 m/px (12,590) over
+    /// the 0.003° land (9,298) and the dashed borders (1,854); the wide 1,600 pane's
+    /// fitted 1× frame is 29,668 with the coarse road copy (11,652) and the same 0.003°
+    /// land (9,642). Both are inside the 1.2 px budget at their scale, so the next lever
+    /// is a coarser road copy for the 603–742 m/px band (0.0055–0.0065°) — but a single
+    /// 0.006° copy was measured at 33,634 on the 552 m/px frame just below its own
+    /// threshold, so it needs a second middle copy, not a replacement — or a fifth land
+    /// tier around 0.0055° (measured error about 1,000 m, threshold about 833 m/px) to
+    /// cover the 833–900 m/px band where the wide pane's coarse frame sits. Neither is
+    /// in P4's scope; the frame is recorded, not claimed.
+    const WORST_FRAME_TRIANGLES: usize = 29_992;
 
     /// The triangles the fitted frame with no vessels draws on the design's pane.
     ///
@@ -1146,20 +1161,18 @@ mod tests {
 
     /// The triangles the 2.8× design frame draws with a full picture.
     ///
-    /// Pinned separately because it is the frame the plan's worst-case analysis names:
-    /// the primary roads now wait for the closest zoom, so this frame is the fine copy
-    /// only. It is 30,135 (land 12,183 + borders 784 + fine 8,740 + lanes 380 + ships
-    /// 8,000 + ring 48), 3,135 over the plan's 27,000. The sweep's actual worst is the
-    /// 2,048 px pane's 1.539× land-tier switch (39,438), not this frame; the pin keeps
-    /// the plan's reference measured.
-    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 30_135;
+    /// Pinned separately because it is the frame the plan's worst-case analysis names.
+    /// With the 0.002° land tier it draws the 0.002° coast (7,122) and the fine road copy
+    /// (8,740): 7,122 + 784 + 8,740 + 380 + 6,000 + 48 = 23,074, inside the 27,000
+    /// target. It was 30,135 in P2.
+    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 23_074;
 
     /// One frame's triangles, layer by layer.
     ///
     /// The budget is a sum, so when a frame goes over it the question is always *which*
-    /// layer did: this keeps the road layer split into the two copies the filter chooses
-    /// between and the primary roads it may add, and every assertion that fails prints
-    /// the whole breakdown rather than only the total.
+    /// layer did: this keeps the road layer split into the three copies the filter
+    /// chooses between and the primary roads it may add, and every assertion that fails
+    /// prints the whole breakdown rather than only the total.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct LayerTriangles {
         /// The coastline tier the projection draws.
@@ -1168,7 +1181,9 @@ mod tests {
         borders: usize,
         /// The coarse copy of class 0, drawn while the scale is coarse.
         roads_coarse: usize,
-        /// The fine copy of class 0, drawn once the coarse copy is too coarse.
+        /// The middle copy of class 0, drawn between the coarse and fine copies.
+        roads_middle: usize,
+        /// The fine copy of class 0, drawn once the middle copy is too coarse.
         roads_fine: usize,
         /// The primary roads, drawn only at the closest zooms.
         roads_primary: usize,
@@ -1191,14 +1206,20 @@ mod tests {
         /// is added twice.
         fn of(layers: &MapLayers, ring: &Path<Pixels>, filter: RoadFilter) -> Self {
             let [class_zero, primary] = &layers.roads;
-            let (roads_coarse, roads_fine) = match filter {
-                RoadFilter::CoarseCopy => (triangles(class_zero), 0),
-                RoadFilter::FineCopy | RoadFilter::FineCopyAndPrimary => (0, triangles(class_zero)),
+            let (roads_coarse, roads_middle, roads_fine) = match filter {
+                RoadFilter::CoarseCopy => (triangles(class_zero), 0, 0),
+                RoadFilter::MiddleCopy | RoadFilter::MiddleCopyAndPrimary => {
+                    (0, triangles(class_zero), 0)
+                }
+                RoadFilter::FineCopy | RoadFilter::FineCopyAndPrimary => {
+                    (0, 0, triangles(class_zero))
+                }
             };
             Self {
                 land: triangles(&layers.land),
                 borders: triangles(&layers.borders),
                 roads_coarse,
+                roads_middle,
                 roads_fine,
                 roads_primary: triangles(primary),
                 lanes: triangles(&layers.lanes),
@@ -1213,6 +1234,7 @@ mod tests {
             self.land
                 + self.borders
                 + self.roads_coarse
+                + self.roads_middle
                 + self.roads_fine
                 + self.roads_primary
                 + self.lanes
@@ -1222,19 +1244,20 @@ mod tests {
 
         /// The road layer's triangles: the copy in use plus the primary roads.
         fn roads(self) -> usize {
-            self.roads_coarse + self.roads_fine + self.roads_primary
+            self.roads_coarse + self.roads_middle + self.roads_fine + self.roads_primary
         }
 
         /// The breakdown as one line, for an assertion that has to say where the budget
         /// went.
         fn describe(self) -> String {
             format!(
-                "land {}, borders {}, roads {} (coarse {}, fine {}, primary {}), lanes {}, \
-                 ships {}, ring {} = {} triangles",
+                "land {}, borders {}, roads {} (coarse {}, middle {}, fine {}, primary {}), \
+                 lanes {}, ships {}, ring {} = {} triangles",
                 self.land,
                 self.borders,
                 self.roads(),
                 self.roads_coarse,
+                self.roads_middle,
                 self.roads_fine,
                 self.roads_primary,
                 self.lanes,
@@ -1281,7 +1304,7 @@ mod tests {
     /// The service's bound on one picture, with every vessel's ship record arrived.
     ///
     /// A vessel with a ship record is one marker triangle, which is the typical frame;
-    /// [`a_full_picture`] is the worst one (an eight-segment dot per vessel).
+    /// [`a_full_picture`] is the worst one (a six-segment dot per vessel).
     fn a_typical_picture(projection: Projection) -> Vec<Vessel> {
         (0..MAX_VESSELS)
             .map(|index| {
@@ -1411,15 +1434,18 @@ mod tests {
             )
             .describe()
         );
+        for zoom in [1.1, 1.4, 1.539, 1.6, 2.0, 2.3, 2.6] {
+            let projection = at(wide_2048_viewport, zoom, Camera::default().center);
+            println!(
+                "2,048 pane at {zoom}× over the middle, full picture: {}",
+                breakdown(projection, &a_full_picture(projection), &ring).describe()
+            );
+        }
         assert_eq!(
             reference.total(),
             REFERENCE_FRAME_2_8_TRIANGLES,
-            "the 2.8× design frame moved: {}; the plan's worst-frame target is \
-             {WORST_FRAME_TARGET_TRIANGLES} and this frame is {} over it",
+            "the 2.8× design frame moved: {}",
             reference.describe(),
-            reference
-                .total()
-                .saturating_sub(WORST_FRAME_TARGET_TRIANGLES),
         );
 
         let viewports = [
@@ -1450,7 +1476,9 @@ mod tests {
             }
             for threshold in [
                 model::ROAD_COARSE_METRES_PER_PIXEL,
+                model::ROAD_MIDDLE_METRES_PER_PIXEL,
                 model::ROAD_SHORT_CHAIN_METRES_PER_PIXEL,
+                model::LAND_TIER_FINE_METRES_PER_PIXEL,
                 model::LAND_TIER_MIDDLE_METRES_PER_PIXEL,
                 model::LAND_TIER_COARSE_METRES_PER_PIXEL,
             ] {
@@ -1633,73 +1661,115 @@ mod tests {
         );
     }
 
-    /// The road detail follows the picture's scale, and the two copies of class 0 never
-    /// overlap: the fitted zoom draws the coarse copy and a closer one the fine copy, so
-    /// a road is drawn once and only once.
+    /// The road detail follows the picture's scale, and the three copies of class 0 never
+    /// overlap: the fitted zoom draws the coarse copy, a closer one the middle copy and a
+    /// closer one still the fine copy, so a road is drawn once and only once.
     #[test]
-    fn zooming_in_switches_from_the_coarse_copy_to_the_fine_one() {
-        let design_1x = Projection::new(Camera::default(), DESIGN_VIEWPORT).metres_per_pixel();
-        let design_1_6 = Projection::new(
-            Camera {
-                zoom: 1.6,
-                ..Camera::default()
-            },
-            DESIGN_VIEWPORT,
-        )
-        .metres_per_pixel();
-        let wide_2048_1x = Projection::new(Camera::default(), [2_048.0, 900.0]).metres_per_pixel();
+    fn zooming_in_walks_the_road_copies_from_coarse_to_fine() {
+        let at_zoom = |zoom: f32, viewport: [f32; 2]| {
+            Projection::new(
+                Camera {
+                    zoom,
+                    ..Camera::default()
+                },
+                viewport,
+            )
+            .metres_per_pixel()
+        };
+        let design_1x = at_zoom(model::MIN_ZOOM, DESIGN_VIEWPORT);
+        let design_1_6 = at_zoom(1.6, DESIGN_VIEWPORT);
+        let design_2_8 = at_zoom(2.8, DESIGN_VIEWPORT);
+        let wide_2048_1x = at_zoom(model::MIN_ZOOM, [2_048.0, 900.0]);
 
         // The class-0 copies are chosen by the picture's scale: on the design pane 1× is
-        // about 1,004 m/px, so 1.6× (about 627 m/px) draws the fine copy. A 2,048 px
-        // wide pane is 688 m/px at 1×, below the 742 m/px coarse threshold, so it draws
-        // the fine copy even at the fitted zoom. The primary layer is chosen by the zoom
-        // instead, so it joins only at the closest zoom, 4×.
+        // about 1,004 m/px, so 1.6× (about 627 m/px) draws the middle copy and 2.8×
+        // (about 359 m/px) the fine copy. A 2,048 px wide pane is 688 m/px at 1×, below
+        // the 742 m/px coarse threshold, so it draws the middle copy even at the fitted
+        // zoom. The primary layer is chosen by the zoom instead, so it joins only at the
+        // closest zoom, 4×.
         assert_eq!(model::road_filter(design_1x, 1.0), RoadFilter::CoarseCopy);
-        assert_eq!(model::road_filter(wide_2048_1x, 1.0), RoadFilter::FineCopy);
-        assert_eq!(model::road_filter(design_1_6, 1.6), RoadFilter::FineCopy);
-        assert_eq!(model::road_filter(design_1_6, 2.8), RoadFilter::FineCopy);
-        assert_eq!(model::road_filter(design_1_6, 3.5), RoadFilter::FineCopy);
         assert_eq!(
-            model::road_filter(design_1_6, 4.0),
+            model::road_filter(wide_2048_1x, 1.0),
+            RoadFilter::MiddleCopy
+        );
+        assert_eq!(model::road_filter(design_1_6, 1.6), RoadFilter::MiddleCopy);
+        assert_eq!(model::road_filter(design_2_8, 2.8), RoadFilter::FineCopy);
+        assert_eq!(model::road_filter(design_2_8, 3.5), RoadFilter::FineCopy);
+        assert_eq!(
+            model::road_filter(design_2_8, 4.0),
             RoadFilter::FineCopyAndPrimary
         );
 
         let scene = scene::scene().expect("the checked-in asset parses");
 
-        // Every class-0 record is drawn by exactly one of the two copies. The coarse copy
-        // holds only the chains at least the build's threshold long; the fine copy holds
-        // every chain, so the coarse geometry is a subset of the roads the fine one
-        // covers, not a partition of them.
-        let (mut coarse, mut fine) = (0, 0);
+        // At a fine scale every class-0 record is drawn by exactly one of the three
+        // copies. The middle and coarse copies hold only the chains at least the build's
+        // threshold long; the fine copy holds every chain, so the coarser geometries are
+        // subsets of the roads the fine one covers, not a partition of them.
+        let (mut coarse, mut middle, mut fine) = (0, 0, 0);
         for piece in &scene.roads.pieces {
             if piece.flags & model::ROAD_PRIMARY != 0 {
                 continue;
             }
-            let in_coarse = model::road_path(RoadFilter::CoarseCopy, piece, design_1_6).is_some();
-            let in_fine = model::road_path(RoadFilter::FineCopy, piece, design_1_6).is_some();
-            assert_ne!(
-                in_coarse, in_fine,
-                "a class-0 piece is drawn by exactly one of the two copies",
+            let copies = [
+                RoadFilter::CoarseCopy,
+                RoadFilter::MiddleCopy,
+                RoadFilter::FineCopy,
+            ]
+            .map(|filter| model::road_path(filter, piece, design_2_8).is_some());
+            assert_eq!(
+                copies.iter().filter(|drawn| **drawn).count(),
+                1,
+                "a class-0 piece is drawn by exactly one of the three copies",
             );
-            if in_coarse {
+            if copies[0] {
                 coarse += 1;
-            } else {
+            }
+            if copies[1] {
+                middle += 1;
+            }
+            if copies[2] {
                 fine += 1;
             }
         }
         assert_eq!(
-            (coarse, fine),
-            (CLASS_ZERO_COARSE_PIECES, CLASS_ZERO_FINE_PIECES)
+            (coarse, middle, fine),
+            (
+                CLASS_ZERO_COARSE_PIECES,
+                CLASS_ZERO_MIDDLE_PIECES,
+                CLASS_ZERO_FINE_PIECES
+            ),
+            "each of the three copies keeps its own records",
         );
         assert_eq!(
-            coarse + fine,
+            coarse + middle + fine,
             CLASS_ZERO_PIECES,
-            "every class-0 record is one of the two copies",
+            "every class-0 record is one of the three copies",
         );
 
-        // The short-chain gate is a second axis: at the fitted scale the fine copy drops
-        // every flagged piece, and at 1.6× it draws all of them again. The difference is
-        // exactly the flagged pieces, so a chain cannot be half drawn.
+        // The coarse and middle copies are the long chains only, and the fitted zoom
+        // draws every one of them whole: no chain is half drawn.
+        let drawn = |filter: RoadFilter, metres_per_pixel: f32| {
+            scene
+                .roads
+                .pieces
+                .iter()
+                .filter(|piece| model::road_path(filter, piece, metres_per_pixel).is_some())
+                .count()
+        };
+        assert_eq!(
+            drawn(RoadFilter::CoarseCopy, design_1x),
+            CLASS_ZERO_COARSE_PIECES,
+            "the fitted scale drops no coarse record",
+        );
+        assert_eq!(
+            drawn(RoadFilter::MiddleCopy, design_1_6),
+            CLASS_ZERO_MIDDLE_PIECES,
+            "1.6× drops no middle record",
+        );
+
+        // The short-chain gate is a second axis: the fine copy drops every flagged piece
+        // at the fitted scale and draws all of them again at 1.6×.
         let short = scene
             .roads
             .pieces
@@ -1707,7 +1777,7 @@ mod tests {
             .filter(|piece| piece.flags & model::ROAD_SHORT_CHAIN != 0)
             .count();
         assert!(short > 0, "the asset carries no short-chain piece");
-        let drawn = |metres_per_pixel: f32| {
+        let fine_drawn = |metres_per_pixel: f32| {
             scene
                 .roads
                 .pieces
@@ -1718,27 +1788,18 @@ mod tests {
                 .count()
         };
         assert_eq!(
-            drawn(design_1_6) - drawn(design_1x),
+            fine_drawn(design_1_6) - fine_drawn(design_1x),
             short,
             "the fitted scale drops exactly the short chains and 1.6× restores them",
         );
         assert_eq!(
-            drawn(design_1_6),
+            fine_drawn(design_1_6),
             CLASS_ZERO_FINE_PIECES,
-            "at 1.6× the fine copy draws every class-0 record, so every chain is back",
-        );
-        let coarse_at_1x = scene
-            .roads
-            .pieces
-            .iter()
-            .filter(|piece| model::road_path(RoadFilter::CoarseCopy, piece, design_1x).is_some())
-            .count();
-        assert_eq!(
-            coarse_at_1x, CLASS_ZERO_COARSE_PIECES,
-            "the fitted scale drops no coarse record: every chain it draws is whole",
+            "at 1.6× the fine copy would draw every class-0 record, so every chain is back",
         );
 
-        // And the layers follow the scale: 1× draws no primary road, 4× does.
+        // And the layers follow the scale: 1× draws the coarse copy, 1.6× the middle one,
+        // 2.8× the fine one, and only 4× adds the primary roads.
         let at = |zoom: f32| {
             map_layers(
                 Some(scene),
@@ -1755,27 +1816,24 @@ mod tests {
             )
         };
         let fitted = at(model::MIN_ZOOM);
+        let middle_zoom = at(1.6);
+        let detailed = at(2.8);
         assert!(
-            !fitted.roads[0].vertices.is_empty(),
-            "the fitted zoom draws the coarse copy",
+            !fitted.roads[0].vertices.is_empty()
+                && !middle_zoom.roads[0].vertices.is_empty()
+                && !detailed.roads[0].vertices.is_empty(),
+            "every zoom band draws a class-0 copy",
         );
         assert!(
-            fitted.roads[1].vertices.is_empty(),
+            fitted.roads[0].vertices.len() != middle_zoom.roads[0].vertices.len()
+                && middle_zoom.roads[0].vertices.len() != detailed.roads[0].vertices.len(),
+            "the three bands draw three different geometries, not the same one three times",
+        );
+        assert!(
+            fitted.roads[1].vertices.is_empty()
+                && middle_zoom.roads[1].vertices.is_empty()
+                && detailed.roads[1].vertices.is_empty(),
             "primary roads wait for the closest zoom",
-        );
-        let detailed = at(1.6);
-        assert!(
-            !detailed.roads[0].vertices.is_empty(),
-            "the first threshold switches to the fine copy",
-        );
-        assert_ne!(
-            fitted.roads[0].vertices.len(),
-            detailed.roads[0].vertices.len(),
-            "the two zooms draw two different geometries, not the same one twice",
-        );
-        assert!(
-            at(2.8).roads[1].vertices.is_empty() && at(3.5).roads[1].vertices.is_empty(),
-            "2.8× and 3.5× are still short of the primary threshold",
         );
         assert!(
             !at(4.0).roads[1].vertices.is_empty(),
