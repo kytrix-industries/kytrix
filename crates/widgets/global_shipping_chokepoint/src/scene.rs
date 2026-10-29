@@ -190,10 +190,11 @@ pub(super) struct LandLayer {
     /// A frame visits the cells its viewport touches plus one cell of margin, which
     /// covers every triangle whose box lies within one cell of its centroid cell. The
     /// tessellator also emits triangles spanning most of the map — the largest covers
-    /// 23.4% of it, and these wide ones are 98.8% of the land's area — so bucketing those
+    /// 23.8% of it, and these wide ones are 98.7% of the land's area — so bucketing those
     /// by centroid would leave them out of nearly every frame that can see them. They
     /// are kept here instead and tested against the viewport's own rectangle: 3,389
-    /// boxes per frame at the finest tier rather than holes in the coastline.
+    /// boxes per frame at the finest tier (2,070 / 1,591 / 958 at the coarser ones)
+    /// rather than holes in the coastline.
     pub wide: Vec<[f32; 6]>,
 }
 
@@ -221,6 +222,10 @@ pub(super) struct Piece {
     /// on borders. Bits the format does not define are rejected.
     pub flags: u8,
     /// The piece's length in metres, as the build measured it; zero on borders.
+    ///
+    /// It never filters at runtime: only the border validation (which requires zero) and
+    /// the tests read it. It is kept because it is the build's own measure of a piece and
+    /// what the LOD statistics in `assets/README.md` are counted from.
     pub length_m: u32,
 }
 
@@ -508,7 +513,7 @@ impl SectionKind {
 enum LineKind {
     /// Land borders: no flags and no length.
     Borders,
-    /// Roads: the three flag bits (0, 2, 3), and a length in metres.
+    /// Roads: the four flag bits (0–3), and a length in metres.
     Roads,
 }
 
@@ -1377,8 +1382,8 @@ mod tests {
         // centroid: at four times the fitted zoom over the strait, 561 of the 4,664
         // triangles the finest viewport touches (12%) have their centroid in a cell the
         // ungrown span does not visit, and they carry 69% of the land area it shows.
-        // Every tier has wide triangles of its own (3,389 / 1,591 / 933), so the wide
-        // path is exercised at all three.
+        // Every tier has wide triangles of its own (3,389 / 2,070 / 1,591 / 958), so the
+        // wide path is exercised at all four.
         let scene = scene().expect("the checked-in asset parses");
         let visible = strait_viewport();
         let cells = model::visible_cells(visible).grown();

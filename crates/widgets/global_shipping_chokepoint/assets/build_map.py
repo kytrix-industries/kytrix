@@ -53,7 +53,7 @@ import shapely
 from shapely import STRtree, box, make_valid
 from shapely.geometry import LineString, Point, Polygon, shape
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import linemerge, unary_union
+from shapely.ops import linemerge, nearest_points, unary_union
 
 # The asset directory is inside the repository: importing `download_map` must not
 # leave a `__pycache__` next to the committed files.
@@ -175,6 +175,12 @@ SCALE_LATITUDE = (SOUTH + NORTH) / 2
 #: pixels the plan's §8 measures them in. The runtime computes the real figure from
 #: the projection, and this is that figure for the pane the design is checked on.
 FITTED_METRES_PER_PIXEL = 1_003.95
+#: The runtime's worst-error budget at a land tier's switch, in pixels.
+#:
+#: `src/model.rs` holds the same 1.2 as `LAND_TIER_WORST_CASE_AT_THRESHOLD_PX`; the
+#: build prints each tier's derived threshold with it so the number in the model can
+#: be checked against the measurement rather than against the nominal tolerance.
+TIER_PIXEL_BUDGET = 1.2
 
 #: Below these sizes a source is not a plausible download of that file.
 PBF_MIN_BYTES = 20 * 1024**2
@@ -223,6 +229,14 @@ class LandTier:
     #: The worst distance from tier 0's drawn coastline: the discrete Hausdorff
     #: distance between the two simplified geometries, in degrees. Zero on tier 0.
     hausdorff_deg: float = 0.0
+    #: The same distance measured in metres on the local equirectangular plane, which
+    #: is what the runtime's thresholds are derived from. Zero on tier 0.
+    hausdorff_m: float = 0.0
+    #: The pair of points that attains `hausdorff_m`, as longitude and latitude.
+    worst_pair: tuple[tuple[float, float], tuple[float, float]] = (
+        (0.0, 0.0),
+        (0.0, 0.0),
+    )
 
 
 @dataclass
@@ -645,18 +659,37 @@ def load_land(zip_path: Path, clip_box) -> Land:
         )
 
     # How far each coarser tier moved the coast: the discrete Hausdorff distance to
-    # tier 0's drawn geometry, in degrees. This is the number the runtime's
-    # thresholds are derived from (`src/model.rs`), so it is measured here rather
-    # than estimated from the tolerance.
+    # tier 0's drawn boundary, measured in metres on the same local equirectangular
+    # plane `length_metres` uses. The degree figure is kept for reference; the metres
+    # are what the runtime's thresholds are derived from (`src/model.rs`), and the
+    # point pair is printed so the number can be checked by hand.
+    tier0_local = local_metres(tiers[0].geometry.boundary)
     for tier in tiers[1:]:
         tier.hausdorff_deg = shapely.hausdorff_distance(
             tiers[0].geometry, tier.geometry
         )
-        metres = tier.hausdorff_deg * DEGREE_M * math.cos(math.radians(SCALE_LATITUDE))
+        tier_local = local_metres(tier.geometry.boundary)
+        metres, first, second = worst_local_pair(tier0_local, tier_local)
+        check = shapely.hausdorff_distance(tier0_local, tier_local)
+        if abs(check - metres) > 1e-6:
+            raise SystemExit(
+                f"error: the {tier.tolerance}° tier's worst pair is {metres:.6f} m, "
+                f"but the boundary Hausdorff is {check:.6f} m"
+            )
+        tier.hausdorff_m = metres
+        tier.worst_pair = (
+            local_pair_to_degrees(first),
+            local_pair_to_degrees(second),
+        )
+        (first_lon, first_lat), (second_lon, second_lat) = tier.worst_pair
+        threshold = math.ceil(metres / TIER_PIXEL_BUDGET)
         print(
             f"  worst deviation from tier 0 at {tier.tolerance}: "
-            f"{tier.hausdorff_deg:.6f} deg = {metres:.1f} m = "
-            f"{metres / FITTED_METRES_PER_PIXEL:.3f} px at the fitted zoom",
+            f"{tier.hausdorff_deg:.6f} deg = {metres:.1f} m on the local metric = "
+            f"{metres / FITTED_METRES_PER_PIXEL:.3f} px at the fitted zoom; "
+            f"threshold {threshold} m/px; pair "
+            f"({first_lon:.7f},{first_lat:.7f}) -> "
+            f"({second_lon:.7f},{second_lat:.7f})",
             flush=True,
         )
 
@@ -688,6 +721,62 @@ def load_land(zip_path: Path, clip_box) -> Land:
         )
 
     return Land(tiers, tiers[0].geometry)
+
+
+def local_metres(geometry: BaseGeometry) -> BaseGeometry:
+    """The geometry projected to metres on the local equirectangular plane.
+
+    The same metric `length_metres` uses: a degree of longitude is `cos(latitude)`
+    of a degree of latitude, applied at the map's scale latitude. A Douglas–Peucker
+    tolerance is isotropic in degrees, so a north-south displacement is not shrunk
+    by the longitude axis; this projection is what makes the Hausdorff distance a
+    ground distance rather than a longitude-scaled one.
+    """
+    cos_latitude = math.cos(math.radians(SCALE_LATITUDE))
+    return shapely.transform(
+        geometry,
+        lambda coordinates: coordinates * [DEGREE_M * cos_latitude, DEGREE_M],
+    )
+
+
+def worst_local_pair(
+    reference: BaseGeometry, other: BaseGeometry
+) -> tuple[float, tuple[float, float], tuple[float, float]]:
+    """The worst boundary-to-boundary distance in metres, and the pair that attains it.
+
+    Both geometries are the **boundaries** of two tiers, already projected by
+    `local_metres`: the coast is a line, and a point inside the filled polygon is not
+    a distance from the coast. The distance is the discrete Hausdorff distance the
+    build has always measured — the largest distance from a vertex of one boundary
+    to the other boundary — but in the local metric, so a north-south displacement
+    is not multiplied by the longitude scale.
+    """
+
+    def farthest(
+        source: BaseGeometry, target: BaseGeometry
+    ) -> tuple[float, tuple[float, float], tuple[float, float]]:
+        coordinates = shapely.get_coordinates(source)
+        points = shapely.points(coordinates)
+        distances = shapely.distance(target, points)
+        index = int(max(range(len(distances)), key=lambda position: distances[position]))
+        nearest = nearest_points(target, points[index])[0]
+        return (
+            float(distances[index]),
+            (float(coordinates[index][0]), float(coordinates[index][1])),
+            (float(nearest.x), float(nearest.y)),
+        )
+
+    forward = farthest(reference, other)
+    backward = farthest(other, reference)
+    return max(forward, backward, key=lambda entry: entry[0])
+
+
+def local_pair_to_degrees(
+    pair: tuple[float, float],
+) -> tuple[float, float]:
+    """The longitude and latitude a local-metre pair came from."""
+    cos_latitude = math.cos(math.radians(SCALE_LATITUDE))
+    return (pair[0] / (DEGREE_M * cos_latitude), pair[1] / DEGREE_M)
 
 
 def way_touches_land(mask: BaseGeometry, coords: list[tuple[float, float]]) -> bool:
@@ -1183,8 +1272,19 @@ def build(assets: Path, out: Path) -> None:
         border_pieces, "borders", measure_lengths=False
     )
     road_pieces, road_cells = cut_per_cell(road_pieces, "roads", measure_lengths=True)
-    # The 1× coarse copy has to be the kept chains, not a sample of their pieces:
-    # prove the cell cut left every chain joined end to end before packing it.
+    # Every copy's cell cut has to rejoin to its own chain geometry, not a sample of
+    # pieces. The fine copy is the only one that holds the short chains, so it proves
+    # the whole network; the middle and coarse copies prove the long chains they store,
+    # and the primary copy proves its own chains.
+    assert_chain_partition(
+        [
+            piece
+            for piece in road_pieces
+            if piece.flags & (FLAG_COARSE | FLAG_MIDDLE | FLAG_PRIMARY) == 0
+        ],
+        [(chain.fine, chain.reference_latitude) for chain in chains],
+        "fine",
+    )
     assert_chain_partition(
         [piece for piece in road_pieces if piece.flags & FLAG_MIDDLE],
         [(chain.middle, chain.reference_latitude) for chain in kept],

@@ -31,7 +31,7 @@ const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 /// Six rather than eight: the dot is 2.5 px in radius, so a segment spans about
 /// 2.6 px of its circumference — still round at the fitted zoom — and a full picture
 /// of [`MAX_VESSELS`](crate::model::MAX_VESSELS) dots costs 6,000 triangles instead of
-/// 8,000. That saving is part of what took the worst frame from 39,438 to 29,992; see
+/// 8,000. That saving is part of what took the worst frame from 39,438 to 31,815; see
 /// [`WORST_FRAME_TRIANGLES`].
 const ROUND_SEGMENTS: usize = 6;
 /// How many segments the hover ring is drawn with.
@@ -1105,7 +1105,7 @@ mod tests {
     /// The plan's §8 target for the worst frame, in triangles.
     ///
     /// **Not met by P4.** P4 adds the 0.002° land tier, the six-segment vessel dots and a
-    /// 0.004° middle road copy; the worst frame falls from 39,438 to 29,992, still 2,992
+    /// 0.004° middle road copy; the worst frame falls from 39,438 to 31,815, still 4,815
     /// over. See [`WORST_FRAME_TRIANGLES`] for the measured frame and the layer that owns
     /// the gap.
     const WORST_FRAME_TARGET_TRIANGLES: usize = 27_000;
@@ -1114,24 +1114,21 @@ mod tests {
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
     /// again rather than absorbed silently into the budget. The busiest view is the
-    /// **2,048 px wide pane at 1× over the strait**: land 9,298 (the 0.003° tier), borders
-    /// 1,854, middle roads 12,590, lanes 202, the full vessel picture 6,000 and the ring
-    /// 48 — **29,992 in all, 2,992 over the plan's 27,000**.
+    /// **2,048 px wide pane at 1.8648× over 25.879N, 52.799E**: land 10,721 (the 0.002°
+    /// tier), borders 850, fine roads 13,916, lanes 280, the full vessel picture 6,000 and
+    /// the ring 48 — **31,815 in all, 4,815 over the plan's 27,000**.
     ///
-    /// It is not the frame P2 pinned. P4's 0.002° land tier and six-segment dots took the
-    /// old 2,048 × 1.539× frame from 39,438 to 24,310, and the 0.004° middle road copy
-    /// took the 2,048 × 1× frame from 33,267 to 28,945 over the middle and 29,992 over
-    /// the strait. The remaining gap is the middle road copy at 688 m/px (12,590) over
-    /// the 0.003° land (9,298) and the dashed borders (1,854); the wide 1,600 pane's
-    /// fitted 1× frame is 29,668 with the coarse road copy (11,652) and the same 0.003°
-    /// land (9,642). Both are inside the 1.2 px budget at their scale, so the next lever
-    /// is a coarser road copy for the 603–742 m/px band (0.0055–0.0065°) — but a single
-    /// 0.006° copy was measured at 33,634 on the 552 m/px frame just below its own
-    /// threshold, so it needs a second middle copy, not a replacement — or a fifth land
-    /// tier around 0.0055° (measured error about 1,000 m, threshold about 833 m/px) to
-    /// cover the 833–900 m/px band where the wide pane's coarse frame sits. Neither is
-    /// in P4's scope; the frame is recorded, not claimed.
-    const WORST_FRAME_TRIANGLES: usize = 29_992;
+    /// The frame sits just below the 0.004° middle copy's 371.1 m/px switch: at 369 m/px
+    /// the fine road copy is drawn (13,916), while the middle copy is the next band up.
+    /// It is the road LOD cliff, not a land threshold. The sweep's 7 × 5 centre grid plus
+    /// two 9 × 9 refinement rounds found it; the review's 2,048 × 1× frame at 27.057N is
+    /// 31,149, 666 lower. The wide 1,600 pane's fitted 1× frame is 29,668 (coarse 11,652
+    /// over the 0.003° land 9,642). The next lever is a finer middle road copy (0.003°) for
+    /// the 278–371 m/px band, or a lower 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
+    /// over the 1.2 px budget, so it is not acceptable. A fifth land tier at 725–911 m/px
+    /// would not touch this frame. Neither is in P4's scope; the frame is recorded, not
+    /// claimed.
+    const WORST_FRAME_TRIANGLES: usize = 31_815;
 
     /// The triangles the fitted frame with no vessels draws on the design's pane.
     ///
@@ -1326,6 +1323,96 @@ mod tests {
             .collect()
     }
 
+    /// The number of latitude samples in the sweep's coarse centre grid.
+    const SWEEP_LATITUDES: usize = 7;
+    /// The number of longitude samples in the sweep's coarse centre grid.
+    const SWEEP_LONGITUDES: usize = 5;
+    /// How many of the heaviest coarse frames are refined.
+    const SWEEP_REFINEMENTS: usize = 20;
+    /// The samples per axis in each refinement round.
+    const SWEEP_REFINEMENT: usize = 9;
+    /// How many refinement rounds each of those frames gets.
+    const SWEEP_REFINEMENT_ROUNDS: usize = 2;
+
+    /// The camera's clamped centre range at `viewport` and `zoom`, as `[x0, x1, y0, y1]`.
+    ///
+    /// The camera may pan until the map's edge reaches the viewport, so the centre is
+    /// confined to the map grown in by half a viewport. An axis whose half-extent does
+    /// not fit (a pane whose aspect matches the map's) has one point, its centre.
+    fn centre_range(viewport: [f32; 2], zoom: f32) -> [f32; 4] {
+        let [west, south, east, north] = model::mercator_bounds();
+        let scale = model::fit_px_per_merc(viewport) * zoom;
+        if !scale.is_finite() || scale <= 0.0 {
+            let [x, y] = Camera::default().center;
+            return [x, x, y, y];
+        }
+        let half = [viewport[0] / (2.0 * scale), viewport[1] / (2.0 * scale)];
+        let x = if west + half[0] >= east - half[0] {
+            let centre = (west + east) / 2.0;
+            (centre, centre)
+        } else {
+            (west + half[0], east - half[0])
+        };
+        let y = if south + half[1] >= north - half[1] {
+            let centre = (south + north) / 2.0;
+            (centre, centre)
+        } else {
+            (south + half[1], north - half[1])
+        };
+        [x.0, x.1, y.0, y.1]
+    }
+
+    /// A `rows × cols` grid of camera centres over `range`, each with its label.
+    ///
+    /// The samples include both ends of the range, which is where the camera can be
+    /// left after a drag. A degenerate axis collapses to its one point, so a pane whose
+    /// viewport already spans the map samples only the centres it can reach.
+    fn sample_centres(range: [f32; 4], rows: usize, cols: usize) -> Vec<([f32; 2], String)> {
+        let mut centres = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            let ty = if rows <= 1 {
+                0.5
+            } else {
+                row as f32 / (rows - 1) as f32
+            };
+            let y = range[2] + (range[3] - range[2]) * ty;
+            for col in 0..cols {
+                let tx = if cols <= 1 {
+                    0.5
+                } else {
+                    col as f32 / (cols - 1) as f32
+                };
+                let x = range[0] + (range[1] - range[0]) * tx;
+                centres.push((
+                    [x, y],
+                    format!("{:.3}N {:.3}E", model::latitude_of(y), x.to_degrees()),
+                ));
+            }
+        }
+        centres.sort_by(|left, right| {
+            left.0[0]
+                .total_cmp(&right.0[0])
+                .then(left.0[1].total_cmp(&right.0[1]))
+        });
+        centres.dedup_by(|left, right| left.0 == right.0);
+        centres
+    }
+
+    /// One frame the sweep measured, with the camera that produced it.
+    #[derive(Clone, Copy, Debug)]
+    struct SweptFrame {
+        /// Which of the sweep's panes this frame was drawn in.
+        pane: &'static str,
+        /// The pane's size, in pixels.
+        viewport: [f32; 2],
+        /// The camera's centre, in Mercator radians.
+        center: [f32; 2],
+        /// The camera's zoom.
+        zoom: f32,
+        /// The layer-by-layer triangle count.
+        triangles: LayerTriangles,
+    }
+
     /// The picture has to fit a 60 Hz frame in the worst view the camera can be left in.
     ///
     /// The totals are the triangles the frame really draws: every path of [`MapLayers`]
@@ -1336,10 +1423,12 @@ mod tests {
     /// not the fitted one: the coast and the road copy both get heavier as the camera
     /// zooms in, and the peak sits just past a switch — see [`WORST_FRAME_TRIANGLES`] for
     /// the view the current asset peaks at. The sweep below covers the user's 1.56:1 pane,
-    /// 1,600 and 2,048 px wide panes and a tall one, over the map's middle, Dubai and the
-    /// strait, at a dense zoom walk plus the exact zooms every switch happens at — the
-    /// road copy, the short-chain gate and the two land tiers — because the count is
-    /// piecewise constant between switches and peaks just above each one.
+    /// 1,600 and 2,048 px wide panes and a tall one, at a dense zoom walk plus the exact
+    /// zooms every switch happens at, and at a **7 × 5 grid of camera centres over the
+    /// camera's clamp range**, refined by two 9 × 9 rounds around the twenty heaviest
+    /// coarse frames. That is a grid sample, not an analytic upper bound: a view between
+    /// two samples can be heavier by whatever the coastline changes between them, which is
+    /// why the pin is the measured maximum and the next lever is measured, not assumed.
     #[test]
     fn the_visible_triangle_budget_is_under_the_frame_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
@@ -1454,13 +1543,39 @@ mod tests {
             ("wide-2048", [2_048.0, 900.0]),
             ("tall", [900.0, 1_400.0]),
         ];
-        let centres = [
-            ("the middle", Camera::default().center),
-            ("Dubai", model::project(55.30, 25.27)),
-            ("the strait", model::project(56.35, 26.30)),
-        ];
 
-        let mut worst = (LayerTriangles::default(), "no view".to_string());
+        let measure = |pane: &'static str, viewport: [f32; 2], zoom: f32, center: [f32; 2]| {
+            let projection = at(viewport, zoom, center);
+            let vessels = a_full_picture(projection);
+            let layers = map_layers(Some(scene), projection, origin, &vessels);
+            assert_eq!(
+                layers.ships.unknown.vertices.len() / 3,
+                MAX_VESSELS * ROUND_SEGMENTS,
+                "the full picture is in frame, so the worst case is the one counted",
+            );
+            let triangles = LayerTriangles::of(
+                &layers,
+                &ring,
+                model::road_filter(projection.metres_per_pixel(), projection.zoom),
+            );
+            let latitude = model::latitude_of(center[1]);
+            let longitude = center[0].to_degrees();
+            assert!(
+                triangles.total() <= FRAME_TRIANGLE_BUDGET,
+                "{pane} pane at {zoom}× over {latitude:.3}N {longitude:.3}E draws {}, over \
+                 the {FRAME_TRIANGLE_BUDGET} budget",
+                triangles.describe(),
+            );
+            SweptFrame {
+                pane,
+                viewport,
+                center,
+                zoom,
+                triangles,
+            }
+        };
+
+        let mut frames: Vec<SweptFrame> = Vec::new();
         for (pane, viewport) in viewports {
             // The zoom at which a projection of this viewport reaches a metres-per-pixel
             // threshold. The switches are scale-based, so their zooms differ per pane.
@@ -1493,41 +1608,66 @@ mod tests {
             zooms.dedup();
 
             for zoom in zooms {
-                for (place, center) in centres {
-                    let projection = at(viewport, zoom, center);
-                    let vessels = a_full_picture(projection);
-                    let layers = map_layers(Some(scene), projection, origin, &vessels);
-                    assert_eq!(
-                        layers.ships.unknown.vertices.len() / 3,
-                        MAX_VESSELS * ROUND_SEGMENTS,
-                        "the full picture is in frame, so the worst case is the one counted",
-                    );
-                    let triangles = LayerTriangles::of(
-                        &layers,
-                        &ring,
-                        model::road_filter(projection.metres_per_pixel(), projection.zoom),
-                    );
-                    assert!(
-                        triangles.total() <= FRAME_TRIANGLE_BUDGET,
-                        "{pane} pane at {zoom}× over {place} draws {}, over the \
-                         {FRAME_TRIANGLE_BUDGET} budget",
-                        triangles.describe(),
-                    );
-                    if triangles.total() > worst.0.total() {
-                        worst = (triangles, format!("{pane} pane at {zoom}× over {place}"));
-                    }
+                let range = centre_range(viewport, zoom);
+                for (center, _place) in sample_centres(range, SWEEP_LATITUDES, SWEEP_LONGITUDES) {
+                    frames.push(measure(pane, viewport, zoom, center));
                 }
             }
         }
+        frames.sort_by_key(|frame| std::cmp::Reverse(frame.triangles.total()));
+        let mut worst = frames[0];
 
-        println!("worst frame ({}): {}", worst.1, worst.0.describe());
+        // Refine around the heaviest coarse frames, two rounds each: the first samples a
+        // window one coarse step either way, the second one quarter of that, so a peak
+        // between two coarse samples is found to about a thirty-second of a cell. This is
+        // where the pin comes from; the coarse grid alone can miss a frame by a few
+        // hundred triangles.
+        for seed in frames.iter().take(SWEEP_REFINEMENTS) {
+            let range = centre_range(seed.viewport, seed.zoom);
+            let mut step = [
+                (range[1] - range[0]) / (SWEEP_LONGITUDES.max(2) - 1) as f32,
+                (range[3] - range[2]) / (SWEEP_LATITUDES.max(2) - 1) as f32,
+            ];
+            let mut local = *seed;
+            for _ in 0..SWEEP_REFINEMENT_ROUNDS {
+                let window = [
+                    (local.center[0] - step[0]).max(range[0]),
+                    (local.center[0] + step[0]).min(range[1]),
+                    (local.center[1] - step[1]).max(range[2]),
+                    (local.center[1] + step[1]).min(range[3]),
+                ];
+                for (center, _place) in sample_centres(window, SWEEP_REFINEMENT, SWEEP_REFINEMENT) {
+                    let frame = measure(seed.pane, seed.viewport, seed.zoom, center);
+                    if frame.triangles.total() > local.triangles.total() {
+                        local = frame;
+                    }
+                    if frame.triangles.total() > worst.triangles.total() {
+                        worst = frame;
+                    }
+                }
+                step = [step[0] / 4.0, step[1] / 4.0];
+            }
+        }
+
+        let latitude = model::latitude_of(worst.center[1]);
+        let longitude = worst.center[0].to_degrees();
+        println!(
+            "worst frame ({} pane at {}×, {latitude:.3}N {longitude:.3}E): {}",
+            worst.pane,
+            worst.zoom,
+            worst.triangles.describe(),
+        );
         assert_eq!(
-            worst.0.total(),
+            worst.triangles.total(),
             WORST_FRAME_TRIANGLES,
-            "the sweep's worst frame is {}; the plan's target is \
-             {WORST_FRAME_TARGET_TRIANGLES}, {} over it",
-            worst.0.describe(),
-            worst.0.total().saturating_sub(WORST_FRAME_TARGET_TRIANGLES),
+            "the sweep's worst frame is {} at {}× over {latitude:.3}N {longitude:.3}E; the \
+             plan's target is {WORST_FRAME_TARGET_TRIANGLES}, {} over it",
+            worst.triangles.describe(),
+            worst.zoom,
+            worst
+                .triangles
+                .total()
+                .saturating_sub(WORST_FRAME_TARGET_TRIANGLES),
         );
     }
 

@@ -134,33 +134,36 @@ pub(super) const LAND_TIERS: usize = 4;
 /// The tiers are chosen by the scale the projection actually draws at, never by the
 /// camera's zoom number: a zoom is relative to the pane's own fitted scale, so `1×`
 /// is 1.0 km/px on the user's 1,404 × 900 pane and 0.7 km/px on a 2,048 px wide one.
-/// The threshold is the measured 1,043.4 m worst deviation divided by the 1.2 px
-/// budget — 869.5 — rounded up to 900, which leaves 3% of the budget unused. At the
-/// switch the tier is 1.16 px off; at the design pane's fitted zoom it is 1.04 px
-/// off, which is what the tier buys. Lowering it to the exact 869.5 would put the
-/// 1,600 px wide pane's fitted 1× frame (880 m/px) on the coarse coast, but it only
-/// moves the worst frame to the switch's finer side, where the 0.003° tier is drawn
-/// at 869 m/px and is 4,000 triangles heavier; the measured worst frame in §8 is
-/// therefore the 0.003° side, and the threshold stays a round-up rather than a
-/// knife-edge.
-pub(super) const LAND_TIER_COARSE_METRES_PER_PIXEL: f32 = 900.0;
+/// The threshold is the measured **1,092.9 m** worst deviation on the local
+/// equirectangular plane (not the longitude-scaled 1,043.4 m the first pass printed),
+/// divided by the 1.2 px budget: `1,092.9 / 1.2 = 910.8`, rounded up to **911**.
+/// The worst pair is not purely north-south — `(50.3324772, 25.5430598) →
+/// (50.3241615, 25.5367125)`, Δlon 0.0083° and Δlat 0.0063° — so the latitude-axis
+/// bound 1,158.4 m overstates it; using that bound would set 965 and needlessly drop
+/// the 1,600 px wide pane's fitted 1× frame (880 m/px) to the 0.003° tier. At 911 the
+/// tier measures 1.1996 px at the switch and 1.089 px at the design pane's fitted
+/// zoom, inside both budgets.
+pub(super) const LAND_TIER_COARSE_METRES_PER_PIXEL: f32 = 911.0;
 
 /// The metres per pixel at and above which the middle coast (0.003°) is drawn.
 ///
-/// Its 456.5 m worst deviation is 1.01 px at this threshold and 0.45 px at the design
-/// pane's fitted zoom.
+/// Its measured **503.4 m** worst deviation is 1.119 px at this threshold and 0.501 px
+/// at the design pane's fitted zoom. The exact derived threshold is `503.4 / 1.2 =
+/// 419.5`, so 450 is a round-up that leaves 6.7% of the budget unused; it is kept
+/// because it is the design's round number and the 0.002° tier covers the scales below
+/// it without a gap.
 pub(super) const LAND_TIER_MIDDLE_METRES_PER_PIXEL: f32 = 450.0;
 
 /// The metres per pixel at and above which the 0.002° coast is drawn.
 ///
 /// Derived from the measurement the same way the two coarser thresholds are: the
-/// tier's worst deviation is **312.4 m**, and `312.4 / 1.2 = 260.4` is the coarsest
-/// scale at which it is still inside the 1.2 px budget. 261 is that figure rounded
-/// up to a whole metre per pixel, so the tier measures 1.197 px at the switch —
-/// just inside the budget rather than just outside it. Below it the 0.001° tier is
-/// drawn, which is 100 m on the ground and well under a pixel at every scale this
-/// threshold leaves it.
-pub(super) const LAND_TIER_FINE_METRES_PER_PIXEL: f32 = 261.0;
+/// tier's worst deviation is **344.8 m** on the local metric, and `344.8 / 1.2 =
+/// 287.3` is the coarsest scale at which it is still inside the 1.2 px budget. 288 is
+/// that figure rounded up to a whole metre per pixel, so the tier measures 1.197 px at
+/// the switch — just inside the budget rather than just outside it. Below it the
+/// 0.001° tier is drawn, which is 100 m on the ground and well under a pixel at every
+/// scale this threshold leaves it.
+pub(super) const LAND_TIER_FINE_METRES_PER_PIXEL: f32 = 288.0;
 
 /// The coastline tier a projection drawing `metres_per_pixel` metres per pixel draws.
 ///
@@ -3487,15 +3490,15 @@ mod tests {
 
     #[test]
     fn the_land_tier_switches_at_its_three_thresholds() {
-        assert_eq!(LAND_TIER_FINE_METRES_PER_PIXEL, 261.0);
+        assert_eq!(LAND_TIER_FINE_METRES_PER_PIXEL, 288.0);
         assert_eq!(LAND_TIER_MIDDLE_METRES_PER_PIXEL, 450.0);
-        assert_eq!(LAND_TIER_COARSE_METRES_PER_PIXEL, 900.0);
+        assert_eq!(LAND_TIER_COARSE_METRES_PER_PIXEL, 911.0);
 
         // Below the 0.002° threshold the finest coast is the only one whose error is
         // under a pixel.
         assert_eq!(land_tier(0.0), 0);
         assert_eq!(land_tier(1.0), 0);
-        assert_eq!(land_tier(260.999), 0);
+        assert_eq!(land_tier(287.999), 0);
         assert_eq!(
             land_tier(LAND_TIER_FINE_METRES_PER_PIXEL),
             1,
@@ -3509,7 +3512,7 @@ mod tests {
             "the 0.003° tier starts at the middle threshold",
         );
         assert_eq!(land_tier(700.0), 2);
-        assert_eq!(land_tier(899.999), 2);
+        assert_eq!(land_tier(910.999), 2);
         assert_eq!(
             land_tier(LAND_TIER_COARSE_METRES_PER_PIXEL),
             3,
@@ -3539,30 +3542,33 @@ mod tests {
 
     /// The measured worst distance each tier's drawn coast sits from tier 0's, in metres.
     ///
-    /// `assets/build_map.py` prints the discrete Hausdorff distance between each tier and
-    /// tier 0 on the same clipped land; these are those measurements on this asset:
-    /// **312.4 m at 0.002°**, 456.5 m at 0.003° and 1,043.4 m at 0.006°. Tier 0 is the
-    /// reference every measurement is taken against, so it is zero. They are
+    /// `assets/build_map.py` prints the discrete Hausdorff distance between each tier's
+    /// **boundary** and tier 0's on the same clipped land, on the local equirectangular
+    /// plane `length_metres` uses; these are those measurements on this asset:
+    /// **344.8 m at 0.002°**, 503.4 m at 0.003° and 1,092.9 m at 0.006°. The first
+    /// pass printed 312.4 / 456.5 / 1,043.4 m because it scaled the degree difference by
+    /// the longitude axis; a mostly north-south pair is underestimated by that. Tier 0
+    /// is the reference every measurement is taken against, so it is zero. They are
     /// measurements, not formulas: **changing `LAND_TIERS` (or any tier's tolerance)
     /// means re-running the build and updating this table**, and the threshold test
     /// below fails if a new number outgrows the pixel budget.
-    const LAND_TIER_WORST_CASE_METRES: [f32; LAND_TIERS] = [0.0, 312.4, 456.5, 1_043.4];
+    const LAND_TIER_WORST_CASE_METRES: [f32; LAND_TIERS] = [0.0, 344.8, 503.4, 1_092.9];
 
     /// The most a land tier may be off at the scale where it starts being drawn, in
     /// pixels.
     ///
-    /// 1.0 is the ideal. The 0.006° tier measures 1.16 px at its 900 m/px switch — 16%
-    /// over — and that is accepted: forcing it under 1.0 would mean switching to the
-    /// 0.003° tier there, which costs about 4,000 more triangles and pushes the frame
-    /// back into GPUI's 2^17 instance-buffer step, doubling that memory.
+    /// 1.0 is the ideal. The 0.006° tier measures 1.1996 px at its 911 m/px switch —
+    /// 20% over — and that is accepted: forcing it under 1.0 would mean switching to
+    /// the 0.003° tier there, which costs about 4,000 more triangles and pushes the
+    /// frame back into GPUI's 2^17 instance-buffer step, doubling that memory.
     const LAND_TIER_WORST_CASE_AT_THRESHOLD_PX: f32 = 1.2;
 
     /// The most the tier drawn at the design pane's fitted zoom may be off, in pixels.
     ///
-    /// 1.0 is the ideal. The 0.006° tier measures 1.04 px at 1,004 m/px — the 4% the
+    /// 1.0 is the ideal. The 0.006° tier measures 1.089 px at 1,004 m/px — the 9% the
     /// plan's one-pixel rule gives up so the fitted frame stays in the 2^16
     /// instance-buffer step; the 0.003° tier would cost ~4,000 more triangles for that
-    /// 4%. It is a worst-case single point, not typical displacement.
+    /// 9%. It is a worst-case single point, not typical displacement.
     const LAND_TIER_WORST_CASE_AT_FIT_PX: f32 = 1.1;
 
     /// The measured error of every tier at the two scales that matter: where it is
@@ -3576,10 +3582,11 @@ mod tests {
     /// instead of being absorbed silently.
     ///
     /// The threshold rule itself is checked, not just the current numbers: **every
-    /// threshold is at least the tier's measured worst error divided by 1.2**, which
-    /// is what makes 900, 450 and 261 derived rather than chosen. The two coarser
-    /// tiers have slack (1.02 and 1.16 px at their switches); the 0.002° one is the
-    /// tight case at 1.197 px, so its threshold cannot be lowered without failing.
+    /// threshold is at least the tier's measured worst error divided by 1.2**. The
+    /// 288 and 911 thresholds are the exact ceils of that division; 450 is a round-up
+    /// of 419.5, so it is the one threshold that leaves slack (1.119 px at the switch
+    /// rather than 1.2). Tiers 1 and 3 are the tight cases at 1.197 and 1.1996 px, so
+    /// their thresholds cannot be lowered without failing.
     #[test]
     fn every_tier_stays_inside_the_pixel_budget_the_plan_sets() {
         for (threshold, tier) in [
@@ -3603,7 +3610,7 @@ mod tests {
         }
 
         // The fitted zoom on the design pane draws 1 px at 1,004 m; the tier it picks
-        // there is the 0.006° one, whose worst point is 1,043 m = 1.039 px.
+        // there is the 0.006° one, whose worst point is 1,092.9 m = 1.089 px.
         let fitted = land_tier(1_004.0);
         let error_px = LAND_TIER_WORST_CASE_METRES[fitted] / 1_004.0;
         assert!(
@@ -3628,7 +3635,8 @@ mod tests {
     #[test]
     fn a_coarser_scale_never_draws_a_finer_coast() {
         // Monotone in metres per pixel: a coarser scale (more metres per pixel) may only
-        // move towards the coarser tiers, so the answer walks 0 → 1 → 2 and never back.
+        // move towards the coarser tiers, so the answer walks 0 → 1 → 2 → 3 and never
+        // back.
         let mut previous = land_tier(0.0);
         assert_eq!(previous, 0);
         for step in 1..=2_000 {
@@ -3649,7 +3657,7 @@ mod tests {
         // The fitted zoom on the design's pane is 1 px ≈ 1 km, so the 0.006° coast is
         // the one whose error is a pixel there; 1.6× is 1 px ≈ 627 m, where the 0.003°
         // coast fits; 2.8× is 359 m/px, under the 450 m/px middle threshold but still
-        // over the 0.002° one's 261 m/px, so it draws the 0.002° coast; 4× is 251 m/px
+        // over the 0.002° one's 288 m/px, so it draws the 0.002° coast; 4× is 251 m/px
         // and draws the 0.001° coast.
         let at = |zoom: f32| {
             Projection::new(

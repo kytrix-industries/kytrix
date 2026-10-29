@@ -180,29 +180,38 @@ fitted zoom on the design pane the 0.006° tier paints 5,733 of its 5,744
 triangles — the eleven missing are outside the cover fit's cropped rows.
 
 **Worst deviation vs typical displacement.** `assets/build_map.py` prints the
-discrete Hausdorff distance from tier 0's drawn land for every tier (shapely
-`hausdorff_distance`, which samples the vertices):
+discrete Hausdorff distance from tier 0's drawn **boundary** for every tier, on
+the same local equirectangular plane `length_metres` uses (`hypot(Δlon·cos(lat),
+Δlat) × 111,320`), and the pair of points that attains it:
 
-| tier | worst distance | metres at this latitude | px @1,004 (1×) | px @ threshold |
+| tier | worst pair (lon, lat) → (lon, lat) | local metres | px @1,004 (1×) | px @ threshold |
 |---|---|---|---|---|
-| 0.002° | 0.003116° | 312.4 m | 0.31 px | **1.20 px at 261 m/px** |
-| 0.003° | 0.004553° | 456.5 m | 0.45 px | 1.01 px at 450 m/px |
-| 0.006° | 0.010406° | 1,043.4 m | **1.04 px** | **1.16 px at 900 m/px** |
+| 0.002° | (55.6096736, 25.5710723) → (55.6105254, 25.5740735) | **344.8 m** | 0.34 px | **1.197 px at 288 m/px** |
+| 0.003° | (53.6230740, 26.6894615) → (53.6244208, 26.6938176) | 503.4 m | 0.50 px | 1.119 px at 450 m/px |
+| 0.006° | (50.3324772, 25.5430598) → (50.3241615, 25.5367125) | 1,092.9 m | **1.09 px** | **1.1996 px at 911 m/px** |
 
 The budget for these is not "strictly 1.0 px". A tier is allowed at most
 `LAND_TIER_WORST_CASE_AT_THRESHOLD_PX` = 1.2 px at the scale where it starts
 being drawn, and the tier the fitted view draws at most
-`LAND_TIER_WORST_CASE_AT_FIT_PX` = 1.1 px. The 0.006° tier is 1.04 px at 1× — 4%
-over the ideal one pixel — and that 4% is a deliberate trade: forcing it to
+`LAND_TIER_WORST_CASE_AT_FIT_PX` = 1.1 px. The 0.006° tier is 1.09 px at 1× — 9%
+over the ideal one pixel — and that 9% is a deliberate trade: forcing it to
 1.0 px means drawing the 0.003° tier at 1×, which costs about 4,000 more
 triangles and pushes the frame back into GPUI's 2^17 instance-buffer step,
-doubling that memory. The 0.002° tier's 261 m/px threshold is the exact
-`312.4 / 1.2 = 260.4` rounded up, so it sits at 1.20 px rather than just over;
-the two coarser thresholds are round-ups (450 and 900) that leave a little of
-the budget unused. The model test
+doubling that memory. The thresholds are derived from those measurements:
+**288** is `344.8 / 1.2 = 287.3` rounded up, **911** is `1,092.9 / 1.2 = 910.8`
+rounded up, and **450** is a round-up of `503.4 / 1.2 = 419.5` that leaves 6.7%
+of the budget unused. The model test
 `every_tier_stays_inside_the_pixel_budget_the_plan_sets` checks both budgets and
 the derivation (`threshold ≥ worst error / 1.2`) against the measured constants,
 so the thresholds cannot drift away from the measurements without failing.
+
+The earlier figures — 312.4 / 456.5 / 1,043.4 m and thresholds 261 / 450 / 900 —
+were computed by scaling the **degree** Hausdorff distance by the longitude axis
+(`111,320 × cos(lat)`), which understates a mostly north-south pair. The 0.002°
+tier's worst pair moves 0.0030° north but only 0.00085° east; its ground
+distance is 344.8 m, not 312.4 m, and at 261 m/px it would have been 1.32 px.
+The build now measures the pair on the local plane and prints it, and the
+thresholds above are the derived ones.
 
 These are **worst single points**, not typical displacement: the distance is one
 vertex pair somewhere on a small island, and the rest of the coast moves by much
@@ -385,7 +394,9 @@ layout to maintain.
   piece can sit up to 1.9e-6° outside its cell box: 76 of the 201 border pieces
   and 4,856 of the 21,748 road pieces do (worst 1.892e-6°). That is 0.2 m and
   harmless — but a containment check needs a 2e-6° tolerance, not equality.
-  There is no piece on a grid line, so no piece was packed into two cells.
+  Five border points and 106 road points sit exactly on a grid line; the cell
+  table still assigns every piece to exactly one cell, so no piece is packed
+  into two cells.
 - The grid covers the bbox with 64 columns × 32 rows: cell `row * 64 + col`,
   column 0 at the west edge, row 0 at the south edge, each cell
   0.2199° × 0.2687° (about 22 km × 30 km).
@@ -397,10 +408,13 @@ reference latitude: `Σ hypot(Δlon × cos(lat), Δlat) × 111,320`, in **metres
 The two axes are not interchangeable; the old formula used the longitude scale
 for both and underestimated a north-south piece by 11%. A cell-cut fragment
 inherits its source's reference latitude, so the fragments' lengths sum to the
-source length — `assert_chain_partition` uses that to prove the cut is exactly
-the chains, and the 0.3 km feature drop is decided on the same unique length.
-The runtime no longer filters on `length_m`: it is kept because it is the
-build's own measure of a piece and what the LOD statistics above are counted
+source length. `assert_chain_partition` uses that to prove each copy's cut
+pieces rejoin to that copy's own chain geometry — the fine copy, which holds
+every chain; the middle and coarse copies, which hold the long ones; and the
+primary copy, which holds its own — and the 0.3 km feature drop is decided on the
+same unique length. The runtime does not filter on `length_m`: only the border
+validation (which requires zero) and the tests read it; it is kept because it is
+the build's own measure of a piece and what the LOD statistics above are counted
 from.
 
 The header bbox is stored as `f32`, so reading it back gives
@@ -464,23 +478,25 @@ rose motorway and a solid ochre primary road.
 **Land tiers.** The four land sections are the same coastline at 0.001°, 0.002°,
 0.003° and 0.006°; `model::land_tier` picks one from the projection's **metres
 per pixel**, never from the zoom number, because a zoom is relative to a fit that
-changes with the pane's size. The thresholds are 261, 450 and 900 m/px: at and
-above 900 m/px the 0.006° tier is drawn, 450–900 m/px the 0.003° one, 261–450
-the 0.002° one and below 261 m/px the 0.001° one. What is guarded is the error
+changes with the pane's size. The thresholds are 288, 450 and 911 m/px: at and
+above 911 m/px the 0.006° tier is drawn, 450–911 m/px the 0.003° one, 288–450
+the 0.002° one and below 288 m/px the 0.001° one. What is guarded is the error
 those thresholds produce: `model.rs` holds the measured
-`LAND_TIER_WORST_CASE_METRES = [0, 312.4, 456.5, 1,043.4]` metres from the
-build's Hausdorff measurement and two pixel budgets — 1.2 px at the scale a tier
-starts being drawn, 1.1 px at the fitted zoom — and
+`LAND_TIER_WORST_CASE_METRES = [0, 344.8, 503.4, 1,092.9]` metres on the local
+plane from the build's Hausdorff measurement and two pixel budgets — 1.2 px at
+the scale a tier starts being drawn, 1.1 px at the fitted zoom — and
 `every_tier_stays_inside_the_pixel_budget_the_plan_sets` fails if a threshold, a
 tier's tolerance or the build's simplification moves the numbers past them. The
-261 m/px threshold is the exact `312.4 / 1.2` rounded up; the two coarser ones
-are round-ups that leave a little budget unused. On the user's 1,404 × 900 pane
-the fitted zoom is 1,004 m/px, so **1× draws the 0.006° tier** (5,733 of its
-5,744 triangles instead of 22,844 of 22,876); 1.6× draws 0.003°; 2.8× draws
-0.002°; 4× draws 0.001° — the same geometry, triangle for triangle, that the map
-drew before the tiers existed. A narrow pane fits fewer pixels across the same
-degrees and therefore reads coarser at the same zoom: 4× on a 320 × 400 pane is
-598 m/px and still draws the 0.003° tier.
+288 and 911 thresholds are the exact `344.8 / 1.2` and `1,092.9 / 1.2` rounded
+up; the 450 is a round-up of `503.4 / 1.2 = 419.5` that leaves 6.7% of the
+budget unused. On the user's 1,404 × 900 pane the fitted zoom is 1,004 m/px, so
+**1× draws the 0.006° tier** (5,733 of its 5,744 triangles instead of 22,844 of
+22,876); 1.6× draws 0.003°; 2.8× draws 0.002°; 3.49× is 287.7 m/px — just below
+the 288 switch — and draws 0.001°; 4× draws 0.001° too. The 0.001° geometry is
+the same one, triangle for triangle, that the map drew before the tiers existed.
+A narrow pane fits fewer pixels across the same degrees and therefore reads
+coarser at the same zoom: 4× on a 320 × 400 pane is 598 m/px and still draws the
+0.003° tier.
 
 **Land culling.** A tier's rings tessellate at `1e-6` into the triangles the
 table above counts. A frame visits the cells its viewport touches plus one cell
@@ -529,60 +545,67 @@ The empty frame is inside §8's **≤ 21,000 triangles / ≤ 65,536 vertices** w
 and 133 vertices** to spare — the margin the 6/4 border dash bought. The history
 on the same viewport is 51,468 (P0) → 34,357 (P1) → **20,801** (P2/P4), a 60% cut
 from the baseline. The land is 28% of the empty frame now, down from 44% of the
-P0 baseline.
+P0 baseline. The coarse LOD's 12,616 in the table above is the packed geometry;
+the frame draws 12,614 because two segments collapse to zero length on screen and
+`push_quad` skips them.
 
 With a full picture of 1,000 vessels — each at its most expensive, a six-segment
 dot for a vessel whose ship record has not arrived — and the hover ring, the
-worst view the sweep finds is **29,992 triangles**, at the **2,048 px wide pane
-at 1× over the strait**:
+worst view the sweep finds is **31,815 triangles**, at the **2,048 px wide pane
+at 1.8648× over 25.879N, 52.799E**:
 
 | layer | triangles |
 |---|---|
-| land, 0.003° tier | 9,298 |
-| borders | 1,854 |
-| roads, middle copy | 12,590 |
-| TSS lanes | 202 |
+| land, 0.002° tier | 10,721 |
+| borders | 850 |
+| roads, fine copy | 13,916 |
+| TSS lanes | 280 |
 | vessels (1,000 × 6 segments) | 6,000 |
 | hover ring | 48 |
-| **worst frame** | **29,992** |
+| **worst frame** | **31,815** |
 
-That is **2,992 over the plan's worst-frame target of ≤ 27,000**; P4 records the
-frame rather than claiming it. The 0.002° land tier and the six-segment dots took
-the old 2,048 × 1.539× frame from 39,438 to 24,310, and the 0.004° middle road
-copy took the 2,048 × 1× frame from 33,267 (fine copy) to 28,945 over the middle
-and 29,992 over the strait. The remaining gap is the middle road copy at
-688 m/px (12,590) over the 0.003° land (9,298) and the borders (1,854). The wide
-1,600 pane's fitted 1× frame is **29,668** with the coarse road copy (11,652) and
-the 0.003° land (9,642). Both are inside the 1.2 px budget at their scale, so the
-next lever is a coarser road copy for the 603–742 m/px band (0.0055–0.0065°) —
-but a single 0.006° copy measured **33,634** on the 552 m/px frame just below its
-own threshold, so it needs a second middle copy, not a replacement — or a fifth
-land tier around 0.0055° (measured error about 1,000 m, threshold about
-833 m/px) for the 833–900 m/px band where the wide pane's coarse frame sits.
-Neither is in P4's scope. The design pane's **4× frame** — the one the primary
-layer belongs to — is **24,222** (land 8,442 + borders 748 + fine 5,912 + primary
-2,666 + lanes 406 + ships 6,000 + ring 48); **3.49×** is **20,149** (land 6,117 +
-borders 760 + fine 6,812 + lanes 412 + ships 6,000 + ring 48); **2.8×** is
-**23,074** (land 7,122 + borders 784 + fine 8,740 + lanes 380 + ships 6,000 +
-ring 48). The wide pane's coarse side just below its road switch (1.177×) is
-**25,146** and its middle side (1.197×) is **27,365**; at the 1.309×/1.329× shots
-the middle copy is **25,877** / **25,884**. The 2,048 pane at 1.539× is **24,310**
-and at 1.1× is **27,360**.
+That is **4,815 over the plan's worst-frame target of ≤ 27,000**; P4 records the
+frame rather than claiming it. The frame sits just below the 0.004° middle road
+copy's 371.1 m/px switch: at 369 m/px the fine road copy is drawn (13,916), while
+the next band up would draw the middle copy. It is the road LOD cliff, not a
+land threshold. The sweep's 7 × 5 centre grid plus two 9 × 9 refinement rounds
+found it; the review's 2,048 × 1× frame at 27.057N is **31,149**, 666 lower. The
+0.002° land tier and the six-segment dots took the old 2,048 × 1.539× frame from
+39,438 to 24,310, and the 0.004° middle road copy took the 2,048 × 1× frame from
+33,267 (fine copy) to 28,945. The wide 1,600 pane's fitted 1× frame is **29,668**
+with the coarse road copy (11,652) and the 0.003° land (9,642). The next lever is
+a finer middle road copy (0.003°) for the 278–371 m/px band, or a lower 0.004°
+threshold — 369 m/px would be 1.204 px, 0.3% over the 1.2 px budget, so it is not
+acceptable. A fifth land tier at 725–911 m/px would not touch this frame. Neither
+is in P4's scope.
+
+The design pane's **4× frame** — the one the primary layer belongs to — is
+**24,222** (land 8,442 + borders 748 + fine 5,912 + primary 2,666 + lanes 406 +
+ships 6,000 + ring 48); **3.49×** is **24,494** (land 10,462 + borders 760 + fine
+6,812 + lanes 412 + ships 6,000 + ring 48) because 287.7 m/px is just below the
+new 288 m/px tier-1 switch and draws the 0.001° coast; **2.8×** is **23,074**
+(land 7,122 + borders 784 + fine 8,740 + lanes 380 + ships 6,000 + ring 48). The
+wide pane's coarse side just below its road switch (1.177×) is **25,146** and its
+middle side (1.197×) is **27,365**; at the 1.309×/1.329× shots the middle copy is
+**25,877** / **25,884**. The 2,048 pane at 1.539× is **24,310**, at 1.1× is
+**27,360**, and at 2.6× is **22,432** (264.6 m/px, now the 0.001° coast).
 
 The ceiling for a 60 Hz frame is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`):
 8.58 ms of fixed frame cost plus 107 ns per triangle still fits a 16.65 ms
 frame. `the_visible_triangle_budget_is_under_the_frame_budget` sweeps a 1.56:1,
-1,600 and 2,048 px wide panes and a tall one over the map's middle, Dubai and
-the strait, at a 0.1× zoom walk plus the exact zooms every switch happens at —
-the three road copies, the short-chain gate and the three land-tier switches —
-and pins the worst count (29,992). They are model values from that budget, not
-frame times measured on a machine.
+1,600 and 2,048 px wide panes and a tall one, at a 0.1× zoom walk plus the exact
+zooms every switch happens at — the three road copies, the short-chain gate and
+the three land-tier switches — and at a **7 × 5 grid of camera centres over the
+camera's clamp range**, refined by two 9 × 9 rounds around the twenty heaviest
+coarse frames. It pins the worst count (**31,815**); that is a grid sample, not an
+analytic upper bound. They are model values from that budget, not frame times
+measured on a machine.
 
-**Visual acceptance (P4).** The 0.006° tier's worst measured deviation is 1.04 px
+**Visual acceptance (P4).** The 0.006° tier's worst measured deviation is 1.09 px
 at the fitted zoom (see "Worst deviation vs typical displacement" above), which
-is over the plan's one-pixel rule by 4% worst-case and typical coastline
-displacement is much smaller. The new 0.002° tier is 0.31 px at 1× and 1.20 px
-only at its 261 m/px switch. P4 adds three visual risks that have not been checked
+is over the plan's one-pixel rule by 9% worst-case and typical coastline
+displacement is much smaller. The new 0.002° tier is 0.34 px at 1× and 1.197 px
+only at its 288 m/px switch. P4 adds three visual risks that have not been checked
 on a real window: the 0.3 km feature dropping now removes 3,278 short class-0
 chains from the middle and coarse copies, and because the middle copy is
 long-only the short chains return only below 371 m/px (about 2.7× on the design
