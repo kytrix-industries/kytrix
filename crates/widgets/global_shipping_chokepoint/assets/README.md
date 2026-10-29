@@ -4,9 +4,14 @@ The OSM vector base map the Hormuz vessel widget draws under its vessels: the
 coastline, the land borders and the motorway/trunk/primary roads around the
 Strait of Hormuz, packed into one KHL2 file and embedded with `include_bytes!`.
 The coastline is packed three times — at 0.001°, 0.003° and 0.006° — and the
-motorways and trunks twice — a fine copy and a coarse one — so a frame draws the
-resolution its own scale justifies: the fitted zoom uses the 0.006° coast and the
-coarse road copy, and zooming in brings the finer ones back.
+motorways and trunks twice: every merged chain at 0.002° (the fine copy) and the
+chains at least 0.3 km long at 0.008° (the coarse copy). A short chain is
+feature-dropped at coarse scales and comes back through the fine copy at 1.6×, so
+a frame draws the resolution its own scale justifies: the fitted zoom uses the
+0.006° coast and the coarse road copy without the short chains, and zooming in
+brings the finer coast and every chain back. The primary roads are joined into
+chains too, with the same 0.3 km drop, and are drawn only at the closest zoom
+(4×).
 
 `src/scene.rs` parses it as KHL2; it is the only asset here.
 
@@ -131,8 +136,9 @@ snapshot will change them.
 
 ## What was generated
 
-`hormuz_map.bin`: **1,859,524 bytes** (1.77 MiB), SHA256
-`00a93522723e9a543ec966263b5b60ccc95ca3279869faa63544122591556c3e`.
+`hormuz_map.bin`: **1,032,232 bytes** (0.98 MiB), SHA256
+`fe97543d3f2669e64e7849128c76e4da82b057f410c4ec102e8b1d262b6446c2`.
+Two consecutive builds are byte-identical.
 
 | section | kind | points | pieces | cells | bytes |
 |---|---|---|---|---|---|
@@ -140,8 +146,8 @@ snapshot will change them.
 | land 0.003° | 2 | 12,113 | 790 | 0 | 16 + 96,904 + 9,480 = 106,400 |
 | land 0.006° | 3 | 8,099 | 785 | 0 | 16 + 64,792 + 9,420 = 74,228 |
 | borders | 4 | 1,630 | 201 | 2,048 | 16 + 13,040 + 2,412 + 16,384 = 31,852 |
-| roads | 5 | 108,505 | 45,728 | 2,048 | 16 + 868,040 + 548,736 + 16,384 = 1,433,176 |
-| **file** | | | | | **36 + 213,832 + 106,400 + 74,228 + 31,852 + 1,433,176 = 1,859,524** |
+| roads | 5 | 47,647 | 17,359 | 2,048 | 16 + 381,176 + 208,308 + 16,384 = 605,884 |
+| **file** | | | | | **36 + 213,832 + 106,400 + 74,228 + 31,852 + 605,884 = 1,032,232** |
 
 **Land.** 2,009 shapes of the land shapefile intersect the map box; they are
 unioned, clipped, made valid **once**, and that one geometry is then simplified
@@ -235,30 +241,74 @@ packed with the other roads.
 
 **Roads.** 127,660 distinct `highway=motorway|trunk|primary` ways in the three
 extracts (48,953 GCC + 57,105 Iran + 21,602 Pakistan; 36 further ways appear in
-two extracts and are merged). 35,611 fine pieces / 83,087 points intersect the
-box at `simplify(0.0012)`. The class-0 ways are then joined into the chains their
-shared endpoints allow (5,999 chains) and simplified again to ~300 m, which is
-what makes the coarse copy coarse: a two-node way cannot be simplified on its
-own, and most ways are two-node. That gives 5,992 coarse pieces / 17,304 points.
-After the per-cell cut the section holds 45,728 pieces / 108,505 points: 38,025
-fine (motorway, trunk, primary) and 7,703 coarse. 716 fine and 372 coarse
-segments are shorter than 16 m.
+two extracts and are merged). The primary roads are joined into the chains their
+shared endpoints allow too (11,364 chains), simplified at 0.002° and cut with the
+same 0.3 km feature drop: 4,439 chains / 12,966 points / 17,054 triangles before
+the grid cut, 5,343 pieces / 14,768 vertices / 18,850 triangles after it. The
+primary layer is drawn only at the closest zoom (4×), where 0.3 km is 1.2 px, so
+a dropped primary chain has no coarser scale at which it would come back: the
+drop is build-time, unlike class 0's runtime gate. 6,925 of its 11,364 chains are
+dropped.
+
+The motorways and trunks are joined into the chains their shared endpoints allow
+(5,999 chains), and **both** copies are built from those chains: a two-node way
+cannot be simplified on its own, and most ways are two-node, so joining first is
+what makes either copy cheap. The fine copy stores every chain at 0.002°
+(18,834 points before the cut), the coarse copy stores the chains at least
+**0.3 km** long at 0.008° (2,721 chains, 7,478 points, 4,757 segments). The
+3,278 short chains are **feature-dropped** from the coarse copy and flagged in
+the fine copy: the runtime draws them only once a pixel is at most 628 m/px (the
+design pane's 1.6× is 627.4 m/px), so they are absent at 1× and back at 1.6× on
+the design, 1,600 px wide and tall panes. A 320 × 400 pane is 2,394 m/px at 1×
+and reaches 628 m/px at about 3.8×, so the "all back by 1.6×" guarantee is not
+pane-independent; the gate is the picture's real scale, like every other road
+threshold. Dropping a whole chain keeps every drawn road continuous; dropping a
+piece of a longer chain would not.
+
+The fine copy's tolerance was 0.0012° before P2; P2 raises it to **0.002°** as
+well. The plan authorized the coarse copy only, but the fine copy's per-way
+0.0012° geometry was the other half of the 2.8× frame, and the chain-level 0.002°
+is 0.8 px at 4×.
+
+The 0.3 km threshold is the build's feature-drop rule. The histogram below is for
+all class-0 chains; the 0.3 km cut drops 3,278 chains, and the coarse copy keeps
+2,721 chains / 4,757 segments / 9,514 triangles before the grid cut. The primary
+copy uses the same cut: 6,925 of 11,364 chains are dropped, leaving 4,439 chains
+/ 12,966 points / 17,054 triangles before the grid cut.
+
+The chain-length distribution (coarse segments are after the 0.008°
+simplification, before the grid cut):
+
+| length | chains | source segments | coarse segments | coarse triangles |
+|---|---|---|---|---|
+| 0–1 km | 3,894 | 24,586 | 4,019 | 8,038 |
+| 1–2 km | 412 | 8,759 | 426 | 852 |
+| 2–5 km | 614 | 25,022 | 653 | 1,306 |
+| 5–10 km | 422 | 27,998 | 531 | 1,062 |
+| 10–20 km | 267 | 29,100 | 510 | 1,020 |
+| 20+ km | 390 | 119,650 | 1,983 | 3,966 |
+
+After the per-cell cut the section holds **17,359 pieces / 47,647 points**:
+5,343 primary, 7,728 fine class-0 and 4,288 coarse. 477 fine class-0 and 26
+coarse segments are shorter than 16 m.
 
 **Road LODs**, recomputed from the packed section (triangles = 2 × (vertices −
 pieces)):
 
-| LOD | runtime filter | pieces | vertices | triangles |
+| LOD | runtime rule | pieces | vertices | triangles |
 |---|---|---|---|---|
-| `COARSE` | zoom < 1.6: the coarse copy, every piece | 7,703 | 20,715 | 26,024 |
-| `FINE` | 1.6 ≤ zoom < 2.8: the fine copy of class 0, every piece | 18,914 | 44,560 | 51,292 |
-| `DE` | zoom ≥ 2.8: the fine copy plus the primary roads | 38,025 | 87,790 | 99,530 |
+| `COARSE` | scale ≥ 742.1 m/px: the chains at least 0.3 km long | 4,288 | 10,596 | 12,616 |
+| `FINE` | scale < 742.1 m/px and zoom < 4×: every class-0 chain, short ones gated | 7,728 | 22,283 | 29,110 |
+| `DE` | scale < 742.1 m/px and zoom ≥ 4×: the fine copy plus the primary roads | 13,071 | 37,051 | 47,960 |
+| `PRIMARY` | drawn only inside `DE`, at 4×: the chains at least 0.3 km long | 5,343 | 14,768 | 18,850 |
 
-No `ref` and no `length_m` test remains at any level: the coarse copy drops
-nothing, which is what makes the network continuous at 1×, and the fine copy
-drops nothing either. The two copies are disjoint, so no road is ever drawn
-twice. The coarse copy leaves 629 dangling endpoints on 588 pieces, which are
-the places a motorway or trunk leaves the map box or ends at a junction the
-network does not continue.
+The coarse copy is not a partition of class 0: it is a second geometry of the
+long chains the fine copy also holds. The two copies are still mutually
+exclusive at runtime — the coarse filter draws only coarse records and the fine
+one only fine records — so no road is ever drawn twice. The coarse copy leaves
+2,450 dangling endpoints on 1,866 pieces; many of them are junctions whose short
+connector is one of the dropped chains, which is the visible cost of the
+feature dropping at 1×.
 
 Land segments shorter than 16 m: 12 at tier 0, 8 at tier 1 and 2 at tier 2. Plan
 §4.1 makes the tier 0 count the trigger for lowering `TESSELLATION_TOLERANCE`
@@ -303,11 +353,12 @@ asset and the parser move together and there is no second layout to maintain.
 
 - `start` is an index into the section's points; `len` is the point count (≤
   65,535, asserted by the build) and includes the closing point for a land ring.
-- `flags` bit 0 is "primary", bit 1 is "the way carries a `ref`" (the fine copy
-  only; packed as data, no longer read by the runtime) and bit 2 is "a piece of
-  the coarse copy of class 0"; land and borders write 0. `length_m` is the
-  piece's length in metres and is 0 for land and borders; the runtime no longer
-  filters on it either. `reserved` is 0.
+- `flags` bit 0 is "primary", bit 2 is "a piece of the coarse copy of class 0"
+  and bit 3 is "a piece of a class-0 chain shorter than 0.3 km", which the
+  runtime gates by scale; bit 1 is unused and must be 0, and the parser rejects
+  it. Land and borders write 0. `length_m` is the piece's length in metres and
+  is 0 for land and borders; the runtime no longer filters on it either.
+  `reserved` is 0.
 - `cells` is the piece array cut into consecutive `(start, count)` ranges in
   row-major order. Every piece of a section with `cell_count > 0` belongs to
   exactly one cell, and the ranges partition the array. Land has no cell table:
@@ -315,7 +366,7 @@ asset and the parser move together and there is no second layout to maintain.
   time.
 - The cut runs in `f64` and the stored coordinate is the nearest `f32`, so a
   piece can sit up to 1.9e-6° outside its cell box: 76 of the 201 border pieces
-  and 3,668 of the 45,728 road pieces do (worst 1.892e-6°). That is 0.2 m and
+  and 1,099 of the 17,359 road pieces do (worst 1.892e-6°). That is 0.2 m and
   harmless — but a containment check needs a 2e-6° tolerance, not equality.
   There is no piece on a grid line, so no piece was packed into two cells.
 - The grid covers the bbox with 64 columns × 32 rows: cell `row * 64 + col`,
@@ -324,12 +375,16 @@ asset and the parser move together and there is no second layout to maintain.
 - A piece is a polyline in degrees. The parser projects it to Web Mercator with
   the same formula as `model::project`; nothing is pre-projected.
 
-`length_m` is `length_degrees × 111,320 × cos(centroid latitude)` — **metres**, not
-the `111.32` (kilometres) the plan's prose prints; with 111.32 every piece would
-be a thousand times too short. It is recomputed **after** the per-cell cut, so
-the cell boundary shortens it. The runtime no longer filters on it: it is kept
-because it is the build's own measure of a piece and what the LOD statistics
-above are counted from.
+`length_m` is the piece's length on a local equirectangular projection at its
+reference latitude: `Σ hypot(Δlon × cos(lat), Δlat) × 111,320`, in **metres**.
+The two axes are not interchangeable; the old formula used the longitude scale
+for both and underestimated a north-south piece by 11%. A cell-cut fragment
+inherits its source's reference latitude, so the fragments' lengths sum to the
+source length — `assert_chain_partition` uses that to prove the cut is exactly
+the chains, and the 0.3 km feature drop is decided on the same unique length.
+The runtime no longer filters on `length_m`: it is kept because it is the
+build's own measure of a piece and what the LOD statistics above are counted
+from.
 
 The header bbox is stored as `f32`, so reading it back gives
 `47.801998138427734 / 21.44300079345703 / 61.875 / 30.04199981689453`. Those are
@@ -346,22 +401,41 @@ literals needs an epsilon above 1.9e-6° (use 1e-5°).
 Mercator radians and tessellates the land; `src/paint.rs` builds the frame's ten
 paths from it. What the widget does with this asset:
 
-**Road LOD.** There is one road section; `model::road_filter` picks the level from
-the clamped zoom, so no rebuild is needed when a threshold moves. The motorways
-and trunks are packed twice and the two copies are disjoint — the coarse one is
-drawn only below the first threshold and the fine one only at or above it, so no
-road is ever drawn twice. Neither level filters on a piece's tags or its length:
+**Road LOD.** There is one road section; `model::road_filter(metres_per_pixel,
+zoom)` picks the level, so no rebuild is needed when a threshold moves. The
+class-0 copies are chosen by the picture's real scale, the primary layer by the
+zoom, and a short chain by a second scale gate:
 
-| zoom | filter | rule | triangles in the asset |
+| condition | filter | rule | triangles in the asset |
 |---|---|---|---|
-| `< 1.6` | `Coarse` | the coarse copy of class 0, every piece | 26,024 |
-| `1.6 .. < 2.8` | `Fine` | the fine copy of class 0, every piece | 51,292 |
-| `>= 2.8` | `De` | the fine copy plus the primary roads, cut to the viewport by the cell table | 99,530 |
+| scale ≥ 742.1 m/px | `CoarseCopy` | the coarse copy: the chains at least 0.3 km long | 12,616 |
+| scale < 742.1 m/px, zoom < 4× | `FineCopy` | every class-0 chain; short ones only at ≤ 628 m/px | 29,110 |
+| scale < 742.1 m/px, zoom ≥ 4× | `FineCopyAndPrimary` | the fine copy plus the primary roads (18,850 of them) | 47,960 |
 
-The two thresholds are a visual-density choice, not a performance limit. Roads
+The coarse threshold is derived from the build's tolerance on its **worst axis**:
+0.008° is 890.6 m on the latitude axis (a degree of latitude is 111,320 m, while
+a degree of longitude at the map's scale latitude is 100,160 m), and
+890.6 / 1.2 = 742.1 m/px is the coarsest scale at which the copy is still within
+1.2 px. A 2,048 px wide pane is 688 m/px at 1×, below that threshold, so it draws
+the fine copy even at the fitted zoom; the design pane's 1,004 m/px still draws
+the coarse copy. The primary layer is a visual-density choice, not a tolerance
+one, so it is gated by zoom: 4× is the closest zoom the camera reaches, which is
+the product's literal "draw D+E at the closest zoom". It is deliberately a zoom
+and not a scale: at 251 m/px (the design pane's 4×) a tall pane would draw it
+from 2.7×, where it covers most of the picture and costs more than the whole
+budget. The short-chain gate is 628 m/px, just coarser than the design pane's
+1.6× (627.4), so every flagged class-0 chain is back at 1.6× on that pane; a
+320 × 400 pane reaches 628 m/px at about 3.8×, as the Roads section says. The
+primary copy is also chain-built and has the same 0.3 km drop, applied at build
+time: the primary layer only exists at 4×, where 0.3 km is 1.2 px, so a dropped
+primary chain has no coarser scale at which to return.
+
+The class-0 copies are mutually exclusive at runtime: the coarse filter draws
+only coarse records and the fine one only fine records, so no road is drawn
+twice. Neither runtime level filters on a piece's tags or its length. Roads
 and borders are screen-space ribbons: 1.6 px for a border, 1.4 px for a motorway
 or trunk, 1.2 px for a primary road; two triangles per segment, and no casing. A
-border is dashed as well as violet — 5 px on and 3 px off, walked along the
+border is dashed as well as violet — 6 px on and 4 px off, walked along the
 piece in `paint.rs` — so the three kinds of line are told apart by pattern as
 well as by hue: a dashed violet border, a solid rose motorway and a solid ochre
 primary road.
@@ -411,52 +485,81 @@ is skipped, so the strait's crowded cities do not print into one pile at 1×
 whose anchor is nearer the canvas edge than 80 px — half the widest name — is
 dropped rather than cut in half. Zooming in separates the crowded ones again.
 
-**Budget.** One frame with no vessels on the user's 1,404 × 900 pane, which is
-the frame the plan's §8 target is about:
+**Budget.** Two frames on the user's 1,404 × 900 pane: the empty fitted frame the
+plan's §8 target is about, and the typical frame with 1,000 vessels whose ship
+record has arrived (one marker triangle each), which has to stay in the 2^16
+instance-buffer step:
 
-| layer | triangles |
-|---|---|
-| land, 0.006° tier (was 22,844 drawn of 22,876) | 5,733 |
-| borders (dashed) | 2,460 |
-| roads, `Coarse` copy | 26,022 |
-| TSS lanes (dashed) | 142 |
-| **fitted 1× frame** | **34,357** |
+| layer | empty 1× | typical 1× |
+|---|---|---|
+| land, 0.006° tier | 5,733 | 5,733 |
+| borders (dashed 6/4) | 2,312 | 2,312 |
+| roads, coarse copy of the chains ≥ 0.3 km | 12,614 | 12,614 |
+| TSS lanes (dashed) | 142 | 142 |
+| vessels (1,000 single triangles) | 0 | 1,000 |
+| **fitted 1× frame** | **20,801** (62,403 vertices) | **21,801** (65,403 vertices) |
 
-That is 51,468 → 34,357 triangles, a 33% cut, measured on the **same viewport**:
-the old frame on this pane is 22,844 land + 2,460 + 26,022 + 142. The land's own
-share fell 44% → 17%.
-
-The plan's §8 targets for the fitted frame are **≤ 21,000 triangles** and
-**≤ 65,536 vertices**, and neither is met: the target is a budget for P1 and P2
-together — about 6,000 for the land plus at most 14,900 for a road network
-thinned by P2 — while the road layer here is still the 26,024 triangles P1
-deliberately leaves alone. The frame emits 103,071 vertices, 78,066 of them the
-road network's. `the_fitted_frame_is_pinned_until_p2` pins the exact count as a
-change detector; **P2 must replace that pin with `<= 21_000`**, and the vertex
-gate closes with the same road thinning.
+The empty frame is inside §8's **≤ 21,000 triangles / ≤ 65,536 vertices** with
+199 triangles and 3,133 vertices to spare. The typical frame is inside the
+**2^16 step** (≤ 21,845 triangles / ≤ 65,536 vertices) with only **44 triangles
+and 133 vertices** to spare — the margin the 6/4 border dash bought. The history
+on the same viewport is 51,468 (P0) → 34,357 (P1) → **20,801** (P2), a 60% cut
+from the baseline. The land is 28% of the empty frame now, down from 44% of the
+P0 baseline.
 
 With a full picture of 1,000 vessels — each at its most expensive, an 8-segment
 dot for a vessel whose ship record has not arrived — and the hover ring, the
-worst view the sweep finds is **51,355 triangles**, at 2.8× over the map's middle
-on the 1.56:1 pane. That is the plan's **worst-frame target of ≤ 27,000** missed
-by 90%; it needs P2's roads and P4's vessel dots together, and neither is part of
-P1. The worst view moved to 2.8× because that is where the land switches back to
-the 0.001° tier and the road layer switches to D+E in the same frame. The
-ceiling for a 60 Hz frame is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`):
+worst view the sweep finds is **39,438 triangles**, at the **2,048 px wide pane
+at 1.539×**, just past the land tier's 450 m/px switch:
+
+| layer | triangles |
+|---|---|
+| land, 0.001° tier | 18,126 |
+| borders | 974 |
+| roads, fine copy | 11,988 |
+| TSS lanes | 302 |
+| vessels (1,000 × 8 segments) | 8,000 |
+| hover ring | 48 |
+| **worst frame** | **39,438** |
+
+That is 12,438 over the plan's **worst-frame target of ≤ 27,000**, and **P2's
+acceptance does not include this frame**: it is moved to P4, which adds a 0.002°
+land tier and the six-segment vessel dots. The gap is land tier 0 (18,126) plus
+the vessel layer (8,000); a middle road tier could cut the 11,988 fine
+triangles, but the land term alone keeps the frame in 2^17 (118,314 vertices),
+so road thinning would save CPU only, not the instance-buffer step. The 2,048
+pane is 688 m/px at 1×, below the coarse copy's 742.1 m/px threshold, so it draws
+the fine copy at every zoom; its 1× frame is **35,267**. The design pane's
+**4× frame** — the one the primary layer belongs to — is **26,222** (land 8,442 +
+borders 748 + fine 5,912 + primary 2,666 + lanes 406 + ships 8,000 + ring 48),
+under the target; **3.49×** is **26,494** (land 10,462 + borders 760 + fine
+6,812 + lanes 412 + ships 8,000 + ring 48), also under; **2.8×** is **30,135**
+(land 12,183 + borders 784 + fine 8,740 + lanes 380 + ships 8,000 + ring 48),
+over. The wide pane's coarse side just below its road switch (1.177×) is
+**27,146** and its fine side (1.197×) is **33,461**; at the 1.309×/1.329× shots
+the fine copy is **31,395** / **31,402**.
+
+The ceiling for a 60 Hz frame is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`):
 8.58 ms of fixed frame cost plus 107 ns per triangle still fits a 16.65 ms
 frame. `the_visible_triangle_budget_is_under_the_frame_budget` sweeps a 1.56:1,
-a wide and a tall pane at 1×, 1.6×, 2.8× and 4× over the map's middle, Dubai and
-the strait, and pins the worst count (51,355). They are model values from that
-budget, not frame times measured on a machine.
+1,600 and 2,048 px wide panes and a tall one over the map's middle, Dubai and
+the strait, at a 0.1× zoom walk plus the exact zooms every switch happens at —
+the road copy, the short-chain gate and the two land tiers — and pins the worst
+count (39,438). They are model values from that budget, not frame times measured
+on a machine.
 
-**Visual acceptance (P1).** The 0.006° tier's worst measured deviation is 1.04 px
-at the fitted zoom (see "Worst deviation vs typical displacement" above), which
-is over the plan's one-pixel rule by 4% worst-case and typical coastline
-displacement is much smaller. The LOD change has not yet been checked on a real
-window: the human step is a 1× screenshot of the strait (Qeshm, Hormuz, Khasab
-and the small islands around them) against the previous build, to be recorded
-here before P1 is signed off. Until then this README states the measurement, not
-a visual pass.
+**Visual acceptance (P1/P2).** The 0.006° tier's worst measured deviation is
+1.04 px at the fitted zoom (see "Worst deviation vs typical displacement"
+above), which is over the plan's one-pixel rule by 4% worst-case and typical
+coastline displacement is much smaller. P2 adds three visual risks that have not
+been checked on a real window: the 0.3 km feature dropping removes 3,278 short
+class-0 chains at 1× (the coarse copy leaves 2,450 dangling endpoints, many of
+them junctions whose connector is gone), it removes 6,925 short primary chains
+at 4× (1.2 px each at that scale), and the chain-level 0.002° simplification
+moves a junction by up to 200 m (0.8 px at 4×). The human step is a 1× and a 4×
+screenshot of the strait against the previous build, to be recorded here before
+P1/P2 are signed off. Until then this README states the measurement, not a
+visual pass.
 
 **Theme.** Five map roles, all opaque and all read from the theme every frame by
 `MapColors::resolve`: `chart.map_ocean`, `chart.map_land`, `chart.map_border`,

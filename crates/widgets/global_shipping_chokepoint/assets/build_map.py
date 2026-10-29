@@ -18,9 +18,14 @@ What is packed (all little-endian, see `README.md` for the format):
    without `maritime=yes` or `natural=coastline` and with at least one point on
    the drawn land, clipped and simplified to ~55 m, cut per grid cell. The land
    mask is the **tier 0** geometry, so the borders stay where they were.
-3. **roads** — `highway=motorway|trunk|primary` at ~134 m plus a **coarse copy**
-   of the motorways and trunks at ~300 m, both cut per grid cell, with the flag
-   bits the runtime LOD filter reads.
+3. **roads** — `highway=motorway|trunk|primary`. The motorways and trunks are
+   joined into the chains their shared endpoints allow and stored twice: a
+   **fine copy** of every chain at 0.002° (~200 m) and a **coarse copy** of the
+   chains at least `SHORT_CHAIN_KM` long at 0.008° (~800 m). The fine copy marks
+   a short chain with `FLAG_SHORT_CHAIN`, so the runtime draws it only once a
+   pixel is fine enough; the coarse copy leaves it out. Primary roads are packed
+   once at 0.002°. Every layer is cut per grid cell, with the flag bits the
+   runtime LOD filter reads.
 
 The same inputs produce a byte-identical file: every list is sorted before it
 is packed.
@@ -74,11 +79,12 @@ LAND_KINDS = (1, 2, 3)
 KIND_BORDERS = LAND_KINDS[-1] + 1
 KIND_ROADS = KIND_BORDERS + 1
 
-#: Road flags: bit 0 is "primary", bit 1 is "the way carries a `ref`", bit 2 is
-#: "this piece belongs to the coarse copy".
+#: Road flags: bit 0 is "primary", bit 2 is "this piece belongs to the coarse
+#: copy", bit 3 is "this piece belongs to a class-0 chain shorter than
+#: `SHORT_CHAIN_KM`". Bit 1 is unused and must be 0; the runtime rejects it.
 FLAG_PRIMARY = 1 << 0
-FLAG_HAS_REF = 1 << 1
 FLAG_COARSE = 1 << 2
+FLAG_SHORT_CHAIN = 1 << 3
 
 #: The road classes the asset keeps, as `highway` tag values.
 ROAD_CLASSES = frozenset({"motorway", "trunk", "primary"})
@@ -118,19 +124,32 @@ BORDER_SIMPLIFY = 0.0005
 #: more out — the two Abu Dhabi rings read 877 m and 1,486 m — so nothing in
 #: between is ambiguous.
 BORDER_LAND_MASK_TOLERANCE = 0.002
-#: Roads are simplified to 0.0012° (about 134 m).
-ROAD_SIMPLIFY = 0.0012
-#: The coarse copy of the motorways and trunks is simplified to 0.0027° (about
-#: 300 m). One pixel at the fitted zoom is about a kilometre, so the copy is
-#: still several pixels per vertex where it is drawn, and its vertices are the
-#: only ones a 1× frame pays for.
-COARSE_ROAD_SIMPLIFY = 0.0027
+#: Roads are simplified to 0.002° (about 200 m).
+ROAD_SIMPLIFY = 0.002
+#: The coarse copy of the motorways and trunks is simplified to 0.008° (about
+#: 800 m). One pixel at the fitted zoom is about a kilometre, so the copy is
+#: under a pixel off where it is drawn, and its vertices are the only ones a 1×
+#: frame pays for.
+COARSE_ROAD_SIMPLIFY = 0.008
+#: Chains shorter than this many kilometres are feature-dropped: the class-0
+#: coarse copy leaves them out and the fine copy marks them so the runtime draws
+#: them only once a pixel is finer than
+#: `model::ROAD_SHORT_CHAIN_METRES_PER_PIXEL`; the primary copy leaves them out
+#: at build time, because it only draws at the closest zoom. A chain is a whole
+#: road between junctions, so dropping one keeps every drawn road continuous;
+#: dropping a piece of a longer chain would not. The build prints the
+#: distributions this is chosen from.
+SHORT_CHAIN_KM = 0.3
 
 #: Degrees to kilometres at the equator; every area scales it by the cosine of
 #: the latitude.
 DEGREE_KM = 111.32
-#: Degrees to metres at the equator; every length scales it by the cosine of the
-#: latitude.
+#: Degrees to metres at the equator, for the build's own length statistics.
+#:
+#: It is 111,320 m, while the runtime's `metres_per_pixel` uses the mean Earth
+#: radius (111,195 m per degree); after both are scaled by the same cosine the
+#: build's figure is 0.1125% larger. That is far below the 0.3 km feature drop's
+#: resolution, and the runtime's 1.2 px thresholds deliberately do not use it.
 DEGREE_M = 111_320.0
 
 #: The latitude the map's scale is quoted at, in degrees: the box's own middle. The
@@ -159,6 +178,13 @@ class Piece:
     coords: list[tuple[float, float]]
     flags: int = 0
     length_m: int = 0
+    #: The latitude every segment's length is scaled at. A cell cut inherits it, which
+    #: makes the cut piece lengths exactly additive: a chain's fragments sum to its own
+    #: length at the same reference latitude, so a missing fragment cannot hide.
+    reference_latitude: float = 0.0
+    #: The chain a road piece came from, as an index into its LOD's chain list. A cell
+    #: cut inherits it; it is not packed.
+    source: int = -1
 
 
 @dataclass
@@ -195,6 +221,22 @@ class Land:
     mask: BaseGeometry
 
 
+@dataclass
+class RoadChain:
+    """One merged class-0 chain and the two resolutions the asset stores it at."""
+
+    #: The chain's true length in metres, measured on its source geometry.
+    length_m: float
+    #: The latitude the chain's length and every fragment's length are measured at.
+    reference_latitude: float
+    #: The source geometry's segment count, for the build's distribution table.
+    source_segments: int
+    #: The geometry the fine copy stores, simplified at `ROAD_SIMPLIFY`.
+    fine: list[tuple[float, float]]
+    #: The geometry the coarse copy stores, simplified at `COARSE_ROAD_SIMPLIFY`.
+    coarse: list[tuple[float, float]]
+
+
 class NationalRelations(osmium.SimpleHandler):
     """The national boundary relations of one extract and the ways they contain."""
 
@@ -223,7 +265,7 @@ class Collector(osmium.SimpleHandler):
         self.borders: dict[int, list[tuple[float, float]]] = {}
         # The packed border ways that carry no boundary tag of their own.
         self.relation_only: set[int] = set()
-        self.roads: dict[int, tuple[str, bool, list[tuple[float, float]]]] = {}
+        self.roads: dict[int, tuple[str, list[tuple[float, float]]]] = {}
         self.admin_level_2 = 0
         self.members_seen = 0
         self.maritime_rejected = 0
@@ -243,9 +285,9 @@ class Collector(osmium.SimpleHandler):
             existing = self.roads.get(handler.id)
             if existing is not None:
                 self.road_duplicates += 1
-                if len(coords) <= len(existing[2]):
+                if len(coords) <= len(existing[1]):
                     return
-            self.roads[handler.id] = (highway, "ref" in tags, coords)
+            self.roads[handler.id] = (highway, coords)
             return
 
         tagged = (
@@ -351,21 +393,68 @@ def as_f32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
-def length_metres(coords: list[tuple[float, float]]) -> float:
-    """The polyline's length in metres, scaled at its centroid latitude."""
-    line = LineString(coords)
-    return line.length * DEGREE_M * math.cos(math.radians(line.centroid.y))
+def reference_latitude(coords: list[tuple[float, float]]) -> float:
+    """The mean latitude a polyline's length is measured at."""
+    return sum(latitude for _, latitude in coords) / len(coords)
+
+
+def length_metres(
+    coords: list[tuple[float, float]], at_latitude: float
+) -> float:
+    """The polyline's length in metres, at one reference latitude.
+
+    A degree of longitude is `cos(latitude)` times a degree of latitude, so the two
+    axes are not interchangeable: the old formula used the longitude scale for both and
+    underestimated a north-south road by 11%. Measuring every segment at the same
+    reference latitude (the piece's own mean) also makes the length additive under a
+    cell cut, which is what the chain-integrity check relies on.
+    """
+    cos_latitude = math.cos(math.radians(at_latitude))
+    total = 0.0
+    for (left_lon, left_lat), (right_lon, right_lat) in zip(coords, coords[1:]):
+        total += math.hypot(
+            (right_lon - left_lon) * cos_latitude,
+            right_lat - left_lat,
+        )
+    return total * DEGREE_M
+
+
+def unique_length_metres(
+    coords: list[tuple[float, float]], at_latitude: float
+) -> float:
+    """The length of the polyline with a segment that is retraced counted once.
+
+    A merged chain can go out and back along the same road; the cell cut's
+    `intersection` deduplicates that segment, so the source length the integrity check
+    compares against has to deduplicate it too. The 0.3 km gate uses the same figure:
+    a road that retraces itself is not twice as long.
+    """
+    cos_latitude = math.cos(math.radians(at_latitude))
+    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    total = 0.0
+    for left, right in zip(coords, coords[1:]):
+        key = (left, right) if left <= right else (right, left)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += math.hypot(
+            (right[0] - left[0]) * cos_latitude,
+            right[1] - left[1],
+        )
+    return total * DEGREE_M
 
 
 def segment_metres(
     left: tuple[float, float], right: tuple[float, float]
 ) -> float:
-    """The length of one segment in metres, scaled at its mid latitude."""
-    latitude = (left[1] + right[1]) / 2.0
+    """The length of one segment in metres, on the same local projection."""
+    mid_latitude = math.radians((left[1] + right[1]) / 2.0)
     return (
-        math.hypot(right[0] - left[0], right[1] - left[1])
+        math.hypot(
+            (right[0] - left[0]) * math.cos(mid_latitude),
+            right[1] - left[1],
+        )
         * DEGREE_M
-        * math.cos(math.radians(latitude))
     )
 
 
@@ -652,7 +741,13 @@ def cut_per_cell(
                         Piece(
                             coords,
                             source.flags,
-                            round(length_metres(coords)) if measure_lengths else 0,
+                            round(
+                                length_metres(coords, source.reference_latitude)
+                            )
+                            if measure_lengths
+                            else 0,
+                            source.reference_latitude,
+                            source.source,
                         )
                     )
             # Deterministic order inside the cell, independent of STRtree order.
@@ -665,6 +760,75 @@ def cut_per_cell(
         flush=True,
     )
     return ordered, cells
+
+
+def assert_chain_partition(
+    pieces: list[Piece],
+    chains: list[tuple[list[tuple[float, float]], float]],
+    label: str,
+) -> None:
+    """Checks that the cut pieces are exactly the chains, joined end to end.
+
+    A cell cut may node a self-intersecting simplified chain, so a cut endpoint is
+    allowed when it is a source chain endpoint, a cell edge (the known f32 bbox sliver
+    at the map border), or a point on a source chain. The real proof is the length:
+    every piece is measured at the same reference latitude, so a chain's fragments sum
+    to its own length and a missing fragment shows up as a short sum.
+    """
+    chain_lines = [LineString(coords) for coords, _ in chains]
+    chain_tree = STRtree(chain_lines)
+    chain_ends: set[tuple[float, float]] = set()
+    source_lengths: list[float] = []
+    for coords, at_latitude in chains:
+        chain_ends.add(coords[0])
+        chain_ends.add(coords[-1])
+        source_lengths.append(unique_length_metres(coords, at_latitude))
+    counts: Counter[tuple[float, float]] = Counter()
+    cut_lengths = [0.0] * len(chains)
+    for piece in pieces:
+        if not 0 <= piece.source < len(chains):
+            raise SystemExit(f"error: a {label} piece has no source chain")
+        counts[piece.coords[0]] += 1
+        counts[piece.coords[-1]] += 1
+        cut_lengths[piece.source] += length_metres(
+            piece.coords, piece.reference_latitude
+        )
+    edge_tolerance = 2e-6
+    xs = cell_edges(WEST, EAST, GRID_COLS)
+    ys = cell_edges(SOUTH, NORTH, GRID_ROWS)
+
+    def on_cell_edge(point: tuple[float, float]) -> bool:
+        return min(abs(point[0] - x) for x in xs) <= edge_tolerance or min(
+            abs(point[1] - y) for y in ys
+        ) <= edge_tolerance
+
+    def on_chain(point: tuple[float, float]) -> bool:
+        nearest = int(chain_tree.nearest(Point(point)))
+        return chain_lines[nearest].distance(Point(point)) <= 1e-6
+
+    gaps = [
+        point
+        for point, count in counts.items()
+        if point not in chain_ends
+        and not on_cell_edge(point)
+        and not on_chain(point)
+        and count % 2 != 0
+    ]
+    if gaps:
+        raise SystemExit(
+            f"error: {len(gaps):,} {label} cut endpoints are neither a source chain "
+            "endpoint, a cell edge, a point on a chain, nor shared by two pieces"
+        )
+    # The fixed reference latitude makes the fragment lengths additive. The metre of
+    # slack is the f32 rounding of the cut points; a missing fragment is much longer.
+    for index, (source_length, cut_length) in enumerate(
+        zip(source_lengths, cut_lengths, strict=True)
+    ):
+        if abs(cut_length - source_length) > 1.0:
+            raise SystemExit(
+                f"error: {label} chain {index} measures {cut_length:,.1f} m, its "
+                f"source {source_length:,.1f} m"
+            )
 
 
 def piece_key(piece: Piece) -> list[float]:
@@ -815,54 +979,182 @@ def build(assets: Path, out: Path) -> None:
         )
 
     print("roads", flush=True)
-    road_pieces: list[Piece] = []
+    primary_parts: list[LineString] = []
     class_zero: list[LineString] = []
-    for highway, has_ref, coords in collector.roads.values():
+    for highway, coords in collector.roads.values():
         line = LineString(coords)
         if not line.intersects(clip_box):
             continue
-        ref_flag = FLAG_HAS_REF if has_ref else 0
         for part in line_parts(line.intersection(clip_box)):
-            simplified = clean_coords(
-                part.simplify(ROAD_SIMPLIFY, preserve_topology=False).coords
-            )
             if highway == "primary":
-                if len(simplified) >= 2:
-                    road_pieces.append(Piece(simplified, FLAG_PRIMARY | ref_flag, 0))
+                primary_parts.append(part)
                 continue
             class_zero.append(part)
-            if len(simplified) >= 2:
-                road_pieces.append(Piece(simplified, ref_flag, 0))
 
-    # The coarse copy is the class-0 network joined into the chains its shared endpoints
-    # allow and simplified as a whole. A per-way simplification cannot thin a two-node
-    # way, and most of the network's ways are exactly that, so joining them first is what
-    # makes the copy coarse at all: the class-0 parts merge into 5,999 chains, and 5,992 of
-    # them survive the ~300 m simplification with 17,304 points (11,312 segments). The
-    # chains carry no per-way tags either, which is why a coarse piece sets the copy bit and
-    # nothing else.
+    # Both copies of class 0 are the network joined into the chains its shared endpoints
+    # allow. A per-way simplification cannot thin a two-node way, and most of the
+    # network's ways are exactly that, so joining them first is what makes the coarse copy
+    # coarse at all. Building the fine copy from the same chains is what lets the short
+    # ones be dropped as whole roads: the two copies then carry the same chain identity,
+    # and a chain is either entirely drawn or entirely absent at a given scale.
     coarse_chains = merge_lines(class_zero)
-    coarse_pieces: list[Piece] = []
+    chains: list[RoadChain] = []
     for chain in coarse_chains:
+        source = clean_coords(chain.coords)
+        reference = reference_latitude(source)
+        fine = clean_coords(
+            chain.simplify(ROAD_SIMPLIFY, preserve_topology=False).coords
+        )
         coarse = clean_coords(
             chain.simplify(COARSE_ROAD_SIMPLIFY, preserve_topology=False).coords
         )
-        if len(coarse) >= 2:
-            coarse_pieces.append(Piece(coarse, FLAG_COARSE, 0))
+        # A chain shorter than the tolerance can simplify to a single point. Keep its
+        # own geometry rather than dropping it: a chain that is drawn must be complete.
+        if len(fine) < 2:
+            fine = source
+        if len(coarse) < 2:
+            coarse = source
+        chains.append(
+            RoadChain(
+                unique_length_metres(source, reference),
+                reference,
+                len(source) - 1,
+                fine,
+                coarse,
+            )
+        )
+    if any(len(chain.fine) < 2 or len(chain.coarse) < 2 for chain in chains):
+        raise SystemExit("error: a class-0 chain has no geometry")
+
+    # The chain-length distribution is what the low-zoom feature dropping is chosen
+    # from: a chain is a whole road between junctions, so dropping a short one leaves
+    # the drawn network continuous while a short *piece* of a long chain would not.
+    print("  class-0 chains by length", flush=True)
+    for low, high in [(0, 1), (1, 2), (2, 5), (5, 10), (10, 20), (20, None)]:
+        selected = [
+            chain
+            for chain in chains
+            if chain.length_m >= low * 1_000
+            and (high is None or chain.length_m < high * 1_000)
+        ]
+        source_segments = sum(chain.source_segments for chain in selected)
+        coarse_segments = sum(len(chain.coarse) - 1 for chain in selected)
+        label = f"{low}-{high} km" if high is not None else f"{low}+ km"
+        print(
+            f"    {label:9s}: {len(selected):6,d} chains, "
+            f"{source_segments:7,d} source segments, "
+            f"{coarse_segments:7,d} coarse segments, "
+            f"{2 * coarse_segments:7,d} triangles",
+            flush=True,
+        )
     print(
-        f"  {len(road_pieces):,} fine pieces, "
-        f"{sum(len(p.coords) for p in road_pieces):,} points; "
-        f"{len(coarse_pieces):,} coarse pieces from {len(coarse_chains):,} chains, "
-        f"{sum(len(p.coords) for p in coarse_pieces):,} points",
+        "  coarse copy with chains shorter than L dropped "
+        "(segments are before the per-cell cut)",
         flush=True,
     )
-    road_pieces.extend(coarse_pieces)
+    for limit_km in [0.25, 0.3, 0.5, 1, 1.5, 2, 3, 4, 6, 10]:
+        kept = [
+            chain for chain in chains if chain.length_m >= limit_km * 1_000
+        ]
+        segments = sum(len(chain.coarse) - 1 for chain in kept)
+        print(
+            f"    < {limit_km:5.2f} km: "
+            f"{len(chains) - len(kept):6,d} chains dropped, "
+            f"{segments:7,d} kept segments, {2 * segments:7,d} kept triangles",
+            flush=True,
+        )
+
+    short = [chain for chain in chains if chain.length_m < SHORT_CHAIN_KM * 1_000]
+    kept = [chain for chain in chains if chain.length_m >= SHORT_CHAIN_KM * 1_000]
+    if not kept:
+        raise SystemExit(
+            f"error: every class-0 chain is shorter than {SHORT_CHAIN_KM} km, so the "
+            "coarse copy would be empty"
+        )
+    fine_class_zero = [
+        Piece(
+            chain.fine,
+            FLAG_SHORT_CHAIN if chain.length_m < SHORT_CHAIN_KM * 1_000 else 0,
+            0,
+            chain.reference_latitude,
+            index,
+        )
+        for index, chain in enumerate(chains)
+    ]
+    coarse_pieces = [
+        Piece(chain.coarse, FLAG_COARSE, 0, chain.reference_latitude, index)
+        for index, chain in enumerate(kept)
+    ]
+
+    # The primary network gets the same chain treatment and the same 0.3 km feature
+    # dropping. It is drawn only at the closest zoom, where 0.3 km is 1.2 px, so there
+    # is no coarser primary scale at which a dropped chain would come back: the drop is
+    # build-time, not a runtime gate.
+    primary_chains = merge_lines(primary_parts)
+    primary_geometry: list[tuple[float, float, list[tuple[float, float]]]] = []
+    for chain in primary_chains:
+        source = clean_coords(chain.coords)
+        reference = reference_latitude(source)
+        simplified = clean_coords(
+            chain.simplify(ROAD_SIMPLIFY, preserve_topology=False).coords
+        )
+        if len(simplified) < 2:
+            simplified = source
+        primary_geometry.append(
+            (unique_length_metres(source, reference), reference, simplified)
+        )
+    primary_kept = [
+        entry for entry in primary_geometry if entry[0] >= SHORT_CHAIN_KM * 1_000
+    ]
+    if not primary_kept:
+        raise SystemExit(
+            f"error: every primary chain is shorter than {SHORT_CHAIN_KM} km"
+        )
+    primary_pieces = [
+        Piece(coords, FLAG_PRIMARY, 0, reference, index)
+        for index, (_, reference, coords) in enumerate(primary_kept)
+    ]
+    primary_points = sum(len(piece.coords) for piece in primary_pieces)
+    print(
+        f"  primary {len(primary_chains):,} chains, "
+        f"{len(primary_kept):,} kept (>= {SHORT_CHAIN_KM} km), "
+        f"{len(primary_chains) - len(primary_kept):,} short dropped; "
+        f"{len(primary_pieces):,} chains, {primary_points:,} points, "
+        f"{2 * (primary_points - len(primary_pieces)):,} triangles",
+        flush=True,
+    )
+
+    road_pieces = [*primary_pieces, *fine_class_zero, *coarse_pieces]
+    fine_points = sum(len(piece.coords) for piece in fine_class_zero)
+    coarse_points = sum(len(piece.coords) for piece in coarse_pieces)
+    print(
+        f"  class-0 fine {len(fine_class_zero):,} chains, {fine_points:,} points, "
+        f"{2 * (fine_points - len(fine_class_zero)):,} triangles "
+        f"({len(short):,} short chains flagged); "
+        f"coarse {len(coarse_pieces):,} chains, {coarse_points:,} points, "
+        f"{2 * (coarse_points - len(coarse_pieces)):,} triangles "
+        f"({len(short):,} short chains dropped); "
+        f"primary {len(primary_pieces):,} chains, {primary_points:,} points",
+        flush=True,
+    )
 
     print("cutting borders and roads per cell", flush=True)
     border_pieces, border_cells = cut_per_cell(
         border_pieces, "borders", measure_lengths=False
     )
     road_pieces, road_cells = cut_per_cell(road_pieces, "roads", measure_lengths=True)
+    # The 1× coarse copy has to be the kept chains, not a sample of their pieces:
+    # prove the cell cut left every chain joined end to end before packing it.
+    assert_chain_partition(
+        [piece for piece in road_pieces if piece.flags & FLAG_COARSE],
+        [(chain.coarse, chain.reference_latitude) for chain in kept],
+        "coarse",
+    )
+    assert_chain_partition(
+        [piece for piece in road_pieces if piece.flags & FLAG_PRIMARY],
+        [(coords, reference) for _, reference, coords in primary_kept],
+        "primary",
+    )
 
     print("packing", flush=True)
     blob = bytearray()
@@ -916,12 +1208,13 @@ def build(assets: Path, out: Path) -> None:
             f"triangles {2 * (vertices - len(selected)):9,d}"
         )
     print(
-        f"  class 0 stored: fine {len(lods['FINE']):,} + coarse {len(lods['COARSE']):,} "
-        f"= {len(lods['FINE']) + len(lods['COARSE']):,} pieces"
+        f"  class-0 pieces: fine all {len(lods['FINE']):,} + coarse kept "
+        f"{len(lods['COARSE']):,} (the coarse copy is a subset of the fine one)"
     )
-    # The coarse copy carries every motorway and trunk piece at the fitted zoom: it is
-    # what makes the network continuous there, so the endpoints nothing joins are the
-    # build's own measure of that claim.
+    # The coarse copy is the long chains at the fitted zoom; the short ones are
+    # feature-dropped and come back through the fine copy. The dangling endpoints are
+    # the junctions whose short connector is gone, the build's own measure of that
+    # visual cost.
     dangling, pieces_with_dangling = dangling_endpoints(lods["COARSE"])
     print(
         f"  COARSE dangling endpoints: {dangling:,} "

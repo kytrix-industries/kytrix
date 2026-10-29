@@ -57,12 +57,54 @@ pub(super) const GRID_COLS: u32 = 64;
 /// The culling grid's rows, south to north.
 pub(super) const GRID_ROWS: u32 = 32;
 
-/// The zooms the road detail switches at, as `[COARSE, DE]`.
+/// The build's simplification tolerance for the coarse copy of class 0, in degrees.
 ///
-/// They are a visual-density choice rather than a performance boundary: the whole D+E
-/// network at twice the fitted zoom still costs a few milliseconds, but below these
-/// thresholds it is a haze of parallel lines rather than a road network.
-pub(super) const ROAD_LOD_ZOOM: [f32; 2] = [1.6, 2.8];
+/// `assets/build_map.py` writes `COARSE_ROAD_SIMPLIFY = 0.008`. **Changing it means
+/// re-running the build, updating this constant and re-measuring the budget** — the
+/// runtime threshold below is derived from it.
+pub(super) const ROAD_COARSE_TOLERANCE_DEGREES: f32 = 0.008;
+
+/// The metres one degree of latitude covers: the worst axis of a Douglas–Peucker
+/// tolerance.
+///
+/// A tolerance is isotropic in degrees, but a degree of latitude is 111,320 m while a
+/// degree of longitude at [`MAP_SCALE_LATITUDE`] is `111,320 × cos(25.7425°) ≈
+/// 100,160 m`. The worst displacement is therefore on the latitude axis, and that is
+/// the figure the 1.2 px threshold is derived from. `assets/build_map.py` uses the same
+/// 111,320 for its length statistics.
+const ROAD_METRES_PER_DEGREE: f32 = 111_320.0;
+
+/// The worst distance the coarse copy may be off where it starts being drawn, in
+/// pixels.
+///
+/// The same 1.2 px budget the coastline tiers use (`TIER_WORST_CASE_AT_THRESHOLD_PX`
+/// in the tests below). A Douglas–Peucker simplification moves a line by at most its
+/// tolerance, so the tolerance in metres divided by this budget is the coarsest scale
+/// the copy may be drawn at.
+pub(super) const ROAD_WORST_CASE_AT_THRESHOLD_PX: f32 = 1.2;
+
+/// The metres per pixel at and above which the coarse copy of class 0 is drawn.
+///
+/// Derived, not chosen: the build's 0.008° is 890.6 m on the latitude axis, and
+/// `890.6 / 1.2 ≈ 742` is the coarsest scale at which that copy is still within the
+/// 1.2 px budget. Above it (a fitted view on a wide pane, or any view zoomed further
+/// out) the coarse copy is drawn; below it the fine copy takes over. A 2,048 px wide
+/// pane is 688 m/px at 1×, so it draws the fine copy.
+pub(super) const ROAD_COARSE_METRES_PER_PIXEL: f32 =
+    ROAD_COARSE_TOLERANCE_DEGREES * ROAD_METRES_PER_DEGREE / ROAD_WORST_CASE_AT_THRESHOLD_PX;
+
+/// The zoom from which the primary roads join the fine copy.
+///
+/// The product's requirement is "the closest zoom draws D+E", and [`MAX_ZOOM`] is the
+/// literal closest zoom: the primary layer appears at 4× and only there. In the
+/// 2.8–3.99× range the picture is the fine class-0 copy alone — the primary network is
+/// a visual-density layer that only the closest view justifies. 3.5× was tried first
+/// and rejected: the per-way primary layer added about 13,000 triangles at its switch,
+/// while the chain-built primary is 18,688 triangles in the asset and 2,646 in the
+/// design pane's 4× frame. A metres-per-pixel threshold is wrong because a tall pane
+/// would then draw primary from 2.7×. It is deliberately a zoom, not a scale; the two
+/// class-0 copies stay scale-based.
+pub(super) const ROAD_PRIMARY_ZOOM: f32 = MAX_ZOOM;
 
 /// How many resolutions of coastline the asset packs, finest first.
 pub(super) const LAND_TIERS: usize = 3;
@@ -109,51 +151,88 @@ pub(super) const ROAD_PRIMARY: u8 = 1 << 0;
 /// The flag bit a road piece sets when it belongs to the coarse copy of class 0.
 ///
 /// Bit 2 of the build's flags. The coarse copy is a second, independently simplified
-/// geometry of the motorways and trunks: it exists so the network can be drawn whole at
-/// the fitted zoom, where the fine copy's per-piece detail is below a pixel.
+/// geometry of the motorways and trunks: it exists so the network can be drawn at the
+/// fitted zoom, where the fine copy's detail is below a pixel. It holds only the chains
+/// at least 0.3 km long; the short ones are feature-dropped there and come back through
+/// the fine copy at the scale below.
 pub(super) const ROAD_COARSE: u8 = 1 << 2;
 
-/// How much of the road network one camera zoom draws.
+/// The flag bit a road piece sets when its whole chain is shorter than the build's
+/// feature-dropping threshold.
+///
+/// Bit 3 of the build's flags. The build measures every merged class-0 chain, leaves
+/// the short ones out of the coarse copy entirely, and sets this bit on every piece of
+/// one in the fine copy, so a chain is drawn whole or not at all. A frame whose pixels
+/// are coarser than [`ROAD_SHORT_CHAIN_METRES_PER_PIXEL`] skips these pieces; a closer
+/// one draws them. Dropping a whole chain keeps every drawn road continuous, which
+/// dropping a piece of a longer chain would not.
+pub(super) const ROAD_SHORT_CHAIN: u8 = 1 << 3;
+
+/// The metres per pixel at and below which the short chains are drawn.
+///
+/// 628 m/px is just coarser than the design pane's 1.6× (627.5 m/px), so every chain
+/// the build flagged is drawn at 1.6× on that pane, while the fitted 1× frame
+/// (1,004 m/px) and the 1.5× frame (669 m/px) drop them. Like every other road
+/// threshold this is the picture's real scale: a narrow pane reaches it later, and a
+/// wide one earlier.
+pub(super) const ROAD_SHORT_CHAIN_METRES_PER_PIXEL: f32 = 628.0;
+
+/// How much of the road network one camera scale draws.
 ///
 /// The two copies of class 0 are mutually exclusive — a frame draws one of them and
 /// never both — so no road is drawn twice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RoadFilter {
     /// The coarse copy of the motorways and trunks: every piece the asset stores.
-    Coarse,
+    CoarseCopy,
     /// The fine copy of the motorways and trunks: every piece the asset stores.
-    Fine,
+    FineCopy,
     /// The fine copy and the primary roads.
-    De,
+    FineCopyAndPrimary,
 }
 
-/// The filter a camera at `zoom` draws with.
-pub(super) fn road_filter(zoom: f32) -> RoadFilter {
-    if zoom < ROAD_LOD_ZOOM[0] {
-        RoadFilter::Coarse
-    } else if zoom < ROAD_LOD_ZOOM[1] {
-        RoadFilter::Fine
+/// The filter a projection drawing `metres_per_pixel` metres per pixel at `zoom` uses.
+///
+/// The two class-0 copies are chosen by the picture's real scale, never by the zoom
+/// number: a zoom is relative to the pane's own fitted scale, so the same 2.8× is
+/// 359 m/px on the design pane and 246 m/px on a 2,048 px wide one. The primary layer
+/// is the one exception, and [`ROAD_PRIMARY_ZOOM`] says why. A scale that is not a
+/// positive number (a pane that is not laid out yet) reads as the finest copy, which is
+/// the safe direction: a frame at an unknown scale has no error budget.
+pub(super) fn road_filter(metres_per_pixel: f32, zoom: f32) -> RoadFilter {
+    if metres_per_pixel >= ROAD_COARSE_METRES_PER_PIXEL {
+        RoadFilter::CoarseCopy
+    } else if zoom < ROAD_PRIMARY_ZOOM {
+        RoadFilter::FineCopy
     } else {
-        RoadFilter::De
+        RoadFilter::FineCopyAndPrimary
     }
 }
 
-/// The path one road piece is drawn in under `filter`, or `None` when the filter drops it.
+/// The path one road piece is drawn in under `filter`, or `None` when it is dropped.
 ///
 /// Path 0 holds motorways and trunks and path 1 the primary roads. The flags are decoded
 /// here and nowhere else, and the filter and the painter's split are the same answer, so
 /// a piece cannot be drawn in a path the filter had already dropped. The copy bit is what
-/// keeps the two geometries apart: a coarse piece is drawn only below the first threshold
-/// and a fine one only at or above it, which is why neither is ever drawn twice.
-pub(super) fn road_path(filter: RoadFilter, piece: &Piece) -> Option<usize> {
-    if piece.flags & ROAD_COARSE != 0 {
-        return (filter == RoadFilter::Coarse).then_some(0);
+/// keeps the two geometries apart: a coarse piece is drawn only at the coarse filter and
+/// a fine one only below it, which is why neither is ever drawn twice.
+///
+/// The short-chain bit is a second, independent gate: a piece of a chain shorter than
+/// the build's threshold is drawn only when a pixel is at most
+/// [`ROAD_SHORT_CHAIN_METRES_PER_PIXEL`]. The build sets it on every piece of such a
+/// chain, so the gate always drops or keeps a whole road.
+pub(super) fn road_path(filter: RoadFilter, piece: &Piece, metres_per_pixel: f32) -> Option<usize> {
+    if piece.flags & ROAD_SHORT_CHAIN != 0 && metres_per_pixel > ROAD_SHORT_CHAIN_METRES_PER_PIXEL {
+        return None;
     }
-    if filter == RoadFilter::Coarse {
+    if piece.flags & ROAD_COARSE != 0 {
+        return (filter == RoadFilter::CoarseCopy).then_some(0);
+    }
+    if filter == RoadFilter::CoarseCopy {
         return None;
     }
     if piece.flags & ROAD_PRIMARY != 0 {
-        return (filter == RoadFilter::De).then_some(1);
+        return (filter == RoadFilter::FineCopyAndPrimary).then_some(1);
     }
     Some(0)
 }
@@ -2974,27 +3053,167 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_road_filter_switches_at_the_two_thresholds() {
-        assert_eq!(ROAD_LOD_ZOOM, [1.6, 2.8]);
+    /// The build's fine-copy tolerance, in degrees.
+    ///
+    /// `assets/build_map.py` writes `ROAD_SIMPLIFY = 0.002`; the primary roads are
+    /// packed by the same simplification. Only the pixel-budget test needs it: the
+    /// runtime's coarse threshold is derived from the coarse tolerance, while the fine
+    /// copy's error is checked here against the same 1.2 px budget.
+    const ROAD_FINE_TOLERANCE_DEGREES: f32 = 0.002;
 
-        assert_eq!(road_filter(MIN_ZOOM), RoadFilter::Coarse);
-        assert_eq!(road_filter(1.5), RoadFilter::Coarse);
-        assert_eq!(road_filter(1.599_999), RoadFilter::Coarse);
-        assert_eq!(
-            road_filter(ROAD_LOD_ZOOM[0]),
-            RoadFilter::Fine,
-            "the threshold itself belongs to the fine copy",
+    #[test]
+    fn the_road_filter_switches_at_its_scale_and_zoom() {
+        // 0.008° is 890.6 m on the latitude axis, and 890.6 / 1.2 = 742.1 m/px:
+        // the coarse copy is drawn at every scale at least that coarse.
+        assert!(
+            (ROAD_COARSE_METRES_PER_PIXEL - 742.1).abs() < 0.5,
+            "the coarse threshold is {ROAD_COARSE_METRES_PER_PIXEL} m/px",
         );
-        assert_eq!(road_filter(2.0), RoadFilter::Fine);
-        assert_eq!(road_filter(2.799_999), RoadFilter::Fine);
+        assert_eq!(ROAD_PRIMARY_ZOOM, MAX_ZOOM);
+
+        // 1× on the design pane is 1,004 m/px, so it draws the coarse copy; a wide
+        // 2,048 px pane is 688 m/px there, below the 742 threshold, so it draws the
+        // fine copy.
+        assert_eq!(road_filter(1_004.0, 1.0), RoadFilter::CoarseCopy);
+        assert_eq!(road_filter(688.0, 1.0), RoadFilter::FineCopy);
         assert_eq!(
-            road_filter(ROAD_LOD_ZOOM[1]),
-            RoadFilter::De,
-            "and the second one to the densest",
+            road_filter(ROAD_COARSE_METRES_PER_PIXEL, 1.0),
+            RoadFilter::CoarseCopy,
+            "the threshold itself belongs to the coarse copy",
         );
-        assert_eq!(road_filter(3.0), RoadFilter::De);
-        assert_eq!(road_filter(MAX_ZOOM), RoadFilter::De);
+        assert_eq!(
+            road_filter(ROAD_COARSE_METRES_PER_PIXEL - 0.001, 1.0),
+            RoadFilter::FineCopy,
+            "one step finer than the threshold is the fine copy",
+        );
+        assert_eq!(road_filter(400.0, 2.0), RoadFilter::FineCopy);
+        assert_eq!(
+            road_filter(400.0, 3.5),
+            RoadFilter::FineCopy,
+            "3.5× is not the closest zoom: the primary roads wait for 4×",
+        );
+        assert_eq!(
+            road_filter(400.0, 4.0),
+            RoadFilter::FineCopyAndPrimary,
+            "the primary roads join at the closest zoom, whatever the scale",
+        );
+        assert_eq!(road_filter(251.0, 4.0), RoadFilter::FineCopyAndPrimary);
+        assert_eq!(road_filter(251.0, 3.5), RoadFilter::FineCopy);
+
+        // A scale that is not a positive number is a pane that is not laid out yet: it
+        // has no error budget, so it reads as the finest copy. The primary layer is
+        // still the zoom's decision.
+        assert_eq!(road_filter(0.0, 1.0), RoadFilter::FineCopy);
+        assert_eq!(road_filter(0.0, 4.0), RoadFilter::FineCopyAndPrimary);
+        assert_eq!(road_filter(f32::NAN, 1.0), RoadFilter::FineCopy);
+        assert_eq!(road_filter(f32::NEG_INFINITY, 1.0), RoadFilter::FineCopy);
+        assert_eq!(
+            road_filter(f32::INFINITY, 1.0),
+            RoadFilter::CoarseCopy,
+            "an infinite scale cannot come out of `metres_per_pixel`, and if it did the \
+             coarsest copy would still be the one it justifies",
+        );
+    }
+
+    /// The road thresholds are the build's tolerances turned into a pixel budget, and
+    /// the pixel budget is the one the plan sets.
+    ///
+    /// A tolerance is isotropic in degrees, so both axes have to be checked: a degree of
+    /// latitude is 111,320 m, while a degree of longitude at the map's scale latitude is
+    /// 100,160 m. The latitude axis is the worst one, and a threshold derived from the
+    /// longitude axis alone would pass this test while being 11% too permissive.
+    #[test]
+    fn every_road_copy_stays_inside_the_pixel_budget_where_it_is_switched_in() {
+        // One pixel at a scale of 1 is one Mercator radian, so a degree of longitude is
+        // π/180 pixels and covers `metres_per_pixel(1.0) × π/180` metres.
+        let metres_per_degree_longitude = metres_per_pixel(1.0) * std::f32::consts::PI / 180.0;
+        let metres_per_degree_latitude = 111_320.0;
+        assert!(
+            metres_per_degree_latitude > metres_per_degree_longitude,
+            "the latitude axis is the worst one: {metres_per_degree_latitude} vs \
+             {metres_per_degree_longitude}",
+        );
+        assert_eq!(
+            ROAD_METRES_PER_DEGREE, metres_per_degree_latitude,
+            "the threshold has to be derived from the worst axis",
+        );
+
+        // The coarse copy is drawn at every scale at least its threshold, so its worst
+        // error is at the threshold itself: 890.6 / 742.1 = 1.20 px on the latitude
+        // axis, 801.3 / 742.1 = 1.08 px on the longitude one.
+        let coarse_latitude = ROAD_COARSE_TOLERANCE_DEGREES * metres_per_degree_latitude
+            / ROAD_COARSE_METRES_PER_PIXEL;
+        let coarse_longitude = ROAD_COARSE_TOLERANCE_DEGREES * metres_per_degree_longitude
+            / ROAD_COARSE_METRES_PER_PIXEL;
+        assert!(coarse_latitude >= coarse_longitude);
+        for (axis, error_px) in [
+            ("latitude", coarse_latitude),
+            ("longitude", coarse_longitude),
+        ] {
+            assert!(
+                error_px <= ROAD_WORST_CASE_AT_THRESHOLD_PX,
+                "the coarse copy is {error_px:.2} px off on the {axis} axis at its \
+                 {ROAD_COARSE_METRES_PER_PIXEL:.1} m/px switch, over the \
+                 {ROAD_WORST_CASE_AT_THRESHOLD_PX} px budget",
+            );
+        }
+
+        // The fine copy starts at the coarse threshold and is still drawn at the primary
+        // layer's switch, 4× on the design pane (251 m/px), so the closer of the two is
+        // its worst case: 222.6 / 251 = 0.89 px on the latitude axis.
+        let primary_switch = Projection::new(
+            Camera {
+                zoom: ROAD_PRIMARY_ZOOM,
+                ..Camera::default()
+            },
+            DESIGN_VIEWPORT,
+        )
+        .metres_per_pixel();
+        assert!(
+            (primary_switch - 251.0).abs() < 1.0,
+            "the design pane's 4× is {primary_switch} m/px",
+        );
+        for threshold in [ROAD_COARSE_METRES_PER_PIXEL, primary_switch] {
+            let fine_latitude =
+                ROAD_FINE_TOLERANCE_DEGREES * metres_per_degree_latitude / threshold;
+            let fine_longitude =
+                ROAD_FINE_TOLERANCE_DEGREES * metres_per_degree_longitude / threshold;
+            assert!(fine_latitude >= fine_longitude);
+            for (axis, error_px) in [("latitude", fine_latitude), ("longitude", fine_longitude)] {
+                assert!(
+                    error_px <= ROAD_WORST_CASE_AT_THRESHOLD_PX,
+                    "the fine copy is {error_px:.2} px off on the {axis} axis at \
+                     {threshold:.1} m/px, over the {ROAD_WORST_CASE_AT_THRESHOLD_PX} px \
+                     budget",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_finer_scale_never_draws_a_coarser_road_copy() {
+        // Monotone in metres per pixel: at a fixed zoom, a finer scale (fewer metres per
+        // pixel) may only move towards the more detailed filter, so the answer walks
+        // coarse → fine (and → D+E once the zoom is close enough) and never back.
+        let rank = |filter: RoadFilter| match filter {
+            RoadFilter::CoarseCopy => 0,
+            RoadFilter::FineCopy => 1,
+            RoadFilter::FineCopyAndPrimary => 2,
+        };
+        for (zoom, expected) in [(2.0, 1), (ROAD_PRIMARY_ZOOM, 2)] {
+            let mut previous = rank(road_filter(f32::INFINITY, zoom));
+            assert_eq!(previous, 0);
+            for step in (1..=2_000).rev() {
+                let metres = step as f32 * 5.0;
+                let current = rank(road_filter(metres, zoom));
+                assert!(
+                    current >= previous,
+                    "{metres} m/px at {zoom}× reads as rank {current} after rank {previous}",
+                );
+                previous = current;
+            }
+            assert_eq!(previous, expected, "5 m/px at {zoom}× is the finest filter");
+        }
     }
 
     #[test]
@@ -3010,48 +3229,105 @@ mod tests {
         let coarse_with_ref = road_piece(ROAD_COARSE | 1 << 1, 0);
         let coarse_primary = road_piece(ROAD_COARSE | ROAD_PRIMARY, 0);
 
-        assert_eq!(road_path(RoadFilter::Coarse, &coarse), Some(0));
-        assert_eq!(road_path(RoadFilter::Coarse, &coarse_with_ref), Some(0));
+        assert_eq!(road_path(RoadFilter::CoarseCopy, &coarse, 0.0), Some(0));
         assert_eq!(
-            road_path(RoadFilter::Coarse, &coarse_primary),
+            road_path(RoadFilter::CoarseCopy, &coarse_with_ref, 0.0),
+            Some(0)
+        );
+        assert_eq!(
+            road_path(RoadFilter::CoarseCopy, &coarse_primary, 0.0),
             Some(0),
             "the coarse copy is class 0 whether or not a bit says otherwise",
         );
         assert_eq!(
-            road_path(RoadFilter::Coarse, &motorway),
+            road_path(RoadFilter::CoarseCopy, &motorway, 0.0),
             None,
-            "the fine copy is not drawn below the first threshold",
+            "the fine copy is not drawn at a coarse scale",
         );
-        assert_eq!(road_path(RoadFilter::Coarse, &primary), None);
+        assert_eq!(road_path(RoadFilter::CoarseCopy, &primary, 0.0), None);
 
         assert_eq!(
-            road_path(RoadFilter::Fine, &motorway),
+            road_path(RoadFilter::FineCopy, &motorway, 0.0),
             Some(0),
             "the fine copy keeps a piece with no ref and no length",
         );
-        assert_eq!(road_path(RoadFilter::Fine, &motorway_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::Fine, &primary),
+            road_path(RoadFilter::FineCopy, &motorway_with_ref, 0.0),
+            Some(0)
+        );
+        assert_eq!(
+            road_path(RoadFilter::FineCopy, &primary, 0.0),
             None,
             "the fine filter is class 0 only",
         );
         assert_eq!(
-            road_path(RoadFilter::Fine, &coarse),
+            road_path(RoadFilter::FineCopy, &coarse, 0.0),
             None,
-            "the coarse copy is not drawn at or above the first threshold",
+            "the coarse copy is not drawn at or below its threshold",
         );
 
-        assert_eq!(road_path(RoadFilter::De, &motorway), Some(0));
-        assert_eq!(road_path(RoadFilter::De, &motorway_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::De, &primary),
-            Some(1),
-            "D+E draws primary roads in the second path",
+            road_path(RoadFilter::FineCopyAndPrimary, &motorway, 0.0),
+            Some(0)
         );
         assert_eq!(
-            road_path(RoadFilter::De, &coarse),
+            road_path(RoadFilter::FineCopyAndPrimary, &motorway_with_ref, 0.0),
+            Some(0)
+        );
+        assert_eq!(
+            road_path(RoadFilter::FineCopyAndPrimary, &primary, 0.0),
+            Some(1),
+            "the closest filter draws primary roads in the second path",
+        );
+        assert_eq!(
+            road_path(RoadFilter::FineCopyAndPrimary, &coarse, 0.0),
             None,
             "and neither copy is drawn on top of the other",
+        );
+    }
+
+    /// A piece of a short chain is drawn only once a pixel is fine enough; a piece of a
+    /// long one is unaffected by that gate.
+    #[test]
+    fn a_short_chain_is_drawn_only_once_a_pixel_is_fine_enough() {
+        let short = road_piece(ROAD_SHORT_CHAIN, 0);
+        let long = road_piece(0, 0);
+
+        // The design pane's fitted 1× is 1,004 m/px and its 1.5× is 669 m/px: both are
+        // coarser than the gate, so the short chain is not drawn.
+        for metres_per_pixel in [1_004.0, 669.0, 628.001] {
+            assert_eq!(
+                road_path(RoadFilter::FineCopy, &short, metres_per_pixel),
+                None,
+                "a short chain at {metres_per_pixel} m/px",
+            );
+            assert_eq!(
+                road_path(RoadFilter::FineCopy, &long, metres_per_pixel),
+                Some(0),
+                "a long chain at {metres_per_pixel} m/px",
+            );
+        }
+
+        // 628 m/px is just below the design pane's 1.6× (627.5 m/px), so the chain is
+        // back there and stays drawn at every finer scale.
+        for metres_per_pixel in [628.0, 627.0, 251.0, 0.0] {
+            assert_eq!(
+                road_path(RoadFilter::FineCopy, &short, metres_per_pixel),
+                Some(0),
+                "a short chain at {metres_per_pixel} m/px",
+            );
+        }
+
+        // The gate is independent of the copy bit: the decoder must drop a coarse piece
+        // carrying it too, even though the build does not write that combination.
+        let coarse_short = road_piece(ROAD_COARSE | ROAD_SHORT_CHAIN, 0);
+        assert_eq!(
+            road_path(RoadFilter::CoarseCopy, &coarse_short, 1_004.0),
+            None
+        );
+        assert_eq!(
+            road_path(RoadFilter::CoarseCopy, &coarse_short, 627.0),
+            Some(0)
         );
     }
 
