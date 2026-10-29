@@ -64,6 +64,43 @@ pub(super) const GRID_ROWS: u32 = 32;
 /// thresholds it is a haze of parallel lines rather than a road network.
 pub(super) const ROAD_LOD_ZOOM: [f32; 2] = [1.6, 2.8];
 
+/// How many resolutions of coastline the asset packs, finest first.
+pub(super) const LAND_TIERS: usize = 3;
+
+/// The metres per pixel at and above which the coarsest coast is drawn.
+///
+/// The tiers are chosen by the scale the projection actually draws at, never by the
+/// camera's zoom number: a zoom is relative to the pane's own fitted scale, so `1×`
+/// is 1.0 km/px on the user's 1,404 × 900 pane and 0.7 km/px on a 2,048 px wide one.
+/// At the switch the 0.006° tier is 1.16 px off by its own measurement; at the
+/// fitted zoom on the design pane it is 1.04 px off, which is what the tier buys.
+pub(super) const LAND_TIER_COARSE_METRES_PER_PIXEL: f32 = 900.0;
+
+/// The metres per pixel at and above which the middle coast is drawn.
+///
+/// Below it the finest tier is drawn, whose 0.001° is 100 m on the ground — a tenth
+/// of a pixel at this threshold, so the switch is invisible.
+pub(super) const LAND_TIER_MIDDLE_METRES_PER_PIXEL: f32 = 450.0;
+
+/// The coastline tier a projection drawing `metres_per_pixel` metres per pixel draws.
+///
+/// Index 0 is the 0.001° tier, 1 the 0.003° one and 2 the 0.006° one; the asset and
+/// [`Scene::land`](crate::scene::Scene::land) store them in the same order. The
+/// selection is monotone — zooming in never picks a coarser tier — and a scale that
+/// is not a positive number (a pane that is not laid out yet) draws the finest one,
+/// which is the safe direction: a frame at an unknown scale has no error budget.
+pub(super) fn land_tier(metres_per_pixel: f32) -> usize {
+    if metres_per_pixel.is_nan() || metres_per_pixel <= 0.0 {
+        0
+    } else if metres_per_pixel >= LAND_TIER_COARSE_METRES_PER_PIXEL {
+        2
+    } else if metres_per_pixel >= LAND_TIER_MIDDLE_METRES_PER_PIXEL {
+        1
+    } else {
+        0
+    }
+}
+
 /// The flag bit a road piece sets when the way is a primary road.
 ///
 /// Bit 0 of the build's flags; a motorway or a trunk leaves it clear.
@@ -321,6 +358,33 @@ pub(super) fn fit_px_per_merc(viewport: [f32; 2]) -> f32 {
 
     let [west, south, east, north] = mercator_bounds();
     (width / (east - west)).max(height / (north - south))
+}
+
+/// The latitude the map's own scale is read at, in degrees.
+///
+/// The map is a Mercator picture whose rows stretch towards the poles, so "metres per
+/// pixel" needs a row to mean anything. This is the map box's own middle — near the
+/// strait the picture is about — rather than the camera's: the two differ by up to
+/// 7% on this box, and letting a pan move the coastline tier would make the coast
+/// pop in and out while dragging.
+const MAP_SCALE_LATITUDE: f32 = (MAP_SOUTH + MAP_NORTH) / 2.0;
+
+/// How many metres one pixel covers when a Mercator unit is drawn at `scale` pixels.
+///
+/// This is the real scale of the picture, and it is what the coastline tier is chosen
+/// by — never the zoom number, which is relative to a fit that changes with the
+/// pane's size. A Mercator `x` is a radian of longitude, and one radian of longitude is
+/// the Earth's radius times the cosine of the latitude — about 5,730 km here, not the
+/// 40,030 km a full circumference would give. A degenerate scale (a pane with no size)
+/// reads as zero, which is "the finest coast there is": a frame that cannot draw has
+/// nothing to be coarse about.
+pub(super) fn metres_per_pixel(scale: f32) -> f32 {
+    if !scale.is_finite() || scale <= 0.0 {
+        return 0.0;
+    }
+    // The Earth's mean radius, in metres (IUGG).
+    const EARTH_RADIUS_M: f32 = 6_371_008.8;
+    EARTH_RADIUS_M * MAP_SCALE_LATITUDE.to_radians().cos() / scale
 }
 
 /// The grid cells a viewport touches, as inclusive column and row indices.
@@ -588,6 +652,15 @@ impl Projection {
             self.center[0] + half[0],
             self.center[1] + half[1],
         ]
+    }
+
+    /// The metres one pixel covers, at the latitude the map is read at.
+    ///
+    /// This is the real scale of the picture, and it is what the coastline tier is
+    /// chosen by: it depends on the pane's size and the camera's zoom, but not on
+    /// where the camera points. See [`metres_per_pixel`].
+    pub(super) fn metres_per_pixel(self) -> f32 {
+        metres_per_pixel(self.scale)
     }
 
     /// Whether a canvas point is inside the canvas grown by `margin` on every side.
@@ -2840,7 +2913,9 @@ mod tests {
             previous = back;
             worst = worst.max((back - latitude).abs());
         }
-        // 7.6e-6° measured: a three-hundredth of the 0.2375° a row spans, and far below\n        // the 0.2199° a column spans, so no edge can fall on the wrong side of a line.\n        assert!(worst < 2e-5, "the inverse Mercator is {worst}° off");
+        // 7.6e-6° measured: a three-hundredth of the 0.2375° a row spans, and far below
+        // the 0.2199° a column spans, so no edge can fall on the wrong side of a line.
+        assert!(worst < 2e-5, "the inverse Mercator is {worst}° off");
     }
 
     #[test]
@@ -2978,5 +3053,244 @@ mod tests {
             None,
             "and neither copy is drawn on top of the other",
         );
+    }
+
+    /// The pane the design measures on: the user's 1.56:1 viewport.
+    const DESIGN_VIEWPORT: [f32; 2] = [1_404.0, 900.0];
+
+    #[test]
+    fn the_land_tier_switches_at_the_two_thresholds() {
+        assert_eq!(LAND_TIER_MIDDLE_METRES_PER_PIXEL, 450.0);
+        assert_eq!(LAND_TIER_COARSE_METRES_PER_PIXEL, 900.0);
+
+        // Below the middle threshold the finest coast is the only one whose error is
+        // under a pixel.
+        assert_eq!(land_tier(0.0), 0);
+        assert_eq!(land_tier(1.0), 0);
+        assert_eq!(land_tier(449.999), 0);
+        assert_eq!(
+            land_tier(LAND_TIER_MIDDLE_METRES_PER_PIXEL),
+            1,
+            "the threshold itself belongs to the middle tier",
+        );
+        assert_eq!(land_tier(700.0), 1);
+        assert_eq!(land_tier(899.999), 1);
+        assert_eq!(
+            land_tier(LAND_TIER_COARSE_METRES_PER_PIXEL),
+            2,
+            "and the second one to the coarsest",
+        );
+        assert_eq!(land_tier(5_000.0), 2);
+
+        // A scale that is not a positive number is a pane that is not laid out yet: it
+        // has no error budget, so it reads as the finest coast.
+        assert_eq!(land_tier(f32::NAN), 0);
+        assert_eq!(land_tier(f32::NEG_INFINITY), 0);
+        assert_eq!(
+            land_tier(f32::INFINITY),
+            2,
+            "an infinite scale cannot come out of `metres_per_pixel`, and if it did the \
+             coarsest coast would still be the one it justifies",
+        );
+    }
+
+    /// The measured worst-case distance each land tier moves the coast, in metres.
+    ///
+    /// Tier 0 is the reference every measurement is taken against, so its value is
+    /// zero. The other two are the discrete Hausdorff distances `assets/build_map.py`
+    /// prints between each tier and tier 0: **457 m at 0.003°** and **1,043 m at
+    /// 0.006°**. They are measurements of this asset, not formulas — **changing
+    /// `LAND_TIERS` (or any tier's tolerance) means re-running the build and updating
+    /// this table**, and the thresholds test below fails if the new numbers outgrow
+    /// the pixel budget.
+    const TIER_WORST_CASE_METRES: [f32; LAND_TIERS] = [0.0, 457.0, 1_043.0];
+
+    /// The most a land tier may be off at the scale where it starts being drawn, in
+    /// pixels.
+    ///
+    /// 1.0 is the ideal. The 0.006° tier measures 1.16 px at its 900 m/px switch —
+    /// 16% over — and that is accepted: forcing it under 1.0 would mean switching to
+    /// the 0.003° tier there, which costs about 4,000 more triangles and pushes the
+    /// frame back into GPUI's 2^17 instance-buffer step, doubling that memory.
+    const TIER_WORST_CASE_AT_THRESHOLD_PX: f32 = 1.2;
+
+    /// The most the tier drawn at the design pane's fitted zoom may be off, in pixels.
+    ///
+    /// 1.0 is the ideal. The 0.006° tier measures 1.04 px at 1,004 m/px — the 4% the
+    /// plan's one-pixel rule gives up so the fitted frame stays in the 2^16
+    /// instance-buffer step; the 0.003° tier would cost ~4,000 more triangles for that
+    /// 4%. It is a worst-case single point, not typical displacement.
+    const TIER_WORST_CASE_AT_FIT_PX: f32 = 1.1;
+
+    /// The measured error of every tier at the two scales that matter: where it is
+    /// switched in, and the design pane's fitted zoom.
+    ///
+    /// This is the plan's §8 one-pixel rule expressed as a test: a tier is never more
+    /// than `TIER_WORST_CASE_AT_THRESHOLD_PX` off where it starts being drawn, and the
+    /// tier the fitted view uses is never more than `TIER_WORST_CASE_AT_FIT_PX` off.
+    /// Both are measured constants, so moving a threshold, a tier's tolerance or the
+    /// build's simplification shows up here instead of being absorbed silently.
+    #[test]
+    fn every_tier_stays_inside_the_pixel_budget_the_plan_sets() {
+        // 1,043 / 900 = 1.159 and 457 / 450 = 1.016 px at the two switches.
+        for (threshold, tier) in [
+            (LAND_TIER_MIDDLE_METRES_PER_PIXEL, 1),
+            (LAND_TIER_COARSE_METRES_PER_PIXEL, 2),
+        ] {
+            let error_px = TIER_WORST_CASE_METRES[tier] / threshold;
+            assert!(
+                error_px <= TIER_WORST_CASE_AT_THRESHOLD_PX,
+                "tier {tier} is {error_px:.2} px off at its {threshold} m/px switch, over \
+                 the {TIER_WORST_CASE_AT_THRESHOLD_PX} px budget",
+            );
+        }
+
+        // The fitted zoom on the design pane draws 1 px at 1,004 m; the tier it picks
+        // there is the 0.006° one, whose worst point is 1,043 m = 1.039 px.
+        let fitted = land_tier(1_004.0);
+        let error_px = TIER_WORST_CASE_METRES[fitted] / 1_004.0;
+        assert!(
+            error_px <= TIER_WORST_CASE_AT_FIT_PX,
+            "the fitted view draws tier {fitted}, which is {error_px:.2} px off, over the \
+             {TIER_WORST_CASE_AT_FIT_PX} px budget",
+        );
+        assert_eq!(
+            fitted,
+            LAND_TIERS - 1,
+            "the fitted view draws the coarsest tier"
+        );
+    }
+
+    #[test]
+    fn a_coarser_scale_never_draws_a_finer_coast() {
+        // Monotone in metres per pixel: a coarser scale (more metres per pixel) may only
+        // move towards the coarser tiers, so the answer walks 0 → 1 → 2 and never back.
+        let mut previous = land_tier(0.0);
+        assert_eq!(previous, 0);
+        for step in 1..=2_000 {
+            let metres = step as f32 * 5.0;
+            let tier = land_tier(metres);
+            assert!(
+                tier >= previous,
+                "{metres} m/px reads as tier {tier} after tier {previous}",
+            );
+            assert!(tier < LAND_TIERS, "a tier index outside the asset");
+            previous = tier;
+        }
+        assert_eq!(previous, LAND_TIERS - 1, "10 km/px is the coarsest tier");
+    }
+
+    #[test]
+    fn the_zoom_selects_the_tier_by_the_scale_it_draws_at() {
+        // The fitted zoom on the design's pane is 1 px ≈ 1 km, so the 0.006° coast is
+        // the one whose error is a pixel there; twice the zoom is 1 px ≈ 500 m, where
+        // the 0.003° coast fits; 2.8× is already under the middle threshold and draws
+        // the 0.001° coast.
+        let at = |zoom: f32| {
+            Projection::new(
+                Camera {
+                    center: map_centre(),
+                    zoom,
+                }
+                .clamped(DESIGN_VIEWPORT),
+                DESIGN_VIEWPORT,
+            )
+            .metres_per_pixel()
+        };
+        let fitted = at(MIN_ZOOM);
+        assert!(
+            (900.0..=1_100.0).contains(&fitted),
+            "the fitted zoom is {fitted} m/px, not about a kilometre",
+        );
+        for (zoom, tier) in [(MIN_ZOOM, 2), (1.6, 1), (2.8, 0), (MAX_ZOOM, 0)] {
+            assert_eq!(
+                land_tier(at(zoom)),
+                tier,
+                "at {zoom}× the pane draws {:.0} m/px",
+                at(zoom),
+            );
+        }
+
+        // The scale is the projection's, not the zoom number's: a narrow pane covers
+        // more ground per pixel at the same zoom, so the same 4× reads as a coarser
+        // tier there than on the design's pane.
+        let narrow = [320.0, 400.0];
+        let at_narrow = |zoom: f32| {
+            Projection::new(
+                Camera {
+                    center: map_centre(),
+                    zoom,
+                }
+                .clamped(narrow),
+                narrow,
+            )
+            .metres_per_pixel()
+        };
+        assert!(
+            at_narrow(MAX_ZOOM) > at(MAX_ZOOM),
+            "a narrow pane at 4× draws {:.0} m/px, no finer than the design pane's {:.0}",
+            at_narrow(MAX_ZOOM),
+            at(MAX_ZOOM),
+        );
+        assert_eq!(
+            (land_tier(at_narrow(MAX_ZOOM)), land_tier(at(MAX_ZOOM))),
+            (1, 0),
+            "the same zoom reads as two different tiers on two different panes",
+        );
+
+        // And the fitted zoom itself is not one tier: a 2,048 px wide pane shows the
+        // same degrees across more pixels, so its fitted view is finer than the design
+        // pane's.
+        let wide_fitted = Projection::new(Camera::default(), [2_048.0, 900.0]).metres_per_pixel();
+        assert!(
+            wide_fitted < fitted,
+            "a wider pane is finer at the same zoom"
+        );
+        assert_eq!(
+            (land_tier(wide_fitted), land_tier(fitted)),
+            (1, 2),
+            "1× is not one tier either: {wide_fitted:.0} vs {fitted:.0} m/px",
+        );
+    }
+
+    /// The scale the picture is drawn at, pinned at four independent viewports.
+    ///
+    /// These are the numbers the thresholds are compared against, so they are asserted
+    /// as plain values rather than recomputed from the same constants the function uses
+    /// (which would only prove the formula equals itself). 1,404 × 900 is the design
+    /// pane; 2,048 × 900 is the same height on a wide one; 320 × 400 is the narrowest
+    /// pane a widget is laid out in, at the fitted zoom and at four times it.
+    #[test]
+    fn the_metres_per_pixel_is_the_scale_the_picture_is_drawn_at() {
+        for (viewport, zoom, expected) in [
+            ([1_404.0, 900.0], 1.0, 1_004.0),
+            ([2_048.0, 900.0], 1.0, 688.0),
+            ([320.0, 400.0], 1.0, 2_394.0),
+            ([320.0, 400.0], 4.0, 598.0),
+        ] {
+            let projection = Projection::new(
+                Camera {
+                    center: map_centre(),
+                    zoom,
+                }
+                .clamped(viewport),
+                viewport,
+            );
+            let metres = projection.metres_per_pixel();
+            assert!(
+                (metres - expected).abs() < 5.0,
+                "{viewport:?} at {zoom}× draws {metres:.1} m/px, not {expected}",
+            );
+        }
+
+        // A pane with no size has no scale to read, and a scale that is not a finite
+        // positive number is not a scale at all.
+        assert_eq!(
+            Projection::new(Camera::default(), [0.0, 0.0]).metres_per_pixel(),
+            0.0,
+        );
+        for scale in [0.0, -1.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            assert_eq!(metres_per_pixel(scale), 0.0, "{scale} is not a scale");
+        }
     }
 }

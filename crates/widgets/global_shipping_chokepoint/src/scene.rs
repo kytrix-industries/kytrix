@@ -1,20 +1,22 @@
 //! The map under the vessels: the packaged OSM base map and the layers it draws.
 //!
 //! The base map is a checked-in binary ([`MAP_ASSET`]) because it is data, not an
-//! icon: one file, read once, embedded by [`include_bytes!`]. It holds three
-//! sections — the coastline, the land borders and the road network — in the KHL2
-//! format `assets/README.md` documents.
+//! icon: one file, read once, embedded by [`include_bytes!`]. It holds five
+//! sections — three resolutions of the coastline, the land borders and the road
+//! network — in the KHL2 format `assets/README.md` documents.
 //!
 //! Loading is the only expensive step, and it happens once per process:
 //!
-//! 1. [`Scene::parse`] walks the header and the three sections, checks every
+//! 1. [`Scene::parse`] walks the header and the five sections, checks every
 //!    declared count against the bytes that are actually there, and checks each
 //!    line layer's cell table.
-//! 2. The land rings are projected to Web Mercator and tessellated as one
+//! 2. Each land tier's rings are projected to Web Mercator and tessellated as one
 //!    even-odd fill, so lakes and seas cut holes in the land instead of being
 //!    filled over. The triangles are then bucketed by centroid into the culling
 //!    grid, so a frame emits only the cells its viewport touches; the few that
 //!    are too wide for a bucket are kept apart and tested against the viewport.
+//!    The three tiers are the same coastline at 111 m, 333 m and 1 km, and a frame
+//!    draws exactly one of them, chosen by metres per pixel (`model::land_tier`).
 //! 3. The borders and roads are kept as projected polylines cut into pieces, with
 //!    the per-cell piece ranges the build wrote.
 //!
@@ -26,21 +28,29 @@ use std::{ops::Range, sync::OnceLock};
 
 use gpui_kit::{FillOptions, FillRule, PathBuilder, PathStyle, point, px};
 
-use crate::model::{self, CellSpan, GRID_COLS, GRID_ROWS};
+use crate::model::{self, CellSpan, GRID_COLS, GRID_ROWS, LAND_TIERS};
 
-/// The packaged base map: KHL2, one land section and two line sections.
+/// The packaged base map: KHL2, three land tiers and two line sections.
 ///
-/// See `assets/README.md` for where it came from and how it was packed.
-const MAP_ASSET: &[u8] = include_bytes!("../assets/hormuz_map.bin");
+/// See `assets/README.md` for where it came from and how it was packed. A `static`
+/// rather than a `const`: a const is inlined at every use, and this one is 1.8 MB —
+/// a duplicated copy in rodata would be invisible in the source and paid for in the
+/// binary. The tests also compare addresses inside the asset, which only means
+/// something if there is exactly one copy.
+static MAP_ASSET: &[u8] = include_bytes!("../assets/hormuz_map.bin");
 
 /// The four bytes a KHL2 asset starts with.
 const MAGIC: [u8; 4] = *b"KHL2";
 
 /// The only KHL2 version this parser knows.
-const VERSION: u32 = 1;
+///
+/// Version 1 held one land section; version 2 holds one per tier. A version 1
+/// asset is not migrated — it is rejected, because the asset is rebuilt from the
+/// script in the same commit that changes this number.
+const VERSION: u32 = 2;
 
 /// The sections the format defines, in the order they are stored.
-const SECTION_COUNT: u32 = 3;
+const SECTION_COUNT: u32 = 5;
 
 /// `magic | version | bbox | grid_cols | grid_rows | section_count`.
 const HEADER_LEN: usize = 36;
@@ -63,7 +73,7 @@ const MIN_RING_POINTS: usize = 3;
 /// How far the stored `f32` bbox may sit from the decimal constants, in degrees.
 ///
 /// The header stores `f32`, so the values read back as the nearest `f32` to
-/// `47.802 / 21.943 / 61.875 / 29.542`. Those are the same `f32` values the
+/// `47.802 / 21.443 / 61.875 / 30.042`. Those are the same `f32` values the
 /// constants hold, but a comparison against the decimal literals would see the west
 /// edge 1.862e-6° off, so the tolerance has to clear that.
 const BBOX_EPSILON: f32 = 1e-5;
@@ -89,6 +99,12 @@ const ROAD_FLAGS: u8 = 0b111;
 /// count and the fact that every skipped point is that close to its neighbours'
 /// line. The triangle count is pinned too, because changing the tolerance changes
 /// how lyon joins nearly touching edges.
+///
+/// The three tiers are tessellated at this same tolerance rather than at one
+/// scaled to their simplification: a coarser tier's ring points are hundreds of
+/// metres apart, so the value only decides how lyon joins a ring against itself,
+/// and keeping it fixed keeps tier 0's triangles exactly the ones the map drew
+/// before the tiers existed.
 const TESSELLATION_TOLERANCE: f32 = 1e-6;
 
 /// Why the packaged base map could not be turned into a [`Scene`].
@@ -120,6 +136,9 @@ pub(super) enum SceneError {
     /// A line layer's cell table is not a partition of its pieces.
     #[error("map asset has an invalid cell table")]
     BadCellRange,
+    /// A land section carries a cell table, which the format reserves for line layers.
+    #[error("map asset has a land section with a cell table")]
+    LandHasCells,
     /// A line layer's pieces are not all covered by its cell table.
     #[error("map asset has a piece that is in no cell")]
     PieceNotInAnyCell,
@@ -146,8 +165,9 @@ pub(super) enum SceneError {
 
 /// The base map, parsed once and kept in Web Mercator space.
 pub(super) struct Scene {
-    /// The land, tessellated and bucketed into the culling grid.
-    pub land: LandLayer,
+    /// The coastline at each tier, coarsest last: index 0 is 0.001°, index 2 is
+    /// 0.006°. A frame draws exactly one of them — see [`Self::land`].
+    pub land: [LandLayer; LAND_TIERS],
     /// The land borders, cut into per-cell pieces by the build.
     pub borders: LineLayer,
     /// The road network, cut into per-cell pieces by the build.
@@ -169,8 +189,8 @@ pub(super) struct LandLayer {
     /// tessellator also emits triangles spanning most of the map — the largest covers
     /// 23.4% of it, and these wide ones are 98.8% of the land's area — so bucketing those
     /// by centroid would leave them out of nearly every frame that can see them. They
-    /// are kept here instead and tested against the viewport's own rectangle: 3,267
-    /// boxes per frame rather than holes in the coastline.
+    /// are kept here instead and tested against the viewport's own rectangle: 3,389
+    /// boxes per frame at the finest tier rather than holes in the coastline.
     pub wide: Vec<[f32; 6]>,
 }
 
@@ -206,13 +226,19 @@ impl Scene {
     /// The header and every section's declared size are checked before anything is
     /// projected or tessellated, and the line layers' pieces and cell tables are
     /// checked before the land is handed to lyon: a malformed asset never reaches the
-    /// tessellator. The land is the only layer that has to be built after those
-    /// checks, so it is filled in last.
+    /// tessellator. The land tiers are the only layers that have to be built after
+    /// those checks, so they are filled in last.
     pub(super) fn parse(bytes: &[u8]) -> Result<Self, SceneError> {
         parse_header(bytes)?;
 
+        // The sections are read in the order the format stores them, and
+        // `RawSection::parse` rejects a kind that is not the one this position
+        // declares: a file whose sections are reordered, duplicated or missing fails
+        // here rather than being read as a different map.
         let mut offset = HEADER_LEN;
-        let land = RawSection::parse(bytes, &mut offset, SectionKind::Land)?;
+        let land_0 = RawSection::parse(bytes, &mut offset, SectionKind::LandFine)?;
+        let land_1 = RawSection::parse(bytes, &mut offset, SectionKind::LandMiddle)?;
+        let land_2 = RawSection::parse(bytes, &mut offset, SectionKind::LandCoarse)?;
         let borders = RawSection::parse(bytes, &mut offset, SectionKind::Borders)?;
         let roads = RawSection::parse(bytes, &mut offset, SectionKind::Roads)?;
         if offset != bytes.len() {
@@ -220,35 +246,34 @@ impl Scene {
         }
 
         // The line layers are checked before the land is tessellated: a malformed cell
-        // table is a cheaper failure than 24,700 ring points through lyon, and the
-        // placeholder land layer below is replaced before the scene is handed out.
-        let mut scene = Self {
-            land: LandLayer::empty(),
-            borders: LineLayer::parse(&borders)?,
-            roads: LineLayer::parse(&roads)?,
-        };
-        scene.validate_line_layers()?;
-        scene.land = LandLayer::parse(&land)?;
-        Ok(scene)
+        // table is a cheaper failure than 44,000 ring points through lyon, and the
+        // three tiers are the most expensive thing this parser does.
+        let borders = LineLayer::parse(&borders)?;
+        let roads = LineLayer::parse(&roads)?;
+        borders.validate(LineKind::Borders)?;
+        roads.validate(LineKind::Roads)?;
+
+        Ok(Self {
+            land: [
+                LandLayer::parse(&land_0)?,
+                LandLayer::parse(&land_1)?,
+                LandLayer::parse(&land_2)?,
+            ],
+            borders,
+            roads,
+        })
     }
 
-    /// Checks the invariants of the two line layers once they are built.
-    fn validate_line_layers(&self) -> Result<(), SceneError> {
-        self.borders.validate(LineKind::Borders)?;
-        self.roads.validate(LineKind::Roads)
+    /// The coastline a projection whose pixels are `metres_per_pixel` wide draws.
+    ///
+    /// The tier is a property of the projection's scale, not of the zoom number: a
+    /// zoom is relative to the pane's own fitted scale, which changes with its size.
+    pub(super) fn land(&self, metres_per_pixel: f32) -> &LandLayer {
+        &self.land[model::land_tier(metres_per_pixel)]
     }
 }
 
 impl LandLayer {
-    /// A land layer with nothing in it, replaced before a [`Scene`] is handed out.
-    fn empty() -> Self {
-        Self {
-            triangles: Vec::new(),
-            cells: Vec::new(),
-            wide: Vec::new(),
-        }
-    }
-
     /// Every triangle that can reach a viewport covering `visible`.
     ///
     /// `cells` is the viewport's cells grown by one, which is what covers the triangles
@@ -274,8 +299,13 @@ impl LandLayer {
     /// The rings are one even-odd fill: a lake or a sea is a ring inside another and
     /// cuts a hole rather than being filled over. Every ring's points are checked to
     /// lie inside the section before they are read, and every projected vertex is
-    /// checked to be finite before lyon sees it.
+    /// checked to be finite before lyon sees it. A land section carries no cell table
+    /// — the grid is made at run time from the triangles — so a section that declares
+    /// one is rejected rather than silently ignored.
     fn parse(section: &RawSection<'_>) -> Result<Self, SceneError> {
+        if !section.cells.is_empty() {
+            return Err(SceneError::LandHasCells);
+        }
         let options = FillOptions::default()
             .with_fill_rule(FillRule::EvenOdd)
             .with_tolerance(TESSELLATION_TOLERANCE);
@@ -434,23 +464,32 @@ pub(super) fn scene() -> Result<&'static Scene, SceneError> {
 }
 
 /// The sections a KHL2 asset stores, in the order it stores them.
+///
+/// The three land tiers come first, coarsest last: the parser tessellates each into
+/// its own [`LandLayer`], and a frame draws the one [`model::land_tier`] picks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SectionKind {
-    /// Closed coastline rings, tessellated at run time.
-    Land = 1,
+    /// Closed coastline rings at 0.001°, tessellated at run time.
+    LandFine = 1,
+    /// Closed coastline rings at 0.003°, tessellated at run time.
+    LandMiddle = 2,
+    /// Closed coastline rings at 0.006°, tessellated at run time.
+    LandCoarse = 3,
     /// Land borders, cut into per-cell pieces by the build.
-    Borders = 2,
+    Borders = 4,
     /// Roads, cut into per-cell pieces by the build.
-    Roads = 3,
+    Roads = 5,
 }
 
 impl SectionKind {
     /// The kind one stored `u32` names, or `None` when it names no section.
     fn from_u32(value: u32) -> Option<Self> {
         match value {
-            1 => Some(Self::Land),
-            2 => Some(Self::Borders),
-            3 => Some(Self::Roads),
+            1 => Some(Self::LandFine),
+            2 => Some(Self::LandMiddle),
+            3 => Some(Self::LandCoarse),
+            4 => Some(Self::Borders),
+            5 => Some(Self::Roads),
             _ => None,
         }
     }
@@ -676,10 +715,10 @@ fn read_array(bytes: &[u8], offset: usize) -> [u8; 4] {
 mod tests {
     use super::*;
 
-    /// The land's stored points, as the checked-in asset declares them.
-    const LAND_POINTS: u32 = 25_446;
-    /// The land rings, as the checked-in asset declares them.
-    const LAND_PIECES: u32 = 854;
+    /// The land's stored points, tier by tier, as the checked-in asset declares them.
+    const LAND_POINTS: [u32; LAND_TIERS] = [25_446, 12_113, 8_099];
+    /// The land rings, tier by tier.
+    const LAND_PIECES: [u32; LAND_TIERS] = [854, 790, 785];
     /// The border points, as the checked-in asset declares them.
     const BORDER_POINTS: u32 = 1_630;
     /// The border pieces, as the checked-in asset declares them.
@@ -691,15 +730,23 @@ mod tests {
     /// The cells each line layer's table holds.
     const CELLS: u32 = GRID_COLS * GRID_ROWS;
 
-    /// The triangles the land rings tessellate into at [`TESSELLATION_TOLERANCE`].
-    const LAND_TRIANGLES: usize = 22_876;
-    /// The land triangles the culling grid can bucket by centroid.
-    const LAND_CELL_TRIANGLES: usize = 19_487;
-    /// The land triangles too wide to bucket by centroid.
-    const LAND_WIDE_TRIANGLES: usize = 3_389;
-    /// The distinct ring points: 25,446 stored points less one closing point per ring.
+    /// The triangles each land tier tessellates into at [`TESSELLATION_TOLERANCE`].
+    ///
+    /// The 0.001° tier is the count the map drew before the tiers existed and is
+    /// pinned to the triangle; the two coarser ones are pinned to the same standard,
+    /// because they are the whole point of the change — the fitted zoom draws 5,744
+    /// triangles, not 22,876. The build's own estimate (`points - 3 × rings`) reads
+    /// 22,884 / 9,743 / 5,744: lyon skips the ring points that are collinear with
+    /// their neighbours, and a simplified ring has a few of those.
+    const LAND_TRIANGLES: [usize; LAND_TIERS] = [22_876, 9_736, 5_744];
+    /// The triangles of each tier the culling grid can bucket by centroid.
+    const LAND_CELL_TRIANGLES: [usize; LAND_TIERS] = [19_487, 8_145, 4_786];
+    /// The triangles of each tier too wide to bucket by centroid.
+    const LAND_WIDE_TRIANGLES: [usize; LAND_TIERS] = [3_389, 1_591, 958];
+    /// The distinct ring points of tier 0: 25,446 stored points less one closing point
+    /// per ring.
     const LAND_RING_POINTS: usize = 24_592;
-    /// The distinct points the triangles are built from.
+    /// The distinct points the tier 0 triangles are built from.
     ///
     /// Two ring points are not in them: lyon skips a vertex that sits within the
     /// tessellation tolerance of the straight line between its neighbours, which both
@@ -740,9 +787,9 @@ mod tests {
         reserved: u8,
     }
 
-    fn land_section(points: &[[f32; 2]], pieces: &[(u32, u16)]) -> SectionSpec {
+    fn land_section(kind: SectionKind, points: &[[f32; 2]], pieces: &[(u32, u16)]) -> SectionSpec {
         SectionSpec {
-            kind: SectionKind::Land as u32,
+            kind: kind as u32,
             points: points.to_vec(),
             pieces: pieces
                 .iter()
@@ -750,6 +797,17 @@ mod tests {
                 .collect(),
             ..SectionSpec::default()
         }
+    }
+
+    /// The same rings at all three tiers, which is what a fixture needs: the parser
+    /// tessellates each section on its own, and a fixture's rings do not have three
+    /// resolutions.
+    fn land_tiers(points: &[[f32; 2]], pieces: &[(u32, u16)]) -> [SectionSpec; LAND_TIERS] {
+        [
+            land_section(SectionKind::LandFine, points, pieces),
+            land_section(SectionKind::LandMiddle, points, pieces),
+            land_section(SectionKind::LandCoarse, points, pieces),
+        ]
     }
 
     fn line_section(
@@ -778,8 +836,8 @@ mod tests {
         line_section(kind, &[], &[], vec![(0, 0); CELLS as usize])
     }
 
-    /// Packs a header and three sections into a KHL2 asset.
-    fn asset(land: SectionSpec, borders: SectionSpec, roads: SectionSpec) -> Vec<u8> {
+    /// Packs a header and the five sections into a KHL2 asset.
+    fn asset(land: [SectionSpec; LAND_TIERS], borders: SectionSpec, roads: SectionSpec) -> Vec<u8> {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&VERSION.to_le_bytes());
         for edge in [
@@ -794,7 +852,7 @@ mod tests {
         bytes.extend_from_slice(&GRID_ROWS.to_le_bytes());
         bytes.extend_from_slice(&SECTION_COUNT.to_le_bytes());
 
-        for section in [land, borders, roads] {
+        for section in land.into_iter().chain([borders, roads]) {
             bytes.extend_from_slice(&section.kind.to_le_bytes());
             bytes.extend_from_slice(&(section.points.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&(section.pieces.len() as u32).to_le_bytes());
@@ -818,24 +876,24 @@ mod tests {
         bytes
     }
 
-    /// A valid land section: one closed triangle.
-    fn land_triangle() -> SectionSpec {
-        land_section(
+    /// A valid land tier: one closed triangle.
+    fn land_triangle() -> [SectionSpec; LAND_TIERS] {
+        land_tiers(
             &[[50.0, 25.0], [51.0, 25.0], [50.0, 26.0], [50.0, 25.0]],
             &[(0, 4)],
         )
     }
 
-    /// A minimal valid asset: one closed land ring, and two empty line layers.
+    /// A minimal valid asset: one closed land ring at every tier, and two empty line layers.
     fn ring_asset(points: &[[f32; 2]]) -> Vec<u8> {
         asset(
-            land_section(points, &[(0, points.len() as u16)]),
+            land_tiers(points, &[(0, points.len() as u16)]),
             empty_line_section(SectionKind::Borders),
             empty_line_section(SectionKind::Roads),
         )
     }
 
-    /// A minimal valid asset: one triangle, closed.
+    /// A minimal valid asset: one triangle at every tier, closed.
     fn triangle_asset() -> Vec<u8> {
         asset(
             land_triangle(),
@@ -844,9 +902,9 @@ mod tests {
         )
     }
 
-    /// A valid asset with every kind of section filled: one triangle of land, two border
-    /// pieces and two road pieces, so the fuzz reaches the cell table and the piece
-    /// metadata as well as the land.
+    /// A valid asset with every kind of section filled: one triangle of land at every
+    /// tier, two border pieces and two road pieces, so the fuzz reaches the cell table
+    /// and the piece metadata as well as the land.
     fn line_asset() -> Vec<u8> {
         let borders = line_section(
             SectionKind::Borders,
@@ -863,15 +921,22 @@ mod tests {
         asset(land_triangle(), borders, roads)
     }
 
-    /// The three raw sections of the checked-in asset.
-    fn raw_sections() -> [RawSection<'static>; 3] {
+    /// The sections the checked-in asset stores, in the order the file stores them.
+    const ALL: [SectionKind; SECTION_COUNT as usize] = [
+        SectionKind::LandFine,
+        SectionKind::LandMiddle,
+        SectionKind::LandCoarse,
+        SectionKind::Borders,
+        SectionKind::Roads,
+    ];
+
+    /// The five raw sections of the checked-in asset, in the file's order.
+    fn raw_sections() -> [RawSection<'static>; SECTION_COUNT as usize] {
         let mut offset = HEADER_LEN;
-        [
-            RawSection::parse(MAP_ASSET, &mut offset, SectionKind::Land).expect("land section"),
-            RawSection::parse(MAP_ASSET, &mut offset, SectionKind::Borders)
-                .expect("borders section"),
-            RawSection::parse(MAP_ASSET, &mut offset, SectionKind::Roads).expect("roads section"),
-        ]
+        ALL.map(|kind| {
+            RawSection::parse(MAP_ASSET, &mut offset, kind)
+                .unwrap_or_else(|error| panic!("{kind:?} section: {error}"))
+        })
     }
 
     /// The extent the triangles cover, as `[min, max]` in Mercator radians.
@@ -879,9 +944,9 @@ mod tests {
     /// The scene does not keep it: the frame draws every triangle against the map box
     /// rather than against the land's own extent, so the extent is only ever a fixture
     /// check — computed here from the triangles it describes.
-    fn land_extent(scene: &Scene) -> [[f32; 2]; 2] {
+    fn land_extent(land: &LandLayer) -> [[f32; 2]; 2] {
         let mut extent = [[f32::INFINITY; 2], [f32::NEG_INFINITY; 2]];
-        for triangle in scene.land.triangles.iter().chain(scene.land.wide.iter()) {
+        for triangle in land.triangles.iter().chain(land.wide.iter()) {
             for pair in triangle.as_chunks::<2>().0 {
                 let [x, y] = *pair;
                 extent[0][0] = extent[0][0].min(x);
@@ -915,25 +980,33 @@ mod tests {
         assert_eq!(read_u32(MAP_ASSET, 32), SECTION_COUNT);
 
         let raw = raw_sections();
-        assert_eq!(raw[0].points.len() / POINT_LEN, LAND_POINTS as usize);
-        assert_eq!(raw[0].pieces.len() / PIECE_LEN, LAND_PIECES as usize);
-        assert_eq!(raw[0].cells.len(), 0, "the land is binned at run time");
-        assert_eq!(raw[1].points.len() / POINT_LEN, BORDER_POINTS as usize);
-        assert_eq!(raw[1].pieces.len() / PIECE_LEN, BORDER_PIECES as usize);
-        assert_eq!(raw[1].cells.len() / CELL_LEN, CELLS as usize);
-        assert_eq!(raw[2].points.len() / POINT_LEN, ROAD_POINTS as usize);
-        assert_eq!(raw[2].pieces.len() / PIECE_LEN, ROAD_PIECES as usize);
-        assert_eq!(raw[2].cells.len() / CELL_LEN, CELLS as usize);
+        for (tier, section) in raw[..LAND_TIERS].iter().enumerate() {
+            assert_eq!(section.points.len() / POINT_LEN, LAND_POINTS[tier] as usize);
+            assert_eq!(section.pieces.len() / PIECE_LEN, LAND_PIECES[tier] as usize);
+            assert_eq!(section.cells.len(), 0, "the land is binned at run time");
+        }
+        assert_eq!(raw[3].points.len() / POINT_LEN, BORDER_POINTS as usize);
+        assert_eq!(raw[3].pieces.len() / PIECE_LEN, BORDER_PIECES as usize);
+        assert_eq!(raw[3].cells.len() / CELL_LEN, CELLS as usize);
+        assert_eq!(raw[4].points.len() / POINT_LEN, ROAD_POINTS as usize);
+        assert_eq!(raw[4].pieces.len() / PIECE_LEN, ROAD_PIECES as usize);
+        assert_eq!(raw[4].cells.len() / CELL_LEN, CELLS as usize);
 
         let scene = scene().expect("the checked-in asset parses");
-        assert_eq!(scene.land.triangles.len(), LAND_CELL_TRIANGLES);
-        assert_eq!(scene.land.wide.len(), LAND_WIDE_TRIANGLES);
-        assert_eq!(
-            scene.land.triangles.len() + scene.land.wide.len(),
-            LAND_TRIANGLES,
-            "every triangle is either bucketed or kept for the viewport test",
-        );
-        assert_eq!(scene.land.cells.len(), CELLS as usize);
+        for (tier, land) in scene.land.iter().enumerate() {
+            assert_eq!(
+                land.triangles.len(),
+                LAND_CELL_TRIANGLES[tier],
+                "tier {tier}"
+            );
+            assert_eq!(land.wide.len(), LAND_WIDE_TRIANGLES[tier], "tier {tier}");
+            assert_eq!(
+                land.triangles.len() + land.wide.len(),
+                LAND_TRIANGLES[tier],
+                "every triangle of tier {tier} is either bucketed or kept for the viewport test",
+            );
+            assert_eq!(land.cells.len(), CELLS as usize);
+        }
         assert_eq!(scene.borders.points.len(), BORDER_POINTS as usize);
         assert_eq!(scene.borders.pieces.len(), BORDER_PIECES as usize);
         assert_eq!(scene.borders.cells.len(), CELLS as usize);
@@ -942,24 +1015,79 @@ mod tests {
         assert_eq!(scene.roads.cells.len(), CELLS as usize);
     }
 
+    /// Each tier is a coarser coast than the one before it: fewer rings, fewer points
+    /// and fewer triangles, in that order. This is what makes the tier choice worth
+    /// anything, so it is pinned to the asset's own counts rather than to a tolerance.
+    #[test]
+    fn the_land_tiers_get_strictly_cheaper() {
+        let scene = scene().expect("the checked-in asset parses");
+        for pair in LAND_TRIANGLES.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "the tiers are not ordered coarse-last: {LAND_TRIANGLES:?}",
+            );
+        }
+        for pair in LAND_PIECES.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "a coarser tier has at least as many rings: {LAND_PIECES:?}",
+            );
+        }
+        for pair in LAND_POINTS.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "a coarser tier has at least as many points: {LAND_POINTS:?}",
+            );
+        }
+        assert_eq!(
+            scene
+                .land
+                .iter()
+                .map(|land| land.triangles.len() + land.wide.len())
+                .collect::<Vec<_>>(),
+            LAND_TRIANGLES,
+            "the parsed layers hold the counts this module pins",
+        );
+        // The fitted zoom draws the coarsest tier, and it costs less than a third of the
+        // finest one: that ratio is the whole of the P1 saving.
+        assert!(
+            LAND_TRIANGLES[LAND_TIERS - 1] * 3 < LAND_TRIANGLES[0],
+            "the coarsest tier is not the cheap one: {LAND_TRIANGLES:?}",
+        );
+    }
+
+    /// Every triangle of every tier, the bucketed ones and the wide ones.
+    fn all_land_triangles(scene: &Scene) -> impl Iterator<Item = &[f32; 6]> {
+        scene
+            .land
+            .iter()
+            .flat_map(|land| land.triangles.iter().chain(land.wide.iter()))
+    }
+
     #[test]
     fn the_land_covers_the_map_box_and_no_more() {
-        let [min, max] = land_extent(scene().expect("the checked-in asset parses"));
+        let scene = scene().expect("the checked-in asset parses");
         let [west, south, east, north] = model::mercator_bounds();
-        assert!((min[0] - west).abs() <= MERCATOR_EPSILON);
-        assert!((min[1] - south).abs() <= MERCATOR_EPSILON);
-        assert!((max[0] - east).abs() <= MERCATOR_EPSILON);
-        assert!((max[1] - north).abs() <= MERCATOR_EPSILON);
+        for (tier, land) in scene.land.iter().enumerate() {
+            let [min, max] = land_extent(land);
+            assert!(
+                (min[0] - west).abs() <= MERCATOR_EPSILON,
+                "tier {tier} starts {min:?} from the west edge",
+            );
+            assert!((min[1] - south).abs() <= MERCATOR_EPSILON, "tier {tier}");
+            assert!((max[0] - east).abs() <= MERCATOR_EPSILON, "tier {tier}");
+            assert!((max[1] - north).abs() <= MERCATOR_EPSILON, "tier {tier}");
+        }
     }
 
     #[test]
     fn every_land_triangle_is_finite_and_inside_the_map_box() {
-        // Both halves: the wide triangles are the ones the culling tests against the
-        // viewport, and a coordinate outside the box there is a triangle drawn in the
-        // wrong place rather than a missing one.
+        // Both halves, at every tier: the wide triangles are the ones the culling tests
+        // against the viewport, and a coordinate outside the box there is a triangle
+        // drawn in the wrong place rather than a missing one.
         let scene = scene().expect("the checked-in asset parses");
         let [west, south, east, north] = model::mercator_bounds();
-        for triangle in scene.land.triangles.iter().chain(scene.land.wide.iter()) {
+        for triangle in all_land_triangles(scene) {
             for pair in triangle.as_chunks::<2>().0 {
                 let [x, y] = *pair;
                 assert!(x.is_finite() && y.is_finite());
@@ -990,8 +1118,8 @@ mod tests {
         let scene = scene().expect("the checked-in asset parses");
         let raw = raw_sections();
         for (layer, section, name) in [
-            (&scene.borders, &raw[1], "borders"),
-            (&scene.roads, &raw[2], "roads"),
+            (&scene.borders, &raw[3], "borders"),
+            (&scene.roads, &raw[4], "roads"),
         ] {
             for (index, range) in layer.cells.iter().enumerate() {
                 let [west, south, east, north] = cell_box(index as u32);
@@ -1095,11 +1223,10 @@ mod tests {
         ring.sort_unstable();
         ring.dedup();
 
-        let mut vertices: Vec<[u32; 2]> = scene
-            .land
+        let mut vertices: Vec<[u32; 2]> = scene.land[0]
             .triangles
             .iter()
-            .chain(scene.land.wide.iter())
+            .chain(scene.land[0].wide.iter())
             .flat_map(|triangle| triangle.as_chunks::<2>().0)
             .map(|pair| [pair[0].to_bits(), pair[1].to_bits()])
             .collect();
@@ -1196,29 +1323,31 @@ mod tests {
         // that point's cell grown by one.
         let scene = scene().expect("the checked-in asset parses");
         let [west, _, east, _] = model::mercator_bounds();
-        for triangle in &scene.land.triangles {
-            let [min_x, min_y, max_x, max_y] = triangle_bounds(triangle);
-            let centroid = row_of((triangle[1] + triangle[3] + triangle[5]) / 3.0) * GRID_COLS
-                + column_of((triangle[0] + triangle[2] + triangle[4]) / 3.0, west, east);
-            for (x, y) in [
-                (min_x, min_y),
-                (max_x, max_y),
-                (min_x, max_y),
-                (max_x, min_y),
-            ] {
-                assert!(
-                    model::visible_cells([x, y, x, y])
-                        .grown()
-                        .indices()
-                        .any(|cell| cell == centroid),
-                    "a bucketed triangle's centroid cell is more than one cell from a \
-                     corner of its box",
-                );
+        for land in &scene.land {
+            for triangle in &land.triangles {
+                let [min_x, min_y, max_x, max_y] = triangle_bounds(triangle);
+                let centroid = row_of((triangle[1] + triangle[3] + triangle[5]) / 3.0) * GRID_COLS
+                    + column_of((triangle[0] + triangle[2] + triangle[4]) / 3.0, west, east);
+                for (x, y) in [
+                    (min_x, min_y),
+                    (max_x, max_y),
+                    (min_x, max_y),
+                    (max_x, min_y),
+                ] {
+                    assert!(
+                        model::visible_cells([x, y, x, y])
+                            .grown()
+                            .indices()
+                            .any(|cell| cell == centroid),
+                        "a bucketed triangle's centroid cell is more than one cell from a \
+                         corner of its box",
+                    );
+                }
             }
         }
         assert!(
-            !scene.land.triangles.is_empty() && !scene.land.wide.is_empty(),
-            "both halves of the layer are exercised",
+            !scene.land[0].triangles.is_empty() && !scene.land[0].wide.is_empty(),
+            "both halves of the finest layer are exercised",
         );
     }
 
@@ -1227,78 +1356,78 @@ mod tests {
         // The tessellator emits triangles spanning most of the map. Bucketed by centroid
         // alone they would be missing from any viewport that touches them but not their
         // centroid: at four times the fitted zoom over the strait, 561 of the 4,664
-        // triangles the viewport touches (12%) have their centroid in a cell the ungrown
-        // span does not visit, and they carry 69% of the land area it shows.
+        // triangles the finest viewport touches (12%) have their centroid in a cell the
+        // ungrown span does not visit, and they carry 69% of the land area it shows.
+        // Every tier has wide triangles of its own (3,389 / 1,591 / 933), so the wide
+        // path is exercised at all three.
         let scene = scene().expect("the checked-in asset parses");
         let visible = strait_viewport();
         let cells = model::visible_cells(visible).grown();
-        let mut drawn: Vec<*const [f32; 6]> = scene
-            .land
-            .visible(cells, visible)
-            .map(|triangle| triangle as *const [f32; 6])
-            .collect();
-        drawn.sort_unstable();
-
-        let mut overlapping = 0;
-        for triangle in scene.land.triangles.iter().chain(scene.land.wide.iter()) {
-            let [west, south, east, north] = triangle_bounds(triangle);
-            if west <= visible[2]
-                && east >= visible[0]
-                && south <= visible[3]
-                && north >= visible[1]
-            {
-                overlapping += 1;
-                assert!(
-                    drawn.binary_search(&(triangle as *const [f32; 6])).is_ok(),
-                    "the viewport touches a triangle the frame would not draw",
-                );
-            }
-        }
-        assert!(overlapping > 0, "the viewport shows some land");
-
-        // The largest triangle covers a quarter of the map. Its centroid cell is far
-        // outside the cells this viewport visits; it is drawn because `wide` is tested
-        // against the viewport itself.
-        let largest = scene
-            .land
-            .wide
-            .iter()
-            .max_by(|left, right| {
-                let [lw, ls, le, ln] = triangle_bounds(left);
-                let [rw, rs, re, rn] = triangle_bounds(right);
-                ((le - lw) * (ln - ls)).total_cmp(&((re - rw) * (rn - rs)))
-            })
-            .expect("the asset has wide triangles");
         let [west, _, east, _] = model::mercator_bounds();
-        let centroid = [
-            (largest[0] + largest[2] + largest[4]) / 3.0,
-            (largest[1] + largest[3] + largest[5]) / 3.0,
-        ];
-        let centroid_cell = row_of(centroid[1]) * GRID_COLS + column_of(centroid[0], west, east);
-        assert!(
-            !cells.indices().any(|cell| cell == centroid_cell),
-            "the largest triangle's centroid cell is not one the viewport visits",
-        );
-        assert!(
-            drawn.contains(&(largest as *const [f32; 6])),
-            "and it is drawn anyway",
-        );
 
-        // At the fitted zoom the whole map is visible, so every triangle is drawn once.
+        for (tier, land) in scene.land.iter().enumerate() {
+            assert!(!land.wide.is_empty(), "tier {tier} has no wide triangles");
+
+            let mut drawn: Vec<*const [f32; 6]> = land
+                .visible(cells, visible)
+                .map(|triangle| triangle as *const [f32; 6])
+                .collect();
+            drawn.sort_unstable();
+
+            let mut overlapping = 0;
+            for triangle in land.triangles.iter().chain(land.wide.iter()) {
+                let [west, south, east, north] = triangle_bounds(triangle);
+                if west <= visible[2]
+                    && east >= visible[0]
+                    && south <= visible[3]
+                    && north >= visible[1]
+                {
+                    overlapping += 1;
+                    assert!(
+                        drawn.binary_search(&(triangle as *const [f32; 6])).is_ok(),
+                        "tier {tier}: the viewport touches a triangle the frame would not draw",
+                    );
+                }
+            }
+            assert!(overlapping > 0, "tier {tier}: the viewport shows some land");
+
+            // At least one of the tier's wide triangles is drawn while its centroid cell
+            // is not one the viewport visits: that is the case `visible` keeps `wide`
+            // for, and it has to hold at every tier, not only at the finest one.
+            let escaped = land.wide.iter().find(|triangle| {
+                let centroid = [
+                    (triangle[0] + triangle[2] + triangle[4]) / 3.0,
+                    (triangle[1] + triangle[3] + triangle[5]) / 3.0,
+                ];
+                let centroid_cell =
+                    row_of(centroid[1]) * GRID_COLS + column_of(centroid[0], west, east);
+                !cells.indices().any(|cell| cell == centroid_cell)
+                    && drawn.binary_search(&(*triangle as *const [f32; 6])).is_ok()
+            });
+            assert!(
+                escaped.is_some(),
+                "tier {tier}: no wide triangle is drawn from outside the visited cells",
+            );
+        }
+
+        // At the fitted zoom the whole map is visible, so every triangle of every tier is
+        // drawn once.
         let whole = model::mercator_bounds();
         let all = model::visible_cells(whole).grown();
-        assert_eq!(
-            scene.land.visible(all, whole).count(),
-            LAND_TRIANGLES,
-            "a frame that sees the whole map draws every triangle exactly once",
-        );
+        for (tier, land) in scene.land.iter().enumerate() {
+            assert_eq!(
+                land.visible(all, whole).count(),
+                LAND_TRIANGLES[tier],
+                "a frame that sees the whole map draws every triangle of tier {tier} once",
+            );
+        }
     }
 
     #[test]
     fn every_truncated_prefix_of_the_asset_is_rejected() {
         // A truncated asset has to fail before the land reaches the tessellator rather
         // than panic in it. Sampled rather than every byte: the tail is dense because a
-        // cut there still leaves all three sections' headers readable.
+        // cut there still leaves every section's header readable.
         let mut cuts: Vec<usize> = (0..MAP_ASSET.len()).step_by(512).collect();
         cuts.extend(MAP_ASSET.len().saturating_sub(1_024)..MAP_ASSET.len());
         for cut in cuts {
@@ -1313,8 +1442,8 @@ mod tests {
     #[test]
     fn a_flipped_header_never_panics() {
         // A flipped byte is either rejected or read as a different but valid value; what
-        // it must never do is panic or over-read. The header and the three section
-        // headers are the bytes every count and offset is read from.
+        // it must never do is panic or over-read. The header and every section header are
+        // the bytes every count and offset is read from.
         let raw = raw_sections();
         let base = MAP_ASSET.as_ptr() as usize;
         let mut positions: Vec<usize> = (0..HEADER_LEN).collect();
@@ -1322,7 +1451,10 @@ mod tests {
             let points = section.points.as_ptr() as usize - base;
             positions.extend(points - SECTION_HEADER_LEN..points);
         }
-        assert_eq!(positions.len(), HEADER_LEN + 3 * SECTION_HEADER_LEN);
+        assert_eq!(
+            positions.len(),
+            HEADER_LEN + SECTION_COUNT as usize * SECTION_HEADER_LEN,
+        );
 
         let mut bytes = MAP_ASSET.to_vec();
         for position in positions {
@@ -1398,12 +1530,19 @@ mod tests {
 
     #[test]
     fn an_unknown_version_is_rejected() {
-        let mut bytes = triangle_asset();
-        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        assert_eq!(
-            Scene::parse(&bytes).err(),
-            Some(SceneError::UnsupportedVersion)
-        );
+        // A version 1 asset is the shape this parser used to read: it holds a single
+        // land section. It is not migrated — the asset is rebuilt in the same change
+        // that bumps the version — so the next version and the previous one both fail
+        // here, as does any other number.
+        for version in [1u32, 3, u32::MAX] {
+            let mut bytes = triangle_asset();
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                Scene::parse(&bytes).err(),
+                Some(SceneError::UnsupportedVersion),
+                "version {version} should be rejected",
+            );
+        }
     }
 
     #[test]
@@ -1424,25 +1563,110 @@ mod tests {
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::GridMismatch));
     }
 
+    /// A version 1 asset is a different file shape — one land section, not three — and
+    /// this parser does not migrate it: the checked-in asset is rebuilt by
+    /// `assets/build_map.py` in the same change that moves the version. Rewriting the
+    /// version byte of the real asset therefore has to be rejected before any section is
+    /// read, not read as a five-section file that happens to start with three land
+    /// sections.
+    #[test]
+    fn the_previous_asset_version_is_rejected_at_the_header() {
+        for version in [1u32, 3, 0] {
+            let mut bytes = MAP_ASSET.to_vec();
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                Scene::parse(&bytes).err(),
+                Some(SceneError::UnsupportedVersion),
+                "the asset rewritten as version {version} should be rejected",
+            );
+        }
+        assert!(Scene::parse(MAP_ASSET).is_ok(), "the asset itself parses");
+    }
+
     #[test]
     fn a_missing_section_is_rejected() {
         // The header declares fewer sections than the format has.
         let mut bytes = triangle_asset();
-        bytes[32..36].copy_from_slice(&2u32.to_le_bytes());
-        assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::MissingSection));
-
-        // The first section is not the land the format stores there.
-        let mut swapped = triangle_asset();
-        swapped[36..40].copy_from_slice(&(SectionKind::Borders as u32).to_le_bytes());
-        assert_eq!(
-            Scene::parse(&swapped).err(),
-            Some(SceneError::MissingSection)
-        );
-
-        // The header declares a fourth section the format does not define.
-        let mut bytes = triangle_asset();
         bytes[32..36].copy_from_slice(&4u32.to_le_bytes());
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::MissingSection));
+
+        // Every section is expected where the format puts it: a file that swapped any
+        // two of them — a land tier for the borders, two tiers the other way round — is
+        // not read as a different map.
+        let raw = raw_sections();
+        let base = MAP_ASSET.as_ptr() as usize;
+        for (index, section) in raw.iter().enumerate() {
+            let section_offset = section.points.as_ptr() as usize - base - SECTION_HEADER_LEN;
+            let wrong = ALL[(index + 1) % SECTION_COUNT as usize] as u32;
+            let mut swapped = MAP_ASSET.to_vec();
+            swapped[section_offset..section_offset + 4].copy_from_slice(&wrong.to_le_bytes());
+            assert_eq!(
+                Scene::parse(&swapped).err(),
+                Some(SceneError::MissingSection),
+                "section {index} reading as kind {wrong} should be rejected",
+            );
+        }
+
+        // The header declares a sixth section the format does not define.
+        let mut bytes = triangle_asset();
+        bytes[32..36].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::MissingSection));
+    }
+
+    /// The byte range of each section of the checked-in asset.
+    fn section_ranges() -> Vec<Range<usize>> {
+        let raw = raw_sections();
+        let base = MAP_ASSET.as_ptr() as usize;
+        let starts: Vec<usize> = raw
+            .iter()
+            .map(|section| section.points.as_ptr() as usize - base - SECTION_HEADER_LEN)
+            .collect();
+        starts
+            .iter()
+            .copied()
+            .zip(starts.iter().copied().skip(1).chain([MAP_ASSET.len()]))
+            .map(|(start, end)| start..end)
+            .collect()
+    }
+
+    #[test]
+    fn a_physically_missing_section_is_rejected() {
+        // The header still declares five sections; the bytes hold four. Removing one from
+        // the middle shifts every later section under the wrong expected kind, which the
+        // kind check catches; removing the last runs out of bytes, which is truncation.
+        let ranges = section_ranges();
+        assert_eq!(ranges.len(), SECTION_COUNT as usize);
+
+        let mut missing_middle = MAP_ASSET.to_vec();
+        missing_middle.drain(ranges[2].clone());
+        assert_eq!(
+            Scene::parse(&missing_middle).err(),
+            Some(SceneError::MissingSection),
+            "a file without its third section is read as a different map",
+        );
+
+        let mut missing_last = MAP_ASSET.to_vec();
+        missing_last.truncate(ranges[4].start);
+        assert_eq!(
+            Scene::parse(&missing_last).err(),
+            Some(SceneError::Truncated),
+            "a file that ends before its fifth section was never packed whole",
+        );
+    }
+
+    #[test]
+    fn a_land_section_with_a_cell_table_is_rejected() {
+        // The format reserves the cell table for the line layers: the land's grid is made
+        // from its triangles at parse time. A land section that declares one is malformed
+        // even if the table itself happens to be valid, and must not be silently ignored.
+        let mut land = land_triangle();
+        land[1].cells = vec![(0, 1)];
+        let bytes = asset(
+            land,
+            empty_line_section(SectionKind::Borders),
+            empty_line_section(SectionKind::Roads),
+        );
+        assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::LandHasCells));
     }
 
     #[test]
@@ -1471,7 +1695,7 @@ mod tests {
     #[test]
     fn an_asset_without_land_is_empty() {
         let bytes = asset(
-            land_section(&[], &[]),
+            land_tiers(&[], &[]),
             empty_line_section(SectionKind::Borders),
             empty_line_section(SectionKind::Roads),
         );
@@ -1522,7 +1746,7 @@ mod tests {
     fn a_piece_that_reaches_past_its_points_is_rejected() {
         // A land ring that claims a point the section does not hold.
         let bytes = asset(
-            land_section(&[[50.0, 25.0], [51.0, 25.0], [50.0, 26.0]], &[(0, 4)]),
+            land_tiers(&[[50.0, 25.0], [51.0, 25.0], [50.0, 26.0]], &[(0, 4)]),
             empty_line_section(SectionKind::Borders),
             empty_line_section(SectionKind::Roads),
         );
@@ -1651,10 +1875,8 @@ mod tests {
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::BadPiece));
 
         // A land piece carries no metadata at all.
-        let land = SectionSpec {
-            reserved: 1,
-            ..land_triangle()
-        };
+        let mut land = land_triangle();
+        land[0].reserved = 1;
         let bytes = asset(
             land,
             empty_line_section(SectionKind::Borders),
@@ -1808,42 +2030,43 @@ mod tests {
     fn every_viewport_draws_every_triangle_it_touches_and_draws_none_twice() {
         // The frame draws the land from the cells the viewport touches plus one cell of
         // margin, and tests the wide triangles against the viewport itself. This is the
-        // ground truth for that: a triangle whose box the viewport touches must be drawn,
-        // and no triangle may be drawn twice — the two halves are disjoint, so a wide
-        // triangle cannot also come back through its cell.
+        // ground truth for that, tier by tier: a triangle whose box the viewport touches
+        // must be drawn, and no triangle may be drawn twice — the two halves are
+        // disjoint, so a wide triangle cannot also come back through its cell.
         let scene = scene().expect("the checked-in asset parses");
-        let all: Vec<(&[f32; 6], [f32; 4])> = scene
-            .land
-            .triangles
-            .iter()
-            .chain(scene.land.wide.iter())
-            .map(|triangle| (triangle, triangle_bounds(triangle)))
-            .collect();
-        assert_eq!(all.len(), LAND_TRIANGLES);
-
-        let mut draws = vec![0u32; LAND_TRIANGLES];
         let mut viewports = 0;
-        for (label, visible) in sweep_viewports() {
-            viewports += 1;
-            let cells = model::visible_cells(visible);
-            for triangle in scene.land.visible(cells.grown(), visible) {
-                let index = index_of(&scene.land, triangle).expect("a triangle of the layer");
-                draws[index] += 1;
-            }
+        for (tier, land) in scene.land.iter().enumerate() {
+            let all: Vec<(&[f32; 6], [f32; 4])> = land
+                .triangles
+                .iter()
+                .chain(land.wide.iter())
+                .map(|triangle| (triangle, triangle_bounds(triangle)))
+                .collect();
+            assert_eq!(all.len(), LAND_TRIANGLES[tier]);
 
-            for (index, (triangle, _)) in all.iter().enumerate() {
-                if touches(triangle, visible) {
-                    assert!(
-                        draws[index] > 0,
-                        "{label} touches a triangle it does not draw",
-                    );
+            let mut draws = vec![0u32; LAND_TRIANGLES[tier]];
+            for (label, visible) in sweep_viewports() {
+                viewports += 1;
+                let cells = model::visible_cells(visible);
+                for triangle in land.visible(cells.grown(), visible) {
+                    let index = index_of(land, triangle).expect("a triangle of the layer");
+                    draws[index] += 1;
                 }
-                assert!(
-                    draws[index] <= 1,
-                    "{label} draws a triangle {} times",
-                    draws[index],
-                );
-                draws[index] = 0;
+
+                for (index, (triangle, _)) in all.iter().enumerate() {
+                    if touches(triangle, visible) {
+                        assert!(
+                            draws[index] > 0,
+                            "{label} touches a triangle it does not draw (tier {tier})",
+                        );
+                    }
+                    assert!(
+                        draws[index] <= 1,
+                        "{label} draws a triangle of tier {tier} {} times",
+                        draws[index],
+                    );
+                    draws[index] = 0;
+                }
             }
         }
         assert!(viewports >= 100, "the sweep lost viewports");
@@ -1871,8 +2094,8 @@ mod tests {
         let [west, _, east, _] = model::mercator_bounds();
         let mut pieces = 0;
         for (layer, section, name) in [
-            (&scene.borders, &raw[1], "borders"),
-            (&scene.roads, &raw[2], "roads"),
+            (&scene.borders, &raw[3], "borders"),
+            (&scene.roads, &raw[4], "roads"),
         ] {
             for (cell, range) in layer.cells.iter().enumerate() {
                 for piece in &layer.pieces[range.start as usize..range.end as usize] {

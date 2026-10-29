@@ -3,10 +3,10 @@
 //!
 //! The base map is prepared once by [`crate::scene`] and the picture arrives as a list of
 //! vessels, so a frame here only applies the camera's affine transform: the coastline is a
-//! triangle list, the borders and the roads are ribbons whose width is in screen pixels,
-//! and the borders and the lanes are dashes walked along their own polylines. Nothing is
-//! tessellated per frame and nothing is cached: a camera change is a different set of
-//! vertices, not a different picture.
+//! triangle list of the one resolution the scale justifies, the borders and the roads are
+//! ribbons whose width is in screen pixels, and the borders and the lanes are dashes walked
+//! along their own polylines. Nothing is tessellated per frame and nothing is cached: a
+//! camera change is a different set of vertices, not a different picture.
 //!
 //! [`MapColors`] stays in the view, because the labels, the hover card and the hit test
 //! read the same palette; this module is what turns the model's [`Projection`] into the
@@ -166,8 +166,9 @@ impl MapLayers {
 
 /// Builds the ten paths one frame draws, from the base map and the picture.
 ///
-/// Pure: no window and no theme. The camera's clamped zoom decides the road detail, and
-/// the viewport decides which cells are read, so two frames of the same camera and the
+/// Pure: no window and no theme. The camera's clamped zoom decides the road detail, the
+/// scale the projection draws at decides which coastline tier is filled, and the
+/// viewport decides which cells are read, so two frames of the same camera and the
 /// same picture build the same geometry. The land's span is grown by one cell because it
 /// is bucketed by triangle centroid; the line layers were cut per cell by the build, so
 /// they take the viewport's span ungrown — growing it would only revisit pieces the
@@ -214,12 +215,15 @@ fn paint_path(window: &mut Window, path: Path<Pixels>, color: Hsla) {
 
 /// The coastline as one fill, every visible triangle transformed into the frame's camera.
 ///
-/// The triangles were tessellated once, when the asset was parsed, and bucketed into the
-/// culling grid: this walks the cells the viewport touches and applies an affine
-/// transform per vertex. That is the land's only per-frame cost, and it is why a cell
-/// the viewport does not touch costs nothing. `cells` is the viewport's span grown by the
-/// one-cell margin; `visible` is the viewport itself, which the layer needs for the
-/// triangles too wide to bucket by centroid.
+/// The asset packs three resolutions of the same coast; the frame draws the one whose
+/// error is about a pixel at the scale it is drawing at ([`model::land_tier`]), which
+/// at the fitted zoom on a typical pane is the 1 km tier rather than the 111 m one.
+/// The triangles of the chosen tier were tessellated once, when the asset was parsed,
+/// and bucketed into the culling grid: this walks the cells the viewport touches and
+/// applies an affine transform per vertex. That is the land's only per-frame cost, and
+/// it is why a cell the viewport does not touch costs nothing. `cells` is the
+/// viewport's span grown by the one-cell margin; `visible` is the viewport itself,
+/// which the layer needs for the triangles too wide to bucket by centroid.
 fn land_path(
     scene: &Scene,
     projection: Projection,
@@ -229,7 +233,10 @@ fn land_path(
 ) -> Path<Pixels> {
     let mut path = Path::new(point(px(0.0), px(0.0)));
     let texture = point(0.0, 1.0);
-    for triangle in scene.land.visible(cells, visible) {
+    for triangle in scene
+        .land(projection.metres_per_pixel())
+        .visible(cells, visible)
+    {
         let [ax, ay, bx, by, cx, cy] = *triangle;
         path.push_triangle(
             (
@@ -626,7 +633,7 @@ mod tests {
         let cells = model::visible_cells(visible).grown();
         let land = land_path(scene, projection, origin, cells, visible);
         let [ax, ay, _, _, _, _] = *scene
-            .land
+            .land(projection.metres_per_pixel())
             .visible(cells, visible)
             .next()
             .expect("the land covers the map box");
@@ -1067,10 +1074,22 @@ mod tests {
     /// The worst frame the viewport and zoom sweep found, in triangles.
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
-    /// again rather than absorbed silently into the budget. It is the fitted zoom that is
-    /// the busiest view now: the coarse copy draws the whole motorway and trunk network
-    /// there, where the old `ref` + length filter drew 13% of it.
-    const WORST_FRAME_TRIANGLES: usize = 59_516;
+    /// again rather than absorbed silently into the budget. The busiest view is the 1.6×
+    /// one rather than the fitted zoom: at 1× the coarsest coast is drawn (5,744
+    /// triangles instead of 22,876) but the coarse copy still draws the whole motorway
+    /// and trunk network, and at 1.6× the finer coast is back while the fine copy of the
+    /// same network replaces the coarse one. The sweep measures it; this constant is
+    /// that measurement.
+    const WORST_FRAME_TRIANGLES: usize = 51_355;
+
+    /// The triangles the fitted frame with no vessels draws on the design's pane.
+    ///
+    /// The ten paths of [`MapLayers`] with an empty picture: the coarsest coast, the
+    /// coarse copy of the whole road network, the dashed borders and the lane sketch.
+    /// Pinned because it is the number the plan's §8 **≤ 21,000** target is about; the
+    /// target itself is not encoded as a constant until P2 can meet it — see
+    /// `the_fitted_frame_is_pinned_until_p2`.
+    const FITTED_FRAME_TRIANGLES: usize = 34_357;
 
     /// The triangles the ten paths of one frame hold.
     fn layer_triangles(layers: &MapLayers) -> usize {
@@ -1145,12 +1164,13 @@ mod tests {
     /// plus the hover ring, with a full picture of [`MAX_VESSELS`] unknown vessels — the
     /// worst each vessel can cost. Nothing is set aside as an allowance.
     ///
-    /// The fit covers the viewport, so 1× does not show the whole map; the fitted zoom is
-    /// nonetheless the busiest view, because it is the one that draws the coarse copy of the
-    /// whole class-0 network. The sweep below covers the user's 1.56:1 pane, a wide one and a
-    /// tall one, at the fitted zoom and at every zoom the road detail switches at, over the
-    /// map's middle, Dubai and the strait — the shots the design's budget was first measured
-    /// on.
+    /// The fit covers the viewport, so 1× does not show the whole map. The fitted zoom is
+    /// no longer the busiest view: it draws the coarsest coast, while 1.6× switches to the
+    /// finer one and to the fine copy of the road network at the same time, and that is
+    /// where the sweep's worst frame sits. The sweep below covers the user's 1.56:1 pane,
+    /// a wide one and a tall one, at the fitted zoom and at every zoom the road detail
+    /// switches at, over the map's middle, Dubai and the strait — the shots the design's
+    /// budget was first measured on.
     #[test]
     fn the_visible_triangle_budget_is_under_the_frame_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
@@ -1204,6 +1224,97 @@ mod tests {
             worst.0, WORST_FRAME_TRIANGLES,
             "the sweep's worst frame is {} triangles ({})",
             worst.0, worst.1,
+        );
+    }
+
+    /// The pane the design measures on: the user's 1.56:1 viewport.
+    const DESIGN_VIEWPORT: [f32; 2] = [1_404.0, 900.0];
+
+    /// The coastline a frame draws follows the projection's real scale, and the vertices
+    /// it emits are exactly the chosen tier's visible triangles.
+    ///
+    /// This is asserted by comparing the painted vertex count with the layer's own
+    /// [`LandLayer::visible`](crate::scene::LandLayer::visible) count for every tier, not
+    /// by looking at whether anything was painted: the fitted zoom has to match the
+    /// coarsest tier's count and four times the zoom the finest tier's, and the two
+    /// counts differ by a factor of five.
+    #[test]
+    fn the_fitted_zoom_fills_the_coarsest_coast_and_four_times_fills_the_finest() {
+        let scene = scene::scene().expect("the checked-in asset parses");
+        let viewport = DESIGN_VIEWPORT;
+        let origin = [0.0, 0.0];
+        let projection = |zoom| {
+            Projection::new(
+                Camera {
+                    center: Camera::default().center,
+                    zoom,
+                }
+                .clamped(viewport),
+                viewport,
+            )
+        };
+
+        for (zoom, expected) in [
+            (model::MIN_ZOOM, model::LAND_TIERS - 1),
+            (model::MAX_ZOOM, 0),
+        ] {
+            let projection = projection(zoom);
+            let visible = projection.visible_mercator();
+            let cells = model::visible_cells(visible).grown();
+            let path = land_path(scene, projection, origin, cells, visible);
+            let triangles: Vec<usize> = scene
+                .land
+                .iter()
+                .map(|land| land.visible(cells, visible).count())
+                .collect();
+
+            assert_eq!(
+                model::land_tier(projection.metres_per_pixel()),
+                expected,
+                "at {zoom}× the projection draws {:.0} m/px, which is not tier {expected}",
+                projection.metres_per_pixel(),
+            );
+            assert_eq!(
+                path.vertices.len(),
+                triangles[expected] * 3,
+                "at {zoom}× the frame paints the triangles of tier {expected}, not another \
+                 tier's: {triangles:?}",
+            );
+            for other in 0..model::LAND_TIERS {
+                if other != expected {
+                    assert_ne!(
+                        triangles[other], triangles[expected],
+                        "tier {other} draws the same count as tier {expected}, so the \
+                         assertion above proves nothing",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fitted frame's triangle count, pinned until P2 lands.
+    ///
+    /// This is a change detector, not a budget assertion: the count is over the plan's
+    /// §8 target of 21,000 because the road layer is still at P1's 26,024 triangles,
+    /// and asserting "over the target" would pass at 21,500 and fail at 20,900 — the
+    /// opposite of what the target means. So the test pins the exact number, and the
+    /// **P2 TODO** is to replace that pin with `assert!(triangles <= 21_000)`: the road
+    /// thinning is what brings this frame from the pinned figure down under 21,000.
+    ///
+    /// The plan's worst-frame target of 27,000 is measured with a full 1,000-vessel
+    /// picture (`the_visible_triangle_budget_is_under_the_frame_budget`); it needs P2's
+    /// roads and P4's vessel dots together, and neither is part of P1.
+    #[test]
+    fn the_fitted_frame_is_pinned_until_p2() {
+        let scene = scene::scene().expect("the checked-in asset parses");
+        let viewport = DESIGN_VIEWPORT;
+        let projection = Projection::new(Camera::default().clamped(viewport), viewport);
+        let layers = map_layers(Some(scene), projection, [0.0, 0.0], &[]);
+        let triangles = layer_triangles(&layers);
+        assert_eq!(
+            triangles, FITTED_FRAME_TRIANGLES,
+            "the fitted frame's triangle count moved: measure it, update the constant and \
+             the README, and check it against the plan's 21,000 target",
         );
     }
 

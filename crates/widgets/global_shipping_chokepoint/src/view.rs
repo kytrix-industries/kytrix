@@ -1910,6 +1910,7 @@ mod tests {
             SceneError::MissingSection,
             SceneError::PointCountOverflow,
             SceneError::BadCellRange,
+            SceneError::LandHasCells,
             SceneError::PieceNotInAnyCell,
             SceneError::BadPiece,
             SceneError::TrailingBytes,

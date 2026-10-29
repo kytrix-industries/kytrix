@@ -3,8 +3,10 @@
 The OSM vector base map the Hormuz vessel widget draws under its vessels: the
 coastline, the land borders and the motorway/trunk/primary roads around the
 Strait of Hormuz, packed into one KHL2 file and embedded with `include_bytes!`.
-The motorways and trunks are packed twice — a fine copy and a coarse one — so
-the network can be drawn whole at the fitted zoom and in detail when zoomed in.
+The coastline is packed three times — at 0.001°, 0.003° and 0.006° — and the
+motorways and trunks twice — a fine copy and a coarse one — so a frame draws the
+resolution its own scale justifies: the fitted zoom uses the 0.006° coast and the
+coarse road copy, and zooming in brings the finer ones back.
 
 `src/scene.rs` parses it as KHL2; it is the only asset here.
 
@@ -129,25 +131,79 @@ snapshot will change them.
 
 ## What was generated
 
-`hormuz_map.bin`: **1,678,896 bytes** (1.60 MiB), SHA256
-`3d4b900c72b8119ec172b5c934a8c622ac1e24ec85344c3c93471a4cf6d84aa3`.
+`hormuz_map.bin`: **1,859,524 bytes** (1.77 MiB), SHA256
+`00a93522723e9a543ec966263b5b60ccc95ca3279869faa63544122591556c3e`.
 
 | section | kind | points | pieces | cells | bytes |
 |---|---|---|---|---|---|
-| land | 1 | 25,446 | 854 | 0 | 16 + 203,568 + 10,248 = 213,832 |
-| borders | 2 | 1,630 | 201 | 2,048 | 16 + 13,040 + 2,412 + 16,384 = 31,852 |
-| roads | 3 | 108,505 | 45,728 | 2,048 | 16 + 868,040 + 548,736 + 16,384 = 1,433,176 |
-| **file** | | | | | **36 + 213,832 + 31,852 + 1,433,176 = 1,678,896** |
+| land 0.001° | 1 | 25,446 | 854 | 0 | 16 + 203,568 + 10,248 = 213,832 |
+| land 0.003° | 2 | 12,113 | 790 | 0 | 16 + 96,904 + 9,480 = 106,400 |
+| land 0.006° | 3 | 8,099 | 785 | 0 | 16 + 64,792 + 9,420 = 74,228 |
+| borders | 4 | 1,630 | 201 | 2,048 | 16 + 13,040 + 2,412 + 16,384 = 31,852 |
+| roads | 5 | 108,505 | 45,728 | 2,048 | 16 + 868,040 + 548,736 + 16,384 = 1,433,176 |
+| **file** | | | | | **36 + 213,832 + 106,400 + 74,228 + 31,852 + 1,433,176 = 1,859,524** |
 
-**Land.** 2,009 shapes of the land shapefile intersect the map box; after the
-union, clip, `make_valid`, `simplify(0.001, preserve_topology=True)` and
-dropping polygons under 0.01 km², 854 polygons stay (950 are dropped) and
-produce 854 closed rings / 25,446 points. The area is converted to km² before
-the test: a raw square degree is about 11,200 km² here, so a `0.01` in raw
-degrees would be a ~112 km² cutoff and drop almost every island. The rings
-cover the whole map box: their extent is 47.801998 / 21.443001 / 61.875 /
-30.042 (the `f32` values as stored), and there are no interior rings in this
-box.
+**Land.** 2,009 shapes of the land shapefile intersect the map box; they are
+unioned, clipped, made valid **once**, and that one geometry is then simplified
+three times with `preserve_topology=True`, each tier dropping its own polygons
+under 0.01 km² and packing one closed ring per polygon ring:
+
+| tier | tolerance | ≈ metres | polygons kept / dropped | rings | points | triangles (lyon) |
+|---|---|---|---|---|---|---|
+| 0 | 0.001° | 100 m | 854 / 950 | 854 | 25,446 | 22,876 |
+| 1 | 0.003° | 300 m | 790 / 1,014 | 790 | 12,113 | 9,736 |
+| 2 | 0.006° | 600 m | 785 / 1,019 | 785 | 8,099 | 5,744 |
+
+The area is converted to km² before the test: a raw square degree is about
+11,200 km² here, so a `0.01` in raw degrees would be a ~112 km² cutoff and drop
+almost every island. Tier 0's rings cover the whole map box: their extent is
+47.801998 / 21.443001 / 61.875 / 30.042 (the `f32` values as stored), and there
+are no interior rings in this box. Its section is byte-identical to the single
+land section of the previous (version 1) asset, so four times the fitted zoom —
+the view that draws tier 0 — paints exactly the geometry it painted before.
+
+The `triangles` column is what `src/scene.rs` counts after lyon tessellates the
+rings at a `1e-6` tolerance; the build's own estimate, `points − 3 × rings`,
+reads 22,884 / 9,743 / 5,744. lyon skips a ring point that sits on the line
+through its neighbours, and a simplified ring has a few of those (two at tier 0).
+That is the **tier total**, not what a particular viewport draws: at the fitted
+zoom on the design pane the 0.006° tier paints 5,733 of its 5,744 triangles — the
+eleven missing are outside the cover fit's cropped rows.
+
+**Worst deviation vs typical displacement.** `assets/build_map.py` prints the
+discrete Hausdorff distance from tier 0's drawn land for every tier (shapely
+`hausdorff_distance`, which samples the vertices):
+
+| tier | worst distance | metres at this latitude | px @1,004 (1×) | px @ threshold |
+|---|---|---|---|---|
+| 0.003° | 0.004553° | 457 m | 0.45 px | 1.02 px at 450 m/px |
+| 0.006° | 0.010406° | 1,043 m | **1.04 px** | **1.16 px at 900 m/px** |
+
+The budget for these is not "strictly 1.0 px". A tier is allowed at most
+`TIER_WORST_CASE_AT_THRESHOLD_PX` = 1.2 px at the scale where it starts being
+drawn, and the tier the fitted view draws at most `TIER_WORST_CASE_AT_FIT_PX` =
+1.1 px. The 0.006° tier is 1.04 px at 1× — 4% over the ideal one pixel — and that
+4% is a deliberate trade: forcing it to 1.0 px means drawing the 0.003° tier at
+1×, which costs about 4,000 more triangles and pushes the frame back into GPUI's
+2^17 instance-buffer step, doubling that memory. The model test
+`every_tier_stays_inside_the_pixel_budget_the_plan_sets` pins both budgets
+against the measured constants, so the thresholds cannot drift away from the
+measurements without failing.
+
+These are **worst single points**, not typical displacement: the distance is one
+vertex pair somewhere on a small island, and the rest of the coast moves by much
+less. The pixel-level check on a real window is still a human step — see "Visual
+acceptance" below.
+
+**Islands.** The two coarser tiers drop small polygons of their own; the number
+worth writing down is how many polygons tier 0 draws that the coarse tier no
+longer does. Measured per source polygon — a tier-0 polygon counts as lost when
+less than 0.01 km² of it is covered by the 0.006° tier's **kept** polygons (the
+ones actually drawn, not the global `simplify` result before its filter) — tier
+2 loses **77** of tier 0's 854 polygons; the largest of them is **0.1082 km²**
+at 50.43684°E, 26.19868°N, 7 are at least 0.05 km² and none reaches 0.5 km².
+Qeshm, Hormuz and Khasab are kept at every tier: the build checks a point on each
+against every tier's kept polygons and prints `named places kept at <tier>: all`.
 
 **Borders.** The ways are selected from the national relations, not from their
 own tags: 19 `boundary=administrative` + `admin_level=2` relations across the
@@ -158,17 +214,19 @@ it out. A member way is dropped when it is `maritime=yes` (262 ways) or
 `natural=coastline` (2); 42 ways appear in two extracts and are merged. The tag
 filter cannot see a sea boundary that carries neither tag, so the selection has
 a second, geometric rule: a candidate way is kept only when **at least one of
-its points lies on the drawn land** (the packed land, grown by 0.002° — about
-200 m, twice the land's own 111 m simplification, so a border point that is
-truly on the coast is not lost to the coastline's simplification). The test is
-"none of its points", never a share of them, so a border that also crosses
-water survives: the two untagged Saudi–Bahrain connector ways sit on the coast
-and stay, and the closest kept point anywhere (the Saudi–Qatar connector) reads
-57 m from the drawn coast. Two ways fail it in this snapshot — way 1211286901
-and way 1211287612, the UAE relation's "United Arab Emirates - Abu Dhabi" rings
-0.88 km and 1.49 km offshore of Abu Dhabi — and are dropped. 48 of the 122
-relation-only ways reach the box (46 after that drop): 119 pieces / 1,466 points
-intersect the box before the grid cut; after `simplify(0.0005,
+its points lies on the drawn land** (the packed **tier 0** land, grown by
+0.002° — about 200 m, twice the land's own ~100 m simplification, so a border
+point that is truly on the coast is not lost to the coastline's simplification).
+The mask is tier 0 and not a coarser tier on purpose: deriving it from a 600 m
+coast would move the drawn shoreline by up to a kilometre and drag the borders
+with it. The test is "none of its points", never a share of them, so a border
+that also crosses water survives: the two untagged Saudi–Bahrain connector ways
+sit on the coast and stay, and the closest kept point anywhere (the Saudi–Qatar
+connector) reads 57 m from the drawn coast. Two ways fail it in this snapshot —
+way 1211286901 and way 1211287612, the UAE relation's "United Arab Emirates -
+Abu Dhabi" rings 0.88 km and 1.49 km offshore of Abu Dhabi — and are dropped. 48
+of the 122 relation-only ways reach the box (46 after that drop): 119 pieces /
+1,466 points intersect the box before the grid cut; after `simplify(0.0005,
 preserve_topology=False)` and the per-cell cut they are 201 pieces / 1,630
 points. 3 border segments are shorter than 16 m. The King Fahd Causeway is not
 affected by the mask: its national-border way is `maritime=yes` and was already
@@ -202,15 +260,12 @@ twice. The coarse copy leaves 629 dangling endpoints on 588 pieces, which are
 the places a motorway or trunk leaves the map box or ends at a junction the
 network does not continue.
 
-12 land segments are shorter than 16 m. Plan §4.1 makes that the trigger for
-lowering `TESSELLATION_TOLERANCE` from `5e-6` to `1e-6` and re-pinning the land
-triangle count; it is the only build statistic the parser's tolerance depends
-on. The rings are 25,446 points in 854 closed rings; a tessellator that drops
-each ring's repeated closing point would emit `25,446 - 3 × 854 = 22,884`
-triangles, and lyon emits **22,876** at `1e-6` — the count `src/scene.rs` pins.
-The dashed borders add 2,460 triangles at the fitted zoom. At 1× on the user's
-1,404 × 900 pane one frame draws **59,516** triangles with a full picture of
-1,000 vessels, against the 75,000 ceiling. See "Runtime contract" below.
+Land segments shorter than 16 m: 12 at tier 0, 8 at tier 1 and 2 at tier 2. Plan
+§4.1 makes the tier 0 count the trigger for lowering `TESSELLATION_TOLERANCE`
+from `5e-6` to `1e-6` and re-pinning the land triangle count; it is the only
+build statistic the parser's tolerance depends on, and the same `1e-6` is used
+for all three tiers (a coarser tier's points are at least a kilometre apart, so
+the tolerance only decides how lyon joins a ring against itself).
 
 ## Format: KHL2
 
@@ -220,26 +275,31 @@ the file is exactly the sum of its sections with no trailing bytes.
 ```
 offset  size  field
 0       4     magic "KHL2"
-4       4     version: u32 = 1
+4       4     version: u32 = 2
 8       16    bbox: west, south, east, north (f32, degrees)
 24      4     grid_cols: u32 = 64
 28      4     grid_rows: u32 = 32
-32      4     section_count: u32 = 3
-36      …     sections, in the order land (1), borders (2), roads (3)
+32      4     section_count: u32 = 5
+36      …     sections, in the order land 0.001° (1), land 0.003° (2),
+              land 0.006° (3), borders (4), roads (5)
 ```
 
 Every section:
 
 ```
 offset  size  field
-0       4     kind: u32 (1 land, 2 borders, 3 roads)
+0       4     kind: u32 (1..3 land tiers, 4 borders, 5 roads)
 4       4     point_count: u32
 8       4     piece_count: u32
-12      4     cell_count: u32        // land = 0; borders/roads = cols * rows = 2,048
+12      4     cell_count: u32        // the land tiers = 0; borders/roads = cols * rows = 2,048
 16      …     points: point_count × (lon f32, lat f32)
 …       …     pieces: piece_count × (start u32, len u16, flags u8, reserved u8, length_m u32)
 …       …     cells: cell_count × (start u32, count u32)
 ```
+
+Version 1 held one land section and two line sections, in the order 1, 2, 3.
+This parser does not read it: `src/scene.rs` rejects any version but 2, so the
+asset and the parser move together and there is no second layout to maintain.
 
 - `start` is an index into the section's points; `len` is the point count (≤
   65,535, asserted by the build) and includes the closing point for a land ring.
@@ -286,11 +346,11 @@ literals needs an epsilon above 1.9e-6° (use 1e-5°).
 Mercator radians and tessellates the land; `src/paint.rs` builds the frame's ten
 paths from it. What the widget does with this asset:
 
-**Road LOD.** There is one section; `model::road_filter` picks the level from the
-clamped zoom, so no rebuild is needed when a threshold moves. The motorways and
-trunks are packed twice and the two copies are disjoint — the coarse one is drawn
-only below the first threshold and the fine one only at or above it, so no road
-is ever drawn twice. Neither level filters on a piece's tags or its length:
+**Road LOD.** There is one road section; `model::road_filter` picks the level from
+the clamped zoom, so no rebuild is needed when a threshold moves. The motorways
+and trunks are packed twice and the two copies are disjoint — the coarse one is
+drawn only below the first threshold and the fine one only at or above it, so no
+road is ever drawn twice. Neither level filters on a piece's tags or its length:
 
 | zoom | filter | rule | triangles in the asset |
 |---|---|---|---|
@@ -306,16 +366,35 @@ piece in `paint.rs` — so the three kinds of line are told apart by pattern as
 well as by hue: a dashed violet border, a solid rose motorway and a solid ochre
 primary road.
 
-**Land culling.** The rings tessellate into 22,876 triangles at `1e-6`. A frame
-visits the cells its viewport touches plus one cell of margin, which covers
-every triangle whose box spans at most two cells on each axis. The tessellator
-also emits triangles spanning most of the map — the widest covers 55×20 cells,
-23.8% of the map box — and those are 98.7% of the land's area, so bucketing
-them by centroid would hide nearly all of it. The 3,389 too-wide triangles are
-kept aside (`LandLayer::wide`) and tested against the viewport's own rectangle
-every frame. Grid rows are latitude bands in the build **and** in the parser:
-reading the row off Mercator `y` would land up to a quarter row away from the
-cell the build wrote.
+**Land tiers.** The three land sections are the same coastline at 0.001°, 0.003°
+and 0.006°; `model::land_tier` picks one from the projection's **metres per
+pixel**, never from the zoom number, because a zoom is relative to a fit that
+changes with the pane's size. The thresholds are 450 and 900 m/px: at and above
+900 m/px the 0.006° tier is drawn, 450–900 m/px the 0.003° one, below 450 m/px
+the 0.001° one. What is guarded is the error those thresholds produce:
+`model.rs` holds the measured `TIER_WORST_CASE_METRES = [0, 457, 1,043]` metres
+from the build's Hausdorff measurement and two pixel budgets — 1.2 px at the
+scale a tier starts being drawn, 1.1 px at the fitted zoom — and
+`every_tier_stays_inside_the_pixel_budget_the_plan_sets` fails if a threshold, a
+tier's tolerance or the build's simplification moves the numbers past them. On
+the user's 1,404 × 900 pane the fitted zoom is 1,004 m/px, so **1× draws the
+0.006° tier** (5,733 of its 5,744 triangles instead of 22,844 of 22,876); 1.6×
+draws 0.003°; 2.8× and 4× draw 0.001° — the same geometry, triangle for triangle,
+that the map drew before the tiers existed. A narrow pane fits fewer pixels
+across the same degrees and therefore reads coarser at the same zoom: 4× on a
+320 × 400 pane is 598 m/px and still draws the 0.003° tier.
+
+**Land culling.** A tier's rings tessellate at `1e-6` into the triangles the
+table above counts. A frame visits the cells its viewport touches plus one cell
+of margin, which covers every triangle whose box spans at most two cells on each
+axis. The tessellator also emits triangles spanning most of the map — at tier 0
+the widest covers 55×20 cells, 23.8% of the map box — and those are 98.7% of the
+land's area, so bucketing them by centroid would hide nearly all of it. The
+too-wide triangles (3,389 / 1,591 / 958, tier by tier) are kept aside
+(`LandLayer::wide`) and tested against the viewport's own rectangle every frame.
+Grid rows are latitude bands in the build **and** in the parser: reading the row
+off Mercator `y` would land up to a quarter row away from the cell the build
+wrote.
 
 **Labels.** Nineteen names — five countries, twelve cities and two seas — are
 elements over the canvas rather than glyphs in it, so they are read from the
@@ -332,24 +411,52 @@ is skipped, so the strait's crowded cities do not print into one pile at 1×
 whose anchor is nearer the canvas edge than 80 px — half the widest name — is
 dropped rather than cut in half. Zooming in separates the crowded ones again.
 
-**Budget.** One frame with a full picture of 1,000 vessels — each at its most
-expensive, an 8-segment dot for a vessel whose ship record has not arrived — and
-the hover ring, on the user's 1,404 × 900 pane:
+**Budget.** One frame with no vessels on the user's 1,404 × 900 pane, which is
+the frame the plan's §8 target is about:
 
-| view | triangles |
+| layer | triangles |
 |---|---|
-| fitted 1×, `Coarse` (the worst view found) | 59,516 |
-| 1.6× over the map's middle, `Fine` | 57,967 |
-| 4× over Dubai, `De` | 44,498 |
+| land, 0.006° tier (was 22,844 drawn of 22,876) | 5,733 |
+| borders (dashed) | 2,460 |
+| roads, `Coarse` copy | 26,022 |
+| TSS lanes (dashed) | 142 |
+| **fitted 1× frame** | **34,357** |
 
-The ceiling is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`): 8.58 ms of fixed
-frame cost plus 107 ns per triangle still fits a 16.65 ms frame. The fitted zoom
-is the busiest view because it is the one that draws the coarse copy of the whole
-28,883 km class-0 network, where the old `ref` + length filter drew 13% of it.
-`the_visible_triangle_budget_is_under_the_frame_budget` sweeps a 1.56:1, a wide
-and a tall pane at 1×, 1.6×, 2.8× and 4× over the map's middle, Dubai and the
-strait, and pins the worst count (59,516). They are model values from that
+That is 51,468 → 34,357 triangles, a 33% cut, measured on the **same viewport**:
+the old frame on this pane is 22,844 land + 2,460 + 26,022 + 142. The land's own
+share fell 44% → 17%.
+
+The plan's §8 targets for the fitted frame are **≤ 21,000 triangles** and
+**≤ 65,536 vertices**, and neither is met: the target is a budget for P1 and P2
+together — about 6,000 for the land plus at most 14,900 for a road network
+thinned by P2 — while the road layer here is still the 26,024 triangles P1
+deliberately leaves alone. The frame emits 103,071 vertices, 78,066 of them the
+road network's. `the_fitted_frame_is_pinned_until_p2` pins the exact count as a
+change detector; **P2 must replace that pin with `<= 21_000`**, and the vertex
+gate closes with the same road thinning.
+
+With a full picture of 1,000 vessels — each at its most expensive, an 8-segment
+dot for a vessel whose ship record has not arrived — and the hover ring, the
+worst view the sweep finds is **51,355 triangles**, at 2.8× over the map's middle
+on the 1.56:1 pane. That is the plan's **worst-frame target of ≤ 27,000** missed
+by 90%; it needs P2's roads and P4's vessel dots together, and neither is part of
+P1. The worst view moved to 2.8× because that is where the land switches back to
+the 0.001° tier and the road layer switches to D+E in the same frame. The
+ceiling for a 60 Hz frame is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`):
+8.58 ms of fixed frame cost plus 107 ns per triangle still fits a 16.65 ms
+frame. `the_visible_triangle_budget_is_under_the_frame_budget` sweeps a 1.56:1,
+a wide and a tall pane at 1×, 1.6×, 2.8× and 4× over the map's middle, Dubai and
+the strait, and pins the worst count (51,355). They are model values from that
 budget, not frame times measured on a machine.
+
+**Visual acceptance (P1).** The 0.006° tier's worst measured deviation is 1.04 px
+at the fitted zoom (see "Worst deviation vs typical displacement" above), which
+is over the plan's one-pixel rule by 4% worst-case and typical coastline
+displacement is much smaller. The LOD change has not yet been checked on a real
+window: the human step is a 1× screenshot of the strait (Qeshm, Hormuz, Khasab
+and the small islands around them) against the previous build, to be recorded
+here before P1 is signed off. Until then this README states the measurement, not
+a visual pass.
 
 **Theme.** Five map roles, all opaque and all read from the theme every frame by
 `MapColors::resolve`: `chart.map_ocean`, `chart.map_land`, `chart.map_border`,

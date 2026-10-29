@@ -7,12 +7,17 @@ and fails with an actionable message when one is missing.
 
 What is packed (all little-endian, see `README.md` for the format):
 
-1. **land** — OSM land polygons, clipped to the map box, simplified to ~111 m,
-   islands under 0.01 km² dropped, one closed ring per polygon ring.
+1. **land, three tiers** — OSM land polygons, clipped to the map box once, then
+   simplified at 0.001° (~100 m on the ground here, the visual reference),
+   0.003° (~300 m) and 0.006° (~600 m). Each tier is simplified from the same
+   clipped geometry with `preserve_topology=True`, drops islands under 0.01 km²
+   on its own and packs one closed ring per polygon ring. The fitted zoom draws
+   the coarsest tier, where one pixel is about a kilometre.
 2. **borders** — the member ways of the `boundary=administrative` +
    `admin_level=2` relations, plus any such way that belongs to no relation,
    without `maritime=yes` or `natural=coastline` and with at least one point on
-   the drawn land, clipped and simplified to ~55 m, cut per grid cell.
+   the drawn land, clipped and simplified to ~55 m, cut per grid cell. The land
+   mask is the **tier 0** geometry, so the borders stay where they were.
 3. **roads** — `highway=motorway|trunk|primary` at ~134 m plus a **coarse copy**
    of the motorways and trunks at ~300 m, both cut per grid cell, with the flag
    bits the runtime LOD filter reads.
@@ -40,7 +45,7 @@ import osmium
 import shapefile
 import shapely
 from shapely import STRtree, box, make_valid
-from shapely.geometry import LineString, Polygon, shape
+from shapely.geometry import LineString, Point, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import linemerge, unary_union
 
@@ -58,8 +63,16 @@ WEST, SOUTH, EAST, NORTH = 47.802, 21.443, 61.875, 30.042
 #: row 0 at the south edge.
 GRID_COLS, GRID_ROWS = 64, 32
 
-#: Section kinds of the KHL2 asset.
-KIND_LAND, KIND_BORDERS, KIND_ROADS = 1, 2, 3
+#: The KHL2 version this script writes, and how many sections it packs.
+VERSION = 2
+SECTION_COUNT = 5
+
+#: Section kinds of the KHL2 asset, in the order the file stores them: the three
+#: land tiers coarse-last, then the two line layers. `LAND_KINDS` is the single
+#: source for the land kinds; `KIND_BORDERS`/`KIND_ROADS` follow them.
+LAND_KINDS = (1, 2, 3)
+KIND_BORDERS = LAND_KINDS[-1] + 1
+KIND_ROADS = KIND_BORDERS + 1
 
 #: Road flags: bit 0 is "primary", bit 1 is "the way carries a `ref`", bit 2 is
 #: "this piece belongs to the coarse copy".
@@ -70,21 +83,40 @@ FLAG_COARSE = 1 << 2
 #: The road classes the asset keeps, as `highway` tag values.
 ROAD_CLASSES = frozenset({"motorway", "trunk", "primary"})
 
-#: Land is simplified to 0.001° (about 111 m) with its topology kept.
-LAND_SIMPLIFY = 0.001
-#: Islands smaller than this are dropped. The area is converted to km² first:
-#: a raw square degree is about 123 km² here and would drop almost every island.
+#: The three land tiers, one per section, coarsest last, in degrees.
+#:
+#: Every tier is simplified from the *same* clipped land, so the three are the
+#: same coastline at three resolutions rather than three independent readings of
+#: the source. `0.001` is about 100 m on the ground at this latitude, which is
+#: what the map drew before the tiers existed and stays the visual reference;
+#: `0.006` is about 600 m, and its worst deviation from tier 0 measures 1.04
+#: pixels at the fitted zoom (see `src/model.rs`, where the runtime's thresholds
+#: are derived from the same measurement). The runtime picks a tier by metres per
+#: pixel, never by zoom.
+LAND_TIERS = (0.001, 0.003, 0.006)
+#: Islands smaller than this are dropped, in every tier. The area is converted to
+#: km² first: a raw square degree is about 11,200 km² here and would drop almost
+#: every island.
 LAND_MIN_AREA_KM2 = 0.01
+#: The places a coarser tier must not erase on the strait itself, as a point on a
+#: piece of land big enough to survive the area filter. Checked by point-in-polygon
+#: against every tier's kept polygons and printed by the build.
+NAMED_PLACES = {
+    "Qeshm": (55.85, 26.85),
+    "Hormuz": (56.46, 27.06),
+    "Khasab": (56.25, 26.18),
+}
 #: Borders are simplified to 0.0005° (about 55 m).
 BORDER_SIMPLIFY = 0.0005
 #: The margin a border point gets when it is tested against the drawn land.
 #:
-#: The land is simplified to 0.001°, so the drawn coastline sits up to about 111 m
-#: off the real one and a border point that is truly on the coast can fall just
-#: outside the drawn polygon. Twice that keeps such a point: the Saudi–Qatar
-#: connector's nearest point reads 57 m from the drawn coast. The sea-only stretches
-#: the mask exists for are a kilometre or more out — the two Abu Dhabi rings read
-#: 877 m and 1,486 m — so nothing in between is ambiguous.
+#: The land mask is the tier 0 geometry, simplified to 0.001°, so the drawn
+#: coastline sits up to about 100 m off the real one and a border point that is
+#: truly on the coast can fall just outside the drawn polygon. Twice that keeps
+#: such a point: the Saudi–Qatar connector's nearest point reads 57 m from the
+#: drawn coast. The sea-only stretches the mask exists for are a kilometre or
+#: more out — the two Abu Dhabi rings read 877 m and 1,486 m — so nothing in
+#: between is ambiguous.
 BORDER_LAND_MASK_TOLERANCE = 0.002
 #: Roads are simplified to 0.0012° (about 134 m).
 ROAD_SIMPLIFY = 0.0012
@@ -101,11 +133,22 @@ DEGREE_KM = 111.32
 #: latitude.
 DEGREE_M = 111_320.0
 
+#: The latitude the map's scale is quoted at, in degrees: the box's own middle. The
+#: runtime reads its metres-per-pixel at the same row (`model::MAP_SCALE_LATITUDE`).
+SCALE_LATITUDE = (SOUTH + NORTH) / 2
+#: The fitted zoom's scale on the user's 1,404 × 900 pane, in metres per pixel.
+#:
+#: Documentation only: it turns the Hausdorff distances printed below into the
+#: pixels the plan's §8 measures them in. The runtime computes the real figure from
+#: the projection, and this is that figure for the pane the design is checked on.
+FITTED_METRES_PER_PIXEL = 1_003.95
+
 #: Below these sizes a source is not a plausible download of that file.
 PBF_MIN_BYTES = 20 * 1024**2
 LAND_ZIP_MIN_BYTES = 500 * 1024**2
 
-#: The asset budget from the plan.
+#: The asset budget from the plan: 2 MiB for the whole base map. The two extra
+#: land tiers add about 0.16 MiB of points, so three tiers still fit.
 MAX_ASSET_BYTES = 2 * 1024 * 1024
 
 
@@ -116,6 +159,40 @@ class Piece:
     coords: list[tuple[float, float]]
     flags: int = 0
     length_m: int = 0
+
+
+@dataclass
+class LandTier:
+    """One land section: the simplification it was built at and the rings it kept."""
+
+    #: The simplification tolerance, in degrees.
+    tolerance: float
+    #: The simplified geometry the rings were cut out of; tier 0's is the border mask.
+    geometry: BaseGeometry
+    #: The kept polygons, before their rings were cut out.
+    polygons: int
+    #: The dropped polygons, as the count under `LAND_MIN_AREA_KM2` plus the
+    #: degenerate rings `make_valid` can leave at a coarser tolerance.
+    dropped: int
+    #: The largest polygon this tier's own area filter dropped, in km².
+    largest_dropped_km2: float
+    #: Where that polygon sat, as longitude and latitude in degrees.
+    largest_dropped_at: tuple[float, float]
+    #: The closed rings, one per exterior or interior ring of a kept polygon.
+    rings: list[Piece]
+    #: The worst distance from tier 0's drawn coastline: the discrete Hausdorff
+    #: distance between the two simplified geometries, in degrees. Zero on tier 0.
+    hausdorff_deg: float = 0.0
+
+
+@dataclass
+class Land:
+    """The three land tiers and the land the border mask tests against."""
+
+    #: Coarsest last, in the order the asset stores them.
+    tiers: list[LandTier]
+    #: The drawn land of tier 0, which is what "on land" means to the borders.
+    mask: BaseGeometry
 
 
 class NationalRelations(osmium.SimpleHandler):
@@ -370,13 +447,14 @@ def read_pbfs(paths: list[Path]) -> Collector:
     return collector
 
 
-def load_land(zip_path: Path, clip_box) -> tuple[list[Piece], BaseGeometry]:
-    """The land rings, and the drawn land as the geometry the border mask tests against.
+def load_land(zip_path: Path, clip_box) -> Land:
+    """The three land tiers, and the drawn land the border mask tests against.
 
-    The mask is the land after the clip, `make_valid` and the simplification — exactly the
-    polygons whose rings are packed, so "on land" means land the map draws. The islands
-    dropped below `LAND_MIN_AREA_KM2` are a hundred metres across at most and are not
-    worth a second union.
+    The map box is read, unioned, clipped and made valid **once**; every tier is
+    then a `simplify` of that same geometry, so the three are one coastline at
+    three resolutions. The mask is the tier 0 land, which is the geometry the map
+    drew before the tiers existed: deriving it from a coarser tier would move the
+    drawn coast by up to a kilometre and drag the borders with it.
     """
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
@@ -406,39 +484,105 @@ def load_land(zip_path: Path, clip_box) -> tuple[list[Piece], BaseGeometry]:
     land = unary_union(polygons)
     clipped = land.intersection(clip_box)
     clipped = make_valid(clipped)
-    simplified = clipped.simplify(LAND_SIMPLIFY, preserve_topology=True)
     print(
-        f"  union + clip + simplify: {time.perf_counter() - started:.1f} s",
+        f"  union + clip: {time.perf_counter() - started:.1f} s",
         flush=True,
     )
 
-    rings: list[Piece] = []
-    dropped = 0
-    kept = 0
-    for polygon in polygon_parts(simplified):
-        area_km2 = (
-            polygon.area
+    tiers: list[LandTier] = []
+    for tolerance in LAND_TIERS:
+        started = time.perf_counter()
+        simplified = clipped.simplify(tolerance, preserve_topology=True)
+        rings: list[Piece] = []
+        dropped = 0
+        kept = 0
+        largest_dropped_km2 = 0.0
+        largest_dropped_at = (0.0, 0.0)
+        for polygon in polygon_parts(simplified):
+            area_km2 = (
+                polygon.area
+                * DEGREE_KM
+                * DEGREE_KM
+                * math.cos(math.radians(polygon.centroid.y))
+            )
+            if area_km2 < LAND_MIN_AREA_KM2:
+                dropped += 1
+                if area_km2 > largest_dropped_km2:
+                    largest_dropped_km2 = area_km2
+                    largest_dropped_at = (polygon.centroid.x, polygon.centroid.y)
+                continue
+            kept += 1
+            for ring in [polygon.exterior, *polygon.interiors]:
+                coords = clean_coords(ring.coords)
+                if len(coords) < 4:
+                    continue
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
+                rings.append(Piece(coords))
+        print(
+            f"  {tolerance}: {kept:,} polygons kept, {dropped:,} dropped under "
+            f"{LAND_MIN_AREA_KM2} km2 (largest {largest_dropped_km2:.4f} km2 at "
+            f"{largest_dropped_at[0]:.5f}E,{largest_dropped_at[1]:.5f}N); "
+            f"{len(rings):,} rings, {sum(len(ring.coords) for ring in rings):,} points "
+            f"({time.perf_counter() - started:.1f} s)",
+            flush=True,
+        )
+        tiers.append(
+            LandTier(
+                tolerance,
+                simplified,
+                kept,
+                dropped,
+                largest_dropped_km2,
+                largest_dropped_at,
+                rings,
+            )
+        )
+
+    # How far each coarser tier moved the coast: the discrete Hausdorff distance to
+    # tier 0's drawn geometry, in degrees. This is the number the runtime's
+    # thresholds are derived from (`src/model.rs`), so it is measured here rather
+    # than estimated from the tolerance.
+    for tier in tiers[1:]:
+        tier.hausdorff_deg = shapely.hausdorff_distance(
+            tiers[0].geometry, tier.geometry
+        )
+        metres = tier.hausdorff_deg * DEGREE_M * math.cos(math.radians(SCALE_LATITUDE))
+        print(
+            f"  worst deviation from tier 0 at {tier.tolerance}: "
+            f"{tier.hausdorff_deg:.6f} deg = {metres:.0f} m = "
+            f"{metres / FITTED_METRES_PER_PIXEL:.2f} px at the fitted zoom",
+            flush=True,
+        )
+
+    # The places a coarser tier must not erase, checked by point-in-polygon against
+    # each tier's kept polygons (a point whose own polygon fell under the area
+    # filter would be gone from the map).
+    for tier in tiers:
+        kept_polygons = [
+            polygon
+            for polygon in polygon_parts(tier.geometry)
+            if polygon.area
             * DEGREE_KM
             * DEGREE_KM
             * math.cos(math.radians(polygon.centroid.y))
+            >= LAND_MIN_AREA_KM2
+        ]
+        missing = [
+            name
+            for name, (longitude, latitude) in NAMED_PLACES.items()
+            if not any(
+                polygon.contains(Point(longitude, latitude))
+                for polygon in kept_polygons
+            )
+        ]
+        print(
+            f"  named places kept at {tier.tolerance}: "
+            f"{'all' if not missing else 'missing ' + ', '.join(missing)}",
+            flush=True,
         )
-        if area_km2 < LAND_MIN_AREA_KM2:
-            dropped += 1
-            continue
-        kept += 1
-        for ring in [polygon.exterior, *polygon.interiors]:
-            coords = clean_coords(ring.coords)
-            if len(coords) < 4:
-                continue
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
-            rings.append(Piece(coords))
-    print(
-        f"  {kept:,} polygons kept, {dropped:,} dropped under "
-        f"{LAND_MIN_AREA_KM2} km2; {len(rings):,} rings",
-        flush=True,
-    )
-    return rings, simplified
+
+    return Land(tiers, tiers[0].geometry)
 
 
 def way_touches_land(mask: BaseGeometry, coords: list[tuple[float, float]]) -> bool:
@@ -534,15 +678,16 @@ def pack_section(
     kind: int,
     pieces: list[Piece],
     cells: list[tuple[int, int]],
+    min_points: int,
 ) -> bytes:
     """One KHL2 section: header, points, 12-byte piece headers, cell table."""
     points: list[tuple[float, float]] = []
     headers: list[tuple[int, int, int, int]] = []
     for piece in pieces:
-        if not 2 <= len(piece.coords) <= 0xFFFF:
+        if not min_points <= len(piece.coords) <= 0xFFFF:
             raise SystemExit(
                 f"error: a piece of kind {kind} has {len(piece.coords)} points, "
-                "which does not fit the u16 length"
+                f"which is outside {min_points}..65535"
             )
         headers.append((len(points), len(piece.coords), piece.flags, piece.length_m))
         points.extend(piece.coords)
@@ -609,10 +754,13 @@ def build(assets: Path, out: Path) -> None:
     )
 
     print("land", flush=True)
-    land_rings, land = load_land(assets / "land-polygons-split-4326.zip", clip_box)
-    land_rings.sort(key=piece_key)
-    longitudes = [point[0] for ring in land_rings for point in ring.coords]
-    latitudes = [point[1] for ring in land_rings for point in ring.coords]
+    land = load_land(assets / "land-polygons-split-4326.zip", clip_box)
+    for tier in land.tiers:
+        tier.rings.sort(key=piece_key)
+    longitudes = [
+        point[0] for ring in land.tiers[0].rings for point in ring.coords
+    ]
+    latitudes = [point[1] for ring in land.tiers[0].rings for point in ring.coords]
     print(
         f"  extent {min(longitudes):.6f} {min(latitudes):.6f} "
         f"{max(longitudes):.6f} {max(latitudes):.6f}",
@@ -620,7 +768,7 @@ def build(assets: Path, out: Path) -> None:
     )
     # The border land mask: the drawn land grown by the margin a border point gets, prepared
     # once for the point test every candidate way is put through.
-    land_mask = land.buffer(BORDER_LAND_MASK_TOLERANCE)
+    land_mask = land.mask.buffer(BORDER_LAND_MASK_TOLERANCE)
     shapely.prepare(land_mask)
 
     print("borders", flush=True)
@@ -719,21 +867,24 @@ def build(assets: Path, out: Path) -> None:
     print("packing", flush=True)
     blob = bytearray()
     blob += b"KHL2"
-    blob += struct.pack("<I", 1)
+    blob += struct.pack("<I", VERSION)
     blob += struct.pack("<4f", WEST, SOUTH, EAST, NORTH)
-    blob += struct.pack("<III", GRID_COLS, GRID_ROWS, 3)
+    blob += struct.pack("<III", GRID_COLS, GRID_ROWS, SECTION_COUNT)
+    # Every land tier stores rings rather than a cell table: the parser tessellates
+    # them and bins the triangles by centroid at run time.
     sections = [
-        (KIND_LAND, land_rings, []),
-        (KIND_BORDERS, border_pieces, border_cells),
-        (KIND_ROADS, road_pieces, road_cells),
+        (kind, tier.rings, [], 3)
+        for kind, tier in zip(LAND_KINDS, land.tiers, strict=True)
     ]
-    for kind, pieces, cells in sections:
-        blob += pack_section(kind, pieces, cells)
+    sections.append((KIND_BORDERS, border_pieces, border_cells, 2))
+    sections.append((KIND_ROADS, road_pieces, road_cells, 2))
+    for kind, pieces, cells, min_points in sections:
+        blob += pack_section(kind, pieces, cells, min_points)
     blob = bytes(blob)
 
     print("")
     print("sections")
-    for kind, pieces, cells in sections:
+    for kind, pieces, cells, _ in sections:
         point_count = sum(len(piece.coords) for piece in pieces)
         print(
             f"  kind {kind}  points {point_count:8,d}  pieces {len(pieces):7,d}  "
@@ -744,6 +895,15 @@ def build(assets: Path, out: Path) -> None:
         raise SystemExit(
             f"error: the asset is {len(blob):,} bytes, over the "
             f"{MAX_ASSET_BYTES:,}-byte budget"
+        )
+
+    print("")
+    print("land tiers (triangles estimated as points - 3 x rings)")
+    for kind, tier in zip(LAND_KINDS, land.tiers, strict=True):
+        points = sum(len(ring.coords) for ring in tier.rings)
+        print(
+            f"  kind {kind}  tier {tier.tolerance}°  rings {len(tier.rings):6,d}  "
+            f"points {points:8,d}  triangles {points - 3 * len(tier.rings):9,d}"
         )
 
     print("")
@@ -768,7 +928,8 @@ def build(assets: Path, out: Path) -> None:
         f"(on {pieces_with_dangling:,} pieces)"
     )
     print(
-        f"segments shorter than 16 m: land {short_segments(land_rings):,}, "
+        f"segments shorter than 16 m: "
+        f"{', '.join(f'land tier {index} {short_segments(tier.rings):,}' for index, tier in enumerate(land.tiers))}, "
         f"borders {short_segments(border_pieces):,}, "
         f"roads {short_segments(lods['FINE']):,}, "
         f"coarse {short_segments(lods['COARSE']):,}"
