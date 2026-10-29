@@ -337,9 +337,11 @@ pub(super) const HIT_RADIUS_PX: f32 = 8.0;
 
 /// How long a picture may go without a push and still be called live.
 ///
-/// The service sends an empty delta every second, so silence means a broken link
-/// rather than an empty strait.
-pub(super) const STALE_AFTER: Duration = Duration::from_secs(30);
+/// The service refreshes at least once a minute, so five minutes of silence is several
+/// refreshes missed: the picture on screen is then a report about the past rather than a
+/// live one. The window is generous on purpose — the badge it arms is a warning, and a
+/// warning that fires between two ordinary refreshes would be noise.
+pub(super) const STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The speed-over-ground value that means "not available".
 const SOG_UNAVAILABLE: u32 = 1_023;
@@ -1480,12 +1482,6 @@ impl VesselStore {
         self.gap
     }
 
-    /// How long the store has been silent, which is what the stale badge counts once the
-    /// whole window has gone by without a push.
-    pub fn silent_for(&self) -> Duration {
-        self.received_at.elapsed()
-    }
-
     /// How many vessels the picture holds.
     pub fn vessel_count(&self) -> usize {
         self.positions.len()
@@ -2206,16 +2202,12 @@ mod tests {
             "a picture inside the window is still live",
         );
 
-        // Kept a second beyond the window: at exactly 30 s the strict `>` would race
+        // Kept a second beyond the window: at exactly the window the strict `>` would race
         // the clock's resolution rather than test the predicate.
         store.received_at = Instant::now() - (STALE_AFTER + Duration::from_secs(1));
         assert!(
             store.is_stale(),
             "no push for the whole window is a broken link, heartbeat included",
-        );
-        assert!(
-            store.silent_for() > STALE_AFTER,
-            "the badge counts the silence the link went through",
         );
         assert!(
             !store.has_gap(),
@@ -2226,7 +2218,6 @@ mod tests {
         store.apply(&keyframe(7, 1, vec![position(1)]));
         assert!(!store.is_stale(), "a push just arrived");
         assert!(!store.has_gap());
-        assert!(store.silent_for() < STALE_AFTER);
     }
 
     #[test]

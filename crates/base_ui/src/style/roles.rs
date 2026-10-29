@@ -686,13 +686,15 @@ impl Roles {
                 MAP_FILL_FLOOR,
             ),
             // The sea is also the fill that has to hold against `surface.sunken`, the chart face
-            // the map is drawn on. The OSM land is paper-white, which reads 1.01:1 there — no
-            // floor can fix that without abandoning the palette the map is asked to have. The
-            // land-on-face separation is therefore **deliberately dropped** (the palette's owner
-            // chose the OSM paper land over a map-to-pane step; no hairline border, no darker
-            // land, no moved face), and the measurement is kept here so the cost is visible. The
-            // sea is the fill held to the face instead: its OSM value reads 1.38:1 in the light
-            // appearance, hence the same pinned floor.
+            // the map is drawn on. The light appearance's paper land reads 1.01:1 there — no
+            // floor can fix that without abandoning the palette the map is asked to have, so the
+            // land-on-face separation is **deliberately dropped** in that appearance (the
+            // palette's owner chose the OSM paper land over a map-to-pane step; no hairline
+            // border, no darker land, no moved face). The night basemap is neutral instead: its
+            // land reads 1.31:1 above the face and its near-black sea 1.04:1 *below* it, so the
+            // dark appearance's fills sit inside the face's own value band on purpose. The sea
+            // entry therefore carries the darker appearance's floor and records the light
+            // appearance's 1.38:1, which it clears with room to spare.
             //
             // What that leaves uncovered, measured on the 1× 1,404 × 900 view: 81% of the top
             // edge of the map is land, 82% of the bottom, 96% of the left and 55% of the right,
@@ -705,7 +707,7 @@ impl Roles {
                 "chart.map_ocean on surface.sunken",
                 self.chart.map_ocean,
                 self.surface.sunken,
-                MAP_FILL_FLOOR,
+                1.03,
             ),
             // The strokes laid over the fills, at the floors cartography gives a line rather
             // than at the ones a paragraph is read with: every one of them is a line to follow

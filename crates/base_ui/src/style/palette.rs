@@ -269,20 +269,18 @@ impl Palette {
                 Oklch::new(0.700, 0.140, 120.0, opacity),
                 Oklch::new(0.660, 0.010, 0.0, opacity),
             ],
-            // The night transport map: the same two OSM hues at dark lightnesses, lifted
-            // until the sea reads on the near-black chart face and the land reads on the
-            // sea. The land is higher than a neutral night grey would be because the sea
-            // below it has to stay above that face.
-            map_ocean: Oklch::new(0.352, 0.040, 217.5, opacity),
-            map_land: Oklch::new(0.479, 0.020, 84.6, opacity),
-            // The same three OSM strokes lifted with the page: the violet and the rose are
-            // the night ends of the light appearance's own hues, and the amber is the same
-            // mustard lifted further — at the light role's lightness it read 2.18:1 on the
-            // night land, under the 2.5:1 every map stroke is held to. Each clears that
-            // floor on the land and the 2.0:1 the sea gives.
+            // A neutral night basemap: a near-black sea, and the darkest land that still
+            // reads as one step above it. The earlier khaki land and blue sea were the OSM
+            // transport colours lifted for a dark page, and at that lightness they read as
+            // colour rather than as the base the vessel series is read against.
+            map_ocean: Oklch::new(0.150, 0.000, 0.0, opacity),
+            map_land: Oklch::new(0.283, 0.000, 0.0, opacity),
+            // The roads are greys too, so the only colour left on the basemap is the
+            // border's violet — which is what tells a border from a road where the two run
+            // side by side, the dash being the other half of that answer.
             map_border: Oklch::new(0.813, 0.090, 311.0, opacity),
-            map_road: Oklch::new(0.814, 0.080, 7.5, opacity),
-            map_road_minor: Oklch::new(0.780, 0.110, 74.9, opacity),
+            map_road: Oklch::new(0.633, 0.000, 0.0, opacity),
+            map_road_minor: Oklch::new(0.530, 0.000, 0.0, opacity),
             on_brand: Oklch::new(0.176, 0.020, 245.0, opacity),
             on_inverse: Oklch::new(0.176, 0.016, 252.4, opacity),
             scrim_alpha: 0.55,

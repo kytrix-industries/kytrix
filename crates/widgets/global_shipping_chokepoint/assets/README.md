@@ -514,10 +514,14 @@ wrote.
 elements over the canvas rather than glyphs in it, so they are read from the
 catalogue, shaped by the platform font and drawn at the display's scale. Each one
 is centred on its anchor: GPUI lays an absolute child out by its top-left corner
-and has no transform to shift it, so the text sits in a fixed 240 × 20 px box
-placed at `(x − 120, y − 10)`. The widest name either locale ships is
-`UNITED ARAB EMIRATES`, about 141 px at `text_xs`, so the box holds every one of
-them without wrapping. Cities are named from the fitted zoom (`CITY_LABEL_ZOOM`), and
+and has no transform to shift it, so the text sits in a fixed 240 × 22 px box
+placed at `(x − 120, y − 11)`. The widest name either locale ships is
+`UNITED ARAB EMIRATES`, about 165 px at the country's `text_sm` step, so the box
+holds every one of them without wrapping. The three kinds are told apart by size
+and weight as well as by colour, in the order a paper atlas prints them: a
+country is `text_sm` (14 px), bold and italic, a city is 13 px, and a sea is the
+12 px `text_xs` italic muted step. Cities are named from the fitted zoom
+(`CITY_LABEL_ZOOM`), and
 `model::place_labels` fixes what a frame draws: countries, then seas, then cities,
 each list in its declared order; a later anchor within 72 px of one already placed
 is skipped, so the strait's crowded cities do not print into one pile at 1×
@@ -618,31 +622,45 @@ Until then this README states the measurement, not a visual pass.
 
 **Theme.** Five map roles, all opaque and all read from the theme every frame by
 `MapColors::resolve`: `chart.map_ocean`, `chart.map_land`, `chart.map_border`,
-`chart.map_road` (motorway/trunk) and `chart.map_road_minor` (primary). They are
-the OSM Carto transport layer's own colours: paper land `#f2efe9`, water
-`#aad3df`, the admin violet `#a875c9` for borders, the motorway casing `#dc2a67`
-and the primary casing `#a06b00`. Their floors are in
-`roles.rs::contrast_floors`: every stroke reads 2.5:1 on the land and 2.0:1 on
+`chart.map_road` (motorway/trunk) and `chart.map_road_minor` (primary). The light
+appearance is the OSM Carto transport layer's own colours: paper land `#f2efe9`,
+water `#aad3df`, the admin violet `#a875c9` for borders, the motorway casing
+`#dc2a67` and the primary casing `#a06b00`. The dark appearance is a neutral
+night basemap instead — near-black water `#0b0b0b`, dark grey land `#2a2a2a`,
+grey roads `#8a8a8a` and `#6c6c6c` — with the violet border kept, because the
+dash and the violet together are what tell a border from a road. Their floors are
+in `roles.rs::contrast_floors`: every stroke reads 2.5:1 on the land and 2.0:1 on
 the sea (a border crosses the water, a bridge or causeway carries a road over
-it). Measured, light / dark: border 3.02 / 2.16 and 3.56 / 6.00, motorway 4.00 /
-2.86 and 3.56 / 6.00, primary 3.98 / 2.84 and 3.24 / 5.45. All five roles are
-opaque. No map colour is hard-coded in the widget.
+it). Measured, light / dark, on the land and on the sea: border 3.02 / 2.16 and
+7.84 / 10.67, motorway 4.00 / 2.86 and 4.18 / 5.69, primary 3.98 / 2.84 and
+2.74 / 3.73. All five roles are opaque. No map colour is hard-coded in the
+widget.
 
-The two fills are the OSM pair and read 1.40:1 against each other in the light
-appearance (1.68 dark): below the 1.5:1 the design asked for, which is why both
-fill floors are pinned at 1.35:1 — the alternatives were a deeper sea, which is
-not the OSM colour, or a land that is not paper. The paper land is 1.01:1 on the
-light chart face and 2.88:1 on the dark one, so the sea is the fill held against
-the face (1.38 light, 1.71 dark). That is also why the map covers the pane
-rather than fitting inside it: with a cover fit there is no band of chart face
-inside the map's own rect for the land to dissolve into.
+The two fills read 1.40:1 against each other in the light appearance and 1.36:1
+in the dark one, so both fill floors are pinned at 1.35:1 — the alternatives were
+a deeper sea, which is not the OSM colour, or a land that is not paper (in the
+dark appearance: a lighter land, which is no longer the neutral black the night
+map asks for). The light paper land is 1.01:1 on the chart face and the dark
+land 1.31:1 above it; the sea is the fill held against the face (1.38 light,
+1.04 dark). That is also why the map covers the pane rather than fitting inside
+it: with a cover fit there is no band of chart face inside the map's own rect
+for the land to dissolve into.
 
-The land-on-face separation was **deliberately dropped** — the palette's owner
-chose the OSM paper land over a visible map-to-pane step, so the paper land
-stays at 1.01:1 against `surface.sunken` with no hairline border, no darker land
-and no moved face. The measurement is kept here because it is the cost of the
-choice: anything that clears 1.5:1 there is no longer the OSM colour, and the
-fill floors do not cover it (`roles.rs` records the same in its table comment).
+The light appearance's land-on-face separation was **deliberately dropped** — the
+palette's owner chose the OSM paper land over a visible map-to-pane step, so the
+paper land stays at 1.01:1 against `surface.sunken` with no hairline border, no
+darker land and no moved face. The night basemap does not have that problem (its
+land sits 1.31:1 above the face), but its near-black sea sits 1.04:1 *below* it,
+so the sea-on-face floor carries the darker appearance's value and the light
+appearance's 1.38:1 is recorded beside it (`roles.rs` has the same in its table
+comment).
+
+**Staleness.** A badge in the top-left names a picture the pushes stopped
+continuing ("live updates have stopped"), and otherwise says the picture is old
+once `STALE_AFTER` (five minutes) has gone by without a push. The service
+refreshes at least once a minute, so the window is several refreshes wide: the
+badge is a warning about the picture, not a countdown, and it never replaces the
+vessels — what is stale is the update, not what was received.
 
 **Attribution.** The widget draws `© OpenStreetMap contributors`
 (`© OpenStreetMap 贡献者` in Chinese) in the map's bottom-left corner, in

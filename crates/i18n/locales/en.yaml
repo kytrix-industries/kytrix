@@ -715,7 +715,7 @@ widget:
       tanker: Tanker
     sign_in: <p align="center">You need to register or log in to see the vessels in the strait.</p>
     stale: Live updates have stopped
-    stale_seconds: No update received for %{seconds}s
+    stale_data: No update for over 5 minutes — the data may be out of date
     unavailable: —
     vessel_count: '%{count} vessels'
     vessel_count_one: 1 vessel

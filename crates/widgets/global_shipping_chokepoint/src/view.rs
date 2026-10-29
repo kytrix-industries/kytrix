@@ -92,10 +92,17 @@ const STALE_TIMER_SLACK: Duration = Duration::from_millis(100);
 
 /// The width and height of the box each label is centred in, in pixels.
 ///
-/// Wider than any name this map draws at the small size, and one line tall, so the text
-/// sits at the centre of the box and the box at the anchor.
+/// Wider than any name this map draws at the small size, and one line tall — tall enough
+/// for the country's 14 px step — so the text sits at the centre of the box and the box at
+/// the anchor.
 const LABEL_BOX_WIDTH: f32 = 240.0;
-const LABEL_BOX_HEIGHT: f32 = 20.0;
+const LABEL_BOX_HEIGHT: f32 = 22.0;
+
+/// The size a city's name is drawn at, in pixels.
+///
+/// One pixel under the country's `text_sm` step and one over the water's `text_xs`, so the
+/// three kinds of word read in the order a paper atlas prints them in.
+const CITY_LABEL_TEXT_SIZE: f32 = 13.0;
 
 /// How opaque a lane is drawn over the sea.
 const DASH_ALPHA: f32 = 0.55;
@@ -799,6 +806,11 @@ impl GlobalShippingChokepointWidget {
     /// `fg.subtle`: subtle reads about 2:1 on the land, and these are the only words drawn
     /// straight on the fill, so they take the readable colour and clear 4.5:1 in both
     /// appearances (pinned by the test below).
+    ///
+    /// The three kinds are told apart by size and weight as well as by colour: a country
+    /// is the map's largest word, bold and italic, a city is a step under it, and water is
+    /// the smallest and the only muted one. That is the order a paper atlas prints them in,
+    /// and it is what makes a country read as a region rather than as another place name.
     fn labels(&self, projection: Projection, colors: MapColors, cx: &App) -> Vec<AnyElement> {
         place_labels(projection)
             .into_iter()
@@ -806,8 +818,9 @@ impl GlobalShippingChokepointWidget {
                 let [x, y] = label.at;
                 let text = match label.kind {
                     LabelKind::Country => div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .italic()
                         .text_color(colors.text)
                         .child(SharedString::from(t!(cx, label.key).to_uppercase())),
                     LabelKind::Water => div()
@@ -816,7 +829,7 @@ impl GlobalShippingChokepointWidget {
                         .text_color(colors.muted)
                         .child(t!(cx, label.key)),
                     LabelKind::City => div()
-                        .text_xs()
+                        .text_size(px(CITY_LABEL_TEXT_SIZE))
                         .text_color(colors.text)
                         .child(t!(cx, label.key)),
                 };
@@ -934,17 +947,15 @@ impl GlobalShippingChokepointWidget {
     /// The badge a picture that is no longer being continued is drawn under.
     ///
     /// A gap is a picture the pushes stopped continuing; a silence is a link that stopped
-    /// delivering. The first names the picture, the second counts the silence, and both
-    /// leave the vessels on the map: what is stale is the update, not what was received.
+    /// delivering. The first names the picture, the second says the picture is old rather
+    /// than counting the seconds — the service refreshes at least once a minute, so a
+    /// count would only ever read "300, 301, 302" — and both leave the vessels on the map:
+    /// what is stale is the update, not what was received.
     fn stale_badge(&self, colors: MapColors, cx: &App) -> AnyElement {
         let text = if self.vessels.has_gap() {
             t!(cx, "widget.global_shipping_chokepoint.stale")
         } else {
-            t!(
-                cx,
-                "widget.global_shipping_chokepoint.stale_seconds",
-                seconds = self.vessels.silent_for().as_secs()
-            )
+            t!(cx, "widget.global_shipping_chokepoint.stale_data")
         };
 
         div()
@@ -2289,7 +2300,7 @@ mod tests {
                 "widget.global_shipping_chokepoint.entitlement_required",
                 "widget.global_shipping_chokepoint.sign_in",
                 "widget.global_shipping_chokepoint.stale",
-                "widget.global_shipping_chokepoint.stale_seconds",
+                "widget.global_shipping_chokepoint.stale_data",
                 "widget.global_shipping_chokepoint.unavailable",
                 "widget.global_shipping_chokepoint.vessel_count",
                 "widget.global_shipping_chokepoint.vessel_count_one",
@@ -2322,13 +2333,8 @@ mod tests {
                     "the count is supplied in {language:?}",
                 );
                 assert!(
-                    !t!(
-                        cx,
-                        "widget.global_shipping_chokepoint.stale_seconds",
-                        seconds = 42
-                    )
-                    .contains("%{"),
-                    "the silence is supplied in {language:?}",
+                    !t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").contains("%{"),
+                    "the singular count carries no placeholder in {language:?}",
                 );
             }
         });

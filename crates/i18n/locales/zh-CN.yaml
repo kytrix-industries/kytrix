@@ -715,7 +715,7 @@ widget:
       tanker: 油轮
     sign_in: <p align="center">注册或登录后即可查看海峡内的船舶。</p>
     stale: 实时更新已停止
-    stale_seconds: 已有 %{seconds} 秒未收到更新
+    stale_data: 已经超过 5 分钟没有数据更新，数据可能已经过时
     unavailable: —
     vessel_count: '%{count} 艘'
     vessel_count_one: 1 艘
