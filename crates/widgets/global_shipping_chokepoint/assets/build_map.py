@@ -9,10 +9,13 @@ What is packed (all little-endian, see `README.md` for the format):
 
 1. **land** — OSM land polygons, clipped to the map box, simplified to ~111 m,
    islands under 0.01 km² dropped, one closed ring per polygon ring.
-2. **borders** — `boundary=administrative` + `admin_level=2` ways without
-   `maritime=yes`, clipped and simplified to ~55 m, cut per grid cell.
-3. **roads** — `highway=motorway|trunk|primary`, clipped and simplified to
-   ~134 m, cut per grid cell, with the two flags the runtime LOD filter reads.
+2. **borders** — the member ways of the `boundary=administrative` +
+   `admin_level=2` relations, plus any such way that belongs to no relation,
+   without `maritime=yes` or `natural=coastline` and with at least one point on
+   the drawn land, clipped and simplified to ~55 m, cut per grid cell.
+3. **roads** — `highway=motorway|trunk|primary` at ~134 m plus a **coarse copy**
+   of the motorways and trunks at ~300 m, both cut per grid cell, with the flag
+   bits the runtime LOD filter reads.
 
 The same inputs produce a byte-identical file: every list is sorted before it
 is packed.
@@ -35,9 +38,11 @@ from pathlib import Path
 
 import osmium
 import shapefile
+import shapely
 from shapely import STRtree, box, make_valid
 from shapely.geometry import LineString, Polygon, shape
-from shapely.ops import unary_union
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import linemerge, unary_union
 
 # The asset directory is inside the repository: importing `download_map` must not
 # leave a `__pycache__` next to the committed files.
@@ -56,9 +61,11 @@ GRID_COLS, GRID_ROWS = 64, 32
 #: Section kinds of the KHL2 asset.
 KIND_LAND, KIND_BORDERS, KIND_ROADS = 1, 2, 3
 
-#: Road flags: bit 0 is "primary", bit 1 is "the way carries a `ref`".
+#: Road flags: bit 0 is "primary", bit 1 is "the way carries a `ref`", bit 2 is
+#: "this piece belongs to the coarse copy".
 FLAG_PRIMARY = 1 << 0
 FLAG_HAS_REF = 1 << 1
+FLAG_COARSE = 1 << 2
 
 #: The road classes the asset keeps, as `highway` tag values.
 ROAD_CLASSES = frozenset({"motorway", "trunk", "primary"})
@@ -70,8 +77,22 @@ LAND_SIMPLIFY = 0.001
 LAND_MIN_AREA_KM2 = 0.01
 #: Borders are simplified to 0.0005° (about 55 m).
 BORDER_SIMPLIFY = 0.0005
+#: The margin a border point gets when it is tested against the drawn land.
+#:
+#: The land is simplified to 0.001°, so the drawn coastline sits up to about 111 m
+#: off the real one and a border point that is truly on the coast can fall just
+#: outside the drawn polygon. Twice that keeps such a point: the Saudi–Qatar
+#: connector's nearest point reads 57 m from the drawn coast. The sea-only stretches
+#: the mask exists for are a kilometre or more out — the two Abu Dhabi rings read
+#: 877 m and 1,486 m — so nothing in between is ambiguous.
+BORDER_LAND_MASK_TOLERANCE = 0.002
 #: Roads are simplified to 0.0012° (about 134 m).
 ROAD_SIMPLIFY = 0.0012
+#: The coarse copy of the motorways and trunks is simplified to 0.0027° (about
+#: 300 m). One pixel at the fitted zoom is about a kilometre, so the copy is
+#: still several pixels per vertex where it is drawn, and its vertices are the
+#: only ones a 1× frame pays for.
+COARSE_ROAD_SIMPLIFY = 0.0027
 
 #: Degrees to kilometres at the equator; every area scales it by the cosine of
 #: the latitude.
@@ -79,9 +100,6 @@ DEGREE_KM = 111.32
 #: Degrees to metres at the equator; every length scales it by the cosine of the
 #: latitude.
 DEGREE_M = 111_320.0
-
-#: The runtime E_MIN filter: `length_m >= 1000`.
-EMIN_LENGTH_M = 1000
 
 #: Below these sizes a source is not a plausible download of that file.
 PBF_MIN_BYTES = 20 * 1024**2
@@ -100,16 +118,41 @@ class Piece:
     length_m: int = 0
 
 
-class Collector(osmium.SimpleHandler):
-    """Collects the border and road ways of one extract."""
+class NationalRelations(osmium.SimpleHandler):
+    """The national boundary relations of one extract and the ways they contain."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.relations: set[int] = set()
+        self.member_ways: set[int] = set()
+
+    def relation(self, relation: osmium.osm.Relation) -> None:
+        tags = relation.tags
+        if tags.get("boundary") != "administrative" or tags.get("admin_level") != "2":
+            return
+        self.relations.add(relation.id)
+        for member in relation.members:
+            if member.type == "w":
+                self.member_ways.add(member.ref)
+
+
+class Collector(osmium.SimpleHandler):
+    """Collects the border and road ways of one extract."""
+
+    def __init__(self, member_ways: set[int]) -> None:
+        super().__init__()
+        # The member ways of every national relation of the three extracts.
+        self.member_ways = member_ways
         self.borders: dict[int, list[tuple[float, float]]] = {}
+        # The packed border ways that carry no boundary tag of their own.
+        self.relation_only: set[int] = set()
         self.roads: dict[int, tuple[str, bool, list[tuple[float, float]]]] = {}
         self.admin_level_2 = 0
+        self.members_seen = 0
         self.maritime_rejected = 0
+        self.coastline_rejected = 0
         self.maritime_ids: set[int] = set()
+        self.coastline_ids: set[int] = set()
         self.border_duplicates = 0
         self.road_duplicates = 0
 
@@ -128,12 +171,27 @@ class Collector(osmium.SimpleHandler):
             self.roads[handler.id] = (highway, "ref" in tags, coords)
             return
 
-        if tags.get("boundary") != "administrative" or tags.get("admin_level") != "2":
+        tagged = (
+            tags.get("boundary") == "administrative" and tags.get("admin_level") == "2"
+        )
+        is_member = handler.id in self.member_ways
+        if not tagged and not is_member:
             return
-        self.admin_level_2 += 1
+        if tagged:
+            self.admin_level_2 += 1
+        if is_member:
+            self.members_seen += 1
+        # The two tags a national boundary relation's member way may carry that make
+        # it a border the runtime can never check: a maritime stretch and the coastline
+        # the land already draws. Both are filtered here, for member ways as well as
+        # for the ones selected by their own tags.
         if tags.get("maritime") == "yes":
             self.maritime_rejected += 1
             self.maritime_ids.add(handler.id)
+            return
+        if tags.get("natural") == "coastline":
+            self.coastline_rejected += 1
+            self.coastline_ids.add(handler.id)
             return
         coords = way_coords(handler)
         if coords is None:
@@ -144,6 +202,8 @@ class Collector(osmium.SimpleHandler):
             if len(coords) <= len(existing):
                 return
         self.borders[handler.id] = coords
+        if not tagged:
+            self.relation_only.add(handler.id)
 
 
 def way_coords(handler: osmium.osm.Way) -> list[tuple[float, float]] | None:
@@ -185,6 +245,20 @@ def polygon_parts(geometry) -> list[Polygon]:
     return []
 
 
+def merge_lines(lines: list[LineString]) -> list[LineString]:
+    """The lines joined into the longest chains their shared endpoints allow.
+
+    The union nodes the network where two ways cross, and `linemerge` then walks every
+    chain of degree-2 nodes into one line. The chains are sorted by their coordinates so
+    the same input produces the same list in the same order.
+    """
+    chains = line_parts(linemerge(unary_union(lines)))
+    chains.sort(
+        key=lambda line: [coordinate for point in line.coords for coordinate in point]
+    )
+    return chains
+
+
 def clean_coords(coords) -> list[tuple[float, float]]:
     """The piece's points exactly as stored: f32, consecutive duplicates dropped."""
     cleaned: list[tuple[float, float]] = []
@@ -219,49 +293,91 @@ def segment_metres(
 
 
 def read_pbfs(paths: list[Path]) -> Collector:
-    """Read the border and road ways of every extract into one collector."""
-    collector = Collector()
+    """Read the national relations, then the border and road ways, of every extract.
+
+    Borders are selected from the relations rather than from the ways' own tags: a
+    national border is frequently mapped as untagged ways that are members of the
+    country's relation, and selecting on `boundary` + `admin_level` alone leaves
+    exactly those out. The relation pass is cheap (relations only, no node
+    locations); the way pass is the one that has to resolve every node.
+    """
+    relations = NationalRelations()
+    started = time.perf_counter()
+    for path in paths:
+        relations.apply_file(str(path))
+    print(
+        f"  {len(relations.relations):,} national relations, "
+        f"{len(relations.member_ways):,} distinct member ways "
+        f"({time.perf_counter() - started:.1f} s)",
+        flush=True,
+    )
+
+    collector = Collector(relations.member_ways)
     for path in paths:
         started = time.perf_counter()
         before_borders = len(collector.borders)
         before_roads = len(collector.roads)
         before_admin = collector.admin_level_2
+        before_members = collector.members_seen
         before_maritime = collector.maritime_rejected
+        before_coastline = collector.coastline_rejected
         collector.apply_file(str(path), locations=True, idx="flex_mem")
         print(
             f"  {path.name}: "
-            f"{collector.admin_level_2 - before_admin:,} admin_level=2 ways "
-            f"({collector.maritime_rejected - before_maritime:,} maritime rejected), "
+            f"{collector.members_seen - before_members:,} national relation members "
+            f"({collector.admin_level_2 - before_admin:,} of them tagged admin_level=2), "
+            f"{collector.maritime_rejected - before_maritime:,} maritime and "
+            f"{collector.coastline_rejected - before_coastline:,} coastline rejected, "
             f"+{len(collector.roads) - before_roads:,} road ways, "
             f"+{len(collector.borders) - before_borders:,} border ways "
             f"({time.perf_counter() - started:.1f} s)",
             flush=True,
         )
     print(
-        f"  {collector.admin_level_2:,} admin_level=2 ways, "
-        f"{collector.maritime_rejected:,} maritime rejected; "
+        f"  {len(relations.relations):,} national relations, "
+        f"{len(relations.member_ways):,} distinct member ways; "
+        f"{len(collector.borders):,} border ways kept, "
+        f"{len(collector.relation_only):,} of them selected only by their relation; "
+        f"{collector.maritime_rejected:,} maritime=yes and "
+        f"{collector.coastline_rejected:,} natural=coastline rejected; "
         f"duplicate ways merged across extracts: {collector.border_duplicates:,} "
         f"border, {collector.road_duplicates:,} road",
         flush=True,
     )
-    # The maritime filter is the one border rule the runtime cannot check, so the build
-    # asserts it here: a way tagged `maritime=yes` must never reach the packed border
-    # set, and the extracts must contain some, or the filter is never exercised.
-    leaked = collector.maritime_ids.intersection(collector.borders)
+    # The two border tags the runtime cannot check are asserted here: such a way must
+    # never reach the packed border set, and the extracts must contain some, or the
+    # filter is never exercised. The second count proves the filter runs over the
+    # member ways a relation contributes, not only over the ways tagged in their own
+    # right.
+    rejected = collector.maritime_ids | collector.coastline_ids
+    leaked = rejected.intersection(collector.borders)
     if leaked:
         raise SystemExit(
-            f"error: {len(leaked):,} ways tagged maritime=yes were packed as borders"
+            f"error: {len(leaked):,} ways a national border excludes were packed as "
+            "borders"
         )
-    if not collector.maritime_ids:
+    if not rejected:
         raise SystemExit(
-            "error: no boundary=administrative + admin_level=2 way is tagged "
-            "maritime=yes, so the maritime filter was never exercised"
+            "error: no way selected as a border — tagged boundary=administrative + "
+            "admin_level=2, or a member of such a relation — is tagged maritime=yes or "
+            "natural=coastline, so the border filter was never exercised"
+        )
+    if not collector.relation_only:
+        raise SystemExit(
+            "error: no member way of a national relation without a boundary tag was "
+            "selected, so selecting borders from the relations selected nothing"
         )
     return collector
 
 
-def load_land(zip_path: Path, clip_box) -> list[Piece]:
-    """The land rings: every polygon ring of the clipped, simplified land."""
+def load_land(zip_path: Path, clip_box) -> tuple[list[Piece], BaseGeometry]:
+    """The land rings, and the drawn land as the geometry the border mask tests against.
+
+    The mask is the land after the clip, `make_valid` and the simplification — exactly the
+    polygons whose rings are packed, so "on land" means land the map draws. The islands
+    dropped below `LAND_MIN_AREA_KM2` are a hundred metres across at most and are not
+    worth a second union.
+    """
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
         shp_name = find_entry(names, ".shp")
@@ -322,7 +438,22 @@ def load_land(zip_path: Path, clip_box) -> list[Piece]:
         f"{LAND_MIN_AREA_KM2} km2; {len(rings):,} rings",
         flush=True,
     )
-    return rings
+    return rings, simplified
+
+
+def way_touches_land(mask: BaseGeometry, coords: list[tuple[float, float]]) -> bool:
+    """Whether any point of the way is on the land `mask`, or inside its margin.
+
+    A prepared geometry is what makes this cheap: every candidate way is put through
+    the same test against the same land.
+    """
+    return bool(
+        shapely.contains_xy(
+            mask,
+            [point[0] for point in coords],
+            [point[1] for point in coords],
+        ).any()
+    )
 
 
 def find_entry(names: list[str], suffix: str) -> str:
@@ -430,15 +561,11 @@ def pack_section(
 def lod_pieces(pieces: list[Piece]) -> dict[str, list[Piece]]:
     """The pieces each runtime road LOD keeps."""
     return {
-        "E_MIN": [
-            piece
-            for piece in pieces
-            if not piece.flags & FLAG_PRIMARY
-            and piece.flags & FLAG_HAS_REF
-            and piece.length_m >= EMIN_LENGTH_M
+        "COARSE": [piece for piece in pieces if piece.flags & FLAG_COARSE],
+        "FINE": [
+            piece for piece in pieces if not piece.flags & (FLAG_COARSE | FLAG_PRIMARY)
         ],
-        "E_ALL": [piece for piece in pieces if not piece.flags & FLAG_PRIMARY],
-        "DE": pieces,
+        "DE": [piece for piece in pieces if not piece.flags & FLAG_COARSE],
     }
 
 
@@ -481,47 +608,8 @@ def build(assets: Path, out: Path) -> None:
         ]
     )
 
-    print("borders", flush=True)
-    border_pieces: list[Piece] = []
-    for coords in collector.borders.values():
-        line = LineString(coords)
-        if not line.intersects(clip_box):
-            continue
-        for part in line_parts(line.intersection(clip_box)):
-            simplified = clean_coords(
-                part.simplify(BORDER_SIMPLIFY, preserve_topology=False).coords
-            )
-            if len(simplified) >= 2:
-                border_pieces.append(Piece(simplified))
-    print(
-        f"  {len(border_pieces):,} pieces, "
-        f"{sum(len(p.coords) for p in border_pieces):,} points",
-        flush=True,
-    )
-
-    print("roads", flush=True)
-    road_pieces: list[Piece] = []
-    for highway, has_ref, coords in collector.roads.values():
-        line = LineString(coords)
-        if not line.intersects(clip_box):
-            continue
-        for part in line_parts(line.intersection(clip_box)):
-            part = part.simplify(ROAD_SIMPLIFY, preserve_topology=False)
-            simplified = clean_coords(part.coords)
-            if len(simplified) < 2:
-                continue
-            flags = (FLAG_PRIMARY if highway == "primary" else 0) | (
-                FLAG_HAS_REF if has_ref else 0
-            )
-            road_pieces.append(Piece(simplified, flags, 0))
-    print(
-        f"  {len(road_pieces):,} pieces, "
-        f"{sum(len(p.coords) for p in road_pieces):,} points",
-        flush=True,
-    )
-
     print("land", flush=True)
-    land_rings = load_land(assets / "land-polygons-split-4326.zip", clip_box)
+    land_rings, land = load_land(assets / "land-polygons-split-4326.zip", clip_box)
     land_rings.sort(key=piece_key)
     longitudes = [point[0] for ring in land_rings for point in ring.coords]
     latitudes = [point[1] for ring in land_rings for point in ring.coords]
@@ -530,6 +618,97 @@ def build(assets: Path, out: Path) -> None:
         f"{max(longitudes):.6f} {max(latitudes):.6f}",
         flush=True,
     )
+    # The border land mask: the drawn land grown by the margin a border point gets, prepared
+    # once for the point test every candidate way is put through.
+    land_mask = land.buffer(BORDER_LAND_MASK_TOLERANCE)
+    shapely.prepare(land_mask)
+
+    print("borders", flush=True)
+    border_pieces: list[Piece] = []
+    relation_only_in_box = 0
+    sea_only: list[int] = []
+    for way_id, coords in collector.borders.items():
+        line = LineString(coords)
+        if not line.intersects(clip_box):
+            continue
+        # A member way of a national relation can be a sea boundary that carries no
+        # `maritime=yes` tag, which the tag filter cannot see. A way with a single point on
+        # land is a border that also crosses water — the two Saudi–Bahrain ways at the coast
+        # are exactly that — so the test is "none of its points", never a share of them.
+        if not way_touches_land(land_mask, coords):
+            sea_only.append(way_id)
+            continue
+        if way_id in collector.relation_only:
+            relation_only_in_box += 1
+        for part in line_parts(line.intersection(clip_box)):
+            simplified = clean_coords(
+                part.simplify(BORDER_SIMPLIFY, preserve_topology=False).coords
+            )
+            if len(simplified) >= 2:
+                border_pieces.append(Piece(simplified))
+    print(
+        f"  {len(border_pieces):,} pieces, "
+        f"{sum(len(p.coords) for p in border_pieces):,} points; "
+        f"{relation_only_in_box:,} of the {len(collector.relation_only):,} ways "
+        "selected only by their relation reach the box; "
+        f"{len(sea_only):,} ways dropped with no point on land "
+        f"({', '.join(str(way_id) for way_id in sorted(sea_only))})",
+        flush=True,
+    )
+    if relation_only_in_box == 0:
+        raise SystemExit(
+            "error: no border way selected only by its national relation reaches the "
+            "map box, so the Saudi–UAE land border is still missing"
+        )
+    if not sea_only:
+        raise SystemExit(
+            "error: no border way lies entirely over water, so the land mask was never "
+            "exercised"
+        )
+
+    print("roads", flush=True)
+    road_pieces: list[Piece] = []
+    class_zero: list[LineString] = []
+    for highway, has_ref, coords in collector.roads.values():
+        line = LineString(coords)
+        if not line.intersects(clip_box):
+            continue
+        ref_flag = FLAG_HAS_REF if has_ref else 0
+        for part in line_parts(line.intersection(clip_box)):
+            simplified = clean_coords(
+                part.simplify(ROAD_SIMPLIFY, preserve_topology=False).coords
+            )
+            if highway == "primary":
+                if len(simplified) >= 2:
+                    road_pieces.append(Piece(simplified, FLAG_PRIMARY | ref_flag, 0))
+                continue
+            class_zero.append(part)
+            if len(simplified) >= 2:
+                road_pieces.append(Piece(simplified, ref_flag, 0))
+
+    # The coarse copy is the class-0 network joined into the chains its shared endpoints
+    # allow and simplified as a whole. A per-way simplification cannot thin a two-node
+    # way, and most of the network's ways are exactly that, so joining them first is what
+    # makes the copy coarse at all: the class-0 parts merge into 5,999 chains, and 5,992 of
+    # them survive the ~300 m simplification with 17,304 points (11,312 segments). The
+    # chains carry no per-way tags either, which is why a coarse piece sets the copy bit and
+    # nothing else.
+    coarse_chains = merge_lines(class_zero)
+    coarse_pieces: list[Piece] = []
+    for chain in coarse_chains:
+        coarse = clean_coords(
+            chain.simplify(COARSE_ROAD_SIMPLIFY, preserve_topology=False).coords
+        )
+        if len(coarse) >= 2:
+            coarse_pieces.append(Piece(coarse, FLAG_COARSE, 0))
+    print(
+        f"  {len(road_pieces):,} fine pieces, "
+        f"{sum(len(p.coords) for p in road_pieces):,} points; "
+        f"{len(coarse_pieces):,} coarse pieces from {len(coarse_chains):,} chains, "
+        f"{sum(len(p.coords) for p in coarse_pieces):,} points",
+        flush=True,
+    )
+    road_pieces.extend(coarse_pieces)
 
     print("cutting borders and roads per cell", flush=True)
     border_pieces, border_cells = cut_per_cell(
@@ -573,20 +752,26 @@ def build(assets: Path, out: Path) -> None:
     for name, selected in lods.items():
         vertices = sum(len(piece.coords) for piece in selected)
         print(
-            f"  {name:5s}  pieces {len(selected):7,d}  vertices {vertices:8,d}  "
+            f"  {name:6s}  pieces {len(selected):7,d}  vertices {vertices:8,d}  "
             f"triangles {2 * (vertices - len(selected)):9,d}"
         )
-    emin_pieces = lods["E_MIN"]
-    dangling, pieces_with_dangling = dangling_endpoints(emin_pieces)
-    print(f"  E_MIN filtered-out pieces: {len(road_pieces) - len(emin_pieces):,}")
     print(
-        f"  E_MIN dangling endpoints: {dangling:,} "
+        f"  class 0 stored: fine {len(lods['FINE']):,} + coarse {len(lods['COARSE']):,} "
+        f"= {len(lods['FINE']) + len(lods['COARSE']):,} pieces"
+    )
+    # The coarse copy carries every motorway and trunk piece at the fitted zoom: it is
+    # what makes the network continuous there, so the endpoints nothing joins are the
+    # build's own measure of that claim.
+    dangling, pieces_with_dangling = dangling_endpoints(lods["COARSE"])
+    print(
+        f"  COARSE dangling endpoints: {dangling:,} "
         f"(on {pieces_with_dangling:,} pieces)"
     )
     print(
         f"segments shorter than 16 m: land {short_segments(land_rings):,}, "
         f"borders {short_segments(border_pieces):,}, "
-        f"roads {short_segments(road_pieces):,}"
+        f"roads {short_segments(lods['FINE']):,}, "
+        f"coarse {short_segments(lods['COARSE']):,}"
     )
 
     temporary = out.with_name(out.name + ".tmp")

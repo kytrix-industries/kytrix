@@ -3,10 +3,10 @@
 //!
 //! The base map is prepared once by [`crate::scene`] and the picture arrives as a list of
 //! vessels, so a frame here only applies the camera's affine transform: the coastline is a
-//! triangle list, the borders and the roads are ribbons one pixel wide in screen space, and
-//! the lanes are dashes walked along their own polylines. Nothing is tessellated per frame
-//! and nothing is cached: a camera change is a different set of vertices, not a different
-//! picture.
+//! triangle list, the borders and the roads are ribbons whose width is in screen pixels,
+//! and the borders and the lanes are dashes walked along their own polylines. Nothing is
+//! tessellated per frame and nothing is cached: a camera change is a different set of
+//! vertices, not a different picture.
 //!
 //! [`MapColors`] stays in the view, because the labels, the hover card and the hit test
 //! read the same palette; this module is what turns the model's [`Projection`] into the
@@ -36,26 +36,46 @@ const HOVER_RING_INNER: f32 = 7.0;
 /// The outer radius of the ring around the vessel under the pointer.
 const HOVER_RING_OUTER: f32 = 9.0;
 
-/// The length of one dash of a lane, and of the gap after it, in pixels.
-const DASH_ON: f32 = 6.0;
-/// The gap between two dashes of a lane, in pixels.
-const DASH_OFF: f32 = 6.0;
-
-/// How wide a lane's dashes are drawn, in pixels.
-const DASH_WIDTH: f32 = 1.5;
-
-/// How wide a land border is drawn, in pixels.
+/// One dashed stroke: a dash, the gap after it and the stroke's width, all in pixels.
 ///
-/// The border is the one stroke drawn over both land and sea. At one pixel it vanished
-/// into the light land fill, so it carries one and a half pixels plus a colour that
-/// clears its floor on both fills by ten percent (see `roles.rs`).
-const BORDER_WIDTH: f32 = 1.6;
+/// The pattern is walked along a polyline rather than handed to a path builder: a
+/// builder's `dash_array` is sampled when the path is built, which would either tessellate
+/// every frame or make a 6 px dash scale with the camera. The walker's two users are the
+/// lane sketch and the land borders, each with its own pattern.
+#[derive(Clone, Copy)]
+struct Dash {
+    /// The length of one dash.
+    on: f32,
+    /// The gap between two dashes.
+    off: f32,
+    /// The width the dash is drawn at.
+    width: f32,
+}
+
+/// The dash pattern a land border is drawn with.
+///
+/// A border is a boundary to follow rather than a road to drive, so it is dashed as well
+/// as violet: the pattern is what tells a border from a motorway at a glance when the two
+/// run side by side. The dash is coarse enough to read at the fitted zoom, where one pixel
+/// is about a kilometre, and the width is the one the old solid stroke had.
+const BORDER_DASH: Dash = Dash {
+    on: 5.0,
+    off: 3.0,
+    width: 1.6,
+};
+
+/// The dash pattern a TSS lane is drawn with.
+const LANE_DASH: Dash = Dash {
+    on: 6.0,
+    off: 6.0,
+    width: 1.5,
+};
 
 /// How wide a motorway or trunk is drawn, in pixels.
-const ROAD_WIDTH: f32 = 1.2;
+const ROAD_WIDTH: f32 = 1.4;
 
 /// How wide a primary road is drawn, in pixels.
-const ROAD_MINOR_WIDTH: f32 = 1.0;
+const ROAD_MINOR_WIDTH: f32 = 1.2;
 
 /// The marker length at the fitted zoom, and at the closest one, in pixels.
 const MARKER_LENGTH_NEAR: f32 = 10.0;
@@ -108,7 +128,7 @@ pub(super) fn paint_map(
 struct MapLayers {
     /// The coastline, every visible triangle.
     land: Path<Pixels>,
-    /// The land borders, one quad per visible segment.
+    /// The land borders, one quad per visible dash.
     borders: Path<Pixels>,
     /// Motorways and trunks, then primary roads.
     roads: [Path<Pixels>; 2],
@@ -164,7 +184,7 @@ fn map_layers(
     let (land, borders, roads) = match scene {
         Some(scene) => (
             land_path(scene, projection, origin, cells.grown(), visible),
-            border_path(&scene.borders, projection, origin, cells, BORDER_WIDTH),
+            border_path(&scene.borders, projection, origin, cells, BORDER_DASH),
             road_paths(
                 &scene.roads,
                 projection,
@@ -223,30 +243,34 @@ fn land_path(
     path
 }
 
-/// The land borders as one path, one quad per segment of every visible piece.
+/// The land borders as one path of dashes, walked along every visible piece.
 ///
-/// `width` is in pixels: a border is furniture rather than a feature of the coastline, so
-/// it does not grow with the camera. The pieces were cut per cell by the build, which is
-/// why `cells` is the viewport's span ungrown.
+/// A border is furniture rather than a feature of the coastline, so its width and its dash
+/// stay in pixels and do not grow with the camera. Each piece anchors the pattern at its
+/// own first point: the build cut the pieces per cell, so a border crossing a cell edge
+/// starts a fresh dash there rather than having its phase crawl when the camera pans.
 fn border_path(
     layer: &LineLayer,
     projection: Projection,
     origin: [f32; 2],
     cells: CellSpan,
-    width: f32,
+    dash: Dash,
 ) -> Path<Pixels> {
     let mut path = Path::new(point(px(0.0), px(0.0)));
     let texture = point(0.0, 1.0);
     for piece in visible_pieces(layer, cells) {
-        for segment in piece_points(layer, piece).windows(2) {
-            push_quad(
-                &mut path,
-                projection.screen(segment[0]),
-                projection.screen(segment[1]),
-                width,
-                origin,
-                texture,
-            );
+        let mut previous: Option<[f32; 2]> = None;
+        let mut along = 0.0f32;
+        for point in piece_points(layer, piece) {
+            let next = projection.screen(*point);
+            if let Some(start) = previous {
+                let length = ((next[0] - start[0]).powi(2) + (next[1] - start[1]).powi(2)).sqrt();
+                if length > 0.0 {
+                    push_dashes(&mut path, start, next, along, length, dash, origin, texture);
+                }
+                along += length;
+            }
+            previous = Some(next);
         }
     }
     path
@@ -363,8 +387,10 @@ fn lane_path(projection: Projection, origin: [f32; 2]) -> Path<Pixels> {
                 // A lane is a long line: at four times the fitted zoom most of it is off
                 // screen, and walking the dashes of a segment nothing draws is the work
                 // this skips.
-                if length > 0.0 && projection.segment_near(start, next, DASH_WIDTH) {
-                    push_dashes(&mut path, start, next, along, length, origin, texture);
+                if length > 0.0 && projection.segment_near(start, next, LANE_DASH.width) {
+                    push_dashes(
+                        &mut path, start, next, along, length, LANE_DASH, origin, texture,
+                    );
                 }
                 along += length;
             }
@@ -374,23 +400,24 @@ fn lane_path(projection: Projection, origin: [f32; 2]) -> Path<Pixels> {
     path
 }
 
-/// Appends the dashes of one screen-space segment of a lane.
+/// Appends the dashes of one screen-space segment of a dashed polyline.
 fn push_dashes(
     path: &mut Path<Pixels>,
     start: [f32; 2],
     end: [f32; 2],
     along: f32,
     length: f32,
+    dash: Dash,
     origin: [f32; 2],
     texture: Point<f32>,
 ) {
     let direction = [(end[0] - start[0]) / length, (end[1] - start[1]) / length];
-    let period = DASH_ON + DASH_OFF;
+    let period = dash.on + dash.off;
     let first = (along / period).floor() as i64;
     let last = ((along + length) / period).ceil() as i64;
     for cycle in first..=last {
         let from = (cycle as f32 * period).max(along);
-        let to = (cycle as f32 * period + DASH_ON).min(along + length);
+        let to = (cycle as f32 * period + dash.on).min(along + length);
         if to <= from {
             continue;
         }
@@ -401,7 +428,7 @@ fn push_dashes(
                 start[1] + direction[1] * travelled,
             ]
         };
-        push_quad(path, at(from), at(to), DASH_WIDTH, origin, texture);
+        push_quad(path, at(from), at(to), dash.width, origin, texture);
     }
 }
 
@@ -767,7 +794,7 @@ mod tests {
         );
         assert_same_geometry(
             &layers.borders,
-            &border_path(&scene.borders, projection, origin, cells, BORDER_WIDTH),
+            &border_path(&scene.borders, projection, origin, cells, BORDER_DASH),
             "the borders",
         );
         assert_same_geometry(&layers.roads[0], &roads[0], "the motorways");
@@ -808,7 +835,7 @@ mod tests {
         );
         assert!(
             painted[3].0.vertices.is_empty(),
-            "E_MIN draws no primary road, so the second road path is empty",
+            "the coarse copy draws no primary road, so the second road path is empty",
         );
         assert!(
             painted[5..]
@@ -821,17 +848,18 @@ mod tests {
     /// A road segment is a screen-space ribbon: two triangles, as wide as it is configured,
     /// in the path its class names, and its width is in pixels rather than in map units.
     #[test]
-    fn a_road_segment_becomes_two_triangles_one_pixel_wide() {
+    fn a_road_segment_becomes_two_triangles_at_its_configured_width() {
         // The two points share a latitude, so the segment is horizontal on screen and the
         // quad's height is exactly the width it is drawn at.
         let points = [model::project(55.0, 25.0), model::project(55.5, 25.0)];
         let projection = Projection::new(Camera::default(), [600.0, 400.0]);
         let origin = [0.0, 0.0];
         let cells = model::visible_cells(projection.visible_mercator());
-        let motorway = one_piece_layer(&points, model::ROAD_REF, 2_000);
-        let primary = one_piece_layer(&points, model::ROAD_PRIMARY | model::ROAD_REF, 2_000);
+        let motorway = one_piece_layer(&points, 1 << 1, 2_000);
+        let coarse = one_piece_layer(&points, model::ROAD_COARSE, 0);
+        let primary = one_piece_layer(&points, model::ROAD_PRIMARY | 1 << 1, 2_000);
 
-        let roads = road_paths(&motorway, projection, origin, cells, RoadFilter::EMin);
+        let roads = road_paths(&motorway, projection, origin, cells, RoadFilter::Fine);
         assert_eq!(roads[0].vertices.len(), 6, "one segment is two triangles");
         assert!(
             roads[1].vertices.is_empty(),
@@ -842,6 +870,21 @@ mod tests {
             ROAD_WIDTH,
             "the motorway quad is drawn as wide as it is configured",
         );
+
+        // The coarse copy is the same width, and only the coarse filter draws it.
+        assert!(
+            road_paths(&coarse, projection, origin, cells, RoadFilter::Fine)[0]
+                .vertices
+                .is_empty(),
+            "the fine copy's filter does not draw the coarse one",
+        );
+        let roads = road_paths(&coarse, projection, origin, cells, RoadFilter::Coarse);
+        assert_eq!(
+            roads[0].vertices.len(),
+            6,
+            "the coarse copy is a ribbon too"
+        );
+        assert_close(quad_height(&roads[0]), ROAD_WIDTH, "at the same width");
 
         let roads = road_paths(&primary, projection, origin, cells, RoadFilter::De);
         assert_eq!(
@@ -869,7 +912,7 @@ mod tests {
             viewport,
         );
         let cells = model::visible_cells(close.visible_mercator());
-        let roads = road_paths(&motorway, close, origin, cells, RoadFilter::EMin);
+        let roads = road_paths(&motorway, close, origin, cells, RoadFilter::Fine);
         assert_eq!(
             roads[0].vertices.len(),
             6,
@@ -894,13 +937,58 @@ mod tests {
             [30.0, 50.0],
             0.0,
             30.0,
+            LANE_DASH,
             [0.0, 0.0],
             texture,
         );
 
         // 6 px on and 6 px off: [0, 6], [12, 18] and [24, 30] are drawn.
         assert_eq!(path.vertices.len(), 18, "three dashes, two triangles each");
-        assert_close(quad_height(&path), DASH_WIDTH, "a dash keeps its width");
+        assert_close(
+            quad_height(&path),
+            LANE_DASH.width,
+            "a dash keeps its width",
+        );
+    }
+
+    /// A border is dashed as well as violet, so that the kind of a line is readable from
+    /// its pattern and not only from its hue: one 40 px segment of a border is five 5 px
+    /// dashes with a 3 px gap after each, and the gap really is a gap.
+    #[test]
+    fn a_border_segment_is_dashes_of_five_pixels_on_and_three_off() {
+        let mut path = Path::new(point(px(0.0), px(0.0)));
+        let texture = point(0.0, 1.0);
+        push_dashes(
+            &mut path,
+            [0.0, 50.0],
+            [40.0, 50.0],
+            0.0,
+            40.0,
+            BORDER_DASH,
+            [0.0, 0.0],
+            texture,
+        );
+
+        // 5 px on and 3 px off over 40 px: [0, 5], [8, 13], [16, 21], [24, 29] and
+        // [32, 37] are drawn, and [37, 40] is the start of the last gap.
+        assert_eq!(path.vertices.len(), 30, "five dashes, two triangles each");
+        assert_close(
+            quad_height(&path),
+            BORDER_DASH.width,
+            "a border dash keeps its width",
+        );
+        let span = path
+            .vertices
+            .iter()
+            .map(|vertex| f32::from(vertex.xy_position.x))
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), x| {
+                (low.min(x), high.max(x))
+            });
+        assert!(
+            span.1 < 40.0,
+            "the last dash ends at 37 px, {} before the segment does",
+            40.0 - span.1,
+        );
     }
 
     /// A pane whose asset failed has no base map, but the lanes and the picture are still
@@ -965,11 +1053,24 @@ mod tests {
     /// plus 107 ns per triangle has to stay inside the 16.65 ms a 60 Hz frame has.
     const FRAME_TRIANGLE_BUDGET: usize = 75_000;
 
+    /// The class-0 pieces the coarse copy holds, as the checked-in asset stores them.
+    ///
+    /// Every one of them is drawn at the fitted zoom: the coarse filter drops nothing.
+    const CLASS_ZERO_COARSE_PIECES: usize = 7_703;
+
+    /// The class-0 pieces the fine copy holds.
+    const CLASS_ZERO_FINE_PIECES: usize = 18_914;
+
+    /// The class-0 pieces of both copies: the motorways and trunks of the two sections.
+    const CLASS_ZERO_PIECES: usize = CLASS_ZERO_COARSE_PIECES + CLASS_ZERO_FINE_PIECES;
+
     /// The worst frame the viewport and zoom sweep found, in triangles.
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
-    /// again rather than absorbed silently into the budget.
-    const WORST_FRAME_TRIANGLES: usize = 57_707;
+    /// again rather than absorbed silently into the budget. It is the fitted zoom that is
+    /// the busiest view now: the coarse copy draws the whole motorway and trunk network
+    /// there, where the old `ref` + length filter drew 13% of it.
+    const WORST_FRAME_TRIANGLES: usize = 59_516;
 
     /// The triangles the ten paths of one frame hold.
     fn layer_triangles(layers: &MapLayers) -> usize {
@@ -1044,11 +1145,12 @@ mod tests {
     /// plus the hover ring, with a full picture of [`MAX_VESSELS`] unknown vessels — the
     /// worst each vessel can cost. Nothing is set aside as an allowance.
     ///
-    /// The fit covers the viewport, so 1× no longer shows the whole map and the old
-    /// "fitted zoom draws everything" case is not the busiest one. The sweep below covers
-    /// the user's 1.56:1 pane, a wide one and a tall one, at the fitted zoom and at every
-    /// zoom the road detail switches at, over the map's middle, Dubai and the strait —
-    /// the shots the design's budget was first measured on.
+    /// The fit covers the viewport, so 1× does not show the whole map; the fitted zoom is
+    /// nonetheless the busiest view, because it is the one that draws the coarse copy of the
+    /// whole class-0 network. The sweep below covers the user's 1.56:1 pane, a wide one and a
+    /// tall one, at the fitted zoom and at every zoom the road detail switches at, over the
+    /// map's middle, Dubai and the strait — the shots the design's budget was first measured
+    /// on.
     #[test]
     fn the_visible_triangle_budget_is_under_the_frame_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
@@ -1105,15 +1207,51 @@ mod tests {
         );
     }
 
+    /// The road detail follows the camera, and the two copies of class 0 never overlap: the
+    /// fitted zoom draws the coarse copy and a closer one the fine copy, so a road is drawn
+    /// once and only once.
     #[test]
-    fn zooming_in_switches_to_the_detailed_road_filter() {
-        assert_eq!(model::road_filter(1.5), RoadFilter::EMin);
-        assert_eq!(model::road_filter(2.0), RoadFilter::EAll);
+    fn zooming_in_switches_from_the_coarse_copy_to_the_fine_one() {
+        assert_eq!(model::road_filter(1.5), RoadFilter::Coarse);
+        assert_eq!(model::road_filter(2.0), RoadFilter::Fine);
         assert_eq!(model::road_filter(3.0), RoadFilter::De);
+
+        let scene = scene::scene().expect("the checked-in asset parses");
+
+        // Every class-0 piece is drawn by exactly one of the two copies, and the fitted
+        // zoom draws all of the coarse one — no `ref` and no length test is left. That is
+        // the whole reason the coarse copy exists: 7,703 pieces are drawn at 1× out of
+        // the 26,617 class-0 pieces the asset stores, and the drawn part is a different
+        // geometry from the rest rather than a subset of it.
+        let (mut coarse, mut fine) = (0, 0);
+        for piece in &scene.roads.pieces {
+            if piece.flags & model::ROAD_PRIMARY != 0 {
+                continue;
+            }
+            let in_coarse = model::road_path(RoadFilter::Coarse, piece).is_some();
+            let in_fine = model::road_path(RoadFilter::Fine, piece).is_some();
+            assert_ne!(
+                in_coarse, in_fine,
+                "a class-0 piece is drawn by exactly one of the two copies",
+            );
+            if in_coarse {
+                coarse += 1;
+            } else {
+                fine += 1;
+            }
+        }
+        assert_eq!(
+            (coarse, fine),
+            (CLASS_ZERO_COARSE_PIECES, CLASS_ZERO_FINE_PIECES)
+        );
+        assert_eq!(
+            coarse + fine,
+            CLASS_ZERO_PIECES,
+            "the two copies are the whole of class 0",
+        );
 
         // And the layers follow the camera: the fitted zoom draws no primary road, four
         // times the zoom does.
-        let scene = scene::scene().expect("the checked-in asset parses");
         let at = |zoom: f32| {
             map_layers(
                 Some(scene),
@@ -1128,9 +1266,24 @@ mod tests {
                 &[],
             )
         };
+        let fitted = at(model::MIN_ZOOM);
         assert!(
-            at(1.5).roads[1].vertices.is_empty(),
-            "E_MIN keeps class 0 only",
+            !fitted.roads[0].vertices.is_empty(),
+            "the fitted zoom draws the coarse copy",
+        );
+        assert!(
+            fitted.roads[1].vertices.is_empty(),
+            "primary roads wait for the densest filter",
+        );
+        let detailed = at(model::ROAD_LOD_ZOOM[0]);
+        assert!(
+            !detailed.roads[0].vertices.is_empty(),
+            "the first threshold switches to the fine copy",
+        );
+        assert_ne!(
+            fitted.roads[0].vertices.len(),
+            detailed.roads[0].vertices.len(),
+            "the two zooms draw two different geometries, not the same one twice",
         );
         assert!(
             !at(3.0).roads[1].vertices.is_empty(),

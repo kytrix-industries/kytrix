@@ -3,6 +3,8 @@
 The OSM vector base map the Hormuz vessel widget draws under its vessels: the
 coastline, the land borders and the motorway/trunk/primary roads around the
 Strait of Hormuz, packed into one KHL2 file and embedded with `include_bytes!`.
+The motorways and trunks are packed twice — a fine copy and a coarse one — so
+the network can be drawn whole at the fitted zoom and in detail when zoomed in.
 
 `src/scene.rs` parses it as KHL2; it is the only asset here.
 
@@ -127,15 +129,15 @@ snapshot will change them.
 
 ## What was generated
 
-`hormuz_map.bin`: **1,417,288 bytes** (1.35 MiB), SHA256
-`3c68a81e436ac4afd1b583f1de49831659563359bb51d135ca0f1f76281aba05`.
+`hormuz_map.bin`: **1,678,896 bytes** (1.60 MiB), SHA256
+`3d4b900c72b8119ec172b5c934a8c622ac1e24ec85344c3c93471a4cf6d84aa3`.
 
 | section | kind | points | pieces | cells | bytes |
 |---|---|---|---|---|---|
 | land | 1 | 25,446 | 854 | 0 | 16 + 203,568 + 10,248 = 213,832 |
-| borders | 2 | 1,320 | 120 | 2,048 | 16 + 10,560 + 1,440 + 16,384 = 28,400 |
-| roads | 3 | 87,790 | 38,025 | 2,048 | 16 + 702,320 + 456,300 + 16,384 = 1,175,020 |
-| **file** | | | | | **36 + 213,832 + 28,400 + 1,175,020 = 1,417,288** |
+| borders | 2 | 1,630 | 201 | 2,048 | 16 + 13,040 + 2,412 + 16,384 = 31,852 |
+| roads | 3 | 108,505 | 45,728 | 2,048 | 16 + 868,040 + 548,736 + 16,384 = 1,433,176 |
+| **file** | | | | | **36 + 213,832 + 31,852 + 1,433,176 = 1,678,896** |
 
 **Land.** 2,009 shapes of the land shapefile intersect the map box; after the
 union, clip, `make_valid`, `simplify(0.001, preserve_topology=True)` and
@@ -147,30 +149,58 @@ cover the whole map box: their extent is 47.801998 / 21.443001 / 61.875 /
 30.042 (the `f32` values as stored), and there are no interior rings in this
 box.
 
-**Borders.** 1,214 `boundary=administrative` + `admin_level=2` ways in the three
-extracts; 258 of them carry `maritime=yes` and are rejected, 42 ways appear in
-two extracts and are merged. 75 pieces / 1,230 points intersect the box before
-the grid cut; after `simplify(0.0005, preserve_topology=False)` and the per-cell
-cut they are 120 pieces / 1,320 points. No border segment is shorter than 16 m.
+**Borders.** The ways are selected from the national relations, not from their
+own tags: 19 `boundary=administrative` + `admin_level=2` relations across the
+three extracts hold 5,184 distinct member ways, and 122 of the 1,034 border ways
+that reach the pack carry no `admin_level` of their own — the Saudi–UAE land
+border is made of ways like that, which is why selecting on the tag alone left
+it out. A member way is dropped when it is `maritime=yes` (262 ways) or
+`natural=coastline` (2); 42 ways appear in two extracts and are merged. The tag
+filter cannot see a sea boundary that carries neither tag, so the selection has
+a second, geometric rule: a candidate way is kept only when **at least one of
+its points lies on the drawn land** (the packed land, grown by 0.002° — about
+200 m, twice the land's own 111 m simplification, so a border point that is
+truly on the coast is not lost to the coastline's simplification). The test is
+"none of its points", never a share of them, so a border that also crosses
+water survives: the two untagged Saudi–Bahrain connector ways sit on the coast
+and stay, and the closest kept point anywhere (the Saudi–Qatar connector) reads
+57 m from the drawn coast. Two ways fail it in this snapshot — way 1211286901
+and way 1211287612, the UAE relation's "United Arab Emirates - Abu Dhabi" rings
+0.88 km and 1.49 km offshore of Abu Dhabi — and are dropped. 48 of the 122
+relation-only ways reach the box (46 after that drop): 119 pieces / 1,466 points
+intersect the box before the grid cut; after `simplify(0.0005,
+preserve_topology=False)` and the per-cell cut they are 201 pieces / 1,630
+points. 3 border segments are shorter than 16 m. The King Fahd Causeway is not
+affected by the mask: its national-border way is `maritime=yes` and was already
+excluded by the tag filter, while the causeway *road* is a class-0 trunk and is
+packed with the other roads.
 
 **Roads.** 127,660 distinct `highway=motorway|trunk|primary` ways in the three
 extracts (48,953 GCC + 57,105 Iran + 21,602 Pakistan; 36 further ways appear in
-two extracts and are merged). 35,611 pieces / 83,087 points intersect the box;
-after `simplify(0.0012, preserve_topology=False)` and the per-cell cut they are
-38,025 pieces / 87,790 points. 2,584 road segments are shorter than 16 m.
+two extracts and are merged). 35,611 fine pieces / 83,087 points intersect the
+box at `simplify(0.0012)`. The class-0 ways are then joined into the chains their
+shared endpoints allow (5,999 chains) and simplified again to ~300 m, which is
+what makes the coarse copy coarse: a two-node way cannot be simplified on its
+own, and most ways are two-node. That gives 5,992 coarse pieces / 17,304 points.
+After the per-cell cut the section holds 45,728 pieces / 108,505 points: 38,025
+fine (motorway, trunk, primary) and 7,703 coarse. 716 fine and 372 coarse
+segments are shorter than 16 m.
 
 **Road LODs**, recomputed from the packed section (triangles = 2 × (vertices −
 pieces)):
 
 | LOD | runtime filter | pieces | vertices | triangles |
 |---|---|---|---|---|
-| `E_MIN` | class 0, has `ref`, `length_m >= 1000` | 5,148 | 16,107 | 21,918 |
-| `E_ALL` | class 0 | 18,914 | 44,560 | 51,292 |
-| `DE` | all | 38,025 | 87,790 | 99,530 |
+| `COARSE` | zoom < 1.6: the coarse copy, every piece | 7,703 | 20,715 | 26,024 |
+| `FINE` | 1.6 ≤ zoom < 2.8: the fine copy of class 0, every piece | 18,914 | 44,560 | 51,292 |
+| `DE` | zoom ≥ 2.8: the fine copy plus the primary roads | 38,025 | 87,790 | 99,530 |
 
-`E_MIN` drops 32,877 pieces. It leaves 6,529 dangling endpoints on 4,182 pieces.
-If that reads badly at 1×, plan §8/R4 widens `E_MIN` to "has `ref` or `length_m
->= 10,000" — that is a runtime filter change, no rebuild needed.
+No `ref` and no `length_m` test remains at any level: the coarse copy drops
+nothing, which is what makes the network continuous at 1×, and the fine copy
+drops nothing either. The two copies are disjoint, so no road is ever drawn
+twice. The coarse copy leaves 629 dangling endpoints on 588 pieces, which are
+the places a motorway or trunk leaves the map box or ends at a junction the
+network does not continue.
 
 12 land segments are shorter than 16 m. Plan §4.1 makes that the trigger for
 lowering `TESSELLATION_TOLERANCE` from `5e-6` to `1e-6` and re-pinning the land
@@ -178,9 +208,9 @@ triangle count; it is the only build statistic the parser's tolerance depends
 on. The rings are 25,446 points in 854 closed rings; a tessellator that drops
 each ring's repeated closing point would emit `25,446 - 3 × 854 = 22,884`
 triangles, and lyon emits **22,876** at `1e-6` — the count `src/scene.rs` pins.
-The borders add 2,400 triangles. At 1× on the user's 1,404 × 900 pane one frame
-draws **55,350** triangles with a full picture of 1,000 vessels, against the
-75,000 ceiling. See "Runtime contract" below.
+The dashed borders add 2,460 triangles at the fitted zoom. At 1× on the user's
+1,404 × 900 pane one frame draws **59,516** triangles with a full picture of
+1,000 vessels, against the 75,000 ceiling. See "Runtime contract" below.
 
 ## Format: KHL2
 
@@ -213,17 +243,19 @@ offset  size  field
 
 - `start` is an index into the section's points; `len` is the point count (≤
   65,535, asserted by the build) and includes the closing point for a land ring.
-- `flags` bit 0 is "primary", bit 1 is "the way carries a `ref`"; land and
-  borders write 0. `length_m` is the piece's length in metres and is 0 for land
-  and borders. `reserved` is 0.
+- `flags` bit 0 is "primary", bit 1 is "the way carries a `ref`" (the fine copy
+  only; packed as data, no longer read by the runtime) and bit 2 is "a piece of
+  the coarse copy of class 0"; land and borders write 0. `length_m` is the
+  piece's length in metres and is 0 for land and borders; the runtime no longer
+  filters on it either. `reserved` is 0.
 - `cells` is the piece array cut into consecutive `(start, count)` ranges in
   row-major order. Every piece of a section with `cell_count > 0` belongs to
   exactly one cell, and the ranges partition the array. Land has no cell table:
   the parser tessellates the rings and bins the triangles by centroid at run
   time.
 - The cut runs in `f64` and the stored coordinate is the nearest `f32`, so a
-  piece can sit up to 1.9e-6° outside its cell box: 43 of the 120 border pieces
-  and 2,310 of the 38,025 road pieces do (worst 1.892e-6°). That is 0.2 m and
+  piece can sit up to 1.9e-6° outside its cell box: 76 of the 201 border pieces
+  and 3,668 of the 45,728 road pieces do (worst 1.892e-6°). That is 0.2 m and
   harmless — but a containment check needs a 2e-6° tolerance, not equality.
   There is no piece on a grid line, so no piece was packed into two cells.
 - The grid covers the bbox with 64 columns × 32 rows: cell `row * 64 + col`,
@@ -234,8 +266,10 @@ offset  size  field
 
 `length_m` is `length_degrees × 111,320 × cos(centroid latitude)` — **metres**, not
 the `111.32` (kilometres) the plan's prose prints; with 111.32 every piece would
-fall under the 1,000 m `E_MIN` threshold. It is recomputed **after** the per-cell
-cut, so the cell boundary shortens it.
+be a thousand times too short. It is recomputed **after** the per-cell cut, so
+the cell boundary shortens it. The runtime no longer filters on it: it is kept
+because it is the build's own measure of a piece and what the LOD statistics
+above are counted from.
 
 The header bbox is stored as `f32`, so reading it back gives
 `47.801998138427734 / 21.44300079345703 / 61.875 / 30.04199981689453`. Those are
@@ -252,19 +286,25 @@ literals needs an epsilon above 1.9e-6° (use 1e-5°).
 Mercator radians and tessellates the land; `src/paint.rs` builds the frame's ten
 paths from it. What the widget does with this asset:
 
-**Road LOD.** There is one D+E section; `model::road_filter` picks the level
-from the clamped zoom, so no rebuild is needed when a threshold moves:
+**Road LOD.** There is one section; `model::road_filter` picks the level from the
+clamped zoom, so no rebuild is needed when a threshold moves. The motorways and
+trunks are packed twice and the two copies are disjoint — the coarse one is drawn
+only below the first threshold and the fine one only at or above it, so no road
+is ever drawn twice. Neither level filters on a piece's tags or its length:
 
 | zoom | filter | rule | triangles in the asset |
 |---|---|---|---|
-| `< 1.6` | `EMin` | class 0 (motorway/trunk), has `ref`, `length_m >= 1000` | 21,918 |
-| `1.6 .. < 2.8` | `EAll` | class 0 | 51,292 |
-| `>= 2.8` | `De` | everything, cut to the viewport by the cell table | 99,530 |
+| `< 1.6` | `Coarse` | the coarse copy of class 0, every piece | 26,024 |
+| `1.6 .. < 2.8` | `Fine` | the fine copy of class 0, every piece | 51,292 |
+| `>= 2.8` | `De` | the fine copy plus the primary roads, cut to the viewport by the cell table | 99,530 |
 
 The two thresholds are a visual-density choice, not a performance limit. Roads
-and borders are screen-space ribbons: 1.6 px for a border, 1.2 px for a
-motorway or trunk, 1.0 px for a primary road; two triangles per segment, and no
-casing.
+and borders are screen-space ribbons: 1.6 px for a border, 1.4 px for a motorway
+or trunk, 1.2 px for a primary road; two triangles per segment, and no casing. A
+border is dashed as well as violet — 5 px on and 3 px off, walked along the
+piece in `paint.rs` — so the three kinds of line are told apart by pattern as
+well as by hue: a dashed violet border, a solid rose motorway and a solid ochre
+primary road.
 
 **Land culling.** The rings tessellate into 22,876 triangles at `1e-6`. A frame
 visits the cells its viewport touches plus one cell of margin, which covers
@@ -298,37 +338,46 @@ the hover ring, on the user's 1,404 × 900 pane:
 
 | view | triangles |
 |---|---|
-| fitted 1×, `EMin` | 55,350 |
-| 1.6× over the map's middle, `EAll` (the worst view found) | 57,707 |
-| 4× over Dubai, `De` | 44,276 |
+| fitted 1×, `Coarse` (the worst view found) | 59,516 |
+| 1.6× over the map's middle, `Fine` | 57,967 |
+| 4× over Dubai, `De` | 44,498 |
 
 The ceiling is 75,000 (`paint.rs`'s `FRAME_TRIANGLE_BUDGET`): 8.58 ms of fixed
-frame cost plus 107 ns per triangle still fits a 16.65 ms frame.
+frame cost plus 107 ns per triangle still fits a 16.65 ms frame. The fitted zoom
+is the busiest view because it is the one that draws the coarse copy of the whole
+28,883 km class-0 network, where the old `ref` + length filter drew 13% of it.
 `the_visible_triangle_budget_is_under_the_frame_budget` sweeps a 1.56:1, a wide
 and a tall pane at 1×, 1.6×, 2.8× and 4× over the map's middle, Dubai and the
-strait, and pins the worst count (57,707). They are model values from that
+strait, and pins the worst count (59,516). They are model values from that
 budget, not frame times measured on a machine.
 
 **Theme.** Five map roles, all opaque and all read from the theme every frame by
 `MapColors::resolve`: `chart.map_ocean`, `chart.map_land`, `chart.map_border`,
-`chart.map_road` (motorway/trunk) and `chart.map_road_minor` (primary). They
-follow the OSM Carto transport layer: paper land `#f2efe9`, water `#aad3df`
-deepened to keep the coastline floor, the admin purple `#a875c9` for borders,
-the motorway rose `#e892a2` toward its casing `#dc2a67`, and the primary amber
-`#fcd6a4` toward `#a06b00`. Their floors are in
-`roles.rs::contrast_floors`: border on land and on ocean 3:1, road on land 3:1
-and on ocean 2:1 (a bridge or causeway over the water), minor road on land
-1.5:1, land on ocean 1.5:1 (1.69 light, 1.68 dark), and the sea on
-`surface.sunken` 1.5:1 (1.66 light, 1.71 dark). The three strokes carry a
-further ten percent margin over their floors, and all five roles are opaque. No
-map colour is hard-coded in the widget.
+`chart.map_road` (motorway/trunk) and `chart.map_road_minor` (primary). They are
+the OSM Carto transport layer's own colours: paper land `#f2efe9`, water
+`#aad3df`, the admin violet `#a875c9` for borders, the motorway casing `#dc2a67`
+and the primary casing `#a06b00`. Their floors are in
+`roles.rs::contrast_floors`: every stroke reads 2.5:1 on the land and 2.0:1 on
+the sea (a border crosses the water, a bridge or causeway carries a road over
+it). Measured, light / dark: border 3.02 / 2.16 and 3.56 / 6.00, motorway 4.00 /
+2.86 and 3.56 / 6.00, primary 3.98 / 2.84 and 3.24 / 5.45. All five roles are
+opaque. No map colour is hard-coded in the widget.
 
-The paper land is 1.01:1 on the light chart face and 2.88:1 on the dark one: it
-is the OSM page colour, and an OSM land cannot also clear a 1.5:1 step from the
-face (a land that did would be a mid-tone beige, not paper). That is why the
-face floor moved to the sea in the OSM palette, and why the map covers the pane
-rather than fitting inside it — with a cover fit there is no band of chart face
+The two fills are the OSM pair and read 1.40:1 against each other in the light
+appearance (1.68 dark): below the 1.5:1 the design asked for, which is why both
+fill floors are pinned at 1.35:1 — the alternatives were a deeper sea, which is
+not the OSM colour, or a land that is not paper. The paper land is 1.01:1 on the
+light chart face and 2.88:1 on the dark one, so the sea is the fill held against
+the face (1.38 light, 1.71 dark). That is also why the map covers the pane
+rather than fitting inside it: with a cover fit there is no band of chart face
 inside the map's own rect for the land to dissolve into.
+
+The land-on-face separation was **deliberately dropped** — the palette's owner
+chose the OSM paper land over a visible map-to-pane step, so the paper land
+stays at 1.01:1 against `surface.sunken` with no hairline border, no darker land
+and no moved face. The measurement is kept here because it is the cost of the
+choice: anything that clears 1.5:1 there is no longer the OSM colour, and the
+fill floors do not cover it (`roles.rs` records the same in its table comment).
 
 **Attribution.** The widget draws `© OpenStreetMap contributors`
 (`© OpenStreetMap 贡献者` in Chinese) in the map's bottom-left corner, in

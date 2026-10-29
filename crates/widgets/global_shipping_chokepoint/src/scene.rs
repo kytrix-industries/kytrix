@@ -68,8 +68,9 @@ const MIN_RING_POINTS: usize = 3;
 /// edge 1.862e-6° off, so the tolerance has to clear that.
 const BBOX_EPSILON: f32 = 1e-5;
 
-/// The flags a road piece may carry: bit 0 primary, bit 1 the way carries a `ref`.
-const ROAD_FLAGS: u8 = 0b11;
+/// The flags a road piece may carry: bit 0 primary, bit 1 the way carries a `ref`,
+/// bit 2 a piece of the coarse copy of class 0.
+const ROAD_FLAGS: u8 = 0b111;
 
 /// The flattening tolerance handed to lyon, in Mercator radians.
 ///
@@ -192,7 +193,8 @@ pub(super) struct Piece {
     /// The format stores this as a `u16`, which is the build's 65,535-point bound: a
     /// piece can never declare more points than the field can hold.
     pub len: u16,
-    /// Bit 0 primary, bit 1 the way carries a `ref`; zero on borders.
+    /// Bit 0 primary, bit 1 the way carries a `ref`, bit 2 a piece of the coarse copy
+    /// of the motorways and trunks; zero on borders.
     pub flags: u8,
     /// The piece's length in metres, as the build measured it; zero on borders.
     pub length_m: u32,
@@ -458,7 +460,7 @@ impl SectionKind {
 enum LineKind {
     /// Land borders: no flags and no length.
     Borders,
-    /// Roads: the two flag bits, and a length in metres.
+    /// Roads: the three flag bits, and a length in metres.
     Roads,
 }
 
@@ -679,13 +681,13 @@ mod tests {
     /// The land rings, as the checked-in asset declares them.
     const LAND_PIECES: u32 = 854;
     /// The border points, as the checked-in asset declares them.
-    const BORDER_POINTS: u32 = 1_320;
+    const BORDER_POINTS: u32 = 1_630;
     /// The border pieces, as the checked-in asset declares them.
-    const BORDER_PIECES: u32 = 120;
+    const BORDER_PIECES: u32 = 201;
     /// The road points, as the checked-in asset declares them.
-    const ROAD_POINTS: u32 = 87_790;
+    const ROAD_POINTS: u32 = 108_505;
     /// The road pieces, as the checked-in asset declares them.
-    const ROAD_PIECES: u32 = 38_025;
+    const ROAD_PIECES: u32 = 45_728;
     /// The cells each line layer's table holds.
     const CELLS: u32 = GRID_COLS * GRID_ROWS;
 
@@ -1027,21 +1029,26 @@ mod tests {
             assert_eq!(piece.length_m, 0, "a border carries no length");
         }
 
-        let mut combinations = [false; 4];
+        // Every flag bit the format defines is set and cleared somewhere in the asset:
+        // bit 0 by the primary roads, bit 1 by the motorways and trunks that carry a `ref`
+        // (packed as data, no longer read by the runtime) and bit 2 by the coarse copy.
+        let mut bits = [[false; 2]; 3];
         let mut longest = 0;
         for piece in &roads.pieces {
-            combinations[usize::from(piece.flags)] = true;
+            for (bit, entry) in bits.iter_mut().enumerate() {
+                entry[usize::from(piece.flags >> bit & 1)] = true;
+            }
             longest = longest.max(piece.length_m);
         }
-        assert_eq!(combinations, [true; 4], "both road bits are used");
+        assert_eq!(bits, [[true; 2]; 3], "every road bit is set and cleared");
         assert!(
             longest >= 30_000,
             "length_m is metres, not kilometres: the longest piece is {longest}",
         );
 
         // The three runtime LODs the design filters to, counted straight from the
-        // packed flags and lengths. A piece of `n` points is `n - 1` segments and each
-        // segment is two triangles, so a LOD is `2 × (points - pieces)` triangles.
+        // packed flags. A piece of `n` points is `n - 1` segments and each segment is
+        // two triangles, so a LOD is `2 × (points - pieces)`.
         fn lod(pieces: &[Piece], keep: fn(&Piece) -> bool) -> (usize, u32, usize) {
             let mut count = 0;
             let mut points = 0;
@@ -1053,21 +1060,19 @@ mod tests {
         }
 
         assert_eq!(
-            lod(&roads.pieces, |piece| piece.flags & 1 == 0
-                && piece.flags & 2 != 0
-                && piece.length_m >= 1_000),
-            (5_148, 16_107, 21_918),
-            "E_MIN: class 0, with a ref, at least 1 km",
+            lod(&roads.pieces, |piece| piece.flags & 0b100 != 0),
+            (7_703, 20_715, 26_024),
+            "COARSE: the coarse copy of class 0, every piece",
         );
         assert_eq!(
-            lod(&roads.pieces, |piece| piece.flags & 1 == 0),
+            lod(&roads.pieces, |piece| piece.flags & 0b101 == 0),
             (18_914, 44_560, 51_292),
-            "E_ALL: class 0",
+            "FINE: the fine copy of class 0, every piece",
         );
         assert_eq!(
-            lod(&roads.pieces, |_| true),
+            lod(&roads.pieces, |piece| piece.flags & 0b100 == 0),
             (38_025, 87_790, 99_530),
-            "DE: every piece",
+            "DE: the fine copy plus the primary roads",
         );
     }
 
@@ -1631,11 +1636,11 @@ mod tests {
         );
         assert_eq!(Scene::parse(&bytes).err(), Some(SceneError::BadPiece));
 
-        // A road carries only the two flag bits the format defines.
+        // A road carries only the three flag bits the format defines.
         let roads = line_section(
             SectionKind::Roads,
             &[[50.0, 25.0], [51.0, 25.0]],
-            &[(0, 2, 4, 1_000)],
+            &[(0, 2, 8, 1_000)],
             one_cell(1),
         );
         let bytes = asset(

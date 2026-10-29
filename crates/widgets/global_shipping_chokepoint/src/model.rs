@@ -57,44 +57,45 @@ pub(super) const GRID_COLS: u32 = 64;
 /// The culling grid's rows, south to north.
 pub(super) const GRID_ROWS: u32 = 32;
 
-/// The zooms the road detail switches at, as `[E_ALL, DE]`.
+/// The zooms the road detail switches at, as `[COARSE, DE]`.
 ///
 /// They are a visual-density choice rather than a performance boundary: the whole D+E
 /// network at twice the fitted zoom still costs a few milliseconds, but below these
 /// thresholds it is a haze of parallel lines rather than a road network.
 pub(super) const ROAD_LOD_ZOOM: [f32; 2] = [1.6, 2.8];
 
-/// The shortest road piece the fitted zoom keeps, in metres.
-///
-/// At the fitted zoom a pixel is about a kilometre, so a shorter piece is a smudge
-/// rather than a road. The length is the build's, measured after the cell cut.
-const ROAD_MIN_LENGTH_M: u32 = 1_000;
-
 /// The flag bit a road piece sets when the way is a primary road.
 ///
 /// Bit 0 of the build's flags; a motorway or a trunk leaves it clear.
 pub(super) const ROAD_PRIMARY: u8 = 1 << 0;
 
-/// The flag bit a road piece sets when its way carries a `ref`.
-pub(super) const ROAD_REF: u8 = 1 << 1;
+/// The flag bit a road piece sets when it belongs to the coarse copy of class 0.
+///
+/// Bit 2 of the build's flags. The coarse copy is a second, independently simplified
+/// geometry of the motorways and trunks: it exists so the network can be drawn whole at
+/// the fitted zoom, where the fine copy's per-piece detail is below a pixel.
+pub(super) const ROAD_COARSE: u8 = 1 << 2;
 
 /// How much of the road network one camera zoom draws.
+///
+/// The two copies of class 0 are mutually exclusive — a frame draws one of them and
+/// never both — so no road is drawn twice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RoadFilter {
-    /// Motorways and trunks that carry a `ref` and are at least a kilometre long.
-    EMin,
-    /// Every motorway and trunk.
-    EAll,
-    /// Every piece: motorways, trunks and primary roads.
+    /// The coarse copy of the motorways and trunks: every piece the asset stores.
+    Coarse,
+    /// The fine copy of the motorways and trunks: every piece the asset stores.
+    Fine,
+    /// The fine copy and the primary roads.
     De,
 }
 
 /// The filter a camera at `zoom` draws with.
 pub(super) fn road_filter(zoom: f32) -> RoadFilter {
     if zoom < ROAD_LOD_ZOOM[0] {
-        RoadFilter::EMin
+        RoadFilter::Coarse
     } else if zoom < ROAD_LOD_ZOOM[1] {
-        RoadFilter::EAll
+        RoadFilter::Fine
     } else {
         RoadFilter::De
     }
@@ -102,19 +103,22 @@ pub(super) fn road_filter(zoom: f32) -> RoadFilter {
 
 /// The path one road piece is drawn in under `filter`, or `None` when the filter drops it.
 ///
-/// Path 0 holds motorways and trunks and path 1 the primary roads. Both flag bits are
-/// decoded here, and the filter and the painter's split are the same answer, so a piece
-/// cannot be drawn in a path the filter had already dropped.
+/// Path 0 holds motorways and trunks and path 1 the primary roads. The flags are decoded
+/// here and nowhere else, and the filter and the painter's split are the same answer, so
+/// a piece cannot be drawn in a path the filter had already dropped. The copy bit is what
+/// keeps the two geometries apart: a coarse piece is drawn only below the first threshold
+/// and a fine one only at or above it, which is why neither is ever drawn twice.
 pub(super) fn road_path(filter: RoadFilter, piece: &Piece) -> Option<usize> {
+    if piece.flags & ROAD_COARSE != 0 {
+        return (filter == RoadFilter::Coarse).then_some(0);
+    }
+    if filter == RoadFilter::Coarse {
+        return None;
+    }
     if piece.flags & ROAD_PRIMARY != 0 {
         return (filter == RoadFilter::De).then_some(1);
     }
-    match filter {
-        RoadFilter::EMin => {
-            (piece.flags & ROAD_REF != 0 && piece.length_m >= ROAD_MIN_LENGTH_M).then_some(0)
-        }
-        RoadFilter::EAll | RoadFilter::De => Some(0),
-    }
+    Some(0)
 }
 
 /// The most vessels one picture holds.
@@ -2899,16 +2903,16 @@ mod tests {
     fn the_road_filter_switches_at_the_two_thresholds() {
         assert_eq!(ROAD_LOD_ZOOM, [1.6, 2.8]);
 
-        assert_eq!(road_filter(MIN_ZOOM), RoadFilter::EMin);
-        assert_eq!(road_filter(1.5), RoadFilter::EMin);
-        assert_eq!(road_filter(1.599_999), RoadFilter::EMin);
+        assert_eq!(road_filter(MIN_ZOOM), RoadFilter::Coarse);
+        assert_eq!(road_filter(1.5), RoadFilter::Coarse);
+        assert_eq!(road_filter(1.599_999), RoadFilter::Coarse);
         assert_eq!(
             road_filter(ROAD_LOD_ZOOM[0]),
-            RoadFilter::EAll,
-            "the threshold itself belongs to the denser class",
+            RoadFilter::Fine,
+            "the threshold itself belongs to the fine copy",
         );
-        assert_eq!(road_filter(2.0), RoadFilter::EAll);
-        assert_eq!(road_filter(2.799_999), RoadFilter::EAll);
+        assert_eq!(road_filter(2.0), RoadFilter::Fine);
+        assert_eq!(road_filter(2.799_999), RoadFilter::Fine);
         assert_eq!(
             road_filter(ROAD_LOD_ZOOM[1]),
             RoadFilter::De,
@@ -2920,61 +2924,59 @@ mod tests {
 
     #[test]
     fn each_road_filter_keeps_the_pieces_it_names() {
-        let motorway_with_ref = road_piece(ROAD_REF, 2_000);
-        let motorway_without_ref = road_piece(0, 2_000);
-        let short_motorway_with_ref = road_piece(ROAD_REF, ROAD_MIN_LENGTH_M - 1);
-        let primary_with_ref = road_piece(ROAD_PRIMARY | ROAD_REF, 5_000);
-        let primary_without_ref = road_piece(ROAD_PRIMARY, 0);
+        // The fine copy of class 0: a motorway with a `ref`, one without it, and a
+        // short one. Nothing about a piece's tags or its length may drop it.
+        let motorway = road_piece(0, 40);
+        let motorway_with_ref = road_piece(1 << 1, 40);
+        let primary = road_piece(ROAD_PRIMARY, 900);
+        // The coarse copy of the same road, and what a coarse primary would be if the
+        // build ever wrote one.
+        let coarse = road_piece(ROAD_COARSE, 0);
+        let coarse_with_ref = road_piece(ROAD_COARSE | 1 << 1, 0);
+        let coarse_primary = road_piece(ROAD_COARSE | ROAD_PRIMARY, 0);
 
-        assert_eq!(road_path(RoadFilter::EMin, &motorway_with_ref), Some(0));
+        assert_eq!(road_path(RoadFilter::Coarse, &coarse), Some(0));
+        assert_eq!(road_path(RoadFilter::Coarse, &coarse_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::EMin, &road_piece(ROAD_REF, ROAD_MIN_LENGTH_M)),
+            road_path(RoadFilter::Coarse, &coarse_primary),
             Some(0),
-            "a kilometre is long enough",
+            "the coarse copy is class 0 whether or not a bit says otherwise",
         );
         assert_eq!(
-            road_path(RoadFilter::EMin, &motorway_without_ref),
+            road_path(RoadFilter::Coarse, &motorway),
             None,
-            "E_MIN keeps only the ways that carry a ref",
+            "the fine copy is not drawn below the first threshold",
         );
-        assert_eq!(
-            road_path(RoadFilter::EMin, &short_motorway_with_ref),
-            None,
-            "and only the pieces a kilometre long",
-        );
-        assert_eq!(
-            road_path(RoadFilter::EMin, &primary_with_ref),
-            None,
-            "E_MIN is class 0 only",
-        );
+        assert_eq!(road_path(RoadFilter::Coarse, &primary), None);
 
-        assert_eq!(road_path(RoadFilter::EAll, &motorway_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::EAll, &motorway_without_ref),
+            road_path(RoadFilter::Fine, &motorway),
             Some(0),
-            "E_ALL drops the ref and length tests",
+            "the fine copy keeps a piece with no ref and no length",
         );
+        assert_eq!(road_path(RoadFilter::Fine, &motorway_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::EAll, &short_motorway_with_ref),
-            Some(0)
-        );
-        assert_eq!(
-            road_path(RoadFilter::EAll, &primary_with_ref),
+            road_path(RoadFilter::Fine, &primary),
             None,
-            "E_ALL is class 0 only",
+            "the fine filter is class 0 only",
+        );
+        assert_eq!(
+            road_path(RoadFilter::Fine, &coarse),
+            None,
+            "the coarse copy is not drawn at or above the first threshold",
         );
 
-        assert_eq!(road_path(RoadFilter::De, &motorway_without_ref), Some(0));
-        assert_eq!(road_path(RoadFilter::De, &short_motorway_with_ref), Some(0));
+        assert_eq!(road_path(RoadFilter::De, &motorway), Some(0));
+        assert_eq!(road_path(RoadFilter::De, &motorway_with_ref), Some(0));
         assert_eq!(
-            road_path(RoadFilter::De, &primary_with_ref),
+            road_path(RoadFilter::De, &primary),
             Some(1),
             "D+E draws primary roads in the second path",
         );
         assert_eq!(
-            road_path(RoadFilter::De, &primary_without_ref),
-            Some(1),
-            "with neither a length nor a ref test",
+            road_path(RoadFilter::De, &coarse),
+            None,
+            "and neither copy is drawn on top of the other",
         );
     }
 }
