@@ -92,16 +92,22 @@ const STALE_TIMER_SLACK: Duration = Duration::from_millis(100);
 
 /// The width and height of the box each label is centred in, in pixels.
 ///
-/// Wider than any name this map draws at the small size, and one line tall — tall enough
-/// for the country's 14 px step — so the text sits at the centre of the box and the box at
-/// the anchor.
-const LABEL_BOX_WIDTH: f32 = 240.0;
-const LABEL_BOX_HEIGHT: f32 = 22.0;
+/// Wide enough for the longest name in either locale at the country's 21 px step, and one
+/// line tall at that step, so the text sits at the centre of the box and the box at the
+/// anchor.
+const LABEL_BOX_WIDTH: f32 = 320.0;
+const LABEL_BOX_HEIGHT: f32 = 30.0;
+
+/// The size a country's name is drawn at, in pixels.
+///
+/// Half again the `text_sm` step the cities used to share with it: at the fitted zoom a
+/// country is a region rather than a place, and the extra size is what says so.
+const COUNTRY_LABEL_TEXT_SIZE: f32 = 21.0;
 
 /// The size a city's name is drawn at, in pixels.
 ///
-/// One pixel under the country's `text_sm` step and one over the water's `text_xs`, so the
-/// three kinds of word read in the order a paper atlas prints them in.
+/// A step over the water's `text_xs` and well under the country's, so the three kinds of
+/// word read in the order a paper atlas prints them in.
 const CITY_LABEL_TEXT_SIZE: f32 = 13.0;
 
 /// How opaque a lane is drawn over the sea.
@@ -818,7 +824,7 @@ impl GlobalShippingChokepointWidget {
                 let [x, y] = label.at;
                 let text = match label.kind {
                     LabelKind::Country => div()
-                        .text_sm()
+                        .text_size(px(COUNTRY_LABEL_TEXT_SIZE))
                         .font_weight(FontWeight::BOLD)
                         .italic()
                         .text_color(colors.text)

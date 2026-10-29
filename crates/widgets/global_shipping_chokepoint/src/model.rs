@@ -900,12 +900,19 @@ pub(super) const LABEL_MIN_SEPARATION_PX: f32 = 72.0;
 /// How far inside the canvas a label's anchor has to sit for the name to fit, in pixels.
 ///
 /// A label is centred on its anchor, so half of it hangs to each side: an anchor nearer the
-/// canvas edge than half the name's width would have that half cut off by the pane. The
-/// widest name this map draws is `UNITED ARAB EMIRATES`, 141 px at the small size in the
-/// longer of the two shipped locales (`en`); half of it, rounded up, is this margin. A
-/// label that cannot fit is not drawn — a name cut in half at the pane's edge reads as a
-/// defect, while a name that appears when the map is panned away from the edge does not.
+/// canvas edge than half the name's width would have that half cut off by the pane. A city's
+/// or a sea's name is short enough that half the longest of them is this margin; a country's
+/// is the long one, and it has its own ([`COUNTRY_LABEL_EDGE_MARGIN_PX`]). A label that
+/// cannot fit is not drawn — a name cut in half at the pane's edge reads as a defect, while
+/// a name that appears when the map is panned away from the edge does not.
 pub(super) const LABEL_EDGE_MARGIN_PX: f32 = 80.0;
+
+/// The margin a country's name needs: half of the widest of them, `UNITED ARAB EMIRATES`.
+///
+/// 141 px at the 12 px size, so about 247 px at the country's 21 px step (a little more in
+/// bold italic); half of that, rounded up. Keeping it out of [`LABEL_EDGE_MARGIN_PX`] is
+/// what lets the country grow without costing the fitted view any of its cities.
+const COUNTRY_LABEL_EDGE_MARGIN_PX: f32 = 130.0;
 
 /// The labels one frame draws, in priority order.
 ///
@@ -927,10 +934,12 @@ pub(super) fn place_labels(projection: Projection) -> Vec<PlacedLabel> {
         for label in labels {
             let at = projection.screen(project(label.at[0], label.at[1]));
             let [width, height] = projection.viewport;
-            if at[0] < LABEL_EDGE_MARGIN_PX
-                || at[0] > width - LABEL_EDGE_MARGIN_PX
-                || at[1] < LABEL_EDGE_MARGIN_PX
-                || at[1] > height - LABEL_EDGE_MARGIN_PX
+            let margin = if kind == LabelKind::Country {
+                COUNTRY_LABEL_EDGE_MARGIN_PX
+            } else {
+                LABEL_EDGE_MARGIN_PX
+            };
+            if at[0] < margin || at[0] > width - margin || at[1] < margin || at[1] > height - margin
             {
                 continue;
             }

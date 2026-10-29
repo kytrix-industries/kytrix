@@ -514,20 +514,22 @@ wrote.
 elements over the canvas rather than glyphs in it, so they are read from the
 catalogue, shaped by the platform font and drawn at the display's scale. Each one
 is centred on its anchor: GPUI lays an absolute child out by its top-left corner
-and has no transform to shift it, so the text sits in a fixed 240 × 22 px box
-placed at `(x − 120, y − 11)`. The widest name either locale ships is
-`UNITED ARAB EMIRATES`, about 165 px at the country's `text_sm` step, so the box
+and has no transform to shift it, so the text sits in a fixed 320 × 30 px box
+placed at `(x − 160, y − 15)`. The widest name either locale ships is
+`UNITED ARAB EMIRATES`, about 247 px at the country's 21 px step, so the box
 holds every one of them without wrapping. The three kinds are told apart by size
 and weight as well as by colour, in the order a paper atlas prints them: a
-country is `text_sm` (14 px), bold and italic, a city is 13 px, and a sea is the
-12 px `text_xs` italic muted step. Cities are named from the fitted zoom
+country is 21 px, bold and italic, a city is 13 px, and a sea is the 12 px
+`text_xs` italic muted step. Cities are named from the fitted zoom
 (`CITY_LABEL_ZOOM`), and
 `model::place_labels` fixes what a frame draws: countries, then seas, then cities,
 each list in its declared order; a later anchor within 72 px of one already placed
 is skipped, so the strait's crowded cities do not print into one pile at 1×
 (Qeshm and Ras Al Khaimah are the two that go on a 1,404 × 900 pane), and a name
-whose anchor is nearer the canvas edge than 80 px — half the widest name — is
-dropped rather than cut in half. Zooming in separates the crowded ones again.
+whose anchor is nearer the canvas edge than half its width — 130 px for a country,
+80 px for a city or a sea — is dropped rather than cut in half. The country's
+margin is its own so that growing it costs the fitted view none of its cities.
+Zooming in separates the crowded ones again.
 
 **Budget.** Two frames on the user's 1,404 × 900 pane: the empty fitted frame the
 plan's §8 target is about, and the typical frame with 1,000 vessels whose ship
