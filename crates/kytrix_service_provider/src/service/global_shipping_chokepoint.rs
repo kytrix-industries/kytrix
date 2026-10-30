@@ -134,9 +134,9 @@ impl GlobalShippingChokepointUpdate {
 
 /// The complete picture the session holds for one area.
 ///
-/// `sequence == 0` means the API has not established a baseline yet; that is "no state",
-/// not "the strait is empty". The distinction is carried by the snapshot's `timestamp`
-/// being zero, exactly as on the wire.
+/// A snapshot whose `timestamp` is zero means the API has not established a baseline yet;
+/// that is "no state", not "the strait is empty". The wire uses the timestamp as that
+/// sentinel, and the sequence is zero with it.
 #[derive(Debug, Default)]
 pub(crate) struct GlobalShippingChokepointState {
     epoch: u64,

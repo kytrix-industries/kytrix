@@ -566,6 +566,11 @@ impl ServiceSessionActor {
                         && !self.subscribers.is_empty();
                     let keep_connection =
                         matches!(error, KytrixServiceError::Server(_)) || reuse_socket;
+                    if reuse_socket {
+                        // The server accepted the previous set and the socket stays open,
+                        // but this subscriber gave it up: flush the smaller set.
+                        self.subscriptions_dirty = true;
+                    }
                     let _ = respond_to.send(Err(error));
                     if keep_connection {
                         self.websocket = Some(websocket);
@@ -741,6 +746,11 @@ impl ServiceSessionActor {
                         let reuse_socket = matches!(&error, KytrixServiceError::RouteChanged)
                             && route_change_reuses_socket
                             && !self.subscribers.is_empty();
+                        if reuse_socket {
+                            // Same as the disconnected path: the accepted remote set is
+                            // now too large and the socket is kept, so flush it.
+                            self.subscriptions_dirty = true;
+                        }
                         let _ = respond_to.send(Err(error.clone()));
                         return if matches!(error, KytrixServiceError::Server(_)) || reuse_socket {
                             Ok(())
@@ -1124,12 +1134,6 @@ impl ServiceSessionActor {
                 removed_topics.push(topic);
             }
         }
-        if !removed_topics.is_empty() {
-            // Every caller that leaves the remote topic set smaller must flush it. Doing
-            // it here covers the error paths that remove a subscriber directly, not only
-            // the sweep that goes through `queue_removed_topics`.
-            self.subscriptions_dirty = true;
-        }
         removed_topics
     }
 
@@ -1332,7 +1336,10 @@ impl ServiceSessionActor {
     }
 
     pub(super) fn queue_removed_topics(&mut self, id: u64) {
-        self.remove_subscriber(id);
+        let topics = self.remove_subscriber(id);
+        if !topics.is_empty() {
+            self.subscriptions_dirty = true;
+        }
     }
 
     pub(super) async fn flush_subscriptions(
@@ -2387,7 +2394,8 @@ mod tests {
                 .contains_key(&GlobalShippingChokepointArea::Hormuz),
             "the pane still reading the area keeps its picture",
         );
-        assert_eq!(actor.remove_subscriber(2), vec![topic]);
+        actor.queue_removed_topics(2);
+        assert!(!actor.topics.contains_key(&topic));
         assert!(
             !actor
                 .global_shipping_chokepoint_states
@@ -2562,6 +2570,168 @@ mod tests {
     }
 
     #[test]
+    fn a_second_pane_joining_before_the_snapshot_should_receive_it_too() {
+        use crate::service::global_shipping_chokepoint::{
+            GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
+            GlobalShippingChokepointUpdate,
+        };
+
+        let (_commands, receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
+        let topic = ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz);
+        let keyframe = GlobalShippingChokepointUpdate {
+            epoch: 7,
+            keyframe: true,
+            sequence: 3,
+            base: 0,
+            ships: Vec::new(),
+            positions: vec![GlobalShippingChokepointPosition {
+                mmsi: 42,
+                latitude: 26_500_000,
+                longitude: 56_300_000,
+                sog: 100,
+                cog: 900,
+                heading: 90,
+                nav_status: 0,
+                last_update: 1_700_000_000_000,
+            }],
+            removed: Vec::new(),
+            timestamp: 1_700_000_000_000,
+        };
+        let (first_publisher, mut first_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        assert_eq!(
+            actor.add_subscriber_inner(
+                1,
+                vec![topic.clone()],
+                SubscriberSink::GlobalShippingChokepoint(first_publisher),
+                None,
+                NetworkRouteGeneration::default(),
+            ),
+            vec![topic.clone()]
+        );
+        let (second_publisher, mut second_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        assert!(
+            actor
+                .add_subscriber_inner(
+                    2,
+                    vec![topic.clone()],
+                    SubscriberSink::GlobalShippingChokepoint(second_publisher),
+                    None,
+                    NetworkRouteGeneration::default(),
+                )
+                .is_empty(),
+            "the topic is already followed"
+        );
+        assert!(first_events.try_recv_for_test().is_err());
+        assert!(second_events.try_recv_for_test().is_err());
+
+        actor.publish_topic(
+            topic,
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(
+                keyframe.clone(),
+            )),
+        );
+        assert_eq!(first_events.try_recv_for_test(), Ok(keyframe.clone()));
+        assert_eq!(second_events.try_recv_for_test(), Ok(keyframe));
+    }
+
+    #[test]
+    fn a_shipping_gap_should_not_fail_another_topic() {
+        use crate::service::global_shipping_chokepoint::{
+            GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
+            GlobalShippingChokepointUpdate,
+        };
+
+        let (_commands, receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let mut actor = ServiceSessionActor::new(receiver, cancellation, Arc::new(Notify::new()));
+        let topic = ServiceTopic::GlobalShippingChokepoint(GlobalShippingChokepointArea::Hormuz);
+        let keyframe = GlobalShippingChokepointUpdate {
+            epoch: 7,
+            keyframe: true,
+            sequence: 3,
+            base: 0,
+            ships: Vec::new(),
+            positions: vec![GlobalShippingChokepointPosition {
+                mmsi: 42,
+                latitude: 26_500_000,
+                longitude: 56_300_000,
+                sog: 100,
+                cog: 900,
+                heading: 90,
+                nav_status: 0,
+                last_update: 1_700_000_000_000,
+            }],
+            removed: Vec::new(),
+            timestamp: 1_700_000_000_000,
+        };
+        let (shipping_publisher, mut shipping_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        let (news_publisher, mut news_events) =
+            network::transport::subscription::subscription_channel(4).unwrap();
+        actor.add_subscriber_inner(
+            1,
+            vec![topic.clone()],
+            SubscriberSink::GlobalShippingChokepoint(shipping_publisher),
+            None,
+            NetworkRouteGeneration::default(),
+        );
+        actor.add_subscriber_inner(
+            2,
+            vec![ServiceTopic::News],
+            SubscriberSink::News(news_publisher),
+            None,
+            NetworkRouteGeneration::default(),
+        );
+        actor.publish_topic(
+            topic.clone(),
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(keyframe)),
+        );
+        assert!(shipping_events.try_recv_for_test().is_ok());
+        let news = |content: &str| {
+            KytrixServiceEvent::News(NewsEvent {
+                timestamp: 1,
+                title: None,
+                content: content.into(),
+                category: NewsKind::General,
+            })
+        };
+        actor.publish_topic(ServiceTopic::News, Ok(news("first")));
+        assert!(news_events.try_recv_for_test().is_ok());
+
+        actor.publish_topic(
+            topic,
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(
+                GlobalShippingChokepointUpdate {
+                    epoch: 7,
+                    keyframe: false,
+                    sequence: 9,
+                    base: 8,
+                    ships: Vec::new(),
+                    positions: Vec::new(),
+                    removed: Vec::new(),
+                    timestamp: 1_700_000_060_000,
+                },
+            )),
+        );
+        assert!(matches!(
+            shipping_events.status(),
+            network::transport::subscription::SubscriptionStatus::Failed(
+                TransportError::ResyncFailed
+            )
+        ));
+        assert!(!matches!(
+            news_events.status(),
+            network::transport::subscription::SubscriptionStatus::Failed(_)
+        ));
+        actor.publish_topic(ServiceTopic::News, Ok(news("second")));
+        assert!(news_events.try_recv_for_test().is_ok());
+    }
+
+    #[test]
     fn a_gap_should_fail_every_shipping_subscriber_and_drop_the_topic() {
         use crate::service::global_shipping_chokepoint::{
             GlobalShippingChokepointArea, GlobalShippingChokepointPosition,
@@ -2602,7 +2772,9 @@ mod tests {
         );
         actor.publish_topic(
             topic.clone(),
-            Ok(KytrixServiceEvent::GlobalShippingChokepoint(keyframe)),
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(
+                keyframe.clone(),
+            )),
         );
         assert!(events.try_recv_for_test().is_ok());
 
@@ -2629,6 +2801,7 @@ mod tests {
             )
         );
         assert!(!actor.topics.contains_key(&topic));
+        assert!(!actor.remote_topics().contains(&topic));
         assert!(actor.subscriptions_dirty);
         assert!(
             !actor
@@ -2637,7 +2810,7 @@ mod tests {
         );
 
         // A retry re-adds the topic; the server answers with a fresh snapshot.
-        let (retry_publisher, _retry_events) =
+        let (retry_publisher, mut retry_events) =
             network::transport::subscription::subscription_channel(4).unwrap();
         assert_eq!(
             actor.add_subscriber_inner(
@@ -2647,8 +2820,14 @@ mod tests {
                 None,
                 NetworkRouteGeneration::default(),
             ),
-            vec![topic]
+            vec![topic.clone()]
         );
+        assert!(actor.remote_topics().contains(&topic));
+        actor.publish_topic(
+            topic,
+            Ok(KytrixServiceEvent::GlobalShippingChokepoint(keyframe)),
+        );
+        assert!(retry_events.try_recv_for_test().is_ok());
     }
 
     #[test]
