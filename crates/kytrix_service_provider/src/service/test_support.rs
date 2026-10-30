@@ -350,6 +350,7 @@ pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingC
             eta_day: 15,
             eta_hour: 12,
             eta_minute: 30,
+            static_updated_at: 1_700_000_000_000,
         }],
         positions: vec![proto_types::GlobalShippingChokepointPosition {
             mmsi: 636_000_001,

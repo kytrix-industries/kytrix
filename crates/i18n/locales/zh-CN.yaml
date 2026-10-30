@@ -662,6 +662,7 @@ widget:
       ship_name: 船名
       ship_type: 船型
       speed: 对地航速
+      static_updated_at: 静态数据更新时间
       updated: 服务端接收时间
     label:
       city:

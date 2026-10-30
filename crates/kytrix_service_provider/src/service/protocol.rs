@@ -1125,6 +1125,7 @@ mod tests {
                 eta_day: 15,
                 eta_hour: 12,
                 eta_minute: 30,
+                static_updated_at: 1_700_000_000_000,
             }]
         );
         assert_eq!(

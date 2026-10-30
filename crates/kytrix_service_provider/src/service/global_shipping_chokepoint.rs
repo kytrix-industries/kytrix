@@ -52,6 +52,9 @@ pub struct GlobalShippingChokepointShip {
     pub eta_day: u32,
     pub eta_hour: u32,
     pub eta_minute: u32,
+    /// The source's last static report, in Unix milliseconds; `0` means unknown. It is
+    /// the static record's own time, not the position's `last_update`.
+    pub static_updated_at: i64,
 }
 
 /// The high-frequency part of one vessel.
@@ -102,6 +105,7 @@ impl GlobalShippingChokepointUpdate {
                     eta_day: vessel.eta_day,
                     eta_hour: vessel.eta_hour,
                     eta_minute: vessel.eta_minute,
+                    static_updated_at: vessel.static_updated_at,
                 })
                 .collect(),
             positions: delta

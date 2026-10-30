@@ -121,12 +121,12 @@ const CARD_MARGIN: f32 = 12.0;
 
 /// The height the hover card is kept inside the pane by, before it has been measured.
 ///
-/// Fifteen rows of text at the small size, the fourteen gaps between them, and the card's
+/// Sixteen rows of text at the small size, the fifteen gaps between them, and the card's
 /// padding and border. A row is a 0.75 rem line box at the default 1.618 line height, so
 /// about 20 px; the 10 px of slack keeps the estimate an upper bound, which is the safe
 /// direction: an underestimate would let the last rows fall outside the pane, while an
 /// overestimate only lifts the card a little.
-const CARD_HEIGHT: f32 = 15.0 * 20.0 + 14.0 * 4.0 + 2.0 * 4.0 + 10.0;
+const CARD_HEIGHT: f32 = 16.0 * 20.0 + 15.0 * 4.0 + 2.0 * 4.0 + 10.0;
 
 /// The page the map's ODbL credit opens.
 ///
@@ -158,8 +158,8 @@ const LEGEND_KEYS: [&str; 4] = [
     "widget.global_shipping_chokepoint.legend.other",
 ];
 
-/// The fifteen labels of the hover card, in the order the design lists the items in.
-const HOVER_KEYS: [&str; 15] = [
+/// The sixteen labels of the hover card, in the order the design lists the items in.
+const HOVER_KEYS: [&str; 16] = [
     "widget.global_shipping_chokepoint.hover.ship_name",
     "widget.global_shipping_chokepoint.hover.mmsi",
     "widget.global_shipping_chokepoint.hover.imo",
@@ -175,6 +175,7 @@ const HOVER_KEYS: [&str; 15] = [
     "widget.global_shipping_chokepoint.hover.heading",
     "widget.global_shipping_chokepoint.hover.nav_status",
     "widget.global_shipping_chokepoint.hover.updated",
+    "widget.global_shipping_chokepoint.hover.static_updated_at",
 ];
 
 /// The catalogue keys naming the fifteen navigation statuses, by their AIS index.
@@ -1048,6 +1049,7 @@ impl GlobalShippingChokepointWidget {
                 |status| t!(cx, NAV_STATUS_KEYS[usize::from(status.index())]),
             ),
             text(details.updated.as_ref()),
+            text(details.static_updated_at.as_ref()),
         ];
         let rows = HOVER_KEYS
             .iter()
@@ -1433,6 +1435,7 @@ mod tests {
             eta_day: 14,
             eta_hour: 9,
             eta_minute: 5,
+            static_updated_at: 1_700_000_000_000,
         }
     }
 
@@ -2261,6 +2264,13 @@ mod tests {
             assert!(report_update(&pane, frame, cx));
         });
         let window = map_window(cx, &pane);
+        // Sixteen rows of card are taller than the default test window's map, and a
+        // card that cannot fit at all is a different case from the one under test:
+        // grow the pane until the placement has somewhere to keep the card.
+        window.simulate_resize(size(px(600.0), px(560.0)));
+        window.run_until_parked();
+        repaint(window);
+        repaint(window);
 
         let at = window.update(|_, cx| {
             let pane = pane.read(cx);

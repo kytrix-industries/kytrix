@@ -1217,7 +1217,7 @@ impl Vessel {
     }
 }
 
-/// The fifteen values a hover card reads, one field per catalogue key.
+/// The sixteen values a hover card reads, one field per catalogue key.
 ///
 /// The card's labels and its "unavailable" text belong to the view: a field is `None`
 /// when the report does not carry the value, either because its sentinel says so or
@@ -1258,6 +1258,10 @@ pub(super) struct VesselDetails {
     /// 15. The server's receipt time of the position, in the pane's data zone, or
     ///     `None` when the report carries zero.
     pub updated: Option<SmolStr>,
+    /// 16. The source's static report time, in the pane's data zone, or `None` when
+    ///     the report carries zero. It is the static record's own time, not the
+    ///     position's receipt time.
+    pub static_updated_at: Option<SmolStr>,
 }
 
 impl VesselDetails {
@@ -1315,22 +1319,24 @@ impl VesselDetails {
             heading: (position.heading != HEADING_UNAVAILABLE)
                 .then(|| format_smolstr!("{}°", position.heading)),
             nav_status: nav_status_of(position.nav_status),
-            updated: format_last_update(position.last_update, zone),
+            updated: format_timestamp(position.last_update, zone),
+            static_updated_at: ship.and_then(|ship| format_timestamp(ship.static_updated_at, zone)),
         }
     }
 }
 
-/// The receipt time as an absolute instant in `zone`, or `None` for no time at all.
+/// One wire millisecond timestamp as an absolute instant in `zone`, or `None` for no
+/// time at all.
 ///
 /// An instant the calendar cannot hold — the far end of the wire's range moved past
 /// the last day a date can express — reads as unavailable rather than as a date that
 /// is not the one the service meant.
-fn format_last_update(last_update: i64, zone: UtcOffset) -> Option<SmolStr> {
-    if last_update == 0 {
+fn format_timestamp(timestamp: i64, zone: UtcOffset) -> Option<SmolStr> {
+    if timestamp == 0 {
         return None;
     }
 
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(last_update) * 1_000_000)
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()?
         .checked_to_offset(zone)
         .map(|time| {
@@ -1625,6 +1631,7 @@ mod tests {
             eta_day: 14,
             eta_hour: 9,
             eta_minute: 5,
+            static_updated_at: 1_700_000_000_000,
         }
     }
 
@@ -1647,6 +1654,7 @@ mod tests {
             eta_day: 0,
             eta_hour: 0,
             eta_minute: 0,
+            static_updated_at: 0,
         }
     }
 
@@ -2347,6 +2355,11 @@ mod tests {
         assert_eq!(details.heading.as_deref(), Some("87°"));
         assert_eq!(details.nav_status.map(NavStatus::index), Some(1));
         assert_eq!(details.updated.as_deref(), Some("2023-11-14 22:13:20"));
+        assert_eq!(
+            details.static_updated_at.as_deref(),
+            Some("2023-11-14 22:13:20"),
+            "the static record carries the same instant as the receipt time here",
+        );
     }
 
     #[test]
@@ -2378,6 +2391,10 @@ mod tests {
         assert!(details.heading.is_none(), "heading 511");
         assert!(details.nav_status.is_none(), "navigation status 15");
         assert!(details.updated.is_none(), "receipt time zero");
+        assert!(
+            details.static_updated_at.is_none(),
+            "static report time zero",
+        );
         assert_eq!(details.mmsi.as_str(), "7");
     }
 
@@ -2429,6 +2446,10 @@ mod tests {
         assert_eq!(details.heading.as_deref(), Some("87°"));
         assert_eq!(details.nav_status.map(NavStatus::index), Some(1));
         assert_eq!(details.updated.as_deref(), Some("2023-11-14 22:13:20"));
+        assert!(
+            details.static_updated_at.is_none(),
+            "a position carries no static record time",
+        );
 
         assert!(
             store.display(10, UtcOffset::UTC).is_none(),

@@ -662,6 +662,7 @@ widget:
       ship_name: Vessel name
       ship_type: Vessel type
       speed: Speed over ground
+      static_updated_at: Static data updated
       updated: Server receipt time
     label:
       city:
