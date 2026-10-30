@@ -44,8 +44,6 @@ use widget::{
     stream::StreamPublisher,
 };
 
-use super::model::MAX_VESSELS;
-
 /// The account whose AIS picture a stream carries, and the area it covers.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct GlobalShippingChokepointScope {
@@ -285,7 +283,6 @@ async fn run_stream<S>(
             () = publisher.cancelled() => break,
             received = subscription.recv() => match received {
                 Ok(update) => {
-                    let update = clamp_to_capacity(update);
                     if publisher
                         .publish_latest(AisStreamMessage::Update(update))
                         .is_err()
@@ -300,21 +297,6 @@ async fn run_stream<S>(
             }
         }
     }
-}
-
-/// Trims a push to the number of vessels the map may hold.
-///
-/// The server already selects at most [`MAX_VESSELS`] vessels by distance, so this is
-/// the defence against a malformed push rather than the way the set is chosen. Only the
-/// positions are trimmed; the ships are left alone, because they describe vessels the
-/// picture may still hold. Which vessels the picture holds is never decided here: deltas
-/// are passed through rather than evicted against a running set the client would then
-/// have picked itself.
-fn clamp_to_capacity(mut update: GlobalShippingChokepointUpdate) -> GlobalShippingChokepointUpdate {
-    if update.positions.len() > MAX_VESSELS {
-        update.positions.truncate(MAX_VESSELS);
-    }
-    update
 }
 
 /// Publishes the failure a stream ended with, and holds the stream until it is replaced.
@@ -787,20 +769,6 @@ mod tests {
             error,
             AisStreamError::Service(KytrixServiceError::Closed)
         ));
-    }
-
-    #[test]
-    fn a_push_over_capacity_should_be_clipped_to_the_vessel_limit() {
-        let over = clamp_to_capacity(update(1, (0..=MAX_VESSELS as u32).map(position).collect()));
-        assert_eq!(over.positions.len(), MAX_VESSELS);
-
-        let at_limit =
-            clamp_to_capacity(update(2, (0..MAX_VESSELS as u32).map(position).collect()));
-        assert_eq!(
-            at_limit.positions.len(),
-            MAX_VESSELS,
-            "a push that fits is passed through untouched"
-        );
     }
 
     #[tokio::test]

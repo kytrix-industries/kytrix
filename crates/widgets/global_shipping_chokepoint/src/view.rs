@@ -68,8 +68,8 @@ use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, Camera, LabelKind, LabelSize, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, Projection,
-        STALE_AFTER, ShipClass, Vessel, VesselDetails, VesselStore, colour_for, place_labels,
+        self, Camera, LabelKind, LabelSize, MAX_ZOOM, MIN_ZOOM, Projection, STALE_AFTER, ShipClass,
+        Vessel, VesselDetails, VesselStore, colour_for, place_labels,
     },
     paint::paint_map,
     scene::{self, Scene, SceneError},
@@ -483,7 +483,7 @@ impl GlobalShippingChokepointWidget {
             frame: Rc::new(MapFrame::default()),
             vessels: VesselStore::new(),
             painted: Arc::default(),
-            hit_points: Vec::with_capacity(MAX_VESSELS),
+            hit_points: Vec::new(),
             hovered: None,
             pointer: point(px(0.0), px(0.0)),
             stale_epoch: 0,

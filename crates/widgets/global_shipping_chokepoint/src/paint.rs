@@ -30,8 +30,8 @@ const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 ///
 /// Six rather than eight: the dot is 2.5 px in radius, so a segment spans about
 /// 2.6 px of its circumference — still round at the fitted zoom — and a full picture
-/// of [`MAX_VESSELS`](crate::model::MAX_VESSELS) dots costs 6,000 triangles instead of
-/// 8,000. That saving is part of what took the worst frame from 39,438 to 31,815; see
+/// of the whole map's ~2,516 dots costs 15,096 triangles instead of 20,128. That saving
+/// is part of what keeps the worst frame under the 75,000-triangle budget; see
 /// [`WORST_FRAME_TRIANGLES`].
 const ROUND_SEGMENTS: usize = 6;
 /// How many segments the hover ring is drawn with.
@@ -608,7 +608,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{MAX_VESSELS, MAX_ZOOM, ShipClass},
+        model::{MAX_ZOOM, ShipClass},
         scene,
         view::CLASSES,
     };
@@ -1115,20 +1115,22 @@ mod tests {
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
     /// again rather than absorbed silently into the budget. The busiest view is the
     /// **2,048 px wide pane at 1.8648× over 25.879N, 52.799E**: land 10,721 (the 0.002°
-    /// tier), borders 850, fine roads 13,916, lanes 280, the full vessel picture 6,000 and
-    /// the ring 48 — **31,815 in all, 4,815 over the plan's 27,000**.
+    /// tier), borders 850, fine roads 13,916, lanes 280, the full vessel picture 15,096 and
+    /// the ring 48 — **40,911 in all, 13,911 over the plan's 27,000**. The vessel layer
+    /// grew from 6,000 to 15,096 when the picture stopped being capped at 1,000 vessels.
     ///
     /// The frame sits just below the 0.004° middle copy's 371.1 m/px switch: at 369 m/px
     /// the fine road copy is drawn (13,916), while the middle copy is the next band up.
     /// It is the road LOD cliff, not a land threshold. The sweep's 7 × 5 centre grid plus
     /// two 9 × 9 refinement rounds found it; the review's 2,048 × 1× frame at 27.057N is
-    /// 31,149, 666 lower. The wide 1,600 pane's fitted 1× frame is 29,668 (coarse 11,652
-    /// over the 0.003° land 9,642). The next lever is a finer middle road copy (0.003°) for
-    /// the 278–371 m/px band, or a lower 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
+    /// 38,041, 2,870 lower. The wide 1,600 pane's 1.177× coarse-side frame is 34,242
+    /// (coarse 8,840 over the 0.003° land 8,924 plus the 15,096-vessel picture). The next
+    /// lever is a finer middle road copy (0.003°) for the 278–371 m/px band, or a lower
+    /// 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
     /// over the 1.2 px budget, so it is not acceptable. A fifth land tier at 725–911 m/px
     /// would not touch this frame. Neither is in P4's scope; the frame is recorded, not
     /// claimed.
-    const WORST_FRAME_TRIANGLES: usize = 31_815;
+    const WORST_FRAME_TRIANGLES: usize = 40_911;
 
     /// The triangles the fitted frame with no vessels draws on the design's pane.
     ///
@@ -1138,31 +1140,31 @@ mod tests {
     /// (21,000 triangles / 65,536 vertices = 62,403).
     const FITTED_FRAME_TRIANGLES: usize = 20_801;
 
-    /// The triangles the fitted frame draws with the typical picture: 1,000 vessels
+    /// The triangles the fitted frame draws with the typical picture: 2,516 vessels
     /// whose ship record has arrived, one marker triangle each.
     ///
     /// Pinned separately from [`FITTED_FRAME_TRIANGLES`] because the empty frame's 21,000
-    /// target does not cover it: the vessel layer adds 1,000 triangles, and the frame's
-    /// gate is the 2^16 instance-buffer step instead (see
-    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It is 21,801 triangles / 65,403
-    /// vertices — 44 triangles and 133 vertices under the step, the margin the border
-    /// dash widening bought.
-    const FITTED_FRAME_TYPICAL_TRIANGLES: usize = 21_801;
+    /// target does not cover it: the vessel layer adds 2,516 triangles, and the frame's
+    /// gate is the instance-buffer step instead (see
+    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It is 23,317 triangles / 69,951
+    /// vertices, so the step moves from 2^16 to 2^17.
+    const FITTED_FRAME_TYPICAL_TRIANGLES: usize = 23_317;
 
-    /// The 2^16 instance-buffer step in triangles: `65,536 / 3` rounded down.
+    /// The 2^17 instance-buffer step in triangles: `131,072 / 3` rounded down.
     ///
-    /// The typical fitted frame is allowed to sit in the 2^16 step — that is the memory
-    /// cliff the plan's §1.1 is about — while the empty frame keeps the stricter §8
-    /// 21,000 target.
-    const FITTED_FRAME_TYPICAL_TARGET_TRIANGLES: usize = 65_536 / 3;
+    /// The typical fitted frame is allowed to sit in the 2^17 step — the picture holds
+    /// the whole map's 2,516 vessels, which no longer fits the 2^16 step — while the
+    /// empty frame keeps the stricter §8 21,000 target.
+    const FITTED_FRAME_TYPICAL_TARGET_TRIANGLES: usize = 131_072 / 3;
 
     /// The triangles the 2.8× design frame draws with a full picture.
     ///
     /// Pinned separately because it is the frame the plan's worst-case analysis names.
     /// With the 0.002° land tier it draws the 0.002° coast (7,122) and the fine road copy
-    /// (8,740): 7,122 + 784 + 8,740 + 380 + 6,000 + 48 = 23,074, inside the 27,000
-    /// target. It was 30,135 in P2.
-    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 23_074;
+    /// (8,740): 7,122 + 784 + 8,740 + 380 + 15,096 + 48 = 32,170, over the 27,000 target
+    /// by 5,170 because the whole map's 2,516 vessels are the full picture now. It was
+    /// 23,074 when the picture was capped at 1,000 vessels.
+    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 32_170;
 
     /// One frame's triangles, layer by layer.
     ///
@@ -1271,20 +1273,28 @@ mod tests {
         path.vertices.len() / 3
     }
 
-    /// The service's bound on one picture, with every vessel at its most expensive.
+    /// The whole map's vessel count, measured against the source's full response.
+    const PICTURE_VESSELS: usize = 2_516;
+    /// The grid the picture's vessels are spread over: 64 × 40 = 2,560 cells, enough
+    /// for every vessel to be inside the viewport at once.
+    const PICTURE_COLUMNS: usize = 64;
+    const PICTURE_ROWS: usize = 40;
+
+    /// One picture, with every vessel at its most expensive.
     ///
     /// A vessel whose ship record has not arrived is a disc of [`ROUND_SEGMENTS`]
-    /// triangles; a vessel with one is a single marker triangle. Spreading `MAX_VESSELS`
-    /// unknown vessels over the viewport therefore counts the most the vessel layer can
-    /// ever draw — no allowance, and no assumption about how many records have arrived.
+    /// triangles; a vessel with one is a single marker triangle. Spreading
+    /// `PICTURE_VESSELS` unknown vessels over the viewport therefore counts the most the
+    /// vessel layer can ever draw — no allowance, and no assumption about how many
+    /// records have arrived.
     fn a_full_picture(projection: Projection) -> Vec<Vessel> {
-        (0..MAX_VESSELS)
+        (0..PICTURE_VESSELS)
             .map(|index| {
-                let column = (index % 40) as f32;
-                let row = (index / 40) as f32;
+                let column = (index % PICTURE_COLUMNS) as f32;
+                let row = (index / PICTURE_COLUMNS) as f32;
                 let canvas = [
-                    projection.viewport[0] * (column + 0.5) / 40.0,
-                    projection.viewport[1] * (row + 0.5) / 25.0,
+                    projection.viewport[0] * (column + 0.5) / PICTURE_COLUMNS as f32,
+                    projection.viewport[1] * (row + 0.5) / PICTURE_ROWS as f32,
                 ];
                 Vessel {
                     mmsi: index as u32 + 1,
@@ -1298,18 +1308,18 @@ mod tests {
             .collect()
     }
 
-    /// The service's bound on one picture, with every vessel's ship record arrived.
+    /// One picture, with every vessel's ship record arrived.
     ///
     /// A vessel with a ship record is one marker triangle, which is the typical frame;
     /// [`a_full_picture`] is the worst one (a six-segment dot per vessel).
     fn a_typical_picture(projection: Projection) -> Vec<Vessel> {
-        (0..MAX_VESSELS)
+        (0..PICTURE_VESSELS)
             .map(|index| {
-                let column = (index % 40) as f32;
-                let row = (index / 40) as f32;
+                let column = (index % PICTURE_COLUMNS) as f32;
+                let row = (index / PICTURE_COLUMNS) as f32;
                 let canvas = [
-                    projection.viewport[0] * (column + 0.5) / 40.0,
-                    projection.viewport[1] * (row + 0.5) / 25.0,
+                    projection.viewport[0] * (column + 0.5) / PICTURE_COLUMNS as f32,
+                    projection.viewport[1] * (row + 0.5) / PICTURE_ROWS as f32,
                 ];
                 Vessel {
                     mmsi: index as u32 + 1,
@@ -1416,7 +1426,7 @@ mod tests {
     /// The picture has to fit a 60 Hz frame in the worst view the camera can be left in.
     ///
     /// The totals are the triangles the frame really draws: every path of [`MapLayers`]
-    /// plus the hover ring, with a full picture of [`MAX_VESSELS`] unknown vessels — the
+    /// plus the hover ring, with a full picture of [`PICTURE_VESSELS`] unknown vessels — the
     /// worst each vessel can cost. Nothing is set aside as an allowance.
     ///
     /// The fit covers the viewport, so 1× does not show the whole map. The busiest view is
@@ -1478,7 +1488,7 @@ mod tests {
         };
         println!("1× fitted frame, no vessels: {}", fitted.describe());
         println!(
-            "1× fitted frame, 1,000 single-triangle vessels: {}",
+            "1× fitted frame, {PICTURE_VESSELS} single-triangle vessels: {}",
             typical.describe()
         );
         println!("2.8× design frame, full picture: {}", reference.describe());
@@ -1550,7 +1560,7 @@ mod tests {
             let layers = map_layers(Some(scene), projection, origin, &vessels);
             assert_eq!(
                 layers.ships.unknown.vertices.len() / 3,
-                MAX_VESSELS * ROUND_SEGMENTS,
+                PICTURE_VESSELS * ROUND_SEGMENTS,
                 "the full picture is in frame, so the worst case is the one counted",
             );
             let triangles = LayerTriangles::of(
@@ -1739,9 +1749,9 @@ mod tests {
     /// The fitted frame is inside the plan's triangle and vertex budgets, both pictures.
     ///
     /// The empty frame is the one the plan's §8 **≤ 21,000 triangles / ≤ 65,536
-    /// vertices** target is about. The typical frame has 1,000 vessels whose ship record
-    /// has arrived — one marker triangle each — and its gate is the 2^16
-    /// instance-buffer step: **≤ 21,845 triangles / ≤ 65,536 vertices**. Both are pinned
+    /// vertices** target is about. The typical frame has 2,516 vessels whose ship record
+    /// has arrived — one marker triangle each — and its gate is the 2^17
+    /// instance-buffer step: **≤ 43,690 triangles / ≤ 131,072 vertices**. Both are pinned
     /// exactly as change detectors and asserted against their targets.
     #[test]
     fn the_fitted_frame_is_inside_the_plan_budget() {
@@ -1789,15 +1799,16 @@ mod tests {
         );
         assert!(
             typical.total() <= FITTED_FRAME_TYPICAL_TARGET_TRIANGLES,
-            "the typical fitted frame draws {}, over the 2^16 step's \
+            "the typical fitted frame draws {}, over the 2^17 step's \
              {FITTED_FRAME_TYPICAL_TARGET_TRIANGLES} triangles",
             typical.describe(),
         );
         assert!(
-            typical.total() * 3 <= FITTED_FRAME_TARGET_VERTICES,
-            "the typical fitted frame emits {} vertices, over the 2^16 step's \
-             {FITTED_FRAME_TARGET_VERTICES}",
+            typical.total() * 3 <= FITTED_FRAME_TYPICAL_TARGET_TRIANGLES * 3,
+            "the typical fitted frame emits {} vertices, over the 2^17 step's \
+             {}",
             typical.total() * 3,
+            FITTED_FRAME_TYPICAL_TARGET_TRIANGLES * 3,
         );
     }
 

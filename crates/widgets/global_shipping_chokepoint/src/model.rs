@@ -320,13 +320,6 @@ pub(super) fn road_path(filter: RoadFilter, piece: &Piece, metres_per_pixel: f32
     Some(0)
 }
 
-/// The most vessels one picture holds.
-///
-/// The service picks which vessels those are, by distance; this is only the bound a
-/// keyframe is checked against, because a client that kept every vessel it ever saw
-/// would accumulate a set the service no longer holds.
-pub(super) const MAX_VESSELS: usize = 1_000;
-
 /// The furthest out the camera goes: the fitted scale, which covers the viewport.
 pub(super) const MIN_ZOOM: f32 = 1.0;
 /// The furthest in the camera goes.
@@ -1492,8 +1485,8 @@ impl VesselStore {
     /// An empty picture, waiting for its first keyframe.
     pub fn new() -> Self {
         Self {
-            ships: AHashMap::with_capacity(MAX_VESSELS),
-            positions: AHashMap::with_capacity(MAX_VESSELS),
+            ships: AHashMap::new(),
+            positions: AHashMap::new(),
             epoch: 0,
             applied: 0,
             gap: false,
@@ -1522,16 +1515,10 @@ impl VesselStore {
     /// 4. Staleness is derived from the gap by [`is_stale`](Self::is_stale); it is
     ///    never written by a timer.
     ///
-    /// `removed` deletes each listed MMSI from both tables, and a keyframe is checked
-    /// against [`MAX_VESSELS`]. Deltas are not trimmed: which vessels the picture
-    /// holds is the service's decision, and a client that trimmed its own set would
-    /// drift from the set the server is tracking.
+    /// `removed` deletes each listed MMSI from both tables. No vessel count is applied
+    /// here: the picture holds every vessel the service sends.
     pub fn apply(&mut self, update: &GlobalShippingChokepointUpdate) {
         if update.keyframe {
-            assert!(
-                update.positions.len() <= MAX_VESSELS,
-                "a keyframe holds at most {MAX_VESSELS} positions",
-            );
             self.ships.clear();
             self.positions.clear();
             self.epoch = update.epoch;
@@ -2375,29 +2362,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a keyframe holds at most 1000 positions")]
-    fn a_keyframe_over_capacity_should_assert() {
-        let positions = (0..=MAX_VESSELS as u32).map(position).collect();
-        VesselStore::new().apply(&keyframe(7, 1, positions));
-    }
+    fn a_keyframe_with_the_whole_map_is_accepted() {
+        const COUNT: u32 = 2_516;
 
-    #[test]
-    fn a_delta_should_not_trim_the_picture_to_the_capacity() {
         let mut store = VesselStore::new();
-        let frame = keyframe(7, 1, (0..MAX_VESSELS as u32).map(position).collect());
-        store.apply(&frame);
-        assert_eq!(store.vessel_count(), MAX_VESSELS);
-
-        // Which vessels are held is the service's decision; a client that trimmed its
-        // own set would drift from the set the server is tracking. Only a keyframe is
-        // checked against the bound.
-        store.apply(&delta(7, 1, 2, vec![position(MAX_VESSELS as u32)]));
-
+        store.apply(&keyframe(7, 1, (0..COUNT).map(position).collect()));
+        assert_eq!(store.vessel_count(), usize::try_from(COUNT).unwrap());
         assert!(!store.is_stale());
+
+        // A delta is laid over the picture, not clipped against a capacity.
+        store.apply(&delta(7, 1, 2, vec![position(COUNT)]));
         assert_eq!(
             store.vessel_count(),
-            MAX_VESSELS + 1,
-            "an applied delta is laid over the picture, not clipped to capacity",
+            usize::try_from(COUNT).unwrap() + 1,
+            "an applied delta is laid over the picture",
         );
     }
 
