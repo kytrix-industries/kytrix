@@ -343,6 +343,12 @@ pub(super) struct MapColors {
     text: Hsla,
     /// Secondary text: the legend's title, the card's labels.
     muted: Hsla,
+    /// The legend's entries the filter draws nothing for.
+    ///
+    /// A legend entry is listed as long as the picture holds that type, so narrowing the
+    /// filter leaves the other entries in place; they go to the disabled step rather than
+    /// disappear, which is what says "this type is here, you are just not looking at it".
+    disabled: Hsla,
     /// The ring a place name is drawn with.
     ///
     /// A name is drawn straight on the picture, and the vessel markers under it are the
@@ -367,6 +373,7 @@ impl MapColors {
             border: roles.line.border.hsla,
             text: roles.fg.default.hsla,
             muted: roles.fg.muted.hsla,
+            disabled: roles.fg.disabled.hsla,
             halo: roles.surface.overlay.hsla,
         }
     }
@@ -1136,6 +1143,19 @@ impl GlobalShippingChokepointWidget {
         }
     }
 
+    /// The colours the legend writes one type's dot and its name in.
+    ///
+    /// A type the filter draws keeps its own colour and the foreground; a type the filter
+    /// has been narrowed away from goes to the disabled step, dot and name alike, so the
+    /// legend still says the picture holds it while showing that nothing of it is drawn.
+    fn legend_ink(&self, ship_type: ShipType, colors: MapColors) -> (Hsla, Hsla) {
+        if self.filter.matches(ship_type) {
+            (colors.ships[ship_type.index()], colors.text)
+        } else {
+            (colors.disabled, colors.disabled)
+        }
+    }
+
     /// The legend in the pane's bottom-right corner: the ship types the picture holds and
     /// the count of what the filter draws.
     ///
@@ -1154,6 +1174,7 @@ impl GlobalShippingChokepointWidget {
             .present_types
             .iter()
             .map(|ship_type| {
+                let (dot, ink) = self.legend_ink(*ship_type, colors);
                 div()
                     .debug_selector({
                         let key = ship_type.key();
@@ -1162,18 +1183,8 @@ impl GlobalShippingChokepointWidget {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(8.0))
-                            .rounded_sm()
-                            .bg(colors.ships[ship_type.index()]),
-                    )
-                    .child(
-                        div()
-                            .text_color(colors.text)
-                            .child(t!(cx, ship_type.label_key())),
-                    )
+                    .child(div().flex_none().size(px(8.0)).rounded_sm().bg(dot))
+                    .child(div().text_color(ink).child(t!(cx, ship_type.label_key())))
             })
             .collect::<Vec<_>>();
 
@@ -2228,6 +2239,55 @@ mod tests {
                 "the legend counts the whole picture while the filter is all",
             );
         });
+    }
+
+    /// Narrowing the filter leaves the legend's other entries where they are but takes
+    /// their colour away: the type being drawn keeps its own dot and the foreground, and
+    /// every other type goes to the disabled step, dot and name alike.
+    #[gpui_kit::test]
+    fn the_legend_should_grey_the_types_the_filter_hides(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1), position(2)]);
+            frame.ships = vec![ship_of_type(1, 80), ship_of_type(2, 70)];
+            assert!(report_update(&pane, frame, cx));
+        });
+
+        let colors = MapColors::resolve(&Theme::of(Appearance::Light));
+        let window = header_window(cx, &pane);
+        window.update(|_, cx| {
+            let pane = pane.read(cx);
+            for ship_type in [ShipType::Tanker, ShipType::Cargo] {
+                assert_eq!(
+                    pane.legend_ink(ship_type, colors),
+                    (colors.ships[ship_type.index()], colors.text),
+                    "{ship_type:?} keeps its own colour while nothing is filtered out",
+                );
+            }
+        });
+
+        press(window, "TEST_CHOKEPOINT_SHIP_TYPE");
+        press(window, "TEST_MENU_ITEM_tanker");
+
+        window.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(
+                pane.legend_ink(ShipType::Tanker, colors),
+                (colors.ships[ShipType::Tanker.index()], colors.text),
+                "the type the filter draws keeps its dot and its name's colour",
+            );
+            assert_eq!(
+                pane.legend_ink(ShipType::Cargo, colors),
+                (colors.disabled, colors.disabled),
+                "a type the filter hides goes grey, dot and name alike",
+            );
+        });
+        assert!(
+            window
+                .debug_bounds("TEST_CHOKEPOINT_LEGEND_cargo")
+                .is_some(),
+            "a greyed entry is still listed: the picture holds that type",
+        );
     }
 
     /// A vessel the filter hides is not under the pointer any more: its card goes with it.
