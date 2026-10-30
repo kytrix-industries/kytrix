@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui_kit::{
     AnyElement, App, ElementId, Empty, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
-    Styled, Transformation, Window,
+    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Transformation, Window,
     base::{Align, Disableable, Easing, Placement, Transition, transition},
     div,
     prelude::FluentBuilder,
@@ -33,7 +33,6 @@ pub struct Select {
     disabled: bool,
     placement: Placement,
     align: Align,
-    menu_max_h: Option<Pixels>,
 }
 
 impl Select {
@@ -52,7 +51,6 @@ impl Select {
             disabled: false,
             placement: Placement::Bottom,
             align: Align::Center,
-            menu_max_h: None,
         }
     }
 
@@ -86,11 +84,6 @@ impl Select {
 
     pub fn align(mut self, align: Align) -> Self {
         self.align = align;
-        self
-    }
-
-    pub fn menu_max_height(mut self, menu_max_h: impl Into<Pixels>) -> Self {
-        self.menu_max_h = Some(menu_max_h.into());
         self
     }
 }
@@ -165,7 +158,6 @@ impl RenderOnce for Select {
             disabled,
             placement,
             align,
-            menu_max_h,
         } = self;
 
         let open_state = window.use_keyed_state((id.clone(), "open"), cx, |_, _| false);
@@ -210,7 +202,6 @@ impl RenderOnce for Select {
                         -std::f32::consts::PI * unfolded,
                     ))),
             )
-            .when_some(menu_max_h, |this, menu_max_h| this.menu_max_h(menu_max_h))
             .disabled(disabled)
             .with_unified_size(unified_size)
             .placement(placement)
