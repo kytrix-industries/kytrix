@@ -753,8 +753,7 @@ widget:
       wing_in_ground: 地效翼船
     sign_in: <p align="center">注册或登录后即可查看海峡内的船舶。</p>
     unavailable: —
-    vessel_count: '%{count} 艘'
-    vessel_count_one: 1 艘
+    vessel_count_label: 船舶数量
     view_plans: 查看订阅方案
   hyperliquid_wallet:
     add: 添加监控地址

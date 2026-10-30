@@ -23,7 +23,8 @@
 //! The framework draws the placeholder, the banner and the spinner, and it only embeds
 //! this body when [`GlobalShippingChokepointWidget::has_content`] is true. So there is no state
 //! branch here: the body is what a pane with a picture draws, and a picture holding no
-//! vessel is drawn as the map it is — the legend's count is what says the strait is empty.
+//! vessel is drawn as the map it is — the count above the legend is what says the strait is
+//! empty.
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
@@ -37,7 +38,7 @@ use base_ui::{
     style::theme::{Theme, ThemeExt},
 };
 use gpui_kit::{
-    AnyElement, App, Bounds, Context, ElementId, Entity, FontStyle, FontWeight, Hsla,
+    AnyElement, App, Bounds, Context, Div, ElementId, Entity, FontStyle, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement, PinchEvent,
     Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Window, canvas, div, point, prelude::FluentBuilder, px,
@@ -377,6 +378,21 @@ impl MapColors {
             halo: roles.surface.overlay.hsla,
         }
     }
+}
+
+/// The chrome the corner's two cards wear.
+///
+/// One recipe for both is what makes them read as a single block: the same padding, edge,
+/// fill and text step, whether the card is holding the legend's grid or the count's row.
+fn card(colors: MapColors, size: UnifiedSize) -> Div {
+    div()
+        .px(size.px())
+        .py(size.px())
+        .rounded_sm()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.overlay)
+        .text_size(size.text_size())
 }
 
 /// The canvas' size as the number the projection is built from.
@@ -1125,24 +1141,6 @@ impl GlobalShippingChokepointWidget {
         .collect()
     }
 
-    /// The legend's line for the size of what the filter draws.
-    ///
-    /// The catalogue has no automatic plural rule, so the two keys are chosen here rather
-    /// than interpolated into one: a filter drawing one vessel reads "1 vessel", not "1
-    /// vessels".
-    fn vessel_count_text(&self, cx: &App) -> SharedString {
-        let count = self.painted.len();
-        if count == 1 {
-            t!(cx, "widget.global_shipping_chokepoint.vessel_count_one")
-        } else {
-            t!(
-                cx,
-                "widget.global_shipping_chokepoint.vessel_count",
-                count = count
-            )
-        }
-    }
-
     /// The colours the legend writes one type's dot and its name in.
     ///
     /// A type the filter draws keeps its own colour and the foreground; a type the filter
@@ -1156,20 +1154,64 @@ impl GlobalShippingChokepointWidget {
         }
     }
 
-    /// The legend in the pane's bottom-right corner: the ship types the picture holds and
-    /// the count of what the filter draws.
+    /// The two cards in the pane's bottom-right corner, the count over the legend.
+    ///
+    /// They are one column rather than two cards placed independently: a card sizes itself
+    /// to its content, so the count's row would be narrower than the legend under it. A
+    /// stretched column draws both at the width of the wider one, which is what makes the
+    /// pair read as one block.
+    ///
+    /// The column is lifted clear of the ODbL credit's line rather than sharing the bottom
+    /// edge with it: a pane narrower than the two together would otherwise have the cards
+    /// painted over the credit, which is the one thing on the map that has to stay
+    /// readable.
+    fn corner(&self, colors: MapColors, cx: &App) -> AnyElement {
+        let size = UnifiedSize::Small;
+        div()
+            .absolute()
+            .right(px(8.0))
+            // Above the credit's line (6px inset + one `text_xs` line), so the two never
+            // overlap however narrow the pane is.
+            .bottom(px(32.0))
+            .flex()
+            .flex_col()
+            .gap(size.gap())
+            .child(self.count_card(colors, size, cx))
+            .child(self.legend(colors, size, cx))
+            .into_any_element()
+    }
+
+    /// How many vessels the filter draws: the label at the card's left edge, the number at
+    /// its right.
+    ///
+    /// The number is bare rather than a sentence — "3 vessels" and "1 vessel" need a plural
+    /// rule the catalogue has none of, and the label beside it already says what is being
+    /// counted.
+    fn count_card(&self, colors: MapColors, size: UnifiedSize, cx: &App) -> AnyElement {
+        card(colors, size)
+            .debug_selector(|| "TEST_CHOKEPOINT_COUNT".into())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().text_color(colors.muted).child(t!(
+                cx,
+                "widget.global_shipping_chokepoint.vessel_count_label"
+            )))
+            .child(
+                div()
+                    .text_color(colors.text)
+                    .child(SharedString::from(self.painted.len().to_string())),
+            )
+            .into_any_element()
+    }
+
+    /// The legend: the ship types the picture holds, each with its dot.
     ///
     /// The types are listed in two columns because a picture can hold most of the twenty
     /// the map distinguishes, and a single column would grow past a short pane. Only the
     /// types that are present are listed: an entry nobody is reporting would draw
     /// nothing.
-    ///
-    /// It is lifted clear of the ODbL credit's line rather than sharing the bottom edge with it:
-    /// a pane narrower than the two together would otherwise have the card painted over the
-    /// credit, which is the one thing on the map that has to stay readable.
-    fn legend(&self, colors: MapColors, cx: &App) -> AnyElement {
-        let size = UnifiedSize::Small;
-        let count_text = self.vessel_count_text(cx);
+    fn legend(&self, colors: MapColors, size: UnifiedSize, cx: &App) -> AnyElement {
         let entries = self
             .present_types
             .iter()
@@ -1188,23 +1230,11 @@ impl GlobalShippingChokepointWidget {
             })
             .collect::<Vec<_>>();
 
-        div()
+        card(colors, size)
             .debug_selector(|| "TEST_CHOKEPOINT_LEGEND".into())
-            .absolute()
-            .right(px(8.0))
-            // Above the credit's line (6px inset + one `text_xs` line), so the two never overlap
-            // however narrow the pane is.
-            .bottom(px(32.0))
             .flex()
             .flex_col()
             .gap(size.gap())
-            .px(size.px())
-            .py(size.px())
-            .rounded_sm()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.overlay)
-            .text_size(size.text_size())
             .child(
                 div()
                     .text_color(colors.muted)
@@ -1218,7 +1248,6 @@ impl GlobalShippingChokepointWidget {
                     .gap_y(size.gap())
                     .children(entries),
             )
-            .child(div().text_color(colors.muted).child(count_text))
             .into_any_element()
     }
 
@@ -1226,9 +1255,9 @@ impl GlobalShippingChokepointWidget {
     ///
     /// The text is the default foreground rather than `fg.muted`: it is drawn straight on the
     /// land, and small text on the buff fill has to clear the 4.5:1 a paragraph is held to,
-    /// which the muted step does not. The corner is the one the legend (raised above it in the
-    /// bottom-right) leaves free, and the label is a link so "OpenStreetMap" is reachable
-    /// from the credit, which is what OSMF's guidance asks for.
+    /// which the muted step does not. The corner is the one the count and the legend (raised
+    /// above it in the bottom-right) leave free, and the label is a link so "OpenStreetMap" is
+    /// reachable from the credit, which is what OSMF's guidance asks for.
     fn attribution(&self, colors: MapColors, cx: &App) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
@@ -1423,7 +1452,7 @@ impl Render for GlobalShippingChokepointWidget {
             .map_or_else(Vec::new, |projection| {
                 self.labels(projection, colors, window, cx)
             });
-        let legend = self.legend(colors, cx);
+        let legend = self.corner(colors, cx);
         let attribution = self.attribution(colors, cx);
         let card = self.hovered.and_then(|mmsi| {
             let projection = projection?;
@@ -2050,50 +2079,37 @@ mod tests {
         );
     }
 
-    /// The count says one vessel in the singular and anything else in the plural, which is
-    /// what the two catalogue keys are for.
+    /// The count is a card of its own, above the legend and as wide as it: the two are one
+    /// stretched column, so the count's row is drawn at the legend's width rather than at
+    /// the width its own two ends would take.
     #[gpui_kit::test]
-    fn the_legend_should_count_one_vessel_in_the_singular(cx: &mut TestAppContext) {
+    fn the_count_should_be_its_own_card_above_the_legend(cx: &mut TestAppContext) {
         let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
-
         cx.update(|cx| {
-            assert!(report_update(&pane, keyframe(7, 1, vec![position(1)]), cx));
-            assert_eq!(pane.read(cx).vessels.vessel_count(), 1);
-            assert_eq!(
-                pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
-                "one vessel is singular",
-            );
-
             assert!(report_update(
                 &pane,
-                keyframe(7, 2, vec![position(1), position(2)]),
+                keyframe(7, 1, vec![position(1), position(2)]),
                 cx,
             ));
-            assert_eq!(pane.read(cx).vessels.vessel_count(), 2);
-            assert_eq!(
-                pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 2
-                )
-                .as_ref(),
-                "two vessels are plural and interpolated",
-            );
-
-            assert!(report_update(&pane, keyframe(7, 3, Vec::new()), cx));
-            assert_eq!(
-                pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 0
-                )
-                .as_ref(),
-                "an empty picture is plural",
-            );
         });
+
+        let window = map_window(cx, &pane);
+        let legend = window
+            .debug_bounds("TEST_CHOKEPOINT_LEGEND")
+            .expect("the legend is part of the ready body");
+        let count = window
+            .debug_bounds("TEST_CHOKEPOINT_COUNT")
+            .expect("the count is a card of its own");
+        assert!(
+            count.bottom() <= legend.top(),
+            "the count sits above the legend: {count:?} over {legend:?}",
+        );
+        assert_eq!(
+            count.size.width, legend.size.width,
+            "the two cards are drawn at one width",
+        );
+        assert_eq!(count.left(), legend.left(), "and share their left edge");
+        assert_eq!(count.right(), legend.right(), "and their right edge");
     }
 
     /// The header's filter offers "all" and the types the picture holds, and choosing one
@@ -2149,11 +2165,6 @@ mod tests {
             assert_eq!(pane.filter, ShipTypeFilter::Only(ShipType::Tanker));
             assert_eq!(pane.painted.len(), 1, "only the tanker is drawn");
             assert_eq!(pane.painted[0].mmsi, 1);
-            assert_eq!(
-                pane.vessel_count_text(cx).as_ref(),
-                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
-                "the legend counts what the filter draws",
-            );
             assert!(
                 pane.ship_type_choice(cx).contains(
                     t!(cx, "widget.global_shipping_chokepoint.ship_type.tanker").as_ref()
@@ -2229,14 +2240,9 @@ mod tests {
         );
         window.update(|_, cx| {
             assert_eq!(
-                pane.read(cx).vessel_count_text(cx).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 3
-                )
-                .as_ref(),
-                "the legend counts the whole picture while the filter is all",
+                pane.read(cx).painted.len(),
+                3,
+                "the count reads the whole picture while the filter is all",
             );
         });
     }
@@ -2380,15 +2386,6 @@ mod tests {
                 "nothing of the chosen type is drawn"
             );
             assert_eq!(pane.present_types, [ShipType::Cargo]);
-            assert_eq!(
-                pane.vessel_count_text(cx).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 0
-                )
-                .as_ref(),
-            );
             assert!(
                 pane.ship_type_choice(cx).contains(
                     t!(cx, "widget.global_shipping_chokepoint.ship_type.tanker").as_ref()
@@ -2425,43 +2422,24 @@ mod tests {
             let count = |cx: &mut App, filter: ShipTypeFilter| {
                 pane.update(cx, |pane, cx| {
                     pane.select_filter(filter, cx);
-                    pane.vessel_count_text(cx)
+                    pane.painted.len()
                 })
             };
 
             assert_eq!(
-                count(cx, ShipTypeFilter::Only(ShipType::Tanker)).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 2
-                )
-                .as_ref(),
+                count(cx, ShipTypeFilter::Only(ShipType::Tanker)),
+                2,
                 "two tankers",
             );
             assert_eq!(
-                count(cx, ShipTypeFilter::Only(ShipType::Cargo)).as_ref(),
-                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
+                count(cx, ShipTypeFilter::Only(ShipType::Cargo)),
+                1,
                 "one cargo ship",
             );
+            assert_eq!(count(cx, ShipTypeFilter::All), 3, "all three vessels");
             assert_eq!(
-                count(cx, ShipTypeFilter::All).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 3
-                )
-                .as_ref(),
-                "all three vessels",
-            );
-            assert_eq!(
-                count(cx, ShipTypeFilter::Only(ShipType::Passenger)).as_ref(),
-                t!(
-                    cx,
-                    "widget.global_shipping_chokepoint.vessel_count",
-                    count = 0
-                )
-                .as_ref(),
+                count(cx, ShipTypeFilter::Only(ShipType::Passenger)),
+                0,
                 "a type the picture does not hold draws nothing",
             );
         });
@@ -3161,8 +3139,7 @@ mod tests {
                 "widget.global_shipping_chokepoint.legend.title",
                 "widget.global_shipping_chokepoint.sign_in",
                 "widget.global_shipping_chokepoint.unavailable",
-                "widget.global_shipping_chokepoint.vessel_count",
-                "widget.global_shipping_chokepoint.vessel_count_one",
+                "widget.global_shipping_chokepoint.vessel_count_label",
                 "widget.global_shipping_chokepoint.view_plans",
             ];
             keys.extend(HOVER_KEYS);
@@ -3182,17 +3159,8 @@ mod tests {
                     );
                 }
                 assert!(
-                    !t!(
-                        cx,
-                        "widget.global_shipping_chokepoint.vessel_count",
-                        count = 3
-                    )
-                    .contains("%{"),
-                    "the count is supplied in {language:?}",
-                );
-                assert!(
-                    !t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").contains("%{"),
-                    "the singular count carries no placeholder in {language:?}",
+                    !t!(cx, "widget.global_shipping_chokepoint.vessel_count_label").contains("%{"),
+                    "the count's label carries no placeholder in {language:?}",
                 );
                 assert!(
                     !t!(

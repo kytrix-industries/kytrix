@@ -753,8 +753,7 @@ widget:
       wing_in_ground: Wing in ground
     sign_in: <p align="center">You need to register or log in to see the vessels in the strait.</p>
     unavailable: —
-    vessel_count: '%{count} vessels'
-    vessel_count_one: 1 vessel
+    vessel_count_label: Vessel count
     view_plans: View plans
   hyperliquid_wallet:
     add: Add monitored address
