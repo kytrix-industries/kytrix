@@ -132,6 +132,8 @@ error:
     stream_unavailable: The financial calendar stream is unavailable
   global_shipping_chokepoint:
     map_asset: The map could not be drawn because the packaged coastline could not be read
+    stale: Live updates have stopped
+    stale_data: No update for over 5 minutes — the data may be out of date
   market_participants:
     authentication_failed: 'Authentication for the %{venue} market participant account failed: %{cause}'
     capability_mismatch: The protocol request requires the %{expected} capability, but the request context declares %{actual}
@@ -734,8 +736,6 @@ widget:
       other: Other vessel
       tanker: Tanker
     sign_in: <p align="center">You need to register or log in to see the vessels in the strait.</p>
-    stale: Live updates have stopped
-    stale_data: No update for over 5 minutes — the data may be out of date
     unavailable: —
     vessel_count: '%{count} vessels'
     vessel_count_one: 1 vessel

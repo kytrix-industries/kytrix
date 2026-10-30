@@ -132,6 +132,8 @@ error:
     stream_unavailable: 财经日历数据流不可用
   global_shipping_chokepoint:
     map_asset: 内置海岸线数据无法读取，地图无法绘制
+    stale: 实时更新已停止
+    stale_data: 已经超过 5 分钟没有数据更新，数据可能已经过时
   market_participants:
     authentication_failed: '%{venue} 市场参与者账户认证失败：%{cause}'
     capability_mismatch: 协议请求需要 %{expected} 能力，但请求上下文声明的是 %{actual}
@@ -734,8 +736,6 @@ widget:
       other: 其他船舶
       tanker: 油轮
     sign_in: <p align="center">注册或登录后即可查看海峡内的船舶。</p>
-    stale: 实时更新已停止
-    stale_data: 已经超过 5 分钟没有数据更新，数据可能已经过时
     unavailable: —
     vessel_count: '%{count} 艘'
     vessel_count_one: 1 艘

@@ -6,15 +6,15 @@
 //! One canvas, under elements that carry the words. The base map's coastline, borders and
 //! roads are layers parsed once by [`crate::scene`]; [`crate::paint`] turns them and the
 //! vessel markers into the paths the canvas paints for the frame's camera, and the labels,
-//! the legend, the hover card and the stale badge are absolutely positioned over it.
+//! the legend and the hover card are absolutely positioned over it.
 //! Nothing tessellates per frame: a frame only applies the camera's affine transform to
 //! geometry that was prepared once.
 //!
 //! # What the pane reports, and what it holds
 //!
 //! The picture is one AIS subscription's. A keyframe replaces it, a delta only applies on
-//! top of the picture already held, and a push that does not continue it is a gap the
-//! stale badge names rather than a state the pane guesses at. The frame is therefore a
+//! top of the picture already held, and a push that does not continue it is a gap the pane
+//! reports as a failure rather than a state it guesses at. The frame is therefore a
 //! picture held between pushes, and the two things the pane owns beyond it are the camera
 //! and the vessel the pointer is on.
 //!
@@ -25,7 +25,7 @@
 //! branch here: the body is what a pane with a picture draws, and a picture holding no
 //! vessel is drawn as the map it is — the legend's count is what says the strait is empty.
 
-use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
@@ -81,13 +81,6 @@ use crate::{
 
 /// How much one wheel notch scales the camera.
 const WHEEL_ZOOM_STEP: f32 = 1.15;
-
-/// How late the one-shot staleness frame is asked for, past the window it reports.
-///
-/// The predicate is "more than the window has gone by", and a wake exactly on the window's
-/// edge races it. A link that went silent has no next push to arm another frame, so the
-/// slack is the difference between a badge that appears and one that never does.
-const STALE_TIMER_SLACK: Duration = Duration::from_millis(100);
 
 /// The width and height of the box each label is centred in, in pixels.
 ///
@@ -178,8 +171,9 @@ fn label_text(cx: &App, key: &str, kind: LabelKind) -> SharedString {
 
 /// How wide the hover card is.
 ///
-/// It is set by the longest row the card draws: the two update times are
-/// `YYYY-MM-DD HH:MM:SS`, and a card any narrower cut the value off behind an ellipsis.
+/// The widest label the card draws sets it: the two update times are labelled with a
+/// sentence rather than the one or two words the other rows use, and each draws its stamp
+/// on a line of its own, so the label is what has to fit.
 const CARD_WIDTH: f32 = 228.0;
 
 /// How far the hover card is kept off the hull it describes, and off the pane's edges.
@@ -187,12 +181,13 @@ const CARD_MARGIN: f32 = 12.0;
 
 /// The height the hover card is kept inside the pane by, before it has been measured.
 ///
-/// Sixteen rows of text at the small size, the fifteen gaps between them, and the card's
-/// padding and border. A row is a 0.75 rem line box at the default 1.618 line height, so
-/// about 20 px; the 10 px of slack keeps the estimate an upper bound, which is the safe
-/// direction: an underestimate would let the last rows fall outside the pane, while an
-/// overestimate only lifts the card a little.
-const CARD_HEIGHT: f32 = 16.0 * 20.0 + 15.0 * 4.0 + 2.0 * 4.0 + 10.0;
+/// Eighteen lines of text at the small size — sixteen rows, two of which stack their value
+/// under the label — the fifteen gaps between the rows, and the card's padding and border.
+/// A line is a 0.75 rem line box at the default 1.618 line height, so about 20 px; the
+/// 10 px of slack keeps the estimate an upper bound, which is the safe direction: an
+/// underestimate would let the last rows fall outside the pane, while an overestimate only
+/// lifts the card a little.
+const CARD_HEIGHT: f32 = 18.0 * 20.0 + 15.0 * 4.0 + 2.0 * 4.0 + 10.0;
 
 /// The page the map's ODbL credit opens.
 ///
@@ -244,6 +239,16 @@ const HOVER_KEYS: [&str; 16] = [
     "widget.global_shipping_chokepoint.hover.static_updated_at",
 ];
 
+/// The two rows whose value is drawn under its label rather than beside it.
+///
+/// Each carries a `YYYY-MM-DD HH:MM:SS` stamp behind a label that is a sentence of its
+/// own, and the two together are wider than the card: on one line it is the stamp that is
+/// cut, so it gets a line of its own.
+const HOVER_STACKED_KEYS: [&str; 2] = [
+    "widget.global_shipping_chokepoint.hover.updated",
+    "widget.global_shipping_chokepoint.hover.static_updated_at",
+];
+
 /// The catalogue keys naming the fifteen navigation statuses, by their AIS index.
 const NAV_STATUS_KEYS: [&str; 15] = [
     "widget.global_shipping_chokepoint.nav_status.0",
@@ -284,6 +289,32 @@ struct MapAssetInvalid(#[from] SceneError);
 impl LocalizedError for MapAssetInvalid {
     fn localized_message(&self, cx: &App) -> SharedString {
         t!(cx, "error.global_shipping_chokepoint.map_asset")
+    }
+}
+
+/// Why the picture on the map is no longer being continued.
+///
+/// Both cases are the picture stopping being live rather than the map being wrong, so the
+/// vessels stay on screen under the failure. Neither can be repaired from what the pane
+/// holds — a missing message is not something a later push can put back — which is why
+/// they are failures with a new subscription behind the control rather than a badge the
+/// pane clears by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum StalePicture {
+    /// A push did not continue the picture, so a message is missing from it.
+    #[error("the picture is missing a push")]
+    Gap,
+    /// The link delivered nothing for the staleness window.
+    #[error("no push arrived within the staleness window")]
+    Silent,
+}
+
+impl LocalizedError for StalePicture {
+    fn localized_message(&self, cx: &App) -> SharedString {
+        match self {
+            Self::Gap => t!(cx, "error.global_shipping_chokepoint.stale"),
+            Self::Silent => t!(cx, "error.global_shipping_chokepoint.stale_data"),
+        }
     }
 }
 
@@ -338,8 +369,6 @@ pub(super) struct MapColors {
     /// white (or night grey) the panels use — so it reads as the fill showing through
     /// rather than as a second colour on the map.
     pub halo: Hsla,
-    /// The stale badge, which is a warning rather than an error.
-    warning: Hsla,
 }
 
 impl MapColors {
@@ -359,7 +388,6 @@ impl MapColors {
             text: roles.fg.default.hsla,
             muted: roles.fg.muted.hsla,
             halo: roles.surface.overlay.hsla,
-            warning: roles.status.warning.base.hsla,
         }
     }
 }
@@ -399,7 +427,7 @@ pub struct GlobalShippingChokepointWidget {
     /// and the wheel's anchor are read from.
     pointer: Point<Pixels>,
     /// The generation of the last push, which is what makes the one-shot stale timer that
-    /// a push arms stop notifying once a newer push has arrived.
+    /// a push arms stop reporting once a newer push has arrived.
     stale_epoch: u64,
     /// Keeps the pane following the account the settings hold.
     _account: Subscription,
@@ -444,6 +472,10 @@ impl WidgetView for GlobalShippingChokepointWidget {
             return;
         }
         self.status.report(WidgetState::Connecting, cx);
+        // The picture the retry keeps on screen is not being continued either: a
+        // subscription that takes over and then delivers nothing has to fail the pane
+        // the same way a link that went silent does, and this is the push it counts from.
+        self.arm_stale_timer(cx);
         self.binding.call(
             GlobalShippingChokepointRequest::Load {
                 scope: GlobalShippingChokepointScope::new(account),
@@ -665,11 +697,21 @@ impl GlobalShippingChokepointWidget {
     }
 
     /// Folds one push into the picture and arms the staleness clock.
+    ///
+    /// A push that did not continue the picture is the one case where what arrived is not
+    /// what the pane reports: the picture it holds is now missing a message, and no later
+    /// push can repair that, so the pane reports the failure the banner is drawn for and
+    /// leaves the vessels on the map under it.
     fn apply_update(&mut self, update: &GlobalShippingChokepointUpdate, cx: &mut Context<Self>) {
         self.vessels.apply(update);
         self.painted = self.vessels.vessels().into();
         // A keyframe the server stamped with no time says it holds no state: the picture
-        // is cleared and the pane waits for one instead of drawing an empty sea.
+        // is cleared and the pane waits for one instead of drawing an empty sea. It is a
+        // gap as well, but there is no picture for it to be a gap in.
+        if self.vessels.has_state() && self.vessels.has_gap() {
+            self.fail_stale(StalePicture::Gap, cx);
+            return;
+        }
         if self.vessels.has_state() {
             self.status.report(WidgetState::Ready, cx);
         } else {
@@ -678,27 +720,37 @@ impl GlobalShippingChokepointWidget {
         self.arm_stale_timer(cx);
     }
 
-    /// Arms the one-shot timer that makes a silent link's badge appear.
+    /// Reports the failure a picture that stopped being continued is shown under.
     ///
-    /// Staleness is derived from the store rather than written by this timer: the timer
-    /// only asks for the frame that re-evaluates the predicate. Each push replaces the
-    /// generation, so the timer of a push that was followed by another notifies nothing,
-    /// and a timer that did reach its deadline notifies once rather than asking for every
-    /// frame after it.
+    /// The recovery is the framework's own retry: the picture cannot be reconstructed
+    /// from what the pane holds, so the way out is a new subscription rather than
+    /// anything the pane could do to the one it has.
+    fn fail_stale(&mut self, stale: StalePicture, cx: &mut Context<Self>) {
+        let recovery = self.recovery.clone();
+        self.status
+            .report(WidgetState::failed(Arc::new(stale), recovery), cx);
+    }
+
+    /// Arms the one-shot timer that fails a link which goes silent.
+    ///
+    /// The timer is the whole of the staleness clock: it is armed by the push it counts
+    /// from, and a push that arrives first replaces the generation, so the timer of a
+    /// push that was followed by another reports nothing. A pane that never receives a
+    /// push has nothing that can go stale, which is why the report is guarded on the
+    /// picture rather than made unconditionally.
     fn arm_stale_timer(&mut self, cx: &mut Context<Self>) {
         self.stale_epoch += 1;
         let epoch = self.stale_epoch;
         cx.spawn(async move |this, cx| {
-            // A wake exactly on the window's edge can read as "not past it" for the
-            // predicate's strict comparison, and a link that went silent has no next push
-            // to arm another frame: the slack is what keeps that race from leaving a dead
-            // link unbadged for ever.
-            cx.background_executor()
-                .timer(STALE_AFTER + STALE_TIMER_SLACK)
-                .await;
+            // A link that went silent has no next push to arm another timer, so this one
+            // is the only chance the failure has to be reported.
+            cx.background_executor().timer(STALE_AFTER).await;
             let _ = this.update(cx, |this, cx| {
-                if this.stale_epoch == epoch {
-                    cx.notify();
+                // A push that arrived first has already replaced the generation, and a
+                // pane with no picture has nothing that could have stopped being
+                // continued: both cases report nothing.
+                if this.stale_epoch == epoch && this.vessels.has_state() {
+                    this.fail_stale(StalePicture::Silent, cx);
                 }
             });
         })
@@ -1055,8 +1107,8 @@ impl GlobalShippingChokepointWidget {
     /// The text is the default foreground rather than `fg.muted`: it is drawn straight on the
     /// land, and small text on the buff fill has to clear the 4.5:1 a paragraph is held to,
     /// which the muted step does not. The corner is the one the legend (raised above it in the
-    /// bottom-right) and the stale badge (top-left) leave free, and the label is a link so
-    /// "OpenStreetMap" is reachable from the credit, which is what OSMF's guidance asks for.
+    /// bottom-right) leaves free, and the label is a link so "OpenStreetMap" is reachable
+    /// from the credit, which is what OSMF's guidance asks for.
     fn attribution(&self, colors: MapColors, cx: &App) -> AnyElement {
         div()
             .id(ElementId::Name(SharedString::new_static(
@@ -1071,37 +1123,6 @@ impl GlobalShippingChokepointWidget {
             .cursor_pointer()
             .on_click(|_, _, cx| cx.open_url(ATTRIBUTION_URL))
             .child(t!(cx, "widget.global_shipping_chokepoint.attribution"))
-            .into_any_element()
-    }
-
-    /// The badge a picture that is no longer being continued is drawn under.
-    ///
-    /// A gap is a picture the pushes stopped continuing; a silence is a link that stopped
-    /// delivering. The first names the picture, the second says the picture is old rather
-    /// than counting the seconds — the service refreshes at least once a minute, so a
-    /// count would only ever read "300, 301, 302" — and both leave the vessels on the map:
-    /// what is stale is the update, not what was received.
-    fn stale_badge(&self, colors: MapColors, cx: &App) -> AnyElement {
-        let text = if self.vessels.has_gap() {
-            t!(cx, "widget.global_shipping_chokepoint.stale")
-        } else {
-            t!(cx, "widget.global_shipping_chokepoint.stale_data")
-        };
-
-        div()
-            .debug_selector(|| "TEST_CHOKEPOINT_STALE".into())
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
-            .px(px(6.0))
-            .py(px(3.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.overlay)
-            .text_xs()
-            .text_color(colors.warning)
-            .child(text)
             .into_any_element()
     }
 
@@ -1152,28 +1173,41 @@ impl GlobalShippingChokepointWidget {
             .iter()
             .zip(values)
             .map(|(key, value)| {
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(colors.muted)
-                            .child(t!(cx, *key)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            // A destination or a call sign is as long as the report says:
-                            // it is cut rather than allowed to widen the card off the map.
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_color(colors.text)
-                            .child(value),
-                    )
+                let label = div()
+                    .flex_none()
+                    .text_color(colors.muted)
+                    .child(t!(cx, *key));
+                let value = div()
+                    // A destination or a call sign is as long as the report says: it is
+                    // cut rather than allowed to widen the card off the map.
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(colors.text)
+                    .child(value);
+                if HOVER_STACKED_KEYS.contains(key) {
+                    // The stamp takes the whole card's width under its label, which is
+                    // what keeps the seconds of it off the ellipsis.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .child(label)
+                        .child(
+                            value
+                                .debug_selector(|| "TEST_CHOKEPOINT_CARD_STAMP".into())
+                                .w_full(),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(label)
+                        .child(value.min_w_0().flex_1())
+                        .into_any_element()
+                }
             })
             .collect::<Vec<_>>();
 
@@ -1271,10 +1305,6 @@ impl Render for GlobalShippingChokepointWidget {
             });
         let legend = self.legend(colors, cx);
         let attribution = self.attribution(colors, cx);
-        let stale = self
-            .vessels
-            .is_stale()
-            .then(|| self.stale_badge(colors, cx));
         let card = self.hovered.and_then(|mmsi| {
             let projection = projection?;
             let details = self.vessels.display(mmsi, zone)?;
@@ -1320,7 +1350,6 @@ impl Render for GlobalShippingChokepointWidget {
             .children(labels)
             .child(attribution)
             .child(legend)
-            .when_some(stale, |this, stale| this.child(stale))
             .when_some(card, |this, card| this.child(card))
     }
 }
@@ -1852,8 +1881,11 @@ mod tests {
         });
     }
 
+    /// A push that does not continue the picture leaves a message missing from it, and no
+    /// later push can put that message back: the pane reports the failure the framework
+    /// draws its banner for, and the vessels stay on the map under it.
     #[gpui_kit::test]
-    fn a_gap_should_draw_the_stale_badge_while_the_picture_stays(cx: &mut TestAppContext) {
+    fn a_gap_should_fail_the_pane_while_the_picture_stays(cx: &mut TestAppContext) {
         let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
 
         cx.update(|cx| {
@@ -1865,21 +1897,103 @@ mod tests {
             assert!(report_update(&pane, removal(7, 5, 6, 1), cx));
 
             let pane = pane.read(cx);
-            assert!(pane.vessels.is_stale());
-            assert!(pane.vessels.has_gap());
+            let state = pane.status.state(cx);
+            let failure = state.failure().expect("a gap fails the pane");
             assert_eq!(
-                pane.vessels.vessel_count(),
-                1,
-                "the picture stays on the map under the badge",
+                failure.text(cx).as_ref(),
+                t!(cx, "error.global_shipping_chokepoint.stale").as_ref(),
+                "the banner names the picture rather than the map",
             );
+            assert_eq!(
+                failure.action().label_key(),
+                "common.retry",
+                "the way out is a new subscription",
+            );
+            assert!(pane.vessels.has_gap());
+            assert!(
+                pane.has_content(),
+                "the picture stays on the map under the banner",
+            );
+            assert_eq!(pane.vessels.vessel_count(), 1);
         });
 
         let window = map_window(cx, &pane);
-        assert!(
-            window.debug_bounds("TEST_CHOKEPOINT_STALE").is_some(),
-            "a picture that is not being continued is drawn under its badge",
-        );
         assert!(window.debug_bounds("TEST_CHOKEPOINT_LEGEND").is_some());
+        assert!(
+            window.debug_bounds("TEST_CHOKEPOINT_STALE").is_none(),
+            "the body carries no badge of its own any more",
+        );
+    }
+
+    /// A stale picture is a failure rather than a warning: the pushes that follow it are
+    /// the ones the pane cannot vouch for, so only the control the banner offers leaves it.
+    #[gpui_kit::test]
+    fn a_stale_pane_should_ignore_pushes_until_the_user_retries(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 10, vec![position(1)]);
+            frame.ships = vec![ships(1)];
+            assert!(report_update(&pane, frame, cx));
+            assert!(report_update(&pane, removal(7, 5, 6, 1), cx));
+
+            // A keyframe would repair the picture, but a failed pane reads nothing.
+            let mut healing = keyframe(7, 11, vec![position(1), position(2)]);
+            healing.ships = vec![ships(1), ships(2)];
+            assert!(
+                !report_update(&pane, healing, cx),
+                "a failed pane applies no push",
+            );
+            assert_eq!(
+                pane.read(cx).vessels.vessel_count(),
+                1,
+                "the picture the pane holds is the one it was left with",
+            );
+
+            // The control the banner offers is the framework's retry, which loads again.
+            pane.update(cx, |pane, cx| pane.load(cx));
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::Connecting,
+                "the retry starts over",
+            );
+
+            assert!(report_update(&pane, keyframe(7, 1, vec![position(1)]), cx));
+            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
+        });
+    }
+
+    /// A link that delivers nothing fails the pane when the window closes, even though the
+    /// last picture is still on screen: what is stale is the update, not what was received.
+    #[gpui_kit::test]
+    fn a_silent_link_should_fail_the_pane_when_the_window_closes(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1)]);
+            frame.ships = vec![ships(1)];
+            assert!(report_update(&pane, frame, cx));
+            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
+        });
+
+        // Nothing else arrives: the timer armed by that push is the whole of the window.
+        cx.executor().advance_clock(STALE_AFTER);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            let state = pane.status.state(cx);
+            let failure = state.failure().expect("a silent link fails the pane");
+            assert_eq!(
+                failure.text(cx).as_ref(),
+                t!(cx, "error.global_shipping_chokepoint.stale_data").as_ref(),
+                "the silence is what is reported, not a picture missing a push",
+            );
+            assert_eq!(failure.action().label_key(), "common.retry");
+            assert!(
+                pane.has_content(),
+                "the picture stays on the map under the banner",
+            );
+        });
     }
 
     #[gpui_kit::test]
@@ -2361,7 +2475,7 @@ mod tests {
             assert!(report_update(&pane, frame, cx));
         });
         let window = map_window(cx, &pane);
-        // Sixteen rows of card are taller than the default test window's map, and a
+        // Eighteen lines of card are taller than the default test window's map, and a
         // card that cannot fit at all is a different case from the one under test:
         // grow the pane until the placement has somewhere to keep the card.
         window.simulate_resize(size(px(600.0), px(560.0)));
@@ -2397,6 +2511,49 @@ mod tests {
         );
     }
 
+    /// The two update times are stamped under their labels rather than beside them: on one
+    /// line the label and the stamp together are wider than the card, and it is the stamp
+    /// that is cut. Under its label the stamp has the card's whole width to itself.
+    #[gpui_kit::test]
+    fn the_update_times_should_be_stamped_under_their_labels(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1)]);
+            frame.ships = vec![ships(1)];
+            assert!(report_update(&pane, frame, cx));
+        });
+        let window = map_window(cx, &pane);
+
+        let at = window.update(|_, cx| {
+            let pane = pane.read(cx);
+            let hull = hull_of(pane, 1).expect("the vessel is painted");
+            window_point(pane, hull).expect("a drawn map records its box")
+        });
+        window.simulate_mouse_move(at, None, Modifiers::none());
+        repaint(window);
+
+        let card = window
+            .debug_bounds("TEST_CHOKEPOINT_CARD")
+            .expect("the vessel under the pointer has a card");
+        let stamp = window
+            .debug_bounds("TEST_CHOKEPOINT_CARD_STAMP")
+            .expect("the card carries the update times");
+        // The card's text box: its width less the padding and the border on both sides.
+        let text_left = card.left() + UnifiedSize::Small.px() + px(1.0);
+        let text_width = card.size.width - 2.0 * UnifiedSize::Small.px() - px(2.0);
+        assert!(
+            (f32::from(stamp.left()) - f32::from(text_left)).abs() < 0.5,
+            "a stamp under its label starts at the card's text edge: {} in {card:?}",
+            f32::from(stamp.left()),
+        );
+        assert!(
+            (f32::from(stamp.size.width) - f32::from(text_width)).abs() < 0.5,
+            "a stamp under its label takes the card's whole width: {} of {}",
+            f32::from(stamp.size.width),
+            f32::from(text_width),
+        );
+    }
+
     /// A key this pane hands over is one both locales define and render: a missing key
     /// translates to an empty string rather than failing, so a typo would be a blank line
     /// on screen.
@@ -2407,12 +2564,12 @@ mod tests {
 
             let mut keys = vec![
                 "error.global_shipping_chokepoint.map_asset",
+                "error.global_shipping_chokepoint.stale",
+                "error.global_shipping_chokepoint.stale_data",
                 "widget.names.global_shipping_chokepoint",
                 "widget.global_shipping_chokepoint.attribution",
                 "widget.global_shipping_chokepoint.entitlement_required",
                 "widget.global_shipping_chokepoint.sign_in",
-                "widget.global_shipping_chokepoint.stale",
-                "widget.global_shipping_chokepoint.stale_data",
                 "widget.global_shipping_chokepoint.unavailable",
                 "widget.global_shipping_chokepoint.vessel_count",
                 "widget.global_shipping_chokepoint.vessel_count_one",
@@ -2655,7 +2812,7 @@ mod tests {
     }
 
     /// The map is drawn under its ODbL credit: the label sits in the bottom-left corner of the
-    /// map's box, below the legend and clear of the stale badge in the top-left.
+    /// map's box, below the legend.
     ///
     /// The body is the cached layer, so the frame that answers `debug_bounds` has to be a
     /// forced full repaint — which is what `repaint` is (`crates/widgets/AGENTS.md` §10, trap 5).

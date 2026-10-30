@@ -14,11 +14,10 @@
 //! session applies those deltas to its own copy and fails the stream when one does not
 //! continue the picture, so a pane normally starts from the session's snapshot and then
 //! only applies continuous increments. The store below still refuses to guess at a
-//! mismatching push: it keeps the last picture under the stale badge instead of applying
-//! it, which is the last line of defence if a mismatching update ever reaches the view.
-//! Staleness is derived from that gap and the local clock rather than written into a
-//! field by a timer: a client in a gap keeps receiving deltas it must ignore, so a
-//! timer would keep resetting the badge into silence while the screen stayed frozen.
+//! mismatching push: it keeps the last picture and records the gap instead of applying
+//! it, which is the last line of defence if a mismatching update ever reaches the view —
+//! and the gap is what the pane reports as a failure, since a picture missing a push
+//! cannot be vouched for.
 //!
 //! # Text
 //!
@@ -28,7 +27,7 @@
 //! this module invents a sentence. Unit symbols (`m`, `kn`, `°`) travel with their
 //! value, and every natural-language word stays in the catalogue.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ahash::AHashMap;
 use base_ui::style::theme::Theme;
@@ -334,8 +333,8 @@ pub(super) const HIT_RADIUS_PX: f32 = 8.0;
 ///
 /// The service refreshes at least once a minute, so five minutes of silence is several
 /// refreshes missed: the picture on screen is then a report about the past rather than a
-/// live one. The window is generous on purpose — the badge it arms is a warning, and a
-/// warning that fires between two ordinary refreshes would be noise.
+/// live one. The window is generous on purpose — the failure it reports is terminal, and
+/// one that fired between two ordinary refreshes would take a working pane down with it.
 pub(super) const STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The speed-over-ground value that means "not available".
@@ -1421,10 +1420,10 @@ fn format_timestamp(timestamp: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// The two tables are the wire's two messages, keyed by MMSI, and they are joined
 /// only when a frame paints them. `epoch` and `applied` are the baseline a delta has
 /// to continue; `gap` says a push did not continue it, so what is held stays on the map
-/// under the stale badge. The session normally fails the stream on that same mismatch;
-/// this flag is what keeps the view honest if one still reaches it. `has_state` is what
-/// the pane reports as "there is a picture to draw" — a picture cleared by a keyframe
-/// the server stamped with no time is not one.
+/// under the failure the pane reports for it. The session normally fails the stream on
+/// that same mismatch; this flag is what keeps the view honest if one still reaches it.
+/// `has_state` is what the pane reports as "there is a picture to draw" — a picture
+/// cleared by a keyframe the server stamped with no time is not one.
 #[derive(Debug)]
 pub(super) struct VesselStore {
     ships: AHashMap<u32, GlobalShippingChokepointShip>,
@@ -1432,7 +1431,6 @@ pub(super) struct VesselStore {
     epoch: u64,
     applied: u64,
     gap: bool,
-    received_at: Instant,
     has_state: bool,
 }
 
@@ -1451,7 +1449,6 @@ impl VesselStore {
             epoch: 0,
             applied: 0,
             gap: false,
-            received_at: Instant::now(),
             has_state: false,
         }
     }
@@ -1472,10 +1469,8 @@ impl VesselStore {
     ///    guessed at and nothing is applied. The session fails the stream on the same
     ///    mismatch and the pane takes a fresh snapshot when the user retries; if one
     ///    still reaches this store, what is already held stays on the map under the
-    ///    stale badge. A new epoch also drops the applied sequence, because it belonged
-    ///    to the process that no longer exists.
-    /// 4. Staleness is derived from the gap by [`is_stale`](Self::is_stale); it is
-    ///    never written by a timer.
+    ///    failure the pane reports for the gap. A new epoch also drops the applied
+    ///    sequence, because it belonged to the process that no longer exists.
     ///
     /// `removed` deletes each listed MMSI from both tables. No vessel count is applied
     /// here: the picture holds every vessel the service sends.
@@ -1488,8 +1483,7 @@ impl VesselStore {
             // A keyframe the server stamped with no time says it holds no state yet,
             // not that the strait is empty: the picture stays cleared and no baseline
             // is established, so the pane keeps waiting instead of drawing an empty
-            // sea. It is also not a usable message, so it does not refresh the clock
-            // the staleness predicate reads.
+            // sea.
             if update.timestamp == 0 {
                 self.applied = 0;
                 self.gap = true;
@@ -1504,7 +1498,6 @@ impl VesselStore {
             self.applied = update.sequence;
             self.gap = false;
             self.has_state = true;
-            self.received_at = Instant::now();
             return;
         }
 
@@ -1524,18 +1517,14 @@ impl VesselStore {
             self.has_state = true;
         } else {
             // The picture already held is deliberately not cleared: it is what the
-            // pane keeps drawing, under the stale badge, until a keyframe replaces
-            // it. `gap` is that badge's other half, and the derivation in `is_stale`
-            // is why no timer can hide a gap that outlives one message.
+            // pane keeps drawing under the failure the gap is reported as. The flag
+            // is a fact about the message rather than a clock, so no later push can
+            // hide a gap that outlives one message.
             self.gap = true;
             if update.epoch != self.epoch {
                 self.applied = 0;
             }
         }
-
-        // An ignored delta still proves the link is alive, which is exactly what the
-        // staleness predicate asks about, so it refreshes the clock as well.
-        self.received_at = Instant::now();
     }
 
     /// Whether a usable picture has arrived, which is what the pane has content from.
@@ -1543,16 +1532,8 @@ impl VesselStore {
         self.has_state
     }
 
-    /// Whether the picture is no longer live.
-    ///
-    /// Derived, not stored: a gap is a picture that stopped being continued, and the
-    /// clock is local because the server's timestamps are not to be compared with it.
-    pub fn is_stale(&self) -> bool {
-        self.gap || self.received_at.elapsed() > STALE_AFTER
-    }
-
-    /// Whether a push did not continue the picture, which is what the stale badge names
-    /// when the link is still delivering.
+    /// Whether a push did not continue the picture, which is what the pane reports as a
+    /// failure when the link is still delivering.
     pub fn has_gap(&self) -> bool {
         self.gap
     }
@@ -1566,8 +1547,8 @@ impl VesselStore {
     ///
     /// Resetting `epoch` and `applied` is what keeps a late delta of the session
     /// being abandoned from being applied: it no longer continues anything this
-    /// store holds. A store that was cleared is not stale — it is empty — so the gap
-    /// goes back to its initial value too.
+    /// store holds. A store that was cleared holds nothing a push could have failed to
+    /// continue, so the gap goes back to its initial value too.
     pub fn clear(&mut self) {
         self.ships.clear();
         self.positions.clear();
@@ -1575,7 +1556,6 @@ impl VesselStore {
         self.applied = 0;
         self.gap = false;
         self.has_state = false;
-        self.received_at = Instant::now();
     }
 
     /// Every vessel that has a position, joined with its ship record by MMSI.
@@ -2114,7 +2094,7 @@ mod tests {
         store.apply(&frame);
         assert!(store.has_state());
         assert_eq!(store.vessel_count(), 2);
-        assert!(!store.is_stale());
+        assert!(!store.has_gap());
 
         store.apply(&keyframe(7, 2, vec![position(3)]));
 
@@ -2138,7 +2118,7 @@ mod tests {
         store.apply(&update);
 
         assert!(store.has_state());
-        assert!(!store.is_stale());
+        assert!(!store.has_gap());
         assert_eq!(
             store.vessel_count(),
             2,
@@ -2171,8 +2151,8 @@ mod tests {
         store.apply(&delta(7, 5, 6, vec![position(2)]));
 
         assert!(
-            store.is_stale(),
-            "a picture that was not continued is stale"
+            store.has_gap(),
+            "a picture that was not continued is in a gap"
         );
         assert!(
             store.has_state(),
@@ -2190,18 +2170,11 @@ mod tests {
         store.apply(&delta(8, 10, 11, vec![position(2)]));
 
         // §9.4's authoritative code only notes the gap on an epoch change: the old
-        // picture is retained and the stale badge (derived from that gap) is what
+        // picture is retained and the gap (which the pane reports as a failure) is what
         // tells the reader it is no longer being continued. §13's "clear" wording
         // contradicts §9.4; the retained picture is deliberate and is replaced by the
         // next keyframe.
-        assert!(
-            store.gap,
-            "the badge says the held picture is not continued"
-        );
-        assert!(
-            store.is_stale(),
-            "and staleness is derived from the gap, not from a timer",
-        );
+        assert!(store.gap, "the gap says the held picture is not continued");
         assert!(
             store.has_state(),
             "the old picture stays on the map until a keyframe replaces it",
@@ -2223,11 +2196,11 @@ mod tests {
         let mut store = VesselStore::new();
         store.apply(&keyframe(7, 1, vec![position(1)]));
         store.apply(&delta(7, 5, 6, vec![position(2)]));
-        assert!(store.is_stale());
+        assert!(store.has_gap());
 
         store.apply(&keyframe(8, 7, vec![position(3)]));
 
-        assert!(!store.is_stale(), "the keyframe healed the gap");
+        assert!(!store.has_gap(), "the keyframe healed the gap");
         assert!(store.has_state());
         assert_eq!(store.vessel_count(), 1);
         assert_eq!(store.applied, 7);
@@ -2252,8 +2225,7 @@ mod tests {
         store.apply(&frame);
 
         assert!(!store.has_state(), "no state yet is not an empty sea");
-        assert!(store.is_stale(), "and it is not a live picture either");
-        assert_eq!(store.vessel_count(), 0, "the stale picture was cleared");
+        assert_eq!(store.vessel_count(), 0, "the cleared picture is gone");
         assert!(
             store.ships.is_empty(),
             "the ship record was cleared with it",
@@ -2266,38 +2238,6 @@ mod tests {
     }
 
     #[test]
-    fn staleness_should_be_derived_from_the_gap_and_the_local_clock() {
-        let mut store = VesselStore::new();
-        assert!(
-            !store.is_stale(),
-            "a store that never received a push is not stale"
-        );
-
-        store.received_at = Instant::now() - (STALE_AFTER - Duration::from_secs(1));
-        assert!(
-            !store.is_stale(),
-            "a picture inside the window is still live",
-        );
-
-        // Kept a second beyond the window: at exactly the window the strict `>` would race
-        // the clock's resolution rather than test the predicate.
-        store.received_at = Instant::now() - (STALE_AFTER + Duration::from_secs(1));
-        assert!(
-            store.is_stale(),
-            "no push for the whole window is a broken link, heartbeat included",
-        );
-        assert!(
-            !store.has_gap(),
-            "a silent link is silence rather than a picture that was not continued",
-        );
-
-        let mut store = VesselStore::new();
-        store.apply(&keyframe(7, 1, vec![position(1)]));
-        assert!(!store.is_stale(), "a push just arrived");
-        assert!(!store.has_gap());
-    }
-
-    #[test]
     fn a_cleared_store_should_not_apply_a_late_delta() {
         let mut store = VesselStore::new();
         store.apply(&keyframe(7, 10, vec![position(1)]));
@@ -2305,7 +2245,10 @@ mod tests {
         store.clear();
 
         assert!(!store.has_state());
-        assert!(!store.is_stale(), "a stopped store is empty, not stale");
+        assert!(
+            !store.has_gap(),
+            "a stopped store holds nothing a push could have failed to continue",
+        );
         assert_eq!(store.vessel_count(), 0);
         assert_eq!(store.applied, 0);
         assert_eq!(store.epoch, 0);
@@ -2318,7 +2261,7 @@ mod tests {
         );
         assert_eq!(store.vessel_count(), 0);
         assert!(
-            store.is_stale(),
+            store.has_gap(),
             "the late delta is noted as a gap rather than applied",
         );
     }
@@ -2330,7 +2273,7 @@ mod tests {
         let mut store = VesselStore::new();
         store.apply(&keyframe(7, 1, (0..COUNT).map(position).collect()));
         assert_eq!(store.vessel_count(), usize::try_from(COUNT).unwrap());
-        assert!(!store.is_stale());
+        assert!(!store.has_gap());
 
         // A delta is laid over the picture, not clipped against a capacity.
         store.apply(&delta(7, 1, 2, vec![position(COUNT)]));
