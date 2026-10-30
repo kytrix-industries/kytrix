@@ -1104,8 +1104,8 @@ mod tests {
         );
         assert_eq!(update.epoch, 5);
         assert!(!update.keyframe);
-        assert_eq!(update.sequence, 7);
-        assert_eq!(update.base, 6);
+        assert_eq!(update.sequence, 8);
+        assert_eq!(update.base, 7);
         assert_eq!(
             update.ships,
             [GlobalShippingChokepointShip {

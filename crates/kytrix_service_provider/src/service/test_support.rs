@@ -330,8 +330,8 @@ pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingC
     proto_types::GlobalShippingChokepointEvent {
         area: proto_types::GlobalShippingChokepointArea::Hormuz as i32,
         epoch: 5,
-        sequence: 7,
-        base: 6,
+        sequence: 8,
+        base: 7,
         keyframe: false,
         ships: vec![proto_types::GlobalShippingChokepointShip {
             mmsi: 636_000_001,
@@ -373,6 +373,7 @@ pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingC
 pub(super) fn global_shipping_chokepoint_keyframe() -> proto_types::GlobalShippingChokepointEvent {
     proto_types::GlobalShippingChokepointEvent {
         keyframe: true,
+        sequence: 7,
         base: 0,
         removed: Vec::new(),
         ..global_shipping_chokepoint_delta()

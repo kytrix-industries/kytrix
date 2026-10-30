@@ -10,10 +10,12 @@
 //!
 //! # A picture held between pushes
 //!
-//! The service publishes deltas, so the client holds the state: a keyframe replaces
-//! it, and a delta is applied only when it continues the exact picture already held —
-//! the same server epoch and the exact sequence applied last. A push that does not
-//! match is not guessed at; the store notes a gap and the next keyframe heals it.
+//! The service publishes one snapshot when the subscription starts, then deltas. The
+//! session applies those deltas to its own copy and fails the stream when one does not
+//! continue the picture, so a pane normally starts from the session's snapshot and then
+//! only applies continuous increments. The store below still refuses to guess at a
+//! mismatching push: it keeps the last picture under the stale badge instead of applying
+//! it, which is the last line of defence if a mismatching update ever reaches the view.
 //! Staleness is derived from that gap and the local clock rather than written into a
 //! field by a timer: a client in a gap keeps receiving deltas it must ignore, so a
 //! timer would keep resetting the badge into silence while the screen stayed frozen.
@@ -1419,9 +1421,10 @@ fn format_timestamp(timestamp: i64, zone: UtcOffset) -> Option<SmolStr> {
 /// The two tables are the wire's two messages, keyed by MMSI, and they are joined
 /// only when a frame paints them. `epoch` and `applied` are the baseline a delta has
 /// to continue; `gap` says a push did not continue it, so what is held stays on the map
-/// under the stale badge until a keyframe replaces it. `has_state` is what the pane reports as "there is a picture
-/// to draw" — a picture cleared by a keyframe the server stamped with no time is not
-/// one.
+/// under the stale badge. The session normally fails the stream on that same mismatch;
+/// this flag is what keeps the view honest if one still reaches it. `has_state` is what
+/// the pane reports as "there is a picture to draw" — a picture cleared by a keyframe
+/// the server stamped with no time is not one.
 #[derive(Debug)]
 pub(super) struct VesselStore {
     ships: AHashMap<u32, GlobalShippingChokepointShip>,
@@ -1466,10 +1469,11 @@ impl VesselStore {
     ///    after a restart would otherwise be laid over state the process that
     ///    produced it never saw.
     /// 3. A delta that does not continue the picture only notes the gap — nothing is
-    ///    guessed at and nothing is applied. What is already held stays on the map
-    ///    under the stale badge, and the next keyframe replaces it. A new epoch also
-    ///    drops the applied sequence, because it belonged to the process that no
-    ///    longer exists.
+    ///    guessed at and nothing is applied. The session fails the stream on the same
+    ///    mismatch and the pane takes a fresh snapshot when the user retries; if one
+    ///    still reaches this store, what is already held stays on the map under the
+    ///    stale badge. A new epoch also drops the applied sequence, because it belonged
+    ///    to the process that no longer exists.
     /// 4. Staleness is derived from the gap by [`is_stale`](Self::is_stale); it is
     ///    never written by a timer.
     ///

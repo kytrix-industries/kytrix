@@ -37,7 +37,9 @@ use yawc::{Frame, WebSocketError};
 
 use super::{
     connector::KytrixServiceConnector,
-    global_shipping_chokepoint::{GlobalShippingChokepointArea, GlobalShippingChokepointUpdate},
+    global_shipping_chokepoint::{
+        GlobalShippingChokepointArea, GlobalShippingChokepointState, GlobalShippingChokepointUpdate,
+    },
 };
 use crate::{
     account_profile::AccountProfile,
@@ -915,15 +917,20 @@ pub(super) struct ServiceSessionActor {
     pub subscribers: AHashMap<u64, LocalSubscriber>,
     pub topics: AHashMap<ServiceTopic, AHashSet<u64>>,
     pub latest_financial_index: AHashMap<FinancialIndexTopic, FinancialIndexEvent>,
-    /// The last keyframe a session delivered for each AIS area.
+    /// The complete AIS picture the session holds for each area.
     ///
-    /// A later local subscriber of an area the session is already subscribed to would
-    /// otherwise join the stream after its keyframe: the server replays a keyframe only
-    /// for a topic a connection adds, and this session is one connection. The pane would
-    /// be left without a baseline until the server's next keyframe (up to its 300 s
-    /// fallback), so the session hands the joining subscriber the last keyframe it saw.
-    pub latest_global_shipping_chokepoint_keyframes:
-        AHashMap<GlobalShippingChokepointArea, GlobalShippingChokepointUpdate>,
+    /// The API sends a keyframe only when the connection subscribes to an area and only
+    /// deltas after it. Applying those deltas here is what lets a later local subscriber
+    /// of the same area start from the current picture without another server snapshot.
+    pub global_shipping_chokepoint_states:
+        AHashMap<GlobalShippingChokepointArea, GlobalShippingChokepointState>,
+    /// Areas whose next frame must be the server's snapshot.
+    ///
+    /// A connection that re-subscribes an area can still have increments queued from the
+    /// previous subscription, and the server enqueues the new snapshot behind them.
+    /// Until that snapshot arrives, an increment belongs to a picture this session no
+    /// longer holds, so it is dropped rather than treated as a gap.
+    pub global_shipping_chokepoint_awaiting_snapshot: AHashSet<GlobalShippingChokepointArea>,
     pub session_state: Option<KytrixSessionState>,
     pub subscriptions_dirty: bool,
     pub websocket: Option<RawWebSocket>,

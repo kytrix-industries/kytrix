@@ -2455,6 +2455,7 @@ mod tests {
         server.send_x_profile();
         server.send_ethereum_wallet_transfer("typed-ethereum-wallet");
         server.send_solana_wallet_transfer("typed-solana-wallet");
+        server.send_global_shipping_chokepoint_keyframe();
         server.send_global_shipping_chokepoint_delta();
 
         assert_eq!(
@@ -2497,6 +2498,12 @@ mod tests {
                 .event_id,
             "typed-solana-wallet"
         );
+        let snapshot = timeout(Duration::from_secs(2), global_shipping_chokepoint.recv())
+            .await
+            .expect("AIS snapshot should arrive")
+            .expect("AIS subscription should remain active");
+        assert!(snapshot.keyframe);
+        assert_eq!(snapshot.sequence, 7);
         assert_eq!(
             timeout(Duration::from_secs(2), global_shipping_chokepoint.recv())
                 .await
@@ -2560,11 +2567,11 @@ mod tests {
 
     /// A second pane of the same account joins a topic this session already follows.
     ///
-    /// The server replays an area's keyframe only when a connection adds its topic, and
-    /// both panes share this connection: without the session's own replay the second pane
-    /// would receive only deltas it cannot apply until the server's fallback keyframe.
+    /// The server sends a snapshot only when a connection adds a topic, and both panes
+    /// share this connection: the session applies the deltas it received and synthesizes
+    /// the joining pane's snapshot from the picture it already holds.
     #[tokio::test]
-    async fn a_second_global_shipping_chokepoint_subscription_should_start_from_the_keyframe_the_session_holds()
+    async fn a_second_global_shipping_chokepoint_subscription_should_start_from_the_session_snapshot()
      {
         let mut server = TestServiceServer::spawn(false).await;
         let connector =
@@ -2591,9 +2598,16 @@ mod tests {
         server.send_global_shipping_chokepoint_keyframe();
         let keyframe = timeout(Duration::from_secs(2), first.recv())
             .await
-            .expect("the keyframe should arrive")
+            .expect("the snapshot should arrive")
             .expect("the first subscription should remain active");
         assert!(keyframe.keyframe);
+
+        server.send_global_shipping_chokepoint_delta();
+        let delta = timeout(Duration::from_secs(2), first.recv())
+            .await
+            .expect("the delta should arrive")
+            .expect("the first subscription should remain active");
+        assert!(!delta.keyframe);
 
         let mut second = session
             .subscribe_global_shipping_chokepoint(GlobalShippingChokepointArea::Hormuz)
@@ -2602,9 +2616,14 @@ mod tests {
         assert_eq!(
             timeout(Duration::from_secs(2), second.recv())
                 .await
-                .expect("the replayed keyframe should arrive")
+                .expect("the synthesized snapshot should arrive")
                 .expect("the second subscription should remain active"),
-            keyframe,
+            GlobalShippingChokepointUpdate {
+                keyframe: true,
+                base: 0,
+                removed: Vec::new(),
+                ..delta
+            },
             "the joining pane should start from the picture already held",
         );
         assert!(second.try_recv_for_test().is_err());
