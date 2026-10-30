@@ -662,8 +662,8 @@ widget:
       ship_name: Vessel name
       ship_type: Vessel type
       speed: Speed over ground
-      static_updated_at: Static data updated
-      updated: Server receipt time
+      static_updated_at: Static data updated at
+      updated: Dynamic data updated at
     label:
       city:
         abu_dhabi: Abu Dhabi
@@ -740,7 +740,6 @@ widget:
     vessel_count: '%{count} vessels'
     vessel_count_one: 1 vessel
     view_plans: View plans
-    waiting_data: Waiting for the first positions to arrive
   hyperliquid_wallet:
     add: Add monitored address
     age_days: '%{value}d ago'

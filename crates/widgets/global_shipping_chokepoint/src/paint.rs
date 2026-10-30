@@ -1118,11 +1118,10 @@ mod tests {
         /// The triangles `layers` draws under `filter`, plus the hover ring.
         ///
         /// The ring is drawn only when a vessel is hovered; counting it always is the
-        /// worst case. The labels, the legend, the card, the badge, the empty state and
-        /// the canvas' own sea fill are elements rather than path triangles, and the
-        /// plan's 8.58 ms intercept already carries them, which is why they are not
-        /// counted here. The vessels are part of the nine paths, so nothing is added
-        /// twice.
+        /// worst case. The labels, the legend, the card, the badge and the canvas' own
+        /// sea fill are elements rather than path triangles, and the plan's 8.58 ms
+        /// intercept already carries them, which is why they are not counted here. The
+        /// vessels are part of the nine paths, so nothing is added twice.
         fn of(layers: &MapLayers, ring: &Path<Pixels>, filter: RoadFilter) -> Self {
             let [class_zero, primary] = &layers.roads;
             let (roads_coarse, roads_middle, roads_fine) = match filter {

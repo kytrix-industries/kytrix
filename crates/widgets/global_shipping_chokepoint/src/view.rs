@@ -6,9 +6,9 @@
 //! One canvas, under elements that carry the words. The base map's coastline, borders and
 //! roads are layers parsed once by [`crate::scene`]; [`crate::paint`] turns them and the
 //! vessel markers into the paths the canvas paints for the frame's camera, and the labels,
-//! the legend, the hover card, the stale badge and the empty state are absolutely
-//! positioned over it. Nothing tessellates per frame: a frame only applies the camera's
-//! affine transform to geometry that was prepared once.
+//! the legend, the hover card and the stale badge are absolutely positioned over it.
+//! Nothing tessellates per frame: a frame only applies the camera's affine transform to
+//! geometry that was prepared once.
 //!
 //! # What the pane reports, and what it holds
 //!
@@ -22,15 +22,14 @@
 //!
 //! The framework draws the placeholder, the banner and the spinner, and it only embeds
 //! this body when [`GlobalShippingChokepointWidget::has_content`] is true. So there is no state
-//! branch here: the body is what a pane with a picture draws, and an empty sea is drawn
-//! as a map with the catalogue's own "no data" on it.
+//! branch here: the body is what a pane with a picture draws, and a picture holding no
+//! vessel is drawn as the map it is — the legend's count is what says the strait is empty.
 
 use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
-    empty_state::EmptyState,
     size::UnifiedSize,
     style::theme::{Theme, ThemeExt},
 };
@@ -178,7 +177,10 @@ fn label_text(cx: &App, key: &str, kind: LabelKind) -> SharedString {
 }
 
 /// How wide the hover card is.
-const CARD_WIDTH: f32 = 208.0;
+///
+/// It is set by the longest row the card draws: the two update times are
+/// `YYYY-MM-DD HH:MM:SS`, and a card any narrower cut the value off behind an ellipsis.
+const CARD_WIDTH: f32 = 228.0;
 
 /// How far the hover card is kept off the hull it describes, and off the pane's edges.
 const CARD_MARGIN: f32 = 12.0;
@@ -454,9 +456,9 @@ impl WidgetView for GlobalShippingChokepointWidget {
     /// A pane is content once an AIS picture has arrived.
     ///
     /// It is the picture that decides, not the number of vessels in it: an empty strait is
-    /// a picture the pane draws the empty state on, while a pane that has not received one
-    /// yet has nothing to draw at all — not even an empty sea, which would claim the
-    /// service answered.
+    /// a picture the pane draws the map for, while a pane that has not received one yet has
+    /// nothing to draw at all — not even an empty sea, which would claim the service
+    /// answered.
     fn has_content(&self) -> bool {
         self.vessels.has_state()
     }
@@ -1103,32 +1105,6 @@ impl GlobalShippingChokepointWidget {
             .into_any_element()
     }
 
-    /// The map with the catalogue's "no data" over it, for a picture that holds no vessel.
-    ///
-    /// The map itself stays behind it: a strait with nothing in it is still the strait, and
-    /// the empty state says which of "nothing there" and "nothing arrived" is being read.
-    fn empty_state(&self, colors: MapColors, cx: &App) -> AnyElement {
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(4.0))
-            .child(EmptyState::new(
-                "GlobalShippingChokepointEmpty",
-                t!(cx, "common.no_data"),
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors.muted)
-                    .child(t!(cx, "widget.global_shipping_chokepoint.waiting_data")),
-            )
-            .into_any_element()
-    }
-
     /// The card of the vessel under the pointer, kept inside the pane and off its hull.
     fn hover_card(
         &self,
@@ -1299,8 +1275,6 @@ impl Render for GlobalShippingChokepointWidget {
             .vessels
             .is_stale()
             .then(|| self.stale_badge(colors, cx));
-        let empty = (self.vessels.has_state() && self.vessels.vessel_count() == 0)
-            .then(|| self.empty_state(colors, cx));
         let card = self.hovered.and_then(|mmsi| {
             let projection = projection?;
             let details = self.vessels.display(mmsi, zone)?;
@@ -1348,7 +1322,6 @@ impl Render for GlobalShippingChokepointWidget {
             .child(legend)
             .when_some(stale, |this, stale| this.child(stale))
             .when_some(card, |this, card| this.child(card))
-            .when_some(empty, |this, empty| this.child(empty))
     }
 }
 
@@ -1803,10 +1776,11 @@ mod tests {
         });
     }
 
-    /// An empty picture is still a picture: the pane draws the map and says it holds no
-    /// vessel, rather than leaving the framework's spinner up for ever.
+    /// An empty picture is still a picture: the pane draws the map and its legend, rather
+    /// than leaving the framework's spinner up for ever or covering the strait with a
+    /// placeholder of its own.
     #[gpui_kit::test]
-    fn an_empty_keyframe_should_be_ready_with_the_empty_state(cx: &mut TestAppContext) {
+    fn an_empty_keyframe_should_be_ready_with_the_map_alone(cx: &mut TestAppContext) {
         let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
 
         cx.update(|cx| {
@@ -1819,16 +1793,16 @@ mod tests {
 
         let window = map_window(cx, &pane);
         assert!(
-            window.debug_bounds("EMPTY_STATE").is_some(),
-            "a picture with no vessel says it holds none",
-        );
-        assert!(
             window.debug_bounds("TEST_CHOKEPOINT_MAP").is_some(),
-            "the map stays behind the empty state",
+            "an empty strait is still drawn as the strait",
         );
         assert!(
             window.debug_bounds("TEST_CHOKEPOINT_LEGEND").is_some(),
             "the legend is part of the ready body",
+        );
+        assert!(
+            window.debug_bounds("EMPTY_STATE").is_none(),
+            "a picture with no vessel carries no placeholder of its own",
         );
     }
 
@@ -2432,7 +2406,6 @@ mod tests {
             install(cx, Some(ACCOUNT));
 
             let mut keys = vec![
-                "common.no_data",
                 "error.global_shipping_chokepoint.map_asset",
                 "widget.names.global_shipping_chokepoint",
                 "widget.global_shipping_chokepoint.attribution",
@@ -2444,7 +2417,6 @@ mod tests {
                 "widget.global_shipping_chokepoint.vessel_count",
                 "widget.global_shipping_chokepoint.vessel_count_one",
                 "widget.global_shipping_chokepoint.view_plans",
-                "widget.global_shipping_chokepoint.waiting_data",
             ];
             keys.extend(HOVER_KEYS);
             keys.extend(SHIP_TYPE_KEYS);

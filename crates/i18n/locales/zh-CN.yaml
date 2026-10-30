@@ -662,8 +662,8 @@ widget:
       ship_name: 船名
       ship_type: 船型
       speed: 对地航速
-      static_updated_at: 静态数据更新时间
-      updated: 服务端接收时间
+      static_updated_at: 静态数据更新于
+      updated: 动态数据更新于
     label:
       city:
         abu_dhabi: 阿布扎比
@@ -740,7 +740,6 @@ widget:
     vessel_count: '%{count} 艘'
     vessel_count_one: 1 艘
     view_plans: 查看订阅方案
-    waiting_data: 等待首批船位数据
   hyperliquid_wallet:
     add: 添加监控地址
     age_days: '%{value} 天前'
