@@ -35,10 +35,10 @@ use base_ui::{
     style::theme::{Theme, ThemeExt},
 };
 use gpui_kit::{
-    AnyElement, App, Bounds, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseMoveEvent, ParentElement, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, point, prelude::FluentBuilder, px,
+    AnyElement, App, Bounds, Context, ElementId, Entity, FontStyle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement, PinchEvent,
+    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 use i18n::t;
 use kytrix_service_provider::{
@@ -68,8 +68,8 @@ use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, Camera, LabelKind, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, Projection, STALE_AFTER,
-        ShipClass, Vessel, VesselDetails, VesselStore, colour_for, place_labels,
+        self, Camera, LabelKind, LabelSize, MAX_VESSELS, MAX_ZOOM, MIN_ZOOM, Projection,
+        STALE_AFTER, ShipClass, Vessel, VesselDetails, VesselStore, colour_for, place_labels,
     },
     paint::paint_map,
     scene::{self, Scene, SceneError},
@@ -109,6 +109,54 @@ const COUNTRY_LABEL_TEXT_SIZE: f32 = 21.0;
 /// A step over the water's `text_xs` and well under the country's, so the three kinds of
 /// word read in the order a paper atlas prints them in.
 const CITY_LABEL_TEXT_SIZE: f32 = 13.0;
+
+/// The box one label's text occupies, shaped in the style the frame draws it in.
+///
+/// The width is the shaped line's own, so a Chinese name is measured as narrow as it is
+/// drawn and an English one as wide — which is the whole reason the placement is handed a
+/// measured size rather than a count of characters. The height is one em: that is the
+/// extent the glyphs themselves take, while the line box the text style resolves to is
+/// 1.618 of it for the paragraph rhythm, and using that would keep two names apart that a
+/// reader would see as two clear lines.
+fn label_size(window: &Window, kind: LabelKind, text: &str) -> LabelSize {
+    let font_size = match kind {
+        LabelKind::Country => px(COUNTRY_LABEL_TEXT_SIZE),
+        LabelKind::City => px(CITY_LABEL_TEXT_SIZE),
+        // The water's `.text_xs()`: three quarters of the window's rem.
+        LabelKind::Water => window.rem_size() * 0.75,
+    };
+    let mut style = window.text_style();
+    style.font_size = font_size.into();
+    style.font_weight = match kind {
+        LabelKind::Country => FontWeight::BOLD,
+        LabelKind::Water | LabelKind::City => FontWeight::NORMAL,
+    };
+    style.font_style = match kind {
+        LabelKind::Country | LabelKind::Water => FontStyle::Italic,
+        LabelKind::City => FontStyle::Normal,
+    };
+    let line = window.text_system().shape_line(
+        SharedString::new(text),
+        font_size,
+        &[style.to_run(text.len())],
+        None,
+    );
+    LabelSize {
+        width: f32::from(line.width()),
+        height: f32::from(font_size),
+    }
+}
+
+/// The text one label reads in the language being read.
+///
+/// A country is upper case — an atlas prints `IRAN`, not `Iran` — and that is part of the
+/// label, so the measurement above has to be given the same string the frame draws.
+fn label_text(cx: &App, key: &str, kind: LabelKind) -> SharedString {
+    match kind {
+        LabelKind::Country => SharedString::from(t!(cx, key).to_uppercase()),
+        LabelKind::Water | LabelKind::City => t!(cx, key),
+    }
+}
 
 /// How opaque a lane is drawn over the sea.
 const DASH_ALPHA: f32 = 0.55;
@@ -797,17 +845,22 @@ impl GlobalShippingChokepointWidget {
         cx.notify();
     }
 
-    /// The map's labels: five countries, the cities, and two seas.
+    /// The map's labels: five countries, thirty-one cities, and two seas.
     ///
-    /// [`place_labels`] decides which anchors a frame draws and in what order, so the
-    /// crowded cities at the fitted zoom are decluttered the same way on every frame and
-    /// in every language.
+    /// [`place_labels`] decides which boxes a frame draws and in what order. It needs the
+    /// size of each name to do it, because what must not overlap is the text and not the
+    /// anchor — so every name is shaped here, in the language being read, before the
+    /// placement runs. Measuring is what makes the rule language-independent in the way
+    /// that matters: `迪拜` takes 26 px and `DUBAI` 38 px, and the placement is told which
+    /// one this frame draws.
     ///
     /// A label is positioned by its anchor, and GPUI lays an absolute child out by its
     /// top-left corner with no transform to shift it by half its own size. Each label is
     /// therefore a box of a fixed size that is centred on the anchor, with the text
     /// centred inside it: the text's own box lands on the anchor rather than hanging
-    /// down-right of it, which is what the old corner-anchored labels did.
+    /// down-right of it, which is what the old corner-anchored labels did. The box is
+    /// wider than any name so the text never wraps, and it draws nothing of its own, so
+    /// it is not the box the placement measures.
     ///
     /// The countries are drawn in the default foreground rather than the design's
     /// `fg.subtle`: subtle reads about 2:1 on the land, and these are the only words drawn
@@ -818,41 +871,50 @@ impl GlobalShippingChokepointWidget {
     /// is the map's largest word, bold and italic, a city is a step under it, and water is
     /// the smallest and the only muted one. That is the order a paper atlas prints them in,
     /// and it is what makes a country read as a region rather than as another place name.
-    fn labels(&self, projection: Projection, colors: MapColors, cx: &App) -> Vec<AnyElement> {
-        place_labels(projection)
-            .into_iter()
-            .map(|label| {
-                let [x, y] = label.at;
-                let text = match label.kind {
-                    LabelKind::Country => div()
-                        .text_size(px(COUNTRY_LABEL_TEXT_SIZE))
-                        .font_weight(FontWeight::BOLD)
-                        .italic()
-                        .text_color(colors.text)
-                        .child(SharedString::from(t!(cx, label.key).to_uppercase())),
-                    LabelKind::Water => div()
-                        .text_xs()
-                        .italic()
-                        .text_color(colors.muted)
-                        .child(t!(cx, label.key)),
-                    LabelKind::City => div()
-                        .text_size(px(CITY_LABEL_TEXT_SIZE))
-                        .text_color(colors.text)
-                        .child(t!(cx, label.key)),
-                };
-                div()
-                    .absolute()
-                    .left(px(x - LABEL_BOX_WIDTH / 2.0))
-                    .top(px(y - LABEL_BOX_HEIGHT / 2.0))
-                    .w(px(LABEL_BOX_WIDTH))
-                    .h(px(LABEL_BOX_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(text)
-                    .into_any_element()
-            })
-            .collect()
+    fn labels(
+        &self,
+        projection: Projection,
+        colors: MapColors,
+        window: &Window,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        place_labels(projection, |label, kind| {
+            label_size(window, kind, &label_text(cx, label.key, kind))
+        })
+        .into_iter()
+        .map(|label| {
+            let [x, y] = label.at;
+            let text = label_text(cx, label.key, label.kind);
+            let text = match label.kind {
+                LabelKind::Country => div()
+                    .text_size(px(COUNTRY_LABEL_TEXT_SIZE))
+                    .font_weight(FontWeight::BOLD)
+                    .italic()
+                    .text_color(colors.text)
+                    .child(text),
+                LabelKind::Water => div()
+                    .text_xs()
+                    .italic()
+                    .text_color(colors.muted)
+                    .child(text),
+                LabelKind::City => div()
+                    .text_size(px(CITY_LABEL_TEXT_SIZE))
+                    .text_color(colors.text)
+                    .child(text),
+            };
+            div()
+                .absolute()
+                .left(px(x - LABEL_BOX_WIDTH / 2.0))
+                .top(px(y - LABEL_BOX_HEIGHT / 2.0))
+                .w(px(LABEL_BOX_WIDTH))
+                .h(px(LABEL_BOX_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(text)
+                .into_any_element()
+        })
+        .collect()
     }
 
     /// The legend's line for the size of the picture.
@@ -1114,7 +1176,7 @@ impl GlobalShippingChokepointWidget {
 }
 
 impl Render for GlobalShippingChokepointWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = MapColors::resolve(cx.theme());
         let zone = data_time_zone(cx);
 
@@ -1169,7 +1231,9 @@ impl Render for GlobalShippingChokepointWidget {
             .map(|bounds| Projection::new(self.frame.camera.get(), viewport_of(bounds)));
         let labels = projection
             .filter(|projection| projection.drawable())
-            .map_or_else(Vec::new, |projection| self.labels(projection, colors, cx));
+            .map_or_else(Vec::new, |projection| {
+                self.labels(projection, colors, window, cx)
+            });
         let legend = self.legend(colors, cx);
         let attribution = self.attribution(colors, cx);
         let stale = self
@@ -1280,7 +1344,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{CITY_LABELS, COUNTRY_LABELS, HIT_RADIUS_PX, WATER_LABELS},
+        model::{CITY_LABELS, CITY_LABELS_LATE, COUNTRY_LABELS, HIT_RADIUS_PX, WATER_LABELS},
         service::{
             AisStreamError, AisStreamMessage, GlobalShippingChokepointEventSubscription,
             GlobalShippingChokepointSession,
@@ -2329,6 +2393,7 @@ mod tests {
             keys.extend(NAV_STATUS_KEYS);
             keys.extend(COUNTRY_LABELS.iter().map(|label| label.key));
             keys.extend(CITY_LABELS.iter().map(|label| label.key));
+            keys.extend(CITY_LABELS_LATE.iter().map(|label| label.key));
             keys.extend(WATER_LABELS.iter().map(|label| label.key));
 
             for language in [LanguageCode::En, LanguageCode::ZhCn] {
@@ -2354,6 +2419,121 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The fitted view names the Gulf's coast: the cities a reader looks for are on it, the
+    /// names that are drawn do not print over each other, and the two names the island
+    /// cannot hold are the ones that wait for a zoom.
+    ///
+    /// The widths here are the shaped ones, so this is the test that measures the density
+    /// the pane was designed around: `model.rs` covers the rule with the widest name of
+    /// each kind, and this one covers what the font actually does in both languages.
+    #[gpui_kit::test]
+    fn the_fitted_view_should_name_the_gulfs_coast_cities(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        let window = map_window(cx, &pane);
+        // The pane the density was measured on: 1,404 x 900 of canvas.
+        window.simulate_resize(size(px(1_436.0), px(932.0)));
+        window.run_until_parked();
+        repaint(window);
+
+        let (keys, viewport) = window.update(|window, cx| {
+            let pane = pane.read(cx);
+            let bounds = pane.frame.bounds.get().expect("the map has a box");
+            let viewport = viewport_of(bounds);
+            let projection = Projection::new(pane.frame.camera.get(), viewport);
+            let measure = |label: &model::PlacedLabel| {
+                label_size(window, label.kind, &label_text(cx, label.key, label.kind))
+            };
+            let placed = place_labels(projection, |label, kind| {
+                label_size(window, kind, &label_text(cx, label.key, kind))
+            });
+
+            let boxes: Vec<[f32; 4]> = placed
+                .iter()
+                .map(|label| {
+                    let size = measure(label);
+                    [
+                        label.at[0] - size.width / 2.0,
+                        label.at[1] - size.height / 2.0,
+                        label.at[0] + size.width / 2.0,
+                        label.at[1] + size.height / 2.0,
+                    ]
+                })
+                .collect();
+            for (index, label) in placed.iter().enumerate() {
+                for (earlier, other) in placed[..index].iter().enumerate() {
+                    let (left, right) = (boxes[index], boxes[earlier]);
+                    assert!(
+                        left[2] + model::LABEL_GAP_PX <= right[0]
+                            || right[2] + model::LABEL_GAP_PX <= left[0]
+                            || left[3] + model::LABEL_GAP_PX <= right[1]
+                            || right[3] + model::LABEL_GAP_PX <= left[1],
+                        "{} and {} print over each other",
+                        other.key,
+                        label.key,
+                    );
+                }
+            }
+            (
+                placed.iter().map(|label| label.key).collect::<Vec<_>>(),
+                viewport,
+            )
+        });
+        assert!(
+            viewport[0] > 1_380.0 && viewport[1] > 890.0,
+            "the pane is the one the density was measured on: {viewport:?}",
+        );
+
+        // Twenty-eight of the thirty-one cities fit here; the three that do not are the two
+        // names a bigger name covers and the island capital.
+        let cities = keys.iter().filter(|key| key.contains(".city.")).count();
+        assert!(cities >= 26, "the fitted view names {cities} cities");
+        for city in [
+            "city.dubai",
+            "city.abu_dhabi",
+            "city.jebel_ali",
+            "city.doha",
+            "city.dammam",
+            "city.bandar_abbas",
+            "city.fujairah",
+            "city.muscat",
+            "city.sohar",
+            "city.ras_laffan",
+        ] {
+            assert!(
+                keys.iter().any(|key| key.ends_with(city)),
+                "{city} is not on the fitted view",
+            );
+        }
+        for city in ["city.sharjah", "city.mesaieed"] {
+            assert!(
+                !keys.iter().any(|key| key.ends_with(city)),
+                "{city} has no room beside the name that covers it",
+            );
+        }
+        assert!(
+            !keys.iter().any(|key| key.ends_with("city.manama")),
+            "Bahrain's own name covers its capital at the fitted zoom",
+        );
+
+        // The island has grown enough for both names by the zoom the capital waits for.
+        let zoomed = window.update(|window, cx| {
+            let camera = Camera {
+                center: model::project(50.58, 26.22),
+                zoom: model::CITY_LABEL_LATE_ZOOM,
+            }
+            .clamped(viewport);
+            place_labels(Projection::new(camera, viewport), |label, kind| {
+                label_size(window, kind, &label_text(cx, label.key, kind))
+            })
+        });
+        assert!(
+            zoomed
+                .iter()
+                .any(|label| label.key.ends_with("city.manama")),
+            "the capital is named once the island is zoomed in",
+        );
     }
 
     /// The words drawn straight on the map fills clear the contrast a paragraph is held to in

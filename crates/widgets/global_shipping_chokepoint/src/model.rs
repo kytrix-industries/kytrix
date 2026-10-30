@@ -1,6 +1,6 @@
 //! What a pane drawing the Strait of Hormuz knows, and how it is drawn.
 //!
-//! The map is largely fixed — a coastline, a lane sketch, nineteen labels — and the
+//! The map is largely fixed — a coastline, a lane sketch, thirty-eight labels — and the
 //! only part that moves is the vessel layer. This module owns the fixed half of that
 //! picture (bounds, projection, label anchors, lanes), the four buckets vessels are
 //! coloured by, the flag-state table, the camera and its clamping, and the store one
@@ -388,6 +388,11 @@ pub(super) struct MapLabel {
 }
 
 /// The five countries the map names.
+///
+/// Qatar's name sits in the south-west of its peninsula rather than on the middle of it:
+/// a name is centred on its anchor, and at the fitted zoom the middle of Qatar is inside
+/// Doha's own name. Bahrain's stays on its island, which is why the island's capital is
+/// named later (see [`CITY_LABELS_LATE`]).
 pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.country.iran",
@@ -403,7 +408,7 @@ pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
     },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.country.qatar",
-        at: [51.2, 25.15],
+        at: [51.05, 24.85],
     },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.country.bahrain",
@@ -411,23 +416,40 @@ pub(super) const COUNTRY_LABELS: [MapLabel; 5] = [
     },
 ];
 
-/// The twelve cities the map names.
-pub(super) const CITY_LABELS: [MapLabel; 12] = [
+/// The thirty cities the map names, the ones a reader is most likely to look for first.
+///
+/// The order is the priority a crowded frame falls back on: Dubai before the emirates
+/// around it, the ports on the strait before the towns further up the Gulf. It is not a
+/// ranking by size — Al Hofuf has more people than Ras Laffan — but by what this map is
+/// about: the water, the terminals on it, and the cities that name them.
+pub(super) const CITY_LABELS: [MapLabel; 30] = [
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.dubai",
+        at: [55.27, 25.20],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.abu_dhabi",
+        at: [54.37, 24.45],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.jebel_ali",
+        at: [55.03, 25.01],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.sharjah",
+        at: [55.40, 25.35],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.doha",
+        at: [51.53, 25.29],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.dammam",
+        at: [50.10, 26.43],
+    },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.city.bandar_abbas",
         at: [56.27, 27.18],
-    },
-    MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.qeshm",
-        at: [55.95, 26.95],
-    },
-    MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
-        at: [55.45, 26.55],
-    },
-    MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.khasab",
-        at: [56.25, 26.18],
     },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.city.fujairah",
@@ -438,30 +460,101 @@ pub(super) const CITY_LABELS: [MapLabel; 12] = [
         at: [55.95, 25.79],
     },
     MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.sharjah",
-        at: [55.40, 25.35],
+        key: "widget.global_shipping_chokepoint.label.city.muscat",
+        at: [58.40, 23.60],
     },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.city.al_jubayl",
         at: [49.65, 27.00],
     },
     MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.al_hofuf",
-        at: [49.59, 25.36],
-    },
-    MapLabel {
         key: "widget.global_shipping_chokepoint.label.city.chabahar",
         at: [60.62, 25.29],
     },
     MapLabel {
-        key: "widget.global_shipping_chokepoint.label.city.muscat",
-        at: [58.40, 23.60],
+        key: "widget.global_shipping_chokepoint.label.city.khasab",
+        at: [56.25, 26.18],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.qeshm",
+        at: [55.95, 26.95],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
+        at: [55.45, 26.55],
     },
     MapLabel {
         key: "widget.global_shipping_chokepoint.label.city.sur",
         at: [59.53, 22.57],
     },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.khor_fakkan",
+        at: [56.36, 25.34],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.ajman",
+        at: [55.51, 25.40],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.ras_tanura",
+        at: [50.16, 26.65],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.ras_laffan",
+        at: [51.55, 25.90],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.sohar",
+        at: [56.75, 24.35],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.mesaieed",
+        at: [51.55, 24.98],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.al_hofuf",
+        at: [49.59, 25.36],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.al_ain",
+        at: [55.74, 24.21],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.ruwais",
+        at: [52.73, 24.11],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.bushehr",
+        at: [50.84, 28.92],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.asaluyeh",
+        at: [52.61, 27.48],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.jask",
+        at: [57.77, 25.64],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.kish",
+        at: [53.98, 26.53],
+    },
+    MapLabel {
+        key: "widget.global_shipping_chokepoint.label.city.barka",
+        at: [57.89, 23.68],
+    },
 ];
+
+/// The one city the map names only once it is zoomed in.
+///
+/// Manama is the capital of an island twenty pixels across at the fitted zoom, so
+/// `BAHRAIN` — a country name four times the island's own width — covers it. The city is
+/// not dropped for good: it is placed after the fitted view's labels, from
+/// [`CITY_LABEL_LATE_ZOOM`], where the island has grown enough to hold both.
+pub(super) const CITY_LABELS_LATE: [MapLabel; 1] = [MapLabel {
+    key: "widget.global_shipping_chokepoint.label.city.manama",
+    at: [50.58, 26.22],
+}];
 
 /// The two bodies of water the map names.
 pub(super) const WATER_LABELS: [MapLabel; 2] = [
@@ -852,7 +945,7 @@ impl Projection {
     }
 }
 
-/// The label layers, in the order the map places them when two anchors collide.
+/// The label layers, in the order the map places them when two names collide.
 ///
 /// Countries and seas are large areas the reader orients by; a city is a point inside
 /// them. That order is also the priority: a city name never displaces a country or a sea
@@ -879,81 +972,99 @@ pub(super) struct PlacedLabel {
     pub at: [f32; 2],
 }
 
-/// The zoom the cities are named from: the fitted zoom itself.
+/// The box one label's text occupies on the canvas, in pixels.
 ///
-/// A city is a point, so its name is only worth drawing once the map is at least as
-/// detailed as the fitted view; lowering this from 1.6 to the fit is what shows the
-/// strait's cities at 1×. The declutter rule below keeps them from piling up there.
-pub(super) const CITY_LABEL_ZOOM: f32 = MIN_ZOOM;
+/// The frame that draws a label measures its own text and hands the size here, because
+/// the names come from the catalogue: `DUBAI` and `迪拜` are the same label and not the
+/// same width, and a rule that counted characters would either crowd the Chinese name or
+/// waste room on the English one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LabelSize {
+    /// How wide the shaped line is.
+    pub width: f32,
+    /// How tall one line of it is.
+    pub height: f32,
+}
 
-/// How close two placed anchors may sit before the later label is dropped, in pixels.
+/// How close two labels' boxes may come before the later one is dropped, in pixels.
 ///
-/// The cities around the strait are the crowded case: at the fitted zoom their anchors are
-/// a few dozen pixels apart while their centred names are up to a hundred pixels wide, so
-/// drawing every one of them would print a single unreadable pile. The rule is
-/// anchor-to-anchor rather than text-to-text because the names come from the catalogue and
-/// change with the language: a fixed screen distance is deterministic and
-/// language-independent, and at this distance no two names this map draws overlap (the
-/// test below measures the boxes on the 1× view).
-pub(super) const LABEL_MIN_SEPARATION_PX: f32 = 72.0;
+/// What must not overlap is the *text*, not the anchor: the names are centred on their
+/// anchors, and this coast runs north-east, so two cities twenty pixels apart are still
+/// two readable names when one sits above the other. An anchor-to-anchor distance cannot
+/// tell that case from the one where two names really would print over each other, and at
+/// the distance that covers the second it also throws away half the first.
+///
+/// The same gap is what a box keeps from the pane's edge: a name cut in half by the pane
+/// reads as a defect, while a name that appears when the map is panned away from the edge
+/// does not.
+pub(super) const LABEL_GAP_PX: f32 = 4.0;
 
-/// How far inside the canvas a label's anchor has to sit for the name to fit, in pixels.
+/// The zoom the late cities are named from.
 ///
-/// A label is centred on its anchor, so half of it hangs to each side: an anchor nearer the
-/// canvas edge than half the name's width would have that half cut off by the pane. A city's
-/// or a sea's name is short enough that half the longest of them is this margin; a country's
-/// is the long one, and it has its own ([`COUNTRY_LABEL_EDGE_MARGIN_PX`]). A label that
-/// cannot fit is not drawn — a name cut in half at the pane's edge reads as a defect, while
-/// a name that appears when the map is panned away from the edge does not.
-pub(super) const LABEL_EDGE_MARGIN_PX: f32 = 80.0;
-
-/// The margin a country's name needs: half of the widest of them, `UNITED ARAB EMIRATES`.
-///
-/// 141 px at the 12 px size, so about 247 px at the country's 21 px step (a little more in
-/// bold italic); half of that, rounded up. Keeping it out of [`LABEL_EDGE_MARGIN_PX`] is
-/// what lets the country grow without costing the fitted view any of its cities.
-const COUNTRY_LABEL_EDGE_MARGIN_PX: f32 = 130.0;
+/// See [`CITY_LABELS_LATE`]: the country that holds them is smaller than its own name
+/// until the map is this far in.
+pub(super) const CITY_LABEL_LATE_ZOOM: f32 = 1.6;
 
 /// The labels one frame draws, in priority order.
 ///
-/// A label whose anchor is too close to the canvas edge for its name to fit (see
-/// [`LABEL_EDGE_MARGIN_PX`]) is not built at all, and one whose anchor is closer than
-/// [`LABEL_MIN_SEPARATION_PX`] to a label already placed is skipped: the first of a crowded
-/// pair is the higher-priority one, because the layers are visited in that order.
-pub(super) fn place_labels(projection: Projection) -> Vec<PlacedLabel> {
-    let mut placed: Vec<PlacedLabel> =
-        Vec::with_capacity(COUNTRY_LABELS.len() + WATER_LABELS.len() + CITY_LABELS.len());
-    for (kind, labels) in [
+/// `measure` is the size the frame will draw one label's text at, which the placement
+/// needs because the collision is between texts. A label whose box does not fit inside
+/// the canvas, or whose box comes within [`LABEL_GAP_PX`] of a box already placed, is
+/// skipped: the layers are visited in priority order, so the first of a crowded pair is
+/// the higher-priority one.
+pub(super) fn place_labels(
+    projection: Projection,
+    measure: impl Fn(&MapLabel, LabelKind) -> LabelSize,
+) -> Vec<PlacedLabel> {
+    let late: &[MapLabel] = if projection.zoom >= CITY_LABEL_LATE_ZOOM {
+        &CITY_LABELS_LATE[..]
+    } else {
+        &[]
+    };
+    let layers: [(LabelKind, &[MapLabel]); 4] = [
         (LabelKind::Country, &COUNTRY_LABELS[..]),
         (LabelKind::Water, &WATER_LABELS[..]),
         (LabelKind::City, &CITY_LABELS[..]),
-    ] {
-        if kind == LabelKind::City && projection.zoom < CITY_LABEL_ZOOM {
-            continue;
-        }
+        (LabelKind::City, late),
+    ];
+    let capacity = COUNTRY_LABELS.len() + WATER_LABELS.len() + CITY_LABELS.len() + late.len();
+    let mut placed: Vec<PlacedLabel> = Vec::with_capacity(capacity);
+    let mut boxes: Vec<[f32; 4]> = Vec::with_capacity(capacity);
+    let [width, height] = projection.viewport;
+
+    for (kind, labels) in layers {
         for label in labels {
             let at = projection.screen(project(label.at[0], label.at[1]));
-            let [width, height] = projection.viewport;
-            let margin = if kind == LabelKind::Country {
-                COUNTRY_LABEL_EDGE_MARGIN_PX
-            } else {
-                LABEL_EDGE_MARGIN_PX
-            };
-            if at[0] < margin || at[0] > width - margin || at[1] < margin || at[1] > height - margin
-            {
+            let size = measure(label, kind);
+            let box_ = [
+                at[0] - size.width / 2.0,
+                at[1] - size.height / 2.0,
+                at[0] + size.width / 2.0,
+                at[1] + size.height / 2.0,
+            ];
+            let inside = box_[0] >= LABEL_GAP_PX
+                && box_[2] <= width - LABEL_GAP_PX
+                && box_[1] >= LABEL_GAP_PX
+                && box_[3] <= height - LABEL_GAP_PX;
+            if !inside {
                 continue;
             }
-            let crowded = placed.iter().any(|other| {
-                let [dx, dy] = [other.at[0] - at[0], other.at[1] - at[1]];
-                dx * dx + dy * dy < LABEL_MIN_SEPARATION_PX * LABEL_MIN_SEPARATION_PX
+            let crowded = boxes.iter().any(|other| {
+                let [left, top, right, bottom] = *other;
+                !(right + LABEL_GAP_PX <= box_[0]
+                    || box_[2] + LABEL_GAP_PX <= left
+                    || bottom + LABEL_GAP_PX <= box_[1]
+                    || box_[3] + LABEL_GAP_PX <= top)
             });
-            if !crowded {
-                placed.push(PlacedLabel {
-                    kind,
-                    key: label.key,
-                    at,
-                });
+            if crowded {
+                continue;
             }
+            boxes.push(box_);
+            placed.push(PlacedLabel {
+                kind,
+                key: label.key,
+                at,
+            });
         }
     }
     placed
@@ -2609,19 +2720,41 @@ mod tests {
         assert_eq!(
             CITY_LABELS.map(|label| label.key),
             [
+                "widget.global_shipping_chokepoint.label.city.dubai",
+                "widget.global_shipping_chokepoint.label.city.abu_dhabi",
+                "widget.global_shipping_chokepoint.label.city.jebel_ali",
+                "widget.global_shipping_chokepoint.label.city.sharjah",
+                "widget.global_shipping_chokepoint.label.city.doha",
+                "widget.global_shipping_chokepoint.label.city.dammam",
                 "widget.global_shipping_chokepoint.label.city.bandar_abbas",
-                "widget.global_shipping_chokepoint.label.city.qeshm",
-                "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
-                "widget.global_shipping_chokepoint.label.city.khasab",
                 "widget.global_shipping_chokepoint.label.city.fujairah",
                 "widget.global_shipping_chokepoint.label.city.ras_al_khaimah",
-                "widget.global_shipping_chokepoint.label.city.sharjah",
-                "widget.global_shipping_chokepoint.label.city.al_jubayl",
-                "widget.global_shipping_chokepoint.label.city.al_hofuf",
-                "widget.global_shipping_chokepoint.label.city.chabahar",
                 "widget.global_shipping_chokepoint.label.city.muscat",
+                "widget.global_shipping_chokepoint.label.city.al_jubayl",
+                "widget.global_shipping_chokepoint.label.city.chabahar",
+                "widget.global_shipping_chokepoint.label.city.khasab",
+                "widget.global_shipping_chokepoint.label.city.qeshm",
+                "widget.global_shipping_chokepoint.label.city.bandar_lengeh",
                 "widget.global_shipping_chokepoint.label.city.sur",
+                "widget.global_shipping_chokepoint.label.city.khor_fakkan",
+                "widget.global_shipping_chokepoint.label.city.ajman",
+                "widget.global_shipping_chokepoint.label.city.ras_tanura",
+                "widget.global_shipping_chokepoint.label.city.ras_laffan",
+                "widget.global_shipping_chokepoint.label.city.sohar",
+                "widget.global_shipping_chokepoint.label.city.mesaieed",
+                "widget.global_shipping_chokepoint.label.city.al_hofuf",
+                "widget.global_shipping_chokepoint.label.city.al_ain",
+                "widget.global_shipping_chokepoint.label.city.ruwais",
+                "widget.global_shipping_chokepoint.label.city.bushehr",
+                "widget.global_shipping_chokepoint.label.city.asaluyeh",
+                "widget.global_shipping_chokepoint.label.city.jask",
+                "widget.global_shipping_chokepoint.label.city.kish",
+                "widget.global_shipping_chokepoint.label.city.barka",
             ],
+        );
+        assert_eq!(
+            CITY_LABELS_LATE.map(|label| label.key),
+            ["widget.global_shipping_chokepoint.label.city.manama"],
         );
         assert_eq!(
             WATER_LABELS.map(|label| label.key),
@@ -2637,6 +2770,7 @@ mod tests {
         let mut anchors: Vec<[f32; 2]> = COUNTRY_LABELS
             .iter()
             .chain(CITY_LABELS.iter())
+            .chain(CITY_LABELS_LATE.iter())
             .chain(WATER_LABELS.iter())
             .map(|label| {
                 let [longitude, latitude] = label.at;
@@ -2662,82 +2796,86 @@ mod tests {
         anchors.dedup();
         assert_eq!(
             anchors.len(),
-            19,
+            38,
             "two labels are anchored on the same point"
         );
     }
 
-    #[test]
-    fn the_fitted_zoom_names_the_cities_without_printing_them_over_each_other() {
-        // The pane the labels were reported on: the user's 1.56:1 viewport at the fitted
-        // zoom, where the strait's seven cities sit a few dozen pixels apart.
-        let viewport = [1_404.0, 900.0];
-        let projection = Projection::new(Camera::default(), viewport);
-        let distance = |left: [f32; 2], right: [f32; 2]| {
-            ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2)).sqrt()
-        };
-        let placed = place_labels(projection);
-        let keys: Vec<&str> = placed.iter().map(|label| label.key).collect();
-        assert_eq!(
-            placed,
-            place_labels(projection),
-            "the order is deterministic"
-        );
+    /// The size the placement tests give a label: the widest name of its kind at the size
+    /// the view draws it, one em tall. The real widths come from the shaped text (the view
+    /// measures them), so these tests are about the rule rather than about the font — and
+    /// a width wider than any real name is the safe side to be wrong on.
+    fn widest(kind: LabelKind) -> LabelSize {
+        match kind {
+            LabelKind::Country => LabelSize {
+                width: 250.0,
+                height: 21.0,
+            },
+            LabelKind::Water => LabelSize {
+                width: 100.0,
+                height: 12.0,
+            },
+            LabelKind::City => LabelSize {
+                width: 95.0,
+                height: 13.0,
+            },
+        }
+    }
 
-        // Every label that is in its zoom band and has room for its name but not placed was
-        // skipped by a *higher-priority* label within the minimum distance. Countries and
-        // seas are never dropped for crowding: nothing on this map sits that close.
-        //
-        // The labels nearer the canvas edge than [`LABEL_EDGE_MARGIN_PX`] are skipped too,
-        // and are the one exception: their centred name would be cut by the pane.
-        let [width, height] = viewport;
-        let fits = |at: [f32; 2]| {
-            at[0] >= LABEL_EDGE_MARGIN_PX
-                && at[0] <= width - LABEL_EDGE_MARGIN_PX
-                && at[1] >= LABEL_EDGE_MARGIN_PX
-                && at[1] <= height - LABEL_EDGE_MARGIN_PX
+    /// The box a label of `kind` centred on `at` would occupy, at [`widest`]'s sizes.
+    fn box_of(kind: LabelKind, at: [f32; 2]) -> [f32; 4] {
+        let size = widest(kind);
+        [
+            at[0] - size.width / 2.0,
+            at[1] - size.height / 2.0,
+            at[0] + size.width / 2.0,
+            at[1] + size.height / 2.0,
+        ]
+    }
+
+    /// Whether two boxes come closer than [`LABEL_GAP_PX`] on both axes.
+    fn overlap(left: [f32; 4], right: [f32; 4]) -> bool {
+        !(left[2] + LABEL_GAP_PX <= right[0]
+            || right[2] + LABEL_GAP_PX <= left[0]
+            || left[3] + LABEL_GAP_PX <= right[1]
+            || right[3] + LABEL_GAP_PX <= left[1])
+    }
+
+    /// The labels of one frame, in the order the placement offers them.
+    fn offered(projection: Projection) -> Vec<(LabelKind, &'static MapLabel)> {
+        let late: &'static [MapLabel] = if projection.zoom >= CITY_LABEL_LATE_ZOOM {
+            &CITY_LABELS_LATE[..]
+        } else {
+            &[]
         };
-        let candidates: Vec<(LabelKind, &'static str, [f32; 2])> = [
+        [
             (LabelKind::Country, &COUNTRY_LABELS[..]),
             (LabelKind::Water, &WATER_LABELS[..]),
             (LabelKind::City, &CITY_LABELS[..]),
+            (LabelKind::City, late),
         ]
         .into_iter()
-        .flat_map(|(kind, labels)| {
-            labels.iter().map(move |label| {
-                (
-                    kind,
-                    label.key,
-                    projection.screen(project(label.at[0], label.at[1])),
-                )
-            })
-        })
-        .collect();
-        for (index, (kind, key, at)) in candidates.iter().enumerate() {
-            if !fits(*at) || (*kind == LabelKind::City && projection.zoom < CITY_LABEL_ZOOM) {
-                continue;
-            }
-            if keys.contains(key) {
-                continue;
-            }
-            let crowded = candidates[..index].iter().any(|(_, earlier, earlier_at)| {
-                keys.contains(earlier) && distance(*earlier_at, *at) < LABEL_MIN_SEPARATION_PX
-            });
-            assert!(
-                crowded,
-                "{key} was skipped without a higher-priority label near its anchor",
-            );
-        }
+        .flat_map(|(kind, labels)| labels.iter().map(move |label| (kind, label)))
+        .collect()
+    }
 
-        // A conservative box around each anchor: wider than twice the widest city name
-        // at the small text size, and one line tall. No two placed labels may overlap it.
-        const HALF_WIDTH: f32 = 90.0;
-        const HALF_HEIGHT: f32 = 10.0;
+    #[test]
+    fn the_fitted_zoom_names_every_label_that_has_room() {
+        let viewport = [1_404.0, 900.0];
+        let projection = Projection::new(Camera::default(), viewport);
+        let placed = place_labels(projection, |_, kind| widest(kind));
+        assert_eq!(
+            placed,
+            place_labels(projection, |_, kind| widest(kind)),
+            "the order is deterministic",
+        );
+        let keys: Vec<&str> = placed.iter().map(|label| label.key).collect();
+
+        // No two placed names print over each other.
         for (index, label) in placed.iter().enumerate() {
             for other in &placed[..index] {
                 assert!(
-                    (other.at[0] - label.at[0]).abs() >= 2.0 * HALF_WIDTH
-                        || (other.at[1] - label.at[1]).abs() >= 2.0 * HALF_HEIGHT,
+                    !overlap(box_of(label.kind, label.at), box_of(other.kind, other.at)),
                     "{} and {} would print over each other",
                     other.key,
                     label.key,
@@ -2745,62 +2883,109 @@ mod tests {
             }
         }
 
-        // The two names the crowded strait drops, and the larger zoom that restores them:
-        // Qeshm sits inside Bandar Abbas's name, Ras al Khaimah inside Khasab's.
-        let bandar_abbas = "widget.global_shipping_chokepoint.label.city.bandar_abbas";
-        let qeshm = "widget.global_shipping_chokepoint.label.city.qeshm";
-        let khasab = "widget.global_shipping_chokepoint.label.city.khasab";
-        let ras_al_khaimah = "widget.global_shipping_chokepoint.label.city.ras_al_khaimah";
-        assert!(keys.contains(&bandar_abbas) && keys.contains(&khasab));
-        assert!(!keys.contains(&qeshm), "Qeshm is inside Bandar Abbas");
-        assert!(
-            !keys.contains(&ras_al_khaimah),
-            "Ras al Khaimah is inside Khasab"
-        );
+        // Every name that is on the pane and has nothing in its way is drawn; the ones
+        // that are not were pushed aside by a higher-priority name, or are cut by the edge.
+        let candidates = offered(projection);
+        for (index, (kind, label)) in candidates.iter().enumerate() {
+            if keys.contains(&label.key) {
+                continue;
+            }
+            let box_ = box_of(*kind, projection.screen(project(label.at[0], label.at[1])));
+            let inside = box_[0] >= LABEL_GAP_PX
+                && box_[2] <= viewport[0] - LABEL_GAP_PX
+                && box_[1] >= LABEL_GAP_PX
+                && box_[3] <= viewport[1] - LABEL_GAP_PX;
+            let blocked = candidates[..index].iter().any(|(earlier_kind, earlier)| {
+                keys.contains(&earlier.key)
+                    && overlap(
+                        box_,
+                        box_of(
+                            *earlier_kind,
+                            projection.screen(project(earlier.at[0], earlier.at[1])),
+                        ),
+                    )
+            });
+            assert!(
+                !inside || blocked,
+                "{} had room and nothing in its way, yet it was not drawn",
+                label.key,
+            );
+        }
 
-        let zoomed = place_labels(Projection::new(
-            Camera {
-                center: map_centre(),
-                zoom: 2.0,
-            },
-            viewport,
-        ));
-        let zoomed_keys: Vec<&str> = zoomed.iter().map(|label| label.key).collect();
-        assert!(
-            zoomed_keys.contains(&qeshm) && zoomed_keys.contains(&ras_al_khaimah),
-            "twice the fitted zoom separates the crowded cities",
-        );
+        // The countries and the two seas are never crowded off the fitted view: what sits
+        // that close to them is a city, and a city yields.
+        for (kind, label) in candidates {
+            if kind != LabelKind::City {
+                assert!(keys.contains(&label.key), "{} was dropped", label.key);
+            }
+        }
     }
 
     #[test]
     fn a_narrow_pane_drops_the_labels_it_cannot_fit_rather_than_cutting_them() {
-        // A 320 px column is the narrowest pane a widget is laid out in. A label is
-        // centred on its anchor, so one whose anchor is nearer the edge than half its name
-        // is dropped instead of printed in halves — Qatar's and the Gulf of Oman's are the
-        // two that would be cut at this width, and they are the two that go.
+        // A 320 px column is the narrowest pane a widget is laid out in. A name is centred
+        // on its anchor, so one whose box does not fit is dropped instead of printed in
+        // halves.
         let viewport = [320.0, 400.0];
-        let placed = place_labels(Projection::new(Camera::default(), viewport));
+        let placed = place_labels(Projection::new(Camera::default(), viewport), |_, kind| {
+            widest(kind)
+        });
         assert!(!placed.is_empty(), "the pane still names what it can");
         for label in &placed {
+            let box_ = box_of(label.kind, label.at);
             assert!(
-                label.at[0] >= LABEL_EDGE_MARGIN_PX
-                    && label.at[0] <= viewport[0] - LABEL_EDGE_MARGIN_PX
-                    && label.at[1] >= LABEL_EDGE_MARGIN_PX
-                    && label.at[1] <= viewport[1] - LABEL_EDGE_MARGIN_PX,
-                "{} sits {} px from the edge of a {viewport:?} pane, where half its name \
-                 would be cut",
+                box_[0] >= LABEL_GAP_PX
+                    && box_[2] <= viewport[0] - LABEL_GAP_PX
+                    && box_[1] >= LABEL_GAP_PX
+                    && box_[3] <= viewport[1] - LABEL_GAP_PX,
+                "{} is cut by the edge of a {viewport:?} pane",
                 label.key,
-                label.at[0].min(viewport[0] - label.at[0]),
             );
         }
-        let keys: Vec<&str> = placed.iter().map(|label| label.key).collect();
-        assert!(!keys.contains(&"widget.global_shipping_chokepoint.label.country.qatar"));
-        assert!(!keys.contains(&"widget.global_shipping_chokepoint.label.water.gulf_of_oman"));
 
-        // The same anchors on the user's pane are all far enough inside it, so the rule
-        // costs the fitted view nothing.
-        let wide = place_labels(Projection::new(Camera::default(), [1_404.0, 900.0]));
-        assert_eq!(wide.len(), 17, "ten cities, five countries and two seas");
+        let wide = place_labels(
+            Projection::new(Camera::default(), [1_404.0, 900.0]),
+            |_, kind| widest(kind),
+        );
+        assert!(
+            wide.len() > placed.len(),
+            "the wider pane names more: {} against {}",
+            wide.len(),
+            placed.len(),
+        );
+    }
+
+    #[test]
+    fn the_island_capital_appears_once_the_map_is_zoomed_in() {
+        // Bahrain is twenty pixels across at the fitted zoom and its own country name is
+        // four times that, so the capital is held back until the island has grown.
+        let viewport = [1_404.0, 900.0];
+        let at = |zoom: f32| {
+            let camera = Camera {
+                center: project(50.58, 26.22),
+                zoom,
+            }
+            .clamped(viewport);
+            place_labels(Projection::new(camera, viewport), |_, kind| widest(kind))
+        };
+        let manama = CITY_LABELS_LATE[0].key;
+        let at_fit = at(MIN_ZOOM);
+        assert!(
+            !at_fit.iter().any(|label| label.key == manama),
+            "BAHRAIN's own name covers Manama at the fitted zoom",
+        );
+        assert!(
+            at_fit
+                .iter()
+                .any(|label| label.key.ends_with("country.bahrain")),
+            "the country is named instead",
+        );
+        assert!(
+            at(CITY_LABEL_LATE_ZOOM)
+                .iter()
+                .any(|label| label.key == manama),
+            "the island holds both names by {CITY_LABEL_LATE_ZOOM}x",
+        );
     }
 
     #[test]

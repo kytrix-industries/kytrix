@@ -666,17 +666,36 @@ widget:
       updated: 服务端接收时间
     label:
       city:
+        abu_dhabi: 阿布扎比
+        ajman: 阿治曼
+        al_ain: 艾因
         al_hofuf: 胡富夫
         al_jubayl: 朱拜勒
+        asaluyeh: 阿萨卢耶
         bandar_abbas: 阿巴斯港
         bandar_lengeh: 伦格港
+        barka: 巴尔卡
+        bushehr: 布什尔
         chabahar: 恰巴哈尔
+        dammam: 达曼
+        doha: 多哈
+        dubai: 迪拜
         fujairah: 富查伊拉
+        jask: 贾斯克
+        jebel_ali: 杰贝阿里
         khasab: 海塞卜
+        khor_fakkan: 豪尔费坎
+        kish: 基什
+        manama: 麦纳麦
+        mesaieed: 梅塞依德
         muscat: 马斯喀特
         qeshm: 格什姆
         ras_al_khaimah: 哈伊马角
+        ras_laffan: 拉斯拉凡
+        ras_tanura: 拉斯坦努拉
+        ruwais: 鲁韦斯
         sharjah: 沙迦
+        sohar: 苏哈尔
         sur: 苏尔
       country:
         bahrain: 巴林

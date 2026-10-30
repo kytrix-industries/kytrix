@@ -510,8 +510,8 @@ Grid rows are latitude bands in the build **and** in the parser: reading the row
 off Mercator `y` would land up to a quarter row away from the cell the build
 wrote.
 
-**Labels.** Nineteen names — five countries, twelve cities and two seas — are
-elements over the canvas rather than glyphs in it, so they are read from the
+**Labels.** Thirty-eight names — five countries, thirty-one cities and two seas —
+are elements over the canvas rather than glyphs in it, so they are read from the
 catalogue, shaped by the platform font and drawn at the display's scale. Each one
 is centred on its anchor: GPUI lays an absolute child out by its top-left corner
 and has no transform to shift it, so the text sits in a fixed 320 × 30 px box
@@ -520,16 +520,29 @@ placed at `(x − 160, y − 15)`. The widest name either locale ships is
 holds every one of them without wrapping. The three kinds are told apart by size
 and weight as well as by colour, in the order a paper atlas prints them: a
 country is 21 px, bold and italic, a city is 13 px, and a sea is the 12 px
-`text_xs` italic muted step. Cities are named from the fitted zoom
-(`CITY_LABEL_ZOOM`), and
-`model::place_labels` fixes what a frame draws: countries, then seas, then cities,
-each list in its declared order; a later anchor within 72 px of one already placed
-is skipped, so the strait's crowded cities do not print into one pile at 1×
-(Qeshm and Ras Al Khaimah are the two that go on a 1,404 × 900 pane), and a name
-whose anchor is nearer the canvas edge than half its width — 130 px for a country,
-80 px for a city or a sea — is dropped rather than cut in half. The country's
-margin is its own so that growing it costs the fitted view none of its cities.
-Zooming in separates the crowded ones again.
+`text_xs` italic muted step.
+
+`model::place_labels` fixes what a frame draws: countries, then seas, then
+cities, each list in its declared order. What it keeps apart is the **text**, not
+the anchor: the view shapes every name in the language being read and hands the
+placement its width, because the collision is between texts — this coast runs
+north-east, so two cities twenty pixels apart are still two readable names when
+one sits above the other, and an anchor-to-anchor distance cannot tell that case
+from the one where two names really would print over each other. A label is
+skipped when its box comes within 4 px of a box already placed or does not fit
+inside the pane, so a name is never cut in half by the edge. A name's box is one
+em tall — the glyph extent, not the 1.618 line box the paragraph layout uses,
+which would hold apart two names a reader would see as two clear lines.
+
+On the 1,404 × 900 pane the fitted view draws **28 of the 31 cities**: Sharjah
+sits inside Dubai's name and Mesaieed inside Qatar's country name, and both come
+back as soon as the map is zoomed in. Manama is the one name held back on purpose
+(`CITY_LABELS_LATE`, from 1.6×): Bahrain's island is twenty pixels across at the
+fitted zoom and `BAHRAIN`'s own name is four times that, so the capital is named
+once the island has grown enough to hold both. Qatar's country name sits in the
+south-west of its peninsula rather than on the middle of it, for the same reason:
+the middle of Qatar is inside Doha's name.
+
 
 **Budget.** Two frames on the user's 1,404 × 900 pane: the empty fitted frame the
 plan's §8 target is about, and the typical frame with 1,000 vessels whose ship

@@ -666,17 +666,36 @@ widget:
       updated: Server receipt time
     label:
       city:
+        abu_dhabi: Abu Dhabi
+        ajman: Ajman
+        al_ain: Al Ain
         al_hofuf: Al Hofuf
         al_jubayl: Al Jubayl
+        asaluyeh: Asaluyeh
         bandar_abbas: Bandar Abbas
         bandar_lengeh: Bandar Lengeh
+        barka: Barka
+        bushehr: Bushehr
         chabahar: Chabahar
+        dammam: Dammam
+        doha: Doha
+        dubai: Dubai
         fujairah: Fujairah
+        jask: Jask
+        jebel_ali: Jebel Ali
         khasab: Khasab
+        khor_fakkan: Khor Fakkan
+        kish: Kish
+        manama: Manama
+        mesaieed: Mesaieed
         muscat: Muscat
         qeshm: Qeshm
         ras_al_khaimah: Ras Al Khaimah
+        ras_laffan: Ras Laffan
+        ras_tanura: Ras Tanura
+        ruwais: Ruwais
         sharjah: Sharjah
+        sohar: Sohar
         sur: Sur
       country:
         bahrain: Bahrain
