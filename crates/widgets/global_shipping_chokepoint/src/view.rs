@@ -30,7 +30,10 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
-    size::UnifiedSize,
+    interactive::InteractiveVariantExt,
+    menu::{MenuItem, MenuItemAction},
+    select::Select,
+    size::{UnifiedSizable, UnifiedSize},
     style::theme::{Theme, ThemeExt},
 };
 use gpui_kit::{
@@ -61,14 +64,14 @@ use widget::{
     identity::{WidgetId, WidgetInstanceId},
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
     time_zone::{data_time_zone, notify_on_data_time_zone_change},
-    view::WidgetView,
+    view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
 
 use crate::{
     model::{
-        self, Camera, LabelKind, LabelSize, MAX_ZOOM, MIN_ZOOM, Projection, STALE_AFTER, ShipClass,
-        Vessel, VesselDetails, VesselStore, colour_for, place_labels,
+        self, Camera, LabelKind, LabelSize, MAX_ZOOM, MIN_ZOOM, Projection, STALE_AFTER, Vessel,
+        VesselDetails, VesselStore, place_labels,
     },
     paint::paint_map,
     scene::{self, Scene, SceneError},
@@ -77,6 +80,7 @@ use crate::{
         GlobalShippingChokepointRequest, GlobalShippingChokepointScope,
         GlobalShippingChokepointService, GlobalShippingChokepointSource,
     },
+    ship::{SHIP_TYPE_COUNT, ShipType, ShipTypeFilter, colours},
 };
 
 /// How much one wheel notch scales the camera.
@@ -195,30 +199,6 @@ const CARD_HEIGHT: f32 = 18.0 * 20.0 + 15.0 * 4.0 + 2.0 * 4.0 + 10.0;
 /// label is a link to the copyright page rather than plain text.
 const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
 
-/// The order the four vessel classes are drawn and listed in.
-pub(super) const CLASSES: [ShipClass; 4] = [
-    ShipClass::Tanker,
-    ShipClass::Container,
-    ShipClass::Bulk,
-    ShipClass::Other,
-];
-
-/// The catalogue keys of the four class names, in [`CLASSES`] order.
-const SHIP_TYPE_KEYS: [&str; 4] = [
-    "widget.global_shipping_chokepoint.ship_type.tanker",
-    "widget.global_shipping_chokepoint.ship_type.container",
-    "widget.global_shipping_chokepoint.ship_type.bulk",
-    "widget.global_shipping_chokepoint.ship_type.other",
-];
-
-/// The catalogue keys of the four legend entries, in [`CLASSES`] order.
-const LEGEND_KEYS: [&str; 4] = [
-    "widget.global_shipping_chokepoint.legend.tanker",
-    "widget.global_shipping_chokepoint.legend.container",
-    "widget.global_shipping_chokepoint.legend.bulk",
-    "widget.global_shipping_chokepoint.legend.other",
-];
-
 /// The sixteen labels of the hover card, in the order the design lists the items in.
 const HOVER_KEYS: [&str; 16] = [
     "widget.global_shipping_chokepoint.hover.ship_name",
@@ -329,10 +309,13 @@ struct MapFrame {
     camera: Cell<Camera>,
 }
 
-/// The colours one frame is drawn with, resolved from the theme it is drawn in.
+/// The colours one frame is drawn with.
 ///
-/// Nothing is kept between frames: the appearance can change while the pane is open, and
-/// a colour cached onto the widget would be a map that kept drawing the old theme.
+/// The map, the panels and the text come from the theme; the ship palette is the
+/// component's own, because the theme has six series and the map distinguishes twenty
+/// types. Nothing is kept between frames: the appearance can change while the pane is
+/// open, and a colour cached onto the widget would be a map that kept drawing the old
+/// theme.
 ///
 /// [`crate::paint`] reads the map fields; the struct's own `pub(super)` keeps them inside
 /// the crate even though the fields themselves are `pub`.
@@ -348,10 +331,8 @@ pub(super) struct MapColors {
     pub road: Hsla,
     /// Primary roads, the finer of the two road strokes.
     pub road_minor: Hsla,
-    /// One colour per class in [`CLASSES`] order.
-    pub ships: [Hsla; 4],
-    /// The dot a vessel without a ship record is drawn as.
-    pub unknown: Hsla,
+    /// One colour per ship type in [`crate::ship::SHIP_TYPES`] order.
+    pub ships: &'static [Hsla; SHIP_TYPE_COUNT],
     /// The ring around the vessel under the pointer.
     pub hover: Hsla,
     /// The fill of the legend, the credit and the card.
@@ -380,8 +361,7 @@ impl MapColors {
             map_border: roles.chart.map_border.hsla,
             road: roles.chart.map_road.hsla,
             road_minor: roles.chart.map_road_minor.hsla,
-            ships: CLASSES.map(|class| colour_for(theme, class)),
-            unknown: roles.fg.muted.hsla,
+            ships: colours(theme.appearance),
             hover: roles.line.focus.hsla,
             overlay: roles.surface.overlay.hsla,
             border: roles.line.border.hsla,
@@ -413,12 +393,20 @@ pub struct GlobalShippingChokepointWidget {
     frame: Rc<MapFrame>,
     /// The picture the subscription published last.
     vessels: VesselStore,
-    /// The vessels the picture holds, joined and projected when a push arrived.
+    /// The vessels the filter draws, joined and projected when a push arrived.
     ///
     /// Building this is the one expensive step of a push, and it is what both the painters
     /// and the hit test read: a frame does not rebuild it, because a frame changes the
-    /// camera rather than the picture.
+    /// camera rather than the picture. It holds only the vessels of the selected type, so
+    /// a vessel the filter hides is neither painted nor hit.
     painted: Arc<[Vessel]>,
+    /// The ship types the picture holds, in [`crate::ship::SHIP_TYPES`] order.
+    ///
+    /// The legend and the header's filter offer these and nothing else: a type nobody in
+    /// the strait is currently reporting would be an entry that draws nothing.
+    present_types: Vec<ShipType>,
+    /// What the map is restricted to.
+    filter: ShipTypeFilter,
     /// The painted vessels in canvas coordinates, filled when a pointer move is resolved.
     hit_points: Vec<(u32, [f32; 2])>,
     /// The vessel the pointer is on, if any.
@@ -494,6 +482,11 @@ impl WidgetView for GlobalShippingChokepointWidget {
     fn has_content(&self) -> bool {
         self.vessels.has_state()
     }
+
+    /// The ship-type filter is the whole of what this widget puts in its header.
+    fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
+        WidgetHeader::empty().left(self.ship_type_select(cx))
+    }
 }
 
 impl GlobalShippingChokepointWidget {
@@ -538,6 +531,8 @@ impl GlobalShippingChokepointWidget {
             frame: Rc::new(MapFrame::default()),
             vessels: VesselStore::new(),
             painted: Arc::default(),
+            present_types: Vec::new(),
+            filter: ShipTypeFilter::All,
             hit_points: Vec::new(),
             hovered: None,
             pointer: point(px(0.0), px(0.0)),
@@ -613,12 +608,48 @@ impl GlobalShippingChokepointWidget {
     /// Drops the picture and the pointer's vessel together.
     ///
     /// The store resets its baseline as well, which is what keeps a delta of the session
-    /// being abandoned from being applied to the picture that replaced it.
+    /// being abandoned from being applied to the picture that replaced it. The filter is
+    /// kept: it is the reader's choice, not part of the picture.
     fn clear_picture(&mut self) {
         self.vessels.clear();
         self.painted = Arc::default();
+        self.present_types.clear();
         self.hovered = None;
         self.hit_points.clear();
+    }
+
+    /// Rebuilds what the filter draws from the picture the store holds.
+    ///
+    /// The present types are derived from every vessel, before the filter is applied, so
+    /// the legend and the header keep offering a type even while another one is selected.
+    fn rebuild_painted(&mut self) {
+        let vessels = self.vessels.vessels();
+        self.present_types = model::present_ship_types(&vessels);
+        let filter = self.filter;
+        self.painted = vessels
+            .into_iter()
+            .filter(|vessel| filter.matches(vessel.ship_type))
+            .collect::<Vec<_>>()
+            .into();
+        if let Some(mmsi) = self.hovered
+            && !self.painted.iter().any(|vessel| vessel.mmsi == mmsi)
+        {
+            self.hovered = None;
+        }
+    }
+
+    /// Restricts the map to one ship type, or widens it back to all of them.
+    ///
+    /// The type is kept even when the picture no longer holds it: the filter is the
+    /// reader's decision, and a type that leaves the picture leaves an empty sea rather
+    /// than silently widening the selection back to everything.
+    fn select_filter(&mut self, filter: ShipTypeFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter;
+        self.rebuild_painted();
+        cx.notify();
     }
 
     fn on_load_result(
@@ -704,7 +735,7 @@ impl GlobalShippingChokepointWidget {
     /// leaves the vessels on the map under it.
     fn apply_update(&mut self, update: &GlobalShippingChokepointUpdate, cx: &mut Context<Self>) {
         self.vessels.apply(update);
-        self.painted = self.vessels.vessels().into();
+        self.rebuild_painted();
         // A keyframe the server stamped with no time says it holds no state: the picture
         // is cleared and the pane waits for one instead of drawing an empty sea. It is a
         // gap as well, but there is no picture for it to be a gap in.
@@ -920,6 +951,63 @@ impl GlobalShippingChokepointWidget {
         cx.notify();
     }
 
+    /// The text the header's filter draws: `Ship type: Tanker`, or `All`.
+    fn ship_type_choice(&self, cx: &App) -> SharedString {
+        let value = match self.filter {
+            ShipTypeFilter::All => t!(cx, "widget.global_shipping_chokepoint.filter.all"),
+            ShipTypeFilter::Only(ship_type) => t!(cx, ship_type.label_key()),
+        };
+        t!(
+            cx,
+            "widget.global_shipping_chokepoint.filter.choice",
+            value = value
+        )
+    }
+
+    /// The ship-type filter in the pane's header.
+    ///
+    /// The menu offers "all" and the types the picture currently holds, in the legend's
+    /// order. A chosen type that has left the picture stays in the trigger and in the
+    /// filter; it is simply no longer offered until a vessel of that type returns.
+    fn ship_type_select(&self, cx: &Context<Self>) -> AnyElement {
+        let all = t!(cx, "widget.global_shipping_chokepoint.filter.all");
+        let select = self.present_types.iter().fold(
+            Select::new(ElementId::Name(SharedString::new_static(
+                "GlobalShippingChokepointShipType",
+            )))
+            .placeholder(self.ship_type_choice(cx))
+            .ghost()
+            .small()
+            .aria_label(t!(cx, "widget.global_shipping_chokepoint.filter.title"))
+            .debug_selector(|| "TEST_CHOKEPOINT_SHIP_TYPE".into())
+            .menu_item(MenuItem::Action(MenuItemAction::new(
+                ShipTypeFilter::All.key(),
+                all,
+            ))),
+            |select, ship_type| {
+                select.menu_item(MenuItem::Action(MenuItemAction::new(
+                    ship_type.key(),
+                    t!(cx, ship_type.label_key()),
+                )))
+            },
+        );
+
+        select
+            .on_change({
+                let widget = cx.entity().downgrade();
+                move |selected, _, app| {
+                    let Some(key) = selected.as_deref() else {
+                        return;
+                    };
+                    let Some(filter) = ShipTypeFilter::from_key(key) else {
+                        return;
+                    };
+                    let _ = widget.update(app, |this, cx| this.select_filter(filter, cx));
+                }
+            })
+            .into_any_element()
+    }
+
     /// The map's labels: five countries, thirty-one cities, and two seas.
     ///
     /// [`place_labels`] decides which boxes a frame draws and in what order. It needs the
@@ -1030,13 +1118,13 @@ impl GlobalShippingChokepointWidget {
         .collect()
     }
 
-    /// The legend's line for the size of the picture.
+    /// The legend's line for the size of what the filter draws.
     ///
     /// The catalogue has no automatic plural rule, so the two keys are chosen here rather
-    /// than interpolated into one: a strait holding one vessel reads "1 vessel", not "1
+    /// than interpolated into one: a filter drawing one vessel reads "1 vessel", not "1
     /// vessels".
     fn vessel_count_text(&self, cx: &App) -> SharedString {
-        let count = self.vessels.vessel_count();
+        let count = self.painted.len();
         if count == 1 {
             t!(cx, "widget.global_shipping_chokepoint.vessel_count_one")
         } else {
@@ -1048,7 +1136,13 @@ impl GlobalShippingChokepointWidget {
         }
     }
 
-    /// The legend in the pane's bottom-right corner: the four classes and the count.
+    /// The legend in the pane's bottom-right corner: the ship types the picture holds and
+    /// the count of what the filter draws.
+    ///
+    /// The types are listed in two columns because a picture can hold most of the twenty
+    /// the map distinguishes, and a single column would grow past a short pane. Only the
+    /// types that are present are listed: an entry nobody is reporting would draw
+    /// nothing.
     ///
     /// It is lifted clear of the ODbL credit's line rather than sharing the bottom edge with it:
     /// a pane narrower than the two together would otherwise have the card painted over the
@@ -1056,11 +1150,15 @@ impl GlobalShippingChokepointWidget {
     fn legend(&self, colors: MapColors, cx: &App) -> AnyElement {
         let size = UnifiedSize::Small;
         let count_text = self.vessel_count_text(cx);
-        let entries = CLASSES
+        let entries = self
+            .present_types
             .iter()
-            .zip(LEGEND_KEYS)
-            .map(|(class, key)| {
+            .map(|ship_type| {
                 div()
+                    .debug_selector({
+                        let key = ship_type.key();
+                        move || format!("TEST_CHOKEPOINT_LEGEND_{key}")
+                    })
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -1069,9 +1167,13 @@ impl GlobalShippingChokepointWidget {
                             .flex_none()
                             .size(px(8.0))
                             .rounded_sm()
-                            .bg(colour_for(cx.theme(), *class)),
+                            .bg(colors.ships[ship_type.index()]),
                     )
-                    .child(div().text_color(colors.text).child(t!(cx, key)))
+                    .child(
+                        div()
+                            .text_color(colors.text)
+                            .child(t!(cx, ship_type.label_key())),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -1097,7 +1199,14 @@ impl GlobalShippingChokepointWidget {
                     .text_color(colors.muted)
                     .child(t!(cx, "widget.global_shipping_chokepoint.legend.title")),
             )
-            .children(entries)
+            .child(
+                div()
+                    .grid()
+                    .grid_cols(2)
+                    .gap_x(px(12.0))
+                    .gap_y(size.gap())
+                    .children(entries),
+            )
             .child(div().text_color(colors.muted).child(count_text))
             .into_any_element()
     }
@@ -1148,9 +1257,9 @@ impl GlobalShippingChokepointWidget {
             SharedString::new(details.mmsi.as_str()),
             text(details.imo.as_ref()),
             text(details.call_sign.as_ref()),
-            details.ship_class.map_or_else(
+            details.ship_type.map_or_else(
                 || unavailable.clone(),
-                |class| t!(cx, SHIP_TYPE_KEYS[class_index(class)]),
+                |ship_type| t!(cx, ship_type.label_key()),
             ),
             details
                 .flag
@@ -1363,16 +1472,6 @@ fn view_plans() -> WidgetAction {
     })
 }
 
-/// The index one class occupies in [`CLASSES`], [`MapColors::ships`] and the legend.
-pub(super) const fn class_index(class: ShipClass) -> usize {
-    match class {
-        ShipClass::Tanker => 0,
-        ShipClass::Container => 1,
-        ShipClass::Bulk => 2,
-        ShipClass::Other => 3,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1384,8 +1483,8 @@ mod tests {
     use app_config_provider::manager::ConfigManager;
     use base_ui::style::palette::Appearance;
     use gpui_kit::{
-        App, AppContext, BorrowAppContext as _, Entity, IntoElement, Modifiers, ParentElement,
-        Pixels, Render, Rgba, ScrollDelta, ScrollWheelEvent, Styled, TestAppContext,
+        App, AppContext, BorrowAppContext as _, Entity, IntoElement, Modifiers, MouseButton,
+        ParentElement, Pixels, Render, Rgba, ScrollDelta, ScrollWheelEvent, Styled, TestAppContext,
         VisualTestContext, WeakEntity, Window, div, point, px, size,
     };
     use i18n::{language::codes::LanguageCode, t};
@@ -1410,6 +1509,7 @@ mod tests {
             AisStreamError, AisStreamMessage, GlobalShippingChokepointEventSubscription,
             GlobalShippingChokepointSession,
         },
+        ship::SHIP_TYPES,
     };
 
     /// The account every fixture pane is signed in as.
@@ -1564,6 +1664,40 @@ mod tests {
         }
     }
 
+    /// One vessel's ship record with the AIS type `ship_type` and every other value as
+    /// [`ships`] carries it.
+    fn ship_of_type(mmsi: u32, ship_type: u32) -> GlobalShippingChokepointShip {
+        let mut ship = ships(mmsi);
+        ship.ship_type = ship_type;
+        ship
+    }
+
+    /// A representative AIS `ship_type` code for one main type.
+    fn code_of(ship_type: ShipType) -> u32 {
+        match ship_type {
+            ShipType::Tanker => 80,
+            ShipType::Cargo => 70,
+            ShipType::Passenger => 60,
+            ShipType::Fishing => 30,
+            ShipType::Towing => 31,
+            ShipType::Dredging => 33,
+            ShipType::Military => 35,
+            ShipType::Sailing => 36,
+            ShipType::Pleasure => 37,
+            ShipType::HighSpeed => 40,
+            ShipType::Pilot => 50,
+            ShipType::SearchAndRescue => 51,
+            ShipType::PortTender => 53,
+            ShipType::AntiPollution => 54,
+            ShipType::LawEnforcement => 55,
+            ShipType::Medical => 58,
+            ShipType::Noncombatant => 59,
+            ShipType::WingInGround => 20,
+            ShipType::Other => 90,
+            ShipType::Unknown => 0,
+        }
+    }
+
     /// A keyframe of `positions`.
     fn keyframe(
         epoch: u64,
@@ -1667,6 +1801,54 @@ mod tests {
         window.run_until_parked();
     }
 
+    /// A window whose top row is the widget's own header group and whose body is the pane.
+    struct HeaderHarness {
+        pane: Entity<GlobalShippingChokepointWidget>,
+    }
+
+    impl Render for HeaderHarness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let header = self.pane.update(cx, |pane, cx| pane.header(window, cx));
+
+            div()
+                .size_full()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(div().flex().items_center().children(header.left))
+                .child(div().flex_1().min_h_0().child(self.pane.clone()))
+        }
+    }
+
+    /// Mounts one pane's header and body in a window of its own, already drawn once.
+    fn header_window<'a>(
+        cx: &'a mut TestAppContext,
+        pane: &Entity<GlobalShippingChokepointWidget>,
+    ) -> &'a mut VisualTestContext {
+        let pane = pane.clone();
+        let (_, window) = cx.add_window_view(move |_, _| HeaderHarness { pane });
+        window.simulate_resize(size(px(600.0), px(400.0)));
+        window.run_until_parked();
+        repaint(window);
+        repaint(window);
+        window
+    }
+
+    /// Presses what `selector` names, the way a window delivers a press: the button goes
+    /// down, the frame that follows is drawn, and only then does it come up.
+    fn press(window: &mut VisualTestContext, selector: &'static str) {
+        let target = window
+            .debug_bounds(selector)
+            .expect("the harness draws what it is asked to press")
+            .center();
+        window.simulate_mouse_down(target, MouseButton::Left, Modifiers::none());
+        window.run_until_parked();
+        window.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+        window.run_until_parked();
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
+    }
+
     /// The window position one canvas point is drawn at.
     fn window_point(
         pane: &GlobalShippingChokepointWidget,
@@ -1731,6 +1913,28 @@ mod tests {
         let first = luminance(foreground);
         let second = luminance(background);
         (first.max(second) + 0.05) / (first.min(second) + 0.05)
+    }
+
+    /// A ship marker is drawn straight on the map's two fills, so every authored colour
+    /// has to read on both of them in the appearance it belongs to.
+    #[test]
+    fn every_ship_type_colour_should_read_on_both_map_fills() {
+        let mut failures = Vec::new();
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = MapColors::resolve(&Theme::of(appearance));
+            for ship_type in SHIP_TYPES {
+                let colour = colors.ships[ship_type.index()];
+                for (what, fill) in [("land", colors.land), ("sea", colors.ocean)] {
+                    let ratio = wcag_contrast(colour, fill);
+                    if ratio < 2.0 {
+                        failures.push(format!(
+                            "{ship_type:?} on the {what} in {appearance:?} reads {ratio:.2}:1"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[gpui_kit::test]
@@ -1877,6 +2081,328 @@ mod tests {
                 )
                 .as_ref(),
                 "an empty picture is plural",
+            );
+        });
+    }
+
+    /// The header's filter offers "all" and the types the picture holds, and choosing one
+    /// restricts the map to that type.
+    #[gpui_kit::test]
+    fn the_header_should_filter_the_map_by_ship_type(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(
+                7,
+                1,
+                vec![position(1), position(2), position(3), position(4)],
+            );
+            frame.ships = vec![
+                ship_of_type(1, 80),
+                ship_of_type(2, 70),
+                ship_of_type(3, 60),
+            ];
+            assert!(report_update(&pane, frame, cx));
+        });
+
+        let window = header_window(cx, &pane);
+        assert!(
+            window.debug_bounds("TEST_CHOKEPOINT_SHIP_TYPE").is_some(),
+            "the filter is the header's left group",
+        );
+
+        press(window, "TEST_CHOKEPOINT_SHIP_TYPE");
+        assert!(
+            window.debug_bounds("TEST_DROPDOWN_PANEL").is_some(),
+            "pressing the filter opens its menu",
+        );
+        for selector in [
+            "TEST_MENU_ITEM_all",
+            "TEST_MENU_ITEM_tanker",
+            "TEST_MENU_ITEM_cargo",
+            "TEST_MENU_ITEM_passenger",
+            "TEST_MENU_ITEM_unknown",
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "{selector} is a type the picture holds",
+            );
+        }
+        assert!(
+            window.debug_bounds("TEST_MENU_ITEM_fishing").is_none(),
+            "a type the picture does not hold is not offered",
+        );
+
+        press(window, "TEST_MENU_ITEM_tanker");
+        window.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.filter, ShipTypeFilter::Only(ShipType::Tanker));
+            assert_eq!(pane.painted.len(), 1, "only the tanker is drawn");
+            assert_eq!(pane.painted[0].mmsi, 1);
+            assert_eq!(
+                pane.vessel_count_text(cx).as_ref(),
+                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
+                "the legend counts what the filter draws",
+            );
+            assert!(
+                pane.ship_type_choice(cx).contains(
+                    t!(cx, "widget.global_shipping_chokepoint.ship_type.tanker").as_ref()
+                ),
+                "the trigger names the chosen type",
+            );
+        });
+
+        press(window, "TEST_CHOKEPOINT_SHIP_TYPE");
+        press(window, "TEST_MENU_ITEM_all");
+        window.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.filter, ShipTypeFilter::All);
+            assert_eq!(pane.painted.len(), 4, "all four vessels are drawn again");
+        });
+    }
+
+    /// A picture holding every type gives the filter twenty entries, and the panel grows
+    /// to hold them: the menu is not capped at a height its entries would spill out of.
+    #[gpui_kit::test]
+    fn a_full_ship_type_menu_should_hold_every_entry(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, (1..=20).map(position).collect());
+            frame.ships = SHIP_TYPES
+                .iter()
+                .enumerate()
+                .map(|(index, ship_type)| ship_of_type(index as u32 + 1, code_of(*ship_type)))
+                .collect();
+            assert!(report_update(&pane, frame, cx));
+        });
+
+        let window = header_window(cx, &pane);
+        press(window, "TEST_CHOKEPOINT_SHIP_TYPE");
+        let panel = window
+            .debug_bounds("TEST_DROPDOWN_PANEL")
+            .expect("pressing the filter opens its menu");
+        let last = window
+            .debug_bounds("TEST_MENU_ITEM_unknown")
+            .expect("the menu lists every type the picture holds");
+        assert!(
+            last.top() >= panel.top() && last.bottom() <= panel.bottom(),
+            "the last type is inside the panel: {last:?} in {panel:?}",
+        );
+    }
+
+    /// The legend lists the types the picture holds and nothing else, in two columns.
+    #[gpui_kit::test]
+    fn the_legend_should_list_only_the_types_the_picture_holds(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1), position(2), position(3)]);
+            frame.ships = vec![ship_of_type(1, 80), ship_of_type(2, 70)];
+            assert!(report_update(&pane, frame, cx));
+        });
+
+        let window = map_window(cx, &pane);
+        for selector in [
+            "TEST_CHOKEPOINT_LEGEND_tanker",
+            "TEST_CHOKEPOINT_LEGEND_cargo",
+            "TEST_CHOKEPOINT_LEGEND_unknown",
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "{selector} is a type the picture holds",
+            );
+        }
+        assert!(
+            window
+                .debug_bounds("TEST_CHOKEPOINT_LEGEND_passenger")
+                .is_none(),
+            "a type the picture does not hold has no legend entry",
+        );
+        window.update(|_, cx| {
+            assert_eq!(
+                pane.read(cx).vessel_count_text(cx).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 3
+                )
+                .as_ref(),
+                "the legend counts the whole picture while the filter is all",
+            );
+        });
+    }
+
+    /// A vessel the filter hides is not under the pointer any more: its card goes with it.
+    #[gpui_kit::test]
+    fn a_filtered_out_vessel_should_not_keep_its_card(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut cargo = position(2);
+            cargo.latitude = 25_500_000;
+            cargo.longitude = 56_800_000;
+            let mut frame = keyframe(7, 1, vec![position(1), cargo]);
+            frame.ships = vec![ship_of_type(1, 80), ship_of_type(2, 70)];
+            assert!(report_update(&pane, frame, cx));
+        });
+
+        let window = map_window(cx, &pane);
+        let at = window.update(|_, cx| {
+            let pane = pane.read(cx);
+            let hull = hull_of(pane, 2).expect("the cargo ship is painted");
+            window_point(pane, hull).expect("a drawn map records its box")
+        });
+        window.simulate_mouse_move(at, None, Modifiers::none());
+        repaint(window);
+        assert_eq!(
+            window.update(|_, cx| pane.read(cx).hovered),
+            Some(2),
+            "the pointer moved onto the cargo ship",
+        );
+        assert!(window.debug_bounds("TEST_CHOKEPOINT_CARD").is_some());
+
+        window.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.select_filter(ShipTypeFilter::Only(ShipType::Tanker), cx);
+            });
+        });
+        repaint(window);
+        assert_eq!(
+            window.update(|_, cx| pane.read(cx).hovered),
+            None,
+            "the hidden vessel is on no card",
+        );
+        assert!(
+            window.debug_bounds("TEST_CHOKEPOINT_CARD").is_none(),
+            "the card of a filtered-out vessel is gone",
+        );
+
+        window.update(|_, cx| {
+            pane.update(cx, |pane, cx| pane.select_filter(ShipTypeFilter::All, cx));
+        });
+        repaint(window);
+        let at = window.update(|_, cx| {
+            let pane = pane.read(cx);
+            let hull = hull_of(pane, 2).expect("the cargo ship is painted again");
+            window_point(pane, hull).expect("a drawn map records its box")
+        });
+        window.simulate_mouse_move(at, None, Modifiers::none());
+        repaint(window);
+        assert_eq!(
+            window.update(|_, cx| pane.read(cx).hovered),
+            Some(2),
+            "widening the filter brings the vessel back",
+        );
+    }
+
+    /// A chosen type that leaves the picture stays chosen: the filter is the reader's
+    /// decision, and the map simply draws nothing until a vessel of that type returns.
+    #[gpui_kit::test]
+    fn the_selected_type_should_survive_its_disappearance(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1), position(2)]);
+            frame.ships = vec![ship_of_type(1, 80), ship_of_type(2, 70)];
+            assert!(report_update(&pane, frame, cx));
+            pane.update(cx, |pane, cx| {
+                pane.select_filter(ShipTypeFilter::Only(ShipType::Tanker), cx);
+            });
+
+            let mut without_tanker = keyframe(7, 2, vec![position(2)]);
+            without_tanker.ships = vec![ship_of_type(2, 70)];
+            assert!(report_update(&pane, without_tanker, cx));
+
+            let pane = pane.read(cx);
+            assert_eq!(
+                pane.filter,
+                ShipTypeFilter::Only(ShipType::Tanker),
+                "the choice survives the type leaving the picture",
+            );
+            assert!(
+                pane.painted.is_empty(),
+                "nothing of the chosen type is drawn"
+            );
+            assert_eq!(pane.present_types, [ShipType::Cargo]);
+            assert_eq!(
+                pane.vessel_count_text(cx).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 0
+                )
+                .as_ref(),
+            );
+            assert!(
+                pane.ship_type_choice(cx).contains(
+                    t!(cx, "widget.global_shipping_chokepoint.ship_type.tanker").as_ref()
+                ),
+                "the trigger still names the chosen type",
+            );
+        });
+
+        cx.update(|cx| {
+            let mut with_tanker = keyframe(7, 3, vec![position(1)]);
+            with_tanker.ships = vec![ship_of_type(1, 80)];
+            assert!(report_update(&pane, with_tanker, cx));
+            assert_eq!(
+                pane.read(cx).painted.len(),
+                1,
+                "the chosen type returns when a vessel of it does",
+            );
+        });
+    }
+
+    /// The count is the filtered picture's, not the store's.
+    #[gpui_kit::test]
+    fn the_filter_should_count_only_what_it_draws(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            let mut frame = keyframe(7, 1, vec![position(1), position(2), position(3)]);
+            frame.ships = vec![
+                ship_of_type(1, 80),
+                ship_of_type(2, 80),
+                ship_of_type(3, 70),
+            ];
+            assert!(report_update(&pane, frame, cx));
+
+            let count = |cx: &mut App, filter: ShipTypeFilter| {
+                pane.update(cx, |pane, cx| {
+                    pane.select_filter(filter, cx);
+                    pane.vessel_count_text(cx)
+                })
+            };
+
+            assert_eq!(
+                count(cx, ShipTypeFilter::Only(ShipType::Tanker)).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 2
+                )
+                .as_ref(),
+                "two tankers",
+            );
+            assert_eq!(
+                count(cx, ShipTypeFilter::Only(ShipType::Cargo)).as_ref(),
+                t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").as_ref(),
+                "one cargo ship",
+            );
+            assert_eq!(
+                count(cx, ShipTypeFilter::All).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 3
+                )
+                .as_ref(),
+                "all three vessels",
+            );
+            assert_eq!(
+                count(cx, ShipTypeFilter::Only(ShipType::Passenger)).as_ref(),
+                t!(
+                    cx,
+                    "widget.global_shipping_chokepoint.vessel_count",
+                    count = 0
+                )
+                .as_ref(),
+                "a type the picture does not hold draws nothing",
             );
         });
     }
@@ -2569,6 +3095,10 @@ mod tests {
                 "widget.names.global_shipping_chokepoint",
                 "widget.global_shipping_chokepoint.attribution",
                 "widget.global_shipping_chokepoint.entitlement_required",
+                "widget.global_shipping_chokepoint.filter.all",
+                "widget.global_shipping_chokepoint.filter.choice",
+                "widget.global_shipping_chokepoint.filter.title",
+                "widget.global_shipping_chokepoint.legend.title",
                 "widget.global_shipping_chokepoint.sign_in",
                 "widget.global_shipping_chokepoint.unavailable",
                 "widget.global_shipping_chokepoint.vessel_count",
@@ -2576,8 +3106,7 @@ mod tests {
                 "widget.global_shipping_chokepoint.view_plans",
             ];
             keys.extend(HOVER_KEYS);
-            keys.extend(SHIP_TYPE_KEYS);
-            keys.extend(LEGEND_KEYS);
+            keys.extend(SHIP_TYPES.iter().map(|ship_type| ship_type.label_key()));
             keys.extend(NAV_STATUS_KEYS);
             keys.extend(COUNTRY_LABELS.iter().map(|label| label.key));
             keys.extend(CITY_LABELS.iter().map(|label| label.key));
@@ -2604,6 +3133,15 @@ mod tests {
                 assert!(
                     !t!(cx, "widget.global_shipping_chokepoint.vessel_count_one").contains("%{"),
                     "the singular count carries no placeholder in {language:?}",
+                );
+                assert!(
+                    !t!(
+                        cx,
+                        "widget.global_shipping_chokepoint.filter.choice",
+                        value = "x"
+                    )
+                    .contains("%{"),
+                    "the filter's value is supplied in {language:?}",
                 );
             }
         });
@@ -2918,11 +3456,10 @@ mod tests {
         );
         let vessel = Vessel {
             mmsi: 7,
-            class: ShipClass::Tanker,
+            ship_type: ShipType::Tanker,
             position: model::project(56.3, 26.5),
             cog: 900,
             heading: 87,
-            has_ship: true,
         };
         let at = projection.screen(vessel.position);
         hit_points.push((vessel.mmsi, at));

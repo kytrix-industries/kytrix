@@ -649,6 +649,10 @@ widget:
   global_shipping_chokepoint:
     attribution: © OpenStreetMap contributors
     entitlement_required: This account does not include the AIS vessel feed
+    filter:
+      all: All
+      choice: 'Ship type: %{value}'
+      title: Ship type
     hover:
       call_sign: Call sign
       course: Course over ground
@@ -709,10 +713,6 @@ widget:
         gulf_of_oman: Gulf of Oman
         persian_gulf: Persian Gulf
     legend:
-      bulk: Bulk carrier
-      container: Container ship
-      other: Other vessel
-      tanker: Tanker
       title: Vessel types
     nav_status:
       "0": Under way using engine
@@ -731,10 +731,26 @@ widget:
       "13": Reserved
       "14": AIS-SART
     ship_type:
-      bulk: Bulk carrier
-      container: Container ship
-      other: Other vessel
+      anti_pollution: Anti-pollution
+      cargo: Cargo
+      dredging: Dredging / diving
+      fishing: Fishing
+      high_speed: High-speed craft
+      law_enforcement: Law enforcement
+      medical: Medical transport
+      military: Military
+      noncombatant: Noncombatant
+      other: Other
+      passenger: Passenger
+      pilot: Pilot
+      pleasure: Pleasure craft
+      port_tender: Port tender
+      sailing: Sailing
+      search_and_rescue: Search and rescue
       tanker: Tanker
+      towing: Tug / towing
+      unknown: Unknown
+      wing_in_ground: Wing in ground
     sign_in: <p align="center">You need to register or log in to see the vessels in the strait.</p>
     unavailable: —
     vessel_count: '%{count} vessels'

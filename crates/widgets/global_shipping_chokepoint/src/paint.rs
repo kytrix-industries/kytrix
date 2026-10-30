@@ -1,4 +1,4 @@
-//! How one frame of the map is drawn: the nine paths a canvas paints, in the order they
+//! How one frame of the map is drawn: the paths a canvas paints, in the order they
 //! stack, and the geometry each is built from.
 //!
 //! The base map is prepared once by [`crate::scene`] and the picture arrives as a list of
@@ -17,13 +17,14 @@ use gpui_kit::{Bounds, Hsla, Path, Pixels, Point, Window, point, px};
 use crate::{
     model::{self, Camera, CellSpan, Projection, RoadFilter, Vessel},
     scene::{LineLayer, Piece, Scene},
-    view::{MapColors, class_index, viewport_of},
+    ship::{SHIP_TYPE_COUNT, SHIP_TYPES, ShipType},
+    view::{MapColors, viewport_of},
 };
 
 /// How wide a marker is against its length.
 const MARKER_WIDTH_RATIO: f32 = 0.7;
 
-/// The radius of the dot a vessel whose ship record has not arrived is drawn as.
+/// The radius of the dot a vessel with no type is drawn as.
 const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 
 /// How many segments the unknown-vessel dot is drawn with.
@@ -80,7 +81,7 @@ const MARKER_LENGTH_NEAR: f32 = 10.0;
 /// The marker length at [`MAX_ZOOM`].
 const MARKER_LENGTH_FAR: f32 = 12.0;
 
-/// Draws one frame of the map: the nine paths of [`MapLayers`] in their stacking order,
+/// Draws one frame of the map: the paths of [`MapLayers`] in their stacking order,
 /// then the ring around the hovered vessel.
 ///
 /// The geometry is [`map_layers`]'s; this function only hands the paths to the frame in
@@ -119,7 +120,7 @@ pub(super) fn paint_map(
     }
 }
 
-/// The nine paths one frame draws, in the order it paints them.
+/// The base map's paths and one ship path per type, in the order one frame paints them.
 ///
 /// Building them is the frame's only geometry work, and it happens in [`map_layers`]
 /// rather than in `paint_map` so the picture can be checked without a window.
@@ -130,36 +131,44 @@ struct MapLayers {
     borders: Path<Pixels>,
     /// Motorways and trunks, then primary roads.
     roads: [Path<Pixels>; 2],
-    /// The vessels: the unknown dots and one path per class.
+    /// The vessels: one path per ship type.
     ships: ShipPaths,
 }
 
 impl MapLayers {
-    /// The nine paths in the order a frame paints them, each with the colour it is drawn in.
+    /// The paths in the order a frame paints them, each with the colour it is drawn in.
     ///
     /// The stacking is the map's: the coastline first, the borders over it, the roads over
     /// those, and the vessels last, so no part of the base map covers a vessel. The unknown
-    /// dots go down before the class markers: a vessel whose ship record has arrived is a
-    /// report that says more about it, and its marker should not be hidden under a
-    /// neighbour's dot.
-    fn in_paint_order(self, colors: MapColors) -> [(Path<Pixels>, Hsla); 9] {
+    /// dots go down before the typed markers: a vessel whose type is known is a report
+    /// that says more about it, and its marker should not be hidden under a neighbour's
+    /// dot.
+    fn in_paint_order(self, colors: MapColors) -> Vec<(Path<Pixels>, Hsla)> {
         let [motorway, primary] = self.roads;
-        let [tanker, container, bulk, other] = self.ships.classes;
-        [
-            (self.land, colors.land),
-            (self.borders, colors.map_border),
-            (motorway, colors.road),
-            (primary, colors.road_minor),
-            (self.ships.unknown, colors.unknown),
-            (tanker, colors.ships[0]),
-            (container, colors.ships[1]),
-            (bulk, colors.ships[2]),
-            (other, colors.ships[3]),
-        ]
+        let mut paths = self.ships.types.map(Some);
+        let mut layers = Vec::with_capacity(4 + SHIP_TYPE_COUNT);
+        layers.push((self.land, colors.land));
+        layers.push((self.borders, colors.map_border));
+        layers.push((motorway, colors.road));
+        layers.push((primary, colors.road_minor));
+
+        let unknown = ShipType::Unknown;
+        if let Some(path) = paths[unknown.index()].take() {
+            layers.push((path, colors.ships[unknown.index()]));
+        }
+        for ship_type in SHIP_TYPES {
+            if ship_type == unknown {
+                continue;
+            }
+            if let Some(path) = paths[ship_type.index()].take() {
+                layers.push((path, colors.ships[ship_type.index()]));
+            }
+        }
+        layers
     }
 }
 
-/// Builds the nine paths one frame draws, from the base map and the picture.
+/// Builds the paths one frame draws, from the base map and the picture.
 ///
 /// Pure: no window and no theme. The scale the projection draws at decides which
 /// coastline tier is filled and which class-0 road copy is drawn, the clamped zoom
@@ -402,29 +411,21 @@ fn push_dashes(
     }
 }
 
-/// The vessels of one frame, one path per class plus one for the vessels without a static
-/// part.
+/// The vessels of one frame, one path per ship type.
 struct ShipPaths {
-    /// One path per class in [`CLASSES`] order.
-    classes: [Path<Pixels>; 4],
-    /// The dots of the vessels a ship record has not arrived for.
-    unknown: Path<Pixels>,
+    /// One path per type in [`SHIP_TYPES`] order. The unknown path holds dots; every
+    /// other path holds marker triangles.
+    types: [Path<Pixels>; SHIP_TYPE_COUNT],
 }
 
 /// Splits the painted vessels into the paths one frame draws.
 ///
-/// A vessel whose ship record has not arrived is a grey dot rather than a coloured marker:
-/// the bucket is a fact about its type, and the report has not said one yet. Its position is
+/// A vessel with no type is a grey dot rather than a coloured marker: its position is
 /// still a position, so it is drawn — a map that hid it would be reporting fewer vessels
 /// than the service does.
 fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> ShipPaths {
-    let mut classes = [
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-    ];
-    let mut unknown = Path::new(point(px(0.0), px(0.0)));
+    let mut types: [Path<Pixels>; SHIP_TYPE_COUNT] =
+        std::array::from_fn(|_| Path::new(point(px(0.0), px(0.0))));
     let texture = point(0.0, 1.0);
     // The marker grows from ten pixels at the fitted zoom to twelve at the closest one,
     // so a hull stays visible while the sea around it gains detail.
@@ -437,9 +438,10 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
         if !projection.near_screen(position, length) {
             continue;
         }
-        if !vessel.has_ship {
+        let path = &mut types[vessel.ship_type.index()];
+        if vessel.ship_type == ShipType::Unknown {
             push_disc(
-                &mut unknown,
+                path,
                 position,
                 UNKNOWN_VESSEL_RADIUS,
                 ROUND_SEGMENTS,
@@ -448,7 +450,6 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
             );
             continue;
         }
-        let path = &mut classes[class_index(vessel.class)];
         let radians = vessel.facing().to_radians();
         let (sin, cos) = radians.sin_cos();
         // North is up in canvas coordinates, so the course turns a direction whose y is
@@ -483,7 +484,7 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
         );
     }
 
-    ShipPaths { classes, unknown }
+    ShipPaths { types }
 }
 
 /// Appends a filled circle centred on `center`, as a fan of triangles.
@@ -563,11 +564,7 @@ mod tests {
     use gpui_kit::Pixels;
 
     use super::*;
-    use crate::{
-        model::{MAX_ZOOM, ShipClass},
-        scene,
-        view::CLASSES,
-    };
+    use crate::{model::MAX_ZOOM, scene};
 
     /// Asserts two floats are the same within the tolerance a projection needs.
     fn assert_close(left: f32, right: f32, what: &str) {
@@ -615,14 +612,13 @@ mod tests {
         let centre = projection.screen(model::project(56.0, 26.0));
         let vessel = Vessel {
             mmsi: 7,
-            class: ShipClass::Tanker,
+            ship_type: ShipType::Tanker,
             position: model::project(56.0, 26.0),
             cog: 0,
             heading: 0,
-            has_ship: true,
         };
         let ships = ship_paths(&[vessel], projection, origin);
-        let tip = ships.classes[0].vertices[0].xy_position;
+        let tip = ships.types[ShipType::Tanker.index()].vertices[0].xy_position;
         assert_close(
             f32::from(tip.x),
             origin[0] + centre[0],
@@ -648,31 +644,21 @@ mod tests {
         );
     }
 
-    /// One vessel of each class and one whose ship record has not arrived, all over the
-    /// strait, so every vessel path has something in it.
+    /// One vessel of each ship type, all over the strait, so every vessel path has
+    /// something in it.
     fn one_vessel_per_path() -> Vec<Vessel> {
         let position = model::project(56.3, 26.5);
-        let mut vessels: Vec<Vessel> = CLASSES
+        SHIP_TYPES
             .iter()
             .enumerate()
-            .map(|(index, class)| Vessel {
+            .map(|(index, ship_type)| Vessel {
                 mmsi: index as u32 + 1,
-                class: *class,
+                ship_type: *ship_type,
                 position,
                 cog: 0,
                 heading: 0,
-                has_ship: true,
             })
-            .collect();
-        vessels.push(Vessel {
-            mmsi: 5,
-            class: ShipClass::Other,
-            position,
-            cog: 0,
-            heading: 0,
-            has_ship: false,
-        });
-        vessels
+            .collect()
     }
 
     /// A line layer holding one piece in the cell its first point falls in.
@@ -731,12 +717,12 @@ mod tests {
         }
     }
 
-    /// The nine paths are the map's stacking: the coastline, the borders, the roads, then
-    /// the vessels.
+    /// The paths are the map's stacking: the coastline, the borders, the roads, then the
+    /// vessels.
     ///
     /// The order lives in one place — [`MapLayers::in_paint_order`] — so this is the test
-    /// that replaces "did the frame paint them in order": each of the nine slots is checked
-    /// against the builder its name claims, and the nine are checked against the colour
+    /// that replaces "did the frame paint them in order": each slot is checked against the
+    /// builder its name claims, and the whole sequence is checked against the colour
     /// roles in the documented order.
     #[test]
     fn the_map_layers_are_built_in_paint_order() {
@@ -769,31 +755,34 @@ mod tests {
         );
         assert_same_geometry(&layers.roads[0], &roads[0], "the motorways");
         assert_same_geometry(&layers.roads[1], &roads[1], "the primary roads");
-        assert_same_geometry(&layers.ships.unknown, &ships.unknown, "the unknown dots");
-        for index in 0..CLASSES.len() {
+        for ship_type in SHIP_TYPES {
             assert_same_geometry(
-                &layers.ships.classes[index],
-                &ships.classes[index],
-                "a class path",
+                &layers.ships.types[ship_type.index()],
+                &ships.types[ship_type.index()],
+                "a ship type path",
             );
         }
 
         let painted = layers.in_paint_order(colors);
+        let mut expected = vec![
+            colors.land,
+            colors.map_border,
+            colors.road,
+            colors.road_minor,
+        ];
+        expected.push(colors.ships[ShipType::Unknown.index()]);
+        expected.extend(
+            SHIP_TYPES
+                .iter()
+                .filter(|ship_type| **ship_type != ShipType::Unknown)
+                .map(|ship_type| colors.ships[ship_type.index()]),
+        );
         assert_eq!(
             painted.iter().map(|(_, color)| *color).collect::<Vec<_>>(),
-            [
-                colors.land,
-                colors.map_border,
-                colors.road,
-                colors.road_minor,
-                colors.unknown,
-                colors.ships[0],
-                colors.ships[1],
-                colors.ships[2],
-                colors.ships[3],
-            ],
-            "the nine paths are painted land, borders, roads, ships, in that order",
+            expected,
+            "the paths are painted land, borders, roads, unknown dots, then the typed markers",
         );
+        assert_eq!(painted.len(), 4 + SHIP_TYPE_COUNT);
         assert!(
             !painted[0].0.vertices.is_empty()
                 && !painted[1].0.vertices.is_empty()
@@ -952,11 +941,10 @@ mod tests {
             layers.roads[0].vertices.is_empty() && layers.roads[1].vertices.is_empty(),
             "and no roads",
         );
-        assert!(!layers.ships.unknown.vertices.is_empty());
         assert!(
             layers
                 .ships
-                .classes
+                .types
                 .iter()
                 .all(|path| !path.vertices.is_empty()),
             "every vessel path has a vessel",
@@ -1056,8 +1044,8 @@ mod tests {
 
     /// The triangles the fitted frame with no vessels draws on the design's pane.
     ///
-    /// The nine paths of [`MapLayers`] with an empty picture and no hover ring: the
-    /// coarsest coast, the dashed borders and the coarse copy of the long road chains.
+    /// The paths of [`MapLayers`] with an empty picture and no hover ring: the coarsest
+    /// coast, the dashed borders and the coarse copy of the long road chains.
     /// 5,733 + 2,312 + 12,614 = 20,659, inside both §8 targets (21,000 triangles /
     /// 65,536 vertices = 61,977).
     const FITTED_FRAME_TRIANGLES: usize = 20_659;
@@ -1121,7 +1109,7 @@ mod tests {
         /// worst case. The labels, the legend, the card and the canvas' own sea fill are
         /// elements rather than path triangles, and the plan's 8.58 ms intercept already
         /// carries them, which is why they are not counted here. The vessels are part of
-        /// the nine paths, so nothing is added twice.
+        /// the map's paths, so nothing is added twice.
         fn of(layers: &MapLayers, ring: &Path<Pixels>, filter: RoadFilter) -> Self {
             let [class_zero, primary] = &layers.roads;
             let (roads_coarse, roads_middle, roads_fine) = match filter {
@@ -1140,8 +1128,7 @@ mod tests {
                 roads_middle,
                 roads_fine,
                 roads_primary: triangles(primary),
-                ships: triangles(&layers.ships.unknown)
-                    + layers.ships.classes.iter().map(triangles).sum::<usize>(),
+                ships: layers.ships.types.iter().map(triangles).sum::<usize>(),
                 ring: triangles(ring),
             }
         }
@@ -1198,11 +1185,10 @@ mod tests {
 
     /// One picture, with every vessel at its most expensive.
     ///
-    /// A vessel whose ship record has not arrived is a disc of [`ROUND_SEGMENTS`]
-    /// triangles; a vessel with one is a single marker triangle. Spreading
-    /// `PICTURE_VESSELS` unknown vessels over the viewport therefore counts the most the
-    /// vessel layer can ever draw — no allowance, and no assumption about how many
-    /// records have arrived.
+    /// A vessel with no type is a disc of [`ROUND_SEGMENTS`] triangles; a vessel with one
+    /// is a single marker triangle. Spreading `PICTURE_VESSELS` untyped vessels over the
+    /// viewport therefore counts the most the vessel layer can ever draw — no allowance,
+    /// and no assumption about how many records have arrived.
     fn a_full_picture(projection: Projection) -> Vec<Vessel> {
         (0..PICTURE_VESSELS)
             .map(|index| {
@@ -1214,11 +1200,10 @@ mod tests {
                 ];
                 Vessel {
                     mmsi: index as u32 + 1,
-                    class: ShipClass::Tanker,
+                    ship_type: ShipType::Unknown,
                     position: projection.mercator(canvas),
                     cog: 0,
                     heading: 0,
-                    has_ship: false,
                 }
             })
             .collect()
@@ -1239,11 +1224,10 @@ mod tests {
                 ];
                 Vessel {
                     mmsi: index as u32 + 1,
-                    class: ShipClass::Tanker,
+                    ship_type: ShipType::Tanker,
                     position: projection.mercator(canvas),
                     cog: 0,
                     heading: 0,
-                    has_ship: true,
                 }
             })
             .collect()
@@ -1475,7 +1459,7 @@ mod tests {
             let vessels = a_full_picture(projection);
             let layers = map_layers(Some(scene), projection, origin, &vessels);
             assert_eq!(
-                layers.ships.unknown.vertices.len() / 3,
+                layers.ships.types[ShipType::Unknown.index()].vertices.len() / 3,
                 PICTURE_VESSELS * ROUND_SEGMENTS,
                 "the full picture is in frame, so the worst case is the one counted",
             );

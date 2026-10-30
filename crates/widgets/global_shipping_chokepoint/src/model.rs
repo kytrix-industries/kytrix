@@ -2,10 +2,9 @@
 //!
 //! The map is largely fixed — a coastline and thirty-eight labels — and the only part
 //! that moves is the vessel layer. This module owns the fixed half of that picture
-//! (bounds, projection, label anchors), the four buckets vessels are coloured by, the
-//! flag-state table, the camera and its clamping, and the store one AIS subscription
-//! fills. None of it needs a GPUI context: a colour is read from the resolved theme and a
-//! push is applied without notifying anything. The frames those changes are drawn in
+//! (bounds, projection, label anchors), the flag-state table, the camera and its
+//! clamping, and the store one AIS subscription fills. None of it needs a GPUI context:
+//! a push is applied without notifying anything. The frames those changes are drawn in
 //! belong to the view.
 //!
 //! # A picture held between pushes
@@ -30,15 +29,16 @@
 use std::time::Duration;
 
 use ahash::AHashMap;
-use base_ui::style::theme::Theme;
-use gpui_kit::Hsla;
 use kytrix_service_provider::service::global_shipping_chokepoint::{
     GlobalShippingChokepointPosition, GlobalShippingChokepointShip, GlobalShippingChokepointUpdate,
 };
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
-use crate::scene::Piece;
+use crate::{
+    scene::Piece,
+    ship::{SHIP_TYPE_COUNT, SHIP_TYPES, ShipType},
+};
 
 /// The west edge of the map, in degrees east.
 pub(super) const MAP_WEST: f32 = 47.802;
@@ -1022,50 +1022,6 @@ pub(super) fn place_labels(
     placed
 }
 
-/// The four buckets vessels are drawn in.
-///
-/// AIS has no authoritative container/bulk split: `ship_type` says `70–79` is cargo
-/// and nothing more. The split below is therefore a display approximation —
-/// `70–74` read as container, `75–79` as bulk, `80–89` as tanker, everything else
-/// (including the "not available" zero) as other — chosen so that every bucket is
-/// reachable from a real report, which is what the four colours and every legend
-/// entry need.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ShipClass {
-    /// A tanker: the `80–89` range of `ship_type`.
-    Tanker,
-    /// A container ship: the `70–74` range of `ship_type`.
-    Container,
-    /// A bulk carrier: the `75–79` range of `ship_type`.
-    Bulk,
-    /// Everything else, including a report that names no type at all.
-    Other,
-}
-
-/// The bucket one AIS `ship_type` is drawn in.
-pub(super) const fn class_of(ship_type: u32) -> ShipClass {
-    match ship_type {
-        70..=74 => ShipClass::Container,
-        75..=79 => ShipClass::Bulk,
-        80..=89 => ShipClass::Tanker,
-        _ => ShipClass::Other,
-    }
-}
-
-/// The colour one class is drawn in, read from the theme the frame is drawn with.
-///
-/// Nothing is cached: the appearance can change between frames, and a cached colour
-/// is a pane that keeps drawing the previous theme's ships.
-pub(super) fn colour_for(theme: &Theme, class: ShipClass) -> Hsla {
-    let series = &theme.roles.chart.series;
-    match class {
-        ShipClass::Tanker => series[0].hsla,
-        ShipClass::Container => series[1].hsla,
-        ShipClass::Bulk => series[2].hsla,
-        ShipClass::Other => series[4].hsla,
-    }
-}
-
 /// The MID-to-flag table, ordered by MID so a lookup is a binary search.
 ///
 /// A MID is the first three digits of an MMSI and names the flag state the vessel is
@@ -1248,9 +1204,9 @@ pub(super) fn nav_status_of(nav_status: u32) -> Option<NavStatus> {
 pub(super) struct Vessel {
     /// The identity its position and its ship record are joined on.
     pub mmsi: u32,
-    /// The bucket its ship type falls in, or [`ShipClass::Other`] while the ship
-    /// record has not arrived.
-    pub class: ShipClass,
+    /// The main type its ship type falls in, or [`ShipType::Unknown`] while the ship
+    /// record has not arrived or names no type.
+    pub ship_type: ShipType,
     /// Its last position, in Mercator coordinates.
     pub position: [f32; 2],
     /// Course over ground in 0.1°, as the wire carries it; the marker turns by it and
@@ -1258,9 +1214,6 @@ pub(super) struct Vessel {
     pub cog: u32,
     /// True heading in degrees, as the wire carries it.
     pub heading: u32,
-    /// Whether the ship record has arrived. A vessel without one is still painted —
-    /// as an unknown — because its position is enough to draw a dot.
-    pub has_ship: bool,
 }
 
 impl Vessel {
@@ -1280,6 +1233,23 @@ impl Vessel {
     }
 }
 
+/// The ship types a picture holds, in [`SHIP_TYPES`] order.
+///
+/// The legend and the filter offer these and nothing else: a type nobody in the strait
+/// is currently reporting would be an entry that draws nothing. An empty picture holds
+/// no types, which is why the legend then shows only its count.
+pub(super) fn present_ship_types(vessels: &[Vessel]) -> Vec<ShipType> {
+    let mut present = [false; SHIP_TYPE_COUNT];
+    for vessel in vessels {
+        present[vessel.ship_type.index()] = true;
+    }
+    SHIP_TYPES
+        .iter()
+        .copied()
+        .filter(|ship_type| present[ship_type.index()])
+        .collect()
+}
+
 /// The sixteen values a hover card reads, one field per catalogue key.
 ///
 /// The card's labels and its "unavailable" text belong to the view: a field is `None`
@@ -1297,8 +1267,9 @@ pub(super) struct VesselDetails {
     pub imo: Option<SmolStr>,
     /// 4. The call sign, or `None` when it is empty.
     pub call_sign: Option<SmolStr>,
-    /// 5. The bucket the ship type falls in, or `None` when it names no type.
-    pub ship_class: Option<ShipClass>,
+    /// 5. The main type the ship type falls in, or `None` before the ship record
+    ///    arrives. A record that names no type is [`ShipType::Unknown`].
+    pub ship_type: Option<ShipType>,
     /// 6. The flag state's two-letter code, or `None` when the MID names none.
     pub flag: Option<&'static str>,
     /// 7. The destination, or `None` when it is empty.
@@ -1346,8 +1317,7 @@ impl VesselDetails {
             imo: ship.and_then(|ship| (ship.imo != 0).then(|| format_smolstr!("{}", ship.imo))),
             call_sign: ship
                 .and_then(|ship| (!ship.call_sign.is_empty()).then(|| ship.call_sign.clone())),
-            ship_class: ship
-                .and_then(|ship| (ship.ship_type != 0).then(|| class_of(ship.ship_type))),
+            ship_type: ship.map(|ship| ShipType::from_code(ship.ship_type)),
             flag: ship.and_then(|ship| flag_for_mid(ship.flag_mid)),
             destination: ship
                 .and_then(|ship| (!ship.destination.is_empty()).then(|| ship.destination.clone())),
@@ -1539,6 +1509,10 @@ impl VesselStore {
     }
 
     /// How many vessels the picture holds.
+    ///
+    /// Test-only: the pane counts what the filter draws, which is the painted list rather
+    /// than the store.
+    #[cfg(test)]
     pub fn vessel_count(&self) -> usize {
         self.positions.len()
     }
@@ -1572,14 +1546,15 @@ impl VesselStore {
             let ship = self.ships.get(&position.mmsi);
             vessels.push(Vessel {
                 mmsi: position.mmsi,
-                class: ship.map_or(ShipClass::Other, |ship| class_of(ship.ship_type)),
+                ship_type: ship.map_or(ShipType::Unknown, |ship| {
+                    ShipType::from_code(ship.ship_type)
+                }),
                 position: project(
                     position.longitude as f32 / 1_000_000.0,
                     position.latitude as f32 / 1_000_000.0,
                 ),
                 cog: position.cog,
                 heading: position.heading,
-                has_ship: ship.is_some(),
             });
         }
         vessels
@@ -1622,8 +1597,6 @@ pub(super) fn hit_test(points: &[(u32, [f32; 2])], at: [f32; 2]) -> Option<u32> 
 
 #[cfg(test)]
 mod tests {
-    use base_ui::style::palette::Appearance;
-
     use super::*;
 
     /// The west edge of the area the service reports positions for, in degrees east.
@@ -1757,18 +1730,36 @@ mod tests {
     }
 
     #[test]
-    fn every_bucket_should_be_reachable_from_a_ship_type() {
-        assert_eq!(class_of(70), ShipClass::Container);
-        assert_eq!(class_of(74), ShipClass::Container);
-        assert_eq!(class_of(75), ShipClass::Bulk);
-        assert_eq!(class_of(79), ShipClass::Bulk);
-        assert_eq!(class_of(80), ShipClass::Tanker);
-        assert_eq!(class_of(89), ShipClass::Tanker);
-        assert_eq!(class_of(35), ShipClass::Other, "a military vessel");
-        assert_eq!(class_of(60), ShipClass::Other, "a passenger vessel");
-        assert_eq!(class_of(0), ShipClass::Other, "a type the report omits");
-        assert_eq!(class_of(90), ShipClass::Other, "the range beyond tankers");
-        assert_eq!(class_of(u32::MAX), ShipClass::Other);
+    fn the_present_types_should_follow_the_display_order_and_include_unknown() {
+        let position = project(56.3, 26.5);
+        let vessels = [
+            (1, ShipType::Cargo),
+            (2, ShipType::Tanker),
+            (3, ShipType::Unknown),
+            (4, ShipType::Passenger),
+        ]
+        .map(|(mmsi, ship_type)| Vessel {
+            mmsi,
+            ship_type,
+            position,
+            cog: 0,
+            heading: 0,
+        });
+
+        assert_eq!(
+            present_ship_types(&vessels),
+            [
+                ShipType::Tanker,
+                ShipType::Cargo,
+                ShipType::Passenger,
+                ShipType::Unknown,
+            ],
+            "the legend lists the types in the table's order",
+        );
+        assert!(
+            present_ship_types(&[]).is_empty(),
+            "an empty picture holds no type",
+        );
     }
 
     #[test]
@@ -2301,8 +2292,7 @@ mod tests {
             .iter()
             .find(|vessel| vessel.mmsi == 1)
             .expect("the vessel with a position is painted");
-        assert!(vessel.has_ship);
-        assert_eq!(vessel.class, ShipClass::Tanker);
+        assert_eq!(vessel.ship_type, ShipType::Tanker);
         assert_eq!(vessel.position, project(56.3, 26.5));
         assert_eq!(vessel.cog, 456);
         assert_eq!(vessel.heading, 87);
@@ -2315,11 +2305,10 @@ mod tests {
             .into_iter()
             .find(|vessel| vessel.mmsi == 3)
             .expect("a position without a ship record is still a vessel");
-        assert!(!vessel.has_ship);
         assert_eq!(
-            vessel.class,
-            ShipClass::Other,
-            "an unknown type is the other bucket",
+            vessel.ship_type,
+            ShipType::Unknown,
+            "a vessel without a static record has no type",
         );
     }
 
@@ -2338,7 +2327,7 @@ mod tests {
         assert_eq!(details.mmsi.as_str(), "42");
         assert_eq!(details.imo.as_deref(), Some("9074729"));
         assert_eq!(details.call_sign.as_deref(), Some("A8AB2"));
-        assert_eq!(details.ship_class, Some(ShipClass::Tanker));
+        assert_eq!(details.ship_type, Some(ShipType::Tanker));
         assert_eq!(details.flag, Some("LR"));
         assert_eq!(details.destination.as_deref(), Some("FUJAIRAH"));
         assert_eq!(details.eta.as_deref(), Some("03-14 09:05"));
@@ -2374,7 +2363,11 @@ mod tests {
         );
         assert!(details.imo.is_none(), "IMO zero");
         assert!(details.call_sign.is_none(), "an empty call sign");
-        assert!(details.ship_class.is_none(), "ship type zero");
+        assert_eq!(
+            details.ship_type,
+            Some(ShipType::Unknown),
+            "a report that names no type is unknown",
+        );
         assert!(details.flag.is_none(), "flag MID zero");
         assert!(details.destination.is_none(), "an empty destination");
         assert!(details.eta.is_none(), "all four ETA fields zero");
@@ -2428,7 +2421,7 @@ mod tests {
         assert!(details.name.is_none());
         assert!(details.imo.is_none());
         assert!(details.call_sign.is_none());
-        assert!(details.ship_class.is_none());
+        assert!(details.ship_type.is_none(), "no static record");
         assert!(details.flag.is_none());
         assert!(details.destination.is_none());
         assert!(details.eta.is_none());
@@ -2480,63 +2473,6 @@ mod tests {
             details.updated.is_none(),
             "an instant past the last date is not a date this can write",
         );
-    }
-
-    #[test]
-    fn every_class_should_be_drawn_in_a_colour_of_its_own() {
-        let theme = Theme::of(Appearance::Light);
-        let colours = [
-            ShipClass::Tanker,
-            ShipClass::Container,
-            ShipClass::Bulk,
-            ShipClass::Other,
-        ]
-        .map(|class| colour_for(&theme, class));
-
-        for (first, first_colour) in colours.iter().enumerate() {
-            for (second, second_colour) in colours.iter().enumerate().skip(first + 1) {
-                assert_ne!(
-                    first_colour, second_colour,
-                    "classes {first} and {second} are drawn alike",
-                );
-            }
-        }
-
-        assert_eq!(
-            colour_for(&theme, ShipClass::Tanker),
-            theme.roles.chart.series[0].hsla
-        );
-        assert_eq!(
-            colour_for(&theme, ShipClass::Container),
-            theme.roles.chart.series[1].hsla,
-        );
-        assert_eq!(
-            colour_for(&theme, ShipClass::Bulk),
-            theme.roles.chart.series[2].hsla
-        );
-        assert_eq!(
-            colour_for(&theme, ShipClass::Other),
-            theme.roles.chart.series[4].hsla
-        );
-    }
-
-    #[test]
-    fn a_class_should_be_drawn_in_the_appearance_the_pane_is_in() {
-        let light = Theme::of(Appearance::Light);
-        let dark = Theme::of(Appearance::Dark);
-
-        for class in [
-            ShipClass::Tanker,
-            ShipClass::Container,
-            ShipClass::Bulk,
-            ShipClass::Other,
-        ] {
-            assert_ne!(
-                colour_for(&light, class),
-                colour_for(&dark, class),
-                "{class:?} draws one colour in both appearances",
-            );
-        }
     }
 
     #[test]
@@ -2853,11 +2789,10 @@ mod tests {
     fn a_marker_should_face_its_course_and_fall_back_to_its_heading() {
         let mut vessel = Vessel {
             mmsi: 1,
-            class: ShipClass::Other,
+            ship_type: ShipType::Other,
             position: [0.0, 0.0],
             cog: 900,
             heading: 347,
-            has_ship: true,
         };
         assert_close(
             vessel.facing(),

@@ -649,6 +649,10 @@ widget:
   global_shipping_chokepoint:
     attribution: © OpenStreetMap 贡献者
     entitlement_required: 当前账户不包含 AIS 船舶数据订阅
+    filter:
+      all: 全部
+      choice: '船舶类型：%{value}'
+      title: 船舶类型
     hover:
       call_sign: 呼号
       course: 对地航向
@@ -709,10 +713,6 @@ widget:
         gulf_of_oman: 阿曼湾
         persian_gulf: 波斯湾
     legend:
-      bulk: 散货船
-      container: 集装箱船
-      other: 其他船舶
-      tanker: 油轮
       title: 船舶类型
     nav_status:
       "0": 在航（机动）
@@ -731,10 +731,26 @@ widget:
       "13": 保留
       "14": AIS-SART（搜救应答器）
     ship_type:
-      bulk: 散货船
-      container: 集装箱船
+      anti_pollution: 防污染船
+      cargo: 货船
+      dredging: 疏浚/潜水作业
+      fishing: 渔船
+      high_speed: 高速船
+      law_enforcement: 执法船
+      medical: 医疗运输船
+      military: 军用船舶
+      noncombatant: 非战斗船
       other: 其他船舶
+      passenger: 客船
+      pilot: 引航船
+      pleasure: 游艇
+      port_tender: 港口作业船
+      sailing: 帆船
+      search_and_rescue: 搜救船
       tanker: 油轮
+      towing: 拖船/拖带
+      unknown: 未知
+      wing_in_ground: 地效翼船
     sign_in: <p align="center">注册或登录后即可查看海峡内的船舶。</p>
     unavailable: —
     vessel_count: '%{count} 艘'
