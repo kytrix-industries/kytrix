@@ -1,12 +1,12 @@
 //! What a pane drawing the Strait of Hormuz knows, and how it is drawn.
 //!
-//! The map is largely fixed — a coastline, a lane sketch, thirty-eight labels — and the
-//! only part that moves is the vessel layer. This module owns the fixed half of that
-//! picture (bounds, projection, label anchors, lanes), the four buckets vessels are
-//! coloured by, the flag-state table, the camera and its clamping, and the store one
-//! AIS subscription fills. None of it needs a GPUI context: a colour is read from the
-//! resolved theme and a push is applied without notifying anything. The frames those
-//! changes are drawn in belong to the view.
+//! The map is largely fixed — a coastline and thirty-eight labels — and the only part
+//! that moves is the vessel layer. This module owns the fixed half of that picture
+//! (bounds, projection, label anchors), the four buckets vessels are coloured by, the
+//! flag-state table, the camera and its clamping, and the store one AIS subscription
+//! fills. None of it needs a GPUI context: a colour is read from the resolved theme and a
+//! push is applied without notifying anything. The frames those changes are drawn in
+//! belong to the view.
 //!
 //! # A picture held between pushes
 //!
@@ -344,32 +344,6 @@ const COG_UNAVAILABLE: u32 = 3_600;
 const HEADING_UNAVAILABLE: u32 = 511;
 /// The first navigation status that means "undefined"; the catalogue names 0–14.
 const NAV_STATUS_UNDEFINED: u8 = 15;
-
-/// The lanes the map sketches, as lines of `(longitude, latitude)` in degrees.
-///
-/// They are a schematic of the traffic separation scheme's direction of travel, not
-/// a surveyed chart boundary: each line is the middle of a lane and the map dashes
-/// it. The first two run the length of the strait in opposite directions, the third
-/// is the Bandar Abbas approach and the fourth the Fujairah anchorage approach.
-pub(super) const TSS_LANES: &[&[(f32, f32)]] = &[
-    &[
-        (57.35, 25.15),
-        (56.72, 25.85),
-        (56.35, 26.38),
-        (55.95, 26.62),
-        (55.30, 26.78),
-    ],
-    &[
-        (55.10, 26.68),
-        (55.65, 26.50),
-        (56.15, 26.45),
-        (56.55, 26.10),
-        (57.10, 25.55),
-        (57.75, 25.05),
-    ],
-    &[(56.30, 27.12), (56.33, 26.80), (56.38, 26.55)],
-    &[(56.34, 25.15), (56.42, 25.58), (56.48, 25.98)],
-];
 
 /// One label the map draws: the name it reads in the catalogue and where it sits.
 #[derive(Clone, Copy, Debug)]
@@ -919,22 +893,6 @@ impl Projection {
             && canvas[0] <= self.viewport[0] + margin
             && canvas[1] >= -margin
             && canvas[1] <= self.viewport[1] + margin
-    }
-
-    /// Whether the box one screen-space segment covers reaches the canvas.
-    ///
-    /// The endpoints of a segment are not enough: a lane's segment can leave the canvas on
-    /// both ends while crossing it.
-    pub(super) fn segment_near(self, start: [f32; 2], end: [f32; 2], margin: f32) -> bool {
-        let left = start[0].min(end[0]);
-        let right = start[0].max(end[0]);
-        let top = start[1].min(end[1]);
-        let bottom = start[1].max(end[1]);
-
-        right >= -margin
-            && left <= self.viewport[0] + margin
-            && bottom >= -margin
-            && top <= self.viewport[1] + margin
     }
 }
 
@@ -2659,28 +2617,6 @@ mod tests {
                 && global_shipping_chokepoint_north <= map_north,
             "and north to south",
         );
-    }
-
-    #[test]
-    fn the_lanes_should_sit_inside_the_picture_they_are_drawn_on() {
-        assert!(
-            (3..=5).contains(&TSS_LANES.len()),
-            "the design sketches three to five lanes",
-        );
-
-        for (index, lane) in TSS_LANES.iter().enumerate() {
-            assert!(lane.len() >= 2, "lane {index} needs a direction");
-            for (longitude, latitude) in lane.iter() {
-                assert!(
-                    (AIS_WEST..=AIS_EAST).contains(longitude),
-                    "lane {index} is off the reported area at {longitude}",
-                );
-                assert!(
-                    (AIS_SOUTH..=AIS_NORTH).contains(latitude),
-                    "lane {index} is off the reported area at {latitude}",
-                );
-            }
-        }
     }
 
     #[test]

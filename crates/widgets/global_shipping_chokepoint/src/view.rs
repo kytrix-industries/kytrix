@@ -1,14 +1,14 @@
-//! The Strait of Hormuz pane: its coastline, its lanes, and the vessels an AIS
-//! subscription reports in it.
+//! The Strait of Hormuz pane: its coastline and the vessels an AIS subscription reports in
+//! it.
 //!
 //! # What the frame draws
 //!
 //! One canvas, under elements that carry the words. The base map's coastline, borders and
-//! roads are layers parsed once by [`crate::scene`]; [`crate::paint`] turns them, the
-//! lanes and the vessel markers into the paths the canvas paints for the frame's camera,
-//! and the labels, the legend, the hover card, the stale badge and the empty state are
-//! absolutely positioned over it. Nothing tessellates per frame: a frame only applies the
-//! camera's affine transform to geometry that was prepared once.
+//! roads are layers parsed once by [`crate::scene`]; [`crate::paint`] turns them and the
+//! vessel markers into the paths the canvas paints for the frame's camera, and the labels,
+//! the legend, the hover card, the stale badge and the empty state are absolutely
+//! positioned over it. Nothing tessellates per frame: a frame only applies the camera's
+//! affine transform to geometry that was prepared once.
 //!
 //! # What the pane reports, and what it holds
 //!
@@ -110,6 +110,25 @@ const COUNTRY_LABEL_TEXT_SIZE: f32 = 21.0;
 /// word read in the order a paper atlas prints them in.
 const CITY_LABEL_TEXT_SIZE: f32 = 13.0;
 
+/// Where a country's or a city's halo is drawn, in pixels off the name's own box.
+///
+/// GPUI has no text stroke: `TextStyle` carries no stroke and no shadow, and
+/// `stroke_width` exists only on paths. The outline a chart gives a name that sits on the
+/// picture is therefore the name itself, drawn in the map's paper colour one pixel off in
+/// each direction and painted under it. Eight offsets rather than four: a cross leaves the
+/// diagonals of a thin glyph uncovered at the city's 13 px step, and the cost is a text
+/// element that shapes from the same cache the name already filled.
+const LABEL_HALO_OFFSETS: [[f32; 2]; 8] = [
+    [-1.0, -1.0],
+    [0.0, -1.0],
+    [1.0, -1.0],
+    [-1.0, 0.0],
+    [1.0, 0.0],
+    [-1.0, 1.0],
+    [0.0, 1.0],
+    [1.0, 1.0],
+];
+
 /// The box one label's text occupies, shaped in the style the frame draws it in.
 ///
 /// The width is the shaped line's own, so a Chinese name is measured as narrow as it is
@@ -157,9 +176,6 @@ fn label_text(cx: &App, key: &str, kind: LabelKind) -> SharedString {
         LabelKind::Water | LabelKind::City => t!(cx, key),
     }
 }
-
-/// How opaque a lane is drawn over the sea.
-const DASH_ALPHA: f32 = 0.55;
 
 /// How wide the hover card is.
 const CARD_WIDTH: f32 = 208.0;
@@ -299,22 +315,27 @@ pub(super) struct MapColors {
     pub road: Hsla,
     /// Primary roads, the finer of the two road strokes.
     pub road_minor: Hsla,
-    /// The lanes, already at their opacity.
-    pub lane: Hsla,
     /// One colour per class in [`CLASSES`] order.
     pub ships: [Hsla; 4],
     /// The dot a vessel without a ship record is drawn as.
     pub unknown: Hsla,
     /// The ring around the vessel under the pointer.
     pub hover: Hsla,
-    /// The fill of the labels' chips and the card.
+    /// The fill of the legend, the credit and the card.
     overlay: Hsla,
-    /// The edge of those chips and of the card.
+    /// The edge of those panels and of the card.
     border: Hsla,
     /// Text and the city dots.
     text: Hsla,
     /// Secondary text: the legend's title, the card's labels.
     muted: Hsla,
+    /// The ring a place name is drawn with.
+    ///
+    /// A name is drawn straight on the picture, and the vessel markers under it are the
+    /// same dark as the letters. The outline is the map's own paper colour — the same
+    /// white (or night grey) the panels use — so it reads as the fill showing through
+    /// rather than as a second colour on the map.
+    pub halo: Hsla,
     /// The stale badge, which is a warning rather than an error.
     warning: Hsla,
 }
@@ -328,7 +349,6 @@ impl MapColors {
             map_border: roles.chart.map_border.hsla,
             road: roles.chart.map_road.hsla,
             road_minor: roles.chart.map_road_minor.hsla,
-            lane: roles.chart.series[3].hsla.opacity(DASH_ALPHA),
             ships: CLASSES.map(|class| colour_for(theme, class)),
             unknown: roles.fg.muted.hsla,
             hover: roles.line.focus.hsla,
@@ -336,6 +356,7 @@ impl MapColors {
             border: roles.line.border.hsla,
             text: roles.fg.default.hsla,
             muted: roles.fg.muted.hsla,
+            halo: roles.surface.overlay.hsla,
             warning: roles.status.warning.base.hsla,
         }
     }
@@ -867,6 +888,12 @@ impl GlobalShippingChokepointWidget {
     /// straight on the fill, so they take the readable colour and clear 4.5:1 in both
     /// appearances (pinned by the test below).
     ///
+    /// A country and a city carry a halo (see [`LABEL_HALO_OFFSETS`]): a name is drawn on
+    /// the picture, and the anchorage it names is where the markers pile up, so the letters
+    /// would otherwise sit on a field of the same dark as themselves. A sea's name is over
+    /// open water, where nothing is drawn under it, so it is the one kind that takes no
+    /// halo.
+    ///
     /// The three kinds are told apart by size and weight as well as by colour: a country
     /// is the map's largest word, bold and italic, a city is a step under it, and water is
     /// the smallest and the only muted one. That is the order a paper atlas prints them in,
@@ -885,23 +912,46 @@ impl GlobalShippingChokepointWidget {
         .map(|label| {
             let [x, y] = label.at;
             let text = label_text(cx, label.key, label.kind);
-            let text = match label.kind {
+            // One name in one colour: the halo copies and the name itself are the same
+            // text in the same style, so restyling a kind cannot leave its outline behind.
+            let name_in = |color: Hsla| match label.kind {
                 LabelKind::Country => div()
                     .text_size(px(COUNTRY_LABEL_TEXT_SIZE))
                     .font_weight(FontWeight::BOLD)
                     .italic()
-                    .text_color(colors.text)
-                    .child(text),
+                    .text_color(color)
+                    .child(text.clone()),
                 LabelKind::Water => div()
                     .text_xs()
                     .italic()
-                    .text_color(colors.muted)
-                    .child(text),
+                    .text_color(color)
+                    .child(text.clone()),
                 LabelKind::City => div()
                     .text_size(px(CITY_LABEL_TEXT_SIZE))
-                    .text_color(colors.text)
-                    .child(text),
+                    .text_color(color)
+                    .child(text.clone()),
             };
+            let halo = matches!(label.kind, LabelKind::Country | LabelKind::City).then(|| {
+                LABEL_HALO_OFFSETS
+                    .iter()
+                    .map(|[dx, dy]| {
+                        div()
+                            .debug_selector(|| "TEST_CHOKEPOINT_LABEL_HALO".into())
+                            .absolute()
+                            .left(px(*dx))
+                            .top(px(*dy))
+                            .child(name_in(colors.halo))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // A sea's name is the only muted one; a country's and a city's take the
+            // readable foreground, because they are the words drawn over the picture.
+            let color = match label.kind {
+                LabelKind::Country | LabelKind::City => colors.text,
+                LabelKind::Water => colors.muted,
+            };
+            let name = name_in(color).debug_selector(|| "TEST_CHOKEPOINT_LABEL_NAME".into());
             div()
                 .absolute()
                 .left(px(x - LABEL_BOX_WIDTH / 2.0))
@@ -911,7 +961,16 @@ impl GlobalShippingChokepointWidget {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(text)
+                // The copies are positioned against the name's own box rather than against
+                // the 320 px label box, which is what makes a one-pixel offset a ring
+                // around the letters instead of a shift of the whole label. The name is the
+                // last child, so it is painted over them.
+                .child(
+                    div()
+                        .relative()
+                        .children(halo.unwrap_or_default())
+                        .child(name),
+                )
                 .into_any_element()
         })
         .collect()
@@ -2553,6 +2612,76 @@ mod tests {
         }
     }
 
+    /// A halo is only a halo if the letters stand clearly off it: the ring is drawn in the
+    /// map's paper colour, so the name has to read against that colour in both appearances.
+    /// An outline a step away from the letters would be a second dark tone on a dark map,
+    /// which is the state the halo exists to end.
+    #[test]
+    fn the_halo_should_stand_off_the_letters_it_outlines() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = MapColors::resolve(&Theme::of(appearance));
+            let ratio = wcag_contrast(colors.text, colors.halo);
+            assert!(
+                ratio >= 4.5,
+                "{appearance:?}: a name reads {ratio:.2}:1 on its own halo",
+            );
+        }
+    }
+
+    /// The halo is a ring rather than a shadow: eight offsets, each exactly one pixel from
+    /// the name and each direction once. A missing diagonal is a gap the markers show
+    /// through at the city's 13 px step, and a wider offset is a second, thicker copy of
+    /// the letters rather than an outline.
+    #[test]
+    fn the_halo_should_ring_the_name_it_outlines() {
+        assert_eq!(LABEL_HALO_OFFSETS.len(), 8, "eight directions are covered");
+
+        for [dx, dy] in LABEL_HALO_OFFSETS {
+            assert_eq!(
+                dx.abs().max(dy.abs()),
+                1.0,
+                "the offset [{dx}, {dy}] is one pixel",
+            );
+            assert!(
+                LABEL_HALO_OFFSETS.contains(&[-dx, -dy]),
+                "the offset [{dx}, {dy}] has no opposite",
+            );
+        }
+    }
+
+    /// A copy of a name is laid out in the name's own box, one pixel off it — not in the
+    /// 320 px label box the name is centred in. The difference is the whole mechanism: an
+    /// offset against the label box would put the ring a hundred pixels away and read as a
+    /// smear beside the name rather than as its outline.
+    ///
+    /// The body is cached, so the frame that answers `debug_bounds` has to be a forced
+    /// repaint (`crates/widgets/AGENTS.md` §10, trap 5).
+    #[gpui_kit::test]
+    fn a_name_should_be_ringed_by_its_halo(cx: &mut TestAppContext) {
+        let pane = pane(cx, RecordingSource::default(), Some(ACCOUNT));
+        cx.update(|cx| {
+            assert!(report_update(&pane, keyframe(7, 1, vec![position(1)]), cx));
+        });
+        let window = map_window(cx, &pane);
+        repaint(window);
+
+        let name = window
+            .debug_bounds("TEST_CHOKEPOINT_LABEL_NAME")
+            .expect("the fitted view names a place");
+        let halo = window
+            .debug_bounds("TEST_CHOKEPOINT_LABEL_HALO")
+            .expect("a city's name is ringed");
+        let offset = halo.origin - name.origin;
+
+        assert_eq!(halo.size, name.size, "a copy is the name's own box");
+        assert!(
+            LABEL_HALO_OFFSETS
+                .iter()
+                .any(|[dx, dy]| offset == point(px(*dx), px(*dy))),
+            "the copy sits at one of the offsets, measured from the name: {offset:?}",
+        );
+    }
+
     /// The map is drawn under its ODbL credit: the label sits in the bottom-left corner of the
     /// map's box, below the legend and clear of the stale badge in the top-left.
     ///
@@ -2680,8 +2809,6 @@ mod tests {
         assert_close(vessel.facing(), 90.0, "the marker faces its course");
         assert!(projection.near_screen(at, 0.0));
         assert!(projection.near_screen([-4.0, 200.0], 8.0));
-        assert!(projection.segment_near([-40.0, 10.0], [10.0, 10.0], 0.0));
-        assert!(!projection.segment_near([-40.0, 10.0], [-10.0, 10.0], 0.0));
     }
 
     /// A Mercator `y` grows north while a canvas `y` grows down, so the projection has to

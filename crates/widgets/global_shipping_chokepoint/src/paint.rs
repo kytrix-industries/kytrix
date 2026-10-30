@@ -1,12 +1,12 @@
-//! How one frame of the map is drawn: the ten paths a canvas paints, in the order they
+//! How one frame of the map is drawn: the nine paths a canvas paints, in the order they
 //! stack, and the geometry each is built from.
 //!
 //! The base map is prepared once by [`crate::scene`] and the picture arrives as a list of
 //! vessels, so a frame here only applies the camera's affine transform: the coastline is a
 //! triangle list of the one resolution the scale justifies, the borders and the roads are
-//! ribbons whose width is in screen pixels, and the borders and the lanes are dashes walked
-//! along their own polylines. Nothing is tessellated per frame and nothing is cached: a
-//! camera change is a different set of vertices, not a different picture.
+//! ribbons whose width is in screen pixels, and the borders are dashes walked along their
+//! own polylines. Nothing is tessellated per frame and nothing is cached: a camera change
+//! is a different set of vertices, not a different picture.
 //!
 //! [`MapColors`] stays in the view, because the labels, the hover card and the hit test
 //! read the same palette; this module is what turns the model's [`Projection`] into the
@@ -15,7 +15,7 @@
 use gpui_kit::{Bounds, Hsla, Path, Pixels, Point, Window, point, px};
 
 use crate::{
-    model::{self, Camera, CellSpan, Projection, RoadFilter, TSS_LANES, Vessel},
+    model::{self, Camera, CellSpan, Projection, RoadFilter, Vessel},
     scene::{LineLayer, Piece, Scene},
     view::{MapColors, class_index, viewport_of},
 };
@@ -46,8 +46,7 @@ const HOVER_RING_OUTER: f32 = 9.0;
 ///
 /// The pattern is walked along a polyline rather than handed to a path builder: a
 /// builder's `dash_array` is sampled when the path is built, which would either tessellate
-/// every frame or make a 6 px dash scale with the camera. The walker's two users are the
-/// lane sketch and the land borders, each with its own pattern.
+/// every frame or make a 6 px dash scale with the camera.
 #[derive(Clone, Copy)]
 struct Dash {
     /// The length of one dash.
@@ -70,13 +69,6 @@ const BORDER_DASH: Dash = Dash {
     width: 1.6,
 };
 
-/// The dash pattern a TSS lane is drawn with.
-const LANE_DASH: Dash = Dash {
-    on: 6.0,
-    off: 6.0,
-    width: 1.5,
-};
-
 /// How wide a motorway or trunk is drawn, in pixels.
 const ROAD_WIDTH: f32 = 1.4;
 
@@ -88,7 +80,7 @@ const MARKER_LENGTH_NEAR: f32 = 10.0;
 /// The marker length at [`MAX_ZOOM`].
 const MARKER_LENGTH_FAR: f32 = 12.0;
 
-/// Draws one frame of the map: the ten paths of [`MapLayers`] in their stacking order,
+/// Draws one frame of the map: the nine paths of [`MapLayers`] in their stacking order,
 /// then the ring around the hovered vessel.
 ///
 /// The geometry is [`map_layers`]'s; this function only hands the paths to the frame in
@@ -127,7 +119,7 @@ pub(super) fn paint_map(
     }
 }
 
-/// The ten paths one frame draws, in the order it paints them.
+/// The nine paths one frame draws, in the order it paints them.
 ///
 /// Building them is the frame's only geometry work, and it happens in [`map_layers`]
 /// rather than in `paint_map` so the picture can be checked without a window.
@@ -138,21 +130,19 @@ struct MapLayers {
     borders: Path<Pixels>,
     /// Motorways and trunks, then primary roads.
     roads: [Path<Pixels>; 2],
-    /// The TSS lanes, as dashes.
-    lanes: Path<Pixels>,
     /// The vessels: the unknown dots and one path per class.
     ships: ShipPaths,
 }
 
 impl MapLayers {
-    /// The ten paths in the order a frame paints them, each with the colour it is drawn in.
+    /// The nine paths in the order a frame paints them, each with the colour it is drawn in.
     ///
     /// The stacking is the map's: the coastline first, the borders over it, the roads over
-    /// those, the lane sketch over the roads, and the vessels last, so no part of the base
-    /// map covers a vessel. The unknown dots go down before the class markers: a vessel
-    /// whose ship record has arrived is a report that says more about it, and its marker
-    /// should not be hidden under a neighbour's dot.
-    fn in_paint_order(self, colors: MapColors) -> [(Path<Pixels>, Hsla); 10] {
+    /// those, and the vessels last, so no part of the base map covers a vessel. The unknown
+    /// dots go down before the class markers: a vessel whose ship record has arrived is a
+    /// report that says more about it, and its marker should not be hidden under a
+    /// neighbour's dot.
+    fn in_paint_order(self, colors: MapColors) -> [(Path<Pixels>, Hsla); 9] {
         let [motorway, primary] = self.roads;
         let [tanker, container, bulk, other] = self.ships.classes;
         [
@@ -160,7 +150,6 @@ impl MapLayers {
             (self.borders, colors.map_border),
             (motorway, colors.road),
             (primary, colors.road_minor),
-            (self.lanes, colors.lane),
             (self.ships.unknown, colors.unknown),
             (tanker, colors.ships[0]),
             (container, colors.ships[1]),
@@ -170,7 +159,7 @@ impl MapLayers {
     }
 }
 
-/// Builds the ten paths one frame draws, from the base map and the picture.
+/// Builds the nine paths one frame draws, from the base map and the picture.
 ///
 /// Pure: no window and no theme. The scale the projection draws at decides which
 /// coastline tier is filled and which class-0 road copy is drawn, the clamped zoom
@@ -206,7 +195,6 @@ fn map_layers(
         land,
         borders,
         roads,
-        lanes: lane_path(projection, origin),
         ships: ship_paths(vessels, projection, origin),
     }
 }
@@ -380,38 +368,6 @@ fn push_quad(
         (start_left, end_right, start_right),
         (texture, texture, texture),
     );
-}
-
-/// The lanes as dashes in screen space.
-///
-/// The dash pattern is walked along each lane rather than handed to a path builder: a
-/// builder's `dash_array` is sampled when the path is built, which would either tessellate
-/// every frame or make a 6 px dash scale with the camera. A dash's phase is anchored at the
-/// lane's first vertex, so panning moves the dashes with the lane instead of crawling them.
-fn lane_path(projection: Projection, origin: [f32; 2]) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    for lane in TSS_LANES {
-        let mut previous: Option<[f32; 2]> = None;
-        let mut along = 0.0f32;
-        for &(longitude, latitude) in lane.iter() {
-            let next = projection.screen(model::project(longitude, latitude));
-            if let Some(start) = previous {
-                let length = ((next[0] - start[0]).powi(2) + (next[1] - start[1]).powi(2)).sqrt();
-                // A lane is a long line: at four times the fitted zoom most of it is off
-                // screen, and walking the dashes of a segment nothing draws is the work
-                // this skips.
-                if length > 0.0 && projection.segment_near(start, next, LANE_DASH.width) {
-                    push_dashes(
-                        &mut path, start, next, along, length, LANE_DASH, origin, texture,
-                    );
-                }
-                along += length;
-            }
-            previous = Some(next);
-        }
-    }
-    path
 }
 
 /// Appends the dashes of one screen-space segment of a dashed polyline.
@@ -775,12 +731,12 @@ mod tests {
         }
     }
 
-    /// The ten paths are the map's stacking: the coastline, the borders, the roads, the
-    /// lanes, then the vessels.
+    /// The nine paths are the map's stacking: the coastline, the borders, the roads, then
+    /// the vessels.
     ///
     /// The order lives in one place — [`MapLayers::in_paint_order`] — so this is the test
-    /// that replaces "did the frame paint them in order": each of the ten slots is checked
-    /// against the builder its name claims, and the ten are checked against the colour
+    /// that replaces "did the frame paint them in order": each of the nine slots is checked
+    /// against the builder its name claims, and the nine are checked against the colour
     /// roles in the documented order.
     #[test]
     fn the_map_layers_are_built_in_paint_order() {
@@ -813,7 +769,6 @@ mod tests {
         );
         assert_same_geometry(&layers.roads[0], &roads[0], "the motorways");
         assert_same_geometry(&layers.roads[1], &roads[1], "the primary roads");
-        assert_same_geometry(&layers.lanes, &lane_path(projection, origin), "the lanes");
         assert_same_geometry(&layers.ships.unknown, &ships.unknown, "the unknown dots");
         for index in 0..CLASSES.len() {
             assert_same_geometry(
@@ -831,20 +786,18 @@ mod tests {
                 colors.map_border,
                 colors.road,
                 colors.road_minor,
-                colors.lane,
                 colors.unknown,
                 colors.ships[0],
                 colors.ships[1],
                 colors.ships[2],
                 colors.ships[3],
             ],
-            "the ten paths are painted land, borders, roads, lanes, ships, in that order",
+            "the nine paths are painted land, borders, roads, ships, in that order",
         );
         assert!(
             !painted[0].0.vertices.is_empty()
                 && !painted[1].0.vertices.is_empty()
-                && !painted[2].0.vertices.is_empty()
-                && !painted[4].0.vertices.is_empty(),
+                && !painted[2].0.vertices.is_empty(),
             "the base map has geometry at the fitted zoom",
         );
         assert!(
@@ -852,7 +805,7 @@ mod tests {
             "the coarse copy draws no primary road, so the second road path is empty",
         );
         assert!(
-            painted[5..]
+            painted[4..]
                 .iter()
                 .all(|(path, _)| !path.vertices.is_empty()),
             "every vessel path has a vessel",
@@ -945,32 +898,6 @@ mod tests {
         );
     }
 
-    /// One lane segment of 30 px is three dashes, each a quad of the configured width: the
-    /// pattern is walked along the segment rather than scaled with the camera.
-    #[test]
-    fn a_lane_segment_is_dashes_of_six_pixels_on_and_off() {
-        let mut path = Path::new(point(px(0.0), px(0.0)));
-        let texture = point(0.0, 1.0);
-        push_dashes(
-            &mut path,
-            [0.0, 50.0],
-            [30.0, 50.0],
-            0.0,
-            30.0,
-            LANE_DASH,
-            [0.0, 0.0],
-            texture,
-        );
-
-        // 6 px on and 6 px off: [0, 6], [12, 18] and [24, 30] are drawn.
-        assert_eq!(path.vertices.len(), 18, "three dashes, two triangles each");
-        assert_close(
-            quad_height(&path),
-            LANE_DASH.width,
-            "a dash keeps its width",
-        );
-    }
-
     /// A border is dashed as well as violet, so that the kind of a line is readable from
     /// its pattern and not only from its hue: one 40 px segment of a border is four 6 px
     /// dashes with a 4 px gap after each, and the gap really is a gap.
@@ -1011,10 +938,10 @@ mod tests {
         );
     }
 
-    /// A pane whose asset failed has no base map, but the lanes and the picture are still
-    /// drawn: a frame does not need the coastline to put something on screen.
+    /// A pane whose asset failed has no base map, but the picture is still drawn: a frame
+    /// does not need the coastline to put something on screen.
     #[test]
-    fn a_map_without_an_asset_still_draws_the_lanes_and_the_ships() {
+    fn a_map_without_an_asset_still_draws_the_ships() {
         let projection = Projection::new(Camera::default(), [600.0, 400.0]);
         let vessels = one_vessel_per_path();
         let layers = map_layers(None, projection, [0.0, 0.0], &vessels);
@@ -1024,10 +951,6 @@ mod tests {
         assert!(
             layers.roads[0].vertices.is_empty() && layers.roads[1].vertices.is_empty(),
             "and no roads",
-        );
-        assert!(
-            !layers.lanes.vertices.is_empty(),
-            "the lanes are not the asset's",
         );
         assert!(!layers.ships.unknown.vertices.is_empty());
         assert!(
@@ -1096,8 +1019,8 @@ mod tests {
 
     /// The plan's §8 targets for the fitted frame: triangles and vertices.
     ///
-    /// Both are met by [`FITTED_FRAME_TRIANGLES`]: 20,801 triangles and 62,403 vertices
-    /// against 21,000 and 65,536 (199 and 3,133 to spare). The vertex target is the
+    /// Both are met by [`FITTED_FRAME_TRIANGLES`]: 20,659 triangles and 61,977 vertices
+    /// against 21,000 and 65,536 (341 and 3,559 to spare). The vertex target is the
     /// 2^16 instance-buffer step the plan's §1.1 explains.
     const FITTED_FRAME_TARGET_TRIANGLES: usize = 21_000;
     const FITTED_FRAME_TARGET_VERTICES: usize = 65_536;
@@ -1114,31 +1037,30 @@ mod tests {
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
     /// again rather than absorbed silently into the budget. The busiest view is the
-    /// **2,048 px wide pane at 1.8648× over 25.879N, 52.799E**: land 10,721 (the 0.002°
-    /// tier), borders 850, fine roads 13,916, lanes 280, the full vessel picture 15,096 and
-    /// the ring 48 — **40,911 in all, 13,911 over the plan's 27,000**. The vessel layer
-    /// grew from 6,000 to 15,096 when the picture stopped being capped at 1,000 vessels.
+    /// **2,048 px wide pane at 1.8648× over 25.879N, 52.697E**: land 10,721 (the 0.002°
+    /// tier), borders 850, fine roads 13,916, the full vessel picture 15,096 and the ring
+    /// 48 — **40,631 in all, 13,631 over the plan's 27,000**. The vessel layer grew from
+    /// 6,000 to 15,096 when the picture stopped being capped at 1,000 vessels.
     ///
     /// The frame sits just below the 0.004° middle copy's 371.1 m/px switch: at 369 m/px
     /// the fine road copy is drawn (13,916), while the middle copy is the next band up.
     /// It is the road LOD cliff, not a land threshold. The sweep's 7 × 5 centre grid plus
-    /// two 9 × 9 refinement rounds found it; the review's 2,048 × 1× frame at 27.057N is
-    /// 38,041, 2,870 lower. The wide 1,600 pane's 1.177× coarse-side frame is 34,242
-    /// (coarse 8,840 over the 0.003° land 8,924 plus the 15,096-vessel picture). The next
-    /// lever is a finer middle road copy (0.003°) for the 278–371 m/px band, or a lower
-    /// 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
+    /// two 9 × 9 refinement rounds found it. The wide 1,600 pane's 1.177× coarse-side frame
+    /// is 34,052 (coarse 8,840 over the 0.003° land 8,924 plus the 15,096-vessel picture).
+    /// The next lever is a finer middle road copy (0.003°) for the 278–371 m/px band, or a
+    /// lower 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
     /// over the 1.2 px budget, so it is not acceptable. A fifth land tier at 725–911 m/px
     /// would not touch this frame. Neither is in P4's scope; the frame is recorded, not
     /// claimed.
-    const WORST_FRAME_TRIANGLES: usize = 40_911;
+    const WORST_FRAME_TRIANGLES: usize = 40_631;
 
     /// The triangles the fitted frame with no vessels draws on the design's pane.
     ///
-    /// The ten paths of [`MapLayers`] with an empty picture and no hover ring: the
-    /// coarsest coast, the coarse copy of the long road chains, the dashed borders and
-    /// the lane sketch. 5,733 + 2,312 + 12,614 + 142 = 20,801, inside both §8 targets
-    /// (21,000 triangles / 65,536 vertices = 62,403).
-    const FITTED_FRAME_TRIANGLES: usize = 20_801;
+    /// The nine paths of [`MapLayers`] with an empty picture and no hover ring: the
+    /// coarsest coast, the dashed borders and the coarse copy of the long road chains.
+    /// 5,733 + 2,312 + 12,614 = 20,659, inside both §8 targets (21,000 triangles /
+    /// 65,536 vertices = 61,977).
+    const FITTED_FRAME_TRIANGLES: usize = 20_659;
 
     /// The triangles the fitted frame draws with the typical picture: 2,516 vessels
     /// whose ship record has arrived, one marker triangle each.
@@ -1146,9 +1068,9 @@ mod tests {
     /// Pinned separately from [`FITTED_FRAME_TRIANGLES`] because the empty frame's 21,000
     /// target does not cover it: the vessel layer adds 2,516 triangles, and the frame's
     /// gate is the instance-buffer step instead (see
-    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It is 23,317 triangles / 69,951
+    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It is 23,175 triangles / 69,525
     /// vertices, so the step moves from 2^16 to 2^17.
-    const FITTED_FRAME_TYPICAL_TRIANGLES: usize = 23_317;
+    const FITTED_FRAME_TYPICAL_TRIANGLES: usize = 23_175;
 
     /// The 2^17 instance-buffer step in triangles: `131,072 / 3` rounded down.
     ///
@@ -1161,10 +1083,10 @@ mod tests {
     ///
     /// Pinned separately because it is the frame the plan's worst-case analysis names.
     /// With the 0.002° land tier it draws the 0.002° coast (7,122) and the fine road copy
-    /// (8,740): 7,122 + 784 + 8,740 + 380 + 15,096 + 48 = 32,170, over the 27,000 target
-    /// by 5,170 because the whole map's 2,516 vessels are the full picture now. It was
+    /// (8,740): 7,122 + 784 + 8,740 + 15,096 + 48 = 31,790, over the 27,000 target
+    /// by 4,790 because the whole map's 2,516 vessels are the full picture now. It was
     /// 23,074 when the picture was capped at 1,000 vessels.
-    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 32_170;
+    const REFERENCE_FRAME_2_8_TRIANGLES: usize = 31_790;
 
     /// One frame's triangles, layer by layer.
     ///
@@ -1186,8 +1108,6 @@ mod tests {
         roads_fine: usize,
         /// The primary roads, drawn only at the closest zooms.
         roads_primary: usize,
-        /// The dashed TSS lanes.
-        lanes: usize,
         /// The vessel layer.
         ships: usize,
         /// The hover ring, which is outside [`MapLayers`].
@@ -1201,8 +1121,8 @@ mod tests {
         /// worst case. The labels, the legend, the card, the badge, the empty state and
         /// the canvas' own sea fill are elements rather than path triangles, and the
         /// plan's 8.58 ms intercept already carries them, which is why they are not
-        /// counted here. The lanes and the vessels are part of the ten paths, so nothing
-        /// is added twice.
+        /// counted here. The vessels are part of the nine paths, so nothing is added
+        /// twice.
         fn of(layers: &MapLayers, ring: &Path<Pixels>, filter: RoadFilter) -> Self {
             let [class_zero, primary] = &layers.roads;
             let (roads_coarse, roads_middle, roads_fine) = match filter {
@@ -1221,7 +1141,6 @@ mod tests {
                 roads_middle,
                 roads_fine,
                 roads_primary: triangles(primary),
-                lanes: triangles(&layers.lanes),
                 ships: triangles(&layers.ships.unknown)
                     + layers.ships.classes.iter().map(triangles).sum::<usize>(),
                 ring: triangles(ring),
@@ -1236,7 +1155,6 @@ mod tests {
                 + self.roads_middle
                 + self.roads_fine
                 + self.roads_primary
-                + self.lanes
                 + self.ships
                 + self.ring
         }
@@ -1251,7 +1169,7 @@ mod tests {
         fn describe(self) -> String {
             format!(
                 "land {}, borders {}, roads {} (coarse {}, middle {}, fine {}, primary {}), \
-                 lanes {}, ships {}, ring {} = {} triangles",
+                 ships {}, ring {} = {} triangles",
                 self.land,
                 self.borders,
                 self.roads(),
@@ -1259,7 +1177,6 @@ mod tests {
                 self.roads_middle,
                 self.roads_fine,
                 self.roads_primary,
-                self.lanes,
                 self.ships,
                 self.ring,
                 self.total(),
