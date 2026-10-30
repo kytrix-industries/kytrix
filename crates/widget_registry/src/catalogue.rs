@@ -114,7 +114,7 @@ mod tests {
             COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ID,
             WidgetCategory::Market,
         ),
-        (CRYPTOCURRENCY_ETF_ID, WidgetCategory::Market),
+        (CRYPTOCURRENCY_ETF_ID, WidgetCategory::Statistics),
         (FINANCIAL_CALENDAR_ID, WidgetCategory::Monitoring),
         (FORCE_ORDER_ID, WidgetCategory::Monitoring),
         (GLOBAL_SHIPPING_CHOKEPOINT_ID, WidgetCategory::Monitoring),
