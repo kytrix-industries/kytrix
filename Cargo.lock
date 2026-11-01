@@ -341,7 +341,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app_config"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "app_config_provider"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "dirs 7.0.0",
@@ -801,7 +801,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "base_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "color",
  "comrak",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "candlestick"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "coin_market_cap_fear_and_greed_index"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "cryptocurrency_etf"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "empty"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "base_ui",
@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "ethereum_wallet"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "financial_calendar"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -2752,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "financial_index"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "force_order"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -3246,7 +3246,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "global_shipping_chokepoint"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -4595,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "hyperliquid_wallet"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "i18n"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "either",
@@ -4938,7 +4938,7 @@ dependencies = [
 
 [[package]]
 name = "instrument_selector_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "base_ui",
@@ -5330,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "kytrix"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -5371,7 +5371,7 @@ dependencies = [
 
 [[package]]
 name = "kytrix_service_provider"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -5668,7 +5668,7 @@ dependencies = [
 
 [[package]]
 name = "market_participants_connector"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "alloy-primitives",
@@ -5715,7 +5715,7 @@ dependencies = [
 
 [[package]]
 name = "market_participants_model"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "bytes",
@@ -5730,7 +5730,7 @@ dependencies = [
 
 [[package]]
 name = "market_participants_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -5752,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "market_trade"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -6034,7 +6034,7 @@ dependencies = [
 
 [[package]]
 name = "network"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -6065,7 +6065,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "news"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -6826,7 +6826,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "order_book"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -7006,7 +7006,7 @@ dependencies = [
 
 [[package]]
 name = "pentagon_pizza_index"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -7032,7 +7032,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perpetual_statistics"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -7475,7 +7475,7 @@ dependencies = [
 
 [[package]]
 name = "profile_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -8882,7 +8882,7 @@ dependencies = [
 
 [[package]]
 name = "settings_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -9140,7 +9140,7 @@ dependencies = [
 
 [[package]]
 name = "solana_wallet"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
@@ -10087,7 +10087,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -10248,7 +10248,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volume_heatmap"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -10438,7 +10438,7 @@ dependencies = [
 
 [[package]]
 name = "watch_list"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -10788,7 +10788,7 @@ dependencies = [
 
 [[package]]
 name = "widget"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -10812,7 +10812,7 @@ dependencies = [
 
 [[package]]
 name = "widget_gallery_ui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base_ui",
  "gpui-kit",
@@ -10823,7 +10823,7 @@ dependencies = [
 
 [[package]]
 name = "widget_registry"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "app_config",
  "candlestick",
@@ -10856,7 +10856,7 @@ dependencies = [
 
 [[package]]
 name = "widget_tokio_runtime"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "gpui-kit",
  "thiserror 2.0.21",
@@ -11567,7 +11567,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "x"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
@@ -11720,7 +11720,7 @@ checksum = "0637d3a5566a82fa5214bae89087bc8c9fb94cd8e8a3c07feb691bb8d9c632db"
 
 [[package]]
 name = "xtask"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "semver",
  "tempfile",
