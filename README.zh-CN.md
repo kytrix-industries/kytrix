@@ -10,8 +10,6 @@
 ![GitHub License](https://img.shields.io/github/license/kytrix-industries/kytrix)
 ![Discord](https://img.shields.io/discord/1561993194793603084?logo=discord&logoColor=white&label=discord&color=5662F6&link=https%3A%2F%2Fdiscord.gg%2FUj2TUKpG8D)
 
----
-
 <a href="README.md">English</a> · <strong>简体中文</strong>
 
 Kytrix 发音为 **Key-Tricks**，意为“洞察市场的关键诀窍”。它是一款使用 Rust 与 GPUI
@@ -24,8 +22,6 @@ Kytrix 发音为 **Key-Tricks**，意为“洞察市场的关键诀窍”。它�
 
 ## 为什么选择 Kytrix
 
----
-
 - **Blazing Fast**：Rust + GPUI，GPU 加速原生渲染，不使用 WebView。
 - **高性能、高可靠、强实时**：行情、消息、快讯，闪电送达。
 - **可组合的 Widget**：切分面板、自由排列、多工作区保存，按你的交易方式搭建终端。
@@ -34,8 +30,6 @@ Kytrix 发音为 **Key-Tricks**，意为“洞察市场的关键诀窍”。它�
 - **多语言支持，直观且易用的界面**：当前支持英文与简体中文，浅色/深色系统主题。
 
 ## 已支持的组件
-
----
 
 > **开箱即用**仅指 Kytrix 侧无需任何凭据即可使用，但有些组件为了获取数据仍然可能需要用户提供相应的API凭证。
 

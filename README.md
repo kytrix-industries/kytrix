@@ -10,8 +10,6 @@
 ![GitHub License](https://img.shields.io/github/license/kytrix-industries/kytrix)
 ![Discord](https://img.shields.io/discord/1561993194793603084?logo=discord&logoColor=white&label=discord&color=5662F6&link=https%3A%2F%2Fdiscord.gg%2FUj2TUKpG8D)
 
----
-
 <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 
 **Kytrix**, pronounced **Key-Tricks**, stands for "The key tricks to reading the market". It is a blazing-fast
@@ -27,8 +25,6 @@ apps and screens.
 
 ## Why Kytrix
 
----
-
 - **Blazing Fast.** Rust + GPUI, GPU-accelerated native rendering, no WebView.
 - **High performance, high reliability, and real-time delivery.** Market quotes, messages, and breaking news — delivered
   in a flash.
@@ -41,8 +37,6 @@ apps and screens.
   dark system themes.
 
 ## Supported Widgets
-
----
 
 > **Out of the box** means only that no credentials are required on the Kytrix side; some widgets may still require the
 > relevant API credentials to fetch their data.
