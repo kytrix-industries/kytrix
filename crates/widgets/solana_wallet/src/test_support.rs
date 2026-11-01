@@ -19,7 +19,7 @@ use kytrix_service_provider::service::{
     engine::{KytrixServiceError, SolanaWalletTransfer},
     solana_wallet::{
         SolanaWalletApiError, SolanaWalletMutationOutcome, SolanaWalletSelection,
-        SolanaWalletSelectionStatus, SolanaWalletSelectionsResponse,
+        SolanaWalletSelectionsResponse,
     },
 };
 use network::transport::{error::TransportError, subscription::SubscriptionStatus};
@@ -75,16 +75,14 @@ pub(crate) fn selection(address: &str) -> SolanaWalletSelection {
     selection_at(address, 1)
 }
 
-/// One monitored address, last changed at `updated_at`.
+/// One monitored address, created at `created_at`.
 ///
 /// The list is read in the account's recency order, so a test that cares which of two
-/// addresses reads first says when each was last changed.
-pub(crate) fn selection_at(address: &str, updated_at: i64) -> SolanaWalletSelection {
+/// addresses reads first says when each was added.
+pub(crate) fn selection_at(address: &str, created_at: i64) -> SolanaWalletSelection {
     SolanaWalletSelection {
         address: SmolStr::new(address),
-        status: SolanaWalletSelectionStatus::Active,
-        created_at: 1,
-        updated_at,
+        created_at,
     }
 }
 

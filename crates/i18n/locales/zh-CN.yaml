@@ -978,7 +978,6 @@ widget:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
   ethereum_wallet:
-    active: 已激活
     add_address: 添加钱包地址
     add_success: 钱包地址添加成功
     address_placeholder: Ethereum 地址
@@ -996,7 +995,6 @@ widget:
     manage: 管理监控钱包地址
     monitored_addresses: '已选择地址：%{current}/%{limit}'
     not_found: 未找到该 Ethereum 钱包地址
-    paused: 已暂停
     refresh: 刷新钱包地址
     scroll_transfers: 垂直滚动钱包转账
     stream_unavailable: 钱包转账推送未连接
@@ -1004,7 +1002,6 @@ widget:
     transfer: '%{amount} 转账，时间 %{time}'
     unavailable: Ethereum 钱包监控尚未配置或暂不可用
   solana_wallet:
-    active: 已激活
     add_address: 添加钱包地址
     add_success: 钱包地址添加成功
     address_placeholder: Solana 地址
@@ -1022,7 +1019,6 @@ widget:
     manage: 管理监控钱包地址
     monitored_addresses: '已选择地址：%{current}/%{limit}'
     not_found: 未找到该 Solana 钱包地址
-    paused: 已暂停
     refresh: 刷新钱包地址
     scroll_transfers: 垂直滚动钱包转账
     stream_unavailable: 钱包转账推送未连接

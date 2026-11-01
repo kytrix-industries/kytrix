@@ -1,10 +1,7 @@
 use std::cmp::Ordering;
 
 use ahash::AHashSet;
-use kytrix_proto::types::v1::{
-    EthereumWalletSelection as ProtoEthereumWalletSelection,
-    EthereumWalletSelectionStatus as ProtoEthereumWalletSelectionStatus,
-};
+use kytrix_proto::types::v1::EthereumWalletSelection as ProtoEthereumWalletSelection;
 use network::transport::error::TransportError;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -20,20 +17,10 @@ const MAX_TRANSFER_FRACTION_DIGITS: usize = 255;
 pub const MAX_ETHEREUM_INTEGER: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-pub enum EthereumWalletSelectionStatus {
-    #[serde(rename = "active")]
-    Active,
-    #[serde(rename = "paused")]
-    Paused,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct EthereumWalletSelection {
     pub address: SmolStr,
-    pub status: EthereumWalletSelectionStatus,
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -106,20 +93,9 @@ pub enum EthereumWalletMutationOutcome<T> {
 pub fn decode_ethereum_wallet_selection(
     selection: ProtoEthereumWalletSelection,
 ) -> Result<EthereumWalletSelection, EthereumWalletApiError> {
-    let status = match ProtoEthereumWalletSelectionStatus::try_from(selection.status)
-        .map_err(|_| EthereumWalletApiError::InvalidResponse)?
-    {
-        ProtoEthereumWalletSelectionStatus::Active => EthereumWalletSelectionStatus::Active,
-        ProtoEthereumWalletSelectionStatus::Paused => EthereumWalletSelectionStatus::Paused,
-        ProtoEthereumWalletSelectionStatus::Unspecified => {
-            return Err(EthereumWalletApiError::InvalidResponse);
-        }
-    };
     let value = EthereumWalletSelection {
         address: selection.address.into(),
-        status,
         created_at: selection.created_at,
-        updated_at: selection.updated_at,
     };
     validate_selection(&value)?;
     Ok(value)
@@ -199,10 +175,7 @@ pub fn validate_ethereum_wallet_selections(
 }
 
 fn validate_selection(selection: &EthereumWalletSelection) -> Result<(), EthereumWalletApiError> {
-    if ethereum_wallet_address(&selection.address).is_none()
-        || selection.created_at <= 0
-        || selection.updated_at < selection.created_at
-    {
+    if ethereum_wallet_address(&selection.address).is_none() || selection.created_at <= 0 {
         return Err(EthereumWalletApiError::InvalidResponse);
     }
     Ok(())
@@ -217,9 +190,8 @@ pub fn compare_ethereum_wallet_selections(
     right: &EthereumWalletSelection,
 ) -> Ordering {
     right
-        .updated_at
-        .cmp(&left.updated_at)
-        .then_with(|| right.created_at.cmp(&left.created_at))
+        .created_at
+        .cmp(&left.created_at)
         .then_with(|| left.address.cmp(&right.address))
 }
 
@@ -270,12 +242,10 @@ fn valid_transfer_amount(value: &str, maximum: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn selection(address: &str, status: EthereumWalletSelectionStatus) -> EthereumWalletSelection {
+    fn selection(address: &str, created_at: i64) -> EthereumWalletSelection {
         EthereumWalletSelection {
             address: address.into(),
-            status,
-            created_at: 1,
-            updated_at: 1,
+            created_at,
         }
     }
 
@@ -340,18 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn selection_contract_accepts_paused_history_above_the_current_limit() {
+    fn selection_contract_accepts_a_history_above_the_current_limit() {
         assert_eq!(
             validate_ethereum_wallet_selections(&EthereumWalletSelectionsResponse {
                 selections: vec![
-                    selection(
-                        "0x0123456789abcdef0123456789abcdef01234567",
-                        EthereumWalletSelectionStatus::Paused,
-                    ),
-                    selection(
-                        "0x89abcdef0123456789abcdef0123456789abcdef",
-                        EthereumWalletSelectionStatus::Paused,
-                    ),
+                    selection("0x0123456789abcdef0123456789abcdef01234567", 1),
+                    selection("0x89abcdef0123456789abcdef0123456789abcdef", 2),
                 ],
                 ethereum_wallet_monitor_address_limit: 1,
             }),
@@ -372,12 +336,10 @@ mod tests {
 
     #[test]
     fn selection_contract_rejects_a_non_canonical_address() {
+        let checksummed = "0x0123456789ABCDEF0123456789abcdef01234567";
         assert_eq!(
             validate_ethereum_wallet_selections(&EthereumWalletSelectionsResponse {
-                selections: vec![selection(
-                    "0x0123456789ABCDEF0123456789abcdef01234567",
-                    EthereumWalletSelectionStatus::Active,
-                )],
+                selections: vec![selection(checksummed, 1)],
                 ethereum_wallet_monitor_address_limit: 1,
             }),
             Err(EthereumWalletApiError::InvalidResponse)
@@ -386,17 +348,11 @@ mod tests {
 
     #[test]
     fn selections_are_ordered_by_recency_then_stable_identity() {
-        let selection = |address: &str, created_at, updated_at| EthereumWalletSelection {
-            address: address.into(),
-            status: EthereumWalletSelectionStatus::Active,
-            created_at,
-            updated_at,
-        };
         let mut selections = vec![
-            selection("0x3333333333333333333333333333333333333333", 3, 4),
-            selection("0x2222222222222222222222222222222222222222", 2, 5),
-            selection("0x1111111111111111111111111111111111111111", 2, 5),
-            selection("0x4444444444444444444444444444444444444444", 1, 4),
+            selection("0x3333333333333333333333333333333333333333", 3),
+            selection("0x2222222222222222222222222222222222222222", 2),
+            selection("0x1111111111111111111111111111111111111111", 2),
+            selection("0x4444444444444444444444444444444444444444", 1),
         ];
 
         sort_ethereum_wallet_selections(&mut selections);
@@ -407,9 +363,9 @@ mod tests {
                 .map(|selection| selection.address.as_str())
                 .collect::<Vec<_>>(),
             [
+                "0x3333333333333333333333333333333333333333",
                 "0x1111111111111111111111111111111111111111",
                 "0x2222222222222222222222222222222222222222",
-                "0x3333333333333333333333333333333333333333",
                 "0x4444444444444444444444444444444444444444",
             ]
         );

@@ -1414,7 +1414,6 @@ pub(crate) mod tests {
 
             for key in [
                 "widget.names.ethereum_wallet",
-                "widget.ethereum_wallet.active",
                 "widget.ethereum_wallet.add_address",
                 "widget.ethereum_wallet.add_success",
                 "widget.ethereum_wallet.address_placeholder",
@@ -1426,7 +1425,6 @@ pub(crate) mod tests {
                 "widget.ethereum_wallet.loading_addresses",
                 "widget.ethereum_wallet.logged_out",
                 "widget.ethereum_wallet.manage",
-                "widget.ethereum_wallet.paused",
                 "widget.ethereum_wallet.refresh",
                 "widget.ethereum_wallet.scroll_transfers",
                 "widget.ethereum_wallet.stream_unavailable",

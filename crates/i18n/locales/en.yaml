@@ -978,7 +978,6 @@ widget:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now
   ethereum_wallet:
-    active: Active
     add_address: Add wallet address
     add_success: Wallet address added successfully
     address_placeholder: Ethereum address
@@ -996,7 +995,6 @@ widget:
     manage: Manage monitored wallet addresses
     monitored_addresses: 'Selected addresses: %{current}/%{limit}'
     not_found: The Ethereum wallet address was not found
-    paused: Paused
     refresh: Refresh wallet addresses
     scroll_transfers: Scroll wallet transfers
     stream_unavailable: The wallet transfer stream is not connected
@@ -1004,7 +1002,6 @@ widget:
     transfer: '%{amount} transfer at %{time}'
     unavailable: Ethereum wallet monitoring is not configured or is unavailable
   solana_wallet:
-    active: Active
     add_address: Add wallet address
     add_success: Wallet address added successfully
     address_placeholder: Solana address
@@ -1022,7 +1019,6 @@ widget:
     manage: Manage monitored wallet addresses
     monitored_addresses: 'Selected addresses: %{current}/%{limit}'
     not_found: The Solana wallet address was not found
-    paused: Paused
     refresh: Refresh wallet addresses
     scroll_transfers: Scroll wallet transfers
     stream_unavailable: The wallet transfer stream is not connected

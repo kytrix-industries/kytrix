@@ -410,18 +410,14 @@ pub(super) fn test_ethereum_wallet_selection(
 ) -> proto_types::EthereumWalletSelection {
     proto_types::EthereumWalletSelection {
         address,
-        status: proto_types::EthereumWalletSelectionStatus::Active as i32,
         created_at: 1,
-        updated_at: 1,
     }
 }
 
 pub(super) fn test_solana_wallet_selection(address: String) -> proto_types::SolanaWalletSelection {
     proto_types::SolanaWalletSelection {
         address,
-        status: proto_types::SolanaWalletSelectionStatus::Active as i32,
         created_at: 1,
-        updated_at: 1,
     }
 }
 

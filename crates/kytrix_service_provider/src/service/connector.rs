@@ -1759,9 +1759,7 @@ mod tests {
             session.add_ethereum_wallet_selection(address).await,
             EthereumWalletMutationOutcome::Confirmed(EthereumWalletSelection {
                 address: address.into(),
-                status: ethereum_wallet::EthereumWalletSelectionStatus::Active,
                 created_at: 1,
-                updated_at: 1,
             })
         );
         assert_eq!(
@@ -1788,9 +1786,7 @@ mod tests {
             session.add_solana_wallet_selection(address).await,
             SolanaWalletMutationOutcome::Confirmed(SolanaWalletSelection {
                 address: address.into(),
-                status: solana_wallet::SolanaWalletSelectionStatus::Active,
                 created_at: 1,
-                updated_at: 1,
             })
         );
         assert_eq!(

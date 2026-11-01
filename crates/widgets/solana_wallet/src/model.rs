@@ -259,8 +259,7 @@ impl SelectionData {
 
     /// Whether the account may monitor nothing further.
     ///
-    /// Every address counts, including the ones a paused history holds: the limit is what
-    /// the account is allowed to have selected, not what it is currently watching.
+    /// The limit is what the account is allowed to have selected.
     pub(super) fn quota_full(&self) -> bool {
         self.selections.len() >= self.limit
     }
@@ -365,9 +364,7 @@ fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use kytrix_service_provider::service::solana_wallet::{
-        SolanaWalletSelectionStatus, compare_solana_wallet_selections,
-    };
+    use kytrix_service_provider::service::solana_wallet::compare_solana_wallet_selections;
     use smol_str::SmolStr;
 
     use super::*;
@@ -390,19 +387,10 @@ mod tests {
         }
     }
 
-    fn selection(address: &str, updated_at: i64) -> SolanaWalletSelection {
+    fn selection(address: &str, created_at: i64) -> SolanaWalletSelection {
         SolanaWalletSelection {
             address: SmolStr::new(address),
-            status: SolanaWalletSelectionStatus::Active,
-            created_at: updated_at,
-            updated_at,
-        }
-    }
-
-    fn paused(address: &str, updated_at: i64) -> SolanaWalletSelection {
-        SolanaWalletSelection {
-            status: SolanaWalletSelectionStatus::Paused,
-            ..selection(address, updated_at)
+            created_at,
         }
     }
 
@@ -604,12 +592,12 @@ mod tests {
 
     #[test]
     fn an_add_should_be_refused_when_the_quota_is_full() {
-        let data = SelectionData::new(response(vec![paused(FIRST, 1)], 1));
+        let data = SelectionData::new(response(vec![selection(FIRST, 1)], 1));
 
         assert_eq!(
             data.with_added(SECOND, selection(SECOND, 2)),
             Err(SolanaWalletDataError::InconsistentSelections),
-            "a paused address still counts against the quota"
+            "an address still counts against the quota"
         );
     }
 
@@ -671,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_delete_should_bring_a_full_list_back_under_its_quota() {
-        let data = SelectionData::new(response(vec![paused(FIRST, 1), paused(SECOND, 2)], 2));
+        let data = SelectionData::new(response(vec![selection(FIRST, 1), selection(SECOND, 2)], 2));
         assert!(data.quota_full());
 
         let shrunk = data.with_deleted(FIRST);
@@ -679,7 +667,7 @@ mod tests {
         assert!(!shrunk.quota_full());
         assert!(
             shrunk.with_added(THIRD, selection(THIRD, 3)).is_ok(),
-            "removing history is what makes room for a new address"
+            "removing an address is what makes room for a new one"
         );
     }
 

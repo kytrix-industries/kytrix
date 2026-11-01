@@ -1407,7 +1407,6 @@ pub(crate) mod tests {
 
             for key in [
                 "widget.names.solana_wallet",
-                "widget.solana_wallet.active",
                 "widget.solana_wallet.add_address",
                 "widget.solana_wallet.add_success",
                 "widget.solana_wallet.address_placeholder",
@@ -1419,7 +1418,6 @@ pub(crate) mod tests {
                 "widget.solana_wallet.loading_addresses",
                 "widget.solana_wallet.logged_out",
                 "widget.solana_wallet.manage",
-                "widget.solana_wallet.paused",
                 "widget.solana_wallet.refresh",
                 "widget.solana_wallet.scroll_transfers",
                 "widget.solana_wallet.stream_unavailable",

@@ -19,7 +19,6 @@
 use std::sync::Arc;
 
 use base_ui::{
-    badge::Badge,
     button::Button,
     icon::{Icon, IconKind},
     input::{Input, InputState, InputStateBuilder, InputStateEvent},
@@ -40,7 +39,7 @@ use gpui_kit::{
 };
 use i18n::t;
 use kytrix_service_provider::service::solana_wallet::{
-    SolanaWalletSelection, SolanaWalletSelectionStatus, solana_wallet_address,
+    SolanaWalletSelection, solana_wallet_address,
 };
 use smol_str::SmolStr;
 use widget::{error::LocalizedError, status::WidgetAction};
@@ -62,14 +61,6 @@ pub(super) const ADDRESS_INPUT_ID: &str = "solana_wallet-monitor-address";
 
 /// The list the dialog draws the addresses with.
 const ADDRESS_LIST_ID: &str = "solana_wallet-monitor-address-list";
-
-/// The height one address of that list is drawn at.
-///
-/// A list of places measures the first row it draws and lays every other one out at that height,
-/// so what a row is worth has to be the row's own height: this one is an address with what the
-/// account is doing with it on the line below, and the medium surface it is drawn as is a control
-/// of one line.
-const ADDRESS_ROW_HEIGHT: f32 = 60.0;
 
 /// The dialog a pane opens to manage the addresses its transfers are watched for.
 ///
@@ -606,7 +597,7 @@ fn canonical_address(typed: &str) -> Option<SmolStr> {
     (!typed.is_empty()).then(|| SmolStr::new(typed))
 }
 
-/// One monitored address: which address it is, and what the account is doing with it.
+/// One monitored address.
 ///
 /// The row is the surface the list draws an address on rather than a control of its own: nothing
 /// about an address is asked for by clicking it, so the only thing the row carries that answers
@@ -654,55 +645,19 @@ fn address_row(
     .rounded_sm()
     .ghost()
     .medium()
-    // The row is given the height every place of its list is laid out at rather than the height
-    // of a control: a control is one line tall, and this row is an address with what the account
-    // is doing with it below it, so a row sized as a control is a row its own content overflows.
-    .h(px(ADDRESS_ROW_HEIGHT))
     .debug_selector(|| "TEST_SOLANA_WALLET_ADDRESS_ROW".into())
     .child(
         div()
             .debug_selector(|| "TEST_SOLANA_WALLET_ADDRESS_ROW_CONTENT".into())
             .min_w_0()
             .flex_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.roles.fg.default.hsla)
-                    .child(SharedString::from(selection.address.as_str())),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Badge::new()
-                            .solid()
-                            .small()
-                            .child(status_label(selection.status, cx)),
-                    ),
-            ),
+            .truncate()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.roles.fg.default.hsla)
+            .child(SharedString::from(selection.address.as_str())),
     )
     .child(delete)
     .into_any_element()
-}
-
-fn status_label(status: SolanaWalletSelectionStatus, cx: &App) -> SharedString {
-    match status {
-        SolanaWalletSelectionStatus::Active => {
-            t!(cx, "widget.solana_wallet.active")
-        }
-        SolanaWalletSelectionStatus::Paused => {
-            t!(cx, "widget.solana_wallet.paused")
-        }
-    }
 }
 
 /// The recovery the pane itself offers, as the dialog's way out of having no stream.
@@ -1017,8 +972,8 @@ mod tests {
         });
     }
 
-    /// The dialog draws the addresses the pane holds — each one a row of the height its own lines
-    /// are laid out at — and the toolbar that adds one is drawn at the size of the field beside it.
+    /// The dialog draws the addresses the pane holds — each one a row one line tall — and the
+    /// toolbar that adds one is drawn at the size of the field beside it.
     #[gpui_kit::test]
     fn a_dialog_should_draw_the_addresses_the_pane_holds(cx: &mut TestAppContext) {
         let source = FakeSource::default();
@@ -1045,15 +1000,11 @@ mod tests {
             .expect("a row is drawn from the pane while the list draws it");
         let content = window
             .debug_bounds("TEST_SOLANA_WALLET_ADDRESS_ROW_CONTENT")
-            .expect("the row draws the address and what the account is doing with it");
+            .expect("the row draws the address");
         assert_eq!(
             row.size.height,
-            px(ADDRESS_ROW_HEIGHT),
-            "a row is drawn at the height its own lines are laid out at"
-        );
-        assert!(
-            row.size.height > UnifiedSize::Medium.h(),
-            "a row carries more than the one line a control is tall"
+            UnifiedSize::Medium.h(),
+            "a row is one line tall"
         );
         assert!(
             content.top() >= row.top() && content.bottom() <= row.bottom(),

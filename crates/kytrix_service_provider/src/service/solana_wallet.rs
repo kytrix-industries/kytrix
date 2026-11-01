@@ -1,10 +1,7 @@
 use std::cmp::Ordering;
 
 use ahash::AHashSet;
-use kytrix_proto::types::v1::{
-    SolanaWalletSelection as ProtoSolanaWalletSelection,
-    SolanaWalletSelectionStatus as ProtoSolanaWalletSelectionStatus,
-};
+use kytrix_proto::types::v1::SolanaWalletSelection as ProtoSolanaWalletSelection;
 use network::transport::error::TransportError;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -19,20 +16,10 @@ const MAX_TRANSFER_AMOUNT_BYTES: usize = 334;
 const MAX_TRANSFER_FRACTION_DIGITS: usize = 255;
 pub const MAX_SOLANA_INTEGER: &str = "18446744073709551615";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-pub enum SolanaWalletSelectionStatus {
-    #[serde(rename = "active")]
-    Active,
-    #[serde(rename = "paused")]
-    Paused,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct SolanaWalletSelection {
     pub address: SmolStr,
-    pub status: SolanaWalletSelectionStatus,
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -105,20 +92,9 @@ pub enum SolanaWalletMutationOutcome<T> {
 pub fn decode_solana_wallet_selection(
     selection: ProtoSolanaWalletSelection,
 ) -> Result<SolanaWalletSelection, SolanaWalletApiError> {
-    let status = match ProtoSolanaWalletSelectionStatus::try_from(selection.status)
-        .map_err(|_| SolanaWalletApiError::InvalidResponse)?
-    {
-        ProtoSolanaWalletSelectionStatus::Active => SolanaWalletSelectionStatus::Active,
-        ProtoSolanaWalletSelectionStatus::Paused => SolanaWalletSelectionStatus::Paused,
-        ProtoSolanaWalletSelectionStatus::Unspecified => {
-            return Err(SolanaWalletApiError::InvalidResponse);
-        }
-    };
     let value = SolanaWalletSelection {
         address: selection.address.into(),
-        status,
         created_at: selection.created_at,
-        updated_at: selection.updated_at,
     };
     validate_selection(&value)?;
     Ok(value)
@@ -197,10 +173,7 @@ pub fn validate_solana_wallet_selections(
 }
 
 fn validate_selection(selection: &SolanaWalletSelection) -> Result<(), SolanaWalletApiError> {
-    if solana_wallet_address(&selection.address).is_none()
-        || selection.created_at <= 0
-        || selection.updated_at < selection.created_at
-    {
+    if solana_wallet_address(&selection.address).is_none() || selection.created_at <= 0 {
         return Err(SolanaWalletApiError::InvalidResponse);
     }
     Ok(())
@@ -215,9 +188,8 @@ pub fn compare_solana_wallet_selections(
     right: &SolanaWalletSelection,
 ) -> Ordering {
     right
-        .updated_at
-        .cmp(&left.updated_at)
-        .then_with(|| right.created_at.cmp(&left.created_at))
+        .created_at
+        .cmp(&left.created_at)
         .then_with(|| left.address.cmp(&right.address))
 }
 
@@ -269,12 +241,10 @@ fn valid_transfer_amount(value: &str, maximum: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn selection(address: &str, status: SolanaWalletSelectionStatus) -> SolanaWalletSelection {
+    fn selection(address: &str, created_at: i64) -> SolanaWalletSelection {
         SolanaWalletSelection {
             address: address.into(),
-            status,
-            created_at: 1,
-            updated_at: 1,
+            created_at,
         }
     }
 
@@ -336,18 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn selection_contract_accepts_paused_history_above_the_current_limit() {
+    fn selection_contract_accepts_a_history_above_the_current_limit() {
         assert_eq!(
             validate_solana_wallet_selections(&SolanaWalletSelectionsResponse {
                 selections: vec![
-                    selection(
-                        "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
-                        SolanaWalletSelectionStatus::Paused,
-                    ),
-                    selection(
-                        "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
-                        SolanaWalletSelectionStatus::Paused,
-                    ),
+                    selection("4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", 1),
+                    selection("8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR", 2),
                 ],
                 solana_wallet_monitor_address_limit: 1,
             }),
@@ -368,12 +332,10 @@ mod tests {
 
     #[test]
     fn selection_contract_rejects_an_ethereum_address() {
+        let ethereum_address = "0x0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             validate_solana_wallet_selections(&SolanaWalletSelectionsResponse {
-                selections: vec![selection(
-                    "0x0123456789abcdef0123456789abcdef01234567",
-                    SolanaWalletSelectionStatus::Active,
-                )],
+                selections: vec![selection(ethereum_address, 1)],
                 solana_wallet_monitor_address_limit: 1,
             }),
             Err(SolanaWalletApiError::InvalidResponse)
@@ -382,17 +344,11 @@ mod tests {
 
     #[test]
     fn selections_are_ordered_by_recency_then_stable_identity() {
-        let selection = |address: &str, created_at, updated_at| SolanaWalletSelection {
-            address: address.into(),
-            status: SolanaWalletSelectionStatus::Active,
-            created_at,
-            updated_at,
-        };
         let mut selections = vec![
-            selection("CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8", 3, 4),
-            selection("8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR", 2, 5),
-            selection("4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", 2, 5),
-            selection("GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq", 1, 4),
+            selection("CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8", 3),
+            selection("8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR", 2),
+            selection("4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", 2),
+            selection("GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq", 1),
         ];
 
         sort_solana_wallet_selections(&mut selections);
@@ -403,9 +359,9 @@ mod tests {
                 .map(|selection| selection.address.as_str())
                 .collect::<Vec<_>>(),
             [
+                "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
                 "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
                 "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
-                "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
                 "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
             ]
         );
