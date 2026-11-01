@@ -44,7 +44,7 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, CursorStyle, ElementId, Entity, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ScrollEvent, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, Window,
     base::{Disableable, Selectable},
     div,
@@ -1812,12 +1812,7 @@ impl CandlestickWidget {
         true
     }
 
-    fn handle_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.chart_layout.borrow().clone() else {
             return;
         };
@@ -2166,7 +2161,7 @@ impl CandlestickWidget {
                         }
                     }
                 })
-                .on_scroll_wheel(move |event, window, app| {
+                .on_scroll(move |event, window, app| {
                     widget.update(app, |this, cx| {
                         this.handle_scroll(event, window, cx);
                     });

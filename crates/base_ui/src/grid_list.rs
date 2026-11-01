@@ -113,7 +113,7 @@ impl RenderOnce for GridList {
 mod tests {
     use gpui_kit::{
         Context, InteractiveElement, IntoElement, Modifiers, ParentElement, Render, ScrollDelta,
-        ScrollHandle, ScrollWheelEvent, Styled, TestAppContext, TouchPhase, Window, div, point, px,
+        ScrollEvent, ScrollHandle, Styled, TestAppContext, TouchPhase, Window, div, point, px,
     };
 
     use super::GridList;
@@ -187,11 +187,12 @@ mod tests {
             .debug_bounds("TEST_GRID_ITEM_0")
             .expect("the first item should be drawn");
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(100.), px(200.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-SCROLL_DISTANCE))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
+            source: Default::default(),
         });
 
         let scrolled = cx
@@ -221,11 +222,12 @@ mod tests {
             .debug_bounds("TEST_GRID_ITEM_0")
             .expect("the first item should be drawn");
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(100.), px(200.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-SCROLL_DISTANCE))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
+            source: Default::default(),
         });
         assert_eq!(
             scroll.offset().y,

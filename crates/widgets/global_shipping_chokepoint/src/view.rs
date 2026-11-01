@@ -40,7 +40,7 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, Bounds, Context, Div, ElementId, Entity, FontStyle, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement, PinchEvent,
-    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 use i18n::t;
@@ -895,7 +895,7 @@ impl GlobalShippingChokepointWidget {
     }
 
     /// One wheel notch, as a zoom around the pointer.
-    fn zoom_by_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn zoom_by_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let step = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y),
@@ -1105,6 +1105,10 @@ impl GlobalShippingChokepointWidget {
                             .absolute()
                             .left(px(*dx))
                             .top(px(*dy))
+                            // The copies sit inside the name's own box, so the box is barely
+                            // wider than one glyph more than the name. Without nowrap the
+                            // text breaks there and the ring turns into stacked copies.
+                            .whitespace_nowrap()
                             .child(name_in(colors.halo))
                             .into_any_element()
                     })
@@ -1478,7 +1482,7 @@ impl Render for GlobalShippingChokepointWidget {
             .min_h_0()
             // The canvas is only `Styled`, so the pointer handlers belong to the box
             // around it, which is the map's own box.
-            .on_scroll_wheel(move |event, _window, app| {
+            .on_scroll(move |event, _window, app| {
                 let _ = wheel.update(app, |this, cx| this.zoom_by_wheel(event, cx));
                 // The map consumes the wheel: a pane next to a scrolling parent would
                 // otherwise zoom and scroll at once.
@@ -1524,7 +1528,7 @@ mod tests {
     use base_ui::style::palette::Appearance;
     use gpui_kit::{
         App, AppContext, BorrowAppContext as _, Entity, IntoElement, Modifiers, MouseButton,
-        ParentElement, Pixels, Render, Rgba, ScrollDelta, ScrollWheelEvent, Styled, TestAppContext,
+        ParentElement, Pixels, Render, Rgba, ScrollDelta, ScrollEvent, Styled, TestAppContext,
         VisualTestContext, WeakEntity, Window, div, point, px, size,
     };
     use i18n::{language::codes::LanguageCode, t};
@@ -2862,7 +2866,7 @@ mod tests {
                 .expect("the pane has been laid out")
                 .center()
         });
-        let wheel = |delta: f32| ScrollWheelEvent {
+        let wheel = |delta: f32| ScrollEvent {
             position: anchor,
             delta: ScrollDelta::Lines(point(0.0, delta)),
             ..Default::default()
