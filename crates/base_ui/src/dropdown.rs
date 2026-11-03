@@ -81,6 +81,10 @@ impl Dropdown {
         self
     }
 
+    /// Caps how tall the menu may grow, counting the hairline it draws around its entries.
+    ///
+    /// A menu with more entries than fit scrolls them inside the cap; without one it is as
+    /// tall as its entries.
     pub fn menu_max_h(mut self, menu_max_h: impl Into<Pixels>) -> Self {
         self.menu_max_h = Some(menu_max_h.into());
         self
@@ -202,7 +206,6 @@ impl RenderOnce for Dropdown {
 
                 div()
                     .min_w(context.trigger_bounds.size.width)
-                    .when_some(menu_max_h, |this, max_h| this.max_h(max_h))
                     // The entries are a menu, which names no selector of its own, so the box
                     // the panel is drawn in is what a test looks at to see the panel at all.
                     .debug_selector(|| "TEST_DROPDOWN_PANEL".into())
@@ -221,8 +224,8 @@ mod tests {
 
     use gpui_kit::{
         Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton, ParentElement as _,
-        Render, StatefulInteractiveElement, Styled as _, TestAppContext, VisualTestContext, Window,
-        div,
+        Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled as _,
+        TestAppContext, VisualTestContext, Window, div, point, px, size,
     };
 
     use super::Dropdown;
@@ -327,6 +330,112 @@ mod tests {
                     .menu_item(MenuItem::Action(MenuItemAction::new("entry", "entry"))),
             )
         }
+    }
+
+    /// A dropdown offering far more entries than its panel may show at once.
+    struct CappedHarness;
+
+    impl Render for CappedHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut dropdown = Dropdown::new("test-capped-dropdown")
+                .small()
+                .menu_max_h(px(80.))
+                .child(
+                    div()
+                        .debug_selector(|| "TEST_CAPPED_TRIGGER".into())
+                        .child("trigger"),
+                );
+
+            for index in 0..24 {
+                let id = format!("entry-{index}");
+                dropdown =
+                    dropdown.menu_item(MenuItem::Action(MenuItemAction::new(id.clone(), id)));
+            }
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(dropdown)
+        }
+    }
+
+    /// A dropdown told how tall its menu may grow keeps to it, and the entries it cannot
+    /// show are reached by scrolling them.
+    ///
+    /// The cap alone is not enough to say the menu scrolls: a menu whose entries box merely
+    /// followed its content would be cut off at the cap with the entries drawn on past it,
+    /// and no scrollbar could appear on a box that never overflows. Scrolling is therefore
+    /// what this measures — a wheel over the panel moves the first entry up, which is the
+    /// one thing a menu that cannot scroll cannot do, and the last entry ends up inside the
+    /// panel rather than below it.
+    #[gpui_kit::test]
+    fn a_capped_menu_should_scroll_its_entries(cx: &mut TestAppContext) {
+        cx.update(style::theme::install);
+        let (_, cx) = cx.add_window_view(|_, _| CappedHarness);
+        cx.simulate_resize(size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+
+        press(cx, "TEST_CAPPED_TRIGGER");
+
+        let panel = cx
+            .debug_bounds("TEST_DROPDOWN_PANEL")
+            .expect("pressing the trigger opens the dropdown");
+        assert!(
+            panel.size.height <= px(80.),
+            "a dropdown that caps its menu must not open a panel taller than the cap: {panel:?}"
+        );
+
+        let before = cx
+            .debug_bounds("TEST_MENU_ITEM_entry-0")
+            .expect("the menu offers its first entry");
+        wheel(cx, panel.center(), -3.0);
+
+        let after = cx
+            .debug_bounds("TEST_MENU_ITEM_entry-0")
+            .expect("the menu still offers its first entry");
+        assert!(
+            after.origin.y < before.origin.y,
+            "the entries of a capped menu must scroll inside it: the first entry was at {} and \
+             is at {} after a wheel over the panel",
+            before.origin.y,
+            after.origin.y
+        );
+        assert_eq!(
+            cx.debug_bounds("TEST_DROPDOWN_PANEL")
+                .expect("the panel stays open")
+                .size,
+            panel.size,
+            "scrolling the entries must not resize the menu they are in"
+        );
+
+        wheel(cx, panel.center(), -100.0);
+
+        let last = cx
+            .debug_bounds("TEST_MENU_ITEM_entry-23")
+            .expect("the menu offers its last entry");
+        assert!(
+            last.bottom() <= panel.bottom(),
+            "the entries must end inside the menu that caps them, not run on past it: the last \
+             entry ends at {} and the panel at {}",
+            last.bottom(),
+            panel.bottom()
+        );
+    }
+
+    /// Rolls the wheel over `position` by `lines` lines, the way a window delivers a scroll:
+    /// the pointer is over the surface first, since that is what says which scrollable box
+    /// the wheel is for.
+    fn wheel(cx: &mut VisualTestContext, position: Point<Pixels>, lines: f32) {
+        cx.simulate_mouse_move(position, None, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_event(ScrollEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, lines)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
     }
 
     fn harness(cx: &mut TestAppContext) -> (Rc<Cell<usize>>, &mut VisualTestContext) {

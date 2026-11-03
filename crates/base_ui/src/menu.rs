@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use either::Either;
 use gpui_kit::{
-    base::{Disableable, ScrollbarMode, StyledExt, box_shadow},
+    base::{Disableable, ScrollbarMode, box_shadow},
     prelude::FluentBuilder,
     *,
 };
@@ -96,7 +96,7 @@ pub struct Menu {
     unified_size: UnifiedSize,
     children: SmallVec<[MenuItem; 8]>,
     on_item_click: Option<Rc<dyn Fn(&ClickEvent, SharedString, &mut Window, &mut App)>>,
-    style: StyleRefinement,
+    max_h: Option<Pixels>,
 }
 
 impl Menu {
@@ -106,7 +106,7 @@ impl Menu {
             unified_size: UnifiedSize::Medium,
             children: SmallVec::new(),
             on_item_click: None,
-            style: StyleRefinement::default(),
+            max_h: None,
         }
     }
 
@@ -122,11 +122,15 @@ impl Menu {
         self.on_item_click = Some(Rc::new(on_item_click));
         self
     }
-}
 
-impl Styled for Menu {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
+    /// Caps how tall the menu may grow. Past the cap the entries scroll inside it, rather
+    /// than the menu running on over whatever it was opened against.
+    ///
+    /// The cap is on the menu's own box, so it counts the hairline the menu draws around
+    /// its entries.
+    pub fn max_h(mut self, max_h: impl Into<Pixels>) -> Self {
+        self.max_h = Some(max_h.into());
+        self
     }
 }
 
@@ -144,7 +148,7 @@ impl RenderOnce for Menu {
             unified_size,
             children,
             on_item_click,
-            style,
+            max_h,
         } = self;
 
         let keep_icon_placeholder = children
@@ -159,69 +163,62 @@ impl RenderOnce for Menu {
 
         let theme = cx.theme();
 
-        let inner = div()
-            .relative()
-            .size_full()
-            .child(
-                div()
-                    .id(id.clone())
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .gap(unified_size.gap())
-                    .p_1()
-                    .overflow_scroll()
-                    .track_scroll(&scroll_handle)
-                    .children(children.into_iter().map(|child| {
-                        match child {
-                            MenuItem::Custom(element) => element,
-                            MenuItem::Action(action) => MenuButton {
-                                id: (id.clone(), action.id.clone()).into(),
-                                unified_size,
-                                item_id: action.id,
-                                icon_kind: Either::Right(keep_icon_placeholder),
-                                label: action.label,
-                                disabled: action.disabled,
-                                on_click: {
-                                    let on_item_click = on_item_click.clone();
-                                    move |event, item_id, window, cx| {
-                                        if let Some(on_item_click) = on_item_click.as_ref() {
-                                            on_item_click(event, item_id, window, cx);
-                                        }
-                                    }
-                                },
+        let entries = div()
+            .id(id.clone())
+            .flex()
+            .flex_col()
+            .gap(unified_size.gap())
+            .p_1()
+            .overflow_y_scroll()
+            .track_scroll(&scroll_handle)
+            .children(children.into_iter().map(|child| {
+                match child {
+                    MenuItem::Custom(element) => element,
+                    MenuItem::Action(action) => MenuButton {
+                        id: (id.clone(), action.id.clone()).into(),
+                        unified_size,
+                        item_id: action.id,
+                        icon_kind: Either::Right(keep_icon_placeholder),
+                        label: action.label,
+                        disabled: action.disabled,
+                        on_click: {
+                            let on_item_click = on_item_click.clone();
+                            move |event, item_id, window, cx| {
+                                if let Some(on_item_click) = on_item_click.as_ref() {
+                                    on_item_click(event, item_id, window, cx);
+                                }
                             }
-                            .into_any_element(),
-                            MenuItem::IconAction(icon_action) => MenuButton {
-                                id: (id.clone(), icon_action.id.clone()).into(),
-                                unified_size,
-                                item_id: icon_action.id,
-                                icon_kind: Either::Left(icon_action.icon_kind),
-                                label: icon_action.label,
-                                disabled: icon_action.disabled,
-                                on_click: {
-                                    let on_item_click = on_item_click.clone();
-                                    move |event, item_id, window, cx| {
-                                        if let Some(on_item_click) = on_item_click.as_ref() {
-                                            on_item_click(event, item_id, window, cx);
-                                        }
-                                    }
-                                },
+                        },
+                    }
+                    .into_any_element(),
+                    MenuItem::IconAction(icon_action) => MenuButton {
+                        id: (id.clone(), icon_action.id.clone()).into(),
+                        unified_size,
+                        item_id: icon_action.id,
+                        icon_kind: Either::Left(icon_action.icon_kind),
+                        label: icon_action.label,
+                        disabled: icon_action.disabled,
+                        on_click: {
+                            let on_item_click = on_item_click.clone();
+                            move |event, item_id, window, cx| {
+                                if let Some(on_item_click) = on_item_click.as_ref() {
+                                    on_item_click(event, item_id, window, cx);
+                                }
                             }
-                            .into_any_element(),
-                            // A group heading is not a control: it takes no pointer
-                            // input, so it can never be mistaken for a selectable entry.
-                            MenuItem::Group(group) => div()
-                                .p(unified_size.px())
-                                .text_size(unified_size.text_size())
-                                .text_color(theme.components.menu.group_foreground.hsla)
-                                .child(group.label)
-                                .into_any_element(),
-                            MenuItem::Separator => Separator::horizontal().into_any_element(),
-                        }
-                    })),
-            )
-            .child(Scrollbar::vertical(scroll_handle).mode(ScrollbarMode::Always));
+                        },
+                    }
+                    .into_any_element(),
+                    // A group heading is not a control: it takes no pointer input, so it can
+                    // never be mistaken for a selectable entry.
+                    MenuItem::Group(group) => div()
+                        .p(unified_size.px())
+                        .text_size(unified_size.text_size())
+                        .text_color(theme.components.menu.group_foreground.hsla)
+                        .child(group.label)
+                        .into_any_element(),
+                    MenuItem::Separator => Separator::horizontal().into_any_element(),
+                }
+            }));
 
         let shadow = theme.components.menu.shadow.hsla;
 
@@ -229,8 +226,17 @@ impl RenderOnce for Menu {
         // dialog's wide elevation — a close band under the panel, plus a short falloff. The
         // `line.divider` edge it also draws is what keeps the panel legible on the dark
         // appearance, where a black shadow over a near-black page has little to say.
+        //
+        // The box is a column so that the entries are given a height instead of asking for
+        // one: past the cap, the entries box — a scroll container, and so a flex item that
+        // may shrink to nothing — takes what is left of the menu and scrolls inside it. A
+        // `100%` chain against a box whose own height follows its content resolves to auto
+        // instead, and a box that never overflows is one no scrollbar can appear on.
         div()
-            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .when_some(max_h, |this, max_h| this.max_h(max_h))
             .bg(theme.components.menu.background.hsla)
             .rounded_sm()
             .border_1()
@@ -239,8 +245,8 @@ impl RenderOnce for Menu {
                 box_shadow(0., 1., 2., 0., shadow),
                 box_shadow(0., 3., 6., -2., shadow),
             ])
-            .child(inner)
-            .refine_style(&style)
+            .child(entries)
+            .child(Scrollbar::vertical(scroll_handle).mode(ScrollbarMode::Always))
     }
 }
 

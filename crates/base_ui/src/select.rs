@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui_kit::{
     AnyElement, App, ElementId, Empty, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Transformation, Window,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
+    Styled, Transformation, Window,
     base::{Align, Disableable, Easing, Placement, Transition, transition},
     div,
     prelude::FluentBuilder,
@@ -31,8 +31,6 @@ pub struct Select {
     menu_items: SmallVec<[MenuItem; 8]>,
     on_change: Option<Rc<dyn Fn(&Option<SharedString>, &mut Window, &mut App)>>,
     disabled: bool,
-    placement: Placement,
-    align: Align,
 }
 
 impl Select {
@@ -49,8 +47,6 @@ impl Select {
             menu_items: SmallVec::new(),
             on_change: None,
             disabled: false,
-            placement: Placement::Bottom,
-            align: Align::Center,
         }
     }
 
@@ -78,12 +74,17 @@ impl Select {
     }
 
     pub fn placement(mut self, placement: Placement) -> Self {
-        self.placement = placement;
+        self.base = self.base.placement(placement);
         self
     }
 
     pub fn align(mut self, align: Align) -> Self {
-        self.align = align;
+        self.base = self.base.align(align);
+        self
+    }
+
+    pub fn menu_max_h(mut self, menu_max_h: impl Into<Pixels>) -> Self {
+        self.base = self.base.menu_max_h(menu_max_h);
         self
     }
 }
@@ -156,8 +157,6 @@ impl RenderOnce for Select {
             menu_items,
             on_change,
             disabled,
-            placement,
-            align,
         } = self;
 
         let open_state = window.use_keyed_state((id.clone(), "open"), cx, |_, _| false);
@@ -204,8 +203,6 @@ impl RenderOnce for Select {
             )
             .disabled(disabled)
             .with_unified_size(unified_size)
-            .placement(placement)
-            .align(align)
             .open_state(&open_state)
             .on_menu_item_click(move |_, id, window, cx| {
                 open_state.write(cx, false);
@@ -226,8 +223,8 @@ mod tests {
 
     use gpui_kit::{
         Context, InteractiveElement, IntoElement, Modifiers, MouseButton, ParentElement, Render,
-        StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div,
-        test::TestWindowExt as _,
+        StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div, px,
+        size, test::TestWindowExt as _,
     };
 
     use super::Select;
@@ -289,6 +286,30 @@ mod tests {
         }
     }
 
+    /// A select offering far more entries than its panel may show at once.
+    struct CappedHarness;
+
+    impl Render for CappedHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut select = Select::new("test-capped-select")
+                .small()
+                .debug_selector(|| "TEST_CAPPED_SELECT".into())
+                .menu_max_h(px(80.));
+
+            for index in 0..24 {
+                let id = format!("entry-{index}");
+                select = select.menu_item(MenuItem::Action(MenuItemAction::new(id.clone(), id)));
+            }
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(select)
+        }
+    }
+
     /// A select that was never opened draws no popup, so a click under its trigger
     /// belongs to whatever is drawn there.
     #[gpui_kit::test]
@@ -335,6 +356,26 @@ mod tests {
             start <= 1,
             "only the popup a select has yet to appear may ask for a frame at first: a caret \
              drawn for the first time belongs where its menu already is"
+        );
+    }
+
+    /// A select told how tall its menu may grow keeps to it: the panel stops at the cap and
+    /// the entries scroll inside it, instead of the list running down the window.
+    #[gpui_kit::test]
+    fn a_select_should_cap_the_panel_it_opens(cx: &mut TestAppContext) {
+        cx.update(style::theme::install);
+        let (_, cx) = cx.add_window_view(|_, _| CappedHarness);
+        cx.simulate_resize(size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+
+        press(cx, "TEST_CAPPED_SELECT");
+
+        let panel = cx
+            .debug_bounds("TEST_DROPDOWN_PANEL")
+            .expect("pressing the trigger opens the select");
+        assert!(
+            panel.size.height <= px(80.),
+            "a select that caps its menu must not open a panel taller than the cap: {panel:?}"
         );
     }
 

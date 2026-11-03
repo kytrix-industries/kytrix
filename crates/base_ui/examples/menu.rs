@@ -72,19 +72,16 @@ impl Render for MenuExample {
                     .child(
                         div()
                             .w(px(240.))
-                            .h(px(210.))
                             .child(self.menu("menu-small", UnifiedSize::Small)),
                     )
                     .child(
                         div()
                             .w(px(240.))
-                            .h(px(230.))
                             .child(self.menu("menu-medium", UnifiedSize::Medium)),
                     )
                     .child(
                         div()
                             .w(px(240.))
-                            .h(px(260.))
                             .child(self.menu("menu-large", UnifiedSize::Large)),
                     ),
             )
