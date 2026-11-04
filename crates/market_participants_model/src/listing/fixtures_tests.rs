@@ -38,7 +38,7 @@ use crate::{
         identifiers::{EquityListingIdentifiers, VenueListingIdentifiers},
         listing_impl::VenueListing,
         route::{VenueListingKey, VenueRoute},
-        venue::PriceBasis,
+        venue::{PolymarketProtocolVersion, PriceBasis},
     },
     outcome::{
         OutcomeGroup, OutcomeGroupSeed, OutcomeMember, OutcomeRiskPool, OutcomeSide,
@@ -302,7 +302,8 @@ fn polymarket_listing_identifiers_should_keep_condition_and_token_apart() {
         route: fixture_route("ctf-clob/polygon"),
         terms: ListingContinuityTerms::Polymarket {
             condition_id: condition.clone(),
-            clob_token_id: token.clone(),
+            asset_id: token.clone(),
+            protocol: PolymarketProtocolVersion::V1,
         },
     }
     .listing_id()

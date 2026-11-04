@@ -1148,7 +1148,7 @@ mod tests {
         );
         assert_eq!(
             connector.supported_venues().len(),
-            4,
+            5,
             "the static table lists the venues this build serves"
         );
 

@@ -503,6 +503,11 @@ error:
     protocol: 'X API protocol error: %{detail}'
     server: The X API returned HTTP %{status}
     timeout: The X API request timed out
+  prediction_chart:
+    no_markets: This prediction event publishes no tradable market
+    timeout: The prediction request timed out after %{seconds}s
+  prediction_selector:
+    interrupted: The prediction event read stopped unexpectedly
 instrument_selector:
   empty: No trading instruments available
   filter_placeholder: Filter symbols
@@ -858,6 +863,11 @@ widget:
     select_instrument: Select instrument
     select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
     table: Recent market trades
+  prediction_chart:
+    more_lines: "+%{count} more"
+    select_event: Select prediction event
+    select_market: Select market
+    select_market_group: Select market category
   names:
     candlestick: Candlestick
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
@@ -875,6 +885,7 @@ widget:
     open_interest: Open Interest
     order_book: Order Book
     pentagon_pizza_index: Pentagon Pizza Index
+    prediction_chart: Prediction Chart
     solana_wallet: Solana Wallet Monitor
     taker_volume: Taker Buy/Sell Volume
     top_trader_account_ratio: Top Trader Account Ratio
@@ -1151,6 +1162,10 @@ settings_ui:
     enter_passphrase: Enter Passphrase
     enter_private_key: Enter Private Key
     enter_secret_key: Enter Secret Key
+    clob_origin: CLOB origin
+    clob_origin_description: The address Polymarket prices and probability history are read from
+    gamma_origin: Event directory origin
+    gamma_origin_description: The address Polymarket events are read from
     http_origin: HTTP origin
     hyperliquid_http_origin_description: The address HyperCore requests are sent to; the venue publishes one
     hyperliquid_websocket_origin_description: The address HyperCore streams are opened on; the venue publishes one
@@ -1159,6 +1174,7 @@ settings_ui:
     origins: Origins
     passphrase: Passphrase
     passphrase_description: The passphrase the key was created with
+    polymarket_websocket_description: The address the Polymarket CLOB publishes streams on
     private_key_description: The private key this venue's requests are signed with
     secret_key: Secret Key
     secret_key_description: The secret key this venue's requests authenticate with
@@ -1240,3 +1256,14 @@ venue:
   hyperliquid: Hyperliquid
   longbridge: Longbridge
   okx: OKX
+  polymarket: Polymarket
+
+prediction_selector:
+  all: All
+  more_markets: "+%{count} more markets"
+  more_options: "+%{count} more"
+  next: Next
+  no_matching_events: No matching events
+  page: Page %{page}
+  previous: Previous
+  search_placeholder: Search prediction events

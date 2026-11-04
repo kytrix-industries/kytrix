@@ -1056,7 +1056,7 @@ pub fn listing_identifiers_of(
             asset_id: *asset_id,
         }),
         VenueListingIdentifiers::Polymarket(metadata) => identifiers.push(
-            ListingIdentifier::PolymarketToken(metadata.clob_token_id.clone()),
+            ListingIdentifier::PolymarketToken(metadata.asset_id.clone()),
         ),
         VenueListingIdentifiers::Equity(metadata) => {
             identifiers.push(ListingIdentifier::EquityCode {

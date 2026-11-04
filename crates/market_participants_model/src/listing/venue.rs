@@ -26,6 +26,36 @@ pub struct HyperliquidTokenId(pub u32);
 #[serde(transparent)]
 pub struct HyperliquidOutcomeId(pub u64);
 
+/// The market/position protocol a Polymarket asset id belongs to.
+///
+/// Both generations are live and both settle in pUSD; they differ in where the
+/// asset id comes from. A V1 market publishes `clobTokenIds`, a V2 market
+/// publishes `positionIds`, and CLOB accepts either as an asset id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PolymarketProtocolVersion {
+    #[serde(rename = "v1")]
+    V1,
+    #[serde(rename = "v2")]
+    V2,
+}
+
+impl PolymarketProtocolVersion {
+    /// Returns the fixed canonical label of this protocol generation.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+/// The uint256 asset id a Polymarket CLOB request addresses.
+///
+/// A V1 CTF token id and a V2 position id are the same wire shape, so the model
+/// names the role rather than keeping two types that would always be converted
+/// into one another.
+pub type PolymarketAssetId = crate::identifier::CtfTokenId;
+
 /// The Hyperliquid product family of an asset identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HyperliquidAssetProduct {

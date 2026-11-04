@@ -18,6 +18,7 @@ pub mod instrument;
 pub mod listing;
 pub mod market;
 pub mod outcome;
+pub mod prediction;
 pub mod reference;
 pub mod routing;
 pub mod settlement;

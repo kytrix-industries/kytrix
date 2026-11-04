@@ -1140,7 +1140,20 @@ mod tests {
                 &[],
             )
             .expect("the venue's routes should load");
-        let routes = connector.venues().scopes();
+        // Only catalog routes are registered in the fixture directory: a
+        // prediction scope publishes no catalog and has no route to bind here.
+        let routes: Vec<VenueRoute> = connector
+            .venues()
+            .scopes()
+            .iter()
+            .filter(|route| {
+                connector
+                    .venues()
+                    .scope(route)
+                    .is_some_and(|entry| entry.catalog_source.is_some())
+            })
+            .cloned()
+            .collect();
         let sources = routes
             .iter()
             .map(|route| test_support::binding(&source_id(route), test_support::pending()))
@@ -2015,7 +2028,16 @@ mod tests {
             // The catalogs a load publishes are what makes each scope a market the pane may
             // read; the commit the load itself makes is what tells the pane to look again.
             for route in routes.iter() {
-                test_support::publish_fixture_catalogs(cx, &[(route.clone(), Vec::new())]);
+                let Some(entry) = cx
+                    .global::<market_participants_connector::connector::MarketParticipantsConnector>()
+                    .venues()
+                    .scope(route)
+                else {
+                    continue;
+                };
+                if entry.catalog_source.is_some() {
+                    test_support::publish_fixture_catalogs(cx, &[(route.clone(), Vec::new())]);
+                }
             }
         });
         // The commit is announced on the market participants root's own task, so the event that re-runs

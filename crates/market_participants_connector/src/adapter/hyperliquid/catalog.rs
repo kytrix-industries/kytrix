@@ -22,7 +22,10 @@ use market_participants_model::{
         continuity::{ListingContinuityKey, ListingContinuityTerms},
         identifiers::HyperliquidListingIdentifiers,
         route::{VenueListingKey, VenueRoute},
-        venue::{HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidTokenId, PriceBasis},
+        venue::{
+            HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidOutcomeId, HyperliquidTokenId,
+            PriceBasis,
+        },
     },
     reference::{
         PriceReferenceTerms, ReferenceAggregation, ReferenceObservation, ReferenceObservationKind,
@@ -36,7 +39,6 @@ use market_participants_model::{
 };
 #[cfg(test)]
 use market_participants_model::{
-    listing::venue::HyperliquidOutcomeId,
     outcome::{
         OutcomeGroup, OutcomeGroupSeed, OutcomeMember, OutcomeSide, OutcomeSideId, OutcomeTopology,
         ResolutionRule, SettlementFractionRule,
@@ -46,10 +48,7 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 
 #[cfg(test)]
-use super::types::{
-    HyperliquidOutcomeMetaResponse, HyperliquidOutcomeSideSpec, HyperliquidOutcomeSpec,
-    HyperliquidSettledOutcome,
-};
+use super::types::HyperliquidOutcomeSpec;
 use super::types::{HyperliquidPerpDex, HyperliquidSpotToken};
 use crate::{
     catalog::{registry::asset::AssetTerms, source::CatalogSourceId},
@@ -63,8 +62,7 @@ pub(super) const VENUE: &str = HYPERLIQUID_VENUE;
 /// The scope prefix of a builder-deployed perpetual DEX.
 pub(super) const PERP_DEX_SCOPE_PREFIX: &str = "perp-dex/";
 
-/// The scope prefix of a HIP-4 outcome venue, as the outcome-identity tests build it.
-#[cfg(test)]
+/// The scope prefix of a HIP-4 outcome venue.
 pub(super) const OUTCOME_VENUE_SCOPE_PREFIX: &str = "outcome-venue/";
 
 /// The asset index of the first spot pair.
@@ -74,7 +72,6 @@ const PERP_DEX_ASSET_ID_BASE: u32 = 100_000;
 /// The number of asset indices one perpetual DEX reserves.
 const PERP_DEX_ASSET_ID_STRIDE: u32 = 10_000;
 /// The asset index of the first outcome side token.
-#[cfg(test)]
 const OUTCOME_ASSET_ID_BASE: u64 = 100_000_000;
 
 /// The smallest scope name the venue accepts for a deployed scope.
@@ -108,7 +105,6 @@ pub(crate) fn perp_dex_scope(name: &str) -> Result<VenueScopeId, MarketParticipa
 }
 
 /// Builds the scope of one HIP-4 outcome venue.
-#[cfg(test)]
 pub(crate) fn outcome_venue_scope(name: &str) -> Result<VenueScopeId, MarketParticipantError> {
     VenueScopeId::new(format_smolstr!("{OUTCOME_VENUE_SCOPE_PREFIX}{name}"))
         .map_err(|error| protocol_error("build a Hyperliquid outcome venue scope", error))
@@ -164,7 +160,6 @@ pub(super) fn perp_asset_id(
 }
 
 /// The wire encoding of one outcome side: `10 * outcome + side`.
-#[cfg(test)]
 pub(crate) fn outcome_encoding(outcome: u64, side: u64) -> Result<u64, MarketParticipantError> {
     if side > 1 {
         return Err(protocol_error(
@@ -184,7 +179,6 @@ pub(crate) fn outcome_encoding(outcome: u64, side: u64) -> Result<u64, MarketPar
 }
 
 /// The asset index of one outcome side token.
-#[cfg(test)]
 pub(crate) fn outcome_asset_id(
     encoding: u64,
 ) -> Result<HyperliquidAssetId, MarketParticipantError> {
@@ -201,7 +195,6 @@ pub(crate) fn outcome_asset_id(
 }
 
 /// The spot coin of one outcome side: `#<encoding>`.
-#[cfg(test)]
 pub(crate) fn outcome_coin(encoding: u64) -> SmolStr {
     format_smolstr!("#{encoding}")
 }
@@ -359,7 +352,6 @@ pub(super) fn perpetual_continuity(
 }
 
 /// The continuity terms of one Hyperliquid outcome listing.
-#[cfg(test)]
 pub(crate) fn outcome_continuity(
     scope: &VenueScopeId,
     outcome_id: HyperliquidOutcomeId,
@@ -635,6 +627,43 @@ pub(crate) fn perp_dex_descriptor(
     ))
 }
 
+/// The capability set one HIP-4 outcome scope serves.
+fn outcome_capabilities() -> Vec<RouteCapabilityDescriptor> {
+    vec![
+        RouteCapabilityDescriptor::new(CapabilityId::PredictionEvents, false),
+        RouteCapabilityDescriptor::new(CapabilityId::PredictionSeries, false),
+    ]
+}
+
+/// The normalization of one HIP-4 outcome scope.
+fn outcome_normalization() -> Vec<IdentifierNormalizationRule> {
+    vec![IdentifierNormalizationRule::new(
+        ListingIdentifierKind::HyperliquidOutcome,
+        Some(IdentifierNormalizationProduct::HyperliquidOutcome),
+        SymbolNormalization::Exact,
+    )]
+}
+
+/// The descriptor of one HIP-4 outcome scope.
+///
+/// The scope publishes no catalog: its events are read from the venue's outcome
+/// metadata, which is committed with the venue's load.
+pub(crate) fn outcome_venue_descriptor(
+    scope: VenueScopeId,
+) -> Result<VenueRouteDescriptor, MarketParticipantError> {
+    let route = VenueRoute::new(
+        market_participants_model::identifier::VenueId::from_name(VENUE)
+            .map_err(|error| protocol_error("build a Hyperliquid venue identity", error))?,
+        scope,
+    );
+    Ok(VenueRouteDescriptor::new(
+        route,
+        outcome_capabilities(),
+        outcome_normalization(),
+        None,
+    ))
+}
+
 /// Every deployment the venue's own `perpDexs` answer named, in the venue's order.
 ///
 /// The first element of the venue's answer is `null` and stands for the core DEX,
@@ -688,8 +717,10 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        HyperliquidOutcomeMetaResponse, HyperliquidOutcomeSideSpec, HyperliquidOutcomeSpec,
-        HyperliquidPerpDex, HyperliquidSettledOutcome, HyperliquidSpotToken, OutcomeIdentity,
+        super::types::{
+            HyperliquidOutcomeMetaResponse, HyperliquidOutcomeSideSpec, HyperliquidSettledOutcome,
+        },
+        HyperliquidOutcomeSpec, HyperliquidPerpDex, HyperliquidSpotToken, OutcomeIdentity,
         RouteCapabilityDescriptor, VENUE, deployed_perp_dexes, is_deployable_scope_name,
         listing_key, margin_fractions, outcome_asset_id, outcome_coin, outcome_continuity,
         outcome_encoding, outcome_group, outcome_side_id, outcome_token_name, outcome_venue_scope,
@@ -709,6 +740,8 @@ mod tests {
             outcome,
             name: SmolStr::new_static("Recurring"),
             description: SmolStr::new_static("class:priceBinary|underlying:BTC"),
+            quote_token: Some(SmolStr::new_static("USDC")),
+            venue: None,
             side_specs: sides
                 .iter()
                 .map(|name| HyperliquidOutcomeSideSpec {

@@ -18,7 +18,8 @@ use app_config::{
     market_participants::{
         origins::{
             BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin, HyperliquidHttpOrigin,
-            HyperliquidWebsocketOrigin, LongbridgeRegion, OkxRegion,
+            HyperliquidWebsocketOrigin, LongbridgeRegion, OkxRegion, PolymarketClobOrigin,
+            PolymarketGammaOrigin, PolymarketWebsocketOrigin,
         },
         settings::{BinanceOrigins, VenueSettings},
     },
@@ -159,6 +160,14 @@ origin_options!(
     HYPERLIQUID_WEBSOCKET_OPTIONS,
     1,
     [HyperliquidWebsocketOrigin::Api]
+);
+
+origin_options!(POLYMARKET_GAMMA_OPTIONS, 1, [PolymarketGammaOrigin::Api]);
+origin_options!(POLYMARKET_CLOB_OPTIONS, 1, [PolymarketClobOrigin::Api]);
+origin_options!(
+    POLYMARKET_WEBSOCKET_OPTIONS,
+    1,
+    [PolymarketWebsocketOrigin::Api]
 );
 
 /// The request addresses one Binance market may be reached on.
@@ -653,6 +662,124 @@ fn venue_sections(venue: &VenueId) -> Vec<SectionDef> {
         VenueId::Okx => okx_sections(venue),
         VenueId::Hyperliquid => hyperliquid_sections(venue),
         VenueId::Longbridge => longbridge_sections(venue),
+        VenueId::Polymarket => polymarket_sections(venue),
+    }
+}
+
+/// Polymarket's page: the event directory, the CLOB and the CLOB stream.
+///
+/// The venue publishes no credential for its market data, so the page has one
+/// section and no credential fields.
+fn polymarket_sections(venue: &VenueId) -> Vec<SectionDef> {
+    vec![SectionDef::fields(
+        Some(text("settings_ui.market_participants.origins")),
+        false,
+        vec![
+            polymarket_gamma_field(venue),
+            polymarket_clob_field(venue),
+            polymarket_websocket_field(venue),
+        ],
+    )]
+}
+
+fn polymarket_gamma_field(venue: &VenueId) -> FieldDef {
+    let reader = *venue;
+    let writer = *venue;
+    FieldDef {
+        id: SharedString::from(format!("market_participants.{}.gamma", venue.as_str())),
+        label: text("settings_ui.market_participants.gamma_origin"),
+        description: text("settings_ui.market_participants.gamma_origin_description"),
+        keywords: &[
+            "market_participants",
+            "polymarket",
+            "gamma",
+            "events",
+            "origin",
+            "地址",
+        ],
+        access: FieldAccess::Select {
+            options: &POLYMARKET_GAMMA_OPTIONS,
+            get: Rc::new(move |config: &Config| {
+                let choice = match config.venue(&reader) {
+                    Some(VenueSettings::Polymarket(settings)) => settings.gamma,
+                    _ => PolymarketGammaOrigin::default(),
+                };
+                FieldValue::new(choice.as_str())
+            }),
+            set: Rc::new(move |config: &mut Config, value: &FieldValue| {
+                let Some(choice) = PolymarketGammaOrigin::from_url(value.as_str()) else {
+                    return;
+                };
+                config.set_polymarket_gamma(&writer, choice);
+            }),
+        },
+    }
+}
+
+fn polymarket_clob_field(venue: &VenueId) -> FieldDef {
+    let reader = *venue;
+    let writer = *venue;
+    FieldDef {
+        id: SharedString::from(format!("market_participants.{}.clob", venue.as_str())),
+        label: text("settings_ui.market_participants.clob_origin"),
+        description: text("settings_ui.market_participants.clob_origin_description"),
+        keywords: &[
+            "market_participants",
+            "polymarket",
+            "clob",
+            "prices",
+            "origin",
+            "地址",
+        ],
+        access: FieldAccess::Select {
+            options: &POLYMARKET_CLOB_OPTIONS,
+            get: Rc::new(move |config: &Config| {
+                let choice = match config.venue(&reader) {
+                    Some(VenueSettings::Polymarket(settings)) => settings.clob,
+                    _ => PolymarketClobOrigin::default(),
+                };
+                FieldValue::new(choice.as_str())
+            }),
+            set: Rc::new(move |config: &mut Config, value: &FieldValue| {
+                let Some(choice) = PolymarketClobOrigin::from_url(value.as_str()) else {
+                    return;
+                };
+                config.set_polymarket_clob(&writer, choice);
+            }),
+        },
+    }
+}
+
+fn polymarket_websocket_field(venue: &VenueId) -> FieldDef {
+    let reader = *venue;
+    let writer = *venue;
+    FieldDef {
+        id: SharedString::from(format!("market_participants.{}.websocket", venue.as_str())),
+        label: text("settings_ui.market_participants.websocket_origin"),
+        description: text("settings_ui.market_participants.polymarket_websocket_description"),
+        keywords: &[
+            "market_participants",
+            "polymarket",
+            "websocket",
+            "origin",
+            "地址",
+        ],
+        access: FieldAccess::Select {
+            options: &POLYMARKET_WEBSOCKET_OPTIONS,
+            get: Rc::new(move |config: &Config| {
+                let choice = match config.venue(&reader) {
+                    Some(VenueSettings::Polymarket(settings)) => settings.websocket,
+                    _ => PolymarketWebsocketOrigin::default(),
+                };
+                FieldValue::new(choice.as_str())
+            }),
+            set: Rc::new(move |config: &mut Config, value: &FieldValue| {
+                let Some(choice) = PolymarketWebsocketOrigin::from_url(value.as_str()) else {
+                    return;
+                };
+                config.set_polymarket_websocket(&writer, choice);
+            }),
+        },
     }
 }
 
@@ -1329,6 +1456,7 @@ fn credential_value(config: &Config, venue: &VenueId, wire_name: &str) -> FieldV
             "access_token" => longbridge.credentials.access_token.clone(),
             _ => FieldValue::default(),
         },
+        VenueSettings::Polymarket(_) => FieldValue::default(),
     }
 }
 

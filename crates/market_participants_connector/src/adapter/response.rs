@@ -20,6 +20,7 @@ use market_participants_model::{
         book::MarketSequence,
         units::{MarketTradeId, PositionSide},
     },
+    prediction::{PredictionEventView, PredictionEventsPage, PredictionSeries},
     reference::PriceReferenceTerms,
 };
 use tokio::sync::watch;
@@ -190,6 +191,9 @@ pub enum ProtocolResponse {
     Candlesticks(Vec<NativeListing<NativeCandlestick>>),
     Ticker(NativeListing<NativeTicker>),
     Tickers(Vec<NativeListing<NativeTicker>>),
+    PredictionEvents(PredictionEventsPage),
+    PredictionEvent(PredictionEventView),
+    PredictionSeries(Vec<PredictionSeries>),
     OrderBook(NativeListing<NativeOrderBook>),
     Trades(Vec<NativeListing<NativeTrade>>),
     OrderPlaced(crate::account::shared::OrderId),
@@ -224,6 +228,8 @@ pub enum ProtocolEvent {
     Position(NativePosition),
     /// One liquidation order of a route-level stream.
     ForceOrder(NativeListing<NativeForceOrder>),
+    /// One live probability reading of a prediction event's legs.
+    PredictionSeries(Vec<PredictionSeries>),
     /// One update of a Hyperliquid wallet stream.
     HyperliquidWalletUpdate(NativeHyperliquidWalletUpdate),
 }

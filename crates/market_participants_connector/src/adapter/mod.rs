@@ -7,6 +7,8 @@ pub(crate) mod hyperliquid;
 pub(crate) mod identity;
 pub(crate) mod longbridge;
 pub(crate) mod okx;
+pub(crate) mod polymarket;
+pub(crate) mod prediction;
 pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod r#trait;

@@ -157,6 +157,9 @@ fn answer_of(request: &FixtureRequest) -> Option<String> {
                 ("metaAndAssetCtxs", Some("abc")) => {
                     Some(format!("[{HYPERLIQUID_CORE_COIN_DEX_META},[{{}}]]"))
                 }
+                ("outcomeMeta", _) => Some(r#"{"outcomes":[],"questions":[]}"#.to_owned()),
+                ("outcomeTemplates", _) => Some("[]".to_owned()),
+                ("allMids", _) => Some("{}".to_owned()),
                 _ => None,
             }
         }

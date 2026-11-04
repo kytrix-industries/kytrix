@@ -17,7 +17,7 @@ pub(super) use app_config::network::NetworkRouteGeneration;
 pub(super) use bytes::Bytes;
 pub(super) use futures::{StreamExt, future::BoxFuture, stream};
 pub(super) use market_participants_model::{
-    decimal::{Price, ProfitOrLoss, Quantity, Ratio, SignedQuantity, Tick},
+    decimal::{Fraction, Price, ProfitOrLoss, Quantity, Ratio, SignedQuantity, Tick},
     identifier::{IdentifierValue, NativeSymbol, VenueId, VenueScopeId, WalletAddress},
     instrument::{Instrument, InstrumentTerms},
     listing::{
@@ -37,6 +37,8 @@ pub(super) use market_participants_model::{
         selection::OrderQuantity,
         units::{MarketTradeId, PositionSide, QuantityUnit, Side},
     },
+    outcome::OutcomeLegRef,
+    prediction::{PredictionNativeLeg, PredictionPricePoint, PredictionSeries},
     routing::CapabilityId,
 };
 pub(super) use smol_str::{SmolStr, format_smolstr};
@@ -51,7 +53,10 @@ pub(super) use super::super::{
     budget::{Spent, Weight, retry_after as info_retry_after},
     catalog,
     signing::{Eip712Signer, NonceGenerator},
-    types::{HyperliquidActiveContextValues, HyperliquidPerpDex, HyperliquidSpotMetaResponse},
+    types::{
+        HyperliquidActiveContextValues, HyperliquidOutcomeMetaResponse, HyperliquidOutcomeTemplate,
+        HyperliquidPerpDex, HyperliquidSpotMetaResponse,
+    },
 };
 use super::contexts::FastContextBoard;
 pub(super) use crate::{
@@ -83,7 +88,8 @@ pub(super) use crate::{
     routing::{CORE_PERP_SCOPE, CORE_SPOT_SCOPE, HYPERLIQUID_WALLET_SCOPE},
     runtime::MarketParticipantNetworkSnapshot,
     venue::metadata::{
-        PerpRouteMeta, RouteContexts, ScopeMetadata, SpotRouteMeta, VenueMetadata, VenueReading,
+        OutcomeRouteMeta, PerpRouteMeta, RouteContexts, ScopeMetadata, SpotRouteMeta,
+        VenueMetadata, VenueReading,
     },
 };
 
@@ -465,8 +471,16 @@ impl HyperliquidAdapter {
                 meta: spot,
             }),
         );
+        let outcome_meta: HyperliquidOutcomeMetaResponse = self
+            .post_info(context, &HyperliquidInfoRequest::OutcomeMeta)
+            .await?;
+        let templates: Vec<HyperliquidOutcomeTemplate> = self
+            .post_info(context, &HyperliquidInfoRequest::OutcomeTemplates)
+            .await?;
+        let outcome_scopes = outcome_scopes(venue, &outcome_meta, &templates, &mut per_scope)?;
         Ok(VenueReading::Verified {
             deployments: verified,
+            outcome_scopes,
             metadata: Arc::new(VenueMetadata::new(per_scope, dexes)),
         })
     }
@@ -510,6 +524,7 @@ impl HyperliquidAdapter {
         match scope_metadata(context, route)? {
             ScopeMetadata::Spot(meta) => spot_listings(route, &meta.meta),
             ScopeMetadata::Perp(meta) => perpetual_listings(route, meta),
+            ScopeMetadata::Outcome(_) => Err(unsupported(context)),
         }
     }
 
@@ -572,6 +587,7 @@ impl HyperliquidAdapter {
         match scope_metadata(context, route)? {
             ScopeMetadata::Spot(meta) => spot_catalog_entries(route, &meta.meta),
             ScopeMetadata::Perp(meta) => perpetual_catalog_entries(route, meta),
+            ScopeMetadata::Outcome(_) => Err(unsupported(context)),
         }
     }
 
@@ -649,6 +665,7 @@ impl HyperliquidAdapter {
         let listings = match meta {
             ScopeMetadata::Spot(meta) => spot_listings(route, &meta.meta)?,
             ScopeMetadata::Perp(meta) => perpetual_listings(route, meta)?,
+            ScopeMetadata::Outcome(_) => return Err(unsupported(context)),
         };
         let mut tickers = Vec::with_capacity(listings.len());
         for (coin, key) in listings.iter() {
@@ -1437,6 +1454,44 @@ impl HyperliquidAdapter {
                     },
                 )
             }
+            ProtocolRequest::SubscribePredictionSeries(query) => {
+                let mut hyperliquid_legs: Vec<(SmolStr, OutcomeLegRef)> = query
+                    .legs
+                    .iter()
+                    .filter_map(|leg| match &leg.native {
+                        PredictionNativeLeg::HyperliquidOutcome { coin, .. } => {
+                            Some((coin.clone(), leg.leg.clone()))
+                        }
+                        PredictionNativeLeg::Polymarket { .. } => None,
+                    })
+                    .collect();
+                if hyperliquid_legs.is_empty() {
+                    log::debug!(
+                        "rejected prediction series subscription: no Hyperliquid outcome legs \
+                         found in a request with {} total legs",
+                        query.legs.len()
+                    );
+                    return Err(unsupported(&context));
+                }
+                // Validate that each outcome coin belongs to the venue's catalog
+                // by checking against the route's listings before subscribing.
+                // The connection will fail later if any outcome is invalid.
+                for (coin, _) in &hyperliquid_legs {
+                    log::trace!(
+                        "subscribing to Hyperliquid outcome: {}",
+                        coin.as_str()
+                    );
+                }
+                (
+                    HyperliquidSubscribe {
+                        method: SmolStr::new_static("subscribe"),
+                        subscription: HyperliquidSubscription::AllMids,
+                    },
+                    SubscriptionKind::Prediction { 
+                        legs: hyperliquid_legs.into(), 
+                    },
+                )
+            }
             ProtocolRequest::SubscribeOrders(query) => {
                 let user: SmolStr = query.target().account().as_str().into();
                 (
@@ -1565,6 +1620,65 @@ impl HyperliquidAdapter {
     }
 }
 
+/// Builds one HIP-4 scope per deployer the venue's outcome metadata names.
+///
+/// A question belongs to the deployer of the outcomes it references: the venue
+/// publishes no venue field on a question, so the outcome table is the only place
+/// that answer exists. The eight recurring outcomes with no venue are their own
+/// `outcome-core` scope.
+fn outcome_scopes(
+    venue: VenueId,
+    meta: &HyperliquidOutcomeMetaResponse,
+    templates: &[HyperliquidOutcomeTemplate],
+    per_scope: &mut BTreeMap<VenueRoute, ScopeMetadata>,
+) -> Result<Vec<VenueScopeId>, MarketParticipantError> {
+    let mut groups: BTreeMap<Option<SmolStr>, (Vec<_>, Vec<_>)> = BTreeMap::new();
+    for outcome in &meta.outcomes {
+        groups
+            .entry(outcome.venue.clone().filter(|venue| !venue.is_empty()))
+            .or_default()
+            .0
+            .push(outcome.clone());
+    }
+    for question in &meta.questions {
+        let deployer = question
+            .named_outcomes
+            .iter()
+            .chain(std::iter::once(&question.fallback_outcome))
+            .find_map(|id| {
+                meta.outcomes
+                    .iter()
+                    .find(|outcome| outcome.outcome == *id)
+                    .and_then(|outcome| outcome.venue.clone())
+                    .filter(|venue| !venue.is_empty())
+            });
+        groups.entry(deployer).or_default().1.push(question.clone());
+    }
+    let mut scopes = Vec::with_capacity(groups.len());
+    for (deployer, (outcomes, questions)) in groups {
+        if outcomes.is_empty() {
+            continue;
+        }
+        let scope = match deployer.as_deref() {
+            Some(name) => catalog::outcome_venue_scope(name)?,
+            None => VenueScopeId::new("outcome-core").map_err(|error| {
+                protocol_error("build the Hyperliquid outcome-core scope", error)
+            })?,
+        };
+        per_scope.insert(
+            VenueRoute::new(venue, scope.clone()),
+            ScopeMetadata::Outcome(OutcomeRouteMeta {
+                deployer,
+                outcomes,
+                questions,
+                templates: templates.to_vec(),
+            }),
+        );
+        scopes.push(scope);
+    }
+    Ok(scopes)
+}
+
 /// Posts one `info` request to one Hyperliquid HTTP origin.
 ///
 /// The catalog and the discovery answers go over HTTP: they are the requests whose
@@ -1659,7 +1773,8 @@ where
 /// before the last one at twice [`INFO_RETRY_BASE`] to the power of the attempts.
 fn info_retry_backoff(attempt: u32) -> Duration {
     let base = INFO_RETRY_BASE.saturating_mul(1_u32 << attempt.min(INFO_RETRY_ATTEMPTS));
-    let jitter = rand::random_range(0..=base.as_millis() as u64);
+    // Use 20% jitter instead of 100% to avoid excessive delays while still preventing thundering herd
+    let jitter = rand::random_range(0..=(base.as_millis() as u64 / 5));
     base + Duration::from_millis(jitter)
 }
 
@@ -1843,7 +1958,7 @@ fn hyperliquid_credentials(
 /// reads metadata cannot reach the venue. A scope the loaded venue's reading
 /// did not cover is refused — the admission that let this execution through is the
 /// only thing that could have covered it.
-fn scope_metadata<'a>(
+pub(crate) fn scope_metadata<'a>(
     context: &'a ExecutionContext,
     route: &VenueRoute,
 ) -> Result<&'a ScopeMetadata, MarketParticipantError> {
@@ -3547,6 +3662,17 @@ fn decode_liquidation(
 }
 
 #[derive(Clone, serde::Deserialize)]
+struct HyperliquidAllMidsEvent {
+    channel: SmolStr,
+    data: HyperliquidAllMidsWire,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct HyperliquidAllMidsWire {
+    mids: BTreeMap<SmolStr, SmolStr>,
+}
+
+#[derive(Clone, serde::Deserialize)]
 struct HyperliquidActiveContextEvent {
     channel: SmolStr,
     data: HyperliquidActiveContextWire,
@@ -3578,6 +3704,10 @@ pub(super) enum SubscriptionKind {
         listing: VenueListingKey,
         coin: SmolStr,
         depth: u16,
+    },
+    /// One all-mids feed decoded into the outcome legs one prediction pane follows.
+    Prediction {
+        legs: Arc<[(SmolStr, OutcomeLegRef)]>,
     },
     Order,
     Position,
@@ -3620,6 +3750,7 @@ impl SubscriptionKind {
             | Self::Ticker { .. }
             | Self::Trade { .. }
             | Self::OrderBook { .. }
+            | Self::Prediction { .. }
             | Self::Order
             | Self::Position => None,
         }
@@ -3748,6 +3879,31 @@ fn decode_event(
                     },
                 ),
             )))
+        }
+        SubscriptionKind::Prediction { legs } => {
+            let event: HyperliquidAllMidsEvent =
+                match serde_json::from_slice::<HyperliquidAllMidsEvent>(payload) {
+                    Ok(event) if event.channel == "allMids" => event,
+                    _ => return Ok(None),
+                };
+            let timestamp = current_timestamp_millis()?;
+            let series: Vec<PredictionSeries> = legs
+                .iter()
+                .filter_map(|(coin, leg)| {
+                    let probability = event.data.mids.get(coin)?.parse::<Fraction>().ok()?;
+                    Some(PredictionSeries {
+                        leg: leg.clone(),
+                        points: vec![PredictionPricePoint {
+                            timestamp,
+                            probability,
+                        }],
+                    })
+                })
+                .collect();
+            if series.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ProtocolEvent::PredictionSeries(series)))
         }
         SubscriptionKind::WalletFills { address, .. } => {
             let event: HyperliquidUserFillsEvent = match serde_json::from_slice::<

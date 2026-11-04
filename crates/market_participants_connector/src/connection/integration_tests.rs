@@ -1066,6 +1066,7 @@ fn keepalive_protocol() -> ConnectionProtocol {
         answer: "pong",
         interval: Duration::from_millis(50),
         maximum_missed: 1,
+        send_while_active: false,
     })
 }
 

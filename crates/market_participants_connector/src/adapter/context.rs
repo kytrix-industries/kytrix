@@ -16,7 +16,7 @@
 use std::{fmt, sync::Arc};
 
 use app_config::{
-    market_participants::origins::OriginPair,
+    market_participants::origins::VenueEndpoints,
     network::{NetworkRouteGeneration, ResolvedProxy},
 };
 use app_config_provider::notification::ConfigNotification;
@@ -121,8 +121,8 @@ impl Authentication {
 pub struct ExecutionContext {
     /// The only route and capability identity of this execution.
     identity: RequestIdentity,
-    /// The origins the route's venue configuration gives its scope.
-    origins: OriginPair,
+    /// Every endpoint the route's venue configuration gives its scope.
+    endpoints: VenueEndpoints,
     pub auth: Option<Authentication>,
     pub proxy: ResolvedProxy,
     /// Generation of the resolved network route used for this operation.
@@ -152,7 +152,7 @@ impl fmt::Debug for ExecutionContext {
         formatter
             .debug_struct("ExecutionContext")
             .field("identity", &self.identity)
-            .field("origins", &self.origins)
+            .field("endpoints", &self.endpoints)
             .field("auth", &self.auth.as_ref().map(Authentication::account_id))
             .field("proxy", &self.proxy)
             .field("network_route_generation", &self.network_route_generation)
@@ -163,15 +163,34 @@ impl fmt::Debug for ExecutionContext {
 
 impl ExecutionContext {
     /// Builds the context of one validated request.
+    #[cfg(test)]
     pub(crate) fn new(
         identity: RequestIdentity,
-        origins: OriginPair,
+        origins: app_config::market_participants::origins::OriginPair,
+        http_client: Client,
+        connection_pool: Arc<ConnectionPool>,
+    ) -> Self {
+        Self::new_with_endpoints(
+            identity,
+            VenueEndpoints {
+                primary: origins,
+                metadata: None,
+            },
+            http_client,
+            connection_pool,
+        )
+    }
+
+    /// Builds the context of one request that has a metadata service beside its primary.
+    pub(crate) fn new_with_endpoints(
+        identity: RequestIdentity,
+        endpoints: VenueEndpoints,
         http_client: Client,
         connection_pool: Arc<ConnectionPool>,
     ) -> Self {
         Self {
             identity,
-            origins,
+            endpoints,
             auth: None,
             proxy: ResolvedProxy::NoProxy,
             network_route_generation: NetworkRouteGeneration::default(),
@@ -215,12 +234,24 @@ impl ExecutionContext {
 
     /// Returns the HTTP origin the route's venue configuration gives its scope.
     pub(crate) fn http_origin(&self) -> &Url {
-        &self.origins.http
+        &self.endpoints.primary.http
+    }
+
+    /// Returns the HTTP origin of the venue's metadata service.
+    ///
+    /// A venue with one host answers its primary HTTP origin: the metadata read is
+    /// the same host there, and no adapter has to branch on whether a second one
+    /// exists.
+    pub(crate) fn http_metadata(&self) -> &Url {
+        self.endpoints
+            .metadata
+            .as_ref()
+            .map_or(&self.endpoints.primary.http, |service| &service.http)
     }
 
     /// Returns the WebSocket origin the route's venue configuration gives its scope.
     pub(crate) fn websocket_origin(&self) -> &Url {
-        &self.origins.websocket
+        &self.endpoints.primary.websocket
     }
 
     /// Returns the generation of the resolved network route.
@@ -280,17 +311,38 @@ impl ExecutionContext {
 pub struct VenueExecutionContext {
     /// The venue this read asks.
     venue: VenueId,
-    /// The pair the venue's own configuration gives a scope it does not name.
-    origins: OriginPair,
+    /// The endpoints the venue's own configuration gives a scope it does not name.
+    endpoints: VenueEndpoints,
     pub http_client: Client,
 }
 
 impl VenueExecutionContext {
     /// Builds the context of one venue-level read.
-    pub(crate) fn new(venue: VenueId, origins: OriginPair, http_client: Client) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(
+        venue: VenueId,
+        origins: app_config::market_participants::origins::OriginPair,
+        http_client: Client,
+    ) -> Self {
+        Self::new_with_endpoints(
+            venue,
+            VenueEndpoints {
+                primary: origins,
+                metadata: None,
+            },
+            http_client,
+        )
+    }
+
+    /// Builds the context of one venue-level read with a metadata service.
+    pub(crate) fn new_with_endpoints(
+        venue: VenueId,
+        endpoints: VenueEndpoints,
+        http_client: Client,
+    ) -> Self {
         Self {
             venue,
-            origins,
+            endpoints,
             http_client,
         }
     }
@@ -302,7 +354,7 @@ impl VenueExecutionContext {
 
     /// Returns the HTTP origin this read dials.
     pub(crate) fn http_origin(&self) -> &Url {
-        &self.origins.http
+        &self.endpoints.primary.http
     }
 }
 

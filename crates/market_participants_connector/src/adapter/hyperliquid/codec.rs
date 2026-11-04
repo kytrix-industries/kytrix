@@ -272,6 +272,14 @@ mod tests {
             r#"{"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}"#
         );
         assert_eq!(
+            serde_json::to_string(&HyperliquidSubscribe {
+                method: SmolStr::new_static("subscribe"),
+                subscription: HyperliquidSubscription::AllMids,
+            })
+            .unwrap(),
+            r#"{"method":"subscribe","subscription":{"type":"allMids"}}"#
+        );
+        assert_eq!(
             serde_json::to_string(&fills).unwrap(),
             r#"{"method":"subscribe","subscription":{"type":"userFills","user":"0x0000000000000000000000000000000000000001"}}"#
         );

@@ -481,6 +481,7 @@ impl MarketParticipants {
             VenueId::Okx => Brand::okx(),
             VenueId::Hyperliquid => Brand::hyperliquid(),
             VenueId::Longbridge => Brand::longbridge(),
+            VenueId::Polymarket => Brand::polymarket(),
         }
         .size_4();
 
@@ -685,6 +686,7 @@ mod tests {
     const OKX_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Okx";
     const HYPERLIQUID_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Hyperliquid";
     const LONGBRIDGE_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Longbridge";
+    const POLYMARKET_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Polymarket";
 
     const OKX_LOAD: &str = "TEST_MARKET_PARTICIPANTS_ACTION_LOAD_Okx";
     const OKX_REFRESH: &str = "TEST_MARKET_PARTICIPANTS_ACTION_REFRESH_Okx";
@@ -1397,7 +1399,7 @@ mod tests {
             cx.global::<MarketParticipantsConnector>()
                 .supported_venues()
         });
-        assert_eq!(venues.len(), 4, "this build speaks four venues");
+        assert_eq!(venues.len(), 5, "this build speaks five venues");
 
         for venue in venues {
             let outcome = load(&mut harness, &venue);
@@ -1406,6 +1408,12 @@ mod tests {
                 "loading {venue} should have reached the origin it is configured with rather than \
                  refusing to resolve one: {outcome:?}"
             );
+            // Polymarket's scope set is static: its load answers without a venue
+            // conversation, so an unreachable origin is not a load failure there.
+            if venue == VenueId::Polymarket {
+                assert!(outcome.is_ok(), "the static scope set loads offline");
+                continue;
+            }
             assert!(
                 format!("{outcome:?}").contains(UNREACHABLE),
                 "loading {venue} should have addressed the origin its own configuration names, so \
@@ -1430,8 +1438,14 @@ mod tests {
             cx.global::<MarketParticipantsConnector>()
                 .supported_venues()
         });
-        assert_eq!(loaded.len(), 4, "this build speaks four venues");
-        for row in [BINANCE_ROW, OKX_ROW, HYPERLIQUID_ROW, LONGBRIDGE_ROW] {
+        assert_eq!(loaded.len(), 5, "this build speaks five venues");
+        for row in [
+            BINANCE_ROW,
+            OKX_ROW,
+            HYPERLIQUID_ROW,
+            LONGBRIDGE_ROW,
+            POLYMARKET_ROW,
+        ] {
             assert!(shows(&mut harness, row), "the panel draws {row}");
         }
     }

@@ -381,6 +381,63 @@ pub struct SetLeverageCommand {
 }
 account_target_query!(SetLeverageCommand);
 
+/// One page of prediction events on one route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredictionEventsQuery {
+    pub route: VenueRoute,
+    pub category: Option<smol_str::SmolStr>,
+    pub search: Option<smol_str::SmolStr>,
+    pub cursor: Option<smol_str::SmolStr>,
+    pub page_size: u16,
+    /// The caller's opaque content locale, forwarded to venues that localize.
+    pub locale: Option<smol_str::SmolStr>,
+}
+route_scoped_query!(PredictionEventsQuery);
+
+/// One prediction event on one route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredictionEventQuery {
+    pub event: market_participants_model::prediction::PredictionEventRef,
+    /// The caller's opaque content locale, forwarded to venues that localize.
+    pub locale: Option<smol_str::SmolStr>,
+}
+
+impl PredictionEventQuery {
+    /// Returns the route this query addresses.
+    pub const fn route(&self) -> &VenueRoute {
+        &self.event.route
+    }
+}
+
+/// Probability series of one prediction event's legs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredictionSeriesQuery {
+    pub event: market_participants_model::prediction::PredictionEventRef,
+    pub legs: Vec<market_participants_model::prediction::PredictionLeg>,
+    pub window: market_participants_model::prediction::PredictionWindow,
+}
+
+impl PredictionSeriesQuery {
+    /// Returns the route this query addresses.
+    pub const fn route(&self) -> &VenueRoute {
+        &self.event.route
+    }
+}
+
+/// The live probabilities of one prediction event's legs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredictionSeriesSubscriptionQuery {
+    pub event: market_participants_model::prediction::PredictionEventRef,
+    pub legs: Vec<market_participants_model::prediction::PredictionLeg>,
+}
+
+impl PredictionSeriesSubscriptionQuery {
+    /// Returns the route this query addresses.
+    pub const fn route(&self) -> &VenueRoute {
+        &self.event.route
+    }
+}
+
 /// Builds a typed "field has a value the boundary rejects" error.
 pub(crate) fn invalid_field(field: &'static str, value: &'static str) -> ModelError {
     ModelError::InvalidField {

@@ -6,6 +6,7 @@ use market_participants_model::{
         listing_impl::ListingStatus,
         route::{VenueListingKey, VenueRoute},
     },
+    prediction::{PredictionEventRef, PredictionLeg},
     routing::CapabilityId,
 };
 
@@ -13,18 +14,18 @@ use super::{
     domain::{MarketSelector, require_listing_route},
     error::{MarketError, market_error_from_catalog},
     helpers::subscribe,
-    streams::ForceOrderStream,
+    streams::{ForceOrderStream, PredictionSeriesStream},
     timeframe::{Adjustment, TimeFrame},
 };
 use crate::{
-    adapter::AdapterLimits,
+    adapter::{AdapterLimits, ProtocolRequest},
     catalog::{
         error::CatalogError,
         resolved::{EnsuredRoute, ResolvedListing},
         store::Catalog,
     },
     connector::MarketParticipantsConnectorInner,
-    market_participants::model::ForceOrderSubscriptionQuery,
+    market_participants::model::{ForceOrderSubscriptionQuery, PredictionSeriesSubscriptionQuery},
 };
 
 /// One catalog row a route publishes, as a caller reads it.
@@ -162,6 +163,36 @@ impl MarketCapability {
         MarketSelector::new(self.clone(), route)
     }
 
+    /// Reads one page of prediction events of one venue.
+    ///
+    /// The facade resolves every loaded scope that declares prediction events,
+    /// so a Hyperliquid venue's deployer scopes are merged into one page and a
+    /// Polymarket scope's server cursor is passed through.
+    pub fn prediction_events(
+        &self,
+        request: super::prediction::PredictionEventsRequest,
+    ) -> super::prediction::PredictionEventsBuilder {
+        super::prediction::PredictionEventsBuilder::new(self.clone(), request)
+    }
+
+    /// Reads one prediction event and every leg it publishes.
+    pub fn prediction_event(
+        &self,
+        event: market_participants_model::prediction::PredictionEventRef,
+    ) -> super::prediction::PredictionEventBuilder {
+        super::prediction::PredictionEventBuilder::new(self.clone(), event)
+    }
+
+    /// Reads the probability series of one prediction event.
+    pub fn prediction_series(
+        &self,
+        event: market_participants_model::prediction::PredictionEventRef,
+        legs: Vec<market_participants_model::prediction::PredictionLeg>,
+        window: market_participants_model::prediction::PredictionWindow,
+    ) -> super::prediction::PredictionSeriesBuilder {
+        super::prediction::PredictionSeriesBuilder::new(self.clone(), event, legs, window)
+    }
+
     /// Returns every listing of one route the published catalog holds.
     ///
     /// The read is answered from the published snapshot alone, so a route nothing
@@ -219,5 +250,28 @@ impl MarketCapability {
     ) -> Result<ForceOrderStream, MarketError> {
         self.subscribe_force_order(ForceOrderSubscriptionQuery { route })
             .await
+    }
+
+    /// Subscribes to the live probabilities of one prediction event's legs.
+    ///
+    /// The stream is event-scoped rather than listing-scoped: a prediction leg's
+    /// venue-native identity is discovered with the event and is not a catalog
+    /// listing, so the request carries the legs themselves.
+    pub async fn subscribe_prediction_series(
+        &self,
+        event: PredictionEventRef,
+        legs: Vec<PredictionLeg>,
+    ) -> Result<PredictionSeriesStream, MarketError> {
+        let route = event.route.clone();
+        let handle = subscribe(
+            self,
+            route,
+            ProtocolRequest::SubscribePredictionSeries(PredictionSeriesSubscriptionQuery {
+                event,
+                legs,
+            }),
+        )
+        .await?;
+        Ok(PredictionSeriesStream::from_handle(handle))
     }
 }

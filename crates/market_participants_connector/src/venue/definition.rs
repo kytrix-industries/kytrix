@@ -173,7 +173,7 @@ pub fn venues_supporting(capability: CapabilityId) -> Vec<VenueId> {
 /// here — the four entries and the four arms are the same four — and a venue the
 /// identity gains before its loader lands is the one that would be carried without an
 /// entry, which is the state this table and [`definition_of`] would have to separate.
-static SERVED: [VenueDefinition; 4] = [
+static SERVED: [VenueDefinition; 5] = [
     VenueDefinition {
         venue: VenueId::Binance,
         capabilities: BINANCE_CAPABILITIES,
@@ -200,6 +200,12 @@ static SERVED: [VenueDefinition; 4] = [
         loader: &LONGBRIDGE_LOADER,
         requires_credentials_to_load: true,
     },
+    VenueDefinition {
+        venue: VenueId::Polymarket,
+        capabilities: POLYMARKET_CAPABILITIES,
+        loader: &POLYMARKET_LOADER,
+        requires_credentials_to_load: false,
+    },
 ];
 
 /// Returns the definition of one venue.
@@ -223,6 +229,7 @@ pub(crate) fn definition_of(venue: VenueId) -> &'static VenueDefinition {
         VenueId::Okx => &SERVED[1],
         VenueId::Hyperliquid => &SERVED[2],
         VenueId::Longbridge => &SERVED[3],
+        VenueId::Polymarket => &SERVED[4],
     }
 }
 
@@ -302,11 +309,12 @@ impl VenueLoader for HyperliquidLoader {
             // that stopped at this build's own bound — fails the whole load.
             // Nothing is truncated and nothing is skipped: the load reports
             // the deployment, or the bound, and commits nothing.
-            let (deployed, metadata) = match reading {
+            let (deployed, outcome_scopes, metadata) = match reading {
                 VenueReading::Verified {
                     deployments,
+                    outcome_scopes,
                     metadata,
-                } => (deployments, metadata),
+                } => (deployments, outcome_scopes, metadata),
                 VenueReading::Unverifiable { dex } => {
                     return Err(VenueLoadError::DiscoveryUnverifiable { venue, dex });
                 }
@@ -328,6 +336,16 @@ impl VenueLoader for HyperliquidLoader {
                 })?;
                 scopes.push(specs::entry_of_descriptor(&descriptor));
             }
+            for scope in outcome_scopes {
+                let descriptor = crate::adapter::hyperliquid::catalog::outcome_venue_descriptor(
+                    scope,
+                )
+                .map_err(|source| VenueLoadError::Discovery {
+                    venue,
+                    source: Box::new(source),
+                })?;
+                scopes.push(specs::entry_of_descriptor(&descriptor));
+            }
             Ok(VenueLoadData { scopes, metadata })
         })
     }
@@ -339,6 +357,18 @@ impl VenueLoader for HyperliquidLoader {
 /// discover: what it publishes is the static table's answer, and the market data
 /// behind those scopes is read through the venue's own authenticated socket rather
 /// than through a second discovery conversation.
+struct PolymarketLoader;
+
+impl VenueLoader for PolymarketLoader {
+    fn load<'a>(
+        &'a self,
+        config: &'a VenueConfig,
+        cancel: &'a LoadCancellation,
+    ) -> BoxFuture<'a, Result<VenueLoadData, VenueLoadError>> {
+        Box::pin(constant_load(*config.venue(), cancel))
+    }
+}
+
 struct LongbridgeLoader;
 
 impl VenueLoader for LongbridgeLoader {
@@ -377,6 +407,8 @@ static OKX_LOADER: OkxLoader = OkxLoader;
 static HYPERLIQUID_LOADER: HyperliquidLoader = HyperliquidLoader;
 /// The one Longbridge loader instance.
 static LONGBRIDGE_LOADER: LongbridgeLoader = LongbridgeLoader;
+/// The one Polymarket loader instance.
+static POLYMARKET_LOADER: PolymarketLoader = PolymarketLoader;
 
 /// Every capability Binance's loader can produce.
 const BINANCE_CAPABILITIES: &[CapabilityId] = &[
@@ -433,6 +465,8 @@ const HYPERLIQUID_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::Tickers,
     CapabilityId::AllTickers,
     CapabilityId::OrderBook,
+    CapabilityId::PredictionEvents,
+    CapabilityId::PredictionSeries,
     CapabilityId::Wallet,
     CapabilityId::AuthenticatedTrading,
     CapabilityId::AccountOrders,
@@ -452,4 +486,13 @@ const LONGBRIDGE_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::MarketCatalog,
     CapabilityId::Candlesticks,
     CapabilityId::Tickers,
+];
+
+/// Every capability Polymarket's loader can produce.
+///
+/// The venue publishes events and probability history; it publishes no catalog
+/// this build stages, so the scope carries no catalog source.
+const POLYMARKET_CAPABILITIES: &[CapabilityId] = &[
+    CapabilityId::PredictionEvents,
+    CapabilityId::PredictionSeries,
 ];

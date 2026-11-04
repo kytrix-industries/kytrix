@@ -21,6 +21,7 @@ mod budget;
 pub(crate) mod catalog;
 mod codec;
 mod heartbeat;
+pub(crate) mod prediction;
 mod signing;
 mod types;
 

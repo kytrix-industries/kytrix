@@ -518,6 +518,8 @@ pub const SWAP_SCOPE: &str = "swap";
 pub const CORE_SPOT_SCOPE: &str = "core-spot";
 /// The HyperCore perpetual scope.
 pub const CORE_PERP_SCOPE: &str = "core-perp";
+/// The canonical name of Polymarket's event scope.
+pub const PREDICT_SCOPE: &str = "predict";
 /// The US-equity scope of Longbridge.
 pub const LONGBRIDGE_US_SCOPE: &str = "us";
 /// The canonical scope every Hyperliquid wallet-monitor connection is keyed by.

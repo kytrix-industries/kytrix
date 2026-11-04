@@ -27,6 +27,7 @@ news = { workspace = true }
 order_book = { workspace = true }
 perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
+prediction_chart = { workspace = true }
 solana_wallet = { workspace = true }
 x = { workspace = true }
 volume_heatmap = { workspace = true }

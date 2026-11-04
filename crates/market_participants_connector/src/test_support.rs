@@ -254,6 +254,13 @@ pub(crate) async fn info_fixture_server_with_readings(
                             };
                             format!("[{},[]]", meta.unwrap_or_else(|| "null".to_owned()))
                         }
+                        // A venue reading now also carries the HIP-4 outcome table
+                        // and its templates. A fixture that serves no outcomes is a
+                        // venue with no outcome scopes, which is the shape every
+                        // pre-HIP-4 fixture means.
+                        "outcomeMeta" => r#"{"outcomes":[],"questions":[]}"#.to_owned(),
+                        "outcomeTemplates" => "[]".to_owned(),
+                        "allMids" => "{}".to_owned(),
                         _ => "null".to_owned(),
                     };
                     let response = format!(

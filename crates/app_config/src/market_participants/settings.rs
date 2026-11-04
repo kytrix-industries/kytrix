@@ -36,7 +36,8 @@ use crate::{
         origins::{
             BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin, HyperliquidHttpOrigin,
             HyperliquidWebsocketOrigin, LongbridgeRegion, OkxRegion, OriginPair, OriginRef,
-            published_url,
+            PolymarketClobOrigin, PolymarketGammaOrigin, PolymarketWebsocketOrigin, ServiceOrigin,
+            VenueEndpoints, published_url,
         },
     },
     network::ProxyRoute,
@@ -56,6 +57,8 @@ pub const HYPERLIQUID_CORE_SPOT: &str = "core-spot";
 pub const HYPERLIQUID_CORE_PERP: &str = "core-perp";
 /// The canonical name of Longbridge's US-equity scope.
 pub const LONGBRIDGE_US: &str = "us";
+/// The canonical name of Polymarket's event scope.
+pub const POLYMARKET_PREDICT: &str = "predict";
 
 /// One venue's settings, exactly as the file stores them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,8 @@ pub enum VenueSettings {
     Okx(OkxSettings),
     #[serde(rename = "longbridge")]
     Longbridge(LongbridgeSettings),
+    #[serde(rename = "polymarket")]
+    Polymarket(PolymarketSettings),
 }
 
 /// The addresses one venue's scopes are dialed at instead of the ones it publishes.
@@ -425,6 +430,73 @@ impl LongbridgeSettings {
     }
 }
 
+/// Polymarket's settings: the event directory, the CLOB and the CLOB stream.
+///
+/// The venue is one market participant reached on two HTTP hosts: Gamma publishes
+/// the event directory and CLOB publishes prices and history. The CLOB is the
+/// primary transport — it is what a prediction leg's probability is read from —
+/// and Gamma is the metadata service beside it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PolymarketSettings {
+    /// The line this venue's requests take, or nothing while it follows the
+    /// document's default line.
+    #[serde(rename = "proxy")]
+    pub proxy: Option<ProxyRoute>,
+    /// The event-directory host.
+    #[serde(rename = "gamma")]
+    pub gamma: PolymarketGammaOrigin,
+    /// The CLOB host.
+    #[serde(rename = "clob")]
+    pub clob: PolymarketClobOrigin,
+    /// The CLOB stream host.
+    #[serde(rename = "websocket")]
+    pub websocket: PolymarketWebsocketOrigin,
+    /// The addresses this venue's scopes are dialed at, which a test's fixture fills in.
+    #[serde(skip)]
+    pub bindings: Bindings,
+}
+
+impl PartialEq for PolymarketSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.proxy == other.proxy
+            && self.gamma == other.gamma
+            && self.clob == other.clob
+            && self.websocket == other.websocket
+    }
+}
+
+impl Eq for PolymarketSettings {}
+
+impl PolymarketSettings {
+    /// Returns the endpoints the venue is dialed at.
+    pub fn addresses(&self) -> VenueEndpoints {
+        #[cfg(feature = "test-support")]
+        if let Some(primary) = self.bindings.get(POLYMARKET_PREDICT) {
+            return VenueEndpoints {
+                primary: primary.origins(),
+                metadata: Some(ServiceOrigin {
+                    http: self
+                        .bindings
+                        .get("gamma")
+                        .map_or_else(|| primary.http.clone(), |gamma| gamma.http.clone()),
+                    websocket: None,
+                }),
+            };
+        }
+
+        VenueEndpoints {
+            primary: OriginPair {
+                http: published_url(&OriginRef::published(self.clob.as_str())),
+                websocket: published_url(&OriginRef::published(self.websocket.as_str())),
+            },
+            metadata: Some(ServiceOrigin {
+                http: published_url(&OriginRef::published(self.gamma.as_str())),
+                websocket: None,
+            }),
+        }
+    }
+}
+
 impl VenueSettings {
     /// Returns the scopes this venue publishes statically, in the order its page
     /// draws them.
@@ -440,6 +512,7 @@ impl VenueSettings {
             Self::Hyperliquid(_) => &[HYPERLIQUID_CORE_SPOT, HYPERLIQUID_CORE_PERP],
             Self::Okx(_) => &[OKX_SPOT, OKX_SWAP],
             Self::Longbridge(_) => &[LONGBRIDGE_US],
+            Self::Polymarket(_) => &[POLYMARKET_PREDICT],
         }
     }
 
@@ -460,6 +533,7 @@ impl VenueSettings {
             Self::Hyperliquid(_) => HYPERLIQUID_CORE_PERP,
             Self::Okx(_) => OKX_SPOT,
             Self::Longbridge(_) => LONGBRIDGE_US,
+            Self::Polymarket(_) => POLYMARKET_PREDICT,
         }
     }
 
@@ -475,6 +549,7 @@ impl VenueSettings {
             Self::Hyperliquid(_) => HYPERLIQUID_CORE_PERP,
             Self::Okx(_) => OKX_SPOT,
             Self::Longbridge(_) => LONGBRIDGE_US,
+            Self::Polymarket(_) => POLYMARKET_PREDICT,
         }
     }
 
@@ -485,18 +560,41 @@ impl VenueSettings {
     /// [`Self::primary_scope`]. A name that is neither — a hand-written file, a route from
     /// another build — is answered by nobody.
     pub fn origins(&self, scope: &str) -> Option<OriginPair> {
+        self.endpoints(scope).map(|endpoints| endpoints.primary)
+    }
+
+    /// Returns every endpoint one scope of this venue is dialed at.
+    ///
+    /// The primary pair is what the venue's market data is read from, and the
+    /// metadata service is the second host a venue publishes its event directory
+    /// on. Every venue answers the shape; only Polymarket fills `metadata`.
+    pub fn endpoints(&self, scope: &str) -> Option<VenueEndpoints> {
         match self {
             Self::Binance(settings) => BinanceMarket::ALL
                 .into_iter()
                 .find(|market| market.scope() == scope)
-                .map(|market| settings.market_addresses(market)),
-            Self::Okx(settings) => {
-                matches!(scope, OKX_SPOT | OKX_SWAP).then(|| settings.addresses())
-            }
-            Self::Longbridge(settings) => (scope == LONGBRIDGE_US).then(|| settings.addresses()),
+                .map(|market| VenueEndpoints {
+                    primary: settings.market_addresses(market),
+                    metadata: None,
+                }),
+            Self::Okx(settings) => matches!(scope, OKX_SPOT | OKX_SWAP).then(|| VenueEndpoints {
+                primary: settings.addresses(),
+                metadata: None,
+            }),
+            Self::Longbridge(settings) => (scope == LONGBRIDGE_US).then(|| VenueEndpoints {
+                primary: settings.addresses(),
+                metadata: None,
+            }),
             Self::Hyperliquid(settings) => {
-                matches!(scope, HYPERLIQUID_CORE_SPOT | HYPERLIQUID_CORE_PERP)
-                    .then(|| settings.addresses())
+                matches!(scope, HYPERLIQUID_CORE_SPOT | HYPERLIQUID_CORE_PERP).then(|| {
+                    VenueEndpoints {
+                        primary: settings.addresses(),
+                        metadata: None,
+                    }
+                })
+            }
+            Self::Polymarket(settings) => {
+                (scope == POLYMARKET_PREDICT).then(|| settings.addresses())
             }
         }
     }
@@ -521,6 +619,7 @@ impl VenueSettings {
             Self::Hyperliquid(settings) => settings.proxy.clone(),
             Self::Okx(settings) => settings.proxy.clone(),
             Self::Longbridge(settings) => settings.proxy.clone(),
+            Self::Polymarket(settings) => settings.proxy.clone(),
         }
     }
 
@@ -535,6 +634,7 @@ impl VenueSettings {
             Self::Hyperliquid(settings) => &mut settings.proxy,
             Self::Okx(settings) => &mut settings.proxy,
             Self::Longbridge(settings) => &mut settings.proxy,
+            Self::Polymarket(settings) => &mut settings.proxy,
         }
     }
 
@@ -565,6 +665,12 @@ impl VenueSettings {
                     .map(bind)
                     .collect();
             }
+            Self::Polymarket(settings) => {
+                settings.bindings = [POLYMARKET_PREDICT, "gamma"]
+                    .into_iter()
+                    .map(bind)
+                    .collect();
+            }
         }
     }
 
@@ -575,6 +681,7 @@ impl VenueSettings {
             Self::Hyperliquid(settings) => settings.proxy = proxy,
             Self::Okx(settings) => settings.proxy = proxy,
             Self::Longbridge(settings) => settings.proxy = proxy,
+            Self::Polymarket(settings) => settings.proxy = proxy,
         }
     }
 
@@ -612,6 +719,9 @@ impl VenueSettings {
                 let credentials = VenueCredentials::Longbridge(settings.credentials.clone());
                 credentials.validate_venue(venue)
             }
+            // Polymarket's market data is public: this build stores no credential
+            // for it, so there is no set to be incomplete.
+            Self::Polymarket(_) => Ok(false),
         }
     }
 }
@@ -631,6 +741,7 @@ pub fn default_venues() -> BTreeMap<VenueId, VenueSettings> {
                 VenueId::Hyperliquid => VenueSettings::Hyperliquid(HyperliquidSettings::default()),
                 VenueId::Okx => VenueSettings::Okx(OkxSettings::default()),
                 VenueId::Longbridge => VenueSettings::Longbridge(LongbridgeSettings::default()),
+                VenueId::Polymarket => VenueSettings::Polymarket(PolymarketSettings::default()),
             };
             (venue, settings)
         })
@@ -758,7 +869,7 @@ mod tests {
                 .keys()
                 .map(|venue| venue.as_str())
                 .collect::<Vec<_>>(),
-            ["binance", "hyperliquid", "longbridge", "okx"],
+            ["binance", "hyperliquid", "longbridge", "okx", "polymarket"],
             "the built-in table names every venue this build speaks"
         );
 

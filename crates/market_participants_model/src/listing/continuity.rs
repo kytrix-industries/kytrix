@@ -7,15 +7,15 @@ use crate::{
     asset::{SecurityIssuerId, ShareClassId},
     error::ModelError,
     identifier::{
-        CanonicalEncoder, CanonicalTerms, CtfConditionId, CtfTokenId, EquityLocalCode, Mic,
-        NativeSymbol, VenueScopeId,
+        CanonicalEncoder, CanonicalTerms, CtfConditionId, EquityLocalCode, Mic, NativeSymbol,
+        VenueScopeId,
     },
     listing::{
         continuity_series::{FutureSeriesIdentifiers, OptionSeriesIdentifiers},
         route::{VenueListingKey, VenueRoute},
         venue::{
             BinanceProduct, HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidOutcomeId,
-            OkxInstrumentType, VenueListingId,
+            OkxInstrumentType, PolymarketAssetId, PolymarketProtocolVersion, VenueListingId,
         },
     },
 };
@@ -64,8 +64,10 @@ pub enum ListingContinuityTerms {
     Polymarket {
         #[serde(rename = "condition_id")]
         condition_id: CtfConditionId,
-        #[serde(rename = "clob_token_id")]
-        clob_token_id: CtfTokenId,
+        #[serde(rename = "asset_id")]
+        asset_id: PolymarketAssetId,
+        #[serde(rename = "protocol")]
+        protocol: PolymarketProtocolVersion,
     },
     #[serde(rename = "equity")]
     Equity {
@@ -94,9 +96,10 @@ impl ListingContinuityTerms {
             Self::HyperliquidAsset { .. } | Self::HyperliquidOutcome { .. } => Ok(()),
             Self::Polymarket {
                 condition_id,
-                clob_token_id,
+                asset_id,
+                ..
             } => {
-                if condition_id.as_str().is_empty() || clob_token_id.as_str().is_empty() {
+                if condition_id.as_str().is_empty() || asset_id.as_str().is_empty() {
                     return Err(ModelError::InvalidListingContinuityTerms {
                         field: "polymarket identifier without a condition or token",
                     });
@@ -162,10 +165,12 @@ impl CanonicalTerms for ListingContinuityTerms {
             }
             Self::Polymarket {
                 condition_id,
-                clob_token_id,
+                asset_id,
+                protocol,
             } => {
                 encoder.write_label(condition_id.as_str());
-                encoder.write_label(clob_token_id.as_str());
+                encoder.write_label(asset_id.as_str());
+                encoder.write_label(protocol.label());
             }
             Self::Equity {
                 issuer,
@@ -249,8 +254,10 @@ enum ListingContinuityTermsWire {
     Polymarket {
         #[serde(rename = "condition_id")]
         condition_id: CtfConditionId,
-        #[serde(rename = "clob_token_id")]
-        clob_token_id: CtfTokenId,
+        #[serde(rename = "asset_id")]
+        asset_id: PolymarketAssetId,
+        #[serde(rename = "protocol")]
+        protocol: PolymarketProtocolVersion,
     },
     #[serde(rename = "equity")]
     Equity {
@@ -306,10 +313,12 @@ impl From<ListingContinuityTermsWire> for ListingContinuityTerms {
             },
             ListingContinuityTermsWire::Polymarket {
                 condition_id,
-                clob_token_id,
+                asset_id,
+                protocol,
             } => Self::Polymarket {
                 condition_id,
-                clob_token_id,
+                asset_id,
+                protocol,
             },
             ListingContinuityTermsWire::Equity {
                 issuer,

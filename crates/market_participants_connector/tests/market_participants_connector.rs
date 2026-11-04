@@ -38,8 +38,8 @@ async fn root_constructs_with_an_empty_registry() {
     );
     assert_eq!(
         connector.supported_venues().len(),
-        4,
-        "the four implemented venues are declared"
+        5,
+        "the five implemented venues are declared"
     );
     assert!(
         connector.catalog().route_set().is_none(),

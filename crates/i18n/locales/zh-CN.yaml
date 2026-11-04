@@ -503,6 +503,11 @@ error:
     protocol: X API 协议错误：%{detail}
     server: X API 返回 HTTP %{status}
     timeout: X API 请求超时
+  prediction_chart:
+    no_markets: 该预测事件没有可交易市场
+    timeout: 预测请求在 %{seconds} 秒后超时
+  prediction_selector:
+    interrupted: 预测事件读取任务异常终止
 instrument_selector:
   empty: 暂无可用交易品种
   filter_placeholder: 筛选交易对
@@ -858,6 +863,11 @@ widget:
     select_instrument: 选择标的
     select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
     table: 最近市场成交
+  prediction_chart:
+    more_lines: 还有 %{count} 条
+    select_event: 选择预测事件
+    select_market: 选择市场
+    select_market_group: 选择市场分类
   names:
     candlestick: K 线
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
@@ -875,6 +885,7 @@ widget:
     open_interest: 持仓量
     order_book: 订单簿
     pentagon_pizza_index: 五角大楼披萨指数
+    prediction_chart: 预测概率图
     solana_wallet: Solana 钱包监控
     taker_volume: 主动买卖量
     top_trader_account_ratio: 大户账户多空比
@@ -1151,6 +1162,10 @@ settings_ui:
     enter_passphrase: 请输入 Passphrase
     enter_private_key: 请输入 Private Key
     enter_secret_key: 请输入 Secret Key
+    clob_origin: CLOB 地址
+    clob_origin_description: 读取 Polymarket 价格与概率历史的地址
+    gamma_origin: 事件目录地址
+    gamma_origin_description: 读取 Polymarket 事件的地址
     http_origin: HTTP 地址
     hyperliquid_http_origin_description: HyperCore 请求发送的地址，该场所只发布一个
     hyperliquid_websocket_origin_description: HyperCore 建立订阅的地址，该场所只发布一个
@@ -1159,6 +1174,7 @@ settings_ui:
     origins: 来源地址
     passphrase: Passphrase
     passphrase_description: 创建该 API Key 时设置的 Passphrase
+    polymarket_websocket_description: Polymarket CLOB 发布订阅的地址
     private_key_description: 该场所请求签名使用的私钥
     secret_key: Secret Key
     secret_key_description: 该场所请求认证使用的 Secret Key
@@ -1238,3 +1254,14 @@ venue:
   hyperliquid: Hyperliquid
   longbridge: 长桥
   okx: 欧易
+  polymarket: Polymarket
+
+prediction_selector:
+  all: 全部
+  more_markets: 还有 %{count} 个市场
+  more_options: 还有 %{count} 个
+  next: 下一页
+  no_matching_events: 暂无相关事件
+  page: 第 %{page} 页
+  previous: 上一页
+  search_placeholder: 搜索预测事件

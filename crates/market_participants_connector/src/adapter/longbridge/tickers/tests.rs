@@ -146,6 +146,7 @@ fn event_name(event: &ProtocolEvent) -> &'static str {
         ProtocolEvent::Position(_) => "a position",
         ProtocolEvent::ForceOrder(_) => "a liquidation",
         ProtocolEvent::HyperliquidWalletUpdate(_) => "a wallet update",
+        ProtocolEvent::PredictionSeries(_) => "prediction series updates",
     }
 }
 

@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use crate::{
     error::ModelError,
     identifier::{
-        BoardId, CtfConditionId, CtfTokenId, EquityLocalCode, IdentifierValue, Mic, NativeSymbol,
+        BoardId, CtfConditionId, EquityLocalCode, IdentifierValue, Mic, NativeSymbol,
         PolymarketEventId, PolymarketMarketId, VenueScopeId,
     },
     instrument::InstrumentKind,
@@ -15,7 +15,7 @@ use crate::{
         route::VenueRoute,
         venue::{
             BinanceProduct, HyperliquidAssetId, HyperliquidOutcomeId, HyperliquidTokenId,
-            OkxInstrumentType,
+            OkxInstrumentType, PolymarketAssetId, PolymarketProtocolVersion,
         },
     },
     outcome::OutcomeSideId,
@@ -277,8 +277,10 @@ pub struct PolymarketListingIdentifiers {
     pub market_id: PolymarketMarketId,
     #[serde(rename = "condition_id")]
     pub condition_id: CtfConditionId,
-    #[serde(rename = "clob_token_id")]
-    pub clob_token_id: CtfTokenId,
+    #[serde(rename = "asset_id")]
+    pub asset_id: PolymarketAssetId,
+    #[serde(rename = "protocol")]
+    pub protocol: PolymarketProtocolVersion,
     #[serde(rename = "outcome_label")]
     pub outcome_label: SmolStr,
 }
@@ -286,7 +288,7 @@ pub struct PolymarketListingIdentifiers {
 impl PolymarketListingIdentifiers {
     /// Validates the required CTF identifiers and the outcome label.
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.condition_id.as_str().is_empty() || self.clob_token_id.as_str().is_empty() {
+        if self.condition_id.as_str().is_empty() || self.asset_id.as_str().is_empty() {
             return Err(ModelError::InvalidListingContinuityTerms {
                 field: "polymarket listing without a condition or token",
             });

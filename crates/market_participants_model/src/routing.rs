@@ -108,6 +108,12 @@ pub enum CapabilityId {
     AllTickers,
     #[serde(rename = "order_book")]
     OrderBook,
+    /// The event directory of a prediction venue.
+    #[serde(rename = "prediction_events")]
+    PredictionEvents,
+    /// Probability series of prediction-event legs.
+    #[serde(rename = "prediction_series")]
+    PredictionSeries,
     #[serde(rename = "open_interest")]
     OpenInterest,
     #[serde(rename = "long_short_account_ratio")]
@@ -146,6 +152,8 @@ impl CapabilityId {
             Self::Tickers => "tickers",
             Self::AllTickers => "all_tickers",
             Self::OrderBook => "order_book",
+            Self::PredictionEvents => "prediction_events",
+            Self::PredictionSeries => "prediction_series",
             Self::OpenInterest => "open_interest",
             Self::LongShortAccountRatio => "long_short_account_ratio",
             Self::TopTraderAccountRatio => "top_trader_account_ratio",

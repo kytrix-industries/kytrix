@@ -12,9 +12,12 @@ use std::{
 };
 
 use futures::Stream;
-use market_participants_model::market::{
-    book::{ListingCandlestick, ListingForceOrder, ListingOrderBookUpdate, ListingTrade},
-    selection::ListingTicker,
+use market_participants_model::{
+    market::{
+        book::{ListingCandlestick, ListingForceOrder, ListingOrderBookUpdate, ListingTrade},
+        selection::ListingTicker,
+    },
+    prediction::PredictionSeries,
 };
 
 use super::{
@@ -150,6 +153,42 @@ impl Stream for TickerStream {
                     return Poll::Ready(Some(
                         ticker(&listing, &data, &self.units).map_err(MarketError::from),
                     ));
+                }
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error.into()))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// One live probability stream of one prediction event.
+pub struct PredictionSeriesStream {
+    inner: ProtocolStream,
+    status: tokio::sync::watch::Receiver<SubscriptionStatus>,
+}
+
+impl PredictionSeriesStream {
+    pub(crate) fn from_handle(handle: SubscriptionHandle) -> Self {
+        let status = map_status(handle.observe_status());
+        Self {
+            inner: handle.into_stream(),
+            status,
+        }
+    }
+}
+
+stream_lifecycle!(PredictionSeriesStream);
+
+impl Stream for PredictionSeriesStream {
+    type Item = Result<Vec<PredictionSeries>, MarketError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(ProtocolEvent::PredictionSeries(series)))) => {
+                    return Poll::Ready(Some(Ok(series)));
                 }
                 Poll::Ready(Some(Ok(_))) => continue,
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error.into()))),

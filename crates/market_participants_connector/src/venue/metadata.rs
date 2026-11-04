@@ -32,7 +32,8 @@ use market_participants_model::listing::route::VenueRoute;
 use smol_str::SmolStr;
 
 use crate::adapter::hyperliquid::{
-    HyperliquidActiveContextValues, HyperliquidMetaResponse, HyperliquidPerpDex,
+    HyperliquidActiveContextValues, HyperliquidMetaResponse, HyperliquidOutcomeQuestion,
+    HyperliquidOutcomeSpec, HyperliquidOutcomeTemplate, HyperliquidPerpDex,
     HyperliquidSpotMetaResponse,
 };
 
@@ -47,6 +48,8 @@ pub(crate) enum ScopeMetadata {
     /// A perpetual scope: its assets, its contexts, its position in the venue's
     /// deployment table and the token it settles in.
     Perp(PerpRouteMeta),
+    /// A HIP-4 outcome scope: its deployer's outcomes, questions and templates.
+    Outcome(OutcomeRouteMeta),
 }
 
 impl ScopeMetadata {
@@ -55,8 +58,15 @@ impl ScopeMetadata {
         match self {
             Self::Spot(meta) => &meta.contexts,
             Self::Perp(meta) => &meta.contexts,
+            Self::Outcome(_) => empty_contexts(),
         }
     }
+}
+
+/// The empty context table an outcome scope answers.
+fn empty_contexts() -> &'static RouteContexts {
+    static EMPTY: std::sync::OnceLock<RouteContexts> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(RouteContexts::new)
 }
 
 /// One spot scope's venue metadata.
@@ -75,6 +85,16 @@ pub(crate) struct PerpRouteMeta {
     pub contexts: RouteContexts,
     /// The token name the DEX settles in.
     pub collateral: SmolStr,
+}
+
+/// One HIP-4 outcome scope's venue metadata.
+#[derive(Debug)]
+pub(crate) struct OutcomeRouteMeta {
+    /// The deployer namespace, or nothing for the recurring core scope.
+    pub deployer: Option<SmolStr>,
+    pub outcomes: Vec<HyperliquidOutcomeSpec>,
+    pub questions: Vec<HyperliquidOutcomeQuestion>,
+    pub templates: Vec<HyperliquidOutcomeTemplate>,
 }
 
 /// One venue's route metadata, committed with the venue that published it.
@@ -149,6 +169,8 @@ pub(crate) enum VenueReading {
     Verified {
         /// The deployed scopes, in the venue's own order.
         deployments: Vec<SmolStr>,
+        /// The HIP-4 outcome scopes this reading covered.
+        outcome_scopes: Vec<market_participants_model::identifier::VenueScopeId>,
         /// The route metadata of every scope the reading covered.
         metadata: Arc<VenueMetadata>,
     },

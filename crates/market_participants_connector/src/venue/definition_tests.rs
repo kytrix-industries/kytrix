@@ -52,6 +52,7 @@ impl VenueConversation for NoDeployments {
         Box::pin(async {
             Ok(VenueReading::Verified {
                 deployments: Vec::new(),
+                outcome_scopes: Vec::new(),
                 metadata: std::sync::Arc::new(VenueMetadata::empty()),
             })
         })
@@ -86,7 +87,7 @@ async fn scope_names(venue: &VenueId) -> Vec<String> {
 /// actually produces, so the venue-level list the unloaded hints read cannot
 /// claim a capability no scope of that venue carries.
 #[tokio::test]
-async fn the_definition_table_lists_four_venues() {
+async fn the_definition_table_lists_every_venue() {
     let venues = supported_venues();
 
     assert_eq!(
@@ -95,9 +96,10 @@ async fn the_definition_table_lists_four_venues() {
             venue("binance"),
             venue("okx"),
             venue("hyperliquid"),
-            venue("longbridge")
+            venue("longbridge"),
+            venue("polymarket")
         ],
-        "the build speaks four venues, and longbridge is the last of them"
+        "the build speaks five venues, and polymarket is the last of them"
     );
     assert_eq!(
         supported_venues(),
@@ -105,7 +107,7 @@ async fn the_definition_table_lists_four_venues() {
         "the venue list has one order for every caller"
     );
 
-    for name in ["binance", "okx", "hyperliquid", "longbridge"] {
+    for name in ["binance", "okx", "hyperliquid", "longbridge", "polymarket"] {
         let supported = venue(name);
         let definition = definition_of(supported);
         assert_eq!(
@@ -128,10 +130,23 @@ async fn the_definition_table_lists_four_venues() {
         vec!["core-spot", "core-perp"]
     );
     assert_eq!(scope_names(&venue("longbridge")).await, vec!["us"]);
+    assert_eq!(scope_names(&venue("polymarket")).await, vec!["predict"]);
 
     for supported in &venues {
         let definition = definition_of(*supported);
         let mut declared: Vec<CapabilityId> = definition.capabilities.to_vec();
+        // The fixture reading publishes no HIP-4 outcomes, so the dynamic
+        // outcome scopes are absent from the fixture's scope set. The venue's
+        // static definition still states the capabilities a real reading can
+        // publish; the outcome-scope test below covers that half.
+        if *supported == venue("hyperliquid") {
+            declared.retain(|capability| {
+                !matches!(
+                    capability,
+                    CapabilityId::PredictionEvents | CapabilityId::PredictionSeries
+                )
+            });
+        }
         declared.sort_unstable();
         let mut produced: Vec<CapabilityId> = load(supported)
             .await
@@ -176,9 +191,10 @@ fn the_definition_table_covers_every_venue_this_build_serves() {
             venue("binance"),
             venue("okx"),
             venue("hyperliquid"),
-            venue("longbridge")
+            venue("longbridge"),
+            venue("polymarket")
         ],
-        "the served set is exactly the four product venues, in product order"
+        "the served set is exactly the five product venues, in product order"
     );
 
     let mut all: Vec<VenueId> = VenueId::ALL.to_vec();

@@ -4,6 +4,7 @@ pub mod builders;
 pub mod domain;
 pub mod error;
 mod helpers;
+pub mod prediction;
 pub mod provider;
 #[cfg(test)]
 mod provider_tests;

@@ -94,9 +94,12 @@ pub enum HyperliquidInfoRequest {
     },
     #[serde(rename = "perpDexs")]
     PerpDexs,
-    #[cfg(test)]
     #[serde(rename = "outcomeMeta")]
     OutcomeMeta,
+    #[serde(rename = "outcomeTemplates")]
+    OutcomeTemplates,
+    #[serde(rename = "allMids")]
+    AllMids,
     #[cfg(test)]
     #[serde(rename = "settledOutcome")]
     SettledOutcome { outcome: u64 },
@@ -128,10 +131,13 @@ impl HyperliquidInfoRequest {
             | Self::SpotMetaAndAssetCtxs
             | Self::Meta { .. }
             | Self::MetaAndAssetCtxs { .. }
-            | Self::PerpDexs => 20,
-            // The two requests only a test can make are not in the venue's table.
+            | Self::PerpDexs
+            | Self::OutcomeMeta
+            | Self::OutcomeTemplates
+            | Self::AllMids => 20,
+            // The one request only a test can make is not in the venue's table.
             #[cfg(test)]
-            Self::OutcomeMeta | Self::SettledOutcome { .. } => 20,
+            Self::SettledOutcome { .. } => 20,
         }
     }
 }
@@ -159,6 +165,8 @@ pub struct HyperliquidCandle {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum HyperliquidSubscription {
+    #[serde(rename = "allMids")]
+    AllMids,
     #[serde(rename = "candle")]
     Candle { coin: SmolStr, interval: SmolStr },
     #[serde(rename = "trades")]
@@ -351,27 +359,87 @@ pub struct HyperliquidActiveContextValues {
 
 /// One outcome of the venue's outcome metadata.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg(test)]
 pub struct HyperliquidOutcomeSpec {
     pub outcome: u64,
     pub name: SmolStr,
     pub description: SmolStr,
     #[serde(rename = "sideSpecs")]
     pub side_specs: Vec<HyperliquidOutcomeSideSpec>,
+    /// The token the outcome settles in.
+    #[serde(rename = "quoteToken", default)]
+    pub quote_token: Option<SmolStr>,
+    /// The deployer namespace the outcome belongs to; absent for the recurring core.
+    #[serde(default)]
+    pub venue: Option<SmolStr>,
 }
 
 /// One tradable side of an outcome, named by the venue.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg(test)]
 pub struct HyperliquidOutcomeSideSpec {
     pub name: SmolStr,
 }
 
+/// One HIP-4 question: a set of named outcomes that settle together.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg(test)]
-pub struct HyperliquidOutcomeMetaResponse {
-    pub outcomes: Vec<HyperliquidOutcomeSpec>,
+pub struct HyperliquidOutcomeQuestion {
+    pub question: u64,
+    pub name: SmolStr,
+    pub description: SmolStr,
+    #[serde(rename = "fallbackOutcome")]
+    pub fallback_outcome: u64,
+    #[serde(rename = "namedOutcomes", default)]
+    pub named_outcomes: Vec<u64>,
+    #[serde(rename = "settledNamedOutcomes", default)]
+    pub settled_named_outcomes: Vec<u64>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidOutcomeMetaResponse {
+    #[serde(default)]
+    pub outcomes: Vec<HyperliquidOutcomeSpec>,
+    #[serde(default)]
+    pub questions: Vec<HyperliquidOutcomeQuestion>,
+}
+
+/// One HIP-4 outcome template.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidOutcomeTemplate {
+    pub id: SmolStr,
+    pub role: HyperliquidOutcomeTemplateRole,
+    pub name: SmolStr,
+    #[serde(default)]
+    pub description: SmolStr,
+}
+
+/// The role a template plays.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum HyperliquidOutcomeTemplateRole {
+    /// A question template, or any other role the venue names with a string.
+    Kind(SmolStr),
+    /// A standalone outcome template with its side names.
+    Detailed {
+        #[serde(rename = "standaloneOutcome", default)]
+        standalone_outcome: Option<HyperliquidStandaloneOutcomeRole>,
+        #[serde(rename = "questionOutcome", default)]
+        question_outcome: Option<HyperliquidQuestionOutcomeRole>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidStandaloneOutcomeRole {
+    #[serde(rename = "sideNames", default)]
+    pub side_names: Vec<SmolStr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidQuestionOutcomeRole {
+    #[serde(default)]
+    pub parent: SmolStr,
+}
+
+/// The venue's current mid price of every coin.
+pub type HyperliquidAllMids = std::collections::BTreeMap<SmolStr, SmolStr>;
 
 /// The settlement of one outcome, as the venue reports it once it is settled.
 ///

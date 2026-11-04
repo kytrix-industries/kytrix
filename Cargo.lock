@@ -4941,6 +4941,7 @@ name = "instrument_selector_ui"
 version = "0.0.3"
 dependencies = [
  "app_config",
+ "app_config_provider",
  "base_ui",
  "gpui-kit",
  "i18n",
@@ -4948,6 +4949,7 @@ dependencies = [
  "market_participants_model",
  "nucleo",
  "smol_str",
+ "time",
  "tokio",
  "widget",
  "widget_tokio_runtime",
@@ -7399,6 +7401,29 @@ name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
+
+[[package]]
+name = "prediction_chart"
+version = "0.0.3"
+dependencies = [
+ "app_config",
+ "app_config_provider",
+ "base_ui",
+ "futures",
+ "gpui-kit",
+ "i18n",
+ "instrument_selector_ui",
+ "market_participants_connector",
+ "market_participants_model",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "widget",
+ "widget_tokio_runtime",
+]
 
 [[package]]
 name = "presser"
@@ -10843,6 +10868,7 @@ dependencies = [
  "order_book",
  "pentagon_pizza_index",
  "perpetual_statistics",
+ "prediction_chart",
  "serde",
  "serde_json",
  "smol_str",

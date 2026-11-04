@@ -1340,7 +1340,8 @@ fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> Cata
             market_id: PolymarketMarketId::new("market-1").expect("the market id is valid"),
             condition_id: CtfConditionId::new("0x".to_owned() + &"1".repeat(64))
                 .expect("the condition id is valid"),
-            clob_token_id: CtfTokenId::new("12345").expect("the token id is valid"),
+            asset_id: CtfTokenId::new("12345").expect("the token id is valid"),
+            protocol: market_participants_model::listing::venue::PolymarketProtocolVersion::V1,
             // the protocol label of a fixture echoes the registry label of
             // the leg it trades, so a test that changes the leg keeps the echo.
             outcome_label: group.members[0]

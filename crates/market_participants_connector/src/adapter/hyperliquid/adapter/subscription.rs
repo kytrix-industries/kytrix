@@ -98,6 +98,21 @@ impl MarketParticipantAdapter for HyperliquidAdapter {
                         crate::adapter::NativeListing::new(listing, ticker),
                     ))
                 }
+                ProtocolRequest::FetchPredictionEvents(query) => {
+                    Ok(ProtocolResponse::PredictionEvents(
+                        super::super::prediction::events(&context, query).await?,
+                    ))
+                }
+                ProtocolRequest::FetchPredictionEvent(query) => {
+                    Ok(ProtocolResponse::PredictionEvent(
+                        super::super::prediction::event(&context, query)?,
+                    ))
+                }
+                ProtocolRequest::FetchPredictionSeries(query) => {
+                    Ok(ProtocolResponse::PredictionSeries(
+                        super::super::prediction::series(&context, query).await?,
+                    ))
+                }
                 ProtocolRequest::FetchAllTickers(query) => {
                     let tickers = adapter.all_tickers(&context, &query.route)?;
                     Ok(ProtocolResponse::Tickers(

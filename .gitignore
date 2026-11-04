@@ -1,5 +1,6 @@
 /target
 .idea
+.openidea
 # Live-test credentials must never be committed; they live in the repository root
 # as `longbridge-test.env` and are read by the ignored `longbridge_live` tests.
 longbridge-test.env

@@ -893,6 +893,8 @@ pub enum VenueId {
     Longbridge,
     #[serde(rename = "okx")]
     Okx,
+    #[serde(rename = "polymarket")]
+    Polymarket,
 }
 
 impl VenueId {
@@ -911,11 +913,12 @@ impl VenueId {
     /// venues this build serves" reads either. The distinction the two sets could take
     /// again is stated on that table, which is the one that would answer nothing for a
     /// venue carried before its loader lands.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Binance,
         Self::Hyperliquid,
         Self::Longbridge,
         Self::Okx,
+        Self::Polymarket,
     ];
 
     /// Returns the canonical venue identity.
@@ -929,6 +932,7 @@ impl VenueId {
             Self::Hyperliquid => "hyperliquid",
             Self::Longbridge => "longbridge",
             Self::Okx => "okx",
+            Self::Polymarket => "polymarket",
         }
     }
 
@@ -1750,13 +1754,13 @@ mod tests {
         assert!(VenueId::from_name("kraken").is_err());
         assert_eq!(
             VenueId::ALL.map(VenueId::as_str),
-            ["binance", "hyperliquid", "longbridge", "okx"],
+            ["binance", "hyperliquid", "longbridge", "okx", "polymarket"],
             "the canonical order is what every venue-keyed map is ordered by"
         );
         assert_eq!(
             VenueId::ALL.len(),
-            4,
-            "the venue set is the four venues this build speaks"
+            5,
+            "the venue set is the five venues this build speaks"
         );
     }
 

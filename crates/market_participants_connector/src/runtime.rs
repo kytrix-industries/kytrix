@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use app_config::{
     market_participants::{
         error::MarketParticipantsConfigError,
-        origins::{BinanceMarket, OriginPair},
+        origins::{BinanceMarket, VenueEndpoints},
         settings::VenueSettings,
     },
     network::NetworkRouteGeneration,
@@ -141,6 +141,8 @@ enum CredentialFingerprint {
     /// and re-signed with — so editing any of them moves the venue's generation, and
     /// a socket dialled for one data centre is never reused for another.
     Longbridge(CredentialState<LongbridgeCredentialValues>),
+    /// Polymarket's market data is public and stores no credential.
+    Polymarket,
 }
 
 impl CredentialFingerprint {
@@ -151,6 +153,7 @@ impl CredentialFingerprint {
             Self::Okx(state) => state.is_configured(),
             Self::Hyperliquid(state) => state.is_configured(),
             Self::Longbridge(state) => state.is_configured(),
+            Self::Polymarket => false,
         }
     }
 }
@@ -264,12 +267,34 @@ impl MarketParticipantNetworkSnapshot {
     /// [`VenueSettings::deployed_origins`], the pair of the scope the venue answers
     /// its own non-scoped conversations on. A venue this build does not configure
     /// answers nothing.
-    pub(crate) fn origins(&self, venue: &VenueId, scope: &VenueScopeId) -> Option<OriginPair> {
+    #[cfg(test)]
+    pub(crate) fn origins(
+        &self,
+        venue: &VenueId,
+        scope: &VenueScopeId,
+    ) -> Option<app_config::market_participants::origins::OriginPair> {
+        self.endpoints(venue, scope)
+            .map(|endpoints| endpoints.primary)
+    }
+
+    /// Returns every endpoint one scope of one venue is reached on.
+    ///
+    /// A scope the venue publishes answers its own settings; a scope it deploys
+    /// is reached through the venue's primary scope and carries no metadata
+    /// service of its own.
+    pub(crate) fn endpoints(
+        &self,
+        venue: &VenueId,
+        scope: &VenueScopeId,
+    ) -> Option<VenueEndpoints> {
         let settings = self.venue_settings(venue)?;
         Some(
             settings
-                .origins(scope.as_str())
-                .unwrap_or_else(|| settings.deployed_origins()),
+                .endpoints(scope.as_str())
+                .unwrap_or_else(|| VenueEndpoints {
+                    primary: settings.deployed_origins(),
+                    metadata: None,
+                }),
         )
     }
 
@@ -285,13 +310,21 @@ impl MarketParticipantNetworkSnapshot {
     /// to the HTTP field, which is exactly the reconfiguration a pool has to
     /// notice.
     pub(crate) fn serves(&self, venue: &VenueId, scope: &VenueScopeId, dialled: &Url) -> bool {
-        self.origins(venue, scope).is_some_and(|origins| {
-            let configured = if is_websocket(dialled) {
-                &origins.websocket
+        self.endpoints(venue, scope).is_some_and(|endpoints| {
+            let primary = if is_websocket(dialled) {
+                &endpoints.primary.websocket
             } else {
-                &origins.http
+                &endpoints.primary.http
             };
-            configured.origin() == dialled.origin()
+            let metadata = endpoints.metadata.as_ref().and_then(|service| {
+                if is_websocket(dialled) {
+                    service.websocket.as_ref()
+                } else {
+                    Some(&service.http)
+                }
+            });
+            primary.origin() == dialled.origin()
+                || metadata.is_some_and(|url| url.origin() == dialled.origin())
         })
     }
 
@@ -461,6 +494,7 @@ impl MarketParticipantNetworkSnapshot {
                     &published_scope(settings.primary_scope()),
                 ))
             }
+            VenueSettings::Polymarket(_) => CredentialFingerprint::Polymarket,
         }
     }
 }

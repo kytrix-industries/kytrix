@@ -13,8 +13,9 @@ use crate::{
         CandlestickSubscriptionQuery, ForceOrderSubscriptionQuery, HyperliquidUserFillsByTimeQuery,
         HyperliquidWalletQuery, MarketCatalogQuery, MarketTradeFetchQuery,
         MarketTradeSubscriptionQuery, OrderBookQuery, PerpetualStatisticsQuery, PlaceOrderCommand,
-        SetLeverageCommand, SetMarginModeCommand, SetPositionModeCommand, TickerQuery,
-        TickersQuery, TradingSettingsQuery,
+        PredictionEventQuery, PredictionEventsQuery, PredictionSeriesQuery,
+        PredictionSeriesSubscriptionQuery, SetLeverageCommand, SetMarginModeCommand,
+        SetPositionModeCommand, TickerQuery, TickersQuery, TradingSettingsQuery,
     },
     protocol::{AuthenticatedTarget, WalletTarget},
 };
@@ -25,6 +26,10 @@ pub enum ProtocolRequest {
     // ---- route-scoped -------------------------------------------------
     FetchMarkets(MarketCatalogQuery),
     FetchAllTickers(TickersQuery),
+    FetchPredictionEvents(PredictionEventsQuery),
+    FetchPredictionEvent(PredictionEventQuery),
+    FetchPredictionSeries(PredictionSeriesQuery),
+    SubscribePredictionSeries(PredictionSeriesSubscriptionQuery),
     SubscribeForceOrder(ForceOrderSubscriptionQuery),
     FetchHyperliquidSpotPairs(MarketCatalogQuery),
     SubscribeHyperliquidFastContexts(HyperliquidWalletQuery),
@@ -98,6 +103,10 @@ impl ProtocolRequest {
             | Self::SubscribePositions(query) => Some(&query.target),
             Self::FetchMarkets(_)
             | Self::FetchAllTickers(_)
+            | Self::FetchPredictionEvents(_)
+            | Self::FetchPredictionEvent(_)
+            | Self::FetchPredictionSeries(_)
+            | Self::SubscribePredictionSeries(_)
             | Self::SubscribeForceOrder(_)
             | Self::FetchCandlesticks(_)
             | Self::SubscribeCandlesticks(_)

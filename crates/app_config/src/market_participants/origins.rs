@@ -54,6 +54,28 @@ pub struct OriginPair {
     pub websocket: Url,
 }
 
+/// One secondary HTTP service of a venue, with an optional stream address.
+///
+/// A venue that serves one product from more than one host states the host it
+/// primarily dials as its [`OriginPair`] and the additional service here. The
+/// stream is optional because a metadata service usually publishes no stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceOrigin {
+    pub http: Url,
+    pub websocket: Option<Url>,
+}
+
+/// Every endpoint one scope of one venue is reached on.
+///
+/// The primary pair is the transport the venue's market data is read from; the
+/// metadata service is the second host some venues publish their event directory
+/// on. A venue with one host answers `metadata: None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VenueEndpoints {
+    pub primary: OriginPair,
+    pub metadata: Option<ServiceOrigin>,
+}
+
 /// The address one choice of an origin table resolves at.
 ///
 /// The value is the address as the venue publishes it, and it is the only shape a choice
@@ -434,6 +456,27 @@ impl<'de> Deserialize<'de> for LongbridgeRegion {
                     "{value:?} is not a service region this build speaks; it speaks {PUBLISHED:?}"
                 ))
             })
+    }
+}
+
+published_origins! {
+    /// One HTTP address the Polymarket Gamma event directory answers on.
+    PolymarketGammaOrigin: Api {
+        Api => "https://gamma-api.polymarket.com",
+    }
+}
+
+published_origins! {
+    /// One HTTP address the Polymarket CLOB answers on.
+    PolymarketClobOrigin: Api {
+        Api => "https://clob.polymarket.com",
+    }
+}
+
+published_origins! {
+    /// One WebSocket address the Polymarket CLOB streams on.
+    PolymarketWebsocketOrigin: Api {
+        Api => "wss://ws-subscriptions-clob.polymarket.com",
     }
 }
 

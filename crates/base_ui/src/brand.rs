@@ -22,6 +22,9 @@ pub const OKX: &str = "brands/OKX/okx.png";
 /// The asset path of Hyperliquid's mark.
 pub const HYPERLIQUID: &str = "brands/Hyperliquid/hyperliquid.png";
 
+/// The asset path of Polymarket's mark.
+pub const POLYMARKET: &str = "brands/Polymarket/polymarket.png";
+
 /// The asset path of Longbridge's mark.
 ///
 /// The file is a placeholder standing in for the venue's own mark, which is acquired
@@ -74,6 +77,13 @@ impl Brand {
     pub fn longbridge() -> Self {
         Self {
             base: img(LONGBRIDGE),
+            style: StyleRefinement::default(),
+        }
+    }
+
+    pub fn polymarket() -> Self {
+        Self {
+            base: img(POLYMARKET),
             style: StyleRefinement::default(),
         }
     }

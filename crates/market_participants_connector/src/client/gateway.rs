@@ -29,7 +29,7 @@ use crate::{
     adapter::{
         Authentication, ExecutionContext, ProtocolRequest, VenueExecutionContext,
         binance::BinanceAdapter, hyperliquid::adapter::implementation::HyperliquidAdapter,
-        longbridge::LongbridgeAdapter, okx::OkxAdapter,
+        longbridge::LongbridgeAdapter, okx::OkxAdapter, polymarket::PolymarketAdapter,
     },
     capability::router::CapabilityRouter,
     catalog::{
@@ -182,11 +182,13 @@ impl MarketParticipantGateway {
         let okx = OkxAdapter::new();
         let hyperliquid = HyperliquidAdapter::from_config(config)?;
         let longbridge = LongbridgeAdapter::new();
+        let polymarket = Arc::new(PolymarketAdapter::new());
         Ok(CapabilityRouter::new([
             binance as Arc<dyn crate::adapter::MarketParticipantAdapter>,
             okx as Arc<dyn crate::adapter::MarketParticipantAdapter>,
             hyperliquid as Arc<dyn crate::adapter::MarketParticipantAdapter>,
             longbridge as Arc<dyn crate::adapter::MarketParticipantAdapter>,
+            polymarket as Arc<dyn crate::adapter::MarketParticipantAdapter>,
         ]))
     }
 
@@ -318,14 +320,18 @@ impl MarketParticipantGateway {
         venue: &market_participants_model::identifier::VenueId,
     ) -> Result<VenueReading, MarketParticipantError> {
         let snapshot = self.runtime.snapshot.current();
-        let origins = snapshot
+        let endpoints = snapshot
             .venue_settings(venue)
-            .and_then(|settings| settings.origins(settings.primary_scope()))
+            .and_then(|settings| settings.endpoints(settings.primary_scope()))
             .ok_or(MarketParticipantError::VenueUnsupported { venue: *venue })?;
         let (proxy, _network_route_generation) = self
             .runtime
             .proxy_resolver
-            .resolve_for_venue_with_generation(venue, &origins.http, &self.runtime.runtime)
+            .resolve_for_venue_with_generation(
+                venue,
+                &endpoints.primary.http,
+                &self.runtime.runtime,
+            )
             .await
             .map_err(|error| MarketParticipantError::Configuration(format_smolstr!("{error}")))?;
         let http_client = self
@@ -338,7 +344,7 @@ impl MarketParticipantGateway {
             .router
             .adapter(venue)
             .ok_or(MarketParticipantError::VenueUnsupported { venue: *venue })?;
-        let context = VenueExecutionContext::new(*venue, origins, http_client);
+        let context = VenueExecutionContext::new_with_endpoints(*venue, endpoints, http_client);
         adapter.read_venue(context).await
     }
 
@@ -494,13 +500,17 @@ impl MarketParticipantGateway {
         // own pair where the venue publishes the scope, and the pair the venue
         // reaches a scope it deploys through — a deployed perpetual DEX is reached
         // through the venue that deployed it, never through an endpoint of its own.
-        let origins = snapshot
-            .origins(&route.venue, &route.scope)
+        let endpoints = snapshot
+            .endpoints(&route.venue, &route.scope)
             .ok_or(MarketParticipantError::VenueUnsupported { venue: route.venue })?;
         let (proxy, network_route_generation) = self
             .runtime
             .proxy_resolver
-            .resolve_for_venue_with_generation(&route.venue, &origins.http, &self.runtime.runtime)
+            .resolve_for_venue_with_generation(
+                &route.venue,
+                &endpoints.primary.http,
+                &self.runtime.runtime,
+            )
             .await
             .map_err(|error| MarketParticipantError::Configuration(format_smolstr!("{error}")))?;
         let http_client = self
@@ -517,9 +527,9 @@ impl MarketParticipantGateway {
             )
             .map_err(|error| MarketParticipantError::Configuration(format_smolstr!("{error}")))?;
         let credential_generation = snapshot.credential_generation(&route.venue, &route.scope);
-        let context = ExecutionContext::new(
+        let context = ExecutionContext::new_with_endpoints(
             identity.clone(),
-            origins,
+            endpoints,
             http_client,
             Arc::clone(&self.runtime.connection_pool),
         )
@@ -649,6 +659,13 @@ fn credential_authentication(
                 }
             }
         }
+        // Polymarket's market data is public and this build stores no credential
+        // for it, so an authenticated request is one the venue cannot answer.
+        VenueSettings::Polymarket(_) => Err(authentication_failed(
+            route,
+            account,
+            AuthError::ApiKeyNotFound,
+        )),
     }
 }
 

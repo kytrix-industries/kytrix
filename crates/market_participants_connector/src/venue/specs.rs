@@ -320,6 +320,20 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
 /// [`CapabilityId::AllTickers`] is deliberately absent: the venue answers a ticker one
 /// listing at a time and has no command for the whole-scope read, so a caller that needs
 /// every listing's ticker in one answer cannot be served by this route.
+/// Everything the Polymarket event scope declares.
+///
+/// The scope publishes no catalog: its events are read page by page and its legs
+/// are discovered with each event. It therefore declares no catalog source and no
+/// normalization rule — there is no catalog identity to normalize.
+const POLYMARKET_ROUTES: &[RouteSpec] = &[RouteSpec {
+    scope: crate::routing::PREDICT_SCOPE,
+    capabilities: &[
+        public(CapabilityId::PredictionEvents),
+        public(CapabilityId::PredictionSeries),
+    ],
+    normalization: &[],
+}];
+
 const LONGBRIDGE_ROUTES: &[RouteSpec] = &[RouteSpec {
     scope: LONGBRIDGE_US_SCOPE,
     capabilities: &[
@@ -344,6 +358,7 @@ fn specs_of(venue: VenueId) -> &'static [RouteSpec] {
         VenueId::Hyperliquid => HYPERLIQUID_ROUTES,
         VenueId::Longbridge => LONGBRIDGE_ROUTES,
         VenueId::Okx => OKX_ROUTES,
+        VenueId::Polymarket => POLYMARKET_ROUTES,
     }
 }
 

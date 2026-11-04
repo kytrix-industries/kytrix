@@ -54,6 +54,7 @@ impl VenueDisplay for VenueId {
             Self::Hyperliquid => "venue.hyperliquid",
             Self::Longbridge => "venue.longbridge",
             Self::Okx => "venue.okx",
+            Self::Polymarket => "venue.polymarket",
         }
     }
 
@@ -63,6 +64,7 @@ impl VenueDisplay for VenueId {
             Self::Hyperliquid => base_ui::brand::HYPERLIQUID,
             Self::Longbridge => base_ui::brand::LONGBRIDGE,
             Self::Okx => base_ui::brand::OKX,
+            Self::Polymarket => base_ui::brand::POLYMARKET,
         }
     }
 

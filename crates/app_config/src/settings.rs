@@ -264,6 +264,45 @@ impl Config {
         true
     }
 
+    /// Replaces the Gamma host Polymarket's event directory is read from.
+    pub fn set_polymarket_gamma(
+        &mut self,
+        venue: &VenueId,
+        gamma: crate::market_participants::origins::PolymarketGammaOrigin,
+    ) -> bool {
+        let Some(VenueSettings::Polymarket(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.gamma = gamma;
+        true
+    }
+
+    /// Replaces the CLOB host Polymarket's prices are read from.
+    pub fn set_polymarket_clob(
+        &mut self,
+        venue: &VenueId,
+        clob: crate::market_participants::origins::PolymarketClobOrigin,
+    ) -> bool {
+        let Some(VenueSettings::Polymarket(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.clob = clob;
+        true
+    }
+
+    /// Replaces the stream host Polymarket's CLOB publishes on.
+    pub fn set_polymarket_websocket(
+        &mut self,
+        venue: &VenueId,
+        websocket: crate::market_participants::origins::PolymarketWebsocketOrigin,
+    ) -> bool {
+        let Some(VenueSettings::Polymarket(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.websocket = websocket;
+        true
+    }
+
     /// Replaces the region a Longbridge account belongs to.
     ///
     /// Returns whether the venue is configured as Longbridge at all: the region is a
@@ -576,6 +615,8 @@ fn write_credential(settings: &mut VenueSettings, field: &str, value: &str) -> b
             "access_token" => longbridge.credentials.access_token = value(),
             _ => return false,
         },
+        // Polymarket's market data is public, so it stores no credential field.
+        VenueSettings::Polymarket(_) => return false,
     }
     true
 }
@@ -772,7 +813,7 @@ mod tests {
                 .keys()
                 .map(|venue| venue.as_str())
                 .collect::<Vec<_>>(),
-            ["binance", "hyperliquid", "longbridge", "okx"],
+            ["binance", "hyperliquid", "longbridge", "okx", "polymarket"],
             "a fresh installation covers every venue this build speaks"
         );
         assert_eq!(

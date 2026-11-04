@@ -26,7 +26,7 @@ use crate::{
         route::VenueRoute,
         venue::{
             BinanceProduct, HyperliquidAssetId, HyperliquidAssetProduct, HyperliquidOutcomeId,
-            OkxInstrumentType,
+            OkxInstrumentType, PolymarketProtocolVersion,
         },
     },
     market::{
@@ -405,7 +405,8 @@ fn polymarket_continuity_should_require_condition_and_token() {
             route: route.clone(),
             terms: ListingContinuityTerms::Polymarket {
                 condition_id: condition(),
-                clob_token_id: CtfTokenId::new(token).expect("token should be valid"),
+                asset_id: CtfTokenId::new(token).expect("token should be valid"),
+                protocol: PolymarketProtocolVersion::V1,
             },
         }
         .listing_id()
@@ -415,7 +416,7 @@ fn polymarket_continuity_should_require_condition_and_token() {
 
     assert_eq!(
         full.as_str(),
-        "listing-id/v1/c82aeeb75e960d62cb1cb4095418ad52adb185bd49775f82f1977352b9411620",
+        "listing-id/v1/a2e82e12561d5e29c3a6ee48cda4d3063b945672e995eeb7fe30dc00d08dca0f",
         "the full Polymarket continuity terms derive a pinned listing identity"
     );
     assert_ne!(
@@ -430,7 +431,8 @@ fn polymarket_continuity_should_require_condition_and_token() {
             terms: ListingContinuityTerms::Polymarket {
                 condition_id: CtfConditionId::new("0x".to_owned() + &"b".repeat(64))
                     .expect("condition should be valid"),
-                clob_token_id: CtfTokenId::new("123").expect("token should be valid"),
+                asset_id: CtfTokenId::new("123").expect("token should be valid"),
+                protocol: PolymarketProtocolVersion::V1,
             },
         }
         .listing_id()
@@ -1185,7 +1187,8 @@ fn polymarket_listing_should_keep_typed_identifiers() {
             .expect("market should be valid"),
         condition_id: CtfConditionId::new("0x".to_owned() + &"c".repeat(64))
             .expect("condition should be valid"),
-        clob_token_id: CtfTokenId::new("42").expect("token should be valid"),
+        asset_id: CtfTokenId::new("42").expect("token should be valid"),
+        protocol: PolymarketProtocolVersion::V1,
         outcome_label: "Yes".into(),
     };
 

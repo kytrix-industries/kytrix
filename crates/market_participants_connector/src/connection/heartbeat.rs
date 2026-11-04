@@ -15,6 +15,11 @@ pub struct Keepalive {
     pub interval: Duration,
     /// How many answers may go missing in a row before the connection is treated as dead.
     pub maximum_missed: u32,
+    /// Whether the message is due on a fixed cadence even while data arrives.
+    ///
+    /// A venue that requires an application heartbeat independently of its data
+    /// stream sets this; one that closes only a silent connection leaves it false.
+    pub send_while_active: bool,
 }
 
 /// One connection's keepalive timer.
@@ -62,10 +67,17 @@ impl Heartbeat {
     /// Any frame restarts the timer, because any frame proves the connection is carrying
     /// traffic; only the answer says the venue replied to the keepalive message itself.
     pub fn on_inbound(&mut self, payload: &[u8]) -> bool {
-        self.silent_since = Instant::now();
-        self.missed = 0;
-        self.keepalive
-            .is_some_and(|keepalive| payload == keepalive.answer.as_bytes())
+        let answer = self
+            .keepalive
+            .is_some_and(|keepalive| payload == keepalive.answer.as_bytes());
+        let fixed_cadence = self
+            .keepalive
+            .is_some_and(|keepalive| keepalive.send_while_active);
+        if !fixed_cadence || answer {
+            self.silent_since = Instant::now();
+            self.missed = 0;
+        }
+        answer
     }
 
     /// Whether the venue has answered recently enough to keep this connection.
@@ -84,6 +96,7 @@ mod tests {
         answer: "pong",
         interval: Duration::from_secs(20),
         maximum_missed: 1,
+        send_while_active: false,
     };
 
     #[test]
@@ -108,6 +121,38 @@ mod tests {
             heartbeat.deadline().expect("a keepalive is armed") >= armed,
             "an inbound frame should push the deadline out"
         );
+    }
+
+    #[test]
+    fn a_fixed_cadence_heartbeat_is_not_reset_by_subscription_data() {
+        const FIXED: Keepalive = Keepalive {
+            message: "PING",
+            answer: "PONG",
+            interval: Duration::from_secs(10),
+            maximum_missed: 1,
+            send_while_active: true,
+        };
+        let mut heartbeat = Heartbeat::start(Some(FIXED));
+        let armed = heartbeat.deadline().expect("a keepalive is armed");
+
+        heartbeat.on_inbound(br#"{"event_type":"book"}"#);
+
+        assert_eq!(
+            heartbeat.deadline(),
+            Some(armed),
+            "subscription data must not postpone a fixed-cadence heartbeat"
+        );
+
+        heartbeat.on_message_sent();
+        heartbeat.on_message_sent();
+        assert!(!heartbeat.is_healthy());
+        heartbeat.on_inbound(br#"{"event_type":"book"}"#);
+        assert!(
+            !heartbeat.is_healthy(),
+            "subscription data must not answer the heartbeat"
+        );
+        assert!(heartbeat.on_inbound(b"PONG"));
+        assert!(heartbeat.is_healthy());
     }
 
     #[test]
