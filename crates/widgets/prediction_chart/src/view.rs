@@ -534,7 +534,7 @@ impl Render for PredictionChartWidget {
                 .items_center()
                 .justify_center()
                 .child(EmptyState::new(
-                    base_ui::empty_state::EmptyState::SELECTOR,
+                    "PredictionChartEmpty",
                     t!(cx, "common.no_data"),
                 ))
                 .into_any_element();

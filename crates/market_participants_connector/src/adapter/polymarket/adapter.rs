@@ -10,7 +10,11 @@
 //! localized answer into display fields only. Public search does not localize, so
 //! its results are re-read by event id when the caller supplies a locale.
 
-use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use futures::{
@@ -93,9 +97,6 @@ const CATEGORIES: [(&str, &str, &str, &str); 8] = [
 const CARD_OPTIONS: usize = 6;
 
 /// The most markets one CLOB batch history request accepts.
-///
-/// Polymarket's `batch-prices-history` endpoint accepts at most 20 market IDs per
-/// request. This limit is enforced by chunking larger leg sets into batches of this size.
 const CLOB_BATCH_LIMIT: usize = 20;
 
 /// The path the CLOB market channel answers on.
@@ -792,7 +793,7 @@ fn categories() -> Vec<PredictionCategory> {
 }
 
 fn merge_localized_events(events: Vec<GammaEvent>, localized: Vec<GammaEvent>) -> Vec<GammaEvent> {
-    let mut localized: HashMap<SmolStr, GammaEvent> = localized
+    let mut localized: BTreeMap<SmolStr, GammaEvent> = localized
         .into_iter()
         .map(|event| (event.id.clone(), event))
         .collect();
@@ -1224,16 +1225,14 @@ fn protocol_of(market: &GammaMarket) -> Result<PolymarketProtocolVersion, Market
     match market.version.as_deref() {
         Some("v1") => Ok(PolymarketProtocolVersion::V1),
         Some("v2") => Ok(PolymarketProtocolVersion::V2),
-        Some(version) => Err(MarketParticipantError::ProtocolError {
-            operation: "decode a Polymarket market version".into(),
-            reason: format_smolstr!("unsupported market version `{version}`"),
-            raw_data: None,
-        }),
-        None => Err(MarketParticipantError::ProtocolError {
-            operation: "decode a Polymarket market version".into(),
-            reason: SmolStr::new_static("the market publishes no version"),
-            raw_data: None,
-        }),
+        Some(version) => Err(protocol_error(
+            "decode a Polymarket market version",
+            format_smolstr!("unsupported market version `{version}`"),
+        )),
+        None => Err(protocol_error(
+            "decode a Polymarket market version",
+            SmolStr::new_static("the market publishes no version"),
+        )),
     }
 }
 

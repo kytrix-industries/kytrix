@@ -31,7 +31,7 @@ pub(crate) const MAX_POINTS: usize = 2_000;
 /// so a finished event's history remains chartable.
 fn visible_markets<'a>(
     event: &'a PredictionEventView,
-    selected: &PredictionMarketRef,
+    selected: &'a PredictionMarketRef,
 ) -> impl Iterator<Item = &'a PredictionMarket> + 'a {
     let has_open = event.markets.iter().any(|market| market.open);
     event

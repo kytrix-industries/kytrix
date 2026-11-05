@@ -502,6 +502,7 @@ async fn publish_failure(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use std::{
         sync::{Arc, Mutex},
@@ -755,7 +756,7 @@ mod tests {
         let event = event_ref();
         let (market, legs) = charted_market(&event, "charted");
         let view = event_with(vec![market]);
-        let mut harness = harness();
+        let harness = harness();
         let mut latest = harness.runtime.latest_stream();
 
         harness
@@ -808,8 +809,7 @@ mod tests {
             ],
             "a tick that arrived before the history page is appended after it"
         );
-        // Runtime will be dropped automatically when this test function returns.
-        drop(harness);
+        harness.runtime.shutdown().await;
     }
 
     #[tokio::test]

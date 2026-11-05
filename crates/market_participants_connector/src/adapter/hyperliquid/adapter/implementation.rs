@@ -1455,7 +1455,7 @@ impl HyperliquidAdapter {
                 )
             }
             ProtocolRequest::SubscribePredictionSeries(query) => {
-                let mut hyperliquid_legs: Vec<(SmolStr, OutcomeLegRef)> = query
+                let legs: Vec<(SmolStr, OutcomeLegRef)> = query
                     .legs
                     .iter()
                     .filter_map(|leg| match &leg.native {
@@ -1465,31 +1465,15 @@ impl HyperliquidAdapter {
                         PredictionNativeLeg::Polymarket { .. } => None,
                     })
                     .collect();
-                if hyperliquid_legs.is_empty() {
-                    log::debug!(
-                        "rejected prediction series subscription: no Hyperliquid outcome legs \
-                         found in a request with {} total legs",
-                        query.legs.len()
-                    );
+                if legs.is_empty() {
                     return Err(unsupported(&context));
-                }
-                // Validate that each outcome coin belongs to the venue's catalog
-                // by checking against the route's listings before subscribing.
-                // The connection will fail later if any outcome is invalid.
-                for (coin, _) in &hyperliquid_legs {
-                    log::trace!(
-                        "subscribing to Hyperliquid outcome: {}",
-                        coin.as_str()
-                    );
                 }
                 (
                     HyperliquidSubscribe {
                         method: SmolStr::new_static("subscribe"),
                         subscription: HyperliquidSubscription::AllMids,
                     },
-                    SubscriptionKind::Prediction { 
-                        legs: hyperliquid_legs.into(), 
-                    },
+                    SubscriptionKind::Prediction { legs: legs.into() },
                 )
             }
             ProtocolRequest::SubscribeOrders(query) => {
@@ -1773,8 +1757,7 @@ where
 /// before the last one at twice [`INFO_RETRY_BASE`] to the power of the attempts.
 fn info_retry_backoff(attempt: u32) -> Duration {
     let base = INFO_RETRY_BASE.saturating_mul(1_u32 << attempt.min(INFO_RETRY_ATTEMPTS));
-    // Use 20% jitter instead of 100% to avoid excessive delays while still preventing thundering herd
-    let jitter = rand::random_range(0..=(base.as_millis() as u64 / 5));
+    let jitter = rand::random_range(0..=base.as_millis() as u64);
     base + Duration::from_millis(jitter)
 }
 
