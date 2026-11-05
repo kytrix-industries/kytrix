@@ -68,11 +68,11 @@ use widget_tokio_runtime::global;
 
 use crate::{
     book::{
-        DEFAULT_BOOK_RATIO, GROUPING_MULTIPLIERS, PredictionBookPanel, PredictionOrderBookError,
-        PredictionOrderBookProtocol, PredictionOrderBookRequest, PredictionOrderBookService,
-        PredictionOrderBookSource, PredictionOrderBookStatus, PredictionOrderBookStreamKey,
-        PredictionOrderBookStreamMessage, clamp_ratio, empty_state, grouping_steps,
-        settle_grouping, split_ratio,
+        DEFAULT_BOOK_RATIO, GROUPING_MULTIPLIERS, MAX_BOOK_RATIO, MIN_BOOK_RATIO,
+        PredictionBookPanel, PredictionOrderBookError, PredictionOrderBookProtocol,
+        PredictionOrderBookRequest, PredictionOrderBookService, PredictionOrderBookSource,
+        PredictionOrderBookStatus, PredictionOrderBookStreamKey, PredictionOrderBookStreamMessage,
+        clamp_ratio, empty_state, grouping_steps, settle_grouping, split_ratio,
     },
     chart::canvas::{ChartCanvasOptions, ChartPaintCaches, chart_element},
     model::{PredictionMarketChoice, PredictionMarketSnapshot, PredictionOrderBookTarget},
@@ -354,6 +354,10 @@ impl WidgetView for PredictionMarketWidget {
             self.awaiting_market = true;
             self.snapshot = None;
             self.forget_chart_state();
+            // The chart cannot be drawn for a market nothing holds any more, and
+            // neither can its book: the stream the panel was reading is retired
+            // with the reading it belonged to.
+            self.clear_book(cx);
             self.report_notice(cx);
             return;
         }
@@ -872,7 +876,13 @@ impl PredictionMarketWidget {
     }
 
     /// Retires the book stream, keeping whatever the panel is drawing.
+    ///
+    /// Hiding, clearing or repointing the book aborts a splitter gesture that is
+    /// running: the bar the gesture was measured on is gone, and the window-wide
+    /// release listener must not write a notch the user never finished choosing.
     fn stop_book(&mut self, cx: &mut Context<Self>) {
+        self.split_drag = None;
+        self.split_dragging = false;
         self.book_binding
             .call(PredictionOrderBookRequest::Stop, cx, Self::apply_book_stop);
         self.book_key = None;
@@ -1020,15 +1030,24 @@ impl PredictionMarketWidget {
         }
         // The stored grouping is settled against the tick this book published, not
         // against the config alone: which steps exist depends on the tick, and a
-        // grouping the venue can no longer express goes back to the finest one.
-        let settled = settle_grouping(book.tick_size, self.config.order_book_grouping);
-        if settled != self.config.order_book_grouping {
-            self.config.order_book_grouping = settled;
-            self.config_change.publish(cx);
-        }
+        // grouping the venue can no longer express goes back to the finest one. An
+        // empty page has no level to group, and the tick it is stated at is a
+        // fallback rather than the venue's, so it must not rewrite a grouping the
+        // user chose on a book that does have levels.
+        let has_levels = !book.bids.is_empty() || !book.asks.is_empty();
+        let multiplier = if has_levels {
+            let settled = settle_grouping(book.tick_size, self.config.order_book_grouping);
+            if settled != self.config.order_book_grouping {
+                self.config.order_book_grouping = settled;
+                self.config_change.publish(cx);
+            }
+            settled
+        } else {
+            self.config.order_book_grouping
+        };
         self.book_snapshot = Some(book.clone());
         self.book_panel.set_leg_label(self.book_leg_label());
-        self.book_panel.set_book(book.clone(), settled);
+        self.book_panel.set_book(book.clone(), multiplier);
         // The state is stored while the panel is hidden — showing it again draws
         // the newest ladder at once — but a hidden body is not repainted.
         self.config.order_book_visible
@@ -1140,10 +1159,18 @@ impl PredictionMarketWidget {
                     self.awaiting_market = true;
                     self.snapshot = None;
                     self.forget_chart_state();
+                    // The market the book was read for is not in memory: the book
+                    // stream is retired with the reading it belonged to.
+                    self.clear_book(cx);
                     self.report_notice(cx);
                     cx.notify();
                     return false;
                 }
+                // A terminal chart failure is the pane's own: the chart's stream is
+                // gone, so the book's lease is released too. The last ladder stays on
+                // screen — it is what the reader was reading — but nothing reads it
+                // any more.
+                self.stop_book(cx);
                 let recovery = self.recovery.clone();
                 self.status.report(
                     WidgetState::failed(
@@ -1578,6 +1605,18 @@ impl PredictionMarketWidget {
             position.y - start.start_y,
             area.size.height,
         );
+        // The drawn panel never gets shorter than its minimum height, so the stored
+        // notch must not go below the share that height takes either: otherwise the
+        // splitter stops at the drawn edge while the value keeps moving and
+        // persists a notch nothing on screen chose.
+        let height = f32::from(area.size.height);
+        let ratio = if height > 0.0 {
+            ratio
+                .max(MIN_BOOK_RATIO.max(f32::from(MIN_BOOK_HEIGHT) / height))
+                .min(MAX_BOOK_RATIO)
+        } else {
+            ratio
+        };
         if ratio == self.config.order_book_ratio {
             return;
         }
@@ -1587,15 +1626,20 @@ impl PredictionMarketWidget {
     }
 
     /// Ends a splitter gesture, reporting the notch only when the gesture moved
-    /// it.
+    /// it away from where it started.
     ///
     /// The two release listeners are not both scoped to the bar: `on_mouse_up`
     /// only fires while the pointer is over it, so a drag released elsewhere is
-    /// seen by `on_mouse_up_out`, which hears every release in the window. The
-    /// flag is what keeps a click anywhere else from writing the ratio back.
+    /// seen by `on_mouse_up_out`, which hears every release in the window. A
+    /// press is therefore the gesture's identity: a release with no press armed —
+    /// a click anywhere else, or a gesture the book hid away — is not a gesture,
+    /// and a drag that came back to its starting ratio chose nothing. Both fields
+    /// are cleared either way.
     fn finish_book_split(&mut self, cx: &mut Context<Self>) {
-        let changed = std::mem::take(&mut self.split_dragging);
-        self.split_drag = None;
+        let start = self.split_drag.take();
+        let dragged = std::mem::take(&mut self.split_dragging);
+        let changed =
+            dragged && start.is_some_and(|start| self.config.order_book_ratio != start.start_ratio);
         if changed {
             self.config_change.publish(cx);
             cx.notify();
@@ -1776,6 +1820,7 @@ mod tests {
         VisualTestContext, Window, div, point, px, size,
     };
     use market_participants_connector::{
+        catalog::error::CatalogError,
         connector::MarketParticipantsConnector,
         market::error::MarketError,
         venue::definition::{CapabilitySupport, ScopeEntry},
@@ -3327,6 +3372,164 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_bottom_anchored_ladder_should_keep_its_spread_when_asks_arrive(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000]));
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+        // The window is laid out before the ladder arrives, so the first anchor is
+        // computed against the panel the reader actually has.
+        let cx = body_window(cx, &pane, size(px(900.0), px(600.0)));
+        // A book deep enough that the anchored spread row is at the very bottom of
+        // the viewport: the offset is at the maximum the current content allows.
+        cx.update(|_, cx| draw_book(&pane, long_book(400, 1), cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let spread_y = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK_SPREAD")
+                .expect("the anchored spread row is drawn")
+                .origin
+                .y
+        };
+        let before = spread_y(cx);
+        cx.update(|_, cx| {
+            let scroll = pane.read(cx).book_panel.scroll.clone();
+            assert!(
+                scroll.is_scrollable(),
+                "the ladder is deeper than the panel"
+            );
+            let handle = scroll.0.borrow();
+            let offset = handle.base_handle.offset().y;
+            let max = handle.base_handle.max_offset().y;
+            assert!(offset < px(0.0), "the spread row is below the content top");
+            assert!(
+                (-offset - max).abs() <= px(1.0),
+                "the anchored spread row sits at the very bottom of the content: \
+                 offset {offset:?}, bound {max:?}"
+            );
+        });
+
+        for (asks, added) in [(401, 1), (411, 10)] {
+            cx.update(|_, cx| {
+                assert!(report_book_snapshot(
+                    &pane,
+                    book_stream_key(1),
+                    long_book(asks, 1),
+                    cx
+                ));
+            });
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let after = spread_y(cx);
+            assert!(
+                (before - after).abs() <= px(1.0),
+                "{added} ask(s) added above the spread must not move it: {before:?} -> {after:?}"
+            );
+        }
+
+        // And the mirror: a level removed above the spread still moves the viewport
+        // with it, whatever the content bound is.
+        cx.update(|_, cx| {
+            assert!(report_book_snapshot(
+                &pane,
+                book_stream_key(1),
+                long_book(400, 1),
+                cx
+            ));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let after_removal = spread_y(cx);
+        assert!(
+            (before - after_removal).abs() <= px(1.0),
+            "an ask removed above the spread must not shift it either: {before:?} -> {after_removal:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn an_empty_book_between_two_ladders_should_reanchor_the_spread(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000]));
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+        // The window is laid out before the ladder arrives, so every anchor below
+        // is computed against the same panel.
+        let cx = body_window(cx, &pane, size(px(900.0), px(600.0)));
+        cx.update(|_, cx| draw_book(&pane, long_book(60, 60), cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let spread_y = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK_SPREAD")
+                .expect("the anchored spread row is drawn")
+                .origin
+                .y
+        };
+        let before = spread_y(cx);
+
+        // The whole book is replaced by a page with no level at all — a same-leg,
+        // same-tick Replace with empty sides, or a re-read that answered 404.
+        cx.update(|_, cx| {
+            assert!(report_book_snapshot(
+                &pane,
+                book_stream_key(1),
+                empty_book(),
+                cx
+            ));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK_SPREAD")
+                .is_none(),
+            "an empty ladder has no spread row to draw"
+        );
+        assert!(cx.debug_bounds("EMPTY_STATE").is_some());
+        cx.update(|_, cx| {
+            assert!(
+                pane.read(cx).book_panel.anchor_pending,
+                "the empty page leaves the spread waiting to be brought back"
+            );
+        });
+
+        // The refilled ladder is a new ladder: it is anchored again instead of
+        // being dragged as if its rows had been on screen all along.
+        cx.update(|_, cx| {
+            assert!(report_book_snapshot(
+                &pane,
+                book_stream_key(1),
+                long_book(60, 60),
+                cx
+            ));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let after = spread_y(cx);
+        assert!(
+            (before - after).abs() <= px(1.0),
+            "the refilled ladder anchors its spread where the first one was: {before:?} -> {after:?}"
+        );
+        cx.update(|_, cx| {
+            let panel = &pane.read(cx).book_panel;
+            assert!(
+                !panel.anchor_pending,
+                "the refill's first frame anchored it"
+            );
+            assert!(
+                panel.scroll.is_scrollable(),
+                "the refilled ladder is the one scrolling again"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     fn the_grouping_select_should_appear_only_with_a_book(cx: &mut TestAppContext) {
         let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
         let (_, cx): (Entity<HeaderHarness>, &mut VisualTestContext) =
@@ -3483,6 +3686,74 @@ mod tests {
             });
         });
         assert_eq!(reports.get(), 1, "the reset is written back");
+    }
+
+    #[gpui_kit::test]
+    fn an_empty_page_should_not_rewrite_the_stored_grouping(cx: &mut TestAppContext) {
+        let reports = reports();
+        let config = PredictionMarketConfig {
+            order_book_grouping: 100,
+            ..PredictionMarketConfig::default()
+        };
+        let (pane, _source) = pane_with(cx, config, reports.clone());
+        let (_, legs) = charted_market(&event_ref(), "charted");
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000]));
+                pane.book_key = Some(book_stream_key(1));
+                pane.book_epoch = 1;
+                // A token with no CLOB book answers 404: the page states no level at
+                // all, and its cent tick is a fallback rather than the venue's.
+                let empty = Arc::new(order_book(
+                    legs[0].clone(),
+                    "0.01",
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                assert!(pane.apply_book_latest(
+                    book_stream_key(1),
+                    Arc::new(PredictionOrderBookStreamMessage::Snapshot(empty)),
+                    cx,
+                ));
+                assert_eq!(
+                    pane.config.order_book_grouping, 100,
+                    "an empty page has no level to group, so its fallback tick must not reset the choice"
+                );
+                assert!(pane.book_panel.is_empty());
+                assert_eq!(
+                    pane.book_panel.multiplier, 100,
+                    "the panel keeps the grouping it was drawing"
+                );
+            });
+        });
+        assert_eq!(
+            reports.get(),
+            0,
+            "nothing was reset, so nothing is written back"
+        );
+
+        // The real book of the same market states a tick a grouping of a hundred is
+        // a price at.
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                let book = Arc::new(order_book(
+                    legs[0].clone(),
+                    "0.001",
+                    vec![level("0.34", "50")],
+                    vec![level("0.35", "100")],
+                ));
+                assert!(pane.apply_book_latest(
+                    book_stream_key(1),
+                    Arc::new(PredictionOrderBookStreamMessage::Snapshot(book)),
+                    cx,
+                ));
+                assert_eq!(pane.config.order_book_grouping, 100);
+                assert_eq!(pane.book_panel.multiplier, 100);
+            });
+        });
+        assert_eq!(reports.get(), 0, "a valid grouping is never rewritten");
     }
 
     #[gpui_kit::test]
@@ -3754,6 +4025,154 @@ mod tests {
             0,
             "a click that is not a splitter drag reports nothing"
         );
+    }
+
+    #[gpui_kit::test]
+    fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch(
+        cx: &mut TestAppContext,
+    ) {
+        let reports = reports();
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports.clone());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000, 2_000]));
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+        let cx = body_window(cx, &pane, size(px(900.0), px(600.0)));
+        let (splitter, _area) = splitter_and_area(cx, &pane);
+        let start = splitter.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(60.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.update(|_, cx| {
+            let ratio = pane.read(cx).config.order_book_ratio;
+            assert!(ratio < 0.5, "the drag moved the notch: {ratio}");
+            // The book is hidden while the pointer is still down and the drag's
+            // preview is running.
+            pane.update(cx, |pane, cx| pane.toggle_book(cx));
+        });
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert!(
+                pane.split_drag.is_none(),
+                "hiding the book aborts the interrupted gesture"
+            );
+            assert!(!pane.split_dragging);
+            assert!(!pane.config.order_book_visible);
+        });
+        assert_eq!(
+            reports.get(),
+            1,
+            "hiding reports the toggle, not the notch the gesture had reached"
+        );
+
+        // Showing it again leaves a splitter whose window-wide release listener
+        // hears the next click: a gesture with no press armed is not a gesture.
+        cx.update(|_, cx| pane.update(cx, |pane, cx| pane.toggle_book(cx)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let chart = cx
+            .debug_bounds("TEST_PREDICTION_MARKET_CHART")
+            .expect("the chart is in the frame");
+        cx.simulate_click(chart.center(), Modifiers::none());
+
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert!(pane.split_drag.is_none(), "the later click arms nothing");
+            assert!(!pane.split_dragging);
+        });
+        assert_eq!(
+            reports.get(),
+            2,
+            "showing the book reports once more, and the later click reports nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_splitter_drag_back_to_its_start_should_not_report(cx: &mut TestAppContext) {
+        let reports = reports();
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports.clone());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000, 2_000]));
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+        let cx = body_window(cx, &pane, size(px(900.0), px(600.0)));
+        let (splitter, _area) = splitter_and_area(cx, &pane);
+        let start = splitter.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(80.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        // The pointer comes back to where it went down before it is released.
+        cx.simulate_mouse_move(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::none());
+
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(
+                pane.config.order_book_ratio, 0.5,
+                "the notch is where the gesture started"
+            );
+            assert!(pane.split_drag.is_none());
+            assert!(!pane.split_dragging);
+        });
+        assert_eq!(
+            reports.get(),
+            0,
+            "a drag that ended where it started chose nothing and reports nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_short_pane_should_not_store_a_notch_below_the_drawn_minimum(cx: &mut TestAppContext) {
+        let reports = reports();
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports.clone());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000, 2_000]));
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+        let cx = body_window(cx, &pane, size(px(900.0), px(160.0)));
+        let (splitter, area) = splitter_and_area(cx, &pane);
+
+        splitter_drag(cx, splitter.center(), px(1_000.0));
+
+        let expected = MIN_BOOK_RATIO.max(f32::from(MIN_BOOK_HEIGHT) / f32::from(area));
+        cx.update(|_, cx| {
+            let ratio = pane.read(cx).config.order_book_ratio;
+            assert!(
+                (ratio - expected).abs() < 1e-3,
+                "the stored notch is the smallest share the panel is drawn at: {ratio} vs {expected}"
+            );
+            assert!(
+                ratio > MIN_BOOK_RATIO,
+                "a short pane's minimum height is more than the tall pane's constant: {ratio}"
+            );
+            assert!(ratio < MAX_BOOK_RATIO);
+        });
+        assert_eq!(reports.get(), 1, "the released notch is written back once");
     }
 
     #[gpui_kit::test]
@@ -4183,6 +4602,77 @@ mod tests {
             let pane = pane.read(cx);
             assert!(pane.book_snapshot.is_none());
             assert!(pane.book_error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_terminal_chart_failure_should_release_the_book_lease(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| draw_book(&pane, book_reading(), cx));
+        cx.update(|cx| {
+            report_status(
+                &pane,
+                stream_key(),
+                PredictionMarketStatus::Failed {
+                    error: PredictionMarketFetchError::NoMarkets,
+                },
+                cx,
+            );
+            let pane = pane.read(cx);
+            assert!(pane.status.is_failed(cx));
+            assert!(
+                pane.book_key.is_none(),
+                "the book's stream is retired with the chart's terminal failure"
+            );
+            assert!(
+                pane.book_snapshot.is_some(),
+                "the last ladder the reader was reading stays on screen"
+            );
+            assert!(pane.book_panel.grouped.is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_chart_whose_market_is_not_loaded_should_clear_the_book(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| draw_book(&pane, book_reading(), cx));
+        cx.update(|cx| {
+            let error = PredictionMarketFetchError::Market(MarketError::Catalog(Box::new(
+                CatalogError::CatalogNotLoaded {
+                    route: event_ref().route,
+                },
+            )));
+            report_status(
+                &pane,
+                stream_key(),
+                PredictionMarketStatus::Failed { error },
+                cx,
+            );
+            let pane = pane.read(cx);
+            assert!(pane.awaiting_market, "the chart waits for its market");
+            assert!(pane.book_key.is_none(), "the book's stream is retired");
+            assert!(
+                pane.book_snapshot.is_none(),
+                "the book of a market not in memory is dropped"
+            );
+            assert!(pane.book_panel.grouped.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_load_without_a_loaded_market_should_clear_the_book(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| draw_book(&pane, book_reading(), cx));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(cut_event_ref());
+                pane.load(cx);
+            });
+            let pane = pane.read(cx);
+            assert!(pane.awaiting_market);
+            assert!(pane.book_key.is_none());
+            assert!(pane.book_snapshot.is_none());
+            assert!(pane.book_panel.grouped.is_none());
         });
     }
 

@@ -1,4 +1,4 @@
-//! Market-participant domain models shared by adapters and Widgets.
+//! Market-participant domain models shared by this crate's adapters.
 //!
 //! Transport and market-participants execution live under [`crate::adapter`] and
 //! [`crate::client`]. This module intentionally contains only the stable

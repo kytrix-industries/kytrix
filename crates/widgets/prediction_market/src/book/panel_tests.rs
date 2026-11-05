@@ -318,6 +318,68 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
     assert!(panel.anchor_pending);
 }
 
+#[gpui_kit::test]
+fn an_empty_page_should_leave_the_anchor_pending_for_the_next_ladder(cx: &mut TestAppContext) {
+    let mut panel = PredictionBookPanel::new();
+    let ladder = |panel: &mut PredictionBookPanel| {
+        panel.set_book(
+            book(
+                "0.001",
+                &[("0.341", "10")],
+                &[("0.342", "10"), ("0.343", "10")],
+            ),
+            1,
+        );
+    };
+    ladder(&mut panel);
+    cx.update(|cx| {
+        install(cx);
+        let _ = panel.render(cx);
+    });
+    assert!(!panel.anchor_pending, "the first frame consumed the anchor");
+
+    // A whole-book replace with no level at all is still the same leg and tick,
+    // so it is the same ladder — only an empty one.
+    panel.set_book(book("0.001", &[], &[]), 1);
+    assert!(panel.is_empty());
+    assert!(
+        panel.anchor_pending,
+        "an empty ladder leaves the anchor pending"
+    );
+    cx.update(|cx| {
+        let _ = panel.render(cx);
+    });
+    assert!(
+        panel.anchor_pending,
+        "the empty frame has no row to bring into view, so it does not consume the anchor"
+    );
+
+    // The refill is a new ladder: it is anchored again instead of being dragged
+    // as if its rows had been on screen all along.
+    ladder(&mut panel);
+    assert!(panel.anchor_pending);
+    cx.update(|cx| {
+        let _ = panel.render(cx);
+    });
+    assert!(!panel.anchor_pending);
+    let deferred = panel
+        .scroll
+        .0
+        .borrow()
+        .deferred_scroll_to_item
+        .expect("the refilled ladder is scrolled to its spread row");
+    assert_eq!(
+        deferred.item_index,
+        panel
+            .grouped
+            .as_deref()
+            .expect("the ladder is grouped")
+            .asks
+            .len(),
+        "the spread row is the anchored item"
+    );
+}
+
 #[test]
 fn split_ratio_should_follow_the_pointer_and_stay_inside_the_area() {
     assert_eq!(split_ratio(0.5, px(0.0), px(500.0)), 0.5);

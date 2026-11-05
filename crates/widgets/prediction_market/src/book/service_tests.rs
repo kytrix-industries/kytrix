@@ -98,11 +98,21 @@ fn stop() -> PredictionOrderBookRequest {
     PredictionOrderBookRequest::Stop
 }
 
-/// The refusal Polymarket answers a token that has no CLOB book at all with.
-fn no_book_error() -> MarketError {
+/// The live CLOB body refusing a token that has no book at all.
+///
+/// The venue states it inside a JSON envelope. The adapter trims the body's
+/// trailing newline, which is what the error's message holds.
+const LIVE_NO_BOOK_BODY: &str = r#"{"error":"No orderbook exists for the requested token id"}"#;
+
+/// The same refusal without an envelope: the venue's sentence is the whole body.
+const PLAIN_NO_BOOK_BODY: &str = "No orderbook exists for the requested token id";
+
+/// One 404 refusing a token because it has no CLOB book, carrying `body` as the
+/// venue's own words.
+fn no_book_error(body: &'static str) -> MarketError {
     MarketError::Network(MarketNetworkError::from(MarketParticipantError::Rejected {
         code: SmolStr::new_static("404"),
-        message: SmolStr::new_static("No orderbook exists for the requested token id"),
+        message: SmolStr::new_static(body),
         retryable: false,
         raw_response: None,
     }))
@@ -940,8 +950,10 @@ async fn a_replace_tick_and_trade_at_the_same_newer_instant_should_all_apply() {
     harness.runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn a_token_with_no_book_should_publish_an_empty_page_and_then_follow_the_channel() {
+/// Drives one no-book refusal through the service: the page becomes an empty
+/// snapshot, Ready follows it, and the channel opened before the page is still
+/// followed afterwards.
+async fn empty_page_for(body: &'static str) {
     let mut harness = Harness::new();
     let (updates, _taken) = harness.subscribe();
     let fetch = harness.fetch();
@@ -954,7 +966,7 @@ async fn a_token_with_no_book_should_publish_an_empty_page_and_then_follow_the_c
         .await
         .expect("the load request starts a stream");
     fetch
-        .send(Err(no_book_error()))
+        .send(Err(no_book_error(body)))
         .expect("the fetch is waiting");
 
     let empty = next_snapshot(&mut latest).await;
@@ -984,10 +996,20 @@ async fn a_token_with_no_book_should_publish_an_empty_page_and_then_follow_the_c
     assert_eq!(
         prices(&snapshot.bids),
         vec![price("0.34")],
-        "a book that appears later replaces the empty page"
+        "the channel kept open for the empty page is still followed"
     );
     assert_eq!(prices(&snapshot.asks), vec![price("0.35")]);
     harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_token_with_no_book_should_publish_an_empty_page_and_then_follow_the_channel() {
+    empty_page_for(LIVE_NO_BOOK_BODY).await;
+}
+
+#[tokio::test]
+async fn the_plain_no_book_sentence_should_be_read_as_an_empty_page() {
+    empty_page_for(PLAIN_NO_BOOK_BODY).await;
 }
 
 #[tokio::test]

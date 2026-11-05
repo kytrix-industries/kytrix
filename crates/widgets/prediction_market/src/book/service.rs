@@ -577,11 +577,20 @@ fn missing_order_book(leg: &OutcomeLegRef) -> PredictionOrderBook {
     }
 }
 
+/// The sentence Polymarket answers a token with no CLOB book with.
+///
+/// The live CLOB states it inside a JSON envelope —
+/// `{"error":"No orderbook exists for the requested token id"}` — and the same
+/// words are the whole body when the envelope is absent. The venue's refusal is
+/// whichever of the two arrived, so its sentence is looked for inside the
+/// message rather than compared to the whole of it.
+const MISSING_ORDER_BOOK_SENTENCE: &str = "No orderbook exists for the requested token id";
+
 /// Whether the venue answered that the requested token has no CLOB book.
 ///
-/// Polymarket returns `404 No orderbook exists for the requested token id` for a
-/// token nothing rests on; every other refusal — a rate limit, an unknown token,
-/// a transport failure — stays a failure.
+/// Polymarket returns a `404` whose body says no order book exists for the
+/// token; every other refusal — a rate limit, an unknown token, a transport
+/// failure — stays a failure.
 fn is_missing_order_book(error: &MarketError) -> bool {
     matches!(
         error,
@@ -589,7 +598,7 @@ fn is_missing_order_book(error: &MarketError) -> bool {
             if matches!(
                 network.error(),
                 MarketParticipantError::Rejected { code, message, .. }
-                    if code == "404" && message == "No orderbook exists for the requested token id"
+                    if code == "404" && message.contains(MISSING_ORDER_BOOK_SENTENCE)
             )
     )
 }

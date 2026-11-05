@@ -279,16 +279,31 @@ impl PredictionBookPanel {
     /// the ladder the reader was reading: its bars move to the new depths. Any
     /// other book is a different ladder, so its bars arrive at once and the next
     /// frame brings the spread back into view.
+    ///
+    /// An empty ladder is not a ladder: the levels of the book that fills it are
+    /// a new one, even when its side and tick are the same as the empty page's,
+    /// so the spread is anchored again instead of being treated as a movement of
+    /// rows that were never drawn. The anchor stays pending while the ladder is
+    /// empty, because there is nothing to bring into view yet.
     pub(crate) fn set_book(&mut self, book: Arc<PredictionOrderBook>, multiplier: u32) {
         let same_ladder = self
             .book
             .as_ref()
             .is_some_and(|held| held.leg == book.leg && held.tick_size == book.tick_size);
-        let multiplier = settle_grouping(book.tick_size, multiplier);
+        let has_levels = !book.bids.is_empty() || !book.asks.is_empty();
+        // An empty page has no level to group, and the tick it is stated at is a
+        // fallback rather than the venue's: settling a stored grouping against it
+        // would rewrite a choice the user made on a book that does have levels.
+        let multiplier = if has_levels {
+            settle_grouping(book.tick_size, multiplier)
+        } else {
+            multiplier
+        };
         let grouped = Arc::new(group(&book, multiplier));
         self.multiplier = multiplier;
         self.book = Some(book);
-        if same_ladder && self.grouped.is_some() {
+        let previous_empty = self.grouped.as_ref().is_none_or(|held| held.is_empty());
+        if same_ladder && !previous_empty && has_levels {
             // The ladder is drawn from the inside out: the spread row sits at the
             // ask count, so a level added above it shifts every row below. The
             // reader's place is a screen position, not an item index, so the
@@ -309,9 +324,12 @@ impl PredictionBookPanel {
     /// Drags the list content by `rows` rows, keeping the reader where they were.
     ///
     /// The offset is measured from the top of the content and is zero or
-    /// negative, so a row added above the viewport moves it further down; the
-    /// new place is clamped to what the list can actually show, which is the
-    /// negative of the handle's (positive) maximum offset.
+    /// negative, so a row added above the viewport moves it further down. The new
+    /// place is clamped to what the list will show once this book is laid out,
+    /// not to the bound the handle still holds: that one describes the previous
+    /// book's content, so a reader at the bottom of a long ladder would lose the
+    /// compensation the moment a row arrived. One row added grows the content by
+    /// one row, and one removed shrinks it by the same.
     fn shift_scroll_by_rows(&self, rows: isize) {
         if rows == 0 {
             return;
@@ -319,10 +337,12 @@ impl PredictionBookPanel {
         let handle = self.scroll.0.borrow();
         let offset = handle.base_handle.offset();
         let max_offset = handle.base_handle.max_offset();
-        let shifted = offset.y - ROW_HEIGHT * rows as f32;
+        let growth = ROW_HEIGHT * rows as f32;
+        let new_max = (max_offset.y + growth).max(px(0.0));
+        let shifted = offset.y - growth;
         handle
             .base_handle
-            .set_offset(point(offset.x, shifted.clamp(-max_offset.y, px(0.0))));
+            .set_offset(point(offset.x, shifted.clamp(-new_max, px(0.0))));
     }
 
     /// Regroups the book on screen at another multiplier.
