@@ -312,12 +312,15 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
 ///
 /// The scope publishes no catalog: its events are read page by page and its legs
 /// are discovered with each event. It therefore declares no catalog source and no
-/// normalization rule — there is no catalog identity to normalize.
+/// normalization rule — there is no catalog identity to normalize. Its book is
+/// event-scoped too: CLOB publishes one book per asset id, and the asset id is
+/// discovered with the event rather than catalogued.
 const POLYMARKET_ROUTES: &[RouteSpec] = &[RouteSpec {
     scope: crate::routing::PREDICT_SCOPE,
     capabilities: &[
         public(CapabilityId::PredictionEvents),
         public(CapabilityId::PredictionSeries),
+        public(CapabilityId::PredictionOrderBook),
     ],
     normalization: &[],
 }];

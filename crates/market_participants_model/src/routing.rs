@@ -114,6 +114,13 @@ pub enum CapabilityId {
     /// Probability series of prediction-event legs.
     #[serde(rename = "prediction_series")]
     PredictionSeries,
+    /// The order book of one leg of a prediction-event market.
+    ///
+    /// It is separate from [`Self::OrderBook`] because a prediction leg has no
+    /// catalog listing: the book is addressed by the event's own legs and the
+    /// venue's own asset id, which are discovered with the event.
+    #[serde(rename = "prediction_order_book")]
+    PredictionOrderBook,
     #[serde(rename = "open_interest")]
     OpenInterest,
     #[serde(rename = "long_short_account_ratio")]
@@ -154,6 +161,7 @@ impl CapabilityId {
             Self::OrderBook => "order_book",
             Self::PredictionEvents => "prediction_events",
             Self::PredictionSeries => "prediction_series",
+            Self::PredictionOrderBook => "prediction_order_book",
             Self::OpenInterest => "open_interest",
             Self::LongShortAccountRatio => "long_short_account_ratio",
             Self::TopTraderAccountRatio => "top_trader_account_ratio",
@@ -362,6 +370,24 @@ mod tests {
         assert_eq!(encoded, "\"top_trader_position_ratio\"");
         assert_eq!(
             serde_json::from_str::<CapabilityId>(&encoded).expect("capability should decode"),
+            capability
+        );
+    }
+
+    /// The prediction book is its own capability, and its spelling is the one the
+    /// persistence and the static definition table name it by.
+    #[test]
+    fn the_prediction_order_book_capability_uses_its_documented_spelling() {
+        let capability = CapabilityId::PredictionOrderBook;
+
+        assert_eq!(capability.to_string(), "prediction_order_book");
+        assert_eq!(
+            serde_json::to_string(&capability).expect("the capability serializes"),
+            "\"prediction_order_book\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilityId>("\"prediction_order_book\"")
+                .expect("the capability decodes"),
             capability
         );
     }

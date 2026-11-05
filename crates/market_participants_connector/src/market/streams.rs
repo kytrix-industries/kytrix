@@ -17,7 +17,7 @@ use market_participants_model::{
         book::{ListingCandlestick, ListingForceOrder, ListingOrderBookUpdate, ListingTrade},
         selection::ListingTicker,
     },
-    prediction::PredictionSeries,
+    prediction::{PredictionOrderBookUpdate, PredictionSeries},
 };
 
 use super::{
@@ -199,6 +199,42 @@ impl Stream for PredictionSeriesStream {
     }
 }
 
+/// The live order book updates of one prediction leg.
+pub struct PredictionOrderBookStream {
+    inner: ProtocolStream,
+    status: tokio::sync::watch::Receiver<SubscriptionStatus>,
+}
+
+impl PredictionOrderBookStream {
+    pub(crate) fn from_handle(handle: SubscriptionHandle) -> Self {
+        let status = map_status(handle.observe_status());
+        Self {
+            inner: handle.into_stream(),
+            status,
+        }
+    }
+}
+
+stream_lifecycle!(PredictionOrderBookStream);
+
+impl Stream for PredictionOrderBookStream {
+    type Item = Result<Vec<PredictionOrderBookUpdate>, MarketError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(ProtocolEvent::PredictionOrderBookUpdate(updates)))) => {
+                    return Poll::Ready(Some(Ok(updates)));
+                }
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error.into()))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 pub struct ForceOrderStream {
     inner: ProtocolStream,
     status: tokio::sync::watch::Receiver<SubscriptionStatus>,
@@ -288,7 +324,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::ForceOrderStream;
+    use super::{ForceOrderStream, PredictionOrderBookStream};
     use crate::{
         adapter::{NativeForceOrder, NativeListing, ProtocolEvent, SubscriptionHandle},
         catalog::test_support,
@@ -460,5 +496,36 @@ mod tests {
             .expect("the fixture liquidation carries its listing");
         assert_eq!(order.listing, listing);
         assert!(orders.next().await.is_none());
+    }
+
+    /// A prediction book stream publishes the update batch of the frame it was
+    /// handed, in the order the adapter decoded it.
+    #[tokio::test]
+    async fn prediction_book_updates_are_published_as_the_adapter_decoded_them() {
+        let updates = vec![
+            market_participants_model::prediction::PredictionOrderBookUpdate::TickSize {
+                tick_size: "0.001".parse().expect("the fixture tick is valid"),
+                timestamp: 10,
+            },
+            market_participants_model::prediction::PredictionOrderBookUpdate::LastTrade {
+                price: "0.25".parse().expect("the fixture price is valid"),
+                timestamp: 11,
+            },
+        ];
+        let handle = SubscriptionHandle::new(
+            Box::pin(stream::iter([Ok(
+                ProtocolEvent::PredictionOrderBookUpdate(updates.clone()),
+            )])),
+            CancellationToken::new(),
+        );
+        let mut book = PredictionOrderBookStream::from_handle(handle);
+
+        let published = book
+            .next()
+            .await
+            .expect("an update batch should be published")
+            .expect("the fixture batch carries no error");
+        assert_eq!(published, updates);
+        assert!(book.next().await.is_none());
     }
 }

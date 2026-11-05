@@ -4,4 +4,4 @@
 //! [`crate::client`]. This module intentionally contains only the stable
 //! domain model namespace.
 
-pub(crate) mod model;
+pub mod model;

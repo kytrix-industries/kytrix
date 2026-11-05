@@ -249,6 +249,11 @@ fn a_definition_carries_its_capability_names() {
         vec![venue("binance"), venue("okx"), venue("hyperliquid")],
         "Longbridge answers tickers one listing at a time, so it serves no whole-scope read"
     );
+    assert_eq!(
+        venues_supporting(CapabilityId::PredictionOrderBook),
+        vec![venue("polymarket")],
+        "only the prediction venue publishes a book for an event leg"
+    );
 }
 
 /// The venue's two definitions state whether a load without credentials is worth

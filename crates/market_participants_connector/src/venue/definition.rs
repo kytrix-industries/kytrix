@@ -494,9 +494,11 @@ const LONGBRIDGE_CAPABILITIES: &[CapabilityId] = &[
 
 /// Every capability Polymarket's loader can produce.
 ///
-/// The venue publishes events and probability history; it publishes no catalog
-/// this build stages, so the scope carries no catalog source.
+/// The venue publishes events, their probability history and their CLOB books;
+/// it publishes no catalog this build stages, so the scope carries no catalog
+/// source.
 const POLYMARKET_CAPABILITIES: &[CapabilityId] = &[
     CapabilityId::PredictionEvents,
     CapabilityId::PredictionSeries,
+    CapabilityId::PredictionOrderBook,
 ];

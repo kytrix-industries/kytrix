@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
 use crate::{
-    decimal::{Fraction, Quantity, UnixMillis},
+    decimal::{Fraction, Quantity, Tick, UnixMillis},
     identifier::IdentifierValue,
     listing::{
         route::{VenueListingKey, VenueRoute},
@@ -249,6 +249,79 @@ pub struct PredictionSeries {
     pub points: Vec<PredictionPricePoint>,
 }
 
+/// One price level of a prediction order book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionBookLevel {
+    #[serde(rename = "price")]
+    pub price: Fraction,
+    #[serde(rename = "size")]
+    pub size: Quantity,
+}
+
+/// One changed price level; a zero size removes the level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionBookLevelChange {
+    #[serde(rename = "price")]
+    pub price: Fraction,
+    #[serde(rename = "size")]
+    pub size: Quantity,
+}
+
+/// One complete prediction order book reading (REST snapshot or normalized state).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionOrderBook {
+    #[serde(rename = "leg")]
+    pub leg: OutcomeLegRef,
+    #[serde(rename = "tick_size")]
+    pub tick_size: Tick,
+    #[serde(rename = "bids")]
+    pub bids: Vec<PredictionBookLevel>,
+    #[serde(rename = "asks")]
+    pub asks: Vec<PredictionBookLevel>,
+    #[serde(rename = "last_trade_price")]
+    pub last_trade_price: Option<Fraction>,
+    #[serde(rename = "timestamp")]
+    pub timestamp: UnixMillis,
+}
+
+/// One incremental update of a prediction order book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "update")]
+pub enum PredictionOrderBookUpdate {
+    #[serde(rename = "replace")]
+    Replace {
+        #[serde(rename = "bids")]
+        bids: Vec<PredictionBookLevel>,
+        #[serde(rename = "asks")]
+        asks: Vec<PredictionBookLevel>,
+        #[serde(rename = "timestamp")]
+        timestamp: UnixMillis,
+    },
+    #[serde(rename = "levels")]
+    Levels {
+        #[serde(rename = "bids")]
+        bids: Vec<PredictionBookLevelChange>,
+        #[serde(rename = "asks")]
+        asks: Vec<PredictionBookLevelChange>,
+        #[serde(rename = "timestamp")]
+        timestamp: UnixMillis,
+    },
+    #[serde(rename = "tick_size")]
+    TickSize {
+        #[serde(rename = "tick_size")]
+        tick_size: Tick,
+        #[serde(rename = "timestamp")]
+        timestamp: UnixMillis,
+    },
+    #[serde(rename = "last_trade")]
+    LastTrade {
+        #[serde(rename = "price")]
+        price: Fraction,
+        #[serde(rename = "timestamp")]
+        timestamp: UnixMillis,
+    },
+}
+
 /// The range a prediction series is read over.
 ///
 /// The product offers these six ranges. The range decides both how far back the
@@ -312,11 +385,125 @@ impl PredictionRange {
 
 #[cfg(test)]
 mod tests {
-    use super::{PredictionEventRef, PredictionRange};
+    use super::{
+        PredictionBookLevel, PredictionBookLevelChange, PredictionEventRef, PredictionOrderBook,
+        PredictionOrderBookUpdate, PredictionRange,
+    };
     use crate::{
+        decimal::{Fraction, Quantity, Tick},
         identifier::{IdentifierValue, VenueId, VenueScopeId},
         listing::route::VenueRoute,
+        outcome::{OutcomeGroupId, OutcomeLegRef, OutcomeMemberId, OutcomeSideId},
     };
+
+    fn leg() -> OutcomeLegRef {
+        let identity = |digits: &str| format!("v1/{}", digits.repeat(64));
+        OutcomeLegRef {
+            group: OutcomeGroupId::from_identity_value(&identity("1"))
+                .expect("the fixture group identity is valid"),
+            member: OutcomeMemberId::from_identity_value(&identity("2"))
+                .expect("the fixture member identity is valid"),
+            side: OutcomeSideId::from_identity_value(&identity("3"))
+                .expect("the fixture side identity is valid"),
+        }
+    }
+
+    fn level(price: &str, size: &str) -> PredictionBookLevel {
+        PredictionBookLevel {
+            price: price
+                .parse::<Fraction>()
+                .expect("the fixture price is a fraction"),
+            size: size
+                .parse::<Quantity>()
+                .expect("the fixture size is a quantity"),
+        }
+    }
+
+    fn fixture_book() -> PredictionOrderBook {
+        PredictionOrderBook {
+            leg: leg(),
+            tick_size: "0.01".parse::<Tick>().expect("the fixture tick is valid"),
+            bids: vec![level("0.4", "10")],
+            asks: vec![level("0.6", "12")],
+            last_trade_price: Some(
+                "0.5"
+                    .parse::<Fraction>()
+                    .expect("the fixture price is a fraction"),
+            ),
+            timestamp: 1_790_000_000_000,
+        }
+    }
+
+    #[test]
+    fn a_prediction_order_book_round_trips_with_its_documented_fields() {
+        let book = fixture_book();
+        let encoded = serde_json::to_string(&book).expect("the book serializes");
+        let decoded: PredictionOrderBook =
+            serde_json::from_str(&encoded).expect("the book decodes");
+
+        assert_eq!(decoded, book);
+        let value: serde_json::Value =
+            serde_json::from_str(&encoded).expect("the book encodes as JSON");
+        assert_eq!(value["tick_size"], "0.01");
+        assert_eq!(value["bids"][0]["price"], "0.4");
+        assert_eq!(value["bids"][0]["size"], "10");
+        assert_eq!(value["asks"][0]["price"], "0.6");
+        assert_eq!(value["last_trade_price"], "0.5");
+        assert_eq!(value["timestamp"], 1_790_000_000_000_i64);
+    }
+
+    #[test]
+    fn every_order_book_update_states_its_documented_tag() {
+        let updates = [
+            (
+                PredictionOrderBookUpdate::Replace {
+                    bids: vec![level("0.4", "10")],
+                    asks: vec![level("0.6", "12")],
+                    timestamp: 1,
+                },
+                "replace",
+            ),
+            (
+                PredictionOrderBookUpdate::Levels {
+                    bids: vec![PredictionBookLevelChange {
+                        price: "0.4".parse::<Fraction>().expect("the fixture price"),
+                        size: Quantity::ZERO,
+                    }],
+                    asks: Vec::new(),
+                    timestamp: 2,
+                },
+                "levels",
+            ),
+            (
+                PredictionOrderBookUpdate::TickSize {
+                    tick_size: "0.001".parse::<Tick>().expect("the fixture tick"),
+                    timestamp: 3,
+                },
+                "tick_size",
+            ),
+            (
+                PredictionOrderBookUpdate::LastTrade {
+                    price: "0.25".parse::<Fraction>().expect("the fixture price"),
+                    timestamp: 4,
+                },
+                "last_trade",
+            ),
+        ];
+
+        for (update, tag) in &updates {
+            let value = serde_json::to_value(update).expect("the update serializes");
+            assert_eq!(value["update"], *tag);
+            let decoded: PredictionOrderBookUpdate =
+                serde_json::from_value(value).expect("the update decodes");
+            assert_eq!(&decoded, update);
+        }
+
+        let removal = serde_json::to_value(&updates[1].0).expect("the update serializes");
+        assert_eq!(
+            removal["bids"][0]["size"], "0",
+            "a zero size states that the level is removed"
+        );
+    }
 
     #[test]
     fn a_prediction_event_ref_round_trips_through_serde() {

@@ -6,26 +6,28 @@ use market_participants_model::{
         listing_impl::ListingStatus,
         route::{VenueListingKey, VenueRoute},
     },
-    prediction::{PredictionEventRef, PredictionLeg},
+    prediction::{PredictionEventRef, PredictionLeg, PredictionOrderBook},
     routing::CapabilityId,
 };
 
 use super::{
     domain::{MarketSelector, require_listing_route},
     error::{MarketError, market_error_from_catalog},
-    helpers::subscribe,
-    streams::{ForceOrderStream, PredictionSeriesStream},
+    helpers::{execute, protocol_response, subscribe},
+    streams::{ForceOrderStream, PredictionOrderBookStream, PredictionSeriesStream},
     timeframe::{Adjustment, TimeFrame},
 };
 use crate::{
-    adapter::{AdapterLimits, ProtocolRequest},
+    adapter::{AdapterLimits, ProtocolRequest, ProtocolResponse},
     catalog::{
         error::CatalogError,
         resolved::{EnsuredRoute, ResolvedListing},
         store::Catalog,
     },
     connector::MarketParticipantsConnectorInner,
-    market_participants::model::{ForceOrderSubscriptionQuery, PredictionSeriesSubscriptionQuery},
+    market_participants::model::{
+        ForceOrderSubscriptionQuery, PredictionOrderBookQuery, PredictionSeriesSubscriptionQuery,
+    },
 };
 
 /// One catalog row a route publishes, as a caller reads it.
@@ -273,5 +275,43 @@ impl MarketCapability {
         )
         .await?;
         Ok(PredictionSeriesStream::from_handle(handle))
+    }
+
+    /// Reads the order book of one prediction leg.
+    ///
+    /// The query names every leg of the leg's market as well as the leg itself, so
+    /// a book and the probability series of the same market subscribe with one
+    /// payload and share one market-channel topic. The snapshot is one request: a
+    /// caller draws the live stream on top of it.
+    pub async fn fetch_prediction_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> Result<PredictionOrderBook, MarketError> {
+        let route = query.route().clone();
+        let request = ProtocolRequest::FetchPredictionOrderBook(query);
+        match execute(self, route, request).await? {
+            ProtocolResponse::PredictionOrderBook(book) => Ok(book),
+            _ => Err(protocol_response("fetch a prediction order book")),
+        }
+    }
+
+    /// Subscribes to the live order book of one prediction leg.
+    ///
+    /// The subscription is event-scoped like a probability series: a prediction
+    /// leg's venue-native identity is discovered with the event rather than
+    /// catalogued, and the whole market's legs travel with the request so both
+    /// subscriptions acquire the same connection topic.
+    pub async fn subscribe_prediction_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> Result<PredictionOrderBookStream, MarketError> {
+        let route = query.route().clone();
+        let handle = subscribe(
+            self,
+            route,
+            ProtocolRequest::SubscribePredictionOrderBook(query),
+        )
+        .await?;
+        Ok(PredictionOrderBookStream::from_handle(handle))
     }
 }

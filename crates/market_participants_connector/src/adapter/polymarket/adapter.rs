@@ -12,19 +12,20 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use futures::{
-    StreamExt,
+    Stream, StreamExt,
     future::{BoxFuture, join_all},
     stream,
 };
 use market_participants_model::{
     asset::{ContractAddress, CryptoTokenOrigin, CryptoTokenTerms, TokenReference},
-    decimal::{Fraction, Quantity, Ratio, UnixMillis},
+    decimal::{Fraction, Quantity, Ratio, Tick, UnixMillis},
     identifier::{ChainId, IdentifierValue, VenueId, VenueScopeId},
     listing::{
         continuity::{ListingContinuityKey, ListingContinuityTerms},
@@ -33,9 +34,10 @@ use market_participants_model::{
     },
     outcome::OutcomeLegRef,
     prediction::{
-        PredictionCategory, PredictionEventCard, PredictionEventRef, PredictionEventView,
-        PredictionEventsPage, PredictionLeg, PredictionMarket, PredictionMarketGroup,
-        PredictionMarketRef, PredictionNativeLeg, PredictionOptionCard, PredictionPricePoint,
+        PredictionBookLevel, PredictionBookLevelChange, PredictionCategory, PredictionEventCard,
+        PredictionEventRef, PredictionEventView, PredictionEventsPage, PredictionLeg,
+        PredictionMarket, PredictionMarketGroup, PredictionMarketRef, PredictionNativeLeg,
+        PredictionOptionCard, PredictionOrderBook, PredictionOrderBookUpdate, PredictionPricePoint,
         PredictionSeries,
     },
     routing::CapabilityId,
@@ -46,9 +48,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
     heartbeat,
     types::{
-        ClobBatchHistory, ClobBatchHistoryRequest, ClobHistoryPoint, GammaEvent, GammaEventsKeyset,
-        GammaIdList, GammaMarket, GammaSearchResponse, PolymarketBookLevel, PolymarketMarketEvent,
-        PolymarketMarketFrame, PolymarketMarketSubscribe, PolymarketMarketUnsubscribe,
+        ClobBatchHistory, ClobBatchHistoryRequest, ClobBookSnapshot, ClobHistoryPoint, GammaEvent,
+        GammaEventsKeyset, GammaIdList, GammaMarket, GammaSearchResponse, PolymarketBookLevel,
+        PolymarketMarketEvent, PolymarketMarketFrame, PolymarketMarketSubscribe,
+        PolymarketMarketUnsubscribe,
     },
 };
 use crate::{
@@ -56,18 +59,19 @@ use crate::{
         AdapterLimits, ExecutionContext, MarketParticipantAdapter, PreparedRequest, ProtocolEvent,
         ProtocolRequest, ProtocolResponse, SubscriptionHandle, bind_execution_identity,
         prediction::{
-            binary, build_group, exactly_one, group_legs, parse_iso8601_millis, probability,
+            binary, build_group, exactly_one, group_legs, model_error, parse_iso8601_millis,
+            probability,
         },
     },
     catalog::registry::asset::AssetTerms,
     connection::{
-        Connection, ConnectionKey, ConnectionState, ReconnectPolicy, SubscriptionTopic,
-        physical::ConnectionProtocol,
+        Connection, ConnectionKey, ConnectionState, ConnectionSubscription, ReconnectPolicy,
+        SubscriptionTopic, physical::ConnectionProtocol,
     },
     error::MarketParticipantError,
     market_participants::model::{
-        PredictionEventQuery, PredictionEventsQuery, PredictionSeriesQuery,
-        PredictionSeriesSubscriptionQuery,
+        PredictionEventQuery, PredictionEventsQuery, PredictionOrderBookQuery,
+        PredictionSeriesQuery, PredictionSeriesSubscriptionQuery,
     },
 };
 
@@ -470,6 +474,31 @@ impl PolymarketAdapter {
         .await
     }
 
+    /// Opens or joins the market-channel topic of one prediction event's legs.
+    ///
+    /// The topic is the subscription payload itself, so every subscription that
+    /// states the same assets acquires the same lease: a probability series and an
+    /// order book of one market therefore read one topic on one connection.
+    async fn market_channel(
+        &self,
+        context: &ExecutionContext,
+        legs: &[PredictionLeg],
+    ) -> Result<MarketChannelSubscription, MarketParticipantError> {
+        let (subscribe_payload, unsubscribe_payload) = market_channel_payloads(legs)?;
+        let connection = self.connection(context).await?;
+        // Subscribe to the connection's frames before the subscription command is
+        // queued: the market channel answers a subscription with a book snapshot,
+        // and a receiver created afterwards could miss it.
+        let events = Box::pin(connection.event_stream());
+        let topic = SubscriptionTopic::from(subscribe_payload.clone());
+        let lease = connection.subscribe(topic, subscribe_payload, unsubscribe_payload)?;
+        Ok(MarketChannelSubscription {
+            events,
+            cancellation: CancellationToken::new(),
+            lease,
+        })
+    }
+
     /// Subscribes to the live midpoints of one prediction event's legs.
     async fn subscribe_prediction_series(
         &self,
@@ -492,41 +521,11 @@ impl PolymarketAdapter {
                 capability: CapabilityId::PredictionSeries,
             });
         }
-        let asset_ids: Vec<SmolStr> = legs.iter().map(|(asset_id, _)| asset_id.clone()).collect();
-        let subscribe = PolymarketMarketSubscribe {
-            assets_ids: &asset_ids,
-            kind: "market",
-            custom_feature_enabled: true,
-        };
-        let unsubscribe = PolymarketMarketUnsubscribe {
-            assets_ids: &asset_ids,
-            operation: "unsubscribe",
-        };
-        let encode = |value: &PolymarketMarketSubscribe<'_>| {
-            serde_json::to_vec(value).map(Bytes::from).map_err(|error| {
-                MarketParticipantError::Configuration(format_smolstr!(
-                    "encode a Polymarket market subscription: {error}"
-                ))
-            })
-        };
-        let subscribe_payload = encode(&subscribe)?;
-        let unsubscribe_payload =
-            serde_json::to_vec(&unsubscribe)
-                .map(Bytes::from)
-                .map_err(|error| {
-                    MarketParticipantError::Configuration(format_smolstr!(
-                        "encode a Polymarket market unsubscription: {error}"
-                    ))
-                })?;
-        let connection = self.connection(context).await?;
-        // Subscribe to the connection's frames before the subscription command is
-        // queued: the market channel answers a subscription with a book snapshot,
-        // and a receiver created afterwards could miss it.
-        let events = Box::pin(connection.event_stream());
-        let topic = SubscriptionTopic::from(subscribe_payload.clone());
-        let connection_subscription =
-            connection.subscribe(topic, subscribe_payload, unsubscribe_payload)?;
-        let cancellation = CancellationToken::new();
+        let MarketChannelSubscription {
+            events,
+            cancellation,
+            lease,
+        } = self.market_channel(context, &query.legs).await?;
         let state = (events, cancellation.clone(), legs);
         let stream = stream::unfold(state, |(mut events, cancellation, legs)| async move {
             loop {
@@ -553,9 +552,128 @@ impl PolymarketAdapter {
         Ok(SubscriptionHandle::with_connection_subscription(
             Box::pin(stream),
             cancellation,
-            connection_subscription,
+            lease,
         ))
     }
+
+    /// Reads one prediction leg's CLOB book snapshot.
+    async fn prediction_order_book(
+        &self,
+        context: &ExecutionContext,
+        query: &PredictionOrderBookQuery,
+    ) -> Result<PredictionOrderBook, MarketParticipantError> {
+        let asset_id = prediction_order_book_asset(query)?;
+        let mut url = endpoint(context.http_origin(), "book")?;
+        url.query_pairs_mut().append_pair("token_id", &asset_id);
+        let snapshot: ClobBookSnapshot = get_json(context, &url).await?;
+        decode_book_snapshot(snapshot, &query.leg)
+    }
+
+    /// Subscribes to the live book of one prediction leg.
+    ///
+    /// The subscription joins the whole market's topic, exactly like the
+    /// probability series of the same legs, and its frames are filtered to the
+    /// requested asset before they are decoded.
+    async fn subscribe_prediction_order_book(
+        &self,
+        context: &ExecutionContext,
+        query: &PredictionOrderBookQuery,
+    ) -> Result<SubscriptionHandle, MarketParticipantError> {
+        let asset_id = prediction_order_book_asset(query)?;
+        let MarketChannelSubscription {
+            events,
+            cancellation,
+            lease,
+        } = self.market_channel(context, &query.legs).await?;
+        let state = (events, cancellation.clone(), asset_id);
+        let stream = stream::unfold(state, |(mut events, cancellation, asset_id)| async move {
+            loop {
+                let next = tokio::select! {
+                    () = cancellation.cancelled() => return None,
+                    next = events.next() => next,
+                };
+                match next {
+                    Some(Ok(payload)) => match decode_prediction_book_frame(&payload, &asset_id) {
+                        Ok(Some(updates)) => {
+                            return Some((
+                                Ok(ProtocolEvent::PredictionOrderBookUpdate(updates)),
+                                (events, cancellation, asset_id),
+                            ));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            return Some((Err(error), (events, cancellation, asset_id)));
+                        }
+                    },
+                    Some(Err(error)) => {
+                        return Some((Err(error), (events, cancellation, asset_id)));
+                    }
+                    None => return None,
+                }
+            }
+        });
+        Ok(SubscriptionHandle::with_connection_subscription(
+            Box::pin(stream),
+            cancellation,
+            lease,
+        ))
+    }
+}
+
+/// One lease on the market-channel topic of one prediction event's legs.
+struct MarketChannelSubscription {
+    events: ConnectionFrames,
+    cancellation: CancellationToken,
+    lease: ConnectionSubscription,
+}
+
+/// The market-channel frames one connection publishes.
+type ConnectionFrames =
+    Pin<Box<dyn Stream<Item = Result<Bytes, MarketParticipantError>> + Send + 'static>>;
+
+/// Builds the market-channel payloads of one prediction subscription.
+///
+/// The assets are the Polymarket legs in the order the query states them. A
+/// probability series and an order book of the same market therefore encode the
+/// same bytes, which is what makes their subscriptions share one topic lease on
+/// the connection.
+fn market_channel_payloads(
+    legs: &[PredictionLeg],
+) -> Result<(Bytes, Bytes), MarketParticipantError> {
+    let asset_ids: Vec<SmolStr> = legs
+        .iter()
+        .filter_map(|leg| match &leg.native {
+            PredictionNativeLeg::Polymarket { asset_id, .. } => {
+                Some(SmolStr::new(asset_id.as_str()))
+            }
+            PredictionNativeLeg::HyperliquidOutcome { .. } => None,
+        })
+        .collect();
+    let subscribe = PolymarketMarketSubscribe {
+        assets_ids: &asset_ids,
+        kind: "market",
+        custom_feature_enabled: true,
+    };
+    let unsubscribe = PolymarketMarketUnsubscribe {
+        assets_ids: &asset_ids,
+        operation: "unsubscribe",
+    };
+    let subscribe_payload = serde_json::to_vec(&subscribe)
+        .map(Bytes::from)
+        .map_err(|error| {
+            MarketParticipantError::Configuration(format_smolstr!(
+                "encode a Polymarket market subscription: {error}"
+            ))
+        })?;
+    let unsubscribe_payload =
+        serde_json::to_vec(&unsubscribe)
+            .map(Bytes::from)
+            .map_err(|error| {
+                MarketParticipantError::Configuration(format_smolstr!(
+                    "encode a Polymarket market unsubscription: {error}"
+                ))
+            })?;
+    Ok((subscribe_payload, unsubscribe_payload))
 }
 
 impl Default for PolymarketAdapter {
@@ -599,6 +717,7 @@ fn decode_market_frame(
                 bids,
                 asks,
                 timestamp,
+                ..
             } => {
                 let Some(probability) = midpoint_from_levels(&bids, &asks) else {
                     continue;
@@ -645,7 +764,11 @@ fn decode_market_frame(
                     frame_timestamp(timestamp)?,
                 );
             }
-            PolymarketMarketEvent::Unknown => {}
+            // A tick-size or last-trade event moves no midpoint, so the series
+            // reads neither; the order book decodes both.
+            PolymarketMarketEvent::TickSizeChange { .. }
+            | PolymarketMarketEvent::LastTradePrice { .. }
+            | PolymarketMarketEvent::Unknown => {}
         }
     }
     if points.is_empty() {
@@ -726,6 +849,237 @@ fn frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketPartic
     Ok(value.map_or(now, |timestamp| timestamp.max(now)))
 }
 
+/// Reads the instant a market-channel book frame states.
+///
+/// A book update keeps the venue's instant exactly as stated. The reader folds
+/// live updates into a REST snapshot by comparing instants, so raising a stated
+/// one to the arrival time — which the series decoder does on purpose, to keep a
+/// live point from freezing behind history — would make every frame buffered while
+/// the snapshot was in flight look newer than the snapshot, including the full book
+/// dump that opened the subscription. A frame without an instant is stamped with
+/// its arrival time.
+fn book_frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketParticipantError> {
+    match value {
+        Some(timestamp) => Ok(timestamp),
+        None => now_millis(),
+    }
+}
+
+/// Returns the CLOB asset id of the leg one prediction order-book query is for.
+///
+/// The leg has to be one of the market's legs, and it has to be a Polymarket leg:
+/// this adapter publishes the CLOB book, so another native outcome leg is a
+/// capability this route does not serve.
+fn prediction_order_book_asset(
+    query: &PredictionOrderBookQuery,
+) -> Result<SmolStr, MarketParticipantError> {
+    query.validate().map_err(model_error)?;
+    let native = query
+        .legs
+        .iter()
+        .find(|leg| leg.leg == query.leg)
+        .map(|leg| &leg.native);
+    match native {
+        Some(PredictionNativeLeg::Polymarket { asset_id, .. }) => {
+            Ok(SmolStr::new(asset_id.as_str()))
+        }
+        Some(PredictionNativeLeg::HyperliquidOutcome { .. }) | None => {
+            Err(MarketParticipantError::UnsupportedCapability {
+                route: query.event.route.clone(),
+                capability: CapabilityId::PredictionOrderBook,
+            })
+        }
+    }
+}
+
+/// Decodes one CLOB book snapshot into a complete prediction order book.
+fn decode_book_snapshot(
+    snapshot: ClobBookSnapshot,
+    leg: &OutcomeLegRef,
+) -> Result<PredictionOrderBook, MarketParticipantError> {
+    let (bids, asks) = best_first_levels(&snapshot.bids, &snapshot.asks)?;
+    Ok(PredictionOrderBook {
+        leg: leg.clone(),
+        tick_size: snapshot.tick_size.parse::<Tick>().map_err(model_error)?,
+        bids,
+        asks,
+        last_trade_price: optional_fraction(snapshot.last_trade_price.as_deref())?,
+        timestamp: snapshot.timestamp.parse::<UnixMillis>().map_err(|_| {
+            protocol_error(
+                "decode a Polymarket book timestamp",
+                format_smolstr!(
+                    "`{}` is not a millisecond instant",
+                    snapshot.timestamp.as_str()
+                ),
+            )
+        })?,
+    })
+}
+
+/// Normalizes both sides of a venue book to best-first order.
+///
+/// The channel and the REST snapshot both publish bids ascending and asks
+/// descending; a level of size zero is not part of the book.
+fn best_first_levels(
+    bids: &[PolymarketBookLevel],
+    asks: &[PolymarketBookLevel],
+) -> Result<(Vec<PredictionBookLevel>, Vec<PredictionBookLevel>), MarketParticipantError> {
+    let mut bids = book_levels(bids)?;
+    let mut asks = book_levels(asks)?;
+    bids.sort_by_key(|level| std::cmp::Reverse(level.price));
+    asks.sort_by_key(|level| level.price);
+    Ok((bids, asks))
+}
+
+fn book_levels(
+    levels: &[PolymarketBookLevel],
+) -> Result<Vec<PredictionBookLevel>, MarketParticipantError> {
+    let mut decoded = Vec::with_capacity(levels.len());
+    for level in levels {
+        let price = level.price.parse::<Fraction>().map_err(model_error)?;
+        let size = level.size.parse::<Quantity>().map_err(model_error)?;
+        if !size.is_zero() {
+            decoded.push(PredictionBookLevel { price, size });
+        }
+    }
+    Ok(decoded)
+}
+
+/// Parses a decimal the venue may omit or publish as an empty string.
+fn optional_fraction(value: Option<&str>) -> Result<Option<Fraction>, MarketParticipantError> {
+    match value {
+        Some(value) if !value.is_empty() => {
+            value.parse::<Fraction>().map(Some).map_err(model_error)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parses the tick size the venue may omit or publish as an empty string.
+fn optional_tick(value: Option<&str>) -> Result<Option<Tick>, MarketParticipantError> {
+    match value {
+        Some(value) if !value.is_empty() => value.parse::<Tick>().map(Some).map_err(model_error),
+        _ => Ok(None),
+    }
+}
+
+/// Reads the book updates of one market-channel frame for one asset.
+///
+/// Frames are single objects or batches, and only the updates of the requested
+/// asset are published; a batch keeps its frame order. The frame this build does
+/// not read — a global lifecycle event, another venue event — is not an error.
+fn decode_prediction_book_frame(
+    payload: &[u8],
+    asset_id: &str,
+) -> Result<Option<Vec<PredictionOrderBookUpdate>>, MarketParticipantError> {
+    let frame: PolymarketMarketFrame = match serde_json::from_slice(payload) {
+        Ok(frame) => frame,
+        Err(_) => return Ok(None),
+    };
+    let events = match frame {
+        PolymarketMarketFrame::One(event) => vec![event],
+        PolymarketMarketFrame::Many(events) => events,
+    };
+    let mut updates = Vec::new();
+    for event in events {
+        match event {
+            PolymarketMarketEvent::Book {
+                asset_id: event_asset,
+                bids,
+                asks,
+                tick_size,
+                last_trade_price,
+                timestamp,
+            } => {
+                if event_asset.as_str() != asset_id {
+                    continue;
+                }
+                let timestamp = book_frame_timestamp(timestamp)?;
+                let (bids, asks) = best_first_levels(&bids, &asks)?;
+                updates.push(PredictionOrderBookUpdate::Replace {
+                    bids,
+                    asks,
+                    timestamp,
+                });
+                // A live book states its own precision and last trade, so a
+                // subscription that joined a leased topic can seed both before the
+                // REST snapshot is read.
+                if let Some(tick_size) = optional_tick(tick_size.as_deref())? {
+                    updates.push(PredictionOrderBookUpdate::TickSize {
+                        tick_size,
+                        timestamp,
+                    });
+                }
+                if let Some(price) = optional_fraction(last_trade_price.as_deref())? {
+                    updates.push(PredictionOrderBookUpdate::LastTrade { price, timestamp });
+                }
+            }
+            PolymarketMarketEvent::PriceChange {
+                price_changes,
+                timestamp,
+            } => {
+                let timestamp = book_frame_timestamp(timestamp)?;
+                let mut bids = Vec::new();
+                let mut asks = Vec::new();
+                for change in price_changes {
+                    if change.asset_id.as_str() != asset_id {
+                        continue;
+                    }
+                    // The size is the new absolute aggregate size of the level, so a
+                    // zero is published as the removal it is rather than dropped.
+                    let level = PredictionBookLevelChange {
+                        price: change.price.parse::<Fraction>().map_err(model_error)?,
+                        size: change.size.parse::<Quantity>().map_err(model_error)?,
+                    };
+                    match change.side.as_str() {
+                        "BUY" => bids.push(level),
+                        "SELL" => asks.push(level),
+                        _ => {}
+                    }
+                }
+                if !bids.is_empty() || !asks.is_empty() {
+                    updates.push(PredictionOrderBookUpdate::Levels {
+                        bids,
+                        asks,
+                        timestamp,
+                    });
+                }
+            }
+            PolymarketMarketEvent::TickSizeChange {
+                asset_id: event_asset,
+                new_tick_size,
+                timestamp,
+            } => {
+                if event_asset.as_str() != asset_id {
+                    continue;
+                }
+                updates.push(PredictionOrderBookUpdate::TickSize {
+                    tick_size: new_tick_size.parse::<Tick>().map_err(model_error)?,
+                    timestamp: book_frame_timestamp(timestamp)?,
+                });
+            }
+            PolymarketMarketEvent::LastTradePrice {
+                asset_id: event_asset,
+                price,
+                timestamp,
+            } => {
+                if event_asset.as_str() != asset_id {
+                    continue;
+                }
+                updates.push(PredictionOrderBookUpdate::LastTrade {
+                    price: price.parse::<Fraction>().map_err(model_error)?,
+                    timestamp: book_frame_timestamp(timestamp)?,
+                });
+            }
+            PolymarketMarketEvent::BestBidAsk { .. } | PolymarketMarketEvent::Unknown => {}
+        }
+    }
+    if updates.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(updates))
+}
+
 impl MarketParticipantAdapter for PolymarketAdapter {
     fn venue(&self) -> &VenueId {
         &self.venue
@@ -757,6 +1111,11 @@ impl MarketParticipantAdapter for PolymarketAdapter {
                 ProtocolRequest::FetchPredictionSeries(query) => Ok(
                     ProtocolResponse::PredictionSeries(adapter.series(&context, query).await?),
                 ),
+                ProtocolRequest::FetchPredictionOrderBook(query) => {
+                    Ok(ProtocolResponse::PredictionOrderBook(
+                        adapter.prediction_order_book(&context, query).await?,
+                    ))
+                }
                 _ => Err(MarketParticipantError::UnsupportedCapability {
                     route: context.route(),
                     capability: context.capability(),
@@ -776,6 +1135,11 @@ impl MarketParticipantAdapter for PolymarketAdapter {
             match &request {
                 ProtocolRequest::SubscribePredictionSeries(query) => {
                     adapter.subscribe_prediction_series(&context, query).await
+                }
+                ProtocolRequest::SubscribePredictionOrderBook(query) => {
+                    adapter
+                        .subscribe_prediction_order_book(&context, query)
+                        .await
                 }
                 _ => Err(MarketParticipantError::UnsupportedCapability {
                     route: context.route(),
@@ -1557,18 +1921,29 @@ fn now_millis() -> Result<UnixMillis, MarketParticipantError> {
 #[cfg(test)]
 mod tests {
     use market_participants_model::{
-        listing::venue::PolymarketProtocolVersion,
-        prediction::{PredictionEventView, PredictionLeg, PredictionNativeLeg},
+        error::ModelError,
+        listing::venue::{HyperliquidAssetId, HyperliquidOutcomeId, PolymarketProtocolVersion},
+        outcome::OutcomeLegRef,
+        prediction::{
+            PredictionEventRef, PredictionEventView, PredictionLeg, PredictionNativeLeg,
+            PredictionOrderBookUpdate,
+        },
+        routing::CapabilityId,
     };
     use smol_str::SmolStr;
 
     use super::{
-        CATEGORIES, category_of, decode_card, decode_market_frame, decode_view, history_window,
-        is_binary_outcome_set, market_type_label, merge_child_events, merge_localized_event,
-        now_millis, parse_string_array,
+        CATEGORIES, category_of, decode_book_snapshot, decode_card, decode_market_frame,
+        decode_prediction_book_frame, decode_view, history_window, is_binary_outcome_set,
+        market_channel_payloads, market_type_label, merge_child_events, merge_localized_event,
+        now_millis, parse_string_array, prediction_order_book_asset,
     };
-    use crate::adapter::polymarket::types::{
-        GammaEvent, GammaId, GammaIdList, GammaMarket, GammaTag,
+    use crate::{
+        adapter::polymarket::types::{
+            ClobBookSnapshot, GammaEvent, GammaId, GammaIdList, GammaMarket, GammaTag,
+        },
+        error::MarketParticipantError,
+        market_participants::model::{PredictionOrderBookQuery, PredictionSeriesSubscriptionQuery},
     };
 
     #[test]
@@ -2158,5 +2533,454 @@ mod tests {
         assert_eq!(card.market_count, 0);
         assert_eq!(card.remaining_options, 0);
         assert_eq!(card.remaining_markets, 0);
+    }
+
+    /// The event, legs and first leg of one fixture prediction market.
+    fn prediction_market() -> (PredictionEventRef, Vec<PredictionLeg>, OutcomeLegRef) {
+        let event = binary_event(binary_market("v1", &["123", "456"]));
+        let (view, _) = decode_view(&event).expect("the fixture decodes");
+        let legs = view.markets[0].legs.clone();
+        let requested = legs[0].leg.clone();
+        (view.event, legs, requested)
+    }
+
+    /// A book snapshot of the documented CLOB shape.
+    fn book_snapshot() -> ClobBookSnapshot {
+        serde_json::from_str(
+            r#"{
+                "market": "0xd174",
+                "asset_id": "123",
+                "timestamp": "1793896716580",
+                "hash": "0xabc",
+                "bids": [
+                    {"price": "0.001", "size": "691209.17"},
+                    {"price": "0.008", "size": "0"},
+                    {"price": "0.004", "size": "12"}
+                ],
+                "asks": [
+                    {"price": "0.999", "size": "4020342.53"},
+                    {"price": "0.9", "size": "20"},
+                    {"price": "0.95", "size": "0"}
+                ],
+                "min_order_size": "5",
+                "tick_size": "0.001",
+                "neg_risk": false,
+                "last_trade_price": "0.008"
+            }"#,
+        )
+        .expect("the documented snapshot decodes")
+    }
+
+    #[test]
+    fn a_book_snapshot_is_decoded_best_first_with_its_string_numbers() {
+        let (_, _, leg) = prediction_market();
+        let book =
+            decode_book_snapshot(book_snapshot(), &leg).expect("the snapshot decodes into a book");
+
+        assert_eq!(book.leg, leg);
+        assert_eq!(book.tick_size.to_string(), "0.001");
+        assert_eq!(book.timestamp, 1_793_896_716_580);
+        assert_eq!(
+            book.last_trade_price.map(|price| price.to_string()),
+            Some("0.008".to_owned())
+        );
+        assert_eq!(
+            book.bids
+                .iter()
+                .map(|level| level.price.to_string())
+                .collect::<Vec<_>>(),
+            ["0.004", "0.001"],
+            "bids are published best first, and a zero-size level is not part of the book"
+        );
+        assert_eq!(
+            book.asks
+                .iter()
+                .map(|level| level.price.to_string())
+                .collect::<Vec<_>>(),
+            ["0.9", "0.999"],
+            "asks are published best first, and a zero-size level is not part of the book"
+        );
+        assert_eq!(book.asks[0].size.to_string(), "20");
+    }
+
+    #[test]
+    fn a_book_snapshot_without_a_last_trade_reads_no_price() {
+        let snapshot: ClobBookSnapshot = serde_json::from_str(
+            r#"{"timestamp":"1793896716580","bids":[],"asks":[],"tick_size":"0.01"}"#,
+        )
+        .expect("a snapshot without a last trade decodes");
+        let (_, _, leg) = prediction_market();
+        let book = decode_book_snapshot(snapshot, &leg).expect("the snapshot decodes into a book");
+
+        assert_eq!(book.last_trade_price, None);
+        assert!(book.bids.is_empty() && book.asks.is_empty());
+        assert_eq!(book.tick_size.to_string(), "0.01");
+    }
+
+    #[test]
+    fn a_book_frame_replaces_the_book_and_seeds_its_tick_and_last_trade() {
+        let frame: &[u8] = br#"[
+            {"event_type":"new_market","asset_id":"123","timestamp":"1"},
+            {"event_type":"book","market":"0xd174","asset_id":"123","timestamp":"1793896716580","hash":"0xabc",
+             "bids":[{"price":"0.001","size":"691209.17"},{"price":"0.008","size":"5"},{"price":"0.004","size":"0"}],
+             "asks":[{"price":"0.999","size":"4020342.53"},{"price":"0.9","size":"7"}],
+             "tick_size":"0.001","last_trade_price":"0.008"},
+            {"event_type":"book","asset_id":"456","bids":[],"asks":[],"timestamp":"1793896716580"}
+        ]"#;
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries updates");
+
+        assert_eq!(updates.len(), 3, "replace, then the tick, then the trade");
+        let PredictionOrderBookUpdate::Replace {
+            bids,
+            asks,
+            timestamp,
+        } = &updates[0]
+        else {
+            panic!("the first update of a book frame is the replacement");
+        };
+        assert_eq!(
+            *timestamp, 1_793_896_716_580,
+            "a book update keeps the instant the venue stated"
+        );
+        assert_eq!(
+            bids.iter()
+                .map(|level| level.price.to_string())
+                .collect::<Vec<_>>(),
+            ["0.008", "0.001"]
+        );
+        assert_eq!(
+            asks.iter()
+                .map(|level| level.price.to_string())
+                .collect::<Vec<_>>(),
+            ["0.9", "0.999"]
+        );
+        let PredictionOrderBookUpdate::TickSize { tick_size, .. } = &updates[1] else {
+            panic!("the book's own tick follows the replacement");
+        };
+        assert_eq!(tick_size.to_string(), "0.001");
+        let PredictionOrderBookUpdate::LastTrade { price, .. } = &updates[2] else {
+            panic!("the book's last trade follows its tick");
+        };
+        assert_eq!(price.to_string(), "0.008");
+    }
+
+    #[test]
+    fn a_book_frame_without_a_tick_or_trade_publishes_the_replacement_alone() {
+        let frame: &[u8] =
+            br#"{"event_type":"book","asset_id":"123","bids":[],"asks":[],"timestamp":"1"}"#;
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries a replacement");
+
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(
+            updates[0],
+            PredictionOrderBookUpdate::Replace { .. }
+        ));
+    }
+
+    #[test]
+    fn a_price_change_frame_maps_sides_to_new_absolute_sizes() {
+        let frame: &[u8] = br#"{
+            "event_type":"price_change","market":"0xd174","timestamp":"1793896724835",
+            "price_changes":[
+                {"asset_id":"4329","price":"0.29","size":"8275","side":"BUY","hash":"0xa","best_bid":"0.991","best_ask":"0.992"},
+                {"asset_id":"123","price":"0.71","size":"8275","side":"SELL","hash":"0xb","best_bid":"0.008","best_ask":"0.009"},
+                {"asset_id":"123","price":"0.008","size":"0","side":"BUY","hash":"0xc","best_bid":"0.009","best_ask":"0.01"}
+            ]
+        }"#;
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries one change batch");
+
+        assert_eq!(updates.len(), 1);
+        let PredictionOrderBookUpdate::Levels { bids, asks, .. } = &updates[0] else {
+            panic!("a price change is published as level changes");
+        };
+        assert_eq!(bids.len(), 1, "the frame's BUY level is a bid");
+        assert_eq!(bids[0].price.to_string(), "0.008");
+        assert_eq!(
+            bids[0].size.to_string(),
+            "0",
+            "a zero size is the removal of the level, not a level to drop"
+        );
+        assert_eq!(asks.len(), 1, "the frame's SELL level is an ask");
+        assert_eq!(asks[0].price.to_string(), "0.71");
+        assert_eq!(asks[0].size.to_string(), "8275");
+    }
+
+    #[test]
+    fn a_tick_size_change_and_a_last_trade_frame_are_decoded() {
+        let tick: &[u8] = br#"{
+            "event_type":"tick_size_change","asset_id":"123","market":"0xd174",
+            "old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"1793896724835"
+        }"#;
+        let updates = decode_prediction_book_frame(tick, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries a tick change");
+        let PredictionOrderBookUpdate::TickSize { tick_size, .. } = &updates[0] else {
+            panic!("a tick-size change is published as a tick-size update");
+        };
+        assert_eq!(tick_size.to_string(), "0.001");
+        assert_eq!(updates.len(), 1);
+
+        let trade: &[u8] = br#"{
+            "event_type":"last_trade_price","asset_id":"123","market":"0xd174",
+            "price":"0.008","size":"100","side":"BUY","timestamp":"1793896724835"
+        }"#;
+        let updates = decode_prediction_book_frame(trade, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries a trade");
+        let PredictionOrderBookUpdate::LastTrade { price, .. } = &updates[0] else {
+            panic!("a last trade is published as a last-trade update");
+        };
+        assert_eq!(price.to_string(), "0.008");
+        assert_eq!(updates.len(), 1);
+    }
+
+    #[test]
+    fn frames_of_other_assets_and_unknown_events_are_ignored() {
+        let frames: [&[u8]; 6] = [
+            br#"{"event_type":"last_trade_price","asset_id":"456","price":"0.7","timestamp":"1"}"#,
+            br#"{"event_type":"book","asset_id":"456","bids":[],"asks":[],"timestamp":"1"}"#,
+            br#"{"event_type":"tick_size_change","asset_id":"456","new_tick_size":"0.01","timestamp":"1"}"#,
+            br#"{"event_type":"price_change","price_changes":[{"asset_id":"456","price":"0.5","size":"1","side":"BUY"}],"timestamp":"1"}"#,
+            br#"{"event_type":"new_market","asset_id":"123","timestamp":"1"}"#,
+            br#"{"unexpected":"shape"}"#,
+        ];
+
+        for frame in frames {
+            assert!(
+                decode_prediction_book_frame(frame, "123")
+                    .expect("an unread or unrelated frame is not an error")
+                    .is_none(),
+                "a frame this build does not read for this asset publishes no update"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_without_a_timestamp_is_stamped_with_its_arrival() {
+        let before = now_millis().expect("the clock is readable");
+        let frame: &[u8] = br#"{"event_type":"last_trade_price","asset_id":"123","price":"0.5"}"#;
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the frame decodes")
+            .expect("the frame carries a trade");
+
+        let PredictionOrderBookUpdate::LastTrade { timestamp, .. } = &updates[0] else {
+            panic!("a last trade is published as a last-trade update");
+        };
+        assert!(*timestamp >= before);
+    }
+
+    /// A book update keeps the venue's instant exactly.
+    ///
+    /// A reader folds live updates into the REST snapshot it fetched by comparing
+    /// instants, so a frame buffered while the snapshot was in flight must not look
+    /// newer than the snapshot it belongs with. The series decoder raises a stated
+    /// instant on purpose; the book decoder must not.
+    #[test]
+    fn a_book_frame_keeps_the_instant_the_venue_stated() {
+        let read_at = now_millis().expect("the clock is readable");
+        let frames: [&[u8]; 4] = [
+            br#"{"event_type":"book","asset_id":"123","bids":[],"asks":[],"timestamp":"100"}"#,
+            br#"{"event_type":"price_change","price_changes":[{"asset_id":"123","price":"0.4","size":"1","side":"BUY"}],"timestamp":"100"}"#,
+            br#"{"event_type":"tick_size_change","asset_id":"123","new_tick_size":"0.001","timestamp":"100"}"#,
+            br#"{"event_type":"last_trade_price","asset_id":"123","price":"0.5","timestamp":"100"}"#,
+        ];
+
+        for frame in frames {
+            let updates = decode_prediction_book_frame(frame, "123")
+                .expect("the frame decodes")
+                .expect("the frame carries an update");
+            for update in &updates {
+                let timestamp = match update {
+                    PredictionOrderBookUpdate::Replace { timestamp, .. }
+                    | PredictionOrderBookUpdate::Levels { timestamp, .. }
+                    | PredictionOrderBookUpdate::TickSize { timestamp, .. }
+                    | PredictionOrderBookUpdate::LastTrade { timestamp, .. } => *timestamp,
+                };
+                assert_eq!(
+                    timestamp, 100,
+                    "a stated book instant is published as it was stated: {update:?}"
+                );
+                assert!(
+                    timestamp < read_at,
+                    "the stated instant is not raised to the arrival time"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_batch_keeps_its_frame_order() {
+        let frame: &[u8] = br#"[
+            {"event_type":"last_trade_price","asset_id":"123","price":"0.5","timestamp":"1"},
+            {"event_type":"tick_size_change","asset_id":"123","new_tick_size":"0.01","timestamp":"2"},
+            {"event_type":"price_change","price_changes":[{"asset_id":"123","price":"0.4","size":"1","side":"BUY"}],"timestamp":"3"}
+        ]"#;
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the frame decodes")
+            .expect("the batch carries updates");
+
+        assert_eq!(updates.len(), 3);
+        assert!(matches!(
+            updates[0],
+            PredictionOrderBookUpdate::LastTrade { .. }
+        ));
+        assert!(matches!(
+            updates[1],
+            PredictionOrderBookUpdate::TickSize { .. }
+        ));
+        assert!(matches!(
+            updates[2],
+            PredictionOrderBookUpdate::Levels { .. }
+        ));
+    }
+
+    #[test]
+    fn one_price_change_frame_moves_both_the_series_and_the_book() {
+        let (_, legs, _) = prediction_market();
+        let mapping: Vec<(SmolStr, OutcomeLegRef)> = legs
+            .iter()
+            .map(|leg| (SmolStr::new(asset_id(leg)), leg.leg.clone()))
+            .collect();
+        let frame: &[u8] = br#"{
+            "event_type":"price_change","timestamp":"2000",
+            "price_changes":[{"asset_id":"123","price":"0.4","size":"15","side":"BUY","best_bid":"0.2","best_ask":"0.4"}]
+        }"#;
+
+        let series = decode_market_frame(frame, &mapping)
+            .expect("the series still reads the frame")
+            .expect("the frame carries a midpoint");
+        assert_eq!(
+            series[0].points[0].probability,
+            "0.3".parse().expect("the midpoint is a fraction")
+        );
+
+        let updates = decode_prediction_book_frame(frame, "123")
+            .expect("the book reads the frame")
+            .expect("the frame carries a level");
+        let PredictionOrderBookUpdate::Levels { bids, .. } = &updates[0] else {
+            panic!("the change is published as a level change");
+        };
+        assert_eq!(bids[0].price.to_string(), "0.4");
+        assert_eq!(bids[0].size.to_string(), "15");
+    }
+
+    #[test]
+    fn a_valid_query_names_the_asset_of_the_leg_it_is_for() {
+        let (event, legs, _) = prediction_market();
+        for leg in &legs {
+            let query = PredictionOrderBookQuery {
+                event: event.clone(),
+                legs: legs.clone(),
+                leg: leg.leg.clone(),
+            };
+            assert_eq!(
+                prediction_order_book_asset(&query).expect("the query is valid"),
+                asset_id(leg)
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_without_legs_is_refused() {
+        let (event, _, requested) = prediction_market();
+        let query = PredictionOrderBookQuery {
+            event,
+            legs: Vec::new(),
+            leg: requested,
+        };
+        let error =
+            prediction_order_book_asset(&query).expect_err("a query without legs is invalid");
+
+        assert!(matches!(
+            error,
+            MarketParticipantError::MarketModel(boxed)
+                if matches!(*boxed, ModelError::EmptyCollection { field: "legs" })
+        ));
+    }
+
+    #[test]
+    fn a_query_whose_leg_is_not_one_of_the_markets_legs_is_refused() {
+        let (event, legs, _) = prediction_market();
+        let requested = legs[1].leg.clone();
+        let query = PredictionOrderBookQuery {
+            event,
+            legs: vec![legs[0].clone()],
+            leg: requested,
+        };
+        let error = prediction_order_book_asset(&query)
+            .expect_err("a leg outside the market's legs has no book");
+
+        assert!(matches!(
+            error,
+            MarketParticipantError::MarketModel(boxed)
+                if matches!(*boxed, ModelError::InvalidField { field: "leg", .. })
+        ));
+    }
+
+    #[test]
+    fn a_query_for_a_leg_of_another_native_kind_is_refused() {
+        let (event, legs, _) = prediction_market();
+        let mut foreign = legs[0].clone();
+        foreign.native = PredictionNativeLeg::HyperliquidOutcome {
+            outcome: HyperliquidOutcomeId(7),
+            side: foreign.leg.side,
+            encoding: 0,
+            coin: SmolStr::new_static("outcome"),
+            asset_id: HyperliquidAssetId(1),
+        };
+        let query = PredictionOrderBookQuery {
+            event: event.clone(),
+            legs: vec![foreign.clone()],
+            leg: foreign.leg,
+        };
+        let error =
+            prediction_order_book_asset(&query).expect_err("the CLOB publishes no such book");
+
+        assert_eq!(
+            error,
+            MarketParticipantError::UnsupportedCapability {
+                route: event.route,
+                capability: CapabilityId::PredictionOrderBook,
+            }
+        );
+    }
+
+    #[test]
+    fn the_series_and_the_book_of_one_market_subscribe_with_the_same_bytes() {
+        let (event, legs, requested) = prediction_market();
+        let series = PredictionSeriesSubscriptionQuery {
+            event: event.clone(),
+            legs: legs.clone(),
+        };
+        let book = PredictionOrderBookQuery {
+            event,
+            legs,
+            leg: requested,
+        };
+
+        let (series_subscribe, series_unsubscribe) =
+            market_channel_payloads(&series.legs).expect("the series subscription encodes");
+        let (book_subscribe, book_unsubscribe) =
+            market_channel_payloads(&book.legs).expect("the book subscription encodes");
+
+        assert_eq!(
+            (&series_subscribe, &series_unsubscribe),
+            (&book_subscribe, &book_unsubscribe),
+            "one market's series and book share the same topic"
+        );
+        assert_eq!(
+            std::str::from_utf8(&book_subscribe).expect("the payload is UTF-8"),
+            r#"{"assets_ids":["123","456"],"type":"market","custom_feature_enabled":true}"#
+        );
+        assert_eq!(
+            std::str::from_utf8(&book_unsubscribe).expect("the payload is UTF-8"),
+            r#"{"assets_ids":["123","456"],"operation":"unsubscribe"}"#
+        );
     }
 }

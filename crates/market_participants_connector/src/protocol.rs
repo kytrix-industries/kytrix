@@ -259,6 +259,11 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
         Request::SubscribePredictionSeries(query) => {
             route_request(Capability::PredictionSeries, query.route())
         }
+        // A prediction book is event-scoped rather than listing-scoped: the leg it
+        // is for has no catalog listing, so its identity travels in the query.
+        Request::FetchPredictionOrderBook(query) | Request::SubscribePredictionOrderBook(query) => {
+            route_request(Capability::PredictionOrderBook, query.route())
+        }
         Request::FetchOrderBook(query) | Request::SubscribeOrderBook(query) => {
             listing_request(Capability::OrderBook, &query.listing, None)
         }
@@ -673,5 +678,55 @@ mod tests {
             wallet.capability(),
             market_participants_model::routing::CapabilityId::Wallet
         );
+    }
+
+    /// The order book of a prediction leg is its own capability, classed on the
+    /// event's route: it names no catalog listing, so the whole identity travels
+    /// in the query rather than in a listing key.
+    #[test]
+    fn a_prediction_order_book_request_is_classified_on_the_events_route() {
+        use market_participants_model::{
+            identifier::{IdentifierValue, VenueId, VenueScopeId},
+            outcome::{OutcomeGroupId, OutcomeLegRef, OutcomeMemberId, OutcomeSideId},
+            prediction::PredictionEventRef,
+        };
+
+        use crate::market_participants::model::PredictionOrderBookQuery;
+
+        let identity = |digits: &str| format!("v1/{}", digits.repeat(64));
+        let route = VenueRoute::new(
+            VenueId::Polymarket,
+            VenueScopeId::new("predict").expect("the prediction scope is canonical"),
+        );
+        let query = PredictionOrderBookQuery {
+            event: PredictionEventRef {
+                route: route.clone(),
+                native_event: IdentifierValue::new("1262243")
+                    .expect("the fixture event id is valid"),
+            },
+            legs: Vec::new(),
+            leg: OutcomeLegRef {
+                group: OutcomeGroupId::from_identity_value(&identity("1"))
+                    .expect("the fixture group identity is valid"),
+                member: OutcomeMemberId::from_identity_value(&identity("2"))
+                    .expect("the fixture member identity is valid"),
+                side: OutcomeSideId::from_identity_value(&identity("3"))
+                    .expect("the fixture side identity is valid"),
+            },
+        };
+
+        for request in [
+            ProtocolRequest::FetchPredictionOrderBook(query.clone()),
+            ProtocolRequest::SubscribePredictionOrderBook(query),
+        ] {
+            let classified = classify(&request);
+            assert_eq!(
+                classified.capability(),
+                market_participants_model::routing::CapabilityId::PredictionOrderBook
+            );
+            assert_eq!(classified.target().route(), &route);
+            assert_eq!(classified.listing(), None);
+            assert_eq!(classified.command(), None);
+        }
     }
 }

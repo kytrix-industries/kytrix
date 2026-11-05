@@ -20,7 +20,10 @@ use market_participants_model::{
         book::MarketSequence,
         units::{MarketTradeId, PositionSide},
     },
-    prediction::{PredictionEventView, PredictionEventsPage, PredictionSeries},
+    prediction::{
+        PredictionEventView, PredictionEventsPage, PredictionOrderBook, PredictionOrderBookUpdate,
+        PredictionSeries,
+    },
     reference::PriceReferenceTerms,
 };
 use tokio::sync::watch;
@@ -194,6 +197,7 @@ pub enum ProtocolResponse {
     PredictionEvents(PredictionEventsPage),
     PredictionEvent(PredictionEventView),
     PredictionSeries(Vec<PredictionSeries>),
+    PredictionOrderBook(PredictionOrderBook),
     OrderBook(NativeListing<NativeOrderBook>),
     Trades(Vec<NativeListing<NativeTrade>>),
     OrderPlaced(crate::account::shared::OrderId),
@@ -230,6 +234,8 @@ pub enum ProtocolEvent {
     ForceOrder(NativeListing<NativeForceOrder>),
     /// One live probability reading of a prediction event's legs.
     PredictionSeries(Vec<PredictionSeries>),
+    /// One incremental update batch of a prediction order book.
+    PredictionOrderBookUpdate(Vec<PredictionOrderBookUpdate>),
     /// One update of a Hyperliquid wallet stream.
     HyperliquidWalletUpdate(NativeHyperliquidWalletUpdate),
 }

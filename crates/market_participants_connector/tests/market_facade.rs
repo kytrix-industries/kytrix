@@ -5,8 +5,16 @@
 //! tests are the outside view: they compile only if the market facade really
 //! exposes them, which is what a widget's own build depends on.
 
-use market_participants_connector::market::timeframe::{
-    Adjustment, StatisticsTimeFrame, TimeFrame,
+use market_participants_connector::{
+    market::timeframe::{Adjustment, StatisticsTimeFrame, TimeFrame},
+    market_participants::model::query::PredictionOrderBookQuery,
+};
+use market_participants_model::{
+    error::ModelError,
+    identifier::{IdentifierValue, VenueId, VenueScopeId},
+    listing::route::VenueRoute,
+    outcome::{OutcomeGroupId, OutcomeLegRef, OutcomeMemberId, OutcomeSideId},
+    prediction::PredictionEventRef,
 };
 
 /// The candlestick intervals a caller can name, with the wire spellings the
@@ -93,5 +101,43 @@ fn the_market_facade_exposes_the_adjustment_conventions() {
         Adjustment::default(),
         Adjustment::None,
         "the neutral convention is the default one"
+    );
+}
+
+/// The prediction order-book query is nameable outside the connector, and its
+/// route is the event's.
+///
+/// The market facade's order-book methods take the query by value, so a widget
+/// builds one from the model's own event, leg and outcome types. This test is the
+/// outside view of that seam: it compiles only if the query and its fields are
+/// really public.
+#[test]
+fn the_market_facade_exposes_the_prediction_order_book_query() {
+    let identity = |digits: &str| format!("v1/{}", digits.repeat(64));
+    let route = VenueRoute::new(
+        VenueId::Polymarket,
+        VenueScopeId::new("predict").expect("the prediction scope is canonical"),
+    );
+    let query = PredictionOrderBookQuery {
+        event: PredictionEventRef {
+            route: route.clone(),
+            native_event: IdentifierValue::new("1262243").expect("the event id is valid"),
+        },
+        legs: Vec::new(),
+        leg: OutcomeLegRef {
+            group: OutcomeGroupId::from_identity_value(&identity("1"))
+                .expect("the group identity is valid"),
+            member: OutcomeMemberId::from_identity_value(&identity("2"))
+                .expect("the member identity is valid"),
+            side: OutcomeSideId::from_identity_value(&identity("3"))
+                .expect("the side identity is valid"),
+        },
+    };
+
+    assert_eq!(query.route(), &route);
+    assert_eq!(
+        query.validate(),
+        Err(ModelError::EmptyCollection { field: "legs" }),
+        "a book without the market's legs has no topic to join"
     );
 }

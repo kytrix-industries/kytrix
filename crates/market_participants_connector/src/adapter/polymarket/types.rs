@@ -257,6 +257,27 @@ pub struct ClobBatchHistoryRequest<'a> {
     pub end_ts: Option<i64>,
 }
 
+/// One CLOB book snapshot answer.
+///
+/// Every number is a decimal string on the wire. The fields the adapter never
+/// reads — `market`, `asset_id`, `hash`, `min_order_size`, `neg_risk` — are not
+/// stated: this is the typed shape of what a prediction order book is decoded
+/// from, not a mirror of the venue's whole answer.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClobBookSnapshot {
+    #[serde(default, deserialize_with = "deserialize_smol_str")]
+    pub timestamp: SmolStr,
+    #[serde(default)]
+    pub bids: Vec<PolymarketBookLevel>,
+    #[serde(default)]
+    pub asks: Vec<PolymarketBookLevel>,
+    #[serde(default)]
+    pub tick_size: SmolStr,
+    /// Absent and null both mean the venue published no trade yet.
+    #[serde(default)]
+    pub last_trade_price: Option<SmolStr>,
+}
+
 /// One market-channel subscription request.
 #[derive(Clone, Debug, Serialize)]
 pub struct PolymarketMarketSubscribe<'a> {
@@ -283,8 +304,9 @@ pub enum PolymarketMarketFrame {
 
 /// One event of the CLOB market channel.
 ///
-/// Only the events that move a probability are stated; every other event the
-/// venue publishes is the `Unknown` arm and is ignored.
+/// Only the events this build reads are stated; every other event the venue
+/// publishes — a global `new_market` lifecycle message, for instance — is the
+/// `Unknown` arm and is ignored.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "event_type")]
 pub enum PolymarketMarketEvent {
@@ -296,6 +318,12 @@ pub enum PolymarketMarketEvent {
         bids: Vec<PolymarketBookLevel>,
         #[serde(default)]
         asks: Vec<PolymarketBookLevel>,
+        /// The book states its own tick, so a live book can seed the precision
+        /// before the REST snapshot is read.
+        #[serde(default)]
+        tick_size: Option<SmolStr>,
+        #[serde(default)]
+        last_trade_price: Option<SmolStr>,
         #[serde(default, deserialize_with = "optional_millis")]
         timestamp: Option<UnixMillis>,
     },
@@ -317,6 +345,24 @@ pub enum PolymarketMarketEvent {
         #[serde(default, deserialize_with = "optional_millis")]
         timestamp: Option<UnixMillis>,
     },
+    #[serde(rename = "tick_size_change")]
+    TickSizeChange {
+        #[serde(rename = "asset_id", default)]
+        asset_id: SmolStr,
+        #[serde(rename = "new_tick_size", default)]
+        new_tick_size: SmolStr,
+        #[serde(default, deserialize_with = "optional_millis")]
+        timestamp: Option<UnixMillis>,
+    },
+    #[serde(rename = "last_trade_price")]
+    LastTradePrice {
+        #[serde(rename = "asset_id", default)]
+        asset_id: SmolStr,
+        #[serde(default)]
+        price: SmolStr,
+        #[serde(default, deserialize_with = "optional_millis")]
+        timestamp: Option<UnixMillis>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -331,10 +377,21 @@ pub struct PolymarketBookLevel {
 }
 
 /// One changed level of a CLOB book.
+///
+/// `size` is the new absolute aggregate size at the price, not a delta, and `"0"`
+/// removes the level. The best levels are still carried because the probability
+/// series decodes a midpoint from them.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PolymarketPriceChange {
     #[serde(rename = "asset_id", default)]
     pub asset_id: SmolStr,
+    #[serde(default)]
+    pub price: SmolStr,
+    #[serde(default)]
+    pub size: SmolStr,
+    /// `BUY` changes a bid level, `SELL` changes an ask level.
+    #[serde(default)]
+    pub side: SmolStr,
     #[serde(default)]
     pub best_bid: Option<SmolStr>,
     #[serde(default)]
@@ -405,7 +462,9 @@ where
 mod tests {
     use smol_str::SmolStr;
 
-    use super::{ClobBatchHistoryRequest, GammaEvent, GammaId, GammaSearchResponse};
+    use super::{
+        ClobBatchHistoryRequest, ClobBookSnapshot, GammaEvent, GammaId, GammaSearchResponse,
+    };
 
     #[test]
     fn a_parent_event_id_is_read_as_either_a_string_or_a_number() {
@@ -478,5 +537,46 @@ mod tests {
                 .and_then(|pagination| pagination.total_results),
             Some(0)
         );
+    }
+
+    #[test]
+    fn a_book_snapshot_reads_its_decimal_strings() {
+        let snapshot: ClobBookSnapshot = serde_json::from_str(
+            r#"{
+                "market": "0xd174",
+                "asset_id": "3116",
+                "timestamp": "1793896716580",
+                "hash": "0xabc",
+                "bids": [{"price": "0.001", "size": "691209.17"}],
+                "asks": [{"price": "0.999", "size": "4020342.53"}],
+                "min_order_size": "5",
+                "tick_size": "0.001",
+                "neg_risk": false,
+                "last_trade_price": "0.008"
+            }"#,
+        )
+        .expect("the documented book snapshot decodes");
+
+        assert_eq!(snapshot.timestamp, "1793896716580");
+        assert_eq!(snapshot.tick_size, "0.001");
+        assert_eq!(snapshot.bids.len(), 1);
+        assert_eq!(snapshot.bids[0].price, "0.001");
+        assert_eq!(snapshot.bids[0].size, "691209.17");
+        assert_eq!(snapshot.last_trade_price.as_deref(), Some("0.008"));
+    }
+
+    #[test]
+    fn a_book_snapshot_may_publish_its_last_trade_as_null_or_not_at_all() {
+        let absent: ClobBookSnapshot = serde_json::from_str(
+            r#"{"timestamp":"1793896716580","bids":[],"asks":[],"tick_size":"0.01"}"#,
+        )
+        .expect("a snapshot without a last trade decodes");
+        let null: ClobBookSnapshot = serde_json::from_str(
+            r#"{"timestamp":"1793896716580","bids":[],"asks":[],"tick_size":"0.01","last_trade_price":null}"#,
+        )
+        .expect("a null last trade decodes");
+
+        assert!(absent.last_trade_price.is_none());
+        assert!(null.last_trade_price.is_none());
     }
 }

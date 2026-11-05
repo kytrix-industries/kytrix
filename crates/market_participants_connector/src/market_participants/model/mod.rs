@@ -9,10 +9,14 @@
 //! Nothing here carries a route *and* a listing key: a listing-scoped request
 //! reads its route from the key, and only a genuinely route-scoped request names
 //! a `VenueRoute` of its own.
+//!
+//! The query module is public because the market facade's prediction order-book
+//! methods take a query by value, so a caller outside this crate has to be able to
+//! name it. The remaining modules are the adapter boundary's alone.
 
 pub(crate) mod account;
 pub(crate) mod hyperliquid;
-pub(crate) mod query;
+pub mod query;
 
 pub(crate) use account::*;
 pub(crate) use hyperliquid::*;

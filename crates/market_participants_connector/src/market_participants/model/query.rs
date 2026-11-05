@@ -14,6 +14,8 @@ use market_participants_model::{
     instrument::InstrumentKind,
     listing::route::{VenueListingKey, VenueRoute},
     market::selection::OrderQuantity,
+    outcome::{OutcomeLegRef, leg_label},
+    prediction::{PredictionEventRef, PredictionLeg},
 };
 
 /// The interval and adjustment types of the market facade this protocol
@@ -439,6 +441,43 @@ impl PredictionSeriesSubscriptionQuery {
     }
 }
 
+/// The order book of one leg of one prediction event's market.
+///
+/// `legs` is every leg of the market the book belongs to, in the venue's own
+/// order. A prediction venue publishes one market channel topic per set of
+/// assets, so the whole set is stated here: an order book and a probability
+/// series of the same market subscribe with the same payload and therefore share
+/// one topic lease on the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredictionOrderBookQuery {
+    pub event: PredictionEventRef,
+    /// Every leg of the selected market, in venue order.
+    pub legs: Vec<PredictionLeg>,
+    /// The leg this book is for; it must be one of [`Self::legs`].
+    pub leg: OutcomeLegRef,
+}
+
+impl PredictionOrderBookQuery {
+    /// Returns the route this query addresses.
+    pub const fn route(&self) -> &VenueRoute {
+        &self.event.route
+    }
+
+    /// Validates that the book's leg is one of the market's legs.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.legs.is_empty() {
+            return Err(ModelError::EmptyCollection { field: "legs" });
+        }
+        if self.legs.iter().any(|leg| leg.leg == self.leg) {
+            return Ok(());
+        }
+        Err(ModelError::InvalidField {
+            field: "leg",
+            value: leg_label(&self.leg),
+        })
+    }
+}
+
 /// Builds a typed "field has a value the boundary rejects" error.
 pub(crate) fn invalid_field(field: &'static str, value: &'static str) -> ModelError {
     ModelError::InvalidField {
@@ -475,5 +514,118 @@ fn validate_positive(value: u16, field: &'static str) -> Result<(), ModelError> 
         Err(ModelError::ZeroValue { field })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use market_participants_model::{
+        error::ModelError,
+        identifier::{CtfConditionId, IdentifierValue, VenueId, VenueScopeId},
+        listing::{
+            continuity::{ListingContinuityKey, ListingContinuityTerms},
+            route::VenueRoute,
+            venue::{PolymarketAssetId, PolymarketProtocolVersion},
+        },
+        outcome::{OutcomeGroupId, OutcomeLegRef, OutcomeMemberId, OutcomeSideId, leg_label},
+        prediction::{PredictionEventRef, PredictionLeg, PredictionNativeLeg},
+    };
+    use smol_str::format_smolstr;
+
+    use super::PredictionOrderBookQuery;
+
+    /// The prediction event every fixture query is about.
+    fn event() -> PredictionEventRef {
+        PredictionEventRef {
+            route: VenueRoute::new(
+                VenueId::Polymarket,
+                VenueScopeId::new("predict").expect("the prediction scope is canonical"),
+            ),
+            native_event: IdentifierValue::new("1262243").expect("the fixture event id is valid"),
+        }
+    }
+
+    /// One outcome leg of the fixture event.
+    fn leg_ref(digit: &str) -> OutcomeLegRef {
+        let identity = |digits: &str| format!("v1/{}", digits.repeat(64));
+        OutcomeLegRef {
+            group: OutcomeGroupId::from_identity_value(&identity("1"))
+                .expect("the fixture group identity is valid"),
+            member: OutcomeMemberId::from_identity_value(&identity(digit))
+                .expect("the fixture member identity is valid"),
+            side: OutcomeSideId::from_identity_value(&identity("3"))
+                .expect("the fixture side identity is valid"),
+        }
+    }
+
+    /// One Polymarket leg of the fixture event.
+    fn leg(digit: &str, asset_id: &str) -> PredictionLeg {
+        let asset_id: PolymarketAssetId = asset_id.parse().expect("the fixture asset id is valid");
+        let listing = ListingContinuityKey {
+            route: event().route,
+            terms: ListingContinuityTerms::Polymarket {
+                condition_id: CtfConditionId::new(format!("0x{}", "a".repeat(64)))
+                    .expect("the fixture condition id is valid"),
+                asset_id: asset_id.clone(),
+                protocol: PolymarketProtocolVersion::V1,
+            },
+        }
+        .listing_key()
+        .expect("the fixture leg listing is valid");
+        PredictionLeg {
+            leg: leg_ref(digit),
+            label: format_smolstr!("Leg {digit}"),
+            probability: None,
+            listing,
+            native: PredictionNativeLeg::Polymarket {
+                protocol: PolymarketProtocolVersion::V1,
+                asset_id,
+            },
+        }
+    }
+
+    #[test]
+    fn an_order_book_query_addresses_the_route_of_its_event() {
+        let event = event();
+        let query = PredictionOrderBookQuery {
+            event: event.clone(),
+            legs: vec![leg("2", "3116"), leg("4", "4329")],
+            leg: leg_ref("2"),
+        };
+
+        assert_eq!(query.route(), &event.route);
+        assert_eq!(query.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_order_book_query_without_legs_is_refused() {
+        let query = PredictionOrderBookQuery {
+            event: event(),
+            legs: Vec::new(),
+            leg: leg_ref("2"),
+        };
+
+        assert_eq!(
+            query.validate(),
+            Err(ModelError::EmptyCollection { field: "legs" })
+        );
+    }
+
+    #[test]
+    fn an_order_book_query_whose_leg_is_not_a_market_leg_is_refused() {
+        let requested = leg_ref("4");
+        let query = PredictionOrderBookQuery {
+            event: event(),
+            legs: vec![leg("2", "3116")],
+            leg: requested.clone(),
+        };
+
+        assert_eq!(
+            query.validate(),
+            Err(ModelError::InvalidField {
+                field: "leg",
+                value: leg_label(&requested),
+            })
+        );
     }
 }
