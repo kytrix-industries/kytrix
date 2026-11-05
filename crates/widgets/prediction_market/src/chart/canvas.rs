@@ -268,7 +268,7 @@ fn step_path(screen: &[ScreenPoint], width: f32) -> Option<Path<Pixels>> {
 pub(crate) struct ChartCanvasOptions {
     /// The pointer in window coordinates, or `None` while it is outside the chart.
     pub pointer: Option<Point<Pixels>>,
-    /// The endpoint pulse's phase, in `0..2` cycles, while one is running.
+    /// The endpoint pulse's phase, in `0..1`, while one is running.
     pub pulse_phase: Option<f32>,
 }
 

@@ -115,11 +115,8 @@ impl WidgetConfig for PredictionMarketConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// The whole breathing effect at the newest point: two 700 ms cycles.
-const PULSE_DURATION: Duration = Duration::from_millis(1_400);
-
-/// One cycle of the breathing effect; the phase runs `0..2` across the duration.
-const PULSE_CYCLE: Duration = Duration::from_millis(700);
+/// The whole breathing effect at the newest point: one 700 ms cycle.
+const PULSE_DURATION: Duration = Duration::from_millis(700);
 
 /// The endpoint breathing effect, started by a live reading that advanced the newest
 /// point.
@@ -133,13 +130,13 @@ struct Pulse {
 }
 
 impl Pulse {
-    /// The phase in `0..2` cycles, or `None` once the effect has ended.
+    /// The phase in `0..1`, or `None` once the effect has ended.
     fn phase(&self, now: Instant) -> Option<f32> {
         let elapsed = now.saturating_duration_since(self.started);
         if elapsed >= PULSE_DURATION {
             return None;
         }
-        Some(elapsed.as_secs_f32() / PULSE_CYCLE.as_secs_f32())
+        Some(elapsed.as_secs_f32() / PULSE_DURATION.as_secs_f32())
     }
 }
 
@@ -1561,27 +1558,23 @@ mod tests {
     }
 
     #[test]
-    fn the_endpoint_pulse_should_run_two_cycles_and_then_end() {
+    fn the_endpoint_pulse_should_run_one_cycle_and_then_end() {
         let started = Instant::now();
         let pulse = Pulse { started };
 
         assert_eq!(pulse.phase(started), Some(0.0));
-        let second_cycle = pulse
-            .phase(started + Duration::from_millis(700))
-            .expect("the second cycle has begun");
+        let halfway = pulse
+            .phase(started + Duration::from_millis(350))
+            .expect("the cycle is still running");
         assert!(
-            (second_cycle - 1.0).abs() < 1e-4,
-            "the phase names the cycle it is in: {second_cycle}"
+            (halfway - 0.5).abs() < 1e-4,
+            "the phase is the fraction of the single cycle: {halfway}"
         );
-        assert!(
-            pulse
-                .phase(started + Duration::from_millis(1_399))
-                .is_some()
-        );
+        assert!(pulse.phase(started + Duration::from_millis(699)).is_some());
         assert_eq!(
-            pulse.phase(started + Duration::from_millis(1_400)),
+            pulse.phase(started + Duration::from_millis(700)),
             None,
-            "the effect ends after 1.4 s"
+            "the effect ends after 0.7 s"
         );
     }
 

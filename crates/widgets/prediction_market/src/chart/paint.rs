@@ -91,7 +91,6 @@ const ENDPOINT_RADIUS: f32 = HOVER_DOT_INNER / 2.0;
 const PULSE_MIN_RADIUS: f32 = ENDPOINT_RADIUS + 2.0;
 const PULSE_MAX_RADIUS: f32 = 10.0;
 const PULSE_ALPHA: f32 = 0.4;
-const PULSE_PHASE_CYCLES: f32 = 2.0;
 const PULSE_DOT_SCALE: f32 = 0.08;
 
 /// The overhang the dot masks add beyond the plot.
@@ -459,21 +458,20 @@ fn paint_endpoints(
 
 /// The expanding ring's radius and alpha for a pulse phase, if the phase is running.
 fn pulse_ring(phase: f32) -> Option<(f32, f32)> {
-    if !(0.0..PULSE_PHASE_CYCLES).contains(&phase) {
+    if !(0.0..1.0).contains(&phase) {
         return None;
     }
-    let cycle = phase.fract();
-    let radius = PULSE_MIN_RADIUS + (PULSE_MAX_RADIUS - PULSE_MIN_RADIUS) * cycle;
-    let alpha = PULSE_ALPHA * (1.0 - cycle);
+    let radius = PULSE_MIN_RADIUS + (PULSE_MAX_RADIUS - PULSE_MIN_RADIUS) * phase;
+    let alpha = PULSE_ALPHA * (1.0 - phase);
     Some((radius, alpha))
 }
 
 /// How much the endpoint dot itself grows at a pulse phase.
 fn dot_scale(phase: f32) -> f32 {
-    if !(0.0..PULSE_PHASE_CYCLES).contains(&phase) {
+    if !(0.0..1.0).contains(&phase) {
         return 1.0;
     }
-    let triangle = 1.0 - (2.0 * phase.fract() - 1.0).abs();
+    let triangle = 1.0 - (2.0 * phase - 1.0).abs();
     1.0 + PULSE_DOT_SCALE * triangle
 }
 

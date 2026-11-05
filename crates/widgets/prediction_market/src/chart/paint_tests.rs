@@ -935,7 +935,7 @@ fn the_endpoint_pulse_reaches_past_the_plot_edge_without_touching_the_labels(
 ) {
     let (harness, cx) = chart_window(cx, snapshot());
     let plot = draw(&harness, cx).plot();
-    set_pulse(&harness, cx, Some(1.9));
+    set_pulse(&harness, cx, Some(0.95));
     let frame = draw(&harness, cx);
 
     let ring = frame
@@ -978,7 +978,7 @@ fn the_endpoint_pulse_reaches_past_the_plot_edge_without_touching_the_labels(
 fn an_endpoint_pulse_at_the_axis_top_is_not_cut_by_its_mask(cx: &mut TestAppContext) {
     let (harness, cx) = chart_window(cx, two_series(100.0, 50.0));
     let plot = draw(&harness, cx).plot();
-    set_pulse(&harness, cx, Some(1.9));
+    set_pulse(&harness, cx, Some(0.95));
     let frame = draw(&harness, cx);
 
     let ring = frame
