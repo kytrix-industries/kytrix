@@ -32,7 +32,7 @@ widget_tokio_runtime = { workspace = true }
 # enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
-# A config written by an older build has to decode with the fields it never had.
+# The persisted config is JSON, so the round-trip test encodes and decodes one.
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

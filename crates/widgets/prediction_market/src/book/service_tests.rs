@@ -13,14 +13,12 @@ use market_participants_connector::{
         domain::DisconnectReason,
         error::{MarketError, MarketNetworkError},
     },
-    market_participants::model::query::PredictionOrderBookQuery,
 };
 use market_participants_model::{
     decimal::{Fraction, Quantity, Tick, UnixMillis},
     outcome::OutcomeLegRef,
     prediction::{
-        PredictionBookLevel, PredictionEventRef, PredictionEventView, PredictionLeg,
-        PredictionOrderBook, PredictionOrderBookUpdate, PredictionRange, PredictionSeries,
+        PredictionBookLevel, PredictionLeg, PredictionOrderBook, PredictionOrderBookUpdate,
     },
 };
 use smol_str::SmolStr;
@@ -31,15 +29,13 @@ use widget::{
 };
 
 use super::{
-    ATTEMPT_TIMEOUT, MAX_BUFFERED_UPDATES, PredictionOrderBookError, PredictionOrderBookProtocol,
-    PredictionOrderBookRequest, PredictionOrderBookResponse, PredictionOrderBookService,
+    ATTEMPT_TIMEOUT, MAX_BUFFERED_UPDATES, PredictionOrderBookError,
+    PredictionOrderBookEventSubscription, PredictionOrderBookProtocol, PredictionOrderBookRequest,
+    PredictionOrderBookResponse, PredictionOrderBookService, PredictionOrderBookSource,
     PredictionOrderBookStatus, PredictionOrderBookStreamKey, PredictionOrderBookStreamMessage,
 };
 use crate::{
-    service::{
-        PredictionMarketSource, PredictionOrderBookEventSubscription,
-        PredictionSeriesEventSubscription,
-    },
+    model::PredictionOrderBookTarget,
     test_support::{change, charted_market, event_ref, level, order_book},
 };
 
@@ -62,6 +58,15 @@ fn leg() -> OutcomeLegRef {
     legs()[0].leg.clone()
 }
 
+/// The book target every fixture request names.
+fn target() -> PredictionOrderBookTarget {
+    PredictionOrderBookTarget {
+        event: event_ref(),
+        legs: legs(),
+        leg: leg(),
+    }
+}
+
 /// One book with a bid, an ask, a last trade and a stated instant.
 fn book(timestamp: UnixMillis) -> PredictionOrderBook {
     let mut book = order_book(
@@ -77,18 +82,14 @@ fn book(timestamp: UnixMillis) -> PredictionOrderBook {
 
 fn load(epoch: u64) -> PredictionOrderBookRequest {
     PredictionOrderBookRequest::Load {
-        event: event_ref(),
-        legs: legs(),
-        leg: leg(),
+        target: target(),
         epoch,
     }
 }
 
 fn retry(epoch: u64) -> PredictionOrderBookRequest {
     PredictionOrderBookRequest::Retry {
-        event: event_ref(),
-        legs: legs(),
-        leg: leg(),
+        target: target(),
         epoch,
     }
 }
@@ -114,38 +115,12 @@ struct FakeSource {
     subscriptions: Arc<Mutex<VecDeque<FakeSubscription>>>,
 }
 
-impl PredictionMarketSource for FakeSource {
-    type Subscription = PendingSeriesSubscription;
-    type OrderBookSubscription = FakeSubscription;
-
-    async fn event(
-        &self,
-        _event: PredictionEventRef,
-        _locale: Option<SmolStr>,
-    ) -> Result<PredictionEventView, MarketError> {
-        Err(MarketError::ServiceClosed)
-    }
-
-    async fn series(
-        &self,
-        _event: PredictionEventRef,
-        _legs: Vec<PredictionLeg>,
-        _range: PredictionRange,
-    ) -> Result<Vec<PredictionSeries>, MarketError> {
-        Err(MarketError::ServiceClosed)
-    }
-
-    async fn subscribe_series(
-        &self,
-        _event: PredictionEventRef,
-        _legs: Vec<PredictionLeg>,
-    ) -> Result<Self::Subscription, MarketError> {
-        Ok(PendingSeriesSubscription)
-    }
+impl PredictionOrderBookSource for FakeSource {
+    type Subscription = FakeSubscription;
 
     async fn fetch_order_book(
         &self,
-        _query: PredictionOrderBookQuery,
+        _target: PredictionOrderBookTarget,
     ) -> Result<PredictionOrderBook, MarketError> {
         let receiver = self
             .fetches
@@ -160,8 +135,8 @@ impl PredictionMarketSource for FakeSource {
 
     async fn subscribe_order_book(
         &self,
-        _query: PredictionOrderBookQuery,
-    ) -> Result<Self::OrderBookSubscription, MarketError> {
+        _target: PredictionOrderBookTarget,
+    ) -> Result<Self::Subscription, MarketError> {
         let subscription = self
             .subscriptions
             .lock()
@@ -187,15 +162,6 @@ impl PredictionOrderBookEventSubscription for FakeSubscription {
         let updates = self.updates.recv().await;
         let _ = self.taken.send(());
         updates
-    }
-}
-
-/// The chart half of the source, which the book service never touches.
-struct PendingSeriesSubscription;
-
-impl PredictionSeriesEventSubscription for PendingSeriesSubscription {
-    async fn recv(&mut self) -> Option<Result<Vec<PredictionSeries>, MarketError>> {
-        std::future::pending().await
     }
 }
 

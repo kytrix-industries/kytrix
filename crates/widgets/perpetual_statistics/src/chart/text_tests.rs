@@ -35,17 +35,6 @@ fn a_value_with_a_tick_should_use_the_tick_not_a_short_form() {
 }
 
 #[test]
-fn an_integer_part_should_be_grouped_in_threes() {
-    assert_eq!(group_digits("1234567.00"), "1,234,567.00");
-    assert_eq!(group_digits("999"), "999");
-    assert_eq!(group_digits("1000"), "1,000");
-    assert_eq!(group_digits("-12345.5"), "-12,345.5");
-    assert_eq!(group_digits("1.50e18"), "1.50e18");
-    assert_eq!(group_digits("--"), "--");
-    assert_eq!(group_digits(""), "");
-}
-
-#[test]
 fn a_compact_label_should_use_a_readable_suffix() {
     assert_eq!(compact(999.0), "999");
     assert_eq!(compact(1_500.0), "2K");

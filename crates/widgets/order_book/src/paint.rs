@@ -19,7 +19,6 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
-    time::Duration,
 };
 
 use ahash::HashMap;
@@ -44,11 +43,6 @@ pub(super) const IMBALANCE_HEIGHT: Pixels = px(24.0);
 /// The inset every label keeps from the edges of its column, so that two columns
 /// never touch even when both are as wide as they are allowed to be.
 const LEVEL_TEXT_INSET: f32 = 8.0;
-/// How fast a depth bar closes on its new ratio, in e-folds per second.
-pub(super) const DEPTH_ANIMATION_RESPONSE_PER_SECOND: f32 = 12.0;
-/// The movement a bar may still have left and be considered settled: easing the
-/// rest of the way costs frames that no one can see.
-pub(super) const DEPTH_ANIMATION_SETTLE_EPSILON: f32 = 0.001;
 
 /// One level ready to paint: the shaped labels plus the ratios the bar eases
 /// between.
@@ -516,30 +510,9 @@ pub(super) fn drawable_window_size(side_bounds: Bounds<Pixels>) -> usize {
     (rows.max(1.0) as usize).min(WINDOW_SIZES[WINDOW_SIZES.len() - 1])
 }
 
-/// How far a depth-bar easing has come after `elapsed`, given where it started.
-///
-/// The approach is exponential rather than linear, so a bar that is interrupted
-/// by another update keeps its speed instead of restarting, and the movement is
-/// computed from the progress rather than from a frame count, which makes it
-/// independent of how the frames happen to be spaced.
-pub(super) fn depth_animation_progress_after(
-    progress: f32,
-    transition_span: f32,
-    elapsed: Duration,
-) -> f32 {
-    let progress = progress.clamp(0.0, 1.0);
-    let remaining_progress =
-        (1.0 - progress) * (-DEPTH_ANIMATION_RESPONSE_PER_SECOND * elapsed.as_secs_f32()).exp();
-    if transition_span * remaining_progress <= DEPTH_ANIMATION_SETTLE_EPSILON {
-        1.0
-    } else {
-        1.0 - remaining_progress
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, time::Instant};
+    use std::str::FromStr;
 
     use market_participants_model::decimal::{Price, Quantity};
 
@@ -661,86 +634,6 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].right() < pair[1].left())
         );
-    }
-
-    #[test]
-    fn depth_animation_should_advance_before_the_old_thirty_fps_interval() {
-        let started_at = std::time::Instant::now();
-        let mut animation = TestAnimation::new(1.0);
-
-        assert_eq!(animation.advance(started_at), 0.0);
-        let progress = animation.advance(started_at + std::time::Duration::from_millis(1));
-
-        assert!(progress > 0.0);
-        assert!(progress < 1.0);
-    }
-
-    #[test]
-    fn depth_animation_should_not_be_forced_complete_at_150_ms() {
-        let started_at = std::time::Instant::now();
-        let mut animation = TestAnimation::new(1.0);
-
-        animation.advance(started_at);
-        let progress = animation.advance(started_at + std::time::Duration::from_millis(150));
-
-        assert!(progress < 1.0);
-    }
-
-    #[test]
-    fn depth_animation_should_be_independent_of_frame_partitioning() {
-        let started_at = std::time::Instant::now();
-        let mut single_frame = TestAnimation::new(1.0);
-        let mut split_frames = TestAnimation::new(1.0);
-
-        single_frame.advance(started_at);
-        let single_progress =
-            single_frame.advance(started_at + std::time::Duration::from_millis(33));
-        split_frames.advance(started_at);
-        split_frames.advance(started_at + std::time::Duration::from_millis(16));
-        let split_progress =
-            split_frames.advance(started_at + std::time::Duration::from_millis(33));
-
-        assert!((single_progress - split_progress).abs() < 1e-6);
-    }
-
-    #[test]
-    fn depth_animation_should_settle_after_visual_convergence() {
-        let started_at = std::time::Instant::now();
-        let mut animation = TestAnimation::new(1.0);
-
-        animation.advance(started_at);
-        let progress = animation.advance(started_at + std::time::Duration::from_secs(1));
-
-        assert_eq!(progress, 1.0);
-    }
-
-    /// Drives the easing rule the same way the widget does, so the rule is tested
-    /// without a window.
-    struct TestAnimation {
-        progress: f32,
-        span: f32,
-        last_frame: Option<Instant>,
-    }
-
-    impl TestAnimation {
-        fn new(span: f32) -> Self {
-            Self {
-                progress: 0.0,
-                span,
-                last_frame: None,
-            }
-        }
-
-        fn advance(&mut self, now: Instant) -> f32 {
-            if let Some(previous) = self.last_frame.replace(now) {
-                self.progress = depth_animation_progress_after(
-                    self.progress,
-                    self.span,
-                    now.saturating_duration_since(previous),
-                );
-            }
-            self.progress
-        }
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use base_ui::format::group_digits;
 use gpui_kit::{Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window};
 use market_participants_model::decimal::{Price, Quantity, Tick};
 use smol_str::{SmolStr, format_smolstr};
@@ -140,36 +141,6 @@ pub(crate) fn format_price(value: f64, tick: Tick) -> SmolStr {
         || compact(value),
         |inner| group_digits(&Price::from_inner(inner).format_and_round_tick(tick)),
     )
-}
-
-/// The integer part of a formatted number, grouped in threes.
-///
-/// The input is a number as `market_participants_model` writes one — digits, an optional
-/// sign, an optional fractional part, and `e` notation for values beyond the
-/// model's own scale. Everything except the run of digits before the point is
-/// carried over untouched, so this never changes what a number *says*.
-pub(crate) fn group_digits(text: &str) -> SmolStr {
-    let (sign, rest) = match text.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", text),
-    };
-    let (integer, tail) = match rest.find(['.', 'e', 'E']) {
-        Some(at) => rest.split_at(at),
-        None => (rest, ""),
-    };
-    if integer.len() <= 3 || !integer.bytes().all(|byte| byte.is_ascii_digit()) {
-        return SmolStr::new(text);
-    }
-    let mut grouped = String::with_capacity(text.len() + integer.len() / 3);
-    grouped.push_str(sign);
-    for (index, digit) in integer.bytes().enumerate() {
-        if index > 0 && (integer.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(char::from(digit));
-    }
-    grouped.push_str(tail);
-    SmolStr::new(grouped)
 }
 
 /// What a value that is not a reading is shown as.

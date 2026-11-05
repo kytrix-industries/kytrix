@@ -8,8 +8,7 @@ use market_participants_model::{
 
 use super::{
     DEFAULT_BOOK_RATIO, GROUPING_MULTIPLIERS, MAX_BOOK_RATIO, MIN_BOOK_RATIO, clamp_ratio,
-    format_notional, format_price_cents, format_shares, format_spread_cents, group, group_digits,
-    grouping_steps, settle_grouping,
+    format_cents, format_notional, format_shares, group, grouping_steps, settle_grouping,
 };
 use crate::test_support::{charted_market, event_ref, level, order_book};
 
@@ -100,7 +99,6 @@ fn a_coarser_grouping_should_merge_neighbouring_ticks() {
     let grouped = group(&book, 10);
 
     assert_eq!(grouped.tick, "0.001".parse::<Tick>().unwrap());
-    assert_eq!(grouped.step, "0.01".parse::<Tick>().unwrap());
     assert_eq!(
         grouped
             .asks
@@ -208,7 +206,7 @@ fn the_spread_should_be_the_best_ask_minus_the_best_bid() {
     let grouped = group(&book, 1);
 
     assert_eq!(grouped.spread, Some(price("0.008")));
-    assert_eq!(format_spread_cents(price("0.008"), grouped.tick), "0.8¢");
+    assert_eq!(format_cents(price("0.008"), grouped.tick), "0.8¢");
 }
 
 #[test]
@@ -282,12 +280,10 @@ fn a_multiplier_the_tick_cannot_express_should_fall_back_to_the_finest() {
     // A whole-share tick leaves no finer grouping than the tick itself.
     let coarse = order_book(leg(), "1", vec![level("0", "10")], vec![level("1", "10")]);
     assert_eq!(settle_grouping(coarse.tick_size, 10), 1);
-    assert_eq!(group(&coarse, 10).step, "1".parse::<Tick>().unwrap());
 
     // Unknown multipliers never reach the book at all.
     let book = screenshot_asks(leg());
     assert_eq!(settle_grouping(book.tick_size, 7), 1);
-    assert_eq!(group(&book, 7).step, "0.001".parse::<Tick>().unwrap());
 
     // A step of a whole share is not a price grouping.
     let tenth = order_book(leg(), "0.1", Vec::new(), vec![level("0.3", "10")]);
@@ -335,15 +331,15 @@ fn a_price_should_be_quoted_in_cents_at_its_ticks_precision() {
     let thousandth = "0.001".parse::<Tick>().unwrap();
     let cent = "0.01".parse::<Tick>().unwrap();
 
-    assert_eq!(format_price_cents(price("0.346"), thousandth), "34.6¢");
+    assert_eq!(format_cents(price("0.346"), thousandth), "34.6¢");
     assert_eq!(
-        format_price_cents(price("0.34"), thousandth),
+        format_cents(price("0.34"), thousandth),
         "34.0¢",
         "a thousandth tick is a tenth of a cent, so the tenth is kept"
     );
-    assert_eq!(format_price_cents(price("0.34"), cent), "34¢");
-    assert_eq!(format_price_cents(price("1"), cent), "100¢");
-    assert_eq!(format_price_cents(Fraction::ZERO, cent), "0¢");
+    assert_eq!(format_cents(price("0.34"), cent), "34¢");
+    assert_eq!(format_cents(price("1"), cent), "100¢");
+    assert_eq!(format_cents(Fraction::ZERO, cent), "0¢");
 }
 
 #[test]
@@ -363,17 +359,6 @@ fn shares_and_notional_should_be_grouped_and_rounded() {
         "$0.01",
         "half a cent rounds up"
     );
-}
-
-#[test]
-fn group_digits_should_group_only_the_integer_part() {
-    assert_eq!(group_digits("1234567.00"), "1,234,567.00");
-    assert_eq!(group_digits("999"), "999");
-    assert_eq!(group_digits("1000"), "1,000");
-    assert_eq!(group_digits("-12345.5"), "-12,345.5");
-    assert_eq!(group_digits("1.50e18"), "1.50e18");
-    assert_eq!(group_digits("--"), "--");
-    assert_eq!(group_digits(""), "");
 }
 
 #[test]

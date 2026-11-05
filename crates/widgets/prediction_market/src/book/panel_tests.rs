@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base_ui::motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND;
 use gpui_kit::{App, ScrollStrategy, TestAppContext, px};
 use market_participants_model::{
     decimal::Fraction,
@@ -18,10 +19,6 @@ use super::{
     split_ratio,
 };
 use crate::test_support::{charted_market, event_ref, level, order_book};
-
-/// How fast the panel's bars ease, mirrored here so a test can state the ratio it
-/// expects at a given time without reading the panel's own constant.
-const EASING_PER_SECOND: f32 = 12.0;
 
 fn leg(index: usize) -> OutcomeLegRef {
     charted_market(&event_ref(), "charted").1[index].clone()
@@ -68,7 +65,7 @@ fn the_ladder_should_put_the_best_ask_directly_above_the_spread_row() {
         1,
     );
 
-    let grouped = panel.grouped().expect("the book is grouped");
+    let grouped = panel.grouped.as_deref().expect("the book is grouped");
     assert_eq!(row_at(grouped, 0), Some(PanelRow::Ask(&grouped.asks[1])));
     assert_eq!(row_at(grouped, 1), Some(PanelRow::Ask(&grouped.asks[0])));
     assert_eq!(
@@ -115,7 +112,7 @@ fn the_first_book_should_jump_and_anchor_the_spread_row(cx: &mut TestAppContext)
         panel.animation.to.as_ref(),
         "there is no previous frame to move away from"
     );
-    assert!(panel.anchor_pending());
+    assert!(panel.anchor_pending);
 
     cx.update(|cx| {
         install(cx);
@@ -123,18 +120,23 @@ fn the_first_book_should_jump_and_anchor_the_spread_row(cx: &mut TestAppContext)
     });
 
     assert!(
-        !panel.anchor_pending(),
+        !panel.anchor_pending,
         "the frame that drew the ladder consumed the anchor"
     );
     let deferred = panel
-        .scroll()
+        .scroll
         .0
         .borrow()
         .deferred_scroll_to_item
         .expect("the spread row was asked for");
     assert_eq!(
         deferred.item_index,
-        panel.grouped().expect("the book is grouped").asks.len(),
+        panel
+            .grouped
+            .as_deref()
+            .expect("the book is grouped")
+            .asks
+            .len(),
         "the spread row is the anchored item"
     );
     assert_eq!(deferred.strategy, ScrollStrategy::Center);
@@ -148,7 +150,7 @@ fn the_first_book_should_place_every_bar_without_animating() {
         1,
     );
 
-    let grouped = panel.grouped().expect("the book is grouped");
+    let grouped = panel.grouped.as_deref().expect("the book is grouped");
     assert!(!panel.animation.active);
     assert_eq!(panel.animation.span, 0.0);
     assert_eq!(panel.animation.eased, 1.0);
@@ -212,19 +214,19 @@ fn the_bars_should_ease_partially_and_then_settle() {
     panel.set_book(book("0.01", &[], &[("0.40", "10"), ("0.50", "30")]), 1);
 
     let started = Instant::now();
-    panel.animation.started = started - Duration::from_millis(30);
+    panel.animation.last_advanced = started - Duration::from_millis(30);
     assert!(
         panel.advance(started, false),
         "30 ms in, the bars are moving"
     );
-    let expected = 1.0 - (-EASING_PER_SECOND * 0.03).exp();
+    let expected = 1.0 - (-DEPTH_ANIMATION_RESPONSE_PER_SECOND * 0.03).exp();
     assert!(
         (panel.animation.eased - expected).abs() < 1e-5,
         "the movement is read from the elapsed time: {} vs {expected}",
         panel.animation.eased
     );
 
-    panel.animation.started = started - Duration::from_secs(1);
+    panel.animation.last_advanced = started - Duration::from_secs(1);
     assert!(
         !panel.advance(started, false),
         "one second in, what is left is smaller than anyone can see"
@@ -280,11 +282,16 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
 
     // Another grouping is another set of rows, not a movement of the old ones.
     panel.set_multiplier(10);
-    assert_eq!(panel.multiplier(), 10);
+    assert_eq!(panel.multiplier, 10);
     assert!(!panel.animation.active);
-    assert!(panel.anchor_pending());
+    assert!(panel.anchor_pending);
     assert_eq!(
-        panel.grouped().expect("the book is regrouped").asks.len(),
+        panel
+            .grouped
+            .as_deref()
+            .expect("the book is regrouped")
+            .asks
+            .len(),
         1,
         "both ticks fall into the same ten-tick bucket"
     );
@@ -297,7 +304,7 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
     // Another side is another ladder as well.
     panel.clear();
     assert!(panel.is_empty());
-    assert!(!panel.anchor_pending());
+    assert!(!panel.anchor_pending);
     panel.set_book(
         Arc::new(order_book(
             leg(1),
@@ -308,7 +315,7 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
         1,
     );
     assert!(!panel.animation.active);
-    assert!(panel.anchor_pending());
+    assert!(panel.anchor_pending);
 }
 
 #[test]

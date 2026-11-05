@@ -3,15 +3,16 @@
 //! The pane follows one event and draws one line per option. It loads a bounded
 //! history and then follows the venue's live probability stream; the event
 //! selector is the header control, and a venue reload drops the chart it can no
-//! longer vouch for. The range the history is read over is the pane's one persisted
-//! option: the header's timeframe picker states the six ranges the venue publishes,
-//! and a switch drops the chart while the new reading lands under the framework's
+//! longer vouch for. The range the history is read over is one of the pane's four
+//! persisted options: the header's timeframe picker states the ranges the venue
+//! publishes, the book's toggle, notch and price grouping are the others, and a
+//! range switch drops the chart while the new reading lands under the framework's
 //! connecting spinner.
 
 use std::{
     cell::Cell,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -40,8 +41,7 @@ use instrument_selector_ui::{
     prediction_button::PredictionEventButton, prediction_locale::polymarket_locale,
 };
 use market_participants_connector::{
-    connector::MarketParticipantsConnector, market::error::MarketError,
-    venue::loaded::VenuesUpdated,
+    connector::MarketParticipantsConnector, venue::loaded::VenuesUpdated,
 };
 use market_participants_model::{
     identifier::VenueId,
@@ -70,8 +70,9 @@ use crate::{
     book::{
         DEFAULT_BOOK_RATIO, GROUPING_MULTIPLIERS, PredictionBookPanel, PredictionOrderBookError,
         PredictionOrderBookProtocol, PredictionOrderBookRequest, PredictionOrderBookService,
-        PredictionOrderBookStatus, PredictionOrderBookStreamKey, PredictionOrderBookStreamMessage,
-        clamp_ratio, grouping_steps, settle_grouping, split_ratio,
+        PredictionOrderBookSource, PredictionOrderBookStatus, PredictionOrderBookStreamKey,
+        PredictionOrderBookStreamMessage, clamp_ratio, empty_state, grouping_steps,
+        settle_grouping, split_ratio,
     },
     chart::canvas::{ChartCanvasOptions, ChartPaintCaches, chart_element},
     model::{PredictionMarketChoice, PredictionMarketSnapshot, PredictionOrderBookTarget},
@@ -121,7 +122,6 @@ impl LocalizedError for PredictionMarketServiceError {
 
 /// The options the prediction market persists.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default)]
 pub struct PredictionMarketConfig {
     /// The range the history is read over.
     #[serde(rename = "range")]
@@ -450,7 +450,7 @@ impl WidgetView for PredictionMarketWidget {
 
 impl PredictionMarketWidget {
     /// The seam a test answers through.
-    pub fn new_with_source<S>(
+    pub(crate) fn new_with_source<S>(
         config: PredictionMarketConfig,
         source: S,
         status: Entity<WidgetStatus>,
@@ -459,7 +459,7 @@ impl PredictionMarketWidget {
         cx: &mut Context<Self>,
     ) -> Self
     where
-        S: PredictionMarketSource,
+        S: PredictionMarketSource + PredictionOrderBookSource,
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
@@ -703,10 +703,20 @@ impl PredictionMarketWidget {
     /// answers a book request. Asking an unsupported venue would turn every
     /// reading into a failure the user cannot retry away.
     fn book_supported(event: &PredictionEventRef) -> bool {
-        market_participants_connector::venue::definition::venues_supporting(
-            CapabilityId::PredictionOrderBook,
-        )
-        .contains(&event.route.venue)
+        Self::book_venues().contains(&event.route.venue)
+    }
+
+    /// The venues this build can read an order book from.
+    ///
+    /// The table is static, so it is resolved once rather than rebuilt for every
+    /// header and body frame that asks whether the drawn event has a book.
+    fn book_venues() -> &'static [VenueId] {
+        static VENUES: OnceLock<Vec<VenueId>> = OnceLock::new();
+        VENUES.get_or_init(|| {
+            market_participants_connector::venue::definition::venues_supporting(
+                CapabilityId::PredictionOrderBook,
+            )
+        })
     }
 
     /// The book the drawn reading points at, when this build can read it.
@@ -918,9 +928,7 @@ impl PredictionMarketWidget {
         });
         self.book_binding.call(
             PredictionOrderBookRequest::Load {
-                event: target.event,
-                legs: target.legs,
-                leg: target.leg,
+                target,
                 epoch: self.book_epoch,
             },
             cx,
@@ -942,7 +950,7 @@ impl PredictionMarketWidget {
     ) {
         if let Err(error) = result {
             log::warn!("the prediction order book request failed: {error}");
-            self.book_error = Some(PredictionOrderBookError::Market(MarketError::ServiceClosed));
+            self.book_error = Some(PredictionOrderBookError::Rpc(error));
             cx.notify();
         }
     }
@@ -1045,9 +1053,7 @@ impl PredictionMarketWidget {
         });
         self.book_binding.call(
             PredictionOrderBookRequest::Retry {
-                event: target.event,
-                legs: target.legs,
-                leg: target.leg,
+                target,
                 epoch: self.book_epoch,
             },
             cx,
@@ -1342,12 +1348,13 @@ impl PredictionMarketWidget {
     /// The book below the chart: the full ladder while there is one, and the
     /// region that says why there is not.
     ///
-    /// The panel is the body's second child, so it takes a fixed share of it and
-    /// the chart keeps the rest; a short pane still gives it [`MIN_BOOK_HEIGHT`],
-    /// because a failure and its way back have to fit. The panel owns its own
-    /// padding so its column header, its rows and their depth bars share one
-    /// content edge; this wrapper only gives it the share, and a compact error
-    /// strip above it when the book failed after a reading was already drawn.
+    /// The panel sits below the splitter in the chart-and-book area, so it takes
+    /// a fixed share of that area and the chart keeps the rest; a short pane still
+    /// gives it [`MIN_BOOK_HEIGHT`], because a failure and its way back have to
+    /// fit. The panel owns its own padding so its column header, its rows and
+    /// their depth bars share one content edge; this wrapper only gives it the
+    /// share, and a compact error strip above it when the book failed after a
+    /// reading was already drawn.
     fn order_book_panel(&mut self, cx: &Context<Self>) -> AnyElement {
         let panel = div()
             .id(ElementId::Name(SharedString::new_static(
@@ -1366,7 +1373,7 @@ impl PredictionMarketWidget {
             let body = match self.book_error.clone() {
                 Some(error) => self.book_failure(&error, cx),
                 None if self.book_loading() => centered_muted(t!(cx, "common.loading"), cx),
-                None => book_empty_state(cx),
+                None => empty_state(cx),
             };
             return panel.child(body).into_any_element();
         }
@@ -1655,21 +1662,6 @@ impl PredictionMarketWidget {
     }
 }
 
-/// The body the panel draws when the book is known to be empty.
-fn book_empty_state(cx: &Context<PredictionMarketWidget>) -> AnyElement {
-    div()
-        .flex_1()
-        .min_h_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(EmptyState::new(
-            "PredictionMarketBookEmpty",
-            t!(cx, "common.no_data"),
-        ))
-        .into_any_element()
-}
-
 /// One muted sentence, centered in the space the panel would otherwise use.
 fn centered_muted(text: SharedString, cx: &Context<PredictionMarketWidget>) -> AnyElement {
     div()
@@ -1786,11 +1778,10 @@ mod tests {
     use market_participants_connector::{
         connector::MarketParticipantsConnector,
         market::error::MarketError,
-        market_participants::model::query::PredictionOrderBookQuery,
         venue::definition::{CapabilitySupport, ScopeEntry},
     };
     use market_participants_model::{
-        decimal::{Fraction, Ratio, Tick},
+        decimal::{Fraction, Ratio},
         identifier::{IdentifierValue, VenueScopeId},
         listing::route::VenueRoute,
         prediction::{
@@ -1802,6 +1793,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        book::PredictionOrderBookEventSubscription,
         chart::paint::{reset_log, take_log},
         model::PredictionMarketSnapshot,
         service::{
@@ -1819,7 +1811,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeSource {
         ranges: Arc<Mutex<Vec<PredictionRange>>>,
-        book_queries: Arc<Mutex<Vec<PredictionOrderBookQuery>>>,
+        book_targets: Arc<Mutex<Vec<PredictionOrderBookTarget>>>,
         book_streams_closed: Arc<Mutex<usize>>,
     }
 
@@ -1831,8 +1823,8 @@ mod tests {
                 .clone()
         }
 
-        fn book_queries(&self) -> Vec<PredictionOrderBookQuery> {
-            self.book_queries
+        fn book_targets(&self) -> Vec<PredictionOrderBookTarget> {
+            self.book_targets
                 .lock()
                 .expect("the fake's book log is not poisoned")
                 .clone()
@@ -1849,7 +1841,6 @@ mod tests {
 
     impl PredictionMarketSource for FakeSource {
         type Subscription = PendingSubscription;
-        type OrderBookSubscription = WatchedBookSubscription;
 
         async fn event(
             &self,
@@ -1887,17 +1878,21 @@ mod tests {
         ) -> Result<Self::Subscription, MarketError> {
             Ok(PendingSubscription)
         }
+    }
+
+    impl PredictionOrderBookSource for FakeSource {
+        type Subscription = WatchedBookSubscription;
 
         async fn fetch_order_book(
             &self,
-            query: PredictionOrderBookQuery,
+            target: PredictionOrderBookTarget,
         ) -> Result<PredictionOrderBook, MarketError> {
-            self.book_queries
+            self.book_targets
                 .lock()
                 .expect("the fake's book log is not poisoned")
-                .push(query.clone());
+                .push(target.clone());
             let mut book = order_book(
-                query.leg,
+                target.leg,
                 "0.001",
                 vec![level("0.34", "50")],
                 vec![level("0.35", "100")],
@@ -1912,8 +1907,8 @@ mod tests {
 
         async fn subscribe_order_book(
             &self,
-            _query: PredictionOrderBookQuery,
-        ) -> Result<Self::OrderBookSubscription, MarketError> {
+            _target: PredictionOrderBookTarget,
+        ) -> Result<Self::Subscription, MarketError> {
             Ok(WatchedBookSubscription {
                 closed: self.book_streams_closed.clone(),
             })
@@ -1947,7 +1942,7 @@ mod tests {
         }
     }
 
-    impl crate::service::PredictionOrderBookEventSubscription for WatchedBookSubscription {
+    impl PredictionOrderBookEventSubscription for WatchedBookSubscription {
         async fn recv(&mut self) -> Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>> {
             std::future::pending().await
         }
@@ -3062,21 +3057,21 @@ mod tests {
         let (pane, source) = pane_with(cx, PredictionMarketConfig::default(), reports());
         cx.update(|cx| select_event(&pane, cx));
         settle_until(cx, "the book request", |_| {
-            !source.book_queries().is_empty()
+            !source.book_targets().is_empty()
         });
         settle_until(cx, "the first book reading", |cx| {
             pane.read(cx).book_snapshot.is_some()
         });
 
         let (_, legs) = charted_market(&event_ref(), "charted");
-        let queries = source.book_queries();
-        assert_eq!(queries[0].event, event_ref());
+        let targets = source.book_targets();
+        assert_eq!(targets[0].event, event_ref());
         assert_eq!(
-            queries[0].leg, legs[0],
+            targets[0].leg, legs[0],
             "the market's default side is the book the panel shows"
         );
         assert_eq!(
-            queries[0]
+            targets[0]
                 .legs
                 .iter()
                 .map(|leg| leg.leg.clone())
@@ -3257,7 +3252,7 @@ mod tests {
             "the anchored spread row is the one the list is scrolled to"
         );
         let (scrollable, offset) = cx.update(|_, cx| {
-            let scroll = pane.read(cx).book_panel.scroll().clone();
+            let scroll = pane.read(cx).book_panel.scroll.clone();
             let scrollable = scroll.is_scrollable();
             let offset = scroll.0.borrow().base_handle.offset().y;
             (scrollable, offset)
@@ -3322,7 +3317,7 @@ mod tests {
         );
 
         cx.update(|_, cx| {
-            let scroll = pane.read(cx).book_panel.scroll().clone();
+            let scroll = pane.read(cx).book_panel.scroll.clone();
             assert!(scroll.is_scrollable(), "the scroll handle still works");
             assert!(
                 scroll.0.borrow().base_handle.offset().y < px(0.0),
@@ -3440,7 +3435,7 @@ mod tests {
                 Some("0.001".to_owned()),
                 "the picker shows the step the ladder is built at"
             );
-            assert_eq!(pane.book_panel.multiplier(), 1);
+            assert_eq!(pane.book_panel.multiplier, 1);
         });
 
         cx.update(|cx| pane.update(cx, |pane, cx| pane.select_book_grouping(10, cx)));
@@ -3448,12 +3443,7 @@ mod tests {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.config.order_book_grouping, 10);
-            assert_eq!(pane.book_panel.multiplier(), 10);
-            assert_eq!(
-                pane.book_panel.grouped().map(|grouped| grouped.step),
-                Some("0.01".parse::<Tick>().unwrap()),
-                "the ladder was regrouped at the chosen step"
-            );
+            assert_eq!(pane.book_panel.multiplier, 10);
         });
         assert_eq!(reports.get(), 1, "the choice is reported once");
     }
@@ -3489,7 +3479,7 @@ mod tests {
                     pane.config.order_book_grouping, 1,
                     "a hundred-tick step is not a price at a cent tick"
                 );
-                assert_eq!(pane.book_panel.multiplier(), 1);
+                assert_eq!(pane.book_panel.multiplier, 1);
             });
         });
         assert_eq!(reports.get(), 1, "the reset is written back");
@@ -3773,7 +3763,7 @@ mod tests {
         settle_until(cx, "the first book reading", |cx| {
             pane.read(cx).book_snapshot.is_some()
         });
-        assert_eq!(source.book_queries().len(), 1);
+        assert_eq!(source.book_targets().len(), 1);
 
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
@@ -3789,17 +3779,17 @@ mod tests {
                     "the book of the replaced catalog is dropped"
                 );
                 assert!(
-                    pane.book_panel.grouped().is_none(),
+                    pane.book_panel.grouped.is_none(),
                     "and so is the ladder drawn from it"
                 );
             });
         });
 
         settle_until(cx, "the book the reload asked for", |_| {
-            source.book_queries().len() >= 2
+            source.book_targets().len() >= 2
         });
         assert_eq!(
-            source.book_queries().len(),
+            source.book_targets().len(),
             2,
             "the next chart reading points the book at its leg again"
         );
@@ -3901,7 +3891,7 @@ mod tests {
         });
 
         assert!(
-            source.book_queries().is_empty(),
+            source.book_targets().is_empty(),
             "Hyperliquid publishes prediction events but no order book"
         );
         cx.update(|cx| {
@@ -3923,7 +3913,7 @@ mod tests {
             assert!(pane.read(cx).book_key.is_none());
         });
         assert!(
-            source.book_queries().is_empty(),
+            source.book_targets().is_empty(),
             "a retry of an unsupported book asks for nothing"
         );
 
@@ -3984,7 +3974,7 @@ mod tests {
         cx.update(|cx| select_event(&pane, cx));
         settle_until(cx, "the chart reading", |cx| pane.read(cx).has_content());
         assert!(
-            source.book_queries().is_empty(),
+            source.book_targets().is_empty(),
             "a hidden book asks for nothing while the chart loads"
         );
         cx.update(|cx| {
@@ -3994,13 +3984,13 @@ mod tests {
 
         // Showing it starts the reading the chart already points at.
         cx.update(|cx| pane.update(cx, |pane, cx| pane.toggle_book(cx)));
-        settle_until(cx, "the book query the shown panel asks for", |_| {
-            !source.book_queries().is_empty()
+        settle_until(cx, "the book request the shown panel asks for", |_| {
+            !source.book_targets().is_empty()
         });
         settle_until(cx, "the first book reading", |cx| {
             pane.read(cx).book_snapshot.is_some()
         });
-        assert_eq!(source.book_queries().len(), 1);
+        assert_eq!(source.book_targets().len(), 1);
         assert_eq!(reports.get(), 1);
 
         // Hiding retires the stream but keeps the ladder the reader had.
@@ -4016,7 +4006,7 @@ mod tests {
             source.book_streams_closed() > closed_before
         });
         assert_eq!(
-            source.book_queries().len(),
+            source.book_targets().len(),
             1,
             "hiding asks for nothing new"
         );
@@ -4053,8 +4043,8 @@ mod tests {
                 "the ladder kept in memory is drawn meanwhile"
             );
         });
-        settle_until(cx, "the second book query", |_| {
-            source.book_queries().len() == 2
+        settle_until(cx, "the second book request", |_| {
+            source.book_targets().len() == 2
         });
         assert_eq!(reports.get(), 3);
 
@@ -4091,7 +4081,7 @@ mod tests {
             let pane = pane.read(cx);
             assert!(pane.book_error.is_some(), "the failure remains the answer");
             assert!(pane.book_snapshot.is_none(), "no stale ladder is drawn");
-            assert!(pane.book_panel.grouped().is_none());
+            assert!(pane.book_panel.grouped.is_none());
         });
     }
 
@@ -4116,7 +4106,7 @@ mod tests {
                 pane.book_snapshot.is_some(),
                 "the ladder the reader was reading stays on screen"
             );
-            assert!(pane.book_panel.grouped().is_some());
+            assert!(pane.book_panel.grouped.is_some());
             assert_eq!(
                 pane.book_key.as_ref().map(|key| key.epoch),
                 Some(2),
@@ -4230,7 +4220,7 @@ mod tests {
                     pane.book_snapshot.is_none(),
                     "the book of a market nothing holds is dropped"
                 );
-                assert!(pane.book_panel.grouped().is_none());
+                assert!(pane.book_panel.grouped.is_none());
             });
         });
     }
@@ -4329,21 +4319,6 @@ mod tests {
             assert_eq!(config.order_book_grouping, 10);
         });
         assert_eq!(reports.get(), 0, "a supported choice is left alone");
-    }
-
-    #[test]
-    fn a_config_written_before_the_book_existed_should_decode_with_its_defaults() {
-        let config: PredictionMarketConfig =
-            serde_json::from_str(r#"{"range":"hour_1"}"#).expect("the old config decodes");
-
-        assert_eq!(
-            config.range,
-            PredictionRange::Hour1,
-            "a range written by an older build is not reset"
-        );
-        assert!(config.order_book_visible);
-        assert_eq!(config.order_book_ratio, 0.5);
-        assert_eq!(config.order_book_grouping, 1);
     }
 
     #[test]

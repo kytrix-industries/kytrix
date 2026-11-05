@@ -19,7 +19,12 @@
 use std::{rc::Rc, sync::Arc, time::Instant};
 
 use ahash::AHashMap;
-use base_ui::{empty_state::EmptyState, scroll_bar::Scrollbar, style::theme::ThemeExt};
+use base_ui::{
+    empty_state::EmptyState,
+    motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
+    scroll_bar::Scrollbar,
+    style::theme::ThemeExt,
+};
 use gpui_kit::{
     AnyElement, App, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels,
     ScrollStrategy, SharedString, Styled, UniformListScrollHandle, base::ScrollbarMode, div, point,
@@ -33,8 +38,8 @@ use market_participants_model::{
 use smol_str::SmolStr;
 
 use super::model::{
-    GroupedBook, GroupedLevel, clamp_ratio, format_notional, format_price_cents, format_shares,
-    format_spread_cents, group, settle_grouping,
+    GroupedBook, GroupedLevel, clamp_ratio, format_cents, format_notional, format_shares, group,
+    settle_grouping,
 };
 
 /// The height of one ladder row.
@@ -56,13 +61,6 @@ const HEADER_TEXT_SIZE: Pixels = px(11.0);
 /// drawn underneath it.
 const SCROLLBAR_INSET: Pixels = px(10.0);
 
-/// How fast a depth bar closes on its new ratio, in e-folds per second.
-const DEPTH_ANIMATION_RESPONSE_PER_SECOND: f32 = 12.0;
-
-/// The movement a bar may still have left and be considered settled: easing the
-/// rest of the way costs frames no one can see.
-const DEPTH_ANIMATION_SETTLE_EPSILON: f32 = 0.001;
-
 /// The price a depth key is indexed by: the level's own fraction of one share.
 type DepthKey = (bool, u128);
 
@@ -78,8 +76,8 @@ pub(crate) struct DepthAnimation {
     pub to: Rc<AHashMap<DepthKey, f32>>,
     /// The largest distance any bar still has to cover.
     pub span: f32,
-    /// When the movement started.
-    pub started: Instant,
+    /// The frame the movement was last advanced at.
+    pub last_advanced: Instant,
     /// Whether a movement is still running.
     pub active: bool,
     /// How far every bar has come, in `0..=1`.
@@ -93,7 +91,7 @@ impl DepthAnimation {
             from: Rc::new(AHashMap::new()),
             to: Rc::new(AHashMap::new()),
             span: 0.0,
-            started: Instant::now(),
+            last_advanced: Instant::now(),
             active: false,
             eased: 1.0,
         }
@@ -109,7 +107,7 @@ impl DepthAnimation {
         self.from = depths.clone();
         self.to = depths;
         self.span = 0.0;
-        self.started = Instant::now();
+        self.last_advanced = Instant::now();
         self.active = false;
         self.eased = 1.0;
     }
@@ -131,7 +129,7 @@ impl DepthAnimation {
         self.from = Rc::new(from);
         self.to = Rc::new(to);
         self.span = span;
-        self.started = now;
+        self.last_advanced = now;
         self.eased = 0.0;
         self.active = span > DEPTH_ANIMATION_SETTLE_EPSILON;
         if !self.active {
@@ -155,9 +153,10 @@ impl DepthAnimation {
             self.active = false;
             return false;
         }
-        let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
-        self.eased = 1.0 - (-DEPTH_ANIMATION_RESPONSE_PER_SECOND * elapsed).exp();
-        if self.span * (1.0 - self.eased) <= DEPTH_ANIMATION_SETTLE_EPSILON {
+        let elapsed = now.saturating_duration_since(self.last_advanced);
+        self.last_advanced = now;
+        self.eased = depth_animation_progress_after(self.eased, self.span, elapsed);
+        if self.eased >= 1.0 {
             self.eased = 1.0;
             self.active = false;
             false
@@ -454,30 +453,6 @@ impl PredictionBookPanel {
         )
         .into_any_element()
     }
-
-    /// The grouped ladder a frame draws, for tests.
-    #[cfg(test)]
-    pub(crate) fn grouped(&self) -> Option<&GroupedBook> {
-        self.grouped.as_deref()
-    }
-
-    /// The grouping the ladder is built at, for tests.
-    #[cfg(test)]
-    pub(crate) fn multiplier(&self) -> u32 {
-        self.multiplier
-    }
-
-    /// The reader's place in the ladder, for tests.
-    #[cfg(test)]
-    pub(crate) fn scroll(&self) -> &UniformListScrollHandle {
-        &self.scroll
-    }
-
-    /// Whether the next frame will bring the spread row into view, for tests.
-    #[cfg(test)]
-    pub(crate) fn anchor_pending(&self) -> bool {
-        self.anchor_pending
-    }
 }
 
 /// The depth each level of a book asks for, by side and price.
@@ -549,7 +524,7 @@ fn level_row(
                 .bg(depth_color),
         )
         .child(level_cell(
-            SharedString::new(format_price_cents(level.price, tick)),
+            SharedString::new(format_cents(level.price, tick)),
             price_color,
         ))
         .child(level_cell(
@@ -586,14 +561,14 @@ fn spread_row(
         t!(
             cx,
             "widget.prediction_market.book.last",
-            price = format_price_cents(price, grouped.tick)
+            price = format_cents(price, grouped.tick)
         )
     });
     let spread = grouped.spread.map(|spread| {
         t!(
             cx,
             "widget.prediction_market.book.spread",
-            spread = format_spread_cents(spread, grouped.tick)
+            spread = format_cents(spread, grouped.tick)
         )
     });
     let mut right = div().flex().items_center().gap_2();
@@ -621,7 +596,7 @@ fn spread_row(
 }
 
 /// The panel's body when there is no level to draw.
-fn empty_state(cx: &App) -> AnyElement {
+pub(crate) fn empty_state(cx: &App) -> AnyElement {
     div()
         .flex_1()
         .min_h_0()

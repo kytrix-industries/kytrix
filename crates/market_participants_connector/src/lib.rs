@@ -23,7 +23,7 @@ pub(crate) mod connection;
 pub mod connector;
 pub mod error;
 pub mod market;
-pub mod market_participants;
+pub(crate) mod market_participants;
 pub(crate) mod protocol;
 pub mod routing;
 pub mod runtime;

@@ -13,23 +13,27 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    future::Future,
     sync::Arc,
     time::Duration,
 };
 
+use futures::StreamExt;
 use gpui_kit::{App, SharedString};
 use i18n::t;
 use market_participants_connector::{
     error::MarketParticipantError,
-    market::{domain::DisconnectReason, error::MarketError, provider::MarketCapability},
-    market_participants::model::query::PredictionOrderBookQuery,
+    market::{
+        domain::DisconnectReason, error::MarketError, provider::MarketCapability,
+        streams::PredictionOrderBookStream,
+    },
 };
 use market_participants_model::{
     decimal::{Fraction, Quantity, Tick, UnixMillis},
     outcome::OutcomeLegRef,
     prediction::{
-        PredictionBookLevel, PredictionBookLevelChange, PredictionEventRef, PredictionLeg,
-        PredictionOrderBook, PredictionOrderBookUpdate,
+        PredictionBookLevel, PredictionBookLevelChange, PredictionEventRef, PredictionOrderBook,
+        PredictionOrderBookUpdate,
     },
 };
 use thiserror::Error;
@@ -37,11 +41,12 @@ use tokio::time::{Instant, timeout};
 use widget::{
     error::LocalizedError,
     protocol::WidgetProtocol,
+    rpc::RpcCallError,
     runtime::{ServiceContext, WidgetService},
     stream::{StreamPublishError, StreamPublisher},
 };
 
-use crate::service::{PredictionMarketSource, PredictionOrderBookEventSubscription};
+use crate::model::PredictionOrderBookTarget;
 
 /// How long one read may take before it is a failure.
 pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,15 +61,11 @@ pub(crate) const MAX_BUFFERED_UPDATES: usize = 2_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookRequest {
     Load {
-        event: PredictionEventRef,
-        legs: Vec<PredictionLeg>,
-        leg: OutcomeLegRef,
+        target: PredictionOrderBookTarget,
         epoch: u64,
     },
     Retry {
-        event: PredictionEventRef,
-        legs: Vec<PredictionLeg>,
-        leg: OutcomeLegRef,
+        target: PredictionOrderBookTarget,
         epoch: u64,
     },
     /// Retires the stream the panel follows and leaves the service waiting for
@@ -113,6 +114,8 @@ pub(crate) enum PredictionOrderBookError {
     Market(#[source] MarketError),
     #[error("the order book request did not answer within {0:?}")]
     Timeout(Duration),
+    #[error("the order book command failed: {0}")]
+    Rpc(#[source] RpcCallError<PredictionOrderBookServiceError>),
 }
 
 impl LocalizedError for PredictionOrderBookError {
@@ -120,6 +123,7 @@ impl LocalizedError for PredictionOrderBookError {
         match self {
             Self::Market(error) => error.localized_message(cx),
             Self::Timeout(_) => t!(cx, "widget.prediction_market.book.timed_out"),
+            Self::Rpc(error) => error.localized_message(cx),
         }
     }
 }
@@ -147,6 +151,65 @@ impl WidgetProtocol for PredictionOrderBookProtocol {
     type Error = PredictionOrderBookServiceError;
 }
 
+/// The seam between the book panel and the connector, so a test can answer
+/// instead.
+///
+/// One book is one leg of one market: the target names the event, every leg of
+/// the market — the payload a venue's market channel subscribes with — and the
+/// leg the ladder is drawn for.
+pub(crate) trait PredictionOrderBookSource: Clone + Send + Sync + 'static {
+    type Subscription: PredictionOrderBookEventSubscription;
+
+    fn fetch_order_book(
+        &self,
+        target: PredictionOrderBookTarget,
+    ) -> impl Future<Output = Result<PredictionOrderBook, MarketError>> + Send;
+
+    fn subscribe_order_book(
+        &self,
+        target: PredictionOrderBookTarget,
+    ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
+}
+
+/// One live order book stream.
+pub(crate) trait PredictionOrderBookEventSubscription: Send + 'static {
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>>> + Send;
+}
+
+impl PredictionOrderBookSource for MarketCapability {
+    type Subscription = ClientPredictionOrderBookSubscription;
+
+    async fn fetch_order_book(
+        &self,
+        target: PredictionOrderBookTarget,
+    ) -> Result<PredictionOrderBook, MarketError> {
+        self.fetch_prediction_order_book(target.event, target.legs, target.leg)
+            .await
+    }
+
+    async fn subscribe_order_book(
+        &self,
+        target: PredictionOrderBookTarget,
+    ) -> Result<Self::Subscription, MarketError> {
+        let inner = self
+            .subscribe_prediction_order_book(target.event, target.legs, target.leg)
+            .await?;
+        Ok(ClientPredictionOrderBookSubscription { inner })
+    }
+}
+
+pub(crate) struct ClientPredictionOrderBookSubscription {
+    inner: PredictionOrderBookStream,
+}
+
+impl PredictionOrderBookEventSubscription for ClientPredictionOrderBookSubscription {
+    async fn recv(&mut self) -> Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>> {
+        self.inner.next().await
+    }
+}
+
 pub(crate) struct PredictionOrderBookService<S = MarketCapability> {
     source: S,
     attempt_timeout: Duration,
@@ -163,7 +226,7 @@ impl<S> PredictionOrderBookService<S> {
 
 impl<S> WidgetService<PredictionOrderBookProtocol> for PredictionOrderBookService<S>
 where
-    S: PredictionMarketSource,
+    S: PredictionOrderBookSource,
 {
     async fn run(self, mut context: ServiceContext<PredictionOrderBookProtocol>) {
         let mut active_key: Option<PredictionOrderBookStreamKey> = None;
@@ -172,29 +235,15 @@ where
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
-            let (key, query) = match &request {
-                PredictionOrderBookRequest::Load {
-                    event,
-                    legs,
-                    leg,
-                    epoch,
-                }
-                | PredictionOrderBookRequest::Retry {
-                    event,
-                    legs,
-                    leg,
-                    epoch,
-                } => (
+            let (key, target) = match &request {
+                PredictionOrderBookRequest::Load { target, epoch }
+                | PredictionOrderBookRequest::Retry { target, epoch } => (
                     PredictionOrderBookStreamKey {
-                        event: event.clone(),
-                        leg: leg.clone(),
+                        event: target.event.clone(),
+                        leg: target.leg.clone(),
                         epoch: *epoch,
                     },
-                    PredictionOrderBookQuery {
-                        event: event.clone(),
-                        legs: legs.clone(),
-                        leg: leg.clone(),
-                    },
+                    target.clone(),
                 ),
                 // A stop names no stream of its own: it retires whatever the
                 // panel was following and answers, leaving the service ready for
@@ -221,7 +270,7 @@ where
             let attempt_timeout = self.attempt_timeout;
             let stream_key = key.clone();
             context.replace_stream(key.clone(), move |publisher| {
-                run_stream(source, stream_key, query, attempt_timeout, publisher)
+                run_stream(source, stream_key, target, attempt_timeout, publisher)
             });
             active_key = Some(key.clone());
             if reply
@@ -240,11 +289,11 @@ where
 async fn run_stream<S>(
     source: S,
     key: PredictionOrderBookStreamKey,
-    query: PredictionOrderBookQuery,
+    target: PredictionOrderBookTarget,
     attempt_timeout: Duration,
     publisher: StreamPublisher<PredictionOrderBookProtocol>,
 ) where
-    S: PredictionMarketSource,
+    S: PredictionOrderBookSource,
 {
     if publish_status(&publisher, PredictionOrderBookStatus::Connecting)
         .await
@@ -253,7 +302,7 @@ async fn run_stream<S>(
         return;
     }
     let mut subscription =
-        match timeout(attempt_timeout, source.subscribe_order_book(query.clone())).await {
+        match timeout(attempt_timeout, source.subscribe_order_book(target.clone())).await {
             Ok(Ok(subscription)) => subscription,
             Ok(Err(error)) => {
                 fail(&publisher, PredictionOrderBookError::Market(error)).await;
@@ -274,7 +323,7 @@ async fn run_stream<S>(
     // bounded: a panel that fell this far behind redraws the newest state
     // anyway.
     let mut buffered: VecDeque<Vec<PredictionOrderBookUpdate>> = VecDeque::new();
-    let fetch = timeout(attempt_timeout, source.fetch_order_book(query.clone()));
+    let fetch = timeout(attempt_timeout, source.fetch_order_book(target.clone()));
     tokio::pin!(fetch);
     let book = loop {
         tokio::select! {
@@ -305,7 +354,7 @@ async fn run_stream<S>(
         // have no resting level at all, and that is an empty page rather than a
         // failure: the panel says there is no data and the channel stays open,
         // because a book can still appear later.
-        Ok(Err(error)) if is_missing_order_book(&error) => missing_order_book(&query.leg),
+        Ok(Err(error)) if is_missing_order_book(&error) => missing_order_book(&target.leg),
         Ok(Err(error)) => {
             fail(&publisher, PredictionOrderBookError::Market(error)).await;
             return;

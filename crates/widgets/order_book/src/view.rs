@@ -27,6 +27,7 @@ use base_ui::{
     icon::{Icon, IconKind},
     interactive::InteractiveVariantExt,
     menu::{MenuItem, MenuItemAction},
+    motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
     select::Select,
     size::UnifiedSizable,
     style::theme::{Theme, ThemeExt},
@@ -76,10 +77,7 @@ use super::{
         default_window_size, interpolated_ratio, is_after, price_step_label, price_step_labels,
         window_sizes,
     },
-    paint::{
-        DEPTH_ANIMATION_SETTLE_EPSILON, HEADER_HEIGHT, IMBALANCE_HEIGHT, MID_PRICE_HEIGHT,
-        OrderBookPaintCaches, SideCanvas, depth_animation_progress_after,
-    },
+    paint::{HEADER_HEIGHT, IMBALANCE_HEIGHT, MID_PRICE_HEIGHT, OrderBookPaintCaches, SideCanvas},
     service::{
         OrderBookProtocol, OrderBookRequest, OrderBookResponse, OrderBookService, OrderBookSource,
         OrderBookStatus, OrderBookStreamError, OrderBookStreamKey, OrderBookStreamMessage,

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use base_ui::format::group_digits;
 use market_participants_model::{
     decimal::{Fraction, Price, Quantity, Ratio, Tick},
     prediction::{PredictionBookLevel, PredictionOrderBook},
@@ -55,8 +56,6 @@ pub(crate) struct GroupedBook {
     pub spread: Option<Fraction>,
     /// The venue's own tick.
     pub tick: Tick,
-    /// The grouping step, a multiple of [`Self::tick`].
-    pub step: Tick,
     pub best_bid: Option<Fraction>,
     pub best_ask: Option<Fraction>,
 }
@@ -100,7 +99,6 @@ pub(crate) fn group(book: &PredictionOrderBook, multiplier: u32) -> GroupedBook 
         last: book.last_trade_price,
         spread,
         tick,
-        step,
         best_bid,
         best_ask,
     }
@@ -226,27 +224,18 @@ fn depth_ratio(cumulative: u128, total: u128) -> f32 {
     (cumulative as f64 / total as f64).clamp(0.0, 1.0) as f32
 }
 
-/// A price in cents, at the precision its tick is quoted with.
+/// A price, or a difference of prices, in cents at the precision its tick is
+/// quoted with.
 ///
 /// The venue quotes a price as a fraction of one share; a reader of a prediction
 /// book reads it in cents, and the tick decides how many decimals survive the
 /// conversion: a tick of `0.001` is a tenth of a cent, one of `0.01` is a whole
-/// cent.
-pub(crate) fn format_price_cents(price: Fraction, tick: Tick) -> SmolStr {
+/// cent. A spread is a difference of prices, so it is quoted the same way one is.
+pub(crate) fn format_cents(value: Fraction, tick: Tick) -> SmolStr {
     let places = tick.decimal_places().saturating_sub(2);
     format_smolstr!(
         "{}¢",
-        format_scaled(price.ratio().inner().saturating_mul(100), places)
-    )
-}
-
-/// A spread in cents; a spread is a difference of prices, so it is quoted the
-/// same way one is.
-pub(crate) fn format_spread_cents(spread: Fraction, tick: Tick) -> SmolStr {
-    let places = tick.decimal_places().saturating_sub(2);
-    format_smolstr!(
-        "{}¢",
-        format_scaled(spread.ratio().inner().saturating_mul(100), places)
+        format_scaled(value.ratio().inner().saturating_mul(100), places)
     )
 }
 
@@ -273,34 +262,4 @@ fn format_scaled(inner: u128, places: usize) -> SmolStr {
 fn tick_with_places(places: usize) -> Option<Tick> {
     let exponent = u32::try_from(18_usize.checked_sub(places)?).ok()?;
     Tick::from_inner(10_u128.checked_pow(exponent)?).ok()
-}
-
-/// The integer part of a formatted number, grouped in threes.
-///
-/// The input is a number as the model writes one — digits, an optional sign, an
-/// optional fractional part, and `e` notation for values beyond its scale.
-/// Everything except the run of digits before the point is carried over
-/// untouched, so this never changes what a number says.
-pub(crate) fn group_digits(text: &str) -> SmolStr {
-    let (sign, rest) = match text.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", text),
-    };
-    let (integer, tail) = match rest.find(['.', 'e', 'E']) {
-        Some(at) => rest.split_at(at),
-        None => (rest, ""),
-    };
-    if integer.len() <= 3 || !integer.bytes().all(|byte| byte.is_ascii_digit()) {
-        return SmolStr::new(text);
-    }
-    let mut grouped = String::with_capacity(text.len() + integer.len() / 3);
-    grouped.push_str(sign);
-    for (index, digit) in integer.bytes().enumerate() {
-        if index > 0 && (integer.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(char::from(digit));
-    }
-    grouped.push_str(tail);
-    SmolStr::new(grouped)
 }

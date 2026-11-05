@@ -6,6 +6,7 @@ use market_participants_model::{
         listing_impl::ListingStatus,
         route::{VenueListingKey, VenueRoute},
     },
+    outcome::OutcomeLegRef,
     prediction::{PredictionEventRef, PredictionLeg, PredictionOrderBook},
     routing::CapabilityId,
 };
@@ -279,14 +280,17 @@ impl MarketCapability {
 
     /// Reads the order book of one prediction leg.
     ///
-    /// The query names every leg of the leg's market as well as the leg itself, so
-    /// a book and the probability series of the same market subscribe with one
-    /// payload and share one market-channel topic. The snapshot is one request: a
-    /// caller draws the live stream on top of it.
+    /// Every leg of the leg's market travels with the request as well as the leg
+    /// itself, so a book and the probability series of the same market subscribe
+    /// with one payload and share one market-channel topic. The snapshot is one
+    /// request: a caller draws the live stream on top of it.
     pub async fn fetch_prediction_order_book(
         &self,
-        query: PredictionOrderBookQuery,
+        event: PredictionEventRef,
+        legs: Vec<PredictionLeg>,
+        leg: OutcomeLegRef,
     ) -> Result<PredictionOrderBook, MarketError> {
+        let query = PredictionOrderBookQuery { event, legs, leg };
         let route = query.route().clone();
         let request = ProtocolRequest::FetchPredictionOrderBook(query);
         match execute(self, route, request).await? {
@@ -303,8 +307,11 @@ impl MarketCapability {
     /// subscriptions acquire the same connection topic.
     pub async fn subscribe_prediction_order_book(
         &self,
-        query: PredictionOrderBookQuery,
+        event: PredictionEventRef,
+        legs: Vec<PredictionLeg>,
+        leg: OutcomeLegRef,
     ) -> Result<PredictionOrderBookStream, MarketError> {
+        let query = PredictionOrderBookQuery { event, legs, leg };
         let route = query.route().clone();
         let handle = subscribe(
             self,
