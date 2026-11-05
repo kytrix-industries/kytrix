@@ -322,20 +322,29 @@ pub(crate) fn decimate(
     }
     chosen.extend(columns.iter().map(|&(_, index)| index));
     chosen.dedup();
-    let screen: Vec<ScreenPoint> = chosen
-        .into_iter()
-        .map(|index| {
-            let sample = samples[index];
-            ScreenPoint {
-                x: x_for_time(domain, plot, sample.timestamp),
-                y: y_for_percent(sample.percent, axis, plot),
-            }
-        })
-        .collect();
-    let last = last_visible_index.map(|index| ScreenPoint {
-        x: x_for_time(domain, plot, samples[index].timestamp),
-        y: y_for_percent(samples[index].percent, axis, plot),
-    });
+    // A step shorter than one pixel cannot be resolved, and drawing it as its own
+    // horizontal run makes a nearly flat line look doubled: the eye reads the second
+    // antialiased edge as a second stroke. Such a step keeps the previous y instead.
+    // The comparison is against the last drawn y, so a run of subpixel moves still
+    // accumulates into a full pixel rather than being flattened forever.
+    let mut screen: Vec<ScreenPoint> = Vec::with_capacity(chosen.len());
+    let mut drawn_y: Option<Pixels> = None;
+    for index in chosen {
+        let sample = samples[index];
+        let y = y_for_percent(sample.percent, axis, plot);
+        let y = match drawn_y {
+            Some(previous) if (y - previous).abs() < px(1.0) => previous,
+            _ => y,
+        };
+        drawn_y = Some(y);
+        screen.push(ScreenPoint {
+            x: x_for_time(domain, plot, sample.timestamp),
+            y,
+        });
+    }
+    // The newest visible sample is the last point kept, so the endpoint dot shares
+    // the exact y the line reaches instead of floating a fraction of a pixel off it.
+    let last = last_visible_index.and_then(|_| screen.last().copied());
     Decimated { screen, last }
 }
 

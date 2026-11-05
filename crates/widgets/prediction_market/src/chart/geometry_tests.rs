@@ -287,6 +287,53 @@ fn decimation_keeps_a_single_sample_as_one_point() {
 }
 
 #[test]
+fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
+    // A 0.05 point dip over a 900 px plot is 0.45 px: real history, but below the
+    // resolution of the line. It used to paint a parallel antialiased run beside the
+    // flat line, which reads as a duplicated stroke.
+    let plot = Bounds::new(point(px(8.0), px(18.0)), size(px(880.0), px(900.0)));
+    let samples = [
+        sample(0, 99.95),
+        sample(1_000, 99.95),
+        sample(2_000, 99.90),
+        sample(3_000, 99.95),
+    ];
+    let domain = TimeDomain {
+        start: 0,
+        end: 3_000,
+    };
+    let folded = decimate(&samples, domain, &ValueAxis::new(100.0), plot);
+    let ys: Vec<Pixels> = folded.screen.iter().map(|point| point.y).collect();
+
+    assert_eq!(ys.len(), 4, "the samples still keep their columns");
+    assert!(
+        ys.windows(2).all(|pair| pair[0] == pair[1]),
+        "the subpixel dip keeps the line's y: {ys:?}"
+    );
+    assert_eq!(
+        folded.last.map(|point| point.y),
+        ys.first().copied(),
+        "the endpoint sits on the line it ends"
+    );
+}
+
+#[test]
+fn a_probability_step_of_a_pixel_or_more_is_still_drawn() {
+    let plot = Bounds::new(point(px(8.0), px(18.0)), size(px(880.0), px(900.0)));
+    let samples = [sample(0, 99.95), sample(1_000, 99.80)];
+    let domain = TimeDomain {
+        start: 0,
+        end: 1_000,
+    };
+    let folded = decimate(&samples, domain, &ValueAxis::new(100.0), plot);
+
+    assert!(
+        folded.screen[0].y != folded.screen[1].y,
+        "a visible step is not flattened"
+    );
+}
+
+#[test]
 fn a_short_window_picks_a_tick_step_that_fits() {
     let domain = TimeDomain {
         start: 0,
