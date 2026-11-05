@@ -867,6 +867,7 @@ widget:
     book:
       last: '最新: %{price}'
       price: 价格
+      price_grouping: 价格档位
       shares: 份额
       spread: '价差: %{spread}'
       timed_out: 订单簿请求超时

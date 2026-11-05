@@ -5,6 +5,7 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 futures = { workspace = true }
 gpui-kit = { workspace = true }
 i18n = { workspace = true }

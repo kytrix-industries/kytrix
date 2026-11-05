@@ -7406,6 +7406,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 name = "prediction_market"
 version = "0.0.3"
 dependencies = [
+ "ahash",
  "app_config",
  "app_config_provider",
  "base_ui",

@@ -867,6 +867,7 @@ widget:
     book:
       last: 'Last: %{price}'
       price: PRICE
+      price_grouping: Price grouping
       shares: SHARES
       spread: 'Spread: %{spread}'
       timed_out: The order book request timed out
