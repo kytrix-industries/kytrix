@@ -54,15 +54,23 @@ pub(crate) fn market(
     }
 }
 
-/// One event view carrying the given markets.
-pub(crate) fn event_with(markets: Vec<PredictionMarket>) -> PredictionEventView {
+/// One event view of `event` carrying the given markets.
+pub(crate) fn event_of(
+    event: PredictionEventRef,
+    markets: Vec<PredictionMarket>,
+) -> PredictionEventView {
     PredictionEventView {
-        event: event_ref(),
+        event,
         title: SmolStr::new_static("An event"),
         category: PredictionCategory::new("sports", "Sports"),
         ends_at: None,
         markets,
     }
+}
+
+/// One event view carrying the given markets.
+pub(crate) fn event_with(markets: Vec<PredictionMarket>) -> PredictionEventView {
+    event_of(event_ref(), markets)
 }
 
 fn settlement_asset() -> AssetId {

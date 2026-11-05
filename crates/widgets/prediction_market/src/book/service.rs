@@ -20,6 +20,7 @@ use std::{
 use gpui_kit::{App, SharedString};
 use i18n::t;
 use market_participants_connector::{
+    error::MarketParticipantError,
     market::{domain::DisconnectReason, error::MarketError, provider::MarketCapability},
     market_participants::model::query::PredictionOrderBookQuery,
 };
@@ -66,29 +67,19 @@ pub(crate) enum PredictionOrderBookRequest {
         leg: OutcomeLegRef,
         epoch: u64,
     },
-}
-
-impl PredictionOrderBookRequest {
-    pub(crate) fn key(&self) -> PredictionOrderBookStreamKey {
-        match self {
-            Self::Load {
-                event, leg, epoch, ..
-            }
-            | Self::Retry {
-                event, leg, epoch, ..
-            } => PredictionOrderBookStreamKey {
-                event: event.clone(),
-                leg: leg.clone(),
-                epoch: *epoch,
-            },
-        }
-    }
+    /// Retires the stream the panel follows and leaves the service waiting for
+    /// another request.
+    ///
+    /// A hidden panel holds no lease on the venue: the stream is cancelled
+    /// instead of publishing into a channel nobody draws.
+    Stop,
 }
 
 /// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookResponse {
     StreamStarted,
+    Stopped,
 }
 
 /// The event, leg and generation one book follows.
@@ -181,18 +172,40 @@ where
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
-            let key = request.key();
-            let query = match &request {
+            let (key, query) = match &request {
                 PredictionOrderBookRequest::Load {
-                    event, legs, leg, ..
+                    event,
+                    legs,
+                    leg,
+                    epoch,
                 }
                 | PredictionOrderBookRequest::Retry {
-                    event, legs, leg, ..
-                } => PredictionOrderBookQuery {
-                    event: event.clone(),
-                    legs: legs.clone(),
-                    leg: leg.clone(),
-                },
+                    event,
+                    legs,
+                    leg,
+                    epoch,
+                } => (
+                    PredictionOrderBookStreamKey {
+                        event: event.clone(),
+                        leg: leg.clone(),
+                        epoch: *epoch,
+                    },
+                    PredictionOrderBookQuery {
+                        event: event.clone(),
+                        legs: legs.clone(),
+                        leg: leg.clone(),
+                    },
+                ),
+                // A stop names no stream of its own: it retires whatever the
+                // panel was following and answers, leaving the service ready for
+                // the next request.
+                PredictionOrderBookRequest::Stop => {
+                    if let Some(previous) = active_key.take() {
+                        context.cancel_stream(&previous);
+                    }
+                    let _ = reply.respond(Ok(PredictionOrderBookResponse::Stopped));
+                    continue;
+                }
             };
             // A panel follows one leg at a time, so a request for another leg —
             // or for a new epoch of the same one — retires the previous stream
@@ -288,6 +301,11 @@ async fn run_stream<S>(
     };
     let book = match book {
         Ok(Ok(book)) => book,
+        // A token no CLOB book exists for answers 404. Many placeholder markets
+        // have no resting level at all, and that is an empty page rather than a
+        // failure: the panel says there is no data and the channel stays open,
+        // because a book can still appear later.
+        Ok(Err(error)) if is_missing_order_book(&error) => missing_order_book(&query.leg),
         Ok(Err(error)) => {
             fail(&publisher, PredictionOrderBookError::Market(error)).await;
             return;
@@ -304,12 +322,22 @@ async fn run_stream<S>(
 
     // The page is authoritative at its own timestamp: the channel usually opens
     // with a dump of the whole book that was queued before the page was read, so
-    // applying it would roll the reading back to an older instant.
+    // applying it would roll the reading back to an older instant. A whole-book
+    // replace from the page's own instant is such a dump too — the page was read
+    // at that instant and the frame may describe an earlier moment — while an
+    // absolute change at that instant happened after the page by construction.
     let page_timestamp = book.timestamp;
     let mut state = BookState::from_snapshot(&book);
     for batch in buffered {
         for update in &batch {
-            if timestamp_of(update) > page_timestamp {
+            let timestamp = timestamp_of(update);
+            let applies = match update {
+                PredictionOrderBookUpdate::Replace { .. } => timestamp > page_timestamp,
+                PredictionOrderBookUpdate::Levels { .. }
+                | PredictionOrderBookUpdate::TickSize { .. }
+                | PredictionOrderBookUpdate::LastTrade { .. } => timestamp >= page_timestamp,
+            };
+            if applies {
                 state.apply(update);
             }
         }
@@ -386,11 +414,20 @@ impl BookState {
         }
     }
 
-    /// Applies one update, dropping it when the book already holds a newer
-    /// instant. Answers whether the state changed.
+    /// Applies one update, dropping it when the book cannot carry it: a
+    /// whole-book replace states an instant that has to be strictly newer than
+    /// the one the state already holds, while a tick change, a last trade and a
+    /// set of absolute sizes are idempotent and may land on that same instant.
+    /// Answers whether the state changed.
     fn apply(&mut self, update: &PredictionOrderBookUpdate) -> bool {
         let timestamp = timestamp_of(update);
-        if timestamp < self.timestamp {
+        let ordered = match update {
+            PredictionOrderBookUpdate::Replace { .. } => timestamp > self.timestamp,
+            PredictionOrderBookUpdate::Levels { .. }
+            | PredictionOrderBookUpdate::TickSize { .. }
+            | PredictionOrderBookUpdate::LastTrade { .. } => timestamp >= self.timestamp,
+        };
+        if !ordered {
             return false;
         }
         match update {
@@ -466,6 +503,46 @@ fn apply_changes(side: &mut BTreeMap<Fraction, Quantity>, changes: &[PredictionB
             side.insert(change.price, change.size);
         }
     }
+}
+
+/// The tick a token with no book at all is read at.
+///
+/// Polymarket quotes its CLOB in cents, so a cent is the fallback precision an
+/// empty page is stated at. The panel hides its grouping control because the
+/// book has no level to group.
+fn missing_book_tick() -> Tick {
+    // A hundredth of one share, in the model's eighteen-digit fixed point: the
+    // value is not zero, so it is always a valid tick.
+    Tick::from_inner(10_000_000_000_000_000).expect("a cent is a valid tick")
+}
+
+/// The empty page a token with no CLOB book is drawn from.
+fn missing_order_book(leg: &OutcomeLegRef) -> PredictionOrderBook {
+    PredictionOrderBook {
+        leg: leg.clone(),
+        tick_size: missing_book_tick(),
+        bids: Vec::new(),
+        asks: Vec::new(),
+        last_trade_price: None,
+        timestamp: 0,
+    }
+}
+
+/// Whether the venue answered that the requested token has no CLOB book.
+///
+/// Polymarket returns `404 No orderbook exists for the requested token id` for a
+/// token nothing rests on; every other refusal — a rate limit, an unknown token,
+/// a transport failure — stays a failure.
+fn is_missing_order_book(error: &MarketError) -> bool {
+    matches!(
+        error,
+        MarketError::Network(network)
+            if matches!(
+                network.error(),
+                MarketParticipantError::Rejected { code, message, .. }
+                    if code == "404" && message == "No orderbook exists for the requested token id"
+            )
+    )
 }
 
 fn disconnected() -> PredictionOrderBookError {

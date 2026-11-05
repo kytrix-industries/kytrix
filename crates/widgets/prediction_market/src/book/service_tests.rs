@@ -8,7 +8,11 @@ use std::{
 };
 
 use market_participants_connector::{
-    market::{domain::DisconnectReason, error::MarketError},
+    error::MarketParticipantError,
+    market::{
+        domain::DisconnectReason,
+        error::{MarketError, MarketNetworkError},
+    },
     market_participants::model::query::PredictionOrderBookQuery,
 };
 use market_participants_model::{
@@ -28,8 +32,8 @@ use widget::{
 
 use super::{
     ATTEMPT_TIMEOUT, MAX_BUFFERED_UPDATES, PredictionOrderBookError, PredictionOrderBookProtocol,
-    PredictionOrderBookRequest, PredictionOrderBookService, PredictionOrderBookStatus,
-    PredictionOrderBookStreamKey, PredictionOrderBookStreamMessage,
+    PredictionOrderBookRequest, PredictionOrderBookResponse, PredictionOrderBookService,
+    PredictionOrderBookStatus, PredictionOrderBookStreamKey, PredictionOrderBookStreamMessage,
 };
 use crate::{
     service::{
@@ -87,6 +91,20 @@ fn retry(epoch: u64) -> PredictionOrderBookRequest {
         leg: leg(),
         epoch,
     }
+}
+
+fn stop() -> PredictionOrderBookRequest {
+    PredictionOrderBookRequest::Stop
+}
+
+/// The refusal Polymarket answers a token that has no CLOB book at all with.
+fn no_book_error() -> MarketError {
+    MarketError::Network(MarketNetworkError::from(MarketParticipantError::Rejected {
+        code: SmolStr::new_static("404"),
+        message: SmolStr::new_static("No orderbook exists for the requested token id"),
+        retryable: false,
+        raw_response: None,
+    }))
 }
 
 /// The queued answers of the fake source: one page and one channel per call.
@@ -804,6 +822,309 @@ async fn a_new_epoch_should_replace_the_old_stream() {
         latest.next_unseen().is_none(),
         "the replaced stream publishes nothing more"
     );
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_buffered_levels_at_the_pages_own_instant_should_be_applied() {
+    let harness = Harness::new();
+    let (updates, mut taken) = harness.subscribe();
+    let fetch = harness.fetch();
+    let mut latest = harness.runtime.latest_stream();
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    // Both frames land while the page is in flight. The replace states the whole
+    // book as it was queued before the page was read, so it loses to the page;
+    // the absolute sizes are newer by construction, even at the same instant.
+    updates
+        .send(Ok(vec![
+            PredictionOrderBookUpdate::Replace {
+                bids: vec![level("0.1", "1")],
+                asks: Vec::new(),
+                timestamp: 1_000,
+            },
+            PredictionOrderBookUpdate::Levels {
+                bids: vec![change("0.34", "80")],
+                asks: Vec::new(),
+                timestamp: 1_000,
+            },
+        ]))
+        .await
+        .expect("the fake channel is open");
+    taken
+        .recv()
+        .await
+        .expect("the frame was taken from the channel");
+    fetch.send(Ok(book(1_000))).expect("the fetch is waiting");
+
+    let snapshot = next_snapshot(&mut latest).await;
+
+    assert_eq!(
+        prices(&snapshot.bids),
+        vec![price("0.34")],
+        "the whole-book replace from the page's own instant is the dump that \
+         predates the page"
+    );
+    assert_eq!(
+        sizes(&snapshot.bids),
+        vec![size("80")],
+        "an absolute size stated at the page's own instant happened after it"
+    );
+    assert_eq!(snapshot.timestamp, 1_000);
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_live_replace_at_the_pages_own_instant_should_be_refused() {
+    let harness = Harness::new();
+    let (updates, _taken) = harness.subscribe();
+    let fetch = harness.fetch();
+    let mut latest = harness.runtime.latest_stream();
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    fetch.send(Ok(book(1_000))).expect("the fetch is waiting");
+    let first = next_snapshot(&mut latest).await;
+    assert_eq!(prices(&first.bids), vec![price("0.34")]);
+
+    updates
+        .send(Ok(vec![PredictionOrderBookUpdate::Replace {
+            bids: vec![level("0.1", "1")],
+            asks: Vec::new(),
+            timestamp: 1_000,
+        }]))
+        .await
+        .expect("the fake channel is open");
+    // A refused frame publishes nothing, so the next reading is the one the
+    // following accepted frame produces.
+    updates
+        .send(Ok(vec![PredictionOrderBookUpdate::Levels {
+            bids: vec![change("0.33", "4")],
+            asks: Vec::new(),
+            timestamp: 2_000,
+        }]))
+        .await
+        .expect("the fake channel is open");
+    let snapshot = next_snapshot(&mut latest).await;
+
+    assert_eq!(
+        prices(&snapshot.bids),
+        vec![price("0.34"), price("0.33")],
+        "the same-instant replace did not roll the page back"
+    );
+    assert_eq!(snapshot.timestamp, 2_000);
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replace_tick_and_trade_at_the_same_newer_instant_should_all_apply() {
+    let harness = Harness::new();
+    let (updates, _taken) = harness.subscribe();
+    let fetch = harness.fetch();
+    let mut latest = harness.runtime.latest_stream();
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    fetch.send(Ok(book(1_000))).expect("the fetch is waiting");
+    let _ = next_snapshot(&mut latest).await;
+
+    updates
+        .send(Ok(vec![
+            PredictionOrderBookUpdate::Replace {
+                bids: vec![level("0.2", "5")],
+                asks: vec![level("0.3", "6")],
+                timestamp: 2_000,
+            },
+            PredictionOrderBookUpdate::TickSize {
+                tick_size: "0.01".parse::<Tick>().expect("the fixture tick is valid"),
+                timestamp: 2_000,
+            },
+            PredictionOrderBookUpdate::LastTrade {
+                price: price("0.25"),
+                timestamp: 2_000,
+            },
+        ]))
+        .await
+        .expect("the fake channel is open");
+    let snapshot = next_snapshot(&mut latest).await;
+
+    assert_eq!(prices(&snapshot.bids), vec![price("0.2")]);
+    assert_eq!(prices(&snapshot.asks), vec![price("0.3")]);
+    assert_eq!(
+        snapshot.tick_size,
+        "0.01".parse::<Tick>().expect("the fixture tick is valid"),
+        "a tick stated at the same instant as the replace is applied"
+    );
+    assert_eq!(
+        snapshot.last_trade_price,
+        Some(price("0.25")),
+        "so is a last trade at that instant"
+    );
+    assert_eq!(snapshot.timestamp, 2_000);
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_token_with_no_book_should_publish_an_empty_page_and_then_follow_the_channel() {
+    let mut harness = Harness::new();
+    let (updates, _taken) = harness.subscribe();
+    let fetch = harness.fetch();
+    let mut latest = harness.runtime.latest_stream();
+    let mut reliable = harness.take_reliable();
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    fetch
+        .send(Err(no_book_error()))
+        .expect("the fetch is waiting");
+
+    let empty = next_snapshot(&mut latest).await;
+    assert_eq!(empty.leg, leg(), "the page names the leg it was read for");
+    assert_eq!(
+        empty.tick_size,
+        "0.01".parse::<Tick>().expect("the fixture tick is valid"),
+        "an empty page is stated at the venue's cent tick"
+    );
+    assert!(empty.bids.is_empty() && empty.asks.is_empty());
+    assert_eq!(empty.last_trade_price, None);
+    assert_eq!(empty.timestamp, 0);
+    // A Ready can only be read after the snapshot; a failure would have ended the
+    // stream before either was published.
+    receive_status(&mut reliable, PredictionOrderBookStatus::Ready).await;
+
+    updates
+        .send(Ok(vec![PredictionOrderBookUpdate::Replace {
+            bids: vec![level("0.34", "50")],
+            asks: vec![level("0.35", "100")],
+            timestamp: 1_000,
+        }]))
+        .await
+        .expect("the fake channel is open");
+    let snapshot = next_snapshot(&mut latest).await;
+
+    assert_eq!(
+        prices(&snapshot.bids),
+        vec![price("0.34")],
+        "a book that appears later replaces the empty page"
+    );
+    assert_eq!(prices(&snapshot.asks), vec![price("0.35")]);
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_404_that_is_not_the_missing_book_answer_should_fail_the_stream() {
+    let mut harness = Harness::new();
+    let (_updates, _taken) = harness.subscribe();
+    let fetch = harness.fetch();
+    let mut reliable = harness.take_reliable();
+    // A missing token and a missing book are both 404s; only the venue's own
+    // sentence says the book is what does not exist.
+    let refusal =
+        MarketError::Network(MarketNetworkError::from(MarketParticipantError::Rejected {
+            code: SmolStr::new_static("404"),
+            message: SmolStr::new_static("the requested token id is unknown"),
+            retryable: false,
+            raw_response: None,
+        }));
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    fetch
+        .send(Err(refusal.clone()))
+        .expect("the fetch is waiting");
+
+    receive_status(
+        &mut reliable,
+        PredictionOrderBookStatus::Failed {
+            error: PredictionOrderBookError::Market(refusal),
+        },
+    )
+    .await;
+    harness.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stop_should_cancel_the_active_stream_and_keep_serving() {
+    let harness = Harness::new();
+    assert_eq!(
+        harness
+            .runtime
+            .client()
+            .call(stop())
+            .await
+            .expect("a stop is answered")
+            .into_value(),
+        PredictionOrderBookResponse::Stopped,
+        "a stop with nothing to stop is still answered"
+    );
+
+    let (first_updates, _first_taken) = harness.subscribe();
+    let _first_fetch = harness.fetch();
+    harness
+        .runtime
+        .client()
+        .call(load(1))
+        .await
+        .expect("the load request starts a stream");
+    assert_eq!(
+        harness
+            .runtime
+            .client()
+            .call(stop())
+            .await
+            .expect("the stop is answered")
+            .into_value(),
+        PredictionOrderBookResponse::Stopped
+    );
+
+    // The stream the stop retired is gone, and with it the channel it read.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        first_updates
+            .send(Ok(vec![PredictionOrderBookUpdate::LastTrade {
+                price: price("0.01"),
+                timestamp: 1,
+            }]))
+            .await
+            .is_err(),
+        "the stopped stream took its channel with it"
+    );
+
+    // The service is still waiting for requests.
+    let (_second_updates, _second_taken) = harness.subscribe();
+    let second_fetch = harness.fetch();
+    let mut latest = harness.runtime.latest_stream();
+    harness
+        .runtime
+        .client()
+        .call(retry(2))
+        .await
+        .expect("a request after a stop starts a stream");
+    second_fetch
+        .send(Ok(book(5_000)))
+        .expect("the second fetch is waiting");
+    let (key, snapshot) = next_snapshot_keyed(&mut latest).await;
+
+    assert_eq!(key.epoch, 2);
+    assert_eq!(snapshot.timestamp, 5_000);
     harness.runtime.shutdown().await;
 }
 

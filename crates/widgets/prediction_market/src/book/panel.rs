@@ -22,7 +22,8 @@ use ahash::AHashMap;
 use base_ui::{empty_state::EmptyState, scroll_bar::Scrollbar, style::theme::ThemeExt};
 use gpui_kit::{
     AnyElement, App, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels,
-    ScrollStrategy, SharedString, Styled, UniformListScrollHandle, div, px, relative, uniform_list,
+    ScrollStrategy, SharedString, Styled, UniformListScrollHandle, base::ScrollbarMode, div, point,
+    px, relative, uniform_list,
 };
 use i18n::t;
 use market_participants_model::{
@@ -289,12 +290,40 @@ impl PredictionBookPanel {
         self.multiplier = multiplier;
         self.book = Some(book);
         if same_ladder && self.grouped.is_some() {
+            // The ladder is drawn from the inside out: the spread row sits at the
+            // ask count, so a level added above it shifts every row below. The
+            // reader's place is a screen position, not an item index, so the
+            // viewport is dragged by the same number of rows the side grew.
+            if !self.anchor_pending {
+                let previous_asks = self.grouped.as_ref().map_or(0, |held| held.asks.len());
+                let delta = grouped.asks.len() as isize - previous_asks as isize;
+                self.shift_scroll_by_rows(delta);
+            }
             self.animation.retarget(&grouped, Instant::now());
         } else {
             self.animation.jump(&grouped);
             self.anchor_pending = true;
         }
         self.grouped = Some(grouped);
+    }
+
+    /// Drags the list content by `rows` rows, keeping the reader where they were.
+    ///
+    /// The offset is measured from the top of the content and is zero or
+    /// negative, so a row added above the viewport moves it further down; the
+    /// new place is clamped to what the list can actually show, which is the
+    /// negative of the handle's (positive) maximum offset.
+    fn shift_scroll_by_rows(&self, rows: isize) {
+        if rows == 0 {
+            return;
+        }
+        let handle = self.scroll.0.borrow();
+        let offset = handle.base_handle.offset();
+        let max_offset = handle.base_handle.max_offset();
+        let shifted = offset.y - ROW_HEIGHT * rows as f32;
+        handle
+            .base_handle
+            .set_offset(point(offset.x, shifted.clamp(-max_offset.y, px(0.0))));
     }
 
     /// Regroups the book on screen at another multiplier.
@@ -419,7 +448,9 @@ impl PredictionBookPanel {
                 .min_h_0()
                 .overflow_hidden()
                 .child(ladder)
-                .child(Scrollbar::vertical(scroll)),
+                // A deep ladder is read, not scrolled through once: the bar says
+                // where in the book the viewport is while the reader is still.
+                .child(Scrollbar::vertical(scroll).mode(ScrollbarMode::Always)),
         )
         .into_any_element()
     }
