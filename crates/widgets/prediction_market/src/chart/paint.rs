@@ -18,6 +18,7 @@ use gpui_kit::{
     App, Bounds, ContentMask, Hsla, Pixels, Point, SharedString, TextAlign, Window, fill, point,
     px, size,
 };
+use i18n::translator::types::I18n;
 use smol_str::{SmolStr, format_smolstr};
 
 use super::{
@@ -44,10 +45,9 @@ const SERIES_FADE_ALPHA: f32 = 0.25;
 const GRID_DOT: f32 = 1.0;
 const GRID_PERIOD: f32 = 4.0;
 
-/// The crosshair is solid, and reaches into the strips around the plot.
+/// The crosshair is solid, reaches up into the time strip, and stops at 0%.
 const CROSSHAIR_WIDTH: f32 = 1.5;
 const CROSSHAIR_OVERHANG_TOP: f32 = 17.0;
-const CROSSHAIR_OVERHANG_BOTTOM: f32 = 14.0;
 
 /// How far a y label sits right of the plot, and an x label below it.
 ///
@@ -82,7 +82,10 @@ const HOVER_DOT_OUTER: f32 = 12.0;
 const HOVER_DOT_OUTER_ALPHA: f32 = 0.1;
 
 /// The static dot at every series' newest point, and the pulse around it.
-const ENDPOINT_RADIUS: f32 = 2.5;
+///
+/// It is the same fill as the dot where the crosshair meets a line, so the newest
+/// reading carries the same weight as a hovered one.
+const ENDPOINT_RADIUS: f32 = HOVER_DOT_INNER / 2.0;
 const PULSE_MIN_RADIUS: f32 = 4.0;
 const PULSE_MAX_RADIUS: f32 = 9.0;
 const PULSE_ALPHA: f32 = 0.35;
@@ -476,7 +479,8 @@ fn dot_scale(phase: f32) -> f32 {
 ///
 /// The crosshair goes under the dots: the indicator is a line and the dots mark where
 /// it meets each series, so the dot has to sit on top rather than have the line cut
-/// through it. The labels come after both, because they name what the dots mark.
+/// through it. It ends on the 0% line instead of running through the x-label band.
+/// The labels come after both, because they name what the dots mark.
 fn paint_hover(prepared: &PreparedChart, hovered: &HoveredSample, context: &mut PaintContext<'_>) {
     let layout = prepared.layout;
     let palette = series_palette(context);
@@ -484,8 +488,7 @@ fn paint_hover(prepared: &PreparedChart, hovered: &HoveredSample, context: &mut 
     context.with_mask(layout.bounds, |_, window, _| {
         let x = hovered.x - px(CROSSHAIR_WIDTH / 2.0);
         let top = layout.plot.origin.y - px(CROSSHAIR_OVERHANG_TOP);
-        let height =
-            layout.plot.size.height + px(CROSSHAIR_OVERHANG_TOP + CROSSHAIR_OVERHANG_BOTTOM);
+        let height = layout.plot.size.height + px(CROSSHAIR_OVERHANG_TOP);
         window.paint_quad(fill(
             Bounds::new(point(x, top), size(px(CROSSHAIR_WIDTH), height)),
             crosshair_color,
@@ -566,7 +569,7 @@ fn paint_label_column(
         &anchors,
         px(LABEL_HEIGHT),
         px(LABEL_COLLISION_GAP),
-        layout.plot.origin.y,
+        layout.plot,
     );
     let background = context.app.theme().roles.surface.overlay.hsla;
     let border = context.app.theme().roles.line.border.hsla;
@@ -621,7 +624,15 @@ fn paint_hover_time(
     let layout = prepared.layout;
     let color = context.app.theme().roles.fg.muted.hsla;
     let font = ChartFont::new(TIME_LABEL_FONT_SIZE, STRONG_WEIGHT, color);
-    let text = format_hover_time(hovered.timestamp, prepared.time_zone);
+    let text = {
+        let i18n = context.app.global::<I18n>();
+        format_hover_time(
+            hovered.timestamp,
+            prepared.time_zone,
+            i18n,
+            prepared.language,
+        )
+    };
     let width = context.width(text.as_str(), font);
     let right_of = hovered.x + px(LABEL_GAP);
     let x = if right_of + width <= layout.plot.right() {

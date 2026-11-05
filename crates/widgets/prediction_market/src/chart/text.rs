@@ -8,15 +8,16 @@
 //! hit is everything else.
 //!
 //! Formatting lives here too, and it is deliberately pure: a timestamp, the label
-//! unit chosen with the axis step, and a zone in, a string out. The formats are the
-//! reference chart's own — English month abbreviations, a twelve-hour clock, no year
-//! under the crosshair — because the chart is read next to the venue's own, and a
-//! translated month would make the two axes disagree. The year appears only where the
+//! unit chosen with the axis step, a zone and the catalogue in, strings out. The
+//! language showing decides the month spelling, the date order and whether the clock
+//! is a twelve- or twenty-four-hour one, so switching the interface language relabels
+//! the axis and the hovered time on the next frame. The year appears only where the
 //! chosen unit needs it: the month labels of a multi-year window.
 
 use std::sync::Arc;
 
 use gpui_kit::{FontWeight, Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window};
+use i18n::{language::codes::LanguageCode, translator::types::I18n};
 use smol_str::{SmolStr, format_smolstr};
 use time::OffsetDateTime;
 
@@ -35,9 +36,20 @@ pub(crate) const TIME_LABEL_FONT_SIZE: f32 = 12.0;
 /// The weight the hover's own labels are set in; the axes stay regular.
 pub(crate) const STRONG_WEIGHT: FontWeight = FontWeight::SEMIBOLD;
 
-/// The English month abbreviations the reference chart labels its axis with.
-const MONTH_ABBREVIATIONS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+/// The message key each month is named by.
+const MONTH_KEYS: [&str; 12] = [
+    "widget.prediction_market.month.january",
+    "widget.prediction_market.month.february",
+    "widget.prediction_market.month.march",
+    "widget.prediction_market.month.april",
+    "widget.prediction_market.month.may",
+    "widget.prediction_market.month.june",
+    "widget.prediction_market.month.july",
+    "widget.prediction_market.month.august",
+    "widget.prediction_market.month.september",
+    "widget.prediction_market.month.october",
+    "widget.prediction_market.month.november",
+    "widget.prediction_market.month.december",
 ];
 
 /// One font a chart line is shaped in.
@@ -152,35 +164,53 @@ pub(crate) fn format_axis_time(
     timestamp: i64,
     label: TimeLabelKind,
     zone: time::UtcOffset,
+    i18n: &I18n,
+    language: LanguageCode,
 ) -> SmolStr {
     let Some(datetime) = local_datetime(timestamp, zone) else {
         return SmolStr::new_static("");
     };
     match label {
-        TimeLabelKind::Clock => format_clock(datetime),
-        TimeLabelKind::Day => format_smolstr!("{} {}", month_name(datetime), datetime.day()),
-        TimeLabelKind::Month => SmolStr::new(month_name(datetime)),
-        TimeLabelKind::MonthYear => {
-            format_smolstr!("{} {}", month_name(datetime), datetime.year())
-        }
+        TimeLabelKind::Clock => format_clock(datetime, i18n, language),
+        TimeLabelKind::Day => translated(
+            i18n,
+            language,
+            "widget.prediction_market.date.day",
+            &[
+                ("month", &month_name(datetime, i18n, language)),
+                ("day", &datetime.day()),
+            ],
+        ),
+        TimeLabelKind::Month => month_name(datetime, i18n, language),
+        TimeLabelKind::MonthYear => translated(
+            i18n,
+            language,
+            "widget.prediction_market.date.month_year",
+            &[
+                ("month", &month_name(datetime, i18n, language)),
+                ("year", &datetime.year()),
+            ],
+        ),
     }
 }
 
 /// The label of every tick of one axis, in the order the ticks were chosen.
 ///
 /// A clock axis is the one tier that can reach a label it has already shown — a
-/// window that ends where it began, or one longer than the twelve-hour face — so a
-/// repeated clock label is blanked while its tick stays in place for the gridline.
-/// The other tiers label monotonic month or date values and are used as they are.
+/// window that ends where it began, or one that wraps the clock face — so a repeated
+/// clock label is blanked while its tick stays in place for the gridline. The other
+/// tiers label monotonic month or date values and are used as they are.
 pub(crate) fn format_axis_labels(
     timestamps: &[i64],
     label: TimeLabelKind,
     zone: time::UtcOffset,
+    i18n: &I18n,
+    language: LanguageCode,
 ) -> Vec<SmolStr> {
     if label != TimeLabelKind::Clock {
         return timestamps
             .iter()
-            .map(|timestamp| format_axis_time(*timestamp, label, zone))
+            .map(|timestamp| format_axis_time(*timestamp, label, zone, i18n, language))
             .collect();
     }
     let mut seen: Vec<(u8, u8)> = Vec::with_capacity(timestamps.len());
@@ -191,27 +221,36 @@ pub(crate) fn format_axis_labels(
                 return SmolStr::new_static("");
             };
             // A clock label is its local hour and minute; equality of those is
-            // equality of the string, because the meridiem follows the hour.
+            // equality of the string, because the clock format follows both.
             let key = (datetime.hour(), datetime.minute());
             if seen.contains(&key) {
                 return SmolStr::new_static("");
             }
             seen.push(key);
-            format_clock(datetime)
+            format_clock(datetime, i18n, language)
         })
         .collect()
 }
 
 /// How the hovered sample reads in the strip above the plot.
-pub(crate) fn format_hover_time(timestamp: i64, zone: time::UtcOffset) -> SmolStr {
+pub(crate) fn format_hover_time(
+    timestamp: i64,
+    zone: time::UtcOffset,
+    i18n: &I18n,
+    language: LanguageCode,
+) -> SmolStr {
     let Some(datetime) = local_datetime(timestamp, zone) else {
         return SmolStr::new_static("");
     };
-    format_smolstr!(
-        "{} {}, {}",
-        month_name(datetime),
-        datetime.day(),
-        format_clock(datetime)
+    translated(
+        i18n,
+        language,
+        "widget.prediction_market.date.hover",
+        &[
+            ("month", &month_name(datetime, i18n, language)),
+            ("day", &datetime.day()),
+            ("time", &format_clock(datetime, i18n, language)),
+        ],
     )
 }
 
@@ -225,18 +264,52 @@ pub(crate) fn format_percent_integer(percent: f64) -> SmolStr {
     format_smolstr!("{percent:.0}%")
 }
 
-/// A twelve-hour clock time, e.g. `8:00 AM` or `12:30 PM`.
-fn format_clock(datetime: OffsetDateTime) -> SmolStr {
-    let (hour, meridiem) = match datetime.hour() {
-        0 => (12, "AM"),
-        1..=11 => (datetime.hour(), "AM"),
-        12 => (12, "PM"),
-        _ => (datetime.hour() - 12, "PM"),
+/// A clock time in the language's own shape, e.g. `8:00 AM` or `08:00`.
+fn format_clock(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -> SmolStr {
+    let hour = datetime.hour();
+    let hour12 = match hour {
+        0 => 12,
+        1..=11 => hour,
+        12 => 12,
+        _ => hour - 12,
     };
-    format_smolstr!("{hour}:{:02} {meridiem}", datetime.minute())
+    let hour24 = format_smolstr!("{hour:02}");
+    let minute = format_smolstr!("{:02}", datetime.minute());
+    let meridiem = i18n.translate(
+        language,
+        if hour < 12 {
+            "widget.prediction_market.date.am"
+        } else {
+            "widget.prediction_market.date.pm"
+        },
+    );
+    translated(
+        i18n,
+        language,
+        "widget.prediction_market.date.clock",
+        &[
+            ("hour12", &hour12),
+            ("hour24", &hour24),
+            ("minute", &minute),
+            ("meridiem", &meridiem),
+        ],
+    )
 }
 
-/// The English abbreviation of a month.
-fn month_name(datetime: OffsetDateTime) -> &'static str {
-    MONTH_ABBREVIATIONS[datetime.month() as usize - 1]
+/// The month's name in the language showing.
+fn month_name(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -> SmolStr {
+    SmolStr::new(
+        i18n.translate(language, MONTH_KEYS[datetime.month() as usize - 1])
+            .as_str(),
+    )
+}
+
+/// One catalogue template with its arguments filled in.
+fn translated(
+    i18n: &I18n,
+    language: LanguageCode,
+    key: &'static str,
+    arguments: &[(&str, &dyn std::fmt::Display)],
+) -> SmolStr {
+    SmolStr::new(i18n.translate_with(language, key, arguments).as_str())
 }

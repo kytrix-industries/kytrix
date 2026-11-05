@@ -864,6 +864,26 @@ widget:
     select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
     table: Recent market trades
   prediction_market:
+    date:
+      am: AM
+      clock: '%{hour12}:%{minute} %{meridiem}'
+      day: '%{month} %{day}'
+      hover: '%{month} %{day}, %{time}'
+      month_year: '%{month} %{year}'
+      pm: PM
+    month:
+      april: Apr
+      august: Aug
+      december: Dec
+      february: Feb
+      january: Jan
+      july: Jul
+      june: Jun
+      march: Mar
+      may: May
+      november: Nov
+      october: Oct
+      september: Sep
     more_lines: "+%{count} more"
     range:
       all: ALL
@@ -873,6 +893,7 @@ widget:
       month_1: 1M
       week_1: 1W
     select_event: Select prediction event
+    select_event_prompt: <p align="center">Select a prediction event</p>
     select_market: Select market
     select_market_group: Select market category
     timeframe: Prediction market timeframe

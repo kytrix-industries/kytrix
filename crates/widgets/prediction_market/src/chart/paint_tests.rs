@@ -17,6 +17,7 @@ use gpui_kit::{
     Bounds, Context, Entity, Hsla, IntoElement, ParentElement, Pixels, Point, Render, ScaledPixels,
     Size, Styled, TestAppContext, VisualTestContext, Window, div, point, px, size,
 };
+use i18n::language::codes::LanguageCode;
 use market_participants_model::{
     decimal::{Fraction, Ratio},
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
@@ -25,6 +26,7 @@ use market_participants_model::{
 use super::{
     canvas::{ChartCanvasOptions, ChartPaintCaches, chart_element},
     geometry::ChartLayout,
+    hover::LABEL_HEIGHT,
     paint::{PaintLog, reset_log, take_log},
 };
 use crate::{
@@ -380,8 +382,8 @@ fn a_chart_without_a_hover_draws_no_hover_furniture(cx: &mut TestAppContext) {
         frame
             .quads
             .iter()
-            .all(|quad| !(7.0..=13.0).contains(&quad.width())),
-        "no hover dot is drawn without a pointer"
+            .all(|quad| !(11.0..=13.0).contains(&quad.width())),
+        "no hover wash is drawn without a pointer; the static endpoint dot is still drawn"
     );
     assert!(frame.label_boxes().is_empty(), "no label column either");
     assert!(
@@ -405,6 +407,105 @@ fn a_chart_without_a_hover_draws_no_hover_furniture(cx: &mut TestAppContext) {
             .series_strokes()
             .all(|stroke| (stroke.color.a - 1.0).abs() < 0.01),
         "a line without a hover is at full colour"
+    );
+}
+
+#[gpui_kit::test]
+fn a_language_change_relabels_the_axis_and_the_hover(cx: &mut TestAppContext) {
+    let (harness, cx) = chart_window(cx, snapshot());
+    let plot = draw(&harness, cx).plot();
+    set_pointer(&harness, cx, Some(plot.center()));
+    let english = draw(&harness, cx);
+    assert!(
+        english.text("Jan 1, 12:30 AM").is_some(),
+        "the English hovered time is drawn"
+    );
+    let caches = caches(&harness, cx);
+    let builds = caches.prepared_builds();
+
+    cx.update(|_, cx| cx.set_global(LanguageCode::ZhCn));
+    let chinese = draw(&harness, cx);
+    assert!(
+        chinese.text("1月1日 00:30").is_some(),
+        "the hovered time follows the language"
+    );
+    assert!(
+        chinese.text("00:30").is_some(),
+        "the x axis follows the language too"
+    );
+    assert_eq!(
+        caches.prepared_builds(),
+        builds + 1,
+        "the prepared labels are rebuilt when the language changes"
+    );
+}
+
+#[gpui_kit::test]
+fn a_hover_at_either_end_keeps_its_labels_inside_the_plot(cx: &mut TestAppContext) {
+    let (harness, cx) = chart_window(cx, two_series(0.0, 100.0));
+    let plot = draw(&harness, cx).plot();
+    set_pointer(
+        &harness,
+        cx,
+        Some(point(plot.right() - px(1.0), plot.center().y)),
+    );
+    let frame = draw(&harness, cx);
+
+    let boxes = frame.label_boxes();
+    assert_eq!(boxes.len(), 2, "the 0% and 100% labels are both drawn");
+    for label in boxes {
+        assert!(
+            f32::from(label.bounds.origin.y) >= f32::from(plot.origin.y) - 0.01,
+            "a label at the top stays inside the plot: {:?}",
+            label.bounds
+        );
+        assert!(
+            f32::from(label.bounds.bottom()) <= f32::from(plot.bottom()) + 0.01,
+            "a label at the bottom is not pushed below 0%: {:?}",
+            label.bounds
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn the_endpoint_dot_is_as_large_as_a_hovered_intersection(cx: &mut TestAppContext) {
+    let (harness, cx) = chart_window(cx, snapshot());
+    let frame = draw(&harness, cx);
+    let plot = frame.plot();
+    let endpoints: Vec<&PaintedQuad> = frame
+        .quads
+        .iter()
+        .filter(|quad| {
+            (quad.width() - 8.0).abs() < 0.01
+                && (f32::from(quad.bounds.origin.x + quad.bounds.size.width / 2.0)
+                    - f32::from(plot.right()))
+                .abs()
+                    < 1.0
+        })
+        .collect();
+
+    assert_eq!(endpoints.len(), 2, "one dot per line at the right edge");
+}
+
+#[gpui_kit::test]
+fn the_hover_crosshair_stops_at_the_zero_line(cx: &mut TestAppContext) {
+    let (harness, cx) = chart_window(cx, snapshot());
+    let plot = draw(&harness, cx).plot();
+    set_pointer(&harness, cx, Some(plot.center()));
+    let frame = draw(&harness, cx);
+    let crosshair = frame
+        .quads
+        .iter()
+        .find(|quad| {
+            (quad.width() - 1.5).abs() < 0.01 && quad.height() > f32::from(plot.size.height)
+        })
+        .expect("a hover draws the vertical indicator");
+
+    assert!(
+        f32::from(crosshair.bounds.bottom()) <= f32::from(plot.bottom()) + 0.01,
+        "the indicator does not run through the x axis: bottom {} vs 0% {}",
+        f32::from(crosshair.bounds.bottom()),
+        f32::from(plot.bottom())
     );
 }
 
@@ -475,8 +576,8 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_twelve_series_column_keeps_every_label_at_a_distinct_top(cx: &mut TestAppContext) {
-    // A taller window, so twelve 20 px boxes plus their 1 px gaps fit inside the
-    // painted area; the reference plot is only ten boxes tall.
+    // Twelve 20 px boxes plus their 1 px gaps are taller than the plot, so the
+    // column has to overflow without piling boxes on top of one another.
     let (harness, cx) = chart_window_sized(
         cx,
         twelve_series(),
@@ -498,14 +599,12 @@ fn a_twelve_series_column_keeps_every_label_at_a_distinct_top(cx: &mut TestAppCo
         "twelve boxes keep twelve distinct tops: {tops:?}"
     );
     assert!(
-        tops[0] >= f32::from(plot.origin.y) - 0.01,
-        "the column starts at the plot's top: {tops:?}"
+        tops[0] < f32::from(plot.origin.y),
+        "the overflow leaves the plot above 100%: {tops:?}"
     );
-    assert_close(
-        tops[0],
-        f32::from(plot.origin.y),
-        0.01,
-        "the saturated column is shifted down to the plot top",
+    assert!(
+        tops[tops.len() - 1] + LABEL_HEIGHT <= f32::from(plot.bottom()),
+        "the lowest box stays inside the plot: {tops:?}"
     );
 }
 
@@ -929,12 +1028,16 @@ fn a_line_that_ended_before_the_hover_grows_no_dot_or_label(cx: &mut TestAppCont
         "the line that still covers the sample keeps its label"
     );
 
-    let dots = frame
+    let washes = frame
         .quads
         .iter()
         .filter(|quad| {
-            (quad.width() - 8.0).abs() <= 0.01 && quad.alpha().is_some_and(|alpha| alpha > 0.9)
+            (quad.width() - 12.0).abs() <= 0.01
+                && quad.alpha().is_some_and(|alpha| (alpha - 0.1).abs() < 0.01)
         })
         .count();
-    assert_eq!(dots, 1, "and it grows no hover dot either");
+    assert_eq!(
+        washes, 1,
+        "only the line that covers the sample grows a hover dot"
+    );
 }

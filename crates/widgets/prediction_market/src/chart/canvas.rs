@@ -24,6 +24,7 @@ use gpui_kit::{
     AnyElement, App, Bounds, IntoElement, Path, PathBuilder, Pixels, Point, Styled, TextStyle,
     Window, canvas, point, px,
 };
+use i18n::{language::codes::LanguageCode, translator::types::I18n};
 use smol_str::SmolStr;
 use time::UtcOffset;
 use widget::time_zone::data_time_zone;
@@ -101,6 +102,9 @@ pub(crate) struct PreparedChart {
     /// The display time zone the axis labels were formatted in; the hovered time is
     /// formatted in it while the pointer moves.
     pub time_zone: UtcOffset,
+    /// The language the axis labels were formatted in, so the hovered time is
+    /// formatted in the same one.
+    pub language: LanguageCode,
 }
 
 impl PreparedChart {
@@ -109,6 +113,8 @@ impl PreparedChart {
         snapshot: &PredictionMarketSnapshot,
         bounds: Bounds<Pixels>,
         time_zone: UtcOffset,
+        language: LanguageCode,
+        i18n: &I18n,
     ) -> Self {
         let layout = ChartLayout::new(bounds);
         let Some(newest) = snapshot.latest_timestamp() else {
@@ -121,6 +127,7 @@ impl PreparedChart {
                 series: Arc::default(),
                 hover_times: Arc::default(),
                 time_zone,
+                language,
             };
         };
         let mut oldest = i64::MAX;
@@ -147,7 +154,8 @@ impl PreparedChart {
             .map(|tick| format_percent_integer(*tick))
             .collect();
         let chosen = time_ticks(domain, layout.plot.size.width, time_zone);
-        let labels = format_axis_labels(&chosen.timestamps, chosen.label, time_zone);
+        let labels =
+            format_axis_labels(&chosen.timestamps, chosen.label, time_zone, i18n, language);
         let time_ticks: Vec<TimeTick> = chosen
             .timestamps
             .into_iter()
@@ -195,6 +203,7 @@ impl PreparedChart {
             series,
             hover_times: hover_times.into(),
             time_zone,
+            language,
         }
     }
 
@@ -268,6 +277,7 @@ struct PreparedKey {
     snapshot: Arc<PredictionMarketSnapshot>,
     bounds: Bounds<Pixels>,
     time_zone: UtcOffset,
+    language: LanguageCode,
     text_style: TextStyle,
 }
 
@@ -277,6 +287,7 @@ impl PreparedKey {
         Arc::ptr_eq(&self.snapshot, &other.snapshot)
             && self.bounds == other.bounds
             && self.time_zone == other.time_zone
+            && self.language == other.language
             && self.text_style == other.text_style
     }
 }
@@ -359,6 +370,7 @@ fn prepare_chart(
         snapshot: snapshot.clone(),
         bounds,
         time_zone: data_time_zone(cx),
+        language: *cx.global::<LanguageCode>(),
         text_style: window.text_style(),
     };
     {
@@ -369,7 +381,13 @@ fn prepare_chart(
             return prepared.clone();
         }
     }
-    let prepared = Rc::new(PreparedChart::new(snapshot, bounds, key.time_zone));
+    let prepared = Rc::new(PreparedChart::new(
+        snapshot,
+        bounds,
+        key.time_zone,
+        key.language,
+        cx.global::<I18n>(),
+    ));
     #[cfg(test)]
     caches.builds.set(caches.builds.get() + 1);
     let mut cache = caches.prepared.borrow_mut();

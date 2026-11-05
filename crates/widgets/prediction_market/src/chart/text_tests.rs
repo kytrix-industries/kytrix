@@ -1,9 +1,9 @@
 //! The chart's formatters, asserted at fixed instants and offsets.
 //!
-//! Month names are English on purpose: the chart is read beside the venue's own and
-//! the two axes have to agree. The tests pin the exact strings so a later "improve the
-//! format" cannot quietly change what the axis says.
+//! Both interface languages are pinned: the axis and the hovered time have to follow
+//! the language showing, not the venue's English spelling.
 
+use i18n::{global::embedded, language::codes::LanguageCode, translator::types::I18n};
 use time::{Date, Month, UtcOffset};
 
 use super::{
@@ -13,6 +13,34 @@ use super::{
         format_percent_one_decimal,
     },
 };
+
+/// The catalogue the chart formats through.
+fn catalog() -> I18n {
+    embedded::load().expect("the embedded locales should load")
+}
+
+/// One axis label at UTC.
+fn axis(timestamp: i64, label: TimeLabelKind, language: LanguageCode) -> String {
+    let i18n = catalog();
+    format_axis_time(timestamp, label, UtcOffset::UTC, &i18n, language).to_string()
+}
+
+/// One axis label in a display zone.
+fn axis_in(
+    timestamp: i64,
+    label: TimeLabelKind,
+    zone: UtcOffset,
+    language: LanguageCode,
+) -> String {
+    let i18n = catalog();
+    format_axis_time(timestamp, label, zone, &i18n, language).to_string()
+}
+
+/// One hovered time at UTC.
+fn hover(timestamp: i64, language: LanguageCode) -> String {
+    let i18n = catalog();
+    format_hover_time(timestamp, UtcOffset::UTC, &i18n, language).to_string()
+}
 
 /// The instant 2026-01-05 08:00:00 UTC, in milliseconds.
 fn january_fifth_eight() -> i64 {
@@ -36,61 +64,113 @@ fn midnight() -> i64 {
 }
 
 #[test]
-fn a_clock_tier_reads_the_time_of_day() {
+fn a_clock_tier_reads_the_time_of_day_in_each_language() {
     assert_eq!(
-        format_axis_time(january_fifth_eight(), TimeLabelKind::Clock, UtcOffset::UTC).as_str(),
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::Clock,
+            LanguageCode::En
+        ),
         "8:00 AM"
+    );
+    assert_eq!(
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::Clock,
+            LanguageCode::ZhCn
+        ),
+        "08:00",
+        "Chinese reads a twenty-four-hour clock without a meridiem"
     );
 }
 
 #[test]
-fn a_day_tier_reads_the_date() {
+fn a_day_tier_reads_the_date_in_each_language() {
     assert_eq!(
-        format_axis_time(january_fifth_eight(), TimeLabelKind::Day, UtcOffset::UTC).as_str(),
+        axis(january_fifth_eight(), TimeLabelKind::Day, LanguageCode::En),
         "Jan 5"
+    );
+    assert_eq!(
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::Day,
+            LanguageCode::ZhCn
+        ),
+        "1月5日"
     );
 }
 
 #[test]
 fn a_month_tier_reads_the_month_without_a_year() {
     assert_eq!(
-        format_axis_time(january_fifth_eight(), TimeLabelKind::Month, UtcOffset::UTC).as_str(),
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::Month,
+            LanguageCode::En
+        ),
         "Jan",
         "the fifteen-month reference labels bare month names"
+    );
+    assert_eq!(
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::Month,
+            LanguageCode::ZhCn
+        ),
+        "1月"
     );
 }
 
 #[test]
 fn a_year_disambiguated_month_tier_reads_the_year_too() {
     assert_eq!(
-        format_axis_time(
+        axis(
             january_fifth_eight(),
             TimeLabelKind::MonthYear,
-            UtcOffset::UTC
-        )
-        .as_str(),
+            LanguageCode::En
+        ),
         "Jan 2026"
+    );
+    assert_eq!(
+        axis(
+            january_fifth_eight(),
+            TimeLabelKind::MonthYear,
+            LanguageCode::ZhCn
+        ),
+        "2026年1月"
     );
 }
 
 #[test]
-fn the_clock_reads_twelve_hour_at_midnight_and_noon() {
-    let at_midnight = format_axis_time(midnight(), TimeLabelKind::Clock, UtcOffset::UTC);
-    assert_eq!(at_midnight.as_str(), "12:00 AM");
-
-    let at_noon = format_axis_time(
-        midnight() + 12 * 3_600_000,
-        TimeLabelKind::Clock,
-        UtcOffset::UTC,
+fn the_clock_reads_midnight_and_noon_in_each_language() {
+    assert_eq!(
+        axis(midnight(), TimeLabelKind::Clock, LanguageCode::En),
+        "12:00 AM"
     );
-    assert_eq!(at_noon.as_str(), "12:00 PM");
-
-    let late = format_axis_time(
-        midnight() + 23 * 3_600_000 + 59 * 60_000,
-        TimeLabelKind::Clock,
-        UtcOffset::UTC,
+    assert_eq!(
+        axis(midnight(), TimeLabelKind::Clock, LanguageCode::ZhCn),
+        "00:00"
     );
-    assert_eq!(late.as_str(), "11:59 PM");
+
+    let noon = midnight() + 12 * 3_600_000;
+    assert_eq!(
+        axis(noon, TimeLabelKind::Clock, LanguageCode::En),
+        "12:00 PM"
+    );
+    assert_eq!(
+        axis(noon, TimeLabelKind::Clock, LanguageCode::ZhCn),
+        "12:00"
+    );
+
+    let late = midnight() + 23 * 3_600_000 + 59 * 60_000;
+    assert_eq!(
+        axis(late, TimeLabelKind::Clock, LanguageCode::En),
+        "11:59 PM"
+    );
+    assert_eq!(
+        axis(late, TimeLabelKind::Clock, LanguageCode::ZhCn),
+        "23:59"
+    );
 }
 
 #[test]
@@ -99,18 +179,18 @@ fn the_axis_time_is_read_in_the_display_zone() {
     let timestamp = midnight();
 
     assert_eq!(
-        format_axis_time(timestamp, TimeLabelKind::Clock, zone).as_str(),
+        axis_in(timestamp, TimeLabelKind::Clock, zone, LanguageCode::En),
         "8:00 AM",
         "midnight UTC is eight in the morning at +08:00"
     );
     assert_eq!(
-        format_axis_time(
+        axis_in(
             timestamp,
             TimeLabelKind::Clock,
-            UtcOffset::from_hms(-5, 0, 0).expect("valid")
-        )
-        .as_str(),
-        "7:00 PM",
+            UtcOffset::from_hms(-5, 0, 0).expect("valid"),
+            LanguageCode::ZhCn
+        ),
+        "19:00",
         "and the previous evening at -05:00"
     );
 }
@@ -122,7 +202,14 @@ fn a_repeated_clock_label_is_blanked_while_its_tick_stays() {
         january_fifth_eight() + 3 * 3_600_000,
         january_fifth_eight() + 24 * 3_600_000,
     ];
-    let labels = format_axis_labels(&timestamps, TimeLabelKind::Clock, UtcOffset::UTC);
+    let i18n = catalog();
+    let labels = format_axis_labels(
+        &timestamps,
+        TimeLabelKind::Clock,
+        UtcOffset::UTC,
+        &i18n,
+        LanguageCode::En,
+    );
 
     assert_eq!(labels[0].as_str(), "8:00 AM");
     assert_eq!(labels[1].as_str(), "11:00 AM");
@@ -134,26 +221,37 @@ fn a_repeated_clock_label_is_blanked_while_its_tick_stays() {
 }
 
 #[test]
-fn the_hovered_time_carries_the_day_but_not_the_year() {
+fn the_hovered_time_carries_the_day_but_not_the_year_in_each_language() {
     assert_eq!(
-        format_hover_time(january_fifth_eight(), UtcOffset::UTC).as_str(),
+        hover(january_fifth_eight(), LanguageCode::En),
         "Jan 5, 8:00 AM"
+    );
+    assert_eq!(
+        hover(january_fifth_eight(), LanguageCode::ZhCn),
+        "1月5日 08:00"
     );
 }
 
 #[test]
-fn every_month_has_its_english_abbreviation() {
-    let expected = [
+fn every_month_has_its_name_in_each_language() {
+    let expected_en = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    for (index, abbreviation) in expected.into_iter().enumerate() {
+    let expected_zh = [
+        "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+    ];
+    for (index, abbreviation) in expected_en.into_iter().enumerate() {
         let date =
             Date::from_calendar_date(2026, Month::try_from(index as u8 + 1).expect("a month"), 1)
                 .expect("the fixture date is valid");
         let timestamp = date.midnight().assume_utc().unix_timestamp() * 1_000;
         assert_eq!(
-            format_axis_time(timestamp, TimeLabelKind::Month, UtcOffset::UTC).as_str(),
+            axis(timestamp, TimeLabelKind::Month, LanguageCode::En),
             abbreviation
+        );
+        assert_eq!(
+            axis(timestamp, TimeLabelKind::Month, LanguageCode::ZhCn),
+            expected_zh[index]
         );
     }
 }

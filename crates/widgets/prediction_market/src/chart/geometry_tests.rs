@@ -2,6 +2,7 @@
 //! domains, the ticks, and the decimation that folds a series onto the plot.
 
 use gpui_kit::{Bounds, Pixels, point, px, size};
+use i18n::{global::embedded, language::codes::LanguageCode};
 use market_participants_model::prediction::PredictionRange;
 use time::{Date, Month, OffsetDateTime, UtcOffset};
 
@@ -41,10 +42,17 @@ fn millis(year: i32, month: Month, day: u8) -> i64 {
 
 /// The label of every tick the axis chose, formatted the way the chart formats them.
 fn labels(ticks: &TimeTicks, zone: UtcOffset) -> Vec<String> {
-    format_axis_labels(&ticks.timestamps, ticks.label, zone)
-        .into_iter()
-        .map(|label| label.to_string())
-        .collect()
+    let i18n = embedded::load().expect("the embedded locales should load");
+    format_axis_labels(
+        &ticks.timestamps,
+        ticks.label,
+        zone,
+        &i18n,
+        LanguageCode::En,
+    )
+    .into_iter()
+    .map(|label| label.to_string())
+    .collect()
 }
 
 /// Asserts that no two non-empty labels in a list read the same.

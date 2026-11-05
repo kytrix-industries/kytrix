@@ -864,6 +864,26 @@ widget:
     select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
     table: 最近市场成交
   prediction_market:
+    date:
+      am: 上午
+      clock: '%{hour24}:%{minute}'
+      day: '%{month}%{day}日'
+      hover: '%{month}%{day}日 %{time}'
+      month_year: '%{year}年%{month}'
+      pm: 下午
+    month:
+      april: 4月
+      august: 8月
+      december: 12月
+      february: 2月
+      january: 1月
+      july: 7月
+      june: 6月
+      march: 3月
+      may: 5月
+      november: 11月
+      october: 10月
+      september: 9月
     more_lines: 还有 %{count} 条
     range:
       all: ALL
@@ -873,6 +893,7 @@ widget:
       month_1: 1M
       week_1: 1W
     select_event: 选择预测事件
+    select_event_prompt: <p align="center">请选择一个预测事件</p>
     select_market: 选择市场
     select_market_group: 选择市场分类
     timeframe: 预测市场时间范围

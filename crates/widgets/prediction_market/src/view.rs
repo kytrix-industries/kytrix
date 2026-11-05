@@ -239,7 +239,9 @@ impl WidgetView for PredictionMarketWidget {
         self.awaiting_market = false;
         let Some(selection) = self.selection.clone() else {
             self.status.report(
-                WidgetState::waiting(Notice::message("widget.prediction_market.select_event")),
+                WidgetState::waiting(Notice::message(
+                    "widget.prediction_market.select_event_prompt",
+                )),
                 cx,
             );
             return;
@@ -1294,6 +1296,28 @@ mod tests {
 
         cx.update(|cx| {
             assert_eq!(pane.read(cx).config(), Some(&config));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_pane_without_an_event_should_wait_with_the_centered_prompt(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.load(cx));
+            assert!(
+                i18n::t!(cx, "widget.prediction_market.select_event_prompt")
+                    .contains("align=\"center\""),
+                "the placeholder prompt is centered"
+            );
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::waiting(Notice::message(
+                    "widget.prediction_market.select_event_prompt"
+                )),
+                "the placeholder points at the centered prompt"
+            );
+            assert!(!pane.read(cx).has_content());
         });
     }
 

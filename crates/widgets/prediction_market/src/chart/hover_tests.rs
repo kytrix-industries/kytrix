@@ -162,7 +162,7 @@ fn every_label_box_sits_above_its_own_point() {
         &[px(200.0), px(100.0)],
         px(LABEL_HEIGHT),
         px(LABEL_COLLISION_GAP),
-        plot().origin.y,
+        plot(),
     );
 
     assert_eq!(tops[0] + px(LABEL_HEIGHT), px(200.0));
@@ -176,7 +176,7 @@ fn a_collision_pushes_the_upper_box_up_with_a_one_pixel_gap() {
         &[px(100.0), px(120.0)],
         px(LABEL_HEIGHT),
         px(LABEL_COLLISION_GAP),
-        plot.origin.y,
+        plot,
     );
 
     // The box of the lower point keeps its own bottom; the upper one gives way.
@@ -193,30 +193,57 @@ fn a_collision_pushes_the_upper_box_up_with_a_one_pixel_gap() {
 }
 
 #[test]
-fn a_saturated_column_starts_at_the_plot_top_without_piling_up() {
+fn a_label_at_either_end_stays_inside_until_the_column_is_crowded() {
+    let plot = plot();
+    let tops = label_tops(
+        &[plot.bottom(), plot.origin.y],
+        px(LABEL_HEIGHT),
+        px(LABEL_COLLISION_GAP),
+        plot,
+    );
+
+    assert_eq!(
+        tops[0] + px(LABEL_HEIGHT),
+        plot.bottom(),
+        "the 0% label keeps its own bottom instead of being pushed below the axis"
+    );
+    assert_eq!(
+        tops[1], plot.origin.y,
+        "the 100% label is moved down to the plot's top"
+    );
+    assert!(
+        tops.iter()
+            .all(|top| *top >= plot.origin.y && *top + px(LABEL_HEIGHT) <= plot.bottom()),
+        "both labels stay inside a plot with room for them: {tops:?}"
+    );
+}
+
+#[test]
+fn a_saturated_column_only_lets_its_overflow_leave_the_plot() {
     let plot = plot();
 
     let anchors: Vec<Pixels> = (0..8).map(|index| px(30.0 + index as f32 * 2.0)).collect();
-    let tops = label_tops(
-        &anchors,
-        px(LABEL_HEIGHT),
-        px(LABEL_COLLISION_GAP),
-        plot.origin.y,
-    );
+    let tops = label_tops(&anchors, px(LABEL_HEIGHT), px(LABEL_COLLISION_GAP), plot);
     let mut sorted = tops.clone();
     sorted.sort_by(|left, right| f32::from(*left).total_cmp(&f32::from(*right)));
 
     assert!(
-        sorted.iter().all(|top| *top >= plot.origin.y),
-        "no box is drawn above the plot: {tops:?}"
-    );
-    assert!(
         sorted.windows(2).all(|pair| pair[1] > pair[0]),
-        "the overflow is shifted down together, not clamped into one pile: {tops:?}"
+        "the boxes are not clamped into one pile: {tops:?}"
     );
     assert!(
-        (f32::from(sorted[0]) - f32::from(plot.origin.y)).abs() < 0.01,
-        "the shifted column starts exactly on the plot's top: {tops:?}"
+        sorted[sorted.len() - 1] + px(LABEL_HEIGHT) <= plot.bottom(),
+        "the lowest box stays inside the plot: {tops:?}"
+    );
+    assert!(
+        sorted[0] < plot.origin.y,
+        "only the boxes that cannot fit above it leave the plot: {tops:?}"
+    );
+    assert!(
+        sorted
+            .windows(2)
+            .all(|pair| ((f32::from(pair[1]) - f32::from(pair[0])) - 21.0).abs() < 0.01),
+        "the one-pixel gaps survive the overflow: {tops:?}"
     );
 }
 
@@ -226,12 +253,7 @@ fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
     let anchors: Vec<Pixels> = (0..12)
         .map(|index| plot.bottom() - px(index as f32 * 4.0))
         .collect();
-    let tops = label_tops(
-        &anchors,
-        px(LABEL_HEIGHT),
-        px(LABEL_COLLISION_GAP),
-        plot.origin.y,
-    );
+    let tops = label_tops(&anchors, px(LABEL_HEIGHT), px(LABEL_COLLISION_GAP), plot);
     let mut sorted = tops.clone();
     sorted.sort_by(|left, right| f32::from(*left).total_cmp(&f32::from(*right)));
 
@@ -241,18 +263,14 @@ fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
         "twelve boxes keep twelve distinct tops: {tops:?}"
     );
     assert!(
-        sorted.iter().all(|top| *top >= plot.origin.y),
-        "and none is above the plot: {tops:?}"
-    );
-    assert!(
-        (f32::from(sorted[0]) - f32::from(plot.origin.y)).abs() < 0.01,
-        "the saturated column is pushed down until its topmost box clears the plot top"
+        sorted[sorted.len() - 1] + px(LABEL_HEIGHT) <= plot.bottom(),
+        "the lowest box stays inside the plot"
     );
     assert!(
         sorted
             .windows(2)
             .all(|pair| ((f32::from(pair[1]) - f32::from(pair[0])) - 21.0).abs() < 0.01),
-        "the one-pixel gaps survive the shift: {tops:?}"
+        "the one-pixel gaps survive the overflow: {tops:?}"
     );
 }
 
@@ -260,7 +278,7 @@ fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
 fn the_box_anchor_is_the_series_point_y() {
     let axis = ValueAxis::new(31.5);
     let anchor = y_for_percent(26.5, &axis, plot());
-    let tops = label_tops(&[anchor], px(LABEL_HEIGHT), px(1.0), plot().origin.y);
+    let tops = label_tops(&[anchor], px(LABEL_HEIGHT), px(1.0), plot());
 
     assert_eq!(tops[0] + px(LABEL_HEIGHT), anchor);
 }

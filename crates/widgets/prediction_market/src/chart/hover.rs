@@ -11,8 +11,9 @@
 //!   time under it is a time the market actually published;
 //! - a sample's value is the step line's value, which is the value of the last sample
 //!   at or before it — not an interpolation;
-//! - a label sits **above its own point**, and a column of labels is stacked from the
-//!   bottom up so the lowest one keeps its point and the ones above it give way.
+//! - a label sits **above its own point** and inside the plot when there is room; a
+//!   column of labels is stacked from the bottom up so the lowest one keeps its point,
+//!   and only a column too tall for the plot lets its upper boxes leave past 100%.
 
 use gpui_kit::{Bounds, Pixels, point, px};
 
@@ -136,37 +137,37 @@ pub(crate) fn label_x(
 /// The natural bottom of a box is the y of the point it names, so a box sits
 /// entirely above its point. The column is stacked from the bottom up: a box that
 /// would overlap the one below it is pushed up until its bottom is one pixel above
-/// that box's top. If the stack would start above the plot, the whole column is
-/// shifted down until its topmost box sits on the plot's top. That keeps the column's
-/// one-pixel gaps and lets it overlap data, where clamping each box separately would
-/// pile the overflow onto the same rectangle.
+/// that box's top. A box whose natural top would leave the plot is moved down to the
+/// plot's top when the one-pixel gap to the box below still allows it; only a box
+/// that cannot fit even there is left above the plot. The whole column is never
+/// shifted because one box overflowed, which is what used to push a label at 0% out
+/// below the x axis.
 pub(crate) fn label_tops(
     anchors: &[Pixels],
     height: Pixels,
     gap: Pixels,
-    plot_top: Pixels,
+    plot: Bounds<Pixels>,
 ) -> Vec<Pixels> {
-    let mut tops = vec![plot_top; anchors.len()];
+    let mut tops = vec![plot.origin.y; anchors.len()];
     let mut order: Vec<usize> = (0..anchors.len()).collect();
     // Stable, so two labels drawn at the same point keep the series order.
     order.sort_by(|left, right| f32::from(anchors[*right]).total_cmp(&f32::from(anchors[*left])));
     let mut top_below: Option<Pixels> = None;
-    let mut topmost = plot_top;
     for index in order {
-        let mut bottom = anchors[index];
+        let mut bottom = anchors[index].min(plot.bottom());
         if let Some(top_below) = top_below {
             bottom = bottom.min(top_below - gap);
         }
-        let top = bottom - height;
+        let mut top = bottom - height;
+        if top < plot.origin.y {
+            let inside_top = plot.origin.y;
+            let inside_bottom = inside_top + height;
+            if top_below.is_none_or(|below| inside_bottom + gap <= below) {
+                top = inside_top;
+            }
+        }
         tops[index] = top;
         top_below = Some(top);
-        topmost = topmost.min(top);
-    }
-    if topmost < plot_top {
-        let overflow = plot_top - topmost;
-        for top in &mut tops {
-            *top += overflow;
-        }
     }
     tops
 }
