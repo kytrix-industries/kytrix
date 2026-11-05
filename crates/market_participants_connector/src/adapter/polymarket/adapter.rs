@@ -36,7 +36,7 @@ use market_participants_model::{
         PredictionCategory, PredictionEventCard, PredictionEventRef, PredictionEventView,
         PredictionEventsPage, PredictionLeg, PredictionMarket, PredictionMarketGroup,
         PredictionMarketRef, PredictionNativeLeg, PredictionOptionCard, PredictionPricePoint,
-        PredictionSeries, PredictionWindow,
+        PredictionSeries,
     },
     routing::CapabilityId,
 };
@@ -46,10 +46,9 @@ use tokio_util::sync::CancellationToken;
 use super::{
     heartbeat,
     types::{
-        ClobBatchHistory, ClobBatchHistoryRequest, ClobHistoryPoint, ClobMidpointRequest,
-        ClobMidpoints, GammaEvent, GammaEventsKeyset, GammaIdList, GammaMarket,
-        GammaSearchResponse, PolymarketBookLevel, PolymarketMarketEvent, PolymarketMarketFrame,
-        PolymarketMarketSubscribe, PolymarketMarketUnsubscribe,
+        ClobBatchHistory, ClobBatchHistoryRequest, ClobHistoryPoint, GammaEvent, GammaEventsKeyset,
+        GammaIdList, GammaMarket, GammaSearchResponse, PolymarketBookLevel, PolymarketMarketEvent,
+        PolymarketMarketFrame, PolymarketMarketSubscribe, PolymarketMarketUnsubscribe,
     },
 };
 use crate::{
@@ -368,67 +367,21 @@ impl PolymarketAdapter {
         context: &ExecutionContext,
         query: &PredictionSeriesQuery,
     ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
-        match query.window {
-            PredictionWindow::Latest => self.latest(context, &query.legs).await,
-            PredictionWindow::History {
-                days,
-                fidelity_minutes,
-            } => {
-                self.history(context, &query.legs, days, fidelity_minutes)
-                    .await
-            }
-        }
-    }
-
-    async fn latest(
-        &self,
-        context: &ExecutionContext,
-        legs: &[PredictionLeg],
-    ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
-        let ids: Vec<SmolStr> = legs
-            .iter()
-            .filter_map(|leg| match &leg.native {
-                PredictionNativeLeg::Polymarket { asset_id, .. } => {
-                    Some(SmolStr::new(asset_id.as_str()))
-                }
-                PredictionNativeLeg::HyperliquidOutcome { .. } => None,
-            })
-            .collect();
-        let body: Vec<ClobMidpointRequest<'_>> = ids
-            .iter()
-            .map(|id| ClobMidpointRequest {
-                token_id: id.as_str(),
-            })
-            .collect();
-        let url = endpoint(context.http_origin(), "midpoints")?;
-        let answer: ClobMidpoints = post_json(context, &url, &body).await?;
-        let timestamp = now_millis()?;
-        Ok(legs
-            .iter()
-            .map(|leg| {
-                let points = native_asset_id(leg)
-                    .and_then(|id| answer.get(id))
-                    .and_then(|value| probability(value))
-                    .map(|probability| {
-                        vec![PredictionPricePoint {
-                            timestamp,
-                            probability,
-                        }]
-                    })
-                    .unwrap_or_default();
-                PredictionSeries {
-                    leg: leg.leg.clone(),
-                    points,
-                }
-            })
-            .collect())
+        let range = query.range;
+        self.history(
+            context,
+            &query.legs,
+            range.span_millis(),
+            range.fidelity_minutes(),
+        )
+        .await
     }
 
     async fn history(
         &self,
         context: &ExecutionContext,
         legs: &[PredictionLeg],
-        days: u16,
+        span: Option<i64>,
         fidelity_minutes: u16,
     ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
         let mut series: Vec<PredictionSeries> = legs
@@ -443,7 +396,7 @@ impl PolymarketAdapter {
             .filter_map(|leg| native_asset_id(leg).map(SmolStr::new))
             .collect();
         let url = endpoint(context.http_origin(), "batch-prices-history")?;
-        let window = history_window(days, fidelity_minutes)?;
+        let window = history_window(span, fidelity_minutes)?;
         for chunk in ids.chunks(CLOB_BATCH_LIMIT) {
             let body = ClobBatchHistoryRequest {
                 markets: chunk,
@@ -1512,7 +1465,8 @@ struct HistoryWindow {
     fidelity: u16,
     start_ts: Option<i64>,
     end_ts: Option<i64>,
-    /// The oldest instant the caller asked for, in milliseconds.
+    /// The oldest instant the caller asked for, in milliseconds. The whole-life
+    /// range asks from the epoch, so every answer passes the trim.
     since: UnixMillis,
 }
 
@@ -1523,7 +1477,13 @@ impl HistoryWindow {
 }
 
 /// The longest span the endpoint accepts as an explicit timestamp pair.
-const CLOB_EXPLICIT_WINDOW_DAYS: u16 = 15;
+const CLOB_EXPLICIT_WINDOW_MILLIS: i64 = 15 * 86_400_000;
+
+/// The longest span the month preset reaches.
+const CLOB_PRESET_WINDOW_MILLIS: i64 = 30 * 86_400_000;
+
+/// The shortest span a request states: a non-positive span is one minute.
+const CLOB_MINIMUM_SPAN_MILLIS: i64 = 60_000;
 
 /// The bucket width the venue serves the whole history at, in minutes.
 ///
@@ -1533,14 +1493,27 @@ const CLOB_EXPLICIT_WINDOW_DAYS: u16 = 15;
 const CLOB_MAX_PRESET_FIDELITY: u16 = 720;
 
 fn history_window(
-    days: u16,
+    span: Option<i64>,
     fidelity_minutes: u16,
 ) -> Result<HistoryWindow, MarketParticipantError> {
-    let days = days.max(1);
     let end_ts = now_millis()? / 1_000;
-    let start_ts = end_ts.saturating_sub(i64::from(days) * 86_400);
+    let Some(span) = span else {
+        // The whole life of the market: the preset states the reach and there is
+        // no earlier instant to trim to.
+        return Ok(HistoryWindow {
+            interval: Some("max"),
+            fidelity: fidelity_minutes.max(CLOB_MAX_PRESET_FIDELITY),
+            start_ts: None,
+            end_ts: None,
+            since: 0,
+        });
+    };
+    // A span of zero (or less) would ask the venue for an empty pair, so it is
+    // clamped to one minute. The pair itself is stated in whole seconds.
+    let span = span.max(CLOB_MINIMUM_SPAN_MILLIS);
+    let start_ts = end_ts.saturating_sub(span / 1_000);
     let since = start_ts.saturating_mul(1_000);
-    if days <= CLOB_EXPLICIT_WINDOW_DAYS {
+    if span <= CLOB_EXPLICIT_WINDOW_MILLIS {
         return Ok(HistoryWindow {
             interval: None,
             fidelity: fidelity_minutes.max(1),
@@ -1549,11 +1522,17 @@ fn history_window(
             since,
         });
     }
-    let interval = history_interval(days);
+    // Past the explicit limit the span is stated by a preset. `1m` is the
+    // venue's one-month window, not one minute: the sample spacing is
+    // `fidelity`, which is a separate field. A span past a month has to be asked
+    // with `max`, which only reaches the whole life at a twelve-hour bucket.
+    let interval = if span <= CLOB_PRESET_WINDOW_MILLIS {
+        "1m"
+    } else {
+        "max"
+    };
     Ok(HistoryWindow {
         interval: Some(interval),
-        // The month preset answers a month at any fidelity; only the whole-life
-        // preset needs a coarse bucket to actually reach back that far.
         fidelity: if interval == "max" {
             fidelity_minutes.max(CLOB_MAX_PRESET_FIDELITY)
         } else {
@@ -1563,18 +1542,6 @@ fn history_window(
         end_ts: None,
         since,
     })
-}
-
-/// The interval preset one span longer than the explicit limit is asked with.
-///
-/// `1m` here is the venue's one-month window, not one minute: the sample spacing
-/// is `fidelity`, which is a separate field. A span past a month has to be asked
-/// with `max`, which only reaches the whole life at a twelve-hour bucket.
-fn history_interval(days: u16) -> &'static str {
-    match days {
-        0..=30 => "1m",
-        _ => "max",
-    }
 }
 
 fn now_millis() -> Result<UnixMillis, MarketParticipantError> {
@@ -1646,33 +1613,71 @@ mod tests {
 
     #[test]
     fn a_history_window_is_asked_the_way_the_endpoint_accepts_it() {
-        // The endpoint refuses an explicit span past fifteen days.
-        let short = history_window(15, 60).expect("the clock is readable");
-        assert!(short.interval.is_none());
-        assert!(short.start_ts.is_some() && short.end_ts.is_some());
-        assert_eq!(short.fidelity, 60);
+        // Every range inside fifteen days is an exact timestamp pair at the
+        // fidelity its range asks for.
+        for (span, fidelity) in [
+            (3_600_000_i64, 1_u16),
+            (21_600_000, 5),
+            (86_400_000, 10),
+            (604_800_000, 60),
+        ] {
+            let short = history_window(Some(span), fidelity).expect("the clock is readable");
+            assert!(short.interval.is_none());
+            let start = short.start_ts.expect("the pair has a start");
+            let end = short.end_ts.expect("the pair has an end");
+            assert_eq!(end - start, span / 1_000);
+            assert_eq!(short.fidelity, fidelity);
+            assert_eq!(short.since, start * 1_000);
+        }
 
-        // Past that, the span is stated by the preset and reaches a month.
-        let month = history_window(30, 60).expect("the clock is readable");
+        // The endpoint refuses an explicit span past fifteen days, so the
+        // boundary itself is the last explicit pair.
+        let boundary = history_window(Some(15 * 86_400_000), 60).expect("the clock is readable");
+        assert!(boundary.interval.is_none());
+        assert!(boundary.start_ts.is_some() && boundary.end_ts.is_some());
+
+        // Past that, the span is stated by the month preset.
+        let month = history_window(Some(30 * 86_400_000), 60).expect("the clock is readable");
         assert_eq!(month.interval, Some("1m"));
         assert!(month.start_ts.is_none() && month.end_ts.is_none());
+        assert_eq!(month.fidelity, 60);
 
-        // A longer span only reaches back at a twelve-hour bucket.
-        let quarter = history_window(90, 60).expect("the clock is readable");
-        assert_eq!(quarter.interval, Some("max"));
-        assert_eq!(quarter.fidelity, 720);
+        // A span longer than a month only reaches back at a twelve-hour bucket.
+        let beyond = history_window(Some(30 * 86_400_000 + 1), 60).expect("the clock is readable");
+        assert_eq!(beyond.interval, Some("max"));
+        assert_eq!(beyond.fidelity, 720);
+
+        // The whole life of the market asks with no explicit bounds and trims
+        // nothing.
+        let all = history_window(None, 720).expect("the clock is readable");
+        assert_eq!(all.interval, Some("max"));
+        assert_eq!(all.fidelity, 720);
+        assert!(all.start_ts.is_none() && all.end_ts.is_none());
+        assert_eq!(all.since, 0);
+        assert!(all.contains(0), "the whole-life range trims nothing");
     }
 
     #[test]
-    fn a_preset_answer_is_trimmed_to_the_window_that_was_asked_for() {
-        let window = history_window(30, 60).expect("the clock is readable");
+    fn a_preset_answer_is_trimmed_to_the_span_that_was_asked_for() {
+        let window = history_window(Some(30 * 86_400_000), 60).expect("the clock is readable");
         let now = now_millis().expect("the clock is readable");
         let requested_from = now - 30 * 86_400_000;
 
-        assert!(window.contains(requested_from + 1));
+        assert!(window.contains(requested_from + 2_000));
         // The request states its bounds in whole seconds, so the trim edge sits
         // within the second the caller asked from.
         assert!(!window.contains(requested_from - 2_000));
+    }
+
+    #[test]
+    fn a_non_positive_span_is_asked_as_one_minute() {
+        let window = history_window(Some(0), 1).expect("the clock is readable");
+        let start = window.start_ts.expect("the clamped pair has a start");
+        let end = window.end_ts.expect("the clamped pair has an end");
+
+        assert_eq!(end - start, 60);
+        assert!(window.contains(start * 1_000));
+        assert!(!window.contains(start * 1_000 - 1));
     }
 
     #[test]

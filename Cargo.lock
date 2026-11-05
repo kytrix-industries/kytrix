@@ -7403,7 +7403,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
-name = "prediction_chart"
+name = "prediction_market"
 version = "0.0.3"
 dependencies = [
  "app_config",
@@ -10867,7 +10867,7 @@ dependencies = [
  "order_book",
  "pentagon_pizza_index",
  "perpetual_statistics",
- "prediction_chart",
+ "prediction_market",
  "serde",
  "serde_json",
  "smol_str",

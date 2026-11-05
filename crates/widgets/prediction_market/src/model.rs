@@ -1,4 +1,4 @@
-//! The probability window one chart draws.
+//! The probability chart one market draws.
 //!
 //! A prediction event is a set of markets, and one market is a set of outcome
 //! sides. The chart follows one market at a time, keeps one line per side, and
@@ -8,11 +8,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use market_participants_model::{
-    decimal::Fraction,
+    decimal::{Fraction, UnixMillis},
     outcome::OutcomeLegRef,
     prediction::{
         PredictionEventView, PredictionMarket, PredictionMarketGroup, PredictionMarketRef,
-        PredictionPricePoint, PredictionSeries,
+        PredictionPricePoint, PredictionRange, PredictionSeries,
     },
 };
 use smol_str::SmolStr;
@@ -21,7 +21,7 @@ use smol_str::SmolStr;
 pub(crate) const MAX_LINES: usize = 12;
 
 /// The most points one line keeps.
-pub(crate) const MAX_POINTS: usize = 2_000;
+pub(crate) const MAX_POINTS: usize = 4_096;
 
 /// The markets a reader can switch to.
 ///
@@ -40,9 +40,9 @@ fn visible_markets<'a>(
         .filter(move |market| !has_open || market.open || &market.market == selected)
 }
 
-/// One line of a prediction chart.
+/// One line of a prediction market chart.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PredictionChartSeries {
+pub(crate) struct PredictionMarketSeries {
     pub leg: OutcomeLegRef,
     pub label: SmolStr,
     /// The index of the chart colour this line is drawn in.
@@ -69,21 +69,25 @@ fn push_live_point(points: &mut Vec<PredictionPricePoint>, point: PredictionPric
 
 /// One complete chart reading.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PredictionChartSnapshot {
+pub(crate) struct PredictionMarketSnapshot {
     pub revision: u64,
+    /// The range the reading was asked over.
+    pub range: PredictionRange,
     pub title: SmolStr,
     pub market: PredictionMarketRef,
     /// The markets a reader can switch to, in the order the venue listed them.
     pub markets: Arc<[PredictionMarketChoice]>,
-    pub series: Arc<[PredictionChartSeries]>,
+    pub series: Arc<[PredictionMarketSeries]>,
     /// How many sides the selected market has beyond the lines drawn.
     pub omitted: usize,
 }
 
-impl PredictionChartSnapshot {
-    /// Builds a chart from one event view, the selected market and its series.
+impl PredictionMarketSnapshot {
+    /// Builds a chart from one range, one event view, the selected market and
+    /// its series.
     pub(crate) fn new(
         revision: u64,
+        range: PredictionRange,
         event: PredictionEventView,
         market: PredictionMarket,
         series: Vec<PredictionSeries>,
@@ -101,7 +105,10 @@ impl PredictionChartSnapshot {
                 group: market.group.clone(),
             })
             .collect();
-        let mut lines: Vec<PredictionChartSeries> = series
+        // The sides stay in the order the venue published them: the legend and the
+        // colours are read off this list, so sorting it by the latest value would
+        // shuffle both on every tick and again on every reload.
+        let mut lines: Vec<PredictionMarketSeries> = series
             .into_iter()
             .map(|mut series| {
                 let label = labels
@@ -114,7 +121,7 @@ impl PredictionChartSnapshot {
                 if series.points.len() > MAX_POINTS {
                     series.points.drain(..series.points.len() - MAX_POINTS);
                 }
-                PredictionChartSeries {
+                PredictionMarketSeries {
                     leg: series.leg,
                     label,
                     color: 0,
@@ -123,12 +130,6 @@ impl PredictionChartSnapshot {
                 }
             })
             .collect();
-        lines.sort_by(|left, right| {
-            right
-                .latest
-                .cmp(&left.latest)
-                .then_with(|| left.label.cmp(&right.label))
-        });
         let omitted = lines.len().saturating_sub(MAX_LINES);
         lines.truncate(MAX_LINES);
         for (index, line) in lines.iter_mut().enumerate() {
@@ -136,12 +137,22 @@ impl PredictionChartSnapshot {
         }
         Self {
             revision,
+            range,
             title: event.title,
             market: market.market,
             markets,
             series: lines.into(),
             omitted,
         }
+    }
+
+    /// The newest point any line holds, for the endpoint pulse.
+    pub(crate) fn latest_timestamp(&self) -> Option<UnixMillis> {
+        self.series
+            .iter()
+            .flat_map(|line| line.points.iter())
+            .map(|point| point.timestamp)
+            .max()
     }
 
     /// The market groups in the order the event lists them.
@@ -202,7 +213,7 @@ impl PredictionChartSnapshot {
                     .map(|point| (series.leg, point))
             })
             .collect();
-        let series: Vec<PredictionChartSeries> = self
+        let series: Vec<PredictionMarketSeries> = self
             .series
             .iter()
             .cloned()
@@ -234,13 +245,13 @@ impl PredictionChartSnapshot {
 mod tests {
     use market_participants_model::{
         decimal::Fraction,
-        prediction::{PredictionPricePoint, PredictionSeries},
+        prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
     };
 
-    use super::{MAX_LINES, MAX_POINTS, PredictionChartSnapshot, push_live_point};
+    use super::{MAX_LINES, MAX_POINTS, PredictionMarketSnapshot, push_live_point};
     use crate::test_support::{charted_market, event_ref, event_with, market};
 
-    fn ids(snapshot: &PredictionChartSnapshot) -> Vec<&str> {
+    fn ids(snapshot: &PredictionMarketSnapshot) -> Vec<&str> {
         snapshot
             .markets
             .iter()
@@ -254,7 +265,66 @@ mod tests {
     }
 
     #[test]
-    fn a_live_line_keeps_only_its_newest_two_thousand_points() {
+    fn thirteen_sides_keep_twelve_lines_in_venue_order_and_report_the_rest() {
+        let event = event_ref();
+        let mut markets = Vec::with_capacity(13);
+        let mut legs = Vec::with_capacity(13);
+        let mut series = Vec::with_capacity(13);
+        for index in 0..13 {
+            let (market, market_legs) = charted_market(&event, &format!("charted-{index}"));
+            let leg = market_legs[0].clone();
+            legs.push(leg.clone());
+            series.push(PredictionSeries {
+                leg,
+                points: vec![PredictionPricePoint {
+                    timestamp: 1_000 + index as i64,
+                    probability: Fraction::ONE,
+                }],
+            });
+            markets.push(market);
+        }
+        // Every side is a leg of the drawn market, so each line has its venue label.
+        let mut drawn = markets[0].clone();
+        drawn.legs = markets
+            .iter()
+            .map(|market| market.legs[0].clone())
+            .collect();
+        let view = event_with(markets);
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, drawn, series);
+
+        assert_eq!(snapshot.series.len(), MAX_LINES);
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|line| line.leg.clone())
+                .collect::<Vec<_>>(),
+            legs.iter().take(MAX_LINES).cloned().collect::<Vec<_>>(),
+            "the twelve kept lines are the venue's first twelve, in its order"
+        );
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|line| line.color)
+                .collect::<Vec<_>>(),
+            (0..MAX_LINES).collect::<Vec<_>>(),
+            "a colour is the kept line's position in that order"
+        );
+        assert_eq!(
+            snapshot.omitted, 1,
+            "the thirteenth side is reported, not drawn"
+        );
+    }
+
+    #[test]
+    fn the_point_cap_is_four_thousand_and_ninety_six() {
+        assert_eq!(MAX_POINTS, 4_096);
+    }
+
+    #[test]
+    fn a_live_line_keeps_only_the_points_inside_its_cap() {
         let mut points = Vec::new();
         for timestamp in 0..=i64::try_from(MAX_POINTS).expect("the cap fits in i64") {
             push_live_point(
@@ -275,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn a_history_line_keeps_only_its_newest_two_thousand_points() {
+    fn a_history_line_keeps_only_the_points_inside_its_cap() {
         let event = event_ref();
         let (market, legs) = charted_market(&event, "charted");
         let view = event_with(vec![market.clone()]);
@@ -291,7 +361,7 @@ mod tests {
             points,
         }];
 
-        let snapshot = PredictionChartSnapshot::new(1, view, market, series);
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
         let line = snapshot
             .series
             .iter()
@@ -300,6 +370,112 @@ mod tests {
 
         assert_eq!(line.points.len(), MAX_POINTS);
         assert_eq!(line.points.first().map(|point| point.timestamp), Some(1));
+    }
+
+    #[test]
+    fn the_snapshot_echoes_the_range_it_was_read_over() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+        let series = vec![PredictionSeries {
+            leg: legs[0].clone(),
+            points: vec![PredictionPricePoint {
+                timestamp: 1_000,
+                probability: Fraction::ONE,
+            }],
+        }];
+
+        let snapshot =
+            PredictionMarketSnapshot::new(7, PredictionRange::Week1, view, market, series);
+
+        assert_eq!(snapshot.range, PredictionRange::Week1);
+        assert_eq!(
+            snapshot.with_live(Vec::new(), 8).range,
+            PredictionRange::Week1,
+            "a live tick keeps the range the reading was asked over"
+        );
+    }
+
+    #[test]
+    fn the_latest_timestamp_is_the_newest_point_across_every_line() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+        let series: Vec<PredictionSeries> = legs
+            .iter()
+            .enumerate()
+            .map(|(index, leg)| PredictionSeries {
+                leg: leg.clone(),
+                points: vec![PredictionPricePoint {
+                    timestamp: 1_000 + index as i64,
+                    probability: Fraction::ONE,
+                }],
+            })
+            .collect();
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
+
+        assert_eq!(
+            snapshot.latest_timestamp(),
+            Some(1_000 + legs.len() as i64 - 1)
+        );
+    }
+
+    #[test]
+    fn an_empty_snapshot_has_no_latest_timestamp() {
+        let event = event_ref();
+        let (market, _) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+
+        let snapshot =
+            PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, Vec::new());
+
+        assert_eq!(snapshot.latest_timestamp(), None);
+    }
+
+    #[test]
+    fn the_lines_keep_the_order_the_venue_published_them_in() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        // The first side is the weakest, so a value sort would move it last.
+        let series = vec![
+            PredictionSeries {
+                leg: legs[0].clone(),
+                points: vec![PredictionPricePoint {
+                    timestamp: 1_000,
+                    probability: Fraction::ZERO,
+                }],
+            },
+            PredictionSeries {
+                leg: legs[1].clone(),
+                points: vec![PredictionPricePoint {
+                    timestamp: 1_000,
+                    probability: Fraction::ONE,
+                }],
+            },
+        ];
+        let view = event_with(vec![market.clone()]);
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
+
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|line| line.leg.clone())
+                .collect::<Vec<_>>(),
+            legs,
+            "the legend and the colours read this order, so it has to be the venue's"
+        );
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|line| line.color)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "a colour is the position of its line in that order"
+        );
     }
 
     #[test]
@@ -323,7 +499,8 @@ mod tests {
             })
             .collect();
         let view = event_with(vec![market.clone()]);
-        let mut snapshot = PredictionChartSnapshot::new(1, view, market, series);
+        let mut snapshot =
+            PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
         let colors_before: Vec<usize> = snapshot.series.iter().map(|line| line.color).collect();
         let live: Vec<PredictionSeries> = legs
             .iter()
@@ -366,7 +543,8 @@ mod tests {
                 }],
             })
             .collect();
-        let mut snapshot = PredictionChartSnapshot::new(1, view, market, series);
+        let mut snapshot =
+            PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
         let stale: Vec<PredictionSeries> = legs
             .iter()
             .map(|leg| PredictionSeries {
@@ -399,7 +577,13 @@ mod tests {
             market(&event, "open-c", "group-a", true),
         ];
         let view = event_with(markets.clone());
-        let snapshot = PredictionChartSnapshot::new(1, view, markets[0].clone(), Vec::new());
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[0].clone(),
+            Vec::new(),
+        );
 
         assert_eq!(ids(&snapshot), vec!["open-a", "open-c"]);
     }
@@ -412,7 +596,13 @@ mod tests {
             market(&event, "closed-b", "group-b", false),
         ];
         let view = event_with(markets.clone());
-        let snapshot = PredictionChartSnapshot::new(1, view, markets[1].clone(), Vec::new());
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[1].clone(),
+            Vec::new(),
+        );
 
         assert_eq!(ids(&snapshot), vec!["open-a", "closed-b"]);
     }
@@ -425,7 +615,13 @@ mod tests {
             market(&event, "closed-b", "group-b", false),
         ];
         let view = event_with(markets.clone());
-        let snapshot = PredictionChartSnapshot::new(1, view, markets[0].clone(), Vec::new());
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[0].clone(),
+            Vec::new(),
+        );
 
         assert_eq!(ids(&snapshot), vec!["closed-a", "closed-b"]);
     }
@@ -439,7 +635,13 @@ mod tests {
             market(&event, "closed-c", "group-c", false),
         ];
         let view = event_with(markets.clone());
-        let snapshot = PredictionChartSnapshot::new(1, view, markets[0].clone(), Vec::new());
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[0].clone(),
+            Vec::new(),
+        );
 
         assert_eq!(
             snapshot
@@ -471,7 +673,13 @@ mod tests {
             market(&event, "spread-b", "spreads", true),
         ];
         let view = event_with(markets.clone());
-        let snapshot = PredictionChartSnapshot::new(1, view, markets[1].clone(), Vec::new());
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[1].clone(),
+            Vec::new(),
+        );
 
         let groups = snapshot.market_groups();
         assert_eq!(groups.len(), 2);

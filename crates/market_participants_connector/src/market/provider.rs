@@ -188,9 +188,9 @@ impl MarketCapability {
         &self,
         event: market_participants_model::prediction::PredictionEventRef,
         legs: Vec<market_participants_model::prediction::PredictionLeg>,
-        window: market_participants_model::prediction::PredictionWindow,
+        range: market_participants_model::prediction::PredictionRange,
     ) -> super::prediction::PredictionSeriesBuilder {
-        super::prediction::PredictionSeriesBuilder::new(self.clone(), event, legs, window)
+        super::prediction::PredictionSeriesBuilder::new(self.clone(), event, legs, range)
     }
 
     /// Returns every listing of one route the published catalog holds.

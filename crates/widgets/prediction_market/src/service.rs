@@ -1,10 +1,10 @@
-//! The background service one prediction chart talks to.
+//! The background service one prediction market widget talks to.
 //!
 //! The chart reads a bounded history once and then follows the venue's live
 //! probability stream. The subscription is opened before the history is requested,
 //! so a tick that lands while the page is in flight is buffered rather than missed.
-//! The stream key is the event, the market, the window and the requested content
-//! locale: another event, market, window or language is another chart, and a
+//! The stream key is the event, the market, the range and the requested content
+//! locale: another event, market, range or language is another chart, and a
 //! message from the previous one is refused by the view.
 
 use std::{
@@ -24,7 +24,7 @@ use market_participants_connector::market::{
 };
 use market_participants_model::prediction::{
     PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket, PredictionMarketRef,
-    PredictionSeries, PredictionWindow,
+    PredictionRange, PredictionSeries,
 };
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -35,7 +35,7 @@ use widget::{
     stream::{StreamPublishError, StreamPublisher},
 };
 
-use crate::model::{MAX_POINTS, PredictionChartSnapshot};
+use crate::model::PredictionMarketSnapshot;
 
 /// How long one read may take before it is a failure.
 pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,13 +46,20 @@ pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// must not repaint the window at that rate.
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The most live updates buffered between opening the stream and the first
+/// snapshot.
+///
+/// This counts updates, not points: one update carries one new observation per
+/// leg, so it is separate from the per-line point budget.
+pub(crate) const MAX_BUFFERED_UPDATES: usize = 2_000;
+
 /// What the view asks the service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PredictionChartRequest {
+pub enum PredictionMarketRequest {
     Load {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
-        window: PredictionWindow,
+        range: PredictionRange,
         locale: Option<SmolStr>,
         /// A local stream epoch. Every explicit load increments it, so messages
         /// from a replaced stream can never be mistaken for the new one's.
@@ -61,32 +68,32 @@ pub enum PredictionChartRequest {
     Retry {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
-        window: PredictionWindow,
+        range: PredictionRange,
         locale: Option<SmolStr>,
         epoch: u64,
     },
 }
 
-impl PredictionChartRequest {
-    pub(crate) fn key(&self) -> PredictionChartStreamKey {
+impl PredictionMarketRequest {
+    pub(crate) fn key(&self) -> PredictionMarketStreamKey {
         match self {
             Self::Load {
                 event,
                 market,
-                window,
+                range,
                 locale,
                 epoch,
             }
             | Self::Retry {
                 event,
                 market,
-                window,
+                range,
                 locale,
                 epoch,
-            } => PredictionChartStreamKey {
+            } => PredictionMarketStreamKey {
                 event: event.clone(),
                 market: market.clone(),
-                window: *window,
+                range: *range,
                 locale: locale.clone(),
                 epoch: *epoch,
             },
@@ -96,16 +103,16 @@ impl PredictionChartRequest {
 
 /// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PredictionChartResponse {
+pub enum PredictionMarketResponse {
     StreamStarted,
 }
 
-/// The event, window and locale one chart follows.
+/// The event, range and locale one chart follows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PredictionChartStreamKey {
+pub struct PredictionMarketStreamKey {
     pub event: PredictionEventRef,
     pub market: Option<PredictionMarketRef>,
-    pub window: PredictionWindow,
+    pub range: PredictionRange,
     pub locale: Option<SmolStr>,
     /// The view-local generation that produced this request.
     pub epoch: u64,
@@ -113,15 +120,15 @@ pub struct PredictionChartStreamKey {
 
 /// Where the stream is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PredictionChartStatus {
+pub enum PredictionMarketStatus {
     Connecting,
     Ready { revision: u64 },
-    Failed { error: PredictionChartFetchError },
+    Failed { error: PredictionMarketFetchError },
 }
 
 /// Why one read produced no snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum PredictionChartFetchError {
+pub enum PredictionMarketFetchError {
     #[error("the prediction request failed: {0}")]
     Market(#[source] MarketError),
     #[error("the prediction event publishes no tradable market")]
@@ -130,7 +137,7 @@ pub enum PredictionChartFetchError {
     Timeout(Duration),
 }
 
-impl From<MarketError> for PredictionChartFetchError {
+impl From<MarketError> for PredictionMarketFetchError {
     fn from(error: MarketError) -> Self {
         Self::Market(error)
     }
@@ -138,9 +145,9 @@ impl From<MarketError> for PredictionChartFetchError {
 
 /// Everything the service publishes.
 #[derive(Clone, Debug)]
-pub enum PredictionChartStreamMessage {
-    Status(PredictionChartStatus),
-    Snapshot(Arc<PredictionChartSnapshot>),
+pub enum PredictionMarketStreamMessage {
+    Status(PredictionMarketStatus),
+    Snapshot(Arc<PredictionMarketSnapshot>),
 }
 
 /// Why a request was refused.
@@ -148,10 +155,10 @@ pub enum PredictionChartStreamMessage {
 /// The service has no refusal of its own: a request always starts or replaces a
 /// stream. The type exists because the protocol boundary names one.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum PredictionChartServiceError {}
+pub enum PredictionMarketServiceError {}
 
 /// The seam between the chart and the connector, so a test can answer instead.
-pub trait PredictionChartSource: Clone + Send + Sync + 'static {
+pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
     type Subscription: PredictionSeriesEventSubscription;
 
     fn event(
@@ -164,7 +171,7 @@ pub trait PredictionChartSource: Clone + Send + Sync + 'static {
         &self,
         event: PredictionEventRef,
         legs: Vec<PredictionLeg>,
-        window: PredictionWindow,
+        range: PredictionRange,
     ) -> impl Future<Output = Result<Vec<PredictionSeries>, MarketError>> + Send;
 
     fn subscribe_series(
@@ -181,7 +188,7 @@ pub trait PredictionSeriesEventSubscription: Send + 'static {
     ) -> impl Future<Output = Option<Result<Vec<PredictionSeries>, MarketError>>> + Send;
 }
 
-impl PredictionChartSource for MarketCapability {
+impl PredictionMarketSource for MarketCapability {
     type Subscription = ClientPredictionSeriesSubscription;
 
     async fn event(
@@ -196,9 +203,9 @@ impl PredictionChartSource for MarketCapability {
         &self,
         event: PredictionEventRef,
         legs: Vec<PredictionLeg>,
-        window: PredictionWindow,
+        range: PredictionRange,
     ) -> Result<Vec<PredictionSeries>, MarketError> {
-        self.prediction_series(event, legs, window).fetch().await
+        self.prediction_series(event, legs, range).fetch().await
     }
 
     fn subscribe_series(
@@ -224,17 +231,17 @@ impl PredictionSeriesEventSubscription for ClientPredictionSeriesSubscription {
     }
 }
 
-pub(crate) struct PredictionChartProtocol;
+pub(crate) struct PredictionMarketProtocol;
 
-impl WidgetProtocol for PredictionChartProtocol {
-    type Request = PredictionChartRequest;
-    type Response = PredictionChartResponse;
-    type StreamKey = PredictionChartStreamKey;
-    type StreamMessage = PredictionChartStreamMessage;
-    type Error = PredictionChartServiceError;
+impl WidgetProtocol for PredictionMarketProtocol {
+    type Request = PredictionMarketRequest;
+    type Response = PredictionMarketResponse;
+    type StreamKey = PredictionMarketStreamKey;
+    type StreamMessage = PredictionMarketStreamMessage;
+    type Error = PredictionMarketServiceError;
 }
 
-pub struct PredictionChartService<S = MarketCapability> {
+pub struct PredictionMarketService<S = MarketCapability> {
     source: S,
     attempt_timeout: Duration,
     /// The next snapshot revision this service hands out.
@@ -246,7 +253,7 @@ pub struct PredictionChartService<S = MarketCapability> {
     revision: Arc<AtomicU64>,
 }
 
-impl<S> PredictionChartService<S> {
+impl<S> PredictionMarketService<S> {
     pub(crate) fn new(source: S) -> Self {
         Self {
             source,
@@ -256,12 +263,12 @@ impl<S> PredictionChartService<S> {
     }
 }
 
-impl<S> WidgetService<PredictionChartProtocol> for PredictionChartService<S>
+impl<S> WidgetService<PredictionMarketProtocol> for PredictionMarketService<S>
 where
-    S: PredictionChartSource,
+    S: PredictionMarketSource,
 {
-    async fn run(self, mut context: ServiceContext<PredictionChartProtocol>) {
-        let mut active_key: Option<PredictionChartStreamKey> = None;
+    async fn run(self, mut context: ServiceContext<PredictionMarketProtocol>) {
+        let mut active_key: Option<PredictionMarketStreamKey> = None;
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
@@ -287,7 +294,7 @@ where
             });
             active_key = Some(key.clone());
             if reply
-                .respond(Ok(PredictionChartResponse::StreamStarted))
+                .respond(Ok(PredictionMarketResponse::StreamStarted))
                 .is_err()
             {
                 context.cancel_stream(&key);
@@ -301,14 +308,14 @@ where
 
 async fn run_stream<S>(
     source: S,
-    key: PredictionChartStreamKey,
+    key: PredictionMarketStreamKey,
     attempt_timeout: Duration,
     revisions: Arc<AtomicU64>,
-    publisher: StreamPublisher<PredictionChartProtocol>,
+    publisher: StreamPublisher<PredictionMarketProtocol>,
 ) where
-    S: PredictionChartSource,
+    S: PredictionMarketSource,
 {
-    if publish_status(&publisher, PredictionChartStatus::Connecting)
+    if publish_status(&publisher, PredictionMarketStatus::Connecting)
         .await
         .is_err()
     {
@@ -322,20 +329,20 @@ async fn run_stream<S>(
     {
         Ok(Ok(event)) => event,
         Ok(Err(error)) => {
-            publish_failure(&publisher, PredictionChartFetchError::Market(error)).await;
+            publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
             return;
         }
         Err(_) => {
             publish_failure(
                 &publisher,
-                PredictionChartFetchError::Timeout(attempt_timeout),
+                PredictionMarketFetchError::Timeout(attempt_timeout),
             )
             .await;
             return;
         }
     };
     let Some(market) = selected_market(&event, key.market.as_ref()) else {
-        publish_failure(&publisher, PredictionChartFetchError::NoMarkets).await;
+        publish_failure(&publisher, PredictionMarketFetchError::NoMarkets).await;
         return;
     };
     let mut subscription = match timeout(
@@ -346,13 +353,13 @@ async fn run_stream<S>(
     {
         Ok(Ok(subscription)) => subscription,
         Ok(Err(error)) => {
-            publish_failure(&publisher, PredictionChartFetchError::Market(error)).await;
+            publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
             return;
         }
         Err(_) => {
             publish_failure(
                 &publisher,
-                PredictionChartFetchError::Timeout(attempt_timeout),
+                PredictionMarketFetchError::Timeout(attempt_timeout),
             )
             .await;
             return;
@@ -361,12 +368,12 @@ async fn run_stream<S>(
 
     // The live stream is open before history is requested, so a tick that lands
     // while the page is in flight is buffered rather than missed. The buffer is
-    // bounded by the point budget a line keeps: a tick older than that many ticks
-    // is a point the chart would drop anyway.
+    // bounded by an update budget: a tick older than that many ticks is a point
+    // the chart would drop anyway.
     let mut buffered: VecDeque<Vec<PredictionSeries>> = VecDeque::new();
     let fetch = timeout(
         attempt_timeout,
-        source.series(event.event.clone(), market.legs.clone(), key.window),
+        source.series(event.event.clone(), market.legs.clone(), key.range),
     );
     tokio::pin!(fetch);
     let history = loop {
@@ -377,18 +384,18 @@ async fn run_stream<S>(
             update = subscription.recv() => match update {
                 Some(Ok(series)) => {
                     buffered.push_back(series);
-                    if buffered.len() > MAX_POINTS {
+                    if buffered.len() > MAX_BUFFERED_UPDATES {
                         buffered.pop_front();
                     }
                 }
                 Some(Err(error)) => {
-                    publish_failure(&publisher, PredictionChartFetchError::Market(error)).await;
+                    publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
                     return;
                 }
                 None => {
                     publish_failure(
                         &publisher,
-                        PredictionChartFetchError::Market(MarketError::Disconnected(
+                        PredictionMarketFetchError::Market(MarketError::Disconnected(
                             DisconnectReason::Normal,
                         )),
                     )
@@ -401,13 +408,13 @@ async fn run_stream<S>(
     let history = match history {
         Ok(Ok(series)) => series,
         Ok(Err(error)) => {
-            publish_failure(&publisher, PredictionChartFetchError::Market(error)).await;
+            publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
             return;
         }
         Err(_) => {
             publish_failure(
                 &publisher,
-                PredictionChartFetchError::Timeout(attempt_timeout),
+                PredictionMarketFetchError::Timeout(attempt_timeout),
             )
             .await;
             return;
@@ -415,20 +422,20 @@ async fn run_stream<S>(
     };
 
     let mut revision = next_revision(&revisions);
-    let mut snapshot = PredictionChartSnapshot::new(revision, event, market, history);
+    let mut snapshot = PredictionMarketSnapshot::new(revision, key.range, event, market, history);
     for update in buffered {
         revision = next_revision(&revisions);
         snapshot = snapshot.with_live(update, revision);
     }
     if publisher
-        .publish_latest(PredictionChartStreamMessage::Snapshot(Arc::new(
+        .publish_latest(PredictionMarketStreamMessage::Snapshot(Arc::new(
             snapshot.clone(),
         )))
         .is_err()
     {
         return;
     }
-    if publish_status(&publisher, PredictionChartStatus::Ready { revision })
+    if publish_status(&publisher, PredictionMarketStatus::Ready { revision })
         .await
         .is_err()
     {
@@ -453,7 +460,7 @@ async fn run_stream<S>(
                 }
                 pending = false;
                 if publisher
-                    .publish_latest(PredictionChartStreamMessage::Snapshot(Arc::new(
+                    .publish_latest(PredictionMarketStreamMessage::Snapshot(Arc::new(
                         snapshot.clone(),
                     )))
                     .is_err()
@@ -468,13 +475,13 @@ async fn run_stream<S>(
                     pending = true;
                 }
                 Some(Err(error)) => {
-                    publish_failure(&publisher, PredictionChartFetchError::Market(error)).await;
+                    publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
                     return;
                 }
                 None => {
                     publish_failure(
                         &publisher,
-                        PredictionChartFetchError::Market(MarketError::Disconnected(
+                        PredictionMarketFetchError::Market(MarketError::Disconnected(
                             DisconnectReason::Normal,
                         )),
                     )
@@ -527,21 +534,21 @@ fn next_revision(revisions: &AtomicU64) -> u64 {
 }
 
 async fn publish_status(
-    publisher: &StreamPublisher<PredictionChartProtocol>,
-    status: PredictionChartStatus,
+    publisher: &StreamPublisher<PredictionMarketProtocol>,
+    status: PredictionMarketStatus,
 ) -> Result<(), StreamPublishError> {
     publisher
-        .publish_reliable(PredictionChartStreamMessage::Status(status))
+        .publish_reliable(PredictionMarketStreamMessage::Status(status))
         .await
 }
 
 async fn publish_failure(
-    publisher: &StreamPublisher<PredictionChartProtocol>,
-    error: PredictionChartFetchError,
+    publisher: &StreamPublisher<PredictionMarketProtocol>,
+    error: PredictionMarketFetchError,
 ) {
     let _ = publisher
-        .publish_reliable(PredictionChartStreamMessage::Status(
-            PredictionChartStatus::Failed { error },
+        .publish_reliable(PredictionMarketStreamMessage::Status(
+            PredictionMarketStatus::Failed { error },
         ))
         .await;
 }
@@ -558,7 +565,7 @@ mod tests {
         decimal::Fraction,
         prediction::{
             PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket,
-            PredictionPricePoint, PredictionSeries, PredictionWindow,
+            PredictionPricePoint, PredictionRange, PredictionSeries,
         },
     };
     use smol_str::SmolStr;
@@ -566,12 +573,13 @@ mod tests {
     use widget::{runtime::WidgetRuntime, stream::ReliableStream};
 
     use super::{
-        PredictionChartFetchError, PredictionChartProtocol, PredictionChartRequest,
-        PredictionChartService, PredictionChartSource, PredictionChartStatus,
-        PredictionChartStreamMessage, PredictionSeriesEventSubscription, selected_market,
+        MAX_BUFFERED_UPDATES, PredictionMarketFetchError, PredictionMarketProtocol,
+        PredictionMarketRequest, PredictionMarketService, PredictionMarketSource,
+        PredictionMarketStatus, PredictionMarketStreamMessage, PredictionSeriesEventSubscription,
+        selected_market,
     };
     use crate::{
-        model::{PredictionChartSeries, PredictionChartSnapshot},
+        model::{PredictionMarketSeries, PredictionMarketSnapshot},
         test_support::{charted_market, event_ref, event_with, market},
     };
 
@@ -658,7 +666,7 @@ mod tests {
         event_received: Arc<Notify>,
     }
 
-    impl PredictionChartSource for FakeSource {
+    impl PredictionMarketSource for FakeSource {
         type Subscription = FakeSubscription;
 
         async fn event(
@@ -679,7 +687,7 @@ mod tests {
             &self,
             _event: PredictionEventRef,
             _legs: Vec<PredictionLeg>,
-            _window: PredictionWindow,
+            _range: PredictionRange,
         ) -> Result<Vec<PredictionSeries>, MarketError> {
             let receiver = self
                 .history
@@ -716,7 +724,7 @@ mod tests {
 
     /// One source, one subscription and the handles a test drives them with.
     struct Harness {
-        runtime: WidgetRuntime<PredictionChartProtocol>,
+        runtime: WidgetRuntime<PredictionMarketProtocol>,
         event: oneshot::Sender<PredictionEventView>,
         history: oneshot::Sender<Vec<PredictionSeries>>,
         events: mpsc::Sender<Result<Vec<PredictionSeries>, MarketError>>,
@@ -740,7 +748,7 @@ mod tests {
             history_requested: history_requested.clone(),
         };
         let runtime =
-            WidgetRuntime::spawn(current_test_handle(), PredictionChartService::new(source));
+            WidgetRuntime::spawn(current_test_handle(), PredictionMarketService::new(source));
         Harness {
             runtime,
             event,
@@ -751,11 +759,11 @@ mod tests {
         }
     }
 
-    fn load() -> PredictionChartRequest {
-        PredictionChartRequest::Load {
+    fn load() -> PredictionMarketRequest {
+        PredictionMarketRequest::Load {
             event: event_ref(),
             market: None,
-            window: PredictionWindow::default(),
+            range: PredictionRange::default(),
             locale: None,
             epoch: 1,
         }
@@ -772,15 +780,15 @@ mod tests {
     }
 
     async fn receive_status(
-        reliable: &mut ReliableStream<PredictionChartProtocol>,
-        expected: PredictionChartStatus,
+        reliable: &mut ReliableStream<PredictionMarketProtocol>,
+        expected: PredictionMarketStatus,
     ) {
         loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), reliable.recv())
                 .await
                 .expect("a status should arrive")
                 .expect("the reliable stream stays open");
-            let PredictionChartStreamMessage::Status(status) = envelope.message().as_ref() else {
+            let PredictionMarketStreamMessage::Status(status) = envelope.message().as_ref() else {
                 continue;
             };
             if *status == expected {
@@ -789,10 +797,10 @@ mod tests {
         }
     }
 
-    fn snapshot_of(message: &PredictionChartStreamMessage) -> Option<&PredictionChartSnapshot> {
+    fn snapshot_of(message: &PredictionMarketStreamMessage) -> Option<&PredictionMarketSnapshot> {
         match message {
-            PredictionChartStreamMessage::Snapshot(snapshot) => Some(snapshot),
-            PredictionChartStreamMessage::Status(_) => None,
+            PredictionMarketStreamMessage::Snapshot(snapshot) => Some(snapshot),
+            PredictionMarketStreamMessage::Status(_) => None,
         }
     }
 
@@ -837,7 +845,7 @@ mod tests {
             .next_unseen()
             .and_then(|envelope| snapshot_of(envelope.message().as_ref()).cloned())
             .expect("the published message is a snapshot");
-        let line: &PredictionChartSeries = snapshot
+        let line: &PredictionMarketSeries = snapshot
             .series
             .iter()
             .find(|line| line.leg == legs[0])
@@ -880,7 +888,7 @@ mod tests {
             .history
             .send(Vec::new())
             .expect("the history read is waiting");
-        receive_status(&mut reliable, PredictionChartStatus::Ready { revision: 1 }).await;
+        receive_status(&mut reliable, PredictionMarketStatus::Ready { revision: 1 }).await;
         harness
             .events
             .send(Err(MarketError::Disconnected(DisconnectReason::Normal)))
@@ -890,8 +898,8 @@ mod tests {
 
         receive_status(
             &mut reliable,
-            PredictionChartStatus::Failed {
-                error: PredictionChartFetchError::Market(MarketError::Disconnected(
+            PredictionMarketStatus::Failed {
+                error: PredictionMarketFetchError::Market(MarketError::Disconnected(
                     DisconnectReason::Normal,
                 )),
             },
@@ -923,13 +931,13 @@ mod tests {
             .history
             .send(Vec::new())
             .expect("the history read is waiting");
-        receive_status(&mut reliable, PredictionChartStatus::Ready { revision: 1 }).await;
+        receive_status(&mut reliable, PredictionMarketStatus::Ready { revision: 1 }).await;
         drop(harness.events);
 
         receive_status(
             &mut reliable,
-            PredictionChartStatus::Failed {
-                error: PredictionChartFetchError::Market(MarketError::Disconnected(
+            PredictionMarketStatus::Failed {
+                error: PredictionMarketFetchError::Market(MarketError::Disconnected(
                     DisconnectReason::Normal,
                 )),
             },
@@ -945,8 +953,14 @@ mod tests {
 
         assert_eq!(key.event, event_ref());
         assert_eq!(key.market, None);
-        assert_eq!(key.window, PredictionWindow::default());
+        assert_eq!(key.range, PredictionRange::default());
         assert_eq!(key.locale, None);
         assert_eq!(key.epoch, 1);
+    }
+
+    #[test]
+    fn the_live_buffer_is_bounded_separately_from_the_line_point_cap() {
+        assert_eq!(MAX_BUFFERED_UPDATES, 2_000);
+        assert_ne!(MAX_BUFFERED_UPDATES, crate::model::MAX_POINTS);
     }
 }

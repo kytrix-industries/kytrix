@@ -503,7 +503,7 @@ error:
     protocol: X API 协议错误：%{detail}
     server: X API 返回 HTTP %{status}
     timeout: X API 请求超时
-  prediction_chart:
+  prediction_market:
     no_markets: 该预测事件没有可交易市场
     timeout: 预测请求在 %{seconds} 秒后超时
   prediction_selector:
@@ -863,11 +863,20 @@ widget:
     select_instrument: 选择标的
     select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
     table: 最近市场成交
-  prediction_chart:
+  prediction_market:
     more_lines: 还有 %{count} 条
+    range:
+      all: ALL
+      day_1: 1D
+      hour_1: 1H
+      hour_6: 6H
+      month_1: 1M
+      week_1: 1W
+    range_aria: 显示 %{range} 区间
     select_event: 选择预测事件
     select_market: 选择市场
     select_market_group: 选择市场分类
+    source: 数据来源：%{venue}
   names:
     candlestick: K 线
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
@@ -885,7 +894,7 @@ widget:
     open_interest: 持仓量
     order_book: 订单簿
     pentagon_pizza_index: 五角大楼披萨指数
-    prediction_chart: 预测概率图
+    prediction_market: 预测市场
     solana_wallet: Solana 钱包监控
     taker_volume: 主动买卖量
     top_trader_account_ratio: 大户账户多空比

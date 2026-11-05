@@ -414,7 +414,8 @@ impl PredictionEventQuery {
 pub struct PredictionSeriesQuery {
     pub event: market_participants_model::prediction::PredictionEventRef,
     pub legs: Vec<market_participants_model::prediction::PredictionLeg>,
-    pub window: market_participants_model::prediction::PredictionWindow,
+    /// The range the series is read over.
+    pub range: market_participants_model::prediction::PredictionRange,
 }
 
 impl PredictionSeriesQuery {

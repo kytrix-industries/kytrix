@@ -503,7 +503,7 @@ error:
     protocol: 'X API protocol error: %{detail}'
     server: The X API returned HTTP %{status}
     timeout: The X API request timed out
-  prediction_chart:
+  prediction_market:
     no_markets: This prediction event publishes no tradable market
     timeout: The prediction request timed out after %{seconds}s
   prediction_selector:
@@ -863,11 +863,20 @@ widget:
     select_instrument: Select instrument
     select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
     table: Recent market trades
-  prediction_chart:
+  prediction_market:
     more_lines: "+%{count} more"
+    range:
+      all: ALL
+      day_1: 1D
+      hour_1: 1H
+      hour_6: 6H
+      month_1: 1M
+      week_1: 1W
+    range_aria: Show the %{range} range
     select_event: Select prediction event
     select_market: Select market
     select_market_group: Select market category
+    source: 'Source: %{venue}'
   names:
     candlestick: Candlestick
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
@@ -885,7 +894,7 @@ widget:
     open_interest: Open Interest
     order_book: Order Book
     pentagon_pizza_index: Pentagon Pizza Index
-    prediction_chart: Prediction Chart
+    prediction_market: Prediction Market
     solana_wallet: Solana Wallet Monitor
     taker_volume: Taker Buy/Sell Volume
     top_trader_account_ratio: Top Trader Account Ratio

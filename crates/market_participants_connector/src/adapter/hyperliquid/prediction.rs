@@ -18,7 +18,7 @@ use market_participants_model::{
         PredictionCategory, PredictionEventCard, PredictionEventRef, PredictionEventView,
         PredictionEventsPage, PredictionLeg, PredictionMarket, PredictionMarketGroup,
         PredictionMarketRef, PredictionNativeLeg, PredictionOptionCard, PredictionPricePoint,
-        PredictionSeries, PredictionWindow,
+        PredictionSeries,
     },
 };
 use smol_str::{SmolStr, format_smolstr};
@@ -50,6 +50,14 @@ const PAGE_LIMIT: usize = 500;
 
 /// The most options one card draws.
 const CARD_OPTIONS: usize = 6;
+
+/// The most candles the venue answers one snapshot with.
+///
+/// The venue applies this cap itself; it is not encoded in the API document this
+/// adapter reads, so the number is a documented approximation of the venue's
+/// behaviour rather than a verified contract. It only bounds how far back the
+/// whole-life range asks from.
+const HYPERLIQUID_CANDLE_LIMIT: i64 = 5_000;
 
 /// Reads one page of HIP-4 events from the loaded metadata.
 pub(crate) async fn events(
@@ -145,66 +153,60 @@ pub(crate) async fn series(
     context: &ExecutionContext,
     query: &PredictionSeriesQuery,
 ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
-    match query.window {
-        PredictionWindow::Latest => latest(context, &query.legs).await,
-        PredictionWindow::History {
-            days,
-            fidelity_minutes,
-        } => history(context, &query.legs, days, fidelity_minutes).await,
-    }
+    let range = query.range;
+    history(
+        context,
+        &query.legs,
+        range.span_millis(),
+        range.fidelity_minutes(),
+    )
+    .await
+}
+
+/// One of the venue's candle intervals: the name the venue knows it by and its
+/// width.
+struct CandleInterval {
+    name: SmolStr,
+    millis: i64,
 }
 
 /// Maps a requested bucket width to one of the venue's candle intervals.
-fn candle_interval(fidelity_minutes: u16) -> SmolStr {
-    match fidelity_minutes {
-        0..=1 => SmolStr::new_static("1m"),
-        2..=3 => SmolStr::new_static("3m"),
-        4..=5 => SmolStr::new_static("5m"),
-        6..=15 => SmolStr::new_static("15m"),
-        16..=30 => SmolStr::new_static("30m"),
-        31..=60 => SmolStr::new_static("1h"),
-        61..=120 => SmolStr::new_static("2h"),
-        121..=240 => SmolStr::new_static("4h"),
-        241..=480 => SmolStr::new_static("8h"),
-        481..=720 => SmolStr::new_static("12h"),
-        721..=1_440 => SmolStr::new_static("1d"),
-        1_441..=4_320 => SmolStr::new_static("3d"),
-        _ => SmolStr::new_static("1w"),
+fn candle_interval(fidelity_minutes: u16) -> CandleInterval {
+    let (name, millis) = match fidelity_minutes {
+        0..=1 => ("1m", 60_000),
+        2..=3 => ("3m", 180_000),
+        4..=5 => ("5m", 300_000),
+        6..=15 => ("15m", 900_000),
+        16..=30 => ("30m", 1_800_000),
+        31..=60 => ("1h", 3_600_000),
+        61..=120 => ("2h", 7_200_000),
+        121..=240 => ("4h", 14_400_000),
+        241..=480 => ("8h", 28_800_000),
+        481..=720 => ("12h", 43_200_000),
+        721..=1_440 => ("1d", 86_400_000),
+        1_441..=4_320 => ("3d", 259_200_000),
+        _ => ("1w", 604_800_000),
+    };
+    CandleInterval {
+        name: SmolStr::new_static(name),
+        millis,
     }
-}
-
-async fn latest(
-    context: &ExecutionContext,
-    legs: &[PredictionLeg],
-) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
-    let mids = all_mids(context).await?;
-    let timestamp = now_millis()?;
-    Ok(legs
-        .iter()
-        .map(|leg| PredictionSeries {
-            leg: leg.leg.clone(),
-            points: encoding(leg)
-                .and_then(|encoding| probability_of(&mids, encoding))
-                .map(|probability| {
-                    vec![PredictionPricePoint {
-                        timestamp,
-                        probability,
-                    }]
-                })
-                .unwrap_or_default(),
-        })
-        .collect())
 }
 
 async fn history(
     context: &ExecutionContext,
     legs: &[PredictionLeg],
-    days: u16,
+    span: Option<i64>,
     fidelity_minutes: u16,
 ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
     let end = now_millis()?;
-    let start = end.saturating_sub(i64::from(days.max(1)) * 86_400_000);
     let interval = candle_interval(fidelity_minutes);
+    // The venue caps an answer at [`HYPERLIQUID_CANDLE_LIMIT`] candles, so a
+    // range with no lower bound asks for exactly that many and no further.
+    let start = match span {
+        Some(span) => end.saturating_sub(span.max(1)),
+        None => end.saturating_sub(HYPERLIQUID_CANDLE_LIMIT.saturating_mul(interval.millis)),
+    };
     let mut series = Vec::with_capacity(legs.len());
     for leg in legs {
         let Some(encoding) = encoding(leg) else {
@@ -217,7 +219,7 @@ async fn history(
         let request = HyperliquidInfoRequest::CandleSnapshot {
             req: HyperliquidCandleSnapshotRequest {
                 coin: outcome_coin(encoding),
-                interval: interval.clone(),
+                interval: interval.name.clone(),
                 start_time: start,
                 end_time: end,
             },
@@ -1163,9 +1165,22 @@ mod tests {
 
     #[test]
     fn a_history_fidelity_selects_a_matching_candle_interval() {
-        assert_eq!(super::candle_interval(60), "1h");
-        assert_eq!(super::candle_interval(5), "5m");
-        assert_eq!(super::candle_interval(1_440), "1d");
+        let hour = super::candle_interval(60);
+        assert_eq!(hour.name, "1h");
+        assert_eq!(hour.millis, 3_600_000);
+        assert_eq!(super::candle_interval(5).name, "5m");
+        assert_eq!(super::candle_interval(1_440).name, "1d");
+        assert_eq!(super::candle_interval(720).name, "12h");
+    }
+
+    #[test]
+    fn the_whole_life_range_reaches_back_one_venue_candle_cap() {
+        // The whole-life range has no lower bound of its own, so its reach is
+        // the venue's candle cap at the interval the fidelity selects.
+        assert_eq!(
+            super::HYPERLIQUID_CANDLE_LIMIT * super::candle_interval(720).millis,
+            5_000 * 12 * 3_600_000
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
         WidgetRegistration::for_view::<news::view::NewsWidget>(),
         WidgetRegistration::for_view::<order_book::view::OrderBookWidget>(),
         WidgetRegistration::for_view::<pentagon_pizza_index::view::PentagonPizzaIndexWidget>(),
-        WidgetRegistration::for_view::<prediction_chart::view::PredictionChartWidget>(),
+        WidgetRegistration::for_view::<prediction_market::view::PredictionMarketWidget>(),
         WidgetRegistration::for_view::<
             perpetual_statistics::widget::open_interest::OpenInterestWidget,
         >(),
@@ -91,7 +91,7 @@ mod tests {
     const NEWS_ID: &str = "kytrix.news";
     const ORDER_BOOK_ID: &str = "kytrix.order_book";
     const PENTAGON_PIZZA_INDEX_ID: &str = "kytrix.pentagon_pizza_index";
-    const PREDICTION_CHART_ID: &str = "kytrix.prediction_chart";
+    const PREDICTION_MARKET_ID: &str = "kytrix.prediction_market";
     const X_ID: &str = "kytrix.x";
     const VOLUME_HEAT_MAP_ID: &str = "kytrix.volume_heatmap";
     const ETHEREUM_WALLET_ID: &str = "kytrix.ethereum_wallet";
@@ -126,7 +126,7 @@ mod tests {
         (NEWS_ID, WidgetCategory::Monitoring),
         (ORDER_BOOK_ID, WidgetCategory::Market),
         (PENTAGON_PIZZA_INDEX_ID, WidgetCategory::Monitoring),
-        (PREDICTION_CHART_ID, WidgetCategory::Market),
+        (PREDICTION_MARKET_ID, WidgetCategory::Market),
         (STATISTICS_IDS[0], WidgetCategory::Statistics),
         (STATISTICS_IDS[1], WidgetCategory::Statistics),
         (STATISTICS_IDS[2], WidgetCategory::Statistics),
@@ -163,7 +163,7 @@ mod tests {
             assert!(registry.get(NEWS_ID).is_some());
             assert!(registry.get(ORDER_BOOK_ID).is_some());
             assert!(registry.get(PENTAGON_PIZZA_INDEX_ID).is_some());
-            assert!(registry.get(PREDICTION_CHART_ID).is_some());
+            assert!(registry.get(PREDICTION_MARKET_ID).is_some());
             assert!(registry.get(X_ID).is_some());
             assert!(registry.get(VOLUME_HEAT_MAP_ID).is_some());
             assert!(registry.get(ETHEREUM_WALLET_ID).is_some());

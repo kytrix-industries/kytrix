@@ -249,55 +249,70 @@ pub struct PredictionSeries {
     pub points: Vec<PredictionPricePoint>,
 }
 
-/// The window a prediction series is read over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "window")]
-pub enum PredictionWindow {
-    /// A bounded history of `days`, sampled at `fidelity_minutes`.
-    #[serde(rename = "history")]
-    History {
-        #[serde(rename = "days")]
-        days: u16,
-        #[serde(rename = "fidelity_minutes")]
-        fidelity_minutes: u16,
-    },
-    /// The latest probability of every requested leg.
-    #[serde(rename = "latest")]
-    Latest,
+/// The range a prediction series is read over.
+///
+/// The product offers these six ranges. The range decides both how far back the
+/// series reaches and how coarsely the venue samples it; a venue that states its
+/// span as an explicit timestamp pair, a preset name, or a candle count is the
+/// adapter's problem, not the caller's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PredictionRange {
+    #[serde(rename = "hour_1")]
+    Hour1,
+    #[serde(rename = "hour_6")]
+    Hour6,
+    #[serde(rename = "day_1")]
+    Day1,
+    #[serde(rename = "week_1")]
+    Week1,
+    #[serde(rename = "month_1")]
+    Month1,
+    /// The whole life of the market.
+    #[default]
+    #[serde(rename = "all")]
+    All,
 }
 
-impl Default for PredictionWindow {
-    fn default() -> Self {
-        Self::History {
-            days: 30,
-            fidelity_minutes: 60,
+impl PredictionRange {
+    /// Every range, in the order the range selector offers them.
+    pub const ALL: [Self; 6] = [
+        Self::Hour1,
+        Self::Hour6,
+        Self::Day1,
+        Self::Week1,
+        Self::Month1,
+        Self::All,
+    ];
+
+    /// The span the range covers, in milliseconds; `None` for the whole life of
+    /// the market.
+    pub const fn span_millis(self) -> Option<i64> {
+        match self {
+            Self::Hour1 => Some(3_600_000),
+            Self::Hour6 => Some(21_600_000),
+            Self::Day1 => Some(86_400_000),
+            Self::Week1 => Some(604_800_000),
+            Self::Month1 => Some(2_592_000_000),
+            Self::All => None,
         }
     }
-}
 
-impl PredictionWindow {
-    /// The number of days this window covers, when it is a history.
-    pub const fn days(self) -> Option<u16> {
+    /// The sampling fidelity the chart asks for, in minutes.
+    pub const fn fidelity_minutes(self) -> u16 {
         match self {
-            Self::History { days, .. } => Some(days),
-            Self::Latest => None,
-        }
-    }
-
-    /// The sampling fidelity in minutes, when it is a history.
-    pub const fn fidelity_minutes(self) -> Option<u16> {
-        match self {
-            Self::History {
-                fidelity_minutes, ..
-            } => Some(fidelity_minutes),
-            Self::Latest => None,
+            Self::Hour1 => 1,
+            Self::Hour6 => 5,
+            Self::Day1 => 10,
+            Self::Week1 => 60,
+            Self::Month1 => 60,
+            Self::All => 720,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PredictionEventRef, PredictionWindow};
+    use super::{PredictionEventRef, PredictionRange};
     use crate::{
         identifier::{IdentifierValue, VenueId, VenueScopeId},
         listing::route::VenueRoute,
@@ -320,15 +335,61 @@ mod tests {
     }
 
     #[test]
-    fn the_default_window_is_thirty_days_at_hourly_fidelity() {
+    fn the_range_table_is_the_agreed_six_in_selector_order() {
         assert_eq!(
-            PredictionWindow::default(),
-            PredictionWindow::History {
-                days: 30,
-                fidelity_minutes: 60
-            }
+            PredictionRange::ALL,
+            [
+                PredictionRange::Hour1,
+                PredictionRange::Hour6,
+                PredictionRange::Day1,
+                PredictionRange::Week1,
+                PredictionRange::Month1,
+                PredictionRange::All,
+            ]
         );
-        assert_eq!(PredictionWindow::default().days(), Some(30));
-        assert_eq!(PredictionWindow::Latest.days(), None);
+    }
+
+    #[test]
+    fn every_range_covers_its_span() {
+        assert_eq!(PredictionRange::Hour1.span_millis(), Some(3_600_000));
+        assert_eq!(PredictionRange::Hour6.span_millis(), Some(21_600_000));
+        assert_eq!(PredictionRange::Day1.span_millis(), Some(86_400_000));
+        assert_eq!(PredictionRange::Week1.span_millis(), Some(604_800_000));
+        assert_eq!(PredictionRange::Month1.span_millis(), Some(2_592_000_000));
+        assert_eq!(PredictionRange::All.span_millis(), None);
+    }
+
+    #[test]
+    fn every_range_asks_for_its_sampling_fidelity() {
+        assert_eq!(PredictionRange::Hour1.fidelity_minutes(), 1);
+        assert_eq!(PredictionRange::Hour6.fidelity_minutes(), 5);
+        assert_eq!(PredictionRange::Day1.fidelity_minutes(), 10);
+        assert_eq!(PredictionRange::Week1.fidelity_minutes(), 60);
+        assert_eq!(PredictionRange::Month1.fidelity_minutes(), 60);
+        assert_eq!(PredictionRange::All.fidelity_minutes(), 720);
+    }
+
+    #[test]
+    fn the_default_range_is_the_whole_life_of_the_market() {
+        assert_eq!(PredictionRange::default(), PredictionRange::All);
+    }
+
+    #[test]
+    fn every_range_round_trips_through_serde() {
+        let names = [
+            (PredictionRange::Hour1, "hour_1"),
+            (PredictionRange::Hour6, "hour_6"),
+            (PredictionRange::Day1, "day_1"),
+            (PredictionRange::Week1, "week_1"),
+            (PredictionRange::Month1, "month_1"),
+            (PredictionRange::All, "all"),
+        ];
+        for (range, name) in names {
+            let encoded = serde_json::to_string(&range).expect("the range serializes");
+            assert_eq!(encoded, format!("\"{name}\""));
+            let decoded: PredictionRange =
+                serde_json::from_str(&encoded).expect("the range decodes");
+            assert_eq!(decoded, range);
+        }
     }
 }

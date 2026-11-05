@@ -257,15 +257,6 @@ pub struct ClobBatchHistoryRequest<'a> {
     pub end_ts: Option<i64>,
 }
 
-/// One token of a CLOB midpoint request.
-#[derive(Clone, Debug, Serialize)]
-pub struct ClobMidpointRequest<'a> {
-    pub token_id: &'a str,
-}
-
-/// One CLOB midpoint answer: asset id to probability.
-pub type ClobMidpoints = BTreeMap<SmolStr, SmolStr>;
-
 /// One market-channel subscription request.
 #[derive(Clone, Debug, Serialize)]
 pub struct PolymarketMarketSubscribe<'a> {

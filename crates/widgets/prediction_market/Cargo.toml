@@ -1,5 +1,5 @@
 [package]
-name = "prediction_chart"
+name = "prediction_market"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true
@@ -25,6 +25,10 @@ widget = { workspace = true }
 widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
+# A pane only reads a venue that is in the loaded-venues view, so a view test has to
+# commit one; the fixture seam is how it does that without a venue answering. Never
+# enabled for a release build.
+market_participants_connector = { workspace = true, features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 

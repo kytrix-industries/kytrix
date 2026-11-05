@@ -13,7 +13,7 @@ use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
     prediction::{
         PredictionEventCard, PredictionEventRef, PredictionEventView, PredictionEventsPage,
-        PredictionLeg, PredictionSeries, PredictionWindow,
+        PredictionLeg, PredictionRange, PredictionSeries,
     },
     routing::CapabilityId,
 };
@@ -318,7 +318,7 @@ pub struct PredictionSeriesBuilder {
     provider: MarketCapability,
     event: PredictionEventRef,
     legs: Vec<PredictionLeg>,
-    window: PredictionWindow,
+    range: PredictionRange,
 }
 
 impl PredictionSeriesBuilder {
@@ -326,13 +326,13 @@ impl PredictionSeriesBuilder {
         provider: MarketCapability,
         event: PredictionEventRef,
         legs: Vec<PredictionLeg>,
-        window: PredictionWindow,
+        range: PredictionRange,
     ) -> Self {
         Self {
             provider,
             event,
             legs,
-            window,
+            range,
         }
     }
 
@@ -345,7 +345,7 @@ impl PredictionSeriesBuilder {
             ProtocolRequest::FetchPredictionSeries(PredictionSeriesQuery {
                 event: self.event,
                 legs: self.legs,
-                window: self.window,
+                range: self.range,
             }),
         )
         .await?
