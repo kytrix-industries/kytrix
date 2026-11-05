@@ -673,14 +673,18 @@ impl PredictionMarketWidget {
         self.status.report(WidgetState::Ready, cx);
         // The pulse marks a *new observation*, not a first reading: a chart opening on
         // a market has nothing to breathe about, and a reading whose newest point did
-        // not move is the same moment drawn again.
+        // not move is the same moment drawn again. A tick that lands while a breath is
+        // still running does not restart it: a venue pushing several ticks a second
+        // would otherwise pin the effect to its first phase, which reads as a static
+        // halo rather than a pulse.
+        let now = Instant::now();
+        let breathing = self.pulse.is_some_and(|pulse| pulse.phase(now).is_some());
         if !cx.reduce_motion()
+            && !breathing
             && newest_before
                 .is_some_and(|previous| newest.is_some_and(|current| current > previous))
         {
-            self.pulse = Some(Pulse {
-                started: Instant::now(),
-            });
+            self.pulse = Some(Pulse { started: now });
         }
         true
     }
@@ -1487,6 +1491,71 @@ mod tests {
             assert!(
                 pane.read(cx).pulse.is_some(),
                 "a newer sample breathes once"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_tick_during_a_running_pulse_should_not_restart_it(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| pane.selection = Some(event_ref()));
+            let key = stream_key();
+            assert!(report_snapshot(
+                &pane,
+                key.clone(),
+                reading(1, PredictionRange::All, &[1_000]),
+                cx
+            ));
+            assert!(report_snapshot(
+                &pane,
+                key.clone(),
+                reading(2, PredictionRange::All, &[1_000, 2_000]),
+                cx
+            ));
+            let started = pane
+                .read(cx)
+                .pulse
+                .expect("the first tick breathes")
+                .started;
+
+            assert!(report_snapshot(
+                &pane,
+                key.clone(),
+                reading(3, PredictionRange::All, &[1_000, 2_000, 3_000]),
+                cx
+            ));
+            assert_eq!(
+                pane.read(cx)
+                    .pulse
+                    .expect("the pulse is still running")
+                    .started,
+                started,
+                "a tick that lands mid-breath keeps the running pulse instead of \
+                 restarting it at phase zero"
+            );
+
+            // A reading that lands after the breath has ended starts a new one.
+            pane.update(cx, |pane, _| {
+                pane.pulse = Some(Pulse {
+                    started: Instant::now() - Duration::from_millis(1_500),
+                });
+            });
+            assert!(report_snapshot(
+                &pane,
+                key,
+                reading(4, PredictionRange::All, &[1_000, 2_000, 3_000, 4_000]),
+                cx
+            ));
+            let restarted = pane
+                .read(cx)
+                .pulse
+                .expect("the next tick breathes again")
+                .started;
+            assert!(
+                restarted > started,
+                "an ended pulse is replaced by the next observation"
             );
         });
     }
