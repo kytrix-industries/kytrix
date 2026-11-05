@@ -535,6 +535,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
                 div()
                     .text_sm()
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(theme.roles.fg.default.hsla)
                     .line_height(gpui_kit::px(18.0))
                     .max_h(px(36.0))
                     .overflow_hidden()
@@ -780,6 +781,7 @@ fn option_row(option: &PredictionOptionCard, cx: &App) -> AnyElement {
                 .min_w_0()
                 .truncate()
                 .text_xs()
+                .text_color(cx.theme().roles.fg.default.hsla)
                 .child(SharedString::new(option.label.clone())),
         )
         .child(
