@@ -86,9 +86,11 @@ const HOVER_DOT_OUTER_ALPHA: f32 = 0.1;
 /// It is the same fill as the dot where the crosshair meets a line, so the newest
 /// reading carries the same weight as a hovered one.
 const ENDPOINT_RADIUS: f32 = HOVER_DOT_INNER / 2.0;
-const PULSE_MIN_RADIUS: f32 = 4.0;
-const PULSE_MAX_RADIUS: f32 = 9.0;
-const PULSE_ALPHA: f32 = 0.35;
+/// The pulse starts outside the endpoint dot, so it is visible from the first frame
+/// instead of spending the first part of each cycle hidden under a dot its own size.
+const PULSE_MIN_RADIUS: f32 = ENDPOINT_RADIUS + 2.0;
+const PULSE_MAX_RADIUS: f32 = 10.0;
+const PULSE_ALPHA: f32 = 0.4;
 const PULSE_PHASE_CYCLES: f32 = 2.0;
 const PULSE_DOT_SCALE: f32 = 0.08;
 

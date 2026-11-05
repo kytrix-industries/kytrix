@@ -673,6 +673,29 @@ fn hovering_fades_every_line_to_the_right_of_the_sample(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
+fn a_pulse_starts_outside_the_endpoint_dot(cx: &mut TestAppContext) {
+    let (harness, cx) = chart_window(cx, snapshot());
+    draw(&harness, cx);
+
+    set_pulse(&harness, cx, Some(0.0));
+    let frame = draw(&harness, cx);
+    let ring = frame
+        .quads
+        .iter()
+        .find(|quad| {
+            quad.alpha().is_some_and(|alpha| (alpha - 0.4).abs() < 0.01)
+                && (quad.width() - 12.0).abs() < 0.01
+        })
+        .expect("the pulse starts as a ring wider than the endpoint dot");
+
+    assert_eq!(
+        ring.width(),
+        12.0,
+        "a six-pixel radius around a four-pixel dot"
+    );
+}
+
+#[gpui_kit::test]
 fn a_pulse_phase_draws_the_expanding_ring(cx: &mut TestAppContext) {
     let (harness, cx) = chart_window(cx, snapshot());
     draw(&harness, cx);
@@ -684,8 +707,8 @@ fn a_pulse_phase_draws_the_expanding_ring(cx: &mut TestAppContext) {
         .iter()
         .filter(|quad| {
             quad.alpha()
-                .is_some_and(|alpha| alpha > 0.0 && alpha < 0.35)
-                && (8.0..13.0).contains(&quad.width())
+                .is_some_and(|alpha| alpha > 0.0 && alpha <= 0.4)
+                && (13.0..15.0).contains(&quad.width())
         })
         .count();
     assert_eq!(early_ring, 2, "one ring around each line's endpoint");
