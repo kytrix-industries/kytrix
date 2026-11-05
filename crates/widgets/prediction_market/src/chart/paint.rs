@@ -28,8 +28,8 @@ use super::{
         label_side, label_tops, label_x, value_at,
     },
     text::{
-        AXIS_FONT_SIZE, ChartFont, ChartTextCache, LABEL_FONT_SIZE, SOURCE_FONT_SIZE,
-        STRONG_WEIGHT, TIME_LABEL_FONT_SIZE, format_hover_time, format_percent_one_decimal,
+        AXIS_FONT_SIZE, ChartFont, ChartTextCache, LABEL_FONT_SIZE, STRONG_WEIGHT,
+        TIME_LABEL_FONT_SIZE, format_hover_time, format_percent_one_decimal,
     },
 };
 
@@ -106,11 +106,6 @@ const DOT_MASK_RIGHT: f32 = PULSE_MAX_RADIUS;
 const DOT_MASK_VERTICAL: f32 = HOVER_DOT_OUTER / 2.0;
 const ENDPOINT_MASK_VERTICAL: f32 = PULSE_MAX_RADIUS;
 
-/// The source caption is drawn small, inside the plot's bottom-left corner.
-const SOURCE_LINE_HEIGHT: f32 = 14.0;
-const SOURCE_INSET: f32 = 4.0;
-const SOURCE_BOTTOM_INSET: f32 = 2.0;
-
 /// The time label fills the strip above the plot.
 const TIME_LABEL_TOP_INSET: f32 = 1.0;
 const TIME_LABEL_LINE_HEIGHT: f32 = 16.0;
@@ -175,9 +170,9 @@ impl PaintContext<'_> {
 
 /// Draws one prepared chart.
 ///
-/// The layers go down in the design's order: grid, axis labels, series, the source
-/// caption, then everything the pointer adds, and the endpoint pulse last. The source
-/// is therefore under the crosshair and the labels, and the pulse is above both.
+/// The layers go down in the design's order: grid, axis labels, series, then
+/// everything the pointer adds, and the endpoint pulse last. The pulse is above the
+/// crosshair and the labels.
 pub(crate) fn paint(
     prepared: &PreparedChart,
     options: &ChartCanvasOptions,
@@ -204,7 +199,6 @@ pub(crate) fn paint(
     paint_grid(prepared, context);
     paint_axis_labels(prepared, context);
     paint_series(prepared, hovered.as_ref(), context);
-    paint_source(prepared, &options.source, context);
     if let Some(hovered) = hovered.as_ref() {
         paint_hover(prepared, hovered, context);
     }
@@ -476,34 +470,6 @@ fn dot_scale(phase: f32) -> f32 {
     }
     let triangle = 1.0 - (2.0 * phase.fract() - 1.0).abs();
     1.0 + PULSE_DOT_SCALE * triangle
-}
-
-/// Draws the source caption inside the plot's bottom-left corner.
-fn paint_source(prepared: &PreparedChart, source: &str, context: &mut PaintContext<'_>) {
-    if source.is_empty() {
-        return;
-    }
-    let layout = prepared.layout;
-    let color = context.app.theme().roles.fg.subtle.hsla;
-    let font = ChartFont::new(SOURCE_FONT_SIZE, gpui_kit::FontWeight::NORMAL, color);
-    let origin = point(
-        layout.plot.origin.x + px(SOURCE_INSET),
-        layout.plot.bottom() - px(SOURCE_LINE_HEIGHT + SOURCE_BOTTOM_INSET),
-    );
-    let width = (layout.plot.size.width - px(SOURCE_INSET * 2.0)).max(Pixels::ZERO);
-    context.with_mask(layout.bounds, |text_cache, window, app| {
-        paint_text(
-            text_cache,
-            window,
-            app,
-            source,
-            origin,
-            font,
-            TextAlign::Left,
-            width,
-            px(SOURCE_LINE_HEIGHT),
-        );
-    });
 }
 
 /// Draws everything the pointer adds: crosshair, dots, label column and time label.

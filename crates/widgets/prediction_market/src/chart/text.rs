@@ -31,8 +31,6 @@ pub(crate) const AXIS_FONT_SIZE: f32 = 12.0;
 pub(crate) const LABEL_FONT_SIZE: f32 = 12.0;
 /// The hovered time in the strip above the plot.
 pub(crate) const TIME_LABEL_FONT_SIZE: f32 = 12.0;
-/// The source caption inside the plot.
-pub(crate) const SOURCE_FONT_SIZE: f32 = 10.0;
 
 /// The weight the hover's own labels are set in; the axes stay regular.
 pub(crate) const STRONG_WEIGHT: FontWeight = FontWeight::SEMIBOLD;

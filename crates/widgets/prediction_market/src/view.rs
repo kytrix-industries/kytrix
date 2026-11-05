@@ -4,8 +4,9 @@
 //! history and then follows the venue's live probability stream; the event
 //! selector is the header control, and a venue reload drops the chart it can no
 //! longer vouch for. The range the history is read over is the pane's one persisted
-//! option: the toolbar under the chart states the six ranges the venue publishes, and
-//! a switch keeps the chart on screen until the new reading lands.
+//! option: the header's timeframe picker states the six ranges the venue publishes,
+//! and a switch drops the chart while the new reading lands under the framework's
+//! connecting spinner.
 
 use std::{
     rc::Rc,
@@ -16,7 +17,6 @@ use std::{
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::manager::ConfigManager;
 use base_ui::{
-    button::Button,
     empty_state::EmptyState,
     interactive::InteractiveVariantExt,
     menu::{MenuItem, MenuItemAction},
@@ -25,9 +25,9 @@ use base_ui::{
     style::theme::ThemeExt,
 };
 use gpui_kit::{
-    AnyElement, App, Context, CursorStyle, ElementId, Entity, FontWeight, InteractiveElement,
-    IntoElement, MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, CursorStyle, ElementId, Entity, InteractiveElement, IntoElement,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use i18n::t;
 use instrument_selector_ui::{
@@ -52,7 +52,6 @@ use widget::{
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
     time_zone::notify_on_data_time_zone_change,
-    venue::VenueDisplay,
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -310,7 +309,9 @@ impl WidgetView for PredictionMarketWidget {
             }
             left = left.child(self.market_select(snapshot, selected, cx));
         }
-        WidgetHeader::empty().left(left)
+        WidgetHeader::empty()
+            .left(left)
+            .right(self.range_select(cx))
     }
 }
 
@@ -447,6 +448,37 @@ impl PredictionMarketWidget {
         })
     }
 
+    /// The six ranges, as the header's timeframe picker.
+    fn range_select(&self, cx: &Context<Self>) -> AnyElement {
+        let mut select = Select::new(ElementId::Name(SharedString::new_static(
+            "PredictionMarketRange",
+        )))
+        .placeholder(range_label(self.config.range, cx))
+        .ghost()
+        .small()
+        .aria_label(t!(cx, "widget.prediction_market.timeframe"))
+        .selected_item(Some(SharedString::new_static(range_id(self.config.range))));
+        for range in PredictionRange::ALL {
+            select = select.menu_item(MenuItem::Action(MenuItemAction::new(
+                SharedString::new_static(range_id(range)),
+                range_label(range, cx),
+            )));
+        }
+        div()
+            .debug_selector(|| "TEST_PREDICTION_MARKET_RANGE".into())
+            .occlude()
+            .child(select.on_change({
+                let widget = cx.entity();
+                move |id, _, app| {
+                    let Some(range) = id.as_deref().and_then(range_of_id) else {
+                        return;
+                    };
+                    widget.update(app, |this, cx| this.select_range(range, cx));
+                }
+            }))
+            .into_any_element()
+    }
+
     fn select(&mut self, event: PredictionEventRef, title: SmolStr, cx: &mut Context<Self>) {
         self.selection = Some(event);
         self.selection_title = Some(title);
@@ -472,18 +504,17 @@ impl PredictionMarketWidget {
 
     /// Switches the range the chart is read over.
     ///
-    /// The reading already on screen stays until the new one lands: the two are the
-    /// same market, and blanking the body to show a spinner for a range the venue
-    /// answers in one request would make a tab click look like a reload.
+    /// The reading on screen answers the window the user just left, so it is dropped
+    /// before the request: the pane has no content while the new reading is fetched,
+    /// and the framework draws its connecting spinner in the body.
     fn select_range(&mut self, range: PredictionRange, cx: &mut Context<Self>) {
         if self.config.range == range {
             return;
         }
         self.config.range = range;
         self.config_change.publish(cx);
-        self.pointer_frame.clear_pending();
-        self.pointer = None;
-        self.pulse = None;
+        self.snapshot = None;
+        self.forget_chart_state();
         self.load(cx);
         cx.notify();
     }
@@ -790,7 +821,6 @@ impl PredictionMarketWidget {
         snapshot: &Arc<PredictionMarketSnapshot>,
         has_points: bool,
         pulse_phase: Option<f32>,
-        source: SharedString,
         cx: &Context<Self>,
     ) -> AnyElement {
         let move_widget = cx.entity().downgrade();
@@ -821,7 +851,6 @@ impl PredictionMarketWidget {
                 ChartCanvasOptions {
                     pointer: self.pointer,
                     pulse_phase,
-                    source,
                 },
                 self.chart_caches.clone(),
             )))
@@ -840,52 +869,6 @@ impl PredictionMarketWidget {
                 )
             })
             .into_any_element()
-    }
-
-    /// The six ranges, under the chart as the live site draws them.
-    ///
-    /// A reading with no points still shows this row: a quiet 1H window is exactly the
-    /// case a reader has to be able to switch out of.
-    fn range_toolbar(&self, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let mut row = div()
-            .debug_selector(|| "TEST_PREDICTION_MARKET_RANGES".into())
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1();
-        for range in PredictionRange::ALL {
-            let selected = self.config.range == range;
-            let label = range_label(range, cx);
-            let aria = t!(cx, "widget.prediction_market.range_aria", range = label);
-            let mut button = Button::new(ElementId::Name(SharedString::new_static(
-                range_control_id(range),
-            )))
-            .ghost()
-            .small()
-            .text_size(px(14.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(if selected {
-                theme.roles.fg.default.hsla
-            } else {
-                theme.roles.fg.muted.hsla
-            })
-            .aria_label(aria)
-            .child(label);
-            if !selected {
-                button = button.on_click({
-                    let widget = cx.entity().downgrade();
-                    move |_, _, app| {
-                        let _ = widget.update(app, |this, cx| this.select_range(range, cx));
-                    }
-                });
-            }
-            row = row.child(button);
-        }
-        row.into_any_element()
     }
 }
 
@@ -909,19 +892,13 @@ impl Render for PredictionMarketWidget {
             return div().size_full().min_h_0().into_any_element();
         };
         let has_points = snapshot.series.iter().any(|line| !line.points.is_empty());
-        let source = t!(
-            cx,
-            "widget.prediction_market.source",
-            venue = snapshot.market.event.route.venue.display_string(cx)
-        );
         let mut body = div().size_full().min_h_0().flex().flex_col();
         // A reading with no points still carries one series per side: the legend is
         // what names them, so it stays exactly as long as the snapshot does.
         if !snapshot.series.is_empty() {
             body = body.child(self.legend(&snapshot, cx));
         }
-        body.child(self.chart_area(&snapshot, has_points, pulse_phase, source, cx))
-            .child(self.range_toolbar(cx))
+        body.child(self.chart_area(&snapshot, has_points, pulse_phase, cx))
             .into_any_element()
     }
 }
@@ -938,16 +915,23 @@ fn range_label(range: PredictionRange, cx: &App) -> SharedString {
     }
 }
 
-/// The stable element id of one range's button.
-fn range_control_id(range: PredictionRange) -> &'static str {
+/// The stable picker id of one range, independent of its translated label.
+fn range_id(range: PredictionRange) -> &'static str {
     match range {
-        PredictionRange::Hour1 => "PredictionMarketRangeHour1",
-        PredictionRange::Hour6 => "PredictionMarketRangeHour6",
-        PredictionRange::Day1 => "PredictionMarketRangeDay1",
-        PredictionRange::Week1 => "PredictionMarketRangeWeek1",
-        PredictionRange::Month1 => "PredictionMarketRangeMonth1",
-        PredictionRange::All => "PredictionMarketRangeAll",
+        PredictionRange::Hour1 => "hour_1",
+        PredictionRange::Hour6 => "hour_6",
+        PredictionRange::Day1 => "day_1",
+        PredictionRange::Week1 => "week_1",
+        PredictionRange::Month1 => "month_1",
+        PredictionRange::All => "all",
     }
+}
+
+/// The range a picker id names.
+fn range_of_id(id: &str) -> Option<PredictionRange> {
+    PredictionRange::ALL
+        .into_iter()
+        .find(|range| range_id(*range) == id)
 }
 
 #[cfg(test)]
@@ -1063,6 +1047,27 @@ mod tests {
     impl Render for BodyHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(self.pane.clone())
+        }
+    }
+
+    /// One pane's header in a window of its own.
+    struct HeaderHarness {
+        pane: Entity<PredictionMarketWidget>,
+    }
+
+    impl Render for HeaderHarness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let header = self.pane.update(cx, |pane, cx| pane.header(window, cx));
+            div().size_full().child(
+                div()
+                    .debug_selector(|| "TEST_PREDICTION_MARKET_HEADER_ROW".into())
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(header.left)
+                    .children(header.right),
+            )
         }
     }
 
@@ -1293,6 +1298,32 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_timeframe_picker_should_sit_in_the_header_right_group(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+
+        let (_harness, cx) = cx.add_window_view(|_, _| HeaderHarness { pane: pane.clone() });
+        cx.simulate_resize(size(px(900.0), px(300.0)));
+        let header = cx.update(|window, cx| pane.update(cx, |pane, cx| pane.header(window, cx)));
+        assert!(header.left.is_some(), "the event picker stays on the left");
+        assert!(
+            header.right.is_some(),
+            "the timeframe picker belongs to the right group"
+        );
+
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_HEADER_ROW")
+                .is_some(),
+            "the header row is in the frame"
+        );
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_RANGE").is_some(),
+            "the header draws the timeframe picker"
+        );
+    }
+
+    #[gpui_kit::test]
     fn a_load_should_read_the_configured_range_and_draw_it(cx: &mut TestAppContext) {
         let (pane, source) = pane_with(cx, PredictionMarketConfig::default(), reports());
 
@@ -1314,7 +1345,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn switching_the_range_should_report_it_and_keep_the_old_chart(cx: &mut TestAppContext) {
+    fn switching_the_range_should_drop_the_chart_and_connect_until_the_reading_lands(
+        cx: &mut TestAppContext,
+    ) {
         let reports = reports();
         let (pane, source) = pane_with(cx, PredictionMarketConfig::default(), reports.clone());
         cx.update(|cx| select_event(&pane, cx));
@@ -1325,11 +1358,17 @@ mod tests {
             let caches = pane.read(cx).chart_caches.clone();
             pane.update(cx, |pane, cx| {
                 pane.pointer = Some(point(px(40.0), px(30.0)));
+                pane.pointer_frame.queue(point(px(41.0), px(31.0)));
                 pane.pulse = Some(Pulse {
                     started: Instant::now(),
                 });
                 pane.select_range(PredictionRange::Hour1, cx);
             });
+            assert_eq!(
+                pane.update(cx, |pane, _| pane.pointer_frame.take()),
+                None,
+                "the position queued for the dropped chart is gone too"
+            );
             let pane = pane.read(cx);
             assert_eq!(pane.config.range, PredictionRange::Hour1);
             assert_eq!(reports.get(), 1, "a persisted change is reported once");
@@ -1339,17 +1378,21 @@ mod tests {
                 "the old range's pulse does not carry over"
             );
             assert!(
-                Rc::ptr_eq(&caches, &pane.chart_caches),
-                "the chart on screen keeps the frame it is drawn from; the new snapshot evicts it by identity"
-            );
-            assert_eq!(
-                pane.snapshot.as_ref().map(|snapshot| snapshot.range),
-                Some(PredictionRange::All),
-                "the chart on screen stays until the new reading lands"
+                pane.snapshot.is_none(),
+                "the chart answered the window the user just left"
             );
             assert!(
-                pane.has_content(),
-                "so the body is not replaced by a placeholder"
+                !pane.has_content(),
+                "so the framework draws its connecting spinner instead of the old chart"
+            );
+            assert_eq!(
+                pane.status.state(cx),
+                WidgetState::Connecting,
+                "the switch is a new connection, not a silent refresh"
+            );
+            assert!(
+                !Rc::ptr_eq(&caches, &pane.chart_caches),
+                "the dropped chart's prepared frame is not kept alive"
             );
         });
 
@@ -1361,6 +1404,9 @@ mod tests {
         });
         assert!(source.ranges().contains(&PredictionRange::Hour1));
         assert_eq!(reports.get(), 1, "the switch is reported exactly once");
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
+        });
     }
 
     #[gpui_kit::test]
@@ -1776,10 +1822,6 @@ mod tests {
             cx.debug_bounds("TEST_PREDICTION_MARKET_LEGEND").is_some(),
             "the sides the empty reading is about are still named"
         );
-        assert!(
-            cx.debug_bounds("TEST_PREDICTION_MARKET_RANGES").is_some(),
-            "the ranges stay on screen, so a quiet window can be left"
-        );
         assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_CHART").is_some());
         let painted = take_log();
         assert!(
@@ -1807,7 +1849,6 @@ mod tests {
 
         assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_LEGEND").is_some());
         assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_CHART").is_some());
-        assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_RANGES").is_some());
         assert!(cx.debug_bounds("EMPTY_STATE").is_none());
     }
 }

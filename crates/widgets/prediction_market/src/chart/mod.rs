@@ -15,9 +15,9 @@
 //!   is handed, and the prepaint cache that keeps a pointer-only frame from
 //!   rebuilding anything.
 //!
-//! The pointer, the pulse phase and the source text are deliberately absent from the
-//! prepaint cache key: they change every frame, and everything they affect is drawn
-//! by [`paint`] from the prepared frame.
+//! The pointer and the pulse phase are deliberately absent from the prepaint cache
+//! key: they change every frame, and everything they affect is drawn by [`paint`]
+//! from the prepared frame.
 
 pub(crate) mod canvas;
 pub(crate) mod geometry;

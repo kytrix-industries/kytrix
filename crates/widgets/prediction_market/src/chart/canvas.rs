@@ -11,18 +11,18 @@
 //!
 //! The cache key is exactly what preparing *reads*: the snapshot by identity, the box
 //! the element was given, the display time zone and the window's text style. The
-//! pointer, the pulse phase and the source caption are deliberately absent, because
-//! they change every frame and everything they affect is drawn by [`super::paint`]
-//! from the prepared frame. A pointer that moved therefore reuses the same
-//! `Rc<PreparedChart>` — same allocation, no geometry rebuilt.
+//! pointer and the pulse phase are deliberately absent, because they change every
+//! frame and everything they affect is drawn by [`super::paint`] from the prepared
+//! frame. A pointer that moved therefore reuses the same `Rc<PreparedChart>` — same
+//! allocation, no geometry rebuilt.
 
 #[cfg(test)]
 use std::cell::Cell;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use gpui_kit::{
-    AnyElement, App, Bounds, IntoElement, Path, PathBuilder, Pixels, Point, SharedString, Styled,
-    TextStyle, Window, canvas, point, px,
+    AnyElement, App, Bounds, IntoElement, Path, PathBuilder, Pixels, Point, Styled, TextStyle,
+    Window, canvas, point, px,
 };
 use smol_str::SmolStr;
 use time::UtcOffset;
@@ -261,8 +261,6 @@ pub(crate) struct ChartCanvasOptions {
     pub pointer: Option<Point<Pixels>>,
     /// The endpoint pulse's phase, in `0..2` cycles, while one is running.
     pub pulse_phase: Option<f32>,
-    /// The caption inside the plot's bottom-left corner; may be empty.
-    pub source: SharedString,
 }
 
 /// The inputs one prepared chart was built from.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use base_ui::style::theme::ThemeExt;
 use gpui_kit::{
     Bounds, Context, Entity, Hsla, IntoElement, ParentElement, Pixels, Point, Render, ScaledPixels,
-    SharedString, Size, Styled, TestAppContext, VisualTestContext, Window, div, point, px, size,
+    Size, Styled, TestAppContext, VisualTestContext, Window, div, point, px, size,
 };
 use market_participants_model::{
     decimal::{Fraction, Ratio},
@@ -668,31 +668,6 @@ fn a_hover_near_the_right_edge_flips_the_time_label_left(cx: &mut TestAppContext
         f32::from(label.origin.x) >= 0.0,
         "and it stays inside the element"
     );
-}
-
-#[gpui_kit::test]
-fn the_source_caption_is_drawn_inside_the_plot_only_when_it_has_text(cx: &mut TestAppContext) {
-    let (harness, cx) = chart_window(cx, snapshot());
-    let frame = draw(&harness, cx);
-    assert!(
-        frame.text("Source: fixture").is_none(),
-        "an empty source draws nothing"
-    );
-
-    cx.update(|_, cx| {
-        harness.update(cx, |harness, _| {
-            harness.options.source = SharedString::new_static("Source: fixture");
-        });
-    });
-    let frame = draw(&harness, cx);
-    let plot = frame.plot();
-    let record = frame
-        .text("Source: fixture")
-        .expect("a source caption is drawn");
-    assert_eq!(f32::from(record.font_size), 10.0);
-    assert!(f32::from(record.origin.x) >= f32::from(plot.origin.x));
-    assert!(f32::from(record.origin.y) >= f32::from(plot.origin.y));
-    assert!(f32::from(record.origin.y) < f32::from(plot.bottom()));
 }
 
 #[gpui_kit::test]

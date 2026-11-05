@@ -872,11 +872,10 @@ widget:
       hour_6: 6H
       month_1: 1M
       week_1: 1W
-    range_aria: Show the %{range} range
     select_event: Select prediction event
     select_market: Select market
     select_market_group: Select market category
-    source: 'Source: %{venue}'
+    timeframe: Prediction market timeframe
   names:
     candlestick: Candlestick
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed

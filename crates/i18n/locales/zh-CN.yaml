@@ -872,11 +872,10 @@ widget:
       hour_6: 6H
       month_1: 1M
       week_1: 1W
-    range_aria: 显示 %{range} 区间
     select_event: 选择预测事件
     select_market: 选择市场
     select_market_group: 选择市场分类
-    source: 数据来源：%{venue}
+    timeframe: 预测市场时间范围
   names:
     candlestick: K 线
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
