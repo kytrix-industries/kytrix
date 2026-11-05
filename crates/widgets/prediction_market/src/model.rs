@@ -11,8 +11,9 @@ use market_participants_model::{
     decimal::{Fraction, UnixMillis},
     outcome::OutcomeLegRef,
     prediction::{
-        PredictionEventView, PredictionMarket, PredictionMarketGroup, PredictionMarketRef,
-        PredictionPricePoint, PredictionRange, PredictionSeries,
+        PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket,
+        PredictionMarketGroup, PredictionMarketRef, PredictionPricePoint, PredictionRange,
+        PredictionSeries,
     },
 };
 use smol_str::SmolStr;
@@ -75,11 +76,29 @@ pub(crate) struct PredictionMarketSnapshot {
     pub range: PredictionRange,
     pub title: SmolStr,
     pub market: PredictionMarketRef,
+    /// Every side of the drawn market, in the order the venue listed them.
+    ///
+    /// The order is the venue's, because it is what a subscription to the
+    /// market's topic is identified by: a book asked for with these legs shares
+    /// the connection lease the chart already holds.
+    pub legs: Arc<[PredictionLeg]>,
+    /// The side the venue calls the market's first outcome.
+    pub default_leg: Option<OutcomeLegRef>,
     /// The markets a reader can switch to, in the order the venue listed them.
     pub markets: Arc<[PredictionMarketChoice]>,
     pub series: Arc<[PredictionMarketSeries]>,
     /// How many sides the selected market has beyond the lines drawn.
     pub omitted: usize,
+}
+
+/// The book one chart reading points at: the market's sides and the one of them
+/// the panel draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PredictionOrderBookTarget {
+    pub event: PredictionEventRef,
+    /// Every leg of the drawn market, in venue order.
+    pub legs: Vec<PredictionLeg>,
+    pub leg: OutcomeLegRef,
 }
 
 impl PredictionMarketSnapshot {
@@ -93,6 +112,8 @@ impl PredictionMarketSnapshot {
         series: Vec<PredictionSeries>,
     ) -> Self {
         let selected = market.market.clone();
+        let legs: Arc<[PredictionLeg]> = market.legs.clone().into();
+        let default_leg = market.default_leg.clone();
         let labels: BTreeMap<OutcomeLegRef, SmolStr> = market
             .legs
             .iter()
@@ -140,10 +161,36 @@ impl PredictionMarketSnapshot {
             range,
             title: event.title,
             market: market.market,
+            legs,
+            default_leg,
             markets,
             series: lines.into(),
             omitted,
         }
+    }
+
+    /// The book the panel shows: the market's default leg, or the first
+    /// charted leg when the venue named no default.
+    ///
+    /// The leg has to be one of the market's own: a venue that named a side the
+    /// market no longer publishes leaves the panel to the first line the chart
+    /// actually drew. A market with no side at all has no book to ask for.
+    pub(crate) fn book_target(&self) -> Option<PredictionOrderBookTarget> {
+        if self.legs.is_empty() {
+            return None;
+        }
+        let published = |leg: &OutcomeLegRef| self.legs.iter().any(|side| &side.leg == leg);
+        let leg = self.default_leg.clone().filter(published).or_else(|| {
+            self.series
+                .iter()
+                .map(|line| line.leg.clone())
+                .find(published)
+        })?;
+        Some(PredictionOrderBookTarget {
+            event: self.market.event.clone(),
+            legs: self.legs.iter().cloned().collect(),
+            leg,
+        })
     }
 
     /// The newest point any line holds, for the endpoint pulse.
@@ -692,5 +739,127 @@ mod tests {
             Some("moneyline")
         );
         assert_eq!(snapshot.markets_in_group(groups[0]).count(), 2);
+    }
+
+    #[test]
+    fn the_book_target_is_the_markets_default_leg() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+        let series = vec![PredictionSeries {
+            leg: legs[1].clone(),
+            points: Vec::new(),
+        }];
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
+        let target = snapshot.book_target().expect("the market has a book");
+
+        assert_eq!(target.leg, legs[0], "the venue named the first side");
+        assert_eq!(target.event, event);
+        assert_eq!(
+            target
+                .legs
+                .iter()
+                .map(|leg| leg.leg.clone())
+                .collect::<Vec<_>>(),
+            legs,
+            "the request carries every side of the market, in venue order"
+        );
+    }
+
+    #[test]
+    fn a_market_without_a_default_falls_back_to_the_first_charted_leg() {
+        let event = event_ref();
+        let (mut market, legs) = charted_market(&event, "charted");
+        market.default_leg = None;
+        let view = event_with(vec![market.clone()]);
+        // The chart drew the second side first, so that is the side to read.
+        let series = vec![
+            PredictionSeries {
+                leg: legs[1].clone(),
+                points: Vec::new(),
+            },
+            PredictionSeries {
+                leg: legs[0].clone(),
+                points: Vec::new(),
+            },
+        ];
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
+
+        assert_eq!(
+            snapshot.book_target().map(|target| target.leg),
+            Some(legs[1].clone()),
+            "with no default, the first line the chart drew is the book"
+        );
+    }
+
+    #[test]
+    fn a_default_leg_the_market_no_longer_publishes_falls_back_to_a_drawn_one() {
+        let event = event_ref();
+        let (mut market, legs) = charted_market(&event, "charted");
+        let (other, other_legs) = charted_market(&event, "other");
+        // The venue named a side of a different market, which this one has no
+        // side for.
+        market.default_leg = Some(other_legs[0].clone());
+        let view = event_with(vec![market.clone(), other]);
+        let series = vec![PredictionSeries {
+            leg: legs[0].clone(),
+            points: Vec::new(),
+        }];
+
+        let snapshot = PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, series);
+
+        assert_eq!(
+            snapshot.book_target().map(|target| target.leg),
+            Some(legs[0].clone()),
+            "a side this market does not publish cannot be read"
+        );
+    }
+
+    #[test]
+    fn a_market_with_no_legs_has_no_book_target() {
+        let event = event_ref();
+        let markets = vec![market(&event, "empty", "markets", true)];
+        let view = event_with(markets.clone());
+
+        let snapshot = PredictionMarketSnapshot::new(
+            1,
+            PredictionRange::All,
+            view,
+            markets[0].clone(),
+            Vec::new(),
+        );
+
+        assert_eq!(snapshot.book_target(), None);
+    }
+
+    #[test]
+    fn the_snapshot_keeps_the_markets_legs_in_venue_order() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+
+        let snapshot =
+            PredictionMarketSnapshot::new(1, PredictionRange::All, view, market, Vec::new());
+
+        assert_eq!(
+            snapshot
+                .legs
+                .iter()
+                .map(|leg| leg.leg.clone())
+                .collect::<Vec<_>>(),
+            legs
+        );
+        assert_eq!(snapshot.default_leg, Some(legs[0].clone()));
+        assert_eq!(
+            snapshot
+                .legs
+                .iter()
+                .map(|leg| leg.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Yes", "No"],
+            "the labels the panel names the default side with are the venue's"
+        );
     }
 }

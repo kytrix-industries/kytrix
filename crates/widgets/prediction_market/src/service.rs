@@ -18,13 +18,18 @@ use std::{
 };
 
 use futures::StreamExt;
-use market_participants_connector::market::{
-    domain::DisconnectReason, error::MarketError, provider::MarketCapability,
-    streams::PredictionSeriesStream,
+use market_participants_connector::{
+    market::{
+        domain::DisconnectReason,
+        error::MarketError,
+        provider::MarketCapability,
+        streams::{PredictionOrderBookStream, PredictionSeriesStream},
+    },
+    market_participants::model::query::PredictionOrderBookQuery,
 };
 use market_participants_model::prediction::{
     PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket, PredictionMarketRef,
-    PredictionRange, PredictionSeries,
+    PredictionOrderBook, PredictionOrderBookUpdate, PredictionRange, PredictionSeries,
 };
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -158,8 +163,12 @@ pub enum PredictionMarketStreamMessage {
 pub enum PredictionMarketServiceError {}
 
 /// The seam between the chart and the connector, so a test can answer instead.
+///
+/// The book is read through the same seam: a pane follows one event's chart and
+/// one leg of one of its markets, and both are served by the same connector.
 pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
     type Subscription: PredictionSeriesEventSubscription;
+    type OrderBookSubscription: PredictionOrderBookEventSubscription;
 
     fn event(
         &self,
@@ -179,6 +188,16 @@ pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
         event: PredictionEventRef,
         legs: Vec<PredictionLeg>,
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
+
+    fn fetch_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> impl Future<Output = Result<PredictionOrderBook, MarketError>> + Send;
+
+    fn subscribe_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> impl Future<Output = Result<Self::OrderBookSubscription, MarketError>> + Send;
 }
 
 /// One live probability stream.
@@ -188,8 +207,16 @@ pub trait PredictionSeriesEventSubscription: Send + 'static {
     ) -> impl Future<Output = Option<Result<Vec<PredictionSeries>, MarketError>>> + Send;
 }
 
+/// One live order book stream.
+pub trait PredictionOrderBookEventSubscription: Send + 'static {
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>>> + Send;
+}
+
 impl PredictionMarketSource for MarketCapability {
     type Subscription = ClientPredictionSeriesSubscription;
+    type OrderBookSubscription = ClientPredictionOrderBookSubscription;
 
     async fn event(
         &self,
@@ -219,6 +246,24 @@ impl PredictionMarketSource for MarketCapability {
             Ok(ClientPredictionSeriesSubscription { inner })
         }
     }
+
+    async fn fetch_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> Result<PredictionOrderBook, MarketError> {
+        self.fetch_prediction_order_book(query).await
+    }
+
+    fn subscribe_order_book(
+        &self,
+        query: PredictionOrderBookQuery,
+    ) -> impl Future<Output = Result<Self::OrderBookSubscription, MarketError>> + Send {
+        let market = self.clone();
+        async move {
+            let inner = market.subscribe_prediction_order_book(query).await?;
+            Ok(ClientPredictionOrderBookSubscription { inner })
+        }
+    }
 }
 
 pub struct ClientPredictionSeriesSubscription {
@@ -227,6 +272,16 @@ pub struct ClientPredictionSeriesSubscription {
 
 impl PredictionSeriesEventSubscription for ClientPredictionSeriesSubscription {
     async fn recv(&mut self) -> Option<Result<Vec<PredictionSeries>, MarketError>> {
+        self.inner.next().await
+    }
+}
+
+pub struct ClientPredictionOrderBookSubscription {
+    inner: PredictionOrderBookStream,
+}
+
+impl PredictionOrderBookEventSubscription for ClientPredictionOrderBookSubscription {
+    async fn recv(&mut self) -> Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>> {
         self.inner.next().await
     }
 }
@@ -560,12 +615,16 @@ mod tests {
         time::Duration,
     };
 
-    use market_participants_connector::market::{domain::DisconnectReason, error::MarketError};
+    use market_participants_connector::{
+        market::{domain::DisconnectReason, error::MarketError},
+        market_participants::model::query::PredictionOrderBookQuery,
+    };
     use market_participants_model::{
         decimal::Fraction,
         prediction::{
             PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket,
-            PredictionPricePoint, PredictionRange, PredictionSeries,
+            PredictionOrderBook, PredictionOrderBookUpdate, PredictionPricePoint, PredictionRange,
+            PredictionSeries,
         },
     };
     use smol_str::SmolStr;
@@ -575,8 +634,8 @@ mod tests {
     use super::{
         MAX_BUFFERED_UPDATES, PredictionMarketFetchError, PredictionMarketProtocol,
         PredictionMarketRequest, PredictionMarketService, PredictionMarketSource,
-        PredictionMarketStatus, PredictionMarketStreamMessage, PredictionSeriesEventSubscription,
-        selected_market,
+        PredictionMarketStatus, PredictionMarketStreamMessage,
+        PredictionOrderBookEventSubscription, PredictionSeriesEventSubscription, selected_market,
     };
     use crate::{
         model::{PredictionMarketSeries, PredictionMarketSnapshot},
@@ -668,6 +727,7 @@ mod tests {
 
     impl PredictionMarketSource for FakeSource {
         type Subscription = FakeSubscription;
+        type OrderBookSubscription = PendingOrderBookSubscription;
 
         async fn event(
             &self,
@@ -710,6 +770,22 @@ mod tests {
                 .take()
                 .ok_or(MarketError::ServiceClosed)
         }
+
+        async fn fetch_order_book(
+            &self,
+            _query: PredictionOrderBookQuery,
+        ) -> Result<PredictionOrderBook, MarketError> {
+            // This fixture drives the chart service only; the book is covered by
+            // its own tests.
+            Err(MarketError::ServiceClosed)
+        }
+
+        async fn subscribe_order_book(
+            &self,
+            _query: PredictionOrderBookQuery,
+        ) -> Result<Self::OrderBookSubscription, MarketError> {
+            Ok(PendingOrderBookSubscription)
+        }
     }
 
     impl PredictionSeriesEventSubscription for FakeSubscription {
@@ -719,6 +795,15 @@ mod tests {
                 self.event_received.notify_waiters();
             }
             event
+        }
+    }
+
+    /// A book stream that publishes nothing: the chart fixture never opens one.
+    struct PendingOrderBookSubscription;
+
+    impl PredictionOrderBookEventSubscription for PendingOrderBookSubscription {
+        async fn recv(&mut self) -> Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>> {
+            std::future::pending().await
         }
     }
 

@@ -864,6 +864,14 @@ widget:
     select_instrument_prompt: <p align="center">Select an instrument from the picker in the top left</p>
     table: Recent market trades
   prediction_market:
+    book:
+      last: 'Last: %{price}'
+      price: PRICE
+      shares: SHARES
+      spread: 'Spread: %{spread}'
+      timed_out: The order book request timed out
+      title: Order book
+      total: TOTAL
     date:
       am: AM
       clock: '%{hour12}:%{minute} %{meridiem}'

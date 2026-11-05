@@ -13,8 +13,9 @@ use market_participants_model::{
         ResolutionRule, SettlementFractionRule,
     },
     prediction::{
-        PredictionCategory, PredictionEventRef, PredictionEventView, PredictionLeg,
-        PredictionMarket, PredictionMarketGroup, PredictionMarketRef, PredictionNativeLeg,
+        PredictionBookLevel, PredictionBookLevelChange, PredictionCategory, PredictionEventRef,
+        PredictionEventView, PredictionLeg, PredictionMarket, PredictionMarketGroup,
+        PredictionMarketRef, PredictionNativeLeg, PredictionOrderBook,
     },
     settlement::Expiry,
 };
@@ -153,4 +154,37 @@ pub(crate) fn charted_market(
         legs: sides,
     };
     (market, legs)
+}
+
+/// One price level of a fixture book.
+pub(crate) fn level(price: &str, size: &str) -> PredictionBookLevel {
+    PredictionBookLevel {
+        price: price.parse().expect("the fixture price is a fraction"),
+        size: size.parse().expect("the fixture size is a quantity"),
+    }
+}
+
+/// One absolute size change of a fixture book level.
+pub(crate) fn change(price: &str, size: &str) -> PredictionBookLevelChange {
+    PredictionBookLevelChange {
+        price: price.parse().expect("the fixture price is a fraction"),
+        size: size.parse().expect("the fixture size is a quantity"),
+    }
+}
+
+/// One fixture book for `leg`, with no last trade and a fixed timestamp.
+pub(crate) fn order_book(
+    leg: OutcomeLegRef,
+    tick: &str,
+    bids: Vec<PredictionBookLevel>,
+    asks: Vec<PredictionBookLevel>,
+) -> PredictionOrderBook {
+    PredictionOrderBook {
+        leg,
+        tick_size: tick.parse().expect("the fixture tick is valid"),
+        bids,
+        asks,
+        last_trade_price: None,
+        timestamp: 1_000,
+    }
 }

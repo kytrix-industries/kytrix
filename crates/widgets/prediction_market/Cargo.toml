@@ -8,6 +8,7 @@ edition.workspace = true
 futures = { workspace = true }
 gpui-kit = { workspace = true }
 i18n = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
@@ -30,6 +31,8 @@ widget_tokio_runtime = { workspace = true }
 # enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
+# A config written by an older build has to decode with the fields it never had.
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -1,3 +1,4 @@
+mod book;
 mod chart;
 mod model;
 mod service;

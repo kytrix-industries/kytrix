@@ -17,6 +17,7 @@ use std::{
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::manager::ConfigManager;
 use base_ui::{
+    button::Button,
     empty_state::EmptyState,
     interactive::InteractiveVariantExt,
     menu::{MenuItem, MenuItemAction},
@@ -25,20 +26,26 @@ use base_ui::{
     style::theme::ThemeExt,
 };
 use gpui_kit::{
-    AnyElement, App, Context, CursorStyle, ElementId, Entity, InteractiveElement, IntoElement,
-    MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, CursorStyle, ElementId, Entity, Hsla, InteractiveElement,
+    IntoElement, MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, base::Selectable, div,
+    prelude::FluentBuilder, px, relative,
 };
 use i18n::t;
 use instrument_selector_ui::{
     prediction_button::PredictionEventButton, prediction_locale::polymarket_locale,
 };
 use market_participants_connector::{
-    connector::MarketParticipantsConnector, venue::loaded::VenuesUpdated,
+    connector::MarketParticipantsConnector, market::error::MarketError,
+    venue::loaded::VenuesUpdated,
 };
 use market_participants_model::{
+    decimal::Tick,
     identifier::VenueId,
-    prediction::{PredictionEventRef, PredictionMarketGroup, PredictionMarketRef, PredictionRange},
+    prediction::{
+        PredictionEventRef, PredictionMarketGroup, PredictionMarketRef, PredictionOrderBook,
+        PredictionRange,
+    },
     routing::CapabilityId,
 };
 use serde::{Deserialize, Serialize};
@@ -57,6 +64,13 @@ use widget::{
 use widget_tokio_runtime::global;
 
 use crate::{
+    book::{
+        DEFAULT_BOOK_RATIO, GROUPING_MULTIPLIERS, GroupedBook, GroupedLevel,
+        PredictionOrderBookError, PredictionOrderBookProtocol, PredictionOrderBookRequest,
+        PredictionOrderBookService, PredictionOrderBookStatus, PredictionOrderBookStreamKey,
+        PredictionOrderBookStreamMessage, clamp_ratio, format_notional, format_price_cents,
+        format_shares, format_spread_cents, group, settle_grouping,
+    },
     chart::canvas::{ChartCanvasOptions, ChartPaintCaches, chart_element},
     model::{PredictionMarketChoice, PredictionMarketSnapshot},
     service::{
@@ -104,11 +118,57 @@ impl LocalizedError for PredictionMarketServiceError {
 }
 
 /// The options the prediction market persists.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
 pub struct PredictionMarketConfig {
     /// The range the history is read over.
     #[serde(rename = "range")]
     pub range: PredictionRange,
+    /// Whether the order book is drawn below the chart.
+    #[serde(rename = "order_book_visible")]
+    pub order_book_visible: bool,
+    /// The share of the body the order book takes.
+    #[serde(rename = "order_book_ratio")]
+    pub order_book_ratio: f32,
+    /// The book's price grouping, as a multiple of the venue's own tick.
+    #[serde(rename = "order_book_grouping")]
+    pub order_book_grouping: u32,
+}
+
+impl Default for PredictionMarketConfig {
+    fn default() -> Self {
+        Self {
+            range: PredictionRange::default(),
+            order_book_visible: true,
+            order_book_ratio: DEFAULT_BOOK_RATIO,
+            order_book_grouping: GROUPING_MULTIPLIERS[0],
+        }
+    }
+}
+
+impl PredictionMarketConfig {
+    /// Settles the book's two drawing choices against what this build offers.
+    ///
+    /// A stored ratio or grouping can stop being valid — a layout written by
+    /// another build, a hand-edited file — and such a choice goes back to the
+    /// default one rather than being drawn at a value nobody picked. The default
+    /// is not in the range for its own sake: the ratio is what a splitter
+    /// clamps, and the grouping is what the venue's tick can express. Answers
+    /// whether anything was replaced, which is what the pane reports so the
+    /// replacement is written back.
+    fn settle(&mut self) -> bool {
+        let defaults = Self::default();
+        let mut settled = false;
+        if clamp_ratio(self.order_book_ratio) != self.order_book_ratio {
+            self.order_book_ratio = defaults.order_book_ratio;
+            settled = true;
+        }
+        if !GROUPING_MULTIPLIERS.contains(&self.order_book_grouping) {
+            self.order_book_grouping = defaults.order_book_grouping;
+            settled = true;
+        }
+        settled
+    }
 }
 
 impl WidgetConfig for PredictionMarketConfig {
@@ -183,6 +243,12 @@ pub struct PredictionMarketWidget {
     selection_title: Option<SmolStr>,
     market: Option<PredictionMarketRef>,
     binding: WidgetBinding<PredictionMarketProtocol>,
+    /// The book the panel is following, which is one leg of the drawn market.
+    book_binding: WidgetBinding<PredictionOrderBookProtocol>,
+    book_snapshot: Option<Arc<PredictionOrderBook>>,
+    book_error: Option<PredictionOrderBookError>,
+    book_key: Option<PredictionOrderBookStreamKey>,
+    book_epoch: u64,
     status: Entity<WidgetStatus>,
     recovery: WidgetAction,
     snapshot: Option<Arc<PredictionMarketSnapshot>>,
@@ -226,6 +292,16 @@ impl WidgetView for PredictionMarketWidget {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
+        // The stored book choices are judged before any work is started, so the
+        // pane never draws or requests a notch and a grouping this build does
+        // not offer.
+        if self.config.settle() {
+            log::warn!(
+                "the prediction market's stored book ratio or grouping is not offered here; \
+                 it was reset to the default"
+            );
+            self.config_change.publish(cx);
+        }
         if !self.market_ready(cx) {
             self.awaiting_market = true;
             self.snapshot = None;
@@ -308,9 +384,14 @@ impl WidgetView for PredictionMarketWidget {
             }
             left = left.child(self.market_select(snapshot, selected, cx));
         }
-        WidgetHeader::empty()
-            .left(left)
-            .right(self.range_select(cx))
+        WidgetHeader::empty().left(left).right(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(self.book_toggle(cx))
+                .child(self.range_select(cx)),
+        )
     }
 }
 
@@ -329,10 +410,17 @@ impl PredictionMarketWidget {
     {
         let binding = WidgetBinding::spawn_conditionally(
             global::handle(cx).handle(),
-            PredictionMarketService::new(source),
+            PredictionMarketService::new(source.clone()),
             cx,
             Self::apply_reliable,
             Self::apply_latest,
+        );
+        let book_binding = WidgetBinding::spawn_conditionally(
+            global::handle(cx).handle(),
+            PredictionOrderBookService::new(source),
+            cx,
+            Self::apply_book_reliable,
+            Self::apply_book_latest,
         );
         let venues = cx.global::<MarketParticipantsConnector>().venues().events();
         let subscription = cx.subscribe(&venues, |this, _, event: &VenuesUpdated, cx| {
@@ -345,6 +433,11 @@ impl PredictionMarketWidget {
             selection_title: None,
             market: None,
             binding,
+            book_binding,
+            book_snapshot: None,
+            book_error: None,
+            book_key: None,
+            book_epoch: 0,
             status,
             recovery,
             snapshot: None,
@@ -483,6 +576,7 @@ impl PredictionMarketWidget {
         self.selection_title = Some(title);
         self.market = None;
         self.snapshot = None;
+        self.clear_book();
         self.clear_pointer(cx);
         self.pulse = None;
         self.load(cx);
@@ -495,6 +589,7 @@ impl PredictionMarketWidget {
         }
         self.market = Some(market);
         self.snapshot = None;
+        self.clear_book();
         self.clear_pointer(cx);
         self.pulse = None;
         self.load(cx);
@@ -592,6 +687,199 @@ impl PredictionMarketWidget {
         }
     }
 
+    /// Forgets the book on screen.
+    ///
+    /// Another market's book cannot be vouched for, and the epoch means a
+    /// message from the stream that was reading it is refused even if the same
+    /// leg is chosen again later.
+    fn clear_book(&mut self) {
+        self.book_snapshot = None;
+        self.book_error = None;
+        self.book_key = None;
+        self.book_epoch = self.book_epoch.wrapping_add(1);
+    }
+
+    /// Points the book panel at the market the chart is drawing.
+    ///
+    /// The request carries every side of the drawn market in venue order, which
+    /// is what makes it share the connection lease the chart's own subscription
+    /// already holds. A reading of the same event and leg is the book already on
+    /// screen, so switching the chart range does not restart it.
+    fn sync_book_target(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.book_target())
+        else {
+            if self.book_key.is_some() {
+                self.clear_book();
+                cx.notify();
+            }
+            return;
+        };
+        if self
+            .book_key
+            .as_ref()
+            .is_some_and(|key| key.event == target.event && key.leg == target.leg)
+        {
+            return;
+        }
+        self.book_epoch = self.book_epoch.wrapping_add(1);
+        self.book_snapshot = None;
+        self.book_error = None;
+        self.book_key = Some(PredictionOrderBookStreamKey {
+            event: target.event.clone(),
+            leg: target.leg.clone(),
+            epoch: self.book_epoch,
+        });
+        self.book_binding.call(
+            PredictionOrderBookRequest::Load {
+                event: target.event,
+                legs: target.legs,
+                leg: target.leg,
+                epoch: self.book_epoch,
+            },
+            cx,
+            Self::apply_book_rpc,
+        );
+        cx.notify();
+    }
+
+    /// Reports a book command the service never answered.
+    ///
+    /// The service answers every command before it does any work, so a failed
+    /// command is a failure of the channel rather than of the book: the book's
+    /// own outcome arrives as a stream status, which is what normally reports a
+    /// failure.
+    fn apply_book_rpc(
+        &mut self,
+        result: WidgetRpcResult<PredictionOrderBookProtocol>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = result {
+            log::warn!("the prediction order book request failed: {error}");
+            self.book_error = Some(PredictionOrderBookError::Market(MarketError::ServiceClosed));
+            cx.notify();
+        }
+    }
+
+    fn apply_book_reliable(
+        &mut self,
+        key: PredictionOrderBookStreamKey,
+        message: Arc<PredictionOrderBookStreamMessage>,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        if self.book_key.as_ref() != Some(&key) {
+            return false;
+        }
+        let PredictionOrderBookStreamMessage::Status(status) = message.as_ref() else {
+            return false;
+        };
+        match status {
+            PredictionOrderBookStatus::Connecting => {
+                let changed = self.book_error.is_some();
+                self.book_error = None;
+                changed
+            }
+            PredictionOrderBookStatus::Ready => false,
+            PredictionOrderBookStatus::Failed { error } => {
+                let changed = self.book_error.as_ref() != Some(error);
+                self.book_error = Some(error.clone());
+                changed
+            }
+        }
+    }
+
+    fn apply_book_latest(
+        &mut self,
+        key: PredictionOrderBookStreamKey,
+        message: Arc<PredictionOrderBookStreamMessage>,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        if self.book_key.as_ref() != Some(&key) {
+            return false;
+        }
+        let PredictionOrderBookStreamMessage::Snapshot(book) = message.as_ref() else {
+            return false;
+        };
+        self.book_snapshot = Some(book.clone());
+        self.book_error = None;
+        true
+    }
+
+    /// Re-reads the book the panel is pointed at.
+    ///
+    /// A retry is a new generation of the same book: the error stops being the
+    /// answer, and the reading arrives under a key no message of the failed
+    /// stream can name.
+    fn retry_book(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.book_target())
+        else {
+            return;
+        };
+        self.book_epoch = self.book_epoch.wrapping_add(1);
+        self.book_snapshot = None;
+        self.book_error = None;
+        self.book_key = Some(PredictionOrderBookStreamKey {
+            event: target.event.clone(),
+            leg: target.leg.clone(),
+            epoch: self.book_epoch,
+        });
+        self.book_binding.call(
+            PredictionOrderBookRequest::Retry {
+                event: target.event,
+                legs: target.legs,
+                leg: target.leg,
+                epoch: self.book_epoch,
+            },
+            cx,
+            Self::apply_book_rpc,
+        );
+        cx.notify();
+    }
+
+    /// Whether the panel is waiting for its first reading.
+    fn book_loading(&self) -> bool {
+        self.book_key.is_some() && self.book_snapshot.is_none() && self.book_error.is_none()
+    }
+
+    /// Takes the book panel out of the body and reports the change.
+    fn toggle_book(&mut self, cx: &mut Context<Self>) {
+        self.config.order_book_visible = !self.config.order_book_visible;
+        self.config_change.publish(cx);
+        cx.notify();
+    }
+
+    /// The header control that shows and hides the book.
+    fn book_toggle(&self, cx: &Context<Self>) -> AnyElement {
+        let widget = cx.entity().downgrade();
+        let label = t!(cx, "widget.prediction_market.book.title");
+        div()
+            .debug_selector(|| "TEST_PREDICTION_MARKET_BOOK_TOGGLE".into())
+            // A control in the header row has to take its own clicks: the row is
+            // the pane's drag area as well.
+            .occlude()
+            .child(
+                Button::new(ElementId::Name(SharedString::new_static(
+                    "PredictionMarketBookToggle",
+                )))
+                .ghost()
+                .small()
+                .selected(self.config.order_book_visible)
+                .aria_label(label.clone())
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    if let Some(widget) = widget.upgrade() {
+                        widget.update(cx, |this, cx| this.toggle_book(cx));
+                    }
+                }),
+            )
+            .into_any_element()
+    }
+
     fn apply_reliable(
         &mut self,
         key: PredictionMarketStreamKey,
@@ -667,6 +955,10 @@ impl PredictionMarketWidget {
         let newest = snapshot.latest_timestamp();
         self.snapshot = Some(snapshot.clone());
         self.selection_title = Some(snapshot.title.clone());
+        // The book follows the market the reading draws, so a switch of market
+        // re-points it here rather than in the header's handler: only a reading
+        // knows which sides the market it fell back to actually publishes.
+        self.sync_book_target(cx);
         self.status.report(WidgetState::Ready, cx);
         // The pulse marks a *new observation*, not a first reading: a chart opening on
         // a market has nothing to breathe about, and a reading whose newest point did
@@ -815,6 +1107,185 @@ impl PredictionMarketWidget {
         row.into_any_element()
     }
 
+    /// The book below the chart: the header row, the spread, and the top of both
+    /// sides of the ladder.
+    ///
+    /// The panel is the body's second child, so it takes a fixed share of it and
+    /// the chart keeps the rest. A book that has not arrived, failed, or holds
+    /// no level at all still occupies that share: the panel is a region of the
+    /// pane, not something that appears with data.
+    fn order_book_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let panel = div()
+            .debug_selector(|| "TEST_PREDICTION_MARKET_BOOK".into())
+            .flex_none()
+            .h(relative(clamp_ratio(self.config.order_book_ratio)))
+            .min_h_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .px_2()
+            .py_1();
+        let Some(book) = self.book_snapshot.clone() else {
+            let body = match self.book_error.clone() {
+                Some(error) => self.book_failure(&error, cx),
+                None if self.book_loading() => centered_muted(t!(cx, "common.loading"), cx),
+                None => book_empty_state(cx),
+            };
+            return panel.child(body).into_any_element();
+        };
+        // The stored grouping is settled against the tick the venue published,
+        // not against the config alone: which steps exist depends on the tick.
+        let step = settle_grouping(book.tick_size, self.config.order_book_grouping);
+        let grouped = group(&book, step);
+        if grouped.is_empty() {
+            return panel.child(book_empty_state(cx)).into_any_element();
+        }
+        let muted = theme.roles.fg.muted.hsla;
+        let foreground = theme.roles.fg.default.hsla;
+        let mut rows = div().flex_1().min_h_0().flex().flex_col();
+        rows = rows.child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .h(px(20.0))
+                .text_size(px(11.0))
+                .child(book_cell(
+                    t!(cx, "widget.prediction_market.book.price"),
+                    muted,
+                ))
+                .child(book_cell(
+                    t!(cx, "widget.prediction_market.book.shares"),
+                    muted,
+                ))
+                .child(book_cell(
+                    t!(cx, "widget.prediction_market.book.total"),
+                    muted,
+                )),
+        );
+        // The ask ladder is drawn above the spread with its worst row at the top,
+        // so the best ask sits against the spread row it is part of.
+        for level in grouped.asks.iter().take(BOOK_ROWS).rev() {
+            rows = rows.child(book_level_row(
+                level,
+                grouped.tick,
+                theme.roles.market.down.hsla,
+                theme.roles.market.down_weak.hsla,
+                foreground,
+                muted,
+            ));
+        }
+        rows = rows.child(self.book_spread_row(&grouped, cx));
+        for level in grouped.bids.iter().take(BOOK_ROWS) {
+            rows = rows.child(book_level_row(
+                level,
+                grouped.tick,
+                theme.roles.market.up.hsla,
+                theme.roles.market.up_weak.hsla,
+                foreground,
+                muted,
+            ));
+        }
+        panel.child(rows).into_any_element()
+    }
+
+    /// The row between the two sides: the side being read, the last trade and the
+    /// spread.
+    fn book_spread_row(&self, grouped: &GroupedBook, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let last = grouped
+            .last
+            .map(|price| {
+                t!(
+                    cx,
+                    "widget.prediction_market.book.last",
+                    price = format_price_cents(price, grouped.tick)
+                )
+            })
+            .unwrap_or_default();
+        let spread = grouped
+            .spread
+            .map(|spread| {
+                t!(
+                    cx,
+                    "widget.prediction_market.book.spread",
+                    spread = format_spread_cents(spread, grouped.tick)
+                )
+            })
+            .unwrap_or_default();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(22.0))
+            .px_1()
+            .text_size(px(12.0))
+            .text_color(theme.roles.fg.muted.hsla)
+            .child(SharedString::new(self.book_leg_label()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(last)
+                    .child(spread),
+            )
+            .into_any_element()
+    }
+
+    /// The label of the side the panel is reading, from the venue's own list.
+    fn book_leg_label(&self) -> SmolStr {
+        let (Some(key), Some(snapshot)) = (self.book_key.as_ref(), self.snapshot.as_ref()) else {
+            return SmolStr::new_static("");
+        };
+        snapshot
+            .legs
+            .iter()
+            .find(|leg| leg.leg == key.leg)
+            .map(|leg| leg.label.clone())
+            .unwrap_or_default()
+    }
+
+    /// The panel's failure: the sentence the error type states, and a way back.
+    fn book_failure(&self, error: &PredictionOrderBookError, cx: &Context<Self>) -> AnyElement {
+        let widget = cx.entity().downgrade();
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(cx.theme().roles.fg.muted.hsla)
+                    .child(error.localized_message(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "TEST_PREDICTION_MARKET_BOOK_RETRY".into())
+                    .occlude()
+                    .child(
+                        Button::new(ElementId::Name(SharedString::new_static(
+                            "PredictionMarketBookRetry",
+                        )))
+                        .ghost()
+                        .small()
+                        .child(t!(cx, "common.retry"))
+                        .on_click(move |_, _, cx| {
+                            if let Some(widget) = widget.upgrade() {
+                                widget.update(cx, |this, cx| this.retry_book(cx));
+                            }
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The chart, or the sentence that stands in for it when the reading has no points.
     ///
     /// The pointer is stored in window coordinates and snapped to a sample by the
@@ -875,6 +1346,93 @@ impl PredictionMarketWidget {
     }
 }
 
+/// How many rows of each side the basic book panel draws.
+///
+/// The full panel scrolls; this one shows the top of each side and no more.
+const BOOK_ROWS: usize = 8;
+
+/// One column of a book row, right-aligned like the numbers under it.
+fn book_cell(text: SharedString, color: Hsla) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .text_right()
+        .text_color(color)
+        .child(text)
+        .into_any_element()
+}
+
+/// One grouped level: its price in cents, its shares and the running notional,
+/// over a bar as long as its share of the side.
+fn book_level_row(
+    level: &GroupedLevel,
+    tick: Tick,
+    price_color: Hsla,
+    depth_color: Hsla,
+    foreground: Hsla,
+    muted: Hsla,
+) -> AnyElement {
+    div()
+        .debug_selector(|| "TEST_PREDICTION_MARKET_BOOK_ROW".into())
+        .relative()
+        .flex_none()
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .text_size(px(12.0))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(relative(level.depth))
+                .bg(depth_color),
+        )
+        .child(book_cell(
+            SharedString::new(format_price_cents(level.price, tick)),
+            price_color,
+        ))
+        .child(book_cell(
+            SharedString::new(format_shares(level.size)),
+            foreground,
+        ))
+        .child(book_cell(
+            SharedString::new(format_notional(level.total)),
+            muted,
+        ))
+        .into_any_element()
+}
+
+/// The body the panel draws when the book is known to be empty.
+fn book_empty_state(cx: &Context<PredictionMarketWidget>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(EmptyState::new(
+            "PredictionMarketBookEmpty",
+            t!(cx, "common.no_data"),
+        ))
+        .into_any_element()
+}
+
+/// One muted sentence, centered in the space the panel would otherwise use.
+fn centered_muted(text: SharedString, cx: &Context<PredictionMarketWidget>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.0))
+        .text_color(cx.theme().roles.fg.muted.hsla)
+        .child(text)
+        .into_any_element()
+}
+
 impl Render for PredictionMarketWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body is cached, and a cached subtree is only repainted when its own
@@ -901,8 +1459,14 @@ impl Render for PredictionMarketWidget {
         if !snapshot.series.is_empty() {
             body = body.child(self.legend(&snapshot, cx));
         }
-        body.child(self.chart_area(&snapshot, has_points, pulse_phase, cx))
-            .into_any_element()
+        // The chart and the book share what the legend leaves: the chart takes
+        // the rest of it, and a hidden book leaves it all to the chart.
+        let mut content = div().flex_1().min_h_0().flex().flex_col();
+        content = content.child(self.chart_area(&snapshot, has_points, pulse_phase, cx));
+        if self.config.order_book_visible {
+            content = content.child(self.order_book_panel(cx));
+        }
+        body.child(content).into_any_element()
     }
 }
 
@@ -954,10 +1518,14 @@ mod tests {
     };
     use market_participants_connector::{
         connector::MarketParticipantsConnector, market::error::MarketError,
+        market_participants::model::query::PredictionOrderBookQuery,
     };
     use market_participants_model::{
         decimal::{Fraction, Ratio},
-        prediction::{PredictionEventView, PredictionLeg, PredictionPricePoint, PredictionSeries},
+        prediction::{
+            PredictionEventView, PredictionLeg, PredictionOrderBookUpdate, PredictionPricePoint,
+            PredictionSeries,
+        },
     };
     use widget_tokio_runtime::global;
 
@@ -969,7 +1537,7 @@ mod tests {
             PredictionMarketSource, PredictionMarketStreamKey, PredictionMarketStreamMessage,
             PredictionSeriesEventSubscription,
         },
-        test_support::{charted_market, event_ref, event_with},
+        test_support::{charted_market, event_ref, event_with, level, order_book},
     };
 
     /// A source that answers one event and one two-point history, and records the range
@@ -980,6 +1548,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeSource {
         ranges: Arc<Mutex<Vec<PredictionRange>>>,
+        book_queries: Arc<Mutex<Vec<PredictionOrderBookQuery>>>,
     }
 
     impl FakeSource {
@@ -989,10 +1558,18 @@ mod tests {
                 .expect("the fake's range log is not poisoned")
                 .clone()
         }
+
+        fn book_queries(&self) -> Vec<PredictionOrderBookQuery> {
+            self.book_queries
+                .lock()
+                .expect("the fake's book log is not poisoned")
+                .clone()
+        }
     }
 
     impl PredictionMarketSource for FakeSource {
         type Subscription = PendingSubscription;
+        type OrderBookSubscription = PendingSubscription;
 
         async fn event(
             &self,
@@ -1030,6 +1607,35 @@ mod tests {
         ) -> Result<Self::Subscription, MarketError> {
             Ok(PendingSubscription)
         }
+
+        async fn fetch_order_book(
+            &self,
+            query: PredictionOrderBookQuery,
+        ) -> Result<PredictionOrderBook, MarketError> {
+            self.book_queries
+                .lock()
+                .expect("the fake's book log is not poisoned")
+                .push(query.clone());
+            let mut book = order_book(
+                query.leg,
+                "0.001",
+                vec![level("0.34", "50")],
+                vec![level("0.35", "100")],
+            );
+            book.last_trade_price = Some(
+                "0.345"
+                    .parse::<Fraction>()
+                    .expect("the fixture price is a fraction"),
+            );
+            Ok(book)
+        }
+
+        async fn subscribe_order_book(
+            &self,
+            _query: PredictionOrderBookQuery,
+        ) -> Result<Self::OrderBookSubscription, MarketError> {
+            Ok(PendingSubscription)
+        }
     }
 
     /// A live stream that publishes nothing: every state a test asserts is reported to
@@ -1038,6 +1644,12 @@ mod tests {
 
     impl PredictionSeriesEventSubscription for PendingSubscription {
         async fn recv(&mut self) -> Option<Result<Vec<PredictionSeries>, MarketError>> {
+            std::future::pending().await
+        }
+    }
+
+    impl crate::service::PredictionOrderBookEventSubscription for PendingSubscription {
+        async fn recv(&mut self) -> Option<Result<Vec<PredictionOrderBookUpdate>, MarketError>> {
             std::future::pending().await
         }
     }
@@ -1248,6 +1860,59 @@ mod tests {
         });
     }
 
+    /// The stream key of one fixture book generation.
+    fn book_stream_key(epoch: u64) -> PredictionOrderBookStreamKey {
+        let (_, legs) = charted_market(&event_ref(), "charted");
+        PredictionOrderBookStreamKey {
+            event: event_ref(),
+            leg: legs[0].clone(),
+            epoch,
+        }
+    }
+
+    /// One reading of the fixture book.
+    fn book_reading() -> Arc<PredictionOrderBook> {
+        let (_, legs) = charted_market(&event_ref(), "charted");
+        Arc::new(order_book(
+            legs[0].clone(),
+            "0.001",
+            vec![level("0.34", "50")],
+            vec![level("0.35", "100")],
+        ))
+    }
+
+    /// Reports a book reading as its stream would.
+    fn report_book_snapshot(
+        pane: &Entity<PredictionMarketWidget>,
+        key: PredictionOrderBookStreamKey,
+        book: Arc<PredictionOrderBook>,
+        cx: &mut App,
+    ) -> bool {
+        pane.update(cx, |pane, cx| {
+            pane.apply_book_latest(
+                key,
+                Arc::new(PredictionOrderBookStreamMessage::Snapshot(book)),
+                cx,
+            )
+        })
+    }
+
+    /// Reports one book status as its stream would.
+    fn report_book_status(
+        pane: &Entity<PredictionMarketWidget>,
+        key: PredictionOrderBookStreamKey,
+        status: PredictionOrderBookStatus,
+        cx: &mut App,
+    ) -> bool {
+        pane.update(cx, |pane, cx| {
+            pane.apply_book_reliable(
+                key,
+                Arc::new(PredictionOrderBookStreamMessage::Status(status)),
+                cx,
+            )
+        })
+    }
+
     /// Lets the pane and its service run until what the test waits for happens.
     ///
     /// Two executors are involved: the pane sends its command from GPUI's own and the
@@ -1292,6 +1957,7 @@ mod tests {
     fn the_config_is_the_range_the_pane_was_built_with(cx: &mut TestAppContext) {
         let config = PredictionMarketConfig {
             range: PredictionRange::Week1,
+            ..PredictionMarketConfig::default()
         };
         let (pane, _source) = pane_with(cx, config, reports());
 
@@ -1918,7 +2584,11 @@ mod tests {
 
     #[gpui_kit::test]
     fn a_reading_with_points_should_draw_the_legend_above_the_chart(cx: &mut TestAppContext) {
-        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        let config = PredictionMarketConfig {
+            order_book_visible: false,
+            ..PredictionMarketConfig::default()
+        };
+        let (pane, _source) = pane_with(cx, config, reports());
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 pane.selection = Some(event_ref());
@@ -1936,5 +2606,251 @@ mod tests {
         assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_LEGEND").is_some());
         assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_CHART").is_some());
         assert!(cx.debug_bounds("EMPTY_STATE").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn a_chart_snapshot_should_start_the_book_request_with_the_markets_legs(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| select_event(&pane, cx));
+        settle_until(cx, "the book request", |_| {
+            !source.book_queries().is_empty()
+        });
+        settle_until(cx, "the first book reading", |cx| {
+            pane.read(cx).book_snapshot.is_some()
+        });
+
+        let (_, legs) = charted_market(&event_ref(), "charted");
+        let queries = source.book_queries();
+        assert_eq!(queries[0].event, event_ref());
+        assert_eq!(
+            queries[0].leg, legs[0],
+            "the market's default side is the book the panel shows"
+        );
+        assert_eq!(
+            queries[0]
+                .legs
+                .iter()
+                .map(|leg| leg.leg.clone())
+                .collect::<Vec<_>>(),
+            legs,
+            "the request carries every side of the market, in venue order, so it \
+             shares the chart's topic lease"
+        );
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.book_error.is_none());
+            assert_eq!(
+                pane.book_key.as_ref().map(|key| key.leg.clone()),
+                Some(legs[0].clone())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_book_reading_from_a_book_the_pane_no_longer_follows_should_be_refused(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.selection = Some(event_ref());
+                pane.book_key = Some(book_stream_key(2));
+                pane.book_epoch = 2;
+            });
+            assert!(
+                !report_book_snapshot(&pane, book_stream_key(1), book_reading(), cx),
+                "a reading of the previous book is refused"
+            );
+            assert!(pane.read(cx).book_snapshot.is_none());
+            assert!(report_book_snapshot(
+                &pane,
+                book_stream_key(2),
+                book_reading(),
+                cx
+            ));
+            assert!(pane.read(cx).book_snapshot.is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_book_failure_should_be_shown_in_the_panel_and_recoverable(cx: &mut TestAppContext) {
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000]));
+                pane.book_key = Some(book_stream_key(1));
+                pane.book_epoch = 1;
+                pane.status.report(WidgetState::Ready, cx);
+            });
+            assert!(report_book_status(
+                &pane,
+                book_stream_key(1),
+                PredictionOrderBookStatus::Failed {
+                    error: PredictionOrderBookError::Timeout(Duration::from_secs(10)),
+                },
+                cx,
+            ));
+            assert_eq!(
+                pane.read(cx).status.state(cx),
+                WidgetState::Ready,
+                "a book failure is the panel's, not the pane's"
+            );
+        });
+
+        let (_, cx): (Entity<BodyHarness>, &mut VisualTestContext) =
+            cx.add_window_view(|_, _| BodyHarness { pane: pane.clone() });
+        cx.simulate_resize(size(px(900.0), px(520.0)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK").is_some());
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK_RETRY")
+                .is_some(),
+            "the panel offers a way to read the book again"
+        );
+
+        cx.update(|_, cx| pane.update(cx, |pane, cx| pane.retry_book(cx)));
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert!(pane.book_error.is_none(), "a retry forgets the failure");
+            assert_eq!(
+                pane.book_key.as_ref().map(|key| key.epoch),
+                Some(2),
+                "the retry is a new generation of the same book"
+            );
+            assert!(pane.book_loading());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_toggle_should_hide_the_book_panel_and_report_the_change(cx: &mut TestAppContext) {
+        let reports = reports();
+        let (pane, _source) = pane_with(cx, PredictionMarketConfig::default(), reports.clone());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.selection = Some(event_ref());
+                pane.snapshot = Some(reading(1, PredictionRange::All, &[1_000, 2_000]));
+                pane.book_key = Some(book_stream_key(1));
+                pane.book_epoch = 1;
+                pane.book_snapshot = Some(book_reading());
+                pane.status.report(WidgetState::Ready, cx);
+            });
+        });
+
+        let (_, cx): (Entity<BodyHarness>, &mut VisualTestContext) =
+            cx.add_window_view(|_, _| BodyHarness { pane: pane.clone() });
+        cx.simulate_resize(size(px(900.0), px(520.0)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK").is_some());
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK_ROW").is_some(),
+            "the book the panel holds is drawn row by row"
+        );
+        assert!(cx.debug_bounds("EMPTY_STATE").is_none());
+
+        cx.update(|_, cx| pane.update(cx, |pane, cx| pane.toggle_book(cx)));
+        cx.update(|_, cx| assert!(!pane.read(cx).config.order_book_visible));
+        assert_eq!(reports.get(), 1, "hiding the book is written back");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK").is_none());
+        assert!(
+            cx.debug_bounds("TEST_PREDICTION_MARKET_CHART").is_some(),
+            "the chart keeps the whole body while the book is hidden"
+        );
+
+        cx.update(|_, cx| pane.update(cx, |pane, cx| pane.toggle_book(cx)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TEST_PREDICTION_MARKET_BOOK").is_some());
+        assert_eq!(reports.get(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_stored_book_choice_this_build_does_not_offer_should_be_reset_and_reported(
+        cx: &mut TestAppContext,
+    ) {
+        let reports = reports();
+        let config = PredictionMarketConfig {
+            order_book_ratio: 5.0,
+            order_book_grouping: 7,
+            ..PredictionMarketConfig::default()
+        };
+        let (pane, _source) = pane_with(cx, config, reports.clone());
+
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.load(cx)));
+
+        cx.update(|cx| {
+            let config = pane.read(cx).config;
+            assert_eq!(config.order_book_ratio, 0.5, "an impossible notch is reset");
+            assert_eq!(
+                config.order_book_grouping, 1,
+                "an unknown grouping is reset"
+            );
+        });
+        assert_eq!(
+            reports.get(),
+            1,
+            "the reset is reported once so the corrected config is written back"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_supported_book_choice_should_be_kept_and_not_reported(cx: &mut TestAppContext) {
+        let reports = reports();
+        let config = PredictionMarketConfig {
+            order_book_ratio: 0.3,
+            order_book_grouping: 10,
+            ..PredictionMarketConfig::default()
+        };
+        let (pane, _source) = pane_with(cx, config, reports.clone());
+
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.load(cx)));
+
+        cx.update(|cx| {
+            let config = pane.read(cx).config;
+            assert_eq!(config.order_book_ratio, 0.3);
+            assert_eq!(config.order_book_grouping, 10);
+        });
+        assert_eq!(reports.get(), 0, "a supported choice is left alone");
+    }
+
+    #[test]
+    fn a_config_written_before_the_book_existed_should_decode_with_its_defaults() {
+        let config: PredictionMarketConfig =
+            serde_json::from_str(r#"{"range":"hour_1"}"#).expect("the old config decodes");
+
+        assert_eq!(
+            config.range,
+            PredictionRange::Hour1,
+            "a range written by an older build is not reset"
+        );
+        assert!(config.order_book_visible);
+        assert_eq!(config.order_book_ratio, 0.5);
+        assert_eq!(config.order_book_grouping, 1);
+    }
+
+    #[test]
+    fn the_config_should_round_trip() {
+        let config = PredictionMarketConfig {
+            range: PredictionRange::Day1,
+            order_book_visible: false,
+            order_book_ratio: 0.3,
+            order_book_grouping: 100,
+        };
+
+        let encoded = serde_json::to_string(&config).expect("the config encodes");
+        let decoded: PredictionMarketConfig =
+            serde_json::from_str(&encoded).expect("the config decodes");
+
+        assert_eq!(decoded, config);
+        assert_eq!(
+            encoded,
+            r#"{"range":"day_1","order_book_visible":false,"order_book_ratio":0.3,"order_book_grouping":100}"#
+        );
     }
 }

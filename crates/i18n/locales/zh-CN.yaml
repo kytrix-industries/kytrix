@@ -864,6 +864,14 @@ widget:
     select_instrument_prompt: <p align="center">请从左上角的标的物选择器中选择标的</p>
     table: 最近市场成交
   prediction_market:
+    book:
+      last: '最新: %{price}'
+      price: 价格
+      shares: 份额
+      spread: '价差: %{spread}'
+      timed_out: 订单簿请求超时
+      title: 订单簿
+      total: 总额
     date:
       am: 上午
       clock: '%{hour24}:%{minute}'
