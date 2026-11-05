@@ -110,11 +110,11 @@ impl HyperliquidInfoRequest {
     ///
     /// Hyperliquid aggregates every REST request of one IP into a budget of 1200
     /// weight per minute, and publishes what each kind costs: `clearinghouseState`
-    /// and `spotClearinghouseState` are 2, `l2Book` is 2, `userRole` is 60, and
-    /// every other documented request is 20. The per-item surcharge the venue adds
-    /// to `userFills` and its siblings is deliberately not modelled here: it is
-    /// decided by the answer's size, and the budget keeps enough headroom under
-    /// the venue's own cap to absorb it.
+    /// and `spotClearinghouseState` are 2, `l2Book` and `allMids` are 2,
+    /// `userRole` is 60, and every other documented request is 20. The per-item
+    /// surcharge the venue adds to `userFills` and its siblings is deliberately
+    /// not modelled here: it is decided by the answer's size, and the budget keeps
+    /// enough headroom under the venue's own cap to absorb it.
     pub(crate) const fn weight(&self) -> u32 {
         match self {
             Self::L2Book { .. }
@@ -133,8 +133,9 @@ impl HyperliquidInfoRequest {
             | Self::MetaAndAssetCtxs { .. }
             | Self::PerpDexs
             | Self::OutcomeMeta
-            | Self::OutcomeTemplates
-            | Self::AllMids => 20,
+            | Self::OutcomeTemplates => 20,
+            // allMids is a light, venue-wide read.
+            Self::AllMids => 2,
             // The one request only a test can make is not in the venue's table.
             #[cfg(test)]
             Self::SettledOutcome { .. } => 20,

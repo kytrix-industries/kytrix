@@ -103,12 +103,17 @@ impl PredictionChartSnapshot {
             .collect();
         let mut lines: Vec<PredictionChartSeries> = series
             .into_iter()
-            .map(|series| {
+            .map(|mut series| {
                 let label = labels
                     .get(&series.leg)
                     .cloned()
                     .unwrap_or_else(|| SmolStr::new_static("Option"));
                 let latest = series.points.last().map(|point| point.probability);
+                // History is the one read that can exceed the live point budget;
+                // keep the newest points so a line never grows without bound.
+                if series.points.len() > MAX_POINTS {
+                    series.points.drain(..series.points.len() - MAX_POINTS);
+                }
                 PredictionChartSeries {
                     leg: series.leg,
                     label,
@@ -226,7 +231,6 @@ impl PredictionChartSnapshot {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use market_participants_model::{
         decimal::Fraction,
@@ -268,6 +272,34 @@ mod tests {
             points.last().map(|point| point.timestamp),
             Some(i64::try_from(MAX_POINTS).expect("the cap fits in i64"))
         );
+    }
+
+    #[test]
+    fn a_history_line_keeps_only_its_newest_two_thousand_points() {
+        let event = event_ref();
+        let (market, legs) = charted_market(&event, "charted");
+        let view = event_with(vec![market.clone()]);
+        let points: Vec<PredictionPricePoint> = (0..=i64::try_from(MAX_POINTS)
+            .expect("the cap fits"))
+            .map(|timestamp| PredictionPricePoint {
+                timestamp,
+                probability: Fraction::ZERO,
+            })
+            .collect();
+        let series = vec![PredictionSeries {
+            leg: legs[0].clone(),
+            points,
+        }];
+
+        let snapshot = PredictionChartSnapshot::new(1, view, market, series);
+        let line = snapshot
+            .series
+            .iter()
+            .find(|line| line.leg == legs[0])
+            .expect("the charted line is present");
+
+        assert_eq!(line.points.len(), MAX_POINTS);
+        assert_eq!(line.points.first().map(|point| point.timestamp), Some(1));
     }
 
     #[test]

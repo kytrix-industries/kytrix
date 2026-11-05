@@ -172,26 +172,38 @@ impl PredictionEventsBuilder {
     ) -> Result<PredictionEventsPage, MarketError> {
         let mut events: BTreeMap<PredictionEventRef, PredictionEventCard> = BTreeMap::new();
         for route in routes {
-            let query = PredictionEventsQuery {
-                route: route.clone(),
-                category: None,
-                search: None,
-                cursor: None,
-                page_size: MAX_PREDICTION_PAGE_SIZE,
-                locale: self.request.locale.clone(),
-            };
-            let page = match execute(
-                &self.provider,
-                route,
-                ProtocolRequest::FetchPredictionEvents(query),
-            )
-            .await?
-            {
-                ProtocolResponse::PredictionEvents(page) => page,
-                _ => return Err(super::helpers::protocol_response("fetch prediction events")),
-            };
-            for event in page.events {
-                events.entry(event.event.clone()).or_insert(event);
+            let mut cursor = None;
+            loop {
+                let query = PredictionEventsQuery {
+                    route: route.clone(),
+                    category: None,
+                    search: None,
+                    cursor: cursor.clone(),
+                    page_size: MAX_PREDICTION_PAGE_SIZE,
+                    locale: self.request.locale.clone(),
+                };
+                let page = match execute(
+                    &self.provider,
+                    route.clone(),
+                    ProtocolRequest::FetchPredictionEvents(query),
+                )
+                .await?
+                {
+                    ProtocolResponse::PredictionEvents(page) => page,
+                    _ => {
+                        return Err(super::helpers::protocol_response("fetch prediction events"));
+                    }
+                };
+                for event in page.events {
+                    events.entry(event.event.clone()).or_insert(event);
+                }
+                let Some(next) = page.next_cursor else {
+                    break;
+                };
+                if cursor.as_ref() == Some(&next) {
+                    break;
+                }
+                cursor = Some(next);
             }
         }
         let mut events: Vec<PredictionEventCard> = events

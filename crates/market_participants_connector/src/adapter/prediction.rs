@@ -122,9 +122,19 @@ pub(crate) fn probability(value: &str) -> Option<Fraction> {
     value.parse().ok()
 }
 
-/// Parses a `YYYY-MM-DDTHH:MM:SSZ` instant.
+/// Parses a `YYYY-MM-DDTHH:MM:SSZ` instant, including a numeric UTC offset.
+///
+/// Gamma's `endDate` is normally UTC with a `Z` suffix, but the API also
+/// publishes date-only values and records written with a `+HH:MM` offset. A
+/// date without a time is the start of that UTC day.
 pub(crate) fn parse_iso8601_millis(value: &str) -> Option<UnixMillis> {
     let bytes = value.as_bytes();
+    if bytes.len() == 10 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
+        let year = value.get(0..4)?.parse::<i32>().ok()?;
+        let month = value.get(5..7)?.parse::<u8>().ok()?;
+        let day = value.get(8..10)?.parse::<u8>().ok()?;
+        return civil_millis(year, month, day, 0, 0, 0);
+    }
     if bytes.len() < 19
         || bytes.get(4) != Some(&b'-')
         || bytes.get(7) != Some(&b'-')
@@ -140,7 +150,45 @@ pub(crate) fn parse_iso8601_millis(value: &str) -> Option<UnixMillis> {
     let hour = value.get(11..13)?.parse::<u8>().ok()?;
     let minute = value.get(14..16)?.parse::<u8>().ok()?;
     let second = value.get(17..19)?.parse::<u8>().ok()?;
-    civil_millis(year, month, day, hour, minute, second)
+    let utc = civil_millis(year, month, day, hour, minute, second)?;
+    let offset_seconds = parse_utc_offset(value.get(19..)?)?;
+    utc.checked_sub(offset_seconds.checked_mul(1_000)?)
+}
+
+/// Parses the suffix of an ISO instant into an offset east of UTC in seconds.
+fn parse_utc_offset(suffix: &str) -> Option<i64> {
+    if suffix.is_empty() || suffix == "Z" {
+        return Some(0);
+    }
+    let suffix = if let Some(fraction) = suffix.strip_prefix('.') {
+        let end = fraction.find(['Z', '+', '-'])?;
+        &fraction[end..]
+    } else {
+        suffix
+    };
+    let (sign, body) = match suffix.as_bytes().first()? {
+        b'Z' => return Some(0),
+        b'+' => (1_i64, &suffix[1..]),
+        b'-' => (-1_i64, &suffix[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = if body.len() == 5 && body.as_bytes().get(2) == Some(&b':') {
+        (
+            body.get(0..2)?.parse::<i64>().ok()?,
+            body.get(3..5)?.parse::<i64>().ok()?,
+        )
+    } else if body.len() == 4 {
+        (
+            body.get(0..2)?.parse::<i64>().ok()?,
+            body.get(2..4)?.parse::<i64>().ok()?,
+        )
+    } else {
+        return None;
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
 }
 
 /// Parses a `YYYYMMDD-HHMM` instant, the compact form HIP-4 descriptions use.
@@ -209,6 +257,11 @@ mod tests {
             parse_iso8601_millis("2026-11-03T23:59:00Z"),
             Some(1_793_750_340_000)
         );
+        assert_eq!(
+            parse_iso8601_millis("2026-11-04T07:59:00+08:00"),
+            Some(1_793_750_340_000)
+        );
+        assert_eq!(parse_iso8601_millis("2026-11-03"), Some(1_793_664_000_000));
         assert_eq!(parse_iso8601_millis("not-a-date"), None);
     }
 

@@ -48,7 +48,7 @@ use market_participants_model::{
     routing::CapabilityId,
 };
 use smol_str::{SmolStr, format_smolstr};
-use widget::{error::LocalizedError, venue::VenueDisplay};
+use widget::{error::LocalizedError, time_zone::data_time_zone, venue::VenueDisplay};
 use widget_tokio_runtime::global;
 
 use crate::prediction_locale::polymarket_locale;
@@ -122,6 +122,7 @@ pub struct PredictionEventSelector<S: PredictionEventSource> {
     cursor: Option<SmolStr>,
     cursor_stack: Vec<Option<SmolStr>>,
     page_number: u32,
+    navigation_backup: Option<(Option<SmolStr>, Vec<Option<SmolStr>>, u32)>,
     generation: u64,
     search_generation: u64,
     search_input: Entity<InputState>,
@@ -217,6 +218,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
             cursor: None,
             cursor_stack: Vec::new(),
             page_number: 1,
+            navigation_backup: None,
             generation: 0,
             search_generation: 0,
             search_input,
@@ -273,18 +275,26 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         match result {
             Ok(page) => {
                 for category in &page.categories {
-                    if !self
+                    if let Some(known) = self
                         .categories
-                        .iter()
-                        .any(|known| known.key == category.key)
+                        .iter_mut()
+                        .find(|known| known.key == category.key)
                     {
+                        known.label = category.label.clone();
+                    } else {
                         self.categories.push(category.clone());
                     }
                 }
+                self.navigation_backup = None;
                 self.page = Some(page);
                 self.error = None;
             }
             Err(error) => {
+                if let Some((cursor, cursor_stack, page_number)) = self.navigation_backup.take() {
+                    self.cursor = cursor;
+                    self.cursor_stack = cursor_stack;
+                    self.page_number = page_number;
+                }
                 self.error = Some(error);
             }
         }
@@ -297,6 +307,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         }
         self.search = query.to_owned();
         self.search_generation = self.search_generation.wrapping_add(1);
+        self.navigation_backup = None;
         let generation = self.search_generation;
         // The page is stale from the first keystroke: show the loading state while
         // the debounce runs and invalidate any read that is still in flight.
@@ -319,7 +330,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         self.search_task = Some(task);
     }
 
-    fn select_venue(&mut self, venue: VenueId, cx: &mut Context<Self>) {
+    fn select_venue(&mut self, venue: VenueId, window: &mut Window, cx: &mut Context<Self>) {
         if self.venue == venue {
             return;
         }
@@ -329,6 +340,11 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         self.categories.clear();
         self.category = None;
         self.search.clear();
+        self.search_input
+            .update(cx, |input, cx| input.update_value("", window, cx));
+        // A debounce armed for the old venue must not reload the new one.
+        self.cancel_search_debounce();
+        self.navigation_backup = None;
         self.cursor = None;
         self.cursor_stack.clear();
         self.page_number = 1;
@@ -344,6 +360,8 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         if self.category == next {
             return;
         }
+        self.cancel_search_debounce();
+        self.navigation_backup = None;
         self.category = next;
         self.cursor = None;
         self.cursor_stack.clear();
@@ -352,9 +370,18 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
     }
 
     fn next_page(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
         let Some(next) = self.page.as_ref().and_then(|page| page.next_cursor.clone()) else {
             return;
         };
+        self.cancel_search_debounce();
+        self.navigation_backup = Some((
+            self.cursor.clone(),
+            self.cursor_stack.clone(),
+            self.page_number,
+        ));
         self.cursor_stack.push(self.cursor.clone());
         self.cursor = Some(next);
         self.page_number = self.page_number.saturating_add(1);
@@ -362,12 +389,27 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
     }
 
     fn previous_page(&mut self, cx: &mut Context<Self>) {
-        let Some(previous) = self.cursor_stack.pop() else {
+        if self.loading {
+            return;
+        }
+        let Some(previous) = self.cursor_stack.last().cloned() else {
             return;
         };
+        self.cancel_search_debounce();
+        self.navigation_backup = Some((
+            self.cursor.clone(),
+            self.cursor_stack.clone(),
+            self.page_number,
+        ));
+        self.cursor_stack.pop();
         self.cursor = previous;
         self.page_number = self.page_number.saturating_sub(1).max(1);
         self.reload(cx);
+    }
+
+    fn cancel_search_debounce(&mut self) {
+        self.search_task.take();
+        self.search_generation = self.search_generation.wrapping_add(1);
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -398,7 +440,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
         select.on_change({
             let selector = cx.entity();
             let venues = self.venues.clone();
-            move |value, _, app| {
+            move |value, window, app| {
                 let Some(value) = value.as_deref() else {
                     return;
                 };
@@ -411,7 +453,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
                 let Some(venue) = venue else {
                     return;
                 };
-                selector.update(app, |this, cx| this.select_venue(venue, cx));
+                selector.update(app, |this, cx| this.select_venue(venue, window, cx));
             }
         })
     }
@@ -509,7 +551,7 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
                             .small()
                             .child(SharedString::new(card.category.label.clone())),
                     )
-                    .children(card.ends_at.and_then(format_end).map(|end| {
+                    .children(card.ends_at.and_then(|end| format_end(end, cx)).map(|end| {
                         div()
                             .text_xs()
                             .text_color(theme.roles.fg.muted.hsla)
@@ -663,10 +705,15 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
             .child(
                 Button::new("PredictionConfirm")
                     .filled()
-                    .disabled(self.selected.is_none())
-                    .when(self.selected.is_some(), |button| {
-                        button.on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx)))
-                    })
+                    .disabled(self.selected.is_none() || self.selected_title.is_none())
+                    .when(
+                        self.selected.is_some() && self.selected_title.is_some(),
+                        |button| {
+                            button.on_click(
+                                cx.listener(|this, _, window, cx| this.confirm(window, cx)),
+                            )
+                        },
+                    )
                     .child(t!(cx, "common.confirm")),
             )
             .into_any_element()
@@ -778,9 +825,10 @@ fn loaded_prediction_venues(venues: &LoadedVenues) -> Vec<VenueId> {
     loaded
 }
 
-fn format_end(millis: i64) -> Option<String> {
+fn format_end(millis: i64, cx: &App) -> Option<String> {
     let seconds = millis.checked_div(1_000)?;
     let date = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;
+    let date = date.to_offset(data_time_zone(cx));
     Some(format!(
         "{:04}-{:02}-{:02}",
         date.year(),
@@ -1094,14 +1142,14 @@ mod tests {
         let window = cx.add_empty_window();
         let selector = selector(window, SlowSource::default());
 
-        window.update(|_, cx| {
+        window.update(|window, cx| {
             selector.update(cx, |selector, _| {
                 selector
                     .categories
                     .push(PredictionCategory::new("politics", "Politics"));
             });
             selector.update(cx, |selector, cx| {
-                selector.select_venue(VenueId::Hyperliquid, cx)
+                selector.select_venue(VenueId::Hyperliquid, window, cx)
             });
         });
 

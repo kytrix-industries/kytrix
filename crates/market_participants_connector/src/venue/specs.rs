@@ -308,18 +308,6 @@ const HYPERLIQUID_ROUTES: &[RouteSpec] = &[
     },
 ];
 
-/// Everything the built-in Longbridge route declares.
-///
-/// The venue publishes one scope — the US equity market — so the table has one row.
-///
-/// The directory is public: it is the venue operator's own listing file rather than anything
-/// behind the account's credentials. Candlesticks and tickers are authenticated: the venue
-/// serves history, streams and real-time quotes on one authenticated session, so a request
-/// for any of them is honest about needing the venue's credential.
-///
-/// [`CapabilityId::AllTickers`] is deliberately absent: the venue answers a ticker one
-/// listing at a time and has no command for the whole-scope read, so a caller that needs
-/// every listing's ticker in one answer cannot be served by this route.
 /// Everything the Polymarket event scope declares.
 ///
 /// The scope publishes no catalog: its events are read page by page and its legs
@@ -334,6 +322,18 @@ const POLYMARKET_ROUTES: &[RouteSpec] = &[RouteSpec {
     normalization: &[],
 }];
 
+/// Everything the built-in Longbridge route declares.
+///
+/// The venue publishes one scope — the US equity market — so the table has one row.
+///
+/// The directory is public: it is the venue operator's own listing file rather than anything
+/// behind the account's credentials. Candlesticks and tickers are authenticated: the venue
+/// serves history, streams and real-time quotes on one authenticated session, so a request
+/// for any of them is honest about needing the venue's credential.
+///
+/// [`CapabilityId::AllTickers`] is deliberately absent: the venue answers a ticker one
+/// listing at a time and has no command for the whole-scope read, so a caller that needs
+/// every listing's ticker in one answer cannot be served by this route.
 const LONGBRIDGE_ROUTES: &[RouteSpec] = &[RouteSpec {
     scope: LONGBRIDGE_US_SCOPE,
     capabilities: &[
@@ -347,9 +347,9 @@ const LONGBRIDGE_ROUTES: &[RouteSpec] = &[RouteSpec {
 /// Returns the static rows of one venue, in declaration order.
 ///
 /// This is the dispatch from a venue identity to its scope table, and it is total over
-/// [`VenueId`]: the four tables are the four venues the identity carries, so there is no fifth
+/// [`VenueId`]: the five tables are the five venues the identity carries, so there is no sixth
 /// answer for a venue the table happens not to carry. Being total over the identity is the same
-/// set as being served — every one of the four has its row here and its definition in
+/// set as being served — every one of the five has its row here and its definition in
 /// [`crate::venue::definition`] — and a block does not state its own venue, because the block a
 /// venue is answered by is the statement of it.
 fn specs_of(venue: VenueId) -> &'static [RouteSpec] {

@@ -7416,7 +7416,6 @@ dependencies = [
  "market_participants_connector",
  "market_participants_model",
  "serde",
- "serde_json",
  "smol_str",
  "thiserror 2.0.21",
  "time",

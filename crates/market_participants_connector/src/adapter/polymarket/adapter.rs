@@ -99,6 +99,9 @@ const CARD_OPTIONS: usize = 6;
 /// The most markets one CLOB batch history request accepts.
 const CLOB_BATCH_LIMIT: usize = 20;
 
+/// The largest page Gamma's event directories accept.
+const GAMMA_PAGE_LIMIT: u16 = 100;
+
 /// The path the CLOB market channel answers on.
 const MARKET_CHANNEL_PATH: &str = "/ws/market";
 
@@ -132,10 +135,13 @@ impl PolymarketAdapter {
             .filter(|event| {
                 if let Some(parent) = &event.parent_event_id {
                     log::debug!("skipped Polymarket child event {} of {parent}", event.id);
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                if event.title.trim().is_empty() {
+                    log::debug!("skipped Polymarket event {} without a title", event.id);
+                    return false;
+                }
+                true
             })
             .filter_map(|event| match decode_card(&event) {
                 Ok(card) => Some(card),
@@ -184,7 +190,8 @@ impl PolymarketAdapter {
             pairs.append_pair("closed", "false");
             pairs.append_pair("order", "volume24hr");
             pairs.append_pair("ascending", "false");
-            pairs.append_pair("limit", &query.page_size.to_string());
+            let limit = query.page_size.min(GAMMA_PAGE_LIMIT);
+            pairs.append_pair("limit", &limit.to_string());
             if let Some(category) = query.category.as_deref()
                 && let Some((_, _, id, _)) = CATEGORIES.iter().find(|(key, ..)| *key == category)
             {
@@ -216,7 +223,8 @@ impl PolymarketAdapter {
             let mut pairs = url.query_pairs_mut();
             pairs.append_pair("q", search);
             pairs.append_pair("events_status", "active");
-            pairs.append_pair("limit_per_type", &query.page_size.to_string());
+            let limit = query.page_size.min(GAMMA_PAGE_LIMIT);
+            pairs.append_pair("limit_per_type", &limit.to_string());
             pairs.append_pair("page", &page.to_string());
             if let Some(category) = query.category.as_deref()
                 && let Some((_, _, _, slug)) = CATEGORIES.iter().find(|(key, ..)| *key == category)
@@ -229,7 +237,11 @@ impl PolymarketAdapter {
         let total = answer.pagination.and_then(|page| page.total_results);
         let next = has_more.then(|| SmolStr::new(format_smolstr!("{}", page.saturating_add(1))));
         let events = self
-            .localized_events(context, answer.events, query.locale.as_deref())
+            .localized_events(
+                context,
+                answer.events.unwrap_or_default(),
+                query.locale.as_deref(),
+            )
             .await?;
         Ok((events, next, total))
     }
@@ -296,16 +308,35 @@ impl PolymarketAdapter {
         id: &str,
         locale: Option<&str>,
     ) -> Result<Vec<GammaEvent>, MarketParticipantError> {
-        let mut url = endpoint(context.http_metadata(), "events")?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("parent_event_id", id);
-            pairs.append_pair("limit", "100");
-            if let Some(locale) = locale {
-                pairs.append_pair("locale", locale);
+        // Only the keyset directory accepts `parent_event_id`; the plain event
+        // directory would ignore it and return unrelated events.
+        let mut children = Vec::new();
+        let mut cursor: Option<SmolStr> = None;
+        loop {
+            let mut url = endpoint(context.http_metadata(), "events/keyset")?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs.append_pair("parent_event_id", id);
+                pairs.append_pair("include_children", "true");
+                pairs.append_pair("limit", "100");
+                if let Some(cursor) = cursor.as_deref() {
+                    pairs.append_pair("after_cursor", cursor);
+                }
+                if let Some(locale) = locale {
+                    pairs.append_pair("locale", locale);
+                }
             }
+            let page: GammaEventsKeyset = get_json(context, &url).await?;
+            children.extend(page.events);
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            if cursor.as_ref() == Some(&next) {
+                break;
+            }
+            cursor = Some(next);
         }
-        get_json(context, &url).await
+        Ok(children)
     }
 
     async fn event_by_id(
@@ -340,8 +371,12 @@ impl PolymarketAdapter {
         match query.window {
             PredictionWindow::Latest => self.latest(context, &query.legs).await,
             PredictionWindow::History {
-                fidelity_minutes, ..
-            } => self.history(context, &query.legs, fidelity_minutes).await,
+                days,
+                fidelity_minutes,
+            } => {
+                self.history(context, &query.legs, days, fidelity_minutes)
+                    .await
+            }
         }
     }
 
@@ -393,6 +428,7 @@ impl PolymarketAdapter {
         &self,
         context: &ExecutionContext,
         legs: &[PredictionLeg],
+        days: u16,
         fidelity_minutes: u16,
     ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
         let mut series: Vec<PredictionSeries> = legs
@@ -407,11 +443,14 @@ impl PolymarketAdapter {
             .filter_map(|leg| native_asset_id(leg).map(SmolStr::new))
             .collect();
         let url = endpoint(context.http_origin(), "batch-prices-history")?;
+        let window = history_window(days, fidelity_minutes)?;
         for chunk in ids.chunks(CLOB_BATCH_LIMIT) {
             let body = ClobBatchHistoryRequest {
                 markets: chunk,
-                interval: "1m",
-                fidelity: fidelity_minutes,
+                interval: window.interval,
+                fidelity: window.fidelity,
+                start_ts: window.start_ts,
+                end_ts: window.end_ts,
             };
             let answer: ClobBatchHistory = post_json(context, &url, &body).await?;
             for (index, leg) in legs.iter().enumerate() {
@@ -422,19 +461,21 @@ impl PolymarketAdapter {
                     continue;
                 };
                 let converted = series[index].points.clone();
-                series[index].points =
-                    points
-                        .iter()
-                        .filter_map(history_point)
-                        .fold(converted, |mut all, point| {
-                            if all
-                                .last()
-                                .is_none_or(|last| last.timestamp != point.timestamp)
-                            {
-                                all.push(point);
-                            }
-                            all
-                        });
+                series[index].points = points
+                    .iter()
+                    .filter_map(history_point)
+                    // A preset window can reach further back than the caller
+                    // asked for, so the answer is trimmed to the request.
+                    .filter(|point| window.contains(point.timestamp))
+                    .fold(converted, |mut all, point| {
+                        if all
+                            .last()
+                            .is_none_or(|last| last.timestamp != point.timestamp)
+                        {
+                            all.push(point);
+                        }
+                        all
+                    });
             }
         }
         Ok(series)
@@ -720,6 +761,13 @@ fn midpoint(bid: Fraction, ask: Fraction) -> Option<Fraction> {
     Fraction::new(Ratio::from_inner(sum / 2)).ok()
 }
 
+/// Reads the instant a market-channel frame states.
+///
+/// The channel publishes milliseconds. A frame without one is stamped with the
+/// arrival time. A stated instant is raised to the arrival time when it is older:
+/// the chart appends a live point only when it is not older than the history it
+/// was folded into, so a venue clock running behind the CLOB history endpoint
+/// would otherwise silently freeze every line.
 fn frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketParticipantError> {
     let now = now_millis()?;
     Ok(value.map_or(now, |timestamp| timestamp.max(now)))
@@ -885,7 +933,16 @@ fn decode_card(event: &GammaEvent) -> Result<PredictionEventCard, MarketParticip
             .filter_map(|market| best_option(&options, market))
             .collect()
     };
-    options.sort_by_key(|option| std::cmp::Reverse(option.probability));
+    options.sort_by(|left, right| {
+        // An option the venue published no price for sorts after every option
+        // it did price, so a missing quote cannot push a priced option out of
+        // the card's bounded option list.
+        right
+            .probability
+            .is_some()
+            .cmp(&left.probability.is_some())
+            .then_with(|| right.probability.cmp(&left.probability))
+    });
     let total_options = options.len();
     options.truncate(CARD_OPTIONS);
     let remaining_options = total_options.saturating_sub(CARD_OPTIONS);
@@ -954,7 +1011,14 @@ fn decode_view(
     let mut markets = Vec::new();
     let mut options = Vec::new();
     for market in &event.markets {
-        let protocol = protocol_of(market)?;
+        let protocol = match protocol_of(market) {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                // One stale or future market must not hide the rest of an event.
+                log::debug!("skipped a Polymarket market: {error}");
+                continue;
+            }
+        };
         let Some((group, assets, prices)) = market_group(market, &settlement, ends_at, protocol)?
         else {
             continue;
@@ -1050,7 +1114,11 @@ fn decode_view(
     Ok((
         PredictionEventView {
             event: event_ref,
-            title: event.title.clone(),
+            title: if event.title.is_empty() {
+                event.id.clone()
+            } else {
+                event.title.clone()
+            },
             category: category_of(event),
             ends_at,
             markets,
@@ -1075,11 +1143,11 @@ fn market_group(
     let canonical_outcomes = parse_string_array(
         market
             .canonical_outcomes
-            .as_deref()
-            .or(market.outcomes.as_deref()),
+            .as_ref()
+            .or(market.outcomes.as_ref()),
     );
     let outcomes = market_display_outcomes(market);
-    let prices: Vec<Option<Fraction>> = parse_string_array(market.outcome_prices.as_deref())
+    let prices: Vec<Option<Fraction>> = parse_string_array(market.outcome_prices.as_ref())
         .iter()
         .map(|value| probability(value))
         .collect();
@@ -1095,7 +1163,12 @@ fn market_group(
             .map(GammaIdList::values)
             .unwrap_or_default(),
     };
-    if outcomes.is_empty() || ids.is_empty() {
+    if outcomes.is_empty() || ids.is_empty() || outcomes.len() != ids.len() {
+        log::debug!(
+            "skipped a Polymarket market with {} outcomes and {} asset ids",
+            outcomes.len(),
+            ids.len()
+        );
         return Ok(None);
     }
     let condition = market.condition_id.clone();
@@ -1223,15 +1296,15 @@ fn humanize_market_type(kind: &str) -> SmolStr {
 
 fn protocol_of(market: &GammaMarket) -> Result<PolymarketProtocolVersion, MarketParticipantError> {
     match market.version.as_deref() {
-        Some("v1") => Ok(PolymarketProtocolVersion::V1),
+        // Gamma leaves `version` out of the legacy CTF markets. Those markets
+        // are the original v1 protocol, so absence is the v1 answer rather than
+        // a malformed market. A version the venue does publish must be one this
+        // build knows how to address.
+        None | Some("v1") => Ok(PolymarketProtocolVersion::V1),
         Some("v2") => Ok(PolymarketProtocolVersion::V2),
         Some(version) => Err(protocol_error(
             "decode a Polymarket market version",
             format_smolstr!("unsupported market version `{version}`"),
-        )),
-        None => Err(protocol_error(
-            "decode a Polymarket market version",
-            SmolStr::new_static("the market publishes no version"),
         )),
     }
 }
@@ -1243,20 +1316,15 @@ fn is_binary_outcome_set(outcomes: &[SmolStr]) -> bool {
 }
 
 fn market_display_outcomes(market: &GammaMarket) -> Vec<SmolStr> {
-    let mut outcomes = parse_string_array(market.outcomes.as_deref());
+    let mut outcomes = parse_string_array(market.outcomes.as_ref());
     if outcomes.is_empty() {
-        outcomes = parse_string_array(market.canonical_outcomes.as_deref());
+        outcomes = parse_string_array(market.canonical_outcomes.as_ref());
     }
     outcomes
 }
 
-fn parse_string_array(value: Option<&str>) -> Vec<SmolStr> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Vec<String>>(value)
-        .map(|values| values.into_iter().map(SmolStr::new).collect())
-        .unwrap_or_default()
+fn parse_string_array(value: Option<&GammaIdList>) -> Vec<SmolStr> {
+    value.map(GammaIdList::values).unwrap_or_default()
 }
 
 fn native_asset_id(leg: &PredictionLeg) -> Option<&str> {
@@ -1431,6 +1499,84 @@ fn transport_error(
     }
 }
 
+/// One CLOB history request's window.
+///
+/// The endpoint states a window two ways with different ceilings: an explicit
+/// `start_ts`/`end_ts` pair is exact but refused past fifteen days, and an
+/// `interval` preset reaches a month but silently collapses to one month at a
+/// fine `fidelity`. This picks the shape the span can actually be asked with,
+/// and remembers the instant the caller asked from so a preset answer wider than
+/// the request can be trimmed.
+struct HistoryWindow {
+    interval: Option<&'static str>,
+    fidelity: u16,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+    /// The oldest instant the caller asked for, in milliseconds.
+    since: UnixMillis,
+}
+
+impl HistoryWindow {
+    fn contains(&self, timestamp: UnixMillis) -> bool {
+        timestamp >= self.since
+    }
+}
+
+/// The longest span the endpoint accepts as an explicit timestamp pair.
+const CLOB_EXPLICIT_WINDOW_DAYS: u16 = 15;
+
+/// The bucket width the venue serves the whole history at, in minutes.
+///
+/// Below twelve hours the `max` preset silently answers one month instead of the
+/// whole history, so a span past the explicit limit has to be sampled at least
+/// this coarsely to actually reach back that far.
+const CLOB_MAX_PRESET_FIDELITY: u16 = 720;
+
+fn history_window(
+    days: u16,
+    fidelity_minutes: u16,
+) -> Result<HistoryWindow, MarketParticipantError> {
+    let days = days.max(1);
+    let end_ts = now_millis()? / 1_000;
+    let start_ts = end_ts.saturating_sub(i64::from(days) * 86_400);
+    let since = start_ts.saturating_mul(1_000);
+    if days <= CLOB_EXPLICIT_WINDOW_DAYS {
+        return Ok(HistoryWindow {
+            interval: None,
+            fidelity: fidelity_minutes.max(1),
+            start_ts: Some(start_ts),
+            end_ts: Some(end_ts),
+            since,
+        });
+    }
+    let interval = history_interval(days);
+    Ok(HistoryWindow {
+        interval: Some(interval),
+        // The month preset answers a month at any fidelity; only the whole-life
+        // preset needs a coarse bucket to actually reach back that far.
+        fidelity: if interval == "max" {
+            fidelity_minutes.max(CLOB_MAX_PRESET_FIDELITY)
+        } else {
+            fidelity_minutes.max(1)
+        },
+        start_ts: None,
+        end_ts: None,
+        since,
+    })
+}
+
+/// The interval preset one span longer than the explicit limit is asked with.
+///
+/// `1m` here is the venue's one-month window, not one minute: the sample spacing
+/// is `fidelity`, which is a separate field. A span past a month has to be asked
+/// with `max`, which only reaches the whole life at a twelve-hour bucket.
+fn history_interval(days: u16) -> &'static str {
+    match days {
+        0..=30 => "1m",
+        _ => "max",
+    }
+}
+
 fn now_millis() -> Result<UnixMillis, MarketParticipantError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1450,13 +1596,12 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        CATEGORIES, category_of, decode_card, decode_market_frame, decode_view,
+        CATEGORIES, category_of, decode_card, decode_market_frame, decode_view, history_window,
         is_binary_outcome_set, market_type_label, merge_child_events, merge_localized_event,
-        parse_string_array,
+        now_millis, parse_string_array,
     };
-    use crate::{
-        adapter::polymarket::types::{GammaEvent, GammaId, GammaIdList, GammaMarket, GammaTag},
-        error::MarketParticipantError,
+    use crate::adapter::polymarket::types::{
+        GammaEvent, GammaId, GammaIdList, GammaMarket, GammaTag,
     };
 
     #[test]
@@ -1500,16 +1645,56 @@ mod tests {
     }
 
     #[test]
+    fn a_history_window_is_asked_the_way_the_endpoint_accepts_it() {
+        // The endpoint refuses an explicit span past fifteen days.
+        let short = history_window(15, 60).expect("the clock is readable");
+        assert!(short.interval.is_none());
+        assert!(short.start_ts.is_some() && short.end_ts.is_some());
+        assert_eq!(short.fidelity, 60);
+
+        // Past that, the span is stated by the preset and reaches a month.
+        let month = history_window(30, 60).expect("the clock is readable");
+        assert_eq!(month.interval, Some("1m"));
+        assert!(month.start_ts.is_none() && month.end_ts.is_none());
+
+        // A longer span only reaches back at a twelve-hour bucket.
+        let quarter = history_window(90, 60).expect("the clock is readable");
+        assert_eq!(quarter.interval, Some("max"));
+        assert_eq!(quarter.fidelity, 720);
+    }
+
+    #[test]
+    fn a_preset_answer_is_trimmed_to_the_window_that_was_asked_for() {
+        let window = history_window(30, 60).expect("the clock is readable");
+        let now = now_millis().expect("the clock is readable");
+        let requested_from = now - 30 * 86_400_000;
+
+        assert!(window.contains(requested_from + 1));
+        // The request states its bounds in whole seconds, so the trim edge sits
+        // within the second the caller asked from.
+        assert!(!window.contains(requested_from - 2_000));
+    }
+
+    #[test]
     fn a_json_array_string_is_read_as_its_values() {
-        assert_eq!(parse_string_array(Some("[\"Yes\", \"No\"]")), ["Yes", "No"]);
-        assert!(parse_string_array(Some("not json")).is_empty());
+        assert_eq!(
+            parse_string_array(Some(GammaIdList::String("[\"Yes\", \"No\"]".into())).as_ref()),
+            ["Yes", "No"]
+        );
+        assert!(
+            parse_string_array(Some(GammaIdList::String("not json".into())).as_ref()).is_empty()
+        );
     }
 
     #[test]
     fn only_the_canonical_yes_no_set_is_binary() {
-        let yes_no = parse_string_array(Some("[\"Yes\", \"No\"]"));
-        let localized = parse_string_array(Some("[\"是\", \"否\"]"));
-        let teams = parse_string_array(Some("[\"Bears\", \"Seahawks\"]"));
+        let yes_no =
+            parse_string_array(Some(GammaIdList::String("[\"Yes\", \"No\"]".into())).as_ref());
+        let localized =
+            parse_string_array(Some(GammaIdList::String("[\"是\", \"否\"]".into())).as_ref());
+        let teams = parse_string_array(
+            Some(GammaIdList::String("[\"Bears\", \"Seahawks\"]".into())).as_ref(),
+        );
 
         assert!(is_binary_outcome_set(&yes_no));
         assert!(!is_binary_outcome_set(&localized));
@@ -1531,12 +1716,15 @@ mod tests {
 
         assert_eq!(view.title, "一个事件");
         assert_eq!(
-            event.markets[0].canonical_outcomes.as_deref(),
-            Some("[\"Yes\", \"No\"]")
+            event.markets[0]
+                .canonical_outcomes
+                .as_ref()
+                .map(GammaIdList::values),
+            Some(vec!["Yes".into(), "No".into()])
         );
         assert_eq!(
-            event.markets[0].outcomes.as_deref(),
-            Some("[\"是\", \"否\"]")
+            event.markets[0].outcomes.as_ref().map(GammaIdList::values),
+            Some(vec!["是".into(), "否".into()])
         );
         assert_eq!(view.markets[0].label, "十二月三十一日");
         assert_eq!(view.markets[0].question, "会发生吗？");
@@ -1784,27 +1972,28 @@ mod tests {
     }
 
     #[test]
-    fn a_market_without_a_version_is_rejected() {
+    fn a_market_without_a_version_is_a_v1_market() {
         let mut market = binary_market("v1", &["123", "456"]);
         market.version = None;
-        let error = decode_view(&binary_event(market)).expect_err("the market has no version");
+        let (view, _) = decode_view(&binary_event(market)).expect("the market is legacy v1");
 
+        assert_eq!(view.markets.len(), 1);
         assert!(matches!(
-            error,
-            MarketParticipantError::ProtocolError { .. }
+            view.markets[0].legs[0].native,
+            PredictionNativeLeg::Polymarket {
+                protocol: PolymarketProtocolVersion::V1,
+                ..
+            }
         ));
     }
 
     #[test]
-    fn an_unsupported_market_version_is_rejected() {
+    fn an_unsupported_market_version_is_skipped() {
         let mut market = binary_market("v1", &["123", "456"]);
         market.version = Some("v3".into());
-        let error = decode_view(&binary_event(market)).expect_err("the market version is unknown");
+        let (view, _) = decode_view(&binary_event(market)).expect("the event still decodes");
 
-        assert!(matches!(
-            error,
-            MarketParticipantError::ProtocolError { .. }
-        ));
+        assert!(view.markets.is_empty());
     }
 
     #[test]

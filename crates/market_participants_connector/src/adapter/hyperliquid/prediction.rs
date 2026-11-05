@@ -6,7 +6,7 @@
 //! metadata the venue load committed, so an event view never reaches the venue.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -147,7 +147,29 @@ pub(crate) async fn series(
 ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
     match query.window {
         PredictionWindow::Latest => latest(context, &query.legs).await,
-        PredictionWindow::History { days, .. } => history(context, &query.legs, days).await,
+        PredictionWindow::History {
+            days,
+            fidelity_minutes,
+        } => history(context, &query.legs, days, fidelity_minutes).await,
+    }
+}
+
+/// Maps a requested bucket width to one of the venue's candle intervals.
+fn candle_interval(fidelity_minutes: u16) -> SmolStr {
+    match fidelity_minutes {
+        0..=1 => SmolStr::new_static("1m"),
+        2..=3 => SmolStr::new_static("3m"),
+        4..=5 => SmolStr::new_static("5m"),
+        6..=15 => SmolStr::new_static("15m"),
+        16..=30 => SmolStr::new_static("30m"),
+        31..=60 => SmolStr::new_static("1h"),
+        61..=120 => SmolStr::new_static("2h"),
+        121..=240 => SmolStr::new_static("4h"),
+        241..=480 => SmolStr::new_static("8h"),
+        481..=720 => SmolStr::new_static("12h"),
+        721..=1_440 => SmolStr::new_static("1d"),
+        1_441..=4_320 => SmolStr::new_static("3d"),
+        _ => SmolStr::new_static("1w"),
     }
 }
 
@@ -178,9 +200,11 @@ async fn history(
     context: &ExecutionContext,
     legs: &[PredictionLeg],
     days: u16,
+    fidelity_minutes: u16,
 ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
     let end = now_millis()?;
     let start = end.saturating_sub(i64::from(days.max(1)) * 86_400_000);
+    let interval = candle_interval(fidelity_minutes);
     let mut series = Vec::with_capacity(legs.len());
     for leg in legs {
         let Some(encoding) = encoding(leg) else {
@@ -193,7 +217,7 @@ async fn history(
         let request = HyperliquidInfoRequest::CandleSnapshot {
             req: HyperliquidCandleSnapshotRequest {
                 coin: outcome_coin(encoding),
-                interval: SmolStr::new_static("1h"),
+                interval: interval.clone(),
                 start_time: start,
                 end_time: end,
             },
@@ -292,11 +316,31 @@ fn question_view(
     let pairs = description_pairs(&question.description);
     let (title, category) = render_question(meta, question, &pairs);
     let ends_at = deadline_of(&pairs);
-    let settlement = settlement_asset()?;
-    let mut outcome_ids = question.named_outcomes.clone();
-    if !outcome_ids.contains(&question.fallback_outcome) {
+    let settled: BTreeSet<u64> = question.settled_named_outcomes.iter().copied().collect();
+    let mut outcome_ids: Vec<u64> = question
+        .named_outcomes
+        .iter()
+        .copied()
+        .filter(|outcome| !settled.contains(outcome))
+        .collect();
+    if !settled.contains(&question.fallback_outcome)
+        && !outcome_ids.contains(&question.fallback_outcome)
+    {
         outcome_ids.push(question.fallback_outcome);
     }
+    let quote_token = outcome_ids
+        .iter()
+        .find_map(|id| meta.outcomes.iter().find(|outcome| outcome.outcome == *id))
+        .and_then(|outcome| outcome.quote_token.as_deref());
+    let settlement = settlement_asset(quote_token)?;
+    let thresholds: Vec<SmolStr> = pairs
+        .get("priceThresholds")
+        .map(|thresholds| thresholds.split(',').map(SmolStr::new).collect())
+        .unwrap_or_default();
+    let bucket_asset = pairs
+        .get("underlying")
+        .or_else(|| pairs.get("perp"))
+        .map(|asset| asset.as_str());
     let mut members = Vec::with_capacity(outcome_ids.len());
     let mut native_sides = BTreeMap::new();
     let mut used_labels: BTreeMap<SmolStr, usize> = BTreeMap::new();
@@ -304,7 +348,19 @@ fn question_view(
         let Some(outcome) = meta.outcomes.iter().find(|outcome| outcome.outcome == *id) else {
             continue;
         };
-        let mut label = render_outcome_name(meta, outcome, &pairs);
+        let mut label = if *id == question.fallback_outcome {
+            SmolStr::new_static("Other")
+        } else if let Some(index) = question
+            .named_outcomes
+            .iter()
+            .position(|candidate| candidate == id)
+        {
+            bucket_asset
+                .and_then(|asset| bucket_label(asset, &thresholds, index))
+                .unwrap_or_else(|| render_outcome_name(meta, outcome, &pairs))
+        } else {
+            render_outcome_name(meta, outcome, &pairs)
+        };
         let occurrence = used_labels.entry(label.clone()).or_default();
         *occurrence += 1;
         if *occurrence > 1 {
@@ -362,7 +418,8 @@ fn outcome_view(
 ) -> Result<(PredictionEventView, Vec<PredictionOptionCard>), MarketParticipantError> {
     let pairs = description_pairs(&outcome.description);
     let title = render_outcome_name(meta, outcome, &pairs);
-    let category = category_of(meta, &outcome.name);
+    let category =
+        category_from_description(&pairs).unwrap_or_else(|| category_of(meta, &outcome.name));
     let ends_at = deadline_of(&pairs);
     let sides: Vec<SmolStr> = if outcome.side_specs.len() == 2 {
         outcome
@@ -387,7 +444,7 @@ fn outcome_view(
     let group = build_group(
         title.clone(),
         ends_at,
-        settlement_asset()?,
+        settlement_asset(outcome.quote_token.as_deref())?,
         binary(),
         vec![(SmolStr::new_static("Yes"), sides)],
     )?;
@@ -533,8 +590,12 @@ fn categories_of(cards: &[PredictionEventCard]) -> Vec<PredictionCategory> {
     categories.into_values().collect()
 }
 
-fn settlement_asset() -> Result<market_participants_model::asset::AssetId, MarketParticipantError> {
-    super::catalog::token_asset("USDC").map(|terms| terms.asset_id())
+fn settlement_asset(
+    quote_token: Option<&str>,
+) -> Result<market_participants_model::asset::AssetId, MarketParticipantError> {
+    // HIP-4 settles in the outcome's quote token. The live core markets all use
+    // USDC, which is also the fallback when the venue omits the field.
+    super::catalog::token_asset(quote_token.unwrap_or("USDC")).map(|terms| terms.asset_id())
 }
 
 fn description_pairs(description: &str) -> BTreeMap<SmolStr, SmolStr> {
@@ -551,11 +612,17 @@ fn render_question(
     pairs: &BTreeMap<SmolStr, SmolStr>,
 ) -> (SmolStr, PredictionCategory) {
     let template = template_of(meta, &question.name);
-    let title = template
-        .map(|template| render_template(&template.name, pairs))
-        .filter(|title| !title.is_empty())
+    let title = description_title(pairs)
+        .or_else(|| {
+            template
+                .map(|template| render_template(&template.name, pairs))
+                .filter(|title| !title.is_empty())
+        })
         .unwrap_or_else(|| question.name.clone());
-    (truncate_question(title), category_of(meta, &question.name))
+    (
+        truncate_question(title),
+        category_from_description(pairs).unwrap_or_else(|| category_of(meta, &question.name)),
+    )
 }
 
 fn render_outcome_name(
@@ -563,15 +630,24 @@ fn render_outcome_name(
     outcome: &HyperliquidOutcomeSpec,
     pairs: &BTreeMap<SmolStr, SmolStr>,
 ) -> SmolStr {
+    if is_fallback_outcome(outcome) {
+        return SmolStr::new_static("Other");
+    }
     // An outcome's own description carries placeholders the question does not,
     // such as `participant` for a team in a contest. The question's pairs remain
     // the base so a template can still read a shared field from it.
     let mut values = pairs.clone();
-    values.extend(description_pairs(&outcome.description));
+    let own = description_pairs(&outcome.description);
+    values.extend(own.clone());
     let template = template_of(meta, &outcome.name);
-    let name = template
-        .map(|template| render_template(&template.name, &values))
-        .filter(|name| !name.is_empty())
+    // Only the outcome's own description decides a machine-readable title; the
+    // question's `class` describes the question, not each of its members.
+    let name = description_title(&own)
+        .or_else(|| {
+            template
+                .map(|template| render_template(&template.name, &values))
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or_else(|| {
             SmolStr::new(
                 outcome
@@ -581,6 +657,68 @@ fn render_outcome_name(
             )
         });
     truncate_question(name)
+}
+
+/// Whether an outcome is the fallback member of a multi-outcome question.
+fn is_fallback_outcome(outcome: &HyperliquidOutcomeSpec) -> bool {
+    outcome.name == "template fallback" || outcome.description == "other"
+}
+
+/// Renders the machine-readable description the core recurring markets use.
+///
+/// The core `outcomeMeta` entries have no template name: a price-binary outcome
+/// is called `Recurring` and its description carries the asset and target. Using
+/// only the name would collapse every core market into one title and, because a
+/// group identity is derived from that title, into one group identity.
+fn description_title(pairs: &BTreeMap<SmolStr, SmolStr>) -> Option<SmolStr> {
+    let class = pairs.get("class")?.as_str();
+    let asset = pairs
+        .get("underlying")
+        .or_else(|| pairs.get("perp"))
+        .filter(|asset| !asset.is_empty());
+    match class {
+        "priceBinary" => {
+            let asset = asset?;
+            let target = pairs
+                .get("targetPrice")
+                .or_else(|| pairs.get("target"))
+                .filter(|target| !target.is_empty());
+            Some(match target {
+                Some(target) => format_smolstr!("{asset} above {target}"),
+                None => format_smolstr!("{asset} price"),
+            })
+        }
+        "priceBucket" => {
+            let asset = asset?;
+            let thresholds = pairs
+                .get("priceThresholds")
+                .filter(|thresholds| !thresholds.is_empty());
+            Some(match thresholds {
+                Some(thresholds) => format_smolstr!("{asset} buckets {thresholds}"),
+                None => format_smolstr!("{asset} price range"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Names one price-bucket member from the question's ordered thresholds.
+fn bucket_label(asset: &str, thresholds: &[SmolStr], index: usize) -> Option<SmolStr> {
+    let upper = thresholds.get(index);
+    let lower = index.checked_sub(1).and_then(|index| thresholds.get(index));
+    match (lower, upper) {
+        (None, Some(upper)) => Some(format_smolstr!("{asset} < {upper}")),
+        (Some(lower), Some(upper)) => Some(format_smolstr!("{asset} {lower}-{upper}")),
+        (Some(lower), None) => Some(format_smolstr!("{asset} > {lower}")),
+        (None, None) => None,
+    }
+}
+
+fn category_from_description(pairs: &BTreeMap<SmolStr, SmolStr>) -> Option<PredictionCategory> {
+    match pairs.get("class")?.as_str() {
+        "priceBinary" | "priceBucket" => Some(PredictionCategory::new("price", "Price")),
+        _ => None,
+    }
 }
 
 fn render_side_name(
@@ -645,8 +783,9 @@ fn category_of(meta: &OutcomeRouteMeta, template_name: &str) -> PredictionCatego
 }
 
 fn deadline_of(pairs: &BTreeMap<SmolStr, SmolStr>) -> Option<UnixMillis> {
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 8] = [
         "resolutionDeadline",
+        "listingDeadline",
         "scheduledStart",
         "expiry",
         "time",
@@ -897,6 +1036,136 @@ mod tests {
         let pairs = description_pairs("perp:ETH|threshold:2114|time:20261106-0800");
         assert_eq!(pairs.get("perp").map(SmolStr::as_str), Some("ETH"));
         assert_eq!(pairs.get("threshold").map(SmolStr::as_str), Some("2114"));
+    }
+
+    #[test]
+    fn a_core_price_binary_description_names_the_market() {
+        let mut market = outcome(11, "Recurring");
+        market.description = SmolStr::new_static(
+            "class:priceBinary|underlying:BTC|expiry:20261106-0600|targetPrice:80371|period:1d",
+        );
+        let meta = OutcomeRouteMeta {
+            deployer: None,
+            outcomes: vec![market.clone()],
+            questions: Vec::new(),
+            templates: Vec::new(),
+        };
+
+        let (view, _) = outcome_view(&meta, &market).expect("the core outcome decodes");
+
+        assert_eq!(view.title, "BTC above 80371");
+        assert_eq!(view.category.key, "price");
+        assert_eq!(
+            view.ends_at,
+            deadline_of(&description_pairs(&market.description))
+        );
+    }
+
+    #[test]
+    fn a_price_bucket_question_description_names_the_question() {
+        let meta = OutcomeRouteMeta {
+            deployer: None,
+            outcomes: vec![
+                outcome(11, "Recurring Named Outcome"),
+                outcome(22, "Recurring Named Outcome 2"),
+                outcome(33, "Other"),
+            ],
+            questions: Vec::new(),
+            templates: Vec::new(),
+        };
+        let question = HyperliquidOutcomeQuestion {
+            question: 7,
+            name: SmolStr::new_static("Recurring"),
+            description: SmolStr::new_static(
+                "class:priceBucket|underlying:BTC|priceThresholds:80000,90000|expiry:20261106-0600",
+            ),
+            fallback_outcome: 33,
+            named_outcomes: vec![11, 22],
+            settled_named_outcomes: Vec::new(),
+        };
+
+        let (view, _) = question_view(&meta, &question).expect("the price bucket decodes");
+
+        assert_eq!(view.title, "BTC buckets 80000,90000");
+        assert_eq!(view.category.key, "price");
+        let labels: Vec<&str> = view.markets[0]
+            .legs
+            .iter()
+            .map(|leg| leg.label.as_str())
+            .collect();
+        assert!(labels.contains(&"BTC < 80000"));
+        assert!(labels.contains(&"BTC 80000-90000"));
+        assert!(labels.contains(&"Other"));
+    }
+
+    #[test]
+    fn a_template_fallback_is_named_other() {
+        let mut fallback = outcome(33, "template fallback");
+        fallback.description = SmolStr::new_static("other");
+        let meta = OutcomeRouteMeta {
+            deployer: None,
+            outcomes: vec![outcome(11, "Alpha"), fallback],
+            questions: Vec::new(),
+            templates: Vec::new(),
+        };
+        let question = HyperliquidOutcomeQuestion {
+            question: 7,
+            name: SmolStr::new_static("Question"),
+            description: SmolStr::new_static(""),
+            fallback_outcome: 33,
+            named_outcomes: vec![11],
+            settled_named_outcomes: Vec::new(),
+        };
+
+        let (view, _) = question_view(&meta, &question).expect("the fallback decodes");
+
+        assert!(view.markets[0].legs.iter().any(|leg| leg.label == "Other"));
+        assert!(
+            !view.markets[0]
+                .legs
+                .iter()
+                .any(|leg| leg.label == "template fallback")
+        );
+    }
+
+    #[test]
+    fn a_settled_named_outcome_is_not_offered() {
+        let meta = OutcomeRouteMeta {
+            deployer: None,
+            outcomes: vec![
+                outcome(11, "Alpha"),
+                outcome(22, "Beta"),
+                outcome(33, "Other"),
+            ],
+            questions: Vec::new(),
+            templates: Vec::new(),
+        };
+        let question = HyperliquidOutcomeQuestion {
+            question: 7,
+            name: SmolStr::new_static("Question"),
+            description: SmolStr::new_static(""),
+            fallback_outcome: 33,
+            named_outcomes: vec![11, 22],
+            settled_named_outcomes: vec![11],
+        };
+
+        let (view, _) = question_view(&meta, &question).expect("the settled question decodes");
+
+        assert!(!view.markets[0].legs.iter().any(|leg| leg.label == "Alpha"));
+        assert!(view.markets[0].legs.iter().any(|leg| leg.label == "Beta"));
+    }
+
+    #[test]
+    fn a_listing_deadline_is_read_from_the_description() {
+        let pairs = description_pairs("listingDeadline:20270501-0359");
+        assert!(deadline_of(&pairs).is_some());
+    }
+
+    #[test]
+    fn a_history_fidelity_selects_a_matching_candle_interval() {
+        assert_eq!(super::candle_interval(60), "1h");
+        assert_eq!(super::candle_interval(5), "5m");
+        assert_eq!(super::candle_interval(1_440), "1d");
     }
 
     #[test]

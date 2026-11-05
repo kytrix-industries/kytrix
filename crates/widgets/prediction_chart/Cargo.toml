@@ -26,7 +26,6 @@ widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -7,7 +7,15 @@
 //! locale: another event, market, window or language is another chart, and a
 //! message from the previous one is refused by the view.
 
-use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::StreamExt;
 use market_participants_connector::market::{
@@ -46,12 +54,16 @@ pub enum PredictionChartRequest {
         market: Option<PredictionMarketRef>,
         window: PredictionWindow,
         locale: Option<SmolStr>,
+        /// A local stream epoch. Every explicit load increments it, so messages
+        /// from a replaced stream can never be mistaken for the new one's.
+        epoch: u64,
     },
     Retry {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
         window: PredictionWindow,
         locale: Option<SmolStr>,
+        epoch: u64,
     },
 }
 
@@ -63,17 +75,20 @@ impl PredictionChartRequest {
                 market,
                 window,
                 locale,
+                epoch,
             }
             | Self::Retry {
                 event,
                 market,
                 window,
                 locale,
+                epoch,
             } => PredictionChartStreamKey {
                 event: event.clone(),
                 market: market.clone(),
                 window: *window,
                 locale: locale.clone(),
+                epoch: *epoch,
             },
         }
     }
@@ -92,6 +107,8 @@ pub struct PredictionChartStreamKey {
     pub market: Option<PredictionMarketRef>,
     pub window: PredictionWindow,
     pub locale: Option<SmolStr>,
+    /// The view-local generation that produced this request.
+    pub epoch: u64,
 }
 
 /// Where the stream is.
@@ -220,13 +237,21 @@ impl WidgetProtocol for PredictionChartProtocol {
 pub struct PredictionChartService<S = MarketCapability> {
     source: S,
     attempt_timeout: Duration,
+    /// The next snapshot revision this service hands out.
+    ///
+    /// Revisions are service-wide rather than stream-local: replacing a stream
+    /// must never restart at a number the chart is still holding from the stream
+    /// being replaced, or the first snapshot of the new stream would be refused
+    /// as stale.
+    revision: Arc<AtomicU64>,
 }
 
 impl<S> PredictionChartService<S> {
-    pub(crate) const fn new(source: S) -> Self {
+    pub(crate) fn new(source: S) -> Self {
         Self {
             source,
             attempt_timeout: ATTEMPT_TIMEOUT,
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -236,24 +261,39 @@ where
     S: PredictionChartSource,
 {
     async fn run(self, mut context: ServiceContext<PredictionChartProtocol>) {
+        let mut active_key: Option<PredictionChartStreamKey> = None;
         while let Some(request) = context.next_rpc().await {
             let (reply, request) = request.into_parts();
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
             let key = request.key();
+            // The supervisor replaces only the exact key it is given. A chart
+            // follows one event at a time, so a request for another event,
+            // market or locale must retire the previous stream as well.
+            if let Some(previous) = active_key
+                .as_ref()
+                .filter(|previous| *previous != &key)
+                .cloned()
+            {
+                context.cancel_stream(&previous);
+            }
             let source = self.source.clone();
             let attempt_timeout = self.attempt_timeout;
             let stream_key = key.clone();
-            let generation = context.replace_stream(key.clone(), move |publisher| {
-                run_stream(source, stream_key, attempt_timeout, publisher)
+            let revision = Arc::clone(&self.revision);
+            context.replace_stream(key.clone(), move |publisher| {
+                run_stream(source, stream_key, attempt_timeout, revision, publisher)
             });
+            active_key = Some(key.clone());
             if reply
                 .respond(Ok(PredictionChartResponse::StreamStarted))
                 .is_err()
             {
                 context.cancel_stream(&key);
-                let _ = generation;
+                if active_key.as_ref() == Some(&key) {
+                    active_key = None;
+                }
             }
         }
     }
@@ -263,6 +303,7 @@ async fn run_stream<S>(
     source: S,
     key: PredictionChartStreamKey,
     attempt_timeout: Duration,
+    revisions: Arc<AtomicU64>,
     publisher: StreamPublisher<PredictionChartProtocol>,
 ) where
     S: PredictionChartSource,
@@ -373,10 +414,10 @@ async fn run_stream<S>(
         }
     };
 
-    let mut revision = 1_u64;
-    let mut snapshot = PredictionChartSnapshot::new(1, event, market, history);
+    let mut revision = next_revision(&revisions);
+    let mut snapshot = PredictionChartSnapshot::new(revision, event, market, history);
     for update in buffered {
-        revision = revision.saturating_add(1);
+        revision = next_revision(&revisions);
         snapshot = snapshot.with_live(update, revision);
     }
     if publisher
@@ -422,7 +463,7 @@ async fn run_stream<S>(
             }
             update = subscription.recv() => match update {
                 Some(Ok(series)) => {
-                    revision = revision.saturating_add(1);
+                    revision = next_revision(&revisions);
                     snapshot = snapshot.with_live(series, revision);
                     pending = true;
                 }
@@ -481,6 +522,10 @@ fn selected_market(
         .cloned()
 }
 
+fn next_revision(revisions: &AtomicU64) -> u64 {
+    revisions.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+}
+
 async fn publish_status(
     publisher: &StreamPublisher<PredictionChartProtocol>,
     status: PredictionChartStatus,
@@ -501,7 +546,6 @@ async fn publish_failure(
         .await;
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use std::{
@@ -713,6 +757,7 @@ mod tests {
             market: None,
             window: PredictionWindow::default(),
             locale: None,
+            epoch: 1,
         }
     }
 
@@ -902,5 +947,6 @@ mod tests {
         assert_eq!(key.market, None);
         assert_eq!(key.window, PredictionWindow::default());
         assert_eq!(key.locale, None);
+        assert_eq!(key.epoch, 1);
     }
 }

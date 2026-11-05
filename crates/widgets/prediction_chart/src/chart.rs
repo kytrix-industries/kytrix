@@ -13,6 +13,8 @@ use gpui_kit::{
     TextAlign, TextRun, Window, canvas, point, px,
 };
 use market_participants_model::decimal::Fraction;
+use smol_str::format_smolstr;
+use widget::time_zone::data_time_zone;
 
 use crate::model::PredictionChartSnapshot;
 
@@ -64,7 +66,7 @@ fn paint(
         paint_text(
             window,
             cx,
-            format!("{:.0}%", value * 100.0),
+            SharedString::new(format_smolstr!("{:.0}%", value * 100.0)),
             point(bounds.origin.x, y - px(7.0)),
             axis,
             px(LEFT_INSET - 6.0),
@@ -83,7 +85,7 @@ fn paint(
         paint_text(
             window,
             cx,
-            format_timestamp(start),
+            format_timestamp(start, cx),
             point(plot.origin.x, plot.bottom() + px(4.0)),
             axis,
             px(90.0),
@@ -91,7 +93,7 @@ fn paint(
         paint_text(
             window,
             cx,
-            format_timestamp(end),
+            format_timestamp(end, cx),
             point(plot.right() - px(90.0), plot.bottom() + px(4.0)),
             axis,
             px(90.0),
@@ -148,8 +150,8 @@ fn time_range(snapshot: &PredictionChartSnapshot) -> (i64, i64) {
 }
 
 fn time_x(timestamp: i64, start: i64, end: i64, plot: Bounds<Pixels>) -> Pixels {
-    let span = (end - start).max(1) as f32;
-    let fraction = ((timestamp - start) as f32 / span).clamp(0.0, 1.0);
+    let span = end.saturating_sub(start).max(1) as f32;
+    let fraction = (timestamp.saturating_sub(start) as f32 / span).clamp(0.0, 1.0);
     plot.origin.x + plot.size.width * fraction
 }
 
@@ -173,12 +175,11 @@ fn paint_line(window: &mut Window, start: Point<Pixels>, end: Point<Pixels>, col
 fn paint_text(
     window: &mut Window,
     cx: &mut App,
-    text: impl Into<SharedString>,
+    text: SharedString,
     origin: Point<Pixels>,
     color: Hsla,
     width: Pixels,
 ) {
-    let text = text.into();
     let style = window.text_style();
     let line = window.text_system().shape_line(
         text.clone(),
@@ -201,17 +202,18 @@ fn paint_text(
     );
 }
 
-fn format_timestamp(millis: i64) -> String {
+fn format_timestamp(millis: i64, cx: &App) -> SharedString {
     let Some(seconds) = millis.checked_div(1_000) else {
-        return String::new();
+        return SharedString::new_static("");
     };
     let Ok(date) = time::OffsetDateTime::from_unix_timestamp(seconds) else {
-        return String::new();
+        return SharedString::new_static("");
     };
-    format!(
+    let date = date.to_offset(data_time_zone(cx));
+    SharedString::new(format_smolstr!(
         "{:04}-{:02}-{:02}",
         date.year(),
         date.month() as u8,
         date.day()
-    )
+    ))
 }

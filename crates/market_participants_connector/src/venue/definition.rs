@@ -170,7 +170,7 @@ pub fn venues_supporting(capability: CapabilityId) -> Vec<VenueId> {
 /// An entry is served only while an arm of [`definition_of`] answers it, and nothing
 /// else reads this table, so the entry and the arm are the two halves of one fact and
 /// are changed together. Every venue this build carries an identity for is served
-/// here — the four entries and the four arms are the same four — and a venue the
+/// here — the five entries and the five arms are the same five — and a venue the
 /// identity gains before its loader lands is the one that would be carried without an
 /// entry, which is the state this table and [`definition_of`] would have to separate.
 static SERVED: [VenueDefinition; 5] = [
@@ -351,12 +351,10 @@ impl VenueLoader for HyperliquidLoader {
     }
 }
 
-/// Longbridge's scope producer: the one scope the venue publishes.
+/// Polymarket's scope producer: the one event scope the venue publishes.
 ///
-/// The venue's scope set is static — one US-equity route — so there is nothing to
-/// discover: what it publishes is the static table's answer, and the market data
-/// behind those scopes is read through the venue's own authenticated socket rather
-/// than through a second discovery conversation.
+/// The venue's scope set is static — one prediction route — so there is nothing to
+/// discover: what it publishes is the static table's answer.
 struct PolymarketLoader;
 
 impl VenueLoader for PolymarketLoader {
@@ -369,6 +367,12 @@ impl VenueLoader for PolymarketLoader {
     }
 }
 
+/// Longbridge's scope producer: the one scope the venue publishes.
+///
+/// The venue's scope set is static — one US-equity route — so there is nothing to
+/// discover: what it publishes is the static table's answer, and the market data
+/// behind those scopes is read through the venue's own authenticated socket rather
+/// than through a second discovery conversation.
 struct LongbridgeLoader;
 
 impl VenueLoader for LongbridgeLoader {

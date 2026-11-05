@@ -1,13 +1,13 @@
 //! The prediction probability chart pane.
 //!
 //! The pane follows one event and draws one line per option. It loads a bounded
-//! history and then folds a latest reading into it every ten seconds; the event
-//! selector is the header control, and an event that is no longer published puts
-//! the selection back to "nothing chosen" rather than leaving a chart that cannot
-//! be recovered.
+//! history and then follows the venue's live probability stream; the event
+//! selector is the header control, and a venue reload drops the chart it can no
+//! longer vouch for.
 
 use std::sync::Arc;
 
+use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use app_config_provider::{events::LanguageChanged, manager::ConfigManager};
 use base_ui::{
     empty_state::EmptyState,
@@ -35,15 +35,17 @@ use market_participants_model::{
     },
     routing::CapabilityId,
 };
+use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use widget::{
     binding::{WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
-    error::LocalizedError,
+    error::{LocalizedError, market_is_catalog_not_loaded},
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    time_zone::notify_on_data_time_zone_change,
     view::{WidgetHeader, WidgetView},
 };
 use widget_tokio_runtime::global;
@@ -95,6 +97,15 @@ impl LocalizedError for PredictionChartServiceError {
     }
 }
 
+/// The prediction chart persists nothing; the type exists because every widget
+/// carries the schema version its config is stored under.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PredictionChartConfig;
+
+impl WidgetConfig for PredictionChartConfig {
+    const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
+}
+
 /// The prediction probability chart.
 pub struct PredictionChartWidget {
     selection: Option<PredictionEventRef>,
@@ -105,18 +116,21 @@ pub struct PredictionChartWidget {
     recovery: WidgetAction,
     snapshot: Option<Arc<PredictionChartSnapshot>>,
     locale: Option<SmolStr>,
+    /// The local epoch of the stream currently requested.
+    epoch: u64,
     awaiting_market: bool,
     _venues: Subscription,
     _language: Option<Subscription>,
+    _time_zone: Option<Subscription>,
 }
 
 impl WidgetView for PredictionChartWidget {
-    type Config = ();
+    type Config = PredictionChartConfig;
 
     const ID: WidgetId = WidgetId::new_static("kytrix.prediction_chart");
     const DISPLAY_NAME: &'static str = "widget.names.prediction_chart";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &str = "Prediction event probabilities over time";
+    const DESCRIPTION: &'static str = "Prediction event probabilities over time";
     const ICON: Option<&'static str> = Some("widgets/prediction_chart.png");
 
     fn new(
@@ -150,13 +164,8 @@ impl WidgetView for PredictionChartWidget {
         self.locale = cx
             .try_global::<ConfigManager>()
             .and_then(|manager| polymarket_locale(manager.read().language));
+        self.epoch = self.epoch.wrapping_add(1);
         let retry = self.status.is_failed(cx);
-        if let Some(snapshot) = self.snapshot.as_mut() {
-            // A replaced stream numbers its revisions from one. The reading kept
-            // across a retry or a language change belongs to the stream being
-            // replaced, so it must not reject the new stream's first snapshot.
-            Arc::make_mut(snapshot).revision = 0;
-        }
         self.status.report(WidgetState::Connecting, cx);
         let request = if retry {
             PredictionChartRequest::Retry {
@@ -164,6 +173,7 @@ impl WidgetView for PredictionChartWidget {
                 market: self.market.clone(),
                 window: PredictionWindow::default(),
                 locale: self.locale.clone(),
+                epoch: self.epoch,
             }
         } else {
             PredictionChartRequest::Load {
@@ -171,6 +181,7 @@ impl WidgetView for PredictionChartWidget {
                 market: self.market.clone(),
                 window: PredictionWindow::default(),
                 locale: self.locale.clone(),
+                epoch: self.epoch,
             }
         };
         self.binding.call(request, cx, Self::apply_load_result);
@@ -257,9 +268,11 @@ impl PredictionChartWidget {
             recovery,
             snapshot: None,
             locale: None,
+            epoch: 0,
             awaiting_market: false,
             _venues: subscription,
             _language: language_subscription,
+            _time_zone: notify_on_data_time_zone_change(cx),
         }
     }
 
@@ -377,15 +390,22 @@ impl PredictionChartWidget {
                 market: self.market.clone(),
                 window: PredictionWindow::default(),
                 locale: self.locale.clone(),
+                epoch: self.epoch,
             })
     }
 
     fn market_ready(&self, cx: &App) -> bool {
         let venues = cx.global::<MarketParticipantsConnector>().venues();
-        if !Self::listed_venues()
-            .iter()
-            .any(|venue| venues.loaded(venue).is_some())
-        {
+        // A venue being loaded is not enough: Hyperliquid loads its core scopes
+        // even when its outcome metadata published no prediction scope. Gate on
+        // a scope that actually declares the capability the selector reads.
+        if !venues.entries().iter().any(|(route, entry)| {
+            Self::listed_venues().contains(&route.venue)
+                && entry
+                    .capabilities
+                    .iter()
+                    .any(|support| support.capability == CapabilityId::PredictionEvents)
+        }) {
             return false;
         }
         let Some(event) = &self.selection else {
@@ -394,26 +414,23 @@ impl PredictionChartWidget {
         venues.scope(&event.route).is_some()
     }
 
+    /// Reports that the market this chart needs is not loaded.
+    ///
+    /// Only the not-loaded path calls this: a pane with no event selected is
+    /// told to select one by `load` itself.
     fn report_notice(&self, cx: &mut Context<Self>) {
-        if self.awaiting_market {
-            let venues = self
-                .selection
-                .as_ref()
-                .map(|event| vec![event.route.venue])
-                .unwrap_or_else(Self::listed_venues);
-            self.status.report(
-                WidgetState::waiting(Notice::MarketNotLoaded {
-                    venues,
-                    supported: Self::listed_venues(),
-                }),
-                cx,
-            );
-        } else if self.selection.is_none() {
-            self.status.report(
-                WidgetState::waiting(Notice::message("widget.prediction_chart.select_event")),
-                cx,
-            );
-        }
+        let venues = self
+            .selection
+            .as_ref()
+            .map(|event| vec![event.route.venue])
+            .unwrap_or_else(Self::listed_venues);
+        self.status.report(
+            WidgetState::waiting(Notice::MarketNotLoaded {
+                venues,
+                supported: Self::listed_venues(),
+            }),
+            cx,
+        );
     }
 
     fn listed_venues() -> Vec<VenueId> {
@@ -462,6 +479,15 @@ impl PredictionChartWidget {
                 }
             }
             PredictionChartStatus::Failed { error } => {
+                if let PredictionChartFetchError::Market(market) = error
+                    && (market_is_catalog_not_loaded(market) || market.is_venue_not_loaded())
+                {
+                    self.awaiting_market = true;
+                    self.snapshot = None;
+                    self.report_notice(cx);
+                    cx.notify();
+                    return false;
+                }
                 let recovery = self.recovery.clone();
                 self.status.report(
                     WidgetState::failed(
@@ -512,10 +538,21 @@ impl PredictionChartWidget {
             .as_ref()
             .is_some_and(|selection| selection.route.venue == event.venue)
         {
+            // A refresh replaces the catalog generation the stream was opened
+            // against. The old chart cannot be vouched for any more.
+            self.snapshot = None;
             self.load(cx);
+            cx.notify();
             return;
         }
-        if self.awaiting_market && self.market_ready(cx) {
+        if !self.market_ready(cx) {
+            self.awaiting_market = true;
+            self.snapshot = None;
+            self.report_notice(cx);
+            cx.notify();
+            return;
+        }
+        if self.awaiting_market {
             self.load(cx);
         }
     }
