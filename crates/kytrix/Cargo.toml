@@ -36,6 +36,11 @@ widget = { workspace = true }
 widget_gallery_ui = { workspace = true }
 widget_registry = { workspace = true }
 
+# llama.cpp has no supported Windows ARM64 native build in this workspace yet, so
+# the translation dependency is absent there and the app compiles without it.
+[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
+ai_translator = { workspace = true }
+
 [build-dependencies]
 embed-resource = { workspace = true }
 

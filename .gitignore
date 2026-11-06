@@ -1,4 +1,5 @@
 /target
+/models/
 .*
 !.github
 !.gitignore

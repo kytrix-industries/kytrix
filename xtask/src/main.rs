@@ -1,6 +1,6 @@
 mod bump;
 
-use std::{io, process::ExitCode};
+use std::{io, path::PathBuf, process::ExitCode};
 
 use bump::{BumpKind, BumpOutcome, find_repository_root, run};
 use thiserror::Error;
@@ -24,22 +24,29 @@ fn main() -> ExitCode {
 fn run_cli(args: Vec<String>) -> Result<(), CliError> {
     let mut args = args.into_iter();
     let command = args.next().ok_or(CliError::MissingCommand)?;
-    if command != "bump-version" {
-        return Err(CliError::UnknownCommand(command));
+    match command.as_str() {
+        "bump-version" => run_bump(args),
+        command => Err(CliError::UnknownCommand(command.to_owned())),
     }
+}
 
+fn run_bump(mut args: impl Iterator<Item = String>) -> Result<(), CliError> {
     let kind = args.next().ok_or(CliError::MissingKind)?;
     let kind = BumpKind::from_arg(&kind).ok_or(CliError::InvalidKind(kind))?;
     if let Some(extra) = args.next() {
         return Err(CliError::UnexpectedArgument(extra));
     }
 
-    let current_dir = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
-    let root = find_repository_root(&current_dir)?;
+    let root = repository_root()?;
     let outcome = run(&root, kind)?;
     print_outcome(&outcome);
 
     Ok(())
+}
+
+fn repository_root() -> Result<PathBuf, CliError> {
+    let current_dir = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+    Ok(find_repository_root(&current_dir)?)
 }
 
 fn print_outcome(outcome: &BumpOutcome) {
@@ -67,9 +74,9 @@ fn print_usage() {
     println!(concat!(
         "Usage: cargo xtask bump-version <major|minor|patch>\n",
         "\n",
-        "Bumps [workspace.package] version in Cargo.toml and the top-level version\n",
-        "in Packager.toml, and creates release_notes/vX.Y.Z/en.md and zh-CN.md when\n",
-        "the version directory is missing. A version directory that already exists\n",
+        "bump-version bumps [workspace.package] version in Cargo.toml and the top-level\n",
+        "version in Packager.toml, and creates release_notes/vX.Y.Z/en.md and zh-CN.md\n",
+        "when the version directory is missing. A version directory that already exists\n",
         "must hold both files."
     ));
 }

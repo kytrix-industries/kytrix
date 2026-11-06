@@ -134,6 +134,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+          submodules: recursive
 
       # protoc: the git dependency kytrix_proto builds with prost-build, which needs
       # the protoc binary; no runner image ships it (checked against the 2026-10
@@ -154,13 +155,42 @@ jobs:
             protobuf-compiler libfuse2 \
             pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
             libasound2-dev libfreetype-dev libfontconfig1-dev \
-            cmake
-      - name: Install protoc (macos)
+            cmake ninja-build libclang-dev
+          for lib in /usr/lib/llvm-*/lib/libclang.so; do
+            if [ -e "$lib" ]; then
+              echo "LIBCLANG_PATH=$(dirname "$lib")" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+      - name: Install native tools (macos)
         if: startsWith(matrix.os, 'macos')
-        run: brew install protobuf
+        shell: bash
+        run: |
+          brew install protobuf cmake ninja libomp
+          LIBCLANG="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ -e "$LIBCLANG/libclang.dylib" ]; then
+            echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
+          fi
       - name: Install protoc (windows)
         if: startsWith(matrix.os, 'windows')
         run: choco install protoc -y --no-progress
+
+      # The x64 Windows job links the local translation model. Its native build
+      # needs CMake, Ninja, libclang for bindgen, and the MSVC environment.
+      - name: Install native tools (Windows x64)
+        if: matrix.job == 'windows-x64'
+        shell: pwsh
+        run: |
+          choco install cmake ninja llvm -y --no-progress
+          $llvm = 'C:\Program Files\LLVM\bin'
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$llvm" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Set up MSVC (Windows)
+        if: startsWith(matrix.os, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.arch }}
 
       # Native builds only, so no `targets` input: the host target is the one the
       # packager looks for in target/release.

@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod language;
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+mod translation;
 mod windows;
 
 use std::sync::Arc;
@@ -54,6 +56,8 @@ fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, Initiali
     let recovery = config_manager::install(cx);
     language::apply_startup(cx);
     language::install(cx);
+    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    translation::install(cx)?;
     MarketParticipantsConnector::install(cx)?;
     let transport = install_kytrix_service(cx)?;
     let runtime = widget_tokio_runtime::global::try_handle(cx)
@@ -111,6 +115,9 @@ const fn transport_policy() -> TransportPolicy {
 enum InitializationError {
     #[error(transparent)]
     Translations(#[from] i18n::error::types::Error),
+    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    #[error(transparent)]
+    AiTranslation(#[from] ai_translator::error::TranslationError),
     #[error(transparent)]
     TokioRuntime(#[from] widget_tokio_runtime::global::TokioRuntimeError),
     #[error(transparent)]

@@ -1,0 +1,13 @@
+[package]
+name = "ai_translator"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+ai_provider.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

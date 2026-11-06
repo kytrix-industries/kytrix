@@ -1,0 +1,20 @@
+[package]
+name = "llama_sys"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+links = "llama"
+
+[features]
+default = ["openmp"]
+openmp = []
+cuda = []
+vulkan = []
+metal = []
+
+[build-dependencies]
+bindgen.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

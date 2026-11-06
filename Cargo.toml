@@ -1,7 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ai_provider",
+    "crates/ai_translator",
     "crates/kytrix",
+    "crates/llama_sys",
     "crates/base_ui",
     "crates/i18n",
     "crates/network",
@@ -53,6 +56,7 @@ ahash = { version = "0.8.12", features = ["serde"] }
 alloy-primitives = { version = "1.7.3", default-features = false }
 alloy-sol-types = { version = "1.7.3", default-features = false }
 base64 = "0.23.1"
+bindgen = "0.73.2"
 boa_engine = "0.22.0"
 bs58 = "0.5.1"
 bytes = "1.12.1"
@@ -87,6 +91,7 @@ jiff = "0.2.38"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
 kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "fdb7d2b533c7737773aa5e0e7cb254dcc190f64b" }
+llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
 nucleo = "0.5.0"
@@ -123,6 +128,8 @@ yawc = { version = "0.5.0", default-features = false }
 zeroize = "1.9.1"
 
 # Workspace members
+ai_provider = { path = "crates/ai_provider" }
+ai_translator = { path = "crates/ai_translator" }
 app_config = { path = "crates/app_config" }
 app_config_provider = { path = "crates/app_config_provider" }
 base_ui = { path = "crates/base_ui" }
