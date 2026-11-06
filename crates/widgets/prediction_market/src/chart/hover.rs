@@ -17,7 +17,7 @@
 
 use gpui_kit::{Bounds, Pixels, point, px};
 
-use super::geometry::{Sample, ScreenPoint, ValueAxis, y_for_percent};
+use super::geometry::{Sample, ScreenPoint, ValueAxis, y_for_series};
 
 /// The gap between the indicator and the label column it opens.
 pub(crate) const LABEL_GAP: f32 = 8.0;
@@ -92,7 +92,7 @@ pub(crate) fn hover_point(
     let percent = value_at(samples, hovered.timestamp)?;
     Some(ScreenPoint {
         x: hovered.x,
-        y: y_for_percent(percent, axis, plot),
+        y: y_for_series(percent, axis, plot),
     })
 }
 

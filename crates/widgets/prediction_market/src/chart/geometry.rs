@@ -74,6 +74,14 @@ const DAY_MILLIS: i64 = 86_400_000;
 /// inner value is scaled by `1e18`, so a percentage is one `1e16`th of it.
 const PERCENT_SCALE: f64 = 1e16;
 
+/// How far inside the plot a line at 0% or 100% is drawn.
+///
+/// The plot is the content mask of every series, and a stroke centred on its
+/// bottom or top edge leaves only half its width visible: a line at exactly 0%
+/// or 100% reads as missing. The inset is the stroke's half-width plus the
+/// antialiased edge, so both extremes stay visible at the axis.
+const SERIES_EDGE_INSET: f32 = 2.0;
+
 /// The box a chart is drawn in, and the plot inside it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ChartLayout {
@@ -222,6 +230,23 @@ pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Bounds<Pixels>
     plot.bottom() - plot.size.height * ratio as f32
 }
 
+/// The y a series point is drawn at, compressed inside the plot's edges.
+///
+/// The plot is the series' content mask, so a stroke centred on its top or
+/// bottom edge would lose half its width; the line and the hover dot both read
+/// this mapping, which keeps them on the same pixel at every value.
+pub(crate) fn y_for_series(percent: f64, axis: &ValueAxis, plot: Bounds<Pixels>) -> Pixels {
+    let y = y_for_percent(percent, axis, plot);
+    let inset = px(SERIES_EDGE_INSET);
+    if plot.size.height <= inset * 2.0 {
+        return y;
+    }
+    let top = plot.origin.y + inset;
+    let bottom = plot.bottom() - inset;
+    let fraction = (y - plot.origin.y) / plot.size.height;
+    top + (bottom - top) * fraction
+}
+
 /// One sample in domain units: a time and a probability in percentage points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Sample {
@@ -331,7 +356,7 @@ pub(crate) fn decimate(
     let mut drawn_y: Option<Pixels> = None;
     for index in chosen {
         let sample = samples[index];
-        let y = y_for_percent(sample.percent, axis, plot);
+        let y = y_for_series(sample.percent, axis, plot);
         let y = match drawn_y {
             Some(previous) if (y - previous).abs() < px(1.0) => previous,
             _ => y,

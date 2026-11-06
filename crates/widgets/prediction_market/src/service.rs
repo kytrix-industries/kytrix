@@ -493,8 +493,8 @@ async fn run_stream<S>(
     }
 }
 
-/// The market the caller asked for, or the event's headline market, or the
-/// market with the strongest published side.
+/// The market the caller asked for, or an open headline market, or the first
+/// open market the venue published.
 fn selected_market(
     event: &PredictionEventView,
     requested: Option<&PredictionMarketRef>,
@@ -512,20 +512,14 @@ fn selected_market(
         .iter()
         .filter(|market| market.open)
         .find(|market| market.headline)
-        .or_else(|| {
-            event
-                .markets
-                .iter()
-                .filter(|market| market.open)
-                .max_by_key(|market| market.legs.iter().filter_map(|leg| leg.probability).max())
-        })
+        // A grouped event publishes one market per candidate, each with a Yes and
+        // a No side. The venue lists the event's main market first, so a fallback
+        // that ranked sides could only pick an arbitrary candidate: every
+        // candidate's No side is priced near one. The order the venue published
+        // is the one a reader sees on the event page.
+        .or_else(|| event.markets.iter().find(|market| market.open))
         .or_else(|| event.markets.iter().find(|market| market.headline))
-        .or_else(|| {
-            event
-                .markets
-                .iter()
-                .max_by_key(|market| market.legs.iter().filter_map(|leg| leg.probability).max())
-        })
+        .or_else(|| event.markets.first())
         .cloned()
 }
 
@@ -624,6 +618,29 @@ mod tests {
         let selected = selected_market(&view, None).expect("a market is selected");
 
         assert_eq!(selected.market.native_market.as_str(), "headline");
+    }
+
+    #[test]
+    fn a_grouped_event_defaults_to_the_first_open_market_not_the_least_likely_candidate() {
+        let event = event_ref();
+        let (mut main, _) = charted_market(&event, "main");
+        main.headline = false;
+        main.legs[0].probability = Some("0.99".parse().expect("a fraction"));
+        main.legs[1].probability = Some("0.01".parse().expect("a fraction"));
+        let (mut long_shot, _) = charted_market(&event, "long-shot");
+        long_shot.headline = false;
+        long_shot.legs[0].probability = Some("0.001".parse().expect("a fraction"));
+        long_shot.legs[1].probability = Some("0.999".parse().expect("a fraction"));
+        let view = event_with(vec![main, long_shot]);
+
+        let selected = selected_market(&view, None).expect("a market is selected");
+
+        assert_eq!(
+            selected.market.native_market.as_str(),
+            "main",
+            "the venue's first market is the event's main one, not the candidate \
+             whose No side is priced highest"
+        );
     }
 
     #[test]

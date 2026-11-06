@@ -4,7 +4,7 @@
 use gpui_kit::{Bounds, Pixels, point, px, size};
 
 use super::{
-    geometry::{Sample, TimeDomain, ValueAxis, x_for_time, y_for_percent},
+    geometry::{Sample, TimeDomain, ValueAxis, x_for_time, y_for_series},
     hover::{
         LABEL_COLLISION_GAP, LABEL_GAP, LABEL_HEIGHT, LABEL_RIGHT_MARGIN, LabelSide, label_side,
         label_tops, label_x, nearest_timestamp, value_at,
@@ -92,7 +92,7 @@ fn the_hover_point_is_at_the_snapped_x_and_the_step_value() {
         .expect("the series has a value at the hovered time");
 
     assert_eq!(point.x, px(400.0));
-    assert_eq!(point.y, y_for_percent(10.0, &axis, plot()));
+    assert_eq!(point.y, y_for_series(10.0, &axis, plot()));
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
 #[test]
 fn the_box_anchor_is_the_series_point_y() {
     let axis = ValueAxis::new(31.5);
-    let anchor = y_for_percent(26.5, &axis, plot());
+    let anchor = y_for_series(26.5, &axis, plot());
     let tops = label_tops(&[anchor], px(LABEL_HEIGHT), px(1.0), plot());
 
     assert_eq!(tops[0] + px(LABEL_HEIGHT), anchor);

@@ -23,7 +23,7 @@ use smol_str::{SmolStr, format_smolstr};
 
 use super::{
     canvas::{ChartCanvasOptions, ChartPaintCaches, PreparedChart},
-    geometry::{ScreenPoint, y_for_percent},
+    geometry::{ScreenPoint, y_for_percent, y_for_series},
     hover::{
         HoveredSample, LABEL_COLLISION_GAP, LABEL_GAP, LABEL_HEIGHT, dot_bounds, hover_point,
         label_side, label_tops, label_x, value_at,
@@ -553,7 +553,7 @@ fn paint_label_column(
         };
         let text = format_smolstr!("{} {}", series.label, format_percent_one_decimal(percent));
         let width = context.width(text.as_str(), font) + px(LABEL_BOX_CHROME);
-        let anchor = y_for_percent(percent, &prepared.axis, layout.plot);
+        let anchor = y_for_series(percent, &prepared.axis, layout.plot);
         labels.push((series.color, text, width, anchor));
     }
     if labels.is_empty() {

@@ -326,6 +326,29 @@ fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
 }
 
 #[test]
+fn a_line_at_either_axis_edge_stays_inside_the_plot() {
+    let plot = Bounds::new(point(px(8.0), px(18.0)), size(px(880.0), px(900.0)));
+    let samples = [sample(0, 0.0), sample(1_000, 100.0)];
+    let domain = TimeDomain {
+        start: 0,
+        end: 1_000,
+    };
+    let folded = decimate(&samples, domain, &ValueAxis::new(100.0), plot);
+
+    assert_eq!(folded.screen.len(), 2);
+    for point in &folded.screen {
+        assert!(
+            point.y > plot.origin.y && point.y < plot.bottom(),
+            "a stroke at the axis edge is inset so the clip cannot hide it: \
+             {} is not inside {}..{}",
+            point.y,
+            plot.origin.y,
+            plot.bottom()
+        );
+    }
+}
+
+#[test]
 fn a_probability_step_of_a_pixel_or_more_is_still_drawn() {
     let plot = Bounds::new(point(px(8.0), px(18.0)), size(px(880.0), px(900.0)));
     let samples = [sample(0, 99.95), sample(1_000, 99.80)];
