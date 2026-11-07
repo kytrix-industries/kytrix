@@ -17,6 +17,7 @@ use crate::{
     },
     network::{Config as NetworkConfig, NetworkRouteGeneration, NetworkRuntimeGenerations},
     time_zone::DataTimeZone,
+    translation::TranslationConfig,
     workspace::WorkspacesConfig,
 };
 
@@ -109,6 +110,10 @@ pub struct Config {
     /// what a first start looks like.
     #[serde(default)]
     pub workspaces: WorkspacesConfig,
+    /// Where the local translation model is stored. A file without this section has no
+    /// directory, which is what a first start looks like.
+    #[serde(default)]
+    pub translation: TranslationConfig,
     #[serde(skip)]
     network_generations: NetworkRuntimeGenerations,
 }
@@ -125,6 +130,7 @@ impl PartialEq for Config {
             && self.proxy_applications == other.proxy_applications
             && self.venues == other.venues
             && self.workspaces == other.workspaces
+            && self.translation == other.translation
     }
 }
 
@@ -477,7 +483,8 @@ impl Config {
     /// settings type: the runtime generations are not settings, and the
     /// test-support `bindings` of a venue row is not settings either. The
     /// workspaces are not reported because nothing outside their single writer
-    /// reads them.
+    /// reads them, and the translation directory is not reported because the
+    /// translator reads it when it is called.
     ///
     /// The destructuring is exhaustive on purpose: a field added to [`Config`]
     /// is a compile error here until it is classified as reported or ignored.
@@ -496,6 +503,9 @@ impl Config {
             // write must not wake a single subscriber. The field is still named
             // rather than matched with `_`, which the workspace forbids.
             workspaces: WorkspacesConfig { .. },
+            // The translator reads this setting when it is called, so a change
+            // needs no event of its own.
+            translation: TranslationConfig { .. },
             // Generations are runtime identity, not settings: they never take
             // part in a diff (see `PartialEq for Config`).
             network_generations: NetworkRuntimeGenerations { .. },
@@ -575,6 +585,7 @@ impl Default for Config {
             proxy_applications: BTreeMap::new(),
             venues: default_venues(),
             workspaces: WorkspacesConfig::default(),
+            translation: TranslationConfig::default(),
             network_generations: NetworkRuntimeGenerations::default(),
         }
     }
@@ -1219,6 +1230,20 @@ mod tests {
             serde_json::from_value::<Config>(serialized).expect("config should deserialize"),
             config
         );
+    }
+
+    /// A file written before the translation settings existed has no section for them, which
+    /// is the same state as a fresh installation: no model directory is configured.
+    #[test]
+    fn a_file_without_translation_settings_should_decode_as_unconfigured() {
+        let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
+        json.as_object_mut()
+            .expect("config serializes as an object")
+            .remove("translation");
+
+        let decoded: Config = serde_json::from_value(json).expect("the file should decode");
+
+        assert_eq!(decoded.translation.model_directory, None);
     }
 
     /// A venue's row carries exactly the settings its own venue has: no scope

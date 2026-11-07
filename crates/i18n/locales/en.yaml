@@ -1169,6 +1169,13 @@ settings_ui:
     title: About
     version: Version
     version_description: The currently installed application version
+  ai:
+    browse: Browse
+    model_directory: Model directory
+    models: Supported models
+    title: AI
+    translation:
+      title: Translation
   appearance:
     dark: Dark
     language: Language

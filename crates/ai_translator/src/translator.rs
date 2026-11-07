@@ -1,8 +1,7 @@
 //! The translator and the process-wide translator instance.
 
 use std::{
-    env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
@@ -17,11 +16,8 @@ use smol_str::SmolStr;
 
 use crate::{error::TranslationError, language::TargetLanguage, prompt};
 
-/// The model file the translator looks for when no path is configured.
+/// The model file the translator loads from the configured directory.
 pub const MODEL_FILE_NAME: &str = "Hy-MT2-1.8B-Q4_K_M.gguf";
-
-/// Names the model file to use; when set, it is used exactly as given.
-pub const MODEL_PATH_ENV: &str = "KYTRIX_AI_MODEL_PATH";
 
 /// Names the model file the ignored integration test loads.
 pub const TEST_MODEL_ENV: &str = "KYTRIX_AI_TEST_MODEL";
@@ -76,61 +72,59 @@ impl Translator {
 
 /// Translates `content` into `target_lang` through the process-wide translator.
 ///
-/// The model is loaded on first use and reused afterwards; a failed load is not cached,
-/// so the next call tries again. The language is parsed before any model work, which is
-/// what keeps an unknown code from turning into a multi-second model load.
-pub fn translate(target_lang: &str, content: &str) -> Result<String, TranslationError> {
+/// The model is loaded from `model_directory` on first use and reused afterwards; a failed
+/// load is not cached, so the next call tries again. The directory is part of what is cached,
+/// which is what makes a directory the user changed apply to the next translation. The
+/// language is parsed before any model work, which is what keeps an unknown code from
+/// turning into a multi-second model load.
+///
+/// Empty content is answered before a directory is needed, so a build with no model
+/// configured can still prove its translation entry point is usable.
+pub fn translate(
+    model_directory: Option<&Path>,
+    target_lang: &str,
+    content: &str,
+) -> Result<String, TranslationError> {
     let language = parse_language(target_lang)?;
     if content.is_empty() {
         return Ok(String::new());
     }
+    let directory = model_directory.ok_or(TranslationError::ModelDirectoryUnset)?;
 
-    shared_translator()?.translate_parsed(language, content)
+    shared_translator(directory)?.translate_parsed(language, content)
 }
 
-/// The translator shared by every caller of [`translate`].
-static TRANSLATOR: OnceLock<Mutex<Option<Arc<Translator>>>> = OnceLock::new();
+/// The translator shared by every caller of [`translate`], with the directory it was loaded
+/// from.
+static TRANSLATOR: OnceLock<Mutex<Option<(PathBuf, Arc<Translator>)>>> = OnceLock::new();
 
-/// Returns the shared translator, loading it on first use.
+/// Returns the translator for `directory`, loading it when the cached model came from another
+/// directory.
 ///
-/// The lock is held only for the one-time initialization: callers clone the `Arc` and
-/// translate outside it, so concurrent translations do not queue on the mutex (the engine
-/// serializes them itself). A failed initialization leaves the slot empty.
-fn shared_translator() -> Result<Arc<Translator>, TranslationError> {
+/// The lock is held while the model loads, as it was when there was one model: callers clone
+/// the `Arc` and translate outside it, so concurrent translations do not queue on the mutex
+/// (the engine serializes them itself). The directory is part of what is cached, so a session
+/// that changes it gets the model from the new directory without a restart; a failed load
+/// leaves the slot empty, so the next call tries again.
+fn shared_translator(directory: &Path) -> Result<Arc<Translator>, TranslationError> {
     let slot = TRANSLATOR.get_or_init(|| Mutex::new(None));
     let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(translator) = cached.as_ref() {
+    if let Some((cached_directory, translator)) = cached.as_ref()
+        && cached_directory.as_path() == directory
+    {
         return Ok(Arc::clone(translator));
     }
 
-    let translator = Arc::new(Translator::new(resolve_model_path()?)?);
-    *cached = Some(Arc::clone(&translator));
-    Ok(translator)
-}
-
-/// Finds the model file to load.
-///
-/// `KYTRIX_AI_MODEL_PATH` wins outright and is used exactly as given. Otherwise the
-/// default location under the working directory and next to the executable are tried, in
-/// that order, and the first one that is a regular file wins.
-fn resolve_model_path() -> Result<PathBuf, TranslationError> {
-    if let Some(path) = env::var_os(MODEL_PATH_ENV) {
-        return Ok(PathBuf::from(path));
-    }
-
-    let mut searched = Vec::with_capacity(2);
-    if let Ok(directory) = env::current_dir() {
-        searched.push(directory.join("models").join(MODEL_FILE_NAME));
-    }
-    if let Ok(executable) = env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        searched.push(directory.join("models").join(MODEL_FILE_NAME));
-    }
-
-    match searched.iter().find(|path| path.is_file()) {
-        Some(path) => Ok(path.clone()),
-        None => Err(TranslationError::ModelNotFound { searched }),
+    match Translator::new(directory.join(MODEL_FILE_NAME)) {
+        Ok(translator) => {
+            let translator = Arc::new(translator);
+            *cached = Some((directory.to_path_buf(), Arc::clone(&translator)));
+            Ok(translator)
+        }
+        Err(error) => {
+            *cached = None;
+            Err(error)
+        }
     }
 }
 
@@ -162,7 +156,11 @@ fn parse_language(code: &str) -> Result<TargetLanguage, TranslationError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sampling_params, translate};
+    use std::path::PathBuf;
+
+    use ai_provider::error::ProviderError;
+
+    use super::{MODEL_FILE_NAME, sampling_params, translate};
     use crate::{error::TranslationError, language::TargetLanguage};
 
     #[test]
@@ -184,7 +182,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_language_fails_before_any_model_work() {
-        let error = translate("xx", "Hello, world!").expect_err("xx is not a model code");
+        let error = translate(None, "xx", "Hello, world!").expect_err("xx is not a model code");
 
         assert!(matches!(
             error,
@@ -194,7 +192,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_language_fails_even_for_empty_content() {
-        let error = translate("xx", "").expect_err("the language is checked first");
+        let error = translate(None, "xx", "").expect_err("the language is checked first");
 
         assert!(matches!(
             error,
@@ -203,18 +201,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_content_is_answered_without_a_model() {
+    fn empty_content_is_answered_without_a_model_directory() {
         assert_eq!(
-            translate("en", "").expect("empty content must not need a model"),
+            translate(None, "en", "").expect("empty content must not need a directory"),
             ""
         );
+    }
+
+    #[test]
+    fn content_needs_a_configured_model_directory() {
+        let error = translate(None, "en", "Hello").expect_err("no directory is configured");
+
+        assert!(matches!(error, TranslationError::ModelDirectoryUnset));
     }
 
     #[test]
     fn every_table_code_is_accepted_before_a_model_is_needed() {
         for language in TargetLanguage::all() {
             assert_eq!(
-                translate(language.code(), "").expect("every table code is valid"),
+                translate(None, language.code(), "").expect("every table code is valid"),
                 ""
             );
         }
@@ -223,8 +228,25 @@ mod tests {
     #[test]
     fn language_codes_are_matched_case_insensitively() {
         assert_eq!(
-            translate("ZH-HANT", "").expect("codes are case-insensitive"),
+            translate(None, "ZH-HANT", "").expect("codes are case-insensitive"),
             ""
         );
+    }
+
+    /// The directory the caller names is the whole of where the model is looked for: the file
+    /// is the one the settings page's models list is loaded from, and no other location is
+    /// consulted.
+    #[test]
+    fn a_configured_directory_is_where_the_model_file_is_looked_for() {
+        let directory = PathBuf::from("no-such-translation-model-directory");
+        let error =
+            translate(Some(&directory), "en", "Hello").expect_err("the model file is missing");
+
+        match error {
+            TranslationError::Provider(ProviderError::ModelFileMissing { path }) => {
+                assert_eq!(path, directory.join(MODEL_FILE_NAME));
+            }
+            other => panic!("expected a missing model file, got {other:?}"),
+        }
     }
 }

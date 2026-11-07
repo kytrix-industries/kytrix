@@ -1169,6 +1169,13 @@ settings_ui:
     title: 关于
     version: 版本
     version_description: 当前安装的应用程序版本
+  ai:
+    browse: 浏览
+    model_directory: 模型存放目录
+    models: 当前支持的模型
+    title: AI
+    translation:
+      title: 翻译
   appearance:
     dark: 深色
     language: 语言

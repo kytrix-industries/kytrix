@@ -29,6 +29,7 @@ pub struct InputStateBuilder {
     default_value: Option<SharedString>,
     placeholder: Option<SharedString>,
     input_mask_type: Option<InputMaskType>,
+    readonly: bool,
 }
 
 impl InputStateBuilder {
@@ -38,6 +39,7 @@ impl InputStateBuilder {
             default_value: None,
             placeholder: None,
             input_mask_type: None,
+            readonly: false,
         }
     }
 
@@ -56,6 +58,12 @@ impl InputStateBuilder {
         self
     }
 
+    /// Draws the value without letting the user edit it.
+    pub fn readonly(mut self) -> Self {
+        self.readonly = true;
+        self
+    }
+
     pub fn currency(mut self, fraction: usize) -> Self {
         self.input_mask_type = Some(InputMaskType::Currency { fraction });
         self
@@ -67,6 +75,7 @@ impl InputStateBuilder {
             default_value,
             placeholder,
             input_mask_type,
+            readonly,
         } = self;
 
         let base = cx.new(|cx| {
@@ -74,6 +83,10 @@ impl InputStateBuilder {
 
             if let Some(default_value) = default_value {
                 base = base.default_value(default_value);
+            }
+
+            if readonly {
+                base.set_readonly(true, cx);
             }
 
             if let Some(placeholder) = placeholder {

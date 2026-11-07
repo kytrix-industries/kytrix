@@ -1,6 +1,4 @@
-//! Errors produced while resolving a model and translating content.
-
-use std::path::PathBuf;
+//! Errors produced while loading a model and translating content.
 
 use ai_provider::error::ProviderError;
 use smol_str::SmolStr;
@@ -15,9 +13,9 @@ pub enum TranslationError {
     /// The content and the requested output do not fit in the model's context.
     #[error("the request needs {tokens} prompt tokens and only {limit} are available for them")]
     ContentTooLong { tokens: usize, limit: usize },
-    /// No model file was found in any of the searched locations.
-    #[error("no model file found in any of {searched:?}")]
-    ModelNotFound { searched: Vec<PathBuf> },
+    /// No directory has been configured to load the model from.
+    #[error("no translation model directory is configured")]
+    ModelDirectoryUnset,
     /// The inference engine failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -40,11 +38,12 @@ mod tests {
         );
         assert!(unsupported.source().is_none());
 
-        let missing = TranslationError::ModelNotFound {
-            searched: vec![PathBuf::from("models/model.gguf")],
-        };
-        assert!(missing.to_string().contains("models/model.gguf"));
-        assert!(missing.source().is_none());
+        let unset = TranslationError::ModelDirectoryUnset;
+        assert_eq!(
+            unset.to_string(),
+            "no translation model directory is configured"
+        );
+        assert!(unset.source().is_none());
     }
 
     #[test]

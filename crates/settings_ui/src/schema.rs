@@ -1,11 +1,12 @@
 //! Every page and field the settings offer, written out.
 //!
-//! The static pages are declarations. The two proxy pages and the venue pages are built from
-//! the build's static venue list and from the stored configuration — see
-//! [`crate::entry::show_settings`]: a venue this build speaks has its line, its origins and its
-//! credentials whether or not anything is loaded, because configuring them is what makes loading
-//! a venue possible at all. The scope rows of one venue's page are the scopes its own stored
-//! configuration names, and the origins of each are read and written there.
+//! The static pages are declarations. The translation page is one of them, though it draws
+//! itself rather than fields; the two proxy pages and the venue pages are built from the build's
+//! static venue list and from the stored configuration — see [`crate::entry::show_settings`]: a
+//! venue this build speaks has its line, its origins and its credentials whether or not anything
+//! is loaded, because configuring them is what makes loading a venue possible at all. The scope
+//! rows of one venue's page are the scopes its own stored configuration names, and the origins
+//! of each are read and written there.
 //!
 //! A built page carries the identity its controls stand for: one proxy row is one venue, one
 //! credential field is one field of the shape that venue's stored credentials hold, and one
@@ -55,6 +56,7 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
     let mut pages = vec![
         appearance_page(),
         time_zone_page(),
+        translation_page(),
         management_page(),
         applications_page(venues),
     ];
@@ -70,6 +72,14 @@ pub(crate) fn catalog(venues: &VenueView) -> (Vec<TreeNodeDef>, Vec<PageDef>) {
                 TreeNodeDef::Page(SharedString::new_static("appearance")),
                 TreeNodeDef::Page(SharedString::new_static("time-zone")),
             ],
+        },
+        TreeNodeDef::Group {
+            id: "ai",
+            label: text("settings_ui.ai.title"),
+            keywords: &["ai", "人工智能", "翻译", "translation", "model", "模型"],
+            children: vec![TreeNodeDef::Page(SharedString::new_static(
+                "ai.translation",
+            ))],
         },
         TreeNodeDef::Group {
             id: "proxy",
@@ -311,6 +321,42 @@ fn time_zone_set(config: &mut Config, value: &FieldValue) {
         return;
     };
     config.data_time_zone = zone;
+}
+
+// --- translation ------------------------------------------------------------------------
+
+/// The translation page, which is a view of its own rather than a page of fields: it lists the
+/// models this build supports and lets the user choose the directory they are loaded from.
+///
+/// The declaration here is the page and the words a search reaches it by; what it draws is
+/// [`crate::translation::TranslationPage`].
+fn translation_page() -> PageDef {
+    PageDef {
+        id: SharedString::new_static("ai.translation"),
+        title: PageTitle::Key(text("settings_ui.ai.translation.title")),
+        keywords: &[
+            "translation",
+            "translate",
+            "翻译",
+            "llama",
+            "llama.cpp",
+            "model",
+            "models",
+            "模型",
+            "当前支持的模型",
+            "模型存放目录",
+            "model directory",
+            "browse",
+            "浏览",
+            "hy-mt2",
+            "hy mt2",
+            "hy-mt2-1.8b-gguf",
+            "hy-mt2-1.8b-2bit-gguf",
+            "hy-mt2-1.8b-1.25bit-gguf",
+            "hy-mt2-7b-gguf",
+        ],
+        sections: Vec::new(),
+    }
 }
 
 fn appearance_page() -> PageDef {
@@ -1706,7 +1752,7 @@ pub(crate) mod tests {
     /// locale, and a locale's key would look like an orphan the crate does not draw. Nothing ties
     /// it to the directory, so a source added to this crate has to be added here too — which is
     /// what [`every_settings_source_should_be_read_by_the_key_guard`] is for.
-    const SETTINGS_SOURCES: [(&str, &str); 12] = [
+    const SETTINGS_SOURCES: [(&str, &str); 13] = [
         ("access.rs", include_str!("access.rs")),
         ("appearance.rs", include_str!("appearance.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
@@ -1719,6 +1765,7 @@ pub(crate) mod tests {
         ("schema.rs", include_str!("schema.rs")),
         ("search.rs", include_str!("search.rs")),
         ("table.rs", include_str!("table.rs")),
+        ("translation.rs", include_str!("translation.rs")),
     ];
 
     /// The half of one source that names the settings: everything above the test module it
@@ -2325,6 +2372,39 @@ pub(crate) mod tests {
         assert!(
             catalog.page("time-zone").is_some(),
             "the time zone page is built"
+        );
+    }
+
+    /// The AI group sits between the general settings and the proxies, and holds the
+    /// translation page — the one page under it today.
+    #[test]
+    fn the_ai_group_should_hold_the_translation_page() {
+        let catalog = catalog_of();
+        let ids = catalog.tree.iter().map(TreeNodeDef::id).collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            ["general", "ai", "proxy", "market_participants", "about"],
+            "the AI group follows the general settings and precedes the proxies"
+        );
+        let ai = catalog
+            .tree
+            .iter()
+            .find(|node| node.id() == "ai")
+            .expect("the settings should offer an AI group");
+        let TreeNodeDef::Group { children, .. } = ai else {
+            panic!("AI is a group");
+        };
+        assert_eq!(
+            children.iter().map(TreeNodeDef::id).collect::<Vec<_>>(),
+            ["ai.translation"],
+            "the AI group holds the translation page"
+        );
+
+        let page = page(&catalog, "ai.translation");
+        assert!(
+            page.sections.is_empty(),
+            "the translation page is drawn by its own view rather than by fields"
         );
     }
 

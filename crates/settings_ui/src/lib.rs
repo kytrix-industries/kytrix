@@ -19,6 +19,7 @@ mod page;
 mod schema;
 mod search;
 mod table;
+mod translation;
 
 pub mod appearance;
 pub mod entry;

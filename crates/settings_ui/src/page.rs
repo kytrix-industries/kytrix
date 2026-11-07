@@ -33,15 +33,16 @@ use i18n::t;
 
 use crate::{
     access::{FieldValue, PROXY_DIRECT, PROXY_INHERIT, PROXY_MIXED, PROXY_SYSTEM},
-    catalog::{FieldAccess, FieldDef, PageDef, SelectOptionDef, Text},
+    catalog::{FieldAccess, FieldDef, PageDef, SelectOptionDef},
     dialog::SettingsDialog,
     search::SearchFilter,
 };
 
 /// The page drawn behind one tree entry, or `None` for a page that has nothing to draw.
 ///
-/// A page with no sections is drawn by something else — the proxy catalog is a table of its
-/// own — so what it says here is that nothing is drawn from the declaration.
+/// A page with no sections is drawn by something else — the proxy catalog is a table of its own
+/// and the translation page is a view of its own — so what it says here is that nothing is drawn
+/// from the declaration.
 ///
 /// The scroll position is handed in rather than read back from the dialog: a page is drawn
 /// while the dialog is being rendered, and the dialog cannot be read from inside its own
@@ -100,7 +101,7 @@ fn page_scroll(
             content = content.child(Separator::horizontal());
         }
         if let Some(title) = section.title.as_ref() {
-            content = content.child(section_title(title, cx));
+            content = content.child(section_title(title.label(cx), cx));
         }
         for field in fields {
             visible += 1;
@@ -356,12 +357,12 @@ fn field_element_id(prefix: &'static str, field_id: &SharedString) -> ElementId 
 }
 
 /// The heading of one section.
-fn section_title(title: &Text, cx: &App) -> AnyElement {
+pub(crate) fn section_title(title: SharedString, cx: &App) -> AnyElement {
     div()
         .pt_1()
         .text_sm()
         .font_weight(gpui_kit::FontWeight::MEDIUM)
         .text_color(cx.theme().roles.fg.default.hsla)
-        .child(title.label(cx))
+        .child(title)
         .into_any_element()
 }

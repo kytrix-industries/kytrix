@@ -8,7 +8,7 @@
 //! workspace layout is persisted — and confirming must not undo it. Replaying the edits onto
 //! the settings of that moment keeps every field the user did not touch at its latest value.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use app_config::{network::ProxyConfig, settings::Config};
 use gpui_kit::Context;
@@ -23,6 +23,8 @@ pub(crate) enum SettingsEdit {
         access: FieldAccess,
         value: FieldValue,
     },
+    /// The directory the local translation model is loaded from.
+    TranslationModelDirectory { directory: PathBuf },
     /// One entry added to the proxy catalog.
     AddProxy { name: SmolStr, proxy: ProxyConfig },
     /// One entry renamed and rewritten, together with every route bound to its name.
@@ -40,6 +42,9 @@ impl SettingsEdit {
     pub(crate) fn apply(&self, config: &mut Config) {
         match self {
             Self::Field { access, value } => access.write(config, value),
+            Self::TranslationModelDirectory { directory } => {
+                config.translation.model_directory = Some(directory.clone());
+            }
             Self::AddProxy { name, proxy } => {
                 config.proxies.insert(name.clone(), proxy.clone());
             }
@@ -116,6 +121,8 @@ impl SettingsDraft {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use app_config::{
         network::{
             KytrixServiceCapability, ProxyAuthorizationConfig, ProxyConfig, ProxyRoute,
@@ -208,6 +215,22 @@ mod tests {
         assert_eq!(applied.language, Language::ZhCn);
         assert_eq!(applied.avatar, current.avatar);
         assert_eq!(applied.account, current.account);
+    }
+
+    /// Choosing a translation directory changes that setting and nothing else.
+    #[test]
+    fn a_translation_directory_edit_should_change_only_that_setting() {
+        let directory = PathBuf::from("models");
+        let mut draft = SettingsDraft::new(Config::default());
+        draft.edits.push(SettingsEdit::TranslationModelDirectory {
+            directory: directory.clone(),
+        });
+
+        let applied = draft.applied_to(&Config::default());
+
+        assert_eq!(applied.translation.model_directory, Some(directory));
+        assert_eq!(applied.language, Config::default().language);
+        assert!(applied.proxies.is_empty());
     }
 
     /// The same draft lands the same way on whatever the settings are at the moment it is

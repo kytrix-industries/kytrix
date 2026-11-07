@@ -25,12 +25,13 @@
 //! the search is answered over, the placeholder of a field built before — does not, so it is
 //! built again when the language moves on — see [`SettingsDialog::adopt_language`].
 //!
-//! The proxy catalog is a view of its own rather than a page of fields, and the form that
-//! changes it is a dialog on the same window layer, drawn over this dialog. A row cannot open one
-//! itself — a table cell is drawn without a window — so it records the form it wants and this
-//! dialog opens it on the layer. The form writes the same draft, because it is one session
-//! either way. Deleting a row is the one request that is put to the user before it is recorded,
-//! and the alert it is put to is opened the same way — see [`SettingsDialog::open_requested_form`].
+//! The proxy catalog and the translation page are views of their own rather than pages of
+//! fields. The form that changes the proxy catalog is a dialog on the same window layer, drawn
+//! over this dialog. A row cannot open one itself — a table cell is drawn without a window — so
+//! it records the form it wants and this dialog opens it on the layer. The form writes the same
+//! draft, because it is one session either way. Deleting a row is the one request that is put to
+//! the user before it is recorded, and the alert it is put to is opened the same way — see
+//! [`SettingsDialog::open_requested_form`].
 
 use std::borrow::BorrowMut as _;
 
@@ -65,6 +66,7 @@ use crate::{
     page,
     search::{FieldSearch, PageSearch, SearchFilter, SearchNode},
     table::{ProxyRequest, ProxyTable},
+    translation::TranslationPage,
 };
 
 /// The size of the panel the dialog draws.
@@ -130,6 +132,7 @@ pub(crate) struct SettingsDialog {
     inputs: Vec<FieldInput>,
     page_scroll: ScrollHandle,
     proxies: Entity<ProxyTable>,
+    translation: Entity<TranslationPage>,
     /// Held because the subscription is what answers the search: dropping it would leave a
     /// field that is typed into and never searched by.
     search_events: Option<Subscription>,
@@ -173,6 +176,7 @@ impl SettingsDialog {
     fn build(draft: Entity<SettingsDraft>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
         let proxies = cx.new(|cx| ProxyTable::new(draft.clone(), cx));
+        let translation = cx.new(|_| TranslationPage::new(draft.clone()));
 
         Self {
             draft,
@@ -188,6 +192,7 @@ impl SettingsDialog {
             inputs: Vec::new(),
             page_scroll: ScrollHandle::new(),
             proxies,
+            translation,
             search_events: None,
         }
     }
@@ -653,9 +658,15 @@ impl Render for SettingsDialog {
             .filter(|page| page_is_reachable(page, &self.filter))
             .cloned();
         let page = match selected {
-            // A page with no fields of its own is drawn by the view that owns it, which for
-            // the proxy catalog is a table that reads the draft itself.
-            Some(page_def) if page_def.sections.is_empty() => div()
+            // These two pages carry no fields of the catalog: each is drawn by the view that
+            // owns it, and both read the draft rather than the saved settings.
+            Some(page_def) if page_def.id.as_ref() == "ai.translation" => div()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(self.translation.clone())
+                .into_any_element(),
+            Some(page_def) if page_def.id.as_ref() == "proxy-management" => div()
                 .size_full()
                 .min_w_0()
                 .min_h_0()
@@ -2579,6 +2590,158 @@ mod tests {
             "market_participants.okx",
             "the row that was clicked should be the page that is drawn"
         );
+    }
+
+    /// The AI group sits between the general settings and the proxies, and its one page is the
+    /// translation page.
+    #[gpui_kit::test]
+    fn the_ai_group_should_open_the_translation_page(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
+
+        assert_eq!(
+            labels(&panel, cx).into_iter().take(6).collect::<Vec<_>>(),
+            [
+                SharedString::new_static("General"),
+                SharedString::new_static("Appearance"),
+                SharedString::new_static("Data time zone"),
+                SharedString::new_static("AI"),
+                SharedString::new_static("Translation"),
+                SharedString::new_static("Proxies"),
+            ],
+            "the AI group follows the general settings and precedes the proxies"
+        );
+
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+
+        assert_eq!(current_page(&panel, cx), "ai.translation");
+    }
+
+    /// The translation page draws its heading, the models this build supports, and the directory
+    /// row in that order.
+    #[gpui_kit::test]
+    fn the_translation_page_should_draw_its_models_and_directory_row(cx: &mut TestAppContext) {
+        let (_panel, cx) = settings(configured_settings(), cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+
+        for selector in [
+            "SETTINGS_AI_PAGE",
+            "SETTINGS_AI_LLAMA_CPP",
+            "SETTINGS_AI_MODELS",
+            "SETTINGS_AI_MODEL_0",
+            "SETTINGS_AI_MODEL_1",
+            "SETTINGS_AI_MODEL_2",
+            "SETTINGS_AI_MODEL_3",
+            "SETTINGS_AI_DIRECTORY",
+            "SETTINGS_AI_DIRECTORY_INPUT",
+            "SETTINGS_AI_BROWSE",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "the page should draw {selector}"
+            );
+        }
+
+        let heading = cx
+            .debug_bounds("SETTINGS_AI_LLAMA_CPP")
+            .expect("the heading should be drawn");
+        let models = cx
+            .debug_bounds("SETTINGS_AI_MODELS")
+            .expect("the model list should be drawn");
+        let directory = cx
+            .debug_bounds("SETTINGS_AI_DIRECTORY")
+            .expect("the directory row should be drawn");
+
+        assert!(heading.bottom() <= models.top());
+        assert!(models.bottom() <= directory.top());
+    }
+
+    /// The system folder picker is what writes the directory field, and confirming the dialog is
+    /// what stores the directory the user chose.
+    #[gpui_kit::test]
+    fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let directory = tempfile::tempdir().expect("the test directory should build");
+
+        click(cx, "SETTINGS_AI_BROWSE");
+        assert!(
+            cx.did_prompt_for_paths(),
+            "the browse button should open the system folder prompt"
+        );
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files, "the prompt should not offer files");
+            assert!(options.directories, "the prompt should offer directories");
+            assert!(!options.multiple, "one directory is enough");
+            Some(vec![directory.path().to_path_buf()])
+        });
+        settle(cx);
+
+        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
+        assert_eq!(
+            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
+                dialog.translation.read(cx).shown_directory(cx)
+            })),
+            Some(expected),
+            "the field should show the chosen directory"
+        );
+
+        click(cx, "SETTINGS_CONFIRM");
+
+        assert_eq!(
+            stored(cx).translation.model_directory,
+            Some(directory.path().to_path_buf())
+        );
+    }
+
+    /// A session that opens over a stored directory shows it in the field.
+    #[gpui_kit::test]
+    fn a_stored_translation_directory_should_be_shown(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+
+        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
+        assert_eq!(
+            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
+                dialog.translation.read(cx).shown_directory(cx)
+            })),
+            Some(expected)
+        );
+    }
+
+    /// The directory field is read-only: typing into it leaves the value the browse button chose.
+    #[gpui_kit::test]
+    fn the_translation_directory_should_not_be_editable(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+
+        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
+        type_into(cx, "SETTINGS_AI_DIRECTORY_INPUT", "E:\\typed");
+
+        assert_eq!(
+            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
+                dialog.translation.read(cx).shown_directory(cx)
+            })),
+            Some(expected)
+        );
+    }
+
+    /// The directory row is reachable by what it configures, even though the page has no fields.
+    #[gpui_kit::test]
+    fn the_translation_page_should_be_reachable_by_its_directory_setting(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
+
+        panel.update(cx, |dialog, cx| {
+            dialog.set_query("model directory".into(), cx);
+        });
+        settle(cx);
+
+        assert_eq!(current_page(&panel, cx), "ai.translation");
     }
 
     /// A venue's page is named by the venue it configures, and the sidebar row is what opens
