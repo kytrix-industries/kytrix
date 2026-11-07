@@ -1,10 +1,11 @@
 //! Builds the pinned llama.cpp checkout and generates the provider's FFI.
 //!
-//! The crate owns the native build so `cargo build` is sufficient: CMake uses
-//! `crates/llama_sys/llama.cpp` (a submodule pinned to v0.9.0), and the resulting
-//! static libraries are linked through this script. Only the llama and ggml
-//! targets are built; `llama-common`, its HTTP client and the C++ shims are not
-//! needed by the C API surface the provider uses.
+//! The crate owns the native build so `cargo build` is sufficient: the script
+//! initializes the `crates/llama_sys/llama.cpp` submodule (pinned to v0.9.0) with
+//! a shallow checkout when it is missing, CMake builds that tree, and the
+//! resulting static libraries are linked through this script. Only the llama and
+//! ggml targets are built; `llama-common`, its HTTP client and the C++ shims are
+//! not needed by the C API surface the provider uses.
 
 use std::{
     env,
@@ -250,13 +251,32 @@ fn valid_cuda_architecture(architecture: &str) -> bool {
 }
 
 /// The checked-out llama.cpp source.
+///
+/// A missing checkout is initialized from the submodule at the commit the
+/// superproject records. The fetch is shallow: compiling needs the sources, not
+/// llama.cpp's history.
 fn source_directory() -> PathBuf {
-    let source =
-        Path::new(&env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")).join("llama.cpp");
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let source = manifest.join("llama.cpp");
+    if source.join("include").join("llama.h").is_file() {
+        return source;
+    }
+
+    eprintln!("llama_sys: initializing the pinned llama.cpp submodule (shallow checkout)");
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(manifest)
+        // `tools/ui` contains paths over MAX_PATH; without this Git for Windows
+        // aborts the checkout and leaves a partially populated tree.
+        .args(["-c", "core.longpaths=true", "submodule", "update"])
+        .args(["--init", "--depth", "1", "--", "llama.cpp"]);
+    run(&mut command, "initialize the pinned llama.cpp submodule");
+
     assert!(
         source.join("include").join("llama.h").is_file(),
-        "llama_sys: llama.cpp v0.9.0 is missing at {}; run \
-         `git submodule update --init crates/llama_sys/llama.cpp`",
+        "llama_sys: the llama.cpp submodule at {} is still incomplete after \
+         `git submodule update --init --depth 1`",
         source.display()
     );
     source

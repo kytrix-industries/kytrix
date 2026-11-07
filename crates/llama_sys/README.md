@@ -1,7 +1,9 @@
 # llama_sys
 
 Raw FFI and the native build for the pinned llama.cpp checkout in
-`crates/llama_sys/llama.cpp` (v0.9.0).
+`crates/llama_sys/llama.cpp` (v0.9.0). When the submodule is missing, `build.rs`
+initializes it with `git submodule update --init --depth 1`, so the first build
+downloads only the pinned commit instead of llama.cpp's history.
 
 `build.rs` owns the whole native build: it configures CMake for the selected
 Cargo features, builds the `llama` target and its `ggml` dependencies, links the
@@ -13,7 +15,8 @@ is intentionally rejected here; `kytrix` omits the dependency on that target.
 
 ## Prerequisites
 
-- the submodule: `git submodule update --init crates/llama_sys/llama.cpp`
+- git: the first build initializes the pinned submodule and therefore needs
+  network access; later builds reuse the checkout
 - CMake 3.20+ and a C++17 compiler
 - Ninja (recommended; CMake's default generator works too)
 - libclang for bindgen (`LIBCLANG_PATH` if it is not in a standard location)
