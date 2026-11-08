@@ -1309,9 +1309,11 @@ settings_ui:
     title: The settings could not be saved
   search:
     placeholder: Search settings
+  subtitle: Configure the application
   time_zone:
     description: Choose the time zone widgets display data timestamps in; every data timestamp is converted to it
     title: Data time zone
+  title: Settings
 
 startup:
   config_reset_message: <p align="center">The configuration file was damaged and has been reset to defaults. The previous file was kept as %{file}.</p>

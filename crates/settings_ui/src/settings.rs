@@ -1,37 +1,39 @@
-//! The settings dialog: the search field above the sidebar of settings in one column, the page
-//! behind the selected entry beside it.
+//! The settings page: what the application is configured by, drawn in the page area of the main
+//! window in place of the workspace.
 //!
-//! The dialog owns what outlives a frame: the page that is drawn, the state of every text field
-//! on it, and the scroll position of that page. Everything else — what a page holds, what a
-//! control writes — belongs to the catalog and to the draft.
+//! The page owns what outlives a frame: the page that is drawn, the state of every text field on
+//! it, and the scroll position of that page. Everything else — what a page holds, what a control
+//! writes — belongs to the catalog and to the draft.
 //!
-//! The sidebar does not fold: a group is the heading over the pages under it, and a page is the
-//! one kind of row that opens anything. What a page opens is the page drawn beside the list, so
-//! the two are one thing and move together.
+//! The page has the gallery's shape: a title and the search field in its header, the settings
+//! menu on the left with the detail page behind the selected entry on the right, and the two
+//! decisions — cancel, confirm — under a separator at its foot. The sidebar does not fold: a
+//! group is the heading over the pages under it, and a page is the one kind of row that opens
+//! anything. What a page opens is the page drawn beside the list, so the two are one thing and
+//! move together.
 //!
 //! A control writes the draft rather than the settings, so the settings are the ones the user
-//! confirmed and nothing else: what leaves this dialog is one commit, made when the user asks
-//! for it, and a commit that cannot be stored leaves the dialog open with what the user had.
+//! confirmed and nothing else: what leaves this page is one commit, made when the user asks for
+//! it, and a commit that cannot be stored leaves the page open with what the user had.
 //!
 //! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its
 //! own label nor by a field on it is not drawn at all, and a group with none of its pages left
 //! is not drawn either, so what is left is the way to what was searched for. What it narrows is
-//! the sidebar, so it is drawn above the sidebar rather than across the whole dialog. A query
-//! that matches nothing is answered in both columns rather than leaving the page that was open
-//! behind.
+//! the sidebar; a query that matches nothing is answered in both columns rather than leaving the
+//! page that was open behind.
 //!
 //! A page is drawn from the catalog on every frame, so it follows the language the window is
-//! showing by itself. What the dialog holds across frames — the rows of the sidebar, the words
+//! showing by itself. What the page holds across frames — the rows of the sidebar, the words
 //! the search is answered over, the placeholder of a field built before — does not, so it is
-//! built again when the language moves on — see [`SettingsDialog::adopt_language`].
+//! built again when the language moves on — see [`SettingsPage::adopt_language`].
 //!
 //! The proxy catalog and the translation page are views of their own rather than pages of
-//! fields. The form that changes the proxy catalog is a dialog on the same window layer, drawn
-//! over this dialog. A row cannot open one itself — a table cell is drawn without a window — so
-//! it records the form it wants and this dialog opens it on the layer. The form writes the same
+//! fields. The form that changes the proxy catalog is a dialog on the window layer, drawn over
+//! this page. A row cannot open one itself — a table cell is drawn without a window — so it
+//! records the form it wants and this page opens it on the layer. The form writes the same
 //! draft, because it is one session either way. Deleting a row is the one request that is put to
 //! the user before it is recorded, and the alert it is put to is opened the same way — see
-//! [`SettingsDialog::open_requested_form`].
+//! [`SettingsPage::open_requested_form`].
 
 use std::borrow::BorrowMut as _;
 
@@ -49,8 +51,8 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, BorrowAppContext as _, Context, DismissEvent, ElementId,
-    Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Pixels,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
     base::Selectable as _, div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
@@ -69,17 +71,18 @@ use crate::{
     translation::TranslationPage,
 };
 
-/// The size of the panel the dialog draws.
-const WIDTH: f32 = 1080.0;
-const HEIGHT: f32 = 760.0;
+/// The widest the page's content column gets, which is also the widest the footer's button row
+/// gets. The footer's separator is drawn outside the column, so it keeps the page's full width
+/// while the header, both columns and the buttons are centred.
+const CONTENT_MAX_WIDTH: Pixels = px(1000.0);
 
-/// How tall the search row is, which is what the sidebar starts below.
-const SEARCH_HEIGHT: f32 = 32.0;
+/// The width of the field the settings are searched with, drawn at the end of the header.
+const SEARCH_WIDTH: Pixels = px(240.0);
 
 /// The element id of the search field, which is also the key of its state.
 const SEARCH_INPUT_ID: &str = "settings-search";
 
-/// One text field of one page, remembered for as long as the dialog is open.
+/// One text field of one page, remembered for as long as the page is open.
 struct FieldInput {
     /// The field this is the input of, which is what says how to read it and how to write it
     /// back: a commit made from the confirm button has no page to look the field up on.
@@ -96,8 +99,8 @@ struct FieldInput {
     _events: Subscription,
 }
 
-/// The whole of the settings, as a dialog.
-pub(crate) struct SettingsDialog {
+/// The whole of the settings, as the main window's settings page.
+pub struct SettingsPage {
     /// What this session has changed, which is what every page is drawn from.
     ///
     /// The settings themselves are not read here: a page that read them would show a value the
@@ -111,7 +114,7 @@ pub(crate) struct SettingsDialog {
     catalog: Catalog,
     query: SharedString,
     filter: SearchFilter,
-    /// The language the text this dialog holds was built in.
+    /// The language the text this page holds was built in.
     ///
     /// A page is drawn from the catalog afresh on every frame, so what it shows is the text of
     /// the frame's language. What is held across frames is not, so this is what the sidebar, the
@@ -126,8 +129,8 @@ pub(crate) struct SettingsDialog {
     /// what a heading names is the pages under it.
     sidebar: Vec<SidebarEntry>,
     sidebar_scroll: ScrollHandle,
-    /// The search field, which is built the first time the dialog is drawn: a text field is
-    /// filled in by a window, and a dialog is built before there is one to draw it in.
+    /// The search field, which is built the first time the page is drawn: a text field is filled
+    /// in by a window, and the page is built before there is one to draw it in.
     search_input: Option<Entity<InputState>>,
     inputs: Vec<FieldInput>,
     page_scroll: ScrollHandle,
@@ -138,33 +141,36 @@ pub(crate) struct SettingsDialog {
     search_events: Option<Subscription>,
 }
 
-/// The settings take themselves off the layer by emitting the dismissal their dialog listens
-/// for: what the close button and a stored commit do is end this session, so it is the session
-/// that says so rather than the layer closing whatever happens to be on top of it.
-impl EventEmitter<DismissEvent> for SettingsDialog {}
+/// The settings ask to be left by emitting a dismissal: what the cancel and confirm buttons do
+/// is end this session, and the main window is what takes the page away and shows the workspace
+/// again.
+impl EventEmitter<DismissEvent> for SettingsPage {}
 
-impl SettingsDialog {
-    /// The whole of the settings, over the draft one session holds.
+impl SettingsPage {
+    /// The settings page, opened on a session that starts from what is stored now.
     ///
     /// The catalog is the venues this build speaks and the fields each of their APIs has: a venue
     /// this build speaks has its line and its page whether or not it is loaded, and every value
     /// on that page is read from and written to the venue's own settings row.
     ///
     /// What needs a window — the search field and the fields of the page that is drawn — is
-    /// built on the first frame rather than here, because a dialog is built before the window
+    /// built on the first frame rather than here, because the page is built before the window
     /// it is about to be shown in has drawn it.
-    pub fn new(draft: Entity<SettingsDraft>, cx: &mut Context<Self>) -> Self {
+    pub fn load(cx: &mut Context<Self>) -> Self {
+        let stored = cx.global::<ConfigManager>().read();
+        let draft = cx.new(|_| SettingsDraft::new(stored.as_ref().clone()));
         let venues: VenueView = supported_venues().into();
+
         Self::build(draft, catalog(&venues), cx)
     }
 
-    /// Builds the dialog over the catalog it draws.
+    /// Builds the page over the catalog it draws.
     ///
-    /// This is the test seam beside [`Self::new`]: a fixture builds the catalog whose groups it
+    /// This is the test seam beside [`Self::load`]: a fixture builds the catalog whose groups it
     /// needs declared and hands it here, so a test draws a catalog the production one is a case
     /// of without the production catalog having to offer it.
     #[cfg(test)]
-    fn new_with_catalog(
+    pub(crate) fn new_with_catalog(
         draft: Entity<SettingsDraft>,
         catalog: Catalog,
         cx: &mut Context<Self>,
@@ -219,21 +225,22 @@ impl SettingsDialog {
     /// The subscription is replaced with the field it belongs to, because a field that is
     /// built again is a different entity.
     fn subscribe_search(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
-        self.search_events = Some(
-            cx.subscribe(input, |dialog, _, event: &InputStateEvent, cx| {
+        self.search_events = Some(cx.subscribe(
+            input,
+            |settings, _, event: &InputStateEvent, cx| {
                 let InputStateEvent::Change(query) = event else {
                     return;
                 };
-                dialog.set_query(query.clone(), cx);
-            }),
-        );
+                settings.set_query(query.clone(), cx);
+            },
+        ));
     }
 
-    /// Rebuilds what the dialog holds in the language the window is showing now.
+    /// Rebuilds what the page holds in the language the window is showing now.
     ///
     /// The language is a global the whole interface is rendered through, so switching it is
     /// what every frame that follows reads: a page follows by being drawn again, and what this
-    /// dialog holds is built again here, because nothing else would draw it again.
+    /// page holds is built again here, because nothing else would draw it again.
     fn adopt_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let language = *cx.global::<LanguageCode>();
         if language == self.language {
@@ -258,7 +265,7 @@ impl SettingsDialog {
     ///
     /// Reusing it is what keeps a caret where it was: an input rebuilt on every frame is an
     /// input the user is typing into that loses what they typed.
-    pub fn input_for(
+    pub(crate) fn input_for(
         &mut self,
         field: FieldDef,
         stored: &FieldValue,
@@ -311,13 +318,14 @@ impl SettingsDialog {
             builder.build(window, cx)
         });
         let access = field.access.clone();
-        let subscription = cx.subscribe(&entity, move |dialog, _, event: &InputStateEvent, cx| {
-            let InputStateEvent::Blur(value) = event else {
-                return;
-            };
-            let value = FieldValue::new(value.as_str());
-            dialog.write_field(access.clone(), value, cx);
-        });
+        let subscription =
+            cx.subscribe(&entity, move |settings, _, event: &InputStateEvent, cx| {
+                let InputStateEvent::Blur(value) = event else {
+                    return;
+                };
+                let value = FieldValue::new(value.as_str());
+                settings.write_field(access.clone(), value, cx);
+            });
         self.inputs.push(FieldInput {
             field,
             built_from: stored.clone(),
@@ -379,11 +387,11 @@ impl SettingsDialog {
     /// Writes what this session changed into the settings, or says why it could not.
     ///
     /// What is written is the changes replayed onto the settings as they are now rather than
-    /// the draft as it was built: work that wrote the settings while this dialog was open —
+    /// the draft as it was built: work that wrote the settings while this page was open —
     /// a generated avatar, a persisted workspace layout, a saved sidebar state — is not this
-    /// dialog's to undo.
+    /// page's to undo.
     ///
-    /// A commit that cannot be stored leaves the dialog exactly as it was, draft included, so
+    /// A commit that cannot be stored leaves the page exactly as it was, draft included, so
     /// the user can try again rather than lose what they configured.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_inputs(cx);
@@ -409,7 +417,7 @@ impl SettingsDialog {
     /// Selects the page one sidebar row names.
     ///
     /// The page drawn and the row that names it are one thing: the row is drawn selected from
-    /// the page the dialog is on, so a page moved on its own would leave the row behind it, and
+    /// the page the settings are on, so a page moved on its own would leave the row behind it, and
     /// the field the user is typing into would stop being drawn under the caret that is still
     /// in it.
     fn select(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -425,7 +433,7 @@ impl SettingsDialog {
 
     /// Answers a new query.
     ///
-    /// The sidebar is rebuilt from the answer while the dialog is drawn, so nothing is built
+    /// The sidebar is rebuilt from the answer while the page is drawn, so nothing is built
     /// here but the answer itself; the page follows the answer, because a page with neither a
     /// matching label nor a matching field is a page that is no longer drawn.
     fn set_query(&mut self, query: SharedString, cx: &mut Context<Self>) {
@@ -468,7 +476,7 @@ impl SettingsDialog {
         self.rebuild_sidebar(cx);
     }
 
-    /// Builds the rows the filter admits, labelled in the language the dialog is holding.
+    /// Builds the rows the filter admits, labelled in the language the page is holding.
     fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar = sidebar_entries(
             &self.catalog,
@@ -483,7 +491,7 @@ impl SettingsDialog {
 
     /// Scrolls the sidebar to the row of the page that is drawn.
     ///
-    /// A page the dialog moved to by itself is not necessarily one the user can see: what it
+    /// A page the settings moved to by itself is not necessarily one the user can see: what it
     /// moves to is moved into view, the way a row the user clicked already is.
     fn reveal_current_page(&self) {
         if let Some(index) = self
@@ -498,11 +506,11 @@ impl SettingsDialog {
     /// Opens the form a proxy row asked for, or asks again about the one thing a row can do that
     /// takes something away.
     ///
-    /// The request is taken on the frame that draws this dialog, and the form is opened on the
+    /// The request is taken on the frame that draws this page, and the form is opened on the
     /// window layer, which pushes it at the end of the effect cycle and draws it on the next frame.
-    /// That is why this can open the form from inside a frame of its own — this dialog is drawn *by*
-    /// that layer — and why nothing here has to wait for a frame to come round: the layer's deferred
-    /// push is what asks for one.
+    /// That is why this can open the form from inside a frame of its own — this page is drawn
+    /// inside the layer's view — and why nothing here has to wait for a frame to come round: the
+    /// layer's deferred push is what asks for one.
     ///
     /// A delete is not a form: it is one decision, and it is the one row action that cannot be
     /// taken back, because removing an entry resets every route that named it. So it is put to the
@@ -542,26 +550,60 @@ impl SettingsDialog {
         }
     }
 
-    /// The search row: what to look for, and the way to stop looking.
+    /// The header: what the page is, and the field the settings are searched with.
     ///
-    /// The field is as wide as the column it filters, and the way to stop looking is the
-    /// field's own: it is drawn inside the input rather than beside it, so the row and the
-    /// sidebar below it are the same width and line up.
-    fn search_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// It is the gallery's header: the title and its subtitle on the left, and the search field
+    /// at the end of the row. The field is the one the sidebar is filtered by; drawing it here
+    /// rather than above the sidebar is what makes the two pages open the same way.
+    fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let input = self.search_input(window, cx);
+        let theme = cx.theme();
 
         div()
-            .debug_selector(|| "SETTINGS_SEARCH".into())
+            .debug_selector(|| "SETTINGS_HEADER".into())
             .flex_none()
             .w_full()
-            .h(px(SEARCH_HEIGHT))
+            .min_w_0()
             .flex()
-            .items_center()
+            .flex_wrap()
+            .items_end()
+            .justify_between()
+            .gap_4()
+            .px_6()
+            .pt_5()
+            .pb_3()
             .child(
                 div()
                     .min_w_0()
                     .flex_1()
-                    .child(Input::new(&input).medium().clearable(true)),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "SETTINGS_TITLE".into())
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child(t!(cx, "settings_ui.title")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.roles.fg.muted.hsla)
+                            .child(t!(cx, "settings_ui.subtitle")),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "SETTINGS_SEARCH".into())
+                    .flex_none()
+                    .w(SEARCH_WIDTH)
+                    .child(
+                        Input::new(&input)
+                            .medium()
+                            .clearable(true)
+                            .prefix_icon(IconKind::MagnifyingGlass),
+                    ),
             )
             .into_any_element()
     }
@@ -570,7 +612,7 @@ impl SettingsDialog {
     ///
     /// A heading is drawn as text rather than as a control, because a group is not something a
     /// user opens: what it does is name the pages that follow it. A page is a button, and the
-    /// one the dialog is on is drawn selected.
+    /// one the settings are on is drawn selected.
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = div()
             .id("settings-sidebar-scroll")
@@ -623,8 +665,8 @@ impl SettingsDialog {
                         })
                         .child(Icon::new(IconKind::GearSix).size_4())
                         .child(label.clone())
-                        .on_click(cx.listener(move |dialog, _, _, cx| {
-                            dialog.select(page.as_str(), cx);
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            settings.select(page.as_str(), cx);
                         }))
                         .into_any_element()
                 }
@@ -643,14 +685,15 @@ impl SettingsDialog {
     }
 }
 
-impl Render for SettingsDialog {
+impl Render for SettingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.adopt_language(window, cx);
         self.sync_sidebar(cx);
         self.open_requested_form(window, cx);
         let foreground = cx.theme().roles.fg.default.hsla;
-        let dialog = cx.entity();
-        let search = self.search_row(window, cx);
+        let canvas = cx.theme().roles.surface.canvas.hsla;
+        let handle = cx.entity();
+        let header = self.header(window, cx);
         // A page with neither its own label nor one of its fields admitted by the query is a
         // page the search took away: what is left is the message, in this column as in the
         // sidebar.
@@ -683,7 +726,7 @@ impl Render for SettingsDialog {
                     self.page_scroll.clone(),
                     window,
                     self,
-                    &dialog,
+                    &handle,
                     cx,
                 )
                 .unwrap_or_else(|| div().into_any_element())
@@ -711,68 +754,100 @@ impl Render for SettingsDialog {
         } else {
             self.sidebar(cx)
         };
-        // The search narrows the sidebar and nothing else, so the two are one column: the field
-        // sits above what it filters, and the column is as wide as the list it holds.
-        let entries = div()
-            .w_64()
-            .flex_none()
+        // The search narrows the sidebar and nothing else: the menu column is as wide as the
+        // list it holds, and the page gets the rest of the column. The search itself is in the
+        // header, where the gallery draws the field it filters its catalogue with.
+        let entries = div().w_64().flex_none().min_h_0().flex().flex_col().child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .debug_selector(|| "SETTINGS_SIDEBAR".into())
+                .child(sidebar),
+        );
+
+        div()
+            .debug_selector(|| "SETTINGS_PAGE".into())
+            .size_full()
+            .min_w_0()
             .min_h_0()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(search)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .debug_selector(|| "SETTINGS_SIDEBAR".into())
-                    .child(sidebar),
-            );
-
-        div()
-            .debug_selector(|| "SETTINGS_DIALOG".into())
-            .w(px(WIDTH))
-            .h(px(HEIGHT))
-            .flex()
-            .flex_col()
-            .gap_2()
+            .bg(canvas)
             .text_color(foreground)
             .child(
                 div()
-                    .min_w_0()
-                    .min_h_0()
                     .flex_1()
+                    .min_h_0()
+                    .w_full()
                     .flex()
-                    .gap_2()
-                    .child(entries)
-                    .child(Separator::vertical())
-                    .child(div().min_w_0().min_h_0().flex_1().child(page)),
+                    .justify_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "SETTINGS_COLUMN".into())
+                            .w(CONTENT_MAX_WIDTH)
+                            .max_w_full()
+                            .h_full()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(header)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .px_6()
+                                    .pb_4()
+                                    .flex()
+                                    .gap_2()
+                                    .child(entries)
+                                    .child(Separator::vertical())
+                                    .child(div().min_w_0().min_h_0().flex_1().child(page)),
+                            ),
+                    ),
             )
-            .child(Separator::horizontal())
             .child(
                 div()
+                    .debug_selector(|| "SETTINGS_FOOTER".into())
                     .flex_none()
+                    .w_full()
                     .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
+                    .flex_col()
+                    .child(Separator::horizontal())
                     .child(
-                        Button::new("settings-close")
-                            .ghost()
-                            .debug_selector(|| "SETTINGS_CLOSE".into())
-                            .aria_label(t!(cx, "common.close"))
-                            .child(t!(cx, "common.close"))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        Button::new("settings-confirm")
-                            .filled()
-                            .debug_selector(|| "SETTINGS_CONFIRM".into())
-                            .aria_label(t!(cx, "common.confirm"))
-                            .child(t!(cx, "common.confirm"))
-                            .on_click(cx.listener(|dialog, _, window, cx| {
-                                dialog.confirm(window, cx);
-                            })),
+                        div().w_full().flex().justify_center().child(
+                            div()
+                                .w(CONTENT_MAX_WIDTH)
+                                .max_w_full()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_2()
+                                .px_6()
+                                .py_3()
+                                .child(
+                                    Button::new("settings-cancel")
+                                        .tonal()
+                                        .medium()
+                                        .debug_selector(|| "SETTINGS_CANCEL".into())
+                                        .aria_label(t!(cx, "common.cancel"))
+                                        .child(t!(cx, "common.cancel"))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(DismissEvent);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("settings-confirm")
+                                        .filled()
+                                        .medium()
+                                        .debug_selector(|| "SETTINGS_CONFIRM".into())
+                                        .aria_label(t!(cx, "common.confirm"))
+                                        .child(t!(cx, "common.confirm"))
+                                        .on_click(cx.listener(|settings, _, window, cx| {
+                                            settings.confirm(window, cx);
+                                        })),
+                                ),
+                        ),
                     ),
             )
     }
@@ -999,14 +1074,14 @@ mod tests {
     };
     use base_ui::{
         animation::ANIMATION_TICK,
-        layer::{Layer, LayerExt},
+        layer::Layer,
         size::UnifiedSize,
         style::{palette::Appearance as ThemeAppearance, theme::ThemeExt as _},
     };
     use gpui_kit::{
-        AnyWindowHandle, AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement,
-        Modifiers, Render, SharedString, Styled, Subscription, TestAppContext, VisualTestContext,
-        Window, WindowAppearance, div, px,
+        AppContext as _, BorrowAppContext as _, Context, DismissEvent, Entity, IntoElement,
+        Modifiers, ParentElement as _, Render, SharedString, Styled, Subscription, TestAppContext,
+        VisualTestContext, Window, WindowAppearance, div, px,
     };
     use i18n::{language::codes::LanguageCode, t};
     use market_participants_connector::connector::MarketParticipantsConnector;
@@ -1015,7 +1090,7 @@ mod tests {
     use tempfile::TempDir;
     use widget_tokio_runtime::global;
 
-    use super::{SettingsDialog, SidebarEntry, default_page};
+    use super::{SettingsPage, SidebarEntry, default_page};
     use crate::{
         access::FieldValue,
         appearance,
@@ -1027,8 +1102,8 @@ mod tests {
 
     /// The venues every test of this module draws the settings from.
     ///
-    /// A dialog draws its venue pages from whichever venue list it is handed, which in production
-    /// is what this build speaks — see [`crate::entry::show_settings`] — and here is this fixture.
+    /// The page draws its venue pages from whichever venue list it is handed, which in production
+    /// is what this build speaks — see [`SettingsPage::load`] — and here is this fixture.
     fn venues() -> VenueView {
         crate::schema::tests::venues()
     }
@@ -1059,24 +1134,29 @@ mod tests {
         })
     }
 
-    /// The window layer the settings are mounted on.
+    /// The window root that hosts one settings page, standing in for the main window's page
+    /// area.
     ///
-    /// The settings are drawn as the window's dialog rather than as a child of this view: the
-    /// form over them is a dialog of its own, and a commit that failed is reported by an
-    /// alert, neither of which exists without a window layer to open it on.
-    struct Harness {
+    /// It is also the test fixture's half of the application's projections: the language the
+    /// interface is rendered through and the appearance the window is drawn in. Without them a
+    /// confirmed preference would reach the settings but not the page drawing it.
+    ///
+    /// The page is dropped when it asks to be dismissed, which is what the main window does when
+    /// the page area goes back to the workspace. A form over the page and an alert over it are
+    /// window dialogs, so the root is still a [`Layer`].
+    struct PageHost {
+        page: Option<Entity<SettingsPage>>,
+        _dismiss: Subscription,
         _language: Subscription,
         _appearance: Subscription,
     }
 
-    impl Harness {
-        /// Subscribes the projections the application itself installs: the language the
-        /// interface is rendered through and the appearance the window is drawn in.
-        ///
-        /// This is the test fixture's half of what the root window and the language projection
-        /// do in the application: a commit writes the settings, and these subscriptions are
-        /// what turn the published events into the globals and the theme the window draws from.
-        fn new(window: &Window, cx: &mut Context<Self>) -> Self {
+    impl PageHost {
+        fn new(page: Entity<SettingsPage>, window: &Window, cx: &mut Context<Self>) -> Self {
+            let dismiss = cx.subscribe(&page, |host, _, _: &DismissEvent, cx| {
+                host.page = None;
+                cx.notify();
+            });
             let events = cx.global::<ConfigManager>().events().clone();
             let language = cx.subscribe(&events, |_, _, event: &LanguageChanged, cx| {
                 cx.set_global(match event.0 {
@@ -1094,21 +1174,41 @@ mod tests {
             );
 
             Self {
+                page: Some(page),
+                _dismiss: dismiss,
                 _language: language,
                 _appearance: appearance,
             }
         }
     }
 
-    impl Render for Harness {
+    impl Render for PageHost {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full()
+            div().size_full().children(self.page.clone())
         }
+    }
+
+    /// Mounts one settings page in a fresh window and applies the stored appearance.
+    fn mount_page(cx: &mut TestAppContext, page: Entity<SettingsPage>) -> &mut VisualTestContext {
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let host = cx.new(move |cx| PageHost::new(page, window, cx));
+            Layer::new(host)
+        });
+        // The appearance the settings name is applied the way a window applies it when it is
+        // built, so a test starts from the theme the stored preference resolves to rather than
+        // from whichever one `install` left behind.
+        cx.update(|window, cx| {
+            let preference = cx.global::<ConfigManager>().read().appearance;
+            appearance::apply(preference, window, cx);
+        });
+        settle(cx);
+
+        cx
     }
 
     /// Opens the settings over a fresh window, the way the system button opens them.
     ///
-    /// What is drawn in the window is read off the window rather than off the panel, so the
+    /// What is drawn in the window is read off the window rather than off the page, so the
     /// window comes back with it. The interface and the settings are both in `language`, which
     /// is what a start with an interface that agrees with the settings looks like; a test that
     /// writes another language is then writing a change.
@@ -1116,7 +1216,7 @@ mod tests {
         config: Config,
         language: Language,
         cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
         let mut config = config;
         config.language = language;
         let manager = cx.update(|cx| ConfigManager::in_memory(config, cx));
@@ -1134,11 +1234,11 @@ mod tests {
         manager: ConfigManager,
         language: Language,
         cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
         settings_over_catalog(manager, language, test_catalog(), cx)
     }
 
-    /// Opens the settings over the catalog the dialog is built from.
+    /// Opens the settings over the catalog the page is built from.
     ///
     /// The catalog is this build's own unless a test asks otherwise: a test of what a group the
     /// catalog closes is drawn as hands a catalog that closes it here.
@@ -1147,8 +1247,8 @@ mod tests {
         language: Language,
         catalog: Catalog,
         cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
-        let panel = cx.update(|cx| {
+    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
+        let page = cx.update(|cx| {
             // What a window installs before it draws anything, in the order the application
             // installs it: a field that is typed into reads the state base_ui's own fields are
             // built on.
@@ -1171,72 +1271,42 @@ mod tests {
                 SettingsDraft::new(current.as_ref().clone())
             });
 
-            cx.new(|cx| SettingsDialog::new_with_catalog(draft, catalog, cx))
+            cx.new(|cx| SettingsPage::new_with_catalog(draft, catalog, cx))
         });
-        let (_, cx) =
-            cx.add_window_view(|window, cx| Layer::new(cx.new(move |cx| Harness::new(window, cx))));
-        // The appearance the settings name is applied the way a window applies it when it is
-        // built, so a test starts from the theme the stored preference resolves to rather than
-        // from whichever one `install` left behind.
-        cx.update(|window, cx| {
-            let preference = cx.global::<ConfigManager>().read().appearance;
-            appearance::apply(preference, window, cx);
-        });
-        // The settings are mounted once the window has its layer: a dialog is opened on the
-        // window layer, and a window that is still being built has none.
-        cx.update({
-            let panel = panel.clone();
-            move |window, cx| window.dialog(cx, panel)
-        });
-        settle(cx);
+        let cx = mount_page(cx, page.clone());
 
-        (panel, cx)
+        (page, cx)
     }
 
     /// Opens the settings with the interface in `language`.
     fn settings(
         config: Config,
         cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
         settings_in(config, Language::En, cx)
     }
 
-    /// Opens the settings again over a window that already holds them.
+    /// Opens the settings again in a new window, over the settings that are stored now.
     ///
     /// Opening the settings installs the globals a session is built on, which a test can only do
-    /// once, so a test that opens them twice — which is what a user who changes their mind does —
-    /// builds the second session on the window the first one left behind.
-    fn reopen_settings(
-        window: AnyWindowHandle,
-        app: &TestAppContext,
-    ) -> (Entity<SettingsDialog>, VisualTestContext) {
-        let mut cx = VisualTestContext::from_window(window, app);
-        let panel = cx.update(|_, cx| {
-            let draft = cx.new(|cx| {
-                let stored = cx.global::<ConfigManager>().read();
-                SettingsDraft::new(stored.as_ref().clone())
-            });
+    /// once, so a test that changes its mind builds the second session in another window. What
+    /// the second session reads is the settings the first one stored, which is the point.
+    fn reopen_settings(cx: &mut TestAppContext) -> (Entity<SettingsPage>, &mut VisualTestContext) {
+        let page = cx.update(|cx| cx.new(SettingsPage::load));
+        let cx = mount_page(cx, page.clone());
 
-            cx.new(|cx| SettingsDialog::new(draft, cx))
-        });
-        cx.update({
-            let panel = panel.clone();
-            move |window, cx| window.dialog(cx, panel)
-        });
-        settle(&mut cx);
-
-        (panel, cx)
+        (page, cx)
     }
 
-    /// Opens the settings the way the system button opens them, over a build that has loaded
-    /// nothing, and hands back the dialog the entry built.
+    /// Opens the settings over a build that has loaded nothing, and hands back the page.
     ///
-    /// The market participants root is the application's own, and the scopes the dialog is handed are what
-    /// the entry reads off it: installing the root loads no venue, so the settings are opened
-    /// over an empty loaded-venues view and every row they offer is the static venue list's.
+    /// The market participants root is the application's own, and the scopes the page is handed
+    /// are what the root reads off it: installing the root loads no venue, so the settings are
+    /// opened over an empty loaded-venues view and every row they offer is the static venue
+    /// list's.
     fn settings_of_an_unconnected_build(
         cx: &mut TestAppContext,
-    ) -> (Entity<SettingsDialog>, &mut VisualTestContext) {
+    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
         cx.update(|cx| {
             gpui_kit::base::init(cx);
             base_ui::style::theme::install(cx);
@@ -1247,37 +1317,14 @@ mod tests {
             MarketParticipantsConnector::install(cx)
                 .expect("the market participants root should install");
         });
-        let panel = cx.update(|cx| {
-            let draft = cx.new(|cx| {
-                let stored = cx.global::<ConfigManager>().read();
-                SettingsDraft::new(stored.as_ref().clone())
-            });
+        let page = cx.update(|cx| cx.new(SettingsPage::load));
+        let cx = mount_page(cx, page.clone());
 
-            cx.new(|cx| SettingsDialog::new(draft, cx))
-        });
-        let (_, cx) =
-            cx.add_window_view(|window, cx| Layer::new(cx.new(move |cx| Harness::new(window, cx))));
-        // The appearance the settings name is applied the way a window applies it when it is
-        // built, so a test starts from the theme the stored preference resolves to rather than
-        // from whichever one `install` left behind.
-        cx.update(|window, cx| {
-            let preference = cx.global::<ConfigManager>().read().appearance;
-            appearance::apply(preference, window, cx);
-        });
-        cx.update({
-            let panel = panel.clone();
-            move |window, cx| window.dialog(cx, panel)
-        });
-        settle(cx);
-
-        (panel, cx)
+        (page, cx)
     }
 
-    /// Lets the dialog's own enter or exit transition finish and repaints.
-    ///
-    /// A dialog in its first frames is painted at zero opacity, and a dismissed one stays on
-    /// the layer until its exit transition is over, so neither can be told from the other
-    /// without waiting out the animation the interface declares.
+    /// Lets the theme's transitions and the forms' and alerts' own enter or exit transitions
+    /// finish and repaints.
     fn settle(cx: &mut VisualTestContext) {
         cx.executor()
             .advance_clock(ANIMATION_TICK + std::time::Duration::from_millis(50));
@@ -1311,7 +1358,7 @@ mod tests {
 
     /// Writes a field into the draft the way the control of that field does.
     fn write_draft_field(
-        panel: &Entity<SettingsDialog>,
+        panel: &Entity<SettingsPage>,
         page: &'static str,
         field: &'static str,
         value: &str,
@@ -1325,7 +1372,7 @@ mod tests {
     }
 
     /// The settings this session would write, which is what the pages are drawn from.
-    fn drafted(panel: &Entity<SettingsDialog>, cx: &VisualTestContext) -> Config {
+    fn drafted(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> Config {
         cx.read(|cx| {
             panel.read_with(cx, |dialog, cx| {
                 dialog.draft.read(cx).config().as_ref().clone()
@@ -1344,12 +1391,12 @@ mod tests {
     }
 
     /// The page the dialog is drawing.
-    fn current_page(panel: &Entity<SettingsDialog>, cx: &VisualTestContext) -> SharedString {
+    fn current_page(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> SharedString {
         cx.read(|cx| panel.read_with(cx, |dialog, _| dialog.current_page.clone()))
     }
 
     /// The labels the sidebar draws, in the order it draws them.
-    fn labels(panel: &Entity<SettingsDialog>, cx: &VisualTestContext) -> Vec<SharedString> {
+    fn labels(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> Vec<SharedString> {
         cx.read(|cx| {
             panel.read_with(cx, |dialog, _| {
                 dialog
@@ -1508,7 +1555,7 @@ mod tests {
     /// Opens the form that edits an entry, the way the row of the catalog that asks for one
     /// does.
     fn open_edit_form(
-        panel: &Entity<SettingsDialog>,
+        panel: &Entity<SettingsPage>,
         name: &'static str,
         cx: &mut VisualTestContext,
     ) {
@@ -1528,7 +1575,7 @@ mod tests {
     /// is what the assertions after this rely on, so refreshing here would draw what the request
     /// opened even if the request alone had left it undrawn. What the clock is for is the opened
     /// form's own transition, which the next `settle` or `click` moves on.
-    fn request(panel: &Entity<SettingsDialog>, request: ProxyRequest, cx: &mut VisualTestContext) {
+    fn request(panel: &Entity<SettingsPage>, request: ProxyRequest, cx: &mut VisualTestContext) {
         panel.update(cx, |dialog, cx| {
             dialog.proxies.update(cx, |table, cx| {
                 table.request(request, cx);
@@ -1540,7 +1587,7 @@ mod tests {
     }
 
     /// Opens the form that adds an entry, the way the button above the catalog asks for one.
-    fn open_add_form(panel: &Entity<SettingsDialog>, cx: &mut VisualTestContext) {
+    fn open_add_form(panel: &Entity<SettingsPage>, cx: &mut VisualTestContext) {
         request(panel, ProxyRequest::Add, cx);
     }
 
@@ -1563,7 +1610,7 @@ mod tests {
     /// What a row asks for is the alert rather than the removal: the entry leaves the session
     /// through the alert's own action, so a test that wants it gone confirms it there.
     fn request_delete(
-        panel: &Entity<SettingsDialog>,
+        panel: &Entity<SettingsPage>,
         name: &'static str,
         cx: &mut VisualTestContext,
     ) {
@@ -1610,7 +1657,7 @@ mod tests {
             "cancelling should take the form away"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings the form was opened over should still be drawn"
         );
         assert_eq!(
@@ -1827,7 +1874,7 @@ mod tests {
             "the retry should store what the user confirmed"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_none(),
+            cx.debug_bounds("SETTINGS_PAGE").is_none(),
             "a commit that was stored should close the settings"
         );
 
@@ -1853,9 +1900,7 @@ mod tests {
     /// was opened with: what the user changed is replayed onto the settings of that moment
     /// rather than published as the snapshot the session started from.
     #[gpui_kit::test]
-    fn a_commit_should_keep_the_settings_written_while_the_dialog_was_open(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_commit_should_keep_the_settings_written_while_the_page_was_open(cx: &mut TestAppContext) {
         let (panel, cx) = settings(configured_settings(), cx);
         write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
 
@@ -1901,7 +1946,7 @@ mod tests {
     /// replaying the snapshot the session was opened with would put the sidebar back where
     /// it was when the dialog opened.
     #[gpui_kit::test]
-    fn a_commit_should_keep_a_sidebar_state_written_while_the_dialog_was_open(
+    fn a_commit_should_keep_a_sidebar_state_written_while_the_page_was_open(
         cx: &mut TestAppContext,
     ) {
         let (panel, cx) = settings(configured_settings(), cx);
@@ -1957,7 +2002,7 @@ mod tests {
             "confirming should write what the user chose"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_none(),
+            cx.debug_bounds("SETTINGS_PAGE").is_none(),
             "a stored commit should close the settings"
         );
     }
@@ -2012,22 +2057,17 @@ mod tests {
         );
 
         let reported = cx.update(|window, _| window.appearance());
-        let window = cx
-            .windows()
-            .into_iter()
-            .next()
-            .expect("the settings are drawn in a window");
-        let (panel, mut cx) = reopen_settings(window, cx);
-        write_draft_field(&panel, "appearance", "appearance", "System", &mut cx);
-        click(&mut cx, "SETTINGS_CONFIRM");
+        let (panel, cx) = reopen_settings(cx);
+        write_draft_field(&panel, "appearance", "appearance", "System", cx);
+        click(cx, "SETTINGS_CONFIRM");
 
         assert_eq!(
-            stored(&cx).appearance,
+            stored(cx).appearance,
             Appearance::System,
             "the draft should have moved the preference back to the system"
         );
         assert_eq!(
-            drawn_appearance(&cx),
+            drawn_appearance(cx),
             match reported {
                 WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeAppearance::Light,
                 WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeAppearance::Dark,
@@ -2080,9 +2120,9 @@ mod tests {
         );
     }
 
-    /// The close button is a cancel: what the session changed is dropped rather than written.
+    /// The cancel button is the session's way out: what the session changed is dropped rather than written.
     #[gpui_kit::test]
-    fn closing_should_discard_what_the_session_changed(cx: &mut TestAppContext) {
+    fn cancelling_should_discard_what_the_session_changed(cx: &mut TestAppContext) {
         let (panel, cx) = settings(Config::default(), cx);
 
         write_draft_field(&panel, "appearance", "language", "zh-CN", cx);
@@ -2092,7 +2132,7 @@ mod tests {
             "the draft should hold what the user changed"
         );
 
-        click(cx, "SETTINGS_CLOSE");
+        click(cx, "SETTINGS_CANCEL");
 
         assert_eq!(
             stored(cx).language,
@@ -2100,31 +2140,31 @@ mod tests {
             "closing the settings must not write what the session changed"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_none(),
+            cx.debug_bounds("SETTINGS_PAGE").is_none(),
             "closing should take the settings away"
         );
     }
 
-    /// The close button is the settings' own way off the layer: what takes the panel away is the
-    /// dismissal the panel emits, so the panel leaves as the dialog it was opened as rather than
-    /// as whatever the layer happens to have on top, and the state it held goes with it.
+    /// The cancel button is the settings' own way off the page area: what takes the page away
+    /// is the dismissal it emits, so the page leaves as the session it was rather than as
+    /// whatever the window happens to show next, and the state it held goes with it.
     #[gpui_kit::test]
-    fn the_close_button_should_close_the_settings_by_their_own_signal(cx: &mut TestAppContext) {
+    fn the_cancel_button_should_close_the_settings_by_their_own_signal(cx: &mut TestAppContext) {
         let (panel, cx) = settings(Config::default(), cx);
-        // What is kept here is a weak handle: a test holding the panel would be a second strong
-        // reference, and the panel would outlive its dialog for as long as the test does, which
-        // is exactly what tells a panel that was released from one that leaked.
+        // What is kept here is a weak handle: a test holding the page would be a second strong
+        // reference, and the page would outlive its host for as long as the test does, which
+        // is exactly what tells a page that was released from one that leaked.
         let dismissed = panel.downgrade();
         drop(panel);
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings should be drawn while they are open"
         );
 
-        click(cx, "SETTINGS_CLOSE");
+        click(cx, "SETTINGS_CANCEL");
 
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_none(),
+            cx.debug_bounds("SETTINGS_PAGE").is_none(),
             "the signal the close button emits should take the settings off the layer"
         );
         assert!(
@@ -2136,7 +2176,7 @@ mod tests {
     /// A commit that cannot be stored is reported rather than swallowed, and the dialog stays
     /// where it is so the user can try again instead of losing what they configured.
     #[gpui_kit::test]
-    fn a_commit_that_cannot_be_stored_should_be_reported_and_keep_the_dialog(
+    fn a_commit_that_cannot_be_stored_should_be_reported_and_keep_the_page(
         cx: &mut TestAppContext,
     ) {
         let (manager, _blocking, _directory) = manager_behind_a_file(cx);
@@ -2160,7 +2200,7 @@ mod tests {
             "settings that could not be stored must not be published as if they had been"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings should stay open so the user can try again"
         );
         assert_eq!(
@@ -2298,7 +2338,7 @@ mod tests {
             "the form should be drawn over the settings"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings should still be drawn under the form"
         );
 
@@ -2313,7 +2353,7 @@ mod tests {
             "a form over the settings must not write them"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings the form was opened over should be the ones left showing"
         );
 
@@ -2348,7 +2388,7 @@ mod tests {
             "confirming a form should take it away"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings the form was opened over should still be drawn when the form is confirmed"
         );
         let session = drafted(&panel, cx);
@@ -2452,8 +2492,8 @@ mod tests {
     }
 
     /// A page follows the language by being drawn again, but the sidebar holds the labels it was
-    /// built with and nothing draws it again: a sidebar that kept them would be the one part of
-    /// the settings still written in the language the user just left.
+    /// built with and on a confirmation the page is left: the next session is what has to be
+    /// built in the language the user just confirmed.
     #[gpui_kit::test]
     fn the_sidebar_should_be_labelled_in_the_language_the_user_confirms(cx: &mut TestAppContext) {
         let (panel, cx) = settings_in(Config::default(), Language::ZhCn, cx);
@@ -2477,15 +2517,22 @@ mod tests {
             LanguageCode::En,
             "confirming the language should switch the interface to it"
         );
+        assert_eq!(
+            stored(cx).language,
+            Language::En,
+            "confirming the language should store it"
+        );
+        let (panel, cx) = reopen_settings(cx);
         let translated = labels(&panel, cx);
         assert!(
             translated.contains(&SharedString::new_static("Appearance")),
-            "the sidebar should be labelled in the language the user confirmed: {translated:?}"
+            "the next session should be labelled in the language the user confirmed: \
+             {translated:?}"
         );
     }
 
     #[gpui_kit::test]
-    fn the_dialog_should_open_on_the_default_page(cx: &mut TestAppContext) {
+    fn the_page_should_open_on_the_default_page(cx: &mut TestAppContext) {
         let (dialog, cx) = settings(Config::default(), cx);
 
         dialog.read_with(cx, |dialog, _| {
@@ -2504,36 +2551,110 @@ mod tests {
         });
     }
 
-    /// The search narrows the sidebar and nothing else, so the two are one column: the field is
-    /// as wide as the list it filters, sits directly above it, and leaves the rest of the dialog
-    /// to the page.
+    /// The header is the gallery's: the title on the left and the search field at the end of
+    /// the row, above the two columns. The field still narrows the sidebar; what moved is where
+    /// it is drawn.
     #[gpui_kit::test]
-    fn the_search_should_sit_in_the_column_of_the_sidebar_it_filters(cx: &mut TestAppContext) {
+    fn the_header_should_hold_the_search_above_the_columns(cx: &mut TestAppContext) {
         let (_, cx) = settings(Config::default(), cx);
 
+        let page = cx
+            .debug_bounds("SETTINGS_PAGE")
+            .expect("the settings page should be drawn");
+        let column = cx
+            .debug_bounds("SETTINGS_COLUMN")
+            .expect("the page's content column should be drawn");
+        let header = cx
+            .debug_bounds("SETTINGS_HEADER")
+            .expect("the header should be drawn");
+        let title = cx
+            .debug_bounds("SETTINGS_TITLE")
+            .expect("the header should draw its title");
         let search = cx
             .debug_bounds("SETTINGS_SEARCH")
-            .expect("the search field should be drawn");
+            .expect("the header should draw its search field");
         let sidebar = cx
             .debug_bounds("SETTINGS_SIDEBAR")
             .expect("the sidebar should be drawn");
-        let dialog = cx
-            .debug_bounds("SETTINGS_DIALOG")
-            .expect("the dialog should be drawn");
 
-        assert_eq!(search.size.width, px(256.0), "the search field is w_64");
         assert_eq!(
-            sidebar.size.width, search.size.width,
-            "the sidebar should be as wide as the field above it"
-        );
-        assert_eq!(sidebar.left(), search.left(), "the two should line up");
-        assert!(
-            sidebar.top() >= search.bottom(),
-            "the search should sit above the list it filters"
+            column.size.width,
+            px(1000.0).min(page.size.width),
+            "the content column is 1000 px, or the page's whole width when the window is narrower"
         );
         assert!(
-            sidebar.right() < dialog.right(),
-            "the column should leave the rest of the dialog to the page"
+            (column.left() - (page.left() + (page.size.width - column.size.width) / 2.0)).abs()
+                < px(1.0),
+            "the content column should be centred in the page: column {column:?}, page {page:?}"
+        );
+        assert_eq!(
+            search.size.width,
+            px(240.0),
+            "the search field is the gallery header's 240 px"
+        );
+        assert!(
+            search.left() > title.right(),
+            "the search field is at the end of the header, not over the title: \
+             search {search:?}, title {title:?}"
+        );
+        assert!(
+            search.top() >= header.top() && search.bottom() <= header.bottom(),
+            "the search field belongs to the header: search {search:?}, header {header:?}"
+        );
+        assert!(
+            sidebar.top() >= header.bottom(),
+            "the columns start under the header: sidebar {sidebar:?}, header {header:?}"
+        );
+        assert!(
+            sidebar.right() < column.right(),
+            "the menu column should leave the rest of the content column to the page"
+        );
+    }
+
+    /// The page's two decisions sit under a separator at its foot, in the same column as the
+    /// content above them: cancel first, confirm last, both at the gallery's medium size.
+    #[gpui_kit::test]
+    fn the_footer_should_draw_cancel_and_confirm_under_a_separator(cx: &mut TestAppContext) {
+        let (_, cx) = settings(Config::default(), cx);
+
+        let page = cx
+            .debug_bounds("SETTINGS_PAGE")
+            .expect("the settings page should be drawn");
+        let column = cx
+            .debug_bounds("SETTINGS_COLUMN")
+            .expect("the page's content column should be drawn");
+        let footer = cx
+            .debug_bounds("SETTINGS_FOOTER")
+            .expect("the page should draw its footer");
+        let cancel = cx
+            .debug_bounds("SETTINGS_CANCEL")
+            .expect("the footer should draw the cancel button");
+        let confirm = cx
+            .debug_bounds("SETTINGS_CONFIRM")
+            .expect("the footer should draw the confirm button");
+
+        assert_eq!(
+            footer.bottom(),
+            page.bottom(),
+            "the footer is the foot of the page: footer {footer:?}, page {page:?}"
+        );
+        assert!(
+            cancel.top() >= footer.top() && confirm.top() >= footer.top(),
+            "both buttons belong under the footer's separator: footer {footer:?}, \
+             cancel {cancel:?}, confirm {confirm:?}"
+        );
+        assert!(
+            cancel.right() < confirm.left(),
+            "cancel comes before confirm: cancel {cancel:?}, confirm {confirm:?}"
+        );
+        assert!(
+            (confirm.right() - (column.right() - px(24.0))).abs() < px(1.0),
+            "the button row ends at the content column's inner edge: confirm {confirm:?}, \
+             column {column:?}"
+        );
+        assert_eq!(
+            cancel.size.height, confirm.size.height,
+            "both buttons are the same medium size: cancel {cancel:?}, confirm {confirm:?}"
         );
     }
 
@@ -3343,7 +3464,7 @@ mod tests {
         click(cx, "SETTINGS_CONFIRM");
 
         assert!(
-            cx.debug_bounds("SETTINGS_DIALOG").is_some(),
+            cx.debug_bounds("SETTINGS_PAGE").is_some(),
             "the settings should not be confirmed by a click that was aimed through the form"
         );
         assert!(

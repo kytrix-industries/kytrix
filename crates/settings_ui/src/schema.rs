@@ -2,7 +2,8 @@
 //!
 //! The static pages are declarations. The translation page is one of them, though it draws
 //! itself rather than fields; the two proxy pages and the venue pages are built from the build's
-//! static venue list and from the stored configuration — see [`crate::entry::show_settings`]: a
+//! static venue list and from the stored configuration — see
+//! [`crate::settings::SettingsPage::load`]: a
 //! venue this build speaks has its line, its origins and its credentials whether or not anything
 //! is loaded, because configuring them is what makes loading a venue possible at all. The scope
 //! rows of one venue's page are the scopes its own stored configuration names, and the origins
@@ -679,10 +680,10 @@ fn venue_pages(venues: &VenueView) -> Vec<PageDef> {
 /// whose settings are of another shape is not one this build can draw, so the page is
 /// chosen by the venue and the settings are read and written through the venue's own row.
 ///
-/// The builder answers any venue identity, while the dialog draws the served list: a venue this
+/// The builder answers any venue identity, while the page draws the served list: a venue this
 /// build serves nothing for would have a page here that nothing reaches, and the day its loader
 /// lands is the day the same page is drawn. Every venue this build carries an identity for is
-/// served, so the two halves agree — see [`crate::dialog::SettingsDialog::new`].
+/// served, so the two halves agree — see [`crate::settings::SettingsPage::load`].
 fn venue_page(venue: &VenueId) -> PageDef {
     PageDef {
         id: venue_page_id(venue),
@@ -1752,18 +1753,17 @@ pub(crate) mod tests {
     /// locale, and a locale's key would look like an orphan the crate does not draw. Nothing ties
     /// it to the directory, so a source added to this crate has to be added here too — which is
     /// what [`every_settings_source_should_be_read_by_the_key_guard`] is for.
-    const SETTINGS_SOURCES: [(&str, &str); 13] = [
+    const SETTINGS_SOURCES: [(&str, &str); 12] = [
         ("access.rs", include_str!("access.rs")),
         ("appearance.rs", include_str!("appearance.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
-        ("dialog.rs", include_str!("dialog.rs")),
         ("draft.rs", include_str!("draft.rs")),
         ("editor.rs", include_str!("editor.rs")),
-        ("entry.rs", include_str!("entry.rs")),
         ("lib.rs", include_str!("lib.rs")),
         ("page.rs", include_str!("page.rs")),
         ("schema.rs", include_str!("schema.rs")),
         ("search.rs", include_str!("search.rs")),
+        ("settings.rs", include_str!("settings.rs")),
         ("table.rs", include_str!("table.rs")),
         ("translation.rs", include_str!("translation.rs")),
     ];

@@ -19,7 +19,7 @@ use gpui_kit::{
 use profile_ui::profile::ProfileMenu;
 
 use super::{footer::SidebarFooter, layout::TITLE_BAR_HEIGHT, workspaces::SidebarWorkspaces};
-use crate::windows::root::components::workspace::Workspaces;
+use crate::windows::root::components::pages::MainPages;
 
 /// The panel, whichever of the two places it is drawn in.
 pub(crate) const SIDEBAR: &str = "SIDEBAR";
@@ -44,7 +44,7 @@ pub(crate) struct Sidebar {
     /// was showing rather than switching to icons on its way out.
     mode: SidebarMode,
     width: Pixels,
-    workspaces: Entity<Workspaces>,
+    pages: Entity<MainPages>,
     profile: Entity<ProfileMenu>,
     /// Called as the pointer enters or leaves the panel's content, below the title bar.
     content_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -56,13 +56,13 @@ impl Sidebar {
     pub(crate) fn new(
         mode: SidebarMode,
         width: Pixels,
-        workspaces: Entity<Workspaces>,
+        pages: Entity<MainPages>,
         profile: Entity<ProfileMenu>,
     ) -> Self {
         Self {
             mode,
             width,
-            workspaces,
+            pages,
             profile,
             content_hover: None,
             popup_scope: 0,
@@ -129,9 +129,10 @@ impl RenderOnce for Sidebar {
             content = content.on_hover(move |hovered, window, cx| on_hover(hovered, window, cx));
         }
 
-        let workspaces =
-            SidebarWorkspaces::new(full, self.workspaces).popup_scope(self.popup_scope);
-        let footer = SidebarFooter::new(full, self.profile).popup_scope(self.popup_scope);
+        let workspaces = self.pages.read(cx).workspaces().clone();
+        let workspaces = SidebarWorkspaces::new(full, workspaces).popup_scope(self.popup_scope);
+        let footer =
+            SidebarFooter::new(full, self.pages, self.profile).popup_scope(self.popup_scope);
 
         content = content
             .child(workspaces)
@@ -191,6 +192,7 @@ mod tests {
     use super::{SIDEBAR, SIDEBAR_DIVIDER, Sidebar};
     use crate::windows::root::{
         components::{
+            pages::MainPages,
             sidebar::{
                 footer::{
                     SIDEBAR_FOOTER_PROFILE, SIDEBAR_FOOTER_PROFILE_LABEL, SIDEBAR_FOOTER_SETTINGS,
@@ -217,7 +219,7 @@ mod tests {
     /// hands it.
     struct Harness {
         mode: SidebarMode,
-        workspaces: Entity<Workspaces>,
+        pages: Entity<MainPages>,
         profile: Entity<ProfileMenu>,
         /// The sidebar reads the list while this view draws, so the view follows the store
         /// the way the window around the panel does.
@@ -229,7 +231,7 @@ mod tests {
             div().size_full().flex().child(Sidebar::new(
                 self.mode,
                 width(self.mode),
-                self.workspaces.clone(),
+                self.pages.clone(),
                 self.profile.clone(),
             ))
         }
@@ -284,6 +286,7 @@ mod tests {
             install_service_connector(cx);
         });
         let workspaces = cx.update(|cx| cx.new(Workspaces::load));
+        let pages = cx.update(|cx| cx.new(|cx| MainPages::new(workspaces.clone(), cx)));
         let profile = cx.update(|cx| cx.new(ProfileMenu::new));
         let (_, cx) = cx.add_window_view({
             let workspaces = workspaces.clone();
@@ -293,7 +296,7 @@ mod tests {
 
                     Harness {
                         mode,
-                        workspaces,
+                        pages,
                         profile,
                         _workspaces: subscription,
                     }

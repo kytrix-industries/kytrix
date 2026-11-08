@@ -17,8 +17,8 @@ use app_config::workspace::{
 };
 use app_config_provider::manager::ConfigManager;
 use gpui_kit::{
-    App, AppContext, BorrowAppContext, Context, Entity, IntoElement, ParentElement, Render,
-    SharedString, Styled, Subscription, Task, Window, div,
+    App, AppContext, BorrowAppContext, Context, Entity, EventEmitter, IntoElement, ParentElement,
+    Render, SharedString, Styled, Subscription, Task, Window, div,
 };
 use i18n::t;
 use smol_str::SmolStr;
@@ -31,6 +31,18 @@ const PERSIST_SETTLE_DELAY: Duration = Duration::from_millis(400);
 /// The element id the first stage of a process gets. Every rebuilt stage takes
 /// the next one, so a new stage never inherits a dead stage's keyed state.
 const FIRST_STAGE_ID: u64 = 1;
+
+/// What the workspace list did that the window around it has to follow.
+///
+/// It is the navigation signal: a row that selects a workspace, and an add or a delete that
+/// leaves another one active, all mean the window is to show a workspace. What the window
+/// shows beside it — the settings page — is not this list's to change; it only says that the
+/// workspace is the page the user asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspacesEvent {
+    /// A workspace was selected, added or left behind by a delete, and is what should be shown.
+    Activated,
+}
 
 pub(crate) struct Workspaces {
     /// In the order the sidebar lists them; the active one is the only entry
@@ -46,6 +58,8 @@ pub(crate) struct Workspaces {
     /// Follows the current stage's layout changes; replaced with the stage.
     stage_layout: Subscription,
 }
+
+impl EventEmitter<WorkspacesEvent> for Workspaces {}
 
 impl Workspaces {
     /// Loads the stored workspaces, creating the first one when there is none.
@@ -145,6 +159,11 @@ impl Workspaces {
             return;
         };
         if target == self.active {
+            // The row is also how the window comes back from the settings page: a press on
+            // the workspace that is already active still asks for the workspace to be shown.
+            // The workspace's own page goes with the press, even though the panes do not.
+            self.close_page(cx);
+            cx.emit(WorkspacesEvent::Activated);
             return;
         }
 
@@ -153,7 +172,22 @@ impl Workspaces {
         self.active = target;
         self.replace_stage(cx);
         self.persist(cx);
+        cx.emit(WorkspacesEvent::Activated);
         cx.notify();
+    }
+
+    /// The stage the active workspace is drawn through.
+    #[cfg(test)]
+    pub(crate) fn stage(&self) -> &Entity<Stage> {
+        &self.stage
+    }
+
+    /// Takes the workspace's own page away at once, if one is open.
+    ///
+    /// The window leaves the workspace for the settings page, and the gallery a pane had open
+    /// belongs to a workspace that is no longer being shown.
+    pub(crate) fn close_page(&self, cx: &mut Context<Self>) {
+        self.stage.update(cx, |stage, cx| stage.close_page(cx));
     }
 
     /// Adds a workspace and switches to it.
@@ -172,6 +206,7 @@ impl Workspaces {
         self.active = self.entries.len() - 1;
         self.replace_stage(cx);
         self.persist(cx);
+        cx.emit(WorkspacesEvent::Activated);
         cx.notify();
 
         Ok(())
@@ -232,13 +267,17 @@ impl Workspaces {
 
         self.pending_persist = None;
         self.entries.remove(index);
-        if index == self.active {
+        let activated = index == self.active;
+        if activated {
             self.active = self.active.saturating_sub(1);
             self.replace_stage(cx);
         } else if index < self.active {
             self.active -= 1;
         }
         self.persist(cx);
+        if activated {
+            cx.emit(WorkspacesEvent::Activated);
+        }
         cx.notify();
     }
 

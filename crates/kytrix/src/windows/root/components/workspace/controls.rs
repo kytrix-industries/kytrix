@@ -58,7 +58,7 @@ impl RenderOnce for PaneWidgetButton {
         // The page covers the pane's header while it is open, so a hint about this control
         // would be a popup painted over the page: the tooltip is withdrawn with the control's
         // job, and the page's own controls carry theirs.
-        let tooltip = (!self.stage.read(cx).is_widget_gallery_open())
+        let tooltip = (!self.stage.read(cx).is_widget_gallery_open(cx))
             .then(|| t!(cx, "window.pane.select_widget"));
         let button = Button::new(self.id)
             .debug_selector(|| PANE_WIDGET_BUTTON.into())
@@ -355,9 +355,9 @@ mod tests {
     use widget_registry::registry::{WidgetRegistration, WidgetRegistry};
 
     use crate::windows::root::components::workspace::{
+        pages::PAGE_TRANSITION_DURATION,
         stage::Stage,
         tree::{NodeId, PaneNode, PaneOrientation},
-        widget_picker::MORPH_DURATION,
     };
 
     /// The debug selectors of the page this test opens, and of its way out.
@@ -462,10 +462,10 @@ mod tests {
         (stage, split_id, panes)
     }
 
-    /// Lets the page's morph finish and repaints, so what is drawn is what has settled.
+    /// Lets the page's transition finish and repaints, so what is drawn is what has settled.
     fn settle(cx: &mut VisualTestContext) {
         cx.executor()
-            .advance_clock(MORPH_DURATION + Duration::from_millis(50));
+            .advance_clock(PAGE_TRANSITION_DURATION + Duration::from_millis(50));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
     }
@@ -511,16 +511,16 @@ mod tests {
         );
     }
 
-    /// The pane's Widget control opens the page inside the workspace, and the page starts as the
-    /// rectangle of the pane whose control was clicked rather than as the whole workspace: it is
-    /// opened from the pane, and the growth out of it is what says so.
+    /// The pane's Widget control opens the page inside the workspace. The page enters from the
+    /// workspace's bottom edge: on the frame it opens it sits a workspace-height below its
+    /// place, and once the transition has run it covers the stage.
     ///
-    /// The pane is one of two, so its rectangle really is smaller than the stage's: a page that
-    /// opened at the stage's own rectangle cannot pass this test.
-    ///
-    /// Backing out leaves the pane as it was and takes the page away once it has shrunk back.
+    /// Backing out leaves the pane as it was and takes the page away once it has slid back
+    /// down.
     #[gpui_kit::test]
-    fn clicking_the_widget_control_opens_the_picker_from_the_pane(cx: &mut TestAppContext) {
+    fn clicking_the_widget_control_opens_the_page_from_the_bottom_of_the_workspace(
+        cx: &mut TestAppContext,
+    ) {
         let (stage, _, panes) = split_stage(cx);
         let (_, cx) = cx.add_window_view({
             let stage = stage.clone();
@@ -540,17 +540,11 @@ mod tests {
             .expect("the panes' headers should draw their Widget controls");
         // Every pane draws the same control selector, so which pane owns the box that was
         // drawn is told by the pane whose rectangle holds it.
-        let (pane_id, pane) = panes
+        let pane_id = panes
             .iter()
-            .map(|pane_id| (pane_id, pane_bounds(cx, &stage, pane_id)))
-            .find(|(_, bounds)| bounds.contains(&button.center()))
+            .find(|pane_id| pane_bounds(cx, &stage, pane_id).contains(&button.center()))
             .expect("the control that was drawn should sit in one of the panes");
         let before = cx.update(|_, cx| stage.read(cx).pane_widget_id(pane_id, cx));
-        assert!(
-            pane.size.width < stage_rect.size.width,
-            "the fixture needs a pane narrower than the stage, or the page would be the stage \
-             anyway: pane {pane:?}, stage {stage_rect:?}"
-        );
 
         cx.simulate_click(button.center(), Modifiers::none());
         cx.update(|window, _| window.refresh());
@@ -559,18 +553,28 @@ mod tests {
         let opened = cx
             .debug_bounds(GALLERY_PANEL)
             .expect("the pane's own control should have opened the page");
+        let below = Bounds::new(
+            point(
+                stage_rect.origin.x,
+                stage_rect.origin.y + stage_rect.size.height,
+            ),
+            stage_rect.size,
+        );
         assert_same_bounds(
             opened,
-            pane,
-            "the page should open on the rectangle of the pane it was opened from",
-        );
-        assert!(
-            opened.size.width < stage_rect.size.width,
-            "the opened page must be the pane it was opened from, not the whole stage: \
-             opened {opened:?}, stage {stage_rect:?}"
+            below,
+            "the page should open one workspace-height below its place",
         );
 
         settle(cx);
+        let settled = cx
+            .debug_bounds(GALLERY_PANEL)
+            .expect("the settled page should be drawn");
+        assert_same_bounds(
+            settled,
+            stage_rect,
+            "the settled page should cover the stage",
+        );
         let cancel = cx
             .debug_bounds(GALLERY_CANCEL)
             .expect("the settled page should offer its way out")
@@ -580,7 +584,7 @@ mod tests {
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "backing out should take the page away once it has shrunk back"
+            "backing out should take the page away once it has slid back down"
         );
         assert_eq!(
             cx.update(|_, cx| stage.read(cx).pane_widget_id(pane_id, cx)),

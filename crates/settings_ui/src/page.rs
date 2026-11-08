@@ -2,16 +2,16 @@
 //!
 //! A control is built from what the catalog says about it, so this module is the only place
 //! that turns a [`FieldAccess`] into an element. What a control is given is always the same
-//! things — the settings this session holds, the dialog that owns the fields being typed
-//! into, and the filter that decides which of the page's fields are drawn.
+//! things — the settings this session holds, the page that owns the fields being typed into,
+//! and the filter that decides which of the page's fields are drawn.
 //!
 //! What a control writes is that session rather than the saved settings: a choice is recorded
 //! as a change to confirm, and the settings move only when the user confirms them.
 //!
 //! Text fields are the one kind that own state: a field is written when the caret leaves it
-//! rather than on every keystroke, so a half-typed key is never recorded. What the dialog owns
+//! rather than on every keystroke, so a half-typed key is never recorded. What the page owns
 //! is the input entities, keyed by field id — see
-//! [`crate::dialog::SettingsDialog::input_for`].
+//! [`crate::settings::SettingsPage::input_for`].
 
 use app_config::settings::Config;
 use base_ui::{
@@ -34,8 +34,8 @@ use i18n::t;
 use crate::{
     access::{FieldValue, PROXY_DIRECT, PROXY_INHERIT, PROXY_MIXED, PROXY_SYSTEM},
     catalog::{FieldAccess, FieldDef, PageDef, SelectOptionDef},
-    dialog::SettingsDialog,
     search::SearchFilter,
+    settings::SettingsPage,
 };
 
 /// The page drawn behind one tree entry, or `None` for a page that has nothing to draw.
@@ -44,26 +44,26 @@ use crate::{
 /// and the translation page is a view of its own — so what it says here is that nothing is drawn
 /// from the declaration.
 ///
-/// The scroll position is handed in rather than read back from the dialog: a page is drawn
-/// while the dialog is being rendered, and the dialog cannot be read from inside its own
-/// render. The settings are handed in for the same reason, and because what is drawn is the
-/// session the dialog holds rather than what is saved.
+/// The scroll position is handed in rather than read back from the settings page: a page is
+/// drawn while the settings page is being rendered, and the settings page cannot be read from
+/// inside its own render. The settings are handed in for the same reason, and because what is
+/// drawn is the session the page holds rather than what is saved.
 pub(crate) fn page_body(
     page: &PageDef,
     config: &Config,
     filter: &SearchFilter,
     scroll: ScrollHandle,
     window: &mut Window,
-    dialog: &mut SettingsDialog,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    settings: &mut SettingsPage,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> Option<AnyElement> {
     if page.sections.is_empty() {
         return None;
     }
 
     Some(page_scroll(
-        page, config, filter, scroll, window, dialog, handle, cx,
+        page, config, filter, scroll, window, settings, handle, cx,
     ))
 }
 
@@ -74,9 +74,9 @@ fn page_scroll(
     filter: &SearchFilter,
     scroll: ScrollHandle,
     window: &mut Window,
-    dialog: &mut SettingsDialog,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    settings: &mut SettingsPage,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
     let mut content = div()
         .debug_selector(|| "SETTINGS_PAGE_CONTENT".into())
@@ -105,7 +105,7 @@ fn page_scroll(
         }
         for field in fields {
             visible += 1;
-            content = content.child(field_row(field, config, window, dialog, handle, cx));
+            content = content.child(field_row(field, config, window, settings, handle, cx));
         }
     }
 
@@ -133,11 +133,11 @@ fn field_row(
     field: &FieldDef,
     config: &Config,
     window: &mut Window,
-    dialog: &mut SettingsDialog,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    settings: &mut SettingsPage,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
-    let control = control(field, config, window, dialog, handle, cx);
+    let control = control(field, config, window, settings, handle, cx);
 
     div()
         .w_full()
@@ -170,9 +170,9 @@ fn control(
     field: &FieldDef,
     config: &Config,
     window: &mut Window,
-    dialog: &mut SettingsDialog,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    settings: &mut SettingsPage,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
     match &field.access {
         FieldAccess::Info { .. } => field
@@ -184,7 +184,7 @@ fn control(
         FieldAccess::ProxyLine { default_line, .. } => {
             field_proxy_line(field, *default_line, config, handle, cx)
         }
-        FieldAccess::Text { .. } => field_text(field, config, window, dialog, cx),
+        FieldAccess::Text { .. } => field_text(field, config, window, settings, cx),
     }
 }
 
@@ -193,8 +193,8 @@ fn field_select(
     field: &FieldDef,
     options: &'static [SelectOptionDef],
     config: &Config,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
     let selected = field.access.current(config);
     let label = field.label.label(cx);
@@ -213,14 +213,14 @@ fn field_select(
         .aria_label(label)
         .on_change({
             let access = field.access.clone();
-            let dialog = handle.downgrade();
+            let settings = handle.downgrade();
             move |item_id, _, cx| {
                 let Some(value) = item_id.clone() else {
                     return;
                 };
-                if let Some(dialog) = dialog.upgrade() {
-                    dialog.update(cx, |dialog, cx| {
-                        dialog.write_field(access.clone(), FieldValue::new(value.as_str()), cx);
+                if let Some(settings) = settings.upgrade() {
+                    settings.update(cx, |settings, cx| {
+                        settings.write_field(access.clone(), FieldValue::new(value.as_str()), cx);
                     });
                 }
             }
@@ -231,7 +231,7 @@ fn field_select(
 
 /// The line every target behind the field is bound to.
 ///
-/// The choices are the entries of the session this dialog holds, which are not a compile-time
+/// The choices are the entries of the session this page holds, which are not a compile-time
 /// fact, so they are read from that session while the control is drawn. The line the row holds is
 /// always one of them: a group whose targets disagree, and an entry the catalog no longer carries,
 /// are the two lines a row can hold that no other choice names, and both are offered as
@@ -245,8 +245,8 @@ fn field_proxy_line(
     field: &FieldDef,
     default_line: bool,
     config: &Config,
-    handle: &Entity<SettingsDialog>,
-    cx: &mut Context<SettingsDialog>,
+    handle: &Entity<SettingsPage>,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
     let selected = field.access.current(config);
     let label = field.label.label(cx);
@@ -291,7 +291,7 @@ fn field_proxy_line(
         )));
     }
     let access = field.access.clone();
-    let dialog = handle.downgrade();
+    let settings = handle.downgrade();
 
     div()
         .w_full()
@@ -310,9 +310,13 @@ fn field_proxy_line(
                     let Some(value) = item_id.clone() else {
                         return;
                     };
-                    if let Some(dialog) = dialog.upgrade() {
-                        dialog.update(cx, |dialog, cx| {
-                            dialog.write_field(access.clone(), FieldValue::new(value.as_str()), cx);
+                    if let Some(settings) = settings.upgrade() {
+                        settings.update(cx, |settings, cx| {
+                            settings.write_field(
+                                access.clone(),
+                                FieldValue::new(value.as_str()),
+                                cx,
+                            );
                         });
                     }
                 }),
@@ -325,11 +329,11 @@ fn field_text(
     field: &FieldDef,
     config: &Config,
     window: &mut Window,
-    dialog: &mut SettingsDialog,
-    cx: &mut Context<SettingsDialog>,
+    settings: &mut SettingsPage,
+    cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
     let stored = field.access.current(config);
-    let input = dialog.input_for(field.clone(), &stored, window, cx);
+    let input = settings.input_for(field.clone(), &stored, window, cx);
 
     div()
         .w_full()

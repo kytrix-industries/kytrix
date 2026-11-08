@@ -25,6 +25,7 @@ use settings_ui::appearance;
 use updater_ui::indicator::UpdateIndicator;
 
 use crate::windows::root::components::{
+    pages::MainPages,
     sidebar::{
         FLOATING_CLOSE_DELAY, FloatingSidebar, SIDEBAR_FLOATING, SIDEBAR_FULL_WIDTH,
         SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE, Sidebar, TITLE_BAR_HEIGHT, TOGGLE_INSET,
@@ -98,8 +99,8 @@ pub fn open(cx: &mut App, recovered: Option<ConfigRecovery>) {
 struct RootWindow {
     /// The market participants menu the title bar draws: the one control that loads a venue.
     market_participants: Entity<MarketParticipants>,
-    /// The workspaces the page shows and the sidebar lists.
-    workspaces: Entity<Workspaces>,
+    /// The page area: the workspace, or the settings page the sidebar switches to.
+    pages: Entity<MainPages>,
     /// How the sidebar is drawn, mirrored from the settings this window read at startup and
     /// wrote back on every press of the toggle.
     sidebar: SidebarMode,
@@ -166,7 +167,7 @@ struct RootWindow {
     _system_appearance: Subscription,
     /// Applies the user's appearance preference for as long as this window lives.
     ///
-    /// The settings dialog only writes the preference; this subscription applies it as the
+    /// The settings page only writes the preference; this subscription applies it as the
     /// process-wide theme when the write is published, resolving `System` against this window.
     _appearance: Subscription,
 }
@@ -216,6 +217,7 @@ impl RootWindow {
         // subscribes to: it is read here, once, and written back by the toggle.
         let sidebar = cx.global::<ConfigManager>().read().ui.sidebar;
         let workspaces = cx.new(Workspaces::load);
+        let pages = cx.new(|cx| MainPages::new(workspaces.clone(), cx));
         // The sidebar reads the workspace list while this window draws, so an added,
         // renamed, deleted or switched workspace is a change to what the window shows. The
         // stage is a view of its own and redraws itself; the list around it does not. Both
@@ -227,7 +229,7 @@ impl RootWindow {
 
         Self {
             market_participants,
-            workspaces,
+            pages,
             sidebar,
             floating: FloatingSidebar::default(),
             popup_scope: 0,
@@ -671,7 +673,7 @@ impl RootWindow {
                 Sidebar::new(
                     SidebarMode::Full,
                     width,
-                    self.workspaces.clone(),
+                    self.pages.clone(),
                     self.profile.clone(),
                 )
                 .popup_scope(self.popup_scope),
@@ -735,7 +737,7 @@ impl Render for RootWindow {
         let mut panel = Sidebar::new(
             self.sidebar,
             docked_width,
-            self.workspaces.clone(),
+            self.pages.clone(),
             self.profile.clone(),
         );
         // The icon-only rail is the collapsed full panel: a pointer on its content asks for
@@ -787,7 +789,7 @@ impl Render for RootWindow {
                             .min_h_0()
                             .px_1()
                             .pb_1()
-                            .child(self.workspaces.clone()),
+                            .child(self.pages.clone()),
                     ),
             )
             .when(popup_should_render(preview_open, preview), |this| {
@@ -884,8 +886,13 @@ mod tests {
 
     /// The labels the full panel draws beside the marks that stay in both states.
     const ADD_WORKSPACE_LABEL: &str = "SIDEBAR_NEW_WORKSPACE_LABEL";
+    const SETTINGS_ENTRY: &str = "SIDEBAR_FOOTER_SETTINGS";
     const SETTINGS_LABEL: &str = "SIDEBAR_FOOTER_SETTINGS_LABEL";
     const PROFILE_LABEL: &str = "SIDEBAR_FOOTER_PROFILE_LABEL";
+
+    /// The settings page and the workspace under it, as the page area draws them.
+    const SETTINGS_PAGE: &str = "SETTINGS_PAGE";
+    const PANE_BODY: &str = "PANE_BODY";
 
     /// The window the notice is announced in.
     ///
@@ -2258,5 +2265,42 @@ mod tests {
                 "{selector} holds the column at the full width"
             );
         }
+    }
+
+    /// The settings entry switches the page area to the settings page without rebuilding the
+    /// workspace, and a press on the workspace that is already active gives the page area back.
+    #[gpui_kit::test]
+    fn the_footer_settings_should_open_the_settings_page_and_a_workspace_row_should_close_it(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = root_window(cx, SidebarMode::Full);
+
+        assert!(
+            cx.debug_bounds(PANE_BODY).is_some(),
+            "the window opens on the workspace"
+        );
+        assert!(cx.debug_bounds(SETTINGS_PAGE).is_none());
+
+        click(cx, SETTINGS_ENTRY);
+
+        assert!(
+            cx.debug_bounds(SETTINGS_PAGE).is_some(),
+            "the settings entry should show the settings page"
+        );
+        assert!(
+            cx.debug_bounds(PANE_BODY).is_none(),
+            "the workspace should not be drawn behind the settings page"
+        );
+
+        click(cx, WORKSPACE_ROW);
+
+        assert!(
+            cx.debug_bounds(SETTINGS_PAGE).is_none(),
+            "a workspace row should take the settings page away"
+        );
+        assert!(
+            cx.debug_bounds(PANE_BODY).is_some(),
+            "a workspace row should show the workspace again"
+        );
     }
 }

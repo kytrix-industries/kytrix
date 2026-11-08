@@ -1309,9 +1309,11 @@ settings_ui:
     title: 设置保存失败
   search:
     placeholder: 搜索设置
+  subtitle: 配置应用程序
   time_zone:
     description: 选择各个部件显示数据时间时使用的时区，所有数据时间都会按该时区换算
     title: 数据时间时区
+  title: 设置
 startup:
   config_reset_message: <p align="center">配置文件受损，已重新初始化为默认配置。原文件已备份为 %{file}。</p>
   config_reset_message_no_backup: <p align="center">配置文件受损，已重新初始化为默认配置；原文件备份失败。</p>

@@ -3,32 +3,25 @@
 
 use app_config::workspace::WorkspaceLayout;
 use gpui_kit::{
-    App, AppContext, Context, ElementId, Empty, Entity, EventEmitter, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Point, Render, SharedString, Styled, Window,
-    base::{Easing, Presence, Transition},
-    div,
+    App, AppContext, Context, ElementId, Empty, Entity, EventEmitter, IntoElement, ParentElement,
+    Pixels, Point, Render, SharedString, Styled, Window, div,
 };
 use market_participants_model::market::selection::InstrumentSelection;
 use widget::{identity::WidgetId, instrument_link::InstrumentLink};
-use widget_gallery_ui::gallery::{WidgetGallery, WidgetGalleryEvent};
 use widget_registry::registry::WidgetRegistry;
 
 use super::{
     controls::ResizeBar,
     drag::PaneDragSource,
     layout::{StageLayoutElement, StageLayoutNode, StageLayoutNodes},
+    pages::WorkspacePages,
     placeholder::InstrumentLinkMode,
     tree::{
         DropTargetPosition, NodeId, PaneNode, PaneNodeTree, PaneOrientation, PaneWidthConstraints,
     },
-    widget_picker::{MORPH_DURATION, WidgetPicker},
 };
 
 const INSTRUMENT_LINK_GROUPS: usize = 9;
-
-/// The debug selector of the transparent layer that keeps the stage under an open page from
-/// being clicked while the page grows over it.
-const WIDGET_GALLERY_SCRIM: &str = "WIDGET_GALLERY_SCRIM";
 
 /// How the stage changed in a way the stored workspace has to follow.
 ///
@@ -53,12 +46,10 @@ pub struct Stage {
     /// The split whose bar the pointer is holding, if any. Transient, like the drop preview: it
     /// outlives neither the press nor the stage.
     held_split: Option<NodeId>,
-    /// The page a pane's widget is being chosen from, while it is open.
-    ///
-    /// It is not persisted and not carried across stages: a workspace switch replaces the
+    /// The page drawn over the panes. It belongs to the stage: a workspace switch replaces the
     /// stage, and a choice that was being made in the workspace that is gone has nowhere to
     /// land.
-    widget_picker: Option<WidgetPicker>,
+    pages: Entity<WorkspacePages>,
     instrument_link_groups: [Option<InstrumentSelection>; INSTRUMENT_LINK_GROUPS],
 }
 
@@ -83,7 +74,7 @@ impl Stage {
             drop_target_preview: None,
             dragging_pane: None,
             held_split: None,
-            widget_picker: None,
+            pages: cx.new(|_| WorkspacePages::new()),
             instrument_link_groups: Default::default(),
         }
     }
@@ -321,10 +312,9 @@ impl Stage {
 
     /// Opens the page in which `pane_id`'s widget is chosen, over the stage.
     ///
-    /// The page is created here rather than while the stage draws: it makes the field it is
-    /// searched with, which is an entity, and it takes the caret, so building it inside a
-    /// frame would be the re-entrancy a frame must not have. The pane's bounds are read now,
-    /// because that is the rectangle the user asked the page to open from.
+    /// The page is created by its host rather than while the stage draws: it makes the field
+    /// it is searched with, which is an entity, and it takes the caret, so building it inside
+    /// a frame would be the re-entrancy a frame must not have.
     ///
     /// A second page over the first would have nothing to choose for, so opening while one is
     /// already open is a no-op.
@@ -334,58 +324,27 @@ impl Stage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.widget_picker.is_some() {
-            return;
-        }
-
         let Some(current) = self.pane_widget_id(pane_id, cx) else {
             log::error!("widget gallery opened from a pane that no longer exists");
             return;
         };
-        // A pane that has not been measured yet has no rectangle for the page to grow out of;
-        // the stage's own bounds are the closest thing to it, and the page still opens.
-        let Some(origin) = self
-            .pane_tree
-            .pane_bounds(pane_id)
-            .or_else(|| self.pane_tree.root().bounds().copied())
-        else {
-            log::error!("widget gallery opened before the stage was measured");
-            return;
-        };
+        let pane_id = pane_id.clone();
+        let stage = cx.entity().downgrade();
+        let pages = self.pages.clone();
 
-        let gallery = cx.new(|cx| WidgetGallery::new(Some(current), window, cx));
-        let events = cx.subscribe(&gallery, |stage, _, event: &WidgetGalleryEvent, cx| {
-            stage.widget_gallery_event(event, cx)
+        pages.update(cx, |pages, cx| {
+            pages.open_widget_gallery(pane_id, current, stage, window, cx);
         });
-        self.widget_picker = Some(WidgetPicker::new(pane_id.clone(), origin, gallery, events));
-        cx.notify();
     }
 
-    /// Whether the page a pane's widget is chosen from is open.
-    pub(in crate::windows::root) fn is_widget_gallery_open(&self) -> bool {
-        self.widget_picker.is_some()
+    /// Whether the page a pane's widget is chosen from is open, including one that is leaving.
+    pub(in crate::windows::root) fn is_widget_gallery_open(&self, cx: &App) -> bool {
+        self.pages.read(cx).is_open()
     }
 
-    /// Applies a confirmed choice and starts the page shrinking back, or starts it shrinking
-    /// back without a choice.
-    ///
-    /// The choice is applied immediately rather than when the shrink has finished: the page
-    /// covers what changes underneath it, and the widget the user asked for is what the frame
-    /// that uncovers the pane shows. A report that arrives while the page is already leaving
-    /// belongs to a decision that was made, so it is dropped rather than applied again.
-    fn widget_gallery_event(&mut self, event: &WidgetGalleryEvent, cx: &mut Context<Self>) {
-        let Some((pane_id, event)) = self.widget_picker.as_mut().and_then(|picker| {
-            let event = picker.report(event)?;
-
-            Some((picker.pane_id().clone(), event))
-        }) else {
-            return;
-        };
-
-        if let WidgetGalleryEvent::Confirm(widget_id) = event {
-            self.set_widget(&pane_id, widget_id.as_str(), cx);
-        }
-        cx.notify();
+    /// Takes the page over the stage away at once, if there is one.
+    pub(in crate::windows::root) fn close_page(&self, cx: &mut Context<Self>) {
+        self.pages.update(cx, |pages, cx| pages.close(cx));
     }
 
     /// The widget type the pane is showing; `None` when there is no such pane.
@@ -600,73 +559,13 @@ impl Stage {
 }
 
 impl Render for Stage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The page grows out of its pane until it covers the stage: 0 is the pane's own
-        // rectangle and 1 is the whole stage. `Presence` owns the transition, including the
-        // value a reversal starts from — an interrupted opening turns around from where it
-        // was rather than from the end it never reached — and reports the value to draw.
-        //
-        // It is sampled on every frame, including the frames on which no page is open:
-        // `Presence` starts from zero and keeps the absent state there, so the page's first
-        // opening frame is its pane's rectangle rather than a flash of the whole stage.
-        let page_present = self
-            .widget_picker
-            .as_ref()
-            .is_some_and(|picker| !picker.is_closing());
-        let morph = Presence::new((self.id.clone(), "WidgetGalleryMorph"), page_present)
-            .transition(Transition::new(MORPH_DURATION).easing(Easing::EaseInOut))
-            .sample(window, cx);
-        // The page is gone once it has shrunk back into its pane. What the frame that clears
-        // it draws is the pane's widget — the one the confirmation applied — uncovered. The
-        // search field's focus handle goes with the page's entity; whatever the user focused
-        // while the page was shrinking stays focused, which is why this frame does not blur
-        // the window.
-        //
-        // A page that starts leaving before `Presence` has drawn it even once would keep an
-        // invisible page over its pane for the length of the morph: `Presence`'s first absent
-        // sample starts a transition from zero to zero, so it reports `Exiting` at zero
-        // progress rather than `Absent`. Zero progress is the page at zero opacity over its
-        // own pane — nothing is drawn, but its scrim still covers the pane — so it is cleared
-        // then too.
-        let page_leaving = self
-            .widget_picker
-            .as_ref()
-            .is_some_and(WidgetPicker::is_closing);
-        if page_leaving && (!morph.should_render() || morph.progress <= 0.0) {
-            self.widget_picker = None;
-        }
-        let progress = morph.progress.clamp(0.0, 1.0);
-
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut nodes = StageLayoutNodes::new();
         // Whether a pane can be closed follows from the topology, so it is read
         // here rather than stored on every pane and kept in step by hand.
         let close_button_visible = self.pane_tree.is_split();
         let (root_index, _) =
             self.append_layout_node(self.pane_tree.root(), close_button_visible, &mut nodes, cx);
-        // The page is placed against the rectangles the current frame measured, so a window
-        // resized under an open page still grows it out of the pane and shrinks it back into
-        // the pane. They are the previous frame's measurements, which is what the retarget of
-        // every frame is for.
-        let overlay = self.widget_picker.as_ref().map(|picker| {
-            let origin = self
-                .pane_tree
-                .pane_bounds(picker.pane_id())
-                .unwrap_or(picker.origin());
-            let stage_bounds = self.pane_tree.root().bounds().copied();
-            picker.overlay(progress, origin, stage_bounds, cx)
-        });
-        // While the page exists, the panes it has not reached yet are still under it: the
-        // page's own occluding rectangle is only as large as the page, so without a scrim a
-        // click on a pane beside it would reach the pane. The scrim sits over the whole
-        // stage and under the page, so the page's own controls stay clickable and nothing
-        // else does.
-        let scrim = self.widget_picker.as_ref().map(|_| {
-            div()
-                .debug_selector(|| WIDGET_GALLERY_SCRIM.into())
-                .absolute()
-                .inset_0()
-                .occlude()
-        });
 
         div()
             .relative()
@@ -678,8 +577,9 @@ impl Render for Stage {
                 root_index,
                 drop_target_preview: self.drop_target_preview,
             })
-            .children(scrim)
-            .children(overlay)
+            // The workspace's own page covers the panes. It is drawn after them so it is
+            // above them, and it decides for itself when it has nothing to show.
+            .child(self.pages.clone())
     }
 }
 
@@ -718,10 +618,10 @@ mod tests {
 
     use crate::windows::root::components::workspace::{
         Stage,
+        pages::PAGE_TRANSITION_DURATION,
         placeholder::InstrumentLinkMode,
         stage::StageChange,
         tree::{PaneNode, PaneOrientation},
-        widget_picker::MORPH_DURATION,
     };
 
     /// A widget that only exists to carry an instrument link.
@@ -1024,10 +924,13 @@ mod tests {
     const GALLERY_CANCEL: &str = "WIDGET_GALLERY_CANCEL";
     const PICKER_WIDGET_ROW: &str = "WIDGET_GALLERY_ROW_kytrix.test.widget-picker";
 
-    /// Lets the page's morph finish and repaints, so what is drawn is what has settled.
-    fn settle_morph(cx: &mut VisualTestContext) {
+    /// The workspace's page host, which is what covers the panes while a page exists.
+    const WORKSPACE_PAGES: &str = "WORKSPACE_PAGES";
+
+    /// Lets the page's transition finish and repaints, so what is drawn is what has settled.
+    fn settle_page(cx: &mut VisualTestContext) {
         cx.executor()
-            .advance_clock(MORPH_DURATION + Duration::from_millis(50));
+            .advance_clock(PAGE_TRANSITION_DURATION + Duration::from_millis(50));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
     }
@@ -1095,73 +998,57 @@ mod tests {
         );
     }
 
-    /// The page grows out of the pane it was opened from: on the frame it opens it is the
-    /// pane's own rectangle, halfway through the morph it is a rectangle strictly between the
-    /// pane and the stage, and once the morph has run it covers the whole stage.
+    /// The page enters from the bottom of the workspace: on the frame it opens it sits one
+    /// workspace-height below its place, halfway through the transition it is halfway up, and
+    /// once the transition has run it covers the stage.
     ///
-    /// The pane is the tail of a split, so its rectangle differs from the stage's in both
-    /// origin and width: a page placed at the stage origin, or one that jumps straight to the
-    /// stage, cannot pass this test.
+    /// The page is the stage's own size at every point of the slide: what the transition moves
+    /// is the whole surface, not the rectangle it is drawn in.
     #[gpui_kit::test]
-    fn the_picker_should_grow_from_the_pane_to_the_whole_stage(cx: &mut TestAppContext) {
+    fn the_page_should_slide_up_from_the_bottom_of_the_workspace(cx: &mut TestAppContext) {
         let (stage, [_, right]) = stage_with_two_panes(cx);
         let cx = open_stage_window(&stage, cx);
-        let pane = pane_bounds(cx, &stage, &right);
         let stage_rect = stage_bounds(cx, &stage);
-        assert!(
-            pane.size.width < stage_rect.size.width,
-            "the fixture needs a pane narrower than the stage: pane {pane:?}, stage {stage_rect:?}"
-        );
 
         open_picker(&stage, &right, cx);
         let opened = cx
             .debug_bounds(GALLERY_PANEL)
-            .expect("the pane's page should be drawn");
+            .expect("the page should be drawn on the frame it opens on");
+        let below = Bounds::new(
+            point(
+                stage_rect.origin.x,
+                stage_rect.origin.y + stage_rect.size.height,
+            ),
+            stage_rect.size,
+        );
         assert_same_bounds(
             opened,
-            pane,
-            "the page should open on the rectangle of the pane it was opened from",
+            below,
+            "the page should open one workspace-height below its place",
         );
         assert!(
-            f32::from(opened.origin.x) > f32::from(stage_rect.origin.x) + 100.0
-                && opened.size.width < stage_rect.size.width,
-            "the opened page must be the pane, not the stage: opened {opened:?}, \
+            opened.top() >= stage_rect.bottom() - px(1.0),
+            "the opening page must start at the workspace's bottom edge: opened {opened:?}, \
              stage {stage_rect:?}"
         );
 
-        // Half of the 300ms morph: the page has to be somewhere on the way from the pane to
-        // the stage, in origin and in size at once.
-        cx.executor().advance_clock(MORPH_DURATION / 2);
+        cx.executor().advance_clock(PAGE_TRANSITION_DURATION / 2);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         let mid = cx
             .debug_bounds(GALLERY_PANEL)
-            .expect("the growing page should still be drawn");
+            .expect("the page should still be drawn halfway through the slide");
         assert!(
-            f32::from(mid.origin.x) < f32::from(pane.origin.x)
-                && f32::from(mid.origin.x) > f32::from(stage_rect.origin.x),
-            "halfway through the morph the page should sit between the pane and the stage: \
-             mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
+            mid.top() > stage_rect.top() && mid.top() < stage_rect.bottom(),
+            "halfway through the slide the page should sit between the workspace's top and \
+             bottom: mid {mid:?}, stage {stage_rect:?}"
         );
-        assert!(
-            mid.size.width > pane.size.width && mid.size.width < stage_rect.size.width,
-            "halfway through the morph the page should be wider than its pane and narrower \
-             than the stage: mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
-        );
-        let area =
-            |bounds: Bounds<Pixels>| f32::from(bounds.size.width) * f32::from(bounds.size.height);
-        assert!(
-            area(pane) < area(mid) && area(mid) < area(stage_rect),
-            "the page should cover more than its pane and less than the stage halfway \
-             through: mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
-        );
-        assert!(
-            mid.contains(&pane.center()) && stage_rect.contains(&mid.center()),
-            "the growing page should still cover its pane and be inside the stage: \
-             mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
+        assert_eq!(
+            mid.size, stage_rect.size,
+            "the sliding page keeps the workspace's size: mid {mid:?}, stage {stage_rect:?}"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
         let settled = cx
             .debug_bounds(GALLERY_PANEL)
             .expect("the settled page should still be drawn");
@@ -1173,16 +1060,13 @@ mod tests {
     }
 
     /// The page is placed in the stage's own coordinates, not the window's: a stage inset from
-    /// the window origin opens its page over its pane, halfway between the pane and the stage,
-    /// and finally over the whole stage — all in window coordinates.
+    /// the window origin slides its page from its own bottom edge and settles on its own
+    /// rectangle.
     ///
-    /// The stage here starts at (80, 40). The overlay draws itself at its target rectangle with
-    /// the stage origin subtracted, so a page that kept the window origin would be drawn 80 by
-    /// 40 pixels past every rectangle asserted below, and no assertion could hold.
+    /// The stage here starts at (80, 40). A page that kept the window origin would be drawn 80
+    /// by 40 pixels past every rectangle asserted below, and no assertion could hold.
     #[gpui_kit::test]
-    fn the_picker_should_be_placed_in_stage_coordinates_when_the_stage_is_inset(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_page_should_follow_an_inset_stage(cx: &mut TestAppContext) {
         let (stage, [_, right]) = stage_with_two_panes(cx);
         let cx = open_offset_stage_window(&stage, cx);
         let stage_rect = stage_bounds(cx, &stage);
@@ -1190,60 +1074,32 @@ mod tests {
             stage_rect.origin.x >= px(80.0) && stage_rect.origin.y >= px(40.0),
             "the fixture needs the stage away from the window origin: stage {stage_rect:?}"
         );
-        let pane = pane_bounds(cx, &stage, &right);
-        assert!(
-            pane.size.width < stage_rect.size.width,
-            "the fixture needs a pane narrower than the stage: pane {pane:?}, \
-             stage {stage_rect:?}"
-        );
 
         open_picker(&stage, &right, cx);
         let opened = cx
             .debug_bounds(GALLERY_PANEL)
-            .expect("the pane's page should be drawn");
+            .expect("the page should be drawn on the frame it opens on");
+        let below = Bounds::new(
+            point(
+                stage_rect.origin.x,
+                stage_rect.origin.y + stage_rect.size.height,
+            ),
+            stage_rect.size,
+        );
         assert_same_bounds(
             opened,
-            pane,
-            "the page should open on its pane's window rectangle, with the stage origin taken off",
-        );
-        assert!(
-            f32::from(opened.origin.x) > f32::from(stage_rect.origin.x) + 100.0
-                && opened.size.width < stage_rect.size.width,
-            "the opened page must be the pane, not the stage: opened {opened:?}, \
-             stage {stage_rect:?}"
+            below,
+            "the page should open on the inset stage's own bottom edge, in window coordinates",
         );
 
-        cx.executor().advance_clock(MORPH_DURATION / 2);
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        let mid = cx
-            .debug_bounds(GALLERY_PANEL)
-            .expect("the growing page should still be drawn");
-        assert!(
-            f32::from(mid.origin.x) < f32::from(pane.origin.x)
-                && f32::from(mid.origin.x) > f32::from(stage_rect.origin.x),
-            "halfway through the morph the page should sit between the pane and the stage: \
-             mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
-        );
-        assert!(
-            mid.size.width > pane.size.width && mid.size.width < stage_rect.size.width,
-            "halfway through the morph the page should be wider than its pane and narrower \
-             than the stage: mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
-        );
-        assert!(
-            mid.contains(&pane.center()) && stage_rect.contains(&mid.center()),
-            "the growing page should still cover its pane and be inside the stage: \
-             mid {mid:?}, pane {pane:?}, stage {stage_rect:?}"
-        );
-
-        settle_morph(cx);
+        settle_page(cx);
         let settled = cx
             .debug_bounds(GALLERY_PANEL)
             .expect("the settled page should still be drawn");
         assert_same_bounds(
             settled,
             stage_bounds(cx, &stage),
-            "the settled page should cover the whole stage with the stage origin taken off",
+            "the settled page should cover the whole inset stage",
         );
     }
 
@@ -1263,7 +1119,7 @@ mod tests {
         );
 
         open_picker(&stage, &left, cx);
-        settle_morph(cx);
+        settle_page(cx);
         search_for_picker_widget(cx);
         click(cx, PICKER_WIDGET_ROW);
         click(cx, GALLERY_CONFIRM);
@@ -1284,7 +1140,7 @@ mod tests {
             "confirming must not move the pane beside it"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
         assert_eq!(
             cx.update(|_, cx| stage.read(cx).pane_widget_id(&right, cx)),
             right_before,
@@ -1292,29 +1148,27 @@ mod tests {
         );
     }
 
-    /// Dismissing the page while it is still growing turns it around from where it had
-    /// reached: it neither jumps back to the pane nor continues to the stage, the pane keeps
-    /// the widget it had, and the page is cleared once the shrink has finished.
+    /// Dismissing the page while it is still sliding up turns it around from where it had
+    /// reached: it neither jumps down to the bottom nor continues up, the pane keeps the widget
+    /// it had, and the page is cleared once the slide down has finished.
     #[gpui_kit::test]
-    fn cancelling_the_picker_mid_morph_should_turn_it_around(cx: &mut TestAppContext) {
+    fn cancelling_the_page_mid_slide_should_turn_it_around(cx: &mut TestAppContext) {
         let (stage, [_, right]) = stage_with_two_panes(cx);
         let cx = open_stage_window(&stage, cx);
         let before = cx.update(|_, cx| stage.read(cx).pane_widget_id(&right, cx));
-        let pane = pane_bounds(cx, &stage, &right);
-        let area =
-            |bounds: Bounds<Pixels>| f32::from(bounds.size.width) * f32::from(bounds.size.height);
+        let stage_rect = stage_bounds(cx, &stage);
 
         open_picker(&stage, &right, cx);
-        cx.executor().advance_clock(MORPH_DURATION / 3);
+        cx.executor().advance_clock(PAGE_TRANSITION_DURATION / 3);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         let opening = cx
             .debug_bounds(GALLERY_PANEL)
             .expect("the opening page should be drawn");
         assert!(
-            area(opening) > area(pane),
-            "the page should have grown past its pane before it is dismissed: \
-             page {opening:?}, pane {pane:?}"
+            opening.top() > stage_rect.top() && opening.top() < stage_rect.bottom(),
+            "the page should have moved off the bottom before it is dismissed: \
+             page {opening:?}, stage {stage_rect:?}"
         );
 
         cx.simulate_keystrokes("escape");
@@ -1328,27 +1182,20 @@ mod tests {
             opening,
             "the reversal should start where the opening had reached",
         );
-        assert!(
-            area(turning) > area(pane),
-            "the page must not jump back to its pane on the frame it is dismissed: \
-             turning {turning:?}, pane {pane:?}"
-        );
 
-        // Half of the reversal's own (already shortened) duration: strictly smaller than the
-        // rectangle it turned around from, and still not the pane.
-        cx.executor().advance_clock(MORPH_DURATION / 10);
+        cx.executor().advance_clock(PAGE_TRANSITION_DURATION / 10);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        let shrinking = cx
+        let leaving = cx
             .debug_bounds(GALLERY_PANEL)
-            .expect("the shrinking page should still be drawn");
+            .expect("the page should still be drawn while it slides back down");
         assert!(
-            area(shrinking) < area(turning) && area(shrinking) > area(pane),
-            "the page should shrink from where it turned around towards its pane: \
-             shrinking {shrinking:?}, turning {turning:?}, pane {pane:?}"
+            leaving.top() > turning.top(),
+            "the page should move back down from where it turned around: \
+             leaving {leaving:?}, turning {turning:?}"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
             "the page should be gone once the reversal has finished"
@@ -1363,11 +1210,10 @@ mod tests {
     /// A page can start leaving before it was ever drawn: a cancellation that arrives in the
     /// first frame the page exists opens and closes it without a frame in between.
     ///
-    /// `Presence` has no drawn page to shrink in that case — its first absent sample runs a
-    /// transition from zero to zero and reports `Exiting` at zero progress — so the old
-    /// cleanup waited for a `should_render` that only turns false once that transition ends.
-    /// Until then the page's invisible overlay and its scrim still covered the pane it was
-    /// opened from. A page at zero progress draws nothing at all, so it is cleared at once.
+    /// `Presence` has no drawn page to slide back down in that case — its first absent sample
+    /// runs a transition from zero to zero and reports `Exiting` at zero progress — so the
+    /// cleanup clears the page at zero progress too. Otherwise the host would keep the stage
+    /// covered for the length of a transition that draws nothing.
     #[gpui_kit::test]
     fn a_page_that_starts_leaving_before_it_was_drawn_should_be_cleared_at_once(
         cx: &mut TestAppContext,
@@ -1377,9 +1223,18 @@ mod tests {
         cx.update(|window, cx| {
             stage.update(cx, |stage, cx| {
                 stage.open_widget_gallery(&pane_id, window, cx);
-                stage.widget_gallery_event(&WidgetGalleryEvent::Cancel, cx);
             });
         });
+        let gallery = cx.update(|_, cx| {
+            stage
+                .read(cx)
+                .pages
+                .read(cx)
+                .gallery()
+                .expect("the page should be open")
+                .clone()
+        });
+        cx.update(|_, cx| gallery.update(cx, |_, cx| cx.emit(WidgetGalleryEvent::Cancel)));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
@@ -1388,33 +1243,31 @@ mod tests {
             "a page that was never drawn should not outlive its cancellation"
         );
         assert!(
-            cx.debug_bounds(super::WIDGET_GALLERY_SCRIM).is_none(),
-            "and its scrim should not keep the pane covered either"
+            cx.debug_bounds(WORKSPACE_PAGES).is_none(),
+            "and the host should not keep the stage covered either"
         );
         assert!(
-            cx.update(|_, cx| !stage.read(cx).is_widget_gallery_open()),
+            cx.update(|_, cx| !stage.read(cx).is_widget_gallery_open(cx)),
             "the workspace should have let the page go"
         );
     }
 
-    /// A window resized under an open page retargets it: the page still ends on the stage, and
-    /// the stage it ends on is the one the resize produced.
+    /// A window resized under an open page follows it: the page is as large as the stage it
+    /// covers, not the stage it opened on.
     #[gpui_kit::test]
-    fn resizing_the_window_mid_morph_should_retarget_the_page(cx: &mut TestAppContext) {
+    fn resizing_the_window_under_an_open_page_should_keep_it_covering_the_stage(
+        cx: &mut TestAppContext,
+    ) {
         let (stage, [_, right]) = stage_with_two_panes(cx);
         let cx = open_stage_window(&stage, cx);
         let old_stage = stage_bounds(cx, &stage);
-        let area =
-            |bounds: Bounds<Pixels>| f32::from(bounds.size.width) * f32::from(bounds.size.height);
 
         open_picker(&stage, &right, cx);
-        cx.executor().advance_clock(MORPH_DURATION / 2);
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
+        settle_page(cx);
 
         cx.simulate_resize(size(px(1200.0), px(900.0)));
-        // The first frame after the resize measures the new stage; the page is placed against
-        // the measurements of the frame it draws, so it takes one more frame to follow them.
+        // The first frame after the resize measures the new stage; the page is placed by the
+        // frame that draws it, so it takes one more frame to follow the measurements.
         for _ in 0..2 {
             cx.update(|window, _| window.refresh());
             cx.run_until_parked();
@@ -1426,37 +1279,21 @@ mod tests {
             "the resize should have reached the stage: resized {resized_stage:?}, \
              old {old_stage:?}"
         );
-        let mid = cx
+        let page = cx
             .debug_bounds(GALLERY_PANEL)
             .expect("the page should still be drawn after the resize");
-        assert!(
-            resized_stage.contains(&mid.center())
-                && f32::from(mid.right()) <= f32::from(resized_stage.right()) + 1.0,
-            "the growing page should be inside the resized stage: mid {mid:?}, \
-             stage {resized_stage:?}"
-        );
-
-        settle_morph(cx);
-        let settled = cx
-            .debug_bounds(GALLERY_PANEL)
-            .expect("the settled page should still be drawn");
         assert_same_bounds(
-            settled,
-            stage_bounds(cx, &stage),
-            "the settled page should cover the resized stage",
-        );
-        assert!(
-            area(settled) > area(old_stage),
-            "the settled page should follow the new stage rather than the size it opened at: \
-             settled {settled:?}, old stage {old_stage:?}"
+            page,
+            resized_stage,
+            "the page should cover the resized stage rather than the size it opened on",
         );
     }
 
-    /// Switching workspaces while the page is still growing drops the stage and the page with
-    /// it: the morph it was in the middle of neither keeps the stage alive nor panics when the
-    /// stage's tree is replaced.
+    /// Switching workspaces while the page is still sliding drops the stage and the page with
+    /// it: the transition it was in the middle of neither keeps the stage alive nor panics when
+    /// the stage's tree is replaced.
     #[gpui_kit::test]
-    fn replacing_the_stage_mid_morph_should_release_its_picker(cx: &mut TestAppContext) {
+    fn replacing_the_stage_mid_slide_should_release_its_page(cx: &mut TestAppContext) {
         let (stage, [_, right]) = stage_with_two_panes(cx);
         let stage_weak = stage.downgrade();
         cx.update(base_ui::style::theme::install);
@@ -1468,16 +1305,16 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         open_picker(&stage, &right, cx);
-        cx.executor().advance_clock(MORPH_DURATION / 3);
+        cx.executor().advance_clock(PAGE_TRANSITION_DURATION / 3);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         let gallery_weak = cx.update(|_, cx| {
             stage
                 .read(cx)
-                .widget_picker
-                .as_ref()
-                .expect("the page should be open")
+                .pages
+                .read(cx)
                 .gallery()
+                .expect("the page should be open")
                 .downgrade()
         });
         drop(stage);
@@ -1497,7 +1334,7 @@ mod tests {
 
         assert!(
             stage_weak.upgrade().is_none(),
-            "a page in the middle of its morph should not keep the stage it belongs to alive"
+            "a page in the middle of its slide should not keep the stage it belongs to alive"
         );
         assert!(
             gallery_weak.upgrade().is_none(),
@@ -1505,12 +1342,12 @@ mod tests {
         );
     }
 
-    /// While the page exists the panes it has not reached yet are not clickable: the scrim
-    /// covers the stage under it, so a click on the pane beside the growing page reaches
-    /// neither that pane's click handling nor its close control, and the page stays open.
-    /// The page's own controls are painted above the scrim and still work.
+    /// While the page exists, the panes under it are not clickable: the host covers the whole
+    /// stage from the first frame, so a click on a pane reaches neither that pane's click
+    /// handling nor its close control, and the page stays open. The page's own controls are
+    /// painted above the host and still work.
     #[gpui_kit::test]
-    fn an_open_picker_should_block_the_panes_it_has_not_reached(cx: &mut TestAppContext) {
+    fn an_open_page_should_block_the_panes_under_it(cx: &mut TestAppContext) {
         let (stage, [left, right]) = stage_with_two_panes(cx);
         let left_applications = Rc::new(Cell::new(0));
         let left_link = link('a', true, left_applications.clone());
@@ -1526,17 +1363,9 @@ mod tests {
         let right_rect = pane_bounds(cx, &stage, &right);
 
         open_picker(&stage, &left, cx);
-        let page = cx
-            .debug_bounds(GALLERY_PANEL)
-            .expect("the pane's page should be drawn");
         assert!(
-            !page.contains(&right_rect.center()),
-            "the fixture needs the growing page to leave the other pane outside it: \
-             page {page:?}, right pane {right_rect:?}"
-        );
-        assert!(
-            cx.debug_bounds(super::WIDGET_GALLERY_SCRIM).is_some(),
-            "an open page should cover the stage under it with its scrim"
+            cx.debug_bounds(WORKSPACE_PAGES).is_some(),
+            "an open page should cover the stage under it with its host"
         );
 
         // A click on the other pane's body, which would otherwise be read as a pane click and
@@ -1553,11 +1382,7 @@ mod tests {
             "the pane under the page must not have handled the click"
         );
         assert_eq!(
-            cx.update(|_, cx| stage
-                .read(cx)
-                .widget_picker
-                .as_ref()
-                .map(|picker| picker.pane_id().clone())),
+            cx.update(|_, cx| stage.read(cx).pages.read(cx).pane_id().cloned()),
             Some(left.clone()),
             "the click must not move the page to another pane"
         );
@@ -1592,30 +1417,26 @@ mod tests {
             "the click on the header must not dismiss the page"
         );
 
-        // The page itself is above the scrim: once it covers the stage its cancel control
-        // still takes the dismissal, and the scrim goes with the page.
-        cx.executor().advance_clock(MORPH_DURATION / 2);
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
+        // The page itself is above the host: once it has slid up its cancel control still
+        // takes the dismissal, and the host goes with the page.
+        settle_page(cx);
         click(cx, GALLERY_CANCEL);
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
             "the page's own control should have dismissed it"
         );
         assert!(
-            cx.debug_bounds(super::WIDGET_GALLERY_SCRIM).is_none(),
-            "the scrim should be gone with the page"
+            cx.debug_bounds(WORKSPACE_PAGES).is_none(),
+            "the host should be gone with the page"
         );
     }
 
-    /// The scrim stays over the stage while the page shrinks back, not only while it grows:
-    /// once the shrinking page has uncovered the pane beside it, a click there must still be
-    /// the scrim's, not that pane's.
+    /// The host stays over the stage while the page slides back down, not only while it slides
+    /// up: once the leaving page has uncovered part of the stage, a click there must still be
+    /// the host's, not that pane's.
     #[gpui_kit::test]
-    fn a_picker_that_is_leaving_should_still_block_the_panes_it_has_not_reached(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_page_that_is_leaving_should_still_block_the_panes_under_it(cx: &mut TestAppContext) {
         let (stage, [left, right]) = stage_with_two_panes(cx);
         let left_applications = Rc::new(Cell::new(0));
         let left_link = link('a', true, left_applications.clone());
@@ -1631,25 +1452,17 @@ mod tests {
         let right_rect = pane_bounds(cx, &stage, &right);
 
         open_picker(&stage, &left, cx);
-        settle_morph(cx);
+        settle_page(cx);
         cx.simulate_keystrokes("escape");
-        cx.executor().advance_clock(MORPH_DURATION / 3);
+        cx.executor().advance_clock(PAGE_TRANSITION_DURATION / 3);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
-        let leaving = cx
-            .debug_bounds(GALLERY_PANEL)
-            .expect("the page should still be drawn while it shrinks back");
         assert!(
-            cx.debug_bounds(super::WIDGET_GALLERY_SCRIM).is_some(),
+            cx.debug_bounds(WORKSPACE_PAGES).is_some(),
             "a page on its way out should still cover the stage under it"
         );
         let target = point(right_rect.right() - px(24.0), right_rect.center().y);
-        assert!(
-            !leaving.contains(&target),
-            "the fixture needs the shrinking page to have uncovered the other pane: \
-             page {leaving:?}, target {target:?}"
-        );
 
         cx.simulate_click(target, Modifiers::none());
         assert_eq!(
@@ -1672,17 +1485,17 @@ mod tests {
             "the click must not dismiss the page that is already leaving"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
-            cx.debug_bounds(super::WIDGET_GALLERY_SCRIM).is_none(),
-            "the scrim should be gone with the page"
+            cx.debug_bounds(WORKSPACE_PAGES).is_none(),
+            "the host should be gone with the page"
         );
     }
 
     /// Closing the page does not blur the window: a focus the user moved somewhere else while
-    /// the page was shrinking back — a settings dialog, for instance — stays where they put it.
+    /// the page was sliding back down — a settings page, for instance — stays where they put it.
     #[gpui_kit::test]
-    fn closing_the_picker_should_not_blur_the_focus_the_user_moved(cx: &mut TestAppContext) {
+    fn closing_the_page_should_not_blur_the_focus_the_user_moved(cx: &mut TestAppContext) {
         let (stage, pane_id) = stage_with_one_pane(cx);
         let cx = open_stage_window(&stage, cx);
         let probe = cx.update(|_, cx| {
@@ -1693,21 +1506,21 @@ mod tests {
         let handle = cx.update(|_, cx| probe.read(cx).handle.clone());
 
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         click(cx, GALLERY_CANCEL);
-        // The page is still shrinking back, and the user moves the focus elsewhere within
+        // The page is still sliding back down, and the user moves the focus elsewhere within
         // that window. The old cleanup took it away with an unconditional window blur.
         cx.update(|window, cx| handle.focus(window, cx));
         assert!(
             cx.update(|window, _| handle.is_focused(window)),
-            "the test should have been able to move the focus while the page shrinks back"
+            "the test should have been able to move the focus while the page slides back down"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the page should be gone once it has shrunk back"
+            "the page should be gone once it has slid back down"
         );
         assert!(
             cx.update(|window, _| handle.is_focused(window)),
@@ -1722,7 +1535,7 @@ mod tests {
     }
 
     /// Confirming applies the chosen widget at once and holds the page over the switch until it
-    /// has shrunk back into the pane, which is when the new widget is uncovered.
+    /// has slid back down, which is when the new widget is uncovered.
     #[gpui_kit::test]
     fn confirming_a_widget_should_apply_it_then_reveal_the_pane(cx: &mut TestAppContext) {
         let (stage, pane_id) = stage_with_one_pane(cx);
@@ -1735,7 +1548,7 @@ mod tests {
             })
         });
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
 
         search_for_picker_widget(cx);
         click(cx, PICKER_WIDGET_ROW);
@@ -1758,37 +1571,37 @@ mod tests {
         );
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_some(),
-            "the page should still cover the switching pane while it shrinks back"
+            "the page should still cover the switching pane while it slides back down"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the page should be gone once it has shrunk back into the pane"
+            "the page should be gone once it has slid back down"
         );
         assert_eq!(
             changes.get(),
             1,
-            "the shrink itself should not report another change"
+            "the slide itself should not report another change"
         );
     }
 
-    /// Backing out changes nothing and takes the page away once it has shrunk back.
+    /// Backing out changes nothing and takes the page away once it has slid back down.
     #[gpui_kit::test]
     fn cancelling_the_picker_should_leave_the_pane_alone(cx: &mut TestAppContext) {
         let (stage, pane_id) = stage_with_one_pane(cx);
         let cx = open_stage_window(&stage, cx);
         let before = cx.update(|_, cx| stage.read(cx).pane_widget_id(&pane_id, cx));
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
 
         click(cx, GALLERY_CANCEL);
-        settle_morph(cx);
+        settle_page(cx);
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "backing out should take the page away once it has shrunk back"
+            "backing out should take the page away once it has slid back down"
         );
         assert_eq!(
             cx.update(|_, cx| stage.read(cx).pane_widget_id(&pane_id, cx)),
@@ -1804,7 +1617,7 @@ mod tests {
         let (stage, pane_id) = stage_with_one_pane(cx);
         let cx = open_stage_window(&stage, cx);
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
 
         search_for_picker_widget(cx);
         click(cx, PICKER_WIDGET_ROW);
@@ -1815,10 +1628,10 @@ mod tests {
             Some(PickerWidget::ID),
             "Enter should confirm the widget the page has selected"
         );
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the confirmed page should be gone once it has shrunk back"
+            "the confirmed page should be gone once it has slid back down"
         );
     }
 
@@ -1830,14 +1643,14 @@ mod tests {
         let cx = open_stage_window(&stage, cx);
         let before = cx.update(|_, cx| stage.read(cx).pane_widget_id(&pane_id, cx));
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
 
         cx.simulate_keystrokes("escape");
-        settle_morph(cx);
+        settle_page(cx);
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "Escape should take the page away once it has shrunk back"
+            "Escape should take the page away once it has slid back down"
         );
         assert_eq!(
             cx.update(|_, cx| stage.read(cx).pane_widget_id(&pane_id, cx)),
@@ -1846,9 +1659,8 @@ mod tests {
         );
     }
 
-    /// Reduced motion cuts the morph to its end: the page is the whole stage on the frame it
-    /// opens — not the pane it was opened from, which is smaller — and closing it is a frame
-    /// rather than a shrink.
+    /// Reduced motion cuts the slide and the fade to their ends: the page is the whole stage on
+    /// the frame it opens, and closing it is a frame rather than a slide.
     #[gpui_kit::test]
     fn reduced_motion_should_open_the_picker_at_full_size_and_close_it_at_once(
         cx: &mut TestAppContext,
@@ -1894,20 +1706,20 @@ mod tests {
         let (stage, pane_id) = stage_with_one_pane(cx);
         let cx = open_stage_window(&stage, cx);
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         search_for_picker_widget(cx);
         click(cx, PICKER_WIDGET_ROW);
 
         click(cx, GALLERY_CONFIRM);
-        // The page is still drawn while it shrinks back, so the Escape of a second press reaches
+        // The page is still drawn while it slides back down, so the Escape of a second press reaches
         // it and reports a cancellation for a choice that is already made.
         cx.simulate_keystrokes("escape");
 
-        settle_morph(cx);
+        settle_page(cx);
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the page should have left once its shrink finished"
+            "the page should have left once its slide finished"
         );
         assert_eq!(
             cx.update(|_, cx| stage.read(cx).pane_widget_id(&pane_id, cx)),
@@ -1927,17 +1739,17 @@ mod tests {
         let cx = open_stage_window(&stage, cx);
 
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         click(cx, GALLERY_SEARCH);
         assert!(
             cx.update(|window, cx| window.focused(cx)).is_some(),
             "the page should hold the keyboard while it is open"
         );
         click(cx, GALLERY_CANCEL);
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the page should be gone once it has shrunk back"
+            "the page should be gone once it has slid back down"
         );
         assert!(
             cx.update(|window, cx| window.focused(cx)).is_none(),
@@ -1945,7 +1757,7 @@ mod tests {
         );
 
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         click(cx, GALLERY_SEARCH);
         assert!(
             cx.update(|window, cx| window.focused(cx)).is_some(),
@@ -1954,10 +1766,10 @@ mod tests {
         search_for_picker_widget(cx);
         click(cx, PICKER_WIDGET_ROW);
         click(cx, GALLERY_CONFIRM);
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the confirmed page should be gone once it has shrunk back"
+            "the confirmed page should be gone once it has slid back down"
         );
         assert!(
             cx.update(|window, cx| window.focused(cx)).is_none(),
@@ -1990,7 +1802,7 @@ mod tests {
         });
 
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         click(cx, GALLERY_CONFIRM);
 
         assert_eq!(
@@ -2005,18 +1817,18 @@ mod tests {
         );
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_some(),
-            "the page should still cover the pane while it shrinks back"
+            "the page should still cover the pane while it slides back down"
         );
 
-        settle_morph(cx);
+        settle_page(cx);
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "the confirmed page should be gone once it has shrunk back"
+            "the confirmed page should be gone once it has slid back down"
         );
         assert_eq!(
             changes.get(),
             0,
-            "the shrink itself should not report a change either"
+            "the slide itself should not report a change either"
         );
     }
 
@@ -2036,14 +1848,14 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         open_picker(&stage, &pane_id, cx);
-        settle_morph(cx);
+        settle_page(cx);
         let gallery_weak = cx.update(|_, cx| {
             stage
                 .read(cx)
-                .widget_picker
-                .as_ref()
-                .expect("the page should be open")
+                .pages
+                .read(cx)
                 .gallery()
+                .expect("the page should be open")
                 .downgrade()
         });
         drop(stage);

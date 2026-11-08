@@ -16,9 +16,9 @@ use gpui_kit::{
 };
 use i18n::t;
 use profile_ui::profile::ProfileMenu;
-use settings_ui::entry::show_settings;
 
 use super::layout::{SIDEBAR_FULL_PADDING, SIDEBAR_ICON_SIZE, SIDEBAR_ITEM_SIZE, SIDEBAR_PADDING};
+use crate::windows::root::components::pages::MainPages;
 
 /// The account entry, named whether or not it draws its label.
 pub(crate) const SIDEBAR_FOOTER_PROFILE: &str = "SIDEBAR_FOOTER_PROFILE";
@@ -45,15 +45,18 @@ const PROFILE_MENU_ICON_ONLY: &str = "sidebar-profile-icon-only";
 pub(crate) struct SidebarFooter {
     /// Whether it draws the labelled panel rather than the icon-only rail.
     full: bool,
+    /// The page area the settings entry switches to the settings page.
+    pages: Entity<MainPages>,
     profile: Entity<ProfileMenu>,
     /// Identifies one opening of the panel, so the account entry's ids do not outlive it.
     popup_scope: u64,
 }
 
 impl SidebarFooter {
-    pub(crate) fn new(full: bool, profile: Entity<ProfileMenu>) -> Self {
+    pub(crate) fn new(full: bool, pages: Entity<MainPages>, profile: Entity<ProfileMenu>) -> Self {
         Self {
             full,
+            pages,
             profile,
             popup_scope: 0,
         }
@@ -136,6 +139,7 @@ impl RenderOnce for SidebarFooter {
             profile_entry.w(SIDEBAR_ITEM_SIZE)
         };
 
+        let pages = self.pages;
         let mut settings_button = Button::new(SIDEBAR_FOOTER_SETTINGS)
             .ghost()
             .h(SIDEBAR_ITEM_SIZE)
@@ -148,7 +152,9 @@ impl RenderOnce for SidebarFooter {
                     .size(SIDEBAR_ICON_SIZE)
                     .flex_none(),
             )
-            .on_click(|_, window, cx| show_settings(window, cx));
+            .on_click(move |_, window, cx| {
+                pages.update(cx, |pages, cx| pages.show_settings(window, cx));
+            });
         settings_button = if full {
             settings_button
                 .w_full()
