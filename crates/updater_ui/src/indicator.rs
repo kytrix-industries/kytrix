@@ -62,10 +62,10 @@ impl Render for UpdateIndicator {
         let label = t!(cx, "window.updater.available");
         let wrapper = ElementId::from((ElementId::from(UPDATER_INDICATOR), "wrapper"));
 
-        // The colour follows the pointer the way the window's own buttons do: the brand's
-        // three steps, with hover and press latched here rather than taken from GPUI's
-        // `:hover`/`:active` element state, which is scoped to a `div` id and would need
-        // this element to be a `div` instead of the tooltip-wrapped `Button` it is.
+        // The colour follows the pointer in the brand's three steps, with hover and press
+        // latched here rather than taken from GPUI's `:hover`/`:active` element state, which
+        // is scoped to a `div` id and would need this element to be a `div` instead of the
+        // tooltip-wrapped `Button` it is.
         let hover_state = window.use_keyed_state((wrapper.clone(), "hover"), cx, |_, _| false);
         let held_state = window.use_keyed_state((wrapper.clone(), "held"), cx, |_, _| false);
         let color = match (*held_state.read(cx), *hover_state.read(cx)) {

@@ -28,6 +28,7 @@ pub enum IconKind {
     EyeClosed,
     Minus,
     MinusBold,
+    CopySimple,
     CopySimpleBold,
     Plus,
     NotePencil,
@@ -83,6 +84,7 @@ impl IconKind {
             IconKind::EyeClosed => "icons/phosphoricons/eye-closed.svg",
             IconKind::Minus => "icons/phosphoricons/minus.svg",
             IconKind::MinusBold => "icons/phosphoricons/minus-bold.svg",
+            IconKind::CopySimple => "icons/phosphoricons/copy-simple.svg",
             IconKind::CopySimpleBold => "icons/phosphoricons/copy-simple-bold.svg",
             IconKind::Plus => "icons/phosphoricons/plus.svg",
             IconKind::NotePencil => "icons/phosphoricons/note-pencil.svg",
@@ -167,7 +169,7 @@ mod tests {
     use super::IconKind;
 
     /// 全部变体，顺序与 [`IconKind::path`] 一致。
-    const KINDS: [IconKind; 50] = [
+    const KINDS: [IconKind; 51] = [
         IconKind::X,
         IconKind::XBold,
         IconKind::Circle,
@@ -189,6 +191,7 @@ mod tests {
         IconKind::EyeClosed,
         IconKind::Minus,
         IconKind::MinusBold,
+        IconKind::CopySimple,
         IconKind::CopySimpleBold,
         IconKind::Plus,
         IconKind::NotePencil,

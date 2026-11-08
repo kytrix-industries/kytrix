@@ -44,6 +44,11 @@ const TITLE_BAR_SIDEBAR_TOGGLE_ICON: &str = "TITLE_BAR_SIDEBAR_TOGGLE_ICON";
 /// the sidebar pushes.
 const TITLE_BAR_CONTROL_GAP: Pixels = px(4.0);
 
+/// The title bar's margin at the window's right edge on macOS, where the updater is the only
+/// control on that side: the system buttons are the traffic lights' to draw, and their inset
+/// is not used.
+const TITLE_BAR_RIGHT_INSET_MACOS: Pixels = px(12.0);
+
 /// The column the page is drawn in, named so a test can say where the sidebar leaves it.
 const PAGE: &str = "ROOT_PAGE";
 
@@ -480,6 +485,14 @@ impl RootWindow {
         } else {
             TOGGLE_INSET
         };
+        // The close button ends the bar's right-hand controls, so the bar leaves it the same
+        // inset above and to the right. macOS draws its traffic lights instead of those
+        // controls and keeps the updater's own margin.
+        let right_inset = if cfg!(target_os = "macos") {
+            TITLE_BAR_RIGHT_INSET_MACOS
+        } else {
+            TOGGLE_INSET
+        };
         // The toggle keeps its place, and the control after it is anchored to the docked
         // sidebar: one control gap past the sidebar's right edge, travelling with the width
         // the window animates, so the sidebar pushes it out as it opens and carries it back
@@ -524,8 +537,11 @@ impl RootWindow {
                     .flex()
                     .items_center()
                     .justify_end()
-                    .gap_2()
-                    .pr_3()
+                    // The system buttons take the bar's control gap, and the close button
+                    // ends them one inset from the window's edge: the same 4 px the bar
+                    // leaves above the 32 px squares.
+                    .gap(TITLE_BAR_CONTROL_GAP)
+                    .pr(right_inset)
                     .child(self.updater.clone())
                     .when(!cfg!(target_os = "macos"), |this| {
                         this.child(WindowSystemButton::minimize())
@@ -1283,6 +1299,58 @@ mod tests {
             "the toggle's mark is centred in its square: toggle {:?}, icon {:?}",
             toggle,
             icon
+        );
+    }
+
+    /// The window's system buttons are the title bar's other controls: each is the sidebar
+    /// toggle's square, on the toggle's line, spaced by the bar's control gap, and the close
+    /// button ends one bar inset from the window's right edge — the same inset the bar leaves
+    /// above it.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui_kit::test]
+    fn the_system_buttons_should_be_the_title_bar_controls(cx: &mut TestAppContext) {
+        use crate::windows::root::components::system_button::{
+            WINDOW_CLOSE, WINDOW_MAXIMIZE, WINDOW_MINIMIZE,
+        };
+
+        let cx = root_window(cx, SidebarMode::Full);
+
+        let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        let minimize = drawn(cx, WINDOW_MINIMIZE);
+        let maximize = drawn(cx, WINDOW_MAXIMIZE);
+        let close = drawn(cx, WINDOW_CLOSE);
+
+        for (tag, button) in [
+            (WINDOW_MINIMIZE, minimize),
+            (WINDOW_MAXIMIZE, maximize),
+            (WINDOW_CLOSE, close),
+        ] {
+            assert_eq!(
+                button.size,
+                size(SIDEBAR_ITEM_SIZE, SIDEBAR_ITEM_SIZE),
+                "{tag} is the toggle's square"
+            );
+            assert_eq!(
+                button.top(),
+                toggle.top(),
+                "{tag} sits on the toggle's line"
+            );
+        }
+
+        assert_eq!(
+            maximize.left() - minimize.right(),
+            TITLE_BAR_CONTROL_GAP,
+            "the minimize and maximize buttons keep one control gap"
+        );
+        assert_eq!(
+            close.left() - maximize.right(),
+            TITLE_BAR_CONTROL_GAP,
+            "the maximize and close buttons keep one control gap"
+        );
+        assert_eq!(
+            px(1280.0) - close.right(),
+            super::TOGGLE_INSET,
+            "the close button keeps the bar's inset from the window's right edge"
         );
     }
 
