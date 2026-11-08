@@ -1593,8 +1593,9 @@ mod tests {
                 "and not the one that answers a ticker only one listing at a time: {sentence}"
             );
             assert!(
-                sentence.contains("top left corner") && sentence.contains("Markets"),
-                "and it points at the control that loads one: {sentence}"
+                sentence.contains("<kbd>![](file://icons/phosphoricons/bank.svg)</kbd>")
+                    && sentence.contains("top left corner"),
+                "and it points at the top left control that loads one, by its icon: {sentence}"
             );
             assert!(!pane.read(cx).has_content());
 

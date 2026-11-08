@@ -18,12 +18,14 @@ use gpui_kit::{
 };
 use i18n::t;
 use smol_str::format_smolstr;
-use widget_gallery_ui::gallery::show_widget_gallery;
 
 use super::{
     stage::Stage,
     tree::{NodeId, PaneOrientation},
 };
+
+/// The debug selector of the pane's Widget control.
+const PANE_WIDGET_BUTTON: &str = "PANE_WIDGET_BUTTON";
 
 /// Width of the instrument linkage slot at the start of a pane's header row.
 pub(in crate::windows::root) const CHROME_LINK_WIDTH: Pixels = px(32.0);
@@ -53,36 +55,30 @@ impl PaneWidgetButton {
 
 impl RenderOnce for PaneWidgetButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        Button::new(self.id)
+        // The page covers the pane's header while it is open, so a hint about this control
+        // would be a popup painted over the page: the tooltip is withdrawn with the control's
+        // job, and the page's own controls carry theirs.
+        let tooltip = (!self.stage.read(cx).is_widget_gallery_open())
+            .then(|| t!(cx, "window.pane.select_widget"));
+        let button = Button::new(self.id)
+            .debug_selector(|| PANE_WIDGET_BUTTON.into())
             .child(Icon::new(IconKind::PuzzlePiece).size_3())
             .ghost()
             .with_unified_size(UnifiedSize::Small)
             .aria_label(t!(cx, "window.pane.select_widget"))
-            .with_tooltip(t!(cx, "window.pane.select_widget"))
             .on_click({
                 let stage = self.stage;
                 let pane_id = self.pane_id;
                 move |_, window, cx| {
-                    // The gallery opens on what the pane is showing, so the dialog the
-                    // user gets is the one that already has their answer in it.
-                    let current = stage.read(cx).pane_widget_id(&pane_id, cx);
-                    let stage_for_choice = stage.downgrade();
-                    let pane_for_choice = pane_id.clone();
-
-                    show_widget_gallery(
-                        current,
-                        move |widget_id, _, cx| {
-                            // The gallery outlives nothing: if the stage has gone the pane it
-                            // named has gone with it, so there is nothing left to choose into.
-                            let _ = stage_for_choice.update(cx, |stage, cx| {
-                                stage.set_widget(&pane_for_choice, widget_id.as_str(), cx);
-                            });
-                        },
-                        window,
-                        cx,
-                    );
+                    stage.update(cx, |stage, cx| {
+                        stage.open_widget_gallery(&pane_id, window, cx);
+                    });
                 }
-            })
+            });
+        match tooltip {
+            Some(tooltip) => button.with_tooltip(tooltip),
+            None => button,
+        }
     }
 }
 
@@ -341,14 +337,13 @@ impl RenderOnce for PaneCloseButton {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc, time::Duration};
+    use std::time::Duration;
 
     use app_config::workspace::WorkspaceLayout;
-    use base_ui::{animation::ANIMATION_TICK, layer::Layer};
+    use base_ui::layer::Layer;
     use gpui_kit::{
-        App, AppContext, Context, ElementId, Entity, IntoElement, Modifiers, MouseButton,
-        ParentElement, Render, RenderOnce as _, Styled, TestAppContext, VisualTestContext,
-        WeakEntity, Window, div, point, px, size,
+        App, AppContext, Bounds, Context, ElementId, Entity, IntoElement, Modifiers, MouseButton,
+        Pixels, Render, TestAppContext, VisualTestContext, Window, div, point, px, size,
     };
     use widget::{
         category::WidgetCategory,
@@ -359,21 +354,17 @@ mod tests {
     };
     use widget_registry::registry::{WidgetRegistration, WidgetRegistry};
 
-    use super::PaneWidgetButton;
     use crate::windows::root::components::workspace::{
         stage::Stage,
         tree::{NodeId, PaneNode, PaneOrientation},
+        widget_picker::MORPH_DURATION,
     };
 
-    /// The debug selectors of the gallery's own panel and confirm control.
-    ///
-    /// The gallery belongs to another crate and proves nothing about itself here, so what a test
-    /// outside it can see is its own selectors — and seeing them is what makes the drops below
-    /// evidence rather than accidents.
+    /// The debug selectors of the page this test opens, and of its way out.
     const GALLERY_PANEL: &str = "WIDGET_GALLERY";
-    const GALLERY_CONFIRM: &str = "WIDGET_GALLERY_CONFIRM";
+    const GALLERY_CANCEL: &str = "WIDGET_GALLERY_CANCEL";
 
-    /// A widget that draws nothing, so the pane's own control and the gallery over it are the only
+    /// A widget that draws nothing, so the pane's own control and the page over it are the only
     /// things a test has to account for.
     struct TestWidget;
 
@@ -410,6 +401,7 @@ mod tests {
     }
 
     fn install(cx: &mut App) {
+        gpui_kit::base::init(cx);
         base_ui::style::theme::install(cx);
         i18n::global::embedded::install(cx).expect("embedded locales should load");
         widget_registry::catalogue::install(cx).expect("the catalogue should install");
@@ -419,10 +411,6 @@ mod tests {
     }
 
     /// A stage with one pane showing the test widget, and the id of that pane.
-    ///
-    /// The pane shows a widget because that is what the gallery opens on: a pane showing nothing
-    /// opens on a category with nothing selected, and a gallery with nothing selected refuses the
-    /// confirmation this test is about.
     fn stage_with_a_widget(cx: &mut TestAppContext) -> (Entity<Stage>, ElementId) {
         cx.update(install);
         let stage =
@@ -446,8 +434,9 @@ mod tests {
         (stage, pane_id)
     }
 
-    /// A stage with two panes side by side, and the id of the split between them.
-    fn split_stage(cx: &mut TestAppContext) -> (Entity<Stage>, NodeId) {
+    /// A stage with two panes side by side, the id of the split between them, and the id of
+    /// each pane, head first.
+    fn split_stage(cx: &mut TestAppContext) -> (Entity<Stage>, NodeId, [ElementId; 2]) {
         let (stage, pane_id) = stage_with_a_widget(cx);
         let split_id = cx.update(|cx| {
             stage.update(cx, |stage, cx| {
@@ -458,114 +447,145 @@ mod tests {
             };
             *id
         });
+        let panes = cx.update(|cx| {
+            let mut ids = Vec::with_capacity(2);
+            stage
+                .read(cx)
+                .pane_tree()
+                .root
+                .for_each_pane(&mut |pane| ids.push(pane.id.clone()));
 
-        (stage, split_id)
+            ids.try_into()
+                .expect("splitting the only pane should leave two panes")
+        });
+
+        (stage, split_id, panes)
     }
 
-    /// The window root the gallery test draws into: the pane's own widget control, with none of the
-    /// pane around it.
-    ///
-    /// The control is drawn only while `showing` says so. A control holds its stage — the
-    /// application's own is drawn out of the stage's tree, and a control that let its workspace go
-    /// would be a control reading a workspace that is already gone — so the test takes it out of the
-    /// tree once the gallery is up, and what is left that could hold the stage is the dialog.
-    struct ButtonHarness {
-        pane_id: ElementId,
-        stage: WeakEntity<Stage>,
-        showing: Rc<Cell<bool>>,
-    }
-
-    impl Render for ButtonHarness {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let control = self
-                .showing
-                .get()
-                .then(|| self.stage.upgrade())
-                .flatten()
-                .map(|stage| PaneWidgetButton::new(self.pane_id.clone(), stage).render(window, cx));
-
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .children(control)
-        }
-    }
-
-    /// Lets the gallery's own fade finish and repaints, so what is drawn is what has settled.
+    /// Lets the page's morph finish and repaints, so what is drawn is what has settled.
     fn settle(cx: &mut VisualTestContext) {
         cx.executor()
-            .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
+            .advance_clock(MORPH_DURATION + Duration::from_millis(50));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
     }
 
-    /// The gallery is handed a weak handle on the stage, so opening it is not what keeps the
-    /// workspace alive, and a choice confirmed after the workspace is gone lands nowhere.
+    /// The bounds the stage has measured for `pane_id`.
+    fn pane_bounds(
+        cx: &mut VisualTestContext,
+        stage: &Entity<Stage>,
+        pane_id: &ElementId,
+    ) -> Bounds<Pixels> {
+        cx.update(|_, cx| {
+            stage
+                .read(cx)
+                .pane_tree()
+                .pane_bounds(pane_id)
+                .expect("the frame that drew the stage should have measured its panes")
+        })
+    }
+
+    /// The bounds the stage has measured for its root.
+    fn stage_bounds(cx: &mut VisualTestContext, stage: &Entity<Stage>) -> Bounds<Pixels> {
+        cx.update(|_, cx| {
+            stage
+                .read(cx)
+                .pane_tree()
+                .root()
+                .bounds()
+                .copied()
+                .expect("the frame that drew the stage should have measured it")
+        })
+    }
+
+    /// Asserts two rectangles are the same to within a device pixel: the page is placed from
+    /// the pane's measured rectangle, and both are snapped by the layout.
+    fn assert_same_bounds(actual: Bounds<Pixels>, expected: Bounds<Pixels>, what: &str) {
+        let distance = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs();
+        assert!(
+            distance(actual.origin.x, expected.origin.x) <= 1.0
+                && distance(actual.origin.y, expected.origin.y) <= 1.0
+                && distance(actual.size.width, expected.size.width) <= 1.0
+                && distance(actual.size.height, expected.size.height) <= 1.0,
+            "{what}: drew {actual:?}, expected {expected:?}"
+        );
+    }
+
+    /// The pane's Widget control opens the page inside the workspace, and the page starts as the
+    /// rectangle of the pane whose control was clicked rather than as the whole workspace: it is
+    /// opened from the pane, and the growth out of it is what says so.
     ///
-    /// The pane's control is drawn from the stage's own tree in the application, and the handle the
-    /// control captures is the one the gallery keeps for as long as it is open: kept strongly, a
-    /// workspace the user closed would stay alive — panes, streams and buffers — behind its dialog.
+    /// The pane is one of two, so its rectangle really is smaller than the stage's: a page that
+    /// opened at the stage's own rectangle cannot pass this test.
+    ///
+    /// Backing out leaves the pane as it was and takes the page away once it has shrunk back.
     #[gpui_kit::test]
-    fn an_open_gallery_should_not_keep_the_stage_alive(cx: &mut TestAppContext) {
-        let (stage, pane_id) = stage_with_a_widget(cx);
-        let weak = stage.downgrade();
-        let showing = Rc::new(Cell::new(true));
-        let harness = cx.update(|cx| {
-            cx.new(|_| ButtonHarness {
-                pane_id,
-                stage: weak.clone(),
-                showing: showing.clone(),
-            })
-        });
+    fn clicking_the_widget_control_opens_the_picker_from_the_pane(cx: &mut TestAppContext) {
+        let (stage, _, panes) = split_stage(cx);
         let (_, cx) = cx.add_window_view({
-            let harness = harness.clone();
-            move |_, _| Layer::new(harness)
+            let stage = stage.clone();
+            move |_, _| Layer::new(stage)
         });
         cx.simulate_resize(size(px(1000.0), px(800.0)));
+        cx.update(|window, _| window.refresh());
         cx.run_until_parked();
 
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
             "nothing is open before the pane's control is clicked"
         );
-        cx.simulate_click(point(px(500.0), px(400.0)), Modifiers::none());
-        settle(cx);
+        let stage_rect = stage_bounds(cx, &stage);
+        let button = cx
+            .debug_bounds(super::PANE_WIDGET_BUTTON)
+            .expect("the panes' headers should draw their Widget controls");
+        // Every pane draws the same control selector, so which pane owns the box that was
+        // drawn is told by the pane whose rectangle holds it.
+        let (pane_id, pane) = panes
+            .iter()
+            .map(|pane_id| (pane_id, pane_bounds(cx, &stage, pane_id)))
+            .find(|(_, bounds)| bounds.contains(&button.center()))
+            .expect("the control that was drawn should sit in one of the panes");
+        let before = cx.update(|_, cx| stage.read(cx).pane_widget_id(pane_id, cx));
         assert!(
-            cx.debug_bounds(GALLERY_PANEL).is_some(),
-            "the pane's own control should have opened the gallery"
+            pane.size.width < stage_rect.size.width,
+            "the fixture needs a pane narrower than the stage, or the page would be the stage \
+             anyway: pane {pane:?}, stage {stage_rect:?}"
         );
 
-        // The control leaves the tree with the stage: the gallery is left as the only thing that
-        // could still be holding what the pane's own control was drawing.
-        drop(stage);
-        cx.update(|_, cx| {
-            harness.update(cx, |_, cx| {
-                showing.set(false);
-                cx.notify();
-            });
-        });
-        settle(cx);
+        cx.simulate_click(button.center(), Modifiers::none());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let opened = cx
+            .debug_bounds(GALLERY_PANEL)
+            .expect("the pane's own control should have opened the page");
+        assert_same_bounds(
+            opened,
+            pane,
+            "the page should open on the rectangle of the pane it was opened from",
+        );
         assert!(
-            weak.upgrade().is_none(),
-            "an open gallery should not be what keeps the workspace it was opened from alive"
+            opened.size.width < stage_rect.size.width,
+            "the opened page must be the pane it was opened from, not the whole stage: \
+             opened {opened:?}, stage {stage_rect:?}"
         );
 
-        // Confirming is the callback the control handed over, run with nothing behind it: the
-        // gallery closes on a choice into a workspace that is already gone.
-        let confirm = cx
-            .debug_bounds(GALLERY_CONFIRM)
-            .expect("the gallery should offer a way to confirm");
-        cx.simulate_click(confirm.center(), Modifiers::none());
         settle(cx);
+        let cancel = cx
+            .debug_bounds(GALLERY_CANCEL)
+            .expect("the settled page should offer its way out")
+            .center();
+        cx.simulate_click(cancel, Modifiers::none());
+        settle(cx);
+
         assert!(
             cx.debug_bounds(GALLERY_PANEL).is_none(),
-            "confirming should have closed the gallery once the exit transition was over"
+            "backing out should take the page away once it has shrunk back"
         );
-        assert!(
-            weak.upgrade().is_none(),
-            "a confirmation made after the workspace was released should not have brought it back"
+        assert_eq!(
+            cx.update(|_, cx| stage.read(cx).pane_widget_id(pane_id, cx)),
+            before,
+            "backing out should leave the pane showing the widget it was showing"
         );
     }
 
@@ -577,7 +597,7 @@ mod tests {
     /// down and the gesture still in progress.
     #[gpui_kit::test]
     fn a_pressed_split_bar_stays_lit_while_it_is_dragged(cx: &mut TestAppContext) {
-        let (stage, split_id) = split_stage(cx);
+        let (stage, split_id, _) = split_stage(cx);
 
         let (_, cx) = cx.add_window_view({
             let stage = stage.clone();
@@ -644,7 +664,7 @@ mod tests {
     /// would leave it lit for good.
     #[gpui_kit::test]
     fn a_split_bar_lets_go_of_a_release_away_from_it(cx: &mut TestAppContext) {
-        let (stage, split_id) = split_stage(cx);
+        let (stage, split_id, _) = split_stage(cx);
 
         let (_, cx) = cx.add_window_view({
             let stage = stage.clone();

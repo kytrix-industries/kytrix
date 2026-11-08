@@ -14,7 +14,7 @@ common:
   market_participants: 市场参与者
   instrument: 标的
   loading: 正在加载
-  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">当前部件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本部件支持的市场参与者有：\n%{markets}</p>"
   no_data: 暂无数据
   no_matches: 没有匹配项
   pair: 交易对
@@ -611,7 +611,7 @@ widget:
     total_net_assets: 总净资产
     value: '%{label}：%{value}'
   empty:
-    hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个组件'
+    hint: '请点击右上角的 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个部件'
   financial_calendar:
     all: 全部
     country: 国家
@@ -1100,6 +1100,10 @@ widget:
     invalid_username: X 用户名无效
     protected_account: 无法添加受保护的 X 账号
     quota_exceeded: 当前订阅等级的 X 账号额度已满
+widget_gallery:
+  search_placeholder: 搜索部件
+  subtitle: 选择你需要的部件
+  title: 部件
 window:
   account:
     authorization_complete: 授权完成
@@ -1126,13 +1130,12 @@ window:
     title: 市场
   pane:
     close: 关闭面板
-    select_widget: 选择组件
+    select_widget: 选择部件
     split: 拆分面板
     split_keep_bottom: 拆分并保留下方
     split_keep_left: 拆分并保留左侧
     split_keep_right: 拆分并保留右侧
     split_keep_top: 拆分并保留上方
-    widget_menu: 组件
   sidebar:
     delete: 删除
     menu: 工作区菜单
@@ -1283,7 +1286,7 @@ settings_ui:
   search:
     placeholder: 搜索设置
   time_zone:
-    description: 选择各个组件显示数据时间时使用的时区，所有数据时间都会按该时区换算
+    description: 选择各个部件显示数据时间时使用的时区，所有数据时间都会按该时区换算
     title: 数据时间时区
 startup:
   config_reset_message: <p align="center">配置文件受损，已重新初始化为默认配置。原文件已备份为 %{file}。</p>
