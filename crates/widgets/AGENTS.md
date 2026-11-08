@@ -127,7 +127,7 @@ pub trait WidgetView: Render + Sized + 'static {
     const ID: WidgetId;                        // 持久化标识，不可依赖类型名
     const DISPLAY_NAME: &'static str;          // i18n **key**，不是文案
     const CATEGORY: WidgetCategory;            // 在 Widget Gallery 的哪个分类下被列出
-    const DESCRIPTION: &'static str = "";
+    const DESCRIPTION: Option<&'static str> = None;  // i18n **key**，不是文案
     const ICON: Option<&'static str> = None;
     const SELECTABLE: bool = true;             // false = 框架自建、选择列表不提供（如 `kytrix.empty`）
 
@@ -605,7 +605,7 @@ pub(super) struct ForceOrderService<S = MarketCapability> {
 
 **i18n**
 
-- 用户可见的文案一律 `t!(cx, "…")`；`DISPLAY_NAME` 是 **key**（如 `widget.names.force_order`）。
+- 用户可见的文案一律 `t!(cx, "…")`；`DISPLAY_NAME` 与 `DESCRIPTION` 都是 **key**（如 `widget.names.force_order`、`widget.descriptions.force_order`），不是文案。
 - **新增 key 必须同时加到 `crates/i18n/locales/en.yaml` 与 `zh-CN.yaml`。** 缺失的 key 翻译成空串——界面上一块空白，
   不是崩溃，所以很容易漏掉。
 - `common.*` 是 **跨 widget 共用**的：`connecting` / `loading` / `retry` 由框架在 surface 里解析，`no_data` 由 widget
@@ -722,7 +722,7 @@ global::install(cx).expect("test Tokio runtime should build");
 2. Config 必须实现 `WidgetConfig` 并给 `SCHEMA_VERSION`，当前一律 `WidgetConfigSchemaVersion::V1`。没有可持久化选项也要
    一个空的 config 类型，不要用 `()` 把 schema 版本糊过去。不兼容变更就直接删旧结构， **不写 migration、不写兼容层、
    不写 fallback**。每一项都要有 `Default`。
-3. `DISPLAY_NAME` 等文案 key 同时加到两个 locale；`CATEGORY` 声明它在 Widget Gallery 的哪个分类下被列出。
+3. `DISPLAY_NAME`、`DESCRIPTION` 等文案 key 同时加到两个 locale；`CATEGORY` 声明它在 Widget Gallery 的哪个分类下被列出。
    `SELECTABLE` 只对框架自建的组件（目前只有 `kytrix.empty`）才是 `false`：用户能选的一律留默认 `true`。
 4. `model.rs` 先写纯逻辑 + 单测，再做 UI。
 5. `service.rs` 定义协议与私有 Source trait，fake 覆盖正常/超时/失败/取消/替换。

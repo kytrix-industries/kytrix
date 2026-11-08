@@ -10,7 +10,7 @@ pub struct WidgetDescriptor {
     id: WidgetId,
     display_name: &'static str,
     category: WidgetCategory,
-    description: &'static str,
+    description: Option<&'static str>,
     icon: Option<&'static str>,
     selectable: bool,
     config_schema_version: WidgetConfigSchemaVersion,
@@ -28,16 +28,16 @@ impl WidgetDescriptor {
             id,
             display_name,
             category,
-            description: "",
+            description: None,
             icon: None,
             selectable: true,
             config_schema_version,
         }
     }
 
-    /// Sets human-readable detail for widget selection surfaces.
+    /// Sets the message key of human-readable detail for widget selection surfaces.
     pub const fn with_description(mut self, description: &'static str) -> Self {
-        self.description = description;
+        self.description = Some(description);
         self
     }
 
@@ -68,8 +68,8 @@ impl WidgetDescriptor {
         self.category
     }
 
-    /// Returns the optional descriptive text, or an empty string when omitted.
-    pub const fn description(&self) -> &'static str {
+    /// Returns the message key of the optional descriptive text.
+    pub const fn description(&self) -> Option<&'static str> {
         self.description
     }
 

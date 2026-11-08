@@ -220,7 +220,8 @@ impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.coin_market_cap_fear_and_greed_index");
     const DISPLAY_NAME: &'static str = "widget.names.coin_market_cap_fear_and_greed_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "CoinMarketCap crypto fear and greed index";
+    const DESCRIPTION: Option<&'static str> =
+        Some("widget.descriptions.coin_market_cap_fear_and_greed_index");
     const ICON: Option<&'static str> = Some("widgets/coin_market_cap_fear_and_greed_index.png");
     const SELECTABLE: bool = true;
 

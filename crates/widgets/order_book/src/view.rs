@@ -375,7 +375,7 @@ impl WidgetView for OrderBookWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.order_book");
     const DISPLAY_NAME: &'static str = "widget.names.order_book";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Live grouped market depth";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.order_book");
     const ICON: Option<&'static str> = Some("widgets/order_book.png");
 
     fn new(

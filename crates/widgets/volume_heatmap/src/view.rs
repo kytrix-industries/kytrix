@@ -359,7 +359,7 @@ impl WidgetView for VolumeHeatMapWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.volume_heatmap");
     const DISPLAY_NAME: &'static str = "widget.names.volume_heatmap";
     const CATEGORY: WidgetCategory = WidgetCategory::Statistics;
-    const DESCRIPTION: &'static str = "One market participant's spot quote volume, as a heat map";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.volume_heatmap");
     const ICON: Option<&'static str> = Some("widgets/volume_heatmap.png");
 
     fn new(

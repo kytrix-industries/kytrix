@@ -163,7 +163,7 @@ impl WidgetView for NewsWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.news");
     const DISPLAY_NAME: &'static str = "widget.names.news";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Live news from the local NewsStream service";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.news");
     const ICON: Option<&'static str> = Some("widgets/news.png");
 
     fn new(

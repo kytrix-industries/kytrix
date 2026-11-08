@@ -25,9 +25,9 @@
 //! The field searches the whole catalogue rather than one category: every section is
 //! drawn from the same match, a section a search leaves empty is not drawn, and a
 //! search that matches nothing is drawn as a search that found nothing rather than as
-//! a page with nothing on it. A widget matches when its localized name or its declared
-//! description contains the text, case-insensitively; the description is the English
-//! sentence the widget declares, because that is the text the catalogue carries.
+//! a page with nothing on it. A widget matches when its localized name or the
+//! description in the language the page is drawn in contains the text,
+//! case-insensitively.
 //!
 //! # What the page reports
 //!
@@ -129,8 +129,8 @@ struct GalleryWidget {
     category: WidgetCategory,
     /// Message key of the widget's name.
     display_name: &'static str,
-    /// The widget's own English sentence, drawn under its name.
-    description: &'static str,
+    /// Message key of the description drawn under the widget's name.
+    description: Option<&'static str>,
     /// The asset path the widget declared, if it declared one.
     icon: Option<&'static str>,
 }
@@ -262,9 +262,8 @@ impl WidgetGallery {
 
     /// Whether one widget is named by the search the page is drawn against.
     ///
-    /// The name is the localized one, because that is what the reader sees; the
-    /// description is the widget's own English sentence, because that is what the
-    /// catalogue declares. Both are compared case-insensitively, and a search of nothing
+    /// The name and the description are both the localized ones, because both are what
+    /// the reader sees. They are compared case-insensitively, and a search of nothing
     /// names everything.
     fn matches(&self, widget: &GalleryWidget, cx: &App) -> bool {
         if self.query.is_empty() {
@@ -276,8 +275,7 @@ impl WidgetGallery {
             .contains(self.query.as_str())
             || widget
                 .description
-                .to_lowercase()
-                .contains(self.query.as_str())
+                .is_some_and(|key| t!(cx, key).to_lowercase().contains(self.query.as_str()))
     }
 
     /// The widgets the search leaves, grouped by the category they are listed under.
@@ -497,7 +495,10 @@ impl WidgetGallery {
         let selected = self.selection.as_ref() == Some(&widget.id);
         let theme = cx.theme();
         let name = t!(cx, widget.display_name);
-        let description = SharedString::new_static(widget.description);
+        let description = widget
+            .description
+            .map(|key| t!(cx, key))
+            .filter(|description| !description.is_empty());
         let widget_id = widget.id.clone();
         let row_element_id = (
             ElementId::Name(SharedString::new_static("WidgetGalleryRow")),
@@ -513,7 +514,7 @@ impl WidgetGallery {
             .flex_col()
             .gap_0p5()
             .child(div().text_sm().truncate().child(name.clone()));
-        if !description.is_empty() {
+        if let Some(description) = description {
             text = text.child(
                 div()
                     .truncate()
@@ -657,9 +658,9 @@ mod tests {
     use widget_registry::registry::WidgetRegistry;
 
     use super::{
-        CANCEL_SELECTOR, COLUMN_SELECTOR, CONFIRM_SELECTOR, CONTENT_SELECTOR, FOOTER_SELECTOR,
-        PANEL_SELECTOR, SEARCH_SELECTOR, VIEWPORT_SELECTOR, WidgetGallery, WidgetGalleryEvent,
-        category_selector,
+        CANCEL_SELECTOR, COLUMN_SELECTOR, CONFIRM_SELECTOR, CONTENT_MAX_WIDTH, CONTENT_SELECTOR,
+        FOOTER_SELECTOR, PANEL_SELECTOR, SEARCH_SELECTOR, VIEWPORT_SELECTOR, WidgetGallery,
+        WidgetGalleryEvent, category_selector,
     };
 
     /// Debug selectors of the rows and radios a test reaches for by name.
@@ -1146,7 +1147,7 @@ mod tests {
             .debug_bounds(SEARCH_SELECTOR)
             .expect("the page should draw its search field");
 
-        assert_eq!(column.size.width, px(800.0));
+        assert_eq!(column.size.width, CONTENT_MAX_WIDTH);
         assert_eq!(column.center().x, panel.center().x);
         assert_eq!(footer.size.width, panel.size.width);
         assert_eq!(footer.left(), panel.left());
@@ -1201,8 +1202,8 @@ mod tests {
         );
     }
 
-    /// The search matches the English description a widget declares as well as its name,
-    /// which is the sentence the catalogue carries rather than a translated one.
+    /// The search matches the description a widget declares as well as its name: in the
+    /// English interface both are the English text.
     #[gpui_kit::test]
     fn typing_a_description_should_narrow_the_gallery(cx: &mut TestAppContext) {
         let mut harness = gallery(cx, None);
@@ -1216,9 +1217,8 @@ mod tests {
         );
     }
 
-    /// The name a search matches is translated while the description is not: with the
-    /// interface in Chinese the widget's Chinese name narrows the list, and the English
-    /// sentence the catalogue carries still does.
+    /// The name a search matches is translated: with the interface in Chinese the
+    /// widget's Chinese name narrows the list.
     #[gpui_kit::test]
     fn typing_a_localized_name_should_narrow_the_gallery(cx: &mut TestAppContext) {
         let mut harness = gallery(cx, None);
@@ -1234,13 +1234,27 @@ mod tests {
             harness.cx.debug_bounds(CANDLESTICK_ROW).is_some(),
             "the matched widget should be drawn"
         );
+    }
 
-        harness.clear_search();
-        harness.type_into_search("OHLCV");
+    /// The description a search matches is translated with the interface: the Chinese
+    /// sentence narrows the list in the Chinese interface, and the English one does not.
+    #[gpui_kit::test]
+    fn typing_a_localized_description_should_narrow_the_gallery(cx: &mut TestAppContext) {
+        let mut harness = gallery(cx, None);
+        harness.set_language(LanguageCode::ZhCn);
+
+        harness.type_into_search("历史");
         assert_eq!(
             harness.listed(),
             ["kytrix.candlestick"],
-            "the English description should stay searchable in the Chinese interface"
+            "the Chinese description of the candlestick widget should be matched"
+        );
+
+        harness.clear_search();
+        harness.type_into_search("Live");
+        assert!(
+            harness.listed().is_empty(),
+            "the English description should not be searched in the Chinese interface"
         );
     }
 

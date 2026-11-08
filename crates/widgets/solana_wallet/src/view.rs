@@ -258,7 +258,7 @@ impl WidgetView for SolanaWalletWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.solana_wallet");
     const DISPLAY_NAME: &'static str = "widget.names.solana_wallet";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Live transfers of the Solana addresses an account monitors";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.solana_wallet");
     const ICON: Option<&'static str> = Some("widgets/solana_wallet.png");
 
     fn new(

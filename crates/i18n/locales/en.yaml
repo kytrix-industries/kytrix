@@ -907,6 +907,30 @@ widget:
     select_market: Select market
     select_market_group: Select market category
     timeframe: Prediction market timeframe
+  descriptions:
+    candlestick: Live and historical OHLCV chart
+    coin_market_cap_fear_and_greed_index: CoinMarketCap crypto fear and greed index
+    cryptocurrency_etf: Daily net flows of the cryptocurrency spot ETF complexes, and the assets they hold
+    ethereum_wallet: Live transfers of the Ethereum addresses an account monitors
+    financial_calendar: Scheduled economic events, grouped by the day they fall on
+    financial_index: Global market and commodity indices
+    force_order: Live liquidation orders across Binance and OKX
+    global_shipping_chokepoint: Live AIS vessel positions across strategic shipping chokepoints
+    hyperliquid_wallet: Monitor Hyperliquid wallet activity
+    long_short_account_ratio: Perpetual long and short account ratio
+    market_trade: Recent native market executions
+    news: Live news from the local NewsStream service
+    open_interest: Perpetual open interest, in the base and quote asset
+    order_book: Live grouped market depth
+    pentagon_pizza_index: The Pentagon Pizza Index, and the readiness level it reports
+    prediction_market: Prediction event probabilities over time
+    solana_wallet: Live transfers of the Solana addresses an account monitors
+    taker_volume: Perpetual taker buy and sell volume
+    top_trader_account_ratio: Top traders' long and short account ratio
+    top_trader_position_ratio: Top traders' long and short position ratio
+    volume_heatmap: One market participant's spot quote volume, as a heat map
+    watch_list: Live 24-hour statistics for followed listings
+    x: Live posts from monitored X accounts
   names:
     candlestick: Candlestick
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed

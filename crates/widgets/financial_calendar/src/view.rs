@@ -189,7 +189,7 @@ impl WidgetView for FinancialCalendarWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.financial_calendar");
     const DISPLAY_NAME: &'static str = "widget.names.financial_calendar";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Scheduled economic events, grouped by the day they fall on";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.financial_calendar");
     const ICON: Option<&'static str> = Some("widgets/financial_calendar.png");
 
     fn new(

@@ -306,7 +306,7 @@ impl WidgetView for ForceOrderWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.force_order");
     const DISPLAY_NAME: &'static str = "widget.names.force_order";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Live liquidation orders across Binance and OKX";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.force_order");
     const ICON: Option<&'static str> = Some("widgets/force_order.png");
 
     fn new(

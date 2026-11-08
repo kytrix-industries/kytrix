@@ -258,8 +258,7 @@ impl WidgetView for EthereumWalletWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.ethereum_wallet");
     const DISPLAY_NAME: &'static str = "widget.names.ethereum_wallet";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str =
-        "Live transfers of the Ethereum addresses an account monitors";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.ethereum_wallet");
     const ICON: Option<&'static str> = Some("widgets/ethereum_wallet.png");
 
     fn new(

@@ -77,7 +77,8 @@ pub trait WidgetView: Render + Sized + 'static {
     const DISPLAY_NAME: &'static str;
     /// The group of the widget gallery this widget is listed under.
     const CATEGORY: WidgetCategory;
-    const DESCRIPTION: &'static str = "";
+    /// Optional message key of the widget description, resolved through the global translator.
+    const DESCRIPTION: Option<&'static str> = None;
     const ICON: Option<&'static str> = None;
     /// Whether a selection surface may offer this widget.
     ///

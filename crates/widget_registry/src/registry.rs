@@ -71,8 +71,10 @@ fn descriptor_of<W: WidgetView>() -> WidgetDescriptor {
         W::CATEGORY,
         W::Config::SCHEMA_VERSION,
     )
-    .with_description(W::DESCRIPTION)
     .with_selectable(W::SELECTABLE);
+    if let Some(description) = W::DESCRIPTION {
+        descriptor = descriptor.with_description(description);
+    }
     if let Some(icon) = W::ICON {
         descriptor = descriptor.with_icon(icon);
     }
@@ -572,7 +574,7 @@ common:
         const ID: WidgetId = WidgetId::new_static("kytrix.test.internal");
         const DISPLAY_NAME: &'static str = "widget.names.empty";
         const CATEGORY: WidgetCategory = WidgetCategory::Market;
-        const DESCRIPTION: &'static str = "built by the framework, never offered";
+        const DESCRIPTION: Option<&'static str> = Some("test.descriptions.internal");
         const ICON: Option<&'static str> = Some("widgets/test.png");
         const SELECTABLE: bool = false;
 
@@ -624,7 +626,7 @@ common:
         assert_eq!(descriptor.display_name(), TestView::DISPLAY_NAME);
         assert_eq!(descriptor.category(), TestView::CATEGORY);
         assert_eq!(descriptor.config_schema_version(), SCHEMA_V1);
-        assert_eq!(descriptor.description(), "");
+        assert_eq!(descriptor.description(), None);
         assert_eq!(descriptor.icon(), None);
         assert!(
             descriptor.selectable(),

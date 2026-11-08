@@ -872,7 +872,7 @@ impl WidgetView for WatchListWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.watch_list");
     const DISPLAY_NAME: &'static str = "widget.names.watch_list";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Live 24-hour statistics for followed listings";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.watch_list");
     const ICON: Option<&'static str> = Some("widgets/watch_list.png");
 
     fn new(

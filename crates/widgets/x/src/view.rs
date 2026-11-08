@@ -292,7 +292,7 @@ impl WidgetView for XWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.x");
     const DISPLAY_NAME: &'static str = "widget.names.x";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Live posts from monitored X accounts";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.x");
     const ICON: Option<&'static str> = Some("widgets/x.png");
 
     fn new(

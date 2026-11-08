@@ -407,7 +407,7 @@ impl WidgetView for HyperliquidWalletWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.hyperliquid_wallet");
     const DISPLAY_NAME: &'static str = "widget.names.hyperliquid_wallet";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str = "Monitor Hyperliquid wallet activity";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.hyperliquid_wallet");
     const ICON: Option<&'static str> = Some("widgets/hyperliquid_wallet.png");
 
     fn new(

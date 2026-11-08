@@ -307,7 +307,7 @@ impl WidgetView for MarketTradeWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.market_trade");
     const DISPLAY_NAME: &'static str = "widget.names.market_trade";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Recent native market executions";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.market_trade");
     const ICON: Option<&'static str> = Some("widgets/market_trade.png");
 
     fn new(

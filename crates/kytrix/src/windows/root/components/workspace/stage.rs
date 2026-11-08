@@ -693,6 +693,7 @@ mod tests {
         IntoElement, Modifiers, MouseButton, ParentElement, Pixels, Render, Styled, TestAppContext,
         VisualTestContext, Window, div, point, px, size,
     };
+    use i18n::t;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::{
@@ -765,15 +766,15 @@ mod tests {
     }
 
     /// The widget a picker test switches a pane to. It has nothing to draw and nothing to
-    /// load, and its description is the text a test searches the page for.
+    /// load, and its name is the text a test searches the page for: the framework's own
+    /// empty widget is not one the page offers, so the name narrows the page to this one.
     struct PickerWidget;
 
     impl WidgetView for PickerWidget {
         type Config = ();
 
         const ID: WidgetId = WidgetId::new_static("kytrix.test.widget-picker");
-        const DISPLAY_NAME: &'static str = "widget.names.news";
-        const DESCRIPTION: &'static str = "test widget the workspace picker can choose";
+        const DISPLAY_NAME: &'static str = "widget.names.empty";
         const CATEGORY: WidgetCategory = WidgetCategory::Market;
 
         fn new(
@@ -1075,7 +1076,8 @@ mod tests {
             .center();
         cx.simulate_click(field, Modifiers::none());
         cx.run_until_parked();
-        cx.simulate_input(PickerWidget::DESCRIPTION);
+        let name = cx.update(|_, cx| t!(cx, PickerWidget::DISPLAY_NAME));
+        cx.simulate_input(name.as_ref());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
     }

@@ -557,7 +557,7 @@ impl WidgetView for FinancialIndexWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.financial_index");
     const DISPLAY_NAME: &'static str = "widget.names.financial_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Global market and commodity indices";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.financial_index");
     const ICON: Option<&'static str> = Some("widgets/indices.png");
 
     fn new(

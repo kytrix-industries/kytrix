@@ -528,7 +528,7 @@ impl WidgetView for CandlestickWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.candlestick");
     const DISPLAY_NAME: &'static str = "widget.names.candlestick";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Live and historical OHLCV chart";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.candlestick");
     const ICON: Option<&'static str> = Some("widgets/candlestick.png");
 
     fn new(

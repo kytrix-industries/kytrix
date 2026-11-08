@@ -116,7 +116,8 @@ pub trait StatisticsMetric: Sized + 'static {
     const ID: WidgetId;
     /// The message key of the widget's name.
     const DISPLAY_NAME: &'static str;
-    const DESCRIPTION: &'static str;
+    /// The message key of the widget's description.
+    const DESCRIPTION: Option<&'static str>;
     /// The asset path of the picture the widget gallery draws for this pane.
     const ICON: &'static str;
     /// Which series this pane plots.
@@ -320,7 +321,7 @@ where
     const ID: WidgetId = M::ID;
     const DISPLAY_NAME: &'static str = M::DISPLAY_NAME;
     const CATEGORY: WidgetCategory = WidgetCategory::Statistics;
-    const DESCRIPTION: &'static str = M::DESCRIPTION;
+    const DESCRIPTION: Option<&'static str> = M::DESCRIPTION;
     const ICON: Option<&'static str> = Some(M::ICON);
 
     fn new(

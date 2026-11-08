@@ -323,7 +323,7 @@ impl WidgetView for PredictionMarketWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.prediction_market");
     const DISPLAY_NAME: &'static str = "widget.names.prediction_market";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    const DESCRIPTION: &'static str = "Prediction event probabilities over time";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.prediction_market");
     const ICON: Option<&'static str> = Some("widgets/prediction_market.png");
 
     fn new(

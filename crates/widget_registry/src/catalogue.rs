@@ -72,6 +72,7 @@ fn catalogue() -> impl ExactSizeIterator<Item = WidgetRegistration> {
 mod tests {
     use app_config::widget::WidgetConfigSchemaVersion;
     use gpui_kit::TestAppContext;
+    use i18n::translator::types::I18n;
     use widget::{category::WidgetCategory, view::WidgetView};
 
     use super::install;
@@ -138,6 +139,43 @@ mod tests {
         (SOLANA_WALLET_ID, WidgetCategory::Monitoring),
         (WATCH_LIST_ID, WidgetCategory::Market),
     ];
+
+    /// A widget's name and description are message keys, and a key no locale defines
+    /// translates to an empty string: a widget that names one the catalogue lacks would
+    /// draw a blank line. Every registered widget is therefore checked in every loaded
+    /// language.
+    #[gpui_kit::test]
+    fn every_widget_text_should_translate_in_every_loaded_language(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            i18n::global::embedded::install(cx).expect("embedded locales should load");
+            install(cx).expect("the catalogue should install");
+        });
+
+        cx.update(|cx| {
+            let i18n = cx.global::<I18n>();
+            let languages = i18n.languages();
+            assert!(
+                !languages.is_empty(),
+                "the catalogue should have a language to translate into"
+            );
+
+            for registration in cx.global::<WidgetRegistry>().iter() {
+                let descriptor = registration.descriptor();
+                let keys =
+                    std::iter::once(descriptor.display_name()).chain(descriptor.description());
+                for key in keys {
+                    for language in &languages {
+                        assert!(
+                            i18n.try_translate(*language, key)
+                                .is_some_and(|message| !message.is_empty()),
+                            "{} names `{key}`, which {language} does not translate",
+                            descriptor.id()
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     #[gpui_kit::test]
     fn install_should_publish_the_whole_catalogue_as_a_global(cx: &mut TestAppContext) {

@@ -453,8 +453,8 @@ impl WidgetView for GlobalShippingChokepointWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.global_shipping_chokepoint");
     const DISPLAY_NAME: &'static str = "widget.names.global_shipping_chokepoint";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str =
-        "Live AIS vessel positions across strategic shipping chokepoints";
+    const DESCRIPTION: Option<&'static str> =
+        Some("widget.descriptions.global_shipping_chokepoint");
     const ICON: Option<&'static str> = Some("widgets/global_shipping_chokepoint.png");
 
     fn new(

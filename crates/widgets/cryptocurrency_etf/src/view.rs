@@ -214,8 +214,7 @@ impl WidgetView for CryptocurrencyEtfWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.cryptocurrency_etf");
     const DISPLAY_NAME: &'static str = "widget.names.cryptocurrency_etf";
     const CATEGORY: WidgetCategory = WidgetCategory::Statistics;
-    const DESCRIPTION: &'static str =
-        "Daily net flows of the cryptocurrency spot ETF complexes, and the assets they hold";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.cryptocurrency_etf");
     const ICON: Option<&'static str> = Some("widgets/cryptocurrency_etf.png");
 
     fn new(

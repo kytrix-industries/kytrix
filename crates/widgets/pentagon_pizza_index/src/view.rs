@@ -160,8 +160,7 @@ impl WidgetView for PentagonPizzaIndexWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.pentagon_pizza_index");
     const DISPLAY_NAME: &'static str = "widget.names.pentagon_pizza_index";
     const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-    const DESCRIPTION: &'static str =
-        "The Pentagon Pizza Index, and the readiness level it reports";
+    const DESCRIPTION: Option<&'static str> = Some("widget.descriptions.pentagon_pizza_index");
     const ICON: Option<&'static str> = Some("widgets/pentagon_pizza_index.png");
 
     fn new(
