@@ -71,7 +71,7 @@ use widget_registry::registry::WidgetRegistry;
 use crate::widget_icon::WidgetIcon;
 
 /// The size of a widget's icon in the gallery's rows.
-const ICON_SIZE: Pixels = px(24.0);
+const ICON_SIZE: Pixels = px(32.0);
 
 /// The height of one row, which holds the icon, the widget's name and description, and its
 /// radio.
@@ -82,7 +82,7 @@ const SEARCH_WIDTH: Pixels = px(240.0);
 
 /// The widest the page's content column gets. The footer is drawn outside it, so it keeps the
 /// page's full width while the header and catalogue are centred.
-const CONTENT_MAX_WIDTH: Pixels = px(800.0);
+const CONTENT_MAX_WIDTH: Pixels = px(1000.0);
 
 /// The element id of the scroll viewport, which is where the page remembers how far it
 /// was scrolled.
