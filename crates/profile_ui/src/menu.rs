@@ -1,9 +1,8 @@
 //! The account menu's content: who is signed in, and the entries that change it.
 //!
-//! The menu is a window-level context menu. The entry that opens it belongs to whoever draws
-//! the account — the sidebar's foot — and [`crate::profile::ProfileMenu`] puts the content on
-//! the layer; this module draws that content and nothing else: the account block, the
-//! entries, and the face a caller may draw in its own entry.
+//! The menu is the panel of the account control the title bar draws. That control belongs to
+//! [`crate::profile::ProfileMenu`]; this module draws the content and nothing else: the
+//! account block, the entries, and the face the control draws.
 //!
 //! # What it does not draw
 //!
@@ -176,7 +175,6 @@ impl AccountMenu {
                             self.avatar.as_ref(),
                             px(ACCOUNT_AVATAR_SIZE),
                             "TEST_PROFILE_ACCOUNT_AVATAR",
-                            cx,
                         )
                         .bg(cx.theme().roles.surface.raised.hsla),
                     )
@@ -278,7 +276,6 @@ pub(crate) fn avatar_face(
     avatar: Option<&Arc<Image>>,
     size: Pixels,
     selector: &'static str,
-    cx: &App,
 ) -> Div {
     let face = div()
         .size(size)
@@ -290,11 +287,7 @@ pub(crate) fn avatar_face(
 
     match avatar {
         Some(avatar) => face.child(img(avatar.clone()).size_full()),
-        None => face.child(
-            Icon::new(IconKind::User)
-                .size_4()
-                .text_color(cx.theme().roles.fg.muted.hsla),
-        ),
+        None => face.child(Icon::new(IconKind::User).size_4()),
     }
 }
 

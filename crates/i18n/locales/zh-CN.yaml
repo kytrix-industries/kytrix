@@ -1166,7 +1166,6 @@ window:
     rename: 修改名称
     settings: 设置
     toggle: 显示或隐藏侧边栏
-    user: 用户
   updater:
     available: 有可用更新
     download: 更新

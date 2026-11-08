@@ -1,9 +1,7 @@
-//! The account entry: who is signed in, and how that changes.
+//! The account control: who is signed in, and how that changes.
 //!
-//! [`profile::ProfileMenu`] is the stateful host: the account, the flows that change it, and
-//! the content of the menu behind the entry. The entry that opens the menu belongs to the
-//! window that draws the account — the sidebar's foot — and opens
-//! [`profile::ProfileMenu::show_context_menu`] as a window-level menu.
+//! [`profile::ProfileMenu`] is the title bar's account control: the account, the flows that
+//! change it, and the face that opens the account menu below it.
 //!
 //! The sign-in itself is the account service's OAuth authorization, driven from
 //! `oauth`: the browser authorizes, a loopback listener in this process receives the

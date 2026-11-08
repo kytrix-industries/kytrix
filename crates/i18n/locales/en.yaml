@@ -1166,7 +1166,6 @@ window:
     rename: Rename
     settings: Settings
     toggle: Toggle sidebar
-    user: User
   updater:
     available: Update available
     download: Update

@@ -1,5 +1,8 @@
-//! The account who is signed in, and how that changes, behind the menu the sidebar's foot
-//! opens.
+//! The account who is signed in, and how that changes, behind the account control the title
+//! bar draws.
+//!
+//! The control is this view: the title bar mounts [`ProfileMenu`], and it draws the
+//! account's face and the menu behind it.
 //!
 //! # What it owns
 //!
@@ -13,13 +16,13 @@
 //!
 //! The account itself. That is the application settings, and this is a *reader* of them
 //! with one writer: [`crate::account`]. Every screen that cares who is signed in —
-//! widgets with an account-scoped stream, and this menu — subscribes to the account
+//! widgets with an account-scoped stream, and this control — subscribes to the account
 //! event, so signing in publishes one event and nothing has to be told twice. That is
 //! also why nothing here calls `refresh_windows`: the event subscription is what
 //! redraws the screens that follow it.
 //!
-//! The entry that opens the menu is not here: the menu's content has a module of its own,
-//! and the window that draws the account draws the row that asks for it.
+//! The content of the menu is not here either: it has a module of its own, and this view
+//! draws the control that opens it.
 //!
 //! # What it does not do
 //!
@@ -32,9 +35,15 @@ use std::sync::Arc;
 
 use app_config::settings::{AccountConfig, AccountWalletKind};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
-use base_ui::{context_menu::ContextMenu, layer::LayerExt as _};
+use base_ui::{
+    dropdown::Dropdown, interactive::InteractiveVariantExt as _, layer::LayerExt as _,
+    size::UnifiedSizable as _, tooltip::Tooltip,
+};
 use futures::future::BoxFuture;
-use gpui_kit::*;
+use gpui_kit::{
+    base::{Align, Placement},
+    *,
+};
 use i18n::t;
 use kytrix_service_provider::{
     auth::{
@@ -162,7 +171,23 @@ impl AccountService for KytrixServiceConnector {
     }
 }
 
-/// The account entry in the sidebar footer.
+/// The element id of the title bar's account control: the trigger, its panel and the state
+/// behind them.
+const PROFILE_BUTTON_ID: &str = "title-bar-profile";
+
+/// The square the control takes: the title bar's control square, which the sidebar toggle,
+/// the market menu and the window's system buttons take as well.
+const TRIGGER_SIZE: Pixels = px(32.0);
+
+/// The face inside the trigger while no generated avatar is ready: the size the title bar's
+/// other marks take, which the placeholder keeps even for a signed-in account.
+const TRIGGER_AVATAR_SIZE: Pixels = px(16.0);
+
+/// The face inside the trigger once the account's generated avatar is ready: larger than the
+/// bar's marks, so the account's picture reads as the control rather than as a mark in it.
+const TRIGGER_ACCOUNT_AVATAR_SIZE: Pixels = px(24.0);
+
+/// The account control in the title bar.
 pub struct ProfileMenu {
     source: Arc<dyn AccountService>,
     /// The account in the settings, which is the one this menu is about.
@@ -175,6 +200,8 @@ pub struct ProfileMenu {
     plan: Option<PlanCode>,
     /// Bumped whenever the plan a query was for stops being the plan in question.
     plan_generation: u64,
+    /// Whether the account menu is open. The overlay writes it and the trigger reads it.
+    open_state: Entity<bool>,
     /// The task of the attempt that is waiting for its browser callback, if one is.
     ///
     /// Ending the attempt is aborting this: the listener the attempt owns is released where
@@ -191,8 +218,8 @@ pub struct ProfileMenu {
 }
 
 impl ProfileMenu {
-    /// Builds the menu the application mounts, reading the account service from the
-    /// globals the composition root installed.
+    /// Builds the account control the application mounts, reading the account service from
+    /// the globals the composition root installed.
     pub fn new(cx: &mut Context<Self>) -> Self {
         let source = Arc::new(cx.global::<KytrixServiceConnector>().clone());
 
@@ -205,6 +232,12 @@ impl ProfileMenu {
             menu.refresh_account(cx);
             cx.notify();
         });
+
+        let open_state = cx.new(|_| false);
+        // The trigger paints itself pressed while its menu is open, and the tooltip gives
+        // way to the menu, so the frame that draws either follows the state the overlay
+        // writes. The overlay is the only writer.
+        cx.observe(&open_state, |_, _, cx| cx.notify()).detach();
 
         let session_source = Arc::clone(&source);
         let session_task = cx.spawn(async move |menu, cx| {
@@ -231,6 +264,7 @@ impl ProfileMenu {
             avatar_wallet: None,
             plan: None,
             plan_generation: 0,
+            open_state,
             sign_in: None,
             _account: account,
             _session_task: session_task,
@@ -241,76 +275,6 @@ impl ProfileMenu {
         };
         menu.refresh_account(cx);
         menu
-    }
-
-    /// The account's face at `size`, for the entry a caller draws for itself.
-    ///
-    /// It is the same face the menu's account block shows; the caller decides how large it
-    /// is and what sits beside it.
-    pub fn avatar(&self, size: Pixels, cx: &App) -> Div {
-        avatar_face(
-            self.avatar.as_ref(),
-            size,
-            "TEST_PROFILE_TRIGGER_AVATAR",
-            cx,
-        )
-    }
-
-    /// Opens the account menu as a context menu at `anchor`.
-    ///
-    /// The menu belongs to the window's layer rather than to the entry that opened it: the
-    /// entry sits at the foot of a sidebar, where a menu opening downward would leave the
-    /// window, so the menu's bottom-left corner sits at the anchor and it grows upward and
-    /// to the right. The layer owns it, and the floating sidebar can ask the layer whether
-    /// it is up.
-    ///
-    /// `id` keys the entries and the account block; the docked rail and the full panel it
-    /// floats can be drawn in the same frame, so each form needs its own.
-    pub fn show_context_menu(
-        &self,
-        id: impl Into<ElementId>,
-        anchor: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let id = id.into();
-        let label = t!(cx, "window.account.menu");
-        let profile = cx.entity().downgrade();
-
-        let entries = {
-            let profile = profile.clone();
-            let id = id.clone();
-            move |_: &mut Window, cx: &mut App| {
-                let (account, avatar, plan) = profile
-                    .read_with(cx, |profile, _| {
-                        (
-                            profile.account.clone(),
-                            profile.avatar.clone(),
-                            profile.plan,
-                        )
-                    })
-                    .unwrap_or((None, None, None));
-
-                AccountMenu::new(account.as_ref().map(SignedInAccount::from), avatar, plan)
-                    .entries(&id, cx)
-            }
-        };
-
-        let on_item_click =
-            move |_: &ClickEvent, item_id: SharedString, window: &mut Window, cx: &mut App| {
-                let _ = profile.update(cx, |profile, cx| {
-                    profile.activate(item_id.as_ref(), window, cx);
-                });
-            };
-
-        window.context_menu(
-            cx,
-            ContextMenu::new(id, anchor, px(MENU_WIDTH), entries)
-                .anchor(Anchor::BottomLeft)
-                .aria_label(label)
-                .debug_selector("TEST_PROFILE_MENU")
-                .on_item_click(on_item_click),
-        );
     }
 
     /// Runs the action an entry of the account menu stands for.
@@ -704,10 +668,73 @@ impl Drop for ProfileMenu {
 }
 
 impl Render for ProfileMenu {
-    /// The account menu is a window-level context menu opened by the entry that draws the
-    /// account, so this view is the state behind it and is never mounted as an element.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        Empty.into_any_element()
+    /// The account control the title bar draws: the account's face in the bar's square, and
+    /// the menu that opens below it.
+    ///
+    /// The menu is a [`Dropdown`], the same control the market menu in the title bar is: it
+    /// belongs to the trigger, is placed against it, and fades as it comes and goes. The
+    /// content belongs to the account menu module; this view only decides when and where it
+    /// is drawn.
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = ElementId::from(PROFILE_BUTTON_ID);
+        let label = t!(cx, "window.account.menu");
+        // The placeholder keeps the bar's mark size; a generated face is the account's own
+        // picture, so it takes more of the square than a mark does.
+        let avatar_size = if self.avatar.is_some() {
+            TRIGGER_ACCOUNT_AVATAR_SIZE
+        } else {
+            TRIGGER_AVATAR_SIZE
+        };
+        let avatar = avatar_face(
+            self.avatar.as_ref(),
+            avatar_size,
+            "TEST_PROFILE_TRIGGER_AVATAR",
+        );
+        // Built from the state this frame sees rather than from a snapshot taken when the
+        // menu opened, so an account that changes while its menu is up is what the menu
+        // shows.
+        let entries = AccountMenu::new(
+            self.account.as_ref().map(SignedInAccount::from),
+            self.avatar.clone(),
+            self.plan,
+        )
+        .entries(&id, cx);
+        let profile = cx.entity().downgrade();
+
+        let trigger = Dropdown::new(id.clone())
+            .small()
+            .ghost()
+            .h(TRIGGER_SIZE)
+            .w(TRIGGER_SIZE)
+            // The face takes the square; the trigger size's own padding would squeeze the
+            // 24 px avatar the account draws.
+            .p_0()
+            .justify_center()
+            .aria_label(label.clone())
+            .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
+            .open_state(&self.open_state)
+            .placement(Placement::Bottom)
+            // The control sits on the title bar's right-hand side, so the menu hangs from its
+            // right edge and grows leftwards into the window rather than off the edge.
+            .align(Align::End)
+            .menu_width(px(MENU_WIDTH))
+            .menu(entries)
+            .on_menu_item_click(move |_, item_id, window, cx| {
+                let _ = profile.update(cx, |profile, cx| {
+                    profile.activate(item_id.as_ref(), window, cx);
+                });
+            })
+            .child(avatar);
+
+        // The hint sits under the face, but not while the menu is down: the menu occupies
+        // that space, and a hint left over its first entry would take the presses meant for
+        // the entry.
+        let tooltip = Tooltip::new((id, "tooltip"), trigger).placement(Placement::Bottom);
+        if *self.open_state.read(cx) {
+            tooltip
+        } else {
+            tooltip.content(label)
+        }
     }
 }
 
@@ -728,14 +755,12 @@ mod tests {
 
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use app_config_provider::manager::ConfigManager;
-    use base_ui::{
-        animation::ANIMATION_TICK, button::Button, layer::Layer, size::UnifiedSizable as _,
-    };
+    use base_ui::{animation::ANIMATION_TICK, layer::Layer};
     use futures::future::BoxFuture;
     use gpui_kit::{
-        AppContext as _, BorrowAppContext as _, Context, Entity, InteractiveElement, IntoElement,
-        Modifiers, ParentElement as _, Render, StatefulInteractiveElement, Styled as _,
-        TestAppContext, VisualTestContext, Window, div, point, px, size,
+        AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, Modifiers,
+        ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div,
+        px, size,
     };
     use kytrix_service_provider::auth::{
         dpop::DpopKey,
@@ -756,6 +781,10 @@ mod tests {
     const ETHEREUM: &str = "0x0123456789abcdef0123456789abcdef01234567";
     const SOLANA: &str = "7YttLkHDoNj9wyDur5VjZ9Pd7WZZvnGvWKbxzwfKQnDb";
     const HANDOFF_CODE: &str = "0123456789012345678901234567890123456789012";
+
+    /// The box the account menu is drawn in. The panel belongs to the dropdown this view is,
+    /// so the box is named by the dropdown rather than by the menu content.
+    const PROFILE_PANEL: &str = "TEST_DROPDOWN_PANEL";
 
     const FAILURE: AuthError = AuthError::MissingCredential;
 
@@ -964,45 +993,27 @@ mod tests {
         config
     }
 
-    /// The menu as the account entry mounts it, over an in-memory settings snapshot.
-    struct Harness<'a> {
-        menu: Entity<ProfileMenu>,
-        source: FakeAccountService,
-        cx: &'a mut VisualTestContext,
-    }
-
-    /// The window a test mounts the account entry in: a button that opens the menu, over the
-    /// layer every alert is opened on.
+    /// The window the account entry is mounted in: a flex row, the way the title bar lays its
+    /// controls out, over the layer every alert is opened on.
     struct MenuRoot {
         menu: Entity<ProfileMenu>,
     }
 
     impl Render for MenuRoot {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let menu = self.menu.clone();
-
             div()
                 .size_full()
                 .flex()
                 .items_center()
-                .justify_center()
-                .child(
-                    Button::new("test-profile-trigger")
-                        .small()
-                        .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
-                        .child("account")
-                        .on_click(move |_, window, cx| {
-                            menu.update(cx, |menu, cx| {
-                                menu.show_context_menu(
-                                    "test-profile-context",
-                                    point(px(200.0), px(200.0)),
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }),
-                )
+                .child(self.menu.clone())
         }
+    }
+
+    /// The menu as the account entry mounts it, over an in-memory settings snapshot.
+    struct Harness<'a> {
+        menu: Entity<ProfileMenu>,
+        source: FakeAccountService,
+        cx: &'a mut VisualTestContext,
     }
 
     fn harness<'a>(
@@ -1020,11 +1031,13 @@ mod tests {
         });
         let menu =
             cx.update(|cx| cx.new(|cx| ProfileMenu::with_source(Arc::new(source.clone()), cx)));
-        let rendered = menu.clone();
-        let (_, cx) = cx.add_window_view(move |_, cx| {
-            let root = cx.new(|_| MenuRoot { menu: rendered });
+        let (_, cx) = cx.add_window_view({
+            let menu = menu.clone();
+            move |_, cx| {
+                let root = cx.new(|_| MenuRoot { menu });
 
-            Layer::new(root)
+                Layer::new(root)
+            }
         });
         cx.simulate_resize(size(px(800.0), px(600.0)));
         cx.run_until_parked();
@@ -1147,6 +1160,38 @@ mod tests {
         assert_eq!(profile_action("something-else"), None);
     }
 
+    /// Signed out, the control is the title bar's own square, and its placeholder face is
+    /// drawn at the size the bar's other marks take.
+    #[gpui_kit::test]
+    fn the_control_should_be_the_title_bars_square(cx: &mut TestAppContext) {
+        let harness = harness(
+            cx,
+            Config::default(),
+            FakeAccountService::new(ethereum_account()),
+        );
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+
+        assert_eq!(
+            harness
+                .cx
+                .debug_bounds("TEST_PROFILE_TRIGGER")
+                .expect("the title bar should draw the account control")
+                .size,
+            size(px(32.0), px(32.0)),
+            "the control is the title bar's control square"
+        );
+        assert_eq!(
+            harness
+                .cx
+                .debug_bounds("TEST_PROFILE_TRIGGER_AVATAR")
+                .expect("the control should draw the account's face")
+                .size,
+            size(px(16.0), px(16.0)),
+            "the face is drawn at the size the title bar's other marks take"
+        );
+    }
+
     #[gpui_kit::test]
     fn a_menu_with_nobody_signed_in_should_offer_only_a_sign_in(cx: &mut TestAppContext) {
         let mut harness = harness(
@@ -1158,7 +1203,7 @@ mod tests {
         assert!(!shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
         open_menu(&mut harness);
 
-        assert!(shows(&mut harness, "TEST_PROFILE_MENU"));
+        assert!(shows(&mut harness, PROFILE_PANEL));
         assert!(!shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
         assert!(!shows(&mut harness, "TEST_MENU_ITEM_open-account"));
     }
@@ -1177,7 +1222,7 @@ mod tests {
         assert_eq!(
             harness
                 .cx
-                .debug_bounds("TEST_PROFILE_MENU")
+                .debug_bounds(PROFILE_PANEL)
                 .expect("the menu should be drawn")
                 .size
                 .width,
@@ -1192,11 +1237,11 @@ mod tests {
         assert!(shows(&mut harness, "TEST_MENU_ITEM_sign-out"));
 
         // The address's tooltip is an overlay inside the menu. It has to open without the
-        // context menu going away, which is what the tooltip's priority is for.
+        // menu going away, which is what the tooltip's priority is for.
         let address = harness
             .cx
             .debug_bounds("TEST_PROFILE_ADDRESS")
-            .expect("the context menu draws the account address")
+            .expect("the menu draws the account address")
             .center();
         harness
             .cx
@@ -1205,29 +1250,29 @@ mod tests {
         settle(&mut harness);
         assert!(
             shows(&mut harness, "TEST_PROFILE_ADDRESS_TOOLTIP"),
-            "the address tooltip opens inside the context menu"
+            "the address tooltip opens inside the menu"
         );
         assert!(
-            shows(&mut harness, "TEST_PROFILE_MENU"),
+            shows(&mut harness, PROFILE_PANEL),
             "the menu stays up while the pointer reads its tooltip"
         );
 
         let sign_out = harness
             .cx
             .debug_bounds("TEST_MENU_ITEM_sign-out")
-            .expect("the context menu draws the sign-out entry")
+            .expect("the menu draws the sign-out entry")
             .center();
         harness.cx.simulate_click(sign_out, Modifiers::none());
         harness.cx.run_until_parked();
         settle(&mut harness);
 
         assert!(
-            !shows(&mut harness, "TEST_PROFILE_MENU"),
-            "choosing an entry closes the context menu"
+            !shows(&mut harness, PROFILE_PANEL),
+            "choosing an entry closes the menu"
         );
         assert!(
             shows(&mut harness, "BASE_UI_ALERT"),
-            "the context menu's sign-out entry asks for confirmation"
+            "the menu's sign-out entry asks for confirmation"
         );
     }
 
@@ -1292,7 +1337,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("the account block should draw {selector}"))
         };
 
-        let panel = drawn(&mut harness, "TEST_PROFILE_MENU");
+        let panel = drawn(&mut harness, PROFILE_PANEL);
         let avatar = drawn(&mut harness, "TEST_PROFILE_ACCOUNT_AVATAR");
         let badge = drawn(&mut harness, "TEST_PROFILE_BRAND");
         let tier = drawn(&mut harness, "TEST_PROFILE_PLAN_PLUS");
@@ -1799,17 +1844,31 @@ mod tests {
         assert_eq!(menu_plan(&mut harness), None);
     }
 
+    /// A stored avatar is decoded for the entry, and the generated face it provides fills the
+    /// control at the larger size the account's own picture takes.
     #[gpui_kit::test]
-    fn a_stored_avatar_should_be_decoded_for_the_entry(cx: &mut TestAppContext) {
+    fn a_stored_avatar_should_be_drawn_at_the_accounts_size(cx: &mut TestAppContext) {
         let mut config = configured(ethereum_account());
         config.avatar =
             Some(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#.to_owned());
-        let harness = harness(cx, config, FakeAccountService::new(ethereum_account()));
+        let mut harness = harness(cx, config, FakeAccountService::new(ethereum_account()));
 
         assert!(
             harness
                 .cx
                 .update(|_, cx| harness.menu.read(cx).avatar.is_some())
+        );
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+
+        assert_eq!(
+            harness
+                .cx
+                .debug_bounds("TEST_PROFILE_TRIGGER_AVATAR")
+                .expect("the control should draw the stored face")
+                .size,
+            size(px(24.0), px(24.0)),
+            "the account's generated face is drawn larger than the placeholder"
         );
     }
 

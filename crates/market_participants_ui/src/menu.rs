@@ -66,13 +66,13 @@ const ACTION_ID: &str = "market-participants-action";
 const MARK_ID: &str = "market-participants-mark";
 const SPINNER_ID: &str = "market-participants-spinner";
 
-/// How wide the rows of the panel are.
+/// How wide the panel is.
 ///
-/// A [`Dropdown`] sizes its panel from its trigger, and this menu's trigger is a button
-/// narrower than a venue line, so the width the panel takes is stated by its rows. It is a
-/// fixed width because the panel is a column of venue lines with an action at the end of each
-/// of them: a panel that resized as a load reported itself would move the buttons under the
-/// pointer that opened it.
+/// A [`Dropdown`] sizes its panel from its trigger unless it is told otherwise, and this
+/// menu's trigger is a button narrower than a venue line, so the panel's width is stated by
+/// the menu. It is a fixed width because the panel is a column of venue lines with an action
+/// at the end of each of them: a panel that resized as a load reported itself would move the
+/// buttons under the pointer that opened it.
 const MENU_WIDTH: f32 = 280.0;
 
 /// The square the trigger takes: the title bar's control square, which the sidebar toggle
@@ -614,10 +614,11 @@ impl Render for MarketParticipants {
             .aria_label(label.clone())
             .debug_selector(|| "TEST_MARKET_PARTICIPANTS_TRIGGER".into())
             .open_state(&self.open_state)
-            // The trigger is the bar's leftmost control, so the panel hangs from its left
-            // edge. Aligned to the other edge, a panel wider than the trigger would be
-            // clamped back into the window and land under the sidebar.
+            // The panel hangs from the trigger's left edge: the trigger is the bar's
+            // leftmost control, and aligned to the other edge a panel wider than the trigger
+            // would be clamped back into the window and land under the sidebar.
             .align(Align::Start)
+            .menu_width(px(MENU_WIDTH))
             .child(
                 div()
                     .debug_selector(|| "TEST_MARKET_PARTICIPANTS_ICON".into())
@@ -625,11 +626,8 @@ impl Render for MarketParticipants {
             );
 
         for (index, row) in self.rows.iter().enumerate() {
-            // The panel takes its width from the trigger, which is a button narrower than a
-            // venue line, so each row states the width the panel is to take.
             dropdown = dropdown.menu_item(MenuItem::Custom(
                 div()
-                    .w(px(MENU_WIDTH))
                     .child(self.row(&menu, index, row, cx))
                     .into_any_element(),
             ));

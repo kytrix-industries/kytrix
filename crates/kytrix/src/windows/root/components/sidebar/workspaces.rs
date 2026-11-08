@@ -4,7 +4,7 @@
 //! The section owns nothing. It reads the list to draw itself and calls back into
 //! [`Workspaces`] to change it, which keeps that entity the only place that knows what a
 //! workspace is. It is a section of its own rather than part of the panel so that the list
-//! can be mounted — and tested — without the account menu at the panel's foot.
+//! can be mounted — and tested — without the settings entry at the panel's foot.
 
 use app_config::workspace::validate_workspace_name;
 use base_ui::{

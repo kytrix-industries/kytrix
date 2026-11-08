@@ -10,6 +10,7 @@ use base_ui::{
     icon::{Icon, IconKind},
     interactive::InteractiveVariantExt,
     layer::{Layer, LayerExt as _},
+    separator::Separator,
     style::theme::ThemeExt,
     tooltip::TooltipExt,
 };
@@ -45,10 +46,19 @@ const TITLE_BAR_SIDEBAR_TOGGLE_ICON: &str = "TITLE_BAR_SIDEBAR_TOGGLE_ICON";
 /// the sidebar pushes.
 const TITLE_BAR_CONTROL_GAP: Pixels = px(4.0);
 
-/// The title bar's margin at the window's right edge on macOS, where the updater is the only
-/// control on that side: the system buttons are the traffic lights' to draw, and their inset
-/// is not used.
+/// The title bar's margin at the window's right edge on macOS, where the account control is
+/// the last control on that side: the system buttons are the traffic lights' to draw, and
+/// their inset is not used.
 const TITLE_BAR_RIGHT_INSET_MACOS: Pixels = px(12.0);
+
+/// The divider between the title bar's account control and the window's system buttons.
+const TITLE_BAR_PROFILE_SEPARATOR: &str = "TITLE_BAR_PROFILE_SEPARATOR";
+
+/// The height of that divider.
+///
+/// It is smaller than the 32 px controls on either side: it separates the account control
+/// from the window's buttons without drawing a second, taller edge in the bar.
+const TITLE_BAR_PROFILE_SEPARATOR_HEIGHT: Pixels = px(16.0);
 
 /// The column the page is drawn in, named so a test can say where the sidebar leaves it.
 const PAGE: &str = "ROOT_PAGE";
@@ -489,7 +499,7 @@ impl RootWindow {
         };
         // The close button ends the bar's right-hand controls, so the bar leaves it the same
         // inset above and to the right. macOS draws its traffic lights instead of those
-        // controls and keeps the updater's own margin.
+        // controls and keeps the account control's own margin.
         let right_inset = if cfg!(target_os = "macos") {
             TITLE_BAR_RIGHT_INSET_MACOS
         } else {
@@ -539,12 +549,26 @@ impl RootWindow {
                     .flex()
                     .items_center()
                     .justify_end()
-                    // The system buttons take the bar's control gap, and the close button
-                    // ends them one inset from the window's edge: the same 4 px the bar
-                    // leaves above the 32 px squares.
+                    // The bar's right-hand controls keep its control gap, and the close
+                    // button ends the system buttons one inset from the window's edge: the
+                    // same 4 px the bar leaves above the 32 px squares.
                     .gap(TITLE_BAR_CONTROL_GAP)
                     .pr(right_inset)
                     .child(self.updater.clone())
+                    // The account control is the title bar's own: a 32 px ghost square with
+                    // the account's face inside it, occluding like the market menu so the
+                    // bar under it does not take the press.
+                    .child(div().occlude().child(self.profile.clone()))
+                    // The system buttons belong to the window rather than to the title
+                    // bar's controls; the divider says so. macOS has no system buttons to
+                    // divide from, so it draws none.
+                    .when(!cfg!(target_os = "macos"), |this| {
+                        this.child(
+                            div()
+                                .debug_selector(|| TITLE_BAR_PROFILE_SEPARATOR.into())
+                                .child(Separator::vertical().h(TITLE_BAR_PROFILE_SEPARATOR_HEIGHT)),
+                        )
+                    })
                     .when(!cfg!(target_os = "macos"), |this| {
                         this.child(WindowSystemButton::minimize())
                     })
@@ -670,16 +694,11 @@ impl RootWindow {
                 this.capture_any_mouse_down(|_, _, cx| cx.stop_propagation())
             })
             .child(
-                Sidebar::new(
-                    SidebarMode::Full,
-                    width,
-                    self.pages.clone(),
-                    self.profile.clone(),
-                )
-                .popup_scope(self.popup_scope)
-                // The preview still draws its rows while it moves away, but the close
-                // buttons belong to the panel the user is still using.
-                .retracting(!live),
+                Sidebar::new(SidebarMode::Full, width, self.pages.clone())
+                    .popup_scope(self.popup_scope)
+                    // The preview still draws its rows while it moves away, but the close
+                    // buttons belong to the panel the user is still using.
+                    .retracting(!live),
             )
     }
 }
@@ -742,13 +761,8 @@ impl Render for RootWindow {
         let sidebar_retracting = self.sidebar == SidebarMode::Hidden && docked_width > px(0.0);
         // The panel is drawn while it collapses out of the full state, so it keeps the
         // labels it was showing rather than switching to an icon rail on its way to nothing.
-        let mut panel = Sidebar::new(
-            self.sidebar,
-            docked_width,
-            self.pages.clone(),
-            self.profile.clone(),
-        )
-        .retracting(sidebar_retracting);
+        let mut panel = Sidebar::new(self.sidebar, docked_width, self.pages.clone())
+            .retracting(sidebar_retracting);
         // The icon-only rail is the collapsed full panel: a pointer on its content asks for
         // the panel, which is drawn over it.
         if self.sidebar == SidebarMode::IconOnly {
@@ -858,8 +872,9 @@ mod tests {
 
     use super::{
         ConfigRecovery, FLOATING_CLOSE_DELAY, PAGE, RootWindow, SIDEBAR_ANIMATION,
-        SIDEBAR_FLOATING, SidebarMode, TITLE_BAR_CONTROL_GAP, TITLE_BAR_SIDEBAR_TOGGLE,
-        TITLE_BAR_SIDEBAR_TOGGLE_ICON, announce_config_recovery, store_sidebar_mode,
+        SIDEBAR_FLOATING, SidebarMode, TITLE_BAR_CONTROL_GAP, TITLE_BAR_PROFILE_SEPARATOR_HEIGHT,
+        TITLE_BAR_SIDEBAR_TOGGLE, TITLE_BAR_SIDEBAR_TOGGLE_ICON, announce_config_recovery,
+        store_sidebar_mode,
     };
     use crate::windows::root::{
         components::sidebar::{SIDEBAR_FULL_WIDTH, SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE},
@@ -892,11 +907,14 @@ mod tests {
     const ROW_ONE: &str = "SIDEBAR_ITEM_one";
     const CLOSE_ONE: &str = "SIDEBAR_WORKSPACE_CLOSE_one";
 
-    /// The account entry at the foot of the panel.
-    const PROFILE_ENTRY: &str = "SIDEBAR_FOOTER_PROFILE";
+    /// The account control the title bar draws, the face inside it, and the divider that
+    /// separates it from the window's system buttons. All are the control's own selectors:
+    /// what the window decides is where the control is drawn.
+    const PROFILE_TRIGGER: &str = "TEST_PROFILE_TRIGGER";
+    const PROFILE_AVATAR: &str = "TEST_PROFILE_TRIGGER_AVATAR";
+    const PROFILE_SEPARATOR: &str = "TITLE_BAR_PROFILE_SEPARATOR";
 
-    /// The account menu the entry opens, and its signed-out entry.
-    const PROFILE_MENU: &str = "TEST_PROFILE_MENU";
+    /// The signed-out entry of the account menu the control opens.
     const SIGN_IN_ENTRY: &str = "TEST_MENU_ITEM_sign-in";
 
     /// The name the full panel draws inside a workspace row.
@@ -906,7 +924,6 @@ mod tests {
     const ADD_WORKSPACE_LABEL: &str = "SIDEBAR_NEW_WORKSPACE_LABEL";
     const SETTINGS_ENTRY: &str = "SIDEBAR_FOOTER_SETTINGS";
     const SETTINGS_LABEL: &str = "SIDEBAR_FOOTER_SETTINGS_LABEL";
-    const PROFILE_LABEL: &str = "SIDEBAR_FOOTER_PROFILE_LABEL";
 
     /// The settings page and the workspace under it, as the page area draws them.
     const SETTINGS_PAGE: &str = "SETTINGS_PAGE";
@@ -915,8 +932,8 @@ mod tests {
     /// The window the notice is announced in.
     ///
     /// It is a bare layer rather than the root window: the notice only needs a
-    /// window layer to open an alert on, and the root window would drag the
-    /// profile menu and the service connector into the test.
+    /// window layer to open an alert on, and the root window would drag the account control
+    /// and the service connector into the test.
     struct NoticeWindow;
 
     impl Render for NoticeWindow {
@@ -1003,7 +1020,7 @@ mod tests {
     /// Opens the window the application opens, with the settings already on `sidebar`.
     ///
     /// Every global the root's own views read is installed the way the composition root
-    /// installs it: the sidebar's account menu is built over the connector's signed-out
+    /// installs it: the title bar's account control is built over the connector's signed-out
     /// in-memory test session, the title bar's participants menu is built over its connector,
     /// and the title bar draws the updater.
     fn root_window(cx: &mut TestAppContext, sidebar: SidebarMode) -> &mut VisualTestContext {
@@ -1035,10 +1052,10 @@ mod tests {
 
     /// Opens the window the application opens, with `config` as the settings it read.
     fn root_window_with_config(cx: &mut TestAppContext, config: Config) -> &mut VisualTestContext {
-        // The account menu's session query is answered by the test connector's auth actor on
-        // its own "kytrix-auth-session" thread. Parking lets the deterministic scheduler wait
-        // for that answer instead of treating activity from another thread as a test that made
-        // its own scheduling; it is an accommodation for that thread, not a sleep.
+        // The account control's session query is answered by the test connector's auth actor
+        // on its own "kytrix-auth-session" thread. Parking lets the deterministic scheduler
+        // wait for that answer instead of treating activity from another thread as a test that
+        // made its own scheduling; it is an accommodation for that thread, not a sleep.
         cx.executor().allow_parking();
         cx.update(|cx| {
             gpui_kit::base::init(cx);
@@ -1351,10 +1368,10 @@ mod tests {
         );
     }
 
-    /// The window's system buttons are the title bar's other controls: each is the sidebar
-    /// toggle's square, on the toggle's line, spaced by the bar's control gap, and the close
-    /// button ends one bar inset from the window's right edge — the same inset the bar leaves
-    /// above it.
+    /// The title bar's right-hand controls are one set: the account control is the toggle's
+    /// square on the toggle's line, the small divider separates it from the window's system
+    /// buttons with one control gap on either side, and the close button ends one bar inset
+    /// from the window's right edge — the same inset the bar leaves above it.
     #[cfg(not(target_os = "macos"))]
     #[gpui_kit::test]
     fn the_system_buttons_should_be_the_title_bar_controls(cx: &mut TestAppContext) {
@@ -1365,9 +1382,48 @@ mod tests {
         let cx = root_window(cx, SidebarMode::Full);
 
         let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        let profile = drawn(cx, PROFILE_TRIGGER);
+        let avatar = drawn(cx, PROFILE_AVATAR);
+        let separator = drawn(cx, PROFILE_SEPARATOR);
         let minimize = drawn(cx, WINDOW_MINIMIZE);
         let maximize = drawn(cx, WINDOW_MAXIMIZE);
         let close = drawn(cx, WINDOW_CLOSE);
+
+        assert_eq!(
+            profile.size,
+            size(SIDEBAR_ITEM_SIZE, SIDEBAR_ITEM_SIZE),
+            "the account control is the toggle's square"
+        );
+        assert_eq!(
+            profile.top(),
+            toggle.top(),
+            "the account control sits on the toggle's line"
+        );
+        assert!(
+            (avatar.center().x - profile.center().x).abs() <= px(0.5)
+                && (avatar.center().y - profile.center().y).abs() <= px(0.5),
+            "the account's face is centred in its square: control {profile:?}, face {avatar:?}"
+        );
+
+        assert_eq!(
+            separator.size,
+            size(px(1.0), TITLE_BAR_PROFILE_SEPARATOR_HEIGHT),
+            "the divider is a hairline shorter than the controls it separates"
+        );
+        assert!(
+            (separator.center().y - toggle.center().y).abs() <= px(0.5),
+            "the divider is centred on the controls' line"
+        );
+        assert_eq!(
+            separator.left() - profile.right(),
+            TITLE_BAR_CONTROL_GAP,
+            "the account control leaves one control gap before the divider"
+        );
+        assert_eq!(
+            minimize.left() - separator.right(),
+            TITLE_BAR_CONTROL_GAP,
+            "the divider leaves one control gap before the system buttons"
+        );
 
         for (tag, button) in [
             (WINDOW_MINIMIZE, minimize),
@@ -1400,6 +1456,41 @@ mod tests {
             px(1280.0) - close.right(),
             super::TOGGLE_INSET,
             "the close button keeps the bar's inset from the window's right edge"
+        );
+    }
+
+    /// The title bar's account control is a working control: its menu opens under it, and
+    /// the signed-out menu offers the sign-in entry.
+    #[gpui_kit::test]
+    fn the_account_control_should_open_its_menu_from_the_title_bar(cx: &mut TestAppContext) {
+        let cx = root_window(cx, SidebarMode::Full);
+
+        assert!(
+            cx.debug_bounds(SIGN_IN_ENTRY).is_none(),
+            "nothing is offered before the account control is pressed"
+        );
+        assert!(
+            cx.debug_bounds(PROFILE_AVATAR).is_some(),
+            "the control draws the account's face"
+        );
+
+        let control = drawn(cx, PROFILE_TRIGGER);
+        click(cx, PROFILE_TRIGGER);
+
+        let panel = drawn(cx, "TEST_DROPDOWN_PANEL");
+        assert!(
+            panel.top() >= control.bottom(),
+            "the account menu hangs below the control: the control ends at {} and the menu starts at {}",
+            control.bottom(),
+            panel.top()
+        );
+        assert!(
+            panel.left() < control.left(),
+            "the menu grows leftwards into the window rather than off its right edge"
+        );
+        assert!(
+            cx.debug_bounds(SIGN_IN_ENTRY).is_some(),
+            "the signed-out menu offers the sign-in entry"
         );
     }
 
@@ -2278,55 +2369,6 @@ mod tests {
         );
     }
 
-    /// The account menu is the other popup the preview can leave the panel for: it opens
-    /// beside the foot's entry, and the pointer on it holds the preview up just as a row's
-    /// menu does. It closes on a press, and the preview waits for the next move after that.
-    #[gpui_kit::test]
-    fn the_icon_only_previews_account_menu_should_keep_it_up_until_the_pointer_leaves(
-        cx: &mut TestAppContext,
-    ) {
-        let cx = root_window(cx, SidebarMode::IconOnly);
-
-        hover(cx, WORKSPACE_ROW);
-        hover(cx, PROFILE_ENTRY);
-        click(cx, PROFILE_ENTRY);
-        assert!(
-            cx.debug_bounds(PROFILE_MENU).is_some(),
-            "the foot's account entry opens the account menu"
-        );
-
-        hover(cx, SIGN_IN_ENTRY);
-        settle_floating(cx);
-        assert!(
-            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
-            "the account menu the pointer is on holds the preview past the close delay"
-        );
-
-        hover_at(cx, point(px(600.0), px(300.0)));
-        settle_floating(cx);
-        assert!(
-            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
-            "a menu that is still open holds the preview, wherever the pointer is"
-        );
-
-        click_at(cx, point(px(600.0), px(300.0)));
-        assert!(
-            cx.debug_bounds(PROFILE_MENU).is_none(),
-            "a press outside the account menu closes it"
-        );
-        assert!(
-            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
-            "the preview stays until the pointer moves after the menu closes"
-        );
-
-        hover_at(cx, point(px(610.0), px(310.0)));
-        settle_floating(cx);
-        assert!(
-            cx.debug_bounds(SIDEBAR_FLOATING).is_none(),
-            "the preview closes on the first move after the account menu is gone"
-        );
-    }
-
     /// The row menu is a context menu owned by the window layer, so it is drawn outside the
     /// panel. The menu, not the press, is what keeps the panel up while the pointer is on it;
     /// a press outside closes the menu, and the next move closes the preview.
@@ -2390,7 +2432,7 @@ mod tests {
         // The workspace row's mark sits in a box of its own, so its name is the column the
         // other labels have to keep.
         let column = drawn(cx, WORKSPACE_NAME).left();
-        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL, PROFILE_LABEL] {
+        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL] {
             assert_eq!(
                 drawn(cx, selector).left(),
                 column,
@@ -2399,7 +2441,7 @@ mod tests {
         }
 
         animate(cx, SIDEBAR_ANIMATION / 2);
-        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL, PROFILE_LABEL] {
+        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL] {
             assert_eq!(
                 drawn(cx, selector).left(),
                 column,
@@ -2408,7 +2450,7 @@ mod tests {
         }
 
         animate(cx, SIDEBAR_ANIMATION);
-        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL, PROFILE_LABEL] {
+        for selector in [ADD_WORKSPACE_LABEL, SETTINGS_LABEL] {
             assert_eq!(
                 drawn(cx, selector).left(),
                 column,

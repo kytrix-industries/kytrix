@@ -28,6 +28,7 @@ pub struct Dropdown {
     disabled: bool,
     placement: Placement,
     align: Align,
+    menu_width: Option<Pixels>,
     menu_max_h: Option<Pixels>,
 }
 
@@ -49,12 +50,34 @@ impl Dropdown {
             disabled: false,
             placement: Placement::Bottom,
             align: Align::Center,
+            menu_width: None,
             menu_max_h: None,
         }
     }
 
     pub fn menu_item(mut self, menu_item: MenuItem) -> Self {
         self.menu = self.menu.item(menu_item);
+        self
+    }
+
+    /// Sets the menu the panel draws, instead of building one from [`Self::menu_item`].
+    ///
+    /// A menu whose entries are built as a whole — a block of account details with entries
+    /// under it, for one — is handed over here; the size the panel gives it is still the
+    /// dropdown's.
+    pub fn menu(mut self, menu: Menu) -> Self {
+        self.menu = menu;
+        self
+    }
+
+    /// Sets the width of the panel.
+    ///
+    /// Without it the panel is at least as wide as its trigger, which is what a menu opened
+    /// from a control as wide as its entries wants. A menu opened from a square narrower than
+    /// its content — a title bar control, for one — states its width here, so that the panel
+    /// does not resize as the content changes.
+    pub fn menu_width(mut self, menu_width: impl Into<Pixels>) -> Self {
+        self.menu_width = Some(menu_width.into());
         self
     }
 
@@ -169,6 +192,7 @@ impl RenderOnce for Dropdown {
             disabled,
             placement,
             align,
+            menu_width,
             menu_max_h,
         } = self;
 
@@ -205,8 +229,16 @@ impl RenderOnce for Dropdown {
                     })
                     .when_some(menu_max_h, |this, max_h| this.max_h(max_h));
 
-                div()
-                    .min_w(context.trigger_bounds.size.width)
+                let panel = div();
+                // A stated width is the panel's; only an unstated one falls back to the
+                // trigger, which a block-level trigger wrapper can take from the window
+                // rather than from the control it wraps.
+                let panel = match menu_width {
+                    Some(width) => panel.w(width),
+                    None => panel.min_w(context.trigger_bounds.size.width),
+                };
+
+                panel
                     // The entries are a menu, which names no selector of its own, so the box
                     // the panel is drawn in is what a test looks at to see the panel at all.
                     .debug_selector(|| "TEST_DROPDOWN_PANEL".into())

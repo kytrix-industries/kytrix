@@ -1,5 +1,4 @@
-//! The sidebar panel itself: the workspace section, and the account and settings entries at
-//! its foot.
+//! The sidebar panel itself: the workspace section, and the settings entry at its foot.
 //!
 //! The panel is drawn twice over the window's life: docked beside the page, and floating
 //! over it while the sidebar is collapsed and the pointer asks for the full one — on the
@@ -16,7 +15,6 @@ use gpui_kit::{
     App, ElementId, Empty, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
     RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-use profile_ui::profile::ProfileMenu;
 
 use super::{footer::SidebarFooter, layout::TITLE_BAR_HEIGHT, workspaces::SidebarWorkspaces};
 use crate::windows::root::components::pages::MainPages;
@@ -45,7 +43,6 @@ pub(crate) struct Sidebar {
     mode: SidebarMode,
     width: Pixels,
     pages: Entity<MainPages>,
-    profile: Entity<ProfileMenu>,
     /// Called as the pointer enters or leaves the panel's content, below the title bar.
     content_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
     /// Whether the panel is moving away rather than coming in or standing still.
@@ -58,17 +55,11 @@ pub(crate) struct Sidebar {
 }
 
 impl Sidebar {
-    pub(crate) fn new(
-        mode: SidebarMode,
-        width: Pixels,
-        pages: Entity<MainPages>,
-        profile: Entity<ProfileMenu>,
-    ) -> Self {
+    pub(crate) fn new(mode: SidebarMode, width: Pixels, pages: Entity<MainPages>) -> Self {
         Self {
             mode,
             width,
             pages,
-            profile,
             content_hover: None,
             retracting: false,
             popup_scope: 0,
@@ -148,8 +139,7 @@ impl RenderOnce for Sidebar {
         let workspaces = SidebarWorkspaces::new(full, workspaces)
             .popup_scope(self.popup_scope)
             .show_close(!self.retracting);
-        let footer =
-            SidebarFooter::new(full, self.pages, self.profile).popup_scope(self.popup_scope);
+        let footer = SidebarFooter::new(full, self.pages);
 
         content = content
             .child(workspaces)
@@ -199,45 +189,34 @@ mod tests {
     use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer, style};
     use gpui_kit::{
-        AppContext, Context, Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, Styled,
+        AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled,
         Subscription, TestAppContext, VisualTestContext, Window, div, px, size,
     };
     use i18n::language::codes::LanguageCode;
-    use profile_ui::profile::ProfileMenu;
     use smol_str::SmolStr;
 
     use super::{SIDEBAR, SIDEBAR_DIVIDER, Sidebar};
-    use crate::windows::root::{
-        components::{
-            pages::MainPages,
-            sidebar::{
-                footer::{
-                    SIDEBAR_FOOTER_PROFILE, SIDEBAR_FOOTER_PROFILE_LABEL, SIDEBAR_FOOTER_SETTINGS,
-                    SIDEBAR_FOOTER_SETTINGS_LABEL,
-                },
-                layout::{
-                    SIDEBAR_FULL_WIDTH, SIDEBAR_ICON_SIZE, SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE,
-                    SIDEBAR_PADDING, width,
-                },
-                workspaces::{
-                    SIDEBAR_NEW_WORKSPACE, SIDEBAR_NEW_WORKSPACE_LABEL, SIDEBAR_WORKSPACE_MARK,
-                    SIDEBAR_WORKSPACE_NAME,
-                },
+    use crate::windows::root::components::{
+        pages::MainPages,
+        sidebar::{
+            footer::{SIDEBAR_FOOTER_SETTINGS, SIDEBAR_FOOTER_SETTINGS_LABEL},
+            layout::{
+                SIDEBAR_FULL_WIDTH, SIDEBAR_ICON_SIZE, SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE,
+                SIDEBAR_PADDING, width,
             },
-            workspace::Workspaces,
+            workspaces::{
+                SIDEBAR_NEW_WORKSPACE, SIDEBAR_NEW_WORKSPACE_LABEL, SIDEBAR_WORKSPACE_MARK,
+                SIDEBAR_WORKSPACE_NAME,
+            },
         },
-        test_support::install_service_connector,
+        workspace::Workspaces,
     };
 
-    /// The avatar the footer draws in both states.
-    const PROFILE_TRIGGER_AVATAR: &str = "TEST_PROFILE_TRIGGER_AVATAR";
-
-    /// The window the panel is mounted in: the real sidebar, with the two entities the window
+    /// The window the panel is mounted in: the real sidebar, with the entities the window
     /// hands it.
     struct Harness {
         mode: SidebarMode,
         pages: Entity<MainPages>,
-        profile: Entity<ProfileMenu>,
         /// The sidebar reads the list while this view draws, so the view follows the store
         /// the way the window around the panel does.
         _workspaces: Subscription,
@@ -249,7 +228,6 @@ mod tests {
                 self.mode,
                 width(self.mode),
                 self.pages.clone(),
-                self.profile.clone(),
             ))
         }
     }
@@ -280,11 +258,6 @@ mod tests {
         config: Config,
         mode: SidebarMode,
     ) -> (&mut VisualTestContext, Entity<Workspaces>) {
-        // The account menu's session query is answered by the test connector's auth actor on
-        // its own "kytrix-auth-session" thread. Parking lets the deterministic scheduler wait
-        // for that answer instead of treating activity from another thread as a test that made
-        // its own scheduling; it is an accommodation for that thread, not a sleep.
-        cx.executor().allow_parking();
         let language = match config.language {
             Language::ZhCn => LanguageCode::ZhCn,
             Language::En => LanguageCode::En,
@@ -298,13 +271,9 @@ mod tests {
             let manager = ConfigManager::in_memory(config, cx);
             cx.set_global(manager);
             widget_tokio_runtime::global::install(cx).expect("the test runtime should install");
-            // The account menu's connector is wired over the signed-out in-memory test
-            // session: no keyring, no startup refresh, no account request.
-            install_service_connector(cx);
         });
         let workspaces = cx.update(|cx| cx.new(Workspaces::load));
         let pages = cx.update(|cx| cx.new(|cx| MainPages::new(workspaces.clone(), cx)));
-        let profile = cx.update(|cx| cx.new(ProfileMenu::new));
         let (_, cx) = cx.add_window_view({
             let workspaces = workspaces.clone();
             move |_, cx| {
@@ -314,7 +283,6 @@ mod tests {
                     Harness {
                         mode,
                         pages,
-                        profile,
                         _workspaces: subscription,
                     }
                 });
@@ -369,17 +337,12 @@ mod tests {
             "the mark sits at the inset the icon-only square centres its mark at"
         );
         assert_eq!(
-            drawn(cx, PROFILE_TRIGGER_AVATAR).left(),
-            item.left() + (SIDEBAR_ITEM_SIZE - SIDEBAR_ICON_SIZE) / 2.0,
-            "the account's face sits at the same inset, so it does not move on expansion"
-        );
-        assert_eq!(
-            drawn(cx, SIDEBAR_FOOTER_PROFILE).size,
+            drawn(cx, SIDEBAR_FOOTER_SETTINGS).size,
             size(
                 SIDEBAR_FULL_WIDTH - SIDEBAR_PADDING * 2.0,
                 SIDEBAR_ITEM_SIZE
             ),
-            "the account entry is the foot's full-width row, like the settings button"
+            "the settings entry is the foot's full-width row"
         );
         // The divider is drawn over the right edge rather than taking a pixel from the
         // width: the content and the divider together are still the panel's 220 px.
@@ -395,11 +358,8 @@ mod tests {
             SIDEBAR_NEW_WORKSPACE_LABEL,
             "SIDEBAR_ITEM_one",
             SIDEBAR_WORKSPACE_NAME,
-            SIDEBAR_FOOTER_PROFILE,
-            SIDEBAR_FOOTER_PROFILE_LABEL,
             SIDEBAR_FOOTER_SETTINGS,
             SIDEBAR_FOOTER_SETTINGS_LABEL,
-            PROFILE_TRIGGER_AVATAR,
         ] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -439,16 +399,6 @@ mod tests {
             "the foot's square leaves the same padding on the panel's right edge"
         );
         assert_eq!(
-            drawn(cx, SIDEBAR_FOOTER_PROFILE).size,
-            size(SIDEBAR_ITEM_SIZE, SIDEBAR_ITEM_SIZE),
-            "the account entry is the settings row's own square"
-        );
-        assert_eq!(
-            drawn(cx, PROFILE_TRIGGER_AVATAR).left(),
-            drawn(cx, "SIDEBAR_ITEM_one").left() + (SIDEBAR_ITEM_SIZE - SIDEBAR_ICON_SIZE) / 2.0,
-            "the account's face sits on the items' column"
-        );
-        assert_eq!(
             drawn(cx, SIDEBAR_DIVIDER).right(),
             SIDEBAR_ICON_WIDTH,
             "the icon-only panel's divider is on its right edge too"
@@ -456,9 +406,7 @@ mod tests {
         for selector in [
             SIDEBAR_NEW_WORKSPACE,
             "SIDEBAR_ITEM_one",
-            SIDEBAR_FOOTER_PROFILE,
             SIDEBAR_FOOTER_SETTINGS,
-            PROFILE_TRIGGER_AVATAR,
         ] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -468,7 +416,6 @@ mod tests {
         for selector in [
             SIDEBAR_NEW_WORKSPACE_LABEL,
             SIDEBAR_WORKSPACE_NAME,
-            SIDEBAR_FOOTER_PROFILE_LABEL,
             SIDEBAR_FOOTER_SETTINGS_LABEL,
         ] {
             assert!(
@@ -513,61 +460,6 @@ mod tests {
         assert!(
             label.right() <= drawn(cx, SIDEBAR_FOOTER_SETTINGS).right(),
             "the settings label stays inside the settings button"
-        );
-        let profile = drawn(cx, SIDEBAR_FOOTER_PROFILE);
-        let footer_top = drawn(cx, SIDEBAR_FOOTER_SETTINGS).top();
-        assert!(
-            profile.bottom() <= footer_top,
-            "the account entry is above the settings button at the foot of the panel"
-        );
-    }
-
-    /// The account entry the sidebar draws itself opens the account menu as a window-level
-    /// context menu; the menu content belongs to `profile_ui`.
-    #[gpui_kit::test]
-    fn the_footers_account_entry_should_open_the_account_menu(cx: &mut TestAppContext) {
-        let (cx, _) = harness(cx, config_with(&["one"]), SidebarMode::IconOnly);
-
-        assert!(
-            cx.debug_bounds("TEST_PROFILE_MENU").is_none(),
-            "the menu is not drawn before the entry is pressed"
-        );
-
-        let entry = drawn(cx, SIDEBAR_FOOTER_PROFILE);
-        cx.simulate_click(entry.center(), Modifiers::none());
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds("TEST_PROFILE_MENU").is_some(),
-            "the entry the sidebar draws opens the profile menu"
-        );
-        assert!(
-            cx.debug_bounds("TEST_MENU_ITEM_sign-in").is_some(),
-            "the signed-out menu offers the sign-in entry"
-        );
-    }
-
-    /// The full panel's account entry opens the same menu beside its row, growing upward
-    /// from the row's bottom rather than below it and off the window.
-    #[gpui_kit::test]
-    fn the_full_footers_account_entry_should_open_its_menu_beside_the_row(cx: &mut TestAppContext) {
-        let (cx, _) = harness(cx, config_with(&["one"]), SidebarMode::Full);
-
-        let entry = drawn(cx, SIDEBAR_FOOTER_PROFILE);
-        cx.simulate_click(entry.center(), Modifiers::none());
-        settle(cx);
-
-        let row = drawn(cx, SIDEBAR_FOOTER_PROFILE);
-        let menu = drawn(cx, "TEST_PROFILE_MENU");
-        assert!(
-            menu.left() >= row.right(),
-            "the account menu opens beside the row: the row ends at {} and the menu starts at {}",
-            row.right(),
-            menu.left()
-        );
-        assert!(
-            menu.bottom() <= row.bottom(),
-            "the menu grows upward from the row's bottom rather than below it"
         );
     }
 
