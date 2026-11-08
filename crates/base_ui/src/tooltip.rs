@@ -52,8 +52,16 @@ impl RenderOnce for Tooltip {
         } = self;
 
         // A tooltip without anything to say is not a control: it draws what it was
-        // given to point at and nothing else.
+        // given to point at and nothing else. If it was on screen it is taken down
+        // here, because the hover that would have closed it is not there any more:
+        // withdrawing the content is how a caller closes a hint the pointer is still
+        // resting on.
         let Some(content) = content else {
+            let open_state = window.use_keyed_state((id, "open"), cx, |_, _| false);
+            if *open_state.read(cx) {
+                open_state.write(cx, false);
+            }
+
             return trigger;
         };
 
@@ -114,8 +122,8 @@ mod tests {
     use std::time::Duration;
 
     use gpui_kit::{
-        AppContext, Context, InteractiveElement, IntoElement, Modifiers, ParentElement, Render,
-        Styled, TestAppContext, VisualTestContext, Window, div, point, px, size,
+        AppContext, Context, Entity, InteractiveElement, IntoElement, Modifiers, ParentElement,
+        Render, Styled, TestAppContext, VisualTestContext, Window, div, point, px, size,
     };
 
     use crate::{animation::ANIMATION_TICK, layer::Layer, style, tooltip::Tooltip};
@@ -124,6 +132,7 @@ mod tests {
     const FREE_TRIGGER: &str = "TEST_FREE_TRIGGER";
     const OCCLUDING_TRIGGER: &str = "TEST_OCCLUDING_TRIGGER";
     const WRAPPED_TRIGGER: &str = "TEST_WRAPPED_TRIGGER";
+    const WITHDRAWN_TRIGGER: &str = "TEST_WITHDRAWN_TRIGGER";
 
     /// Three ways to trigger one tooltip, so the shapes can be compared.
     struct Harness;
@@ -168,6 +177,28 @@ mod tests {
         }
     }
 
+    /// A tooltip whose caller decides, frame by frame, whether there is a hint to give.
+    struct WithdrawableHarness {
+        show: bool,
+    }
+
+    impl Render for WithdrawableHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tooltip = Tooltip::new(
+                "withdrawn",
+                div()
+                    .debug_selector(|| WITHDRAWN_TRIGGER.into())
+                    .w_16()
+                    .h_8(),
+            );
+            div().size_full().flex().flex_col().child(if self.show {
+                tooltip.content("withdrawn")
+            } else {
+                tooltip
+            })
+        }
+    }
+
     fn harness(cx: &mut TestAppContext) -> &mut VisualTestContext {
         cx.update(|cx| {
             gpui_kit::base::init(cx);
@@ -178,6 +209,22 @@ mod tests {
         cx.run_until_parked();
 
         cx
+    }
+
+    fn withdrawable_harness(
+        cx: &mut TestAppContext,
+    ) -> (Entity<WithdrawableHarness>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::base::init(cx);
+            style::theme::install(cx);
+        });
+        let harness = cx.update(|cx| cx.new(|_| WithdrawableHarness { show: true }));
+        let rendered = harness.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Layer::new(rendered));
+        cx.simulate_resize(size(px(480.0), px(160.0)));
+        cx.run_until_parked();
+
+        (harness, cx)
     }
 
     /// Lets the tooltip's own delay and fade pass.
@@ -255,6 +302,68 @@ mod tests {
         assert!(
             cx.debug_bounds(TOOLTIP).is_some(),
             "an occluding wrapper keeps both the occlusion and the tooltip"
+        );
+    }
+
+    /// A caller that withdraws the hint takes the open tooltip down with it, even though the
+    /// pointer has not moved: the hover that would have closed it belonged to the tooltip that
+    /// is no longer there. Restoring the content does not resurrect the withdrawn hint, which is
+    /// what keeps a panel opened in the tooltip's place from being covered by it.
+    #[gpui_kit::test]
+    fn withdrawing_the_content_should_close_an_open_tooltip(cx: &mut TestAppContext) {
+        let (harness, cx) = withdrawable_harness(cx);
+
+        hover(cx, WITHDRAWN_TRIGGER);
+        assert!(
+            cx.debug_bounds(TOOLTIP).is_some(),
+            "the hint opens while its trigger is hovered"
+        );
+
+        cx.update(|_, cx| {
+            harness.update(cx, |harness, cx| {
+                harness.show = false;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds(TOOLTIP).is_none(),
+            "the hint leaves when its content is withdrawn under the pointer"
+        );
+
+        // The pointer leaves while there is no hint to hover, which is the shape of a caller
+        // opening something over the trigger: the tooltip it took down must not come back
+        // with the content, or it would cover the panel that was opened in its place.
+        cx.simulate_mouse_move(point(px(300.0), px(120.0)), None, Modifiers::none());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            harness.update(cx, |harness, cx| {
+                harness.show = true;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds(TOOLTIP).is_none(),
+            "the withdrawn hint does not come back without a new hover"
+        );
+
+        let trigger = cx
+            .debug_bounds(WITHDRAWN_TRIGGER)
+            .expect("the trigger is drawn")
+            .center();
+        cx.simulate_mouse_move(trigger, None, Modifiers::none());
+        cx.run_until_parked();
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds(TOOLTIP).is_some(),
+            "the hint is back after the pointer returns"
         );
     }
 }

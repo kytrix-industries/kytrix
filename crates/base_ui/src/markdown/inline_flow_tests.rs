@@ -41,7 +41,7 @@ const WIDE_IMAGE: &str = "![a](file://icons/phosphoricons/arrow-up.svg?size=24)"
 const TALL_IMAGE: &str = "![a](file://icons/phosphoricons/arrow-up.svg?size=40)";
 /// 同一张图，宽高分开写：宽度与默认的一样，只有高度是 64px。
 const RECTANGLE_IMAGE: &str = "![a](file://icons/phosphoricons/arrow-up.svg?size=16,64)";
-/// 占位文案里那张「市场」图标（`common.market_not_loaded` 用的就是它）。
+/// 占位文案里那种图标：`common.market_not_loaded` 只把图标写进 `<kbd>`。
 const GRAPH_IMAGE: &str = "![a](file://icons/phosphoricons/graph.svg)";
 /// 一张宽到 kbd 段自己就放不下的图：整段只能移到下一行。
 const WIDE_KBD_IMAGE: &str = "![a](file://icons/phosphoricons/graph.svg?size=200)";
@@ -1028,8 +1028,8 @@ fn a_line_break_inside_kbd_should_split_the_box_across_lines(cx: &mut TestAppCon
 
 /// kbd 里可以同时有图片与文字，两者仍然是一段不拆开的内容：图片不会独占一行。
 ///
-/// 这是占位文案的形态（`common.market_not_loaded` 把控件写成
-/// `<kbd>![](file://icons/phosphoricons/graph.svg) 市场</kbd>`）：图片与它旁边的字要一起走。
+/// 这是 kbd 里放图标的形态（`common.market_not_loaded` 就只把市场按钮的图标写进
+/// `<kbd>`；这里的 fixture 在图标旁边多放一个字，验的是两者要一起走）。
 /// 段内不能拆分，所以图片多占的宽度只会让整段更早换到下一行，不会把图片挤到单独一行——
 /// 那会让块高出一行。
 ///

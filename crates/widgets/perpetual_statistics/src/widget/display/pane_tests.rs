@@ -825,12 +825,7 @@ fn market_sentence(cx: &App) -> SharedString {
         .collect::<Vec<_>>()
         .join("\n");
 
-    t!(
-        cx,
-        "common.market_not_loaded",
-        markets = listed,
-        control = t!(cx, "window.market_participants.title")
-    )
+    t!(cx, "common.market_not_loaded", markets = listed)
 }
 
 /// The notice is a reference into the catalogue rather than a sentence, so a pane waiting

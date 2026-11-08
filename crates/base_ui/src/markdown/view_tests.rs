@@ -52,7 +52,7 @@ const ALERT_MESSAGES: &[&str] = &[
 /// 所以这些 key 也是自己写成居中标签对才居中。
 ///
 /// 与 alert 那份清单同理，写法错了的代价是整段文案不显示。`common.market_not_loaded` 是这些句子里
-/// 唯一带参数的：场所名与控件名由 `widget::venue` 供上，两个 `%{…}` 都落在标签对里面。
+/// 唯一带参数的：场所名由 `widget::venue` 供上，`%{markets}` 落在标签对里面。
 const PLACEHOLDER_MESSAGES: &[&str] = &[
     "common.market_not_loaded",
     "widget.candlestick.select_instrument_prompt",
@@ -396,8 +396,8 @@ fn blank_lines_should_read_as_blank_lines(cx: &mut TestAppContext) {
 /// "填进去之后还成立吗"正是原文里那个 `%{…}` 看不见的东西——一个填进来的值里少了一个闭标签
 /// 就会让整段消失，语法断言对它一个字都说不出。
 ///
-/// 这份 fixture 自己填那两个参数，而不是借 `widget::venue`：`widget` 依赖 `base_ui`，反向
-/// 依赖不成立。填进来的值照着真实那个值的形状写：控件名是一行，每个市场参与者一行、写成它的
+/// 这份 fixture 自己填那个参数，而不是借 `widget::venue`：`widget` 依赖 `base_ui`，反向
+/// 依赖不成立。填进来的值照着真实那个值的形状写：每个市场参与者一行、写成它的
 /// logo（`?size=16` 的行内图片，路径就是 `brands/` 下的那一张）加上加粗的名字。
 fn assert_message_draws_centered(cx: &mut TestAppContext, language: LanguageCode, key: &str) {
     let message = cx.update(|cx| {
@@ -405,7 +405,6 @@ fn assert_message_draws_centered(cx: &mut TestAppContext, language: LanguageCode
         t!(
             cx,
             key,
-            control = t!(cx, "window.market_participants.title"),
             markets = "![](file://brands/Binance/binance.png?size=16) **Binance**\n\
                        ![](file://brands/OKX/okx.png?size=16) **OKX**"
         )

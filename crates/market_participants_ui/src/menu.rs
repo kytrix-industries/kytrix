@@ -1,5 +1,5 @@
-//! The market participants entry the market page's toolbar mounts: the venue list this build
-//! speaks, and the one action that loads each of them.
+//! The market participants entry the title bar mounts: the venue list this build speaks, and
+//! the one action that loads each of them.
 //!
 //! # What it owns
 //!
@@ -34,12 +34,13 @@ use base_ui::{
     size::{UnifiedSizable, UnifiedSize},
     spinner::Spinner,
     style::theme::ThemeExt,
+    tooltip::Tooltip,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity,
-    Window,
-    base::{Align, Disableable},
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Task,
+    WeakEntity, Window,
+    base::{Align, Disableable, Placement},
     div, px,
 };
 use i18n::t;
@@ -54,7 +55,7 @@ use tokio::task::JoinError;
 use widget::{error::LocalizedError, venue::VenueDisplay};
 use widget_tokio_runtime::global;
 
-/// The element id of the toolbar entry: the trigger, its panel and the state behind them.
+/// The element id of the title bar's entry: the trigger, its panel and the state behind them.
 const MENU_ID: &str = "market-participants-menu";
 
 /// The sibling scopes every row is built under: they are told apart by the index the venue has
@@ -73,6 +74,16 @@ const SPINNER_ID: &str = "market-participants-spinner";
 /// of them: a panel that resized as a load reported itself would move the buttons under the
 /// pointer that opened it.
 const MENU_WIDTH: f32 = 280.0;
+
+/// The square the trigger takes: the title bar's control square, which the sidebar toggle
+/// drawn beside it takes as well.
+///
+/// The menu is a title bar control, so it has to be the size of the bar's other controls:
+/// a square of its own would not line up with the toggle next to it.
+const TRIGGER_SIZE: Pixels = px(32.0);
+
+/// The mark inside the trigger, drawn at the size the sidebar toggle draws its own.
+const TRIGGER_ICON_SIZE: Pixels = px(16.0);
 
 /// The room the mark at the left of a row's action takes.
 ///
@@ -253,7 +264,7 @@ impl LocalizedError for LoadFailure {
     }
 }
 
-/// The market participants entry the market page's toolbar mounts.
+/// The market participants entry the title bar mounts.
 pub struct MarketParticipants {
     connector: MarketParticipantsConnector,
     /// The rows the panel draws, rebuilt from the static venue list and the loaded venues.
@@ -591,15 +602,27 @@ impl Render for MarketParticipants {
         // The panel's rows are built here, once per frame the menu draws, and handed to the
         // dropdown: the menu they are entries of is built with it, and a row is a picture of
         // `rows` + `activity` as they are now rather than an element kept between frames.
+        //
+        // The trigger is the title bar's icon-only square, drawn as the sidebar toggle is:
+        // the panel it opens names every venue, so the trigger itself has nothing to say
+        // but the mark, and the label is left to the tooltip and the accessible name.
         let mut dropdown = Dropdown::new(MENU_ID)
-            .outline()
-            .medium()
+            .ghost()
+            .h(TRIGGER_SIZE)
+            .w(TRIGGER_SIZE)
+            .justify_center()
             .aria_label(label.clone())
             .debug_selector(|| "TEST_MARKET_PARTICIPANTS_TRIGGER".into())
             .open_state(&self.open_state)
-            .align(Align::End)
-            .child(Icon::new(IconKind::Graph).size_4())
-            .child(label);
+            // The trigger is the bar's leftmost control, so the panel hangs from its left
+            // edge. Aligned to the other edge, a panel wider than the trigger would be
+            // clamped back into the window and land under the sidebar.
+            .align(Align::Start)
+            .child(
+                div()
+                    .debug_selector(|| "TEST_MARKET_PARTICIPANTS_ICON".into())
+                    .child(Icon::new(IconKind::Bank).size(TRIGGER_ICON_SIZE)),
+            );
 
         for (index, row) in self.rows.iter().enumerate() {
             // The panel takes its width from the trigger, which is a button narrower than a
@@ -612,7 +635,17 @@ impl Render for MarketParticipants {
             ));
         }
 
-        dropdown
+        // The hint sits under the square, as the sidebar toggle's does, but only while the
+        // panel is down. The panel occupies that space, so a hint left over its first row
+        // would take the presses meant for that row — and the hover that would have closed
+        // it is gone the moment the press moves the pointer.
+        let tooltip = Tooltip::new((ElementId::from(MENU_ID), "tooltip"), dropdown)
+            .placement(Placement::Bottom);
+        if *self.open_state.read(cx) {
+            tooltip
+        } else {
+            tooltip.content(label)
+        }
     }
 }
 
@@ -1133,16 +1166,16 @@ mod tests {
         })
     }
 
-    /// The window a test drives: the toolbar row with the menu at the end of it, over the
-    /// layer every alert is opened on.
+    /// The window a test drives: a row with the menu in it, over the layer every alert is
+    /// opened on.
     struct Toolbar {
         menu: Entity<MarketParticipants>,
     }
 
     impl Render for Toolbar {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            // The menu is mounted the way the toolbar mounts it: a row that sizes the trigger
-            // to its own button and puts it at the end of the row.
+            // The menu is mounted the way the title bar mounts it: a row that gives the
+            // trigger a place of its own.
             div()
                 .size_full()
                 .flex()

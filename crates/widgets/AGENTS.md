@@ -361,7 +361,7 @@ pane 停在 connecting，不为它另加超时层。
 
 `WidgetState::waiting` 收的是 `Notice`：`Notice::message("widget.x.y")` 交一条没有占位符的目录文案（key 是字面量），
 `Notice::MarketNotLoaded { venues, supported }` 交两份场所——`venues` 是自己等的那几个（只有状态的身份，句子不读它），
-`supported` 是这条句子列出来的、本组件能读的全部场所（见 §9）。句子与它的两个参数由 `widget::venue` 供给。
+`supported` 是这条句子列出来的、本组件能读的全部场所（见 §9）。句子与它的实参由 `widget::venue` 供给。
 `error` 是 `Arc<dyn LocalizedError>`，`action` 是 `WidgetAction`（标签是目录 key）；`WidgetState::waiting` 与
 `WidgetState::failed` 就是 `Waiting` / `Failed` 的构造器，直接写变体也一样。
 
@@ -531,7 +531,7 @@ pub(super) struct ForceOrderService<S = MarketCapability> {
 不在场就 `self.status.report(WidgetState::waiting(Notice::MarketNotLoaded { venues, supported }), cx)` 报一句中性文案：
 `venues` 是自己等的那几个场所，`supported` 是句子列出来的那组——**本组件所需 capability 的场所集合**，从静态定义表取
 （`market_participants_connector::venue::definition::venues_supporting(CapabilityId::…)`），与加载状态、与用户当前选了什么标的都无关。
-句子与它的两个实参由 `widget::venue` 在画它的那一帧供给（见 §9，指向左上角那个带图标的「市场」入口），然后立即返回。
+句子与它的实参由 `widget::venue` 在画它的那一帧供给（见 §9，指向左上角那个纯图标的「市场」入口），然后立即返回。
 
 - 检查放在 `load()` 的 **最前面**，早于任何订阅与构建。scope 被剪除（场所再次加载后收缩）时 pane 因此回到中性提示，而不是
   走进既有的"能力不支持"分支——那条分支会清掉用户持久化的选择。
@@ -615,16 +615,15 @@ pub(super) struct ForceOrderService<S = MarketCapability> {
   - `Notice::message("widget.x.y")`：一条没有占位符的目录文案，key 是字面量。
   - `Notice::MarketNotLoaded { venues, supported }`：交两份场所，都是 `VenueId`。`venues` 是自己等的那几个（只有状态
     的身份：重复上报要能去重，句子不读它）；`supported` 是句子要列出来的那组——本组件所需 capability 的场所集合，从静态
-    定义表取，与加载状态和用户选了什么标的都无关。句子是 `common.market_not_loaded`，它的两个实参由 `widget::venue`
+    定义表取，与加载状态和用户选了什么标的都无关。句子是 `common.market_not_loaded`，它的实参由 `widget::venue`
     供给——`%{markets}` 把**每个场所写成一行**，一行是它的 logo（`VenueDisplay::asset_path` 那条 `brands/` 路径，写成
-    `?size=16` 的行内图片）加它自己的名字（markdown 加粗），名字来自 `VenueDisplay::name_key`；
-    `%{control}` 是「市场」控件自己的标签 key（`window.market_participants.title`）。"这条句子指向哪个控件"因此只落在一
-    处，不跟着调用点复制。
+    `?size=16` 的行内图片）加它自己的名字（markdown 加粗），名字来自 `VenueDisplay::name_key`。
+    标题栏的「市场」按钮是纯图标的，所以句子指向它时只写图标，不带控件名：`<kbd>![](file://icons/phosphoricons/bank.svg)</kbd>`。
+    "这条句子指向哪个控件"因此只落在一处，不跟着调用点复制。
     logo 的路径只有一处：`base_ui::brand` 里每个品牌一个常量，`Brand` 元素与这条句子读的是同一个，所以列表里的 logo
     不会和界面别处画的那张分叉。
   目录里那条文案自己写成 markdown：`<p align="center">…` 里先写句子（以冒号收尾），换一行再放 `%{markets}`，最后在
-  同一行收 `</p>`；`<kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd>` 把图标与控件名圈成一个不可拆开的
-  整体，换行时一起走。
+  同一行收 `</p>`；`<kbd>![](file://icons/phosphoricons/bank.svg)</kbd>` 把那个图标圈成一个不可拆开的整体，换行时一起走。
   **整对标签之间可以有空行**（`%{markets}` 的值里也一样）：空行照旧是空行，标签对跨过它闭合，整段文案与列表都画出来
   （空行那一条由 `base_ui` 的 `a_blank_line_in_a_tag_pairs_content_keeps_the_whole_message` 钉住；整句照旧画成一个居中
   段落由 `every_placeholder_message_should_draw_as_an_aligned_paragraph` 按参数填好之后再验）。

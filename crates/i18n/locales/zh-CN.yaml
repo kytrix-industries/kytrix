@@ -14,7 +14,7 @@ common:
   market_participants: 市场参与者
   instrument: 标的
   loading: 正在加载
-  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> 中加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
   no_data: 暂无数据
   no_matches: 没有匹配项
   pair: 交易对

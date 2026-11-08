@@ -25,27 +25,24 @@ use crate::{
 /// draws it rather than where it was reported. `sample.failure` is a widget's own typed
 /// failure, and it is resolved the same way.
 ///
-/// `common.market_not_loaded` is the product's own sentence, together with the three keys
-/// it is written in terms of — a venue's name through `venue.binance` and `venue.okx`, and
-/// the control it points at through `window.market_participants.title`. They are here because
-/// they are what the framework supplies when it resolves a notice that names markets.
+/// `common.market_not_loaded` is the product's own sentence, together with the two keys it
+/// is written in terms of: a venue's name through `venue.binance` and `venue.okx`. They are
+/// here because they are what the framework supplies when it resolves a notice that names
+/// markets; the control the sentence points at is its icon, which the sentence writes itself.
 pub(crate) const MESSAGES_EN: &str = r#"
 common:
   connecting: Connecting
   loading: Loading
   retry: Retry
-  market_not_loaded: "<p align=\"center\">This widget needs the metadata of a supported market participant to be loaded first.\nLoad the metadata of at least one supported market participant from the <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> section in the top left corner.\nThe market participants this widget supports are:\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">This widget needs the metadata of a supported market participant to be loaded first.\nLoad the metadata of at least one supported market participant from the <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> button in the top left corner.\nThe market participants this widget supports are:\n%{markets}</p>"
 sample:
   failure: route unavailable
 test:
-  notice: 'Load a market from the <kbd>![](file://icons/phosphoricons/graph.svg) Markets</kbd> button'
+  notice: 'Load a market from the <kbd>![](file://icons/phosphoricons/bank.svg) Markets</kbd> button'
   waiting: Waiting for orders
 venue:
   binance: Binance
   okx: OKX
-window:
-  market_participants:
-    title: Markets
 "#;
 
 pub(crate) const MESSAGES_ZH: &str = r#"
@@ -53,18 +50,15 @@ common:
   connecting: 正在连接
   loading: 正在加载
   retry: 重试
-  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> 中加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
 sample:
   failure: 路线不可用
 test:
-  notice: 请先从左上角的 <kbd>![](file://icons/phosphoricons/graph.svg) 市场</kbd> 中加载市场
+  notice: 请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg) 市场</kbd> 中加载市场
   waiting: 正在等待订单
 venue:
   binance: 币安
   okx: 欧易
-window:
-  market_participants:
-    title: 市场
 "#;
 
 /// Installs a minimal English and Chinese translator into `cx`, together with the

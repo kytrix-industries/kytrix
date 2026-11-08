@@ -14,7 +14,7 @@ common:
   market_participants: Market participant
   instrument: Instrument
   loading: Loading
-  market_not_loaded: "<p align=\"center\">This widget needs the metadata of a supported market participant to be loaded first.\nLoad the metadata of at least one supported market participant from the <kbd>![](file://icons/phosphoricons/graph.svg) %{control}</kbd> section in the top left corner.\nThe market participants this widget supports are:\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">This widget needs the metadata of a supported market participant to be loaded first.\nLoad the metadata of at least one supported market participant from the <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> button in the top left corner.\nThe market participants this widget supports are:\n%{markets}</p>"
   no_data: No data
   no_matches: No matches
   pair: Pair

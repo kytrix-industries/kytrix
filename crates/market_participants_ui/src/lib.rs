@@ -1,4 +1,4 @@
-//! The market participants entry in the page toolbar: the one place a venue is loaded.
+//! The market participants entry in the title bar: the one place a venue is loaded.
 //!
 //! [`menu::MarketParticipants`] lists every venue this build declares and offers each of them
 //! the action that loads it — [`market_participants_connector::connector::MarketParticipantsConnector::load_venue`],

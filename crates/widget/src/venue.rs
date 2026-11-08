@@ -161,23 +161,15 @@ fn venue_of_key(key: &str) -> VenueId {
         .unwrap_or_else(|| panic!("`{key}` is not the name key of a venue this build speaks"))
 }
 
-/// The control the catalogue's "load the market first" sentence points at.
-///
-/// The sentence and the control it names are one fact of the product —
-/// `common.market_not_loaded` spells that control's icon and its `%{control}` — so
-/// the correspondence lives here rather than at each of the call sites that report
-/// the notice.
-const MARKET_CONTROL: &str = "window.market_participants.title";
-
 /// Renders the whole sentence that asks the user to load the metadata of a market first.
 ///
-/// The sentence states what has to happen and where the control that does it is; the venues
-/// it ends with are the ones the reporting widget can read at all, so a reader who loads any
-/// of them gets a pane that works. Both arguments are supplied here, in the language showing
-/// now, because both of them are punctuation of this module's own kind: the venues through
-/// [`listed_names`] — each line its logo and its name — and the control through the key it is
-/// itself labelled with, so the control a reader is pointed at reads as the control they can
-/// see.
+/// The sentence states what has to happen and points at the control that does it by the one
+/// mark that control draws: the title bar's market button is icon-only, so the catalogue
+/// spells the button as its icon and the sentence carries no label for it. The venues it ends
+/// with are the ones the reporting widget can read at all, so a reader who loads any of them
+/// gets a pane that works. They are supplied here, in the language showing now, because the
+/// list is punctuation of this module's own kind: [`listed_names`] writes each of them as its
+/// logo and its name.
 ///
 /// `supported` is the widget's own answer rather than anything derived here: which markets a
 /// widget may read is a fact about that widget's capability, and this layer is below the one
@@ -192,8 +184,7 @@ pub(crate) fn market_not_loaded_sentence(cx: &App, supported: &[VenueId]) -> Sha
     t!(
         cx,
         "common.market_not_loaded",
-        markets = listed_names(cx, &keys),
-        control = t!(cx, MARKET_CONTROL)
+        markets = listed_names(cx, &keys)
     )
 }
 
@@ -361,20 +352,19 @@ mod tests {
     ///
     /// The fixture is the shape this module has to handle; this is the copy the user
     /// actually gets against it — the market participants the sentence ends with, one per
-    /// line, and the control through the key the control itself is labelled with, with the
-    /// control's icon kept in the sentence. Both locales write that message, so rendering it
-    /// is the only guard against one of its `%{…}` being renamed out from under the call
-    /// sites.
+    /// line, and the market control pointed at by its icon alone, because the title bar's
+    /// button draws no label. Both locales write that message, so rendering it is the only
+    /// guard against one of its `%{…}` being renamed out from under the call sites.
     #[gpui_kit::test]
-    fn a_market_notice_should_list_its_market_participants_and_name_its_control_in_both_languages(
+    fn a_market_notice_should_list_its_market_participants_in_both_languages(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         cx.update(|cx| {
             i18n::global::embedded::install(cx).expect("the embedded locales should load");
 
-            for (language, names, logo, control) in [
-                ("en", ["Binance", "OKX"], base_ui::brand::BINANCE, "Markets"),
-                ("zh-CN", ["币安", "欧易"], base_ui::brand::BINANCE, "市场"),
+            for (language, names, logo) in [
+                ("en", ["Binance", "OKX"], base_ui::brand::BINANCE),
+                ("zh-CN", ["币安", "欧易"], base_ui::brand::BINANCE),
             ] {
                 cx.set_global(match language {
                     "en" => LanguageCode::En,
@@ -396,10 +386,11 @@ mod tests {
                     "{language} lists the market participants one per line, each its logo and its bold name: \
                      {notice:?}"
                 );
-                assert!(notice.contains(control), "{language}: {notice}");
                 assert!(
-                    notice.contains("file://icons/phosphoricons/graph.svg"),
-                    "{language}: {notice}"
+                    notice.contains(
+                        "<kbd>![](file://icons/phosphoricons/bank.svg)</kbd>"
+                    ),
+                    "{language} points at the icon-only market control: {notice}"
                 );
                 assert!(
                     !notice.contains("venue.") && !notice.contains("%{"),

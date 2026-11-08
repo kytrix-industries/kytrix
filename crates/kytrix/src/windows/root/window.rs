@@ -19,21 +19,19 @@ use gpui_kit::{
     *,
 };
 use i18n::t;
+use market_participants_ui::menu::MarketParticipants;
 use profile_ui::profile::ProfileMenu;
 use settings_ui::appearance;
 use updater_ui::indicator::UpdateIndicator;
 
-use crate::windows::root::{
-    components::{
-        sidebar::{
-            FLOATING_CLOSE_DELAY, FloatingSidebar, SIDEBAR_FLOATING, SIDEBAR_FULL_WIDTH,
-            SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE, Sidebar, TITLE_BAR_HEIGHT, TOGGLE_INSET,
-            TOGGLE_INSET_MACOS, next_mode, width as sidebar_width,
-        },
-        system_button::WindowSystemButton,
-        workspace::Workspaces,
+use crate::windows::root::components::{
+    sidebar::{
+        FLOATING_CLOSE_DELAY, FloatingSidebar, SIDEBAR_FLOATING, SIDEBAR_FULL_WIDTH,
+        SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE, Sidebar, TITLE_BAR_HEIGHT, TOGGLE_INSET,
+        TOGGLE_INSET_MACOS, next_mode, width as sidebar_width,
     },
-    pages::market::Market,
+    system_button::WindowSystemButton,
+    workspace::Workspaces,
 };
 
 /// The title bar's sidebar toggle.
@@ -41,6 +39,10 @@ const TITLE_BAR_SIDEBAR_TOGGLE: &str = "TITLE_BAR_SIDEBAR_TOGGLE";
 
 /// The mark inside the title bar's sidebar toggle, named so a test can centre it.
 const TITLE_BAR_SIDEBAR_TOGGLE_ICON: &str = "TITLE_BAR_SIDEBAR_TOGGLE_ICON";
+
+/// The gap between the title bar's controls, and between the docked sidebar and the control
+/// the sidebar pushes.
+const TITLE_BAR_CONTROL_GAP: Pixels = px(4.0);
 
 /// The column the page is drawn in, named so a test can say where the sidebar leaves it.
 const PAGE: &str = "ROOT_PAGE";
@@ -89,7 +91,8 @@ pub fn open(cx: &mut App, recovered: Option<ConfigRecovery>) {
 }
 
 struct RootWindow {
-    page_market: Entity<Market>,
+    /// The market participants menu the title bar draws: the one control that loads a venue.
+    market_participants: Entity<MarketParticipants>,
     /// The workspaces the page shows and the sidebar lists.
     workspaces: Entity<Workspaces>,
     /// How the sidebar is drawn, mirrored from the settings this window read at startup and
@@ -213,12 +216,12 @@ impl RootWindow {
         // stage is a view of its own and redraws itself; the list around it does not. Both
         // subscriptions are held: an observer that is dropped stops following.
         let workspaces_changes = cx.observe(&workspaces, |_, _, cx| cx.notify());
-        let page_market = cx.new(|cx| Market::new(cx, workspaces.clone()));
+        let market_participants = cx.new(MarketParticipants::new);
         let profile = cx.new(ProfileMenu::new);
         let profile_changes = cx.observe(&profile, |_, _, cx| cx.notify());
 
         Self {
-            page_market,
+            market_participants,
             workspaces,
             sidebar,
             floating: FloatingSidebar::default(),
@@ -467,7 +470,25 @@ impl RootWindow {
     /// its bounds are being debugged; that tint is not part of the design. Being drawn last,
     /// it is also what the pointer finds first across the top of the window, which is who
     /// drags the window.
-    fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// `docked_width` is the width the sidebar is drawn at on this frame: the controls after
+    /// the toggle are anchored to the sidebar's edge rather than to the toggle, so this is
+    /// what pushes them while the sidebar opens and carries them back while it closes.
+    fn title_bar(&self, docked_width: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
+        let toggle_inset = if cfg!(target_os = "macos") {
+            TOGGLE_INSET_MACOS
+        } else {
+            TOGGLE_INSET
+        };
+        // The toggle keeps its place, and the control after it is anchored to the docked
+        // sidebar: one control gap past the sidebar's right edge, travelling with the width
+        // the window animates, so the sidebar pushes it out as it opens and carries it back
+        // as it closes. A hidden sidebar has no width, so that control falls back to one gap
+        // past the toggle. The floating preview is not the docked sidebar's width, and pushes
+        // nothing.
+        let toggle_home = toggle_inset + SIDEBAR_ITEM_SIZE + TITLE_BAR_CONTROL_GAP;
+        let sidebar_push = (docked_width + TITLE_BAR_CONTROL_GAP).max(toggle_home) - toggle_home;
+
         let title_bar = div()
             .id("title-bar")
             .absolute()
@@ -484,13 +505,18 @@ impl RootWindow {
                     .flex()
                     .items_center()
                     // The traffic lights the system draws in the window's top-left corner are
-                    // what the macOS inset clears; elsewhere the toggle is all that is there.
-                    .pl(if cfg!(target_os = "macos") {
-                        TOGGLE_INSET_MACOS
-                    } else {
-                        TOGGLE_INSET
-                    })
-                    .child(self.sidebar_toggle(cx)),
+                    // what the macOS inset clears; elsewhere the toggle leads the bar.
+                    .pl(toggle_inset)
+                    .gap(TITLE_BAR_CONTROL_GAP)
+                    .child(self.sidebar_toggle(cx))
+                    // The market menu takes the pointer for itself, as the toggle does: the
+                    // title bar under it is the window's drag area, and the wrapper rather
+                    // than the menu is what occludes, so the menu's tooltip still opens.
+                    .child(
+                        div()
+                            .pl(sidebar_push)
+                            .child(div().occlude().child(self.market_participants.clone())),
+                    ),
             )
             .child(
                 div()
@@ -743,14 +769,15 @@ impl Render for RootWindow {
                         div()
                             .flex_1()
                             .min_h_0()
-                            .p_1()
-                            .child(self.page_market.clone()),
+                            .px_1()
+                            .pb_1()
+                            .child(self.workspaces.clone()),
                     ),
             )
             .when(popup_should_render(preview_open, preview), |this| {
                 this.child(self.floating_sidebar(preview_open, preview.progress, cx))
             })
-            .child(self.title_bar(cx))
+            .child(self.title_bar(docked_width, cx))
             // A window-level move listener, not a hitbox: the first move after a context
             // menu closes is what decides whether the panel that waited for it goes away,
             // and that move may belong to an alert over the page. The canvas paints nothing;
@@ -800,8 +827,8 @@ mod tests {
 
     use super::{
         ConfigRecovery, FLOATING_CLOSE_DELAY, PAGE, RootWindow, SIDEBAR_ANIMATION,
-        SIDEBAR_FLOATING, SidebarMode, TITLE_BAR_SIDEBAR_TOGGLE, TITLE_BAR_SIDEBAR_TOGGLE_ICON,
-        announce_config_recovery, store_sidebar_mode,
+        SIDEBAR_FLOATING, SidebarMode, TITLE_BAR_CONTROL_GAP, TITLE_BAR_SIDEBAR_TOGGLE,
+        TITLE_BAR_SIDEBAR_TOGGLE_ICON, announce_config_recovery, store_sidebar_mode,
     };
     use crate::windows::root::{
         components::sidebar::{SIDEBAR_FULL_WIDTH, SIDEBAR_ICON_WIDTH, SIDEBAR_ITEM_SIZE},
@@ -815,6 +842,13 @@ mod tests {
     /// The docked panel's debug selector, which the sidebar module keeps to itself: the
     /// window's tests name the same string the panel is drawn with.
     const SIDEBAR: &str = "SIDEBAR";
+
+    /// The market participants menu the title bar draws, the mark inside it, and one venue's
+    /// row of the panel it opens. All are the menu's own selectors: what the window decides
+    /// is where the control is drawn.
+    const MARKET_MENU_TRIGGER: &str = "TEST_MARKET_PARTICIPANTS_TRIGGER";
+    const MARKET_MENU_ICON: &str = "TEST_MARKET_PARTICIPANTS_ICON";
+    const MARKET_MENU_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Binance";
 
     /// The menu item a workspace row's right click opens, named by the entry's id.
     const RENAME_ENTRY: &str = "TEST_MENU_ITEM_rename";
@@ -930,8 +964,8 @@ mod tests {
     ///
     /// Every global the root's own views read is installed the way the composition root
     /// installs it: the sidebar's account menu is built over the connector's signed-out
-    /// in-memory test session, the market page's participants menu is built over its
-    /// connector, and the title bar draws the updater.
+    /// in-memory test session, the title bar's participants menu is built over its connector,
+    /// and the title bar draws the updater.
     fn root_window(cx: &mut TestAppContext, sidebar: SidebarMode) -> &mut VisualTestContext {
         // The account menu's session query is answered by the test connector's auth actor on
         // its own "kytrix-auth-session" thread. Parking lets the deterministic scheduler wait
@@ -1249,6 +1283,134 @@ mod tests {
             "the toggle's mark is centred in its square: toggle {:?}, icon {:?}",
             toggle,
             icon
+        );
+    }
+
+    /// The market menu is the title bar's other control: it takes the sidebar toggle's square,
+    /// and the docked sidebar pushes it. The toggle itself never moves; the market menu sits
+    /// one control gap past the sidebar's right edge, and falls back to one gap past the toggle
+    /// while the sidebar is hidden.
+    #[gpui_kit::test]
+    fn the_sidebar_should_push_the_market_menu_while_the_toggle_stays(cx: &mut TestAppContext) {
+        let cx = root_window(cx, SidebarMode::Hidden);
+
+        let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        let toggle_left = toggle.left();
+        let home = toggle.right() + TITLE_BAR_CONTROL_GAP;
+
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            home,
+            "a hidden sidebar leaves the market menu one control gap past the toggle"
+        );
+
+        // The floating preview is not the docked sidebar: it asks for width without changing
+        // where the docked panel stands, so it pushes nothing.
+        hover(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        assert!(
+            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
+            "the hover floats the preview"
+        );
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            home,
+            "the floating preview pushes nothing"
+        );
+
+        click(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+
+        assert_eq!(
+            drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE).left(),
+            toggle_left,
+            "the toggle keeps its place while the sidebar opens"
+        );
+        assert_eq!(drawn(cx, PAGE).left(), SIDEBAR_ICON_WIDTH);
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            (SIDEBAR_ICON_WIDTH + TITLE_BAR_CONTROL_GAP).max(home),
+            "the icon-only rail pushes the market menu one control gap past its edge"
+        );
+
+        click(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+
+        let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        let market = drawn(cx, MARKET_MENU_TRIGGER);
+        let icon = drawn(cx, MARKET_MENU_ICON);
+
+        assert_eq!(
+            toggle.left(),
+            toggle_left,
+            "the toggle keeps its place while the sidebar is full"
+        );
+        assert_eq!(drawn(cx, PAGE).left(), SIDEBAR_FULL_WIDTH);
+        assert_eq!(
+            market.left(),
+            SIDEBAR_FULL_WIDTH + TITLE_BAR_CONTROL_GAP,
+            "the full panel pushes the market menu one control gap past its edge"
+        );
+        assert_eq!(
+            market.size,
+            size(SIDEBAR_ITEM_SIZE, SIDEBAR_ITEM_SIZE),
+            "the market menu is one item's square, like the toggle"
+        );
+        assert_eq!(
+            market.top(),
+            toggle.top(),
+            "the market menu and the toggle are on the same line"
+        );
+        assert!(
+            (icon.center().x - market.center().x).abs() <= px(0.5)
+                && (icon.center().y - market.center().y).abs() <= px(0.5),
+            "the market menu's mark is centred in its square: market {market:?}, icon {icon:?}"
+        );
+
+        // The collapse is a movement, not a cut: the market menu keeps the place the full
+        // panel pushed it to on the frame of the press, travels with the panel's width, and
+        // ends one gap past the toggle again.
+        let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE).center();
+        cx.simulate_click(toggle, Modifiers::none());
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            SIDEBAR_FULL_WIDTH + TITLE_BAR_CONTROL_GAP,
+            "the collapse starts from the place the full panel pushed it to"
+        );
+
+        animate(cx, SIDEBAR_ANIMATION / 2);
+        let page = drawn(cx, PAGE).left();
+        assert!(
+            page > px(0.0) && page < SIDEBAR_FULL_WIDTH,
+            "the panel is on its way back to no width halfway through: {page}"
+        );
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            (page + TITLE_BAR_CONTROL_GAP).max(home),
+            "the market menu travels with the width the panel is collapsing through"
+        );
+
+        animate(cx, SIDEBAR_ANIMATION);
+        assert_eq!(
+            drawn(cx, MARKET_MENU_TRIGGER).left(),
+            home,
+            "the collapse ends one gap past the toggle"
+        );
+    }
+
+    /// The title bar's market menu is a working control, not only a drawn one: a press on its
+    /// square opens the venue panel over the page.
+    #[gpui_kit::test]
+    fn the_market_menu_should_open_its_panel_from_the_title_bar(cx: &mut TestAppContext) {
+        let cx = root_window(cx, SidebarMode::Full);
+
+        assert!(
+            cx.debug_bounds(MARKET_MENU_ROW).is_none(),
+            "nothing is listed before the menu is pressed"
+        );
+
+        click(cx, MARKET_MENU_TRIGGER);
+
+        assert!(
+            cx.debug_bounds(MARKET_MENU_ROW).is_some(),
+            "the press on the title bar's square opens the venue panel"
         );
     }
 
