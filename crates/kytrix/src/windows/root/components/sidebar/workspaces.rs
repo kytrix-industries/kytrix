@@ -21,8 +21,8 @@ use base_ui::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, ElementId, Entity, InteractiveElement,
-    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement,
-    Styled, UniformListScrollHandle, Window,
+    IntoElement, MouseButton, ParentElement, Pixels, RenderOnce, SharedString,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
     base::{Disableable, Selectable},
     div, px, uniform_list,
 };
@@ -56,6 +56,9 @@ pub(crate) const SIDEBAR_WORKSPACE_NAME: &str = "SIDEBAR_WORKSPACE_NAME";
 /// The workspace mark drawn inside a row, named so tests can say where it sits.
 pub(crate) const SIDEBAR_WORKSPACE_MARK: &str = "SIDEBAR_WORKSPACE_MARK";
 
+/// The prefix of one workspace row's close button selector.
+const SIDEBAR_WORKSPACE_CLOSE: &str = "SIDEBAR_WORKSPACE_CLOSE";
+
 /// The context menu a row's right click opens, named for tests.
 const SIDEBAR_WORKSPACE_MENU_PANEL: &str = "SIDEBAR_WORKSPACE_MENU_PANEL";
 
@@ -75,6 +78,12 @@ const DELETE_ITEM: &str = "delete";
 pub(crate) struct SidebarWorkspaces {
     /// Whether it draws the labelled panel rather than the icon-only rail.
     full: bool,
+    /// Whether a selected or hovered row offers its close button.
+    ///
+    /// The panel turns this off while it retracts: the rows it is still drawing belong to a
+    /// panel on its way out, and the control that belongs to the settled panel is not
+    /// offered there.
+    show_close: bool,
     workspaces: Entity<Workspaces>,
     /// Identifies one opening of the panel, so a row's ids and menus do not outlive it.
     popup_scope: u64,
@@ -84,9 +93,16 @@ impl SidebarWorkspaces {
     pub(crate) fn new(full: bool, workspaces: Entity<Workspaces>) -> Self {
         Self {
             full,
+            show_close: true,
             workspaces,
             popup_scope: 0,
         }
+    }
+
+    /// Whether a selected or hovered row may draw its close button.
+    pub(crate) fn show_close(mut self, show_close: bool) -> Self {
+        self.show_close = show_close;
+        self
     }
 
     /// Names this opening of the panel in the ids of its rows and menus.
@@ -95,8 +111,9 @@ impl SidebarWorkspaces {
         self
     }
 
-    /// One workspace of the list: the row that selects it, and the right click that renames
-    /// or deletes it.
+    /// One workspace of the list: the row that selects it, the right click that renames or
+    /// deletes it, and the close button the full panel draws while the row is selected or
+    /// under the pointer.
     ///
     /// The row is a button in both panel states. A left click selects the workspace; a
     /// right click opens its menu at the pointer, and the row keeps its hover paint while
@@ -110,6 +127,7 @@ impl SidebarWorkspaces {
         name: &SmolStr,
         active: bool,
         can_delete: bool,
+        close_available: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
@@ -131,7 +149,7 @@ impl SidebarWorkspaces {
             window.use_keyed_state((row_id.clone(), "menu-open"), cx, |_, _| false);
         let menu_open = *menu_open_state.read(cx);
 
-        let mut select = Button::new((row_id, "select"))
+        let mut select = Button::new((row_id.clone(), "select"))
             .ghost()
             .selected(active)
             .force_hover(menu_open)
@@ -218,30 +236,71 @@ impl SidebarWorkspaces {
         let mark = div()
             .debug_selector(|| SIDEBAR_WORKSPACE_MARK.into())
             .child(Icon::new(IconKind::SquaresFour).size(SIDEBAR_ICON_SIZE));
-        if full {
-            select = select
-                .w_full()
-                .px(SIDEBAR_FULL_PADDING)
-                .gap_2()
-                .child(mark)
-                .child(
-                    div()
-                        .debug_selector(|| SIDEBAR_WORKSPACE_NAME.into())
-                        .max_w(SIDEBAR_NAME_MAX_WIDTH)
-                        // The panel narrows while it collapses: the name gives way to the
-                        // mark rather than reaching past the panel's edge.
-                        .min_w_0()
-                        .truncate()
-                        .child(label),
-                )
-        } else {
+        if !full {
             // The item is the toggle's square, so the column's marks line up with the
             // toggle in the title bar. The name is read from the full panel the pointer
             // floats over the rail, not from a tooltip.
-            select = select.w(SIDEBAR_ITEM_SIZE).justify_center().child(mark);
+            return select
+                .w(SIDEBAR_ITEM_SIZE)
+                .justify_center()
+                .child(mark)
+                .into_any_element();
         }
 
-        select.into_any_element()
+        select = select
+            .w_full()
+            .px(SIDEBAR_FULL_PADDING)
+            .gap_2()
+            .child(mark)
+            .child(
+                div()
+                    .debug_selector(|| SIDEBAR_WORKSPACE_NAME.into())
+                    .max_w(SIDEBAR_NAME_MAX_WIDTH)
+                    // The panel narrows while it collapses: the name gives way to the
+                    // mark rather than reaching past the panel's edge.
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
+            );
+
+        // The close button belongs to the row the page shows or the pointer is on. The
+        // wrapper watches the row rather than the button itself: the button is only drawn
+        // while it is wanted, so it cannot be what keeps itself up.
+        let hover_state = window.use_keyed_state((row_id.clone(), "row-hover"), cx, |_, _| false);
+        let show_close = close_available && can_delete && (active || *hover_state.read(cx));
+        let mut row = div()
+            .id((row_id.clone(), "row"))
+            .relative()
+            .w_full()
+            .on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
+            .child(select);
+        if show_close {
+            let close_selector = format_smolstr!("{SIDEBAR_WORKSPACE_CLOSE}_{name}");
+            let close_label = t!(cx, "window.workspace.close");
+            let close = Button::new((row_id, "close"))
+                .ghost()
+                .small()
+                .absolute()
+                .right(px(5.0))
+                .top(px(6.0))
+                .debug_selector(move || close_selector.to_string())
+                .aria_label(close_label)
+                .child(Icon::new(IconKind::X).size(px(12.0)))
+                // The row's select button lies under the close button, so a press here
+                // must not reach it: selecting the workspace, or opening its menu, is not
+                // what this button is for. The press never becomes the row's click, so
+                // there is nothing to stop on the way back up.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_click({
+                    let workspaces = workspaces.clone();
+                    let name = name.clone();
+                    move |_, window, cx| show_delete_alert(&workspaces, &name, window, cx)
+                });
+            row = row.child(close);
+        }
+
+        row.into_any_element()
     }
 }
 
@@ -249,6 +308,7 @@ impl RenderOnce for SidebarWorkspaces {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let SidebarWorkspaces {
             full,
+            show_close,
             workspaces,
             popup_scope,
         } = self;
@@ -330,6 +390,7 @@ impl RenderOnce for SidebarWorkspaces {
                                         name,
                                         name == &active,
                                         can_delete,
+                                        show_close,
                                         window,
                                         cx,
                                     ))
@@ -532,7 +593,14 @@ mod tests {
 
     const PANEL: &str = "BASE_UI_ALERT";
     const OK: &str = "BASE_UI_ALERT_OK";
+    const CANCEL: &str = "BASE_UI_ALERT_CANCEL";
     const INPUT: &str = "BASE_UI_INPUT";
+
+    /// The close button of a row, named for the workspace it stands for.
+    const CLOSE_ONE: &str = "SIDEBAR_WORKSPACE_CLOSE_one";
+    const CLOSE_TWO: &str = "SIDEBAR_WORKSPACE_CLOSE_two";
+    const CLOSE_NOTES: &str = "SIDEBAR_WORKSPACE_CLOSE_Notes";
+    const CLOSE_ONLY: &str = "SIDEBAR_WORKSPACE_CLOSE_Only";
 
     /// The box the menu of a row's right click is drawn in. The panel belongs to the
     /// context menu, which names no selector of its own for it.
@@ -662,6 +730,18 @@ mod tests {
         cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
         cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
         settle(cx);
+    }
+
+    /// Moves the pointer to `at`, and draws the frame the move asks for.
+    fn hover_at(cx: &mut VisualTestContext, at: gpui_kit::Point<Pixels>) {
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        settle(cx);
+    }
+
+    /// Moves the pointer to the middle of what `selector` names.
+    fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+        let at = drawn(cx, selector).center();
+        hover_at(cx, at);
     }
 
     /// Turns the wheel at `at`, and draws the frame the scroll asks for.
@@ -830,6 +910,179 @@ mod tests {
         assert!(
             cx.debug_bounds(SIDEBAR_WORKSPACE_NAME).is_none(),
             "an icon-only sidebar draws no workspace name"
+        );
+    }
+
+    /// The full panel draws the close button on the row the page shows and on the row under
+    /// the pointer, on the row's right edge and centred in its height. A row that is neither
+    /// selected nor hovered has none, and the button goes away when the pointer leaves.
+    #[gpui_kit::test]
+    fn the_close_button_should_follow_the_selected_and_hovered_rows(cx: &mut TestAppContext) {
+        let (cx, _) = section_window(cx, config_with(&["one", "two"]), SidebarMode::Full);
+
+        let row = drawn(cx, "SIDEBAR_ITEM_one");
+        let close = drawn(cx, CLOSE_ONE);
+        assert!(
+            close.left() > row.center().x,
+            "the close button belongs on the row's right: {close:?} in {row:?}"
+        );
+        assert_eq!(
+            close.center().y,
+            row.center().y,
+            "the close button is centred in the row's height"
+        );
+        assert!(
+            close.right() <= row.right(),
+            "the close button stays inside the row it belongs to"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_none(),
+            "a row that is neither selected nor hovered draws no close button"
+        );
+
+        hover(cx, "SIDEBAR_ITEM_two");
+
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_some(),
+            "hovering a row draws its close button"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_some(),
+            "the selected row keeps its close button while another row is hovered"
+        );
+
+        hover(cx, CLOSE_TWO);
+
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_some(),
+            "the close button stays drawn while the pointer is on it"
+        );
+
+        hover_at(cx, point(px(350.0), px(550.0)));
+
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_none(),
+            "the close button goes away when the pointer leaves the row"
+        );
+    }
+
+    /// Pressing the close button asks for the deletion the row menu asks for, and is not the
+    /// row's selection: the workspace goes only after the confirmation, and cancelling it
+    /// leaves both the list and the page where they were.
+    #[gpui_kit::test]
+    fn the_close_button_should_delete_the_workspace_after_the_rows_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, workspaces) =
+            section_window(cx, config_with(&["Keep", "Notes"]), SidebarMode::Full);
+
+        hover(cx, "SIDEBAR_ITEM_Notes");
+        click(cx, CLOSE_NOTES);
+
+        assert!(
+            cx.debug_bounds(PANEL).is_some(),
+            "closing a workspace asks for the same confirmation the row menu does"
+        );
+        assert_eq!(
+            active_name(cx, &workspaces),
+            SmolStr::new_static("Keep"),
+            "the press on the close button is not the row's selection"
+        );
+        assert_eq!(
+            names(cx, &workspaces),
+            [SmolStr::new_static("Keep"), SmolStr::new_static("Notes")],
+            "nothing is deleted before the confirmation"
+        );
+
+        click(cx, CANCEL);
+
+        assert_eq!(
+            names(cx, &workspaces),
+            [SmolStr::new_static("Keep"), SmolStr::new_static("Notes")],
+            "cancelling leaves the workspace in the list"
+        );
+        assert_eq!(
+            active_name(cx, &workspaces),
+            SmolStr::new_static("Keep"),
+            "cancelling leaves the page on the selected workspace"
+        );
+
+        hover(cx, "SIDEBAR_ITEM_Notes");
+        click(cx, CLOSE_NOTES);
+        click(cx, OK);
+
+        assert_eq!(names(cx, &workspaces), [SmolStr::new_static("Keep")]);
+        assert_eq!(active_name(cx, &workspaces), SmolStr::new_static("Keep"));
+        assert!(
+            cx.debug_bounds(CLOSE_NOTES).is_none(),
+            "the deleted row takes its close button with it"
+        );
+    }
+
+    /// The close button's area is not the row's right click: the workspace menu stays closed
+    /// there, for the row the page shows and for the row under the pointer alike.
+    #[gpui_kit::test]
+    fn the_close_button_should_not_respond_to_a_right_click_as_the_row_does(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, workspaces) = section_window(cx, config_with(&["one", "two"]), SidebarMode::Full);
+
+        right_click(cx, CLOSE_ONE);
+        assert!(
+            cx.debug_bounds(MENU_PANEL).is_none(),
+            "a right click on the selected row's close button opens no menu"
+        );
+
+        hover(cx, "SIDEBAR_ITEM_two");
+        right_click(cx, CLOSE_TWO);
+        assert!(
+            cx.debug_bounds(MENU_PANEL).is_none(),
+            "a right click on a hovered row's close button opens no menu"
+        );
+        assert_eq!(
+            active_name(cx, &workspaces),
+            SmolStr::new_static("one"),
+            "the right click on the close button selected no workspace"
+        );
+        assert_eq!(
+            names(cx, &workspaces),
+            [SmolStr::new_static("one"), SmolStr::new_static("two")],
+            "the right click on the close button deleted no workspace"
+        );
+    }
+
+    /// The last workspace cannot be deleted, so its row offers no close button even while it
+    /// is hovered.
+    #[gpui_kit::test]
+    fn the_last_workspace_should_not_draw_a_close_button(cx: &mut TestAppContext) {
+        let (cx, _) = section_window(cx, config_with(&["Only"]), SidebarMode::Full);
+
+        assert!(
+            cx.debug_bounds(CLOSE_ONLY).is_none(),
+            "the only workspace cannot be deleted"
+        );
+        hover(cx, "SIDEBAR_ITEM_Only");
+        assert!(
+            cx.debug_bounds(CLOSE_ONLY).is_none(),
+            "hovering the only workspace still offers no close button"
+        );
+    }
+
+    /// The icon-only rail has no close button at all: its row is one icon square, with no
+    /// room beside the workspace mark.
+    #[gpui_kit::test]
+    fn the_icon_only_rail_should_not_draw_a_close_button(cx: &mut TestAppContext) {
+        let (cx, _) = section_window(cx, config_with(&["one", "two"]), SidebarMode::IconOnly);
+
+        hover(cx, "SIDEBAR_ITEM_one");
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_none(),
+            "the icon-only rail draws no close button on the selected row"
+        );
+        hover(cx, "SIDEBAR_ITEM_two");
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_none(),
+            "the icon-only rail draws no close button on a hovered row"
         );
     }
 

@@ -48,6 +48,11 @@ pub(crate) struct Sidebar {
     profile: Entity<ProfileMenu>,
     /// Called as the pointer enters or leaves the panel's content, below the title bar.
     content_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
+    /// Whether the panel is moving away rather than coming in or standing still.
+    ///
+    /// The rows are still drawn while the panel moves out, but the controls that belong to
+    /// the settled panel — the workspace close buttons — are not offered on the way out.
+    retracting: bool,
     /// Identifies one opening of the panel, so its rows and menus do not outlive it.
     popup_scope: u64,
 }
@@ -65,6 +70,7 @@ impl Sidebar {
             pages,
             profile,
             content_hover: None,
+            retracting: false,
             popup_scope: 0,
         }
     }
@@ -78,6 +84,15 @@ impl Sidebar {
         callback: impl Fn(&bool, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.content_hover = Some(Rc::new(callback));
+        self
+    }
+
+    /// Whether the panel is on its way out.
+    ///
+    /// A panel that is retracting still draws its rows, but it does not offer the close
+    /// buttons that belong to the settled panel.
+    pub(crate) fn retracting(mut self, retracting: bool) -> Self {
+        self.retracting = retracting;
         self
     }
 
@@ -130,7 +145,9 @@ impl RenderOnce for Sidebar {
         }
 
         let workspaces = self.pages.read(cx).workspaces().clone();
-        let workspaces = SidebarWorkspaces::new(full, workspaces).popup_scope(self.popup_scope);
+        let workspaces = SidebarWorkspaces::new(full, workspaces)
+            .popup_scope(self.popup_scope)
+            .show_close(!self.retracting);
         let footer =
             SidebarFooter::new(full, self.pages, self.profile).popup_scope(self.popup_scope);
 

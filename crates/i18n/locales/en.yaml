@@ -1182,6 +1182,7 @@ window:
     add: Add New Workspace
     add_message: <p align="center">Name the new workspace.</p>
     add_title: Add Workspace
+    close: Close workspace
     default_name: Workspace %{index}
     delete_message: '<p align="center">Delete the workspace "%{name}"? Its pane layout is deleted with it.</p>'
     delete_title: Delete Workspace

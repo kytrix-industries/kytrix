@@ -676,7 +676,10 @@ impl RootWindow {
                     self.pages.clone(),
                     self.profile.clone(),
                 )
-                .popup_scope(self.popup_scope),
+                .popup_scope(self.popup_scope)
+                // The preview still draws its rows while it moves away, but the close
+                // buttons belong to the panel the user is still using.
+                .retracting(!live),
             )
     }
 }
@@ -732,6 +735,11 @@ impl Render for RootWindow {
             window,
             cx,
         );
+        // The docked panel retracts in one place: the toggle walking out of the full state.
+        // The hidden state keeps no docked panel, so a width still above zero while the
+        // state is hidden is the panel on its way out; the rows it draws until the width is
+        // gone must not offer the close buttons that belong to the settled panel.
+        let sidebar_retracting = self.sidebar == SidebarMode::Hidden && docked_width > px(0.0);
         // The panel is drawn while it collapses out of the full state, so it keeps the
         // labels it was showing rather than switching to an icon rail on its way to nothing.
         let mut panel = Sidebar::new(
@@ -739,7 +747,8 @@ impl Render for RootWindow {
             docked_width,
             self.pages.clone(),
             self.profile.clone(),
-        );
+        )
+        .retracting(sidebar_retracting);
         // The icon-only rail is the collapsed full panel: a pointer on its content asks for
         // the panel, which is drawn over it.
         if self.sidebar == SidebarMode::IconOnly {
@@ -830,7 +839,10 @@ mod tests {
         time::Duration,
     };
 
-    use app_config::settings::{Config, Language};
+    use app_config::{
+        settings::{Config, Language},
+        workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
+    };
     use app_config_provider::{manager::ConfigManager, store::ConfigLoadError};
     use base_ui::{layer::Layer, style};
     use gpui_kit::{
@@ -840,6 +852,7 @@ mod tests {
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::connector::MarketParticipantsConnector;
     use network::transport::hub::{TransportHub, TransportPolicy};
+    use smol_str::SmolStr;
     use updater_ui::global::UpdaterDeps;
     use widget_tokio_runtime::runtime::Runtime;
 
@@ -873,6 +886,11 @@ mod tests {
 
     /// The workspace the default configuration starts with, in English.
     const WORKSPACE_ROW: &str = "SIDEBAR_ITEM_Workspace 1";
+
+    /// The active workspace of the settings a test seeds, its row, and the close button the
+    /// settled full panel offers on it.
+    const ROW_ONE: &str = "SIDEBAR_ITEM_one";
+    const CLOSE_ONE: &str = "SIDEBAR_WORKSPACE_CLOSE_one";
 
     /// The account entry at the foot of the panel.
     const PROFILE_ENTRY: &str = "SIDEBAR_FOOTER_PROFILE";
@@ -982,14 +1000,41 @@ mod tests {
         settle(cx);
     }
 
-    /// Opens the window the application opens, with the real root view and the settings
-    /// already on `sidebar`.
+    /// Opens the window the application opens, with the settings already on `sidebar`.
     ///
     /// Every global the root's own views read is installed the way the composition root
     /// installs it: the sidebar's account menu is built over the connector's signed-out
     /// in-memory test session, the title bar's participants menu is built over its connector,
     /// and the title bar draws the updater.
     fn root_window(cx: &mut TestAppContext, sidebar: SidebarMode) -> &mut VisualTestContext {
+        let mut config = Config::default();
+        config.language = Language::En;
+        config.ui.sidebar = sidebar;
+        root_window_with_config(cx, config)
+    }
+
+    /// Settings with the named workspaces, the first one active, in the state `sidebar`
+    /// names.
+    fn config_with_workspaces(sidebar: SidebarMode, names: &[&str]) -> Config {
+        let mut config = Config::default();
+        config.language = Language::En;
+        config.ui.sidebar = sidebar;
+        config.workspaces = WorkspacesConfig {
+            entries: names
+                .iter()
+                .map(|name| WorkspaceConfig {
+                    name: SmolStr::new(*name),
+                    layout: WorkspaceLayout::single_pane(),
+                })
+                .collect(),
+            active: names.first().map(|name| SmolStr::new(*name)),
+        };
+
+        config
+    }
+
+    /// Opens the window the application opens, with `config` as the settings it read.
+    fn root_window_with_config(cx: &mut TestAppContext, config: Config) -> &mut VisualTestContext {
         // The account menu's session query is answered by the test connector's auth actor on
         // its own "kytrix-auth-session" thread. Parking lets the deterministic scheduler wait
         // for that answer instead of treating activity from another thread as a test that made
@@ -1001,9 +1046,6 @@ mod tests {
             widget_registry::catalogue::install(cx).expect("the catalogue should install");
             style::theme::install(cx);
             cx.set_global(LanguageCode::En);
-            let mut config = Config::default();
-            config.language = Language::En;
-            config.ui.sidebar = sidebar;
             let manager = ConfigManager::in_memory(config, cx);
             cx.set_global(manager);
             widget_tokio_runtime::global::install(cx).expect("the test runtime should install");
@@ -1615,6 +1657,114 @@ mod tests {
             cx.debug_bounds(SIDEBAR_FLOATING).is_none(),
             "the preview closes once the pointer has left it, because nothing holds it"
         );
+    }
+
+    /// The floating preview offers the selected row's close button while it is open, and
+    /// stops offering it as soon as it is on its way out: the close belongs to the panel the
+    /// pointer can still use.
+    #[gpui_kit::test]
+    fn a_retracting_hidden_preview_should_not_offer_the_close_button(cx: &mut TestAppContext) {
+        let cx = root_window_with_config(
+            cx,
+            config_with_workspaces(SidebarMode::Hidden, &["one", "two"]),
+        );
+
+        hover(cx, TITLE_BAR_SIDEBAR_TOGGLE);
+        assert!(
+            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
+            "the toggle under the pointer floats the preview"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_some(),
+            "the open preview offers the selected row's close button"
+        );
+
+        hover_at(cx, point(px(600.0), px(300.0)));
+        assert!(
+            cx.debug_bounds(SIDEBAR_FLOATING).is_some(),
+            "the preview is still drawn on its way out"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_none(),
+            "the retracting preview offers no close button"
+        );
+
+        settle_floating(cx);
+        assert!(cx.debug_bounds(SIDEBAR_FLOATING).is_none());
+    }
+
+    /// The icon-only rail's preview narrows back onto the rail and offers no close button
+    /// while it does: the control is the settled panel's, not the panel on its way out.
+    #[gpui_kit::test]
+    fn a_retracting_icon_only_preview_should_not_offer_the_close_button(cx: &mut TestAppContext) {
+        let cx = root_window_with_config(
+            cx,
+            config_with_workspaces(SidebarMode::IconOnly, &["one", "two"]),
+        );
+
+        hover(cx, ROW_ONE);
+        assert_eq!(
+            drawn(cx, SIDEBAR_FLOATING).size.width,
+            SIDEBAR_FULL_WIDTH,
+            "the item under the pointer floats the full panel over the rail"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_some(),
+            "the open preview offers the selected row's close button"
+        );
+
+        hover_at(cx, point(px(600.0), px(300.0)));
+        let leaving = drawn(cx, SIDEBAR_FLOATING);
+        assert!(
+            leaving.size.width < SIDEBAR_FULL_WIDTH,
+            "the preview is narrowing back onto the rail: {leaving:?}"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_none(),
+            "the narrowing preview offers no close button"
+        );
+
+        settle_floating(cx);
+        assert!(cx.debug_bounds(SIDEBAR_FLOATING).is_none());
+    }
+
+    /// The full panel's selected row offers its close button while the panel is settled, but
+    /// not while it collapses: the button belongs to the panel the user can still act on.
+    #[gpui_kit::test]
+    fn a_collapsing_sidebar_should_not_offer_the_close_button(cx: &mut TestAppContext) {
+        let cx = root_window_with_config(
+            cx,
+            config_with_workspaces(SidebarMode::Full, &["one", "two"]),
+        );
+        let toggle = drawn(cx, TITLE_BAR_SIDEBAR_TOGGLE).center();
+
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_some(),
+            "the settled full panel offers the selected row's close button"
+        );
+
+        cx.simulate_click(toggle, Modifiers::none());
+        assert!(
+            cx.debug_bounds(SIDEBAR).is_some(),
+            "the panel is still drawn on the frame the press starts its collapse"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_none(),
+            "the collapsing panel offers no close button"
+        );
+
+        animate(cx, SIDEBAR_ANIMATION / 2);
+        assert!(
+            cx.debug_bounds(SIDEBAR).is_some(),
+            "the panel is still drawn halfway out"
+        );
+        assert!(
+            cx.debug_bounds(CLOSE_ONE).is_none(),
+            "the panel still offers no close button halfway out"
+        );
+
+        animate(cx, SIDEBAR_ANIMATION);
+        assert!(cx.debug_bounds(SIDEBAR).is_none());
     }
 
     /// The hidden sidebar's preview slides in from the window's left edge rather than appearing

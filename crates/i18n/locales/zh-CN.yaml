@@ -1182,6 +1182,7 @@ window:
     add: 新增工作区
     add_message: <p align="center">为新工作区命名。</p>
     add_title: 新增工作区
+    close: 关闭工作区
     default_name: 工作区 %{index}
     delete_message: <p align="center">确定删除工作区「%{name}」吗？其中的面板布局也会一并删除。</p>
     delete_title: 删除工作区
