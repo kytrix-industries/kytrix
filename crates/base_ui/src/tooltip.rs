@@ -102,7 +102,9 @@ impl RenderOnce for Tooltip {
         .placement(placement)
         // A tooltip points at something inside a panel as often as it points at a
         // control of its own, and it must not be buried under the panel it explains.
-        .priority(POPUP_PRIORITY + 1)
+        // A context menu is one step below it for the same reason: the hint on an entry
+        // inside the menu is read over the menu, not under it.
+        .priority(POPUP_PRIORITY + 2)
         .into_any_element()
     }
 }

@@ -23,6 +23,16 @@ impl Button {
             style: StyleRefinement::default(),
         }
     }
+
+    /// Keeps the button in its hover paint while a popup it opened is up.
+    ///
+    /// The popup's sheet covers the button, so its own hover listener reports the pointer
+    /// leaving. This asks the button to paint the hover state anyway; see
+    /// [`Interactive::force_hover`].
+    pub fn force_hover(mut self, force_hover: bool) -> Self {
+        self.base = self.base.force_hover(force_hover);
+        self
+    }
 }
 
 impl InteractiveVariantExt for Button {

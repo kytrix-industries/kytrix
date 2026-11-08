@@ -1,4 +1,5 @@
-//! The account entry the window header mounts: who is signed in, and how that changes.
+//! The account who is signed in, and how that changes, behind the menu the sidebar's foot
+//! opens.
 //!
 //! # What it owns
 //!
@@ -17,6 +18,9 @@
 //! also why nothing here calls `refresh_windows`: the event subscription is what
 //! redraws the screens that follow it.
 //!
+//! The entry that opens the menu is not here: the menu's content has a module of its own,
+//! and the window that draws the account draws the row that asks for it.
+//!
 //! # What it does not do
 //!
 //! It never retries. A failed sign-in reports itself and stops; the user asks again. A
@@ -28,7 +32,7 @@ use std::sync::Arc;
 
 use app_config::settings::{AccountConfig, AccountWalletKind};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
-use base_ui::layer::LayerExt as _;
+use base_ui::{context_menu::ContextMenu, layer::LayerExt as _};
 use futures::future::BoxFuture;
 use gpui_kit::*;
 use i18n::t;
@@ -48,15 +52,11 @@ use zeroize::Zeroizing;
 
 use crate::{
     account::{self, SignedInAccount},
-    avatar,
-    avatar_dropdown::AvatarDropDown,
-    dialogs,
+    avatar, dialogs,
+    menu::{AccountMenu, MENU_WIDTH, ProfileAction, avatar_face, profile_action},
     oauth::{self, LoginError},
     session::{LocalSession, SessionWatch},
 };
-
-/// The element id of the header entry, which is also its keyed popup state.
-const PROFILE_MENU_ID: &str = "profile-menu";
 
 /// What the account service has to do for this menu.
 ///
@@ -162,7 +162,7 @@ impl AccountService for KytrixServiceConnector {
     }
 }
 
-/// The account entry in the window header.
+/// The account entry in the sidebar footer.
 pub struct ProfileMenu {
     source: Arc<dyn AccountService>,
     /// The account in the settings, which is the one this menu is about.
@@ -241,6 +241,86 @@ impl ProfileMenu {
         };
         menu.refresh_account(cx);
         menu
+    }
+
+    /// The account's face at `size`, for the entry a caller draws for itself.
+    ///
+    /// It is the same face the menu's account block shows; the caller decides how large it
+    /// is and what sits beside it.
+    pub fn avatar(&self, size: Pixels, cx: &App) -> Div {
+        avatar_face(
+            self.avatar.as_ref(),
+            size,
+            "TEST_PROFILE_TRIGGER_AVATAR",
+            cx,
+        )
+    }
+
+    /// Opens the account menu as a context menu at `anchor`.
+    ///
+    /// The menu belongs to the window's layer rather than to the entry that opened it: the
+    /// entry sits at the foot of a sidebar, where a menu opening downward would leave the
+    /// window, so the menu's bottom-left corner sits at the anchor and it grows upward and
+    /// to the right. The layer owns it, and the floating sidebar can ask the layer whether
+    /// it is up.
+    ///
+    /// `id` keys the entries and the account block; the docked rail and the full panel it
+    /// floats can be drawn in the same frame, so each form needs its own.
+    pub fn show_context_menu(
+        &self,
+        id: impl Into<ElementId>,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = id.into();
+        let label = t!(cx, "window.account.menu");
+        let profile = cx.entity().downgrade();
+
+        let entries = {
+            let profile = profile.clone();
+            let id = id.clone();
+            move |_: &mut Window, cx: &mut App| {
+                let (account, avatar, plan) = profile
+                    .read_with(cx, |profile, _| {
+                        (
+                            profile.account.clone(),
+                            profile.avatar.clone(),
+                            profile.plan,
+                        )
+                    })
+                    .unwrap_or((None, None, None));
+
+                AccountMenu::new(account.as_ref().map(SignedInAccount::from), avatar, plan)
+                    .entries(&id, cx)
+            }
+        };
+
+        let on_item_click =
+            move |_: &ClickEvent, item_id: SharedString, window: &mut Window, cx: &mut App| {
+                let _ = profile.update(cx, |profile, cx| {
+                    profile.activate(item_id.as_ref(), window, cx);
+                });
+            };
+
+        window.context_menu(
+            cx,
+            ContextMenu::new(id, anchor, px(MENU_WIDTH), entries)
+                .anchor(Anchor::BottomLeft)
+                .aria_label(label)
+                .debug_selector("TEST_PROFILE_MENU")
+                .on_item_click(on_item_click),
+        );
+    }
+
+    /// Runs the action an entry of the account menu stands for.
+    fn activate(&mut self, item_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match profile_action(item_id) {
+            Some(ProfileAction::SignIn) => self.start_sign_in(window, cx),
+            Some(ProfileAction::OpenAccount) => self.open_account(window, cx),
+            Some(ProfileAction::SignOut) => self.confirm_sign_out(window, cx),
+            None => {}
+        }
     }
 
     /// Re-reads the account from the settings and follows what changed about it.
@@ -624,25 +704,10 @@ impl Drop for ProfileMenu {
 }
 
 impl Render for ProfileMenu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let menu = cx.entity().downgrade();
-        let sign_in = menu.clone();
-        let open_account = menu.clone();
-        let sign_out = menu;
-
-        AvatarDropDown::new(PROFILE_MENU_ID, t!(cx, "window.account.menu"))
-            .account(self.account.as_ref().map(SignedInAccount::from))
-            .avatar(self.avatar.clone())
-            .plan(self.plan)
-            .on_sign_in(move |window, cx| {
-                let _ = sign_in.update(cx, |menu, cx| menu.start_sign_in(window, cx));
-            })
-            .on_open_account(move |window, cx| {
-                let _ = open_account.update(cx, |menu, cx| menu.open_account(window, cx));
-            })
-            .on_sign_out(move |window, cx| {
-                let _ = sign_out.update(cx, |menu, cx| menu.confirm_sign_out(window, cx));
-            })
+    /// The account menu is a window-level context menu opened by the entry that draws the
+    /// account, so this view is the state behind it and is never mounted as an element.
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty.into_any_element()
     }
 }
 
@@ -663,12 +728,14 @@ mod tests {
 
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use app_config_provider::manager::ConfigManager;
-    use base_ui::{animation::ANIMATION_TICK, layer::Layer};
+    use base_ui::{
+        animation::ANIMATION_TICK, button::Button, layer::Layer, size::UnifiedSizable as _,
+    };
     use futures::future::BoxFuture;
     use gpui_kit::{
-        AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, Modifiers,
-        ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div,
-        px, size,
+        AppContext as _, BorrowAppContext as _, Context, Entity, InteractiveElement, IntoElement,
+        Modifiers, ParentElement as _, Render, StatefulInteractiveElement, Styled as _,
+        TestAppContext, VisualTestContext, Window, div, point, px, size,
     };
     use kytrix_service_provider::auth::{
         dpop::DpopKey,
@@ -682,7 +749,7 @@ mod tests {
     use super::{ACCOUNT_ORIGIN, AccountService, LoginError, ProfileMenu};
     use crate::{
         account::shortened_wallet_address,
-        avatar_dropdown::{ProfileAction, profile_action},
+        menu::{MENU_WIDTH, ProfileAction, profile_action},
         session::LocalSession,
     };
 
@@ -897,28 +964,44 @@ mod tests {
         config
     }
 
-    /// The menu as the header mounts it, over an in-memory settings snapshot.
+    /// The menu as the account entry mounts it, over an in-memory settings snapshot.
     struct Harness<'a> {
         menu: Entity<ProfileMenu>,
         source: FakeAccountService,
         cx: &'a mut VisualTestContext,
     }
 
+    /// The window a test mounts the account entry in: a button that opens the menu, over the
+    /// layer every alert is opened on.
     struct MenuRoot {
         menu: Entity<ProfileMenu>,
     }
 
     impl Render for MenuRoot {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            // The menu is mounted the way the header mounts it: a flex row that sizes the
-            // trigger to its own button and puts it at the end of the row. A trigger left
-            // to stretch across the window would take a press anywhere along it.
+            let menu = self.menu.clone();
+
             div()
                 .size_full()
                 .flex()
                 .items_center()
-                .justify_end()
-                .child(self.menu.clone())
+                .justify_center()
+                .child(
+                    Button::new("test-profile-trigger")
+                        .small()
+                        .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
+                        .child("account")
+                        .on_click(move |_, window, cx| {
+                            menu.update(cx, |menu, cx| {
+                                menu.show_context_menu(
+                                    "test-profile-context",
+                                    point(px(200.0), px(200.0)),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
         }
     }
 
@@ -957,7 +1040,7 @@ mod tests {
         )
     }
 
-    /// Opens the menu by clicking the avatar and repaints.
+    /// Opens the menu by pressing the entry and repaints.
     fn open_menu(harness: &mut Harness) {
         let trigger = harness
             .cx
@@ -1080,19 +1163,72 @@ mod tests {
         assert!(!shows(&mut harness, "TEST_MENU_ITEM_open-account"));
     }
 
+    /// The menu is the account's: the face with the wallet family's mark on it, the tier, the
+    /// address and the entries, at the one width the block is centred on. Its tooltip opens
+    /// over the menu rather than under it, and choosing an entry takes the menu down before
+    /// the entry's own surface opens.
     #[gpui_kit::test]
-    fn a_signed_in_menu_should_show_the_account_and_its_tier(cx: &mut TestAppContext) {
+    fn the_menu_should_show_the_signed_in_account(cx: &mut TestAppContext) {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
         open_menu(&mut harness);
 
+        assert_eq!(
+            harness
+                .cx
+                .debug_bounds("TEST_PROFILE_MENU")
+                .expect("the menu should be drawn")
+                .size
+                .width,
+            px(MENU_WIDTH),
+            "the menu is one width whether or not there is an account in it"
+        );
         assert!(shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
         assert!(shows(&mut harness, "TEST_PROFILE_ADDRESS"));
         assert!(shows(&mut harness, "TEST_PROFILE_BRAND"));
         assert!(shows(&mut harness, "TEST_PROFILE_PLAN_PLUS"));
         assert!(shows(&mut harness, "TEST_MENU_ITEM_open-account"));
         assert!(shows(&mut harness, "TEST_MENU_ITEM_sign-out"));
+
+        // The address's tooltip is an overlay inside the menu. It has to open without the
+        // context menu going away, which is what the tooltip's priority is for.
+        let address = harness
+            .cx
+            .debug_bounds("TEST_PROFILE_ADDRESS")
+            .expect("the context menu draws the account address")
+            .center();
+        harness
+            .cx
+            .simulate_mouse_move(address, None, Modifiers::none());
+        harness.cx.run_until_parked();
+        settle(&mut harness);
+        assert!(
+            shows(&mut harness, "TEST_PROFILE_ADDRESS_TOOLTIP"),
+            "the address tooltip opens inside the context menu"
+        );
+        assert!(
+            shows(&mut harness, "TEST_PROFILE_MENU"),
+            "the menu stays up while the pointer reads its tooltip"
+        );
+
+        let sign_out = harness
+            .cx
+            .debug_bounds("TEST_MENU_ITEM_sign-out")
+            .expect("the context menu draws the sign-out entry")
+            .center();
+        harness.cx.simulate_click(sign_out, Modifiers::none());
+        harness.cx.run_until_parked();
+        settle(&mut harness);
+
+        assert!(
+            !shows(&mut harness, "TEST_PROFILE_MENU"),
+            "choosing an entry closes the context menu"
+        );
+        assert!(
+            shows(&mut harness, "BASE_UI_ALERT"),
+            "the context menu's sign-out entry asks for confirmation"
+        );
     }
 
     fn open_account_entry(harness: &mut Harness) {
@@ -1218,40 +1354,6 @@ mod tests {
         assert!(
             copy.right() <= panel.right(),
             "the copy button may not leave the menu"
-        );
-    }
-
-    /// The badge belongs to the face the menu draws and not to the trigger: the header
-    /// holds the same avatar, and a mark on it there would be a claim about a menu nobody
-    /// has opened.
-    #[gpui_kit::test]
-    fn the_wallet_badge_should_belong_to_the_menu_rather_than_to_the_trigger(
-        cx: &mut TestAppContext,
-    ) {
-        let mut harness = signed_in_harness(cx);
-        harness.cx.update(|window, _| window.refresh());
-        harness.cx.run_until_parked();
-
-        assert!(shows(&mut harness, "TEST_PROFILE_TRIGGER_AVATAR"));
-        assert!(
-            !shows(&mut harness, "TEST_PROFILE_BRAND"),
-            "the trigger of a closed menu carries no badge"
-        );
-
-        open_menu(&mut harness);
-
-        let trigger = harness
-            .cx
-            .debug_bounds("TEST_PROFILE_TRIGGER_AVATAR")
-            .expect("the trigger keeps the avatar it had");
-        let badge = harness
-            .cx
-            .debug_bounds("TEST_PROFILE_BRAND")
-            .expect("the face in the menu carries the wallet family's mark");
-
-        assert!(
-            badge.top() > trigger.bottom(),
-            "the badge is drawn on the face in the menu, not on the trigger"
         );
     }
 
@@ -1698,7 +1800,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_stored_avatar_should_be_decoded_for_the_trigger(cx: &mut TestAppContext) {
+    fn a_stored_avatar_should_be_decoded_for_the_entry(cx: &mut TestAppContext) {
         let mut config = configured(ethereum_account());
         config.avatar =
             Some(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#.to_owned());

@@ -33,7 +33,7 @@ const PERSIST_SETTLE_DELAY: Duration = Duration::from_millis(400);
 const FIRST_STAGE_ID: u64 = 1;
 
 pub(crate) struct Workspaces {
-    /// In the order the switcher lists them; the active one is the only entry
+    /// In the order the sidebar lists them; the active one is the only entry
     /// with a runtime stage.
     entries: Vec<WorkspaceConfig>,
     active: usize,
@@ -92,7 +92,7 @@ impl Workspaces {
         workspaces
     }
 
-    /// The workspaces the switcher lists, in order.
+    /// The workspaces the sidebar lists, in order.
     pub(crate) fn names(&self) -> impl Iterator<Item = &SmolStr> {
         self.entries.iter().map(|entry| &entry.name)
     }
@@ -101,7 +101,7 @@ impl Workspaces {
         &self.entries[self.active].name
     }
 
-    /// Whether the active workspace may be deleted.
+    /// Whether a workspace may be deleted.
     ///
     /// The last one cannot: the application always shows exactly one workspace,
     /// so an empty list is not a state it has.
@@ -177,40 +177,67 @@ impl Workspaces {
         Ok(())
     }
 
-    /// Renames the active workspace.
+    /// Renames the workspace called `name`.
     ///
-    /// The name is the workspace's identity, so renaming it also moves the
-    /// active marker: nothing else in the settings refers to a workspace by name.
-    pub(crate) fn rename(
+    /// The name is the workspace's identity, so renaming the active one also
+    /// moves the active marker. Renaming another one leaves the active
+    /// workspace, the stage mirroring it, and the marker alone.
+    ///
+    /// A name that is not a workspace's is a no-op, like selecting one: the
+    /// caller reads it from the same list, so an unknown name can only be stale.
+    pub(crate) fn rename_entry(
         &mut self,
         name: &str,
+        new_name: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), WorkspaceNameError> {
-        let current = self.active_name().clone();
-        let name = self.validate_name(name, Some(current.as_str()))?;
-        if name == current {
+        let Some(index) = self.entries.iter().position(|entry| entry.name == name) else {
+            log::error!("workspace `{name}` does not exist");
+
+            return Ok(());
+        };
+        // The renamed workspace may keep its own name, so it is the one name the
+        // new name does not have to differ from.
+        let new_name = self.validate_name(new_name, Some(self.entries[index].name.as_str()))?;
+        if new_name == self.entries[index].name {
             return Ok(());
         }
 
-        self.entries[self.active].name = name;
+        self.entries[index].name = new_name;
         self.persist(cx);
         cx.notify();
 
         Ok(())
     }
 
-    /// Deletes the active workspace and activates the one before it.
-    pub(crate) fn delete_active(&mut self, cx: &mut Context<Self>) {
+    /// Deletes the workspace called `name`.
+    ///
+    /// The last workspace cannot be deleted, because the application always shows
+    /// exactly one. Deleting the active workspace activates the one before it and
+    /// rebuilds the stage; deleting another one only shifts the active index when
+    /// the removed entry was before it, and the stage is left in place.
+    ///
+    /// A name that is not a workspace's is a no-op, like renaming one.
+    pub(crate) fn delete_entry(&mut self, name: &str, cx: &mut Context<Self>) {
         if !self.can_delete() {
             log::error!("the last workspace cannot be deleted");
 
             return;
         }
+        let Some(index) = self.entries.iter().position(|entry| entry.name == name) else {
+            log::error!("workspace `{name}` does not exist");
+
+            return;
+        };
 
         self.pending_persist = None;
-        self.entries.remove(self.active);
-        self.active = self.active.saturating_sub(1);
-        self.replace_stage(cx);
+        self.entries.remove(index);
+        if index == self.active {
+            self.active = self.active.saturating_sub(1);
+            self.replace_stage(cx);
+        } else if index < self.active {
+            self.active -= 1;
+        }
         self.persist(cx);
         cx.notify();
     }
@@ -390,6 +417,10 @@ mod tests {
 
         fn active_name(&mut self) -> SmolStr {
             self.update(|workspaces, _| workspaces.active_name().clone())
+        }
+
+        fn active_index(&mut self) -> usize {
+            self.update(|workspaces, _| workspaces.active)
         }
 
         fn stage(&mut self) -> Entity<Stage> {
@@ -697,64 +728,159 @@ mod tests {
     #[test]
     fn renaming_to_its_own_name_should_be_accepted() {
         let mut harness = Harness::start(&Config::default());
+        let before = harness.stored();
 
         harness
-            .update(|workspaces, cx| workspaces.rename("工作区 1", cx))
+            .update(|workspaces, cx| workspaces.rename_entry("工作区 1", "工作区 1", cx))
             .expect("a workspace may keep the name it has");
 
         assert_eq!(harness.active_name(), SmolStr::new_static("工作区 1"));
-        assert_eq!(
-            harness.stored().active,
-            Some(SmolStr::new_static("工作区 1"))
-        );
+        assert_eq!(harness.stored(), before, "keeping the name writes nothing");
     }
 
     #[test]
-    fn renaming_to_another_workspace_name_should_be_rejected() {
+    fn renaming_an_inactive_workspace_should_leave_the_active_one_alone() {
         let mut harness = Harness::start(&Config::default());
         harness
             .update(|workspaces, cx| workspaces.add("Research", cx))
             .expect("the name should be accepted");
+        let stage = harness.stage();
+        let pane = only_pane(&stage, &mut harness.cx);
+
+        harness
+            .update(|workspaces, cx| workspaces.rename_entry("工作区 1", "Notes", cx))
+            .expect("an inactive workspace can be renamed");
 
         assert_eq!(
-            harness.update(|workspaces, cx| workspaces.rename("工作区 1", cx)),
-            Err(WorkspaceNameError::Taken)
+            harness.names(),
+            [
+                SmolStr::new_static("Notes"),
+                SmolStr::new_static("Research")
+            ],
+            "the renamed entry keeps its place in the list"
         );
-        assert_eq!(harness.active_name(), SmolStr::new_static("Research"));
         assert_eq!(
-            harness.stored().active,
-            Some(SmolStr::new_static("Research"))
+            harness.active_name(),
+            SmolStr::new_static("Research"),
+            "renaming another workspace does not switch to it"
+        );
+        assert_eq!(
+            harness.stage(),
+            stage,
+            "the stage mirrors the active workspace, so it is not rebuilt"
+        );
+        assert_eq!(
+            only_pane(&harness.stage(), &mut harness.cx),
+            pane,
+            "the active workspace keeps the pane it was showing"
+        );
+        let stored = harness.stored();
+        assert_eq!(
+            stored
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            [
+                SmolStr::new_static("Notes"),
+                SmolStr::new_static("Research")
+            ],
+            "the renamed workspace is written out"
+        );
+        assert_eq!(
+            stored.active,
+            Some(SmolStr::new_static("Research")),
+            "the active marker still names the active workspace"
         );
     }
 
     #[test]
-    fn renaming_should_move_the_active_marker_with_the_name() {
+    fn renaming_the_active_workspace_should_move_the_active_marker() {
         let mut harness = Harness::start(&Config::default());
 
         harness
-            .update(|workspaces, cx| workspaces.rename("Renamed", cx))
+            .update(|workspaces, cx| workspaces.rename_entry("工作区 1", "Renamed", cx))
             .expect("the name should be accepted");
 
-        assert_eq!(
-            harness.stored().active,
-            Some(SmolStr::new_static("Renamed")),
-            "the name is the workspace's identity, so the marker follows it"
-        );
+        assert_eq!(harness.active_name(), SmolStr::new_static("Renamed"));
         assert_eq!(harness.names(), [SmolStr::new_static("Renamed")]);
+        assert_eq!(
+            harness.stored(),
+            WorkspacesConfig {
+                entries: vec![WorkspaceConfig {
+                    name: SmolStr::new_static("Renamed"),
+                    layout: WorkspaceLayout::single_pane(),
+                }],
+                active: Some(SmolStr::new_static("Renamed")),
+            },
+            "the settings file reads back as the renamed workspace, with the marker on it"
+        );
+    }
+
+    #[test]
+    fn renaming_to_a_taken_or_empty_name_should_change_nothing() {
+        let mut harness = Harness::start(&Config::default());
+        harness
+            .update(|workspaces, cx| workspaces.add("Second", cx))
+            .expect("the name should be accepted");
+        let before = harness.stored();
+
+        assert_eq!(
+            harness
+                .update(|workspaces, cx| { workspaces.rename_entry("工作区 1", "Second", cx) }),
+            Err(WorkspaceNameError::Taken),
+            "an inactive workspace cannot take another workspace's name"
+        );
+        assert_eq!(
+            harness.update(|workspaces, cx| { workspaces.rename_entry("Second", "   ", cx) }),
+            Err(WorkspaceNameError::Empty),
+            "the active workspace cannot take an empty name"
+        );
+        assert_eq!(harness.stored(), before, "a rejected name writes nothing");
+        assert_eq!(
+            harness.names(),
+            [
+                SmolStr::new_static("工作区 1"),
+                SmolStr::new_static("Second")
+            ]
+        );
+        assert_eq!(harness.active_name(), SmolStr::new_static("Second"));
+    }
+
+    #[test]
+    fn renaming_an_unknown_workspace_should_change_nothing() {
+        let mut harness = Harness::start(&Config::default());
+        let before = harness.stored();
+
+        assert_eq!(
+            harness.update(|workspaces, cx| { workspaces.rename_entry("Missing", "Other", cx) }),
+            Ok(()),
+            "an unknown name is a no-op rather than a panic"
+        );
+        assert_eq!(harness.stored(), before, "an unknown name writes nothing");
+        assert_eq!(harness.names(), [SmolStr::new_static("工作区 1")]);
     }
 
     #[test]
     fn deleting_the_only_workspace_should_be_refused() {
         let mut harness = Harness::start(&Config::default());
+        let stage = harness.stage();
+        let before = harness.stored();
 
-        harness.update(|workspaces, cx| workspaces.delete_active(cx));
+        harness.update(|workspaces, cx| workspaces.delete_entry("工作区 1", cx));
 
-        assert_eq!(harness.names().len(), 1);
+        assert_eq!(harness.names(), [SmolStr::new_static("工作区 1")]);
+        assert_eq!(harness.stage(), stage);
         assert_eq!(harness.pane_count(), 1);
+        assert_eq!(
+            harness.stored(),
+            before,
+            "a refused deletion writes nothing"
+        );
     }
 
     #[test]
-    fn deleting_a_workspace_should_activate_the_previous_one() {
+    fn deleting_an_inactive_workspace_should_keep_the_active_one_and_its_stage() {
         let mut harness = Harness::start(&Config::default());
         harness
             .update(|workspaces, cx| workspaces.add("Second", cx))
@@ -762,8 +888,13 @@ mod tests {
         harness
             .update(|workspaces, cx| workspaces.add("Third", cx))
             .expect("the name should be accepted");
+        harness.update(|workspaces, cx| workspaces.select("Second", cx));
+        let stage = harness.stage();
+        let pane = only_pane(&stage, &mut harness.cx);
+        split(&stage, &pane, &mut harness.cx);
+        let panes = pane_ids(&stage, &mut harness.cx);
 
-        harness.update(|workspaces, cx| workspaces.delete_active(cx));
+        harness.update(|workspaces, cx| workspaces.delete_entry("Third", cx));
 
         assert_eq!(
             harness.names(),
@@ -773,9 +904,97 @@ mod tests {
             ]
         );
         assert_eq!(harness.active_name(), SmolStr::new_static("Second"));
+        assert_eq!(
+            harness.active_index(),
+            1,
+            "the removed entry was after the active one, so the index does not move"
+        );
+        assert_eq!(
+            harness.stage(),
+            stage,
+            "the stage mirrors the active workspace, which was not deleted"
+        );
+        assert_eq!(
+            pane_ids(&harness.stage(), &mut harness.cx),
+            panes,
+            "the layout the active workspace was showing is still on screen"
+        );
+        let stored = harness.stored();
+        assert_eq!(stored.entries.len(), 2);
+        assert_eq!(stored.active, Some(SmolStr::new_static("Second")));
+    }
+
+    #[test]
+    fn deleting_a_workspace_before_the_active_one_should_shift_the_active_index() {
+        let mut harness = Harness::start(&Config::default());
+        harness
+            .update(|workspaces, cx| workspaces.add("Second", cx))
+            .expect("the name should be accepted");
+        harness
+            .update(|workspaces, cx| workspaces.add("Third", cx))
+            .expect("the name should be accepted");
+        let stage = harness.stage();
+
+        harness.update(|workspaces, cx| workspaces.delete_entry("工作区 1", cx));
+
+        assert_eq!(
+            harness.names(),
+            [SmolStr::new_static("Second"), SmolStr::new_static("Third")]
+        );
+        assert_eq!(
+            harness.active_index(),
+            1,
+            "the entries after the removed one move down, so the index follows"
+        );
+        assert_eq!(
+            harness.active_name(),
+            SmolStr::new_static("Third"),
+            "the active workspace is the same one, now at another index"
+        );
+        assert_eq!(harness.stage(), stage, "the active stage is not rebuilt");
+        assert_eq!(harness.stored().active, Some(SmolStr::new_static("Third")));
+    }
+
+    #[test]
+    fn deleting_the_active_workspace_should_activate_the_previous_one() {
+        let mut harness = Harness::start(&Config::default());
+        harness
+            .update(|workspaces, cx| workspaces.add("Second", cx))
+            .expect("the name should be accepted");
+        harness
+            .update(|workspaces, cx| workspaces.add("Third", cx))
+            .expect("the name should be accepted");
+        let deleted = harness.stage();
+        split(
+            &deleted,
+            &only_pane(&deleted, &mut harness.cx),
+            &mut harness.cx,
+        );
+
+        harness.update(|workspaces, cx| workspaces.delete_entry("Third", cx));
+
+        assert_eq!(
+            harness.names(),
+            [
+                SmolStr::new_static("工作区 1"),
+                SmolStr::new_static("Second")
+            ]
+        );
+        assert_eq!(harness.active_name(), SmolStr::new_static("Second"));
+        assert_eq!(harness.active_index(), 1);
+        assert_ne!(
+            harness.stage(),
+            deleted,
+            "the deleted workspace's stage is replaced by one built for the previous workspace"
+        );
+        assert_eq!(
+            harness.pane_count(),
+            1,
+            "Second is restored from its own single-pane layout, not the deleted split"
+        );
         assert_eq!(harness.stored().active, Some(SmolStr::new_static("Second")));
 
-        harness.update(|workspaces, cx| workspaces.delete_active(cx));
+        harness.update(|workspaces, cx| workspaces.delete_entry("Second", cx));
 
         assert_eq!(
             harness.active_name(),
@@ -792,13 +1011,36 @@ mod tests {
             .expect("the name should be accepted");
         let doomed = harness.stage().downgrade();
 
-        harness.update(|workspaces, cx| workspaces.delete_active(cx));
+        harness.update(|workspaces, cx| workspaces.delete_entry("Second", cx));
         harness.cx.run_until_parked();
 
         assert!(
             doomed.upgrade().is_none(),
             "the deleted workspace's stage, its panes and its widgets are released"
         );
+    }
+
+    #[test]
+    fn deleting_an_unknown_workspace_should_change_nothing() {
+        let mut harness = Harness::start(&Config::default());
+        harness
+            .update(|workspaces, cx| workspaces.add("Second", cx))
+            .expect("the name should be accepted");
+        let stage = harness.stage();
+        let before = harness.stored();
+
+        harness.update(|workspaces, cx| workspaces.delete_entry("Missing", cx));
+
+        assert_eq!(
+            harness.names(),
+            [
+                SmolStr::new_static("工作区 1"),
+                SmolStr::new_static("Second")
+            ]
+        );
+        assert_eq!(harness.active_name(), SmolStr::new_static("Second"));
+        assert_eq!(harness.stage(), stage);
+        assert_eq!(harness.stored(), before, "an unknown name writes nothing");
     }
 
     #[test]

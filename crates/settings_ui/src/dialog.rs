@@ -380,7 +380,8 @@ impl SettingsDialog {
     ///
     /// What is written is the changes replayed onto the settings as they are now rather than
     /// the draft as it was built: work that wrote the settings while this dialog was open —
-    /// a generated avatar, a persisted workspace layout — is not this dialog's to undo.
+    /// a generated avatar, a persisted workspace layout, a saved sidebar state — is not this
+    /// dialog's to undo.
     ///
     /// A commit that cannot be stored leaves the dialog exactly as it was, draft included, so
     /// the user can try again rather than lose what they configured.
@@ -988,6 +989,7 @@ mod tests {
         },
         network::{ProxyAuthorizationConfig, ProxyConfig},
         settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
+        ui::SidebarMode,
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
     use app_config_provider::{
@@ -1472,7 +1474,8 @@ mod tests {
     }
 
     /// What the rest of the application writes while the settings are open: an avatar the
-    /// background generated, an account it signed in, a layout it persisted.
+    /// background generated, an account it signed in, a layout it persisted, a sidebar state
+    /// the main window saved.
     ///
     /// Every one of them goes through `update`, which is the path those subsystems own; the
     /// dialog must neither know about them nor undo them.
@@ -1494,6 +1497,7 @@ mod tests {
                             }],
                             active: Some(SmolStr::new_static("written-while-open")),
                         };
+                        config.ui.sidebar = SidebarMode::IconOnly;
                     },
                     cx,
                 );
@@ -1889,6 +1893,40 @@ mod tests {
             published.workspaces.active.as_deref(),
             Some("written-while-open"),
             "a commit must not roll back a workspace layout persisted while it was open"
+        );
+    }
+
+    /// The sidebar state is stored beside the settings the dialog owns rather than in the
+    /// draft, so a commit made while the state moved has to write the state of that moment:
+    /// replaying the snapshot the session was opened with would put the sidebar back where
+    /// it was when the dialog opened.
+    #[gpui_kit::test]
+    fn a_commit_should_keep_a_sidebar_state_written_while_the_dialog_was_open(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, cx) = settings(configured_settings(), cx);
+        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
+
+        write_while_open(cx);
+        settle(cx);
+
+        assert_eq!(
+            drafted(&panel, cx).ui.sidebar,
+            SidebarMode::Full,
+            "the session should still hold the sidebar state it was opened with"
+        );
+
+        click(cx, "SETTINGS_CONFIRM");
+
+        assert_eq!(
+            stored(cx).ui.sidebar,
+            SidebarMode::IconOnly,
+            "a commit must not roll back the sidebar state written while it was open"
+        );
+        assert_eq!(
+            stored(cx).appearance,
+            Appearance::Dark,
+            "the change the user confirmed should be the one that is stored"
         );
     }
 

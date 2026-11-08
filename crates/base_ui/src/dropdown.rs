@@ -66,6 +66,7 @@ impl Dropdown {
         self
     }
 
+    /// Keeps the menu's open state in `open_state` rather than in the window's keyed state.
     pub fn open_state(mut self, open_state: &Entity<bool>) -> Self {
         self.open_state = Some(open_state.clone());
         self

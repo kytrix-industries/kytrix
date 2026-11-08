@@ -50,6 +50,8 @@ pub struct Interactive {
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
+    /// Whether the control is painted as hovered regardless of the pointer.
+    force_hover: bool,
     tooltip: Option<AnyElement>,
 }
 
@@ -67,8 +69,19 @@ impl Interactive {
             style: StyleRefinement::default(),
             disabled: false,
             selected: false,
+            force_hover: false,
             tooltip: None,
         }
+    }
+
+    /// Paints the control as hovered even when the pointer is elsewhere.
+    ///
+    /// A popup owned by the window layer covers the control that opened it, so the
+    /// control's own hover listener reports the pointer leaving. The caller that keeps the
+    /// popup up asks for the hover paint to stay for as long as it is open.
+    pub fn force_hover(mut self, force_hover: bool) -> Self {
+        self.force_hover = force_hover;
+        self
     }
 }
 
@@ -157,11 +170,12 @@ impl RenderOnce for Interactive {
             style,
             disabled,
             selected,
+            force_hover,
             tooltip,
         } = self;
 
         let hover_state = window.use_keyed_state((id.clone(), "hover"), cx, |_, _| false);
-        let hovered = *hover_state.read(cx);
+        let hovered = force_hover || *hover_state.read(cx);
 
         let active_state = window.use_keyed_state((id.clone(), "active"), cx, |_, _| false);
         let active = *active_state.read(cx) || selected;

@@ -1133,10 +1133,13 @@ window:
     split_keep_right: Split then keep on the right
     split_keep_top: Split then keep on the top
     widget_menu: Widget
-  tabs:
-    market: Market
-    portfolio: Portfolio
-    quant: Quant
+  sidebar:
+    delete: Delete
+    menu: Workspace menu
+    rename: Rename
+    settings: Settings
+    toggle: Toggle sidebar
+    user: User
   updater:
     available: Update available
     download: Update
@@ -1153,17 +1156,13 @@ window:
     add_message: <p align="center">Name the new workspace.</p>
     add_title: Add Workspace
     default_name: Workspace %{index}
-    delete: Delete Current Workspace
     delete_message: '<p align="center">Delete the workspace "%{name}"? Its pane layout is deleted with it.</p>'
     delete_title: Delete Workspace
-    empty: No Other Workspace
     name_exists: <p align="center">Another workspace already uses this name</p>
     name_placeholder: Workspace name
     name_required: <p align="center">Enter a workspace name</p>
-    rename: Rename Current Workspace
     rename_message: '<p align="center">Enter the new name of "%{name}".</p>'
     rename_title: Rename Workspace
-    select: Workspace
 settings_ui:
   about:
     title: About

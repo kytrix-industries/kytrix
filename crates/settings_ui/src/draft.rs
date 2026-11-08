@@ -5,8 +5,9 @@
 //!
 //! The edits are kept rather than only their result, because the settings are not the draft's
 //! to own: background work writes them while the dialog is open — an avatar is generated, a
-//! workspace layout is persisted — and confirming must not undo it. Replaying the edits onto
-//! the settings of that moment keeps every field the user did not touch at its latest value.
+//! workspace layout is persisted, a sidebar state is saved — and confirming must not undo it.
+//! Replaying the edits onto the settings of that moment keeps every field the user did not
+//! touch at its latest value.
 
 use std::{path::PathBuf, sync::Arc};
 

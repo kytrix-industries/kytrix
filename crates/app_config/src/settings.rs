@@ -18,6 +18,7 @@ use crate::{
     network::{Config as NetworkConfig, NetworkRouteGeneration, NetworkRuntimeGenerations},
     time_zone::DataTimeZone,
     translation::TranslationConfig,
+    ui::UiConfig,
     workspace::WorkspacesConfig,
 };
 
@@ -78,6 +79,10 @@ pub struct Config {
     /// Application display language.
     #[serde(default)]
     pub language: Language,
+    /// Preferences about the interface itself. A file without this section draws the
+    /// interface the way a fresh installation does.
+    #[serde(default)]
+    pub ui: UiConfig,
     /// The time zone every data timestamp is displayed in.
     #[serde(default)]
     pub data_time_zone: DataTimeZone,
@@ -122,6 +127,7 @@ impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
         self.appearance == other.appearance
             && self.language == other.language
+            && self.ui == other.ui
             && self.data_time_zone == other.data_time_zone
             && self.account == other.account
             && self.avatar == other.avatar
@@ -483,7 +489,8 @@ impl Config {
     /// settings type: the runtime generations are not settings, and the
     /// test-support `bindings` of a venue row is not settings either. The
     /// workspaces are not reported because nothing outside their single writer
-    /// reads them, and the translation directory is not reported because the
+    /// reads them, the sidebar state because the main window reads it rather than a
+    /// subscriber, and the translation directory is not reported because the
     /// translator reads it when it is called.
     ///
     /// The destructuring is exhaustive on purpose: a field added to [`Config`]
@@ -492,6 +499,9 @@ impl Config {
         let Config {
             appearance: previous_appearance,
             language: previous_language,
+            // The sidebar state is drawn by the main window and read by nothing that
+            // subscribes to a change: a UI-only write must not wake a single subscriber.
+            ui: UiConfig { .. },
             data_time_zone: previous_data_time_zone,
             account: previous_account,
             avatar: previous_avatar,
@@ -577,6 +587,7 @@ impl Default for Config {
         Self {
             appearance: Appearance::System,
             language: Language::default(),
+            ui: UiConfig::default(),
             data_time_zone: DataTimeZone::default(),
             account: None,
             avatar: None,
@@ -664,6 +675,7 @@ mod tests {
             AccountConfig, AccountWalletKind, Appearance, Config, Language, ReplaceProxyError,
         },
         time_zone::DataTimeZone,
+        ui::{SidebarMode, UiConfig},
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
 
@@ -1909,6 +1921,25 @@ mod tests {
         assert_eq!(decoded.language, Language::ZhCn);
     }
 
+    /// A file written before the sidebar state existed holds the full sidebar, which is
+    /// what a first start draws: the section is absent rather than filled with defaults.
+    #[test]
+    fn a_config_without_ui_should_decode_as_the_full_sidebar() {
+        let mut json = serde_json::to_value(configured_settings())
+            .expect("configured settings should serialize");
+        let serialized_sidebar = json["ui"]["sidebar"].clone();
+        json.as_object_mut()
+            .expect("config should serialize as an object")
+            .remove("ui");
+
+        let decoded: Config = serde_json::from_value(json)
+            .expect("a config without interface settings should decode");
+
+        assert_eq!(serialized_sidebar, json!("full"));
+        assert_eq!(decoded.ui.sidebar, SidebarMode::Full);
+        assert_eq!(decoded.ui, UiConfig::default());
+    }
+
     #[test]
     fn default_data_time_zone_should_be_utc() {
         assert_eq!(Config::default().data_time_zone, DataTimeZone::UTC);
@@ -2017,6 +2048,29 @@ mod tests {
 
         assert_ne!(with_workspace("Workspace 1"), with_workspace("Workspace 2"));
         assert_ne!(Config::default(), with_workspace("Workspace 1"));
+    }
+
+    /// The manager persists a candidate only when it differs from what it holds, so an
+    /// equality that ignored the sidebar state would silently drop the state change.
+    #[test]
+    fn config_equality_should_notice_a_sidebar_change() {
+        let hidden = Config {
+            ui: UiConfig {
+                sidebar: SidebarMode::Hidden,
+            },
+            ..Config::default()
+        };
+
+        assert_ne!(Config::default(), hidden);
+        assert_ne!(
+            hidden,
+            Config {
+                ui: UiConfig {
+                    sidebar: SidebarMode::IconOnly,
+                },
+                ..Config::default()
+            }
+        );
     }
 
     /// The manager persists a candidate only when it differs from what it holds, so
@@ -2513,15 +2567,27 @@ mod tests {
         assert_eq!(changed.changes_since(&previous), ConfigChangeSet::default());
     }
 
+    /// The sidebar state is drawn by the main window and has no subscriber of its own: a
+    /// state write is a real configuration difference that wakes nobody.
+    #[test]
+    fn a_sidebar_only_change_should_report_nothing() {
+        let previous = configured_settings();
+        let mut changed = previous.clone();
+        changed.ui.sidebar = SidebarMode::Hidden;
+
+        assert_ne!(changed, previous, "a sidebar write is a real difference");
+        assert_eq!(changed.changes_since(&previous), ConfigChangeSet::default());
+    }
+
     /// Every settings field the change set covers can reach it: a field that
     /// could not would be one the exhaustive destructuring names as ignored, and
     /// this is the runtime guard on that classification.
     ///
-    /// The two ignored fields are checked apart: a workspace write has its own
-    /// test, and the network generations are runtime identity that `PartialEq`
-    /// does not compare at all.
+    /// The ignored settings are checked apart: a workspace write and a sidebar write
+    /// have their own tests, and the network generations are runtime identity that
+    /// `PartialEq` does not compare at all.
     #[test]
-    fn every_non_workspace_difference_should_report_something() {
+    fn every_reported_settings_difference_should_report_something() {
         let previous = configured_settings();
         let with_change = |update: fn(&mut Config)| {
             let mut config = previous.clone();

@@ -2,15 +2,19 @@ use gpui_kit::{prelude::FluentBuilder, *};
 
 use crate::{
     alert::{Alert, AlertBuilder},
+    context_menu::ContextMenu,
     dialog::Dialog,
 };
 
-/// The window's dialog layer: the view at the bottom, the dialogs opened over it, and the alert
-/// over all of them.
+/// The window's layer: the view at the bottom, the dialogs opened over it, the alert over all of
+/// them, and the context menu over everything.
 ///
 /// That is what "the alert is above every dialog" means: the layer's own stacking order. A popup —
 /// a dropdown, a tooltip, an avatar menu, anything drawn by a [`crate::overlay`] panel — is painted
-/// by GPUI after the layer it was opened from, so an open popup is above the alert as well.
+/// by GPUI after the layer it was opened from, so an open popup is above the alert as well. A
+/// context menu is different: the layer owns it, so the layer is what decides where it is drawn.
+/// It is deferred with a priority above every popup and above the alert; a tooltip is the one
+/// surface above it, so a hint on an entry inside the menu is not buried under it.
 pub struct Layer {
     view: AnyView,
     /// The dialogs on this layer, oldest first, which is also the order they are drawn in: a dialog
@@ -22,6 +26,12 @@ pub struct Layer {
     dialogs: Vec<Entity<Dialog>>,
     /// The alert: at most one, on the layer above every dialog.
     alert: Option<Entity<Dialog>>,
+    /// The context menu: at most one, drawn above every dialog, the alert and every popup.
+    ///
+    /// A closed menu stays here, empty, until another menu replaces it: a menu's own press is
+    /// dispatched from an element the entity drew, and dropping the entity in the middle of that
+    /// dispatch would remove a view the frame is still drawing.
+    context_menu: Option<Entity<ContextMenu>>,
 }
 
 impl Layer {
@@ -30,14 +40,50 @@ impl Layer {
             view: view.into(),
             dialogs: Vec::new(),
             alert: None,
+            context_menu: None,
         }
+    }
+
+    /// Puts `menu` on the layer as the context menu, replacing the one that was there.
+    ///
+    /// The replaced menu is closed through its own [`ContextMenu::on_close`], so a trigger
+    /// that keeps something mounted while its menu is up is told about the replacement. The
+    /// callback runs while this layer update is in progress; it is for clearing that state,
+    /// not for opening another menu or dialog.
+    pub fn open_context_menu(&mut self, cx: &mut Context<Self>, menu: ContextMenu) {
+        if let Some(previous) = self.context_menu.take() {
+            previous.update(cx, |previous, cx| previous.dismiss(cx));
+        }
+
+        self.context_menu = Some(cx.new(|_| menu));
+        cx.notify();
+    }
+
+    /// Takes the current context menu down, if there is one.
+    pub fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.context_menu.clone() else {
+            return;
+        };
+
+        menu.update(cx, |menu, cx| menu.dismiss(cx));
+    }
+
+    /// Whether a context menu is open on this layer.
+    ///
+    /// A menu that has been closed stays on the layer until it is replaced, so this asks the
+    /// menu whether it is still open rather than whether the layer holds one.
+    pub fn has_context_menu(&self, cx: &App) -> bool {
+        self.context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.read(cx).is_open())
     }
 }
 
 impl Render for Layer {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // Children are painted in the order they are added, so this is the stacking order: the
-        // view first, then the dialogs oldest first, then the alert over all of them.
+        // view first, then the dialogs oldest first, then the alert over all of them. The context
+        // menu is the last child, and its render defers it above every popup as well.
         div()
             .relative()
             .size_full()
@@ -50,6 +96,10 @@ impl Render for Layer {
             .when_some(self.alert.as_ref(), |this, alert| {
                 this.child(div().absolute().inset_0().child(alert.clone()))
             })
+            // The context menu is deferred by its own render, with a priority above every
+            // popup and above the alert. It is still a child of the layer, so the layer's
+            // entity is what holds it and what renders it.
+            .children(self.context_menu.iter().cloned())
     }
 }
 
@@ -127,6 +177,25 @@ pub trait LayerExt {
     ///
     /// This is where the last strong reference to the [`Alert`] entity is dropped.
     fn clean_alert(&self, alert: &Entity<Dialog>, cx: &mut App);
+
+    /// Puts `menu` on the layer as the window's context menu, over every dialog, alert and
+    /// popup, and closes the menu it replaces.
+    ///
+    /// The menu is the window's, not a control's: it is drawn at the point it was built with and
+    /// stays until a press outside it, an entry, or [`LayerExt::dismiss_context_menu`] takes it
+    /// down. A window without a layer cannot show one.
+    fn context_menu(&self, cx: &mut App, menu: ContextMenu);
+
+    /// Takes the window's context menu down, if there is one. This is what an entry that opens a
+    /// dialog or an alert calls before asking for it, and what the layer itself calls when a
+    /// dialog or an alert is opened over a menu that is still up.
+    fn dismiss_context_menu(&self, cx: &mut App);
+
+    /// Whether the window has an open context menu.
+    ///
+    /// A menu that has been closed is no longer open, even when the layer still holds it until
+    /// another replaces it.
+    fn has_context_menu(&self, cx: &App) -> bool;
 }
 
 impl LayerExt for Window {
@@ -134,6 +203,10 @@ impl LayerExt for Window {
     where
         Content: Render + EventEmitter<DismissEvent>,
     {
+        // A dialog is modal, and a context menu is not a dialog: the menu goes first, so what the
+        // user opened is not drawn under a menu that still takes the mouse.
+        self.dismiss_context_menu(cx);
+
         // The typed handle the subscription below needs, and the erased one the dialog stores: the
         // subscription entry points all take a concrete `Entity<T>`, and `AnyView` can only hand
         // back an `EntityId`.
@@ -194,6 +267,10 @@ impl LayerExt for Window {
         cx: &mut App,
         builder: impl FnOnce(AlertBuilder, &mut Window, &mut Context<Alert>) -> AlertBuilder + 'static,
     ) {
+        // The alert is modal too, and it is opened over the layer's dialogs: a context menu left
+        // up would be drawn over it and would take the presses meant for its buttons.
+        self.dismiss_context_menu(cx);
+
         // The alert is built here, where a `Window` and a `Context<Alert>` are both in hand, and not
         // while the dialog draws it: building an alert makes the entities it is drawn from — the
         // field's, and the markdown state of its message — and creating an entity in the middle of a
@@ -245,6 +322,28 @@ impl LayerExt for Window {
             cx.notify();
         });
     }
+
+    fn context_menu(&self, cx: &mut App, menu: ContextMenu) {
+        let Some(Some(layer)) = self.root::<Layer>() else {
+            panic!("no layer")
+        };
+
+        layer.update(cx, |this, cx| this.open_context_menu(cx, menu));
+    }
+
+    fn dismiss_context_menu(&self, cx: &mut App) {
+        let Some(Some(layer)) = self.root::<Layer>() else {
+            return;
+        };
+
+        layer.update(cx, |this, cx| this.dismiss_context_menu(cx));
+    }
+
+    fn has_context_menu(&self, cx: &App) -> bool {
+        self.root::<Layer>()
+            .flatten()
+            .is_some_and(|layer| layer.read(cx).has_context_menu(cx))
+    }
 }
 
 #[cfg(test)]
@@ -259,14 +358,16 @@ mod tests {
         AppContext as _, Context, DismissEvent, EmptyView, Entity, EntityId, EventEmitter,
         FocusHandle, InteractiveElement as _, IntoElement, Modifiers, ParentElement as _, Render,
         StatefulInteractiveElement as _, Styled as _, TestAppContext, VisualTestContext, Window,
-        px,
+        point, px,
     };
 
     use crate::{
         animation::ANIMATION_TICK,
         button::Button,
+        context_menu::ContextMenu,
         input::{Input, InputState, InputStateBuilder},
         layer::{Layer, LayerExt as _},
+        menu::{Menu, MenuItem, MenuItemAction},
         style,
     };
 
@@ -1480,6 +1581,114 @@ mod tests {
             clicks.get(),
             1,
             "the content the test holds a handle of should be the one the dialog draws"
+        );
+    }
+
+    /// A context menu is drawn over the alert as well as over the dialogs, and its sheet
+    /// takes the press: a click on the alert's own button closes the menu instead of reaching
+    /// the button under it.
+    #[gpui_kit::test]
+    fn a_context_menu_should_stay_over_an_alert(cx: &mut TestAppContext) {
+        let cx = harness(cx);
+        let ok = Rc::new(Cell::new(0usize));
+
+        open_ok_alert(cx, ok.clone());
+        settle(cx);
+
+        let alert_ok = cx
+            .debug_bounds(ALERT_OK)
+            .expect("the alert should draw its ok button");
+
+        cx.update(|window, cx| {
+            window.context_menu(
+                cx,
+                ContextMenu::new(
+                    "layer-context-menu",
+                    point(px(2.0), px(2.0)),
+                    px(120.0),
+                    |_, _| {
+                        Menu::new("layer-context-menu-list")
+                            .item(MenuItem::Action(MenuItemAction::new("entry", "Entry")))
+                    },
+                ),
+            );
+        });
+        settle(cx);
+
+        assert!(
+            cx.update(|window, cx| window.has_context_menu(cx)),
+            "the context menu should be open over the alert"
+        );
+
+        cx.simulate_click(alert_ok.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            ok.get(),
+            0,
+            "the alert's button must not be reached through the context menu's sheet"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_context_menu(cx)),
+            "the press outside the menu should have closed it"
+        );
+        assert!(
+            cx.debug_bounds(ALERT).is_some(),
+            "closing the context menu must not close the alert under it"
+        );
+    }
+
+    /// A dialog is under the alert but over the view, so a context menu is over it too; the
+    /// dialog's own button is not reached through the menu's sheet.
+    #[gpui_kit::test]
+    fn a_context_menu_should_stay_over_a_dialog(cx: &mut TestAppContext) {
+        let cx = harness(cx);
+        let clicks = Rc::new(Cell::new(0usize));
+        let content = cx.update(|_, cx| {
+            cx.new(|_| CountingButton {
+                selector: DIALOG_A,
+                clicks: clicks.clone(),
+                wide: false,
+            })
+        });
+
+        cx.update(|window, cx| window.dialog(cx, content));
+        settle(cx);
+        let target = cx
+            .debug_bounds(DIALOG_A)
+            .expect("the dialog should draw its content");
+
+        cx.update(|window, cx| {
+            window.context_menu(
+                cx,
+                ContextMenu::new(
+                    "layer-context-menu-over-dialog",
+                    point(px(2.0), px(2.0)),
+                    px(120.0),
+                    |_, _| {
+                        Menu::new("layer-context-menu-over-dialog-list")
+                            .item(MenuItem::Action(MenuItemAction::new("entry", "Entry")))
+                    },
+                ),
+            );
+        });
+        settle(cx);
+
+        cx.simulate_click(target.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicks.get(),
+            0,
+            "the dialog's button must not be reached through the context menu's sheet"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_context_menu(cx)),
+            "the press outside the menu should have closed it"
+        );
+        assert!(
+            cx.debug_bounds(DIALOG_A).is_some(),
+            "closing the context menu must not close the dialog under it"
         );
     }
 }

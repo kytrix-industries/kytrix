@@ -1,5 +1,5 @@
-//! The market participants entry in the window header: the venue list this build speaks, and the
-//! one action that loads each of them.
+//! The market participants entry the market page's toolbar mounts: the venue list this build
+//! speaks, and the one action that loads each of them.
 //!
 //! # What it owns
 //!
@@ -54,7 +54,7 @@ use tokio::task::JoinError;
 use widget::{error::LocalizedError, venue::VenueDisplay};
 use widget_tokio_runtime::global;
 
-/// The element id of the header entry: the trigger, its panel and the state behind them.
+/// The element id of the toolbar entry: the trigger, its panel and the state behind them.
 const MENU_ID: &str = "market-participants-menu";
 
 /// The sibling scopes every row is built under: they are told apart by the index the venue has
@@ -253,7 +253,7 @@ impl LocalizedError for LoadFailure {
     }
 }
 
-/// The market participants entry the window header mounts.
+/// The market participants entry the market page's toolbar mounts.
 pub struct MarketParticipants {
     connector: MarketParticipantsConnector,
     /// The rows the panel draws, rebuilt from the static venue list and the loaded venues.
@@ -594,9 +594,6 @@ impl Render for MarketParticipants {
         let mut dropdown = Dropdown::new(MENU_ID)
             .outline()
             .medium()
-            // The header row is the window's drag area, so a control in it takes the pointer
-            // explicitly or a press on it would move the window instead.
-            .occlude()
             .aria_label(label.clone())
             .debug_selector(|| "TEST_MARKET_PARTICIPANTS_TRIGGER".into())
             .open_state(&self.open_state)
@@ -1136,15 +1133,15 @@ mod tests {
         })
     }
 
-    /// The window a test drives: the header row with the menu at the end of it, over the
+    /// The window a test drives: the toolbar row with the menu at the end of it, over the
     /// layer every alert is opened on.
-    struct Header {
+    struct Toolbar {
         menu: Entity<MarketParticipants>,
     }
 
-    impl Render for Header {
+    impl Render for Toolbar {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            // The menu is mounted the way the header mounts it: a row that sizes the trigger
+            // The menu is mounted the way the toolbar mounts it: a row that sizes the trigger
             // to its own button and puts it at the end of the row.
             div()
                 .size_full()
@@ -1195,7 +1192,7 @@ mod tests {
         let menu = cx.update(|cx| cx.new(MarketParticipants::new));
         let rendered = menu.clone();
         let (_, cx) =
-            cx.add_window_view(move |_, cx| Layer::new(cx.new(|_| Header { menu: rendered })));
+            cx.add_window_view(move |_, cx| Layer::new(cx.new(|_| Toolbar { menu: rendered })));
         cx.simulate_resize(size(px(1280.0), px(960.0)));
         cx.run_until_parked();
 

@@ -2,8 +2,9 @@
 //!
 //! [`settings::Config`] is the persisted application snapshot. This crate owns
 //! the [`network`] proxy and outbound-route model, the [`market_participants`] credential
-//! settings, the [`translation`] model directory, the [`widget`] config envelope, and the
-//! [`workspace`] pane layouts, so every consumer reads one configuration vocabulary.
+//! settings, the [`translation`] model directory, the [`ui`] interface preferences, the
+//! [`widget`] config envelope, and the [`workspace`] pane layouts, so every consumer reads one
+//! configuration vocabulary.
 //!
 //! Loading, atomic persistence, the settings manager and its per-domain events live
 //! in `app_config_provider`, which also installs the manager in GPUI global state.
@@ -17,5 +18,6 @@ pub mod network;
 pub mod settings;
 pub mod time_zone;
 pub mod translation;
+pub mod ui;
 pub mod widget;
 pub mod workspace;

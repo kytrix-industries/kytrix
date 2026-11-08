@@ -10,14 +10,11 @@ use gpui_kit::{
     div,
     prelude::FluentBuilder,
 };
-use settings_ui::entry::show_settings;
 
-#[derive(Clone)]
 enum WindowSystemButtonKind {
     Minimize,
     Maximize,
     Close,
-    Settings,
 }
 
 #[derive(IntoElement)]
@@ -45,13 +42,6 @@ impl WindowSystemButton {
         Self {
             id: "window-close".into(),
             kind: WindowSystemButtonKind::Close,
-        }
-    }
-
-    pub(crate) fn settings() -> Self {
-        Self {
-            id: "window-settings".into(),
-            kind: WindowSystemButtonKind::Settings,
         }
     }
 }
@@ -105,7 +95,6 @@ impl RenderOnce for WindowSystemButton {
                         }
                     }
                     WindowSystemButtonKind::Close => IconKind::XBold,
-                    WindowSystemButtonKind::Settings => IconKind::GearSix,
                 })
                 .size_3p5()
                 .text_color(fg.hsla),
@@ -118,9 +107,6 @@ impl RenderOnce for WindowSystemButton {
             })
             .when(matches!(kind, WindowSystemButtonKind::Close), |this| {
                 this.window_control_area(WindowControlArea::Close)
-            })
-            .when(matches!(kind, WindowSystemButtonKind::Settings), |this| {
-                this.on_click(move |_event, window, cx| show_settings(window, cx))
             })
             .on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
             .on_mouse_down(MouseButton::Left, {

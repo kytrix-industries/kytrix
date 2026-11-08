@@ -108,7 +108,7 @@ pub struct WorkspaceWidget {
 /// Every workspace of this installation, and the active one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct WorkspacesConfig {
-    /// In the order the workspace switcher lists them.
+    /// In the order the workspace sidebar lists them.
     pub entries: Vec<WorkspaceConfig>,
     /// The active workspace's name; `None` exactly when `entries` is empty.
     pub active: Option<SmolStr>,

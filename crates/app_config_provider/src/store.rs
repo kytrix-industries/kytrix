@@ -288,7 +288,7 @@ impl ConfigStore {
     /// Mutates a cloned candidate and publishes it, persisting it afterwards.
     ///
     /// Subsystems that own a part of the settings (the account, the avatar, the
-    /// workspaces) change a value nobody can be asked to submit again, so the
+    /// workspaces, the sidebar state) change a value nobody can be asked to submit again, so the
     /// candidate is published first and a persistence failure is only logged. A
     /// change a user submits and can submit again belongs in [`Self::write`],
     /// which reports the failure instead of dropping it.

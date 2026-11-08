@@ -652,10 +652,30 @@ impl KytrixServiceConnector {
         ))
     }
 
+    /// Installs the connector over the signed-out in-memory test session.
+    ///
+    /// `AuthSession::for_test_signed_out` builds a session whose credential store is empty
+    /// and in memory and whose authority is a fake, so installing it touches no keyring
+    /// entry, performs no startup refresh, and sends no account request. The connector
+    /// then serves the signed-out status a UI test reads.
+    #[cfg(feature = "test-support")]
+    pub fn install_for_test(
+        cx: &mut App,
+        runtime: &Runtime,
+        config: ConfigNotification<Config>,
+        transport: Arc<TransportHub>,
+    ) -> Result<Self, AuthError> {
+        let auth = AuthSession::for_test_signed_out()?;
+        Ok(Self::install_with_auth(
+            cx, runtime, config, transport, auth,
+        ))
+    }
+
     /// Completes installation over a caller-supplied auth session.
     ///
     /// Exists so a test can install the connector without starting the real auth
-    /// session; the only production caller is [`Self::install`].
+    /// session; the production caller is [`Self::install`], and the test construction
+    /// is `install_for_test`.
     pub(crate) fn install_with_auth(
         cx: &mut App,
         runtime: &Runtime,

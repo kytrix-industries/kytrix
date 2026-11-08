@@ -1,38 +1,62 @@
+//! The fake auth fixtures this crate's tests share: an in-memory credential store and
+//! authorities that answer every request themselves, without a network.
+//!
+//! The module is also compiled with the `test-support` feature, because the signed-out
+//! session the connector's `install_for_test` builds is constructed from the store and
+//! authority here. Only those two and the `cfg`-gated `AuthSession` constructors in
+//! `auth::session` are needed outside `cfg(test)`; every other fixture below stays
+//! test-only.
+
+#[cfg(test)]
+use std::sync::Arc;
 pub(crate) use std::sync::atomic::Ordering;
+use std::sync::{Mutex, atomic::AtomicBool};
+#[cfg(test)]
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicUsize},
-    },
+    sync::{Condvar, atomic::AtomicUsize},
 };
 
+#[cfg(test)]
 pub(crate) use app_config::network::{Config, ProxyRoute};
+#[cfg(test)]
 pub(crate) use app_config_provider::notification::ConfigNotification;
+#[cfg(test)]
 pub(crate) use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 pub(crate) use bytes::Bytes;
 pub(crate) use futures::future::BoxFuture;
+#[cfg(test)]
 pub(crate) use network::transport::hub::{TransportHub, TransportPolicy};
+#[cfg(test)]
 pub(crate) use p256::{ecdsa::SigningKey, elliptic_curve::Generate};
+#[cfg(test)]
 pub(crate) use sha2::{Digest, Sha256};
+#[cfg(test)]
+pub(crate) use tokio::sync::watch;
+#[cfg(test)]
 pub(crate) use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
-    sync::{Notify, mpsc, watch},
+    sync::{Notify, mpsc},
     task::JoinHandle,
     time::{Duration, timeout},
 };
+#[cfg(test)]
 pub(crate) use tokio_util::sync::CancellationToken;
+#[cfg(test)]
 pub(crate) use url::Url;
+#[cfg(test)]
 use widget_tokio_runtime::runtime::Runtime;
 
 use super::*;
+#[cfg(test)]
 pub(crate) use crate::auth::session::AuthSession;
 
 /// The transport policy every test session shares.
 ///
 /// Production callers construct their own policy; tests reach the loopback
 /// `/oauth` and `/rpc` fixtures over `http://` and `ws://`.
+#[cfg(test)]
 pub(crate) fn test_transport_policy() -> TransportPolicy {
     TransportPolicy {
         allow_plaintext: true,
@@ -41,6 +65,7 @@ pub(crate) fn test_transport_policy() -> TransportPolicy {
 }
 
 /// Builds the plaintext-tolerant transport that policy backs.
+#[cfg(test)]
 pub(crate) fn test_transport() -> Arc<TransportHub> {
     Arc::new(TransportHub::new(test_transport_policy()))
 }
@@ -80,46 +105,7 @@ impl CredentialStore for InMemoryCredentialStore {
     }
 }
 
-impl AuthSession {
-    pub(super) fn spawn_with_control(
-        store: Arc<dyn CredentialStore>,
-        control: Arc<SessionControl>,
-        authority: Arc<dyn AuthAuthority>,
-    ) -> Result<Self, AuthError> {
-        Self::spawn_with_control_and_startup(store, control, authority, false, Runtime::for_test())
-    }
-
-    pub(crate) fn for_test(transport: Arc<TransportHub>) -> Self {
-        Self::for_test_with_revision(transport, 0, 0)
-    }
-
-    pub(crate) fn for_test_with_revision(
-        transport: Arc<TransportHub>,
-        revision: u64,
-        epoch: u64,
-    ) -> Self {
-        let _ = transport;
-        let key = DpopKey::generate().expect("test DPoP key should generate");
-        let store = Arc::new(InMemoryCredentialStore {
-            payload: Mutex::new(Some(credential_payload(
-                "11111111-1111-4111-8111-111111111111",
-                "test-refresh-token",
-                &key,
-            ))),
-            fail_next_store: AtomicBool::new(false),
-        });
-        let authority = Arc::new(ServiceTestAuthority);
-        let (changes, _) = watch::channel(SessionChange::default());
-        Self::spawn_with_control(
-            store,
-            Arc::new(SessionControl::new(revision, epoch, changes)),
-            authority,
-        )
-        .expect("the test auth actor should start")
-    }
-}
-
-struct ServiceTestAuthority;
+pub(super) struct ServiceTestAuthority;
 
 impl AuthAuthority for ServiceTestAuthority {
     fn exchange_authorization_code<'a>(
@@ -159,16 +145,21 @@ impl AuthAuthority for ServiceTestAuthority {
     }
 }
 
+#[cfg(test)]
 pub(crate) const TEST_USER_ID: &str = "11111111-1111-4111-8111-111111111111";
+#[cfg(test)]
 pub(crate) const TEST_REPLACEMENT_USER_ID: &str = "22222222-2222-4222-8222-222222222222";
+#[cfg(test)]
 pub(crate) const TEST_OTHER_USER_ID: &str = "33333333-3333-4333-8333-333333333333";
 
+#[cfg(test)]
 pub(crate) enum OAuthHttpBehavior {
     Respond { status: u16, body: String },
     DropResponse,
     Stall,
 }
 
+#[cfg(test)]
 pub(crate) struct RecordedOAuthRequest {
     pub method: String,
     pub target: String,
@@ -176,6 +167,7 @@ pub(crate) struct RecordedOAuthRequest {
     pub body: String,
 }
 
+#[cfg(test)]
 pub(crate) struct TestOAuthServer {
     pub origin: Url,
     pub requests: mpsc::Receiver<RecordedOAuthRequest>,
@@ -183,6 +175,7 @@ pub(crate) struct TestOAuthServer {
     task: JoinHandle<()>,
 }
 
+#[cfg(test)]
 impl TestOAuthServer {
     pub(crate) async fn spawn(behaviors: Vec<OAuthHttpBehavior>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -248,6 +241,7 @@ impl TestOAuthServer {
     }
 }
 
+#[cfg(test)]
 async fn read_oauth_request(stream: &mut tokio::net::TcpStream) -> Option<RecordedOAuthRequest> {
     let mut bytes = Vec::new();
     let header_end = loop {
@@ -296,6 +290,7 @@ async fn read_oauth_request(stream: &mut tokio::net::TcpStream) -> Option<Record
     })
 }
 
+#[cfg(test)]
 pub(super) fn oauth_token_body(refresh_token: &str, access_token: &str) -> String {
     serde_json::json!({
         "access_token": access_token,
@@ -311,6 +306,7 @@ pub(super) fn oauth_token_body(refresh_token: &str, access_token: &str) -> Strin
     .to_string()
 }
 
+#[cfg(test)]
 pub(super) fn oauth_authority(origin: Url, transport: Arc<TransportHub>) -> Arc<OAuthAuthority> {
     Arc::new(OAuthAuthority {
         config: ConfigNotification::new(Arc::new(Config::default())),
@@ -320,12 +316,14 @@ pub(super) fn oauth_authority(origin: Url, transport: Arc<TransportHub>) -> Arc<
     })
 }
 
+#[cfg(test)]
 pub(super) fn form_fields(body: &str) -> std::collections::BTreeMap<String, String> {
     url::form_urlencoded::parse(body.as_bytes())
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn dpop_claims(request: &RecordedOAuthRequest) -> serde_json::Value {
     let proof = request
         .headers
@@ -338,6 +336,7 @@ pub(super) fn dpop_claims(request: &RecordedOAuthRequest) -> serde_json::Value {
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
 }
 
+#[cfg(test)]
 pub(crate) struct StallingCredentialStore {
     pub payload: Mutex<Option<Bytes>>,
     stall_next: AtomicBool,
@@ -354,6 +353,7 @@ pub(crate) struct StallingCredentialStore {
     pub deletes: AtomicUsize,
 }
 
+#[cfg(test)]
 impl StallingCredentialStore {
     pub(crate) fn new(payload: Option<Bytes>) -> Self {
         Self {
@@ -433,14 +433,17 @@ impl StallingCredentialStore {
     }
 }
 
+#[cfg(test)]
 struct ActiveStoreOperation<'a>(&'a AtomicUsize);
 
+#[cfg(test)]
 impl Drop for ActiveStoreOperation<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+#[cfg(test)]
 impl CredentialStore for StallingCredentialStore {
     fn load(&self) -> Result<Bytes, AuthError> {
         let _active = self.enter(false);
@@ -495,12 +498,14 @@ impl CredentialStore for StallingCredentialStore {
     }
 }
 
+#[cfg(test)]
 pub(crate) enum FakeRefreshOutcome {
     Current,
     Rotated(String),
     Error(AuthError),
 }
 
+#[cfg(test)]
 pub(crate) struct FakeRefreshAuthority {
     outcomes: Mutex<VecDeque<FakeRefreshOutcome>>,
     plans: Mutex<VecDeque<PlanCode>>,
@@ -510,6 +515,7 @@ pub(crate) struct FakeRefreshAuthority {
     call_count: AtomicUsize,
 }
 
+#[cfg(test)]
 impl FakeRefreshAuthority {
     pub(crate) fn new() -> Self {
         Self {
@@ -565,6 +571,7 @@ impl FakeRefreshAuthority {
     }
 }
 
+#[cfg(test)]
 impl AuthAuthority for FakeRefreshAuthority {
     fn exchange_authorization_code<'a>(
         &'a self,
@@ -639,11 +646,13 @@ impl AuthAuthority for FakeRefreshAuthority {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct StallingRefreshAuthority {
     pub started: Notify,
     pub future_dropped: AtomicBool,
 }
 
+#[cfg(test)]
 impl StallingRefreshAuthority {
     pub(crate) fn new() -> Self {
         Self {
@@ -653,14 +662,17 @@ impl StallingRefreshAuthority {
     }
 }
 
+#[cfg(test)]
 struct FutureDropGuard<'a>(&'a AtomicBool);
 
+#[cfg(test)]
 impl Drop for FutureDropGuard<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
 }
 
+#[cfg(test)]
 impl AuthAuthority for StallingRefreshAuthority {
     fn exchange_authorization_code<'a>(
         &'a self,
@@ -694,6 +706,7 @@ impl AuthAuthority for StallingRefreshAuthority {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn credential_payload(user_id: &str, refresh_token: &str, key: &DpopKey) -> Bytes {
     serde_json::to_vec(&StoredCredential::Active {
         user_id: user_id.to_owned(),
@@ -704,6 +717,7 @@ pub(crate) fn credential_payload(user_id: &str, refresh_token: &str, key: &DpopK
     .into()
 }
 
+#[cfg(test)]
 pub(super) fn stored_active_credential(store: &StallingCredentialStore) -> (String, String) {
     let record: StoredCredential = serde_json::from_slice(
         store
@@ -726,6 +740,7 @@ pub(super) fn stored_active_credential(store: &StallingCredentialStore) -> (Stri
     }
 }
 
+#[cfg(test)]
 pub(super) fn token_response(
     user_id: &str,
     refresh_token: &str,
@@ -740,6 +755,7 @@ pub(super) fn token_response(
     )
 }
 
+#[cfg(test)]
 pub(super) fn token_response_with_plan(
     user_id: &str,
     refresh_token: &str,
@@ -755,6 +771,7 @@ pub(super) fn token_response_with_plan(
     )
 }
 
+#[cfg(test)]
 pub(super) fn token_response_with_expiry(
     user_id: &str,
     refresh_token: &str,
@@ -775,6 +792,7 @@ pub(super) fn token_response_with_expiry(
     }
 }
 
+#[cfg(test)]
 pub(super) fn test_session(
     store: Arc<dyn CredentialStore>,
     revision: u64,
@@ -788,6 +806,7 @@ pub(super) fn test_session(
     )
 }
 
+#[cfg(test)]
 pub(super) fn test_session_with_authority(
     store: Arc<dyn CredentialStore>,
     revision: u64,
@@ -799,6 +818,7 @@ pub(super) fn test_session_with_authority(
     (session, receiver)
 }
 
+#[cfg(test)]
 pub(super) fn test_session_with_authority_and_control(
     store: Arc<dyn CredentialStore>,
     revision: u64,
@@ -814,4 +834,28 @@ pub(super) fn test_session_with_authority_and_control(
     let session = AuthSession::spawn_with_control(store, control.clone(), authority)
         .expect("the auth actor thread should start");
     (session, receiver, control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session the UI tests' connector installs starts with nothing: the store is
+    /// empty, so the status has no available or unavailable record to report, the
+    /// in-memory session has no plan, and no startup refresh has asked the authority.
+    #[tokio::test]
+    async fn the_signed_out_test_session_should_start_without_a_credential() {
+        let session =
+            AuthSession::for_test_signed_out().expect("the signed-out test session should start");
+
+        let status = session
+            .local_session_status()
+            .await
+            .expect("the signed-out status should be readable");
+        assert_eq!(status.availability(), SessionAvailability::Unknown);
+        assert_eq!(status.observed_change(), SessionChange::default());
+        assert_eq!(session.current_plan(TEST_USER_ID).await.unwrap(), None);
+
+        session.shutdown().await;
+    }
 }

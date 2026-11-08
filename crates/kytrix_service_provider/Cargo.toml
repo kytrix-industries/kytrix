@@ -8,6 +8,9 @@ edition.workspace = true
 # Selects the production account/API origins. Development builds talk to the
 # local service on 127.0.0.1; plaintext policy belongs to the transport hub.
 production = []
+# Exposes the signed-out in-memory auth session a UI test installs a connector
+# over. Never enabled for a release build: it is a dev-dependency feature only.
+test-support = []
 
 [dependencies]
 ahash.workspace = true

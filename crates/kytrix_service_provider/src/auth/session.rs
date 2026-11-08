@@ -14,6 +14,10 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
+#[cfg(test)]
+use super::test_support::credential_payload;
+#[cfg(any(test, feature = "test-support"))]
+use super::test_support::{InMemoryCredentialStore, ServiceTestAuthority};
 use super::{
     ACCOUNT_ORIGIN, AUTH_COMMAND_CAPACITY, AccountIdentity, AuthAuthority, AuthCommand, AuthError,
     AuthorizationProofContext, CREDENTIAL_SERVICE, CREDENTIAL_USER, CredentialStore, DpopKey,
@@ -494,6 +498,68 @@ impl AuthSession {
         let (respond_to, response_receiver) = oneshot::channel();
         self.send_command(AuthCommand::LocalStatus { respond_to }, response_receiver)
             .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_with_control(
+        store: Arc<dyn CredentialStore>,
+        control: Arc<SessionControl>,
+        authority: Arc<dyn AuthAuthority>,
+    ) -> Result<Self, AuthError> {
+        Self::spawn_with_control_and_startup(store, control, authority, false, Runtime::for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(transport: Arc<TransportHub>) -> Self {
+        Self::for_test_with_revision(transport, 0, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_revision(
+        transport: Arc<TransportHub>,
+        revision: u64,
+        epoch: u64,
+    ) -> Self {
+        let _ = transport;
+        let key = DpopKey::generate().expect("test DPoP key should generate");
+        let store = Arc::new(InMemoryCredentialStore::default());
+        *store
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(credential_payload(
+            "11111111-1111-4111-8111-111111111111",
+            "test-refresh-token",
+            &key,
+        ));
+        let authority = Arc::new(ServiceTestAuthority);
+        let (changes, _) = watch::channel(SessionChange::default());
+        Self::spawn_with_control(
+            store,
+            Arc::new(SessionControl::new(revision, epoch, changes)),
+            authority,
+        )
+        .expect("the test auth actor should start")
+    }
+
+    /// Builds the signed-out session a UI test's connector runs over.
+    ///
+    /// The store starts empty and nothing seeds it: the session has no credential to
+    /// load, and the authority answers every request itself, so the actor never reads the
+    /// operating system keyring and never reaches the account service. A startup refresh
+    /// is off as well, so the first command is served without asking the authority
+    /// anything.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn for_test_signed_out() -> Result<Self, AuthError> {
+        let store = Arc::new(InMemoryCredentialStore::default());
+        let (changes, _) = watch::channel(SessionChange::default());
+        let control = Arc::new(SessionControl::new(0, 0, changes));
+        Self::spawn_with_control_and_startup(
+            store,
+            control,
+            Arc::new(ServiceTestAuthority),
+            false,
+            Runtime::for_test(),
+        )
     }
 }
 

@@ -55,6 +55,7 @@ pub enum IconKind {
     PlugsConnected,
     SpeakerSimpleHigh,
     SpeakerSimpleSlash,
+    Sidebar,
 }
 
 impl IconKind {
@@ -108,6 +109,7 @@ impl IconKind {
             IconKind::PlugsConnected => "icons/phosphoricons/plugs-connected.svg",
             IconKind::SpeakerSimpleHigh => "icons/phosphoricons/speaker-simple-high.svg",
             IconKind::SpeakerSimpleSlash => "icons/phosphoricons/speaker-simple-slash.svg",
+            IconKind::Sidebar => "icons/phosphoricons/sidebar.svg",
         }
     }
 }
@@ -163,7 +165,7 @@ mod tests {
     use super::IconKind;
 
     /// 全部变体，顺序与 [`IconKind::path`] 一致。
-    const KINDS: [IconKind; 48] = [
+    const KINDS: [IconKind; 49] = [
         IconKind::X,
         IconKind::XBold,
         IconKind::Circle,
@@ -212,6 +214,7 @@ mod tests {
         IconKind::PlugsConnected,
         IconKind::SpeakerSimpleHigh,
         IconKind::SpeakerSimpleSlash,
+        IconKind::Sidebar,
     ];
 
     /// 每个变体的 `path()` 都必须指向一个真实存在于 `assets/` 里的文件，否则 `svg()` 画不出东西。

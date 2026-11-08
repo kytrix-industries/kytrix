@@ -46,6 +46,10 @@ embed-resource = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+# The root-window tests install the connector over the provider's signed-out in-memory
+# session. The normal dependency above stays feature-free; cargo unifies this feature
+# into test builds only.
+kytrix_service_provider = { workspace = true, features = ["test-support"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
