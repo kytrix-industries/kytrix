@@ -8,6 +8,7 @@
 
 use app_config::workspace::validate_workspace_name;
 use base_ui::{
+    animation::ANIMATION_TICK,
     button::Button,
     context_menu::ContextMenu,
     icon::{Icon, IconKind},
@@ -23,7 +24,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, ElementId, Entity, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Pixels, RenderOnce, SharedString,
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
-    base::{Disableable, Selectable},
+    base::{Disableable, Easing, Selectable, Transition, transition},
     div, px, uniform_list,
 };
 use i18n::t;
@@ -264,17 +265,29 @@ impl SidebarWorkspaces {
             );
 
         // The close button belongs to the row the page shows or the pointer is on. The
-        // wrapper watches the row rather than the button itself: the button is only drawn
-        // while it is wanted, so it cannot be what keeps itself up.
+        // wrapper watches the row rather than the button itself: the button is not what
+        // keeps itself up.
         let hover_state = window.use_keyed_state((row_id.clone(), "row-hover"), cx, |_, _| false);
         let show_close = close_available && can_delete && (active || *hover_state.read(cx));
+        // The button appears and disappears with the row's own hover paint rather than
+        // cutting in: both follow the same `ANIMATION_TICK` transition, so the fade and the
+        // row's background settle together. The opacity is sampled even when the button is
+        // not drawn, which is what carries a fade out to its end. A panel on its way out
+        // takes the button away at once: the control belongs to the settled panel.
+        let close_opacity: f32 = transition(
+            (row_id.clone(), "close"),
+            if show_close { 1.0 } else { 0.0 },
+            Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
+            window,
+            cx,
+        );
         let mut row = div()
             .id((row_id.clone(), "row"))
             .relative()
             .w_full()
             .on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
             .child(select);
-        if show_close {
+        if close_available && (show_close || close_opacity > 0.0) {
             let close_selector = format_smolstr!("{SIDEBAR_WORKSPACE_CLOSE}_{name}");
             let close_label = t!(cx, "window.workspace.close");
             let close = Button::new((row_id, "close"))
@@ -283,6 +296,7 @@ impl SidebarWorkspaces {
                 .absolute()
                 .right(px(5.0))
                 .top(px(6.0))
+                .opacity(close_opacity)
                 .debug_selector(move || close_selector.to_string())
                 .aria_label(close_label)
                 .child(Icon::new(IconKind::X).size(px(12.0)))
@@ -705,6 +719,11 @@ mod tests {
     fn settle(cx: &mut VisualTestContext) {
         cx.executor()
             .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
+        paint(cx);
+    }
+
+    /// Draws the frame the state just changed asks for, without moving the clock.
+    fn paint(cx: &mut VisualTestContext) {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
     }
@@ -963,6 +982,48 @@ mod tests {
         assert!(
             cx.debug_bounds(CLOSE_TWO).is_none(),
             "the close button goes away when the pointer leaves the row"
+        );
+    }
+
+    /// The close button fades in and out with the row's own hover paint rather than cutting
+    /// in and out: the row's background settles over one `ANIMATION_TICK`, and the button is
+    /// drawn for as long as its own fade still has something to paint.
+    #[gpui_kit::test]
+    fn the_close_button_should_fade_out_rather_than_disappear_with_the_hover_state(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, _) = section_window(cx, config_with(&["one", "two"]), SidebarMode::Full);
+
+        hover(cx, "SIDEBAR_ITEM_two");
+        settle(cx);
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_some(),
+            "the hovered row offers its close button"
+        );
+
+        // The pointer leaves the row. The row starts painting its hover away on this frame,
+        // and the button starts its own fade instead of vanishing with the hover state.
+        cx.simulate_mouse_move(point(px(350.0), px(550.0)), None, Modifiers::none());
+        paint(cx);
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_some(),
+            "the close button is still drawn on the first frame of its fade-out"
+        );
+
+        // Halfway through the tick there is still a fade to paint; once the tick is up the
+        // button has nothing left to draw and leaves the tree.
+        cx.executor().advance_clock(ANIMATION_TICK / 2);
+        paint(cx);
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_some(),
+            "the close button is drawn through its fade-out"
+        );
+
+        cx.executor().advance_clock(ANIMATION_TICK);
+        paint(cx);
+        assert!(
+            cx.debug_bounds(CLOSE_TWO).is_none(),
+            "the close button goes away once its fade-out has finished"
         );
     }
 
