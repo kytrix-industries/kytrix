@@ -1025,7 +1025,7 @@ fn blank_lines_inside_an_align_tag_pair_are_kept() {
 
 /// 产品文案的形状：`%{markets}` 那样的插值里带一个空行时，整句照旧画出来。
 ///
-/// 这正是 `common.market_not_loaded` 的形状（"本组件支持的市场参与者有：" 换行、然后一行一个场所名），
+/// 这正是 `common.market_not_loaded` 的形状（"本部件支持的市场参与者有：" 换行、然后一行一个场所名），
 /// 场所列表里多一个空行曾经让整句连同列表一起不显示。
 #[test]
 fn a_blank_line_in_a_tag_pairs_content_keeps_the_whole_message() {

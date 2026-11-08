@@ -50,7 +50,7 @@ common:
   connecting: 正在连接
   loading: 正在加载
   retry: 重试
-  market_not_loaded: "<p align=\"center\">当前组件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本组件支持的市场参与者有：\n%{markets}</p>"
+  market_not_loaded: "<p align=\"center\">当前部件需要先加载受支持的市场参与者元数据才可以使用。\n请先从左上角的 <kbd>![](file://icons/phosphoricons/bank.svg)</kbd> 按钮加载至少一个受支持的市场参与者元数据。\n本部件支持的市场参与者有：\n%{markets}</p>"
 sample:
   failure: 路线不可用
 test:

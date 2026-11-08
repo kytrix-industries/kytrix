@@ -1100,6 +1100,10 @@ widget:
     invalid_username: The X username is invalid
     protected_account: Protected X accounts cannot be added
     quota_exceeded: Your current tier's X account quota is full
+widget_gallery:
+  search_placeholder: Search widgets
+  subtitle: Choose the widget you need
+  title: Widgets
 window:
   account:
     authorization_complete: Authorization complete
@@ -1132,7 +1136,6 @@ window:
     split_keep_left: Split then keep on the left
     split_keep_right: Split then keep on the right
     split_keep_top: Split then keep on the top
-    widget_menu: Widget
   sidebar:
     delete: Delete
     menu: Workspace menu
