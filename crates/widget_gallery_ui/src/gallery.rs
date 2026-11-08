@@ -80,8 +80,9 @@ const ROW_HEIGHT: Pixels = px(56.0);
 /// The width of the field the gallery is searched with.
 const SEARCH_WIDTH: Pixels = px(240.0);
 
-/// The widest the page's content column gets. The footer is drawn outside it, so it keeps the
-/// page's full width while the header and catalogue are centred.
+/// The widest the page's content column gets, which is also the widest the footer's button row
+/// gets. The footer's separator is drawn outside the column, so it keeps the page's full width
+/// while the header, the catalogue and the buttons are centred.
 const CONTENT_MAX_WIDTH: Pixels = px(1000.0);
 
 /// The element id of the scroll viewport, which is where the page remembers how far it
@@ -552,6 +553,10 @@ impl WidgetGallery {
 
     /// The two decisions: leave without choosing, or confirm the widget that is selected.
     ///
+    /// The separator is drawn across the page, while the buttons are drawn in the same column
+    /// the header and the catalogue are centred in, so the confirm control lines up with the
+    /// content above it.
+    ///
     /// The confirm control refuses input while nothing is selected: a page with a search and
     /// no choice holds no answer, and a control that confirmed nothing would leave as if it
     /// had chosen something.
@@ -564,35 +569,38 @@ impl WidgetGallery {
             .flex_col()
             .child(Separator::horizontal())
             .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .px_6()
-                    .py_3()
-                    .child(
-                        Button::new("widget-gallery-cancel")
-                            .tonal()
-                            .medium()
-                            .debug_selector(|| String::from(CANCEL_SELECTOR))
-                            .aria_label(t!(cx, "common.cancel"))
-                            .child(t!(cx, "common.cancel"))
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(WidgetGalleryEvent::Cancel);
-                            })),
-                    )
-                    .child(
-                        Button::new("widget-gallery-confirm")
-                            .filled()
-                            .medium()
-                            .debug_selector(|| String::from(CONFIRM_SELECTOR))
-                            .aria_label(t!(cx, "common.confirm"))
-                            .disabled(self.selection.is_none())
-                            .child(t!(cx, "common.confirm"))
-                            .on_click(cx.listener(|gallery, _, _, cx| gallery.confirm(cx))),
-                    ),
+                div().w_full().flex().justify_center().child(
+                    div()
+                        .w(CONTENT_MAX_WIDTH)
+                        .max_w_full()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .px_6()
+                        .py_3()
+                        .child(
+                            Button::new("widget-gallery-cancel")
+                                .tonal()
+                                .medium()
+                                .debug_selector(|| String::from(CANCEL_SELECTOR))
+                                .aria_label(t!(cx, "common.cancel"))
+                                .child(t!(cx, "common.cancel"))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(WidgetGalleryEvent::Cancel);
+                                })),
+                        )
+                        .child(
+                            Button::new("widget-gallery-confirm")
+                                .filled()
+                                .medium()
+                                .debug_selector(|| String::from(CONFIRM_SELECTOR))
+                                .aria_label(t!(cx, "common.confirm"))
+                                .disabled(self.selection.is_none())
+                                .child(t!(cx, "common.confirm"))
+                                .on_click(cx.listener(|gallery, _, _, cx| gallery.confirm(cx))),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -1123,8 +1131,9 @@ mod tests {
         );
     }
 
-    /// The header and the catalogue are one 800-pixel column in the middle of the page. The
-    /// footer is outside that column, so it keeps the page's full width.
+    /// The header, the catalogue and the footer's buttons are one 1000-pixel column in the
+    /// middle of the page, while the footer's separator is outside that column and keeps the
+    /// page's full width.
     #[gpui_kit::test]
     fn the_page_should_cap_its_content_width_and_centre_it_above_the_footer(
         cx: &mut TestAppContext,
@@ -1146,6 +1155,14 @@ mod tests {
             .cx
             .debug_bounds(SEARCH_SELECTOR)
             .expect("the page should draw its search field");
+        let cancel = harness
+            .cx
+            .debug_bounds(CANCEL_SELECTOR)
+            .expect("the page should draw its cancel control");
+        let confirm = harness
+            .cx
+            .debug_bounds(CONFIRM_SELECTOR)
+            .expect("the page should draw its confirm control");
 
         assert_eq!(column.size.width, CONTENT_MAX_WIDTH);
         assert_eq!(column.center().x, panel.center().x);
@@ -1154,6 +1171,35 @@ mod tests {
         assert!(footer.top() >= column.bottom());
         assert!(search.left() >= column.left());
         assert!(search.right() <= column.right());
+        assert_eq!(
+            confirm.right(),
+            search.right(),
+            "the footer's buttons should end where the content column's content ends"
+        );
+        assert!(
+            cancel.right() < confirm.left(),
+            "the two decisions should be drawn side by side"
+        );
+    }
+
+    /// A page narrower than the footer's column draws its buttons in the width it has instead
+    /// of overflowing it.
+    #[gpui_kit::test]
+    fn a_narrow_page_should_draw_its_footer_in_its_width(cx: &mut TestAppContext) {
+        let mut harness = gallery(cx, None);
+        harness.cx.simulate_resize(size(px(600.0), px(800.0)));
+        harness.settle();
+
+        let panel = harness
+            .cx
+            .debug_bounds(PANEL_SELECTOR)
+            .expect("the page should draw its panel");
+        let confirm = harness
+            .cx
+            .debug_bounds(CONFIRM_SELECTOR)
+            .expect("the page should draw its confirm control");
+
+        assert!(confirm.right() <= panel.right());
     }
 
     /// A page narrower than the column fills the width it has instead of overflowing it.
