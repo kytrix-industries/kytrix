@@ -80,6 +80,10 @@ const ROW_HEIGHT: Pixels = px(56.0);
 /// The width of the field the gallery is searched with.
 const SEARCH_WIDTH: Pixels = px(240.0);
 
+/// The widest the page's content column gets. The footer is drawn outside it, so it keeps the
+/// page's full width while the header and catalogue are centred.
+const CONTENT_MAX_WIDTH: Pixels = px(800.0);
+
 /// The element id of the scroll viewport, which is where the page remembers how far it
 /// was scrolled.
 const SCROLL_ID: &str = "widget-gallery-scroll";
@@ -90,6 +94,8 @@ const SEARCH_ID: &str = "widget-gallery-search";
 /// Debug selectors of the page's own parts. The panel, confirm and cancel selectors are
 /// what the workspace's integration tests look the page up by.
 const PANEL_SELECTOR: &str = "WIDGET_GALLERY";
+const COLUMN_SELECTOR: &str = "WIDGET_GALLERY_COLUMN";
+const FOOTER_SELECTOR: &str = "WIDGET_GALLERY_FOOTER";
 const SEARCH_SELECTOR: &str = "WIDGET_GALLERY_SEARCH";
 const CONTENT_SELECTOR: &str = "WIDGET_GALLERY_CONTENT";
 const VIEWPORT_SELECTOR: &str = "WIDGET_GALLERY_VIEWPORT";
@@ -550,6 +556,7 @@ impl WidgetGallery {
     /// had chosen something.
     fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .debug_selector(|| String::from(FOOTER_SELECTOR))
             .flex_none()
             .w_full()
             .flex()
@@ -611,8 +618,26 @@ impl Render for WidgetGallery {
             .flex_col()
             .bg(cx.theme().roles.surface.canvas.hsla)
             .text_color(cx.theme().roles.fg.default.hsla)
-            .child(header)
-            .child(body)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .debug_selector(|| String::from(COLUMN_SELECTOR))
+                            .w(CONTENT_MAX_WIDTH)
+                            .max_w_full()
+                            .h_full()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(header)
+                            .child(body),
+                    ),
+            )
             .child(footer)
     }
 }
@@ -632,8 +657,9 @@ mod tests {
     use widget_registry::registry::WidgetRegistry;
 
     use super::{
-        CANCEL_SELECTOR, CONFIRM_SELECTOR, CONTENT_SELECTOR, SEARCH_SELECTOR, VIEWPORT_SELECTOR,
-        WidgetGallery, WidgetGalleryEvent, category_selector,
+        CANCEL_SELECTOR, COLUMN_SELECTOR, CONFIRM_SELECTOR, CONTENT_SELECTOR, FOOTER_SELECTOR,
+        PANEL_SELECTOR, SEARCH_SELECTOR, VIEWPORT_SELECTOR, WidgetGallery, WidgetGalleryEvent,
+        category_selector,
     };
 
     /// Debug selectors of the rows and radios a test reaches for by name.
@@ -1094,6 +1120,59 @@ mod tests {
             pairs > 0,
             "at least one category should fill a two-column row"
         );
+    }
+
+    /// The header and the catalogue are one 800-pixel column in the middle of the page. The
+    /// footer is outside that column, so it keeps the page's full width.
+    #[gpui_kit::test]
+    fn the_page_should_cap_its_content_width_and_centre_it_above_the_footer(
+        cx: &mut TestAppContext,
+    ) {
+        let harness = gallery(cx, None);
+        let panel = harness
+            .cx
+            .debug_bounds(PANEL_SELECTOR)
+            .expect("the page should draw its panel");
+        let column = harness
+            .cx
+            .debug_bounds(COLUMN_SELECTOR)
+            .expect("the page should draw its content column");
+        let footer = harness
+            .cx
+            .debug_bounds(FOOTER_SELECTOR)
+            .expect("the page should draw its footer");
+        let search = harness
+            .cx
+            .debug_bounds(SEARCH_SELECTOR)
+            .expect("the page should draw its search field");
+
+        assert_eq!(column.size.width, px(800.0));
+        assert_eq!(column.center().x, panel.center().x);
+        assert_eq!(footer.size.width, panel.size.width);
+        assert_eq!(footer.left(), panel.left());
+        assert!(footer.top() >= column.bottom());
+        assert!(search.left() >= column.left());
+        assert!(search.right() <= column.right());
+    }
+
+    /// A page narrower than the column fills the width it has instead of overflowing it.
+    #[gpui_kit::test]
+    fn a_narrow_page_should_fill_its_width_instead_of_overflowing(cx: &mut TestAppContext) {
+        let mut harness = gallery(cx, None);
+        harness.cx.simulate_resize(size(px(600.0), px(800.0)));
+        harness.settle();
+
+        let panel = harness
+            .cx
+            .debug_bounds(PANEL_SELECTOR)
+            .expect("the page should draw its panel");
+        let column = harness
+            .cx
+            .debug_bounds(COLUMN_SELECTOR)
+            .expect("the page should draw its content column");
+
+        assert_eq!(column.size.width, panel.size.width);
+        assert_eq!(column.left(), panel.left());
     }
 
     /// The search matches the name a reader sees, case-insensitively, and the sections it
