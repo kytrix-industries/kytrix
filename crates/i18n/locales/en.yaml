@@ -908,38 +908,38 @@ widget:
     select_market_group: Select market category
     timeframe: Prediction market timeframe
   descriptions:
-    candlestick: Live and historical OHLCV chart
+    candlestick: Powerful multi-asset charts with cross-market coverage
     coin_market_cap_fear_and_greed_index: CoinMarketCap crypto fear and greed index
-    cryptocurrency_etf: Daily net flows of the cryptocurrency spot ETF complexes, and the assets they hold
-    ethereum_wallet: Live transfers of the Ethereum addresses an account monitors
-    financial_calendar: Scheduled economic events, grouped by the day they fall on
-    financial_index: Global market and commodity indices
+    cryptocurrency_etf: Daily net flows for BTC, ETH, SOL and HYPE spot ETFs
+    ethereum_wallet: Monitor Ethereum wallet activity
+    financial_calendar: Calendar of financial events
+    financial_index: Key indices across the world's major markets
     force_order: Live liquidation orders across Binance and OKX
     global_shipping_chokepoint: Live AIS vessel positions across strategic shipping chokepoints
     hyperliquid_wallet: Monitor Hyperliquid wallet activity
     long_short_account_ratio: Perpetual long and short account ratio
-    market_trade: Recent native market executions
-    news: Live news from the local NewsStream service
+    market_trade: Live market trade data
+    news: Live news updates
     open_interest: Perpetual open interest, in the base and quote asset
-    order_book: Live grouped market depth
-    pentagon_pizza_index: The Pentagon Pizza Index, and the readiness level it reports
-    prediction_market: Prediction event probabilities over time
-    solana_wallet: Live transfers of the Solana addresses an account monitors
+    order_book: Live market order book data
+    pentagon_pizza_index: Order trends at six well-known pizza shops near the Pentagon
+    prediction_market: Prediction markets data from Polymarket and Hyperliquid
+    solana_wallet: Monitor Solana wallet activity
     taker_volume: Perpetual taker buy and sell volume
     top_trader_account_ratio: Top traders' long and short account ratio
     top_trader_position_ratio: Top traders' long and short position ratio
-    volume_heatmap: One market participant's spot quote volume, as a heat map
-    watch_list: Live 24-hour statistics for followed listings
-    x: Live posts from monitored X accounts
+    volume_heatmap: Multi-market spot trading volume heat map
+    watch_list: Pick and track the instruments you care about most
+    x: Monitor posts from X accounts in real time
   names:
-    candlestick: Candlestick
+    candlestick: Candlestick Chart
     coin_market_cap_fear_and_greed_index: CoinMarketCap Fear & Greed
-    cryptocurrency_etf: Crypto Currency ETF
+    cryptocurrency_etf: Cryptocurrency ETF
     empty: Empty
-    ethereum_wallet: Ethereum Wallet Monitor
+    ethereum_wallet: Ethereum Wallet
     financial_calendar: Financial Calendar
     financial_index: Financial Index
-    force_order: Force Order Stream
+    force_order: Liquidation Orders
     global_shipping_chokepoint: Global Shipping Chokepoint
     hyperliquid_wallet: Hyperliquid Wallet
     long_short_account_ratio: Long/Short Account Ratio
@@ -949,13 +949,13 @@ widget:
     order_book: Order Book
     pentagon_pizza_index: Pentagon Pizza Index
     prediction_market: Prediction Market
-    solana_wallet: Solana Wallet Monitor
+    solana_wallet: Solana Wallet
     taker_volume: Taker Buy/Sell Volume
     top_trader_account_ratio: Top Trader Account Ratio
     top_trader_position_ratio: Top Trader Position Ratio
     volume_heatmap: Volume Heat Map
     watch_list: Watch List
-    x: X
+    x: X (Twitter) Posts
   news:
     crypto: Crypto
     disable_sound: Mute notification sound

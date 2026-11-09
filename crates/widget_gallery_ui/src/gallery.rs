@@ -1254,7 +1254,7 @@ mod tests {
     fn typing_a_description_should_narrow_the_gallery(cx: &mut TestAppContext) {
         let mut harness = gallery(cx, None);
 
-        harness.type_into_search("ohlcv");
+        harness.type_into_search("multi-asset");
 
         assert_eq!(
             harness.listed(),
@@ -1289,7 +1289,7 @@ mod tests {
         let mut harness = gallery(cx, None);
         harness.set_language(LanguageCode::ZhCn);
 
-        harness.type_into_search("历史");
+        harness.type_into_search("多资产");
         assert_eq!(
             harness.listed(),
             ["kytrix.candlestick"],
@@ -1311,7 +1311,7 @@ mod tests {
         let mut harness = gallery(cx, None);
         let whole = harness.listed();
 
-        harness.type_into_search("ohlcv");
+        harness.type_into_search("multi-asset");
         assert_eq!(harness.listed().len(), 1);
 
         harness.clear_search();
@@ -1331,7 +1331,7 @@ mod tests {
         let mut harness = gallery(cx, None);
         let search = harness.search_focus_handle();
 
-        harness.type_into_search("ohlcv");
+        harness.type_into_search("multi-asset");
         assert_eq!(harness.listed(), ["kytrix.candlestick"]);
 
         harness.clear_search();
@@ -1511,7 +1511,7 @@ mod tests {
     fn a_selection_the_search_hides_should_still_be_confirmable(cx: &mut TestAppContext) {
         let mut harness = gallery(cx, Some("kytrix.news"));
 
-        harness.type_into_search("ohlcv");
+        harness.type_into_search("multi-asset");
         assert_eq!(harness.listed(), ["kytrix.candlestick"]);
         assert!(
             harness.cx.debug_bounds(NEWS_ROW).is_none(),

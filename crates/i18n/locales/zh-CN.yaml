@@ -908,38 +908,38 @@ widget:
     select_market_group: 选择市场分类
     timeframe: 预测市场时间范围
   descriptions:
-    candlestick: 实时与历史 OHLCV 图表
+    candlestick: 多资产、跨市场覆盖的强大图表
     coin_market_cap_fear_and_greed_index: CoinMarketCap 加密货币恐惧贪婪指数
-    cryptocurrency_etf: 加密货币现货 ETF 组合的每日净流入及其持有的资产
-    ethereum_wallet: 账户监控的 Ethereum 地址的实时转账
-    financial_calendar: 按发生日期分组的经济事件日程
-    financial_index: 全球市场与商品指数
+    cryptocurrency_etf: BTC/ETH/SOL/HYPE 现货 ETF 的每日净流向
+    ethereum_wallet: 监控 Ethereum 钱包活动
+    financial_calendar: 金融事件日历
+    financial_index: 全球主要经济市场指数指标
     force_order: Binance 与 OKX 的实时强平订单
     global_shipping_chokepoint: 战略航运咽喉要道的实时 AIS 船舶位置
     hyperliquid_wallet: 监控 Hyperliquid 钱包活动
     long_short_account_ratio: 永续合约多空账户比
-    market_trade: 最近的原生市场成交
-    news: 来自本地 NewsStream 服务的实时新闻
+    market_trade: 实时市场成交数据
+    news: 实时新闻快讯
     open_interest: 永续合约持仓量（基础资产与计价资产）
-    order_book: 实时分组市场深度
-    pentagon_pizza_index: 五角大楼披萨指数及其报告的战备等级
-    prediction_market: 预测事件概率随时间变化
-    solana_wallet: 账户监控的 Solana 地址的实时转账
+    order_book: 实时市场挂单数据
+    pentagon_pizza_index: 五角大楼附近6家知名披萨店的订购趋势
+    prediction_market: Polymarket 与 Hyperliquid 的预测市场行情数据
+    solana_wallet: 监控 Solana 钱包活动
     taker_volume: 永续合约主动买入与卖出量
     top_trader_account_ratio: 大户账户的多空比
     top_trader_position_ratio: 大户持仓的多空比
-    volume_heatmap: 单一市场参与者的现货报价成交量热力图
-    watch_list: 自选标的的实时 24 小时统计
-    x: 受监控 X 账号的实时帖子
+    volume_heatmap: 多市场的现货成交量热力图
+    watch_list: 挑选并追踪你最在意的标的
+    x: 实时监控 X 账号的帖子
   names:
-    candlestick: K 线
+    candlestick: K线图
     coin_market_cap_fear_and_greed_index: CoinMarketCap 恐惧贪婪指数
-    cryptocurrency_etf: 加密货币ETF
+    cryptocurrency_etf: 加密货币 ETF
     empty: 空白
-    ethereum_wallet: Ethereum 钱包监控
+    ethereum_wallet: Ethereum 钱包
     financial_calendar: 财经日历
-    financial_index: 指数
-    force_order: 强平订单流
+    financial_index: 金融指数
+    force_order: 强平订单
     global_shipping_chokepoint: 全球关键航道
     hyperliquid_wallet: Hyperliquid 钱包
     long_short_account_ratio: 多空账户比
@@ -949,13 +949,13 @@ widget:
     order_book: 订单簿
     pentagon_pizza_index: 五角大楼披萨指数
     prediction_market: 预测市场
-    solana_wallet: Solana 钱包监控
+    solana_wallet: Solana 钱包
     taker_volume: 主动买卖量
     top_trader_account_ratio: 大户账户多空比
     top_trader_position_ratio: 大户持仓多空比
     volume_heatmap: 成交量热力图
     watch_list: 自选列表
-    x: X
+    x: X（Twitter）帖子
   news:
     crypto: 加密货币
     disable_sound: 禁止提示音
