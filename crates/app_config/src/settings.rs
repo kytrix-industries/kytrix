@@ -490,8 +490,8 @@ impl Config {
     /// test-support `bindings` of a venue row is not settings either. The
     /// workspaces are not reported because nothing outside their single writer
     /// reads them, the sidebar state because the main window reads it rather than a
-    /// subscriber, and the translation directory is not reported because the
-    /// translator reads it when it is called.
+    /// subscriber, and the translation settings are not reported because the
+    /// translator reads them when it is called.
     ///
     /// The destructuring is exhaustive on purpose: a field added to [`Config`]
     /// is a compile error here until it is classified as reported or ignored.
@@ -513,7 +513,7 @@ impl Config {
             // write must not wake a single subscriber. The field is still named
             // rather than matched with `_`, which the workspace forbids.
             workspaces: WorkspacesConfig { .. },
-            // The translator reads this setting when it is called, so a change
+            // The translator reads these settings when it is called, so a change
             // needs no event of its own.
             translation: TranslationConfig { .. },
             // Generations are runtime identity, not settings: they never take

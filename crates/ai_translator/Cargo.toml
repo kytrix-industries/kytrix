@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 ai_provider.workspace = true
+app_config.workspace = true
 smol_str.workspace = true
 thiserror.workspace = true
 

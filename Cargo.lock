@@ -183,6 +183,7 @@ name = "ai_translator"
 version = "0.0.3"
 dependencies = [
  "ai_provider",
+ "app_config",
  "smol_str",
  "thiserror 2.0.21",
 ]
@@ -9009,12 +9010,19 @@ dependencies = [
  "app_config_provider",
  "base_ui",
  "gpui-kit",
+ "hyper",
+ "hyper-util",
  "i18n",
  "log",
  "market_participants_connector",
  "market_participants_model",
+ "network",
+ "reqwest 0.13.5",
  "smol_str",
  "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "url",
  "widget",
  "widget_tokio_runtime",

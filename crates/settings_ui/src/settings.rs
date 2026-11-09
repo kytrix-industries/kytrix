@@ -69,6 +69,7 @@ use crate::{
     search::{FieldSearch, PageSearch, SearchFilter, SearchNode},
     table::{ProxyRequest, ProxyTable},
     translation::TranslationPage,
+    translation_downloads::DownloadState,
 };
 
 /// The widest the page's content column gets, which is also the widest the footer's button row
@@ -182,7 +183,8 @@ impl SettingsPage {
     fn build(draft: Entity<SettingsDraft>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
         let proxies = cx.new(|cx| ProxyTable::new(draft.clone(), cx));
-        let translation = cx.new(|_| TranslationPage::new(draft.clone()));
+        let downloads = crate::translation_downloads::entity(cx);
+        let translation = cx.new(|cx| TranslationPage::new(draft.clone(), downloads, cx));
 
         Self {
             draft,
@@ -396,7 +398,29 @@ impl SettingsPage {
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_inputs(cx);
         let previous = cx.global::<ConfigManager>().read();
-        let applied = self.draft.read(cx).applied_to(previous.as_ref());
+        let mut applied = self.draft.read(cx).applied_to(previous.as_ref());
+        // The draft's directory and a selection the background download manager may have
+        // written while the page was open can disagree: a model auto-selected in the stored
+        // directory is not downloaded in the directory this session is about to store. A model
+        // whose file is being deleted is not available either, even if the file is still
+        // there while the engine unloads. Clear such a selection rather than persist it.
+        if let Some(downloads) = crate::translation_downloads::entity(cx)
+            && let Some(selected) = applied.translation.selected_model
+        {
+            let available =
+                applied
+                    .translation
+                    .model_directory
+                    .as_deref()
+                    .is_some_and(|directory| {
+                        let downloads = downloads.read(cx);
+                        downloads.row_state(selected, directory) != DownloadState::Deleting
+                            && downloads.is_downloaded(selected, directory)
+                    });
+            if !available {
+                applied.translation.selected_model = None;
+            }
+        }
         let stored = cx.update_global::<ConfigManager, _>(|manager, cx| {
             manager.write(applied, cx.borrow_mut())
         });
@@ -1064,6 +1088,7 @@ mod tests {
         },
         network::{ProxyAuthorizationConfig, ProxyConfig},
         settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
+        translation::TranslationModel,
         ui::SidebarMode,
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
@@ -1238,6 +1263,40 @@ mod tests {
         settings_over_catalog(manager, language, test_catalog(), cx)
     }
 
+    /// Installs the process-wide download manager a settings session reads, once per test app.
+    ///
+    /// A test that opens two settings sessions in one application context installs it with the
+    /// first session; installing it again would replace the global and lose the downloads it
+    /// holds, which is exactly what the production composition root never does.
+    fn install_translation_downloads(cx: &mut gpui_kit::App) {
+        install_translation_downloads_with(cx, std::sync::Arc::new(|_: &std::path::Path| Ok(())));
+    }
+
+    /// Installs the process-wide download manager with the unload callback a test controls.
+    fn install_translation_downloads_with(
+        cx: &mut gpui_kit::App,
+        unload: std::sync::Arc<
+            dyn Fn(&std::path::Path) -> Result<(), crate::translation_downloads::UnloadFailure>
+                + Send
+                + Sync,
+        >,
+    ) {
+        if crate::translation_downloads::entity(cx).is_some() {
+            return;
+        }
+
+        crate::translation_downloads::install(
+            cx,
+            crate::translation_downloads::TranslationDownloadsDeps {
+                transport: std::sync::Arc::new(network::transport::hub::TransportHub::new(
+                    network::transport::hub::TransportPolicy::default(),
+                )),
+                runtime: widget_tokio_runtime::runtime::Runtime::for_test(),
+                unload,
+            },
+        );
+    }
+
     /// Opens the settings over the catalog the page is built from.
     ///
     /// The catalog is this build's own unless a test asks otherwise: a test of what a group the
@@ -1260,6 +1319,7 @@ mod tests {
                 Language::En => LanguageCode::En,
             });
             cx.set_global(manager);
+            install_translation_downloads(cx);
             // A manager whose settings are stored under another language than the one the
             // interface is drawn in is a session that starts with a change nobody made, so the
             // two are made to agree here rather than left to what a default happens to be.
@@ -1313,6 +1373,7 @@ mod tests {
             i18n::global::embedded::install(cx).expect("embedded locales should load");
             let manager = ConfigManager::in_memory(Config::default(), cx);
             cx.set_global(manager);
+            install_translation_downloads(cx);
             global::install(cx).expect("the test Tokio runtime should build");
             MarketParticipantsConnector::install(cx)
                 .expect("the market participants root should install");
@@ -1383,6 +1444,40 @@ mod tests {
     /// The settings as everyone outside this dialog sees them.
     fn stored(cx: &VisualTestContext) -> Config {
         cx.read(|cx| cx.global::<ConfigManager>().read().as_ref().clone())
+    }
+
+    /// The process-wide downloads the harness installed.
+    fn translation_downloads(
+        cx: &VisualTestContext,
+    ) -> Entity<crate::translation_downloads::TranslationDownloads> {
+        cx.read(|cx| {
+            crate::translation_downloads::entity(cx)
+                .expect("the settings harness installs the translation downloads")
+        })
+    }
+
+    /// Waits for a blocking delete to finish without assuming the executor's timing.
+    fn wait_until_absent(
+        cx: &mut VisualTestContext,
+        downloads: &Entity<crate::translation_downloads::TranslationDownloads>,
+        model: TranslationModel,
+        directory: &std::path::Path,
+        path: &std::path::Path,
+    ) {
+        for _ in 0..200 {
+            // The delete reports through a polling GPUI task; move its timer on each turn.
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            if !path.exists()
+                && cx.read(|cx| downloads.read(cx).row_state(model, directory))
+                    == crate::translation_downloads::DownloadState::Idle
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the delete should finish: {path:?} still exists");
     }
 
     /// The appearance the application is drawn in.
@@ -2775,8 +2870,8 @@ mod tests {
         assert_eq!(current_page(&panel, cx), "ai.translation");
     }
 
-    /// The translation page draws its heading, the models this build supports, and the directory
-    /// row in that order.
+    /// The translation page draws the directory row, the model select, and the eight models,
+    /// in that order.
     #[gpui_kit::test]
     fn the_translation_page_should_draw_its_models_and_directory_row(cx: &mut TestAppContext) {
         let (_panel, cx) = settings(configured_settings(), cx);
@@ -2784,15 +2879,20 @@ mod tests {
 
         for selector in [
             "SETTINGS_AI_PAGE",
-            "SETTINGS_AI_LLAMA_CPP",
+            "SETTINGS_AI_DIRECTORY",
+            "SETTINGS_AI_DIRECTORY_INPUT",
+            "SETTINGS_AI_BROWSE",
+            "SETTINGS_AI_MODEL_SELECT_SECTION",
+            "SETTINGS_AI_MODEL_SELECT",
             "SETTINGS_AI_MODELS",
             "SETTINGS_AI_MODEL_0",
             "SETTINGS_AI_MODEL_1",
             "SETTINGS_AI_MODEL_2",
             "SETTINGS_AI_MODEL_3",
-            "SETTINGS_AI_DIRECTORY",
-            "SETTINGS_AI_DIRECTORY_INPUT",
-            "SETTINGS_AI_BROWSE",
+            "SETTINGS_AI_MODEL_4",
+            "SETTINGS_AI_MODEL_5",
+            "SETTINGS_AI_MODEL_6",
+            "SETTINGS_AI_MODEL_7",
         ] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -2800,18 +2900,18 @@ mod tests {
             );
         }
 
-        let heading = cx
-            .debug_bounds("SETTINGS_AI_LLAMA_CPP")
-            .expect("the heading should be drawn");
-        let models = cx
-            .debug_bounds("SETTINGS_AI_MODELS")
-            .expect("the model list should be drawn");
         let directory = cx
             .debug_bounds("SETTINGS_AI_DIRECTORY")
             .expect("the directory row should be drawn");
+        let select = cx
+            .debug_bounds("SETTINGS_AI_MODEL_SELECT_SECTION")
+            .expect("the model select should be drawn");
+        let models = cx
+            .debug_bounds("SETTINGS_AI_MODELS")
+            .expect("the model list should be drawn");
 
-        assert!(heading.bottom() <= models.top());
-        assert!(models.bottom() <= directory.top());
+        assert!(directory.bottom() <= select.top());
+        assert!(select.bottom() <= models.top());
     }
 
     /// The system folder picker is what writes the directory field, and confirming the dialog is
@@ -2901,6 +3001,473 @@ mod tests {
         settle(cx);
 
         assert_eq!(current_page(&panel, cx), "ai.translation");
+    }
+
+    /// A downloaded model offers only delete; a download in flight offers a disabled button and
+    /// a progress bar; a failed one offers retry and the reason.
+    #[gpui_kit::test]
+    fn the_translation_rows_should_draw_download_retry_progress_and_delete_states(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (_panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let path = directory.path().to_path_buf();
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone(), cx);
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218BQ6K,
+                path.clone(),
+                crate::translation_downloads::DownloadState::Downloading { downloaded: 100 },
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218BQ8,
+                path.clone(),
+                crate::translation_downloads::DownloadState::DownloadFailed {
+                    failure: crate::translation_downloads::DownloadFailure::Transport,
+                },
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218B2Bit,
+                path.clone(),
+                crate::translation_downloads::DownloadState::Deleting,
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218B125Bit,
+                path,
+                crate::translation_downloads::DownloadState::DeleteFailed {
+                    failure: crate::translation_downloads::DeleteFailure::Io {
+                        kind: std::io::ErrorKind::PermissionDenied,
+                    },
+                },
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_0").is_some(),
+            "a downloaded model offers delete"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_0").is_none(),
+            "a downloaded model offers no download button"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_1").is_some(),
+            "a download in flight draws its progress bar"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_1").is_none(),
+            "a download in flight offers no download button"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_2").is_some(),
+            "a failed download offers retry"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_2").is_some(),
+            "a failed download names its reason"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETING_3").is_some(),
+            "a delete in flight offers its disabled button"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_3").is_none(),
+            "a delete in flight must not offer a second delete"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_4").is_some(),
+            "a failed delete names its reason even when the file is gone"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_4").is_some(),
+            "a model whose file is gone offers a download rather than only a delete"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_4").is_none(),
+            "a model whose file is gone has nothing to delete"
+        );
+    }
+
+    /// The select offers exactly the models whose files are present at their published size.
+    #[gpui_kit::test]
+    fn the_model_select_should_list_only_downloaded_models(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (_panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let path = directory.path().to_path_buf();
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(TranslationModel::HyMt27BQ8, path.clone(), cx);
+            downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ6K, path.clone(), cx);
+        });
+        settle(cx);
+
+        let offered = cx.read(|cx| downloads.read(cx).downloaded_models(&path));
+
+        assert_eq!(
+            offered,
+            vec![TranslationModel::HyMt218BQ6K, TranslationModel::HyMt27BQ8],
+            "only the downloaded models are offered, in page order"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_SELECT").is_some(),
+            "the select is drawn over what it offers"
+        );
+    }
+
+    /// Deleting a model clears the selection that named it and removes its file.
+    #[gpui_kit::test]
+    fn deleting_a_selected_model_should_clear_the_selection_and_the_file(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let path = directory.path().join(model.file_name());
+        std::fs::write(&path, b"stub").expect("the fixture file should be written");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
+        });
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
+                    cx,
+                );
+            });
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| config.translation.selected_model = Some(model), cx);
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
+        wait_until_absent(cx, &downloads, model, directory.path(), &path);
+
+        assert!(!path.exists(), "the model file is deleted");
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            None,
+            "the stored selection is cleared before the file goes"
+        );
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            None,
+            "the session selection is cleared too"
+        );
+    }
+
+    /// A selection whose file is being deleted must not be written back by Confirm.
+    #[gpui_kit::test]
+    fn confirming_should_clear_a_selected_model_that_is_being_deleted(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let model = TranslationModel::HyMt27BQ8;
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
+            downloads.set_state_for_test(
+                model,
+                directory.path().to_path_buf(),
+                crate::translation_downloads::DownloadState::Deleting,
+                cx,
+            );
+        });
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_CONFIRM");
+
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            None,
+            "a model that is being deleted must not be stored as selected"
+        );
+        assert_eq!(
+            stored(cx).translation.model_directory,
+            Some(directory.path().to_path_buf())
+        );
+    }
+
+    /// Deleting a selected model clears the session selection at once rather than waiting for
+    /// the delete to finish, so a Confirm pressed during the delete cannot write it back.
+    #[gpui_kit::test]
+    fn confirming_while_a_delete_is_unloading_should_not_restore_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let path = directory.path().join(model.file_name());
+        std::fs::write(&path, b"stub").expect("the fixture file should be written");
+
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = std::sync::Mutex::new(release_receiver);
+        let unload: std::sync::Arc<
+            dyn Fn(&std::path::Path) -> Result<(), crate::translation_downloads::UnloadFailure>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_: &std::path::Path| {
+            entered_sender
+                .send(())
+                .expect("the test should be waiting for the unload");
+            release_receiver
+                .lock()
+                .expect("the release channel is not poisoned")
+                .recv()
+                .expect("the test should release the unload");
+            Ok(())
+        });
+        cx.update(|cx| install_translation_downloads_with(cx, unload));
+
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
+        });
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the delete should reach its unload");
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            None,
+            "clicking delete should clear the session selection immediately"
+        );
+
+        click(cx, "SETTINGS_CONFIRM");
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            None,
+            "confirming during a delete must not restore the selection"
+        );
+
+        release_sender
+            .send(())
+            .expect("the delete worker should still be waiting");
+        wait_until_absent(cx, &downloads, model, directory.path(), &path);
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            None,
+            "the finished delete must not put the selection back"
+        );
+    }
+
+    /// Deleting a model that is not the selected one leaves the selection alone.
+    #[gpui_kit::test]
+    fn deleting_another_model_should_keep_the_selected_one(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let selected = TranslationModel::HyMt218BQ4Km;
+        let other = TranslationModel::HyMt27BQ8;
+        let selected_path = directory.path().join(selected.file_name());
+        std::fs::write(&selected_path, b"stub").expect("the fixture file should be written");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(selected, directory.path().to_path_buf(), cx);
+            downloads.force_downloaded_for_test(other, directory.path().to_path_buf(), cx);
+        });
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelSelected {
+                        model: Some(selected),
+                    },
+                    cx,
+                );
+            });
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| config.translation.selected_model = Some(selected),
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_AI_MODEL_DELETE_7");
+
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            Some(selected),
+            "deleting another model must not clear the selected one"
+        );
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            Some(selected),
+            "deleting another model must not clear the stored selection"
+        );
+
+        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
+        wait_until_absent(cx, &downloads, selected, directory.path(), &selected_path);
+
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            None,
+            "deleting the selected model clears the selection"
+        );
+        assert_eq!(stored(cx).translation.selected_model, None);
+    }
+
+    /// A finished download becomes the selection when nothing usable was selected.
+    #[gpui_kit::test]
+    fn a_completed_download_should_be_selected_when_nothing_usable_is_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let model = TranslationModel::HyMt218BQ8;
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.complete_download_for_test(model, directory.path().to_path_buf(), cx);
+        });
+        settle(cx);
+
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            Some(model),
+            "the finished download is what the page now uses"
+        );
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            Some(model),
+            "and the settings the download manager writes agree"
+        );
+    }
+
+    /// A directory change clears a selection whose file is not in the new directory.
+    #[gpui_kit::test]
+    fn changing_the_directory_should_clear_a_selection_that_is_not_there(cx: &mut TestAppContext) {
+        let first = tempfile::tempdir().expect("the first directory should build");
+        let second = tempfile::tempdir().expect("the second directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(first.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let model = TranslationModel::HyMt218BQ4Km;
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.force_downloaded_for_test(model, first.path().to_path_buf(), cx);
+        });
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_AI_BROWSE");
+        cx.simulate_path_prompt_response(|_| Some(vec![second.path().to_path_buf()]));
+        settle(cx);
+
+        assert_eq!(
+            drafted(&panel, cx).translation.selected_model,
+            None,
+            "the model is not in the chosen directory, so the choice goes"
+        );
+        assert_eq!(
+            drafted(&panel, cx).translation.model_directory,
+            Some(second.path().to_path_buf())
+        );
+    }
+
+    /// A model the background manager selected in the stored directory is not persisted with
+    /// the different directory this session chose but has not confirmed yet.
+    #[gpui_kit::test]
+    fn confirming_should_clear_a_selected_model_that_is_not_in_the_chosen_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let stored_directory = tempfile::tempdir().expect("the stored directory should build");
+        let chosen_directory = tempfile::tempdir().expect("the chosen directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(stored_directory.path().to_path_buf());
+        let (panel, cx) = settings(config, cx);
+
+        panel.update(cx, |dialog, cx| {
+            dialog.draft.update(cx, |draft, cx| {
+                draft.write(
+                    crate::draft::SettingsEdit::TranslationModelDirectory {
+                        directory: chosen_directory.path().to_path_buf(),
+                    },
+                    cx,
+                );
+            });
+            // What the download manager writes when a download finishes while the page is
+            // open: it selects the model in the directory the settings still name.
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(
+                    |config| config.translation.selected_model = Some(TranslationModel::HyMt27BQ8),
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_CONFIRM");
+
+        assert_eq!(
+            stored(cx).translation.model_directory,
+            Some(chosen_directory.path().to_path_buf()),
+            "the directory the session chose should be stored"
+        );
+        assert_eq!(
+            stored(cx).translation.selected_model,
+            None,
+            "a selection that is not downloaded in the stored directory must be cleared"
+        );
     }
 
     /// A venue's page is named by the venue it configures, and the sidebar row is what opens

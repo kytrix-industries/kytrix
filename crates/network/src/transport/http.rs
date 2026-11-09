@@ -16,6 +16,15 @@ use crate::transport::{
 
 const MIB: usize = 1024 * 1024;
 const STANDARD_RESPONSE_BODY_LIMIT: usize = 30 * MIB;
+/// The response-body budget for a model download.
+///
+/// A model is streamed to disk rather than buffered, so this only has to exceed the
+/// largest published model. 16 GiB leaves room for every model in the catalog; a
+/// 32-bit target cannot express that number and uses its own maximum instead.
+#[cfg(target_pointer_width = "64")]
+const MODEL_DOWNLOAD_RESPONSE_BODY_LIMIT: usize = 16 * 1024 * MIB;
+#[cfg(not(target_pointer_width = "64"))]
+const MODEL_DOWNLOAD_RESPONSE_BODY_LIMIT: usize = usize::MAX;
 const MAX_HTTP_CLIENTS: usize = 64;
 
 /// A fixed HTTP policy for one class of network operation.
@@ -27,6 +36,7 @@ pub enum HttpClientClass {
     XMedia,
     UpdaterMetadata,
     UpdaterDownload,
+    ModelDownload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +99,13 @@ impl HttpClientClass {
                 request_timeout: None,
                 redirect_limit: 10,
                 response_body_limit: 1024 * MIB,
+                user_agent: concat!("Kytrix/", env!("CARGO_PKG_VERSION")),
+            },
+            Self::ModelDownload => HttpClientProfile {
+                connect_timeout: Duration::from_secs(10),
+                request_timeout: None,
+                redirect_limit: 10,
+                response_body_limit: MODEL_DOWNLOAD_RESPONSE_BODY_LIMIT,
                 user_agent: concat!("Kytrix/", env!("CARGO_PKG_VERSION")),
             },
         }

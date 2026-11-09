@@ -77,6 +77,18 @@ fn client_classes_have_fixed_body_and_redirect_limits() {
         HttpClientClass::UpdaterDownload.response_body_limit(),
         1024 * MIB
     );
+    assert_eq!(HttpClientClass::ModelDownload.redirect_limit(), 10);
+    #[cfg(target_pointer_width = "64")]
+    assert!(
+        HttpClientClass::ModelDownload.response_body_limit() >= 8 * 1024 * MIB,
+        "the model download class must be able to cover an 8 GiB model"
+    );
+    #[cfg(not(target_pointer_width = "64"))]
+    assert_eq!(
+        HttpClientClass::ModelDownload.response_body_limit(),
+        usize::MAX,
+        "a 32-bit target uses the largest budget it can express"
+    );
 }
 
 async fn spawn_keep_alive_server() -> (

@@ -100,8 +100,9 @@ impl NetworkGenerationTracker {
             runtime.venues.insert(venue, generation);
         }
 
-        // Kytrix's own services are stamped apart from the venues: they are routed
-        // by their own applications and a venue moving must not invalidate them.
+        // Kytrix's own services and the built-in model download are stamped apart
+        // from the venues: they are routed by their own applications and a venue
+        // moving must not invalidate them.
         for target in all_network_targets(config, self.services.keys().cloned()) {
             let fingerprint = service_route_fingerprint(config, &target);
             let generation = self
@@ -148,6 +149,10 @@ fn all_network_targets(
     .into_iter()
     .map(|capability| ServiceTarget::KytrixService { capability })
     .collect::<BTreeSet<_>>();
+    // The HuggingFace model download has no Kytrix capability, but it is a base
+    // target all the same: its route generation has to be computed whether or not
+    // the user has configured a line for it.
+    targets.insert(ServiceTarget::TranslationModelDownload);
     targets.extend(config.proxy_applications.keys().cloned());
     targets.extend(known_targets);
     targets
@@ -169,7 +174,7 @@ fn effective_route_fingerprint(config: &Config, venue: &VenueId) -> EffectiveRou
     }
 }
 
-/// Fingerprints the route one Kytrix service takes.
+/// Fingerprints the route one service target takes.
 fn service_route_fingerprint(config: &Config, target: &ServiceTarget) -> EffectiveRouteFingerprint {
     let route = config
         .proxy_applications
@@ -928,14 +933,18 @@ mod tests {
         assert_eq!(store.read().network_route_generation(&okx), okx_initial);
     }
 
-    /// Every Kytrix service capability is a target the store stamps, whether or not anything
-    /// has configured a line of its own for it: a capability missing from the list would never
+    /// Every base network target is a target the store stamps, whether or not anything
+    /// has configured a line of its own for it: a target missing from the list would never
     /// have its route generation computed, so a proxy change for it would go unnoticed.
     #[test]
-    fn every_kytrix_service_capability_should_have_a_network_target() {
+    fn every_base_network_target_should_have_a_route_generation() {
         let targets = all_network_targets(&Config::default(), []);
 
-        assert_eq!(targets.len(), 14);
+        assert_eq!(targets.len(), 15);
+        assert!(
+            targets.contains(&ServiceTarget::TranslationModelDownload),
+            "the HuggingFace model download should be a stamped target"
+        );
         assert!(
             targets.contains(&ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::CoinMarketCapFearAndGreedIndex,
@@ -947,6 +956,31 @@ mod tests {
                 capability: KytrixServiceCapability::GlobalShippingChokepoint,
             }),
             "the AIS capability should be a stamped target"
+        );
+    }
+
+    /// The model download target's generation moves with the default route, which can
+    /// only happen when the target takes part in route generation.
+    #[test]
+    fn translation_model_download_should_follow_the_default_route_generation() {
+        let target = ServiceTarget::TranslationModelDownload;
+        let mut store = ConfigStore::in_memory(Config::default());
+        let initial = store
+            .read()
+            .network_config()
+            .service_network_route_generation(&target);
+
+        store.update(|config| {
+            config.proxies.insert("local".into(), local_proxy());
+            config.proxy_default = ProxyRoute::named("local");
+        });
+
+        assert_ne!(
+            store
+                .read()
+                .network_config()
+                .service_network_route_generation(&target),
+            initial
         );
     }
 

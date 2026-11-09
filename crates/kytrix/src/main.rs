@@ -62,6 +62,14 @@ fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, Initiali
     let transport = install_kytrix_service(cx)?;
     let runtime = widget_tokio_runtime::global::try_handle(cx)
         .ok_or(InitializationError::RuntimeUnavailable)?;
+    settings_ui::translation_downloads::install(
+        cx,
+        settings_ui::translation_downloads::TranslationDownloadsDeps {
+            transport: Arc::clone(&transport),
+            runtime: runtime.clone(),
+            unload: translation_unload(),
+        },
+    );
     updater_ui::global::install(cx, UpdaterDeps { transport, runtime });
 
     Ok(recovery)
@@ -108,6 +116,33 @@ const fn transport_policy() -> TransportPolicy {
         allow_plaintext: !cfg!(feature = "production"),
         extra_root_certificates: Vec::new(),
     }
+}
+
+/// Drops the translation engine that may hold a model file before the download manager deletes
+/// it. Windows ARM64 has no llama.cpp build, so there the engine cannot have loaded a file.
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+fn translation_unload() -> Arc<
+    dyn Fn(&std::path::Path) -> Result<(), settings_ui::translation_downloads::UnloadFailure>
+        + Send
+        + Sync,
+> {
+    Arc::new(|path| {
+        ai_translator::translator::unload_model(path).map_err(|error| match error {
+            ai_translator::error::TranslationError::UnloadTimeout { .. } => {
+                settings_ui::translation_downloads::UnloadFailure::TimedOut
+            }
+            _ => settings_ui::translation_downloads::UnloadFailure::Engine,
+        })
+    })
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn translation_unload() -> Arc<
+    dyn Fn(&std::path::Path) -> Result<(), settings_ui::translation_downloads::UnloadFailure>
+        + Send
+        + Sync,
+> {
+    Arc::new(|_: &std::path::Path| Ok(()))
 }
 
 /// Failure to bring the application into a runnable state.

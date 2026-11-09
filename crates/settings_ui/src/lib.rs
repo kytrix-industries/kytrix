@@ -21,5 +21,6 @@ mod search;
 pub mod settings;
 mod table;
 mod translation;
+pub mod translation_downloads;
 
 pub mod appearance;

@@ -9,8 +9,14 @@ ahash = { workspace = true }
 gpui-kit = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
+network = { workspace = true }
+reqwest = { workspace = true }
 smol_str = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 url = { workspace = true }
+widget_tokio_runtime = { workspace = true }
 
 # Workspace members
 app_config = { workspace = true }
@@ -26,11 +32,9 @@ widget = { workspace = true }
 # `test-support` feature, which is never enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 tempfile = { workspace = true }
-# The runtime global the market participants root is installed against: a test that opens the
-# settings the way the system button does installs both, the way the composition
-# root does.
-widget_tokio_runtime = { workspace = true }
 
 [lints]
 workspace = true

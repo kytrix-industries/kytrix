@@ -339,22 +339,29 @@ fn translation_page() -> PageDef {
             "translation",
             "translate",
             "翻译",
-            "llama",
-            "llama.cpp",
             "model",
             "models",
             "模型",
             "当前支持的模型",
             "模型存放目录",
+            "使用模型",
             "model directory",
+            "model in use",
             "browse",
             "浏览",
+            "huggingface",
+            "download",
+            "下载",
             "hy-mt2",
             "hy mt2",
-            "hy-mt2-1.8b-gguf",
-            "hy-mt2-1.8b-2bit-gguf",
-            "hy-mt2-1.8b-1.25bit-gguf",
-            "hy-mt2-7b-gguf",
+            "hy-mt2-1.8b-q4_k_m",
+            "hy-mt2-1.8b-q6_k",
+            "hy-mt2-1.8b-q8_0",
+            "hy-mt2-1.8b-2bit",
+            "hy-mt2-1.8b-1.25bit",
+            "hy-mt2-7b-q4_k_m",
+            "hy-mt2-7b-q6_k",
+            "hy-mt2-7b-q8_0",
         ],
         sections: Vec::new(),
     }
@@ -569,6 +576,12 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
                 "settings_ui.proxies.app_updates",
                 &["updater", "update", "更新"],
                 APP_UPDATES,
+            ),
+            proxy_targets_field(
+                "proxy-applications.ai.models",
+                "settings_ui.proxies.ai_model_downloads",
+                &["ai", "model", "模型", "huggingface", "下载"],
+                AI_MODELS,
             ),
         ],
     ));
@@ -1566,6 +1579,9 @@ const APP_UPDATES: &[ServiceTarget] = &[
     },
 ];
 
+/// The HuggingFace translation model downloads, which have a line of their own.
+const AI_MODELS: &[ServiceTarget] = &[ServiceTarget::TranslationModelDownload];
+
 /// The media service, which the applications page groups on its own.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
@@ -1753,7 +1769,7 @@ pub(crate) mod tests {
     /// locale, and a locale's key would look like an orphan the crate does not draw. Nothing ties
     /// it to the directory, so a source added to this crate has to be added here too — which is
     /// what [`every_settings_source_should_be_read_by_the_key_guard`] is for.
-    const SETTINGS_SOURCES: [(&str, &str); 12] = [
+    const SETTINGS_SOURCES: [(&str, &str); 13] = [
         ("access.rs", include_str!("access.rs")),
         ("appearance.rs", include_str!("appearance.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
@@ -1766,6 +1782,10 @@ pub(crate) mod tests {
         ("settings.rs", include_str!("settings.rs")),
         ("table.rs", include_str!("table.rs")),
         ("translation.rs", include_str!("translation.rs")),
+        (
+            "translation_downloads.rs",
+            include_str!("translation_downloads.rs"),
+        ),
     ];
 
     /// The half of one source that names the settings: everything above the test module it
@@ -2235,6 +2255,7 @@ pub(crate) mod tests {
         for id in [
             "proxy-applications.kytrix.cloud",
             "proxy-applications.kytrix.updates",
+            "proxy-applications.ai.models",
             "proxy-applications.x.media",
         ] {
             let row = field(applications, id);

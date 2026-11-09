@@ -21,8 +21,9 @@ pub(crate) fn translate(
 ) -> Result<String, TranslationError> {
     let config = cx.global::<ConfigManager>().read();
     let directory = config.translation.model_directory.as_deref();
+    let selected_model = config.translation.selected_model;
 
-    ai_translator::translator::translate(directory, target_lang, content)
+    ai_translator::translator::translate(directory, selected_model, target_lang, content)
 }
 
 /// Keeps the translation entry point in the binary after checking it is usable.

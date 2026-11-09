@@ -1196,8 +1196,36 @@ settings_ui:
     version_description: 当前安装的应用程序版本
   ai:
     browse: 浏览
+    delete: 删除
+    delete_failed: 删除失败：%{reason}
+    delete_failed_downloads: 该模型的下载未能停止
+    delete_failed_io: 文件无法删除
+    delete_failed_timeout: 删除未在限定时间内完成
+    delete_failed_unload: 模型无法被释放
+    delete_failed_unload_timeout: 翻译任务占用模型过久
+    deleting: 删除中
+    download: 下载
+    download_failed: 下载失败：%{reason}
+    download_failed_cancelled: 下载已取消
+    download_failed_destination: 目标不是文件路径
+    download_failed_io: 文件无法写入
+    download_failed_redirect: 下载重定向到了不可用的地址
+    download_failed_route: 无法解析网络线路
+    download_failed_size: 下载得到 %{actual} 字节，预期 %{expected} 字节
+    download_failed_status: 服务器返回 HTTP %{status}
+    download_failed_task: 下载任务失败
+    download_failed_transport: 下载因网络问题失败
+    download_failed_url: 模型地址无效
+    downloading: 下载中
+    download_url: 下载地址：%{url}
     model_directory: 模型存放目录
+    model_in_use: 使用模型
+    model_size: （模型大小：%{size} MB）
     models: 当前支持的模型
+    no_downloaded_models: 暂无已下载模型
+    no_model_directory: 请先选择模型存放目录
+    progress: '%{percent}%'
+    retry: 重试
     title: AI
     translation:
       title: 翻译
@@ -1261,6 +1289,7 @@ settings_ui:
   proxies:
     add: 新增代理
     address: 地址
+    ai_model_downloads: AI 模型下载
     app_updates: 应用更新
     applications: 代理应用
     authorization: 认证方式

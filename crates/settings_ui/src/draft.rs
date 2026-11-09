@@ -11,7 +11,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use app_config::{network::ProxyConfig, settings::Config};
+use app_config::{network::ProxyConfig, settings::Config, translation::TranslationModel};
 use gpui_kit::Context;
 use smol_str::SmolStr;
 
@@ -26,6 +26,8 @@ pub(crate) enum SettingsEdit {
     },
     /// The directory the local translation model is loaded from.
     TranslationModelDirectory { directory: PathBuf },
+    /// The model the local translation is loaded from, or none when no model is chosen.
+    TranslationModelSelected { model: Option<TranslationModel> },
     /// One entry added to the proxy catalog.
     AddProxy { name: SmolStr, proxy: ProxyConfig },
     /// One entry renamed and rewritten, together with every route bound to its name.
@@ -45,6 +47,9 @@ impl SettingsEdit {
             Self::Field { access, value } => access.write(config, value),
             Self::TranslationModelDirectory { directory } => {
                 config.translation.model_directory = Some(directory.clone());
+            }
+            Self::TranslationModelSelected { model } => {
+                config.translation.selected_model = *model;
             }
             Self::AddProxy { name, proxy } => {
                 config.proxies.insert(name.clone(), proxy.clone());
@@ -232,6 +237,34 @@ mod tests {
         assert_eq!(applied.translation.model_directory, Some(directory));
         assert_eq!(applied.language, Config::default().language);
         assert!(applied.proxies.is_empty());
+    }
+
+    /// Choosing and clearing a translation model changes that setting and nothing else.
+    #[test]
+    fn a_translation_model_edit_should_change_only_that_setting() {
+        let mut config = Config::default();
+        config.translation.model_directory = Some(PathBuf::from("models"));
+        let mut draft = SettingsDraft::new(config.clone());
+        let model = app_config::translation::TranslationModel::HyMt27BQ8;
+
+        draft
+            .edits
+            .push(SettingsEdit::TranslationModelSelected { model: Some(model) });
+        let applied = draft.applied_to(&config);
+
+        assert_eq!(applied.translation.selected_model, Some(model));
+        assert_eq!(
+            applied.translation.model_directory,
+            config.translation.model_directory
+        );
+        assert!(applied.proxies.is_empty());
+
+        draft
+            .edits
+            .push(SettingsEdit::TranslationModelSelected { model: None });
+        let cleared = draft.applied_to(&config);
+
+        assert_eq!(cleared.translation.selected_model, None);
     }
 
     /// The same draft lands the same way on whatever the settings are at the moment it is

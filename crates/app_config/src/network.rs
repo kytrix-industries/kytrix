@@ -1,7 +1,7 @@
 //! The persisted network, proxy, and outbound-route configuration model.
 //!
 //! Every outbound request is routed by a [`ProxyRoute`]: a venue by its own line,
-//! a Kytrix service by its application, and one that names no line by the
+//! a service target by its application, and one that names no line by the
 //! document's default line. The model is persisted with the rest of the
 //! application settings and materialized into [`ResolvedProxy`] hops by the
 //! `network` transport before any request is sent.
@@ -66,8 +66,8 @@ pub enum KytrixServiceCapability {
 /// The network crate never interprets a target; it forwards it as a typed
 /// configuration key. A venue is not a target: its requests are routed by the
 /// venue's own configuration, which names a line of its own or follows the
-/// default line, so the only service a target still addresses is one of Kytrix's
-/// own.
+/// default line, so the targets that remain are Kytrix's own services and the
+/// built-in HuggingFace model download.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ServiceTarget {
@@ -76,6 +76,13 @@ pub enum ServiceTarget {
         #[serde(rename = "capability")]
         capability: KytrixServiceCapability,
     },
+    /// A HuggingFace download of one of the local translation models.
+    ///
+    /// The files come from HuggingFace rather than from a Kytrix service, but the
+    /// download still takes one of the application's outbound routes, so it is a
+    /// service target of its own.
+    #[serde(rename = "translation_model_download")]
+    TranslationModelDownload,
 }
 
 impl fmt::Display for ServiceTarget {
@@ -83,6 +90,9 @@ impl fmt::Display for ServiceTarget {
         match self {
             Self::KytrixService { capability } => {
                 write!(formatter, "Kytrix service {capability:?}")
+            }
+            Self::TranslationModelDownload => {
+                formatter.write_str("HuggingFace translation model download")
             }
         }
     }
@@ -381,7 +391,7 @@ pub struct NetworkRuntimeGenerations {
     pub default_route: NetworkRouteGeneration,
     /// The generation of each venue's proxy decision, keyed by venue.
     pub venues: BTreeMap<VenueId, NetworkRouteGeneration>,
-    /// The generation of each Kytrix service's route, keyed by service target.
+    /// The generation of each service target's route, keyed by service target.
     pub services: BTreeMap<ServiceTarget, NetworkRouteGeneration>,
 }
 
@@ -390,7 +400,7 @@ pub struct NetworkRuntimeGenerations {
 pub struct Config {
     pub proxies: BTreeMap<SmolStr, ProxyConfig>,
     pub proxy_default: ProxyRoute,
-    /// The outbound route of Kytrix's own services, keyed by service target.
+    /// The outbound route of each service target, keyed by service target.
     pub proxy_applications: BTreeMap<ServiceTarget, ProxyRoute>,
     /// The outbound route of each venue that names one of its own, keyed by
     /// venue.
@@ -402,7 +412,7 @@ pub struct Config {
     pub default_route_generation: NetworkRouteGeneration,
     /// The generation of each venue's proxy decision, keyed by venue.
     pub route_generations: BTreeMap<VenueId, NetworkRouteGeneration>,
-    /// The generation of each Kytrix service's route, keyed by service target.
+    /// The generation of each service target's route, keyed by service target.
     pub service_route_generations: BTreeMap<ServiceTarget, NetworkRouteGeneration>,
 }
 
@@ -432,7 +442,7 @@ impl Config {
             .unwrap_or_else(|| self.proxy_default.clone())
     }
 
-    /// Returns the outbound route one Kytrix service takes.
+    /// Returns the outbound route one service target takes.
     pub fn service_proxy_route_for(&self, target: &ServiceTarget) -> ProxyRoute {
         self.proxy_applications
             .get(target)
@@ -448,7 +458,7 @@ impl Config {
             .unwrap_or(self.default_route_generation)
     }
 
-    /// Returns the proxy generation of one Kytrix service.
+    /// Returns the proxy generation of one service target.
     pub fn service_network_route_generation(
         &self,
         target: &ServiceTarget,
@@ -907,6 +917,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translation_model_download_should_use_the_explicit_wire_shape() {
+        let target = ServiceTarget::TranslationModelDownload;
+
+        assert_eq!(
+            serde_json::to_value(&target).expect("the download target should serialize"),
+            json!({ "kind": "translation_model_download" })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceTarget>(json!({
+                "kind": "translation_model_download",
+            }))
+            .expect("the download target should decode"),
+            target
+        );
+        assert_eq!(target.to_string(), "HuggingFace translation model download");
+    }
+
     /// A service target is an ordered key: a rewritten file keeps its order.
     #[test]
     fn service_target_should_keep_a_stable_order_as_a_btree_key() {
@@ -947,6 +975,29 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// The model download target is a key of the same map: it sorts after every
+    /// Kytrix service capability and a separate but equal value addresses the same
+    /// entry.
+    #[test]
+    fn translation_model_download_should_be_an_ordered_and_equal_btree_key() {
+        let service = target();
+        let download = ServiceTarget::TranslationModelDownload;
+        let mut applications = BTreeMap::new();
+        applications.insert(download.clone(), ProxyRoute::named("hk"));
+        applications.insert(service.clone(), ProxyRoute::System);
+
+        assert_eq!(
+            applications.keys().cloned().collect::<Vec<_>>(),
+            vec![service, download.clone()],
+            "the unit variant is declared last, so it sorts after every Kytrix service"
+        );
+        assert_eq!(
+            applications.get(&ServiceTarget::TranslationModelDownload),
+            Some(&ProxyRoute::named("hk"))
+        );
+        assert_ne!(download, target());
     }
 
     /// A venue that names a route and a generation of its own owns them; the
