@@ -24,8 +24,8 @@ use tokio::task::AbortHandle;
 /// attempt this alert is the report of. That handle is the only thing it knows about the
 /// attempt, which is why the way to end one is handed to it rather than reached for.
 ///
-/// Ending the attempt there is what keeps the menu honest: an alert that could be
-/// dismissed while the attempt behind it stayed open would be a menu offering a sign-in
+/// Ending the attempt there is what keeps the control honest: an alert that could be
+/// dismissed while the attempt behind it stayed open would be a control offering a sign-in
 /// that does nothing, for as long as the abandoned attempt lived.
 pub(crate) fn show_awaiting_authorization(window: &mut Window, cx: &mut App, sign_in: AbortHandle) {
     let title = t!(cx, "window.account.sign_in");

@@ -1136,7 +1136,6 @@ window:
     awaiting_authorization: <p align="center">Finish signing in and authorizing in your browser. Choosing “Cancel sign-in” gives up this attempt.</p>
     cancel_sign_in: Cancel sign-in
     copy_wallet_address: Copy wallet address
-    menu: Account menu
     open_account: Account
     plan_unavailable: Subscription plan unavailable
     sign_in: Sign in

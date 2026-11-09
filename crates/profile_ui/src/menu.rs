@@ -51,9 +51,6 @@ const ACCOUNT_BADGE_LOGO_SIZE: f32 = 14.0;
 /// entries under the pointer that opened it.
 pub(crate) const MENU_WIDTH: f32 = 280.0;
 
-/// The entry that starts a sign-in.
-pub(crate) const SIGN_IN_ITEM_ID: &str = "sign-in";
-
 /// The entry that opens the account dashboard in the browser.
 pub(crate) const OPEN_ACCOUNT_ITEM_ID: &str = "open-account";
 
@@ -63,7 +60,6 @@ pub(crate) const SIGN_OUT_ITEM_ID: &str = "sign-out";
 /// What an activated menu entry asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProfileAction {
-    SignIn,
     OpenAccount,
     SignOut,
 }
@@ -71,7 +67,6 @@ pub(crate) enum ProfileAction {
 /// The action a menu entry stands for, or `None` for an entry this menu does not own.
 pub(crate) fn profile_action(item_id: &str) -> Option<ProfileAction> {
     match item_id {
-        SIGN_IN_ITEM_ID => Some(ProfileAction::SignIn),
         OPEN_ACCOUNT_ITEM_ID => Some(ProfileAction::OpenAccount),
         SIGN_OUT_ITEM_ID => Some(ProfileAction::SignOut),
         _ => None,
@@ -80,19 +75,20 @@ pub(crate) fn profile_action(item_id: &str) -> Option<ProfileAction> {
 
 /// The content of the account menu, as it stands when one frame of it is drawn.
 ///
-/// Signed out, the menu holds one entry: sign in. Signed in, it holds the account it belongs
-/// to — the face with the wallet family's mark on its lower-right corner, the subscription
-/// tier, and the shortened address, which offers the whole address on hover, with the button
-/// that copies it — above the entries that open and sign out the account.
+/// The menu holds the account it belongs to — the face with the wallet family's mark on its
+/// lower-right corner, the subscription tier, and the shortened address, which offers the
+/// whole address on hover, with the button that copies it — above the entries that open and
+/// sign out the account. There is nothing else in it: somebody who is not signed in has the
+/// title bar's control to press, not a menu to open.
 pub(crate) struct AccountMenu {
-    account: Option<SignedInAccount>,
+    account: SignedInAccount,
     avatar: Option<Arc<Image>>,
     plan: Option<PlanCode>,
 }
 
 impl AccountMenu {
     pub(crate) fn new(
-        account: Option<SignedInAccount>,
+        account: SignedInAccount,
         avatar: Option<Arc<Image>>,
         plan: Option<PlanCode>,
     ) -> Self {
@@ -103,45 +99,35 @@ impl AccountMenu {
         }
     }
 
-    /// The menu of entries: a sign-in, or an account and a sign-out.
+    /// The menu of entries: the account, and the two things to do with it.
     ///
     /// The entries are built on every frame the menu is drawn rather than moved into it once,
     /// because the account, the face and the tier are the menu's own state and can read
     /// differently from one frame to the next.
     ///
-    /// Neither entry is ever disabled. Signing in is offered again the moment an attempt
-    /// ends, and an attempt ends when its alert is read, so there is no moment in which
-    /// the entry is the one thing the user cannot ask for; signing out finishes before the
+    /// Neither entry is ever disabled: a dashboard handoff that fails reports itself in an
+    /// alert rather than making the entry unavailable, and a sign-out finishes before the
     /// click is over.
     pub(crate) fn entries(&self, id: &ElementId, cx: &App) -> Menu {
         let mut menu = Menu::new((id.clone(), "menu")).small();
 
-        match self.account.as_ref() {
-            None => {
-                menu = menu.item(MenuItem::Action(MenuItemAction::new(
-                    SIGN_IN_ITEM_ID,
-                    t!(cx, "window.account.sign_in"),
-                )));
-            }
-            Some(account) => {
-                menu = menu.item(MenuItem::Custom(self.account_block(id, account, cx)));
-                menu = menu.item(MenuItem::Separator);
-                menu = menu.item(MenuItem::Action(MenuItemAction::new(
-                    OPEN_ACCOUNT_ITEM_ID,
-                    t!(cx, "window.account.open_account"),
-                )));
-                menu = menu.item(MenuItem::Action(MenuItemAction::new(
-                    SIGN_OUT_ITEM_ID,
-                    t!(cx, "window.account.sign_out"),
-                )));
-            }
-        }
+        menu = menu.item(MenuItem::Custom(self.account_block(id, cx)));
+        menu = menu.item(MenuItem::Separator);
+        menu = menu.item(MenuItem::Action(MenuItemAction::new(
+            OPEN_ACCOUNT_ITEM_ID,
+            t!(cx, "window.account.open_account"),
+        )));
+        menu = menu.item(MenuItem::Action(MenuItemAction::new(
+            SIGN_OUT_ITEM_ID,
+            t!(cx, "window.account.sign_out"),
+        )));
 
         menu
     }
 
     /// The account block: face, tier and the address it belongs to, stacked and centred.
-    fn account_block(&self, id: &ElementId, account: &SignedInAccount, cx: &App) -> AnyElement {
+    fn account_block(&self, id: &ElementId, cx: &App) -> AnyElement {
+        let account = &self.account;
         let address = account.wallet_address();
         let copy_button = Button::new((id.clone(), "copy-address"))
             .ghost()

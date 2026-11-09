@@ -914,9 +914,6 @@ mod tests {
     const PROFILE_AVATAR: &str = "TEST_PROFILE_TRIGGER_AVATAR";
     const PROFILE_SEPARATOR: &str = "TITLE_BAR_PROFILE_SEPARATOR";
 
-    /// The signed-out entry of the account menu the control opens.
-    const SIGN_IN_ENTRY: &str = "TEST_MENU_ITEM_sign-in";
-
     /// The name the full panel draws inside a workspace row.
     const WORKSPACE_NAME: &str = "SIDEBAR_WORKSPACE_NAME";
 
@@ -1459,14 +1456,15 @@ mod tests {
         );
     }
 
-    /// The title bar's account control is a working control: its menu opens under it, and
-    /// the signed-out menu offers the sign-in entry.
+    /// The title bar's account control is a working control: with nobody signed in it is the
+    /// button whose press starts the sign-in, rather than a menu, and the bar's drag area
+    /// does not take the press.
     #[gpui_kit::test]
-    fn the_account_control_should_open_its_menu_from_the_title_bar(cx: &mut TestAppContext) {
+    fn the_account_control_should_start_a_sign_in_from_the_title_bar(cx: &mut TestAppContext) {
         let cx = root_window(cx, SidebarMode::Full);
 
         assert!(
-            cx.debug_bounds(SIGN_IN_ENTRY).is_none(),
+            cx.debug_bounds("TEST_DROPDOWN_PANEL").is_none(),
             "nothing is offered before the account control is pressed"
         );
         assert!(
@@ -1474,23 +1472,15 @@ mod tests {
             "the control draws the account's face"
         );
 
-        let control = drawn(cx, PROFILE_TRIGGER);
         click(cx, PROFILE_TRIGGER);
 
-        let panel = drawn(cx, "TEST_DROPDOWN_PANEL");
         assert!(
-            panel.top() >= control.bottom(),
-            "the account menu hangs below the control: the control ends at {} and the menu starts at {}",
-            control.bottom(),
-            panel.top()
+            cx.debug_bounds("TEST_DROPDOWN_PANEL").is_none(),
+            "a signed-out control is a button: its press is the sign-in, not a menu"
         );
         assert!(
-            panel.left() < control.left(),
-            "the menu grows leftwards into the window rather than off its right edge"
-        );
-        assert!(
-            cx.debug_bounds(SIGN_IN_ENTRY).is_some(),
-            "the signed-out menu offers the sign-in entry"
+            cx.debug_bounds(PANEL).is_some(),
+            "the press starts the sign-in the control offers"
         );
     }
 

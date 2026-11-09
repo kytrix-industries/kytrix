@@ -2,7 +2,8 @@
 //! bar draws.
 //!
 //! The control is this view: the title bar mounts [`ProfileMenu`], and it draws the
-//! account's face and the menu behind it.
+//! account's face and the menu behind it — or, while nobody is signed in, the button whose
+//! press starts the sign-in.
 //!
 //! # What it owns
 //!
@@ -36,8 +37,8 @@ use std::sync::Arc;
 use app_config::settings::{AccountConfig, AccountWalletKind};
 use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
-    dropdown::Dropdown, interactive::InteractiveVariantExt as _, layer::LayerExt as _,
-    size::UnifiedSizable as _, tooltip::Tooltip,
+    button::Button, dropdown::Dropdown, interactive::InteractiveVariantExt as _,
+    layer::LayerExt as _, size::UnifiedSizable as _, tooltip::Tooltip,
 };
 use futures::future::BoxFuture;
 use gpui_kit::{
@@ -280,7 +281,6 @@ impl ProfileMenu {
     /// Runs the action an entry of the account menu stands for.
     fn activate(&mut self, item_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match profile_action(item_id) {
-            Some(ProfileAction::SignIn) => self.start_sign_in(window, cx),
             Some(ProfileAction::OpenAccount) => self.open_account(window, cx),
             Some(ProfileAction::SignOut) => self.confirm_sign_out(window, cx),
             None => {}
@@ -300,6 +300,13 @@ impl ProfileMenu {
         let current_user_id = account.as_ref().map(|account| account.user_id.clone());
         self.account = account;
         self.avatar = avatar;
+
+        // The menu goes with the account that opened it: a signed-out control is a plain
+        // button, so the state that said a menu was open is left behind rather than
+        // inherited by the next account that signs in.
+        if self.account.is_none() && *self.open_state.read(cx) {
+            self.open_state.write(cx, false);
+        }
 
         if previous_user_id != current_user_id {
             self.clear_plan_query();
@@ -410,7 +417,7 @@ impl ProfileMenu {
     ///
     /// The attempt lives exactly as long as the alert that reports it. Reading that alert is
     /// how the user says they are done with this attempt, so the alert aborts it — there is
-    /// nothing behind it any more, and the menu offers a sign-in again the moment the alert
+    /// nothing behind it any more, and the control offers a sign-in again the moment the alert
     /// is gone. An attempt nothing is waiting on would be a listener holding a loopback port
     /// for five minutes while the user has no way to ask for another one.
     ///
@@ -484,7 +491,7 @@ impl ProfileMenu {
 
     /// Accepts the end of the attempt that was waiting for its browser callback.
     ///
-    /// The wait is over whichever way it ended, so the attempt is dropped first: the menu
+    /// The wait is over whichever way it ended, so the attempt is dropped first: the control
     /// offers a sign-in again from here, whether the account arrived, the attempt failed,
     /// or nothing was left to report. The account is stored in the same step, because it is
     /// the news itself rather than something drawn about it.
@@ -669,15 +676,18 @@ impl Drop for ProfileMenu {
 
 impl Render for ProfileMenu {
     /// The account control the title bar draws: the account's face in the bar's square, and
-    /// the menu that opens below it.
+    /// — while somebody is signed in — the menu that opens below it.
     ///
-    /// The menu is a [`Dropdown`], the same control the market menu in the title bar is: it
-    /// belongs to the trigger, is placed against it, and fades as it comes and goes. The
-    /// content belongs to the account menu module; this view only decides when and where it
-    /// is drawn.
+    /// Signed in, the menu is a [`Dropdown`], the same control the market menu in the title
+    /// bar is: it belongs to the trigger, is placed against it, and fades as it comes and
+    /// goes. The content belongs to the account menu module; this view only decides when and
+    /// where it is drawn. Signed out there is nothing for a menu to hold, so the control is
+    /// the bar's plain button and its press is the sign-in itself.
+    ///
+    /// The hint on the control says what pressing it does: the address of the account whose
+    /// menu it opens, or the sign-in it starts.
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let id = ElementId::from(PROFILE_BUTTON_ID);
-        let label = t!(cx, "window.account.menu");
         // The placeholder keeps the bar's mark size; a generated face is the account's own
         // picture, so it takes more of the square than a mark does.
         let avatar_size = if self.avatar.is_some() {
@@ -690,41 +700,74 @@ impl Render for ProfileMenu {
             avatar_size,
             "TEST_PROFILE_TRIGGER_AVATAR",
         );
-        // Built from the state this frame sees rather than from a snapshot taken when the
-        // menu opened, so an account that changes while its menu is up is what the menu
-        // shows.
-        let entries = AccountMenu::new(
-            self.account.as_ref().map(SignedInAccount::from),
-            self.avatar.clone(),
-            self.plan,
-        )
-        .entries(&id, cx);
         let profile = cx.entity().downgrade();
 
-        let trigger = Dropdown::new(id.clone())
-            .small()
-            .ghost()
-            .h(TRIGGER_SIZE)
-            .w(TRIGGER_SIZE)
-            // The face takes the square; the trigger size's own padding would squeeze the
-            // 24 px avatar the account draws.
-            .p_0()
-            .justify_center()
-            .aria_label(label.clone())
-            .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
-            .open_state(&self.open_state)
-            .placement(Placement::Bottom)
-            // The control sits on the title bar's right-hand side, so the menu hangs from its
-            // right edge and grows leftwards into the window rather than off the edge.
-            .align(Align::End)
-            .menu_width(px(MENU_WIDTH))
-            .menu(entries)
-            .on_menu_item_click(move |_, item_id, window, cx| {
-                let _ = profile.update(cx, |profile, cx| {
-                    profile.activate(item_id.as_ref(), window, cx);
-                });
-            })
-            .child(avatar);
+        let (trigger, hint) = match self.account.as_ref() {
+            // Nobody is signed in, so there is no menu to open: the press is the sign-in,
+            // and the hint is the one thing the control does.
+            None => {
+                let label = t!(cx, "window.account.sign_in");
+                let trigger = Button::new(id.clone())
+                    .small()
+                    .ghost()
+                    .h(TRIGGER_SIZE)
+                    .w(TRIGGER_SIZE)
+                    // The face takes the square; the trigger size's own padding would
+                    // squeeze the 24 px avatar the account draws.
+                    .p_0()
+                    .justify_center()
+                    .aria_label(label.clone())
+                    .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
+                    .child(avatar)
+                    .on_click(move |_, window, cx| {
+                        let _ = profile.update(cx, |profile, cx| profile.start_sign_in(window, cx));
+                    });
+                let hint = div()
+                    .debug_selector(|| "TEST_PROFILE_TOOLTIP_SIGN_IN".into())
+                    .child(label);
+
+                (trigger.into_any_element(), hint.into_any_element())
+            }
+            // Built from the state this frame sees rather than from a snapshot taken when the
+            // menu opened, so an account that changes while its menu is up is what the menu
+            // shows.
+            Some(account) => {
+                let account = SignedInAccount::from(account);
+                // The address is shortened by the rule the menu's own line uses, so the hint
+                // and the menu cannot disagree about which account is signed in.
+                let address = account.shortened_address();
+                let entries =
+                    AccountMenu::new(account, self.avatar.clone(), self.plan).entries(&id, cx);
+                let trigger = Dropdown::new(id.clone())
+                    .small()
+                    .ghost()
+                    .h(TRIGGER_SIZE)
+                    .w(TRIGGER_SIZE)
+                    .p_0()
+                    .justify_center()
+                    .aria_label(address.clone())
+                    .debug_selector(|| "TEST_PROFILE_TRIGGER".into())
+                    .open_state(&self.open_state)
+                    .placement(Placement::Bottom)
+                    // The control sits on the title bar's right-hand side, so the menu hangs
+                    // from its right edge and grows leftwards into the window rather than off
+                    // the edge.
+                    .align(Align::End)
+                    .menu_width(px(MENU_WIDTH))
+                    .menu(entries)
+                    .on_menu_item_click(move |_, item_id, window, cx| {
+                        let _ = profile.update(cx, |profile, cx| {
+                            profile.activate(item_id.as_ref(), window, cx);
+                        });
+                    })
+                    .child(avatar);
+                let hint = div()
+                    .debug_selector(|| "TEST_PROFILE_TOOLTIP_ADDRESS".into())
+                    .child(address);
+
+                (trigger.into_any_element(), hint.into_any_element())
+            }
+        };
 
         // The hint sits under the face, but not while the menu is down: the menu occupies
         // that space, and a hint left over its first entry would take the presses meant for
@@ -733,7 +776,7 @@ impl Render for ProfileMenu {
         if *self.open_state.read(cx) {
             tooltip
         } else {
-            tooltip.content(label)
+            tooltip.content(hint)
         }
     }
 }
@@ -1009,7 +1052,7 @@ mod tests {
         }
     }
 
-    /// The menu as the account entry mounts it, over an in-memory settings snapshot.
+    /// The control as the title bar mounts it, over an in-memory settings snapshot.
     struct Harness<'a> {
         menu: Entity<ProfileMenu>,
         source: FakeAccountService,
@@ -1053,8 +1096,9 @@ mod tests {
         )
     }
 
-    /// Opens the menu by pressing the entry and repaints.
-    fn open_menu(harness: &mut Harness) {
+    /// Presses the account control and repaints: the menu opens while somebody is signed in,
+    /// and the sign-in starts while nobody is.
+    fn press_trigger(harness: &mut Harness) {
         let trigger = harness
             .cx
             .debug_bounds("TEST_PROFILE_TRIGGER")
@@ -1065,6 +1109,19 @@ mod tests {
         harness.cx.run_until_parked();
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
+    }
+
+    /// Hovers the account control and lets the hint it gives finish fading in.
+    fn hover_trigger(harness: &mut Harness) {
+        let trigger = harness
+            .cx
+            .debug_bounds("TEST_PROFILE_TRIGGER")
+            .expect("the trigger should render")
+            .center();
+        harness
+            .cx
+            .simulate_mouse_move(trigger, None, Modifiers::none());
+        settle(harness);
     }
 
     fn shows(harness: &mut Harness, selector: &'static str) -> bool {
@@ -1151,7 +1208,6 @@ mod tests {
 
     #[test]
     fn every_menu_entry_should_map_to_the_action_it_stands_for() {
-        assert_eq!(profile_action("sign-in"), Some(ProfileAction::SignIn));
         assert_eq!(
             profile_action("open-account"),
             Some(ProfileAction::OpenAccount)
@@ -1192,20 +1248,124 @@ mod tests {
         );
     }
 
+    /// Signed out, the control is not a dropdown: its press is the sign-in itself, and there
+    /// is no menu between the two.
     #[gpui_kit::test]
-    fn a_menu_with_nobody_signed_in_should_offer_only_a_sign_in(cx: &mut TestAppContext) {
+    fn pressing_the_control_with_nobody_signed_in_should_start_a_sign_in(cx: &mut TestAppContext) {
         let mut harness = harness(
             cx,
             Config::default(),
             FakeAccountService::new(ethereum_account()),
         );
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
 
-        assert!(!shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
+        assert_eq!(
+            harness.source.count(|state| state.prepared),
+            1,
+            "the press asks the account service for a sign-in"
+        );
+        assert!(
+            pending_sign_in(&mut harness),
+            "the control waits for the browser the press opened"
+        );
+        assert!(shows(&mut harness, "BASE_UI_ALERT"));
+        assert!(
+            !shows(&mut harness, PROFILE_PANEL),
+            "a signed-out control opens no menu between the press and the sign-in"
+        );
+    }
+
+    /// Signed out, the hint on the control is the one thing its press does.
+    #[gpui_kit::test]
+    fn the_hint_on_a_signed_out_control_should_be_the_sign_in(cx: &mut TestAppContext) {
+        let mut harness = harness(
+            cx,
+            Config::default(),
+            FakeAccountService::new(ethereum_account()),
+        );
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+
+        hover_trigger(&mut harness);
+
+        assert!(
+            shows(&mut harness, "TEST_PROFILE_TOOLTIP_SIGN_IN"),
+            "the hint is the sign-in the control performs"
+        );
+        assert!(
+            !shows(&mut harness, "TEST_PROFILE_TOOLTIP_ADDRESS"),
+            "nothing is signed in, so there is no account to name"
+        );
+    }
+
+    /// Signed in, the hint is the account whose menu the press opens, shortened by the rule
+    /// the menu's own address line uses.
+    #[gpui_kit::test]
+    fn the_hint_on_a_signed_in_control_should_be_the_shortened_address(cx: &mut TestAppContext) {
+        let mut harness = signed_in_harness(cx);
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+
+        hover_trigger(&mut harness);
+
+        assert!(
+            shows(&mut harness, "TEST_PROFILE_TOOLTIP_ADDRESS"),
+            "the hint names the account the menu is about"
+        );
+        assert!(
+            !shows(&mut harness, "TEST_PROFILE_TOOLTIP_SIGN_IN"),
+            "a signed-in control does not offer a sign-in"
+        );
+    }
+
+    /// The menu occupies the space under the face, so the hint that would be drawn there is
+    /// withdrawn while the menu is down.
+    #[gpui_kit::test]
+    fn an_open_menu_should_take_the_hint_away(cx: &mut TestAppContext) {
+        let mut harness = signed_in_harness(cx);
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+        press_trigger(&mut harness);
         assert!(shows(&mut harness, PROFILE_PANEL));
-        assert!(!shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
-        assert!(!shows(&mut harness, "TEST_MENU_ITEM_open-account"));
+
+        hover_trigger(&mut harness);
+
+        assert!(
+            !shows(&mut harness, "TEST_PROFILE_TOOLTIP_ADDRESS"),
+            "a hint over the menu's first entry would take the presses meant for it"
+        );
+    }
+
+    /// The menu belongs to the account that opened it: a signed-out control is a button, and
+    /// the state that said a menu was open is not the next account's to inherit.
+    #[gpui_kit::test]
+    fn a_menu_left_open_when_the_account_goes_away_should_not_open_for_the_next_one(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = signed_in_harness(cx);
+        harness.cx.update(|window, _| window.refresh());
+        harness.cx.run_until_parked();
+        press_trigger(&mut harness);
+        assert!(shows(&mut harness, PROFILE_PANEL));
+
+        harness.cx.update(|_, cx| crate::account::clear_account(cx));
+        harness.cx.run_until_parked();
+        assert!(
+            !shows(&mut harness, PROFILE_PANEL),
+            "the menu goes with the account it was about"
+        );
+
+        harness
+            .cx
+            .update(|_, cx| crate::account::store_account(ethereum_account(), cx));
+        harness.cx.run_until_parked();
+        assert!(
+            !shows(&mut harness, PROFILE_PANEL),
+            "the next account opens with its menu closed"
+        );
     }
 
     /// The menu is the account's: the face with the wallet family's mark on it, the tier, the
@@ -1217,7 +1377,7 @@ mod tests {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         assert_eq!(
             harness
@@ -1227,7 +1387,7 @@ mod tests {
                 .size
                 .width,
             px(MENU_WIDTH),
-            "the menu is one width whether or not there is an account in it"
+            "the menu is the one width the account block is centred on"
         );
         assert!(shows(&mut harness, "TEST_PROFILE_ACCOUNT"));
         assert!(shows(&mut harness, "TEST_PROFILE_ADDRESS"));
@@ -1297,7 +1457,7 @@ mod tests {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         open_account_entry(&mut harness);
 
@@ -1312,7 +1472,7 @@ mod tests {
         harness.source.with(|state| state.handoff = Step::Fail);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         open_account_entry(&mut harness);
 
@@ -1328,7 +1488,7 @@ mod tests {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         let drawn = |harness: &mut Harness, selector: &'static str| {
             harness
@@ -1409,7 +1569,7 @@ mod tests {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         let address = harness
             .cx
@@ -1445,7 +1605,7 @@ mod tests {
         let mut harness = harness(cx, configured(ethereum_account()), source);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         assert!(shows(&mut harness, "TEST_PROFILE_PLAN_UNKNOWN"));
         assert!(!shows(&mut harness, "TEST_PROFILE_PLAN_PLUS"));
@@ -1456,7 +1616,7 @@ mod tests {
         let mut harness = signed_in_harness(cx);
         harness.cx.update(|window, _| window.refresh());
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        press_trigger(&mut harness);
 
         let copy = harness
             .cx
@@ -1521,8 +1681,8 @@ mod tests {
 
     /// Reading the waiting alert is the user's answer to the whole attempt: the alert is
     /// what reports the wait, so the wait ends where the report was read. The attempt is
-    /// aborted rather than left listening, which is what lets the menu offer a sign-in
-    /// again immediately instead of greying the entry out until the attempt expires.
+    /// aborted rather than left listening, which is what lets the control offer a sign-in
+    /// again immediately instead of greying the press out until the attempt expires.
     #[gpui_kit::test]
     fn reading_the_waiting_alert_should_end_the_attempt(cx: &mut TestAppContext) {
         let mut harness = harness(
@@ -1539,8 +1699,9 @@ mod tests {
         harness.cx.simulate_click(ok.center(), Modifiers::none());
         settle(&mut harness);
         // The alert closes itself when its control is read, so its absence says nothing about
-        // the attempt. What says the attempt ended is the menu no longer waiting: that happens
-        // when the task the abort released resumes on the application runtime and reports.
+        // the attempt. What says the attempt ended is the control no longer waiting: that
+        // happens when the task the abort released resumes on the application runtime and
+        // reports.
         settle_until(&mut harness, "the attempt to end", |harness| {
             !pending_sign_in(harness)
         });
@@ -1553,7 +1714,7 @@ mod tests {
         assert!(stored_account(&mut harness).is_none());
     }
 
-    /// The reported bug: a sign-in whose alert was read must not leave the menu unable to
+    /// The reported bug: a sign-in whose alert was read must not leave the control unable to
     /// start another one. The attempt is aborted where the alert is read, so the second
     /// sign-in is a fresh attempt rather than a report over an attempt still running.
     #[gpui_kit::test]
@@ -1764,11 +1925,17 @@ mod tests {
             harness.menu.update(cx, |menu, cx| menu.sign_out(cx));
         });
         harness.cx.run_until_parked();
-        open_menu(&mut harness);
+        // The control is the signed-out one now: its hint offers the sign-in again, and
+        // nothing the sign-out left behind has a failure to report.
+        hover_trigger(&mut harness);
 
         assert_eq!(harness.source.count(|state| state.discards), 1);
         assert!(stored_account(&mut harness).is_none());
         assert_eq!(harness.source.count(|state| state.revocations), 0);
+        assert!(
+            shows(&mut harness, "TEST_PROFILE_TOOLTIP_SIGN_IN"),
+            "the signed-out control offers a sign-in again"
+        );
         assert!(
             !shows(&mut harness, "BASE_UI_ALERT"),
             "a sign-out reports nothing: there is no failure left for it to report"
@@ -1851,7 +2018,7 @@ mod tests {
         let mut config = configured(ethereum_account());
         config.avatar =
             Some(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#.to_owned());
-        let mut harness = harness(cx, config, FakeAccountService::new(ethereum_account()));
+        let harness = harness(cx, config, FakeAccountService::new(ethereum_account()));
 
         assert!(
             harness
@@ -1888,7 +2055,6 @@ mod tests {
             "window.account.awaiting_authorization",
             "window.account.cancel_sign_in",
             "window.account.copy_wallet_address",
-            "window.account.menu",
             "window.account.open_account",
             "window.account.plan_unavailable",
             "window.account.sign_in",
@@ -2036,7 +2202,7 @@ mod tests {
         settle(harness);
     }
 
-    /// Whether the menu is still waiting for a browser callback.
+    /// Whether the control is still waiting for a browser callback.
     fn pending_sign_in(harness: &mut Harness) -> bool {
         harness
             .cx
