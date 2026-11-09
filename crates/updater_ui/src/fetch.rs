@@ -1,18 +1,17 @@
-//! The two requests the updater makes, and the redirect policy both of them follow.
+//! The metadata request the updater makes, and the redirect policy it follows.
 //!
-//! Neither request lets the client follow redirects: GitHub answers
-//! `releases/latest/download/...` with a redirect to the release's own asset, and
-//! the transport's client is built with `Policy::none()` precisely so that every
-//! hop is resolved against the configured route rather than reused from the first
-//! one. The hops are therefore followed here, one at a time, and the budget for
-//! them is the operation class's own.
+//! The request does not let the client follow redirects: GitHub answers the
+//! release endpoint with a redirect to the file it publishes, and the transport's
+//! client is built with `Policy::none()` precisely so that every hop is resolved
+//! against the configured route rather than reused from the first one. The hops
+//! are therefore followed here, one at a time, and the budget for them is the
+//! operation class's own.
 
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
-use bytes::Bytes;
 use network::{
     proxy::resolve_async_cancellable,
     transport::{
-        http::{HttpClientClass, read_response_body, read_response_body_with_progress},
+        http::{HttpClientClass, read_response_body},
         hub::{TransportHub, TransportPermit},
     },
 };
@@ -68,40 +67,6 @@ pub async fn fetch_release(
     let key = PlatformKey::current().ok_or(UpdaterError::UnsupportedPlatform)?;
 
     manifest.select(key, &current)
-}
-
-/// Downloads the payload of `release`, reporting the accepted bytes as they arrive.
-///
-/// `on_progress` is called `(bytes read so far, exact payload size when the
-/// response names one)` on the task that is reading, so it must not block: it is
-/// what hands the numbers to the interface, not what draws them.
-pub async fn download(
-    transport: &TransportHub,
-    config: &Config,
-    runtime: &Runtime,
-    release: &ReleaseInfo,
-    cancellation: &CancellationToken,
-    on_progress: impl Fn(u64, Option<u64>),
-) -> Result<Bytes, UpdaterError> {
-    let (_operation, response) = exchange(
-        transport,
-        config,
-        runtime,
-        KytrixServiceCapability::UpdaterDownload,
-        HttpClientClass::UpdaterDownload,
-        release.asset.url.clone(),
-        cancellation,
-    )
-    .await?;
-
-    read_response_body_with_progress(
-        response,
-        HttpClientClass::UpdaterDownload,
-        cancellation,
-        on_progress,
-    )
-    .await
-    .map_err(|source| UpdaterError::Transport(UpdateRequestError::Read(source)))
 }
 
 /// What to do with the response to a request that follows its own redirects.

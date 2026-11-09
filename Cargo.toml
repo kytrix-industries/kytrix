@@ -11,6 +11,7 @@ members = [
     "crates/market_participants_model",
     "crates/app_config",
     "crates/app_config_provider",
+    "crates/download_provider",
     "crates/market_participants_connector",
     "crates/instrument_selector_ui",
     "crates/kytrix_service_provider",
@@ -136,6 +137,7 @@ base_ui = { path = "crates/base_ui" }
 candlestick = { path = "crates/widgets/candlestick" }
 coin_market_cap_fear_and_greed_index = { path = "crates/widgets/coin_market_cap_fear_and_greed_index" }
 cryptocurrency_etf = { path = "crates/widgets/cryptocurrency_etf" }
+download_provider = { path = "crates/download_provider" }
 empty = { path = "crates/widgets/empty" }
 ethereum_wallet = { path = "crates/widgets/ethereum_wallet" }
 financial_calendar = { path = "crates/widgets/financial_calendar" }

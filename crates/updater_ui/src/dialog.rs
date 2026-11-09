@@ -21,7 +21,9 @@ use base_ui::{
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, DismissEvent, Empty, Entity, EventEmitter,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, base::ScrollbarMode, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window,
+    base::{Disableable as _, ScrollbarMode},
+    div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
 use smol_str::SmolStr;
@@ -61,6 +63,9 @@ const UPDATER_DIALOG_RELEASE_PAGE: &str = "UPDATER_DIALOG_RELEASE_PAGE";
 const UPDATER_DIALOG_FAILURE: &str = "UPDATER_DIALOG_FAILURE";
 const UPDATER_DIALOG_CLOSE: &str = "UPDATER_DIALOG_CLOSE";
 const UPDATER_DIALOG_CANCEL: &str = "UPDATER_DIALOG_CANCEL";
+const UPDATER_DIALOG_PAUSE: &str = "UPDATER_DIALOG_PAUSE";
+const UPDATER_DIALOG_PAUSING: &str = "UPDATER_DIALOG_PAUSING";
+const UPDATER_DIALOG_RESUME: &str = "UPDATER_DIALOG_RESUME";
 
 /// What the dialog draws, named rather than borrowed from the updater.
 ///
@@ -76,6 +81,10 @@ enum Shown {
     Notes,
     /// A download in flight: what it has accepted, and the size the response named.
     Download(u64, Option<u64>),
+    /// A download being stopped: what it has accepted, and the size the response named.
+    Pausing(u64, Option<u64>),
+    /// A stopped download: what it has accepted, and the size the response named.
+    Paused(u64, Option<u64>),
     /// The payload is downloaded, waiting for the user.
     Downloaded,
     /// Nothing left to press: the application is being replaced underneath it.
@@ -90,10 +99,16 @@ impl Shown {
         match state {
             UpdaterState::Idle | UpdaterState::Checking => None,
             UpdaterState::Available(_) => Some(Self::Notes),
-            // A download in flight is the state itself: what it has accepted and the
-            // size it is measured against are both part of it.
+            // A download is the state itself: what it has accepted and the size it
+            // is measured against are both part of it.
             UpdaterState::Downloading(download) => {
                 Some(Self::Download(download.accepted(), download.named_total()))
+            }
+            UpdaterState::Pausing(download) => {
+                Some(Self::Pausing(download.accepted(), download.named_total()))
+            }
+            UpdaterState::Paused(download) => {
+                Some(Self::Paused(download.accepted(), download.named_total()))
             }
             UpdaterState::ReadyToInstall(_) => Some(Self::Downloaded),
             UpdaterState::Installing(_) => Some(Self::Installing),
@@ -174,7 +189,15 @@ impl UpdateDialog {
     fn body(&self, shown: Shown, cx: &Context<Self>) -> AnyElement {
         match shown {
             Shown::Notes => self.notes_body(cx),
-            Shown::Download(downloaded, total) => download_body(downloaded, total, cx),
+            Shown::Download(downloaded, total) => {
+                download_body(t!(cx, "window.updater.downloading"), downloaded, total, cx)
+            }
+            Shown::Pausing(downloaded, total) => {
+                download_body(t!(cx, "window.updater.pausing"), downloaded, total, cx)
+            }
+            Shown::Paused(downloaded, total) => {
+                download_body(t!(cx, "window.updater.paused"), downloaded, total, cx)
+            }
             Shown::Downloaded | Shown::Installing => downloaded_body(cx),
             Shown::Failure(key) => self.failure_body(key, cx),
         }
@@ -206,14 +229,40 @@ impl UpdateDialog {
                 self.download_button(cx),
             ],
             // Cancelling a download stops it where it is: the bytes it had are
-            // discarded, and the release is on offer again.
-            Shown::Download(..) => vec![self.closing_button(
-                "UpdaterDialogCancelDownload",
-                UPDATER_DIALOG_CANCEL,
-                t!(cx, "window.updater.cancel"),
-                Some(Updater::cancel_download),
-                cx,
-            )],
+            // discarded, and the release is on offer again. Pausing keeps them, so
+            // the transfer can continue from where it stopped.
+            Shown::Download(..) => vec![
+                self.closing_button(
+                    "UpdaterDialogCancelDownload",
+                    UPDATER_DIALOG_CANCEL,
+                    t!(cx, "window.updater.cancel"),
+                    Some(Updater::cancel_download),
+                    cx,
+                ),
+                self.pause_button(cx),
+            ],
+            // A pause in progress is the manager stopping the transfer; there is
+            // nothing to press until it has settled.
+            Shown::Pausing(..) => vec![
+                self.closing_button(
+                    "UpdaterDialogCancelPausing",
+                    UPDATER_DIALOG_CANCEL,
+                    t!(cx, "window.updater.cancel"),
+                    Some(Updater::cancel_download),
+                    cx,
+                ),
+                self.pausing_button(cx),
+            ],
+            Shown::Paused(..) => vec![
+                self.closing_button(
+                    "UpdaterDialogCancelPaused",
+                    UPDATER_DIALOG_CANCEL,
+                    t!(cx, "window.updater.cancel"),
+                    Some(Updater::cancel_download),
+                    cx,
+                ),
+                self.resume_button(cx),
+            ],
             Shown::Downloaded => vec![
                 self.closing_button(
                     "UpdaterDialogDiscard",
@@ -316,6 +365,54 @@ impl UpdateDialog {
             .into_any_element()
     }
 
+    /// The control that stops the download in flight, keeping its partial file.
+    fn pause_button(&self, cx: &Context<Self>) -> AnyElement {
+        let label = t!(cx, "window.updater.pause");
+
+        Button::new("UpdaterDialogPause")
+            .tonal()
+            .medium()
+            .debug_selector(|| UPDATER_DIALOG_PAUSE.into())
+            .aria_label(label.clone())
+            .on_click(cx.listener(|this, _, _, cx| {
+                let updater = this.updater.clone();
+                updater.update(cx, |updater, cx| updater.pause_download(cx));
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    /// The control the dialog is drawn with while the download is being stopped.
+    fn pausing_button(&self, cx: &Context<Self>) -> AnyElement {
+        let label = t!(cx, "window.updater.pausing");
+
+        Button::new("UpdaterDialogPausing")
+            .tonal()
+            .medium()
+            .disabled(true)
+            .debug_selector(|| UPDATER_DIALOG_PAUSING.into())
+            .aria_label(label.clone())
+            .child(label)
+            .into_any_element()
+    }
+
+    /// The control that continues a stopped download from its partial file.
+    fn resume_button(&self, cx: &Context<Self>) -> AnyElement {
+        let label = t!(cx, "window.updater.resume");
+
+        Button::new("UpdaterDialogResume")
+            .tonal()
+            .medium()
+            .debug_selector(|| UPDATER_DIALOG_RESUME.into())
+            .aria_label(label.clone())
+            .on_click(cx.listener(|this, _, _, cx| {
+                let updater = this.updater.clone();
+                updater.update(cx, |updater, cx| updater.resume_download(cx));
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
     /// The control that hands the downloaded payload to the installer.
     fn install_button(&self, cx: &Context<Self>) -> AnyElement {
         let label = t!(cx, "window.updater.install");
@@ -368,9 +465,12 @@ impl Render for UpdateDialog {
         };
         let width = match shown {
             Shown::Notes => NOTES_WIDTH,
-            Shown::Download(..) | Shown::Downloaded | Shown::Installing | Shown::Failure(_) => {
-                STATUS_WIDTH
-            }
+            Shown::Download(..)
+            | Shown::Pausing(..)
+            | Shown::Paused(..)
+            | Shown::Downloaded
+            | Shown::Installing
+            | Shown::Failure(_) => STATUS_WIDTH,
         };
         let body = self.body(shown, cx);
         let actions = self.actions(shown, cx);
@@ -394,15 +494,18 @@ impl Render for UpdateDialog {
     }
 }
 
-/// The progress of the download in flight.
+/// The progress of a download that is running, stopping, or stopped.
 ///
 /// A response that named its length is drawn as a bar against it, with the share
 /// accepted so far centred under it. One that did not — a chunked answer — has no total
 /// to measure against, so what is drawn is the fact that something is happening rather
-/// than a fraction of it: a spinner, centred, under the same heading.
-fn download_body(downloaded: u64, total: Option<u64>, cx: &Context<UpdateDialog>) -> AnyElement {
-    let heading = t!(cx, "window.updater.downloading");
-
+/// than a fraction of it: a spinner, centred, under the same heading of the state.
+fn download_body(
+    heading: SharedString,
+    downloaded: u64,
+    total: Option<u64>,
+    cx: &Context<UpdateDialog>,
+) -> AnyElement {
     let progress = match total.filter(|total| *total > 0) {
         Some(total) => {
             let percent = (downloaded as f64 / total as f64 * 100.0).clamp(0.0, 100.0) as f32;
@@ -482,9 +585,12 @@ mod tests {
 
     use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer, style::theme};
+    use download_provider::{
+        global::{DownloadProviderDeps, install as install_download_provider},
+        task::DownloadId,
+    };
     use gpui_kit::{EmptyView, Modifiers, TestAppContext, VisualTestContext};
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use tokio_util::sync::CancellationToken;
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::*;
@@ -529,11 +635,19 @@ mod tests {
         let updater = cx.update(|cx| {
             let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
             cx.set_global(manager);
+            let provider = install_download_provider(
+                cx,
+                DownloadProviderDeps {
+                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
+                    runtime: Runtime::for_test(),
+                },
+            );
             global::install(
                 cx,
                 UpdaterDeps {
                     transport: Arc::new(TransportHub::new(TransportPolicy::default())),
                     runtime: Runtime::for_test(),
+                    provider,
                 },
             );
 
@@ -660,15 +774,14 @@ mod tests {
     /// The download is not started here: pressing the control would send a real
     /// request. What is drawn while one is in flight is the same state either way.
     #[gpui_kit::test]
-    fn a_download_in_flight_should_be_drawn_as_progress_and_offer_only_cancelling(
+    fn a_download_in_flight_should_be_drawn_as_progress_and_offer_pausing_and_cancelling(
         cx: &mut TestAppContext,
     ) {
         let (cx, updater) = harness(cx);
-        let cancellation = CancellationToken::new();
         shown(
             cx,
             &updater,
-            UpdaterState::downloading_for_test(release(), 4_096, Some(8_192), cancellation.clone()),
+            UpdaterState::downloading_for_test(release(), DownloadId::new(), 4_096, Some(8_192)),
         );
 
         assert!(
@@ -683,21 +796,97 @@ mod tests {
             cx.debug_bounds(UPDATER_DIALOG_INSTALL).is_none(),
             "nothing is downloaded yet"
         );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PAUSE).is_some(),
+            "a running download can be paused"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_CANCEL).is_some(),
+            "a running download can be given up"
+        );
 
         click(cx, UPDATER_DIALOG_CANCEL);
 
-        assert!(
-            cancellation.is_cancelled(),
-            "cancelling a download stops the request that is running it"
-        );
         assert!(
             updater.read_with(cx, |updater, _| matches!(
                 updater.state(),
                 UpdaterState::Available(_)
             )),
-            "the release is on offer again"
+            "cancelling a download offers the release again"
         );
         dismissed(cx, UPDATER_DIALOG_CANCEL);
+    }
+
+    /// A pause the download manager has already accepted is the manager stopping the
+    /// transfer: the dialog says so and offers nothing until it has settled.
+    #[gpui_kit::test]
+    fn a_download_being_paused_should_say_so_and_offer_cancelling(cx: &mut TestAppContext) {
+        let (cx, updater) = harness(cx);
+        shown(
+            cx,
+            &updater,
+            UpdaterState::pausing_for_test(release(), DownloadId::new(), 4_096, Some(8_192)),
+        );
+
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PROGRESS).is_some(),
+            "a download being stopped still says how far it got"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PAUSING).is_some(),
+            "the dialog says the transfer is being stopped"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PAUSE).is_none(),
+            "there is nothing left to pause"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_RESUME).is_none(),
+            "the transfer has not stopped yet"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_CANCEL).is_some(),
+            "a download being stopped can still be given up"
+        );
+    }
+
+    /// A stopped download keeps what it accepted and offers to continue from there.
+    #[gpui_kit::test]
+    fn a_paused_download_should_offer_resuming_and_cancelling(cx: &mut TestAppContext) {
+        let (cx, updater) = harness(cx);
+        let task = DownloadId::new();
+        shown(
+            cx,
+            &updater,
+            UpdaterState::paused_for_test(release(), task, 4_096, Some(8_192)),
+        );
+
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PROGRESS).is_some(),
+            "a stopped download says how far it got"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_PAUSE).is_none(),
+            "a stopped download has nothing left to pause"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_RESUME).is_some(),
+            "a stopped download can be continued"
+        );
+        assert!(
+            cx.debug_bounds(UPDATER_DIALOG_CANCEL).is_some(),
+            "a stopped download can be given up"
+        );
+
+        click(cx, UPDATER_DIALOG_RESUME);
+
+        assert!(
+            updater.read_with(cx, |updater, _| matches!(
+                updater.state(),
+                UpdaterState::Paused(_)
+            )),
+            "the download manager holds no task for the state a test built, so it did not resume"
+        );
     }
 
     #[gpui_kit::test]
@@ -706,7 +895,7 @@ mod tests {
         shown(
             cx,
             &updater,
-            UpdaterState::downloading_for_test(release(), 4_096, None, CancellationToken::new()),
+            UpdaterState::downloading_for_test(release(), DownloadId::new(), 4_096, None),
         );
 
         assert!(
@@ -793,11 +982,10 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (cx, updater) = harness(cx);
-        let cancellation = CancellationToken::new();
         shown(
             cx,
             &updater,
-            UpdaterState::downloading_for_test(release(), 4_096, Some(8_192), cancellation),
+            UpdaterState::downloading_for_test(release(), DownloadId::new(), 4_096, Some(8_192)),
         );
 
         // Pressed without letting the transition settle, so the frames that follow are
@@ -891,12 +1079,7 @@ mod tests {
         shown(
             cx,
             &updater,
-            UpdaterState::downloading_for_test(
-                release(),
-                4_096,
-                Some(8_192),
-                CancellationToken::new(),
-            ),
+            UpdaterState::downloading_for_test(release(), DownloadId::new(), 4_096, Some(8_192)),
         );
         let download_width = cx
             .debug_bounds(UPDATER_DIALOG_PROGRESS)

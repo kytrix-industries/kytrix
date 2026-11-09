@@ -10,11 +10,7 @@ gpui-kit = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
 network = { workspace = true }
-reqwest = { workspace = true }
 smol_str = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
 url = { workspace = true }
 widget_tokio_runtime = { workspace = true }
 
@@ -22,6 +18,7 @@ widget_tokio_runtime = { workspace = true }
 app_config = { workspace = true }
 app_config_provider = { workspace = true }
 base_ui = { workspace = true }
+download_provider = { workspace = true }
 market_participants_connector = { workspace = true }
 market_participants_model = { workspace = true }
 # The layer that names a venue in the reader's language.
@@ -35,6 +32,9 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 tempfile = { workspace = true }
+# The download manager tests drive a real HTTP server, which the product code no
+# longer does: the transfers are the provider's.
+tokio = { workspace = true }
 
 [lints]
 workspace = true

@@ -8,6 +8,7 @@ use app_config_provider::{
     manager::ConfigManager,
     notification::ConfigNotification,
 };
+use download_provider::provider::DownloadProvider;
 use gpui_kit::{App, AppContext as _, Entity, Global};
 use network::transport::hub::TransportHub;
 use widget_tokio_runtime::runtime::Runtime;
@@ -20,6 +21,8 @@ pub struct UpdaterDeps {
     pub transport: Arc<TransportHub>,
     /// The application runtime the requests run on.
     pub runtime: Runtime,
+    /// The download manager the payload is fetched through.
+    pub provider: Entity<DownloadProvider>,
 }
 
 /// Installs the updater: the composition root's one call for this feature.
@@ -45,6 +48,7 @@ pub fn install(cx: &mut App, deps: UpdaterDeps) {
         ),
     );
     let updater = cx.new(|_| Updater::new(deps, notification));
+    updater.update(cx, |updater, cx| updater.watch_provider(cx));
     updater.update(cx, |updater, cx| updater.start(cx));
     cx.set_global(UpdaterGlobal {
         updater,
@@ -78,6 +82,7 @@ mod tests {
         settings::{Config, Language},
     };
     use app_config_provider::manager::ConfigManager;
+    use download_provider::global::{DownloadProviderDeps, install as install_download_provider};
     use gpui_kit::{BorrowAppContext as _, TestAppContext};
     use network::transport::hub::{TransportHub, TransportPolicy};
     use smol_str::SmolStr;
@@ -92,11 +97,19 @@ mod tests {
         cx.update(|cx| {
             let manager = ConfigManager::in_memory(Config::default(), cx);
             cx.set_global(manager);
+            let provider = install_download_provider(
+                cx,
+                DownloadProviderDeps {
+                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
+                    runtime: Runtime::for_test(),
+                },
+            );
             install(
                 cx,
                 UpdaterDeps {
                     transport: Arc::new(TransportHub::new(TransportPolicy::default())),
                     runtime: Runtime::for_test(),
+                    provider,
                 },
             );
         });

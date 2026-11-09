@@ -1066,11 +1066,21 @@ mod tests {
             install_service_connector(cx);
             MarketParticipantsConnector::install(cx)
                 .expect("the market participants connector should install");
+            let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
+            let runtime = Runtime::for_test();
+            let downloads = download_provider::global::install(
+                cx,
+                download_provider::global::DownloadProviderDeps {
+                    transport: Arc::clone(&transport),
+                    runtime: runtime.clone(),
+                },
+            );
             updater_ui::global::install(
                 cx,
                 UpdaterDeps {
-                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
-                    runtime: Runtime::for_test(),
+                    transport,
+                    runtime,
+                    provider: downloads,
                 },
             );
         });

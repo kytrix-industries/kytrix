@@ -450,6 +450,7 @@ error:
     metadata: The update metadata could not be read
     unsupported_platform: This platform does not support in-app updates
     install: The update could not be installed
+    download: The update download failed
   upgrade:
     handshake: 'The peer handshake is not usable: %{detail}'
     rejected: The peer answered %{status} instead of switching protocols
@@ -1171,6 +1172,10 @@ window:
     cancel: Cancel
     install: Install update
     downloading: Downloading the update…
+    pausing: Pausing…
+    paused: Paused
+    pause: Pause
+    resume: Resume
     download_progress: '%{percent}%'
     downloaded_message: The new version has been downloaded. Choosing “Install update” quits the application so the installation can finish.
     restart_hint: Start Kytrix again once the update has finished.
@@ -1198,8 +1203,8 @@ settings_ui:
     browse: Browse
     delete: Delete
     delete_failed: 'Delete failed: %{reason}'
-    delete_failed_downloads: the download of this model did not stop
     delete_failed_io: the file could not be removed
+    delete_failed_provider: the download manager could not remove the files
     delete_failed_timeout: the delete did not finish in time
     delete_failed_unload: the model could not be released
     delete_failed_unload_timeout: translations kept the model in use for too long
@@ -1209,14 +1214,15 @@ settings_ui:
     download_failed_cancelled: the download was cancelled
     download_failed_destination: the destination is not a file path
     download_failed_io: the file could not be written
+    download_failed_range: the download could not be continued from its partial file
     download_failed_redirect: the download was redirected somewhere unusable
     download_failed_route: the network route could not be resolved
     download_failed_size: 'the download was %{actual} bytes but %{expected} were expected'
     download_failed_status: the server answered with HTTP %{status}
     download_failed_task: the download task failed
+    download_failed_too_large: the download exceeded the allowed size
     download_failed_transport: the download failed on the network
     download_failed_url: the model address is invalid
-    downloading: Downloading
     download_url: 'Download address: %{url}'
     model_directory: Model directory
     model_in_use: Model in use
@@ -1224,7 +1230,11 @@ settings_ui:
     models: Supported models
     no_downloaded_models: No downloaded models
     no_model_directory: Choose a model directory first
+    pause: Pause
+    paused: Paused
+    pausing: Pausing…
     progress: '%{percent}%'
+    resume: Resume
     retry: Retry
     title: AI
     translation:

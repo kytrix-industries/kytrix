@@ -2352,6 +2352,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "download_provider"
+version = "0.0.3"
+dependencies = [
+ "ahash",
+ "app_config",
+ "app_config_provider",
+ "gpui-kit",
+ "hyper",
+ "hyper-util",
+ "log",
+ "network",
+ "reqwest 0.13.5",
+ "smol_str",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+ "widget_tokio_runtime",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5397,6 +5420,7 @@ dependencies = [
  "app_config",
  "app_config_provider",
  "base_ui",
+ "download_provider",
  "embed-resource",
  "gpui-kit",
  "i18n",
@@ -9009,6 +9033,7 @@ dependencies = [
  "app_config",
  "app_config_provider",
  "base_ui",
+ "download_provider",
  "gpui-kit",
  "hyper",
  "hyper-util",
@@ -9017,12 +9042,9 @@ dependencies = [
  "market_participants_connector",
  "market_participants_model",
  "network",
- "reqwest 0.13.5",
  "smol_str",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
- "tokio-util",
  "url",
  "widget",
  "widget_tokio_runtime",
@@ -10223,6 +10245,7 @@ dependencies = [
  "base_ui",
  "bytes",
  "cargo-packager-updater",
+ "download_provider",
  "gpui-kit",
  "http",
  "hyper",

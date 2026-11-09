@@ -1285,12 +1285,26 @@ mod tests {
             return;
         }
 
-        crate::translation_downloads::install(
+        // The process-wide download manager routes with the network settings, so it needs the
+        // settings manager. A test that installs the downloads before it sets the settings up
+        // gets the defaults, which the session replaces with its own manager when it starts.
+        if cx.try_global::<ConfigManager>().is_none() {
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
+        }
+        let provider = download_provider::global::install(
             cx,
-            crate::translation_downloads::TranslationDownloadsDeps {
+            download_provider::global::DownloadProviderDeps {
                 transport: std::sync::Arc::new(network::transport::hub::TransportHub::new(
                     network::transport::hub::TransportPolicy::default(),
                 )),
+                runtime: widget_tokio_runtime::runtime::Runtime::for_test(),
+            },
+        );
+        crate::translation_downloads::install(
+            cx,
+            crate::translation_downloads::TranslationDownloadsDeps {
+                provider,
                 runtime: widget_tokio_runtime::runtime::Runtime::for_test(),
                 unload,
             },
@@ -3004,7 +3018,8 @@ mod tests {
     }
 
     /// A downloaded model offers only delete; a download in flight offers a disabled button and
-    /// a progress bar; a failed one offers retry and the reason.
+    /// a progress bar; a failed one offers retry, the reason, and a delete to discard its partial
+    /// file.
     #[gpui_kit::test]
     fn the_translation_rows_should_draw_download_retry_progress_and_delete_states(
         cx: &mut TestAppContext,
@@ -3029,7 +3044,7 @@ mod tests {
                 TranslationModel::HyMt218BQ8,
                 path.clone(),
                 crate::translation_downloads::DownloadState::DownloadFailed {
-                    failure: crate::translation_downloads::DownloadFailure::Transport,
+                    failure: download_provider::error::DownloadFailure::Transport,
                 },
                 cx,
             );
@@ -3037,6 +3052,18 @@ mod tests {
                 TranslationModel::HyMt218B2Bit,
                 path.clone(),
                 crate::translation_downloads::DownloadState::Deleting,
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt27BQ4Km,
+                path.clone(),
+                crate::translation_downloads::DownloadState::Pausing { downloaded: 100 },
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt27BQ6K,
+                path.clone(),
+                crate::translation_downloads::DownloadState::Paused { downloaded: 100 },
                 cx,
             );
             downloads.set_state_for_test(
@@ -3065,12 +3092,20 @@ mod tests {
             "a download in flight draws its progress bar"
         );
         assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_1").is_some(),
+            "a download in flight offers pause"
+        );
+        assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_1").is_none(),
             "a download in flight offers no download button"
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_2").is_some(),
             "a failed download offers retry"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_2").is_some(),
+            "a failed download can discard its partial file"
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_2").is_some(),
@@ -3095,6 +3130,26 @@ mod tests {
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_4").is_none(),
             "a model whose file is gone has nothing to delete"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSING_5").is_some(),
+            "a pausing download says what it is doing"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_5").is_none(),
+            "a pausing download cannot be resumed yet"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_6").is_some(),
+            "a paused download offers resume"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_6").is_none(),
+            "a paused download offers no pause"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_6").is_some(),
+            "a paused download can be discarded"
         );
     }
 

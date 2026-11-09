@@ -7,6 +7,7 @@
 
 use app_config::network::ConfigError;
 use cargo_packager_updater as updater;
+use download_provider::error::DownloadFailure;
 use network::transport::error::TransportError;
 use thiserror::Error;
 
@@ -26,6 +27,9 @@ pub enum UpdaterError {
     /// The request or its response failed on the wire.
     #[error("the update request failed")]
     Transport(#[source] UpdateRequestError),
+    /// The download manager could not fetch the update's payload.
+    #[error("the update download failed")]
+    Download(#[source] DownloadFailure),
     /// The published metadata could not be read as the release it announces.
     #[error("the update metadata could not be read")]
     Metadata(#[source] MetadataError),
@@ -44,6 +48,7 @@ impl UpdaterError {
             Self::Route(_) => "error.updater.route",
             Self::Client(_) => "error.updater.client",
             Self::Transport(_) => "error.updater.transport",
+            Self::Download(_) => "error.updater.download",
             Self::Metadata(_) => "error.updater.metadata",
             Self::UnsupportedPlatform => "error.updater.unsupported_platform",
             Self::Install(_) => "error.updater.install",
@@ -167,7 +172,7 @@ mod tests {
 
         assert_eq!(
             keys.len(),
-            6,
+            7,
             "every failure the updater reports names its message, and {} was read",
             keys.len()
         );

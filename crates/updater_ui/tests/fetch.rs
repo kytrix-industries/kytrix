@@ -1,132 +1,64 @@
-//! The update path end to end, against a server that answers the way GitHub does.
+//! The update metadata end to end, against a server that answers the way GitHub does.
 //!
-//! The requests go through a real transport, a real client and a real redirect
-//! chain, so what is exercised here is the path production takes: metadata behind
-//! a redirect, a payload behind another one, and frames that arrive one at a time.
+//! The request goes through a real transport, a real client and a real redirect
+//! chain, so what is exercised here is the path production takes: the endpoint behind
+//! a redirect, and the release it publishes behind another one.
 
 use std::{
-    collections::VecDeque,
     convert::Infallible,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
-    time::Duration,
 };
 
 use app_config::network::Config;
 use bytes::Bytes;
 use hyper::{
     Request, Response, StatusCode,
-    body::{Body, Frame, Incoming, SizeHint},
+    body::{Body, Frame, Incoming},
     header::LOCATION,
     server::conn::http1,
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use network::transport::{
-    error::TransportError,
-    hub::{TransportHub, TransportPolicy},
-};
+use network::transport::hub::{TransportHub, TransportPolicy};
 use serde_json::json;
-use tokio::{net::TcpListener, time::Sleep};
+use tokio::net::TcpListener;
 use updater_ui::{
-    error::{UpdateRequestError, UpdaterError},
     fetch,
     release::{PlatformKey, ReleaseFormat},
 };
 use url::Url;
 use widget_tokio_runtime::runtime::Runtime;
 
-/// How much of the payload each frame carries.
-const FRAME: usize = 16 * 1024;
+/// The response body the release server answers with: its whole entity in one frame.
+struct TestBody(Option<Bytes>);
 
-/// How long the payload is: it has to be several frames, so a download in flight
-/// is a download that is still going.
-const LENGTH: usize = 192 * 1024;
-
-/// The payload the release publishes.
-fn payload() -> Bytes {
-    Bytes::from(
-        (0..LENGTH)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<u8>>(),
-    )
-}
-
-/// A response body that hands out its frames one at a time, pausing between them.
-///
-/// The pause is what makes a download that is cancelled observably mid-transfer
-/// rather than after the fact: without it the whole payload is handed to the
-/// kernel at once and there is nothing left to interrupt.
-struct PacedBody {
-    frames: VecDeque<Frame<Bytes>>,
-    pace: Duration,
-    wait: Option<Pin<Box<Sleep>>>,
-    length: Option<u64>,
-}
-
-impl PacedBody {
-    fn new(payload: Bytes, pace: Duration, length: Option<u64>) -> Self {
-        let frames = payload
-            .chunks(FRAME)
-            .map(|part| Frame::data(Bytes::copy_from_slice(part)))
-            .collect();
-
-        Self {
-            frames,
-            pace,
-            wait: None,
-            length,
-        }
+impl TestBody {
+    /// A body that carries `bytes`.
+    fn whole(bytes: Bytes) -> Self {
+        Self(Some(bytes))
     }
 
-    /// A body of one frame, sent as fast as the connection takes it.
-    fn whole(payload: Bytes) -> Self {
-        let length = payload.len() as u64;
-
-        Self::new(payload, Duration::ZERO, Some(length))
+    /// A body that carries nothing, which is what a redirect has.
+    fn empty() -> Self {
+        Self(None)
     }
 }
 
-impl Body for PacedBody {
+impl Body for TestBody {
     type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
         self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
+        _: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        if let Some(wait) = this.wait.as_mut() {
-            match wait.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => this.wait = None,
-            }
-        }
-        let Some(frame) = this.frames.pop_front() else {
-            return Poll::Ready(None);
-        };
-        if !this.frames.is_empty() {
-            this.wait = Some(Box::pin(tokio::time::sleep(this.pace)));
-        }
-
-        Poll::Ready(Some(Ok(frame)))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        match self.length {
-            Some(length) => SizeHint::with_exact(length),
-            None => SizeHint::default(),
-        }
+        Poll::Ready(self.get_mut().0.take().map(|bytes| Ok(Frame::data(bytes))))
     }
 }
 
-fn empty() -> PacedBody {
-    PacedBody::whole(Bytes::new())
-}
-
-fn answer(status: StatusCode, body: PacedBody, location: Option<&str>) -> Response<PacedBody> {
+fn answer(status: StatusCode, body: TestBody, location: Option<&str>) -> Response<TestBody> {
     let mut answer = Response::builder().status(status);
     if let Some(location) = location {
         answer = answer.header(LOCATION, location);
@@ -156,15 +88,10 @@ fn metadata(address: SocketAddr, payload_path: &str) -> Bytes {
     Bytes::from(serde_json::to_vec(&published).expect("the manifest is JSON"))
 }
 
-/// Starts a release server: the metadata behind a redirect, and the payload behind another.
-///
-/// The payload is announced at `payload_path`, which a test points at a path the
-/// server does not serve when what it is about is a release that is gone.
-async fn spawn_release_server(
-    payload_path: &'static str,
-    pace: Duration,
-    length: Option<u64>,
-) -> SocketAddr {
+/// Starts a release server: the metadata behind a redirect to a relative location,
+/// which is what GitHub sends and what the client has to resolve against the request
+/// it made.
+async fn spawn_release_server() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("a loopback port is free");
@@ -174,39 +101,26 @@ async fn spawn_release_server(
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let service = service_fn(move |request: Request<Incoming>| {
-                let path = request.uri().path().to_owned();
-                async move {
-                    let response = match path.as_str() {
-                        "/latest.json" => {
-                            answer(StatusCode::FOUND, empty(), Some("/releases/latest.json"))
-                        }
-                        // A relative location, which is what GitHub sends and what the
-                        // client has to resolve against the request it made.
-                        "/releases/latest.json" => answer(
-                            StatusCode::OK,
-                            PacedBody::whole(metadata(address, payload_path)),
-                            None,
-                        ),
-                        "/payload" => answer(
-                            StatusCode::TEMPORARY_REDIRECT,
-                            empty(),
-                            Some("/releases/payload"),
-                        ),
-                        "/releases/payload" => answer(
-                            StatusCode::OK,
-                            PacedBody::new(payload(), pace, length),
-                            None,
-                        ),
-                        _ => answer(
-                            StatusCode::NOT_FOUND,
-                            PacedBody::whole(Bytes::from_static(b"not found")),
-                            None,
-                        ),
-                    };
+            let service = service_fn(move |request: Request<Incoming>| async move {
+                let response = match request.uri().path() {
+                    "/latest.json" => answer(
+                        StatusCode::FOUND,
+                        TestBody::empty(),
+                        Some("/releases/latest.json"),
+                    ),
+                    "/releases/latest.json" => answer(
+                        StatusCode::OK,
+                        TestBody::whole(metadata(address, "/payload")),
+                        None,
+                    ),
+                    _ => answer(
+                        StatusCode::NOT_FOUND,
+                        TestBody::whole(Bytes::from_static(b"not found")),
+                        None,
+                    ),
+                };
 
-                    Ok::<_, Infallible>(response)
-                }
+                Ok::<_, Infallible>(response)
             });
             tokio::spawn(async move {
                 let _ = http1::Builder::new()
@@ -233,149 +147,23 @@ fn endpoint(address: SocketAddr) -> Url {
 }
 
 #[tokio::test]
-async fn a_release_should_be_read_and_downloaded_end_to_end() {
-    let address = spawn_release_server("/payload", Duration::ZERO, None).await;
+async fn a_release_should_be_read_through_its_redirect_chain() {
+    let address = spawn_release_server().await;
     let hub = transport();
     let runtime = Runtime::for_test();
     let config = Config::default();
     let cancellation = hub.cancellation().child_token();
-    let endpoint = endpoint(address);
 
-    let release = fetch::fetch_release(&hub, &config, &runtime, &endpoint, &cancellation)
+    let release = fetch::fetch_release(&hub, &config, &runtime, &endpoint(address), &cancellation)
         .await
         .expect("the metadata is read through its redirect")
         .expect("a newer release is offered");
+
     assert_eq!(release.version, semver::Version::new(9, 9, 9));
     assert_eq!(release.asset.format, ReleaseFormat::Nsis);
     assert_eq!(
         release.asset.url.as_str(),
         format!("http://{address}/payload"),
         "the payload is what the metadata named, not what was asked for"
-    );
-
-    let reported = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&reported);
-    let bytes = fetch::download(
-        &hub,
-        &config,
-        &runtime,
-        &release,
-        &cancellation,
-        move |read, total| {
-            recorder
-                .lock()
-                .expect("the recorder is never poisoned")
-                .push((read, total));
-        },
-    )
-    .await
-    .expect("the payload is downloaded through its redirect");
-
-    assert_eq!(
-        bytes,
-        payload(),
-        "the bytes that arrived are the bytes served"
-    );
-
-    let reported = reported.lock().expect("the recorder is never poisoned");
-    assert!(
-        reported.len() > 2,
-        "a paced payload is reported frame by frame, not once"
-    );
-    assert!(
-        reported.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-        "progress never goes backwards: {reported:?}"
-    );
-    assert_eq!(
-        reported.first(),
-        Some(&(0, None)),
-        "a chunked response names no length, and says so before the first byte"
-    );
-    assert_eq!(
-        reported.last().map(|(read, _)| *read),
-        Some(bytes.len() as u64),
-        "the last report is the whole payload"
-    );
-}
-
-#[tokio::test]
-async fn a_download_should_be_cancellable_mid_transfer_and_keep_nothing() {
-    let address =
-        spawn_release_server("/payload", Duration::from_millis(50), Some(LENGTH as u64)).await;
-    let hub = transport();
-    let runtime = Runtime::for_test();
-    let config = Config::default();
-    let cancellation = hub.cancellation().child_token();
-    let endpoint = endpoint(address);
-
-    let release = fetch::fetch_release(&hub, &config, &runtime, &endpoint, &cancellation)
-        .await
-        .expect("the metadata is read")
-        .expect("a newer release is offered");
-
-    let reported = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&reported);
-    let cancelled = cancellation.clone();
-    let outcome = fetch::download(
-        &hub,
-        &config,
-        &runtime,
-        &release,
-        &cancellation,
-        move |read, _| {
-            recorder
-                .lock()
-                .expect("the recorder is never poisoned")
-                .push(read);
-            // The user cancels once the first frame has been accepted, which is
-            // while the rest of the payload is still being sent.
-            if read > 0 {
-                cancelled.cancel();
-            }
-        },
-    )
-    .await;
-
-    assert!(
-        matches!(
-            outcome,
-            Err(UpdaterError::Transport(UpdateRequestError::Read(
-                TransportError::Cancelled
-            )))
-        ),
-        "a cancelled download reports the cancellation rather than the bytes it had: {outcome:?}"
-    );
-    let reported = reported.lock().expect("the recorder is never poisoned");
-    let last = *reported.last().expect("the download reported its start");
-    assert!(
-        last > 0 && last < LENGTH as u64,
-        "the download was stopped part way through, not before or after it: {last}"
-    );
-}
-
-#[tokio::test]
-async fn a_payload_the_server_does_not_have_should_be_an_error_rather_than_bytes() {
-    let address = spawn_release_server("/gone", Duration::ZERO, None).await;
-    let hub = transport();
-    let runtime = Runtime::for_test();
-    let config = Config::default();
-    let cancellation = hub.cancellation().child_token();
-    let endpoint = endpoint(address);
-
-    let release = fetch::fetch_release(&hub, &config, &runtime, &endpoint, &cancellation)
-        .await
-        .expect("the metadata is read")
-        .expect("a newer release is offered");
-    let outcome =
-        fetch::download(&hub, &config, &runtime, &release, &cancellation, |_, _| {}).await;
-
-    assert!(
-        matches!(
-            outcome,
-            Err(UpdaterError::Transport(UpdateRequestError::Status {
-                status: StatusCode::NOT_FOUND
-            }))
-        ),
-        "a release that is gone is a failure, not an empty payload: {outcome:?}"
     );
 }

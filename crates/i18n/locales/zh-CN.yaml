@@ -450,6 +450,7 @@ error:
     metadata: 更新元数据无法解析
     unsupported_platform: 当前平台不支持应用内更新
     install: 安装更新失败
+    download: 更新下载失败
   upgrade:
     handshake: 对端握手无效：%{detail}
     rejected: 对端返回 %{status}，未切换协议
@@ -1171,6 +1172,10 @@ window:
     cancel: 取消
     install: 安装更新
     downloading: 正在下载更新…
+    pausing: 正在暂停…
+    paused: 已暂停
+    pause: 暂停
+    resume: 继续
     download_progress: '%{percent}%'
     downloaded_message: 新版本已下载完成，点击“安装更新”后应用将退出以完成安装。
     restart_hint: 更新完成后请重新启动 Kytrix。
@@ -1198,8 +1203,8 @@ settings_ui:
     browse: 浏览
     delete: 删除
     delete_failed: 删除失败：%{reason}
-    delete_failed_downloads: 该模型的下载未能停止
     delete_failed_io: 文件无法删除
+    delete_failed_provider: 下载管理器无法删除文件
     delete_failed_timeout: 删除未在限定时间内完成
     delete_failed_unload: 模型无法被释放
     delete_failed_unload_timeout: 翻译任务占用模型过久
@@ -1209,14 +1214,15 @@ settings_ui:
     download_failed_cancelled: 下载已取消
     download_failed_destination: 目标不是文件路径
     download_failed_io: 文件无法写入
+    download_failed_range: 无法从已下载的部分继续下载
     download_failed_redirect: 下载重定向到了不可用的地址
     download_failed_route: 无法解析网络线路
     download_failed_size: 下载得到 %{actual} 字节，预期 %{expected} 字节
     download_failed_status: 服务器返回 HTTP %{status}
     download_failed_task: 下载任务失败
+    download_failed_too_large: 下载内容超过允许的大小
     download_failed_transport: 下载因网络问题失败
     download_failed_url: 模型地址无效
-    downloading: 下载中
     download_url: 下载地址：%{url}
     model_directory: 模型存放目录
     model_in_use: 使用模型
@@ -1224,7 +1230,11 @@ settings_ui:
     models: 当前支持的模型
     no_downloaded_models: 暂无已下载模型
     no_model_directory: 请先选择模型存放目录
+    pause: 暂停
+    paused: 已暂停
+    pausing: 正在暂停…
     progress: '%{percent}%'
+    resume: 继续
     retry: 重试
     title: AI
     translation:

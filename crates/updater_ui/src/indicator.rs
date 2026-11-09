@@ -128,6 +128,7 @@ mod tests {
 
     use app_config_provider::manager::ConfigManager;
     use base_ui::{animation::ANIMATION_TICK, layer::Layer};
+    use download_provider::global::{DownloadProviderDeps, install as install_download_provider};
     use gpui_kit::{
         AppContext as _, Context, IntoElement, Modifiers, Render, TestAppContext,
         VisualTestContext, Window, div, px,
@@ -183,11 +184,19 @@ mod tests {
             i18n::global::embedded::install(cx).expect("the embedded locales should load");
             let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
             cx.set_global(manager);
+            let provider = install_download_provider(
+                cx,
+                DownloadProviderDeps {
+                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
+                    runtime: Runtime::for_test(),
+                },
+            );
             global::install(
                 cx,
                 UpdaterDeps {
                     transport: Arc::new(TransportHub::new(TransportPolicy::default())),
                     runtime: Runtime::for_test(),
+                    provider,
                 },
             );
 

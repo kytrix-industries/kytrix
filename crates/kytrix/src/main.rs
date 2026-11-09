@@ -40,9 +40,11 @@ fn main() {
 /// catalogue, the venues and the runtime projection itself. Installing it is
 /// wiring and nothing else: no venue is loaded at startup, because the only
 /// action that loads a market is the user's own, through the market-participants
-/// menu. The updater is installed last, on the transport the service connection
-/// was built with: nothing else reads it, and its first check is a delay rather
-/// than work this call does.
+/// menu. The download manager is installed on the service transport and the shared
+/// runtime, and the two features that fetch through it — the translation page and
+/// the updater — are installed after it so they are handed the manager rather than
+/// looking it up. The updater is the last of them: nothing else reads it, and its
+/// first check is a delay rather than work this call does.
 ///
 /// Returns the settings recovery, if the stored file was unusable and had to be
 /// replaced with defaults. Starting up is never blocked by a damaged file, and the
@@ -62,15 +64,29 @@ fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, Initiali
     let transport = install_kytrix_service(cx)?;
     let runtime = widget_tokio_runtime::global::try_handle(cx)
         .ok_or(InitializationError::RuntimeUnavailable)?;
+    let downloads = download_provider::global::install(
+        cx,
+        download_provider::global::DownloadProviderDeps {
+            transport: Arc::clone(&transport),
+            runtime: runtime.clone(),
+        },
+    );
     settings_ui::translation_downloads::install(
         cx,
         settings_ui::translation_downloads::TranslationDownloadsDeps {
-            transport: Arc::clone(&transport),
+            provider: downloads.clone(),
             runtime: runtime.clone(),
             unload: translation_unload(),
         },
     );
-    updater_ui::global::install(cx, UpdaterDeps { transport, runtime });
+    updater_ui::global::install(
+        cx,
+        UpdaterDeps {
+            transport,
+            runtime,
+            provider: downloads,
+        },
+    );
 
     Ok(recovery)
 }
@@ -83,8 +99,9 @@ fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, Initiali
 /// it does not fetch anything — a request is what opens the connection.
 ///
 /// The transport comes back because it is the process's, not the connector's: the
-/// updater takes the same one, so an update request leaves along the route the user
-/// configured for it, under the same lifecycle barrier as everything else.
+/// download manager and the updater take the same one, so an update request leaves
+/// along the route the user configured for it, under the same lifecycle barrier as
+/// everything else.
 fn install_kytrix_service(
     cx: &mut gpui_kit::App,
 ) -> Result<Arc<TransportHub>, InitializationError> {
