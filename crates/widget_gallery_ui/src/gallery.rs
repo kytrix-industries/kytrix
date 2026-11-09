@@ -71,7 +71,7 @@ use widget_registry::registry::WidgetRegistry;
 use crate::widget_icon::WidgetIcon;
 
 /// The size of a widget's icon in the gallery's rows.
-const ICON_SIZE: Pixels = px(32.0);
+const ICON_SIZE: Pixels = px(36.0);
 
 /// The height of one row, which holds the icon, the widget's name and description, and its
 /// radio.
