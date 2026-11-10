@@ -149,7 +149,7 @@ fn all_network_targets(
     .into_iter()
     .map(|capability| ServiceTarget::KytrixService { capability })
     .collect::<BTreeSet<_>>();
-    // The HuggingFace model download has no Kytrix capability, but it is a base
+    // The translation model download has no Kytrix capability, but it is a base
     // target all the same: its route generation has to be computed whether or not
     // the user has configured a line for it.
     targets.insert(ServiceTarget::TranslationModelDownload);
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(targets.len(), 15);
         assert!(
             targets.contains(&ServiceTarget::TranslationModelDownload),
-            "the HuggingFace model download should be a stamped target"
+            "the translation model download should be a stamped target"
         );
         assert!(
             targets.contains(&ServiceTarget::KytrixService {

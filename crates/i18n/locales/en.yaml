@@ -1209,7 +1209,10 @@ settings_ui:
     delete_failed_unload: the model could not be released
     delete_failed_unload_timeout: translations kept the model in use for too long
     deleting: Deleting
+    description: Description
     download: Download
+    download_complete_message: The model %{model} was downloaded successfully.
+    download_complete_title: Download complete
     download_failed: 'Download failed: %{reason}'
     download_failed_cancelled: the download was cancelled
     download_failed_destination: the destination is not a file path
@@ -1223,19 +1226,23 @@ settings_ui:
     download_failed_too_large: the download exceeded the allowed size
     download_failed_transport: the download failed on the network
     download_failed_url: the model address is invalid
-    download_url: 'Download address: %{url}'
+    download_site_huggingface: Huggingface
+    download_site_modelscope: ModelScope
+    download_site_title: Choose a model download site
+    downloading_progress: Downloading %{percent}%
+    model_description: '%{bits}-bit quantized version of the HY-MT2 %{size} model'
     model_directory: Model directory
     model_in_use: Model in use
-    model_size: '(Model size: %{size} MB)'
+    model_name: Model name
     models: Supported models
     no_downloaded_models: No downloaded models
     no_model_directory: Choose a model directory first
     pause: Pause
-    paused: Paused
+    paused_progress: Paused %{percent}%
     pausing: Pausing…
-    progress: '%{percent}%'
     resume: Resume
     retry: Retry
+    status: Status
     title: AI
     translation:
       title: Translation

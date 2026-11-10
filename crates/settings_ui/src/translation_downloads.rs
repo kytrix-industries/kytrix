@@ -21,7 +21,7 @@ use std::{
 use ahash::AHashMap;
 use app_config::{
     network::{RouteTarget, ServiceTarget},
-    translation::TranslationModel,
+    translation::{DownloadSite, TranslationModel},
 };
 use app_config_provider::manager::ConfigManager;
 use download_provider::{
@@ -126,12 +126,19 @@ pub(crate) struct TranslationDownloads {
     /// The provider task of each model in each directory, which is what a pause, a resume or a
     /// delete of the row acts on.
     tasks: AHashMap<(TranslationModel, PathBuf), DownloadId>,
+    /// The site each download was started from, which is what a retry defaults to.
+    sites: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
+    /// The downloads a retry asked to start once the files of another site are gone.
+    pending_restarts: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
     /// The directory of the most recent completed download, even when the settings session that
     /// started it was never confirmed.
     last_download_directory: Option<PathBuf>,
     /// Models a test treats as downloaded without creating a multi-gigabyte file.
     #[cfg(test)]
     forced_downloaded: ahash::AHashSet<(TranslationModel, PathBuf)>,
+    /// Whether a test asked for transfers to be recorded rather than started.
+    #[cfg(test)]
+    transfers_deferred: bool,
     /// Held because dropping it would stop the manager from following its downloads.
     _provider_events: Subscription,
 }
@@ -149,9 +156,13 @@ impl TranslationDownloads {
             unload: deps.unload,
             states: AHashMap::with_capacity(capacity),
             tasks: AHashMap::with_capacity(capacity),
+            sites: AHashMap::with_capacity(capacity),
+            pending_restarts: AHashMap::with_capacity(capacity),
             last_download_directory: None,
             #[cfg(test)]
             forced_downloaded: ahash::AHashSet::with_capacity(capacity),
+            #[cfg(test)]
+            transfers_deferred: false,
             _provider_events: provider_events,
         }
     }
@@ -191,16 +202,47 @@ impl TranslationDownloads {
             .collect()
     }
 
-    /// Starts downloading `model` into `directory`, or resumes the download already there.
+    /// The site the download of `model` in `directory` was started from.
+    pub(crate) fn site(&self, model: TranslationModel, directory: &Path) -> Option<DownloadSite> {
+        self.sites.get(&(model, directory.to_path_buf())).copied()
+    }
+
+    /// Starts downloading `model` into `directory` from `site`.
+    ///
+    /// This is what both a first download and the restart a retry asks for go through. A new
+    /// transfer starts from the chosen site; a paused or failed task is continued only when the
+    /// site it was started from is unknown or the same, because continuing it would report the
+    /// bytes of one site under another.
     pub(crate) fn download(
         &mut self,
         model: TranslationModel,
         directory: PathBuf,
+        site: DownloadSite,
         cx: &mut Context<Self>,
     ) {
-        let Ok(url) = Url::parse(model.download_url()) else {
+        let key = (model, directory.clone());
+        // A task that already exists from another site is left alone: resuming it, or recording
+        // this site over it, would report the bytes of one site under another.
+        if self.tasks.contains_key(&key)
+            && self
+                .sites
+                .get(&key)
+                .is_some_and(|recorded| *recorded != site)
+        {
+            return;
+        }
+        // A delete that is still in flight owns the files: a download started now would truncate
+        // the partial file that delete is removing.
+        if self.pending_restarts.contains_key(&key)
+            || self.is_downloaded(model, &directory)
+            || matches!(self.row_state(model, &directory), DownloadState::Deleting)
+        {
+            return;
+        }
+
+        let Ok(url) = Url::parse(model.download_url(site)) else {
             self.states.insert(
-                (model, directory),
+                key,
                 DownloadState::DownloadFailed {
                     failure: DownloadFailure::InvalidUrl,
                 },
@@ -209,39 +251,119 @@ impl TranslationDownloads {
             return;
         };
 
-        self.start_download(model, directory, url, cx);
+        #[cfg(test)]
+        if self.transfers_deferred {
+            self.sites.insert(key.clone(), site);
+            self.states
+                .insert(key, DownloadState::Downloading { downloaded: 0 });
+            cx.notify();
+            return;
+        }
+
+        // The site is recorded only when this call is what starts the transfer. A call that
+        // finds a paused or failed task continues that task, whose bytes are from the site it
+        // was started from: recording the site asked for here would report bytes of one site
+        // under the name of another.
+        if self.start_download(model, directory, url, cx) {
+            self.sites.insert(key, site);
+        }
+    }
+
+    /// Retries the failed download of `model` in `directory` from `site`.
+    ///
+    /// The same site continues the partial file the failed task left; another site discards that
+    /// file first, so the model is transferred from the site the user chose rather than stitched
+    /// together from bytes of the two.
+    pub(crate) fn retry(
+        &mut self,
+        model: TranslationModel,
+        directory: PathBuf,
+        site: DownloadSite,
+        cx: &mut Context<Self>,
+    ) {
+        // A delete that is still in flight is already the retry's first half: asking it to
+        // delete again would keep a restart that nothing would ever run.
+        if matches!(self.row_state(model, &directory), DownloadState::Deleting) {
+            return;
+        }
+
+        let key = (model, directory.clone());
+        let previous = self
+            .sites
+            .get(&key)
+            .copied()
+            .unwrap_or(DownloadSite::HuggingFace);
+
+        if previous == site {
+            // The retry defaults to the site of the failed task, so an unchanged choice continues
+            // what the task already has. A task the provider no longer holds falls back to a
+            // download from the same site.
+            self.sites.insert(key, site);
+            if self.resume(model, directory.clone(), cx) {
+                return;
+            }
+            self.download(model, directory, site, cx);
+            return;
+        }
+
+        self.pending_restarts.insert(key, site);
+        self.delete(model, directory, cx);
     }
 
     /// Starts downloading `model` into `directory` from `url`, or resumes the download already
     /// there.
+    ///
+    /// Returns whether a new provider task was added; a paused or failed task it continued
+    /// keeps the site it was started from.
     fn start_download(
         &mut self,
         model: TranslationModel,
         directory: PathBuf,
         url: Url,
         cx: &mut Context<Self>,
-    ) {
-        if self.is_downloaded(model, &directory)
+    ) -> bool {
+        let key = (model, directory.clone());
+        if self.pending_restarts.contains_key(&key)
+            || self.is_downloaded(model, &directory)
             || matches!(self.row_state(model, &directory), DownloadState::Deleting)
         {
-            return;
+            return false;
         }
 
-        let key = (model, directory.clone());
         if let Some(id) = self.tasks.get(&key).copied() {
             // The manager's own status decides: a paused or failed task continues from its
-            // partial file, while anything else is already doing what the row asked for.
-            let status = self.provider.read(cx).task(id).map(|task| task.status);
-            if matches!(
-                status,
-                Some(DownloadStatus::Paused { .. } | DownloadStatus::Failed { .. })
-            ) {
-                self.provider
-                    .update(cx, |provider, cx| provider.resume(id, cx));
+            // partial file, while anything else is already doing what the row asked for. A task
+            // the provider no longer holds is forgotten, so the download starts afresh.
+            match self.provider.read(cx).task(id) {
+                Some(task)
+                    if matches!(
+                        task.status,
+                        DownloadStatus::Paused { .. } | DownloadStatus::Failed { .. }
+                    ) =>
+                {
+                    self.provider
+                        .update(cx, |provider, cx| provider.resume(id, cx));
+                    return false;
+                }
+                Some(_) => return false,
+                None => {
+                    self.tasks.remove(&key);
+                }
             }
-            return;
         }
 
+        self.start_new_task(model, directory, url, cx);
+        true
+    }
+
+    /// Adds the provider task one download is.
+    fn start_new_task(
+        &mut self,
+        model: TranslationModel,
+        directory: PathBuf,
+        url: Url,
+        cx: &mut Context<Self>,
+    ) {
         let request = DownloadRequest {
             url,
             destination: directory.join(model.file_name()),
@@ -252,7 +374,7 @@ impl TranslationDownloads {
         let id = self
             .provider
             .update(cx, |provider, cx| provider.add(request, cx));
-        self.tasks.insert(key, id);
+        self.tasks.insert((model, directory), id);
         // The provider publishes the task while it is being added, before this row knows the
         // task is its own; adopting its status here is what tells the row it is running.
         let task = self.provider.read(cx).task(id);
@@ -287,7 +409,16 @@ impl TranslationDownloads {
         directory: PathBuf,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(id) = self.tasks.get(&(model, directory)).copied() else {
+        let key = (model, directory);
+        #[cfg(test)]
+        if self.transfers_deferred {
+            self.states
+                .insert(key, DownloadState::Downloading { downloaded: 0 });
+            cx.notify();
+            return true;
+        }
+
+        let Some(id) = self.tasks.get(&key).copied() else {
             return false;
         };
         self.provider
@@ -367,6 +498,7 @@ impl TranslationDownloads {
         let key = (model, directory.clone());
         self.states.remove(&key);
         self.tasks.remove(&key);
+        self.sites.remove(&key);
         self.last_download_directory = Some(directory.clone());
 
         let auto_select = cx.try_global::<ConfigManager>().is_some_and(|manager| {
@@ -412,6 +544,7 @@ impl TranslationDownloads {
         let key = (model, directory.clone());
         let path = directory.join(model.file_name());
         let task = self.tasks.get(&key).copied();
+        self.sites.remove(&key);
         self.states.insert(key, DownloadState::Deleting);
         cx.notify();
 
@@ -557,12 +690,33 @@ impl TranslationDownloads {
 
         match outcome {
             Ok(()) => {
-                self.states.remove(&(model, directory.clone()));
+                let key = (model, directory.clone());
+                self.states.remove(&key);
+                self.sites.remove(&key);
                 #[cfg(test)]
-                self.forced_downloaded.remove(&(model, directory.clone()));
-                cx.emit(TranslationDownloadsEvent::Deleted { model, directory });
+                self.forced_downloaded.remove(&key);
+                cx.emit(TranslationDownloadsEvent::Deleted {
+                    model,
+                    directory: directory.clone(),
+                });
+
+                // A retry that chose another site is a delete and then a download. The provider
+                // is in the middle of publishing the end of the delete here, so the restart is
+                // deferred out of that update rather than re-entering it, and it waits until the
+                // files the delete owned are gone before a new transfer can truncate them.
+                if let Some(site) = self.pending_restarts.remove(&key) {
+                    let downloads = cx.entity().downgrade();
+                    cx.defer(move |cx| {
+                        let _ = downloads.update(cx, |downloads, cx| {
+                            downloads.download(model, directory, site, cx);
+                        });
+                    });
+                }
             }
             Err(failure) => {
+                // The retry's intent is not kept for later: a delete that failed is what the row
+                // reports, and the user is the one who decides whether to try again.
+                self.pending_restarts.remove(&(model, directory.clone()));
                 self.states
                     .insert((model, directory), DownloadState::DeleteFailed { failure });
             }
@@ -598,6 +752,25 @@ impl TranslationDownloads {
         cx: &mut Context<Self>,
     ) {
         self.states.insert((model, directory), state);
+        cx.notify();
+    }
+
+    /// Records a download a test started without transferring it, and makes every download this
+    /// manager is asked to start afterwards record what it was asked for rather than transfer it.
+    #[cfg(test)]
+    pub(crate) fn set_transfers_deferred_for_test(
+        &mut self,
+        model: TranslationModel,
+        directory: PathBuf,
+        site: DownloadSite,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfers_deferred = true;
+        self.sites.insert((model, directory.clone()), site);
+        self.states.insert(
+            (model, directory),
+            DownloadState::Downloading { downloaded: 0 },
+        );
         cx.notify();
     }
 
@@ -673,7 +846,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         convert::Infallible,
-        io,
+        fs, io,
         net::{Ipv4Addr, SocketAddr},
         path::Path,
         pin::Pin,
@@ -685,7 +858,7 @@ mod tests {
     use app_config::{
         network::{RouteTarget, ServiceTarget},
         settings::Config,
-        translation::TranslationModel,
+        translation::{DownloadSite, TranslationModel},
     };
     use app_config_provider::manager::ConfigManager;
     use download_provider::{
@@ -1495,7 +1668,12 @@ mod tests {
 
         cx.update(|cx| {
             harness.downloads.update(cx, |downloads, cx| {
-                downloads.download(model, directory.path().to_path_buf(), cx);
+                downloads.download(
+                    model,
+                    directory.path().to_path_buf(),
+                    DownloadSite::HuggingFace,
+                    cx,
+                );
             });
         });
         wait_until(cx, "the download asked for again to complete", |cx| {
@@ -1507,6 +1685,59 @@ mod tests {
             payload.to_vec()
         );
         assert!(!part.exists(), "the continued transfer renames the part");
+    }
+
+    /// Asking again for a model that already has a paused task continues that task rather than
+    /// starting a second download of it, and does not report those bytes under another site.
+    #[gpui_kit::test]
+    fn a_download_that_resumes_a_task_should_not_change_its_site(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let payload = payload(160 * 1024);
+        let address = spawn_server(payload, Some(PACE));
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ8;
+        let harness = harness(cx);
+        let path = directory.path().to_path_buf();
+
+        adopt(cx, &harness, model, &path, address);
+        wait_until(cx, "some bytes to arrive before the pause", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::Downloading { downloaded } if downloaded > 0
+            )
+        });
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.pause(model, path.clone(), cx);
+            });
+        });
+        wait_until(cx, "the download to settle as paused", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::Paused { .. }
+            )
+        });
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
+            });
+        });
+
+        assert_eq!(
+            cx.update(|cx| harness.downloads.read(cx).site(model, &path)),
+            None,
+            "continuing a task keeps the site it was started from, which was never recorded here"
+        );
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.delete(model, path.clone(), cx);
+            });
+        });
+        wait_until(cx, "the resumed download to be discarded", |cx| {
+            state(cx, &harness.downloads, model, &path) == DownloadState::Idle
+        });
     }
 
     /// Deleting a downloaded model unloads the engine and removes the file; the row released its
@@ -1787,6 +2018,253 @@ mod tests {
                 TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
             )),
             "the page is told the paused model was deleted"
+        );
+    }
+
+    /// A download records the site it was started from, which is what a retry defaults to.
+    #[gpui_kit::test]
+    fn a_download_should_record_the_site_it_was_started_from(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt27BQ4Km;
+        let path = directory.path().to_path_buf();
+
+        // The seam turns the transfers of this manager into records, so no request leaves the
+        // process; it needs a row of its own to hold the state it simulates.
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.set_transfers_deferred_for_test(
+                    TranslationModel::HyMt218BQ4Km,
+                    path.clone(),
+                    DownloadSite::HuggingFace,
+                    cx,
+                );
+                downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
+            });
+        });
+
+        assert_eq!(
+            cx.update(|cx| harness.downloads.read(cx).site(model, &path)),
+            Some(DownloadSite::ModelScope),
+            "the site the download was asked for is the site the row recorded"
+        );
+        assert_eq!(
+            state(cx, &harness.downloads, model, &path),
+            DownloadState::Downloading { downloaded: 0 }
+        );
+    }
+
+    /// A site is unknown until a download records one; a retry with no recorded site continues
+    /// the failed task from the same site rather than deleting it.
+    #[gpui_kit::test]
+    fn a_same_site_retry_should_continue_the_failed_task(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let payload = payload(64 * 1024);
+        let address = spawn_server(payload, None);
+        let local_url =
+            Url::parse(&format!("http://{address}/model")).expect("the test URL is a URL");
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt27BQ8;
+        let harness = harness(cx);
+        let path = directory.path().to_path_buf();
+
+        assert_eq!(
+            cx.update(|cx| harness.downloads.read(cx).site(model, &path)),
+            None,
+            "a download that never ran records no site"
+        );
+
+        // The test server answers fewer bytes than the model publishes, so the task fails with
+        // the bytes that did arrive still in its partial file.
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.start_download(model, path.clone(), local_url, cx);
+            });
+        });
+        wait_until(cx, "the download to fail", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::DownloadFailed { .. }
+            )
+        });
+        let failed_task = cx.update(|cx| {
+            harness
+                .downloads
+                .read(cx)
+                .tasks
+                .get(&(model, path.clone()))
+                .copied()
+                .expect("the failed download keeps its provider task")
+        });
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.retry(model, path.clone(), DownloadSite::HuggingFace, cx);
+            });
+        });
+
+        assert_eq!(
+            state(cx, &harness.downloads, model, &path),
+            DownloadState::Downloading {
+                downloaded: fs::metadata(
+                    directory.path().join(format!("{}.part", model.file_name()))
+                )
+                .map(|part| part.len())
+                .unwrap_or(0),
+            },
+            "a retry at the same site continues the failed task from its partial file"
+        );
+        assert_eq!(
+            cx.update(|cx| harness
+                .downloads
+                .read(cx)
+                .tasks
+                .get(&(model, path.clone()))
+                .copied()),
+            Some(failed_task),
+            "the retry resumes the task the download already had"
+        );
+        assert_eq!(
+            cx.update(|cx| harness.downloads.read(cx).site(model, &path)),
+            Some(DownloadSite::HuggingFace),
+            "the retry records the site it resumed from"
+        );
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.delete(model, path.clone(), cx);
+            });
+        });
+        wait_until(cx, "the retried download to be discarded", |cx| {
+            state(cx, &harness.downloads, model, &path) == DownloadState::Idle
+        });
+    }
+
+    /// A retry at another site deletes what the previous site transferred and starts again from
+    /// zero, after the delete has finished rather than while it is still removing the files.
+    #[gpui_kit::test]
+    fn a_different_site_retry_should_delete_then_restart(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let payload = payload(192 * 1024);
+        let address = spawn_server(payload, Some(PACE));
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let harness = harness(cx);
+        let events = events(cx, &harness.downloads);
+        let path = directory.path().to_path_buf();
+        let part = path.join(format!("{}.part", model.file_name()));
+
+        adopt(cx, &harness, model, &path, address);
+        wait_until(cx, "some bytes to arrive before the pause", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::Downloading { downloaded } if downloaded > 0
+            )
+        });
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.pause(model, path.clone(), cx);
+            });
+        });
+        wait_until(cx, "the download to settle as paused", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::Paused { .. }
+            )
+        });
+        assert!(part.exists());
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.set_transfers_deferred_for_test(
+                    TranslationModel::HyMt27BQ8,
+                    path.clone(),
+                    DownloadSite::HuggingFace,
+                    cx,
+                );
+                downloads.retry(model, path.clone(), DownloadSite::ModelScope, cx);
+            });
+        });
+        assert_eq!(
+            state(cx, &harness.downloads, model, &path),
+            DownloadState::Deleting,
+            "another site discards the previous site's files before it downloads"
+        );
+
+        wait_until(cx, "the restart from the other site", |cx| {
+            state(cx, &harness.downloads, model, &path)
+                == DownloadState::Downloading { downloaded: 0 }
+                && cx.update(|cx| harness.downloads.read(cx).site(model, &path))
+                    == Some(DownloadSite::ModelScope)
+        });
+
+        assert!(
+            !part.exists(),
+            "the partial file of the previous site is gone before the new download starts"
+        );
+        assert!(
+            cx.update(|cx| harness.downloads.read(cx).tasks.is_empty()),
+            "the previous site's task is gone before the new download starts"
+        );
+        assert!(
+            recorded_events(&events).iter().any(|event| matches!(
+                event,
+                TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
+            )),
+            "the page is told the old download was deleted before the restart"
+        );
+    }
+
+    /// A restart whose delete fails reports the delete and keeps no intent to restart later.
+    #[gpui_kit::test]
+    fn a_restart_that_cannot_delete_should_report_the_failure(cx: &mut TestAppContext) {
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let path = directory.path().to_path_buf();
+        std::fs::write(path.join(model.file_name()), b"model")
+            .expect("the fixture file is written");
+        let harness = harness_with(
+            cx,
+            Config::default(),
+            Arc::new(|_: &Path| Err(UnloadFailure::TimedOut)),
+        );
+        let events = events(cx, &harness.downloads);
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.set_state_for_test(
+                    model,
+                    path.clone(),
+                    DownloadState::DownloadFailed {
+                        failure: DownloadFailure::Transport,
+                    },
+                    cx,
+                );
+                downloads.retry(model, path.clone(), DownloadSite::ModelScope, cx);
+            });
+        });
+
+        wait_until(cx, "the restart's delete to fail", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::DeleteFailed { .. }
+            )
+        });
+
+        assert!(
+            cx.update(|cx| harness.downloads.read(cx).pending_restarts.is_empty()),
+            "a delete that failed must not keep the retry for later"
+        );
+        assert_eq!(
+            cx.update(|cx| harness.downloads.read(cx).site(model, &path)),
+            None,
+            "no site was recorded for a restart that never started"
+        );
+        assert!(
+            !recorded_events(&events)
+                .iter()
+                .any(|event| matches!(event, TranslationDownloadsEvent::Deleted { .. })),
+            "a delete that failed is not reported as a delete"
         );
     }
 }

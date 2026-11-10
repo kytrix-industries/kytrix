@@ -14,6 +14,7 @@ where
 {
     id: ElementId,
     size: UnifiedSize,
+    row_height: Option<Pixels>,
     dataset: Entity<D>,
 }
 
@@ -25,8 +26,18 @@ where
         Self {
             id: id.into(),
             size: UnifiedSize::Medium,
+            row_height: None,
             dataset: dataset.clone(),
         }
+    }
+
+    /// Draws every row — the header included — at `height` instead of the size's own row height.
+    ///
+    /// A dataset whose cells wrap over several lines asks for a row tall enough to hold them;
+    /// what the size still decides is the text size, the padding and the gap between columns.
+    pub fn row_height(mut self, height: impl Into<Pixels>) -> Self {
+        self.row_height = Some(height.into());
+        self
     }
 }
 
@@ -35,7 +46,15 @@ where
     D: TableDataSet<COLUMNS> + 'static,
 {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self { id, size, dataset } = self;
+        let Self {
+            id,
+            size,
+            row_height,
+            dataset,
+        } = self;
+        // A row is as tall as the dataset asked for, or as the size decides. The header is drawn
+        // at the same height, so a wrapped row keeps its column labels above it.
+        let row_height = row_height.unwrap_or_else(|| size.h());
 
         let scroll_handle = window.use_keyed_state((id.clone(), "scroll"), cx, |_, _| {
             UniformListScrollHandle::new()
@@ -71,7 +90,7 @@ where
                         gpui_kit::base::TableHead::new(id, index)
                             .font_bold()
                             .text_size(size.text_size())
-                            .h(size.h())
+                            .h(row_height)
                             .px(size.px())
                             .w(column_widths[index])
                             .flex()
@@ -144,13 +163,14 @@ where
                                             let cell_id: ElementId =
                                                 (id.clone(), column_index.to_smolstr().as_str())
                                                     .into();
+                                            let wraps = dataset.cell_wraps(row_index, column_index);
 
                                             cells.push(
                                                 gpui_kit::base::TableCell::new(
                                                     cell_id,
                                                     column_index,
                                                 )
-                                                .h(size.h())
+                                                .h(row_height)
                                                 .px(size.px())
                                                 .text_size(size.text_size())
                                                 .w(width)
@@ -168,7 +188,10 @@ where
                                                 .child(
                                                     div()
                                                         .min_w_0()
-                                                        .truncate()
+                                                        .when(wraps, |this| {
+                                                            this.w_full().whitespace_normal()
+                                                        })
+                                                        .when(!wraps, |this| this.truncate())
                                                         .text_color(row_foreground)
                                                         .child(dataset.cell(
                                                             row_index,
@@ -223,6 +246,17 @@ pub trait TableDataSet<const COLUMNS: usize> {
     fn headers(&self, cx: &App) -> [SharedString; COLUMNS];
     fn column_aligns(&self) -> [Align; COLUMNS];
     fn column_widths(&self) -> [Length; COLUMNS];
+    /// Whether the cell at `column_index` of `row_index` wraps its content over several lines
+    /// instead of being cut to one.
+    ///
+    /// A wrapping cell is laid out across the full width of its column and its text breaks at the
+    /// spaces in it, which is what a row taller than the size's own row height is for — see
+    /// [`Table::row_height`]. A cell that does not wrap keeps the single line it is drawn with and
+    /// is cut with an ellipsis when it is too wide, which is the behaviour of every cell that does
+    /// not say otherwise.
+    fn cell_wraps(&self, _row_index: usize, _column_index: usize) -> bool {
+        false
+    }
     fn cell(&self, row_index: usize, column_index: usize, cx: &App) -> impl IntoElement;
 
     /// How each column of one row is aligned, in column order.

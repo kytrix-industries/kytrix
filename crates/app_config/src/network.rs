@@ -67,7 +67,7 @@ pub enum KytrixServiceCapability {
 /// configuration key. A venue is not a target: its requests are routed by the
 /// venue's own configuration, which names a line of its own or follows the
 /// default line, so the targets that remain are Kytrix's own services and the
-/// built-in HuggingFace model download.
+/// built-in model download.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ServiceTarget {
@@ -76,11 +76,11 @@ pub enum ServiceTarget {
         #[serde(rename = "capability")]
         capability: KytrixServiceCapability,
     },
-    /// A HuggingFace download of one of the local translation models.
+    /// A download of one of the local translation models.
     ///
-    /// The files come from HuggingFace rather than from a Kytrix service, but the
-    /// download still takes one of the application's outbound routes, so it is a
-    /// service target of its own.
+    /// The files come from the download site the user chose — HuggingFace or
+    /// ModelScope — rather than from a Kytrix service, but the download still takes
+    /// one of the application's outbound routes, so it is a service target of its own.
     #[serde(rename = "translation_model_download")]
     TranslationModelDownload,
 }
@@ -91,9 +91,7 @@ impl fmt::Display for ServiceTarget {
             Self::KytrixService { capability } => {
                 write!(formatter, "Kytrix service {capability:?}")
             }
-            Self::TranslationModelDownload => {
-                formatter.write_str("HuggingFace translation model download")
-            }
+            Self::TranslationModelDownload => formatter.write_str("translation model download"),
         }
     }
 }
@@ -932,7 +930,7 @@ mod tests {
             .expect("the download target should decode"),
             target
         );
-        assert_eq!(target.to_string(), "HuggingFace translation model download");
+        assert_eq!(target.to_string(), "translation model download");
     }
 
     /// A service target is an ordered key: a rewritten file keeps its order.

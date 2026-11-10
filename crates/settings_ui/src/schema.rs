@@ -350,6 +350,11 @@ fn translation_page() -> PageDef {
             "browse",
             "浏览",
             "huggingface",
+            "modelscope",
+            "魔搭",
+            "download site",
+            "下载站点",
+            "站点",
             "download",
             "下载",
             "hy-mt2",
@@ -580,7 +585,15 @@ fn application_sections(venues: &[VenueId]) -> Vec<SectionDef> {
             proxy_targets_field(
                 "proxy-applications.ai.models",
                 "settings_ui.proxies.ai_model_downloads",
-                &["ai", "model", "模型", "huggingface", "下载"],
+                &[
+                    "ai",
+                    "model",
+                    "模型",
+                    "huggingface",
+                    "modelscope",
+                    "魔搭",
+                    "下载",
+                ],
                 AI_MODELS,
             ),
         ],
@@ -1579,7 +1592,7 @@ const APP_UPDATES: &[ServiceTarget] = &[
     },
 ];
 
-/// The HuggingFace translation model downloads, which have a line of their own.
+/// The translation model downloads, which have a line of their own.
 const AI_MODELS: &[ServiceTarget] = &[ServiceTarget::TranslationModelDownload];
 
 /// The media service, which the applications page groups on its own.
@@ -1769,7 +1782,7 @@ pub(crate) mod tests {
     /// locale, and a locale's key would look like an orphan the crate does not draw. Nothing ties
     /// it to the directory, so a source added to this crate has to be added here too — which is
     /// what [`every_settings_source_should_be_read_by_the_key_guard`] is for.
-    const SETTINGS_SOURCES: [(&str, &str); 13] = [
+    const SETTINGS_SOURCES: [(&str, &str); 15] = [
         ("access.rs", include_str!("access.rs")),
         ("appearance.rs", include_str!("appearance.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
@@ -1786,6 +1799,8 @@ pub(crate) mod tests {
             "translation_downloads.rs",
             include_str!("translation_downloads.rs"),
         ),
+        ("translation_site.rs", include_str!("translation_site.rs")),
+        ("translation_table.rs", include_str!("translation_table.rs")),
     ];
 
     /// The half of one source that names the settings: everything above the test module it

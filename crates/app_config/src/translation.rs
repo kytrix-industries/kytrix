@@ -9,6 +9,23 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// One site the translation models can be downloaded from.
+///
+/// It is a choice the settings page offers rather than a persisted value. A completed
+/// download is saved under the model's own file name, whichever site it came from, but
+/// a retry from another site discards the partial file the previous site left rather
+/// than continuing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DownloadSite {
+    HuggingFace,
+    ModelScope,
+}
+
+impl DownloadSite {
+    /// Every site, in the order the settings page offers them.
+    pub const ALL: [Self; 2] = [Self::HuggingFace, Self::ModelScope];
+}
+
 /// One downloadable Hy-MT2 GGUF model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TranslationModel {
@@ -71,7 +88,30 @@ impl TranslationModel {
         }
     }
 
-    /// The exact size HuggingFace publishes for the file, in bytes.
+    /// The parameter count the settings page labels the model with.
+    pub fn parameter_size(self) -> &'static str {
+        match self {
+            Self::HyMt218BQ4Km
+            | Self::HyMt218BQ6K
+            | Self::HyMt218BQ8
+            | Self::HyMt218B2Bit
+            | Self::HyMt218B125Bit => "1.8B",
+            Self::HyMt27BQ4Km | Self::HyMt27BQ6K | Self::HyMt27BQ8 => "7B",
+        }
+    }
+
+    /// The quantization width the settings page labels the model with, in bits.
+    pub fn quantization_bits(self) -> &'static str {
+        match self {
+            Self::HyMt218BQ4Km | Self::HyMt27BQ4Km => "4",
+            Self::HyMt218BQ6K | Self::HyMt27BQ6K => "6",
+            Self::HyMt218BQ8 | Self::HyMt27BQ8 => "8",
+            Self::HyMt218B2Bit => "2",
+            Self::HyMt218B125Bit => "1.25",
+        }
+    }
+
+    /// The published size of the model's file, in bytes.
     pub fn size_bytes(self) -> u64 {
         match self {
             Self::HyMt218BQ4Km => 1_133_080_448,
@@ -85,39 +125,62 @@ impl TranslationModel {
         }
     }
 
-    /// The HuggingFace URL the model is downloaded from.
-    pub fn download_url(self) -> &'static str {
-        match self {
-            Self::HyMt218BQ4Km => {
-                "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf"
-            }
-            Self::HyMt218BQ6K => {
-                "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf"
-            }
-            Self::HyMt218BQ8 => {
-                "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q8_0.gguf"
-            }
-            Self::HyMt218B2Bit => {
-                "https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF/resolve/main/Hy-MT2-1.8B-2Bit.gguf"
-            }
-            Self::HyMt218B125Bit => {
-                "https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf"
-            }
-            Self::HyMt27BQ4Km => {
-                "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/Hy-MT2-7B-Q4_K_M.gguf"
-            }
-            Self::HyMt27BQ6K => {
-                "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q6_K.gguf"
-            }
-            Self::HyMt27BQ8 => {
-                "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q8_0.gguf"
-            }
+    /// The URL the model is downloaded from on `site`.
+    pub fn download_url(self, site: DownloadSite) -> &'static str {
+        match site {
+            DownloadSite::HuggingFace => match self {
+                Self::HyMt218BQ4Km => {
+                    "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf"
+                }
+                Self::HyMt218BQ6K => {
+                    "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf"
+                }
+                Self::HyMt218BQ8 => {
+                    "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q8_0.gguf"
+                }
+                Self::HyMt218B2Bit => {
+                    "https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF/resolve/main/Hy-MT2-1.8B-2Bit.gguf"
+                }
+                Self::HyMt218B125Bit => {
+                    "https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf"
+                }
+                Self::HyMt27BQ4Km => {
+                    "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/Hy-MT2-7B-Q4_K_M.gguf"
+                }
+                Self::HyMt27BQ6K => {
+                    "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q6_K.gguf"
+                }
+                Self::HyMt27BQ8 => {
+                    "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q8_0.gguf"
+                }
+            },
+            DownloadSite::ModelScope => match self {
+                Self::HyMt218BQ4Km => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q4_K_M.gguf"
+                }
+                Self::HyMt218BQ6K => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q6_K.gguf"
+                }
+                Self::HyMt218BQ8 => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q8_0.gguf"
+                }
+                Self::HyMt218B2Bit => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-2bit-GGUF/resolve/master/Hy-MT2-1.8B-2Bit.gguf"
+                }
+                Self::HyMt218B125Bit => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-1.25bit-GGUF/resolve/master/Hy-MT2-1.8B-1.25Bit.gguf"
+                }
+                Self::HyMt27BQ4Km => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/Hy-MT2-7B-Q4_K_M.gguf"
+                }
+                Self::HyMt27BQ6K => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/HY-MT2-7B-Q6_K.gguf"
+                }
+                Self::HyMt27BQ8 => {
+                    "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/HY-MT2-7B-Q8_0.gguf"
+                }
+            },
         }
-    }
-
-    /// The published size in mebibytes (1 MiB = 1024 * 1024 bytes).
-    pub fn size_mb(self) -> f64 {
-        self.size_bytes() as f64 / (1024.0 * 1024.0)
     }
 
     /// Resolves a settings value to the model it names.
@@ -149,61 +212,109 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{TranslationConfig, TranslationModel};
+    use super::{DownloadSite, TranslationConfig, TranslationModel};
 
     /// Every published fact, in the order the page offers the models.
-    const CATALOG: [(&str, &str, u64); 8] = [
+    const CATALOG: [(&str, &str, u64, &str, &str); 8] = [
         (
             "HY-MT2-1.8B-Q4_K_M",
             "HY-MT2-1.8B-Q4_K_M.gguf",
             1_133_080_448,
+            "1.8B",
+            "4",
         ),
-        ("HY-MT2-1.8B-Q6_K", "HY-MT2-1.8B-Q6_K.gguf", 1_474_785_120),
-        ("HY-MT2-1.8B-Q8_0", "HY-MT2-1.8B-Q8_0.gguf", 1_908_528_192),
-        ("HY-MT2-1.8B-2Bit", "HY-MT2-1.8B-2Bit.gguf", 600_534_880),
+        (
+            "HY-MT2-1.8B-Q6_K",
+            "HY-MT2-1.8B-Q6_K.gguf",
+            1_474_785_120,
+            "1.8B",
+            "6",
+        ),
+        (
+            "HY-MT2-1.8B-Q8_0",
+            "HY-MT2-1.8B-Q8_0.gguf",
+            1_908_528_192,
+            "1.8B",
+            "8",
+        ),
+        (
+            "HY-MT2-1.8B-2Bit",
+            "HY-MT2-1.8B-2Bit.gguf",
+            600_534_880,
+            "1.8B",
+            "2",
+        ),
         (
             "HY-MT2-1.8B-1.25Bit",
             "HY-MT2-1.8B-1.25Bit.gguf",
             461_860_800,
+            "1.8B",
+            "1.25",
         ),
-        ("HY-MT2-7B-Q4_K_M", "HY-MT2-7B-Q4_K_M.gguf", 4_624_648_896),
-        ("HY-MT2-7B-Q6_K", "HY-MT2-7B-Q6_K.gguf", 6_164_482_720),
-        ("HY-MT2-7B-Q8_0", "HY-MT2-7B-Q8_0.gguf", 7_981_928_896),
+        (
+            "HY-MT2-7B-Q4_K_M",
+            "HY-MT2-7B-Q4_K_M.gguf",
+            4_624_648_896,
+            "7B",
+            "4",
+        ),
+        (
+            "HY-MT2-7B-Q6_K",
+            "HY-MT2-7B-Q6_K.gguf",
+            6_164_482_720,
+            "7B",
+            "6",
+        ),
+        (
+            "HY-MT2-7B-Q8_0",
+            "HY-MT2-7B-Q8_0.gguf",
+            7_981_928_896,
+            "7B",
+            "8",
+        ),
     ];
 
-    /// Every model's stable wire id and HuggingFace URL, in the same order.
-    const URLS: [(&str, &str); 8] = [
+    /// Every model's stable wire id and its URL on each site, in the same order.
+    const URLS: [(&str, &str, &str); 8] = [
         (
             "hy_mt2_1_8b_q4_k_m",
             "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q4_K_M.gguf",
         ),
         (
             "hy_mt2_1_8b_q6_k",
             "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q6_K.gguf",
         ),
         (
             "hy_mt2_1_8b_q8_0",
             "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q8_0.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q8_0.gguf",
         ),
         (
             "hy_mt2_1_8b_2bit",
             "https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF/resolve/main/Hy-MT2-1.8B-2Bit.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-2bit-GGUF/resolve/master/Hy-MT2-1.8B-2Bit.gguf",
         ),
         (
             "hy_mt2_1_8b_1_25bit",
             "https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-1.25bit-GGUF/resolve/master/Hy-MT2-1.8B-1.25Bit.gguf",
         ),
         (
             "hy_mt2_7b_q4_k_m",
             "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/Hy-MT2-7B-Q4_K_M.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/Hy-MT2-7B-Q4_K_M.gguf",
         ),
         (
             "hy_mt2_7b_q6_k",
             "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q6_K.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/HY-MT2-7B-Q6_K.gguf",
         ),
         (
             "hy_mt2_7b_q8_0",
             "https://huggingface.co/tencent/Hy-MT2-7B-GGUF/resolve/main/HY-MT2-7B-Q8_0.gguf",
+            "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-7B-GGUF/resolve/master/HY-MT2-7B-Q8_0.gguf",
         ),
     ];
 
@@ -246,33 +357,42 @@ mod tests {
     #[test]
     fn the_catalog_should_list_the_models_in_page_order() {
         assert_eq!(TranslationModel::ALL.len(), CATALOG.len());
-        for (model, (display_name, _, _)) in TranslationModel::ALL.iter().zip(CATALOG) {
+        for (model, (display_name, ..)) in TranslationModel::ALL.iter().zip(CATALOG) {
             assert_eq!(model.display_name(), display_name);
         }
     }
 
     #[test]
-    fn every_model_should_expose_its_file_size_and_download_url() {
+    fn every_model_should_expose_its_published_facts_and_download_urls() {
         for (index, model) in TranslationModel::ALL.into_iter().enumerate() {
-            let (display_name, file_name, size_bytes) = CATALOG[index];
-            let (wire_id, url) = URLS[index];
+            let (display_name, file_name, size_bytes, parameter_size, quantization_bits) =
+                CATALOG[index];
+            let (wire_id, hugging_face_url, model_scope_url) = URLS[index];
             let remote_file_name = REMOTE_FILE_NAMES[index];
 
             assert_eq!(model.display_name(), display_name);
             assert_eq!(model.file_name(), file_name);
             assert_eq!(model.size_bytes(), size_bytes);
-            assert_eq!(model.download_url(), url);
-            assert_eq!(
-                model.download_url().rsplit('/').next(),
-                Some(remote_file_name),
-                "{} must download the published remote file",
-                model.display_name()
-            );
-            assert!(
-                model.download_url().starts_with("https://huggingface.co/"),
-                "{} must come from HuggingFace",
-                model.display_name()
-            );
+            assert_eq!(model.parameter_size(), parameter_size);
+            assert_eq!(model.quantization_bits(), quantization_bits);
+            for (site, expected_url) in [
+                (DownloadSite::HuggingFace, hugging_face_url),
+                (DownloadSite::ModelScope, model_scope_url),
+            ] {
+                let url = model.download_url(site);
+                assert_eq!(
+                    url,
+                    expected_url,
+                    "{site:?} URL of {}",
+                    model.display_name()
+                );
+                assert_eq!(
+                    url.rsplit('/').next(),
+                    Some(remote_file_name),
+                    "{site:?} must download the published remote file for {}",
+                    model.display_name()
+                );
+            }
             assert_eq!(
                 serde_json::to_value(model).expect("the model should serialize"),
                 json!(wire_id),
@@ -288,26 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn the_7b_download_urls_should_name_the_published_files() {
-        for (model, expected) in [
-            (TranslationModel::HyMt27BQ4Km, "Hy-MT2-7B-Q4_K_M.gguf"),
-            (TranslationModel::HyMt27BQ6K, "HY-MT2-7B-Q6_K.gguf"),
-            (TranslationModel::HyMt27BQ8, "HY-MT2-7B-Q8_0.gguf"),
-        ] {
-            assert_eq!(
-                model.download_url().rsplit('/').next(),
-                Some(expected),
-                "{} must name the file the repository publishes",
-                model.display_name()
-            );
-        }
-    }
-
-    #[test]
-    fn a_size_should_be_reported_in_mebibytes() {
+    fn both_download_sites_should_be_offered_in_page_order() {
         assert_eq!(
-            TranslationModel::HyMt218BQ4Km.size_mb(),
-            1_133_080_448.0 / (1024.0 * 1024.0)
+            DownloadSite::ALL,
+            [DownloadSite::HuggingFace, DownloadSite::ModelScope]
         );
     }
 

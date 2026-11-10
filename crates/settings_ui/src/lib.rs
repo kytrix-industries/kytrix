@@ -22,5 +22,7 @@ pub mod settings;
 mod table;
 mod translation;
 pub mod translation_downloads;
+mod translation_site;
+mod translation_table;
 
 pub mod appearance;
