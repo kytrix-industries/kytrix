@@ -11,15 +11,20 @@
 //! be stored leaves the settings as they were and is reported to the user. There is nothing to
 //! confirm and nothing to cancel: leaving the page keeps what was stored, and only a text field
 //! that has not lost the caret yet is written on the way out.
+//!
+//! Every page is native UI drawn by the module that owns it. [`pages`] holds the pages that are a
+//! list of setting rows, [`pages::registry`] is the navigation and search index over all of them,
+//! and [`layout`] is the row and card the pages are built from.
 
-mod access;
-mod catalog;
 mod editor;
-mod page;
-mod schema;
+mod layout;
+mod pages;
+mod proxy_route;
 mod search;
 mod session;
 pub mod settings;
+#[cfg(test)]
+mod settings_tests;
 mod table;
 mod translation;
 pub mod translation_downloads;

@@ -1198,7 +1198,6 @@ settings_ui:
   about:
     title: About
     version: Version
-    version_description: The currently installed application version
   ai:
     browse: Browse
     delete: Delete
@@ -1224,11 +1223,14 @@ settings_ui:
     download_failed_transport: the download failed on the network
     download_failed_url: the model address is invalid
     download_site: Model download site
+    download_site_description: The site model files are downloaded from
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope
     downloading_progress: Downloading %{speed} %{percent}%
     model_directory: Model directory
+    model_directory_description: The folder translation models are downloaded to and loaded from
     model_in_use: Model in use
+    model_in_use_description: The downloaded model local translation uses
     model_name: Model name
     models: Supported models
     no_downloaded_models: No downloaded models
@@ -1249,14 +1251,18 @@ settings_ui:
   appearance:
     dark: Dark
     language: Language
-    language_description: Choose the application display language
+    language_description: Choose the display language
     language_en: English
     language_zh_cn: 简体中文
     light: Light
-    mode: Appearance mode
-    mode_description: Choose the application's light, dark, or system appearance
+    mode: Mode
+    mode_description: Choose the appearance mode
     system: System
     title: Appearance
+  data_format:
+    description: Choose the time zone widgets display data timestamps in; every data timestamp is converted to it
+    time_zone: Time zone
+    title: Data formatting
   general:
     title: General
   market_participants:
@@ -1269,6 +1275,8 @@ settings_ui:
     app_key_description: The application key of the OpenAPI application
     app_secret: App Secret
     app_secret_description: The application secret the access token is signed with
+    binance_spot: Spot
+    binance_usd_m_perp: USDⓈ-M Futures
     ed25519_passphrase: Ed25519 Passphrase
     ed25519_private_key: Ed25519 Private Key
     enter_access_token: Enter Access Token
@@ -1278,19 +1286,17 @@ settings_ui:
     enter_passphrase: Enter Passphrase
     enter_private_key: Enter Private Key
     enter_secret_key: Enter Secret Key
-    clob_origin: CLOB origin
-    clob_origin_description: The address Polymarket prices and probability history are read from
-    gamma_origin: Event directory origin
-    gamma_origin_description: The address Polymarket events are read from
-    http_origin: HTTP origin
-    hyperliquid_http_origin_description: The address HyperCore requests are sent to; the venue publishes one
-    hyperliquid_websocket_origin_description: The address HyperCore streams are opened on; the venue publishes one
+    clob_api_endpoint: CLOB API endpoint
+    clob_api_endpoint_description: The endpoint the CLOB API uses
+    credentials: Credentials
+    gamma_api_endpoint: Gamma API endpoint
+    gamma_api_endpoint_description: The endpoint the Gamma API uses
+    http_api_endpoint: HTTP API endpoint
+    http_api_endpoint_description: The endpoint the HTTP API uses
     main_account_address: Main account address
     main_account_description: The main account the API agent is allowed to operate
-    origins: Origins
     passphrase: Passphrase
     passphrase_description: The passphrase the key was created with
-    polymarket_websocket_description: The address the Polymarket CLOB publishes streams on
     private_key_description: The private key this venue's requests are signed with
     secret_key: Secret Key
     secret_key_description: The secret key this venue's requests authenticate with
@@ -1301,42 +1307,50 @@ settings_ui:
     service_region_global: International (Global)
     service_region_us_au: United States and Australia (US&AU)
     title: Market participants
-    websocket_origin: WebSocket origin
+    websocket_api_endpoint: WebSocket API endpoint
+    websocket_api_endpoint_description: The endpoint the WebSocket API uses
   no_matches: No settings match the search
   proxies:
     add: Add proxy
     address: Address
     ai_model_downloads: AI model downloads
+    ai_model_downloads_description: Proxy settings for fetching and downloading AI model data
     app_updates: App updates
-    applications: Proxy applications
+    app_updates_description: Proxy settings for fetching and downloading Kytrix app update data
     authorization: Authentication
-    default_line: Default line
-    default_line_description: Network targets without an override use this line
+    binance_description: Proxy settings for network activity by all Binance APIs
+    configure: Configure
+    default_proxy: Default proxy
     delete: Delete proxy
-    delete_message: '<p align="center">Delete the proxy "%{name}"? Network targets set to this line go back to the default line.</p>'
+    delete_message: '<p align="center">Delete the proxy "%{name}"? Network targets set to this proxy go back to the default proxy.</p>'
     delete_title: Delete Proxy
     dns_mode: DNS mode
     dns_mode_local: Local
     dns_mode_proxy: Proxy
     edit: Edit proxy
     empty: No proxies
-    group_description: Apply the same line to every network target in this group
-    inherit: Follow the default line
+    hyperliquid_description: Proxy settings for network activity by all Hyperliquid APIs
+    inherit: Follow the default proxy
     invalid_address: Enter a host name or an IP address
     invalid_port: Port must be an integer from 1 to 65535
     kytrix_cloud: Account and cloud services
+    kytrix_cloud_description: Proxy settings for network activity by APIs related to the Kytrix account and cloud services
     kytrix_section: Kytrix
-    management: Proxy management
-    mixed: Multiple lines
+    longbridge_description: Proxy settings for network activity by all Longbridge APIs
+    market_participants_section: Market participants
+    mixed: Multiple proxies
     name: Name
     name_exists: A proxy with this name already exists
     name_required: Enter a proxy name
     name_reserved: This name is reserved for route options
     no_authorization: No authentication
     no_proxy: Do not use a proxy
+    okx_description: Proxy settings for network activity by all OKX APIs
     password: Password
     password_required: Enter a password
+    polymarket_description: Proxy settings for network activity by all Polymarket APIs
     port: Port
+    server_management: Server management
     socks5_address: Socks5 address
     socks5_authorization: Socks5 authentication
     socks5_port: Socks5 port
@@ -1345,19 +1359,13 @@ settings_ui:
     username: Username
     username_password: Username and password
     username_required: Enter a username
-    venue_description: This venue's requests use this line; until it names one, they follow the default line
-    venue_section: Venue
-    x_media_group: Media
-    x_section: X (Twitter)
+    x_post_media: Media in X posts
+    x_post_media_description: Proxy settings for fetching and downloading media from X posts
   save_failed:
     message: '<p align="center">The settings were not written to disk: %{reason}</p>'
     title: The settings could not be saved
   search:
     placeholder: Search settings
-  subtitle: Changes are applied immediately. Text fields save when you leave them.
-  time_zone:
-    description: Choose the time zone widgets display data timestamps in; every data timestamp is converted to it
-    title: Data time zone
   title: Settings
 
 startup:

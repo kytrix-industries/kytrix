@@ -12,6 +12,21 @@
 use ahash::AHashSet;
 use gpui_kit::SharedString;
 
+/// The text a page or a setting is searched by, from the words it is drawn with.
+///
+/// Every word is lowercased and joined with a space, so a query is answered in the same spelling
+/// whatever the case it was typed in and whatever language the interface is showing.
+pub(crate) fn words(parts: &[&str]) -> String {
+    let mut text = String::new();
+
+    for part in parts {
+        text.push_str(&part.to_lowercase());
+        text.push(' ');
+    }
+
+    text
+}
+
 /// One node of the tree, with the text it is searched by.
 pub(crate) struct SearchNode {
     pub id: SharedString,
@@ -238,12 +253,12 @@ mod tests {
                 page: None,
                 keywords: vec!["proxies".into(), "代理".into(), "socks5".into()],
                 children: vec![SearchNode {
-                    id: "proxy-management".into(),
+                    id: "server-management".into(),
                     page: Some(PageSearch {
-                        label: "proxy management 代理管理".into(),
+                        label: "server management 服务器管理".into(),
                         fields: Vec::new(),
                     }),
-                    keywords: vec!["proxy".into(), "catalog".into()],
+                    keywords: vec!["proxy".into(), "server".into()],
                     children: Vec::new(),
                 }],
             },
@@ -255,7 +270,7 @@ mod tests {
         let filter = SearchFilter::new("  ", &tree());
 
         assert!(filter.is_all());
-        assert!(filter.admits_page("proxy-management"));
+        assert!(filter.admits_page("server-management"));
         assert!(filter.admits_field("appearance", "language"));
     }
 
@@ -265,7 +280,7 @@ mod tests {
 
         assert!(matches!(filter, SearchFilter::Nothing));
         assert!(!filter.admits_page("appearance"));
-        assert!(!filter.admits_page("proxy-management"));
+        assert!(!filter.admits_page("server-management"));
         assert!(!filter.admits_field("appearance", "appearance"));
     }
 
@@ -275,7 +290,7 @@ mod tests {
     fn a_group_should_be_admitted_by_its_own_label_and_bring_its_children() {
         let filter = SearchFilter::new("代理", &tree());
 
-        assert!(filter.admits_page("proxy-management"));
+        assert!(filter.admits_page("server-management"));
         assert!(!filter.admits_page("appearance"));
     }
 

@@ -39,45 +39,19 @@ use tempfile::TempDir;
 use widget_tokio_runtime::global;
 
 use crate::{
-    access::FieldValue,
     appearance,
-    catalog::{Catalog, FieldAccess, PageDef, VenueView, catalog},
-    session::SettingsSession,
+    pages::registry,
+    session::SettingsChange,
     settings::{SettingsPage, SidebarEntry},
     table::ProxyRequest,
 };
 
-/// The venues every test of this module draws the settings from.
-///
-/// The page draws its venue pages from whichever venue list it is handed, which in production
-/// is what this build speaks — see [`SettingsPage::load`] — and here is this fixture.
-pub(crate) fn venues() -> VenueView {
-    crate::schema::tests::venues()
-}
-
-/// The catalog of one venue list, over the fixture settings.
-///
-/// The catalog of the venues this build speaks.
-pub(crate) fn test_catalog() -> Catalog {
-    catalog(&venues())
-}
-
-/// The pages of the fixture catalog.
-pub(crate) fn pages() -> Vec<PageDef> {
-    test_catalog().pages
-}
-
-/// The label one page of the fixture catalog is drawn with.
-///
-/// A page is named by the message key it declares or by the identity it stands
-/// for, and the sidebar draws whichever the catalog carries.
+/// The label one page is drawn with.
 pub(crate) fn page_title(page: &str, cx: &TestAppContext) -> SharedString {
     cx.read(|cx| {
-        test_catalog()
-            .page(page)
-            .unwrap_or_else(|| panic!("{page} should be in the catalog"))
-            .title
-            .label(cx)
+        registry::page(page)
+            .unwrap_or_else(|| panic!("{page} should be offered"))
+            .title(cx)
     })
 }
 
@@ -177,7 +151,31 @@ pub(crate) fn settings_over(
     language: Language,
     cx: &mut TestAppContext,
 ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-    settings_over_catalog(manager, language, test_catalog(), cx)
+    let page = cx.update(|cx| {
+        // What a window installs before it draws anything, in the order the application
+        // installs it: a field that is typed into reads the state base_ui's own fields are
+        // built on.
+        gpui_kit::base::init(cx);
+        base_ui::style::theme::install(cx);
+        i18n::global::embedded::install(cx).expect("embedded locales should load");
+        cx.set_global(match language {
+            Language::ZhCn => LanguageCode::ZhCn,
+            Language::En => LanguageCode::En,
+        });
+        cx.set_global(manager);
+        install_translation_downloads(cx);
+        // A manager whose settings are stored under another language than the one the
+        // interface is drawn in is a session that starts with a change nobody made, so the
+        // two are made to agree here rather than left to what a default happens to be.
+        cx.update_global::<ConfigManager, _>(|manager, cx| {
+            manager.update(|config| config.language = language, cx);
+        });
+
+        cx.new(SettingsPage::load)
+    });
+    let cx = mount_page(cx, page.clone());
+
+    (page, cx)
 }
 
 /// Installs the process-wide download manager a settings session reads, once per test app.
@@ -226,44 +224,6 @@ pub(crate) fn install_translation_downloads_with(
             unload,
         },
     );
-}
-
-/// Opens the settings over the catalog the page is built from.
-///
-/// The catalog is this build's own unless a test asks otherwise: a test of what a group the
-/// catalog closes is drawn as hands a catalog that closes it here.
-pub(crate) fn settings_over_catalog(
-    manager: ConfigManager,
-    language: Language,
-    catalog: Catalog,
-    cx: &mut TestAppContext,
-) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-    let page = cx.update(|cx| {
-        // What a window installs before it draws anything, in the order the application
-        // installs it: a field that is typed into reads the state base_ui's own fields are
-        // built on.
-        gpui_kit::base::init(cx);
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("embedded locales should load");
-        cx.set_global(match language {
-            Language::ZhCn => LanguageCode::ZhCn,
-            Language::En => LanguageCode::En,
-        });
-        cx.set_global(manager);
-        install_translation_downloads(cx);
-        // A manager whose settings are stored under another language than the one the
-        // interface is drawn in is a session that starts with a change nobody made, so the
-        // two are made to agree here rather than left to what a default happens to be.
-        cx.update_global::<ConfigManager, _>(|manager, cx| {
-            manager.update(|config| config.language = language, cx);
-        });
-        let session = cx.new(|_| SettingsSession::new());
-
-        cx.new(|cx| SettingsPage::new_with_catalog(session, catalog, cx))
-    });
-    let cx = mount_page(cx, page.clone());
-
-    (page, cx)
 }
 
 /// Opens the settings with the interface in `language`.
@@ -319,31 +279,14 @@ pub(crate) fn click(cx: &mut VisualTestContext, selector: &'static str) {
     settle(cx);
 }
 
-/// The access of a field of the catalog, so a test writes the way a control writes.
-pub(crate) fn field_access(page: &str, field: &str) -> FieldAccess {
-    test_catalog()
-        .page(page)
-        .unwrap_or_else(|| panic!("{page} should be in the catalog"))
-        .sections
-        .iter()
-        .flat_map(|section| &section.fields)
-        .find(|definition| definition.id == field)
-        .unwrap_or_else(|| panic!("{page} should offer {field}"))
-        .access
-        .clone()
-}
-
-/// Writes a field the way the control of that field does: at once, into the settings.
-pub(crate) fn write_field(
+/// Writes a change the way a native setting writes one: at once, into the settings.
+pub(crate) fn edit_settings(
     panel: &Entity<SettingsPage>,
-    page: &'static str,
-    field: &'static str,
-    value: &str,
+    edit: impl Fn(&mut Config) + 'static,
     cx: &mut VisualTestContext,
 ) {
-    let access = field_access(page, field);
     panel.update(cx, |panel, cx| {
-        panel.write_field(access, FieldValue::new(value), cx);
+        panel.apply(SettingsChange::edit(edit), cx);
     });
     settle(cx);
 }
@@ -417,7 +360,7 @@ pub(crate) fn drawn_appearance(cx: &VisualTestContext) -> ThemeAppearance {
 
 /// The page the dialog is drawing.
 pub(crate) fn current_page(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> SharedString {
-    cx.read(|cx| panel.read_with(cx, |dialog, _| dialog.current_page.clone()))
+    cx.read(|cx| panel.read_with(cx, |dialog, _| dialog.current_page_for_test().clone()))
 }
 
 /// The labels the sidebar draws, in the order it draws them.
@@ -425,7 +368,7 @@ pub(crate) fn labels(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> Ve
     cx.read(|cx| {
         panel.read_with(cx, |dialog, _| {
             dialog
-                .sidebar
+                .sidebar_for_test()
                 .iter()
                 .filter_map(|entry| match entry {
                     SidebarEntry::Heading(label) => Some(label.clone()),
@@ -606,7 +549,7 @@ pub(crate) fn request(
     cx: &mut VisualTestContext,
 ) {
     panel.update(cx, |dialog, cx| {
-        dialog.proxies.update(cx, |table, cx| {
+        dialog.proxies_for_test().update(cx, |table, cx| {
             table.request(request, cx);
         });
     });
@@ -620,15 +563,18 @@ pub(crate) fn open_add_form(panel: &Entity<SettingsPage>, cx: &mut VisualTestCon
     request(panel, ProxyRequest::Add, cx);
 }
 
-/// Clicks one text field of a form and types into it without leaving it.
+/// Clicks one text field of a form, moves the caret to the end of its value, and types into it
+/// without leaving it.
 ///
 /// The caret is left where it is, which is what a user who types and then presses a button
-/// does: it is the case that tells a field committed on blur from one the form reads.
+/// does: it is the case that tells a field committed on blur from one the form reads. The caret
+/// is moved to the end first, so what is typed is appended however wide the field is.
 pub(crate) fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
     let field = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("the form should draw {selector}"));
     cx.simulate_click(field.center(), Modifiers::none());
+    cx.simulate_keystrokes("end");
     cx.simulate_input(text);
     settle(cx);
 }

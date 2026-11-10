@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::{
     AnyElement, App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    StatefulInteractiveElement, Styled, Window,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window,
     base::{POPUP_PRIORITY, Placement},
     div,
 };
@@ -19,6 +19,7 @@ pub struct Tooltip {
     trigger: AnyElement,
     content: Option<AnyElement>,
     placement: Placement,
+    style: StyleRefinement,
 }
 
 impl Tooltip {
@@ -28,6 +29,7 @@ impl Tooltip {
             trigger: trigger.into_any_element(),
             content: None,
             placement: Placement::Bottom,
+            style: StyleRefinement::default(),
         }
     }
 
@@ -42,6 +44,18 @@ impl Tooltip {
     }
 }
 
+/// The tooltip's outer box: the item a caller's layout sizes, and the box its trigger is
+/// measured in.
+///
+/// The panel is anchored to that box, so a trigger that has to shrink inside a row — a path cut
+/// to the column it sits in — is cut to the box the caller constrains, not to the text's full
+/// width.
+impl Styled for Tooltip {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Tooltip {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Self {
@@ -49,6 +63,7 @@ impl RenderOnce for Tooltip {
             trigger,
             content,
             placement,
+            style,
         } = self;
 
         // A tooltip without anything to say is not a control: it draws what it was
@@ -79,7 +94,7 @@ impl RenderOnce for Tooltip {
         // after it are given nothing to draw.
         let content = Rc::new(RefCell::new(Some(content)));
 
-        Overlay::new(
+        let mut overlay = Overlay::new(
             id,
             open_state,
             move |open_state, _, _| {
@@ -112,8 +127,10 @@ impl RenderOnce for Tooltip {
         // control of its own, and it must not be buried under the panel it explains.
         // A context menu is one step below it for the same reason: the hint on an entry
         // inside the menu is read over the menu, not under it.
-        .priority(POPUP_PRIORITY + 2)
-        .into_any_element()
+        .priority(POPUP_PRIORITY + 2);
+        overlay.style().clone_from(&style);
+
+        overlay.into_any_element()
     }
 }
 

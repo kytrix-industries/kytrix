@@ -2,8 +2,9 @@
 //! window in place of the workspace.
 //!
 //! The page owns what outlives a frame: the page that is drawn, the state of every text field on
-//! it, and the scroll position of that page. Everything else — what a page holds, what a control
-//! writes — belongs to the catalog and to the settings themselves.
+//! it, and the scroll position of that page. Each page is native UI — its rows, cards and controls
+//! are written where the page is written — and this module is the frame around them: the sidebar,
+//! the search, the routing between pages, and the one place a text field is committed.
 //!
 //! The page has the gallery's shape: a title and the search field in its header, and the settings
 //! menu on the left with the detail page behind the selected entry on the right. There is no
@@ -14,30 +15,32 @@
 //! and move together.
 //!
 //! A control writes the settings rather than a copy of them, through the session every view of
-//! this page shares — see [`SettingsPage::write_field`]. A write that cannot be stored leaves the
+//! this page shares — see [`SettingsPage::apply`]. A write that cannot be stored leaves the
 //! settings as they were and is reported over the page, so what the user had is still there to try
 //! again with. A text field is written when the caret leaves it or Enter is pressed, and what is
 //! still unsaved when another page is opened or this one is left is written then.
 //!
-//! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its
-//! own label nor by a field on it is not drawn at all, and a group with none of its pages left
-//! is not drawn either, so what is left is the way to what was searched for. What it narrows is
-//! the sidebar; a query that matches nothing is answered in both columns rather than leaving the
-//! page that was open behind.
+//! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its own
+//! label nor by a setting on it is not drawn at all, and a group with none of its pages left is not
+//! drawn either, so what is left is the way to what was searched for. What it narrows is the
+//! sidebar; a query that matches nothing is answered in both columns rather than leaving the page
+//! that was open behind.
 //!
-//! A page is drawn from the catalog on every frame, so it follows the language the window is
-//! showing by itself. What the page holds across frames — the rows of the sidebar, the words
-//! the search is answered over, the placeholder of a field built before — does not, so it is
-//! built again when the language moves on — see [`SettingsPage::adopt_language`].
+//! A page is native UI drawn on every frame, so it follows the language the window is showing by
+//! itself. What the page holds across frames — the rows of the sidebar, the words the search is
+//! answered over, the placeholder of a field built before — does not, so it is built again when
+//! the language moves on — see [`SettingsPage::adopt_language`].
 //!
-//! The proxy catalog and the translation page are views of their own rather than pages of
-//! fields. The form that changes the proxy catalog is a dialog on the window layer, drawn over
-//! this page. A row cannot open one itself — a table cell is drawn without a window — so it
-//! records the form it wants and this page opens it on the layer. The form writes the same
-//! session, because it is one page either way. Deleting a row is the one request that is put to
-//! the user before it is written, and the alert it is put to is opened the same way — see
-//! [`SettingsPage::open_requested_form`].
+//! The proxy catalog and the translation page are views of their own. The form that changes the
+//! proxy catalog is a dialog on the window layer, drawn over this page. A row cannot open one
+//! itself — a table cell is drawn without a window — so it records the form it wants and this page
+//! opens it on the layer. The form writes the same session, because it is one page either way.
+//! Deleting a row is the one request that is put to the user before it is written, and the alert
+//! it is put to is opened the same way — see [`SettingsPage::open_requested_form`].
 
+use std::rc::Rc;
+
+use app_config::settings::Config;
 use base_ui::{
     button::Button,
     icon::{Icon, IconKind},
@@ -56,16 +59,12 @@ use gpui_kit::{
     div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
-use market_participants_connector::venue::definition::supported_venues;
 
 use crate::{
-    access::FieldValue,
-    catalog::{
-        Catalog, FieldAccess, FieldDef, PageDef, TreeNodeDef, VenueView, catalog, default_page,
-    },
     editor::ProxyEditor,
-    page,
-    search::{FieldSearch, PageSearch, SearchFilter, SearchNode},
+    layout::{self, PageArgs},
+    pages::registry::{self, PageId},
+    search::SearchFilter,
     session::{SettingsChange, SettingsSession},
     table::{ProxyRequest, ProxyTable},
     translation::TranslationPage,
@@ -82,20 +81,21 @@ const SEARCH_WIDTH: Pixels = px(240.0);
 const SEARCH_INPUT_ID: &str = "settings-search";
 
 /// One text field of one page, remembered for as long as the page is open.
-struct FieldInput {
-    /// The field this is the input of, which is what says how to read it and how to write it
-    /// back: what the field commits has no page to look the field up on.
-    field: FieldDef,
+struct TextInput {
+    /// The setting this is the input of, which is what keeps the control's state across frames.
+    id: SharedString,
     /// The value this input was last aligned with the settings on, which is what a rebuild
     /// compares against: a value the field holds that is neither this nor the stored one is a
     /// value the user typed and the settings have not taken.
-    built_from: FieldValue,
+    built_from: SharedString,
     /// The placeholder the field carries, which is text of the language it was built in and is
     /// written again when that moved on.
     placeholder: Option<SharedString>,
+    /// How the page writes what is typed into this field.
+    write: Rc<dyn Fn(&mut Config, &str)>,
     entity: Entity<InputState>,
-    /// Held because the subscription is what commits the field: dropping it would leave a
-    /// field that is typed into and never written.
+    /// Held because the subscription is what commits the field: dropping it would leave a field
+    /// that is typed into and never written.
     _events: Subscription,
 }
 
@@ -110,17 +110,12 @@ pub struct SettingsPage {
     /// reaches the page through.
     _session: Subscription,
     current_page: SharedString,
-    /// The catalog this session draws: the pages of the venues this build speaks.
-    ///
-    /// The pages are a function of the venue list alone, so a session draws one catalog for as
-    /// long as it is open: nothing a user changes moves which fields a venue's page holds.
-    catalog: Catalog,
     query: SharedString,
     filter: SearchFilter,
     /// The language the text this page holds was built in.
     ///
-    /// A page is drawn from the catalog afresh on every frame, so what it shows is the text of
-    /// the frame's language. What is held across frames is not, so this is what the sidebar, the
+    /// A page is drawn natively afresh on every frame, so what it shows is the text of the
+    /// frame's language. What is held across frames is not, so this is what the sidebar, the
     /// filter and the placeholder of a field are compared against.
     language: LanguageCode,
     /// The query the sidebar was last built for, so it is rebuilt when the answer changed rather
@@ -135,7 +130,7 @@ pub struct SettingsPage {
     /// The search field, which is built the first time the page is drawn: a text field is filled
     /// in by a window, and the page is built before there is one to draw it in.
     search_input: Option<Entity<InputState>>,
-    inputs: Vec<FieldInput>,
+    inputs: Vec<TextInput>,
     page_scroll: ScrollHandle,
     proxies: Entity<ProxyTable>,
     translation: Entity<TranslationPage>,
@@ -147,38 +142,16 @@ pub struct SettingsPage {
 impl SettingsPage {
     /// The settings page, opened over the settings that are stored now.
     ///
-    /// The catalog is the venues this build speaks and the fields each of their APIs has: a venue
-    /// this build speaks has its line and its page whether or not it is loaded, and every value
-    /// on that page is read from and written to the venue's own settings row.
+    /// Every page is drawn from the settings of the frame it is drawn in: nothing is copied when
+    /// the page opens, and every value on a page is read from and written to the settings
+    /// themselves.
     ///
     /// What needs a window — the search field and the fields of the page that is drawn — is
     /// built on the first frame rather than here, because the page is built before the window
     /// it is about to be shown in has drawn it.
     pub fn load(cx: &mut Context<Self>) -> Self {
         let session = cx.new(|_| SettingsSession::new());
-        let venues: VenueView = supported_venues().into();
-
-        Self::build(session, catalog(&venues), cx)
-    }
-
-    /// Builds the page over the catalog it draws.
-    ///
-    /// This is the test seam beside [`Self::load`]: a fixture builds the catalog whose groups it
-    /// needs declared and hands it here, so a test draws a catalog the production one is a case
-    /// of without the production catalog having to offer it.
-    #[cfg(test)]
-    pub(crate) fn new_with_catalog(
-        session: Entity<SettingsSession>,
-        catalog: Catalog,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::build(session, catalog, cx)
-    }
-
-    /// The whole of the settings, over the catalog they draw and the session they are written
-    /// through.
-    fn build(session: Entity<SettingsSession>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
-        let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
+        let filter = SearchFilter::new("", &registry::search_nodes(cx));
         let proxies = cx.new(|cx| ProxyTable::new(session.clone(), cx));
         let downloads = crate::translation_downloads::entity(cx);
         let translation = cx.new(|cx| TranslationPage::new(session.clone(), downloads, cx));
@@ -189,8 +162,7 @@ impl SettingsPage {
         Self {
             session,
             _session: session_changes,
-            current_page: SharedString::new_static(default_page()),
-            catalog,
+            current_page: SharedString::new_static(registry::DEFAULT_PAGE),
             query: SharedString::default(),
             filter,
             language: *cx.global::<LanguageCode>(),
@@ -253,7 +225,7 @@ impl SettingsPage {
         self.language = language;
         // The filter answers over the rendered text of every label, so the words it holds are
         // of the language it was answered in.
-        self.filter = SearchFilter::new(&self.query, &search_nodes(&self.catalog, cx));
+        self.filter = SearchFilter::new(&self.query, &registry::search_nodes(cx));
         self.rebuild_sidebar(cx);
         // A query answered in one language does not have to answer the same way in another: the
         // page that is drawn may be one the new language no longer reaches, and what is drawn
@@ -263,9 +235,10 @@ impl SettingsPage {
         // by a page that moves, not by the language itself.
         let reachable = self
             .page()
-            .is_some_and(|page| page_is_reachable(page, &self.filter));
-        if !reachable && let Some(page) = first_admitted_page(&self.catalog, &self.filter) {
-            self.move_to(page.as_str(), cx);
+            .is_some_and(|page| registry::page_is_reachable(page, &self.filter, cx));
+        if !reachable && let Some(page) = registry::first_admitted_page(&self.filter, cx) {
+            let id = page.id();
+            self.move_to(id.as_ref(), cx);
         }
         if let Some(input) = self.search_input.as_ref() {
             let placeholder = t!(cx, "settings_ui.search.placeholder");
@@ -285,34 +258,23 @@ impl SettingsPage {
     /// second a field whose own write has already been stored, and both are what the user is
     /// looking at. Anything else is a field whose value moved under it, and that one is built
     /// again around the value the settings hold.
-    pub(crate) fn input_for(
+    pub(crate) fn text_input(
         &mut self,
-        field: FieldDef,
-        stored: &FieldValue,
+        id: SharedString,
+        stored: SharedString,
+        placeholder: Option<SharedString>,
+        password: bool,
+        write: Rc<dyn Fn(&mut Config, &str)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
-        let (password, declared) = match &field.access {
-            FieldAccess::Text {
-                password,
-                placeholder,
-                ..
-            } => (*password, placeholder.clone()),
-            _ => (false, None),
-        };
-        let placeholder = declared.map(|placeholder| placeholder.label(cx));
-
-        if let Some(input) = self
-            .inputs
-            .iter_mut()
-            .find(|input| input.field.id == field.id)
-        {
+        if let Some(input) = self.inputs.iter_mut().find(|input| input.id == id) {
             let current = input.entity.read(cx).value(cx);
-            if &input.built_from == stored || current.as_str() == stored.as_str() {
+            if input.built_from == stored || current == stored {
                 // A write of this field has been stored since the input was built, so the value
                 // it was built from is one frame behind what the field now holds: the input is
                 // what the settings moved to, and it is taken as aligned rather than rebuilt.
-                input.built_from = stored.clone();
+                input.built_from = stored;
                 // What a field that is used again holds is left alone, because the user may be
                 // typing into it. Its placeholder is text of the language it was built in, so
                 // that is written again rather than left in the language the interface has left.
@@ -331,10 +293,9 @@ impl SettingsPage {
         // A field whose stored value changed elsewhere is rebuilt around that value: what the
         // field had is what the user was looking at, and what they are configuring is the
         // settings.
-        self.inputs.retain(|input| input.field.id != field.id);
+        self.inputs.retain(|input| input.id != id);
         let entity = cx.new(|cx| {
-            let mut builder =
-                InputStateBuilder::new(field.id.clone()).default_value(stored.as_str());
+            let mut builder = InputStateBuilder::new(id.clone()).default_value(stored.as_str());
             if password {
                 builder = builder.password();
             }
@@ -344,7 +305,7 @@ impl SettingsPage {
 
             builder.build(window, cx)
         });
-        let access = field.access.clone();
+        let write_for_event = write.clone();
         let subscription =
             cx.subscribe(&entity, move |settings, _, event: &InputStateEvent, cx| {
                 // A field is written when the user is done with it rather than on every
@@ -352,16 +313,23 @@ impl SettingsPage {
                 // without leaving the field.
                 match event {
                     InputStateEvent::Blur(value) | InputStateEvent::PressEnter(value) => {
-                        let value = FieldValue::new(value.as_str());
-                        settings.write_field(access.clone(), value, cx);
+                        let value = value.clone();
+                        let write = write_for_event.clone();
+                        settings.apply(
+                            SettingsChange::edit(move |config| {
+                                write(config, value.as_str());
+                            }),
+                            cx,
+                        );
                     }
                     InputStateEvent::Change(_) => {}
                 }
             });
-        self.inputs.push(FieldInput {
-            field,
-            built_from: stored.clone(),
+        self.inputs.push(TextInput {
+            id,
+            built_from: stored,
             placeholder,
+            write,
             entity: entity.clone(),
             _events: subscription,
         });
@@ -369,25 +337,8 @@ impl SettingsPage {
         entity
     }
 
-    /// Writes one value into the settings this page draws.
-    ///
-    /// A value the settings already hold is not written: a field that is submitted without being
-    /// changed is not a change, and storing it would be a write and a set of events for nothing.
-    pub(crate) fn write_field(
-        &mut self,
-        access: FieldAccess,
-        value: FieldValue,
-        cx: &mut Context<Self>,
-    ) {
-        let unchanged = {
-            let config = self.session.read(cx).config(cx);
-            access.current(config.as_ref()) == value
-        };
-        if unchanged {
-            return;
-        }
-
-        let change = SettingsChange::Field { access, value };
+    /// Writes one change into the settings this page draws.
+    pub(crate) fn apply(&mut self, change: SettingsChange, cx: &mut Context<Self>) {
         self.session.update(cx, |session, cx| {
             let _ = session.write(change, cx);
         });
@@ -409,13 +360,17 @@ impl SettingsPage {
             .iter()
             .filter_map(|input| {
                 let value = input.entity.read(cx).value(cx);
-                (value.as_str() != input.built_from.as_str())
-                    .then(|| (input.field.access.clone(), FieldValue::new(value.as_str())))
+                (value != input.built_from).then(|| (input.write.clone(), value))
             })
             .collect::<Vec<_>>();
 
-        for (access, value) in pending {
-            self.write_field(access, value, cx);
+        for (write, value) in pending {
+            self.apply(
+                SettingsChange::edit(move |config| {
+                    write(config, value.as_str());
+                }),
+                cx,
+            );
         }
     }
 
@@ -452,8 +407,8 @@ impl SettingsPage {
     /// on, because the field it was in is not drawn any more and a keystroke would reach something
     /// the user cannot see. The page moves even when that write failed, because the input is kept
     /// by this page and the field is still there to be submitted again when the user comes back.
-    fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current_page == id {
+    pub(crate) fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page.as_ref() == id {
             return;
         }
 
@@ -473,14 +428,14 @@ impl SettingsPage {
     /// The translation page repairs its settings when it is opened, and being moved to is what
     /// opens it: see [`crate::translation::TranslationPage::repair_on_open`].
     fn move_to(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.current_page == id {
+        if self.current_page.as_ref() == id {
             return;
         }
 
         self.current_page = SharedString::from(id);
         self.page_scroll = ScrollHandle::new();
         self.reveal_current_page();
-        if self.current_page.as_ref() == "ai.translation" {
+        if registry::page(id).is_some_and(PageId::is_translation) {
             self.translation
                 .update(cx, |page, cx| page.repair_on_open(cx));
         }
@@ -491,19 +446,19 @@ impl SettingsPage {
     ///
     /// The sidebar is rebuilt from the answer while the page is drawn, so nothing is built
     /// here but the answer itself; the page follows the answer, because a page with neither a
-    /// matching label nor a matching field is a page that is no longer drawn.
-    fn set_query(&mut self, query: SharedString, cx: &mut Context<Self>) {
+    /// matching label nor a matching setting is a page that is no longer drawn.
+    pub(crate) fn set_query(&mut self, query: SharedString, cx: &mut Context<Self>) {
         if self.query == query {
             return;
         }
 
         self.query = query;
-        self.filter = SearchFilter::new(&self.query, &search_nodes(&self.catalog, cx));
+        self.filter = SearchFilter::new(&self.query, &registry::search_nodes(cx));
         let reachable = self
             .page()
-            .is_some_and(|page| page_is_reachable(page, &self.filter));
+            .is_some_and(|page| registry::page_is_reachable(page, &self.filter, cx));
         let next = (!reachable)
-            .then(|| first_admitted_page(&self.catalog, &self.filter))
+            .then(|| registry::first_admitted_page(&self.filter, cx))
             .flatten();
         if let Some(page) = next {
             // The page moves the way a selection moves rather than on its own: the page drawn
@@ -511,14 +466,15 @@ impl SettingsPage {
             // a page the sidebar has no row for. A search is not a page being left, though: what
             // a text field still holds is written when the page is selected or left, not when
             // the query that narrows the sidebar changed.
-            self.move_to(page.as_str(), cx);
+            let id = page.id();
+            self.move_to(id.as_ref(), cx);
         }
         cx.notify();
     }
 
     /// The page currently drawn.
-    fn page(&self) -> Option<&PageDef> {
-        self.catalog.page(self.current_page.as_str())
+    fn page(&self) -> Option<PageId> {
+        registry::page(self.current_page.as_str())
     }
 
     /// Gives the sidebar the rows the current answer admits.
@@ -536,13 +492,7 @@ impl SettingsPage {
 
     /// Builds the rows the filter admits, labelled in the language the page is holding.
     fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar = sidebar_entries(
-            &self.catalog,
-            &self.filter,
-            self.catalog.tree.as_slice(),
-            true,
-            cx,
-        );
+        self.sidebar = sidebar_entries(&self.filter, cx);
         self.sidebar_query = Some(self.query.clone());
         self.reveal_current_page();
     }
@@ -612,12 +562,11 @@ impl SettingsPage {
 
     /// The header: what the page is, and the field the settings are searched with.
     ///
-    /// It is the gallery's header: the title and its subtitle on the left, and the search field
-    /// at the end of the row. The field is the one the sidebar is filtered by; drawing it here
-    /// rather than above the sidebar is what makes the two pages open the same way.
+    /// It is the gallery's header: the title on the left, and the search field at the end of the
+    /// row. The field is the one the sidebar is filtered by; drawing it here rather than above
+    /// the sidebar is what makes the two pages open the same way.
     fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let input = self.search_input(window, cx);
-        let theme = cx.theme();
 
         div()
             .debug_selector(|| "SETTINGS_HEADER".into())
@@ -633,25 +582,13 @@ impl SettingsPage {
             .pt_5()
             .pb_3()
             .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .debug_selector(|| "SETTINGS_TITLE".into())
-                            .text_2xl()
-                            .font_weight(FontWeight::BOLD)
-                            .child(t!(cx, "settings_ui.title")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.roles.fg.muted.hsla)
-                            .child(t!(cx, "settings_ui.subtitle")),
-                    ),
+                div().min_w_0().flex_1().child(
+                    div()
+                        .debug_selector(|| "SETTINGS_TITLE".into())
+                        .text_2xl()
+                        .font_weight(FontWeight::BOLD)
+                        .child(t!(cx, "settings_ui.title")),
+                ),
             )
             .child(
                 div()
@@ -743,6 +680,57 @@ impl SettingsPage {
             .child(Scrollbar::vertical(self.sidebar_scroll.clone()))
             .into_any_element()
     }
+
+    /// The page the settings are on, for the tests that assert where routing left it.
+    #[cfg(test)]
+    pub(crate) fn current_page_for_test(&self) -> &SharedString {
+        &self.current_page
+    }
+
+    /// The query the page is answering, for the tests of the search.
+    #[cfg(test)]
+    pub(crate) fn query_for_test(&self) -> &SharedString {
+        &self.query
+    }
+
+    /// What the query admits, for the tests of the search's answer.
+    #[cfg(test)]
+    pub(crate) fn filter_for_test(&self) -> &SearchFilter {
+        &self.filter
+    }
+
+    /// The rows the sidebar is drawing, for the tests of its labels.
+    #[cfg(test)]
+    pub(crate) fn sidebar_for_test(&self) -> &[SidebarEntry] {
+        &self.sidebar
+    }
+
+    /// The proxy catalog's table, for the tests that read its rows.
+    #[cfg(test)]
+    pub(crate) fn proxies_for_test(&self) -> &Entity<ProxyTable> {
+        &self.proxies
+    }
+
+    /// The session the page writes through, for the tests that read what it stored.
+    #[cfg(test)]
+    pub(crate) fn session_for_test(&self) -> &Entity<SettingsSession> {
+        &self.session
+    }
+
+    /// The translation page this page routes to, for the tests that read its directory.
+    #[cfg(test)]
+    pub(crate) fn translation_for_test(&self) -> &Entity<TranslationPage> {
+        &self.translation
+    }
+
+    /// One text field of the page, for the tests that read what it holds.
+    #[cfg(test)]
+    pub(crate) fn input_for_test(&self, id: &str) -> Option<Entity<InputState>> {
+        self.inputs
+            .iter()
+            .find(|input| input.id.as_ref() == id)
+            .map(|input| input.entity.clone())
+    }
 }
 
 impl Render for SettingsPage {
@@ -755,43 +743,40 @@ impl Render for SettingsPage {
         let canvas = cx.theme().roles.surface.canvas.hsla;
         let handle = cx.entity();
         let header = self.header(window, cx);
-        // A page with neither its own label nor one of its fields admitted by the query is a
+        // A page with neither its own label nor one of its settings admitted by the query is a
         // page the search took away: what is left is the message, in this column as in the
         // sidebar.
         let selected = self
             .page()
-            .filter(|page| page_is_reachable(page, &self.filter))
-            .cloned();
+            .filter(|page| registry::page_is_reachable(*page, &self.filter, cx));
         let page = match selected {
-            // These two pages carry no fields of the catalog: each is drawn by the view that
-            // owns it, and both read the settings through the session rather than a copy of
-            // them.
-            Some(page_def) if page_def.id.as_ref() == "ai.translation" => div()
+            Some(PageId::Translation) => div()
                 .size_full()
                 .min_w_0()
                 .min_h_0()
                 .child(self.translation.clone())
                 .into_any_element(),
-            Some(page_def) if page_def.id.as_ref() == "proxy-management" => div()
+            Some(PageId::ServerManagement) => div()
                 .size_full()
                 .min_w_0()
                 .min_h_0()
                 .child(self.proxies.clone())
                 .into_any_element(),
-            Some(page_def) => {
-                let config = self.session.read(cx).config(cx);
-                let filter = self.filter.clone();
-                page::page_body(
-                    &page_def,
-                    config.as_ref(),
-                    &filter,
-                    self.page_scroll.clone(),
-                    window,
-                    self,
-                    &handle,
-                    cx,
-                )
-                .unwrap_or_else(|| div().into_any_element())
+            Some(page) => {
+                let content = {
+                    let config = self.session.read(cx).config(cx);
+                    let filter = self.filter.clone();
+                    let mut args = PageArgs {
+                        config: config.as_ref(),
+                        filter: &filter,
+                        window,
+                        settings: self,
+                        handle: &handle,
+                        cx,
+                    };
+                    registry::render_page(page, &mut args)
+                };
+                layout::scroll(content, self.page_scroll.clone())
             }
             None => div()
                 .debug_selector(|| "SETTINGS_PAGE_NO_MATCHES".into())
@@ -893,121 +878,6 @@ fn no_matches(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The catalog the search is answered over.
-///
-/// One node per entry, with the text the entry is found by: what it renders as now, plus the
-/// words the catalog declares beside it — which is what makes a setting reachable in either
-/// language and by the name it is stored under.
-fn search_nodes(catalog: &Catalog, cx: &App) -> Vec<SearchNode> {
-    catalog
-        .tree
-        .iter()
-        .map(|node| match node {
-            TreeNodeDef::Page(id) => SearchNode {
-                id: id.clone(),
-                page: catalog.page(id).map(|page| page_search(page, cx)),
-                keywords: Vec::new(),
-                children: Vec::new(),
-            },
-            TreeNodeDef::Group {
-                id,
-                label,
-                keywords,
-                children,
-                ..
-            } => {
-                let mut group_keywords = vec![label.label(cx).to_string()];
-                group_keywords.extend(keywords.iter().map(|keyword| (*keyword).to_owned()));
-
-                SearchNode {
-                    id: SharedString::new_static(id),
-                    page: None,
-                    keywords: group_keywords,
-                    children: children
-                        .iter()
-                        .map(|child| SearchNode {
-                            id: SharedString::from(child.id()),
-                            page: catalog.page(child.id()).map(|page| page_search(page, cx)),
-                            keywords: Vec::new(),
-                            children: Vec::new(),
-                        })
-                        .collect(),
-                }
-            }
-        })
-        .collect()
-}
-
-fn page_search(page: &PageDef, cx: &App) -> PageSearch {
-    let mut label = page.title.search_words(cx);
-    for keyword in page.keywords {
-        label.push_str(&keyword.to_lowercase());
-        label.push(' ');
-    }
-
-    PageSearch {
-        label,
-        fields: page
-            .sections
-            .iter()
-            .flat_map(|section| section.fields.iter())
-            .map(|field| {
-                let mut text = field.label.search_words(&field.label.label(cx));
-                text.push_str(&field.description.search_words(&field.description.label(cx)));
-                for keyword in field.keywords {
-                    text.push_str(&keyword.to_lowercase());
-                    text.push(' ');
-                }
-
-                FieldSearch {
-                    id: field.id.clone(),
-                    text,
-                }
-            })
-            .collect(),
-    }
-}
-
-/// Whether the query leaves one page reachable.
-///
-/// A page is reachable by its own label, exactly the way the search has always answered a query,
-/// or through any field it holds: a query that names a setting on a page is a query that can
-/// open that page, even when the page's own name says nothing about what was searched for. A
-/// page reached the second way is listed in the sidebar, and [`SearchFilter::admits_field`] draws
-/// only the fields that matched on it.
-fn page_is_reachable(page: &PageDef, filter: &SearchFilter) -> bool {
-    filter.admits_page(&page.id)
-        || page
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .any(|field| filter.admits_field(&page.id, &field.id))
-}
-
-/// The first page a filter leaves reachable, in the order the sidebar draws them.
-fn first_admitted_page(catalog: &Catalog, filter: &SearchFilter) -> Option<SharedString> {
-    catalog
-        .tree
-        .iter()
-        .find_map(|node| first_admitted_in(catalog, node, filter))
-}
-
-fn first_admitted_in(
-    catalog: &Catalog,
-    node: &TreeNodeDef,
-    filter: &SearchFilter,
-) -> Option<SharedString> {
-    match node {
-        TreeNodeDef::Page(id) => catalog
-            .page(id)
-            .filter(|page| page_is_reachable(page, filter))
-            .map(|_| id.clone()),
-        TreeNodeDef::Group { children, .. } => children
-            .iter()
-            .find_map(|child| first_admitted_in(catalog, child, filter)),
-    }
-}
-
 /// One row of the settings sidebar.
 pub(crate) enum SidebarEntry {
     /// A group's name over the pages that follow it: text, because a group is not something a
@@ -1020,14 +890,14 @@ pub(crate) enum SidebarEntry {
     },
     /// A divider between one part of the sidebar and the next.
     ///
-    /// A page at the top of the catalog is a part of its own rather than another page of the
+    /// A page at the top of the sidebar is a part of its own rather than another page of the
     /// group above it, and the divider is what says so.
     Separator,
 }
 
 impl SidebarEntry {
     /// The page this row opens, or `None` for anything else.
-    fn page_id(&self) -> Option<&SharedString> {
+    pub(crate) fn page_id(&self) -> Option<&SharedString> {
         match self {
             Self::Heading(_) | Self::Separator => None,
             Self::Page { id, .. } => Some(id),
@@ -1037,51 +907,46 @@ impl SidebarEntry {
 
 /// The sidebar as it is drawn, holding only what the filter leaves reachable.
 ///
-/// A page is reached by its label or by a field on it — see [`page_is_reachable`] — and a group
-/// with none of its pages left is not drawn at all, which is what keeps an unmatched part of the
-/// settings out of the way instead of dimming it.
-///
-/// `top_level` is what tells the catalog's own pages from the pages of a group: only the former
-/// are their own part of the sidebar, so only they are divided from what precedes them.
-fn sidebar_entries(
-    catalog: &Catalog,
-    filter: &SearchFilter,
-    nodes: &[TreeNodeDef],
-    top_level: bool,
-    cx: &App,
-) -> Vec<SidebarEntry> {
-    let mut entries = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        match node {
-            TreeNodeDef::Page(id) => {
-                if catalog
-                    .page(id)
-                    .is_some_and(|page| page_is_reachable(page, filter))
-                {
-                    if top_level && !entries.is_empty() {
-                        entries.push(SidebarEntry::Separator);
-                    }
-                    entries.push(SidebarEntry::Page {
-                        id: id.clone(),
-                        label: catalog.page_label(id.as_str()).label(cx),
-                    });
-                }
-            }
-            TreeNodeDef::Group {
-                label, children, ..
-            } => {
-                let pages = sidebar_entries(catalog, filter, children, false, cx);
-                if pages.is_empty() {
-                    continue;
-                }
+/// A page is reached by its label or by a setting on it — see [`registry::page_is_reachable`] —
+/// and a group with none of its pages left is not drawn at all, which is what keeps an unmatched
+/// part of the settings out of the way instead of dimming it.
+fn sidebar_entries(filter: &SearchFilter, cx: &App) -> Vec<SidebarEntry> {
+    let mut entries = Vec::new();
 
-                entries.push(SidebarEntry::Heading(label.label(cx)));
-                entries.extend(pages);
-            }
+    for group in registry::groups() {
+        let pages = group
+            .pages
+            .into_iter()
+            .filter(|page| registry::page_is_reachable(*page, filter, cx))
+            .collect::<Vec<_>>();
+        if pages.is_empty() {
+            continue;
+        }
+
+        entries.push(SidebarEntry::Heading(t!(cx, group.label_key)));
+        for page in pages {
+            entries.push(SidebarEntry::Page {
+                id: page.id(),
+                label: page.title(cx),
+            });
         }
     }
+
+    let roots = registry::root_pages()
+        .into_iter()
+        .filter(|page| registry::page_is_reachable(*page, filter, cx))
+        .collect::<Vec<_>>();
+    if !roots.is_empty() {
+        if !entries.is_empty() {
+            entries.push(SidebarEntry::Separator);
+        }
+        for page in roots {
+            entries.push(SidebarEntry::Page {
+                id: page.id(),
+                label: page.title(cx),
+            });
+        }
+    }
+
     entries
 }
-
-#[cfg(test)]
-mod tests;

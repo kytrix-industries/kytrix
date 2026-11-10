@@ -4,9 +4,8 @@ use app_config::{
     settings::Language,
     translation::{DownloadSite, TranslationModel},
 };
-use app_config_provider::manager::ConfigManager;
 use download_provider::error::DownloadFailure;
-use gpui_kit::{BorrowAppContext as _, SharedString, TestAppContext, px, size};
+use gpui_kit::{Modifiers, SharedString, TestAppContext, px, size};
 
 use super::test_support::*;
 use crate::translation_downloads::{DeleteFailure, DownloadState};
@@ -20,12 +19,12 @@ fn the_translation_page_should_draw_its_models_and_directory_row(cx: &mut TestAp
 
     for selector in [
         "SETTINGS_AI_PAGE",
+        "SETTINGS_CARD_ai.translation",
         "SETTINGS_AI_DIRECTORY",
-        "SETTINGS_AI_DIRECTORY_INPUT",
+        "SETTINGS_AI_DIRECTORY_LABEL",
         "SETTINGS_AI_BROWSE",
         "SETTINGS_AI_DOWNLOAD_SITE",
-        "SETTINGS_AI_SITE_HUGGINGFACE",
-        "SETTINGS_AI_SITE_MODELSCOPE",
+        "SETTINGS_AI_SITE_SELECT",
         "SETTINGS_AI_MODEL_SELECT_SECTION",
         "SETTINGS_AI_MODEL_SELECT",
         "SETTINGS_AI_MODELS",
@@ -151,7 +150,7 @@ fn the_translation_table_should_be_drawn_at_the_minimum_window_size(cx: &mut Tes
     );
 }
 
-/// The system folder picker is what writes the directory field, and the directory it writes
+/// The system folder picker is what changes the directory label, and the directory it chooses
 /// is stored at once.
 #[gpui_kit::test]
 fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContext) {
@@ -175,10 +174,10 @@ fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContex
     let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
     assert_eq!(
         cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
+            panel.translation_for_test().read(cx).shown_directory(cx)
         })),
         Some(expected),
-        "the field should show the chosen directory"
+        "the label should show the chosen directory"
     );
     assert_eq!(
         stored(cx).translation.model_directory,
@@ -187,7 +186,7 @@ fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContex
     );
 }
 
-/// A page that opens over a stored directory shows it in the field.
+/// A page that opens over a stored directory shows it in the label.
 #[gpui_kit::test]
 fn a_stored_translation_directory_should_be_shown(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().expect("the test directory should build");
@@ -199,29 +198,237 @@ fn a_stored_translation_directory_should_be_shown(cx: &mut TestAppContext) {
     let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
     assert_eq!(
         cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
+            panel.translation_for_test().read(cx).shown_directory(cx)
         })),
         Some(expected)
     );
 }
 
-/// The directory field is read-only: typing into it leaves the value the browse button chose.
+/// A fresh installation opens on the models directory beside the settings file, and the
+/// directory has no field to type into: the folder picker is the only way it changes.
 #[gpui_kit::test]
-fn the_translation_directory_should_not_be_editable(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (panel, cx) = settings(config, cx);
+fn a_fresh_installation_should_open_on_the_default_directory(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
     click(cx, "SETTINGS_ENTRY_ai.translation");
 
-    let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-    type_into(cx, "SETTINGS_AI_DIRECTORY_INPUT", "E:\\typed");
+    let expected = app_config::paths::default_model_directory()
+        .map(|path| SharedString::from(path.to_string_lossy().into_owned()));
+    assert_eq!(
+        cx.read(|cx| panel.read_with(cx, |panel, cx| {
+            panel.translation_for_test().read(cx).shown_directory(cx)
+        })),
+        expected,
+        "the label should show the models directory beside the settings file"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_AI_DIRECTORY_INPUT").is_none(),
+        "the directory is a label rather than a field"
+    );
+}
+
+/// A short path sizes the label to its own text and keeps it left aligned, with the browse
+/// button at the end of the control column.
+#[gpui_kit::test]
+fn a_short_directory_label_should_take_only_the_width_of_its_text(cx: &mut TestAppContext) {
+    let mut config = configured_settings();
+    config.translation.model_directory = Some(std::path::PathBuf::from("E:"));
+    let (_, cx) = settings(config, cx);
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+
+    let control = cx
+        .debug_bounds("SETTINGS_CONTROL_ai.directory")
+        .expect("the directory row should draw its control column");
+    let label = cx
+        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
+        .expect("the directory label should be drawn");
+    let browse = cx
+        .debug_bounds("SETTINGS_AI_BROWSE")
+        .expect("the browse button should be drawn");
+
+    assert!(
+        (label.left() - control.left()).abs() < px(1.0),
+        "the label should start where the control column starts: {label:?} in {control:?}"
+    );
+    assert!(
+        (browse.right() - control.right()).abs() < px(1.0),
+        "the button should end where the control column ends: {browse:?} in {control:?}"
+    );
+    assert!(
+        label.size.width < control.size.width - browse.size.width,
+        "a short path should not stretch the label: {label:?} beside {browse:?}"
+    );
+    assert!(
+        label.right() < browse.left(),
+        "the label should stop where its text stops: {label:?} beside {browse:?}"
+    );
+    assert!(
+        label.size.height < px(25.0),
+        "the label should stay on one line: {label:?}"
+    );
+}
+
+/// The tooltip belongs to the text rather than to the space the label column leaves: a short
+/// path opens it under the text, not in the middle of the empty column.
+#[gpui_kit::test]
+fn a_short_directory_label_should_show_its_tooltip_under_its_text(cx: &mut TestAppContext) {
+    let mut config = configured_settings();
+    config.translation.model_directory = Some(std::path::PathBuf::from("E:"));
+    let (_, cx) = settings(config, cx);
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+
+    let label = cx
+        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
+        .expect("the directory label should be drawn");
+    cx.simulate_mouse_move(label.center(), None, Modifiers::none());
+    cx.run_until_parked();
+    for _ in 0..10 {
+        settle(cx);
+    }
+    let tooltip = cx
+        .debug_bounds("BASE_UI_TOOLTIP")
+        .expect("hovering the label should show the whole path");
+    assert!(
+        (tooltip.center().x - label.center().x).abs() < px(8.0),
+        "the tooltip should sit under the text: {tooltip:?} for label {label:?}"
+    );
+}
+
+/// A directory too long for the column is cut rather than wrapped, and hovering the label shows
+/// the whole path.
+#[gpui_kit::test]
+fn a_long_directory_should_be_cut_with_its_path_on_hover(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().expect("the test directory should build");
+    let directory = root.path().join(
+        "a-very-long-model-directory-name-that-cannot-fit-inside-the-directory-row-of-the-page",
+    );
+    std::fs::create_dir_all(&directory).expect("the long directory should build");
+    let mut config = configured_settings();
+    config.translation.model_directory = Some(directory);
+    let (_, cx) = settings(config, cx);
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+
+    let control = cx
+        .debug_bounds("SETTINGS_CONTROL_ai.directory")
+        .expect("the directory row should draw its control column");
+    let label = cx
+        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
+        .expect("the directory label should be drawn");
+    assert!(
+        label.size.width < control.size.width,
+        "the long path should be cut to the width the button leaves: {label:?}"
+    );
+    assert!(
+        label.right() <= control.right(),
+        "the long path should be cut before the column ends: {label:?} in {control:?}"
+    );
+    assert!(
+        label.size.height < px(25.0),
+        "the long path should be cut rather than wrapped: {label:?}"
+    );
+
+    cx.simulate_mouse_move(label.center(), None, Modifiers::none());
+    cx.run_until_parked();
+    for _ in 0..10 {
+        settle(cx);
+    }
+    assert!(
+        cx.debug_bounds("BASE_UI_TOOLTIP").is_some(),
+        "hovering the label should show the whole path"
+    );
+}
+
+/// Switching to a directory that holds models selects the first their names sort to: the
+/// selection the page had names a file the new directory does not hold.
+#[gpui_kit::test]
+fn browsing_should_select_the_first_model_the_new_directory_holds(cx: &mut TestAppContext) {
+    let (_, cx) = settings(configured_settings(), cx);
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+    let downloads = translation_downloads(cx);
+    let directory = tempfile::tempdir().expect("the test directory should build");
+    let path = directory.path().to_path_buf();
+
+    downloads.update(cx, |downloads, cx| {
+        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone(), cx);
+        downloads.force_downloaded_for_test(TranslationModel::HyMt218B2Bit, path.clone(), cx);
+        downloads.force_downloaded_for_test(TranslationModel::HyMt218B125Bit, path.clone(), cx);
+    });
+
+    click(cx, "SETTINGS_AI_BROWSE");
+    cx.simulate_path_prompt_response(|_| Some(vec![path]));
+    settle(cx);
 
     assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |dialog, cx| {
-            dialog.translation.read(cx).shown_directory(cx)
-        })),
-        Some(expected)
+        stored(cx).translation.selected_model,
+        Some(TranslationModel::HyMt218B125Bit),
+        "HY-MT2-1.8B-1.25Bit sorts first among the models the new directory holds"
+    );
+}
+
+/// A selection the new directory also holds is kept: switching directory does not re-pick a
+/// model the settings already name.
+#[gpui_kit::test]
+fn browsing_should_keep_a_selection_the_new_directory_holds(cx: &mut TestAppContext) {
+    let stored_directory = tempfile::tempdir().expect("the stored directory should build");
+    let chosen_directory = tempfile::tempdir().expect("the chosen directory should build");
+    let stored_path = stored_directory.path().to_path_buf();
+    let chosen_path = chosen_directory.path().to_path_buf();
+    let mut config = configured_settings();
+    config.translation.model_directory = Some(stored_path.clone());
+    config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
+    let (_, cx) = settings(config, cx);
+    let downloads = translation_downloads(cx);
+    downloads.update(cx, |downloads, cx| {
+        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, stored_path, cx);
+        downloads.force_downloaded_for_test(
+            TranslationModel::HyMt218BQ4Km,
+            chosen_path.clone(),
+            cx,
+        );
+        downloads.force_downloaded_for_test(
+            TranslationModel::HyMt218B125Bit,
+            chosen_path.clone(),
+            cx,
+        );
+    });
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+
+    click(cx, "SETTINGS_AI_BROWSE");
+    cx.simulate_path_prompt_response(|_| Some(vec![chosen_path]));
+    settle(cx);
+
+    assert_eq!(
+        stored(cx).translation.selected_model,
+        Some(TranslationModel::HyMt218BQ4Km),
+        "the model the settings already name is in the new directory and stays selected"
+    );
+}
+
+/// A directory that holds no model clears the selection rather than leaving one that names a
+/// file the directory does not have.
+#[gpui_kit::test]
+fn browsing_to_an_empty_directory_should_clear_the_selection(cx: &mut TestAppContext) {
+    let stored_directory = tempfile::tempdir().expect("the stored directory should build");
+    let empty_directory = tempfile::tempdir().expect("the empty directory should build");
+    let stored_path = stored_directory.path().to_path_buf();
+    let empty_path = empty_directory.path().to_path_buf();
+    let mut config = configured_settings();
+    config.translation.model_directory = Some(stored_path.clone());
+    config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
+    let (_, cx) = settings(config, cx);
+    let downloads = translation_downloads(cx);
+    downloads.update(cx, |downloads, cx| {
+        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, stored_path, cx);
+    });
+    click(cx, "SETTINGS_ENTRY_ai.translation");
+
+    click(cx, "SETTINGS_AI_BROWSE");
+    cx.simulate_path_prompt_response(|_| Some(vec![empty_path]));
+    settle(cx);
+
+    assert_eq!(
+        stored(cx).translation.selected_model,
+        None,
+        "a directory with no usable model leaves nothing selected"
     );
 }
 
@@ -508,7 +715,8 @@ fn clicking_download_should_start_from_the_site_the_session_holds(cx: &mut TestA
     });
     settle(cx);
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
     assert_eq!(
         stored(cx).translation.download_site,
         DownloadSite::ModelScope,
@@ -604,7 +812,8 @@ fn a_retry_at_the_site_of_the_failed_download_should_continue_it(cx: &mut TestAp
     });
     settle(cx);
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
     click(cx, "SETTINGS_AI_MODEL_RETRY_2");
 
     assert_eq!(
@@ -701,7 +910,8 @@ fn a_paused_download_should_resume_where_it_is(cx: &mut TestAppContext) {
     });
     settle(cx);
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
     click(cx, "SETTINGS_AI_MODEL_RESUME_6");
 
     assert_eq!(
@@ -753,80 +963,7 @@ fn a_paused_download_should_be_stopped_from_its_row(cx: &mut TestAppContext) {
     );
 }
 
-/// Opening the settings page without entering the translation page writes no translation
-/// repair, even when a download left a directory to adopt.
-#[gpui_kit::test]
-fn opening_the_settings_should_not_write_the_translation_repair(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let (panel, cx) = settings(configured_settings(), cx);
-    let downloads = translation_downloads(cx);
-    downloads.update(cx, |downloads, _| {
-        downloads.set_last_download_directory_for_test(directory.path().to_path_buf());
-    });
-    settle(cx);
-
-    assert_ne!(
-        current_page(&panel, cx),
-        "ai.translation",
-        "the settings open on another page"
-    );
-    assert_eq!(
-        stored(cx).translation.model_directory,
-        None,
-        "opening the settings page must not write the translation settings"
-    );
-}
-
-/// Entering the translation page adopts the directory once: the repair is written through the
-/// session, the field shows it, and entering the page again does not write it a second time.
-#[gpui_kit::test]
-fn entering_the_translation_page_should_repair_once(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let (panel, cx) = settings(configured_settings(), cx);
-    let downloads = translation_downloads(cx);
-    downloads.update(cx, |downloads, cx| {
-        downloads.complete_download_for_test(
-            TranslationModel::HyMt27BQ8,
-            directory.path().to_path_buf(),
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    settle(cx);
-
-    let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-    assert_eq!(
-        stored(cx).translation.model_directory,
-        Some(directory.path().to_path_buf()),
-        "entering the page should adopt the directory the download finished in"
-    );
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
-        })),
-        Some(expected),
-        "the read-only field should show the directory the repair stored"
-    );
-
-    click(cx, "SETTINGS_ENTRY_appearance");
-    cx.update(|_, cx| {
-        cx.update_global::<ConfigManager, _>(|manager, cx| {
-            manager.update(|config| config.translation.model_directory = None, cx);
-        });
-    });
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    settle(cx);
-
-    assert_eq!(
-        stored(cx).translation.model_directory,
-        None,
-        "the repair is made the first time the page is entered and never again"
-    );
-}
-
-/// A directory that could not be stored is not shown as if it had been: the field keeps the
+/// A directory that could not be stored is not shown as if it had been: the label keeps the
 /// stored directory, the page reports why, and the choice is stored when it is made again.
 #[gpui_kit::test]
 fn a_failed_directory_write_should_keep_the_stored_directory_and_report(cx: &mut TestAppContext) {
@@ -847,7 +984,7 @@ fn a_failed_directory_write_should_keep_the_stored_directory_and_report(cx: &mut
     let stored_shown = SharedString::from(stored_directory.path().to_string_lossy().into_owned());
     assert_eq!(
         cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
+            panel.translation_for_test().read(cx).shown_directory(cx)
         })),
         Some(stored_shown.clone()),
         "the page should open on the directory the settings hold"
@@ -864,10 +1001,10 @@ fn a_failed_directory_write_should_keep_the_stored_directory_and_report(cx: &mut
     );
     assert_eq!(
         cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
+            panel.translation_for_test().read(cx).shown_directory(cx)
         })),
         Some(stored_shown),
-        "the field should keep showing the directory that is stored"
+        "the label should keep showing the directory that is stored"
     );
     assert!(
         cx.debug_bounds("BASE_UI_ALERT").is_some(),
@@ -889,10 +1026,10 @@ fn a_failed_directory_write_should_keep_the_stored_directory_and_report(cx: &mut
     );
     assert_eq!(
         cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation.read(cx).shown_directory(cx)
+            panel.translation_for_test().read(cx).shown_directory(cx)
         })),
         Some(chosen_shown),
-        "the field should show the directory the retry stored"
+        "the label should show the directory the retry stored"
     );
 }
 
@@ -910,7 +1047,8 @@ fn a_failed_site_write_should_keep_the_stored_site_and_report(cx: &mut TestAppCo
         "settings with nothing stored start on HuggingFace"
     );
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
 
     assert_eq!(
         stored(cx).translation.download_site,
@@ -925,7 +1063,8 @@ fn a_failed_site_write_should_keep_the_stored_site_and_report(cx: &mut TestAppCo
     click(cx, "BASE_UI_ALERT_OK");
     std::fs::remove_file(&blocking).expect("the blocking file should be removable");
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
 
     assert_eq!(
         stored(cx).translation.download_site,

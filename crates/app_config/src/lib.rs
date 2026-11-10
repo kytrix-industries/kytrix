@@ -15,6 +15,7 @@
 pub mod change;
 pub mod market_participants;
 pub mod network;
+pub mod paths;
 pub mod settings;
 pub mod time_zone;
 pub mod translation;

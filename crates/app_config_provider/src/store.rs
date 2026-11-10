@@ -18,21 +18,19 @@ use app_config::{
         KytrixServiceCapability, NamedProxyError, NetworkRouteGeneration,
         NetworkRuntimeGenerations, ProxyRoute, ResolvedProxy, ServiceTarget,
     },
+    paths::settings_directory,
     settings::Config,
 };
 use market_participants_model::identifier::VenueId;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const CONFIG_DIRECTORY_NAME: &str = "kytrix";
 const CONFIG_FILE_NAME: &str = "config.json";
 /// How many `-N` suffixes a backup name tries before giving up.
 const MAX_BACKUP_ATTEMPTS: u32 = 1_000;
 
-fn config_file_path(config_directory: &Path) -> PathBuf {
-    config_directory
-        .join(CONFIG_DIRECTORY_NAME)
-        .join(CONFIG_FILE_NAME)
+fn config_file_path() -> Option<PathBuf> {
+    settings_directory().map(|directory| directory.join(CONFIG_FILE_NAME))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -208,15 +206,15 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Loads settings from `dirs::config_dir()/kytrix/config.json`, replacing an
-    /// unusable file with defaults.
+    /// Loads settings from `kytrix/config.json` under the platform's config directory, replacing
+    /// an unusable file with defaults.
     ///
     /// A missing file starts with [`Config::default`]. A file that cannot be read
     /// or decoded is moved aside, replaced with [`Config::default`], and reported
     /// so the user can be told once a window exists to tell them in. Starting up
     /// is never blocked by a damaged file.
     pub fn load_default() -> (Self, Option<ConfigRecovery>) {
-        let Some(config_directory) = dirs::config_dir() else {
+        let Some(path) = config_file_path() else {
             let error = ConfigLoadError::ConfigDirectoryUnavailable;
             log::error!("failed to load settings config: {error}");
 
@@ -229,7 +227,7 @@ impl ConfigStore {
             );
         };
 
-        Self::load_or_recover(config_file_path(&config_directory))
+        Self::load_or_recover(path)
     }
 
     /// Loads settings from an injected path.
@@ -564,11 +562,7 @@ pub enum ConfigPersistenceError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
+    use std::{fs, path::PathBuf, sync::Arc};
 
     use app_config::{
         market_participants::{
@@ -586,9 +580,8 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        CONFIG_DIRECTORY_NAME, CONFIG_FILE_NAME, ConfigLoadError, ConfigPersistenceError,
-        ConfigStore, all_network_targets, available_backup_path, back_up_damaged_config,
-        config_file_path,
+        CONFIG_FILE_NAME, ConfigLoadError, ConfigPersistenceError, ConfigStore,
+        all_network_targets, available_backup_path, back_up_damaged_config,
     };
     use crate::test_support::test_temp;
 
@@ -698,15 +691,6 @@ mod tests {
             .expect("a service target decodes whether or not it has an override");
 
         assert_eq!(decoded.proxy_applications.len(), 1);
-    }
-
-    #[test]
-    fn config_file_path_should_append_kytrix_config_json() {
-        let base = Path::new("base");
-
-        let path = config_file_path(base);
-
-        assert_eq!(path, base.join("kytrix").join("config.json"));
     }
 
     #[test]
@@ -1112,10 +1096,7 @@ mod tests {
     #[test]
     fn config_should_round_trip_through_json_file() {
         let temporary_directory = test_temp("config");
-        let path = temporary_directory
-            .path()
-            .join(CONFIG_DIRECTORY_NAME)
-            .join(CONFIG_FILE_NAME);
+        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
         let expected = configured_settings();
         let mut store = store_from_path(&path);
 

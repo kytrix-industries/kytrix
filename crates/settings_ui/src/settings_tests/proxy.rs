@@ -3,7 +3,7 @@
 use std::fs;
 
 use app_config::{
-    network::ProxyConfig,
+    network::{KytrixServiceCapability, ProxyConfig, ProxyRoute, ServiceTarget},
     settings::{Config, Language},
 };
 use base_ui::size::UnifiedSize;
@@ -26,7 +26,7 @@ use super::test_support::*;
 #[gpui_kit::test]
 fn a_cancelled_form_should_leave_the_settings_alone(cx: &mut TestAppContext) {
     let (panel, cx) = settings(configured_settings(), cx);
-    write_field(&panel, "appearance", "language", "zh-CN", cx);
+    edit_settings(&panel, |config| config.language = Language::ZhCn, cx);
     select(&panel, "market_participants.okx", cx);
     panel.update(cx, |panel, cx| {
         panel.set_query("market_participants.okx".into(), cx);
@@ -64,7 +64,7 @@ fn a_cancelled_form_should_leave_the_settings_alone(cx: &mut TestAppContext) {
     );
     panel.read_with(cx, |panel, _| {
         assert_eq!(
-            panel.query.as_ref(),
+            panel.query_for_test().as_ref(),
             "market_participants.okx",
             "the settings should still hold the search they were found by"
         );
@@ -384,9 +384,9 @@ fn a_proxy_line_should_be_settable_with_an_empty_catalog(cx: &mut TestAppContext
         "the settings this test opens hold no proxy at all"
     );
 
-    select(&dialog, "proxy-applications", cx);
+    select(&dialog, "configure", cx);
 
-    click(cx, "SETTINGS_CONTROL_proxy-applications.binance");
+    click(cx, "SETTINGS_CONTROL_configure.binance");
 
     assert!(
         cx.debug_bounds("TEST_DROPDOWN_PANEL").is_some(),
@@ -404,6 +404,54 @@ fn a_proxy_line_should_be_settable_with_an_empty_catalog(cx: &mut TestAppContext
     );
 }
 
+/// The document's default line has nothing above it to inherit from, so its row offers the two
+/// built-in lines and the catalog's entries, and writes the one it is given.
+#[gpui_kit::test]
+fn the_default_line_should_be_set_from_its_row(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+    select(&panel, "configure", cx);
+
+    click(cx, "SETTINGS_CONTROL_proxy.default-line");
+    assert!(
+        cx.debug_bounds("TEST_MENU_ITEM_@inherit").is_none(),
+        "the default line cannot follow a default above it"
+    );
+    click(cx, "TEST_MENU_ITEM_@direct");
+
+    assert_eq!(
+        stored(cx).proxy_default,
+        ProxyRoute::Direct,
+        "choosing the direct line stores it as the document's default"
+    );
+}
+
+/// The Kytrix cloud row stands for every Kytrix service, so one choice reaches all of them.
+#[gpui_kit::test]
+fn the_kytrix_cloud_row_should_bind_every_service_it_names(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+    select(&panel, "configure", cx);
+
+    click(cx, "SETTINGS_CONTROL_configure.kytrix.cloud");
+    click(cx, "TEST_MENU_ITEM_@direct");
+
+    let stored = stored(cx);
+    for capability in [
+        KytrixServiceCapability::Account,
+        KytrixServiceCapability::News,
+        KytrixServiceCapability::X,
+        KytrixServiceCapability::PentagonPizzaIndex,
+        KytrixServiceCapability::GlobalShippingChokepoint,
+    ] {
+        assert_eq!(
+            stored
+                .proxy_applications
+                .get(&ServiceTarget::KytrixService { capability }),
+            Some(&ProxyRoute::Direct),
+            "the cloud line should reach {capability:?}"
+        );
+    }
+}
+
 /// The proxy catalog is drawn by the table rather than by the page's own fields, and a
 /// catalog with nothing in it says so once, across the body, rather than in every column
 /// of a row that has no entry behind it.
@@ -411,12 +459,12 @@ fn a_proxy_line_should_be_settable_with_an_empty_catalog(cx: &mut TestAppContext
 fn the_proxy_page_should_be_drawable_with_an_empty_catalog(cx: &mut TestAppContext) {
     let (dialog, cx) = settings(Config::default(), cx);
 
-    select(&dialog, "proxy-management", cx);
+    select(&dialog, "server-management", cx);
 
     dialog.read_with(cx, |dialog, cx| {
-        assert_eq!(dialog.current_page, "proxy-management");
+        assert_eq!(dialog.current_page_for_test(), "server-management");
         assert_eq!(
-            base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies.read(cx)),
+            base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies_for_test().read(cx)),
             0,
             "a catalog with nothing in it has no rows for the table to draw"
         );
@@ -441,7 +489,7 @@ fn the_proxy_page_should_be_drawable_with_an_empty_catalog(cx: &mut TestAppConte
 #[gpui_kit::test]
 fn the_add_button_should_sit_above_a_table_that_fills_the_page(cx: &mut TestAppContext) {
     let (dialog, cx) = settings(Config::default(), cx);
-    select(&dialog, "proxy-management", cx);
+    select(&dialog, "server-management", cx);
 
     let page = cx
         .debug_bounds("SETTINGS_PROXY_PAGE")
@@ -496,11 +544,11 @@ fn a_catalog_with_an_entry_should_draw_the_entry_rather_than_the_empty_message(
     cx: &mut TestAppContext,
 ) {
     let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "proxy-management", cx);
+    select(&panel, "server-management", cx);
 
     panel.read_with(cx, |dialog, cx| {
         assert_eq!(
-            base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies.read(cx)),
+            base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies_for_test().read(cx)),
             1,
             "the entry the catalog holds should be the one row of the table"
         );
@@ -530,7 +578,7 @@ fn a_form_should_keep_the_settings_under_it_out_of_reach(cx: &mut TestAppContext
     let page = current_page(&panel, cx);
 
     let entry = cx
-        .debug_bounds("SETTINGS_ENTRY_proxy-management")
+        .debug_bounds("SETTINGS_ENTRY_server-management")
         .expect("the sidebar should draw the row the click is aimed at");
     let form = cx
         .debug_bounds("SETTINGS_PROXY_EDIT")
@@ -541,7 +589,7 @@ fn a_form_should_keep_the_settings_under_it_out_of_reach(cx: &mut TestAppContext
          click would prove nothing: the form is {form:?} and the row is {entry:?}"
     );
 
-    click(cx, "SETTINGS_ENTRY_proxy-management");
+    click(cx, "SETTINGS_ENTRY_server-management");
 
     assert_eq!(
         current_page(&panel, cx),

@@ -10,9 +10,10 @@ use super::test_support::*;
 /// A value the user changes reaches the settings at once: there is nothing to confirm.
 #[gpui_kit::test]
 fn a_field_change_should_reach_the_settings_at_once(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
+    let (_panel, cx) = settings(Config::default(), cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    click(cx, "SETTINGS_CONTROL_appearance");
+    click(cx, "TEST_MENU_ITEM_Dark");
 
     assert_eq!(
         stored(cx).appearance,
@@ -31,9 +32,10 @@ fn a_field_change_should_reach_the_settings_at_once(cx: &mut TestAppContext) {
 /// is drawn in follows the stored preference at once.
 #[gpui_kit::test]
 fn the_theme_should_follow_the_appearance_at_once(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
+    let (_panel, cx) = settings(Config::default(), cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    click(cx, "SETTINGS_CONTROL_appearance");
+    click(cx, "TEST_MENU_ITEM_Dark");
 
     assert_eq!(
         drawn_appearance(cx),
@@ -53,9 +55,10 @@ fn the_theme_should_follow_the_appearance_at_once(cx: &mut TestAppContext) {
 /// to — which the window reports itself, so the test asks the window rather than assuming one.
 #[gpui_kit::test]
 fn an_appearance_should_draw_the_appearance_it_resolves_to(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
+    let (_panel, cx) = settings(Config::default(), cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    click(cx, "SETTINGS_CONTROL_appearance");
+    click(cx, "TEST_MENU_ITEM_Dark");
 
     assert_eq!(
         drawn_appearance(cx),
@@ -64,7 +67,8 @@ fn an_appearance_should_draw_the_appearance_it_resolves_to(cx: &mut TestAppConte
     );
 
     let reported = cx.update(|window, _| window.appearance());
-    write_field(&panel, "appearance", "appearance", "System", cx);
+    click(cx, "SETTINGS_CONTROL_appearance");
+    click(cx, "TEST_MENU_ITEM_System");
 
     assert_eq!(
         stored(cx).appearance,
@@ -92,7 +96,8 @@ fn the_language_should_switch_at_once_and_the_page_should_stay_reachable(cx: &mu
         "the sidebar should open in the language the window opened in"
     );
 
-    write_field(&panel, "appearance", "language", "en", cx);
+    click(cx, "SETTINGS_CONTROL_language");
+    click(cx, "TEST_MENU_ITEM_en");
 
     assert_eq!(
         cx.read(|cx| *cx.global::<LanguageCode>()),
@@ -117,5 +122,22 @@ fn the_language_should_switch_at_once_and_the_page_should_stay_reachable(cx: &mu
     assert!(
         cx.debug_bounds("SETTINGS_PAGE").is_some(),
         "switching the language leaves the settings page open"
+    );
+}
+
+/// The data formatting page's time zone is chosen from the offsets the setting stores, and
+/// choosing one writes it.
+#[gpui_kit::test]
+fn the_time_zone_should_be_chosen_from_its_row(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(Config::default(), cx);
+
+    select(&panel, "data-format", cx);
+    click(cx, "SETTINGS_CONTROL_data-format.offset");
+    click(cx, "TEST_MENU_ITEM_8");
+
+    assert_eq!(
+        stored(cx).data_time_zone.hours(),
+        8,
+        "the row writes the offset the user chose"
     );
 }

@@ -2,48 +2,39 @@
 //! downloaded.
 //!
 //! The page is a view of its own rather than a page of fields: its model list is a table of its
-//! own, its directory is an input that only the system folder picker writes, and its download
+//! own, its directory is a label that only the system folder picker changes, and its download
 //! state belongs to the process-wide [`crate::translation_downloads::TranslationDownloads`]
 //! rather than to the settings page. The chosen directory and model are written into the settings
 //! as they are chosen, and the controls read them back from there, so what the page draws is what
 //! is stored.
 //!
-//! Two repairs are made the first time the page is really drawn, and only then — see
-//! [`TranslationPage::repair_on_open`]: a directory is adopted from the last completed download
-//! when none is stored, and a selection that the stored directory does not hold is cleared. They
-//! are written together, in one write, so a page opened without being entered writes nothing.
+//! One repair is made the first time the page is really drawn, and only then — see
+//! [`TranslationPage::repair_on_open`]: a selection that the stored directory does not hold is
+//! cleared. It is written once, so a page opened without being entered writes nothing.
 //!
-//! Downloading starts from the site the settings hold: the two sites are drawn under the
-//! directory, and both a first download and a retry of a failed one use the chosen site.
+//! Downloading starts from the site the settings hold: the site is a select in the card of model
+//! settings, and both a first download and a retry of a failed one use the chosen site.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use app_config::translation::{DownloadSite, TranslationModel};
 use base_ui::{
-    button::Button,
-    input::{Input, InputState, InputStateBuilder},
-    interactive::InteractiveVariantExt,
-    menu::{MenuItem, MenuItemAction},
-    select::Select,
-    size::UnifiedSizable,
-    toggle::Toggle,
+    button::Button, interactive::InteractiveVariantExt, style::theme::ThemeExt, tooltip::Tooltip,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
-    Window, base::Disableable as _, div,
+    App, AppContext as _, Context, ElementId, Entity, InteractiveElement as _, IntoElement,
+    ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
+    Styled, Subscription, Window, div,
 };
 use i18n::t;
 
 use crate::{
-    page,
+    layout,
+    search::{PageSearch, words},
     session::{SettingsChange, SettingsSession},
     translation_downloads::TranslationDownloads,
     translation_table::{TranslationRequest, TranslationTable},
 };
-
-/// The element id of the directory field, which is also the key of its state.
-const DIRECTORY_INPUT_ID: &str = "settings-ai-directory";
 
 /// What one site is called in the interface.
 fn site_label(site: DownloadSite, cx: &App) -> SharedString {
@@ -53,28 +44,83 @@ fn site_label(site: DownloadSite, cx: &App) -> SharedString {
     }
 }
 
-/// What one site's radio is drawn under, which is what a test chooses it by.
-fn site_selector(site: DownloadSite) -> &'static str {
+/// The stored id of one site, which is what its choice writes.
+const fn site_id(site: DownloadSite) -> &'static str {
     match site {
-        DownloadSite::HuggingFace => "SETTINGS_AI_SITE_HUGGINGFACE",
-        DownloadSite::ModelScope => "SETTINGS_AI_SITE_MODELSCOPE",
+        DownloadSite::HuggingFace => "hugging_face",
+        DownloadSite::ModelScope => "model_scope",
+    }
+}
+
+/// The site a choice names.
+fn site_from_id(id: &str) -> Option<DownloadSite> {
+    DownloadSite::ALL
+        .into_iter()
+        .find(|site| site_id(*site) == id)
+}
+
+/// The text the translation page is searched by.
+///
+/// The page has no setting rows of its own to filter: its directory, its site and its model are
+/// delivered by the page as a whole, and the model table is a view over the directory. What the
+/// search reaches it by is therefore the page's own words, including the names of the settings it
+/// holds.
+pub(crate) fn search(cx: &App) -> PageSearch {
+    let title = t!(cx, "settings_ui.ai.translation.title");
+    let directory = t!(cx, "settings_ui.ai.model_directory");
+    let site = t!(cx, "settings_ui.ai.download_site");
+    let model = t!(cx, "settings_ui.ai.model_in_use");
+    let models = t!(cx, "settings_ui.ai.models");
+
+    PageSearch {
+        label: words(&[
+            title.as_ref(),
+            directory.as_ref(),
+            site.as_ref(),
+            model.as_ref(),
+            models.as_ref(),
+            "translation",
+            "translate",
+            "翻译",
+            "model",
+            "models",
+            "模型",
+            "当前支持的模型",
+            "模型存放目录",
+            "使用的模型",
+            "model directory",
+            "model in use",
+            "browse",
+            "浏览",
+            "huggingface",
+            "modelscope",
+            "魔搭",
+            "download site",
+            "model download site",
+            "下载站点",
+            "模型下载站点",
+            "站点",
+            "download",
+            "下载",
+            "hy-mt2",
+            "hy mt2",
+        ]),
+        fields: Vec::new(),
     }
 }
 
 /// The translation page.
 pub(crate) struct TranslationPage {
     session: Entity<SettingsSession>,
-    /// The read-only field that shows the directory, built on the first frame that draws it.
-    directory: Option<Entity<InputState>>,
     /// The process-wide downloads, when the composition root installed them.
     downloads: Option<Entity<TranslationDownloads>>,
     /// The supported models and what each of them is doing.
     table: Entity<TranslationTable>,
-    /// Whether the repairs of [`Self::repair_on_open`] have been scheduled, so they happen once.
+    /// Whether the repair of [`Self::repair_on_open`] has been scheduled, so it happens once.
     repair_started: bool,
     /// Held because a write of the settings can land here rather than through this page — the
-    /// repairs the page schedules are written through the session — and the field, the site
-    /// radios and the model select all draw what the settings hold.
+    /// repair the page schedules is written through the session — and the directory label, the
+    /// site radios and the model select all draw what the settings hold.
     _session: Subscription,
     /// Held because every change the download manager publishes repaints this page through it:
     /// it selects a finished download and clears the selection of a model it starts removing
@@ -96,7 +142,6 @@ impl TranslationPage {
 
         Self {
             session,
-            directory: None,
             downloads,
             table,
             repair_started: false,
@@ -105,11 +150,11 @@ impl TranslationPage {
         }
     }
 
-    /// Schedules the two repairs the page makes, once, when it is first opened.
+    /// Schedules the repair the page makes, once, when it is first opened.
     ///
     /// A settings page that is opened but never shows this page must not write the translation
-    /// settings, so nothing is written when the page is built: the repairs are scheduled here,
-    /// when the page is moved to, and run at the end of the effect cycle that moved there.
+    /// settings, so nothing is written when the page is built: the repair is scheduled here,
+    /// when the page is moved to, and runs at the end of the effect cycle that moved there.
     pub(crate) fn repair_on_open(&mut self, cx: &mut Context<Self>) {
         if self.repair_started {
             return;
@@ -121,13 +166,7 @@ impl TranslationPage {
         cx.defer(move |cx| Self::repair(session, downloads, cx));
     }
 
-    /// Adopts the directory of the most recent completed download when none is stored, and clears
-    /// a selection the stored directory does not hold.
-    ///
-    /// The two are one write: the directory a download finished in is the directory the selection
-    /// is judged against, so storing one without the other would leave a selection naming a
-    /// directory the settings no longer have. A directory that is already stored is never
-    /// replaced — a download that ran elsewhere is not a reason to move the user's setting.
+    /// Clears a selection the stored directory does not hold.
     ///
     /// A model is available when its file is in that directory at its published size and its row
     /// is not being removed: a file that is still there while the engine unloads is not one the
@@ -142,77 +181,24 @@ impl TranslationPage {
         };
 
         let config = session.read(cx).config(cx);
-        let stored = config.translation.model_directory.clone();
-        let adopted = stored.clone().or_else(|| {
-            downloads
-                .read(cx)
-                .last_download_directory()
-                .map(Path::to_path_buf)
-        });
-
-        let mut changes = Vec::with_capacity(2);
-        if stored.is_none()
-            && let Some(directory) = adopted.clone()
-        {
-            changes.push(SettingsChange::TranslationModelDirectory { directory });
-        }
-        if let Some(selected) = config.translation.selected_model {
-            let available = adopted.as_deref().is_some_and(|directory| {
-                let downloads = downloads.read(cx);
-                !downloads.row_state(selected, directory).is_removing()
-                    && downloads.is_downloaded(selected, directory)
-            });
-            if !available {
-                changes.push(SettingsChange::TranslationModelSelected { model: None });
-            }
-        }
+        let directory = config.translation.model_directory.clone();
+        let selected = config.translation.selected_model;
         drop(config);
 
-        if changes.is_empty() {
+        let Some(selected) = selected else {
+            return;
+        };
+        let available = directory
+            .as_deref()
+            .is_some_and(|directory| downloads.read(cx).is_available(selected, directory));
+        if available {
             return;
         }
+
         session.update(cx, |session, cx| {
-            let _ = session.write_all(changes, cx);
+            let change = SettingsChange::TranslationModelSelected { model: None };
+            let _ = session.write(change, cx);
         });
-    }
-
-    /// The read-only field that shows the directory the settings hold.
-    fn directory_input(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        let stored = self
-            .session
-            .read(cx)
-            .config(cx)
-            .translation
-            .model_directory
-            .clone();
-        let value = stored.map_or_else(SharedString::default, |path| {
-            SharedString::from(path.to_string_lossy().into_owned())
-        });
-
-        if let Some(input) = self.directory.as_ref() {
-            // The field is readonly, so its value only moves when the settings do — a repair
-            // that adopted a directory, or a directory written elsewhere. What it shows is what
-            // is stored, exactly as the other controls do.
-            if input.read(cx).value(cx) != value {
-                input.update(cx, |input, cx| input.update_value(&value, window, cx));
-            }
-
-            return input.clone();
-        }
-
-        let input = cx.new(|cx| {
-            InputStateBuilder::new(DIRECTORY_INPUT_ID)
-                .default_value(value)
-                .readonly()
-                .build(window, cx)
-        });
-        self.directory = Some(input.clone());
-
-        input
     }
 
     /// Asks the system for a directory and records the one chosen.
@@ -232,43 +218,50 @@ impl TranslationPage {
             let Some(directory) = paths.into_iter().next() else {
                 return;
             };
-            let _ = page.update_in(cx, |page, window, cx| page.choose(directory, window, cx));
+            let _ = page.update_in(cx, |page, _window, cx| page.choose(directory, cx));
         })
         .detach();
     }
 
-    /// Writes `directory` as the model directory and shows it in the field.
+    /// Writes `directory` as the model directory and shows it in the label.
     ///
-    /// A selection that the new directory cannot load is cleared in the same write: the menu is
-    /// drawn from what the stored directory holds, so a directory stored without that clearing
-    /// would be one frame away from naming a model that is not in it. The field shows the
-    /// directory only once it is stored — a write that failed leaves the old one on screen, and
-    /// the settings page reports why.
-    fn choose(&mut self, directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let (unchanged, clears_selection) = {
+    /// The selection follows the directory in the same write: a selection the new directory
+    /// cannot load would name a file that is not there, so the first model the directory holds —
+    /// in the order their names sort — is selected instead, and the selection is cleared when the
+    /// directory holds none. A selection the new directory does hold is left as it is. The label
+    /// shows the directory only once it is stored — a write that failed leaves the old one on
+    /// screen, and the settings page reports why.
+    fn choose(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        let (unchanged, selected) = {
             let config = self.session.read(cx).config(cx);
             let unchanged =
                 config.translation.model_directory.as_deref() == Some(directory.as_path());
-            let clears_selection = config.translation.selected_model.is_some_and(|selected| {
-                !self.downloads.as_ref().is_some_and(|downloads| {
-                    let downloads = downloads.read(cx);
-                    !downloads.row_state(selected, &directory).is_removing()
-                        && downloads.is_downloaded(selected, &directory)
-                })
-            });
+            let selected = config.translation.selected_model;
 
-            (unchanged, clears_selection)
+            (unchanged, selected)
         };
         if unchanged {
             return;
         }
 
+        let next = {
+            let mut available = self
+                .downloads
+                .as_ref()
+                .map(|downloads| downloads.read(cx).available_models(&directory))
+                .unwrap_or_default();
+            available.sort_by_key(|model| model.display_name());
+
+            match selected {
+                Some(model) if available.contains(&model) => Some(model),
+                _ => available.first().copied(),
+            }
+        };
+
         let mut changes = Vec::with_capacity(2);
-        changes.push(SettingsChange::TranslationModelDirectory {
-            directory: directory.clone(),
-        });
-        if clears_selection {
-            changes.push(SettingsChange::TranslationModelSelected { model: None });
+        changes.push(SettingsChange::TranslationModelDirectory { directory });
+        if next != selected {
+            changes.push(SettingsChange::TranslationModelSelected { model: next });
         }
 
         let stored = self
@@ -278,10 +271,6 @@ impl TranslationPage {
             return;
         }
 
-        let shown = SharedString::from(directory.to_string_lossy().into_owned());
-        if let Some(input) = self.directory.as_ref() {
-            input.update(cx, |input, cx| input.update_value(&shown, window, cx));
-        }
         cx.notify();
     }
 
@@ -395,12 +384,16 @@ impl TranslationPage {
         });
     }
 
-    /// The directory the field shows, for the page's tests.
+    /// The directory the page shows, for the page's tests.
     #[cfg(test)]
     pub(crate) fn shown_directory(&self, cx: &gpui_kit::App) -> Option<SharedString> {
-        self.directory
+        let config = self.session.read(cx).config(cx);
+
+        config
+            .translation
+            .model_directory
             .as_ref()
-            .map(|input| input.read(cx).value(cx))
+            .map(|path| SharedString::from(path.to_string_lossy().into_owned()))
     }
 
     /// Chooses a model the way the open menu does, for the settings page's tests.
@@ -415,26 +408,20 @@ impl TranslationPage {
 }
 
 impl Render for TranslationPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.handle_request(cx);
 
-        let input = self.directory_input(window, cx);
         let config = self.session.read(cx).config(cx);
         let directory = config.translation.model_directory.clone();
         // What the menu offers is what the directory holds, minus what is being removed: a model
         // whose files are on their way out is not one the page can load, so it is not one the
         // user can pick.
-        let downloaded = match (self.downloads.as_ref(), directory.as_deref()) {
-            (Some(downloads), Some(directory)) => {
-                let downloads = downloads.read(cx);
-                downloads
-                    .downloaded_models(directory)
-                    .into_iter()
-                    .filter(|model| !downloads.row_state(*model, directory).is_removing())
-                    .collect::<Vec<_>>()
-            }
-            _ => Vec::new(),
-        };
+        let downloaded = self
+            .downloads
+            .as_ref()
+            .zip(directory.as_deref())
+            .map(|(downloads, directory)| downloads.read(cx).available_models(directory))
+            .unwrap_or_default();
         let selected = config
             .translation
             .selected_model
@@ -446,62 +433,157 @@ impl Render for TranslationPage {
             t!(cx, "settings_ui.ai.no_model_directory")
         };
 
-        let mut select = Select::new("settings-ai-model-select")
-            .tonal()
-            .placeholder(placeholder)
-            .disabled(disabled)
-            .aria_label(t!(cx, "settings_ui.ai.model_in_use"));
-        for model in &downloaded {
-            select = select.menu_item(MenuItem::Action(MenuItemAction::new(
-                model.display_name(),
-                model.display_name(),
-            )));
-        }
-        let page = cx.entity().downgrade();
-        let select = select
-            .selected_item(selected.map(|model| SharedString::from(model.display_name())))
-            .on_change(move |item_id, _, cx| {
+        let model_page = cx.entity().downgrade();
+        let model_label = t!(cx, "settings_ui.ai.model_in_use");
+        let model_choices = downloaded.iter().map(|model| {
+            (
+                SharedString::from(model.display_name()),
+                SharedString::from(model.display_name()),
+            )
+        });
+        let model_select = layout::choice_select(
+            ElementId::Name(SharedString::new_static("settings-ai-model-select")),
+            selected.map(|model| SharedString::from(model.display_name())),
+            model_choices,
+            model_label.clone(),
+            Some(placeholder.into_any_element()),
+            disabled,
+            move |item_id, _, cx| {
                 let Some(model) = item_id
                     .as_ref()
                     .and_then(|id| TranslationModel::from_name(id.as_str()))
                 else {
                     return;
                 };
-                if let Some(page) = page.upgrade() {
+                if let Some(page) = model_page.upgrade() {
                     page.update(cx, |page, cx| page.select_model(model, cx));
                 }
-            });
+            },
+        );
 
         let download_site = config.translation.download_site;
         let site_page = cx.entity().downgrade();
-        let site_choices = DownloadSite::ALL.into_iter().fold(
-            div().w_full().flex().flex_col().gap_1(),
-            |choices, site| {
-                let page = site_page.clone();
-                choices.child(
-                    Toggle::new(site_selector(site))
-                        .radio()
-                        .checked(download_site == site)
-                        .label(site_label(site, cx))
-                        .debug_selector(move || site_selector(site).into())
-                        .on_change(move |checked, _, cx| {
-                            if !checked {
-                                return;
-                            }
-                            let Some(page) = page.upgrade() else {
-                                return;
-                            };
-                            page.update(cx, |page, cx| {
-                                let change = SettingsChange::TranslationDownloadSite { site };
-                                page.session.update(cx, |session, cx| {
-                                    let _ = session.write(change, cx);
-                                });
-                                cx.notify();
-                            });
-                        }),
-                )
+        let site_label_text = t!(cx, "settings_ui.ai.download_site");
+        let site_choices = DownloadSite::ALL.into_iter().map(|site| {
+            (
+                SharedString::new_static(site_id(site)),
+                site_label(site, cx),
+            )
+        });
+        let site_select = layout::choice_select(
+            ElementId::Name(SharedString::new_static("settings-ai-site-select")),
+            Some(SharedString::new_static(site_id(download_site))),
+            site_choices,
+            site_label_text,
+            None,
+            false,
+            move |item_id, _, cx| {
+                let Some(site) = item_id.as_ref().and_then(|id| site_from_id(id.as_str())) else {
+                    return;
+                };
+                let Some(page) = site_page.upgrade() else {
+                    return;
+                };
+                page.update(cx, |page, cx| {
+                    let change = SettingsChange::TranslationDownloadSite { site };
+                    page.session.update(cx, |session, cx| {
+                        let _ = session.write(change, cx);
+                    });
+                    cx.notify();
+                });
             },
         );
+
+        let directory_text = directory
+            .as_ref()
+            .map_or_else(SharedString::default, |path| {
+                SharedString::from(path.to_string_lossy().into_owned())
+            });
+        let directory_label = div()
+            .debug_selector(|| "SETTINGS_AI_DIRECTORY_LABEL".into())
+            .min_w_0()
+            .truncate()
+            .text_sm()
+            .text_color(cx.theme().roles.fg.muted.hsla)
+            .child(directory_text.clone());
+        let mut directory_hint = Tooltip::new(
+            ElementId::Name(SharedString::new_static("settings-ai-directory-tooltip")),
+            directory_label,
+        )
+        .min_w_0();
+        if !directory_text.is_empty() {
+            directory_hint = directory_hint.content(directory_text);
+        }
+
+        let directory_control = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pr_2()
+                    .flex()
+                    .items_center()
+                    .child(directory_hint),
+            )
+            .child(
+                Button::new("settings-ai-browse")
+                    .tonal()
+                    .flex_none()
+                    .debug_selector(|| "SETTINGS_AI_BROWSE".into())
+                    .aria_label(t!(cx, "settings_ui.ai.browse"))
+                    .child(t!(cx, "settings_ui.ai.browse"))
+                    .on_click(cx.listener(|page, _, window, cx| {
+                        page.browse(window, cx);
+                    })),
+            )
+            .into_any_element();
+
+        let directory_row = div()
+            .debug_selector(|| "SETTINGS_AI_DIRECTORY".into())
+            .child(layout::row(
+                "ai.directory",
+                t!(cx, "settings_ui.ai.model_directory"),
+                t!(cx, "settings_ui.ai.model_directory_description"),
+                directory_control,
+                layout::CONTROL_WIDTH,
+                cx,
+            ))
+            .into_any_element();
+        let site_row = div()
+            .debug_selector(|| "SETTINGS_AI_DOWNLOAD_SITE".into())
+            .child(layout::row(
+                "ai.download-site",
+                t!(cx, "settings_ui.ai.download_site"),
+                t!(cx, "settings_ui.ai.download_site_description"),
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(|| "SETTINGS_AI_SITE_SELECT".into())
+                    .child(site_select)
+                    .into_any_element(),
+                layout::CONTROL_WIDTH,
+                cx,
+            ))
+            .into_any_element();
+        let model_row = div()
+            .debug_selector(|| "SETTINGS_AI_MODEL_SELECT_SECTION".into())
+            .child(layout::row(
+                "ai.model",
+                model_label,
+                t!(cx, "settings_ui.ai.model_in_use_description"),
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(|| "SETTINGS_AI_MODEL_SELECT".into())
+                    .child(model_select)
+                    .into_any_element(),
+                layout::CONTROL_WIDTH,
+                cx,
+            ))
+            .into_any_element();
 
         div()
             .debug_selector(|| "SETTINGS_AI_PAGE".into())
@@ -512,74 +594,12 @@ impl Render for TranslationPage {
             .flex_col()
             .gap_4()
             .py_1()
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_AI_DIRECTORY".into())
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(page::section_title(
-                        t!(cx, "settings_ui.ai.model_directory"),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .debug_selector(|| "SETTINGS_AI_DIRECTORY_INPUT".into())
-                                    .child(Input::new(&input).medium()),
-                            )
-                            .child(
-                                Button::new("settings-ai-browse")
-                                    .tonal()
-                                    .debug_selector(|| "SETTINGS_AI_BROWSE".into())
-                                    .aria_label(t!(cx, "settings_ui.ai.browse"))
-                                    .child(t!(cx, "settings_ui.ai.browse"))
-                                    .on_click(cx.listener(|page, _, window, cx| {
-                                        page.browse(window, cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_AI_DOWNLOAD_SITE".into())
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(page::section_title(
-                        t!(cx, "settings_ui.ai.download_site"),
-                        cx,
-                    ))
-                    .child(site_choices),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_AI_MODEL_SELECT_SECTION".into())
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(page::section_title(
-                        t!(cx, "settings_ui.ai.model_in_use"),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .debug_selector(|| "SETTINGS_AI_MODEL_SELECT".into())
-                            .child(select),
-                    ),
-            )
+            .child(layout::section(
+                None,
+                "ai.translation",
+                vec![directory_row, site_row, model_row],
+                cx,
+            ))
             .child(
                 div()
                     .debug_selector(|| "SETTINGS_AI_MODELS".into())
@@ -589,7 +609,7 @@ impl Render for TranslationPage {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(page::section_title(t!(cx, "settings_ui.ai.models"), cx))
+                    .child(layout::section_title(t!(cx, "settings_ui.ai.models"), cx))
                     .child(self.table.clone()),
             )
     }
@@ -673,7 +693,9 @@ mod tests {
             "a page without the process-wide manager cannot download"
         );
 
-        let session = session_over(cx, Config::default());
+        let mut config = Config::default();
+        config.translation.model_directory = None;
+        let session = session_over(cx, config);
         let page =
             cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads.clone()), cx)));
 
@@ -690,115 +712,6 @@ mod tests {
         assert!(
             cx.read(|cx| page.read(cx).table.read(cx).downloads_enabled()),
             "the manager and a directory are what the download action needs"
-        );
-    }
-
-    /// A directory the settings already hold is not replaced by the last download's one, even
-    /// when a download is running in that other directory.
-    #[gpui_kit::test]
-    fn a_page_should_keep_the_directory_the_settings_already_have(cx: &mut TestAppContext) {
-        let chosen = TempDir::new().expect("the chosen directory builds");
-        let downloaded = TempDir::new().expect("the download directory builds");
-        let downloads = downloads(cx);
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_last_download_directory_for_test(downloaded.path().to_path_buf());
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ4Km,
-                downloaded.path().to_path_buf(),
-                DownloadState::Downloading {
-                    downloaded: 42,
-                    mb_per_second: 2.0,
-                },
-                cx,
-            );
-        });
-        let mut config = Config::default();
-        config.translation.model_directory = Some(chosen.path().to_path_buf());
-        let session = session_over(cx, config);
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        open(&page, cx);
-
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            Some(chosen.path().to_path_buf()),
-            "the page must not rewrite a directory the settings already hold"
-        );
-    }
-
-    /// Settings opened without a directory adopt the one the last download completed in, and
-    /// opening the page is what writes it.
-    #[gpui_kit::test]
-    fn a_page_should_adopt_the_last_download_directory_when_it_has_none(cx: &mut TestAppContext) {
-        let directory = TempDir::new().expect("the test directory builds");
-        let downloads = downloads(cx);
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(
-                TranslationModel::HyMt27BQ8,
-                directory.path().to_path_buf(),
-                cx,
-            );
-        });
-        let session = session_over(cx, Config::default());
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            None,
-            "building the page must not write the translation settings"
-        );
-
-        open(&page, cx);
-
-        let config = stored(cx);
-        assert_eq!(
-            config.translation.model_directory,
-            Some(directory.path().to_path_buf()),
-            "a page with no directory should open on the one the download finished in"
-        );
-        assert_eq!(
-            config.translation.selected_model, None,
-            "opening the page must not select a model the user never chose"
-        );
-    }
-
-    /// The repair runs once: a page opened again does not adopt what a later download left
-    /// behind when the directory the settings hold moved on in between.
-    #[gpui_kit::test]
-    fn a_page_should_repair_its_settings_once(cx: &mut TestAppContext) {
-        let first = TempDir::new().expect("the first directory builds");
-        let second = TempDir::new().expect("the second directory builds");
-        let downloads = downloads(cx);
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(
-                TranslationModel::HyMt27BQ8,
-                first.path().to_path_buf(),
-                cx,
-            );
-        });
-        let session = session_over(cx, Config::default());
-        let page =
-            cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads.clone()), cx)));
-
-        open(&page, cx);
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            Some(first.path().to_path_buf())
-        );
-
-        // What a second repair would see: no stored directory, another download's directory.
-        cx.update_global::<ConfigManager, _>(|manager, cx| {
-            manager.update(|config| config.translation.model_directory = None, cx);
-        });
-        downloads.update(cx, |downloads, _| {
-            downloads.set_last_download_directory_for_test(second.path().to_path_buf());
-        });
-        open(&page, cx);
-
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            None,
-            "the repair is made the first time the page is opened and never again"
         );
     }
 

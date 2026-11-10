@@ -19,7 +19,7 @@ fn the_field_should_clear_the_search_it_was_filtered_by(cx: &mut TestAppContext)
     cx.run_until_parked();
 
     assert!(
-        !dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
+        !dialog.read_with(cx, |dialog, _| dialog.filter_for_test().is_all()),
         "typing into the field should narrow the sidebar"
     );
 
@@ -31,7 +31,7 @@ fn the_field_should_clear_the_search_it_was_filtered_by(cx: &mut TestAppContext)
     cx.run_until_parked();
 
     assert!(
-        dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
+        dialog.read_with(cx, |dialog, _| dialog.filter_for_test().is_all()),
         "clearing the field should admit everything again"
     );
 }
@@ -86,11 +86,15 @@ fn a_query_should_move_the_page_to_one_it_admits(cx: &mut TestAppContext) {
 
     dialog.read_with(cx, |dialog, _| {
         assert!(
-            !dialog.filter.admits_page("market_participants.okx"),
+            !dialog
+                .filter_for_test()
+                .admits_page("market_participants.okx"),
             "the query should not admit the page that was selected"
         );
         assert!(
-            dialog.filter.admits_page(&dialog.current_page),
+            dialog
+                .filter_for_test()
+                .admits_page(dialog.current_page_for_test()),
             "the page that is drawn must be one the query admits"
         );
     });
@@ -143,7 +147,7 @@ fn a_query_that_matches_a_field_should_open_the_page_that_holds_it(cx: &mut Test
 #[gpui_kit::test]
 fn a_query_that_matches_nothing_should_say_so_in_both_columns(cx: &mut TestAppContext) {
     let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "proxy-management", cx);
+    select(&panel, "server-management", cx);
     panel.update(cx, |dialog, cx| {
         dialog.set_query("555".into(), cx);
     });
@@ -151,7 +155,7 @@ fn a_query_that_matches_nothing_should_say_so_in_both_columns(cx: &mut TestAppCo
 
     panel.read_with(cx, |dialog, _| {
         assert!(
-            dialog.filter.is_nothing(),
+            dialog.filter_for_test().is_nothing(),
             "the query should admit nothing at all"
         );
     });
@@ -197,6 +201,6 @@ fn clearing_a_query_should_admit_everything_again(cx: &mut TestAppContext) {
     });
 
     dialog.read_with(cx, |dialog, _| {
-        assert!(dialog.filter.is_all());
+        assert!(dialog.filter_for_test().is_all());
     });
 }

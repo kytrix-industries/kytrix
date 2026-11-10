@@ -22,7 +22,8 @@ fn choosing_a_download_site_should_store_it_at_once(cx: &mut TestAppContext) {
         "settings with nothing stored start on HuggingFace"
     );
 
-    click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+    click(cx, "SETTINGS_AI_SITE_SELECT");
+    click(cx, "TEST_MENU_ITEM_model_scope");
 
     assert_eq!(
         stored(cx).translation.download_site,
@@ -30,7 +31,7 @@ fn choosing_a_download_site_should_store_it_at_once(cx: &mut TestAppContext) {
         "choosing a site should store it at once"
     );
     assert!(
-        cx.debug_bounds("SETTINGS_AI_SITE_MODELSCOPE").is_some(),
+        cx.debug_bounds("SETTINGS_AI_SITE_SELECT").is_some(),
         "the page should still draw the chosen site"
     );
 }
@@ -242,7 +243,7 @@ fn a_stale_model_menu_choice_after_deletion_should_clear_the_selection(cx: &mut 
     // ... and the click lands after it: what was offered is checked against the directory
     // again, and refused.
     panel.update(cx, |panel, cx| {
-        panel.translation.update(cx, |page, cx| {
+        panel.translation_for_test().update(cx, |page, cx| {
             page.select_model_for_test(removed, cx);
         });
     });

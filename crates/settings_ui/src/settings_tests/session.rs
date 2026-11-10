@@ -123,7 +123,7 @@ fn a_write_that_could_not_be_stored_should_be_stored_when_it_is_tried_again(
     let path = blocking.join("config.json");
     let (panel, cx) = settings_over(manager, Language::En, cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
 
     assert!(
         cx.debug_bounds("BASE_UI_ALERT").is_some(),
@@ -148,7 +148,7 @@ fn a_write_that_could_not_be_stored_should_be_stored_when_it_is_tried_again(
 
     fs::remove_file(&blocking).expect("the blocking file should be removable");
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
 
     assert_eq!(
         stored(cx).appearance,
@@ -192,7 +192,7 @@ fn a_background_write_should_survive_the_next_settings_write(cx: &mut TestAppCon
     write_while_open(cx);
     settle(cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
 
     let published = stored(cx);
     assert_eq!(
@@ -230,7 +230,7 @@ fn a_background_sidebar_state_should_survive_the_next_settings_write(cx: &mut Te
     write_while_open(cx);
     settle(cx);
 
-    write_field(&panel, "appearance", "appearance", "Dark", cx);
+    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
 
     assert_eq!(
         stored(cx).ui.sidebar,
@@ -334,16 +334,8 @@ fn switching_pages_should_drop_the_hidden_input_focus(cx: &mut TestAppContext) {
     let focused = cx.update(|window, cx| {
         panel.read_with(cx, |panel, cx| {
             panel
-                .inputs
-                .iter()
-                .find(|input| input.field.id == "market_participants.okx.api_key")
-                .is_some_and(|input| {
-                    input
-                        .entity
-                        .read(cx)
-                        .engine_focus_handle(cx)
-                        .is_focused(window)
-                })
+                .input_for_test("market_participants.okx.api_key")
+                .is_some_and(|input| input.read(cx).engine_focus_handle(cx).is_focused(window))
         })
     });
     assert!(focused, "clicking a field should put the caret in it");
@@ -353,16 +345,8 @@ fn switching_pages_should_drop_the_hidden_input_focus(cx: &mut TestAppContext) {
     let focused = cx.update(|window, cx| {
         panel.read_with(cx, |panel, cx| {
             panel
-                .inputs
-                .iter()
-                .find(|input| input.field.id == "market_participants.okx.api_key")
-                .is_some_and(|input| {
-                    input
-                        .entity
-                        .read(cx)
-                        .engine_focus_handle(cx)
-                        .is_focused(window)
-                })
+                .input_for_test("market_participants.okx.api_key")
+                .is_some_and(|input| input.read(cx).engine_focus_handle(cx).is_focused(window))
         })
     });
     assert!(
@@ -445,10 +429,8 @@ fn a_failed_text_write_should_keep_the_page_and_the_input(cx: &mut TestAppContex
     );
     let typed = panel.read_with(cx, |panel, cx| {
         panel
-            .inputs
-            .iter()
-            .find(|input| input.field.id == "market_participants.okx.api_key")
-            .map(|input| input.entity.read(cx).value(cx))
+            .input_for_test("market_participants.okx.api_key")
+            .map(|input| input.read(cx).value(cx))
     });
     assert_eq!(
         typed,
@@ -495,7 +477,7 @@ fn a_failed_select_write_should_keep_the_old_value_and_report(cx: &mut TestAppCo
     let (manager, _blocking, _directory) = manager_behind_a_file(cx);
     let (panel, cx) = settings_over(manager, Language::ZhCn, cx);
 
-    write_field(&panel, "appearance", "language", "en", cx);
+    edit_settings(&panel, |config| config.language = Language::En, cx);
 
     assert!(
         cx.debug_bounds("BASE_UI_ALERT").is_some(),
@@ -515,7 +497,9 @@ fn a_failed_select_write_should_keep_the_old_value_and_report(cx: &mut TestAppCo
         cx.debug_bounds("SETTINGS_PAGE").is_some(),
         "the settings should stay open so the user can try again"
     );
-    let shown = panel.read_with(cx, |panel, cx| panel.session.read(cx).config(cx).language);
+    let shown = panel.read_with(cx, |panel, cx| {
+        panel.session_for_test().read(cx).config(cx).language
+    });
     assert_eq!(
         shown,
         Language::ZhCn,
@@ -534,11 +518,11 @@ fn a_setter_that_rejects_the_value_should_keep_the_old_value_without_a_report(
     let (panel, cx) = settings(config, cx);
     let before = stored(cx);
 
-    write_field(
+    edit_settings(
         &panel,
-        "market_participants.okx",
-        "market_participants.okx.api_key",
-        "typed-key",
+        |config| {
+            config.set_venue_credential(&VenueId::Okx, "api_key", "typed-key");
+        },
         cx,
     );
 

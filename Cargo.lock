@@ -365,6 +365,7 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
+ "dirs 7.0.0",
  "market_participants_model",
  "serde",
  "serde_json",
@@ -378,7 +379,6 @@ name = "app_config_provider"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "dirs 7.0.0",
  "gpui-kit",
  "log",
  "market_participants_model",

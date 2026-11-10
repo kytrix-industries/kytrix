@@ -569,7 +569,7 @@ mod tests {
 
     use super::{ContentRange, Validator, content_range, download, redirect_target};
     use crate::{
-        error::{DownloadError, RangeFailure, RedirectFailure},
+        error::{DownloadError, DownloadFailure, RangeFailure, RedirectFailure},
         progress::{Progress, Snapshot},
         request::DownloadRequest,
     };
@@ -1105,6 +1105,101 @@ mod tests {
             (payload.len() as u64, Some(payload.len() as u64), true),
             "the whole file is what the transfer leaves in its progress",
         );
+    }
+
+    /// A destination whose directories do not exist yet is written into a tree created for it:
+    /// the default model directory of a fresh installation is not there before the first
+    /// download.
+    #[tokio::test]
+    async fn a_download_should_create_the_directories_its_destination_names() {
+        let payload = payload(32 * 1024);
+        let server = Arc::new(Server::new(payload.clone()));
+        let address = spawn(Arc::clone(&server)).await;
+        let directory = TempDir::new().expect("a temporary directory is available");
+        let destination = directory
+            .path()
+            .join("models")
+            .join("nested")
+            .join("model.bin");
+        let hub = transport();
+        let config = Config::default();
+        let runtime = Runtime::for_test();
+        let progress = Progress::default();
+        let request = request(
+            address,
+            "/payload",
+            &destination,
+            Some(payload.len() as u64),
+        );
+
+        let written = download(
+            &hub,
+            &config,
+            &runtime,
+            &request,
+            true,
+            validator(),
+            &CancellationToken::new(),
+            &progress,
+        )
+        .await
+        .expect("a download creates the directories its destination names");
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(file_content(&destination).await, payload.to_vec());
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "the download asks for the payload once the directory exists"
+        );
+    }
+
+    /// A directory that cannot be created is a failed download, and no request is made for a
+    /// file that has nowhere to go.
+    #[tokio::test]
+    async fn a_destination_directory_that_cannot_be_created_should_fail_before_the_request() {
+        let payload = payload(1024);
+        let server = Arc::new(Server::new(payload.clone()));
+        let address = spawn(Arc::clone(&server)).await;
+        let directory = TempDir::new().expect("a temporary directory is available");
+        let blocker = directory.path().join("blocked");
+        tokio::fs::write(&blocker, b"a file where a directory is needed")
+            .await
+            .expect("the blocking file is written");
+        let destination = blocker.join("model.bin");
+        let hub = transport();
+        let config = Config::default();
+        let runtime = Runtime::for_test();
+        let progress = Progress::default();
+        let request = request(
+            address,
+            "/payload",
+            &destination,
+            Some(payload.len() as u64),
+        );
+
+        let error = download(
+            &hub,
+            &config,
+            &runtime,
+            &request,
+            true,
+            validator(),
+            &CancellationToken::new(),
+            &progress,
+        )
+        .await
+        .expect_err("a destination under a file cannot be written");
+
+        assert!(
+            matches!(error.failure(), DownloadFailure::Io { .. }),
+            "a directory that cannot be created is a file-system failure: {error:?}"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "the transfer must not ask for a file it has nowhere to put"
+        );
+        assert!(!progress.snapshot().opened(), "no partial file was opened");
     }
 
     #[tokio::test]

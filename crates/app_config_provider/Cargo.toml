@@ -9,7 +9,6 @@ edition.workspace = true
 test-support = []
 
 [dependencies]
-dirs.workspace = true
 gpui-kit.workspace = true
 log.workspace = true
 parking_lot.workspace = true

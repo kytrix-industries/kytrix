@@ -183,9 +183,6 @@ pub(crate) struct TranslationDownloads {
     sites: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
     /// The downloads a retry asked to start once the files of another site are gone.
     pending_restarts: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
-    /// The directory of the most recent completed download, which a page that is opened without
-    /// a directory adopts.
-    last_download_directory: Option<PathBuf>,
     /// Models a test treats as downloaded without creating a multi-gigabyte file.
     #[cfg(test)]
     forced_downloaded: ahash::AHashSet<(TranslationModel, PathBuf)>,
@@ -211,19 +208,12 @@ impl TranslationDownloads {
             tasks: AHashMap::with_capacity(capacity),
             sites: AHashMap::with_capacity(capacity),
             pending_restarts: AHashMap::with_capacity(capacity),
-            last_download_directory: None,
             #[cfg(test)]
             forced_downloaded: ahash::AHashSet::with_capacity(capacity),
             #[cfg(test)]
             transfers_deferred: false,
             _provider_events: provider_events,
         }
-    }
-
-    /// The directory of the most recent completed download, whether or not the page that started
-    /// it is still open.
-    pub(crate) fn last_download_directory(&self) -> Option<&Path> {
-        self.last_download_directory.as_deref()
     }
 
     /// What one row of `model` in `directory` last did.
@@ -252,6 +242,20 @@ impl TranslationDownloads {
         TranslationModel::ALL
             .into_iter()
             .filter(|model| self.is_downloaded(*model, directory))
+            .collect()
+    }
+
+    /// Whether `model` is one `directory` can load: its file is there at the published size and
+    /// it is not being removed.
+    pub(crate) fn is_available(&self, model: TranslationModel, directory: &Path) -> bool {
+        !self.row_state(model, directory).is_removing() && self.is_downloaded(model, directory)
+    }
+
+    /// The models `directory` can load, in page order.
+    pub(crate) fn available_models(&self, directory: &Path) -> Vec<TranslationModel> {
+        self.downloaded_models(directory)
+            .into_iter()
+            .filter(|model| self.is_available(*model, directory))
             .collect()
     }
 
@@ -574,7 +578,6 @@ impl TranslationDownloads {
         self.states.remove(&key);
         self.tasks.remove(&key);
         self.sites.remove(&key);
-        self.last_download_directory = Some(directory.clone());
 
         let auto_select = cx.try_global::<ConfigManager>().is_some_and(|manager| {
             let config = manager.read();
@@ -852,12 +855,6 @@ impl TranslationDownloads {
     ) {
         self.forced_downloaded.insert((model, directory));
         cx.notify();
-    }
-
-    /// Records the directory of a download without starting one.
-    #[cfg(test)]
-    pub(crate) fn set_last_download_directory_for_test(&mut self, directory: PathBuf) {
-        self.last_download_directory = Some(directory);
     }
 
     /// Puts one row into a state a test draws without a network.
@@ -1539,9 +1536,9 @@ mod tests {
         );
     }
 
-    /// A failed download does not become the directory a later page opens on.
+    /// A failed download is reported on its row.
     #[gpui_kit::test]
-    fn a_failed_download_should_not_record_its_directory(cx: &mut TestAppContext) {
+    fn a_failed_download_should_be_reported_on_its_row(cx: &mut TestAppContext) {
         let harness = harness(cx);
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
@@ -1569,43 +1566,10 @@ mod tests {
         });
 
         assert_eq!(
-            cx.update(|cx| harness
-                .downloads
-                .read(cx)
-                .last_download_directory()
-                .map(Path::to_path_buf)),
-            None,
-            "a failed download must not become the directory the page opens on"
-        );
-        assert_eq!(
             state(cx, &harness.downloads, model, directory.path()),
             DownloadState::DownloadFailed {
                 failure: DownloadFailure::Cancelled,
             }
-        );
-    }
-
-    /// A completed download records its directory, whether or not the page that started it is
-    /// still open.
-    #[gpui_kit::test]
-    fn a_completed_download_should_record_its_directory(cx: &mut TestAppContext) {
-        let harness = harness(cx);
-        let directory = TempDir::new().expect("the test directory builds");
-        let model = TranslationModel::HyMt27BQ8;
-
-        cx.update(|cx| {
-            harness.downloads.update(cx, |downloads, cx| {
-                downloads.complete_download_for_test(model, directory.path().to_path_buf(), cx);
-            });
-        });
-
-        assert_eq!(
-            cx.update(|cx| harness
-                .downloads
-                .read(cx)
-                .last_download_directory()
-                .map(Path::to_path_buf)),
-            Some(directory.path().to_path_buf())
         );
     }
 
@@ -1806,15 +1770,6 @@ mod tests {
                 .join(format!("{}.part", model.file_name()))
                 .exists(),
             "a completed download leaves no partial file"
-        );
-        assert_eq!(
-            cx.update(|cx| harness
-                .downloads
-                .read(cx)
-                .last_download_directory()
-                .map(Path::to_path_buf)),
-            Some(directory.path().to_path_buf()),
-            "a finished download records the directory it went to"
         );
         assert_eq!(
             cx.update(|cx| cx

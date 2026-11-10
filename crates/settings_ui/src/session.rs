@@ -10,7 +10,7 @@
 //! they were. The reason is kept here for the page to report, and what the user typed is what they
 //! can try again with.
 
-use std::{error::Error, fmt, path::PathBuf, sync::Arc};
+use std::{error::Error, fmt, path::PathBuf, rc::Rc, sync::Arc};
 
 use app_config::{
     network::ProxyConfig,
@@ -20,8 +20,6 @@ use app_config::{
 use app_config_provider::{manager::ConfigManager, store::ConfigPersistenceError};
 use gpui_kit::{App, BorrowAppContext as _, Context};
 use smol_str::SmolStr;
-
-use crate::{access::FieldValue, catalog::FieldAccess};
 
 /// Why a change could not be stored.
 ///
@@ -52,13 +50,27 @@ impl Error for SettingsWriteError {
     }
 }
 
+/// One change a native setting makes to the configuration.
+///
+/// The change is a closure rather than a variant of its own: a setting page writes the same typed
+/// values it reads, and the closure carries whatever identity it needs — a venue, a market, a
+/// credential name — without the session having to know the shape of every page.
+pub(crate) struct ConfigEdit(Rc<dyn Fn(&mut Config)>);
+
+impl ConfigEdit {
+    pub(crate) fn new(apply: impl Fn(&mut Config) + 'static) -> Self {
+        Self(Rc::new(apply))
+    }
+
+    fn apply(&self, config: &mut Config) {
+        (self.0)(config);
+    }
+}
+
 /// One change made to the settings, applied to the snapshot it is written on.
 pub(crate) enum SettingsChange {
-    /// One field of the catalog, written the way its own access writes it.
-    Field {
-        access: FieldAccess,
-        value: FieldValue,
-    },
+    /// One native setting, written the way its page writes it.
+    Edit(ConfigEdit),
     /// The directory the local translation model is loaded from.
     TranslationModelDirectory { directory: PathBuf },
     /// The model the local translation is loaded from, or none when no model is chosen.
@@ -78,10 +90,15 @@ pub(crate) enum SettingsChange {
 }
 
 impl SettingsChange {
+    /// One native setting's change.
+    pub(crate) fn edit(apply: impl Fn(&mut Config) + 'static) -> Self {
+        Self::Edit(ConfigEdit::new(apply))
+    }
+
     /// Makes this change in `config`.
     pub(crate) fn apply(&self, config: &mut Config) {
         match self {
-            Self::Field { access, value } => access.write(config, value),
+            Self::Edit(edit) => edit.apply(config),
             Self::TranslationModelDirectory { directory } => {
                 config.translation.model_directory = Some(directory.clone());
             }
@@ -206,11 +223,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{SettingsChange, SettingsSession};
-    use crate::{
-        access::FieldValue,
-        catalog::{FieldAccess, catalog},
-        schema,
-    };
 
     fn test_temp(name: &str) -> TempDir {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -236,19 +248,6 @@ mod tests {
 
     fn config_now(cx: &TestAppContext) -> Arc<Config> {
         cx.read(|cx| cx.global::<ConfigManager>().read())
-    }
-
-    fn access(page: &str, field: &str) -> FieldAccess {
-        catalog(&schema::tests::venues())
-            .page(page)
-            .unwrap_or_else(|| panic!("{page} should be in the catalog"))
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .find(|definition| definition.id == field)
-            .unwrap_or_else(|| panic!("{page} should offer {field}"))
-            .access
-            .clone()
     }
 
     fn proxy(port: u16) -> ProxyConfig {
@@ -280,10 +279,7 @@ mod tests {
 
         write(
             &session,
-            SettingsChange::Field {
-                access: access("appearance", "language"),
-                value: FieldValue::new_static("en"),
-            },
+            SettingsChange::edit(|config| config.language = Language::En),
             cx,
         )
         .expect("an in-memory manager stores every settings change");
@@ -318,10 +314,9 @@ mod tests {
 
         write(
             &session,
-            SettingsChange::Field {
-                access: access("appearance", "appearance"),
-                value: FieldValue::new_static("Dark"),
-            },
+            SettingsChange::edit(|config| {
+                config.appearance = app_config::settings::Appearance::Dark;
+            }),
             cx,
         )
         .expect("an in-memory manager stores every settings change");
@@ -528,10 +523,9 @@ mod tests {
         let error = session
             .update(cx, |session, cx| {
                 session.write(
-                    SettingsChange::Field {
-                        access: access("appearance", "appearance"),
-                        value: FieldValue::new_static("Dark"),
-                    },
+                    SettingsChange::edit(|config| {
+                        config.appearance = app_config::settings::Appearance::Dark;
+                    }),
                     cx,
                 )
             })
@@ -573,15 +567,11 @@ mod tests {
     fn an_unchanged_change_should_be_accepted_without_a_report(cx: &mut TestAppContext) {
         let session = session_over(Config::default(), cx);
         let before = config_now(cx);
-        let language = access("appearance", "language");
-        let current = language.current(before.as_ref());
+        let language = before.language;
 
         write(
             &session,
-            SettingsChange::Field {
-                access: language,
-                value: current,
-            },
+            SettingsChange::edit(move |config| config.language = language),
             cx,
         )
         .expect("a change that stores nothing is accepted");
@@ -615,10 +605,9 @@ mod tests {
 
         write(
             &session,
-            SettingsChange::Field {
-                access: access("market_participants.okx", "market_participants.okx.api_key"),
-                value: FieldValue::new_static("typed-key"),
-            },
+            SettingsChange::edit(|config| {
+                config.set_venue_credential(&VenueId::Okx, "api_key", "typed-key");
+            }),
             cx,
         )
         .expect("a value the settings cannot hold is not a failure");

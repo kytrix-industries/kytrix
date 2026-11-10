@@ -43,10 +43,7 @@ use gpui_kit::{
 use i18n::t;
 use smol_str::SmolStr;
 
-use crate::{
-    access::{FieldValue, ProxyDraft},
-    session::{SettingsChange, SettingsSession},
-};
+use crate::session::{SettingsChange, SettingsSession};
 
 /// How wide the form is.
 const WIDTH: f32 = 480.0;
@@ -93,6 +90,56 @@ impl ProxyFormKind {
         match self {
             Self::Add => "SETTINGS_PROXY_ADD",
             Self::Edit { .. } => "SETTINGS_PROXY_EDIT",
+        }
+    }
+}
+
+/// One catalog entry as an add or edit form holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProxyDraft {
+    pub name: SmolStr,
+    pub addr: SmolStr,
+    pub port: SmolStr,
+    pub username: SmolStr,
+    pub password: SmolStr,
+    pub authenticated: bool,
+    pub resolve_dns_at_remote: bool,
+}
+
+impl ProxyDraft {
+    /// The form that adds a new entry.
+    ///
+    /// What it starts from is what a user who touches nothing records, so a new entry resolves
+    /// names here: the mode that asks nothing of the proxy is the one to opt out of.
+    pub(crate) fn empty() -> Self {
+        Self {
+            name: SmolStr::default(),
+            addr: SmolStr::default(),
+            port: SmolStr::default(),
+            username: SmolStr::default(),
+            password: SmolStr::default(),
+            authenticated: false,
+            resolve_dns_at_remote: false,
+        }
+    }
+
+    /// The form that edits an existing entry, including the name it is stored under.
+    pub(crate) fn from_proxy(name: &SmolStr, proxy: &ProxyConfig) -> Self {
+        let (username, password, authenticated) = match &proxy.authorization {
+            ProxyAuthorizationConfig::None => (SmolStr::default(), SmolStr::default(), false),
+            ProxyAuthorizationConfig::UsernameAndPassword { username, password } => {
+                (username.clone(), password.clone(), true)
+            }
+        };
+
+        Self {
+            name: name.clone(),
+            addr: proxy.addr.clone(),
+            port: SmolStr::new(proxy.port.to_string()),
+            username,
+            password,
+            authenticated,
+            resolve_dns_at_remote: proxy.resolve_dns_at_remote,
         }
     }
 }
@@ -549,12 +596,7 @@ impl Field {
 /// — the box it is drawn in and the animation of its border — from being the control of another:
 /// the whole form shares one element-id prefix, so the name of the field is what tells them
 /// apart.
-fn input(
-    field: Field,
-    value: &FieldValue,
-    window: &mut Window,
-    cx: &mut App,
-) -> Entity<InputState> {
+fn input(field: Field, value: &SmolStr, window: &mut Window, cx: &mut App) -> Entity<InputState> {
     cx.new(|cx| {
         InputStateBuilder::new(ElementId::NamedChild(
             Arc::new(ElementId::Name(SharedString::new_static(
@@ -769,7 +811,35 @@ fn choice_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsMode, dns_mode_id, dns_mode_of};
+    use app_config::network::{ProxyAuthorizationConfig, ProxyConfig};
+    use smol_str::SmolStr;
+
+    use super::{DnsMode, ProxyDraft, dns_mode_id, dns_mode_of};
+
+    /// A draft is the form's copy of one entry: the name it is stored under and the values the
+    /// form edits, so confirming it can write the entry the user saw.
+    #[test]
+    fn a_draft_should_hold_the_entry_the_form_edits() {
+        let proxy = ProxyConfig {
+            addr: "127.0.0.1".into(),
+            port: 1080,
+            authorization: ProxyAuthorizationConfig::UsernameAndPassword {
+                username: "user".into(),
+                password: "secret".into(),
+            },
+            resolve_dns_at_remote: false,
+        };
+
+        let draft = ProxyDraft::from_proxy(&SmolStr::new_static("hk"), &proxy);
+
+        assert_eq!(draft.name, "hk");
+        assert_eq!(draft.addr, "127.0.0.1");
+        assert_eq!(draft.port, "1080");
+        assert_eq!(draft.username, "user");
+        assert_eq!(draft.password, "secret");
+        assert!(draft.authenticated);
+        assert!(!draft.resolve_dns_at_remote);
+    }
 
     /// A mode is one reading of the flag an entry stores, and the choice a form reports is one of
     /// the choices it offered: a mode and its stored flag that disagreed would record the opposite

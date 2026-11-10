@@ -13,6 +13,7 @@ test-support = []
 
 [dependencies]
 ahash.workspace = true
+dirs.workspace = true
 market_participants_model.workspace = true
 serde.workspace = true
 serde_json.workspace = true

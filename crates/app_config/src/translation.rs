@@ -176,10 +176,15 @@ impl TranslationModel {
 }
 
 /// Where the local translation model is stored and which model it is.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslationConfig {
-    /// The directory holding the GGUF model files, or `None` until the user chooses one.
-    #[serde(default)]
+    /// The directory holding the GGUF model files.
+    ///
+    /// It defaults to the `models` directory beside the settings file: the models are large,
+    /// user-provided files, and a first start has nowhere else to put them. A platform that
+    /// names no config directory has no default to name, and the value stays `None` until the
+    /// user picks one.
+    #[serde(default = "crate::paths::default_model_directory")]
     pub model_directory: Option<PathBuf>,
     /// The selected model, or `None` until the user chooses one.
     #[serde(default)]
@@ -187,6 +192,16 @@ pub struct TranslationConfig {
     /// The site the models are downloaded from.
     #[serde(default)]
     pub download_site: DownloadSite,
+}
+
+impl Default for TranslationConfig {
+    fn default() -> Self {
+        Self {
+            model_directory: crate::paths::default_model_directory(),
+            selected_model: None,
+            download_site: DownloadSite::default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,15 +289,32 @@ mod tests {
     ];
 
     #[test]
-    fn a_default_config_names_no_model_directory_or_selected_model() {
+    fn a_default_config_stores_models_beside_the_settings_file() {
         let config = TranslationConfig::default();
 
-        assert_eq!(config.model_directory, None);
+        assert_eq!(
+            config.model_directory,
+            crate::paths::default_model_directory(),
+            "a fresh installation stores models in the models directory beside its settings file"
+        );
         assert_eq!(config.selected_model, None);
         assert_eq!(
             config.download_site,
             DownloadSite::HuggingFace,
             "a fresh installation downloads from HuggingFace"
+        );
+    }
+
+    /// A translation section written without a directory names the default one, so a file that
+    /// predates the directory being stored still has a place to download to.
+    #[test]
+    fn a_translation_section_without_a_directory_should_name_the_default_one() {
+        let config: TranslationConfig =
+            serde_json::from_value(json!({})).expect("the settings should decode");
+
+        assert_eq!(
+            config.model_directory,
+            crate::paths::default_model_directory()
         );
     }
 

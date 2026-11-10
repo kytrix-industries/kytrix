@@ -115,8 +115,8 @@ pub struct Config {
     /// what a first start looks like.
     #[serde(default)]
     pub workspaces: WorkspacesConfig,
-    /// Where the local translation model is stored. A file without this section has no
-    /// directory, which is what a first start looks like.
+    /// Where the local translation model is stored. A file without this section names the
+    /// models directory beside the settings file, which is what a first start looks like.
     #[serde(default)]
     pub translation: TranslationConfig,
     #[serde(skip)]
@@ -1245,9 +1245,9 @@ mod tests {
     }
 
     /// A file written before the translation settings existed has no section for them, which
-    /// is the same state as a fresh installation: no model directory is configured.
+    /// is the same state as a fresh installation: models are stored beside the settings file.
     #[test]
-    fn a_file_without_translation_settings_should_decode_as_unconfigured() {
+    fn a_file_without_translation_settings_should_name_the_default_directory() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
         json.as_object_mut()
             .expect("config serializes as an object")
@@ -1255,7 +1255,10 @@ mod tests {
 
         let decoded: Config = serde_json::from_value(json).expect("the file should decode");
 
-        assert_eq!(decoded.translation.model_directory, None);
+        assert_eq!(
+            decoded.translation.model_directory,
+            crate::paths::default_model_directory()
+        );
         assert_eq!(
             decoded.translation.download_site,
             crate::translation::DownloadSite::HuggingFace,

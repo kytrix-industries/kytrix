@@ -2,25 +2,25 @@
 
 use app_config::settings::Config;
 use gpui_kit::{Modifiers, SharedString, TestAppContext, px};
+use market_participants_connector::venue::definition::supported_venues;
 
 use super::test_support::*;
-use crate::{search::SearchFilter, settings::default_page};
+use crate::{pages::registry, search::SearchFilter};
 
 #[gpui_kit::test]
 fn the_page_should_open_on_the_default_page(cx: &mut TestAppContext) {
     let (dialog, cx) = settings(Config::default(), cx);
 
     dialog.read_with(cx, |dialog, _| {
-        assert_eq!(dialog.current_page, default_page());
-        assert_eq!(dialog.query, gpui_kit::SharedString::default());
-        assert!(dialog.filter.is_all());
+        assert_eq!(dialog.current_page_for_test(), registry::DEFAULT_PAGE);
+        assert_eq!(dialog.query_for_test(), &gpui_kit::SharedString::default());
+        assert!(dialog.filter_for_test().is_all());
         // The row of the page the dialog shows is a row of the sidebar, so the two columns
         // say the same thing from the first frame.
         assert!(
-            dialog
-                .sidebar
-                .iter()
-                .any(|entry| entry.page_id().is_some_and(|id| id == default_page())),
+            dialog.sidebar_for_test().iter().any(|entry| entry
+                .page_id()
+                .is_some_and(|id| id == registry::DEFAULT_PAGE)),
             "the sidebar should list the page the dialog opens on"
         );
     });
@@ -120,7 +120,7 @@ fn selecting_a_page_should_show_it_and_reset_its_scroll(cx: &mut TestAppContext)
     select(&dialog, "market_participants.okx", cx);
 
     dialog.read_with(cx, |dialog, _| {
-        assert_eq!(dialog.current_page, "market_participants.okx");
+        assert_eq!(dialog.current_page_for_test(), "market_participants.okx");
     });
 }
 
@@ -180,7 +180,7 @@ fn the_ai_group_should_open_the_translation_page(cx: &mut TestAppContext) {
         [
             SharedString::new_static("General"),
             SharedString::new_static("Appearance"),
-            SharedString::new_static("Data time zone"),
+            SharedString::new_static("Data formatting"),
             SharedString::new_static("AI"),
             SharedString::new_static("Translation"),
             SharedString::new_static("Proxies"),
@@ -202,9 +202,9 @@ fn the_ai_group_should_open_the_translation_page(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn every_page_should_be_drawable(cx: &mut TestAppContext) {
     let (dialog, cx) = settings(configured_settings(), cx);
-    let pages = pages()
-        .iter()
-        .map(|page| page.id.clone())
+    let pages = registry::pages()
+        .into_iter()
+        .map(|page| page.id())
         .collect::<Vec<_>>();
 
     for page in pages {
@@ -212,39 +212,176 @@ fn every_page_should_be_drawable(cx: &mut TestAppContext) {
 
         dialog.read_with(cx, |dialog, _| {
             assert_eq!(
-                dialog.current_page, page,
+                dialog.current_page_for_test().as_ref(),
+                page.as_ref(),
                 "selecting {page} should draw it rather than another"
             );
         });
     }
 }
 
-/// Every page the catalog declares is reachable from the sidebar, and every row leads to
-/// one: a page nobody can select is a page that does not exist, and a row that opens
-/// nothing is a dead end.
-#[test]
-fn the_sidebar_and_the_pages_should_name_each_other() {
-    let catalog = test_catalog();
-    let mut reachable = catalog.tree.iter().flat_map(leaves).collect::<Vec<_>>();
-    reachable.sort_unstable();
+/// A setting is one row: its name and explanation on the left, its control on the right, and the
+/// row belongs to the card its group is drawn as.
+#[gpui_kit::test]
+fn a_setting_should_be_a_row_with_its_control_at_the_card_edge(cx: &mut TestAppContext) {
+    let (_, cx) = settings(Config::default(), cx);
 
-    let mut declared = catalog
-        .pages
-        .iter()
-        .map(|page| page.id.clone())
-        .collect::<Vec<_>>();
-    declared.sort_unstable();
+    let card = cx
+        .debug_bounds("SETTINGS_CARD_appearance_0")
+        .expect("the appearance group should be drawn as a card");
+    let row = cx
+        .debug_bounds("SETTINGS_FIELD_appearance")
+        .expect("the appearance row should be drawn");
+    let label = cx
+        .debug_bounds("SETTINGS_LABEL_appearance")
+        .expect("the row should draw its name");
+    let description = cx
+        .debug_bounds("SETTINGS_DESCRIPTION_appearance")
+        .expect("the row should draw its explanation");
+    let control = cx
+        .debug_bounds("SETTINGS_CONTROL_appearance")
+        .expect("the row should draw its control");
 
-    assert_eq!(reachable, declared);
-    assert!(SearchFilter::new("", &[]).is_all());
+    assert!(card.contains(&row.center()), "the row belongs to the card");
+    assert!(
+        label.left() < control.left(),
+        "the control is drawn beside the name rather than under it: name {label:?}, \
+         control {control:?}"
+    );
+    assert!(
+        description.top() >= label.bottom(),
+        "the explanation is under the name: name {label:?}, explanation {description:?}"
+    );
+    assert!(
+        description.left() < control.left(),
+        "the explanation belongs to the side the name is on: explanation {description:?}, \
+         control {control:?}"
+    );
+    assert!(
+        (control.right() - (card.right() - px(20.0))).abs() < px(1.0),
+        "the control column ends at the card's padding: control {control:?}, card {card:?}"
+    );
 }
 
-/// The pages a tree entry leads to, which for a group are the pages of its children.
-fn leaves(node: &crate::catalog::TreeNodeDef) -> Vec<SharedString> {
-    match node {
-        crate::catalog::TreeNodeDef::Page(id) => vec![id.clone()],
-        crate::catalog::TreeNodeDef::Group { children, .. } => {
-            children.iter().flat_map(leaves).collect()
+/// The rows of one group share one card, and the card draws a line between them.
+#[gpui_kit::test]
+fn one_group_should_be_one_card_with_a_line_between_its_rows(cx: &mut TestAppContext) {
+    let (_, cx) = settings(Config::default(), cx);
+
+    let card = cx
+        .debug_bounds("SETTINGS_CARD_appearance_0")
+        .expect("the appearance group should be drawn as a card");
+    let first = cx
+        .debug_bounds("SETTINGS_FIELD_appearance")
+        .expect("the first row should be drawn");
+    let second = cx
+        .debug_bounds("SETTINGS_FIELD_language")
+        .expect("the second row should be drawn");
+    let divider = cx
+        .debug_bounds("SETTINGS_DIVIDER_appearance_0_1")
+        .expect("the card should separate its rows");
+
+    assert!(card.contains(&first.center()));
+    assert!(card.contains(&second.center()));
+    assert!(
+        first.bottom() <= divider.top() && divider.bottom() <= second.top(),
+        "the line belongs between the rows: first {first:?}, line {divider:?}, second {second:?}"
+    );
+    assert!(
+        (divider.left() - (first.left() + px(20.0))).abs() < px(1.0),
+        "the line should start where the row's padding ends: line {divider:?}, row {first:?}"
+    );
+    assert!(
+        (divider.right() - (first.right() - px(20.0))).abs() < px(1.0),
+        "the line should end where the row's padding starts: line {divider:?}, row {first:?}"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_DIVIDER_appearance_0_2").is_none(),
+        "a card draws no line below its last row"
+    );
+}
+
+/// A group whose heading repeats the only row it holds is drawn without that heading: the row
+/// already names the setting, and two titles for one setting is one too many.
+#[gpui_kit::test]
+fn a_heading_that_repeats_its_only_row_should_not_be_drawn(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+
+    select(&panel, "configure", cx);
+    assert!(
+        cx.debug_bounds("SETTINGS_SECTION_TITLE_configure_0")
+            .is_none(),
+        "the default line's heading repeats its row"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_SECTION_TITLE_configure_1")
+            .is_some(),
+        "the venue group is named over its rows"
+    );
+
+    select(&panel, "market_participants.okx", cx);
+    assert!(
+        cx.debug_bounds("SETTINGS_SECTION_TITLE_market_participants.okx_0")
+            .is_none(),
+        "the region's heading repeats its row"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_SECTION_TITLE_market_participants.okx_1")
+            .is_some(),
+        "the credentials group is named"
+    );
+}
+
+/// The lines of the venues share one card: a card per venue would be five cards under the same
+/// heading, and the heading already says what the rows have in common.
+#[gpui_kit::test]
+fn the_venue_group_should_be_one_card_for_every_venue(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+    select(&panel, "configure", cx);
+
+    let card = cx
+        .debug_bounds("SETTINGS_CARD_configure_1")
+        .expect("the venue group should be drawn as one card");
+    let venues = supported_venues();
+    for (index, venue) in venues.iter().enumerate() {
+        let selector =
+            Box::leak(format!("SETTINGS_FIELD_configure.{}", venue.as_str()).into_boxed_str());
+        let row = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("the venue card should draw {selector}"));
+        assert!(
+            card.contains(&row.center()),
+            "the row for {} belongs to the venue card",
+            venue.as_str()
+        );
+        if index > 0 {
+            let divider = format!("SETTINGS_DIVIDER_configure_1_{index}");
+            assert!(
+                cx.debug_bounds(Box::leak(divider.into_boxed_str()))
+                    .is_some(),
+                "the venue card should separate row {index} from the row above it"
+            );
         }
     }
+}
+
+/// Every page the registry offers is drawn as a sidebar row, and every row leads to one: a page
+/// nobody can select is a page that does not exist, and a row that opens nothing is a dead end.
+#[gpui_kit::test]
+fn the_sidebar_and_the_pages_should_name_each_other(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+    let drawn = panel.read_with(cx, |panel, _| {
+        panel
+            .sidebar_for_test()
+            .iter()
+            .filter_map(|entry| entry.page_id().cloned())
+            .collect::<Vec<_>>()
+    });
+    let declared = registry::pages()
+        .into_iter()
+        .map(|page| page.id())
+        .collect::<Vec<_>>();
+
+    assert_eq!(drawn, declared);
+    assert!(SearchFilter::new("", &[]).is_all());
 }

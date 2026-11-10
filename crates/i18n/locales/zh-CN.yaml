@@ -1198,7 +1198,6 @@ settings_ui:
   about:
     title: 关于
     version: 版本
-    version_description: 当前安装的应用程序版本
   ai:
     browse: 浏览
     delete: 删除
@@ -1224,11 +1223,14 @@ settings_ui:
     download_failed_transport: 下载因网络问题失败
     download_failed_url: 模型地址无效
     download_site: 模型下载站点
+    download_site_description: 下载模型文件时使用的站点
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope（魔搭社区）
     downloading_progress: 下载中 %{speed} %{percent}%
     model_directory: 模型存放目录
-    model_in_use: 使用模型
+    model_directory_description: 翻译模型下载与加载所在的文件夹
+    model_in_use: 使用的模型
+    model_in_use_description: 本地翻译使用的已下载模型
     model_name: 模型名
     models: 当前支持的模型
     no_downloaded_models: 暂无已下载模型
@@ -1249,16 +1251,20 @@ settings_ui:
   appearance:
     dark: 深色
     language: 语言
-    language_description: 选择应用显示语言
+    language_description: 选择显示的语言
     language_en: English
     language_zh_cn: 简体中文
     light: 浅色
-    mode: 外观模式
-    mode_description: 选择应用的浅色、深色或跟随系统外观
+    mode: 模式
+    mode_description: 选择外观模式
     system: 跟随系统
     title: 外观
+  data_format:
+    description: 选择各个部件显示数据时间时使用的时区，所有数据时间都会按该时区换算
+    time_zone: 时区
+    title: 数据格式化
   general:
-    title: 通用设置
+    title: 常规
   market_participants:
     access_token: Access Token
     access_token_description: 为该应用签发的 Access Token，场所用它认证一条会话
@@ -1269,6 +1275,8 @@ settings_ui:
     app_key_description: OpenAPI 应用的 App Key
     app_secret: App Secret
     app_secret_description: 用于签发 Access Token 的 App Secret
+    binance_spot: 现货
+    binance_usd_m_perp: U本位合约
     ed25519_passphrase: Ed25519 Passphrase
     ed25519_private_key: Ed25519 Private Key
     enter_access_token: 请输入 Access Token
@@ -1278,19 +1286,17 @@ settings_ui:
     enter_passphrase: 请输入 Passphrase
     enter_private_key: 请输入 Private Key
     enter_secret_key: 请输入 Secret Key
-    clob_origin: CLOB 地址
-    clob_origin_description: 读取 Polymarket 价格与概率历史的地址
-    gamma_origin: 事件目录地址
-    gamma_origin_description: 读取 Polymarket 事件的地址
-    http_origin: HTTP 地址
-    hyperliquid_http_origin_description: HyperCore 请求发送的地址，该场所只发布一个
-    hyperliquid_websocket_origin_description: HyperCore 建立订阅的地址，该场所只发布一个
+    clob_api_endpoint: CLOB API 接入点
+    clob_api_endpoint_description: CLOB API 使用的接入点
+    credentials: 凭据
+    gamma_api_endpoint: Gamma API 接入点
+    gamma_api_endpoint_description: Gamma API 使用的接入点
+    http_api_endpoint: HTTP API 接入点
+    http_api_endpoint_description: HTTP API 使用的接入点
     main_account_address: 主账户地址
     main_account_description: API Agent 有权操作的主账户
-    origins: 来源地址
     passphrase: Passphrase
     passphrase_description: 创建该 API Key 时设置的 Passphrase
-    polymarket_websocket_description: Polymarket CLOB 发布订阅的地址
     private_key_description: 该场所请求签名使用的私钥
     secret_key: Secret Key
     secret_key_description: 该场所请求认证使用的 Secret Key
@@ -1301,42 +1307,50 @@ settings_ui:
     service_region_global: 国际（Global）
     service_region_us_au: 美国与澳大利亚（US&AU）
     title: 市场参与者
-    websocket_origin: WebSocket 地址
+    websocket_api_endpoint: WebSocket API 接入点
+    websocket_api_endpoint_description: WebSocket API 使用的接入点
   no_matches: 没有匹配的设置项
   proxies:
     add: 新增代理
     address: 地址
     ai_model_downloads: AI 模型下载
+    ai_model_downloads_description: 获取与下载 AI 模型数据时的代理设置
     app_updates: 应用更新
-    applications: 代理应用
+    app_updates_description: 获取与下载 Kytrix 应用更新数据时的代理设置
     authorization: 认证方式
-    default_line: 默认线路
-    default_line_description: 未单独覆盖的网络目标都走这条线路
+    binance_description: 所有币安 API 进行网络活动时的代理设置
+    configure: 配置
+    default_proxy: 默认代理
     delete: 删除代理
-    delete_message: <p align="center">确定删除代理「%{name}」吗？指定该线路的网络目标会回到默认线路。</p>
+    delete_message: <p align="center">确定删除代理「%{name}」吗？指定为该代理的网络目标会回到默认代理。</p>
     delete_title: 删除代理
     dns_mode: DNS 模式
     dns_mode_local: 本地解析
     dns_mode_proxy: 代理解析
     edit: 编辑代理
     empty: 暂无代理
-    group_description: 将该组全部网络目标设为同一线路
-    inherit: 跟随默认线路
+    hyperliquid_description: 所有 Hyperliquid API 进行网络活动时的代理设置
+    inherit: 跟随默认代理
     invalid_address: 请输入主机名或 IP 地址
     invalid_port: 端口必须是 1 到 65535 之间的整数
     kytrix_cloud: 账户与云服务
+    kytrix_cloud_description: 有关 Kytrix 账户与云服务的 API 进行网络活动时的代理设置
     kytrix_section: Kytrix
-    management: 代理管理
-    mixed: 多种线路
+    longbridge_description: 所有长桥 API 进行网络活动时的代理设置
+    market_participants_section: 市场参与者
+    mixed: 多种代理
     name: 名称
     name_exists: 代理名称已存在
     name_required: 请输入代理名称
     name_reserved: 该名称已被线路选项保留
     no_authorization: 无认证
     no_proxy: 不使用代理
+    okx_description: 所有欧易 API 进行网络活动时的代理设置
     password: 密码
     password_required: 请输入密码
+    polymarket_description: 所有 Polymarket API 进行网络活动时的代理设置
     port: 端口
+    server_management: 服务器管理
     socks5_address: Socks5 地址
     socks5_authorization: Socks5 认证方式
     socks5_port: Socks5 端口
@@ -1345,19 +1359,13 @@ settings_ui:
     username: 用户名
     username_password: 用户名和密码
     username_required: 请输入用户名
-    venue_description: 该场所的请求走这条线路，未指定时跟随默认线路
-    venue_section: 场所
-    x_media_group: 媒体
-    x_section: X（Twitter）
+    x_post_media: X 帖子媒体内容
+    x_post_media_description: 获取与下载 X 帖子媒体内容数据时的代理设置
   save_failed:
     message: <p align="center">设置未能写入磁盘：%{reason}</p>
     title: 设置保存失败
   search:
     placeholder: 搜索设置
-  subtitle: 更改会立即生效，文本字段在离开时保存。
-  time_zone:
-    description: 选择各个部件显示数据时间时使用的时区，所有数据时间都会按该时区换算
-    title: 数据时间时区
   title: 设置
 startup:
   config_reset_message: <p align="center">配置文件受损，已重新初始化为默认配置。原文件已备份为 %{file}。</p>
