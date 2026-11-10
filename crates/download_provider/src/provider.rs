@@ -2,10 +2,11 @@
 //! and the events that publish them.
 //!
 //! A task is one transfer, started on the application runtime and reported back
-//! to this entity by two interface tasks — one for progress, one for the outcome
-//! — which the entry holds for as long as the attempt lasts. Pausing cancels the
-//! attempt and settles at the partial file once it has stopped; deleting cancels
-//! it too, and only removes the files once both tasks have finished.
+//! to this entity by two interface tasks — one publishing the progress it writes
+//! once an interval, one for the outcome — which the entry holds for as long as
+//! the attempt lasts. Pausing cancels the attempt and settles at the partial file
+//! once it has stopped; deleting cancels it too, and only removes the files once
+//! both tasks have finished.
 
 use std::{
     io,
@@ -19,7 +20,6 @@ use app_config::network::Config;
 use app_config_provider::notification::ConfigNotification;
 use gpui_kit::{BackgroundExecutor, Context, EventEmitter, Task};
 use network::transport::hub::TransportHub;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use widget_tokio_runtime::runtime::Runtime;
 
@@ -27,10 +27,13 @@ use crate::{
     error::{DownloadError, DownloadFailure},
     fetch::{self, Validator},
     global::DownloadProviderDeps,
+    progress::{Progress, Snapshot},
     request::DownloadRequest,
     task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
 };
 
+/// How often a transfer's progress is published.
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 /// How often a delete task checks whether the work it waits for has stopped.
 const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How long a delete waits for the cancelled attempt to settle.
@@ -48,12 +51,12 @@ struct Entry {
     validator: Arc<Mutex<Option<Validator>>>,
     /// Whether the next attempt still has to start from zero.
     ///
-    /// A task is fresh from the moment it is added until its transfer first
-    /// reports progress. That report is sent only after the attempt has opened
-    /// and truncated the partial file, so from then on the bytes on disk are
-    /// this task's own resume point. A pause before that report leaves the flag
-    /// set, and the next resume truncates again instead of continuing a partial
-    /// file this task never wrote.
+    /// A task is fresh from the moment it is added until one of its transfers has
+    /// opened the partial file. That is announced only after the attempt has
+    /// opened and truncated the file, so from then on the bytes on disk are this
+    /// task's own resume point. A pause before that opening leaves the flag set,
+    /// and the next resume truncates again instead of continuing a partial file
+    /// this task never wrote.
     fresh: bool,
     /// The transfer in flight, or the last one when nothing is running.
     ///
@@ -66,6 +69,8 @@ struct Entry {
 /// One started transfer: its cancellation boundary and the tasks that report it.
 struct Attempt {
     cancellation: CancellationToken,
+    /// What this transfer has written, as the publishing task reads it.
+    progress: Arc<Progress>,
     tasks: Vec<Task<()>>,
 }
 
@@ -109,10 +114,11 @@ impl DownloadProvider {
     /// task wrote cannot be stitched onto the download. The partial file is the
     /// resume point of this task's own pause and resume only.
     ///
-    /// The same holds for a resume before the first attempt has reported any
-    /// progress: the transfer reports only once it has opened the partial file,
-    /// so until then a resume starts from zero too, and pausing before the file
-    /// was ever opened cannot inherit bytes this task did not write.
+    /// The same holds for a resume before the first attempt has opened the partial
+    /// file: the transfer announces that opening only once it has created or
+    /// truncated the file, so until then a resume starts from zero too, and
+    /// pausing before the file was ever opened cannot inherit bytes this task did
+    /// not write.
     ///
     /// The destination is not validated here: a destination with no file name
     /// fails its first attempt with [`DownloadFailure::InvalidDestination`] rather
@@ -122,6 +128,7 @@ impl DownloadProvider {
         let status = DownloadStatus::Downloading {
             downloaded: 0,
             total: request.expected_size,
+            mb_per_second: 0.0,
         };
         self.entries.insert(
             id,
@@ -175,7 +182,9 @@ impl DownloadProvider {
             return false;
         };
         let (downloaded, total) = match &entry.status {
-            DownloadStatus::Downloading { downloaded, total } => (*downloaded, *total),
+            DownloadStatus::Downloading {
+                downloaded, total, ..
+            } => (*downloaded, *total),
             _ => return false,
         };
         if let Some(attempt) = &entry.attempt {
@@ -196,8 +205,8 @@ impl DownloadProvider {
     /// Accepted from `Paused` and from `Failed`: a failed transfer is retried the
     /// same way a paused one is continued, from the bytes the partial file holds.
     ///
-    /// A task that has not reported progress yet starts from zero even here: its
-    /// first attempt never got as far as opening the partial file, so a resume
+    /// A task that has not opened a partial file yet starts from zero even here:
+    /// no attempt of it ever got as far as opening the partial file, so a resume
     /// keeps the fresh transfer's guarantee rather than continuing a file this
     /// task did not write.
     pub fn resume(&mut self, id: DownloadId, cx: &mut Context<Self>) -> bool {
@@ -215,7 +224,11 @@ impl DownloadProvider {
         } else {
             part_length(&entry.request.destination)
         };
-        entry.status = DownloadStatus::Downloading { downloaded, total };
+        entry.status = DownloadStatus::Downloading {
+            downloaded,
+            total,
+            mb_per_second: 0.0,
+        };
         self.start_attempt(id, fresh, cx);
         self.publish(id, cx);
 
@@ -280,6 +293,14 @@ impl DownloadProvider {
         let Some(entry) = self.entries.get(&id) else {
             return;
         };
+        let DownloadStatus::Downloading {
+            downloaded: starting_from,
+            ..
+        } = &entry.status
+        else {
+            return;
+        };
+        let starting_from = *starting_from;
         let request = entry.request.clone();
         let validator = Arc::clone(&entry.validator);
         let transport = Arc::clone(&self.transport);
@@ -288,7 +309,10 @@ impl DownloadProvider {
         let resolving = runtime.clone();
         let cancellation = self.transport.cancellation().child_token();
         let download_cancellation = cancellation.clone();
-        let (progress_sender, mut progress) = mpsc::unbounded_channel();
+        let publishing_cancellation = cancellation.clone();
+        let progress = Arc::new(Progress::default());
+        let transfer_progress = Arc::clone(&progress);
+        let publishing_progress = Arc::clone(&progress);
 
         let downloading = runtime.run(async move {
             fetch::download(
@@ -299,20 +323,34 @@ impl DownloadProvider {
                 fresh,
                 validator,
                 &download_cancellation,
-                move |written, total| {
-                    // This runs on the task reading the response, so it only hands
-                    // the numbers over; the entity is updated on the interface
-                    // thread by the progress task below.
-                    let _ = progress_sender.send((written, total));
-                },
+                &transfer_progress,
             )
             .await
         });
-        let progress_task = cx.spawn(async move |provider, cx| {
-            while let Some((written, total)) = progress.recv().await {
-                let _ = provider.update(cx, |provider, cx| {
-                    provider.record_progress(id, written, total, cx)
-                });
+        let publishing = cx.spawn(async move |provider, cx| {
+            let clock = cx.background_executor().clone();
+            let mut sampled_at = clock.now();
+            let mut sampled = starting_from;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = publishing_cancellation.cancelled() => return,
+                    () = clock.timer(PUBLISH_INTERVAL) => {}
+                }
+                let snapshot = publishing_progress.snapshot();
+                let now = clock.now();
+                let interval = now.saturating_duration_since(sampled_at);
+                let rate = snapshot.megabytes_per_second_since(sampled, interval);
+                sampled_at = now;
+                sampled = snapshot.written();
+                let running = provider
+                    .update(cx, |provider, cx| {
+                        provider.publish_progress(id, snapshot, rate, cx)
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    return;
+                }
             }
         });
         let outcome_task = cx.spawn(async move |provider, cx| {
@@ -325,44 +363,46 @@ impl DownloadProvider {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.attempt = Some(Attempt {
                 cancellation,
-                tasks: vec![progress_task, outcome_task],
+                progress,
+                tasks: vec![publishing, outcome_task],
             });
         }
     }
 
-    /// Records the bytes a transfer has written; `total` is `None` while the
-    /// response has not named one.
-    fn record_progress(
+    /// Publishes what a transfer has written since the last interval and the rate
+    /// it wrote at; `false` once the task is no longer downloading, which is what
+    /// ends the task that publishes.
+    fn publish_progress(
         &mut self,
         id: DownloadId,
-        written: u64,
-        total: Option<u64>,
+        snapshot: Snapshot,
+        rate: f32,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
-            return;
+            return false;
         };
         let DownloadStatus::Downloading {
             downloaded,
-            total: known,
+            total,
+            mb_per_second,
         } = &mut entry.status
         else {
-            return;
+            return false;
         };
-        // A transfer reports only after it has opened the partial file, so this
-        // report is what makes the bytes on disk this task's own resume point.
-        // It is cleared before the numbers are compared: a first report that
-        // repeats the seeded zero is still proof that the file was opened.
-        entry.fresh = false;
         // A number below the last one is a server that answered `200` after a
         // range request, which restarts the file at zero; it is progress, not a
         // stale report.
-        if *downloaded == written && *known == total {
-            return;
+        *downloaded = snapshot.written();
+        // The caller's expected size is not news a response can take back: only a
+        // size the transfer named replaces it.
+        if let Some(named) = snapshot.total() {
+            *total = Some(named);
         }
-        *downloaded = written;
-        *known = total;
+        *mb_per_second = rate;
         self.publish(id, cx);
+
+        true
     }
 
     /// Applies what an attempt produced: the final size, a cancellation that the
@@ -381,6 +421,15 @@ impl DownloadProvider {
         if matches!(entry.status, DownloadStatus::Deleting) {
             return;
         }
+        // The transfer opened the partial file, so from here on the bytes on disk
+        // are this task's own resume point, whichever outcome it stopped with.
+        if entry
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.progress.snapshot().opened())
+        {
+            entry.fresh = false;
+        }
         entry.status = match result {
             Ok(total) => DownloadStatus::Completed {
                 downloaded: total,
@@ -388,10 +437,10 @@ impl DownloadProvider {
             },
             Err(error) => match &entry.status {
                 DownloadStatus::Pausing { total, .. } => DownloadStatus::Paused {
-                    // A task that never reported progress has not opened its
-                    // partial file yet; its resume truncates the file and starts
-                    // from zero, so the paused state announces that same starting
-                    // point instead of the length of a file this task never wrote.
+                    // A task that never opened its partial file has nothing to
+                    // resume; the next attempt truncates the file and starts from
+                    // zero, so the paused state announces that same starting point
+                    // instead of the length of a file this task never wrote.
                     downloaded: if entry.fresh {
                         0
                     } else {
@@ -554,14 +603,16 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::{net::TcpListener, time::Sleep};
+    use tokio_util::sync::CancellationToken;
     use url::Url;
     use uuid::Uuid;
     use widget_tokio_runtime::runtime::Runtime;
 
-    use super::{DownloadProvider, Entry};
+    use super::{Attempt, DownloadProvider, Entry, PUBLISH_INTERVAL};
     use crate::{
         error::{DownloadError, DownloadFailure},
         global::DownloadProviderDeps,
+        progress::Progress,
         request::DownloadRequest,
         task::{DownloadEvent, DownloadId, DownloadStatus},
     };
@@ -826,6 +877,34 @@ mod tests {
         Url::parse(&format!("http://{address}{path}")).expect("the request URL is a URL")
     }
 
+    /// Starts a server that accepts a connection and never answers it.
+    ///
+    /// A transfer to it stays in flight writing nothing, which is what a stalled
+    /// download looks like from the manager's side.
+    fn spawn_stalled_server() -> SocketAddr {
+        let runtime = Runtime::for_test();
+        let listener = runtime
+            .handle()
+            .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a loopback port is free");
+        let address = listener.local_addr().expect("the listener has an address");
+        drop(runtime.run(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    // Holding the connection open without writing to it is what
+                    // keeps the transfer waiting for headers that never arrive.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    drop(stream);
+                });
+            }
+        }));
+
+        address
+    }
+
     fn request(
         address: SocketAddr,
         path: &str,
@@ -887,6 +966,26 @@ mod tests {
             .lock()
             .expect("the event log is never poisoned")
             .clone()
+    }
+
+    /// The statuses the log holds for `id`, in the order they were published.
+    fn published(events: &Arc<Mutex<Vec<DownloadEvent>>>, id: DownloadId) -> Vec<DownloadStatus> {
+        recorded(events)
+            .into_iter()
+            .filter_map(|event| match event {
+                DownloadEvent::TaskUpdated(task) if task.id == id => Some(task.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An attempt whose transfer had recorded `progress` when it stopped.
+    fn attempt(progress: Progress) -> Attempt {
+        Attempt {
+            cancellation: CancellationToken::new(),
+            progress: Arc::new(progress),
+            tasks: Vec::new(),
+        }
     }
 
     fn status(
@@ -993,6 +1092,7 @@ mod tests {
             DownloadStatus::Downloading {
                 downloaded: 0,
                 total: expected,
+                mb_per_second: 0.0,
             },
         );
 
@@ -1098,7 +1198,9 @@ mod tests {
     fn pausing_a_download_should_keep_the_part_and_resuming_should_ask_for_it(
         cx: &mut TestAppContext,
     ) {
-        let payload = payload(192 * 1024);
+        // Big enough that the transfer is still running when the first interval
+        // publishes what it has written.
+        let payload = payload(512 * 1024);
         let server = Arc::new(Server::paced(payload.clone()));
         let address = spawn_server(Arc::clone(&server));
         let provider = provider(cx);
@@ -1249,7 +1351,9 @@ mod tests {
 
     #[gpui_kit::test]
     fn deleting_a_download_in_flight_should_cancel_it_and_remove_the_part(cx: &mut TestAppContext) {
-        let payload = payload(192 * 1024);
+        // Big enough that the transfer is still running when the first interval
+        // publishes what it has written.
+        let payload = payload(512 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider(cx);
         let events = events(cx, &provider);
@@ -1387,160 +1491,91 @@ mod tests {
         );
     }
 
-    /// A repeated progress report is not news, while a report that goes back to
-    /// zero is: it is the server restarting the entity it would not range.
+    /// The progress of a task is published once an interval whether or not bytes
+    /// arrive: a stalled transfer still reports its state, at zero rather than at
+    /// the rate it last managed.
     #[gpui_kit::test]
-    fn progress_should_be_published_only_when_it_changes(cx: &mut TestAppContext) {
+    fn progress_should_be_published_once_an_interval_even_while_nothing_arrives(
+        cx: &mut TestAppContext,
+    ) {
+        let address = spawn_stalled_server();
         let provider = provider(cx);
         let events = events(cx, &provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
-        let id = DownloadId::new();
-        cx.update(|cx| {
-            provider.update(cx, |provider, _| {
-                provider.entries.insert(
-                    id,
-                    Entry {
-                        request: request(
-                            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
-                            "/payload",
-                            &destination,
-                            None,
-                        ),
-                        status: DownloadStatus::Downloading {
-                            downloaded: 0,
-                            total: None,
-                        },
-                        validator: Arc::new(Mutex::new(None)),
-                        fresh: false,
-                        attempt: None,
-                    },
-                );
-                provider.order.push(id);
-            });
-        });
 
-        let updates = || {
-            recorded(&events)
-                .into_iter()
-                .filter(|event| matches!(event, DownloadEvent::TaskUpdated(task) if task.id == id))
-                .count()
-        };
-        let record = |cx: &mut TestAppContext, written: u64, total: Option<u64>| {
-            cx.update(|cx| {
-                provider.update(cx, |provider, cx| {
-                    provider.record_progress(id, written, total, cx)
-                })
-            });
-        };
-
-        record(cx, 0, None);
-        assert_eq!(updates(), 0, "the seeded status is not published again");
-
-        record(cx, 32, Some(100));
-        assert_eq!(updates(), 1, "changed progress is published");
-
-        record(cx, 32, Some(100));
-        assert_eq!(updates(), 1, "the same numbers are not published again");
-
-        record(cx, 0, Some(100));
-        assert_eq!(
-            updates(),
-            2,
-            "a server that restarts the entity reports zero",
+        let id = add(
+            cx,
+            &provider,
+            request(address, "/payload", &destination, Some(4096)),
         );
         assert_eq!(
-            status(cx, &provider, id),
-            Some(DownloadStatus::Downloading {
-                downloaded: 0,
-                total: Some(100),
-            }),
+            published(&events, id).len(),
+            1,
+            "adding publishes the starting state",
         );
+
+        for interval in 1_usize..=3 {
+            cx.executor().advance_clock(PUBLISH_INTERVAL);
+            cx.run_until_parked();
+            let statuses = published(&events, id);
+            assert_eq!(
+                statuses.len(),
+                interval + 1,
+                "the download publishes once an interval, whether or not bytes arrive",
+            );
+            assert!(
+                matches!(
+                    statuses.last(),
+                    Some(DownloadStatus::Downloading {
+                        downloaded: 0,
+                        mb_per_second,
+                        ..
+                    }) if *mb_per_second == 0.0
+                ),
+                "a transfer that wrote nothing reports no rate: {statuses:?}",
+            );
+        }
     }
 
-    /// A fresh task stays fresh until its transfer reports progress: a pause
-    /// before that report means the partial file was never opened, so even a
-    /// resume still has to begin from zero.
+    /// The rate is what the transfer wrote over the interval since it last
+    /// published, in megabytes per second.
     #[gpui_kit::test]
-    fn a_task_should_stay_fresh_until_its_transfer_reports_progress(cx: &mut TestAppContext) {
+    fn a_download_should_publish_the_rate_it_writes_at(cx: &mut TestAppContext) {
+        // Big enough that the transfer is still running when the first interval
+        // publishes what it has written.
+        let payload = payload(512 * 1024);
+        let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider(cx);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
-        let id = DownloadId::new();
-        cx.update(|cx| {
-            provider.update(cx, |provider, _| {
-                provider.entries.insert(
-                    id,
-                    Entry {
-                        request: request(
-                            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
-                            "/payload",
-                            &destination,
-                            None,
-                        ),
-                        status: DownloadStatus::Pausing {
-                            downloaded: 0,
-                            total: None,
-                        },
-                        validator: Arc::new(Mutex::new(None)),
-                        fresh: true,
-                        attempt: None,
-                    },
-                );
-                provider.order.push(id);
-            });
-        });
 
-        let fresh = |cx: &TestAppContext| {
-            cx.update(|cx| {
-                provider
-                    .read(cx)
-                    .entries
-                    .get(&id)
-                    .expect("the entry is held")
-                    .fresh
-            })
-        };
-        let record = |cx: &mut TestAppContext, written: u64, total: Option<u64>| {
-            cx.update(|cx| {
-                provider.update(cx, |provider, cx| {
-                    provider.record_progress(id, written, total, cx)
-                })
-            });
-        };
-
-        // A transfer that is being stopped never reported, so the partial file
-        // it would have opened is not this task's resume point.
-        record(cx, 0, None);
-        assert!(
-            fresh(cx),
-            "a report outside a running transfer does not clear fresh"
+        let id = add(
+            cx,
+            &provider,
+            request(
+                address,
+                "/payload",
+                &destination,
+                Some(payload.len() as u64),
+            ),
         );
-
-        cx.update(|cx| {
-            provider.update(cx, |provider, _| {
-                if let Some(entry) = provider.entries.get_mut(&id) {
-                    entry.status = DownloadStatus::Downloading {
-                        downloaded: 0,
-                        total: None,
-                    };
-                }
-            });
+        wait_until(cx, "a rate the transfer is writing at", |cx| {
+            matches!(
+                status(cx, &provider, id),
+                Some(DownloadStatus::Downloading { mb_per_second, .. })
+                    if mb_per_second > 0.0 && mb_per_second < 100.0
+            )
         });
-        // The first report repeats the seeded zero and is still the proof that
-        // the transfer opened (and truncated) the partial file.
-        record(cx, 0, None);
-        assert!(
-            !fresh(cx),
-            "the first running report makes the partial file resumable"
-        );
     }
 
-    /// A paused task that never reported progress truncates on resume, so its
-    /// `Paused` state must announce the same starting point rather than the
-    /// length of a partial file it did not write.
+    /// The bytes on disk are a task's resume point only once an attempt of it has
+    /// opened the partial file: a pause before that settles at zero, and the next
+    /// resume truncates whatever file it finds.
     #[gpui_kit::test]
-    fn a_pause_before_the_first_report_should_show_zero_progress(cx: &mut TestAppContext) {
+    fn a_pause_should_settle_at_what_the_partial_file_holds_once_it_was_opened(
+        cx: &mut TestAppContext,
+    ) {
         let provider = provider(cx);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
@@ -1549,7 +1584,11 @@ mod tests {
         std::fs::write(&part, vec![0xEE_u8; partial as usize])
             .expect("the partial file is written");
 
-        let insert_pausing = |cx: &mut TestAppContext, fresh: bool| -> DownloadId {
+        let insert_pausing = |cx: &mut TestAppContext, fresh: bool, opened: bool| -> DownloadId {
+            let progress = Progress::default();
+            if opened {
+                progress.opened_at(partial, None);
+            }
             let id = DownloadId::new();
             cx.update(|cx| {
                 provider.update(cx, |provider, _| {
@@ -1568,7 +1607,7 @@ mod tests {
                             },
                             validator: Arc::new(Mutex::new(None)),
                             fresh,
-                            attempt: None,
+                            attempt: Some(attempt(progress)),
                         },
                     );
                     provider.order.push(id);
@@ -1584,33 +1623,70 @@ mod tests {
                 });
             });
         };
+        let fresh = |cx: &TestAppContext, id: DownloadId| {
+            cx.update(|cx| {
+                provider
+                    .read(cx)
+                    .entries
+                    .get(&id)
+                    .expect("the entry is held")
+                    .fresh
+            })
+        };
 
-        let fresh = insert_pausing(cx, true);
-        settle(cx, fresh);
+        // No attempt of this task ever opened the file, so there is nothing for a
+        // resume to continue.
+        let unopened = insert_pausing(cx, true, false);
+        settle(cx, unopened);
         assert_eq!(
-            status(cx, &provider, fresh),
+            status(cx, &provider, unopened),
             Some(DownloadStatus::Paused {
                 downloaded: 0,
                 total: None,
             }),
-            "a fresh task that never reported progress resumes from zero",
+            "a task whose transfer never opened the partial file resumes from zero",
+        );
+        assert!(
+            fresh(cx, unopened),
+            "the next attempt of that task still starts from zero",
         );
 
-        let resumable = insert_pausing(cx, false);
-        settle(cx, resumable);
+        // The attempt opened the file, so the bytes that arrived are its own.
+        let opened = insert_pausing(cx, true, true);
+        settle(cx, opened);
         assert_eq!(
-            status(cx, &provider, resumable),
+            status(cx, &provider, opened),
             Some(DownloadStatus::Paused {
                 downloaded: partial,
                 total: None,
             }),
-            "a task that reported progress resumes from the partial file it wrote",
+            "a task whose transfer opened the partial file resumes from the bytes it wrote",
         );
+        assert!(
+            !fresh(cx, opened),
+            "the bytes on disk are the next attempt's resume point",
+        );
+
+        // An attempt that stopped before opening keeps the resume point an earlier
+        // attempt of the same task made.
+        let resumed = insert_pausing(cx, false, false);
+        settle(cx, resumed);
+        assert_eq!(
+            status(cx, &provider, resumed),
+            Some(DownloadStatus::Paused {
+                downloaded: partial,
+                total: None,
+            }),
+            "a task that already opened the file keeps its resume point",
+        );
+        assert!(!fresh(cx, resumed));
     }
 
     #[gpui_kit::test]
     fn a_pause_should_be_refused_unless_the_download_is_running(cx: &mut TestAppContext) {
-        let payload = payload(192 * 1024);
+        // Big enough that the transfer is still running when the first interval
+        // publishes what it has written.
+        let payload = payload(512 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider(cx);
         let directory = TempDir::new().expect("a temporary directory is available");

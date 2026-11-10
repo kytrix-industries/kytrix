@@ -19,7 +19,6 @@ use std::{
     io,
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 use app_config::network::Config;
@@ -39,13 +38,9 @@ use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     error::{DownloadError, RangeFailure, RedirectFailure},
+    progress::Progress,
     request::DownloadRequest,
 };
-
-/// How many new bytes may accumulate before progress is reported.
-const PROGRESS_REPORT_BYTES: u64 = 1024 * 1024;
-/// How much wall-clock time may pass before progress is reported.
-const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The entity validator a partial download is conditional on.
 ///
@@ -79,10 +74,10 @@ impl Validator {
 /// `Range` is asked for. Only a task continuing its own paused or failed transfer
 /// passes `false`.
 ///
-/// `on_progress` is called `(absolute bytes written, absolute size when known)`:
-/// once as soon as the response is understood, then at most once per megabyte or
-/// per 100 milliseconds, and once more when the file is complete. It runs on the
-/// task driving the transfer, so it must not block.
+/// `progress` is where the transfer records what it has written: the bytes it
+/// resumes at and the size of the entity as soon as the partial file is open, then
+/// the bytes it writes. It runs on the task driving the transfer, so it must not
+/// block; the manager publishes what it records there once an interval.
 pub(crate) async fn download(
     transport: &TransportHub,
     config: &Config,
@@ -91,7 +86,7 @@ pub(crate) async fn download(
     fresh: bool,
     validator: Arc<Mutex<Option<Validator>>>,
     cancellation: &CancellationToken,
-    on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+    progress: &Progress,
 ) -> Result<u64, DownloadError> {
     let outcome = attempt(
         transport,
@@ -101,7 +96,7 @@ pub(crate) async fn download(
         fresh,
         validator,
         cancellation,
-        on_progress,
+        progress,
     )
     .await;
     if let Err(error) = &outcome {
@@ -126,7 +121,7 @@ async fn attempt(
     fresh: bool,
     validator: Arc<Mutex<Option<Validator>>>,
     cancellation: &CancellationToken,
-    on_progress: impl Fn(u64, Option<u64>),
+    progress: &Progress,
 ) -> Result<u64, DownloadError> {
     if cancellation.is_cancelled() {
         return Err(DownloadError::Cancelled);
@@ -300,10 +295,8 @@ async fn attempt(
         return Err(DownloadError::TooLarge { limit: size_limit });
     }
 
-    on_progress(offset, total);
+    progress.opened_at(offset, total);
     let mut written = offset;
-    let mut last_reported = offset;
-    let mut last_reported_at = Instant::now();
 
     loop {
         let chunk = tokio::select! {
@@ -352,13 +345,7 @@ async fn attempt(
             return Err(DownloadError::TooLarge { limit: size_limit });
         }
         file.write_all(&chunk).await.map_err(DownloadError::Io)?;
-        if written.saturating_sub(last_reported) >= PROGRESS_REPORT_BYTES
-            || last_reported_at.elapsed() >= PROGRESS_REPORT_INTERVAL
-        {
-            on_progress(written, total);
-            last_reported = written;
-            last_reported_at = Instant::now();
-        }
+        progress.wrote(written);
     }
 
     file.flush().await.map_err(DownloadError::Io)?;
@@ -387,7 +374,6 @@ async fn attempt(
     }
     drop(file);
     replace_file(&part, &request.destination).await?;
-    on_progress(written, total);
 
     Ok(written)
 }
@@ -584,6 +570,7 @@ mod tests {
     use super::{ContentRange, Validator, content_range, download, redirect_target};
     use crate::{
         error::{DownloadError, RangeFailure, RedirectFailure},
+        progress::{Progress, Snapshot},
         request::DownloadRequest,
     };
 
@@ -834,7 +821,14 @@ mod tests {
                 if let Some(chunked_range) = self.chunked_range {
                     return self.chunked_response(start, chunked_range);
                 }
-                let body = TestBody::whole(self.payload.slice(start as usize..));
+                let remaining = self.payload.slice(start as usize..);
+                // A paced response is paced whatever it carries, so a resumed
+                // transfer is observably in flight like a fresh one.
+                let body = if paced {
+                    TestBody::paced(remaining, PACE)
+                } else {
+                    TestBody::whole(remaining)
+                };
                 let end = if self.bad_range {
                     // A range that names fewer bytes than the body carries.
                     start + 31
@@ -1005,24 +999,23 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
-    fn recorder() -> (
-        Arc<Mutex<Vec<(u64, Option<u64>)>>>,
-        impl Fn(u64, Option<u64>) + Send + 'static,
-    ) {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-        (recorded, move |written, total| {
-            sink.lock()
-                .expect("the progress log is never poisoned")
-                .push((written, total));
+    /// Cancels `cancellation` once `reached` holds for the transfer's progress.
+    ///
+    /// The transfer has no callback a test can hook, so watching the progress it
+    /// records is how a test stops it at a state it wants to observe.
+    fn cancel_when(
+        progress: &Arc<Progress>,
+        cancellation: &CancellationToken,
+        mut reached: impl FnMut(&Snapshot) -> bool + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let progress = Arc::clone(progress);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            while !reached(&progress.snapshot()) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            cancellation.cancel();
         })
-    }
-
-    fn progress(recorded: &Arc<Mutex<Vec<(u64, Option<u64>)>>>) -> Vec<(u64, Option<u64>)> {
-        recorded
-            .lock()
-            .expect("the progress log is never poisoned")
-            .clone()
     }
 
     async fn file_content(path: &Path) -> Vec<u8> {
@@ -1066,7 +1059,7 @@ mod tests {
         let config = Config::default();
         let runtime = Runtime::for_test();
         let cancellation = CancellationToken::new();
-        let (recorded, on_progress) = recorder();
+        let progress = Progress::default();
         let request = request(
             address,
             "/payload",
@@ -1082,7 +1075,7 @@ mod tests {
             true,
             validator(),
             &cancellation,
-            on_progress,
+            &progress,
         )
         .await
         .expect("the payload downloads");
@@ -1106,16 +1099,11 @@ mod tests {
             "a fresh download asks for nothing it already has"
         );
 
-        let reported = progress(&recorded);
+        let snapshot = progress.snapshot();
         assert_eq!(
-            reported.first(),
-            Some(&(0, Some(payload.len() as u64))),
-            "the transfer announces its size before the first byte"
-        );
-        assert_eq!(
-            reported.last(),
-            Some(&(payload.len() as u64, Some(payload.len() as u64))),
-            "the last report is the whole file"
+            (snapshot.written(), snapshot.total(), snapshot.opened()),
+            (payload.len() as u64, Some(payload.len() as u64), true),
+            "the whole file is what the transfer leaves in its progress",
         );
     }
 
@@ -1132,7 +1120,7 @@ mod tests {
         let hub = transport();
         let config = Config::default();
         let runtime = Runtime::for_test();
-        let (recorded, on_progress) = recorder();
+        let progress = Progress::default();
         let request = request(
             address,
             "/payload",
@@ -1148,7 +1136,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            on_progress,
+            &progress,
         )
         .await
         .expect("the rest of the payload downloads");
@@ -1166,11 +1154,62 @@ mod tests {
         );
         assert_eq!(requests[0].if_range, None, "no validator is known yet");
 
-        let reported = progress(&recorded);
+        let snapshot = progress.snapshot();
         assert_eq!(
-            reported.first(),
-            Some(&(prefix as u64, Some(payload.len() as u64))),
-            "the progress of a resume starts at the partial file"
+            (snapshot.written(), snapshot.total(), snapshot.opened()),
+            (payload.len() as u64, Some(payload.len() as u64), true),
+            "a resume leaves the whole file in its progress, not just the bytes it added",
+        );
+    }
+
+    /// The resume point and the size of the entity are announced as soon as the
+    /// partial file is open, so the first interval a resume is published at
+    /// already knows where the bytes are being added to.
+    #[tokio::test]
+    async fn a_transfer_should_announce_its_resume_point_before_it_reads_the_body() {
+        let payload = payload(192 * 1024);
+        let server = Arc::new(Server::new(payload.clone()));
+        let address = spawn(Arc::clone(&server)).await;
+        let (_directory, destination, part) = downloading();
+        let prefix = 64 * 1024;
+        tokio::fs::write(&part, &payload[..prefix])
+            .await
+            .expect("the partial file is written");
+        let hub = transport();
+        let config = Config::default();
+        let runtime = Runtime::for_test();
+        let cancellation = CancellationToken::new();
+        let progress = Arc::new(Progress::default());
+        let watcher = cancel_when(&progress, &cancellation, |snapshot| snapshot.opened());
+        let request = request(address, "/paced", &destination, Some(payload.len() as u64));
+
+        let outcome = download(
+            &hub,
+            &config,
+            &runtime,
+            &request,
+            false,
+            validator(),
+            &cancellation,
+            &progress,
+        )
+        .await;
+        watcher.abort();
+        assert!(
+            matches!(outcome, Err(DownloadError::Cancelled)),
+            "the transfer is stopped as soon as it makes the announcement: {outcome:?}"
+        );
+
+        let announced = progress.snapshot();
+        assert!(announced.opened(), "the partial file was opened");
+        assert_eq!(
+            announced.total(),
+            Some(payload.len() as u64),
+            "the size of the entity is announced with the resume point",
+        );
+        assert!(
+            announced.written() >= prefix as u64 && announced.written() < payload.len() as u64,
+            "the resume point is announced before the body is read to its end: {announced:?}",
         );
     }
 
@@ -1186,7 +1225,8 @@ mod tests {
         let request = request(address, "/paced", &destination, Some(payload.len() as u64));
 
         let cancellation = CancellationToken::new();
-        let stop = cancellation.clone();
+        let progress = Arc::new(Progress::default());
+        let watcher = cancel_when(&progress, &cancellation, |snapshot| snapshot.written() > 0);
         let outcome = download(
             &hub,
             &config,
@@ -1195,13 +1235,10 @@ mod tests {
             true,
             validator(),
             &cancellation,
-            move |written, _| {
-                if written > 0 {
-                    stop.cancel();
-                }
-            },
+            &progress,
         )
         .await;
+        watcher.abort();
         assert!(
             matches!(outcome, Err(DownloadError::Cancelled)),
             "a paused transfer reports the cancellation: {outcome:?}"
@@ -1218,7 +1255,7 @@ mod tests {
             "a paused download is not a destination file"
         );
 
-        let (recorded, on_progress) = recorder();
+        let resumed_progress = Progress::default();
         let resumed = download(
             &hub,
             &config,
@@ -1227,7 +1264,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            on_progress,
+            &resumed_progress,
         )
         .await
         .expect("the transfer resumes from the partial file");
@@ -1244,10 +1281,10 @@ mod tests {
             Some(expected_range.as_str()),
             "the resume starts where the pause left the partial file"
         );
-        let reported = progress(&recorded);
         assert_eq!(
-            reported.first(),
-            Some(&(partial, Some(payload.len() as u64)))
+            resumed_progress.snapshot().written(),
+            payload.len() as u64,
+            "the progress of the resume counts the bytes the first attempt wrote",
         );
     }
 
@@ -1264,7 +1301,7 @@ mod tests {
         let hub = transport();
         let config = Config::default();
         let runtime = Runtime::for_test();
-        let (recorded, on_progress) = recorder();
+        let progress = Progress::default();
         let request = request(
             address,
             "/payload",
@@ -1280,7 +1317,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            on_progress,
+            &progress,
         )
         .await
         .expect("the whole entity downloads again");
@@ -1295,11 +1332,10 @@ mod tests {
             Some("bytes=65536-"),
             "the client did ask to resume"
         );
-        let reported = progress(&recorded);
         assert_eq!(
-            reported.first(),
-            Some(&(0, Some(payload.len() as u64))),
-            "the whole entity restarts at zero rather than being appended to"
+            progress.snapshot().written(),
+            payload.len() as u64,
+            "the restarted entity is written whole rather than appended to the bytes the part held"
         );
     }
 
@@ -1328,7 +1364,7 @@ mod tests {
             true,
             Arc::clone(&validator),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the first download completes");
@@ -1351,7 +1387,7 @@ mod tests {
             false,
             validator,
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the resume completes");
@@ -1394,7 +1430,7 @@ mod tests {
             true,
             Arc::clone(&validator),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the first download completes");
@@ -1409,7 +1445,7 @@ mod tests {
             &destination,
             Some(payload.len() as u64),
         );
-        let (recorded, on_progress) = recorder();
+        let progress = Progress::default();
         download(
             &hub,
             &config,
@@ -1418,7 +1454,7 @@ mod tests {
             false,
             validator,
             &CancellationToken::new(),
-            on_progress,
+            &progress,
         )
         .await
         .expect("the changed entity downloads again");
@@ -1430,11 +1466,10 @@ mod tests {
             "the resume names the entity the partial file was taken from"
         );
         assert_eq!(requests[0].range.as_deref(), Some("bytes=65536-"));
-        let reported = progress(&recorded);
         assert_eq!(
-            reported.first(),
-            Some(&(0, Some(payload.len() as u64))),
-            "the server's 200 restarts the file at zero"
+            progress.snapshot().written(),
+            payload.len() as u64,
+            "the server's 200 restarts the file at zero instead of appending to the part"
         );
         assert_eq!(file_content(&destination).await, payload.to_vec());
     }
@@ -1459,7 +1494,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1501,7 +1536,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1545,7 +1580,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1583,7 +1618,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1624,7 +1659,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the payload downloads through its redirect");
@@ -1663,7 +1698,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1703,7 +1738,7 @@ mod tests {
             true,
             Arc::clone(&validator),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the first download completes");
@@ -1726,7 +1761,7 @@ mod tests {
             false,
             validator,
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the resume completes");
@@ -1772,7 +1807,7 @@ mod tests {
             true,
             Arc::clone(&validator),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the first download completes");
@@ -1797,7 +1832,7 @@ mod tests {
             false,
             validator,
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the resume completes");
@@ -1833,7 +1868,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1875,7 +1910,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1923,7 +1958,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -1965,7 +2000,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("the whole entity downloads over the stale partial file");
@@ -2009,7 +2044,7 @@ mod tests {
             true,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -2058,7 +2093,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -2112,7 +2147,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 
@@ -2159,7 +2194,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await
         .expect("an unannounced body that fills its range completes");
@@ -2194,7 +2229,7 @@ mod tests {
             false,
             validator(),
             &CancellationToken::new(),
-            |_, _| {},
+            &Progress::default(),
         )
         .await;
 

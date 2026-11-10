@@ -36,7 +36,7 @@ impl fmt::Display for DownloadId {
 }
 
 /// One download as its observers see it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DownloadTask {
     pub id: DownloadId,
     pub url: Url,
@@ -45,10 +45,20 @@ pub struct DownloadTask {
 }
 
 /// What a download is doing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DownloadStatus {
     /// The transfer is in flight.
-    Downloading { downloaded: u64, total: Option<u64> },
+    Downloading {
+        downloaded: u64,
+        total: Option<u64>,
+        /// The rate the transfer wrote at over the interval this state was last
+        /// published at, in megabytes per second, where a megabyte is 1024 × 1024
+        /// bytes.
+        ///
+        /// It is zero while nothing arrives, so a stalled transfer reports zero
+        /// rather than its last speed.
+        mb_per_second: f32,
+    },
     /// The transfer is being stopped and will settle as [`Self::Paused`].
     Pausing { downloaded: u64, total: Option<u64> },
     /// The transfer is stopped at a partial file, and can be resumed.
@@ -66,7 +76,7 @@ pub enum DownloadStatus {
 }
 
 /// What changed about a download.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DownloadEvent {
     /// The task was created or its status changed.
     TaskUpdated(DownloadTask),
@@ -125,6 +135,7 @@ mod tests {
             DownloadStatus::Downloading {
                 downloaded: 12,
                 total: Some(34),
+                mb_per_second: 1.5,
             },
             DownloadStatus::Pausing {
                 downloaded: 12,

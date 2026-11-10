@@ -1138,6 +1138,9 @@ mod tests {
 
     /// Polls `condition` on the interface executor until it holds, with real time passing so the
     /// transfer it observes can make progress.
+    ///
+    /// The step is a tenth of the interval the manager publishes progress at, so waiting for a
+    /// report costs a few real milliseconds rather than the whole interval.
     fn wait_until(
         cx: &mut TestAppContext,
         what: &str,
@@ -1149,7 +1152,7 @@ mod tests {
                 return;
             }
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            cx.executor().advance_clock(Duration::from_millis(20));
+            cx.executor().advance_clock(Duration::from_millis(100));
             cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(5));
         }

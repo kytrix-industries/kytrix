@@ -669,7 +669,9 @@ impl Updater {
             return;
         }
         match &task.status {
-            DownloadStatus::Downloading { downloaded, total } => {
+            DownloadStatus::Downloading {
+                downloaded, total, ..
+            } => {
                 self.record_progress(task.id, *downloaded, *total, cx);
             }
             DownloadStatus::Pausing { .. } => {
