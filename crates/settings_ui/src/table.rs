@@ -5,13 +5,13 @@
 //!
 //! The table is an entity of its own because that is what [`Table`] reads its rows from. It
 //! holds one snapshot at a time and is told to look again when the settings session changes
-//! it, which is what makes it follow an edit rather than showing what the catalog was when
-//! the dialog opened.
+//! them, which is what makes it follow a change rather than showing what the catalog was when
+//! the settings page opened.
 //!
 //! Opening a form is not done here. A table cell is drawn without a window, and a dialog
-//! needs one, so a row records the form the user asked for and the dialog takes it: the dialog
+//! needs one, so a row records the form the user asked for and the settings page takes it: it
 //! opens the form on the window layer, which pushes it and draws it on the next frame. A request
-//! is opened once, in the frame the dialog takes it — see [`ProxyTable::take_request`].
+//! is opened once, in the frame the settings page takes it — see [`ProxyTable::take_request`].
 
 use app_config::network::{ProxyAuthorizationConfig, ProxyConfig};
 use base_ui::{
@@ -31,7 +31,7 @@ use gpui_kit::{
 use i18n::t;
 use smol_str::SmolStr;
 
-use crate::{draft::SettingsDraft, editor::DnsMode};
+use crate::{editor::DnsMode, session::SettingsSession};
 
 /// Columns: name, address, port, authentication, DNS mode, actions.
 const COLUMN_COUNT: usize = 6;
@@ -49,22 +49,22 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
     Length::Definite(relative(0.08)),
 ];
 
-/// What one row asks the dialog to do.
+/// What one row asks the settings page to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProxyRequest {
     /// Open the form that adds a new entry.
     Add,
     /// Open the form that edits `name`, started from what it currently holds.
     Edit { name: SmolStr },
-    /// Remove `name` and everything bound to it, which the dialog has the user confirm before
-    /// anything is recorded.
+    /// Remove `name` and everything bound to it, which the settings page has the user confirm
+    /// before anything is written.
     Delete { name: SmolStr },
 }
 
 /// The proxy catalog, drawn as a table.
 pub(crate) struct ProxyTable {
     rows: Vec<(SmolStr, ProxyConfig)>,
-    /// The form a row asked for, which the dialog takes when it next draws.
+    /// The form a row asked for, which the settings page takes when it next draws.
     request: Option<ProxyRequest>,
     /// How many times the rows changed, so the table is drawn again rather than reusing
     /// what it drew before.
@@ -73,31 +73,31 @@ pub(crate) struct ProxyTable {
     /// so a row cannot reach the entity it belongs to any other way.
     owner: WeakEntity<ProxyTable>,
     /// The session the rows are the catalog of.
-    draft: Entity<SettingsDraft>,
+    session: Entity<SettingsSession>,
     /// Held because the subscription is what keeps the rows of the table the rows of the
     /// session: dropping it would leave a catalog that never notices it changed.
-    _draft_changes: Subscription,
+    _session_changes: Subscription,
 }
 
 impl ProxyTable {
-    pub fn new(draft: Entity<SettingsDraft>, cx: &mut Context<Self>) -> Self {
-        let changes = cx.observe(&draft, |table, _, cx| table.reload(cx));
+    pub fn new(session: Entity<SettingsSession>, cx: &mut Context<Self>) -> Self {
+        let changes = cx.observe(&session, |table, _, cx| table.reload(cx));
 
         let mut table = Self {
             rows: Vec::new(),
             request: None,
             revision: 0,
             owner: cx.entity().downgrade(),
-            draft,
-            _draft_changes: changes,
+            session,
+            _session_changes: changes,
         };
         table.reload(cx);
 
         table
     }
 
-    /// Records the form the user asked for, which the dialog takes when it next draws and opens on
-    /// the window layer.
+    /// Records the form the user asked for, which the settings page takes when it next draws and
+    /// opens on the window layer.
     pub fn request(&mut self, request: ProxyRequest, cx: &mut Context<Self>) {
         self.request = Some(request);
         cx.notify();
@@ -111,7 +111,7 @@ impl ProxyTable {
     /// Re-reads the catalog of the session and tells the table to draw it again when it
     /// changed.
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let config = self.draft.read(cx).config();
+        let config = self.session.read(cx).config(cx);
         let rows = config
             .proxies
             .iter()
@@ -354,8 +354,8 @@ impl Render for ProxyTable {
                     .border_1()
                     .border_color(theme.roles.line.divider.hsla)
                     // §8.4: a table's rows are transparent over `surface.sunken`, and its
-                    // header is `surface.raised`. The table lives on a dialog here, so the
-                    // content face has to be laid down by the box that holds it.
+                    // header is `surface.raised`. The table lives on the settings page here, so
+                    // the content face has to be laid down by the box that holds it.
                     .bg(theme.roles.surface.sunken.hsla)
                     .overflow_hidden()
                     .child(Table::new(

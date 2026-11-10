@@ -5,19 +5,20 @@
 //! behind the selected entry on the other; the form that changes the proxy catalog is a dialog of
 //! its own on the window layer.
 //!
-//! The settings themselves are not owned here, but neither does a control write them. They
-//! live in `app_config_provider`'s global, a session reads them once when it opens, and every
-//! control changes the session instead — see [`draft`]. The page's confirm button is what
-//! writes the session into the settings, and the manager persists it; settings that could not
-//! be stored are reported to the user, and what they changed is still there to try again.
+//! The settings themselves are not owned here: they live in `app_config_provider`'s global, and
+//! every control writes the change it makes at once — see [`session`]. A change is applied to the
+//! settings as they are at that moment and stored before it is published, so a change that cannot
+//! be stored leaves the settings as they were and is reported to the user. There is nothing to
+//! confirm and nothing to cancel: leaving the page keeps what was stored, and only a text field
+//! that has not lost the caret yet is written on the way out.
 
 mod access;
 mod catalog;
-mod draft;
 mod editor;
 mod page;
 mod schema;
 mod search;
+mod session;
 pub mod settings;
 mod table;
 mod translation;

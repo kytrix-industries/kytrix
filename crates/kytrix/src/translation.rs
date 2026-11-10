@@ -13,7 +13,7 @@ use gpui_kit::App;
 /// Translates `content` into `target_lang` through the process-wide model.
 ///
 /// The directory comes from the settings rather than from this module, so changing it in the
-/// settings dialog takes effect on the next call.
+/// settings page takes effect on the next call.
 pub(crate) fn translate(
     cx: &App,
     target_lang: &str,

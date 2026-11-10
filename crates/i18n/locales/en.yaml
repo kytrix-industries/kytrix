@@ -1354,7 +1354,7 @@ settings_ui:
     title: The settings could not be saved
   search:
     placeholder: Search settings
-  subtitle: Configure the application
+  subtitle: Changes are applied immediately. Text fields save when you leave them.
   time_zone:
     description: Choose the time zone widgets display data timestamps in; every data timestamp is converted to it
     title: Data time zone

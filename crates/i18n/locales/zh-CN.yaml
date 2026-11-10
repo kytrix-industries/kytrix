@@ -1354,7 +1354,7 @@ settings_ui:
     title: 设置保存失败
   search:
     placeholder: 搜索设置
-  subtitle: 配置应用程序
+  subtitle: 更改会立即生效，文本字段在离开时保存。
   time_zone:
     description: 选择各个部件显示数据时间时使用的时区，所有数据时间都会按该时区换算
     title: 数据时间时区

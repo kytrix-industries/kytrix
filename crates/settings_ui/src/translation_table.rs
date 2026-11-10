@@ -11,7 +11,6 @@
 //! asked for and the page takes it on the frame it draws — see
 //! [`TranslationTable::take_request`]. A pause is the one action with no dialog and no selection
 //! behind it, so the table asks the manager for it directly.
-
 use app_config::translation::TranslationModel;
 use base_ui::{
     button::Button,
@@ -34,7 +33,7 @@ use i18n::t;
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    draft::SettingsDraft,
+    session::SettingsSession,
     translation_downloads::{DeleteFailure, DownloadState, TranslationDownloads, UnloadFailure},
 };
 
@@ -51,15 +50,15 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
 /// What one row asks the page to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranslationRequest {
-    /// Download [`TranslationModel`] from the site the session holds.
+    /// Download [`TranslationModel`] from the site the settings hold.
     Download { model: TranslationModel },
     /// Continue a paused download from its partial file.
     Resume { model: TranslationModel },
-    /// Retry the failed download of [`TranslationModel`] from the site the session holds.
+    /// Retry the failed download of [`TranslationModel`] from the site the settings hold.
     Retry { model: TranslationModel },
     /// Stop the download of [`TranslationModel`] for good and discard what it wrote.
     Terminate { model: TranslationModel },
-    /// Remove [`TranslationModel`] and stop naming it where the session did.
+    /// Remove [`TranslationModel`] and stop naming it where the settings did.
     Delete { model: TranslationModel },
 }
 
@@ -67,7 +66,7 @@ pub(crate) enum TranslationRequest {
 #[derive(Clone, Debug, PartialEq)]
 struct ModelRow {
     model: TranslationModel,
-    /// Whether the model's file is present in the session's directory.
+    /// Whether the model's file is present in the directory the settings hold.
     downloaded: bool,
     /// What the download manager last reported for this model in that directory.
     state: DownloadState,
@@ -82,25 +81,25 @@ pub(crate) struct TranslationTable {
     /// row cannot reach the entity it belongs to any other way.
     owner: WeakEntity<TranslationTable>,
     /// The session whose directory the rows are about.
-    draft: Entity<SettingsDraft>,
+    session: Entity<SettingsSession>,
     /// The process-wide downloads, when the composition root installed them.
     downloads: Option<Entity<TranslationDownloads>>,
     /// Whether a download can be started: both the manager and a directory have to exist.
     can_download: bool,
     /// Held because the subscription is what keeps the rows of the table the rows of the
     /// session: dropping it would leave a table that never notices the directory changed.
-    _draft_changes: Subscription,
+    _session_changes: Subscription,
     /// Held for the same reason, over the manager the rows report.
     _download_changes: Option<Subscription>,
 }
 
 impl TranslationTable {
     pub(crate) fn new(
-        draft: Entity<SettingsDraft>,
+        session: Entity<SettingsSession>,
         downloads: Option<Entity<TranslationDownloads>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let draft_changes = cx.observe(&draft, |table, _, cx| table.reload(cx));
+        let session_changes = cx.observe(&session, |table, _, cx| table.reload(cx));
         let download_changes = downloads
             .as_ref()
             .map(|downloads| cx.observe(downloads, |table, _, cx| table.reload(cx)));
@@ -109,10 +108,10 @@ impl TranslationTable {
             rows: Vec::new(),
             request: None,
             owner: cx.entity().downgrade(),
-            draft,
+            session,
             downloads,
             can_download: false,
-            _draft_changes: draft_changes,
+            _session_changes: session_changes,
             _download_changes: download_changes,
         };
         table.reload(cx);
@@ -138,16 +137,16 @@ impl TranslationTable {
         cx.notify();
     }
 
-    /// Stops the download of `model` in the directory the session holds.
+    /// Stops the download of `model` in the directory the settings hold.
     fn pause(&mut self, model: TranslationModel, cx: &mut Context<Self>) {
-        let Some(directory) = self
-            .draft
+        let directory = self
+            .session
             .read(cx)
-            .config()
+            .config(cx)
             .translation
             .model_directory
-            .clone()
-        else {
+            .clone();
+        let Some(directory) = directory else {
             return;
         };
         let Some(downloads) = self.downloads.clone() else {
@@ -158,10 +157,10 @@ impl TranslationTable {
         });
     }
 
-    /// Re-reads the rows of the session and the manager, and tells the table to draw them again
+    /// Re-reads the rows of the settings and the manager, and tells the table to draw them again
     /// when they changed.
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let config = self.draft.read(cx).config();
+        let config = self.session.read(cx).config(cx);
         let directory = config.translation.model_directory.clone();
         drop(config);
 
@@ -705,12 +704,22 @@ impl Render for TranslationTable {
 #[cfg(test)]
 mod tests {
     use app_config::{settings::Config, translation::TranslationModel};
+    use app_config_provider::manager::ConfigManager;
     use base_ui::{icon::IconKind, table::TableDataSet as _};
-    use gpui_kit::{AppContext as _, TestAppContext};
+    use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use i18n::{global::embedded, language::codes::LanguageCode, t};
 
     use super::{RowAction, TranslationTable, size_text, speed_text, whole_percent};
-    use crate::draft::SettingsDraft;
+    use crate::session::SettingsSession;
+
+    /// Opens the session a table reads its directory from.
+    fn session(cx: &mut TestAppContext) -> Entity<SettingsSession> {
+        cx.update(|cx| {
+            let manager = ConfigManager::in_memory(Config::default(), cx);
+            cx.set_global(manager);
+            cx.new(|_| SettingsSession::new())
+        })
+    }
 
     /// The label and the icon of every row action, which are the copy and the picture the
     /// status column was designed with.
@@ -841,8 +850,8 @@ mod tests {
     /// No column wraps: every cell is cut to the one line it is drawn with.
     #[gpui_kit::test]
     fn no_column_should_wrap(cx: &mut TestAppContext) {
-        let draft = cx.update(|cx| cx.new(|_| SettingsDraft::new(Config::default())));
-        let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(draft, None, cx)));
+        let session = session(cx);
+        let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(session, None, cx)));
 
         let wraps = cx.read(|cx| {
             let table = table.read(cx);
@@ -861,8 +870,8 @@ mod tests {
     /// The second column is the model's size, named in the interface's language.
     #[gpui_kit::test]
     fn the_second_column_should_be_the_model_size(cx: &mut TestAppContext) {
-        let draft = cx.update(|cx| cx.new(|_| SettingsDraft::new(Config::default())));
-        let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(draft, None, cx)));
+        let session = session(cx);
+        let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(session, None, cx)));
 
         cx.update(|cx| {
             embedded::install(cx).expect("embedded locales should load");

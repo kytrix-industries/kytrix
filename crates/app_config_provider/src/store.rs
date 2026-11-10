@@ -1276,8 +1276,8 @@ mod tests {
 
     /// A venue edit submitted the way a settings interface submits one — a mutated
     /// `Config` handed to a write-back entry — reaches the file and moves the venue's
-    /// outbound generation. The dialog submits a whole applied configuration through
-    /// `write`; this drives `update`, which takes the edit as a closure.
+    /// outbound generation. The settings page submits each change through `write`; this drives
+    /// `update`, which takes the edit as a closure.
     #[test]
     fn a_venue_edit_should_persist_and_rotate_the_venue_generation() {
         let temporary_directory = test_temp("config");

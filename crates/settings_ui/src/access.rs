@@ -11,9 +11,8 @@
 //! so a setting the page does not name can never be written to.
 //!
 //! Where that write lands is not this module's to decide: an access is given a [`Config`] by
-//! whoever holds one, which while the settings dialog is open is the session the user is
-//! configuring rather than the settings themselves — see [`crate::draft`]. What changed the
-//! settings is only ever what the user confirmed.
+//! whoever holds one, which is the settings themselves — a control writes the change it makes and
+//! the settings page stores it at once. See [`crate::session`].
 
 use std::{rc::Rc, sync::Arc};
 

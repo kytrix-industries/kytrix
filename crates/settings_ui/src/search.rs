@@ -80,8 +80,8 @@ impl SearchFilter {
 
     /// Whether anything is filtered out at all.
     ///
-    /// Only the tests ask this: the dialog draws from what a filter admits rather than from
-    /// whether the query narrowed anything.
+    /// Only the tests ask this: the settings page draws from what a filter admits rather than
+    /// from whether the query narrowed anything.
     #[cfg(test)]
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
@@ -95,8 +95,8 @@ impl SearchFilter {
     /// Whether one page is admitted by its own label and keywords.
     ///
     /// A page can also be reached through one of its fields; that is a question about the page's
-    /// fields rather than about its label, and the dialog asks both so a field match can open the
-    /// page it sits on.
+    /// fields rather than about its label, and the settings page asks both so a field match can
+    /// open the page it sits on.
     pub fn admits_page(&self, id: &str) -> bool {
         match self {
             Self::All => true,

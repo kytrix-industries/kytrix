@@ -31,8 +31,8 @@ use download_provider::{
     task::{DownloadEvent, DownloadId, DownloadStatus},
 };
 use gpui_kit::{
-    App, AppContext as _, BackgroundExecutor, BorrowAppContext as _, Context, Entity, EventEmitter,
-    Global, Subscription,
+    App, AppContext as _, BackgroundExecutor, BorrowAppContext as _, Context, Entity, Global,
+    Subscription,
 };
 use network::transport::http::HttpClientClass;
 use url::Url;
@@ -183,8 +183,8 @@ pub(crate) struct TranslationDownloads {
     sites: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
     /// The downloads a retry asked to start once the files of another site are gone.
     pending_restarts: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
-    /// The directory of the most recent completed download, even when the settings session that
-    /// started it was never confirmed.
+    /// The directory of the most recent completed download, which a page that is opened without
+    /// a directory adopts.
     last_download_directory: Option<PathBuf>,
     /// Models a test treats as downloaded without creating a multi-gigabyte file.
     #[cfg(test)]
@@ -220,8 +220,8 @@ impl TranslationDownloads {
         }
     }
 
-    /// The directory of the most recent completed download, with or without a confirmed
-    /// settings session.
+    /// The directory of the most recent completed download, whether or not the page that started
+    /// it is still open.
     pub(crate) fn last_download_directory(&self) -> Option<&Path> {
         self.last_download_directory.as_deref()
     }
@@ -590,7 +590,6 @@ impl TranslationDownloads {
             });
         }
 
-        cx.emit(TranslationDownloadsEvent::Completed { model, directory });
         cx.notify();
     }
 
@@ -803,10 +802,21 @@ impl TranslationDownloads {
                 self.sites.remove(&key);
                 #[cfg(test)]
                 self.forced_downloaded.remove(&key);
-                cx.emit(TranslationDownloadsEvent::Deleted {
-                    model,
-                    directory: directory.clone(),
+                // A model chosen while its removal was already running was not there when the
+                // removal started to look for it, so the selection is cleared again here: by now
+                // the files are gone, and a selection naming them is one the page cannot load.
+                // A selection is only this model's to clear when it names the directory the
+                // removal emptied.
+                let clears_selection = cx.try_global::<ConfigManager>().is_some_and(|manager| {
+                    let config = manager.read();
+                    config.translation.model_directory.as_ref() == Some(&directory)
+                        && config.translation.selected_model == Some(model)
                 });
+                if clears_selection {
+                    cx.update_global::<ConfigManager, _>(|manager, cx| {
+                        manager.update(|config| config.translation.selected_model = None, cx);
+                    });
+                }
 
                 // A retry that chose another site is a removal and then a download. The provider
                 // is in the middle of publishing the end of the removal here, so the restart is
@@ -898,23 +908,6 @@ impl TranslationDownloads {
     }
 }
 
-/// What the translation page listens for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TranslationDownloadsEvent {
-    /// A download finished and its file is in place.
-    Completed {
-        model: TranslationModel,
-        directory: PathBuf,
-    },
-    /// A model was deleted.
-    Deleted {
-        model: TranslationModel,
-        directory: PathBuf,
-    },
-}
-
-impl EventEmitter<TranslationDownloadsEvent> for TranslationDownloads {}
-
 /// Whether `path` is a file of exactly `expected` bytes.
 fn file_size_matches(path: &Path, expected: u64) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected)
@@ -978,7 +971,7 @@ mod tests {
         request::DownloadRequest,
         task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
     };
-    use gpui_kit::{AppContext as _, Entity, TestAppContext};
+    use gpui_kit::{AppContext as _, BorrowAppContext as _, Entity, TestAppContext};
     use hyper::{
         Request, Response, StatusCode,
         body::{Body, Bytes, Frame, Incoming, SizeHint},
@@ -997,8 +990,7 @@ mod tests {
 
     use super::{
         DELETE_TIMEOUT, DeleteFailure, DownloadFailure, DownloadState, Removal,
-        TranslationDownloads, TranslationDownloadsDeps, TranslationDownloadsEvent, UnloadFailure,
-        file_size_matches,
+        TranslationDownloads, TranslationDownloadsDeps, UnloadFailure, file_size_matches,
     };
 
     /// How much of a paced payload each frame carries.
@@ -1172,31 +1164,6 @@ mod tests {
         }
     }
 
-    /// Subscribes the manager's events into a log the test asserts on.
-    fn events(
-        cx: &mut TestAppContext,
-        downloads: &Entity<TranslationDownloads>,
-    ) -> Arc<Mutex<Vec<TranslationDownloadsEvent>>> {
-        let recorded: Arc<Mutex<Vec<TranslationDownloadsEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-        cx.update(|cx| {
-            cx.subscribe(downloads, move |_, event: &TranslationDownloadsEvent, _| {
-                sink.lock()
-                    .expect("the event log is not poisoned")
-                    .push(event.clone());
-            })
-            .detach();
-        });
-
-        recorded
-    }
-
-    fn recorded_events(
-        log: &Arc<Mutex<Vec<TranslationDownloadsEvent>>>,
-    ) -> Vec<TranslationDownloadsEvent> {
-        log.lock().expect("the event log is not poisoned").clone()
-    }
-
     /// Starts a provider task for `model` in `directory` and makes it the row's own task.
     ///
     /// This is the part of a download the manager cannot do without the model's real published
@@ -1339,6 +1306,82 @@ mod tests {
             *order.lock().expect("the order log is not poisoned"),
             ["unload-before-remove"],
             "the engine must release the file before the delete removes it"
+        );
+    }
+
+    /// A selection that was made while the removal was already running is cleared when the
+    /// removal finishes: the files it names are gone by then.
+    #[gpui_kit::test]
+    fn finish_removal_should_clear_a_selection_made_while_the_removal_ran(cx: &mut TestAppContext) {
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let mut config = Config::default();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let harness = harness_with(cx, config, Arc::new(|_: &Path| Ok(())));
+
+        // What a stale menu choice or another writer may have stored after the removal started:
+        // the selection was not there when the removal began to look for it.
+        cx.update(|cx| {
+            cx.update_global::<ConfigManager, _>(|manager, cx| {
+                manager.update(|config| config.translation.selected_model = Some(model), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.finish_removal(
+                    model,
+                    directory.path().to_path_buf(),
+                    Removal::Delete,
+                    Ok(()),
+                    cx,
+                );
+            });
+        });
+
+        assert_eq!(
+            cx.update(|cx| cx
+                .global::<ConfigManager>()
+                .read()
+                .translation
+                .selected_model),
+            None,
+            "a selection that still names the removed model is cleared when the removal finishes"
+        );
+    }
+
+    /// A finished removal only clears the selection when it names the directory the removal
+    /// emptied: the same model in another directory is still there.
+    #[gpui_kit::test]
+    fn finish_removal_should_keep_a_selection_in_another_directory(cx: &mut TestAppContext) {
+        let removed = TempDir::new().expect("the removed directory builds");
+        let chosen = TempDir::new().expect("the chosen directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let mut config = Config::default();
+        config.translation.model_directory = Some(chosen.path().to_path_buf());
+        config.translation.selected_model = Some(model);
+        let harness = harness_with(cx, config, Arc::new(|_: &Path| Ok(())));
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.finish_removal(
+                    model,
+                    removed.path().to_path_buf(),
+                    Removal::Delete,
+                    Ok(()),
+                    cx,
+                );
+            });
+        });
+
+        assert_eq!(
+            cx.update(|cx| cx
+                .global::<ConfigManager>()
+                .read()
+                .translation
+                .selected_model),
+            Some(model),
+            "the selection names a directory the removal did not empty, so it is kept"
         );
     }
 
@@ -1496,7 +1539,7 @@ mod tests {
         );
     }
 
-    /// A failed download does not become the directory a later settings session opens on.
+    /// A failed download does not become the directory a later page opens on.
     #[gpui_kit::test]
     fn a_failed_download_should_not_record_its_directory(cx: &mut TestAppContext) {
         let harness = harness(cx);
@@ -1542,8 +1585,8 @@ mod tests {
         );
     }
 
-    /// A completed download does record its directory, even when the session that started it
-    /// was never confirmed.
+    /// A completed download records its directory, whether or not the page that started it is
+    /// still open.
     #[gpui_kit::test]
     fn a_completed_download_should_record_its_directory(cx: &mut TestAppContext) {
         let harness = harness(cx);
@@ -1746,7 +1789,6 @@ mod tests {
         let mut config = Config::default();
         config.translation.model_directory = Some(directory.path().to_path_buf());
         let harness = harness_with(cx, config, Arc::new(|_: &Path| Ok(())));
-        let events = events(cx, &harness.downloads);
 
         adopt(cx, &harness, model, directory.path(), address);
         wait_until(cx, "the download to complete", |cx| {
@@ -1783,13 +1825,6 @@ mod tests {
             Some(model),
             "a finished download becomes the selection when nothing usable was selected"
         );
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Completed { model: completed, .. } if *completed == model
-            )),
-            "the page is told a download finished"
-        );
     }
 
     /// A paused download keeps its bytes for a resume, and resuming finishes it.
@@ -1801,7 +1836,6 @@ mod tests {
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
         let harness = harness(cx);
-        let events = events(cx, &harness.downloads);
         let path = directory.path().join(model.file_name());
         let part = directory.path().join(format!("{}.part", model.file_name()));
 
@@ -1846,13 +1880,6 @@ mod tests {
             payload.to_vec()
         );
         assert!(!part.exists(), "the resumed transfer renames the part");
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Completed { model: completed, .. } if *completed == model
-            )),
-            "the resumed download reports its completion"
-        );
     }
 
     /// Asking for a model that already has a paused task continues that task rather than
@@ -1990,7 +2017,6 @@ mod tests {
                 Ok(())
             }),
         );
-        let events = events(cx, &harness.downloads);
         let path = directory.path().join(model.file_name());
 
         let id = adopt(cx, &harness, model, directory.path(), address);
@@ -2022,13 +2048,6 @@ mod tests {
                 total: expected,
             }),
             "the provider keeps its completed record; the delete does not need it"
-        );
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
-            )),
-            "the page is told the model was deleted"
         );
     }
 
@@ -2138,7 +2157,6 @@ mod tests {
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt27BQ8;
         let harness = harness(cx);
-        let events = events(cx, &harness.downloads);
         let path = directory.path().join(model.file_name());
         let part = directory.path().join(format!("{}.part", model.file_name()));
 
@@ -2176,13 +2194,6 @@ mod tests {
             cx.update(|cx| harness.downloads.read(cx).tasks.is_empty()),
             "the discarded download keeps no provider task"
         );
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
-            )),
-            "the page is told the failed model was deleted"
-        );
     }
 
     /// Deleting a paused download removes its partial file through the manager.
@@ -2194,7 +2205,6 @@ mod tests {
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
         let harness = harness(cx);
-        let events = events(cx, &harness.downloads);
         let path = directory.path().join(model.file_name());
         let part = directory.path().join(format!("{}.part", model.file_name()));
 
@@ -2233,13 +2243,6 @@ mod tests {
         assert!(
             cx.update(|cx| harness.downloads.read(cx).tasks.is_empty()),
             "the deleted model keeps no provider task"
-        );
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
-            )),
-            "the page is told the paused model was deleted"
         );
     }
 
@@ -2377,7 +2380,6 @@ mod tests {
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
         let harness = harness(cx);
-        let events = events(cx, &harness.downloads);
         let path = directory.path().to_path_buf();
         let part = path.join(format!("{}.part", model.file_name()));
 
@@ -2436,13 +2438,6 @@ mod tests {
             cx.update(|cx| harness.downloads.read(cx).tasks.is_empty()),
             "the previous site's task is gone before the new download starts"
         );
-        assert!(
-            recorded_events(&events).iter().any(|event| matches!(
-                event,
-                TranslationDownloadsEvent::Deleted { model: deleted, .. } if *deleted == model
-            )),
-            "the page is told the old download was deleted before the restart"
-        );
     }
 
     /// A restart whose delete fails reports the delete and keeps no intent to restart later.
@@ -2458,7 +2453,6 @@ mod tests {
             Config::default(),
             Arc::new(|_: &Path| Err(UnloadFailure::TimedOut)),
         );
-        let events = events(cx, &harness.downloads);
 
         cx.update(|cx| {
             harness.downloads.update(cx, |downloads, cx| {
@@ -2490,11 +2484,12 @@ mod tests {
             None,
             "no site was recorded for a restart that never started"
         );
-        assert!(
-            !recorded_events(&events)
-                .iter()
-                .any(|event| matches!(event, TranslationDownloadsEvent::Deleted { .. })),
-            "a delete that failed is not reported as a delete"
+        assert_eq!(
+            state(cx, &harness.downloads, model, &path),
+            DownloadState::DeleteFailed {
+                failure: DeleteFailure::Unload(UnloadFailure::TimedOut),
+            },
+            "a delete that failed is a failure the row reports, not a delete it completed"
         );
     }
 }

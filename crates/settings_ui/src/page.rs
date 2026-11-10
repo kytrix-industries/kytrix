@@ -2,16 +2,18 @@
 //!
 //! A control is built from what the catalog says about it, so this module is the only place
 //! that turns a [`FieldAccess`] into an element. What a control is given is always the same
-//! things — the settings this session holds, the page that owns the fields being typed into,
-//! and the filter that decides which of the page's fields are drawn.
+//! things — the settings as they are now, the page that owns the fields being typed into, and
+//! the filter that decides which of the page's fields are drawn.
 //!
-//! What a control writes is that session rather than the saved settings: a choice is recorded
-//! as a change to confirm, and the settings move only when the user confirms them.
+//! What a control writes is the settings themselves, through the session the settings page
+//! holds: a choice is written as the change it makes, and it is stored before the frame that
+//! follows it draws the value it left.
 //!
-//! Text fields are the one kind that own state: a field is written when the caret leaves it
-//! rather than on every keystroke, so a half-typed key is never recorded. What the page owns
-//! is the input entities, keyed by field id — see
-//! [`crate::settings::SettingsPage::input_for`].
+//! Text fields are the one kind that own state: a field is written when the caret leaves it or
+//! Enter is pressed rather than on every keystroke, so a half-typed key is never written. What is
+//! still in a field when another page is opened, or when the settings page is left, is written
+//! then — see [`crate::settings::SettingsPage::commit_pending`]. What the page owns is the input
+//! entities, keyed by field id — see [`crate::settings::SettingsPage::input_for`].
 
 use app_config::settings::Config;
 use base_ui::{
@@ -47,7 +49,7 @@ use crate::{
 /// The scroll position is handed in rather than read back from the settings page: a page is
 /// drawn while the settings page is being rendered, and the settings page cannot be read from
 /// inside its own render. The settings are handed in for the same reason, and because what is
-/// drawn is the session the page holds rather than what is saved.
+/// drawn is the settings as they are now rather than a copy of them.
 pub(crate) fn page_body(
     page: &PageDef,
     config: &Config,
@@ -188,7 +190,7 @@ fn control(
     }
 }
 
-/// A fixed set of choices, recorded as a change to confirm as soon as one is chosen.
+/// A fixed set of choices, written as soon as one is chosen.
 fn field_select(
     field: &FieldDef,
     options: &'static [SelectOptionDef],
@@ -226,17 +228,26 @@ fn field_select(
             }
         });
 
-    div().w_full().min_w_0().child(select).into_any_element()
+    div()
+        .w_full()
+        .min_w_0()
+        // The box the control itself occupies, which is what a test presses to open the menu:
+        // the row the field is drawn in holds its label above it and its description under it.
+        .debug_selector({
+            let id = field.id.clone();
+            move || format!("SETTINGS_CONTROL_{id}")
+        })
+        .child(select)
+        .into_any_element()
 }
 
 /// The line every target behind the field is bound to.
 ///
-/// The choices are the entries of the session this page holds, which are not a compile-time
-/// fact, so they are read from that session while the control is drawn. The line the row holds is
-/// always one of them: a group whose targets disagree, and an entry the catalog no longer carries,
-/// are the two lines a row can hold that no other choice names, and both are offered as
-/// themselves — a control that showed anything else would report a binding the settings do not
-/// have.
+/// The choices are the entries of the proxy catalog, which are not a compile-time fact, so they
+/// are read from the settings while the control is drawn. The line the row holds is always one of
+/// them: a group whose targets disagree, and an entry the catalog no longer carries, are the two
+/// lines a row can hold that no other choice names, and both are offered as themselves — a control
+/// that showed anything else would report a binding the settings do not have.
 ///
 /// Every row can hold a line the settings can store, whatever the catalog holds: a row that may
 /// follow the default line offers that choice even while no entry has been added yet, and the
@@ -324,7 +335,7 @@ fn field_proxy_line(
         .into_any_element()
 }
 
-/// One line of text, recorded when the caret leaves it.
+/// One line of text, written when the caret leaves it or Enter is pressed.
 fn field_text(
     field: &FieldDef,
     config: &Config,

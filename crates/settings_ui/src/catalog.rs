@@ -2,7 +2,7 @@
 //!
 //! This is a declaration rather than a database. Nothing here reads the settings or draws
 //! anything: a page says what it holds and how each control converts to and from the stored
-//! value, and the dialog is what turns that into a sidebar and a form.
+//! value, and the settings page is what turns that into a sidebar and a form.
 //!
 //! Ids are the identity of a setting. A field id is what a value is remembered under while
 //! it is being typed and what a search matches it against, so it is not a rendering detail
@@ -23,7 +23,7 @@ use crate::{
 /// The page the settings open on.
 pub(crate) const DEFAULT_PAGE: &str = "appearance";
 
-/// The page a dialog opens on.
+/// The page the settings page opens on.
 pub(crate) const fn default_page() -> &'static str {
     DEFAULT_PAGE
 }
@@ -196,9 +196,9 @@ pub(crate) enum FieldAccess {
     /// One of the lines a venue or a group of Kytrix services is bound to.
     ///
     /// The choices depend on the proxy catalog, which is not a compile-time fact: the entries
-    /// of the session the dialog holds are read from it while the control is drawn. Which venue
-    /// or which services the field covers is a compile-time fact of the page that declares it, so
-    /// it is captured by the closures rather than looked up from the field's id.
+    /// of the settings are read from it while the control is drawn. Which venue or which services
+    /// the field covers is a compile-time fact of the page that declares it, so it is captured by
+    /// the closures rather than looked up from the field's id.
     ProxyLine {
         /// Whether the row is the document-wide default line itself: it is the one line no
         /// other line can follow, so the row that sets it offers no "follow the default line"
@@ -273,8 +273,9 @@ impl SectionDef {
 /// One page of the settings.
 ///
 /// A page is a declaration: its identity is the id this module writes, and its fields are the
-/// controls the dialog draws for it. The venue pages are built one per venue this build speaks,
-/// so which of them exist is a fact of the build rather than of anything loaded or stored.
+/// controls the settings page draws for it. The venue pages are built one per venue this build
+/// speaks, so which of them exist is a fact of the build rather than of anything loaded or
+/// stored.
 #[derive(Clone)]
 pub(crate) struct PageDef {
     pub id: SharedString,

@@ -1,15 +1,17 @@
 //! The form that adds a proxy to the catalog or changes one already in it.
 //!
 //! The form is a dialog of its own on the same window layer as the settings, drawn over them, and
-//! it owns nothing but a draft of one entry: what it holds is not written to the settings when the
-//! user confirms the form, so a cancelled edit leaves the catalog exactly as it was. What the
-//! confirm button does is record the entry as a change of the settings session, which the
-//! settings dialog writes when the user confirms that. What is recorded is validated first,
-//! and a rejected form reports every problem at once rather than one field at a time.
+//! it owns nothing but a draft of one entry: what it holds is not written to the settings until
+//! the user confirms the form, so a cancelled edit leaves the catalog exactly as it was. What the
+//! confirm button does is write the entry into the settings, as one change: an added entry is
+//! added, and an edited one is replaced together with every route bound to its name. A form whose
+//! entry cannot be stored stays open with what the user typed, and the settings page reports why.
+//! What is written is validated first, and a rejected form reports every problem at once rather
+//! than one field at a time.
 //!
 //! Dismissing the form takes it off the layer and leaves the settings it was opened over exactly
-//! where they were, which is why nothing has to be re-mounted: the settings are never taken off
-//! the layer, so the page they were showing, the search they were answered by and every field the
+//! where they were, which is why nothing has to be re-mounted: the settings page is never taken
+//! off the layer, so the page it was showing, the search it was answered by and every field the
 //! user had filled in are still there. The form is drawn over the settings and takes the mouse
 //! from them, so a click aimed at the settings reaches the form while it is open.
 //!
@@ -43,7 +45,7 @@ use smol_str::SmolStr;
 
 use crate::{
     access::{FieldValue, ProxyDraft},
-    draft::{SettingsDraft, SettingsEdit},
+    session::{SettingsChange, SettingsSession},
 };
 
 /// How wide the form is.
@@ -176,8 +178,8 @@ impl FormErrors {
 pub(crate) struct ProxyEditor {
     kind: ProxyFormKind,
     draft: ProxyDraft,
-    /// The settings session the entry is recorded in.
-    session: Entity<SettingsDraft>,
+    /// The settings session the entry is written through.
+    session: Entity<SettingsSession>,
     authorization: Authorization,
     errors: FormErrors,
     name: Entity<InputState>,
@@ -197,22 +199,22 @@ impl EventEmitter<DismissEvent> for ProxyEditor {}
 
 impl ProxyEditor {
     /// Opens the form that adds an entry.
-    pub fn show_add(session: Entity<SettingsDraft>, window: &mut Window, cx: &mut App) {
+    pub fn show_add(session: Entity<SettingsSession>, window: &mut Window, cx: &mut App) {
         Self::show(ProxyFormKind::Add, ProxyDraft::empty(), session, window, cx);
     }
 
     /// Opens the form that changes one entry.
     ///
-    /// The entry is read from the session here rather than handed in, so a form opened from a
+    /// The entry is read from the settings here rather than handed in, so a form opened from a
     /// row is always started from what the catalog holds instead of from what the row happened
     /// to be drawn with.
     pub fn show_edit(
         name: &SmolStr,
-        session: Entity<SettingsDraft>,
+        session: Entity<SettingsSession>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let stored = session.read(cx).config().proxies.get(name).cloned();
+        let stored = session.read(cx).config(cx).proxies.get(name).cloned();
         let Some(proxy) = stored else {
             log::warn!("editing proxy {name} which is no longer in the catalog");
             return;
@@ -232,7 +234,7 @@ impl ProxyEditor {
     fn show(
         kind: ProxyFormKind,
         draft: ProxyDraft,
-        session: Entity<SettingsDraft>,
+        session: Entity<SettingsSession>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -353,7 +355,7 @@ impl ProxyEditor {
         } else if self
             .session
             .read(cx)
-            .config()
+            .config(cx)
             .proxies
             .keys()
             .any(|existing| existing.as_str() == name && original != Some(existing.as_str()))
@@ -408,15 +410,16 @@ impl ProxyEditor {
         ))
     }
 
-    /// Records the entry in the settings session, or reports what is wrong with the form.
+    /// Writes the entry into the settings, or reports what is wrong with the form.
     ///
-    /// What the form holds is recorded as one change: an edit that renames an entry moves it
+    /// What the form holds is written as one change: an edit that renames an entry moves it
     /// and every route bound to it together, which is why it goes through the catalog's own
-    /// replacement rather than through an insert and a delete. Nothing is written to the
-    /// settings here — the session is what the user confirms.
+    /// replacement rather than through an insert and a delete.
     ///
-    /// An entry that has been recorded takes the form off the layer, which uncovers the settings
-    /// it was opened over: what is left for the user to confirm is theirs.
+    /// An entry that has been stored takes the form off the layer, which uncovers the settings it
+    /// was opened over. One that could not be stored leaves the form open with what the user
+    /// typed: the settings page reports the reason, and the form is where the entry is submitted
+    /// again from.
     fn confirm(&mut self, cx: &mut Context<Self>) {
         self.commit_inputs(cx);
         let (name, proxy) = match self.validate(cx) {
@@ -428,17 +431,24 @@ impl ProxyEditor {
             }
         };
 
-        let edit = match &self.kind {
-            ProxyFormKind::Add => SettingsEdit::AddProxy { name, proxy },
-            ProxyFormKind::Edit { original } => SettingsEdit::ReplaceProxy {
+        let change = match &self.kind {
+            ProxyFormKind::Add => SettingsChange::AddProxy { name, proxy },
+            ProxyFormKind::Edit { original } => SettingsChange::ReplaceProxy {
                 original: original.clone(),
                 name,
                 proxy,
             },
         };
-        self.session
-            .update(cx, |session, cx| session.write(edit, cx));
-        cx.emit(DismissEvent);
+        let stored = self
+            .session
+            .update(cx, |session, cx| session.write(change, cx));
+
+        match stored {
+            Ok(()) => cx.emit(DismissEvent),
+            // The reason is the settings page's to report, and the form stays where the user can
+            // submit it again.
+            Err(_) => cx.notify(),
+        }
     }
 
     /// One text field, with its label and whatever is wrong with it.

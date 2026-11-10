@@ -3,18 +3,21 @@
 //!
 //! The page owns what outlives a frame: the page that is drawn, the state of every text field on
 //! it, and the scroll position of that page. Everything else — what a page holds, what a control
-//! writes — belongs to the catalog and to the draft.
+//! writes — belongs to the catalog and to the settings themselves.
 //!
-//! The page has the gallery's shape: a title and the search field in its header, the settings
-//! menu on the left with the detail page behind the selected entry on the right, and the two
-//! decisions — cancel, confirm — under a separator at its foot. The sidebar does not fold: a
-//! group is the heading over the pages under it, and a page is the one kind of row that opens
-//! anything. What a page opens is the page drawn beside the list, so the two are one thing and
-//! move together.
+//! The page has the gallery's shape: a title and the search field in its header, and the settings
+//! menu on the left with the detail page behind the selected entry on the right. There is no
+//! footer: a control writes the change it makes at once, so there is nothing to confirm and
+//! nothing to cancel, and the page is left through the workspace rows alone. The sidebar does not
+//! fold: a group is the heading over the pages under it, and a page is the one kind of row that
+//! opens anything. What a page opens is the page drawn beside the list, so the two are one thing
+//! and move together.
 //!
-//! A control writes the draft rather than the settings, so the settings are the ones the user
-//! confirmed and nothing else: what leaves this page is one commit, made when the user asks for
-//! it, and a commit that cannot be stored leaves the page open with what the user had.
+//! A control writes the settings rather than a copy of them, through the session every view of
+//! this page shares — see [`SettingsPage::write_field`]. A write that cannot be stored leaves the
+//! settings as they were and is reported over the page, so what the user had is still there to try
+//! again with. A text field is written when the caret leaves it or Enter is pressed, and what is
+//! still unsaved when another page is opened or this one is left is written then.
 //!
 //! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its
 //! own label nor by a field on it is not drawn at all, and a group with none of its pages left
@@ -31,13 +34,10 @@
 //! fields. The form that changes the proxy catalog is a dialog on the window layer, drawn over
 //! this page. A row cannot open one itself — a table cell is drawn without a window — so it
 //! records the form it wants and this page opens it on the layer. The form writes the same
-//! draft, because it is one session either way. Deleting a row is the one request that is put to
-//! the user before it is recorded, and the alert it is put to is opened the same way — see
+//! session, because it is one page either way. Deleting a row is the one request that is put to
+//! the user before it is written, and the alert it is put to is opened the same way — see
 //! [`SettingsPage::open_requested_form`].
 
-use std::borrow::BorrowMut as _;
-
-use app_config_provider::manager::ConfigManager;
 use base_ui::{
     button::Button,
     icon::{Icon, IconKind},
@@ -50,10 +50,10 @@ use base_ui::{
     style::theme::ThemeExt,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, DismissEvent, ElementId,
-    Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Pixels,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    base::Selectable as _, div, px,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, base::Selectable as _,
+    div, px,
 };
 use i18n::{language::codes::LanguageCode, t};
 use market_participants_connector::venue::definition::supported_venues;
@@ -63,17 +63,16 @@ use crate::{
     catalog::{
         Catalog, FieldAccess, FieldDef, PageDef, TreeNodeDef, VenueView, catalog, default_page,
     },
-    draft::{SettingsDraft, SettingsEdit},
     editor::ProxyEditor,
     page,
     search::{FieldSearch, PageSearch, SearchFilter, SearchNode},
+    session::{SettingsChange, SettingsSession},
     table::{ProxyRequest, ProxyTable},
     translation::TranslationPage,
 };
 
-/// The widest the page's content column gets, which is also the widest the footer's button row
-/// gets. The footer's separator is drawn outside the column, so it keeps the page's full width
-/// while the header, both columns and the buttons are centred.
+/// The widest the page's content column gets. The column holds the header and the two panels
+/// beside each other, and the page's background keeps the window's full width around it.
 const CONTENT_MAX_WIDTH: Pixels = px(1000.0);
 
 /// The width of the field the settings are searched with, drawn at the end of the header.
@@ -85,10 +84,11 @@ const SEARCH_INPUT_ID: &str = "settings-search";
 /// One text field of one page, remembered for as long as the page is open.
 struct FieldInput {
     /// The field this is the input of, which is what says how to read it and how to write it
-    /// back: a commit made from the confirm button has no page to look the field up on.
+    /// back: what the field commits has no page to look the field up on.
     field: FieldDef,
-    /// What the draft said when the field was built, which is what a rebuild compares
-    /// against: a value that changed under the field is a value the field has to show.
+    /// The value this input was last aligned with the settings on, which is what a rebuild
+    /// compares against: a value the field holds that is neither this nor the stored one is a
+    /// value the user typed and the settings have not taken.
     built_from: FieldValue,
     /// The placeholder the field carries, which is text of the language it was built in and is
     /// written again when that moved on.
@@ -101,11 +101,14 @@ struct FieldInput {
 
 /// The whole of the settings, as the main window's settings page.
 pub struct SettingsPage {
-    /// What this session has changed, which is what every page is drawn from.
+    /// The session every control of this page writes through.
     ///
-    /// The settings themselves are not read here: a page that read them would show a value the
-    /// user has already changed as the value they are changing it from.
-    draft: Entity<SettingsDraft>,
+    /// The settings themselves are not held here: a page reads them from the session on every
+    /// frame, so what it draws is what is stored rather than what a session started from.
+    session: Entity<SettingsSession>,
+    /// Held because it is what draws the page again after a write, and what a failed write
+    /// reaches the page through.
+    _session: Subscription,
     current_page: SharedString,
     /// The catalog this session draws: the pages of the venues this build speaks.
     ///
@@ -141,13 +144,8 @@ pub struct SettingsPage {
     search_events: Option<Subscription>,
 }
 
-/// The settings ask to be left by emitting a dismissal: what the cancel and confirm buttons do
-/// is end this session, and the main window is what takes the page away and shows the workspace
-/// again.
-impl EventEmitter<DismissEvent> for SettingsPage {}
-
 impl SettingsPage {
-    /// The settings page, opened on a session that starts from what is stored now.
+    /// The settings page, opened over the settings that are stored now.
     ///
     /// The catalog is the venues this build speaks and the fields each of their APIs has: a venue
     /// this build speaks has its line and its page whether or not it is loaded, and every value
@@ -157,11 +155,10 @@ impl SettingsPage {
     /// built on the first frame rather than here, because the page is built before the window
     /// it is about to be shown in has drawn it.
     pub fn load(cx: &mut Context<Self>) -> Self {
-        let stored = cx.global::<ConfigManager>().read();
-        let draft = cx.new(|_| SettingsDraft::new(stored.as_ref().clone()));
+        let session = cx.new(|_| SettingsSession::new());
         let venues: VenueView = supported_venues().into();
 
-        Self::build(draft, catalog(&venues), cx)
+        Self::build(session, catalog(&venues), cx)
     }
 
     /// Builds the page over the catalog it draws.
@@ -171,22 +168,27 @@ impl SettingsPage {
     /// of without the production catalog having to offer it.
     #[cfg(test)]
     pub(crate) fn new_with_catalog(
-        draft: Entity<SettingsDraft>,
+        session: Entity<SettingsSession>,
         catalog: Catalog,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(draft, catalog, cx)
+        Self::build(session, catalog, cx)
     }
 
-    /// The whole of the settings, over the catalog they draw and the draft the session holds.
-    fn build(draft: Entity<SettingsDraft>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
+    /// The whole of the settings, over the catalog they draw and the session they are written
+    /// through.
+    fn build(session: Entity<SettingsSession>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         let filter = SearchFilter::new("", &search_nodes(&catalog, cx));
-        let proxies = cx.new(|cx| ProxyTable::new(draft.clone(), cx));
+        let proxies = cx.new(|cx| ProxyTable::new(session.clone(), cx));
         let downloads = crate::translation_downloads::entity(cx);
-        let translation = cx.new(|cx| TranslationPage::new(draft.clone(), downloads, cx));
+        let translation = cx.new(|cx| TranslationPage::new(session.clone(), downloads, cx));
+        // Every write of this page repaints it: the page draws what is stored, and a write that
+        // failed is reported on the frame that follows it.
+        let session_changes = cx.observe(&session, |_, _, cx| cx.notify());
 
         Self {
-            draft,
+            session,
+            _session: session_changes,
             current_page: SharedString::new_static(default_page()),
             catalog,
             query: SharedString::default(),
@@ -253,6 +255,18 @@ impl SettingsPage {
         // of the language it was answered in.
         self.filter = SearchFilter::new(&self.query, &search_nodes(&self.catalog, cx));
         self.rebuild_sidebar(cx);
+        // A query answered in one language does not have to answer the same way in another: the
+        // page that is drawn may be one the new language no longer reaches, and what is drawn
+        // then is the message in both columns. The first page that is still reachable is where
+        // the page goes instead, the way a search moves it. A page the new language still reaches
+        // is not moved, so what the user scrolled to on it stays where it was: the scroll is reset
+        // by a page that moves, not by the language itself.
+        let reachable = self
+            .page()
+            .is_some_and(|page| page_is_reachable(page, &self.filter));
+        if !reachable && let Some(page) = first_admitted_page(&self.catalog, &self.filter) {
+            self.move_to(page.as_str(), cx);
+        }
         if let Some(input) = self.search_input.as_ref() {
             let placeholder = t!(cx, "settings_ui.search.placeholder");
             input.update(cx, |input, cx| {
@@ -265,7 +279,12 @@ impl SettingsPage {
     /// afterwards.
     ///
     /// Reusing it is what keeps a caret where it was: an input rebuilt on every frame is an
-    /// input the user is typing into that loses what they typed.
+    /// input the user is typing into that loses what they typed. What an input is reused for is
+    /// the field it belongs to holding either the value it was last aligned with the settings on
+    /// or the value the settings hold now: the first is a field the user is typing into, the
+    /// second a field whose own write has already been stored, and both are what the user is
+    /// looking at. Anything else is a field whose value moved under it, and that one is built
+    /// again around the value the settings hold.
     pub(crate) fn input_for(
         &mut self,
         field: FieldDef,
@@ -286,25 +305,32 @@ impl SettingsPage {
         if let Some(input) = self
             .inputs
             .iter_mut()
-            .find(|input| input.field.id == field.id && &input.built_from == stored)
+            .find(|input| input.field.id == field.id)
         {
-            // What a field that is used again holds is left alone, because the user may be
-            // typing into it. Its placeholder is text of the language it was built in, so that
-            // is written again rather than left in the language the interface has left.
-            if input.placeholder != placeholder {
-                let text = placeholder.clone().unwrap_or_default();
-                input.entity.update(cx, |input, cx| {
-                    input.update_placeholder(text, window, cx);
-                });
-                input.placeholder = placeholder;
-            }
+            let current = input.entity.read(cx).value(cx);
+            if &input.built_from == stored || current.as_str() == stored.as_str() {
+                // A write of this field has been stored since the input was built, so the value
+                // it was built from is one frame behind what the field now holds: the input is
+                // what the settings moved to, and it is taken as aligned rather than rebuilt.
+                input.built_from = stored.clone();
+                // What a field that is used again holds is left alone, because the user may be
+                // typing into it. Its placeholder is text of the language it was built in, so
+                // that is written again rather than left in the language the interface has left.
+                if input.placeholder != placeholder {
+                    let text = placeholder.clone().unwrap_or_default();
+                    input.entity.update(cx, |input, cx| {
+                        input.update_placeholder(text, window, cx);
+                    });
+                    input.placeholder = placeholder;
+                }
 
-            return input.entity.clone();
+                return input.entity.clone();
+            }
         }
 
-        // A field whose drafted value changed elsewhere is rebuilt around the value the draft
-        // now holds: what the field had is what the user was looking at, and what they are
-        // configuring is the draft.
+        // A field whose stored value changed elsewhere is rebuilt around that value: what the
+        // field had is what the user was looking at, and what they are configuring is the
+        // settings.
         self.inputs.retain(|input| input.field.id != field.id);
         let entity = cx.new(|cx| {
             let mut builder =
@@ -321,11 +347,16 @@ impl SettingsPage {
         let access = field.access.clone();
         let subscription =
             cx.subscribe(&entity, move |settings, _, event: &InputStateEvent, cx| {
-                let InputStateEvent::Blur(value) = event else {
-                    return;
-                };
-                let value = FieldValue::new(value.as_str());
-                settings.write_field(access.clone(), value, cx);
+                // A field is written when the user is done with it rather than on every
+                // keystroke: a half-typed key is never stored, and Enter is the way to write one
+                // without leaving the field.
+                match event {
+                    InputStateEvent::Blur(value) | InputStateEvent::PressEnter(value) => {
+                        let value = FieldValue::new(value.as_str());
+                        settings.write_field(access.clone(), value, cx);
+                    }
+                    InputStateEvent::Change(_) => {}
+                }
             });
         self.inputs.push(FieldInput {
             field,
@@ -338,10 +369,10 @@ impl SettingsPage {
         entity
     }
 
-    /// Writes one value into the draft this session holds.
+    /// Writes one value into the settings this page draws.
     ///
-    /// A value the draft already holds is not recorded: what a commit replays is the changes
-    /// the user made, not the value every field happens to be showing.
+    /// A value the settings already hold is not written: a field that is submitted without being
+    /// changed is not a change, and storing it would be a write and a set of events for nothing.
     pub(crate) fn write_field(
         &mut self,
         access: FieldAccess,
@@ -349,34 +380,37 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) {
         let unchanged = {
-            let config = self.draft.read(cx).config();
+            let config = self.session.read(cx).config(cx);
             access.current(config.as_ref()) == value
         };
         if unchanged {
             return;
         }
 
-        let edit = SettingsEdit::Field { access, value };
-        self.draft.update(cx, |draft, cx| draft.write(edit, cx));
+        let change = SettingsChange::Field { access, value };
+        self.session.update(cx, |session, cx| {
+            let _ = session.write(change, cx);
+        });
+        // A control that offered a value the settings refused draws the old value again on the
+        // frame that follows: the session is not written then, so the page is told to draw.
         cx.notify();
     }
 
-    /// Writes what every text field currently holds into the draft.
+    /// Writes what every text field currently holds.
     ///
-    /// A text field commits when the caret leaves it, and clicking a button does not take the
-    /// caret away from it: without this, the last thing typed before the confirm button was
-    /// pressed would be the one thing the commit did not carry.
-    fn commit_inputs(&mut self, cx: &mut Context<Self>) {
-        // The fields are read while the draft is written, and the draft is written through
-        // `self`, so what to write is collected before anything is written.
+    /// A text field is written when the caret leaves it, and opening another page or leaving the
+    /// page does not take the caret away from it: without this, the last thing typed before the
+    /// page moved on would be the one thing the settings did not carry.
+    fn commit_pending_inputs(&mut self, cx: &mut Context<Self>) {
+        // The fields are read while the settings are written, and the settings are written
+        // through `self`, so what to write is collected before anything is written.
         let pending = self
             .inputs
             .iter()
-            .map(|input| {
-                (
-                    input.field.access.clone(),
-                    FieldValue::new(input.entity.read(cx).value(cx).as_str()),
-                )
+            .filter_map(|input| {
+                let value = input.entity.read(cx).value(cx);
+                (value.as_str() != input.built_from.as_str())
+                    .then(|| (input.field.access.clone(), FieldValue::new(value.as_str())))
             })
             .collect::<Vec<_>>();
 
@@ -385,65 +419,60 @@ impl SettingsPage {
         }
     }
 
-    /// Writes what this session changed into the settings, or says why it could not.
+    /// Writes what is still typed into a text field, and says why it could not be stored.
     ///
-    /// What is written is the changes replayed onto the settings as they are now rather than
-    /// the draft as it was built: work that wrote the settings while this page was open —
-    /// a generated avatar, a persisted workspace layout, a saved sidebar state — is not this
-    /// page's to undo.
-    ///
-    /// A commit that cannot be stored leaves the page exactly as it was, draft included, so
-    /// the user can try again rather than lose what they configured.
-    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_inputs(cx);
-        let previous = cx.global::<ConfigManager>().read();
-        let mut applied = self.draft.read(cx).applied_to(previous.as_ref());
-        // The draft's directory and a selection the background download manager may have
-        // written while the page was open can disagree: a model auto-selected in the stored
-        // directory is not downloaded in the directory this session is about to store. A model
-        // whose files are being removed is not available either, even if the file is still
-        // there while the engine unloads. Clear such a selection rather than persist it.
-        if let Some(downloads) = crate::translation_downloads::entity(cx)
-            && let Some(selected) = applied.translation.selected_model
-        {
-            let available =
-                applied
-                    .translation
-                    .model_directory
-                    .as_deref()
-                    .is_some_and(|directory| {
-                        let downloads = downloads.read(cx);
-                        !downloads.row_state(selected, directory).is_removing()
-                            && downloads.is_downloaded(selected, directory)
-                    });
-            if !available {
-                applied.translation.selected_model = None;
-            }
-        }
-        let stored = cx.update_global::<ConfigManager, _>(|manager, cx| {
-            manager.write(applied, cx.borrow_mut())
-        });
+    /// The main window is what asks this before it takes the page away. The page is left either
+    /// way: what is reported is the last write that did not land, and the input it came from is
+    /// what the user lost by leaving.
+    pub fn commit_pending(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        self.commit_pending_inputs(cx);
 
-        match stored {
-            Ok(()) => cx.emit(DismissEvent),
-            Err(error) => {
-                let title = t!(cx, "settings_ui.save_failed.title");
-                let message = t!(cx, "settings_ui.save_failed.message", reason = error);
-                let confirm = t!(cx, "common.confirm");
-                window.alert(cx, move |alert, _window, _cx| {
-                    alert.ok(title, message).ok_text(confirm)
-                });
-            }
-        }
+        self.session
+            .update(cx, |session, _| session.take_failure())
+            .map(|error| error.to_string())
+    }
+
+    /// Reports the last write that could not be stored, if one is waiting.
+    ///
+    /// The reason is taken out of the session, so it is reported once. What a failed write leaves
+    /// behind is the settings as they were: a choice is drawn from them again and shows the old
+    /// value, and a text field keeps what the user typed so the write can be made again.
+    fn report_write_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.session.update(cx, |session, _| session.take_failure()) else {
+            return;
+        };
+
+        show_write_failure(window, cx, error.to_string());
     }
 
     /// Selects the page one sidebar row names.
     ///
+    /// What is still typed into a text field of the page being left is written first: the field
+    /// is not drawn any more, so nothing else would write it. The caret goes with the page it was
+    /// on, because the field it was in is not drawn any more and a keystroke would reach something
+    /// the user cannot see. The page moves even when that write failed, because the input is kept
+    /// by this page and the field is still there to be submitted again when the user comes back.
+    fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page == id {
+            return;
+        }
+
+        self.commit_pending_inputs(cx);
+        window.blur(cx);
+        self.move_to(id, cx);
+    }
+
+    /// Moves the page to one entry of the sidebar.
+    ///
     /// The page drawn and the row that names it are one thing: the row is drawn selected from
     /// the page the settings are on, so a page moved on its own would leave the row behind it, and
     /// the field the user is typing into would stop being drawn under the caret that is still
-    /// in it.
-    fn select(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// in it. Nothing is written here: this is what the page moves by, and what a search or a
+    /// language switch moves it with.
+    ///
+    /// The translation page repairs its settings when it is opened, and being moved to is what
+    /// opens it: see [`crate::translation::TranslationPage::repair_on_open`].
+    fn move_to(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.current_page == id {
             return;
         }
@@ -451,6 +480,10 @@ impl SettingsPage {
         self.current_page = SharedString::from(id);
         self.page_scroll = ScrollHandle::new();
         self.reveal_current_page();
+        if self.current_page.as_ref() == "ai.translation" {
+            self.translation
+                .update(cx, |page, cx| page.repair_on_open(cx));
+        }
         cx.notify();
     }
 
@@ -475,8 +508,10 @@ impl SettingsPage {
         if let Some(page) = next {
             // The page moves the way a selection moves rather than on its own: the page drawn
             // and the row that names it are one thing, so a page moved without the sidebar is
-            // a page the sidebar has no row for.
-            self.select(page.as_str(), cx);
+            // a page the sidebar has no row for. A search is not a page being left, though: what
+            // a text field still holds is written when the page is selected or left, not when
+            // the query that narrows the sidebar changed.
+            self.move_to(page.as_str(), cx);
         }
         cx.notify();
     }
@@ -537,13 +572,13 @@ impl SettingsPage {
     ///
     /// A delete is not a form: it is one decision, and it is the one row action that cannot be
     /// taken back, because removing an entry resets every route that named it. So it is put to the
-    /// user as an alert over the settings, and only what the alert confirms is recorded — walking
-    /// away from it leaves the draft, and with it the catalog the rows are drawn from, as it was.
+    /// user as an alert over the settings, and only what the alert confirms is written — walking
+    /// away from it leaves the catalog the rows are drawn from as it was.
     fn open_requested_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.proxies.update(cx, |table, _| table.take_request()) {
-            Some(ProxyRequest::Add) => ProxyEditor::show_add(self.draft.clone(), window, cx),
+            Some(ProxyRequest::Add) => ProxyEditor::show_add(self.session.clone(), window, cx),
             Some(ProxyRequest::Edit { name }) => {
-                ProxyEditor::show_edit(&name, self.draft.clone(), window, cx)
+                ProxyEditor::show_edit(&name, self.session.clone(), window, cx)
             }
             Some(ProxyRequest::Delete { name }) => {
                 // Both the alert and its action are `'static`, so every sentence is resolved here,
@@ -556,7 +591,7 @@ impl SettingsPage {
                 );
                 let confirm = t!(cx, "common.confirm");
                 let cancel = t!(cx, "common.cancel");
-                let draft = self.draft.clone();
+                let session = self.session.clone();
 
                 window.alert(cx, move |alert, _, _| {
                     alert
@@ -564,8 +599,10 @@ impl SettingsPage {
                         .ok_text(confirm)
                         .cancel_text(cancel)
                         .ok_action(move |_, _, cx| {
-                            let edit = SettingsEdit::RemoveProxy { name: name.clone() };
-                            draft.update(cx, |draft, cx| draft.write(edit, cx));
+                            session.update(cx, |session, cx| {
+                                let change = SettingsChange::RemoveProxy { name: name.clone() };
+                                let _ = session.write(change, cx);
+                            });
                         })
                 });
             }
@@ -688,8 +725,8 @@ impl SettingsPage {
                         })
                         .child(Icon::new(IconKind::GearSix).size_4())
                         .child(label.clone())
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.select(page.as_str(), cx);
+                        .on_click(cx.listener(move |settings, _, window, cx| {
+                            settings.select(page.as_str(), window, cx);
                         }))
                         .into_any_element()
                 }
@@ -710,6 +747,7 @@ impl SettingsPage {
 
 impl Render for SettingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.report_write_failure(window, cx);
         self.adopt_language(window, cx);
         self.sync_sidebar(cx);
         self.open_requested_form(window, cx);
@@ -726,7 +764,8 @@ impl Render for SettingsPage {
             .cloned();
         let page = match selected {
             // These two pages carry no fields of the catalog: each is drawn by the view that
-            // owns it, and both read the draft rather than the saved settings.
+            // owns it, and both read the settings through the session rather than a copy of
+            // them.
             Some(page_def) if page_def.id.as_ref() == "ai.translation" => div()
                 .size_full()
                 .min_w_0()
@@ -740,7 +779,7 @@ impl Render for SettingsPage {
                 .child(self.proxies.clone())
                 .into_any_element(),
             Some(page_def) => {
-                let config = self.draft.read(cx).config();
+                let config = self.session.read(cx).config(cx);
                 let filter = self.filter.clone();
                 page::page_body(
                     &page_def,
@@ -829,51 +868,20 @@ impl Render for SettingsPage {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_FOOTER".into())
-                    .flex_none()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .child(Separator::horizontal())
-                    .child(
-                        div().w_full().flex().justify_center().child(
-                            div()
-                                .w(CONTENT_MAX_WIDTH)
-                                .max_w_full()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap_2()
-                                .px_6()
-                                .py_3()
-                                .child(
-                                    Button::new("settings-cancel")
-                                        .tonal()
-                                        .medium()
-                                        .debug_selector(|| "SETTINGS_CANCEL".into())
-                                        .aria_label(t!(cx, "common.cancel"))
-                                        .child(t!(cx, "common.cancel"))
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(DismissEvent);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("settings-confirm")
-                                        .filled()
-                                        .medium()
-                                        .debug_selector(|| "SETTINGS_CONFIRM".into())
-                                        .aria_label(t!(cx, "common.confirm"))
-                                        .child(t!(cx, "common.confirm"))
-                                        .on_click(cx.listener(|settings, _, window, cx| {
-                                            settings.confirm(window, cx);
-                                        })),
-                                ),
-                        ),
-                    ),
-            )
     }
+}
+
+/// Shows why a change could not be stored.
+///
+/// The settings page reports its own failures with this, and so does the main window when leaving
+/// the page discarded what was still typed into a field: one sentence, wherever it is reported.
+pub fn show_write_failure(window: &mut Window, cx: &mut App, reason: String) {
+    let title = t!(cx, "settings_ui.save_failed.title");
+    let message = t!(cx, "settings_ui.save_failed.message", reason = reason);
+    let confirm = t!(cx, "common.confirm");
+    window.alert(cx, move |alert, _window, _cx| {
+        alert.ok(title, message).ok_text(confirm)
+    });
 }
 
 /// What a column says when the query admitted nothing it could draw.
@@ -1076,3744 +1084,4 @@ fn sidebar_entries(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{fs, path::PathBuf};
-
-    use app_config::{
-        market_participants::{
-            credentials::{BinanceCredentials, LongbridgeCredentials, OkxCredentials},
-            origins::LongbridgeRegion,
-            settings::VenueSettings,
-        },
-        network::{ProxyAuthorizationConfig, ProxyConfig},
-        settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
-        translation::{DownloadSite, TranslationModel},
-        ui::SidebarMode,
-        workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
-    };
-    use app_config_provider::{
-        events::{AppearanceChanged, LanguageChanged},
-        manager::ConfigManager,
-        store::ConfigPersistenceError,
-    };
-    use base_ui::{
-        animation::ANIMATION_TICK,
-        layer::Layer,
-        size::UnifiedSize,
-        style::{palette::Appearance as ThemeAppearance, theme::ThemeExt as _},
-    };
-    use download_provider::error::DownloadFailure;
-    use gpui_kit::{
-        AppContext as _, BorrowAppContext as _, Context, DismissEvent, Entity, IntoElement,
-        Modifiers, ParentElement as _, Render, SharedString, Styled, Subscription, TestAppContext,
-        VisualTestContext, Window, WindowAppearance, div, px, size,
-    };
-    use i18n::{language::codes::LanguageCode, t};
-    use market_participants_connector::connector::MarketParticipantsConnector;
-    use market_participants_model::identifier::VenueId;
-    use smol_str::SmolStr;
-    use tempfile::TempDir;
-    use widget_tokio_runtime::global;
-
-    use super::{SettingsPage, SidebarEntry, default_page};
-    use crate::{
-        access::FieldValue,
-        appearance,
-        catalog::{Catalog, FieldAccess, PageDef, VenueView, catalog},
-        draft::SettingsDraft,
-        search::SearchFilter,
-        table::ProxyRequest,
-        translation_downloads::{DeleteFailure, DownloadState},
-    };
-
-    /// The venues every test of this module draws the settings from.
-    ///
-    /// The page draws its venue pages from whichever venue list it is handed, which in production
-    /// is what this build speaks — see [`SettingsPage::load`] — and here is this fixture.
-    fn venues() -> VenueView {
-        crate::schema::tests::venues()
-    }
-
-    /// The catalog of one venue list, over the fixture settings.
-    ///
-    /// The catalog of the venues this build speaks.
-    fn test_catalog() -> Catalog {
-        catalog(&venues())
-    }
-
-    /// The pages of the fixture catalog.
-    fn pages() -> Vec<PageDef> {
-        test_catalog().pages
-    }
-
-    /// The label one page of the fixture catalog is drawn with.
-    ///
-    /// A page is named by the message key it declares or by the identity it stands
-    /// for, and the sidebar draws whichever the catalog carries.
-    fn page_title(page: &str, cx: &TestAppContext) -> SharedString {
-        cx.read(|cx| {
-            test_catalog()
-                .page(page)
-                .unwrap_or_else(|| panic!("{page} should be in the catalog"))
-                .title
-                .label(cx)
-        })
-    }
-
-    /// The window root that hosts one settings page, standing in for the main window's page
-    /// area.
-    ///
-    /// It is also the test fixture's half of the application's projections: the language the
-    /// interface is rendered through and the appearance the window is drawn in. Without them a
-    /// confirmed preference would reach the settings but not the page drawing it.
-    ///
-    /// The page is dropped when it asks to be dismissed, which is what the main window does when
-    /// the page area goes back to the workspace. A form over the page and an alert over it are
-    /// window dialogs, so the root is still a [`Layer`].
-    struct PageHost {
-        page: Option<Entity<SettingsPage>>,
-        _dismiss: Subscription,
-        _language: Subscription,
-        _appearance: Subscription,
-    }
-
-    impl PageHost {
-        fn new(page: Entity<SettingsPage>, window: &Window, cx: &mut Context<Self>) -> Self {
-            let dismiss = cx.subscribe(&page, |host, _, _: &DismissEvent, cx| {
-                host.page = None;
-                cx.notify();
-            });
-            let events = cx.global::<ConfigManager>().events().clone();
-            let language = cx.subscribe(&events, |_, _, event: &LanguageChanged, cx| {
-                cx.set_global(match event.0 {
-                    Language::ZhCn => LanguageCode::ZhCn,
-                    Language::En => LanguageCode::En,
-                });
-                cx.refresh_windows();
-            });
-            let appearance = cx.subscribe_in(
-                &events,
-                window,
-                |_, _, event: &AppearanceChanged, window, cx| {
-                    appearance::apply(event.0, window, cx)
-                },
-            );
-
-            Self {
-                page: Some(page),
-                _dismiss: dismiss,
-                _language: language,
-                _appearance: appearance,
-            }
-        }
-    }
-
-    impl Render for PageHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().children(self.page.clone())
-        }
-    }
-
-    /// Mounts one settings page in a fresh window and applies the stored appearance.
-    fn mount_page(cx: &mut TestAppContext, page: Entity<SettingsPage>) -> &mut VisualTestContext {
-        let (_, cx) = cx.add_window_view(move |window, cx| {
-            let host = cx.new(move |cx| PageHost::new(page, window, cx));
-            Layer::new(host)
-        });
-        // The appearance the settings name is applied the way a window applies it when it is
-        // built, so a test starts from the theme the stored preference resolves to rather than
-        // from whichever one `install` left behind.
-        cx.update(|window, cx| {
-            let preference = cx.global::<ConfigManager>().read().appearance;
-            appearance::apply(preference, window, cx);
-        });
-        settle(cx);
-
-        cx
-    }
-
-    /// Opens the settings over a fresh window, the way the system button opens them.
-    ///
-    /// What is drawn in the window is read off the window rather than off the page, so the
-    /// window comes back with it. The interface and the settings are both in `language`, which
-    /// is what a start with an interface that agrees with the settings looks like; a test that
-    /// writes another language is then writing a change.
-    fn settings_in(
-        config: Config,
-        language: Language,
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        let mut config = config;
-        config.language = language;
-        let manager = cx.update(|cx| ConfigManager::in_memory(config, cx));
-
-        settings_over(manager, language, cx)
-    }
-
-    /// Opens the settings over a manager the caller built, which is how a test gets settings
-    /// that cannot be stored.
-    ///
-    /// The settings the manager holds are put in `language` as well as the interface: a start
-    /// with an interface that agrees with the settings is what a test writing another language
-    /// is then writing a change against.
-    fn settings_over(
-        manager: ConfigManager,
-        language: Language,
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        settings_over_catalog(manager, language, test_catalog(), cx)
-    }
-
-    /// Installs the process-wide download manager a settings session reads, once per test app.
-    ///
-    /// A test that opens two settings sessions in one application context installs it with the
-    /// first session; installing it again would replace the global and lose the downloads it
-    /// holds, which is exactly what the production composition root never does.
-    fn install_translation_downloads(cx: &mut gpui_kit::App) {
-        install_translation_downloads_with(cx, std::sync::Arc::new(|_: &std::path::Path| Ok(())));
-    }
-
-    /// Installs the process-wide download manager with the unload callback a test controls.
-    fn install_translation_downloads_with(
-        cx: &mut gpui_kit::App,
-        unload: std::sync::Arc<
-            dyn Fn(&std::path::Path) -> Result<(), crate::translation_downloads::UnloadFailure>
-                + Send
-                + Sync,
-        >,
-    ) {
-        if crate::translation_downloads::entity(cx).is_some() {
-            return;
-        }
-
-        // The process-wide download manager routes with the network settings, so it needs the
-        // settings manager. A test that installs the downloads before it sets the settings up
-        // gets the defaults, which the session replaces with its own manager when it starts.
-        if cx.try_global::<ConfigManager>().is_none() {
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-        }
-        let provider = download_provider::global::install(
-            cx,
-            download_provider::global::DownloadProviderDeps {
-                transport: std::sync::Arc::new(network::transport::hub::TransportHub::new(
-                    network::transport::hub::TransportPolicy::default(),
-                )),
-                runtime: widget_tokio_runtime::runtime::Runtime::for_test(),
-            },
-        );
-        crate::translation_downloads::install(
-            cx,
-            crate::translation_downloads::TranslationDownloadsDeps {
-                provider,
-                runtime: widget_tokio_runtime::runtime::Runtime::for_test(),
-                unload,
-            },
-        );
-    }
-
-    /// Opens the settings over the catalog the page is built from.
-    ///
-    /// The catalog is this build's own unless a test asks otherwise: a test of what a group the
-    /// catalog closes is drawn as hands a catalog that closes it here.
-    fn settings_over_catalog(
-        manager: ConfigManager,
-        language: Language,
-        catalog: Catalog,
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        let page = cx.update(|cx| {
-            // What a window installs before it draws anything, in the order the application
-            // installs it: a field that is typed into reads the state base_ui's own fields are
-            // built on.
-            gpui_kit::base::init(cx);
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-            cx.set_global(match language {
-                Language::ZhCn => LanguageCode::ZhCn,
-                Language::En => LanguageCode::En,
-            });
-            cx.set_global(manager);
-            install_translation_downloads(cx);
-            // A manager whose settings are stored under another language than the one the
-            // interface is drawn in is a session that starts with a change nobody made, so the
-            // two are made to agree here rather than left to what a default happens to be.
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(|config| config.language = language, cx);
-            });
-            let draft = cx.new(|cx| {
-                let current = cx.global::<ConfigManager>().read();
-                SettingsDraft::new(current.as_ref().clone())
-            });
-
-            cx.new(|cx| SettingsPage::new_with_catalog(draft, catalog, cx))
-        });
-        let cx = mount_page(cx, page.clone());
-
-        (page, cx)
-    }
-
-    /// Opens the settings with the interface in `language`.
-    fn settings(
-        config: Config,
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        settings_in(config, Language::En, cx)
-    }
-
-    /// Opens the settings again in a new window, over the settings that are stored now.
-    ///
-    /// Opening the settings installs the globals a session is built on, which a test can only do
-    /// once, so a test that changes its mind builds the second session in another window. What
-    /// the second session reads is the settings the first one stored, which is the point.
-    fn reopen_settings(cx: &mut TestAppContext) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        let page = cx.update(|cx| cx.new(SettingsPage::load));
-        let cx = mount_page(cx, page.clone());
-
-        (page, cx)
-    }
-
-    /// Opens the settings over a build that has loaded nothing, and hands back the page.
-    ///
-    /// The market participants root is the application's own, and the scopes the page is handed
-    /// are what the root reads off it: installing the root loads no venue, so the settings are
-    /// opened over an empty loaded-venues view and every row they offer is the static venue
-    /// list's.
-    fn settings_of_an_unconnected_build(
-        cx: &mut TestAppContext,
-    ) -> (Entity<SettingsPage>, &mut VisualTestContext) {
-        cx.update(|cx| {
-            gpui_kit::base::init(cx);
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-            install_translation_downloads(cx);
-            global::install(cx).expect("the test Tokio runtime should build");
-            MarketParticipantsConnector::install(cx)
-                .expect("the market participants root should install");
-        });
-        let page = cx.update(|cx| cx.new(SettingsPage::load));
-        let cx = mount_page(cx, page.clone());
-
-        (page, cx)
-    }
-
-    /// Lets the theme's transitions and the forms' and alerts' own enter or exit transitions
-    /// finish and repaints.
-    fn settle(cx: &mut VisualTestContext) {
-        cx.executor()
-            .advance_clock(ANIMATION_TICK + std::time::Duration::from_millis(50));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-    }
-
-    /// Clicks what a selector draws, and lets whatever it opened settle.
-    fn click(cx: &mut VisualTestContext, selector: &'static str) {
-        let target = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("the window should draw {selector}"))
-            .center();
-        cx.simulate_click(target, Modifiers::none());
-        settle(cx);
-    }
-
-    /// The access of a field of the catalog, so a test writes the way a control writes.
-    fn field_access(page: &str, field: &str) -> FieldAccess {
-        test_catalog()
-            .page(page)
-            .unwrap_or_else(|| panic!("{page} should be in the catalog"))
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .find(|definition| definition.id == field)
-            .unwrap_or_else(|| panic!("{page} should offer {field}"))
-            .access
-            .clone()
-    }
-
-    /// Writes a field into the draft the way the control of that field does.
-    fn write_draft_field(
-        panel: &Entity<SettingsPage>,
-        page: &'static str,
-        field: &'static str,
-        value: &str,
-        cx: &mut VisualTestContext,
-    ) {
-        let access = field_access(page, field);
-        panel.update(cx, |dialog, cx| {
-            dialog.write_field(access, FieldValue::new(value), cx);
-        });
-        settle(cx);
-    }
-
-    /// The settings this session would write, which is what the pages are drawn from.
-    fn drafted(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> Config {
-        cx.read(|cx| {
-            panel.read_with(cx, |dialog, cx| {
-                dialog.draft.read(cx).config().as_ref().clone()
-            })
-        })
-    }
-
-    /// The settings as everyone outside this dialog sees them.
-    fn stored(cx: &VisualTestContext) -> Config {
-        cx.read(|cx| cx.global::<ConfigManager>().read().as_ref().clone())
-    }
-
-    /// The process-wide downloads the harness installed.
-    fn translation_downloads(
-        cx: &VisualTestContext,
-    ) -> Entity<crate::translation_downloads::TranslationDownloads> {
-        cx.read(|cx| {
-            crate::translation_downloads::entity(cx)
-                .expect("the settings harness installs the translation downloads")
-        })
-    }
-
-    /// Waits for a blocking delete to finish without assuming the executor's timing.
-    fn wait_until_absent(
-        cx: &mut VisualTestContext,
-        downloads: &Entity<crate::translation_downloads::TranslationDownloads>,
-        model: TranslationModel,
-        directory: &std::path::Path,
-        path: &std::path::Path,
-    ) {
-        for _ in 0..200 {
-            // The delete reports through a polling GPUI task; move its timer on each turn.
-            cx.executor()
-                .advance_clock(std::time::Duration::from_millis(20));
-            cx.run_until_parked();
-            if !path.exists()
-                && cx.read(|cx| downloads.read(cx).row_state(model, directory))
-                    == crate::translation_downloads::DownloadState::Idle
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the delete should finish: {path:?} still exists");
-    }
-
-    /// The appearance the application is drawn in.
-    fn drawn_appearance(cx: &VisualTestContext) -> ThemeAppearance {
-        cx.read(|cx| cx.theme().appearance)
-    }
-
-    /// The page the dialog is drawing.
-    fn current_page(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> SharedString {
-        cx.read(|cx| panel.read_with(cx, |dialog, _| dialog.current_page.clone()))
-    }
-
-    /// The labels the sidebar draws, in the order it draws them.
-    fn labels(panel: &Entity<SettingsPage>, cx: &VisualTestContext) -> Vec<SharedString> {
-        cx.read(|cx| {
-            panel.read_with(cx, |dialog, _| {
-                dialog
-                    .sidebar
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        SidebarEntry::Heading(label) => Some(label.clone()),
-                        SidebarEntry::Page { label, .. } => Some(label.clone()),
-                        SidebarEntry::Separator => None,
-                    })
-                    .collect()
-            })
-        })
-    }
-
-    /// Settings with something written everywhere the settings can hold something, so that a
-    /// commit overwriting them wholesale rather than replaying changes would be visible.
-    fn configured_settings() -> Config {
-        let mut config = Config::default();
-        config.account = Some(AccountConfig {
-            user_id: "11111111-1111-4111-8111-111111111111".into(),
-            wallet_address: "0x0123456789abcdef".into(),
-            wallet_kind: AccountWalletKind::Ethereum,
-        });
-        config.avatar = Some("<svg>configured-avatar</svg>".to_owned());
-        config.proxies.insert(
-            SmolStr::new_static("hk"),
-            ProxyConfig {
-                addr: SmolStr::new_static("127.0.0.1"),
-                port: 1080,
-                authorization: ProxyAuthorizationConfig::UsernameAndPassword {
-                    username: SmolStr::new_static("proxy-user"),
-                    password: SmolStr::new_static("proxy-password"),
-                },
-                resolve_dns_at_remote: true,
-            },
-        );
-
-        {
-            let VenueSettings::Binance(binance) = config
-                .venues
-                .get_mut(&VenueId::Binance)
-                .expect("the default settings name every venue this build speaks")
-            else {
-                panic!("binance is configured as Binance");
-            };
-            binance.credentials = BinanceCredentials {
-                spot_api_key: SmolStr::new_static("binance-spot-key"),
-                spot_private_key: SmolStr::new_static("binance-spot-private"),
-                spot_passphrase: SmolStr::new_static("binance-spot-passphrase"),
-                usd_m_perp_api_key: SmolStr::new_static("binance-perp-key"),
-                usd_m_perp_private_key: SmolStr::new_static("binance-perp-private"),
-                usd_m_perp_passphrase: SmolStr::new_static("binance-perp-passphrase"),
-            };
-        }
-
-        {
-            let VenueSettings::Okx(okx) = config
-                .venues
-                .get_mut(&VenueId::Okx)
-                .expect("the default settings name every venue this build speaks")
-            else {
-                panic!("okx is configured as OKX");
-            };
-            okx.credentials = OkxCredentials {
-                api_key: SmolStr::new_static("okx-api-key"),
-                secret_key: SmolStr::new_static("okx-secret-key"),
-                passphrase: SmolStr::new_static("okx-passphrase"),
-            };
-        }
-
-        config
-    }
-
-    /// A manager whose settings cannot be stored, the file that blocks it, and the directory the
-    /// two of them are in.
-    ///
-    /// The settings sit behind a path that is a file rather than a directory, so creating the
-    /// config directory there fails the way an unwritable config directory does. The settings it
-    /// starts with are the defaults, which is what a first start looks like and what a language
-    /// of `en` — the one the interface of a test starts in — is a change of.
-    ///
-    /// The path is one this run has to itself: it is made inside a directory that is created for
-    /// the test and removed when the returned handle is dropped, so the file that blocks the
-    /// settings is written at a path nothing else can already hold. A name built from the process
-    /// id and a counter is not — a later run of a recycled id reaches the same name, and writing
-    /// a file where that run left a directory fails with access denied instead of with the
-    /// failure a test is about.
-    ///
-    /// A test that repairs the path the way a user repairs a permission is the one thing that can
-    /// tell a retry apart from a commit that was never attempted again, so the handle lives for as
-    /// long as the path is used: dropping it removes the directory and what the test put in it.
-    fn manager_behind_a_file(cx: &mut TestAppContext) -> (ConfigManager, PathBuf, TempDir) {
-        let directory = test_temp("manager-behind-a-file");
-        let blocking = directory.path().join("not-a-directory");
-        fs::write(&blocking, b"block directory creation").expect("the blocking file is written");
-
-        let manager = cx
-            .update(|cx| ConfigManager::from_path(blocking.join("config.json"), cx))
-            .expect("a config manager loads around a missing file");
-
-        (manager, blocking, directory)
-    }
-
-    /// A temporary directory of the test's own, under the workspace's build output.
-    ///
-    /// The system temporary directory is not usable here: a test that runs behind a restricted
-    /// integrity token cannot create directories in `%TEMP%`, which leaves every test about a file
-    /// on disk failing for a reason that has nothing to do with the code under test. The build
-    /// output is the workspace's own writable scratch space, so the directory goes there.
-    fn test_temp(name: &str) -> TempDir {
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("this crate lives two directories below the workspace root");
-        let root = workspace.join("target").join("test-temp").join("settings");
-        fs::create_dir_all(&root).expect("the test temporary directory should be created");
-        tempfile::Builder::new()
-            .prefix(name)
-            .tempdir_in(&root)
-            .expect("a temporary directory should be created")
-    }
-
-    /// What the rest of the application writes while the settings are open: an avatar the
-    /// background generated, an account it signed in, a layout it persisted, a sidebar state
-    /// the main window saved.
-    ///
-    /// Every one of them goes through `update`, which is the path those subsystems own; the
-    /// dialog must neither know about them nor undo them.
-    fn write_while_open(cx: &mut VisualTestContext) {
-        cx.update(|_, cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| {
-                        config.avatar = Some("<svg>generated-while-open</svg>".to_owned());
-                        config.account = Some(AccountConfig {
-                            user_id: "22222222-2222-4222-8222-222222222222".to_owned(),
-                            wallet_address: "0xfeed".to_owned(),
-                            wallet_kind: AccountWalletKind::Ethereum,
-                        });
-                        config.workspaces = WorkspacesConfig {
-                            entries: vec![WorkspaceConfig {
-                                name: SmolStr::new_static("written-while-open"),
-                                layout: WorkspaceLayout::single_pane(),
-                            }],
-                            active: Some(SmolStr::new_static("written-while-open")),
-                        };
-                        config.ui.sidebar = SidebarMode::IconOnly;
-                    },
-                    cx,
-                );
-            });
-        });
-    }
-
-    /// Opens the form that edits an entry, the way the row of the catalog that asks for one
-    /// does.
-    fn open_edit_form(
-        panel: &Entity<SettingsPage>,
-        name: &'static str,
-        cx: &mut VisualTestContext,
-    ) {
-        request(
-            panel,
-            ProxyRequest::Edit {
-                name: SmolStr::new_static(name),
-            },
-            cx,
-        );
-    }
-
-    /// Asks the catalog for something a row asks for, and lets the dialog take it.
-    ///
-    /// The window is not refreshed here, which is what makes the wait worth anything: the request
-    /// is what marks the window dirty, and the frame that follows — drawn inside the effect flush —
-    /// is what the assertions after this rely on, so refreshing here would draw what the request
-    /// opened even if the request alone had left it undrawn. What the clock is for is the opened
-    /// form's own transition, which the next `settle` or `click` moves on.
-    fn request(panel: &Entity<SettingsPage>, request: ProxyRequest, cx: &mut VisualTestContext) {
-        panel.update(cx, |dialog, cx| {
-            dialog.proxies.update(cx, |table, cx| {
-                table.request(request, cx);
-            });
-        });
-        cx.executor()
-            .advance_clock(ANIMATION_TICK + std::time::Duration::from_millis(50));
-        cx.run_until_parked();
-    }
-
-    /// Opens the form that adds an entry, the way the button above the catalog asks for one.
-    fn open_add_form(panel: &Entity<SettingsPage>, cx: &mut VisualTestContext) {
-        request(panel, ProxyRequest::Add, cx);
-    }
-
-    /// Clicks one text field of a form and types into it without leaving it.
-    ///
-    /// The caret is left where it is, which is what a user who types and then presses a button
-    /// does: it is the case that tells a field committed on blur from one the form reads.
-    fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
-        let field = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("the form should draw {selector}"));
-        cx.simulate_click(field.center(), Modifiers::none());
-        cx.simulate_input(text);
-        settle(cx);
-    }
-
-    /// Asks the catalog for a delete, the way a row of it asks for one, and lets the dialog take
-    /// it.
-    ///
-    /// What a row asks for is the alert rather than the removal: the entry leaves the session
-    /// through the alert's own action, so a test that wants it gone confirms it there.
-    fn request_delete(
-        panel: &Entity<SettingsPage>,
-        name: &'static str,
-        cx: &mut VisualTestContext,
-    ) {
-        request(
-            panel,
-            ProxyRequest::Delete {
-                name: SmolStr::new_static(name),
-            },
-            cx,
-        );
-    }
-
-    /// A form the user walks away from is not a change of the session.
-    ///
-    /// The form was opened over the settings, which were never taken off the layer: what
-    /// cancelling leaves behind is the panel that was always there, uncovered rather than put
-    /// back, and what the form held is dropped rather than recorded, which is what makes it a
-    /// cancel.
-    ///
-    /// The session is already holding a change when the form opens, so what this asks is that
-    /// leaving the form neither records the entry nor loses the change, and the assertions on
-    /// the panel are what tell the panel that was always there from one built in its place: a
-    /// panel built again would open on the default page with an empty search.
-    #[gpui_kit::test]
-    fn a_cancelled_form_should_leave_the_session_and_the_settings_alone(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        write_draft_field(&panel, "appearance", "language", "zh-CN", cx);
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx)
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.set_query("market_participants.okx".into(), cx)
-        });
-        settle(cx);
-        let before = drafted(&panel, cx);
-        let selected = current_page(&panel, cx);
-
-        open_edit_form(&panel, "hk", cx);
-        type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-        click(cx, crate::editor::CANCEL_SELECTOR);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_EDIT").is_none(),
-            "cancelling should take the form away"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings the form was opened over should still be drawn"
-        );
-        assert_eq!(
-            drafted(&panel, cx),
-            before,
-            "a cancelled form must not change what the session holds"
-        );
-        assert_eq!(
-            stored(cx).proxies,
-            before.proxies,
-            "a cancelled form must not write the settings"
-        );
-        assert_eq!(
-            current_page(&panel, cx),
-            selected,
-            "the settings should still be on the page the form was opened over"
-        );
-        panel.read_with(cx, |dialog, _| {
-            assert_eq!(
-                dialog.query.as_ref(),
-                "market_participants.okx",
-                "the settings should still hold the search they were found by"
-            );
-        });
-    }
-
-    /// The form ends the way the application's other dialogs end: a line across it, and the two
-    /// buttons under that line rather than in among the fields. What the line is for is telling
-    /// what the form holds from what the form does, so the fields are above it and the buttons are
-    /// below it, and both buttons are one size because neither is the field's own control.
-    #[gpui_kit::test]
-    fn the_form_buttons_should_sit_under_a_separator_at_the_foot_of_the_form(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        open_edit_form(&panel, "hk", cx);
-
-        let form = cx
-            .debug_bounds("SETTINGS_PROXY_EDIT")
-            .expect("the form should be drawn");
-        let footer = cx
-            .debug_bounds(crate::editor::FOOTER_SELECTOR)
-            .expect("the form should draw the row its buttons are in");
-        let confirm = cx
-            .debug_bounds(crate::editor::CONFIRM_SELECTOR)
-            .expect("the form should draw the button that records the entry");
-        let cancel = cx
-            .debug_bounds(crate::editor::CANCEL_SELECTOR)
-            .expect("the form should draw the button that leaves the entry alone");
-        let field = cx
-            .debug_bounds("SETTINGS_PROXY_FIELD_port")
-            .expect("the form should draw the field the entry's port is typed into");
-
-        assert!(
-            field.bottom() <= footer.top(),
-            "the line the row starts with belongs between the fields and the buttons: {field:?} \
-             above {footer:?}"
-        );
-        assert!(
-            footer.top() <= cancel.top() && footer.top() <= confirm.top(),
-            "the buttons belong under the line rather than over it: {footer:?} over {cancel:?} and \
-             {confirm:?}"
-        );
-        assert_eq!(
-            footer.bottom(),
-            form.bottom(),
-            "the row should be the foot of the form: {footer:?} in {form:?}"
-        );
-        assert!(
-            (confirm.right() - form.right()).abs() < px(1.0),
-            "the row should be laid out from the right edge of the form: {confirm:?} in {form:?}"
-        );
-        assert_eq!(
-            cancel.size.height, confirm.size.height,
-            "the two buttons should be one size, which is neither of them being a control of a \
-             field: {cancel:?} beside {confirm:?}"
-        );
-    }
-
-    /// The alert a rejected commit raises says what went wrong, in either language.
-    ///
-    /// The message is only worth raising if the user can read the reason, so both locales have
-    /// to carry the placeholder the reason is written into, and the reason has to arrive in the
-    /// text the alert is given.
-    ///
-    /// The copy is centered when it is drawn, which it says with a `<p align="center">` tag pair:
-    /// that pair is how the message opens and how it ends, so both readings here skip it and ask
-    /// about the sentence inside it.
-    ///
-    /// A key that is missing from a locale translates to an empty string rather than failing,
-    /// which is what makes "the message is not empty" the thing this has to check: a typo in a
-    /// key would otherwise reach the user as an alert with nothing in it.
-    #[gpui_kit::test]
-    fn the_failure_alert_should_name_the_reason_in_both_languages(cx: &mut TestAppContext) {
-        let (mut manager, _blocking, _directory) = manager_behind_a_file(cx);
-        let mut candidate = manager.read().as_ref().clone();
-        candidate.appearance = Appearance::Dark;
-        let reason: ConfigPersistenceError = cx.update(|cx| {
-            manager
-                .write(candidate, cx)
-                .expect_err("storing behind a file should fail")
-        });
-
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-        });
-
-        for (language, title, opening) in [
-            (
-                LanguageCode::En,
-                "The settings could not be saved",
-                "The settings were not written to disk: ",
-            ),
-            (LanguageCode::ZhCn, "设置保存失败", "设置未能写入磁盘："),
-        ] {
-            cx.update(|cx| {
-                cx.set_global(language);
-            });
-
-            let (declared, drawn_title, message, filling) = cx.read(|cx| {
-                let i18n = cx.global::<i18n::translator::types::I18n>();
-
-                (
-                    i18n.try_translate(language, "settings_ui.save_failed.message")
-                        .is_some(),
-                    t!(cx, "settings_ui.save_failed.title"),
-                    t!(cx, "settings_ui.save_failed.message", reason = reason),
-                    // The same message with a reason that is a word of its own, which is what
-                    // says the placeholder of this locale was filled rather than dropped.
-                    t!(cx, "settings_ui.save_failed.message", reason = "the-reason"),
-                )
-            });
-
-            assert!(
-                declared,
-                "both locales should define the message a failed commit raises"
-            );
-            assert!(
-                !drawn_title.is_empty(),
-                "the title of {language:?} should not be an empty string"
-            );
-            assert!(
-                !message.is_empty(),
-                "the message of {language:?} should not be an empty string"
-            );
-            // The message is centered markdown, so the reason is followed by the align tag pair's
-            // closing tag rather than by the end of the sentence.
-            assert!(
-                filling.contains("the-reason</p>"),
-                "the message of {language:?} should write the reason where its placeholder is: {filling}"
-            );
-            assert_eq!(
-                drawn_title.as_ref(),
-                title,
-                "the title should be written in {language:?}"
-            );
-            assert!(
-                message
-                    .trim_start_matches("<p align=\"center\">")
-                    .starts_with(opening),
-                "the message should be written in {language:?}: {message}"
-            );
-            assert!(
-                message.contains(&reason.to_string()),
-                "the message should carry the reason {reason}: {message}"
-            );
-            assert!(
-                !message.contains("%{"),
-                "every placeholder should be filled in: {message}"
-            );
-        }
-    }
-
-    /// A commit that could not be stored is not one the dialog treats as stored: once the
-    /// reason is gone, the same change reaches the file.
-    ///
-    /// What this is about is the retry: the file was never written, so the settings in memory
-    /// are the ones the user started with and the dialog still holds their change — asking
-    /// again has to store it rather than report it as already stored.
-    #[gpui_kit::test]
-    fn a_commit_that_could_not_be_stored_should_be_stored_when_it_is_tried_again(
-        cx: &mut TestAppContext,
-    ) {
-        let (manager, blocking, _directory) = manager_behind_a_file(cx);
-        let path = blocking.join("config.json");
-        let (panel, cx) = settings_over(manager, Language::En, cx);
-
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "the failure should be reported before anything is tried again"
-        );
-        assert!(
-            !path.exists(),
-            "a commit that failed must not have left a file behind: {path:?}"
-        );
-
-        // Reading the alert is what leaves the dialog to be asked again.
-        click(cx, "BASE_UI_ALERT_OK");
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_none(),
-            "the alert should be gone once it has been read"
-        );
-
-        fs::remove_file(&blocking).expect("the blocking file should be removable");
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::Dark,
-            "the retry should store what the user confirmed"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_none(),
-            "a commit that was stored should close the settings"
-        );
-
-        let written = fs::read_to_string(&path).expect("the retry should have written a file");
-        assert!(
-            written.contains("\"appearance\": \"Dark\""),
-            "the file should hold what the user confirmed: {written}"
-        );
-        let reloaded = cx
-            .update(|_, cx| ConfigManager::from_path(&path, cx))
-            .expect("the stored settings should load");
-        assert_eq!(
-            reloaded.read().as_ref(),
-            &stored(cx),
-            "what was stored should load as the settings the application is running with"
-        );
-    }
-
-    /// Work that writes the settings while the dialog is open is not the dialog's to undo.
-    ///
-    /// An avatar is generated in the background and a workspace layout is persisted on a
-    /// delay, so the settings of the moment a commit is made are not the settings the dialog
-    /// was opened with: what the user changed is replayed onto the settings of that moment
-    /// rather than published as the snapshot the session started from.
-    #[gpui_kit::test]
-    fn a_commit_should_keep_the_settings_written_while_the_page_was_open(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-
-        write_while_open(cx);
-        settle(cx);
-
-        assert_eq!(
-            drafted(&panel, cx).avatar.as_deref(),
-            Some("<svg>configured-avatar</svg>"),
-            "the session should still draw the settings it was opened with"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        let published = stored(cx);
-        assert_eq!(
-            published.appearance,
-            Appearance::Dark,
-            "the change the user confirmed should be the one that is stored"
-        );
-        assert_eq!(
-            published.avatar.as_deref(),
-            Some("<svg>generated-while-open</svg>"),
-            "a commit must not roll back the avatar the background wrote"
-        );
-        assert_eq!(
-            published
-                .account
-                .as_ref()
-                .map(|account| account.user_id.as_str()),
-            Some("22222222-2222-4222-8222-222222222222"),
-            "a commit must not roll back the account another subsystem signed in"
-        );
-        assert_eq!(
-            published.workspaces.active.as_deref(),
-            Some("written-while-open"),
-            "a commit must not roll back a workspace layout persisted while it was open"
-        );
-    }
-
-    /// The sidebar state is stored beside the settings the dialog owns rather than in the
-    /// draft, so a commit made while the state moved has to write the state of that moment:
-    /// replaying the snapshot the session was opened with would put the sidebar back where
-    /// it was when the dialog opened.
-    #[gpui_kit::test]
-    fn a_commit_should_keep_a_sidebar_state_written_while_the_page_was_open(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-
-        write_while_open(cx);
-        settle(cx);
-
-        assert_eq!(
-            drafted(&panel, cx).ui.sidebar,
-            SidebarMode::Full,
-            "the session should still hold the sidebar state it was opened with"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).ui.sidebar,
-            SidebarMode::IconOnly,
-            "a commit must not roll back the sidebar state written while it was open"
-        );
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::Dark,
-            "the change the user confirmed should be the one that is stored"
-        );
-    }
-
-    /// A value the user changed reaches the draft and nothing else: the settings only move
-    /// when the user says so.
-    #[gpui_kit::test]
-    fn a_field_change_should_reach_the_settings_only_when_it_is_confirmed(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-
-        assert_eq!(
-            drafted(&panel, cx).appearance,
-            Appearance::Dark,
-            "the draft should hold what the user chose"
-        );
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::System,
-            "a control must not write the settings before the user confirms it"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::Dark,
-            "confirming should write what the user chose"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_none(),
-            "a stored commit should close the settings"
-        );
-    }
-
-    /// The theme is what the user confirmed, and only then.
-    ///
-    /// A control writes the session rather than the settings, so the appearance the interface is
-    /// drawn in has to follow the same rule the stored preference does: choosing another mode
-    /// while the dialog is open is not yet the appearance the application is in, and confirming
-    /// it is what draws it.
-    #[gpui_kit::test]
-    fn the_theme_should_follow_the_appearance_the_user_confirmed(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-
-        assert_eq!(
-            drawn_appearance(cx),
-            ThemeAppearance::Light,
-            "the appearance reaches the theme when the user confirms it, not when they choose it"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            drawn_appearance(cx),
-            ThemeAppearance::Dark,
-            "the appearance the user confirmed should be the one the application is drawn in"
-        );
-    }
-
-    /// The theme is drawn from the appearance the user confirmed, and a preference that names an
-    /// appearance is not the system's to answer.
-    ///
-    /// The precedence itself — every preference against every appearance a system reports, the
-    /// pinned cases included — is a table in [`crate::appearance`], where the system appearance is
-    /// an argument and so can be put to it. What only a whole session can show is that the resolved
-    /// appearance reaches the theme: a confirmed `Dark` draws the dark appearance, and handing the
-    /// preference back to the system draws the appearance the system's own appearance resolves
-    /// to — which the window reports itself, so the test asks the window rather than assuming one.
-    #[gpui_kit::test]
-    fn confirming_an_appearance_should_draw_the_appearance_it_resolves_to(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            drawn_appearance(cx),
-            ThemeAppearance::Dark,
-            "the appearance the user confirmed is the one the application is drawn in"
-        );
-
-        let reported = cx.update(|window, _| window.appearance());
-        let (panel, cx) = reopen_settings(cx);
-        write_draft_field(&panel, "appearance", "appearance", "System", cx);
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::System,
-            "the draft should have moved the preference back to the system"
-        );
-        assert_eq!(
-            drawn_appearance(cx),
-            match reported {
-                WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeAppearance::Light,
-                WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeAppearance::Dark,
-            },
-            "following the system again means being drawn in the appearance the system reports"
-        );
-    }
-
-    /// A text field commits when the caret leaves it, and pressing a button does not take the
-    /// caret away from it: what was typed last is exactly what a commit has to carry.
-    #[gpui_kit::test]
-    fn what_was_typed_into_a_field_should_be_written_by_the_confirm_button(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        // The dialog opens the page the user would be on; what this is about is the field.
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx)
-        });
-        settle(cx);
-
-        let control = cx
-            .debug_bounds("SETTINGS_CONTROL_market_participants.okx.api_key")
-            .expect("the OKX page should draw the field's own box");
-        // The row holds the label above the field and the description under it, so a point inside
-        // the row is not necessarily inside the field: what the click is aimed at is the field's own
-        // box, which is the control the caret has to land in.
-        cx.simulate_click(control.center(), Modifiers::none());
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.okx",
-            "clicking in the page must not move the dialog off the page the field is on"
-        );
-        cx.simulate_input("typed-without-leaving-the-field");
-        settle(cx);
-
-        // The field is not left before this runs, so what it holds is still only in the field:
-        // clicking a button of the window's dialog does not take the caret away from it.
-        click(cx, "SETTINGS_CONFIRM");
-
-        let okx = VenueId::Okx;
-        let written = match stored(cx).venue(&okx) {
-            Some(VenueSettings::Okx(okx)) => okx.credentials.api_key.clone(),
-            _ => panic!("the settings should still hold OKX"),
-        };
-        assert_eq!(
-            written, "okx-api-keytyped-without-leaving-the-field",
-            "confirming should read what the fields hold without them losing the caret first"
-        );
-    }
-
-    /// The cancel button is the session's way out: what the session changed is dropped rather than written.
-    #[gpui_kit::test]
-    fn cancelling_should_discard_what_the_session_changed(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-
-        write_draft_field(&panel, "appearance", "language", "zh-CN", cx);
-        assert_eq!(
-            drafted(&panel, cx).language,
-            Language::ZhCn,
-            "the draft should hold what the user changed"
-        );
-
-        click(cx, "SETTINGS_CANCEL");
-
-        assert_eq!(
-            stored(cx).language,
-            Language::En,
-            "closing the settings must not write what the session changed"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_none(),
-            "closing should take the settings away"
-        );
-    }
-
-    /// The cancel button is the settings' own way off the page area: what takes the page away
-    /// is the dismissal it emits, so the page leaves as the session it was rather than as
-    /// whatever the window happens to show next, and the state it held goes with it.
-    #[gpui_kit::test]
-    fn the_cancel_button_should_close_the_settings_by_their_own_signal(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-        // What is kept here is a weak handle: a test holding the page would be a second strong
-        // reference, and the page would outlive its host for as long as the test does, which
-        // is exactly what tells a page that was released from one that leaked.
-        let dismissed = panel.downgrade();
-        drop(panel);
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings should be drawn while they are open"
-        );
-
-        click(cx, "SETTINGS_CANCEL");
-
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_none(),
-            "the signal the close button emits should take the settings off the layer"
-        );
-        assert!(
-            dismissed.upgrade().is_none(),
-            "the panel that closed itself should have been released with its dialog"
-        );
-    }
-
-    /// A commit that cannot be stored is reported rather than swallowed, and the dialog stays
-    /// where it is so the user can try again instead of losing what they configured.
-    #[gpui_kit::test]
-    fn a_commit_that_cannot_be_stored_should_be_reported_and_keep_the_page(
-        cx: &mut TestAppContext,
-    ) {
-        let (manager, _blocking, _directory) = manager_behind_a_file(cx);
-        let (panel, cx) = settings_over(manager, Language::ZhCn, cx);
-
-        write_draft_field(&panel, "appearance", "language", "en", cx);
-        assert_eq!(
-            drafted(&panel, cx).language,
-            Language::En,
-            "the session should hold the language the user chose"
-        );
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "a commit that could not be stored should tell the user"
-        );
-        assert_eq!(
-            stored(cx).language,
-            Language::ZhCn,
-            "settings that could not be stored must not be published as if they had been"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings should stay open so the user can try again"
-        );
-        assert_eq!(
-            drafted(&panel, cx).language,
-            Language::En,
-            "what the user changed should survive a commit that failed"
-        );
-        assert_eq!(
-            cx.read(|cx| *cx.global::<LanguageCode>()),
-            LanguageCode::ZhCn,
-            "an interface the settings did not move should stay where it was"
-        );
-    }
-
-    /// The proxy catalog is part of the same session: a row asks for a delete, the user says so in
-    /// the alert that asks, and what the rows are drawn from loses the entry.
-    ///
-    /// What the alert confirms is one change of the session and nothing more: the settings the
-    /// session was opened over keep the entry until the user confirms them in turn.
-    #[gpui_kit::test]
-    fn a_deleted_proxy_should_leave_the_catalog_only_when_it_is_confirmed(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        request_delete(&panel, "hk", cx);
-        click(cx, "BASE_UI_ALERT_OK");
-
-        assert!(
-            !drafted(&panel, cx).proxies.contains_key("hk"),
-            "the draft should hold the catalog without the entry the user deleted"
-        );
-        assert!(
-            stored(cx).proxies.contains_key("hk"),
-            "a deleted row must not reach the settings before the user confirms it"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert!(
-            !stored(cx).proxies.contains_key("hk"),
-            "confirming should remove the entry from the settings"
-        );
-    }
-
-    /// A delete is the one row action that takes something away, so it is asked about before it is
-    /// recorded: the alert is where the user hears that the routes naming the entry go with it, and
-    /// a user who walks away from it leaves the catalog exactly as it was.
-    #[gpui_kit::test]
-    fn a_delete_should_ask_before_it_takes_the_entry_out_of_the_catalog(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        request_delete(&panel, "hk", cx);
-
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "a row that asks for a delete should be answered with an alert rather than the entry \
-             going at once"
-        );
-        assert!(
-            drafted(&panel, cx).proxies.contains_key("hk"),
-            "the entry should still be in the session while the alert asking about it is up"
-        );
-
-        click(cx, "BASE_UI_ALERT_CANCEL");
-
-        assert!(
-            drafted(&panel, cx).proxies.contains_key("hk"),
-            "walking away from the alert should leave the entry in the session"
-        );
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_none(),
-            "the alert should leave the window once it is dismissed"
-        );
-    }
-
-    /// The alert a delete raises names the entry it is about, in either language.
-    ///
-    /// The name is the one thing that tells two rows of the catalog apart, so a message that
-    /// dropped it would ask the user to confirm a deletion without saying which entry goes. Both
-    /// locales therefore have to carry the placeholder the name is written into, and the name has
-    /// to arrive in the text the alert is given.
-    #[gpui_kit::test]
-    fn the_delete_alert_should_name_the_entry_in_both_languages(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-        });
-
-        for language in [LanguageCode::En, LanguageCode::ZhCn] {
-            cx.update(|cx| {
-                cx.set_global(language);
-            });
-
-            let (declared, title, message) = cx.read(|cx| {
-                let i18n = cx.global::<i18n::translator::types::I18n>();
-
-                (
-                    i18n.try_translate(language, "settings_ui.proxies.delete_message")
-                        .is_some(),
-                    t!(cx, "settings_ui.proxies.delete_title"),
-                    t!(cx, "settings_ui.proxies.delete_message", name = "osaka"),
-                )
-            });
-
-            assert!(
-                declared,
-                "both locales should define the message a delete is confirmed by"
-            );
-            assert!(
-                !title.is_empty() && !message.is_empty(),
-                "the title and the message of {language:?} should not be empty strings"
-            );
-            assert!(
-                message.contains("osaka"),
-                "the message of {language:?} should name the entry it is about: {message}"
-            );
-            assert!(
-                !message.contains("%{"),
-                "every placeholder of {language:?} should be filled in: {message}"
-            );
-        }
-    }
-
-    /// The form over the settings is a dialog of its own on the same session, drawn over them:
-    /// the settings stay on the layer while the form is open, and what takes the form away is the
-    /// form being dismissed rather than the settings being mounted again under it.
-    ///
-    /// What the form was started from is an entry the settings hold, so confirming it records
-    /// an entry the session already has: what this asks is that the session survives the form,
-    /// that the settings are still the ones it was opened over, and that they are not written by
-    /// it.
-    #[gpui_kit::test]
-    fn a_form_over_the_settings_should_write_the_draft_and_return_to_them(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        open_edit_form(&panel, "hk", cx);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_EDIT").is_some(),
-            "the form should be drawn over the settings"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings should still be drawn under the form"
-        );
-
-        click(cx, crate::editor::CONFIRM_SELECTOR);
-
-        assert!(
-            drafted(&panel, cx).proxies.contains_key("hk"),
-            "the session should be the one the form wrote in"
-        );
-        assert!(
-            stored(cx).proxies.contains_key("hk"),
-            "a form over the settings must not write them"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings the form was opened over should be the ones left showing"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert!(
-            stored(cx).proxies.contains_key("hk"),
-            "the settings should hold what the form wrote once they are confirmed"
-        );
-    }
-
-    /// An entry the user types into the form and confirms is one change of the session, and
-    /// the settings only move when the user confirms them.
-    ///
-    /// What the user typed is in the field and nowhere else: a field reports itself when the
-    /// caret leaves it, and the confirm button does not take the caret away, so the form has to
-    /// read the fields back. This is the whole of adding a proxy, from the button to the file.
-    #[gpui_kit::test]
-    fn a_typed_entry_should_reach_the_settings_only_when_the_session_is_confirmed(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(Config::default(), cx);
-        open_add_form(&panel, cx);
-
-        type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-        type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
-        type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-        click(cx, crate::editor::CONFIRM_SELECTOR);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_ADD").is_none(),
-            "confirming a form should take it away"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings the form was opened over should still be drawn when the form is confirmed"
-        );
-        let session = drafted(&panel, cx);
-        assert_eq!(
-            session.proxies.get("osaka").map(|proxy| proxy.port),
-            Some(1080),
-            "the entry the user typed should be what the session holds: {:#?}",
-            session.proxies
-        );
-        assert!(
-            !stored(cx).proxies.contains_key("osaka"),
-            "a form over the settings must not write them"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).proxies.get("osaka").map(|proxy| proxy.port),
-            Some(1080),
-            "confirming the settings should store the entry the form added"
-        );
-    }
-
-    /// A new entry resolves names on this side of the proxy until the form is asked for the other
-    /// mode: the control opens on the mode the entry is recorded with, so what a user who touches
-    /// nothing gets is the default and not whatever the form happened to hold.
-    #[gpui_kit::test]
-    fn a_new_entry_should_resolve_names_here_until_the_form_is_asked_otherwise(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(Config::default(), cx);
-        open_add_form(&panel, cx);
-
-        type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-        type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
-        type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-        click(cx, crate::editor::CONFIRM_SELECTOR);
-
-        assert_eq!(
-            drafted(&panel, cx)
-                .proxies
-                .get("osaka")
-                .map(|proxy| proxy.resolve_dns_at_remote),
-            Some(false),
-            "the entry the form recorded should resolve names here"
-        );
-    }
-
-    /// The mode the control shows is the mode the entry is recorded with, and the other choice of
-    /// it is what a user picks to have the proxy resolve the names.
-    #[gpui_kit::test]
-    fn choosing_the_proxy_mode_should_be_what_the_entry_is_recorded_with(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(Config::default(), cx);
-        open_add_form(&panel, cx);
-
-        type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-        type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
-        type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-        click(cx, crate::editor::DNS_MODE_SELECTOR);
-        assert!(
-            cx.debug_bounds("TEST_MENU_ITEM_proxy").is_some(),
-            "the control should offer the mode that resolves names there"
-        );
-        click(cx, "TEST_MENU_ITEM_proxy");
-        click(cx, crate::editor::CONFIRM_SELECTOR);
-
-        assert_eq!(
-            drafted(&panel, cx)
-                .proxies
-                .get("osaka")
-                .map(|proxy| proxy.resolve_dns_at_remote),
-            Some(true),
-            "the entry should be recorded with the mode the user chose"
-        );
-    }
-
-    /// The form that changes an entry is opened on the mode the entry is stored under: a form that
-    /// started from the default would record the entry as a mode the user never chose, which is the
-    /// one way an edit the user made nowhere could still change the settings.
-    #[gpui_kit::test]
-    fn an_edit_form_should_open_on_the_mode_the_entry_is_stored_under(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        assert!(
-            stored(cx)
-                .proxies
-                .get("hk")
-                .is_some_and(|proxy| proxy.resolve_dns_at_remote),
-            "the entry this test edits should be one the proxy resolves names for"
-        );
-
-        open_edit_form(&panel, "hk", cx);
-        click(cx, crate::editor::CONFIRM_SELECTOR);
-
-        assert!(
-            drafted(&panel, cx)
-                .proxies
-                .get("hk")
-                .is_some_and(|proxy| proxy.resolve_dns_at_remote),
-            "confirming the form should record the entry with the mode it opened on"
-        );
-    }
-
-    /// A page follows the language by being drawn again, but the sidebar holds the labels it was
-    /// built with and on a confirmation the page is left: the next session is what has to be
-    /// built in the language the user just confirmed.
-    #[gpui_kit::test]
-    fn the_sidebar_should_be_labelled_in_the_language_the_user_confirms(cx: &mut TestAppContext) {
-        let (panel, cx) = settings_in(Config::default(), Language::ZhCn, cx);
-
-        assert!(
-            labels(&panel, cx).contains(&SharedString::new_static("外观")),
-            "the sidebar should open in the language the window opened in"
-        );
-
-        write_draft_field(&panel, "appearance", "language", "en", cx);
-        assert_eq!(
-            cx.read(|cx| *cx.global::<LanguageCode>()),
-            LanguageCode::ZhCn,
-            "the interface should not switch to a language the user has not confirmed"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            cx.read(|cx| *cx.global::<LanguageCode>()),
-            LanguageCode::En,
-            "confirming the language should switch the interface to it"
-        );
-        assert_eq!(
-            stored(cx).language,
-            Language::En,
-            "confirming the language should store it"
-        );
-        let (panel, cx) = reopen_settings(cx);
-        let translated = labels(&panel, cx);
-        assert!(
-            translated.contains(&SharedString::new_static("Appearance")),
-            "the next session should be labelled in the language the user confirmed: \
-             {translated:?}"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn the_page_should_open_on_the_default_page(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-
-        dialog.read_with(cx, |dialog, _| {
-            assert_eq!(dialog.current_page, default_page());
-            assert_eq!(dialog.query, gpui_kit::SharedString::default());
-            assert!(dialog.filter.is_all());
-            // The row of the page the dialog shows is a row of the sidebar, so the two columns
-            // say the same thing from the first frame.
-            assert!(
-                dialog
-                    .sidebar
-                    .iter()
-                    .any(|entry| entry.page_id().is_some_and(|id| id == default_page())),
-                "the sidebar should list the page the dialog opens on"
-            );
-        });
-    }
-
-    /// The header is the gallery's: the title on the left and the search field at the end of
-    /// the row, above the two columns. The field still narrows the sidebar; what moved is where
-    /// it is drawn.
-    #[gpui_kit::test]
-    fn the_header_should_hold_the_search_above_the_columns(cx: &mut TestAppContext) {
-        let (_, cx) = settings(Config::default(), cx);
-
-        let page = cx
-            .debug_bounds("SETTINGS_PAGE")
-            .expect("the settings page should be drawn");
-        let column = cx
-            .debug_bounds("SETTINGS_COLUMN")
-            .expect("the page's content column should be drawn");
-        let header = cx
-            .debug_bounds("SETTINGS_HEADER")
-            .expect("the header should be drawn");
-        let title = cx
-            .debug_bounds("SETTINGS_TITLE")
-            .expect("the header should draw its title");
-        let search = cx
-            .debug_bounds("SETTINGS_SEARCH")
-            .expect("the header should draw its search field");
-        let sidebar = cx
-            .debug_bounds("SETTINGS_SIDEBAR")
-            .expect("the sidebar should be drawn");
-
-        assert_eq!(
-            column.size.width,
-            px(1000.0).min(page.size.width),
-            "the content column is 1000 px, or the page's whole width when the window is narrower"
-        );
-        assert!(
-            (column.left() - (page.left() + (page.size.width - column.size.width) / 2.0)).abs()
-                < px(1.0),
-            "the content column should be centred in the page: column {column:?}, page {page:?}"
-        );
-        assert_eq!(
-            search.size.width,
-            px(240.0),
-            "the search field is the gallery header's 240 px"
-        );
-        assert!(
-            search.left() > title.right(),
-            "the search field is at the end of the header, not over the title: \
-             search {search:?}, title {title:?}"
-        );
-        assert!(
-            search.top() >= header.top() && search.bottom() <= header.bottom(),
-            "the search field belongs to the header: search {search:?}, header {header:?}"
-        );
-        assert!(
-            sidebar.top() >= header.bottom(),
-            "the columns start under the header: sidebar {sidebar:?}, header {header:?}"
-        );
-        assert!(
-            sidebar.right() < column.right(),
-            "the menu column should leave the rest of the content column to the page"
-        );
-    }
-
-    /// The page's two decisions sit under a separator at its foot, in the same column as the
-    /// content above them: cancel first, confirm last, both at the gallery's medium size.
-    #[gpui_kit::test]
-    fn the_footer_should_draw_cancel_and_confirm_under_a_separator(cx: &mut TestAppContext) {
-        let (_, cx) = settings(Config::default(), cx);
-
-        let page = cx
-            .debug_bounds("SETTINGS_PAGE")
-            .expect("the settings page should be drawn");
-        let column = cx
-            .debug_bounds("SETTINGS_COLUMN")
-            .expect("the page's content column should be drawn");
-        let footer = cx
-            .debug_bounds("SETTINGS_FOOTER")
-            .expect("the page should draw its footer");
-        let cancel = cx
-            .debug_bounds("SETTINGS_CANCEL")
-            .expect("the footer should draw the cancel button");
-        let confirm = cx
-            .debug_bounds("SETTINGS_CONFIRM")
-            .expect("the footer should draw the confirm button");
-
-        assert_eq!(
-            footer.bottom(),
-            page.bottom(),
-            "the footer is the foot of the page: footer {footer:?}, page {page:?}"
-        );
-        assert!(
-            cancel.top() >= footer.top() && confirm.top() >= footer.top(),
-            "both buttons belong under the footer's separator: footer {footer:?}, \
-             cancel {cancel:?}, confirm {confirm:?}"
-        );
-        assert!(
-            cancel.right() < confirm.left(),
-            "cancel comes before confirm: cancel {cancel:?}, confirm {confirm:?}"
-        );
-        assert!(
-            (confirm.right() - (column.right() - px(24.0))).abs() < px(1.0),
-            "the button row ends at the content column's inner edge: confirm {confirm:?}, \
-             column {column:?}"
-        );
-        assert_eq!(
-            cancel.size.height, confirm.size.height,
-            "both buttons are the same medium size: cancel {cancel:?}, confirm {confirm:?}"
-        );
-    }
-
-    /// The clear control is the field's own, and clearing the field is what brings the whole
-    /// sidebar back: the field and the answer are one thing, so emptying one empties the other.
-    #[gpui_kit::test]
-    fn the_field_should_clear_the_search_it_was_filtered_by(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-
-        let search = cx
-            .debug_bounds("SETTINGS_SEARCH")
-            .expect("the search field should be drawn");
-        cx.simulate_click(search.center(), Modifiers::none());
-        cx.simulate_input("proxy");
-        cx.run_until_parked();
-
-        assert!(
-            !dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
-            "typing into the field should narrow the sidebar"
-        );
-
-        // The control is drawn inside the field, at the end of the row the field fills.
-        cx.simulate_click(
-            gpui_kit::point(search.right() - px(18.0), search.center().y),
-            Modifiers::none(),
-        );
-        cx.run_until_parked();
-
-        assert!(
-            dialog.read_with(cx, |dialog, _| dialog.filter.is_all()),
-            "clearing the field should admit everything again"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn selecting_a_page_should_show_it_and_reset_its_scroll(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(configured_settings(), cx);
-        cx.run_until_parked();
-
-        dialog.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx)
-        });
-
-        dialog.read_with(cx, |dialog, _| {
-            assert_eq!(dialog.current_page, "market_participants.okx");
-        });
-    }
-
-    /// The page drawn and the row that names it are one thing: the rows are drawn from the page
-    /// the dialog is on, so a page moved on its own would leave the row behind it, and a row
-    /// that moved the page back would take the field the user is typing into off the screen.
-    #[gpui_kit::test]
-    fn selecting_a_page_should_move_the_sidebar_with_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx)
-        });
-        settle(cx);
-
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.okx",
-            "the page selected and the page drawn are one thing"
-        );
-
-        // Working in the page is what the sidebar used to answer with its own selection: the
-        // caret goes into the field, and a sidebar that disagreed put its own page back under
-        // it.
-        click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.okx",
-            "the sidebar must not be able to move the page back off the page it is on"
-        );
-    }
-
-    /// A row is what opens the page it names: the rows are the only way into a page besides
-    /// the search, so a row that does not reach its page is a page with no way in.
-    #[gpui_kit::test]
-    fn clicking_a_sidebar_row_should_open_its_page(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        let row = cx
-            .debug_bounds("SETTINGS_ENTRY_market_participants.okx")
-            .expect("the sidebar should list the OKX page");
-        cx.simulate_click(row.center(), Modifiers::none());
-        settle(cx);
-
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.okx",
-            "the row that was clicked should be the page that is drawn"
-        );
-    }
-
-    /// The AI group sits between the general settings and the proxies, and its one page is the
-    /// translation page.
-    #[gpui_kit::test]
-    fn the_ai_group_should_open_the_translation_page(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        assert_eq!(
-            labels(&panel, cx).into_iter().take(6).collect::<Vec<_>>(),
-            [
-                SharedString::new_static("General"),
-                SharedString::new_static("Appearance"),
-                SharedString::new_static("Data time zone"),
-                SharedString::new_static("AI"),
-                SharedString::new_static("Translation"),
-                SharedString::new_static("Proxies"),
-            ],
-            "the AI group follows the general settings and precedes the proxies"
-        );
-
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-
-        assert_eq!(current_page(&panel, cx), "ai.translation");
-    }
-
-    /// The translation page draws the directory row, the model select, and the table of the
-    /// eight supported models, in that order.
-    #[gpui_kit::test]
-    fn the_translation_page_should_draw_its_models_and_directory_row(cx: &mut TestAppContext) {
-        let (_panel, cx) = settings(configured_settings(), cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-
-        for selector in [
-            "SETTINGS_AI_PAGE",
-            "SETTINGS_AI_DIRECTORY",
-            "SETTINGS_AI_DIRECTORY_INPUT",
-            "SETTINGS_AI_BROWSE",
-            "SETTINGS_AI_DOWNLOAD_SITE",
-            "SETTINGS_AI_SITE_HUGGINGFACE",
-            "SETTINGS_AI_SITE_MODELSCOPE",
-            "SETTINGS_AI_MODEL_SELECT_SECTION",
-            "SETTINGS_AI_MODEL_SELECT",
-            "SETTINGS_AI_MODELS",
-            "SETTINGS_AI_MODEL_TABLE",
-            "SETTINGS_AI_MODEL_0",
-            "SETTINGS_AI_MODEL_1",
-            "SETTINGS_AI_MODEL_2",
-            "SETTINGS_AI_MODEL_3",
-            "SETTINGS_AI_MODEL_4",
-            "SETTINGS_AI_MODEL_5",
-            "SETTINGS_AI_MODEL_6",
-            "SETTINGS_AI_MODEL_7",
-            "SETTINGS_AI_MODEL_DOWNLOAD_0",
-            "SETTINGS_AI_MODEL_DOWNLOAD_7",
-        ] {
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "the page should draw {selector}"
-            );
-        }
-
-        let directory = cx
-            .debug_bounds("SETTINGS_AI_DIRECTORY")
-            .expect("the directory row should be drawn");
-        let sites = cx
-            .debug_bounds("SETTINGS_AI_DOWNLOAD_SITE")
-            .expect("the download site row should be drawn");
-        let select = cx
-            .debug_bounds("SETTINGS_AI_MODEL_SELECT_SECTION")
-            .expect("the model select should be drawn");
-        let models = cx
-            .debug_bounds("SETTINGS_AI_MODELS")
-            .expect("the model list should be drawn");
-        let table = cx
-            .debug_bounds("SETTINGS_AI_MODEL_TABLE")
-            .expect("the model table should be drawn");
-
-        assert!(directory.bottom() <= sites.top());
-        assert!(sites.bottom() <= select.top());
-        assert!(select.bottom() <= models.top());
-        assert!(
-            table.top() >= models.top(),
-            "the table is what the model section holds"
-        );
-
-        let rows = (0..8)
-            .map(|index| {
-                cx.debug_bounds(Box::leak(
-                    format!("SETTINGS_AI_MODEL_{index}").into_boxed_str(),
-                ))
-                .unwrap_or_else(|| panic!("the table should draw model row {index}"))
-            })
-            .collect::<Vec<_>>();
-        for (index, pair) in rows.windows(2).enumerate() {
-            assert!(
-                pair[0].top() < pair[1].top(),
-                "the table draws the models in page order: row {index} is above row {}",
-                index + 1
-            );
-        }
-    }
-
-    /// At the window's minimum size the translation page still draws its table in the normal
-    /// content column, and every cell stays on the single line it is drawn with: the size and
-    /// the longest failure reason are cut rather than stacked.
-    #[gpui_kit::test]
-    fn the_translation_table_should_be_drawn_at_the_minimum_window_size(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        cx.simulate_resize(size(px(1280.0), px(960.0)));
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-
-        let table = cx
-            .debug_bounds("SETTINGS_AI_MODEL_TABLE")
-            .expect("the table should be drawn at the window's minimum size");
-        assert!(
-            table.size.width >= px(600.0),
-            "the table should fill the content column beside the sidebar: {table:?}"
-        );
-        for index in 0..8 {
-            let selector = Box::leak(format!("SETTINGS_AI_MODEL_{index}").into_boxed_str());
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "model row {index} should be drawn at the window's minimum size"
-            );
-        }
-
-        let size_cell = cx
-            .debug_bounds("SETTINGS_AI_MODEL_SIZE_4")
-            .expect("the 1.25-bit size should be drawn");
-        assert!(
-            size_cell.size.height < px(25.0),
-            "the size should stay on one line: {size_cell:?}"
-        );
-
-        // A size mismatch with a realistic pair of sizes is the longest reason the status column
-        // ever shows, and it should be cut to one line rather than wrap.
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ6K,
-                path,
-                DownloadState::DownloadFailed {
-                    failure: DownloadFailure::SizeMismatch {
-                        expected: 7_981_928_896,
-                        actual: 7_981_928_895,
-                    },
-                },
-                cx,
-            );
-        });
-        settle(cx);
-
-        let error = cx
-            .debug_bounds("SETTINGS_AI_MODEL_ERROR_1")
-            .expect("the failed download should draw its reason");
-        assert!(
-            error.size.height < px(25.0),
-            "the long failure reason should be cut to one line: {error:?}"
-        );
-    }
-
-    /// The system folder picker is what writes the directory field, and confirming the dialog is
-    /// what stores the directory the user chose.
-    #[gpui_kit::test]
-    fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let directory = tempfile::tempdir().expect("the test directory should build");
-
-        click(cx, "SETTINGS_AI_BROWSE");
-        assert!(
-            cx.did_prompt_for_paths(),
-            "the browse button should open the system folder prompt"
-        );
-        cx.simulate_path_prompt_response(|options| {
-            assert!(!options.files, "the prompt should not offer files");
-            assert!(options.directories, "the prompt should offer directories");
-            assert!(!options.multiple, "one directory is enough");
-            Some(vec![directory.path().to_path_buf()])
-        });
-        settle(cx);
-
-        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-        assert_eq!(
-            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
-                dialog.translation.read(cx).shown_directory(cx)
-            })),
-            Some(expected),
-            "the field should show the chosen directory"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            Some(directory.path().to_path_buf())
-        );
-    }
-
-    /// A session that opens over a stored directory shows it in the field.
-    #[gpui_kit::test]
-    fn a_stored_translation_directory_should_be_shown(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-
-        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-        assert_eq!(
-            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
-                dialog.translation.read(cx).shown_directory(cx)
-            })),
-            Some(expected)
-        );
-    }
-
-    /// The directory field is read-only: typing into it leaves the value the browse button chose.
-    #[gpui_kit::test]
-    fn the_translation_directory_should_not_be_editable(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-
-        let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-        type_into(cx, "SETTINGS_AI_DIRECTORY_INPUT", "E:\\typed");
-
-        assert_eq!(
-            cx.read(|cx| panel.read_with(cx, |dialog, cx| {
-                dialog.translation.read(cx).shown_directory(cx)
-            })),
-            Some(expected)
-        );
-    }
-
-    /// The directory row is reachable by what it configures, even though the page has no fields.
-    #[gpui_kit::test]
-    fn the_translation_page_should_be_reachable_by_its_directory_setting(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        panel.update(cx, |dialog, cx| {
-            dialog.set_query("model directory".into(), cx);
-        });
-        settle(cx);
-
-        assert_eq!(current_page(&panel, cx), "ai.translation");
-    }
-
-    /// The status column of each row follows the download state: buttons only where the state
-    /// has an action, and the text of the state beside them.
-    #[gpui_kit::test]
-    fn the_translation_rows_should_draw_download_retry_progress_and_delete_states(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone(), cx);
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ6K,
-                path.clone(),
-                DownloadState::Downloading {
-                    downloaded: 100,
-                    mb_per_second: 1.5,
-                },
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ8,
-                path.clone(),
-                DownloadState::DownloadFailed {
-                    failure: DownloadFailure::Transport,
-                },
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218B2Bit,
-                path.clone(),
-                DownloadState::Deleting,
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt27BQ4Km,
-                path.clone(),
-                DownloadState::Pausing { downloaded: 100 },
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadState::Paused { downloaded: 100 },
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218B125Bit,
-                path,
-                DownloadState::DeleteFailed {
-                    failure: DeleteFailure::Io {
-                        kind: std::io::ErrorKind::PermissionDenied,
-                    },
-                },
-                cx,
-            );
-        });
-        settle(cx);
-
-        // A model that was never started but whose file is present shows the downloaded row.
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_0").is_some(),
-            "a downloaded model offers delete"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_0").is_none(),
-            "a downloaded model offers no download button"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_0").is_none()
-                && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_0").is_none(),
-            "a downloaded model has no status text"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_1").is_some(),
-            "a download in flight offers pause"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
-            "a download in flight can be stopped for good"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
-            "a download in flight is stopped rather than deleted"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_1").is_some(),
-            "a download in flight draws how far it is"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_1").is_none(),
-            "a download in flight offers no download button"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_2").is_some(),
-            "a failed download offers retry"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_2").is_some(),
-            "a failed download can be stopped for good"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_2").is_none(),
-            "a failed download is stopped rather than deleted"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_2").is_some(),
-            "a failed download names its reason"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETING_3").is_some(),
-            "a delete in flight offers its disabled button"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_3").is_none(),
-            "a delete in flight must not offer a second delete"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_3").is_none()
-                && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_3").is_none(),
-            "a delete in flight has no status text"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_4").is_some(),
-            "a failed delete names its reason even when the file is gone"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_4").is_some(),
-            "a failed delete can be tried again"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_4").is_none(),
-            "a failed delete offers its own action rather than a download"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_5").is_some(),
-            "a pausing download is drawn with its disabled pause"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_5").is_some(),
-            "a pausing download can still be stopped for good"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_5").is_none(),
-            "a pausing download is stopped rather than deleted"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_5").is_some(),
-            "a pausing download says what it is doing"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_5").is_none(),
-            "a pausing download cannot be resumed yet"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_6").is_some(),
-            "a paused download offers resume"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_6").is_some(),
-            "a paused download can be stopped for good"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_6").is_none(),
-            "a paused download offers no pause"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_6").is_some(),
-            "a paused download says how much it already has"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_6").is_none(),
-            "a paused download is stopped rather than deleted"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_7").is_some(),
-            "a model that was never downloaded offers download"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_7").is_none()
-                && cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_7").is_none()
-                && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_7").is_none(),
-            "an idle model has no delete and no status text"
-        );
-    }
-
-    /// A row whose download is being stopped draws the disabled stop and says so, and a stop
-    /// that failed offers the stop again rather than a retry of the download.
-    #[gpui_kit::test]
-    fn the_translation_rows_should_draw_the_stopping_states(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ4Km,
-                path.clone(),
-                DownloadState::Terminating,
-                cx,
-            );
-            downloads.set_state_for_test(
-                TranslationModel::HyMt218BQ6K,
-                path,
-                DownloadState::TerminateFailed {
-                    failure: DeleteFailure::Io {
-                        kind: std::io::ErrorKind::PermissionDenied,
-                    },
-                },
-                cx,
-            );
-        });
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATING_0").is_some(),
-            "a download being stopped offers its disabled stop"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_0").is_none(),
-            "a download being stopped must not offer a second stop"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_0").is_some(),
-            "a download being stopped says what it is doing"
-        );
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
-            "a stop that failed can be tried again"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_1").is_some(),
-            "a failed stop names its reason"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_1").is_none()
-                && cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
-            "a failed stop offers neither a retry nor a delete"
-        );
-    }
-
-    /// Choosing a site is a change of the session, and the download icon starts from the site
-    /// the session holds rather than asking for one.
-    #[gpui_kit::test]
-    fn clicking_download_should_start_from_the_site_the_session_holds(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ8;
-
-        // The seam records downloads instead of transferring them, so nothing leaves the
-        // process. It needs a row of its own, which is not the one this test downloads.
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
-        assert_eq!(
-            drafted(&panel, cx).translation.download_site,
-            DownloadSite::ModelScope,
-            "choosing a site is a change of the session"
-        );
-
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).site(model, &path)),
-            Some(DownloadSite::ModelScope),
-            "the download starts from the site the session holds"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading {
-                downloaded: 0,
-                mb_per_second: 0.0,
-            },
-            "the download icon starts the download without asking for a site"
-        );
-    }
-
-    /// A session that never chose a site downloads from HuggingFace.
-    #[gpui_kit::test]
-    fn a_download_without_a_chosen_site_should_use_huggingface(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).site(model, &path)),
-            Some(DownloadSite::HuggingFace),
-            "a session with no choice of its own downloads from HuggingFace"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading {
-                downloaded: 0,
-                mb_per_second: 0.0,
-            }
-        );
-    }
-
-    /// A retry at the site the failed download came from continues that task from its partial
-    /// file.
-    #[gpui_kit::test]
-    fn a_retry_at_the_site_of_the_failed_download_should_continue_it(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt218BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ8,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-            // A download that came from ModelScope and failed, which is the row a retry starts
-            // from.
-            downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
-            downloads.set_state_for_test(
-                model,
-                path.clone(),
-                DownloadState::DownloadFailed {
-                    failure: DownloadFailure::Transport,
-                },
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
-        click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).site(model, &path)),
-            Some(DownloadSite::ModelScope),
-            "the retry uses the site the session holds"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading {
-                downloaded: 0,
-                mb_per_second: 0.0,
-            },
-            "the site of the failed task continues it rather than discarding it"
-        );
-    }
-
-    /// A retry whose session holds another site discards the failed transfer and starts again
-    /// from the chosen site.
-    #[gpui_kit::test]
-    fn a_retry_at_another_site_should_restart(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt218BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ8,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-            downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
-            downloads.set_state_for_test(
-                model,
-                path.clone(),
-                DownloadState::DownloadFailed {
-                    failure: DownloadFailure::Transport,
-                },
-                cx,
-            );
-        });
-        settle(cx);
-
-        // The session still holds HuggingFace while the failed task came from ModelScope.
-        click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-        settle(cx);
-
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).site(model, &path)),
-            Some(DownloadSite::HuggingFace),
-            "the restart is recorded against the site the session holds"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading {
-                downloaded: 0,
-                mb_per_second: 0.0,
-            },
-            "the other site restarts the download from zero"
-        );
-    }
-
-    /// Continuing a paused download starts it where it is, whatever site the session holds.
-    #[gpui_kit::test]
-    fn a_paused_download_should_resume_where_it_is(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ6K;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ8,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-            downloads.set_state_for_test(
-                model,
-                path.clone(),
-                DownloadState::Paused { downloaded: 100 },
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
-        click(cx, "SETTINGS_AI_MODEL_RESUME_6");
-
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading {
-                downloaded: 0,
-                mb_per_second: 0.0,
-            },
-            "the continue icon resumes the paused task"
-        );
-    }
-
-    /// Stopping a paused download from its row discards what it wrote: the partial file goes and
-    /// the row offers a download again.
-    #[gpui_kit::test]
-    fn a_paused_download_should_be_stopped_from_its_row(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ6K;
-        let part = path.join(format!("{}.part", model.file_name()));
-        std::fs::write(&part, b"partial").expect("the partial file should be written");
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_state_for_test(
-                model,
-                path.clone(),
-                DownloadState::Paused { downloaded: 7 },
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_TERMINATE_6");
-        wait_until_absent(cx, &downloads, model, &path, &part);
-
-        assert!(
-            !part.exists(),
-            "the stopped download's partial file is gone"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Idle,
-            "the stopped download is a download the row offers again"
-        );
-    }
-
-    /// The chosen site is stored with the rest of the session when the settings are confirmed.
-    #[gpui_kit::test]
-    fn choosing_a_download_site_should_be_stored_on_confirm(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-
-        assert_eq!(
-            drafted(&panel, cx).translation.download_site,
-            DownloadSite::HuggingFace,
-            "a session with nothing stored starts on HuggingFace"
-        );
-
-        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).translation.download_site,
-            DownloadSite::ModelScope,
-            "confirming stores the site the session holds"
-        );
-    }
-
-    /// The select offers exactly the models whose files are present at their published size.
-    #[gpui_kit::test]
-    fn the_model_select_should_list_only_downloaded_models(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(TranslationModel::HyMt27BQ8, path.clone(), cx);
-            downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ6K, path.clone(), cx);
-        });
-        settle(cx);
-
-        let offered = cx.read(|cx| downloads.read(cx).downloaded_models(&path));
-
-        assert_eq!(
-            offered,
-            vec![TranslationModel::HyMt218BQ6K, TranslationModel::HyMt27BQ8],
-            "only the downloaded models are offered, in page order"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_SELECT").is_some(),
-            "the select is drawn over what it offers"
-        );
-    }
-
-    /// Deleting a model clears the selection that named it and removes its file.
-    #[gpui_kit::test]
-    fn deleting_a_selected_model_should_clear_the_selection_and_the_file(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let model = TranslationModel::HyMt218BQ4Km;
-        let path = directory.path().join(model.file_name());
-        std::fs::write(&path, b"stub").expect("the fixture file should be written");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
-                    cx,
-                );
-            });
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(|config| config.translation.selected_model = Some(model), cx);
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
-        wait_until_absent(cx, &downloads, model, directory.path(), &path);
-
-        assert!(!path.exists(), "the model file is deleted");
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "the stored selection is cleared before the file goes"
-        );
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            None,
-            "the session selection is cleared too"
-        );
-    }
-
-    /// A selection whose file is being deleted must not be written back by Confirm.
-    #[gpui_kit::test]
-    fn confirming_should_clear_a_selected_model_that_is_being_deleted(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let model = TranslationModel::HyMt27BQ8;
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
-            downloads.set_state_for_test(
-                model,
-                directory.path().to_path_buf(),
-                crate::translation_downloads::DownloadState::Deleting,
-                cx,
-            );
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
-                    cx,
-                );
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "a model that is being deleted must not be stored as selected"
-        );
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            Some(directory.path().to_path_buf())
-        );
-    }
-
-    /// Deleting a selected model clears the session selection at once rather than waiting for
-    /// the delete to finish, so a Confirm pressed during the delete cannot write it back.
-    #[gpui_kit::test]
-    fn confirming_while_a_delete_is_unloading_should_not_restore_the_selection(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let model = TranslationModel::HyMt218BQ4Km;
-        let path = directory.path().join(model.file_name());
-        std::fs::write(&path, b"stub").expect("the fixture file should be written");
-
-        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
-        let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        let release_receiver = std::sync::Mutex::new(release_receiver);
-        let unload: std::sync::Arc<
-            dyn Fn(&std::path::Path) -> Result<(), crate::translation_downloads::UnloadFailure>
-                + Send
-                + Sync,
-        > = std::sync::Arc::new(move |_: &std::path::Path| {
-            entered_sender
-                .send(())
-                .expect("the test should be waiting for the unload");
-            release_receiver
-                .lock()
-                .expect("the release channel is not poisoned")
-                .recv()
-                .expect("the test should release the unload");
-            Ok(())
-        });
-        cx.update(|cx| install_translation_downloads_with(cx, unload));
-
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
-                    cx,
-                );
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
-        entered_receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the delete should reach its unload");
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            None,
-            "clicking delete should clear the session selection immediately"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "confirming during a delete must not restore the selection"
-        );
-
-        release_sender
-            .send(())
-            .expect("the delete worker should still be waiting");
-        wait_until_absent(cx, &downloads, model, directory.path(), &path);
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "the finished delete must not put the selection back"
-        );
-    }
-
-    /// Deleting a model that is not the selected one leaves the selection alone.
-    #[gpui_kit::test]
-    fn deleting_another_model_should_keep_the_selected_one(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let selected = TranslationModel::HyMt218BQ4Km;
-        let other = TranslationModel::HyMt27BQ8;
-        let selected_path = directory.path().join(selected.file_name());
-        std::fs::write(&selected_path, b"stub").expect("the fixture file should be written");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(selected, directory.path().to_path_buf(), cx);
-            downloads.force_downloaded_for_test(other, directory.path().to_path_buf(), cx);
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelSelected {
-                        model: Some(selected),
-                    },
-                    cx,
-                );
-            });
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| config.translation.selected_model = Some(selected),
-                    cx,
-                );
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DELETE_7");
-
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            Some(selected),
-            "deleting another model must not clear the selected one"
-        );
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            Some(selected),
-            "deleting another model must not clear the stored selection"
-        );
-
-        click(cx, "SETTINGS_AI_MODEL_DELETE_0");
-        wait_until_absent(cx, &downloads, selected, directory.path(), &selected_path);
-
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            None,
-            "deleting the selected model clears the selection"
-        );
-        assert_eq!(stored(cx).translation.selected_model, None);
-    }
-
-    /// A finished download becomes the selection when nothing usable was selected.
-    #[gpui_kit::test]
-    fn a_completed_download_should_be_selected_when_nothing_usable_is_selected(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let model = TranslationModel::HyMt218BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(model, directory.path().to_path_buf(), cx);
-        });
-        settle(cx);
-
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            Some(model),
-            "the finished download is what the page now uses"
-        );
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            Some(model),
-            "and the settings the download manager writes agree"
-        );
-    }
-
-    /// A directory change clears a selection whose file is not in the new directory.
-    #[gpui_kit::test]
-    fn changing_the_directory_should_clear_a_selection_that_is_not_there(cx: &mut TestAppContext) {
-        let first = tempfile::tempdir().expect("the first directory should build");
-        let second = tempfile::tempdir().expect("the second directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(first.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let model = TranslationModel::HyMt218BQ4Km;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(model, first.path().to_path_buf(), cx);
-        });
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelSelected { model: Some(model) },
-                    cx,
-                );
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_BROWSE");
-        cx.simulate_path_prompt_response(|_| Some(vec![second.path().to_path_buf()]));
-        settle(cx);
-
-        assert_eq!(
-            drafted(&panel, cx).translation.selected_model,
-            None,
-            "the model is not in the chosen directory, so the choice goes"
-        );
-        assert_eq!(
-            drafted(&panel, cx).translation.model_directory,
-            Some(second.path().to_path_buf())
-        );
-    }
-
-    /// A model the background manager selected in the stored directory is not persisted with
-    /// the different directory this session chose but has not confirmed yet.
-    #[gpui_kit::test]
-    fn confirming_should_clear_a_selected_model_that_is_not_in_the_chosen_directory(
-        cx: &mut TestAppContext,
-    ) {
-        let stored_directory = tempfile::tempdir().expect("the stored directory should build");
-        let chosen_directory = tempfile::tempdir().expect("the chosen directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(stored_directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-
-        panel.update(cx, |dialog, cx| {
-            dialog.draft.update(cx, |draft, cx| {
-                draft.write(
-                    crate::draft::SettingsEdit::TranslationModelDirectory {
-                        directory: chosen_directory.path().to_path_buf(),
-                    },
-                    cx,
-                );
-            });
-            // What the download manager writes when a download finishes while the page is
-            // open: it selects the model in the directory the settings still name.
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| config.translation.selected_model = Some(TranslationModel::HyMt27BQ8),
-                    cx,
-                );
-            });
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert_eq!(
-            stored(cx).translation.model_directory,
-            Some(chosen_directory.path().to_path_buf()),
-            "the directory the session chose should be stored"
-        );
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "a selection that is not downloaded in the stored directory must be cleared"
-        );
-    }
-
-    /// A venue's page is named by the venue it configures, and the sidebar row is what opens
-    /// it: every venue this build speaks is one page, so a shared label would make two venues
-    /// tell apart by nothing the user can read.
-    #[gpui_kit::test]
-    fn a_venue_page_should_be_named_by_the_venue_it_configures(cx: &mut TestAppContext) {
-        let (_panel, cx) = settings(Config::default(), cx);
-
-        assert_eq!(
-            page_title("market_participants.okx", cx),
-            SharedString::new_static("OKX"),
-            "the venue's page is named by the venue it configures"
-        );
-        assert_eq!(
-            page_title("appearance", cx),
-            SharedString::new_static("Appearance"),
-            "every other page is named by the message key it declares"
-        );
-    }
-
-    /// A group is a heading over the pages under it, and every page under it is drawn: nothing
-    /// a group declares hides one of them, so the venues the release notes promise are one
-    /// click away from the first frame.
-    #[gpui_kit::test]
-    fn a_group_should_draw_every_page_under_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        let opening = labels(&panel, cx);
-        assert!(
-            opening.contains(&SharedString::new_static("Market participants")),
-            "the group should be drawn as a heading: {opening:?}"
-        );
-        assert!(
-            opening.contains(&SharedString::new_static("OKX")),
-            "every venue under the group should be drawn on the first frame: {opening:?}"
-        );
-    }
-
-    /// A page at the top of the catalog is a part of its own rather than another page of the
-    /// group above it: the divider is what says so, and a page with nothing before it is not
-    /// divided from anything.
-    #[gpui_kit::test]
-    fn a_root_page_should_be_divided_from_the_group_above_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_SIDEBAR_SEPARATOR").is_some(),
-            "About should be divided from the group above it"
-        );
-
-        panel.update(cx, |dialog, cx| dialog.set_query("about".into(), cx));
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_SIDEBAR_SEPARATOR").is_none(),
-            "a page with nothing before it should not be divided from anything"
-        );
-        assert_eq!(
-            labels(&panel, cx),
-            [SharedString::new_static("About")],
-            "the query should leave the page the divider belonged to"
-        );
-    }
-
-    /// A query keeps the heading of a group a page under it matches in: the rows are the pages,
-    /// and a page drawn without the heading over it would be a page whose group the search
-    /// left behind.
-    #[gpui_kit::test]
-    fn a_query_should_keep_the_group_of_a_page_it_matches(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        panel.update(cx, |dialog, cx| dialog.set_query("a".into(), cx));
-        settle(cx);
-
-        assert_eq!(
-            current_page(&panel, cx),
-            "appearance",
-            "the query admits the page that is drawn, so the page should not have moved"
-        );
-        let narrowed = labels(&panel, cx);
-        assert!(
-            narrowed.contains(&SharedString::new_static("Market participants")),
-            "the query should keep the heading it matches in: {narrowed:?}"
-        );
-        assert!(
-            narrowed.contains(&SharedString::new_static("OKX")),
-            "the pages the query admits should be listed under the heading: {narrowed:?}"
-        );
-    }
-
-    /// A page the query does not admit is a page that is no longer drawn, so what is drawn
-    /// moves to the first page the query does admit.
-    #[gpui_kit::test]
-    fn a_query_should_move_the_page_to_one_it_admits(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-
-        dialog.update(cx, |dialog, cx| {
-            dialog.select("market_participants.okx", cx);
-            dialog.set_query("proxy".into(), cx);
-        });
-
-        dialog.read_with(cx, |dialog, _| {
-            assert!(
-                !dialog.filter.admits_page("market_participants.okx"),
-                "the query should not admit the page that was selected"
-            );
-            assert!(
-                dialog.filter.admits_page(&dialog.current_page),
-                "the page that is drawn must be one the query admits"
-            );
-        });
-    }
-
-    /// A page whose own label the query does not match but one of whose fields it does is a
-    /// page the query reaches: it is listed in the sidebar, opened as the page that is drawn,
-    /// and only the fields that matched are drawn on it.
-    #[gpui_kit::test]
-    fn a_query_that_matches_a_field_should_open_the_page_that_holds_it(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        panel.update(cx, |dialog, cx| dialog.set_query("api_key".into(), cx));
-        settle(cx);
-
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.binance",
-            "the page that holds the field should be the one the query opens"
-        );
-        let narrowed = labels(&panel, cx);
-        assert!(
-            narrowed.contains(&SharedString::new_static("Market participants")),
-            "the group that holds the page should be kept: {narrowed:?}"
-        );
-        assert!(
-            narrowed.contains(&SharedString::new_static("Binance"))
-                && narrowed.contains(&SharedString::new_static("OKX")),
-            "every page a matching field sits on should be listed: {narrowed:?}"
-        );
-        assert!(
-            !narrowed.contains(&SharedString::new_static("Appearance")),
-            "a page with no matching label or field should not be listed: {narrowed:?}"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_FIELD_market_participants.binance.spot.spot_api_key")
-                .is_some(),
-            "the field the query matched should be drawn on the page it opened"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_FIELD_market_participants.binance.spot.spot_private_key")
-                .is_none(),
-            "a field the query did not match should not be drawn on a page reached by a field"
-        );
-    }
-
-    /// A query that matches nothing is answered in both columns: the sidebar has no row left
-    /// and the page that was open is not drawn behind it, so the two do not disagree the way
-    /// they would if the page stayed selected while the sidebar went empty.
-    #[gpui_kit::test]
-    fn a_query_that_matches_nothing_should_say_so_in_both_columns(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        panel.update(cx, |dialog, cx| {
-            dialog.select("proxy-management", cx);
-            dialog.set_query("555".into(), cx);
-        });
-        settle(cx);
-
-        panel.read_with(cx, |dialog, _| {
-            assert!(
-                dialog.filter.is_nothing(),
-                "the query should admit nothing at all"
-            );
-        });
-        assert!(
-            labels(&panel, cx).is_empty(),
-            "the sidebar should draw no row for a query that admits nothing"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_SIDEBAR_NO_MATCHES").is_some(),
-            "the sidebar column should say that nothing matched"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE_NO_MATCHES").is_some(),
-            "the page column should say that nothing matched"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_PAGE").is_none(),
-            "the page the query took away must not be drawn behind the empty sidebar"
-        );
-
-        panel.update(cx, |dialog, cx| dialog.set_query("".into(), cx));
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds("SETTINGS_SIDEBAR_NO_MATCHES").is_none()
-                && cx.debug_bounds("SETTINGS_PAGE_NO_MATCHES").is_none(),
-            "clearing the query should take the message away"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_PAGE").is_some(),
-            "clearing the query should bring back the page that was open before it"
-        );
-    }
-
-    /// Clearing a query brings the whole sidebar back, and with it the page that was drawn.
-    #[gpui_kit::test]
-    fn clearing_a_query_should_admit_everything_again(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-
-        dialog.update(cx, |dialog, cx| {
-            dialog.set_query("appearance".into(), cx);
-            dialog.set_query("".into(), cx);
-        });
-
-        dialog.read_with(cx, |dialog, _| {
-            assert!(dialog.filter.is_all());
-        });
-    }
-
-    /// A build that has loaded nothing still offers the rows of its own venues: the venue list
-    /// is this build's static answer, so a row per venue is there before anything is
-    /// loaded, while a scope line is what the loaded venues answer and appears only once its
-    /// venue is loaded.
-    ///
-    /// What is asserted here is the dialog the entry's own read of the loaded venues built —
-    /// not a catalog assembled beside it — so a page source that went back to a declaration
-    /// view, or one that read a scope list before its venue was loaded, would be caught here.
-    #[gpui_kit::test]
-    fn an_unconnected_build_should_still_offer_the_declared_settings(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings_of_an_unconnected_build(cx);
-        let connector = cx.read(|cx| cx.global::<MarketParticipantsConnector>().clone());
-        let venues = connector.supported_venues();
-
-        assert!(
-            connector.venues().scopes().is_empty(),
-            "the settings are opened over an empty loaded-venues view"
-        );
-
-        let applications = dialog.read_with(cx, |dialog, _| {
-            dialog
-                .catalog
-                .page("proxy-applications")
-                .expect("the applications page is built")
-                .clone()
-        });
-        let rows = applications
-            .sections
-            .iter()
-            .filter(|section| {
-                section.title.as_ref().and_then(crate::catalog::Text::key)
-                    == Some("settings_ui.proxies.venue_section")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rows.len(),
-            venues.len(),
-            "one row per venue this build speaks, whether or not anything is loaded"
-        );
-        for (row, venue) in rows.iter().zip(venues.iter()) {
-            assert_eq!(
-                row.fields.len(),
-                1,
-                "a venue's own line is the whole of its row"
-            );
-            assert_eq!(
-                row.fields[0].id,
-                format!("proxy-applications.{}", venue.as_str()),
-                "the row stands for the venue it is drawn under"
-            );
-        }
-
-        // The page is drawn rather than skipped: the proxy lines that are not a market's are
-        // there for a build that has loaded nothing.
-        type_into(cx, "SETTINGS_SEARCH", "applications");
-        assert!(
-            cx.debug_bounds("SETTINGS_FIELD_proxy-applications.kytrix.cloud")
-                .is_some(),
-            "the rows that belong to no market are drawn by a build that has loaded nothing"
-        );
-
-        // A venue's origins are its own configuration's answer rather than a load's, so they are
-        // there for a build that has loaded nothing — and a load does not add or move one.
-        let binance = VenueId::Binance;
-        let page = catalog(&crate::schema::tests::venues())
-            .page("market_participants.binance")
-            .expect("the venue's page is built")
-            .clone();
-        let scope = page
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .find(|field| field.label.key().is_none())
-            .expect("a venue that has loaded nothing still offers the origin of a scope")
-            .clone();
-        let before = page
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .map(|field| field.id.clone())
-            .collect::<Vec<_>>();
-
-        cx.update(|_, cx| {
-            cx.global::<MarketParticipantsConnector>()
-                .load_fixture(
-                    &market_participants_connector::test_support::definitions(&venues),
-                    &[],
-                    &[],
-                )
-                .expect("the declared scopes load");
-        });
-        let loaded = catalog(&crate::schema::tests::venues());
-        let after = loaded
-            .page("market_participants.binance")
-            .expect("the venue's page is built")
-            .sections
-            .iter()
-            .flat_map(|section| &section.fields)
-            .map(|field| field.id.clone())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            before, after,
-            "loading a venue does not add or move an origin row: the rows are the stored scopes"
-        );
-        assert!(
-            scope
-                .id
-                .as_ref()
-                .starts_with(&format!("market_participants.{}.", binance.as_str())),
-            "the origin row stands for a scope of its venue: {}",
-            scope.id
-        );
-    }
-
-    /// Every page is drawn, one after another.
-    ///
-    /// What this is for is the frames rather than the pixels: a page is built while the
-    /// dialog is being rendered, so a field that reached back into the dialog — or a view
-    /// that read it while it drew itself — would be a panic rather than a wrong color, and
-    /// this is what would find it.
-    #[gpui_kit::test]
-    fn every_page_should_be_drawable(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(configured_settings(), cx);
-        let pages = pages()
-            .iter()
-            .map(|page| page.id.clone())
-            .collect::<Vec<_>>();
-
-        for page in pages {
-            dialog.update(cx, |dialog, cx| dialog.select(page.as_str(), cx));
-            cx.run_until_parked();
-
-            dialog.read_with(cx, |dialog, _| {
-                assert_eq!(
-                    dialog.current_page, page,
-                    "selecting {page} should draw it rather than another"
-                );
-            });
-        }
-    }
-
-    /// A venue's line is a row a user can set before any proxy exists: the control is operable
-    /// with an empty catalog, and the lines it offers are the row's own choices — the default
-    /// line among them.
-    ///
-    /// Every venue starts on the default line, so a row that was only operable once the catalog
-    /// held an entry would be one a fresh installation cannot put back on it.
-    #[gpui_kit::test]
-    fn a_proxy_line_should_be_settable_with_an_empty_catalog(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-        assert!(
-            stored(cx).proxies.is_empty(),
-            "the settings this test opens hold no proxy at all"
-        );
-
-        dialog.update(cx, |dialog, cx| dialog.select("proxy-applications", cx));
-        settle(cx);
-
-        click(cx, "SETTINGS_CONTROL_proxy-applications.binance");
-
-        assert!(
-            cx.debug_bounds("TEST_DROPDOWN_PANEL").is_some(),
-            "a venue's line opens with nothing in the catalog: a disabled control opens nothing"
-        );
-        // An entry is drawn by a button the menu names after the entry's own id, so the lines the
-        // open menu offers are read back by the tokens the settings store those lines under.
-        assert!(
-            cx.debug_bounds("TEST_MENU_ITEM_@inherit").is_some(),
-            "the row offers the default line, which is the line every venue starts on"
-        );
-        assert!(
-            cx.debug_bounds("TEST_MENU_ITEM_@direct").is_some(),
-            "beside the one that names no proxy at all"
-        );
-    }
-
-    /// The proxy catalog is drawn by the table rather than by the page's own fields, and a
-    /// catalog with nothing in it says so once, across the body, rather than in every column
-    /// of a row that has no entry behind it.
-    #[gpui_kit::test]
-    fn the_proxy_page_should_be_drawable_with_an_empty_catalog(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-
-        dialog.update(cx, |dialog, cx| dialog.select("proxy-management", cx));
-        settle(cx);
-
-        dialog.read_with(cx, |dialog, cx| {
-            assert_eq!(dialog.current_page, "proxy-management");
-            assert_eq!(
-                base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies.read(cx)),
-                0,
-                "a catalog with nothing in it has no rows for the table to draw"
-            );
-        });
-
-        let message = cx
-            .debug_bounds("SETTINGS_PROXY_EMPTY")
-            .expect("the empty catalog should draw the message it has to say");
-        let table = cx
-            .debug_bounds("SETTINGS_PROXY_TABLE")
-            .expect("the page should draw the frame the table is drawn in");
-        assert!(
-            (message.center().x - table.center().x).abs() < px(1.0),
-            "the message should be drawn across the whole table rather than inside one of its \
-             columns: it is {message:?} in {table:?}"
-        );
-    }
-
-    /// The way to add an entry is the right end of the row above the catalog, and the catalog
-    /// below that row is the rest of the page: the page is as tall as the dialog gives it, so the
-    /// table is not a height of its own but whatever the row above it left.
-    #[gpui_kit::test]
-    fn the_add_button_should_sit_above_a_table_that_fills_the_page(cx: &mut TestAppContext) {
-        let (dialog, cx) = settings(Config::default(), cx);
-        dialog.update(cx, |dialog, cx| dialog.select("proxy-management", cx));
-        settle(cx);
-
-        let page = cx
-            .debug_bounds("SETTINGS_PROXY_PAGE")
-            .expect("the proxy page should be drawn");
-        let add = cx
-            .debug_bounds("SETTINGS_PROXY_ADD_BUTTON")
-            .expect("the page should draw the button that adds an entry");
-        let table = cx
-            .debug_bounds("SETTINGS_PROXY_TABLE")
-            .expect("the page should draw the frame the table is drawn in");
-        // The sidebar is the foot of the column beside the page, so where it ends is where the
-        // body the page is drawn in ends: a page that stopped at its own two rows would end
-        // higher.
-        let column = cx
-            .debug_bounds("SETTINGS_SIDEBAR")
-            .expect("the dialog should draw the sidebar beside the page");
-
-        assert_eq!(
-            add.size.height,
-            UnifiedSize::Medium.h(),
-            "the button that adds an entry is a medium one: it is {add:?}"
-        );
-        assert!(
-            (add.right() - page.right()).abs() < px(1.0),
-            "the button belongs at the right end of the row above the table: it is {add:?} in \
-             {page:?}"
-        );
-        assert!(
-            add.bottom() <= table.top(),
-            "the table belongs below the button rather than beside it: {table:?} under {add:?}"
-        );
-        assert_eq!(
-            page.bottom(),
-            column.bottom(),
-            "the page should be the whole of the body it is drawn in: {page:?} beside {column:?}"
-        );
-        assert_eq!(
-            table.bottom(),
-            page.bottom(),
-            "the table should be the rest of the page: {table:?} in {page:?}"
-        );
-        assert_eq!(
-            table.size.width, page.size.width,
-            "the table should be as wide as the page it fills: {table:?} in {page:?}"
-        );
-    }
-
-    /// An entry is a row of the catalog: the table counts it, and the body draws it instead of
-    /// the message that says there is nothing in the catalog.
-    #[gpui_kit::test]
-    fn a_catalog_with_an_entry_should_draw_the_entry_rather_than_the_empty_message(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        panel.update(cx, |dialog, cx| dialog.select("proxy-management", cx));
-        settle(cx);
-
-        panel.read_with(cx, |dialog, cx| {
-            assert_eq!(
-                base_ui::table::TableDataSet::<6>::rows_count(dialog.proxies.read(cx)),
-                1,
-                "the entry the catalog holds should be the one row of the table"
-            );
-        });
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_PAGE").is_some(),
-            "the catalog should still be the page that is drawn, so that the message being gone \
-             is the table's doing rather than the page's"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_EMPTY").is_none(),
-            "a catalog that holds an entry must not draw the message that it holds none"
-        );
-    }
-
-    /// Every page the catalog declares is reachable from the sidebar, and every row leads to
-    /// one: a page nobody can select is a page that does not exist, and a row that opens
-    /// nothing is a dead end.
-    #[test]
-    fn the_sidebar_and_the_pages_should_name_each_other() {
-        let catalog = test_catalog();
-        let mut reachable = catalog.tree.iter().flat_map(leaves).collect::<Vec<_>>();
-        reachable.sort_unstable();
-
-        let mut declared = catalog
-            .pages
-            .iter()
-            .map(|page| page.id.clone())
-            .collect::<Vec<_>>();
-        declared.sort_unstable();
-
-        assert_eq!(reachable, declared);
-        assert!(SearchFilter::new("", &[]).is_all());
-    }
-
-    /// The form is drawn over the settings and takes the mouse from them: a click at the
-    /// settings' own confirm button reaches the form over it instead, so the settings under an
-    /// open form are out of reach while it is up.
-    ///
-    /// What draws the form is the frame the request for it asks for: nothing here refreshes the
-    /// window, so a form that reached the layer without a frame ever drawing it would leave the
-    /// click to land on the settings underneath.
-    #[gpui_kit::test]
-    fn a_form_should_keep_the_settings_under_it_out_of_reach(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        // The session holds a change before the form opens, so the click below has something to
-        // write if it reaches the settings: without it, "the settings were not written" would hold
-        // even for a click that went straight through the form.
-        write_draft_field(&panel, "appearance", "appearance", "Dark", cx);
-        open_edit_form(&panel, "hk", cx);
-        let before = stored(cx);
-
-        let form = cx.debug_bounds("SETTINGS_PROXY_EDIT").expect(
-            "the request alone should be enough for the form over the settings to be drawn",
-        );
-        let confirm = cx
-            .debug_bounds("SETTINGS_CONFIRM")
-            .expect("the settings should draw their own confirm button");
-        assert!(
-            !form.contains(&confirm.center()),
-            "the settings' confirm button should be outside the form's own panel, or a swallowed \
-             click would prove nothing: the form is {form:?} and the button is {confirm:?}"
-        );
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        assert!(
-            cx.debug_bounds("SETTINGS_PAGE").is_some(),
-            "the settings should not be confirmed by a click that was aimed through the form"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_PROXY_EDIT").is_some(),
-            "the form should still be open over the settings"
-        );
-        assert_eq!(
-            stored(cx),
-            before,
-            "the click should have been swallowed by the form rather than confirm the settings"
-        );
-        assert_eq!(
-            stored(cx).appearance,
-            Appearance::System,
-            "the change the session was holding must not have been written by a click that was \
-             aimed at the settings through the form"
-        );
-    }
-
-    /// The pages a tree entry leads to, which for a group are the pages of its children.
-    fn leaves(node: &crate::catalog::TreeNodeDef) -> Vec<SharedString> {
-        match node {
-            crate::catalog::TreeNodeDef::Page(id) => vec![id.clone()],
-            crate::catalog::TreeNodeDef::Group { children, .. } => {
-                children.iter().flat_map(leaves).collect()
-            }
-        }
-    }
-
-    /// A write that moves a venue's credential shape moves the page with it: the fields the user
-    /// is looking at are the ones the shape the venue holds now has, so what they type into the
-    /// page as it is drawn lands in that shape rather than nowhere.
-    ///
-    /// A write through a control of a venue's page lands in that venue's own row, and a venue's
-    /// market holds its own values: what a control offers is the venue's own API rather than
-    /// anything a value moves.
-    ///
-    /// The write goes through the field's own access, which is what the control of that field
-    /// holds — the same conversion the dialog's `write_field` is handed — so this is about where a
-    /// page's write lands, not about where a click lands.
-    #[gpui_kit::test]
-    fn a_write_through_a_venue_row_should_land_in_that_venues_row(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.binance", cx)
-        });
-        settle(cx);
-
-        let spot = "SETTINGS_CONTROL_market_participants.binance.spot.spot_api_key";
-        assert!(
-            cx.debug_bounds(spot).is_some(),
-            "the page opens on the market the venue publishes"
-        );
-
-        let access = field_access(
-            "market_participants.binance",
-            "market_participants.binance.spot.spot_api_key",
-        );
-        panel.update(cx, |dialog, cx| {
-            dialog.write_field(access, FieldValue::new_static("typed-key"), cx);
-        });
-        settle(cx);
-
-        panel.read_with(cx, |dialog, cx| {
-            let stored = dialog.draft.read(cx).config();
-            let VenueSettings::Binance(binance) = stored
-                .venue(&VenueId::Binance)
-                .expect("the fixture settings name every venue this build speaks")
-            else {
-                panic!("binance is configured as Binance");
-            };
-            assert_eq!(
-                binance.credentials.spot_api_key, "typed-key",
-                "the value landed in the venue the row belongs to"
-            );
-            assert_eq!(
-                binance.credentials.usd_m_perp_api_key, "binance-perp-key",
-                "and the venue's other market kept its own"
-            );
-        });
-    }
-
-    /// Longbridge is a page of the settings a user can open, not one that exists only in the
-    /// catalog's own builder.
-    ///
-    /// The dialog builds its venue pages from the venue list this build *serves*, so a venue a
-    /// previous build declared settings for without serving it is a page nothing can reach: this
-    /// opens that page through the served list and reads the boxes its rows are drawn in. The
-    /// query narrows the page to its own rows — a page is drawn inside a scroll viewport, and a
-    /// row below the fold is one the window never lays out — so every row the design names is
-    /// asserted rather than the first one that happens to fit.
-    ///
-    /// A row's *control* is asserted for the rows a text field draws. The region row's control is
-    /// a `Select`, which registers no debug bounds of its own — the same is true of every select
-    /// in the settings, the appearance page's and OKX's region among them — so what is asserted
-    /// for that row is that the row itself is drawn; which choice it offers is the catalogue's,
-    /// and the page's own round trip below is what writes through it.
-    #[gpui_kit::test]
-    fn longbridges_page_should_be_a_page_of_the_served_settings(cx: &mut TestAppContext) {
-        let (panel, cx) = settings(configured_settings(), cx);
-
-        assert!(
-            !labels(&panel, cx).is_empty(),
-            "the sidebar should draw at least one row"
-        );
-
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.longbridge", cx);
-            dialog.set_query("longbridge".into(), cx);
-        });
-        settle(cx);
-
-        assert_eq!(
-            current_page(&panel, cx),
-            "market_participants.longbridge",
-            "the page the served settings declare is the page that is opened"
-        );
-        assert_eq!(
-            page_title("market_participants.longbridge", cx),
-            SharedString::new_static("Longbridge"),
-            "the page is named by the venue it configures"
-        );
-
-        for field in [
-            "SETTINGS_FIELD_market_participants.longbridge.region",
-            "SETTINGS_FIELD_market_participants.longbridge.app_key",
-            "SETTINGS_FIELD_market_participants.longbridge.app_secret",
-            "SETTINGS_FIELD_market_participants.longbridge.access_token",
-        ] {
-            assert!(
-                cx.debug_bounds(field).is_some(),
-                "the page should draw the row {field} names"
-            );
-        }
-        for control in [
-            "SETTINGS_CONTROL_market_participants.longbridge.app_key",
-            "SETTINGS_CONTROL_market_participants.longbridge.app_secret",
-            "SETTINGS_CONTROL_market_participants.longbridge.access_token",
-        ] {
-            assert!(
-                cx.debug_bounds(control).is_some(),
-                "the page should draw the field behind {control}"
-            );
-        }
-    }
-
-    /// What a user configures on Longbridge's page is what the settings hold: the region moves
-    /// the site the venue is reached on, and the three values land in the venue's own credential
-    /// set, once the session is confirmed.
-    ///
-    /// The write goes through the page's own rows and the commit through the dialog's own confirm
-    /// button, over the manager the settings session was opened from — which is what makes this a
-    /// round trip through the settings rather than through the configuration type: the values are
-    /// read back from the manager every other part of the application reads.
-    #[gpui_kit::test]
-    fn longbridges_page_should_write_the_region_and_the_credentials(cx: &mut TestAppContext) {
-        let longbridge = VenueId::Longbridge;
-        let (panel, cx) = settings(Config::default(), cx);
-
-        panel.update(cx, |dialog, cx| {
-            dialog.select("market_participants.longbridge", cx)
-        });
-        settle(cx);
-
-        write_draft_field(
-            &panel,
-            "market_participants.longbridge",
-            "market_participants.longbridge.region",
-            "china",
-            cx,
-        );
-
-        // The three values are typed into the controls the page draws, and the commit is what
-        // reads them: a text row commits when the caret leaves it, and pressing a button of the
-        // dialog does not take the caret away from it.
-        for (selector, value) in [
-            (
-                "SETTINGS_CONTROL_market_participants.longbridge.app_key",
-                "typed-app-key",
-            ),
-            (
-                "SETTINGS_CONTROL_market_participants.longbridge.app_secret",
-                "typed-app-secret",
-            ),
-            (
-                "SETTINGS_CONTROL_market_participants.longbridge.access_token",
-                "typed-access-token",
-            ),
-        ] {
-            type_into(cx, selector, value);
-        }
-
-        click(cx, "SETTINGS_CONFIRM");
-
-        let written = stored(cx);
-        let Some(VenueSettings::Longbridge(settings)) = written.venue(&longbridge) else {
-            panic!("longbridge is configured as Longbridge");
-        };
-        assert_eq!(
-            settings.credentials,
-            LongbridgeCredentials {
-                app_key: SmolStr::new_static("typed-app-key"),
-                app_secret: SmolStr::new_static("typed-app-secret"),
-                access_token: SmolStr::new_static("typed-access-token"),
-            },
-            "the three values landed in the venue's own credential set"
-        );
-        assert_eq!(
-            settings.region,
-            LongbridgeRegion::China,
-            "the region row wrote the region the user chose"
-        );
-        assert_eq!(
-            settings.addresses().http.as_str(),
-            "https://openapi.longbridge.cn/",
-            "and the venue is reached on the site that region publishes"
-        );
-    }
-}
+mod tests;
