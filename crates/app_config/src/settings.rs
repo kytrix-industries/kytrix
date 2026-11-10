@@ -1256,6 +1256,11 @@ mod tests {
         let decoded: Config = serde_json::from_value(json).expect("the file should decode");
 
         assert_eq!(decoded.translation.model_directory, None);
+        assert_eq!(
+            decoded.translation.download_site,
+            crate::translation::DownloadSite::HuggingFace,
+            "a file without a download site downloads from HuggingFace"
+        );
     }
 
     /// A venue's row carries exactly the settings its own venue has: no scope

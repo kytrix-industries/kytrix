@@ -1211,8 +1211,6 @@ settings_ui:
     deleting: Deleting
     description: Description
     download: Download
-    download_complete_message: The model %{model} was downloaded successfully.
-    download_complete_title: Download complete
     download_failed: 'Download failed: %{reason}'
     download_failed_cancelled: the download was cancelled
     download_failed_destination: the destination is not a file path
@@ -1226,9 +1224,9 @@ settings_ui:
     download_failed_too_large: the download exceeded the allowed size
     download_failed_transport: the download failed on the network
     download_failed_url: the model address is invalid
+    download_site: Model download site
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope
-    download_site_title: Choose a model download site
     downloading_progress: Downloading %{percent}%
     model_description: '%{bits}-bit quantized version of the HY-MT2 %{size} model'
     model_directory: Model directory

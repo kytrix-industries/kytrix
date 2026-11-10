@@ -2898,6 +2898,9 @@ mod tests {
             "SETTINGS_AI_DIRECTORY",
             "SETTINGS_AI_DIRECTORY_INPUT",
             "SETTINGS_AI_BROWSE",
+            "SETTINGS_AI_DOWNLOAD_SITE",
+            "SETTINGS_AI_SITE_HUGGINGFACE",
+            "SETTINGS_AI_SITE_MODELSCOPE",
             "SETTINGS_AI_MODEL_SELECT_SECTION",
             "SETTINGS_AI_MODEL_SELECT",
             "SETTINGS_AI_MODELS",
@@ -2922,6 +2925,9 @@ mod tests {
         let directory = cx
             .debug_bounds("SETTINGS_AI_DIRECTORY")
             .expect("the directory row should be drawn");
+        let sites = cx
+            .debug_bounds("SETTINGS_AI_DOWNLOAD_SITE")
+            .expect("the download site row should be drawn");
         let select = cx
             .debug_bounds("SETTINGS_AI_MODEL_SELECT_SECTION")
             .expect("the model select should be drawn");
@@ -2932,7 +2938,8 @@ mod tests {
             .debug_bounds("SETTINGS_AI_MODEL_TABLE")
             .expect("the model table should be drawn");
 
-        assert!(directory.bottom() <= select.top());
+        assert!(directory.bottom() <= sites.top());
+        assert!(sites.bottom() <= select.top());
         assert!(select.bottom() <= models.top());
         assert!(
             table.top() >= models.top(),
@@ -2954,14 +2961,6 @@ mod tests {
                 index + 1
             );
         }
-
-        // The session has no directory, so the download action is drawn but disabled: pressing
-        // it starts nothing and opens no dialog.
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_0");
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_none(),
-            "a download with no directory must not ask for a site"
-        );
     }
 
     /// At the window's minimum size the translation page still draws its table in the normal
@@ -3295,16 +3294,14 @@ mod tests {
         );
     }
 
-    /// The download icon asks which site the file should come from, and cancelling that question
-    /// starts nothing.
+    /// Choosing a site is a change of the session, and the download icon starts from the site
+    /// the session holds rather than asking for one.
     #[gpui_kit::test]
-    fn clicking_download_should_ask_for_a_site_and_cancel_should_start_nothing(
-        cx: &mut TestAppContext,
-    ) {
+    fn clicking_download_should_start_from_the_site_the_session_holds(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
         let mut config = configured_settings();
         config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
+        let (panel, cx) = settings(config, cx);
         click(cx, "SETTINGS_ENTRY_ai.translation");
         let downloads = translation_downloads(cx);
         let path = directory.path().to_path_buf();
@@ -3322,84 +3319,30 @@ mod tests {
         });
         settle(cx);
 
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_some(),
-            "the download icon opens the site dialog"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_HUGGINGFACE").is_some()
-                && cx.debug_bounds("SETTINGS_AI_SITE_MODELSCOPE").is_some(),
-            "the dialog offers both sites"
-        );
-
-        click(cx, "SETTINGS_AI_SITE_CANCEL");
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_none(),
-            "cancel closes the dialog"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Idle,
-            "cancel starts no download"
-        );
-        assert_eq!(
-            cx.read(|cx| downloads.read(cx).site(model, &path)),
-            None,
-            "cancel records no site"
-        );
-    }
-
-    /// Confirming a site starts the download from that site.
-    #[gpui_kit::test]
-    fn confirming_a_site_should_start_the_download_from_it(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
         click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
-
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_none(),
-            "confirm closes the dialog"
+        assert_eq!(
+            drafted(&panel, cx).translation.download_site,
+            DownloadSite::ModelScope,
+            "choosing a site is a change of the session"
         );
+
+        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
+
         assert_eq!(
             cx.read(|cx| downloads.read(cx).site(model, &path)),
             Some(DownloadSite::ModelScope),
-            "the download is started from the site that was chosen"
+            "the download starts from the site the session holds"
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
             DownloadState::Downloading { downloaded: 0 },
-            "confirm starts the download rather than opening a progress dialog"
-        );
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_none(),
-            "there is no progress dialog behind the site dialog"
+            "the download icon starts the download without asking for a site"
         );
     }
 
-    /// Confirming without choosing a radio downloads from HuggingFace, which is the site the
-    /// dialog opens on.
+    /// A session that never chose a site downloads from HuggingFace.
     #[gpui_kit::test]
-    fn confirming_the_default_site_should_download_from_huggingface(cx: &mut TestAppContext) {
+    fn a_download_without_a_chosen_site_should_use_huggingface(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
         let mut config = configured_settings();
         config.translation.model_directory = Some(directory.path().to_path_buf());
@@ -3420,24 +3363,22 @@ mod tests {
         settle(cx);
 
         click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
 
         assert_eq!(
             cx.read(|cx| downloads.read(cx).site(model, &path)),
             Some(DownloadSite::HuggingFace),
-            "a download confirmed without a choice comes from the site the dialog opened on"
+            "a session with no choice of its own downloads from HuggingFace"
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 },
-            "confirming the default starts the download"
+            DownloadState::Downloading { downloaded: 0 }
         );
     }
 
-    /// A retry opens the site dialog on the site the failed download used, and confirming that
-    /// unchanged choice continues from the failed task.
+    /// A retry at the site the failed download came from continues that task from its partial
+    /// file.
     #[gpui_kit::test]
-    fn a_retry_should_default_to_the_site_of_the_failed_download(cx: &mut TestAppContext) {
+    fn a_retry_at_the_site_of_the_failed_download_should_continue_it(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
         let mut config = configured_settings();
         config.translation.model_directory = Some(directory.path().to_path_buf());
@@ -3468,31 +3409,25 @@ mod tests {
         });
         settle(cx);
 
+        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
         click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_some(),
-            "retry always asks which site to use"
-        );
-
-        // Confirming without choosing keeps the default, which is the failed task's site.
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
 
         assert_eq!(
             cx.read(|cx| downloads.read(cx).site(model, &path)),
             Some(DownloadSite::ModelScope),
-            "the retry defaults to the site the failed task recorded"
+            "the retry uses the site the session holds"
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
             DownloadState::Downloading { downloaded: 0 },
-            "keeping the site continues the failed task rather than discarding it"
+            "the site of the failed task continues it rather than discarding it"
         );
     }
 
-    /// Choosing another site on a retry discards the failed transfer and starts again from the
-    /// chosen site.
+    /// A retry whose session holds another site discards the failed transfer and starts again
+    /// from the chosen site.
     #[gpui_kit::test]
-    fn a_retry_should_restart_when_another_site_is_chosen(cx: &mut TestAppContext) {
+    fn a_retry_at_another_site_should_restart(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
         let mut config = configured_settings();
         config.translation.model_directory = Some(directory.path().to_path_buf());
@@ -3521,15 +3456,14 @@ mod tests {
         });
         settle(cx);
 
+        // The session still holds HuggingFace while the failed task came from ModelScope.
         click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-        click(cx, "SETTINGS_AI_SITE_HUGGINGFACE");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
         settle(cx);
 
         assert_eq!(
             cx.read(|cx| downloads.read(cx).site(model, &path)),
             Some(DownloadSite::HuggingFace),
-            "the restart is recorded against the site that was chosen"
+            "the restart is recorded against the site the session holds"
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
@@ -3538,9 +3472,9 @@ mod tests {
         );
     }
 
-    /// Continuing a paused download starts it where it is, without asking for a site.
+    /// Continuing a paused download starts it where it is, whatever site the session holds.
     #[gpui_kit::test]
-    fn a_paused_download_should_resume_without_asking_for_a_site(cx: &mut TestAppContext) {
+    fn a_paused_download_should_resume_where_it_is(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
         let mut config = configured_settings();
         config.translation.model_directory = Some(directory.path().to_path_buf());
@@ -3566,12 +3500,9 @@ mod tests {
         });
         settle(cx);
 
+        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
         click(cx, "SETTINGS_AI_MODEL_RESUME_6");
 
-        assert!(
-            cx.debug_bounds("SETTINGS_AI_SITE_DIALOG").is_none(),
-            "resuming a paused download does not ask for a site"
-        );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
             DownloadState::Downloading { downloaded: 0 },
@@ -3579,188 +3510,26 @@ mod tests {
         );
     }
 
-    /// A download the page started is reported with an alert when it finishes; one it did not
-    /// start is not.
+    /// The chosen site is stored with the rest of the session when the settings are confirmed.
     #[gpui_kit::test]
-    fn a_finished_download_this_page_started_should_be_reported_in_an_alert(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
+    fn choosing_a_download_site_should_be_stored_on_confirm(cx: &mut TestAppContext) {
+        let (panel, cx) = settings(configured_settings(), cx);
         click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let started = TranslationModel::HyMt27BQ8;
-        let unrelated = TranslationModel::HyMt218BQ4Km;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        // A download that was already running when the page opened has nothing to announce.
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(unrelated, path.clone(), cx);
-        });
-        settle(cx);
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_none(),
-            "a completion this page did not start is not reported"
-        );
-
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(started, path.clone(), cx);
-        });
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "a download this page started is reported when it finishes"
-        );
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT_OK").is_some(),
-            "the report is the one-button alert with the close button"
-        );
-        assert_eq!(
-            cx.read(|cx| t!(cx, "settings_ui.ai.download_complete_title")),
-            SharedString::new_static("Download complete")
-        );
-        assert_eq!(
-            cx.read(|cx| t!(
-                cx,
-                "settings_ui.ai.download_complete_message",
-                model = started.display_name()
-            )),
-            SharedString::from("The model HY-MT2-7B-Q8_0 was downloaded successfully.")
-        );
-
-        click(cx, "BASE_UI_ALERT_OK");
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_none(),
-            "the alert closes when its button is clicked"
-        );
-    }
-
-    /// Two completions that arrive while the first is being reported are reported one after the
-    /// other rather than the second replacing the first.
-    #[gpui_kit::test]
-    fn completions_that_arrive_together_should_be_reported_one_after_another(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (_panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let first = TranslationModel::HyMt27BQ8;
-        let second = TranslationModel::HyMt27BQ6K;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ4Km,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        // Both rows are downloaded by this page, in the order they are completed below.
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_6");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(first, path.clone(), cx);
-        });
-        settle(cx);
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "the first completion is reported"
-        );
-
-        // The second completion arrives while the first report is still on screen.
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(second, path.clone(), cx);
-        });
-        settle(cx);
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "the second completion waits behind the first instead of replacing it"
-        );
-
-        click(cx, "BASE_UI_ALERT_OK");
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "dismissing the first report shows the completion that waited behind it"
-        );
-
-        click(cx, "BASE_UI_ALERT_OK");
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_none(),
-            "the last queued report closes when its button is clicked"
-        );
-    }
-
-    /// A completion that arrives while another settings page is drawn is still reported over it.
-    #[gpui_kit::test]
-    fn a_completion_should_be_reported_while_another_page_is_drawn(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().expect("the test directory should build");
-        let mut config = configured_settings();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let (panel, cx) = settings(config, cx);
-        click(cx, "SETTINGS_ENTRY_ai.translation");
-        let downloads = translation_downloads(cx);
-        let path = directory.path().to_path_buf();
-        let model = TranslationModel::HyMt27BQ8;
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.set_transfers_deferred_for_test(
-                TranslationModel::HyMt27BQ6K,
-                path.clone(),
-                DownloadSite::HuggingFace,
-                cx,
-            );
-        });
-        settle(cx);
-
-        click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-        click(cx, "SETTINGS_AI_SITE_CONFIRM");
-        click(cx, "SETTINGS_ENTRY_appearance");
-        assert_eq!(
-            current_page(&panel, cx),
-            "appearance",
-            "the user left the translation page before the download finished"
-        );
-
-        downloads.update(cx, |downloads, cx| {
-            downloads.complete_download_for_test(model, path.clone(), cx);
-        });
-        settle(cx);
 
         assert_eq!(
-            current_page(&panel, cx),
-            "appearance",
-            "the report must not move the settings back to the translation page"
-        );
-        assert!(
-            cx.debug_bounds("BASE_UI_ALERT").is_some(),
-            "a completion this page started is reported over the page the user moved to"
+            drafted(&panel, cx).translation.download_site,
+            DownloadSite::HuggingFace,
+            "a session with nothing stored starts on HuggingFace"
         );
 
-        click(cx, "BASE_UI_ALERT_OK");
+        click(cx, "SETTINGS_AI_SITE_MODELSCOPE");
+        click(cx, "SETTINGS_CONFIRM");
+
+        assert_eq!(
+            stored(cx).translation.download_site,
+            DownloadSite::ModelScope,
+            "confirming stores the site the session holds"
+        );
     }
 
     /// The select offers exactly the models whose files are present at their published size.

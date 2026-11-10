@@ -11,13 +11,16 @@ use serde::{Deserialize, Serialize};
 
 /// One site the translation models can be downloaded from.
 ///
-/// It is a choice the settings page offers rather than a persisted value. A completed
-/// download is saved under the model's own file name, whichever site it came from, but
-/// a retry from another site discards the partial file the previous site left rather
-/// than continuing it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// It is a stored setting: a download, and a retry of a failed one, starts from the site
+/// named here. A completed download is saved under the model's own file name, whichever
+/// site it came from, but a retry that finds another site chosen discards the partial file
+/// the previous site left rather than continuing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DownloadSite {
+    #[default]
+    #[serde(rename = "hugging_face")]
     HuggingFace,
+    #[serde(rename = "model_scope")]
     ModelScope,
 }
 
@@ -204,6 +207,9 @@ pub struct TranslationConfig {
     /// The selected model, or `None` until the user chooses one.
     #[serde(default)]
     pub selected_model: Option<TranslationModel>,
+    /// The site the models are downloaded from.
+    #[serde(default)]
+    pub download_site: DownloadSite,
 }
 
 #[cfg(test)]
@@ -336,22 +342,39 @@ mod tests {
 
         assert_eq!(config.model_directory, None);
         assert_eq!(config.selected_model, None);
+        assert_eq!(
+            config.download_site,
+            DownloadSite::HuggingFace,
+            "a fresh installation downloads from HuggingFace"
+        );
     }
 
     #[test]
-    fn a_model_directory_and_selected_model_should_round_trip() {
+    fn a_model_directory_selected_model_and_download_site_should_round_trip() {
         let config = TranslationConfig {
             model_directory: Some(PathBuf::from("models")),
             selected_model: Some(TranslationModel::HyMt27BQ8),
+            download_site: DownloadSite::ModelScope,
         };
         let json = serde_json::to_value(&config).expect("the settings should serialize");
 
         assert_eq!(json["model_directory"], json!("models"));
         assert_eq!(json["selected_model"], json!("hy_mt2_7b_q8_0"));
+        assert_eq!(json["download_site"], json!("model_scope"));
         assert_eq!(
             serde_json::from_value::<TranslationConfig>(json).expect("the settings should decode"),
             config
         );
+    }
+
+    /// A file written before the download site was stored has no value of its own, which is
+    /// the same state as a fresh installation: downloads come from HuggingFace.
+    #[test]
+    fn a_config_without_a_download_site_should_download_from_huggingface() {
+        let config: TranslationConfig =
+            serde_json::from_value(json!({})).expect("the settings should decode");
+
+        assert_eq!(config.download_site, DownloadSite::HuggingFace);
     }
 
     #[test]
@@ -413,6 +436,24 @@ mod tests {
             DownloadSite::ALL,
             [DownloadSite::HuggingFace, DownloadSite::ModelScope]
         );
+    }
+
+    #[test]
+    fn every_download_site_should_keep_its_stable_wire_id() {
+        for (site, wire_id) in [
+            (DownloadSite::HuggingFace, "hugging_face"),
+            (DownloadSite::ModelScope, "model_scope"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(site).expect("the site should serialize"),
+                json!(wire_id)
+            );
+            assert_eq!(
+                serde_json::from_value::<DownloadSite>(json!(wire_id))
+                    .expect("the site id should decode"),
+                site
+            );
+        }
     }
 
     #[test]

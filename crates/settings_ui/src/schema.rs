@@ -353,7 +353,9 @@ fn translation_page() -> PageDef {
             "modelscope",
             "魔搭",
             "download site",
+            "model download site",
             "下载站点",
+            "模型下载站点",
             "站点",
             "download",
             "下载",
@@ -1782,7 +1784,7 @@ pub(crate) mod tests {
     /// locale, and a locale's key would look like an orphan the crate does not draw. Nothing ties
     /// it to the directory, so a source added to this crate has to be added here too — which is
     /// what [`every_settings_source_should_be_read_by_the_key_guard`] is for.
-    const SETTINGS_SOURCES: [(&str, &str); 15] = [
+    const SETTINGS_SOURCES: [(&str, &str); 14] = [
         ("access.rs", include_str!("access.rs")),
         ("appearance.rs", include_str!("appearance.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
@@ -1799,7 +1801,6 @@ pub(crate) mod tests {
             "translation_downloads.rs",
             include_str!("translation_downloads.rs"),
         ),
-        ("translation_site.rs", include_str!("translation_site.rs")),
         ("translation_table.rs", include_str!("translation_table.rs")),
     ];
 

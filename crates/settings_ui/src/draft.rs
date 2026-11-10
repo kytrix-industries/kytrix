@@ -11,7 +11,11 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use app_config::{network::ProxyConfig, settings::Config, translation::TranslationModel};
+use app_config::{
+    network::ProxyConfig,
+    settings::Config,
+    translation::{DownloadSite, TranslationModel},
+};
 use gpui_kit::Context;
 use smol_str::SmolStr;
 
@@ -28,6 +32,8 @@ pub(crate) enum SettingsEdit {
     TranslationModelDirectory { directory: PathBuf },
     /// The model the local translation is loaded from, or none when no model is chosen.
     TranslationModelSelected { model: Option<TranslationModel> },
+    /// The site the local translation model is downloaded from.
+    TranslationDownloadSite { site: DownloadSite },
     /// One entry added to the proxy catalog.
     AddProxy { name: SmolStr, proxy: ProxyConfig },
     /// One entry renamed and rewritten, together with every route bound to its name.
@@ -50,6 +56,9 @@ impl SettingsEdit {
             }
             Self::TranslationModelSelected { model } => {
                 config.translation.selected_model = *model;
+            }
+            Self::TranslationDownloadSite { site } => {
+                config.translation.download_site = *site;
             }
             Self::AddProxy { name, proxy } => {
                 config.proxies.insert(name.clone(), proxy.clone());
@@ -135,6 +144,7 @@ mod tests {
             ServiceTarget,
         },
         settings::{AccountConfig, AccountWalletKind, Appearance, Config, Language},
+        translation::DownloadSite,
     };
     use market_participants_model::identifier::VenueId;
     use smol_str::SmolStr;
@@ -265,6 +275,27 @@ mod tests {
         let cleared = draft.applied_to(&config);
 
         assert_eq!(cleared.translation.selected_model, None);
+    }
+
+    /// Choosing a translation download site changes that setting and nothing else.
+    #[test]
+    fn a_translation_download_site_edit_should_change_only_that_setting() {
+        let mut config = Config::default();
+        config.translation.model_directory = Some(PathBuf::from("models"));
+        let mut draft = SettingsDraft::new(config.clone());
+        draft.edits.push(SettingsEdit::TranslationDownloadSite {
+            site: DownloadSite::ModelScope,
+        });
+
+        let applied = draft.applied_to(&config);
+
+        assert_eq!(applied.translation.download_site, DownloadSite::ModelScope);
+        assert_eq!(
+            applied.translation.model_directory,
+            config.translation.model_directory
+        );
+        assert_eq!(applied.translation.selected_model, None);
+        assert!(applied.proxies.is_empty());
     }
 
     /// The same draft lands the same way on whatever the settings are at the moment it is

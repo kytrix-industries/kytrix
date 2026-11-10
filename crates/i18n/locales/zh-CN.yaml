@@ -1211,8 +1211,6 @@ settings_ui:
     deleting: 删除中
     description: 说明
     download: 下载
-    download_complete_message: 模型 %{model} 下载成功。
-    download_complete_title: 下载完成
     download_failed: 下载失败：%{reason}
     download_failed_cancelled: 下载已取消
     download_failed_destination: 目标不是文件路径
@@ -1226,9 +1224,9 @@ settings_ui:
     download_failed_too_large: 下载内容超过允许的大小
     download_failed_transport: 下载因网络问题失败
     download_failed_url: 模型地址无效
+    download_site: 模型下载站点
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope（魔搭社区）
-    download_site_title: 选择模型下载站点
     downloading_progress: 下载中 %{percent}%
     model_description: HY-MT2 %{size}模型的%{bits}Bit量化版本
     model_directory: 模型存放目录

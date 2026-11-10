@@ -50,11 +50,11 @@ const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
 /// What one row asks the page to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranslationRequest {
-    /// Ask the user which site to download [`TranslationModel`] from, then download it.
+    /// Download [`TranslationModel`] from the site the session holds.
     Download { model: TranslationModel },
     /// Continue a paused download from its partial file.
     Resume { model: TranslationModel },
-    /// Ask the user which site to retry [`TranslationModel`] from, then retry it.
+    /// Retry the failed download of [`TranslationModel`] from the site the session holds.
     Retry { model: TranslationModel },
     /// Remove [`TranslationModel`] and stop naming it where the session did.
     Delete { model: TranslationModel },

@@ -8,30 +8,25 @@
 //! session draft, so confirming the dialog is what stores them, and the controls read them back
 //! from the draft, so a session that is reopened shows the stored ones.
 //!
-//! Downloading asks which site the file should come from: the table records the row the user
-//! pressed, and the page opens the dialog for it. A download this page started is reported with
-//! an alert over the settings when it finishes, even when the user has moved to another page.
+//! Downloading starts from the site the session holds: the two sites are drawn under the
+//! directory, and both a first download and a retry of a failed one use the chosen site.
 
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use ahash::AHashSet;
 use app_config::translation::{DownloadSite, TranslationModel};
 use base_ui::{
     button::Button,
     input::{Input, InputState, InputStateBuilder},
     interactive::InteractiveVariantExt,
-    layer::LayerExt,
     menu::{MenuItem, MenuItemAction},
     select::Select,
     size::UnifiedSizable,
+    toggle::Toggle,
 };
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
-    Styled, Subscription, Window, base::Disableable as _, div,
+    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
+    Window, base::Disableable as _, div,
 };
 use i18n::t;
 
@@ -39,12 +34,27 @@ use crate::{
     draft::{SettingsDraft, SettingsEdit},
     page,
     translation_downloads::{TranslationDownloads, TranslationDownloadsEvent},
-    translation_site::DownloadSiteDialog,
     translation_table::{TranslationRequest, TranslationTable},
 };
 
 /// The element id of the directory field, which is also the key of its state.
 const DIRECTORY_INPUT_ID: &str = "settings-ai-directory";
+
+/// What one site is called in the interface.
+fn site_label(site: DownloadSite, cx: &App) -> SharedString {
+    match site {
+        DownloadSite::HuggingFace => t!(cx, "settings_ui.ai.download_site_huggingface"),
+        DownloadSite::ModelScope => t!(cx, "settings_ui.ai.download_site_modelscope"),
+    }
+}
+
+/// What one site's radio is drawn under, which is what a test chooses it by.
+fn site_selector(site: DownloadSite) -> &'static str {
+    match site {
+        DownloadSite::HuggingFace => "SETTINGS_AI_SITE_HUGGINGFACE",
+        DownloadSite::ModelScope => "SETTINGS_AI_SITE_MODELSCOPE",
+    }
+}
 
 /// The translation page.
 pub(crate) struct TranslationPage {
@@ -55,16 +65,6 @@ pub(crate) struct TranslationPage {
     downloads: Option<Entity<TranslationDownloads>>,
     /// The supported models and what each of them is doing.
     table: Entity<TranslationTable>,
-    /// The window the page was last drawn in, which is where a finished download is reported.
-    window: Option<AnyWindowHandle>,
-    /// The downloads this page started in its current lifetime, which are the only ones its
-    /// completion alert is about.
-    started: AHashSet<(TranslationModel, PathBuf)>,
-    /// The completions that finished while another one was already being reported, in the order
-    /// they finished.
-    pending_alerts: VecDeque<TranslationModel>,
-    /// Whether one of this page's alerts is on the layer, which holds one at a time.
-    alert_showing: bool,
     /// Held because a download that reports progress repaints this page through it.
     _observe: Option<Subscription>,
     /// Held because it is what turns a finished download into a fresh selection.
@@ -96,10 +96,6 @@ impl TranslationPage {
             directory: None,
             downloads,
             table,
-            window: None,
-            started: AHashSet::with_capacity(4),
-            pending_alerts: VecDeque::new(),
-            alert_showing: false,
             _observe: observe,
             _events: events,
         };
@@ -251,7 +247,7 @@ impl TranslationPage {
 
     /// Takes the action a row asked for and answers it, before the page draws that action's
     /// result.
-    fn handle_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_request(&mut self, cx: &mut Context<Self>) {
         let Some(request) = self.table.update(cx, |table, _| table.take_request()) else {
             return;
         };
@@ -265,16 +261,17 @@ impl TranslationPage {
 
         match request {
             TranslationRequest::Download { model } => {
-                self.open_site_dialog(model, false, window, cx);
+                let site = self.draft.read(cx).config().translation.download_site;
+                self.start_model_download(model, site, false, cx);
             }
             TranslationRequest::Retry { model } => {
-                self.open_site_dialog(model, true, window, cx);
+                let site = self.draft.read(cx).config().translation.download_site;
+                self.start_model_download(model, site, true, cx);
             }
             TranslationRequest::Resume { model } => {
                 let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
                     return;
                 };
-                self.started.insert((model, directory.clone()));
                 downloads.update(cx, |downloads, cx| {
                     downloads.resume(model, directory, cx);
                 });
@@ -283,10 +280,8 @@ impl TranslationPage {
                 let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
                     return;
                 };
-                // A model the user deleted is no longer one this page is waiting for a report
-                // of, and the session stops naming it only when it was the one this directory
+                // The session stops naming the model only when it was the one this directory
                 // held.
-                self.started.remove(&(model, directory.clone()));
                 let clears_selection = {
                     let config = self.draft.read(cx).config();
                     config.translation.selected_model == Some(model)
@@ -305,7 +300,7 @@ impl TranslationPage {
         }
     }
 
-    /// Starts the download of `model` from `site`, which the page is now waiting to report.
+    /// Starts the download of `model` from `site`.
     fn start_model_download(
         &mut self,
         model: TranslationModel,
@@ -327,7 +322,6 @@ impl TranslationPage {
             return;
         };
 
-        self.started.insert((model, directory.clone()));
         downloads.update(cx, |downloads, cx| {
             if retry {
                 downloads.retry(model, directory, site, cx);
@@ -337,58 +331,10 @@ impl TranslationPage {
         });
     }
 
-    /// Asks which site `model` should come from: the failed task's site for a retry, and
-    /// HuggingFace for a first download.
-    fn open_site_dialog(
-        &mut self,
-        model: TranslationModel,
-        retry: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let directory = self
-            .draft
-            .read(cx)
-            .config()
-            .translation
-            .model_directory
-            .clone();
-        // A download needs both the manager and a directory; a row drawn without them is one
-        // the page has nothing to ask about.
-        let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
-            return;
-        };
-
-        let initial = if retry {
-            downloads
-                .read(cx)
-                .site(model, &directory)
-                .unwrap_or(DownloadSite::HuggingFace)
-        } else {
-            DownloadSite::HuggingFace
-        };
-
-        let page = cx.entity().downgrade();
-        let dialog = cx.new(|_| {
-            DownloadSiteDialog::new(initial, move |site, _, cx| {
-                let Some(page) = page.upgrade() else {
-                    return;
-                };
-                page.update(cx, |page, cx| {
-                    page.start_model_download(model, site, retry, cx);
-                });
-            })
-        });
-        window.dialog(cx, dialog);
-    }
-
     /// Answers a download or a delete the manager reports.
     fn download_event(&mut self, event: TranslationDownloadsEvent, cx: &mut Context<Self>) {
         match event {
             TranslationDownloadsEvent::Completed { model, directory } => {
-                // A completion is reported only for a download this page started: a download
-                // that was already running when the page opened has nothing to announce here.
-                let started = self.started.remove(&(model, directory.clone()));
                 let config = self.draft.read(cx).config();
                 let same_directory =
                     config.translation.model_directory.as_ref() == Some(&directory);
@@ -405,9 +351,6 @@ impl TranslationPage {
                         );
                     });
                 }
-                if started {
-                    self.show_download_complete(model, cx);
-                }
             }
             TranslationDownloadsEvent::Deleted { model, .. } => {
                 if self.draft.read(cx).config().translation.selected_model == Some(model) {
@@ -418,79 +361,6 @@ impl TranslationPage {
             }
         }
         cx.notify();
-    }
-
-    /// Reports that a model this page downloaded finished, or queues the report behind the one
-    /// the layer is already showing.
-    fn show_download_complete(&mut self, model: TranslationModel, cx: &mut Context<Self>) {
-        // The layer holds one alert at a time: a completion that arrives while another one is
-        // being reported waits its turn rather than replacing the report on screen.
-        if self.alert_showing {
-            self.pending_alerts.push_back(model);
-            return;
-        }
-        self.alert_showing = true;
-        self.open_download_complete(model, cx);
-    }
-
-    /// Opens the alert that says `model` finished.
-    ///
-    /// The alert is opened through the window the page was drawn in rather than through a
-    /// window the event handler has, because the download can finish while the user is on
-    /// another page — or after this view stopped being drawn — and it is still about the
-    /// settings the user left open.
-    fn open_download_complete(&mut self, model: TranslationModel, cx: &mut Context<Self>) {
-        let Some(window) = self.window else {
-            self.alert_showing = false;
-            return;
-        };
-        let title = t!(cx, "settings_ui.ai.download_complete_title");
-        let message = t!(
-            cx,
-            "settings_ui.ai.download_complete_message",
-            model = model.display_name()
-        );
-        let close = t!(cx, "common.close");
-        // The report belongs to the settings session that started the download: a page that
-        // was closed before the effect cycle ran has nothing left to report to.
-        let page = cx.entity().downgrade();
-
-        cx.defer(move |cx| {
-            if page.upgrade().is_none() {
-                return;
-            }
-            let alert_page = page.clone();
-            let opened = cx.update_window(window, move |_, window, cx| {
-                window.alert(cx, move |alert, _, _| {
-                    alert
-                        .ok(title.clone(), message.clone())
-                        .ok_text(close)
-                        .ok_action(move |_, _, cx| {
-                            let Some(page) = alert_page.upgrade() else {
-                                return;
-                            };
-                            page.update(cx, |page, cx| page.report_next_download_complete(cx));
-                        })
-                });
-            });
-            // A window that went away has nothing left to show, but the page is still able to
-            // report a later completion: the slot it was holding is released rather than left
-            // taken for the rest of the page's life.
-            if opened.is_err()
-                && let Some(page) = page.upgrade()
-            {
-                page.update(cx, |page, cx| page.report_next_download_complete(cx));
-            }
-        });
-    }
-
-    /// Reports the completion that waited behind the alert that was just dismissed.
-    fn report_next_download_complete(&mut self, cx: &mut Context<Self>) {
-        self.alert_showing = false;
-        let Some(model) = self.pending_alerts.pop_front() else {
-            return;
-        };
-        self.show_download_complete(model, cx);
     }
 
     /// The directory the field shows, for the dialog's tests.
@@ -504,8 +374,7 @@ impl TranslationPage {
 
 impl Render for TranslationPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.window = Some(window.window_handle());
-        self.handle_request(window, cx);
+        self.handle_request(cx);
 
         let input = self.directory_input(window, cx);
         let config = self.draft.read(cx).config();
@@ -559,6 +428,36 @@ impl Render for TranslationPage {
                 }
             });
 
+        let download_site = config.translation.download_site;
+        let site_page = cx.entity().downgrade();
+        let site_choices = DownloadSite::ALL.into_iter().fold(
+            div().w_full().flex().flex_col().gap_1(),
+            |choices, site| {
+                let page = site_page.clone();
+                choices.child(
+                    Toggle::new(site_selector(site))
+                        .radio()
+                        .checked(download_site == site)
+                        .label(site_label(site, cx))
+                        .debug_selector(move || site_selector(site).into())
+                        .on_change(move |checked, _, cx| {
+                            if !checked {
+                                return;
+                            }
+                            let Some(page) = page.upgrade() else {
+                                return;
+                            };
+                            page.update(cx, |page, cx| {
+                                page.draft.update(cx, |draft, cx| {
+                                    draft.write(SettingsEdit::TranslationDownloadSite { site }, cx);
+                                });
+                                cx.notify();
+                            });
+                        }),
+                )
+            },
+        );
+
         div()
             .debug_selector(|| "SETTINGS_AI_PAGE".into())
             .size_full()
@@ -603,6 +502,19 @@ impl Render for TranslationPage {
                                     })),
                             ),
                     ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "SETTINGS_AI_DOWNLOAD_SITE".into())
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(page::section_title(
+                        t!(cx, "settings_ui.ai.download_site"),
+                        cx,
+                    ))
+                    .child(site_choices),
             )
             .child(
                 div()

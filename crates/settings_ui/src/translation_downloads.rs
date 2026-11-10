@@ -126,7 +126,8 @@ pub(crate) struct TranslationDownloads {
     /// The provider task of each model in each directory, which is what a pause, a resume or a
     /// delete of the row acts on.
     tasks: AHashMap<(TranslationModel, PathBuf), DownloadId>,
-    /// The site each download was started from, which is what a retry defaults to.
+    /// The site each download was started from, which is what tells a retry whether the site
+    /// the user chose continues that task or asks for a different transfer.
     sites: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
     /// The downloads a retry asked to start once the files of another site are gone.
     pending_restarts: AHashMap<(TranslationModel, PathBuf), DownloadSite>,
@@ -202,7 +203,9 @@ impl TranslationDownloads {
             .collect()
     }
 
-    /// The site the download of `model` in `directory` was started from.
+    /// The site the download of `model` in `directory` was started from, for the tests that
+    /// pin what a retry asks the manager to do.
+    #[cfg(test)]
     pub(crate) fn site(&self, model: TranslationModel, directory: &Path) -> Option<DownloadSite> {
         self.sites.get(&(model, directory.to_path_buf())).copied()
     }
@@ -2021,7 +2024,8 @@ mod tests {
         );
     }
 
-    /// A download records the site it was started from, which is what a retry defaults to.
+    /// A download records the site it was started from, which is what tells a retry whether it
+    /// can continue the task or has to start again.
     #[gpui_kit::test]
     fn a_download_should_record_the_site_it_was_started_from(cx: &mut TestAppContext) {
         let harness = harness(cx);
