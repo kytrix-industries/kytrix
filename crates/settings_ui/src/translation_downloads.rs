@@ -6,8 +6,8 @@
 //! composition root, and the settings page only observes the entity it finds there.
 //!
 //! The transfers themselves belong to the [`DownloadProvider`]: this module asks it to add,
-//! pause, resume and delete the task of one model in one directory, and draws the states it
-//! publishes. What stays here is the translation model's own meaning — which file of which
+//! pause, resume, stop and delete the task of one model in one directory, and draws the states
+//! it publishes. What stays here is the translation model's own meaning — which file of which
 //! directory a row is, the engine unload that has to happen before a file goes, and the
 //! directory and selection a finished download records.
 
@@ -84,13 +84,18 @@ struct TranslationDownloadsGlobal {
 impl Global for TranslationDownloadsGlobal {}
 
 /// What one row of the translation page is doing.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum DownloadState {
     /// Nothing has happened to this model in this process.
     #[default]
     Idle,
     /// The file is being streamed to disk.
-    Downloading { downloaded: u64 },
+    Downloading {
+        downloaded: u64,
+        /// The rate the transfer wrote at over the interval this state was published for, in
+        /// megabytes per second, as the download manager reports it.
+        mb_per_second: f32,
+    },
     /// The transfer is being stopped and will settle as [`Self::Paused`].
     Pausing { downloaded: u64 },
     /// The transfer is stopped and can be resumed.
@@ -99,8 +104,55 @@ pub(crate) enum DownloadState {
     DownloadFailed { failure: DownloadFailure },
     /// The model file is being unloaded and deleted.
     Deleting,
+    /// What the download wrote is being removed after it was stopped for good.
+    Terminating,
     /// The last delete failed, and the row says why.
     DeleteFailed { failure: DeleteFailure },
+    /// The last stop failed, and the row says why.
+    TerminateFailed { failure: DeleteFailure },
+}
+
+impl DownloadState {
+    /// Which removal the row is in the middle of, when it is in one.
+    fn removal(&self) -> Option<Removal> {
+        match self {
+            Self::Deleting => Some(Removal::Delete),
+            Self::Terminating => Some(Removal::Terminate),
+            _ => None,
+        }
+    }
+
+    /// Whether the row's files are being removed, whichever action asked for it.
+    pub(crate) fn is_removing(&self) -> bool {
+        self.removal().is_some()
+    }
+}
+
+/// What the removal of a model's files was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removal {
+    /// Delete a model whose file is in place.
+    Delete,
+    /// Stop a download for good and discard what it wrote.
+    Terminate,
+}
+
+impl Removal {
+    /// The state a row is drawn with while this removal runs.
+    fn running(self) -> DownloadState {
+        match self {
+            Self::Delete => DownloadState::Deleting,
+            Self::Terminate => DownloadState::Terminating,
+        }
+    }
+
+    /// The state a row is drawn with when this removal failed.
+    fn failed(self, failure: DeleteFailure) -> DownloadState {
+        match self {
+            Self::Delete => DownloadState::DeleteFailed { failure },
+            Self::Terminate => DownloadState::TerminateFailed { failure },
+        }
+    }
 }
 
 /// Why a translation model file could not be deleted.
@@ -238,7 +290,7 @@ impl TranslationDownloads {
         // the partial file that delete is removing.
         if self.pending_restarts.contains_key(&key)
             || self.is_downloaded(model, &directory)
-            || matches!(self.row_state(model, &directory), DownloadState::Deleting)
+            || self.row_state(model, &directory).is_removing()
         {
             return;
         }
@@ -257,8 +309,13 @@ impl TranslationDownloads {
         #[cfg(test)]
         if self.transfers_deferred {
             self.sites.insert(key.clone(), site);
-            self.states
-                .insert(key, DownloadState::Downloading { downloaded: 0 });
+            self.states.insert(
+                key,
+                DownloadState::Downloading {
+                    downloaded: 0,
+                    mb_per_second: 0.0,
+                },
+            );
             cx.notify();
             return;
         }
@@ -286,7 +343,7 @@ impl TranslationDownloads {
     ) {
         // A delete that is still in flight is already the retry's first half: asking it to
         // delete again would keep a restart that nothing would ever run.
-        if matches!(self.row_state(model, &directory), DownloadState::Deleting) {
+        if self.row_state(model, &directory).is_removing() {
             return;
         }
 
@@ -328,7 +385,7 @@ impl TranslationDownloads {
         let key = (model, directory.clone());
         if self.pending_restarts.contains_key(&key)
             || self.is_downloaded(model, &directory)
-            || matches!(self.row_state(model, &directory), DownloadState::Deleting)
+            || self.row_state(model, &directory).is_removing()
         {
             return false;
         }
@@ -415,8 +472,13 @@ impl TranslationDownloads {
         let key = (model, directory);
         #[cfg(test)]
         if self.transfers_deferred {
-            self.states
-                .insert(key, DownloadState::Downloading { downloaded: 0 });
+            self.states.insert(
+                key,
+                DownloadState::Downloading {
+                    downloaded: 0,
+                    mb_per_second: 0.0,
+                },
+            );
             cx.notify();
             return true;
         }
@@ -436,8 +498,13 @@ impl TranslationDownloads {
                     return;
                 };
                 let state = match &task.status {
-                    DownloadStatus::Downloading { downloaded, .. } => DownloadState::Downloading {
+                    DownloadStatus::Downloading {
+                        downloaded,
+                        mb_per_second,
+                        ..
+                    } => DownloadState::Downloading {
                         downloaded: *downloaded,
+                        mb_per_second: *mb_per_second,
                     },
                     DownloadStatus::Pausing { downloaded, .. } => DownloadState::Pausing {
                         downloaded: *downloaded,
@@ -445,18 +512,22 @@ impl TranslationDownloads {
                     DownloadStatus::Paused { downloaded, .. } => DownloadState::Paused {
                         downloaded: *downloaded,
                     },
-                    DownloadStatus::Deleting => DownloadState::Deleting,
+                    DownloadStatus::Deleting => {
+                        // The row already knows which removal it asked for; a delete this
+                        // manager did not start is drawn as the deletion it is.
+                        self.states
+                            .get(&key)
+                            .and_then(DownloadState::removal)
+                            .map_or(DownloadState::Deleting, Removal::running)
+                    }
                     DownloadStatus::Completed { .. } => {
                         self.complete_download(key.0, key.1, cx);
                         return;
                     }
                     DownloadStatus::Failed { failure } => {
-                        if matches!(self.states.get(&key), Some(DownloadState::Deleting)) {
-                            DownloadState::DeleteFailed {
-                                failure: delete_failure(*failure),
-                            }
-                        } else {
-                            DownloadState::DownloadFailed { failure: *failure }
+                        match self.states.get(&key).and_then(DownloadState::removal) {
+                            Some(removal) => removal.failed(delete_failure(*failure)),
+                            None => DownloadState::DownloadFailed { failure: *failure },
                         }
                     }
                 };
@@ -468,11 +539,12 @@ impl TranslationDownloads {
                     return;
                 };
                 self.tasks.remove(&key);
-                if matches!(self.states.get(&key), Some(DownloadState::Deleting)) {
-                    self.finish_delete(key.0, key.1, Ok(()), cx);
-                } else {
-                    self.states.remove(&key);
-                    cx.notify();
+                match self.states.get(&key).and_then(DownloadState::removal) {
+                    Some(removal) => self.finish_removal(key.0, key.1, removal, Ok(()), cx),
+                    None => {
+                        self.states.remove(&key);
+                        cx.notify();
+                    }
                 }
             }
         }
@@ -529,7 +601,31 @@ impl TranslationDownloads {
         directory: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.row_state(model, &directory), DownloadState::Deleting) {
+        self.remove(model, directory, Removal::Delete, cx);
+    }
+
+    /// Stops the download of `model` in `directory` for good and removes what it wrote.
+    ///
+    /// A stopped download is one the user does not want: its partial file is discarded rather
+    /// than kept for a resume, so the row goes back to offering a download.
+    pub(crate) fn terminate(
+        &mut self,
+        model: TranslationModel,
+        directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove(model, directory, Removal::Terminate, cx);
+    }
+
+    /// Removes what `model` has in `directory`, unloading it before the files go.
+    fn remove(
+        &mut self,
+        model: TranslationModel,
+        directory: PathBuf,
+        removal: Removal,
+        cx: &mut Context<Self>,
+    ) {
+        if self.row_state(model, &directory).is_removing() {
             return;
         }
 
@@ -546,30 +642,37 @@ impl TranslationDownloads {
 
         let key = (model, directory.clone());
         let path = directory.join(model.file_name());
+        // A stopped transfer leaves its bytes in the partial file beside the destination, so a
+        // row without a task can still own files this removal has to remove.
+        let files_exist = path.exists()
+            || download_provider::partial::path(&path).is_some_and(|part| part.exists());
         let task = self.tasks.get(&key).copied();
         self.sites.remove(&key);
-        self.states.insert(key, DownloadState::Deleting);
+        self.states.insert(key, removal.running());
         cx.notify();
 
         match task {
-            // A downloaded model is unloaded before the manager removes its file, so the engine
-            // cannot be holding it open while the delete runs.
-            Some(id) if path.exists() => self.unload_then_delete(id, model, directory, path, cx),
+            // A file in place is unloaded before the manager removes it, so the engine cannot be
+            // holding it open while the removal runs. A stopped transfer may have left one too.
+            Some(id) if path.exists() => {
+                self.unload_then_remove(id, model, directory, path, removal, cx);
+            }
             // A running, paused or failed download has no destination file to unload.
-            Some(id) => self.delete_provider_task(id, model, directory, cx),
-            // A file this process did not download has no task, only the file to remove.
-            None if path.exists() => self.delete_files(model, directory, cx),
-            None => self.finish_delete(model, directory, Ok(()), cx),
+            Some(id) => self.remove_provider_task(id, model, directory, removal, cx),
+            // Files this process did not download have no task, only the files to remove.
+            None if files_exist => self.remove_files(model, directory, removal, cx),
+            None => self.finish_removal(model, directory, removal, Ok(()), cx),
         }
     }
 
     /// Unloads the engine and then lets the provider remove the task and its files.
-    fn unload_then_delete(
+    fn unload_then_remove(
         &mut self,
         id: DownloadId,
         model: TranslationModel,
         directory: PathBuf,
         path: PathBuf,
+        removal: Removal,
         cx: &mut Context<Self>,
     ) {
         let runtime = self.runtime.clone();
@@ -586,38 +689,38 @@ impl TranslationDownloads {
             let clock = cx.background_executor().clone();
             let result = wait_for_delete(&completion, &clock).await;
             let _ = downloads.update(cx, |downloads, cx| {
-                downloads.finish_unload(id, model, directory, result, cx)
+                downloads.finish_unload(id, model, directory, removal, result, cx)
             });
         })
         .detach();
     }
 
-    /// Applies what an unload for a delete produced.
+    /// Applies what an unload for a removal produced.
     fn finish_unload(
         &mut self,
         id: DownloadId,
         model: TranslationModel,
         directory: PathBuf,
+        removal: Removal,
         result: Result<(), DeleteFailure>,
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(()) => self.delete_provider_task(id, model, directory, cx),
+            Ok(()) => self.remove_provider_task(id, model, directory, removal, cx),
             Err(failure) => {
-                log::warn!(
-                    "failed to unload translation model {model:?} for deletion: {failure:?}"
-                );
-                self.finish_delete(model, directory, Err(failure), cx);
+                log::warn!("failed to unload translation model {model:?} for removal: {failure:?}");
+                self.finish_removal(model, directory, removal, Err(failure), cx);
             }
         }
     }
 
     /// Asks the provider to remove a task, falling back to the files when it no longer has it.
-    fn delete_provider_task(
+    fn remove_provider_task(
         &mut self,
         id: DownloadId,
         model: TranslationModel,
         directory: PathBuf,
+        removal: Removal,
         cx: &mut Context<Self>,
     ) {
         if !self
@@ -625,15 +728,16 @@ impl TranslationDownloads {
             .update(cx, |provider, cx| provider.delete(id, cx))
         {
             self.tasks.remove(&(model, directory.clone()));
-            self.delete_files(model, directory, cx);
+            self.remove_files(model, directory, removal, cx);
         }
     }
 
     /// Unloads the engine and removes the model's files without a provider task.
-    fn delete_files(
+    fn remove_files(
         &mut self,
         model: TranslationModel,
         directory: PathBuf,
+        removal: Removal,
         cx: &mut Context<Self>,
     ) {
         let runtime = self.runtime.clone();
@@ -647,7 +751,7 @@ impl TranslationDownloads {
                     unload(&path).map_err(DeleteFailure::Unload)?;
                     if let Some(part) = download_provider::partial::path(&path) {
                         // Best effort: a missing or locked partial file must not stop the
-                        // model itself from being deleted.
+                        // model itself from being removed.
                         let _ = std::fs::remove_file(part);
                     }
                     match std::fs::remove_file(&path) {
@@ -666,25 +770,26 @@ impl TranslationDownloads {
             let result = wait_for_delete(&completion, &clock).await;
             let _ = downloads.update(cx, |downloads, cx| {
                 if let Err(error) = &result {
-                    log::warn!("failed to delete translation model {model:?}: {error:?}");
+                    log::warn!("failed to remove translation model {model:?}: {error:?}");
                 }
-                downloads.finish_delete(model, directory, result, cx)
+                downloads.finish_removal(model, directory, removal, result, cx)
             });
         })
         .detach();
     }
 
-    /// Applies what a delete produced.
-    fn finish_delete(
+    /// Applies what a removal produced.
+    fn finish_removal(
         &mut self,
         model: TranslationModel,
         directory: PathBuf,
+        removal: Removal,
         result: Result<(), DeleteFailure>,
         cx: &mut Context<Self>,
     ) {
         let outcome = match result {
             Ok(()) => Ok(()),
-            // The file is already gone, which is what the delete asked for.
+            // The file is already gone, which is what the removal asked for.
             Err(DeleteFailure::Io {
                 kind: io::ErrorKind::NotFound,
             }) => Ok(()),
@@ -703,10 +808,10 @@ impl TranslationDownloads {
                     directory: directory.clone(),
                 });
 
-                // A retry that chose another site is a delete and then a download. The provider
-                // is in the middle of publishing the end of the delete here, so the restart is
+                // A retry that chose another site is a removal and then a download. The provider
+                // is in the middle of publishing the end of the removal here, so the restart is
                 // deferred out of that update rather than re-entering it, and it waits until the
-                // files the delete owned are gone before a new transfer can truncate them.
+                // files the removal owned are gone before a new transfer can truncate them.
                 if let Some(site) = self.pending_restarts.remove(&key) {
                     let downloads = cx.entity().downgrade();
                     cx.defer(move |cx| {
@@ -717,11 +822,11 @@ impl TranslationDownloads {
                 }
             }
             Err(failure) => {
-                // The retry's intent is not kept for later: a delete that failed is what the row
-                // reports, and the user is the one who decides whether to try again.
+                // The retry's intent is not kept for later: a removal that failed is what the
+                // row reports, and the user is the one who decides whether to try again.
                 self.pending_restarts.remove(&(model, directory.clone()));
                 self.states
-                    .insert((model, directory), DownloadState::DeleteFailed { failure });
+                    .insert((model, directory), removal.failed(failure));
             }
         }
         cx.notify();
@@ -772,7 +877,10 @@ impl TranslationDownloads {
         self.sites.insert((model, directory.clone()), site);
         self.states.insert(
             (model, directory),
-            DownloadState::Downloading { downloaded: 0 },
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            },
         );
         cx.notify();
     }
@@ -888,8 +996,9 @@ mod tests {
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::{
-        DELETE_TIMEOUT, DeleteFailure, DownloadFailure, DownloadState, TranslationDownloads,
-        TranslationDownloadsDeps, TranslationDownloadsEvent, UnloadFailure, file_size_matches,
+        DELETE_TIMEOUT, DeleteFailure, DownloadFailure, DownloadState, Removal,
+        TranslationDownloads, TranslationDownloadsDeps, TranslationDownloadsEvent, UnloadFailure,
+        file_size_matches,
     };
 
     /// How much of a paced payload each frame carries.
@@ -1235,16 +1344,17 @@ mod tests {
 
     /// A finished delete that found the file already gone is still success.
     #[gpui_kit::test]
-    fn finish_delete_should_accept_a_missing_file(cx: &mut TestAppContext) {
+    fn finish_removal_should_accept_a_missing_file(cx: &mut TestAppContext) {
         let harness = harness(cx);
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
 
         cx.update(|cx| {
             harness.downloads.update(cx, |downloads, cx| {
-                downloads.finish_delete(
+                downloads.finish_removal(
                     model,
                     directory.path().to_path_buf(),
+                    Removal::Delete,
                     Err(DeleteFailure::Io {
                         kind: io::ErrorKind::NotFound,
                     }),
@@ -1261,16 +1371,17 @@ mod tests {
 
     /// A failed unload leaves the row reporting the reason instead of hanging in Deleting.
     #[gpui_kit::test]
-    fn finish_delete_should_report_an_unload_failure(cx: &mut TestAppContext) {
+    fn finish_removal_should_report_an_unload_failure(cx: &mut TestAppContext) {
         let harness = harness(cx);
         let directory = TempDir::new().expect("the test directory builds");
         let model = TranslationModel::HyMt218BQ4Km;
 
         cx.update(|cx| {
             harness.downloads.update(cx, |downloads, cx| {
-                downloads.finish_delete(
+                downloads.finish_removal(
                     model,
                     directory.path().to_path_buf(),
+                    Removal::Delete,
                     Err(DeleteFailure::Unload(UnloadFailure::TimedOut)),
                     cx,
                 );
@@ -1283,6 +1394,105 @@ mod tests {
                 failure: DeleteFailure::Unload(UnloadFailure::TimedOut),
             },
             "an unload failure should become DeleteFailed"
+        );
+    }
+
+    /// A terminate that fails to unload reports it as the failed stop it is, not as a delete.
+    #[gpui_kit::test]
+    fn a_terminate_should_report_its_own_failure(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.finish_removal(
+                    model,
+                    directory.path().to_path_buf(),
+                    Removal::Terminate,
+                    Err(DeleteFailure::Unload(UnloadFailure::Engine)),
+                    cx,
+                );
+            });
+        });
+
+        assert_eq!(
+            state(cx, &harness.downloads, model, directory.path()),
+            DownloadState::TerminateFailed {
+                failure: DeleteFailure::Unload(UnloadFailure::Engine),
+            },
+            "a stop that could not remove the files is a failed stop"
+        );
+    }
+
+    /// Stopping a paused download discards its partial file, so the row offers a download again.
+    #[gpui_kit::test]
+    fn a_terminate_should_discard_the_partial_file(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let path = directory.path().join(model.file_name());
+        let part = directory.path().join(format!("{}.part", model.file_name()));
+        std::fs::write(&part, b"partial").expect("the partial file is written");
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.set_state_for_test(
+                    model,
+                    directory.path().to_path_buf(),
+                    DownloadState::Paused { downloaded: 7 },
+                    cx,
+                );
+                downloads.terminate(model, directory.path().to_path_buf(), cx);
+            });
+        });
+        wait_until(cx, "the stopped download to be discarded", |cx| {
+            state(cx, &harness.downloads, model, directory.path()) == DownloadState::Idle
+        });
+
+        assert!(!part.exists(), "the stopped download's bytes are gone");
+        assert!(!path.exists(), "a stopped download leaves no file behind");
+    }
+
+    /// Stopping a download in flight cancels its transfer and removes what it wrote.
+    #[gpui_kit::test]
+    fn a_terminate_should_stop_a_download_in_flight(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let payload = payload(192 * 1024);
+        let address = spawn_server(payload, Some(PACE));
+        let directory = TempDir::new().expect("the test directory builds");
+        let model = TranslationModel::HyMt218BQ4Km;
+        let harness = harness(cx);
+        let path = directory.path().to_path_buf();
+        let part = path.join(format!("{}.part", model.file_name()));
+
+        adopt(cx, &harness, model, &path, address);
+        wait_until(cx, "some bytes to arrive before the stop", |cx| {
+            matches!(
+                state(cx, &harness.downloads, model, &path),
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
+            )
+        });
+
+        cx.update(|cx| {
+            harness.downloads.update(cx, |downloads, cx| {
+                downloads.terminate(model, path.clone(), cx);
+            });
+        });
+        assert_eq!(
+            state(cx, &harness.downloads, model, &path),
+            DownloadState::Terminating,
+            "a download being stopped says so while its files are removed"
+        );
+
+        wait_until(cx, "the stopped download to be discarded", |cx| {
+            state(cx, &harness.downloads, model, &path) == DownloadState::Idle
+        });
+
+        assert!(!part.exists(), "the stopped transfer's bytes are gone");
+        assert!(
+            !path.join(model.file_name()).exists(),
+            "a stopped transfer leaves no file behind"
         );
     }
 
@@ -1507,14 +1717,20 @@ mod tests {
                 downloads.set_state_for_test(
                     TranslationModel::HyMt218BQ8,
                     path.clone(),
-                    DownloadState::Downloading { downloaded: 7 },
+                    DownloadState::Downloading {
+                        downloaded: 7,
+                        mb_per_second: 4.0,
+                    },
                     cx,
                 );
             });
         });
         assert_eq!(
             state(cx, &harness.downloads, TranslationModel::HyMt218BQ8, &path),
-            DownloadState::Downloading { downloaded: 7 }
+            DownloadState::Downloading {
+                downloaded: 7,
+                mb_per_second: 4.0,
+            }
         );
     }
 
@@ -1593,7 +1809,7 @@ mod tests {
         wait_until(cx, "some bytes to arrive before the pause", |cx| {
             matches!(
                 state(cx, &harness.downloads, model, directory.path()),
-                DownloadState::Downloading { downloaded } if downloaded > 0
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
             )
         });
 
@@ -1656,7 +1872,7 @@ mod tests {
         wait_until(cx, "some bytes to arrive before the pause", |cx| {
             matches!(
                 state(cx, &harness.downloads, model, directory.path()),
-                DownloadState::Downloading { downloaded } if downloaded > 0
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
             )
         });
         cx.update(|cx| {
@@ -1709,7 +1925,7 @@ mod tests {
         wait_until(cx, "some bytes to arrive before the pause", |cx| {
             matches!(
                 state(cx, &harness.downloads, model, &path),
-                DownloadState::Downloading { downloaded } if downloaded > 0
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
             )
         });
         cx.update(|cx| {
@@ -1986,7 +2202,7 @@ mod tests {
         wait_until(cx, "some bytes to arrive before the pause", |cx| {
             matches!(
                 state(cx, &harness.downloads, model, directory.path()),
-                DownloadState::Downloading { downloaded } if downloaded > 0
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
             )
         });
         cx.update(|cx| {
@@ -2057,7 +2273,10 @@ mod tests {
         );
         assert_eq!(
             state(cx, &harness.downloads, model, &path),
-            DownloadState::Downloading { downloaded: 0 }
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            }
         );
     }
 
@@ -2118,6 +2337,7 @@ mod tests {
                 )
                 .map(|part| part.len())
                 .unwrap_or(0),
+                mb_per_second: 0.0,
             },
             "a retry at the same site continues the failed task from its partial file"
         );
@@ -2165,7 +2385,7 @@ mod tests {
         wait_until(cx, "some bytes to arrive before the pause", |cx| {
             matches!(
                 state(cx, &harness.downloads, model, &path),
-                DownloadState::Downloading { downloaded } if downloaded > 0
+                DownloadState::Downloading { downloaded, .. } if downloaded > 0
             )
         });
         cx.update(|cx| {
@@ -2200,7 +2420,10 @@ mod tests {
 
         wait_until(cx, "the restart from the other site", |cx| {
             state(cx, &harness.downloads, model, &path)
-                == DownloadState::Downloading { downloaded: 0 }
+                == DownloadState::Downloading {
+                    downloaded: 0,
+                    mb_per_second: 0.0,
+                }
                 && cx.update(|cx| harness.downloads.read(cx).site(model, &path))
                     == Some(DownloadSite::ModelScope)
         });

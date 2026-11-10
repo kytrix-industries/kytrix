@@ -14,7 +14,6 @@ where
 {
     id: ElementId,
     size: UnifiedSize,
-    row_height: Option<Pixels>,
     dataset: Entity<D>,
 }
 
@@ -26,18 +25,8 @@ where
         Self {
             id: id.into(),
             size: UnifiedSize::Medium,
-            row_height: None,
             dataset: dataset.clone(),
         }
-    }
-
-    /// Draws every row — the header included — at `height` instead of the size's own row height.
-    ///
-    /// A dataset whose cells wrap over several lines asks for a row tall enough to hold them;
-    /// what the size still decides is the text size, the padding and the gap between columns.
-    pub fn row_height(mut self, height: impl Into<Pixels>) -> Self {
-        self.row_height = Some(height.into());
-        self
     }
 }
 
@@ -46,15 +35,7 @@ where
     D: TableDataSet<COLUMNS> + 'static,
 {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self {
-            id,
-            size,
-            row_height,
-            dataset,
-        } = self;
-        // A row is as tall as the dataset asked for, or as the size decides. The header is drawn
-        // at the same height, so a wrapped row keeps its column labels above it.
-        let row_height = row_height.unwrap_or_else(|| size.h());
+        let Self { id, size, dataset } = self;
 
         let scroll_handle = window.use_keyed_state((id.clone(), "scroll"), cx, |_, _| {
             UniformListScrollHandle::new()
@@ -90,7 +71,6 @@ where
                         gpui_kit::base::TableHead::new(id, index)
                             .font_bold()
                             .text_size(size.text_size())
-                            .h(row_height)
                             .px(size.px())
                             .w(column_widths[index])
                             .flex()
@@ -170,11 +150,11 @@ where
                                                     cell_id,
                                                     column_index,
                                                 )
-                                                .h(row_height)
                                                 .px(size.px())
                                                 .text_size(size.text_size())
                                                 .w(width)
                                                 .flex()
+                                                .truncate()
                                                 .items_center()
                                                 .when(matches!(align, Align::Start), |this| {
                                                     this.justify_start()

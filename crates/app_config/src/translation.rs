@@ -91,29 +91,6 @@ impl TranslationModel {
         }
     }
 
-    /// The parameter count the settings page labels the model with.
-    pub fn parameter_size(self) -> &'static str {
-        match self {
-            Self::HyMt218BQ4Km
-            | Self::HyMt218BQ6K
-            | Self::HyMt218BQ8
-            | Self::HyMt218B2Bit
-            | Self::HyMt218B125Bit => "1.8B",
-            Self::HyMt27BQ4Km | Self::HyMt27BQ6K | Self::HyMt27BQ8 => "7B",
-        }
-    }
-
-    /// The quantization width the settings page labels the model with, in bits.
-    pub fn quantization_bits(self) -> &'static str {
-        match self {
-            Self::HyMt218BQ4Km | Self::HyMt27BQ4Km => "4",
-            Self::HyMt218BQ6K | Self::HyMt27BQ6K => "6",
-            Self::HyMt218BQ8 | Self::HyMt27BQ8 => "8",
-            Self::HyMt218B2Bit => "2",
-            Self::HyMt218B125Bit => "1.25",
-        }
-    }
-
     /// The published size of the model's file, in bytes.
     pub fn size_bytes(self) -> u64 {
         match self {
@@ -221,63 +198,23 @@ mod tests {
     use super::{DownloadSite, TranslationConfig, TranslationModel};
 
     /// Every published fact, in the order the page offers the models.
-    const CATALOG: [(&str, &str, u64, &str, &str); 8] = [
+    const CATALOG: [(&str, &str, u64); 8] = [
         (
             "HY-MT2-1.8B-Q4_K_M",
             "HY-MT2-1.8B-Q4_K_M.gguf",
             1_133_080_448,
-            "1.8B",
-            "4",
         ),
-        (
-            "HY-MT2-1.8B-Q6_K",
-            "HY-MT2-1.8B-Q6_K.gguf",
-            1_474_785_120,
-            "1.8B",
-            "6",
-        ),
-        (
-            "HY-MT2-1.8B-Q8_0",
-            "HY-MT2-1.8B-Q8_0.gguf",
-            1_908_528_192,
-            "1.8B",
-            "8",
-        ),
-        (
-            "HY-MT2-1.8B-2Bit",
-            "HY-MT2-1.8B-2Bit.gguf",
-            600_534_880,
-            "1.8B",
-            "2",
-        ),
+        ("HY-MT2-1.8B-Q6_K", "HY-MT2-1.8B-Q6_K.gguf", 1_474_785_120),
+        ("HY-MT2-1.8B-Q8_0", "HY-MT2-1.8B-Q8_0.gguf", 1_908_528_192),
+        ("HY-MT2-1.8B-2Bit", "HY-MT2-1.8B-2Bit.gguf", 600_534_880),
         (
             "HY-MT2-1.8B-1.25Bit",
             "HY-MT2-1.8B-1.25Bit.gguf",
             461_860_800,
-            "1.8B",
-            "1.25",
         ),
-        (
-            "HY-MT2-7B-Q4_K_M",
-            "HY-MT2-7B-Q4_K_M.gguf",
-            4_624_648_896,
-            "7B",
-            "4",
-        ),
-        (
-            "HY-MT2-7B-Q6_K",
-            "HY-MT2-7B-Q6_K.gguf",
-            6_164_482_720,
-            "7B",
-            "6",
-        ),
-        (
-            "HY-MT2-7B-Q8_0",
-            "HY-MT2-7B-Q8_0.gguf",
-            7_981_928_896,
-            "7B",
-            "8",
-        ),
+        ("HY-MT2-7B-Q4_K_M", "HY-MT2-7B-Q4_K_M.gguf", 4_624_648_896),
+        ("HY-MT2-7B-Q6_K", "HY-MT2-7B-Q6_K.gguf", 6_164_482_720),
+        ("HY-MT2-7B-Q8_0", "HY-MT2-7B-Q8_0.gguf", 7_981_928_896),
     ];
 
     /// Every model's stable wire id and its URL on each site, in the same order.
@@ -388,16 +325,13 @@ mod tests {
     #[test]
     fn every_model_should_expose_its_published_facts_and_download_urls() {
         for (index, model) in TranslationModel::ALL.into_iter().enumerate() {
-            let (display_name, file_name, size_bytes, parameter_size, quantization_bits) =
-                CATALOG[index];
+            let (display_name, file_name, size_bytes) = CATALOG[index];
             let (wire_id, hugging_face_url, model_scope_url) = URLS[index];
             let remote_file_name = REMOTE_FILE_NAMES[index];
 
             assert_eq!(model.display_name(), display_name);
             assert_eq!(model.file_name(), file_name);
             assert_eq!(model.size_bytes(), size_bytes);
-            assert_eq!(model.parameter_size(), parameter_size);
-            assert_eq!(model.quantization_bits(), quantization_bits);
             for (site, expected_url) in [
                 (DownloadSite::HuggingFace, hugging_face_url),
                 (DownloadSite::ModelScope, model_scope_url),

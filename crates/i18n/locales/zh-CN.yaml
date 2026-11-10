@@ -1205,11 +1205,10 @@ settings_ui:
     delete_failed: 删除失败：%{reason}
     delete_failed_io: 文件无法删除
     delete_failed_provider: 下载管理器无法删除文件
-    delete_failed_timeout: 删除未在限定时间内完成
+    delete_failed_timeout: 移除未在限定时间内完成
     delete_failed_unload: 模型无法被释放
     delete_failed_unload_timeout: 翻译任务占用模型过久
     deleting: 删除中
-    description: 说明
     download: 下载
     download_failed: 下载失败：%{reason}
     download_failed_cancelled: 下载已取消
@@ -1227,8 +1226,7 @@ settings_ui:
     download_site: 模型下载站点
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope（魔搭社区）
-    downloading_progress: 下载中 %{percent}%
-    model_description: HY-MT2 %{size}模型的%{bits}Bit量化版本
+    downloading_progress: 下载中 %{speed} %{percent}%
     model_directory: 模型存放目录
     model_in_use: 使用模型
     model_name: 模型名
@@ -1240,7 +1238,11 @@ settings_ui:
     pausing: 正在暂停…
     resume: 继续
     retry: 重试
+    size: 大小
     status: 状态
+    terminate: 终止
+    terminate_failed: 终止失败：%{reason}
+    terminating: 正在终止…
     title: AI
     translation:
       title: 翻译

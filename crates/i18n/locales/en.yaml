@@ -1205,11 +1205,10 @@ settings_ui:
     delete_failed: 'Delete failed: %{reason}'
     delete_failed_io: the file could not be removed
     delete_failed_provider: the download manager could not remove the files
-    delete_failed_timeout: the delete did not finish in time
+    delete_failed_timeout: the removal did not finish in time
     delete_failed_unload: the model could not be released
     delete_failed_unload_timeout: translations kept the model in use for too long
     deleting: Deleting
-    description: Description
     download: Download
     download_failed: 'Download failed: %{reason}'
     download_failed_cancelled: the download was cancelled
@@ -1227,8 +1226,7 @@ settings_ui:
     download_site: Model download site
     download_site_huggingface: Huggingface
     download_site_modelscope: ModelScope
-    downloading_progress: Downloading %{percent}%
-    model_description: '%{bits}-bit quantized version of the HY-MT2 %{size} model'
+    downloading_progress: Downloading %{speed} %{percent}%
     model_directory: Model directory
     model_in_use: Model in use
     model_name: Model name
@@ -1240,7 +1238,11 @@ settings_ui:
     pausing: Pausing…
     resume: Resume
     retry: Retry
+    size: Size
     status: Status
+    terminate: Stop
+    terminate_failed: 'Stop failed: %{reason}'
+    terminating: Stopping…
     title: AI
     translation:
       title: Translation

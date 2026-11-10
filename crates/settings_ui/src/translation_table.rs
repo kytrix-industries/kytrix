@@ -1,16 +1,16 @@
-//! The supported translation models, drawn as a table: what each model is, and what the row
-//! can do with it.
+//! The supported translation models, drawn as a table: how large each model's file is, and what
+//! the row can do with it.
 //!
 //! The table is an entity of its own because that is what [`Table`] reads its rows from. It
 //! holds one snapshot at a time — the model, whether its file is present and what the download
 //! manager last reported for it — and is told to look again when the settings session or the
 //! manager changes, which is what makes the rows follow a download as it runs.
 //!
-//! A row does not download, resume or delete anything itself. A cell is drawn without a window
-//! and the page owns the dialogs and the selection, so the row records what the user asked for
-//! and the page takes it on the frame it draws — see [`TranslationTable::take_request`]. A pause
-//! is the one action with no dialog and no selection behind it, so the table asks the manager
-//! for it directly.
+//! A row does not download, resume, stop or delete anything itself. A cell is drawn without a
+//! window and the page owns the dialogs and the selection, so the row records what the user
+//! asked for and the page takes it on the frame it draws — see
+//! [`TranslationTable::take_request`]. A pause is the one action with no dialog and no selection
+//! behind it, so the table asks the manager for it directly.
 
 use app_config::translation::TranslationModel;
 use base_ui::{
@@ -20,7 +20,7 @@ use base_ui::{
     size::UnifiedSizable,
     style::theme::ThemeExt,
     table::{Table, TableDataSet},
-    tooltip::{Tooltip, TooltipExt},
+    tooltip::TooltipExt,
 };
 use download_provider::error::DownloadFailure;
 use gpui_kit::{
@@ -28,23 +28,24 @@ use gpui_kit::{
     Length, ParentElement, Render, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
     Subscription, WeakEntity, Window,
     base::{Align, Disableable as _},
-    div, px, relative,
+    div, relative,
 };
 use i18n::t;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
     draft::SettingsDraft,
     translation_downloads::{DeleteFailure, DownloadState, TranslationDownloads, UnloadFailure},
 };
 
-/// Columns: model name, description, status.
+/// Columns: model name, size, status.
 const COLUMN_COUNT: usize = 3;
 
 /// Column widths in header order.
 const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
-    Length::Definite(relative(0.25)),
-    Length::Definite(relative(0.33)),
-    Length::Definite(relative(0.42)),
+    Length::Definite(relative(0.40)),
+    Length::Definite(relative(0.20)),
+    Length::Definite(relative(0.40)),
 ];
 
 /// What one row asks the page to do.
@@ -56,12 +57,14 @@ pub(crate) enum TranslationRequest {
     Resume { model: TranslationModel },
     /// Retry the failed download of [`TranslationModel`] from the site the session holds.
     Retry { model: TranslationModel },
+    /// Stop the download of [`TranslationModel`] for good and discard what it wrote.
+    Terminate { model: TranslationModel },
     /// Remove [`TranslationModel`] and stop naming it where the session did.
     Delete { model: TranslationModel },
 }
 
 /// One model's row as the table last read it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ModelRow {
     model: TranslationModel,
     /// Whether the model's file is present in the session's directory.
@@ -212,7 +215,7 @@ impl TableDataSet<COLUMN_COUNT> for TranslationTable {
     fn headers(&self, cx: &App) -> [SharedString; COLUMN_COUNT] {
         [
             t!(cx, "settings_ui.ai.model_name"),
-            t!(cx, "settings_ui.ai.description"),
+            t!(cx, "settings_ui.ai.size"),
             t!(cx, "settings_ui.ai.status"),
         ]
     }
@@ -223,13 +226,6 @@ impl TableDataSet<COLUMN_COUNT> for TranslationTable {
 
     fn column_widths(&self) -> [Length; COLUMN_COUNT] {
         COLUMN_WIDTHS
-    }
-
-    /// The description and the status text speak in sentences: a narrower table wraps them onto
-    /// another line instead of hiding what they say behind an ellipsis. The model name stays one
-    /// line, and its tooltip keeps the whole of it readable when even that is cut.
-    fn cell_wraps(&self, _row_index: usize, column_index: usize) -> bool {
-        matches!(column_index, 1 | 2)
     }
 
     fn cell(&self, row_index: usize, column_index: usize, _cx: &App) -> impl IntoElement {
@@ -272,44 +268,23 @@ impl RenderOnce for TranslationCell {
         match column {
             0 => {
                 let name = SharedString::from(row.model.display_name());
-                Tooltip::new(
-                    ElementId::NamedInteger(
-                        SharedString::new_static("settings-ai-model-name-tooltip"),
-                        index as u64,
-                    ),
-                    div()
-                        .debug_selector(move || format!("SETTINGS_AI_MODEL_{index}"))
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .child(name.clone()),
-                )
-                .content(name)
-                .into_any_element()
+                div()
+                    .debug_selector(move || format!("SETTINGS_AI_MODEL_{index}"))
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .child(name)
+                    .into_any_element()
             }
             1 => {
-                let description = t!(
-                    cx,
-                    "settings_ui.ai.model_description",
-                    size = row.model.parameter_size(),
-                    bits = row.model.quantization_bits()
-                );
-                Tooltip::new(
-                    ElementId::NamedInteger(
-                        SharedString::new_static("settings-ai-model-description-tooltip"),
-                        index as u64,
-                    ),
-                    div()
-                        .debug_selector(move || format!("SETTINGS_AI_MODEL_DESCRIPTION_{index}"))
-                        .w_full()
-                        .min_w_0()
-                        .whitespace_normal()
-                        .line_height(relative(1.2))
-                        .text_xs()
-                        .child(description.clone()),
-                )
-                .content(description)
-                .into_any_element()
+                let size = SharedString::from(size_text(row.model.size_bytes()).as_str());
+                div()
+                    .debug_selector(move || format!("SETTINGS_AI_MODEL_SIZE_{index}"))
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .child(size)
+                    .into_any_element()
             }
             2 => status_cell(&row, index, can_download, &owner, cx),
             _ => Empty.into_any_element(),
@@ -336,15 +311,27 @@ fn status_cell(
         DownloadState::Deleting => {
             status = status.child(action(RowAction::Deleting, true));
         }
-        DownloadState::Downloading { downloaded } => {
+        DownloadState::Terminating => {
+            status = status.child(action(RowAction::Terminating, true));
+            text = Some(progress_text(
+                index,
+                t!(cx, "settings_ui.ai.terminating"),
+                cx,
+            ));
+        }
+        DownloadState::Downloading {
+            downloaded,
+            mb_per_second,
+        } => {
             status = status
                 .child(action(RowAction::Pause, false))
-                .child(action(RowAction::Delete, false));
+                .child(action(RowAction::Terminate, false));
             text = Some(progress_text(
                 index,
                 t!(
                     cx,
                     "settings_ui.ai.downloading_progress",
+                    speed = speed_text(*mb_per_second),
                     percent = whole_percent(model, *downloaded)
                 ),
                 cx,
@@ -353,13 +340,16 @@ fn status_cell(
         DownloadState::Pausing { .. } => {
             status = status
                 .child(action(RowAction::Pause, true))
-                .child(action(RowAction::Delete, false));
+                .child(action(RowAction::Terminate, false));
             text = Some(progress_text(index, t!(cx, "settings_ui.ai.pausing"), cx));
         }
         DownloadState::Paused { downloaded } => {
-            // A paused download has no delete beside it: continuing it is the only thing the
-            // row offers, and discarding it is the failed download's row to offer.
-            status = status.child(action(RowAction::Resume, false));
+            // A paused download is either continued from its partial file or stopped for good:
+            // there is nothing else the row can do with bytes that are neither in place nor
+            // wanted.
+            status = status
+                .child(action(RowAction::Resume, false))
+                .child(action(RowAction::Terminate, false));
             text = Some(progress_text(
                 index,
                 t!(
@@ -374,7 +364,7 @@ fn status_cell(
             let reason = download_failure_reason(failure, cx);
             status = status
                 .child(action(RowAction::Retry, false))
-                .child(action(RowAction::Delete, false));
+                .child(action(RowAction::Terminate, false));
             text = Some(failure_text(
                 index,
                 t!(cx, "settings_ui.ai.download_failed", reason = reason),
@@ -387,6 +377,15 @@ fn status_cell(
             text = Some(failure_text(
                 index,
                 t!(cx, "settings_ui.ai.delete_failed", reason = reason),
+                cx,
+            ));
+        }
+        DownloadState::TerminateFailed { failure } => {
+            let reason = delete_failure_reason(failure, cx);
+            status = status.child(action(RowAction::Terminate, false));
+            text = Some(failure_text(
+                index,
+                t!(cx, "settings_ui.ai.terminate_failed", reason = reason),
                 cx,
             ));
         }
@@ -413,9 +412,13 @@ enum RowAction {
     Pause,
     Resume,
     Retry,
+    /// Stops a download for good and discards what it wrote.
+    Terminate,
     Delete,
     /// The disabled bin a row is drawn with while its delete is in flight.
     Deleting,
+    /// The disabled stop a row is drawn with while its terminate is in flight.
+    Terminating,
 }
 
 impl RowAction {
@@ -425,6 +428,7 @@ impl RowAction {
             Self::Pause => "settings_ui.ai.pause",
             Self::Resume => "settings_ui.ai.resume",
             Self::Retry => "settings_ui.ai.retry",
+            Self::Terminate | Self::Terminating => "settings_ui.ai.terminate",
             Self::Delete => "settings_ui.ai.delete",
             Self::Deleting => "settings_ui.ai.deleting",
         }
@@ -436,6 +440,7 @@ impl RowAction {
             Self::Pause => IconKind::Pause,
             Self::Resume => IconKind::Play,
             Self::Retry => IconKind::ArrowsClockwise,
+            Self::Terminate | Self::Terminating => IconKind::StopFill,
             Self::Delete | Self::Deleting => IconKind::Trash,
         }
     }
@@ -447,8 +452,10 @@ impl RowAction {
             Self::Pause => "settings-ai-model-pause",
             Self::Resume => "settings-ai-model-resume",
             Self::Retry => "settings-ai-model-retry",
+            Self::Terminate => "settings-ai-model-terminate",
             Self::Delete => "settings-ai-model-delete",
             Self::Deleting => "settings-ai-model-deleting",
+            Self::Terminating => "settings-ai-model-terminating",
         }
     }
 
@@ -459,8 +466,10 @@ impl RowAction {
             Self::Pause => "SETTINGS_AI_MODEL_PAUSE",
             Self::Resume => "SETTINGS_AI_MODEL_RESUME",
             Self::Retry => "SETTINGS_AI_MODEL_RETRY",
+            Self::Terminate => "SETTINGS_AI_MODEL_TERMINATE",
             Self::Delete => "SETTINGS_AI_MODEL_DELETE",
             Self::Deleting => "SETTINGS_AI_MODEL_DELETING",
+            Self::Terminating => "SETTINGS_AI_MODEL_TERMINATING",
         }
     }
 
@@ -470,8 +479,9 @@ impl RowAction {
             Self::Download => TranslationRequest::Download { model },
             Self::Resume => TranslationRequest::Resume { model },
             Self::Retry => TranslationRequest::Retry { model },
+            Self::Terminate => TranslationRequest::Terminate { model },
             Self::Delete => TranslationRequest::Delete { model },
-            Self::Pause | Self::Deleting => return None,
+            Self::Pause | Self::Deleting | Self::Terminating => return None,
         })
     }
 }
@@ -486,7 +496,10 @@ fn action_button(
     cx: &App,
 ) -> Button {
     let label = t!(cx, action.label_key());
-    let danger = matches!(action, RowAction::Delete | RowAction::Deleting);
+    let danger = matches!(
+        action,
+        RowAction::Terminate | RowAction::Terminating | RowAction::Delete | RowAction::Deleting
+    );
     let mut icon = Icon::new(action.icon()).size_3();
     if danger {
         icon = icon.text_color(cx.theme().roles.status.danger.base.hsla);
@@ -519,7 +532,7 @@ fn action_button(
                 table.update(cx, |table, cx| table.pause(model, cx));
             });
         }
-        RowAction::Deleting => {}
+        RowAction::Deleting | RowAction::Terminating => {}
         _ => {
             let request = action
                 .request(model)
@@ -556,37 +569,61 @@ fn failure_text(index: usize, caption: SharedString, cx: &App) -> AnyElement {
     )
 }
 
-/// The line of status text beside the buttons of one row: small, and wrapped inside the column
-/// it is in so a long reason stays readable.
+/// The line of status text beside the buttons of one row: small, and cut to the one line the
+/// column has room for.
 fn status_text(
     prefix: &'static str,
     index: usize,
     caption: SharedString,
     color: Hsla,
 ) -> AnyElement {
-    let full_text = caption.clone();
     div()
         .flex_1()
         .min_w_0()
         .child(
-            Tooltip::new(
-                ElementId::NamedInteger(
-                    SharedString::new_static("settings-ai-model-status-tooltip"),
-                    index as u64,
-                ),
-                div()
-                    .debug_selector(move || format!("{prefix}_{index}"))
-                    .w_full()
-                    .min_w_0()
-                    .whitespace_normal()
-                    .line_height(relative(1.2))
-                    .text_xs()
-                    .text_color(color)
-                    .child(caption),
-            )
-            .content(full_text),
+            div()
+                .debug_selector(move || format!("{prefix}_{index}"))
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(color)
+                .child(caption),
         )
         .into_any_element()
+}
+
+/// The published size of a model's file, in the unit that keeps the number short: megabytes up
+/// to 1024 of them, and gigabytes above that. Two decimals are always written, rounded, and the
+/// unit follows the number after a space.
+fn size_text(bytes: u64) -> SmolStr {
+    const MEBIBYTE: u64 = 1024 * 1024;
+    const GIBIBYTE: u64 = 1024 * MEBIBYTE;
+
+    let (value, unit) = if bytes > GIBIBYTE {
+        (bytes as f64 / GIBIBYTE as f64, "GB")
+    } else {
+        (bytes as f64 / MEBIBYTE as f64, "MB")
+    };
+
+    format_smolstr!("{value:.2} {unit}")
+}
+
+/// The rate a download is transferring at, in the unit that keeps the number short: kilobytes
+/// below one megabyte per second, megabytes up to 1024 of them, and gigabytes above that. At
+/// most two decimals are written, and trailing zeros are dropped.
+fn speed_text(megabytes_per_second: f32) -> SmolStr {
+    let (value, unit) = if megabytes_per_second < 1.0 {
+        (megabytes_per_second * 1024.0, "KB/s")
+    } else if megabytes_per_second > 1024.0 {
+        (megabytes_per_second / 1024.0, "GB/s")
+    } else {
+        (megabytes_per_second, "MB/s")
+    };
+    let rounded = format!("{:.2}", value.max(0.0));
+    let number = rounded.trim_end_matches('0').trim_end_matches('.');
+
+    format_smolstr!("{number} {unit}")
 }
 
 /// How much of `model`'s published file `downloaded` bytes are, as a whole percentage.
@@ -661,7 +698,7 @@ impl Render for TranslationTable {
             .border_color(theme.roles.line.divider.hsla)
             .bg(theme.roles.surface.sunken.hsla)
             .overflow_hidden()
-            .child(Table::new("settings-ai-model-table", &table).row_height(px(48.0)))
+            .child(Table::new("settings-ai-model-table", &table))
     }
 }
 
@@ -672,7 +709,7 @@ mod tests {
     use gpui_kit::{AppContext as _, TestAppContext};
     use i18n::{global::embedded, language::codes::LanguageCode, t};
 
-    use super::{RowAction, TranslationTable, whole_percent};
+    use super::{RowAction, TranslationTable, size_text, speed_text, whole_percent};
     use crate::draft::SettingsDraft;
 
     /// The label and the icon of every row action, which are the copy and the picture the
@@ -692,11 +729,21 @@ mod tests {
                 "settings_ui.ai.retry",
                 IconKind::ArrowsClockwise,
             ),
+            (
+                RowAction::Terminate,
+                "settings_ui.ai.terminate",
+                IconKind::StopFill,
+            ),
             (RowAction::Delete, "settings_ui.ai.delete", IconKind::Trash),
             (
                 RowAction::Deleting,
                 "settings_ui.ai.deleting",
                 IconKind::Trash,
+            ),
+            (
+                RowAction::Terminating,
+                "settings_ui.ai.terminate",
+                IconKind::StopFill,
             ),
         ];
 
@@ -732,10 +779,68 @@ mod tests {
         );
     }
 
-    /// The columns that speak in sentences wrap onto another line; the model name keeps the one
-    /// line it has always been drawn with.
+    /// A rate is drawn in the unit that keeps its number short, with at most two decimals and
+    /// no trailing zeros: kilobytes below a megabyte, megabytes up to 1024 of them, and
+    /// gigabytes above that.
+    #[test]
+    fn a_speed_should_be_drawn_in_the_unit_that_keeps_it_short() {
+        assert_eq!(speed_text(0.0).as_str(), "0 KB/s");
+        assert_eq!(speed_text(0.5).as_str(), "512 KB/s");
+        assert_eq!(speed_text(0.999).as_str(), "1022.98 KB/s");
+        assert_eq!(speed_text(1.0).as_str(), "1 MB/s");
+        assert_eq!(speed_text(1.234).as_str(), "1.23 MB/s");
+        assert_eq!(
+            speed_text(1.235).as_str(),
+            "1.24 MB/s",
+            "a third decimal is rounded rather than dropped"
+        );
+        assert_eq!(speed_text(1.5).as_str(), "1.5 MB/s");
+        assert_eq!(speed_text(2.0).as_str(), "2 MB/s");
+        assert_eq!(
+            speed_text(1024.0).as_str(),
+            "1024 MB/s",
+            "a thousand and twenty-four megabytes is still megabytes"
+        );
+        assert_eq!(speed_text(1536.0).as_str(), "1.5 GB/s");
+        assert_eq!(speed_text(2048.0).as_str(), "2 GB/s");
+    }
+
+    /// The downloading status names the rate before the progress, in both languages.
     #[gpui_kit::test]
-    fn only_the_description_and_status_columns_should_wrap(cx: &mut TestAppContext) {
+    fn the_downloading_status_should_name_the_speed_before_the_progress(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            embedded::install(cx).expect("embedded locales should load");
+
+            assert_eq!(
+                t!(
+                    cx,
+                    "settings_ui.ai.downloading_progress",
+                    speed = "1.5 MB/s",
+                    percent = 42
+                )
+                .as_ref(),
+                "Downloading 1.5 MB/s 42%",
+                "the English status names the speed and then the progress"
+            );
+
+            cx.set_global(LanguageCode::ZhCn);
+            assert_eq!(
+                t!(
+                    cx,
+                    "settings_ui.ai.downloading_progress",
+                    speed = "1.5 MB/s",
+                    percent = 42
+                )
+                .as_ref(),
+                "下载中 1.5 MB/s 42%",
+                "the Chinese status is the sentence the page was designed with"
+            );
+        });
+    }
+
+    /// No column wraps: every cell is cut to the one line it is drawn with.
+    #[gpui_kit::test]
+    fn no_column_should_wrap(cx: &mut TestAppContext) {
         let draft = cx.update(|cx| cx.new(|_| SettingsDraft::new(Config::default())));
         let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(draft, None, cx)));
 
@@ -748,44 +853,72 @@ mod tests {
 
         assert_eq!(
             wraps,
-            [false, true, true],
-            "the model name is cut to one line while the description and status wrap"
+            [false, false, false],
+            "the model name, the size and the status are all cut to one line"
         );
     }
 
-    /// The description under a model's name is the sentence that says what the file is, and
-    /// both languages say exactly that.
+    /// The second column is the model's size, named in the interface's language.
     #[gpui_kit::test]
-    fn the_model_description_should_name_the_size_and_bits_in_both_languages(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_second_column_should_be_the_model_size(cx: &mut TestAppContext) {
+        let draft = cx.update(|cx| cx.new(|_| SettingsDraft::new(Config::default())));
+        let table = cx.update(|cx| cx.new(|cx| TranslationTable::new(draft, None, cx)));
+
         cx.update(|cx| {
             embedded::install(cx).expect("embedded locales should load");
 
-            assert_eq!(
-                t!(
-                    cx,
-                    "settings_ui.ai.model_description",
-                    size = "1.8B",
-                    bits = "1.25"
-                )
-                .as_ref(),
-                "1.25-bit quantized version of the HY-MT2 1.8B model",
-                "the English description names the model and the quantization"
-            );
+            let headers = table.read(cx).headers(cx);
+            assert_eq!(headers[0].as_ref(), "Model name");
+            assert_eq!(headers[1].as_ref(), "Size");
+            assert_eq!(headers[2].as_ref(), "Status");
 
             cx.set_global(LanguageCode::ZhCn);
-            assert_eq!(
-                t!(
-                    cx,
-                    "settings_ui.ai.model_description",
-                    size = "1.8B",
-                    bits = "1.25"
-                )
-                .as_ref(),
-                "HY-MT2 1.8B模型的1.25Bit量化版本",
-                "the Chinese description is the sentence the page was designed with"
-            );
+            let headers = table.read(cx).headers(cx);
+            assert_eq!(headers[1].as_ref(), "大小");
         });
+    }
+
+    /// Every supported model's published size is drawn in the unit that keeps the number short:
+    /// megabytes up to 1024 of them, gigabytes above that, and always two rounded decimals.
+    #[test]
+    fn a_model_size_should_be_drawn_in_the_unit_that_keeps_it_short() {
+        for (model, expected) in [
+            (TranslationModel::HyMt218BQ4Km, "1.06 GB"),
+            (TranslationModel::HyMt218BQ6K, "1.37 GB"),
+            (TranslationModel::HyMt218BQ8, "1.78 GB"),
+            (TranslationModel::HyMt218B2Bit, "572.71 MB"),
+            (TranslationModel::HyMt218B125Bit, "440.46 MB"),
+            (TranslationModel::HyMt27BQ4Km, "4.31 GB"),
+            (TranslationModel::HyMt27BQ6K, "5.74 GB"),
+            (TranslationModel::HyMt27BQ8, "7.43 GB"),
+        ] {
+            assert_eq!(
+                size_text(model.size_bytes()).as_str(),
+                expected,
+                "{}",
+                model.display_name()
+            );
+        }
+
+        assert_eq!(
+            size_text(1024 * 1024 * 1024).as_str(),
+            "1024.00 MB",
+            "a thousand and twenty-four megabytes is still megabytes"
+        );
+        assert_eq!(
+            size_text(1024 * 1024 * 1024 + 1).as_str(),
+            "1.00 GB",
+            "a byte over a thousand and twenty-four megabytes is gigabytes"
+        );
+        assert_eq!(
+            size_text(1_294_992).as_str(),
+            "1.24 MB",
+            "a third decimal is rounded rather than dropped"
+        );
+        assert_eq!(
+            size_text(512 * 1024 * 1024).as_str(),
+            "512.00 MB",
+            "two decimals are written even when they are zeros"
+        );
     }
 }

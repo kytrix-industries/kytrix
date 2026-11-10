@@ -276,27 +276,43 @@ impl TranslationPage {
                     downloads.resume(model, directory, cx);
                 });
             }
+            TranslationRequest::Terminate { model } => {
+                let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
+                    return;
+                };
+                self.clear_selection(model, &directory, cx);
+                downloads.update(cx, |downloads, cx| {
+                    downloads.terminate(model, directory, cx);
+                });
+            }
             TranslationRequest::Delete { model } => {
                 let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
                     return;
                 };
-                // The session stops naming the model only when it was the one this directory
-                // held.
-                let clears_selection = {
-                    let config = self.draft.read(cx).config();
-                    config.translation.selected_model == Some(model)
-                        && config.translation.model_directory.as_deref()
-                            == Some(directory.as_path())
-                };
-                if clears_selection {
-                    self.draft.update(cx, |draft, cx| {
-                        draft.write(SettingsEdit::TranslationModelSelected { model: None }, cx);
-                    });
-                }
+                self.clear_selection(model, &directory, cx);
                 downloads.update(cx, |downloads, cx| {
                     downloads.delete(model, directory, cx);
                 });
             }
+        }
+    }
+
+    /// Stops the session naming `model` when it was the model `directory` held.
+    fn clear_selection(
+        &mut self,
+        model: TranslationModel,
+        directory: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let clears_selection = {
+            let config = self.draft.read(cx).config();
+            config.translation.selected_model == Some(model)
+                && config.translation.model_directory.as_deref() == Some(directory)
+        };
+        if clears_selection {
+            self.draft.update(cx, |draft, cx| {
+                draft.write(SettingsEdit::TranslationModelSelected { model: None }, cx);
+            });
         }
     }
 
@@ -643,7 +659,10 @@ mod tests {
             downloads.set_state_for_test(
                 TranslationModel::HyMt218BQ4Km,
                 downloaded.path().to_path_buf(),
-                DownloadState::Downloading { downloaded: 42 },
+                DownloadState::Downloading {
+                    downloaded: 42,
+                    mb_per_second: 2.0,
+                },
                 cx,
             );
         });

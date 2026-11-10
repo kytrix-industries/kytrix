@@ -69,7 +69,6 @@ use crate::{
     search::{FieldSearch, PageSearch, SearchFilter, SearchNode},
     table::{ProxyRequest, ProxyTable},
     translation::TranslationPage,
-    translation_downloads::DownloadState,
 };
 
 /// The widest the page's content column gets, which is also the widest the footer's button row
@@ -402,7 +401,7 @@ impl SettingsPage {
         // The draft's directory and a selection the background download manager may have
         // written while the page was open can disagree: a model auto-selected in the stored
         // directory is not downloaded in the directory this session is about to store. A model
-        // whose file is being deleted is not available either, even if the file is still
+        // whose files are being removed is not available either, even if the file is still
         // there while the engine unloads. Clear such a selection rather than persist it.
         if let Some(downloads) = crate::translation_downloads::entity(cx)
             && let Some(selected) = applied.translation.selected_model
@@ -414,7 +413,7 @@ impl SettingsPage {
                     .as_deref()
                     .is_some_and(|directory| {
                         let downloads = downloads.read(cx);
-                        downloads.row_state(selected, directory) != DownloadState::Deleting
+                        !downloads.row_state(selected, directory).is_removing()
                             && downloads.is_downloaded(selected, directory)
                     });
             if !available {
@@ -2964,8 +2963,8 @@ mod tests {
     }
 
     /// At the window's minimum size the translation page still draws its table in the normal
-    /// content column, and the cells that wrap keep the original copy readable there: the long
-    /// English description takes two lines and the long original failure reason three.
+    /// content column, and every cell stays on the single line it is drawn with: the size and
+    /// the longest failure reason are cut rather than stacked.
     #[gpui_kit::test]
     fn the_translation_table_should_be_drawn_at_the_minimum_window_size(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().expect("the test directory should build");
@@ -2992,16 +2991,16 @@ mod tests {
             );
         }
 
-        let description = cx
-            .debug_bounds("SETTINGS_AI_MODEL_DESCRIPTION_4")
-            .expect("the 1.25-bit description should be drawn");
+        let size_cell = cx
+            .debug_bounds("SETTINGS_AI_MODEL_SIZE_4")
+            .expect("the 1.25-bit size should be drawn");
         assert!(
-            description.size.height >= px(25.0),
-            "the original English description should wrap to at least two lines: {description:?}"
+            size_cell.size.height < px(25.0),
+            "the size should stay on one line: {size_cell:?}"
         );
 
         // A size mismatch with a realistic pair of sizes is the longest reason the status column
-        // ever shows, and it should wrap rather than be cut off.
+        // ever shows, and it should be cut to one line rather than wrap.
         downloads.update(cx, |downloads, cx| {
             downloads.set_state_for_test(
                 TranslationModel::HyMt218BQ6K,
@@ -3021,8 +3020,8 @@ mod tests {
             .debug_bounds("SETTINGS_AI_MODEL_ERROR_1")
             .expect("the failed download should draw its reason");
         assert!(
-            error.size.height >= px(40.0),
-            "the original long failure reason should wrap to at least three lines: {error:?}"
+            error.size.height < px(25.0),
+            "the long failure reason should be cut to one line: {error:?}"
         );
     }
 
@@ -3134,7 +3133,10 @@ mod tests {
             downloads.set_state_for_test(
                 TranslationModel::HyMt218BQ6K,
                 path.clone(),
-                DownloadState::Downloading { downloaded: 100 },
+                DownloadState::Downloading {
+                    downloaded: 100,
+                    mb_per_second: 1.5,
+                },
                 cx,
             );
             downloads.set_state_for_test(
@@ -3196,8 +3198,12 @@ mod tests {
             "a download in flight offers pause"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_some(),
-            "a download in flight can be discarded"
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
+            "a download in flight can be stopped for good"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
+            "a download in flight is stopped rather than deleted"
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_1").is_some(),
@@ -3213,8 +3219,12 @@ mod tests {
             "a failed download offers retry"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_2").is_some(),
-            "a failed download can discard its partial file"
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_2").is_some(),
+            "a failed download can be stopped for good"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_2").is_none(),
+            "a failed download is stopped rather than deleted"
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_2").is_some(),
@@ -3253,8 +3263,12 @@ mod tests {
             "a pausing download is drawn with its disabled pause"
         );
         assert!(
-            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_5").is_some(),
-            "a pausing download can still be discarded"
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_5").is_some(),
+            "a pausing download can still be stopped for good"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_5").is_none(),
+            "a pausing download is stopped rather than deleted"
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_5").is_some(),
@@ -3270,6 +3284,10 @@ mod tests {
             "a paused download offers resume"
         );
         assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_6").is_some(),
+            "a paused download can be stopped for good"
+        );
+        assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_6").is_none(),
             "a paused download offers no pause"
         );
@@ -3279,7 +3297,7 @@ mod tests {
         );
         assert!(
             cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_6").is_none(),
-            "a paused download is not discarded from its row"
+            "a paused download is stopped rather than deleted"
         );
 
         assert!(
@@ -3291,6 +3309,66 @@ mod tests {
                 && cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_7").is_none()
                 && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_7").is_none(),
             "an idle model has no delete and no status text"
+        );
+    }
+
+    /// A row whose download is being stopped draws the disabled stop and says so, and a stop
+    /// that failed offers the stop again rather than a retry of the download.
+    #[gpui_kit::test]
+    fn the_translation_rows_should_draw_the_stopping_states(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (_panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let path = directory.path().to_path_buf();
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218BQ4Km,
+                path.clone(),
+                DownloadState::Terminating,
+                cx,
+            );
+            downloads.set_state_for_test(
+                TranslationModel::HyMt218BQ6K,
+                path,
+                DownloadState::TerminateFailed {
+                    failure: DeleteFailure::Io {
+                        kind: std::io::ErrorKind::PermissionDenied,
+                    },
+                },
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATING_0").is_some(),
+            "a download being stopped offers its disabled stop"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_0").is_none(),
+            "a download being stopped must not offer a second stop"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_0").is_some(),
+            "a download being stopped says what it is doing"
+        );
+
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
+            "a stop that failed can be tried again"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_1").is_some(),
+            "a failed stop names its reason"
+        );
+        assert!(
+            cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_1").is_none()
+                && cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
+            "a failed stop offers neither a retry nor a delete"
         );
     }
 
@@ -3335,7 +3413,10 @@ mod tests {
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 },
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            },
             "the download icon starts the download without asking for a site"
         );
     }
@@ -3371,7 +3452,10 @@ mod tests {
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 }
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            }
         );
     }
 
@@ -3419,7 +3503,10 @@ mod tests {
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 },
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            },
             "the site of the failed task continues it rather than discarding it"
         );
     }
@@ -3467,7 +3554,10 @@ mod tests {
         );
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 },
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            },
             "the other site restarts the download from zero"
         );
     }
@@ -3505,8 +3595,50 @@ mod tests {
 
         assert_eq!(
             cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-            DownloadState::Downloading { downloaded: 0 },
+            DownloadState::Downloading {
+                downloaded: 0,
+                mb_per_second: 0.0,
+            },
             "the continue icon resumes the paused task"
+        );
+    }
+
+    /// Stopping a paused download from its row discards what it wrote: the partial file goes and
+    /// the row offers a download again.
+    #[gpui_kit::test]
+    fn a_paused_download_should_be_stopped_from_its_row(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("the test directory should build");
+        let mut config = configured_settings();
+        config.translation.model_directory = Some(directory.path().to_path_buf());
+        let (_panel, cx) = settings(config, cx);
+        click(cx, "SETTINGS_ENTRY_ai.translation");
+        let downloads = translation_downloads(cx);
+        let path = directory.path().to_path_buf();
+        let model = TranslationModel::HyMt27BQ6K;
+        let part = path.join(format!("{}.part", model.file_name()));
+        std::fs::write(&part, b"partial").expect("the partial file should be written");
+
+        downloads.update(cx, |downloads, cx| {
+            downloads.set_state_for_test(
+                model,
+                path.clone(),
+                DownloadState::Paused { downloaded: 7 },
+                cx,
+            );
+        });
+        settle(cx);
+
+        click(cx, "SETTINGS_AI_MODEL_TERMINATE_6");
+        wait_until_absent(cx, &downloads, model, &path, &part);
+
+        assert!(
+            !part.exists(),
+            "the stopped download's partial file is gone"
+        );
+        assert_eq!(
+            cx.read(|cx| downloads.read(cx).row_state(model, &path)),
+            DownloadState::Idle,
+            "the stopped download is a download the row offers again"
         );
     }
 
