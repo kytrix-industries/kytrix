@@ -209,6 +209,10 @@ impl RenderOnce for Dropdown {
                     .disabled(disabled)
                     .rounded_sm()
                     .unified_sized(unified_size)
+                    // The caller's content is drawn inside the trigger rather than over it:
+                    // content wider than the box the control was given is cut at the
+                    // control's edge instead of painting past it.
+                    .overflow_hidden()
                     .children(children)
                     .when(!opened && !disabled, |this| {
                         this.on_click(move |_, _, cx| trigger_open.write(cx, true))
@@ -256,9 +260,10 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use gpui_kit::{
-        Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton, ParentElement as _,
-        Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled as _,
-        TestAppContext, VisualTestContext, Window, div, point, px, size,
+        Context, Hsla, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+        ParentElement as _, Pixels, Point, Render, Rgba, ScrollDelta, ScrollEvent,
+        StatefulInteractiveElement, Styled as _, TestAppContext, VisualTestContext, Window, div,
+        point, px, size,
     };
 
     use super::Dropdown;
@@ -392,6 +397,96 @@ mod tests {
                 .items_center()
                 .child(dropdown)
         }
+    }
+
+    /// A dropdown whose trigger content is far wider than the box the control is drawn in.
+    ///
+    /// The content is a painted block of its own width, so no amount of squeezing makes it
+    /// narrower and what it paints can be measured: a control drawn in a narrower box has to
+    /// cut it off at its own edge rather than let it paint across the window.
+    struct ClippedContentHarness;
+
+    /// The colour the block inside [`ClippedContentHarness`] is painted in: nothing else in
+    /// the window is that colour, so the quad it paints is the one to look at.
+    const CONTENT_COLOR: Rgba = Rgba {
+        r: 0.0,
+        g: 1.0,
+        b: 0.0,
+        a: 1.0,
+    };
+
+    impl Render for ClippedContentHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().items_center().child(
+                div().w(px(120.0)).child(
+                    Dropdown::new("test-clipped-content-dropdown")
+                        .small()
+                        .debug_selector(|| "TEST_CLIPPED_CONTENT_DROPDOWN".into())
+                        .child(
+                            div()
+                                .min_w(px(300.0))
+                                .h(px(8.0))
+                                .bg(CONTENT_COLOR)
+                                .debug_selector(|| "TEST_CLIPPED_CONTENT".into()),
+                        )
+                        .menu_item(MenuItem::Action(MenuItemAction::new("entry", "entry"))),
+                ),
+            )
+        }
+    }
+
+    /// A dropdown draws its content inside its own box: content too wide for the control is
+    /// cut off at the control's edge instead of painting past it, over whatever it covers.
+    ///
+    /// The quad the content paints is what this measures: `debug_bounds` answers where the
+    /// content was laid out — which is past the control's edge, and stays there — while what
+    /// was actually drawn is that box intersected with the content mask the control paints
+    /// under.
+    #[gpui_kit::test]
+    fn a_dropdown_should_cut_the_content_that_does_not_fit_inside_it(cx: &mut TestAppContext) {
+        cx.update(style::theme::install);
+        let (_, cx) = cx.add_window_view(|_, _| ClippedContentHarness);
+        cx.simulate_resize(size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+
+        let dropdown = cx
+            .debug_bounds("TEST_CLIPPED_CONTENT_DROPDOWN")
+            .expect("the harness draws its dropdown");
+        let content = cx
+            .debug_bounds("TEST_CLIPPED_CONTENT")
+            .expect("the dropdown draws the content it was given");
+        assert!(
+            content.right() > dropdown.right(),
+            "the harness draws content wider than its dropdown, which is what this is about: \
+             the content ends at {} and the dropdown at {}",
+            content.right(),
+            dropdown.right()
+        );
+
+        let (scale, quads) = cx.update(|window, _| (window.scale_factor(), window.painted_quads()));
+        let content_quad = quads
+            .into_iter()
+            .find(|quad| {
+                quad.background
+                    .as_solid()
+                    .is_some_and(|color| color == Hsla::from(CONTENT_COLOR))
+            })
+            .expect("the content block is painted");
+
+        let painted = |scaled: f32| px(scaled / scale);
+        let painted_right = painted(
+            content_quad
+                .bounds
+                .right()
+                .0
+                .min(content_quad.content_mask.bounds.right().0),
+        );
+        assert!(
+            painted_right <= dropdown.right(),
+            "a dropdown must not paint its content outside itself: the content is painted as \
+             far as {painted_right}, and the dropdown ends at {}",
+            dropdown.right()
+        );
     }
 
     /// A dropdown told how tall its menu may grow keeps to it, and the entries it cannot

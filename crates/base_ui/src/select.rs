@@ -185,18 +185,40 @@ impl RenderOnce for Select {
         menu_items
             .into_iter()
             .fold(base, |base, item| base.menu_item(item))
+            // The label is the part that gives way: what it says is cut inside the control
+            // rather than widening it, so the marks beside it keep the room they are drawn
+            // in however long the label is.
             .when_none(&selected, |this| {
-                this.child(div().flex_1().child(placeholder))
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .debug_selector(|| "TEST_SELECT_CONTENT".into())
+                        .child(placeholder),
+                )
             })
             .when_some(selected, |this, (icon_kind, label)| {
                 this.when_some(icon_kind, |this, icon_kind| {
-                    this.child(Icon::new(icon_kind).size(unified_size.icon_size()))
+                    this.child(
+                        Icon::new(icon_kind)
+                            .size(unified_size.icon_size())
+                            .flex_shrink_0(),
+                    )
                 })
-                .child(div().flex_1().child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .debug_selector(|| "TEST_SELECT_CONTENT".into())
+                        .child(label),
+                )
             })
             .child(
                 Icon::new(IconKind::CaretDown)
                     .size(unified_size.icon_size())
+                    .flex_shrink_0()
                     .transformation(Transformation::rotate(radians(
                         -std::f32::consts::PI * unfolded,
                     ))),
@@ -222,9 +244,9 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use gpui_kit::{
-        Context, InteractiveElement, IntoElement, Modifiers, MouseButton, ParentElement, Render,
-        StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div, px,
-        size, test::TestWindowExt as _,
+        Context, InteractiveElement, IntoElement, Modifiers, MouseButton, ParentElement, Pixels,
+        Render, StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div,
+        px, size, test::TestWindowExt as _,
     };
 
     use super::Select;
@@ -233,7 +255,7 @@ mod tests {
         button::Button,
         interactive::InteractiveVariantExt,
         menu::{MenuItem, MenuItemAction},
-        size::UnifiedSizable,
+        size::{UnifiedSizable, UnifiedSize},
         style,
     };
 
@@ -282,6 +304,35 @@ mod tests {
                     .placeholder("nothing to choose from")
                     .aria_label("nothing to choose from")
                     .debug_selector(|| "TEST_EMPTY_SELECT".into()),
+            )
+        }
+    }
+
+    /// A label with nothing to break at, so that it asks for the same width however much
+    /// room it is given: only a box narrower than it can cut it short.
+    const LONG_LABEL: &str = "CONSTANTINOPOLITANCONSTANTINOPOLITAN";
+
+    /// The entry whose label is [`LONG_LABEL`], drawn on a select that has chosen it.
+    const LONG_ENTRY: &str = "long-entry";
+
+    /// The width the select harness is drawn in: narrower than [`LONG_LABEL`] needs.
+    const NARROW: Pixels = px(120.0);
+
+    /// A select told its own width while holding a chosen label wider than that width: the
+    /// label has to give way to the caret rather than take the room the caret is drawn in.
+    struct StatedWidthSelectHarness;
+
+    impl Render for StatedWidthSelectHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().items_center().child(
+                Select::new("test-stated-width-select")
+                    .small()
+                    .w(NARROW)
+                    .selected_item(Some(LONG_ENTRY))
+                    .menu_item(MenuItem::Action(MenuItemAction::new(
+                        LONG_ENTRY, LONG_LABEL,
+                    )))
+                    .debug_selector(|| "TEST_STATED_WIDTH_SELECT".into()),
             )
         }
     }
@@ -376,6 +427,41 @@ mod tests {
         assert!(
             panel.size.height <= px(80.),
             "a select that caps its menu must not open a panel taller than the cap: {panel:?}"
+        );
+    }
+
+    /// A select told its width keeps the room its caret is drawn in: the label is the part
+    /// that gives way, and it is cut on one line instead of wrapping out of the control.
+    #[gpui_kit::test]
+    fn a_long_label_should_be_cut_short_of_the_caret(cx: &mut TestAppContext) {
+        cx.update(style::theme::install);
+        let (_, cx) = cx.add_window_view(|_, _| StatedWidthSelectHarness);
+        cx.simulate_resize(size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+
+        let select = cx
+            .debug_bounds("TEST_STATED_WIDTH_SELECT")
+            .expect("the harness draws its select");
+        let label = cx
+            .debug_bounds("TEST_SELECT_CONTENT")
+            .expect("the select draws the label of its chosen entry");
+
+        let room = select.size.width
+            - UnifiedSize::Small.px() * 2.0
+            - UnifiedSize::Small.gap()
+            - UnifiedSize::Small.icon_size();
+        assert!(
+            label.size.width <= room,
+            "the label must give way to the caret, not take the room the control has left \
+             for it ({room}): the label is {} wide, and the caret is drawn in the rest of \
+             {select:?}",
+            label.size.width
+        );
+        assert!(
+            label.size.height <= select.size.height,
+            "a label too wide for its select must be cut short on one line, not wrapped \
+             past the control: the label is {} tall inside {select:?}",
+            label.size.height
         );
     }
 
