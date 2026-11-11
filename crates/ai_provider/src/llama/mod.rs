@@ -2,6 +2,7 @@
 
 mod backend;
 mod batch;
+pub mod cancel;
 pub mod config;
 mod context;
 mod detokenizer;

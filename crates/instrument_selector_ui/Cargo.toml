@@ -5,8 +5,10 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 gpui-kit = { workspace = true }
 i18n = { workspace = true }
+log = { workspace = true }
 nucleo = { workspace = true }
 smol_str = { workspace = true }
 time = { workspace = true }

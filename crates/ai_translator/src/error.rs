@@ -27,6 +27,24 @@ pub enum TranslationError {
     /// Other translations kept the model in use for longer than an unload may wait.
     #[error("translation model `{path}` did not finish its translations within 30 seconds")]
     UnloadTimeout { path: PathBuf },
+    /// The caller cancelled the request before the model finished it.
+    #[error("the translation request was cancelled")]
+    Cancelled,
+    /// The batch request repeats a segment id, so its answer could not be matched back.
+    #[error("the batch request repeats the segment id `{id}`")]
+    BatchRequestDuplicateId { id: SmolStr },
+    /// The model did not answer a batch request with a JSON object.
+    #[error("the model response is not a JSON object")]
+    BatchResponseNotJson,
+    /// The model response did not translate every requested segment.
+    #[error("the model response is missing translations for ids {ids:?}")]
+    BatchResponseMissing { ids: Vec<SmolStr> },
+    /// The model response invented segment ids that were not requested.
+    #[error("the model response contains translations for unrequested ids {ids:?}")]
+    BatchResponseExtra { ids: Vec<SmolStr> },
+    /// The model returned an empty translation for a requested segment.
+    #[error("the model response left translations empty for ids {ids:?}")]
+    BatchResponseEmpty { ids: Vec<SmolStr> },
     /// The inference engine failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -91,5 +109,57 @@ mod tests {
             "model file `models/model.gguf` does not exist"
         );
         assert!(matches!(error, TranslationError::Provider(_)));
+    }
+
+    #[test]
+    fn cancellation_has_its_own_message() {
+        let cancelled = TranslationError::Cancelled;
+
+        assert_eq!(
+            cancelled.to_string(),
+            "the translation request was cancelled"
+        );
+        assert!(cancelled.source().is_none());
+    }
+
+    #[test]
+    fn batch_failures_name_the_affected_ids() {
+        let duplicate = TranslationError::BatchRequestDuplicateId { id: "s00".into() };
+        assert_eq!(
+            duplicate.to_string(),
+            "the batch request repeats the segment id `s00`"
+        );
+        assert!(duplicate.source().is_none());
+
+        let not_json = TranslationError::BatchResponseNotJson;
+        assert_eq!(
+            not_json.to_string(),
+            "the model response is not a JSON object"
+        );
+        assert!(not_json.source().is_none());
+
+        let missing = TranslationError::BatchResponseMissing {
+            ids: vec!["1".into(), "3".into()],
+        };
+        assert_eq!(
+            missing.to_string(),
+            "the model response is missing translations for ids [\"1\", \"3\"]"
+        );
+
+        let extra = TranslationError::BatchResponseExtra {
+            ids: vec!["9".into()],
+        };
+        assert_eq!(
+            extra.to_string(),
+            "the model response contains translations for unrequested ids [\"9\"]"
+        );
+
+        let empty = TranslationError::BatchResponseEmpty {
+            ids: vec!["2".into()],
+        };
+        assert_eq!(
+            empty.to_string(),
+            "the model response left translations empty for ids [\"2\"]"
+        );
     }
 }

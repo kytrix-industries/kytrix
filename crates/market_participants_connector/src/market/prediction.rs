@@ -45,8 +45,6 @@ pub struct PredictionEventsRequest {
     pub search: Option<SmolStr>,
     pub cursor: Option<SmolStr>,
     pub page_size: u16,
-    /// The caller's opaque content locale, forwarded to venues that localize.
-    pub locale: Option<SmolStr>,
 }
 
 impl PredictionEventsRequest {
@@ -58,7 +56,6 @@ impl PredictionEventsRequest {
             search: None,
             cursor: None,
             page_size: DEFAULT_PREDICTION_PAGE_SIZE,
-            locale: None,
         }
     }
 
@@ -83,12 +80,6 @@ impl PredictionEventsRequest {
     /// Sets the page size, clamped to what a selector may ask for.
     pub fn page_size(mut self, page_size: u16) -> Self {
         self.page_size = page_size.clamp(1, MAX_PREDICTION_PAGE_SIZE);
-        self
-    }
-
-    /// Sets the opaque content locale forwarded to venues that localize.
-    pub fn locale(mut self, locale: Option<SmolStr>) -> Self {
-        self.locale = locale;
         self
     }
 }
@@ -152,7 +143,6 @@ impl PredictionEventsBuilder {
             search: self.request.search.clone(),
             cursor: self.request.cursor.clone(),
             page_size: self.request.page_size,
-            locale: self.request.locale.clone(),
         };
         match execute(
             &self.provider,
@@ -180,7 +170,6 @@ impl PredictionEventsBuilder {
                     search: None,
                     cursor: cursor.clone(),
                     page_size: MAX_PREDICTION_PAGE_SIZE,
-                    locale: self.request.locale.clone(),
                 };
                 let page = match execute(
                     &self.provider,
@@ -274,22 +263,11 @@ fn categories_of(
 pub struct PredictionEventBuilder {
     provider: MarketCapability,
     event: PredictionEventRef,
-    locale: Option<SmolStr>,
 }
 
 impl PredictionEventBuilder {
     pub(super) fn new(provider: MarketCapability, event: PredictionEventRef) -> Self {
-        Self {
-            provider,
-            event,
-            locale: None,
-        }
-    }
-
-    /// Sets the opaque content locale forwarded to venues that localize.
-    pub fn locale(mut self, locale: Option<SmolStr>) -> Self {
-        self.locale = locale;
-        self
+        Self { provider, event }
     }
 
     /// Fetches the event and every leg it publishes.
@@ -298,10 +276,7 @@ impl PredictionEventBuilder {
         match execute(
             &self.provider,
             route,
-            ProtocolRequest::FetchPredictionEvent(PredictionEventQuery {
-                event: self.event,
-                locale: self.locale,
-            }),
+            ProtocolRequest::FetchPredictionEvent(PredictionEventQuery { event: self.event }),
         )
         .await?
         {
@@ -372,14 +347,6 @@ mod tests {
         assert!(request.category.is_none());
         assert!(request.search.is_none());
         assert!(request.cursor.is_none());
-        assert!(request.locale.is_none());
-    }
-
-    #[test]
-    fn a_request_carries_the_callers_locale() {
-        let request = PredictionEventsRequest::first(VenueId::Polymarket).locale(Some("zh".into()));
-
-        assert_eq!(request.locale.as_deref(), Some("zh"));
     }
 
     #[test]

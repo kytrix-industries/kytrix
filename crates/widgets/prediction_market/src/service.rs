@@ -3,9 +3,9 @@
 //! The chart reads a bounded history once and then follows the venue's live
 //! probability stream. The subscription is opened before the history is requested,
 //! so a tick that lands while the page is in flight is buffered rather than missed.
-//! The stream key is the event, the market, the range and the requested content
-//! locale: another event, market, range or language is another chart, and a
-//! message from the previous one is refused by the view.
+//! The stream key is the event, the market and the range: another event, market or
+//! range is another chart, and a message from the previous one is refused by the
+//! view.
 
 use std::{
     collections::VecDeque,
@@ -26,7 +26,6 @@ use market_participants_model::prediction::{
     PredictionEventRef, PredictionEventView, PredictionLeg, PredictionMarket, PredictionMarketRef,
     PredictionRange, PredictionSeries,
 };
-use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 use widget::{
@@ -60,7 +59,6 @@ pub enum PredictionMarketRequest {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
         range: PredictionRange,
-        locale: Option<SmolStr>,
         /// A local stream epoch. Every explicit load increments it, so messages
         /// from a replaced stream can never be mistaken for the new one's.
         epoch: u64,
@@ -69,7 +67,6 @@ pub enum PredictionMarketRequest {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
         range: PredictionRange,
-        locale: Option<SmolStr>,
         epoch: u64,
     },
 }
@@ -81,20 +78,17 @@ impl PredictionMarketRequest {
                 event,
                 market,
                 range,
-                locale,
                 epoch,
             }
             | Self::Retry {
                 event,
                 market,
                 range,
-                locale,
                 epoch,
             } => PredictionMarketStreamKey {
                 event: event.clone(),
                 market: market.clone(),
                 range: *range,
-                locale: locale.clone(),
                 epoch: *epoch,
             },
         }
@@ -107,13 +101,12 @@ pub enum PredictionMarketResponse {
     StreamStarted,
 }
 
-/// The event, range and locale one chart follows.
+/// The event, market and range one chart follows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PredictionMarketStreamKey {
     pub event: PredictionEventRef,
     pub market: Option<PredictionMarketRef>,
     pub range: PredictionRange,
-    pub locale: Option<SmolStr>,
     /// The view-local generation that produced this request.
     pub epoch: u64,
 }
@@ -164,7 +157,6 @@ pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
     fn event(
         &self,
         event: PredictionEventRef,
-        locale: Option<SmolStr>,
     ) -> impl Future<Output = Result<PredictionEventView, MarketError>> + Send;
 
     fn series(
@@ -191,12 +183,8 @@ pub trait PredictionSeriesEventSubscription: Send + 'static {
 impl PredictionMarketSource for MarketCapability {
     type Subscription = ClientPredictionSeriesSubscription;
 
-    async fn event(
-        &self,
-        event: PredictionEventRef,
-        locale: Option<SmolStr>,
-    ) -> Result<PredictionEventView, MarketError> {
-        self.prediction_event(event).locale(locale).fetch().await
+    async fn event(&self, event: PredictionEventRef) -> Result<PredictionEventView, MarketError> {
+        self.prediction_event(event).fetch().await
     }
 
     async fn series(
@@ -276,8 +264,8 @@ where
             }
             let key = request.key();
             // The supervisor replaces only the exact key it is given. A chart
-            // follows one event at a time, so a request for another event,
-            // market or locale must retire the previous stream as well.
+            // follows one event at a time, so a request for another event or
+            // market must retire the previous stream as well.
             if let Some(previous) = active_key
                 .as_ref()
                 .filter(|previous| *previous != &key)
@@ -321,12 +309,7 @@ async fn run_stream<S>(
     {
         return;
     }
-    let event = match timeout(
-        attempt_timeout,
-        source.event(key.event.clone(), key.locale.clone()),
-    )
-    .await
-    {
+    let event = match timeout(attempt_timeout, source.event(key.event.clone())).await {
         Ok(Ok(event)) => event,
         Ok(Err(error)) => {
             publish_failure(&publisher, PredictionMarketFetchError::Market(error)).await;
@@ -562,7 +545,6 @@ mod tests {
             PredictionPricePoint, PredictionRange, PredictionSeries,
         },
     };
-    use smol_str::SmolStr;
     use tokio::sync::{Notify, mpsc, oneshot};
     use widget::{runtime::WidgetRuntime, stream::ReliableStream};
 
@@ -689,7 +671,6 @@ mod tests {
         async fn event(
             &self,
             _event: PredictionEventRef,
-            _locale: Option<SmolStr>,
         ) -> Result<PredictionEventView, MarketError> {
             let receiver = self
                 .event
@@ -781,7 +762,6 @@ mod tests {
             event: event_ref(),
             market: None,
             range: PredictionRange::default(),
-            locale: None,
             epoch: 1,
         }
     }
@@ -971,7 +951,6 @@ mod tests {
         assert_eq!(key.event, event_ref());
         assert_eq!(key.market, None);
         assert_eq!(key.range, PredictionRange::default());
-        assert_eq!(key.locale, None);
         assert_eq!(key.epoch, 1);
     }
 
