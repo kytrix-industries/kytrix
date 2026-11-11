@@ -13,15 +13,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "accesskit"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e883d1d28c5fd5568c79ed2d2bd48d9f2fd3945c8974ed0f53690ceddb051be"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "accesskit_atspi_common"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023da0e5097f46df7092d5280b02efb9bbf8d93298daeced42652463e357d636"
 dependencies = [
- "accesskit",
- "accesskit_consumer",
+ "accesskit 0.24.1",
+ "accesskit_consumer 0.38.0",
  "atspi-common",
  "phf 0.13.1",
+ "serde",
+ "zvariant",
+]
+
+[[package]]
+name = "accesskit_atspi_common"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24f5baf62e34a4a6c30e3d697e4782f821a7337049c44c3b40576a27dfbb580d"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_consumer 0.39.2",
+ "atspi-common",
+ "phf 0.14.0",
  "serde",
  "zvariant",
 ]
@@ -32,8 +55,18 @@ version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d10a236f96f87d70732e44520046785431ef01d5bcd6b041317bfadd2f88245"
 dependencies = [
- "accesskit",
+ "accesskit 0.24.1",
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "accesskit_consumer"
+version = "0.39.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3da8f27636015191b2264ee1df681503170a632cafd832fdc1edfdd4e3a2fd3"
+dependencies = [
+ "accesskit 0.25.2",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -42,9 +75,23 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce02dc63b43f0c9296af9ac946312a2dc8814427d7a64d2d600971dac55b6076"
 dependencies = [
- "accesskit",
- "accesskit_consumer",
+ "accesskit 0.24.1",
+ "accesskit_consumer 0.38.0",
  "hashbrown 0.16.1",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "accesskit_macos"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "123828ceeec755b05255e3976cb0852993202de98a0626c97dd8d34246991f84"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_consumer 0.39.2",
+ "hashbrown 0.17.1",
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
@@ -56,8 +103,8 @@ version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03e156ed3802e35eefe894ef2671bc6c889303d8a7e110b5e1b48f504b91362f"
 dependencies = [
- "accesskit",
- "accesskit_atspi_common",
+ "accesskit 0.24.1",
+ "accesskit_atspi_common 0.19.1",
  "async-channel",
  "async-executor",
  "async-task",
@@ -69,14 +116,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "accesskit_unix"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5192871228c54f1b0fb4a85cef000e11a3804f25d2165f14afa0daa67f3f6"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_atspi_common 0.21.1",
+ "atspi",
+ "futures-lite",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "zbus 5.19.0",
+]
+
+[[package]]
 name = "accesskit_windows"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "106c2b961215864d1c2e703ee63269c25c4e80a577ffb2c1017b9c17dcdf83a1"
 dependencies = [
- "accesskit",
- "accesskit_consumer",
+ "accesskit 0.24.1",
+ "accesskit_consumer 0.38.0",
  "hashbrown 0.16.1",
+ "static_assertions",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "accesskit_windows"
+version = "0.35.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498668b90da9995302a0055aaecad4756932333da2ddef6baee1c00844c430fc"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_consumer 0.39.2",
+ "hashbrown 0.17.1",
  "static_assertions",
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -1935,7 +2012,7 @@ checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags 2.13.2",
  "fontdb",
- "harfrust",
+ "harfrust 0.5.2",
  "linebender_resource_handle",
  "log",
  "rangemap",
@@ -2746,6 +2823,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etagere"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ecb5c40d5683a270e077688f53a99eac51c1cb1ae5ba63b55590370cb3536bf"
+dependencies = [
+ "euclid",
+]
+
+[[package]]
 name = "ethereum_wallet"
 version = "0.0.3"
 dependencies = [
@@ -3084,6 +3170,28 @@ dependencies = [
  "slotmap",
  "tinyvec",
  "ttf-parser",
+]
+
+[[package]]
+name = "fontique"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbf1df16263783918b7da396077521f92b729ef7c429444dfcf03581f1448b77"
+dependencies = [
+ "hashbrown 0.17.1",
+ "linebender_resource_handle",
+ "memmap2",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-text",
+ "objc2-foundation 0.3.2",
+ "parlance",
+ "read-fonts 0.41.0",
+ "roxmltree 0.21.2",
+ "smallvec",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -3595,7 +3703,7 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8c3a7e25e5a4789656da980b0316857acbdb72347b5d890d7d0c549bb9fee72"
 dependencies = [
- "accesskit",
+ "accesskit 0.24.1",
  "anyhow",
  "async-channel",
  "async-task",
@@ -3604,7 +3712,7 @@ dependencies = [
  "chrono",
  "derive_more",
  "embed-resource",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "futures-concurrency",
  "getrandom 0.3.4",
@@ -3675,7 +3783,7 @@ dependencies = [
  "core-graphics 0.24.0",
  "core-text",
  "dispatch2",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "gpui-fast",
  "gpui-pre-collections",
@@ -3706,8 +3814,8 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0409042721bd50ed8c538e13cb13f6d92f5adeade2e2a284a41d32c704c2eef1"
 dependencies = [
- "accesskit",
- "accesskit_unix",
+ "accesskit 0.24.1",
+ "accesskit_unix 0.22.1",
  "anyhow",
  "as-raw-xcb-connection",
  "ashpd",
@@ -3740,7 +3848,7 @@ dependencies = [
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "x11rb",
- "xkbcommon",
+ "xkbcommon 0.8.0",
  "zed-scap",
  "zed-xim",
 ]
@@ -3751,8 +3859,8 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "192b5731d190f840ad7868d1bb8c1c1fe70007a747cc8d2f60700699ca4318e0"
 dependencies = [
- "accesskit",
- "accesskit_macos",
+ "accesskit 0.24.1",
+ "accesskit_macos 0.26.3",
  "anyhow",
  "block2 0.6.2",
  "core-foundation 0.10.1",
@@ -3854,7 +3962,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "cosmic-text",
- "etagere",
+ "etagere 0.2.15",
  "gpui-fast",
  "gpui-pre-collections",
  "gpui-pre-util",
@@ -3879,11 +3987,11 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89bfdc3a922a29f83611fc7f01642533d35260a7f86aa9befb14f2b6dcca093"
 dependencies = [
- "accesskit",
- "accesskit_windows",
+ "accesskit 0.24.1",
+ "accesskit_windows 0.34.0",
  "anyhow",
  "dunce",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "gpui-fast",
  "gpui-pre-collections",
@@ -3940,7 +4048,7 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29db89613527079737f53752eab27fb65c9a7dd94979256c65a0e590c9fd34d8"
 dependencies = [
- "accesskit",
+ "accesskit 0.24.1",
  "anyhow",
  "async-channel",
  "async-task",
@@ -3949,7 +4057,7 @@ dependencies = [
  "chrono",
  "derive_more",
  "embed-resource",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "futures-concurrency",
  "getrandom 0.3.4",
@@ -4020,7 +4128,7 @@ dependencies = [
  "core-graphics 0.24.0",
  "core-text",
  "dispatch2",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "gpui-pre",
  "gpui-pre-collections",
@@ -4126,8 +4234,8 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54bab418d0b7c027af9495f278619b46887362b3bd6446e246c87c5b0fa167df"
 dependencies = [
- "accesskit",
- "accesskit_unix",
+ "accesskit 0.24.1",
+ "accesskit_unix 0.22.1",
  "anyhow",
  "as-raw-xcb-connection",
  "ashpd",
@@ -4160,7 +4268,7 @@ dependencies = [
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "x11rb",
- "xkbcommon",
+ "xkbcommon 0.8.0",
  "zed-scap",
  "zed-xim",
 ]
@@ -4171,8 +4279,8 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de7d3f4ad51ac387e822495db363fcc1188d349793365731d054444c4cb06ee"
 dependencies = [
- "accesskit",
- "accesskit_macos",
+ "accesskit 0.24.1",
+ "accesskit_macos 0.26.3",
  "anyhow",
  "block2 0.6.2",
  "core-foundation 0.10.1",
@@ -4385,7 +4493,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "cosmic-text",
- "etagere",
+ "etagere 0.2.15",
  "gpui-pre",
  "gpui-pre-collections",
  "gpui-pre-util",
@@ -4410,11 +4518,11 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7201762420222d5b5ce5bdf0056996199212a3349bfb2457a3a0238c688681f3"
 dependencies = [
- "accesskit",
- "accesskit_windows",
+ "accesskit 0.24.1",
+ "accesskit_windows 0.34.0",
  "anyhow",
  "dunce",
- "etagere",
+ "etagere 0.2.15",
  "futures",
  "gpui-pre",
  "gpui-pre-collections",
@@ -4522,6 +4630,18 @@ dependencies = [
  "bytemuck",
  "core_maths",
  "read-fonts 0.37.0",
+ "smallvec",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "read-fonts 0.41.0",
  "smallvec",
 ]
 
@@ -5563,6 +5683,42 @@ dependencies = [
  "widget_gallery_ui",
  "widget_registry",
  "widget_tokio_runtime",
+]
+
+[[package]]
+name = "kytrix_gui"
+version = "0.0.3"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_macos 0.27.2",
+ "accesskit_unix 0.24.1",
+ "accesskit_windows 0.35.2",
+ "ash",
+ "bitflags 2.13.2",
+ "bytemuck",
+ "calloop",
+ "calloop-wayland-source",
+ "color",
+ "etagere 0.3.0",
+ "fontique",
+ "lyon",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "parley",
+ "skrifa 0.44.0",
+ "smol_str",
+ "swash",
+ "taffy",
+ "thiserror 2.0.21",
+ "wayland-client",
+ "wayland-protocols",
+ "windows 0.62.2",
+ "xkbcommon 0.9.0",
 ]
 
 [[package]]
@@ -6763,10 +6919,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "dispatch2",
+ "libc",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-io-surface",
+ "objc2-metal 0.3.2",
 ]
 
 [[package]]
@@ -6891,6 +7050,7 @@ dependencies = [
  "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
 
@@ -6914,9 +7074,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
 ]
@@ -7190,6 +7353,62 @@ dependencies = [
  "redox_syscall 0.9.5",
  "smallvec",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "parlance"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
+
+[[package]]
+name = "parley"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61bd0c0c1737f0b3d3726dc06b225083af213b61913e4fbae1670613a106c6ce"
+dependencies = [
+ "fontique",
+ "hashbrown 0.17.1",
+ "linebender_resource_handle",
+ "parlance",
+ "parley_engine",
+ "smallvec",
+]
+
+[[package]]
+name = "parley_data"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c43b63f808f6cc8f4a3b07de0d62a977bddd2e0bb5c232bd9e93ba8ef92e5e4b"
+dependencies = [
+ "icu_collections",
+ "icu_properties",
+]
+
+[[package]]
+name = "parley_emoji"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c4482d912d7671a7cd2089794f90ef3bb5f5f8c738230fb0fcd50fa020f0ed3"
+
+[[package]]
+name = "parley_engine"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74c0d373e462e504ad4436710a39f099e18e848e1ee711f70cd2dcd5a69b290"
+dependencies = [
+ "fontique",
+ "harfrust 0.12.0",
+ "hashbrown 0.17.1",
+ "icu_locale_core",
+ "icu_normalizer",
+ "icu_properties",
+ "icu_segmenter",
+ "linebender_resource_handle",
+ "parlance",
+ "parley_data",
+ "parley_emoji",
+ "skrifa 0.44.0",
 ]
 
 [[package]]
@@ -10059,6 +10278,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12008,6 +12238,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d66ca9352cbd4eecbbc40871d8a11b4ac8107cfc528a6e14d7c19c69d0e1ac9"
 dependencies = [
  "as-raw-xcb-connection",
+ "libc",
+ "memmap2",
+ "xkeysym",
+]
+
+[[package]]
+name = "xkbcommon"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
+dependencies = [
  "libc",
  "memmap2",
  "xkeysym",

@@ -4,6 +4,7 @@ members = [
     "crates/ai_provider",
     "crates/ai_translator",
     "crates/kytrix",
+    "crates/kytrix_gui",
     "crates/llama_sys",
     "crates/base_ui",
     "crates/i18n",
@@ -53,27 +54,43 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+accesskit = "0.25.2"
+accesskit_macos = "0.27.2"
+accesskit_unix = { version = "0.24.1", default-features = false, features = ["tokio"] }
+accesskit_windows = "0.35.2"
 ahash = { version = "0.8.12", features = ["serde"] }
 alloy-primitives = { version = "1.7.3", default-features = false }
 alloy-sol-types = { version = "1.7.3", default-features = false }
+ash = { version = "0.38.0", default-features = false, features = [
+    "std",
+    "loaded",
+    "debug",
+] }
 base64 = "0.23.1"
 bindgen = "0.73.2"
+bitflags = "2.13.2"
 boa_engine = "0.22.0"
 bs58 = "0.5.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 bytes = "1.12.1"
+calloop = "0.14.5"
+calloop-wayland-source = "0.4.1"
 cargo-packager-updater = "0.2.3"
 color = "0.3.3"
 comrak = { version = "0.59.0", default-features = false }
 const-hex = "1.19.3"
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
+criterion = "0.8.2"
 dicebear-core = "10.7.0"
 dicebear-styles = { version = "10.6.0", default-features = false }
 dirs = "7.0.0"
 ed25519-dalek = "3.0.0"
 either = "1.19.0"
 embed-resource = "3.0.12"
+etagere = "0.3.0"
 flate2 = "1.1.11"
+fontique = "0.12.0"
 futures = "0.3.34"
 gpui-kit = { version = "0.9.1", default-features = false }
 hmac = "0.13.0"
@@ -95,9 +112,94 @@ kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev 
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
+lyon = "1.0.19"
 nucleo = "0.5.0"
+objc2 = { version = "0.6.5", features = ["std"] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "std",
+    "alloc",
+    "NSAccessibility",
+    "NSAccessibilityConstants",
+    "NSAccessibilityElement",
+    "NSAccessibilityProtocols",
+    "NSApplication",
+    "NSColor",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSText",
+    "NSTextInputClient",
+    "NSTextInputContext",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["std", "alloc", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", features = [
+    "std",
+    "alloc",
+    "CGColor",
+    "CGColorSpace",
+    "CGContext",
+    "CGGeometry",
+] }
+objc2-foundation = { version = "0.3.2", features = [
+    "std",
+    "alloc",
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSError",
+    "NSNotification",
+    "NSObject",
+    "NSRange",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSURL",
+    "NSValue",
+] }
+objc2-metal = { version = "0.3.2", features = [
+    "std",
+    "alloc",
+    "MTLBlitCommandEncoder",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLDepthStencil",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLEvent",
+    "MTLLibrary",
+    "MTLPixelFormat",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPass",
+    "MTLRenderPipeline",
+    "MTLResource",
+    "MTLSampler",
+    "MTLTexture",
+    "MTLTypes",
+] }
+objc2-quartz-core = { version = "0.3.2", features = [
+    "std",
+    "alloc",
+    "CAMetalLayer",
+    "CATransaction",
+    "CALayer",
+] }
 p256 = "0.14.0"
 parking_lot = "0.13.0"
+parley = "0.12.0"
 percent-encoding = "2.3.2"
 pkcs8 = "0.11.0"
 prost = "0.14.5"
@@ -115,16 +217,34 @@ serde-saphyr = { version = "2.1.1", default-features = false, features = [
 serde_json = "1.0.154"
 sha1 = "0.11.0"
 sha2 = "0.11.1"
+skrifa = "0.44.0"
 smallvec = "1.16.5"
 smol_str = "0.3.7"
+swash = "0.2.10"
+taffy = { version = "=0.15.0", default-features = false, features = [
+    "std",
+    "flexbox",
+    "grid",
+    "block_layout",
+    "calc",
+    "content_size",
+] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = "0.3.55"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = "0.7.20"
 url = "2.5.8"
+usvg = { version = "0.49.0", default-features = false }
 uuid = "1.29.2"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = [
+    "client",
+    "staging",
+    "unstable",
+] }
 windows = "0.62.2"
+xkbcommon = { version = "0.9.0", default-features = false, features = ["wayland"] }
 yawc = { version = "0.5.0", default-features = false }
 zeroize = "1.9.1"
 
@@ -147,6 +267,7 @@ global_shipping_chokepoint = { path = "crates/widgets/global_shipping_chokepoint
 hyperliquid_wallet = { path = "crates/widgets/hyperliquid_wallet" }
 i18n = { path = "crates/i18n" }
 instrument_selector_ui = { path = "crates/instrument_selector_ui" }
+kytrix_gui = { path = "crates/kytrix_gui" }
 kytrix_service_provider = { path = "crates/kytrix_service_provider" }
 market_participants_connector = { path = "crates/market_participants_connector" }
 market_participants_model = { path = "crates/market_participants_model" }
