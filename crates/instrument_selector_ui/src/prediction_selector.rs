@@ -20,6 +20,7 @@ use base_ui::{
     badge::Badge,
     button::Button,
     empty_state::EmptyState,
+    icon::{Icon, IconKind},
     input::{Input, InputState, InputStateBuilder, InputStateEvent},
     interactive::InteractiveVariantExt,
     layer::LayerExt,
@@ -77,7 +78,7 @@ const BAR_WIDTH: f32 = 96.0;
 const DIALOG_WIDTH: f32 = 960.0;
 const DIALOG_HEIGHT: f32 = 680.0;
 /// How long text waiting for its translation takes to dim and brighten again.
-const TRANSLATION_PULSE: Duration = Duration::from_millis(600);
+const TRANSLATION_PULSE: Duration = Duration::from_millis(1200);
 /// How often the dialog looks for a chunk that finished on the blocking pool.
 const TRANSLATION_POLL: Duration = Duration::from_millis(10);
 /// The deadline one translation gets after its model finished loading.
@@ -530,44 +531,44 @@ impl<S: PredictionEventSource> PredictionEventSelector<S> {
 
     /// The translate button in the state the frame found it in.
     ///
+    /// The control is the translate icon alone, so its tooltip is what names it and its
+    /// accessible name repeats that tooltip: on a disabled button the tooltip is instead
+    /// the reason it cannot run.
+    ///
     /// A disabled button carries no click handler: `Button::disabled` only paints the
     /// state, so the handler is what would otherwise still start a translation.
     fn translate_button(affordance: TranslateAffordance, cx: &mut Context<Self>) -> AnyElement {
-        let label = match affordance {
+        let (tooltip, content) = match affordance {
             TranslateAffordance::Hidden => return div().into_any_element(),
-            TranslateAffordance::Busy => t!(cx, "prediction_selector.translating"),
-            TranslateAffordance::Disabled(_) | TranslateAffordance::Ready => {
-                t!(cx, "prediction_selector.translate")
-            }
+            TranslateAffordance::Busy => (
+                t!(cx, "prediction_selector.translating"),
+                div()
+                    .debug_selector(|| "PREDICTION_TRANSLATE_SPINNER".into())
+                    .size_4()
+                    .child(Spinner::new("PredictionTranslateSpinner"))
+                    .into_any_element(),
+            ),
+            TranslateAffordance::Disabled(key) => (
+                t!(cx, key),
+                Icon::new(IconKind::Translate).size_4().into_any_element(),
+            ),
+            TranslateAffordance::Ready => (
+                t!(cx, "prediction_selector.translate"),
+                Icon::new(IconKind::Translate).size_4().into_any_element(),
+            ),
         };
         let mut button = Button::new(ElementId::Name(SharedString::new_static(
             "PredictionTranslate",
         )))
-        .small()
+        .medium()
         .tonal()
         .flex_none()
-        .debug_selector(|| "PREDICTION_TRANSLATE".into());
-        button = match affordance {
-            TranslateAffordance::Busy => button.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .debug_selector(|| "PREDICTION_TRANSLATE_SPINNER".into())
-                            .size_3()
-                            .child(Spinner::new("PredictionTranslateSpinner")),
-                    )
-                    .child(label),
-            ),
-            _ => button.child(label),
-        };
+        .debug_selector(|| "PREDICTION_TRANSLATE".into())
+        .aria_label(tooltip.clone())
+        .with_tooltip(tooltip)
+        .child(content);
         match affordance {
-            TranslateAffordance::Disabled(key) => {
-                button = button.disabled(true).with_tooltip(t!(cx, key));
-            }
-            TranslateAffordance::Busy => {
+            TranslateAffordance::Disabled(_) | TranslateAffordance::Busy => {
                 button = button.disabled(true);
             }
             TranslateAffordance::Ready => {

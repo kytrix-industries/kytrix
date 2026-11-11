@@ -12,15 +12,18 @@ vulkan = ["llama_sys/vulkan"]
 metal = ["llama_sys/metal"]
 
 [dependencies]
-llama_sys.workspace = true
 log.workspace = true
 smol_str.workspace = true
 thiserror.workspace = true
 
-# Metal is the only usable GPU backend on macOS, so it is part of the platform
-# build rather than an opt-in Cargo feature.
 [target.'cfg(target_os = "macos")'.dependencies]
 llama_sys = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+llama_sys = { workspace = true, features = ["cuda"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+llama_sys = { workspace = true, features = ["vulkan"] }
 
 [lints]
 workspace = true
