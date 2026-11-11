@@ -419,3 +419,339 @@
 | 隔离 probe 包数 | 233 | **238** | `%TEMP%\kg-final-probe`（清单 = `phase-01-foundation.md` §5.2 并集，含 tokio/atspi/zbus/objc2 双版本），`cargo metadata` 的 `packages` 长度；差 5 个包源于 probe 范围不同，不改变「三平台一次解析通过」的结论。**已确认采用可复现的 238** |
 | 仓库内联测试模块 | 276 | **277** | `crates/**/*.rs` 正则 `#\[cfg\(test\)\]\s*\n\s*mod tests` 的严格匹配数；同范围 `mod tests` 字样为 282。**已确认采用 277**（保留严格口径注释） |
 | 仓库并行版本（N10） | — | 已核实 | `accesskit 0.24.1`（gpui-fast `^0.24`）+ `0.25.2`（引擎）；`skrifa 0.40.0`（现有生态）+ `0.44.0`；`harfrust 0.5.2`（`cosmic-text 0.19`）+ `0.12.0`；`objc2 0.5.3 + 0.6.5`。均为不同 semver 线的预期并存，不影响引擎自身依赖边 |
+
+---
+
+## 七、Phase 02 绘制基础层（2026-11-12）
+
+> 关联文档：`design/phase-02-paint-foundation.md`（本节 = 该文档 §20 的落地条目；裁决记录见该文档 §17）。
+> **项目级授权 A-01（单文件行数放宽）继续适用**；M-01…M-09、F-09/F-13/F-14/F-17、S-07 继续有效，本节不重复。
+> 本节只**追加**，不改写任何历史条目（一～六 未改动）。
+>
+> **评审修订说明（2026-11-12，实现开始前）**：§七 经设计裁决 ①—⑤ 校准，修订点逐条标注「(裁决 ①)」等：
+> - **F-25** 撤销「damage 前移到 `paint/`」的草案：damage 位置仍按 P01 §4.1 留在 `render/damage.rs`，只把落地 Phase 改为 **P06**；
+> - **S-08** 的落地清单改为 `render/atlas.rs`→**P05**、`render/damage.rs`→**P06**、`paint/instance.rs`→**P07**；
+> - **S-10** 改为「`Scene` 只读 + `Canvas` 是唯一公开写入口」；
+> - 新增 **F-33**（`Canvas` = lane 片段模型）、**S-14**（边框+渐变拆两个 `Quad`）、**S-15**（`Scene`/`Canvas`/`Lane` 所有权契约）。
+>
+> **第二轮审查（FAIL）追加（2026-11-12）**：B1/B2/B3/N11 把 `Scene` 整体推迟 P03、`MAX_CLIP_DEPTH` 改为 `u8`；
+> N6 让 `Canvas` 的 clip API 返回 `bool`、N7 记公开白名单闭包、N2/N3/N4/N5/N13 记数值与 damage 契约、
+> B4 记文档完整性复核方法与事故。**新增 S-16…S-19**，并在 S-08/S-09/S-10/S-15、F-24 内追加「第二轮」说明。
+>
+> 事实基线：`color 0.3.3` / `etagere 0.3.0` / `bytemuck 1.25.2` 的真实源码 + `%TEMP%\kg-{pod-probe,pod-probe2,dead-probe,dead-probe2,size-probe}` probe，详见 phase-02 文档 §2。
+
+### F-23 `GpuPrimitive` 必须 `#[repr(C, align(16))]`（主设计的 `#[repr(C)]` + `align_of == 16` 不成立）
+
+| 项 | 内容 |
+|----|------|
+| 设计原文 | §2.3 / 附录 B：`#[repr(C)]` + `#[derive(bytemuck::Pod, …)]` 的 `GpuPrimitive`，静态断言 "size_of == 128、align_of = 16" |
+| 偏差 | 结构体必须是 **`#[repr(C, align(16))]`**。仅 `#[repr(C)]` 时 `size_of == 128` 成立但 **`align_of == 4`**，附录 B 声明的 `align_of = 16` 与 P01 §7.2 要求的静态断言**无法同时成立**（断言会直接编译失败） |
+| 原因 | 8 个 `[f32; 4]` 字段的自然对齐是 4；Rust 不会因为「总大小是 16 的倍数」就提升对齐。实测（`%TEMP%\kg-pod-probe`）：`error[E0080]: evaluation panicked: assertion failed: align_of::<GpuPrimitive>() == 16`。补 `align(16)` 后（`%TEMP%\kg-pod-probe2`）`size_of == 128`、`align_of == 16`、8 个 `offset_of!` 全成立、`bytemuck::Pod` derive 通过、`cargo +nightly clippy --all-targets -- -D warnings` **退出 0** |
+| 修订后设计 | `paint/instance.rs`（**P07 落地**，裁决 ④）用 `#[repr(C, align(16))]`；静态断言 = size 128 + align 16 + 8 个 offset。**P10 的 `render/shaders/contract.md` 必须写「结构体 16 B 对齐」**；**三平台实例缓冲的基址也必须 16 B 对齐**（分配器/偏移计算显式保证；D3D12 常量缓冲的 256 B 要求由分段上传向上取整满足）→ phase-02 §16 R7 |
+
+### F-24 `AtlasTile` / `AtlasKind` 归属 `paint/atlas.rs`（不在 `resources.rs`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §4.5 公开路径表：`AtlasTile` → `kytrix_gui::resources::*`、`AtlasKind` → `kytrix_gui::resources::AtlasKind`，定义文件 `src/resources.rs`（P15） |
+| 偏差 | 两者定义在 **`src/paint/atlas.rs`**，公开路径 **`kytrix_gui::paint::atlas::{AtlasKind, AtlasTile}`**；`resources.rs`（P15）只保留 `ResourceId` / `ResourceCache`。**P01 §4.5 正文不改**，以本条为路径表的修订记录 |
+| 原因 | ①`AtlasTile` 是 `Primitive::GlyphRun`/`Image` 的**字段类型**，属 I2 的共享数据契约，必须在 `paint`；②放 `resources` 会让 `paint → resources`（P15 高层模块）反向依赖，且 P15 之前（P02/P06/P07）就要用到；③图集**分配器**仍按 brief 留在 crate 私有的 `render/atlas.rs`（P05），公开的只有只读数据 |
+| 修订后设计 | phase-02 文档 §4.1/§4.2 的路径表；P15 的 `resources.rs` 不再定义这两个类型，`ResourceCache` 直接复用 `paint::atlas::AtlasTile`。**P01 `design/phase-01-foundation.md` §4.5 的 `AtlasTile` 行已按 N8 加注记**（只加注记，不改历史正文） |
+
+### F-25 damage 仍在 `render/damage.rs`，落地 Phase 改为 **P06**（裁决 ①）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §2.3 共享数据契约把 `DamageRect` 与图集/几何并列；P01 §4.1 把 `damage` 归 `src/render/damage.rs`（P09） |
+| 偏差 | **位置不变**（`src/render/damage.rs`，crate 私有）；**落地 Phase 由 P09 改为 P06**（首个消费者 = paint 之后的 damage 步骤）。此前草案「前移到 `paint/damage.rs`」**撤销** |
+| 原因 | ①`render` 整体私有（I9），`pub(crate)` item 需要**非 test 消费者**（`-D warnings` 与 `dead_code`，phase-02 §2.4c）；P06 的帧组装正是该消费者，因此不必移动位置；②damage 是纯 CPU 算法，与 GPU 无关，位置在 `render/` 不影响可测性（同模块单测）；③矩形类型复用 `math::PhysicalRect`（F-09 不变） |
+| 修订后设计 | phase-02 文档 §12（算法逐字、阈值常量、14 个用例）；P09 的渲染后端只做「`DamageOutput` → 三平台 API 参数」的**平台翻译**（`Present1` dirty rects / `VK_KHR_incremental_present` / scroll hint），不重算区域 |
+
+### F-26 `Primitive::Path` 删除 `triangles` / `coverage_pass`（v1 路径无 AA，裁决 ③）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 附录 C：`Path{ triangles, coverage_pass, fill, clip_chain }`；§5.1「CPU 三角化后的三角形 / 两阶段 coverage 标记」 |
+| 偏差 | 改为 `Path{ bounds: Rect, geometry: GeometryId, fill: Color }`：三角形走**已注册的静态几何**（§5.5 的收益项），`coverage_pass` **删除**，`clip_chain` 删除（clip 改为栈指令）。**v1 的路径是硬边三角形，不做 AA** |
+| 原因 | ①三角形进每帧 `Primitive` 会让每次 lane 重建都拷一份顶点，直接抵消 §5.5「顶点零上传」；②两阶段 coverage 是渲染器的 pass 结构（同一份三角形成对出现），放进每帧数据会让 1 个逻辑绘制变成 2 个 `Primitive`、破坏 `REUSABLE` 整桶复用、污染 §3.8 oracle 的 `PartialEq` 比较；③小尺寸矢量（54 个图标）在**构建期**转成图集（§5.6），不受影响 |
+| 修订后设计 | phase-02 文档 §6.3.4；`Path` 的几何必须是 `GeometryPipeline::Ui` + 恒等变换；AA 由后续**两阶段 coverage**（`kind = 4` 已在 contract 预留）或 MSAA 承担，**不进 v1**；**像素 golden 覆盖矩阵必须显式标注「路径硬边」**（phase-02 §14.10） |
+
+### F-27 `Primitive::Geometry` 删除 `pipeline` / `damage` 字段
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 附录 C：`Geometry{ geometry_id, transform, pipeline, damage }` |
+| 偏差 | 改为 `GeometryDraw{ id: GeometryId, transform: Transform }`（独立类型名，避免与 `paint::geometry::Geometry` 混淆） |
+| 原因 | ①`pipeline` 属 `GeometryDesc`（注册期不可变），每帧图元再存一份 = 两个真值来源（I2）；②`damage` 是**计算结果**（变换前后 AABB ∪ 物理像素外扩），不是存储字段；存进去会让「同一几何被两个节点引用」时无法归属，也会让复用的 lane 持有过期 damage |
+| 修订后设计 | phase-02 文档 §6.3.7 / §9.6；damage 由 P06/P07 在累加时按 `desc.bounds` + `transform` 计算 |
+
+### F-28 `color 0.3.3` 没有 `map_chroma`（§5.8.1 事实更正）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.8.1：「它提供 `ColorSpaceTag::{Oklch, …}`、`DynamicColor::convert/interpolate`、`map_lightness/map_hue/map_chroma`、CSS Color 4 的 `none` 缺失分量与 premultiplied 插值」 |
+| 偏差 | **不存在 `map_chroma`**。`DynamicColor` 只有 `scale_chroma(scale)`（`dynamic.rs:264`）、`map_lightness`（:530）、`map_hue`（:550）；`map_chroma` 在 `color-0.3.3` 全 crate 无此符号。另：`DynamicColor { cs, flags, components }` 三个字段均 `pub` 且类型**无 `#[non_exhaustive]`**（`dynamic.rs:34-50`），可直接构造，不需要 parse 路径 |
+| 原因 | 0.3.x 的 chroma 操作统一为「按比例缩放」（`ColorSpace::scale_chroma`，`tag.rs:346`），没有绝对映射 |
+| 修订后设计 | 自建 gamut mapping 的 chroma 二分**直接构造** `DynamicColor { cs: ColorSpaceTag::Oklch, flags: Flags::default(), components: [L, mid, h, alpha] }`，再 `.convert(ColorSpaceTag::LinearSrgb)`。等价写法 `scale_chroma(mid / C)` 需 `C == 0` 特判且有除法误差，不采用。phase-02 §5.4 的伪代码与 §14.1 的测试按直接构造实现 |
+
+### F-29 `Canvas` v1 **不**注册应用自有 pipeline（§5.9 的延后）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.9：「应用注册自有 pipeline（顶点布局 / uniform / shader 句柄），在 paint 阶段向 `Scene` 追加 `Primitive::Canvas(CustomDraw { pipeline, buffers, uniform, damage })`」 |
+| 偏差 | v1 的 `Canvas` **只记录引擎图元**（`Quad`/`GlyphRun`/`Image`/`Path`/`Shadow`/`Geometry`/`Clip`），不注册 pipeline、不接受 GPU 句柄、不允许任意命令插入 |
+| 原因 | ①D2 明确不内化外部 shader 工具链（P10 的 build.rs 只编译引擎三套 shader）；②§5.9 自身禁止「任意 GPU 命令插入」（破坏 I4 与 damage 正确性），而「不能插入命令的自定义 pipeline」语义上等价于用引擎图元拼装；③自定义 pipeline 需要三平台 PSO 创建/资源绑定/延迟销毁，是独立工程量，且必须以 P11/P16/P17 全完成为前提 |
+| 修订后设计 | phase-02 文档 §11（含 `Canvas` 的 lane 片段模型，见 F-33）；扩展路径（additive）：`Canvas::push_custom(CustomDraw)` + `GeometryPipeline::Custom { pso }` + `App::register_pipeline` + `kind` 保留值 6/7 |
+
+### F-30 `GeometryId` 是 `Copy` 句柄，释放必须显式
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.5 表格：「`drop(GeometryId)` → retire 队列延迟释放」 |
+| 偏差 | `GeometryId` 是 `Copy`（无 `Drop`），释放改为显式 `App::release_geometry(id)`；节点侧由 P08 的 `NodeKind::Geometry` 卸载自动 release |
+| 原因 | `Primitive::Geometry`/`Path` 每帧都要携带 id；`Drop` 句柄要么每帧 clone（引用计数）、要么让 `Primitive` 不能 `Copy`，两者都抬高 lane 复用成本 |
+| 修订后设计 | phase-02 文档 §9.1；失败模式（忘记释放 = VBO 泄漏到进程结束）写进 §16 R9，P18 用内存快照/`GpuTimer` 发现 |
+
+### F-31 `GeometryPipeline` 不含 `Path` 变体
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.5「`GeometryPipeline`：应用注册或引擎内置」；§5.1 把 `Path` 的目标管线写成 "geometry pipeline"，隐含一个独立的 Path 管线 |
+| 偏差 | v1 只有 `Ui`（stride 8）与 `Textured { atlas }`（stride 16）两个变体；`Primitive::Path` 用 `Ui` + 恒等变换 |
+| 原因 | `Path` 与 `Ui` 的顶点布局、着色方式、管线状态完全相同，唯一差别是「谁拥有几何、变换是否恒等」——那是 `Primitive` 的语义，不是 GPU 管线的语义。再造一个变体会让 P09 维护两条一模一样的管线（三平台 × 2 = 6 份） |
+| 修订后设计 | phase-02 文档 §9.4/§9.7；`Ui` 的颜色走 per-draw 常量（`GeometryColor`，16 B），顶点不带颜色 |
+
+### F-32 渐变 v1 只支持双色 + linear premultiplied 插值（OKLab 渐变与 LUT 延后）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.8.2：「渐变必须在 OKLab 空间插值……在 CPU 生成梯度 LUT，仍不进片元」；§5.4 `gradient_eval(kind, t, color0, color1)` |
+| 偏差 | v1 的渐变在 **shader 内、linear premultiplied 空间**插值（`color0`→`color1`），只用 `params0.z` 区分 horizontal/vertical/radial；**不生成 LUT**，不支持 ≥3 色标，不支持带角度的线性渐变 |
+| 原因 | ①`GpuPrimitive` 冻结在 128 B，只有两个颜色槽；LUT 需要「渐变纹理」= 新 `AtlasKind` + 新 `kind` 值 + `texture_index` 语义扩展，属**契约变更**（I2/I8 要求三平台 shader 同步）；②shader 内做 OKLCH→linear 的每片元转换（cbrt + sin_cos）代价明显；③`ColorResolver::interpolate` 保留为 **CPU 侧**求值（P13 动画、P03 hover 过渡、主题混合），两套语义在 `contract.md` 分别标注，禁止互相替代 |
+| 修订后设计 | phase-02 文档 §5.5/§5.6/§16 R3；触发条件：设计稿出现 ≥3 色标，或深色主题下双色线性渐变肉眼可见发灰 → 引入 `AtlasKind::Lut` + `kind` 变体（additive） |
+
+### F-33 `Canvas` 改为「lane 片段」模型，删除 `CanvasOp`（裁决 ②）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §5.9 的 `Primitive::Canvas(CustomDraw{…})`；phase-02 v1 草案的 `Canvas{ bounds, ops: Vec<CanvasOp> }` + `CanvasOp` 枚举 |
+| 偏差 | `Canvas{ bounds: Rect, lane: scene::Lane }` + **公开 `push_*`**（`push_quad`/`push_text`/`push_image`/`push_path`/`push_shadow`/`push_geometry`/`push_clip`/`pop_clip`）+ 只读 `bounds()/primitives()/is_empty()`；**`CanvasOp` 删除** |
+| 原因 | ①裁决 ②：`Canvas` 是应用层**唯一公开写入口**，`Scene` 只读；②`CanvasOp` 是 `Primitive` 的**第二份图元表示**（I2 违反），删掉后全链路只有 `Primitive` 一份；③`Canvas` 持有 `Lane` 后，`Lane::new/push/clip_depth` 在 P02 就有**非 test 消费者**（解决 `dead_code`，见 S-08） |
+| 修订后设计 | phase-02 文档 §11（API/所有权/不变量/扩展路径）、§7.1（`Lane` 的 `pub(crate)` 写入面）、§7.2（可见性契约）；递归类型（`Primitive::Canvas` → `Canvas` → `Lane` → `Vec<Primitive>`）由 `Vec` 提供间接，编码器 `assert!(canvas_depth == 0)` 禁止嵌套 |
+
+### S-08 P02 的落地策略：只落「可达且 §1.3 白名单内」的数据契约（裁决 ①）
+
+- **决策**：P02 落地 **7 个文件** —— `paint.rs`、`paint/{color,primitive,scene,geometry,canvas,atlas}.rs`；`lib.rs` 追加
+  `pub mod paint;`；`crates/kytrix_gui/Cargo.toml` 追加 `bytes`。**推迟**：`paint/instance.rs`→**P07**、
+  `render/damage.rs`→**P06**、`render/atlas.rs`+`render.rs`→**P05**。三处的**规格**在 phase-02 文档里一次冻结
+  （字段/签名/算法/常量），实现 Phase 只做「把规格变代码 + 接上消费者」，不得改语义。
+- **依据**：`cargo +nightly clippy --all-targets -- -D warnings` 下，任何无同相非测试消费者的 `pub(crate)` item（甚至私有模块
+  里的 `pub`）都会被 `dead_code` 判死（`%TEMP%\kg-dead-probe` / `kg-dead-probe2` 实测原文见 phase-02 §2.4c）；而 §1.3 的
+  公开面是一张封闭表，`GpuPrimitive`/`InstanceBuffer`/`DamageAccumulator`/`AtlasAllocator` 都不在其中，不能靠「提升为 `pub`」
+  规避；AGENTS §4 又禁止 `#[allow(dead_code)]`。三者夹击下唯一可行解是**按消费者排序落地**。
+- **硬规则**：P02 **不得**创建 `src/render.rs`、`src/render/`、`src/paint/instance.rs`、`src/paint/damage.rs`；
+  每个 `pub(crate)` item 必须有非 test 消费者（P02 是 **5 个方法 + 1 个常量**：`Lane::{new, push, clip_depth, primitives, is_empty}` 与 `MAX_CLIP_DEPTH`，消费者 = `Canvas`）。
+- **代价**：P05/P06/P07 需要多一步「实现已冻结的规格」。
+- **第二轮修订（B1/B2/B3/N11）**：`Scene` / `LaneId` / lane 分配 / 绘制序**整体推迟 P03**；P02 的 `paint/scene.rs` 只剩
+  **`pub(crate)` 的 `Lane` 与 `MAX_CLIP_DEPTH`**（`pub(crate) mod scene;`）。`Lane::push` 内部用
+  `usize::from(self.clip_depth()) < usize::from(MAX_CLIP_DEPTH)` 断言，保证 `clip_depth()`/`MAX_CLIP_DEPTH` 有非 test 消费者。
+
+### S-09 `MAX_CLIP_DEPTH = 8`，超限 `assert!`（不新增 `EngineError` 变体）
+
+- **决策**：`paint::scene::MAX_CLIP_DEPTH = 8`；**C2/C3 由 `Lane::push` 在 P02 即强制**（`Pop` 不得弹穿 0、深度不得超限），
+  **C1（lane 末尾平衡）由 P03 的 `end_lane` 断言**。超限用 `assert!`，不返回 `Result`。
+- **理由**：paint 是纯 CPU 数据层，clip 嵌套由引擎自己的布局/样式生成，应用层无法直接压栈；>8 层是编程错误，不是运行时状态。
+  新增一个应用层永远无法处理的错误变体（还要进 F-15 的 17 变体冻结表）属预防性抽象。
+- **一致性要求**：P02 `Lane::push` / P07 编码器 / P10 三套 shader 的固定数组长度必须同为 8；改这个常量必须三处同步。
+- **第二轮修订（B3 + N6）**：类型固定为 **`u8`**（`pub(crate) const MAX_CLIP_DEPTH: u8 = 8`）；断言写成
+  `usize::from(...) < usize::from(...)`；**应用层路径不 panic**——`Canvas::push_clip`/`pop_clip` 返回 `bool`
+  （超深/空栈返回 `false` 且不写入），`Lane::push` 的 `debug_assert` 只抓「引擎内部绕过 Canvas」的误用；
+  C1（lane 末尾平衡）由 P06 的展平阶段断言。
+
+### S-10 `Scene` 只读 + `Canvas` 唯一公开写入口（裁决 ②）
+
+- **决策**：`Scene` 的公开面**全部只读**（`new`/`Default`/`lane`/`lane_count`/`order`/`iter`/`primitive_count`/`is_empty`）；
+  写入面（`new_lane`/`release_lane`/`lane_mut`/`clear_frame`/`set_order`）为 `pub(crate)` 且**P02 不落地**（无消费者 → P03）。
+  应用层的写入口是 **`Canvas`**（8 个 `push_*`/`pop_clip`），它内部持有 `scene::Lane`。
+- **理由**：§1.3 明确「`Scene`（只读句柄）」；`Scene` 的公开可变方法会给出「应用可构造 Scene 但无法提交」的死 API；
+  而把 `Scene` 改成 `pub` 可变只是为了 P02 测试方便，属于用公开面换测试便利，不可接受（裁决 ② 明确否决）。
+- **备选（已否决）**：`Scene` 的写入面 `pub`。
+- **第二轮修订（B1/B2/N11）**：`Scene` 在 P02 **完全不存在**（连只读面也没有），整体推迟 P03；P02 的写入口只有 `Canvas`。
+
+### S-11 图集 v1：单页 + `R8`/`BGRA8 sRGB` + 1 纹素 padding + 无 CPU 像素副本
+
+- **决策**：每个 `AtlasKind` **单页**（Glyph `2048²` R8 = 4 MiB，Image `2048²` BGRA8 = 16 MiB）；内容区四周 1 纹素清 0 padding
+  且**不计入 UV**；UV 用「边」而非纹素中心，并**按请求的内容尺寸**计算（`etagere` 返回的 `rectangle` 可能被 alignment /
+  shelf 分档放大，不能直接拿它算 UV）；`generation` 只在 `clear()`（DPI 变化 / 字形换代 / 容量逃逸）时 +1；
+  容量失败路径 = `clear + retry` → 仍失败则 `EngineError::AtlasExhausted { kind }`（P05 随分配器追加该变体）；
+  图集**不持有** CPU 像素副本（源像素在 P06/P15 的缓存里）。
+- **理由**：`etagere 0.3.0` 的结构限制（`allocator.rs:189` 拒绝 `> u16::MAX`；:99-100 单列 `shelf_width = page_width`；
+  `deallocate` 对非法 id `panic`，:398-399）；单页让 `AtlasTile` 不需要 `page` 字段（契约最小）；
+  「整体清空 + 代际失效」是 §9.3 明示的重排路径，比 LRU/扩容更简单且语义闭合。
+- **延后**：LRU 逐出、多页、页扩容（2× 翻倍）。触发条件见 phase-02 §16 R5。
+
+### S-12 `Color` 的 v1 范围与「两套插值语义」的显式分离
+
+- **决策**：`Color` 5 变体（`Srgb`/`LinearSrgb`/`DisplayP3`/`Oklab`/`Oklch`）+ 独立 alpha；**不提供** `from_hex`、CSS 字符串解析、
+  `none` 缺失分量、powerless hue、`Hwb/Hsl/Lab/Lch/Rec2020/AcesCg` 变体；预乘只发生在 `ColorResolver::resolve` 的出口。
+  `ColorResolver::interpolate`（CPU 侧，OKLab/OKLCH/linear）与 **shader 的双色渐变**（linear premultiplied，F-32）
+  是两套语义，`contract.md` 必须分别写明，禁止互相替代。
+- **理由**：无 CSS 字符串解析 → 无缺失分量/powerless hue 的状态机；`from_hex` 无 P02 消费方（应用层可直接用 `color::parse_color`）。
+- **延后**：`from_hex`、宽色域变体、HDR/PQ/ICC（§5.8.3 已定 HDR 不进 v1 默认路径）。
+
+### S-13 damage 阈值（16 / 0.5）是常量而非配置层
+
+- **决策**：`MAX_DAMAGE_RECTS = 16`、`FULL_FRAME_AREA_RATIO = 0.5` 都是模块内 `pub(crate) const`；不引入 `DamageConfig` / 环境变量 / 特性开关。
+- **理由**：AGENTS §1.2 禁止「当前没有实际需求的配置层」；两个数字的依据分别是三平台 dirty rect 列表长度上限（16 是安全值）
+  与「超过半屏时全帧更便宜」的经验值。P18 基准若给出更好的数值，改常量 + 更新文档即可（V-13）。
+
+### S-14 边框 + 渐变 = 两个 `Quad`（顺序 / 混合 / 责任，裁决 ⑤）
+
+- **决策**：`QuadPaint` 保持三选一（`Solid{fill,border}` / `Gradient`），**不新增**「渐变 + 边框」的复合变体。需要两者时由
+  P03 的 style → paint 产出**两个 `Quad`**：①`Gradient` 填充（无 border）；②同 bounds 的 `Solid{ fill: TRANSPARENT, border: Some(b) }`。
+- **绘制顺序**：先填充/渐变、后边框（顺序即绘制序，引擎不重排）。
+- **混合语义**：边框像素 = `border over fill`，填充内缘只被覆盖一次；边框不透明时直接覆盖（CSS 内联边框的视觉）。
+  两者都半透明时边框区域经历**两次 premultiplied over**——这是与 CSS「半透明 border 叠在 background 上」一致的**已接受行为**。
+- **应用层责任**：需要「边框内缘挖空」观感时，`base_ui` 必须让边框不透明，或给 `fill` 用**与背景预乘合成后的不透明色**；
+  引擎不提供 stencil/两 pass 的挖空（那会破坏 v1 的单实例模型）。
+- **damage 影响**：两个 quad 的 `bounds` 相同 ⇒ 累加器的「并集面积 ≤ 两者之和」判据把它们合并成 1 个 rect，不放大 damage。
+- **实例数**：每节点最多 +1 实例；比扩 128 B 契约（三套 shader + contract + damage 同步）便宜得多。
+
+### S-15 `Scene` / `Canvas` / `Lane` 的所有权与 API 契约（裁决 ②）
+
+- **决策**：
+  - `Canvas` 是**应用层唯一公开写入口**；它是**值**（应用构造 → 交给引擎 → 引擎包成 `Primitive::Canvas` 塞进 lane），
+    内部持有 `scene::Lane`；`bounds` 契约 = ⊇ 内部图元并集（damage/命中只用它）。
+  - `Scene` 只读（S-10）；引擎侧的 lane 分配/绘制序在 P03。
+  - `Lane` 的写入面 `pub(crate)`，**消费者 = `Canvas`**（P02 的 `dead_code` 约束因此满足）；`Lane` 的 `clip_depth`
+    由 `Lane::push` 增量维护并强制 C2/C3。
+- **理由**：让 `Canvas` 直接持有 `Scene` 会让每个自绘节点拖一张 lane 表 + 绘制序（无边界浪费），也无法表达「canvas 属于哪个节点」；
+  一个 lane 是两者的最小交集。同时它把「图元序列只有一份表示」（I2）与「应用层不能写 Scene」（§1.3）同时满足。
+- **第二轮修订（N6/N7/N1）**：`Lane` 是 **`pub(crate)`**（应用层只见 `&[Primitive]`）；`Canvas` 尺寸 48 B（Rect 16 + Lane 32）；
+  `push_clip`/`pop_clip` 返回 `bool`、文档写 `# Panics: none`。
+- **不变量**：`Canvas` 不得嵌套（无接受 `Canvas` 的 push 方法；编码器 `assert!(canvas_depth == 0)`）；`Canvas::push_text`
+  只接受引擎产出的 `GlyphRun`（应用层无法构造，需文本请用 `NodeBuilder::text()`）。
+
+### Phase 02 追加的待复核项
+
+| # | 项 | 复核 Phase | 触发条件 |
+|---|----|-----------|----------|
+| V-11 | `GpuPrimitive` 的 16 B 对齐与三平台常量/结构化缓冲要求的组合（D3D12 需 256 B 基址对齐、Metal `setVertexBytes` 上限、Vulkan `minStorageBufferOffsetAlignment`） | P09/P10 | 首次上传实例缓冲；若某平台的基址对齐与「只写 dirty 区间」冲突，改为 256 B 对齐的分段上传（不改 128 B 契约） |
+| V-12 | `Path` 无 AA 在大面积矢量填充上的视觉可接受性（裁决 ③） | P18 | 像素快照出现明显锯齿且该图形未走构建期图集 → 启用两阶段 coverage（`kind = 4`）；契约不变 |
+| V-13 | damage 阈值 16 / 0.5 与三平台实际收益 | P18 | L4 基准显示局部重绘收益低于全帧 |
+| V-14 | 图集单页容量（Glyph 2048² / Image 2048²）与真实资源 | P15/P18 | 出现 >2048 的预览图或字形集溢出 → 加 `page` 字段或扩容（契约变更，需三平台同步） |
+| V-15 | 每帧 `resolve` 颜色的 CPU 成本 | P18 | >0.5 ms/帧 → lane 内缓存 `LinearPremulRgba`（additive） |
+| V-16 | `render/damage.rs`（P06）与 `render/atlas.rs`（P05）的落地顺序是否与文本/图集的实际先后一致 | P05/P06 | 若总计划调整相位：文件跟**消费者**走（phase-02 §3.2 末段），并同步更新 phase-02 §19 |
+
+### S-16 §1.3 公开白名单按**传递闭包**扩充（N7）
+
+- **决策**：§1.3 的白名单按类型名列出；`paint` 的契约会通过字段/参数**传递**带出下表类型，因此把它们显式登记为
+  §1.3 的传递扩充（不新增能力）。`Lane` 与 `MAX_CLIP_DEPTH` 保持 `pub(crate)`，**不进**公开面。
+- **登记清单**（详见 phase-02 §4.4）：
+
+  | 传递新增的公开类型 | 由谁带出 | 消费 Phase |
+  |---|---|---|
+  | `Quad` `QuadPaint` `Border` `Gradient` `GradientKind` | `Primitive::Quad` | P03/P07/P06 |
+  | `GlyphRun` `PositionedGlyph` | `Primitive::GlyphRun` | P06/P07 |
+  | `Image` `Path` `Shadow` `ClipOp` `ClipRect` `GeometryDraw` | `Primitive` 其它变体 | P03/P07/P08 |
+  | `AtlasKind` `AtlasTile` | `GlyphRun`/`Image` 的字段 | P06/P15/P07 |
+  | `LinearPremulRgba` `Interpolation` `HueDirection` | `ColorResolver` 的签名 | P02/P03/P06/P08 |
+  | `IndexType` `Topology` `GeometryPipeline` | `GeometryDesc` 的字段 | P08/P09 |
+
+- **理由**：不登记会让「§1.3 封闭表」与「实际公开面」出现无法审计的偏差；登记后 `cargo doc` 的公开项可以与表逐条对齐。
+- **不做**：不把 `GpuPrimitive`/`InstanceBuffer`（P07）、`DamageAccumulator` 系列（P06）、`AtlasAllocator` 系列（P05）加入公开面。
+
+### S-17 文档完整性复核方法（B4）与本轮损坏事故记录
+
+- **事故**：phase-02 文档在编辑过程中被一次 PowerShell 替换误伤——`@(@('a','b'))` 会被 PowerShell 展平成 2 个字符串，
+  于是 `$pair[0]`/`$pair[1]` 变成「首字符/次字符」，一次 `Replace` 把全文的 `|` 换成了空格（DEVIATIONS 的 `>` 也被同类操作
+  短暂换掉）。结果是表格结构、`||`/`&&` 运算符出现缺失。**已全部修复**（DEVIATIONS 从 git 恢复后重写 §七；phase-02 逐处
+  恢复并用命令复核）。
+- **复核方法（写进 phase-02 §15-12，每次改文档后跑）**：
+  1. 表格管道符总数 `([regex]::Matches($doc, '\|')).Count`（当前基线见 §15-12a；显著下降即被破坏）；
+  2. 三个必须成对出现的运算符字面量各命中 1 次：`kind != QUAD || border_width == 0.0 || color1.is_opaque()`、
+     `content.0 == 0 || content.1 == 0`、`usize::from(self.clip_depth()) < usize::from(MAX_CLIP_DEPTH)`；
+  3. 双空格伪算子扫描（代码围栏内不应出现「标识符 + 2 空格 + 标识符」，对齐用的注释列人工确认）。
+- **工具纪律**：文档批量替换**只用**单个 `$old`/`$new` 变量或 `$c.Substring` 拼接；**禁止** `$pairs = @( @(a,b) )`
+  这种单元素嵌套数组；每次写盘后立刻复跑上面的复核命令。
+
+### S-18 `Canvas` 的 clip API 返回 `bool`、不 panic（N6）+ `Lane`/`MAX_CLIP_DEPTH` 的类型与断言（B3）
+
+- **决策**：`Canvas::push_clip(&mut self, clip: ClipRect) -> bool`、`Canvas::pop_clip(&mut self) -> bool`；
+  超深 / 空栈返回 `false` 且**不写入**任何图元；所有 `Canvas` 公开方法文档写 `# Panics: none`。
+- **`Lane`**：`pub(crate) struct Lane { primitives: Vec<Primitive>, clip_depth: u8 }`；`push` 内部
+  `debug_assert!(usize::from(self.clip_depth()) > 0)`（Pop）与 `debug_assert!(usize::from(self.clip_depth()) < usize::from(MAX_CLIP_DEPTH))`（Push），
+  并用 `saturating_add/sub` 防止 release 下回绕。
+- **`MAX_CLIP_DEPTH`**：`pub(crate) const MAX_CLIP_DEPTH: u8 = 8`（B3：类型就是契约的一部分）。
+- **理由**：应用层经 `Canvas` 表达 clip，越界是**可恢复的调用错误**，不应 panic（N6）；而引擎内部若绕过 `Canvas`
+  直接 `Lane::push` 属编程错误，用 debug 断言抓。C1（lane 末尾平衡）由 P06 的展平阶段断言。
+
+### S-19 数值与 damage 语义契约（N2 / N3 / N4 / N5 / N13）
+
+- **N2 整数取回**：`params1` 的四个分量是「整数编码进 f32」；三套 shader 一律用**数值转换**（HLSL/MSL `(int)x`、GLSL `int(x)`），
+  **禁止**位重解释（`as_type`/`asfloat`/`floatBitsToInt`）。`contract.md` 必须逐字写明。
+- **N4 数值健壮性**：`resolve`/`interpolate` 的**每个**分量先 `NaN → 0` 再 clamp 到定义域
+  （`clamp_01` / `clamp_nonneg`，`h` 先 `rem_euclid(360)`），输出严格在 `[0,1]`（alpha 单独处理）。
+- **N5 可复现性**：同平台**逐位**可复现；跨平台允许 ULP 级差异（`sin_cos`/`cbrt` 的 libm 实现不同），像素 golden 按 **8 位**比较。
+- **N3 scroll 放弃规则**：仅当**所有** dirty rect 都落在 `scroll.rect` 内才保留 scroll hint；否则放弃 scroll、保留全部 rects
+  （宁多画不漏画），不丢弃任何脏区。
+- **N13 Clip 与 damage**：`Clip` **本身不产生像素**，不 push damage；mask 边界只作用于被裁剪图元（其 damage 由被裁剪图元
+  自己的 bounds + `clip` 求交得到）。
+
+### S-20 `GeometryId` 的可见性：私有字段 + 公开 getter + 仅测试构造器
+
+- **文档原文（phase-02 §9.1/§18.2）**：`GeometryId { index: u32, generation: u32 }` 字段私有，「只能由 `GeometryStore` 铸出」。
+- **代码审查要求**：字段改 `pub(crate)` + 公开 `index()`/`generation()`。
+- **不可行**：workspace lint `field_scoped_visibility_modifiers = "forbid"` 明确拒绝 `pub struct` 里的 `pub(crate)` 字段
+  （实测 `%TEMP%\kg-field-vis`：`error: scoped visibility modifier on a field`）。
+- **实际落地**：字段**保持私有**；新增公开 `index()` / `generation()`；测试用 `#[cfg(test)] pub(crate) const fn for_test(index, generation)`
+  构造。`for_test` 只存在于 test 构建，因此**不触发 `dead_code`**，也不扩大公开面。
+- **为什么不选「`pub` 字段 + 文档说明」**：那会让应用层用结构体字面量伪造句柄（P09 无法区分伪造与真实，只能靠代际偶然拦截）；
+  `for_test` 把这条口子限制在本 crate 的测试构建内。
+- **P09 交接**：`GeometryStore` 落地时把 `for_test` 换成 `pub(crate) fn mint(index, generation)`（同签名、有非 test 消费者），
+  测试改用 `mint`；公开面不变。
+
+### S-21 第二轮代码审查（A/B 均 PASS-WITH-FIXES）：B1 与 N1–N15 的处置
+
+- **阻塞 B1 已修复**：`interpolate` 的 `mid` 此前在 `Interpolation::LinearSrgb` 下复用了 `resolve` 的 (A) 路径（逐通道 clamp），
+  破坏端点不变量。现在：①`resolve` 与 `interpolate` 共用 `normalized_dynamic`（alpha clamp + Oklch 的 L/C/h 归一）；
+  ②`mid` **无条件**走 `gamut_mapped_linear`（转 Oklch → 24 步 chroma 二分 → premultiply），不再看插值空间。
+  回归用例：`interpolate_endpoints_match_resolve`（4 空间 × 4 端点 × 2 端）、`linear_srgb_space_matches_resolve_for_p3_endpoint`
+  （审查给出的复现用例），以及两条独立字面量断言 `p3_green_midpoint_is_gamut_mapped` / `p3_blue_midpoint_is_gamut_mapped`。
+- **N1** `clamp_nonneg`/`hue_deg` 对非有限值（含 `±inf`）统一收敛到 `0.0`；新增 `clamp_nonneg_handles_infinity`、
+  `hue_extremes_are_normalized`。
+- **N2** `Canvas::push_clip` 对 `ClipRect`（坐标/尺寸/圆角）加 `debug_assert!`（C4），文档写明 debug-only；新增
+  `push_clip_rejects_negative_size`。
+- **N3** `ColorBrush` 移到 `#[cfg(test)] mod tests` 之前。
+- **N4/N5** `primitive.rs` 的样例表补第 8 个变体（`Primitive::Canvas`）；新增 `canvas_size_is_48_bytes`。
+- **N6** 颜色测试对齐设计：P3 红断言 `>= 0.99`；`350→10` 的 `Shorter == Increasing` 前提写反，改为断言 `Longer` 中点 ≈180°，
+  另加 `10→350` 的 `Increasing`/`Decreasing` 行为断言；`oklch_in_gamut_is_passthrough` 改用 `color` crate 独立期望。
+- **N7** 新增 `resolve_linear_srgb_variant_is_passthrough`、`resolve_oklab_variant`、`interpolate_linear_srgb_space`。
+- **N8** 见 **S-20**（`pub(crate)` 字段被 lint 禁止）。
+- **N9** geometry 测试改用 `ahash::HashSet`；crate `[dev-dependencies]` 追加 `ahash = { workspace = true }`。
+- **N10/N11** `push_text` 文档改为「应用层不应自行构造，`AtlasTile` 只能来自图集分配器」；`push_text`/`push_image` 分别
+  `debug_assert` 图集 kind；新增 `push_image_rejects_glyph_atlas`。
+- **N12** `push_text_keeps_run` 断言 `run` 整体相等 + color/tile/position/size 逐项保留。
+- **N13** 四个弱断言重写：`all_variants_clone_eq_and_debug`（8 变体 + Debug 名 + 改字段破坏相等）、
+  `quad_paint_encodings_are_mutually_exclusive`、`gradient_kind_has_three_distinct_variants`、`clip_op_push_pop_roundtrip`。
+- **N14** 本文件与 phase-02 的不一致已统一：P02 的 `pub(crate)` item 是 **5 个方法 + 1 个常量**
+  （`Lane::{new,push,clip_depth,primitives,is_empty}`、`MAX_CLIP_DEPTH`）；C1 的断言归属统一为
+  「引擎展平阶段（P06）的 `debug_assert`；P03 的 `end_lane` 只做 lane 平衡的显式收尾」。
+- **N15** `Canvas::push_clip`/`pop_clip` 加 `#[must_use]`。
+- **B-N5** phase-02 §9.1/§18.2 与本节统一为「私有字段 + 公开 getter + 仅测试构造器」。
+- **B-N6** 端点 hue 归一化由 `normalized_dynamic` 覆盖；`h = 1e9` 用例确认与 `rem_euclid(360)` 逐位一致。
+- **B-N7** powerless hue：v1 **不承诺** `C = 0` 端点的 hue 语义 —— `Color::Oklch{l, 0, h}` 的字面量保留调用方给的 h，
+  而 `Color::Oklab` 转 Oklch 时 missing hue 会被 `color` crate 取 0；两者在 `C = 0` 处**不可互换**（视觉无差异，但
+  `PartialEq` 与帧记录会不同）。v1 的用法（主题色、渐变端点）不依赖该差异。
+- **B-N8** phase-02 §15 的「`paint::*` 全部有文档注释」不成立，已删除该表述；公开项文档债登记为 **V-22**。
+- **B-N9** phase-02 的表数勘误为 **83**（分隔行计数）。
+- **门禁**：`cargo test` **103** / `--release` **99**、clippy `-D warnings`、`fmt --check`、`doc` 零警告、落地文件边界、
+  `cargo check --target aarch64-apple-darwin` 全绿（Linux 交叉见提交说明）。
+
+### S-22 公开项的 `missing_docs` 债务（V-22）
+
+- **事实**：P02 的公开 API 只对**类型/模块/关键方法**写了文档注释，字段级/变体级注释不全。
+  当前 `missing_docs` 计数（reviewer 实测）：`paint::color` 34、`paint::primitive` 24、`paint::geometry` 10、`paint::atlas` 1。
+- **决策**：**本阶段不补齐**，登记为债务。理由：①这些字段的语义已由 phase-02 §5–§10 逐条定义，重复一遍会形成两处真相；
+  ②`missing_docs` 未开启为 lint，不影响门禁；③字段注释应在 P03/P07 的**首个消费者**落地时按实际用法补（那时才知道哪些字段值得展开）。
+- **触发条件**：P10 的 `contract.md` 同步要求 rustdoc 可读，或任何 Phase 决定开启 `#![warn(missing_docs)]` → 先补 `paint::*`。

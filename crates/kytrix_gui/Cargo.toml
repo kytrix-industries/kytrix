@@ -9,8 +9,9 @@ edition.workspace = true
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 
-# P02 颜色 / P03 绘制契约
+# P02 颜色 / 绘制契约
 bitflags = { workspace = true }
+bytes = { workspace = true }
 bytemuck = { workspace = true }
 color = { workspace = true }
 lyon = { workspace = true }
@@ -82,3 +83,6 @@ xkbcommon = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+ahash = { workspace = true }

@@ -322,7 +322,7 @@ error: using `pub use`
 | `Geometry` `GeometryId` `GeometryDesc` | `kytrix_gui::paint::geometry::*` | `src/paint/geometry.rs` |
 | `Color` `ColorResolver` `ColorBrush` | `kytrix_gui::paint::color::*` | `src/paint/color.rs` |
 | `TextStyle` `ShapedLine` `FontStack` `InlineBoxSpec` | `kytrix_gui::text::*` | `src/text.rs` |
-| `ResourceId` `ResourceCache` `AtlasTile` | `kytrix_gui::resources::*` | `src/resources.rs` |
+| `ResourceId` `ResourceCache` `AtlasTile` | `kytrix_gui::resources::*`（**`AtlasTile` 已被 DEVIATIONS F-24 修订为 `paint::atlas::AtlasTile`**） | `src/resources.rs` |
 | `AtlasKind` | `kytrix_gui::resources::AtlasKind` | `src/resources.rs` |
 | `FocusScope` `ScrollHandle` `VirtualList` `Overlay` `DragState` `AnimationId` | `kytrix_gui::interaction::*` | `src/interaction.rs` |
 | `A11yRole` `A11yNode` `A11yLabel` `A11yAction` `A11yOverride` `A11yPatch` | `kytrix_gui::a11y::*` | `src/a11y.rs` |
