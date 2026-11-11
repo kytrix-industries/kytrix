@@ -171,7 +171,7 @@ widget_gallery_ui = { path = "crates/widget_gallery_ui" }
 widget_registry = { path = "crates/widget_registry" }
 
 [workspace.lints.clippy]
-self_named_module_files = "forbid"
+self_named_module_files = "allow"
 pub_use = "forbid"
 field_scoped_visibility_modifiers = "forbid"
 pub_without_shorthand = "forbid"
