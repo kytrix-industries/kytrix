@@ -178,6 +178,25 @@ impl InputState {
         self.base.read(cx).value()
     }
 
+    /// Whether the field is drawn with its value hidden.
+    ///
+    /// A test reads this rather than the builder's own flag: what a secret is drawn as is the
+    /// engine's answer, and the component's job is only to have asked for it.
+    pub fn is_masked(&self, cx: &App) -> bool {
+        self.base.read(cx).presentation().is_masked()
+    }
+
+    /// The text the field draws while it holds nothing, if it was given one.
+    ///
+    /// The engine holds the placeholder as a string that is empty when there is none, so the
+    /// empty string is reported as no placeholder rather than as one that says nothing.
+    pub fn placeholder(&self, cx: &App) -> Option<SharedString> {
+        let presentation = self.base.read(cx).presentation();
+        let placeholder = presentation.placeholder();
+
+        (!placeholder.is_empty()).then(|| placeholder.clone())
+    }
+
     pub fn update_value(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.base
             .update(cx, |this, cx| this.set_value(value, window, cx))

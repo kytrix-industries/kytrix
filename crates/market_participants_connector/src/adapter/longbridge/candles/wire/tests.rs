@@ -96,7 +96,7 @@ async fn sent_history(
     fixture: &LongbridgeFixture,
     query: &CandlestickFetchQuery,
 ) -> SecurityHistoryCandlestickRequest {
-    let context = execution(fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -377,7 +377,7 @@ async fn the_history_is_answered_in_ascending_order() {
         QuoteAnswer::default(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -427,7 +427,7 @@ async fn the_two_anchored_shape_drops_what_the_start_excludes() {
         QuoteAnswer::default(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -476,7 +476,7 @@ async fn the_subscription_asks_for_its_screen_with_the_requests_adjustment() {
         QuoteAnswer::default(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -585,7 +585,7 @@ async fn the_screen_is_answered_before_the_pushes_and_the_open_candle_rolls() {
         }],
     });
 
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -675,7 +675,7 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
         QuoteAnswer::default(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -783,7 +783,7 @@ async fn a_half_day_from_the_venue_moves_the_afternoon_grid() {
         }],
     });
 
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)
@@ -973,7 +973,7 @@ async fn a_refused_calendar_is_asked_about_once() {
         });
     }
 
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = ConnectionPlan::of(&context, &credential_values())
         .expect("the fixture connection is planned");
     let session = establish(&context, &credential_values(), &plan)

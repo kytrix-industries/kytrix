@@ -39,10 +39,11 @@ use crate::{
 /// The configuration is what makes the venue reachable and what its credentials are
 /// resolved from: the three values are stored in the venue's own settings row and the
 /// snapshot is what a request's runtime receiver carries, so the adapter resolves its
-/// credentials exactly the way it does in production.
+/// credentials exactly the way it does in production. A venue holding no set is the
+/// one a file stores nothing for.
 pub(crate) fn execution(
     fixture: &LongbridgeFixture,
-    credentials: LongbridgeCredentials,
+    credentials: Option<LongbridgeCredentials>,
     capability: CapabilityId,
 ) -> ExecutionContext {
     let mut config = Config::default();

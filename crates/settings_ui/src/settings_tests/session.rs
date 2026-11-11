@@ -3,17 +3,18 @@
 use std::fs;
 
 use app_config::{
-    market_participants::settings::VenueSettings,
+    market_participants::credentials::OkxCredentials,
     settings::{Appearance, Config, Language},
     ui::SidebarMode,
 };
 use app_config_provider::{manager::ConfigManager, store::ConfigPersistenceError};
-use gpui_kit::{SharedString, TestAppContext};
+use gpui_kit::TestAppContext;
 use i18n::{language::codes::LanguageCode, t};
 use market_participants_model::identifier::VenueId;
 use smol_str::SmolStr;
 
 use super::test_support::*;
+use crate::session::SettingsChange;
 
 /// The alert a rejected commit raises says what went wrong, in either language.
 ///
@@ -244,223 +245,41 @@ fn a_background_sidebar_state_should_survive_the_next_settings_write(cx: &mut Te
     );
 }
 
-/// A text field writes what it holds when the caret leaves it.
+/// A reason a write failed is not lost when the page is left before the frame that reports it:
+/// whoever leaves the page asks for it, and it is handed over once.
 #[gpui_kit::test]
-fn a_text_field_should_write_when_the_caret_leaves_it(cx: &mut TestAppContext) {
-    let (page, cx) = settings(configured_settings(), cx);
-    select(&page, "market_participants.okx", cx);
-
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("typed-without-leaving-the-field");
-    settle(cx);
-    blur(cx);
-
-    let written = match stored(cx).venue(&VenueId::Okx) {
-        Some(VenueSettings::Okx(okx)) => okx.credentials.api_key.clone(),
-        _ => panic!("the settings should still hold OKX"),
-    };
-    assert_eq!(
-        written, "okx-api-keytyped-without-leaving-the-field",
-        "leaving the field should write what was typed into it"
-    );
-}
-
-/// Enter writes a field without leaving it, which is the way to store a change and keep the
-/// caret where it is.
-#[gpui_kit::test]
-fn a_text_field_should_write_when_enter_is_pressed(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
-
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("typed-on-enter");
-    cx.simulate_keystrokes("enter");
-    settle(cx);
-
-    let written = match stored(cx).venue(&VenueId::Okx) {
-        Some(VenueSettings::Okx(okx)) => okx.credentials.api_key.clone(),
-        _ => panic!("the settings should still hold OKX"),
-    };
-    assert_eq!(
-        written, "okx-api-keytyped-on-enter",
-        "Enter should write what the field holds"
-    );
-}
-
-/// Opening another page writes what an unfocused text field still holds, because the field
-/// is not drawn any more and nothing else would write it.
-#[gpui_kit::test]
-fn switching_the_page_should_commit_a_pending_text_field(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
-
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("typed-before-switching");
-    settle(cx);
-    assert_eq!(
-        stored(cx).venue(&VenueId::Okx).map(|venue| match venue {
-            VenueSettings::Okx(okx) => okx.credentials.api_key.clone(),
-            _ => panic!("the settings should still hold OKX"),
-        }),
-        Some(SmolStr::new_static("okx-api-key")),
-        "what is typed is not written until the field is left or the page moves on"
-    );
-
-    click(cx, "SETTINGS_ENTRY_appearance");
-
-    assert_eq!(
-        current_page(&panel, cx),
-        "appearance",
-        "the row should be the page that is drawn"
-    );
-    assert_eq!(
-        stored(cx).venue(&VenueId::Okx).map(|venue| match venue {
-            VenueSettings::Okx(okx) => okx.credentials.api_key.clone(),
-            _ => panic!("the settings should still hold OKX"),
-        }),
-        Some(SmolStr::new_static("okx-api-keytyped-before-switching")),
-        "moving on should write what the field still held"
-    );
-}
-
-/// The caret goes with the page it was on: a field the page stops drawing is not one a
-/// keystroke should still reach.
-#[gpui_kit::test]
-fn switching_pages_should_drop_the_hidden_input_focus(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-
-    let focused = cx.update(|window, cx| {
-        panel.read_with(cx, |panel, cx| {
-            panel
-                .input_for_test("market_participants.okx.api_key")
-                .is_some_and(|input| input.read(cx).engine_focus_handle(cx).is_focused(window))
-        })
-    });
-    assert!(focused, "clicking a field should put the caret in it");
-
-    click(cx, "SETTINGS_ENTRY_appearance");
-
-    let focused = cx.update(|window, cx| {
-        panel.read_with(cx, |panel, cx| {
-            panel
-                .input_for_test("market_participants.okx.api_key")
-                .is_some_and(|input| input.read(cx).engine_focus_handle(cx).is_focused(window))
-        })
-    });
-    assert!(
-        !focused,
-        "the field the page left behind should not keep the window's focus"
-    );
-}
-
-/// Leaving the page writes what an unfocused text field still holds and reports whether it
-/// could not be stored.
-#[gpui_kit::test]
-fn leaving_should_commit_a_pending_text_field(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
-
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("typed-before-leaving");
-    settle(cx);
-
-    let failure = panel.update(cx, |panel, cx| panel.commit_pending(cx));
-
-    assert_eq!(
-        failure, None,
-        "a write that was stored is nothing to report while leaving"
-    );
-    assert_eq!(
-        stored(cx).venue(&VenueId::Okx).map(|venue| match venue {
-            VenueSettings::Okx(okx) => okx.credentials.api_key.clone(),
-            _ => panic!("the settings should still hold OKX"),
-        }),
-        Some(SmolStr::new_static("okx-api-keytyped-before-leaving")),
-        "leaving should write what the field still held"
-    );
-}
-
-/// Leaving with nothing typed into a field writes nothing.
-#[gpui_kit::test]
-fn commit_pending_without_pending_text_should_not_write(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    let before = stored(cx);
-
-    let failure = panel.update(cx, |panel, cx| panel.commit_pending(cx));
-
-    assert_eq!(failure, None);
-    assert_eq!(
-        stored(cx),
-        before,
-        "nothing was typed, so there is nothing to write"
-    );
-}
-
-/// A text write that could not be stored leaves the page open with what was typed in it, so
-/// the user can try again.
-#[gpui_kit::test]
-fn a_failed_text_write_should_keep_the_page_and_the_input(cx: &mut TestAppContext) {
+fn a_write_failure_waiting_to_be_reported_should_be_handed_to_whoever_leaves(
+    cx: &mut TestAppContext,
+) {
     let (manager, _blocking, _directory) = manager_behind_a_file(cx);
     let (panel, cx) = settings_over(manager, Language::En, cx);
-    select(&panel, "market_participants.okx", cx);
 
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("could-not-be-stored");
-    settle(cx);
-    blur(cx);
-
-    assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_some(),
-        "a write that could not be stored should tell the user"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "the page should stay open so the user can try again"
-    );
-    assert_eq!(
-        stored(cx).venue(&VenueId::Okx).map(|venue| match venue {
-            VenueSettings::Okx(okx) => okx.credentials.api_key.clone(),
-            _ => panic!("the settings should still hold OKX"),
-        }),
-        Some(SmolStr::new_static("")),
-        "settings that could not be stored must not be published as if they had been"
-    );
-    let typed = panel.read_with(cx, |panel, cx| {
-        panel
-            .input_for_test("market_participants.okx.api_key")
-            .map(|input| input.read(cx).value(cx))
+    // One turn's worth of state: the write fails, and nothing has drawn the page that would
+    // report it before the leave asks for the reason.
+    let reason = panel.update(cx, |panel, cx| {
+        panel.session_for_test().update(cx, |session, cx| {
+            let _ = session.write(
+                SettingsChange::edit(|config| config.appearance = Appearance::Dark),
+                cx,
+            );
+        });
+        panel.take_write_failure(cx)
     });
-    assert_eq!(
-        typed,
-        Some(SharedString::new_static("could-not-be-stored")),
-        "the field should keep what the user typed so the write can be tried again"
-    );
-}
-
-/// A page whose last text write failed is still a page that can be left: the failure is
-/// carried to whoever leaves it, and what it writes when it gets there is not a reason to
-/// stay.
-#[gpui_kit::test]
-fn a_failed_change_should_not_block_leaving(cx: &mut TestAppContext) {
-    let (manager, _blocking, _directory) = manager_behind_a_file(cx);
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-    select(&panel, "market_participants.okx", cx);
-
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
-    cx.simulate_input("lost-on-leaving");
-    settle(cx);
-
-    let failure = panel.update(cx, |panel, cx| panel.commit_pending(cx));
 
     assert!(
-        failure.is_some_and(|reason| !reason.is_empty()),
+        reason.is_some_and(|reason| !reason.is_empty()),
         "the reason the write failed should be handed to whoever leaves the page"
     );
+    assert_eq!(
+        stored(cx).appearance,
+        Appearance::System,
+        "settings that could not be stored must not be published as if they had been"
+    );
     assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "the page itself is still drawn: leaving is the main window's to do"
+        panel
+            .update(cx, |panel, cx| panel.take_write_failure(cx))
+            .is_none(),
+        "one failure should be reported once"
     );
     click(cx, "SETTINGS_ENTRY_appearance");
     assert_eq!(
@@ -521,7 +340,14 @@ fn a_setter_that_rejects_the_value_should_keep_the_old_value_without_a_report(
     edit_settings(
         &panel,
         |config| {
-            config.set_venue_credential(&VenueId::Okx, "api_key", "typed-key");
+            config.set_okx_credentials(
+                &VenueId::Okx,
+                Some(OkxCredentials {
+                    api_key: SmolStr::new_static("typed-key"),
+                    secret_key: SmolStr::new_static("typed-secret"),
+                    passphrase: SmolStr::new_static("typed-passphrase"),
+                }),
+            );
         },
         cx,
     );

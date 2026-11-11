@@ -98,7 +98,7 @@ async fn the_planned_connection_is_the_regions_own() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let plan = plan(&context);
 
     assert_eq!(plan.key.endpoint.path(), "/v2");
@@ -139,7 +139,7 @@ async fn the_handshake_reaches_the_wire_in_the_venues_own_order() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let session = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -286,7 +286,7 @@ async fn a_healthy_pooled_socket_is_not_handshaken_twice() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let first = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -339,7 +339,7 @@ async fn a_venue_with_no_free_connection_slot_states_its_own_numbers() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -390,7 +390,7 @@ async fn a_refused_token_endpoint_is_the_refusal_it_is() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -425,7 +425,7 @@ async fn a_refused_authentication_fails_the_connection() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -463,7 +463,7 @@ async fn a_refused_profile_fails_the_connection() {
         },
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -496,7 +496,7 @@ async fn the_otp_request_is_signed_with_the_algorithm_the_venue_accepts() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     establish(&context, &credential_values(), &plan(&context))
         .await

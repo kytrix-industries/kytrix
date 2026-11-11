@@ -10,21 +10,17 @@ use market_participants_model::identifier::VenueId;
 
 use crate::{
     layout::{self, PageArgs},
-    pages::venues::shared::{self, CredentialField, OriginKind},
+    pages::venues::{
+        credentials::{self, CredentialsKind},
+        shared::{self, OriginKind},
+    },
     search::FieldSearch,
 };
-
-const CREDENTIAL_FIELDS: [CredentialField; 2] = [
-    CredentialField::MainAccountAddress,
-    CredentialField::ApiAgentPrivateKey,
-];
 
 pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
     let venue = VenueId::Hyperliquid;
     let page_id = shared::page_id(&venue);
-    let mut groups = Vec::new();
-    let mut origin_rows = Vec::new();
-    let mut credential_rows = Vec::new();
+    let mut rows = Vec::new();
 
     let (http, websocket) = match args.config.venue(&venue) {
         Some(VenueSettings::Hyperliquid(settings)) => (settings.http, settings.websocket),
@@ -58,7 +54,7 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
             },
         );
 
-        origin_rows.push(layout::row(
+        rows.push(layout::row(
             &http_id,
             label,
             description,
@@ -92,7 +88,7 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
             },
         );
 
-        origin_rows.push(layout::row(
+        rows.push(layout::row(
             &websocket_id,
             label,
             description,
@@ -102,33 +98,24 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
         ));
     }
 
-    for field in CREDENTIAL_FIELDS {
-        if args
-            .filter
-            .admits_field(page_id.as_ref(), field.field_id(&venue, None).as_ref())
-        {
-            credential_rows.push(shared::credential_row(args, venue, None, field));
-        }
+    let credentials = CredentialsKind::Hyperliquid;
+    if args
+        .filter
+        .admits_field(page_id.as_ref(), credentials.row_id())
+    {
+        rows.push(credentials::credentials_row(args, credentials));
     }
 
-    if !origin_rows.is_empty() {
-        groups.push(layout::section(
-            None,
-            "market_participants.hyperliquid_0",
-            origin_rows,
-            args.cx,
-        ));
-    }
-    if !credential_rows.is_empty() {
-        groups.push(layout::section(
-            Some(t!(args.cx, "settings_ui.market_participants.credentials")),
-            "market_participants.hyperliquid_1",
-            credential_rows,
-            args.cx,
-        ));
+    if rows.is_empty() {
+        return layout::page(Vec::new());
     }
 
-    layout::page(groups)
+    layout::page(vec![layout::section(
+        None,
+        "market_participants.hyperliquid_0",
+        rows,
+        args.cx,
+    )])
 }
 
 pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
@@ -138,35 +125,32 @@ pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
     let http_description = t!(cx, OriginKind::Http.description_key());
     let websocket_label = t!(cx, OriginKind::Websocket.label_key());
     let websocket_description = t!(cx, OriginKind::Websocket.description_key());
-    let mut fields = Vec::with_capacity(4);
 
-    fields.push(shared::origin_search_field(
-        format!("{page_id}.http"),
-        http_label.as_ref(),
-        http_description.as_ref(),
-        &[
-            "market_participants",
-            "hyperliquid",
-            "http",
-            "origin",
-            "地址",
-        ],
-    ));
-    fields.push(shared::origin_search_field(
-        format!("{page_id}.websocket"),
-        websocket_label.as_ref(),
-        websocket_description.as_ref(),
-        &[
-            "market_participants",
-            "hyperliquid",
-            "websocket",
-            "origin",
-            "地址",
-        ],
-    ));
-    for field in CREDENTIAL_FIELDS {
-        fields.push(shared::credential_search_field(venue, None, field, cx));
-    }
-
-    fields
+    vec![
+        shared::origin_search_field(
+            format!("{page_id}.http"),
+            http_label.as_ref(),
+            http_description.as_ref(),
+            &[
+                "market_participants",
+                "hyperliquid",
+                "http",
+                "origin",
+                "地址",
+            ],
+        ),
+        shared::origin_search_field(
+            format!("{page_id}.websocket"),
+            websocket_label.as_ref(),
+            websocket_description.as_ref(),
+            &[
+                "market_participants",
+                "hyperliquid",
+                "websocket",
+                "origin",
+                "地址",
+            ],
+        ),
+        CredentialsKind::Hyperliquid.search_field(cx),
+    ]
 }

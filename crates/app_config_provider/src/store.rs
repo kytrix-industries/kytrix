@@ -566,7 +566,7 @@ mod tests {
 
     use app_config::{
         market_participants::{
-            credentials::{BinanceCredentials, OkxCredentials},
+            credentials::{BinanceMarketCredentials, OkxCredentials},
             origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
             settings::{BinanceOrigins, VenueSettings},
         },
@@ -1255,6 +1255,64 @@ mod tests {
         );
     }
 
+    /// A configuration written under the previous per-market Binance shape is reset whole.
+    ///
+    /// Every venue is named and the file is valid JSON, but Binance's row carries the six-value
+    /// `credentials` object of the previous version instead of the two per-market keys this
+    /// build writes. That row is not this shape: it is kept aside as a `.corrupt-*` backup and
+    /// the application starts from defaults, with the language and appearance it also held gone.
+    #[test]
+    fn a_previous_per_market_binance_configuration_is_reset_whole_and_reported() {
+        let temporary_directory = test_temp("config");
+        let path = temporary_directory.path().join(CONFIG_FILE_NAME);
+        let mut old = serde_json::to_value(Config::default()).expect("config should serialize");
+        {
+            let binance = old["venues"]
+                .as_object_mut()
+                .expect("the venues are a map")
+                .get_mut("binance")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("the default configuration holds a Binance row");
+            binance.remove("spot_credentials");
+            binance.remove("usd_m_perp_credentials");
+            binance.insert(
+                "credentials".to_owned(),
+                serde_json::json!({
+                    "spot_api_key": "old-spot-key",
+                    "spot_private_key": "old-spot-private",
+                    "spot_passphrase": "",
+                    "usd_m_perp_api_key": "old-perp-key",
+                    "usd_m_perp_private_key": "old-perp-private",
+                    "usd_m_perp_passphrase": "",
+                }),
+            );
+        }
+        old["language"] = serde_json::json!("en");
+        old["appearance"] = serde_json::json!("dark");
+        let old_bytes = serde_json::to_vec_pretty(&old).expect("the old file should serialize");
+        fs::write(&path, &old_bytes).expect("the old fixture should be written");
+
+        let (store, recovery) = ConfigStore::load_or_recover(path);
+
+        let recovery = recovery.expect("an old file is reported as recovered");
+        assert!(
+            matches!(recovery.error, ConfigLoadError::Decode { .. }),
+            "the previous per-market shape is refused at decode, not read partially"
+        );
+        let backup = recovery.backup.expect("the old file should be kept");
+        assert_eq!(
+            fs::read(&backup).expect("the backup should be readable"),
+            old_bytes,
+            "the backup keeps exactly what the user had"
+        );
+        assert_eq!(store.read().as_ref(), &Config::default());
+        assert_eq!(
+            (store.read().language, store.read().appearance),
+            (Config::default().language, Config::default().appearance),
+            "language and appearance reset with the row"
+        );
+    }
+
     /// A venue edit submitted the way a settings interface submits one — a mutated
     /// `Config` handed to a write-back entry — reaches the file and moves the venue's
     /// outbound generation. The settings page submits each change through `write`; this drives
@@ -1674,14 +1732,22 @@ mod tests {
             else {
                 panic!("binance is configured as Binance");
             };
-            binance.credentials = BinanceCredentials {
-                spot_api_key: SmolStr::new_static("binance-spot-key"),
-                spot_private_key: SmolStr::new_static("binance-spot-private"),
-                spot_passphrase: SmolStr::new_static("binance-spot-passphrase"),
-                usd_m_perp_api_key: SmolStr::new_static("binance-perp-key"),
-                usd_m_perp_private_key: SmolStr::new_static("binance-perp-private"),
-                usd_m_perp_passphrase: SmolStr::new_static("binance-perp-passphrase"),
-            };
+            binance.set_market_credentials(
+                BinanceMarket::Spot,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("binance-spot-key"),
+                    private_key: SmolStr::new_static("binance-spot-private"),
+                    passphrase: SmolStr::new_static("binance-spot-passphrase"),
+                }),
+            );
+            binance.set_market_credentials(
+                BinanceMarket::UsdMPerp,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("binance-perp-key"),
+                    private_key: SmolStr::new_static("binance-perp-private"),
+                    passphrase: SmolStr::new_static("binance-perp-passphrase"),
+                }),
+            );
         }
         {
             let VenueSettings::Okx(okx) = config
@@ -1691,11 +1757,11 @@ mod tests {
             else {
                 panic!("okx is configured as OKX");
             };
-            okx.credentials = OkxCredentials {
+            okx.credentials = Some(OkxCredentials {
                 api_key: SmolStr::new_static("okx-api-key"),
                 secret_key: SmolStr::new_static("okx-secret-key"),
                 passphrase: SmolStr::new_static("okx-passphrase"),
-            };
+            });
         }
 
         config

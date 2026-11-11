@@ -1,9 +1,10 @@
 //! The tests of the search: what it admits, what it keeps, and what it answers.
 
-use app_config::settings::Config;
+use app_config::settings::{Config, Language};
 use gpui_kit::{Modifiers, SharedString, TestAppContext, px};
 
 use super::test_support::*;
+use crate::pages::venues::credentials::CredentialsKind;
 
 /// The clear control is the field's own, and clearing the field is what brings the whole
 /// sidebar back: the field and the answer are one thing, so emptying one empties the other.
@@ -107,12 +108,12 @@ fn a_query_should_move_the_page_to_one_it_admits(cx: &mut TestAppContext) {
 fn a_query_that_matches_a_field_should_open_the_page_that_holds_it(cx: &mut TestAppContext) {
     let (panel, cx) = settings(configured_settings(), cx);
 
-    panel.update(cx, |dialog, cx| dialog.set_query("api_key".into(), cx));
+    panel.update(cx, |dialog, cx| dialog.set_query("clob".into(), cx));
     settle(cx);
 
     assert_eq!(
         current_page(&panel, cx),
-        "market_participants.binance",
+        "market_participants.polymarket",
         "the page that holds the field should be the one the query opens"
     );
     let narrowed = labels(&panel, cx);
@@ -121,23 +122,194 @@ fn a_query_that_matches_a_field_should_open_the_page_that_holds_it(cx: &mut Test
         "the group that holds the page should be kept: {narrowed:?}"
     );
     assert!(
-        narrowed.contains(&SharedString::new_static("Binance"))
-            && narrowed.contains(&SharedString::new_static("OKX")),
-        "every page a matching field sits on should be listed: {narrowed:?}"
+        narrowed.contains(&SharedString::new_static("Polymarket")),
+        "the page a matching field sits on should be listed: {narrowed:?}"
     );
     assert!(
         !narrowed.contains(&SharedString::new_static("Appearance")),
         "a page with no matching label or field should not be listed: {narrowed:?}"
     );
     assert!(
-        cx.debug_bounds("SETTINGS_FIELD_market_participants.binance.spot.spot_api_key")
+        cx.debug_bounds("SETTINGS_FIELD_market_participants.polymarket.clob")
             .is_some(),
         "the field the query matched should be drawn on the page it opened"
     );
     assert!(
-        cx.debug_bounds("SETTINGS_FIELD_market_participants.binance.spot.spot_private_key")
+        cx.debug_bounds("SETTINGS_FIELD_market_participants.polymarket.gamma")
             .is_none(),
         "a field the query did not match should not be drawn on a page reached by a field"
+    );
+}
+
+/// The credential rows are searched by what they are for rather than by the names of the values
+/// they hold: a user looking for a venue's credentials finds them by the venue, by the word the
+/// row is drawn with, or by what the row says they are for, and a value's name is not a way into
+/// the row that holds it.
+#[gpui_kit::test]
+fn a_credential_field_name_should_not_find_the_credential_row(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+    let kind = CredentialsKind::BinanceSpot;
+
+    panel.update(cx, |dialog, cx| dialog.set_query("api_key".into(), cx));
+    settle(cx);
+
+    panel.read_with(cx, |dialog, _| {
+        assert!(
+            dialog.filter_for_test().is_nothing(),
+            "a credential value's name should admit nothing"
+        );
+    });
+    assert!(
+        cx.debug_bounds("SETTINGS_PAGE_NO_MATCHES").is_some(),
+        "the page column should say that nothing matched"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_SIDEBAR_NO_MATCHES").is_some(),
+        "the sidebar column should say that nothing matched"
+    );
+
+    panel.update(cx, |dialog, cx| {
+        dialog.set_query("trading features".into(), cx);
+    });
+    settle(cx);
+
+    assert_eq!(
+        current_page(&panel, cx),
+        "market_participants.binance",
+        "what the credentials are for should reach the page that holds them"
+    );
+    assert!(
+        bounds(cx, &credentials_row(kind)).is_some(),
+        "the credential row should be drawn on the page the query opened"
+    );
+    assert!(
+        bounds(cx, "SETTINGS_FIELD_market_participants.binance.spot.http").is_none(),
+        "the query reached the credential row rather than the whole page"
+    );
+
+    panel.update(cx, |dialog, cx| dialog.set_query("凭据".into(), cx));
+    settle(cx);
+
+    panel.read_with(cx, |dialog, _| {
+        assert!(
+            dialog
+                .filter_for_test()
+                .admits_page("market_participants.binance"),
+            "the word is one the page is named by, so the page itself is admitted"
+        );
+    });
+    assert!(
+        bounds(cx, &credentials_row(kind)).is_some(),
+        "the row is reachable by the word it is drawn with as well"
+    );
+}
+
+/// The credential rows are searched by the venue's name in the language the interface is drawn
+/// in, and by the market's name: in Chinese, `币安 现货` reaches the spot row and only it, so a
+/// user naming one Binance market is not shown the sibling whose values it does not edit.
+///
+/// The query reaches the row and not the page it sits on: the page's own text holds neither word,
+/// so what draws the row is the row's own search text rather than every field of a page the query
+/// admitted.
+#[gpui_kit::test]
+fn a_chinese_venue_and_market_name_should_narrow_the_credentials_to_one_market(
+    cx: &mut TestAppContext,
+) {
+    let (panel, cx) = settings_in(Config::default(), Language::ZhCn, cx);
+    let spot = CredentialsKind::BinanceSpot;
+    let perp = CredentialsKind::BinanceUsdMPerp;
+    let page = "market_participants.binance";
+
+    panel.update(cx, |dialog, cx| dialog.set_query("币安 现货".into(), cx));
+    settle(cx);
+
+    assert_eq!(
+        current_page(&panel, cx),
+        page,
+        "the query should open the page whose credential row it names"
+    );
+    panel.read_with(cx, |dialog, _| {
+        let filter = dialog.filter_for_test();
+
+        assert!(
+            !filter.admits_page(page),
+            "the page's own text holds neither word, so the row has to be the thing that matched"
+        );
+        assert!(
+            filter.admits_field(page, spot.row_id()),
+            "the spot credential row's own text should hold the venue and the market"
+        );
+        assert!(
+            !filter.admits_field(page, perp.row_id()),
+            "the futures credential row should not hold the spot market's name"
+        );
+    });
+    assert!(
+        bounds(cx, &credentials_row(spot)).is_some(),
+        "the spot credential row should be drawn by a query that names it"
+    );
+    assert!(
+        bounds(cx, &credentials_row(perp)).is_none(),
+        "the futures credential row should not be drawn by a query that names spot"
+    );
+    for selector in [
+        "SETTINGS_FIELD_market_participants.binance.spot.http",
+        "SETTINGS_FIELD_market_participants.binance.spot.websocket",
+        "SETTINGS_FIELD_market_participants.binance.usd-m-perp.http",
+        "SETTINGS_FIELD_market_participants.binance.usd-m-perp.websocket",
+    ] {
+        assert!(
+            bounds(cx, selector).is_none(),
+            "the query matched the credentials rather than the market's addresses: {selector} \
+             was drawn"
+        );
+    }
+
+    panel.update(cx, |dialog, cx| dialog.set_query("币安 合约".into(), cx));
+    settle(cx);
+
+    assert_eq!(
+        current_page(&panel, cx),
+        page,
+        "the other market's name should open the same page"
+    );
+    panel.read_with(cx, |dialog, _| {
+        let filter = dialog.filter_for_test();
+
+        assert!(
+            filter.admits_field(page, perp.row_id()),
+            "the futures credential row's own text should hold the venue and the market"
+        );
+        assert!(
+            !filter.admits_field(page, spot.row_id()),
+            "the spot credential row should not hold the futures market's name"
+        );
+    });
+    assert!(
+        bounds(cx, &credentials_row(perp)).is_some(),
+        "the futures credential row should be drawn by a query that names it"
+    );
+    assert!(
+        bounds(cx, &credentials_row(spot)).is_none(),
+        "the spot credential row should not be drawn by a query that names the futures market"
+    );
+
+    // The word alone is one the page itself is named by, so it admits the page and with it every
+    // row it holds: what proves that a row's own text matched is the market-named query above,
+    // where the page holds neither word and only the credential row does.
+    panel.update(cx, |dialog, cx| dialog.set_query("凭据".into(), cx));
+    settle(cx);
+
+    panel.read_with(cx, |dialog, _| {
+        assert!(
+            dialog.filter_for_test().admits_page(page),
+            "the word is one the page is named by, so the page itself is admitted"
+        );
+    });
+    assert!(
+        bounds(cx, &credentials_row(spot)).is_some()
+            && bounds(cx, &credentials_row(perp)).is_some(),
+        "the word the row is drawn with should still reach both markets' rows"
     );
 }
 

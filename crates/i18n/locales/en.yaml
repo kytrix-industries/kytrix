@@ -1267,18 +1267,31 @@ settings_ui:
     title: General
   market_participants:
     access_token: Access Token
-    access_token_description: The access token issued for the application; the venue authenticates a session with it
+    access_token_required: Enter an Access Token
     api_agent_private_key: API Agent private key
+    api_agent_private_key_required: Enter an API Agent private key
     api_key: API Key
-    api_key_description: The API key this venue's requests authenticate with
+    api_key_required: Enter an API Key
     app_key: App Key
-    app_key_description: The application key of the OpenAPI application
+    app_key_required: Enter an App Key
     app_secret: App Secret
-    app_secret_description: The application secret the access token is signed with
+    app_secret_required: Enter an App Secret
     binance_spot: Spot
+    binance_spot_credentials_title: Binance Spot trading credentials
     binance_usd_m_perp: USDⓈ-M Futures
+    binance_usd_m_perp_credentials_title: Binance USDⓈ-M Futures trading credentials
+    clear_credentials: Clear
+    clear_credentials_for: 'Clear %{title}'
+    clear_credentials_message: '<p align="center">Clear the saved credentials in "%{title}"? Trading features that use them will stop working until they are filled in again.</p>'
+    clear_credentials_title: Clear trading credentials
+    clob_api_endpoint: CLOB API endpoint
+    clob_api_endpoint_description: The endpoint the CLOB API uses
+    credentials: Credentials
+    credentials_description: Credentials used by trading features
     ed25519_passphrase: Ed25519 Passphrase
     ed25519_private_key: Ed25519 Private Key
+    edit_credentials: Edit
+    edit_credentials_for: 'Edit %{title}'
     enter_access_token: Enter Access Token
     enter_api_key: Enter API Key
     enter_app_key: Enter App Key
@@ -1286,20 +1299,20 @@ settings_ui:
     enter_passphrase: Enter Passphrase
     enter_private_key: Enter Private Key
     enter_secret_key: Enter Secret Key
-    clob_api_endpoint: CLOB API endpoint
-    clob_api_endpoint_description: The endpoint the CLOB API uses
-    credentials: Credentials
     gamma_api_endpoint: Gamma API endpoint
     gamma_api_endpoint_description: The endpoint the Gamma API uses
     http_api_endpoint: HTTP API endpoint
     http_api_endpoint_description: The endpoint the HTTP API uses
+    hyperliquid_credentials_title: Hyperliquid trading credentials
+    longbridge_credentials_title: Longbridge trading credentials
     main_account_address: Main account address
-    main_account_description: The main account the API agent is allowed to operate
+    main_account_address_required: Enter a main account address
+    okx_credentials_title: OKX trading credentials
     passphrase: Passphrase
-    passphrase_description: The passphrase the key was created with
-    private_key_description: The private key this venue's requests are signed with
+    passphrase_required: Enter a Passphrase
+    private_key_required: Enter a Private Key
     secret_key: Secret Key
-    secret_key_description: The secret key this venue's requests authenticate with
+    secret_key_required: Enter a Secret Key
     service_region: Service region
     service_region_china: Mainland China
     service_region_description: The region the account was registered in; the venue answers on that region's hosts

@@ -891,7 +891,7 @@ mod tests {
             let Some(VenueSettings::Longbridge(settings)) = config.venues.get_mut(&venue) else {
                 panic!("{venue} is the venue whose credentials the fixture fills in");
             };
-            settings.credentials = credentials;
+            settings.credentials = Some(credentials);
         }
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config.clone()));
         let notification = ConfigNotification::new(snapshot);

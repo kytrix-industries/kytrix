@@ -9,7 +9,10 @@ use market_participants_model::identifier::VenueId;
 
 use crate::{
     layout::{self, PageArgs},
-    pages::venues::shared::{self, CredentialField, OriginKind},
+    pages::venues::{
+        credentials::{self, CredentialsKind},
+        shared::{self, OriginKind},
+    },
     search::FieldSearch,
 };
 
@@ -91,17 +94,12 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
             ));
         }
 
-        for field in [
-            CredentialField::BinanceApiKey,
-            CredentialField::BinancePrivateKey,
-            CredentialField::BinancePassphrase,
-        ] {
-            if args.filter.admits_field(
-                page_id.as_ref(),
-                field.field_id(&venue, Some(market)).as_ref(),
-            ) {
-                rows.push(shared::credential_row(args, venue, Some(market), field));
-            }
+        let credentials = CredentialsKind::for_market(market);
+        if args
+            .filter
+            .admits_field(page_id.as_ref(), credentials.row_id())
+        {
+            rows.push(credentials::credentials_row(args, credentials));
         }
 
         if rows.is_empty() {
@@ -130,7 +128,7 @@ fn market_title(market: BinanceMarket, cx: &App) -> SharedString {
 pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
     let venue = VenueId::Binance;
     let page_id = shared::page_id(&venue);
-    let mut fields = Vec::with_capacity(BinanceMarket::ALL.len() * 5);
+    let mut fields = Vec::with_capacity(BinanceMarket::ALL.len() * 3);
 
     for market in BinanceMarket::ALL {
         let scope = market.scope();
@@ -151,19 +149,7 @@ pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
             websocket_description.as_ref(),
             &[venue.as_str(), scope, "websocket", "origin", "地址"],
         ));
-
-        for field in [
-            CredentialField::BinanceApiKey,
-            CredentialField::BinancePrivateKey,
-            CredentialField::BinancePassphrase,
-        ] {
-            fields.push(shared::credential_search_field(
-                venue,
-                Some(market),
-                field,
-                cx,
-            ));
-        }
+        fields.push(CredentialsKind::for_market(market).search_field(cx));
     }
 
     fields

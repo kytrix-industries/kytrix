@@ -440,7 +440,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+        let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
         adapter
             .execute(
@@ -490,7 +490,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+        let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
         let handle = adapter
             .subscribe(
@@ -530,7 +530,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+        let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
         let error = adapter
             .execute(
@@ -572,7 +572,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::AllTickers);
+        let context = execution(&fixture, Some(credentials()), CapabilityId::AllTickers);
 
         let error = adapter
             .execute(
@@ -606,11 +606,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(
-            &fixture,
-            LongbridgeCredentials::default(),
-            CapabilityId::Candlesticks,
-        );
+        let context = execution(&fixture, None, CapabilityId::Candlesticks);
 
         let error = adapter
             .execute(
@@ -655,7 +651,7 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let context = execution(&fixture, credentials(), CapabilityId::MarketCatalog);
+        let context = execution(&fixture, Some(credentials()), CapabilityId::MarketCatalog);
 
         let response = adapter
             .execute(
@@ -699,13 +695,13 @@ mod tests {
         )
         .await;
         let adapter = LongbridgeAdapter::new();
-        let asia = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+        let asia = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
         let united_states = execution(
             &fixture,
-            LongbridgeCredentials {
+            Some(LongbridgeCredentials {
                 app_key: SmolStr::new_static("us_app-key"),
                 ..credentials()
-            },
+            }),
             CapabilityId::Candlesticks,
         );
 

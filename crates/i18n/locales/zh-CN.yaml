@@ -1267,18 +1267,31 @@ settings_ui:
     title: 常规
   market_participants:
     access_token: Access Token
-    access_token_description: 为该应用签发的 Access Token，场所用它认证一条会话
+    access_token_required: 请输入 Access Token
     api_agent_private_key: API Agent 私钥
+    api_agent_private_key_required: 请输入 API Agent 私钥
     api_key: API Key
-    api_key_description: 该场所请求认证使用的 API Key
+    api_key_required: 请输入 API Key
     app_key: App Key
-    app_key_description: OpenAPI 应用的 App Key
+    app_key_required: 请输入 App Key
     app_secret: App Secret
-    app_secret_description: 用于签发 Access Token 的 App Secret
+    app_secret_required: 请输入 App Secret
     binance_spot: 现货
+    binance_spot_credentials_title: 币安现货交易凭据
     binance_usd_m_perp: U本位合约
+    binance_usd_m_perp_credentials_title: 币安U本位合约交易凭据
+    clear_credentials: 清除
+    clear_credentials_for: '清除 %{title}'
+    clear_credentials_message: <p align="center">确定清除“%{title}”中已保存的凭据吗？在重新填写前，相关交易功能将无法使用。</p>
+    clear_credentials_title: 清除交易凭据
+    clob_api_endpoint: CLOB API 接入点
+    clob_api_endpoint_description: CLOB API 使用的接入点
+    credentials: 凭据
+    credentials_description: 涉及交易功能所使用的凭据
     ed25519_passphrase: Ed25519 Passphrase
     ed25519_private_key: Ed25519 Private Key
+    edit_credentials: 编辑
+    edit_credentials_for: '编辑 %{title}'
     enter_access_token: 请输入 Access Token
     enter_api_key: 请输入 API Key
     enter_app_key: 请输入 App Key
@@ -1286,20 +1299,20 @@ settings_ui:
     enter_passphrase: 请输入 Passphrase
     enter_private_key: 请输入 Private Key
     enter_secret_key: 请输入 Secret Key
-    clob_api_endpoint: CLOB API 接入点
-    clob_api_endpoint_description: CLOB API 使用的接入点
-    credentials: 凭据
     gamma_api_endpoint: Gamma API 接入点
     gamma_api_endpoint_description: Gamma API 使用的接入点
     http_api_endpoint: HTTP API 接入点
     http_api_endpoint_description: HTTP API 使用的接入点
+    hyperliquid_credentials_title: Hyperliquid交易凭据
+    longbridge_credentials_title: 长桥交易凭据
     main_account_address: 主账户地址
-    main_account_description: API Agent 有权操作的主账户
+    main_account_address_required: 请输入主账户地址
+    okx_credentials_title: 欧易交易凭据
     passphrase: Passphrase
-    passphrase_description: 创建该 API Key 时设置的 Passphrase
-    private_key_description: 该场所请求签名使用的私钥
+    passphrase_required: 请输入 Passphrase
+    private_key_required: 请输入 Private Key
     secret_key: Secret Key
-    secret_key_description: 该场所请求认证使用的 Secret Key
+    secret_key_required: 请输入 Secret Key
     service_region: 服务地区
     service_region_china: 中国大陆
     service_region_description: 该账户注册的地区，该场所只在该地区的地址上应答

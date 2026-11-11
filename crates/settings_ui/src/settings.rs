@@ -1,10 +1,10 @@
 //! The settings page: what the application is configured by, drawn in the page area of the main
 //! window in place of the workspace.
 //!
-//! The page owns what outlives a frame: the page that is drawn, the state of every text field on
-//! it, and the scroll position of that page. Each page is native UI — its rows, cards and controls
-//! are written where the page is written — and this module is the frame around them: the sidebar,
-//! the search, the routing between pages, and the one place a text field is committed.
+//! The page owns what outlives a frame: the page that is drawn and the scroll position of that
+//! page. Each page is native UI — its rows, cards and controls are written where the page is
+//! written — and this module is the frame around them: the sidebar, the search, the routing between
+//! pages, and the one place a failed write is reported.
 //!
 //! The page has the gallery's shape: a title and the search field in its header, and the settings
 //! menu on the left with the detail page behind the selected entry on the right. There is no
@@ -17,8 +17,9 @@
 //! A control writes the settings rather than a copy of them, through the session every view of
 //! this page shares — see [`SettingsPage::apply`]. A write that cannot be stored leaves the
 //! settings as they were and is reported over the page, so what the user had is still there to try
-//! again with. A text field is written when the caret leaves it or Enter is pressed, and what is
-//! still unsaved when another page is opened or this one is left is written then.
+//! again with. A form that edits a credential set is a dialog on the window layer: it holds a draft
+//! of one set and writes nothing until it is confirmed, so a cancelled dialog leaves the settings
+//! untouched and a confirmed one writes the set through the same session.
 //!
 //! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its own
 //! label nor by a setting on it is not drawn at all, and a group with none of its pages left is not
@@ -27,20 +28,19 @@
 //! that was open behind.
 //!
 //! A page is native UI drawn on every frame, so it follows the language the window is showing by
-//! itself. What the page holds across frames — the rows of the sidebar, the words the search is
-//! answered over, the placeholder of a field built before — does not, so it is built again when
-//! the language moves on — see [`SettingsPage::adopt_language`].
+//! itself. What the page holds across frames — the rows of the sidebar and the words the search is
+//! answered over — does not, so it is built again when the language moves on — see
+//! [`SettingsPage::adopt_language`].
 //!
 //! The proxy catalog and the translation page are views of their own. The form that changes the
 //! proxy catalog is a dialog on the window layer, drawn over this page. A row cannot open one
 //! itself — a table cell is drawn without a window — so it records the form it wants and this page
 //! opens it on the layer. The form writes the same session, because it is one page either way.
 //! Deleting a row is the one request that is put to the user before it is written, and the alert
-//! it is put to is opened the same way — see [`SettingsPage::open_requested_form`].
+//! it is put to is opened the same way — see [`SettingsPage::open_requested_form`]. The credential
+//! dialog and its clear confirmation are opened by the venue row that holds them, which is drawn
+//! with a window and with this page's session.
 
-use std::rc::Rc;
-
-use app_config::settings::Config;
 use base_ui::{
     button::Button,
     icon::{Icon, IconKind},
@@ -84,25 +84,6 @@ const SEARCH_WIDTH: Pixels = px(240.0);
 /// The element id of the search field, which is also the key of its state.
 const SEARCH_INPUT_ID: &str = "settings-search";
 
-/// One text field of one page, remembered for as long as the page is open.
-struct TextInput {
-    /// The setting this is the input of, which is what keeps the control's state across frames.
-    id: SharedString,
-    /// The value this input was last aligned with the settings on, which is what a rebuild
-    /// compares against: a value the field holds that is neither this nor the stored one is a
-    /// value the user typed and the settings have not taken.
-    built_from: SharedString,
-    /// The placeholder the field carries, which is text of the language it was built in and is
-    /// written again when that moved on.
-    placeholder: Option<SharedString>,
-    /// How the page writes what is typed into this field.
-    write: Rc<dyn Fn(&mut Config, &str)>,
-    entity: Entity<InputState>,
-    /// Held because the subscription is what commits the field: dropping it would leave a field
-    /// that is typed into and never written.
-    _events: Subscription,
-}
-
 /// The whole of the settings, as the main window's settings page.
 pub struct SettingsPage {
     /// The session every control of this page writes through.
@@ -119,8 +100,8 @@ pub struct SettingsPage {
     /// The language the text this page holds was built in.
     ///
     /// A page is drawn natively afresh on every frame, so what it shows is the text of the
-    /// frame's language. What is held across frames is not, so this is what the sidebar, the
-    /// filter and the placeholder of a field are compared against.
+    /// frame's language. What is held across frames is not, so this is what the sidebar and the
+    /// filter are compared against.
     language: LanguageCode,
     /// The query the sidebar was last built for, so it is rebuilt when the answer changed rather
     /// than on every frame.
@@ -134,7 +115,6 @@ pub struct SettingsPage {
     /// The search field, which is built the first time the page is drawn: a text field is filled
     /// in by a window, and the page is built before there is one to draw it in.
     search_input: Option<Entity<InputState>>,
-    inputs: Vec<TextInput>,
     page_scroll: ScrollHandle,
     proxies: Entity<ProxyTable>,
     translation: Entity<TranslationPage>,
@@ -150,9 +130,8 @@ impl SettingsPage {
     /// the page opens, and every value on a page is read from and written to the settings
     /// themselves.
     ///
-    /// What needs a window — the search field and the fields of the page that is drawn — is
-    /// built on the first frame rather than here, because the page is built before the window
-    /// it is about to be shown in has drawn it.
+    /// The search field needs a window and is built on the first frame rather than here, because
+    /// the page is built before the window it is about to be shown in has drawn it.
     pub fn load(cx: &mut Context<Self>) -> Self {
         let session = cx.new(|_| SettingsSession::new());
         let filter = SearchFilter::new("", &registry::search_nodes(cx));
@@ -174,12 +153,21 @@ impl SettingsPage {
             sidebar: Vec::new(),
             sidebar_scroll: ScrollHandle::new(),
             search_input: None,
-            inputs: Vec::new(),
             page_scroll: ScrollHandle::new(),
             proxies,
             translation,
             search_events: None,
         }
+    }
+
+    /// The session every control of this page writes through, for a control that opens a dialog
+    /// of its own.
+    ///
+    /// A credential row is drawn by the page's own frame, so what it is handed is the page; the
+    /// dialog it opens writes the same session, and this is how the row gets it without reaching
+    /// back into the page entity while that entity is being rendered.
+    pub(crate) fn session_entity(&self) -> Entity<SettingsSession> {
+        self.session.clone()
     }
 
     /// The search field, built the first time it is drawn.
@@ -252,95 +240,6 @@ impl SettingsPage {
         }
     }
 
-    /// The state of one text field, built the first time the field is drawn and reused
-    /// afterwards.
-    ///
-    /// Reusing it is what keeps a caret where it was: an input rebuilt on every frame is an
-    /// input the user is typing into that loses what they typed. What an input is reused for is
-    /// the field it belongs to holding either the value it was last aligned with the settings on
-    /// or the value the settings hold now: the first is a field the user is typing into, the
-    /// second a field whose own write has already been stored, and both are what the user is
-    /// looking at. Anything else is a field whose value moved under it, and that one is built
-    /// again around the value the settings hold.
-    pub(crate) fn text_input(
-        &mut self,
-        id: SharedString,
-        stored: SharedString,
-        placeholder: Option<SharedString>,
-        password: bool,
-        write: Rc<dyn Fn(&mut Config, &str)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        if let Some(input) = self.inputs.iter_mut().find(|input| input.id == id) {
-            let current = input.entity.read(cx).value(cx);
-            if input.built_from == stored || current == stored {
-                // A write of this field has been stored since the input was built, so the value
-                // it was built from is one frame behind what the field now holds: the input is
-                // what the settings moved to, and it is taken as aligned rather than rebuilt.
-                input.built_from = stored;
-                // What a field that is used again holds is left alone, because the user may be
-                // typing into it. Its placeholder is text of the language it was built in, so
-                // that is written again rather than left in the language the interface has left.
-                if input.placeholder != placeholder {
-                    let text = placeholder.clone().unwrap_or_default();
-                    input.entity.update(cx, |input, cx| {
-                        input.update_placeholder(text, window, cx);
-                    });
-                    input.placeholder = placeholder;
-                }
-
-                return input.entity.clone();
-            }
-        }
-
-        // A field whose stored value changed elsewhere is rebuilt around that value: what the
-        // field had is what the user was looking at, and what they are configuring is the
-        // settings.
-        self.inputs.retain(|input| input.id != id);
-        let entity = cx.new(|cx| {
-            let mut builder = InputStateBuilder::new(id.clone()).default_value(stored.as_str());
-            if password {
-                builder = builder.password();
-            }
-            if let Some(placeholder) = &placeholder {
-                builder = builder.placeholder(placeholder.clone());
-            }
-
-            builder.build(window, cx)
-        });
-        let write_for_event = write.clone();
-        let subscription =
-            cx.subscribe(&entity, move |settings, _, event: &InputStateEvent, cx| {
-                // A field is written when the user is done with it rather than on every
-                // keystroke: a half-typed key is never stored, and Enter is the way to write one
-                // without leaving the field.
-                match event {
-                    InputStateEvent::Blur(value) | InputStateEvent::PressEnter(value) => {
-                        let value = value.clone();
-                        let write = write_for_event.clone();
-                        settings.apply(
-                            SettingsChange::edit(move |config| {
-                                write(config, value.as_str());
-                            }),
-                            cx,
-                        );
-                    }
-                    InputStateEvent::Change(_) => {}
-                }
-            });
-        self.inputs.push(TextInput {
-            id,
-            built_from: stored,
-            placeholder,
-            write,
-            entity: entity.clone(),
-            _events: subscription,
-        });
-
-        entity
-    }
-
     /// Writes one change into the settings this page draws.
     pub(crate) fn apply(&mut self, change: SettingsChange, cx: &mut Context<Self>) {
         self.session.update(cx, |session, cx| {
@@ -351,41 +250,13 @@ impl SettingsPage {
         cx.notify();
     }
 
-    /// Writes what every text field currently holds.
+    /// Says why the last write could not be stored, if one is waiting.
     ///
-    /// A text field is written when the caret leaves it, and opening another page or leaving the
-    /// page does not take the caret away from it: without this, the last thing typed before the
-    /// page moved on would be the one thing the settings did not carry.
-    fn commit_pending_inputs(&mut self, cx: &mut Context<Self>) {
-        // The fields are read while the settings are written, and the settings are written
-        // through `self`, so what to write is collected before anything is written.
-        let pending = self
-            .inputs
-            .iter()
-            .filter_map(|input| {
-                let value = input.entity.read(cx).value(cx);
-                (value != input.built_from).then(|| (input.write.clone(), value))
-            })
-            .collect::<Vec<_>>();
-
-        for (write, value) in pending {
-            self.apply(
-                SettingsChange::edit(move |config| {
-                    write(config, value.as_str());
-                }),
-                cx,
-            );
-        }
-    }
-
-    /// Writes what is still typed into a text field, and says why it could not be stored.
-    ///
-    /// The main window is what asks this before it takes the page away. The page is left either
-    /// way: what is reported is the last write that did not land, and the input it came from is
-    /// what the user lost by leaving.
-    pub fn commit_pending(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        self.commit_pending_inputs(cx);
-
+    /// The main window is what asks this before it takes the page away: a write that failed and
+    /// was not drawn by this page — the settings were left before the frame that reports it — is
+    /// carried to what is drawn next, rather than dropped with the page. The reason is taken out
+    /// of the session, so it is reported once.
+    pub fn take_write_failure(&mut self, cx: &mut Context<Self>) -> Option<String> {
         self.session
             .update(cx, |session, _| session.take_failure())
             .map(|error| error.to_string())
@@ -395,7 +266,7 @@ impl SettingsPage {
     ///
     /// The reason is taken out of the session, so it is reported once. What a failed write leaves
     /// behind is the settings as they were: a choice is drawn from them again and shows the old
-    /// value, and a text field keeps what the user typed so the write can be made again.
+    /// value, and a dialog keeps what the user typed so the write can be made again.
     fn report_write_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(error) = self.session.update(cx, |session, _| session.take_failure()) else {
             return;
@@ -406,17 +277,15 @@ impl SettingsPage {
 
     /// Selects the page one sidebar row names.
     ///
-    /// What is still typed into a text field of the page being left is written first: the field
-    /// is not drawn any more, so nothing else would write it. The caret goes with the page it was
-    /// on, because the field it was in is not drawn any more and a keystroke would reach something
-    /// the user cannot see. The page moves even when that write failed, because the input is kept
-    /// by this page and the field is still there to be submitted again when the user comes back.
+    /// The caret goes with the page it was on: a control of the page being left is not drawn any
+    /// more, and a keystroke would reach something the user cannot see. Nothing is written here:
+    /// a change is written by the control that makes it, and a dialog that holds a draft writes it
+    /// only when the dialog is confirmed.
     pub(crate) fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.current_page.as_ref() == id {
             return;
         }
 
-        self.commit_pending_inputs(cx);
         window.blur(cx);
         self.move_to(id, cx);
     }
@@ -424,10 +293,9 @@ impl SettingsPage {
     /// Moves the page to one entry of the sidebar.
     ///
     /// The page drawn and the row that names it are one thing: the row is drawn selected from
-    /// the page the settings are on, so a page moved on its own would leave the row behind it, and
-    /// the field the user is typing into would stop being drawn under the caret that is still
-    /// in it. Nothing is written here: this is what the page moves by, and what a search or a
-    /// language switch moves it with.
+    /// the page the settings are on, so a page moved on its own would leave the row behind it.
+    /// Nothing is written here: this is what the page moves by, and what a search or a language
+    /// switch moves it with.
     ///
     /// The translation page repairs its settings when it is opened, and being moved to is what
     /// opens it: see [`crate::pages::translation::page::TranslationPage::repair_on_open`].
@@ -467,9 +335,7 @@ impl SettingsPage {
         if let Some(page) = next {
             // The page moves the way a selection moves rather than on its own: the page drawn
             // and the row that names it are one thing, so a page moved without the sidebar is
-            // a page the sidebar has no row for. A search is not a page being left, though: what
-            // a text field still holds is written when the page is selected or left, not when
-            // the query that narrows the sidebar changed.
+            // a page the sidebar has no row for.
             let id = page.id();
             self.move_to(id.as_ref(), cx);
         }
@@ -726,15 +592,6 @@ impl SettingsPage {
     pub(crate) fn translation_for_test(&self) -> &Entity<TranslationPage> {
         &self.translation
     }
-
-    /// One text field of the page, for the tests that read what it holds.
-    #[cfg(test)]
-    pub(crate) fn input_for_test(&self, id: &str) -> Option<Entity<InputState>> {
-        self.inputs
-            .iter()
-            .find(|input| input.id.as_ref() == id)
-            .map(|input| input.entity.clone())
-    }
 }
 
 impl Render for SettingsPage {
@@ -773,7 +630,6 @@ impl Render for SettingsPage {
                     let mut args = PageArgs {
                         config: config.as_ref(),
                         filter: &filter,
-                        window,
                         settings: self,
                         handle: &handle,
                         cx,
@@ -862,8 +718,9 @@ impl Render for SettingsPage {
 
 /// Shows why a change could not be stored.
 ///
-/// The settings page reports its own failures with this, and so does the main window when leaving
-/// the page discarded what was still typed into a field: one sentence, wherever it is reported.
+/// The settings page reports its own failures with this, and so does the main window when a write
+/// that failed was carried out of the page before a frame reported it: one sentence, wherever it
+/// is reported.
 pub fn show_write_failure(window: &mut Window, cx: &mut App, reason: String) {
     let title = t!(cx, "settings_ui.save_failed.title");
     let message = t!(cx, "settings_ui.save_failed.message", reason = reason);

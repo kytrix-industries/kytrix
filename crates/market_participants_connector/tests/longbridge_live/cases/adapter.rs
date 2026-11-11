@@ -385,15 +385,18 @@ async fn live_case_20_the_adapter_reads_a_live_ticker() {
 fn live_connector(case: &str, values: &Credentials) -> (MarketParticipantsConnector, Arc<Catalog>) {
     let mut settings = LongbridgeSettings {
         region: LongbridgeRegion::Global,
-        credentials: LongbridgeCredentials {
+        credentials: Some(LongbridgeCredentials {
             app_key: SmolStr::new(values.app_key.as_str()),
             app_secret: SmolStr::new(values.app_secret.as_str()),
             access_token: SmolStr::new(values.access_token.as_str()),
-        },
+        }),
         ..LongbridgeSettings::default()
     };
     assert!(
-        settings.credentials.is_complete(),
+        settings
+            .credentials
+            .as_ref()
+            .is_some_and(LongbridgeCredentials::is_complete),
         "{case}: the credential set this run read is complete"
     );
     assert_eq!(

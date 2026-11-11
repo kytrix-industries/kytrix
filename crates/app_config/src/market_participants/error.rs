@@ -10,7 +10,12 @@ use thiserror::Error;
 /// states the venue through the catalogue instead.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MarketParticipantsConfigError {
-    /// The credential set configured for one market is only partly filled.
+    /// A credential set is stored but only partly filled.
+    ///
+    /// The set is one market's where the venue configures its markets apart — Binance's spot
+    /// or USDⓈ-M perpetual set — and the venue's whole surface where it authenticates with one
+    /// set, which is every other venue. Either way it is refused wherever it would sign a
+    /// request, so a half-filled set never reaches a venue.
     #[error(
         "the credentials stored for venue {} are incomplete{}",
         .venue.as_str(),
@@ -20,20 +25,6 @@ pub enum MarketParticipantsConfigError {
         venue: VenueId,
         /// The scope whose credential set is at fault, for a venue that configures
         /// its markets apart.
-        scope: Option<SmolStr>,
-    },
-    /// The stored credential set is another venue's shape.
-    ///
-    /// A credential set is a value of exactly one venue's shape, so this is not a
-    /// set to finish filling in: it is one that can never authenticate the venue it
-    /// was found under.
-    #[error(
-        "the credentials stored for venue {} are not that venue's shape{}",
-        .venue.as_str(),
-        .scope.as_ref().map_or_else(String::new, |scope| format!(" for scope {scope}"))
-    )]
-    MismatchedShape {
-        venue: VenueId,
         scope: Option<SmolStr>,
     },
 }

@@ -1246,11 +1246,11 @@ mod tests {
         else {
             panic!("the built-in table configures longbridge as Longbridge");
         };
-        settings.credentials = LongbridgeCredentials {
+        settings.credentials = Some(LongbridgeCredentials {
             app_key: SmolStr::new_static("app-key"),
             app_secret: SmolStr::new_static("app-secret"),
             access_token: SmolStr::new_static("access-token"),
-        };
+        });
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config));
         let notification = ConfigNotification::new(snapshot);
         let configured = MarketParticipantsConnector::new(

@@ -29,8 +29,7 @@ use url::Url;
 use crate::{
     market_participants::{
         credentials::{
-            BinanceCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
-            VenueCredentials,
+            BinanceMarketCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
         },
         error::MarketParticipantsConfigError,
         origins::{
@@ -123,8 +122,10 @@ impl FixturePair {
 ///
 /// The venue's two products are configured apart because they are reached apart and
 /// signed apart: the spot API answers on its own hosts and authenticates with its own
-/// key, and the USDⓈ-M futures API does neither with the spot API's.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// key, and the USDⓈ-M futures API does neither with the spot API's. A market nothing
+/// was typed into stores no set at all, so clearing one market's credentials leaves
+/// the other's exactly where they were.
+#[derive(Clone, Debug, Serialize)]
 pub struct BinanceSettings {
     /// The line this venue's requests take, or nothing while it follows the
     /// document's default line.
@@ -134,9 +135,13 @@ pub struct BinanceSettings {
     /// canonical scope name.
     #[serde(rename = "origins", deserialize_with = "deserialize_market_origins")]
     pub origins: BTreeMap<SmolStr, BinanceOrigins>,
-    /// The credentials each of the venue's markets signs with.
-    #[serde(rename = "credentials")]
-    pub credentials: BinanceCredentials,
+    /// The credentials the spot market signs with, or nothing while it is unconfigured.
+    #[serde(rename = "spot_credentials")]
+    pub spot_credentials: Option<BinanceMarketCredentials>,
+    /// The credentials the USDⓈ-M perpetual market signs with, or nothing while it is
+    /// unconfigured.
+    #[serde(rename = "usd_m_perp_credentials")]
+    pub usd_m_perp_credentials: Option<BinanceMarketCredentials>,
     /// The addresses this venue's markets are dialed at, which a test's fixture fills in.
     ///
     /// Public because it is a field of a public struct, and a caller outside this crate that
@@ -153,13 +158,104 @@ impl PartialEq for BinanceSettings {
     fn eq(&self, other: &Self) -> bool {
         self.proxy == other.proxy
             && self.origins == other.origins
-            && self.credentials == other.credentials
+            && self.spot_credentials == other.spot_credentials
+            && self.usd_m_perp_credentials == other.usd_m_perp_credentials
     }
 }
 
 impl Eq for BinanceSettings {}
 
+/// The keys a Binance row stores, exactly as the file spells them.
+///
+/// The two credential keys are `Option` twice over: the outer one says whether the file
+/// names the key at all, and the inner one whether that market is configured. A row that
+/// names neither is refused by [`BinanceSettings`]'s decoder rather than read as a venue
+/// whose markets happen to be unconfigured, which is what an older file without the
+/// per-market keys would otherwise look like.
+#[derive(Deserialize)]
+struct BinanceSettingsFile {
+    #[serde(rename = "proxy")]
+    proxy: Option<ProxyRoute>,
+    #[serde(rename = "origins", deserialize_with = "deserialize_market_origins")]
+    origins: BTreeMap<SmolStr, BinanceOrigins>,
+    #[serde(
+        rename = "spot_credentials",
+        default,
+        deserialize_with = "deserialize_present_credentials"
+    )]
+    spot_credentials: Option<Option<BinanceMarketCredentials>>,
+    #[serde(
+        rename = "usd_m_perp_credentials",
+        default,
+        deserialize_with = "deserialize_present_credentials"
+    )]
+    usd_m_perp_credentials: Option<Option<BinanceMarketCredentials>>,
+}
+
+/// Decodes one per-market credential key, telling an explicit `null` apart from a key the row
+/// never names.
+///
+/// `Option<T>`'s own decoder answers `None` for both, which is what would read an old file as
+/// a venue with two unconfigured markets: here a key that is present — whatever it holds — is
+/// `Some`, and only a key that is absent stays `None`.
+fn deserialize_present_credentials<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<BinanceMarketCredentials>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<BinanceMarketCredentials>::deserialize(deserializer).map(Some)
+}
+
+/// Decodes a Binance row, requiring both per-market credential keys to be named.
+///
+/// `null` is a market nothing was typed into, but a missing key is not: the file this
+/// build writes always names both, so a row that names neither is a shape from before the
+/// markets were configured apart. It is refused whole — which routes it to the reset path
+/// that backs the old file up — instead of being read as a venue with two unconfigured
+/// markets. The fixture bindings are the running snapshot's, so they are never read here.
+impl<'de> Deserialize<'de> for BinanceSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let file = BinanceSettingsFile::deserialize(deserializer)?;
+        Ok(Self {
+            proxy: file.proxy,
+            origins: file.origins,
+            spot_credentials: file
+                .spot_credentials
+                .ok_or_else(|| D::Error::missing_field("spot_credentials"))?,
+            usd_m_perp_credentials: file
+                .usd_m_perp_credentials
+                .ok_or_else(|| D::Error::missing_field("usd_m_perp_credentials"))?,
+            bindings: Bindings::default(),
+        })
+    }
+}
+
 impl BinanceSettings {
+    /// Returns the credentials one market signs with, or nothing while the operator has
+    /// configured none for it.
+    pub fn market_credentials(&self, market: BinanceMarket) -> Option<&BinanceMarketCredentials> {
+        match market {
+            BinanceMarket::Spot => self.spot_credentials.as_ref(),
+            BinanceMarket::UsdMPerp => self.usd_m_perp_credentials.as_ref(),
+        }
+    }
+
+    /// Replaces the credentials one market signs with; `None` clears that market alone.
+    pub fn set_market_credentials(
+        &mut self,
+        market: BinanceMarket,
+        credentials: Option<BinanceMarketCredentials>,
+    ) {
+        match market {
+            BinanceMarket::Spot => self.spot_credentials = credentials,
+            BinanceMarket::UsdMPerp => self.usd_m_perp_credentials = credentials,
+        }
+    }
+
     /// Returns the origin choices of one market, or nothing for a market the file
     /// does not configure.
     pub fn market_origins(&self, market: BinanceMarket) -> Option<BinanceOrigins> {
@@ -239,7 +335,8 @@ impl Default for BinanceSettings {
                     )
                 })
                 .collect(),
-            credentials: BinanceCredentials::default(),
+            spot_credentials: None,
+            usd_m_perp_credentials: None,
             bindings: Bindings::default(),
         }
     }
@@ -273,9 +370,17 @@ pub struct OkxSettings {
     /// The service region this account belongs to.
     #[serde(rename = "region")]
     pub region: OkxRegion,
-    /// The credentials the venue's authenticated requests sign with.
+    /// The credentials the venue's authenticated requests sign with, or nothing while the
+    /// venue is unconfigured.
+    ///
+    /// A row that names no `credentials` key and a row that names `null` both decode as
+    /// `None`: this build accepts a missing key as unconfigured. A file this build writes
+    /// always writes the key, the object shape an older file carries is unchanged, and a key
+    /// that is present but holds a set with an empty value stays `Some` and is refused by
+    /// [`VenueSettings::validate_credentials`]: an incomplete set fails closed rather than
+    /// being read as unconfigured or signing a request.
     #[serde(rename = "credentials")]
-    pub credentials: OkxCredentials,
+    pub credentials: Option<OkxCredentials>,
     /// The addresses this venue's scopes are dialed at, which a test's fixture fills in.
     ///
     /// Public for the reason [`BinanceSettings::bindings`] is.
@@ -333,9 +438,17 @@ pub struct HyperliquidSettings {
     /// The address the venue's streams are opened on.
     #[serde(rename = "websocket")]
     pub websocket: HyperliquidWebsocketOrigin,
-    /// The credentials the venue's authenticated requests sign with.
+    /// The credentials the venue's authenticated requests sign with, or nothing while the
+    /// venue is unconfigured.
+    ///
+    /// A row that names no `credentials` key and a row that names `null` both decode as
+    /// `None`: this build accepts a missing key as unconfigured. A file this build writes
+    /// always writes the key, the object shape an older file carries is unchanged, and a key
+    /// that is present but holds a set with an empty value stays `Some` and is refused by
+    /// [`VenueSettings::validate_credentials`]: an incomplete set fails closed rather than
+    /// being read as unconfigured or signing a request.
     #[serde(rename = "credentials")]
-    pub credentials: HyperliquidCredentials,
+    pub credentials: Option<HyperliquidCredentials>,
     /// The addresses this venue's scopes are dialed at, which a test's fixture fills in.
     ///
     /// Public for the reason [`BinanceSettings::bindings`] is.
@@ -389,9 +502,17 @@ pub struct LongbridgeSettings {
     /// The service region this account belongs to.
     #[serde(rename = "region")]
     pub region: LongbridgeRegion,
-    /// The credentials the venue's authenticated requests sign with.
+    /// The credentials the venue's authenticated requests sign with, or nothing while the
+    /// venue is unconfigured.
+    ///
+    /// A row that names no `credentials` key and a row that names `null` both decode as
+    /// `None`: this build accepts a missing key as unconfigured. A file this build writes
+    /// always writes the key, the object shape an older file carries is unchanged, and a key
+    /// that is present but holds a set with an empty value stays `Some` and is refused by
+    /// [`VenueSettings::validate_credentials`]: an incomplete set fails closed rather than
+    /// being read as unconfigured or signing a request.
     #[serde(rename = "credentials")]
-    pub credentials: LongbridgeCredentials,
+    pub credentials: Option<LongbridgeCredentials>,
     /// The addresses this venue's scopes are dialed at, which a test's fixture fills in.
     ///
     /// Public for the reason [`BinanceSettings::bindings`] is.
@@ -519,6 +640,22 @@ impl VenueSettings {
     /// Returns whether this venue publishes one scope statically.
     pub fn publishes(&self, scope: &str) -> bool {
         self.scope_ids().contains(&scope)
+    }
+
+    /// Returns the venue this row is tagged as.
+    ///
+    /// The row is stored under this same venue in the file's `venues` map. The decoder holds
+    /// the key and the row's own `venue` tag together, so a hand-edited file cannot put one
+    /// venue's settings under another venue's key and have every reader answer the wrong
+    /// venue's choices.
+    pub const fn venue_id(&self) -> VenueId {
+        match self {
+            Self::Binance(_) => VenueId::Binance,
+            Self::Hyperliquid(_) => VenueId::Hyperliquid,
+            Self::Okx(_) => VenueId::Okx,
+            Self::Longbridge(_) => VenueId::Longbridge,
+            Self::Polymarket(_) => VenueId::Polymarket,
+        }
     }
 
     /// Returns the scope the venue answers its own non-scoped conversations on.
@@ -685,8 +822,13 @@ impl VenueSettings {
         }
     }
 
-    /// Reports whether the credentials one scope's requests sign with are complete,
-    /// empty, or only partly filled.
+    /// Reports whether the credentials one scope's requests sign with are complete or
+    /// absent, or stored only partly filled.
+    ///
+    /// A scope nothing is stored for is *unconfigured* rather than invalid, which is
+    /// what every venue starts as. A set that is stored but incomplete is refused, so a
+    /// half-filled set can never sign a request. Binance stores one set per market, and
+    /// a scope the venue does not publish has no set at all.
     pub fn validate_credentials(
         &self,
         venue: VenueId,
@@ -699,30 +841,60 @@ impl VenueSettings {
                     .into_iter()
                     .find(|market| market.scope() == credential_scope)
                 else {
-                    return Err(MarketParticipantsConfigError::MismatchedShape {
-                        venue,
-                        scope: Some(SmolStr::new(scope)),
-                    });
+                    return Ok(false);
                 };
-                let credentials = settings.credentials.market(market.credential_market());
-                credentials.validate(venue, Some(credential_scope))
+                stored_credentials(
+                    settings.market_credentials(market),
+                    venue,
+                    Some(credential_scope),
+                    BinanceMarketCredentials::is_complete,
+                )
             }
-            Self::Okx(settings) => {
-                let credentials = VenueCredentials::Okx(settings.credentials.clone());
-                credentials.validate_venue(venue)
-            }
-            Self::Hyperliquid(settings) => {
-                let credentials = VenueCredentials::Hyperliquid(settings.credentials.clone());
-                credentials.validate_venue(venue)
-            }
-            Self::Longbridge(settings) => {
-                let credentials = VenueCredentials::Longbridge(settings.credentials.clone());
-                credentials.validate_venue(venue)
-            }
+            Self::Okx(settings) => stored_credentials(
+                settings.credentials.as_ref(),
+                venue,
+                None,
+                OkxCredentials::is_complete,
+            ),
+            Self::Hyperliquid(settings) => stored_credentials(
+                settings.credentials.as_ref(),
+                venue,
+                None,
+                HyperliquidCredentials::is_complete,
+            ),
+            Self::Longbridge(settings) => stored_credentials(
+                settings.credentials.as_ref(),
+                venue,
+                None,
+                LongbridgeCredentials::is_complete,
+            ),
             // Polymarket's market data is public: this build stores no credential
             // for it, so there is no set to be incomplete.
             Self::Polymarket(_) => Ok(false),
         }
+    }
+}
+
+/// Reports whether one stored credential set is complete, absent, or only partly filled.
+///
+/// `None` is a set nothing was written into — the unconfigured state every venue starts
+/// as. A `Some` set missing a required value is refused against the venue — and against
+/// the scope as well when the venue configures its markets apart — by
+/// [`MarketParticipantsConfigError::IncompleteCredentials`], which the operator resolves
+/// by finishing the set.
+fn stored_credentials<T>(
+    stored: Option<&T>,
+    venue: VenueId,
+    scope: Option<&str>,
+    is_complete: impl Fn(&T) -> bool,
+) -> Result<bool, MarketParticipantsConfigError> {
+    match stored {
+        None => Ok(false),
+        Some(credentials) if is_complete(credentials) => Ok(true),
+        Some(_) => Err(MarketParticipantsConfigError::IncompleteCredentials {
+            venue,
+            scope: scope.map(SmolStr::new),
+        }),
     }
 }
 
@@ -760,6 +932,11 @@ pub fn default_venues() -> BTreeMap<VenueId, VenueSettings> {
 /// A venue this build does not speak is refused by the identity itself, one step
 /// earlier: the keys of this map are a closed set, so a name outside it is not a
 /// venue the file could have meant.
+///
+/// Each row is also held to the key it is stored under: the row's own `venue` tag has
+/// to name the same venue as its key. A hand-edited file that puts one venue's row
+/// under another venue's key is refused whole rather than read as the venue its key
+/// names.
 pub(crate) fn deserialize_venues<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<VenueId, VenueSettings>, D::Error>
@@ -776,6 +953,15 @@ where
         return Err(D::Error::custom(format_args!(
             "venues does not name every venue this build speaks: missing {missing:?}"
         )));
+    }
+    for (venue, settings) in &venues {
+        let tagged = settings.venue_id();
+        if tagged != *venue {
+            return Err(D::Error::custom(format_args!(
+                "the venues map names {venue} but its row is tagged {tagged}: every row is stored \
+                 under the venue its `venue` tag names"
+            )));
+        }
     }
     Ok(venues)
 }
@@ -1099,7 +1285,8 @@ mod tests {
                     "websocket": "wss://fstream.binance.com",
                 },
             },
-            "credentials": BinanceCredentials::default(),
+            "spot_credentials": null,
+            "usd_m_perp_credentials": null,
         }))
         .expect("a published address decodes");
         let VenueSettings::Binance(decoded) = decoded else {
@@ -1127,7 +1314,8 @@ mod tests {
                     "websocket": "wss://fstream.binance.com",
                 },
             },
-            "credentials": BinanceCredentials::default(),
+            "spot_credentials": null,
+            "usd_m_perp_credentials": null,
         }));
         assert!(
             refused.is_err(),
@@ -1150,7 +1338,8 @@ mod tests {
                     "websocket": "wss://fstream.binance.com",
                 },
             },
-            "credentials": BinanceCredentials::default(),
+            "spot_credentials": null,
+            "usd_m_perp_credentials": null,
         }));
         assert!(
             borrowed.is_err(),
@@ -1175,7 +1364,8 @@ mod tests {
                 "venue": "binance",
                 "proxy": null,
                 "origins": markets,
-                "credentials": BinanceCredentials::default(),
+                "spot_credentials": null,
+                "usd_m_perp_credentials": null,
             }));
 
             assert!(
@@ -1197,12 +1387,139 @@ mod tests {
             "venue": "binance",
             "proxy": null,
             "origins": { "spot": span, "perp-dex/xyz": span },
-            "credentials": BinanceCredentials::default(),
+            "spot_credentials": null,
+            "usd_m_perp_credentials": null,
         }));
 
         assert!(
             refused.is_err(),
             "a scope this build does not route is not a settings key"
+        );
+    }
+
+    /// A complete Binance row of the shape this build writes, for tests that take one key away.
+    fn binance_row() -> serde_json::Value {
+        json!({
+            "venue": "binance",
+            "proxy": null,
+            "origins": {
+                "spot": {
+                    "http": "https://api.binance.com",
+                    "websocket": "wss://stream.binance.com:9443",
+                },
+                "usd-m-perp": {
+                    "http": "https://fapi.binance.com",
+                    "websocket": "wss://fstream.binance.com",
+                },
+            },
+            "spot_credentials": null,
+            "usd_m_perp_credentials": null,
+        })
+    }
+
+    /// Both per-market credential keys are required: a row that names only one of them is a
+    /// shape from before the markets were configured apart, so it is refused whole rather than
+    /// read as a market nobody configured.
+    #[test]
+    fn a_binance_row_without_a_market_credential_key_is_refused() {
+        for missing in ["spot_credentials", "usd_m_perp_credentials"] {
+            let mut row = binance_row();
+            row.as_object_mut()
+                .expect("a venue row serializes as an object")
+                .remove(missing);
+
+            let refused = serde_json::from_value::<VenueSettings>(row.clone());
+            let message = refused
+                .expect_err("a row without a market's credential key is not this shape")
+                .to_string();
+
+            assert!(
+                message.contains(missing),
+                "the refusal names the key the row is missing: {message}"
+            );
+        }
+    }
+
+    /// An explicit `null` is a market nothing was typed into, and it decodes as such: the key
+    /// is required, the value it holds is not.
+    #[test]
+    fn a_binance_market_credential_key_may_hold_null() {
+        let VenueSettings::Binance(decoded) =
+            serde_json::from_value::<VenueSettings>(binance_row()).expect("a null set decodes")
+        else {
+            panic!("the row is Binance's");
+        };
+
+        assert_eq!(decoded.spot_credentials, None);
+        assert_eq!(decoded.usd_m_perp_credentials, None);
+        assert_eq!(
+            serde_json::to_value(VenueSettings::Binance(decoded)).expect("a row serializes")["spot_credentials"],
+            json!(null),
+            "an unconfigured market is written back as the same null it was read from"
+        );
+    }
+
+    /// One market may be configured while the other is not: the two keys are independent, so
+    /// the market nothing was typed into stays `None`.
+    #[test]
+    fn one_binance_market_may_be_configured_without_the_other() {
+        let mut row = binance_row();
+        row["spot_credentials"] = json!({
+            "api_key": "spot-key",
+            "private_key": "spot-private",
+            "passphrase": "",
+        });
+
+        let VenueSettings::Binance(decoded) =
+            serde_json::from_value::<VenueSettings>(row).expect("one configured market decodes")
+        else {
+            panic!("the row is Binance's");
+        };
+
+        assert_eq!(
+            decoded
+                .spot_credentials
+                .as_ref()
+                .map(|credentials| credentials.api_key.clone()),
+            Some(SmolStr::new_static("spot-key"))
+        );
+        assert_eq!(
+            decoded.usd_m_perp_credentials, None,
+            "the market the row leaves null is unconfigured"
+        );
+    }
+
+    /// A file from the shape this build replaced names one six-value `credentials` object and
+    /// neither per-market key, so it is refused whole — which is what sends it to the reset
+    /// path rather than reading two markets as unconfigured.
+    #[test]
+    fn a_binance_row_of_the_superseded_credential_shape_is_refused() {
+        let mut row = binance_row();
+        let object = row
+            .as_object_mut()
+            .expect("a venue row serializes as an object");
+        object.remove("spot_credentials");
+        object.remove("usd_m_perp_credentials");
+        object.insert(
+            "credentials".to_owned(),
+            json!({
+                "spot_api_key": "spot-key",
+                "spot_private_key": "spot-private",
+                "spot_passphrase": "spot-passphrase",
+                "usd_m_perp_api_key": "perp-key",
+                "usd_m_perp_private_key": "perp-private",
+                "usd_m_perp_passphrase": "perp-passphrase",
+            }),
+        );
+
+        let refused = serde_json::from_value::<VenueSettings>(row);
+        let message = refused
+            .expect_err("the six-value credential object is not this shape")
+            .to_string();
+
+        assert!(
+            message.contains("spot_credentials"),
+            "the refusal is the per-market key the old row never named: {message}"
         );
     }
 
@@ -1221,7 +1538,7 @@ mod tests {
                     "proxy": null,
                     "http": "https://api.hyperliquid.xyz/",
                     "websocket": "wss://api.hyperliquid.xyz/ws",
-                    "credentials": HyperliquidCredentials::default(),
+                    "credentials": null,
                 }),
                 "an OKX row is not addressed, so naming an address does not make one",
             ),
@@ -1230,7 +1547,6 @@ mod tests {
                     "venue": "binance",
                     "proxy": null,
                     "region": "global",
-                    "credentials": OkxCredentials::default(),
                 }),
                 "a Binance row has two markets of addresses rather than one region",
             ),
@@ -1239,7 +1555,6 @@ mod tests {
                     "venue": "hyperliquid",
                     "proxy": null,
                     "origins": {},
-                    "credentials": BinanceCredentials::default(),
                 }),
                 "a HyperCore row names its own two addresses, and this one names neither",
             ),
@@ -1248,7 +1563,6 @@ mod tests {
                     "venue": "longbridge",
                     "proxy": null,
                     "origins": {},
-                    "credentials": OkxCredentials::default(),
                 }),
                 "a Longbridge row names the region its account belongs to, and this one names none",
             ),
@@ -1277,11 +1591,9 @@ mod tests {
                 "proxy": null,
                 "http": "https://api.hyperliquid.xyz/",
                 "websocket": "wss://api.hyperliquid.xyz/ws",
-                "credentials": {
-                    "main_account_address": "",
-                    "api_agent_private_key": "",
-                },
-            })
+                "credentials": null,
+            }),
+            "a venue nothing was typed into stores no credential set"
         );
         assert_eq!(
             serde_json::to_value(VenueSettings::Okx(OkxSettings::default()))
@@ -1290,7 +1602,7 @@ mod tests {
                 "venue": "okx",
                 "proxy": null,
                 "region": "global",
-                "credentials": { "api_key": "", "secret_key": "", "passphrase": "" },
+                "credentials": null,
             })
         );
         assert_eq!(
@@ -1308,6 +1620,125 @@ mod tests {
             }),
             "the Binance row carries one choice per scope it publishes"
         );
+
+        let binance = serde_json::to_value(VenueSettings::Binance(BinanceSettings::default()))
+            .expect("a row serializes");
+        assert!(
+            binance.get("credentials").is_none(),
+            "the venue-wide credential set this shape replaced is gone"
+        );
+        assert_eq!(
+            (
+                &binance["spot_credentials"],
+                &binance["usd_m_perp_credentials"]
+            ),
+            (&json!(null), &json!(null)),
+            "each market stores its own set, and a fresh installation stores neither"
+        );
+    }
+
+    /// Binance's two markets store two credential sets: writing one leaves its sibling
+    /// exactly as it was, and clearing one clears only that market.
+    #[test]
+    fn each_binance_market_stores_its_own_credential_set() {
+        let mut settings = BinanceSettings::default();
+        assert_eq!(settings.market_credentials(BinanceMarket::Spot), None);
+        assert_eq!(settings.market_credentials(BinanceMarket::UsdMPerp), None);
+
+        settings.set_market_credentials(
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }),
+        );
+        assert_eq!(
+            settings
+                .market_credentials(BinanceMarket::Spot)
+                .map(|credentials| credentials.api_key.clone()),
+            Some(SmolStr::new_static("spot-key"))
+        );
+        assert_eq!(
+            settings.market_credentials(BinanceMarket::UsdMPerp),
+            None,
+            "the sibling market is untouched"
+        );
+
+        settings.set_market_credentials(
+            BinanceMarket::UsdMPerp,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("perp-key"),
+                private_key: SmolStr::new_static("perp-private"),
+                passphrase: SmolStr::new_static("perp-passphrase"),
+            }),
+        );
+        settings.set_market_credentials(BinanceMarket::Spot, None);
+        assert_eq!(
+            settings.market_credentials(BinanceMarket::Spot),
+            None,
+            "clearing one market clears only that market"
+        );
+        assert!(
+            settings
+                .market_credentials(BinanceMarket::UsdMPerp)
+                .is_some(),
+            "the sibling market keeps the set it holds"
+        );
+
+        let encoded =
+            serde_json::to_value(VenueSettings::Binance(settings)).expect("a row serializes");
+        assert_eq!(
+            encoded["spot_credentials"],
+            json!(null),
+            "a cleared market stores nothing"
+        );
+        assert_eq!(
+            encoded["usd_m_perp_credentials"],
+            json!({
+                "api_key": "perp-key",
+                "private_key": "perp-private",
+                "passphrase": "perp-passphrase",
+            }),
+            "each market's set stores its own three values"
+        );
+    }
+
+    /// A stored set is the three values one market signs with: a file missing one of
+    /// them is not this shape and is refused rather than completed.
+    #[test]
+    fn a_stored_set_missing_a_value_is_refused() {
+        for refused in [
+            json!({ "api_key": "key", "private_key": "private" }),
+            json!({ "private_key": "private", "passphrase": "" }),
+            json!({ "api_key": "key", "passphrase": "" }),
+            json!({ "kind": "binance", "api_key": "key", "private_key": "private" }),
+        ] {
+            let decoded =
+                serde_json::from_value::<Option<BinanceMarketCredentials>>(refused.clone());
+            assert!(
+                decoded.is_err(),
+                "{refused} is not a market's credential set"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<Option<BinanceMarketCredentials>>(json!({
+                "api_key": "key",
+                "private_key": "private",
+                "passphrase": "",
+            }))
+            .expect("a complete set decodes"),
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("key"),
+                private_key: SmolStr::new_static("private"),
+                passphrase: SmolStr::new_static(""),
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<Option<BinanceMarketCredentials>>(json!(null))
+                .expect("an unconfigured market decodes"),
+            None
+        );
     }
 
     /// The Longbridge row is one region beside the three values the venue authenticates
@@ -1322,7 +1753,7 @@ mod tests {
                 "venue": "longbridge",
                 "proxy": null,
                 "region": "global",
-                "credentials": { "app_key": "", "app_secret": "", "access_token": "" },
+                "credentials": null,
             })
         );
 
@@ -1341,7 +1772,14 @@ mod tests {
             panic!("the row is Longbridge's");
         };
         assert_eq!(decoded.region, LongbridgeRegion::China);
-        assert!(decoded.credentials.is_complete());
+        assert_eq!(
+            decoded
+                .credentials
+                .as_ref()
+                .map(LongbridgeCredentials::is_complete),
+            Some(true),
+            "the stored set is complete, and it is one set rather than three fields"
+        );
         assert_eq!(
             decoded.addresses(),
             LongbridgeRegion::China.origins(),
@@ -1358,7 +1796,6 @@ mod tests {
                 "venue": "longbridge",
                 "proxy": null,
                 "region": region,
-                "credentials": LongbridgeCredentials::default(),
             }));
 
             assert!(
@@ -1368,12 +1805,16 @@ mod tests {
         }
     }
 
-    /// The venue's three credential values are one set: nothing typed is unconfigured, all
-    /// three is configured, and anything between is refused rather than signed with.
+    /// A venue's credential set is one `Option` beside the rest of its row: nothing typed
+    /// is unconfigured, a complete set is configured, and a stored set missing a value is
+    /// refused rather than signed with.
     #[test]
-    fn longbridge_credentials_are_validated_as_one_set() {
+    fn a_venues_credentials_are_validated_as_one_stored_set() {
         let longbridge = venue("longbridge");
-        let row = |credentials| {
+        let okx = venue("okx");
+        let hyperliquid = venue("hyperliquid");
+        let binance = venue("binance");
+        let longbridge_row = |credentials| {
             VenueSettings::Longbridge(LongbridgeSettings {
                 credentials,
                 ..LongbridgeSettings::default()
@@ -1381,15 +1822,16 @@ mod tests {
         };
 
         assert_eq!(
-            row(LongbridgeCredentials::default()).validate_credentials(longbridge, LONGBRIDGE_US),
+            longbridge_row(None).validate_credentials(longbridge, LONGBRIDGE_US),
             Ok(false),
             "a venue nothing was typed into is unconfigured rather than invalid"
         );
         assert_eq!(
-            row(LongbridgeCredentials {
+            longbridge_row(Some(LongbridgeCredentials {
                 app_key: SmolStr::new_static("app-key"),
-                ..LongbridgeCredentials::default()
-            })
+                app_secret: SmolStr::new_static("app-secret"),
+                access_token: SmolStr::new_static(""),
+            }))
             .validate_credentials(longbridge, LONGBRIDGE_US),
             Err(MarketParticipantsConfigError::IncompleteCredentials {
                 venue: longbridge,
@@ -1398,13 +1840,286 @@ mod tests {
             "a set the user has to finish is refused wherever the venue is asked about"
         );
         assert_eq!(
-            row(LongbridgeCredentials {
+            longbridge_row(Some(LongbridgeCredentials {
                 app_key: SmolStr::new_static("app-key"),
                 app_secret: SmolStr::new_static("app-secret"),
                 access_token: SmolStr::new_static("access-token"),
-            })
+            }))
             .validate_credentials(longbridge, LONGBRIDGE_US),
             Ok(true)
+        );
+
+        assert_eq!(
+            VenueSettings::Okx(OkxSettings {
+                credentials: Some(OkxCredentials {
+                    api_key: SmolStr::new_static("api-key"),
+                    secret_key: SmolStr::new_static(""),
+                    passphrase: SmolStr::new_static("passphrase"),
+                }),
+                ..OkxSettings::default()
+            })
+            .validate_credentials(okx, OKX_SWAP),
+            Err(MarketParticipantsConfigError::IncompleteCredentials {
+                venue: okx,
+                scope: None,
+            }),
+            "every scope of a venue that authenticates as a whole signs with the one set"
+        );
+        assert_eq!(
+            VenueSettings::Hyperliquid(HyperliquidSettings {
+                credentials: Some(HyperliquidCredentials {
+                    main_account_address: SmolStr::new_static("0xmain"),
+                    api_agent_private_key: SmolStr::new_static("agent-private"),
+                }),
+                ..HyperliquidSettings::default()
+            })
+            .validate_credentials(hyperliquid, HYPERLIQUID_CORE_PERP),
+            Ok(true)
+        );
+
+        let spot_only = |spot: Option<BinanceMarketCredentials>| {
+            VenueSettings::Binance(BinanceSettings {
+                spot_credentials: spot,
+                ..BinanceSettings::default()
+            })
+        };
+        assert_eq!(
+            spot_only(None).validate_credentials(binance, BINANCE_SPOT),
+            Ok(false),
+            "a market the operator never started is unconfigured"
+        );
+        assert_eq!(
+            spot_only(Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static(""),
+                passphrase: SmolStr::new_static(""),
+            }))
+            .validate_credentials(binance, BINANCE_SPOT),
+            Err(MarketParticipantsConfigError::IncompleteCredentials {
+                venue: binance,
+                scope: Some(SmolStr::new_static(BINANCE_SPOT)),
+            }),
+            "a half-filled market names the market the operator has to finish"
+        );
+        assert_eq!(
+            spot_only(Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }))
+            .validate_credentials(binance, BINANCE_SPOT),
+            Ok(true),
+            "the passphrase is optional, so a set without one is complete"
+        );
+        assert_eq!(
+            spot_only(Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }))
+            .validate_credentials(binance, BINANCE_USD_M_PERP),
+            Ok(false),
+            "the sibling market was never started, so it is unconfigured"
+        );
+        assert_eq!(
+            spot_only(Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }))
+            .validate_credentials(binance, "perp-dex/xyz"),
+            Ok(false),
+            "a scope Binance does not publish holds no credential set at all"
+        );
+    }
+
+    /// A venue-wide row names its credential set with one optional key: a row without the key
+    /// is unconfigured rather than a shape this build refuses, an explicit `null` is the same
+    /// state spelled out, and a present but empty object is a stored set that has to be
+    /// finished.
+    ///
+    /// These venues authenticate their whole surface with one set, so the key has been optional
+    /// for as long as it has existed and the object shape an older file carries is unchanged.
+    /// What is refused is only an incomplete stored set — at validation, where the operator can
+    /// finish it, rather than at decode, where the whole file would be reset.
+    #[test]
+    fn a_venue_credentials_key_is_unconfigured_or_stored_but_incomplete() {
+        let rows = [
+            (
+                "okx",
+                json!({
+                    "venue": "okx",
+                    "proxy": null,
+                    "region": "global",
+                }),
+                venue("okx"),
+                OKX_SPOT,
+            ),
+            (
+                "hyperliquid",
+                json!({
+                    "venue": "hyperliquid",
+                    "proxy": null,
+                    "http": "https://api.hyperliquid.xyz/",
+                    "websocket": "wss://api.hyperliquid.xyz/ws",
+                }),
+                venue("hyperliquid"),
+                HYPERLIQUID_CORE_PERP,
+            ),
+            (
+                "longbridge",
+                json!({
+                    "venue": "longbridge",
+                    "proxy": null,
+                    "region": "global",
+                }),
+                venue("longbridge"),
+                LONGBRIDGE_US,
+            ),
+        ];
+
+        for (name, row, venue, scope) in rows {
+            // A row that names no credential key stores nothing: it is unconfigured.
+            let decoded =
+                serde_json::from_value::<VenueSettings>(row.clone()).unwrap_or_else(|error| {
+                    panic!("{name}'s row without a credentials key should decode: {error}")
+                });
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("the row should serialize")["credentials"],
+                json!(null),
+                "{name}'s row names no credential key, so it stores no set"
+            );
+            assert_eq!(
+                decoded.validate_credentials(venue, scope),
+                Ok(false),
+                "{name} without a credential key is unconfigured, not invalid"
+            );
+
+            // An explicit null is the same state: the key is present, the value is not.
+            let mut explicit_null = row;
+            explicit_null
+                .as_object_mut()
+                .expect("a venue row serializes as an object")
+                .insert("credentials".to_owned(), json!(null));
+            let decoded =
+                serde_json::from_value::<VenueSettings>(explicit_null).unwrap_or_else(|error| {
+                    panic!("{name}'s row with a null credentials key should decode: {error}")
+                });
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("the row should serialize")["credentials"],
+                json!(null),
+                "{name}'s explicit null stores no set either"
+            );
+            assert_eq!(
+                decoded.validate_credentials(venue, scope),
+                Ok(false),
+                "{name}'s null credential set is unconfigured, not invalid"
+            );
+        }
+
+        // A present object is a stored set even when every value in it is empty: it decodes as
+        // `Some`, and validation refuses it as a set the operator has to finish. OKX is the
+        // representative; every venue-wide set is an `Option` of the same shape, validated alike.
+        let decoded = serde_json::from_value::<VenueSettings>(json!({
+            "venue": "okx",
+            "proxy": null,
+            "region": "global",
+            "credentials": {
+                "api_key": "",
+                "secret_key": "",
+                "passphrase": "",
+            },
+        }))
+        .expect("an all-empty object is still this shape");
+        let VenueSettings::Okx(settings) = &decoded else {
+            panic!("the row is OKX's");
+        };
+        let stored = settings
+            .credentials
+            .as_ref()
+            .expect("an object that is present is stored, empty values and all");
+        assert_eq!(
+            (
+                stored.api_key.as_str(),
+                stored.secret_key.as_str(),
+                stored.passphrase.as_str(),
+            ),
+            ("", "", ""),
+            "the stored set is the all-empty object the file names"
+        );
+        assert_eq!(
+            decoded.validate_credentials(venue("okx"), OKX_SPOT),
+            Err(MarketParticipantsConfigError::IncompleteCredentials {
+                venue: venue("okx"),
+                scope: None,
+            }),
+            "a stored set missing every value is refused as incomplete"
+        );
+    }
+
+    /// A venue row is a value a log may carry: every secret it stores is redacted,
+    /// whichever market of the venue holds it.
+    #[test]
+    fn venue_settings_debug_should_redact_every_stored_secret() {
+        let binance = VenueSettings::Binance(BinanceSettings {
+            spot_credentials: Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("binance-spot-api-key"),
+                private_key: SmolStr::new_static("binance-spot-private-key"),
+                passphrase: SmolStr::new_static("binance-spot-passphrase"),
+            }),
+            usd_m_perp_credentials: Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("binance-perp-api-key"),
+                private_key: SmolStr::new_static("binance-perp-private-key"),
+                passphrase: SmolStr::new_static("binance-perp-passphrase"),
+            }),
+            ..BinanceSettings::default()
+        });
+        let okx = VenueSettings::Okx(OkxSettings {
+            credentials: Some(OkxCredentials {
+                api_key: SmolStr::new_static("okx-api-key"),
+                secret_key: SmolStr::new_static("okx-secret-key"),
+                passphrase: SmolStr::new_static("okx-passphrase"),
+            }),
+            ..OkxSettings::default()
+        });
+        let hyperliquid = VenueSettings::Hyperliquid(HyperliquidSettings {
+            credentials: Some(HyperliquidCredentials {
+                main_account_address: SmolStr::new_static("hypercore-main-account"),
+                api_agent_private_key: SmolStr::new_static("hypercore-agent-key"),
+            }),
+            ..HyperliquidSettings::default()
+        });
+        let longbridge = VenueSettings::Longbridge(LongbridgeSettings {
+            credentials: Some(LongbridgeCredentials {
+                app_key: SmolStr::new_static("longbridge-app-key"),
+                app_secret: SmolStr::new_static("longbridge-app-secret"),
+                access_token: SmolStr::new_static("longbridge-access-token"),
+            }),
+            ..LongbridgeSettings::default()
+        });
+
+        let output = format!("{binance:?} {okx:?} {hyperliquid:?} {longbridge:?}");
+
+        assert!(
+            [
+                "binance-spot-api-key",
+                "binance-spot-private-key",
+                "binance-spot-passphrase",
+                "binance-perp-api-key",
+                "binance-perp-private-key",
+                "binance-perp-passphrase",
+                "okx-api-key",
+                "okx-secret-key",
+                "okx-passphrase",
+                "hypercore-main-account",
+                "hypercore-agent-key",
+                "longbridge-app-key",
+                "longbridge-app-secret",
+                "longbridge-access-token",
+            ]
+            .iter()
+            .all(|secret| !output.contains(secret)),
+            "a stored secret never reaches the log: {output}"
         );
     }
 
@@ -1441,6 +2156,52 @@ mod tests {
             deserialize_venues(short_of_longbridge).is_err(),
             "a configuration short of the venue this build added is refused whole"
         );
+    }
+
+    /// A venue's row is stored under the key its own `venue` tag names: a hand-edited file
+    /// that puts one venue's row under another venue's key is refused whole, so no reader
+    /// answers the wrong venue's settings.
+    #[test]
+    fn a_venue_row_under_another_venues_key_is_refused() {
+        let mut config = serde_json::to_value(crate::settings::Config::default())
+            .expect("the default configuration serializes");
+        let venues = config["venues"]
+            .as_object_mut()
+            .expect("the venues are a map");
+        let okx = venues["okx"].clone();
+        venues.insert("binance".to_owned(), okx);
+
+        let message = serde_json::from_value::<crate::settings::Config>(config)
+            .expect_err("a row under another venue's key is not this shape")
+            .to_string();
+
+        assert!(
+            message.contains("binance") && message.contains("okx"),
+            "the refusal names the key and the row's own tag: {message}"
+        );
+        assert!(
+            message.contains("tagged"),
+            "the refusal says what disagrees with the key: {message}"
+        );
+    }
+
+    /// A configuration this build writes stores every row under the key its tag names, and
+    /// decodes back as the settings it was written from.
+    #[test]
+    fn every_venue_row_is_stored_under_the_key_its_tag_names() {
+        let written = serde_json::to_value(crate::settings::Config::default())
+            .expect("the default configuration serializes");
+        let decoded = serde_json::from_value::<crate::settings::Config>(written)
+            .expect("a configuration this build wrote is this shape");
+
+        for (venue, settings) in &decoded.venues {
+            assert_eq!(
+                settings.venue_id(),
+                *venue,
+                "the row is stored under the key its own `venue` tag names"
+            );
+        }
+        assert_eq!(decoded.venues, default_venues());
     }
 
     /// The line a venue names is the venue's own, and it is the only network fact

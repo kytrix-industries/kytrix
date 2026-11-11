@@ -10,12 +10,13 @@
 //! them would be a file too large to read.
 
 mod appearance;
+mod credentials;
 mod keys;
 mod layout;
 mod proxy;
 mod search;
 mod session;
-mod test_support;
+pub(crate) mod test_support;
 mod translation;
 mod translation_models;
 mod venues;

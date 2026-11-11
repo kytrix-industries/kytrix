@@ -196,7 +196,7 @@ async fn a_pull_answers_the_venues_whole_quote() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote(&symbol)]).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let response = fetch_ticker(&context, &session, &reference)
@@ -239,7 +239,7 @@ async fn a_pull_without_a_quote_is_a_protocol_failure() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(Vec::new()).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let error = fetch_ticker(&context, &session, &reference)
@@ -263,7 +263,7 @@ async fn a_pull_about_another_symbol_is_a_protocol_failure() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote("MSFT.US")]).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let error = fetch_ticker(&context, &session, &reference)
@@ -295,7 +295,7 @@ async fn a_pull_without_permission_is_refused_before_the_frame() {
         },
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
     let reference = listing().await;
 
@@ -335,7 +335,7 @@ async fn a_subscription_pulls_its_baseline_and_then_registers() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote(&symbol)]).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let handle = subscribe_ticker(&context, &session, &reference)
@@ -399,7 +399,7 @@ async fn a_subscription_that_cannot_read_its_baseline_never_registers() {
         },
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let error = subscribe_ticker(&context, &session, &reference)
@@ -441,7 +441,7 @@ async fn a_subscription_answers_its_baseline_before_any_push() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote(&symbol)]).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let handle = subscribe_ticker(&context, &session, &reference)
@@ -500,7 +500,7 @@ async fn a_push_merges_into_the_baseline_rather_than_replacing_it() {
     turnover_only.turnover = "210000.00".to_owned();
     fixture.push_quote(&turnover_only);
 
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
     let handle = subscribe_ticker(&context, &session, &reference)
         .await
@@ -575,7 +575,7 @@ async fn another_symbols_push_is_skipped_and_the_stream_reads_on() {
     own.last_done = "107.00".to_owned();
     fixture.push_quote(&own);
 
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
     let handle = subscribe_ticker(&context, &session, &reference)
         .await
@@ -614,7 +614,7 @@ async fn a_push_of_another_command_is_skipped() {
     own.last_done = "108.00".to_owned();
     fixture.push_quote(&own);
 
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
     let handle = subscribe_ticker(&context, &session, &reference)
         .await
@@ -635,7 +635,7 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote(&symbol)]).await;
-    let context = execution(&fixture, credentials(), CapabilityId::Tickers);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Tickers);
     let session = session(&context).await;
 
     let handle = subscribe_ticker(&context, &session, &reference)

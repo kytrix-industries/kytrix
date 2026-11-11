@@ -7,4 +7,4 @@ mod data_format;
 pub(crate) mod proxy;
 pub(crate) mod registry;
 pub(crate) mod translation;
-mod venues;
+pub(crate) mod venues;

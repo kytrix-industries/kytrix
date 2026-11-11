@@ -49,7 +49,7 @@ async fn a_refusal_inside_the_envelope_is_the_venues_own_code_and_message() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -85,7 +85,7 @@ async fn an_envelope_without_its_payload_is_not_a_token() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -114,7 +114,7 @@ async fn the_connection_limit_is_the_venues_own_comparison() {
         ProfileAnswer::granted(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let error = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -154,7 +154,7 @@ async fn a_market_data_command_without_permission_is_refused_before_a_frame() {
         ProfileAnswer::without_us_market_data(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let session = establish(&context, &credential_values(), &plan(&context))
         .await
         .expect("the fixture venue authenticates the connection");
@@ -204,7 +204,7 @@ async fn the_profile_is_asked_for_even_when_no_permission_is_granted() {
         ProfileAnswer::without_us_market_data(),
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
 
     let session = establish(&context, &credential_values(), &plan(&context))
         .await
@@ -230,7 +230,7 @@ async fn a_paced_command_waits_for_its_token() {
         },
     )
     .await;
-    let context = execution(&fixture, credentials(), CapabilityId::Candlesticks);
+    let context = execution(&fixture, Some(credentials()), CapabilityId::Candlesticks);
     let session = establish(&context, &credential_values(), &plan(&context))
         .await
         .expect("the fixture venue authenticates the connection");

@@ -139,10 +139,9 @@ fn selecting_a_page_should_move_the_sidebar_with_it(cx: &mut TestAppContext) {
         "the page selected and the page drawn are one thing"
     );
 
-    // Working in the page is what the sidebar used to answer with its own selection: the
-    // caret goes into the field, and a sidebar that disagreed put its own page back under
-    // it.
-    click(cx, "SETTINGS_CONTROL_market_participants.okx.api_key");
+    // Working in the page is what the sidebar used to answer with its own selection: a control of
+    // the page is pressed, and a sidebar that disagreed put its own page back under it.
+    click(cx, "SETTINGS_CONTROL_market_participants.okx.region");
     assert_eq!(
         current_page(&panel, cx),
         "market_participants.okx",
@@ -326,9 +325,14 @@ fn a_heading_that_repeats_its_only_row_should_not_be_drawn(cx: &mut TestAppConte
         "the region's heading repeats its row"
     );
     assert!(
-        cx.debug_bounds("SETTINGS_SECTION_TITLE_market_participants.okx_1")
+        cx.debug_bounds("SETTINGS_CARD_market_participants.okx_0")
             .is_some(),
-        "the credentials group is named"
+        "the region and the credential set are rows of one card"
+    );
+    assert!(
+        cx.debug_bounds("SETTINGS_CARD_market_participants.okx_1")
+            .is_none(),
+        "the credential set is a row of that card rather than a group of its own"
     );
 }
 

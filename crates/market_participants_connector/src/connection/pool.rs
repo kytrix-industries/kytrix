@@ -393,9 +393,10 @@ mod tests {
 
     use app_config::{
         market_participants::{
+            credentials::{BinanceMarketCredentials, OkxCredentials},
             fixture::{self, FixtureAddress},
             origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
-            settings::{BinanceOrigins, VenueSettings},
+            settings::BinanceOrigins,
         },
         network::{NetworkRouteGeneration, NetworkRuntimeGenerations, ResolvedProxy},
         settings::Config,
@@ -523,21 +524,26 @@ mod tests {
     }
 
     fn binance_credentials(config: &mut Config, api_key: &str, private_key: &str) {
-        let Some(VenueSettings::Binance(settings)) = config.venues.get_mut(&venue("binance"))
-        else {
-            panic!("binance is configured as Binance by the built-in table");
-        };
-        settings.credentials.spot_api_key = api_key.into();
-        settings.credentials.spot_private_key = private_key.into();
+        assert!(config.set_binance_market_credentials(
+            &venue("binance"),
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: api_key.into(),
+                private_key: private_key.into(),
+                passphrase: "".into(),
+            }),
+        ));
     }
 
     fn okx_credentials(config: &mut Config, api_key: &str, secret_key: &str) {
-        let Some(VenueSettings::Okx(settings)) = config.venues.get_mut(&venue("okx")) else {
-            panic!("okx is configured as OKX by the built-in table");
-        };
-        settings.credentials.api_key = api_key.into();
-        settings.credentials.secret_key = secret_key.into();
-        settings.credentials.passphrase = "pass".into();
+        assert!(config.set_okx_credentials(
+            &venue("okx"),
+            Some(OkxCredentials {
+                api_key: api_key.into(),
+                secret_key: secret_key.into(),
+                passphrase: "pass".into(),
+            }),
+        ));
     }
 
     /// One fixture address a venue's published origins resolve at, for both roles.

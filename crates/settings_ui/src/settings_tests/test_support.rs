@@ -8,7 +8,9 @@ use std::{fs, path::PathBuf};
 
 use app_config::{
     market_participants::{
-        credentials::{BinanceCredentials, OkxCredentials},
+        credentials::{
+            BinanceMarketCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
+        },
         settings::VenueSettings,
     },
     network::{ProxyAuthorizationConfig, ProxyConfig},
@@ -27,8 +29,8 @@ use base_ui::{
     style::{palette::Appearance as ThemeAppearance, theme::ThemeExt as _},
 };
 use gpui_kit::{
-    AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, Modifiers,
-    ParentElement as _, Render, SharedString, Styled, Subscription, TestAppContext,
+    AppContext as _, BorrowAppContext as _, Bounds, Context, Entity, IntoElement, Modifiers,
+    ParentElement as _, Pixels, Render, SharedString, Styled, Subscription, TestAppContext,
     VisualTestContext, Window, div,
 };
 use i18n::language::codes::LanguageCode;
@@ -40,7 +42,7 @@ use widget_tokio_runtime::global;
 
 use crate::{
     appearance,
-    pages::{proxy::table::ProxyRequest, registry},
+    pages::{proxy::table::ProxyRequest, registry, venues::credentials::CredentialsKind},
     session::SettingsChange,
     settings::{SettingsPage, SidebarEntry},
 };
@@ -63,7 +65,8 @@ pub(crate) fn page_title(page: &str, cx: &TestAppContext) -> SharedString {
 ///
 /// The page is not closed from within it: the settings page has no confirm or cancel, and
 /// leaving it is the main window's `show_workspace`, which the settings tests exercise by
-/// asking the page for what it still holds — see [`SettingsPage::commit_pending`].
+/// asking the page for the write that failed before a frame reported it — see
+/// [`SettingsPage::take_write_failure`].
 pub(crate) struct PageHost {
     page: Entity<SettingsPage>,
     _language: Subscription,
@@ -268,12 +271,23 @@ pub(crate) fn settle(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// The bounds one selector draws, or nothing.
+///
+/// A selector is a `&'static str` to the window's test API, and the selectors of a credential set
+/// are built from the set they belong to, so the one place that leaks them is here.
+pub(crate) fn bounds(cx: &mut VisualTestContext, selector: &str) -> Option<Bounds<Pixels>> {
+    let selector: &'static str = Box::leak(selector.to_owned().into_boxed_str());
+    cx.debug_bounds(selector)
+}
+
+/// The bounds one selector draws, which the window has to be drawing.
+pub(crate) fn element(cx: &mut VisualTestContext, selector: &str) -> Bounds<Pixels> {
+    bounds(cx, selector).unwrap_or_else(|| panic!("the window should draw {selector}"))
+}
+
 /// Clicks what a selector draws, and lets whatever it opened settle.
-pub(crate) fn click(cx: &mut VisualTestContext, selector: &'static str) {
-    let target = cx
-        .debug_bounds(selector)
-        .unwrap_or_else(|| panic!("the window should draw {selector}"))
-        .center();
+pub(crate) fn click(cx: &mut VisualTestContext, selector: &str) {
+    let target = element(cx, selector).center();
     cx.simulate_click(target, Modifiers::none());
     settle(cx);
 }
@@ -298,19 +312,41 @@ pub(crate) fn select(panel: &Entity<SettingsPage>, page: &str, cx: &mut VisualTe
     settle(cx);
 }
 
-/// Moves the caret out of whatever holds it, and draws the frame that delivers the focus
-/// change — the public test API for taking the caret away from a field.
-///
-/// The window has to be active for GPUI to report focus changes: an inactive one blanks the
-/// focus paths it hands its listeners, so the blur would never reach the field.
-pub(crate) fn blur(cx: &mut VisualTestContext) {
-    cx.update(|window, _| window.activate_window());
-    cx.run_until_parked();
-    cx.update(|window, cx| window.blur(cx));
-    cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
-    });
-    settle(cx);
+/// The selector of one credential set's row.
+pub(crate) fn credentials_row(kind: CredentialsKind) -> String {
+    format!("SETTINGS_FIELD_{}", kind.row_id())
+}
+
+/// The selector of one credential set's clear button.
+pub(crate) fn credentials_clear(kind: CredentialsKind) -> String {
+    kind.clear_selector()
+}
+
+/// The selector of one value of one credential set's dialog.
+pub(crate) fn credentials_field(kind: CredentialsKind, id: &str) -> String {
+    let field = kind
+        .fields()
+        .iter()
+        .find(|field| field.id == id)
+        .unwrap_or_else(|| panic!("{kind:?} holds no credential field named {id}"));
+
+    kind.field_selector(field)
+}
+
+/// The selector of the message one rejected value of a credential dialog is reported with.
+pub(crate) fn credentials_error(kind: CredentialsKind, id: &str) -> String {
+    let field = kind
+        .fields()
+        .iter()
+        .find(|field| field.id == id)
+        .unwrap_or_else(|| panic!("{kind:?} holds no credential field named {id}"));
+
+    kind.error_selector(field)
+}
+
+/// The id of the page one credential set is configured on.
+pub(crate) fn credentials_page(kind: CredentialsKind) -> String {
+    format!("market_participants.{}", kind.venue().as_str())
 }
 
 /// The settings as everyone outside this page sees them.
@@ -410,14 +446,16 @@ pub(crate) fn configured_settings() -> Config {
         else {
             panic!("binance is configured as Binance");
         };
-        binance.credentials = BinanceCredentials {
-            spot_api_key: SmolStr::new_static("binance-spot-key"),
-            spot_private_key: SmolStr::new_static("binance-spot-private"),
-            spot_passphrase: SmolStr::new_static("binance-spot-passphrase"),
-            usd_m_perp_api_key: SmolStr::new_static("binance-perp-key"),
-            usd_m_perp_private_key: SmolStr::new_static("binance-perp-private"),
-            usd_m_perp_passphrase: SmolStr::new_static("binance-perp-passphrase"),
-        };
+        binance.spot_credentials = Some(BinanceMarketCredentials {
+            api_key: SmolStr::new_static("binance-spot-key"),
+            private_key: SmolStr::new_static("binance-spot-private"),
+            passphrase: SmolStr::new_static("binance-spot-passphrase"),
+        });
+        binance.usd_m_perp_credentials = Some(BinanceMarketCredentials {
+            api_key: SmolStr::new_static("binance-perp-key"),
+            private_key: SmolStr::new_static("binance-perp-private"),
+            passphrase: SmolStr::new_static("binance-perp-passphrase"),
+        });
     }
 
     {
@@ -428,11 +466,40 @@ pub(crate) fn configured_settings() -> Config {
         else {
             panic!("okx is configured as OKX");
         };
-        okx.credentials = OkxCredentials {
+        okx.credentials = Some(OkxCredentials {
             api_key: SmolStr::new_static("okx-api-key"),
             secret_key: SmolStr::new_static("okx-secret-key"),
             passphrase: SmolStr::new_static("okx-passphrase"),
+        });
+    }
+
+    {
+        let VenueSettings::Hyperliquid(settings) = config
+            .venues
+            .get_mut(&VenueId::Hyperliquid)
+            .expect("the default settings name every venue this build speaks")
+        else {
+            panic!("hyperliquid is configured as Hypercore");
         };
+        settings.credentials = Some(HyperliquidCredentials {
+            main_account_address: SmolStr::new_static("0xhyperliquid-main"),
+            api_agent_private_key: SmolStr::new_static("hyperliquid-agent-private"),
+        });
+    }
+
+    {
+        let VenueSettings::Longbridge(settings) = config
+            .venues
+            .get_mut(&VenueId::Longbridge)
+            .expect("the default settings name every venue this build speaks")
+        else {
+            panic!("longbridge is configured as Longbridge");
+        };
+        settings.credentials = Some(LongbridgeCredentials {
+            app_key: SmolStr::new_static("longbridge-app-key"),
+            app_secret: SmolStr::new_static("longbridge-app-secret"),
+            access_token: SmolStr::new_static("longbridge-access-token"),
+        });
     }
 
     config
@@ -568,10 +635,8 @@ pub(crate) fn open_add_form(panel: &Entity<SettingsPage>, cx: &mut VisualTestCon
 /// The caret is left where it is, which is what a user who types and then presses a button
 /// does: it is the case that tells a field committed on blur from one the form reads. The caret
 /// is moved to the end first, so what is typed is appended however wide the field is.
-pub(crate) fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
-    let field = cx
-        .debug_bounds(selector)
-        .unwrap_or_else(|| panic!("the form should draw {selector}"));
+pub(crate) fn type_into(cx: &mut VisualTestContext, selector: &str, text: &str) {
+    let field = element(cx, selector);
     cx.simulate_click(field.center(), Modifiers::none());
     cx.simulate_keystrokes("end");
     cx.simulate_input(text);

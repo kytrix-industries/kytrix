@@ -19,7 +19,7 @@ const TEST_SOURCES_DIRECTORY: &str = "settings_tests";
 ///
 /// The list is spelled out by hand and held to the directory below: a source that is not in it
 /// would silently escape both halves of the guard.
-const SETTINGS_SOURCES: [(&str, &str); 28] = [
+const SETTINGS_SOURCES: [(&str, &str); 29] = [
     ("appearance.rs", include_str!("../appearance.rs")),
     ("layout.rs", include_str!("../layout.rs")),
     ("lib.rs", include_str!("../lib.rs")),
@@ -63,6 +63,10 @@ const SETTINGS_SOURCES: [(&str, &str); 28] = [
     (
         "pages/venues/binance.rs",
         include_str!("../pages/venues/binance.rs"),
+    ),
+    (
+        "pages/venues/credentials.rs",
+        include_str!("../pages/venues/credentials.rs"),
     ),
     (
         "pages/venues/dispatcher.rs",

@@ -9,6 +9,9 @@ pub(crate) use crate::network::{ProxyConfig, ProxyRoute, ServiceTarget};
 use crate::{
     change::ConfigChangeSet,
     market_participants::{
+        credentials::{
+            BinanceMarketCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
+        },
         origins::{
             BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin, HyperliquidHttpOrigin,
             HyperliquidWebsocketOrigin, LongbridgeRegion, OkxRegion,
@@ -375,18 +378,70 @@ impl Config {
         true
     }
 
-    /// Replaces one credential value of one venue.
+    /// Replaces one Binance market's credentials.
     ///
-    /// `field` is the wire name the credential set stores, and the write lands in
-    /// the venue's own shape: a venue that holds a different kind of credential
-    /// stores nothing, because a credential set is a value of exactly one venue's
-    /// shape and there is no second place to put it. Returns whether the write
-    /// landed.
-    pub fn set_venue_credential(&mut self, venue: &VenueId, field: &str, value: &str) -> bool {
-        let Some(settings) = self.venues.get_mut(venue) else {
+    /// Returns whether the venue holds a Binance row at all: the set belongs to that
+    /// market alone, so a row of another shape has nowhere to put it. `None` clears that
+    /// market and leaves its sibling exactly as it was.
+    pub fn set_binance_market_credentials(
+        &mut self,
+        venue: &VenueId,
+        market: BinanceMarket,
+        credentials: Option<BinanceMarketCredentials>,
+    ) -> bool {
+        let Some(VenueSettings::Binance(settings)) = self.venues.get_mut(venue) else {
             return false;
         };
-        write_credential(settings, field, value)
+        settings.set_market_credentials(market, credentials);
+        true
+    }
+
+    /// Replaces OKX's credentials.
+    ///
+    /// Returns whether the venue is configured as OKX at all: the set belongs to that
+    /// venue alone, so a row of another shape has nowhere to put it.
+    pub fn set_okx_credentials(
+        &mut self,
+        venue: &VenueId,
+        credentials: Option<OkxCredentials>,
+    ) -> bool {
+        let Some(VenueSettings::Okx(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.credentials = credentials;
+        true
+    }
+
+    /// Replaces HyperCore's credentials.
+    ///
+    /// Returns whether the venue is configured as HyperCore at all: the set belongs to that
+    /// venue alone, so a row of another shape has nowhere to put it.
+    pub fn set_hyperliquid_credentials(
+        &mut self,
+        venue: &VenueId,
+        credentials: Option<HyperliquidCredentials>,
+    ) -> bool {
+        let Some(VenueSettings::Hyperliquid(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.credentials = credentials;
+        true
+    }
+
+    /// Replaces Longbridge's credentials.
+    ///
+    /// Returns whether the venue is configured as Longbridge at all: the set belongs to that
+    /// venue alone, so a row of another shape has nowhere to put it.
+    pub fn set_longbridge_credentials(
+        &mut self,
+        venue: &VenueId,
+        credentials: Option<LongbridgeCredentials>,
+    ) -> bool {
+        let Some(VenueSettings::Longbridge(settings)) = self.venues.get_mut(venue) else {
+            return false;
+        };
+        settings.credentials = credentials;
+        true
     }
 
     /// Returns the process-local generation of one venue's proxy decision.
@@ -602,47 +657,6 @@ impl Default for Config {
     }
 }
 
-/// Writes one credential value into the row of the venue it belongs to.
-///
-/// `field` is the name the credential set stores the value under, so the write lands
-/// in the venue's own shape and nowhere else: a field of another venue's credentials
-/// is not a value this row has, and writing it would be a credential the venue's
-/// adapters never read. Returns whether the write landed.
-fn write_credential(settings: &mut VenueSettings, field: &str, value: &str) -> bool {
-    let value = || SmolStr::new(value);
-    match settings {
-        VenueSettings::Binance(binance) => match field {
-            "spot_api_key" => binance.credentials.spot_api_key = value(),
-            "spot_private_key" => binance.credentials.spot_private_key = value(),
-            "spot_passphrase" => binance.credentials.spot_passphrase = value(),
-            "usd_m_perp_api_key" => binance.credentials.usd_m_perp_api_key = value(),
-            "usd_m_perp_private_key" => binance.credentials.usd_m_perp_private_key = value(),
-            "usd_m_perp_passphrase" => binance.credentials.usd_m_perp_passphrase = value(),
-            _ => return false,
-        },
-        VenueSettings::Okx(okx) => match field {
-            "api_key" => okx.credentials.api_key = value(),
-            "secret_key" => okx.credentials.secret_key = value(),
-            "passphrase" => okx.credentials.passphrase = value(),
-            _ => return false,
-        },
-        VenueSettings::Hyperliquid(hyperliquid) => match field {
-            "main_account_address" => hyperliquid.credentials.main_account_address = value(),
-            "api_agent_private_key" => hyperliquid.credentials.api_agent_private_key = value(),
-            _ => return false,
-        },
-        VenueSettings::Longbridge(longbridge) => match field {
-            "app_key" => longbridge.credentials.app_key = value(),
-            "app_secret" => longbridge.credentials.app_secret = value(),
-            "access_token" => longbridge.credentials.access_token = value(),
-            _ => return false,
-        },
-        // Polymarket's market data is public, so it stores no credential field.
-        VenueSettings::Polymarket(_) => return false,
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -655,7 +669,8 @@ mod tests {
         change::ConfigChangeSet,
         market_participants::{
             credentials::{
-                BinanceCredentials, HyperliquidCredentials, LongbridgeCredentials, OkxCredentials,
+                BinanceMarketCredentials, HyperliquidCredentials, LongbridgeCredentials,
+                OkxCredentials,
             },
             error::MarketParticipantsConfigError,
             origins::{
@@ -748,14 +763,22 @@ mod tests {
             else {
                 panic!("binance is configured as Binance");
             };
-            binance.credentials = BinanceCredentials {
-                spot_api_key: SmolStr::new_static("binance-spot-key"),
-                spot_private_key: SmolStr::new_static("binance-spot-private"),
-                spot_passphrase: SmolStr::new_static("binance-spot-passphrase"),
-                usd_m_perp_api_key: SmolStr::new_static("binance-perp-key"),
-                usd_m_perp_private_key: SmolStr::new_static("binance-perp-private"),
-                usd_m_perp_passphrase: SmolStr::new_static("binance-perp-passphrase"),
-            };
+            binance.set_market_credentials(
+                BinanceMarket::Spot,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("binance-spot-key"),
+                    private_key: SmolStr::new_static("binance-spot-private"),
+                    passphrase: SmolStr::new_static("binance-spot-passphrase"),
+                }),
+            );
+            binance.set_market_credentials(
+                BinanceMarket::UsdMPerp,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("binance-perp-key"),
+                    private_key: SmolStr::new_static("binance-perp-private"),
+                    passphrase: SmolStr::new_static("binance-perp-passphrase"),
+                }),
+            );
         }
         {
             let VenueSettings::Okx(okx) = venues
@@ -764,11 +787,11 @@ mod tests {
             else {
                 panic!("okx is configured as OKX");
             };
-            okx.credentials = OkxCredentials {
+            okx.credentials = Some(OkxCredentials {
                 api_key: SmolStr::new_static("okx-api-key"),
                 secret_key: SmolStr::new_static("okx-secret-key"),
                 passphrase: SmolStr::new_static("okx-passphrase"),
-            };
+            });
             // An operator-chosen region: the shape the settings interface edits.
             okx.region = OkxRegion::Europe;
         }
@@ -779,10 +802,10 @@ mod tests {
             else {
                 panic!("hyperliquid is configured as HyperCore");
             };
-            hyperliquid.credentials = HyperliquidCredentials {
+            hyperliquid.credentials = Some(HyperliquidCredentials {
                 main_account_address: SmolStr::new_static(" 0xmain-account "),
                 api_agent_private_key: SmolStr::new_static(" agent-private-key "),
-            };
+            });
         }
         {
             let VenueSettings::Longbridge(longbridge) = venues
@@ -791,11 +814,11 @@ mod tests {
             else {
                 panic!("longbridge is configured as Longbridge");
             };
-            longbridge.credentials = LongbridgeCredentials {
+            longbridge.credentials = Some(LongbridgeCredentials {
                 app_key: SmolStr::new_static("longbridge-app-key"),
                 app_secret: SmolStr::new_static("longbridge-app-secret"),
                 access_token: SmolStr::new_static("longbridge-access-token"),
-            };
+            });
             // An operator-chosen region: the shape the settings interface edits.
             longbridge.region = LongbridgeRegion::China;
         }
@@ -1068,19 +1091,31 @@ mod tests {
         assert!(!config.set_longbridge_region(&venue("okx"), LongbridgeRegion::Global));
     }
 
-    /// Longbridge's three credential values are written into the venue's own shape and
-    /// nowhere else: a field of another venue's credentials is not a value this row has.
+    /// Longbridge's credential set is written into the venue's own row and nowhere else:
+    /// a set of another venue's shape is not a value this row has.
     #[test]
-    fn a_longbridge_credential_lands_in_the_venue_that_stores_it() {
+    fn a_longbridge_credential_set_lands_in_the_venue_that_stores_it() {
         let mut config = Config::default();
         let longbridge = venue("longbridge");
 
-        assert!(config.set_venue_credential(&longbridge, "app_key", "app-key"));
-        assert!(config.set_venue_credential(&longbridge, "app_secret", "app-secret"));
-        assert!(config.set_venue_credential(&longbridge, "access_token", "access-token"));
+        assert!(config.set_longbridge_credentials(
+            &longbridge,
+            Some(LongbridgeCredentials {
+                app_key: SmolStr::new_static("app-key"),
+                app_secret: SmolStr::new_static("app-secret"),
+                access_token: SmolStr::new_static("access-token"),
+            }),
+        ));
         assert!(
-            !config.set_venue_credential(&longbridge, "api_key", "okx-key"),
-            "an OKX field is not a field of Longbridge's shape"
+            !config.set_okx_credentials(
+                &longbridge,
+                Some(OkxCredentials {
+                    api_key: SmolStr::new_static("okx-key"),
+                    secret_key: SmolStr::new_static("okx-secret"),
+                    passphrase: SmolStr::new_static("okx-passphrase"),
+                }),
+            ),
+            "an OKX set is not a value a Longbridge row holds"
         );
 
         assert_eq!(
@@ -1100,6 +1135,16 @@ mod tests {
                 "app_secret": "app-secret",
                 "access_token": "access-token",
             })
+        );
+
+        assert!(config.set_longbridge_credentials(&longbridge, None));
+        assert_eq!(
+            config
+                .venue(&longbridge)
+                .expect("the venue is configured")
+                .validate_credentials(longbridge, LONGBRIDGE_US),
+            Ok(false),
+            "clearing the set leaves the venue unconfigured rather than half filled"
         );
     }
 
@@ -1133,38 +1178,80 @@ mod tests {
         ));
     }
 
-    /// A credential value is written into the venue's own shape and nowhere else: a
-    /// field of another venue's credentials is not a value this row has.
+    /// One Binance market's credential set lands in that market, and each market keeps
+    /// the set its sibling's writes never touch.
     #[test]
-    fn a_credential_value_lands_in_the_venue_that_stores_it() {
+    fn a_binance_market_credential_set_lands_in_that_market() {
         let mut config = Config::default();
         let binance = venue("binance");
 
-        assert!(config.set_venue_credential(&binance, "spot_api_key", "spot-key"));
+        assert!(config.set_binance_market_credentials(
+            &binance,
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }),
+        ));
         assert!(
-            config.set_venue_credential(&binance, "usd_m_perp_api_key", "perp-key"),
-            "each market stores its own key"
+            config.set_binance_market_credentials(
+                &binance,
+                BinanceMarket::UsdMPerp,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("perp-key"),
+                    private_key: SmolStr::new_static("perp-private"),
+                    passphrase: SmolStr::new_static("perp-passphrase"),
+                }),
+            ),
+            "each market stores its own set"
         );
         assert!(
-            !config.set_venue_credential(&binance, "api_key", "okx-key"),
-            "an OKX field is not a field of Binance's shape"
-        );
-        assert!(
-            !config.set_venue_credential(&binance, "ed_25519_api_key", "superseded"),
-            "the shape this build replaced is not this shape"
+            !config.set_binance_market_credentials(
+                &venue("okx"),
+                BinanceMarket::Spot,
+                Some(BinanceMarketCredentials {
+                    api_key: SmolStr::new_static("spot-key"),
+                    private_key: SmolStr::new_static("spot-private"),
+                    passphrase: SmolStr::new_static(""),
+                }),
+            ),
+            "an OKX row has no Binance market to put a set in"
         );
 
         let serialized = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(
-            serialized["venues"]["binance"]["credentials"],
+            serialized["venues"]["binance"]["spot_credentials"],
             json!({
-                "spot_api_key": "spot-key",
-                "spot_private_key": "",
-                "spot_passphrase": "",
-                "usd_m_perp_api_key": "perp-key",
-                "usd_m_perp_private_key": "",
-                "usd_m_perp_passphrase": "",
+                "api_key": "spot-key",
+                "private_key": "spot-private",
+                "passphrase": "",
             })
+        );
+        assert_eq!(
+            serialized["venues"]["binance"]["usd_m_perp_credentials"],
+            json!({
+                "api_key": "perp-key",
+                "private_key": "perp-private",
+                "passphrase": "perp-passphrase",
+            })
+        );
+        assert!(
+            serialized["venues"]["binance"].get("credentials").is_none(),
+            "the venue-wide set this shape replaced is gone"
+        );
+
+        assert!(config.set_binance_market_credentials(&binance, BinanceMarket::Spot, None));
+        let settings = config.venue(&binance).expect("the venue is configured");
+        assert_eq!(
+            settings.validate_credentials(binance, BINANCE_SPOT),
+            Ok(false),
+            "a cleared market is unconfigured"
+        );
+        assert_eq!(
+            settings.validate_credentials(binance, BINANCE_USD_M_PERP),
+            Ok(true),
+            "clearing one market leaves the other market's set exactly as it was"
         );
     }
 
@@ -1175,7 +1262,15 @@ mod tests {
         let mut config = Config::default();
         let binance = venue("binance");
 
-        assert!(config.set_venue_credential(&binance, "spot_api_key", "spot-key"));
+        assert!(config.set_binance_market_credentials(
+            &binance,
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static(""),
+                passphrase: SmolStr::new_static(""),
+            }),
+        ));
         let settings = config.venue(&binance).expect("the venue is configured");
 
         assert_eq!(
@@ -1192,7 +1287,15 @@ mod tests {
             "the perpetual half was never started"
         );
 
-        config.set_venue_credential(&binance, "spot_private_key", "spot-private");
+        assert!(config.set_binance_market_credentials(
+            &binance,
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("spot-key"),
+                private_key: SmolStr::new_static("spot-private"),
+                passphrase: SmolStr::new_static(""),
+            }),
+        ));
         assert_eq!(
             config
                 .venue(&binance)
@@ -1213,11 +1316,11 @@ mod tests {
         let serialized = serde_json::to_value(&config).expect("config should serialize");
 
         assert_eq!(
-            serialized["venues"]["binance"]["credentials"]["spot_api_key"],
+            serialized["venues"]["binance"]["spot_credentials"]["api_key"],
             json!("binance-spot-key")
         );
         assert_eq!(
-            serialized["venues"]["binance"]["credentials"]["usd_m_perp_api_key"],
+            serialized["venues"]["binance"]["usd_m_perp_credentials"]["api_key"],
             json!("binance-perp-key")
         );
         assert_eq!(
@@ -1284,8 +1387,14 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["credentials", "origins", "proxy", "venue"],
-            "a venue names its markets, its credentials and its own line"
+            [
+                "origins",
+                "proxy",
+                "spot_credentials",
+                "usd_m_perp_credentials",
+                "venue",
+            ],
+            "a venue names its markets, the credentials of each, and its own line"
         );
         assert_eq!(
             binance["origins"]
@@ -2517,7 +2626,15 @@ mod tests {
         );
 
         let mut credentials = previous.clone();
-        assert!(credentials.set_venue_credential(&binance, "spot_api_key", "rotated-key"));
+        assert!(credentials.set_binance_market_credentials(
+            &binance,
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new_static("rotated-key"),
+                private_key: SmolStr::new_static("rotated-private"),
+                passphrase: SmolStr::new_static(""),
+            }),
+        ));
         assert_eq!(
             credentials.changes_since(&previous),
             ConfigChangeSet {

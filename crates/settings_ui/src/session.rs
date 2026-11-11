@@ -598,7 +598,7 @@ mod tests {
     fn a_change_a_setter_refuses_should_be_accepted_without_a_report(cx: &mut TestAppContext) {
         let mut config = Config::default();
         // A venue this build does not hold a row for is the one shape whose setter writes
-        // nothing: the settings have no place for the value the row stands for.
+        // nothing: the settings have no place for the value the dialog stands for.
         config.venues.remove(&VenueId::Okx);
         let session = session_over(config, cx);
         let before = config_now(cx);
@@ -606,7 +606,16 @@ mod tests {
         write(
             &session,
             SettingsChange::edit(|config| {
-                config.set_venue_credential(&VenueId::Okx, "api_key", "typed-key");
+                config.set_okx_credentials(
+                    &VenueId::Okx,
+                    Some(
+                        app_config::market_participants::credentials::OkxCredentials {
+                            api_key: SmolStr::new_static("typed-key"),
+                            secret_key: SmolStr::new_static("typed-secret"),
+                            passphrase: SmolStr::new_static("typed-passphrase"),
+                        },
+                    ),
+                );
             }),
             cx,
         )

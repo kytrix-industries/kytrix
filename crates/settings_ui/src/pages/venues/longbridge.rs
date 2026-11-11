@@ -7,7 +7,10 @@ use market_participants_model::identifier::VenueId;
 
 use crate::{
     layout::{self, PageArgs},
-    pages::venues::shared::{self, CredentialField},
+    pages::venues::{
+        credentials::{self, CredentialsKind},
+        shared,
+    },
     search::FieldSearch,
 };
 
@@ -22,18 +25,10 @@ const REGION_OPTIONS: [(LongbridgeRegion, &str); 2] = [
     ),
 ];
 
-const CREDENTIAL_FIELDS: [CredentialField; 3] = [
-    CredentialField::LongbridgeAppKey,
-    CredentialField::LongbridgeAppSecret,
-    CredentialField::LongbridgeAccessToken,
-];
-
 pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
     let venue = VenueId::Longbridge;
     let page_id = shared::page_id(&venue);
-    let mut groups = Vec::new();
-    let mut region_rows = Vec::new();
-    let mut credential_rows = Vec::new();
+    let mut rows = Vec::new();
 
     let region_id = format!("{page_id}.region");
     if args.filter.admits_field(page_id.as_ref(), &region_id) {
@@ -70,7 +65,7 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
             }),
         );
 
-        region_rows.push(layout::row(
+        rows.push(layout::row(
             &region_id,
             label,
             description,
@@ -80,33 +75,24 @@ pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
         ));
     }
 
-    for field in CREDENTIAL_FIELDS {
-        if args
-            .filter
-            .admits_field(page_id.as_ref(), field.field_id(&venue, None).as_ref())
-        {
-            credential_rows.push(shared::credential_row(args, venue, None, field));
-        }
+    let credentials = CredentialsKind::Longbridge;
+    if args
+        .filter
+        .admits_field(page_id.as_ref(), credentials.row_id())
+    {
+        rows.push(credentials::credentials_row(args, credentials));
     }
 
-    if !region_rows.is_empty() {
-        groups.push(layout::section(
-            None,
-            "market_participants.longbridge_0",
-            region_rows,
-            args.cx,
-        ));
-    }
-    if !credential_rows.is_empty() {
-        groups.push(layout::section(
-            Some(t!(args.cx, "settings_ui.market_participants.credentials")),
-            "market_participants.longbridge_1",
-            credential_rows,
-            args.cx,
-        ));
+    if rows.is_empty() {
+        return layout::page(Vec::new());
     }
 
-    layout::page(groups)
+    layout::page(vec![layout::section(
+        None,
+        "market_participants.longbridge_0",
+        rows,
+        args.cx,
+    )])
 }
 
 pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
@@ -117,24 +103,21 @@ pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
         cx,
         "settings_ui.market_participants.service_region_description"
     );
-    let mut fields = Vec::with_capacity(4);
 
-    fields.push(shared::origin_search_field(
-        format!("{page_id}.region"),
-        label.as_ref(),
-        description.as_ref(),
-        &[
-            "market_participants",
-            "longbridge",
-            "region",
-            "origin",
-            "服务地区",
-            "市场参与者",
-        ],
-    ));
-    for field in CREDENTIAL_FIELDS {
-        fields.push(shared::credential_search_field(venue, None, field, cx));
-    }
-
-    fields
+    vec![
+        shared::origin_search_field(
+            format!("{page_id}.region"),
+            label.as_ref(),
+            description.as_ref(),
+            &[
+                "market_participants",
+                "longbridge",
+                "region",
+                "origin",
+                "服务地区",
+                "市场参与者",
+            ],
+        ),
+        CredentialsKind::Longbridge.search_field(cx),
+    ]
 }

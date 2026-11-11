@@ -687,24 +687,17 @@ fn authentication_failed(
 /// configuration error's own sentence: that sentence spells the canonical identity,
 /// and interpolating it would name the venue a second time, in English, inside a
 /// message whose venue is already the catalogue's name.
-///
-/// Every set that reaches here is the venue's *own* shape — the resolution behind it
-/// validates each venue's row as that venue — so a set of another venue's shape is a
-/// configuration this build cannot produce rather than one a user can write. It is still
-/// answered as the invalid credential it would be, because the alternative is a panic on a
-/// value that came out of a file.
 fn authentication_invalid(
     route: &VenueRoute,
     account: &MarketParticipantAccountId,
     error: MarketParticipantsConfigError,
 ) -> MarketParticipantError {
-    let source = match error {
-        MarketParticipantsConfigError::IncompleteCredentials { venue, scope } => {
-            AuthError::IncompleteCredentials { venue, scope }
-        }
-        MarketParticipantsConfigError::MismatchedShape { .. } => AuthError::InvalidCredentials,
-    };
-    authentication_failed(route, account, source)
+    let MarketParticipantsConfigError::IncompleteCredentials { venue, scope } = error;
+    authentication_failed(
+        route,
+        account,
+        AuthError::IncompleteCredentials { venue, scope },
+    )
 }
 
 /// Returns the current wall-clock time in Unix milliseconds.
@@ -736,8 +729,9 @@ mod tests {
 
     use app_config::{
         market_participants::{
-            credentials::{BinanceCredentialMarket, LongbridgeCredentials},
+            credentials::{BinanceMarketCredentials, LongbridgeCredentials},
             fixture::{self, FixtureAddress, FixtureInstallation},
+            origins::BinanceMarket,
             settings::VenueSettings,
         },
         settings::Config,
@@ -838,17 +832,15 @@ mod tests {
         let Some(VenueSettings::Binance(settings)) = config.venues.get_mut(&venue) else {
             panic!("the fixture venue is configured as Binance");
         };
-        for market in [
-            BinanceCredentialMarket::Spot,
-            BinanceCredentialMarket::UsdMPerp,
-        ] {
-            settings.credentials.set_market(
+        for market in BinanceMarket::ALL {
+            settings.set_market_credentials(
                 market,
-                app_config::market_participants::credentials::BinanceMarketCredentials {
-                    api_key: "fixture-api-key",
-                    private_key: "0707070707070707070707070707070707070707070707070707070707070707",
-                    passphrase: "",
-                },
+                Some(BinanceMarketCredentials {
+                    api_key: "fixture-api-key".into(),
+                    private_key: "0707070707070707070707070707070707070707070707070707070707070707"
+                        .into(),
+                    passphrase: "".into(),
+                }),
             );
         }
         config
@@ -1291,11 +1283,11 @@ mod tests {
             panic!("the built-in table configures longbridge as Longbridge");
         };
         if let Some((app_key, app_secret, access_token)) = values {
-            settings.credentials = LongbridgeCredentials {
+            settings.credentials = Some(LongbridgeCredentials {
                 app_key: smol_str::SmolStr::new(app_key),
                 app_secret: smol_str::SmolStr::new(app_secret),
                 access_token: smol_str::SmolStr::new(access_token),
-            };
+            });
         }
         config
     }

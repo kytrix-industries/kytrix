@@ -11,10 +11,9 @@
 //! shown.
 //!
 //! The settings page has no cancel and no confirm button: every control writes the change it makes
-//! at once, so leaving the page keeps everything that was stored. What is left is a text field the
-//! user typed into without leaving it, and that is written before the page goes; a write that
-//! failed does not keep the user on a page they asked to leave, so the page goes and the window
-//! reports what could not be stored.
+//! at once, and a dialog writes its draft only when it is confirmed, so leaving the page keeps
+//! everything that was stored. A write that failed does not keep the user on a page they asked to
+//! leave: the page goes and the window reports what could not be stored.
 
 use gpui_kit::{AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window};
 use settings_ui::settings::{SettingsPage, show_write_failure};
@@ -34,10 +33,13 @@ pub(crate) struct MainPages {
     /// The workspace the window shows, kept for as long as the window lives.
     workspaces: Entity<Workspaces>,
     page: MainPage,
-    /// Why the settings page could not store what was still typed into it when it was left.
+    /// Why a write the settings page started could not be stored, when the page was left
+    /// before its own `Render` reported the failure.
     ///
-    /// The page is left regardless, so the reason is carried here and reported over whatever is
-    /// drawn next: the field it came from is what the user lost by leaving.
+    /// The producer is the settings page's write path: a write it made and storage refused, on
+    /// a page the user left before the frame that would have shown the failure. The page is
+    /// left regardless, so the reason is carried here and reported over whatever is drawn next:
+    /// the settings page that could have reported it is gone.
     pending_write_failure: Option<String>,
     /// Follows the workspace list, so a selected workspace takes the page area back from the
     /// settings page.
@@ -88,17 +90,18 @@ impl MainPages {
 
     /// Shows the workspace again, ending the settings page if one was open.
     ///
-    /// What is still typed into a text field of the settings page is written before it goes. The
-    /// page is left whether or not that write landed: a user who asked for the workspace is not
-    /// held on the settings page, and what could not be stored is reported over the workspace. A
-    /// reason that was already waiting to be reported is not dropped by a leave that stored
-    /// everything: the frame that reports it may not have been drawn yet.
+    /// This is where a write the settings page started, and storage refused before the page's
+    /// own `Render` reported it, is carried out of the page. The page is left either way: a user
+    /// who asked for the workspace is not held on the settings page, and what could not be
+    /// stored is reported over the workspace. A reason that was already waiting to be reported
+    /// is not dropped by a leave that stored everything: the frame that reports it may not have
+    /// been drawn yet.
     fn show_workspace(&mut self, cx: &mut Context<Self>) {
         let MainPage::Settings(page) = &self.page else {
             return;
         };
         let page = page.clone();
-        if let Some(reason) = page.update(cx, |page, cx| page.commit_pending(cx)) {
+        if let Some(reason) = page.update(cx, |page, cx| page.take_write_failure(cx)) {
             self.pending_write_failure = Some(reason);
         }
         self.page = MainPage::Workspace;
@@ -109,7 +112,7 @@ impl MainPages {
 impl Render for MainPages {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A page that was left with a write that failed reports it over what is drawn now: the
-        // settings page it came from is gone, and the input it came from with it.
+        // settings page it came from is gone.
         if let Some(reason) = self.pending_write_failure.take() {
             show_write_failure(window, cx, reason);
         }
@@ -123,18 +126,17 @@ impl Render for MainPages {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::time::Duration;
 
     use app_config::settings::{Appearance, Config};
     use app_config_provider::manager::ConfigManager;
     use base_ui::{layer::Layer, style};
     use gpui_kit::{
-        App, AppContext as _, Context, ElementId, Entity, FocusHandle, IntoElement, Modifiers,
+        AppContext as _, Context, ElementId, Entity, FocusHandle, IntoElement, Modifiers,
         ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div,
         px, size,
     };
     use i18n::language::codes::LanguageCode;
-    use tempfile::TempDir;
 
     use super::MainPages;
     use crate::windows::root::components::workspace::{
@@ -148,12 +150,6 @@ mod tests {
     /// the page's own selectors, so what the test changes is a control, not the settings.
     const APPEARANCE: &str = "SETTINGS_CONTROL_appearance";
     const APPEARANCE_DARK: &str = "TEST_MENU_ITEM_Dark";
-    /// The OKX page and its API key, a text field: what is typed into it is only written when the
-    /// caret leaves it or the page is left.
-    const OKX_ENTRY: &str = "SETTINGS_ENTRY_market_participants.okx";
-    const OKX_API_KEY: &str = "SETTINGS_CONTROL_market_participants.okx.api_key";
-    const ALERT: &str = "BASE_UI_ALERT";
-    const CONFIG_FILE_NAME: &str = "config.json";
 
     /// A window root drawing the page area inside the window's layer, which is how the root window
     /// mounts it.
@@ -170,40 +166,9 @@ mod tests {
         }
     }
 
-    /// A temporary directory of the test's own, under the workspace's build output.
-    ///
-    /// The system temporary directory is not usable here: a test that runs behind a restricted
-    /// integrity token cannot create directories in `%TEMP%`, which leaves every test about a
-    /// file on disk failing for a reason that has nothing to do with the code under test. The
-    /// build output is the workspace's own writable scratch space, so the directory goes there.
-    fn test_temp(name: &str) -> TempDir {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("this crate lives two directories below the workspace root");
-        let root = workspace.join("target").join("test-temp").join("kytrix");
-        fs::create_dir_all(&root).expect("the test temporary directory should be created");
-        tempfile::Builder::new()
-            .prefix(name)
-            .tempdir_in(&root)
-            .expect("a temporary directory should be created")
-    }
-
     /// Opens a window over a fresh workspace and the page area that shows it.
     fn harness(
         cx: &mut TestAppContext,
-    ) -> (
-        Entity<MainPages>,
-        Entity<Workspaces>,
-        &mut VisualTestContext,
-    ) {
-        harness_over(cx, |cx| ConfigManager::in_memory(Config::default(), cx))
-    }
-
-    /// Opens a window whose settings are the ones `manager` stores.
-    fn harness_over(
-        cx: &mut TestAppContext,
-        build_manager: impl FnOnce(&mut App) -> ConfigManager,
     ) -> (
         Entity<MainPages>,
         Entity<Workspaces>,
@@ -215,7 +180,7 @@ mod tests {
             widget_registry::catalogue::install(cx).expect("the catalogue should install");
             style::theme::install(cx);
             cx.set_global(LanguageCode::En);
-            let manager = build_manager(cx);
+            let manager = ConfigManager::in_memory(Config::default(), cx);
             cx.set_global(manager);
         });
         let workspaces = cx.update(|cx| cx.new(Workspaces::load));
@@ -270,38 +235,6 @@ mod tests {
     /// The appearance the settings hold, which is what every frame after the change reads.
     fn stored_appearance(cx: &VisualTestContext) -> Appearance {
         cx.read(|cx| cx.global::<ConfigManager>().read().appearance)
-    }
-
-    /// A window whose settings cannot be stored: the config directory is a file, so every write
-    /// fails the way an unwritable config directory does.
-    fn harness_behind_a_blocking_file(
-        cx: &mut TestAppContext,
-    ) -> (
-        TempDir,
-        Entity<MainPages>,
-        Entity<Workspaces>,
-        &mut VisualTestContext,
-    ) {
-        let directory = test_temp("pages-behind-a-blocking-file");
-        let blocking = directory.path().join("settings");
-        fs::write(&blocking, b"block the config directory")
-            .expect("the blocking file should be written");
-        let path = blocking.join(CONFIG_FILE_NAME);
-        let (pages, workspaces, cx) = harness_over(cx, move |cx| {
-            ConfigManager::from_path(path, cx)
-                .expect("a missing settings file starts from defaults")
-        });
-
-        (directory, pages, workspaces, cx)
-    }
-
-    /// Opens the OKX page and types into its API key without leaving the field: what was typed is
-    /// only in the field, which is what leaving the page has to carry.
-    fn type_into_the_okx_api_key_without_leaving(cx: &mut VisualTestContext) {
-        click(cx, OKX_ENTRY);
-        click(cx, OKX_API_KEY);
-        cx.simulate_input("x");
-        cx.run_until_parked();
     }
 
     /// A focus handle a test can put the window's caret on, standing in for a field in the
@@ -511,72 +444,40 @@ mod tests {
         );
     }
 
-    /// A text field that could not be stored when the page was left does not keep the user on the
-    /// page: the workspace comes back, the field goes with the page, and the reason is reported
-    /// over the workspace.
+    /// A write that failed on the settings page but was never reported by its own frame is not
+    /// dropped when the page is left: the window reports it over the workspace.
+    ///
+    /// The handover is covered in two halves: settings_ui's own test covers what
+    /// `take_write_failure` hands over, and this one covers what the window does with it after
+    /// `show_workspace` — reports it through Render, and consumes it once.
     #[gpui_kit::test]
-    fn a_failed_pending_write_should_leave_and_report_on_the_workspace(cx: &mut TestAppContext) {
-        let (_directory, pages, workspaces, cx) = harness_behind_a_blocking_file(cx);
-
-        open_settings(&pages, cx);
-        type_into_the_okx_api_key_without_leaving(cx);
-        press_the_active_workspace_row(&workspaces, cx);
-        settle(cx);
-
-        assert!(
-            cx.debug_bounds(SETTINGS_PAGE).is_none(),
-            "a write that could not be stored must not keep the settings page open"
-        );
-        assert!(
-            cx.debug_bounds(PANE_BODY).is_some(),
-            "the workspace the row asked for should be shown"
-        );
-        assert!(
-            cx.debug_bounds(ALERT).is_some(),
-            "what could not be stored should be reported over the workspace"
-        );
-    }
-
-    /// A reason waiting to be reported is not lost when the settings are opened and left again
-    /// before the frame that would report it: what is reported is the write that failed.
-    #[gpui_kit::test]
-    fn a_failure_waiting_to_be_reported_should_survive_leaving_the_settings_again(
+    fn a_write_failure_carried_out_of_the_settings_page_is_reported_over_the_workspace(
         cx: &mut TestAppContext,
     ) {
-        let (_directory, pages, _workspaces, cx) = harness_behind_a_blocking_file(cx);
-
+        let (pages, _, cx) = harness(cx);
         open_settings(&pages, cx);
-        type_into_the_okx_api_key_without_leaving(cx);
-
-        // One frame's worth of state: the first leave fails to store the field, and the settings
-        // are opened and left again before anything was drawn.
-        cx.update(|window, cx| {
-            pages.update(cx, |pages, cx| pages.show_workspace(cx));
-            assert!(
-                pages.read(cx).pending_write_failure.is_some(),
-                "the write that failed should be waiting to be reported"
-            );
-
-            pages.update(cx, |pages, cx| pages.show_settings(window, cx));
-            pages.update(cx, |pages, cx| pages.show_workspace(cx));
-            assert!(
-                pages.read(cx).pending_write_failure.is_some(),
-                "leaving a page with nothing to store must not drop the reason that was waiting"
-            );
+        // What `show_workspace` carries out of a page whose render never reported the failure:
+        // the page is left before the frame that would have shown it, so nothing else knows.
+        cx.update(|_, cx| {
+            pages.update(cx, |pages, cx| {
+                pages.pending_write_failure = Some("the settings could not be stored".to_owned());
+                pages.show_workspace(cx);
+            });
         });
+
         settle(cx);
 
         assert!(
-            cx.debug_bounds(SETTINGS_PAGE).is_none(),
-            "the settings page should be gone"
+            cx.debug_bounds("BASE_UI_ALERT").is_some(),
+            "the failure carried out of the settings page should be reported"
         );
         assert!(
             cx.debug_bounds(PANE_BODY).is_some(),
-            "the workspace should be shown"
+            "the workspace is what is drawn while the failure is reported"
         );
         assert!(
-            cx.debug_bounds(ALERT).is_some(),
-            "the reason the first leave carried should still be reported"
+            cx.update(|_, cx| pages.read(cx).pending_write_failure.is_none()),
+            "the reason is reported once rather than carried into every frame"
         );
     }
 

@@ -280,13 +280,12 @@ pub(crate) fn on_select(
 
 /// The context a native page is drawn in.
 ///
-/// It bundles what every page is handed rather than repeating six parameters in each page's
-/// signature. The page owns nothing here: the settings are the session's, and the window and the
-/// page entity are the ones drawing this frame.
+/// It bundles what every page is handed rather than repeating five parameters in each page's
+/// signature. The page owns nothing here: the settings are the session's, and the page entity is
+/// the one drawing this frame.
 pub(crate) struct PageArgs<'a, 'b> {
     pub config: &'a Config,
     pub filter: &'a crate::search::SearchFilter,
-    pub window: &'a mut Window,
     pub settings: &'a mut SettingsPage,
     pub handle: &'a Entity<SettingsPage>,
     pub cx: &'a mut Context<'b, SettingsPage>,

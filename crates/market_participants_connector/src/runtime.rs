@@ -28,11 +28,11 @@ use crate::routing::CredentialGeneration;
 /// Resolved state for one complete credential set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CredentialState<T> {
-    /// Every field in the credential set is empty.
+    /// No set is stored at all: the market or venue is unconfigured.
     Unconfigured,
     /// Every required field is present; cryptographic validation is deferred.
     Configured(T),
-    /// The stored set is missing, mismatched, or partial.
+    /// A set is stored but incomplete, so it fails closed rather than signing.
     Invalid(MarketParticipantsConfigError),
 }
 
@@ -367,22 +367,28 @@ impl MarketParticipantNetworkSnapshot {
         venue: &VenueId,
         scope: &VenueScopeId,
     ) -> CredentialState<BinanceCredentialValues> {
-        let Some(VenueSettings::Binance(settings)) = self.venue_settings(venue) else {
+        let Some(settings @ VenueSettings::Binance(binance)) = self.venue_settings(venue) else {
             return CredentialState::Unconfigured;
         };
         let Some(market) = binance_market(scope.as_str()) else {
             return CredentialState::Unconfigured;
         };
-        let stored = settings.credentials.market(market.credential_market());
-        match stored.validate(*venue, Some(market.scope())) {
+        match settings.validate_credentials(*venue, market.scope()) {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
-            Ok(true) => CredentialState::Configured(BinanceCredentialValues {
-                api_key: SmolStr::new(stored.api_key),
-                private_key: SmolStr::new(stored.private_key),
-                passphrase: (!stored.passphrase.trim().is_empty())
-                    .then(|| SmolStr::new(stored.passphrase)),
-            }),
+            Ok(true) => {
+                // `Ok(true)` is only returned for this same settings' complete `Some` set of
+                // the market mapped above, so no user input reaches this `expect`.
+                let stored = binance
+                    .market_credentials(market)
+                    .expect("a market whose credentials are complete stores them");
+                CredentialState::Configured(BinanceCredentialValues {
+                    api_key: stored.api_key.clone(),
+                    private_key: stored.private_key.clone(),
+                    passphrase: (!stored.passphrase.trim().is_empty())
+                        .then(|| stored.passphrase.clone()),
+                })
+            }
         }
     }
 
@@ -403,11 +409,19 @@ impl MarketParticipantNetworkSnapshot {
         match settings.validate_credentials(*venue, credential_scope) {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
-            Ok(true) => CredentialState::Configured(OkxCredentialValues {
-                api_key: okx.credentials.api_key.clone(),
-                secret_key: okx.credentials.secret_key.clone(),
-                passphrase: okx.credentials.passphrase.clone(),
-            }),
+            Ok(true) => {
+                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
+                // so no user input reaches this `expect`.
+                let stored = okx
+                    .credentials
+                    .as_ref()
+                    .expect("a venue whose credentials are complete stores them");
+                CredentialState::Configured(OkxCredentialValues {
+                    api_key: stored.api_key.clone(),
+                    secret_key: stored.secret_key.clone(),
+                    passphrase: stored.passphrase.clone(),
+                })
+            }
         }
     }
 
@@ -429,10 +443,18 @@ impl MarketParticipantNetworkSnapshot {
         match settings.validate_credentials(*venue, credential_scope) {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
-            Ok(true) => CredentialState::Configured(HyperliquidCredentialValues {
-                main_account_address: hypercore.credentials.main_account_address.clone(),
-                api_agent_private_key: hypercore.credentials.api_agent_private_key.clone(),
-            }),
+            Ok(true) => {
+                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
+                // so no user input reaches this `expect`.
+                let stored = hypercore
+                    .credentials
+                    .as_ref()
+                    .expect("a venue whose credentials are complete stores them");
+                CredentialState::Configured(HyperliquidCredentialValues {
+                    main_account_address: stored.main_account_address.clone(),
+                    api_agent_private_key: stored.api_agent_private_key.clone(),
+                })
+            }
         }
     }
 
@@ -455,11 +477,19 @@ impl MarketParticipantNetworkSnapshot {
         match settings.validate_credentials(*venue, credential_scope) {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
-            Ok(true) => CredentialState::Configured(LongbridgeCredentialValues {
-                app_key: longbridge.credentials.app_key.clone(),
-                app_secret: longbridge.credentials.app_secret.clone(),
-                access_token: longbridge.credentials.access_token.clone(),
-            }),
+            Ok(true) => {
+                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
+                // so no user input reaches this `expect`.
+                let stored = longbridge
+                    .credentials
+                    .as_ref()
+                    .expect("a venue whose credentials are complete stores them");
+                CredentialState::Configured(LongbridgeCredentialValues {
+                    app_key: stored.app_key.clone(),
+                    app_secret: stored.app_secret.clone(),
+                    access_token: stored.access_token.clone(),
+                })
+            }
         }
     }
 
@@ -523,7 +553,11 @@ mod tests {
 
     use app_config::{
         market_participants::{
-            credentials::{LongbridgeCredentials, OkxCredentials},
+            credentials::{
+                BinanceMarketCredentials, HyperliquidCredentials, LongbridgeCredentials,
+                OkxCredentials,
+            },
+            error::MarketParticipantsConfigError,
             origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
             settings::{BinanceOrigins, OkxSettings, VenueSettings, default_venues},
         },
@@ -533,7 +567,7 @@ mod tests {
     use market_participants_model::identifier::{VenueId, VenueScopeId};
     use smol_str::SmolStr;
 
-    use super::{CredentialGeneration, MarketParticipantNetworkSnapshot};
+    use super::{CredentialGeneration, CredentialState, MarketParticipantNetworkSnapshot};
     use crate::routing::{
         CORE_PERP_SCOPE, LONGBRIDGE_US_SCOPE, PERPETUAL_SCOPE, SPOT_SCOPE, SWAP_SCOPE,
     };
@@ -548,8 +582,14 @@ mod tests {
         else {
             panic!("binance is configured as Binance by the built-in table");
         };
-        settings.credentials.spot_api_key = SmolStr::new(api_key);
-        settings.credentials.spot_private_key = SmolStr::new(private_key);
+        settings.set_market_credentials(
+            BinanceMarket::Spot,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new(api_key),
+                private_key: SmolStr::new(private_key),
+                passphrase: SmolStr::default(),
+            }),
+        );
     }
 
     /// Writes one complete Binance USD-M perpetual credential set into the configuration.
@@ -558,8 +598,14 @@ mod tests {
         else {
             panic!("binance is configured as Binance by the built-in table");
         };
-        settings.credentials.usd_m_perp_api_key = SmolStr::new(api_key);
-        settings.credentials.usd_m_perp_private_key = SmolStr::new(private_key);
+        settings.set_market_credentials(
+            BinanceMarket::UsdMPerp,
+            Some(BinanceMarketCredentials {
+                api_key: SmolStr::new(api_key),
+                private_key: SmolStr::new(private_key),
+                passphrase: SmolStr::default(),
+            }),
+        );
     }
 
     /// Writes one complete OKX credential set into the configuration.
@@ -567,11 +613,11 @@ mod tests {
         let Some(VenueSettings::Okx(settings)) = config.venues.get_mut(&VenueId::Okx) else {
             panic!("okx is configured as OKX by the built-in table");
         };
-        settings.credentials = OkxCredentials {
+        settings.credentials = Some(OkxCredentials {
             api_key: SmolStr::new(api_key),
             secret_key: SmolStr::new_static("okx-secret"),
             passphrase: SmolStr::new_static("okx-passphrase"),
-        };
+        });
     }
 
     /// Writes one complete HyperCore credential set into the configuration.
@@ -581,8 +627,10 @@ mod tests {
         else {
             panic!("hyperliquid is configured as HyperCore by the built-in table");
         };
-        settings.credentials.main_account_address = SmolStr::new(address);
-        settings.credentials.api_agent_private_key = SmolStr::new(private_key);
+        settings.credentials = Some(HyperliquidCredentials {
+            main_account_address: SmolStr::new(address),
+            api_agent_private_key: SmolStr::new(private_key),
+        });
     }
 
     /// Writes one Longbridge credential set into the configuration.
@@ -591,11 +639,11 @@ mod tests {
         else {
             panic!("longbridge is configured as Longbridge by the built-in table");
         };
-        settings.credentials = LongbridgeCredentials {
+        settings.credentials = Some(LongbridgeCredentials {
             app_key: SmolStr::new(app_key),
             app_secret: SmolStr::new(app_secret),
             access_token: SmolStr::new(token),
-        };
+        });
     }
 
     /// The Binance spot market's own second address choice.
@@ -844,7 +892,11 @@ mod tests {
         let Some(VenueSettings::Okx(settings)) = config.venues.get_mut(&okx_venue) else {
             panic!("okx is configured as OKX by the built-in table");
         };
-        settings.credentials.api_key = SmolStr::new_static("okx-key");
+        settings.credentials = Some(OkxCredentials {
+            api_key: SmolStr::new_static("okx-key"),
+            secret_key: SmolStr::default(),
+            passphrase: SmolStr::default(),
+        });
 
         let snapshot = MarketParticipantNetworkSnapshot::new(config);
 
@@ -863,6 +915,55 @@ mod tests {
         ));
     }
 
+    /// A Binance market holding a half-filled set fails closed: it resolves as invalid rather
+    /// than as the values it happens to hold, its sibling stays unconfigured, and neither
+    /// answers a generation or reports the venue configured.
+    #[test]
+    fn a_partially_configured_binance_market_fails_closed() {
+        let binance = VenueId::Binance;
+        let mut config = Config::default();
+        let Some(VenueSettings::Binance(settings)) = config.venues.get_mut(&binance) else {
+            panic!("binance is configured as Binance by the built-in table");
+        };
+        settings.spot_credentials = Some(BinanceMarketCredentials {
+            api_key: SmolStr::new_static("k"),
+            private_key: SmolStr::default(),
+            passphrase: SmolStr::default(),
+        });
+        settings.usd_m_perp_credentials = None;
+
+        let snapshot = MarketParticipantNetworkSnapshot::new(config);
+
+        assert_eq!(
+            snapshot.resolve_binance_credentials(&binance, &scope(SPOT_SCOPE)),
+            CredentialState::Invalid(MarketParticipantsConfigError::IncompleteCredentials {
+                venue: binance,
+                scope: Some(SmolStr::new_static(SPOT_SCOPE)),
+            }),
+            "the spot market stores a set missing its private key, so it is refused rather \
+             than resolved"
+        );
+        assert_eq!(
+            snapshot.resolve_binance_credentials(&binance, &scope(PERPETUAL_SCOPE)),
+            CredentialState::Unconfigured,
+            "the sibling market stores no set at all"
+        );
+        assert_eq!(
+            snapshot.credential_generation(&binance, &scope(SPOT_SCOPE)),
+            None,
+            "an incomplete set signs nothing, so it answers no generation"
+        );
+        assert_eq!(
+            snapshot.credential_generation(&binance, &scope(PERPETUAL_SCOPE)),
+            None,
+            "the unconfigured market answers no generation either"
+        );
+        assert!(
+            !snapshot.credentials_configured(&binance),
+            "a venue whose primary market is half filled is not configured"
+        );
+    }
+
     /// A venue row holding another kind of credential answers nothing for the kind it
     /// is not: credentials are typed per venue, and one venue's keys are never
     /// presented to another venue's host.
@@ -873,11 +974,11 @@ mod tests {
         config.venues.insert(
             binance,
             VenueSettings::Okx(OkxSettings {
-                credentials: OkxCredentials {
+                credentials: Some(OkxCredentials {
                     api_key: SmolStr::new_static("okx-key"),
                     secret_key: SmolStr::new_static("okx-secret"),
                     passphrase: SmolStr::new_static("okx-passphrase"),
-                },
+                }),
                 ..OkxSettings::default()
             }),
         );
