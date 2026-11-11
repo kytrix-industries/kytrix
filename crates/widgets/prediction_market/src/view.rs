@@ -17,7 +17,6 @@ use std::{
 };
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use app_config_provider::manager::ConfigManager;
 use base_ui::{
     button::Button,
     empty_state::EmptyState,
@@ -37,9 +36,7 @@ use gpui_kit::{
     px, relative,
 };
 use i18n::t;
-use instrument_selector_ui::{
-    prediction_button::PredictionEventButton, prediction_locale::polymarket_locale,
-};
+use instrument_selector_ui::prediction_button::PredictionEventButton;
 use market_participants_connector::{
     connector::MarketParticipantsConnector, venue::loaded::VenuesUpdated,
 };
@@ -309,7 +306,6 @@ pub struct PredictionMarketWidget {
     pointer_frame: PointerFrameState,
     /// The breathing effect around the endpoints, while it is running.
     pulse: Option<Pulse>,
-    locale: Option<SmolStr>,
     /// The local epoch of the stream currently requested.
     epoch: u64,
     awaiting_market: bool,
@@ -371,9 +367,6 @@ impl WidgetView for PredictionMarketWidget {
             );
             return;
         };
-        self.locale = cx
-            .try_global::<ConfigManager>()
-            .and_then(|manager| polymarket_locale(manager.read().language));
         self.epoch = self.epoch.wrapping_add(1);
         let retry = self.status.is_failed(cx);
         self.status.report(WidgetState::Connecting, cx);
@@ -382,7 +375,6 @@ impl WidgetView for PredictionMarketWidget {
                 event: selection,
                 market: self.market.clone(),
                 range: self.config.range,
-                locale: self.locale.clone(),
                 epoch: self.epoch,
             }
         } else {
@@ -390,7 +382,6 @@ impl WidgetView for PredictionMarketWidget {
                 event: selection,
                 market: self.market.clone(),
                 range: self.config.range,
-                locale: self.locale.clone(),
                 epoch: self.epoch,
             }
         };
@@ -506,7 +497,6 @@ impl PredictionMarketWidget {
             pointer: None,
             pointer_frame: PointerFrameState::default(),
             pulse: None,
-            locale: None,
             epoch: 0,
             awaiting_market: false,
             _venues: subscription,
@@ -793,7 +783,6 @@ impl PredictionMarketWidget {
                 event: event.clone(),
                 market: self.market.clone(),
                 range: self.config.range,
-                locale: self.locale.clone(),
                 epoch: self.epoch,
             })
     }
@@ -1890,7 +1879,6 @@ mod tests {
         async fn event(
             &self,
             _event: PredictionEventRef,
-            _locale: Option<SmolStr>,
         ) -> Result<PredictionEventView, MarketError> {
             let event = event_ref();
             let (market, _) = charted_market(&event, "charted");
@@ -2092,7 +2080,6 @@ mod tests {
             event: event_ref(),
             market: None,
             range: PredictionRange::All,
-            locale: None,
             epoch: 0,
         }
     }
@@ -2330,7 +2317,6 @@ mod tests {
             event: hyperliquid_event_ref(),
             market: None,
             range: PredictionRange::All,
-            locale: None,
             epoch: 0,
         }
     }

@@ -79,6 +79,9 @@ pub enum ProviderError {
     /// The worker thread is gone, so no request can be served.
     #[error("the llama worker is no longer running")]
     WorkerUnavailable,
+    /// The caller's cancellation check asked for the request to stop.
+    #[error("the request was cancelled")]
+    Cancelled,
     /// The engine configuration cannot be used.
     #[error("invalid engine configuration: {reason}")]
     InvalidConfig { reason: SmolStr },
@@ -193,5 +196,9 @@ mod tests {
             "the prompt needs 9000 tokens and only 4096 are available for it"
         );
         assert!(too_long.source().is_none());
+
+        let cancelled = ProviderError::Cancelled;
+        assert_eq!(cancelled.to_string(), "the request was cancelled");
+        assert!(cancelled.source().is_none());
     }
 }

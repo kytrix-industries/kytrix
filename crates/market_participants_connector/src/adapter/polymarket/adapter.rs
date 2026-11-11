@@ -4,11 +4,6 @@
 //! directory and CLOB publishes prices and history; the execution context carries
 //! both, and this adapter chooses the host by the request it is answering rather
 //! than by a second venue identity.
-//!
-//! Gamma can localize event content with a `locale` query parameter. The adapter
-//! always keeps the canonical English answer as the semantic source and merges the
-//! localized answer into display fields only. Public search does not localize, so
-//! its results are re-read by event id when the caller supplies a locale.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,11 +13,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{
-    Stream, StreamExt,
-    future::{BoxFuture, join_all},
-    stream,
-};
+use futures::{Stream, StreamExt, future::BoxFuture, stream};
 use market_participants_model::{
     asset::{ContractAddress, CryptoTokenOrigin, CryptoTokenTerms, TokenReference},
     decimal::{Fraction, Quantity, Ratio, Tick, UnixMillis},
@@ -167,25 +158,14 @@ impl PolymarketAdapter {
         context: &ExecutionContext,
         query: &PredictionEventsQuery,
     ) -> Result<(Vec<GammaEvent>, Option<SmolStr>, Option<u32>), MarketParticipantError> {
-        let answer = self.keyset_page(context, query, None).await?;
-        let Some(locale) = query.locale.as_deref() else {
-            return Ok((answer.events, answer.next_cursor, None));
-        };
-        // Gamma localizes list content per request. Keep the canonical answer as the
-        // semantic source and use the localized page only for display fields.
-        let localized = self.keyset_page(context, query, Some(locale)).await?;
-        Ok((
-            merge_localized_events(answer.events, localized.events),
-            answer.next_cursor,
-            None,
-        ))
+        let answer = self.keyset_page(context, query).await?;
+        Ok((answer.events, answer.next_cursor, None))
     }
 
     async fn keyset_page(
         &self,
         context: &ExecutionContext,
         query: &PredictionEventsQuery,
-        locale: Option<&str>,
     ) -> Result<GammaEventsKeyset, MarketParticipantError> {
         let mut url = endpoint(context.http_metadata(), "events/keyset")?;
         {
@@ -202,9 +182,6 @@ impl PolymarketAdapter {
             }
             if let Some(cursor) = query.cursor.as_deref() {
                 pairs.append_pair("after_cursor", cursor);
-            }
-            if let Some(locale) = locale {
-                pairs.append_pair("locale", locale);
             }
         }
         get_json(context, &url).await
@@ -239,40 +216,7 @@ impl PolymarketAdapter {
         let has_more = answer.pagination.as_ref().is_some_and(|page| page.has_more);
         let total = answer.pagination.and_then(|page| page.total_results);
         let next = has_more.then(|| SmolStr::new(format_smolstr!("{}", page.saturating_add(1))));
-        let events = self
-            .localized_events(
-                context,
-                answer.events.unwrap_or_default(),
-                query.locale.as_deref(),
-            )
-            .await?;
-        Ok((events, next, total))
-    }
-
-    /// Reads the localized copy of every event a search returned.
-    ///
-    /// Gamma's public search does not localize its event titles, so each result is
-    /// re-read by event id when the caller asked for a locale. The canonical search
-    /// result remains the source of market structure; the localized copy only
-    /// supplies display text.
-    async fn localized_events(
-        &self,
-        context: &ExecutionContext,
-        events: Vec<GammaEvent>,
-        locale: Option<&str>,
-    ) -> Result<Vec<GammaEvent>, MarketParticipantError> {
-        let Some(locale) = locale else {
-            return Ok(events);
-        };
-        let localized = join_all(
-            events
-                .iter()
-                .map(|event| self.event_by_id(context, event.id.as_str(), Some(locale))),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-        Ok(merge_localized_events(events, localized))
+        Ok((answer.events.unwrap_or_default(), next, total))
     }
 
     /// Reads one event from Gamma, including the child events that carry its
@@ -283,11 +227,7 @@ impl PolymarketAdapter {
         query: &PredictionEventQuery,
     ) -> Result<PredictionEventView, MarketParticipantError> {
         let id = query.event.native_event.as_str();
-        let mut event = self.event_with_children(context, id, None).await?;
-        if let Some(locale) = query.locale.as_deref() {
-            let localized = self.event_with_children(context, id, Some(locale)).await?;
-            merge_localized_event(&mut event, localized);
-        }
+        let event = self.event_with_children(context, id).await?;
         decode_view(&event).map(|(view, _)| view)
     }
 
@@ -296,10 +236,9 @@ impl PolymarketAdapter {
         &self,
         context: &ExecutionContext,
         id: &str,
-        locale: Option<&str>,
     ) -> Result<GammaEvent, MarketParticipantError> {
-        let mut event = self.event_by_id(context, id, locale).await?;
-        let children = self.event_children(context, id, locale).await?;
+        let mut event = self.event_by_id(context, id).await?;
+        let children = self.event_children(context, id).await?;
         merge_child_events(&mut event, children);
         Ok(event)
     }
@@ -309,7 +248,6 @@ impl PolymarketAdapter {
         &self,
         context: &ExecutionContext,
         id: &str,
-        locale: Option<&str>,
     ) -> Result<Vec<GammaEvent>, MarketParticipantError> {
         // Only the keyset directory accepts `parent_event_id`; the plain event
         // directory would ignore it and return unrelated events.
@@ -324,9 +262,6 @@ impl PolymarketAdapter {
                 pairs.append_pair("limit", "100");
                 if let Some(cursor) = cursor.as_deref() {
                     pairs.append_pair("after_cursor", cursor);
-                }
-                if let Some(locale) = locale {
-                    pairs.append_pair("locale", locale);
                 }
             }
             let page: GammaEventsKeyset = get_json(context, &url).await?;
@@ -346,7 +281,6 @@ impl PolymarketAdapter {
         &self,
         context: &ExecutionContext,
         id: &str,
-        locale: Option<&str>,
     ) -> Result<GammaEvent, MarketParticipantError> {
         if !id
             .bytes()
@@ -358,10 +292,7 @@ impl PolymarketAdapter {
                 raw_data: None,
             });
         }
-        let mut url = endpoint(context.http_metadata(), &format_smolstr!("events/{id}"))?;
-        if let Some(locale) = locale {
-            url.query_pairs_mut().append_pair("locale", locale);
-        }
+        let url = endpoint(context.http_metadata(), &format_smolstr!("events/{id}"))?;
         get_json(context, &url).await
     }
 
@@ -1157,38 +1088,6 @@ fn categories() -> Vec<PredictionCategory> {
         .collect()
 }
 
-fn merge_localized_events(events: Vec<GammaEvent>, localized: Vec<GammaEvent>) -> Vec<GammaEvent> {
-    let mut localized: BTreeMap<SmolStr, GammaEvent> = localized
-        .into_iter()
-        .map(|event| (event.id.clone(), event))
-        .collect();
-    events
-        .into_iter()
-        .map(|mut event| {
-            if let Some(localized_event) = localized.remove(&event.id) {
-                merge_localized_event(&mut event, localized_event);
-            }
-            event
-        })
-        .collect()
-}
-
-fn merge_localized_event(event: &mut GammaEvent, localized: GammaEvent) {
-    if !localized.title.is_empty() {
-        event.title = localized.title;
-    }
-    let mut localized: BTreeMap<SmolStr, GammaMarket> = localized
-        .markets
-        .into_iter()
-        .map(|market| (market.id.clone(), market))
-        .collect();
-    for market in &mut event.markets {
-        if let Some(localized_market) = localized.remove(&market.id) {
-            market.apply_localized(localized_market);
-        }
-    }
-}
-
 /// Appends the markets of every child event that the parent does not already
 /// publish.
 fn merge_child_events(event: &mut GammaEvent, children: Vec<GammaEvent>) {
@@ -1363,7 +1262,7 @@ fn decode_view(
             .unwrap_or_else(|| question.clone());
         let group_meta = market_group_meta(market);
         let headline = group_meta.key == "moneyline";
-        let display_outcomes = market_display_outcomes(market);
+        let display_outcomes = parse_string_array(market.outcomes.as_ref());
         let mut default_leg = None;
         let mut legs = Vec::new();
         for (leg, side_label) in group_legs(&group) {
@@ -1457,13 +1356,7 @@ fn market_group(
     )>,
     MarketParticipantError,
 > {
-    let canonical_outcomes = parse_string_array(
-        market
-            .canonical_outcomes
-            .as_ref()
-            .or(market.outcomes.as_ref()),
-    );
-    let outcomes = market_display_outcomes(market);
+    let outcomes = parse_string_array(market.outcomes.as_ref());
     let prices: Vec<Option<Fraction>> = parse_string_array(market.outcome_prices.as_ref())
         .iter()
         .map(|value| probability(value))
@@ -1497,9 +1390,9 @@ fn market_group(
     } else {
         market.question.clone()
     };
-    // The localized copy may say `是` / `否`; only the canonical outcomes decide
-    // the market's shape. The display outcomes are used for the option labels.
-    let binary_market = is_binary_outcome_set(&canonical_outcomes);
+    // A two-participant market is not binary: its outcomes name the members, so
+    // only the canonical Yes/No set takes the binary topology.
+    let binary_market = is_binary_outcome_set(&outcomes);
     let member_label = market
         .group_item_title
         .as_ref()
@@ -1507,12 +1400,7 @@ fn market_group(
         .cloned()
         .unwrap_or_else(|| question.clone());
     let (topology, members) = if binary_market {
-        let sides = if outcomes.len() == 2 {
-            outcomes
-        } else {
-            canonical_outcomes
-        };
-        (binary(), vec![(member_label, sides)])
+        (binary(), vec![(member_label, outcomes)])
     } else {
         (
             exactly_one(),
@@ -1630,14 +1518,6 @@ fn is_binary_outcome_set(outcomes: &[SmolStr]) -> bool {
     outcomes.len() == 2
         && outcomes[0].eq_ignore_ascii_case("yes")
         && outcomes[1].eq_ignore_ascii_case("no")
-}
-
-fn market_display_outcomes(market: &GammaMarket) -> Vec<SmolStr> {
-    let mut outcomes = parse_string_array(market.outcomes.as_ref());
-    if outcomes.is_empty() {
-        outcomes = parse_string_array(market.canonical_outcomes.as_ref());
-    }
-    outcomes
 }
 
 fn parse_string_array(value: Option<&GammaIdList>) -> Vec<SmolStr> {
@@ -1935,8 +1815,8 @@ mod tests {
     use super::{
         CATEGORIES, category_of, decode_book_snapshot, decode_card, decode_market_frame,
         decode_prediction_book_frame, decode_view, history_window, is_binary_outcome_set,
-        market_channel_payloads, market_type_label, merge_child_events, merge_localized_event,
-        now_millis, parse_string_array, prediction_order_book_asset,
+        market_channel_payloads, market_type_label, merge_child_events, now_millis,
+        parse_string_array, prediction_order_book_asset,
     };
     use crate::{
         adapter::polymarket::types::{
@@ -2070,62 +1950,12 @@ mod tests {
     fn only_the_canonical_yes_no_set_is_binary() {
         let yes_no =
             parse_string_array(Some(GammaIdList::String("[\"Yes\", \"No\"]".into())).as_ref());
-        let localized =
-            parse_string_array(Some(GammaIdList::String("[\"是\", \"否\"]".into())).as_ref());
         let teams = parse_string_array(
             Some(GammaIdList::String("[\"Bears\", \"Seahawks\"]".into())).as_ref(),
         );
 
         assert!(is_binary_outcome_set(&yes_no));
-        assert!(!is_binary_outcome_set(&localized));
         assert!(!is_binary_outcome_set(&teams));
-    }
-
-    #[test]
-    fn a_localized_binary_market_keeps_its_shape_and_uses_localized_labels() {
-        let mut event = binary_event(binary_market("v1", &["123", "456"]));
-        event.title = "An event".into();
-        let mut localized = event.clone();
-        localized.title = "一个事件".into();
-        localized.markets[0].question = "会发生吗？".into();
-        localized.markets[0].group_item_title = Some("十二月三十一日".into());
-        localized.markets[0].outcomes = Some("[\"是\", \"否\"]".into());
-
-        merge_localized_event(&mut event, localized);
-        let (view, options) = decode_view(&event).expect("the localized fixture decodes");
-
-        assert_eq!(view.title, "一个事件");
-        assert_eq!(
-            event.markets[0]
-                .canonical_outcomes
-                .as_ref()
-                .map(GammaIdList::values),
-            Some(vec!["Yes".into(), "No".into()])
-        );
-        assert_eq!(
-            event.markets[0].outcomes.as_ref().map(GammaIdList::values),
-            Some(vec!["是".into(), "否".into()])
-        );
-        assert_eq!(view.markets[0].label, "十二月三十一日");
-        assert_eq!(view.markets[0].question, "会发生吗？");
-        assert_eq!(view.markets[0].legs.len(), 2);
-        assert_eq!(options.len(), 2, "both localized sides stay addressable");
-        let yes = options
-            .iter()
-            .find(|option| option.label == "是")
-            .expect("the localized Yes side is present");
-        assert_eq!(
-            yes.probability,
-            Some("0.4".parse().expect("the fixture probability is valid"))
-        );
-        let no = options
-            .iter()
-            .find(|option| option.label == "否")
-            .expect("the localized No side is present");
-        assert_eq!(
-            no.probability,
-            Some("0.6".parse().expect("the fixture probability is valid"))
-        );
     }
 
     fn binary_market(version: &str, ids: &[&str]) -> GammaMarket {
@@ -2134,7 +1964,6 @@ mod tests {
             question: "Will it happen?".into(),
             condition_id: format!("0x{}", "a".repeat(64)).into(),
             outcomes: Some("[\"Yes\", \"No\"]".into()),
-            canonical_outcomes: None,
             outcome_prices: Some("[\"0.4\", \"0.6\"]".into()),
             clob_token_ids: (version == "v1").then(|| {
                 GammaIdList::String(
@@ -2168,39 +1997,6 @@ mod tests {
             tags: Vec::new(),
             markets,
         }
-    }
-
-    #[test]
-    fn a_localized_participant_market_keeps_both_members() {
-        let mut market = binary_market("v1", &["123", "456"]);
-        market.question = "Bears vs. Seahawks".into();
-        market.group_item_title = None;
-        market.outcomes = Some("[\"Bears\", \"Seahawks\"]".into());
-        let mut event = binary_event(market);
-        let mut localized = event.clone();
-        localized.markets[0].question = "熊对海鹰".into();
-        localized.markets[0].outcomes = Some("[\"熊\", \"海鹰\"]".into());
-
-        merge_localized_event(&mut event, localized);
-        let (_, options) = decode_view(&event).expect("the localized fixture decodes");
-
-        assert_eq!(options.len(), 2, "a two-participant market is not binary");
-        let bear = options
-            .iter()
-            .find(|option| option.label == "熊")
-            .expect("the bear option is present");
-        let seahawk = options
-            .iter()
-            .find(|option| option.label == "海鹰")
-            .expect("the seahawk option is present");
-        assert_eq!(
-            bear.probability,
-            Some("0.4".parse().expect("the fixture probability is valid"))
-        );
-        assert_eq!(
-            seahawk.probability,
-            Some("0.6".parse().expect("the fixture probability is valid"))
-        );
     }
 
     #[test]
@@ -2503,26 +2299,6 @@ mod tests {
         assert_eq!(card.options.len(), 6);
         assert_eq!(card.remaining_options, 2);
         assert_eq!(card.remaining_markets, 2);
-    }
-
-    #[test]
-    fn a_localized_candidate_card_keeps_the_yes_side() {
-        let mut event = binary_event(binary_market("v1", &["123", "456"]));
-        event.markets[0].question = "Will candidate A win?".into();
-        event.markets[0].group_item_title = Some("Candidate A".into());
-        let mut localized = event.clone();
-        localized.markets[0].outcomes = Some("[\"是\", \"否\"]".into());
-        localized.markets[0].group_item_title = Some("候选人 A".into());
-
-        merge_localized_event(&mut event, localized);
-        let card = decode_card(&event).expect("the localized candidate event decodes");
-
-        assert_eq!(card.options.len(), 1);
-        assert_eq!(card.options[0].label, "候选人 A");
-        assert_eq!(
-            card.options[0].probability,
-            Some("0.4".parse().expect("the fixture probability is valid"))
-        );
     }
 
     #[test]

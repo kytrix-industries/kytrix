@@ -391,8 +391,6 @@ pub struct PredictionEventsQuery {
     pub search: Option<smol_str::SmolStr>,
     pub cursor: Option<smol_str::SmolStr>,
     pub page_size: u16,
-    /// The caller's opaque content locale, forwarded to venues that localize.
-    pub locale: Option<smol_str::SmolStr>,
 }
 route_scoped_query!(PredictionEventsQuery);
 
@@ -400,8 +398,6 @@ route_scoped_query!(PredictionEventsQuery);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PredictionEventQuery {
     pub event: market_participants_model::prediction::PredictionEventRef,
-    /// The caller's opaque content locale, forwarded to venues that localize.
-    pub locale: Option<smol_str::SmolStr>,
 }
 
 impl PredictionEventQuery {

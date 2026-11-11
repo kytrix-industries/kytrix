@@ -1405,3 +1405,9 @@ prediction_selector:
   page: 第 %{page} 页
   previous: 上一页
   search_placeholder: 搜索预测事件
+  translate: 翻译
+  translate_tooltip_model_unset: 请先在设置-AI-翻译中配置使用的模型
+  translate_tooltip_no_content: 没有可翻译的内容
+  translate_tooltip_page_loading: 等待页面加载完成
+  translate_tooltip_unavailable: 当前版本不支持本地翻译
+  translating: 翻译中…

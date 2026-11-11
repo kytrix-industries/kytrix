@@ -7,6 +7,7 @@ use llama_sys::ffi;
 use super::{
     backend,
     batch::Batch,
+    cancel::CancelCheck,
     config::{EngineConfig, SamplingParams},
     context::Context,
     detokenizer::StreamDetokenizer,
@@ -22,6 +23,7 @@ pub(super) enum Command {
     Generate {
         prompt: Vec<PromptSpan>,
         params: SamplingParams,
+        cancel: Option<CancelCheck>,
         reply: SyncSender<Result<String, ProviderError>>,
     },
     /// Stop serving and let the thread end.
@@ -70,9 +72,10 @@ impl Worker {
                 Command::Generate {
                     prompt,
                     params,
+                    cancel,
                     reply,
                 } => {
-                    let generated = self.generate(&mut context, &prompt, &params);
+                    let generated = self.generate(&mut context, &prompt, &params, &cancel);
                     context.clear_kv_cache();
                     let _ = reply.send(generated);
                 }
@@ -82,12 +85,21 @@ impl Worker {
     }
 
     /// Tokenizes, decodes and samples one request on the reused context.
+    ///
+    /// `cancel` is polled before tokenization, before each prefill chunk and before
+    /// each sampled token. Returning early is safe: [`Worker::run`] clears the KV
+    /// cache after every request, including a cancelled one.
     fn generate(
         &self,
         context: &mut Context<'_>,
         prompt: &[PromptSpan],
         params: &SamplingParams,
+        cancel: &Option<CancelCheck>,
     ) -> Result<String, ProviderError> {
+        if cancel.as_ref().is_some_and(|check| check()) {
+            return Err(ProviderError::Cancelled);
+        }
+
         let mut tokens = Vec::<ffi::llama_token>::new();
         for span in prompt {
             match span {
@@ -130,6 +142,10 @@ impl Worker {
         let mut position = 0_i32;
         let chunk_count = tokens.len().div_ceil(batch_tokens);
         for (index, chunk) in tokens.chunks(batch_tokens).enumerate() {
+            if cancel.as_ref().is_some_and(|check| check()) {
+                return Err(ProviderError::Cancelled);
+            }
+
             let is_last_chunk = index + 1 == chunk_count;
             batch.clear();
             for (offset, token) in chunk.iter().enumerate() {
@@ -152,6 +168,10 @@ impl Worker {
         let mut truncated = false;
 
         for generated in 0..params.max_tokens {
+            if cancel.as_ref().is_some_and(|check| check()) {
+                return Err(ProviderError::Cancelled);
+            }
+
             let token = sampler
                 .sample(context, sampled_index)
                 .map_err(|source| ProviderError::Sample { source })?;

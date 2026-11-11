@@ -1407,3 +1407,9 @@ prediction_selector:
   page: Page %{page}
   previous: Previous
   search_placeholder: Search prediction events
+  translate: Translate
+  translate_tooltip_model_unset: Select a model in Settings > AI > Translation first
+  translate_tooltip_no_content: There is nothing to translate
+  translate_tooltip_page_loading: Wait for the page to finish loading
+  translate_tooltip_unavailable: Local translation is not available in this build
+  translating: Translating…

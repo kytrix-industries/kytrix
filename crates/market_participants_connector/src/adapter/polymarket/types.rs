@@ -146,11 +146,6 @@ pub struct GammaMarket {
     pub condition_id: SmolStr,
     #[serde(default)]
     pub outcomes: Option<GammaIdList>,
-    /// The canonical outcomes of this market before a localized copy replaced
-    /// [`Self::outcomes`]. Business classification reads this field, never the
-    /// display text, so a translated `是` / `否` cannot change the market's shape.
-    #[serde(skip)]
-    pub canonical_outcomes: Option<GammaIdList>,
     #[serde(rename = "outcomePrices", default)]
     pub outcome_prices: Option<GammaIdList>,
     #[serde(rename = "clobTokenIds", default)]
@@ -173,28 +168,6 @@ pub struct GammaMarket {
 /// Gamma omits `active` on a few legacy documents; such a market is still live.
 fn default_true() -> bool {
     true
-}
-
-impl GammaMarket {
-    /// Replaces this market's display text with a localized copy.
-    ///
-    /// The canonical outcomes are captured before the localized outcomes replace
-    /// them. Everything that decides a market's shape keeps reading
-    /// [`Self::canonical_outcomes`].
-    pub fn apply_localized(&mut self, localized: Self) {
-        if self.canonical_outcomes.is_none() {
-            self.canonical_outcomes = self.outcomes.take();
-        }
-        if !localized.question.is_empty() {
-            self.question = localized.question;
-        }
-        if localized.group_item_title.is_some() {
-            self.group_item_title = localized.group_item_title;
-        }
-        if localized.outcomes.is_some() {
-            self.outcomes = localized.outcomes;
-        }
-    }
 }
 
 /// An id collection Gamma may publish either as a JSON array or as its string

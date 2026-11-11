@@ -9,8 +9,10 @@ use std::{
 use ai_provider::{
     error::ProviderError,
     llama::{
+        cancel::CancelCheck,
         config::{EngineConfig, SamplingParams},
         engine::Engine,
+        prompt::PromptSpan,
     },
 };
 use app_config::translation::TranslationModel;
@@ -62,13 +64,32 @@ impl Translator {
         }
 
         let prompt = prompt::build(language, content);
-        match self.engine.generate(&prompt, &self.sampling) {
-            Ok(text) => Ok(text.trim().to_owned()),
-            Err(ProviderError::PromptTooLong { tokens, limit }) => {
-                Err(TranslationError::ContentTooLong { tokens, limit })
-            }
-            Err(error) => Err(TranslationError::Provider(error)),
+        Ok(self.generate(&prompt, None)?.trim().to_owned())
+    }
+
+    /// Sends `prompt` to the engine, naming the failures a caller can act on.
+    ///
+    /// A cancelled request is not retried: the caller asked for it to stop, so it is
+    /// reported as [`TranslationError::Cancelled`] rather than as a provider failure.
+    pub(crate) fn generate(
+        &self,
+        prompt: &[PromptSpan],
+        cancel: Option<CancelCheck>,
+    ) -> Result<String, TranslationError> {
+        self.engine
+            .generate(prompt, &self.sampling, cancel)
+            .map_err(map_provider_error)
+    }
+}
+
+/// Maps an engine failure to the error the translator's callers handle.
+fn map_provider_error(error: ProviderError) -> TranslationError {
+    match error {
+        ProviderError::PromptTooLong { tokens, limit } => {
+            TranslationError::ContentTooLong { tokens, limit }
         }
+        ProviderError::Cancelled => TranslationError::Cancelled,
+        error => TranslationError::Provider(error),
     }
 }
 
@@ -93,11 +114,23 @@ pub fn translate(
     if content.is_empty() {
         return Ok(String::new());
     }
-    let directory = model_directory.ok_or(TranslationError::ModelDirectoryUnset)?;
-    let model = selected_model.ok_or(TranslationError::ModelNotSelected)?;
-    let model_path = directory.join(model.file_name());
+    let model_path = resolve_model_path(model_directory, selected_model)?;
 
     shared_translator(&model_path)?.translate_parsed(language, content)
+}
+
+/// Returns the file inside `model_directory` that the selected model names.
+///
+/// Every entry point resolves the path here, so a batch and a single translation
+/// load the same file from the same place.
+pub(crate) fn resolve_model_path(
+    model_directory: Option<&Path>,
+    selected_model: Option<TranslationModel>,
+) -> Result<PathBuf, TranslationError> {
+    let directory = model_directory.ok_or(TranslationError::ModelDirectoryUnset)?;
+    let model = selected_model.ok_or(TranslationError::ModelNotSelected)?;
+
+    Ok(directory.join(model.file_name()))
 }
 
 /// The process-wide translator slot.
@@ -117,6 +150,11 @@ enum CachedTranslator {
 /// loaded from.
 static TRANSLATOR: OnceLock<Mutex<CachedTranslator>> = OnceLock::new();
 
+/// Serializes tests that touch the process-wide translator cache, in this module and in
+/// [`crate::batch`]: replacing a cache entry or observing one must not overlap.
+#[cfg(test)]
+pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Returns the translator for `model_path`, loading it when the cached model came from
 /// another path.
 ///
@@ -126,7 +164,7 @@ static TRANSLATOR: OnceLock<Mutex<CachedTranslator>> = OnceLock::new();
 /// changes the directory or the selected model gets the new file without a restart; a
 /// failed load leaves the slot empty, so the next call tries again. A model that is being
 /// unloaded is reported as busy instead of being loaded while its file is still dropped.
-fn shared_translator(model_path: &Path) -> Result<Arc<Translator>, TranslationError> {
+pub(crate) fn shared_translator(model_path: &Path) -> Result<Arc<Translator>, TranslationError> {
     let slot = TRANSLATOR.get_or_init(|| Mutex::new(CachedTranslator::Empty));
     let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
     match &*cached {
@@ -241,7 +279,7 @@ fn sampling_params() -> SamplingParams {
 }
 
 /// Parses a target language code into the language the prompt names.
-fn parse_language(code: &str) -> Result<TargetLanguage, TranslationError> {
+pub(crate) fn parse_language(code: &str) -> Result<TargetLanguage, TranslationError> {
     TargetLanguage::parse(code).ok_or_else(|| TranslationError::UnsupportedLanguage {
         code: SmolStr::new(code),
     })
@@ -249,19 +287,43 @@ fn parse_language(code: &str) -> Result<TargetLanguage, TranslationError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::{Path, PathBuf},
-        sync::Mutex,
-    };
+    use std::path::{Path, PathBuf};
 
     use ai_provider::error::ProviderError;
     use app_config::translation::TranslationModel;
 
-    use super::{CachedTranslator, sampling_params, set_cached_translator_for_test, translate};
+    use super::{
+        CACHE_TEST_LOCK, CachedTranslator, map_provider_error, sampling_params,
+        set_cached_translator_for_test, translate,
+    };
     use crate::{error::TranslationError, language::TargetLanguage};
 
-    /// The translator slot is process-wide, so tests that replace it take turns.
-    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn provider_failures_are_mapped_to_the_errors_callers_handle() {
+        assert!(matches!(
+            map_provider_error(ProviderError::Cancelled),
+            TranslationError::Cancelled
+        ));
+
+        assert!(matches!(
+            map_provider_error(ProviderError::PromptTooLong {
+                tokens: 9000,
+                limit: 4096,
+            }),
+            TranslationError::ContentTooLong {
+                tokens: 9000,
+                limit: 4096,
+            }
+        ));
+
+        let missing = ProviderError::ModelFileMissing {
+            path: PathBuf::from("models/model.gguf"),
+        };
+        assert!(matches!(
+            map_provider_error(missing),
+            TranslationError::Provider(ProviderError::ModelFileMissing { .. })
+        ));
+    }
 
     #[test]
     fn the_sampling_contract_matches_the_model_card() {

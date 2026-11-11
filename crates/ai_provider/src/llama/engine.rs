@@ -6,6 +6,7 @@ use std::{
 };
 
 use super::{
+    cancel::CancelCheck,
     config::{EngineConfig, SamplingParams},
     prompt::PromptSpan,
     worker::{Command, Worker},
@@ -76,10 +77,16 @@ impl Engine {
     /// Control spans are parsed as special tokens; text spans are tokenized as
     /// plain text, so a document cannot forge a turn marker. The output is not
     /// trimmed; a caller that wraps the text decides what to strip.
+    ///
+    /// `cancel` is polled by the worker after it receives the request, before each
+    /// prompt prefill chunk and before each sampled token. A check that returns
+    /// `true` ends the request with [`ProviderError::Cancelled`]; the worker clears
+    /// the context and stays available for the next request either way.
     pub fn generate(
         &self,
         prompt: &[PromptSpan],
         params: &SamplingParams,
+        cancel: Option<CancelCheck>,
     ) -> Result<String, ProviderError> {
         params.validate()?;
 
@@ -88,6 +95,7 @@ impl Engine {
             .send(Command::Generate {
                 prompt: prompt.to_vec(),
                 params: params.clone(),
+                cancel,
                 reply,
             })
             .map_err(|_| ProviderError::WorkerUnavailable)?;
