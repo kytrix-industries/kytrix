@@ -31,7 +31,8 @@ use gpui_kit::{
 use i18n::t;
 use smol_str::SmolStr;
 
-use crate::{editor::DnsMode, session::SettingsSession};
+use super::editor::DnsMode;
+use crate::session::SettingsSession;
 
 /// Columns: name, address, port, authentication, DNS mode, actions.
 const COLUMN_COUNT: usize = 6;

@@ -61,13 +61,17 @@ use gpui_kit::{
 use i18n::{language::codes::LanguageCode, t};
 
 use crate::{
-    editor::ProxyEditor,
     layout::{self, PageArgs},
-    pages::registry::{self, PageId},
+    pages::{
+        proxy::{
+            editor::ProxyEditor,
+            table::{ProxyRequest, ProxyTable},
+        },
+        registry::{self, PageId},
+        translation::page::TranslationPage,
+    },
     search::SearchFilter,
     session::{SettingsChange, SettingsSession},
-    table::{ProxyRequest, ProxyTable},
-    translation::TranslationPage,
 };
 
 /// The widest the page's content column gets. The column holds the header and the two panels
@@ -426,7 +430,7 @@ impl SettingsPage {
     /// language switch moves it with.
     ///
     /// The translation page repairs its settings when it is opened, and being moved to is what
-    /// opens it: see [`crate::translation::TranslationPage::repair_on_open`].
+    /// opens it: see [`crate::pages::translation::page::TranslationPage::repair_on_open`].
     fn move_to(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.current_page.as_ref() == id {
             return;

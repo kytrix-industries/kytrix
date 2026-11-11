@@ -13,7 +13,7 @@ use widget::venue::VenueDisplay;
 
 use crate::{
     layout::{self, PageArgs},
-    proxy_route::{
+    pages::proxy::route::{
         PROXY_DIRECT, PROXY_INHERIT, PROXY_MIXED, PROXY_SYSTEM, proxy_default_of,
         proxy_route_of_group, proxy_route_of_venue, set_proxy_default, set_proxy_route_of_group,
         set_proxy_route_of_venue,

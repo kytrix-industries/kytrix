@@ -6,17 +6,21 @@
 //! as text rather than through a declaration of the pages, because the pages are native UI: a
 //! literal is the one statement of a key every page already has to write.
 
+use std::path::Path;
+
 const TEST_MODULE_ATTRIBUTE: &str = concat!("#[cfg", "(test)]");
 
 const TEST_MODULE_SHAPES: [&str; 4] = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "];
+
+/// The directory the settings page's tests live in, which the guard does not read.
+const TEST_SOURCES_DIRECTORY: &str = "settings_tests";
 
 /// Every production source of this crate, as the file it was written in beside its text.
 ///
 /// The list is spelled out by hand and held to the directory below: a source that is not in it
 /// would silently escape both halves of the guard.
-const SETTINGS_SOURCES: [(&str, &str); 26] = [
+const SETTINGS_SOURCES: [(&str, &str); 28] = [
     ("appearance.rs", include_str!("../appearance.rs")),
-    ("editor.rs", include_str!("../editor.rs")),
     ("layout.rs", include_str!("../layout.rs")),
     ("lib.rs", include_str!("../lib.rs")),
     ("pages/about.rs", include_str!("../pages/about.rs")),
@@ -30,7 +34,32 @@ const SETTINGS_SOURCES: [(&str, &str); 26] = [
         include_str!("../pages/data_format.rs"),
     ),
     ("pages/mod.rs", include_str!("../pages/mod.rs")),
+    (
+        "pages/proxy/editor.rs",
+        include_str!("../pages/proxy/editor.rs"),
+    ),
+    ("pages/proxy/mod.rs", include_str!("../pages/proxy/mod.rs")),
+    (
+        "pages/proxy/route.rs",
+        include_str!("../pages/proxy/route.rs"),
+    ),
+    (
+        "pages/proxy/table.rs",
+        include_str!("../pages/proxy/table.rs"),
+    ),
     ("pages/registry.rs", include_str!("../pages/registry.rs")),
+    (
+        "pages/translation/mod.rs",
+        include_str!("../pages/translation/mod.rs"),
+    ),
+    (
+        "pages/translation/page.rs",
+        include_str!("../pages/translation/page.rs"),
+    ),
+    (
+        "pages/translation/table.rs",
+        include_str!("../pages/translation/table.rs"),
+    ),
     (
         "pages/venues/binance.rs",
         include_str!("../pages/venues/binance.rs"),
@@ -63,19 +92,12 @@ const SETTINGS_SOURCES: [(&str, &str); 26] = [
         "pages/venues/shared.rs",
         include_str!("../pages/venues/shared.rs"),
     ),
-    ("proxy_route.rs", include_str!("../proxy_route.rs")),
     ("search.rs", include_str!("../search.rs")),
     ("session.rs", include_str!("../session.rs")),
     ("settings.rs", include_str!("../settings.rs")),
-    ("table.rs", include_str!("../table.rs")),
-    ("translation.rs", include_str!("../translation.rs")),
     (
         "translation_downloads.rs",
         include_str!("../translation_downloads.rs"),
-    ),
-    (
-        "translation_table.rs",
-        include_str!("../translation_table.rs"),
     ),
 ];
 
@@ -112,26 +134,35 @@ fn source_names_on_disk() -> Vec<String> {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     let mut names = Vec::new();
 
-    for (directory, prefix) in [
-        (root.to_owned(), ""),
-        (format!("{root}/pages"), "pages/"),
-        (format!("{root}/pages/venues"), "pages/venues/"),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries {
-            let entry = entry.expect("a directory entry is readable");
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".rs") {
-                names.push(format!("{prefix}{name}"));
-            }
-        }
-    }
+    collect_sources(Path::new(root), "", &mut names);
 
     names.sort();
     names
+}
+
+/// Adds every production `.rs` file under `directory` to `names`, named from the crate's `src`
+/// directory.
+///
+/// The walk follows the directories rather than a list of them, so a page added under a
+/// directory is read by the guard without the list above having to learn about the directory.
+fn collect_sources(directory: &Path, prefix: &str, names: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.expect("a directory entry is readable");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+
+        if path.is_dir() {
+            if name.as_ref() != TEST_SOURCES_DIRECTORY {
+                collect_sources(&path, &format!("{prefix}{name}/"), names);
+            }
+        } else if name.ends_with(".rs") {
+            names.push(format!("{prefix}{name}"));
+        }
+    }
 }
 
 /// Every source of this crate is read by the guard.

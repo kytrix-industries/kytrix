@@ -65,7 +65,7 @@ impl PageId {
         match self {
             Self::Appearance => appearance::search(cx),
             Self::DataFormat => data_format::search(cx),
-            Self::Translation => crate::translation::search(cx),
+            Self::Translation => crate::pages::translation::page::search(cx),
             Self::ServerManagement => {
                 let title = t!(cx, "settings_ui.proxies.server_management");
 

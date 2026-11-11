@@ -12,22 +12,17 @@
 //! confirm and nothing to cancel: leaving the page keeps what was stored, and only a text field
 //! that has not lost the caret yet is written on the way out.
 //!
-//! Every page is native UI drawn by the module that owns it. [`pages`] holds the pages that are a
-//! list of setting rows, [`pages::registry`] is the navigation and search index over all of them,
-//! and [`layout`] is the row and card the pages are built from.
+//! Every page is native UI drawn by the module that owns it. [`pages`] holds the settings pages —
+//! the ones that are a list of setting rows, the proxy catalog and its form, and the translation
+//! page — [`pages::registry`] is the navigation and search index over all of them, and [`layout`]
+//! is the row and card the pages are built from.
 
-mod editor;
+pub mod appearance;
 mod layout;
 mod pages;
-mod proxy_route;
 mod search;
 mod session;
 pub mod settings;
 #[cfg(test)]
 mod settings_tests;
-mod table;
-mod translation;
 pub mod translation_downloads;
-mod translation_table;
-
-pub mod appearance;

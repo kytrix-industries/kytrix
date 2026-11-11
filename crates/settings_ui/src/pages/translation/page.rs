@@ -28,12 +28,12 @@ use gpui_kit::{
 };
 use i18n::t;
 
+use super::table::{TranslationRequest, TranslationTable};
 use crate::{
     layout,
     search::{PageSearch, words},
     session::{SettingsChange, SettingsSession},
     translation_downloads::TranslationDownloads,
-    translation_table::{TranslationRequest, TranslationTable},
 };
 
 /// What one site is called in the interface.

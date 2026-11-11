@@ -40,10 +40,9 @@ use widget_tokio_runtime::global;
 
 use crate::{
     appearance,
-    pages::registry,
+    pages::{proxy::table::ProxyRequest, registry},
     session::SettingsChange,
     settings::{SettingsPage, SidebarEntry},
-    table::ProxyRequest,
 };
 
 /// The label one page is drawn with.

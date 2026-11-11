@@ -1,9 +1,11 @@
-//! The stored spelling of a proxy line, and the conversions the settings pages share.
+//! The stored spelling of a proxy line, and the conversions the proxy settings are written
+//! through.
 //!
 //! A line is stored as a [`ProxyRoute`]; a control shows it as the name it was chosen under, with
 //! the two built-in choices spelled as reserved tokens. The conversions live here rather than in
-//! the pages because the applications page and the proxy catalog both read the same routes, and
-//! a page that spelled a token differently would write a route the settings never hold.
+//! the configure page because the default line, a group of targets and a venue of its own are all
+//! written the same way, and a page that spelled a token differently would write a route the
+//! settings never hold.
 
 use app_config::{
     network::{ProxyRoute, ServiceTarget},

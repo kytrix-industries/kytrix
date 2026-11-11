@@ -37,7 +37,7 @@ fn a_cancelled_form_should_leave_the_settings_alone(cx: &mut TestAppContext) {
 
     open_edit_form(&panel, "hk", cx);
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-    click(cx, crate::editor::CANCEL_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CANCEL_SELECTOR);
 
     assert!(
         cx.debug_bounds("SETTINGS_PROXY_EDIT").is_none(),
@@ -84,13 +84,13 @@ fn the_form_buttons_should_sit_under_a_separator_at_the_foot_of_the_form(cx: &mu
         .debug_bounds("SETTINGS_PROXY_EDIT")
         .expect("the form should be drawn");
     let footer = cx
-        .debug_bounds(crate::editor::FOOTER_SELECTOR)
+        .debug_bounds(crate::pages::proxy::editor::FOOTER_SELECTOR)
         .expect("the form should draw the row its buttons are in");
     let confirm = cx
-        .debug_bounds(crate::editor::CONFIRM_SELECTOR)
+        .debug_bounds(crate::pages::proxy::editor::CONFIRM_SELECTOR)
         .expect("the form should draw the button that records the entry");
     let cancel = cx
-        .debug_bounds(crate::editor::CANCEL_SELECTOR)
+        .debug_bounds(crate::pages::proxy::editor::CANCEL_SELECTOR)
         .expect("the form should draw the button that leaves the entry alone");
     let field = cx
         .debug_bounds("SETTINGS_PROXY_FIELD_port")
@@ -238,7 +238,7 @@ fn a_form_over_the_settings_should_write_the_entry_at_once(cx: &mut TestAppConte
     );
 
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert_eq!(
         stored(cx).proxies.get("hkosaka").map(|proxy| proxy.port),
@@ -272,7 +272,7 @@ fn a_typed_entry_should_reach_the_settings_when_the_form_is_confirmed(cx: &mut T
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
     type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
     type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert!(
         cx.debug_bounds("SETTINGS_PROXY_ADD").is_none(),
@@ -304,7 +304,7 @@ fn a_new_entry_should_resolve_names_here_until_the_form_is_asked_otherwise(
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
     type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
     type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert_eq!(
         stored(cx)
@@ -326,13 +326,13 @@ fn choosing_the_proxy_mode_should_be_what_the_entry_is_recorded_with(cx: &mut Te
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
     type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
     type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-    click(cx, crate::editor::DNS_MODE_SELECTOR);
+    click(cx, crate::pages::proxy::editor::DNS_MODE_SELECTOR);
     assert!(
         cx.debug_bounds("TEST_MENU_ITEM_proxy").is_some(),
         "the control should offer the mode that resolves names there"
     );
     click(cx, "TEST_MENU_ITEM_proxy");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert_eq!(
         stored(cx)
@@ -359,7 +359,7 @@ fn an_edit_form_should_open_on_the_mode_the_entry_is_stored_under(cx: &mut TestA
     );
 
     open_edit_form(&panel, "hk", cx);
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert!(
         stored(cx)
@@ -618,7 +618,7 @@ fn a_failed_proxy_add_should_keep_the_form_open_and_report(cx: &mut TestAppConte
     type_into(cx, "SETTINGS_PROXY_FIELD_name", "osaka");
     type_into(cx, "SETTINGS_PROXY_FIELD_addr", "127.0.0.1");
     type_into(cx, "SETTINGS_PROXY_FIELD_port", "1080");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert!(
         cx.debug_bounds("SETTINGS_PROXY_ADD").is_some(),
@@ -635,7 +635,7 @@ fn a_failed_proxy_add_should_keep_the_form_open_and_report(cx: &mut TestAppConte
 
     click(cx, "BASE_UI_ALERT_OK");
     fs::remove_file(&blocking).expect("the blocking file should be removable");
-    click(cx, crate::editor::CONFIRM_SELECTOR);
+    click(cx, crate::pages::proxy::editor::CONFIRM_SELECTOR);
 
     assert!(
         cx.debug_bounds("SETTINGS_PROXY_ADD").is_none(),
