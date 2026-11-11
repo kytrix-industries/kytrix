@@ -583,8 +583,8 @@ pub(crate) fn credentials_row(args: &mut PageArgs<'_, '_>, kind: CredentialsKind
             "settings-credentials-edit",
             kind.row_id(),
         ))
-        .small()
-        .ghost()
+        .medium()
+        .tonal()
         .debug_selector({
             let selector = kind.edit_selector();
             move || selector
@@ -610,8 +610,8 @@ pub(crate) fn credentials_row(args: &mut PageArgs<'_, '_>, kind: CredentialsKind
                 "settings-credentials-clear",
                 kind.row_id(),
             ))
-            .small()
-            .ghost()
+            .medium()
+            .tonal()
             .debug_selector({
                 let selector = kind.clear_selector();
                 move || selector

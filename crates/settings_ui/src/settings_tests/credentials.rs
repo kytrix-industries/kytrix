@@ -11,6 +11,7 @@ use app_config::{
     },
     settings::{Config, Language},
 };
+use base_ui::size::UnifiedSize;
 use gpui_kit::{TestAppContext, px};
 use i18n::{language::codes::LanguageCode, t};
 use market_participants_model::identifier::VenueId;
@@ -860,6 +861,37 @@ fn a_credential_rows_buttons_should_end_the_control_column(cx: &mut TestAppConte
         bounds(cx, &credentials_clear(kind)).is_none(),
         "a row with nothing stored has nothing to clear"
     );
+}
+
+/// The buttons of a credential row are actions of the settings row rather than compact controls
+/// inside a table, so they are drawn at the medium size: the edit button with the outline
+/// appearance and the clear button with the tonal one.
+///
+/// The size is what a test can read off the window; the appearances come from the same theme
+/// entries every outline and tonal control resolves.
+#[gpui_kit::test]
+fn a_credential_rows_buttons_should_be_medium_sized(cx: &mut TestAppContext) {
+    let (panel, cx) = settings(configured_settings(), cx);
+
+    for kind in [
+        CredentialsKind::BinanceSpot,
+        CredentialsKind::BinanceUsdMPerp,
+        CredentialsKind::Okx,
+        CredentialsKind::Hyperliquid,
+        CredentialsKind::Longbridge,
+    ] {
+        select(&panel, &credentials_page(kind), cx);
+        assert_eq!(
+            element(cx, &kind.edit_selector()).size.height,
+            UnifiedSize::Medium.h(),
+            "{kind:?}'s edit button should be drawn at the medium size"
+        );
+        assert_eq!(
+            element(cx, &credentials_clear(kind)).size.height,
+            UnifiedSize::Medium.h(),
+            "{kind:?}'s clear button should be drawn at the medium size"
+        );
+    }
 }
 
 /// The Hyperliquid dialog opens over the set the settings hold and writes the whole set: what the
