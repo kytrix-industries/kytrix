@@ -88,6 +88,8 @@ objc2-core-foundation = { workspace = true }
 objc2-core-graphics = { workspace = true }
 accesskit = { workspace = true }
 accesskit_macos = { workspace = true }
+# metallib 加载：MTLDevice::newLibraryWithData:error: 收 DispatchData（已在 Cargo.lock，零新 crate）
+dispatch2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit = { workspace = true }
@@ -95,10 +97,9 @@ accesskit_unix = { workspace = true }
 ash = { workspace = true }
 calloop = { workspace = true }
 calloop-wayland-source = { workspace = true }
-wayland-client = { workspace = true }
+wayland-client = { workspace = true, features = ["system"] }
 wayland-protocols = { workspace = true }
 xkbcommon = { workspace = true }
 
 [lints]
 workspace = true
-

@@ -100,11 +100,20 @@ impl FramePlan {
     }
 
     /// copy 到 back buffer 的范围：`fresh` 时**强制全量**。
+    ///
+    /// 只有 D3D12 后端消费（`F-121`：Metal / Vulkan 的 present 目标跨帧内容无保证，
+    /// 两平台每帧整面写入，不看这个值）。
+    #[cfg(any(windows, test))]
     pub(crate) fn copy_plan(self) -> Plan {
         if self.fresh { Plan::Full } else { self.plan }
     }
 
-    /// `Present1` 的 dirty 集：`None` = 全量（`DirtyRectsCount = 0`）。
+    /// 本帧的 dirty 集：`None` = 全量（D3D12 的 `DirtyRectsCount = 0`）。
+    ///
+    /// **消费方**：D3D12 用它做 `DirtyRect` 拷贝，Vulkan 用它生成
+    /// `VK_KHR_incremental_present` 的 region hint；Metal 不消费（无对应扩展，F-121）。
+    /// 任何后端都**不得**把它当作「必须跳过的像素」：present 目标跨帧内容在 Metal/Vulkan 上
+    /// 没有保证，draw/persist 侧仍按 `plan()` 的 scissor 处理。
     pub(crate) fn present_dirty(self) -> Option<DamageRects> {
         if self.fresh {
             return None;

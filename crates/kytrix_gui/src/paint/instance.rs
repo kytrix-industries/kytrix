@@ -102,7 +102,6 @@ pub(crate) struct ClipChain {
 /// `parent` 打进 `uint4.x`，`.yzw` 保留恒 0；表项 **0 恒为哨兵**（`clip_index == 0` 时 shader 直接返回 1）。
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-#[cfg(windows)]
 pub(crate) struct GpuClipEntry {
     /// `(x, y, w, h)`，物理像素。
     pub rect: [f32; 4],
@@ -112,7 +111,6 @@ pub(crate) struct GpuClipEntry {
     pub meta: [u32; 4],
 }
 
-#[cfg(windows)]
 const _: () = {
     use core::mem::{align_of, size_of};
     assert!(size_of::<GpuClipEntry>() == 48);
@@ -121,7 +119,6 @@ const _: () = {
 
 impl ClipChain {
     /// 转成 GPU 布局（P08 的上传源；哨兵语义照抄 CPU 值，不做数学）。
-    #[cfg(windows)]
     pub(crate) fn gpu_entry(self) -> GpuClipEntry {
         GpuClipEntry {
             rect: self.rect,
@@ -187,7 +184,6 @@ impl InstanceBuffer {
     }
 
     /// 本帧的绘制序（P08 的录制循环唯一读者；P06 遗留 ④ 的收口，DEVIATIONS F-78）。
-    #[cfg(windows)]
     pub(crate) fn ops(&self) -> &[FrameOp] {
         &self.ops
     }
@@ -199,13 +195,11 @@ impl InstanceBuffer {
     }
 
     /// 裁剪表（表项 0 是哨兵；GPU 布局由 [`ClipChain::gpu_entry`] 转）。
-    #[cfg(windows)]
     pub(crate) fn clips(&self) -> &[ClipChain] {
         &self.clips
     }
 
     /// 把裁剪表写成 GPU 布局（容量复用，不每帧分配）。
-    #[cfg(windows)]
     pub(crate) fn write_clips_gpu(&self, out: &mut Vec<GpuClipEntry>) {
         out.clear();
         out.extend(self.clips().iter().copied().map(ClipChain::gpu_entry));

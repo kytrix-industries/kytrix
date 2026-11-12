@@ -400,7 +400,7 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     }
     if let Some(first) = windows.first() {
         dispatcher.attach(first.hwnd_raw());
-        app.set_native_window(first.hwnd_raw());
+        crate::platform::windows::clipboard::set_owner(first.hwnd_raw());
     }
     // 首帧：显示之后请求一帧（I3 的「空闲」只发生在没有 dirty 时）。
     dispatcher.wake();

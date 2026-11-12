@@ -5,14 +5,6 @@
 
 use smol_str::SmolStr;
 
-#[cfg(windows)]
-use crate::render::backend::Renderer;
-#[cfg(windows)]
-use crate::render::compositor::{FramePlan, Plan, plan};
-#[cfg(windows)]
-use crate::render::damage::DamageSummary;
-#[cfg(windows)]
-use crate::render::timer::FrameTimings;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameRecord, FrameStats, PaintLog};
 use crate::{
@@ -27,7 +19,12 @@ use crate::{
         pass::{PaintPass, PaintReport},
         scene::Scene,
     },
-    render::damage::DamageAccumulator,
+    render::{
+        backend::Renderer,
+        compositor::{FramePlan, Plan, plan},
+        damage::{DamageAccumulator, DamageSummary},
+        timer::FrameTimings,
+    },
 };
 
 /// 窗口句柄：单调递增、**永不复用**（陈旧 id 落回 `None`，因此不需要代际）。
@@ -197,10 +194,8 @@ pub struct Window {
     /// 颜色解析器（编码期 `resolve`；P14 主题的注入点）。
     resolver: ColorResolver,
     /// GPU 渲染器（`None` = headless，I7 的默认；P09 的窗口层负责 attach 原生窗口）。
-    #[cfg(windows)]
     renderer: Option<Renderer>,
     /// 本帧的分段计时（容量跨帧复用）。
-    #[cfg(windows)]
     timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
     paint_order: Vec<crate::paint::scene::LaneId>,
@@ -237,9 +232,7 @@ impl Window {
             encoder: InstanceEncoder::new(),
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver::new(Interpolation::default()),
-            #[cfg(windows)]
             renderer: None,
-            #[cfg(windows)]
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -486,7 +479,6 @@ impl Window {
     }
 
     /// 是否已有 GPU 渲染器（`App::upload_glyph_page` 的判据）。
-    #[cfg(windows)]
     pub(crate) fn has_renderer(&self) -> bool {
         self.renderer.is_some()
     }
@@ -494,7 +486,6 @@ impl Window {
     /// 把一页图集像素交给渲染器（下一次 `submit` 上传；无渲染器时丢弃）。
     ///
     /// 消费者：`App::frame` 的字形页上传（P09 整页；增量属 P15）。
-    #[cfg(windows)]
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: crate::paint::atlas::AtlasKind,
@@ -507,7 +498,6 @@ impl Window {
     }
 
     /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
-    #[cfg(windows)]
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         self.renderer = Some(renderer);
     }
@@ -520,7 +510,6 @@ impl Window {
     /// # Errors
     /// `EngineError::UnsupportedGpu`（D8 基线不足）、`EngineError::AppInit`（设备 / 管线创建失败）、
     /// `EngineError::ShaderLoad`（DXIL 产物缺失或被跳过）。
-    #[cfg(windows)]
     pub fn enable_offscreen_renderer(&mut self) -> Result<(), EngineError> {
         if self.renderer.is_some() {
             return Ok(());
@@ -531,7 +520,6 @@ impl Window {
     }
 
     /// 窗口的物理像素尺寸（`size × scale` 的 covering 结果）。
-    #[cfg(windows)]
     fn physical_surface(&self) -> (u32, u32) {
         let rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
             .to_physical_covering(self.scale);
@@ -634,7 +622,6 @@ impl Window {
         }
         let index = self.scheduler.commit(ticket);
         self.tree.settle_frame();
-        #[cfg(windows)]
         if let Some(mut renderer) = self.renderer.take() {
             let result = self.submit_gpu(&mut renderer, index, report.damage);
             self.renderer = Some(renderer);
@@ -661,7 +648,6 @@ impl Window {
     }
 
     /// 把本帧交给 GPU（headless 不进入；`renderer` 由调用方临时取出以避免借用冲突）。
-    #[cfg(windows)]
     fn submit_gpu(
         &mut self,
         renderer: &mut Renderer,

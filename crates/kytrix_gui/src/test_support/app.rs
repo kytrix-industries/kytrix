@@ -243,8 +243,30 @@ impl TestApp {
         }
         #[cfg(not(windows))]
         {
-            let _ = case;
-            Err(SnapshotError::NoRenderer)
+            let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
+                detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
+            })?;
+            let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
+                .to_physical_covering(case.scale);
+            let size = (
+                surface.width().max(1) as u32,
+                surface.height().max(1) as u32,
+            );
+            let ((page_width, _page_height), pixels) = self.app.glyph_page_pixels();
+            let mut renderer =
+                crate::render::backend::Renderer::new_offscreen_with_page(size, page_width)
+                    .map_err(gpu_error)?;
+            let mut rows = crate::render::DirtyRows::default();
+            rows.mark(0, u32::MAX);
+            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
+            let image = renderer
+                .render_snapshot(window.instance_buffer())
+                .map_err(gpu_error)?;
+            Ok(SnapshotImage {
+                width: image.width,
+                height: image.height,
+                rgba8: image.rgba8,
+            })
         }
     }
 
@@ -257,7 +279,6 @@ impl TestApp {
     }
 }
 
-#[cfg(windows)]
 fn gpu_error(error: EngineError) -> SnapshotError {
     SnapshotError::Gpu {
         detail: smol_str::SmolStr::new(error.to_string()),

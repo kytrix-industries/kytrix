@@ -4,6 +4,8 @@
 //! → `CloseClipboard` 往返逐字节相等（含中文与 emoji），空串（只有 `NUL`）也成立。
 //! 富文本 / 图片 / 拖放属 P12。
 
+use std::sync::atomic::{AtomicIsize, Ordering};
+
 use smol_str::SmolStr;
 use windows::Win32::{
     Foundation::{HANDLE, HGLOBAL, HWND},
@@ -18,11 +20,33 @@ use windows::Win32::{
 
 use crate::error::EngineError;
 
-/// 写入剪贴板文本（`CF_UNICODETEXT`，UTF-16 + `NUL`）。
+/// 剪贴板 owner 窗口（`OpenClipboard` 需要一个 owner）。
+///
+/// 由平台循环在原生窗口建好后登记（`Application::run`）；`0` = 尚无窗口，
+/// 此时 `set_text` / `get_text` 返回 `EngineError::Clipboard`（不静默失败）。
+static OWNER: AtomicIsize = AtomicIsize::new(0);
+
+/// 登记 owner 窗口句柄（平台层唯一写点）。
+pub(crate) fn set_owner(hwnd: isize) {
+    OWNER.store(hwnd, Ordering::Release);
+}
+
+fn owner() -> Result<HWND, EngineError> {
+    let raw = OWNER.load(Ordering::Acquire);
+    if raw == 0 {
+        return Err(EngineError::Clipboard {
+            detail: SmolStr::new_static("no native window; clipboard needs an owner"),
+        });
+    }
+    Ok(HWND(raw as *mut core::ffi::c_void))
+}
+
+/// 写入剪贴板文本（`CF_UNICODETEXT`，UTF-16 + `NUL`；owner 来自 [`set_owner`]）。
 ///
 /// # Errors
 /// `EngineError::Clipboard`：剪贴板被其它进程占用（`OpenClipboard` 失败）或分配失败。
-pub(crate) fn set_text(hwnd: HWND, text: &str) -> Result<(), EngineError> {
+pub(crate) fn set_text(text: &str) -> Result<(), EngineError> {
+    let hwnd = owner()?;
     let units = utf16_with_nul(text);
     let bytes = units.len() * 2;
     // SAFETY: 全局内存由本函数分配并交给剪贴板；成功后所有权归系统，不再释放。
@@ -58,7 +82,8 @@ pub(crate) fn set_text(hwnd: HWND, text: &str) -> Result<(), EngineError> {
 ///
 /// # Errors
 /// `EngineError::Clipboard`：剪贴板被占用或内存映射失败。
-pub(crate) fn text(hwnd: HWND) -> Result<SmolStr, EngineError> {
+pub(crate) fn get_text() -> Result<SmolStr, EngineError> {
+    let hwnd = owner()?;
     // SAFETY: 句柄只在打开的剪贴板会话内使用；读取范围由系统给出的 `NUL` 终止。
     unsafe {
         OpenClipboard(Some(hwnd)).map_err(|error| clipboard_error("OpenClipboard", error))?;

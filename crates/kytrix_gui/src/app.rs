@@ -104,10 +104,6 @@ pub struct App {
     events: Vec<(WindowId, Event)>,
     /// 每轮事件循环调用一次的应用钩子（读事件 / 写状态；`Application::run` 唯一调用点）。
     frame_hook: Option<Box<dyn FnMut(&mut App)>>,
-    /// 平台层写入的原生窗口句柄（`0` = 没有原生窗口）：剪贴板需要 owner 窗口。
-    /// **不构成公开面**（I9：句柄不越过 `platform/`，这里只保留一个整数）。
-    #[cfg(windows)]
-    native_window: isize,
     /// 动作处理器表（P10；同 `Action` 后写覆盖）。
     handlers: ahash::HashMap<Action, ActionHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
@@ -274,15 +270,13 @@ impl AppHandle {
     }
 }
 
-/// 引擎自有事件循环的入口（`#[cfg(windows)]`；P11/P17 落地各自平台时解除）。
+/// 引擎自有事件循环的入口（三平台各一份平台实现：Win32 泵 / AppKit run loop / calloop）。
 ///
 /// 用法：`let mut app = App::new(handle); ...建窗/建树...; Application::new().run(app)?`。
 /// `run` 负责：DPI 感知 → 建窗口（初始隐藏）→ 挂渲染器 → 显示 → 消息泵 → 关闭。
-#[cfg(windows)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Application;
 
-#[cfg(windows)]
 impl Application {
     /// 无参数：tokio 句柄由 `App` 持有。
     #[must_use]
@@ -324,8 +318,6 @@ impl App {
             dispatcher: Dispatcher::new(),
             events: Vec::new(),
             frame_hook: None,
-            #[cfg(windows)]
-            native_window: 0,
             handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
             thresholds: InputThresholds::default(),
@@ -354,12 +346,6 @@ impl App {
             hook(self);
             self.frame_hook = Some(hook);
         }
-    }
-
-    /// 平台层登记原生窗口句柄（`0` = 解除）。
-    #[cfg(windows)]
-    pub(crate) fn set_native_window(&mut self, handle: isize) {
-        self.native_window = handle;
     }
 
     /// 跨线程句柄（`AppHandle`）。
@@ -398,30 +384,26 @@ impl App {
         self.events.push((window, event));
     }
 
-    /// 写剪贴板文本（`CF_UNICODETEXT`）。
+    /// 写剪贴板文本（Win32 `CF_UNICODETEXT` / macOS `NSPasteboard` / Wayland `wl_data_source`）。
     ///
     /// # Errors
-    /// `EngineError::Clipboard`：剪贴板被其它进程占用或内存分配失败。
-    #[cfg(windows)]
+    /// `EngineError::Clipboard`：平台拒绝（剪贴板被占用、分配失败、无 owner 窗口）。
     pub fn set_clipboard_text(&self, text: &str) -> Result<(), EngineError> {
-        let hwnd = self.clipboard_owner()?;
-        crate::platform::native::clipboard::set_text(hwnd, text)
+        crate::platform::native::clipboard::set_text(text)
     }
 
-    /// 读剪贴板文本（无 `CF_UNICODETEXT` 时是空串）。
+    /// 读剪贴板文本（无文本内容时是空串）。
     ///
     /// # Errors
-    /// `EngineError::Clipboard`：剪贴板被占用或内存映射失败。
-    #[cfg(windows)]
+    /// `EngineError::Clipboard`：平台拒绝；Wayland 下「尚未收到过选区内容」也走这里
+    /// （剪贴板是异步拉模型，`design/phase-12-macos-linux.md` F-130）。
     pub fn clipboard_text(&self) -> Result<smol_str::SmolStr, EngineError> {
-        let hwnd = self.clipboard_owner()?;
-        crate::platform::native::clipboard::text(hwnd)
+        crate::platform::native::clipboard::get_text()
     }
 
     /// 把字形页的当前内容交给窗口渲染器（有变化才传；整页，P09）。
     ///
     /// 调用点只有两个：`App::frame`（每帧）与 `TestApp::snapshot`（临时 WARP 渲染器）。
-    #[cfg(windows)]
     pub(crate) fn upload_glyph_page(&mut self, window: WindowId) {
         let has_renderer = self
             .windows
@@ -445,19 +427,6 @@ impl App {
         let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize)];
         self.glyph_atlas.write_page(&mut pixels, page.0);
         (page, pixels)
-    }
-
-    /// 剪贴板 owner 窗口；没有原生窗口时返回 `EngineError::Clipboard`（不静默失败）。
-    #[cfg(windows)]
-    fn clipboard_owner(&self) -> Result<windows::Win32::Foundation::HWND, EngineError> {
-        if self.native_window == 0 {
-            return Err(EngineError::Clipboard {
-                detail: smol_str::SmolStr::new_static("no native window; clipboard needs an owner"),
-            });
-        }
-        Ok(windows::Win32::Foundation::HWND(
-            self.native_window as *mut core::ffi::c_void,
-        ))
     }
 
     /// 本 App 绑定的 tokio 句柄（**借用**，不 clone）。
@@ -2217,7 +2186,6 @@ impl App {
         // `set_virtual_items` 那一次调用定终身（P10 §8.3 / 评审 #5）。
         self.rewindow_virtuals(window);
         // 字形页上传（P09 整页）：`layout_text` 在这之前完成光栅与装箱。
-        #[cfg(windows)]
         self.upload_glyph_page(window);
         let paint = match self.windows.get_mut(&window) {
             Some(target) => target.paint_frame(),

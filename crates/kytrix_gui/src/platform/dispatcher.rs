@@ -35,7 +35,7 @@ impl UserTask {
 #[cfg(windows)]
 pub(crate) const WM_APP_FRAME_WAKE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
-/// 唤醒投递：收目标窗口句柄，返回是否成功投递。
+/// 唤醒投递：收目标 token（Windows = 窗口句柄），返回是否成功投递。
 type PostFn = fn(isize) -> bool;
 
 /// 线程安全的唤醒队列（`AppHandle` 与平台事件循环共享）。
@@ -45,7 +45,7 @@ pub(crate) struct Dispatcher {
     frame_pending: AtomicBool,
     /// tokio / a11y 回投的任务（FIFO；不在热路径）。
     tasks: Mutex<VecDeque<UserTask>>,
-    /// `0` = 尚未 attach（`build` 之前 / 无窗口的测试）。
+    /// 唤醒目标：Windows 是窗口句柄；macOS / Linux 用平台自己安装的唤醒句柄（此值忽略）。
     hwnd: AtomicIsize,
 }
 
@@ -63,7 +63,7 @@ impl Dispatcher {
         })
     }
 
-    /// 绑定唤醒目标窗口（`Application::run` 在窗口建好后调用）。
+    /// 绑定唤醒目标（Win32：窗口句柄；macOS / Linux：占位 token，唤醒句柄由平台自己安装）。
     pub(crate) fn attach(&self, hwnd: isize) {
         self.hwnd.store(hwnd, Ordering::Release);
     }
@@ -121,9 +121,16 @@ fn post_frame_wake(hwnd: isize) -> bool {
     result.is_ok()
 }
 
-#[cfg(not(windows))]
-fn post_frame_wake(_hwnd: isize) -> bool {
-    false
+/// macOS：`CFRunLoopSourceSignal` + `CFRunLoopWakeUp`（`platform/macos/wake.rs` 安装的句柄）。
+#[cfg(target_os = "macos")]
+fn post_frame_wake(_token: isize) -> bool {
+    crate::platform::macos::wake::signal()
+}
+
+/// Linux：`calloop::ping::Ping::ping`（`platform/linux/event_loop.rs` 安装的句柄）。
+#[cfg(target_os = "linux")]
+fn post_frame_wake(_token: isize) -> bool {
+    crate::platform::linux::wake::signal()
 }
 
 #[cfg(test)]

@@ -2050,3 +2050,82 @@
 | **S-117** | **焦点陈旧时回退到窗口根**，不是「最近的已发出祖先」：陈旧句柄读不到 `parent`（节点已出 arena），设计稿 §6.3 的措辞按实现收口；`MissingFocusTarget` 诊断照记 |
 | **S-118** | `A11yTreeSnapshot::visible_nodes()` 按「自身 + **本快照内**的祖先链」排除 `hidden`（增量笔的祖先可能不在本笔里，那时按可见处理；平台侧的 `set_hidden` 继承语义才是权威） |
 | 门禁 | test **589**（+32 vs P10）/ test-support **621**（+47）+ 集成 **6**；clippy 两包 `-D warnings` / fmt --check / doc 0 warning / release 全绿 |
+---
+
+## 十七、P12 · macOS（Metal）+ Linux（Vulkan / Wayland）（2026-11-13）
+
+> 完整设计见 `design/phase-12-macos-linux.md`。本节只记**与上游文档不同的事实**与实现纪律。
+
+### 17.1 交叉编译与依赖事实（本轮实测）
+
+| 项 | 实测 |
+|---|---|
+| `cargo check -p kytrix_gui --target aarch64-apple-darwin`（`KYTRIX_GUI_SKIP_SHADERS=1`） | **exit 0**（60 warnings，全是非 Windows target 的 `dead_code`；P12 落地后由 `platform/macos` 重新消费） |
+| `cargo check … --target x86_64-unknown-linux-gnu` **无** pkg-config | **exit 1**：`yeslogic-fontconfig-sys 6.0.1` 的 build script（`pkg-config has not been configured to support cross-compilation`）；与引擎代码无关（P07 起既有，V-04） |
+| 同上 + 12 行 stub `pkg-config`（`PKG_CONFIG=<stub>`，可选 `PKG_CONFIG_ALLOW_CROSS=1`） | **exit 0**（同样 60 warnings）。stub 只需回答 `--libs [--cflags]`（输出 `-lfontconfig`）与 `--modversion`（输出 `2.14.0`） |
+| `RUST_FONTCONFIG_DLOPEN=1` 作为绕过 | **不可行**：dlopen 形态下 `fontconfig_sys` 不在根导出 `fontique 0.12` 需要的 29 个 `Fc*` 符号（`E0432`）⇒ F-125 |
+| probe crate（`%TEMP%\kg-p12-macos-linux`，依赖逐字复制 P01） | `aarch64-apple-darwin` **exit 0**、`x86_64-unknown-linux-gnu` **exit 0**；本文 §5–§8 的每个原生调用都已编译验证（附录 B 是签名速查表） |
+
+### 17.2 设计期条目
+
+| 编号 | 内容 |
+|---|---|
+| **F-119** | **macOS 不做 argument buffer**：P07 已落地的 `contract.md` §7 绑定表是 `buffer(0/1/2)` + `texture(0/1)` + `sampler(0)` 直绑；改成 argument buffer 要改 14 个 shader 源文件 + `contract.md` + `build.rs` 锚点，且 D3D12/Vulkan 无对应物。`argumentBuffersSupport == Tier2` 仍作为 D8 硬基线（主设计 §2.2），未来 ≥3 页图集时按 `texture_index` 拆 draw（不是塞 argument buffer 数组） |
+| **F-120** | **Metal v1 同步提交**：`commit` + `waitUntilCompleted` 即 fence；**不用** `MTLSharedEvent`——`encodeWaitForEvent:value:` 需要 `&ProtocolObject<dyn MTLEvent>` 上转，而 `objc2 0.6.5` 的 `ProtocolObject` 只有 `from_ref/from_id/from_retained`（probe `E0308`）。P13 异步化时用 `msg_send!` 或升级 objc2 |
+| **F-121** | **`FramePlan` 的 `copy_plan()` / `present_dirty()` 是 D3D12 专用**：Metal 的 drawable 与 Vulkan 的 swapchain image **present 后内容未定义** ⇒ 两个新后端每帧整面 blit / `cmd_copy_image`；`plan()`（scissor）与 `is_full()`（clear）仍是共用语义。`render/{macos,linux}/compositor.rs` 文件头必须写明 |
+| **F-122** | Metal 加载 metallib 用 `MTLDevice::newLibraryWithData:error:`，需要 objc2-metal 的 **`dispatch2` feature**（其 default features 已启用）与 **`dispatch2` 直接依赖**（`dispatch2 0.3.1` 已在 `Cargo.lock`，由 objc2 生态引入 ⇒ **零 lock 变化**）。`newLibraryWithFile` 已 deprecated；`newLibraryWithSource` 无法处理 `#include "common.metal"` |
+| **F-123** | Vulkan v1 **不使用** `runtimeDescriptorArray`：GLSL 的 `instances[]` 是 std430 结构体数组（`binding 0` 的普通 storage buffer），不是 descriptor array。`descriptorIndexing` 仍按 D-4 作为硬基线；`runtime_descriptor_array` 只记录，不支持时降级 `false` 不失败 |
+| **F-124** | `accesskit_unix 0.24.1` 与 P11 §12 的措辞不同：①`request_initial_tree() → None` **合法**（`context.rs:91-109` 进 `Pending`，下一次 `update_if_active` 必须是全树）；②`update_if_active` **无返回值**（无需 `raise()`）；③`DeactivationHandler` 由**库自己**在 deactivate / `RemoveAdapter` 时调用，引擎只实现空 handler。**不需要**新增 `full_update` 辅助（`A11yBridge` 的第一次 `take` 必为全树） |
+| **F-125** | `RUST_FONTCONFIG_DLOPEN=1` **不能**作为 Linux 交叉 check 的绕过（见 17.1）；可行解法只有 stub `pkg-config` 或真 sysroot |
+| **F-126** | Vulkan 用**核心 `VkRenderPass` + `VkFramebuffer`**（persist 一个附件）而非 dynamic rendering：`VK_KHR_dynamic_rendering` 在 1.2 是扩展，不是基线。swapchain image 不建 framebuffer（只作 `cmd_copy_image` 目标） |
+| **F-127** | macOS 自绘标题栏：`styleMask = Titled|Closable|Miniaturizable|Resizable|FullSizeContentView`，`titlebarAppearsTransparent` + `titleVisibility = Hidden`；交通灯**只保留 Close**（重排到 x=12），Miniaturize/Zoom 隐藏 ⇒ P13 必须补引擎绘制的最小化/最大化控件 |
+| **F-128** | `zwp_text_input_v3` 的 `preedit_string` / `commit_string` / `delete_surrounding_text` 必须**缓存到 `done` 再原子生效**（可能同批到达）；`commit` 后要吞掉同帧紧随的字符键（GNOME 的部分版本会重复发） |
+| **F-129** | `wl_data_device.set_selection` **必须**带最近的输入事件 serial（`wl_pointer::Enter` / `wl_keyboard::Enter` 的 serial）；无 serial 时 compositor 静默忽略 |
+| **F-130** | Linux 剪贴板是**异步拉模型**：`App::clipboard_text()` 只能返回事件循环缓存的最近一次选区内容，从未收到时返回 `Err(Clipboard)`；与 Win32/macOS 的同步语义不同，必须在公开 API 文档写明 |
+| **F-131** | Metal 的 `Section::Gpu` 用 `MTLCommandBuffer::GPUStartTime/GPUEndTime`（command buffer 级），**不用** `MTLCounterSampleBuffer`（`counterSets` 可能为空、需拆 pass、CI 无法验证） |
+| **F-132** | P01 的 objc2 feature 列表是**文档性冗余**：`objc2-app-kit` / `objc2-metal` 的 `default` 已包含 `NSButton` / `NSCursor` / `dispatch2` 等全部类与协议（`cargo tree -e features` 验证）⇒ P12 **不需要**新增任何 feature |
+| **S-119** | `render/device.rs` 拆分：`GpuCaps` / `fl_name` / `sm_name` / `FEATURE_LEVEL_12_0` / `SHADER_MODEL_6_2` 与 5 个单测搬入 `render/windows/device.rs`；共享文件只留 `D8_REQUIRED_{WINDOWS,MACOS,LINUX}` |
+| **S-120** | `platform/event.rs`（`PlatformEvent` / `translate` / `key_from_vk`）**保持 `#[cfg(windows)]` 不重构**：mac/Linux 的平台层直接把原生事件翻成公共 `Event` 后调 `App::dispatch`（与 Win32 的 `to_app_event` 同层职责） |
+| **S-121** | `ReadbackImage` 三个后端各一份（`render/{windows,macos,linux}/readback.rs`），**不**提到共享层：它只在 `test`/`test-support` 构建存在，且每个后端都要和自己的 `Renderer::readback` 同形 |
+| **S-122** | `Application::run(self, app: App)` 三平台同签名：macOS **不子类化** `NSApplication`（帧泵挂 `CFRunLoopSource`）；Linux 用 `calloop` + `WaylandSource`。两者都不引 libdispatch / 第二套事件循环 |
+| **S-123** | P08 的 S-78（共享层只在 Windows 编译）**收口**：`render.rs` / `platform.rs` / `window.rs` / `app.rs` 里为「只有一个后端」而加的 `#[cfg(windows)]` 全部删除；`app.rs` 的 `Application` / clipboard / `attach_a11y` / `upload_glyph_page` 一并解除 |
+| **S-124** | ~~mac/Linux 的 `TestApp::snapshot` 仍返回 `SnapshotError::NoRenderer`~~ **实现期更正（见 F-137）**：`TestApp::snapshot` 的非 Windows 分支**接真渲染器**（`new_offscreen_with_page` → `queue_atlas_upload` → `render_snapshot`）。macOS 的离屏 Metal 渲染器真实可用（WARP 的对应物是 Apple GPU 的 offscreen），Linux 的 `new_offscreen*` 因 Vulkan WSI 需要真实 `wl_surface` 而显式返回 `UnsupportedGpu` ⇒ Linux 上快照恒为 `SnapshotError::Gpu`（不再是 `NoRenderer`） |
+| **V-82** | **L5 实机矩阵**：GNOME 45+/KDE Plasma 6/Sway × 单/双 GPU（含 hybrid）× 单/多显示器 × 100%/125%/150%/175% × 中/日文 IME。P12 只保证「两 target 编译 + 结构正确」，出帧与像素归 L5 |
+| **V-83** | MSL / SPIR-V **未在本机编译**：CI 必须加 macOS runner（`xcrun metal`）与 `glslang-tools`；`build.rs` 的 skip 分支只在缺工具链时用 |
+| **V-84** | macOS dead key / IME 行为未验证（`NSEvent.characters` 是否已合成、`insertText:` 的 `replacementRange` 语义）；L5 用中日德文语料回放 |
+| **V-85** | macOS 滚轮「行」换算（`scrollingDeltaY / 3.0`）未校准：L5 与 Win32 的 120 单位/行对齐 |
+| **V-86** | 无 `zxdg_decoration_manager_v1` 时 compositor 可能自己加服务端装饰（与自绘标题栏重叠）；L5 在三大 compositor 上确认 |
+| **V-87** | Linux 光标形状**未设置**（无 `wayland-cursor` 依赖）：`take_cursor_change()` 在 Linux 空转；是否需要新依赖由 P13 裁决 |
+| **V-88** | 多 seat / 多键盘未支持（v1 只接第一个 `wl_seat`）；`zwp_text_input_v3` 的 seat 绑定同理 |
+| **V-89** | xkb 修饰键位图的取法二选一（`serialize_mods` 位图 vs `xkb_state_mod_name_is_active`）未在本机验证；实现期以 probe 编译通过的写法为准，行为归 V-82 |
+| **V-90** | Metal 的 Xcode GPU Frame Capture（`MTLCaptureManager`）与 Vulkan 的 `VK_EXT_debug_utils` 未接：v1 只靠 `EngineError` + 文件诊断 |
+| **V-91** | 「每帧整面 copy/blit」的带宽成本未基准（4K/120Hz 下 persist→swapchain 约 1.99 GB/s）；L4 量化后再决定是否需要「多 swapchain image 各自缓存一份 persist」 |
+
+### 17.3 门禁（实现期）
+
+| 项 | 期望 |
+|---|---|
+| 默认测试 | `cargo test -p kytrix_gui` **589**（逐项不变）；`--features test-support` 621 + 集成 6；demo 1 |
+| lint / 格式 / 文档 / release | `clippy --all-targets [--all-features] -D warnings` / `fmt --check` / `cargo doc --no-deps` / `--release build` 全绿 |
+| 交叉 target | `KYTRIX_GUI_SKIP_SHADERS=1 cargo check -p kytrix_gui --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}` **exit 0**（Linux 需 stub `pkg-config`，§17.1）；两 target 再加 `--features test-support` 各 **exit 0**（覆盖 `readback.rs`） |
+| 依赖 | `cargo tree` 无 `x11*` / `xcb*` / `winit` / `wgpu` / `naga`；**`wayland-sys` 必须存在**（F-135，`system` feature）；`Cargo.lock` 仅 +2 行（`dispatch2` 依赖边与其 `libc`）；`Cargo.toml` 仅 `dispatch2` / `system` 两处 |
+| 代码形态 | `render.rs` / `platform.rs` / 四个后端模块根只有 `mod`/`use`；无 `#[allow]` / `#[expect]`；`unsafe` 只在 `render/{windows,macos,linux}/**` 与 `platform/{windows,macos,linux}/**`，每块带 `// SAFETY:` |
+
+### 17.4 实现期条目（2026-11-13，落地时新增）
+
+| 编号 | 内容 |
+|---|---|
+| **F-133** | macOS 事件循环**自持**：`Application::run` 用 `NSApplication::nextEventMatchingMask:untilDate:`（drain + `distantFuture` 阻塞）+ `CFRunLoopSource` 唤醒源 + 60 Hz 动画 `CFRunLoopTimer`（有动画才挂、空闲移除），**不**调 `NSApplication::run()`，也**不**用 `NSWindowDelegate` / 通知中心：尺寸 / 缩放 / 焦点 / 关闭全部靠每轮 O(1) 快照对比。理由：`NSApp.run()` 拿走控制权后帧泵只能塞进 `performSelectorOnMainThread`（多一次 run-loop 跳转且退出路径不可控）。代价：`App` 以 `Box::into_raw` 固定地址穿透两个 C 回调（`pump_callback` / `timer_callback`），模块头写了线程/别名论证；退出路径由 `CFRunLoop::current().stop()` 打断阻塞 |
+| **F-134** | mac/Linux **不建 geometry pipeline**（共享层 `FrameOp::Geometry` → `EngineError::GeometryRegister`）：P12 没有几何注册入口（P08 同），提前建管线只会引入一个永远不 bind 的对象；P13 接 `GeometryStore` 时与 Windows 一起补齐（MSL/SPIR-V 产物已在 `OUT_DIR/shaders`） |
+| **F-135** | `wayland-client` 必须 `features = ["system"]`：`VkWaylandSurfaceCreateInfoKHR` 要 `wl_display*` / `wl_surface*` 的**真实对象**，纯 Rust 后端的 `ObjectId` 只是令牌，交给驱动即崩。因此 `wayland-sys` + `libwayland-client` 进依赖树（设计期「纯 Rust、零系统依赖」的说法作废），Linux 构建机必须有 `wayland-client` 开发包；`wayland-sys` 的 build script 走 `pkg-config`，交叉编译仍需 §17.1 的 stub |
+| **F-136** | `Renderer::resize` 在 mac/Linux 只收 `(u32, u32)`：`contentsScale` / `drawableSize` 由平台层持有图层后自行更新（mac），Vulkan 的 extent 由 swapchain 自己记。`Window::submit_gpu` 因此三平台同签名，`renderer.surface()` 只报物理尺寸 |
+| **F-137** | Linux 的两处「主循环独占」适配：① 剪贴板 `set_text` / `get_text` 走进程级 mailbox + 缓存（`set_selection` 需要最近输入 serial，只有循环持有，且 Wayland 是拉模型）；② `Renderer::new_offscreen` 明确返回 `UnsupportedGpu`（Vulkan WSI 需要真实 `wl_surface`，`App` 构造期没有连接），`TestApp::snapshot` 在 Linux 上因此恒为 `SnapshotError::Gpu`；macOS 的离屏渲染器（`new_offscreen[_with_page]`）真实可用，`Readback` 不再无消费者 |
+| **S-125** | 共享 `render/device.rs` **删除**：`GpuCaps` / `D8_REQUIRED` / `FEATURE_LEVEL_12_0` 全部下沉到各后端（三个后端的基线本来就不同：`Base\|\|FeatureLevel12`、`ArgumentBuffersTier2`、`Vulkan1.2+descriptorIndexing`）。`render.rs` 不再声明 `device`，`caps_tests` 跟着搬进 `render/windows/device.rs` |
+| **S-126** | `platform/dispatcher.rs` 的 `post_frame_wake` 变成三段 `#[cfg]`（`PostMessageW` / `CFRunLoopSourceSignal`+`WakeUp` / `calloop::ping`），`attach` 的句柄在 mac/Linux 上只是占位 token；`Dispatcher::attach(1)` 由两个新循环调用（保持「先置位再唤醒」的唯一性，I3） |
+| **S-127** | 两个新 `Renderer` 都在**同步提交**下工作（mac `waitUntilCompleted`、Vulkan `wait_for_fences`+timeline），因此 `readback` / `render_snapshot` 之前不需要额外同步；`resize` / 退出前统一 `wait_idle`（Vulkan 用 timeline 值，mac 是 no-op） |
+| **V-92** | macOS 的输入翻译是 v1 近似：`keyDown:` 同时发 `Key` 与 `Text`，IME 组合期间靠 `hasMarkedText()` + 上次 commit 去重；`scrollWheel:` 的 `precise` 与非 `precise` 分别 /10 /3 归一到「行」；光标形状只做系统箭头（`NSCursor::arrowCursor`）。L5 需要按 §7.8 的表逐项校准 |
+| **V-93** | Linux 输入同理：`wl_pointer` 的 `axis.value`（1/120 行）取反后传给 `delta_y`；没有 `wp_pointer_constraints` / `wp_relative_pointer`（拖拽出窗口依赖 compositor 的隐式抓取）；`set_cursor` 未接（Wayland 需要 `wl_cursor_shape` 或自绘，属 P13 窗口装饰的一部分） |
+| **V-94** | `InFlightRing::reserve` 至今无生产消费者（只在共享层测试里）；P12 没有动它，`test-support` 交叉 target 上会报 1 项 `never used`（既有问题，不在 P12 范围） |
+
+
+
