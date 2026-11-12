@@ -6,6 +6,7 @@
 pub mod app;
 pub mod error;
 pub mod event;
+pub mod interaction;
 pub mod layout;
 pub mod math;
 pub mod node;

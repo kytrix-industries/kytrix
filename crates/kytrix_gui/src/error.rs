@@ -21,6 +21,7 @@ use crate::{
     layout::Axis,
     node::{id::NodeId, signal::DerivedId},
     paint::atlas::AtlasKind,
+    window::WindowId,
 };
 
 /// 引擎公开错误枚举。
@@ -109,6 +110,24 @@ pub enum EngineError {
     /// 剪贴板访问失败（被其它进程占用 / 内存分配失败）。
     #[error("clipboard access failed: {detail}")]
     Clipboard { detail: SmolStr },
+    /// 目标节点不是滚动容器（未 `make_scroll`，或 `Style.clip != Clip::Bounds`）。
+    #[error("node {node:?} is not scrollable (make_scroll / Clip::Bounds required)")]
+    NotScrollable {
+        /// 目标节点。
+        node: NodeId,
+    },
+    /// 目标节点不是虚拟列表容器（未 `make_virtual_list`，或不是 `Clip::Bounds + position: relative`）。
+    #[error("node {node:?} is not a virtual list (Clip::Bounds + position: relative required)")]
+    NotVirtualList {
+        /// 目标节点。
+        node: NodeId,
+    },
+    /// 窗口已关闭 / 从未存在（P10：需要返回句柄或开启动画时无法静默）。
+    #[error("unknown window: {window:?}")]
+    UnknownWindow {
+        /// 陈旧/未知的窗口句柄。
+        window: WindowId,
+    },
 }
 
 #[cfg(test)]

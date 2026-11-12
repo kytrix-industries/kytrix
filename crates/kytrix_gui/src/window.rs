@@ -17,6 +17,7 @@ use crate::render::timer::FrameTimings;
 use crate::test_support::record::{FrameRecord, FrameStats, PaintLog};
 use crate::{
     error::EngineError,
+    interaction::{FocusScope, PointerState},
     layout::LayoutReport,
     math::{Rect, Scale, Size},
     node::{dirty::DirtyFlags, tree::NodeTree},
@@ -211,6 +212,12 @@ pub struct Window {
     /// 最近一帧的调度/绘制记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     record: Option<FrameRecord>,
+    /// 焦点（P10 的唯一权威源）。
+    focus: FocusScope,
+    /// 指针状态（hover / 光标 / 按下 / 拖拽 / 捕获）。
+    pointer: PointerState,
+    /// 下一帧必须重绘的逻辑矩形（滚动视口；`paint_frame` 消费后清空）。
+    pending_damage: Option<Rect>,
 }
 
 impl Window {
@@ -238,7 +245,39 @@ impl Window {
             stats: FrameStats::default(),
             #[cfg(feature = "test-support")]
             record: None,
+            focus: FocusScope::default(),
+            pointer: PointerState::new(),
+            pending_damage: None,
         }
+    }
+
+    /// 焦点状态（只读；写入口是 `App::{set_focus, focus_next, focus_prev}`）。
+    #[must_use]
+    pub fn focus(&self) -> &FocusScope {
+        &self.focus
+    }
+
+    /// 焦点状态的可写引用（写入口是 `App::set_focus`，它负责标脏）。
+    pub(crate) fn focus_mut(&mut self) -> &mut FocusScope {
+        &mut self.focus
+    }
+
+    /// 指针状态（crate 私有：`App::dispatch_input` 与平台泵是唯一读者）。
+    pub(crate) fn pointer(&self) -> &PointerState {
+        &self.pointer
+    }
+
+    /// 指针状态的可写引用。
+    pub(crate) fn pointer_mut(&mut self) -> &mut PointerState {
+        &mut self.pointer
+    }
+
+    /// 请求下一帧重绘一个逻辑矩形（滚动视口；并集语义）。
+    pub(crate) fn request_damage(&mut self, rect: Rect) {
+        self.pending_damage = Some(match self.pending_damage {
+            Some(existing) => existing.union(rect),
+            None => rect,
+        });
     }
 
     /// 窗口句柄。
@@ -338,6 +377,7 @@ impl Window {
     /// `!REUSABLE` 表示 lane 内容与树/样式不一致；`LAYOUT | PAINT` 覆盖「新建/未标 REUSABLE」的节点。
     pub(crate) fn needs_frame(&self, wake: bool) -> bool {
         wake || self.full_damage_pending
+            || self.pending_damage.is_some()
             || self.tree.any_node(|node| {
                 let dirty = node.dirty();
                 dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
@@ -446,7 +486,12 @@ impl Window {
             self.damage.push_full();
             self.full_damage_pending = false;
         }
+        // 滚动（P10 §7.8）：唯一来源是视口矩形；节点级 damage 不参与（偏移不写 `layout.bounds`）。
+        if let Some(pending) = self.pending_damage.take() {
+            self.damage.push(pending, 1.0, None);
+        }
         self.paint_order.clear();
+        let focused = self.focus.focused();
         let mut pass = PaintPass {
             tree: &mut self.tree,
             scene: &mut self.scene,
@@ -454,6 +499,7 @@ impl Window {
             scale,
             frame,
             order: &mut self.paint_order,
+            focused,
             #[cfg(feature = "test-support")]
             log: PaintLog::default(),
         };

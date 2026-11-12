@@ -423,6 +423,16 @@ impl StateStore {
         }
     }
 
+    /// 瞬态值的借用视图（不克隆）。`None` = 不是瞬态值或类型不符。
+    ///
+    /// 消费者：`App::animate` 取动画起点、`ActionCtx` 侧的诊断读。
+    pub(crate) fn transient_ref<T: 'static>(&self, id: SignalId) -> Option<&T> {
+        match &self.values.get(id.index() as usize)?.value {
+            SignalValue::Transient(value) => value.downcast_ref::<T>(),
+            SignalValue::Owned(_) | SignalValue::Derived(_) => None,
+        }
+    }
+
     pub(crate) fn mark_derived_dirty(&mut self, id: DerivedId) -> bool {
         self.derived.mark_dirty(id)
     }

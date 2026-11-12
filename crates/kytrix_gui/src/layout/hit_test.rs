@@ -75,19 +75,34 @@ pub struct HitResult {
     pub clip_chain: ClipChain,
 }
 
+/// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
+fn negate(offset: Point) -> Point {
+    Point::new(-offset.x, -offset.y)
+}
+
 /// 逆绘制序（`order` 是 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
+///
+/// **屏幕坐标**：`point` 是窗口逻辑像素；布局盒是**内容坐标**，因此进入滚动容器的子树时按它的 `offset`
+/// 把点换算到内容空间（`design/phase-10-interaction.md` §7.3）。根不是滚动容器 ⇒ 顶层偏移恒为零。
 pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
     let root = tree.root();
     if !tree.get(root).ok()?.layout().bounds.contains(point) {
         return None; // 窗口外（根 100% 撑满 ⇒ 等价于「点在窗口外」）
     }
     let mut chain = ClipChain::default();
-    pick(tree, root, point, &mut chain)
+    pick(tree, root, point, Point::ZERO, &mut chain)
 }
 
-fn pick(tree: &NodeTree, node: NodeId, point: Point, chain: &mut ClipChain) -> Option<HitResult> {
+fn pick(
+    tree: &NodeTree,
+    node: NodeId,
+    point: Point,
+    offset: Point,
+    chain: &mut ClipChain,
+) -> Option<HitResult> {
     let slot = tree.get(node).ok()?;
-    let bounds = slot.layout().bounds;
+    // 本节点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）。
+    let bounds = slot.layout().bounds.translate(negate(offset));
     // 本节点**未**入链前的深度：`clip_chain` 只含祖先的 clip（目标自己的 padding box 由应用自己算）。
     let depth = chain.len();
 
@@ -112,6 +127,11 @@ fn pick(tree: &NodeTree, node: NodeId, point: Point, chain: &mut ClipChain) -> O
     }
 
     if !clipped {
+        // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
+        let child_offset = offset
+            + tree
+                .scroll_slot(node)
+                .map_or(Point::ZERO, |slot| slot.offset);
         // 子节点逆序：最后一个子节点绘制在最上层，因此先测。
         for child in slot.children().iter().rev() {
             let Ok(child_node) = tree.get(*child) else {
@@ -122,10 +142,16 @@ fn pick(tree: &NodeTree, node: NodeId, point: Point, chain: &mut ClipChain) -> O
             // 内部的 `clipped` 处理（它仍然允许命中该节点自己的 border 带）。
             // 这里只跳过「叶子 + 盒外」这种零代价的明显不可能项。
             let leaf = child_node.children().is_empty();
-            if leaf && !child_node.layout().bounds.contains(point) {
+            if leaf
+                && !child_node
+                    .layout()
+                    .bounds
+                    .translate(negate(child_offset))
+                    .contains(point)
+            {
                 continue;
             }
-            if let Some(hit) = pick(tree, *child, point, chain) {
+            if let Some(hit) = pick(tree, *child, point, child_offset, chain) {
                 chain.truncate(depth);
                 return Some(hit);
             }
@@ -134,6 +160,12 @@ fn pick(tree: &NodeTree, node: NodeId, point: Point, chain: &mut ClipChain) -> O
 
     // 自身：先看布局盒（允许溢出后代，但自身不声称盒外命中），再看 `hit_shape`（局部坐标）。
     if !bounds.contains(point) {
+        chain.truncate(depth);
+        return None;
+    }
+    // `interactive: Some(false)` 的节点**不作为目标**（子节点已在上面的循环里独立判定）。
+    // 设计 §4.9 把它定义为「命中 / 焦点 / Action 开关」。
+    if slot.style_patch().interactive == Some(false) {
         chain.truncate(depth);
         return None;
     }
@@ -153,7 +185,6 @@ fn pick(tree: &NodeTree, node: NodeId, point: Point, chain: &mut ClipChain) -> O
         clip_chain,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -441,7 +472,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let base = add(&mut tree, root, fixed(100.0, 100.0));
-        // 浮层：绝对定位在最后，尺寸小 ⇒ 必须 append 到 order 末尾（P13 的 Overlay 契约）
+        // 浮层：绝对定位在最后，尺寸小 ⇒ 必须 append 到 order 末尾（P10 的 Overlay 契约）
         let overlay = add(&mut tree, root, absolute(20.0));
         layout(&mut tree);
 

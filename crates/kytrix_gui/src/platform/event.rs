@@ -51,6 +51,7 @@ pub(crate) enum PlatformEvent {
     },
     Focus(bool),
     Appearance(bool),
+    PointerLeave,
     Close,
 }
 
@@ -139,6 +140,8 @@ pub(crate) fn translate(
             }
             decode_char(wparam as u16, state).map(PlatformEvent::Text)
         }
+        // `WM_MOUSELEAVE` 由 `Win32::UI::Controls` 导出（不是 `WindowsAndMessaging`）。
+        windows::Win32::UI::Controls::WM_MOUSELEAVE => Some(PlatformEvent::PointerLeave),
         WM_SETFOCUS => Some(PlatformEvent::Focus(true)),
         WM_KILLFOCUS => Some(PlatformEvent::Focus(false)),
         WM_SIZE => {

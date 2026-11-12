@@ -1827,3 +1827,117 @@
 | 已知限制 | ①V-64 文本像素（P10）；②`WM_DPICHANGED` 只能合成验证（无第二显示器）；③IME 无真实输入法输入（V-61 不变）；④CI 无桌面时 present 只能人工验收（V-62 不变） |
 
 
+
+---
+
+## 十五、P10 · 交互机制 + Action 分发（2026-11-13）
+
+> 设计见 `design/phase-10-interaction.md`；probe 在 `%TEMP%\kg-p10-interaction`（仓库外、独立 `CARGO_TARGET_DIR`、`--offline`）。
+> 本阶段**只做设计 + probe**：未写仓库代码、未改 `Cargo.toml` / `Cargo.lock`、未 commit。§15.4 的实施记录待实现期追加。
+
+### 15.1 设计期条目
+
+| 编号 | 内容 |
+|---|---|
+| **F-93** | **`Action` 的形态定死为引擎枚举 + `Custom(SmolStr)`**（`event::Action`：`FocusNext` / `FocusPrev` / `Dismiss` / `Custom`），**不是** `impl Action` trait + `TypeId` downcast（GPUI 形态）。`Action` 是 handler 表的键 ⇒ 必须 `Eq + Hash`；「怎么触发的」走 `ActionSource`（`Click { click_count }` / `Key` / `Drag { phase, delta }` / `Programmatic`），不进 `Action`。节点只持**声明**（`on_click` / `on_drag`），handler 集中在 `App::on_action` |
+| **F-94** | **滚动偏移不进 `StateStore` 的 `Transient`**（主设计 §3.7 / §8.4 的原文归类），改存 `Node.interaction.scroll.offset`。原因：`place_subtree` / `paint` / `hit_test` / `Probe` / a11y bounds 全都只拿得到 `&NodeTree`（`StateStore` 在 `App` 里）；存 store 则必须给这五个入口各加一个 `&StateStore` 参数，或者接受「store 一份 + tree 一份」的两个真值。`Transient` 的三条语义（不入依赖图、不写 `Signal`、不产生 `PAINT`）由 tree 侧槽等价实现（§7.1） |
+| **F-95** | **滚动偏移吸收进绝对布局盒**（`place_subtree` 的 `content_shift = -offset`，只在进出滚动容器时生效），代价 = 被移动子树的 lane 重建（清 `REUSABLE`，**不**标 `PAINT` ⇒ 不重算 `bind_style`）。主设计 §3.4 行 7「滚动偏移只改 uniform / clip，不改 lane 内容」在本引擎的 lane 模型下不可实现：lane 内图元持**绝对** bounds、lane 自带**祖先 clip 前缀**（P06 §5.4），给 lane 加「内容变换」会把视口 clip 一起平移（clip 在窗口空间、内容在内容空间） |
+| **F-96** | **probe：null 类光标 + `HTCLIENT` 会得到空光标（不可见）**。`DefWindowProcW(WM_SETCURSOR, lParam=MAKELPARAM(HTCLIENT, WM_MOUSEMOVE))` 返回 **0** 且 `GetCursor()` = `0x0`；类光标为 `IDC_ARROW` 时同一消息返回 0 但把光标设成箭头；非客户区（`HTLEFT` / `HTTOP` / `HTBOTTOMRIGHT`）由 `DefWindowProcW` 自行设尺寸光标并返回 **1**，`HTCAPTION` 返回 0 但设箭头。⇒ P10 把类光标改为 `IDC_ARROW`（`platform/windows/window.rs:289` 的 `HCURSOR::default()`）并**不加** `WM_SETCURSOR` 分支，只在泵里按「解析结果变化」`SetCursor` |
+| **F-97** | **probe：双击 / 拖拽阈值的系统真值**：`GetDoubleClickTime()` = **500 ms**、`SM_CXDOUBLECLK` = `SM_CYDOUBLECLK` = **4**、`SM_CXDRAG` = `SM_CYDRAG` = **4**（`SM_MOUSEWHEELPRESENT` = 1，光标 32×32）。⇒ `InputThresholds::default()` 用这些值，平台在 `platform_init` 写入系统真值（`app.rs` 里 **0 个 Win32 类型**，I9） |
+| **F-98** | `Node` 新增**一个**字段 `interaction: Option<Box<NodeInteraction>>`（+8 B）：滚动槽 / 虚拟列表槽 / 浮层槽 / `on_click` / `on_drag` 全在同一个 `Box` 里，`Node` 从 **1128 → 1136 B**（P06 预算 1128 / 上限 1152）。`Node` 的手写 `Debug` 必须同步（N4 的口径：闭包打 `<closure>`） |
+| **S-86** | 交互状态的三处归属（唯一真值）：节点级槽（滚动 / 虚拟列表 / 浮层 / `on_click` / `on_drag`）→ `Node.interaction: Option<Box<NodeInteraction>>`；焦点 + 指针 → `Window`；handler 表 / `KeyBinding` 表 / 动画槽 / 时钟 / 阈值 → `App`。**禁止**第二份焦点、第二份偏移、第二份「谁在拖拽」 |
+| **S-87** | `ScrollHandle` / `VirtualList` / `Overlay` / `DragState` / `AnimationId` 全部**携带 `WindowId`**：`NodeId` 只在一棵树内有意义（各窗口的 `Arena` 独立 ⇒ 跨窗口的 `NodeId` 可能偶然有效）。不匹配 ⇒ `EngineError::StaleNode`；窗口已关闭 ⇒ 静默（不是错误） |
+| **S-88** | Tab 序 = `tree.order()`（DFS 先序）过滤 `focusable`，**不做 `tab_index`**（第二排序会与 `ORDER` 脏位、虚拟列表动态挂载、浮层末尾插入三处冲突）；焦点环 = `Style.focus_ring: Option<FocusRing>` + paint 在**焦点节点自己的 lane 内**画（自动受祖先 clip 约束，不需要第二条绘制通道） |
+| **S-89** | 浮层 = **root 的末尾子节点**（层级 = 绘制序 = `order` 末尾，无 `z-index`）；`hit_test` 的逆序遍历因此天然优先命中浮层（`layout/hit_test.rs:444` 的既有用例就是按此契约写的）。点击外部只关**最上层** `OverlayDismiss::OutsideClick` 浮层并**消费**该次按下（否则会同时触发下层按钮）；`Escape` / `Dismiss` 动作可关任意层 |
+| **S-90** | 虚拟列表：容器要求 `Clip::Bounds + position: relative`；行 = **绝对定位**子节点（`left:0 / right:0 / top:i*extent / height:extent`），**不用 `LayoutOverride`**（那是布局叶子，不能挂子节点，P04 §10.3）；`content = Size(viewport.width, count × extent)` **显式**写入滚动槽（taffy 无可滚动内容盒）；v1 只支持均匀行高 |
+| **S-91** | 动画槽在 **`App`**（tick 需同时 `&mut StateStore` 与 `&mut NodeTree`）；被驱动的值落 `Transient`（`bind_style` 用 `read_transient`），重绘由**显式注册的节点集合**的 `mark_paint` 给出（对应主设计 §3.7 的「显式注册」，不把时间接进 `dependents`）；平台用 `SetTimer(1 ms)` + `WM_TIMER` 唤醒、按 `has_animations()` arm/disarm（probe：1 ms → 16.0 ms / 320 ms 内 20 次；`KillTimer` 后 60 ms 内 0 次） |
+| **S-92** | `InputEvent` 的 `PointerMove` / `PointerDown` / `PointerUp` / `Scroll` 增加 `modifiers: Modifiers`（平台侧 `TranslateState::modifiers()` 已有真值）；`InputOutcome` 从 `test_support::input` 迁到公开 `event.rs`（`{hit, action, target, click_count}`），**删除** `test_support/input.rs`（与 S-79 同型处置）；`TestApp::inject` 与平台走**同一个** `App::dispatch_input` |
+| **S-93** | `platform/windows/event_loop.rs` 的 P10 增量：`WM_MOUSELEAVE` → `PlatformEvent::PointerLeave`（`TrackMouseEvent(TME_LEAVE)` 在首次 move 时注册）、`WM_TIMER`（`wParam == 1`）→ `dispatcher.wake()`、每轮 `SetCapture`/`ReleaseCapture` / `SetCursor` / `SetTimer`/`KillTimer` / `app.sync_clock()`。`wndproc` 仍**不调用 `App`**（只写 `WndProcState` + `wake`），沿用 P09 §5.2 的纪律 |
+| **S-94** | `interaction.rs` 是**公共模块根**（P01 §4.2），契约类型定义在根文件、实现放 `interaction/{focus,scroll,virtual_list,overlay,drag,animation}.rs`；但**每个类型只有一个 `impl` 块**（`multiple_inherent_impl = "forbid"`）——交互方法必须写进 `app.rs` / `window.rs` / `tree.rs` 里**已存在的** impl，子模块只放 `pub(crate)` 自由函数 |
+| **S-95** | 编号对齐：`node/tree.rs:319` / `:949`、`layout/hit_test.rs:444`、`node/tree.rs:1180` 的「P13」与 `paint/style.rs:101` / `:107` 的「P12」在本阶段一并改为 **P10**（纯注释）；`app.rs:122` 的 `P11/P17` 与 `render.rs` / `platform.rs` 的端口编号**不动**（属另一条编号线） |
+
+### 15.1b 上级裁决修订（2026-11-13，实现前）
+
+> 上级裁决：**A1/A3/A4/A5 采纳，A2 不采纳**。A2 原方案（滚动偏移吸收进 `layout.bounds`）被否，改为 **paint 期偏移**；
+> 本节追加修订，§15.1 的 F-94/F-95 保留历史但**以本节为准**。
+
+| 编号 | 内容 |
+|---|---|
+| **F-99** | **滚动偏移改为 paint 期应用**（上级裁决）：偏移 = `Node.interaction.scroll.offset`（`Transient` 语义：不登记依赖、不写 `Signal`、不标 `LAYOUT`/`PAINT`、不跑 taffy、不跑 `refresh_styles`）；`layout.bounds` 恒为**内容坐标**，`place_subtree` **不感知**滚动。应用点只有两处：`paint_node` 的**累计偏移**（图元 bounds 与 clip 矩形同步平移，容器自身 padding box 用祖先累计、子树内部用含自身偏移的累计）与 `hit_test::pick`（屏幕点 → 内容点）。damage **只**来自滚动视口矩形（`Window.pending_damage`），`FrameIndex` 照常推进 |
+| **F-99a** | **「仅重写实例、不重建 lane」未采用，根因已证实**：本引擎的 lane 头部嵌**祖先 clip 前缀**（P06 §5.4，矩形在**窗口空间**），而内容图元在**内容空间**；给 lane 加单个平移会把视口 clip 一起移走，反向把外层 clip 反算进内容空间则需要 `Scene` 增加 per-lane 平移 + 编码器对 8 类 `Primitive`（含 `GlyphRun` 的逐字形位置）逐个平移 —— 属 P06/P07 的契约级改动（含三套 golden），超出 P10 边界。**采用的替代**：paint 发现 `Node.lane_offset != 当前累计偏移` 时**重建该 lane**（不重算样式、不跑布局），damage 仍只算视口；代价上界 = 滚动容器子树内**已挂载**节点数（虚拟列表下 = 视口行数 + overscan） |
+| **S-96** | `Window` 增加 `pending_damage: Option<Rect>`（逻辑像素，并集）+ `needs_frame` 的第三项判据；`NodeTree` 增加 `lane_offset` 戳（`Node` 侧 1 个 `Point`，放 `NodeInteraction` 内）+ `set_lane_offset` / `lane_offset`。两者都只有非 test 消费者（`paint_frame` / `paint/pass.rs`） |
+
+### 15.2 probe 记录（`%TEMP%\kg-p10-interaction`，2026-11-13）
+
+> 环境：Windows，**非交互式 agent 会话**；`windows 0.62.2`（`Win32_Graphics_Gdi` 是 `WNDCLASSW` / `RegisterClassW` 的 feature 门控）；
+> `cargo run --offline`（crate 源在本地 registry 缓存）。
+
+| # | 实测项 | 结果 |
+|---|---|---|
+| 1 | `LoadCursorW` 8 个 `IDC_*` | ARROW `0x10003` / HAND `0x1001f` / IBEAM `0x10005` / SIZEWE `0x10011` / SIZENS `0x10013` / NO `0x10017` / SIZEALL `0x10015` / CROSS `0x10009`，全部 `Ok` |
+| 2 | `SetCursor` 往返 | `SetCursor(arrow)` 返回前值 `0x10007`；`GetCursor()` = `0x10003`（相等）⇒ 光标是**线程状态**，可在泵里随时覆盖 |
+| 3 | `SetCursor(None)` | `GetCursor()` = `0x0` ⇒ 传 `None` = 清空光标（不可见），引擎永不这么干 |
+| 4 | 类光标 = null + `WM_SETCURSOR(HTCLIENT)` | `DefWindowProcW` 返回 **0**，`GetCursor()` = **0x0**（空光标） |
+| 5 | 类光标 = `IDC_ARROW` + `WM_SETCURSOR(HTCLIENT)` | 返回 **0**，但 `GetCursor()` = arrow ⇒ 默认光标交给系统即可 |
+| 6 | 类光标 = null + 非客户区 | `HTLEFT` → 返回 **1**、光标 `0x10011`；`HTTOP` → 1、`0x10013`；`HTBOTTOMRIGHT` → 1、`0x1000d`；`HTCAPTION` → 0、`0x10003` |
+| 7 | `WM_SETCURSOR` 解码 | `wParam` = hwnd；`LOWORD(lParam)` = **1**（`HTCLIENT`）；`HIWORD(lParam)` = `0x0200`（`WM_MOUSEMOVE`） |
+| 8 | `SetCapture` / `GetCapture` / `ReleaseCapture` | 隐藏窗口上：`during == hwnd`；`ReleaseCapture()` = `Ok(())`；after = `0` ⇒ 拖拽捕获可落地、可单测 |
+| 9 | `TrackMouseEvent(TME_LEAVE)` | `Ok(())`（无真实鼠标 ⇒ `WM_MOUSELEAVE` 本身未验证，V-66） |
+| 10 | 阈值真值 | `GetDoubleClickTime()` = **500 ms**；`SM_CXDOUBLECLK` = `SM_CYDOUBLECLK` = **4**；`SM_CXDRAG` = `SM_CYDRAG` = **4**；`SM_MOUSEWHEELPRESENT` = 1 |
+| 11 | `MSG.time` / `GetMessageTime()` | 两者相等且非零（`1090101703`）⇒ 未来做事件合并可用；P10 用 `Instant`（测试可注入） |
+| 12 | `SetTimer(1 ms)` | 320 ms 内 **20** 次 ⇒ 实测周期 **16.0 ms**；`KillTimer` 后 60 ms 内 **0** 次（复验 P09 F-88） |
+| 13 | `SetTimer(16 ms)` | 320 ms 内 **12~13** 次 ⇒ **24.6~26.7 ms** ⇒ 否掉「用 16 ms 定时器做 60 fps」 |
+
+### 15.3 未验证项（不阻塞）
+
+| 编号 | 未验证 | 后续 |
+|---|---|---|
+| V-65 | `DirtyFlags::ORDER` 在 P10 仍**没有清除者**（`settle_frame` 只清 `LAYOUT|PAINT`），会累积到 P11 | 位是 `pub const`（不触发 `dead_code`）；`VirtualList` / `Overlay` 的单测断言被置位即可 |
+| V-66 | `WM_MOUSELEAVE` 的真实投递（需要真实鼠标移出客户区；probe 只验证 `TrackMouseEvent` 调用成功） | 后续的 L5 实机矩阵 |
+| V-67 | 拖拽移出窗口/跨屏时 `SetCapture` 的实际投递（无交互桌面） | 同上；单测只覆盖「捕获请求的真值序列」 |
+| V-68 | 真实滚轮/触控板的高频小增量（±40 等）：平台的 `/120.0` 已保留小数（P09 落地），本阶段不改 | 实机验收 |
+| V-69 | 系统定时器在 120/144 Hz 显示器上的抖动；P10 **不承诺 60 fps**（实测 16.0 ms） | 动画按 `Instant` 插值（抖动只影响平滑度）；若不可接受 → 后续 Phase 换 `DwmFlush`/`WaitForVBlank`（不改 `AnimationClock` 契约） |
+| V-70 | 浮层**不做** collision avoidance（超出窗口不翻转） | 应用用 `place_overlay` 自行修正；tooltip 需要时再加 |
+| V-71 | 拖拽**不做**节流与速度采样 ⇒ 无「抛掷」惯性（只有滚轮的缓动到位） | 触控板/惯性滚动属后续 Phase；`AnimationClock` 已能承载 |
+| V-72 | 焦点环颜色不在 `StylePatch` 里 ⇒ 主题切换需重挂载 | 主题 Phase 的批量失效会覆盖（把 `FocusRing.color` 接到 `ThemeHandle.role(...)`） |
+
+### 15.4 实施记录（2026-11-13，P10 落地）
+
+| 项 | 实测 |
+|---|---|
+| 新增 | `src/interaction.rs` + `interaction/{focus,scroll,virtual_list,overlay,drag,animation}.rs`；`test_support/input.rs` **删除**（`InputOutcome` 迁 `event.rs`） |
+| 修改 | `event.rs`（`Action`/`KeyBinding`/`ActionHandler`/`ActionSource`/`InputOutcome`、指针事件加 `modifiers`）、`app.rs`（分发 / 焦点 / 滚动 / 虚拟列表 / 浮层 / 拖拽 / 动画 / 时钟）、`window.rs`（`focus`/`pointer`/`pending_damage`）、`node/tree.rs`（`interaction` 槽 + `lane_offset` + 8 个访问器）、`node/builder.rs`（`on_click`/`on_action`/`on_drag`/`focus_ring`）、`node/signal.rs`（`transient_ref`）、`paint/{style,pass}.rs`（`FocusRing`、累计偏移、焦点环）、`layout/hit_test.rs`（累计偏移 + `interactive:false`）、`platform/{event.rs,windows/{event_loop,window}.rs}`（`PointerLeave`/捕获/光标/`SetTimer`/`sync_clock`/类光标 `IDC_ARROW`）、`error.rs`（`NotScrollable`/`NotVirtualList`）、`kytrix_gui_demo/{Cargo.toml,scene.rs}`（`taffy` 依赖 + 动作/焦点环/滚动列表 + 1 项用例）、`Cargo.lock`（**+1 行**：demo → taffy 的边） |
+| 测试 | `cargo test -p kytrix_gui` **557**（P09 基线 491 → **+66**）；`--features test-support` **574**（含 `p10_tests` 端到端）+ 集成 5；demo **1**（评审后追加 11 项回归用例，见 §15.6） |
+| 门禁 | `cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings` 通过；`cargo +nightly fmt --all -- --check` 通过；`cargo doc -p kytrix_gui --no-deps` 无 warning；`cargo build -p kytrix_gui --release` 通过 |
+| 死代码 | `#[allow(` 0 处、`#[expect(` 0 处、`#[path]` 0 处；`unsafe` 只在 `platform/windows/**`（每处 `// SAFETY:`） |
+| 编号对齐 | S-95 的 6 处注释已改（`tree.rs` ×3、`hit_test.rs` ×1、`paint/style.rs` ×2） |
+| 偏差/发现 | 见 F-101 / F-102 / F-103 / F-104 / F-105、S-99…S-106（§15.5 / §15.6）；F-100 已被 F-104 取代 |
+| 已知环境限制 | ①`cargo clippy --workspace --all-features` 会在 `llama_sys`（llama.cpp 构建脚本）失败，与 P10 无关，门禁按 `-p kytrix_gui -p kytrix_gui_demo` 收窄；②`platform::dispatcher` 的两项 P09 用例在**高并行**下偶发失败（`PostMessageW` 计数与并行测试竞争），单跑/重跑稳定通过，属既有 flake（V-73）；③macOS / Linux 交叉 check 未在本轮执行（无对应 toolchain 目标） |
+
+### 15.5 实施期追加条目
+
+| 编号 | 内容 |
+|---|---|
+| **F-100** | `windows 0.62.2` **没有导出 `WM_MOUSELEAVE`**（`WindowsAndMessaging` 里查无此常量，实测 probe 与源码 grep）。处理：`platform/event.rs` 自行命名 `WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3` 并在 `translate` 里映射到 `PlatformEvent::PointerLeave`（配合 `TrackMouseEvent(TME_LEAVE)`） |
+| **F-101** | **`FocusRing` 不进 `Style`**，改由 `NodeBuilder::focus_ring(ring)` 写进 `NodeInteraction.focus_ring`：落地时发现 `Style` 加字段会让全仓 40+ 处 `Style { inner, clip }` 字面量（含 P02/P04/P06 测试）全部失效；且「焦点环」是交互态而非布局/绘制样式（§6.4 已同步） |
+| **F-102** | `Node` 实际体积 **1144 B**（1128 + `interaction` 8 + `lane_offset` 8），仍在 1152 上限内；`node_size_after_p06` 的严格断言同步改为 1144（并注明是 P10 预算） |
+| **S-97** | 滚动偏移的**唯一应用点**落地为两处：`paint/pass.rs::paint_node` 的 `offset` 参数（图元与 clip 矩形按 `-offset` 平移）与 `layout/hit_test.rs::pick` 的 `offset` 参数（屏幕点 → 内容点）；`Node.lane_offset: Point` 是 lane 复用判据的偏移戳（paint 重建后写回） |
+| **S-98** | 滚动**不产生任何脏位**：`App::scroll_to` 只写 `ScrollSlot.offset` + `Window::request_damage(viewport)` + `wake_requested`；`paint_frame` 把 `pending_damage` 以 `aa_padding = 1.0` 推进 `DamageAccumulator`（与其它 damage 同口径），因此滚动 damage ⊆ 视口 + 1 px AA 外扩 |
+| **V-73** | `platform::dispatcher` 的 `repeated_wakes_coalesce_into_one_post` / `queued_tasks_are_drained_once` 在高并行测试下偶发失败（P09 既有用例，`PostMessageW` 计数与并行度相关）；单跑与重跑稳定通过，非 P10 引入 |
+
+### 15.6 评审修复（2026-11-13，第二轮）
+
+| 编号 | 内容 |
+|---|---|
+| **F-103** | 新增 `EngineError::UnknownWindow { window: WindowId }`：`create_overlay`/`animate` 在窗口已关闭时返回它。原先用 `NodeId::for_test(0, 0)` 当哨兵，而该构造器要求 `generation != 0` ⇒ **panic**（评审 #1）。`NodeId::for_test` 重新收进 `#[cfg(test)]`（生产侧不再有调用者） |
+| **F-104** | `WM_MOUSELEAVE` **确实由 `windows 0.62.2` 导出**，但来自 `Win32::UI::Controls`（不是 `WindowsAndMessaging`）⇒ 撤销 F-100 的本地常量，改用导出常量（`Win32_UI_Controls` feature 本就在列表里） |
+| **F-105** | `FocusRing` 保持 `NodeInteraction.focus_ring`（F-101 不变）；评审 #9 的「旧环残留」根因不是字段位置，而是 **damage 没含环的外扩**：`set_focus` 清旧焦点时按 `bounds.outset(offset + width)` 并入 `Window::pending_damage` |
+| **S-99** | **damage 一律屏幕坐标**：`scroll::to_screen(tree, node, rect)`（减**祖先**滚动偏移）用于 `scroll_to` 的视口 damage、`paint` 的 `node_damage`/`hide_subtree`、`resolve_placement` 的 `Anchor`；`scroll::ancestor_offset` 不含自身（容器自己的 offset 只作用于子树） |
+| **S-100** | 焦点有效性：`App::focused` 校验 `tree.get(node)`，`validate_focus` 在 `dispatch_input`/`focus_next`/`focus_prev` 前清理陈旧焦点（虚拟行回收后 Tab 不再卡死） |
+| **S-101** | 虚拟列表：`visible_range` 在**视口未知（0）**时挂 `0..(1+overscan)`；`App::frame` 在 `layout_text` 之后调 `rewindow_virtuals`，布局/改尺寸后自动修窗 |
+| **S-102** | 分发显式传 `modifiers`：`dispatch_action_with_hit(.., modifiers)`；键盘路径用**本次按键**的修饰键，不再回落到 `pointer.modifiers` |
+| **S-103** | 动画重定向：`animate` 在入槽前 `retain(!same_target)`（`Scalar`/`Color` 比 `SignalId`、`Scroll` 比 handle），避免两条插值同时写同一瞬态值 ⇒ 回弹；零时长动画也置 `wake_requested` |
+| **S-104** | 指针细节：拖拽中二次 `PointerDown` 忽略；浮层外部点击把本次 `press` 作废（`Up` 不再落到下层）；`ClickRecord` 带 `WindowId`；`InputThresholds` 由平台用 `GetDoubleClickTime` / `SM_CXDRAG` 初始化并提供 `App::set_input_thresholds`；`close_window` 清该窗口的动画槽与点击记录 |
+| **S-105** | 公开面：`PressRecord`/`DragSession`/`ScrollSlot`/`OverlaySlot` 收为 `pub(crate)`（内部状态）；`DragInfo` 增加 `phase`；`AnimationId` 字段改名为 `generation`（单调代际）；`scroll_to` 对已卸载节点返回 `StaleNode` |
+| **S-106** | `lerp_color` 改为 **sRGB 分量**插值（端点精确、中点按 sRGB 编码后线性插值再解码），符合设计 §11.2 |
+| **V-74** | `platform::dispatcher` 两项 P09 用例在**全量并行**下偶发失败（`PostMessageW` 计数与他测并发），单跑/重跑稳定；本轮全量连跑 3 次中 1 次复现，非 P10 引入 |

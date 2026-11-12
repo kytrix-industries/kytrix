@@ -18,6 +18,10 @@ use windows::Win32::{
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+        Input::KeyboardAndMouse::{
+            GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+            TrackMouseEvent,
+        },
         WindowsAndMessaging::*,
     },
 };
@@ -37,6 +41,48 @@ use crate::{
     window::{WindowId, WindowOptions},
 };
 
+/// 动画 tick 的定时器 id（`wndproc` 用它唤醒；P09 probe 实测 1 ms → 16.0 ms）。
+const ANIMATION_TIMER_ID: usize = 1;
+
+/// 用系统设置初始化输入阈值（双击时间 + 拖拽/双击的距离容差，§5.4）。
+fn install_input_thresholds(app: &mut App) {
+    // SAFETY: 两个都是无副作用、无指针参数的系统查询。
+    let (double_click, drag_x, drag_y) = unsafe {
+        (
+            GetDoubleClickTime(),
+            GetSystemMetrics(SM_CXDRAG),
+            GetSystemMetrics(SM_CYDRAG),
+        )
+    };
+    let distance = drag_x.max(drag_y).max(1) as f32;
+    app.set_input_thresholds(crate::interaction::InputThresholds {
+        double_click_time: std::time::Duration::from_millis(u64::from(double_click.max(1))),
+        double_click_distance: distance,
+        drag_distance: distance,
+    });
+}
+
+/// 引擎光标 → 系统光标。`Default` 交给类光标（`IDC_ARROW`），不调 `SetCursor`。
+fn cursor_handle(cursor: crate::paint::style::Cursor) -> HCURSOR {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE,
+    };
+
+    use crate::paint::style::Cursor;
+
+    let id = match cursor {
+        Cursor::Default => IDC_ARROW,
+        Cursor::Pointer => IDC_HAND,
+        Cursor::Text => IDC_IBEAM,
+        Cursor::NotAllowed => IDC_NO,
+        Cursor::Grab | Cursor::Grabbing => IDC_SIZEALL,
+        Cursor::ResizeHorizontal => IDC_SIZEWE,
+        Cursor::ResizeVertical => IDC_SIZENS,
+    };
+    // SAFETY: `LoadCursorW` 取共享的系统光标句柄（不拥有、不释放）；`id` 是本函数的静态常量。
+    unsafe { LoadCursorW(None, id) }.unwrap_or_default()
+}
+
 /// `WndProc` 的每窗口状态（`GWLP_USERDATA` 指向它）。
 pub(crate) struct WndProcState {
     dispatcher: Arc<Dispatcher>,
@@ -47,6 +93,8 @@ pub(crate) struct WndProcState {
     close_requested: bool,
     /// 最近一次指针位置（客户区物理像素）：IME 组合窗按它定位。
     cursor: (i32, i32),
+    /// 是否已注册 `TrackMouseEvent(TME_LEAVE)`（每进入一次客户区注册一次）。
+    mouse_tracking: bool,
 }
 
 impl WndProcState {
@@ -58,6 +106,7 @@ impl WndProcState {
             min_size: (1, 1),
             close_requested: false,
             cursor: (0, 0),
+            mouse_tracking: false,
         }
     }
 
@@ -136,6 +185,27 @@ pub(crate) extern "system" fn wndproc(
             // `Dispatcher::wake` 已置位，这里只需要返回。
             return LRESULT(0);
         }
+        if msg == WM_TIMER {
+            // 动画 tick：只唤醒，推进在 `App::frame` 的 `tick_animations`。
+            if wparam.0 == ANIMATION_TIMER_ID {
+                state.wake();
+                return LRESULT(0);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        if msg == WM_MOUSEMOVE && !state.mouse_tracking {
+            // `PointerLeave` 的生产者：鼠标离开客户区时系统发 `WM_MOUSELEAVE`（0x02A3）。
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: core::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // `track` 在栈上，`hwnd` 是本窗口；失败时下一帧再试。
+            if TrackMouseEvent(&mut track).is_ok() {
+                state.mouse_tracking = true;
+            }
+        }
 
         // 滚轮：`lParam` 是屏幕坐标，翻译层要求客户区坐标。
         let (wparam_value, lparam_value) = (wparam.0, lparam.0);
@@ -163,6 +233,9 @@ pub(crate) extern "system" fn wndproc(
         };
 
         if let Some(event) = event {
+            if matches!(event, PlatformEvent::PointerLeave) {
+                state.mouse_tracking = false;
+            }
             // 指针位置用于 IME 组合窗定位（P09 没有 caret 语义，用最后指针位置）。
             if let PlatformEvent::Pointer { x, y, .. } = &event {
                 state.cursor = (*x, *y);
@@ -252,6 +325,7 @@ fn install_dpi_awareness() {
 /// 引擎自有事件循环：建窗口 → 挂渲染器 → 显示 → 泵 → 关闭。
 pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     install_dpi_awareness();
+    install_input_thresholds(&mut app);
     let dispatcher = app.dispatcher();
 
     let requests: Vec<(WindowId, WindowOptions)> = app
@@ -286,6 +360,7 @@ fn pump(
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let mut message = MSG::default();
+    let mut animation_timer: Option<usize> = None;
     loop {
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
@@ -305,7 +380,41 @@ fn pump(
         }
 
         // ② 平台事件 → App。
+        app.sync_clock();
         collect_events(&mut app, &mut windows, &dispatcher)?;
+
+        // ②b 交互反馈：光标 / 指针捕获 / 动画定时器（P10 §5.4 / §11.3）。
+        if let Some(native) = windows.first_mut() {
+            let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+            if let Some(cursor) = app.take_cursor_change() {
+                // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
+                unsafe { SetCursor(Some(cursor_handle(cursor))) };
+            }
+            if let Some(capture) = app.take_capture_request() {
+                if capture {
+                    // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/失焦时释放。
+                    unsafe { SetCapture(hwnd) };
+                } else {
+                    // SAFETY: 同上，释放本线程的捕获。
+                    let _ = unsafe { ReleaseCapture() };
+                }
+            }
+            match (app.has_animations(), animation_timer) {
+                (true, None) => {
+                    // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
+                    let id = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, 1, None) };
+                    if id != 0 {
+                        animation_timer = Some(id);
+                    }
+                }
+                (false, Some(id)) => {
+                    // SAFETY: `id` 由本线程的 `SetTimer` 产生。
+                    let _ = unsafe { KillTimer(Some(hwnd), id) };
+                    animation_timer = None;
+                }
+                _ => {}
+            }
+        }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
         if close_requested_windows(&mut app, &mut windows)? {
@@ -372,13 +481,25 @@ fn apply_event(
     let to_logical = |x: i32, y: i32| {
         crate::math::Point::new(scale.to_logical(x as f32), scale.to_logical(y as f32))
     };
+    let modifiers = native.state_mut().modifiers();
     let app_event = match event {
         PlatformEvent::Pointer { x, y, kind } => {
             let position = to_logical(x, y);
             let input = match kind {
-                PointerKind::Move => InputEvent::PointerMove { position },
-                PointerKind::Down(button) => InputEvent::PointerDown { position, button },
-                PointerKind::Up(button) => InputEvent::PointerUp { position, button },
+                PointerKind::Move => InputEvent::PointerMove {
+                    position,
+                    modifiers,
+                },
+                PointerKind::Down(button) => InputEvent::PointerDown {
+                    position,
+                    button,
+                    modifiers,
+                },
+                PointerKind::Up(button) => InputEvent::PointerUp {
+                    position,
+                    button,
+                    modifiers,
+                },
             };
             Event::Input(input)
         }
@@ -391,7 +512,9 @@ fn apply_event(
             position: to_logical(x, y),
             delta_x: dx_ticks,
             delta_y: dy_ticks,
+            modifiers,
         }),
+        PlatformEvent::PointerLeave => Event::Input(InputEvent::PointerLeave),
         PlatformEvent::Key { key, state } => Event::Input(InputEvent::Key {
             key,
             state,

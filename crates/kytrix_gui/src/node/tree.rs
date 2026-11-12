@@ -13,6 +13,8 @@ use smol_str::SmolStr;
 
 use crate::{
     error::EngineError,
+    event::Action,
+    interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
     layout::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, hit_test},
@@ -95,6 +97,9 @@ pub(crate) struct NodeSpec {
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
     paint: Option<Box<PaintSpec>>,
     debug_id: Option<SmolStr>,
+    action: Option<Action>,
+    drag: Option<Action>,
+    focus_ring: Option<crate::paint::style::FocusRing>,
 }
 
 impl NodeSpec {
@@ -113,7 +118,25 @@ impl NodeSpec {
             bind_text: None,
             paint: None,
             debug_id: None,
+            action: None,
+            drag: None,
+            focus_ring: None,
         }
+    }
+
+    pub(crate) fn with_focus_ring(mut self, ring: crate::paint::style::FocusRing) -> Self {
+        self.focus_ring = Some(ring);
+        self
+    }
+
+    pub(crate) fn with_action(mut self, action: Action) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    pub(crate) fn with_drag(mut self, action: Action) -> Self {
+        self.drag = Some(action);
+        self
     }
 
     pub(crate) fn with_paint(mut self, paint: PaintSpec) -> Self {
@@ -201,6 +224,12 @@ pub struct Node {
     /// 上次求值实际读过的信号（差分清理用；`replace_deps` 的 `old`）。
     deps: SmallVec<[SignalId; 8]>,
     dirty: DirtyFlags,
+    /// 交互槽（点击/拖拽声明、滚动、虚拟列表、浮层）；`None` = 非交互节点。
+    ///
+    /// 一个 `Box` 装下全部字段（`Node` 只 +8 B，P10 预算 1136 ≤ 1152）。
+    interaction: Option<Box<NodeInteraction>>,
+    /// 该节点 lane 上次生成时的**累计滚动偏移**（paint 的复用判据，§7.6）。`Point::ZERO` = 未滚动。
+    lane_offset: Point,
 }
 
 /// **手写 `Debug`**（N4）：`bind_style` / `measure` / `hit_shape` 是闭包（不实现 `Debug`），
@@ -233,6 +262,8 @@ impl fmt::Debug for Node {
             .field("lanes", &self.lanes)
             .field("deps", &self.deps)
             .field("dirty", &self.dirty)
+            .field("interaction", &self.interaction)
+            .field("lane_offset", &self.lane_offset)
             .finish()
     }
 }
@@ -316,7 +347,7 @@ impl Node {
         self.hit_shape.as_deref()
     }
 
-    /// 布局覆盖（P13 的分栏拖拽；`None` = 由 taffy 决定）。
+    /// 布局覆盖（P10 的拖拽/分栏手柄；`None` = 由 taffy 决定）。
     #[must_use]
     pub fn layout_override(&self) -> Option<LayoutOverride> {
         self.layout_override
@@ -496,6 +527,8 @@ impl NodeTree {
             lanes: SmallVec::new(),
             deps: SmallVec::new(),
             dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
+            interaction: None,
+            lane_offset: Point::ZERO,
         });
         Self {
             arena,
@@ -653,7 +686,17 @@ impl NodeTree {
             bind_text,
             paint,
             debug_id,
+            action,
+            drag,
+            focus_ring,
         } = spec;
+        let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
+            let mut slot = NodeInteraction::new();
+            slot.action = action;
+            slot.drag = drag;
+            slot.focus_ring = focus_ring;
+            Box::new(slot)
+        });
         let id = self.arena.insert_with(move |id| Node {
             id,
             parent: None,
@@ -679,6 +722,8 @@ impl NodeTree {
             lanes: SmallVec::new(),
             deps: SmallVec::new(),
             dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
+            interaction,
+            lane_offset: Point::ZERO,
         });
         // 槽位复用：上一代节点的 taffy 缓存必须丢弃，否则新节点继承陈旧布局（P04 §6.1）。
         let index = id.index() as usize;
@@ -946,7 +991,7 @@ impl NodeTree {
         Ok(())
     }
 
-    /// 更新布局覆盖矩形（P13 的分栏拖拽）：写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 缓存。
+    /// 更新布局覆盖矩形（P10 的拖拽/分栏手柄）：写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 缓存。
     ///
     /// # Errors
     /// `EngineError::StaleNode { node }`：句柄陈旧。
@@ -1177,10 +1222,137 @@ impl NodeTree {
 
     /// 命中测试（逆绘制序 + clip 链 + `hit_shape`）。
     ///
-    /// 消费者：P10 的事件分发、P13 的 `Overlay`、P14 的 a11y hit test（P04 的用例也用它）。
+    /// 消费者：P10 的事件分发、P10 的 `Overlay`、P11 的 a11y hit test（P04 的用例也用它）。
     #[must_use]
     pub fn hit_test(&self, point: Point) -> Option<HitResult> {
         hit_test(self, point)
+    }
+
+    // ── P10：交互槽的读写（消费者：`interaction/**`、`app.rs::dispatch_input`、`paint/pass.rs`） ──
+
+    /// 交互槽（`None` = 非交互节点）。
+    #[must_use]
+    pub(crate) fn interaction(&self, node: NodeId) -> Option<&NodeInteraction> {
+        self.arena
+            .get(node)
+            .and_then(|target| target.interaction.as_deref())
+    }
+
+    /// 确保交互槽存在（滚动 / 虚拟列表 / 浮层在挂载后挂槽的唯一入口）。
+    pub(crate) fn ensure_interaction(&mut self, node: NodeId) -> Option<&mut NodeInteraction> {
+        self.arena
+            .get_mut(node)
+            .map(|target| {
+                target
+                    .interaction
+                    .get_or_insert_with(|| Box::new(NodeInteraction::new()))
+            })
+            .map(Box::as_mut)
+    }
+
+    /// 该节点是否可成为命中目标（`interactive == Some(false)` ⇒ 否；子节点照旧）。
+    #[must_use]
+    pub(crate) fn is_hittable(&self, node: NodeId) -> bool {
+        self.arena
+            .get(node)
+            .is_some_and(|target| target.style_patch.interactive != Some(false))
+    }
+
+    /// 焦点环（`None` = 不画）。
+    #[must_use]
+    pub(crate) fn focus_ring(&self, node: NodeId) -> Option<crate::paint::style::FocusRing> {
+        self.interaction(node).and_then(|slot| slot.focus_ring)
+    }
+
+    /// 该节点是否被显式标为可交互（`interactive == Some(true)`）。
+    #[must_use]
+    pub(crate) fn is_explicitly_interactive(&self, node: NodeId) -> bool {
+        self.arena
+            .get(node)
+            .is_some_and(|target| target.style_patch.interactive == Some(true))
+    }
+
+    /// 滚动槽（`None` = 不是滚动容器）。
+    #[must_use]
+    pub(crate) fn scroll_slot(&self, node: NodeId) -> Option<ScrollSlot> {
+        self.interaction(node).and_then(|slot| slot.scroll)
+    }
+
+    /// 滚动槽的可写引用。
+    pub(crate) fn scroll_slot_mut(&mut self, node: NodeId) -> Option<&mut ScrollSlot> {
+        self.ensure_interaction(node)
+            .and_then(|slot| slot.scroll.as_mut())
+    }
+
+    /// 该节点 lane 上次生成时的累计滚动偏移（paint 的复用判据）。
+    #[must_use]
+    pub(crate) fn lane_offset(&self, node: NodeId) -> Point {
+        self.arena
+            .get(node)
+            .map_or(Point::ZERO, |target| target.lane_offset)
+    }
+
+    /// 写 lane 的偏移戳（paint 重建 lane 时调用）。
+    pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: Point) {
+        if let Some(target) = self.arena.get_mut(node) {
+            target.lane_offset = offset;
+        }
+    }
+
+    /// 浮层槽（`None` = 不是浮层）。
+    #[must_use]
+    pub(crate) fn overlay_slot(&self, node: NodeId) -> Option<OverlaySlot> {
+        self.interaction(node).and_then(|slot| slot.overlay)
+    }
+
+    /// 虚拟列表槽。
+    #[must_use]
+    pub(crate) fn virtual_slot(&self, node: NodeId) -> Option<&VirtualSlot> {
+        self.interaction(node)
+            .and_then(|slot| slot.virtual_list.as_ref())
+    }
+
+    /// 虚拟列表槽的可写引用。
+    pub(crate) fn virtual_slot_mut(&mut self, node: NodeId) -> Option<&mut VirtualSlot> {
+        self.ensure_interaction(node)
+            .and_then(|slot| slot.virtual_list.as_mut())
+    }
+
+    /// 写一行虚拟列表的绝对定位（`left: 0 / right: 0 / top: i*extent / height: extent`）。
+    ///
+    /// 只碰 taffy 样式里「行位置」的四个字段（应用的行子树不受影响），随后走 `invalidate_layout`
+    /// （`LAYOUT|PAINT` + 冒泡 + 清缓存）。
+    pub(crate) fn set_virtual_row(&mut self, node: NodeId, top: f32, height: f32) -> bool {
+        let Some(target) = self.arena.get_mut(node) else {
+            return false;
+        };
+        target.style.inner.position = taffy::style::Position::Absolute;
+        target.style.inner.inset = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(0.0),
+            right: taffy::style::LengthPercentageAuto::length(0.0),
+            top: taffy::style::LengthPercentageAuto::length(top),
+            bottom: taffy::style::LengthPercentageAuto::auto(),
+        };
+        target.style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::auto(),
+            height: taffy::style::Dimension::length(height),
+        };
+        self.invalidate_layout(node)
+    }
+
+    /// 写绝对定位节点的左上角（浮层定位；只碰 `inset.left/top`）。
+    pub(crate) fn set_absolute_inset(&mut self, node: NodeId, origin: Point) -> bool {
+        let Some(target) = self.arena.get_mut(node) else {
+            return false;
+        };
+        target.style.inner.position = taffy::style::Position::Absolute;
+        target.style.inner.inset = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(origin.x),
+            right: taffy::style::LengthPercentageAuto::auto(),
+            top: taffy::style::LengthPercentageAuto::length(origin.y),
+            bottom: taffy::style::LengthPercentageAuto::auto(),
+        };
+        self.invalidate_layout(node)
     }
 
     // ── P04：taffy 低级 trait 的访问器（消费者：`layout::taffy_tree` / `layout::hit_test`） ──
@@ -2282,8 +2454,8 @@ mod tests {
             "Node 超预算：{size} B（备选 style: Box<Style>）"
         );
         assert!(
-            size <= 1128,
-            "P06 的预算是 1128（paint 8 + content_offset 8）；超了要更新设计"
+            size <= 1144,
+            "P10 的预算是 1144（P06 的 1128 + interaction 8 + lane_offset 8）；超了要更新设计"
         );
     }
 }

@@ -13,6 +13,8 @@ snapshot = ["dep:image", "kytrix_gui/test-support"]
 [dependencies]
 kytrix_gui = { workspace = true }
 tokio = { workspace = true }
+# P10：demo 的滚动容器/布局常量需要声明 taffy 样式（引擎 `Style.inner` 的类型）。
+taffy = { workspace = true }
 image = { workspace = true, optional = true }
 
 [lints]

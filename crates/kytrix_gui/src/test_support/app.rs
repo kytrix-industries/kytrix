@@ -3,8 +3,9 @@
 //! `TestApp::new()` 的 renderer 恒为 `None`：`Scene` 照常生成、记录照常抓取、present 是 no-op。
 //! `drain()` 是**唯一**帧推进原语：一次最多一帧，不做「等到没事干」的隐式阻塞（设计 §6.2）。
 
+use std::time::Duration;
+
 use super::{
-    input::InputOutcome,
     probe::Probe,
     record::{FrameRecord, RenderedFrame},
     snapshot::{SnapshotCase, SnapshotError, SnapshotImage},
@@ -12,7 +13,7 @@ use super::{
 use crate::{
     app::App,
     error::EngineError,
-    event::InputEvent,
+    event::{InputEvent, InputOutcome},
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -121,14 +122,14 @@ impl TestApp {
         Probe::new(window.tree())
     }
 
-    /// 注入一个输入事件（P06 只做命中；无位置的事件不产生命中）。
+    /// 注入一个输入事件：走**与平台泵相同**的 `App::dispatch_input`（命中 / 焦点 / 拖拽 / 动作 / 滚动）。
     pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
-        let hit = event.position().and_then(|point| {
-            self.app
-                .window(self.window)
-                .and_then(|window| window.tree().hit_test(point))
-        });
-        InputOutcome { hit }
+        self.app.dispatch_input(self.window, event)
+    }
+
+    /// 推进测试时钟（双击窗口 / 动画 / 拖拽时间都读它；不改任何状态）。
+    pub fn advance(&mut self, by: Duration) {
+        self.app.advance_clock(by);
     }
 
     /// 强制整棵树的 lane 失效（oracle 的「全量」路径）。
@@ -271,16 +272,6 @@ impl TestWindow<'_> {
     pub fn probe(&self) -> Probe<'_> {
         let window = self.app.window(self.id).expect("window must exist");
         Probe::new(window.tree())
-    }
-
-    /// 注入事件（P06 只做命中；无位置的事件不产生命中）。
-    pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
-        let hit = event.position().and_then(|point| {
-            self.app
-                .window(self.id)
-                .and_then(|window| window.tree().hit_test(point))
-        });
-        InputOutcome { hit }
     }
 }
 
@@ -589,3 +580,330 @@ mod tests {
     }
 }
 
+/// P10 的端到端用例（`TestApp::inject` 走与平台泵相同的分发路径）。
+#[cfg(test)]
+mod p10_tests {
+    use super::TestApp;
+    use crate::{
+        event::{Action, InputEvent, Key, KeyState, Modifiers, PointerButton},
+        math::{Point, Rect},
+        node::builder::NodeBuilder,
+        paint::style::{Clip, PaintSpec, Style, StylePatch},
+    };
+
+    fn app_with_button() -> (TestApp, crate::node::id::NodeId) {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .layout_override(Rect::new(10.0, 10.0, 60.0, 40.0))
+            .paint(PaintSpec {
+                background: crate::paint::color::Color::from_rgba8([10, 20, 30, 255]),
+                ..PaintSpec::default()
+            })
+            .on_click(Action::custom("press"))
+            .build(tree, root)
+            .expect("mount");
+        app.app_mut().on_action(Action::custom("press"), |_ctx| {});
+        app.drain().expect("first frame");
+        (app, node)
+    }
+
+    #[test]
+    fn inject_click_reports_the_action_and_the_target() {
+        let (mut app, node) = app_with_button();
+        app.inject(InputEvent::PointerDown {
+            position: Point::new(20.0, 20.0),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+        });
+        let outcome = app.inject(InputEvent::PointerUp {
+            position: Point::new(20.0, 20.0),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+        });
+
+        assert_eq!(outcome.hit.map(|hit| hit.node), Some(node));
+        assert_eq!(outcome.action, Some(Action::custom("press")));
+        assert_eq!(outcome.target, Some(node));
+        assert_eq!(outcome.click_count, 1);
+    }
+
+    #[test]
+    fn inject_scroll_only_damages_the_viewport() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let mut style = Style::default();
+        style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(100.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(tree, root)
+            .expect("mount");
+        for index in 0..4 {
+            let _ = NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 40.0, 100.0, 40.0))
+                .paint(PaintSpec {
+                    background: crate::paint::color::Color::from_rgba8([
+                        index as u8 * 10 + 1,
+                        0,
+                        0,
+                        255,
+                    ]),
+                    ..PaintSpec::default()
+                })
+                .build(tree, container);
+        }
+        app.drain().expect("first frame");
+        let handle = app
+            .app_mut()
+            .make_scroll(
+                window,
+                container,
+                crate::interaction::ScrollConfig::default(),
+            )
+            .expect("scroll");
+        app.app_mut()
+            .set_scroll_content(&handle, crate::math::Size::new(100.0, 160.0))
+            .expect("content");
+        app.app_mut()
+            .scroll_to(&handle, Point::new(0.0, 40.0))
+            .expect("scroll");
+        let record = app.drain().expect("scroll frame");
+
+        // 视口 100×100（物理像素）+ AA 外扩 1 px（`DamageAccumulator::push` 的固定外扩）。
+        let allowed = crate::math::PhysicalRect::new(-1, -1, 101, 101);
+        assert!(!record.damage.is_empty(), "滚动必须产生 damage");
+        for rect in &record.damage {
+            assert!(
+                rect.intersect(allowed) == *rect,
+                "damage 必须落在视口（含 1px AA 外扩）内：{rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_double_click_reports_two() {
+        let (mut app, node) = app_with_button();
+        let click = |app: &mut TestApp| {
+            app.inject(InputEvent::PointerDown {
+                position: Point::new(20.0, 20.0),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::empty(),
+            });
+            app.inject(InputEvent::PointerUp {
+                position: Point::new(20.0, 20.0),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::empty(),
+            })
+        };
+
+        assert_eq!(click(&mut app).click_count, 1);
+        app.advance(std::time::Duration::from_millis(200));
+        assert_eq!(click(&mut app).click_count, 2, "200ms 内同点 = 双击");
+        app.advance(std::time::Duration::from_millis(600));
+        assert_eq!(click(&mut app).click_count, 1, "超时后重新计数");
+        let _ = node;
+    }
+
+    #[test]
+    fn animation_reaches_idle_after_the_last_frame() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let transient = app.app_mut().transient(0.0_f32);
+        app.app_mut()
+            .animate(
+                window,
+                crate::interaction::AnimatedValue::Scalar {
+                    target: transient,
+                    to: 1.0,
+                },
+                &[],
+                crate::interaction::AnimationSpec {
+                    duration: std::time::Duration::from_millis(50),
+                    easing: crate::interaction::Easing::Linear,
+                },
+            )
+            .expect("animate");
+        app.drain().expect("animation frame");
+        app.advance(std::time::Duration::from_millis(60));
+        app.drain().expect("final frame");
+
+        assert_eq!(app.app().read_transient(&transient), 1.0);
+        assert!(!app.app().animations_running(window));
+        // 再推进一帧：没有脏位 ⇒ Idle（不提交、FrameIndex 不变）。
+        let before = app.app().window(window).expect("window").frame_index();
+        app.drain().expect("idle frame");
+        let after = app.app().window(window).expect("window").frame_index();
+        assert_eq!(before, after, "动画结束后必须回到空闲零帧");
+    }
+
+    #[test]
+    fn tab_focus_is_visible_through_the_probe() {
+        let (_app_unused, _node_unused) = app_with_button();
+        let (mut app, node) = app_with_button();
+        app.inject(InputEvent::Key {
+            key: Key::Tab,
+            state: KeyState::Down,
+            modifiers: Modifiers::empty(),
+        });
+        assert_eq!(app.app().focused(app.window_id()), Some(node));
+        assert!(
+            !app.app()
+                .window(app.window_id())
+                .expect("window")
+                .tree()
+                .get(node)
+                .expect("node")
+                .dirty()
+                .contains(crate::node::dirty::DirtyFlags::PAINT)
+        );
+        let _ = StylePatch::default();
+    }
+    #[test]
+    fn nested_scroll_damage_is_in_screen_coordinates() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let mut outer_style = Style::default();
+        outer_style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(200.0),
+        };
+        outer_style.clip = Clip::Bounds;
+        let outer = NodeBuilder::boxed()
+            .style(outer_style)
+            .build(tree, root)
+            .expect("outer");
+        let mut inner_style = Style::default();
+        inner_style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(200.0),
+        };
+        inner_style.inner.margin = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(0.0),
+            right: taffy::style::LengthPercentageAuto::length(0.0),
+            top: taffy::style::LengthPercentageAuto::length(100.0),
+            bottom: taffy::style::LengthPercentageAuto::length(0.0),
+        };
+        inner_style.clip = Clip::Bounds;
+        let inner = NodeBuilder::boxed()
+            .style(inner_style)
+            .build(tree, outer)
+            .expect("inner");
+        for index in 0..6 {
+            let _ = NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 40.0, 200.0, 40.0))
+                .paint(PaintSpec {
+                    background: crate::paint::color::Color::from_rgba8([
+                        index as u8 + 1,
+                        0,
+                        0,
+                        255,
+                    ]),
+                    ..PaintSpec::default()
+                })
+                .build(tree, inner);
+        }
+        app.drain().expect("first frame");
+
+        let outer_handle = app
+            .app_mut()
+            .make_scroll(window, outer, crate::interaction::ScrollConfig::default())
+            .expect("outer scroll");
+        app.app_mut()
+            .set_scroll_content(&outer_handle, crate::math::Size::new(200.0, 400.0))
+            .expect("outer content");
+        let inner_handle = app
+            .app_mut()
+            .make_scroll(window, inner, crate::interaction::ScrollConfig::default())
+            .expect("inner scroll");
+        app.app_mut()
+            .set_scroll_content(&inner_handle, crate::math::Size::new(200.0, 240.0))
+            .expect("inner content");
+        // 外层先滚 30（内层屏幕 y = 100 − 30 = 70），把这一帧的 damage 消费掉。
+        app.app_mut()
+            .scroll_to(&outer_handle, Point::new(0.0, 30.0))
+            .expect("outer scroll");
+        let _ = app.drain().expect("outer frame");
+
+        app.app_mut()
+            .scroll_to(&inner_handle, Point::new(0.0, 10.0))
+            .expect("inner scroll");
+        let record = app.drain().expect("inner frame");
+
+        // 内层视口在屏幕上 = (0, 70, 200, 70+200) + 1 px AA 外扩。
+        let allowed = crate::math::PhysicalRect::new(-1, 69, 201, 271);
+        assert!(!record.damage.is_empty(), "内层滚动必须产生 damage");
+        for rect in &record.damage {
+            assert!(
+                rect.intersect(allowed) == *rect,
+                "嵌套滚动的 damage 必须在**屏幕**坐标内：{rect:?}"
+            );
+        }
+        assert!(
+            record
+                .damage
+                .iter()
+                .any(|rect| (69..=71).contains(&rect.y0)),
+            "damage 顶部必须落在内层视口的屏幕位置：{:?}",
+            record.damage
+        );
+    }
+
+    #[test]
+    fn clearing_focus_damages_the_ring_outset() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let ringed = NodeBuilder::boxed()
+            .layout_override(Rect::new(10.0, 10.0, 40.0, 40.0))
+            .paint(PaintSpec {
+                background: crate::paint::color::Color::from_rgba8([9, 9, 9, 255]),
+                ..PaintSpec::default()
+            })
+            .on_click(Action::custom("a"))
+            .focus_ring(crate::paint::style::FocusRing::new(
+                2.0,
+                2.0,
+                crate::paint::color::Color::from_rgba8([0, 120, 255, 255]),
+            ))
+            .build(tree, root)
+            .expect("ringed");
+        let other = NodeBuilder::boxed()
+            .layout_override(Rect::new(100.0, 10.0, 40.0, 40.0))
+            .on_click(Action::custom("b"))
+            .build(tree, root)
+            .expect("other");
+        app.drain().expect("first frame");
+        app.app_mut()
+            .set_focus(window, Some(ringed))
+            .then_some(())
+            .expect("focus");
+        let _ = app.drain().expect("focus frame");
+
+        app.app_mut()
+            .set_focus(window, Some(other))
+            .then_some(())
+            .expect("move focus");
+        let record = app.drain().expect("unfocus frame");
+
+        // 环外扩 = bounds.outset(offset 2 + width 2) ⇒ (6, 6, 48, 48) → 物理像素覆盖 (6,6)-(54,54)。
+        assert!(
+            record
+                .damage
+                .iter()
+                .any(|rect| rect.x0 <= 6 && rect.y0 <= 6 && rect.x1 >= 54 && rect.y1 >= 54),
+            "清焦点时必须把环的外扩并入 damage（否则残留 1px）：{:?}",
+            record.damage
+        );
+    }
+}

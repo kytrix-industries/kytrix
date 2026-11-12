@@ -32,6 +32,12 @@ const CLASS_NAME: &str = "KytrixGuiWindow";
 /// 最小客户区（逻辑像素；`WM_GETMINMAXINFO` 换算成物理像素后生效）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
+/// 类光标（`IDC_ARROW`）：probe 实测「类光标 = null + `HTCLIENT`」会得到**空光标**（不可见）。
+fn load_arrow_cursor() -> HCURSOR {
+    // SAFETY: 共享的系统光标句柄（进程不拥有）；`IDC_ARROW` 是静态常量。
+    unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default()
+}
+
 /// 一个原生窗口（`Application::run` 持有；`Drop` 时销毁）。
 pub(crate) struct NativeWindow {
     id: WindowId,
@@ -286,7 +292,9 @@ fn register_class(instance: windows::Win32::Foundation::HMODULE) -> Result<(), E
         cbWndExtra: 0,
         hInstance: instance.into(),
         hIcon: HICON::default(),
-        hCursor: HCURSOR::default(),
+        // 类光标必须是箭头：probe 实测「类光标 = null + HTCLIENT」会得到**空光标**（不可见），
+        // 而 `DefWindowProcW` 会用类光标兜底客户区与非客户区（P10 F-96）。
+        hCursor: load_arrow_cursor(),
         // 引擎自己画每一帧：不擦背景，避免 `WM_ERASEBKGND` 闪白。
         hbrBackground: HBRUSH::default(),
         lpszMenuName: windows::core::PCWSTR::null(),

@@ -8,6 +8,7 @@ use smol_str::SmolStr;
 
 use crate::{
     error::EngineError,
+    event::Action,
     layout::{LayoutOverride, MeasureFn},
     math::{Point, Rect},
     node::{
@@ -37,6 +38,9 @@ pub struct NodeBuilder {
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
     paint: Option<PaintSpec>,
     debug_id: Option<SmolStr>,
+    action: Option<Action>,
+    drag: Option<Action>,
+    focus_ring: Option<crate::paint::style::FocusRing>,
 }
 
 impl Default for NodeBuilder {
@@ -59,7 +63,45 @@ impl NodeBuilder {
             bind_text: None,
             paint: None,
             debug_id: None,
+            action: None,
+            drag: None,
+            focus_ring: None,
         }
+    }
+
+    /// 焦点环（P10）：该节点获得焦点后由 paint 在**它自己的 lane 内**画一圈（受祖先 clip 约束）。
+    #[must_use]
+    pub fn focus_ring(mut self, ring: crate::paint::style::FocusRing) -> Self {
+        self.focus_ring = Some(ring);
+        self
+    }
+
+    /// 声明**动作**：指针点击，以及焦点节点的 Enter/Space 激活，都会分发它（`event::Action`）。
+    ///
+    /// 与 [`NodeBuilder::on_action`] 写同一个槽（后写覆盖）：`on_click` 是指针语义的拼写，`on_action` 是
+    /// 通用拼写（键盘 / a11y 激活读的是同一个声明）。动作按「命中节点 → 祖先」冒泡取第一条，
+    /// `interactive: Some(false)` 处停止。
+    #[must_use]
+    pub fn on_click(mut self, action: Action) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    /// 声明**动作**的通用拼写（与 [`NodeBuilder::on_click`] 同槽）。
+    #[must_use]
+    pub fn on_action(mut self, action: Action) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    /// 声明**拖拽动作**：按下即开启会话，移动/抬起按 `ActionSource::Drag` 分发它。
+    ///
+    /// 引擎不改受拖拽节点的布局 —— 分栏/平移的几何由应用在 handler 里写
+    /// （`LayoutOverride` 或 `Signal`）。
+    #[must_use]
+    pub fn on_drag(mut self, action: Action) -> Self {
+        self.drag = Some(action);
+        self
     }
 
     /// 自绘节点：挂载时提交画布内容（P02 的 `Canvas`）。
@@ -217,6 +259,15 @@ impl NodeBuilder {
         }
         if let Some(debug_id) = self.debug_id {
             spec = spec.with_debug_id(debug_id);
+        }
+        if let Some(action) = self.action {
+            spec = spec.with_action(action);
+        }
+        if let Some(drag) = self.drag {
+            spec = spec.with_drag(drag);
+        }
+        if let Some(ring) = self.focus_ring {
+            spec = spec.with_focus_ring(ring);
         }
         tree.insert_child(parent, spec)
     }

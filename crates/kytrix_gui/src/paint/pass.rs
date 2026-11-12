@@ -43,6 +43,8 @@ pub(crate) struct PaintPass<'a> {
     pub frame: PhysicalRect,
     /// 本帧的 lane 绘制序（复用调用方的容量）。
     pub order: &'a mut Vec<LaneId>,
+    /// 本帧的焦点节点（画 `Style.focus_ring`；`None` = 无焦点）。
+    pub focused: Option<NodeId>,
     /// lane 重建/复用记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
@@ -76,13 +78,14 @@ impl PaintPass<'_> {
             damage,
             scale,
             order,
+            focused: self.focused,
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
-        paint_node(&mut context, root, false, &mut clip);
+        paint_node(&mut context, root, false, &mut clip, Point::ZERO);
         context.scene.set_order(context.order);
         let damage = context.damage.finish(frame);
         PaintReport {
@@ -103,6 +106,7 @@ struct PaintContext<'a> {
     damage: &'a mut DamageAccumulator,
     scale: Scale,
     order: &'a mut Vec<LaneId>,
+    focused: Option<NodeId>,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
@@ -160,6 +164,7 @@ fn paint_node(
     node: NodeId,
     parent_hidden: bool,
     clip: &mut ClipContext,
+    offset: Point,
 ) {
     let Ok(target) = context.tree.get(node) else {
         return;
@@ -167,14 +172,16 @@ fn paint_node(
     let hidden =
         parent_hidden || matches!(target.style().inner.display, taffy::style::Display::None);
     if hidden {
-        hide_subtree(context, node, clip);
+        hide_subtree(context, node, clip, offset);
         return;
     }
     let current_key = clip.key();
-    // 复用判据（§5.6）：`REUSABLE` + clip 上下文一致。**不要求** lane 存在：从未产生图元的节点
-    // 没有 lane，但它的 `clip_key` 已写回，仍可整帧跳过（否则空节点每帧都要重建）。
+    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **滚动偏移戳一致**（祖先滚动会移动
+    // 全部后代图元，因此偏移变化必须重建）。**不要求** lane 存在：从未产生图元的节点没有 lane，
+    // 但它的 `clip_key` 已写回，仍可整帧跳过（否则空节点每帧都要重建）。
     let reusable = target.dirty().contains(DirtyFlags::REUSABLE)
-        && context.tree.clip_key(node) == Some(current_key);
+        && context.tree.clip_key(node) == Some(current_key)
+        && context.tree.lane_offset(node) == offset;
 
     if reusable {
         if let Some(lane) = context.tree.lane_of(node) {
@@ -194,7 +201,7 @@ fn paint_node(
             }
         }
     } else {
-        rebuild_lane(context, node, clip);
+        rebuild_lane(context, node, clip, offset);
     }
 
     let (children, clip_bounds) = {
@@ -204,15 +211,26 @@ fn paint_node(
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
         // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
         // damage 全部被裁空，与 `hit_test` 的 clip 链语义一致；跳过它会让子内容"越界可见"。
-        let clip_bounds = (target.clip() == Clip::Bounds)
-            .then(|| target.layout().bounds.inset(target.layout().border));
+        let clip_bounds = (target.clip() == Clip::Bounds).then(|| {
+            target
+                .layout()
+                .bounds
+                .translate(negate(offset))
+                .inset(target.layout().border)
+        });
         (children, clip_bounds)
     };
     if let Some(padding_box) = clip_bounds {
         clip.push(padding_box, context.scale);
     }
+    // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
+    let child_offset = offset
+        + context
+            .tree
+            .scroll_slot(node)
+            .map_or(Point::ZERO, |slot| slot.offset);
     for child in children {
-        paint_node(context, child, false, clip);
+        paint_node(context, child, false, clip, child_offset);
     }
     if clip_bounds.is_some() {
         clip.pop(context.scale);
@@ -221,14 +239,23 @@ fn paint_node(
 
 /// 隐藏子树：清空每条 lane（保留分配），并把旧像素并入 damage；`clip_key` 置空
 /// （再次显示时必然失配 ⇒ 重建，避免"复用空 lane"）。
-fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext) {
-    let (children, damage_rect) = {
+fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, offset: Point) {
+    let (children, damage_rect, child_offset) = {
         let Ok(target) = context.tree.get(node) else {
             return;
         };
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
-        let damage_rect = target.damage().union(target.layout().bounds);
-        (children, damage_rect)
+        // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
+        let damage_rect = target
+            .damage()
+            .union(target.layout().bounds)
+            .translate(negate(offset));
+        let child_offset = offset
+            + context
+                .tree
+                .scroll_slot(node)
+                .map_or(Point::ZERO, |slot| slot.offset);
+        (children, damage_rect, child_offset)
     };
     if let Some(lane) = context.tree.lane_of(node) {
         let had_primitives = context
@@ -253,11 +280,11 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     context.tree.clear_paint(node);
     context.damage.push(damage_rect, 1.0, clip.covering);
     for child in children {
-        hide_subtree(context, child, clip);
+        hide_subtree(context, child, clip, child_offset);
     }
 }
 
-fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext) {
+fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, offset: Point) {
     #[cfg(feature = "test-support")]
     let created = context.tree.lane_of(node).is_none();
     let lane = match context.tree.lane_of(node) {
@@ -276,7 +303,7 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
             .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
     }
 
-    let (bounds, content_offset, patch, spec, content, node_damage) = {
+    let (bounds, content_offset, patch, spec, content, node_damage, ring) = {
         let Ok(target) = context.tree.get(node) else {
             return;
         };
@@ -286,12 +313,24 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
             NodeKind::Canvas(canvas) => Content::Canvas(Box::new(canvas.clone())),
             NodeKind::Geometry(id) => Content::Geometry(*id),
         };
-        let bounds = target.layout().bounds;
+        // 屏幕坐标 = 内容坐标 − 祖先滚动偏移（P10 §7.2）。
+        let bounds = target.layout().bounds.translate(negate(offset));
         let patch = target.style_patch().clone();
         let spec = target.paint_spec().cloned();
         let node_damage = target.damage();
         let content_offset = context.tree.content_offset(node);
-        (bounds, content_offset, patch, spec, content, node_damage)
+        let ring = (context.focused == Some(node))
+            .then(|| context.tree.focus_ring(node))
+            .flatten();
+        (
+            bounds,
+            content_offset,
+            patch,
+            spec,
+            content,
+            node_damage,
+            ring,
+        )
     };
 
     let mut emitter = PrimitiveEmitter {
@@ -305,6 +344,8 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         content,
         emitted: 0,
         node_damage,
+        offset,
+        ring,
     };
     emitter.emit(context);
 
@@ -318,6 +359,7 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         .map_or(0, <[Primitive]>::len);
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
+    context.tree.set_lane_offset(node, offset);
     context.tree.clear_paint(node);
 
     // 「没有东西要画」的节点不留 lane（空 lane 只占 order/内存）：丢弃句柄并释放分配。
@@ -360,8 +402,17 @@ struct PrimitiveEmitter {
     content: Content,
     /// 已 push 的图元数（决定本节点是否计入 `rebuilt`/damage）。
     emitted: usize,
-    /// 本帧累积的节点级 damage（`touch`/`absolutize` 写入）。
+    /// 本帧累积的节点级 damage（**内容坐标**；`touch`/`absolutize` 写入）。
     node_damage: Rect,
+    /// 该节点的祖先滚动偏移（把 `node_damage` 换算到屏幕坐标）。
+    offset: Point,
+    /// 焦点环（仅焦点节点 + `Style.focus_ring` 时存在）。
+    ring: Option<crate::paint::style::FocusRing>,
+}
+
+/// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
+fn negate(offset: Point) -> Point {
+    Point::new(-offset.x, -offset.y)
 }
 
 impl PrimitiveEmitter {
@@ -379,7 +430,8 @@ impl PrimitiveEmitter {
         };
         if !visible || self.bounds.is_empty() {
             if !self.node_damage.is_empty() {
-                context.damage.push(self.node_damage, 1.0, self.clip);
+                let damage = self.node_damage.translate(negate(self.offset));
+                context.damage.push(damage, 1.0, self.clip);
             }
             return;
         }
@@ -476,8 +528,37 @@ impl PrimitiveEmitter {
         }
 
         self.emit_content(context, opacity);
+
+        // 焦点环：在**节点自己的 lane 内**画（受祖先 clip 约束），环在 border box 外侧。
+        if let Some(ring) = self.ring
+            && ring.width > 0.0
+            && !ring.color.with_opacity(opacity).is_transparent()
+        {
+            let mut radii = radii;
+            for radius in &mut radii {
+                *radius += ring.offset;
+            }
+            let bounds = self.bounds.outset(ring.offset);
+            self.push(
+                context,
+                Primitive::Quad(Quad {
+                    bounds,
+                    corner_radius: radii,
+                    paint: QuadPaint::Solid {
+                        fill: Color::TRANSPARENT,
+                        border: Some(crate::paint::primitive::Border {
+                            width: ring.width,
+                            color: ring.color.with_opacity(opacity),
+                        }),
+                    },
+                }),
+            );
+            context.damage.push(bounds, 1.0, self.clip);
+        }
+
         if self.emitted > 0 || !self.node_damage.is_empty() {
-            context.damage.push(self.node_damage, 1.0, self.clip);
+            let damage = self.node_damage.translate(negate(self.offset));
+            context.damage.push(damage, 1.0, self.clip);
         }
     }
 
@@ -601,6 +682,7 @@ mod tests {
                 scale: scale(),
                 frame: frame(),
                 order: &mut self.order,
+                focused: None,
                 #[cfg(feature = "test-support")]
                 log: crate::test_support::record::PaintLog::default(),
             };

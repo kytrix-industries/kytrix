@@ -34,6 +34,29 @@ pub struct Style {
     pub clip: Clip,
 }
 
+/// 焦点环（静态结构：宽度 / 外扩 / 颜色在挂载时解析，主题切换时重挂载）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FocusRing {
+    /// 环宽（逻辑像素；沿 `bounds.outset(offset)` 的内侧展开）。
+    pub width: f32,
+    /// 环相对节点 border box 的外扩（逻辑像素；`0.0` = 贴着节点）。
+    pub offset: f32,
+    /// 环颜色。
+    pub color: Color,
+}
+
+impl FocusRing {
+    /// 便捷构造。
+    #[must_use]
+    pub const fn new(width: f32, offset: f32, color: Color) -> Self {
+        Self {
+            width,
+            offset,
+            color,
+        }
+    }
+}
+
 /// 子树裁剪策略。
 ///
 /// v1 只有矩形（`Bounds`）；圆角裁剪由 P06 的 `CornerRadius` 追加变体。
@@ -98,13 +121,13 @@ pub struct StylePatch {
     pub visible: Option<bool>,
     /// 命中/焦点/Action 开关（`false` = 不可交互，P10/P11）。
     pub interactive: Option<bool>,
-    /// 光标形状（P12 设置平台光标）。
+    /// 光标形状（P10 由平台泵 `SetCursor`；`Default` 交给类光标）。
     pub cursor: Option<Cursor>,
     /// **尺寸会变时必须置 true** → `App` 追加 `LAYOUT` 并向祖先冒泡（§4.9.4 边界情况表）。
     pub affects_layout: bool,
 }
 
-/// 光标形状（P12 映射到平台光标）。
+/// 光标形状（P10 映射到 `IDC_*` 系统光标）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Cursor {
     /// 平台默认箭头。
