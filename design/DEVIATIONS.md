@@ -1273,3 +1273,161 @@
 | V-35 | 不实现 `get_detailed_layout_info` ⇒ grid 容器内的 absolute 子盒按 padding box 定位 | P08 / P13 | 出现真实需求 → additive 存 `DetailedGridInfo<SmolStr>` |
 | V-36 | `ClipChain` 定长 8：超过 8 层的 clip 链被截断（点仍按前 8 层裁剪） | P10 | 与 `MAX_CLIP_DEPTH` 同一上限（shader 固定数组）；`Lane::push` 的 debug 断言先行暴露 |
 | V-37 | 增量正确性依赖「结构变更也清缓存」：`append_child`/`remove` → `mark_structure` → 清 `node..root` | P04 实现 | 用例 `remove_drops_cache_and_hoisted_entries` 固化；P03 的 `mark_structure` 调用点已就位，只需内部接上 `invalidate_caches_upwards` |
+
+## 十、Phase 05 文本子系统（2026-11-12）
+
+> 关联文档：`custom-gui-engine-design.md` §4.5–§4.8 / §5.6 / §9.3 / §2.8；
+> `design/phase-01-foundation.md` §4.1 / §4.5 / 附录 A.2 / A.6；
+> `design/phase-02-paint-foundation.md` §10 / §6.3.2；`design/phase-04-layout.md` §8 / §9；
+> **本阶段详细设计 = `design/phase-05-text.md`**（下文 §N 均指该文件）。
+>
+> **A-01 继续适用**：本节只**追加**，不改写任何历史条目（一～九 未改动）。
+>
+> 事实基线：parley 0.12.0 / fontique 0.12.0 / skrifa 0.44.0 / swash 0.2.10 / etagere 0.3.0 的**本地源码**
+> （`E:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\`，逐字签名与行号见 phase-05 §2.1/§2.2）；
+> 四个仓库外 probe（`%TEMP%\kg-p05-probe`、`kg-p05-font-probe`、`kg-p05-size-probe`，phase-05 §2.4）。
+>
+> 裁决：新增 5 条 F（F-53…F-57）、5 条 S（S-53…S-57）；补齐 S-52 许诺但缺失的 **V-38**（P04 欠账），
+> P05 自己的待复核项从 **V-39** 起（V-39…V-47）。
+
+### F-53 形状缓存键拆成两级：`atlas_generation` **不进**形状键
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §4.5（928 行）：「缓存键：`text + color + font_size + TextStyle + scale + font_stack_version + atlas_generation`」 |
+| 偏差 | 拆成两级：**形状缓存**键 = `(text hash, TextStyle hash, scale, font_stack_version)`，**不含** `atlas_generation`；`atlas_generation` 只进**字形 tile 缓存**键与 `ShapedLine.atlas_generation` 字段（供 `AtlasTile::is_stale` 判定） |
+| 原因 | ①字形 id、advance、baseline、行数全部与图集无关（phase-05 probe ⑤：同一文本的 5 个 run 只取决于字体与 scale）；②`generation` 只在 `clear()` 时 +1（S-11），而 `clear()` 的触发之一是**容量逃逸**——若形状键含它，一次图集满会把**所有**文本 re-shape（`RangedBuilder::build` + 断行），代价远大于重光栅；③P02 §10.6/§3.8 的目标语义是「图集重排 → 依赖节点 `PAINT`」，不是 `LAYOUT` |
+| 修订后设计 | phase-05 §7.2 的两级键表 + §10 的 `GlyphKey { font, glyph, ppem }`；`ShapedLine.atlas_generation` 是唯一把代际带回形状快照的字段（P06 用它判 stale） |
+
+### F-54 `parley::TextStyle` **存在但 P05 不用**；`TextContext` 不公开
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §4.5（893 行）「**Parley 0.12 无 `TextStyle`**，样式单元是 `StyleProperty<'a, B: Brush>`（26 变体）」；同节 898–902 行又给出 `pub struct TextContext { pub font_cx: parley::FontContext, pub layout_cx: parley::LayoutContext, pub font_stack: FontStack }` |
+| 偏差 | ①`parley::style::TextStyle<'family,'settings,B>` 在 0.12.0 **真实存在**（`style/mod.rs:284`，26 个 pub 字段；F-03 已判同一事实）——但它是 `StyleRunBuilder::push_style`（`builder.rs:136`）与 `TreeBuilder::push_style_span`（`builder.rs:237`）的「整段样式」输入，`RangedBuilder` **没有**接受它的方法（`push_default` 只收 `impl Into<StyleProperty>`）；P05 走 `RangedBuilder` + `StyleProperty`，**不**使用 `TextStyle`。②`TextContext` **不公开**（crate 私有，`pub(crate)`） |
+| 原因 | ①P05 的样式是单段平铺（一个节点一个 `TextStyle`），`RangedBuilder` 的 26 个变体足够；`TreeBuilder` 还要自管文本缓冲与 style span 栈，属 Markdown 管线（P15）的形态，现在引入等于两套代码路径（F-03 的「二者取一，不并存」）。②`TextContext` 的字段必然是 `parley::{FontContext, LayoutContext}`，公开即把第三方 crate 拉进公开面（F-35 的同类事件，但更重：`Collection` 的每个方法都要 `&mut self`，公开字段等于把「谁能 shape」交给应用层）；且公开后应用可绕过 `App::refresh_text` 直接 shape，与「`App` 持有字体库/图集」的所有权冲突 |
+| 修订后设计 | ①phase-05 §7.1 的逐字段映射表（`TextStyle → StyleProperty`），`ranged_builder(fcx, text, scale, quantize=true)` 5 参，方向用 `set_base_direction`（F-03 的第 5 参裁决在本阶段落地实现）。②公开面 = `kytrix_gui::text::{TextStyle, FontStack, InlineBoxSpec, ShapedLine, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, TextContent, TextPassReport, TextDiagnostic}` + `App::{font_stack, font_stack_version, set_font_stack, reload_system_fonts, refresh_text, text_diagnostics}`；`TextContext` 不在公开面，phase-01 §4.5 的路径表**无需**新增行。**「无 `TextStyle`」这句按 F-03 视为事实错误，本节不改主设计正文** |
+
+### F-55 `AtlasExhausted` 的落地 Phase 由 P09 改为 **P05**
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §6.2.2 #12：「`AtlasExhausted { kind: AtlasKind }`，实现 Phase **P09**」；P02 §10.6 又说「该变体随分配器在 P05 追加」 |
+| 偏差 | 在 **P05** 落地（payload 逐字不变），P09 只做消费者 |
+| 原因 | 唯一生产者是 `AtlasAllocator::allocate` → `None` 的第二次重试（P02 §10.6 的容量失败路径），而分配器按 P02 裁决 ① 在 P05 落地（phase-05 §9.5）；P09 不产生该错误。与 F-51（`InvalidMeasure` 由 P05 提前到 P04）同一类修订 |
+| 修订后设计 | `error.rs` 加变体 + `all_variants()` 一条；phase-05 §9.5 的失败路径逐字；P01 表 #12 的「实现 Phase」列以本条为准，正文不改 |
+
+### F-56 `invalidate_measure` **不**标 `PAINT`（S-47 的语义缺口）：文本 pass 显式补
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §4.6（939 行）：「系统字体安装/卸载、深浅色切换、语言切换 → `font_stack_version += 1` → 所有文本节点 **`LAYOUT + PAINT`**」；S-47：「P05 的字体栈/文本内容变化 → 对受影响文本节点调 `invalidate_measure`」 |
+| 偏差 | `NodeTree::invalidate_measure`（P04 已落地）只标 `LAYOUT` + 清 `node..root` 缓存，**不**标 `PAINT`（`node/tree.rs:663` 走 `invalidate_layout`）。因此仅调它会让 §4.6 要求的 `PAINT` 丢失 |
+| 原因 | 两条上游要求不等价：`invalidate_measure` 的语义是「布局输入变了」，`PAINT` 的语义是「像素变了」。文本/字体变化**两者都**成立 |
+| 修订后设计 | 文本 pass 用 `NodeTree::invalidate_text_layout(node)`（= `invalidate_measure` + `mark_paint`，phase-05 §13.1/§6.3），`pub(crate)`；字体栈切换遍历所有文本节点调它。`invalidate_measure` 本身**不改**（P04 的公开语义保持） |
+
+### F-57 `parley` 必须开 `complex-scripts` feature
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §5.1 只钉 `parley = "0.12.0"`（默认 features）；主设计 §4.5 说断行由 ICU4X 分析 |
+| 偏差 | `[workspace.dependencies] parley` 改为 `features = ["complex-scripts"]` |
+| 原因 | 不开时 `parley_engine` 的 `word_segmenter()`/`line_segmenter()` 走 `new_for_non_complex_scripts`（`analysis.rs:110-116`、`:153-162`），ICU4X 没有 CJK 词典模型（`icu_segmenter-2.4.0/src/complex/mod.rs:183`），probe 每段中文都向 stderr 打 `ICU4X data error: No segmentation model for complex script: Chinese/Japanese`，并退化到 UAX #29 WB999 的「有无字典都按字符边界」路径（`analysis.rs:681-686`）；`has_word_dictionary() = cfg!(feature = "complex-scripts")`（`analysis.rs:854-855`） |
+| 修订后设计 | phase-05 §17：只改 feature，**不新增依赖**（`Cargo.lock` 不变）；门禁 §16-12 用 `cargo tree -e features` 断言该 feature 生效 |
+
+### S-53 `NodeKind::Text` 的载荷**内联**（`Node` **1088 B**），不做 `Box<TextContent>`
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `NodeKind::Text(TextContent)`，`TextContent { text: SmolStr, style: TextStyle }` **内联**；`Node.text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>`（**胖指针 16 B**）+ `Node.text_measured_size: Size`（8 B）；`Rc<ShapedText>`/`Rc<ShapedLine>` 放 `NodeTree` 的**旁表** `text_slots: Vec<Option<TextSlot>>`（16 B/槽，仿 P04 的 `layout_cache`） |
+| 原因 | probe ③ 实测：`Node` 1016 B、`NodeKind` 48 B（= `Canvas`）、`TextStyle` 72 B、`TextContent` 96 B、`Option<Box<TextContent>>` 8 B。内联 ⇒ `NodeKind` **96 B**（载荷 96 吃掉了 tag/niche：`Canvas` 的 `Vec` 提供 niche，实测）、`Node` = 1016 − 48 + 96 + 16 + 8 = **1088 B** ≤ P04 的 1152 B 上界（余量 64 B）。`Box` 方案回 1040 B 但每个文本节点多一次分配 + 一层解引用；文本节点在 UI 里是常态而非例外 |
+| 代价 | `Node` 从 1016 → **1088 B**（+72 B ≈ 7%）。若 P06/P07 再加字段顶破 1152，改 `NodeKind::Text(Box<TextContent>)` 即可（公开面不变） |
+| 实测校正 | `Option<Box<dyn Fn>>` 是 16 B（`Box<dyn Trait>` = data + vtable），初版文档误记为 8 B；`NodeKind` 实测 **96 B**（不是 104：`TextContent` 的 96 B 载荷吃掉了判别位，`Canvas` 的 `Vec` 提供 niche）⇒ `Node` 实测 **1088 B**；P04 的 `node_and_handle_sizes` 断言**本来就是 `<= 1152`**，不存在 1024 的上界 |
+| 登记 | phase-05 §14.1、§2.4④；`node_and_handle_sizes` 追加 `size_of::<TextContent>() == 96` 与 `size_of::<Node>() <= 1152` |
+
+### S-54 光栅与图集在 **P05** 落地，`PositionedGlyph` 复用 P02 类型
+
+| 项 | 内容 |
+|----|------|
+| 决策 | P05 交付「shape → raster → 装箱」的 CPU 全链：`App::refresh_text` 产出 `ShapedLine`，其中每个字形是 P02 的 `paint::primitive::PositionedGlyph { tile, position, size }`（`position` 为**文本盒局部**坐标）。P06 只做 `ShapedLine → Scene` 的实例编码（加节点原点、组 `GlyphRun`、分 lane） |
+| 原因 | ①若把光栅/图集推到 P06，`render/atlas.rs` 的 11 个 `pub(crate)` item 只有 test 消费者 ⇒ 违反「`pub(crate)` 必须有非 test 消费者」（P02 §3.2 / P03 §4.3 / AGENTS §4），`-D warnings` 直接红；②`ShapedLine` 的自然形态就是「字形 + 图集矩形 + 落点」，P02 §6.3.2 已经冻结了 `PositionedGlyph` 的字段与语义（40 B 实测），再定义一套「未装箱字形」等于两份真相 |
+| 契约细节 | `PositionedGlyph.size` 的契约「`scale * size` 必须是整数」由光栅侧的整数 ppem 保证（phase-05 §8.3）；`position` 在 `ShapedLine` 里是局部坐标，加节点原点后才是 P02 意义的绝对坐标（P06 的责任，phase-05 §5.2 的 rustdoc 写明） |
+| 门禁 | `render/atlas.rs` 的每条 `pub(crate)` 必须在 phase-05 §4.3 表里指向 `text/atlas.rs` 或 `App::refresh_text`（非 test） |
+
+### S-55 `NodeTree::text_selection_rects` 返回 `Vec<Rect>`（**不**用 `SmallVec`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `pub fn text_selection_rects(&self, node: NodeId, anchor: usize, focus: usize) -> Result<Vec<Rect>, EngineError>` |
+| 原因 | P04 §4.2 已确立「不把 `smallvec` 版本写进公开面」（`ClipChain` 用定长结构就是这条）。选区每行一个矩形，行数一般 ≤ 4，但公开面不为此引入第三方类型 |
+| 备选（已否） | 返回 `SmallVec<[Rect; 4]>`（少一次分配）；因公开面纪律否决 |
+| 登记 | phase-05 §12.5、§4.1 |
+
+### S-56 空文本 = `Size::ZERO` + 0 行（parley `""` 是**非零**布局）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `measure` 对 `text.is_empty()` 直接返回 `Size::ZERO`；`ShapedLine` 对空文本产出 `lines: []`、`width/height: 0`、`first_baseline: None` |
+| 原因 | probe 实测（16 px Segoe UI、scale=1）：`text=""` ⇒ `lines()==1`、`width()==4.4453`、`full_width()==4.4453`、`height()==18.0`、`first_baseline()==Some(14.0)`、`items()==0`。即 parley 0.12 对空文本报出一个「有宽度的一行」；直接采信会让空 label 占 4.4 px 宽（布局抖动 + damage 失真）。`" "` 的 4.4453 是真实空格，不受影响 |
+| 代价 | 需要保留高度的应用显式给节点 `Style.size.height`（文档写明） |
+| 用例 | `empty_text_is_zero_size`（phase-05 §15.1 #7）、`raster_space_is_empty`（§15.3 #22） |
+
+### S-57 `NodeBuilder::bind_text` 返回 `SmolStr`（brief 写的是 `String`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `pub fn bind_text(self, f: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static) -> Self`；`Node.text_bind` 同型 |
+| 原因 | AGENTS §2.2：短字符串优先 `SmolStr`、禁止 `format!` → `String` → `SmolStr` 的中转；文本节点的值域绝大多数 ≤ 22 B（内联，零分配），`String` 会每次求值分配一次堆 |
+| 影响 | 应用层写 `bind_text(|cx| format_smolstr!("…"))`；若仲裁要求 `String`，只在闭包出口做一次 `SmolStr::new(&s)`（多一次分配），设计其余部分不变 |
+| 登记 | phase-05 §13.2、§18 裁决项 ② |
+
+### S-58 P05 设计审查（FAIL：B1–B3 + N1–N6）的修正
+
+| 项 | 修正 |
+|---|---|
+| **B1 形状快照失效纪律** | 任何 shape 快照变化（`text` / `TextStyle` 任一字段 / `scale` / `font_stack_version`）**必须**清 `node..root` 的 taffy 缓存；「测得尺寸是否变化」只决定**额外**置不置 `LAYOUT`（没变 → 只 `PAINT`）。实现：`NodeTree::set_text_shaped(node, shaped, measured, size_changed)` 内**无条件** `invalidate_caches_upwards(node)`。反例用例 `text_wrap_change_same_max_width_relayouts`（`Wrap`→`Anywhere`：`widths.max` 相同、`Definite(40)` 的行数不同）；另 `text_same_size_still_clears_cache`（`"ab"`→`"ba"`：尺寸全同、缓存仍重算） |
+| **B2 `FontKey` 稳定性** | `(ptr, len, index)` 不稳定：`ranged_builder` 每次都 `source_cache.prune(128, false)`（`parley/context.rs:109`），Blob 释放后同地址可被复用。修正：`FontEntry { blob: parley::FontData }` **pin 住** `Blob` 的 `Arc`，键改为 `(ptr, len, ttc_index, font_epoch)`；`set_font_stack` / `reload_system_fonts` 时 `font_epoch += 1` + 清 `GlyphRasterizer::fonts` + 清 `GlyphAtlas` + `AtlasSet::glyph_mut().clear()`（字形 tile 不跨字体代际复用） |
+| **B3 `Node` 尺寸与断言** | `Option<Box<dyn Fn>>` 是 **16 B**（初版误记 8）⇒ `Node` = **1088 B**（实测；`NodeKind` 96 B，载荷吃掉判别位）。P04 的 `node_and_handle_sizes` 断言本来就是 `<= 1152`，无需改动；phase-05 §0/§14.1/§16-13 的尺寸表已按实测回填，并追加 `size_of::<TextContent>() == 96`、`size_of::<NodeKind>() == 96` 打印 |
+| **N1 tofu 断言** | 改为「`tofu == 0` **或** `diagnostics` 含 `FontStackMiss`」；宿主无 CJK/emoji 字体时 `eprintln!` 一条 skip 说明，不 panic（防 CI 假绿/假红） |
+| **N2 借用** | `refresh_text` 用**索引循环**（`while index < tree.order().len()`），避免 `for node in tree.order()`（持 `&NodeTree`）与 `set_text_shaped`（要 `&mut`）冲突；`App` 侧先按字段解构再 `windows.get_mut` |
+| **N3 命名** | 只有 `Window::scale_epoch()` 与 `App.scale_epochs`；判定用 `entry.or_insert(0)`，无 `text_scale_epoch` 字段 |
+| **N4 哈希** | `ShapeKey` 的 `family` 用 `Option<&str>`（`SmolStr::as_str()`）参与 hash，不做 `SmolStr` 的 `Hash` 依赖 |
+| **N5 槽位复用** | `text_slots` 与 `layout_cache` 同生命周期：`insert_child` 复用槽位时 `resize_with` 后置 `None`，`remove` 对整棵子树逐个置 `None`（否则新节点继承上一代的 `Rc<ShapedText>`） |
+| **实现期实测（2026-11-12）** | `Node` = **1088 B**（`NodeKind` 96 B 吃掉判别位）；`cargo test` = **356**、release = **348**、clippy/fmt/doc 全绿；`take_dirty_rows`/`deallocate` 因「v1 无逐 tile 逐出」降为 `#[cfg(test)]`（P09 恢复），脏行的生产读面改为 `dirty_span_count()`；`GlyphAtlas::ensure` 返回 `GlyphTile`（tile + swash `left/top/w/h`，只给 `AtlasTile` 算不出落点）；`refresh_styles` 在文本变更后**重新补 `PAINT`**（`clear_paint` 会吞掉它） |
+| **N6 版本来源** | 注明 `parley` 的 `pub use fontique`（`lib.rs:109`）与 `kytrix_gui` 直依赖的 `fontique` 都是 **0.12.0**，全仓单一实例（`Collection` 与 `parley::FontContext.collection` 同型） |
+
+### 十·待复核项（P05 新增）
+
+| 编号 | 内容 | 复核 Phase | 触发条件 / 处置 |
+|---|---|---|---|
+| V-38 | **（P04 欠账补齐，S-52 的 B2 行许诺「代价记 V-38」）** 命中测试**不能**用布局盒做子树剪枝后，最坏情况是整树遍历：每个节点都要做 `bounds.contains(point)` + clip 祖先链检查，O(n) 而非 O(命中路径) | P10（事件分发）/ P13（Overlay）/ P14（a11y hit test） | 若高频 hover 的树规模 > 5k 节点且命中耗时进入 L4 基准：additive 加「按层/按浮层的空间索引」（不改 `HitResult` 契约）；在此之前靠 P04 的「叶子 + 盒外」与 clip 剪枝（S-52 B2）兜住 |
+| V-39 | 长文本 measure 的 `clone + rebreak` 成本：16000 字符 **288 µs/次**（probe ④，`--release`），×2–3 次/轮 ⇒ 近 1 ms | P05 实现首日 / P18 基准 | 先落 256 条 / 8 MiB 的形状缓存 + 文档写明「>8k 字符建议拆节点」；成为热点则给 `ShapeCache` 加「按宽度的测量记忆」（`(key, width_bits) → Size`，仍无 `RefCell`：记忆在 `App` 侧，闭包只捕获不可变句柄） |
+| V-40 | v1 整数 ppem + 整数物理落点：同一行内不同字号/ppem 的字形会有 ±0.5 px 的基线/字面抖动（`quantize=true` 只保证 baseline 整数，`placement.top` 是字形自身的整数上沿） | P06（像素快照）/ P18 | 视觉回归若可见抖动 → 加 subpixel x（3 套 tile 或 3× 页，图集容量 ×3）或改用 `quantize=false` + 自算舍入 |
+| V-41 | 彩色 emoji：R8 字形图集只能表达单色轮廓；CBDT-only 字体会渲染为空（probe ⑤ 的 `🌍` 用 `Source::Outline` 有 213 个非零像素，说明该字体有 COLR/outline 层） | P06 / P15 | 出现空 emoji → additive 加 `AtlasKind::Color`（BGRA8 的第三页）与新 `kind` 值；P02 §10.3 的两种格式表要扩 |
+| V-42 | measure 闭包持有 `Rc<ShapedText>`（含 parley `Layout`）⇒ 大段落的 `Layout` 在节点卸载/文本变化前不释放 | P05 实现 / P06 帧记录 | `remove` 清 `text_slots`（已设计）；这是**期望**行为（正在显示的文本不该因缓存逐出而重排）。若内存吃紧：给 `ShapedText` 加 `SmallVec<[Line; 1]>` 之外的瘦身不划算，改为 `Rc` 弱引用 + 每帧重建（不推荐） |
+| V-43 | 性能细项：`family_list()` 每次 shape `clone` 一次 `Vec`；`swash::FontRef::from_index` 每次光栅化重解析表目录；LRU 用 `VecDeque` 提升 O(n) | P18 基准 | 都在 µs 级；有热点再改（不改公开面）：`family_list` 改借用、`FontEntry` 缓存 `offset`、LRU 改侵入式链表 |
+| V-44 | 图集单页 2048²（字形 4 MiB / 图片 16 MiB）：CJK + 多 DPI 档可能不够；容量逃逸是 `clear + retry`（全部文本重光栅） | P09 / P15 | 先按 P02 §10.6 的 `clear + retry` → `AtlasExhausted`；出现真实溢出再加 `page` 字段（契约变更，需 P02/P07/P09 同步）或页扩容（`generation` 语义要扩） |
+| V-45 | 文本 pass 每帧遍历 `tree.order()`（O(n)），不走脏位；`DirtyRows::spans` 在 P05 只被 `TextPassReport.dirty_spans` 计数（真正的上传读者是 P07） | P06 帧驱动 | `DirtyFlags` 还有 2 个保留位，加 `TEXT` 位即可增量遍历；在此之前 `refresh_text` 的 `report` 里 `shaped/reused` 计数是「是否真的做了活」的判据 |
+| V-46 | CI 的 Linux 容器可能无 CJK/emoji 系统字体 ⇒ `tofu == 0` 的断言会假失败（D17 明确不要求跨平台一致） | P05 实现 / CI | 断言写成「`tofu == 0` **或** `diagnostics` 非空」，并单独断言诊断的字段；测试注释写明依赖宿主字体 |
+| V-47 | `complex-scripts` 会把 ICU4X 的 CJK 词典数据链进二进制（体积未实测） | P18 体积预算 | 中文断行正确性优先；若 release 体积超预算，再评估「仅 CJK 目标平台开 feature」（会引入 `#[cfg]`，与「平台差异收在 platform/render」的纪律冲突，慎用） |
+
+---
+
+### S-59 文本两阶段（shape → 按内容宽重排）+ 审查第二轮修正
+
+| 项 | 内容 |
+|---|---|
+| **B1 新增第二阶段** | `App::layout_text(window) -> Result<TextLayoutReport, EngineError>`，帧序 **styles → refresh_text → compute_layout → layout_text → paint**。`refresh_text` 只 shape + 按 max-content 量固有尺寸（喂 measure）；`layout_text` 用 taffy 解析出的**内容宽**（`Layout.size - border - padding`，在 `set_local_layout` 时存进 `Node.text_content_width`）clone layout → `break_all_lines(Some(width*scale))` → `align` → 光栅/装箱 → `ShapedLine`。选区映射改用**最终断行布局**（`TextSlot.broken`），不再用 max-content 布局 |
+| **B2 ppem** | `parley::Run::font_size()` 已是**物理值**；`rasterize` 改为 `font_size().round().clamp(1,512)`（原实现又乘了一次 `scale`）。用例：1x/1.25x/2x 的物理宽度递增、逻辑宽度不变 |
+| **B3 `TextStyle.family`** | `shape::family_list(stack, custom)` 把 `style.family` **前置**进 `FontFamily::List`；用例：三个 family 的 advance 至少两种不同 |
+| **B4 空闲帧** | `refresh_text` 先比 `ShapeKey` + `scale_epoch` + `Rc::ptr_eq`，全等则 `skipped += 1` 并 **continue**（不重建 measure、不清缓存）。`TextPassReport::skipped` 是它的计数器 |
+| **N1 行内盒入口** | `TextContent.inline_boxes: Box<[InlineBoxSpec]>`（+16 B）+ `TextContent::with_inline_boxes` + `NodeBuilder::inline_boxes`；`ShapeKey` 手工哈希盒字段（f32 走 bits）；`InlineBoxOverflow` 现在用真实内容宽触发 |
+| **N2 R8 留存** | `GlyphRecord.data: Box<[u8]>` 存覆盖度（P09 上传源），`GlyphAtlas::coverage` 读它；tile 命中**不重光栅**（`stats.hits` 只加计数） |
+| **N3 代际一致** | `layout_text` 记录 pass 起始 `generation`；若中途换代（容量逃逸）**整 pass 重跑一次**（`TextLayoutReport::reruns`），第二次仍变则返回 `TextShape` |
+| **N4 统一跳过口径** | `App::font_stack_status() -> FontStackStatus{Ready,EmptyStack,NoMatchingFamily}`；用例不再散落 `eprintln!` |
+| **N5 FontStackMiss / 空格负缓存 / 合成** | 空栈与「全部候选都不存在」都**退 generic 兜底**并记 `FontStackMiss`（`ShapeFailure::EmptyFontStack` 已删除）；`GlyphAtlas.missing` 负缓存空白字形；`Run::synthesis().any()` ⇒ `TextDiagnostic::SyntheticStyle{text_range}`（只记录，不应用合成） |
+| **N6 渲染出口** | `render.rs` 暴露 `{Allocation, AtlasAllocator, AtlasSet, DirtyRows}` 四项；`AtlasSet::image()`；`AtlasAllocator::take_dirty_rows` 恢复非 test，`App::pending_dirty` 合并；`DirtyRows::merge`；`close_window` 清 `scale_epochs`；删除无读者的 `AtlasSet::generation`/`dirty_span_count` |
+| **尺寸（实测）** | `TextContent` **112 B**（+`Box<[InlineBoxSpec]>` 16）、`NodeKind` **112 B**、`Node` **1112 B** ≤ 1152（余 40 B） |
+| **B4 复位（复审二）** | `set_text_shaped` 的 Some 分支写新快照时同时把 `line/broken/laid_width_bits/laid_generation` 清空 ⇒ `layout_text` 的复用判据（`line.is_some() && width_bits && generation`）必然失效、强制重排；回归用例覆盖文本变短/变长、style、family、inline_boxes 四类变更 |
+| **inline_boxes 保留（复审二）** | `refresh_styles` 不再用 `TextContent::new(value, style)` 重建（会丢行内盒），改为 clone 旧载荷只改 `text`/`style`；用例断言 `bind_text` 首帧与更新后 `inline_boxes.len()` 不变 |
+| **门禁（复审二）** | `cargo test` **364**、release **356**、clippy/fmt/doc 0；三平台 `metadata` rc=0；`Node` 1112 断言保留 |

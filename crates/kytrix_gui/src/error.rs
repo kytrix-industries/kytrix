@@ -7,7 +7,7 @@
 //! 9 项：D8 基线五类 + [`EngineError::InvalidDpiScale`] + [`EngineError::StaleNode`] /
 //! [`EngineError::CyclicDerived`]（P03）+ [`EngineError::InvalidMeasure`]（P04）。其余变体随对应阶段落地
 //! （`LayoutInvalid` 无生产者、继续留空，`GeometryRegister` → P09，
-//! `AtlasExhausted` → P09，`TextShape` → P06，`AppInit` → P08，
+//! `AtlasExhausted` / `TextShape` → **P05**（DEVIATIONS F-55），`AppInit` → P08，
 //! `WindowCreate` → P12，`ResourceDecode` → P15，`A11yInit` → P14）。
 //! 完整「名称 + payload + 实现 Phase」表见 `design/phase-01-foundation.md` §6.2.2；
 //! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03（`design/DEVIATIONS.md` S-30），
@@ -20,6 +20,7 @@ use smol_str::SmolStr;
 use crate::{
     layout::Axis,
     node::{id::NodeId, signal::DerivedId},
+    paint::atlas::AtlasKind,
 };
 
 /// 引擎公开错误枚举。
@@ -83,11 +84,20 @@ pub enum EngineError {
         axis: Axis,
         value: f32,
     },
+
+    /// 文本形状失败（设计 §4.8 / P01 §6.2.2 #13）：字体栈为空、行内盒字节偏移非法、超宽降级需上报。
+    #[error("text shaping failed for {node:?}: {detail}")]
+    TextShape { node: NodeId, detail: SmolStr },
+
+    /// 图集无法容纳新图元（清空重建后仍失败，P02 §10.6 / P01 §6.2.2 #12）。
+    #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
+    AtlasExhausted { kind: AtlasKind },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paint::atlas::AtlasKind;
 
     fn unsupported_gpu() -> EngineError {
         EngineError::UnsupportedGpu {
@@ -126,7 +136,39 @@ mod tests {
                 axis: Axis::X,
                 value: f32::NAN,
             },
+            EngineError::TextShape {
+                node: NodeId::for_test(5, 1),
+                detail: SmolStr::new_static("font stack is empty"),
+            },
+            EngineError::AtlasExhausted {
+                kind: AtlasKind::Glyph,
+            },
         ]
+    }
+
+    #[test]
+    fn text_shape_display_names_node_and_detail() {
+        let text = EngineError::TextShape {
+            node: NodeId::for_test(6, 2),
+            detail: SmolStr::new_static("inline box index 1 is not a char boundary"),
+        }
+        .to_string();
+
+        assert!(text.contains("text shaping failed"), "{text}");
+        assert!(text.contains("n6.2"), "{text}");
+        assert!(text.contains("char boundary"), "{text}");
+    }
+
+    #[test]
+    fn atlas_exhausted_display_names_the_kind() {
+        let text = EngineError::AtlasExhausted {
+            kind: AtlasKind::Image,
+        }
+        .to_string();
+
+        assert!(text.contains("Image"), "{text}");
+        assert!(text.contains("exhausted"), "{text}");
+        assert!(text.contains("clear and rebuild"), "{text}");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! - 所有写路径都走 `mark_*`（§9.3 的表），`touch` 顺带并 damage 并清 `REUSABLE`；
 //! - `taffy::Cache` **不**内联（P04 在 `NodeTree` 旁建旁表，见 §11.1）。
 
-use std::fmt;
+use std::{fmt, rc::Rc};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -17,7 +17,7 @@ use crate::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, hit_test},
     },
-    math::{Edges, Point, Rect},
+    math::{Edges, Point, Rect, Size},
     node::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, affects_parent, depends_on_children},
@@ -30,6 +30,7 @@ use crate::{
         scene::LaneId,
         style::{Clip, Style, StylePatch},
     },
+    text::{ShapedLine, TextContent},
 };
 
 /// 逻辑像素的布局结果（只记录 AABB 与边框）。
@@ -56,13 +57,27 @@ pub enum NodeKind {
     Canvas(Canvas),
     /// 静态几何节点：引用 P09 的 GPU 几何。
     Geometry(GeometryId),
+    /// 文本叶子：载荷是 [`TextContent`]，布局由 `App::refresh_text` 注入的 measure 闭包完成。
+    ///
+    /// 在首次 `refresh_text` 之前它的 measure 为 `0×0`（`NodeBuilder::text` 不伪造闭包）。
+    Text(TextContent),
 }
 
 impl NodeKind {
-    /// 叶子节点（`Canvas`/`Geometry`）不布局子节点 —— 消费者：`depends_on_children`、`NodeBuilder::build` 的 debug 断言。
+    /// 叶子节点（`Canvas`/`Geometry`/`Text`）不布局子节点 —— 消费者：`depends_on_children`、
+    /// `NodeBuilder::build` 的 debug 断言。
     #[must_use]
     pub(crate) fn is_leaf(&self) -> bool {
-        matches!(self, Self::Canvas(_) | Self::Geometry(_))
+        matches!(self, Self::Canvas(_) | Self::Geometry(_) | Self::Text(_))
+    }
+
+    /// 文本载荷（P06 的 paint 分派与 `App::refresh_text` 的唯一读入口）。
+    #[must_use]
+    pub(crate) fn text(&self) -> Option<&TextContent> {
+        match self {
+            Self::Text(content) => Some(content),
+            _ => None,
+        }
     }
 }
 
@@ -77,6 +92,7 @@ pub(crate) struct NodeSpec {
     measure: Option<MeasureFn>,
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     layout_override: Option<LayoutOverride>,
+    bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
 }
 
 impl NodeSpec {
@@ -92,6 +108,7 @@ impl NodeSpec {
             measure: None,
             hit_shape: None,
             layout_override: None,
+            bind_text: None,
         }
     }
 
@@ -107,6 +124,14 @@ impl NodeSpec {
 
     pub(crate) fn with_layout_override(mut self, layout_override: LayoutOverride) -> Self {
         self.layout_override = Some(layout_override);
+        self
+    }
+
+    pub(crate) fn with_bind_text(
+        mut self,
+        bind_text: Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>,
+    ) -> Self {
+        self.bind_text = Some(bind_text);
         self
     }
 }
@@ -135,6 +160,12 @@ pub struct Node {
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     /// 布局覆盖（root 逃生口）。
     layout_override: Option<LayoutOverride>,
+    /// 动态文本闭包（`bind_text` 的求值入口；`None` = 静态文本）。
+    text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
+    /// 最近一次 shape 的内容尺寸（逻辑像素；`App::refresh_text` 判「尺寸变了没有」）。
+    text_measured_size: Size,
+    /// 最近一次布局的**内容宽**（逻辑像素；`App::layout_text` 的断行宽度，B1）。
+    text_content_width: f32,
     /// 当前布局盒（逻辑像素；窗口绝对）。消费者：`Probe`/P06/P04 的命中测试。
     layout: LayoutBox,
     /// 上一次布局盒（damage 的「旧」一侧）。
@@ -170,6 +201,9 @@ impl fmt::Debug for Node {
             .field("measure", &self.measure.as_ref().map(|_| "<closure>"))
             .field("hit_shape", &self.hit_shape.as_ref().map(|_| "<closure>"))
             .field("layout_override", &self.layout_override)
+            .field("text_bind", &self.text_bind.as_ref().map(|_| "<closure>"))
+            .field("text_measured_size", &self.text_measured_size)
+            .field("text_content_width", &self.text_content_width)
             .field("layout", &self.layout)
             .field("prev_layout", &self.prev_layout)
             .field("local", &self.local)
@@ -277,6 +311,50 @@ impl Node {
     }
 }
 
+/// 一个文本节点的快照（P05）：`shaped` 供 measure/选区，`line` 供 P06 的 paint。
+///
+/// `key`/`scale_epoch`/`laid_*` 是「本帧是否需要重做」的判据（B4）：三者全等 ⇒ 整节点跳过。
+pub(crate) struct TextSlot {
+    shaped: Rc<crate::text::shape::ShapedText>,
+    key: crate::text::cache::ShapeKey,
+    scale_epoch: u32,
+    line: Option<Rc<ShapedLine>>,
+    /// 最终（按内容宽断行 + 对齐）的 parley 布局：选区映射的唯一真相（B1）。
+    broken: Option<Box<parley::Layout<crate::paint::color::ColorBrush>>>,
+    laid_width_bits: u32,
+    laid_generation: u32,
+}
+
+impl TextSlot {
+    pub(crate) fn shaped(&self) -> &Rc<crate::text::shape::ShapedText> {
+        &self.shaped
+    }
+
+    pub(crate) fn key(&self) -> crate::text::cache::ShapeKey {
+        self.key
+    }
+
+    pub(crate) fn scale_epoch(&self) -> u32 {
+        self.scale_epoch
+    }
+
+    pub(crate) fn line(&self) -> Option<&Rc<ShapedLine>> {
+        self.line.as_ref()
+    }
+
+    pub(crate) fn laid_width_bits(&self) -> u32 {
+        self.laid_width_bits
+    }
+
+    pub(crate) fn laid_generation(&self) -> u32 {
+        self.laid_generation
+    }
+
+    pub(crate) fn broken(&self) -> Option<&parley::Layout<crate::paint::color::ColorBrush>> {
+        self.broken.as_deref()
+    }
+}
+
 /// 唯一的一棵节点树（I5）。
 ///
 /// `order` 是 DFS 先序数组：任何节点的子树在数组里占**连续**一段，因此结构变更只需拼接一段。
@@ -286,6 +364,8 @@ pub struct NodeTree {
     order: Vec<NodeId>,
     /// taffy 布局缓存旁表（按 arena 槽位下标索引；`Node` 不内联 `Cache`，见 P03 N6 / P04 §6.1）。
     layout_cache: Vec<Option<taffy::Cache>>,
+    /// 文本形状快照旁表（按 arena 槽位下标；只有文本节点非空，16 B/槽）。
+    text_slots: Vec<Option<TextSlot>>,
     /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
     hoisted: ahash::HashMap<NodeId, SmallVec<[NodeId; 2]>>,
     /// 布局运行代次（0 保留，首轮为 1）。
@@ -363,6 +443,9 @@ impl NodeTree {
             measure: None,
             hit_shape: None,
             layout_override: None,
+            text_bind: None,
+            text_measured_size: Size::ZERO,
+            text_content_width: 0.0,
             layout: LayoutBox::default(),
             prev_layout: LayoutBox::default(),
             local: Rect::default(),
@@ -378,6 +461,7 @@ impl NodeTree {
             root,
             order: vec![root],
             layout_cache: vec![None],
+            text_slots: vec![None],
             hoisted: ahash::HashMap::default(),
             layout_epoch: 0,
             layout_stats: LayoutStats::default(),
@@ -468,6 +552,9 @@ impl NodeTree {
             if let Some(slot) = self.layout_cache.get_mut(index) {
                 *slot = None;
             }
+            if let Some(slot) = self.text_slots.get_mut(index) {
+                *slot = None;
+            }
             self.hoisted.remove(id);
             let _ = self.arena.remove(*id);
         }
@@ -499,6 +586,7 @@ impl NodeTree {
             measure,
             hit_shape,
             layout_override,
+            bind_text,
         } = spec;
         let id = self.arena.insert_with(move |id| Node {
             id,
@@ -511,6 +599,9 @@ impl NodeTree {
             measure,
             hit_shape,
             layout_override,
+            text_bind: bind_text,
+            text_measured_size: Size::ZERO,
+            text_content_width: 0.0,
             layout: LayoutBox::default(),
             prev_layout: LayoutBox::default(),
             local: Rect::default(),
@@ -527,6 +618,11 @@ impl NodeTree {
             self.layout_cache.resize_with(index + 1, || None);
         }
         self.layout_cache[index] = None;
+        // N5：文本形状快照与 taffy 缓存同生命周期 —— 复用槽位时必须丢弃上一代的 `Rc<ShapedText>`。
+        if self.text_slots.len() <= index {
+            self.text_slots.resize_with(index + 1, || None);
+        }
+        self.text_slots[index] = None;
         self.hoisted.remove(&id);
         self.order_insert(parent, id);
         if let Some(node) = self.arena.get_mut(id) {
@@ -685,6 +781,205 @@ impl NodeTree {
         Ok(())
     }
 
+    // ── P05：文本（载荷 / 形状快照 / 选区） ───────────────────────────────────
+
+    /// 文本载荷（`None` = 不是文本节点）。消费者：`App::refresh_styles` / `App::refresh_text`。
+    pub(crate) fn text_content(&self, node: NodeId) -> Option<&TextContent> {
+        self.arena.get(node).and_then(|target| target.kind.text())
+    }
+
+    /// 写回文本载荷（`bind_text` 求值 + 静态 `text()` 的挂载路径）。
+    pub(crate) fn set_text_content(&mut self, node: NodeId, content: TextContent) -> bool {
+        match self.arena.get_mut(node) {
+            Some(target) => match &mut target.kind {
+                NodeKind::Text(existing) => {
+                    *existing = content;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// 取走 `bind_text` 闭包（求值期间脱离节点，避免借用冲突）。
+    pub(crate) fn take_bind_text(
+        &mut self,
+        node: NodeId,
+    ) -> Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>> {
+        self.arena.get_mut(node)?.text_bind.take()
+    }
+
+    /// 放回 `bind_text` 闭包。
+    pub(crate) fn put_bind_text(
+        &mut self,
+        node: NodeId,
+        bind_text: Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>,
+    ) -> bool {
+        match self.arena.get_mut(node) {
+            Some(target) => {
+                target.text_bind = Some(bind_text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 冻结形状快照并重建 measure 闭包。
+    ///
+    /// **无条件**清 `node..root` 的 taffy 缓存（B1）：taffy 的 cache 键不含「闭包捕获的状态」，
+    /// snapshot 变化后旧 measure 结果必须作废；`size_changed` 只决定**是否额外**置 `LAYOUT`。
+    pub(crate) fn set_text_shaped(
+        &mut self,
+        node: NodeId,
+        shaped: Rc<crate::text::shape::ShapedText>,
+        key: crate::text::cache::ShapeKey,
+        scale_epoch: u32,
+        measured: Size,
+        size_changed: bool,
+    ) -> bool {
+        let Some(target) = self.arena.get_mut(node) else {
+            return false;
+        };
+        let rc = Rc::clone(&shaped);
+        target.measure = Some(Box::new(move |known, available| {
+            rc.measure(known, available)
+        }));
+        target.text_measured_size = measured;
+
+        let index = node.index() as usize;
+        if self.text_slots.len() <= index {
+            self.text_slots.resize_with(index + 1, || None);
+        }
+        match self.text_slots.get_mut(index).and_then(Option::as_mut) {
+            Some(slot) => {
+                slot.shaped = shaped;
+                slot.key = key;
+                slot.scale_epoch = scale_epoch;
+                // 新快照 ⇒ 旧的断行/选区/布局依据全部作废（B4）：`layout_text` 的复用判据是
+                // `line.is_some() && width_bits && generation`，任一不成立就重排。
+                slot.line = None;
+                slot.broken = None;
+                slot.laid_width_bits = 0;
+                slot.laid_generation = 0;
+            }
+            None => {
+                if let Some(slot) = self.text_slots.get_mut(index) {
+                    *slot = Some(TextSlot {
+                        shaped,
+                        key,
+                        scale_epoch,
+                        line: None,
+                        broken: None,
+                        laid_width_bits: 0,
+                        laid_generation: 0,
+                    });
+                }
+            }
+        }
+
+        self.invalidate_caches_upwards(node);
+        if size_changed {
+            self.mark_layout(node)
+        } else {
+            self.mark_paint(node)
+        }
+    }
+
+    /// 挂上只读快照（P06 的 paint 输入）；`width`/`generation` 记下这次重排的依据。
+    pub(crate) fn set_text_line(
+        &mut self,
+        node: NodeId,
+        line: Rc<ShapedLine>,
+        broken: parley::Layout<crate::paint::color::ColorBrush>,
+        width: f32,
+        generation: u32,
+    ) -> bool {
+        let index = node.index() as usize;
+        let Some(slot) = self.text_slots.get_mut(index).and_then(Option::as_mut) else {
+            return false;
+        };
+        slot.line = Some(line);
+        slot.broken = Some(Box::new(broken));
+        slot.laid_width_bits = width.to_bits();
+        slot.laid_generation = generation;
+        true
+    }
+
+    /// 最近一次布局的**内容宽**（逻辑像素；文本节点的断行宽度）。
+    pub(crate) fn text_content_width(&self, node: NodeId) -> f32 {
+        self.arena
+            .get(node)
+            .map_or(0.0, |target| target.text_content_width)
+    }
+
+    /// 只读快照（P06）。
+    pub(crate) fn text_line(&self, node: NodeId) -> Option<&Rc<ShapedLine>> {
+        self.text_slots
+            .get(node.index() as usize)
+            .and_then(Option::as_ref)
+            .and_then(TextSlot::line)
+    }
+
+    /// 最近一次 shape 的内容尺寸（逻辑像素）。
+    pub(crate) fn text_measured_size(&self, node: NodeId) -> Option<Size> {
+        self.arena.get(node).map(|target| target.text_measured_size)
+    }
+
+    /// 文本快照（`shaped` 供 measure/选区）。
+    pub(crate) fn text_slot(&self, node: NodeId) -> Option<&TextSlot> {
+        self.text_slots
+            .get(node.index() as usize)
+            .and_then(Option::as_ref)
+    }
+
+    /// `(anchor, focus)` 字节偏移 → 文本盒局部的选区矩形（P10 的入口）。
+    ///
+    /// # Errors
+    /// `StaleNode`：句柄陈旧；`TextShape`：不是文本节点或尚未 shape。
+    pub fn text_selection_rects(
+        &self,
+        node: NodeId,
+        anchor: usize,
+        focus: usize,
+    ) -> Result<Vec<Rect>, EngineError> {
+        let Some(target) = self.arena.get(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        if target.kind.text().is_none() {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("node is not a text node"),
+            });
+        }
+        let Some(slot) = self.text_slot(node) else {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("text has not been shaped yet"),
+            });
+        };
+        let Some(broken) = slot.broken() else {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("text has no final layout yet"),
+            });
+        };
+        Ok(crate::text::inline_flow::selection_rects(
+            broken,
+            anchor,
+            focus,
+            slot.shaped().scale(),
+        ))
+    }
+
+    /// 文本节点的布局失效（= `invalidate_measure` + 补 `PAINT`，F-56）。
+    pub(crate) fn invalidate_text_layout(&mut self, node: NodeId) -> bool {
+        if self.invalidate_measure(node).is_err() {
+            return false;
+        }
+        self.mark_paint(node)
+    }
+
     /// 一次布局运行：`compute_root_layout` → 绝对坐标 post-pass → 错误面。
     ///
     /// 消费者：`Window::compute_layout`（唯一调用点）。
@@ -750,9 +1045,16 @@ impl NodeTree {
             layout.border.bottom,
             layout.border.left,
         );
+        let content_width = (layout.size.width
+            - layout.border.left
+            - layout.border.right
+            - layout.padding.left
+            - layout.padding.right)
+            .max(0.0);
         if let Some(target) = self.arena.get_mut(node) {
             target.local = local;
             target.local_border = border;
+            target.text_content_width = content_width;
             target.laid_out_epoch = epoch;
             // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
             target.dirty.remove(DirtyFlags::LAYOUT);
@@ -1306,9 +1608,19 @@ mod tests {
         let node_size = size_of::<Node>();
         println!("size_of::<Node>() = {node_size}");
         println!("size_of::<LayoutBox>() = {}", size_of::<LayoutBox>());
+        println!("size_of::<NodeKind>() = {}", size_of::<NodeKind>());
+        println!(
+            "size_of::<TextContent>() = {}",
+            size_of::<crate::text::TextContent>()
+        );
         assert!(
             node_size <= 1152,
             "Node 尺寸超预算: {node_size} B（过 1152 → 备选 style: Box<Style>，见 V-31）"
+        );
+        assert_eq!(
+            size_of::<crate::text::TextContent>(),
+            112,
+            "TextContent 的尺寸是 P05 的预算基线（S-53：含 inline_boxes）"
         );
         assert_eq!(size_of::<Option<NodeId>>(), 8, "Option<NodeId> 必须零开销");
         assert_eq!(size_of::<NodeId>(), 8);
@@ -1566,5 +1878,89 @@ mod tests {
                 .dirty()
                 .contains(DirtyFlags::ORDER)
         );
+    }
+
+    // ── P05：文本节点 ────────────────────────────────────────────────────────
+
+    fn text_tree(text: &str) -> (NodeTree, NodeId) {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::text(text, crate::text::TextStyle::new(16.0))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+        (tree, node)
+    }
+
+    #[test]
+    fn text_kind_is_a_leaf_and_exposes_its_content() {
+        let (tree, node) = text_tree("hello");
+
+        assert!(tree.get(node).expect("存在").kind().is_leaf());
+        let content = tree.text_content(node).expect("文本载荷");
+        assert_eq!(content.text, "hello");
+        assert!(tree.text_line(node).is_none(), "尚未 shape");
+        assert!(tree.text_slot(node).is_none());
+    }
+
+    #[test]
+    fn remove_drops_the_text_slot() {
+        let (mut tree, node) = text_tree("temp");
+        assert!(tree.remove(node).is_ok());
+
+        assert!(tree.text_slot(node).is_none(), "槽位必须随卸载清空（N5）");
+        assert!(tree.text_line(node).is_none());
+    }
+
+    #[test]
+    fn text_selection_rects_reports_preconditions() {
+        let (tree, node) = text_tree("abcdef");
+
+        let error = tree
+            .text_selection_rects(node, 0, 3)
+            .expect_err("尚未 shape 的节点必须报错");
+        assert!(matches!(
+            error,
+            EngineError::TextShape { node: reported, .. } if reported == node
+        ));
+
+        let root = tree.root();
+        let error = tree
+            .text_selection_rects(root, 0, 3)
+            .expect_err("非文本节点必须报错");
+        assert!(matches!(error, EngineError::TextShape { .. }));
+    }
+
+    #[test]
+    fn text_content_updates_only_text_nodes() {
+        let (mut tree, node) = text_tree("one");
+        let root = tree.root();
+
+        assert!(tree.set_text_content(
+            node,
+            crate::text::TextContent::new("two", crate::text::TextStyle::new(12.0))
+        ));
+        assert_eq!(tree.text_content(node).expect("文本").text, "two");
+        assert!(
+            !tree.set_text_content(
+                root,
+                crate::text::TextContent::new("nope", crate::text::TextStyle::default())
+            ),
+            "非文本节点必须拒绝写载荷"
+        );
+    }
+
+    #[test]
+    fn text_bind_text_round_trips() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::text("x", crate::text::TextStyle::new(16.0))
+            .bind_text(|_cx| smol_str::SmolStr::new_static("bound"))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let closure = tree.take_bind_text(node).expect("闭包必须存在");
+        assert!(tree.take_bind_text(node).is_none(), "取走后为空");
+        assert!(tree.put_bind_text(node, closure));
+        assert!(tree.take_bind_text(node).is_some(), "放回后仍可取");
     }
 }

@@ -4,6 +4,8 @@
 //! 一个 builder 实例 = 一次挂载（不是可复用的模板）；`build` 时把 6 个部件装成 `NodeSpec` 交给
 //! `NodeTree::insert_child`（`NodeSpec` 的字段私有 —— 见其 rustdoc）。
 
+use smol_str::SmolStr;
+
 use crate::{
     error::EngineError,
     layout::{LayoutOverride, MeasureFn},
@@ -18,6 +20,7 @@ use crate::{
         geometry::GeometryId,
         style::{Style, StylePatch},
     },
+    text::{TextContent, TextStyle},
 };
 
 /// 声明式建树的唯一入口。**只在挂载时使用一次**。
@@ -31,6 +34,7 @@ pub struct NodeBuilder {
     measure: Option<MeasureFn>,
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     layout_override: Option<LayoutOverride>,
+    bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
 }
 
 impl Default for NodeBuilder {
@@ -50,6 +54,7 @@ impl NodeBuilder {
             measure: None,
             hit_shape: None,
             layout_override: None,
+            bind_text: None,
         }
     }
 
@@ -68,6 +73,41 @@ impl NodeBuilder {
         Self {
             kind: NodeKind::Geometry(geometry),
             ..Self::boxed()
+        }
+    }
+
+    /// 文本叶子（静态文本）。
+    ///
+    /// 挂载后由 `App::refresh_text` 首次形状 —— **在此之前 measure 是 0×0**
+    /// （`NodeBuilder::text` 不伪造与真实形状不一致的闭包）。
+    #[must_use]
+    pub fn text(text: impl Into<SmolStr>, style: TextStyle) -> Self {
+        Self {
+            kind: NodeKind::Text(TextContent::new(text, style)),
+            ..Self::boxed()
+        }
+    }
+
+    /// 行内盒（`<img>` / `kbd`）：参与断行与行高，位置由引擎算（§12）。
+    #[must_use]
+    pub fn inline_boxes(
+        mut self,
+        boxes: impl IntoIterator<Item = crate::text::InlineBoxSpec>,
+    ) -> Self {
+        if let NodeKind::Text(content) = &mut self.kind {
+            content.inline_boxes = boxes.into_iter().collect();
+        }
+        self
+    }
+
+    /// 动态文本：每次 `refresh_styles` 求值（与 `bind_style` 同一机制、同一依赖图）。
+    ///
+    /// 返回值是 `SmolStr`（不是 `String`）：短字符串零分配（AGENTS §2.2）。
+    #[must_use]
+    pub fn bind_text(self, bind_text: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static) -> Self {
+        Self {
+            bind_text: Some(Box::new(bind_text)),
+            ..self
         }
     }
 
@@ -144,6 +184,9 @@ impl NodeBuilder {
         }
         if let Some(layout_override) = self.layout_override {
             spec = spec.with_layout_override(layout_override);
+        }
+        if let Some(bind_text) = self.bind_text {
+            spec = spec.with_bind_text(bind_text);
         }
         tree.insert_child(parent, spec)
     }
@@ -353,5 +396,69 @@ mod tests {
             .expect("挂载成功");
 
         let _ = NodeBuilder::boxed().build(&mut tree, pane);
+    }
+
+    // ── P05：文本 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn text_builder_sets_kind_content_and_no_measure() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::text("label", crate::text::TextStyle::new(13.0))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        match tree.get(node).expect("存在").kind() {
+            NodeKind::Text(content) => {
+                assert_eq!(content.text, "label");
+                assert_eq!(content.style.size, 13.0);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert!(
+            tree.measure_of(node).is_none(),
+            "text() 不伪造 measure：首次形状由 App::refresh_text 注入"
+        );
+        assert_eq!(
+            tree.text_measured_size(node),
+            Some(crate::math::Size::ZERO),
+            "未 shape 前的尺寸记录是 0"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "leaf nodes cannot have children")]
+    fn text_parent_is_debug_assert() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let text = NodeBuilder::text("x", crate::text::TextStyle::default())
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let _ = NodeBuilder::boxed().build(&mut tree, text);
+    }
+
+    #[test]
+    fn bind_text_keeps_the_text_kind_and_marks_paint() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::text("", crate::text::TextStyle::default())
+            .bind_text(|_cx| smol_str::SmolStr::new_static("dynamic"))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        assert!(tree.get(node).expect("存在").kind().is_leaf());
+        assert!(
+            tree.take_bind_text(node).is_some(),
+            "bind_text 必须存进节点"
+        );
+        assert!(
+            tree.get(node)
+                .expect("存在")
+                .dirty()
+                .contains(DirtyFlags::PAINT),
+            "带 bind_text 的节点必须待求值"
+        );
     }
 }

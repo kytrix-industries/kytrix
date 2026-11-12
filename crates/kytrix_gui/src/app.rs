@@ -6,17 +6,24 @@
 //! 写路径是 push 模型（§7.5）：一次 `write` 沿依赖图把 owner 标脏，**不**遍历整棵树；
 //! 帧内唯一的重活是 `refresh_styles`（样式求值 pass，P06 的 paint 阶段复用同一实现）。
 
-use std::any::Any;
+use std::{any::Any, rc::Rc};
 
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
+    error::EngineError,
+    math::Size,
     node::{
         dependency::{DependencyGraph, EvalStack, Owner, ReadCtx, ReadTracker},
         dirty::DirtyFlags,
         signal::{Derived, Signal, SignalId, StateStore, Transient},
     },
     paint::style::StylePatch,
+    render::AtlasSet,
+    text::{
+        FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
+        TextStyle, atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+    },
     window::{Window, WindowId, WindowOptions},
 };
 
@@ -34,6 +41,10 @@ pub struct StylePassReport {
     pub paint_dirty: bool,
     /// pass 结束后 `App::take_wake_request()` 会返回的值（**本报告不消费它**）。
     pub wake_requested: bool,
+    /// 本次求值的 `bind_text` 闭包个数（含值未变的求值）。
+    pub text_evaluated: usize,
+    /// 本次文本值**真的变了**的节点数。
+    pub text_changed: usize,
 }
 
 /// 引擎侧全部状态。字段全私有（`field_scoped_visibility_modifiers` 禁止字段级可见性）。
@@ -47,6 +58,18 @@ pub struct App {
     next_window_id: u32,
     /// tokio 运行时的句柄（只保存；引擎内不得调用 `Handle::current()`，`clippy.toml` 已禁用）。
     runtime: tokio::runtime::Handle,
+    /// 文本引擎（字体库 / 布局 scratch / 字体栈 / 形状缓存 / 诊断）：进程级一份。
+    text: TextContext,
+    /// 字形光栅器（swash `ScaleContext` + 被 pin 住的字体 blob）。
+    raster: GlyphRasterizer,
+    /// 图集（字形页 + 图片页）：进程级一份（单 GPU 设备）。
+    atlas: AtlasSet,
+    /// 字形 `key → tile` 缓存（与图集同事务换代）。
+    glyph_atlas: GlyphAtlas,
+    /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
+    scale_epochs: ahash::HashMap<WindowId, u32>,
+    /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、`dirty_spans` 计数）。
+    pending_dirty: crate::render::DirtyRows,
 }
 
 impl App {
@@ -64,6 +87,12 @@ impl App {
             wake_requested: false,
             next_window_id: 1,
             runtime,
+            text: TextContext::new(),
+            raster: GlyphRasterizer::new(),
+            atlas: AtlasSet::new(),
+            glyph_atlas: GlyphAtlas::new(),
+            scale_epochs: ahash::HashMap::default(),
+            pending_dirty: crate::render::DirtyRows::default(),
         }
     }
 
@@ -203,6 +232,8 @@ impl App {
         eval_stack.clear();
 
         let mut evaluated = 0usize;
+        let mut text_evaluated = 0usize;
+        let mut text_changed = 0usize;
         let mut index = 0usize;
         while index < tree.order().len() {
             let node = tree.order()[index];
@@ -217,7 +248,9 @@ impl App {
             let old_patch = tree
                 .get(node)
                 .map_or_else(|_| StylePatch::default(), |n| n.style_patch().clone());
-            let Some(compute) = tree.take_bind_style(node) else {
+            let compute = tree.take_bind_style(node);
+            let bind_text = tree.take_bind_text(node);
+            if compute.is_none() && bind_text.is_none() {
                 // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（`build` 之后必然有闭包）。
                 // 那次 pass 在 `replace_deps` 之前就中断了，所以节点仍带着**上一次成功的** deps：
                 // 它们是「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。
@@ -227,12 +260,12 @@ impl App {
                 tree.set_deps(node, SmallVec::new());
                 tree.clear_paint(node);
                 continue;
-            };
+            }
 
             let (values, derived) = store.split();
             let mut tracker = ReadTracker::new();
             // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
-            let (patch, owner) = {
+            let (patch, text_value, owner) = {
                 let mut ctx = ReadCtx::new(
                     values,
                     derived,
@@ -241,28 +274,65 @@ impl App {
                     &mut *eval_stack,
                     Owner::Node { window, node },
                 );
-                let patch = compute(&mut ctx);
-                (patch, ctx.owner())
+                let patch = compute
+                    .as_ref()
+                    .map_or_else(StylePatch::default, |compute| compute(&mut ctx));
+                let text_value = bind_text.as_ref().map(|bind| bind(&mut ctx));
+                (patch, text_value, ctx.owner())
             };
-            evaluated += 1;
+            if compute.is_some() {
+                evaluated += 1;
+            }
+            if text_value.is_some() {
+                text_evaluated += 1;
+            }
 
             let old_deps = tree.deps(node).unwrap_or(&[]);
             graph.replace_deps(owner, old_deps, tracker.as_slice());
             tree.set_deps(node, tracker.into_inner());
 
-            let layout_changed = patch.affects_layout || old_patch.affects_layout;
-            let a11y_changed =
-                patch.interactive != old_patch.interactive || patch.visible != old_patch.visible;
-
-            tree.set_style_patch(node, patch);
-            tree.put_bind_style(node, compute);
-            if layout_changed {
-                tree.mark_layout(node);
+            if let Some(compute) = compute {
+                let layout_changed = patch.affects_layout || old_patch.affects_layout;
+                let a11y_changed = patch.interactive != old_patch.interactive
+                    || patch.visible != old_patch.visible;
+                tree.set_style_patch(node, patch);
+                tree.put_bind_style(node, compute);
+                if layout_changed {
+                    tree.mark_layout(node);
+                }
+                if a11y_changed {
+                    tree.mark_a11y(node);
+                }
             }
-            if a11y_changed {
-                tree.mark_a11y(node);
+            let mut text_changed_here = false;
+            if let Some(bind) = bind_text {
+                tree.put_bind_text(node, bind);
+            }
+            if let Some(value) = text_value {
+                let style = tree
+                    .text_content(node)
+                    .map_or_else(TextStyle::default, |content| content.style.clone());
+                let changed = tree
+                    .text_content(node)
+                    .is_none_or(|content| content.text != value);
+                if changed {
+                    // 只换 text/style，**保留** inline_boxes（N1 回归）。
+                    let mut content = tree
+                        .text_content(node)
+                        .cloned()
+                        .unwrap_or_else(|| TextContent::new(value.clone(), style.clone()));
+                    content.text = value;
+                    content.style = style;
+                    tree.set_text_content(node, content);
+                    text_changed += 1;
+                    text_changed_here = true;
+                }
             }
             tree.clear_paint(node);
+            if text_changed_here {
+                // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
+                tree.mark_paint(node);
+            }
         }
 
         Some(StylePassReport {
@@ -270,7 +340,236 @@ impl App {
             layout_dirty: tree.any_node(|n| n.dirty().contains(DirtyFlags::LAYOUT)),
             paint_dirty: tree.any_node(|n| !n.dirty().contains(DirtyFlags::REUSABLE)),
             wake_requested: *wake_requested,
+            text_evaluated,
+            text_changed,
         })
+    }
+
+    // ── P05：文本 pass / 字体栈 / 诊断 ────────────────────────────────────────
+
+    /// 文本 pass：形状（缓存）→ 光栅 → 图集 → `ShapedLine`，尺寸变化时置 `LAYOUT`。
+    ///
+    /// **必须在 `refresh_styles` 之后、`Window::compute_layout` 之前调用**
+    /// （帧序：styles → text → layout）。`NodeBuilder::text` 不设 measure，因此没跑本 pass 的
+    /// 文本节点 measure 为 `0×0`。
+    ///
+    /// 返回 `None` = 窗口不存在；`Some(Err(..))` = `TextShape` / `AtlasExhausted`（调用方丢弃本帧）。
+    pub fn refresh_text(
+        &mut self,
+        window: WindowId,
+    ) -> Option<Result<TextPassReport, EngineError>> {
+        let Self {
+            text,
+            raster,
+            atlas,
+            glyph_atlas,
+            windows,
+            scale_epochs,
+            pending_dirty,
+            ..
+        } = self;
+        let window = windows.get_mut(&window)?;
+        let window_id = window.id();
+        let scale = window.scale().factor();
+        let epoch = window.scale_epoch();
+
+        if scale_epochs.get(&window_id).copied().unwrap_or(0) != epoch {
+            atlas.clear_all();
+            glyph_atlas.clear();
+            scale_epochs.insert(window_id, epoch);
+        }
+        raster.set_font_epoch(text.font_epoch());
+
+        let tree = window.tree_mut();
+        let mut report = TextPassReport::default();
+        let known = taffy::Size {
+            width: None,
+            height: None,
+        };
+        let available = taffy::Size {
+            width: taffy::AvailableSpace::MaxContent,
+            height: taffy::AvailableSpace::MaxContent,
+        };
+
+        let mut index = 0usize;
+        while index < tree.order().len() {
+            let node = tree.order()[index];
+            index += 1;
+            let Some(content) = tree.text_content(node).cloned() else {
+                continue;
+            };
+            let (shaped, hit) = text.shape_cached(&content, scale);
+            if hit {
+                report.reused += 1;
+            } else {
+                report.shaped += 1;
+            }
+            let key = crate::text::cache::ShapeKey::new(&content, scale, text.font_stack_version());
+            if let Some(slot) = tree.text_slot(node)
+                && slot.key() == key
+                && slot.scale_epoch() == epoch
+                && Rc::ptr_eq(slot.shaped(), &shaped)
+            {
+                // B4：快照未变 ⇒ 不重建、不清缓存、不重挂（空闲帧只走这条路）。
+                report.skipped += 1;
+                continue;
+            }
+
+            let measured = shaped.measure(known, available);
+            let previous = tree.text_measured_size(node).unwrap_or(Size::ZERO);
+            let size_changed = previous.width.to_bits() != measured.width.to_bits()
+                || previous.height.to_bits() != measured.height.to_bits();
+            tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
+        }
+        report.dirty_spans = pending_dirty.spans().len();
+        Some(Ok(report))
+    }
+
+    /// 文本的**第二阶段**：`compute_layout` 之后，按每个文本节点的**内容宽**重排、光栅、装箱。
+    ///
+    /// 帧序（B1）：`refresh_styles` → `refresh_text` → `Window::compute_layout` → `layout_text` → paint。
+    /// 与 `refresh_text` 的分工：前者只 shape + 量固有尺寸（给 measure 用），后者拿 taffy 算出的
+    /// **内容宽**做最终断行（`break_all_lines` + `align`）并产出 `ShapedLine`。
+    ///
+    /// 图集代际在一次 pass 内必须稳定（N3）：若中途换代（容量逃逸），整 pass **重跑一次**；
+    /// 第二次仍换代则返回 `TextShape`（调用方丢弃本帧）。
+    pub fn layout_text(
+        &mut self,
+        window: WindowId,
+    ) -> Option<Result<TextLayoutReport, EngineError>> {
+        let Self {
+            text,
+            raster,
+            atlas,
+            glyph_atlas,
+            windows,
+            pending_dirty,
+            ..
+        } = self;
+        let window = windows.get_mut(&window)?;
+        let scale = window.scale().factor();
+        let mut report = TextLayoutReport::default();
+
+        for attempt in 0..2 {
+            let generation = atlas.glyph().generation();
+            let mut laid = 0usize;
+            let mut reused = 0usize;
+            let tree = window.tree_mut();
+            let mut index = 0usize;
+            while index < tree.order().len() {
+                let node = tree.order()[index];
+                index += 1;
+                let Some(shaped) = tree.text_slot(node).map(|slot| Rc::clone(slot.shaped())) else {
+                    continue;
+                };
+                let width = {
+                    let width = tree.text_content_width(node);
+                    if width > 0.0 {
+                        width
+                    } else {
+                        shaped.widths().max / scale
+                    }
+                };
+                let current = tree
+                    .text_slot(node)
+                    .map(|slot| (slot.laid_width_bits(), slot.laid_generation()));
+                if current == Some((width.to_bits(), generation)) && tree.text_line(node).is_some()
+                {
+                    reused += 1;
+                    continue;
+                }
+
+                let layout = shaped.layout_at(width);
+                let (line, diagnostics, _stats) = match shaped.rasterize(
+                    &layout,
+                    width,
+                    raster,
+                    glyph_atlas,
+                    atlas.glyph_mut(),
+                    generation,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                pending_dirty.merge(&mut atlas.glyph_mut().take_dirty_rows());
+                text.push_diagnostics(diagnostics);
+                tree.set_text_line(node, Rc::new(line), layout, width, generation);
+                laid += 1;
+            }
+            if atlas.glyph().generation() == generation {
+                report.laid = laid;
+                report.reused = reused;
+                report.reruns = attempt;
+                return Some(Ok(report));
+            }
+        }
+        Some(Err(EngineError::TextShape {
+            node: window.tree().root(),
+            detail: smol_str::SmolStr::new_static(
+                "atlas generation changed twice within one text pass",
+            ),
+        }))
+    }
+    /// 当前字体栈。
+    #[must_use]
+    pub fn font_stack(&self) -> &FontStack {
+        self.text.font_stack()
+    }
+
+    /// 当前字体栈版本（形状缓存键的一部分）。
+    #[must_use]
+    pub fn font_stack_version(&self) -> u32 {
+        self.text.font_stack_version()
+    }
+
+    /// 文本诊断（tofu / 行内盒边界 / 超宽 / 合成样式）。
+    #[must_use]
+    pub fn text_diagnostics(&self) -> &[TextDiagnostic] {
+        self.text.diagnostics()
+    }
+
+    /// 字体栈的健康状态（N4：测试与诊断的**唯一**跳过判据）。
+    pub fn font_stack_status(&mut self) -> FontStackStatus {
+        self.text.font_stack_status()
+    }
+
+    /// 换字体栈：版本 +1、字体代际 +1、清形状缓存与字形图集、所有窗口的文本节点
+    /// `LAYOUT | PAINT`。返回新版本号。
+    pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
+        let version = self.text.set_font_stack(stack);
+        self.glyph_atlas.clear();
+        self.atlas.glyph_mut().clear();
+        self.raster.set_font_epoch(self.text.font_epoch());
+        self.invalidate_all_text();
+        version
+    }
+
+    /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
+    pub fn reload_system_fonts(&mut self) -> u32 {
+        let version = self.text.reload_system_fonts();
+        self.glyph_atlas.clear();
+        self.atlas.glyph_mut().clear();
+        self.raster.set_font_epoch(self.text.font_epoch());
+        self.invalidate_all_text();
+        version
+    }
+
+    /// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。
+    fn invalidate_all_text(&mut self) {
+        let ids: SmallVec<[WindowId; 4]> = self.windows.keys().copied().collect();
+        for id in ids {
+            let Some(window) = self.windows.get_mut(&id) else {
+                continue;
+            };
+            let tree = window.tree_mut();
+            let order: SmallVec<[crate::node::id::NodeId; 8]> =
+                tree.order().iter().copied().collect();
+            for node in order {
+                if tree.text_content(node).is_some() {
+                    tree.invalidate_text_layout(node);
+                }
+            }
+        }
     }
 
     /// 沿依赖图失效：节点标脏（或经派生级联），有节点变脏则置唤醒位。
@@ -365,6 +664,327 @@ mod tests {
             .expect("current-thread runtime");
         let app = App::new(rt.handle().clone());
         (rt, app)
+    }
+
+    // ── P05：文本 pass / 字体栈 / B1 失效纪律 ────────────────────────────────
+
+    fn text_style(width: Option<f32>) -> crate::paint::style::Style {
+        let mut style = crate::paint::style::Style::default();
+        style.inner.align_self = Some(taffy::style::AlignSelf::START);
+        if let Some(width) = width {
+            style.inner.size.width = taffy::style::Dimension::length(width);
+        }
+        style
+    }
+
+    fn text_app(
+        text: &str,
+        width: Option<f32>,
+    ) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
+        let (rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let node = NodeBuilder::text(text, crate::text::TextStyle::new(16.0))
+            .style(text_style(width))
+            .build(w.tree_mut(), root)
+            .expect("挂载成功");
+        (rt, app, window, node)
+    }
+
+    fn refresh(app: &mut App, window: WindowId) -> crate::text::TextPassReport {
+        app.refresh_text(window)
+            .expect("窗口存在")
+            .expect("文本 pass 不报错")
+    }
+
+    fn set_text(
+        app: &mut App,
+        window: WindowId,
+        node: NodeId,
+        text: &str,
+        style: crate::text::TextStyle,
+    ) {
+        app.window_mut(window)
+            .expect("窗口存在")
+            .tree_mut()
+            .set_text_content(node, crate::text::TextContent::new(text, style));
+    }
+
+    fn text_layout(app: &mut App, window: WindowId) -> crate::text::TextLayoutReport {
+        app.layout_text(window)
+            .expect("窗口存在")
+            .expect("文本重排不报错")
+    }
+
+    fn layout(app: &mut App, window: WindowId) -> crate::layout::LayoutReport {
+        app.window_mut(window)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局不报错")
+    }
+
+    fn layout_height(app: &App, window: WindowId, node: NodeId) -> f32 {
+        app.window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点存在")
+            .layout()
+            .bounds
+            .size
+            .height
+    }
+
+    #[test]
+    fn refresh_text_requires_an_existing_window() {
+        let (_rt, mut app) = new_app();
+
+        assert!(app.refresh_text(WindowId::for_test(0)).is_none());
+    }
+
+    #[test]
+    fn refresh_text_shapes_once_then_reuses() {
+        let (_rt, mut app, window, node) = text_app("hello", None);
+
+        let first = refresh(&mut app, window);
+        let second = refresh(&mut app, window);
+
+        assert_eq!(first.shaped, 1);
+        assert_eq!(second.skipped, 1, "B4: unchanged snapshot must be skipped");
+        assert_eq!(second.shaped, 0);
+        // 行快照只由第二阶段（layout_text）产出。
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .is_none(),
+            "refresh_text must not attach a line snapshot (B1)"
+        );
+        let laid = text_layout(&mut app, window);
+        assert_eq!(laid.laid, 1);
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .is_some(),
+            "layout_text must attach the final snapshot"
+        );
+    }
+
+    #[test]
+    fn bind_text_reevaluation_updates_content_and_marks_paint() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(smol_str::SmolStr::new_static("first"));
+        let node = {
+            let w = app.window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::text("", crate::text::TextStyle::new(16.0))
+                .bind_text(move |cx| cx.read(&signal))
+                .build(w.tree_mut(), root)
+                .expect("挂载成功")
+        };
+
+        let report = app.refresh_styles(window).expect("窗口存在");
+        assert_eq!(report.text_evaluated, 1);
+        assert_eq!(report.text_changed, 1);
+        clear_dirty(&mut app, window);
+        let report = app.refresh_styles(window).expect("窗口存在");
+        assert_eq!(report.text_changed, 0, "unchanged value must not re-mark");
+
+        app.write(&signal, smol_str::SmolStr::new_static("second"));
+        let report = app.refresh_styles(window).expect("窗口存在");
+        assert_eq!(report.text_changed, 1);
+        let content = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_content(node)
+            .expect("文本节点")
+            .clone();
+        assert_eq!(content.text, "second");
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .dirty()
+                .contains(DirtyFlags::PAINT)
+        );
+    }
+
+    #[test]
+    fn text_size_change_marks_layout() {
+        let (_rt, mut app, window, node) = text_app("ab", None);
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        clear_dirty(&mut app, window);
+
+        set_text(
+            &mut app,
+            window,
+            node,
+            "a much longer text that wraps",
+            crate::text::TextStyle::new(16.0),
+        );
+        let _ = refresh(&mut app, window);
+
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .dirty()
+                .contains(DirtyFlags::LAYOUT),
+            "a size change must set LAYOUT"
+        );
+    }
+
+    #[test]
+    fn text_same_size_still_clears_the_taffy_cache() {
+        // B1：尺寸没变（"ab" → "ba"）也必须清 node..root 的 taffy 缓存，否则陈旧 measure 会留存。
+        let (_rt, mut app, window, node) = text_app("ab", None);
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let warm = layout(&mut app, window);
+        assert_eq!(warm.cache_misses, 0, "second layout must hit the cache");
+        assert!(warm.cache_hits > 0);
+        clear_dirty(&mut app, window);
+
+        set_text(
+            &mut app,
+            window,
+            node,
+            "ba",
+            crate::text::TextStyle::new(16.0),
+        );
+        let _ = refresh(&mut app, window);
+        let dirty = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点存在")
+            .dirty();
+        assert!(
+            !dirty.contains(DirtyFlags::LAYOUT),
+            "same measured size must not set LAYOUT"
+        );
+
+        let cold = layout(&mut app, window);
+        assert!(
+            cold.cache_misses >= 1,
+            "the measure cache must be cleared even when the size is unchanged"
+        );
+    }
+
+    #[test]
+    fn text_wrap_change_same_max_width_relayouts() {
+        // B1 的反例：Wrap → Anywhere 的 max-content 宽相同，但定宽（40 px）下的行数/高度不同。
+        let (_rt, mut app, window, node) = text_app("aaaaaaaaaa", Some(40.0));
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let height_before = layout_height(&app, window, node);
+
+        let mut style = crate::text::TextStyle::new(16.0);
+        style.wrap = crate::text::TextWrap::Anywhere;
+        set_text(&mut app, window, node, "aaaaaaaaaa", style);
+        let _ = refresh(&mut app, window);
+        let relayout = layout(&mut app, window);
+        let height_after = layout_height(&app, window, node);
+
+        assert!(
+            relayout.cache_misses >= 1,
+            "snapshot change must invalidate the measure cache"
+        );
+        assert!(
+            height_after > height_before,
+            "BreakAll wraps into more lines at 40 px: {height_after} vs {height_before}"
+        );
+    }
+
+    #[test]
+    fn set_font_stack_invalidates_all_text_and_drops_the_shape_cache() {
+        let (_rt, mut app, window, node) = text_app("hello", None);
+        let _ = refresh(&mut app, window);
+
+        let version = app.set_font_stack(crate::text::FontStack::new(["Segoe UI"]));
+
+        assert_eq!(version, 2);
+        assert_eq!(app.font_stack_version(), 2);
+        assert!(app.font_stack().families().count() == 1);
+        let dirty = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点存在")
+            .dirty();
+        assert!(dirty.contains(DirtyFlags::LAYOUT | DirtyFlags::PAINT));
+        // 形状缓存被清空 ⇒ 下一次 refresh_text 重新 shape。
+        let report = refresh(&mut app, window);
+        assert_eq!(report.shaped, 1);
+    }
+
+    #[test]
+    fn reload_system_fonts_is_idempotent_but_bumps_the_version() {
+        let (_rt, mut app, window, _node) = text_app("x", None);
+        let before = app.font_stack_version();
+
+        let after = app.reload_system_fonts();
+
+        assert_eq!(after, before + 1);
+        assert!(app.refresh_text(window).is_some());
+    }
+
+    #[test]
+    fn scale_change_clears_the_atlas_generation() {
+        let (_rt, mut app, window, node) = text_app("hello", None);
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let first = text_layout(&mut app, window);
+        assert!(first.laid > 0);
+        let generation_before = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("快照存在")
+            .atlas_generation;
+
+        app.window_mut(window)
+            .expect("窗口存在")
+            .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let second = text_layout(&mut app, window);
+        let generation_after = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("快照存在")
+            .atlas_generation;
+
+        assert!(
+            generation_after > generation_before,
+            "DPI change bumps the atlas"
+        );
+        assert!(second.laid > 0, "the text is re-laid at the new ppem");
+    }
+
+    #[test]
+    fn text_diagnostics_start_empty_for_supported_text() {
+        let (_rt, mut app, window, _node) = text_app("ascii only", None);
+        let _ = refresh(&mut app, window);
+
+        // 具体诊断依宿主字体而定；这里只要求 API 可用且不 panic。
+        let _ = app.text_diagnostics();
     }
 
     fn node_with<F>(app: &mut App, window: WindowId, bind: F) -> NodeId
@@ -886,5 +1506,167 @@ mod tests {
         let _ = app.take_wake_request();
         assert!(app.write(&signal, 5), "值仍然会变");
         assert!(!app.take_wake_request(), "退订后再写旧信号不得再命中该节点");
+    }
+
+    #[test]
+    fn layout_text_breaks_at_the_content_width() {
+        // B1：60 px 宽、16 px 字号的 4 个单词必须断成多行，且选区矩形逐行对齐。
+        let (_rt, mut app, window, node) = text_app("aaaa aaaa aaaa aaaa", Some(60.0));
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let report = text_layout(&mut app, window);
+
+        assert_eq!(report.laid, 1);
+        let tree = app.window(window).expect("窗口存在").tree();
+        let line = tree.text_line(node).expect("行快照").clone();
+        assert!(
+            line.lines.len() >= 3,
+            "content width 60 must wrap into several lines, got {}",
+            line.lines.len()
+        );
+        let rects = tree
+            .text_selection_rects(node, 0, line.text.len())
+            .expect("选区");
+        assert!(
+            rects.len() >= 3,
+            "selection rects must cover the broken lines"
+        );
+        assert!(
+            line.width <= 60.5,
+            "the line box must respect the content width"
+        );
+    }
+
+    #[test]
+    fn close_window_forgets_the_scale_epoch() {
+        let (_rt, mut app, window, _node) = text_app("x", None);
+        let _ = refresh(&mut app, window);
+        assert!(app.close_window(window));
+        assert!(!app.close_window(window), "second close is a no-op");
+    }
+
+    #[test]
+    fn changed_text_always_relayouts_the_snapshot() {
+        let (_rt, mut app, window, node) = text_app("aaaa aaaa aaaa aaaa", Some(60.0));
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let _ = text_layout(&mut app, window);
+
+        for text in ["bbbb", "aaaa aaaa aaaa aaaa bbbb", "WWWW"] {
+            set_text(
+                &mut app,
+                window,
+                node,
+                text,
+                crate::text::TextStyle::new(16.0),
+            );
+            let pass = refresh(&mut app, window);
+            assert_eq!(pass.shaped, 1, "new text must reshape");
+            let laid = text_layout(&mut app, window);
+            assert_eq!(laid.laid, 1, "B4: changed text must relayout ({text})");
+            assert_eq!(laid.reused, 0);
+            let tree = app.window(window).expect("window").tree();
+            assert_eq!(tree.text_line(node).expect("line").text, text);
+        }
+    }
+
+    #[test]
+    fn style_and_family_changes_relayout() {
+        let (_rt, mut app, window, node) = text_app("same text", Some(60.0));
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let _ = text_layout(&mut app, window);
+
+        let mut style = crate::text::TextStyle::new(24.0);
+        style.family = Some(smol_str::SmolStr::new_static("Consolas"));
+        set_text(&mut app, window, node, "same text", style);
+
+        let pass = refresh(&mut app, window);
+        assert_eq!(pass.shaped, 1, "style/family is part of the shape key");
+        assert_eq!(text_layout(&mut app, window).laid, 1);
+    }
+
+    #[test]
+    fn inline_boxes_changes_relayout() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let spec = crate::text::InlineBoxSpec {
+            id: 7,
+            index: 1,
+            size: crate::math::Size::new(20.0, 20.0),
+            baseline: None,
+            align: crate::text::InlineAlign::Baseline,
+        };
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
+                .inline_boxes([spec])
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        assert_eq!(text_layout(&mut app, window).laid, 1);
+
+        let spec2 = crate::text::InlineBoxSpec {
+            id: 9,
+            index: 1,
+            size: crate::math::Size::new(40.0, 10.0),
+            baseline: Some(8.0),
+            align: crate::text::InlineAlign::Top,
+        };
+        {
+            let tree = app.window_mut(window).expect("window").tree_mut();
+            let mut content = tree.text_content(node).expect("text").clone();
+            content.inline_boxes = Box::new([spec2]);
+            tree.set_text_content(node, content);
+        }
+        let pass = refresh(&mut app, window);
+        assert_eq!(pass.shaped, 1, "inline boxes are part of the shape key");
+        assert_eq!(text_layout(&mut app, window).laid, 1);
+    }
+
+    #[test]
+    fn bind_text_preserves_inline_boxes() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(smol_str::SmolStr::new_static("first"));
+        let spec = crate::text::InlineBoxSpec {
+            id: 3,
+            index: 0,
+            size: crate::math::Size::new(16.0, 16.0),
+            baseline: None,
+            align: crate::text::InlineAlign::Baseline,
+        };
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("", crate::text::TextStyle::new(16.0))
+                .bind_text(move |cx| cx.read(&signal))
+                .inline_boxes([spec])
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+
+        for value in ["first", "second"] {
+            let _ = app.refresh_styles(window);
+            let content = app
+                .window(window)
+                .expect("window")
+                .tree()
+                .text_content(node)
+                .expect("text")
+                .clone();
+            assert_eq!(
+                content.inline_boxes.len(),
+                1,
+                "inline boxes survive bind_text"
+            );
+            assert_eq!(content.text, value);
+            if value == "first" {
+                app.write(&signal, smol_str::SmolStr::new_static("second"));
+            }
+        }
     }
 }

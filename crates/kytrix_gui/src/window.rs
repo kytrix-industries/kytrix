@@ -68,6 +68,8 @@ pub struct Window {
     tree: NodeTree,
     scene: Scene,
     scale: Scale,
+    /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
+    scale_epoch: u32,
 }
 
 impl Window {
@@ -80,6 +82,7 @@ impl Window {
             tree: NodeTree::new(),
             scene: Scene::empty(),
             scale,
+            scale_epoch: 0,
         }
     }
 
@@ -133,6 +136,9 @@ impl Window {
 
     /// 用窗口逻辑尺寸重排，返回本次布局统计（P06/P09 的帧驱动调用它）。
     ///
+    /// **文本节点必须先在本帧调用 `App::refresh_text`**：`NodeBuilder::text` 不设 measure，
+    /// 没跑文本 pass 的文本节点测量为 `0×0`（P05 §13.4）。
+    ///
     /// # Errors
     /// `EngineError::InvalidMeasure { node, axis, value }`：某个 measure 闭包返回 NaN / 负数（首条优先）。
     /// 出错时布局盒可能为空，调用方**不得**提交本帧。
@@ -150,8 +156,15 @@ impl Window {
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
     pub fn set_scale(&mut self, scale: Scale) {
         self.scale = scale;
+        self.scale_epoch = self.scale_epoch.wrapping_add(1);
         let root = self.tree.root();
         self.tree.mark_layout(root);
+    }
+
+    /// DPI 代际（`set_scale` 递增；`App::refresh_text` 的图集换代判据）。
+    #[must_use]
+    pub fn scale_epoch(&self) -> u32 {
+        self.scale_epoch
     }
 }
 
@@ -350,5 +363,17 @@ mod tests {
             "尺寸变化必须标根 LAYOUT（实际 {flags:?}）"
         );
         assert_eq!(window.size(), Size::new(640.0, 480.0));
+    }
+    #[test]
+    fn scale_epoch_bumps_on_dpi_change() {
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        assert_eq!(window.scale_epoch(), 0);
+
+        window.set_scale(Scale::new(1.5).expect("finite scale"));
+        assert_eq!(window.scale_epoch(), 1);
+
+        window.set_scale(Scale::new(2.0).expect("finite scale"));
+        assert_eq!(window.scale_epoch(), 2);
+        assert_eq!(window.scale().factor(), 2.0);
     }
 }
