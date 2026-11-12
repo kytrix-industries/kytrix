@@ -755,3 +755,296 @@
 - **决策**：**本阶段不补齐**，登记为债务。理由：①这些字段的语义已由 phase-02 §5–§10 逐条定义，重复一遍会形成两处真相；
   ②`missing_docs` 未开启为 lint，不影响门禁；③字段注释应在 P03/P07 的**首个消费者**落地时按实际用法补（那时才知道哪些字段值得展开）。
 - **触发条件**：P10 的 `contract.md` 同步要求 rustdoc 可读，或任何 Phase 决定开启 `#![warn(missing_docs)]` → 先补 `paint::*`。
+
+---
+
+## 八、Phase 03 节点状态核心（2026-11-12）
+
+> 关联文档：`design/phase-03-node-state.md`（本节 = 该文档 §22 的落地条目；裁决记录见该文档 §20）。
+> **项目级授权 A-01 继续适用**；M-01…M-09、F-09/F-13/F-14/F-17、S-07、§七 全部条目继续有效，本节不重复。
+> 本节只**追加**，不改写任何历史条目（一～七 未改动）。
+>
+> **事实基线**：`taffy 0.15.0`（`Style<S>`/`Dimension`/`Layout`/`Cache`）、`tokio 1.54.1`（`Handle`）、
+> `ahash 0.8.12`、`smallvec 1.16.5`、`bitflags 2.13.2` 的真实源码（`E:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\`），
+> 逐条行号见 phase-03 §2。**未使用 web 检索**；P03 不写生产代码，唯一的语言行为 probe 是
+> `%TEMP%\kg-p03-priv-probe`（验证 `private_interfaces` 在 `-D warnings` 下为 error，决定 F-38 的形态，见 phase-03 §2.4）。
+>
+> **裁决**（phase-03 §20 提案 / §23 裁决记录，2026-11-12 上级裁决：**全部采纳**）：①`Application`/`AppHandle` 推迟，
+> `App::runtime_handle(&self) -> &Handle`；②`versions` 全删（含每槽位 `version`）+ `write<T: Clone + PartialEq>` 等值短路；
+> ③`Scene` 写面 `pub` + doc 标注 engine-internal + 不 `Clone`/`Default`/无公开构造（取「只给切片投影」的方案②）；
+> ④`Owner` 携带 `WindowId`（derive 与去重/序规则见 S-32）；⑤派生环检测移到运行时（`EvalGuard` 保证 panic 安全）。
+> 裁决同时给出 9 条细化（`refresh_styles` 报告、`Border` 核对、`build` 错误语义、taffy 泄漏的白名单登记等），
+> 逐条落地位置见 phase-03 §23.2。
+
+### F-34 `NodeBuilder` 的公开路径改为 `node::builder::NodeBuilder`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §4.5 公开路径表：`NodeBuilder` `NodeHandle` `Slot` `Children` → `kytrix_gui::node::*`（定义文件 `src/node.rs`，模块根） |
+| 偏差 | `NodeBuilder` 定义在 **`src/node/builder.rs`**，公开路径 **`kytrix_gui::node::builder::NodeBuilder`**。`NodeHandle`/`Slot`/`Children` 推迟 P08（S-29） |
+| 原因 | P03 的文件树（brief）把 `NodeBuilder` 放叶子文件，且 P02 §3.3 已固化「模块根不定义 item」；两处约束冲突时按 P01 §4.5 自己的判据「公开路径 = 类型实际定义所在的文件路径」处理 |
+| 修订后设计 | phase-03 §4.1 的路径表；P08 的应用层迁移按 `node::builder::NodeBuilder` 引用 |
+
+### F-35 公开面首次包含第三方 crate 类型（`Style.inner: taffy::Style<SmolStr>`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §4.9.3 的草图 `pub struct Style { pub inner: taffy::Style, … }`；D24/I17 要求引擎只暴露 `Style`/`StylePatch`/`bind_style` |
+| 偏差 | 照草图**暴露** `pub inner: taffy::Style<SmolStr>`（类型参数必须写全 `SmolStr`：`taffy::Style` 的默认参数是 `DefaultCheapStr`，两者不是同一类型）。应用层 crate（`base_ui`）必须自行声明 `taffy = { workspace = true }` 才能构造它 |
+| 原因 | ①不暴露就必须为 40+ 个布局属性提供引擎自有访问器 —— 那正是 D24 明令只允许存在于应用层的「builder/DSL」；②`taffy` 已是引擎硬依赖且 workspace 精确钉 `=0.15.0`（P01 §5.3④），版本不会漂移；③`taffy` 的 `Style` 是**布局属性的唯一事实**（I5 的节点树即布局树），包一层再翻译一遍是双份真相 |
+| 修订后设计 | phase-03 §10.1；P06 追加的引擎自有字段（圆角/clip/阴影/字体族）走 `Style` 的新字段（additive），不改 `inner` 的语义。V-23 跟踪「additive 是否被结构体字面量构造挡住」 |
+
+### F-36 不新增 `paint::style::Border`，复用 `paint::primitive::Border`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §4.5：`Style` `StylePatch` `Border` `Cursor` → `kytrix_gui::paint::style::*`（`src/paint/style.rs`）；P03 的 brief 同样把 `Border` 列进 `paint/style.rs` |
+| 偏差 | **`paint/style.rs` 不定义 `Border`**；`StylePatch.border: Option<paint::primitive::Border>`（P02 已有的 `{ width: f32, color: Color }`） |
+| 原因 | P02 §4.2 的路径表已把 `Border` 归入 `paint::primitive::*`（它是 `QuadPaint::Solid` 的字段类型，属 I2 数据契约）。再定义一个 `paint::style::Border` 会出现两个同义类型 → 「一条边框两种真相」，且 P06 的 style→paint 每次都要转换 |
+| 修订后设计 | phase-03 §10.2；P01 §4.5 的 `Border` 行以本条 + P02 §4.2 为准（历史正文不改） |
+
+### F-37 `NodeBuilder::build` 返回 `Result<NodeId, EngineError>`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §3.10 / §4.9.3 / 附录 A：`pub fn build(self, tree: &mut NodeTree, parent: NodeId) -> NodeId` |
+| 偏差 | **`-> Result<NodeId, EngineError>`**，唯一错误是 `EngineError::StaleNode { node: parent }`（父节点已卸载） |
+| 原因 | ①挂到已卸载的容器是应用层可触发的真实错误（`Window::tree_mut` 允许 `remove`）；②静默丢弃子树会变成 stale drawing 且无诊断（违反 I10 的「不静默降级」精神）；③`StaleNode` 需要真实生产者（P01 §6.2.2 #7 的 payload 是 `NodeId`），否则该变体在 P03 无构造点；④冻结表不允许新增「`ParentMissing`」之类的变体 |
+| 修订后设计 | phase-03 §12.1/§12.2；应用层写法 `.build(&mut tree, parent)?`。P08 的 `base_ui` 在 `Result` 上传播（挂载失败 = 应用 bug，日志级别 error） |
+
+### F-38 `Scene` 的公开签名按可见性重构（`lane → lane_primitives`、`lane_mut` → `push`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P02 §7.2 的「P03 落地时的形状（已冻结）」：`pub fn lane(&self, id) -> Option<&Lane>`、`pub(crate) fn lane_mut(&mut self, id) -> Option<&mut Lane>` |
+| 偏差 | ①`lane` 改为 **`pub fn lane_primitives(&self, id: LaneId) -> Option<&[Primitive]>`**（**不**再返回 `&Lane`，见裁决 ③ 的方案②）；②`lane_mut` **不落地**，改为 **`pub fn push(&mut self, lane: LaneId, primitive: Primitive) -> bool`**；③写入面的可见性见 S-33，构造/派生约束见 F-39 |
+| 原因 | `Lane` 按 P02 N7/S-15 保持 `pub(crate)`；公开签名里出现 `pub(crate)` 类型会触发 `private_interfaces`（warn-by-default），在 `-D warnings` 门禁下**编译失败**。**已实测**（`%TEMP%\kg-p03-priv-probe`，`rustc 1.97.1`，`--edition 2024 -D warnings`）：`error: type `Lane` is more private than the item `Scene::lane`` / `= note: -D private-interfaces implied by -D warnings`；唯一规避是 `#[allow]`，AGENTS §4 禁止。裁决 ③ 进一步要求取**公开面更小**的方案②（只给图元切片投影；`Lane` 的内部状态——`clip_depth`——不泄漏，P06/P07 在 crate 内另有 `pub(crate)` 通道） |
+| 修订后设计 | phase-03 §13.2 的差异表；P02 §7.2 的其余条款（代际、`order`、持久性、`Scene` 不 `Clone`）**不变** |
+
+### F-39 `Scene` 不实现 `Clone`/`Default`，且**无公开构造器**（`pub(crate) fn empty()`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P02 §7.2：`#[derive(Debug, Default)] pub struct Scene` + `pub fn new() -> Self` |
+| 偏差 | ①`Scene` **只 `derive(Debug)`**（不 `Clone`、不 `Default`，P02 的「不 `Clone`」保留）；②构造函数为 **`pub(crate) fn empty() -> Self`**（唯一的构造点 = `Window::new`），应用层无法构造；③`Arena` 随之**不再实现 `Default`** |
+| 原因 | 裁决 ③ 明确要求「`Scene` 不实现 `Clone`/`Default`」。去掉 `Default` 后 `pub fn new()` 会触发 clippy `new_without_default`（style 组、warn-by-default），而 `#[allow]` 被 AGENTS §4 禁止 → 改名 `empty` 并降为 `pub(crate)`（同时消除「应用层自造 Scene」的口子） |
+| 修订后设计 | phase-03 §13.1/§13.2/§17.8-1；门禁 §18-11 新增三条 grep（`engine-internal` 标注、无 `derive(…Default/Clone)`、无 `pub fn new/default`） |
+
+### F-40 `App::refresh_styles(window) -> Option<StylePassReport>` 与报告类型
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-03 提案期：`pub fn refresh_styles(&mut self) -> usize`（全窗口、只返回被求值的个数） |
+| 偏差 | ①**按窗口**：`pub fn refresh_styles(&mut self, window: WindowId) -> Option<StylePassReport>`；②新增公开类型 **`StylePassReport { evaluated, layout_dirty, paint_dirty, wake_requested }`**（`Copy`）；③`None` = 该窗口不存在；④pass 结束后 `clear()` 求值栈（panic 兜底） |
+| 原因 | 裁决 6：报告要能被 P06 的 `FrameRecord` 直接复用，且帧是**按窗口**推进的；P03 没有「未知窗口」的错误变体（P01 §6.2.2 冻结表），`Option` 是唯一诚实的表达（比「返回全零报告 + 静默吞 bug」好） |
+| 修订后设计 | phase-03 §5.1（签名 + 报告字段语义）、§14.4（逐字 + 决策表）、§4.1/§4.2（路径与白名单闭包）、§17.9-4/5/7/8/11 |
+
+### S-23 P03 的落地判据 =「§1.3 白名单内 **或** 有非 test 消费者」
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 与 P02 §3.2（S-08）同源：`pub(crate)` item 必须有非 test 消费者；`pub` item 必须在 §1.3 白名单内或按其传递闭包登记（phase-03 §4.2）。**唯一例外**是 `Scene` 的写入面（S-33） |
+| 理由 | `dead_code` 是编译期硬门禁（`-D warnings`）；而白名单是「不越界」的产品约束。两者同时满足才落地 |
+| 执行 | phase-03 §4.3 的逐条审计表（实现时必须逐项对齐）；门禁 §18-8 的 grep |
+
+### S-24 `Application` / `AppHandle` 推迟 P08/P09
+
+| 项 | 内容 |
+|----|------|
+| 决策 | P03 **不落地** `Application`（`run(build)` 需要平台事件循环）与 `AppHandle`（需要 `PlatformDispatcher`）。`App` 侧命名 **`runtime_handle(&self) -> &tokio::runtime::Handle`**（借用；字段名 `runtime`） |
+| 理由 | P03 没有事件循环/派发器 → 两者无任何非 test 消费者，落地即 `dead_code`，或被迫写空壳（AGENTS §1.2/§4 禁止）。**命名由裁决 ① 定死**：不占用 `handle()`，P09 加 `App::handle() -> AppHandle` 时是纯新增、零破坏 |
+| 影响 | §1.3 白名单里的这两个名字仍属「**允许**但不要求本阶段落地」；P08/P09 落地时补齐（`AppHandle` 的语义见设计 §1.4 的跨线程入口） |
+| 交接 | P09 的 `PlatformDispatcher::wake(FrameWake)` 取代 `App::take_wake_request` 的**同一处调用点**（phase-03 §14.3） |
+
+### S-25 信号/派生值不回收（与 `App` 同寿），`SignalId` 无代际
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §3.9：「Signal 值：显式 `StateStore::drop(signal)`，引用计数（应用层持有句柄），无引用即释放」 |
+| 决策 | **不回收**：`values: Vec<SignalSlot>` 只增不减；`SignalId`/`DerivedId` 是纯 `u32`，**不带代际** |
+| 原因 | `Signal<T>` 被冻结为 `Copy` 句柄（设计 §3.2 + phase-03 §7.2）→ **无法**做引用计数（Copy 无法观测「最后一个句柄」）。没有删除就没有槽位复用，代际无用。应用的状态集是**有界**的（一个交易终端数百到数千信号），内存上界可算：`SignalSlot` ≈ 32 B |
+| 影响 | 设计 §3.9 的该行**作废**；`SignalId` 不需要 `StaleSignal` 类错误（也就不会破坏 P01 §6.2.2 的 17 变体冻结表） |
+
+### S-26 派生环检测移到运行时求值栈，`read_derived` 返回 `Result`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §3.9：「`Derived` 链在注册时做 DFS 检测环，命中即 `EngineError::CyclicDerived`，**拒绝注册**」 |
+| 决策 | 环检测在 **`ReadCtx::eval_derived` 的求值栈**上做：`EvalStack.contains(id)` → `Err(EngineError::CyclicDerived { derived })`。`App::derived` 永不失败；`ReadCtx::read_derived` 返回 `Result<T, EngineError>`。**入栈/出栈由 `EvalGuard`（拥有 `&mut EvalStack`，`Drop` 里 `pop`）保证 panic 安全**；**环检测先于 `take_compute`** → 求值失败不污染缓存（`dirty` 与 cache 均不动），闭包 panic 后该派生 `compute == None`，后续读返回 `CyclicDerived` 而不是 panic |
+| 原因 | 注册期 DFS **不可行**：①闭包读哪些信号/派生，在闭包运行前不可知；②注册时新派生尚不存在于任何闭包里（自引只能在运行期通过 `Rc<RefCell<Option<_>>>` 等间接建立），因此「注册时一定有环」这个前提不成立 |
+| 代价 | 派生读派生时要显式处理 `Result`（可 `expect`/`unwrap_or_default`）。绝大多数派生只读信号（不失败），不受影响 |
+| 备选（已否） | 「派生不得读派生」可从结构上消除环 —— 但会丢掉设计 §3.9 的派生链（行情派生指标需要它） |
+
+### S-27 删除 `versions`（独立向量与每槽位字段都删）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §3.2：`StateStore { values: HashMap<SignalId, Box<dyn Any>>, versions: Vec<u64> }`（「按 `SignalId` 索引，写入即 +1」） |
+| 决策 | **两者都删**：`versions` 向量不存在；`SignalSlot { value }` 也不再保留 `version: u64`（裁决 ②：「若没有读者则删除该字段，不要为测试保留」） |
+| 原因 | 本设计的失效是 **push**（`App::write` 直接标脏），staleness 由 `DerivedSlot.dirty` / `Node.dirty` 表达 —— 没有任何代码做「版本比较」。核对 P03 的全部非 test 读者：等值短路由值比较完成；`StylePassReport` 只统计 `evaluated`/`layout`/`paint`/`wake`；帧记录属 P06 → **零读者** ⇒ 保留即 `dead_code`（非 test 构建）+ 违反 AGENTS §2.1 |
+| 影响 | 「写相等值时是否失效」由 `App::write` 的 `PartialEq` 短路回答（相等**不**失效，phase-03 §7.5）；`SignalSlot` 尺寸 32 B → **24 B** |
+
+### S-28 `GEOMETRY` / `REUSABLE` 位在 P03 无读者（位已定义、有写者）
+
+| 项 | 内容 |
+|----|------|
+| 事实 | `DirtyFlags` 的 6 位在 P03 全部定义；`LAYOUT`/`PAINT`/`A11Y`/`ORDER` 有写者**且**有读者；`GEOMETRY` 无写者（P08）；`REUSABLE` 只在 `mark_*` 里被 `remove`（常量被读），读者在 P06 |
+| 决策 | 保留 6 位定义（设计 §3.4 冻结的位布局），不加占位/不删位 |
+| 理由 | 位是 `pub const`，不触发 `dead_code`；`remove(REUSABLE)` 真实读取该常量。删位会让 P06/P08 重新编号 → 破坏「位定义冻结」 |
+
+### S-29 `Children` / `Slot` / `NodeHandle` 推迟 P08
+
+| 项 | 内容 |
+|----|------|
+| 原文 | §1.3 白名单的「节点」行列出 `NodeId`、`NodeBuilder`、`NodeHandle`、`Slot`、`Children` |
+| 决策 | P03 只落 `NodeId` 与 `NodeBuilder`；其余三个推迟 P08 |
+| 原因 | 它们是**声明式建树的语法层**（子节点集合 / 命名插槽 / 可保存句柄），消费者是 `base_ui` 的组件组合（P08）。P03 的等价能力是 `NodeBuilder::build(tree, parent)` + `NodeTree::append_child`；`NodeId` 本身已是完整句柄（`Copy` + 代际） |
+| 影响 | 白名单不要求本阶段落地（同 S-24） |
+
+### S-30 `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 **P03**
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §6.2.2 冻结表 #7/#8 的「实现 Phase」列 = P04（当时的相位编号里 P04 是节点/状态层） |
+| 变更 | 实际落地 Phase = **P03**（相位重排：P03 = 节点状态核心）。**变体名、payload、`Display` 文案、`source() == None` 全部不变** |
+| 理由 | 冻结表是按当时的总计划编号写的；相位重排后「跟着消费者走」（P02 §3.2 的同一原则）。payload/文案不变 ⇒ 对外契约无变化 |
+| 追加 | `error.rs` 的 `all_variants()` 必须补两个新变体（`engine_error_source_is_none` 用例覆盖） |
+
+### S-31 P03 交付 **81** 个内联单测（brief 估算 40–60）
+
+| 项 | 内容 |
+|----|------|
+| 估算 | brief 的 40–60 |
+| 实际 | phase-03 §17 列出 **81**（id 7 / signal 12 / panic 安全 1 / dependency 8 / dirty 11 / tree 9 / builder 6 / style 3 / scene 9 / app 11 / window 4） |
+| 理由 | 每条对应一条独立不变量、终止条件或端到端断言（`Arena` A1–A5、依赖图 D1–D5、§3.4 的 8 行失效规则、跨窗口/唤醒/`A11Y`）。P02 交付 60，而 P03 的语义面更宽；平均每例 ~8 行。裁决后新增 5 条：等值短路风险（`Rc<Cell>` 反例）、`EvalGuard` 的 panic 安全、`refresh_styles` 未知窗口、`clear_frame` 的 clip 复位、叶子父的 debug 断言 |
+| 兜底 | 排期紧张时按「每张表从上到下」交付到 52 个（覆盖全部机制性断言，表尾为幂等/边界补充） |
+
+### S-32 `Owner::Node` 携带 `WindowId`（+ derive 与去重/序规则）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 设计 §3.3：`dependents: HashMap<SignalId, NodeIdSet>`、`tracker.record(signal.id, self.node)` —— 依赖边只带 `NodeId` |
+| 决策 | `Owner::Node { window: WindowId, node: NodeId }`；`NodeIdSet` 改为 `OwnerSet = SmallVec<[Owner; 2]>`（**不是** ahash `HashSet`，**不是**位图）；`Owner` 派生 `Clone, Copy, Debug, PartialEq, Eq, Hash`，**不**实现 `Ord`；去重 = 插入前 `contains` 线性查重 + 删除时 `retain` 清历史重复；**序 = 首次登记序**（不重排）；`replace_deps` 的结果**集合**与输入顺序无关，**迭代序**可能随 `new` 的顺序变化（对正确性无影响：失效只做标脏与 damage 并集，两者都与顺序无关） |
+| 原因 | ①`NodeId` 是**窗口内** arena 索引：两个窗口可以各自有 `n0.1`，不带窗口会在 `App::write` 里误标另一个窗口的同号节点（stale 之外的第二类错误）；②位图键是稠密 index，而 `NodeId` 的 index 会被复用（装卸），代际不在位图里 ⇒ 陈旧句柄的位会命中复用后的新节点；③稳态读者数 1–3，`SmallVec` 内联零分配、迭代序确定、差分是两条小切片比较；④排序需要 `Ord`，而 P03 没有任何排序消费者（诊断要稳定序时由调用方排序） |
+| 代价 | `Owner` 16 B（`u32` + 8 B + 判别）；mount 期主题类信号的集合插入是 O(k) 查重（V-26） |
+
+### S-33 `Scene` 的写入面在 P03 是 `pub`，且 doc 首行标注 engine-internal
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P02 §7.2：「以下 `pub(crate)`，消费者 = P03 的 paint 循环」；S-10：「`Scene` 只读 + `Canvas` 唯一公开写入口」 |
+| 事实 | P03 **没有** paint 循环（绘制指令生产属 P06）→ `new_lane`/`release_lane`/`lane_mut`/`clear_frame`/`set_order` 在 crate 内**零调用者** ⇒ `pub(crate)` 必触发 `dead_code` |
+| 决策 | 改为 **`pub`**：`new_lane`/`release_lane`/`push`/`clear_frame`/`set_order`/`clear_order` 全部公开，**每个方法的 doc 首行**写 `engine-internal, 应用层不得调用`；`lane_mut` 不落地（F-38）；构造/派生约束见 F-39 |
+| 为什么这不违反 S-10 | S-10 说的是「应用层的**唯一公开写入口**是 `Canvas`」—— 应用层依然拿不到 `&mut Scene`（`Window::scene()` 只读）、`Scene` 不 `Clone`/`Default` 且**无公开构造器**、`Window` 无 `set_scene`。`pub` 的是**方法**，不是可达的写路径 |
+| 交接 | P06 的 paint 循环成为首个**引擎内部**调用者；届时若要把这 6 个方法降回 `pub(crate)`，属于可见性收紧（有真实调用者），需另记偏差 |
+
+### S-34 `App::refresh_styles` 作为 P03 的样式求值 pass 落地（按窗口 + 报告）
+
+| 项 | 内容 |
+|----|------|
+| 事实 | P03 不做 paint pass（绘制指令生产属 P06）。但 `ReadCtx`/`ReadTracker`/`DependencyGraph::replace_deps`/`Derived` 求值/`EvalStack`/`EvalGuard`/`StylePatch` 比较/`affects_layout`/`Node.deps`/`bind_style` 字段这 10 余项能力**没有**其它非 test 消费者 |
+| 决策 | 落地 `App::refresh_styles(&mut self, window: WindowId) -> Option<StylePassReport>`（裁决 6 的细化，见 F-40）：按 `NodeTree::order()` 遍历该窗口，对 `PAINT` 且带 `bind_style` 的节点求值、替换依赖、写回 patch、按 `affects_layout` 升级 `LAYOUT`、按 `interactive`/`visible` 变化标 `A11Y`、最后清 `PAINT`；进入时 `clear()` 求值栈（panic 兜底） |
+| 为什么不是预防性抽象 | 它是 §4.9.4 步骤 4 的**前半**（「Paint 阶段重新求值 `bind_style` 得到 `StylePatch`」），且必须在**布局之前**运行（`affects_layout` 会改变布局输入）。P06 的 paint 阶段在重建 lane 前调用同一实现 → 不是过渡层，是帧流水线的固定一段 |
+| 边界 | **不产生任何 Scene 图元**；不重建 lane、不算 damage（`!REUSABLE` 与 `Node.damage` 交给 P06）；不读 `bind_text`/`bind_a11y`（P05/P11） |
+| 测试 | phase-03 §17.9 的 11 条（只重算脏节点、幂等、升级 `LAYOUT`、替换 deps、未知窗口、跨窗口、`A11Y`、报告的三个标志） |
+
+### S-35 `App::write` 的约束与「等值短路」的语义/风险
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `App::write<T: Clone + PartialEq + 'static>(&mut self, signal: &Signal<T>, value: T) -> bool`；`Signal<T>`/`Transient<T>`/`Derived<T>` 句柄与 `ReadCtx::read` **无** `PartialEq` 约束；短路用 `owned_ref`（借用比较，不克隆）。P03 **不提供** `Signal::set`；若将来提供，bound 必须与 `write` 相同 |
+| 语义 | `false` = 值未变（不标脏、不置唤醒）；`true` = 值变了（已失效）。返回值**不**表示「有节点被标脏」 |
+| 风险（必须写进应用层契约） | `T` 内部可变（`Rc<RefCell<_>>`/`Cell`/`Arc<Mutex<_>>`）且 `PartialEq` 只比外层 ⇒ 「内部变了但不重绘」。**应用层必须用不可变值语义**；风险由 phase-03 §17.2-6 的反例测试固化（R9） |
+| 原因 | 高频行情下「同一报价重复推送」极常见，短路省掉整条失效链路（I3 的「空闲零帧」也依赖它）；`PartialEq` 只在写路径，不传染读/句柄 |
+
+### S-36 `NodeBuilder::build` 的错误语义冻结（`StaleNode` 是唯一 `Err`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `build(self, tree, parent) -> Result<NodeId, EngineError>`，`Err` 只有 `StaleNode { node: parent }`（父不存在/代际不匹配）。其余情形：叶子父（`Canvas`/`Geometry`）= `debug_assert!` + release 放行（子树不参与布局）；结构环（仅 `append_child` 可能）= `debug_assert!` + 不改结构 + `Ok(())`；`Style` 非法 = `Ok`（交给 P04/P05 的布局校验）；OOM = abort（不引入 `try_reserve` 错误面） |
+| 原因 | P01 §6.2.2 的冻结表没有「父不可容子」变体，新增会破坏契约；而叶子父是应用层建模错误，debug 构建立刻暴露、release 下行为**安全且已定义**（子树不参与布局，不会 UB/画错） |
+| 落地 | phase-03 §12.1 的错误语义表 + `# Panics`、§12.2 伪代码的 `debug_assert!(!p.kind().is_leaf())`、§11.2 的 `NodeKind::is_leaf`、§17.6-6 用例 |
+
+### S-37 `App::runtime_handle` 的命名与返回形态
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `pub fn runtime_handle(&self) -> &tokio::runtime::Handle`（**借用**，不 clone）；`App` 的字段名同步为 `runtime` |
+| 原因 | 裁决 ①：不占用 `handle()` 这个名字 —— P09 加 `App::handle() -> AppHandle` 时是**纯新增、零破坏**；返回借用避免每次取句柄都 `clone`（`Handle: Clone` 是 O(1) 的 Arc 增加，但没必要） |
+| 交接 | P09 的 `PlatformDispatcher` 落地后，`take_wake_request` 的调用点换成 `wake(FrameWake)`，`runtime_handle` 保持不变 |
+
+### 八·待复核项（P03 新增）
+
+| 编号 | 内容 | 复核 Phase | 触发条件 / 处置 |
+|---|---|---|---|
+| V-23 | `Style` 的 P06 字段能否安全 additive 加（若应用层已按结构体字面量构造 `Style`，加字段即破坏构造点） | P06 | style→paint 落地时若冲突，改为 `Style { inner, paint: PaintStyle }` 子结构 |
+| V-24 | 派生闭包误读 `Transient` → 永久 stale（写 transient 不置 `dirty`） | P13 | 动画/滚动落地后若出现，加 `debug_assert` 或在求值期标记「读过 transient」 |
+| V-25 | `App::write` 的相等比较成本（`T` 大时 O(n)）**与等值短路的语义风险**（`T` 内部可变而 `PartialEq` 只比外层 ⇒ 不重绘） | P18 / P08 | 成本：L4 基准显示写路径占比显著 → 拆细信号；语义风险：写进应用层契约（S-35/R9），`base_ui` code review 约定 + P08 迁移文档 |
+| V-26 | `OwnerSet` 的 mount 期 O(k²) 插入（主题类信号聚合上千读者） | P18 | 5000 节点 mount >1 ms → 改 `ahash::HashSet`（接口不变） |
+| V-27 | 冒泡终止过保守（`Dimension::Auto` 一律视为依赖子内容） | P04 | `set_layout` 比较新旧 `size`：相同则不再向上（§4.4）；P03 的判定表是它的上界 |
+| V-28 | `order_pos` 是 O(n) 线性扫描（`Vec::insert`/`drain` 的定位） | P13 | 虚拟列表每帧上千次结构变更 → 加 `Node.order_index`（additive 字段） |
+| V-29 | 节点卸载后 `dependents` 残留死 owner（靠写路径 `retain` 惰性剔除） | P08 | 大量增删节点时内存/写路径扫描变慢 → `App::remove_node(window, node)` 精确退订 |
+| V-30 | `size_of::<Node>()` 实测（内联 `taffy::Style<SmolStr>`，估计 ~800 B） | P04 | 超 1024 B 或 5 万节点场景内存吃紧 → `style: Box<Style>`（不改公开面） |
+
+### F-41 `NodeId.generation` 用 `NonZeroU32`（`Option<NodeId>` 保持 8 B）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-03 §6.1：`pub struct NodeId { index: u32, generation: u32 }`，并把「`generation` 恒在 `1..=u32::MAX`」写成不变量 |
+| 偏差 | `generation: std::num::NonZeroU32`；`generation()` 仍返回 `u32`（`.get()`），**公开面不变** |
+| 原因 | 实现时 `size_of::<Option<NodeId>>()` 实测 **12 B**（两个 `u32` 没有 niche ⇒ `Option` 多一个 tag）。文档 §17.5-8 要求它 8 B（`Node.parent: Option<NodeId>` 零开销），而 `NonZeroU32` 把「0 永不是合法代际」提升为**类型即证明**：`Option<NodeId>` 回到 8 B，且 `ArenaKey::from_parts` 成为该不变量的唯一守门点 |
+| 影响 | 无公开面变化；`NodeId::for_test(_, 0)` 会在测试里 panic（0 本就非法） |
+
+### F-42 `ExpandedDimension::Calc` 是**无条件**分支（`#[cfg(feature = "calc")]` 不可表达），且变体名是 `Calc`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-03 §9.3（N3）：`#[cfg(feature = "calc")] ExpandedDimension::FitContentCalc(_) => false` |
+| 偏差 | ①变体名实际是 **`ExpandedDimension::Calc(_)`**（taffy 0.15.0 源码）；②写成**无条件** match 分支 |
+| 原因 | ①按 `E:\.cargo\registry\...\taffy-0.15.0\src\style\dimension.rs` 的 `ExpandedDimension` 定义，calc 变体名是 `Calc`；②我们的 crate **不能** `#[cfg]` 依赖的 feature（`feature = "calc"` 只匹配**本 crate** 的 feature），taffy 的 `calc` 由 workspace 精确开启（`features = [..., "calc", ...]`）⇒ 该变体恒存在，无条件列出即可；若将来关掉 calc，这里会**编译失败**（显式失败优于悄悄把 `Calc` 归入保守分支） |
+| 影响 | 行为与文档一致（`Calc` 不依赖子内容）；记录实现事实 |
+
+### F-43 `NodeTree::insert_child` 收「部件」而不是半成品 `Node`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-03 §11.2：`pub(crate) fn insert_child(&mut self, parent: NodeId, node: Node) -> Result<NodeId, EngineError>` |
+| 偏差 | `insert_child(&mut self, parent, kind: NodeKind, style: Style, bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>)` |
+| 原因 | `Node` 的全部字段都是 `node::tree` 私有的，`NodeBuilder` 无法构造 `Node`；若要走 `node: Node` 就得给 `Node` 加一个带**占位 id** 的构造器（占位 id 是 `NodeId::from_parts(0,0)`，而 0 不是合法代际），比现状更危险。收部件后 `id` 由 arena 铸出、无中间态 |
+| 影响 | 纯 crate 内部签名；调用点只有 `NodeBuilder::build` |
+
+### F-44 `eval_derived` 的 `take_compute == None` 分支**不加** `debug_assert`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-03 §7.4 伪代码：`else { debug_assert!(false, "派生值正在求值（环检测被绕过）"); return Err(CyclicDerived…) }` |
+| 偏差 | 去掉 `debug_assert!`，直接 `return Err(EngineError::CyclicDerived { derived })` |
+| 原因 | 这个分支有**两种**到达方式：①环检测被绕过（真不变量破坏）；②上一次求值 **panic** 导致 `compute` 未放回（**已定义的可恢复路径**，N8 明确要求「闭包 panic 后本派生返回 `CyclicDerived`，不得作为环的唯一判据」）。断言会把 ② 变成 debug 崩溃 ⇒ 一个闭包 panic 会让引擎在 debug 构建里**永久不可用**，与「panic 后仍可继续服务」的设计冲突。`tests::eval_guard_pops_on_panic_and_cache_survives` 固化了 ② |
+| 影响 | 环真被绕过时也返回强类型错误（而不是断言）；`CyclicDerived` 的 `Display` 已覆盖两种来源 |
+
+### S-38 测试落地实测：**87** 个 P03 用例（文档列 82），三处断言按可测性改写
+
+| 项 | 内容 |
+|----|------|
+| 实测 | `cargo test -p kytrix_gui` = **190 passed**（P01+P02 = 103，P03 = **87**）；`--release` = **184**（6 个 `#[cfg(debug_assertions)]` 用例不编译：`paint/canvas.rs` 2 个 P02 用例 + `paint/scene.rs` 2 + `node/tree.rs` 1 + `node/builder.rs` 1） |
+| 分布 | `id` 7、`signal` 13、`dependency` 9、`dirty` 13、`tree` 9、`builder` 6、`style` 3、`scene` 9（另加 P02 的 6 个 `Lane` 用例）、`app` 12、`window` 4、`error` 2（新增 `StaleNode`/`CyclicDerived` 的 Display 与 `all_variants` 覆盖） |
+| 比文档多 2 条 | ①`signal::split_borrow_returns_disjoint_views`（`StateStore::split` 的借用契约，B1/B2 的落地证据）；②`app::eval_guard_pops_on_panic_and_cache_survives` 从 `dependency.rs` 移到 `app.rs`（需要读 `App::eval_stack`，那里才有字段访问权） |
+| 断言改写 ① | phase-03 §17.4-10 原写「`Canvas`/`Geometry` 节点 `mark_layout` → 父不含 `LAYOUT`」。但 `NodeBuilder::build` **禁止**给叶子父挂子节点（§12.1），该场景不可达 ⇒ 改为谓词级断言 `leaf_kinds_do_not_depend_on_children`（叶子 `depends_on_children == false`，且它们自己的 `mark_layout` 仍标本节点） |
+| 断言改写 ② | phase-03 §17.8-5 原要把「超过 `MAX_CLIP_DEPTH` 的 `#[should_panic]`」放在 `scene.rs`；P02 的 `paint/scene.rs` 已有 `depth_cap_is_debug_assert` 覆盖同一断言 ⇒ P03 的用例只断言 `Scene::push` → `Lane::push` 的转发与 clip 图元计数，不重复断言上限 |
+| 断言改写 ③ | phase-03 §17.6-4 原写「`refresh_styles` 后 `style_patch()` 是闭包算出的值」——那是 `App` 级行为，`builder.rs` 拿不到 `App` ⇒ 用例改为断言「闭包确实存进节点、build 不预求值」，`refresh_styles` 的求值面由 `app.rs` 的 5 个用例覆盖 |
+
+### S-39 代码审查期（A/B）新增与替换的用例清单
+
+| 类别 | 用例 | 归属 |
+|---|---|---|
+| **新增（A-B2，D16/I3 端到端）** | `app::write_isolates_sibling_nodes`（同窗口两节点各读一信号，写 A 后 B 的 `DirtyFlags` 全量不变且 `take_wake_request()` 为真）、`app::write_only_derived_does_not_wake`（只有派生失效 ⇒ 不唤醒，且 `report.wake_requested == false`）、`app::write_marks_across_windows`（两窗口各一读者，写一次两者都脏） | `app.rs` |
+| **新增（A-B3/B-N4/A-N3 回归）** | `app::bind_style_panic_clears_ghost_deps`（成功求值 → panic → 再写旧信号不唤醒）、`app::create_window_ids_are_unique_and_monotonic`（1/2/3 且 `windows()` 带出 id）、`app::close_window_unknown_returns_false`、`tree::append_child_marks_moved_subtree_paint`（重挂后整棵子树 `PAINT` 且 `REUSABLE` 被清）、`tree::damage_unions_prev_and_current`、`tree::remove_marks_parent_structure`、`dirty::mark_a11y_keeps_damage` | `app.rs` / `tree.rs` / `dirty.rs` |
+| **强化（原断言过弱）** | `dirty::repeated_mark_layout_is_idempotent`（加 `damage == prev ∪ layout` 的内容断言）、`dirty::layout_escalation_marks_fixed_size_node_ancestors`（加两个谓词输入断言 + 早停分支复跑）、`dirty::leaf_kinds_do_not_depend_on_children`（加 auto/fixed/混合三例）、`app::refresh_styles_escalates_layout_when_patch_affects_layout`（`false→true` 与 `true→false` 双向）、`signal::equal_but_interior_mutable_value_is_not_repainted`（改为「不重绘 + 不唤醒」）、`signal::derived_cycle_is_reported_not_panicking`（去掉同义反复，改断言「依赖里没有未读信号」） | 各文件 |
+| **语义变更（B-N4）** | `NodeTree::append_child` 重挂时新增 `mark_subtree_paint`（逐节点 `touch(PAINT)` ⇒ 清 `REUSABLE` + 并 damage） | `node/tree.rs` |
+| **语义变更（A-N3）** | `NodeTree::touch` 只在 flags 含 `LAYOUT`/`PAINT` 时 `remove(REUSABLE)` + `accumulate_damage()`；`mark_a11y` 不再产生 damage | `node/tree.rs` |
+| **语义变更（A-N2）** | `App::refresh_styles` 的「闭包已丢」分支显式退订幽灵边：`graph.replace_deps(owner, ghost_deps, &[])` + `set_deps(∅)` | `app.rs` |
+| **API 对齐（A-B3/A-N8）** | `App::windows() -> (WindowId, &Window)`；`next_window_id` 从 1 起（0 非法）；`signal`/`derived`/`transient` 加 `Clone` bound；`Node` 补 7 个公开只读访问器（删 `damage_for_test`/`parent_for_test`）；`LaneId::{index, generation}` 降为 `#[cfg(test)]`；`Arena::len` 用 `saturating_sub` | 各文件 |
+| **工程化（A-N4/A-N5）** | `#[cfg(debug_assertions)] fn debug_assert_order_matches_tree`（`order` 必须是 DFS 先序全序），在 `insert_child`/`append_child`/`remove` 末尾调用；`Arena::len` 溢出安全 | `node/tree.rs` / `node/id.rs` |
+
+> **A-N6 注记**：`error.rs` 的模块文档把 `GeometryRegister` 的落地 Phase 统一为 **P09**（与 P01 §6.2.2 冻结表一致）；
+> P01 的该行无需改动，P09 落地时按其表执行即可（此条只是把 P03 文档里的旧笔误纠正）。

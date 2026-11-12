@@ -16,6 +16,11 @@ bytemuck = { workspace = true }
 color = { workspace = true }
 lyon = { workspace = true }
 
+# P03 节点 / 状态 / 容器
+ahash = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true }
+
 # P05 布局 / P06 文本
 fontique = { workspace = true }
 parley = { workspace = true }
@@ -84,5 +89,3 @@ xkbcommon = { workspace = true }
 [lints]
 workspace = true
 
-[dev-dependencies]
-ahash = { workspace = true }

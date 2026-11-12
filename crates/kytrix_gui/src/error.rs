@@ -3,16 +3,20 @@
 //! 只有强类型变体，不出现字符串错误或通用错误包装（AGENTS §3）。`Display` 为英文诊断文本，
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
-//! 变体表在 `design/phase-01-foundation.md` §6.2.2 冻结为 17 项，本阶段只实现不依赖后续阶段类型的
-//! 6 项：D8 基线五类 + [`EngineError::InvalidDpiScale`]。其余变体随对应阶段落地
-//! （`StaleNode` / `CyclicDerived` → P04，`InvalidMeasure` / `LayoutInvalid` → P05，
-//! `GeometryRegister` → P03，`AtlasExhausted` → P09，`TextShape` → P06，`AppInit` → P08，
+//! 变体表在 `design/phase-01-foundation.md` §6.2.2 冻结为 17 项，本阶段实现不依赖后续阶段类型的
+//! 8 项：D8 基线五类 + [`EngineError::InvalidDpiScale`] + P03 的 [`EngineError::StaleNode`] /
+//! [`EngineError::CyclicDerived`]。其余变体随对应阶段落地
+//! （`InvalidMeasure` / `LayoutInvalid` → P05，`GeometryRegister` → P09，
+//! `AtlasExhausted` → P09，`TextShape` → P06，`AppInit` → P08，
 //! `WindowCreate` → P12，`ResourceDecode` → P15，`A11yInit` → P14）。
-//! 完整「名称 + payload + 实现 Phase」表见 `design/phase-01-foundation.md` §6.2.2。
+//! 完整「名称 + payload + 实现 Phase」表见 `design/phase-01-foundation.md` §6.2.2；
+//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03（`design/DEVIATIONS.md` S-30）。
 
 use std::path::PathBuf;
 
 use smol_str::SmolStr;
+
+use crate::node::{id::NodeId, signal::DerivedId};
 
 /// 引擎公开错误枚举。
 ///
@@ -53,6 +57,17 @@ pub enum EngineError {
     /// 平台报告的 DPI 缩放因子非法（非有限值或 `<= 0`）。唯一生产者是平台层 DPI 事件处理。
     #[error("invalid DPI scale factor {factor}: must be finite and greater than zero")]
     InvalidDpiScale { factor: f32 },
+
+    /// 节点句柄不可用：从未存在、已卸载（代际不匹配），或**不是可移除的子节点**（root）。
+    #[error("stale node handle {node:?}: the node was unmounted or never existed in this window")]
+    StaleNode { node: NodeId },
+
+    /// 派生值形成环（或该派生的闭包上次 panic 未放回）。
+    #[error(
+        "cyclic derived value {derived:?}: its compute closure depends on itself (directly or \
+         through another derived value)"
+    )]
+    CyclicDerived { derived: DerivedId },
 }
 
 #[cfg(test)]
@@ -85,7 +100,35 @@ mod tests {
                 detail: SmolStr::new_static("CreateSwapChainForHwnd failed"),
             },
             EngineError::InvalidDpiScale { factor: 0.0 },
+            EngineError::StaleNode {
+                node: NodeId::for_test(3, 1),
+            },
+            EngineError::CyclicDerived {
+                derived: DerivedId::for_test(0),
+            },
         ]
+    }
+
+    #[test]
+    fn stale_node_display_mentions_the_state() {
+        let text = EngineError::StaleNode {
+            node: NodeId::for_test(3, 1),
+        }
+        .to_string();
+
+        assert!(text.contains("n3.1"), "{text}");
+        assert!(text.contains("unmounted or never existed"), "{text}");
+    }
+
+    #[test]
+    fn cyclic_derived_display_mentions_self_dependency() {
+        let text = EngineError::CyclicDerived {
+            derived: DerivedId::for_test(2),
+        }
+        .to_string();
+
+        assert!(text.contains("DerivedId(2)"), "{text}");
+        assert!(text.contains("itself"), "{text}");
     }
 
     #[test]
