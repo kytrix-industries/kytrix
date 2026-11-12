@@ -206,3 +206,44 @@ fn frame_outcome_is_reported() {
     assert_eq!(second, FrameOutcome::Idle);
     assert_eq!(app.frame_record().frame_index.get(), 1);
 }
+
+/// P11：`FrameRecord.a11y` 在**空闲帧**也必须存在（纯 `A11Y` 变化不提交像素）。
+#[test]
+fn idle_frames_still_record_the_a11y_snapshot() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let window = app.window_id();
+    let root = app.app().window(window).expect("窗口存在").tree().root();
+    let button = NodeBuilder::boxed()
+        .layout_override(LABEL)
+        .on_click(kytrix_gui::event::Action::custom("press"))
+        .a11y(kytrix_gui::a11y::A11yOverride {
+            label: Some(smol_str::SmolStr::new_static("提交")),
+            ..kytrix_gui::a11y::A11yOverride::default()
+        })
+        .id("submit")
+        .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+        .expect("挂载成功");
+
+    let first = app.drain().expect("帧成功").clone();
+    let snapshot = first.a11y.as_ref().expect("首帧必须有 a11y 交付");
+    assert!(snapshot.full, "首笔必须是全树");
+    assert_eq!(
+        snapshot.focus_node().engine,
+        root,
+        "没有焦点时焦点回退到窗口根"
+    );
+
+    // 只移动焦点 ⇒ 本帧 `Idle`，但快照仍必须挂到记录上。
+    app.app_mut().set_focus(window, Some(button));
+    let record = app.drain().expect("帧成功").clone();
+    assert_eq!(record.frame_index, first.frame_index, "空闲帧不提交");
+    let snapshot = record.a11y.as_ref().expect("空闲帧也要有 a11y 交付");
+    assert_eq!(
+        snapshot.focus_node().engine,
+        button,
+        "焦点节点必须独立携带（不依赖 nodes）"
+    );
+    assert!(record.damage.is_empty(), "a11y 更新不产生 damage");
+    let _ = FrameOutcome::Idle;
+}

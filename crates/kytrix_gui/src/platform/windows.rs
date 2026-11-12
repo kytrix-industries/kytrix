@@ -2,6 +2,7 @@
 //!
 //! 本文件只做模块声明与 crate 内出口；实现按职责分文件（创建窗口 / 消息泵 / DPI / IME / 剪贴板）。
 
+pub(crate) mod a11y;
 pub(crate) mod clipboard;
 pub(crate) mod dpi;
 pub(crate) mod event_loop;

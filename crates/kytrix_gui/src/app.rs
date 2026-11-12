@@ -52,6 +52,9 @@ use crate::{
     window::{FrameOutcome, FrameTicket, Window, WindowId, WindowOptions},
 };
 
+/// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
+const A11Y_DIAGNOSTIC_CAPACITY: usize = 64;
+
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StylePassReport {
@@ -123,6 +126,13 @@ pub struct App {
     cursor_pending: Option<Cursor>,
     /// 待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
     capture_request: Option<bool>,
+    /// a11y 动作的 handler 表（P11；同 `A11yAction` 后写覆盖）。
+    a11y_handlers: ahash::HashMap<
+        crate::a11y::A11yAction,
+        Box<dyn FnMut(&mut crate::a11y::A11yActionCtx<'_>)>,
+    >,
+    /// a11y 诊断（P11；环形上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
+    a11y_diagnostics: Vec<crate::a11y::A11yDiagnostic>,
 }
 
 /// 一次点击的记录（双击判定的输入）。
@@ -325,6 +335,8 @@ impl App {
             next_animation: 1,
             cursor_pending: None,
             capture_request: None,
+            a11y_handlers: ahash::HashMap::default(),
+            a11y_diagnostics: Vec::new(),
         }
     }
 
@@ -1233,6 +1245,9 @@ impl App {
         // damage 是**屏幕坐标**：视口在内容坐标里，必须减掉祖先滚动偏移（容器自身偏移不算）。
         let damage = scroll::to_screen(target.tree(), node, viewport);
         target.request_damage(damage);
+        // P11：a11y 的 bounds 也是屏幕化的内容坐标 ⇒ 偏移变了，整棵子树必须重发。
+        // 唯一写点在 `scroll_to`（`scroll_by` / 滚轮 / 动画滚动 / a11y action 全汇到这里）。
+        target.a11y_note_scroll(node);
         self.wake_requested = true;
         self.rewindow_virtual(window, node);
         Ok(())
@@ -1880,6 +1895,7 @@ impl App {
     /// **不产生任何 Scene 图元**（那是 P06 的 paint 阶段；两者共用本实现的前半段）。
     ///
     /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
+    /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
     pub fn refresh_styles(&mut self, window: WindowId) -> Option<StylePassReport> {
         let Self {
             store,
@@ -1889,7 +1905,12 @@ impl App {
             wake_requested,
             ..
         } = self;
-        let tree = windows.get_mut(&window)?.tree_mut();
+        // P11：本 pass 会求值全部 `bind_a11y`，旗标在这里消费。
+        if let Some(target) = windows.get_mut(&window) {
+            target.a11y_clear_bind_work();
+        }
+        let window_state = windows.get_mut(&window)?;
+        let tree = window_state.tree_mut();
         debug_assert!(eval_stack.is_empty(), "上一帧的派生求值栈泄漏");
         eval_stack.clear();
 
@@ -1901,9 +1922,11 @@ impl App {
             let node = tree.order()[index];
             index += 1;
 
-            let needs_eval = tree
-                .get(node)
-                .is_ok_and(|n| n.dirty().contains(DirtyFlags::PAINT));
+            let needs_eval = tree.get(node).is_ok_and(|n| {
+                n.dirty().contains(DirtyFlags::PAINT)
+                    // 只有 `bind_a11y` 的节点没有 PAINT（写信号只标 A11Y），但补丁仍要重算。
+                    || (n.dirty().contains(DirtyFlags::A11Y) && tree.has_a11y_bind(node))
+            });
             if !needs_eval {
                 continue;
             }
@@ -1912,7 +1935,8 @@ impl App {
                 .map_or_else(|_| StylePatch::default(), |n| n.style_patch().clone());
             let compute = tree.take_bind_style(node);
             let bind_text = tree.take_bind_text(node);
-            if compute.is_none() && bind_text.is_none() {
+            let bind_a11y = tree.take_bind_a11y(node);
+            if compute.is_none() && bind_text.is_none() && bind_a11y.is_none() {
                 // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（`build` 之后必然有闭包）。
                 // 那次 pass 在 `replace_deps` 之前就中断了，所以节点仍带着**上一次成功的** deps：
                 // 它们是「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。
@@ -1927,7 +1951,7 @@ impl App {
             let (values, derived) = store.split();
             let mut tracker = ReadTracker::new();
             // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
-            let (patch, text_value, owner) = {
+            let (patch, text_value, a11y_value, owner) = {
                 let mut ctx = ReadCtx::new(
                     values,
                     derived,
@@ -1940,7 +1964,10 @@ impl App {
                     .as_ref()
                     .map_or_else(StylePatch::default, |compute| compute(&mut ctx));
                 let text_value = bind_text.as_ref().map(|bind| bind(&mut ctx));
-                (patch, text_value, ctx.owner())
+                let a11y_value = bind_a11y
+                    .as_ref()
+                    .map_or_else(crate::a11y::A11yPatch::default, |bind| bind(&mut ctx));
+                (patch, text_value, a11y_value, ctx.owner())
             };
             if compute.is_some() {
                 evaluated += 1;
@@ -1990,6 +2017,18 @@ impl App {
                     text_changed_here = true;
                 }
             }
+            // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
+            if let Some(bind) = bind_a11y {
+                let previous = tree
+                    .a11y_of(node)
+                    .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
+                if a11y_value != previous {
+                    tree.set_a11y_patch(node, a11y_value);
+                    // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
+                    tree.mark_a11y(node);
+                }
+                tree.put_bind_a11y(node, bind);
+            }
             tree.clear_paint(node);
             if text_changed_here {
                 // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
@@ -2005,6 +2044,108 @@ impl App {
             text_evaluated,
             text_changed,
         })
+    }
+
+    // ── P11：无障碍（动作 / 诊断 / 交付） ──────────────────────────────────
+
+    /// 注册 a11y 动作的处理器（同 `A11yAction` 后写覆盖）。
+    ///
+    /// 返回 `false` = 该动作**不能**注册：`A11yAction::Click` 必须落到 P10 的 `Action` 表
+    /// （`App::on_action`），让指针点击 / 键盘 Enter / AT 激活共享同一身份
+    /// （`design/phase-11-a11y.md` §9.3）。
+    pub fn on_a11y_action(
+        &mut self,
+        action: crate::a11y::A11yAction,
+        handler: impl FnMut(&mut crate::a11y::A11yActionCtx<'_>) + 'static,
+    ) -> bool {
+        if action == crate::a11y::A11yAction::Click {
+            return false;
+        }
+        self.a11y_handlers.insert(action, Box::new(handler));
+        true
+    }
+
+    /// 删除 a11y 动作的处理器（返回是否真的删了）。
+    pub fn off_a11y_action(&mut self, action: crate::a11y::A11yAction) -> bool {
+        self.a11y_handlers.remove(&action).is_some()
+    }
+
+    /// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
+    #[must_use]
+    pub fn a11y_diagnostics(&self) -> &[crate::a11y::A11yDiagnostic] {
+        &self.a11y_diagnostics
+    }
+
+    /// 记录一条 a11y 诊断（唯一入口：计数与容量在这里统一）。
+    pub(crate) fn a11y_note(&mut self, diagnostic: crate::a11y::A11yDiagnostic) {
+        if self.a11y_diagnostics.len() >= A11Y_DIAGNOSTIC_CAPACITY {
+            self.a11y_diagnostics.remove(0);
+        }
+        self.a11y_diagnostics.push(diagnostic);
+    }
+
+    /// 该动作是否注册了 handler（`a11y::action` 的分派判据）。
+    pub(crate) fn a11y_has_handler(&self, action: crate::a11y::A11yAction) -> bool {
+        self.a11y_handlers.contains_key(&action)
+    }
+
+    /// 摘出 handler（借用纪律：调用期间它不在表里）。
+    pub(crate) fn a11y_take_handler(
+        &mut self,
+        action: crate::a11y::A11yAction,
+    ) -> Option<Box<dyn FnMut(&mut crate::a11y::A11yActionCtx<'_>)>> {
+        self.a11y_handlers.remove(&action)
+    }
+
+    /// 放回 handler。
+    pub(crate) fn a11y_put_handler(
+        &mut self,
+        action: crate::a11y::A11yAction,
+        handler: Box<dyn FnMut(&mut crate::a11y::A11yActionCtx<'_>)>,
+    ) {
+        self.a11y_handlers.insert(action, handler);
+    }
+
+    /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
+    #[must_use]
+    pub(crate) fn a11y_pending(&self, window: WindowId) -> bool {
+        self.windows.get(&window).is_some_and(Window::a11y_pending)
+    }
+
+    /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
+    ///
+    /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
+    /// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。
+    pub(crate) fn a11y_take(&mut self, window: WindowId) -> Option<crate::a11y::A11yTreeSnapshot> {
+        let mut diagnostics = Vec::new();
+        let snapshot = {
+            let Self { windows, .. } = self;
+            windows.get_mut(&window)?.a11y_take(&mut diagnostics)
+        };
+        for diagnostic in diagnostics {
+            self.a11y_note(diagnostic);
+        }
+        snapshot
+    }
+
+    /// 打开/关闭某个窗口的 a11y 快照捕获（`TestApp` 专用）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_a11y_capture(&mut self, window: WindowId, on: bool) {
+        if let Some(target) = self.windows.get_mut(&window) {
+            target.set_a11y_capture(on);
+        }
+    }
+
+    /// 该窗口的捕获是否打开。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn attach_a11y(
+        &mut self,
+        window: WindowId,
+        snapshot: crate::a11y::A11yTreeSnapshot,
+    ) {
+        if let Some(target) = self.windows.get_mut(&window) {
+            target.attach_a11y(snapshot);
+        }
     }
 
     // ── P06：完整帧（styles → text → layout → layout_text → paint → commit）────────
@@ -2402,11 +2543,18 @@ impl App {
                         let Some(target) = windows.get_mut(&window) else {
                             continue;
                         };
+                        // P11：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**产像素：
+                        // 标 `A11Y` 并让下一帧仍跑 `refresh_styles`（帧末门禁会退回 `Idle`）。
+                        let a11y_only = target.tree().has_a11y_bind(node)
+                            && !target.tree().has_visual_bind(node);
                         let affects_layout = target
                             .tree()
                             .get(node)
                             .is_ok_and(|n| n.style_patch().affects_layout);
-                        let alive = if affects_layout {
+                        let alive = if a11y_only {
+                            target.a11y_note_bind_work();
+                            target.tree_mut().mark_a11y(node)
+                        } else if affects_layout {
                             target.tree_mut().mark_layout(node)
                         } else {
                             target.tree_mut().mark_paint(node)

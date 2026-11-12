@@ -1941,3 +1941,112 @@
 | **S-105** | 公开面：`PressRecord`/`DragSession`/`ScrollSlot`/`OverlaySlot` 收为 `pub(crate)`（内部状态）；`DragInfo` 增加 `phase`；`AnimationId` 字段改名为 `generation`（单调代际）；`scroll_to` 对已卸载节点返回 `StaleNode` |
 | **S-106** | `lerp_color` 改为 **sRGB 分量**插值（端点精确、中点按 sRGB 编码后线性插值再解码），符合设计 §11.2 |
 | **V-74** | `platform::dispatcher` 两项 P09 用例在**全量并行**下偶发失败（`PostMessageW` 计数与他测并发），单跑/重跑稳定；本轮全量连跑 3 次中 1 次复现，非 P10 引入 |
+
+---
+
+## 十六、P11 · 无障碍（AccessKit）（2026-11-13）
+
+> 设计见 `design/phase-11-a11y.md`；probe 在 `%TEMP%\kg-p11-a11y`（仓库外、独立 `CARGO_TARGET_DIR`、`--offline`）。
+> 本阶段**只做设计 + API 核验 + 可编译 probe**：未写仓库代码、未改 `Cargo.toml` / `Cargo.lock`、未 commit。§16.4 的实施记录待实现期追加。
+> **阶段号**：`custom-gui-engine-design.md` §7 与 `phase-01-foundation.md` 附录 A.3 的「P14」= 本阶段（旧路线图编号）；
+> `phase-03/05/06/10` 里的「P11」也是本阶段。本文用 **P11**。
+
+### 16.1 设计期条目
+
+| 编号 | 内容 |
+|---|---|
+| **F-106** | **`Role::StaticText` 与 `Role::ScrollArea` 都不存在**（主设计 §7.4 的两处事实错误）。`accesskit 0.25.2` 的 `Role`（lib.rs:62）里与文本相关的只有 `TextRun`(65)、`Label`(67)、`Paragraph`(80)、`LineBreak`(160)；滚动容器是 `ScrollView`(182)。修订：文本 → `Label`，滚动容器 → `ScrollView` |
+| **F-107** | **`Role::TextRun` 不能当普通文本叶子**：`accesskit_consumer 0.39.2` 的 `common_filter_base` 把 `GenericContainer` 与 `TextRun` 都判为 `FilterResult::ExcludeNode`（filters.rs:31-34），`TextRun` 还要求 `character_lengths` / `character_positions` 才成立。且 `Label` 角色的**可访问名来自 `value`**（`label_comes_from_value()` ⇔ `role()==Label`，node.rs:756-763；`accesskit_windows/node.rs:406-409` 的 `name()` 按此分派，`Role::Label → UIA_TextControlTypeId`，node.rs:65）。修订：文本节点写 `Role::Label` + `set_value(text)`，**不写** `set_label` |
+| **F-108** | **`GenericContainer` 的子节点在 UIA 树里被上提**（probe ① #3/#4 实测：`root.filtered_children(common_filter)` 直接是 `[text, button, input, canvas, scroll]`，容器本身不出现）。因此「`Box` 有自己的 a11y 节点」是错的预期；容器要在 AT 树里出现必须显式给 `A11yOverride.role = Group`。反过来说，`Box → GenericContainer` 的映射**不需要**引擎做 children 压缩 |
+| **F-109** | `Canvas` / `Geometry` → **`Role::Image`**（不是 `GraphicsObject`）：ARIA 的 `graphics-object` 必须位于 `graphics-document` 之内，单独使用会让 UIA/NSA 的映射退化；`Image` 在 UIA 是 `UIA_ImageControlTypeId`、在 NSAccessibility 是 `image`，正是「有替代文本的图形」的语义。主设计 §7.4 的「`Image` / `GraphicsObject` 二选一」按此收口 |
+| **F-110** | **焦点可达性**：`common_filter_base` **先判 `is_focused()`**（focused ⇒ `Include`，filters.rs:17-20），`hidden` 只在其后（22-24）⇒ **被聚焦的 hidden 节点反而出现在 AT 树里**。真正会 `panic` 的是「`TreeUpdate.focus` 指向不在 `nodes` 里的节点」（`validate_global`，tree.rs:86-96 / :485）。修订：`hidden` 只表达可见性；焦点回退规则针对**未发出的节点**（虚拟列表回收行），不是 hidden |
+| **F-111** | **Windows adapter 没有 deactivation 路径**：`accesskit_windows 0.35.2` 全仓无 `deactivate` 字样、`Adapter` 无 `Drop`（只有 `SubclassingAdapter` 的 `Drop` 用于卸子类化，subclass.rs:200-204）；`DeactivationHandler`（accesskit lib.rs:3380-3388）只被 `accesskit_unix` 使用。修订：Windows 的「关闭时 deactivate」= `DestroyWindow` **之后** drop `Adapter`；主设计 §8.1 shutdown 清单里的「a11y deactivate」在 Windows 无对应 API |
+| **F-112** | **clip 不参与 `hidden` 判定（v1）**：主设计 §7.4 的「隐藏 / 被 clip 裁掉 ⇒ `set_hidden(true)`」只落前半。原因是"被完全裁掉"要算 `bounds ∩ clip_chain`（`hit_test` 级别的遍历），而 a11y pass 的增量语义会被"滚动导致整棵子树可见性翻转"污染。v1 只按 `visible:false` / `Display::None` / `A11yPatch.hidden` / 缺替代文本置 hidden；代价是滚出视口但**仍挂载**的节点仍暴露（虚拟列表未挂载的行本就不存在，不受影响） |
+| **F-113** | **`A11yTreeSnapshot` 进 `FrameRecord` 而不是 `RenderedFrame`**（主设计 §7.9 原文是「`RenderedFrame` 的一部分」）：`A11Y` 不产生 damage（§7.5 / P03 §9.3 表第 9 行）⇒ 纯 a11y 变化让 `App::frame` 返回 `FrameOutcome::Idle`，而 `RenderedFrame` 只在已提交帧存在（`window.rs:539-544` 的 `record_idle` 分支 `frame: None`）。放 `RenderedFrame` 会让「focus 每帧必带」「增量只含变更」两条断言在 Idle 帧上无从验证 |
+| **F-114** | **a11y 槽走侧表，`Node` 保持 1144 B**：`Node` 只剩 8 B 余量（F-102 的 1144 / 上限 1152），内联 `Option<Box<NodeA11y>>` 会正好顶满 1152（P12 无余量）。改为 `NodeTree.a11y_slots: Vec<Option<Box<NodeA11y>>>`（按 arena 槽位），与 `layout_cache`（S-42）、`clip_keys`（S-66）、`text_slots`、`debug_ids` **同型**，不引入新机制；槽位复用与 `remove` 的清槽纪律完全照抄既有四处 |
+| **S-107** | **`bind_a11y` 在 `refresh_styles` 内求值**（与 `bind_style` / `bind_text` 同一 `ReadCtx`、同一 `ReadTracker`、同一份依赖边集）。理由：`DependencyGraph::replace_deps(owner, old, new)` 是**整体替换** `Owner::Node{..}` 的边集（dependency.rs:55-82），独立 pass 会用「只有 bind_a11y 读过的信号」覆盖 `bind_style` 的边集 ⇒ 后者的依赖静默丢失。一条 pass / 一个 tracker / 一份边集是唯一自洽形态 |
+| **S-108** | **`A11Y` 是累积位**：`settle_frame` 只清 `LAYOUT|PAINT`（tree.rs:950-959），a11y pass 跑在帧之后 ⇒ 位会跨帧累积，由 pass 消费后显式 `clear_a11y(node)`。`NodeTree` 增加 O(1) 计数 `a11y_dirty: u32`（`touch` 里 A11Y 由无到有时 +1，`clear_a11y` 时 -1），平台层用它做「本轮有没有 a11y 工作」的 O(1) 判据 |
+| **S-109** | **`mark_layout` 追加 `A11Y`**：bounds 变了 ⇒ a11y bounds 必须重发，而 `LAYOUT` 在帧末被清，pass 看不见。`A11Y` 不产生 damage、不清 `REUSABLE`（`touch` 只在含 `LAYOUT|PAINT` 时累积 damage，tree.rs:1604-1614），所以这条追加不违反「a11y 更新不产生 damage」。实现期需复核两条既有用例的断言形态（`refresh_styles_escalates_layout_when_patch_affects_layout`、`layout_escalation_marks_fixed_size_node_ancestors`），若它们断言了 flags **相等**则改为 `contains` |
+| **S-110** | **a11y pass 在帧门禁之外**：`Window::needs_frame`（window.rs:378-386）与 `commit_frame` 的第二段门禁（`has_pixels`，window.rs:532-544）都只与像素有关。pass 由**平台泵每轮**调用一次（`pump` 的第 ④′ 步）+ 测试捕获路径（`App::frame` 开头）调用；平台层先用 O(1) 的 `app.a11y_pending(window)` 判据过滤，避免 adapter 一旦 Active 就每轮构全树判断 |
+| **S-111** | **公开面定案**：`kytrix_gui::a11y::{A11yRole, A11yNode, A11yLabel, A11yLabelSource, A11yNodeId, A11yAction, A11yOverride, A11yPatch, A11yTreeSnapshot, A11yPassReport, A11yDiagnostic, A11yActionCtx, A11yActionData}` 定义在 `src/a11y.rs`（自命名模块根，`interaction.rs` 同款）；`A11yBridge` / `A11yTree` / `NodeA11y` 是 `pub(crate)`。**`Selector::Role` 永久不做**（F-63 的「延后 P14」收口）：角色是 a11y pass 的产物、不在 `Node` 上，`Probe` 只有 `&NodeTree`；角色查询走 `A11yTreeSnapshot::node_for(engine_id)` |
+| **S-112** | **单一 drainer 规则**：a11y 的 pending 集合同一时刻只有一个消费者——生产构建里是 Windows adapter（`update_if_active` 的闭包），`test-support` 里是捕获路径。`A11yBridge.capture: bool` 只在 `TestApp` 里打开（`TestApp` 从不建原生窗口），生产恒 `false`；捕获路径不碰 `full_pending`。这条规则是 §10.5 用例 ① 的可断言前提 |
+| **S-113** | **Action 回投形态**：`platform/windows/a11y.rs` 的 `ActionHandler` 只做 `Dispatcher::push(UserTask::new(move |app| a11y::action::dispatch(app, window, request)))`（dispatcher.rs:19-98）；`ActionRequest` 全字段 `Send`。`Click` 必须落到 P10 的 `Action` 表（`focus::action_target` → `App::dispatch_action(ActionSource::Programmatic)`），**不合成 `PointerDown/Up`**（P10 §6.4 已裁决）；`A11yAction::Click` 因此不进 `on_a11y_action` 的合法键 |
+
+### 16.2 probe 记录（`%TEMP%\kg-p11-a11y`，2026-11-13）
+
+> 环境：Windows，非交互式 agent 会话；`cargo run --offline`（registry 缓存命中）；`CARGO_TARGET_DIR=%TEMP%\kg-p11-a11y-target`。
+
+| # | 实测项 | 结果 |
+|---|---|---|
+| 1 | `cpu_tree`：真实 `accesskit 0.25.2` 建 11 节点树 → `accesskit_consumer 0.39.2` 的 `Tree::new` | ✅ 全树接受，`root`/`focus`/`toolkit_name=="Kytrix"` 就位 |
+| 2 | 未过滤 children vs `filtered_children(common_filter)` | ✅ `[container, scroll, hidden]` vs `[text, button, input, canvas, scroll]`（容器上提、hidden 消失） |
+| 3 | `Label` 节点的 `label()` / `label_comes_from_value()` / `value()` | ✅ `None` / `true` / `Some("价格")` |
+| 4 | `bounds` 换算（逻辑 8/32/60/24 × 1.25，逐边 round） | ✅ `Rect::new(10, 40, 85, 70)` |
+| 5 | 只改 label 的增量 | ✅ `nodes.len()==1`、`updated==[button]`、`added==[]` |
+| 6 | 新增子节点**同批发父** | ✅ `added` 含子、父 children 变 3 |
+| 7 | **只发子不发父** | ✅ 消费端 `panic!("…neither in the current tree nor a child of another node…")`（`catch_unwind` 捕获） |
+| 8 | 删除（只发父 + children 缩短，被删节点不出现） | ✅ `removed` 含被删 id、父 children 回到 2 |
+| 9 | 只改焦点（`nodes: []`） | ✅ 合法，`focus_moved == [(root, button)]` |
+| 10 | 焦点指向不存在的 id | ✅ `panic!("Focused ID … is not in the node list")` |
+| 11 | hidden 节点：未聚焦 / 被聚焦 | ✅ 前者不在 filtered children；后者**反而 Include** |
+| 12 | 陈旧 `NodeId`（同槽位 generation+1） | ✅ `node_by_tree_local_id(..).is_none()` |
+| 13 | `ActionRequest{SetValue, Value("42")}` 经 `impl ActionHandler` | ✅ 收到且字段正确 |
+| 14 | 27 个 `Role` 变体逐条 `Node::new(role).role()==role` | ✅ |
+| 15 | `win_adapter`：隐藏窗口（`IsWindowVisible==false`）下 `Adapter::new(hwnd, false, handler)` | ✅ 构造成功（首显前构造可行；`SubclassingAdapter` 在此处会 panic） |
+| 16 | Inactive：`update_if_active(|| calls+=1)`（显示前 + 显示后，无 AT） | ✅ 均返回 `None`，闭包执行 **0** 次 |
+| 17 | `handle_wm_getobject(WPARAM(0), LPARAM(OBJID_CLIENT=-25), &mut activation)` | ✅ 返回 `Some(..)`（占位激活） |
+| 18 | 占位激活后 `update_if_active` | ✅ 返回 `Some(QueuedEvents)`，闭包执行 **1** 次（首棵全树） |
+| 19 | 非 client/root 的 objid | ✅ 返回 `None`（交 `DefWindowProcW`） |
+| 20 | `QueuedEvents::raise` 可作为 `fn(QueuedEvents)` 取到 | ✅（probe 刻意不调用：无 AT 时不向 UIA 广播） |
+| 21 | `wm_getobject_pattern`：`&mut` 借用作用域只覆盖 `handle_wm_getobject`，`Option<impl Into<LRESULT>> → LRESULT` 在作用域**之外**转换 | ✅ 编译通过（`use<H>` 不把 activation handler 的生命周期绑到返回值；与 subclass.rs:50-60 同构） |
+
+### 16.3 未验证项（不阻塞）
+
+| 编号 | 未验证 | 后续 |
+|---|---|---|
+| V-75 | UIA 真实联动（角色 / 名称 / 动作 / 焦点事件在 NVDA / Narrator 下的表现） | L5 实机矩阵；本文只保证 `TreeUpdate` 的数据正确（probe ① 用真正的消费端校验） |
+| V-76 | macOS `accesskit_macos 0.27.2` / Linux `accesskit_unix 0.24.1` 全链路 | P12；接口与三平台差异见 `phase-11-a11y.md` §12 |
+| V-77 | `QueuedEvents::raise()` 在真实 AT 下执行（probe ② 刻意 drop 掉，避免向 UIA 广播） | L5；线程约束已按 adapter.rs:633-642 落实 |
+| V-78 | 大树（> 5k 节点）首次全树的成本未基准 | L4；超标则分片交付（`TreeUpdate` 可多次调用），不改 `A11yTreeSnapshot` 契约 |
+| V-79 | `A11yPatch.selected` / `expanded` 的引擎侧写点很少（多数由应用给） | 字段有非 test 消费者（映射），符合 AGENTS §2.1；P13 控件库若不需要则删除 |
+| V-80 | `pos_in_set` / `set_size_of_set` 未填（`VirtualListState` 已有 `first/last/count` 数据） | 需要时用 `Node::set_pos_in_set` 补，不改快照契约 |
+
+### 16.4 实施记录（2026-11-13，P11 落地）与实施期条目
+
+| 项 | 实测 |
+|---|---|
+| 新增 | `src/a11y.rs` + `a11y/{tree,mapping,adapter,action}.rs`；`platform/windows/a11y.rs` |
+| 修改 | `lib.rs`、`app.rs`、`window.rs`、`node/tree.rs`、`node/builder.rs`、`error.rs`、`platform/windows/{window,event_loop}.rs`、`test_support/{app,record}.rs` |
+| 测试 | `cargo test -p kytrix_gui` **585**（P10 基线 557 → +28）；`--features test-support` **613** + 集成 5；demo 1 |
+| 门禁 | clippy 两包 `--all-targets --all-features -D warnings` 通过；`fmt --check` 通过；`doc --no-deps` 无 warning；`--release` 通过 |
+| 死代码 | `#[allow(` 0 / `#[expect(` 0 / `#[path` 0 / `pub use` 0；`a11y*` 的 `unsafe` **0** 处；`platform/windows/a11y.rs` 生产部分只有 1 处 `unsafe`（`IsWindow`，带 `SAFETY`） |
+| 尺寸 | `size_of::<Node>()` = **1144 B**（侧表生效，F-114 无需追加字段） |
+| 文件边界 | `platform/` 下只有 `windows/a11y.rs`（macOS / Linux 归 P12） |
+| P03 断言 | `mark_layout` 追加 `A11Y` 后，`refresh_styles_escalates_layout_when_patch_affects_layout` 与 `layout_escalation_marks_fixed_size_node_ancestors` **无需改**（断言用的是 `contains`），全量用例原样通过 |
+
+实施期新增/修订条目：
+
+| 编号 | 内容 |
+|---|---|
+| **F-115** | **虚拟列表容器的角色必须先于滚动容器判定**：`make_virtual_list` 同时装 `scroll` 与 `virtual_list` 槽，若先判 `scroll_slot` 则永远得到 `ScrollView`（实施期实测失败）。修订：`role_by_kind` 先判 `virtual_slot`（⇒ `List`），并把 `ScrollUp/Down/Left/Right`/`ScrollIntoView`/`SetScrollOffset` 改为 `effective_actions` 的「**有滚动槽就补**」规则（否则 `List` 拿不到滚动动作） |
+| **F-116** | `accesskit 0.25.2` 的 `Selected` / `Expanded` 是 `bool_property_methods!` 生成的**三态属性**：`set_x(bool)` / `is_x() -> Option<bool>` / `clear_x()`（不是 `flag_methods!` 的裸 bool）。映射按 `if let Some(v) = record.selected { node.set_selected(v) }` 写，「不表态」= 不调用 |
+| **F-117** | `Action::Blur` 与 `Action::ReplaceSelectedText` **没有** `A11yAction` 变体（`A11yAction` 只表达「对目标做什么」）：`Blur` 在 `dispatch` 开头先行处理（焦点正好在该节点才清），`ReplaceSelectedText` 归一成 `SetValue`（无选区模型时等价）。`CustomAction` 的 id 来自 `ActionData`，同样在 `dispatch` 里单独解 |
+| **S-114** | **`A11yPassReport` 不落地**：没有非 test 消费者。计数直接读 `A11yTreeSnapshot` 的 `full` / `nodes.len()` / `diagnostics`；`FrameStats` 不追加字段（`FrameRecord.a11y` 已经是断言面） |
+| **S-115** | **a11y 交付点在帧之后**：`TestApp::drain` 在 `App::frame` 返回后调 `App::a11y_take` + `App::attach_a11y` 写进 `FrameRecord.a11y`，与平台泵的 `update_a11y` 同序。因此**纯 A11Y 变化的 Idle 帧同样带快照**（`RenderedFrame` 在空闲帧不存在，F-113 的落地形态）。`A11yBridge.capture` / `Window::set_a11y_capture` 只在 `test-support` 构建里存在（生产零字段、零分支） |
+| **S-116** | `mark_layout` / `mark_subtree_paint` 追加 `A11Y` 后，P03 的两条 flags 用例**无需改**（`contains` 断言），全量 585/613 用例原样通过——S-109 的语义变更没有引入回归面 |
+| **V-81** | `A11yBridge::take` 的增量路径是 O(n) 扫描 `tree.order()` 定位脏节点（已收集的 id 用 `SmallVec::contains` 去重）。5k 节点以上未基准；若进 L4 超标，加「脏位链表」而不改快照契约 |
+
+### 16.5 审查修复轮（2026-11-13，PASS-WITH-FIXES 的 6 条阻塞 + 顺带项）
+
+| 编号 | 修复 |
+|---|---|
+| **R-1** | **布局后子树 bounds 不重发**：新增 `NodeTree::mark_moved_a11y()`（比较 `layout != prev_layout` 并标 `A11Y`），由 `Window::compute_layout` 在布局成功后调用；`set_size` / `set_scale` 改走 `invalidate_layout`（与 `set_style` 同一条路径）。用例：`p11_fix_tests::a11y_bounds_follow_window_resize` |
+| **R-2** | **`invalidate_layout` 未标 A11Y**：该函数是 `set_style` / `invalidate_measure` / `set_layout_override` / `set_virtual_row` / `set_absolute_inset` / `set_size` / `set_scale` 的公共尾段，统一追加 `A11Y`。用例：`a11y_bounds_follow_layout_override` |
+| **R-3** | **普通滚动不失效 a11y 子树**：`a11y_note_scroll` 从 a11y action 路径移到 `App::scroll_to` 的成功路径（`scroll_by` / 滚轮 / 动画滚动 / a11y action 全汇到这里，是 `slot.offset` 的唯一写点），`a11y/action.rs` 不再重复调用。用例：`a11y_bounds_follow_scroll` |
+| **R-4** | **`focus_node()` panic**：`A11yTreeSnapshot` 新增 `focus_node: A11yNode` 字段（独立于 `nodes`，用临时诊断缓冲构造，避免重复诊断），`focus_node()` 直接返回它、不再查 `nodes`。用例：`adapter::focus_node_is_carried_even_when_it_is_not_in_the_batch` |
+| **R-5** | **`WM_GETOBJECT` 重入 UB**：`WindowsA11y` 拆出 `begin_getobject` / `end_getobject`，`wm_getobject` 返回**未转换**的 `impl Into<LRESULT>`，`wndproc` 在短借用块里取值、**出块后**才 `.into()`；`focus_changed` / `update` 改为返回 `Option<QueuedEvents>`，`raise()` 同样在释放 `&mut WndProcState` 之后。旗标覆盖整个「取值→转换→清除」窗口 |
+| **R-6** | **`bind_a11y` 写入仍重绘**：新增 `NodeTree::{has_visual_bind, has_a11y_bind}` 与 `A11yBridge.bind_work`；`App::invalidate` 对「只有 a11y 绑定」的节点只标 `A11Y` + 置 bind_work（不标 PAINT/LAYOUT）；`Window::needs_frame` 感知 bind_work（帧末门禁仍退回 `Idle`）；`refresh_styles` 的 `needs_eval` 追加 `A11Y && has_a11y_bind`；`paint_frame` 在「无 damage 且无节点需重建」时早退（lane 保持 `REUSABLE`、damage 保持空）。用例：`a11y_bind_a11y_write_is_idle_without_damage`（替换原先的假绿断言） |
+| **F-118** | 诊断补强：`MissingAltText` 增加 `kind: A11yDrawKind`（`Canvas`/`Geometry`）；`UnhandledAction.action` 改为 `Option<A11yAction>`（`None` = 该 `accesskit::Action` 本阶段没有映射），不再伪造 `Custom(-1)`。顺带：声明了 `on_click`/`on_action` 的节点在 `effective_actions` 里补 `Click`（与角色无关，虚拟行也覆盖） |
+| **S-117** | **焦点陈旧时回退到窗口根**，不是「最近的已发出祖先」：陈旧句柄读不到 `parent`（节点已出 arena），设计稿 §6.3 的措辞按实现收口；`MissingFocusTarget` 诊断照记 |
+| **S-118** | `A11yTreeSnapshot::visible_nodes()` 按「自身 + **本快照内**的祖先链」排除 `hidden`（增量笔的祖先可能不在本笔里，那时按可见处理；平台侧的 `set_hidden` 继承语义才是权威） |
+| 门禁 | test **589**（+32 vs P10）/ test-support **621**（+47）+ 集成 **6**；clippy 两包 `-D warnings` / fmt --check / doc 0 warning / release 全绿 |

@@ -100,6 +100,8 @@ pub(crate) struct NodeSpec {
     action: Option<Action>,
     drag: Option<Action>,
     focus_ring: Option<crate::paint::style::FocusRing>,
+    a11y: Option<crate::a11y::A11yOverride>,
+    bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
 }
 
 impl NodeSpec {
@@ -121,7 +123,22 @@ impl NodeSpec {
             action: None,
             drag: None,
             focus_ring: None,
+            a11y: None,
+            bind_a11y: None,
         }
+    }
+
+    pub(crate) fn with_a11y(mut self, over: crate::a11y::A11yOverride) -> Self {
+        self.a11y = Some(over);
+        self
+    }
+
+    pub(crate) fn with_bind_a11y(
+        mut self,
+        bind: Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>,
+    ) -> Self {
+        self.bind_a11y = Some(bind);
+        self
     }
 
     pub(crate) fn with_focus_ring(mut self, ring: crate::paint::style::FocusRing) -> Self {
@@ -434,6 +451,12 @@ pub struct NodeTree {
     debug_ids: Vec<Option<SmolStr>>,
     /// 每节点最近一次重建 lane 时的 clip 上下文（`(depth, covering)`；P06 §5.6 的 B1 守卫）。
     clip_keys: Vec<Option<(u8, Option<PhysicalRect>)>>,
+    /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
+    ///
+    /// 与 `layout_cache` / `clip_keys` 同型：`Node` 因此保持 1144 B（P11 F-114）。
+    a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
+    /// 带 `A11Y` 位的节点数（O(1) 的「有没有 a11y 工作」判据；P11 S-108）。
+    a11y_dirty: u32,
     /// 卸载节点的待释放 lane（`Window::paint_frame` 消费后清空，容量保留）。
     removed_lanes: Vec<LaneId>,
     /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
@@ -538,6 +561,8 @@ impl NodeTree {
             text_slots: vec![None],
             debug_ids: vec![None],
             clip_keys: vec![None],
+            a11y_slots: vec![None],
+            a11y_dirty: 1,
             removed_lanes: Vec::new(),
             hoisted: ahash::HashMap::default(),
             layout_epoch: 0,
@@ -652,6 +677,16 @@ impl NodeTree {
             if let Some(slot) = self.clip_keys.get_mut(index) {
                 *slot = None;
             }
+            if let Some(slot) = self.a11y_slots.get_mut(index) {
+                *slot = None;
+            }
+            if self
+                .arena
+                .get(*id)
+                .is_some_and(|target| target.dirty().contains(DirtyFlags::A11Y))
+            {
+                self.a11y_dirty = self.a11y_dirty.saturating_sub(1);
+            }
             self.hoisted.remove(id);
             let _ = self.arena.remove(*id);
         }
@@ -689,6 +724,8 @@ impl NodeTree {
             action,
             drag,
             focus_ring,
+            a11y,
+            bind_a11y,
         } = spec;
         let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
             let mut slot = NodeInteraction::new();
@@ -745,6 +782,14 @@ impl NodeTree {
             self.clip_keys.resize_with(index + 1, || None);
         }
         self.clip_keys[index] = None;
+        // a11y 载荷同生命周期：槽位复用不得继承上一代节点的声明/补丁（P11 F-114）。
+        if self.a11y_slots.len() <= index {
+            self.a11y_slots.resize_with(index + 1, || None);
+        }
+        self.a11y_slots[index] = (a11y.is_some() || bind_a11y.is_some())
+            .then(|| Box::new(crate::a11y::tree::NodeA11y::new(a11y, bind_a11y)));
+        // 新节点恒带 `A11Y`（`dirty` 的初值），计数必须同步。
+        self.a11y_dirty = self.a11y_dirty.saturating_add(1);
         self.hoisted.remove(&id);
         self.order_insert(parent, id);
         if let Some(node) = self.arena.get_mut(id) {
@@ -814,9 +859,15 @@ impl NodeTree {
         self.touch(node, DirtyFlags::PAINT)
     }
 
-    /// 标 `LAYOUT | PAINT` 并向上冒泡（§9.2 / N7），同时清 `node..root` 的 taffy 缓存（P04 §6.2）。
+    /// 标 `LAYOUT | PAINT | A11Y` 并向上冒泡（§9.2 / N7），同时清 `node..root` 的 taffy 缓存（P04 §6.2）。
+    ///
+    /// `A11Y` 是 P11 追加的：bounds 变了 ⇒ a11y bounds 也变了，必须重发（S-109）。它不产生
+    /// damage、不清 `REUSABLE`（`touch` 只在含 `LAYOUT|PAINT` 时做那两件事）。
     pub(crate) fn mark_layout(&mut self, node: NodeId) -> bool {
-        if !self.touch(node, DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
+        if !self.touch(
+            node,
+            DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
+        ) {
             return false;
         }
         self.bubble_layout(node);
@@ -851,6 +902,116 @@ impl NodeTree {
             }
             None => false,
         }
+    }
+
+    // ── P11：a11y 侧表与 A11Y 脏位的消费 ──────────────────────────────────────
+
+    /// a11y 载荷（`None` = 该节点没有声明任何 a11y 属性）。
+    pub(crate) fn a11y_of(&self, node: NodeId) -> Option<&crate::a11y::tree::NodeA11y> {
+        self.a11y_slots
+            .get(node.index() as usize)
+            .and_then(|slot| slot.as_deref())
+    }
+
+    /// 取走 `bind_a11y` 闭包（求值期间脱离节点，避免借用冲突）。
+    pub(crate) fn take_bind_a11y(
+        &mut self,
+        node: NodeId,
+    ) -> Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>> {
+        self.a11y_slots
+            .get_mut(node.index() as usize)?
+            .as_mut()?
+            .bind
+            .take()
+    }
+
+    /// 放回 `bind_a11y` 闭包（求值后；panic 展开时闭包丢失 ⇒ 该节点退化为静态 a11y）。
+    pub(crate) fn put_bind_a11y(
+        &mut self,
+        node: NodeId,
+        bind: Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>,
+    ) -> bool {
+        match self
+            .a11y_slots
+            .get_mut(node.index() as usize)
+            .and_then(|slot| slot.as_mut())
+        {
+            Some(slot) => {
+                slot.bind = Some(bind);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 写回 `bind_a11y` 的上次求值结果（槽位不存在时创建）。
+    pub(crate) fn set_a11y_patch(&mut self, node: NodeId, patch: crate::a11y::A11yPatch) -> bool {
+        if self.arena.get(node).is_none() {
+            return false;
+        }
+        let index = node.index() as usize;
+        if self.a11y_slots.len() <= index {
+            self.a11y_slots.resize_with(index + 1, || None);
+        }
+        let slot = &mut self.a11y_slots[index];
+        let slot =
+            slot.get_or_insert_with(|| Box::new(crate::a11y::tree::NodeA11y::new(None, None)));
+        slot.patch = patch;
+        true
+    }
+
+    /// 消费 `A11Y | ORDER`（a11y pass 交付完一笔后调用；`P11` 起 `ORDER` 终于有清除者）。
+    pub(crate) fn clear_a11y(&mut self, node: NodeId) -> bool {
+        let Some(target) = self.arena.get_mut(node) else {
+            return false;
+        };
+        let had = target.dirty.contains(DirtyFlags::A11Y);
+        target.dirty.remove(DirtyFlags::A11Y | DirtyFlags::ORDER);
+        if had {
+            self.a11y_dirty = self.a11y_dirty.saturating_sub(1);
+        }
+        true
+    }
+
+    /// 带 `A11Y` 位的节点数（O(1)；平台层每轮用它判「有没有 a11y 工作」）。
+    pub(crate) fn a11y_dirty(&self) -> u32 {
+        self.a11y_dirty
+    }
+
+    /// 布局 post-pass：把「布局盒与上一帧不同」的节点标 `A11Y`，返回条数。
+    ///
+    /// `set_size` / `set_scale` 只标根，子树节点的 `layout.bounds` 由布局 pass 写入而不经过
+    /// `mark_*` —— 不在这里补标，窗口 resize 后子孙的 a11y bounds 就是旧值（P11 审查 #1）。
+    /// `prev_layout` 只在 `settle_frame` 前进，所以本函数在「布局后、提交前」是准确的。
+    pub(crate) fn mark_moved_a11y(&mut self) -> usize {
+        let mut moved: SmallVec<[NodeId; 8]> = SmallVec::new();
+        for node in &self.order {
+            if let Some(target) = self.arena.get(*node)
+                && target.layout != target.prev_layout
+            {
+                moved.push(*node);
+            }
+        }
+        let count = moved.len();
+        for node in moved {
+            let _ = self.touch(node, DirtyFlags::A11Y);
+        }
+        count
+    }
+
+    /// 该节点是否有**视觉**动态绑定（`bind_style` / `bind_text`）。
+    pub(crate) fn has_visual_bind(&self, node: NodeId) -> bool {
+        self.arena
+            .get(node)
+            .is_some_and(|target| target.bind_style.is_some() || target.text_bind.is_some())
+    }
+
+    /// 该节点是否有 a11y 动态绑定（`bind_a11y`）。
+    pub(crate) fn has_a11y_bind(&self, node: NodeId) -> bool {
+        self.a11y_slots
+            .get(node.index() as usize)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|slot| slot.bind.is_some())
     }
 
     // ── P06：lane / clip 上下文 / 帧结算 ──────────────────────────────────────
@@ -1475,11 +1636,17 @@ impl NodeTree {
         std::mem::take(&mut self.layout_stats).into_report()
     }
 
-    /// 标 `LAYOUT|PAINT` + 冒泡 + 清 `node..root` 的 taffy 缓存（所有「布局输入变了」的公共尾段）。
+    /// 标 `LAYOUT|PAINT|A11Y` + 冒泡 + 清 `node..root` 的 taffy 缓存（所有「布局输入变了」的公共尾段）。
     ///
-    /// 消费者：`set_style` / `invalidate_measure` / `set_layout_override` / `Window::{set_size, set_scale}`。
+    /// `A11Y` 是 P11 追加的：布局输入变了 ⇒ 布局盒（进而 a11y bounds）可能变，必须重发。
+    ///
+    /// 消费者：`set_style` / `invalidate_measure` / `set_layout_override` / `set_virtual_row` /
+    /// `set_absolute_inset` / `Window::{set_size, set_scale}`。
     pub(crate) fn invalidate_layout(&mut self, node: NodeId) -> bool {
-        if !self.touch(node, DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
+        if !self.touch(
+            node,
+            DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
+        ) {
             return false;
         }
         self.bubble_layout(node);
@@ -1605,10 +1772,15 @@ impl NodeTree {
         let Some(target) = self.arena.get_mut(node) else {
             return false;
         };
+        let had_a11y = target.dirty.contains(DirtyFlags::A11Y);
         target.dirty.insert(flags);
         if flags.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
             target.dirty.remove(DirtyFlags::REUSABLE);
             target.accumulate_damage();
+        }
+        // `A11Y` 是累积位（`settle_frame` 不清它），计数必须与位同步（P11 S-108）。
+        if flags.contains(DirtyFlags::A11Y) && !had_a11y {
+            self.a11y_dirty = self.a11y_dirty.saturating_add(1);
         }
         true
     }
@@ -1644,11 +1816,12 @@ impl NodeTree {
         }
     }
 
-    /// 整棵子树标 `PAINT`（并清 `REUSABLE`）—— 重挂后绘制桶顺序可能变化（消费者：`append_child`）。
+    /// 整棵子树标 `PAINT | A11Y`（并清 `REUSABLE`）—— 重挂后绘制桶顺序与 a11y 父链都可能变化
+    /// （消费者：`append_child`；`A11Y` 是 P11 追加，见 `design/phase-11-a11y.md` §6.4）。
     fn mark_subtree_paint(&mut self, node: NodeId) {
         let ids = self.collect_subtree_ids(node);
         for id in ids {
-            let _ = self.touch(id, DirtyFlags::PAINT);
+            let _ = self.touch(id, DirtyFlags::PAINT | DirtyFlags::A11Y);
         }
     }
 

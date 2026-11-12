@@ -41,6 +41,8 @@ pub struct NodeBuilder {
     action: Option<Action>,
     drag: Option<Action>,
     focus_ring: Option<crate::paint::style::FocusRing>,
+    a11y: Option<crate::a11y::A11yOverride>,
+    bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
 }
 
 impl Default for NodeBuilder {
@@ -66,6 +68,33 @@ impl NodeBuilder {
             action: None,
             drag: None,
             focus_ring: None,
+            a11y: None,
+            bind_a11y: None,
+        }
+    }
+
+    /// 静态 a11y 声明（角色 / 可访问名 / 值 / 动作 / 隐藏 / 禁用）。
+    ///
+    /// 不写 `a11y` 的节点仍会进 a11y 树（角色由节点种类推导，见 `design/phase-11-a11y.md` §5.2）；
+    /// 自绘节点（`canvas` / `geometry`）**必须**在这里给 `label`，否则会被标 `hidden` 并记诊断。
+    #[must_use]
+    pub fn a11y(mut self, a11y: crate::a11y::A11yOverride) -> Self {
+        self.a11y = Some(a11y);
+        self
+    }
+
+    /// 动态 a11y 属性：闭包在每次 `refresh_styles` 求值时重算 `A11yPatch`（值语义，不累积）。
+    ///
+    /// **与 `bind_style` / `bind_text` 同一 `ReadCtx`、同一依赖集合**：一个节点只能有一份依赖边集
+    /// （`DependencyGraph::replace_deps` 整体替换），因此三条动态通道必须在同一个 pass 里求值。
+    #[must_use]
+    pub fn bind_a11y(
+        self,
+        bind_a11y: impl Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch + 'static,
+    ) -> Self {
+        Self {
+            bind_a11y: Some(Box::new(bind_a11y)),
+            ..self
         }
     }
 
@@ -268,6 +297,12 @@ impl NodeBuilder {
         }
         if let Some(ring) = self.focus_ring {
             spec = spec.with_focus_ring(ring);
+        }
+        if let Some(a11y) = self.a11y {
+            spec = spec.with_a11y(a11y);
+        }
+        if let Some(bind_a11y) = self.bind_a11y {
+            spec = spec.with_bind_a11y(bind_a11y);
         }
         tree.insert_child(parent, spec)
     }

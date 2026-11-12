@@ -218,6 +218,8 @@ pub struct Window {
     pointer: PointerState,
     /// 下一帧必须重绘的逻辑矩形（滚动视口；`paint_frame` 消费后清空）。
     pending_damage: Option<Rect>,
+    /// a11y 状态机（P11：变更集合 / 全树旗标 / 捕获开关）。
+    a11y: crate::a11y::adapter::A11yBridge,
 }
 
 impl Window {
@@ -248,6 +250,7 @@ impl Window {
             focus: FocusScope::default(),
             pointer: PointerState::new(),
             pending_damage: None,
+            a11y: crate::a11y::adapter::A11yBridge::new(),
         }
     }
 
@@ -326,7 +329,8 @@ impl Window {
         self.options.size = size;
         self.full_damage_pending = true;
         let root = self.tree.root();
-        self.tree.mark_layout(root);
+        // 与 `set_style` / `set_layout_override` 同一条失效路径（P11：它也标 `A11Y`）。
+        self.tree.invalidate_layout(root);
     }
 
     /// 用窗口逻辑尺寸重排，返回本次布局统计（P06/P09 的帧驱动调用它）。
@@ -338,10 +342,14 @@ impl Window {
     /// `EngineError::InvalidMeasure { node, axis, value }`：某个 measure 闭包返回 NaN / 负数（首条优先）。
     /// 出错时布局盒可能为空，调用方**不得**提交本帧。
     pub fn compute_layout(&mut self) -> Result<LayoutReport, EngineError> {
-        self.tree.compute_layout(taffy::geometry::Size {
+        let report = self.tree.compute_layout(taffy::geometry::Size {
             width: Some(self.options.size.width),
             height: Some(self.options.size.height),
-        })
+        })?;
+        // P11：布局盒变了的节点必须重发 a11y（bounds = 物理化的 layout 盒）。窗口 resize /
+        // 虚拟列表重窗都只标根，子树的新盒由布局 pass 写入，不经过任何 `mark_*`。
+        self.tree.mark_moved_a11y();
+        Ok(report)
     }
 
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT | PAINT`。
@@ -354,7 +362,62 @@ impl Window {
         self.scale_epoch = self.scale_epoch.wrapping_add(1);
         self.full_damage_pending = true;
         let root = self.tree.root();
-        self.tree.mark_layout(root);
+        self.tree.invalidate_layout(root);
+        // a11y 的 bounds 全是物理像素 ⇒ 比例变了必须整棵重发（P11 §5.5）。
+        self.a11y.note_bounds_changed();
+    }
+
+    // ── P11：a11y（快照交付 + 捕获） ─────────────────────────────────────────
+
+    /// 本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active` 调用）。
+    #[must_use]
+    pub(crate) fn a11y_pending(&self) -> bool {
+        self.a11y.pending(&self.tree)
+    }
+
+    /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
+    ///
+    /// 调用方：平台层的 `update_if_active` 闭包（生产）、`App::frame` 的捕获路径（测试）。
+    pub(crate) fn a11y_take(
+        &mut self,
+        diagnostics: &mut Vec<crate::a11y::A11yDiagnostic>,
+    ) -> Option<crate::a11y::A11yTreeSnapshot> {
+        let Self {
+            tree,
+            a11y,
+            focus,
+            scale,
+            options,
+            ..
+        } = self;
+        a11y.take(
+            tree,
+            focus.focused(),
+            *scale,
+            options.title.as_str(),
+            diagnostics,
+        )
+    }
+
+    /// 某个子树内容整体平移（滚动：子孙 bounds 全变 ⇒ 重发整棵子树）。
+    pub(crate) fn a11y_note_scroll(&mut self, container: crate::node::id::NodeId) {
+        self.a11y.invalidate_subtree(container);
+    }
+
+    /// 只有 `bind_a11y` 的节点被写信号（没有像素要画，但下帧仍要跑样式 pass）。
+    pub(crate) fn a11y_note_bind_work(&mut self) {
+        self.a11y.note_bind_work();
+    }
+
+    /// 清掉「a11y 绑定待求值」旗标（`refresh_styles` 的入口处）。
+    pub(crate) fn a11y_clear_bind_work(&mut self) {
+        self.a11y.clear_bind_work();
+    }
+
+    /// 打开/关闭 a11y 快照捕获（仅 `test-support` 的 `TestApp` 调用）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_a11y_capture(&mut self, on: bool) {
+        self.a11y.set_capture(on);
     }
 
     /// DPI 代际（`set_scale` 递增；`App::refresh_text` 的图集换代判据）。
@@ -376,8 +439,11 @@ impl Window {
     /// `wake` = `App::take_wake_request()` 的结果（`App::frame` 传入；`Window::frame` 传 `false`）。
     /// `!REUSABLE` 表示 lane 内容与树/样式不一致；`LAYOUT | PAINT` 覆盖「新建/未标 REUSABLE」的节点。
     pub(crate) fn needs_frame(&self, wake: bool) -> bool {
+        // `a11y_bind_pending`：只有 `bind_a11y` 的节点被写信号时**没有**像素要画，但
+        // `refresh_styles` 仍必须跑一次（否则补丁永远不更新）。帧末的门禁会把它退回 `Idle`。
         wake || self.full_damage_pending
             || self.pending_damage.is_some()
+            || self.a11y.bind_work()
             || self.tree.any_node(|node| {
                 let dirty = node.dirty();
                 dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
@@ -472,6 +538,17 @@ impl Window {
         (rect.width().max(1) as u32, rect.height().max(1) as u32)
     }
 
+    /// 是否有节点需要重建 lane（`LAYOUT` / `PAINT` / `REUSABLE` 不在）。
+    ///
+    /// `A11Y` 不在判据里：a11y 更新不产生 damage（`design §7.5` / P03 §9.3 表第 9 行）。
+    fn needs_node_repaint(&self) -> bool {
+        self.tree.any_node(|node| {
+            let dirty = node.dirty();
+            dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
+                || !dirty.contains(DirtyFlags::REUSABLE)
+        })
+    }
+
     /// lane 重建/复用 + damage + 实例编码（`design/phase-06-paint-runtime.md` §9.6）。
     pub(crate) fn paint_frame(&mut self) -> PaintReport {
         // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
@@ -482,6 +559,7 @@ impl Window {
         let size = self.size();
         let frame = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
         self.damage.reset(scale);
+        let has_damage = self.full_damage_pending || self.pending_damage.is_some();
         if self.full_damage_pending {
             self.damage.push_full();
             self.full_damage_pending = false;
@@ -489,6 +567,18 @@ impl Window {
         // 滚动（P10 §7.8）：唯一来源是视口矩形；节点级 damage 不参与（偏移不写 `layout.bounds`）。
         if let Some(pending) = self.pending_damage.take() {
             self.damage.push(pending, 1.0, None);
+        }
+        // P11：只有 `A11Y` 脏（`bind_a11y` 重算）的帧**没有任何像素要画**：早退让 lane 保持
+        // `REUSABLE`、damage 保持空，帧末门禁把本帧退回 `Idle`（P11 审查 #6）。
+        if !has_damage && !self.needs_node_repaint() {
+            return PaintReport {
+                rebuilt: 0,
+                damage: crate::render::damage::DamageSummary::default(),
+                #[cfg(feature = "test-support")]
+                instances: 0,
+                #[cfg(feature = "test-support")]
+                log: crate::test_support::record::PaintLog::default(),
+            };
         }
         self.paint_order.clear();
         let focused = self.focus.focused();
@@ -654,6 +744,14 @@ impl Window {
             FrameIndex(self.scheduler.committed()),
             std::mem::take(&mut self.stats),
         ));
+    }
+
+    /// 把一笔 a11y 交付挂到**最近一帧**的记录上（`TestApp::drain` 在帧之后调用，与平台泵同序）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn attach_a11y(&mut self, snapshot: crate::a11y::A11yTreeSnapshot) {
+        if let Some(record) = self.record.as_mut() {
+            record.a11y = Some(snapshot);
+        }
     }
 
     /// `App::frame` 在提交前写入本帧的统计（仅 `test-support`）。

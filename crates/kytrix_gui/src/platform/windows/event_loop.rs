@@ -95,19 +95,33 @@ pub(crate) struct WndProcState {
     cursor: (i32, i32),
     /// 是否已注册 `TrackMouseEvent(TME_LEAVE)`（每进入一次客户区注册一次）。
     mouse_tracking: bool,
+    /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
+    a11y: crate::platform::windows::a11y::WindowsA11y,
 }
 
 impl WndProcState {
-    pub(crate) fn new(dispatcher: Arc<Dispatcher>) -> Self {
-        Self {
-            dispatcher,
+    pub(crate) fn new(
+        dispatcher: Arc<Dispatcher>,
+        hwnd: HWND,
+        window: WindowId,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            dispatcher: dispatcher.clone(),
             events: Vec::with_capacity(8),
             translate: TranslateState::default(),
             min_size: (1, 1),
             close_requested: false,
             cursor: (0, 0),
             mouse_tracking: false,
-        }
+            // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
+            // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
+            a11y: crate::platform::windows::a11y::WindowsA11y::new(hwnd, dispatcher, window)?,
+        })
+    }
+
+    /// a11y 状态（`WM_GETOBJECT` / 焦点消息 / 每轮交付的唯一入口）。
+    pub(crate) fn a11y_mut(&mut self) -> &mut crate::platform::windows::a11y::WindowsA11y {
+        &mut self.a11y
     }
 
     pub(crate) fn set_min_size(&mut self, min: (u32, u32)) {
@@ -178,6 +192,45 @@ pub(crate) extern "system" fn wndproc(
         }
         if state.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        // ── a11y（P11）：借用纪律 ──────────────────────────────────────────────
+        // `UiaReturnRawElementProvider`（转 `LRESULT` 时）与 `QueuedEvents::raise` 都会**同步**
+        // 派发嵌套 `WM_GETOBJECT`。所以这两处只能在**不持有 `&mut WndProcState`** 的窗口里做：
+        // 短借用块取出「未转换的值」，出了块再 `.into()` / `raise()`（P11 审查 #5）。
+        if msg == WM_GETOBJECT {
+            let pending = {
+                // SAFETY: `state` 非空且由本线程独占（`GWLP_USERDATA` 的既有纪律）。
+                let cell = &mut *state;
+                if !cell.a11y_mut().begin_getobject() {
+                    // 重入：本次不接管（不让 UIA 拿到半个 provider）。
+                    return LRESULT(0);
+                }
+                cell.a11y_mut().wm_getobject(wparam, lparam)
+            };
+            let result = match pending {
+                Some(value) => value.into(),
+                None => DefWindowProcW(hwnd, msg, wparam, lparam),
+            };
+            // SAFETY: 转换已完成，此时没有其它 `&mut` 存活。
+            (*state).a11y_mut().end_getobject();
+            return result;
+        }
+        // 窗口焦点态同步（与 `TranslateState` 的 `PlatformEvent::Focus` 是两条独立的线：
+        // 前者给 AT 看「窗口有没有焦点」，后者给引擎做键盘分发）。
+        if matches!(msg, WM_SETFOCUS | WM_EXITMENULOOP | WM_EXITSIZEMOVE) {
+            // SAFETY: 短借用；`raise` 在借用释放之后（它可能派发嵌套消息）。
+            let events = { (*state).a11y_mut().focus_changed(true) };
+            if let Some(events) = events {
+                events.raise();
+            }
+        }
+        if matches!(msg, WM_KILLFOCUS | WM_ENTERMENULOOP | WM_ENTERSIZEMOVE) {
+            // SAFETY: 同上。
+            let events = { (*state).a11y_mut().focus_changed(false) };
+            if let Some(events) = events {
+                events.raise();
+            }
         }
 
         let state = &mut *state;
@@ -425,6 +478,12 @@ fn pump(
         app.run_frame_hook();
         if dispatcher.take_frame_wake() {
             frame_all(&mut app)?;
+        }
+
+        // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter
+        // 一次机会；`App::a11y_pending` 是 O(1) 过滤，adapter 不活跃时闭包根本不执行（懒激活）。
+        for native in windows.iter_mut() {
+            native.update_a11y(&mut app);
         }
 
         // ⑤ 跨线程回投的任务。

@@ -128,6 +128,9 @@ pub enum EngineError {
         /// 陈旧/未知的窗口句柄。
         window: WindowId,
     },
+    /// 平台 a11y adapter 初始化失败（必须在窗口**首次显示之前**构造，见 `design/phase-11-a11y.md` §8.1）。
+    #[error("accessibility adapter initialization failed: {detail}")]
+    A11yInit { detail: SmolStr },
 }
 
 #[cfg(test)]

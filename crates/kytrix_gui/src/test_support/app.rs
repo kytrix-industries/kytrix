@@ -26,6 +26,8 @@ pub struct TestApp {
     window: WindowId,
     /// 最近一次**提交**的绘制快照（空闲帧不会产生 `frame`，oracle 的增量侧要回退到这里）。
     last_rendered: Option<RenderedFrame>,
+    /// 是否在每帧之后交付一笔 a11y 快照（`enable_a11y_capture` 打开）。
+    a11y_capture: bool,
 }
 
 impl Default for TestApp {
@@ -58,6 +60,7 @@ impl TestApp {
             app,
             window,
             last_rendered: None,
+            a11y_capture: false,
         }
     }
 
@@ -90,6 +93,13 @@ impl TestApp {
             .frame(self.window)
             .expect("TestApp's window must exist");
         outcome?;
+        // P11：a11y 交付在**帧之后**（与平台泵的 `update_a11y` 同序）。纯 `A11Y` 变化不提交帧，
+        // 所以这一步与 `FrameOutcome` 无关（`FrameRecord.a11y` 在空闲帧也存在）。
+        if self.a11y_capture
+            && let Some(snapshot) = self.app.a11y_take(self.window)
+        {
+            self.app.attach_a11y(self.window, snapshot);
+        }
         if let Some(frame) = self.frame_record().frame.clone() {
             self.last_rendered = Some(frame);
         }
@@ -120,6 +130,21 @@ impl TestApp {
             .window(self.window)
             .expect("TestApp's window must exist");
         Probe::new(window.tree())
+    }
+
+    /// 打开 a11y 快照捕获：之后每次 `drain` 都把本帧的交付写进 `FrameRecord.a11y`。
+    ///
+    /// 首帧恒为全树（`A11yBridge.full_pending`），捕获开关只允许一个 drainer（生产里是平台
+    /// adapter），见 `design/phase-11-a11y.md` S-112。
+    pub fn enable_a11y_capture(&mut self) {
+        self.a11y_capture = true;
+        self.app.set_a11y_capture(self.window, true);
+    }
+
+    /// 最近一帧的 a11y 交付（`None` = 本帧没有 a11y 工作，或捕获未打开）。
+    #[must_use]
+    pub fn a11y(&self) -> Option<&crate::a11y::A11yTreeSnapshot> {
+        self.frame_record().a11y.as_ref()
     }
 
     /// 注入一个输入事件：走**与平台泵相同**的 `App::dispatch_input`（命中 / 焦点 / 拖拽 / 动作 / 滚动）。
@@ -904,6 +929,711 @@ mod p10_tests {
                 .any(|rect| rect.x0 <= 6 && rect.y0 <= 6 && rect.x1 >= 54 && rect.y1 >= 54),
             "清焦点时必须把环的外扩并入 damage（否则残留 1px）：{:?}",
             record.damage
+        );
+    }
+}
+
+/// P11 的端到端用例：`TestApp` 在每帧之后交付一笔 a11y 快照（与平台泵同序）。
+#[cfg(test)]
+mod p11_tests {
+    use smol_str::SmolStr;
+
+    use super::TestApp;
+    use crate::{
+        a11y::{
+            A11yAction, A11yDiagnostic, A11yNodeId, A11yOverride, A11yPatch, A11yRole,
+            A11yTreeSnapshot,
+        },
+        event::Action,
+        math::{Point, Rect, Scale},
+        node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
+        paint::{
+            canvas::Canvas,
+            color::Color,
+            style::{Clip, PaintSpec, Style, StylePatch},
+        },
+        text::TextStyle,
+        window::WindowOptions,
+    };
+
+    fn white() -> PaintSpec {
+        PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        }
+    }
+
+    fn mount(
+        app: &mut TestApp,
+        build: impl FnOnce(&mut crate::node::tree::NodeTree, NodeId) -> NodeId,
+    ) -> NodeId {
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        build(tree, root)
+    }
+
+    fn snapshot(app: &TestApp) -> &A11yTreeSnapshot {
+        app.a11y().expect("本帧必须有一笔 a11y 交付")
+    }
+
+    #[test]
+    fn a11y_roles_labels_and_values() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let root = {
+            let window = app.window_id();
+            app.app().window(window).expect("window").tree().root()
+        };
+        let label = mount(&mut app, |tree, root| {
+            NodeBuilder::text("价格", TextStyle::new(12.0))
+                .layout_override(Rect::new(0.0, 0.0, 40.0, 20.0))
+                .id("price")
+                .build(tree, root)
+                .expect("text")
+        });
+        let button = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 24.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("submit"))
+                .a11y(A11yOverride {
+                    label: Some(SmolStr::new_static("提交")),
+                    ..A11yOverride::default()
+                })
+                .id("submit")
+                .build(tree, root)
+                .expect("button")
+        });
+        let canvas = mount(&mut app, |tree, root| {
+            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 52.0, 60.0, 30.0)))
+                .a11y(A11yOverride {
+                    label: Some(SmolStr::new_static("K 线图")),
+                    ..A11yOverride::default()
+                })
+                .id("chart")
+                .build(tree, root)
+                .expect("canvas")
+        });
+        let _ = app.drain().expect("frame");
+
+        let snap = snapshot(&app);
+        assert!(snap.full, "首笔必须是全树");
+        let root_node = snap.node_for(root).expect("root");
+        assert_eq!(root_node.role, A11yRole::Window);
+        assert_eq!(root_node.label_text(), None, "默认窗口没有标题 ⇒ 根无名");
+        let label_node = snap.node_for(label).expect("label");
+        assert_eq!(label_node.role, A11yRole::Label);
+        assert_eq!(
+            label_node.value.as_deref(),
+            Some("价格"),
+            "文本走 value（Role::Label）"
+        );
+        let button_node = snap.node_for(button).expect("button");
+        assert_eq!(button_node.role, A11yRole::Button);
+        assert_eq!(button_node.label_text(), Some("提交"));
+        assert!(button_node.actions.contains(&A11yAction::Click));
+        assert!(button_node.actions.contains(&A11yAction::Focus));
+        let canvas_node = snap.node_for(canvas).expect("canvas");
+        assert_eq!(canvas_node.role, A11yRole::Image);
+        assert_eq!(canvas_node.label_text(), Some("K 线图"));
+        assert!(!canvas_node.hidden);
+    }
+
+    #[test]
+    fn a11y_box_is_a_transparent_container() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let panel = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .id("panel")
+                .build(tree, root)
+                .expect("panel")
+        });
+        let _ = app.drain().expect("frame");
+        assert_eq!(
+            snapshot(&app).node_for(panel).expect("panel").role,
+            A11yRole::GenericContainer,
+            "没有语义的 Box 必须是 GenericContainer（AccessKit 侧透明）"
+        );
+    }
+
+    #[test]
+    fn a11y_increment_contains_only_the_change_and_its_ancestors() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let text = app.app_mut().signal(SmolStr::new_static("旧的"));
+        let label_signal = text;
+        let button = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("press"))
+                .bind_a11y(move |cx| A11yPatch {
+                    label: Some(cx.read(&label_signal)),
+                    ..A11yPatch::default()
+                })
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        let _ = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 30.0, 60.0, 24.0))
+                .id("sibling")
+                .build(tree, root)
+                .expect("sibling")
+        });
+        let _ = app.drain().expect("first");
+        assert!(snapshot(&app).full);
+
+        app.app_mut().write(&text, SmolStr::new_static("新的"));
+        let _ = app.drain().expect("second");
+        let snap = snapshot(&app);
+        assert!(!snap.full, "第二笔必须是增量");
+        let ids: Vec<NodeId> = snap.nodes().iter().map(|node| node.engine).collect();
+        assert_eq!(
+            ids,
+            vec![root, button],
+            "增量 = 变更节点 + 祖先链（不含兄弟）"
+        );
+        assert_eq!(
+            snap.node_for(button).expect("button").label_text(),
+            Some("新的")
+        );
+    }
+
+    #[test]
+    fn a11y_focus_is_always_present_even_on_an_idle_frame() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let button = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .on_click(Action::custom("press"))
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        let _ = app.drain().expect("first");
+
+        app.app_mut().set_focus(window, Some(button));
+        let record = app.drain().expect("focus frame");
+        assert!(!record.rendered, "纯 A11Y 变化必须让本帧保持 Idle");
+        let snap = record.a11y.as_ref().expect("Idle 帧也要有 a11y 交付");
+        assert_eq!(snap.focus(), A11yNodeId::from_engine(button));
+        assert_eq!(snap.focus_node().engine, button, "焦点节点必须在快照里");
+    }
+
+    #[test]
+    fn a11y_structure_matches_the_tree() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let panel = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .id("panel")
+                .build(tree, root)
+                .expect("panel")
+        });
+        let _ = app.drain().expect("first");
+
+        let child = mount(&mut app, |tree, _root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .id("child")
+                .build(tree, panel)
+                .expect("child")
+        });
+        let _ = app.drain().expect("second");
+        let expected: Vec<A11yNodeId> = app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(panel)
+            .expect("panel")
+            .children()
+            .iter()
+            .map(|child| A11yNodeId::from_engine(*child))
+            .collect();
+        let snap = snapshot(&app);
+        let actual = snap.children_of(A11yNodeId::from_engine(panel));
+        assert_eq!(actual, expected, "父的 children 必须与节点树完全一致");
+        assert!(snap.node_for(child).is_some(), "新子节点必须出现");
+    }
+
+    #[test]
+    fn a11y_bounds_equal_probe_times_scale() {
+        let scale = Scale::new(1.25).expect("scale");
+        let mut app = TestApp::with_options(WindowOptions {
+            title: SmolStr::new_static("scale"),
+            size: crate::math::Size::new(400.0, 300.0),
+            scale,
+        });
+        app.enable_a11y_capture();
+        let node = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(8.0, 12.0, 40.0, 24.0))
+                .paint(white())
+                .id("box")
+                .build(tree, root)
+                .expect("box")
+        });
+        let _ = app.drain().expect("frame");
+        let logical = app.probe().bounds(node).expect("bounds");
+        let expected = logical.to_physical(scale);
+        let snap = snapshot(&app);
+        assert_eq!(
+            snap.node_for(node).expect("box").bounds,
+            expected,
+            "a11y bounds 必须是 逻辑 × scale 逐边 round"
+        );
+    }
+
+    #[test]
+    fn a11y_bind_a11y_disabled_is_not_layout() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let disabled = app.app_mut().signal(false);
+        let signal = disabled;
+        let button = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("press"))
+                .bind_a11y(move |cx| A11yPatch {
+                    disabled: Some(cx.read(&signal)),
+                    ..A11yPatch::default()
+                })
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        let _ = app.drain().expect("first");
+        assert!(!snapshot(&app).node_for(button).expect("button").disabled);
+
+        app.app_mut().write(&disabled, true);
+        let _ = app.drain().expect("second");
+        let snap = snapshot(&app);
+        assert!(snap.node_for(button).expect("button").disabled);
+        let flags = app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(button)
+            .expect("button")
+            .dirty();
+        assert!(
+            !flags.contains(DirtyFlags::LAYOUT),
+            "`bind_a11y` 的禁用态不得触发重排（A11Y 不产生视觉 damage）"
+        );
+    }
+
+    #[test]
+    fn a11y_canvas_requires_alt_text() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let canvas = mount(&mut app, |tree, root| {
+            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 60.0, 30.0)))
+                .id("chart")
+                .build(tree, root)
+                .expect("canvas")
+        });
+        let _ = app.drain().expect("frame");
+        let snap = snapshot(&app);
+        assert!(
+            snap.node_for(canvas).expect("canvas").hidden,
+            "缺替代文本的自绘节点必须 hidden（不静默丢弃）"
+        );
+        assert!(
+            app.app()
+                .a11y_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic,
+                    A11yDiagnostic::MissingAltText { node, .. } if *node == canvas
+                )),
+            "必须记 MissingAltText 诊断"
+        );
+    }
+
+    #[test]
+    fn a11y_hidden_nodes_are_excluded() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let hidden = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .id("hidden")
+                .build(tree, root)
+                .expect("hidden")
+        });
+        let _ = app.drain().expect("first");
+
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(
+                hidden,
+                StylePatch {
+                    visible: Some(false),
+                    ..StylePatch::default()
+                },
+            );
+        // 直接写 patch 不经过 `refresh_styles`，这里显式标脏（生产路径由 `refresh_styles` 负责）。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(hidden);
+        let _ = app.drain().expect("second");
+        let snap = snapshot(&app);
+        assert!(
+            snap.node_for(hidden).expect("hidden").hidden,
+            "`visible: false` 必须传播到 a11y 的 hidden"
+        );
+        assert!(
+            snap.visible_nodes().all(|node| node.engine != hidden),
+            "hidden 节点不得出现在可见集合里"
+        );
+    }
+
+    #[test]
+    fn a11y_scale_change_resends_the_full_tree() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let node = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .paint(white())
+                .build(tree, root)
+                .expect("box")
+        });
+        let _ = app.drain().expect("first");
+        assert!(snapshot(&app).full);
+
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .set_scale(Scale::new(1.5).expect("scale"));
+        let _ = app.drain().expect("second");
+        let snap = snapshot(&app);
+        assert!(snap.full, "DPI 变化必须整棵重发（bounds 全是物理像素）");
+        assert_eq!(
+            snap.node_for(node).expect("box").bounds,
+            Rect::new(0.0, 0.0, 20.0, 20.0).to_physical(Scale::new(1.5).expect("scale"))
+        );
+    }
+
+    #[test]
+    fn a11y_virtual_list_exposes_only_mounted_rows() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(100.0),
+            height: taffy::style::Dimension::length(80.0),
+        };
+        inner.position = taffy::style::Position::Relative;
+        let container = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .style(Style {
+                    inner,
+                    clip: Clip::Bounds,
+                })
+                .id("rows")
+                .build(tree, root)
+                .expect("container")
+        });
+        let list = app
+            .app_mut()
+            .make_virtual_list(
+                window,
+                container,
+                crate::interaction::VirtualListConfig {
+                    extent: 20.0,
+                    overscan: 1,
+                },
+            )
+            .expect("virtual list");
+        app.app_mut()
+            .set_virtual_items(&list, 100, |index| {
+                NodeBuilder::boxed()
+                    .a11y(A11yOverride {
+                        label: Some(smol_str::format_smolstr!("row {index}")),
+                        ..A11yOverride::default()
+                    })
+                    .id("row")
+            })
+            .expect("items");
+        let _ = app.drain().expect("frame");
+
+        let snap = snapshot(&app);
+        let rows: Vec<&crate::a11y::A11yNode> = snap
+            .nodes()
+            .iter()
+            .filter(|node| node.role == A11yRole::ListBoxOption)
+            .collect();
+        let mounted = app.app().virtual_list_state(&list).expect("state").mounted;
+        assert_eq!(rows.len(), mounted, "a11y 只暴露已挂载的行（可见窗口）");
+        assert_eq!(snap.node_for(container).expect("list").role, A11yRole::List);
+        assert!(mounted < 100, "100 行的列表不得整表挂载");
+        let _ = Point::ZERO;
+    }
+}
+
+#[cfg(test)]
+mod p11_fix_tests {
+    use smol_str::SmolStr;
+
+    use super::TestApp;
+    use crate::{
+        a11y::A11yPatch,
+        event::Action,
+        interaction::ScrollConfig,
+        layout::LayoutOverride,
+        math::{Rect, Scale, Size},
+        node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
+        paint::{
+            color::Color,
+            style::{Clip, PaintSpec, Style},
+        },
+        window::FrameOutcome,
+    };
+
+    fn white() -> PaintSpec {
+        PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        }
+    }
+
+    fn percent_style() -> Style {
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::percent(1.0),
+            height: taffy::style::Dimension::percent(1.0),
+        };
+        Style {
+            inner,
+            clip: Clip::None,
+        }
+    }
+
+    fn mount(
+        app: &mut TestApp,
+        build: impl FnOnce(&mut crate::node::tree::NodeTree, NodeId) -> NodeId,
+    ) -> NodeId {
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        build(tree, root)
+    }
+
+    /// 审查 #1：窗口 resize 后子孙的布局盒变了，增量笔必须把它们重发。
+    #[test]
+    fn a11y_bounds_follow_window_resize() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let child = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .style(percent_style())
+                .paint(white())
+                .id("child")
+                .build(tree, root)
+                .expect("child")
+        });
+        let _ = app.drain().expect("first");
+        let before = app.probe().bounds(child).expect("bounds");
+
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .set_size(Size::new(400.0, 300.0));
+        let _ = app.drain().expect("second");
+
+        let after = app.probe().bounds(child).expect("bounds");
+        assert_ne!(before, after, "resize 必须真的改变子节点的布局盒");
+        let snap = app.a11y().expect("resize 后必须有 a11y 交付");
+        assert_eq!(
+            snap.node_for(child)
+                .expect("布局盒变了的子节点必须重发")
+                .bounds,
+            after.to_physical(app.app().window(window).expect("window").scale()),
+            "a11y bounds 必须等于 逻辑 × scale"
+        );
+    }
+
+    /// 审查 #2：`set_layout_override` / `set_style` 等走 `invalidate_layout` 的路径必须标 `A11Y`。
+    #[test]
+    fn a11y_bounds_follow_layout_override() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let node = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .paint(white())
+                .id("box")
+                .build(tree, root)
+                .expect("box")
+        });
+        let _ = app.drain().expect("first");
+
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_layout_override(
+                node,
+                Some(LayoutOverride::new(Rect::new(0.0, 0.0, 44.0, 24.0))),
+            )
+            .expect("override");
+        let _ = app.drain().expect("second");
+
+        let logical = app.probe().bounds(node).expect("bounds");
+        assert_eq!(logical.size, Size::new(44.0, 24.0), "覆盖必须生效");
+        let snap = app.a11y().expect("覆盖后必须有 a11y 交付");
+        assert_eq!(
+            snap.node_for(node).expect("必须重发").bounds,
+            logical.to_physical(Scale::ONE)
+        );
+    }
+
+    /// 审查 #3：普通滚动（非 a11y action）也必须让容器的 a11y 子树失效。
+    #[test]
+    fn a11y_bounds_follow_scroll() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        inner.position = taffy::style::Position::Relative;
+        let container = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .style(Style {
+                    inner,
+                    clip: Clip::Bounds,
+                })
+                .id("viewport")
+                .build(tree, root)
+                .expect("container")
+        });
+        let row = mount(&mut app, |tree, _root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+                .paint(white())
+                .id("row")
+                .build(tree, container)
+                .expect("row")
+        });
+        let handle = app
+            .app_mut()
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("scroll");
+        app.app_mut()
+            .set_scroll_content(&handle, Size::new(200.0, 400.0))
+            .expect("content");
+        let _ = app.drain().expect("first");
+        let before = app
+            .a11y()
+            .expect("first a11y")
+            .node_for(row)
+            .expect("row")
+            .bounds;
+
+        app.app_mut()
+            .scroll_by(&handle, crate::math::Point::new(0.0, 60.0))
+            .expect("scroll");
+        let _ = app.drain().expect("second");
+
+        let logical = app.probe().bounds(row).expect("bounds");
+        let snap = app.a11y().expect("滚动后必须有 a11y 交付");
+        let after = snap.node_for(row).expect("行必须重发").bounds;
+        assert_ne!(before, after, "滚动必须改变行的 a11y 位置");
+        assert_eq!(
+            after,
+            crate::interaction::scroll::to_screen(
+                app.app().window(window).expect("window").tree(),
+                row,
+                logical
+            )
+            .to_physical(Scale::ONE)
+        );
+    }
+
+    /// 审查 #6：写 `bind_a11y` 的信号**不得**产生任何像素（Idle、无 damage、无 PAINT）。
+    #[test]
+    fn a11y_bind_a11y_write_is_idle_without_damage() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let disabled = app.app_mut().signal(false);
+        let signal = disabled;
+        let button = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("press"))
+                .bind_a11y(move |cx| A11yPatch {
+                    disabled: Some(cx.read(&signal)),
+                    ..A11yPatch::default()
+                })
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        let first = app.drain().expect("first");
+        assert!(first.rendered, "首帧必须提交（有背景要画）");
+        assert!(
+            !app.a11y()
+                .expect("first a11y")
+                .node_for(button)
+                .expect("button")
+                .disabled
+        );
+
+        app.app_mut().write(&disabled, true);
+        let record = app.drain().expect("second");
+        assert!(
+            !record.rendered,
+            "只有 a11y 变化 ⇒ 帧末门禁必须退回 Idle（FrameOutcome::{:?}）",
+            FrameOutcome::Idle
+        );
+        assert!(record.damage.is_empty(), "a11y 更新不产生 damage");
+        let flags = app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(button)
+            .expect("button")
+            .dirty();
+        assert!(
+            !flags.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT),
+            "`bind_a11y` 不得标 LAYOUT/PAINT：{flags:?}"
+        );
+        assert!(
+            app.a11y()
+                .expect("a11y 必须交付")
+                .node_for(button)
+                .expect("button")
+                .disabled,
+            "补丁照常生效"
         );
     }
 }

@@ -35,6 +35,11 @@ pub struct FrameRecord {
     pub dirty_nodes: Vec<NodeId>,
     /// lane 级重建/复用记录。
     pub paint_log: PaintLog,
+    /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
+    ///
+    /// **放在这里而不是 `RenderedFrame`**：纯 `A11Y` 变化不产生 damage ⇒ 本帧 `Idle`，
+    /// 而 `RenderedFrame` 只存在于已提交帧（`design/phase-11-a11y.md` F-113）。
+    pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
 }
 
 /// 已提交帧的**绘制快照**（设计 §6.3 的 `RenderedFrame`）。
@@ -170,6 +175,7 @@ impl FrameRecord {
             damage_full: false,
             dirty_nodes: Vec::new(),
             paint_log: PaintLog::default(),
+            a11y: None,
         }
     }
 }
@@ -245,6 +251,7 @@ pub(crate) fn capture(
         damage_full: report.damage.full,
         dirty_nodes,
         paint_log: report.log.clone(),
+        a11y: None,
     }
 }
 

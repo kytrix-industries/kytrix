@@ -87,7 +87,17 @@ impl NativeWindow {
         }
         .map_err(|error| window_error("CreateWindowExW", error))?;
 
-        let state = Box::into_raw(Box::new(WndProcState::new(dispatcher)));
+        let state = match WndProcState::new(dispatcher, hwnd, id) {
+            Ok(state) => Box::into_raw(Box::new(state)),
+            Err(error) => {
+                // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
+                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                return Err(error);
+            }
+        };
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
 
@@ -204,6 +214,21 @@ impl NativeWindow {
     pub(crate) fn state_mut(&mut self) -> &mut WndProcState {
         // SAFETY: `state` 由 `create` 的 `Box::into_raw` 产生、`Drop` 回收；窗口存活期内唯一所有者。
         unsafe { &mut *self.state }
+    }
+
+    /// 交付一笔 a11y 更新（`pump` 每轮调用；`a11y_pending` 为 O(1) 过滤）。
+    ///
+    /// `build_update` 只在 `update_if_active` 的闭包里执行 ⇒ 没有辅助技术时**没有任何**
+    /// `accesskit::Node` 构造（懒激活零开销）。
+    pub(crate) fn update_a11y(&mut self, app: &mut crate::app::App) {
+        let window = self.id;
+        if !app.a11y_pending(window) {
+            return;
+        }
+        let state = self.state_mut();
+        state
+            .a11y_mut()
+            .update(|| crate::a11y::adapter::build_update(app, window));
     }
 
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。
