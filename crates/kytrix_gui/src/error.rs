@@ -4,19 +4,23 @@
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
 //! 变体表在 `design/phase-01-foundation.md` §6.2.2 冻结为 17 项，本阶段实现不依赖后续阶段类型的
-//! 8 项：D8 基线五类 + [`EngineError::InvalidDpiScale`] + P03 的 [`EngineError::StaleNode`] /
-//! [`EngineError::CyclicDerived`]。其余变体随对应阶段落地
-//! （`InvalidMeasure` / `LayoutInvalid` → P05，`GeometryRegister` → P09，
+//! 9 项：D8 基线五类 + [`EngineError::InvalidDpiScale`] + [`EngineError::StaleNode`] /
+//! [`EngineError::CyclicDerived`]（P03）+ [`EngineError::InvalidMeasure`]（P04）。其余变体随对应阶段落地
+//! （`LayoutInvalid` 无生产者、继续留空，`GeometryRegister` → P09，
 //! `AtlasExhausted` → P09，`TextShape` → P06，`AppInit` → P08，
 //! `WindowCreate` → P12，`ResourceDecode` → P15，`A11yInit` → P14）。
 //! 完整「名称 + payload + 实现 Phase」表见 `design/phase-01-foundation.md` §6.2.2；
-//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03（`design/DEVIATIONS.md` S-30）。
+//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03（`design/DEVIATIONS.md` S-30），
+//! `InvalidMeasure` 由 P05 改为 P04（DEVIATIONS F-51）。
 
 use std::path::PathBuf;
 
 use smol_str::SmolStr;
 
-use crate::node::{id::NodeId, signal::DerivedId};
+use crate::{
+    layout::Axis,
+    node::{id::NodeId, signal::DerivedId},
+};
 
 /// 引擎公开错误枚举。
 ///
@@ -68,6 +72,17 @@ pub enum EngineError {
          through another derived value)"
     )]
     CyclicDerived { derived: DerivedId },
+
+    /// measure 闭包返回了非有限值或负尺寸（设计 §4.8）。
+    #[error(
+        "invalid measure for {node:?} on the {axis:?} axis: {value} \
+         (measure closures must return finite, non-negative sizes)"
+    )]
+    InvalidMeasure {
+        node: NodeId,
+        axis: Axis,
+        value: f32,
+    },
 }
 
 #[cfg(test)]
@@ -106,7 +121,28 @@ mod tests {
             EngineError::CyclicDerived {
                 derived: DerivedId::for_test(0),
             },
+            EngineError::InvalidMeasure {
+                node: NodeId::for_test(4, 1),
+                axis: Axis::X,
+                value: f32::NAN,
+            },
         ]
+    }
+
+    #[test]
+    fn invalid_measure_display_names_node_axis_and_value() {
+        let text = EngineError::InvalidMeasure {
+            node: NodeId::for_test(2, 1),
+            axis: Axis::Y,
+            value: -1.5,
+        }
+        .to_string();
+
+        assert!(text.contains("invalid measure"), "{text}");
+        assert!(text.contains("n2.1"), "{text}");
+        assert!(text.contains("Y"), "{text}");
+        assert!(text.contains("-1.5"), "{text}");
+        assert!(text.contains("finite, non-negative"), "{text}");
     }
 
     #[test]

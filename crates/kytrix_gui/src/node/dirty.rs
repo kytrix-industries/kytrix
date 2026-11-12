@@ -35,8 +35,9 @@ bitflags! {
 /// N 的布局尺寸**是否可能**随子内容变化（保守：任一轴依赖即 true）。
 ///
 /// 叶子节点（`Canvas`/`Geometry`）恒 `false`：它们不布局子节点。
+/// 带 `LayoutOverride` 的节点（P04）同样恒 `false`：布局盒由应用给定，跳过了 taffy 的子布局。
 pub(crate) fn depends_on_children(node: &Node) -> bool {
-    if node.kind().is_leaf() {
+    if node.kind().is_leaf() || node.layout_override().is_some() {
         return false;
     }
     let size = node.style().inner.size;
@@ -76,13 +77,19 @@ mod tests {
             id::NodeId,
             tree::{LayoutBox, NodeTree},
         },
-        paint::{canvas::Canvas, style::Style},
+        paint::{
+            canvas::Canvas,
+            style::{Clip, Style},
+        },
     };
 
     fn style_with(width: Dimension, height: Dimension) -> Style {
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
         inner.size = taffy::geometry::Size { width, height };
-        Style { inner }
+        Style {
+            inner,
+            clip: Clip::None,
+        }
     }
 
     fn auto_style() -> Style {
@@ -311,6 +318,7 @@ mod tests {
         tree.set_layout_for_test(
             child,
             LayoutBox {
+                border: crate::math::Edges::ZERO,
                 bounds: crate::math::Rect::new(0.0, 0.0, 4.0, 4.0),
             },
             LayoutBox::default(),
@@ -403,6 +411,7 @@ mod tests {
         tree.set_layout_for_test(
             child,
             LayoutBox {
+                border: crate::math::Edges::ZERO,
                 bounds: crate::math::Rect::new(2.0, 3.0, 10.0, 10.0),
             },
             LayoutBox::default(),

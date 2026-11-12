@@ -6,6 +6,8 @@
 use smol_str::SmolStr;
 
 use crate::{
+    error::EngineError,
+    layout::LayoutReport,
     math::{Scale, Size},
     node::tree::NodeTree,
     paint::scene::Scene,
@@ -116,7 +118,34 @@ impl Window {
         self.scale
     }
 
+    /// 窗口逻辑尺寸（根布局的可用空间）。
+    #[must_use]
+    pub fn size(&self) -> Size {
+        self.options.size
+    }
+
+    /// 逻辑尺寸变化（消费者：P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存。
+    pub fn set_size(&mut self, size: Size) {
+        self.options.size = size;
+        let root = self.tree.root();
+        self.tree.mark_layout(root);
+    }
+
+    /// 用窗口逻辑尺寸重排，返回本次布局统计（P06/P09 的帧驱动调用它）。
+    ///
+    /// # Errors
+    /// `EngineError::InvalidMeasure { node, axis, value }`：某个 measure 闭包返回 NaN / 负数（首条优先）。
+    /// 出错时布局盒可能为空，调用方**不得**提交本帧。
+    pub fn compute_layout(&mut self) -> Result<LayoutReport, EngineError> {
+        self.tree.compute_layout(taffy::geometry::Size {
+            width: Some(self.options.size.width),
+            height: Some(self.options.size.height),
+        })
+    }
+
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT | PAINT`。
+    ///
+    /// **逻辑布局盒与 scale 无关**（I11：布局全用逻辑像素，物理化在 paint/P06），这里只保守地失效。
     ///
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
     pub fn set_scale(&mut self, scale: Scale) {
@@ -129,7 +158,10 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::{Window, WindowId, WindowOptions};
-    use crate::{math::Scale, node::dirty::DirtyFlags};
+    use crate::{
+        math::{Scale, Size},
+        node::dirty::DirtyFlags,
+    };
 
     fn window() -> Window {
         Window::new(WindowId::for_test(1), WindowOptions::default())
@@ -180,5 +212,143 @@ mod tests {
         assert_eq!(options.size.width, 800.0);
         assert_eq!(options.size.height, 600.0);
         assert_eq!(options.scale, Scale::ONE);
+    }
+
+    #[test]
+    fn window_size_is_root_available_space() {
+        use crate::node::builder::NodeBuilder;
+
+        let mut window = Window::new(
+            WindowId::for_test(1),
+            WindowOptions {
+                size: Size::new(120.0, 60.0),
+                ..WindowOptions::default()
+            },
+        );
+        let root = window.tree().root();
+        let child = NodeBuilder::boxed()
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+
+        let report = window.compute_layout().expect("布局成功");
+
+        assert_eq!(window.size(), Size::new(120.0, 60.0));
+        assert_eq!(
+            window.tree().get(root).expect("root").layout().bounds.size,
+            Size::new(120.0, 60.0),
+            "根 100% × 100% 撑满窗口"
+        );
+        assert!(report.laid_out >= 2, "根与子节点都要布局：{report:?}");
+        let _ = child;
+    }
+
+    #[test]
+    fn dpi_scale_does_not_change_logical_boxes() {
+        use crate::{
+            math::Rect,
+            node::builder::NodeBuilder,
+            paint::style::{Clip, Style},
+        };
+
+        fn fixed(width: f32, height: f32) -> Style {
+            let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+            inner.size = taffy::geometry::Size {
+                width: taffy::style::Dimension::length(width),
+                height: taffy::style::Dimension::length(height),
+            };
+            Style {
+                inner,
+                clip: Clip::None,
+            }
+        }
+
+        let mut window = Window::new(
+            WindowId::for_test(1),
+            WindowOptions {
+                size: Size::new(120.0, 60.0),
+                ..WindowOptions::default()
+            },
+        );
+        let root = window.tree().root();
+        let child = NodeBuilder::boxed()
+            .style(fixed(10.5, 3.25))
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let _ = window.compute_layout().expect("布局成功");
+        let before = window.tree().get(child).expect("存在").layout().bounds;
+
+        window.set_scale(Scale::new(1.5).expect("合法比例"));
+        let _ = window.compute_layout().expect("布局成功");
+
+        assert_eq!(
+            window.tree().get(child).expect("存在").layout().bounds,
+            before,
+            "逻辑布局盒与 scale 无关（物理化在 P06）"
+        );
+        assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25));
+    }
+
+    #[test]
+    fn resize_relayouts_percent_children() {
+        use crate::{
+            node::builder::NodeBuilder,
+            paint::style::{Clip, Style},
+        };
+
+        let mut window = Window::new(
+            WindowId::for_test(1),
+            WindowOptions {
+                size: Size::new(100.0, 100.0),
+                ..WindowOptions::default()
+            },
+        );
+        let root = window.tree().root();
+        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::percent(1.0),
+            height: taffy::style::Dimension::percent(1.0),
+        };
+        let child = NodeBuilder::boxed()
+            .style(Style {
+                inner,
+                clip: Clip::None,
+            })
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let _ = window.compute_layout().expect("布局成功");
+        assert_eq!(
+            window.tree().get(child).expect("存在").layout().bounds.size,
+            Size::new(100.0, 100.0)
+        );
+
+        window.set_size(Size::new(300.0, 50.0));
+        let _ = window.compute_layout().expect("布局成功");
+
+        assert_eq!(
+            window.tree().get(child).expect("存在").layout().bounds.size,
+            Size::new(300.0, 50.0),
+            "百分比尺寸随根可用空间变化"
+        );
+    }
+
+    #[test]
+    fn set_size_marks_root_layout_and_clears_cache() {
+        use crate::node::builder::NodeBuilder;
+
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let root = window.tree().root();
+        let _ = NodeBuilder::boxed()
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let _ = window.compute_layout().expect("布局成功");
+
+        window.set_size(Size::new(640.0, 480.0));
+
+        let flags = window.tree().get(root).expect("root 存在").dirty();
+        assert!(
+            flags.contains(DirtyFlags::LAYOUT),
+            "尺寸变化必须标根 LAYOUT（实际 {flags:?}）"
+        );
+        assert_eq!(window.size(), Size::new(640.0, 480.0));
     }
 }

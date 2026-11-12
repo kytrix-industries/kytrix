@@ -1048,3 +1048,228 @@
 
 > **A-N6 注记**：`error.rs` 的模块文档把 `GeometryRegister` 的落地 Phase 统一为 **P09**（与 P01 §6.2.2 冻结表一致）；
 > P01 的该行无需改动，P09 落地时按其表执行即可（此条只是把 P03 文档里的旧笔误纠正）。
+
+---
+
+## 九、Phase 04 布局与命中测试（2026-11-12）
+
+> 关联文档：`design/phase-04-layout.md`（本节 = 该文档 §20 的落地条目）。
+> **项目级授权 A-01 继续适用**；一～八 全部条目继续有效，本节不重复，只**追加**（不改写任何历史条目）。
+>
+> **事实基线**：`taffy 0.15.0`（`tree/traits.rs` 的 7 个 trait、`compute/{mod,leaf,oof,flexbox,grid,block}.rs`、
+> `tree/{cache,layout,node,taffy_tree}.rs`、`style/mod.rs`、`style/available_space.rs`），逐条行号见 phase-04 §2。
+> **未使用 web 检索**。唯一的语言行为/API 验证是 `%TEMP%\kg-p04-probe`（13 文件 / 3110 行 / 40 个单测，
+> `rustc 1.97.1` + `clippy 0.1.99`，`-D warnings` 与 `--release` 全绿），见 phase-04 §2.4。
+>
+> **5 项裁决**（phase-04 §18 提案；上级 2026-11-12 裁决：**待裁决**，本文档先按建议形态落地）：
+> ①不实现 `RoundTree`；②入口 = `Window::compute_layout`（不加 `App::layout`）；③`HitResult` 落 `layout::hit_test`；
+> ④`LayoutBox` 加 `border`；⑤`layout_override` 由 builder 强制 `position: Absolute`。
+
+### F-45 `HitResult` / `ClipChain` 的公开路径改为 `layout::hit_test::*`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §4.5 公开路径表：`HitResult` → `kytrix_gui::event::*`（定义文件 `src/event.rs`） |
+| 偏差 | `HitResult` 定义在 **`src/layout/hit_test.rs`**，公开路径 **`kytrix_gui::layout::hit_test::HitResult`**；新增公开类型 **`ClipChain`**（同文件，`HitResult::clip_chain` 的字段类型） |
+| 原因 | ①P04 的文件树把命中测试放 `layout/hit_test.rs`（brief 明确），而 `event` 模块（P10）此时不存在，P04 不能为一个路径去建空模块；②`HitResult` 的内容全部是**布局坐标**的产物（`bounds`/`clip_chain`/`local_point`），归属布局更贴合职责；③按 P01 §4.5 自己的判据「公开路径 = 类型实际定义所在的文件路径」 |
+| 修订后设计 | phase-04 §4.1 的路径表；P10 落 `event` 模块时**不再**定义 `HitResult`（避免同义类型），只在 `InputEvent` 分发里消费它 |
+
+### F-46 `LayoutBox` 增加 `border: Edges`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P03 §11.3：`LayoutBox { bounds: Rect }`（「P03 只有 `bounds`」，`baseline`/其他字段由后续 Phase additive 加） |
+| 偏差 | 增加 **`pub border: Edges`**（来源 taffy `Layout.border`，四边宽）；`LayoutBox` 从 16 B → **32 B**（probe 实测） |
+| 原因 | `Style.clip = Clip::Bounds` 的裁剪盒必须是 CSS 的 **padding box** = `bounds.inset(border)`。没有 `border` 就没有 P04 的正确 clip 链（只能退化成「裁到 border box」，差一个边框宽的系统性错误）；P06 的背景/圆角内缩同样需要它 → 不是预先设计，是 P04 的真实读者 |
+| 修订后设计 | phase-04 §8.1；P03 的结构体字面量构造点（仅测试）随之改成 `LayoutBox { bounds, border }`；`content_size` / `baseline` 仍推迟（V-33 / P05） |
+
+### F-47 **不实现** `RoundTree` / `TraverseTree` / `PrintTree`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-04 brief 要求为 `NodeTree` 实现 8 个 taffy trait（含 `RoundTree`） |
+| 偏差 | 只实现 **7 个**：`TraversePartialTree` / `LayoutPartialTree` / `LayoutContainingBlock` / `CacheTree` / `LayoutFlexboxContainer` / `LayoutGridContainer` / `LayoutBlockContainer`。`RoundTree` / `TraverseTree` / `PrintTree` **不实现** |
+| 原因 | ①`round_layout` 的唯一调用点是 `TaffyTree::compute_layout_with_measure`（`tree/taffy_tree.rs:976-981`），引擎走低级 `compute_root_layout`，**永不圆整**（P01 §7.5 / F-17）；②`RoundTree` 的 `set_final_layout` / `hoisted_child_count` / `get_hoisted_child_id` 只被 `round_layout_inner` 读（`compute/mod.rs:379-435`）⇒ 落地即无消费者（AGENTS §1.2）；③落地代价是每节点 `final_layout: Layout` = **92 B**（probe 实测），把 `Node` 从 ≈796 B 推到 888 B，逼近 1024 预算（V-30/V-31） |
+| 证据 | probe **能**实现（8 个 trait 全部编译通过、40 个用例全绿）→ 这是**决策**，不是能力限制；将来引入「按物理网格圆整」或 `print_tree` 调试时 additive 补 `final_layout` 字段 + 1 个 impl 即可 |
+| 修订后设计 | phase-04 §5.3 的决策表 + §16-7 的门禁 grep（`round_layout|final_layout|impl RoundTree` 必须无输出） |
+
+### F-48 `LayoutContainingBlock` 的 hoisted 列表**必须存储**（taffy 文档只提到 `round_layout` 消费它）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | taffy `tree/traits.rs:236-239`：「The recorded lists are consumed by `round_layout` … and are also useful for consumers implementing paint/hit-testing traversals」 |
+| 偏差 | 引擎**必须**存 `hoisted: HashMap<NodeId, SmallVec<[NodeId; 2]>>`，且它的**唯一读者是 P04 的绝对坐标 post-pass**（不是 `round_layout`） |
+| 原因 | 出流盒的包含块**可以不是它的树父**（CSS：最近的定位祖先；`position: fixed` 甚至恒定是 root）。taffy 给该盒写的 `Layout.location` 相对**包含块 border box**，而引擎的树 DFS 从树父推出不来这个参照系。`add_hoisted_children` 是 taffy 唯一权威地告诉我们「谁是谁的包含块」的地方。probe 用例 `out_of_flow_child_hoisted_to_ancestor_uses_containing_block_origin` 固化了这条（实测 (5,7)：容器 padding 10 但 taffy 的 `absolute_position_offset = border`） |
+| 修订后设计 | phase-04 §7.3-A2 / §8.3；hoisted 的三处清理点在 §6.1 的表里 |
+
+### F-49 根节点默认 `size: 100% × 100%`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 上游文档没有任何「根尺寸」的规定（只假设「窗口尺寸 = 根可用空间」） |
+| 偏差 | `NodeTree::new()` 把根的 `style.inner.size` 写成 `Dimension::percent(1.0)` × 2 |
+| 原因 | `compute_root_layout` 只接受 `available_space`，**不会**把它强加给根（`compute/mod.rs:188-324` 的 `known_dimensions` 只对 block 根自动 stretch）。probe 实测：窗口 200×200 + 根 `size: auto` ⇒ 根 **0×0**、`width: 100%` 的子节点全 0。不修这个，所有依赖「根 = 视口」的用例（命中、damage、百分比布局）都是错的 |
+| 修订后设计 | phase-04 §8.4；根默认撑满、应用可改但不该改（rustdoc 写明） |
+
+### F-50 `MeasureFn` 的输入用 taffy `Size<Option<f32>>` / `Size<AvailableSpace>`，输出用引擎 `Size`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | phase-04 brief 建议 `Box<dyn Fn(Size<Option<f32>>) -> Size<f32>>`（只给已知尺寸） |
+| 偏差 | `pub type MeasureFn = Box<dyn Fn(taffy::Size<Option<f32>>, taffy::Size<taffy::AvailableSpace>) -> Size<f32>>` |
+| 原因 | ①文本换行必须区分 `Definite(w)` / `MinContent` / `MaxContent`（固有尺寸测量），只给 `known_dimensions` 表达不了（`PerformLayout` 时 `known` 恒 `None`）；②形状与 taffy `compute_leaf_layout` 的 `MeasureFunction` **逐字一致**（`compute/leaf.rs:20-27`），适配是零成本转发；③引擎 `Size` 按 P01 §6.3 冻结为纯 `f32`，无法表达 `Option`/三态；`taffy` 类型已在公开面（F-35 先例） |
+| 修订后设计 | phase-04 §9.1 / §9.2；`Box<dyn Fn>`（不是 `FnMut`）是「measure 纯函数」的类型级保障 |
+
+### F-51 `InvalidMeasure` 的实现 Phase 改为 **P04**；`LayoutInvalid` 不落地
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §6.2.2：#9 `InvalidMeasure` 与 #10 `LayoutInvalid` 的实现 Phase 都是 **P05** |
+| 偏差 | #9 在 **P04** 落地（payload 逐字不变）；#10 **不落地**（继续留空） |
+| 原因 | ①measure 适配（`compute_leaf`）在 P04 落地，违规检测的唯一生产点就在这里（`compute/leaf.rs` 会把 NaN 夹掉/被 padding 放大，必须在闭包返回值上检测）；②#10 没有生产者：taffy 低级 API 全部返回 `LayoutOutput`、不返回 `Result`，唯一的后置校验就是 measure 违规，而它已有更精确的变体（AGENTS §1.2「不留占位」） |
+| 修订后设计 | phase-04 §14.1 / §14.2；`error.rs` 的 `all_variants()` 增加 #9 |
+
+### F-52 `calc()` 不解析（`resolve_calc_value` 走默认 `0.0`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P01 §5.3④ 把 `calc` 列进 taffy 的冻结 features；上游设计未提 calc 的求值 |
+| 偏差 | 引擎**不实现** `resolve_calc_value`（走 trait 默认实现，恒返回 `0.0`）；`calc()` 值布局为 0 |
+| 原因 | `taffy::style::Calc(*const ())` 是**不透明指针**（`style/dimension.rs:106-109`），只暴露 `calc_value() -> *const ()`，taffy 0.15 没有公开求值器；taffy 自带的 `TaffyView` 同样返回 `0.0`（`tree/taffy_tree.rs:400-403`）。要真支持 calc 就得 fork taffy 或自建 calc arena（P05 再评估） |
+| 影响 | 应用层不得使用 `Dimension::Calc` / `LengthPercentage::Calc`；`Style.inner` 的 rustdoc 写明；不新增错误变体（没有运行时可判定的信号） |
+
+### S-40 `NodeTree::insert_child` 收 `NodeSpec`（私有字段 + `new`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `insert_child(&mut self, parent: NodeId, spec: NodeSpec)`；`NodeSpec { kind, style, measure, layout_override, hit_shape }` **字段全私有** + `NodeSpec::new(kind, style, measure, layout_override, hit_shape)` + `Default`（= boxed 空部件） |
+| 原因 | `clippy::field_scoped_visibility_modifiers = "forbid"`（workspace 根）**禁止字段带 scoped 可见性修饰**（`pub(crate)`/`pub(super)`/`pub(in …)`）：probe 实测 5 个 `pub(crate)` 字段全部报 `scoped visibility modifier on a field`。部件结构体因此不能有 `pub(crate)` 字段；备选是「6 个位置参数」（`too_many_arguments` 已 allow），但调用点可读性更差 |
+| 影响 | 纯 crate 内部签名；调用点只有 `NodeBuilder::build`（与 P03 的 F-43 同源） |
+
+### S-41 布局入口 = `Window::compute_layout()`；`NodeTree::compute_layout` 是 `pub(crate)`
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `pub fn Window::compute_layout(&mut self) -> Result<LayoutReport, EngineError>`；`pub(crate) fn NodeTree::compute_layout(&mut self, available: taffy::Size<Option<f32>>)`；**不新增** `App::layout` |
+| 原因 | ①`App` 在这件事上只贡献「窗口查找」，`Option<Result<…>>` 是双层失败语义（窗口不存在 / measure 违规），调用方每次都要拆两层；②根可用空间**就是**窗口逻辑尺寸（P12 写入 `size`），不需要第二个参数；③`NodeTree::compute_layout` 需要 taffy 的 `Size<Option<f32>>`，不该进公开面 |
+| 交接 | P06/P09 的帧驱动：`app.refresh_styles(w)` → `app.window_mut(w).unwrap().compute_layout()?` → paint |
+
+### S-42 taffy `Cache` 旁表 = `Vec<Option<Cache>>`（按 arena 槽位下标）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `NodeTree.layout_cache: Vec<Option<taffy::Cache>>`，与 `slots` 等长；三处清理：`insert_child` 复用槽位、`remove` 逐节点、新增槽位 push `None` |
+| 原因 | 节点树是**稠密**的（taffy 给每个参与布局的节点建缓存）；`Cache` 实测 **408 B** ⇒ 10k 节点 ≈ 4.2 MB，可算；`Vec` 无哈希（布局顺序确定、帧记录可复现）；槽位复用是我们自己的不变量（一个 `= None` 够） |
+| 备选（已否） | `ahash::HashMap<NodeId, Cache>`：命中率无优势（稠密），条目控制字更大，且两套生命周期要两处清理 |
+| 影响 | `Node` 不内联 `Cache`（P03 N6 的预算约束），`size_of::<Node>()` 断言仍成立（V-31 跟踪） |
+
+### S-43 `LAYOUT` 的唯一消费点是 `set_unrounded_layout`；`prev_layout` / damage 在 post-pass 更新
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `set_local_layout`（= `LayoutPartialTree::set_unrounded_layout` 的落点）里 `slot.dirty.remove(LAYOUT)` + 记 `laid_out_epoch`；`absolutize` 在绝对盒变化时写 `prev_layout = old`、`layout = new`、`damage ∪= old ∪ new` |
+| 原因 | 「被 taffy 排过」= `LAYOUT` 已满足，这是唯一能精确判定的时刻（一个节点可能在一轮里被写多次）；damage 的新旧并集必须在**绝对坐标**上做（P03 的 `touch` 并的是上一帧的绝对盒） |
+| 已知空位 | 布局叶子的子节点永不被布局 ⇒ 它们的 `LAYOUT` 永不清（V-32；仅 release 可达） |
+
+### S-44 `Style.clip: Clip { None, Bounds }`：只裁子树、裁到 padding box、不读 taffy `overflow`
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 见 phase-04 §11 |
+| 原因 | ①CSS `overflow: hidden` 的裁剪盒是 padding box（需要 `LayoutBox.border`，F-46）；②裁剪**不裁自己的 border/background**（probe 固化：边框带命中自己）；③taffy 的 `Overflow` 同时改布局（滚动条槽、可滚动溢出矩形），与「裁剪」是两件事，混用会让「设了 overflow 就悄悄改了布局」 |
+| 推迟 | 圆角（`Clip::Rounded`，P06）；滚动偏移（P10 在 `clip_chain` 的绝对矩形上平移） |
+
+### S-45 `hit_test` = 逆绘制序 DFS + 布局盒剪枝；`Overlay` 无特殊分支；`ClipChain` 定长 8
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 见 phase-04 §12 |
+| 原因 | ①`order` 是 DFS 先序 ⇒ 兄弟**逆序** + 先子树后自身 = 与绘制序严格互逆（z 序天然正确）；②布局盒剪枝把 O(n) 降到 O(深 × 兄弟)；③`Overlay` 的「最高优先」= 排在 `order` 末尾，P13 不需要在 hit test 里加分支（probe 用「末尾的小浮层压过大底层」固化）；④`ClipChain` 定长 `Copy`（136 B）避免把 `smallvec` 版本写进公开 API，也与 `MAX_CLIP_DEPTH = 8` 对齐 |
+
+### S-46 `LayoutReport` 的四个字段与计数语义
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `{ laid_out, moved, cache_hits, cache_misses }`；`laid_out` 只在 `PerformLayout` 且 cache 未命中时 +1；`cache_hits/misses` 在 `cache_get` 里计；`moved` 在 post-pass 里计 |
+| 实测基线 | 首轮 4 节点 ⇒ `laid_out = 4`；改 1 个子节点 ⇒ `{ laid_out: 2, moved: 2, cache_hits: 4, cache_misses: 4 }`；无变化 ⇒ `{ laid_out: 0, moved: 0, cache_hits: 2, cache_misses: 0 }` |
+| 原因 | 「只重算脏子树」必须**可断言**（L1 的增量判据）；`cache_hits` 会随 taffy 的 measure pass 次数浮动 ⇒ 用例只断言方向（`> 0` / `== 0`），不对精确值断言 |
+| 不含 damage | damage 跨帧累积（P03 §9.4），P06 在帧初清零并物理化；放进报告会诱使调用方把它当「本帧 damage」 |
+
+### S-47 不建独立 measure 缓存；`invalidate_measure` 是唯一失效入口
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 没有 `(measure_version, available_space)` 缓存、没有 `measure_version` 字段；`pub fn NodeTree::invalidate_measure(node)` = 标 `LAYOUT` + 清 `node..root` 的 taffy 缓存 |
+| 原因 | taffy `Cache` 的 key 已含 `(known_dimensions, available_space, sizing_mode, run_mode, parent_size, mode)`（`tree/cache.rs:254-280`），probe 实测「第二轮 measure 零调用」；唯一缺的输入是「闭包捕获的状态变了」，那是一个**失效事件**（`invalidate_measure`），不是一个版本号字段（无读者的字段按 AGENTS §2.1 不加） |
+| 交接 | P05 的字体栈/文本内容变化 → 对受影响文本节点调 `invalidate_measure` |
+
+### S-48 每类型只能有一个 inherent `impl` 块；trait impl 全在 `layout/taffy_tree.rs`
+
+| 项 | 内容 |
+|----|------|
+| 事实 | `clippy::multiple_inherent_impl = "forbid"`（workspace 根）；probe 实测：同一类型两个 inherent impl 块（**即使同文件**）→ `error: multiple implementations of this structure` |
+| 决策 | `NodeTree` 的全部 inherent 方法（含 `compute_layout`/`absolutize`/`hit_test`）写在 `node/tree.rs` 的**那一个** `impl NodeTree { … }` 里；`layout/taffy_tree.rs` 只放 `impl <Trait> for NodeTree` + 自由函数（`run`/`dispatch_child_layout`/id 映射） |
+| 门禁 | phase-04 §16-10：`layout/taffy_tree.rs` 的 `^impl ` 必须是 7 行 trait impl；`node/tree.rs` 的 `^impl NodeTree {` 恰好 1 行 |
+
+### S-48b 结构性样式变更的公开入口 = `set_style`（取代提案期的 `apply_style`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `pub fn NodeTree::set_style(&mut self, node: NodeId, style: Style) -> Result<(), EngineError>`；写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 的 taffy 缓存；陈旧句柄 ⇒ `Err(EngineError::StaleNode { node })` |
+| 原因 | 审查 B1：提案期的 `apply_style` 是 `pub(crate)` 且**没有任何非 test 消费者**（`NodeBuilder` 只在挂载时写 style，`Window` 只标脏）⇒ 违反「`pub(crate)` 必须有非 test 消费者」。提升为 `pub` + 返回 `Result` 后，它是应用层「结构性样式变更」的正式入口（P08 的主题/密度切换），并给 `StaleNode` 增加一个真实生产者 |
+| 文档 | `set_style` 的 rustdoc 必须写明「**动态属性请用 `bind_style`**」：每帧调它会清整条祖先链的缓存，把增量布局退化为全量 |
+| 登记 | phase-04 §4.1 的「方法级公开面增量」表 + §4.3 的预留清单 + §8.5 的签名 |
+
+### S-49 `LayoutOverride` 的 builder 副作用 + `set_layout_override` 写入口
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `NodeBuilder::layout_override(rect)` **强制** `style.inner.position = Position::Absolute`；挂载后用 `NodeTree::set_layout_override(node, Option<LayoutOverride>) -> bool` 更新（写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 缓存） |
+| 原因 | ①出流是「位置与尺寸都由应用定」的必要条件（父不留空间），由 builder 强制比要求调用方记得设更可靠；②覆盖矩形必须在挂载后可改（分栏拖拽），而它是布局输入 ⇒ 与 `set_style`/`invalidate_measure` 同一形状的「输入变了」入口 |
+| 语义细节 | `rect` 相对**父 border box**；它是节点的 **border box**（不再过 min/max/padding）；节点是布局叶子（`build` 有 debug 断言） |
+
+### S-50 `get_detailed_layout_info` / `set_detailed_grid_info` 走默认实现
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 不存 `DetailedGridInfo<SmolStr>`，不覆写这两个方法 |
+| 原因 | 没有读者（P04 的绝对坐标 post-pass 只用 hoisted 列表）；代价是 **grid 容器内**的 absolute 子盒按 padding box 而非 grid area 定位（taffy 的默认行为，`tree/traits.rs:246-254`） |
+| 复核 | V-35；若 P08 出现「absolute 子盒按 grid area 定位」的真实需求，additive 存 `DetailedGridInfo<SmolStr>`（每 grid 容器一份 Box） |
+
+### S-51 测试与尺寸的落地实测（P04）
+
+| 项 | 计划 | 实测 |
+|---|---|---|
+| 新增 `#[cfg(test)]` 用例 | 60（phase-04 §15） | **71**（`layout/taffy_tree.rs` 25、`layout/hit_test.rs` 19、`layout/measure.rs` 10、`node/tree.rs` 9、`node/builder.rs` 3、`window.rs` 4、`node/dirty.rs` 1、`error.rs` 1、`paint/style.rs` 1、`node/id.rs` 1） |
+| `cargo test -p kytrix_gui` | — | **271 passed**（P03 结束 200 + 71） |
+| `cargo test -p kytrix_gui --release` | — | **264 passed**（7 个 `#[cfg(debug_assertions)]`/debug-only 用例不编译） |
+| `size_of::<Node>()` | ≤ 1152（§8.3） | **1016 B**（P03 是 888 B，+128 B：40 B 字段 + 88 B 对齐/填充） |
+| `size_of::<LayoutBox>()` | 32 B | **32 B** |
+
+> 74 个用例全部通过；`node_and_handle_sizes` 打印实测值，`set_style`/`set_layout_override`/`invalidate_measure`
+> 的 `StaleNode` 错误路径、`node_debug_prints_layout_fields`（N4 的 Debug 同步）、`clip_chain` 不含目标自身
+> （N3）、`visible=false` 不参与命中（N9）、`change_below_fixed_size_ancestor_still_relayouts`（N14 的
+> `cache_hits > 0` + 未受影响子树不动）都有专门用例。
+
+### S-52 代码审查（PASS-WITH-FIXES）后的三处语义修正
+
+| 项 | 修正 |
+|---|---|
+| **B1 `LayoutOverride` 参照系** | taffy 把 `position: absolute` 的 override 节点挂到最近的**定位**祖先（无则 root/ICB），其 `local` 因此相对**包含块**；引擎的 override 契约是「相对父 border box」。修正：`absolutize` 的 children 循环不跳过 override 子节点（用父 `abs.origin + override.rect`），hoisted 循环跳过它们。用例：父被 spacer 推到 y=40/100 ⇒ override 绝对 (10,60)/(10,120)、命中、父移动后跟随 |
+| **B2 hit test 剪枝** | 布局盒**不能**作为子树剪枝依据（出流子节点可溢出父盒）；唯一安全的剪枝是 `Clip::Bounds` 祖先的 padding box。修正：children 循环只跳过「叶子 + 盒外」，自身命中增加 `bounds.contains(point)` 前置条件。用例：无 clip 父 + 溢出子命中；有 clip 父 → 不命中（落 root）。代价记 V-38 |
+| **N1/N3 幽灵盒** | 隐藏子树（自身或祖先 `display: none`）的所有后代（含 override 与出流盒）强制零化；`dispatch_child_layout` 里 `display:none` 判断**先于** override 分支。用例：隐藏父的出流后代 / 隐藏的 override 节点必须 `bounds.is_empty()` |
+| **N2 `FlowRoot`** | `Display::FlowRoot` 的 `block_ctx` 透传改为 `None`（与 taffy `TaffyView` 一致） |
+| **N5 `hoisted` 清理** | `remove` 除删除被卸载节点自身的列表外，还 `retain` 掉**所有**「值里包含被卸载 id」的旧列表项 |
+| **N6 兄弟用例** | 改为完全重叠的绝对定位兄弟，断言后者胜出（原用例按布局盒剪枝，B2 后语义已变） |
+
+### 九·待复核项（P04 新增）
+
+| 编号 | 内容 | 复核 Phase | 触发条件 / 处置 |
+|---|---|---|---|
+| V-31 | `size_of::<Node>()`：P04 新增 40 B（`local` 16 + `local_border` 16 + `epoch` 4 + padding）。probe 的等价节点 = 888 B（含 92 B probe-only `final_layout`）⇒ 去掉后 ≈796 B | P04 实现首日 | 复跑 `node_size_within_budget`；超 1024 → `style: Box<Style>`（P03 V-30 的备选，公开面不变） |
+| V-32 | 布局叶子（`Canvas`/`Geometry`/`LayoutOverride`）的子节点永不被布局 ⇒ 它们的 `LAYOUT` 位永不清（`StylePassReport.layout_dirty` 可能长期为真） | P06 | 若影响「有无脏位」判定：在 `remove`/`begin_frame` 里对不可达子树清位 |
+| V-33 | damage 覆盖：祖先盒不含**出流溢出**的后代时，只按祖先 AABB 累积 damage 会漏 | P06 | 给 `LayoutBox` additive 加 `overflow: Rect`（taffy `Layout.scrollable_overflow_rect`）并并入 damage |
+| V-34 | taffy 的 `absolute_position_offset = border`（不含 padding），与 CSS「padding box 定位」有差异 | P08 迁移 | 引擎照抄不重算（`compute/flexbox.rs:511`）；应用层文档写明「absolute 子节点的 inset 相对 border box」 |
+| V-35 | 不实现 `get_detailed_layout_info` ⇒ grid 容器内的 absolute 子盒按 padding box 定位 | P08 / P13 | 出现真实需求 → additive 存 `DetailedGridInfo<SmolStr>` |
+| V-36 | `ClipChain` 定长 8：超过 8 层的 clip 链被截断（点仍按前 8 层裁剪） | P10 | 与 `MAX_CLIP_DEPTH` 同一上限（shader 固定数组）；`Lane::push` 的 debug 断言先行暴露 |
+| V-37 | 增量正确性依赖「结构变更也清缓存」：`append_child`/`remove` → `mark_structure` → 清 `node..root` | P04 实现 | 用例 `remove_drops_cache_and_hoisted_entries` 固化；P03 的 `mark_structure` 调用点已就位，只需内部接上 `invalidate_caches_upwards` |

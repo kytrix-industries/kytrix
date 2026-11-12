@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod error;
+pub mod layout;
 pub mod math;
 pub mod node;
 pub mod paint;

@@ -9,10 +9,15 @@
 use std::fmt;
 
 use smallvec::SmallVec;
+use smol_str::SmolStr;
 
 use crate::{
     error::EngineError,
-    math::Rect,
+    layout::{
+        Axis, LayoutOverride, LayoutReport, MeasureFn,
+        hit_test::{HitResult, hit_test},
+    },
+    math::{Edges, Point, Rect},
     node::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, affects_parent, depends_on_children},
@@ -23,18 +28,21 @@ use crate::{
         canvas::Canvas,
         geometry::GeometryId,
         scene::LaneId,
-        style::{Style, StylePatch},
+        style::{Clip, Style, StylePatch},
     },
 };
 
-/// 逻辑像素的布局结果（只记录 AABB）。
+/// 逻辑像素的布局结果（只记录 AABB 与边框）。
 ///
-/// P03 只声明与搬运它（`layout` + `prev_layout` + `damage`）；写入者是 P04 的 `set_layout`。
-/// `Copy`、16 B：damage 计算只需两次并集，不必借用。
+/// `bounds` 是**窗口绝对** border box AABB（P04 的绝对坐标 post-pass 写入）；`border` 来自 taffy
+/// `Layout.border`，是 clip 的 padding box 与 P06 背景/边框绘制的来源。
+/// `Copy`、32 B：damage 计算只需两次并集，不必借用。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutBox {
     /// 相对窗口左上角的逻辑像素 AABB（`w`/`h` 可为 0）。
     pub bounds: Rect,
+    /// 四边 border 宽度（逻辑像素，CSS 顺序 上/右/下/左）。
+    pub border: Edges,
 }
 
 /// 节点的种类（决定叶子性与绘制路径）。
@@ -58,6 +66,57 @@ impl NodeKind {
     }
 }
 
+/// 建节点所需的**部件**（`NodeBuilder` 收齐后一次性交给 [`NodeTree::insert_child`]）。
+///
+/// **字段全私有**：本 workspace 的 `clippy::field_scoped_visibility_modifiers = "forbid"` 禁止字段带
+/// *scoped* 可见性修饰（`pub(crate)` 也不行，实测编译失败），因此只能走构造器 + 链式 `with_*`。
+pub(crate) struct NodeSpec {
+    kind: NodeKind,
+    style: Style,
+    bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
+    measure: Option<MeasureFn>,
+    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    layout_override: Option<LayoutOverride>,
+}
+
+impl NodeSpec {
+    pub(crate) fn new(
+        kind: NodeKind,
+        style: Style,
+        bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
+    ) -> Self {
+        Self {
+            kind,
+            style,
+            bind_style,
+            measure: None,
+            hit_shape: None,
+            layout_override: None,
+        }
+    }
+
+    pub(crate) fn with_measure(mut self, measure: MeasureFn) -> Self {
+        self.measure = Some(measure);
+        self
+    }
+
+    pub(crate) fn with_hit_shape(mut self, hit_shape: Box<dyn Fn(Point) -> bool>) -> Self {
+        self.hit_shape = Some(hit_shape);
+        self
+    }
+
+    pub(crate) fn with_layout_override(mut self, layout_override: LayoutOverride) -> Self {
+        self.layout_override = Some(layout_override);
+        self
+    }
+}
+
+impl Default for NodeSpec {
+    fn default() -> Self {
+        Self::new(NodeKind::Box, Style::default(), None)
+    }
+}
+
 /// 一个持久节点（跨帧存活）。**字段全私有**（I6：应用层不得持 `&mut Node`）。
 pub struct Node {
     id: NodeId,
@@ -70,10 +129,22 @@ pub struct Node {
     style_patch: StylePatch,
     /// 动态属性闭包（`None` = 静态节点）。
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
-    /// 当前布局盒（逻辑像素；P04 写）。
+    /// 自定义叶子测量（P05 的文本入口；见 [`MeasureFn`] 的纯函数契约）。
+    measure: Option<MeasureFn>,
+    /// 自定义命中形状（局部坐标；`None` = 用 `layout.bounds` 判定）。
+    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    /// 布局覆盖（root 逃生口）。
+    layout_override: Option<LayoutOverride>,
+    /// 当前布局盒（逻辑像素；窗口绝对）。消费者：`Probe`/P06/P04 的命中测试。
     layout: LayoutBox,
     /// 上一次布局盒（damage 的「旧」一侧）。
     prev_layout: LayoutBox,
+    /// taffy 写入的**父相对** border box（`set_unrounded_layout` 的唯一落点）。
+    local: Rect,
+    /// taffy 写入的四边 border 宽度。
+    local_border: Edges,
+    /// 最近一次被 taffy 布局的 epoch（`== NodeTree::layout_epoch` ⇒ 本轮布局过）。
+    laid_out_epoch: u32,
     /// 本帧累积的逻辑 damage AABB（§9.4）。
     damage: Rect,
     /// 该节点的绘制输出桶（按绘制序；P06 的 paint 分配）。
@@ -83,7 +154,9 @@ pub struct Node {
     dirty: DirtyFlags,
 }
 
-/// **手写 `Debug`**（N4）：`bind_style` 是 `Box<dyn Fn>`（不实现 `Debug`），闭包位固定打印 `<closure>`。
+/// **手写 `Debug`**（N4）：`bind_style` / `measure` / `hit_shape` 是闭包（不实现 `Debug`），
+/// 固定打印 `Some("<closure>")` / `None`；P04 新增的布局字段全部逐字段打印（否则测试失败信息与
+/// P08 的 `Probe` 诊断会缺失布局事实）。
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Node")
@@ -94,8 +167,14 @@ impl fmt::Debug for Node {
             .field("style", &self.style)
             .field("style_patch", &self.style_patch)
             .field("bind_style", &self.bind_style.as_ref().map(|_| "<closure>"))
+            .field("measure", &self.measure.as_ref().map(|_| "<closure>"))
+            .field("hit_shape", &self.hit_shape.as_ref().map(|_| "<closure>"))
+            .field("layout_override", &self.layout_override)
             .field("layout", &self.layout)
             .field("prev_layout", &self.prev_layout)
+            .field("local", &self.local)
+            .field("local_border", &self.local_border)
+            .field("laid_out_epoch", &self.laid_out_epoch)
             .field("damage", &self.damage)
             .field("lanes", &self.lanes)
             .field("deps", &self.deps)
@@ -171,6 +250,24 @@ impl Node {
         &self.lanes
     }
 
+    /// 子树裁剪策略（P04 的命中测试与 P06 的 `Clip` 图元都读它）。
+    #[must_use]
+    pub fn clip(&self) -> Clip {
+        self.style.clip
+    }
+
+    /// 自定义命中形状（局部坐标；`None` = 用 `layout.bounds` 判定）。
+    #[must_use]
+    pub fn hit_shape(&self) -> Option<&dyn Fn(Point) -> bool> {
+        self.hit_shape.as_deref()
+    }
+
+    /// 布局覆盖（P13 的分栏拖拽；`None` = 由 taffy 决定）。
+    #[must_use]
+    pub fn layout_override(&self) -> Option<LayoutOverride> {
+        self.layout_override
+    }
+
     /// 把 `prev_layout ∪ layout` 并入 damage（§9.4：位置变化时新旧都要重画）。
     fn accumulate_damage(&mut self) {
         self.damage = self
@@ -187,6 +284,52 @@ pub struct NodeTree {
     arena: Arena<Node>,
     root: NodeId,
     order: Vec<NodeId>,
+    /// taffy 布局缓存旁表（按 arena 槽位下标索引；`Node` 不内联 `Cache`，见 P03 N6 / P04 §6.1）。
+    layout_cache: Vec<Option<taffy::Cache>>,
+    /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
+    hoisted: ahash::HashMap<NodeId, SmallVec<[NodeId; 2]>>,
+    /// 布局运行代次（0 保留，首轮为 1）。
+    layout_epoch: u32,
+    /// 本轮布局的计数器（`LayoutReport` 的来源）。
+    layout_stats: LayoutStats,
+    /// 首条 measure 违规（`InvalidMeasure` 的唯一来源）。
+    invalid_measure: Option<EngineError>,
+}
+
+/// 一次布局运行的计数器。
+///
+/// 字段私有 + `note_*`/`into_report` 方法：`field_scoped_visibility_modifiers` 禁止字段带 scoped 修饰，
+/// 而可见性必须能被 `layout::taffy_tree` 使用，因此只能经方法暴露。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LayoutStats {
+    cache_hits: usize,
+    cache_misses: usize,
+    laid_out: usize,
+    moved: usize,
+}
+
+impl LayoutStats {
+    pub(crate) fn note_cache_hit(&mut self) {
+        self.cache_hits += 1;
+    }
+
+    pub(crate) fn note_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    /// 只有「完整布局且 taffy cache 未命中」的节点才计入 `laid_out`（= 真正被重算的节点）。
+    pub(crate) fn note_laid_out(&mut self) {
+        self.laid_out += 1;
+    }
+
+    pub(crate) fn into_report(self) -> LayoutReport {
+        LayoutReport {
+            laid_out: self.laid_out,
+            moved: self.moved,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+        }
+    }
 }
 
 impl Default for NodeTree {
@@ -197,19 +340,34 @@ impl Default for NodeTree {
 
 impl NodeTree {
     /// 建一棵只有根节点的树（消费者：`Window::new`）。
+    ///
+    /// **根默认撑满 ICB**（`size: 100% × 100%`）：taffy 的 `compute_root_layout` 只接受
+    /// `available_space`，不会把「窗口尺寸」强加给根；flex/grid 根的 `size: auto` 是 shrink-to-fit
+    /// （实测：窗口 200×200 时根会塌成 0×0，百分比子节点全部为 0）。因此根必须在建树时显式撑满。
     #[must_use]
     pub fn new() -> Self {
+        let mut root_style = Style::default();
+        root_style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::percent(1.0),
+            height: taffy::style::Dimension::percent(1.0),
+        };
         let mut arena: Arena<Node> = Arena::new();
         let root = arena.insert_with(|id| Node {
             id,
             parent: None,
             children: SmallVec::new(),
             kind: NodeKind::Box,
-            style: Style::default(),
+            style: root_style,
             style_patch: StylePatch::default(),
             bind_style: None,
+            measure: None,
+            hit_shape: None,
+            layout_override: None,
             layout: LayoutBox::default(),
             prev_layout: LayoutBox::default(),
+            local: Rect::default(),
+            local_border: Edges::ZERO,
+            laid_out_epoch: 0,
             damage: Rect::default(),
             lanes: SmallVec::new(),
             deps: SmallVec::new(),
@@ -219,6 +377,11 @@ impl NodeTree {
             arena,
             root,
             order: vec![root],
+            layout_cache: vec![None],
+            hoisted: ahash::HashMap::default(),
+            layout_epoch: 0,
+            layout_stats: LayoutStats::default(),
+            invalid_measure: None,
         }
     }
 
@@ -301,8 +464,18 @@ impl NodeTree {
         }
         let block = self.collect_subtree_ids(node);
         for id in block.iter().rev() {
+            let index = id.index() as usize;
+            if let Some(slot) = self.layout_cache.get_mut(index) {
+                *slot = None;
+            }
+            self.hoisted.remove(id);
             let _ = self.arena.remove(*id);
         }
+        // 别的包含块可能把被卸载的节点记在自己的 hoisted 列表里（出流孙节点）⇒ 逐表剔除。
+        self.hoisted.retain(|_, list| {
+            list.retain(|child| !block.contains(child));
+            !list.is_empty()
+        });
         self.mark_structure(parent);
         #[cfg(debug_assertions)]
         self.debug_assert_order_matches_tree();
@@ -311,15 +484,22 @@ impl NodeTree {
 
     /// 铸一个新节点并挂到 `parent` 末尾（消费者：`NodeBuilder::build`）。
     ///
-    /// 参数而不是半成品 `Node`：`Node` 的全部字段都是 `node::tree` 私有的，只有本模块能构造。
+    /// 参数是 [`NodeSpec`]（部件）而不是半成品 `Node`：`Node` 的全部字段都是本模块私有的，
+    /// 只有这里能构造（P03 F-43 / P04 S-40）。
     pub(crate) fn insert_child(
         &mut self,
         parent: NodeId,
-        kind: NodeKind,
-        style: Style,
-        bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
+        spec: NodeSpec,
     ) -> Result<NodeId, EngineError> {
         self.get(parent)?;
+        let NodeSpec {
+            kind,
+            style,
+            bind_style,
+            measure,
+            hit_shape,
+            layout_override,
+        } = spec;
         let id = self.arena.insert_with(move |id| Node {
             id,
             parent: None,
@@ -328,13 +508,26 @@ impl NodeTree {
             style,
             style_patch: StylePatch::default(),
             bind_style,
+            measure,
+            hit_shape,
+            layout_override,
             layout: LayoutBox::default(),
             prev_layout: LayoutBox::default(),
+            local: Rect::default(),
+            local_border: Edges::ZERO,
+            laid_out_epoch: 0,
             damage: Rect::default(),
             lanes: SmallVec::new(),
             deps: SmallVec::new(),
             dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         });
+        // 槽位复用：上一代节点的 taffy 缓存必须丢弃，否则新节点继承陈旧布局（P04 §6.1）。
+        let index = id.index() as usize;
+        if self.layout_cache.len() <= index {
+            self.layout_cache.resize_with(index + 1, || None);
+        }
+        self.layout_cache[index] = None;
+        self.hoisted.remove(&id);
         self.order_insert(parent, id);
         if let Some(node) = self.arena.get_mut(id) {
             node.parent = Some(parent);
@@ -403,12 +596,13 @@ impl NodeTree {
         self.touch(node, DirtyFlags::PAINT)
     }
 
-    /// 标 `LAYOUT | PAINT` 并向上冒泡（§9.2 / N7）。
+    /// 标 `LAYOUT | PAINT` 并向上冒泡（§9.2 / N7），同时清 `node..root` 的 taffy 缓存（P04 §6.2）。
     pub(crate) fn mark_layout(&mut self, node: NodeId) -> bool {
         if !self.touch(node, DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
             return false;
         }
         self.bubble_layout(node);
+        self.invalidate_caches_upwards(node);
         true
     }
 
@@ -417,7 +611,7 @@ impl NodeTree {
         self.touch(node, DirtyFlags::A11Y)
     }
 
-    /// 结构变更：标 `LAYOUT|PAINT|ORDER|A11Y` 并向上冒泡。
+    /// 结构变更：标 `LAYOUT|PAINT|ORDER|A11Y` 并向上冒泡，同时清 `node..root` 的 taffy 缓存。
     pub(crate) fn mark_structure(&mut self, node: NodeId) -> bool {
         if !self.touch(
             node,
@@ -426,6 +620,7 @@ impl NodeTree {
             return false;
         }
         self.bubble_layout(node);
+        self.invalidate_caches_upwards(node);
         true
     }
 
@@ -437,6 +632,301 @@ impl NodeTree {
                 true
             }
             None => false,
+        }
+    }
+
+    // ── P04：布局与命中的公开入口 ──────────────────────────────────────────────
+
+    /// 结构性/静态样式变更的唯一公开入口：写值 + 标 `LAYOUT|PAINT` + 冒泡 + 清 `node..root` 的 taffy 缓存。
+    ///
+    /// **动态属性请用 `bind_style`**（`StylePatch` 通道）：每帧调本方法会清掉整条祖先链的缓存，
+    /// 让增量布局退化为全量。
+    ///
+    /// # Errors
+    /// `EngineError::StaleNode { node }`：句柄陈旧（从未存在 / 已卸载）。
+    pub fn set_style(&mut self, node: NodeId, style: Style) -> Result<(), EngineError> {
+        let Some(target) = self.arena.get_mut(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        target.style = style;
+        self.invalidate_layout(node);
+        Ok(())
+    }
+
+    /// 「我的 measure 结果变了，但样式没变」：唯一的 measure 失效入口（P05 的字体栈/文本内容变化）。
+    ///
+    /// 不做独立 measure 缓存：taffy `Cache` 的 key 已含 `(known_dimensions, available_space,
+    /// sizing_mode, run_mode, parent_size)`，唯一缺的是「闭包捕获的状态变了」这个信号 —— 就是本方法。
+    ///
+    /// # Errors
+    /// `EngineError::StaleNode { node }`：句柄陈旧。
+    pub fn invalidate_measure(&mut self, node: NodeId) -> Result<(), EngineError> {
+        if self.arena.get(node).is_none() {
+            return Err(EngineError::StaleNode { node });
+        }
+        self.invalidate_layout(node);
+        Ok(())
+    }
+
+    /// 更新布局覆盖矩形（P13 的分栏拖拽）：写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 缓存。
+    ///
+    /// # Errors
+    /// `EngineError::StaleNode { node }`：句柄陈旧。
+    pub fn set_layout_override(
+        &mut self,
+        node: NodeId,
+        layout_override: Option<LayoutOverride>,
+    ) -> Result<(), EngineError> {
+        let Some(target) = self.arena.get_mut(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        target.layout_override = layout_override;
+        self.invalidate_layout(node);
+        Ok(())
+    }
+
+    /// 一次布局运行：`compute_root_layout` → 绝对坐标 post-pass → 错误面。
+    ///
+    /// 消费者：`Window::compute_layout`（唯一调用点）。
+    ///
+    /// # Errors
+    /// `EngineError::InvalidMeasure { node, axis, value }`：measure 闭包返回非有限值或负尺寸（首条优先）。
+    pub(crate) fn compute_layout(
+        &mut self,
+        available: taffy::Size<Option<f32>>,
+    ) -> Result<LayoutReport, EngineError> {
+        crate::layout::taffy_tree::run(self, available)
+    }
+
+    /// 命中测试（逆绘制序 + clip 链 + `hit_shape`）。
+    ///
+    /// 消费者：P10 的事件分发、P13 的 `Overlay`、P14 的 a11y hit test（P04 的用例也用它）。
+    #[must_use]
+    pub fn hit_test(&self, point: Point) -> Option<HitResult> {
+        hit_test(self, point)
+    }
+
+    // ── P04：taffy 低级 trait 的访问器（消费者：`layout::taffy_tree` / `layout::hit_test`） ──
+
+    /// 节点的 taffy 样式；陈旧 id 回落到根的样式（`debug_assert`）。
+    pub(crate) fn taffy_style(&self, node: NodeId) -> &taffy::Style<SmolStr> {
+        match self.arena.get(node) {
+            Some(target) => &target.style.inner,
+            None => {
+                debug_assert!(false, "taffy queried a stale node's style");
+                &self.arena.get(self.root).expect("根节点恒存活").style.inner
+            }
+        }
+    }
+
+    /// 子节点切片；陈旧 id 回落为空切片。
+    pub(crate) fn taffy_children(&self, node: NodeId) -> &[NodeId] {
+        self.arena
+            .get(node)
+            .map_or(&[], |target| target.children.as_slice())
+    }
+
+    /// 旁表里的 taffy 缓存（首次访问即建）。
+    pub(crate) fn taffy_cache(&mut self, node: NodeId) -> &mut taffy::Cache {
+        let index = node.index() as usize;
+        if self.layout_cache.len() <= index {
+            self.layout_cache.resize_with(index + 1, || None);
+        }
+        self.layout_cache[index].get_or_insert_with(taffy::Cache::new)
+    }
+
+    /// `LayoutPartialTree::set_unrounded_layout` 的落点：写**父相对**几何 + 消费 `LAYOUT`。
+    pub(crate) fn set_local_layout(&mut self, node: NodeId, layout: &taffy::Layout) {
+        let epoch = self.layout_epoch;
+        let local = Rect::new(
+            layout.location.x,
+            layout.location.y,
+            layout.size.width,
+            layout.size.height,
+        );
+        let border = Edges::new(
+            layout.border.top,
+            layout.border.right,
+            layout.border.bottom,
+            layout.border.left,
+        );
+        if let Some(target) = self.arena.get_mut(node) {
+            target.local = local;
+            target.local_border = border;
+            target.laid_out_epoch = epoch;
+            // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
+            target.dirty.remove(DirtyFlags::LAYOUT);
+        }
+    }
+
+    /// 节点的自定义测量闭包。
+    pub(crate) fn measure_of(&self, node: NodeId) -> Option<&MeasureFn> {
+        self.arena
+            .get(node)
+            .and_then(|target| target.measure.as_ref())
+    }
+
+    /// 节点的布局覆盖。
+    pub(crate) fn layout_override_of(&self, node: NodeId) -> Option<LayoutOverride> {
+        self.arena
+            .get(node)
+            .and_then(|target| target.layout_override)
+    }
+
+    /// `LayoutContainingBlock::clear_hoisted_children`。
+    pub(crate) fn hoisted_clear(&mut self, node: NodeId) {
+        if let Some(list) = self.hoisted.get_mut(&node) {
+            list.clear();
+        }
+    }
+
+    /// `LayoutContainingBlock::add_hoisted_children`。
+    pub(crate) fn hoisted_push(&mut self, node: NodeId, hoisted: &[NodeId]) {
+        self.hoisted
+            .entry(node)
+            .or_default()
+            .extend_from_slice(hoisted);
+    }
+
+    /// 本轮统计的可写视图（消费者：`impl CacheTree for NodeTree`、`dispatch_child_layout`）。
+    pub(crate) fn stats_mut(&mut self) -> &mut LayoutStats {
+        &mut self.layout_stats
+    }
+
+    /// 记录一条 measure 违规（**首条优先**，保证诊断确定）。
+    pub(crate) fn note_invalid_measure(&mut self, node: NodeId, axis: Axis, value: f32) {
+        if self.invalid_measure.is_none() {
+            self.invalid_measure = Some(EngineError::InvalidMeasure { node, axis, value });
+        }
+    }
+
+    pub(crate) fn take_invalid_measure(&mut self) -> Option<EngineError> {
+        self.invalid_measure.take()
+    }
+
+    /// 开一轮布局：epoch +1、统计清零。
+    pub(crate) fn begin_layout(&mut self) {
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
+        self.layout_stats = LayoutStats::default();
+    }
+
+    /// 取走本轮统计（消费者：`layout::taffy_tree::run`）。
+    pub(crate) fn take_report(&mut self) -> LayoutReport {
+        std::mem::take(&mut self.layout_stats).into_report()
+    }
+
+    /// 标 `LAYOUT|PAINT` + 冒泡 + 清 `node..root` 的 taffy 缓存（所有「布局输入变了」的公共尾段）。
+    ///
+    /// 消费者：`set_style` / `invalidate_measure` / `set_layout_override` / `Window::{set_size, set_scale}`。
+    pub(crate) fn invalidate_layout(&mut self, node: NodeId) -> bool {
+        if !self.touch(node, DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
+            return false;
+        }
+        self.bubble_layout(node);
+        self.invalidate_caches_upwards(node);
+        true
+    }
+
+    /// 绝对坐标 post-pass：把 `local`（父相对）换算成 `layout.bounds`（窗口绝对）。
+    ///
+    /// 遍历规则（正确性的核心，见 `design/phase-04-layout.md` §7）：
+    /// - 从根开始，根的 `local` 相对 ICB 原点 ⇒ 绝对 = `local`；
+    /// - 流内子节点：`abs = 父 abs.origin + child.local.origin`；
+    /// - 出流子节点：**不在**父的 children 循环里处理（跳过），而由它**包含块**的 hoisted 列表驱动，
+    ///   参照系仍是包含块的 border box origin（taffy `OofPositioningArea.offset` 的定义）；
+    /// - 跳过整棵子树的条件：本轮没被布局（`laid_out_epoch != epoch`）且 `abs` 与旧值逐位相同。
+    pub(crate) fn absolutize(&mut self) {
+        let epoch = self.layout_epoch;
+        self.place_subtree(self.root, Point::ZERO, epoch, true, false);
+    }
+
+    fn place_subtree(
+        &mut self,
+        node: NodeId,
+        reference: Point,
+        epoch: u32,
+        force: bool,
+        parent_hidden: bool,
+    ) {
+        let Some(target) = self.arena.get(node) else {
+            return;
+        };
+        // 隐藏子树（自身或祖先 `display: none`）一律零化：taffy 的 hidden pass 已把 local 写成零，
+        // 这里再兜住 `LayoutOverride`（覆盖节点不得留非零幽灵盒）。
+        let hidden =
+            parent_hidden || matches!(target.style.inner.display, taffy::style::Display::None);
+        // `LayoutOverride` 直接覆盖 taffy 给的父相对盒（位置与尺寸都取应用给的值）；
+        // 隐藏时归零（否则出流/隐藏的覆盖节点会在 P06 读到幽灵盒）。
+        let local = if hidden {
+            Rect::default()
+        } else {
+            target
+                .layout_override
+                .map_or(target.local, |over| over.rect)
+        };
+        let abs = Rect::from_origin_size(reference + local.origin, local.size);
+        let old = target.layout;
+        let children = target.children.clone();
+        let changed = abs != old.bounds;
+        let fresh = target.laid_out_epoch == epoch;
+        if !force && !fresh && !changed {
+            return;
+        }
+
+        if changed {
+            self.layout_stats.moved += 1;
+            if let Some(target) = self.arena.get_mut(node) {
+                target.damage = target.damage.union(old.bounds).union(abs);
+                target.prev_layout = old;
+                target.layout = LayoutBox {
+                    bounds: abs,
+                    border: target.local_border,
+                };
+            }
+        } else if fresh {
+            // 尺寸/位置没变但 border 宽可能变了（样式改 border）。
+            if let Some(target) = self.arena.get_mut(node) {
+                target.layout.border = target.local_border;
+            }
+        }
+
+        let hoisted: SmallVec<[NodeId; 2]> = self.hoisted.get(&node).cloned().unwrap_or_default();
+        for child in children {
+            // 出流节点（无 override）由它的**包含块**的 hoisted 列表驱动；但 override 节点按
+            // **树父**的 border-box origin 放置（B1：taffy 会把 absolute 节点挂到最近的定位祖先，
+            // 而引擎 `LayoutOverride` 的契约是「相对父 border box」），隐藏子树里的出流后代也必须
+            // 在这里零化（N1）。
+            if self.is_out_of_flow(child) && self.layout_override_of(child).is_none() && !hidden {
+                continue;
+            }
+            self.place_subtree(child, abs.origin, epoch, false, hidden);
+        }
+        for child in hoisted {
+            if self.layout_override_of(child).is_some() {
+                // override 节点已由树父按 border-box origin 放置（B1），不得再用包含块的 local 算一次。
+                continue;
+            }
+            self.place_subtree(child, abs.origin, epoch, false, false);
+        }
+    }
+
+    /// 节点的布局是否「出流」（与 taffy `RoundTree::is_out_of_flow` 的判定逐字一致）。
+    pub(crate) fn is_out_of_flow(&self, node: NodeId) -> bool {
+        self.arena.get(node).is_some_and(|target| {
+            target.style.inner.position.is_out_of_flow()
+                && !matches!(target.style.inner.display, taffy::style::Display::None)
+        })
+    }
+
+    /// 清 `node` 与**全部祖先**的 taffy 缓存（**不能早停**：任一祖先 cache 命中都会让 taffy 不再下钻）。
+    fn invalidate_caches_upwards(&mut self, node: NodeId) {
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            let index = current.index() as usize;
+            if let Some(cache) = self.layout_cache.get_mut(index).and_then(Option::as_mut) {
+                cache.clear();
+            }
+            cursor = self.arena.get(current).and_then(|target| target.parent);
         }
     }
 
@@ -663,12 +1153,12 @@ impl NodeTree {
 mod tests {
     use smallvec::smallvec;
 
-    use super::{LayoutBox, Node, NodeKind, NodeTree};
+    use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree};
     use crate::{
         error::EngineError,
-        math::Rect,
+        math::{Edges, Rect},
         node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
-        paint::style::{Style, StylePatch},
+        paint::style::{Clip, Style, StylePatch},
     };
 
     fn boxed(tree: &mut NodeTree, parent: NodeId) -> NodeId {
@@ -792,9 +1282,11 @@ mod tests {
         let node = tree
             .insert_child(
                 root,
-                NodeKind::Box,
-                Style::default(),
-                Some(Box::new(|_cx| StylePatch::default())),
+                NodeSpec::new(
+                    NodeKind::Box,
+                    Style::default(),
+                    Some(Box::new(|_cx| StylePatch::default())),
+                ),
             )
             .expect("插入成功");
 
@@ -811,13 +1303,170 @@ mod tests {
 
     #[test]
     fn node_and_handle_sizes() {
+        let node_size = size_of::<Node>();
+        println!("size_of::<Node>() = {node_size}");
+        println!("size_of::<LayoutBox>() = {}", size_of::<LayoutBox>());
         assert!(
-            size_of::<Node>() <= 1024,
-            "Node 尺寸超预算: {} B（备选：style: Box<Style>，见 V-30）",
-            size_of::<Node>()
+            node_size <= 1152,
+            "Node 尺寸超预算: {node_size} B（过 1152 → 备选 style: Box<Style>，见 V-31）"
         );
         assert_eq!(size_of::<Option<NodeId>>(), 8, "Option<NodeId> 必须零开销");
         assert_eq!(size_of::<NodeId>(), 8);
+    }
+
+    #[test]
+    fn layout_box_is_32_bytes() {
+        assert_eq!(
+            size_of::<LayoutBox>(),
+            size_of::<Rect>() + size_of::<Edges>()
+        );
+        assert_eq!(size_of::<LayoutBox>(), 32);
+    }
+
+    #[test]
+    fn root_style_is_percent_100() {
+        use taffy::style::{Dimension, ExpandedDimension};
+
+        let tree = NodeTree::new();
+        let root = tree.get(tree.root()).expect("root 存在");
+        let size = root.style().inner.size;
+
+        assert!(matches!(size.width.expand(), ExpandedDimension::Percent(v) if v == 1.0));
+        assert!(matches!(size.height.expand(), ExpandedDimension::Percent(v) if v == 1.0));
+        assert_eq!(size.width, Dimension::percent(1.0));
+    }
+
+    #[test]
+    fn slot_reuse_drops_cache() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let doomed = boxed(&mut tree, root);
+        let index = doomed.index();
+        // 建一个缓存条目
+        let _ = tree.taffy_cache(doomed);
+        assert!(
+            tree.layout_cache[index as usize].is_some(),
+            "缓存条目必须建立"
+        );
+
+        tree.remove(doomed).expect("卸载成功");
+        assert!(
+            tree.layout_cache[index as usize].is_none(),
+            "卸载必须清掉槽位的缓存"
+        );
+
+        let reused = boxed(&mut tree, root);
+        assert_eq!(reused.index(), index, "槽位必须复用");
+        assert!(
+            tree.layout_cache[index as usize].is_none(),
+            "复用槽位不得继承上一代节点的缓存"
+        );
+    }
+
+    #[test]
+    fn set_style_clears_caches_to_root() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = boxed(&mut tree, root);
+        let child = boxed(&mut tree, parent);
+        let sibling = boxed(&mut tree, root);
+        let _ = tree
+            .compute_layout(taffy::geometry::Size {
+                width: Some(100.0),
+                height: Some(100.0),
+            })
+            .expect("布局成功");
+        let sibling_index = sibling.index() as usize;
+        assert!(
+            tree.layout_cache[sibling_index].is_some(),
+            "布局后兄弟必须有缓存条目"
+        );
+
+        tree.set_style(child, Style::default()).expect("节点存活");
+
+        for node in [root, parent, child] {
+            let index = node.index() as usize;
+            let empty = tree.layout_cache[index]
+                .as_ref()
+                .is_none_or(taffy::Cache::is_empty);
+            assert!(empty, "node {node:?} 的缓存必须被清空");
+        }
+        assert!(
+            tree.layout_cache[sibling_index]
+                .as_ref()
+                .is_some_and(|cache| !cache.is_empty()),
+            "无关兄弟的缓存必须保留"
+        );
+    }
+
+    #[test]
+    fn remove_drops_cache_and_hoisted_entries() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = boxed(&mut tree, root);
+        let child = boxed(&mut tree, parent);
+        let child_index = child.index() as usize;
+        let _ = tree.taffy_cache(child);
+        tree.hoisted_push(parent, &[child]);
+
+        tree.remove(parent).expect("卸载成功");
+
+        assert!(
+            tree.layout_cache[child_index].is_none(),
+            "子树内每个槽位的缓存都要清"
+        );
+        assert!(
+            !tree.hoisted.contains_key(&parent),
+            "包含块的 hoisted 列表要清"
+        );
+        assert!(!tree.hoisted.contains_key(&child));
+
+        // N5：别的包含块若把被卸载节点记在自己的列表里，也必须被逐表剔除
+        let other = boxed(&mut tree, root);
+        let victim = boxed(&mut tree, root);
+        tree.hoisted_push(other, &[victim]);
+        tree.remove(victim).expect("卸载被记录的节点");
+        assert!(
+            tree.hoisted
+                .get(&other)
+                .is_none_or(|list| !list.contains(&victim)),
+            "其它包含块的列表不得残留被卸载 id"
+        );
+    }
+
+    #[test]
+    fn node_clip_reads_style() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let style = Style {
+            clip: Clip::Bounds,
+            ..Style::default()
+        };
+        let node = tree
+            .insert_child(root, NodeSpec::new(NodeKind::Box, style, None))
+            .expect("插入成功");
+
+        assert_eq!(tree.get(node).expect("存在").clip(), Clip::Bounds);
+    }
+
+    #[test]
+    fn node_debug_prints_layout_fields() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = boxed(&mut tree, root);
+
+        let debug = format!("{:?}", tree.get(node).expect("存在"));
+
+        for field in [
+            "layout_override",
+            "local",
+            "local_border",
+            "laid_out_epoch",
+            "measure",
+            "hit_shape",
+        ] {
+            assert!(debug.contains(field), "Debug 缺字段 {field}: {debug}");
+        }
     }
 
     #[test]
@@ -828,9 +1477,11 @@ mod tests {
         tree.set_layout_for_test(
             node,
             LayoutBox {
+                border: Edges::ZERO,
                 bounds: Rect::new(10.0, 0.0, 4.0, 4.0),
             },
             LayoutBox {
+                border: Edges::ZERO,
                 bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
             },
         );

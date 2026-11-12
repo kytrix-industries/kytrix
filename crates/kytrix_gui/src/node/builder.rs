@@ -1,13 +1,17 @@
 //! `NodeBuilder`：声明式建树的唯一入口。
 //!
-//! 设计见 `design/phase-03-node-state.md` §12。一个 builder 实例 = 一次挂载（不是可复用的模板）。
+//! 设计见 `design/phase-03-node-state.md` §12 与 `design/phase-04-layout.md` §10。
+//! 一个 builder 实例 = 一次挂载（不是可复用的模板）；`build` 时把 6 个部件装成 `NodeSpec` 交给
+//! `NodeTree::insert_child`（`NodeSpec` 的字段私有 —— 见其 rustdoc）。
 
 use crate::{
     error::EngineError,
+    layout::{LayoutOverride, MeasureFn},
+    math::{Point, Rect},
     node::{
         dependency::ReadCtx,
         id::NodeId,
-        tree::{NodeKind, NodeTree},
+        tree::{NodeKind, NodeSpec, NodeTree},
     },
     paint::{
         canvas::Canvas,
@@ -24,6 +28,9 @@ pub struct NodeBuilder {
     kind: NodeKind,
     style: Style,
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
+    measure: Option<MeasureFn>,
+    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    layout_override: Option<LayoutOverride>,
 }
 
 impl Default for NodeBuilder {
@@ -40,6 +47,9 @@ impl NodeBuilder {
             kind: NodeKind::Box,
             style: Style::default(),
             bind_style: None,
+            measure: None,
+            hit_shape: None,
+            layout_override: None,
         }
     }
 
@@ -48,8 +58,7 @@ impl NodeBuilder {
     pub fn canvas(canvas: Canvas) -> Self {
         Self {
             kind: NodeKind::Canvas(canvas),
-            style: Style::default(),
-            bind_style: None,
+            ..Self::boxed()
         }
     }
 
@@ -58,15 +67,15 @@ impl NodeBuilder {
     pub fn geometry(geometry: GeometryId) -> Self {
         Self {
             kind: NodeKind::Geometry(geometry),
-            style: Style::default(),
-            bind_style: None,
+            ..Self::boxed()
         }
     }
 
     /// 静态样式（覆盖 `Style::default()`）。
     #[must_use]
-    pub fn style(self, style: Style) -> Self {
-        Self { style, ..self }
+    pub fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 
     /// 动态属性：闭包在每次 `refresh_styles` 求值时重算 `StylePatch`（值语义，不累积）。
@@ -78,23 +87,65 @@ impl NodeBuilder {
         }
     }
 
+    /// 自定义叶子测量（P05 的文本 / 坐标标签入口）。
+    ///
+    /// 闭包必须是**纯函数**：不读 `Signal`、不写状态（见 `crate::layout::MeasureFn` 的契约）。
+    #[must_use]
+    pub fn measure(mut self, measure: MeasureFn) -> Self {
+        self.measure = Some(measure);
+        self
+    }
+
+    /// 自定义命中形状：`point` 是节点 **border box 局部坐标**，返回 `false` = 该点穿透到下层。
+    ///
+    /// 纯函数契约同 [`NodeBuilder::measure`]；默认（不设置）用布局盒矩形判定。
+    #[must_use]
+    pub fn hit_shape(mut self, hit_shape: impl Fn(Point) -> bool + 'static) -> Self {
+        self.hit_shape = Some(Box::new(hit_shape));
+        self
+    }
+
+    /// 布局覆盖（root 逃生口，P04 §10）：`rect` 相对**父节点 border box**，且就是该节点的 border box。
+    ///
+    /// **副作用**：同时把 `style.inner.position` 置为 `Position::Absolute` —— 出流是「位置与尺寸都由应用定」
+    /// 的必要条件（父不该为它保留流内空间）。
+    ///
+    /// 该节点因此是**布局叶子**：挂在它下面的子节点不会被布局（`build` 有 debug 断言）。
+    /// 若容器还需要子布局，请用普通容器 + `Style` 的尺寸，而不是 Override。
+    #[must_use]
+    pub fn layout_override(mut self, rect: Rect) -> Self {
+        self.style.inner.position = taffy::style::Position::Absolute;
+        self.layout_override = Some(LayoutOverride::new(rect));
+        self
+    }
+
     /// 挂载到 `parent` 末尾并返回新句柄。
     ///
     /// # Errors
     /// `EngineError::StaleNode { node: parent }`：父节点陈旧（从未存在/已卸载）。
     ///
     /// # Panics（仅 debug）
-    /// 父节点是叶子（`NodeKind::Canvas` / `Geometry`）时 `debug_assert!` 失败。**release 下允许挂载，
-    /// 但该子树永不产生布局盒、也永不产生任何像素**（P04 对叶子节点的子节点不做布局）——这是「已定义
-    /// 但不可见」的行为，不是 UB，也不是静默降级（debug 构建必然失败）。
+    /// 父节点是**布局叶子**（`NodeKind::Canvas` / `Geometry`，或带 `LayoutOverride`）时 `debug_assert!` 失败。
+    /// **release 下允许挂载，但该子树永不产生布局盒、也永不产生任何像素**（P04 对叶子节点的子节点不做布局）
+    /// ——这是「已定义但不可见」的行为，不是 UB，也不是静默降级（debug 构建必然失败）。
     pub fn build(self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let parent_node = tree.get(parent)?;
         debug_assert!(
-            !parent_node.kind().is_leaf(),
-            "leaf nodes cannot have children: canvas/geometry nodes do not lay out children, \
-             so the subtree would never produce layout boxes or pixels"
+            !(parent_node.kind().is_leaf() || parent_node.layout_override().is_some()),
+            "leaf nodes cannot have children: canvas/geometry/override nodes do not lay out \
+             children, so the subtree would never produce layout boxes or pixels"
         );
-        tree.insert_child(parent, self.kind, self.style, self.bind_style)
+        let mut spec = NodeSpec::new(self.kind, self.style, self.bind_style);
+        if let Some(measure) = self.measure {
+            spec = spec.with_measure(measure);
+        }
+        if let Some(hit_shape) = self.hit_shape {
+            spec = spec.with_hit_shape(hit_shape);
+        }
+        if let Some(layout_override) = self.layout_override {
+            spec = spec.with_layout_override(layout_override);
+        }
+        tree.insert_child(parent, spec)
     }
 }
 
@@ -103,7 +154,8 @@ mod tests {
     use super::NodeBuilder;
     use crate::{
         error::EngineError,
-        math::Rect,
+        layout::LayoutOverride,
+        math::{Point, Rect},
         node::{
             dirty::DirtyFlags,
             tree::{NodeKind, NodeTree},
@@ -111,7 +163,7 @@ mod tests {
         paint::{
             canvas::Canvas,
             geometry::GeometryId,
-            style::{Style, StylePatch},
+            style::{Clip, Style, StylePatch},
         },
     };
 
@@ -227,6 +279,56 @@ mod tests {
     }
 
     #[test]
+    fn layout_override_forces_absolute_and_stores_rect() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let rect = Rect::new(1.0, 2.0, 3.0, 4.0);
+
+        let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
+            .layout_override(rect)
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let node = tree.get(node).expect("存在");
+        assert_eq!(
+            node.style().inner.position,
+            taffy::style::Position::Absolute,
+            "override 语义要求出流"
+        );
+        assert_eq!(node.layout_override(), Some(LayoutOverride::new(rect)));
+        assert_eq!(node.style().clip, Clip::None);
+        let _ = Point::ZERO;
+    }
+
+    #[test]
+    fn measure_and_hit_shape_are_stored() {
+        use std::cell::Cell;
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let calls = std::rc::Rc::new(Cell::new(0usize));
+        let counter = calls;
+
+        let node = NodeBuilder::boxed()
+            .measure(Box::new(move |_known, _available| {
+                counter.set(counter.get() + 1);
+                crate::math::Size::new(10.0, 10.0)
+            }))
+            .hit_shape(|point: Point| point.x < 5.0)
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        assert!(tree.measure_of(node).is_some(), "measure 必须存进节点");
+        let shape = tree
+            .get(node)
+            .expect("存在")
+            .hit_shape()
+            .expect("hit_shape 必须存进节点");
+        assert!(shape(Point::new(1.0, 1.0)));
+        assert!(!shape(Point::new(6.0, 1.0)));
+    }
+
+    #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "leaf nodes cannot have children")]
     fn leaf_parent_is_debug_assert() {
@@ -237,5 +339,19 @@ mod tests {
             .expect("挂载成功");
 
         let _ = NodeBuilder::boxed().build(&mut tree, canvas);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "leaf nodes cannot have children")]
+    fn override_parent_is_debug_assert() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let pane = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let _ = NodeBuilder::boxed().build(&mut tree, pane);
     }
 }

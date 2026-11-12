@@ -33,9 +33,25 @@ impl NodeId {
     /// `(generation as u64) << 32 | index as u64`。
     ///
     /// 消费者：结构化日志/帧记录需要单值可打印的节点标识（设计 §9.1）；同一节点的历次代际在数值上连续递增。
+    /// P04 起它同时是 taffy `NodeId` 的编码（双向无损，见 `NodeId::from_bits`）。
     #[must_use]
     pub const fn to_bits(self) -> u64 {
         ((self.generation.get() as u64) << 32) | self.index as u64
+    }
+
+    /// `NodeId::to_bits` 的逆运算；代际为 0 的编码非法（返回 `None`）。
+    ///
+    /// 消费者：`layout::taffy_tree::to_engine`（taffy 回调里把 `taffy::NodeId` 换回引擎句柄）。
+    #[must_use]
+    pub(crate) const fn from_bits(bits: u64) -> Option<Self> {
+        let generation = (bits >> 32) as u32;
+        match NonZeroU32::new(generation) {
+            Some(generation) => Some(Self {
+                index: bits as u32,
+                generation,
+            }),
+            None => None,
+        }
     }
 
     /// 仅测试用的构造器（不扩大公开面，S-20 的形态）。
@@ -193,6 +209,18 @@ mod tests {
         assert_eq!(id.index(), 3);
         assert_eq!(id.generation(), 7);
         assert_eq!(size_of::<NodeId>(), size_of::<u64>());
+    }
+
+    #[test]
+    fn node_id_from_bits_roundtrip() {
+        let id = NodeId::for_test(3, 7);
+
+        assert_eq!(NodeId::from_bits(id.to_bits()), Some(id));
+        assert_eq!(NodeId::from_bits(3), None, "代际 0 的编码非法");
+        assert_eq!(
+            NodeId::from_bits(id.to_bits()).map(NodeId::to_bits),
+            Some(id.to_bits())
+        );
     }
 
     #[test]

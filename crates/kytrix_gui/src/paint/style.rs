@@ -1,6 +1,7 @@
-//! 样式契约：静态结构 `Style` + 动态属性 `StylePatch` + `Cursor`。
+//! 样式契约：静态结构 `Style` + 动态属性 `StylePatch` + `Cursor` + `Clip`。
 //!
-//! 设计见 `design/phase-03-node-state.md` §10；上游 `custom-gui-engine-design.md` §4.9（D24 / I17）。
+//! 设计见 `design/phase-03-node-state.md` §10 与 `design/phase-04-layout.md` §11；
+//! 上游 `custom-gui-engine-design.md` §4.9（D24 / I17）。
 //!
 //! 分层：`Style` 是**静态结构**（挂载时一次写入），`StylePatch` 是**动态属性**（`bind_style` 每次求值重算）。
 //! 引擎不提供任何链式 DSL / 宏 / `Styled` 形状的 builder（那属应用层 `base_ui`，D24）。
@@ -15,11 +16,29 @@ use crate::paint::{color::Color, primitive::Border};
 /// `base_ui::StyleBuilder` 直接构造 `taffy::Style<SmolStr>` 再包一层即可（F-35：应用层需自行声明
 /// `taffy = { workspace = true }`，版本由 workspace 精确钉住）。
 ///
-/// P06 才会追加引擎自有字段（圆角 / clip / 阴影 / 字体族）——它们现在**没有读者**，按 AGENTS §2.1 不加。
+/// P06 才会追加其余引擎自有字段（圆角 / 阴影 / 字体族）——它们现在**没有读者**，按 AGENTS §2.1 不加。
+///
+/// **`calc()` 不解析**：`Dimension::Calc` / `LengthPercentage::Calc` 在 v1 会按 0 处理
+/// （taffy 0.15 只把 calc 当不透明指针；连它自带的 `TaffyTree` 也返回 0）。见 `design/phase-04-layout.md` §14.3。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Style {
     /// 布局属性（taffy 0.15.0，`CustomIdent = SmolStr`）。
     pub inner: taffy::Style<SmolStr>,
+    /// 子树裁剪策略（P04；命中测试的 clip 链与 P06 的 `Clip` 图元同源）。
+    pub clip: Clip,
+}
+
+/// 子树裁剪策略。
+///
+/// v1 只有矩形（`Bounds`）；圆角裁剪由 P06 的 `CornerRadius` 追加变体。
+/// **只裁子树**（不裁本节点自己的 border/background），与 CSS `overflow: hidden` 一致。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Clip {
+    /// 不裁剪。
+    #[default]
+    None,
+    /// 按本节点的 **padding box**（布局盒内缩 `border`）裁剪整棵子树。
+    Bounds,
 }
 
 /// 动态属性的增量补丁（§4.9.2 的「动态属性」列）：由 `bind_style` 每次求值**重算**，值语义。
@@ -72,7 +91,7 @@ pub enum Cursor {
 mod tests {
     use smol_str::SmolStr;
 
-    use super::{Cursor, Style, StylePatch};
+    use super::{Clip, Cursor, Style, StylePatch};
 
     #[test]
     fn style_default_is_taffy_default() {
@@ -105,5 +124,11 @@ mod tests {
     fn cursor_default_is_default() {
         assert_eq!(Cursor::default(), Cursor::Default);
         assert_ne!(Cursor::NotAllowed, Cursor::Pointer);
+    }
+
+    #[test]
+    fn clip_default_is_none() {
+        assert_eq!(Clip::default(), Clip::None);
+        assert_eq!(Style::default().clip, Clip::None);
     }
 }
