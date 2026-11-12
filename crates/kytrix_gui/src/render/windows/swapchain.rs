@@ -7,31 +7,30 @@
 //!
 //! 格式：`B8G8R8A8_UNORM`（sRGB flip swapchain 在本机创建即失败，DEVIATIONS F-80）。
 
-#[cfg(test)]
-use windows::Win32::Foundation::HWND;
-#[cfg(test)]
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::{
     Win32::{
-        Foundation::RECT,
-        Graphics::{Direct3D12::*, Dxgi::*},
+        Foundation::{HWND, RECT},
+        Graphics::{
+            Direct3D12::*,
+            Dxgi::{
+                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+                *,
+            },
+        },
     },
     core::Interface,
 };
 
-#[cfg(test)]
-use crate::render::windows::queue::Queue;
 use crate::{
     error::EngineError,
     render::{
         compositor::{DamageRects, FramePlan},
         damage::MAX_DAMAGE_RECTS,
-        windows::device::init_error_from,
+        windows::{device::init_error_from, queue::Queue},
     },
 };
 
 /// flip-model 的 back buffer 数（主设计 §2.4 的 `BufferCount ≥ 2`；本设计取 3）。
-#[cfg(test)]
 pub(crate) const BUFFER_COUNT: u32 = 3;
 
 /// 一个 flip swapchain（`fresh` 记录「下一次 present 必须全量」）。
@@ -43,7 +42,6 @@ pub(crate) struct Swapchain {
 
 impl Swapchain {
     /// 隐藏 / 真实 HWND 的 swapchain（P09 的窗口层与隐藏窗口 probe 共用）。
-    #[cfg(test)]
     pub(crate) fn for_hwnd(
         queue: &Queue,
         hwnd: isize,
@@ -65,7 +63,6 @@ impl Swapchain {
         Self::validate(raw, size)
     }
 
-    #[cfg(test)]
     fn validate(raw: IDXGISwapChain1, size: (u32, u32)) -> Result<Self, EngineError> {
         let actual = unsafe { raw.GetDesc1() }
             .map_err(|error| init_error_from("SwapChain::GetDesc1", error))?;
@@ -169,7 +166,6 @@ impl Swapchain {
     }
 }
 
-#[cfg(test)]
 fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
     DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0,
@@ -189,7 +185,6 @@ fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
     }
 }
 
-#[cfg(test)]
 fn create_factory() -> Result<IDXGIFactory4, EngineError> {
     unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| init_error_from("CreateDXGIFactory2", error))

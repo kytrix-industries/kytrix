@@ -130,6 +130,27 @@ impl Queue {
         self.wait_for(self.ring.last_signaled())
     }
 
+    /// 复位**所有** in-flight 槽的 allocator + list 并立即关闭列表（resize 前必须调用）。
+    ///
+    /// 关闭的 command list 仍记录着它引用过的资源；不 Reset 的话，swapchain 的 back buffer
+    /// 会一直有引用，`ResizeBuffers` 返回 `DXGI_ERROR_INVALID_CALL`（DEVIATIONS F-86）。
+    /// 调用方必须先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
+    pub(crate) fn reset_in_flight_lists(&mut self) -> Result<(), EngineError> {
+        for index in 0..self.allocators.len() {
+            let allocator = &self.allocators[index];
+            // SAFETY: 上一个提交已由 `wait_idle` 等到完成，allocator 不再被 GPU 使用。
+            unsafe { allocator.Reset() }
+                .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
+            let list = &self.lists[index];
+            // SAFETY: 列表已关闭（`submit` 或上一次本调用），重开后立刻关闭。
+            unsafe { list.Reset(allocator, None) }
+                .map_err(|error| init_error_from("CommandList::Reset", error))?;
+            // SAFETY: 空列表；关闭之后再执行才是合法的，这里只需要它丢掉记录的资源引用。
+            unsafe { list.Close() }.map_err(|error| init_error_from("Close", error))?;
+        }
+        Ok(())
+    }
+
     /// 帧外的一次性提交（readback / resize）：等 idle → 用槽 0 录制 → 提交 → 等完成。
     /// 不推进 ring 的槽位（只预留一个 fence 值），调用前后都必须 idle。
     #[cfg(any(test, feature = "test-support"))]
@@ -183,7 +204,6 @@ impl Queue {
             .map_err(|error| init_error_from("GetTimestampFrequency", error))
     }
 
-    #[cfg(test)]
     pub(crate) fn raw(&self) -> &ID3D12CommandQueue {
         &self.raw
     }

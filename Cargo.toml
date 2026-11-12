@@ -5,6 +5,7 @@ members = [
     "crates/ai_translator",
     "crates/kytrix",
     "crates/kytrix_gui",
+    "crates/kytrix_gui_demo",
     "crates/llama_sys",
     "crates/base_ui",
     "crates/i18n",
@@ -268,6 +269,7 @@ hyperliquid_wallet = { path = "crates/widgets/hyperliquid_wallet" }
 i18n = { path = "crates/i18n" }
 instrument_selector_ui = { path = "crates/instrument_selector_ui" }
 kytrix_gui = { path = "crates/kytrix_gui" }
+kytrix_gui_demo = { path = "crates/kytrix_gui_demo" }
 kytrix_service_provider = { path = "crates/kytrix_service_provider" }
 market_participants_connector = { path = "crates/market_participants_connector" }
 market_participants_model = { path = "crates/market_participants_model" }

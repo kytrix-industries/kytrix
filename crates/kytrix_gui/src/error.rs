@@ -101,6 +101,14 @@ pub enum EngineError {
     /// 引擎 / 平台初始化失败（`Application::run` 的前置条件；P08 的渲染器初始化也走这里）。
     #[error("engine initialization failed: {detail}")]
     AppInit { detail: SmolStr },
+
+    /// 原生窗口创建 / 消息泵失败（`RegisterClassW` / `CreateWindowExW` / `GetMessageW`）。
+    #[error("window creation failed: {detail}")]
+    WindowCreate { detail: SmolStr },
+
+    /// 剪贴板访问失败（被其它进程占用 / 内存分配失败）。
+    #[error("clipboard access failed: {detail}")]
+    Clipboard { detail: SmolStr },
 }
 
 #[cfg(test)]
@@ -157,6 +165,12 @@ mod tests {
             },
             EngineError::AppInit {
                 detail: SmolStr::new_static("d3d12 D3D12CreateDevice: 0x887A0004"),
+            },
+            EngineError::WindowCreate {
+                detail: SmolStr::new_static("CreateWindowExW: 0x8007057E"),
+            },
+            EngineError::Clipboard {
+                detail: SmolStr::new_static("OpenClipboard: 0x80070005"),
             },
         ]
     }

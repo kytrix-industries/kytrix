@@ -4,7 +4,7 @@
 //! `drain()` 是**唯一**帧推进原语：一次最多一帧，不做「等到没事干」的隐式阻塞（设计 §6.2）。
 
 use super::{
-    input::{InputEvent, InputOutcome},
+    input::InputOutcome,
     probe::Probe,
     record::{FrameRecord, RenderedFrame},
     snapshot::{SnapshotCase, SnapshotError, SnapshotImage},
@@ -12,7 +12,7 @@ use super::{
 use crate::{
     app::App,
     error::EngineError,
-    math::Point,
+    event::InputEvent,
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -121,15 +121,14 @@ impl TestApp {
         Probe::new(window.tree())
     }
 
-    /// 注入一个输入事件（P06 只做命中）。
+    /// 注入一个输入事件（P06 只做命中；无位置的事件不产生命中）。
     pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
-        let point = event.position();
-        InputOutcome {
-            hit: self
-                .app
+        let hit = event.position().and_then(|point| {
+            self.app
                 .window(self.window)
-                .and_then(|window| window.tree().hit_test(Point::new(point.x, point.y))),
-        }
+                .and_then(|window| window.tree().hit_test(point))
+        });
+        InputOutcome { hit }
     }
 
     /// 强制整棵树的 lane 失效（oracle 的「全量」路径）。
@@ -199,8 +198,14 @@ impl TestApp {
                 surface.width().max(1) as u32,
                 surface.height().max(1) as u32,
             );
+            // 快照的渲染器是临时建的：图集页尺寸必须与 App 的分配器一致，否则字形页传不进去。
+            let ((page_width, _page_height), pixels) = self.app.glyph_page_pixels();
             let mut renderer =
-                crate::render::backend::Renderer::new_warp_offscreen(size).map_err(gpu_error)?;
+                crate::render::backend::Renderer::new_warp_offscreen_with_page(size, page_width)
+                    .map_err(gpu_error)?;
+            let mut rows = crate::render::DirtyRows::default();
+            rows.mark(0, u32::MAX);
+            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
             let image = renderer
                 .render_snapshot(window.instance_buffer())
                 .map_err(gpu_error)?;
@@ -268,15 +273,14 @@ impl TestWindow<'_> {
         Probe::new(window.tree())
     }
 
-    /// 注入事件（P06 只做命中）。
+    /// 注入事件（P06 只做命中；无位置的事件不产生命中）。
     pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
-        let point = event.position();
-        InputOutcome {
-            hit: self
-                .app
+        let hit = event.position().and_then(|point| {
+            self.app
                 .window(self.id)
-                .and_then(|window| window.tree().hit_test(point)),
-        }
+                .and_then(|window| window.tree().hit_test(point))
+        });
+        InputOutcome { hit }
     }
 }
 
@@ -455,6 +459,66 @@ mod tests {
         assert_eq!(result, Err(SnapshotError::NoRenderer));
     }
 
+    /// **文本像素级断言**（V-64 的回归面）：黑底白字，离屏读回后必须真有亮像素，
+    /// 且覆盖率既不是 0 也不是整屏。只看 `GlyphRun` 实例/UV 字段抓不到上传或采样的错位。
+    #[test]
+    fn rendered_text_produces_visible_glyph_pixels() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let mut app = TestApp::with_options(crate::window::WindowOptions {
+            title: "text pixels".into(),
+            size: crate::math::Size::new(200.0, 60.0),
+            scale: Scale::ONE,
+        });
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let _backplate = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 200.0, 60.0))
+            .paint(PaintSpec {
+                background: Color::BLACK,
+                ..PaintSpec::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                root,
+            )
+            .expect("backplate");
+        let _text = NodeBuilder::text(
+            "WWWW",
+            TextStyle {
+                size: 24.0,
+                color: Color::WHITE,
+                ..TextStyle::default()
+            },
+        )
+        .layout_override(Rect::new(10.0, 8.0, 180.0, 40.0))
+        .build(
+            app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+            root,
+        )
+        .expect("text");
+        let _ = app.drain().expect("text frame");
+
+        let image = app
+            .snapshot(SnapshotCase {
+                size: crate::math::Size::new(200.0, 60.0),
+                scale: Scale::ONE,
+            })
+            .expect("WARP snapshot");
+        let bright = image
+            .rgba8
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[0] > 128 && pixel[1] > 128 && pixel[2] > 128)
+            .count();
+        let coverage = bright as f32 / f32::from((image.width * image.height) as u16);
+        assert!(bright > 0, "text must produce non-background pixels");
+        assert!(
+            coverage > 0.001 && coverage < 0.5,
+            "glyph coverage {coverage} is implausible (0 or whole screen)"
+        );
+    }
+
     #[test]
     fn resize_forces_full_damage() {
         let mut app = TestApp::new();
@@ -524,3 +588,4 @@ mod tests {
         );
     }
 }
+

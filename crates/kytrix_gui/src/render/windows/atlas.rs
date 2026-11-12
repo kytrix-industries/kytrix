@@ -29,7 +29,11 @@ use crate::{
 /// 图集页尺寸（P02 §10.3：2048×2048）。
 pub(crate) const ATLAS_PAGE: u32 = 2048;
 
-/// staging 一次最多搬的行数（超过就分块，避免每槽十几 MB 的常驻 staging）。
+/// staging 的**初始**行数（需要更大时按本次上传的行数扩容）。
+///
+/// 一次 `record_uploads` 里的多条 `CopyTextureRegion` 都在同一提交、同一个 staging 上，
+/// **不能分块复用同一个缓冲**（后面的 CPU 写入会覆盖前面的内容，GPU 执行时读到的全是最后一块
+/// —— V-64 的根因）。因此一次上传的每一行都必须在 staging 里各有位置。
 const STAGING_ROWS: u32 = 256;
 
 const PITCH_ALIGNMENT: u32 = 256;
@@ -37,7 +41,10 @@ const PITCH_ALIGNMENT: u32 = 256;
 /// 一张图集纹理 + 每 in-flight 槽的 staging。
 struct AtlasTexture {
     resource: ID3D12Resource,
+    /// 每槽一块 staging；容量按**本次上传的最大行数**增长（见 [`STAGING_ROWS`]）。
     staging: Vec<ID3D12Resource>,
+    /// 当前 staging 能容纳的行数。
+    staging_rows: u32,
     page: u32,
     row_pitch: u32,
     texel_bytes: u32,
@@ -78,8 +85,7 @@ impl AtlasTextures {
         self.pending.iter().any(Option::is_some)
     }
 
-    /// 入队一页的脏行（test/CI 的像素入口；整页 `pixels` 的布局 = `page * page * texel`）。
-    #[cfg(test)]
+    /// 入队一页的脏行（整页 `pixels` 的布局 = `page * page * texel`）。
     pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
         let page = match kind {
             AtlasKind::Glyph => self.glyph.page,
@@ -100,6 +106,7 @@ impl AtlasTextures {
     /// 在本帧命令列表里录制「staging 写入 + 逐区间 `CopyTextureRegion`」。
     pub(crate) fn record_uploads(
         &mut self,
+        device: &Device,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
     ) -> Result<(), EngineError> {
@@ -115,7 +122,7 @@ impl AtlasTextures {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
             };
-            texture.upload(list, slot, kind, &pending)?;
+            texture.upload(device, list, slot, kind, &pending)?;
         }
         Ok(())
     }
@@ -139,6 +146,7 @@ impl AtlasTexture {
         Ok(Self {
             resource,
             staging,
+            staging_rows: STAGING_ROWS,
             page,
             row_pitch,
             texel_bytes: texel,
@@ -147,6 +155,7 @@ impl AtlasTexture {
 
     fn upload(
         &mut self,
+        device: &Device,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
         kind: AtlasKind,
@@ -166,13 +175,12 @@ impl AtlasTexture {
         } else {
             pending.rows.spans()
         };
+        // 每一段必须在 staging 里**各有位置**：同一 staging 上先写后画的多次拷贝会在 GPU 执行时
+        // 读到最后一块的字节（V-64）。
         for span in spans {
-            let mut start = span.start;
-            while start < span.end {
-                let count = (span.end - start).min(STAGING_ROWS);
-                self.upload_chunk(list, slot, kind, pending, start, count)?;
-                start += count;
-            }
+            let rows = span.end - span.start;
+            self.ensure_staging(device, slot, rows)?;
+            self.upload_chunk(list, slot, kind, pending, span.start, rows)?;
         }
 
         barrier(
@@ -181,6 +189,23 @@ impl AtlasTexture {
             D3D12_RESOURCE_STATE_COPY_DEST,
             resident,
         );
+        Ok(())
+    }
+
+    /// 保证第 `slot` 个 staging 能容纳 `rows` 行（不够就重建；一次性扩容，之后复用）。
+    fn ensure_staging(
+        &mut self,
+        device: &Device,
+        slot: usize,
+        rows: u32,
+    ) -> Result<(), EngineError> {
+        if rows <= self.staging_rows {
+            return Ok(());
+        }
+        let bytes = u64::from(self.row_pitch) * u64::from(rows);
+        let staging = create_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD)?;
+        self.staging[slot] = staging;
+        self.staging_rows = rows;
         Ok(())
     }
 
@@ -226,21 +251,27 @@ impl AtlasTexture {
                 RowPitch: self.row_pitch,
             },
         };
-        let destination = D3D12_TEXTURE_COPY_LOCATION {
+        let mut destination = D3D12_TEXTURE_COPY_LOCATION {
             pResource: core::mem::ManuallyDrop::new(Some(self.resource.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 SubresourceIndex: 0,
             },
         };
-        let source = D3D12_TEXTURE_COPY_LOCATION {
+        let mut source = D3D12_TEXTURE_COPY_LOCATION {
             pResource: core::mem::ManuallyDrop::new(Some(staging.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: placed,
             },
         };
+        // SAFETY: 两个 location 与 `placed` 在调用期间有效，行区间已由 `DirtyRows` 保证在页内。
         unsafe { list.CopyTextureRegion(&destination, 0, start, 0, &source, None) };
+        // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
+        unsafe {
+            core::mem::ManuallyDrop::drop(&mut destination.pResource);
+            core::mem::ManuallyDrop::drop(&mut source.pResource);
+        }
         Ok(())
     }
 }
@@ -251,7 +282,7 @@ fn barrier(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) {
-    let barrier = D3D12_RESOURCE_BARRIER {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -263,7 +294,13 @@ fn barrier(
             }),
         },
     };
-    unsafe { list.ResourceBarrier(&[barrier]) };
+    // SAFETY: `barrier` 在本次调用期间独占；`slice::from_ref` 不转移所有权。
+    unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
+    // SAFETY: union 载荷与 `pResource` 都是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（F-86）。
+    unsafe {
+        let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
+        core::mem::ManuallyDrop::drop(&mut transition.pResource);
+    }
 }
 
 fn texture_format(kind: AtlasKind) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
@@ -402,7 +439,7 @@ mod tests {
         assert!(atlas.has_pending());
 
         queue
-            .submit_immediate(|list| atlas.record_uploads(list, 0))
+            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
             .expect("upload");
         assert!(
             !atlas.has_pending(),

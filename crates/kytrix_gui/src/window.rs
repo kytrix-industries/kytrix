@@ -379,6 +379,33 @@ impl Window {
         self.instance_buffer().as_bytes()
     }
 
+    /// 是否已有 GPU 渲染器（`App::upload_glyph_page` 的判据）。
+    #[cfg(windows)]
+    pub(crate) fn has_renderer(&self) -> bool {
+        self.renderer.is_some()
+    }
+
+    /// 把一页图集像素交给渲染器（下一次 `submit` 上传；无渲染器时丢弃）。
+    ///
+    /// 消费者：`App::frame` 的字形页上传（P09 整页；增量属 P15）。
+    #[cfg(windows)]
+    pub(crate) fn queue_atlas_upload(
+        &mut self,
+        kind: crate::paint::atlas::AtlasKind,
+        pixels: &[u8],
+        rows: crate::render::DirtyRows,
+    ) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.queue_atlas_upload(kind, pixels, rows);
+        }
+    }
+
+    /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
+    #[cfg(windows)]
+    pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
+        self.renderer = Some(renderer);
+    }
+
     /// 启用**离屏** GPU 渲染（headless 行为不变：不调用就恒为 `None`）。
     ///
     /// P09 的原生窗口层会在此之后 attach swapchain；本方法本身只把窗口的绘制目标变成

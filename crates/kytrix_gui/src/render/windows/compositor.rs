@@ -43,12 +43,12 @@ use crate::{
     window::FrameIndex,
 };
 
+/// 测试构建的图集页（2048² 在 WARP 上代价过高）。
+#[cfg(test)]
+const TEST_ATLAS_PAGE: u32 = 64;
+
 /// `RootUniform` 的字节数（P07 §2.7：112 B = 28 DWORD）。
 const ROOT_UNIFORM_DWORDS: usize = 28;
-
-/// 测试构建的图集页（2048² 在 WARP 上代价过高）。
-#[cfg(any(test, feature = "test-support"))]
-const TEST_ATLAS_PAGE: u32 = 64;
 
 /// 一个窗口的 GPU 渲染器（`Window.renderer` 的载荷）。
 pub(crate) struct Renderer {
@@ -79,17 +79,26 @@ impl Renderer {
         )
     }
 
-    /// test / CI：WARP 设备（不编译进发布物）。
-    #[cfg(any(test, feature = "test-support"))]
+    /// 测试用的 WARP 渲染器（图集页 = 测试页尺寸）。
+    #[cfg(test)]
     pub(crate) fn new_warp_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
         Self::with_device(Device::new_warp()?, size, TEST_ATLAS_PAGE)
     }
 
-    /// 隐藏 HWND 的 swapchain（probe / 测试；P09 会把它接到真实窗口）。
+    /// WARP + 指定图集页尺寸（`TestApp::snapshot` 必须与 `App` 的分配器同页尺寸，
+    /// 否则字形页的整页上传会被尺寸断言拒绝）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_warp_offscreen_with_page(
+        size: (u32, u32),
+        atlas_page: u32,
+    ) -> Result<Self, EngineError> {
+        Self::with_device(Device::new_warp()?, size, atlas_page)
+    }
+
+    /// 真实 HWND 的 swapchain（P09 的窗口层）。
     ///
     /// 用**硬件**设备：WARP 设备不能 present 到 HWND（本机实测 `Present1` 直接
     /// `DXGI_ERROR_DEVICE_REMOVED`），因此无硬件设备的 CI 上由调用方跳过。
-    #[cfg(test)]
     pub(crate) fn new_for_hwnd(hwnd: isize, size: (u32, u32)) -> Result<Self, EngineError> {
         let mut renderer = Self::with_device(
             Device::new()?,
@@ -154,12 +163,14 @@ impl Renderer {
         self.swapchain.as_ref().is_none_or(Swapchain::is_fresh)
     }
 
-    /// resize：等 GPU 空闲 → 重建持久 offscreen（swapchain 由 P09 的窗口层先 attach）。
+    /// resize：等 GPU 空闲 → 复位全部命令列表（丢弃 back buffer 引用）→ `ResizeBuffers` →
+    /// 重建持久 offscreen（DEVIATIONS F-86 / V-55）。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         if size == self.surface {
             return Ok(());
         }
         self.queue.wait_idle()?;
+        self.queue.reset_in_flight_lists()?;
         if let Some(swapchain) = self.swapchain.as_mut() {
             swapchain.resize(size)?;
         }
@@ -239,7 +250,7 @@ impl Renderer {
                 timer.begin(list, slot.index);
             }
             if atlas.has_pending() {
-                atlas.record_uploads(list, slot.index)?;
+                atlas.record_uploads(device, list, slot.index)?;
             }
             if full {
                 // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）。
@@ -334,8 +345,7 @@ impl Renderer {
         self.clear_color = color;
     }
 
-    /// 测试用的图集上传入口（P15/P09 的真实像素源接上后 additive 打开）。
-    #[cfg(test)]
+    /// 图集上传入口：P09 的字形页（整页）与 P15 的图片页共用。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
@@ -672,14 +682,14 @@ fn copy_rect(
     destination: &ID3D12Resource,
     rect: &crate::math::PhysicalRect,
 ) {
-    let destination_location = D3D12_TEXTURE_COPY_LOCATION {
+    let mut destination_location = D3D12_TEXTURE_COPY_LOCATION {
         pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             SubresourceIndex: 0,
         },
     };
-    let source_location = D3D12_TEXTURE_COPY_LOCATION {
+    let mut source_location = D3D12_TEXTURE_COPY_LOCATION {
         pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
@@ -694,6 +704,7 @@ fn copy_rect(
         bottom: rect.y1 as u32,
         back: 1,
     };
+    // SAFETY: 两个 location 在本次调用期间有效，`region` 的边界由调用方夹紧到 surface 内。
     unsafe {
         list.CopyTextureRegion(
             &destination_location,
@@ -704,6 +715,12 @@ fn copy_rect(
             Some(&region),
         )
     };
+    // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用；不显式释放会让
+    // swapchain back buffer 永远存活（DEVIATIONS F-86）。
+    unsafe {
+        core::mem::ManuallyDrop::drop(&mut destination_location.pResource);
+        core::mem::ManuallyDrop::drop(&mut source_location.pResource);
+    }
 }
 
 fn transition(
@@ -712,7 +729,7 @@ fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) {
-    let barrier = D3D12_RESOURCE_BARRIER {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -724,7 +741,15 @@ fn transition(
             }),
         },
     };
-    unsafe { list.ResourceBarrier(&[barrier]) };
+    // SAFETY: `barrier` 在本次调用期间独占；`slice::from_ref` 不转移所有权。
+    unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
+    // SAFETY: union 载荷与 `pResource` 都是 `ManuallyDrop`，结构体 drop **不会**释放 COM 引用；
+    // 被 barrier 过的资源（尤其是 swapchain back buffer）会被永久钉住，导致 `ResizeBuffers`
+    // 返回 `DXGI_ERROR_INVALID_CALL`（DEVIATIONS F-86）。记录已经提交，这里显式释放。
+    unsafe {
+        let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
+        core::mem::ManuallyDrop::drop(&mut transition.pResource);
+    }
 }
 
 /// `RootUniform`（112 B）：`frame @0`、`draw @32`（P07 §2.7）。
@@ -883,13 +908,15 @@ mod tests {
 
     use super::{Renderer, geometry_root, root_uniform};
     use crate::{
-        math::{PhysicalRect, Rect, Scale, Transform},
+        math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
         paint::{
             atlas::{AtlasKind, AtlasTile},
             color::{Color, ColorResolver, Interpolation},
             geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
             instance::{FrameOp, InstanceEncoder},
-            primitive::{GeometryDraw, Image, Primitive, Quad, QuadPaint},
+            primitive::{
+                GeometryDraw, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
+            },
             scene::Scene,
         },
         render::{
@@ -1230,6 +1257,65 @@ mod tests {
         );
     }
 
+    /// 在给定页尺寸上做一次「上传 → 画字形 → 读回」的可见性探测。
+    fn glyph_probe(page: u32) -> bool {
+        let Some(mut renderer) = super::Renderer::new_warp_offscreen_with_page((64, 64), page).ok()
+        else {
+            return false;
+        };
+        let mut pixels = vec![0u8; (page * page) as usize];
+        for y in 1..11u32 {
+            for x in 1..11u32 {
+                pixels[(y * page + x) as usize] = 255;
+            }
+        }
+        let mut rows = crate::render::atlas::DirtyRows::default();
+        rows.mark(0, page);
+        renderer.queue_atlas_upload(AtlasKind::Glyph, &pixels, rows);
+        let tile = AtlasTile {
+            atlas: AtlasKind::Glyph,
+            u0: 1.0 / page as f32,
+            v0: 1.0 / page as f32,
+            u1: 11.0 / page as f32,
+            v1: 11.0 / page as f32,
+            generation: 0,
+        };
+        let scene = one_lane_scene(Primitive::GlyphRun(GlyphRun {
+            color: Color::WHITE,
+            glyphs: vec![PositionedGlyph {
+                tile,
+                position: Point::new(16.0, 16.0),
+                size: Size::new(16.0, 16.0),
+            }],
+        }));
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let mut frame = full_plan((64, 64));
+        let mut timings = FrameTimings::new();
+        if renderer
+            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(image) = renderer.readback() else {
+            return false;
+        };
+        pixel(&image, 64, 24, 24)[3] > 0
+    }
+
+    /// 字形像素级断言：把「tile 区域 255」的字形页上传，画一个只含该 tile 的 `GlyphRun`，
+    /// 断言覆盖度真的被采样到（V-64 的回归面；只看实例/UV 字段抓不到这类 bug）。
+    #[test]
+    fn glyph_run_samples_the_uploaded_glyph_page() {
+        let _guard = lock();
+        // 页尺寸扫描：64² 的测试页会掩盖分块/行距问题，产品页是 2048²。
+        for page in [64u32, 256, 512, 1024, 2048] {
+            let visible = glyph_probe(page);
+            println!("page {page}: glyph visible = {visible}");
+            assert!(visible, "page {page}: glyph coverage was not sampled");
+        }
+    }
     /// 奇数宽：读回的 row pitch 是 256 对齐，但输出必须逐像素紧凑（B5）。
     #[test]
     fn odd_surface_readback_has_no_row_padding() {

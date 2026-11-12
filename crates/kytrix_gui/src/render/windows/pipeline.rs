@@ -418,7 +418,7 @@ unsafe fn create_pipeline_state(
     };
     let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
     rtv_formats[0] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+    let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(Some(root_signature.clone())),
         VS: D3D12_SHADER_BYTECODE {
             pShaderBytecode: vertex.as_ptr().cast(),
@@ -462,8 +462,13 @@ unsafe fn create_pipeline_state(
         },
         ..D3D12_GRAPHICS_PIPELINE_STATE_DESC::default()
     };
-    unsafe { device.raw().CreateGraphicsPipelineState(&desc) }
-        .map_err(|error| init_error_from("CreateGraphicsPipelineState", error))
+    // SAFETY: desc 的字符串/字节切片指针指向本函数栈上的产物，CreateGraphicsPipelineState 同步消费。
+    let state = unsafe { device.raw().CreateGraphicsPipelineState(&desc) }
+        .map_err(|error| init_error_from("CreateGraphicsPipelineState", error));
+    // SAFETY: `pRootSignature` 是 `ManuallyDrop`，desc 的 drop 不会释放 root signature 的 COM 引用
+    // （DEVIATIONS F-86）；PSO 已经创建完成，这里显式释放。
+    unsafe { ManuallyDrop::drop(&mut desc.pRootSignature) };
+    state
 }
 
 /// 一条已注册静态几何的 GPU 视图（顶点/索引缓冲各持一个句柄）。

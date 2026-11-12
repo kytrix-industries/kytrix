@@ -91,21 +91,27 @@ impl Readback {
 
         queue.submit_immediate(|list| {
             transition(list, source, resident, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            let destination = D3D12_TEXTURE_COPY_LOCATION {
+            let mut destination = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(buffer.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: placed,
                 },
             };
-            let source_location = D3D12_TEXTURE_COPY_LOCATION {
+            let mut source_location = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     SubresourceIndex: 0,
                 },
             };
+            // SAFETY: footprint 由 `GetCopyableFootprints` 计算，源纹理处于 COPY_SOURCE。
             unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source_location, None) };
+            // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
+            unsafe {
+                core::mem::ManuallyDrop::drop(&mut destination.pResource);
+                core::mem::ManuallyDrop::drop(&mut source_location.pResource);
+            }
             transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, resident);
             Ok(())
         })?;
@@ -235,7 +241,7 @@ fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) {
-    let barrier = D3D12_RESOURCE_BARRIER {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -247,5 +253,11 @@ fn transition(
             }),
         },
     };
-    unsafe { list.ResourceBarrier(&[barrier]) };
+    // SAFETY: `barrier` 在本次调用期间独占；`slice::from_ref` 不转移所有权。
+    unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
+    // SAFETY: union 载荷与 `pResource` 都是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（F-86）。
+    unsafe {
+        let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
+        core::mem::ManuallyDrop::drop(&mut transition.pResource);
+    }
 }

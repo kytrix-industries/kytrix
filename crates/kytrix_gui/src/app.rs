@@ -6,7 +6,7 @@
 //! 写路径是 push 模型（§7.5）：一次 `write` 沿依赖图把 owner 标脏，**不**遍历整棵树；
 //! 帧内唯一的重活是 `refresh_styles`（样式求值 pass，P06 的 paint 阶段复用同一实现）。
 
-use std::{any::Any, rc::Rc};
+use std::{any::Any, rc::Rc, sync::Arc};
 
 use smallvec::{SmallVec, smallvec};
 
@@ -14,6 +14,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::test_support::record::{FrameStats, LaneOutcome};
 use crate::{
     error::EngineError,
+    event::Event,
     math::Size,
     node::{
         dependency::{DependencyGraph, EvalStack, Owner, ReadCtx, ReadTracker},
@@ -21,6 +22,7 @@ use crate::{
         signal::{Derived, Signal, SignalId, StateStore, Transient},
     },
     paint::style::StylePatch,
+    platform::dispatcher::{Dispatcher, UserTask},
     render::AtlasSet,
     text::{
         FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
@@ -72,6 +74,75 @@ pub struct App {
     scale_epochs: ahash::HashMap<WindowId, u32>,
     /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、`dirty_spans` 计数）。
     pending_dirty: crate::render::DirtyRows,
+    /// 跨线程唤醒队列（`AppHandle` 的载荷；主线程之外唯一的引擎入口）。
+    dispatcher: Arc<Dispatcher>,
+    /// 本帧从平台层收到的、尚未被应用取走的事件。
+    events: Vec<(WindowId, Event)>,
+    /// 每轮事件循环调用一次的应用钩子（读事件 / 写状态；`Application::run` 唯一调用点）。
+    frame_hook: Option<Box<dyn FnMut(&mut App)>>,
+    /// 平台层写入的原生窗口句柄（`0` = 没有原生窗口）：剪贴板需要 owner 窗口。
+    /// **不构成公开面**（I9：句柄不越过 `platform/`，这里只保留一个整数）。
+    #[cfg(windows)]
+    native_window: isize,
+}
+
+/// 应用层持有的跨线程句柄（`App::handle` 产出）。
+///
+/// 三个方法就是全部的跨线程入口（`design/phase-09-win32-demo.md` §5.1）：
+/// `wake` 请求一帧、`send` 回投一个主线程闭包、`spawn` 经 `App` 的 tokio 句柄提交任务。
+#[derive(Clone)]
+pub struct AppHandle {
+    dispatcher: Arc<Dispatcher>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AppHandle {
+    /// 请求一帧（合并；任意线程）。
+    pub fn wake(&self) {
+        self.dispatcher.wake();
+    }
+
+    /// 回投一个在主线程执行的闭包（业务异步结果的唯一入口）。
+    pub fn send(&self, task: impl FnOnce(&mut App) + Send + 'static) {
+        self.dispatcher.push(UserTask::new(task));
+    }
+
+    /// 经 `App` 的 tokio 句柄提交任务。
+    ///
+    /// **主线程内不得直接 `tokio::spawn`**（不在 runtime 上下文会 panic，`clippy.toml` 也禁了
+    /// `Handle::current`）；跨线程/主线程都走这里。
+    pub fn spawn<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.runtime.spawn(future);
+    }
+}
+
+/// 引擎自有事件循环的入口（`#[cfg(windows)]`；P11/P17 落地各自平台时解除）。
+///
+/// 用法：`let mut app = App::new(handle); ...建窗/建树...; Application::new().run(app)?`。
+/// `run` 负责：DPI 感知 → 建窗口（初始隐藏）→ 挂渲染器 → 显示 → 消息泵 → 关闭。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Application;
+
+#[cfg(windows)]
+impl Application {
+    /// 无参数：tokio 句柄由 `App` 持有。
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// 跑到没有窗口为止。
+    ///
+    /// # Errors
+    /// `EngineError::WindowCreate`（窗口/消息泵）、`UnsupportedGpu` / `AppInit`（设备）、
+    /// `Swapchain` / `DeviceLost`（present）、`InvalidDpiScale`（DPI 事件）。
+    pub fn run(self, app: App) -> Result<(), EngineError> {
+        crate::platform::native::run(app)
+    }
 }
 
 impl App {
@@ -95,7 +166,121 @@ impl App {
             glyph_atlas: GlyphAtlas::new(),
             scale_epochs: ahash::HashMap::default(),
             pending_dirty: crate::render::DirtyRows::default(),
+            dispatcher: Dispatcher::new(),
+            events: Vec::new(),
+            frame_hook: None,
+            #[cfg(windows)]
+            native_window: 0,
         }
+    }
+
+    /// 注册每轮事件循环的钩子：在平台事件已落地、提交本帧之前调用一次。
+    ///
+    /// 形态是 `&mut App`（可以建信号 / 改树 / 关窗），因此钩子内部**不能**再调用
+    /// `Application::run`。重复注册会替换上一个钩子。
+    pub fn on_frame(&mut self, hook: impl FnMut(&mut App) + 'static) {
+        self.frame_hook = Some(Box::new(hook));
+    }
+
+    /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
+    pub(crate) fn run_frame_hook(&mut self) {
+        if let Some(mut hook) = self.frame_hook.take() {
+            hook(self);
+            self.frame_hook = Some(hook);
+        }
+    }
+
+    /// 平台层登记原生窗口句柄（`0` = 解除）。
+    #[cfg(windows)]
+    pub(crate) fn set_native_window(&mut self, handle: isize) {
+        self.native_window = handle;
+    }
+
+    /// 跨线程句柄（`AppHandle`）。
+    #[must_use]
+    pub fn handle(&self) -> AppHandle {
+        AppHandle {
+            dispatcher: self.dispatcher.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    /// 平台层共享的唤醒队列（crate 私有）。
+    pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
+        self.dispatcher.clone()
+    }
+
+    /// 取走本帧的平台事件（`Application::run` 每帧填充；顺序即产生顺序）。
+    #[must_use]
+    pub fn drain_events(&mut self) -> Vec<(WindowId, Event)> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// 平台层投递一个事件（`crate::platform::native` 唯一写入点）。
+    pub(crate) fn dispatch(&mut self, window: WindowId, event: Event) {
+        self.events.push((window, event));
+    }
+
+    /// 写剪贴板文本（`CF_UNICODETEXT`）。
+    ///
+    /// # Errors
+    /// `EngineError::Clipboard`：剪贴板被其它进程占用或内存分配失败。
+    #[cfg(windows)]
+    pub fn set_clipboard_text(&self, text: &str) -> Result<(), EngineError> {
+        let hwnd = self.clipboard_owner()?;
+        crate::platform::native::clipboard::set_text(hwnd, text)
+    }
+
+    /// 读剪贴板文本（无 `CF_UNICODETEXT` 时是空串）。
+    ///
+    /// # Errors
+    /// `EngineError::Clipboard`：剪贴板被占用或内存映射失败。
+    #[cfg(windows)]
+    pub fn clipboard_text(&self) -> Result<smol_str::SmolStr, EngineError> {
+        let hwnd = self.clipboard_owner()?;
+        crate::platform::native::clipboard::text(hwnd)
+    }
+
+    /// 把字形页的当前内容交给窗口渲染器（有变化才传；整页，P09）。
+    ///
+    /// 调用点只有两个：`App::frame`（每帧）与 `TestApp::snapshot`（临时 WARP 渲染器）。
+    #[cfg(windows)]
+    pub(crate) fn upload_glyph_page(&mut self, window: WindowId) {
+        let has_renderer = self
+            .windows
+            .get(&window)
+            .is_some_and(crate::window::Window::has_renderer);
+        if !has_renderer || !self.glyph_atlas.take_page_dirty() {
+            return;
+        }
+        let (page_width, pixels) = self.glyph_page_pixels();
+        let mut rows = crate::render::DirtyRows::default();
+        rows.mark(0, u32::MAX);
+        if let Some(target) = self.windows.get_mut(&window) {
+            target.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
+        }
+        let _ = page_width;
+    }
+
+    /// 字形页的整页像素（`R8`；`upload_glyph_page` 与快照路径共用）。
+    pub(crate) fn glyph_page_pixels(&self) -> ((u32, u32), Vec<u8>) {
+        let page = self.atlas.glyph().page();
+        let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize)];
+        self.glyph_atlas.write_page(&mut pixels, page.0);
+        (page, pixels)
+    }
+
+    /// 剪贴板 owner 窗口；没有原生窗口时返回 `EngineError::Clipboard`（不静默失败）。
+    #[cfg(windows)]
+    fn clipboard_owner(&self) -> Result<windows::Win32::Foundation::HWND, EngineError> {
+        if self.native_window == 0 {
+            return Err(EngineError::Clipboard {
+                detail: smol_str::SmolStr::new_static("no native window; clipboard needs an owner"),
+            });
+        }
+        Ok(windows::Win32::Foundation::HWND(
+            self.native_window as *mut core::ffi::c_void,
+        ))
     }
 
     /// 本 App 绑定的 tokio 句柄（**借用**，不 clone）。
@@ -409,6 +594,9 @@ impl App {
                 return None;
             }
         };
+        // 字形页上传（P09 整页）：`layout_text` 在这之前完成光栅与装箱。
+        #[cfg(windows)]
+        self.upload_glyph_page(window);
         let paint = match self.windows.get_mut(&window) {
             Some(target) => target.paint_frame(),
             None => {

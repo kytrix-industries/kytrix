@@ -5726,6 +5726,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kytrix_gui_demo"
+version = "0.0.3"
+dependencies = [
+ "image",
+ "kytrix_gui",
+ "tokio",
+]
+
+[[package]]
 name = "kytrix_proto"
 version = "0.1.0"
 source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=fdb7d2b533c7737773aa5e0e7cb254dcc190f64b#fdb7d2b533c7737773aa5e0e7cb254dcc190f64b"

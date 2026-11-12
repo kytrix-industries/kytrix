@@ -1768,3 +1768,62 @@
 | 死代码 | **`#[allow(` 0 处**（含 `dead_code` / `too_many_arguments`）、`#[expect(` 0 处、`#[path]` 0 处；`render` 全私有，公开面只多加 `Window::enable_offscreen_renderer()` 一个方法 |
 | 与设计的偏差 | 见 13.3；设计文档本身未改动（`design/phase-08-d3d12.md` 与实现一致） |
 | 已知限制 | ①实机 present / resize 归 P09（V-55 / V-57）；②几何着色待 P09 扩展 `FrameOp`（S-77）；③`--release` 少 9 项（`cfg(debug_assertions)` 测试） |
+---
+
+## 十四、P09 · Windows 平台层 + 最小 demo（2026-11-12）
+
+> 设计见 `design/phase-09-win32-demo.md`；probe 在 `%TEMP%\kg-p09-win32`（仓库外）。
+> 本节条目全部来自本机 Win32 probe（`kg-p09-win32` / `kg-p09-resize` 20 变体 / `kg-p09-resize2`）。
+
+### 14.1 设计期条目
+
+| 编号 | 内容 |
+|---|---|
+| **F-86** | **`ResizeBuffers` 的 `0x887A0001` 根因是 COM 引用泄漏**：`windows 0.62.2` 把 `D3D12_RESOURCE_BARRIER` 的 union 载荷（`ManuallyDrop<D3D12_RESOURCE_TRANSITION_BARRIER>`）与其内层 `pResource`（`ManuallyDrop<Option<ID3D12Resource>>`）、以及 `D3D12_TEXTURE_COPY_LOCATION.pResource` 都做成 `ManuallyDrop`；**结构体 drop 不释放引用**。P08 的 `transition`/`copy_rect` 每帧对 back buffer 泄漏 3 个引用 ⇒ DXGI 判定"仍被引用" ⇒ `ResizeBuffers` 恒 `0x887A0001`（V-55 的真因）。**双层显式释放 + `allocator.Reset`/`list.Reset` 之后**，同尺寸与变尺寸 `ResizeBuffers` 都 `S_OK` 且可重复（`kg-p09-resize2` 实测）。泄漏点：`compositor.rs:675-689/715-722`、`atlas.rs:229-240/254-262`、`readback.rs:94-105/238-245`、`pipeline.rs:422` |
+| **F-87** | **`PostMessageW` 队列上限 10,000**：第 10001 条失败 `0x80070718`（`GetLastError=1816 ERROR_NOT_ENOUGH_QUOTA`）⇒ 帧唤醒必须合并（`AtomicBool` 置位 + 只有首次 post）；`Dispatcher.wake()` 先置位再 post，post 失败也能被 drain-then-check 兜住 |
+| **F-88** | **user32 定时器粒度**：`SetTimer(16ms)` 实测 24.6 ms（13 次/320 ms）、`SetTimer(1ms)` 实测 16.0 ms（20 次/320 ms）⇒ P13 的动画 tick 用 1 ms + 容忍抖动；P09 不装定时器 |
+| **F-89** | `windows 0.62.2` 事实补充：**没有自由函数 `SetFocus`/`GetFocus`**（只能靠 `WM_SETFOCUS`/`WM_KILLFOCUS`）；`LoadKeyboardLayoutW` 不存在（只有 A）；`SendMessageW` 的 wparam/lparam 是 `Option<…>`；`CreateSwapChainForHwnd` 是 5 参返回 `Result`；`CF_UNICODETEXT` 在 `Win32::System::Ole` 且是 `CLIPBOARD_FORMAT(u16)`；`BeginPaint`/`InvalidateRect` 在 `Graphics::Gdi` |
+| **F-90** | **`WM_QUIT` 会被 `PeekMessageW` 取出并消费**：`DispatchMessageW(WM_QUIT)` 静默丢弃，之后 `GetMessageW` 永久阻塞（probe 首轮真事故）。泵循环必须在 `PeekMessageW` 后显式判 `msg.message == WM_QUIT` 再退出 |
+| **F-91** | **隐藏窗口可以 present**：独立进程里隐藏窗口首帧全量 `Present1` = `S_OK`，随后显示/dirty/越界三种调用与 P08 §2.6 完全一致 ⇒ V-57 是**进程内状态污染**（与 V-59 同源），不是"隐藏窗口不能 present"。V-56（WARP 不能 present 到 HWND）不受影响 |
+| **S-79** | `InputEvent` / `PointerButton` 从 `test_support::input` **迁到公开 `src/event.rs`**（`Event`/`InputEvent`/`Key`/`KeyState`/`Modifiers`/`ImeEvent` 同处），`test_support::app::inject` 改用公开类型；**删除**测试模块里的重复定义（AGENTS §1.1 不保留过时设计） |
+| **S-80** | `platform/` 整体私有（I9），公开 `Application`/`AppHandle` 定义在 `app.rs`（它们在 §1.3 白名单里且必须可命名）；Windows 实现拆 `platform/windows/{event_loop,window,dpi,ime,clipboard}.rs`；`platform.rs` / `platform/windows.rs` 只做模块声明（M-06/M-03） |
+| **S-81** | P09 **用系统标题栏**（`WM_NCCALCSIZE` 一律交 `DefWindowProcW`）；自绘标题栏 / `WindowControlArea` / 拖拽最大化留 P12。probe 实测两种模式的客户区（462×273 vs 802×602）都已记录，P12 只需切分支 |
+| **S-82** | 平台事件到应用层的唯一通道 = `App::drain_events() -> Vec<(WindowId, Event)>`（引擎已先做命中测试）；P10 的 `Action` 分发接在它上面，不新增 `App::on_*` 回调 |
+| **S-83** | 键盘输入走 `TranslateMessage` + `WM_CHAR`（死键/组合由 OS 完成一次），引擎**不**跑 `ToUnicodeEx`；probe 只把 `ToUnicodeEx` 的死键/组合语义记录为 P12 的备选（德语布局 `VK_OEM_5` → -1，随后 `VK_A` → `â`；`VK_OEM_6` 一次返回 2 个码元 ⇒ 缓冲区 ≥ 8 u16） |
+| **V-60** | resize 在本机已闭环（F-86），但**只在单一驱动/单会话**验证：多显示器混合 DPI、其它厂商驱动、`SIZE_MAXIMIZED` 路径未验证 | P12 的 L5 矩阵补；P09 保持"失败即 `EngineError::Swapchain`、不重试" |
+| **V-61** | IME 只有消息通路可验：本机 `ImmGetContext` 返回有效 `HIMC`、`ImmSetCompositionWindow`/`ImmAssociateContextEx` 均 true，但**没有真实输入法输入**（组合串顺序、候选窗、去重未验证） | P12 用微软拼音/日文输入法补；P09 用 `WM_CHAR` 兜底 |
+| **V-62** | demo 的 present 路径在无交互桌面的 CI 上不可验证（只能看 `Present1` 返回值，看不到像素） | CI 走 `--snapshot`（WARP 离屏 PNG）；present 属人工验收 |
+| **V-63** | `WM_PAINT` 不验证会风暴：100 ms 内 **24,576** 次 | `wndproc` 的 `WM_PAINT` 分支只有 `BeginPaint`/`EndPaint`；写进 review checklist |
+
+### 14.2 probe 矩阵（resize，每变体独立进程）
+
+| 变体 | 帧内容 | `ResizeBuffers` |
+|---|---|---|
+| 0 | 从不 present | `S_OK` |
+| 1/2/3/4/5/7/8/9/10/11/12/13/14/15/16 | 只 `ClearRenderTargetView`（隐藏/可见、sync 0/1、立即/延迟 200 ms、`DwmFlush`、FLIP_DISCARD、dirty present、常驻 persist+RTV 堆） | 全部 `S_OK`，可重复 |
+| 6 | `FRAME_LATENCY_WAITABLE_OBJECT` 创建 swapchain | 创建即 `0x887A0001`（本机不可用） |
+| 17/18/19/21/22/23/24/25 | 任何 `CopyTextureRegion`/`CopyResource` 写入 back buffer（含 `Reset`、单层 `ManuallyDrop` 释放、FLIP_DISCARD） | 全部 `0x887A0001` |
+| 26 | 拷贝帧 → drop swapchain → 同 HWND 新建 | 新建 `0x80070005 E_ACCESSDENIED`（旧 chain 仍被泄漏引用钉住） |
+| `resize2`（F-86 修复） | 拷贝帧 + 双层释放 + `Reset` | **`S_OK`**；随后 present `S_OK`；变尺寸 `S_OK` |
+
+### 14.3 实现期新增（F-92、S-84 / S-85、V-64）
+
+| 编号 | 内容 |
+|---|---|
+| **F-92** | `crates/kytrix_gui/Cargo.toml` 的 windows features 追加 **`Win32_System_Memory`**（`GlobalAlloc`/`GlobalLock`/`GlobalUnlock` 被该 feature 门控；剪贴板写入需要）。只改 feature 列表，无新 crate，`Cargo.lock` 除 workspace member 外零变化 |
+| **S-84** | 公开面形态定案：`Application::new()`（无参，tokio 句柄由 `App` 持有）+ **`Application::run(app: App)`**；事件只在 `App::on_frame(hook)` 里可见（`hook(&mut App)` 每轮调用一次，是 `drain_events` 的唯一消费者入口）；剪贴板是 `App::{set_clipboard_text, clipboard_text}`（`EngineError::Clipboard`）。设计稿写的 `run(build)` 闭包形态被否：闭包拿不到「建树 → 装钩子 → 进循环」这三步的顺序控制 |
+| **S-85** | 字形页上传在 P09 落地（P05/P08 遗留的「上传源有了、上传没接线」）：`GlyphAtlas` 记录每块 tile 的页面原点并 `write_page` 组装整页；`App::frame` 在 `layout_text` 之后整页上传（`Window::queue_atlas_upload` → `Renderer::queue_atlas_upload`）；`TestApp::snapshot` 用**同页尺寸**的临时 WARP 渲染器再传一次。整页而非脏行（P15 再改增量）。`new_warp_offscreen` 降为 `#[cfg(test)]`，快照改用 `new_warp_offscreen_with_page` |
+| **V-64** | **字形像素不可见（已修，根因在 P08 的图集分块上传）**：`AtlasTexture::upload` 把一次上传按 `STAGING_ROWS = 256` 行**分块复用同一块 staging**——CPU 写块 0 → 录制 copy0 → 写块 1 → 录制 copy1……；GPU 在全部录制之后才执行，**每条 copy 读到的都是最后一块的字节**。产品页 2048² 有 8 块，前 7 块的拷贝实际写的是最后一块（全 0），字形永远不可见；而 64²/256² 的测试页只有 1 块，P08 的测试因此全绿。控制实验完全吻合：整页填 255（各块相同）→ 可见；只填字形 bbox → 被最后一块的 0 覆盖 → 不可见；翻页/换页尺寸都无效。**修复**：`AtlasTexture.staging` 改为按**本次上传跨度**增长（`ensure_staging(device, slot, rows)`，初始 256 行，必要时一次性扩容），每段只录**一次** `CopyTextureRegion`，不再分块复用；`record_uploads` 因此多收一个 `&Device`。**回归**：`glyph_run_samples_the_uploaded_glyph_page`（页尺寸扫描 64/256/512/1024/2048，修复前 512 起必失败）+ `rendered_text_produces_visible_glyph_pixels`（黑底白字，读回断言亮像素数 > 0 且覆盖率 0.001…0.5）。修复后 demo 文本可见（截图见 `%TEMP%\kytrix-demo.png`） |
+
+### 14.4 实施记录（2026-11-13，P09 落地）
+
+| 项 | 实测 |
+|---|---|
+| 新增 | `event.rs`、`platform.rs` + `platform/{dispatcher,event}.rs` + `platform/windows/{event_loop,window,dpi,ime,clipboard}.rs`、`crates/kytrix_gui_demo/{Cargo.toml,main.rs,scene.rs}`；改 `app.rs`/`window.rs`/`error.rs`/`lib.rs`/`test_support/{input,app}.rs`、`render/windows/{queue,compositor,atlas,readback,pipeline,swapchain}.rs`、`Cargo.toml`（member + `Win32_System_Memory`） |
+| 测试 | `cargo test -p kytrix_gui` **491**（P08 466 → +25）/ 1 ignored；`--features test-support` **500 + 5**；demo 1 |
+| demo 实机 | 窗口出现（标题 `Kytrix GUI · Phase 09`），客户区 1000×750（800×600 逻辑 @ 1.25 DPI），三个色块 sRGB 正确；`PrintWindow` 截图 `%TEMP%\kytrix-demo.png`（1018×797） |
+| demo 离屏 | `cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out.png` → 800×600 PNG，色块像素正确 |
+| 门禁 | clippy `-D warnings` / fmt / doc / release / macOS check 全绿；Linux check 需 P08 的 stub `pkg-config`（环境既有约束，非 P09 引入） |
+| 已知限制 | ①V-64 文本像素（P10）；②`WM_DPICHANGED` 只能合成验证（无第二显示器）；③IME 无真实输入法输入（V-61 不变）；④CI 无桌面时 present 只能人工验收（V-62 不变） |
+
+

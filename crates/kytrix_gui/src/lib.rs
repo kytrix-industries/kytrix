@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod error;
+pub mod event;
 pub mod layout;
 pub mod math;
 pub mod node;
@@ -17,4 +18,5 @@ pub mod window;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+mod platform;
 mod render;

@@ -25,6 +25,8 @@ struct GlyphRecord {
     top: i32,
     width: u32,
     height: u32,
+    /// 内容区在页面里的左上角（P09 整页上传的写入原点）。
+    origin: (u32, u32),
     /// R8 覆盖度（**已加 padding 的内容区**，P09 的上传源；N2）。
     data: Box<[u8]>,
 }
@@ -55,6 +57,8 @@ pub(crate) struct GlyphAtlas {
     /// 空白/无轮廓字形的**负缓存**（N5：不再每帧重光栅空格）。
     missing: ahash::HashSet<GlyphKey>,
     stats: GlyphAtlasStats,
+    /// 有新的覆盖度写入 ⇒ 下一帧要把整页传上去（P09 全页上传；增量属 P15）。
+    page_dirty: bool,
 }
 
 impl GlyphAtlas {
@@ -64,6 +68,7 @@ impl GlyphAtlas {
             ids: ahash::HashMap::default(),
             missing: ahash::HashSet::default(),
             stats: GlyphAtlasStats::default(),
+            page_dirty: false,
         }
     }
 
@@ -153,6 +158,10 @@ impl GlyphAtlas {
             top: image.placement.top,
             width,
             height,
+            origin: (
+                allocation.content.x0.max(0) as u32,
+                allocation.content.y0.max(0) as u32,
+            ),
             data: image.data.into_boxed_slice(),
         };
         let tile = GlyphTile {
@@ -164,6 +173,8 @@ impl GlyphAtlas {
         };
         self.records.insert(key, record);
         self.ids.insert(key, allocation.id);
+        // 新覆盖度：下一帧要整页上传（P09）。
+        self.page_dirty = true;
         debug_assert_eq!(
             self.coverage(key).map_or(0, |data| data.len()) as u32,
             width * height,
@@ -177,6 +188,32 @@ impl GlyphAtlas {
         self.records.clear();
         self.ids.clear();
         self.missing.clear();
+        // 换代之后整页内容都要重传（旧代际的 tile 全失效）。
+        self.page_dirty = true;
+    }
+
+    /// 取走「页面内容变了」的信号（`App::frame` 据此上传整页）。
+    pub(crate) fn take_page_dirty(&mut self) -> bool {
+        core::mem::take(&mut self.page_dirty)
+    }
+
+    /// 把所有 tile 的覆盖度写进整页缓冲区（`R8`、行主序、页宽 `page_width`）。
+    ///
+    /// P09 的上传是**整页**（每批新字形 4 MiB）；脏行增量属 P15（DEVIATIONS V-64）。
+    pub(crate) fn write_page(&self, page: &mut [u8], page_width: u32) {
+        for record in self.records.values() {
+            let (x0, y0) = record.origin;
+            let row_len = record.width as usize;
+            for row in 0..record.height {
+                let destination = (y0 + row) as usize * page_width as usize + x0 as usize;
+                let source = row as usize * row_len;
+                if destination + row_len > page.len() {
+                    continue;
+                }
+                page[destination..destination + row_len]
+                    .copy_from_slice(&record.data[source..source + row_len]);
+            }
+        }
     }
 
     /// 字形覆盖度（P09 的上传源；`None` = 空白/未光栅）。

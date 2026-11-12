@@ -1,0 +1,19 @@
+[package]
+name = "kytrix_gui_demo"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# 离屏像素验证（`--snapshot`）：需要引擎的 `test-support`（WARP 渲染 + readback）。
+# 默认关闭，发布/手动运行不带测试基建（I7）。
+snapshot = ["dep:image", "kytrix_gui/test-support"]
+
+[dependencies]
+kytrix_gui = { workspace = true }
+tokio = { workspace = true }
+image = { workspace = true, optional = true }
+
+[lints]
+workspace = true
