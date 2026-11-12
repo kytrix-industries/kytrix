@@ -1619,3 +1619,89 @@
 | `Node` 尺寸 | 实测 **1128 B**（1112 + `paint` 8 + `content_offset` 8）≤ 1152（余 24 B） |
 | 实现期修正（相对 phase-06 计划） | ①`FrameScheduler::{state, skipped}` 与 `Window::frame_state` **不落**（无默认构建消费者；测试用 `FrameOutcome`/`frame_index` 断言，见 phase-06 §9.5）；②**空 `Canvas` 节点也 push `Primitive::Canvas`**（`bounds` 参与 damage，P02 §11.3），编码器展开后 0 实例；③`rebuilt` 只统计**产生像素或有 damage** 的节点（空 lane 不触发提交，否则空窗口首帧无法判空闲）；④`FrameStats` 去掉 `geometry_draws`（无消费者）；⑤`paint/pass.rs` 的 `run` 末尾补 `scene.set_order`（计划文字里隐含、实现必须显式）；⑥`FrameOp::Geometry.clip_rect` 用 f32 位模式（V-53） |
 | 遗留（已知、已登记） | ①集成文本用例依赖宿主字体（`tofu == 0` 断言，V-46）；②oracle 只比较 `primitives`/`quads` 序列（damage 必然不同，设计 §3.8 的范围）；③damage 的节点级 push 偏保守（V-52）；④`InstanceBuffer` 的 `as_bytes`/`instances()`/`clips()`/`geometry()` 等 P07 上传访问器**尚未提供**（无消费者）；⑤`Geometry` 的 transform 恒 `IDENTITY`（F-62） |
+
+---
+
+## 十二、Phase 07 三套 shader / `build.rs` / 渲染契约（2026-11-12）
+
+> P07 只做设计 + 本机 dxc 核验（交付 `design/phase-07-shaders.md`，不落生产代码）；下列条目在 P07 实现期生效。
+> 事实基线：Windows SDK **10.0.26100.0** / `dxcompiler 1.9.2602.17`；7 个 entry 以 `-WX` 全部编过（合计 187 ms），
+> 产物 4164–7864 B，magic `DXBC`；MSL/GLSL 本机无编译器（静态审查）。
+
+### F-68 geometry per-draw 常量 48 B → 80 B，并与帧 uniform 合并为 112 B `RootUniform`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | `phase-02-paint-foundation.md` §9.5：`GeometryUniform`（32 B：`basis` + `translation`）+ `GeometryColor`（16 B），P09 相邻写入同一条 48 B 常量区 |
+| 偏差 | 改为 **`GeometryDrawUniform`（80 B）**：`basis`/`translation`/`color0`/`clip_rect`/`clip`（`uint4`，`.x = clip_index`）；并与 `FrameUniform`（32 B）合并为 **112 B `RootUniform`**（`frame @0`、`draw @32`）。三平台各一个槽位：D3D12 root constants `b0`（28 DWORD）/ Metal `buffer(2)`（112 B）/ Vulkan push constants `[0,112)`（≤ 规范下限 128 B） |
+| 原因 | ①`Primitive::Geometry` / `Path` 的绘制必须带 clip（P06 已把 `clip_index` + `clip_rect` 放进 `FrameOp::Geometry`，V-53），48 B 布局**无处传**；②圆角 clip 在 geometry 通道同样要按 `ClipEntry` 链求距离，`clip_index` 不可省；③合并成一块后三平台的常量布局逐字节一致，且不必为 quad 单独维护第二套常量绑定 |
+| 修订后设计 | `design/phase-07-shaders.md` §2.7（布局表）/§2.9（绑定表）/§4.2（变换链）；P09 上传 112 B，`GeometryUniform`/`GeometryColor` 两个类型由 `GeometryDrawUniform` 取代 |
+
+### F-69 clip 链的 GPU 侧镜像 `ClipEntry`（48 B，丢 `aabb`、`parent` 进 `uint4`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | `phase-02-paint-foundation.md` §8.7 只定义 CPU 侧 `ClipChain { parent, rect, corner_radius, aabb }`；`GpuPrimitive.clip_index` 指向「完整链」，但 GPU 侧布局未定 |
+| 偏差 | GPU 侧为 **`ClipEntry` 48 B**：`rect: float4` / `corner_radius: float4` / `meta: uint4`（`.x = parent`，`.yzw` 保留恒 0）。**丢弃 `aabb`**（已由 `GpuPrimitive.clip_rect` 冗余），`parent` 用 `uint4` 占满 16 B |
+| 原因 | ①shader 只需要「每层的 rect + 半径」求距离，`aabb` 在 primitive 上已有一份；②16 B 成员的布局在 cbuffer/std140/std430/MSL 下逐字节一致（§2.1 的硬约束）；③表项 0 仍是哨兵：`clip_index == 0` 时 shader 直接返回 1，**不读表项 0 做数学**——Rust 哨兵 `aabb = [MIN,MIN,MAX,MAX]` 按其 `(x,y,w,h)` 语义算出的右/下边界是 `MIN+MAX = 0`，不是无穷大矩形 |
+| 修订后设计 | `design/phase-07-shaders.md` §2.6（布局+哨兵陷阱）；P09 把 CPU 表转成 `ClipEntry` 数组上传，表项 0 必须存在 |
+
+### S-68 GLSL 用 1 个 `common.glsl` + 7 个 stage 文件（不是单文件 `quad.glsl` / `geometry.glsl`）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | GLSL 侧共 **8 个文件**：`common.glsl`（无 `#version`）+ `quad.vert.glsl` / `quad.frag.glsl` + `geometry.ui.vert.glsl` / `geometry.textured.vert.glsl` / `geometry.ui.frag.glsl` / `geometry.textured_image.frag.glsl` / `geometry.textured_glyph.frag.glsl` |
+| 原因 | GLSL 一个编译单元只能一个 stage、入口恒为 `main`、`#version` 必须在首行 ⇒ 无法像 HLSL/MSL 那样「一文件多入口」。共享函数只在 `common.glsl` 里出现一次（不复制），每个 stage 文件 `#version 450` + `#extension GL_GOOGLE_include_directive : require` + `#include "common.glsl"` |
+| 代价 | 文件数从 3 增到 8；`build.rs` 的 `rerun-if-changed` 覆盖 14 个源文件；若发行版 glslang 不支持 `#include`，改 build.rs 做拼接式预处理（源码不动） |
+
+### S-69 `apply_gamma` 在 v1 是恒等函数（gamma 归 sRGB 渲染目标）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 三套源码都保留 `apply_gamma(linear)` 并在 FS 末尾调用，但 v1 的实现是 `return c;`。linear→sRGB 的**唯一**编码点是 **sRGB 格式的渲染目标**（D3D12 `*_UNORM_SRGB` / Metal `*.bgra8Unorm_srgb` / Vulkan `*_SRGB`），混合发生在编码前的 linear 值上 |
+| 原因 | 主设计 §2.11 要求三套源码「函数同名同语义」；而 §5.8 又要求「不得在任一后端多/少做一次 sRGB 转换」。在 shader 内做编码会与 sRGB attachment 叠加成双重编码；删掉函数则偏离函数集契约。恒等实现同时满足两者，并把「为什么不能在这里转」写进源码注释 |
+| 代价 | `apply_gamma` 目前是死代码（编译器会内联成空操作）。它存在的价值是**契约锚点**（主设计 §2.11 的函数集）与「编码点只有一处」的可审查性 |
+
+### S-70 阴影 `σ = max(blur/3, 0.35)`（`blur` 是可见外扩半径，不是 CSS 的 2σ）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `analytic_shadow(d, blur)` 内部取 `σ = max(blur/3, 0.35)`，`erf` 用 Abramowitz–Stegun 7.1.26（误差 ≤ 1.5e-7）；覆盖率 = `0.5·(1 − erf(d/(σ√2)))` |
+| 原因 | F-13 / P02 §8.4 已把阴影的 damage 与顶点外扩冻结为 `params0.w = blur + 1`，即**可见外扩 = blur**。若按 CSS 惯例取 `σ = blur/2`，在 `d = blur+1`（2σ+1）处的残差是 **2.3% ≈ 6/255**，会在外扩边界留下可见的矩形硬边；`σ = blur/3`（3σ = blur）时残差降到 **2.2e-3 ≈ 0.5/255**（blur=0 时 σ 下限 0.35，残差 2.1e-3）。实测数值见 `phase-07-shaders.md` §0 第 8 条与 §8 R-9 |
+| 代价 | 同一 `blur` 数值的阴影比 CSS 观感略紧（`base_ui` 的主题阴影按本契约校准）；`blur < ~1.05 px` 与 0 等价（σ 下限） |
+
+### S-71 `KYTRIX_GUI_SKIP_SHADERS=1` 时写**占位产物**（不是不写产物）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 跳过编译时（`KYTRIX_GUI_SKIP_SHADERS` = `1`/`true`，其它值视为未设置并在 warning 里说明；或 `CARGO_CFG_TARGET_OS != host`），为**每个**预期产物写一个占位文件（内容 `KYTRIX-SHADER-SKIPPED\n`），同时 `cargo:warning=…`；并 `cargo:rerun-if-env-changed=KYTRIX_GUI_SKIP_SHADERS` / `KYTRIX_DXC` |
+| 原因 | P09 用 `include_bytes!(concat!(env!("OUT_DIR"), "/shaders/…"))` 嵌入产物；缺文件会让跨 target 的 `cargo check` 在**类型检查**阶段失败，而跳过模式的唯一目的就是让这种检查通过。占位文件让 `include_bytes!` 始终可解析；真跑起来会在 P09 的 magic 校验处得到 `EngineError::ShaderLoad`（显式失败，符合 I10 的「不静默降级」） |
+| 代价 | 跳过构建的二进制不可运行（预期）；必须用 `rerun-if-env-changed` 防止占位文件在切回正常构建后残留 |
+
+### S-72 实例缓冲 = 只读 structured / storage buffer（不是 CBV）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `GpuPrimitive` 数组统一为**只读、可下标寻址**的缓冲：D3D12 `StructuredBuffer<GpuPrimitive>` SRV `t0`（`StructureByteStride = 128`）/ Metal `device const GpuPrimitive* [[buffer(0)]]` / Vulkan `std430 readonly buffer`（set 0 binding 0） |
+| 原因 | ①D3D12 的 CBV 单块上限 64 KB = **512 个实例**，而实例缓冲容量按历史峰值一次分配、只写不重建（主设计 §2.7），CBV 会直接顶破；②按实例做 CBV 偏移需要 256 B 对齐，128 B 的实例会浪费一倍；③SRV/SSBO/`device` 指针是三平台唯一都支持「按动态下标读一个 128 B 结构」的绑定形态 |
+| 代价 | 实例缓冲必须 16 B 对齐（F-23 已要求）；D3D12 的 SRV 描述符走 descriptor table（§2.9），不能像 CBV 那样用 root descriptor 直接给地址 |
+
+### 十二·待复核项（P07 新增）
+
+| 编号 | 内容 | 复核 Phase | 触发条件 / 处置 |
+|------|------|-----------|-----------------|
+| V-54 | MSL/GLSL **未在本机编译**（无 xcrun / glslang），只有 HLSL 经 dxc `-WX` 验证；另有三个外部不确定点：Vulkan 对 sRGB attachment 的混合空间、glslang 的 `GL_GOOGLE_include_directive`/`-I` 支持、dxc 升级后 `-WX` 的新警告 | P07（CI）/ P18（L3） | 新增 `shader-compile-linux` / `shader-compile-macos` 两个 CI job；L3 的「半透明叠加」「圆角 1 px」「字形 emoji」三个 case 是这三点的验收面；glslang 不支持 include 时改 build.rs 拼接（源码不动） |
+
+
+### 实施记录（2026-11-12，P07 落地）
+
+| 项 | 实测 |
+|----|------|
+| 新增文件 | `crates/kytrix_gui/build.rs`（648 行）+ `crates/kytrix_gui/src/render/shaders/{contract.md}` + 14 个源文件（HLSL 3 / MSL 3 / GLSL 8） |
+| 修改文件 | `crates/kytrix_gui/Cargo.toml` 只加 `build = "build.rs"`；无 `[build-dependencies]`；`Cargo.lock` **零变化** |
+| dxc | SDK 10.0.26100.0 / dxcompiler 1.9.2602.17；7 个 entry 全绿（`-WX`）；产物 4072–7864 B、全部 `DXBC` magic（build.rs 自检） |
+| 门禁 | `cargo test -p kytrix_gui` **418 passed**（P06 基线不变）；`cargo +nightly clippy -p kytrix_gui --all-targets -- -D warnings` rc=0（build script 在内）；`fmt --check` rc=0；`KYTRIX_GUI_SKIP_SHADERS=1 cargo check --target aarch64-apple-darwin` rc=0（占位产物） |
+| 负例 | 4/4 按预期失败：字段交换 / 常量改值 / 删字段 / `asuint(` 禁用 token；还原后 build 成功、7 产物重建（复现步骤见 `design/phase-07-shaders.md` §6.4） |
+| 一致性 | 设计文档 §3.2–§3.4 的 HLSL 代码块与落盘文件逐字节相同；`contract.md` 的 6 个锚点由 build.rs 的 R4 守护 |
+| 已知限制 | ①`cargo check --target x86_64-unknown-linux-gnu` 本机 rc=101：`yeslogic-fontconfig-sys 6.0.1` 的 build.rs 需要交叉 pkg-config（P07 之前就存在，与 shader 无关；shader 侧已正确 skip）；②MSL/GLSL 未本机编译（无 xcrun / glslang）；③`cargo metadata --filter-platform x86_64-unknown-linux-gnu` rc=0 |
+| 与设计的偏差 | 无新增 F/S。实现期细化并回写设计：MSL 用 `mix`；GLSL 整型常量用 `u` 后缀 + `common.glsl` 提供 `lerp`/`saturate` 包装；build.rs 实际 648 行 |

@@ -3,6 +3,7 @@ name = "kytrix_gui"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [features]
 # 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle）。**不进发布物**（I7 / §6.6）；
