@@ -1,7 +1,8 @@
-//! 像素快照的接口（GPU 实现留 P09）。
+//! 像素快照的接口（P08 在 Windows 上用 WARP 真渲染；其余平台仍 `NoRenderer`）。
 //!
-//! P06 没有 GPU：`TestApp::snapshot` 恒返回 [`SnapshotError::NoRenderer`]。这不是兜底路径
-//! （D8 禁止软件回退），而是把「无设备」表达成**可断言**的错误，避免调用方把空图当成功。
+//! 无 GPU 时返回 [`SnapshotError::NoRenderer`]（不是兜底路径：D8 禁止软件回退，这里只是把
+//! 「本构建没有渲染器」表达成**可断言**的错误）；GPU 路径失败用 [`SnapshotError::Gpu`] 与
+//! 「没有渲染器」区分开（I10）。
 
 use crate::math::{Scale, Size};
 
@@ -35,8 +36,13 @@ pub struct SnapshotImage {
 }
 
 /// 快照失败的原因。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// 本构建没有渲染器（P06 的 headless 默认；P09 之前恒为此值）。
+    /// 本构建没有渲染器（非 Windows 构建；headless 的默认）。
     NoRenderer,
+    /// GPU 路径失败（设备创建 / 渲染 / 读回）。
+    Gpu {
+        /// 可读的诊断（含 HRESULT 或具体阶段）。
+        detail: smol_str::SmolStr,
+    },
 }

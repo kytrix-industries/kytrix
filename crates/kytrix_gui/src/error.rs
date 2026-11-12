@@ -92,6 +92,15 @@ pub enum EngineError {
     /// 图集无法容纳新图元（清空重建后仍失败，P02 §10.6 / P01 §6.2.2 #12）。
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
+
+    /// 静态几何注册 / 查找失败（设计 §4.8）。首个生产者是 P08 的渲染层：
+    /// `FrameOp::Geometry` 的 `GeometryId` 没有对应的 GPU 缓冲（`GeometryStore` 属 P09）。
+    #[error("geometry registration failed: {detail}")]
+    GeometryRegister { detail: SmolStr },
+
+    /// 引擎 / 平台初始化失败（`Application::run` 的前置条件；P08 的渲染器初始化也走这里）。
+    #[error("engine initialization failed: {detail}")]
+    AppInit { detail: SmolStr },
 }
 
 #[cfg(test)]
@@ -142,6 +151,12 @@ mod tests {
             },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
+            },
+            EngineError::GeometryRegister {
+                detail: SmolStr::new_static("geometry id 0:0 has no GPU buffers"),
+            },
+            EngineError::AppInit {
+                detail: SmolStr::new_static("d3d12 D3D12CreateDevice: 0x887A0004"),
             },
         ]
     }

@@ -5,6 +5,14 @@
 
 use smol_str::SmolStr;
 
+#[cfg(windows)]
+use crate::render::backend::Renderer;
+#[cfg(windows)]
+use crate::render::compositor::{FramePlan, Plan, plan};
+#[cfg(windows)]
+use crate::render::damage::DamageSummary;
+#[cfg(windows)]
+use crate::render::timer::FrameTimings;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameRecord, FrameStats, PaintLog};
 use crate::{
@@ -14,7 +22,7 @@ use crate::{
     node::{dirty::DirtyFlags, tree::NodeTree},
     paint::{
         color::{ColorResolver, Interpolation},
-        instance::InstanceEncoder,
+        instance::{InstanceBuffer, InstanceEncoder},
         pass::{PaintPass, PaintReport},
         scene::Scene,
     },
@@ -78,6 +86,13 @@ impl FrameIndex {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    /// crate 内构造（渲染器的**一次性**帧，如快照；不参与窗口的 `FrameScheduler`）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) const fn from_raw(value: u32) -> Self {
+        debug_assert!(value >= 1, "FrameIndex 0 从未提交");
+        Self(value)
     }
 }
 
@@ -180,6 +195,12 @@ pub struct Window {
     damage: DamageAccumulator,
     /// 颜色解析器（编码期 `resolve`；P14 主题的注入点）。
     resolver: ColorResolver,
+    /// GPU 渲染器（`None` = headless，I7 的默认；P09 的窗口层负责 attach 原生窗口）。
+    #[cfg(windows)]
+    renderer: Option<Renderer>,
+    /// 本帧的分段计时（容量跨帧复用）。
+    #[cfg(windows)]
+    timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
     paint_order: Vec<crate::paint::scene::LaneId>,
     /// 尺寸/DPI 变化 ⇒ 必须整帧重绘（S-64）。
@@ -207,6 +228,10 @@ impl Window {
             encoder: InstanceEncoder::new(),
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver::new(Interpolation::default()),
+            #[cfg(windows)]
+            renderer: None,
+            #[cfg(windows)]
+            timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
             #[cfg(feature = "test-support")]
@@ -340,12 +365,44 @@ impl Window {
         self.compute_layout().map(Some)
     }
 
+    /// 最近一帧的编码结果（渲染层上传源；P08 的 `Renderer` 消费）。
+    #[must_use]
+    pub(crate) fn instance_buffer(&self) -> &InstanceBuffer {
+        self.encoder.buffer()
+    }
+
     /// 本帧编码出的实例字节（P07 的上传入口；应用层不得依赖其内容）。
     ///
     /// 返回最近一帧 `InstanceEncoder` 的 `&[u8]`（`GpuPrimitive` 数组的字节视图，P02 §8.1 的 128 B 布局）。
     #[must_use]
     pub fn instance_bytes(&self) -> &[u8] {
-        self.encoder.buffer().as_bytes()
+        self.instance_buffer().as_bytes()
+    }
+
+    /// 启用**离屏** GPU 渲染（headless 行为不变：不调用就恒为 `None`）。
+    ///
+    /// P09 的原生窗口层会在此之后 attach swapchain；本方法本身只把窗口的绘制目标变成
+    /// 持久 offscreen（快照 / 导出 / 无窗口验证），从不 present。
+    ///
+    /// # Errors
+    /// `EngineError::UnsupportedGpu`（D8 基线不足）、`EngineError::AppInit`（设备 / 管线创建失败）、
+    /// `EngineError::ShaderLoad`（DXIL 产物缺失或被跳过）。
+    #[cfg(windows)]
+    pub fn enable_offscreen_renderer(&mut self) -> Result<(), EngineError> {
+        if self.renderer.is_some() {
+            return Ok(());
+        }
+        let surface = self.physical_surface();
+        self.renderer = Some(Renderer::new_offscreen(surface)?);
+        Ok(())
+    }
+
+    /// 窗口的物理像素尺寸（`size × scale` 的 covering 结果）。
+    #[cfg(windows)]
+    fn physical_surface(&self) -> (u32, u32) {
+        let rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
+            .to_physical_covering(self.scale);
+        (rect.width().max(1) as u32, rect.height().max(1) as u32)
     }
 
     /// lane 重建/复用 + damage + 实例编码（`design/phase-06-paint-runtime.md` §9.6）。
@@ -390,11 +447,15 @@ impl Window {
     /// 提交（或在中止条件下退回 `Idle`）。
     ///
     /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画 ⇒ 不提交、`FrameIndex` 不变。
+    ///
+    /// # Errors
+    /// 挂了渲染器时，GPU 提交失败（device lost / present 失败 / swapchain 重建失败）会原样返回；
+    /// 此时 `FrameIndex` 已递增、damage 已结算，调用方**不得**重试本帧。
     pub(crate) fn commit_frame(
         &mut self,
         ticket: FrameTicket,
         report: PaintReport,
-    ) -> FrameOutcome {
+    ) -> Result<FrameOutcome, EngineError> {
         let has_pixels = report.rebuilt > 0 || report.damage.full || report.damage.rects > 0;
         // 默认构建也算的读点：摘要计数必须与累加器的实际矩形数一致（P07 消费同一累加器）。
         debug_assert_eq!(
@@ -406,10 +467,16 @@ impl Window {
             self.scheduler.abort(ticket);
             #[cfg(feature = "test-support")]
             self.record_idle();
-            return FrameOutcome::Idle;
+            return Ok(FrameOutcome::Idle);
         }
         let index = self.scheduler.commit(ticket);
         self.tree.settle_frame();
+        #[cfg(windows)]
+        if let Some(mut renderer) = self.renderer.take() {
+            let result = self.submit_gpu(&mut renderer, index, report.damage);
+            self.renderer = Some(renderer);
+            result?;
+        }
         #[cfg(feature = "test-support")]
         {
             let frame_rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
@@ -427,7 +494,40 @@ impl Window {
             );
             self.record = Some(record);
         }
-        FrameOutcome::Committed(index)
+        Ok(FrameOutcome::Committed(index))
+    }
+
+    /// 把本帧交给 GPU（headless 不进入；`renderer` 由调用方临时取出以避免借用冲突）。
+    #[cfg(windows)]
+    fn submit_gpu(
+        &mut self,
+        renderer: &mut Renderer,
+        index: FrameIndex,
+        damage: DamageSummary,
+    ) -> Result<(), EngineError> {
+        let surface = self.physical_surface();
+        let frame = Rect::new(0.0, 0.0, self.size().width, self.size().height)
+            .to_physical_covering(self.scale);
+        let fresh = renderer.surface() != surface || renderer.is_fresh();
+        if fresh {
+            renderer.resize(surface)?;
+        }
+        let plan = plan(damage, self.damage.rects(), frame);
+        if plan == Plan::Idle && !fresh {
+            return Ok(());
+        }
+        let mut frame_plan = FramePlan::new(plan, fresh);
+        if frame_plan.is_idle() {
+            return Ok(());
+        }
+        let Window {
+            encoder,
+            timings,
+            damage,
+            ..
+        } = self;
+        let _ = damage;
+        renderer.submit(index, encoder.buffer(), &mut frame_plan, timings)
     }
 
     /// 中止（错误路径）：不结算、不递增序号（damage/dirty 保留，下一次重试）。
@@ -465,7 +565,7 @@ impl Window {
             }
         }
         let report = self.paint_frame();
-        Ok(self.commit_frame(ticket, report))
+        self.commit_frame(ticket, report)
     }
 
     /// 最近一帧的调度记录（仅 `test-support`）。

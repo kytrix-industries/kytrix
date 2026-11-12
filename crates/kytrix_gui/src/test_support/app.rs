@@ -181,13 +181,40 @@ impl TestApp {
         }
     }
 
-    /// 快照（P06 恒 `Err(NoRenderer)`；P09 接入 GPU 设备）。
+    /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`，其余平台恒 `NoRenderer`。
     ///
     /// # Errors
-    /// 本构建没有渲染器时返回 [`SnapshotError::NoRenderer`]。
+    /// [`SnapshotError::NoRenderer`]（本构建没有渲染器）或 [`SnapshotError::Gpu`]
+    /// （设备 / 管线 / 渲染 / 读回失败）。
     pub fn snapshot(&self, case: SnapshotCase) -> Result<SnapshotImage, SnapshotError> {
         debug_assert!(case.scale.factor() > 0.0, "snapshot scale must be positive");
-        Err(SnapshotError::NoRenderer)
+        #[cfg(windows)]
+        {
+            let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
+                detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
+            })?;
+            let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
+                .to_physical_covering(case.scale);
+            let size = (
+                surface.width().max(1) as u32,
+                surface.height().max(1) as u32,
+            );
+            let mut renderer =
+                crate::render::backend::Renderer::new_warp_offscreen(size).map_err(gpu_error)?;
+            let image = renderer
+                .render_snapshot(window.instance_buffer())
+                .map_err(gpu_error)?;
+            Ok(SnapshotImage {
+                width: image.width,
+                height: image.height,
+                rgba8: image.rgba8,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = case;
+            Err(SnapshotError::NoRenderer)
+        }
     }
 
     /// 单窗口借用视图（多窗口驱动的入口）。
@@ -196,6 +223,13 @@ impl TestApp {
             app: &mut self.app,
             id: self.window,
         }
+    }
+}
+
+#[cfg(windows)]
+fn gpu_error(error: EngineError) -> SnapshotError {
+    SnapshotError::Gpu {
+        detail: smol_str::SmolStr::new(error.to_string()),
     }
 }
 
@@ -259,7 +293,7 @@ mod tests {
         test_support::{
             probe::Selector,
             record::{LaneOutcome, PrimitiveKind},
-            snapshot::{SnapshotCase, SnapshotError},
+            snapshot::SnapshotCase,
         },
         text::TextStyle,
     };
@@ -403,12 +437,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_without_gpu_is_no_renderer() {
+    fn snapshot_without_gpu_is_a_typed_result() {
         let app = TestApp::new();
         let result = app.snapshot(SnapshotCase {
             size: crate::math::Size::new(64.0, 64.0),
             scale: Scale::new(1.0).expect("scale"),
         });
+        #[cfg(windows)]
+        {
+            // Windows：WARP 真渲染（空场景 ⇒ 全透明的 64×64）。
+            let image = result.expect("WARP snapshot");
+            assert_eq!((image.width, image.height), (64, 64));
+            assert_eq!(image.rgba8.len(), 64 * 64 * 4);
+            assert!(image.rgba8.iter().all(|byte| *byte == 0));
+        }
+        #[cfg(not(windows))]
         assert_eq!(result, Err(SnapshotError::NoRenderer));
     }
 

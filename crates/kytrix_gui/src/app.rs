@@ -451,8 +451,7 @@ impl App {
             self.abort_frame(window, ticket);
             return None;
         };
-        let outcome = target.commit_frame(ticket, paint);
-        Some(Ok(outcome))
+        Some(target.commit_frame(ticket, paint))
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。

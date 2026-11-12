@@ -1705,3 +1705,66 @@
 | 一致性 | 设计文档 §3.2–§3.4 的 HLSL 代码块与落盘文件逐字节相同；`contract.md` 的 6 个锚点由 build.rs 的 R4 守护 |
 | 已知限制 | ①`cargo check --target x86_64-unknown-linux-gnu` 本机 rc=101：`yeslogic-fontconfig-sys 6.0.1` 的 build.rs 需要交叉 pkg-config（P07 之前就存在，与 shader 无关；shader 侧已正确 skip）；②MSL/GLSL 未本机编译（无 xcrun / glslang）；③`cargo metadata --filter-platform x86_64-unknown-linux-gnu` rc=0 |
 | 与设计的偏差 | 无新增 F/S。实现期细化并回写设计：MSL 用 `mix`；GLSL 整型常量用 `u` 后缀 + `common.glsl` 提供 `lerp`/`saturate` 包装；build.rs 实际 648 行 |
+
+---
+
+## 十三、P08 · render 共享层 + Windows D3D12 + readback（2026-11-12）
+
+### 13.1 文件清单
+
+| 类别 | 文件 |
+|---|---|
+| 新增（共享层，`#[cfg(windows)]`） | `src/render/{device,frame,retire,compositor,timer}.rs` |
+| 新增（Windows 后端） | `src/render/windows.rs`（模块根）+ `src/render/windows/{device,queue,swapchain,pipeline,atlas,compositor,readback,timer}.rs` |
+| 修改 | `src/render.rs`（`mod` 行 + `backend` 别名）、`src/window.rs`（`Option<Renderer>` / `commit_frame -> Result` / `enable_offscreen_renderer`）、`src/app.rs`、`src/error.rs`（`GeometryRegister` / `AppInit`）、`src/paint/instance.rs`（`GpuClipEntry` + 访问器）、`src/test_support/{app,snapshot}.rs`（WARP 快照）、`Cargo.toml`（`Win32_Security`） |
+| 未落地（按设计） | macOS/Linux 后端（P11）、Win32 事件循环 / 可见窗口（P09）；`Cargo.lock` **零变化** |
+
+### 13.2 设计期条目（F-70 … F-80、S-73 … S-75、V-55）
+
+| 编号 | 内容 |
+|---|---|
+| **F-70** | 主设计 §2.4 的 `CopySubresourceRegion1` 在 **D3D12 不存在**（那是 D3D11.3 `ID3D11DeviceContext1`）；`windows 0.62.2` 只暴露 `CopyTextureRegion`。P08 用 `CopyTextureRegion` + `D3D12_BOX`，区域求交在共享层 `render/compositor.rs`（不用 Win32 `IntersectRect`） |
+| **F-71** | 帧结构改为「**persist 是唯一绘制目标**，swapchain back buffer 只作 `COPY_DEST`（不建 RTV、不逐 scissor 画到 back）」；主设计 §2.4 的「copy 到 back 再画」被取代 |
+| **F-72** | `Present1` 三条**实现期实测**约束：①创建后/`ResizeBuffers` 后第一次 present 必须全量；②dirty rect 非空且完全在 surface 内；③`pPresentParameters` 不得为 NULL。违反 ①② → `0x887A0001`，违反 ③ → 进程终止 |
+| **F-73** | `D3D12_FEATURE_DATA_SHADER_MODEL.HighestShaderModel` 是**入参**，必须先填期望上限（6_8）再查；填 `6_0` 会得到 `6_0`（本机实测会把 RTX 5080 误判为 SM 6.0） |
+| **F-74** | `FrameIndex` 留在 `window.rs`；`render/frame.rs` 只有 `MAX_FRAMES_IN_FLIGHT` / `slot` / `InFlightRing`（D-1） |
+| **F-75** | `SnapshotError` 增 `Gpu { detail: SmolStr }`；`TestApp::snapshot` 在 `cfg(windows)` 用 WARP 真渲染，其余平台仍 `NoRenderer` |
+| **F-76** | `Window::commit_frame` 返回 `Result<FrameOutcome, EngineError>`（GPU 错误冒泡；`App::frame` 的 `Some(Err)`） |
+| **F-77** | 新增 `EngineError::GeometryRegister { detail: SmolStr }` 与其**首个生产者**（`FrameOp::Geometry` 的 `GeometryId` 未注册；P09 的 `GeometryStore` 接上后语义不变） |
+| **F-78** | `InstanceBuffer` 追加 `ops()/geometry()/clips()` 与 `ClipChain::gpu_entry()`、`GpuClipEntry`（48 B）；P06 遗留 ④ 收口（非 test 消费者 = `render/windows/compositor.rs` 的录制循环） |
+| **F-79** | `crates/kytrix_gui/Cargo.toml` 的 windows features 追加 **`Win32_Security`**（`CreateEventW` 在 0.62.2 被该 feature 门控；缺了是 `E0425`）。**只改 feature 列表**，无新 crate，`Cargo.lock` 零变化 |
+| **F-80** | persist 资源格式 = `B8G8R8A8_UNORM`、**RTV 视图格式 = `B8G8R8A8_UNORM_SRGB`**（编码一次；probe：`clear(0.5) → 188`）；**sRGB flip swapchain 在本机创建即失败**（`0x887A0001`）⇒ swapchain 固定 `*_UNORM`；`CopyTextureRegion` 的源/目标必须同格式，`GetCopyableFootprints` 用**资源格式**。主设计 §2.4 与 P07 §2.3 都未涉及「资源格式 vs 视图格式」与 flip swapchain 的格式限制 |
+| **S-73** | `render/windows.rs` 是模块根（只 `mod` + `pub(crate) use`）；`Renderer` 定义在 `windows/compositor.rs`（lint `definition_in_module_root`） |
+| **S-74** | **不启用** SM 6.6 `ResourceDescriptorHeap` / Tier3 加速：WARP 报 SM 6.8/Tier3，启用会让 CI golden 与真机走不同 shader 路径（主设计 §6.4 的同一条警告） |
+| **S-75** | descriptor 堆**静态分区**（每 in-flight 槽 4 个 SRV + 2 个备用，无动态索引回收）；`GpuResourceHandle` 的 `kind=2/3` 编码为 P09 预留，P08 只产生 `kind=1` |
+| **V-55** | 「present 之后的 `ResizeBuffers`」在**本机非交互会话 + 隐藏窗口**下无法验证（`0x887A0001`，含 waitable/泵消息/释放全部引用三种尝试）；P08 以纯逻辑单测 + 「失败即 `EngineError::Swapchain`、不重试」处置，**P09 必须在可见窗口会话补实机验证** |
+
+### 13.3 实现期新增（F-81 … F-85、S-76 / S-77、V-56 / V-57）
+
+| 编号 | 事实 | 处置 |
+|---|---|---|
+| **F-81** | **`NumElements = 0` 的 buffer SRV 会移除设备**（`CreateShaderResourceView` 不报错，一帧后 readback 的 `CreateCommittedResource` / `Present1` 返回 `0x887A0005`）；空场景（`instances.len() == 0`）必然踩到 | `Pipeline::write_slot` 传 `count.max(1)`（缓冲容量恒 ≥ 1 元素）；`offscreen_full_frame_clears_transparent` 守住该路径 |
+| **F-82** | 全帧也用 `CopyTextureRegion`（逐矩形），不再用 `CopyResource`：persist→back 只有一条复制路径 | `copy_to_back` 统一走 `copy_rect`；与 F-71 一致 |
+| **F-83** | `Readback` 必须按**源格式**建缓冲：图集是 `R8_UNORM`，按 `B8G8R8A8_UNORM` 建 footprint 会让 copy 移除设备 | `capture_from(..., format, resident)`；`capture` = BGRA8 + `RENDER_TARGET`；R8 读回成 `[v,0,0,255]` |
+| **F-84** | 图集页尺寸参数化：产品 2048，测试 64。2048² glyph/image + 16 MB readback 在并行测试里拖垮 WARP | `AtlasTextures::new(device, page)`；`Renderer::new_warp_offscreen` 用 `TEST_ATLAS_PAGE = 64` |
+| **F-85** | `GpuCaps::describe()` 保留为**全构建**诊断行（不再 `cfg`），由 `Device::from_adapter` 的 `debug_assert!` 消费；`GpuCaps` 不再存进 `Device` | 删除 `Device::caps()/live_resources()` 与 `ResourceTable::live`（无消费者的状态不保留） |
+| **S-76** | GPU 单测需进程级串行：并行创建多个 WARP 设备会互相拖垮（后续 `D3D12CreateDevice` 直接失败） | `windows::device::gpu_test_lock()`（`static Mutex<()>`），每个 GPU 测试取锁 |
+| **S-77** | `FrameOp::Geometry` 只带 clip 信息（P06 契约），**不带填充色/变换**；P08 的 geometry 根常量 = 单位 basis + 白色 + clip rect | 几何的着色/变换属 P09（`Scene → FrameOp` 需扩字段）；P08 只验证注册 + 绘制链路，不做像素断言 |
+| **S-78** | P08 的共享层（`device/frame/retire/compositor/timer`）只在 `#[cfg(windows)]` 下编译：其余平台还没有后端消费者，无条件编译会让每个 `pub(crate)` item 成为 `dead_code`（P08 无 `#[allow(dead_code)]`） | P11/P17 落地各自后端时同步解除该 `cfg`（`render.rs` 的模块注记） |
+| **V-56** | **WARP 设备不能 present 到 HWND**：`Present1` 直接 `0x887A0005`（`DXGI_ERROR_DEVICE_REMOVED`）；硬件设备创建成功 | swapchain 往返测试改用硬件设备，无硬件时 skip（`Renderer::new_for_hwnd` 文档写明） |
+| **V-57** | 隐藏窗口（本机非交互会话）+ 硬件设备的帧：录制结束后 `GetDeviceRemovedReason` 已是 `0x887A0001`，`Present1` 报 `0x887A0005`；同一序列在 probe（独立进程、同样隐藏窗口）通过 → 差异在会话/窗口状态 | `hidden_window_swapchain_accepts_a_full_present` 标 `#[ignore]`（理由指向 V-55），保留可手动跑的完整路径；实机 present 验收属 P09 |
+| **V-59** | 被**移除**的设备会污染同进程后续创建：WARP 设备移除后，同一进程里再 `D3D12CreateDevice(WARP)` 会失败（此前多项 GPU 测试因此连带失败）；硬件移除相对稳定 | ①设备丢失测试改用硬件设备，无硬件时 skip；②所有 WARP 渲染器测试在设备不可用时**跳过并诊断**（设计允许的策略），不把环境失败计为断言失败 |
+
+### 13.4 实施记录（2026-11-12，P08 落地）
+
+| 项 | 实测 |
+|---|---|
+| 新增文件 | 14 个（共享层 5 + `render/windows.rs` + 后端 8），共约 3.4 k 行（含单测） |
+| 修改文件 | 8 个（`render.rs` / `window.rs` / `app.rs` / `error.rs` / `paint/instance.rs` / `test_support/{app,snapshot}.rs` / `Cargo.toml`）；`Cargo.lock` **零变化**；未 commit |
+| 测试 | `cargo test -p kytrix_gui`：**466 passed / 1 ignored**（P07 基线 418 → +48；ignored = V-57）；`--features test-support`：475 + 5；`--release`：457 passed |
+| WARP 实测 | `Device::new_warp()`：FL 12_1 / SM 6_8 / BindingTier 3 / `warp=true`；离屏帧 clear(0,0,0,0) → readback 全 0；图集脏行上传（R8，row 5 = `0xAB`、row 4/6 = 0）；局部 damage 帧不改区域外像素；`render_snapshot` 尺寸/字节数正确 |
+| 硬件实测 | RTX 5080：FL 12_2 / SM 6_8 / Tier 3；persist UNORM + SRGB RTV 单次编码；`CopyTextureRegion` persist→back 全绿（probe §2.6） |
+| 门禁 | `cargo build -p kytrix_gui` rc=0；`clippy --all-targets --all-features -D warnings` rc=0；`fmt --all --check` rc=0；`cargo doc --no-deps` rc=0；`KYTRIX_GUI_SKIP_SHADERS=1 cargo check --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}` rc=0（Linux 需 V-04 的 stub `pkg-config` + `PKG_CONFIG_ALLOW_CROSS=1`） |
+| 死代码 | **`#[allow(` 0 处**（含 `dead_code` / `too_many_arguments`）、`#[expect(` 0 处、`#[path]` 0 处；`render` 全私有，公开面只多加 `Window::enable_offscreen_renderer()` 一个方法 |
+| 与设计的偏差 | 见 13.3；设计文档本身未改动（`design/phase-08-d3d12.md` 与实现一致） |
+| 已知限制 | ①实机 present / resize 归 P09（V-55 / V-57）；②几何着色待 P09 扩展 `FrameOp`（S-77）；③`--release` 少 9 项（`cfg(debug_assertions)` 测试） |
