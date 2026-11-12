@@ -477,6 +477,12 @@ impl PhysicalRect {
         self.width() == 0 || self.height() == 0
     }
 
+    /// 面积（`i64`，避免 `i32` 溢出）：damage 阈值与测试断言共用的唯一实现。
+    #[must_use]
+    pub fn area(self) -> i64 {
+        i64::from(self.width()) * i64::from(self.height())
+    }
+
     pub fn union(self, other: Self) -> Self {
         if self.is_empty() {
             return other;

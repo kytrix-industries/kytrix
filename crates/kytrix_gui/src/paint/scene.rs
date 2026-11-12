@@ -101,6 +101,12 @@ impl LaneId {
     pub(crate) const fn generation(self) -> u32 {
         self.generation
     }
+
+    /// 仅测试：直接构造句柄（layout 侧表与 `remove` 的 lane 归还用例需要）。
+    #[cfg(test)]
+    pub(crate) const fn for_test(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
 }
 
 /// 一帧的绘制指令（I2）。**持久**：lane id 跨帧稳定（`Node.lanes` 持有）。
@@ -151,6 +157,20 @@ impl Scene {
     pub fn clear_frame(&mut self) {
         for lane in self.lanes.values_mut() {
             lane.clear();
+        }
+    }
+
+    /// engine-internal, 应用层不得调用 —— 清空**一条** lane 的内容并复位 `clip_depth`（保留容量）。
+    ///
+    /// 返回 `false` = lane 句柄陈旧。消费者：P06 的 paint pass（按节点重建 lane 的起点）。
+    #[must_use]
+    pub fn clear_lane(&mut self, id: LaneId) -> bool {
+        match self.lanes.get_mut(id) {
+            Some(lane) => {
+                lane.clear();
+                true
+            }
+            None => false,
         }
     }
 
@@ -470,5 +490,42 @@ mod tests {
             assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
         }
         assert_eq!(scene.lane_primitives(a).map(<[Primitive]>::len), Some(8));
+    }
+
+    // ── P06：clear_lane ──
+
+    #[test]
+    fn clear_lane_keeps_capacity_and_resets_clip_depth() {
+        let mut scene = Scene::empty();
+        let a = scene.new_lane();
+        for _ in 0..MAX_CLIP_DEPTH {
+            assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
+        }
+        assert!(scene.clear_lane(a));
+        assert_eq!(scene.lane_primitives(a).map(<[Primitive]>::len), Some(0));
+        // clip_depth 已复位：可以再压满 8 层而不触发 C3 断言。
+        for _ in 0..MAX_CLIP_DEPTH {
+            assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
+        }
+    }
+
+    #[test]
+    fn clear_lane_stale_is_false() {
+        let mut scene = Scene::empty();
+        let a = scene.new_lane();
+        scene.release_lane(a);
+        assert!(!scene.clear_lane(a), "陈旧句柄必须返回 false 而不是 panic");
+    }
+
+    #[test]
+    fn order_keeps_empty_lanes() {
+        let mut scene = Scene::empty();
+        let a = scene.new_lane();
+        let b = scene.new_lane();
+        assert!(scene.push(b, quad()));
+        scene.set_order(&[a, b]);
+        assert_eq!(scene.order(), &[a, b], "空 lane 保留在绘制序里");
+        assert_eq!(scene.primitive_count(), 1, "空 lane 不贡献图元");
+        assert!(!scene.is_empty());
     }
 }

@@ -10,6 +10,8 @@ use std::{any::Any, rc::Rc};
 
 use smallvec::{SmallVec, smallvec};
 
+#[cfg(feature = "test-support")]
+use crate::test_support::record::{FrameStats, LaneOutcome};
 use crate::{
     error::EngineError,
     math::Size,
@@ -24,7 +26,7 @@ use crate::{
         FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
         TextStyle, atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
-    window::{Window, WindowId, WindowOptions},
+    window::{FrameOutcome, FrameTicket, Window, WindowId, WindowOptions},
 };
 
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。
@@ -345,6 +347,131 @@ impl App {
         })
     }
 
+    // ── P06：完整帧（styles → text → layout → layout_text → paint → commit）────────
+
+    /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
+    /// → paint → commit。
+    ///
+    /// 返回 `None` = 窗口不存在（**不**消费 wake 请求）；`Ok(FrameOutcome::Idle)` = 空闲零帧（I3，
+    /// 不提交、`FrameIndex` 不变）；`Err` = 本帧已中止（damage/dirty 保留，下一帧重试）。
+    ///
+    /// 产品路径：含 `bind_style`/`bind_text` 的窗口只能走这里；`Window::frame` 是它的无 App 通道版本。
+    pub fn frame(&mut self, window: WindowId) -> Option<Result<FrameOutcome, EngineError>> {
+        if !self.windows.contains_key(&window) {
+            return None;
+        }
+        let wake = self.take_wake_request();
+        let needs_frame = self
+            .windows
+            .get(&window)
+            .is_some_and(|candidate| candidate.needs_frame(wake));
+        if !needs_frame {
+            self.record_idle(window);
+            return Some(Ok(FrameOutcome::Idle));
+        }
+        let Some(ticket) = self.windows.get_mut(&window).and_then(Window::begin_frame) else {
+            return Some(Ok(FrameOutcome::Idle));
+        };
+        let Some(styles) = self.refresh_styles(window) else {
+            self.abort_frame(window, ticket);
+            return None;
+        };
+        let text = match self.refresh_text(window) {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                self.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
+            None => {
+                self.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        let layout = match self.windows.get_mut(&window).map(Window::layout_if_dirty) {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                self.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
+            None => {
+                self.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        let text_layout = match self.layout_text(window) {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                self.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
+            None => {
+                self.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        let paint = match self.windows.get_mut(&window) {
+            Some(target) => target.paint_frame(),
+            None => {
+                self.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        #[cfg(feature = "test-support")]
+        {
+            let Some(target) = self.windows.get(&window) else {
+                self.abort_frame(window, ticket);
+                return None;
+            };
+            let stats = FrameStats {
+                styles,
+                text: Some(text),
+                text_layout: Some(text_layout),
+                layout,
+                painted_lanes: paint.rebuilt,
+                reused_lanes: paint
+                    .log
+                    .lanes
+                    .iter()
+                    .filter(|entry| entry.outcome == LaneOutcome::Reused)
+                    .count(),
+                primitives: target.scene().primitive_count(),
+                instances: paint.instances,
+            };
+            let Some(target) = self.windows.get_mut(&window) else {
+                self.abort_frame(window, ticket);
+                return None;
+            };
+            target.set_frame_stats(stats);
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let _ = (&styles, &text, &text_layout, &layout);
+        }
+        let Some(target) = self.windows.get_mut(&window) else {
+            self.abort_frame(window, ticket);
+            return None;
+        };
+        let outcome = target.commit_frame(ticket, paint);
+        Some(Ok(outcome))
+    }
+
+    /// 中止本帧（不结算、不递增 `FrameIndex`）。
+    fn abort_frame(&mut self, window: WindowId, ticket: FrameTicket) {
+        if let Some(target) = self.windows.get_mut(&window) {
+            target.abort_frame(ticket);
+        }
+    }
+
+    /// 记录一次空闲帧（仅 `test-support`；其余构建是空操作）。
+    fn record_idle(&mut self, window: WindowId) {
+        #[cfg(feature = "test-support")]
+        if let Some(target) = self.windows.get_mut(&window) {
+            target.record_idle();
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = window;
+    }
+
     // ── P05：文本 pass / 字体栈 / 诊断 ────────────────────────────────────────
 
     /// 文本 pass：形状（缓存）→ 光栅 → 图集 → `ShapedLine`，尺寸变化时置 `LAYOUT`。
@@ -655,7 +782,7 @@ mod tests {
             signal::{Derived, Signal, SignalId},
         },
         paint::style::StylePatch,
-        window::{WindowId, WindowOptions},
+        window::{FrameOutcome, WindowId, WindowOptions},
     };
 
     fn new_app() -> (tokio::runtime::Runtime, App) {
@@ -1668,5 +1795,67 @@ mod tests {
                 app.write(&signal, smol_str::SmolStr::new_static("second"));
             }
         }
+    }
+
+    // ── P06：完整帧 ──
+
+    #[test]
+    fn app_frame_runs_styles_then_paints() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口").tree().root();
+        let background = app.signal(crate::paint::color::Color::WHITE);
+        {
+            let _ = NodeBuilder::boxed()
+                .layout_override(crate::math::Rect::new(0.0, 0.0, 20.0, 10.0))
+                .bind_style(move |cx| StylePatch {
+                    background: Some(cx.read(&background)),
+                    ..StylePatch::default()
+                })
+                .build(app.window_mut(window).expect("窗口").tree_mut(), root)
+                .expect("挂载成功");
+        }
+
+        let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
+        assert!(matches!(outcome, FrameOutcome::Committed(_)));
+
+        // 改信号 → 下一帧的 Quad 颜色必须变（证明 styles pass 在 paint 之前跑过）。
+        app.write(&background, crate::paint::color::Color::BLACK);
+        let _ = app.frame(window).expect("窗口存在").expect("帧成功");
+        let scene = app.window(window).expect("窗口").scene();
+        let quad_color = scene
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::paint::primitive::Primitive::Quad(quad) => match &quad.paint {
+                    crate::paint::primitive::QuadPaint::Solid { fill, .. } => Some(*fill),
+                    crate::paint::primitive::QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("必须有背景 Quad");
+        assert_eq!(quad_color, crate::paint::color::Color::BLACK);
+    }
+
+    #[test]
+    fn app_frame_unknown_window_is_none() {
+        let (_rt, mut app) = new_app();
+        assert!(app.frame(WindowId::for_test(99)).is_none());
+    }
+
+    #[test]
+    fn app_frame_is_idle_without_work() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        // 首帧有布局移动（根从 0 尺寸撑满窗口）⇒ 提交一次；之后无写、无脏 ⇒ 空闲零帧。
+        let first = app.frame(window).expect("窗口存在");
+        assert!(matches!(first, Ok(FrameOutcome::Committed(_))));
+
+        let second = app.frame(window).expect("窗口存在");
+        assert!(matches!(second, Ok(FrameOutcome::Idle)));
+        assert_eq!(
+            app.window(window).expect("窗口").frame_index().get(),
+            1,
+            "空闲帧不得递增序号"
+        );
     }
 }

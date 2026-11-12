@@ -31,10 +31,12 @@ impl GeometryId {
         self.generation
     }
 
-    /// 仅测试用：P02 还没有 `GeometryStore`（P09 落地），而 `Primitive::Path` / `GeometryDraw`
-    /// 是公开类型，测试必须能构造句柄。**不进入任何非 test 构建**，因此没有 `dead_code`。
-    #[cfg(test)]
-    pub(crate) const fn for_test(index: u32, generation: u32) -> Self {
+    /// 仅测试用：P09 之前没有 `GeometryStore`，而 `Primitive::Path` / `GeometryDraw` 是公开类型，
+    /// 测试（含 `--features test-support` 的集成测试）必须能构造句柄。
+    ///
+    /// **P09 落地 `GeometryStore` 后必须删除**（store 是唯一铸造点，F-65）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn for_test(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
 }

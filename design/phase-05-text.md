@@ -1652,7 +1652,7 @@ AtlasExhausted { kind: AtlasKind },
 | `TextContent` | **96 B** | `SmolStr` 24 + `TextStyle` 72 |
 | `NodeKind::Text` | **96 B**（实测；载荷 96 吃掉判别位） | `Canvas` 的 `Vec` 提供 niche，因此 `NodeKind` 只从 48 → 96（+48 B） |
 | `Node`（P05） | **1088 B**（实测：1016 − 48 + 96 + `text_bind` **16** + `text_measured_size` 8） | `Option<Box<dyn Fn>>` 是**胖指针 16 B**（不是 8：`Box<dyn Fn>` = data + vtable） |
-| 断言上界 | **1152 B**（P04 的 `node_and_handle_sizes` **已是** `<= 1152`，不含 1024） | 余量 64 B |
+| 断言上界 | **1152 B**（P04 的 `node_and_handle_sizes` **已是** `<= 1152`，不含 1024） | 余量 64 B；**实现实测 1112 B**（S-59 的 `TextContent` 加 `Box<[InlineBoxSpec]>` 后），P06 再加 `paint`/`content_offset` 后为 1128 B（见 `design/phase-06-paint-runtime.md` §11.1） |
 | 备选（若 P06/P07 再增字段顶破） | `NodeKind::Text(Box<TextContent>)` ⇒ `Node` 回 **1040 B** | `Option<Box<TextContent>>` 实测 **8 B**；代价 = 每个文本节点一次 96 B 分配 |
 
 **结论（S-53）**：内联 `TextContent`（**实测 1088 B** ≤ 1152 B，余量 64 B），**不**用 `Box`。P04 的
@@ -1660,6 +1660,10 @@ AtlasExhausted { kind: AtlasKind },
 本阶段**不改**该断言，只**追加**两条打印/断言：`size_of::<TextContent>() == 96` 与 `size_of::<Node>() <= 1152`
 （后者在 P05 实现首日复跑并把实测值回填本表）。`NodeKind` 的 `large_enum_variant` 已 `allow`（workspace lint），
 不产生告警。
+
+> **实测更正（2026-11-12，S-59 落地后）**：`TextContent` 因 `inline_boxes: Box<[InlineBoxSpec]>` 变为 **112 B**、
+> `NodeKind` **112 B**，`Node` 实测 **1112 B**（不是 1088）。上表的 1088 是 N1（`inline_boxes`）落地前的推算，
+> 以 **1112** 为准；P06 追加 `paint`(8)+`content_offset`(8) 后为 **1128 B**（余 24 B）。
 
 ### 14.2 `TextSlot` 的旁表成本
 

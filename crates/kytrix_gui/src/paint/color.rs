@@ -79,6 +79,48 @@ impl Color {
         Self::Oklch { l, c, h, alpha }
     }
 
+    /// alpha 乘 `factor`（`[0, 1]` clamp，NaN → 0）：`StylePatch::opacity` 的唯一落点。
+    ///
+    /// 只动 alpha 分量（所有变体都存独立 alpha），因此与 [`ColorResolver::resolve`] 的
+    /// 「预乘空间缩放 alpha」逐位等价，且不需要解析器。
+    #[must_use]
+    pub fn with_opacity(self, factor: f32) -> Self {
+        let factor = if factor.is_nan() {
+            0.0
+        } else {
+            factor.clamp(0.0, 1.0)
+        };
+        let alpha = (self.alpha() * factor).clamp(0.0, 1.0);
+        match self {
+            Self::Srgb { r, g, b, .. } => Self::Srgb { r, g, b, alpha },
+            Self::LinearSrgb { r, g, b, .. } => Self::LinearSrgb { r, g, b, alpha },
+            Self::DisplayP3 { r, g, b, .. } => Self::DisplayP3 { r, g, b, alpha },
+            Self::Oklab { l, a, b, .. } => Self::Oklab { l, a, b, alpha },
+            Self::Oklch { l, c, h, .. } => Self::Oklch { l, c, h, alpha },
+        }
+    }
+
+    /// alpha `<= 0`（NaN 视为透明）：「本图元不产生像素」的**唯一**判定。
+    ///
+    /// 与 [`LinearPremulRgba::is_transparent`] 同语义，但作用在未预乘的 [`Color`] 上，
+    /// 让 paint 阶段（还没有解析器时）与编码器用同一判据。
+    #[must_use]
+    pub fn is_transparent(self) -> bool {
+        let alpha = self.alpha();
+        alpha <= 0.0 || alpha.is_nan()
+    }
+
+    /// 读取独立 alpha 分量（5 个变体同名分量；`with_opacity`/`is_transparent` 的内部实现）。
+    const fn alpha(self) -> f32 {
+        match self {
+            Self::Srgb { alpha, .. }
+            | Self::LinearSrgb { alpha, .. }
+            | Self::DisplayP3 { alpha, .. }
+            | Self::Oklab { alpha, .. }
+            | Self::Oklch { alpha, .. } => alpha,
+        }
+    }
+
     /// 8 位 sRGB（`alpha` 也是 8 位）：主题 / 资源 / 设计稿最常见的入口。
     #[must_use]
     pub fn from_rgba8(rgba: [u8; 4]) -> Self {

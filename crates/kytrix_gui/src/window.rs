@@ -5,12 +5,20 @@
 
 use smol_str::SmolStr;
 
+#[cfg(feature = "test-support")]
+use crate::test_support::record::{FrameRecord, FrameStats, PaintLog};
 use crate::{
     error::EngineError,
     layout::LayoutReport,
-    math::{Scale, Size},
-    node::tree::NodeTree,
-    paint::scene::Scene,
+    math::{Rect, Scale, Size},
+    node::{dirty::DirtyFlags, tree::NodeTree},
+    paint::{
+        color::{ColorResolver, Interpolation},
+        instance::InstanceEncoder,
+        pass::{PaintPass, PaintReport},
+        scene::Scene,
+    },
+    render::damage::DamageAccumulator,
 };
 
 /// 窗口句柄：单调递增、**永不复用**（陈旧 id 落回 `None`，因此不需要代际）。
@@ -61,7 +69,101 @@ impl Default for WindowOptions {
     }
 }
 
-/// 一个窗口的全部状态：节点树 + 绘制场景 + DPI + 参数。
+/// 单调递增的提交序号。**0 = 从未提交**（`Default`），首帧 = 1。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameIndex(u32);
+
+impl FrameIndex {
+    /// 原始值（`0` 只在 `Default` 里出现；`commit` 保证提交序号 ≥ 1）。
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// headless 版帧状态机（设计 §3.5 的 10 态在一次同步调用内部，见 F-66）。
+///
+/// crate 私有：P06 没有公开的观察者（测试用 `FrameOutcome`/`frame_index` 断言）；P09 的事件循环
+/// 需要时再决定是否公开。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameState {
+    /// 没有待办的帧。
+    Idle,
+    /// 已请求一帧，尚未开始。
+    Pending,
+    /// 正在跑 pass（`begin` 之后、`commit`/`abort` 之前）。
+    Draining,
+}
+
+/// 一帧的最终结果（`FrameRecord` 只存在于 `test-support`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// 本帧没有像素要画：不跑 pass、不编码、不提交、`FrameIndex` 不变（I3）。
+    Idle,
+    /// 已提交；序号 = 本次提交后的 `FrameIndex`。
+    Committed(FrameIndex),
+}
+
+/// `Draining` 的凭证：只能由 [`FrameScheduler::begin`] 铸出，`commit`/`abort` 各消费一次。
+pub(crate) struct FrameTicket(());
+
+/// 窗口级帧调度（`FrameIndex` 的唯一递增点在这里）。
+pub(crate) struct FrameScheduler {
+    state: FrameState,
+    committed: u32,
+}
+
+impl FrameScheduler {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: FrameState::Idle,
+            committed: 0,
+        }
+    }
+
+    /// `Idle → Pending`；返回是否真的发生了转换（幂等）。
+    pub(crate) fn request_frame(&mut self) -> bool {
+        if self.state == FrameState::Idle {
+            self.state = FrameState::Pending;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `Pending → Draining`；不在 `Pending` 时返回 `None`（调用方须先 `request_frame`）。
+    pub(crate) fn begin(&mut self) -> Option<FrameTicket> {
+        if self.state == FrameState::Pending {
+            self.state = FrameState::Draining;
+            Some(FrameTicket(()))
+        } else {
+            None
+        }
+    }
+
+    /// `Draining → Idle`，`committed += 1`，返回新序号（**唯一**递增点）。
+    pub(crate) fn commit(&mut self, _ticket: FrameTicket) -> FrameIndex {
+        self.state = FrameState::Idle;
+        let next = self.committed.checked_add(1);
+        debug_assert!(next.is_some(), "FrameIndex overflow (u32::MAX frames)");
+        // 溢出时**饱和**而不是回绕到 0：0 是「从未提交」的哨兵，回绕会让 in-flight 判据失效。
+        self.committed = next.unwrap_or(u32::MAX);
+        let index = FrameIndex(self.committed);
+        debug_assert!(index.get() >= 1, "提交序号必须 >= 1");
+        index
+    }
+
+    /// `Draining → Idle`，序号不变（空闲帧 / 错误中止）。
+    pub(crate) fn abort(&mut self, _ticket: FrameTicket) {
+        self.state = FrameState::Idle;
+    }
+
+    pub(crate) fn committed(&self) -> u32 {
+        self.committed
+    }
+}
+
+/// 一个窗口的全部状态：节点树 + 绘制场景 + DPI + 参数 + 帧调度。
 pub struct Window {
     id: WindowId,
     options: WindowOptions,
@@ -70,6 +172,24 @@ pub struct Window {
     scale: Scale,
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
+    /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
+    scheduler: FrameScheduler,
+    /// 实例编码器（容量跨帧保留；P07 消费 `InstanceBuffer`）。
+    encoder: InstanceEncoder,
+    /// 本帧的 damage 累加器（`paint_frame` 重置，`commit_frame` 消费）。
+    damage: DamageAccumulator,
+    /// 颜色解析器（编码期 `resolve`；P14 主题的注入点）。
+    resolver: ColorResolver,
+    /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
+    paint_order: Vec<crate::paint::scene::LaneId>,
+    /// 尺寸/DPI 变化 ⇒ 必须整帧重绘（S-64）。
+    full_damage_pending: bool,
+    /// `App::frame` 在提交前写入的帧统计（仅 `test-support`）。
+    #[cfg(feature = "test-support")]
+    stats: FrameStats,
+    /// 最近一帧的调度/绘制记录（仅 `test-support`）。
+    #[cfg(feature = "test-support")]
+    record: Option<FrameRecord>,
 }
 
 impl Window {
@@ -83,6 +203,16 @@ impl Window {
             scene: Scene::empty(),
             scale,
             scale_epoch: 0,
+            scheduler: FrameScheduler::new(),
+            encoder: InstanceEncoder::new(),
+            damage: DamageAccumulator::new(scale),
+            resolver: ColorResolver::new(Interpolation::default()),
+            paint_order: Vec::new(),
+            full_damage_pending: false,
+            #[cfg(feature = "test-support")]
+            stats: FrameStats::default(),
+            #[cfg(feature = "test-support")]
+            record: None,
         }
     }
 
@@ -130,6 +260,7 @@ impl Window {
     /// 逻辑尺寸变化（消费者：P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存。
     pub fn set_size(&mut self, size: Size) {
         self.options.size = size;
+        self.full_damage_pending = true;
         let root = self.tree.root();
         self.tree.mark_layout(root);
     }
@@ -157,6 +288,7 @@ impl Window {
     pub fn set_scale(&mut self, scale: Scale) {
         self.scale = scale;
         self.scale_epoch = self.scale_epoch.wrapping_add(1);
+        self.full_damage_pending = true;
         let root = self.tree.root();
         self.tree.mark_layout(root);
     }
@@ -166,11 +298,208 @@ impl Window {
     pub fn scale_epoch(&self) -> u32 {
         self.scale_epoch
     }
+
+    // ── P06：帧推进 ───────────────────────────────────────────────────────────
+
+    /// 提交游标（0 = 从未提交；空闲帧不变）。
+    #[must_use]
+    pub fn frame_index(&self) -> FrameIndex {
+        FrameIndex(self.scheduler.committed())
+    }
+
+    /// 本帧是否需要画面（两段门禁的第一段）。
+    ///
+    /// `wake` = `App::take_wake_request()` 的结果（`App::frame` 传入；`Window::frame` 传 `false`）。
+    /// `!REUSABLE` 表示 lane 内容与树/样式不一致；`LAYOUT | PAINT` 覆盖「新建/未标 REUSABLE」的节点。
+    pub(crate) fn needs_frame(&self, wake: bool) -> bool {
+        wake || self.full_damage_pending
+            || self.tree.any_node(|node| {
+                let dirty = node.dirty();
+                dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
+                    || !dirty.contains(DirtyFlags::REUSABLE)
+            })
+    }
+
+    /// `Idle → Pending → Draining`；空闲/重复调用返回 `None`。
+    pub(crate) fn begin_frame(&mut self) -> Option<FrameTicket> {
+        if !self.scheduler.request_frame() {
+            // 已经是 Pending/Draining：重复请求不产生新帧。
+            return None;
+        }
+        self.scheduler.begin()
+    }
+
+    /// 仅当有 `LAYOUT` 时才重排（纯颜色变化不跑布局）。
+    pub(crate) fn layout_if_dirty(&mut self) -> Result<Option<LayoutReport>, EngineError> {
+        if !self
+            .tree
+            .any_node(|node| node.dirty().contains(DirtyFlags::LAYOUT))
+        {
+            return Ok(None);
+        }
+        self.compute_layout().map(Some)
+    }
+
+    /// 本帧编码出的实例字节（P07 的上传入口；应用层不得依赖其内容）。
+    ///
+    /// 返回最近一帧 `InstanceEncoder` 的 `&[u8]`（`GpuPrimitive` 数组的字节视图，P02 §8.1 的 128 B 布局）。
+    #[must_use]
+    pub fn instance_bytes(&self) -> &[u8] {
+        self.encoder.buffer().as_bytes()
+    }
+
+    /// lane 重建/复用 + damage + 实例编码（`design/phase-06-paint-runtime.md` §9.6）。
+    pub(crate) fn paint_frame(&mut self) -> PaintReport {
+        // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
+        for lane in self.tree.drain_removed_lanes() {
+            self.scene.release_lane(lane);
+        }
+        let scale = self.scale;
+        let size = self.size();
+        let frame = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
+        self.damage.reset(scale);
+        if self.full_damage_pending {
+            self.damage.push_full();
+            self.full_damage_pending = false;
+        }
+        self.paint_order.clear();
+        let mut pass = PaintPass {
+            tree: &mut self.tree,
+            scene: &mut self.scene,
+            damage: &mut self.damage,
+            scale,
+            frame,
+            order: &mut self.paint_order,
+            #[cfg(feature = "test-support")]
+            log: PaintLog::default(),
+        };
+        let mut report = pass.run();
+        let buffer = self.encoder.encode(&self.scene, scale, &self.resolver);
+        #[cfg(feature = "test-support")]
+        {
+            report.instances = buffer.len();
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let _ = buffer;
+            let _ = &mut report;
+        }
+        report
+    }
+
+    /// 提交（或在中止条件下退回 `Idle`）。
+    ///
+    /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画 ⇒ 不提交、`FrameIndex` 不变。
+    pub(crate) fn commit_frame(
+        &mut self,
+        ticket: FrameTicket,
+        report: PaintReport,
+    ) -> FrameOutcome {
+        let has_pixels = report.rebuilt > 0 || report.damage.full || report.damage.rects > 0;
+        // 默认构建也算的读点：摘要计数必须与累加器的实际矩形数一致（P07 消费同一累加器）。
+        debug_assert_eq!(
+            report.damage.rects,
+            self.damage.rects().len(),
+            "damage summary and accumulator disagree"
+        );
+        if !has_pixels {
+            self.scheduler.abort(ticket);
+            #[cfg(feature = "test-support")]
+            self.record_idle();
+            return FrameOutcome::Idle;
+        }
+        let index = self.scheduler.commit(ticket);
+        self.tree.settle_frame();
+        #[cfg(feature = "test-support")]
+        {
+            let frame_rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
+                .to_physical_covering(self.scale);
+            let stats = std::mem::take(&mut self.stats);
+            let record = crate::test_support::record::capture(
+                &self.scene,
+                &self.tree,
+                &self.resolver,
+                &report,
+                self.damage.rects(),
+                frame_rect,
+                index,
+                stats,
+            );
+            self.record = Some(record);
+        }
+        FrameOutcome::Committed(index)
+    }
+
+    /// 中止（错误路径）：不结算、不递增序号（damage/dirty 保留，下一次重试）。
+    pub(crate) fn abort_frame(&mut self, ticket: FrameTicket) {
+        self.scheduler.abort(ticket);
+        #[cfg(feature = "test-support")]
+        self.record_idle();
+    }
+
+    /// 窗口本地帧（**无 App 通道**：不跑样式/文本 pass）。
+    ///
+    /// 含 `bind_style` / `bind_text` 的窗口必须走 `App::frame`，否则补丁不会重新求值
+    /// （debug 构建会直接断言失败）。
+    ///
+    /// # Errors
+    /// `EngineError::InvalidMeasure`：布局闭包返回非有限值/负尺寸（本帧已中止，未提交）。
+    pub fn frame(&mut self) -> Result<FrameOutcome, EngineError> {
+        if !self.needs_frame(false) {
+            #[cfg(feature = "test-support")]
+            self.record_idle();
+            return Ok(FrameOutcome::Idle);
+        }
+        debug_assert!(
+            !self.tree.any_node(crate::node::tree::Node::has_bindings),
+            "Window::frame does not run style/text passes; use App::frame for bound nodes"
+        );
+        let Some(ticket) = self.begin_frame() else {
+            return Ok(FrameOutcome::Idle);
+        };
+        match self.layout_if_dirty() {
+            Ok(_) => {}
+            Err(error) => {
+                self.abort_frame(ticket);
+                return Err(error);
+            }
+        }
+        let report = self.paint_frame();
+        Ok(self.commit_frame(ticket, report))
+    }
+
+    /// 最近一帧的调度记录（仅 `test-support`）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record(&self) -> Option<&FrameRecord> {
+        self.record.as_ref()
+    }
+
+    /// 记录一次空闲帧（不提交、序号不变）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_idle(&mut self) {
+        self.record = Some(FrameRecord::idle(
+            FrameIndex(self.scheduler.committed()),
+            std::mem::take(&mut self.stats),
+        ));
+    }
+
+    /// `App::frame` 在提交前写入本帧的统计（仅 `test-support`）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_frame_stats(&mut self, stats: FrameStats) {
+        self.stats = stats;
+    }
+
+    /// 强制全量重绘（oracle 的「全量」路径）：清 `REUSABLE` + 清空所有 lane 的内容。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn force_full_repaint(&mut self) {
+        self.tree.clear_all_reusable();
+        self.scene.clear_frame();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Window, WindowId, WindowOptions};
+    use super::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions};
     use crate::{
         math::{Scale, Size},
         node::dirty::DirtyFlags,
@@ -375,5 +704,106 @@ mod tests {
         window.set_scale(Scale::new(2.0).expect("finite scale"));
         assert_eq!(window.scale_epoch(), 2);
         assert_eq!(window.scale().factor(), 2.0);
+    }
+
+    // ── P06：帧推进 ──
+
+    use crate::{
+        node::builder::NodeBuilder,
+        paint::{
+            color::Color,
+            style::{PaintSpec, StylePatch},
+        },
+    };
+
+    fn painted_window() -> (Window, crate::node::id::NodeId) {
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let root = window.tree().root();
+        let node = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(0.0, 0.0, 40.0, 16.0))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        (window, node)
+    }
+
+    #[test]
+    fn frame_commits_once_and_increments_index() {
+        let (mut window, _node) = painted_window();
+        assert_eq!(window.frame_index().get(), 0);
+
+        let outcome = window.frame().expect("帧成功");
+        assert_eq!(outcome, FrameOutcome::Committed(FrameIndex(1)));
+        assert_eq!(window.frame_index().get(), 1);
+    }
+
+    #[test]
+    fn idle_frame_does_not_commit_or_increment() {
+        let (mut window, _node) = painted_window();
+        let _ = window.frame().expect("首帧");
+        assert_eq!(window.frame_index().get(), 1);
+
+        let outcome = window.frame().expect("第二帧");
+        assert_eq!(outcome, FrameOutcome::Idle);
+        assert_eq!(window.frame_index().get(), 1, "空闲帧不得递增序号");
+    }
+
+    #[test]
+    fn paint_only_frame_skips_layout_and_reuses_lanes() {
+        let (mut window, node) = painted_window();
+        let _ = window.frame().expect("首帧");
+
+        let patch = StylePatch {
+            background: Some(Color::BLACK),
+            ..StylePatch::default()
+        };
+        assert!(window.tree_mut().set_style_patch(node, patch));
+        let _ = window.tree_mut().mark_paint(node);
+
+        assert!(
+            window.layout_if_dirty().expect("无错误").is_none(),
+            "只改颜色不应触发布局"
+        );
+        let outcome = window.frame().expect("第二帧");
+        assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    }
+
+    #[test]
+    fn frame_aborts_on_layout_error() {
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let root = window.tree().root();
+        let _ = NodeBuilder::boxed()
+            .measure(Box::new(
+                |_: taffy::Size<Option<f32>>, _: taffy::Size<taffy::AvailableSpace>| {
+                    Size::new(f32::NAN, 10.0)
+                },
+            ))
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+
+        let outcome = window.frame();
+        assert!(matches!(
+            outcome,
+            Err(crate::error::EngineError::InvalidMeasure { .. })
+        ));
+        assert_eq!(window.frame_index().get(), 0, "中止不得递增序号");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "use App::frame")]
+    fn frame_rejects_bound_nodes_without_styles() {
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let root = window.tree().root();
+        let _ = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .bind_style(|_cx| StylePatch::default())
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+
+        let _ = window.frame();
     }
 }

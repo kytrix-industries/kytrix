@@ -4,6 +4,16 @@ version.workspace = true
 publish.workspace = true
 edition.workspace = true
 
+[features]
+# 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle）。**不进发布物**（I7 / §6.6）；
+# 集成测试 `tests/frame_record.rs` 通过 `required-features` 依赖它。
+test-support = []
+
+[[test]]
+name = "frame_record"
+path = "tests/frame_record.rs"
+required-features = ["test-support"]
+
 [dependencies]
 # P01 实际使用
 smol_str = { workspace = true }

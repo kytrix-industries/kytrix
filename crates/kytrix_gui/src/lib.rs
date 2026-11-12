@@ -12,4 +12,9 @@ pub mod paint;
 pub mod text;
 pub mod window;
 
+/// 测试基建（`TestApp`/`Probe`/帧记录/oracle）。**只在 `test-support` feature 下编译**，
+/// 不进发布物（I7 / `design/phase-06-paint-runtime.md` §10）。
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 mod render;

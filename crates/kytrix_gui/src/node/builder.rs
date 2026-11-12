@@ -18,7 +18,7 @@ use crate::{
     paint::{
         canvas::Canvas,
         geometry::GeometryId,
-        style::{Style, StylePatch},
+        style::{PaintSpec, Style, StylePatch},
     },
     text::{TextContent, TextStyle},
 };
@@ -35,6 +35,8 @@ pub struct NodeBuilder {
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
+    paint: Option<PaintSpec>,
+    debug_id: Option<SmolStr>,
 }
 
 impl Default for NodeBuilder {
@@ -55,6 +57,8 @@ impl NodeBuilder {
             hit_shape: None,
             layout_override: None,
             bind_text: None,
+            paint: None,
+            debug_id: None,
         }
     }
 
@@ -159,6 +163,26 @@ impl NodeBuilder {
         self
     }
 
+    /// 静态绘制属性（P06）：背景 / 边框 / 圆角 / 阴影 / 渐变。动态覆盖请用 [`NodeBuilder::bind_style`]。
+    #[must_use]
+    pub fn paint(self, paint: PaintSpec) -> Self {
+        Self {
+            paint: Some(paint),
+            ..self
+        }
+    }
+
+    /// 稳定调试 id（P06）：`Probe::by_selector(Selector::Id(..))` 与诊断日志的锚点。
+    ///
+    /// 同一棵树内**允许重复**（多个命中取 `order()` 的第一个）；引擎不做唯一性检查。
+    #[must_use]
+    pub fn id(self, id: impl Into<SmolStr>) -> Self {
+        Self {
+            debug_id: Some(id.into()),
+            ..self
+        }
+    }
+
     /// 挂载到 `parent` 末尾并返回新句柄。
     ///
     /// # Errors
@@ -187,6 +211,12 @@ impl NodeBuilder {
         }
         if let Some(bind_text) = self.bind_text {
             spec = spec.with_bind_text(bind_text);
+        }
+        if let Some(paint) = self.paint {
+            spec = spec.with_paint(paint);
+        }
+        if let Some(debug_id) = self.debug_id {
+            spec = spec.with_debug_id(debug_id);
         }
         tree.insert_child(parent, spec)
     }

@@ -1431,3 +1431,191 @@
 | **B4 复位（复审二）** | `set_text_shaped` 的 Some 分支写新快照时同时把 `line/broken/laid_width_bits/laid_generation` 清空 ⇒ `layout_text` 的复用判据（`line.is_some() && width_bits && generation`）必然失效、强制重排；回归用例覆盖文本变短/变长、style、family、inline_boxes 四类变更 |
 | **inline_boxes 保留（复审二）** | `refresh_styles` 不再用 `TextContent::new(value, style)` 重建（会丢行内盒），改为 clone 旧载荷只改 `text`/`style`；用例断言 `bind_text` 首帧与更新后 `inline_boxes.len()` 不变 |
 | **门禁（复审二）** | `cargo test` **364**、release **356**、clippy/fmt/doc 0；三平台 `metadata` rc=0；`Node` 1112 断言保留 |
+
+---
+
+## 十一、Phase 06 paint pass / 实例编码 / damage / headless 运行时 / 测试基建（2026-11-12）
+
+> 关联文档：`custom-gui-engine-design.md` §3.4–§3.8 / §5.1–§5.7 / §5.9 / §6.1–§6.6 / §6.8 / 附录 B、C；
+> `design/phase-02-paint-foundation.md` §6–§8、§11–§13；`design/phase-03-node-state.md` §9 / §11 / §13 / §14；
+> `design/phase-04-layout.md` §8 / §13；`design/phase-05-text.md` §5.2 / §13；
+> **本阶段详细设计 = `design/phase-06-paint-runtime.md`**（下文 §N 均指该文件）。
+>
+> **A-01 继续适用**：本节只**追加**，不改写任何历史条目（一～十 未改动）。
+>
+> 事实基线：仓库外三个 probe（§2.1 的 `kg-p06-size-probe`、§2.2 的 `kg-p06-deadcode-probe` / `kg-p06-lints-probe`）；
+> `cargo test -p kytrix_gui` 基线 **364 passed**。
+>
+> 裁决：5 条（phase-06 §15，全部采纳）；新增 9 条 F（F-58…F-66）、7 条 S（S-60…S-66，
+> S-66 为审查 B1 的 clip_key 守卫）；P06 自己的待复核项从 **V-48** 起（V-48…V-52）。
+
+### F-58 静态绘制属性 = `Node.paint: Option<Box<PaintSpec>>`（**不进** `Style`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §4.9.3 / P03 §10.1：`Style` 是「静态结构」，注记「P06 才会追加其余引擎自有字段（圆角 / 阴影 / 字体族）」 |
+| 偏差 | 新增公开类型 `paint::style::PaintSpec { background, border, corner_radius, shadow, gradient }` + `ShadowSpec`，作为 **`Node` 的独立字段** `paint: Option<Box<PaintSpec>>`；`Style` 的公开结构（`inner` / `clip`）**不变** |
+| 原因 | ①probe：`Style` 560 B、`PaintSpec` 136 B —— 内联 `Style.paint` 会让 `Style` 696 B、`Node` **1248 B > 1152**；②`Style` 加私有字段会让全仓 `Style { inner, clip }` 字面量（`window.rs`/`app.rs` 的测试等 6 处）无法构造，加公开字段则要求所有调用点补 `paint: None`（纯噪声）；③绘制属性与布局属性是两条独立的失效通道（`StylePatch` 已按外观分组），`set_style` 不该承担绘制语义 |
+| 代价 | `Node` 1112 → **1120**（+8），叠加 F-59 的 `content_offset` 后 **1128**（余 24 B，V-48） |
+| 修订后设计 | phase-06 §1.2 / §6.1 / §11.1；`NodeBuilder::paint(PaintSpec)`、`Node::paint_spec()`（`pub(crate)`） |
+
+### F-59 `REUSABLE` / damage / `prev_layout` 的复位点在**提交**（`NodeTree::settle_frame`）
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §3.4：「**一帧开始时**所有节点默认 `REUSABLE`；被失效的节点清掉该位」；P03 §9.4：「damage 清零：P06 的帧初（`NodeTree::begin_frame`）」 |
+| 偏差 | 不设 `begin_frame`；改在**提交**时调 `NodeTree::settle_frame`：`damage = ∅`、`prev_layout = layout`、`dirty.insert(REUSABLE)`、`dirty.remove(LAYOUT | PAINT)` |
+| 原因 | `drain`（写信号 → `mark_*` → `touch` 清 `REUSABLE` 并并 damage）发生在 `frame()` **之前**。帧初清零会：①吞掉 drain 累积的旧像素 damage（"改了颜色但旧位置没重绘"）；②把 `REUSABLE` 重新置位，让 paint 复用过期 lane（stale drawing）。复位必须发生在**消费之后** |
+| 推论 | 复位点是 `FrameIndex` 递增的同一处 ⇒ "提交了才结算"；错误/空闲路径**不**结算（damage/dirty 保留，下一次重试）。`prev_layout = layout` 同时让"只改颜色"的节点不必把历史上的位置并进 damage |
+| 修订后设计 | phase-06 §9.4 / §5.5；用例 §12-E1/E2 |
+
+### F-60 `absolutize` 的 `changed` 分支必须清 `REUSABLE`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P04 §7.2 / S-43：`place_subtree` 在 `changed` 时把 `old ∪ new` 并入 damage、写 `prev_layout`、`layout` |
+| 偏差 | 同一分支追加 `dirty.remove(REUSABLE)` |
+| 原因 | lane 内的 `Primitive` 持有**绝对** bounds（P02 §6.1 无变换栈）。布局移动后，即使没有任何 `mark_paint`，lane 内容也已过期；只并 damage 会让"移动到新位置的节点"继续用旧坐标绘制（且新位置的像素没人写） |
+| 修订后设计 | phase-06 §5.6；用例 §12-F3（paint-only 帧不重排、移动帧必须重建） |
+
+### F-61 damage 的输出是 `DamageSummary{full, rects}`；`DamageOutput` / `ScrollHint` 延后 P07 / P12
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P02 §12.1：`DamageOutput { Full, Partial { rects: Vec<PhysicalRect>, scroll: Option<ScrollHint> } }` + `push_scroll` |
+| 偏差 | 不落 `DamageOutput` / `ScrollHint` / `push_scroll`；`DamageAccumulator::finish(frame) -> DamageSummary { full: bool, rects: usize }`，矩形留在累加器里（`rects()` 只在该 feature 下提供） |
+| 原因 | ①`Partial { rects: Vec }` 是**耗尽式**交出，与 P02 §12.6「`reset` 保留容量」自相矛盾；②P06 没有 scroll 数据源（`Transient` 滚动偏移属 P12），一个永远 `None` 的字段违反 AGENTS §2.1；③P07 的平台翻译（`Present1` dirty/scroll、`VK_KHR_incremental_present`）只需要 `(full, &[PhysicalRect])`，需要拥有式结果时 additive 加 `take_rects()` |
+| 修订后设计 | phase-06 §8.1 / §8.5；用例 §12-B11/B12 |
+
+### F-62 `Geometry` 的 transform 在 P06 恒为 `Transform::IDENTITY`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §5.5 / §3.10：`app.set_geometry_transform(geo, camera_matrix)` → 只更新 uniform；`GEOMETRY` dirty |
+| 偏差 | P06 的 paint 生成 `Primitive::Geometry(GeometryDraw { id, transform: IDENTITY })`；`GEOMETRY` 位**仍无写者**；`set_geometry_transform` 的 uniform 通道留 P08/P09 |
+| 原因 | ①`App` 还没有 `GeometryStore`（P02 §9 明确 store 属 P09），`GeometryId` 只能由测试构造（F-65）；②transform 的归属是 **`GeometryId`**（per-id 相机矩阵），不是节点 —— 在 `Node` 上造 `geometry_transform`（+24 B）会破 Node 预算（1144+24）并与 P08 的 per-id API 冲突；③P06 的职责是"0 实例 + 1 个 `FrameOp::Geometry`"，uniform 的重写属 GPU 侧 |
+| 修订后设计 | phase-06 §6.2 / §7.5；P08 落地时：写者置 `GEOMETRY` + 重写该节点的单条 `GeometryDraw`（≤1 图元的 lane 重建，GPU VBO 不动），damage = 变换前后 bounds 并集 |
+
+### F-63 `Selector::Role` 延后 P14
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §6.2：`Selector` 支持 `Id(&'static str)` / `Role(A11yRole)` / `Text(&str)` / `Path(&[...])` |
+| 偏差 | P06 落 `Id` / `Text` / `Path` 三个变体，`Role` 推迟到 P14 |
+| 原因 | `A11yRole` 是 P14 的类型（`a11y.rs` 不存在）；先建一个带"占位类型"的变体等于引入无消费者分支，且会迫使 P14 改 `Selector` 的布局 |
+| 修订后设计 | phase-06 §10.2；P14 additive 加 `Role(A11yRole)` 变体 + 匹配臂 |
+
+### F-64 文本绝对坐标 = `bounds.origin + content_offset + 局部`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P05 §5.2 / S-54：「`positioned` 的 y 已含基线，P06 加节点 `LayoutBox.bounds.origin` 后才是绝对坐标」 |
+| 偏差 | 在 `bounds.origin` 之外再加 `Node.content_offset`（= `border.top/left + padding.top/left`，`set_local_layout` 从 taffy `Layout` 写入） |
+| 原因 | `LayoutBox.bounds` 是 **border box**，而 `ShapedLine` 的坐标是**文本盒（内容盒）局部**。有 padding 的文本节点（按钮/输入框/标签）直接用 `bounds.origin` 会整体左上偏移 padding 像素。`content_offset` 是 8 B 的点（不是 16 B 的 `Edges`），因为绘制只需内容盒原点 |
+| 修订后设计 | phase-06 §5.2 / §6.3；`Node` +8 B（F-58 合计 1128） |
+
+### F-65 `GeometryId::for_test` 在 `feature = "test-support"` 下是 `pub`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | P02 S-20：`GeometryId` 字段私有 + 公开 getter + **仅测试构造器** `#[cfg(test)] pub(crate) fn for_test` |
+| 偏差 | cfg 扩为 `#[cfg(any(test, feature = "test-support"))]`，可见性改为 `pub` |
+| 原因 | 集成测试（`tests/frame_record.rs`）不是 `cfg(test)`，而 P09 之前没有 `GeometryStore` 铸造句柄的公开路径；没有它，"`Geometry` 节点产生 `GeometryDraw`"这条 L2 断言无法写 |
+| 修订后设计 | phase-06 §1.2 / §4.1；**P09 必须删除该构造器**（`GeometryStore` 是唯一铸造点），用例只在 test-support 下存在 |
+
+### F-66 `FrameScheduler` 只保留 `Idle` / `Pending` / `Draining`
+
+| 项 | 内容 |
+|----|------|
+| 原文 | 主设计 §3.5 的 10 态：`Idle → Pending → Drain → Invalidate → Layout → Paint → Damage → Submit → WaitGpu` |
+| 偏差 | headless 版 3 态 + `FrameIndex`（唯一递增点在 `commit`）；`WaitGpu` / in-flight ring / `PlatformDispatcher::wake` 留 P09 |
+| 原因 | 中间态全部发生在**一次同步调用内部**（没有平台事件循环、没有异步边界），没有任何观察者；把它们造成状态只会产生"永远观测不到"的变体。in-flight 轮转的**契约**（`index.get() % 3` 槽、retire 释放）写在 §9.1，P09 扩展变体时 additive |
+| 修订后设计 | phase-06 §9.1 / §9.2；`FrameIndex` 只在 `commit` 递增（I3 的"空闲零帧不增号"由此保证） |
+
+### S-60 paint pass 归属 `src/paint/pass.rs`（crate 私有）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 新增 `paint/pass.rs`（`pub(crate) mod pass;`），`PaintPass` / `PaintReport` 放在这里；`window.rs` 只做帧编排（begin/layout/paint/commit/abort） |
+| 原因 | paint pass 是「style + patch + text + canvas + geometry → `Primitive`」的单一职责；塞进 `window.rs` 会让后者混入绘制语义（AGENTS §1.3 模块边界），并把它推到 700+ 行 |
+| 代价 | 超出 brief 的文件清单一项（裁决 ⑤）；文件边界门禁（§13-9）已把它列入允许集合 |
+
+### S-61 一节点一 lane；lane 自包含祖先 clip 前缀；空 lane 粘性；释放只随卸载
+
+| 项 | 内容 |
+|----|------|
+| 决策 | 每个有绘制内容的节点一条 lane（`Node.lanes[0]`，容量仍 2）；lane 内容 = 祖先 `Clip(Push)*` + 本节点图元 + 逆序 `Clip(Pop)*`；lane 分配后不因"本帧无图元"释放（只 `clear_lane`），节点卸载时经 `NodeTree::removed_lanes` 归还 |
+| 原因 | ①`REUSABLE` 的语义是"整桶复用"，一节点多 lane 会让一次失效写多条、`reused_lanes` 判定复杂化；②clip 若只在本节点 lane 内 push/pop，子 lane 不在作用域内（lane 是独立桶），因此必须把祖先链展开成每 lane 的前缀（C1「lane 内部闭环」）；③粘性 lane 让 `Scene::order` 跨帧稳定，oracle 的 `node` 键可直接比较，也避免 lane 反复分配/释放 |
+| 代价 | clip 前缀在 CPU 侧重复（GPU 侧由 `ClipChain` 去重，P02 §8.7）；典型 depth ≤ 1 |
+
+### S-62 `Scene` 的写面**不收紧**；新增 `Scene::clear_lane` 同为 `pub` + engine-internal doc
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `new_lane` / `release_lane` / `push` / `clear_frame` / `set_order` / `clear_order` 保持 P03 的 `pub`（doc 首行 "engine-internal, 应用层不得调用"）；`clear_lane` 照此新增 |
+| 原因 | P06 之后 `new_lane`/`push`/`set_order`/`release_lane` 有了 crate 内调用者，但 `clear_frame`/`clear_order` 仍**只**有 `feature = "test-support"` 的 oracle 调用者。只收紧一半会让写面分裂成两套可见性规则（比 S-33 现状更难审计）；全部改 `pub(crate)` 则 `clear_frame`/`clear_order` 会在默认构建里 `dead_code` |
+| 修订后设计 | phase-06 §4.3；P03 S-33 的「pub 仅为满足 dead_code」注记被本条扩展为「写面统一 pub + engine-internal」 |
+
+### S-63 `test-support` 的模块划分与两种记录类型
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `lib.rs` 加 `#[cfg(feature = "test-support")] pub mod test_support;`；`test_support.rs` 只有 5 行 `pub mod`（`app` / `input` / `probe` / `record` / `snapshot`）；`FrameRecord`（调度记录）与 `RenderedFrame`（绘制快照）**分型**，`FrameRecord.frame: Option<RenderedFrame>` |
+| 原因 | ①`pub use` 被 workspace lint 禁止（M-02），无法把 5 个模块压平成一个命名空间，模块划分必须显式；②调度事实（`rendered` / `damage` / `stats` / `paint_log`）与绘制事实（`quads` / `primitives` / `debug_bounds`）的生命周期不同：空闲帧只有前者，提交帧两者都有，混在一个类型里会让"本帧未提交"只能靠空 Vec 猜 |
+| 公开路径 | `kytrix_gui::test_support::{app::TestApp, app::TestWindow, probe::{Probe, Selector}, record::…, input::…, snapshot::…}`（S-16 闭包表见 phase-06 §4.2） |
+
+### S-64 全帧 damage 的触发点 = `set_size` / `set_scale` 的 `full_damage_pending`
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `Window` 新增 `full_damage_pending: bool`；`set_size` / `set_scale` 置位，`paint_frame` 在 `damage.reset` 之后消费它并 `push_full()` |
+| 原因 | 尺寸/DPI 变化会重建 framebuffer（P09 的 swapchain），局部 rect 的坐标系整体失效（P01 §7.2 / 主设计 §5.7 的"窗口尺寸/DPI → 全帧"）。用显式 flag 而不是"比较 `scale_epoch`/`size` 与上一帧"，是因为后者在**多帧未提交**（错误中止）时会把"已经全帧过一次"误判成"还需要全帧" —— 语义上两者都不能漏，但 flag 只需要一次 |
+| 修订后设计 | phase-06 §9.5 / §8.5；用例 §12-F4 |
+
+### S-65 编码器自检承担 `InstanceBuffer` 内部字段的非 test 读点
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `InstanceEncoder::encode` 末尾做三项 `debug_assert!`：`Σ FrameOp::Instances.len == instances.len()`、每个 `FrameOp::Geometry(i)` 的 `i < geometry.len()`、每个 `ClipChain.parent` 的下标 < 自身下标 |
+| 原因 | `InstanceBuffer` 是 crate 私有（P02 §13.2），P06 没有 GPU 上传路径，`instances/clips/geometry/ops` 如果只写不读会触发 `dead_code`。probe（§2.2）实测 `debug_assert!` 内的字段读取**计入**使用（`cfg!(debug_assertions)` 是运行期常量，HIR 里两个分支都在）。这三条同时也是真实不变量：`FrameOp` 必须恰好覆盖全部实例与几何绘制，clip 链必须无环 |
+| 代价 | 每次 `encode` 一次 O(#ops + #clips) 的断言（debug 构建；release 下 `cfg!` 为 false，代价是一次可预测分支） |
+
+### S-66 `clip_key` 侧表：lane 复用的 clip 上下文守卫（审查 B1）
+
+| 项 | 内容 |
+|----|------|
+| 决策 | `NodeTree` 新增侧表 `clip_keys: Vec<Option<(u8, Option<PhysicalRect>)>>`；paint 对每个节点在 `REUSABLE` 短路**之前**比较 `(depth, covering)` 与当前递归携带的 clip 上下文，不等即重建并写回。`set_style` 不再需要"clip 变化 → 子树失效"的特殊逻辑 |
+| 原因 | `Style.clip` 只表达"裁不裁"，lane 前缀是**具体矩形**。窗口 resize / 分栏拖拽 / P13 的布局写入会改变 `Clip::Bounds` 容器的 padding box，而子节点的绝对盒可能逐位不变（`absolutize` 的 `changed` 为假）⇒ `REUSABLE` 保持置位；只比较开关会复用旧矩形，把子内容裁到错误区域（stale drawing）。侧表与 `layout_cache`/`text_slots` 同一生命周期纪律（槽位复用/卸载置 `None`） |
+| 代价 | 每节点 1 槽（`Option<(u8, Option<PhysicalRect>)>` ≈ 20 B，只对曾重建的节点非空）；每次 paint 每节点一次比较（O(1)） |
+| 验证 | 用例 `clip_key_mismatch_after_resize_or_reparent`（phase-06 §12-E5）：resize 改变滚动容器尺寸、重挂子树到 clip 节点下两种情况都必须重建且前缀矩形更新 |
+
+### 十一·待复核项（P06 新增）
+
+| 编号 | 内容 | 复核 Phase | 触发条件 / 处置 |
+|---|---|---|---|
+| V-48 | `Node` **1128 B**（余 24 B）：`paint`(8) + `content_offset`(8) 之后，任何再加内联字段的 Phase 都会顶破 1152 | P07 / P08 | 触发即改 `style: Box<Style>`（公开面不变，P03 V-30 的备选）或把字段移到 `NodeTree` 侧表（`debug_ids`/`removed_lanes` 是现成范例） |
+| V-49 | 每帧 O(n)：paint 递归全树 + 文本两 pass（P05 V-45）+ 每图元 `resolve`（P02 R7） | P13 / P18 | 触发（虚拟列表 / 基准热点）→ `DirtyFlags` 的 2 个保留位加 `TEXT` / `PAINT` 增量遍历；lane 内缓存 `LinearPremulRgba`（不改 128 B 契约） |
+| V-50 | `Canvas` 在每次 lane 重建时 `clone`（48 B + `Vec<Primitive>` 深拷贝） | P15 | 出现 > 1k 图元的画布 → `NodeKind::Canvas(Rc<Canvas>)`（additive，公开面只多一个构造器） |
+| V-51 | `opacity` 是**逐图元 alpha**（非 group opacity）；`Canvas` 内部图元不参与 | P15 | 需要整组淡出（模态遮罩/交叉淡入）→ 离屏合成或 `Canvas` 层 alpha，属渲染器能力 |
+| V-52 | damage 的**节点级** push 对隐藏/无图元节点也生效（过绘，安全侧） | P18 | I4 的 damage 比不达标 → 只在 `rebuilt && lane 非空` 时 push；前提是先证明"图元减少"仍被节点级 rect 覆盖 |
+
+**审查二轮新增**（PASS-WITH-FIXES：B1 空 clip、N1/N2/N3）：
+
+| 编号 | 裁决 / 偏差 | 理由 |
+|---|---|---|
+| F-67 | `Clip::Bounds` 的 padding box 为 0×0 时**仍入栈**（depth+1、covering 交空、子 lane 带空前缀） | 与 `hit_test` 的 clip 链同构；跳过会让子内容"越界可见"（审查 B1，阻塞项） |
+| S-67 | **无图元的节点不留 lane**（重建后 `release_lane` + 清 `Node.lanes`）；复用判据去掉 `lane_of().is_some()`，改靠 `REUSABLE` + `clip_key` | 空 lane 只占 `Scene::order`/内存；空窗口首帧必须能判空闲（审查 N3） |
+| V-53 | `FrameOp::Geometry.clip_rect` 用 `[u32; 4]`（f32 位模式）而非 `[f32; 4]` | `FrameOp` 需要 `Eq`（测试按 `matches!` 断言 + 去重），f32 无 `Eq`；P07 侧 `from_bits` 还原（成本可忽略） |
+
+### 实施记录（2026-11-12，P06 落地）
+
+| 项 | 实测 |
+|---|---|
+| 新增文件 | `src/paint/{instance,pass}.rs`、`src/render/damage.rs`、`src/test_support.rs` + `src/test_support/{app,input,probe,record,snapshot}.rs`、`tests/frame_record.rs` |
+| 修改文件 | `Cargo.toml`（`[features] test-support` + `[[test]] frame_record`）、`lib.rs`、`paint.rs`、`render.rs`、`paint/{style,color,geometry,scene}.rs`、`node/{tree,builder}.rs`、`window.rs`、`app.rs`、`math.rs` |
+| 测试 | 审查二轮修复后：`cargo test -p kytrix_gui` **418**；`--features test-support` **427 + 集成 5**；`--release` **409**；`--release --features test-support` **418 + 集成 5**（较 P05 基线 364 新增：默认 54 / feature 63 / 集成 5） |
+| 审查二轮 | B1（空 clip 入栈）+ N1/N2/N3 全部落地，逐条见上方「审查二轮新增」表与 phase-06 §17；回归用例 `zero_size_clip_still_pushes_and_empties_damage`、`transparent_gradient_emits_nothing`、`resize_forces_full_damage`、`text_glyphs_use_border_and_padding_offset`、`image_maps_to_atlas_quad` |
+| 门禁 | clippy（默认与 feature 的 `--all-targets -D warnings`）0；`fmt --check` 0；`doc --no-deps`（两配置）0；三平台 `cargo metadata` rc=0；`Cargo.lock` **零变化**；零 `unsafe`/`#[allow]`/`#[expect]`/`serde_json`/`#[path]`/`mod.rs`/`pub use`（`render.rs` 的 `pub(crate) use` 属 M-07 白名单） |
+| `Node` 尺寸 | 实测 **1128 B**（1112 + `paint` 8 + `content_offset` 8）≤ 1152（余 24 B） |
+| 实现期修正（相对 phase-06 计划） | ①`FrameScheduler::{state, skipped}` 与 `Window::frame_state` **不落**（无默认构建消费者；测试用 `FrameOutcome`/`frame_index` 断言，见 phase-06 §9.5）；②**空 `Canvas` 节点也 push `Primitive::Canvas`**（`bounds` 参与 damage，P02 §11.3），编码器展开后 0 实例；③`rebuilt` 只统计**产生像素或有 damage** 的节点（空 lane 不触发提交，否则空窗口首帧无法判空闲）；④`FrameStats` 去掉 `geometry_draws`（无消费者）；⑤`paint/pass.rs` 的 `run` 末尾补 `scene.set_order`（计划文字里隐含、实现必须显式）；⑥`FrameOp::Geometry.clip_rect` 用 f32 位模式（V-53） |
+| 遗留（已知、已登记） | ①集成文本用例依赖宿主字体（`tofu == 0` 断言，V-46）；②oracle 只比较 `primitives`/`quads` 序列（damage 必然不同，设计 §3.8 的范围）；③damage 的节点级 push 偏保守（V-52）；④`InstanceBuffer` 的 `as_bytes`/`instances()`/`clips()`/`geometry()` 等 P07 上传访问器**尚未提供**（无消费者）；⑤`Geometry` 的 transform 恒 `IDENTITY`（F-62） |

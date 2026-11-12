@@ -8,7 +8,13 @@
 
 use smol_str::SmolStr;
 
-use crate::paint::{color::Color, primitive::Border};
+use crate::{
+    math::Point,
+    paint::{
+        color::Color,
+        primitive::{Border, Gradient},
+    },
+};
 
 /// 静态样式结构（I17）。
 ///
@@ -39,6 +45,39 @@ pub enum Clip {
     None,
     /// 按本节点的 **padding box**（布局盒内缩 `border`）裁剪整棵子树。
     Bounds,
+}
+
+/// 静态绘制属性（`design/phase-06-paint-runtime.md` §6.1）。
+///
+/// 与 [`Style`] 分开存放（`Node.paint`）：`Style` 内联会让 `Node` 超过 1152 B 的预算（F-58），
+/// 且绘制属性与布局属性是两条独立的失效通道。动态覆盖走 [`StylePatch`]（`background`/`border`/
+/// `opacity`/`foreground`），合并规则是「patch 覆盖 spec」。
+///
+/// `border` 的宽度是**绘制**宽度（单值、沿 `bounds` 内侧展开）；它不参与布局 —— 需要为边框留空间时
+/// 请用 `Style.inner.border`（taffy 的布局边框），两者不一致时以应用的意图为准。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaintSpec {
+    /// 背景填充；`Color::TRANSPARENT`（默认）= 不画背景。
+    pub background: Color,
+    /// 内侧边框；`None` = 无边框。
+    pub border: Option<Border>,
+    /// 四角圆角（逻辑像素，CSS 顺序 `[tl, tr, br, bl]`）；编码期 clamp 到 `min(w, h) / 2`。
+    pub corner_radius: [f32; 4],
+    /// 解析阴影；`None` = 无阴影。
+    pub shadow: Option<ShadowSpec>,
+    /// 双色渐变；`None` = 实色。与 `border` 同时存在时拆成两个 `Quad`（P02 §8.5）。
+    pub gradient: Option<Gradient>,
+}
+
+/// 解析阴影的静态参数（`rect` 由布局盒给出，不进样式）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowSpec {
+    /// 偏移（逻辑像素）。
+    pub offset: Point,
+    /// 高斯模糊半径（逻辑像素，`>= 0`）。
+    pub blur: f32,
+    /// 阴影色。
+    pub color: Color,
 }
 
 /// 动态属性的增量补丁（§4.9.2 的「动态属性」列）：由 `bind_style` 每次求值**重算**，值语义。

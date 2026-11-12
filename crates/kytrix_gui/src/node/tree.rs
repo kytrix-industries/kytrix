@@ -17,7 +17,7 @@ use crate::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, hit_test},
     },
-    math::{Edges, Point, Rect, Size},
+    math::{Edges, PhysicalRect, Point, Rect, Size},
     node::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, affects_parent, depends_on_children},
@@ -28,7 +28,7 @@ use crate::{
         canvas::Canvas,
         geometry::GeometryId,
         scene::LaneId,
-        style::{Clip, Style, StylePatch},
+        style::{Clip, PaintSpec, Style, StylePatch},
     },
     text::{ShapedLine, TextContent},
 };
@@ -93,6 +93,8 @@ pub(crate) struct NodeSpec {
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
+    paint: Option<Box<PaintSpec>>,
+    debug_id: Option<SmolStr>,
 }
 
 impl NodeSpec {
@@ -109,7 +111,19 @@ impl NodeSpec {
             hit_shape: None,
             layout_override: None,
             bind_text: None,
+            paint: None,
+            debug_id: None,
         }
+    }
+
+    pub(crate) fn with_paint(mut self, paint: PaintSpec) -> Self {
+        self.paint = Some(Box::new(paint));
+        self
+    }
+
+    pub(crate) fn with_debug_id(mut self, id: impl Into<SmolStr>) -> Self {
+        self.debug_id = Some(id.into());
+        self
     }
 
     pub(crate) fn with_measure(mut self, measure: MeasureFn) -> Self {
@@ -160,6 +174,10 @@ pub struct Node {
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     /// 布局覆盖（root 逃生口）。
     layout_override: Option<LayoutOverride>,
+    /// 静态绘制属性（P06；`None` = 不画背景/边框/阴影/渐变）。
+    paint: Option<Box<PaintSpec>>,
+    /// 内容盒相对 border box 左上角的偏移（`border + padding`；P06 的文本绝对坐标基准）。
+    content_offset: Point,
     /// 动态文本闭包（`bind_text` 的求值入口；`None` = 静态文本）。
     text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
     /// 最近一次 shape 的内容尺寸（逻辑像素；`App::refresh_text` 判「尺寸变了没有」）。
@@ -201,6 +219,8 @@ impl fmt::Debug for Node {
             .field("measure", &self.measure.as_ref().map(|_| "<closure>"))
             .field("hit_shape", &self.hit_shape.as_ref().map(|_| "<closure>"))
             .field("layout_override", &self.layout_override)
+            .field("paint", &self.paint)
+            .field("content_offset", &self.content_offset)
             .field("text_bind", &self.text_bind.as_ref().map(|_| "<closure>"))
             .field("text_measured_size", &self.text_measured_size)
             .field("text_content_width", &self.text_content_width)
@@ -302,6 +322,19 @@ impl Node {
         self.layout_override
     }
 
+    /// 静态绘制属性（消费者：`paint/pass.rs`）。
+    #[must_use]
+    pub(crate) fn paint_spec(&self) -> Option<&PaintSpec> {
+        self.paint.as_deref()
+    }
+
+    /// 是否挂了动态闭包（`bind_style` / `bind_text`）。消费者：`Window::frame` 的 `debug_assert`
+    /// （无 App 通道的窗口帧不跑样式/文本 pass，挂绑定就会读到过期补丁）。
+    #[must_use]
+    pub(crate) fn has_bindings(&self) -> bool {
+        self.bind_style.is_some() || self.text_bind.is_some()
+    }
+
     /// 把 `prev_layout ∪ layout` 并入 damage（§9.4：位置变化时新旧都要重画）。
     fn accumulate_damage(&mut self) {
         self.damage = self
@@ -366,6 +399,12 @@ pub struct NodeTree {
     layout_cache: Vec<Option<taffy::Cache>>,
     /// 文本形状快照旁表（按 arena 槽位下标；只有文本节点非空，16 B/槽）。
     text_slots: Vec<Option<TextSlot>>,
+    /// 稳定调试 id 旁表（`NodeBuilder::id`；按 arena 槽位，槽位复用不继承）。
+    debug_ids: Vec<Option<SmolStr>>,
+    /// 每节点最近一次重建 lane 时的 clip 上下文（`(depth, covering)`；P06 §5.6 的 B1 守卫）。
+    clip_keys: Vec<Option<(u8, Option<PhysicalRect>)>>,
+    /// 卸载节点的待释放 lane（`Window::paint_frame` 消费后清空，容量保留）。
+    removed_lanes: Vec<LaneId>,
     /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
     hoisted: ahash::HashMap<NodeId, SmallVec<[NodeId; 2]>>,
     /// 布局运行代次（0 保留，首轮为 1）。
@@ -443,6 +482,8 @@ impl NodeTree {
             measure: None,
             hit_shape: None,
             layout_override: None,
+            paint: None,
+            content_offset: Point::ZERO,
             text_bind: None,
             text_measured_size: Size::ZERO,
             text_content_width: 0.0,
@@ -462,6 +503,9 @@ impl NodeTree {
             order: vec![root],
             layout_cache: vec![None],
             text_slots: vec![None],
+            debug_ids: vec![None],
+            clip_keys: vec![None],
+            removed_lanes: Vec::new(),
             hoisted: ahash::HashMap::default(),
             layout_epoch: 0,
             layout_stats: LayoutStats::default(),
@@ -547,12 +591,32 @@ impl NodeTree {
             p.children.retain(|existing| *existing != node);
         }
         let block = self.collect_subtree_ids(node);
+        // 旧像素必须重绘：被卸载子树的包围盒并入父的 damage（出流/覆盖节点可能超出父盒，
+        // 不能只靠 `mark_structure` 的父盒；P06 §5.5、不加 `LayoutBox.overflow` 的依据）。
+        let mut subtree_damage = Rect::default();
+        for id in &block {
+            if let Some(target) = self.arena.get(*id) {
+                subtree_damage = subtree_damage
+                    .union(target.damage)
+                    .union(target.layout.bounds);
+                self.removed_lanes.extend(target.lanes.iter().copied());
+            }
+        }
+        if let Some(p) = self.arena.get_mut(parent) {
+            p.damage = p.damage.union(subtree_damage);
+        }
         for id in block.iter().rev() {
             let index = id.index() as usize;
             if let Some(slot) = self.layout_cache.get_mut(index) {
                 *slot = None;
             }
             if let Some(slot) = self.text_slots.get_mut(index) {
+                *slot = None;
+            }
+            if let Some(slot) = self.debug_ids.get_mut(index) {
+                *slot = None;
+            }
+            if let Some(slot) = self.clip_keys.get_mut(index) {
                 *slot = None;
             }
             self.hoisted.remove(id);
@@ -587,6 +651,8 @@ impl NodeTree {
             hit_shape,
             layout_override,
             bind_text,
+            paint,
+            debug_id,
         } = spec;
         let id = self.arena.insert_with(move |id| Node {
             id,
@@ -599,6 +665,8 @@ impl NodeTree {
             measure,
             hit_shape,
             layout_override,
+            paint,
+            content_offset: Point::ZERO,
             text_bind: bind_text,
             text_measured_size: Size::ZERO,
             text_content_width: 0.0,
@@ -623,6 +691,15 @@ impl NodeTree {
             self.text_slots.resize_with(index + 1, || None);
         }
         self.text_slots[index] = None;
+        // 稳定调试 id 与 clip 上下文同生命周期：槽位复用不得继承上一代的值（P06 §5.6 / C4）。
+        if self.debug_ids.len() <= index {
+            self.debug_ids.resize_with(index + 1, || None);
+        }
+        self.debug_ids[index] = debug_id;
+        if self.clip_keys.len() <= index {
+            self.clip_keys.resize_with(index + 1, || None);
+        }
+        self.clip_keys[index] = None;
         self.hoisted.remove(&id);
         self.order_insert(parent, id);
         if let Some(node) = self.arena.get_mut(id) {
@@ -728,6 +805,111 @@ impl NodeTree {
                 true
             }
             None => false,
+        }
+    }
+
+    // ── P06：lane / clip 上下文 / 帧结算 ──────────────────────────────────────
+
+    /// 节点的绘制桶句柄（`P06` 每节点最多一条；消费者：`paint/pass.rs`）。
+    pub(crate) fn lane_of(&self, node: NodeId) -> Option<LaneId> {
+        self.arena
+            .get(node)
+            .and_then(|target| target.lanes.first().copied())
+    }
+
+    /// 记录节点的绘制桶（首个 lane；消费者：`paint/pass.rs`）。
+    pub(crate) fn set_lane(&mut self, node: NodeId, lane: LaneId) {
+        if let Some(target) = self.arena.get_mut(node) {
+            if target.lanes.is_empty() {
+                target.lanes.push(lane);
+            } else {
+                target.lanes[0] = lane;
+            }
+        }
+    }
+
+    /// 最近一次重建 lane 时的 clip 上下文 `(depth, covering)`（P06 §5.6 的 B1 守卫）。
+    pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
+        self.clip_keys.get(node.index() as usize).copied().flatten()
+    }
+
+    /// 写回本帧的 clip 上下文（消费者：`paint/pass.rs`）。
+    pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
+        let index = node.index() as usize;
+        if self.clip_keys.len() <= index {
+            self.clip_keys.resize_with(index + 1, || None);
+        }
+        self.clip_keys[index] = Some(key);
+    }
+
+    /// 清空 clip 上下文（隐藏子树用：再次显示时必然失配 ⇒ 重建，避免复用空 lane）。
+    pub(crate) fn clear_clip_key(&mut self, node: NodeId) {
+        let index = node.index() as usize;
+        if let Some(slot) = self.clip_keys.get_mut(index) {
+            *slot = None;
+        }
+    }
+
+    /// 标记节点可整桶复用（lane 内容与本帧的树/样式一致）。消费者：`paint/pass.rs`。
+    pub(crate) fn set_reusable(&mut self, node: NodeId) {
+        if let Some(target) = self.arena.get_mut(node) {
+            target.dirty.insert(DirtyFlags::REUSABLE);
+        }
+    }
+
+    /// 全树清 `REUSABLE`（消费者：`Window::force_full_repaint` 的 oracle 全量路径）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn clear_all_reusable(&mut self) {
+        for id in &self.order {
+            if let Some(target) = self.arena.get_mut(*id) {
+                target.dirty.remove(DirtyFlags::REUSABLE);
+            }
+        }
+    }
+
+    /// 取走卸载节点的待释放 lane（消费者：`Window::paint_frame`；**借用式**清空，容量保留）。
+    pub(crate) fn drain_removed_lanes(&mut self) -> std::vec::Drain<'_, LaneId> {
+        self.removed_lanes.drain(..)
+    }
+
+    /// 丢弃节点的 lane 句柄（不放回 `Scene`；重建路径在"无图元"时先 `Scene::release_lane` 再调它）。
+    pub(crate) fn clear_lane(&mut self, node: NodeId) {
+        if let Some(target) = self.arena.get_mut(node) {
+            target.lanes.clear();
+        }
+    }
+
+    /// 稳定调试 id（`NodeBuilder::id` 的只读面；消费者：`Probe`、诊断日志）。
+    ///
+    /// 同一棵树内**允许重复**：`Selector::Id` 取 `order()` 的第一个（确定性），不做唯一性检查。
+    #[must_use]
+    pub fn debug_id(&self, node: NodeId) -> Option<&str> {
+        self.debug_ids
+            .get(node.index() as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(SmolStr::as_str)
+    }
+
+    /// 内容盒相对 border box 左上角的偏移（消费者：`paint/pass.rs` 的文本绝对坐标）。
+    pub(crate) fn content_offset(&self, node: NodeId) -> Point {
+        self.arena
+            .get(node)
+            .map_or(Point::ZERO, |target| target.content_offset)
+    }
+
+    /// 帧结算（**唯一**的复位点，P06 §9.4 / F-59）：damage 归零、`prev_layout = layout`、
+    /// 置 `REUSABLE`、清本帧已消费的 `LAYOUT | PAINT`。
+    ///
+    /// **只在提交时调用**（`Window::commit_frame`）：drain 阶段的 `touch` 发生在帧前，帧初归零会吞掉
+    /// 已累积的 damage。帧内不得 `mark_*`（`&mut self` 已把写操作挡在帧外）。
+    pub(crate) fn settle_frame(&mut self) {
+        for id in &self.order {
+            if let Some(target) = self.arena.get_mut(*id) {
+                target.damage = Rect::default();
+                target.prev_layout = target.layout;
+                target.dirty.insert(DirtyFlags::REUSABLE);
+                target.dirty.remove(DirtyFlags::LAYOUT | DirtyFlags::PAINT);
+            }
         }
     }
 
@@ -1055,6 +1237,10 @@ impl NodeTree {
             target.local = local;
             target.local_border = border;
             target.text_content_width = content_width;
+            target.content_offset = Point::new(
+                layout.border.left + layout.padding.left,
+                layout.border.top + layout.padding.top,
+            );
             target.laid_out_epoch = epoch;
             // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
             target.dirty.remove(DirtyFlags::LAYOUT);
@@ -1184,6 +1370,9 @@ impl NodeTree {
                     bounds: abs,
                     border: target.local_border,
                 };
+                // P06 F-60：lane 内的图元持有**绝对** bounds；布局移动后即使没有 `mark_paint`，
+                // 旧 lane 也已过期（新位置的像素没人写）。
+                target.dirty.remove(DirtyFlags::REUSABLE);
             }
         } else if fresh {
             // 尺寸/位置没变但 border 宽可能变了（样式改 border）。
@@ -1440,6 +1629,12 @@ impl NodeTree {
             }
             None => false,
         }
+    }
+
+    /// 仅测试：直接写样式补丁（paint pass 的 visible/opacity/background 用例需要）。
+    #[cfg(test)]
+    pub(crate) fn set_style_patch_for_test(&mut self, node: NodeId, patch: StylePatch) -> bool {
+        self.set_style_patch(node, patch)
     }
 
     /// 仅测试：就地编辑静态样式。
@@ -1962,5 +2157,133 @@ mod tests {
         assert!(tree.take_bind_text(node).is_none(), "取走后为空");
         assert!(tree.put_bind_text(node, closure));
         assert!(tree.take_bind_text(node).is_some(), "放回后仍可取");
+    }
+
+    // ── P06：settle / lane / debug id / clip key ──
+
+    fn layout_box(bounds: Rect) -> LayoutBox {
+        LayoutBox {
+            bounds,
+            border: Edges::ZERO,
+        }
+    }
+
+    #[test]
+    fn settle_frame_resets_damage_bits_and_prev_layout() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let child = boxed(&mut tree, root);
+        let _ = tree.set_layout_for_test(
+            child,
+            layout_box(Rect::new(1.0, 2.0, 3.0, 4.0)),
+            LayoutBox::default(),
+        );
+        let _ = tree.mark_paint(child);
+        let _ = tree.mark_a11y(child);
+        let flags = tree.get(child).expect("存在").dirty();
+        assert!(flags.contains(DirtyFlags::PAINT));
+        assert!(!tree.get(child).expect("存在").damage().is_empty());
+
+        tree.settle_frame();
+
+        let node = tree.get(child).expect("存在");
+        assert!(node.damage().is_empty(), "damage 归零");
+        assert_eq!(node.prev_layout(), node.layout(), "prev_layout = layout");
+        assert!(node.dirty().contains(DirtyFlags::REUSABLE));
+        assert!(!node.dirty().contains(DirtyFlags::PAINT));
+        assert!(!node.dirty().contains(DirtyFlags::LAYOUT));
+        assert!(
+            node.dirty().contains(DirtyFlags::A11Y),
+            "A11Y 的消费者不在本帧（P11），结算必须保留"
+        );
+    }
+
+    #[test]
+    fn remove_unions_subtree_bounds_into_parent_damage() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = boxed(&mut tree, root);
+        let child = boxed(&mut tree, parent);
+        // 出流子节点在父盒之外。
+        let _ = tree.set_layout_for_test(
+            parent,
+            layout_box(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            LayoutBox::default(),
+        );
+        let outside = Rect::new(100.0, 100.0, 20.0, 20.0);
+        let _ = tree.set_layout_for_test(child, layout_box(outside), LayoutBox::default());
+        tree.settle_frame();
+
+        tree.remove(child).expect("卸载成功");
+
+        let damage = tree.get(parent).expect("存在").damage();
+        assert!(
+            damage.union(outside) == damage,
+            "父 damage 必须覆盖被卸载子树的旧盒：{damage:?}"
+        );
+    }
+
+    #[test]
+    fn remove_reports_released_lanes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = boxed(&mut tree, root);
+        let child = boxed(&mut tree, parent);
+        let lane = crate::paint::scene::LaneId::for_test(0, 1);
+        tree.set_lane(parent, crate::paint::scene::LaneId::for_test(1, 1));
+        tree.set_lane(child, lane);
+
+        tree.remove(parent).expect("卸载成功");
+
+        let removed: Vec<_> = tree.drain_removed_lanes().collect();
+        assert_eq!(removed.len(), 2, "父 + 子各一条 lane");
+        assert!(removed.contains(&lane));
+        assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
+    }
+
+    #[test]
+    fn debug_id_roundtrip_and_slot_reuse() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .id("label")
+            .build(&mut tree, root)
+            .expect("挂载成功");
+        assert_eq!(tree.debug_id(node), Some("label"));
+
+        tree.remove(node).expect("卸载");
+        let replacement = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("挂载成功");
+        assert_eq!(replacement.index(), node.index(), "槽位应复用");
+        assert_eq!(tree.debug_id(replacement), None, "新节点不得继承 debug id");
+    }
+
+    #[test]
+    fn clip_key_roundtrip_and_clear() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let child = boxed(&mut tree, root);
+        assert_eq!(tree.clip_key(child), None);
+        let covering = Rect::new(0.0, 0.0, 10.0, 10.0)
+            .to_physical_covering(crate::math::Scale::new(1.0).expect("scale"));
+        tree.set_clip_key(child, (1, Some(covering)));
+        assert_eq!(tree.clip_key(child), Some((1, Some(covering))));
+        tree.clear_clip_key(child);
+        assert_eq!(tree.clip_key(child), None);
+    }
+
+    #[test]
+    fn node_size_after_p06() {
+        let size = size_of::<Node>();
+        println!("size_of::<Node>() = {size}");
+        assert!(
+            size <= 1152,
+            "Node 超预算：{size} B（备选 style: Box<Style>）"
+        );
+        assert!(
+            size <= 1128,
+            "P06 的预算是 1128（paint 8 + content_offset 8）；超了要更新设计"
+        );
     }
 }
