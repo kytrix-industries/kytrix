@@ -8,6 +8,7 @@
 //! `kytrix_gui::test_support::app::TestApp` 这类模块限定形式。
 
 pub mod app;
+pub mod diagnostics;
 pub mod probe;
 pub mod record;
 pub mod snapshot;

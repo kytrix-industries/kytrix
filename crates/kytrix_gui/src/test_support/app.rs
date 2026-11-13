@@ -206,68 +206,68 @@ impl TestApp {
         }
     }
 
-    /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`，其余平台恒 `NoRenderer`。
+    /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
+    /// （`new_offscreen` 需要真实 `wl_surface`，见 `design/phase-12-macos-linux.md` F-137）。
+    ///
+    /// 两张图集页都会上传：字形页恒上传，图片页只在 `App::resources` 非空时上传（P13 §8.3）。
     ///
     /// # Errors
     /// [`SnapshotError::NoRenderer`]（本构建没有渲染器）或 [`SnapshotError::Gpu`]
     /// （设备 / 管线 / 渲染 / 读回失败）。
     pub fn snapshot(&self, case: SnapshotCase) -> Result<SnapshotImage, SnapshotError> {
         debug_assert!(case.scale.factor() > 0.0, "snapshot scale must be positive");
-        #[cfg(windows)]
-        {
-            let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
-                detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
-            })?;
-            let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
-                .to_physical_covering(case.scale);
-            let size = (
-                surface.width().max(1) as u32,
-                surface.height().max(1) as u32,
+        let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
+            detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
+        })?;
+        let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
+            .to_physical_covering(case.scale);
+        let size = (
+            surface.width().max(1) as u32,
+            surface.height().max(1) as u32,
+        );
+        // 快照的渲染器是临时建的：图集页尺寸必须与 App 的分配器一致，否则图集页传不进去。
+        let ((page_width, page_height), glyph_pixels) = self.app.glyph_page_pixels();
+        let mut renderer = Self::offscreen_renderer(size, page_width).map_err(gpu_error)?;
+        let mut rows = crate::render::DirtyRows::default();
+        rows.mark(0, u32::MAX);
+        renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &glyph_pixels, rows);
+        // 图片页：只有插过资源才上传（否则每个快照都白传 16 MiB）。
+        if !self.app.resources().is_empty() {
+            let ((image_width, image_height), image_pixels) = self.app.resource_page_pixels();
+            debug_assert_eq!(
+                (image_width, image_height),
+                (page_width, page_height),
+                "字形页与图片页必须同尺寸（渲染器只有一个 page 参数）"
             );
-            // 快照的渲染器是临时建的：图集页尺寸必须与 App 的分配器一致，否则字形页传不进去。
-            let ((page_width, _page_height), pixels) = self.app.glyph_page_pixels();
-            let mut renderer =
-                crate::render::backend::Renderer::new_warp_offscreen_with_page(size, page_width)
-                    .map_err(gpu_error)?;
             let mut rows = crate::render::DirtyRows::default();
             rows.mark(0, u32::MAX);
-            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
-            let image = renderer
-                .render_snapshot(window.instance_buffer())
-                .map_err(gpu_error)?;
-            Ok(SnapshotImage {
-                width: image.width,
-                height: image.height,
-                rgba8: image.rgba8,
-            })
+            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Image, image_pixels, rows);
         }
-        #[cfg(not(windows))]
-        {
-            let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
-                detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
-            })?;
-            let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
-                .to_physical_covering(case.scale);
-            let size = (
-                surface.width().max(1) as u32,
-                surface.height().max(1) as u32,
-            );
-            let ((page_width, _page_height), pixels) = self.app.glyph_page_pixels();
-            let mut renderer =
-                crate::render::backend::Renderer::new_offscreen_with_page(size, page_width)
-                    .map_err(gpu_error)?;
-            let mut rows = crate::render::DirtyRows::default();
-            rows.mark(0, u32::MAX);
-            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
-            let image = renderer
-                .render_snapshot(window.instance_buffer())
-                .map_err(gpu_error)?;
-            Ok(SnapshotImage {
-                width: image.width,
-                height: image.height,
-                rgba8: image.rgba8,
-            })
-        }
+        let image = renderer
+            .render_snapshot(window.instance_buffer())
+            .map_err(gpu_error)?;
+        Ok(SnapshotImage {
+            width: image.width,
+            height: image.height,
+            rgba8: image.rgba8,
+        })
+    }
+
+    /// 离屏渲染器（Windows：WARP；macOS：真实 Metal；Linux：构造期返回 `UnsupportedGpu`）。
+    #[cfg(windows)]
+    fn offscreen_renderer(
+        size: (u32, u32),
+        page: u32,
+    ) -> Result<crate::render::backend::Renderer, EngineError> {
+        crate::render::backend::Renderer::new_warp_offscreen_with_page(size, page)
+    }
+
+    #[cfg(not(windows))]
+    fn offscreen_renderer(
+        size: (u32, u32),
+        page: u32,
+    ) -> Result<crate::render::backend::Renderer, EngineError> {
+        crate::render::backend::Renderer::new_offscreen_with_page(size, page)
     }
 
     /// 单窗口借用视图（多窗口驱动的入口）。
@@ -324,6 +324,8 @@ impl TestWindow<'_> {
 #[cfg(test)]
 mod tests {
     use super::TestApp;
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    use crate::test_support::snapshot::SnapshotError;
     use crate::{
         math::{Point, Rect, Scale},
         node::builder::NodeBuilder,
@@ -477,10 +479,13 @@ mod tests {
         assert!(app.oracle_diff().is_none());
     }
 
+    /// 快照在各平台的**类型化**结果（S-124：mac 真读回、Linux 恒 `Gpu`、Windows WARP 真渲染）。
     #[test]
-    fn snapshot_without_gpu_is_a_typed_result() {
+    fn snapshot_result_is_typed_per_platform() {
         let app = TestApp::new();
         let result = app.snapshot(SnapshotCase {
+            scene: crate::test_support::snapshot::SnapshotScene::Shapes,
+            theme: crate::test_support::snapshot::SnapshotTheme::Light,
             size: crate::math::Size::new(64.0, 64.0),
             scale: Scale::new(1.0).expect("scale"),
         });
@@ -492,12 +497,28 @@ mod tests {
             assert_eq!(image.rgba8.len(), 64 * 64 * 4);
             assert!(image.rgba8.iter().all(|byte| *byte == 0));
         }
-        #[cfg(not(windows))]
-        assert_eq!(result, Err(SnapshotError::NoRenderer));
+        #[cfg(target_os = "macos")]
+        {
+            // macOS：真实 Metal 离屏渲染（F-137：`new_offscreen` 可用，`Readback` 真实读回）。
+            let image = result.expect("Metal offscreen snapshot");
+            assert_eq!((image.width, image.height), (64, 64));
+            assert_eq!(image.rgba8.len(), 64 * 64 * 4);
+        }
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        {
+            // Linux：`new_offscreen` 需要真实 `wl_surface`，构造期就失败（F-137）。
+            assert!(
+                matches!(result, Err(SnapshotError::Gpu { .. })),
+                "{result:?}"
+            );
+        }
     }
 
     /// **文本像素级断言**（V-64 的回归面）：黑底白字，离屏读回后必须真有亮像素，
     /// 且覆盖率既不是 0 也不是整屏。只看 `GlyphRun` 实例/UV 字段抓不到上传或采样的错位。
+    ///
+    /// 仅 Windows（WARP）：这是字形页上传/采样的回归面，宿主无关的断言在 `frame_record` 里。
+    #[cfg(windows)]
     #[test]
     fn rendered_text_produces_visible_glyph_pixels() {
         let _guard = crate::render::windows::device::gpu_test_lock();
@@ -537,6 +558,8 @@ mod tests {
 
         let image = app
             .snapshot(SnapshotCase {
+                scene: crate::test_support::snapshot::SnapshotScene::Shapes,
+                theme: crate::test_support::snapshot::SnapshotTheme::Light,
                 size: crate::math::Size::new(200.0, 60.0),
                 scale: Scale::ONE,
             })

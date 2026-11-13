@@ -21,7 +21,7 @@ pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-pub(crate) use atlas::{Allocation, AtlasAllocator, AtlasSet, DirtyRows};
+pub(crate) use atlas::{Allocation, AtlasAllocator, DirtyRows};
 #[cfg(target_os = "linux")]
 pub(crate) use linux as backend;
 #[cfg(target_os = "macos")]

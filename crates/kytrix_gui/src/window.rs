@@ -195,6 +195,13 @@ pub struct Window {
     resolver: ColorResolver,
     /// GPU 渲染器（`None` = headless，I7 的默认；P09 的窗口层负责 attach 原生窗口）。
     renderer: Option<Renderer>,
+    /// 该窗口的渲染器是否已经收到过**完整**的字形图集页（新渲染器 ⇒ `false`）。
+    ///
+    /// 图集页是进程级共享数据，但纹理是每窗口一份（`AtlasTextures`），因此必须逐窗口记账：
+    /// 第一次（或渲染器重建后）必须整页上传，之后才允许按脏行增量（P13 §8.2 / 评审阻塞 ②）。
+    glyph_page_received: bool,
+    /// 同上，图片图集页。
+    image_page_received: bool,
     /// 本帧的分段计时（容量跨帧复用）。
     timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
@@ -233,6 +240,8 @@ impl Window {
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver::new(Interpolation::default()),
             renderer: None,
+            glyph_page_received: false,
+            image_page_received: false,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -478,14 +487,35 @@ impl Window {
         self.instance_buffer().as_bytes()
     }
 
-    /// 是否已有 GPU 渲染器（`App::upload_glyph_page` 的判据）。
+    /// 是否已有 GPU 渲染器（`App::upload_atlas_pages` 的判据）。
     pub(crate) fn has_renderer(&self) -> bool {
         self.renderer.is_some()
     }
 
+    /// 该窗口的渲染器是否已收到完整字形图集页。
+    pub(crate) fn glyph_page_received(&self) -> bool {
+        self.glyph_page_received
+    }
+
+    /// 该窗口的渲染器是否已收到完整图片图集页。
+    pub(crate) fn image_page_received(&self) -> bool {
+        self.image_page_received
+    }
+
+    /// 记账：字形页已整页上传到本窗口的渲染器。
+    pub(crate) fn mark_glyph_page_received(&mut self) {
+        self.glyph_page_received = true;
+    }
+
+    /// 记账：图片页已整页上传到本窗口的渲染器。
+    pub(crate) fn mark_image_page_received(&mut self) {
+        self.image_page_received = true;
+    }
+
     /// 把一页图集像素交给渲染器（下一次 `submit` 上传；无渲染器时丢弃）。
     ///
-    /// 消费者：`App::frame` 的字形页上传（P09 整页；增量属 P15）。
+    /// 消费者：`App::upload_atlas_pages`（P13：**广播**给所有窗口的渲染器；
+    /// 图集页是进程级共享数据，纹理是每窗口一份）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: crate::paint::atlas::AtlasKind,
@@ -498,8 +528,12 @@ impl Window {
     }
 
     /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
+    ///
+    /// 换渲染器 = 换一套空纹理（`AtlasTextures`），所以两张图集页都要重新整页上传。
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         self.renderer = Some(renderer);
+        self.glyph_page_received = false;
+        self.image_page_received = false;
     }
 
     /// 启用**离屏** GPU 渲染（headless 行为不变：不调用就恒为 `None`）。
@@ -516,6 +550,8 @@ impl Window {
         }
         let surface = self.physical_surface();
         self.renderer = Some(Renderer::new_offscreen(surface)?);
+        self.glyph_page_received = false;
+        self.image_page_received = false;
         Ok(())
     }
 

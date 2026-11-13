@@ -6,14 +6,30 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-# 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle）。**不进发布物**（I7 / §6.6）；
-# 集成测试 `tests/frame_record.rs` 通过 `required-features` 依赖它。
+# 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle/诊断）。**不进发布物**（I7 / §6.6）；
+# 集成测试 `tests/frame_record.rs` 与 `tests/snapshot.rs` 通过 `required-features` 依赖它。
 test-support = []
 
 [[test]]
 name = "frame_record"
 path = "tests/frame_record.rs"
 required-features = ["test-support"]
+
+# P13：像素 golden（Windows WARP；mac/Linux 由 `skip_reason()` 跳过）。
+[[test]]
+name = "snapshot"
+path = "tests/snapshot.rs"
+required-features = ["test-support"]
+
+# P13：L4 基准（criterion 自带 harness）。
+[[bench]]
+name = "perf"
+path = "benches/perf.rs"
+harness = false
+
+[dev-dependencies]
+# P13：只测 CPU 侧 pass。workspace 已关掉 criterion 的默认 features（无 plotters/rayon，S-130）。
+criterion = { workspace = true }
 
 [dependencies]
 # P01 实际使用
@@ -41,6 +57,9 @@ taffy = { workspace = true }
 
 # P09 渲染共享层
 etagere = { workspace = true }
+
+# P13 资源解码（workspace 已钉 0.25.10；六个 codec feature 已在 base_ui 的依赖图内）
+image = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

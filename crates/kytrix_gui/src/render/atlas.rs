@@ -26,10 +26,10 @@ pub(crate) struct AtlasAllocator {
     kind: AtlasKind,
     page: (u32, u32),
     allocator: EtagereAllocator,
-    /// 槽位表（仅测试构建：v1 没有逐 tile 逐出，生产路径只靠 `clear()` 换代）。
-    #[cfg(test)]
+    /// 槽位表：`deallocate` 的幂等守卫（`etagere` 对陈旧 `AllocId` 会 `assert!` panic）。
+    ///
+    /// P13 起是**生产**字段：`ResourceCache::unload` 需要真正逐块释放（F-147）。
     tiles: Vec<Option<AllocId>>,
-    #[cfg(test)]
     free: Vec<usize>,
     generation: u32,
     dirty: DirtyRows,
@@ -59,9 +59,7 @@ impl AtlasAllocator {
             kind,
             page,
             allocator: EtagereAllocator::new(size2(page.0 as i32, page.1 as i32)),
-            #[cfg(test)]
             tiles: Vec::with_capacity(64),
-            #[cfg(test)]
             free: Vec::new(),
             generation: 1,
             dirty: DirtyRows::default(),
@@ -133,13 +131,10 @@ impl AtlasAllocator {
             rectangle.max.y,
         );
         debug_assert_eq!(tile.atlas, self.kind(), "tile must carry its atlas kind");
-        #[cfg(test)]
-        {
-            if let Some(index) = self.free.pop() {
-                self.tiles[index] = Some(allocation.id);
-            } else {
-                self.tiles.push(Some(allocation.id));
-            }
+        if let Some(index) = self.free.pop() {
+            self.tiles[index] = Some(allocation.id);
+        } else {
+            self.tiles.push(Some(allocation.id));
         }
         self.mark_written(content_rect);
         Some(Allocation {
@@ -151,7 +146,8 @@ impl AtlasAllocator {
     }
 
     /// 幂等释放：`id` 不在槽位表里就忽略（etagere 对陈旧 id 会 panic）。
-    #[cfg(test)]
+    ///
+    /// P13 起是生产代码（`ResourceCache::unload` 的唯一调用点）；不换代，因此在用 tile 的 UV 不受影响。
     pub(crate) fn deallocate(&mut self, id: AllocId) {
         let Some(index) = self
             .tiles
@@ -168,11 +164,8 @@ impl AtlasAllocator {
     /// 清空并 `generation += 1`（DPI 变化 / 字体换代 / 容量逃逸）。
     pub(crate) fn clear(&mut self) {
         self.allocator = EtagereAllocator::new(size2(self.page.0 as i32, self.page.1 as i32));
-        #[cfg(test)]
-        {
-            self.tiles.clear();
-            self.free.clear();
-        }
+        self.tiles.clear();
+        self.free.clear();
         self.dirty.clear();
         self.generation = self.generation.wrapping_add(1);
     }
@@ -196,58 +189,6 @@ const fn page_of(kind: AtlasKind) -> (u32, u32) {
     match kind {
         AtlasKind::Glyph => GLYPH_PAGE,
         AtlasKind::Image => IMAGE_PAGE,
-    }
-}
-
-/// 两类图集的集合（P02 §5.6：字形与图片分图集；v1 每类单页）。
-pub(crate) struct AtlasSet {
-    glyph: AtlasAllocator,
-    image: AtlasAllocator,
-}
-
-impl AtlasSet {
-    pub(crate) fn new() -> Self {
-        Self {
-            glyph: AtlasAllocator::new(AtlasKind::Glyph),
-            image: AtlasAllocator::new(AtlasKind::Image),
-        }
-    }
-
-    pub(crate) fn glyph(&self) -> &AtlasAllocator {
-        &self.glyph
-    }
-
-    pub(crate) fn glyph_mut(&mut self) -> &mut AtlasAllocator {
-        &mut self.glyph
-    }
-
-    /// 图片页（P15 的写入目标）。
-    pub(crate) fn image(&mut self) -> &mut AtlasAllocator {
-        &mut self.image
-    }
-
-    /// 两页都换代（DPI 变化 / 字体切换 / 容量逃逸）。
-    pub(crate) fn clear_all(&mut self) {
-        self.glyph.clear();
-        self.image().clear();
-    }
-
-    /// 仅测试：图片页尺寸。
-    #[cfg(test)]
-    pub(crate) fn image_page_for_test(&self) -> (u32, u32) {
-        self.image.page()
-    }
-
-    /// 仅测试：图片页代际。
-    #[cfg(test)]
-    pub(crate) fn image_generation_for_test(&self) -> u32 {
-        self.image.generation()
-    }
-}
-
-impl Default for AtlasSet {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -309,7 +250,7 @@ impl DirtyRows {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasAllocator, AtlasSet, DirtyRows, GLYPH_PAGE};
+    use super::{AtlasAllocator, DirtyRows, GLYPH_PAGE, IMAGE_PAGE};
     use crate::paint::atlas::AtlasKind;
 
     fn allocator() -> AtlasAllocator {
@@ -361,10 +302,17 @@ mod tests {
     #[test]
     fn default_page_sizes_match_paint_contract() {
         assert_eq!(GLYPH_PAGE, (2048, 2048));
-        let set = AtlasSet::new();
-        assert_eq!(set.glyph().page(), (2048, 2048));
-        assert_eq!(set.glyph().kind(), AtlasKind::Glyph);
-        assert_eq!(set.image_page_for_test(), (2048, 2048));
+        assert_eq!(
+            IMAGE_PAGE,
+            (2048, 2048),
+            "图片页尺寸是 ResourceCache 的契约"
+        );
+        let glyph = AtlasAllocator::new(AtlasKind::Glyph);
+        assert_eq!(glyph.page(), GLYPH_PAGE);
+        assert_eq!(glyph.kind(), AtlasKind::Glyph);
+        let image = AtlasAllocator::new(AtlasKind::Image);
+        assert_eq!(image.page(), IMAGE_PAGE);
+        assert_eq!(image.kind(), AtlasKind::Image);
     }
 
     #[test]
@@ -468,16 +416,11 @@ mod tests {
     }
 
     #[test]
-    fn atlas_set_keeps_kinds_independent_and_clears_together() {
-        let mut set = AtlasSet::new();
-        let glyph_before = set.glyph_mut().generation();
-        let image_before = set.image_generation_for_test();
-        let glyph_tile = set.glyph_mut().allocate((8, 8)).expect("fits").tile;
-
-        set.clear_all();
-
-        assert_eq!(set.glyph_mut().generation(), glyph_before + 1);
-        assert_eq!(set.image_generation_for_test(), image_before + 1);
-        assert!(glyph_tile.is_stale(set.glyph_mut().generation()));
+    fn deallocate_is_available_outside_tests() {
+        // F-147 的回归面：`deallocate` 必须是生产代码（`ResourceCache::unload` 的唯一调用点）。
+        let mut atlas = allocator();
+        let allocation = atlas.allocate((8, 8)).expect("fits");
+        atlas.deallocate(allocation.id);
+        assert!(atlas.allocate((8, 8)).is_some(), "释放后容量必须回来");
     }
 }

@@ -82,7 +82,9 @@ comrak = { version = "0.59.0", default-features = false }
 const-hex = "1.19.3"
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
-criterion = "0.8.2"
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
 dicebear-core = "10.7.0"
 dicebear-styles = { version = "10.6.0", default-features = false }
 dirs = "7.0.0"

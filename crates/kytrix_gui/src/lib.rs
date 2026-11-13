@@ -12,6 +12,7 @@ pub mod layout;
 pub mod math;
 pub mod node;
 pub mod paint;
+pub mod resources;
 pub mod text;
 pub mod window;
 

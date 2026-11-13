@@ -51,6 +51,12 @@ impl DependencyGraph {
         self.dependents.get_mut(&id)
     }
 
+    /// 只读反查表（消费者：`test-support` 的 `diagnostics::dependency_dump`；P13）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn dependents(&self) -> &ahash::HashMap<SignalId, OwnerSet> {
+        &self.dependents
+    }
+
     /// **每帧替换**依赖：`old` 有新无 → 退订；`new` 有旧无 → 订阅（去重）。
     pub(crate) fn replace_deps(&mut self, owner: Owner, old: &[SignalId], new: &[SignalId]) {
         for id in old {

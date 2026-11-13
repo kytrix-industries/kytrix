@@ -2127,5 +2127,120 @@
 | **V-93** | Linux 输入同理：`wl_pointer` 的 `axis.value`（1/120 行）取反后传给 `delta_y`；没有 `wp_pointer_constraints` / `wp_relative_pointer`（拖拽出窗口依赖 compositor 的隐式抓取）；`set_cursor` 未接（Wayland 需要 `wl_cursor_shape` 或自绘，属 P13 窗口装饰的一部分） |
 | **V-94** | `InFlightRing::reserve` 至今无生产消费者（只在共享层测试里）；P12 没有动它，`test-support` 交叉 target 上会报 1 项 `never used`（既有问题，不在 P12 范围） |
 
+## 十八、P13 · 资源 + 像素 golden + bench + 诊断（2026-11-13）
+
+> 完整设计见 `design/phase-13-resources-snapshot.md`。本阶段**同时**收口上游排期的 **P15（资源）** 与 **P18（像素快照 / bench）**，
+> 外加主设计 §9.1 的四个诊断导出。本节只记**与上游文档不同的事实**与实现纪律；一～十七 未改动。
+>
+> **编号说明**：F-127 / V-87 / V-93 里的「P13」是旧排期的**窗口装饰 / 光标形状**阶段，与本阶段无关（本阶段不实现窗口装饰）。
+>
+> **事实基线**：`image 0.25.10` 与 `criterion 0.8.2` 的真实源码 + 两个离线 probe
+> （`%TEMP%\kg-p13-probe`、`%TEMP%\kg-p13-bench-probe`）；已落地代码 `paint/atlas.rs`、`render/atlas.rs`、
+> `text/atlas.rs`、`test_support/{snapshot,app,record}.rs`、`app.rs`、`error.rs`（逐条行号见 phase-13 §2.1）。
+> 基线门禁实测：`cargo test -p kytrix_gui --lib -- --list` = **590**，`--features test-support` = **622**，集成 `frame_record` = **6**。
+
+### 18.1 设计期条目（F-138 … F-148、S-128 … S-131、V-95 … V-101）
+
+| 编号 | 内容 |
+|---|---|
+| **F-138** | **`EngineError::ResourceDecode` 的 payload 改为强类型**：P01 §6.2.2 #16 冻结的 `{ resource: ResourceId, detail: SmolStr }` → `{ cause: DecodeCause }`，`DecodeCause = UnsupportedFormat { format } \| Corrupt { format, detail } \| TooLarge { width, height, limit } \| Capacity { width, height, page }`。理由：①`detail` 无法 match，AGENTS §3 要求调用方按类型决定「占位图 / 提示 / 卸载重试」；②解码发生在 `ResourceId` 铸出**之前**，冻结表里的 `resource` 只能填陈旧句柄。P01 历史正文不改，本条为 payload 修订记录 |
+| **F-139** | **远程图片磁盘缓存 v1 不做**（主设计 §8.5 的「含远程图片的磁盘缓存」降级为应用层）：`ResourceCache` 只收 `&[u8]`。理由：v1 无消费者（远程头像属 M6 的 `base_ui`/`download_provider`）；引擎主线程禁阻塞 IO（`clippy.toml` 禁 `spawn_blocking`）；缓存键（URL/ETag/TTL/尺寸）未定义，仓促定会造出第二套真值。后续形态是应用层 `base_ui::assets::disk` 命中后仍调 `ResourceCache::insert` ⇒ **纯增量、无重构** |
+| **F-140** | **图片图集的容量逃逸是强类型错误，不是 `clear + retry`**：P02 §10.6 的「`clear()` + 重试 → `AtlasExhausted`」只服务字形路径。图片 tile 只在应用**建树**时解析一次（`Canvas` 是值语义快照，`paint/canvas.rs:33`），清页会让应用手里的 UV 全部悬垂（被复用后画出别人的图）⇒ 溢出直接 `DecodeCause::Capacity`，不 clear、不换代 |
+| **F-141** | **图片图集按 `contract.md` §8 实现「线性预乘 → sRGB 重编码」的 BGRA8**：`srgb_decode(rgb) * alpha` → `srgb_encode` → 8 bit（alpha 直存）。事实核对：已落地的 `render/shaders/contract.md:190-193` 冻结的就是这条（「纹素是 linear-premultiplied 后 sRGB 编码」「上传方职责：P15 必须 linear 空间预乘 → sRGB 编码」），而 phase-02 §10.3 写的「直通 alpha」与之冲突 ⇒ **以 `contract.md` 为准，P02 该句作废**。理由：①直通 alpha 在预乘混合下会亮边，且要改三套 shader；②编码域预乘 probe 实测最大差 **60/255**（中灰 128 @ a=128：64 vs 93）；③本方案 shader 零改动，8 bit 往返最坏线性误差 **0.0097**。实现用 64 KiB `OnceLock` LUT（`(color<<8)\|alpha`） |
+| **F-142** | **只接受 PNG / JPEG / WebP**，且 `image::Limits` 用 `default()` + 字段赋值：`guess_format` 与 feature 无关（未开 `gif` feature 也返回 `Ok(Gif)` ⇒ 必须**策略性**拒绝，不能靠 feature 裁剪）；`Limits` 是 `#[non_exhaustive]`（结构体字面量 = `E0639`）；16-bit PNG 经 `to_rgba8()` 静默降位（0/62/125/187 实测），资产契约写明「字节必须已是 sRGB，引擎不做 ICC/gAMA」 |
+| **F-143** | **golden 字节 = 读回字节原样（预乘 sRGB RGBA8）**，不反预乘（反预乘要除 alpha，低 alpha 放大误差、破坏逐字节可复现）；PNG 无损往返实测逐字节一致。v1 只建 `tests/golden/warp/`，`lavapipe/` 与 `metal-real/` 在对应 job 真正产出 golden 时再建（空目录是噪音）；golden 在普通看图器里偏暗，`tests/golden/README.md` 写明 |
+| **F-144** | **文字 / emoji 像素 golden 不进 v1**（主设计 §6.5 的「字形（拉丁/CJK/emoji）」维度暂缺）：引擎不随包字体（D17 / Fontique 系统字体），字形像素随宿主机字体文件/版本变化 ⇒ golden 跨机必红。替代覆盖：`rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）+ L2 的 `GlyphRun` 字段断言 + P06 的塑形语料。启用前提是打包固定字体资产（`FontStack` 指向资产字体，契约变更），登记 V-96 |
+| **F-145** | **`FrameDump` 是「可 diff 的结构化记录」，不是已实现的 replay**（主设计 §9.1 写「可重放记录」）：v1 导出 `InstanceDump` / `OpDump` / `ClipDump` / damage 的强类型 DTO + 稳定文本，**没有** `--replay` 工具，也没有「dump + atlas → 重放」的入口。真正的 replay 要封装 atlas 页内容 + shader 产物 + 平台 renderer，属独立工具 |
+| **F-146** | **诊断挂既有 `test-support` feature，不新增 `diagnostics` feature**：四个 dump 的输入（`FrameRecord` / `InstanceBuffer` / `A11yTreeSnapshot` / `FrameStats`）本身只在 `test-support` 存在，两个 feature 会产生非法组合。发布物自查：`findstr /M /C:"FrameDump" target\release\kytrix_gui_demo.exe` 必须无输出 |
+| **F-147** | **`AtlasAllocator::deallocate` 生产化；`ResourceCache` 不做自动 LRU**（主设计 §9.3 的「图集 `etagere` + LRU + `generation`」在 v1 只保留前两者）：`deallocate` 的幂等槽位表从 `#[cfg(test)]` 提升为生产代码（`render/atlas.rs:29-33,154-166`）；自动 LRU 逐出的前置条件是 ①`bind_canvas` / 画布可重建契约 ②换代后全量 PAINT 与应用重建的协调 ③逐 tile 引用计数——三者都缺，硬做会得到静默错图。淘汰策略归应用层（D15），引擎只提供 `unload` 机制 |
+| **F-148** | **`AtlasSet` 删除**：字形分配器直接是 `App::atlas: AtlasAllocator`，图片分配器 + `Page` 移入 `ResourceCache`。原因：①`AtlasSet::clear_all()` 在 **DPI 换代**时把图片页也清空（`app.rs:2281-2284`）= 悬垂 UV；②图片 tile 与 scale 无关，本就不该随 DPI 换代；③只剩一个分配器时 `AtlasSet` 是空壳包装（AGENTS 1.2） |
+| **S-128** | **`tests/` 与 `benches/` 的 target 形态（M-09 落地细则）**：`tests/snapshot.rs` 用 `required-features = ["test-support"]`；`benches/perf.rs` 用 `[[bench]] harness = false` 且**无** `required-features`（只用公开 API，`cargo bench --no-run` 在默认 features 下可编译）；`tests/golden/` 只是数据目录；不建 `tests/perf.rs` |
+| **S-129** | **`SnapshotCase` 的 `scene` / `theme` 不参与渲染**：`TestApp::snapshot` 的语义仍是 P08 §7.7 的「读最近一次提交的实例缓冲」，只消费 `size` / `scale`；`scene` / `theme` 的消费者是 `snapshot::mount` 与 `golden_name` / `golden_path`（两个真实消费者，不是死字段） |
+| **S-130** | **`criterion` 关闭默认 features（写在 workspace 根）**：`criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }` ⇒ 去 `plotters` / `rayon`（probe：`cargo tree` 无二者，bench 可编译可跑）。**实现期修正**：Cargo 不允许在继承 workspace 依赖时覆盖 `default-features`（`criterion = { workspace = true, default-features = false }` 直接报错），因此这条配置必须落在根 `Cargo.toml`，子 crate 只 `criterion = { workspace = true }`。`criterion::black_box` 在 0.8 已 `#[deprecated]` ⇒ benches 一律 `std::hint::black_box`。`Cargo.lock` 只有 `kytrix_gui` 依赖表里新增 `"criterion"` / `"image"` 两行边（无新包、无版本变化） |
+| **S-131** | **集成测试的 GPU 串行锁**：`test_support::snapshot::gpu_guard()`（`test-support` 构建）与 lib 单测的 `render/windows/device.rs::gpu_test_lock()`（`#[cfg(test)]` 保持）同构、同语义（进程级 `Mutex` + poison 恢复），但**不共享同一个静态**（跨二进制不共享地址空间）。理由：多个 WARP 设备并行会互相拖垮（本机实测 device removed） |
+| **V-95** | **golden 跨设备 / 软件 vs 真机差异未量化**：v1 只有 WARP golden。L3 任一处开始出 golden 时，用同一 case 跑 WARP 与真实 GPU，量化 max/avg/超容差像素，回填 `Tolerance::default()`（当前 `1 / 0`，按 D19 不冻结）与 `tests/golden/README.md` |
+| **V-96** | **文字 / emoji 像素无 golden**（F-144）：打包固定字体资产（拉丁/CJK/emoji）并让 `FontStack` 能指向资产字体后，**新增** `SnapshotScene::Glyphs` 变体并补 §6.5 的 emoji 维度 |
+| **V-97** | **`image` 解码 feature 的二进制体积增量未实测**：六个 codec 已在 `base_ui` 的依赖图内 ⇒ 引擎不新增 codec 代码，但 release 体积增量未测。发布体积预算复核（与 V-47 同批）时用 `cargo bloat`/安装包差分；超预算则改 workspace 的 `image` feature 列表（影响 `base_ui`，需单独立项） |
+| **V-98** | **图片页上传仍整页 `to_vec`**（P09 遗留，`render/windows/atlas.rs:101`）：脏行已按 `DirtyRows` 精确，但 `queue_upload` 每次都会复制整页（16 MiB）。多图/大图时若成热点，与 V-64 的字形增量上传一起改成「行跨度缓冲」 |
+| **V-99** | **低 alpha 的预乘 8 bit 量化误差**：probe 只量到 alpha ≥ 32（最坏线性误差 0.0097）。阴影贴图/淡出等低 alpha 图若出现色阶，评估 16-bit 图集（契约变更）或改走非图片路径 |
+| **V-100** | **每个 golden case 建两个 2048² WARP 纹理**（字形 4 MiB + 图片 16 MiB）：13 个 case 串行、单次运行目标 < 60 s。超时/内存吃紧时给 `App` 注入页尺寸（`SnapshotCase` 加 `page` 字段）或复用 renderer |
+| **V-101** | **编码域缩放的半透明 fringe 未验证**：`image::imageops::resize` 在 sRGB 编码域重采样（与浏览器一致），透明像素带色时可能出现暗边/亮边。`Image` golden case 会暴露明显问题；修法是「先预乘再缩放」或线性空间重采样（成本 ×3） |
+
+### 18.2 本阶段**不**改写的既有条目（易被误判为需要更新）
+
+| 条目 | 说明 |
+|---|---|
+| **F-11** | `usvg` 归 `base_ui` 的 build-dependency，引擎不声明。本阶段新增 `image` 依赖**不**改变该结论；门禁含 `cargo tree -p kytrix_gui \| findstr usvg` 必须无输出 |
+| **F-24** | `AtlasKind` / `AtlasTile` 在 `paint::atlas`，`resources` 只留 `ResourceId` / `ResourceCache`（本阶段再加 `ResourceImage` / `DecodeCause`）。P01 §3 的注释仍按「只加注记、不改历史正文」 |
+| **S-85** | 字形页在 P09 走整页上传（P15 再改增量）。本阶段**没有**改渲染器上传 API：图片页沿用「整页 `pixels` + 脏行」，首次整页（保证 padding 为 0）；增量属 V-98 |
+| **M-09** | `tests/` 与 `benches/` 的 target 形态；本阶段的 S-128 是其落地细则，不构成新决策 |
+| **V-22** | 公开项 `missing_docs` 债务不补齐、但**不许扩大**：本阶段新增的公开项必须有 rustdoc |
+| **V-14 / V-44** | 图集单页容量与 `clear + retry` 逃逸属字形路径；图片路径的策略差异见 F-140，不修改这两条 |
+
+### 18.3 门禁（实现期）
+
+| 项 | 期望 |
+|---|---|
+| 默认测试 | `590 → 636`（实测）；既有 590 项逐项不变 |
+| `--features test-support` | `622 → 691`（实测）；集成 `6 → 14`（`frame_record` 6 + `snapshot` 8） |
+| release | 682 项全绿（debug_assert 门控的 9 项在 release 下不跑，与既有口径一致） |
+| 像素 golden | `cargo test -p kytrix_gui --features test-support --test snapshot` 在 Windows WARP 上 13 个 case 全绿；mac/Linux 只出 skip 日志且 exit 0（依据 `skip_reason()` + F-137） |
+| bench | `cargo bench -p kytrix_gui --bench perf --no-run` 通过；数值**不**进门禁（D19） |
+| lint / 格式 / 文档 | `clippy --all-targets --all-features -D warnings` / `fmt --check` / `doc --no-deps` 零 warning |
+| 发布物 | `test_support::*` 零符号（`findstr` 自查）；`usvg` / `plotters` 不在 `-p kytrix_gui` 的依赖树 |
+| 依赖锁 | `git diff Cargo.lock` 只允许 `kytrix_gui` 依赖表里的 `"criterion"` / `"image"` 两行边（无新包、无版本变化）。实现备注：Cargo **不允许**在继承 workspace 依赖时覆盖 `default-features`，因此 `criterion` 的 `default-features = false` 写在 workspace 根声明里 |
 
 
+
+
+### 18.4 实施记录（2026-11-13，P13 落地）
+
+| 门禁 | 实测 |
+|---|---|
+| `cargo test -p kytrix_gui` | **636** passed（基线 590 + 46；1 ignored） |
+| `cargo test -p kytrix_gui --features test-support` | **691** lib + **6** `frame_record` + **8** `snapshot`（基线 622 + 69） |
+| `cargo test -p kytrix_gui --release --features test-support` | **682** lib + 14 集成（debug_assert 门控的 9 项不跑） |
+| `cargo test ... --test snapshot`（13 个 golden） | 全绿，**0.4 s**；`UPDATE_GOLDEN=1` 生成后同轮自检 `max=0 / over=0` |
+| `cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings` | **exit 0** |
+| `cargo +nightly fmt --check` / `cargo doc --no-deps` | exit 0 / 零 warning |
+| `cargo bench -p kytrix_gui --bench perf --no-run` | exit 0（未跑数值；`cargo tree` 无 `plotters`） |
+| `cargo check --target aarch64-apple-darwin`（`SKIP_SHADERS=1`） | exit 0 |
+| `cargo check --target x86_64-unknown-linux-gnu`（`SKIP_SHADERS=1` + stub `pkg-config`） | exit 0 |
+| 交叉 + `--features test-support` | exit 0；唯一 warning 是既有 **V-94**（`InFlightRing::reserve`，不在本阶段范围） |
+| 发布物 | `findstr` 查 `FrameDump` / `DependencyGraphDump` / `A11yTreeDump` / `DamageOverlay` / `SnapshotDiff` / `UPDATE_GOLDEN`：release demo **全无命中** |
+| `git diff Cargo.lock` | 仅 `kytrix_gui` 依赖表的 `"criterion"` / `"image"` 两行 |
+
+**实现期与本文档的差异（都不改语义，逐条登记）**：
+
+- **`ResourceImage` 增加 `id: ResourceId` 字段**：设计里 `insert` 只返回 `tile`/尺寸，但那样应用拿不到句柄 ⇒ `unload` 没有入口。加字段后「先插后卸」闭环，且 `ResourceImage` 仍是 `Copy`（24 → 32 B）。
+- **`GoldenError` 增加 `Frame { detail }`**：`TestApp::drain()` 的错误（`TextShape` / `AtlasExhausted`）需要与「GPU 失败」区分，否则只能塞进 `Snapshot` 变成语义谎言。
+- **golden 场景多一层 backdrop**：`shapes` / `shadow` / `gradient` / `clip` 也铺主题底色，让 golden 覆盖「背景填充 + 主题色」，而不是大片透明区（`colors` / `image` 本来就有）。
+- **`SnapshotScene::size()` 是公开方法**：case 尺寸由场景自报（`tests/snapshot.rs` 与 `capture` 共用），避免在测试里复制尺寸表。
+- **`App::resource_page_pixels` 的可见性收窄为 `#[cfg(feature = "test-support")]`**：生产路径用 `resources.page_pixels()`（`upload_image_page` 内部），只有 `TestApp::snapshot` 需要这个 crate 级转发。
+- **`test_support::snapshot::mount(app, scene, theme)`** 是自由函数（不是 `TestApp` 方法）：`impl TestApp` 只能有一个文件（`multiple_inherent_impl`），而场景构建属于 golden 层。
+- **demo 的 `SnapshotCase`** 用 `Shapes`/`Light` 作元数据（场景由 `build_into` 自己挂载），与 S-129 一致。
+- **`AtlasSet` 删除的连带改动**：`render/atlas.rs` 的 12 项测试里删 1（`AtlasSet` 的组合用例）、改写 1（`default_page_sizes` 改为断言 `GLYPH_PAGE`/`IMAGE_PAGE`）、加 1（`deallocate_is_available_outside_tests`）；`app.rs` 的 `atlas.clear_all()` / `atlas.glyph*()` 全部收成 `atlas.clear()` / `atlas`。
+
+### 18.5 评审修复（PASS-WITH-FIXES → 修复后 PASS）
+
+**阻塞 ①（`frame_dump` 在未 `drain()` 时 panic）**：`TestApp::frame_record()` 内部 `expect("drain() must have produced a frame record")`。`frame_dump` 改用 `Window::record()` 的 `Option`：无提交帧时帧号 0、`damage` 空、实例/op 取当前（空）缓冲，**不 panic**；新增 `frame_dump_on_a_fresh_app_is_empty`。
+
+**阻塞 ②（图集页只上传给当前窗口）**：`frame_all` 逐窗提交，旧的 `upload_image_page(window)` 用进程级 `take_dirty_rows()`，第一个窗口消费后其余窗口的图片/字形纹理永远收不到整页。改为 `App::upload_atlas_pages()`（无 `window` 参数）**广播**给每个有渲染器的窗口：
+
+- 脏旗标/脏行由本方法统一消费一次，然后广播（增量行 `clone()` 给所有已同步窗口）；
+- 每个窗口记 `glyph_page_received` / `image_page_received`；**没收到过整页的窗口拿整页**（新建窗口、换渲染器）；
+- `Window::set_renderer` / `enable_offscreen_renderer` 把两个标记清零（新渲染器 = 空纹理）；
+- 新增 `atlas_upload_without_renderers_keeps_windows_unsynced` / `atlas_upload_marks_only_windows_with_a_renderer` / `atlas_pages_are_broadcast_to_every_window`（Windows，两个离屏渲染器）。
+
+**非阻塞项**（逐条已改）：
+
+| 项 | 处理 |
+|---|---|
+| `snapshot_without_gpu_is_a_typed_result` 与 S-124 冲突 | 改名 `snapshot_result_is_typed_per_platform`：Windows=match(Ok)、macOS=Ok（Metal 真读回）、Linux=`Err(Gpu)` |
+| 非 Windows `test-support` 引用 `render::windows` | `rendered_text_produces_visible_glyph_pixels` 整体 `#[cfg(windows)]`；`SnapshotError` 的 `use` 也按平台门控 |
+| bench `sample_size` | 30 → 50（50 samples / 1 s warmup / 3 s 测量；理由写在 bench 文件头） |
+| bench `tree_build` 把 setup/drop 算进测量 | 改 `iter_batched`：setup 只建空 `App`，routine 才是 512 次建树 |
+| bench `frame_incremental` 只挂 1 节点 | 512 个静态 box + 1 个绑信号节点（真正的「复用 511 + 重绘 1」） |
+| `compare` 在 release 静默少比 | 新增 `GoldenError::Malformed`，长度不符返回**显式错误**（不再用 `debug_assert`）；新增 `compare_rejects_a_malformed_buffer_in_every_profile` |
+| LUT 测试采样太少 | 全 256×256 组合逐一对比标量公式；另加 `premultiply_fast_paths_are_byte_exact` |
+| `DependencyGraph::dump` 路径与文档不符 | 实际是 `DependencyGraph::dependents()`（`cfg test-support`）+ `diagnostics::dependency_dump`；文档 §4.3 / §11.3 已同步 |

@@ -51,6 +51,9 @@ fn snapshot(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let _ = test.drain()?;
     let image = test
         .snapshot(SnapshotCase {
+            // 场景由 demo 自己 `build_into` 挂载；这两个字段只用于 golden 命名（此处是元数据）。
+            scene: kytrix_gui::test_support::snapshot::SnapshotScene::Shapes,
+            theme: kytrix_gui::test_support::snapshot::SnapshotTheme::Light,
             size: kytrix_gui::math::Size::new(scene::LOGICAL_WIDTH, scene::LOGICAL_HEIGHT),
             scale: Scale::ONE,
         })

@@ -44,7 +44,8 @@ use crate::{
         style::{Clip, Cursor, StylePatch},
     },
     platform::dispatcher::{Dispatcher, UserTask},
-    render::AtlasSet,
+    render::AtlasAllocator,
+    resources::ResourceCache,
     text::{
         FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
         TextStyle, atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
@@ -90,8 +91,10 @@ pub struct App {
     text: TextContext,
     /// 字形光栅器（swash `ScaleContext` + 被 pin 住的字体 blob）。
     raster: GlyphRasterizer,
-    /// 图集（字形页 + 图片页）：进程级一份（单 GPU 设备）。
-    atlas: AtlasSet,
+    /// 字形图集页（进程级一份；DPI 换代时 `clear()` 换代码）。
+    atlas: AtlasAllocator,
+    /// 图片资源缓存（解码 + 图片图集页；与字形页分图集，且**不随 DPI 换代**，P13 §8.1）。
+    resources: ResourceCache,
     /// 字形 `key → tile` 缓存（与图集同事务换代）。
     glyph_atlas: GlyphAtlas,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
@@ -311,7 +314,8 @@ impl App {
             runtime,
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
-            atlas: AtlasSet::new(),
+            atlas: AtlasAllocator::new(crate::paint::atlas::AtlasKind::Glyph),
+            resources: ResourceCache::new(),
             glyph_atlas: GlyphAtlas::new(),
             scale_epochs: ahash::HashMap::default(),
             pending_dirty: crate::render::DirtyRows::default(),
@@ -401,32 +405,112 @@ impl App {
         crate::platform::native::clipboard::get_text()
     }
 
-    /// 把字形页的当前内容交给窗口渲染器（有变化才传；整页，P09）。
+    /// 把两张图集页**广播**给所有窗口的渲染器（P13 §8.2；评审阻塞 ②）。
     ///
-    /// 调用点只有两个：`App::frame`（每帧）与 `TestApp::snapshot`（临时 WARP 渲染器）。
-    pub(crate) fn upload_glyph_page(&mut self, window: WindowId) {
-        let has_renderer = self
-            .windows
-            .get(&window)
-            .is_some_and(crate::window::Window::has_renderer);
-        if !has_renderer || !self.glyph_atlas.take_page_dirty() {
+    /// 为什么不按窗口取脏行：图集页是**进程级**共享数据（`AtlasAllocator` / `GlyphAtlas` 一份），
+    /// 而纹理是**每窗口一份**（`AtlasTextures`）。`frame_all` 逐窗提交，若第一次 `take` 就把脏行
+    /// 消费给当前窗口，其余窗口的纹理永远收不到内容。因此：
+    ///
+    /// 1. 脏行/脏旗标由**本方法**统一消费一次，然后广播给每个有渲染器的窗口；
+    /// 2. 还没收到过整页的窗口（新建窗口 / 换过渲染器）拿到的是**整页**，不是增量行；
+    /// 3. 字形页沿用 P09 的整页上传，图片页在有脏行时按行增量。
+    ///
+    /// 调用点：`App::frame`（每帧，paint 之前）。`TestApp::snapshot` 走自己的临时渲染器。
+    pub(crate) fn upload_atlas_pages(&mut self) {
+        let glyph_dirty = self.glyph_atlas.take_page_dirty();
+        let image_rows = self.resources.take_dirty_rows();
+        let image_dirty = !image_rows.spans().is_empty();
+
+        // 字形页：有脏 ⇒ 所有窗口整页；没脏 ⇒ 只补给从未收到过的窗口。
+        let glyph_needed = glyph_dirty
+            || self
+                .windows
+                .values()
+                .any(|window| window.has_renderer() && !window.glyph_page_received());
+        if glyph_needed {
+            let (_, pixels) = self.glyph_page_pixels();
+            let mut rows = crate::render::DirtyRows::default();
+            rows.mark(0, u32::MAX);
+            for window in self.windows.values_mut() {
+                if !window.has_renderer() {
+                    continue;
+                }
+                if !glyph_dirty && window.glyph_page_received() {
+                    continue;
+                }
+                window.queue_atlas_upload(
+                    crate::paint::atlas::AtlasKind::Glyph,
+                    &pixels,
+                    rows.clone(),
+                );
+                window.mark_glyph_page_received();
+            }
+        }
+
+        // 图片页：有脏行 ⇒ 已收到的窗口拿增量、未收到的拿整页；没脏 ⇒ 只补未收到的窗口。
+        let image_needed = image_dirty
+            || self
+                .windows
+                .values()
+                .any(|window| window.has_renderer() && !window.image_page_received());
+        if !image_needed {
             return;
         }
-        let (page_width, pixels) = self.glyph_page_pixels();
-        let mut rows = crate::render::DirtyRows::default();
-        rows.mark(0, u32::MAX);
-        if let Some(target) = self.windows.get_mut(&window) {
-            target.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &pixels, rows);
+        let (_, pixels) = self.resources.page_pixels();
+        let mut full_rows = crate::render::DirtyRows::default();
+        full_rows.mark(0, u32::MAX);
+        for window in self.windows.values_mut() {
+            if !window.has_renderer() {
+                continue;
+            }
+            if window.image_page_received() {
+                if image_dirty {
+                    window.queue_atlas_upload(
+                        crate::paint::atlas::AtlasKind::Image,
+                        pixels,
+                        image_rows.clone(),
+                    );
+                }
+                continue;
+            }
+            window.queue_atlas_upload(
+                crate::paint::atlas::AtlasKind::Image,
+                pixels,
+                full_rows.clone(),
+            );
+            window.mark_image_page_received();
         }
-        let _ = page_width;
     }
 
     /// 字形页的整页像素（`R8`；`upload_glyph_page` 与快照路径共用）。
     pub(crate) fn glyph_page_pixels(&self) -> ((u32, u32), Vec<u8>) {
-        let page = self.atlas.glyph().page();
+        let page = self.atlas.page();
         let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize)];
         self.glyph_atlas.write_page(&mut pixels, page.0);
         (page, pixels)
+    }
+
+    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn resource_page_pixels(&self) -> ((u32, u32), &[u8]) {
+        self.resources.page_pixels()
+    }
+
+    /// 图片资源缓存（只读）。应用层在**建树时**用 [`App::resources_mut`] 换 `AtlasTile`。
+    #[must_use]
+    pub fn resources(&self) -> &ResourceCache {
+        &self.resources
+    }
+
+    /// 图片资源缓存（可变）：`insert` / `unload` 的唯一入口。
+    pub fn resources_mut(&mut self) -> &mut ResourceCache {
+        &mut self.resources
+    }
+
+    /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn dependency_graph(&self) -> &DependencyGraph {
+        &self.graph
     }
 
     /// 本 App 绑定的 tokio 句柄（**借用**，不 clone）。
@@ -2185,8 +2269,8 @@ impl App {
         // 布局后（视口尺寸已知/已变）再修一次虚拟列表窗口：首次布局前视口 = 0，不能靠
         // `set_virtual_items` 那一次调用定终身（P10 §8.3 / 评审 #5）。
         self.rewindow_virtuals(window);
-        // 字形页上传（P09 整页）：`layout_text` 在这之前完成光栅与装箱。
-        self.upload_glyph_page(window);
+        // 图集页上传（P13：广播给所有窗口的渲染器；两张页分开、顺序固定以便帧记录复现）。
+        self.upload_atlas_pages();
         let paint = match self.windows.get_mut(&window) {
             Some(target) => target.paint_frame(),
             None => {
@@ -2278,7 +2362,7 @@ impl App {
         let epoch = window.scale_epoch();
 
         if scale_epochs.get(&window_id).copied().unwrap_or(0) != epoch {
-            atlas.clear_all();
+            atlas.clear();
             glyph_atlas.clear();
             scale_epochs.insert(window_id, epoch);
         }
@@ -2355,7 +2439,7 @@ impl App {
         let mut report = TextLayoutReport::default();
 
         for attempt in 0..2 {
-            let generation = atlas.glyph().generation();
+            let generation = atlas.generation();
             let mut laid = 0usize;
             let mut reused = 0usize;
             let tree = window.tree_mut();
@@ -2389,18 +2473,18 @@ impl App {
                     width,
                     raster,
                     glyph_atlas,
-                    atlas.glyph_mut(),
+                    atlas,
                     generation,
                 ) {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                pending_dirty.merge(&mut atlas.glyph_mut().take_dirty_rows());
+                pending_dirty.merge(&mut atlas.take_dirty_rows());
                 text.push_diagnostics(diagnostics);
                 tree.set_text_line(node, Rc::new(line), layout, width, generation);
                 laid += 1;
             }
-            if atlas.glyph().generation() == generation {
+            if atlas.generation() == generation {
                 report.laid = laid;
                 report.reused = reused;
                 report.reruns = attempt;
@@ -2442,7 +2526,7 @@ impl App {
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
         let version = self.text.set_font_stack(stack);
         self.glyph_atlas.clear();
-        self.atlas.glyph_mut().clear();
+        self.atlas.clear();
         self.raster.set_font_epoch(self.text.font_epoch());
         self.invalidate_all_text();
         version
@@ -2452,7 +2536,7 @@ impl App {
     pub fn reload_system_fonts(&mut self) -> u32 {
         let version = self.text.reload_system_fonts();
         self.glyph_atlas.clear();
-        self.atlas.glyph_mut().clear();
+        self.atlas.clear();
         self.raster.set_font_epoch(self.text.font_epoch());
         self.invalidate_all_text();
         version
@@ -4803,5 +4887,177 @@ mod interaction_tests {
             .scroll_to(&handle, Point::new(0.0, 10.0))
             .expect_err("节点已卸载");
         assert!(matches!(error, EngineError::StaleNode { node } if node == container));
+    }
+}
+
+/// P13：`ResourceCache` 接入 `App` 的边界用例（图片页上传 / 进程级缓存 / 零副作用）。
+#[cfg(test)]
+mod resources_tests {
+    use super::App;
+    use crate::{
+        math::{Rect, Size},
+        node::builder::NodeBuilder,
+        paint::style::PaintSpec,
+        window::{WindowId, WindowOptions},
+    };
+
+    fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(rt.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: "resources".into(),
+            size: Size::new(200.0, 120.0),
+            scale: crate::math::Scale::ONE,
+        });
+        (rt, app, window)
+    }
+
+    /// 4×4 的不透明 PNG（解码后逐字节可预测：BGRA = 源 RGB 交换）。
+    fn png() -> Vec<u8> {
+        let pixels: Vec<u8> = std::iter::repeat_n([10u8, 20, 30, 255], 16)
+            .flatten()
+            .collect();
+        let image = image::RgbaImage::from_raw(4, 4, pixels).expect("raw");
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode png");
+        out.into_inner()
+    }
+
+    #[test]
+    fn resources_are_process_level() {
+        let (_rt, mut app, window) = setup();
+        let image = app.resources_mut().insert(&png()).expect("insert");
+
+        assert_eq!(app.resources().len(), 1);
+        assert_eq!(app.resources().page_pixels().0, (2048, 2048));
+        // 另一窗口共享同一份缓存（单 GPU 设备、进程级一份）。
+        let second = app.create_window(WindowOptions {
+            title: "second".into(),
+            size: Size::new(64.0, 64.0),
+            scale: crate::math::Scale::ONE,
+        });
+        assert_ne!(second, window);
+        assert_eq!(app.resources().len(), 1);
+
+        // 内容区写进了页缓冲（BGR 顺序）。
+        let (_, pixels) = app.resources().page_pixels();
+        let origin_x = (image.tile.u0 * 2048.0).round() as usize;
+        let origin_y = (image.tile.v0 * 2048.0).round() as usize;
+        let offset = origin_y * 2048 * 4 + origin_x * 4;
+        assert_eq!(&pixels[offset..offset + 4], &[30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn insert_does_not_touch_node_dirty_flags() {
+        let (_rt, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+            .paint(PaintSpec {
+                background: crate::paint::color::Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("box");
+        let _ = app.frame(window).expect("frame").expect("ok");
+        let before = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(node)
+            .expect("node")
+            .dirty();
+
+        let _ = app.resources_mut().insert(&png()).expect("insert");
+
+        let after = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(node)
+            .expect("node")
+            .dirty();
+        assert_eq!(before, after, "插入资源不得改动任何节点的脏位");
+    }
+
+    #[test]
+    fn atlas_upload_without_renderers_keeps_windows_unsynced() {
+        let (_rt, mut app, window) = setup();
+        let _ = app.resources_mut().insert(&png()).expect("insert");
+
+        // headless：没有 renderer ⇒ 不上传，窗口保持「未收到整页」（换渲染器后会自动补整页）。
+        app.upload_atlas_pages();
+        app.upload_atlas_pages();
+        let target = app.window(window).expect("window");
+        assert!(!target.glyph_page_received());
+        assert!(!target.image_page_received());
+        assert_eq!(app.resources().len(), 1, "上传不影响缓存内容");
+    }
+
+    #[test]
+    fn atlas_upload_marks_only_windows_with_a_renderer() {
+        let (_rt, mut app, first) = setup();
+        let second = app.create_window(WindowOptions {
+            title: "second".into(),
+            size: Size::new(64.0, 64.0),
+            scale: crate::math::Scale::ONE,
+        });
+        app.upload_atlas_pages();
+
+        for window in [first, second] {
+            let target = app.window(window).expect("window");
+            assert!(!target.has_renderer());
+            assert!(
+                !target.image_page_received(),
+                "没有渲染器的窗口不得被记账为已同步"
+            );
+        }
+    }
+
+    /// 评审阻塞 ②：`frame_all` 逐窗提交，图集页必须**广播**给每个窗口的渲染器，
+    /// 否则第一个窗口消费脏行后，其余窗口的纹理永远收不到内容。
+    #[cfg(windows)]
+    #[test]
+    fn atlas_pages_are_broadcast_to_every_window() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let (_rt, mut app, first) = setup();
+        app.window_mut(first)
+            .expect("window")
+            .enable_offscreen_renderer()
+            .expect("offscreen renderer");
+        let second = app.create_window(WindowOptions {
+            title: "second".into(),
+            size: Size::new(64.0, 64.0),
+            scale: crate::math::Scale::ONE,
+        });
+        app.window_mut(second)
+            .expect("window")
+            .enable_offscreen_renderer()
+            .expect("offscreen renderer");
+
+        let _ = app.resources_mut().insert(&png()).expect("insert");
+        app.upload_atlas_pages();
+
+        for window in [first, second] {
+            let target = app.window(window).expect("window");
+            assert!(target.glyph_page_received(), "字形页必须广播到每个窗口");
+            assert!(target.image_page_received(), "图片页必须广播到每个窗口");
+        }
+
+        // 第二次调用：没有新写入 ⇒ 不重复上传（脏旗标已被统一消费）。
+        app.upload_atlas_pages();
+        for window in [first, second] {
+            assert!(app.window(window).expect("window").image_page_received());
+        }
+    }
+
+    #[test]
+    fn image_atlas_page_is_16_mib() {
+        let (_rt, app, _window) = setup();
+        assert_eq!(app.resources().page_pixels().1.len(), 16 * 1024 * 1024);
     }
 }
