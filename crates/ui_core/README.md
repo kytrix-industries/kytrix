@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API + demo 的 23 项单元测试 | `cargo test -p ui_core` ← 不跑 13 项场景测试（需要 `test-support`）                                                                                                                                      |
 | L2    | 帧记录 / 布局命中 / HUD 集成测试                               | `cargo test -p ui_core --features test-support --test frame_record`<br>`cargo test -p ui_core --features "hud,test-support" --test hud`<br>`cargo test -p ui_core --features test-support --test layout` |
 | L2    | demo example 的场景测试                                        | `cargo test -p ui_core --features "hud,test-support" --example demo`                                                                                                                                     |
-| L3    | 像素 golden（Windows WARP）                                    | `cargo test -p ui_core --features test-support --test snapshot`                                                                                                                                          |
+| L3    | 像素 golden（Windows WARP / Linux lavapipe）                   | `cargo test -p ui_core --features test-support --test snapshot`                                                                                                                                          |
 | L4    | criterion 基准（非门禁）                                       | `cargo bench -p ui_core --bench perf --no-run` / `cargo bench -p ui_core --bench perf`                                                                                                                   |
 
 ```powershell
@@ -117,6 +117,8 @@ cargo run --release -p ui_core --example snapshot_demo --features test-support -
   带 HUD 为 36 项）。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - 缺 shader 工具链时设 `ui_core_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
+- Linux 实机验证：`design/linux-verification.md`（环境、11 项 BUG 与修复决策、逐项结果、lavapipe 基线）。
+  构建依赖：`pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools fonts-noto-cjk`。
 - 交叉 target：`cargo check -p ui_core --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
   （Linux 需要 `pkg-config` stub 提供 `fontconfig`，见 `design/DEVIATIONS.md` V-04）。
 - CI：[`.github/workflows/gui-ci.yml`](../../.github/workflows/gui-ci.yml)（windows / ubuntu / macos 三个 job）。

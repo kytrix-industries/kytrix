@@ -69,12 +69,33 @@ impl SnapshotCase {
         )
     }
 
-    /// `CARGO_MANIFEST_DIR/tests/golden/warp/<golden_name>.png`。
+    /// `CARGO_MANIFEST_DIR/tests/golden/<device>/<golden_name>.png`。
+    ///
+    /// 按**设备类型**分目录（D14）：`warp/`（Windows WARP）、`lavapipe/`（Linux Mesa llvmpipe）。
+    /// 软件光栅与真实 GPU 的 AA 存在系统性差异，跨设备比同一份 golden 会永久红。
     #[must_use]
     pub fn golden_path(&self) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/golden/warp")
+            .join("tests/golden")
+            .join(device_dir())
             .join(format!("{}.png", self.golden_name()))
+    }
+}
+
+/// 当前平台的 golden 目录（D14 的设备分组）。
+#[must_use]
+pub fn device_dir() -> &'static str {
+    #[cfg(windows)]
+    {
+        "warp"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "metal-real"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "lavapipe"
     }
 }
 
@@ -523,14 +544,21 @@ pub fn assert_golden(
 
 /// 本平台是否跳过像素 golden（`Some(原因)` = 跳过）。
 ///
-/// v1 的 golden 只由 Windows WARP 产出；macOS（真实 Metal）与 Linux（`new_offscreen` 恒
-/// `UnsupportedGpu`，F-137）没有对应设备的 golden，比对必然失败。
+/// golden 按**设备类型**分目录（D14）：Windows 用 WARP、Linux 用 lavapipe、macOS 用真实 Metal
+/// （`metal-real/` 尚无基线，需在实机 GPU runner 上产出）。
 #[must_use]
 pub fn skip_reason() -> Option<&'static str> {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         None
-    } else {
-        Some("pixel goldens are WARP-only in v1 (design/phase-13-resources-snapshot.md §9.6)")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some("no metal-real/ baseline yet (produced on a real-GPU runner, D14)")
     }
 }
 
@@ -1070,12 +1098,10 @@ mod tests {
     }
 
     #[test]
-    fn golden_path_is_under_tests_golden_warp() {
+    fn golden_path_is_under_the_device_directory() {
         let path = solid_case(SnapshotScene::Clip, SnapshotTheme::Light, 2.0).golden_path();
-        assert!(
-            path.ends_with(Path::new("tests/golden/warp/clip_2_light.png")),
-            "{path:?}"
-        );
+        let expected = format!("tests/golden/{}/clip_2_light.png", super::device_dir());
+        assert!(path.ends_with(Path::new(&expected)), "{path:?}");
     }
 
     #[test]
@@ -1213,10 +1239,33 @@ mod tests {
 
     #[test]
     fn skip_reason_is_platform_specific() {
-        if cfg!(windows) {
+        // Windows（WARP）与 Linux（lavapipe）都有 golden 目录；macOS 的 `metal-real/` 尚无基线。
+        if cfg!(any(windows, target_os = "linux")) {
             assert!(super::skip_reason().is_none());
         } else {
             assert!(super::skip_reason().is_some());
         }
+    }
+
+    #[test]
+    fn device_dir_matches_the_platform_backend() {
+        let expected = if cfg!(windows) {
+            "warp"
+        } else if cfg!(target_os = "macos") {
+            "metal-real"
+        } else {
+            "lavapipe"
+        };
+        assert_eq!(super::device_dir(), expected);
+        let case = SnapshotCase::default();
+        assert!(
+            case.golden_path().starts_with(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/golden")
+                    .join(expected)
+            ),
+            "{:?}",
+            case.golden_path()
+        );
     }
 }

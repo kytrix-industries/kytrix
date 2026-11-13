@@ -380,10 +380,8 @@ fn shader_module(
     if bytes.starts_with(SKIPPED) || !bytes.starts_with(&SPIRV_MAGIC) {
         return Err(shader_error);
     }
-    let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect();
+    let (words, _) = bytes.as_chunks::<4>();
+    let words: Vec<u32> = words.iter().map(|word| u32::from_le_bytes(*word)).collect();
     // SAFETY: `words` 是对齐后的本地 `Vec<u32>`，长度 = 代码字数；调用期间有效。
     unsafe {
         device

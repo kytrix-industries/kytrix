@@ -128,6 +128,7 @@ impl Device {
         // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
         let devices = unsafe { instance.raw().enumerate_physical_devices() }
             .map_err(|error| init_error("enumerate_physical_devices", format!("{error:?}")))?;
+        let surface_fn = instance.surface_fn();
         let mut chosen = None;
         for physical in devices {
             // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
@@ -141,15 +142,21 @@ impl Device {
             let Some(family) = family else {
                 continue;
             };
-            // SAFETY: `family` 来自本设备的队列族列表；surface 由同一实例创建。
-            let supported = unsafe {
-                instance.surface_fn().get_physical_device_surface_support(
-                    physical,
-                    family as u32,
-                    instance.surface(),
-                )
-            }
-            .unwrap_or(false);
+            // 离屏实例没有 surface：只要求图形队列族（`surface_fn` 为 `None`）。
+            let supported = match surface_fn {
+                Some(surface_fn) => {
+                    // SAFETY: `family` 来自本设备的队列族列表；surface 由同一实例创建。
+                    unsafe {
+                        surface_fn.get_physical_device_surface_support(
+                            physical,
+                            family as u32,
+                            instance.surface(),
+                        )
+                    }
+                    .unwrap_or(false)
+                }
+                None => true,
+            };
             if supported {
                 chosen = Some((physical, family as u32));
                 break;
@@ -191,8 +198,7 @@ impl Device {
             adapter: SmolStr::new(
                 // SAFETY: `deviceName` 是 Vulkan 保证的 NUL 结尾字符串。
                 unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
-                    .to_string_lossy()
-                    .to_string(),
+                    .to_string_lossy(),
             ),
             api_version: properties.api_version,
             device_type: properties.device_type,
@@ -205,7 +211,8 @@ impl Device {
             incremental_present,
         };
         caps.check()?;
-        if !caps.swapchain {
+        // 离屏实例（快照）没有 surface，自然没有 swapchain：那条路径不需要 present。
+        if surface_fn.is_some() && !caps.swapchain {
             return Err(EngineError::UnsupportedGpu {
                 os: "linux",
                 required: D8_REQUIRED,
@@ -222,7 +229,10 @@ impl Device {
             .timeline_semaphore(true)
             .descriptor_indexing(true)
             .runtime_descriptor_array(caps.runtime_descriptor_array);
-        let mut extension_pointers = vec![ash::khr::swapchain::NAME.as_ptr()];
+        let mut extension_pointers = Vec::with_capacity(2);
+        if caps.swapchain {
+            extension_pointers.push(ash::khr::swapchain::NAME.as_ptr());
+        }
         if incremental_present {
             extension_pointers.push(ash::khr::incremental_present::NAME.as_ptr());
         }

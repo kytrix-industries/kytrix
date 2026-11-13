@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "common.glsl"
+#include "common.frag.glsl"
 
 layout(location = 0) in vec2 v_local_px;
 layout(location = 1) in vec2 v_uv;

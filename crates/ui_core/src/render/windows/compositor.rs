@@ -127,7 +127,7 @@ impl Renderer {
                     NodeMask: 0,
                 })
         }
-            .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
+        .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
         // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
         let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
 
@@ -865,7 +865,7 @@ fn create_target(device: &mut Device, size: (u32, u32)) -> Result<ID3D12Resource
             &mut out,
         )
     }
-        .map_err(|error| init_error_from("CreateCommittedResource(persist)", error))?;
+    .map_err(|error| init_error_from("CreateCommittedResource(persist)", error))?;
     out.ok_or_else(|| EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("d3d12 persist target missing"),
     })
@@ -905,7 +905,7 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
             &mut out,
         )
     }
-        .map_err(|error| init_error_from("CreateCommittedResource(upload)", error))?;
+    .map_err(|error| init_error_from("CreateCommittedResource(upload)", error))?;
     out.ok_or_else(|| EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("d3d12 upload buffer missing"),
     })
@@ -1491,7 +1491,7 @@ mod tests {
                 None,
             )
         }
-            .expect("hidden window");
+        .expect("hidden window");
 
         let Ok(mut renderer) = Renderer::new_for_hwnd(hwnd.0 as isize, (64, 64)) else {
             eprintln!("skip: no hardware D3D12 device for the swapchain test");

@@ -83,6 +83,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let mut last_size = size;
     let result = (|| -> Result<(), EngineError> {
         loop {
+            // ⓪ 窗口全关就退出：`Application::run` 的契约是「跑到没有窗口」
+            // （与 Win32 的 `should_exit` / macOS 的 `windows.is_empty()` 同构）。
+            // 漏了这一步时，应用自己调 `App::close_window`（如 demo 的 Esc）之后循环会永久空转（F-149）。
+            if app.windows().next().is_none() {
+                return Ok(());
+            }
             // ① 平台事件 → App（IME / 输入 / 尺寸 / 焦点 / DPI）。
             let events = state.take_events();
             let had_events = !events.is_empty();
@@ -174,7 +180,4 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     result
 }
 
-/// 名称别名：`calloop-wayland-source` 的 `WaylandSource`（避免与 `surface` 模块同名冲突）。
-mod calloop_wayland {
-    pub(crate) use calloop_wayland_source::WaylandSource;
-}
+mod calloop_wayland;

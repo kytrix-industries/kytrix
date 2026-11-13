@@ -4,7 +4,7 @@
 字段顺序、offset、取值、绑定、坐标与颜色空间的任何变更，必须**同时**改：
 
 1. `paint/instance.rs`（`GpuPrimitive` 与 `KIND_*`/`FLAG_*`/`GRADIENT_*` 常量）；
-2. 本目录下 14 个源文件（`common.*` / `quad.*` / `geometry.*`）；
+2. 本目录下 15 个源文件（`common.*` / `common.frag.glsl` / `quad.*` / `geometry.*`）；
 3. 本文件；
 4. 触发像素快照回归（主设计 I8）。
 

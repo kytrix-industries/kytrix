@@ -129,7 +129,8 @@ impl Readback {
             std::ptr::copy_nonoverlapping(pointer.cast::<u8>(), rgba8.as_mut_ptr(), bytes as usize);
             device.raw().unmap_memory(self.memory);
         }
-        for pixel in rgba8.chunks_exact_mut(4) {
+        // 目标格式是 B8G8R8A8（或 R8G8B8A8）：统一换成交给 `SnapshotImage` 的 RGBA8。
+        for pixel in rgba8.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         Ok(ReadbackImage {

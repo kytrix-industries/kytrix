@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use smol_str::SmolStr;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle, event_created_child,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
@@ -60,6 +60,9 @@ pub(crate) struct WaylandState {
     /// 只为保活（`xdg_wm_base::ping` 必须回 pong）。
     _wm_base: xdg_wm_base::XdgWmBase,
     seat: wl_seat::WlSeat,
+    /// `wl_seat.capabilities` 最近一次声明的能力位：只有声明过的设备才能 `get_keyboard` / `get_pointer`
+    /// （否则服务端报 `wl_seat error 0` 并断开连接，见 F-146）。
+    seat_caps: wl_seat::Capability,
     keyboard: Option<wl_kb::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     /// 只为保活（`wl_data_device` 的 offer 事件在它上面）。
@@ -172,6 +175,7 @@ impl WaylandState {
             toplevel,
             _wm_base: wm_base,
             seat,
+            seat_caps: wl_seat::Capability::empty(),
             keyboard: None,
             pointer: None,
             _data_device: data_device,
@@ -471,7 +475,6 @@ macro_rules! dispatch_unit {
 
 dispatch_unit!(
     wl_compositor::WlCompositor,
-    wl_seat::WlSeat,
     wl_output::WlOutput,
     wl_data_device_manager::WlDataDeviceManager,
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -480,6 +483,28 @@ dispatch_unit!(
     ZwpTextInputManagerV3,
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
 );
+
+impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            // `WEnum::Unknown` 是未来版本新增的位：按「本版本不认识」处理，保留已知能力。
+            state.seat_caps = match capabilities {
+                wayland_client::WEnum::Value(caps) => caps,
+                wayland_client::WEnum::Unknown(_) => state.seat_caps,
+            };
+            // 能力可能在建好设备之后才到齐（部分 compositor 首帧之后才 announce），
+            // 也可能被撤销（热插拔）。`create_devices` 是幂等的：补建缺失的、释放多余的。
+            let _ = create_devices(state);
+        }
+    }
+}
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
     fn event(
@@ -575,14 +600,14 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState 
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            if let Ok(next) = dpi::scale_from_120(scale) {
-                state.scale = next;
-                state.events.push(Event::DpiChanged {
-                    dpi: (next.factor() * 96.0).round() as u32,
-                    scale: next,
-                });
-            }
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Ok(next) = dpi::scale_from_120(scale)
+        {
+            state.scale = next;
+            state.events.push(Event::DpiChanged {
+                dpi: (next.factor() * 96.0).round() as u32,
+                scale: next,
+            });
         }
     }
 }
@@ -755,6 +780,12 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandState {
     ) {
         state.clipboard.handle_device_event(event);
     }
+
+    // `wl_data_device.data_offer` 会创建 `wl_data_offer` 子对象：wayland-client 要求在这里
+    // 给出它的 user data，缺了会在**收到第一个 offer 时 panic**（mutter 启动即发，F-147）。
+    event_created_child!(WaylandState, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
 }
 
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandState {
@@ -779,8 +810,13 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_data_source::Event::Send { mime_type, fd } = event {
-            state.clipboard.handle_send(data_source, &mime_type, fd);
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                state.clipboard.handle_send(data_source, &mime_type, fd);
+            }
+            // 对端换了选区属主：我们不再持有剪贴板内容。
+            wl_data_source::Event::Cancelled => state.clipboard.handle_cancelled(),
+            _ => {}
         }
     }
 }
@@ -845,14 +881,26 @@ pub(crate) fn initial_roundtrip(
     Ok(())
 }
 
-/// 把 `wl_keyboard` / `wl_pointer` 建出来（`wl_seat::capabilities` 之后调用）。
+/// 把 `wl_keyboard` / `wl_pointer` 建出来（或按最新的 capabilities 释放）。
+///
+/// **只有 seat 声明过的能力才能 bind**：`wl_seat.get_keyboard` 在没有 KEYBOARD 能力时是协议错误，
+/// 服务端会回 `wl_seat error 0` 并直接断开连接（F-146）。幂等：每轮 capabilities 变化都调用。
 pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError> {
     let queue = state.queue_handle.clone();
-    if state.keyboard.is_none() {
-        state.keyboard = Some(state.seat.get_keyboard(&queue, ()));
+    let caps = state.seat_caps;
+    if caps.contains(wl_seat::Capability::Keyboard) {
+        if state.keyboard.is_none() {
+            state.keyboard = Some(state.seat.get_keyboard(&queue, ()));
+        }
+    } else {
+        state.keyboard = None;
     }
-    if state.pointer.is_none() {
-        state.pointer = Some(state.seat.get_pointer(&queue, ()));
+    if caps.contains(wl_seat::Capability::Pointer) {
+        if state.pointer.is_none() {
+            state.pointer = Some(state.seat.get_pointer(&queue, ()));
+        }
+    } else {
+        state.pointer = None;
     }
     Ok(())
 }

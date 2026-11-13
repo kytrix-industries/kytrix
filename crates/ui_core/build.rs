@@ -12,8 +12,8 @@ use std::{
     process::Command,
 };
 
-/// 契约里的 14 个源文件（相对 `src/render/shaders`）。静态校验与 `rerun-if-changed` 的唯一清单。
-const SOURCES: [&str; 14] = [
+/// 契约里的 15 个源文件（相对 `src/render/shaders`）。静态校验与 `rerun-if-changed` 的唯一清单。
+const SOURCES: [&str; 15] = [
     "common.hlsl",
     "quad.hlsl",
     "geometry.hlsl",
@@ -21,6 +21,7 @@ const SOURCES: [&str; 14] = [
     "quad.metal",
     "geometry.metal",
     "common.glsl",
+    "common.frag.glsl",
     "quad.vert.glsl",
     "quad.frag.glsl",
     "geometry.ui.vert.glsl",
@@ -393,9 +394,11 @@ fn build_linux(shader_dir: &Path, out_dir: &Path) {
 
     for (source, artifact) in VULKAN_ENTRIES {
         let output = out_dir.join(artifact);
+        // glslang 的 `-I` **必须**紧贴目录（`-I<dir>`）；写成两个参数会直接报
+        // `-I<dir> include path must immediately follow option (no spaces)` 并退出 1。
         let status = Command::new("glslangValidator")
-            .args(["-V", "--target-env", "vulkan1.2", "-I"])
-            .arg(shader_dir)
+            .args(["-V", "--target-env", "vulkan1.2"])
+            .arg(format!("-I{}", shader_dir.display()))
             .arg("-o")
             .arg(&output)
             .arg(shader_dir.join(source))

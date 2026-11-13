@@ -74,11 +74,8 @@ vec2 to_ndc(vec2 world_px) {
 
 // ---- SDF 与 AA -----------------------------------------------------------
 
-// 1 px 解析 AA：d 为像素单位的带符号距离。只在「实例级一致」的分支内调用。
-float aa_coverage(float d) {
-    float w = max(fwidth(d), 1e-5);
-    return saturate(0.5 - d / w);
-}
+// AA 与 clip_mask 在 `common.frag.glsl`：它们用 `fwidth`，而 GLSL 禁止顶点阶段求导，
+// 本文件又被 3 个 vertex stage 包含（F-145）。
 
 float sd_rounded_rect(vec2 p, vec2 half_size, vec4 radii) {
     float r = (p.x > 0.0) ? ((p.y > 0.0) ? radii.z : radii.y)
@@ -119,25 +116,6 @@ vec4 gradient_eval(uint kind, vec2 p, vec2 half_size, vec4 c0, vec4 c1) {
         return c0;
     }
     return lerp(c0, c1, saturate(t));
-}
-
-// ---- clip ----------------------------------------------------------------
-
-// clip_index == 0 = 无裁剪（表项 0 不是可用矩形，禁止对它做数学运算）。
-float clip_mask(vec2 world_px, uint clip_index) {
-    if (clip_index == 0u) {
-        return 1.0;
-    }
-    float m = 1.0;
-    uint idx = clip_index;
-    for (uint i = 0u; i < KYTRIX_MAX_CLIP_DEPTH && idx != 0u; ++i) {
-        ClipEntry e = clips[idx];
-        vec2 half_size = max(e.rect.zw, vec2(0.0)) * 0.5;
-        vec2 center = e.rect.xy + half_size;
-        m *= aa_coverage(sd_rounded_rect(world_px - center, half_size, e.corner_radius));
-        idx = e.meta.x;
-    }
-    return m;
 }
 
 // ---- geometry ------------------------------------------------------------

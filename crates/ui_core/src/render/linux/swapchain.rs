@@ -36,11 +36,26 @@ impl Swapchain {
         device: &Device,
         size: (u32, u32),
     ) -> Result<Self, EngineError> {
+        Self::create(instance, device, size, vk::SwapchainKHR::null())
+    }
+
+    /// `old` 非空时交给 `SwapchainCreateInfoKHR::oldSwapchain`（Vulkan 规范的 resize 路径）：
+    /// 同一个 surface 不允许同时被两个 swapchain 持有，先建后销毁会报
+    /// `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`（F-148）。创建成功后由调用方销毁 `old`。
+    fn create(
+        instance: &VulkanInstance,
+        device: &Device,
+        size: (u32, u32),
+        old: vk::SwapchainKHR,
+    ) -> Result<Self, EngineError> {
+        let surface_fn = instance
+            .surface_fn()
+            .ok_or_else(|| EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static("swapchain requires a Wayland surface"),
+            })?;
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
         let formats = unsafe {
-            instance
-                .surface_fn()
-                .get_physical_device_surface_formats(device.physical(), instance.surface())
+            surface_fn.get_physical_device_surface_formats(device.physical(), instance.surface())
         }
         .map_err(|error| EngineError::Swapchain {
             detail: smol_str::format_smolstr!("get_physical_device_surface_formats: {error:?}"),
@@ -61,8 +76,7 @@ impl Swapchain {
             })?;
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
         let capabilities = unsafe {
-            instance
-                .surface_fn()
+            surface_fn
                 .get_physical_device_surface_capabilities(device.physical(), instance.surface())
         }
         .map_err(|error| EngineError::Swapchain {
@@ -85,6 +99,7 @@ impl Swapchain {
         let fn_ = ash::khr::swapchain::Device::new(instance.raw(), device.raw());
         let create = vk::SwapchainCreateInfoKHR::default()
             .surface(instance.surface())
+            .old_swapchain(old)
             .min_image_count(image_count)
             .image_format(chosen.format)
             .image_color_space(chosen.color_space)
@@ -250,13 +265,15 @@ impl Swapchain {
                 })?;
         }
         let old = self.raw;
-        let mut replacement = Self::new(instance, device, size)?;
+        // 规范路径：新 swapchain 通过 `oldSwapchain` 接管同一个 surface，创建成功后再销毁旧的
+        // （先销毁再创建会丢一帧；先创建再销毁是 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`）。
+        let mut replacement = Self::create(instance, device, size, old)?;
         // 先把新句柄/图像取出来，再把 replacement 置空 —— 顺序反了会把 `null` 写进 `self`
         // （旧的 Drop 仍会销毁旧句柄，这里显式销毁）。
         let new_raw = replacement.raw;
         let new_images = std::mem::take(&mut replacement.images);
         replacement.raw = vk::SwapchainKHR::null();
-        // SAFETY: 旧 swapchain 不再被使用（`Renderer::resize` 先 `wait_idle`）。
+        // SAFETY: 旧 swapchain 已被新 swapchain 取代（`oldSwapchain` 语义保证可销毁）。
         unsafe { self.fn_.destroy_swapchain(old, None) };
         let old_acquire = std::mem::replace(&mut self.acquire, replacement.acquire);
         let old_render = std::mem::replace(&mut self.render_finished, replacement.render_finished);

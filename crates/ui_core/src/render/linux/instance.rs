@@ -19,10 +19,11 @@ pub(crate) struct VulkanInstance {
     /// 只为保活（实例创建之后 loader 入口仍须有效）。
     _entry: Entry,
     raw: Instance,
+    /// 离屏（快照）实例没有 surface：`null` 句柄，`surface_fn` / `_wayland_fn` 也不存在。
     surface: ash::vk::SurfaceKHR,
-    surface_fn: ash::khr::surface::Instance,
+    surface_fn: Option<ash::khr::surface::Instance>,
     /// 只为保活（surface 已创建；销毁走 `surface_fn`）。
-    _wayland_fn: ash::khr::wayland_surface::Instance,
+    _wayland_fn: Option<ash::khr::wayland_surface::Instance>,
 }
 
 impl VulkanInstance {
@@ -91,8 +92,40 @@ impl VulkanInstance {
             _entry: entry,
             raw,
             surface,
-            surface_fn,
-            _wayland_fn: wayland_fn,
+            surface_fn: Some(surface_fn),
+            _wayland_fn: Some(wayland_fn),
+        })
+    }
+
+    /// 离屏实例（无窗口）：不建 surface，也不启用 WSI 扩展。
+    ///
+    /// Linux 的产品**窗口**路径需要真实 `wl_surface`（F-137），但「没有窗口也要画」的路径
+    /// （`Window::enable_offscreen_renderer`、像素快照）只需要一个能渲染到 `VkImage` 的设备。
+    pub(crate) fn new_headless() -> Result<Self, EngineError> {
+        // SAFETY: `Entry::load` 只加载 `libvulkan.so.1`。
+        let entry =
+            unsafe { Entry::load() }.map_err(|error| init_error("libvulkan", error.to_string()))?;
+        let application = ash::vk::ApplicationInfo::default()
+            .application_name(c"kytrix")
+            .application_version(1)
+            .engine_name(c"ui_core")
+            .api_version(ash::vk::make_api_version(0, 1, 2, 0));
+        let mut layers = Vec::new();
+        if cfg!(debug_assertions) && validation_available(&entry) {
+            layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
+        }
+        let create = ash::vk::InstanceCreateInfo::default()
+            .application_info(&application)
+            .enabled_layer_names(&layers);
+        // SAFETY: `create` 的指针都在本次调用期间有效；没有 `pNext` 链。
+        let raw = unsafe { entry.create_instance(&create, None) }
+            .map_err(|error| init_error("create_instance(headless)", format!("{error:?}")))?;
+        Ok(Self {
+            _entry: entry,
+            raw,
+            surface: ash::vk::SurfaceKHR::null(),
+            surface_fn: None,
+            _wayland_fn: None,
         })
     }
 
@@ -104,8 +137,9 @@ impl VulkanInstance {
         self.surface
     }
 
-    pub(crate) fn surface_fn(&self) -> &ash::khr::surface::Instance {
-        &self.surface_fn
+    /// 产品路径恒 `Some`；离屏实例 `None`（没有 surface 也就没有 WSI 函数）。
+    pub(crate) fn surface_fn(&self) -> Option<&ash::khr::surface::Instance> {
+        self.surface_fn.as_ref()
     }
 }
 
@@ -113,7 +147,9 @@ impl Drop for VulkanInstance {
     fn drop(&mut self) {
         // SAFETY: 句柄归本结构独占；`destroy_surface` 之前不会有队列提交。
         unsafe {
-            self.surface_fn.destroy_surface(self.surface, None);
+            if let Some(surface_fn) = self.surface_fn.as_ref() {
+                surface_fn.destroy_surface(self.surface, None);
+            }
             self.raw.destroy_instance(None);
         }
     }

@@ -801,10 +801,64 @@ mod tests {
 
     #[test]
     fn explicit_family_changes_the_shape() {
-        // B3：`TextStyle.family` 必须前置进 family 列表。
+        // B3：`TextStyle.family` 必须**前置**进 family 列表 —— 用列表内容断言，不依赖宿主字体。
+        // （原实现按 advance 比较三个 Windows 专有家族名；Linux/macOS 上它们都不存在，
+        //  三者 fallback 到同一字体、advance 完全相同，测试必然失败。）
+        let stack = FontStack::new(["Consolas"]);
+        let with_custom = family_list(&stack, Some("Times New Roman"));
+        let without = family_list(&stack, None);
+
+        let names = |family: &parley::FontFamily<'static>| -> Vec<String> {
+            match family {
+                parley::FontFamily::List(list) => list
+                    .iter()
+                    .map(|name| match name {
+                        parley::FontFamilyName::Named(name) => name.to_string(),
+                        parley::FontFamilyName::Generic(generic) => format!("{generic:?}"),
+                    })
+                    .collect(),
+                parley::FontFamily::Single(name) => vec![format!("{name:?}")],
+                parley::FontFamily::Source(_) => vec!["<source>".to_owned()],
+            }
+        };
+
+        let with_custom = names(&with_custom);
+        let without = names(&without);
+        assert_eq!(
+            with_custom.first().map(String::as_str),
+            Some("Times New Roman"),
+            "显式 family 必须是列表首项（优先级最高），实际：{with_custom:?}"
+        );
+        assert_eq!(
+            with_custom.get(1).map(String::as_str),
+            Some("Consolas"),
+            "字体栈必须排在显式 family 之后，实际：{with_custom:?}"
+        );
+        assert_eq!(
+            without.first().map(String::as_str),
+            Some("Consolas"),
+            "没有显式 family 时栈首项就是最高优先级，实际：{without:?}"
+        );
+        assert_eq!(
+            with_custom.len(),
+            without.len() + 1,
+            "显式 family 只多一项，不改变 fallback 结构：{with_custom:?} vs {without:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_family_changes_advances_when_the_host_has_both_fonts() {
+        // 家族真的能改变 advance —— 只在宿主同时装了这两族时才有意义（跨平台可跳过）。
         let mut harness = Harness::new();
+        let candidates = [
+            "Consolas",
+            "Times New Roman",
+            "Segoe UI",
+            "DejaVu Sans",
+            "Liberation Serif",
+        ];
         let mut widths = Vec::new();
-        for family in ["Consolas", "Times New Roman", "Segoe UI"] {
+        for family in candidates {
             harness.family = family_list(&FontStack::new([family]), None);
             let shaped = harness.shape("Hamburgefonstiv", TextStyle::new(16.0));
             widths.push((family, shaped.widths().max));
@@ -813,6 +867,10 @@ mod tests {
             .iter()
             .map(|(_, width)| width.to_bits())
             .collect::<std::collections::HashSet<_>>();
+        if distinct.len() < 2 {
+            eprintln!("skip: host resolves every candidate family to the same font: {widths:?}");
+            return;
+        }
         assert!(
             distinct.len() >= 2,
             "different families must produce different advances: {widths:?}"

@@ -42,7 +42,8 @@ const CLIP_ALIGN: u64 = 256;
 
 /// 一个窗口的 GPU 渲染器（`Window.renderer` 的载荷）。
 pub(crate) struct Renderer {
-    swapchain: Swapchain,
+    /// 真实窗口才有 swapchain；离屏（快照）渲染器只有 `persist`。
+    swapchain: Option<Swapchain>,
     pipeline: Pipeline,
     atlas: AtlasTextures,
     persist: Persist,
@@ -52,6 +53,8 @@ pub(crate) struct Renderer {
     timer: Option<GpuTimer>,
     clear_color: [f32; 4],
     surface: (u32, u32),
+    /// 渲染目标格式（swapchain 的格式，或离屏时的 `B8G8R8A8_SRGB`）。
+    format: vk::Format,
     clips: Vec<GpuClipEntry>,
     /// 最近一次提交的 timeline 值（`FrameIndex` 的镜像；`wait_idle` 用）。
     submitted: u64,
@@ -61,6 +64,9 @@ pub(crate) struct Renderer {
     device: Device,
     instance: VulkanInstance,
 }
+
+/// 离屏渲染目标格式：与 Wayland swapchain 的首选格式一致（`swapchain.rs` 的选择顺序）。
+const OFFSCREEN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 impl Renderer {
     /// 真实窗口（Wayland surface 的裸指针由平台层提供）。
@@ -74,15 +80,16 @@ impl Renderer {
         let instance = VulkanInstance::new(display, surface_ptr)?;
         let mut device = Device::new(&instance)?;
         let swapchain = Swapchain::new(&instance, &device, size)?;
-        let pipeline = Pipeline::new(&device, swapchain.format())?;
+        let format = swapchain.format();
+        let pipeline = Pipeline::new(&device, format)?;
         let atlas = AtlasTextures::new(&device, ATLAS_PAGE)?;
         pipeline.write_atlas(atlas.glyph_view(), atlas.image_view(), atlas.sampler());
-        let persist = Persist::new(&device, &pipeline, size, swapchain.format())?;
+        let persist = Persist::new(&device, &pipeline, size, format)?;
         let upload = UploadArena::new(&mut device)?;
         let (command_pool, commands) = create_commands(&device)?;
         let timer = GpuTimer::new(&device)?;
         Ok(Self {
-            swapchain,
+            swapchain: Some(swapchain),
             pipeline,
             atlas,
             persist,
@@ -92,6 +99,7 @@ impl Renderer {
             timer,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             surface: size,
+            format,
             clips: Vec::with_capacity(8),
             submitted: 0,
             #[cfg(any(test, feature = "test-support"))]
@@ -101,27 +109,59 @@ impl Renderer {
         })
     }
 
-    /// 离屏渲染器：Linux 的 Vulkan WSI 需要真实 `wl_surface`，`App` 构造期没有连接
-    /// ⇒ 明确报 `UnsupportedGpu`（快照请走真实窗口的 `render_snapshot`）。
+    /// 离屏渲染器（无窗口 / 快照）：不建 surface 与 swapchain，只渲染到持久 `persist`。
+    ///
+    /// Linux 的**产品**窗口路径必须有真实 `wl_surface`（F-137）；这里给的是「没有窗口也要画」
+    /// 的路径（`Window::enable_offscreen_renderer` 与 `test-support` 的像素快照）。
     ///
     /// # Errors
-    /// 始终 `EngineError::UnsupportedGpu`。
+    /// 实例 / 设备 / 管线 / 图集 / 持久目标任一创建失败。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::new_offscreen_with_page(size, ATLAS_PAGE)
+        Self::with_headless(size, ATLAS_PAGE)
     }
 
-    /// 同上（页尺寸参数只为与其它后端的快照调用点保持同一签名）。
+    /// 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
     ///
     /// # Errors
-    /// 始终 `EngineError::UnsupportedGpu`（见 `new_offscreen`）。
+    /// 同 [`Self::new_offscreen`]。
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_offscreen_with_page(
-        _size: (u32, u32),
-        _atlas_page: u32,
+        size: (u32, u32),
+        atlas_page: u32,
     ) -> Result<Self, EngineError> {
-        Err(EngineError::UnsupportedGpu {
-            os: "linux",
-            required: "Wayland surface (offscreen Vulkan renderer)",
-            actual: smol_str::SmolStr::new_static("no wl_surface at App construction"),
+        Self::with_headless(size, atlas_page)
+    }
+
+    fn with_headless(size: (u32, u32), atlas_page: u32) -> Result<Self, EngineError> {
+        let size = (size.0.max(1), size.1.max(1));
+        let instance = VulkanInstance::new_headless()?;
+        let mut device = Device::new(&instance)?;
+        let format = OFFSCREEN_FORMAT;
+        let pipeline = Pipeline::new(&device, format)?;
+        let atlas = AtlasTextures::new(&device, atlas_page)?;
+        pipeline.write_atlas(atlas.glyph_view(), atlas.image_view(), atlas.sampler());
+        let persist = Persist::new(&device, &pipeline, size, format)?;
+        let upload = UploadArena::new(&mut device)?;
+        let (command_pool, commands) = create_commands(&device)?;
+        let timer = GpuTimer::new(&device)?;
+        Ok(Self {
+            swapchain: None,
+            pipeline,
+            atlas,
+            persist,
+            upload,
+            command_pool,
+            commands,
+            timer,
+            clear_color: [0.0, 0.0, 0.0, 0.0],
+            surface: size,
+            format,
+            clips: Vec::with_capacity(8),
+            submitted: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            readback: Readback::new(),
+            device,
+            instance,
         })
     }
 
@@ -130,7 +170,7 @@ impl Renderer {
     }
 
     pub(crate) fn is_fresh(&self) -> bool {
-        self.swapchain.is_fresh()
+        self.swapchain.as_ref().is_none_or(Swapchain::is_fresh)
     }
 
     /// resize：等 GPU 空闲 → 重建 swapchain + persist（旧资源走 retire）。
@@ -140,8 +180,10 @@ impl Renderer {
             return Ok(());
         }
         self.wait_idle()?;
-        self.swapchain.resize(&self.instance, &self.device, size)?;
-        let persist = Persist::new(&self.device, &self.pipeline, size, self.swapchain.format())?;
+        if let Some(swapchain) = self.swapchain.as_mut() {
+            swapchain.resize(&self.instance, &self.device, size)?;
+        }
+        let persist = Persist::new(&self.device, &self.pipeline, size, self.format)?;
         // `wait_idle` 之后旧 persist 可以立即 drop（`Persist::drop` 自己销毁句柄）。
         self.persist = persist;
         self.surface = size;
@@ -181,17 +223,22 @@ impl Renderer {
         self.pipeline
             .write_slot(slot.index, self.upload.buffer(slot.index), clip_offset);
 
-        let mut image_index = self.swapchain.acquire(&self.device, index.get() as u64)?;
-        if image_index == u32::MAX {
-            // OUT_OF_DATE：**必须**重建（`Renderer::resize` 的同尺寸短路只服务窗口尺寸变化，
-            // 这里尺寸没变也得换 swapchain）。重建后重试一次 acquire。
-            self.swapchain
-                .resize(&self.instance, &self.device, self.surface)?;
-            image_index = self.swapchain.acquire(&self.device, index.get() as u64)?;
-            if image_index == u32::MAX {
-                return Ok(crate::render::RenderStats::default());
+        let image_index = match self.swapchain.as_mut() {
+            Some(swapchain) => {
+                let mut index_now = swapchain.acquire(&self.device, index.get() as u64)?;
+                if index_now == u32::MAX {
+                    // OUT_OF_DATE：**必须**重建（`Renderer::resize` 的同尺寸短路只服务窗口尺寸变化，
+                    // 这里尺寸没变也得换 swapchain）。重建后重试一次 acquire。
+                    swapchain.resize(&self.instance, &self.device, self.surface)?;
+                    index_now = swapchain.acquire(&self.device, index.get() as u64)?;
+                    if index_now == u32::MAX {
+                        return Ok(crate::render::RenderStats::default());
+                    }
+                }
+                Some(index_now)
             }
-        }
+            None => None,
+        };
         timings.push(GpuTimerSample {
             section: Section::Upload,
             cpu_ns: elapsed_ns(upload_started),
@@ -224,7 +271,9 @@ impl Renderer {
 
         let full = frame.is_full();
         let draw_calls = self.draw(command, slot.index, buffer, frame, full)?;
-        self.copy_to_swapchain(command, image_index)?;
+        if let Some(image_index) = image_index {
+            self.copy_to_swapchain(command, image_index)?;
+        }
         if let Some(timer) = self.timer.as_ref() {
             timer.end(command, slot.index);
         }
@@ -244,9 +293,8 @@ impl Renderer {
         {
             timings.push(sample);
         }
-        if let Err(error) = self
-            .swapchain
-            .present(&self.device, slot.index, image_index, *frame)
+        if let (Some(swapchain), Some(image_index)) = (self.swapchain.as_mut(), image_index)
+            && let Err(error) = swapchain.present(&self.device, slot.index, image_index, *frame)
         {
             // present 路径上的 device-lost 也要进粘性记录（否则下一帧才在 submit 里发现）。
             if matches!(error, EngineError::DeviceLost { .. }) {
@@ -365,7 +413,7 @@ impl Renderer {
         full: bool,
     ) -> Result<u32, EngineError> {
         let mut draw_calls = 0u32;
-        let extent = self.swapchain.extent();
+        let extent = self.extent();
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: self.clear_color,
@@ -470,14 +518,28 @@ impl Renderer {
         Ok(draw_calls)
     }
 
+    /// 渲染目标的像素尺寸（有 swapchain 时与它一致；离屏时等于 `persist` 尺寸）。
+    fn extent(&self) -> vk::Extent2D {
+        match self.swapchain.as_ref() {
+            Some(swapchain) => swapchain.extent(),
+            None => vk::Extent2D {
+                width: self.surface.0,
+                height: self.surface.1,
+            },
+        }
+    }
+
     /// persist → swapchain 整面 copy + 两侧 barrier（§6.6 的表）。
     fn copy_to_swapchain(
         &mut self,
         command: vk::CommandBuffer,
         image_index: u32,
     ) -> Result<(), EngineError> {
-        let extent = self.swapchain.extent();
-        let target = self.swapchain.image(image_index);
+        let Some(swapchain) = self.swapchain.as_ref() else {
+            return Ok(());
+        };
+        let extent = swapchain.extent();
+        let target = swapchain.image(image_index);
         let layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
@@ -576,22 +638,35 @@ impl Renderer {
         timeline_value: u64,
     ) -> Result<(), EngineError> {
         let commands = [command];
-        let waits = [self.swapchain.wait_semaphore()];
+        // 离屏路径没有 swapchain：既不 wait acquire 信号量，也不 signal render-finished。
+        let waits: Vec<vk::Semaphore> = self
+            .swapchain
+            .as_ref()
+            .map(|swapchain| swapchain.wait_semaphore())
+            .into_iter()
+            .collect();
         let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let signals = [
-            self.swapchain.render_finished(slot.index),
-            self.device.timeline(),
-        ];
+        let mut signals = Vec::with_capacity(2);
+        if let Some(swapchain) = self.swapchain.as_ref() {
+            signals.push(swapchain.render_finished(slot.index));
+        }
+        signals.push(self.device.timeline());
         // timeline semaphore **必须带值**：`wait_semaphore_values` 覆盖全部 wait 信号量
         // （binary 信号量的值被忽略），`signal_semaphore_values` 给出每个信号量的目标值。
-        let wait_values = [0u64];
-        let signal_values = [0u64, timeline_value];
+        let wait_values = vec![0u64; waits.len()];
+        let signal_values: Vec<u64> = {
+            let mut values = vec![0u64; signals.len()];
+            if let Some(last) = values.last_mut() {
+                *last = timeline_value;
+            }
+            values
+        };
         let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&stages)
+            .wait_dst_stage_mask(&stages[..waits.len().min(stages.len())])
             .command_buffers(&commands)
             .signal_semaphores(&signals)
             .push_next(&mut timeline_info);
@@ -965,7 +1040,7 @@ fn draw_ops(
             }
         }
     }
-    Ok(())
+    Ok(draw_calls)
 }
 
 fn create_commands(

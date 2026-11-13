@@ -479,7 +479,7 @@ mod tests {
         assert!(app.oracle_diff().is_none());
     }
 
-    /// 快照在各平台的**类型化**结果（S-124：mac 真读回、Linux 恒 `Gpu`、Windows WARP 真渲染）。
+    /// 快照在各平台的**类型化**结果（S-124：mac 真读回、Linux 真读回、Windows WARP 真渲染）。
     #[test]
     fn snapshot_result_is_typed_per_platform() {
         let app = TestApp::new();
@@ -504,13 +504,24 @@ mod tests {
             assert_eq!((image.width, image.height), (64, 64));
             assert_eq!(image.rgba8.len(), 64 * 64 * 4);
         }
-        #[cfg(all(not(windows), not(target_os = "macos")))]
+        #[cfg(target_os = "linux")]
         {
-            // Linux：`new_offscreen` 需要真实 `wl_surface`，构造期就失败（F-137）。
-            assert!(
-                matches!(result, Err(SnapshotError::Gpu { .. })),
-                "{result:?}"
-            );
+            // Linux：Vulkan 离屏渲染器（无 surface；F-150）。宿主没有 Vulkan 设备时是
+            // `SnapshotError::Gpu`（构造期失败），有设备时必须真读回一张 64×64。
+            match result {
+                Ok(image) => {
+                    assert_eq!((image.width, image.height), (64, 64));
+                    assert_eq!(image.rgba8.len(), 64 * 64 * 4);
+                    assert!(
+                        image.rgba8.iter().all(|byte| *byte == 0),
+                        "empty scene must read back fully transparent"
+                    );
+                }
+                Err(SnapshotError::Gpu { detail }) => {
+                    eprintln!("skip: no usable Vulkan device for the offscreen renderer: {detail}");
+                }
+                Err(other) => panic!("unexpected snapshot error: {other:?}"),
+            }
         }
     }
 

@@ -113,21 +113,34 @@ jobs:
       # fontconfig (fontique build script, pkg-config), xkbcommon + wayland (platform
       # backend), glslang-tools for `glslangValidator` (SPIR-V shaders, build.rs).
       # `fonts-noto-cjk` keeps the demo example's "no MissingGlyph" scene tests runnable.
-      # Vulkan is loaded at runtime through `ash`, so no libvulkan-dev is needed to build.
+      # Vulkan is loaded at runtime through `ash`, so no libvulkan-dev is needed to build;
+      # `mesa-vulkan-drivers` provides lavapipe, which the pixel goldens need.
       - name: Install system dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools fonts-noto-cjk
+            pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools \
+            fonts-noto-cjk mesa-vulkan-drivers vulkan-tools
+
+      # Fail fast if the runner has no Vulkan device: the goldens would silently "skip"
+      # and the Linux job would pass without ever rendering a pixel.
+      - name: Verify a Vulkan device is present
+        run: |
+          set -euo pipefail
+          vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|apiVersion' | head -5
+          vulkaninfo --summary 2>/dev/null | grep -q 'deviceName' || {
+            echo "no Vulkan device available (lavapipe missing?)"; exit 1; }
 
       - name: Test (unit)
         run: cargo test -p ui_core
 
-      # `--test snapshot` prints one `skip <case>: …` line per golden on non-Windows
-      # (WARP-only baselines) and exits 0; see tests/golden/README.md.
+      # Linux goldens live in `tests/golden/lavapipe/`; `skip_reason()` only skips on macOS.
       - name: Test (test-support)
         run: cargo test -p ui_core --features test-support
+
+      - name: Pixel goldens (lavapipe)
+        run: cargo test -p ui_core --features test-support --test snapshot -- --nocapture
 
       - name: Clippy
         run: cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings
@@ -153,9 +166,8 @@ jobs:
         with:
           key: gui-macos
 
-      # Metal shaders compile with `xcrun metal` (Xcode CLT on the runner); pixel
-      # goldens are WARP-only and skip, but `snapshot_result_is_typed_per_platform`
-      # asserts that the real Metal offscreen readback path still works.
+      # Metal shaders compile with `xcrun metal` (Xcode CLT on the runner). Pixel goldens
+      # skip here: `metal-real/` has no baseline yet (needs a real-GPU runner, D14).
       - name: Test (unit)
         run: cargo test -p ui_core
 
