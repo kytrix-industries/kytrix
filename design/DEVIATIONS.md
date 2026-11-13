@@ -2294,3 +2294,15 @@ F-152 / F-153）是 demo 的 UIA/输入法实测**暴露出来的既有缺口**�
 |---|---|---|
 | **F-154** | **新增 IME caret 区域 API（解决 V-106 的定位缺口）** | `App::set_ime_cursor_area(window, text_node, byte_index)` 登记文本节点 + UTF-8 插入点；`NodeTree::text_caret_rect` 用 parley `Cursor::geometry` 生成 1 逻辑像素宽的 caret 矩形（含 content offset / 祖先滚动），`Window::text_caret_rect` 换算窗口绝对坐标；`App::ime_cursor_area` 供平台泵读取。Win32 用 `ImmSetCompositionWindow(CFS_POINT, caret 底边)` + `ImmSetCandidateWindow(CFS_EXCLUDE, caret 区域)`，`WM_IME_STARTCOMPOSITION` 重放，并删除最后指针回退；macOS `firstRectForCharacterRange` 返回 caret 屏幕矩形；Linux `set_cursor_rectangle` 使用 caret 逻辑矩形。demo 的输入框正文子节点在 `Scene::sync_focus` 中上报 `display(false).len()`，失焦清除。回归：inline_flow caret 几何、App set/get/clear 与陈旧文本错误、padding/border + 祖先滚动、Win32 `caret_forms` 与隐藏窗口 smoke、demo 输入框 caret 随「你好」右移并在失焦后 `Ok(None)` |
 | **V-107** | **P16 IME caret 的平台/表示限制** | ① `CFS_POINT` 允许 IME 按自身策略调整组合窗位置，不能保证与 `ptCurrentPos` 逐像素相等；不采用 `CFS_FORCE_POSITION`。② Windows 11 Microsoft Pinyin 的 TSF 路径可能自行决定候选窗位置（V-104 的组合串边界仍在）；`ImmSetCandidateWindow` 是 IMM32/CUAS 兼容提示，不是 TSF 文档管理器的完整实现。③ 空文本没有 parley 行 metrics，caret 高度用 `TextStyle.size × line_height.unwrap_or(1.0)` 近似，不含字体 leading。④ macOS/Linux 只做交叉编译静态检查，未实机验证 IME UI 位置；Wayland 当前绑定 `zwp_text_input_v3` v1，`commit()` 直接生效（v2+ 还需 surface commit，见 `platform/linux/surface.rs` 的实现注释）。⑤ 引擎仍无完整选区/`SetTextSelection`/插入点移动模型；`byte_index` 由应用维护 |
+
+---
+
+## 二十三、P17 · 引擎内置 Debug HUD（2026-11-13）
+
+本阶段范围是 `design/phase-17-debug-hud.md`。HUD 通过 `kytrix_gui` 的 `hud` feature 编译；
+demo 默认 feature `hud = ["kytrix_gui/hud"]`，因此默认显示、`--no-default-features` 可关闭。
+
+| 编号 | 条目 | 内容 |
+|---|---|---|
+| **F-155** | **新增 `App::set_debug_hud` / `App::debug_hud_enabled`** | HUD 是 root 末尾的普通子树（`debug-hud` + 10 个固定文本节点），右上角 244×184 浮层；`hit_shape(false)` 保证命中穿透，所有节点 `A11yOverride{hidden}`，不声明 Action/FocusRing。文本更新在 `App::frame` 内分两段：`prepare_debug_hud`（帧门禁前采样 + 请求 HUD damage）与 `apply_debug_hud`（`refresh_styles` 后、`refresh_text` 前直接 `set_text_content` + `mark_paint`）；`pending_text` 在成功提交后才清，帧中止时下一帧重写。HUD 可见时 `App::needs_continuous_frames` 让三平台定时器持续出帧，数字每 500 ms 汇总。`RenderStats` 由三平台 `Renderer::submit` 返回，DrawCall 按「full 一次 / 每个 damage scissor 一次」计数；`FrameTimings::sample` 提供 CPU/GPU/Upload/Present。 |
+| **V-108** | **P17 HUD 的边界** | ① `Frame`/`FPS` 采用相邻 `App::frame` 入口间隔（非 GPU 完成时刻）；CPU 行不含 `submit_gpu`/Present 等待。② 无 swapchain 的 offscreen 窗口 Present 段可能是 `0.00 ms` 而非 `--`。③ HUD 面板在小窗口上可占 damage 面积 >50%，此时 `DamageAccumulator` 退化为 full damage，不再保证 partial commit。④ 最小化/完全遮挡不做可见性过滤，HUD 可见期间仍按 60 Hz tick 唤醒。⑤ HUD 是普通 root 子树：`create_overlay`/`bring_overlay_to_front` 会自动把 HUD 提回最上层，但应用直接 `append_child` 的 root 子节点仍可能覆盖 HUD。⑥ 直接调用 `Window::frame` 不刷新 HUD 文本（HUD 没有 `bind_text`，不会触发 no-bindings 断言，但更新入口是 `App::frame`/`Application`）。⑦ macOS 交叉 `cargo check` 通过；Linux 交叉构建在 Windows 宿主缺 `pkg-config`/`wayland-client`/`fontconfig` sysroot 时无法完成，属环境限制，未伪装成通过。 |

@@ -58,13 +58,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 层 | 覆盖 | 命令 |
 |---|---|---|
 | L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API | `cargo test -p kytrix_gui` ← **只跑这些** |
-| L2 | 帧记录 / 布局命中集成测试 | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
+| L2 | 帧记录 / 布局命中 / HUD 集成测试 | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features "hud,test-support" --test hud`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
 | L3 | 像素 golden（Windows WARP） | `cargo test -p kytrix_gui --features test-support --test snapshot` |
 | L4 | criterion 基准（非门禁） | `cargo bench -p kytrix_gui --bench perf --no-run` / `cargo bench -p kytrix_gui --bench perf` |
 
 ```powershell
 # 全部（L0–L3）：注意 `--features test-support`，否则集成测试不会编译
 cargo test -p kytrix_gui --features test-support
+
+# P17：Debug HUD 的公开 API 集成测试（`hud` feature）
+cargo test -p kytrix_gui --features "hud,test-support" --test hud
 
 # 单独跑某一层
 cargo test -p kytrix_gui --features test-support --test frame_record
@@ -98,6 +101,9 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
   `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、
   **无障碍**（AccessKit 角色 / 名称 / `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、
   **滚动列表**。`--snapshot` 会先 `Scene::preview` 播种一套可截图的组合态（含内联组合串）。
+- **Debug HUD**（`design/phase-17-debug-hud.md`）：demo 默认启用 `kytrix_gui` 的 `hud` feature，
+  右上角显示 FPS / 帧时间 / CPU/GPU/Draw / Upload/Present / 分辨率/DPI/后端；F12 隐藏/显示。
+  `--snapshot` 不安装 HUD；`cargo run -p kytrix_gui_demo --no-default-features` 构建无 HUD demo。
 - demo 的集成测试（`cargo test -p kytrix_gui_demo`）用 dev-dependency 的 `kytrix_gui/test-support`
   跑无 GPU 帧驱动 + a11y 快照，与主二进制无关。
 - demo 自己的门禁：`cargo test -p kytrix_gui_demo` + `cargo +nightly clippy -p kytrix_gui_demo --all-targets --all-features -- -D warnings`。
@@ -112,7 +118,7 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 | 文档 | 内容 |
 |---|---|
 | `../../custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量） |
-| `../../design/phase-01…16-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
+| `../../design/phase-01…17-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
 | `../../design/DEVIATIONS.md` | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里 |
 | `../../AGENTS.md` | 仓库纪律（模块/测试/错误/依赖） |
 | `src/render/shaders/contract.md` | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |

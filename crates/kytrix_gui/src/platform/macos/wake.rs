@@ -1,4 +1,4 @@
-//! 跨线程唤醒（`CFRunLoopSource`）+ 动画定时器（`CFRunLoopTimer`）
+//! 跨线程唤醒（`CFRunLoopSource`）+ 连续帧定时器（`CFRunLoopTimer`）
 //! （`design/phase-12-macos-linux.md` §7.1）。
 //!
 //! `CFRunLoopSourceSignal` / `CFRunLoopWakeUp` / `CFRunLoopTimerInvalidate` 都是 CoreFoundation
@@ -142,7 +142,7 @@ pub(crate) fn signal() -> bool {
     true
 }
 
-/// 动画定时器开关（主线程；`pump` 每轮按 `app.has_animations()` 同步）。
+/// 连续帧定时器开关（主线程；`pump` 每轮按 `app.needs_continuous_frames()` 同步）。
 ///
 /// 打开：建一个 60 Hz 的 repeating timer 并挂到 common modes；关闭：`invalidate` + 从 run loop 移除。
 pub(crate) fn set_animating(active: bool, interval: f64) {

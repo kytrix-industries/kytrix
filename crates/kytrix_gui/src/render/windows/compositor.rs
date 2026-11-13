@@ -188,7 +188,7 @@ impl Renderer {
         buffer: &InstanceBuffer,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
-    ) -> Result<(), EngineError> {
+    ) -> Result<crate::render::RenderStats, EngineError> {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
@@ -246,6 +246,7 @@ impl Renderer {
             bottom: surface.1 as i32,
         };
 
+        let mut draw_calls = 0u32;
         let draw_result = {
             let list = queue.list(slot);
             if let Some(timer) = timer.as_ref() {
@@ -260,7 +261,9 @@ impl Renderer {
             }
             bind_frame(list, pipeline, persist, slot.index, &root);
             match full {
-                true => draw_ops(list, pipeline, buffer, geometry, &root, scissor_whole)?,
+                true => {
+                    draw_calls = draw_ops(list, pipeline, buffer, geometry, &root, scissor_whole)?;
+                }
                 false => match frame.plan() {
                     Plan::Idle | Plan::Full => {}
                     Plan::Partial(damage) => {
@@ -273,7 +276,9 @@ impl Renderer {
                             };
                             // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
                             unsafe { list.RSSetScissorRects(&[scissor]) };
-                            draw_ops(list, pipeline, buffer, geometry, &root, scissor)?;
+                            draw_calls = draw_calls.saturating_add(draw_ops(
+                                list, pipeline, buffer, geometry, &root, scissor,
+                            )?);
                         }
                     }
                 },
@@ -315,7 +320,10 @@ impl Renderer {
         });
 
         self.queue.release_completed(index, &mut self.device);
-        Ok(())
+        Ok(crate::render::RenderStats {
+            draw_calls,
+            instances: instance_count,
+        })
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。
@@ -562,7 +570,8 @@ fn draw_ops(
     geometry: &GeometryRegistry,
     root: &[f32; ROOT_UNIFORM_DWORDS],
     scissor: RECT,
-) -> Result<(), EngineError> {
+) -> Result<u32, EngineError> {
+    let mut draw_calls = 0u32;
     let mut quad_bound = false;
     for op in buffer.ops() {
         match *op {
@@ -587,6 +596,7 @@ fn draw_ops(
                 }
                 // SAFETY: 4 顶点 TriangleStrip + 实例区间 [start, start+len) 已在编码期校验。
                 unsafe { list.DrawInstanced(4, len, 0, start) };
+                draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry {
                 index,
@@ -626,11 +636,12 @@ fn draw_ops(
                     list.RSSetScissorRects(&[scissor]);
                     list.DrawIndexedInstanced(entry.index_count(), 1, 0, 0, 0);
                 }
+                draw_calls = draw_calls.saturating_add(1);
                 quad_bound = false;
             }
         }
     }
-    Ok(())
+    Ok(draw_calls)
 }
 fn copy_to_back(
     list: &ID3D12GraphicsCommandList,
@@ -1111,15 +1122,51 @@ mod tests {
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
-        renderer
+        let stats = renderer
             .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
+        assert_eq!(stats.draw_calls, 1, "one non-empty instance op = one draw");
+        assert_eq!(stats.instances, 1);
         let image = renderer.readback().expect("readback");
         assert_eq!(pixel(&image, 64, 24, 24), [255, 0, 0, 255]);
         assert_eq!(pixel(&image, 64, 4, 4), [0, 0, 0, 0]);
     }
 
     /// 白底 + 红 damage：两帧都是非空场景，damage 之外的蓝块必须原样保留（B5）。
+    #[test]
+    fn draw_calls_follow_full_and_partial_scissor_passes() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((64, 64)) else {
+            return;
+        };
+        let scene = one_lane_scene(quad(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        ));
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let mut timings = FrameTimings::new();
+
+        let mut first = full_plan((64, 64));
+        let stats = renderer
+            .submit(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+            .expect("full frame");
+        assert_eq!(stats.draw_calls, 1, "full frame has one scissor pass");
+
+        let damage = [
+            PhysicalRect::new(0, 0, 32, 64),
+            PhysicalRect::new(32, 0, 64, 64),
+        ];
+        let mut second = partial_plan(&damage, (64, 64));
+        let stats = renderer
+            .submit(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+            .expect("partial frame");
+        assert_eq!(
+            stats.draw_calls, 2,
+            "each damage scissor repeats the draw op list"
+        );
+    }
+
     #[test]
     fn damage_isolates_pixels_across_two_real_frames() {
         let _guard = lock();

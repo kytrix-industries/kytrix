@@ -231,6 +231,21 @@ pub struct Window {
     a11y: crate::a11y::adapter::A11yBridge,
     /// IME caret hint（P16：应用声明的文本节点 + UTF-8 字节偏移）。
     ime_cursor: Option<ImeCursorRequest>,
+    /// 最近一帧的实际 GPU 绘制统计（P17 HUD）。
+    #[cfg(feature = "hud")]
+    render_stats: crate::render::RenderStats,
+    /// 最近一帧的 CPU 时间（`begin_frame` → `paint_frame` 结束）。
+    #[cfg(feature = "hud")]
+    frame_cpu: Option<std::time::Duration>,
+    /// 最近两次提交帧入口的间隔（首帧为 `None`）。
+    #[cfg(feature = "hud")]
+    frame_interval: Option<std::time::Duration>,
+    /// 上一次提交帧的入口时间戳（App 时钟；用于 HUD 帧间隔）。
+    #[cfg(feature = "hud")]
+    last_commit_at: Option<std::time::Instant>,
+    /// 当前帧开始时间（仅 CPU 计时用；中止/空闲时清空）。
+    #[cfg(feature = "hud")]
+    frame_started_at: Option<std::time::Instant>,
 }
 
 impl Window {
@@ -263,6 +278,16 @@ impl Window {
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
             ime_cursor: None,
+            #[cfg(feature = "hud")]
+            render_stats: crate::render::RenderStats::default(),
+            #[cfg(feature = "hud")]
+            frame_cpu: None,
+            #[cfg(feature = "hud")]
+            frame_interval: None,
+            #[cfg(feature = "hud")]
+            last_commit_at: None,
+            #[cfg(feature = "hud")]
+            frame_started_at: None,
         }
     }
 
@@ -516,7 +541,12 @@ impl Window {
             // 已经是 Pending/Draining：重复请求不产生新帧。
             return None;
         }
-        self.scheduler.begin()
+        let ticket = self.scheduler.begin()?;
+        #[cfg(feature = "hud")]
+        {
+            self.frame_started_at = Some(std::time::Instant::now());
+        }
+        Some(ticket)
     }
 
     /// 仅当有 `LAYOUT` 时才重排（纯颜色变化不跑布局）。
@@ -689,6 +719,10 @@ impl Window {
             let _ = buffer;
             let _ = &mut report;
         }
+        #[cfg(feature = "hud")]
+        {
+            self.frame_cpu = self.frame_started_at.map(|started| started.elapsed());
+        }
         Ok(report)
     }
 
@@ -713,6 +747,11 @@ impl Window {
         );
         if !has_pixels {
             self.scheduler.abort(ticket);
+            #[cfg(feature = "hud")]
+            {
+                self.frame_started_at = None;
+                self.frame_cpu = None;
+            }
             #[cfg(feature = "test-support")]
             self.record_idle();
             return Ok(FrameOutcome::Idle);
@@ -722,7 +761,15 @@ impl Window {
         if let Some(mut renderer) = self.renderer.take() {
             let result = self.submit_gpu(&mut renderer, index, report.damage);
             self.renderer = Some(renderer);
-            result?;
+            let stats = result?;
+            #[cfg(feature = "hud")]
+            {
+                self.render_stats = stats;
+            }
+            #[cfg(not(feature = "hud"))]
+            {
+                let _ = stats;
+            }
         }
         #[cfg(feature = "test-support")]
         {
@@ -750,7 +797,7 @@ impl Window {
         renderer: &mut Renderer,
         index: FrameIndex,
         damage: DamageSummary,
-    ) -> Result<(), EngineError> {
+    ) -> Result<crate::render::RenderStats, EngineError> {
         let surface = self.physical_surface();
         let frame = Rect::new(0.0, 0.0, self.size().width, self.size().height)
             .to_physical_covering(self.scale);
@@ -760,11 +807,11 @@ impl Window {
         }
         let plan = plan(damage, self.damage.rects(), frame);
         if plan == Plan::Idle && !fresh {
-            return Ok(());
+            return Ok(crate::render::RenderStats::default());
         }
         let mut frame_plan = FramePlan::new(plan, fresh);
         if frame_plan.is_idle() {
-            return Ok(());
+            return Ok(crate::render::RenderStats::default());
         }
         let Window {
             encoder,
@@ -779,6 +826,11 @@ impl Window {
     /// 中止（错误路径）：不结算、不递增序号（damage/dirty 保留，下一次重试）。
     pub(crate) fn abort_frame(&mut self, ticket: FrameTicket) {
         self.scheduler.abort(ticket);
+        #[cfg(feature = "hud")]
+        {
+            self.frame_started_at = None;
+            self.frame_cpu = None;
+        }
         #[cfg(feature = "test-support")]
         self.record_idle();
     }
@@ -847,6 +899,59 @@ impl Window {
     #[cfg(feature = "test-support")]
     pub(crate) fn set_frame_stats(&mut self, stats: FrameStats) {
         self.stats = stats;
+    }
+
+    /// 重置 HUD 的提交时间基准（开启/重新开启 HUD 时调用）。
+    #[cfg(feature = "hud")]
+    pub(crate) fn reset_debug_hud_timing(&mut self) {
+        self.render_stats = crate::render::RenderStats::default();
+        self.frame_cpu = None;
+        self.frame_interval = None;
+        self.last_commit_at = None;
+        self.frame_started_at = None;
+    }
+
+    /// 记录一次提交的时间戳（P17 HUD 的帧间隔/FPS 来源）。
+    #[cfg(feature = "hud")]
+    pub(crate) fn note_debug_hud_commit(&mut self, now: std::time::Instant) {
+        self.frame_interval = self
+            .last_commit_at
+            .map(|previous| now.saturating_duration_since(previous));
+        self.last_commit_at = Some(now);
+    }
+
+    /// 最近提交帧的 HUD 指标（P17）。
+    #[cfg(feature = "hud")]
+    pub(crate) fn debug_hud_metrics(&self) -> crate::debug_hud::DebugHudMetrics {
+        use crate::render::timer::Section;
+
+        let (physical_width, physical_height) = self.physical_surface();
+        let upload_time = self
+            .timings
+            .sample(Section::Upload)
+            .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
+        let gpu_time = self
+            .timings
+            .sample(Section::Gpu)
+            .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns));
+        let present_time = self
+            .timings
+            .sample(Section::Present)
+            .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
+        crate::debug_hud::DebugHudMetrics {
+            frame_index: self.frame_index(),
+            frame_interval: self.frame_interval,
+            cpu_time: self.frame_cpu,
+            upload_time,
+            gpu_time,
+            present_time,
+            draw_calls: self.render_stats.draw_calls,
+            instances: self.render_stats.instances,
+            primitives: self.scene.primitive_count(),
+            physical_width,
+            physical_height,
+            scale: self.scale.factor(),
+        }
     }
 
     /// 强制全量重绘（oracle 的「全量」路径）：清 `REUSABLE` + 清空所有 lane 的内容。

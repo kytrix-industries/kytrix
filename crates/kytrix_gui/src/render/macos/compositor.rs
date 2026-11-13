@@ -156,7 +156,7 @@ impl Renderer {
         buffer: &InstanceBuffer,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
-    ) -> Result<(), EngineError> {
+    ) -> Result<crate::render::RenderStats, EngineError> {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
@@ -180,7 +180,7 @@ impl Renderer {
         let drawable = match self.swapchain.as_ref() {
             Some(swapchain) => match swapchain.next_drawable() {
                 Some(drawable) => Some(drawable),
-                None => return Ok(()),
+                None => return Ok(crate::render::RenderStats::default()),
             },
             None => None,
         };
@@ -203,6 +203,7 @@ impl Renderer {
         });
 
         let full = frame.is_full();
+        let mut draw_calls = 0u32;
 
         if self.atlas.has_pending() {
             let blit = command
@@ -232,14 +233,18 @@ impl Renderer {
             match full {
                 true => {
                     encoder.setScissorRect(whole_scissor(self.surface));
-                    draw_ops(&encoder, buffer, instance_count)?;
+                    draw_calls = draw_ops(&encoder, buffer, instance_count)?;
                 }
                 false => match frame.plan() {
                     Plan::Idle | Plan::Full => {}
                     Plan::Partial(damage) => {
                         for rect in damage.as_slice() {
                             encoder.setScissorRect(scissor_for(rect));
-                            draw_ops(&encoder, buffer, instance_count)?;
+                            draw_calls = draw_calls.saturating_add(draw_ops(
+                                &encoder,
+                                buffer,
+                                instance_count,
+                            )?);
                         }
                     }
                 },
@@ -300,7 +305,10 @@ impl Renderer {
         );
 
         self.queue.release_completed(index, &mut self.device);
-        Ok(())
+        Ok(crate::render::RenderStats {
+            draw_calls,
+            instances: instance_count,
+        })
     }
 
     /// 读回持久 offscreen（快照；同步等待 GPU 完成）。
@@ -575,7 +583,8 @@ fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     buffer: &InstanceBuffer,
     instance_count: u32,
-) -> Result<(), EngineError> {
+) -> Result<u32, EngineError> {
+    let mut draw_calls = 0u32;
     for op in buffer.ops() {
         match *op {
             FrameOp::Instances { start, len } => {
@@ -593,6 +602,7 @@ fn draw_ops(
                         start as usize,
                     );
                 }
+                draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry { index, .. } => {
                 return Err(EngineError::GeometryRegister {
@@ -603,7 +613,7 @@ fn draw_ops(
             }
         }
     }
-    Ok(())
+    Ok(draw_calls)
 }
 
 /// 整面 blit（**每帧**，因为 drawable 内容跨帧无保证）。

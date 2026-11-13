@@ -21,8 +21,8 @@ use crate::{
     render::backend::Renderer,
 };
 
-/// 动画时的定时器间隔（60 Hz）。
-const ANIMATION_TICK: Duration = Duration::from_millis(16);
+/// 连续帧（动画 / P17 HUD）的定时器间隔（60 Hz）。
+const FRAME_TICK: Duration = Duration::from_millis(16);
 
 /// `Application::run` 的平台入口。
 pub(crate) fn run(app: App) -> Result<(), EngineError> {
@@ -151,13 +151,13 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             ));
             state.update_a11y(&mut a11y, &mut app);
 
-            // ⑥ 动画：定时器语义由 `dispatch` 的 timeout 提供，醒来后主动请求一帧
-            // （否则 tick 只更新状态、不出帧）。
-            if app.has_animations() {
+            // ⑥ 连续帧（动画 / P17 HUD）：定时器语义由 `dispatch` 的 timeout 提供，
+            // 醒来后主动请求一帧（否则 tick 只更新状态、不出帧）。
+            if app.needs_continuous_frames() {
                 dispatcher.wake();
             }
-            let timeout = if app.has_animations() {
-                ANIMATION_TICK
+            let timeout = if app.needs_continuous_frames() {
+                FRAME_TICK
             } else {
                 surface::IDLE_TIMEOUT
             };

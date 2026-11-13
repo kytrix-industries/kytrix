@@ -155,7 +155,7 @@ impl Renderer {
         buffer: &InstanceBuffer,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
-    ) -> Result<(), EngineError> {
+    ) -> Result<crate::render::RenderStats, EngineError> {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
@@ -170,6 +170,7 @@ impl Renderer {
         buffer.write_clips_gpu(&mut self.clips);
         let slot: FrameSlot = self.device.begin(index)?;
 
+        let instances = (buffer.as_bytes().len() / 128) as u32;
         let (_instance_bytes, clip_offset, _clip_bytes) = self.upload.write(
             &mut self.device,
             index,
@@ -188,7 +189,7 @@ impl Renderer {
                 .resize(&self.instance, &self.device, self.surface)?;
             image_index = self.swapchain.acquire(&self.device, index.get() as u64)?;
             if image_index == u32::MAX {
-                return Ok(());
+                return Ok(crate::render::RenderStats::default());
             }
         }
         timings.push(GpuTimerSample {
@@ -222,7 +223,7 @@ impl Renderer {
         }
 
         let full = frame.is_full();
-        self.draw(command, slot.index, buffer, frame, full)?;
+        let draw_calls = self.draw(command, slot.index, buffer, frame, full)?;
         self.copy_to_swapchain(command, image_index)?;
         if let Some(timer) = self.timer.as_ref() {
             timer.end(command, slot.index);
@@ -268,7 +269,10 @@ impl Renderer {
 
         self.submitted = index.get() as u64;
         self.device.drain_retire(index);
-        Ok(())
+        Ok(crate::render::RenderStats {
+            draw_calls,
+            instances,
+        })
     }
 
     /// 读回持久 offscreen（快照路径；同步等待 GPU）。
@@ -359,7 +363,8 @@ impl Renderer {
         buffer: &InstanceBuffer,
         frame: &FramePlan,
         full: bool,
-    ) -> Result<(), EngineError> {
+    ) -> Result<u32, EngineError> {
+        let mut draw_calls = 0u32;
         let extent = self.swapchain.extent();
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -432,7 +437,7 @@ impl Renderer {
                         }],
                     );
                 }
-                draw_ops(&self.device, command, buffer)?;
+                draw_calls = draw_ops(&self.device, command, buffer)?;
             }
             false => {
                 if let Plan::Partial(damage) = frame.plan() {
@@ -451,7 +456,8 @@ impl Renderer {
                         unsafe {
                             self.device.raw().cmd_set_scissor(command, 0, &[scissor]);
                         }
-                        draw_ops(&self.device, command, buffer)?;
+                        draw_calls =
+                            draw_calls.saturating_add(draw_ops(&self.device, command, buffer)?);
                     }
                 }
             }
@@ -461,7 +467,7 @@ impl Renderer {
         unsafe {
             self.device.raw().cmd_end_render_pass(command);
         }
-        Ok(())
+        Ok(draw_calls)
     }
 
     /// persist → swapchain 整面 copy + 两侧 barrier（§6.6 的表）。
@@ -936,7 +942,8 @@ fn draw_ops(
     device: &Device,
     command: vk::CommandBuffer,
     buffer: &InstanceBuffer,
-) -> Result<(), EngineError> {
+) -> Result<u32, EngineError> {
+    let mut draw_calls = 0u32;
     for op in buffer.ops() {
         match *op {
             FrameOp::Instances { start, len } => {
@@ -947,6 +954,7 @@ fn draw_ops(
                 unsafe {
                     device.raw().cmd_draw(command, 4, len, start, 0);
                 }
+                draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry { index, .. } => {
                 return Err(EngineError::GeometryRegister {

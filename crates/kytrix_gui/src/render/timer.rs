@@ -55,6 +55,15 @@ impl FrameTimings {
     pub(crate) fn frame(&self) -> FrameIndex {
         self.frame
     }
+
+    /// 某一分段的本帧采样（P17 HUD）。同段最多一条，顺序由后端写入。
+    #[cfg(feature = "hud")]
+    pub(crate) fn sample(&self, section: Section) -> Option<GpuTimerSample> {
+        self.samples
+            .iter()
+            .find(|sample| sample.section == section)
+            .copied()
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +93,26 @@ mod tests {
     fn sections_have_a_stable_order() {
         assert!(Section::Upload < Section::Gpu);
         assert!(Section::Gpu < Section::Present);
+    }
+
+    #[cfg(feature = "hud")]
+    #[test]
+    fn sample_returns_the_first_matching_section() {
+        let mut timings = FrameTimings::new();
+        timings.reset(FrameIndex::from_raw(1));
+        assert_eq!(timings.sample(Section::Upload), None);
+        timings.push(GpuTimerSample {
+            section: Section::Upload,
+            cpu_ns: 10,
+            gpu_ns: 0,
+        });
+        timings.push(GpuTimerSample {
+            section: Section::Gpu,
+            cpu_ns: 0,
+            gpu_ns: 20,
+        });
+        assert_eq!(timings.sample(Section::Upload).map(|s| s.cpu_ns), Some(10));
+        assert_eq!(timings.sample(Section::Gpu).map(|s| s.gpu_ns), Some(20));
+        assert_eq!(timings.sample(Section::Present), None);
     }
 }

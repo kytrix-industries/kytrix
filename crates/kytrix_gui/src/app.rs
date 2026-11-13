@@ -15,6 +15,8 @@ use std::{
 
 use smallvec::{SmallVec, smallvec};
 
+#[cfg(feature = "hud")]
+use crate::debug_hud::{self, DebugHudState};
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameStats, LaneOutcome};
 use crate::{
@@ -132,6 +134,9 @@ pub struct App {
     >,
     /// a11y 诊断（P11；环形上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
     a11y_diagnostics: Vec<crate::a11y::A11yDiagnostic>,
+    /// 每窗口的 Debug HUD 运行状态（P17；feature 关闭时字段不存在）。
+    #[cfg(feature = "hud")]
+    debug_hud: ahash::HashMap<WindowId, DebugHudState>,
 }
 
 /// 一次点击的记录（双击判定的输入）。
@@ -333,6 +338,8 @@ impl App {
             capture_request: None,
             a11y_handlers: ahash::HashMap::default(),
             a11y_diagnostics: Vec::new(),
+            #[cfg(feature = "hud")]
+            debug_hud: ahash::HashMap::default(),
         }
     }
 
@@ -1659,6 +1666,8 @@ impl App {
                 dismiss: options.dismiss,
             });
         }
+        #[cfg(feature = "hud")]
+        self.raise_debug_hud(window);
         self.request_frame();
         Ok(Overlay::new(window, node))
     }
@@ -1694,6 +1703,8 @@ impl App {
         if target.tree_mut().append_child(root, node).is_err() {
             return false;
         }
+        #[cfg(feature = "hud")]
+        self.raise_debug_hud(window);
         self.request_frame();
         true
     }
@@ -1880,6 +1891,25 @@ impl App {
         !self.animations.is_empty()
     }
 
+    /// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
+    pub(crate) fn needs_continuous_frames(&self) -> bool {
+        if self.has_animations() {
+            return true;
+        }
+        #[cfg(feature = "hud")]
+        {
+            self.debug_hud.iter().any(|(window, state)| {
+                self.windows
+                    .get(window)
+                    .is_some_and(|target| target.tree().get(state.root()).is_ok())
+            })
+        }
+        #[cfg(not(feature = "hud"))]
+        {
+            false
+        }
+    }
+
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
         if let Some(target) = self.windows.get_mut(&window) {
             for node in nodes {
@@ -1984,6 +2014,8 @@ impl App {
     pub fn close_window(&mut self, id: WindowId) -> bool {
         // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
         self.animations.retain(|slot| slot.window != id);
+        #[cfg(feature = "hud")]
+        self.debug_hud.remove(&id);
         self.last_click = self.last_click.filter(|record| record.window != id);
         let Some(window) = self.windows.remove(&id) else {
             return false;
@@ -2010,6 +2042,101 @@ impl App {
     /// 拿不到「这是哪个窗口」（消费者：P09 的帧驱动、测试）。
     pub fn windows(&self) -> impl Iterator<Item = (WindowId, &Window)> {
         self.windows.iter().map(|(id, window)| (*id, window))
+    }
+
+    /// 显示或隐藏内置 Debug HUD（P17；需要 `hud` feature）。
+    ///
+    /// HUD 是窗口 root 末尾的普通子树：右上角浮动、不参与文档流、命中穿透、a11y 隐藏。
+    /// 可见时平台泵会持续出帧，数字每 500 ms 汇总一次。应用应在建完静态场景后开启 HUD；
+    /// 之后再追加的 root 子节点可能盖在它上面。
+    ///
+    /// # Errors
+    /// `EngineError::UnknownWindow`：窗口不存在。建树失败时返回底层 `StaleNode` 等错误，
+    /// 且不会留下半棵 HUD 子树。
+    #[cfg(feature = "hud")]
+    pub fn set_debug_hud(&mut self, window: WindowId, enabled: bool) -> Result<(), EngineError> {
+        if !self.windows.contains_key(&window) {
+            return Err(EngineError::UnknownWindow { window });
+        }
+        let mut changed = false;
+        if enabled {
+            if let Some(root) = self.debug_hud.get(&window).map(DebugHudState::root) {
+                // 外部若删掉了 HUD 子树，map 里的句柄会陈旧；重新安装而不是假装成功。
+                let valid = self
+                    .windows
+                    .get(&window)
+                    .is_some_and(|target| target.tree().get(root).is_ok());
+                if valid {
+                    return Ok(());
+                }
+                self.debug_hud.remove(&window);
+            }
+            let Some(target) = self.windows.get_mut(&window) else {
+                return Err(EngineError::UnknownWindow { window });
+            };
+            let state = debug_hud::install(target, self.clock)?;
+            self.debug_hud.insert(window, state);
+            changed = true;
+        } else if let Some(state) = self.debug_hud.remove(&window) {
+            self.remove_node(window, state.root());
+            changed = true;
+        }
+        if changed {
+            self.request_frame();
+        }
+        Ok(())
+    }
+
+    /// 该窗口是否安装了 Debug HUD（未知窗口返回 `false`）。
+    #[cfg(feature = "hud")]
+    #[must_use]
+    pub fn debug_hud_enabled(&self, window: WindowId) -> bool {
+        let Some(state) = self.debug_hud.get(&window) else {
+            return false;
+        };
+        self.windows
+            .get(&window)
+            .is_some_and(|target| target.tree().get(state.root()).is_ok())
+    }
+
+    /// 帧门禁前更新 HUD 的采样/文本暂存，并请求 HUD damage。
+    #[cfg(feature = "hud")]
+    fn prepare_debug_hud(&mut self, window: WindowId) {
+        let now = self.clock;
+        let Some(state) = self.debug_hud.get_mut(&window) else {
+            return;
+        };
+        let Some(target) = self.windows.get_mut(&window) else {
+            return;
+        };
+        debug_hud::prepare_frame(state, target, now);
+    }
+
+    /// `refresh_styles` 之后、`refresh_text` 之前写入 HUD 文本。
+    #[cfg(feature = "hud")]
+    fn apply_debug_hud(&mut self, window: WindowId) {
+        let Some(state) = self.debug_hud.get_mut(&window) else {
+            return;
+        };
+        let Some(target) = self.windows.get_mut(&window) else {
+            return;
+        };
+        debug_hud::apply_frame(state, target);
+    }
+
+    /// 新 overlay 会 append 到 root 末尾；HUD 必须保持在最上层。
+    #[cfg(feature = "hud")]
+    fn raise_debug_hud(&mut self, window: WindowId) {
+        let Some(state) = self.debug_hud.get(&window) else {
+            return;
+        };
+        let hud = state.root();
+        let Some(target) = self.windows.get_mut(&window) else {
+            return;
+        };
+        let tree = target.tree_mut();
+        let root = tree.root();
+        let _ = tree.append_child(root, hud);
     }
 
     // ── 帧内：样式求值 pass ────────────────────────────────────────────────────
@@ -2289,6 +2416,10 @@ impl App {
         if !self.windows.contains_key(&window) {
             return None;
         }
+        #[cfg(feature = "hud")]
+        let committed_at = self.clock;
+        #[cfg(feature = "hud")]
+        self.prepare_debug_hud(window);
         let wake = self.take_wake_request();
         // P10：动画在帧门禁**之前**推进（写 `Transient` + 给注册节点标 `PAINT`），因此「有动画」必然
         // 让 `needs_frame` 为真；动画结束后不再留帧。
@@ -2308,6 +2439,10 @@ impl App {
             self.abort_frame(window, ticket);
             return None;
         };
+        // P17：必须在 refresh_styles 之后写 HUD 文本，否则 `clear_paint` 会吞掉脏位；
+        // 又必须在 refresh_text 之前，让新文本在同一帧完成 shape。
+        #[cfg(feature = "hud")]
+        self.apply_debug_hud(window);
         let text = match self.refresh_text(window) {
             Some(Ok(report)) => report,
             Some(Err(error)) => {
@@ -2394,7 +2529,15 @@ impl App {
             self.abort_frame(window, ticket);
             return None;
         };
-        Some(target.commit_frame(ticket, paint))
+        let outcome = target.commit_frame(ticket, paint);
+        #[cfg(feature = "hud")]
+        if matches!(outcome, Ok(FrameOutcome::Committed(_))) {
+            if let Some(state) = self.debug_hud.get_mut(&window) {
+                debug_hud::finish_frame(state);
+            }
+            target.note_debug_hud_commit(committed_at);
+        }
+        Some(outcome)
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。
@@ -2486,8 +2629,15 @@ impl App {
 
             let measured = shaped.measure(known, available);
             let previous = tree.text_measured_size(node).unwrap_or(Size::ZERO);
-            let size_changed = previous.width.to_bits() != measured.width.to_bits()
-                || previous.height.to_bits() != measured.height.to_bits();
+            // `LayoutOverride` 节点的尺寸由应用固定，文本 intrinsic size 变化不可能影响布局；
+            // 不置 LAYOUT，避免 HUD 每 500 ms 触发一次全窗口重排。`layout_text` 仍会按新
+            // ShapedText 重排/重建 ShapedLine（`set_text_shaped` 已清 line/width）。
+            let fixed_layout = tree
+                .get(node)
+                .is_ok_and(|target| target.layout_override().is_some());
+            let size_changed = !fixed_layout
+                && (previous.width.to_bits() != measured.width.to_bits()
+                    || previous.height.to_bits() != measured.height.to_bits());
             tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
         }
         report.dirty_spans = pending_dirty.spans().len();

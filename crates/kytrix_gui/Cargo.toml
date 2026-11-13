@@ -9,6 +9,8 @@ build = "build.rs"
 # 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle/诊断）。**不进发布物**（I7 / §6.6）；
 # 集成测试 `tests/frame_record.rs` 与 `tests/snapshot.rs` 通过 `required-features` 依赖它。
 test-support = []
+# P17：内置 Debug HUD（`App::set_debug_hud`）。默认关闭；demo 通过自身默认 feature 打开。
+hud = []
 
 [[test]]
 name = "frame_record"
@@ -26,6 +28,12 @@ required-features = ["test-support"]
 name = "layout"
 path = "tests/layout.rs"
 required-features = ["test-support"]
+
+# P17：Debug HUD 的公开 API / 命中穿透 / 持续帧 / 500 ms 汇总。
+[[test]]
+name = "hud"
+path = "tests/hud.rs"
+required-features = ["hud", "test-support"]
 
 # P13：L4 基准（criterion 自带 harness）。
 [[bench]]

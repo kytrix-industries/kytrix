@@ -12,6 +12,7 @@ pub(crate) mod compositor;
 pub(crate) mod damage;
 pub(crate) mod frame;
 pub(crate) mod retire;
+pub(crate) mod stats;
 pub(crate) mod timer;
 
 #[cfg(target_os = "linux")]
@@ -26,5 +27,6 @@ pub(crate) use atlas::{Allocation, AtlasAllocator, DirtyRows};
 pub(crate) use linux as backend;
 #[cfg(target_os = "macos")]
 pub(crate) use macos as backend;
+pub(crate) use stats::RenderStats;
 #[cfg(windows)]
 pub(crate) use windows as backend;

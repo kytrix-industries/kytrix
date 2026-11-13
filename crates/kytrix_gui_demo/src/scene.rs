@@ -73,6 +73,10 @@ const TITLE_RECT: Rect = Rect::new(24.0, 14.0, 800.0, 34.0);
 /// 副标题矩形。
 const SUBTITLE_RECT: Rect = Rect::new(24.0, 50.0, 912.0, 20.0);
 /// 副标题文案。
+#[cfg(feature = "hud")]
+const SUBTITLE: &str = "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · F12 调试 HUD · Esc 退出";
+/// 无 HUD 构建的副标题。
+#[cfg(not(feature = "hud"))]
 const SUBTITLE: &str =
     "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · Esc 退出";
 
@@ -227,7 +231,7 @@ impl Scene {
         }
     }
 
-    /// 安装交互：动作处理器 + 帧钩子 + 初始焦点（色块 1，焦点环可见）。
+    /// 安装交互：动作处理器 + 帧钩子 + 初始焦点（色块 1，焦点环可见）+ P17 HUD。
     pub fn install(app: &mut App, scene: Self) {
         swatch::install(app, &scene);
         a11y::install(app, &scene);
@@ -238,6 +242,10 @@ impl Scene {
                 FocusView::resolve(Some(first), &scene.focus_targets),
             );
             let _ = app.write(&scene.input_focused, first == scene.ime_field);
+        }
+        #[cfg(feature = "hud")]
+        {
+            let _ = app.set_debug_hud(scene.window, true);
         }
         let mut hook = scene;
         app.on_frame(move |app| hook.tick(app));
@@ -301,6 +309,16 @@ impl Scene {
     fn handle_event(&mut self, app: &mut App, event: &Event) {
         let focused = app.focused(self.window);
         match event {
+            #[cfg(feature = "hud")]
+            Event::Input(InputEvent::Key {
+                key: Key::Function(12),
+                state: KeyState::Down,
+                modifiers,
+                ..
+            }) if modifiers.is_empty() => {
+                let enabled = !app.debug_hud_enabled(self.window);
+                let _ = app.set_debug_hud(self.window, enabled);
+            }
             Event::Input(InputEvent::Key {
                 key: Key::Escape,
                 state: KeyState::Down,

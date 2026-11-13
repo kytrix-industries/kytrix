@@ -42,8 +42,8 @@ use crate::{
     window::{WindowId, WindowOptions},
 };
 
-/// 动画 tick 的定时器 id（`wndproc` 用它唤醒；P09 probe 实测 1 ms → 16.0 ms）。
-const ANIMATION_TIMER_ID: usize = 1;
+/// 连续帧定时器 id（动画 / P17 HUD 共用；`wndproc` 用它唤醒；P09 probe 实测 1 ms → 16.0 ms）。
+const FRAME_TIMER_ID: usize = 1;
 
 /// 用系统设置初始化输入阈值（双击时间 + 拖拽/双击的距离容差，§5.4）。
 fn install_input_thresholds(app: &mut App) {
@@ -247,8 +247,9 @@ pub(crate) extern "system" fn wndproc(
             return LRESULT(0);
         }
         if msg == WM_TIMER {
-            // 动画 tick：只唤醒，推进在 `App::frame` 的 `tick_animations`。
-            if wparam.0 == ANIMATION_TIMER_ID {
+            // 连续帧 tick：只唤醒；动画推进在 `App::frame` 的 `tick_animations`，
+            // P17 HUD 的采样/请求 damage 在 `App::frame` 的 `prepare_debug_hud`。
+            if wparam.0 == FRAME_TIMER_ID {
                 state.wake();
                 return LRESULT(0);
             }
@@ -413,7 +414,7 @@ fn pump(
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let mut message = MSG::default();
-    let mut animation_timer: Option<usize> = None;
+    let mut frame_timer: Option<usize> = None;
     loop {
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
@@ -436,7 +437,7 @@ fn pump(
         app.sync_clock();
         collect_events(&mut app, &mut windows, &dispatcher)?;
 
-        // ②b 交互反馈：光标 / 指针捕获 / 动画定时器（P10 §5.4 / §11.3）。
+        // ②b 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             if let Some(cursor) = app.take_cursor_change() {
@@ -452,18 +453,18 @@ fn pump(
                     let _ = unsafe { ReleaseCapture() };
                 }
             }
-            match (app.has_animations(), animation_timer) {
+            match (app.needs_continuous_frames(), frame_timer) {
                 (true, None) => {
                     // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
-                    let id = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, 1, None) };
+                    let id = unsafe { SetTimer(Some(hwnd), FRAME_TIMER_ID, 1, None) };
                     if id != 0 {
-                        animation_timer = Some(id);
+                        frame_timer = Some(id);
                     }
                 }
                 (false, Some(id)) => {
                     // SAFETY: `id` 由本线程的 `SetTimer` 产生。
                     let _ = unsafe { KillTimer(Some(hwnd), id) };
-                    animation_timer = None;
+                    frame_timer = None;
                 }
                 _ => {}
             }

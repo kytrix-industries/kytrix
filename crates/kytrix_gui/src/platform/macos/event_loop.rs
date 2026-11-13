@@ -1,9 +1,9 @@
-//! 引擎自有事件循环（`NSApplication` + `CFRunLoopSource` 唤醒 + 动画定时器）
+//! 引擎自有事件循环（`NSApplication` + `CFRunLoopSource` 唤醒 + 连续帧定时器）
 //! （`design/phase-12-macos-linux.md` §7.1）。
 //!
 //! 结构：
 //! - 主线程：`nextEventMatchingMask:` 排空事件 → `sendEvent:`（AppKit 同步回调 `GuiView`）→ 泵；
-//!   空闲时用 `distantFuture` 阻塞，**唤醒源 / 动画定时器**在 run loop 上直接执行泵（不轮询，I3）。
+//!   空闲时用 `distantFuture` 阻塞，**唤醒源 / 连续帧定时器**在 run loop 上直接执行泵（不轮询，I3）。
 //! - 跨线程：`Dispatcher::wake` → `CFRunLoopSourceSignal` + `CFRunLoopWakeUp`。
 //!
 //! `App` 以 `Box` 存放、地址稳定；两个 C 回调只在主线程、且主线程阻塞在 run loop 时执行
@@ -179,7 +179,7 @@ fn pump(state: &mut LoopState) -> Result<(), EngineError> {
     app.run_frame_hook();
     // 动画期间每个 tick（定时器回调 → 本函数）都要出帧：定时器只负责唤醒 run loop，
     // 帧请求仍走 `Dispatcher`（与 Win32 的 `WM_TIMER → wake` 同一语义）。
-    if app.has_animations() {
+    if app.needs_continuous_frames() {
         state.dispatcher.wake();
     }
     if state.dispatcher.take_frame_wake() {
@@ -202,9 +202,9 @@ fn pump(state: &mut LoopState) -> Result<(), EngineError> {
         task.run(app);
     }
 
-    // 动画定时器：有动画才挂（空闲零唤醒）。
+    // 连续帧定时器：有动画或 HUD 可见才挂（其余时间空闲零唤醒）。
     if let Some(native) = state.windows.first() {
-        native.set_animating(app.has_animations());
+        native.set_animating(app.needs_continuous_frames());
     }
 
     // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。

@@ -483,6 +483,40 @@ fn window_focus_loss_cancels_the_composition_too() {
     );
 }
 
+#[cfg(feature = "hud")]
+#[test]
+fn f12_toggles_the_hud_and_snapshot_build_has_none() {
+    let (mut test, window, _scene) = setup();
+    assert!(
+        !test.app().debug_hud_enabled(window),
+        "snapshot 路径（build_into）不得安装 HUD"
+    );
+    frame(&mut test);
+
+    let (mut test, window, mut scene) = setup_installed();
+    assert!(test.app().debug_hud_enabled(window), "真实路径默认开启 HUD");
+    frame(&mut test);
+
+    scene::dispatch_event(
+        &mut scene,
+        test.app_mut(),
+        &Event::Input(press(Key::Function(12))),
+    );
+    frame(&mut test);
+    assert!(!test.app().debug_hud_enabled(window), "F12 必须隐藏 HUD");
+
+    scene::dispatch_event(
+        &mut scene,
+        test.app_mut(),
+        &Event::Input(press(Key::Function(12))),
+    );
+    frame(&mut test);
+    assert!(
+        test.app().debug_hud_enabled(window),
+        "第二次 F12 必须重新显示 HUD"
+    );
+}
+
 #[test]
 fn preview_seeds_the_snapshot_state() {
     let (mut test, window, scene) = setup();

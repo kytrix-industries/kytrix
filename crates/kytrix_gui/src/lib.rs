@@ -21,5 +21,7 @@ pub mod window;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+#[cfg(feature = "hud")]
+mod debug_hud;
 mod platform;
 mod render;

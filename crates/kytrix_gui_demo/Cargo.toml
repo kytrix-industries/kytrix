@@ -5,7 +5,9 @@ publish.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+# P17：demo 默认展示引擎内置 Debug HUD；`--no-default-features` 可构建无 HUD 版本。
+default = ["hud"]
+hud = ["kytrix_gui/hud"]
 # 离屏像素验证（`--snapshot`）：需要引擎的 `test-support`（WARP 渲染 + readback）。
 # 默认关闭，发布/手动运行不带测试基建（I7）。
 snapshot = ["dep:image", "kytrix_gui/test-support"]
