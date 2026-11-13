@@ -140,6 +140,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             for task in dispatcher.drain_tasks() {
                 task.run(&mut app);
             }
+            state.sync_ime_cursor_area(&app, id);
 
             // ⑤ 剪贴板发布（需要最新输入 serial）+ a11y 增量。
             let serial = state.serial();

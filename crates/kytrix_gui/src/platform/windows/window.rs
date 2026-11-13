@@ -14,6 +14,7 @@ use windows::Win32::{
 };
 
 use crate::{
+    app::App,
     error::EngineError,
     math::{Rect, Scale, Size},
     platform::{
@@ -46,6 +47,8 @@ pub(crate) struct NativeWindow {
     state: *mut WndProcState,
     scale: Scale,
     logical_size: Size,
+    /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
+    ime_area: Option<(Rect, Scale)>,
 }
 
 impl NativeWindow {
@@ -110,6 +113,7 @@ impl NativeWindow {
             state,
             scale: Scale::ONE,
             logical_size: options.size,
+            ime_area: None,
         };
         window.apply_dpi_and_size(options.size)?;
         Ok(window)
@@ -242,6 +246,28 @@ impl NativeWindow {
         }
     }
 
+    /// 同步 IME caret 区域到 IMM32（每轮泵调用，独立于帧门禁；缓存键含 Scale，DPI 变化会重发）。
+    pub(crate) fn sync_ime_cursor_area(&mut self, app: &App) {
+        let area = match app.ime_cursor_area(self.id) {
+            Ok(area) => area,
+            // 文本尚未 shape / 文本刚变化：保留上一次有效区域，等下一轮。
+            Err(_) => return,
+        };
+        let next = area.map(|rect| (rect, self.scale));
+        if self.ime_area == next {
+            return;
+        }
+        self.ime_area = next;
+        match area {
+            Some(rect) => {
+                let physical = rect.to_physical(self.scale);
+                let hwnd = self.hwnd;
+                self.state_mut().set_ime_cursor_area(hwnd, physical);
+            }
+            None => self.state_mut().clear_ime_cursor_area(),
+        }
+    }
+
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。
     pub(crate) fn is_destroyed(&self) -> bool {
         self.hwnd.is_invalid()
@@ -250,6 +276,8 @@ impl NativeWindow {
     /// 应用新的 DPI 比例（`WM_DPICHANGED`）：更新最小尺寸，并按新 DPI 重算窗口尺寸。
     pub(crate) fn apply_scale(&mut self, scale: Scale, dpi: u32) -> Result<(), EngineError> {
         self.scale = scale;
+        // 旧 cursor_area 是物理像素；DPI 变化后在下一次 sync 前不得被 WM_IME_START 复用。
+        self.state_mut().clear_ime_cursor_area();
         let min = (
             (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
             (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,

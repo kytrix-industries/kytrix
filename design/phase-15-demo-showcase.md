@@ -119,9 +119,10 @@ DFS 先序 = 挂载顺序，因此**挂载顺序即 Tab 序**：
   MSPY 组合期间不发任何事件（Start/Commit/End 都在提交时到达，见 `DEVIATIONS.md` V-104），因此真实
   Windows 上应用无法感知组合中，**若 Esc 被 IME 放行到应用**就会走关窗路径；「组合中不关窗」只对按时
   发 `Start` 或 `Preedit` 的平台/IME 生效（Linux / macOS 经 `Preedit` 进入组合，从不发 `Start`）。
-- 组合窗位置：Win32 按**最后指针位置**（`ImmSetCompositionWindow(CFS_POINT)`）；macOS / Linux v1 用固定的
-  窗口原点 1×1 矩形（`firstRectForCharacterRange` / `set_cursor_rectangle(0,0,1,1)`）——三者都没有
-  caret 定位（见 `DEVIATIONS.md` V-106）。
+- 组合窗位置：P15 当时 Win32 按**最后指针位置**（`ImmSetCompositionWindow(CFS_POINT)`）；macOS / Linux
+  用固定的窗口原点 1×1 矩形（`firstRectForCharacterRange` / `set_cursor_rectangle(0,0,1,1)`）。P16
+  （`design/phase-16-ime-caret.md` / `DEVIATIONS.md` F-154）已改为 `App::set_ime_cursor_area` +
+  `Window::text_caret_rect` 的精确 caret hint，关闭 V-106。
 
 ### 2.5 无障碍
 
@@ -179,7 +180,7 @@ crates/kytrix_gui_demo/
 ## 5. 非目标
 
 - 不做文本选区 / 光标移动 / 多行编辑（引擎 v1 无编辑模型）。
-- 不做 caret 定位的 IME 候选窗（平台层按指针位置，见 §2.4）。
+- 不做 caret 定位的 IME 候选窗（P15 当时平台层按指针位置，见 §2.4；P16 已补精确 caret hint，非本阶段范围）。
 - 不做真实 macOS/Linux 窗口验收（沿用 P12 的静态检查结论）。
 - 不为 Windows 补 TSF 文档管理器（内联组合串的平台限制见 §6.3 / `DEVIATIONS.md` V-104）。
 

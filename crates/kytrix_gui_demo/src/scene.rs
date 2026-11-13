@@ -5,9 +5,10 @@
 //! 本模块是场景的**模块根**：常量、[`Scene`] 句柄与编排（建树 / 安装 / 帧钩子 / 截图种子状态）；
 //! 每张卡片的内容在子模块里。
 //!
-//! 帧钩子（`Scene::tick`）做两件事：
+//! 帧钩子（`Scene::tick`）做三件事：
 //! 1. 把平台事件落到场景状态（IME / 输入 / 滑块方向键 / Esc 关窗）；
-//! 2. 轮询 `App::focused` 写 `FocusView` 与「输入框是否聚焦」（引擎不派发焦点变化事件）。
+//! 2. 轮询 `App::focused` 写 `FocusView` 与「输入框是否聚焦」（引擎不派发焦点变化事件）；
+//! 3. 输入框聚焦时把真实文本插入点交给 `App::set_ime_cursor_area`（P16 精确 IME 定位）。
 
 mod a11y;
 mod card;
@@ -125,6 +126,8 @@ pub struct Scene {
     focus_targets: Vec<(NodeId, &'static str)>,
     /// 输入框节点。
     ime_field: NodeId,
+    /// 输入框正文文本节点（IME caret 的几何来源）。
+    ime_text: NodeId,
     /// 缩放滑块节点。
     slider: NodeId,
 }
@@ -186,7 +189,7 @@ impl Scene {
         let controls = a11y::build(app, window, a11y_card, a11y);
 
         let ime_card = card::card(app, window, root, IME_CARD, "⑤ 输入法（IME）");
-        let ime_field = ime::build(app, window, ime_card, ime, input_focused);
+        let (ime_field, ime_text) = ime::build(app, window, ime_card, ime, input_focused);
 
         let resources_card = card::card(app, window, root, RES_CARD, "⑥ 图片与滚动");
         resources::build(app, window, resources_card, RES_CARD.origin);
@@ -219,6 +222,7 @@ impl Scene {
             swatches,
             focus_targets,
             ime_field,
+            ime_text,
             slider: controls.slider,
         }
     }
@@ -251,6 +255,8 @@ impl Scene {
             &self.focus,
             FocusView::resolve(Some(self.ime_field), &self.focus_targets),
         );
+        let caret = app.read(&self.ime).display(false).len();
+        let _ = app.set_ime_cursor_area(self.window, self.ime_text, caret);
     }
 
     /// 帧钩子：事件 → 场景状态；然后同步焦点视图。
@@ -276,6 +282,13 @@ impl Scene {
         // 焦点离开输入框：组合串不能在字段里永久残留（Tab 走开再按 Esc 时会被误判成「组合中」）。
         if !on_input && app.read(&self.ime).composing() {
             self.update_ime(app, ImeField::cancel_composition);
+        }
+        // P16：把真实文本插入点（不含视觉 `|`）交给引擎；引擎负责 caret 几何与平台 IME 下发。
+        if on_input {
+            let caret = app.read(&self.ime).display(false).len();
+            let _ = app.set_ime_cursor_area(self.window, self.ime_text, caret);
+        } else {
+            app.clear_ime_cursor_area(self.window);
         }
         app.write(
             &self.focus,

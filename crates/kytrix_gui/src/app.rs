@@ -31,7 +31,7 @@ use crate::{
         animation as anim, drag as drag_util, focus, overlay as overlay_util, scroll, virtual_list,
     },
     layout::hit_test::HitResult,
-    math::{Point, Size},
+    math::{Point, Rect, Size},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, Owner, ReadCtx, ReadTracker},
@@ -1199,6 +1199,66 @@ impl App {
         }
         self.request_frame();
         true
+    }
+
+    /// 设置 IME caret hint（P16）：`node` 是该窗口内的文本节点，`byte_index` 是 UTF-8 字节偏移。
+    ///
+    /// 允许在文本尚未 shape 时调用；**`byte_index` 的越界/char-boundary 校验在读取时做**，
+    /// 因为信号写入到下一次 text pass 之间文本内容可能还是旧快照。该调用**不标脏、不请求重绘**，
+    /// 只在 hint 变化时唤醒平台事件循环。
+    ///
+    /// # Errors
+    /// `UnknownWindow`：窗口不存在；`StaleNode`：节点不存在；`TextShape`：不是文本节点。
+    pub fn set_ime_cursor_area(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        byte_index: usize,
+    ) -> Result<(), EngineError> {
+        let changed = {
+            let Some(target) = self.windows.get_mut(&window) else {
+                return Err(EngineError::UnknownWindow { window });
+            };
+            let Some(slot) = target.tree().get(node).ok() else {
+                return Err(EngineError::StaleNode { node });
+            };
+            if slot.kind().text().is_none() {
+                return Err(EngineError::TextShape {
+                    node,
+                    detail: smol_str::SmolStr::new_static("node is not a text node"),
+                });
+            }
+            target.set_ime_cursor_request(node, byte_index)
+        };
+        if changed {
+            self.dispatcher.wake();
+        }
+        Ok(())
+    }
+
+    /// 清除 IME caret hint（P16）；不存在的窗口是 no-op。
+    pub fn clear_ime_cursor_area(&mut self, window: WindowId) {
+        let changed = self
+            .windows
+            .get_mut(&window)
+            .is_some_and(Window::clear_ime_cursor_request);
+        if changed {
+            self.dispatcher.wake();
+        }
+    }
+
+    /// 当前 IME caret hint 对应的窗口客户区逻辑矩形（P16）。
+    ///
+    /// `Ok(None)` = 没有设置 hint；`Err(TextShape)` = 已设置但文本尚未 shape / 文本变化，
+    /// 平台层应跳过本次更新而不是清除上一次有效位置。
+    ///
+    /// # Errors
+    /// `UnknownWindow`：窗口不存在；`StaleNode` / `TextShape`：hint 指向的文本节点不可解析。
+    pub fn ime_cursor_area(&self, window: WindowId) -> Result<Option<Rect>, EngineError> {
+        self.windows
+            .get(&window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .ime_cursor_area()
     }
 
     /// 焦点移到下一个可聚焦节点（末尾回绕）。
@@ -3616,6 +3676,125 @@ mod tests {
     }
 
     #[test]
+    fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
+        let (_rt, mut app, window, node) = text_app("abc", None);
+        let unknown = WindowId::for_test(999);
+        assert!(matches!(
+            app.set_ime_cursor_area(unknown, node, 0),
+            Err(crate::error::EngineError::UnknownWindow { .. })
+        ));
+        let root = app.window(window).expect("窗口").tree().root();
+        assert!(matches!(
+            app.set_ime_cursor_area(window, root, 0),
+            Err(crate::error::EngineError::TextShape { .. })
+        ));
+        assert!(matches!(app.set_ime_cursor_area(window, node, 4), Ok(())));
+        assert!(matches!(app.set_ime_cursor_area(window, node, 1), Ok(())));
+        assert!(matches!(
+            app.ime_cursor_area(window),
+            Err(crate::error::EngineError::TextShape { .. })
+        ));
+
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let _ = text_layout(&mut app, window);
+        let area = app
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .expect("已 shape 后有 hint");
+        assert!(area.size.width >= 1.0);
+        assert!(area.size.height > 0.0);
+
+        assert!(app.set_ime_cursor_area(window, node, 4).is_ok());
+        assert!(matches!(
+            app.ime_cursor_area(window),
+            Err(crate::error::EngineError::TextShape { .. })
+        ));
+        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
+
+        app.clear_ime_cursor_area(window);
+        assert_eq!(app.ime_cursor_area(window).expect("窗口存在"), None);
+
+        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
+        set_text(
+            &mut app,
+            window,
+            node,
+            "abcd",
+            crate::text::TextStyle::new(16.0),
+        );
+        assert!(
+            matches!(
+                app.ime_cursor_area(window),
+                Err(crate::error::EngineError::TextShape { .. })
+            ),
+            "文本内容变化后、下一次 text pass 前不得返回旧 caret"
+        );
+    }
+
+    #[test]
+    fn ime_cursor_area_resolves_after_the_first_frame() {
+        let (_rt, mut app, window, node) = text_app("abc", None);
+        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
+
+        let outcome = app.frame(window).expect("窗口存在").expect("首帧成功");
+        assert!(matches!(outcome, FrameOutcome::Committed(_)));
+        assert!(
+            app.ime_cursor_area(window).expect("窗口存在").is_some(),
+            "首帧 text/layout 完成后应能解析 caret"
+        );
+    }
+
+    #[test]
+    fn ime_cursor_area_rejects_a_non_boundary_byte_index() {
+        let (_rt, mut app, window, node) = text_app("a中b", None);
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let _ = text_layout(&mut app, window);
+
+        assert!(app.set_ime_cursor_area(window, node, 2).is_ok());
+        assert!(matches!(
+            app.ime_cursor_area(window),
+            Err(crate::error::EngineError::TextShape { .. })
+        ));
+    }
+
+    #[test]
+    fn text_caret_rect_includes_border_padding_and_node_origin() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口").tree().root();
+        let mut style = text_style(Some(200.0));
+        style.inner.padding = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentage::length(9.0),
+            right: taffy::style::LengthPercentage::length(0.0),
+            top: taffy::style::LengthPercentage::length(7.0),
+            bottom: taffy::style::LengthPercentage::length(0.0),
+        };
+        style.inner.border = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentage::length(2.0),
+            right: taffy::style::LengthPercentage::length(0.0),
+            top: taffy::style::LengthPercentage::length(3.0),
+            bottom: taffy::style::LengthPercentage::length(0.0),
+        };
+        let node = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
+            .style(style)
+            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
+            .expect("挂载");
+        let _ = refresh(&mut app, window);
+        let _ = layout(&mut app, window);
+        let _ = text_layout(&mut app, window);
+
+        let rect = app
+            .window(window)
+            .expect("窗口")
+            .text_caret_rect(node, 0)
+            .expect("caret");
+        assert!((rect.origin.x - 11.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.origin.y - 10.0).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
     fn close_window_forgets_the_scale_epoch() {
         let (_rt, mut app, window, _node) = text_app("x", None);
         let _ = refresh(&mut app, window);
@@ -4179,6 +4358,35 @@ mod interaction_tests {
         app.set_scroll_content(&handle, Size::new(200.0, 200.0))
             .expect("content");
         (rt, app, window, container, child)
+    }
+
+    #[test]
+    fn text_caret_rect_follows_ancestor_scroll() {
+        let (_rt, mut app, window, container, _child) = scrollable_app();
+        let text = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
+            .layout_override(Rect::new(10.0, 20.0, 100.0, 20.0))
+            .build(
+                app.window_mut(window).expect("window").tree_mut(),
+                container,
+            )
+            .expect("text");
+        frame(&mut app, window);
+        let before = app
+            .window(window)
+            .expect("window")
+            .text_caret_rect(text, 3)
+            .expect("caret");
+        let handle = app.scroll_handle(window, container).expect("scroll");
+        app.scroll_to(&handle, Point::new(0.0, 50.0))
+            .expect("scroll");
+        frame(&mut app, window);
+        let after = app
+            .window(window)
+            .expect("window")
+            .text_caret_rect(text, 3)
+            .expect("caret");
+        assert!((after.origin.y - before.origin.y + 50.0).abs() < 0.01);
+        assert!((after.origin.x - before.origin.x).abs() < 0.01);
     }
 
     #[test]

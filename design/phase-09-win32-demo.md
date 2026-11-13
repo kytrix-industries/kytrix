@@ -232,7 +232,7 @@ std::mem::ManuallyDrop::drop(&mut src.pResource);
 
 | 项 | 最小复现 | 替代 |
 |---|---|---|
-| 真实 IME 输入（候选窗、preedit 光标） | 本机有 `HIMC` 但无输入法实际输入；`WM_IME_*` 只能合成 | 只实现消息通路 + `ImmSetCompositionWindow`；语义留 P12 实机（V-61） |
+| 真实 IME 输入（候选窗、preedit 光标） | 本机有 `HIMC` 但无输入法实际输入；`WM_IME_*` 只能合成 | P09 只实现消息通路 + `ImmSetCompositionWindow`；P16 追加 `App::set_ime_cursor_area` / `ImmSetCandidateWindow(CFS_EXCLUDE)` 的 caret 定位（F-154），preedit/TSF 语义仍留平台矩阵（V-61 / V-104） |
 | dead key 的 `WM_CHAR` 组合 | 只能验证 `ToUnicodeEx` 的 -1/组合语义；无法用真实键盘产生死键消息 | 走 `TranslateMessage`+`WM_CHAR`（OS 组合），单测钉死 `WM_CHAR` 的消费路径 |
 | 多 swapchain / 同 HWND 重建 | 泄漏引用时 `E_ACCESSDENIED`；修复后未再验证「重建」路线 | P09 选 `ResizeBuffers`（已闭环），不引入第二条 resize 路径 |
 | 无桌面 CI 的 present | 无交互桌面时只能看 `Present1` 返回值，不能看像素 | demo 的 `--snapshot`（WARP 离屏）做像素断言；present 人工验收（V-62） |
@@ -383,7 +383,7 @@ WndProc(msg, wparam, lparam)
 | `WM_IME_COMPOSITION`（`lParam & GCS_COMPSTR`） | 用 `ImmGetCompositionStringW(himc, GCS_COMPSTR)` 取 preedit（`u16` → `String`，`SmolStr`）；`ImeEvent::Preedit` |
 | `WM_IME_COMPOSITION`（`lParam & GCS_RESULTSTR`） | `ImeEvent::Commit(SmolStr)`；同时**不**再重复发 `WM_CHAR`（Windows 两者都可能给，去重靠 `ImeState.last_commit` 比较） |
 | `WM_IME_ENDCOMPOSITION` | `composing=false`；`ImeEvent::End` |
-| 任意时刻 | `ImmSetCompositionWindow(himc, COMPOSITIONFORM{ dwStyle: CFS_POINT, ptCurrentPos: 光标物理点 })`（probe 已验证调用成功） |
+| 任意时刻 | `ImmSetCompositionWindow(himc, COMPOSITIONFORM{ dwStyle: CFS_POINT, ptCurrentPos: 光标物理点 })`（probe 已验证调用成功）；P16 起由 `App::set_ime_cursor_area` → `Window::text_caret_rect` 提供精确 caret，并追加 `ImmSetCandidateWindow(CFS_EXCLUDE)`，见 `phase-16-ime-caret.md` |
 
 `ImmGetContext`/`ImmReleaseContext` **按消息成对**取用（不缓存 `HIMC`：P12 的 TSF 会改所有权）；
 `himc` 无效时整条 IME 路径降级为「忽略」，但 `WM_CHAR` 仍然工作（可用的最小输入）。

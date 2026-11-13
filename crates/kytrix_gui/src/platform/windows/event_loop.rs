@@ -30,6 +30,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Event, InputEvent},
+    math::PhysicalRect,
     platform::{
         dispatcher::{Dispatcher, WM_APP_FRAME_WAKE},
         event::{
@@ -91,8 +92,6 @@ pub(crate) struct WndProcState {
     /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（物理像素）。
     min_size: (u32, u32),
     close_requested: bool,
-    /// 最近一次指针位置（客户区物理像素）：IME 组合窗按它定位。
-    cursor: (i32, i32),
     /// 是否已注册 `TrackMouseEvent(TME_LEAVE)`（每进入一次客户区注册一次）。
     mouse_tracking: bool,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
@@ -111,7 +110,6 @@ impl WndProcState {
             translate: TranslateState::default(),
             min_size: (1, 1),
             close_requested: false,
-            cursor: (0, 0),
             mouse_tracking: false,
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
@@ -142,6 +140,16 @@ impl WndProcState {
 
     pub(crate) fn take_close_request(&mut self) -> bool {
         std::mem::take(&mut self.close_requested)
+    }
+
+    /// 设置 IME caret 区域（客户区物理像素）；由 `NativeWindow::sync_ime_cursor_area` 调用。
+    pub(crate) fn set_ime_cursor_area(&mut self, hwnd: HWND, area: PhysicalRect) {
+        self.translate.ime_mut().set_cursor_area(hwnd, area);
+    }
+
+    /// 清除 IME caret hint（不改变 IME 的启用状态）。
+    pub(crate) fn clear_ime_cursor_area(&mut self) {
+        self.translate.ime_mut().clear_cursor_area();
     }
 
     /// 当前修饰键（事件投递时随按键一起给应用层）。
@@ -288,17 +296,6 @@ pub(crate) extern "system" fn wndproc(
         if let Some(event) = event {
             if matches!(event, PlatformEvent::PointerLeave) {
                 state.mouse_tracking = false;
-            }
-            // 指针位置用于 IME 组合窗定位（P09 没有 caret 语义，用最后指针位置）。
-            if let PlatformEvent::Pointer { x, y, .. } = &event {
-                state.cursor = (*x, *y);
-            }
-            if matches!(event, PlatformEvent::Ime(crate::event::ImeEvent::Start)) {
-                state.translate.ime_mut().set_composition_point(
-                    hwnd,
-                    state.cursor.0,
-                    state.cursor.1,
-                );
             }
             let is_close = matches!(event, PlatformEvent::Close);
             state.push(event);
@@ -487,6 +484,7 @@ fn pump(
         // 一次机会；`App::a11y_pending` 是 O(1) 过滤，adapter 不活跃时闭包根本不执行（懒激活）。
         for native in windows.iter_mut() {
             native.update_a11y(&mut app);
+            native.sync_ime_cursor_area(&app);
         }
 
         // ⑤ 跨线程回投的任务。

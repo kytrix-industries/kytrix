@@ -38,7 +38,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
-    math::{Point, Scale, Size},
+    math::{Point, Rect, Scale, Size},
     platform::linux::{a11y::UnixA11y, clipboard::Clipboard, dpi, ime::ImeState, window},
 };
 
@@ -65,6 +65,10 @@ pub(crate) struct WaylandState {
     /// 只为保活（`wl_data_device` 的 offer 事件在它上面）。
     _data_device: wl_data_device::WlDataDevice,
     text_input: Option<ZwpTextInputV3>,
+    /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
+    ime_cursor_area: Option<Rect>,
+    /// 最近一次实际下发给 `zwp_text_input_v3` 的区域（含 None 回退）。
+    ime_cursor_applied: Option<Rect>,
     /// 分数缩放（v1 只读 `preferred_scale`；对象必须保活）。
     _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     /// 分数缩放的落地窗口（`set_destination` 让 compositor 做非整数缩放，D-5）。
@@ -172,6 +176,8 @@ impl WaylandState {
             pointer: None,
             _data_device: data_device,
             text_input,
+            ime_cursor_area: None,
+            ime_cursor_applied: None,
             _fractional: fractional,
             viewport,
             _decoration: decoration,
@@ -278,15 +284,60 @@ impl WaylandState {
             return;
         };
         if focused {
-            // v1 不声明 content-type（v3 的默认值就是「普通文本」）；光标矩形给组合串一个
-            // 可落点，`commit` 才会让它们生效。
-            text_input.set_cursor_rectangle(0, 0, 1, 1);
+            // v3：enable 会重置此前 set_cursor_rectangle 的状态；必须先 enable，再设矩形，再 commit。
+            // 当前绑定 version 1；若未来绑 v2+，cursor rectangle 还需 surface 的 wl_surface.commit。
             text_input.enable();
+            let area = self
+                .ime_cursor_area
+                .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
+            text_input.set_cursor_rectangle(
+                area.origin.x.round() as i32,
+                area.origin.y.round() as i32,
+                area.size.width.max(1.0).round() as i32,
+                area.size.height.max(1.0).round() as i32,
+            );
+            self.ime_cursor_applied = Some(area);
         } else {
             text_input.disable();
+            self.ime_cursor_applied = None;
         }
         text_input.commit();
         self.surface.commit();
+    }
+
+    /// 保存 IME caret 区域；已聚焦时立即下发（`commit` 是 v3 的生效点）。
+    pub(crate) fn set_ime_cursor_area(&mut self, area: Option<Rect>) {
+        if self.ime_cursor_area == area {
+            return;
+        }
+        self.ime_cursor_area = area;
+        if !self.focused {
+            return;
+        }
+        let effective = area.unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
+        if let Some(text_input) = self.text_input.as_ref() {
+            if self.ime_cursor_applied != Some(effective) {
+                text_input.set_cursor_rectangle(
+                    effective.origin.x.round() as i32,
+                    effective.origin.y.round() as i32,
+                    effective.size.width.max(1.0).round() as i32,
+                    effective.size.height.max(1.0).round() as i32,
+                );
+                self.ime_cursor_applied = Some(effective);
+            }
+            text_input.commit();
+        }
+        self.surface.commit();
+    }
+
+    /// 从 `App` 同步当前窗口的 IME caret 区域（每轮泵调用，独立于帧门禁）。
+    pub(crate) fn sync_ime_cursor_area(&mut self, app: &App, window: crate::window::WindowId) {
+        let area = match app.ime_cursor_area(window) {
+            Ok(area) => area,
+            // 文本尚未 shape / 文本刚变化：保留上一次有效区域。
+            Err(_) => return,
+        };
+        self.set_ime_cursor_area(area);
     }
 
     /// 交付一笔 a11y 更新（`accesskit_unix` 的 `update_if_active` 无返回值）。

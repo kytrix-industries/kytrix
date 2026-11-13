@@ -15,7 +15,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::Event,
-    math::{Scale, Size},
+    math::{Rect, Scale, Size},
     platform::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, view::GuiView, wake},
@@ -42,6 +42,8 @@ pub(crate) struct NativeWindow {
     was_key: bool,
     close_requested: bool,
     destroyed: bool,
+    /// 最近一次下发的 IME caret 区域（逻辑坐标）。
+    ime_area: Option<Rect>,
 }
 
 impl NativeWindow {
@@ -123,6 +125,7 @@ impl NativeWindow {
             was_key: false,
             close_requested: false,
             destroyed: false,
+            ime_area: None,
         };
         native.view.set_scale(scale);
         native.sync_initial(mtm)?;
@@ -248,6 +251,20 @@ impl NativeWindow {
         let id = self.id;
         self.view
             .update_a11y(|| crate::a11y::adapter::build_update(app, id));
+    }
+
+    /// 同步 IME caret 区域到 `NSTextInputClient` 的 `firstRect`（每轮泵调用，独立于帧门禁）。
+    pub(crate) fn sync_ime_cursor_area(&mut self, app: &App) {
+        let area = match app.ime_cursor_area(self.id) {
+            Ok(area) => area,
+            // 文本尚未 shape / 文本刚变化：保留上一次有效区域。
+            Err(_) => return,
+        };
+        if self.ime_area == area {
+            return;
+        }
+        self.ime_area = area;
+        self.view.set_ime_cursor_area(area);
     }
 
     /// 关闭窗口（幂等）。

@@ -196,6 +196,7 @@ fn pump(state: &mut LoopState) -> Result<(), EngineError> {
 
     for native in state.windows.iter_mut() {
         native.update_a11y(app);
+        native.sync_ime_cursor_area(app);
     }
     for task in state.dispatcher.drain_tasks() {
         task.run(app);

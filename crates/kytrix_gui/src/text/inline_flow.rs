@@ -88,6 +88,17 @@ pub(crate) fn selection_rects(
         .collect()
 }
 
+/// `byte_index` 处的 caret 矩形（文本盒局部逻辑像素，宽 1 逻辑像素）。
+pub(crate) fn caret_rect(
+    layout: &parley::Layout<ColorBrush>,
+    byte_index: usize,
+    scale: f32,
+) -> Rect {
+    let width = if scale > 0.0 { scale } else { 1.0 };
+    let cursor = Cursor::from_byte_index(layout, byte_index, Affinity::Downstream);
+    to_rect(cursor.geometry(layout, width), scale)
+}
+
 fn to_rect(bounds: BoundingBox, scale: f32) -> Rect {
     let scale = f64::from(if scale > 0.0 { scale } else { 1.0 });
     Rect::new(
@@ -100,7 +111,7 @@ fn to_rect(bounds: BoundingBox, scale: f32) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{floor_boundary, selection_rects, to_inline_box, vertical_align};
+    use super::{caret_rect, floor_boundary, selection_rects, to_inline_box, vertical_align};
     use crate::{
         math::Size,
         paint::color::ColorBrush,
@@ -119,13 +130,17 @@ mod tests {
 
     /// 直接建一个 parley 布局（不经过 `ShapedText`，避免测试互相依赖）。
     fn layout_of(text: &str) -> parley::Layout<ColorBrush> {
+        layout_of_scaled(text, 1.0)
+    }
+
+    fn layout_of_scaled(text: &str, scale: f32) -> parley::Layout<ColorBrush> {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
-        let mut builder = layout_cx.ranged_builder(&mut font_cx, text, 1.0, true);
+        let mut builder = layout_cx.ranged_builder(&mut font_cx, text, scale, true);
         builder.push_default(parley::StyleProperty::FontSize(16.0));
         builder.push_default(parley::StyleProperty::Brush(ColorBrush::default()));
         let mut layout = builder.build(text);
-        layout.break_all_lines(Some(400.0));
+        layout.break_all_lines(Some(400.0 * scale));
         layout.align(
             parley::Alignment::Start,
             parley::AlignmentOptions::default(),
@@ -243,5 +258,51 @@ mod tests {
             unit[0].size.width,
             doubled[0].size.width
         );
+    }
+
+    #[test]
+    fn caret_rect_reaches_the_end_of_the_text() {
+        let layout = layout_of("abc");
+
+        let rect = caret_rect(&layout, 3, 1.0);
+
+        assert!((rect.size.width - 1.0).abs() < 0.01);
+        assert!(
+            (rect.origin.x - layout.width()).abs() < 0.01,
+            "caret x {} must equal line width {}",
+            rect.origin.x,
+            layout.width()
+        );
+    }
+
+    #[test]
+    fn caret_rect_handles_cjk_bytes() {
+        let layout = layout_of("你好");
+
+        let rect = caret_rect(&layout, "你好".len(), 1.0);
+
+        assert!(rect.origin.x > 0.0);
+        assert!(rect.size.height > 0.0);
+    }
+
+    #[test]
+    fn caret_rect_scales_back_to_one_logical_pixel() {
+        let layout = layout_of_scaled("abc", 2.0);
+
+        let rect = caret_rect(&layout, 3, 2.0);
+
+        assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.origin.x - layout.width() / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn caret_rect_for_empty_text_still_has_a_line_height() {
+        let layout = layout_of("");
+
+        let rect = caret_rect(&layout, 0, 1.0);
+
+        assert_eq!(rect.origin.x, 0.0);
+        assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");
+        assert!(rect.size.height > 0.0, "{rect:?}");
     }
 }

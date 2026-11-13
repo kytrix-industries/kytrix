@@ -22,7 +22,7 @@ use objc2_foundation::{
 
 use crate::{
     event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
-    math::Point,
+    math::{Point, Rect},
     platform::macos::{a11y::MacA11y, ime::ImeState},
 };
 
@@ -41,6 +41,8 @@ pub(crate) struct ViewIvars {
     suppress_text: Cell<bool>,
     /// 最近一次读到的 `backingScaleFactor`。
     scale: Cell<f64>,
+    /// IME caret 区域（窗口逻辑坐标；`None` = 无 hint）。
+    ime_cursor: Cell<Option<Rect>>,
 }
 
 define_class!(
@@ -340,8 +342,18 @@ define_class!(
             // `actualRange` 必须写回（不写会让输入法拿到未定义值）。
             // SAFETY: AppKit 传进来的 `actualRange` 指向本方法可写的 `NSRange`。
             unsafe { *actual.as_ptr() = range };
-            // 光标矩形由交互层提供（P13）；v1 给窗口原点附近的 1×1 屏幕矩形。
-            let local = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
+            // P16：应用/引擎提供的 caret 区域（窗口逻辑坐标，view 已 isFlipped）→ 屏幕坐标。
+            // 无 hint 时保留 P12 的窗口原点 1×1 回退。
+            let local = match self.ivars().ime_cursor.get() {
+                Some(area) => NSRect::new(
+                    NSPoint::new(f64::from(area.origin.x), f64::from(area.origin.y)),
+                    NSSize::new(
+                        f64::from(area.size.width.max(1.0)),
+                        f64::from(area.size.height.max(1.0)),
+                    ),
+                ),
+                None => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+            };
             let in_window = self.convertRect_toView(local, None);
             self.window()
                 .map(|window| window.convertRectToScreen(in_window))
@@ -372,6 +384,7 @@ impl GuiView {
             modifiers: Cell::new(0),
             suppress_text: Cell::new(false),
             scale: Cell::new(1.0),
+            ime_cursor: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         unsafe {
@@ -416,6 +429,11 @@ impl GuiView {
 
     pub(crate) fn set_scale(&self, scale: f64) {
         self.ivars().scale.set(scale);
+    }
+
+    /// 保存 IME caret 区域（窗口逻辑坐标；`None` = 无 hint，`firstRect` 回退 1×1）。
+    pub(crate) fn set_ime_cursor_area(&self, area: Option<Rect>) {
+        self.ivars().ime_cursor.set(area);
     }
 
     fn modifiers(&self) -> Modifiers {

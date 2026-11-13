@@ -9,10 +9,10 @@ use smol_str::SmolStr;
 use crate::test_support::record::{FrameRecord, FrameStats, PaintLog};
 use crate::{
     error::EngineError,
-    interaction::{FocusScope, PointerState},
+    interaction::{FocusScope, PointerState, scroll},
     layout::LayoutReport,
-    math::{Rect, Scale, Size},
-    node::{dirty::DirtyFlags, tree::NodeTree},
+    math::{Point, Rect, Scale, Size},
+    node::{dirty::DirtyFlags, id::NodeId, tree::NodeTree},
     paint::{
         color::{ColorResolver, Interpolation},
         instance::{InstanceBuffer, InstanceEncoder},
@@ -176,6 +176,13 @@ impl FrameScheduler {
     }
 }
 
+/// IME caret hint：`node` 是文本节点，`byte_index` 是该文本内容的 UTF-8 字节偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImeCursorRequest {
+    node: NodeId,
+    byte_index: usize,
+}
+
 /// 一个窗口的全部状态：节点树 + 绘制场景 + DPI + 参数 + 帧调度。
 pub struct Window {
     id: WindowId,
@@ -222,6 +229,8 @@ pub struct Window {
     pending_damage: Option<Rect>,
     /// a11y 状态机（P11：变更集合 / 全树旗标 / 捕获开关）。
     a11y: crate::a11y::adapter::A11yBridge,
+    /// IME caret hint（P16：应用声明的文本节点 + UTF-8 字节偏移）。
+    ime_cursor: Option<ImeCursorRequest>,
 }
 
 impl Window {
@@ -253,6 +262,7 @@ impl Window {
             pointer: PointerState::new(),
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
+            ime_cursor: None,
         }
     }
 
@@ -275,6 +285,53 @@ impl Window {
     /// 指针状态的可写引用。
     pub(crate) fn pointer_mut(&mut self) -> &mut PointerState {
         &mut self.pointer
+    }
+
+    // ── P16：IME caret hint ────────────────────────────────────────────────────
+
+    /// 登记 IME caret hint；返回是否真的变化（同值 no-op）。
+    pub(crate) fn set_ime_cursor_request(&mut self, node: NodeId, byte_index: usize) -> bool {
+        let next = ImeCursorRequest { node, byte_index };
+        if self.ime_cursor == Some(next) {
+            return false;
+        }
+        self.ime_cursor = Some(next);
+        true
+    }
+
+    /// 清除 IME caret hint；返回是否真的变化。
+    pub(crate) fn clear_ime_cursor_request(&mut self) -> bool {
+        self.ime_cursor.take().is_some()
+    }
+
+    /// 解析当前 IME caret hint（窗口客户区逻辑坐标）。
+    ///
+    /// `Ok(None)` = 没有 hint；`Err(TextShape)` = 已登记但文本尚未 shape / 文本已变化，
+    /// 平台层应跳过本次更新并保留上一次有效区域。
+    pub(crate) fn ime_cursor_area(&self) -> Result<Option<Rect>, EngineError> {
+        let Some(request) = self.ime_cursor else {
+            return Ok(None);
+        };
+        self.text_caret_rect(request.node, request.byte_index)
+            .map(Some)
+    }
+
+    /// 文本插入点的窗口绝对矩形（逻辑像素）。
+    ///
+    /// `NodeTree::text_caret_rect` 给出文本盒局部矩形；本方法补上节点 border box 原点、
+    /// 内容盒偏移（border + padding）与祖先滚动偏移。
+    ///
+    /// # Errors
+    /// `StaleNode`：节点不存在；`TextShape`：不是已 shape 的文本节点或 `byte_index` 非法。
+    pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
+        let local = self.tree.text_caret_rect(node, byte_index)?;
+        let bounds = self.tree.get(node)?.layout().bounds;
+        let content_offset = self.tree.content_offset(node);
+        let origin = Point::new(
+            bounds.origin.x + content_offset.x,
+            bounds.origin.y + content_offset.y,
+        );
+        Ok(scroll::to_screen(&self.tree, node, local.translate(origin)))
     }
 
     /// 请求下一帧重绘一个逻辑矩形（滚动视口；并集语义）。

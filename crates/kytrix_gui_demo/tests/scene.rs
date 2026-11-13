@@ -297,6 +297,58 @@ fn ime_events_are_applied_only_while_the_input_is_focused() {
 }
 
 #[test]
+fn ime_cursor_area_tracks_the_input_caret() {
+    let (mut test, window, mut scene) = setup_installed();
+    frame(&mut test);
+
+    let empty = {
+        let app = test.app_mut();
+        let _ = app.focus_prev(window).expect("输入框");
+        scene::tick(&mut scene, app);
+        app.ime_cursor_area(window)
+            .expect("窗口存在")
+            .expect("输入框聚焦后必须有 caret hint")
+    };
+    // 输入框：卡片 (24,484) + 字段 (18,40) = (42,524,544,54)；正文子节点再内缩 (14,12)。
+    assert!(empty.origin.x >= 56.0, "{empty:?}");
+    assert!(empty.origin.y >= 536.0, "{empty:?}");
+    assert!(empty.max().y <= 578.0, "{empty:?}");
+
+    {
+        let app = test.app_mut();
+        scene::dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Commit("你好".into())),
+        );
+        scene::tick(&mut scene, app);
+    }
+    // 文本信号改了，必须让 text pass 重建 ShapedText 后 caret 几何才可解析。
+    assert_eq!(scene::ime_text(&scene, test.app()).as_str(), "你好");
+    frame(&mut test);
+    let after = test
+        .app()
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("提交文字后仍有 caret hint");
+    assert!(
+        after.origin.x > empty.origin.x + 20.0,
+        "caret 必须跟随已提交文本向右移动：{empty:?} -> {after:?}"
+    );
+
+    {
+        let app = test.app_mut();
+        let _ = app.set_focus(window, None);
+        scene::tick(&mut scene, app);
+    }
+    assert_eq!(
+        test.app().ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "焦点离开输入框必须清除 hint"
+    );
+}
+
+#[test]
 fn escape_during_composition_does_not_close_the_window() {
     let (mut test, window, mut scene) = setup_installed();
     frame(&mut test);

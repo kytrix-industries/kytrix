@@ -94,7 +94,8 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 ```
 
 - demo 现在覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
-  焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显）、
+  焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显 +
+  `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、
   **无障碍**（AccessKit 角色 / 名称 / `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、
   **滚动列表**。`--snapshot` 会先 `Scene::preview` 播种一套可截图的组合态（含内联组合串）。
 - demo 的集成测试（`cargo test -p kytrix_gui_demo`）用 dev-dependency 的 `kytrix_gui/test-support`
@@ -111,7 +112,7 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 | 文档 | 内容 |
 |---|---|
 | `../../custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量） |
-| `../../design/phase-01…15-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
+| `../../design/phase-01…16-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
 | `../../design/DEVIATIONS.md` | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里 |
 | `../../AGENTS.md` | 仓库纪律（模块/测试/错误/依赖） |
 | `src/render/shaders/contract.md` | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |

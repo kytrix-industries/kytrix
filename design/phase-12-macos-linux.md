@@ -1191,7 +1191,7 @@ pub(crate) fn physical(size: Size, scale: Scale) -> (u32, u32);                 
 | `selectedRange` | 未实现选区 ⇒ `NSRange(NSUInteger::MAX, 0)`（P13 的文本选区接上后给真实值） |
 | `attributedSubstringForProposedRange:actualRange:` | `None`（引擎不让 IME 读回富文本） |
 | `validAttributesForMarkedText` | 空 `NSArray`（无富文本属性） |
-| `firstRectForCharacterRange:actualRange:` | 屏幕坐标的**光标矩形**（`NSRect`，来自 `Window::ime_cursor_rect()`；无光标 ⇒ 窗口原点 1×1） |
+| `firstRectForCharacterRange:actualRange:` | 屏幕坐标的**光标矩形**（`NSRect`；P16 由 `App::set_ime_cursor_area` → `Window::text_caret_rect` 提供；无 hint ⇒ 窗口原点 1×1） |
 | `characterIndexForPoint:` | `0`（无字符索引模型） |
 | `doCommandBySelector:` | 吞掉（`sel` 记录到诊断日志；不转发给 `keyDown`） |
 

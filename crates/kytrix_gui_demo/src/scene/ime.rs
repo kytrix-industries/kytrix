@@ -1,8 +1,9 @@
 //! ⑤ 输入法：`ImeField` 单行模型 + 输入框（`design/phase-15-demo-showcase.md` §2.4）。
 //!
-//! 引擎只负责把平台 `WM_IME_*` / `NSTextInputClient` / `zwp_text_input` 翻译成
+//! 引擎负责把平台 `WM_IME_*` / `NSTextInputClient` / `zwp_text_input` 翻译成
 //! [`ImeEvent`](kytrix_gui::event::ImeEvent) 并交给应用；**组合串的语义**（提交后追加、组合中忽略
-//! Backspace）是应用层的事，这里用值语义的 [`ImeField`] 表达，可脱离窗口单测。
+//! Backspace）是应用层的事，这里用值语义的 [`ImeField`] 表达，可脱离窗口单测。P16 另把正文文本节点
+//! 的插入点交给 `App::set_ime_cursor_area`，由引擎计算 caret 并通知三平台 IME。
 
 use kytrix_gui::{
     a11y::{A11yAction, A11yOverride, A11yPatch, A11yRole},
@@ -188,14 +189,17 @@ impl ImeField {
     }
 }
 
-/// 建输入框 + 三行状态 + 提示；返回输入框节点（可聚焦、`TextInput`）。
+/// 建输入框 + 三行状态 + 提示；返回 `(输入框节点, 正文文本节点)`。
+///
+/// 正文文本节点是 IME caret 的几何来源（P16）：它的可见文本不含末尾视觉 `|`，应用用
+/// `display(false).len()` 作为 UTF-8 插入点偏移。
 pub(crate) fn build(
     app: &mut App,
     window: WindowId,
     panel: NodeId,
     field: Signal<ImeField>,
     focused: Signal<bool>,
-) -> NodeId {
+) -> (NodeId, NodeId) {
     let field_node = NodeBuilder::boxed()
         .style(card::absolute_style(Rect::new(18.0, 40.0, 544.0, 54.0)))
         .paint(PaintSpec {
@@ -231,7 +235,7 @@ pub(crate) fn build(
         .build(card::tree(app, window), panel)
         .expect("输入框挂载");
 
-    let _ = card::bound_hidden_label(
+    let text_node = card::bound_hidden_label(
         app,
         window,
         field_node,
@@ -282,7 +286,7 @@ pub(crate) fn build(
         "Enter 提交 / Backspace 删除 / Esc 退出（IME 组合由系统处理）。",
         text_style(11.0, 400, DIM_RGBA),
     );
-    field_node
+    (field_node, text_node)
 }
 
 #[cfg(test)]

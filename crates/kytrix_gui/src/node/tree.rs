@@ -1360,6 +1360,92 @@ impl NodeTree {
         ))
     }
 
+    /// `byte_index` 处的文本插入点矩形（文本内容盒局部逻辑像素）。
+    ///
+    /// 与 [`Self::text_selection_rects`] 共用 `TextSlot`；空文本没有 parley 行 metrics 时，
+    /// 高度回退到 `TextStyle.size × line_height`，宽度回退到 1 逻辑像素。
+    ///
+    /// # Errors
+    /// `StaleNode`：句柄陈旧；`TextShape`：不是文本节点、尚未 shape、或 `byte_index` 越界/不在 char boundary。
+    pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
+        let Some(target) = self.arena.get(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        if target.kind.text().is_none() {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("node is not a text node"),
+            });
+        }
+        let Some(slot) = self.text_slot(node) else {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("text has not been shaped yet"),
+            });
+        };
+        let Some(broken) = slot.broken() else {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("text has no final layout yet"),
+            });
+        };
+        let shaped = slot.shaped();
+        let Some(content) = self.text_content(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        let text = content.text.as_str();
+        if shaped.text() != text
+            || shaped.style() != &content.style
+            || shaped.inline_boxes() != content.inline_boxes.as_ref()
+        {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static(
+                    "text content/style changed since the last shape; wait for the text pass",
+                ),
+            });
+        }
+        if byte_index > text.len() {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("byte index is past the end of the text"),
+            });
+        }
+        if !text.is_char_boundary(byte_index) {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static("byte index is not a char boundary"),
+            });
+        }
+        let expected_width = {
+            let width = self.text_content_width(node);
+            if width > 0.0 {
+                width
+            } else {
+                shaped.widths().max / shaped.scale()
+            }
+        };
+        if slot.laid_width_bits() != expected_width.to_bits() {
+            return Err(EngineError::TextShape {
+                node,
+                detail: SmolStr::new_static(
+                    "text layout width changed since the last text pass; wait for the text pass",
+                ),
+            });
+        }
+
+        let mut rect = crate::text::inline_flow::caret_rect(broken, byte_index, shaped.scale());
+        if rect.size.width <= 0.0 {
+            rect.size.width = 1.0;
+        }
+        if rect.size.height <= 0.0 {
+            let style_size = content.style.size.max(1.0);
+            let line_height = content.style.line_height.unwrap_or(1.0).max(0.0);
+            rect.size.height = (style_size * line_height).max(1.0);
+        }
+        Ok(rect)
+    }
+
     /// 文本节点的布局失效（= `invalidate_measure` + 补 `PAINT`，F-56）。
     pub(crate) fn invalidate_text_layout(&mut self, node: NodeId) -> bool {
         if self.invalidate_measure(node).is_err() {
@@ -2466,6 +2552,25 @@ mod tests {
         let root = tree.root();
         let error = tree
             .text_selection_rects(root, 0, 3)
+            .expect_err("非文本节点必须报错");
+        assert!(matches!(error, EngineError::TextShape { .. }));
+    }
+
+    #[test]
+    fn text_caret_rect_reports_preconditions() {
+        let (tree, node) = text_tree("abcdef");
+
+        let error = tree
+            .text_caret_rect(node, 0)
+            .expect_err("尚未 shape 的节点必须报错");
+        assert!(matches!(
+            error,
+            EngineError::TextShape { node: reported, .. } if reported == node
+        ));
+
+        let root = tree.root();
+        let error = tree
+            .text_caret_rect(root, 0)
             .expect_err("非文本节点必须报错");
         assert!(matches!(error, EngineError::TextShape { .. }));
     }
