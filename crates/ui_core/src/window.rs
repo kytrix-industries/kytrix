@@ -54,7 +54,49 @@ impl WindowId {
     }
 }
 
+/// Linux/wayland 客户端装饰（自绘标题栏）的窗口控制请求。
+///
+/// 其它平台有原生标题栏，不需要应用发这些请求；本类型只在 Linux 构建里存在。
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowControl {
+    /// 最小化（`xdg_toplevel.set_minimized`）。
+    Minimize,
+    /// 在最大化与还原之间切换（`set_maximized` / `unset_maximized`）。
+    ToggleMaximize,
+    /// 开始交互式移动（`xdg_toplevel._move(seat, serial)`）。
+    BeginMove,
+    /// 开始交互式缩放（`xdg_toplevel.resize(seat, serial, edge)`）。
+    BeginResize(WindowResizeEdge),
+}
+
+/// 自绘标题栏的缩放边（与 `xdg_toplevel.resize` 的边一一对应）。
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowResizeEdge {
+    /// 上边。
+    Top,
+    /// 下边。
+    Bottom,
+    /// 左边。
+    Left,
+    /// 右边。
+    Right,
+    /// 左上角。
+    TopLeft,
+    /// 右上角。
+    TopRight,
+    /// 左下角。
+    BottomLeft,
+    /// 右下角。
+    BottomRight,
+}
+
 /// 建窗参数。P03 只保存，不驱动平台（P12 才消费）。
+///
+/// 三个平台创建的窗口默认都是**可关闭 / 最小化 / 最大化 / 可缩放**的：Windows 用
+/// `WS_OVERLAPPEDWINDOW` 的系统标题栏，macOS 保留三个原生交通灯，Linux/Wayland 请求
+/// 客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台请求）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
@@ -937,38 +979,41 @@ impl Window {
         use crate::render::timer::Section;
 
         let (physical_width, physical_height) = self.physical_surface();
-        let mut upload_time = self
+        let upload_time = self
             .timings
             .sample(Section::Upload)
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
-        let mut gpu_time = self
+        let gpu_time = self
             .timings
             .sample(Section::Gpu)
             .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns));
-        let mut present_time = self
+        let present_time = self
             .timings
             .sample(Section::Present)
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
         // macOS 窗口路径的 GPU 工作已移到 render 线程：主线程没有本帧的 samples，
         // 用最近完成帧的 worker 采样补齐（HUD 允许领先一帧）。
         #[cfg(target_os = "macos")]
-        if let Some(renderer) = self.renderer.as_ref() {
-            upload_time = upload_time.or_else(|| {
-                renderer
-                    .timing_sample(Section::Upload)
-                    .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
-            });
-            gpu_time = gpu_time.or_else(|| {
-                renderer
-                    .timing_sample(Section::Gpu)
-                    .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns))
-            });
-            present_time = present_time.or_else(|| {
-                renderer
-                    .timing_sample(Section::Present)
-                    .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
-            });
-        }
+        let (upload_time, gpu_time, present_time) = match self.renderer.as_ref() {
+            Some(renderer) => (
+                upload_time.or_else(|| {
+                    renderer
+                        .timing_sample(Section::Upload)
+                        .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
+                }),
+                gpu_time.or_else(|| {
+                    renderer
+                        .timing_sample(Section::Gpu)
+                        .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns))
+                }),
+                present_time.or_else(|| {
+                    renderer
+                        .timing_sample(Section::Present)
+                        .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
+                }),
+            ),
+            None => (upload_time, gpu_time, present_time),
+        };
         crate::debug_hud::DebugHudMetrics {
             frame_index: self.frame_index(),
             frame_interval: self.frame_interval,

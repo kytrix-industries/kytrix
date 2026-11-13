@@ -7,6 +7,10 @@
 > 用户已确认：目标名为 `demo`；`ui_core` 的 `hud` feature 仍默认关闭；另建
 > `snapshot_demo` example，与 `demo` 共用基础 scene。
 
+> **窗口/布局更新**：`snapshot_demo` 的尺寸改为 `scene::window_size()`（内容 `960×740` + 平台顶部
+> 安全区）；截图尺寸因此随平台变化（macOS `960×778`、Linux `960×776`、Windows `960×740`）。
+> 下文的 `960×740` 是 P18 当时的记录。
+
 ---
 
 ## 0. 结论摘要

@@ -12,6 +12,8 @@
 
 mod a11y;
 mod card;
+#[cfg(target_os = "linux")]
+mod chrome;
 mod cjk;
 mod focus;
 mod ime;
@@ -32,16 +34,59 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::Color,
-        style::{FocusRing, PaintSpec},
+        style::{FocusRing, PaintSpec, Style},
     },
     text::TextStyle,
     window::{WindowId, WindowOptions},
 };
 
-/// 场景逻辑宽度。
+/// 窗口逻辑宽度（= 内容宽度；三平台一致）。
 pub const LOGICAL_WIDTH: f32 = 960.0;
-/// 场景逻辑高度。
+/// **内容区**逻辑高度（不含平台标题栏 / macOS 交通灯安全区）。
 pub const LOGICAL_HEIGHT: f32 = 740.0;
+
+/// 平台标题栏 / 交通灯安全区高度（内容整体下移）。
+#[cfg(target_os = "linux")]
+const WINDOW_TOP_INSET: f32 = chrome::TITLEBAR_HEIGHT;
+/// macOS 全屏内容 + 三色交通灯：顶部留出安全区。
+#[cfg(target_os = "macos")]
+const WINDOW_TOP_INSET: f32 = 38.0;
+/// Windows 使用系统标题栏，客户区不需要额外上边距。
+#[cfg(windows)]
+const WINDOW_TOP_INSET: f32 = 0.0;
+
+/// macOS 交通灯在标题栏左侧；标题文字再右移，避免视觉上压在按钮下方。
+#[cfg(target_os = "macos")]
+const HEADER_LEFT_INSET: f32 = 76.0;
+/// 其它平台不需要标题栏左侧安全区。
+#[cfg(not(target_os = "macos"))]
+const HEADER_LEFT_INSET: f32 = 0.0;
+
+/// 根节点顶部内边距（内容从窗口顶部再下移这么多）。
+const ROOT_TOP_PADDING: f32 = 14.0;
+/// 根节点左右内边距。
+const ROOT_SIDE_PADDING: f32 = 24.0;
+/// 根节点底部内边距。
+const ROOT_BOTTOM_PADDING: f32 = 14.0;
+/// 顶部标题列高度（标题 34 + 间距 2 + 副标题 20）。
+const HEADER_HEIGHT: f32 = 56.0;
+/// 标题列与内容列的间距。
+const CONTENT_MARGIN_TOP: f32 = 10.0;
+/// 内容区宽度（580 + 20 + 312）。
+const CONTENT_WIDTH: f32 = 912.0;
+/// 两列之间的水平间距。
+const COLUMN_GAP: f32 = 20.0;
+/// 三行之间的垂直间距。
+const ROW_GAP: f32 = 14.0;
+
+/// 内容区第一行的顶部（相对窗口）。
+const CONTENT_TOP: f32 = WINDOW_TOP_INSET + ROOT_TOP_PADDING + HEADER_HEIGHT + CONTENT_MARGIN_TOP;
+
+/// 场景窗口的逻辑尺寸（内容高度 + 平台顶部安全区）。
+#[must_use]
+pub fn window_size() -> Size {
+    Size::new(LOGICAL_WIDTH, LOGICAL_HEIGHT + WINDOW_TOP_INSET)
+}
 
 /// 窗口标题。
 pub const TITLE: &str = "Kytrix GUI · 焦点 / 中文 / 输入法 / 无障碍";
@@ -71,10 +116,12 @@ const RAIL_RGBA: [u8; 4] = [0x24, 0x2E, 0x3A, 0xFF];
 /// 滚动容器背景（`#1B222B`）。
 const TRACK_RGBA: [u8; 4] = [0x1B, 0x22, 0x2B, 0xFF];
 
-/// 顶部标题 / 副标题。
-const TITLE_RECT: Rect = Rect::new(24.0, 14.0, 800.0, 34.0);
-/// 副标题矩形。
-const SUBTITLE_RECT: Rect = Rect::new(24.0, 50.0, 912.0, 20.0);
+/// 标题高度。
+const TITLE_HEIGHT: f32 = 34.0;
+/// 副标题高度。
+const SUBTITLE_HEIGHT: f32 = 20.0;
+/// 标题与副标题之间的间距。
+const HEADER_GAP: f32 = 2.0;
 /// 副标题文案。
 #[cfg(feature = "hud")]
 const SUBTITLE: &str = "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · F12 调试 HUD · Esc 退出";
@@ -83,18 +130,38 @@ const SUBTITLE: &str = "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 
 const SUBTITLE: &str =
     "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · Esc 退出";
 
-/// 六张卡片（`design/phase-15-demo-showcase.md` §1）。
-const FOCUS_CARD: Rect = Rect::new(24.0, 80.0, 580.0, 176.0);
+/// 六张卡片的默认逻辑矩形（flex 顶左排列后的位置；供测试 / `Canvas` 绝对坐标复用）。
+pub(crate) const FOCUS_CARD: Rect = Rect::new(24.0, CONTENT_TOP, 580.0, 176.0);
 /// 焦点状态面板。
-const FOCUS_PANEL: Rect = Rect::new(624.0, 80.0, 312.0, 176.0);
+pub(crate) const FOCUS_PANEL: Rect = Rect::new(624.0, CONTENT_TOP, 312.0, 176.0);
 /// CJK 卡片。
-const CJK_CARD: Rect = Rect::new(24.0, 270.0, 580.0, 200.0);
+pub(crate) const CJK_CARD: Rect = Rect::new(
+    24.0,
+    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP,
+    580.0,
+    200.0,
+);
 /// 无障碍卡片。
-const A11Y_CARD: Rect = Rect::new(624.0, 270.0, 312.0, 200.0);
+pub(crate) const A11Y_CARD: Rect = Rect::new(
+    624.0,
+    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP,
+    312.0,
+    200.0,
+);
 /// 输入法卡片。
-const IME_CARD: Rect = Rect::new(24.0, 484.0, 580.0, 242.0);
+pub(crate) const IME_CARD: Rect = Rect::new(
+    24.0,
+    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP + CJK_CARD.size.height + ROW_GAP,
+    580.0,
+    242.0,
+);
 /// 图片与滚动卡片。
-const RES_CARD: Rect = Rect::new(624.0, 484.0, 312.0, 242.0);
+pub(crate) const RES_CARD: Rect = Rect::new(
+    624.0,
+    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP + CJK_CARD.size.height + ROW_GAP,
+    312.0,
+    242.0,
+);
 
 /// sRGB 字节 → 引擎颜色。
 pub(crate) fn color(rgba: [u8; 4]) -> Color {
@@ -111,6 +178,98 @@ pub(crate) fn text_style(size: f32, weight: u16, rgba: [u8; 4]) -> TextStyle {
 /// 焦点环：2px 宽、2px 外扩、强调色。
 pub(crate) fn ring() -> FocusRing {
     FocusRing::new(2.0, 2.0, color(RING_RGBA))
+}
+
+/// 根：撑满窗口的 flex 列，左上锚定；平台顶部安全区落在 padding 上。
+fn root_style() -> Style {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::percent(1.0),
+        height: taffy::style::Dimension::percent(1.0),
+    };
+    style.inner.flex_direction = taffy::style::FlexDirection::Column;
+    style.inner.align_items = taffy::style::AlignItems::START;
+    style.inner.padding = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentage::length(ROOT_SIDE_PADDING),
+        right: taffy::style::LengthPercentage::length(ROOT_SIDE_PADDING),
+        top: taffy::style::LengthPercentage::length(WINDOW_TOP_INSET + ROOT_TOP_PADDING),
+        bottom: taffy::style::LengthPercentage::length(ROOT_BOTTOM_PADDING),
+    };
+    style
+}
+
+/// 整窗背景：绝对定位、四边 100%，不参与 flex 流。
+fn background_style() -> Style {
+    let mut style = Style::default();
+    style.inner.position = taffy::style::Position::Absolute;
+    style.inner.inset = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentageAuto::length(0.0),
+        top: taffy::style::LengthPercentageAuto::length(0.0),
+        right: taffy::style::LengthPercentageAuto::auto(),
+        bottom: taffy::style::LengthPercentageAuto::auto(),
+    };
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::percent(1.0),
+        height: taffy::style::Dimension::percent(1.0),
+    };
+    style
+}
+
+/// 顶部标题列：固定高度、两行、行距 2；macOS 上左侧留交通灯安全区。
+fn header_style() -> Style {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::percent(1.0),
+        height: taffy::style::Dimension::length(HEADER_HEIGHT),
+    };
+    style.inner.flex_direction = taffy::style::FlexDirection::Column;
+    style.inner.align_items = taffy::style::AlignItems::START;
+    style.inner.gap = taffy::geometry::Size {
+        width: taffy::style::LengthPercentage::length(0.0),
+        height: taffy::style::LengthPercentage::length(HEADER_GAP),
+    };
+    style.inner.padding.left = taffy::style::LengthPercentage::length(HEADER_LEFT_INSET);
+    style
+}
+
+/// 单行文本：撑满标题列内容宽，固定行高。
+fn text_line_style(height: f32) -> Style {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::percent(1.0),
+        height: taffy::style::Dimension::length(height),
+    };
+    style
+}
+
+/// 内容列：固定 912 宽、三行、行距 14；整体左对齐（窗口更宽时右侧留背景）。
+fn content_style() -> Style {
+    let mut style = Style::default();
+    style.inner.size.width = taffy::style::Dimension::length(CONTENT_WIDTH);
+    style.inner.flex_direction = taffy::style::FlexDirection::Column;
+    style.inner.align_items = taffy::style::AlignItems::START;
+    style.inner.gap = taffy::geometry::Size {
+        width: taffy::style::LengthPercentage::length(0.0),
+        height: taffy::style::LengthPercentage::length(ROW_GAP),
+    };
+    style.inner.margin.top = taffy::style::LengthPercentageAuto::length(CONTENT_MARGIN_TOP);
+    style
+}
+
+/// 一行：固定高度 + 两列水平间距 20。
+fn row_style(height: f32) -> Style {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::percent(1.0),
+        height: taffy::style::Dimension::length(height),
+    };
+    style.inner.flex_direction = taffy::style::FlexDirection::Row;
+    style.inner.align_items = taffy::style::AlignItems::START;
+    style.inner.gap = taffy::geometry::Size {
+        width: taffy::style::LengthPercentage::length(COLUMN_GAP),
+        height: taffy::style::LengthPercentage::length(0.0),
+    };
+    style
 }
 
 /// 场景句柄（建树之后交给事件钩子；`Clone` 让帧钩子持有一份）。
@@ -137,6 +296,9 @@ pub struct Scene {
     ime_text: NodeId,
     /// 缩放滑块节点。
     slider: NodeId,
+    /// Linux 客户端装饰（自绘标题栏 + 边框缩放热区）。
+    #[cfg(target_os = "linux")]
+    chrome: chrome::Chrome,
 }
 
 impl Scene {
@@ -144,7 +306,7 @@ impl Scene {
     pub fn open(app: &mut App) -> Self {
         let window = app.create_window(WindowOptions {
             title: TITLE.into(),
-            size: Size::new(LOGICAL_WIDTH, LOGICAL_HEIGHT),
+            size: window_size(),
             scale: ui_core::math::Scale::ONE,
         });
         Self::build_into(app, window)
@@ -163,49 +325,99 @@ impl Scene {
         let ime = app.signal(ImeField::default());
         let a11y = app.signal(A11yState::default());
 
-        // 背景（整窗）+ 标题：先画、垫在最底层。
-        let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT))
+        // 页面级 flex：根列 → 标题列 / 内容列（三行两列）。
+        card::tree(app, window)
+            .set_style(root, root_style())
+            .expect("根样式写入");
+        let _background = NodeBuilder::boxed()
+            .style(background_style())
             .paint(PaintSpec {
                 background: color(BG_RGBA),
                 ..PaintSpec::default()
             })
-            .build(card::tree(app, window), root);
-        let _ = card::label(
-            app,
-            window,
-            root,
-            TITLE_RECT,
-            "Kytrix GUI · 焦点 / 中文 / 输入法 / 无障碍",
-            text_style(20.0, 700, TEXT_RGBA),
-        );
-        let _ = card::label(
-            app,
-            window,
-            root,
-            SUBTITLE_RECT,
-            SUBTITLE,
-            text_style(12.5, 400, MUTED_RGBA),
-        );
+            .id("demo.background")
+            .build(card::tree(app, window), root)
+            .expect("背景挂载");
 
-        // 挂载顺序 = Tab 序：① 色块 → ④ 单选/滑块 → ⑤ 输入框；其余卡片没有可聚焦节点。
-        let focus_card = card::card(app, window, root, FOCUS_CARD, "① 焦点与动作");
+        let header = card::container(app, window, root, header_style());
+        let _ = NodeBuilder::text(TITLE, text_style(20.0, 700, TEXT_RGBA))
+            .style(text_line_style(TITLE_HEIGHT))
+            .build(card::tree(app, window), header)
+            .expect("标题挂载");
+        let _ = NodeBuilder::text(SUBTITLE, text_style(12.5, 400, MUTED_RGBA))
+            .style(text_line_style(SUBTITLE_HEIGHT))
+            .build(card::tree(app, window), header)
+            .expect("副标题挂载");
+
+        let content = card::container(app, window, root, content_style());
+        let row_one = card::container(app, window, content, row_style(FOCUS_CARD.size.height));
+        let row_two = card::container(app, window, content, row_style(CJK_CARD.size.height));
+        let row_three = card::container(app, window, content, row_style(IME_CARD.size.height));
+
+        // 挂载顺序 = 视觉顺序 = DFS Tab 序（只有 ①④⑤ 含可聚焦节点）。
+        let focus_card = card::card(
+            app,
+            window,
+            row_one,
+            FOCUS_CARD.size,
+            "① 焦点与动作",
+            "demo.card.focus",
+        );
         let swatches = swatch::build(app, window, focus_card, active);
 
-        let a11y_card = card::card(app, window, root, A11Y_CARD, "④ 无障碍（AccessKit）");
-        let controls = a11y::build(app, window, a11y_card, a11y);
+        let focus_panel = card::card(
+            app,
+            window,
+            row_one,
+            FOCUS_PANEL.size,
+            "② 焦点状态",
+            "demo.card.focus-panel",
+        );
+        focus::build(app, window, focus_panel, focus);
 
-        let ime_card = card::card(app, window, root, IME_CARD, "⑤ 输入法（IME）");
-        let (ime_field, ime_text) = ime::build(app, window, ime_card, ime, input_focused);
-
-        let resources_card = card::card(app, window, root, RES_CARD, "⑥ 图片与滚动");
-        resources::build(app, window, resources_card, RES_CARD.origin);
-
-        let cjk_card = card::card(app, window, root, CJK_CARD, "③ 中文排版（CJK）");
+        let cjk_card = card::card(
+            app,
+            window,
+            row_two,
+            CJK_CARD.size,
+            "③ 中文排版（CJK）",
+            "demo.card.cjk",
+        );
         cjk::build(app, window, cjk_card);
 
-        let focus_panel = card::card(app, window, root, FOCUS_PANEL, "② 焦点状态");
-        focus::build(app, window, focus_panel, focus);
+        let a11y_card = card::card(
+            app,
+            window,
+            row_two,
+            A11Y_CARD.size,
+            "④ 无障碍（AccessKit）",
+            "demo.card.a11y",
+        );
+        let controls = a11y::build(app, window, a11y_card, a11y);
+
+        let ime_card = card::card(
+            app,
+            window,
+            row_three,
+            IME_CARD.size,
+            "⑤ 输入法（IME）",
+            "demo.card.ime",
+        );
+        let (ime_field, ime_text) = ime::build(app, window, ime_card, ime, input_focused);
+
+        let resources_card = card::card(
+            app,
+            window,
+            row_three,
+            RES_CARD.size,
+            "⑥ 图片与滚动",
+            "demo.card.resources",
+        );
+        resources::build(app, window, resources_card, RES_CARD.origin);
+
+        // Linux 的客户端装饰画在最后，保证盖在背景与卡片之上（按钮 / 边框热区独立命中）。
+        #[cfg(target_os = "linux")]
+        let chrome = chrome::build(app, window, root);
 
         let mut focus_targets: Vec<(NodeId, &'static str)> = Vec::with_capacity(7);
         focus_targets.extend(
@@ -231,6 +443,8 @@ impl Scene {
             ime_field,
             ime_text,
             slider: controls.slider,
+            #[cfg(target_os = "linux")]
+            chrome,
         }
     }
 
@@ -238,6 +452,8 @@ impl Scene {
     pub fn install(app: &mut App, scene: Self) {
         swatch::install(app, &scene);
         a11y::install(app, &scene);
+        #[cfg(target_os = "linux")]
+        chrome::install(app, &scene);
         if let Some((first, _)) = scene.focus_targets.first().copied() {
             let _ = app.set_focus(scene.window, Some(first));
             let _ = app.write(
@@ -415,11 +631,17 @@ pub(crate) fn ime_text(scene: &Scene, app: &App) -> SmolStr {
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
-    use ui_core::{a11y::A11yRole, test_support::record::PrimitiveKind, text::TextDiagnostic};
+    use ui_core::{
+        a11y::A11yRole,
+        math::{Rect, Size},
+        test_support::{probe::Selector, record::PrimitiveKind},
+        text::TextDiagnostic,
+    };
 
     use super::{
-        ime_text,
+        FOCUS_CARD, RES_CARD, ime_text,
         test_support::{frame, setup},
+        window_size,
     };
 
     #[test]
@@ -448,7 +670,7 @@ mod tests {
         );
 
         // 自绘画布（两个 PNG 图标）：`Canvas` 内部图元是**绝对窗口坐标**，必须落在 ⑥ 卡片
-        // （x=624,y=484,w=312,h=242）内，而不是被误当成父相对坐标画到窗口左上角。
+        // 内，而不是被误当成父相对坐标画到窗口左上角。
         let canvases: Vec<_> = frame
             .primitives
             .iter()
@@ -458,10 +680,37 @@ mod tests {
         assert_eq!(canvases.len(), 2, "两个图标都是 Canvas 节点");
         for bounds in canvases {
             assert!(
-                bounds.origin.x >= 624.0 && bounds.origin.y >= 484.0,
+                bounds.origin.x >= RES_CARD.origin.x && bounds.origin.y >= RES_CARD.origin.y,
                 "图标必须画在 ⑥ 卡片内：{bounds:?}"
             );
-            assert!(bounds.max().y <= 726.0, "图标不得溢出卡片底边：{bounds:?}");
+            assert!(
+                bounds.max().y <= RES_CARD.max().y,
+                "图标不得溢出卡片底边：{bounds:?}"
+            );
+        }
+
+        // 页面级 flex 的落点必须与默认矩形一致；背景必须铺满整个窗口。
+        let probe = test.probe();
+        let background = probe
+            .by_selector(Selector::Id("demo.background"))
+            .expect("背景节点");
+        assert_eq!(
+            probe.bounds(background),
+            Some(Rect::new(
+                0.0,
+                0.0,
+                window_size().width,
+                window_size().height
+            )),
+            "背景必须铺满整个窗口"
+        );
+        for (id, expected) in [
+            ("demo.card.focus", FOCUS_CARD),
+            ("demo.card.cjk", super::CJK_CARD),
+            ("demo.card.ime", super::IME_CARD),
+        ] {
+            let node = probe.by_selector(Selector::Id(id)).expect(id);
+            assert_eq!(probe.bounds(node), Some(expected), "{id} 的 flex 落点");
         }
 
         let app = test.app();
@@ -478,6 +727,45 @@ mod tests {
             app.a11y_diagnostics()
         );
         assert_eq!(app.focused(window), None, "`build_into` 不预置焦点");
+    }
+
+    #[test]
+    fn resizing_window_fills_background_and_keeps_content_top_left() {
+        let (mut test, window, _scene) = setup();
+        frame(&mut test);
+
+        let resized = Size::new(window_size().width + 240.0, window_size().height + 160.0);
+        test.app_mut()
+            .window_mut(window)
+            .expect("窗口存在")
+            .set_size(resized);
+        frame(&mut test);
+
+        assert!(
+            test.frame_record().rendered,
+            "resize 后必须重新提交一帧（不能只保留旧画面）"
+        );
+        let probe = test.probe();
+        let background = probe
+            .by_selector(Selector::Id("demo.background"))
+            .expect("背景节点");
+        assert_eq!(
+            probe.bounds(background),
+            Some(Rect::new(0.0, 0.0, resized.width, resized.height)),
+            "窗口变大后背景必须继续铺满"
+        );
+        for (id, expected) in [
+            ("demo.card.focus", FOCUS_CARD),
+            ("demo.card.ime", super::IME_CARD),
+            ("demo.card.resources", RES_CARD),
+        ] {
+            let node = probe.by_selector(Selector::Id(id)).expect(id);
+            assert_eq!(
+                probe.bounds(node),
+                Some(expected),
+                "flex 内容必须保持左上锚定（{id}）"
+            );
+        }
     }
 
     #[test]

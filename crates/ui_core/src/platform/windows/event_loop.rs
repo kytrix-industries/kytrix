@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use windows::Win32::{
-    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
@@ -84,6 +84,72 @@ fn cursor_handle(cursor: crate::paint::style::Cursor) -> HCURSOR {
     unsafe { LoadCursorW(None, id) }.unwrap_or_default()
 }
 
+/// `WM_NCHITTEST` 的可缩放边框区域。
+fn is_resize_hit(hit: u32) -> bool {
+    matches!(
+        hit,
+        HTLEFT | HTRIGHT | HTTOP | HTBOTTOM | HTTOPLEFT | HTTOPRIGHT | HTBOTTOMLEFT | HTBOTTOMRIGHT
+    )
+}
+
+/// 缩放边框期间的系统光标。
+fn resize_cursor(hit: u32) -> HCURSOR {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    };
+
+    let id = match hit {
+        HTLEFT | HTRIGHT => IDC_SIZEWE,
+        HTTOP | HTBOTTOM => IDC_SIZENS,
+        HTTOPLEFT | HTBOTTOMRIGHT => IDC_SIZENWSE,
+        HTTOPRIGHT | HTBOTTOMLEFT => IDC_SIZENESW,
+        _ => IDC_ARROW,
+    };
+    // SAFETY: 共享的系统光标句柄；不拥有、不释放。
+    unsafe { LoadCursorW(None, id) }.unwrap_or_default()
+}
+
+/// 从缩放起点与当前鼠标位置算出新的窗口矩形（物理像素，含最小尺寸钳制）。
+fn resized_rect(session: ResizeSession, cursor: POINT, min: (u32, u32)) -> RECT {
+    let dx = cursor.x - session.cursor.x;
+    let dy = cursor.y - session.cursor.y;
+    let mut rect = session.window;
+    let left = matches!(session.hit, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT);
+    let right = matches!(session.hit, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT);
+    let top = matches!(session.hit, HTTOP | HTTOPLEFT | HTTOPRIGHT);
+    let bottom = matches!(session.hit, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT);
+    if left {
+        rect.left += dx;
+    }
+    if right {
+        rect.right += dx;
+    }
+    if top {
+        rect.top += dy;
+    }
+    if bottom {
+        rect.bottom += dy;
+    }
+
+    let min_width = min.0.max(1) as i32;
+    let min_height = min.1.max(1) as i32;
+    if (left || right) && rect.right - rect.left < min_width {
+        if left {
+            rect.left = rect.right - min_width;
+        } else {
+            rect.right = rect.left + min_width;
+        }
+    }
+    if (top || bottom) && rect.bottom - rect.top < min_height {
+        if top {
+            rect.top = rect.bottom - min_height;
+        } else {
+            rect.bottom = rect.top + min_height;
+        }
+    }
+    rect
+}
+
 /// `WndProc` 的每窗口状态（`GWLP_USERDATA` 指向它）。
 pub(crate) struct WndProcState {
     dispatcher: Arc<Dispatcher>,
@@ -94,8 +160,22 @@ pub(crate) struct WndProcState {
     close_requested: bool,
     /// 是否已注册 `TrackMouseEvent(TME_LEAVE)`（每进入一次客户区注册一次）。
     mouse_tracking: bool,
+    /// 正在进行的自绘边框缩放（拦截 `WM_NCLBUTTONDOWN` 后不再进入 Win32 模态循环，
+    /// 这样消息泵才能继续处理 `WM_SIZE` 并及时出帧）。
+    resize: Option<ResizeSession>,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
     a11y: crate::platform::windows::a11y::WindowsA11y,
+}
+
+/// 一次自绘边框缩放的起点。
+#[derive(Clone, Copy)]
+struct ResizeSession {
+    /// `WM_NCHITTEST` 的 `HT*` 值。
+    hit: u32,
+    /// 按下时的屏幕坐标。
+    cursor: POINT,
+    /// 按下时的窗口矩形（物理像素）。
+    window: RECT,
 }
 
 impl WndProcState {
@@ -111,6 +191,7 @@ impl WndProcState {
             min_size: (1, 1),
             close_requested: false,
             mouse_tracking: false,
+            resize: None,
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
             a11y: crate::platform::windows::a11y::WindowsA11y::new(hwnd, dispatcher, window)?,
@@ -156,6 +237,68 @@ impl WndProcState {
     pub(crate) fn modifiers(&self) -> crate::event::Modifiers {
         self.translate.modifiers()
     }
+
+    /// 开始自绘边框缩放：记录起点并抓鼠标（不再把消息交给 `DefWindowProcW` 的模态循环）。
+    fn begin_resize(&mut self, hwnd: HWND, hit: u32) {
+        let mut cursor = POINT::default();
+        let mut window = RECT::default();
+        // SAFETY: 两个输出指针都指向本函数栈上的值；`hwnd` 由当前消息给出且窗口存活。
+        let captured = unsafe {
+            GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut window).is_ok()
+        };
+        if !captured {
+            return;
+        }
+        // SAFETY: `hwnd` 是本进程创建的窗口；捕获在抬起 / 取消时释放。
+        unsafe { SetCapture(hwnd) };
+        self.resize = Some(ResizeSession {
+            hit,
+            cursor,
+            window,
+        });
+        // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
+        unsafe { SetCursor(Some(resize_cursor(hit))) };
+    }
+
+    /// 按当前鼠标位置移动窗口边框（物理像素）。
+    fn resize_step(&mut self, hwnd: HWND) {
+        let Some(session) = self.resize else {
+            return;
+        };
+        let mut cursor = POINT::default();
+        // SAFETY: `cursor` 是本函数栈上的输出值。
+        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            return;
+        }
+        let next = resized_rect(session, cursor, self.min_size);
+        let width = next.right - next.left;
+        let height = next.bottom - next.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        // SAFETY: `hwnd` 存活；只改位置与尺寸，不改变 Z 序、不激活窗口。
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                next.left,
+                next.top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        // SAFETY: 同 `begin_resize`。
+        unsafe { SetCursor(Some(resize_cursor(session.hit))) };
+    }
+
+    /// 结束自绘边框缩放并释放鼠标捕获。
+    fn end_resize(&mut self) {
+        if self.resize.take().is_some() {
+            // SAFETY: 只释放本线程的捕获；没有捕获时是 no-op。
+            let _ = unsafe { ReleaseCapture() };
+        }
+    }
 }
 
 /// 窗口过程。所有分支都先取 `GWLP_USERDATA`；创建期（尚未绑定状态）一律交 `DefWindowProcW`。
@@ -200,6 +343,36 @@ pub(crate) extern "system" fn wndproc(
         }
         if state.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        // ── 自绘边框缩放 ────────────────────────────────────────────────────────
+        // 非客户区的缩放不能交给 `DefWindowProcW`：`WM_NCLBUTTONDOWN` 会进入 Win32 的模态
+        // sizing 循环，把我们的泵阻塞在里面，`WM_SIZE` 只能排队、画面在拖动期间不更新。
+        // 这里接管边框的按下/移动/抬起，普通消息循环继续跑，下一轮泵就能按新尺寸出帧。
+        {
+            let state = &mut *state;
+            let hit = wparam.0 as u32;
+            if msg == WM_NCLBUTTONDOWN && is_resize_hit(hit) {
+                state.begin_resize(hwnd, hit);
+                return LRESULT(0);
+            }
+            if state.resize.is_some() {
+                match msg {
+                    WM_MOUSEMOVE => {
+                        state.resize_step(hwnd);
+                        return LRESULT(0);
+                    }
+                    WM_LBUTTONUP => {
+                        state.end_resize();
+                        return LRESULT(0);
+                    }
+                    WM_CAPTURECHANGED => {
+                        state.resize = None;
+                        return LRESULT(0);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // ── a11y（P11）：借用纪律 ──────────────────────────────────────────────
@@ -666,4 +839,66 @@ fn encode_point(x: i32, y: i32) -> isize {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use windows::Win32::{
+        Foundation::{POINT, RECT},
+        UI::WindowsAndMessaging::{HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOPLEFT},
+    };
+
+    use super::{ResizeSession, is_resize_hit, resized_rect};
+
+    fn session(hit: u32) -> ResizeSession {
+        ResizeSession {
+            hit,
+            cursor: POINT { x: 500, y: 300 },
+            window: RECT {
+                left: 100,
+                top: 100,
+                right: 500,
+                bottom: 400,
+            },
+        }
+    }
+
+    #[test]
+    fn border_hits_are_the_eight_resize_edges() {
+        assert!(is_resize_hit(HTLEFT));
+        assert!(is_resize_hit(HTBOTTOMRIGHT));
+        assert!(!is_resize_hit(HTCAPTION), "标题栏拖动仍交给 DefWindowProcW");
+    }
+
+    #[test]
+    fn dragging_the_right_edge_changes_only_the_width() {
+        let rect = resized_rect(session(HTRIGHT), POINT { x: 540, y: 280 }, (320, 200));
+
+        assert_eq!(rect.left, 100);
+        assert_eq!(rect.right, 540);
+        assert_eq!(rect.top, 100);
+        assert_eq!(rect.bottom, 400);
+    }
+
+    #[test]
+    fn dragging_the_top_left_corner_moves_the_origin() {
+        let rect = resized_rect(session(HTTOPLEFT), POINT { x: 480, y: 280 }, (320, 200));
+
+        assert_eq!(rect.left, 80);
+        assert_eq!(rect.top, 80);
+        assert_eq!(rect.right, 500);
+        assert_eq!(rect.bottom, 400);
+    }
+
+    #[test]
+    fn minimum_size_clamps_the_dragged_edge() {
+        let rect = resized_rect(session(HTLEFT), POINT { x: 490, y: 300 }, (320, 200));
+        assert_eq!(
+            rect.right - rect.left,
+            320,
+            "左边不能把窗口压到最小宽度以下"
+        );
+        assert_eq!(rect.right, 500);
+        assert_eq!(rect.left, 180);
+    }
 }

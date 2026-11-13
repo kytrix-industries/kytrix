@@ -158,8 +158,9 @@ mod showcase_tests {
         test.enable_a11y_capture();
         frame(&mut test);
 
-        // 色块 2 的中心：卡片 (24,80) + 卡片内 (202,42,150,88)。
-        let center = Point::new(24.0 + 202.0 + 75.0, 80.0 + 42.0 + 44.0);
+        // 色块 2 的中心：卡片原点 + 卡片内 (202,42,150,88)。
+        let card = crate::scene::FOCUS_CARD.origin;
+        let center = Point::new(card.x + 202.0 + 75.0, card.y + 42.0 + 44.0);
         let _ = test.inject(InputEvent::PointerDown {
             position: center,
             button: PointerButton::Primary,

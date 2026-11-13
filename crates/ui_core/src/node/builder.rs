@@ -43,6 +43,7 @@ pub struct NodeBuilder {
     focus_ring: Option<crate::paint::style::FocusRing>,
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
+    tab_stop: bool,
 }
 
 impl Default for NodeBuilder {
@@ -70,6 +71,7 @@ impl NodeBuilder {
             focus_ring: None,
             a11y: None,
             bind_a11y: None,
+            tab_stop: true,
         }
     }
 
@@ -96,6 +98,16 @@ impl NodeBuilder {
             bind_a11y: Some(Box::new(bind_a11y)),
             ..self
         }
+    }
+
+    /// 是否进入 Tab / Shift+Tab 焦点序（默认 `true`）。
+    ///
+    /// `false` 只影响键盘焦点遍历：节点仍可被指针点击、仍可被辅助技术激活。
+    /// 窗口装饰按钮（关闭 / 最小化 / 最大化）用 `false`，避免抢占应用自身的焦点序。
+    #[must_use]
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
     }
 
     /// 焦点环（P10）：该节点获得焦点后由 paint 在**它自己的 lane 内**画一圈（受祖先 clip 约束）。
@@ -303,6 +315,9 @@ impl NodeBuilder {
         }
         if let Some(bind_a11y) = self.bind_a11y {
             spec = spec.with_bind_a11y(bind_a11y);
+        }
+        if !self.tab_stop {
+            spec = spec.with_tab_stop(false);
         }
         tree.insert_child(parent, spec)
     }

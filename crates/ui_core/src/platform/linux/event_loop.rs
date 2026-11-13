@@ -31,7 +31,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
 
-    let (mut state, mut queue) = WaylandState::new()?;
+    let (initial_size, initial_title) = app.windows().next().map_or(
+        (crate::math::Size::new(800.0, 600.0), "Kytrix"),
+        |(_, window)| (window.size(), window.options().title.as_str()),
+    );
+    let (mut state, mut queue) = WaylandState::new(initial_size, initial_title)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
     // 首个 configure 之后才知道真实尺寸；`wp_viewport.set_destination` 让 compositor 做分数缩放。
@@ -134,9 +138,23 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 
             app.sync_clock();
             app.run_frame_hook();
+            // ③b 自绘标题栏的窗口控制：与触发它的输入事件同一轮执行，`serial` 仍是按下时的值。
+            if let Some((window, control)) = app.take_window_control()
+                && window == id
+            {
+                match control {
+                    crate::window::WindowControl::Minimize => state.minimize(),
+                    crate::window::WindowControl::ToggleMaximize => state.toggle_maximize(),
+                    crate::window::WindowControl::BeginMove => state.begin_move(),
+                    crate::window::WindowControl::BeginResize(edge) => state.begin_resize(edge),
+                }
+            }
             // ④ 提交一帧。`wl_callback` 必须在**提交（present 触发 commit）之前**请求，
             // 否则 `done` 永远不会到达（Wayland 的 frame 回调只在 commit 之后生效）。
-            if dispatcher.take_frame_wake() && state.frame_ready() {
+            //
+            // 先判 `frame_ready` 再消费唤醒：上一帧还没 present 时，唤醒必须留在队列里；
+            // frame callback 到达后下一轮会重新看到它。反过来先消费会把 resize 的最后一帧丢掉。
+            if state.frame_ready() && dispatcher.take_frame_wake() {
                 state.request_frame();
                 match app.frame(id) {
                     None | Some(Ok(_)) => {}
@@ -167,6 +185,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             } else {
                 surface::IDLE_TIMEOUT
             };
+            // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。
+            if app.windows().next().is_none() {
+                return Ok(());
+            }
             event_loop
                 .dispatch(timeout, &mut state)
                 .map_err(|error| EngineError::AppInit {

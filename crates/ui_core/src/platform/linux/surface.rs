@@ -84,6 +84,8 @@ pub(crate) struct WaylandState {
     xkb_state: Option<xkb::State>,
     /// 最近的输入 serial（IME / 剪贴板 / 拖拽都要）。
     serial: u32,
+    /// 最近一次指针按键的 serial（`xdg_toplevel.move` / `resize` 的隐式抓取凭证）。
+    pointer_serial: u32,
     mods: (u32, u32, u32),
     modifiers: Modifiers,
     pointer_pos: Point,
@@ -93,6 +95,8 @@ pub(crate) struct WaylandState {
     viewport_applied: Option<(u32, u32)>,
     focused: bool,
     configured: bool,
+    /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
+    maximized: bool,
     close_requested: bool,
     /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交。
     frame_ready: bool,
@@ -100,7 +104,13 @@ pub(crate) struct WaylandState {
 
 impl WaylandState {
     /// 连上 compositor、绑定必需 global、建 surface/toplevel、装 IME / 剪贴板（§8.1 的 1–4）。
-    pub(crate) fn new() -> Result<(Self, wayland_client::EventQueue<Self>), EngineError> {
+    ///
+    /// `size` / `title` 是应用建窗参数：compositor 的 configure 给出 `0×0` 时，客户端用请求的
+    /// 尺寸作为初值（否则会退到固定的 800×600）。
+    pub(crate) fn new(
+        size: Size,
+        title: &str,
+    ) -> Result<(Self, wayland_client::EventQueue<Self>), EngineError> {
         let connection =
             Connection::connect_to_env().map_err(|error| EngineError::WaylandCompositor {
                 detail: smol_str::format_smolstr!("no Wayland session: {error}"),
@@ -123,7 +133,7 @@ impl WaylandState {
         let xdg_surface = wm_base.get_xdg_surface(&surface, &queue_handle, ());
         let toplevel = xdg_surface.get_toplevel(&queue_handle, ());
         toplevel.set_app_id(APP_ID.to_owned());
-        toplevel.set_title("Kytrix".to_owned());
+        toplevel.set_title(title.to_owned());
         window::apply_min_size(&toplevel, Scale::ONE);
         surface.commit();
 
@@ -190,14 +200,16 @@ impl WaylandState {
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
             serial: 0,
+            pointer_serial: 0,
             mods: (0, 0, 0),
             modifiers: Modifiers::empty(),
             pointer_pos: Point::new(0.0, 0.0),
-            size: Size::new(800.0, 600.0),
+            size: Size::new(size.width.max(1.0), size.height.max(1.0)),
             scale: Scale::ONE,
             viewport_applied: None,
             focused: false,
             configured: false,
+            maximized: false,
             close_requested: false,
             frame_ready: true,
         };
@@ -266,6 +278,44 @@ impl WaylandState {
 
     pub(crate) fn take_close_request(&mut self) -> bool {
         std::mem::take(&mut self.close_requested)
+    }
+
+    /// 最小化（自绘标题栏的“缩小”按钮）。
+    pub(crate) fn minimize(&self) {
+        self.toplevel.set_minimized();
+    }
+
+    /// 最大化 / 还原切换；最终状态以 compositor 的 configure 为准。
+    pub(crate) fn toggle_maximize(&mut self) {
+        if self.maximized {
+            self.toplevel.unset_maximized();
+        } else {
+            self.toplevel.set_maximized();
+        }
+    }
+
+    /// 开始交互式移动；使用触发拖动的指针按键 serial。
+    pub(crate) fn begin_move(&self) {
+        self.toplevel._move(&self.seat, self.pointer_serial);
+    }
+
+    /// 开始交互式缩放；使用触发拖动的指针按键 serial。
+    pub(crate) fn begin_resize(&self, edge: crate::window::WindowResizeEdge) {
+        use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+
+        use crate::window::WindowResizeEdge;
+
+        let edge = match edge {
+            WindowResizeEdge::Top => ResizeEdge::Top,
+            WindowResizeEdge::Bottom => ResizeEdge::Bottom,
+            WindowResizeEdge::Left => ResizeEdge::Left,
+            WindowResizeEdge::Right => ResizeEdge::Right,
+            WindowResizeEdge::TopLeft => ResizeEdge::TopLeft,
+            WindowResizeEdge::TopRight => ResizeEdge::TopRight,
+            WindowResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
+            WindowResizeEdge::BottomRight => ResizeEdge::BottomRight,
+        };
+        self.toplevel.resize(&self.seat, self.pointer_serial, edge);
     }
 
     pub(crate) fn clipboard_mut(&mut self) -> &mut Clipboard {
@@ -575,11 +625,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
                 // 0 = 「客户端自己选」；否则用 compositor 给的建议尺寸。
                 if width > 0 && height > 0 {
                     state.size = Size::new(width as f32, height as f32);
                 }
+                // `states` 是协议数组的原始字节（u32 native-endian 的 state 枚举序列）。
+                let maximized = xdg_toplevel::State::Maximized as u32;
+                state.maximized = states
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|chunk| u32::from_ne_bytes(*chunk) == maximized);
                 state.configured = true;
                 state.events.push(Event::Resized { size: state.size });
             }
@@ -723,6 +784,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 }));
             }
             wl_pointer::Event::Button {
+                serial,
                 button,
                 state: button_state,
                 ..
@@ -730,6 +792,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 if let Some(button) = Self::pointer_button(button) {
                     let event = match button_state {
                         wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                            state.pointer_serial = serial;
                             InputEvent::PointerDown {
                                 position: state.pointer_pos,
                                 button,

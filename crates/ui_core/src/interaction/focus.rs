@@ -19,7 +19,7 @@ pub(crate) fn accepts_action(tree: &NodeTree, node: NodeId) -> bool {
 /// 该节点是否可聚焦：接受动作，或被显式标为 `interactive: Some(true)`。
 #[must_use]
 pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
-    if !tree.is_hittable(node) {
+    if !tree.is_hittable(node) || !tree.get(node).is_ok_and(|target| target.tab_stop()) {
         return false;
     }
     accepts_action(tree, node) || tree.is_explicitly_interactive(node)
@@ -218,6 +218,30 @@ mod tests {
 
         assert!(focusable(&tree, node));
         assert_eq!(next_focusable(&tree, None, false), Some(node));
+    }
+
+    #[test]
+    fn tab_stop_false_keeps_the_action_but_skips_the_tab_order() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let first = NodeBuilder::boxed()
+            .on_click(Action::custom("first"))
+            .build(&mut tree, root)
+            .expect("mount");
+        let chrome = NodeBuilder::boxed()
+            .on_click(Action::custom("chrome"))
+            .tab_stop(false)
+            .build(&mut tree, root)
+            .expect("mount");
+
+        assert!(!focusable(&tree, chrome), "窗口控件不进入应用 Tab 序");
+        assert_eq!(
+            tree.interaction(chrome)
+                .and_then(|slot| slot.action.clone()),
+            Some(Action::custom("chrome")),
+            "点击 / AT 的动作仍然保留"
+        );
+        assert_eq!(next_focusable(&tree, Some(first), false), Some(first));
     }
 
     #[test]

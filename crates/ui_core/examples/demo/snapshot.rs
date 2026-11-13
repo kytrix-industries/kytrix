@@ -10,7 +10,7 @@
 
 pub mod scene;
 
-use scene::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Scene, TITLE};
+use scene::{Scene, TITLE, window_size};
 use ui_core::{
     math::Scale,
     test_support::{
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn capture(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let size = ui_core::math::Size::new(LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    let size = window_size();
     let mut test = TestApp::with_options(WindowOptions {
         title: TITLE.into(),
         size,

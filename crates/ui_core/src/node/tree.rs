@@ -102,6 +102,8 @@ pub(crate) struct NodeSpec {
     focus_ring: Option<crate::paint::style::FocusRing>,
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
+    /// 是否进入 Tab 序（窗口控件可以点击但不抢应用焦点）。
+    tab_stop: bool,
 }
 
 impl NodeSpec {
@@ -125,6 +127,7 @@ impl NodeSpec {
             focus_ring: None,
             a11y: None,
             bind_a11y: None,
+            tab_stop: true,
         }
     }
 
@@ -138,6 +141,11 @@ impl NodeSpec {
         bind: Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>,
     ) -> Self {
         self.bind_a11y = Some(bind);
+        self
+    }
+
+    pub(crate) fn with_tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
         self
     }
 
@@ -214,6 +222,8 @@ pub struct Node {
     hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
     /// 布局覆盖（root 逃生口）。
     layout_override: Option<LayoutOverride>,
+    /// 是否进入 Tab 序（`false` = 仍可点击 / 可被 AT 激活，但 `focus_next/prev` 跳过它）。
+    tab_stop: bool,
     /// 静态绘制属性（P06；`None` = 不画背景/边框/阴影/渐变）。
     paint: Option<Box<PaintSpec>>,
     /// 内容盒相对 border box 左上角的偏移（`border + padding`；P06 的文本绝对坐标基准）。
@@ -296,6 +306,12 @@ impl Node {
     #[must_use]
     pub fn style(&self) -> &Style {
         &self.style
+    }
+
+    /// 是否进入 Tab 序（`NodeBuilder::tab_stop`；默认 `true`）。
+    #[must_use]
+    pub(crate) fn tab_stop(&self) -> bool {
+        self.tab_stop
     }
 
     /// 上次求值的动态属性补丁（消费者：`App::refresh_styles`、`App::write` 的 `affects_layout`）。
@@ -536,6 +552,7 @@ impl NodeTree {
             measure: None,
             hit_shape: None,
             layout_override: None,
+            tab_stop: true,
             paint: None,
             content_offset: Point::ZERO,
             text_bind: None,
@@ -726,6 +743,7 @@ impl NodeTree {
             focus_ring,
             a11y,
             bind_a11y,
+            tab_stop,
         } = spec;
         let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
             let mut slot = NodeInteraction::new();
@@ -745,6 +763,7 @@ impl NodeTree {
             measure,
             hit_shape,
             layout_override,
+            tab_stop,
             paint,
             content_offset: Point::ZERO,
             text_bind: bind_text,

@@ -527,10 +527,11 @@ mod showcase_tests {
                 .expect("窗口存在")
                 .expect("输入框聚焦后必须有 caret hint")
         };
-        // 输入框：卡片 (24,484) + 字段 (18,40) = (42,524,544,54)；正文子节点再内缩 (14,12)。
-        assert!(empty.origin.x >= 56.0, "{empty:?}");
-        assert!(empty.origin.y >= 536.0, "{empty:?}");
-        assert!(empty.max().y <= 578.0, "{empty:?}");
+        // 输入框：卡片原点 + 字段 (18,40) + 正文子节点内缩 (14,12)。
+        let card = crate::scene::IME_CARD.origin;
+        assert!(empty.origin.x >= card.x + 18.0 + 14.0, "{empty:?}");
+        assert!(empty.origin.y >= card.y + 40.0 + 12.0, "{empty:?}");
+        assert!(empty.max().y <= card.y + 40.0 + 12.0 + 30.0, "{empty:?}");
 
         {
             let app = test.app_mut();

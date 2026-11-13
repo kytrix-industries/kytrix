@@ -6,7 +6,7 @@
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CAMetalLayer;
@@ -105,20 +105,8 @@ impl NativeWindow {
         view.setWantsLayer(true);
         window.makeFirstResponder(Some(&view));
 
-        // 交通灯：只保留 Close（重排到左上角），Miniaturize / Zoom 隐藏（F-127）。
-        if let Some(close) = window.standardWindowButton(NSWindowButton::CloseButton) {
-            let frame = close.frame();
-            close.setFrame(NSRect::new(NSPoint::new(12.0, frame.origin.y), frame.size));
-        }
-        for button in [
-            NSWindowButton::MiniaturizeButton,
-            NSWindowButton::ZoomButton,
-        ] {
-            if let Some(button) = window.standardWindowButton(button) {
-                button.setHidden(true);
-            }
-        }
-
+        // 原生交通灯全部保留：关闭 / 最小化 / 缩放。标题栏透明且标题隐藏，内容铺满窗口，
+        // 因此窗口控件浮在内容上方（应用用顶部安全区避让）。
         let a11y = MacA11y::new(&view, dispatcher.clone(), id)?;
         view.install_a11y(a11y);
 

@@ -4,18 +4,18 @@
 
 use ui_core::{
     event::{InputEvent, Key, KeyState, Modifiers},
-    math::{Scale, Size},
+    math::Scale,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
 };
 
-use super::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Scene, TITLE};
+use super::{Scene, TITLE, window_size};
 
 /// 建一个与真实窗口同尺寸的 headless 场景（未安装交互）。
 pub(super) fn setup() -> (TestApp, WindowId, Scene) {
     let mut test = TestApp::with_options(WindowOptions {
         title: TITLE.into(),
-        size: Size::new(LOGICAL_WIDTH, LOGICAL_HEIGHT),
+        size: window_size(),
         scale: Scale::ONE,
     });
     let window = test.window_id();

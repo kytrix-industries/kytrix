@@ -127,6 +127,9 @@ pub struct App {
     cursor_pending: Option<Cursor>,
     /// 待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
     capture_request: Option<bool>,
+    /// 待执行的 Linux 客户端装饰窗口控制（自绘标题栏的按钮 / 拖动）。
+    #[cfg(target_os = "linux")]
+    window_control: Option<(WindowId, crate::window::WindowControl)>,
     /// a11y 动作的 handler 表（P11；同 `A11yAction` 后写覆盖）。
     a11y_handlers: ahash::HashMap<
         crate::a11y::A11yAction,
@@ -336,6 +339,8 @@ impl App {
             next_animation: 1,
             cursor_pending: None,
             capture_request: None,
+            #[cfg(target_os = "linux")]
+            window_control: None,
             a11y_handlers: ahash::HashMap::default(),
             a11y_diagnostics: Vec::new(),
             #[cfg(feature = "hud")]
@@ -2034,6 +2039,45 @@ impl App {
             }
         }
         true
+    }
+
+    /// 请求一次 Linux 客户端装饰的窗口控制（自绘标题栏专用）。
+    ///
+    /// 请求由 Wayland 事件循环在**同一轮**内执行；`BeginMove` / `BeginResize` 使用最近一次
+    /// 指针按键的 serial，因此只应从输入事件的动作处理器里调用（拖动/点击的 handler）。
+    /// 其它平台有原生标题栏，不提供本入口。
+    ///
+    /// # Errors
+    /// `EngineError::UnknownWindow`：窗口不存在（已经关闭）。
+    #[cfg(target_os = "linux")]
+    pub fn request_window_control(
+        &mut self,
+        window: WindowId,
+        control: crate::window::WindowControl,
+    ) -> Result<(), EngineError> {
+        let Some(target) = self.windows.get_mut(&window) else {
+            return Err(EngineError::UnknownWindow { window });
+        };
+        if matches!(
+            control,
+            crate::window::WindowControl::BeginMove | crate::window::WindowControl::BeginResize(_)
+        ) {
+            // 移动/缩放一旦交给 compositor，客户端就收不到后续指针抬起：主动结束本地拖拽
+            // 会话，避免下一次移动被误当成标题栏/边框拖拽。
+            target.pointer_mut().end_drag();
+            target.pointer_mut().press = None;
+            self.capture_request = Some(false);
+        }
+        self.window_control = Some((window, control));
+        Ok(())
+    }
+
+    /// 取走待执行的窗口控制请求（Wayland 事件循环的唯一读点）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_window_control(
+        &mut self,
+    ) -> Option<(WindowId, crate::window::WindowControl)> {
+        self.window_control.take()
     }
 
     /// 遍历全部窗口（顺序不保证）并带出 `WindowId`。

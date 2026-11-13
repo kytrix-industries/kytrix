@@ -102,16 +102,19 @@ mod showcase_tests {
             .as_ref()
             .expect("提交帧必须有绘制快照");
 
-        // 混排段落：卡片 x=24 + 18 = 42 起、宽 544；只数 CJK 卡片（x < 604）里的字形 run，
-        // 否则右侧 ④ 卡片同 y 区间的状态/提示文字也会被算进来。
+        // 混排段落：卡片 x + 18 起、宽 544；只数 CJK 卡片里的字形 run，否则右侧 ④ 卡片
+        // 同 y 区间的状态/提示文字也会被算进来。
+        let card = crate::scene::CJK_CARD;
+        let lower = card.origin.y + 142.0;
+        let upper = lower + 44.0;
         let wrapped = frame
             .primitives
             .iter()
             .filter(|primitive| {
                 primitive.kind == PrimitiveKind::GlyphRun
-                    && primitive.bounds.min().x < 604.0
-                    && primitive.bounds.min().y >= 405.0
-                    && primitive.bounds.max().y <= 462.0
+                    && primitive.bounds.min().x < card.origin.x + card.size.width
+                    && primitive.bounds.min().y >= lower
+                    && primitive.bounds.max().y <= upper
                     && primitive.bounds.size.width > 40.0
             })
             .count();

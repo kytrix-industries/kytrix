@@ -1192,7 +1192,7 @@ metal_layer.setDrawableSize(physical size)
 | 创建      | `NSWindow::initWithContentRect_styleMask_backing_defer(alloc, rect, style, Buffered, false)`                                                                                                                 |
 | styleMask | `Titled                                                                                                                                                                                                      | Closable | Miniaturizable | Resizable | FullSizeContentView`（自绘标题栏：内容延伸到标题栏区域） |
 | 标题栏    | `setTitlebarAppearsTransparent(true)`、`setTitleVisibility(Hidden)`；`setOpaque(false)`、`setBackgroundColor(clearColor)`                                                                                    |
-| 交通灯    | `standardWindowButton(CloseButton)` **保留**并重排到 `x = 12`（逻辑点）；`MiniaturizeButton` / `ZoomButton` 隐藏。**隐藏后必须提供等价的引擎绘制控件**（P13 的窗口控件），否则用户失去最小化/最大化（F-127） |
+| 交通灯    | Close / Miniaturize / Zoom 三个系统按钮**全部保留**（当前实现不再隐藏 Miniaturize/Zoom，也不再重排 Close）；窗口默认可关闭/最小化/缩放/调整大小。F-127 的隐藏方案已被取代。 |
 | 拖拽      | `performWindowDragWithEvent(event)`（`NSEvent` 的左键拖动落在标题栏区域时；引擎自绘标题栏的 `WindowControlArea` 语义在 P13 接）                                                                              |
 | 最小尺寸  | `setContentMinSize(NSSize(320, 200))`（`MIN_SIZE_LOGICAL` 与 Win32 同源）                                                                                                                                    |
 | 尺寸回读  | `contentView.frame.size`（点，逻辑像素）→ `Window::set_size`                                                                                                                                                 |
@@ -1412,7 +1412,7 @@ pub(crate) struct NativeSurface {
 |----------|---------------------------------------------------------------------------------------------------------------------------------------|
 | 逻辑尺寸 | `Size`（引擎单位），物理 = `× scale` 的 covering                                                                                      |
 | 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），物理值给 `set_min_size`                                                     |
-| 标题栏   | **自绘**（引擎绘制窗口控制区）；`toplevel.move/resize` 由平台层在标题栏拖动时调用                                                     |
+| 标题栏   | 平台层不绘制标题栏，只提供 `App::request_window_control`（minimize / toggle-maximize / move / resize）；demo 在 `scene/chrome.rs` 自绘标题栏与按钮 |
 | 关闭     | `toplevel.destroy()` + `surface.destroy()`；`LinuxLoop` 见 `app.windows()` 空即退出                                                   |
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |
 | 键盘焦点 | `wl_keyboard::Event::Enter/Leave` ⇒ `FocusChanged { focused }`                                                                        |

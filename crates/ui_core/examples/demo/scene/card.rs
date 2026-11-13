@@ -1,14 +1,12 @@
-//! 卡片 / 文字 / 绝对定位样式助手（`design/phase-15-demo-showcase.md` §1）。
+//! 卡片 / 文字 / 布局样式助手（`design/phase-15-demo-showcase.md` §1）。
 //!
-//! 场景是**绝对定位的卡片网格**：卡片本身用 `Style`（`Position::Absolute` + `inset` + 固定尺寸）
-//! 参与 taffy 布局，卡片内的叶子（文字 / 画布 / 色块）用 `LayoutOverride` 相对卡片内容盒定位。
-//! 不用 `LayoutOverride` 建卡片：override 节点是布局叶子，`NodeBuilder::build` 的 debug 断言不允许
-//! 再挂子节点（`design/phase-04-layout.md` §10）。
+//! 页面级布局由 [`super`] 的 flex 容器（根列 / 标题列 / 内容列 / 三行）负责；卡片是固定尺寸的
+//! flex 项，卡片内的叶子（文字 / 画布 / 色块）仍用 `LayoutOverride` 相对卡片内容盒定位。
 
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
-    math::Rect,
+    math::{Rect, Size},
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
     paint::{
         primitive::Border,
@@ -47,16 +45,38 @@ pub(crate) fn absolute_style(rect: Rect) -> Style {
     style
 }
 
+/// 正常流内的固定尺寸样式（flex 项）。
+pub(crate) fn flow_style(size: Size) -> Style {
+    let mut style = Style::default();
+    // 卡片是 absolute 叶子的包含块（taffy 默认 position: static 不会建立包含块）。
+    style.inner.position = taffy::style::Position::Relative;
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(size.width),
+        height: taffy::style::Dimension::length(size.height),
+    };
+    style
+}
+
+/// 建一个普通容器（标题列 / 内容列 / 行 / 背景等布局盒子）。
+pub(crate) fn container(app: &mut App, window: WindowId, parent: NodeId, style: Style) -> NodeId {
+    NodeBuilder::boxed()
+        .style(style)
+        .build(tree(app, window), parent)
+        .expect("容器挂载")
+}
+
 /// 建一张卡片（背景 + 1px 边框 + 圆角）并返回卡片节点（子节点坐标相对它）。
 pub(crate) fn card(
     app: &mut App,
     window: WindowId,
-    root: NodeId,
-    rect: Rect,
+    parent: NodeId,
+    size: Size,
     heading: &str,
+    id: &'static str,
 ) -> NodeId {
     let node = NodeBuilder::boxed()
-        .style(absolute_style(rect))
+        .style(flow_style(size))
+        .id(id)
         .paint(PaintSpec {
             background: color(CARD_RGBA),
             border: Some(Border {
@@ -66,7 +86,7 @@ pub(crate) fn card(
             corner_radius: [14.0; 4],
             ..PaintSpec::default()
         })
-        .build(tree(app, window), root)
+        .build(tree(app, window), parent)
         .expect("卡片挂载");
     let heading_style = TextStyle::new(HEADING_SIZE)
         .with_weight(HEADING_WEIGHT)
@@ -75,7 +95,7 @@ pub(crate) fn card(
         app,
         window,
         node,
-        Rect::new(18.0, 12.0, rect.size.width - 36.0, 20.0),
+        Rect::new(18.0, 12.0, size.width - 36.0, 20.0),
         heading,
         heading_style,
     );
