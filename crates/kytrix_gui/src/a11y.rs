@@ -187,6 +187,13 @@ pub struct A11yPatch {
     pub disabled: Option<bool>,
     /// 隐藏。
     pub hidden: Option<bool>,
+    /// 勾选/开关状态（`accesskit::Toggled`）。
+    ///
+    /// `RadioButton` / `CheckBox` / `Switch` 的勾选态都走这个通道：UIA 的 RadioButton 只有
+    /// `toggled()` 有值时才暴露 `SelectionItemPattern`（`accesskit_windows` 的
+    /// `is_selection_item_pattern_supported`），CheckBox / Switch 映射到 `TogglePattern`；
+    /// 这几个角色都不读 `selected`。
+    pub checked: Option<bool>,
     /// 选中（`None` = 不表态）。
     pub selected: Option<bool>,
     /// 展开（`None` = 不表态）。
@@ -249,6 +256,8 @@ pub struct A11yNode {
     pub hidden: bool,
     /// 禁用（`set_disabled`）。
     pub disabled: bool,
+    /// 勾选/开关状态（`set_toggled`；`RadioButton` 的选中态走这里，不是 `selected`）。
+    pub checked: Option<bool>,
     /// 选中（`None` = 不表态）。
     pub selected: Option<bool>,
     /// 展开（`None` = 不表态）。

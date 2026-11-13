@@ -15,7 +15,13 @@ kytrix_gui = { workspace = true }
 tokio = { workspace = true }
 # P10：demo 的滚动容器/布局常量需要声明 taffy 样式（引擎 `Style.inner` 的类型）。
 taffy = { workspace = true }
+# P15：场景状态（`ImeField` / `FocusView`）用短字符串表达，走 `format_smolstr!`（AGENTS §2.2）。
+smol_str = { workspace = true }
 image = { workspace = true, optional = true }
+
+[dev-dependencies]
+# P15：集成测试用 `TestApp`（无 GPU 帧驱动 + a11y 快照捕获）。主二进制不受影响（dev-dep 只在测试目标里）。
+kytrix_gui = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

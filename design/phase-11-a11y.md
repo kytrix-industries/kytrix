@@ -375,6 +375,8 @@ pub struct A11yNode {
     pub actions: Vec<A11yAction>,
     pub hidden: bool,
     pub disabled: bool,
+    /// 勾选/开关状态（`set_toggled`）。`RadioButton` / `CheckBox` / `Switch` 的选中态走这里。
+    pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
     /// 引擎侧的**直接**子节点（未过滤；hidden 子树故在列）。
@@ -463,6 +465,9 @@ pub struct A11yPatch {
     pub description: Option<SmolStr>,
     pub disabled: Option<bool>,
     pub hidden: Option<bool>,
+    /// 勾选/开关状态（`Toggled`）。与 `selected` **不是**可互换的通道：UIA 的 RadioButton
+    /// 只按 `toggled()` 暴露 `SelectionItemPattern`（P15 F-151）。
+    pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
     pub actions: Option<Vec<A11yAction>>,
@@ -481,6 +486,7 @@ effective.hidden   = patch.hidden == Some(true) || override.hidden
                      || style.inner.display == Display::None
                      || (kind ∈ {Canvas, Geometry} && effective.label.is_none())   // §5.4
 effective.selected = patch.selected
+effective.checked  = patch.checked
 effective.expanded = patch.expanded
 effective.actions  = patch.actions.or(override.actions).unwrap_or(by_role)
                      ∪ {Focus}（若 focusable()）
@@ -621,6 +627,9 @@ impl A11yTreeSnapshot {
 `Focus` 动作**不按角色给**，而是按 `interaction::focus::focusable(tree, node)`（`focus.rs:21-26`）——
 与 Tab 序、键盘分发**同源**（P10 §6.2 的接口，正是为 P11 留的）。
 `A11yPatch.selected == Some(v)` ⇒ `set_selected()`（`v == false` 时不置位，`Node` 的旗标只有 set/clear 语义）；
+`effective.checked == Some(v)` ⇒ `set_toggled(Toggled::from(v))`（**显式 `false` 也写**：`accesskit_windows` 的
+`is_selection_item_pattern_supported` 对 `RadioButton` 要求 `toggled()` 是 `Some(True|False)`，不写就没有
+`SelectionItemPattern`；P15 F-151）；
 `effective.disabled` ⇒ `set_disabled()`。**disabled 不删动作**——UIA 的 `IsEnabled` 由 `Disabled` 决定，
 删掉动作会让 AT 认为控件类型变了。
 
@@ -823,6 +832,7 @@ if !children.is_empty() { node.set_children(children.iter().map(|c| c.accesskit(
 if hidden   { node.set_hidden() }
 if disabled { node.set_disabled() }
 if let Some(sel) = selected { node.set_selected() / clear（false 时不置位） }   // 见下
+if let Some(checked) = checked { node.set_toggled(Toggled::from(checked)) }      // 显式 false 也写（F-151）
 match label_source {
     Override    => node.set_label(text),
     TextContent => node.set_value(text),

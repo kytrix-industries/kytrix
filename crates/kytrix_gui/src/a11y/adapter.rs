@@ -272,6 +272,9 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(selected) = record.selected {
         node.set_selected(selected);
     }
+    if let Some(checked) = record.checked {
+        node.set_toggled(accesskit::Toggled::from(checked));
+    }
     if let Some(expanded) = record.expanded {
         node.set_expanded(expanded);
     }
@@ -476,6 +479,7 @@ mod tests {
                 value: Some(SmolStr::new_static("42")),
                 disabled: Some(true),
                 hidden: Some(true),
+                checked: Some(true),
                 selected: Some(true),
                 ..A11yPatch::default()
             },
@@ -485,6 +489,7 @@ mod tests {
         let record = patch.node_for(node).expect("node");
         assert!(record.hidden);
         assert!(record.disabled);
+        assert_eq!(record.checked, Some(true));
         assert_eq!(record.selected, Some(true));
         assert_eq!(record.label_text(), Some("量"));
         assert_eq!(record.value.as_deref(), Some("42"));
@@ -492,10 +497,51 @@ mod tests {
         let converted = to_accesskit(record);
         assert!(converted.is_hidden());
         assert!(converted.is_disabled());
+        assert_eq!(converted.toggled(), Some(accesskit::Toggled::True));
         assert_eq!(converted.is_selected(), Some(true));
         assert_eq!(converted.label(), Some("量"));
         assert_eq!(converted.value(), Some("42"));
         let _ = StylePatch::default();
+    }
+
+    /// `Role::RadioButton` 的「勾选」必须走 `set_toggled`：accesskit 的 UIA 适配层用
+    /// `toggled()` 判断是否暴露 `SelectionItemPattern`，只写 `selected` 的 RadioButton 在 UIA 里
+    /// **没有任何选中状态**（P15 用 UIA 客户端实测发现的缺口）。
+    #[test]
+    fn radio_checked_reaches_the_toggled_channel() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let radio = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::RadioButton),
+                label: Some(SmolStr::new_static("A")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("radio");
+        let mut bridge = A11yBridge::new();
+        let _ = take(&mut bridge, &mut tree, None).expect("首笔");
+
+        tree.set_a11y_patch(
+            radio,
+            A11yPatch {
+                checked: Some(false),
+                ..A11yPatch::default()
+            },
+        );
+        tree.mark_a11y(radio);
+        let patch = take(&mut bridge, &mut tree, None).expect("增量");
+        let converted = to_accesskit(patch.node_for(radio).expect("radio"));
+        assert_eq!(
+            converted.toggled(),
+            Some(accesskit::Toggled::False),
+            "显式未勾选必须写 Toggled::False（不是 clear）"
+        );
+        assert_eq!(
+            converted.is_selected(),
+            None,
+            "selected 不参与 RadioButton 的语义"
+        );
     }
 
     #[test]

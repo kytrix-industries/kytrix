@@ -576,6 +576,18 @@ impl App {
         requested
     }
 
+    /// 置「需要一帧」并**唤醒平台事件循环**（合并位由 `Dispatcher::wake` 保证幂等）。
+    ///
+    /// 不能只置 `wake_requested`：平台泵的顺序是「事件 → 钩子 → 帧 → a11y → 回投任务」，
+    /// 回投任务（`AppHandle::send`、a11y `ActionRequest`）里写状态时循环已经过了帧门禁、
+    /// 即将阻塞在 `GetMessageW` / `poll`。只置位不唤醒会让这批状态一直等到下一条无关消息
+    /// （画面与 a11y 更新都迟到）——P15 用 UIA 客户端实测 `SelectionItemPattern.Select()`
+    /// 不生效时定位到这一点（`design/DEVIATIONS.md` F-152）。
+    fn request_frame(&mut self) {
+        self.wake_requested = true;
+        self.dispatcher.wake();
+    }
+
     // ── P10：动作（Action）与键盘绑定 ──────────────────────────────────────────
 
     /// 注册/替换一个动作的处理器（同 `Action` 后写覆盖）。
@@ -1185,7 +1197,7 @@ impl App {
                 target.tree_mut().mark_paint(changed);
             }
         }
-        self.wake_requested = true;
+        self.request_frame();
         true
     }
 
@@ -1301,7 +1313,7 @@ impl App {
         // P11：a11y 的 bounds 也是屏幕化的内容坐标 ⇒ 偏移变了，整棵子树必须重发。
         // 唯一写点在 `scroll_to`（`scroll_by` / 滚轮 / 动画滚动 / a11y action 全汇到这里）。
         target.a11y_note_scroll(node);
-        self.wake_requested = true;
+        self.request_frame();
         self.rewindow_virtual(window, node);
         Ok(())
     }
@@ -1363,7 +1375,7 @@ impl App {
             easing: spec.easing,
             nodes: Vec::new(),
         });
-        self.wake_requested = true;
+        self.request_frame();
         Ok(())
     }
 
@@ -1557,7 +1569,7 @@ impl App {
         }
         if changed {
             target.tree_mut().mark_structure(node);
-            self.wake_requested = true;
+            self.request_frame();
         }
     }
 
@@ -1587,7 +1599,7 @@ impl App {
                 dismiss: options.dismiss,
             });
         }
-        self.wake_requested = true;
+        self.request_frame();
         Ok(Overlay::new(window, node))
     }
 
@@ -1607,7 +1619,7 @@ impl App {
         if !target.tree_mut().set_absolute_inset(node, origin) {
             return false;
         }
-        self.wake_requested = true;
+        self.request_frame();
         true
     }
 
@@ -1622,7 +1634,7 @@ impl App {
         if target.tree_mut().append_child(root, node).is_err() {
             return false;
         }
-        self.wake_requested = true;
+        self.request_frame();
         true
     }
 
@@ -1659,7 +1671,7 @@ impl App {
         };
         let removed = target.tree_mut().remove(node).is_ok();
         if removed {
-            self.wake_requested = true;
+            self.request_frame();
         }
         removed
     }
@@ -1745,7 +1757,7 @@ impl App {
                 if spec.duration.is_zero() {
                     self.store.set_transient(target.id(), to);
                     self.mark_nodes_paint(window, nodes);
-                    self.wake_requested = true;
+                    self.request_frame();
                     return Ok(AnimationId::new(window, id));
                 }
                 AnimationTarget::Scalar {
@@ -1763,7 +1775,7 @@ impl App {
                 if spec.duration.is_zero() {
                     self.store.set_transient(target.id(), to);
                     self.mark_nodes_paint(window, nodes);
-                    self.wake_requested = true;
+                    self.request_frame();
                     return Ok(AnimationId::new(window, id));
                 }
                 AnimationTarget::Color {
@@ -1785,7 +1797,7 @@ impl App {
             easing: spec.easing,
             nodes: nodes.to_vec(),
         });
-        self.wake_requested = true;
+        self.request_frame();
         Ok(AnimationId::new(window, id))
     }
 
@@ -2086,6 +2098,9 @@ impl App {
             if text_changed_here {
                 // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
                 tree.mark_paint(node);
+                // 文本节点的可访问名/值就是文本内容：内容变了 a11y 必须重发。只标 PAINT 时，
+                // 新字符串与旧串度量相同（例如 "70%" → "80%"）不会触发 LAYOUT，AT 会读到旧值。
+                tree.mark_a11y(node);
             }
         }
 
@@ -2573,6 +2588,7 @@ impl App {
             graph,
             windows,
             wake_requested,
+            dispatcher,
             ..
         } = self;
         let mut worklist: SmallVec<[SignalId; 8]> = smallvec![signal];
@@ -2632,6 +2648,7 @@ impl App {
 
         if marked > 0 {
             *wake_requested = true;
+            dispatcher.wake();
         }
     }
 
@@ -3416,6 +3433,66 @@ mod tests {
         assert!(!report.wake_requested);
         assert!(app.write(&signal, 3));
         let _ = derived;
+    }
+
+    #[test]
+    fn changed_text_marks_a11y() {
+        // 文本节点的可访问名/值 = 文本内容。只标 PAINT 时，"70%" → "80%" 这种等宽替换不会触发
+        // LAYOUT，AT 会一直读到旧值（P15 F-153）。
+        use smol_str::SmolStr;
+
+        let (_rt, mut app) = new_app();
+        let signal: Signal<SmolStr> = app.signal(SmolStr::new_static("A"));
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let node = NodeBuilder::text("A", crate::text::TextStyle::new(12.0))
+            .bind_text(move |cx| cx.read(&signal))
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("挂载");
+        app.refresh_styles(window).expect("窗口存在");
+        // 消费首帧的 A11Y 位（新节点初始就带 LAYOUT|PAINT|A11Y）。
+        let _ = app.a11y_take(window);
+        let _ = app.take_wake_request();
+        assert!(
+            !flags(&app, window, node).contains(DirtyFlags::A11Y),
+            "前置条件：A11Y 位已消费"
+        );
+
+        assert!(app.write(&signal, SmolStr::new_static("B")));
+        app.refresh_styles(window).expect("窗口存在");
+
+        assert!(
+            flags(&app, window, node).contains(DirtyFlags::A11Y),
+            "文本内容变化必须标 A11Y（AT 读的是文本值）"
+        );
+    }
+
+    #[test]
+    fn writing_a_signal_wakes_the_platform_loop() {
+        // 回投任务（`AppHandle::send` / a11y `ActionRequest`）里写状态时，平台泵已经过了帧门禁；
+        // 只置 `wake_requested` 不唤醒 dispatcher，会让画面与 a11y 更新等到下一条无关消息（F-152）。
+        let (_rt, mut app) = new_app();
+        let signal: Signal<u32> = app.signal(0);
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let _ = NodeBuilder::boxed()
+            .bind_style(move |cx| StylePatch {
+                opacity: Some(cx.read(&signal) as f32),
+                ..StylePatch::default()
+            })
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("挂载");
+        // 先求值一次样式：依赖边在 `refresh_styles` 里建立，没有边就无从失效。
+        app.refresh_styles(window).expect("窗口存在");
+        let _ = app.take_wake_request();
+        let _ = app.dispatcher().take_frame_wake();
+
+        assert!(app.write(&signal, 1));
+
+        assert!(
+            app.dispatcher().take_frame_wake(),
+            "写信号必须唤醒平台事件循环（否则回投任务里的状态不会出帧）"
+        );
     }
 
     #[test]

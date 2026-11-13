@@ -610,6 +610,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **命中**：点击红块中心（逻辑 140,100）后，该处像素变成 `#F2555A`（下一次 `--snapshot` 可复现，
   或手动点击后肉眼确认）。
 
+> **P15 扩展**：demo 已从本节的「三色块 + 一行文本」扩成 6 张卡片（① 焦点与动作 / ② 焦点状态 /
+> ③ 中文排版 / ④ 无障碍 / ⑤ 输入法 / ⑥ 图片与滚动），窗口 `960×740`。本节保留 P09 的最小场景作为
+> **历史基线**；现行结构与实测见 `design/phase-15-demo-showcase.md`。
+
 ### 7.4 运行与截图命令
 
 ```powershell
@@ -617,7 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run -p kytrix_gui_demo
 
 # 2) 离屏像素（CI 可跑；WARP，不需要桌面）
-cargo run -p kytrix_gui_demo -- --snapshot out\demo.png
+cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
 
 # 3) 外部工具截屏（验收"屏幕上的确是这张图"）
 #    PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=2) → BMP；或 Win+Shift+S
@@ -685,7 +689,7 @@ cargo run -p kytrix_gui_demo -- --snapshot out\demo.png
 | 项 | 方式 |
 |---|---|
 | 真实窗口 / present / 输入 / resize / 关闭 | `cargo run -p kytrix_gui_demo` 人工跑一遍（截图存 `release_notes/` 或 PR） |
-| 像素 | `cargo run -p kytrix_gui_demo -- --snapshot out\demo.png` + §7.3 的坐标断言（可写成 demo 的自检 `--check` 模式） |
+| 像素 | `cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png` + §7.3 的坐标断言（可写成 demo 的自检 `--check` 模式） |
 | 无 GPU 错误路径 | `KYTRIX_GUI_FORCE_D8_FAIL=1`（P08 已有的 test-only 注入？——P08 用的是单测注入 `GpuCaps`）：P09 用**单测**断言 `Application::run` 在 `Renderer::new_for_hwnd` 返回 `UnsupportedGpu` 时窗口未显示且错误原样返回（把 `platform_init`/`attach` 拆成可测的纯函数，`run` 只做编排） |
 | DPI | 合成 `WM_DPICHANGED`（`SendMessageW`）后断言 `window.scale()` 与 `GetClientRect` 的新尺寸 |
 | 消息翻译 | 用 `SendMessageW(hwnd, WM_*, w, l)` 直接打（probe §9 已验证可行），断言 `App::drain_events()` 的内容 |

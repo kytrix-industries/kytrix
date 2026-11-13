@@ -82,6 +82,8 @@ pub(crate) fn node_a11y(
     }
     let value = effective_value(target, role, over, patch);
     let description = effective_description(over, patch);
+    // 与 `selected` / `expanded` 同型：布尔状态只走动态补丁（`A11yOverride` 不承载）。
+    let checked = patch.and_then(|patch| patch.checked);
     let hidden = is_hidden(target, role, label.as_ref(), over, patch);
     let disabled = is_disabled(target, over, patch);
     let actions = effective_actions(tree, node, role, over, patch);
@@ -131,6 +133,7 @@ pub(crate) fn node_a11y(
         actions,
         hidden,
         disabled,
+        checked,
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
         children,

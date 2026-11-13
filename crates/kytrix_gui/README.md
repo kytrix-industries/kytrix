@@ -88,11 +88,18 @@ cargo doc -p kytrix_gui --no-deps
 
 ```powershell
 cargo run -p kytrix_gui_demo
-cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
+cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo-showcase.png
 # 直接跑 release（仍需 `--features snapshot` 才有 `--snapshot`）
-cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
+cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\demo-showcase.png
 ```
 
+- demo 现在覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
+  焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显）、
+  **无障碍**（AccessKit 角色 / 名称 / `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、
+  **滚动列表**。`--snapshot` 会先 `Scene::preview` 播种一套可截图的组合态（含内联组合串）。
+- demo 的集成测试（`cargo test -p kytrix_gui_demo`）用 dev-dependency 的 `kytrix_gui/test-support`
+  跑无 GPU 帧驱动 + a11y 快照，与主二进制无关。
+- demo 自己的门禁：`cargo test -p kytrix_gui_demo` + `cargo +nightly clippy -p kytrix_gui_demo --all-targets --all-features -- -D warnings`。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - 缺 shader 工具链时设 `KYTRIX_GUI_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
 - 交叉 target：`cargo check -p kytrix_gui --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
@@ -104,7 +111,7 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 | 文档 | 内容 |
 |---|---|
 | `../../custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量） |
-| `../../design/phase-01…14-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
+| `../../design/phase-01…15-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
 | `../../design/DEVIATIONS.md` | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里 |
 | `../../AGENTS.md` | 仓库纪律（模块/测试/错误/依赖） |
 | `src/render/shaders/contract.md` | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |

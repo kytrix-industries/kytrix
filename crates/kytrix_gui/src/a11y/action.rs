@@ -348,6 +348,27 @@ mod tests {
         assert_eq!(app.focused(window), None);
     }
 
+    /// a11y 动作在 `Dispatcher` 回投的任务里执行；`set_focus` 必须唤醒平台泵，否则焦点环
+    /// 与 a11y 更新要等下一条无关消息（F-152）。
+    #[test]
+    fn a11y_focus_wakes_the_event_loop() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .on_click(Action::custom("press"))
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let _ = app.dispatcher().take_frame_wake();
+
+        dispatch(&mut app, window, request(AkAction::Focus, node, None));
+
+        assert_eq!(app.focused(window), Some(node));
+        assert!(
+            app.dispatcher().take_frame_wake(),
+            "a11y Focus 必须唤醒事件循环（回投任务里改状态）"
+        );
+    }
+
     #[test]
     fn stale_target_is_ignored_and_diagnosed() {
         let (_runtime, mut app, window) = setup();
