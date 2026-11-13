@@ -1,5 +1,8 @@
 # Phase 09 · Windows 平台层 + 最小 demo — 详细设计（v1）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 依据：`custom-gui-engine-design.md` §1.4 / §1.5 / §8.1 / §8.2 / §8.3 / §9.2 / 附录 A；
 > `design/phase-08-d3d12.md`（§5.3 `for_hwnd` / `Present1` / V-55 / V-57）、`design/phase-06-paint-runtime.md` §9；
 > 已落地 `app.rs` / `window.rs` / `render/**` / `test_support/**`；DEVIATIONS F-70…F-85 / S-73…S-78 / V-55…V-59。

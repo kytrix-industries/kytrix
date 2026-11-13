@@ -2,8 +2,12 @@
 
 > 背景：P15 demo 已能展示焦点 / CJK / IME / a11y / 图片与滚动，但没有运行时性能观察面。
 > 本阶段给引擎增加一个**可复用的 Debug HUD**：应用一行 API 开启，引擎在窗口右上角维护
-> 一个非交互浮层，持续显示帧率、DrawCall 与渲染统计；demo 默认开启并用 F12 切换。
+> 一个非交互浮层，持续显示帧率、DrawCall 与渲染统计；demo 加 `--features hud` 开启并用 F12 切换。
 > 实现与本文不一致处记入 `design/DEVIATIONS.md`。
+>
+> **P18 迁移**：demo 已并入 `kytrix_gui` 的 example（`design/phase-18-demo-example.md`），
+> 不再是独立 crate；`hud` 仍默认关闭，运行 `demo` 时必须显式加 `--features hud`。本文历史
+> 验证记录里的 `kytrix_gui_demo` 命令是迁移前状态，当前命令见 README。
 
 ---
 
@@ -13,10 +17,10 @@
 |---|---|
 | 形态 | **引擎内置 API**：`App::set_debug_hud(window, enabled)`；HUD 是 root 末尾的普通子树（不是平台 overlay 窗口） |
 | 位置 | **右上角浮层**：半透明深色面板，不参与文档流、不挡命中、a11y 标记 `hidden` |
-| 编译 | 全部 HUD 代码由 `kytrix_gui` 的 **`hud` feature** 门控；未开启时零代码 / 零开销。demo 默认 feature 打开 `hud` |
+| 编译 | 全部 HUD 代码由 `kytrix_gui` 的 **`hud` feature** 门控；未开启时零代码 / 零开销。demo 用 `--features hud` 打开 |
 | 指标 | 核心性能、CPU/GPU 耗时、显示与后端；英文缩写 |
 | 刷新 | HUD 可见时按平台帧定时器连续出帧；数字每 **500 ms** 汇总一次，面板每帧重绘 |
-| demo | 真实窗口默认开启，**F12** 隐藏/显示；`--snapshot` 不安装 HUD（保持展示截图稳定） |
+| demo | 真实窗口加 `--features hud` 后开启，**F12** 隐藏/显示；`snapshot_demo` 不安装 HUD（保持展示截图稳定） |
 | 测试 | 纯格式化、HUD 节点 / 命中 / a11y、开关生命周期、空闲时强制提交、500 ms 汇总、后端 DrawCall 计数、demo F12 与快照隔离 |
 
 ## 1. 目标与非目标
@@ -52,15 +56,9 @@ hud = []
 - `App` 上所有 HUD 方法用 `#[cfg(feature = "hud")]` 门控；未开启时 API 不存在。
 - 平台事件循环里的「连续帧」判断也 gates：未开启时退化为原有「只有动画时定时出帧」。
 
-`crates/kytrix_gui_demo/Cargo.toml`：
-
-```toml
-[features]
-default = ["hud"]
-hud = ["kytrix_gui/hud"]
-```
-
-因此 `cargo run -p kytrix_gui_demo` 默认启用 HUD；`--no-default-features` 可构建无 HUD 的 demo。
+P18 之后 demo 是 `crates/kytrix_gui/examples/demo/`，不再有独立 `Cargo.toml` / 默认 feature。
+运行 `cargo run -p kytrix_gui --example demo --features hud` 才启用 HUD；不加 feature 的 demo
+没有 HUD 与 F12。`snapshot_demo` 走 `build_into`，不安装 HUD。
 
 ### 2.2 `App::set_debug_hud`
 
@@ -304,7 +302,7 @@ pub(crate) fn needs_continuous_frames(&self) -> bool {
 
 - `Scene::open` 的真实窗口路径：建完场景后（`Scene::install` 里）调用 `app.set_debug_hud(window, true)`；
   仅在 `#[cfg(feature = "hud")]` 下编译。
-- `Scene::build_into`（`--snapshot` 路径）不安装 HUD；`preview` 也不安装。
+- `Scene::build_into`（`snapshot_demo` 路径）不安装 HUD；`preview` 也不安装。
 - `Scene` **不保存** `hud_visible` 布尔：开关状态以引擎 `App::debug_hud_enabled(window)` 为准。
   这样 `Scene::install` 接收 clone 时，外部 `Scene` 与安装副本不会出现状态分叉。
 - `Scene::handle_event` 捕获 `Key::Function(12)` + `KeyState::Down` + 无修饰键：
@@ -323,9 +321,9 @@ pub(crate) fn needs_continuous_frames(&self) -> bool {
 | 单元 | `src/render/windows/compositor.rs` | 已知 ops 的 draw call 计数（Instances 1 次 + Geometry 1 次；空 len 不计） |
 | 单元 | `src/render/timer.rs` | `FrameTimings::sample` 缺失/存在、同段首条；分段值语义 |
 | 集成 | `crates/kytrix_gui/tests/hud.rs` | 未知窗口 / 幂等 / 外部删树重建；HUD 节点/文本、命中穿透、a11y hidden、overlay 层级、持续提交、关闭请求擦除帧、500 ms FPS 样本 |
-| 集成 | `crates/kytrix_gui_demo/tests/scene.rs` | 真实路径安装 HUD；F12 切换；`build_into` 快照路径无 HUD |
+| 集成 | `crates/kytrix_gui/examples/demo/scene.rs` | 真实路径安装 HUD；F12 切换；`build_into` 快照路径无 HUD |
 | 静态 | 三平台 | `cargo test` / `--features hud` / `--all-features`；macOS `cargo check --features hud`；Linux 交叉构建受宿主 pkg-config 环境限制时记录原因 |
-| 验证 | Windows 实机 | `cargo run -p kytrix_gui_demo` 观察右上角 HUD 每秒变化、F12 隐藏/显示；截图存档 |
+| 验证 | Windows 实机 | `cargo run -p kytrix_gui --example demo --features hud` 观察右上角 HUD 每秒变化、F12 隐藏/显示；截图存档 |
 
 ## 9. 验证命令
 
@@ -333,10 +331,10 @@ pub(crate) fn needs_continuous_frames(&self) -> bool {
 cargo test -p kytrix_gui
 cargo test -p kytrix_gui --features hud
 cargo test -p kytrix_gui --features "hud,test-support"
-cargo test -p kytrix_gui_demo --all-features
-cargo check -p kytrix_gui_demo --no-default-features
-cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings
-cargo +nightly fmt -p kytrix_gui -p kytrix_gui_demo -- --check
+cargo test -p kytrix_gui --example demo --features "hud,test-support"
+cargo check -p kytrix_gui --example demo
+cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+cargo +nightly fmt -p kytrix_gui -- --check
 cargo doc -p kytrix_gui --no-deps --features hud
 cargo check -p kytrix_gui --features hud --target x86_64-unknown-linux-gnu
 cargo check -p kytrix_gui --features hud --target aarch64-apple-darwin
@@ -360,6 +358,9 @@ cargo check -p kytrix_gui --features hud --target aarch64-apple-darwin
 
 ## 11. 验证记录（2026-11-13，Windows 实机）
 
+> P18 迁移前的记录；当时 demo 仍是独立 crate。当前 example 的测试命令见
+> `design/phase-18-demo-example.md` §5.3。
+
 - `cargo test -p kytrix_gui`：**668 passed / 1 ignored**。
 - `cargo test -p kytrix_gui --features "hud,test-support"`：**729 passed / 1 ignored**；集成
   `hud` 7、`frame_record` 6、`layout` 4、`snapshot` 8。
@@ -370,7 +371,7 @@ cargo check -p kytrix_gui --features hud --target aarch64-apple-darwin
   （`KYTRIX_GUI_SKIP_SHADERS=1`）通过。Linux 交叉构建在本机 Windows 宿主缺少
   `pkg-config` / `wayland-client` / `fontconfig` sysroot 时无法启动 `wayland-sys` 构建脚本；
   这是环境限制，不把未执行的 Linux 编译伪装成通过（V-108）。
-- **真机观察**：`cargo run -p kytrix_gui_demo` 默认右上角 HUD，首屏实测
+- **真机观察**（迁移前命令）：`cargo run -p kytrix_gui_demo` 的默认 HUD，首屏实测
   `FPS 60.2 / Frame 16.62 ms / CPU 1.11 ms / GPU 0.01 ms / Draw 1 / Prims 250 / Inst 761`；
   WScript `AppActivate` + `SendKeys("{F12}")` 后 HUD 消失，再按一次恢复。
   截图见 [`demo-phase17-hud.png`](demo-phase17-hud.png) 与

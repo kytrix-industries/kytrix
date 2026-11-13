@@ -1,5 +1,8 @@
 # Phase 12 代码审查结论（macOS + Linux 后端）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 审查方式：静态审查 + 两 target 交叉编译 + 与 D3D12/共享契约逐项对照。本机无法运行时验证。
 > 结论：**FAIL**（15 项阻塞；门禁本身全绿，但后端有静态可证的死锁/泄漏/崩溃/不出帧问题）。
 

@@ -454,3 +454,177 @@ mod tests {
         assert_eq!(field.submitted_line().as_str(), "最近提交：跨平台 GUI 引擎");
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod showcase_tests {
+    use kytrix_gui::event::{Event, ImeEvent, InputEvent, Key};
+
+    use crate::scene::{
+        dispatch_event, ime_text,
+        test_support::{frame, press, setup_installed},
+        tick,
+    };
+
+    #[test]
+    fn ime_events_are_applied_only_while_the_input_is_focused() {
+        let (mut test, window, mut scene) = setup_installed();
+        frame(&mut test);
+
+        let app = test.app_mut();
+        // Tab 序的最后一个可聚焦节点是输入框。
+        let focused = app.focus_prev(window).expect("输入框");
+        assert_eq!(app.focused(window), Some(focused));
+
+        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Start));
+        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Preedit("ni".into())));
+        assert_eq!(ime_text(&scene, app).as_str(), "", "组合串不进正文");
+
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Commit("你好".into())),
+        );
+        assert_eq!(ime_text(&scene, app).as_str(), "你好");
+
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Input(InputEvent::Text { text: "a".into() }),
+        );
+        assert_eq!(ime_text(&scene, app).as_str(), "你好a");
+
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Backspace)));
+        assert_eq!(ime_text(&scene, app).as_str(), "你好");
+
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Enter)));
+        assert_eq!(ime_text(&scene, app).as_str(), "", "Enter 提交后清空输入");
+
+        // 焦点移走后，IME / 文本事件都必须被忽略。
+        let _ = app.set_focus(window, None);
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Commit("干扰".into())),
+        );
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Input(InputEvent::Text { text: "x".into() }),
+        );
+        assert_eq!(ime_text(&scene, app).as_str(), "");
+    }
+
+    #[test]
+    fn ime_cursor_area_tracks_the_input_caret() {
+        let (mut test, window, mut scene) = setup_installed();
+        frame(&mut test);
+
+        let empty = {
+            let app = test.app_mut();
+            let _ = app.focus_prev(window).expect("输入框");
+            tick(&mut scene, app);
+            app.ime_cursor_area(window)
+                .expect("窗口存在")
+                .expect("输入框聚焦后必须有 caret hint")
+        };
+        // 输入框：卡片 (24,484) + 字段 (18,40) = (42,524,544,54)；正文子节点再内缩 (14,12)。
+        assert!(empty.origin.x >= 56.0, "{empty:?}");
+        assert!(empty.origin.y >= 536.0, "{empty:?}");
+        assert!(empty.max().y <= 578.0, "{empty:?}");
+
+        {
+            let app = test.app_mut();
+            dispatch_event(
+                &mut scene,
+                app,
+                &Event::Ime(ImeEvent::Commit("你好".into())),
+            );
+            tick(&mut scene, app);
+        }
+        // 文本信号改了，必须让 text pass 重建 ShapedText 后 caret 几何才可解析。
+        assert_eq!(ime_text(&scene, test.app()).as_str(), "你好");
+        frame(&mut test);
+        let after = test
+            .app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .expect("提交文字后仍有 caret hint");
+        assert!(
+            after.origin.x > empty.origin.x + 20.0,
+            "caret 必须跟随已提交文本向右移动：{empty:?} -> {after:?}"
+        );
+
+        {
+            let app = test.app_mut();
+            let _ = app.set_focus(window, None);
+            tick(&mut scene, app);
+        }
+        assert_eq!(
+            test.app().ime_cursor_area(window).expect("窗口存在"),
+            None,
+            "焦点离开输入框必须清除 hint"
+        );
+    }
+
+    #[test]
+    fn escape_during_composition_does_not_close_the_window() {
+        let (mut test, window, mut scene) = setup_installed();
+        frame(&mut test);
+        let app = test.app_mut();
+        let _ = app.focus_prev(window).expect("输入框");
+
+        // 覆盖「平台在组合开始时发 Start」的路径（Windows IMM32 IME）；Linux/macOS 平台层不发 Start，
+        // 经 Preedit 进入组合态。本机 Windows 11 MSPY 组合期间不发 Start，属 V-104 的平台边界。
+        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Start));
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        assert!(
+            app.window(window).is_some(),
+            "组合中的 Esc 是取消组合（平台处理），不得关窗"
+        );
+
+        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::End));
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        assert!(app.window(window).is_none(), "组合结束后的 Esc 关窗退出");
+    }
+
+    #[test]
+    fn leaving_the_input_cancels_the_composition_so_escape_still_quits() {
+        let (mut test, window, mut scene) = setup_installed();
+        frame(&mut test);
+        let app = test.app_mut();
+        let input = app.focus_prev(window).expect("输入框");
+        assert_eq!(app.focused(window), Some(input));
+
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Preedit("shi".into())),
+        );
+        // Tab 离开输入框：钩子必须收起组合态，否则 Esc 会被一直当成「组合中」。
+        let _ = app.focus_next(window);
+        tick(&mut scene, app);
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+
+        assert!(
+            app.window(window).is_none(),
+            "失焦收起组合后 Esc 必须能关窗"
+        );
+    }
+
+    #[test]
+    fn window_focus_loss_cancels_the_composition_too() {
+        let (mut test, window, mut scene) = setup_installed();
+        frame(&mut test);
+        let app = test.app_mut();
+        let _ = app.focus_prev(window).expect("输入框");
+
+        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Preedit("ni".into())));
+        dispatch_event(&mut scene, app, &Event::FocusChanged { focused: false });
+        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+
+        assert!(
+            app.window(window).is_none(),
+            "窗口失焦收起组合后 Esc 必须能关窗"
+        );
+    }
+}

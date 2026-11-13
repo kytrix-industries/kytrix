@@ -1,7 +1,7 @@
 //! demo 的主场景：焦点 / CJK / 输入法 / 无障碍 / 图片与滚动
-//! （`design/phase-15-demo-showcase.md`）。
+//! （`design/phase-15-demo-showcase.md`、`design/phase-18-demo-example.md`）。
 //!
-//! 两个入口共用同一份建树代码：真实窗口（`Application::run`）与 `--snapshot`（WARP 离屏）。
+//! 两个 example 目标共用同一份建树代码：`demo`（真实窗口）与 `snapshot_demo`（WARP 离屏）。
 //! 本模块是场景的**模块根**：常量、[`Scene`] 句柄与编排（建树 / 安装 / 帧钩子 / 截图种子状态）；
 //! 每张卡片的内容在子模块里。
 //!
@@ -17,6 +17,8 @@ mod focus;
 mod ime;
 mod resources;
 mod swatch;
+#[cfg(all(test, feature = "test-support"))]
+mod test_support;
 
 use a11y::A11yState;
 use focus::FocusView;
@@ -33,6 +35,7 @@ use kytrix_gui::{
     text::TextStyle,
     window::{WindowId, WindowOptions},
 };
+#[cfg(all(test, feature = "test-support"))]
 use smol_str::SmolStr;
 
 /// 场景逻辑宽度。
@@ -392,17 +395,213 @@ impl Scene {
 }
 
 /// 把一条合成事件交给场景（测试用：平台事件队列只能由引擎内部投递）。
-pub fn dispatch_event(scene: &mut Scene, app: &mut App, event: &Event) {
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn dispatch_event(scene: &mut Scene, app: &mut App, event: &Event) {
     scene.handle_event(app, event);
 }
 
 /// 跑一次场景钩子（测试用：`TestApp::drain` 不经过平台泵的帧钩子）。
-pub fn tick(scene: &mut Scene, app: &mut App) {
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn tick(scene: &mut Scene, app: &mut App) {
     scene.tick(app);
 }
 
 /// 输入框当前已提交的文本（测试 / 诊断用）。
+#[cfg(all(test, feature = "test-support"))]
 #[must_use]
-pub fn ime_text(scene: &Scene, app: &App) -> SmolStr {
+pub(crate) fn ime_text(scene: &Scene, app: &App) -> SmolStr {
     SmolStr::new(app.read(&scene.ime).committed())
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use kytrix_gui::{a11y::A11yRole, test_support::record::PrimitiveKind, text::TextDiagnostic};
+
+    use super::{
+        ime_text,
+        test_support::{frame, setup},
+    };
+
+    #[test]
+    fn the_first_frame_commits_every_card() {
+        let (mut test, window, _scene) = setup();
+        test.enable_a11y_capture();
+        frame(&mut test);
+
+        let record = test.frame_record();
+        assert!(record.rendered, "首帧必须产出像素");
+        assert!(
+            record.stats.primitives > 60,
+            "六张卡片 + 色块 + 分段 + 滚动行 + 文字应当远超 60 个图元：{}",
+            record.stats.primitives
+        );
+
+        let frame = record.frame.as_ref().expect("提交帧必须有绘制快照");
+        let glyph_runs = frame
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+            .count();
+        assert!(
+            glyph_runs >= 12,
+            "标题 + 6 张卡片 + CJK 段落至少 12 个字形 run：{glyph_runs}"
+        );
+
+        // 自绘画布（两个 PNG 图标）：`Canvas` 内部图元是**绝对窗口坐标**，必须落在 ⑥ 卡片
+        // （x=624,y=484,w=312,h=242）内，而不是被误当成父相对坐标画到窗口左上角。
+        let canvases: Vec<_> = frame
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::Canvas)
+            .map(|primitive| primitive.bounds)
+            .collect();
+        assert_eq!(canvases.len(), 2, "两个图标都是 Canvas 节点");
+        for bounds in canvases {
+            assert!(
+                bounds.origin.x >= 624.0 && bounds.origin.y >= 484.0,
+                "图标必须画在 ⑥ 卡片内：{bounds:?}"
+            );
+            assert!(bounds.max().y <= 726.0, "图标不得溢出卡片底边：{bounds:?}");
+        }
+
+        let app = test.app();
+        assert!(
+            !app.text_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(diagnostic, TextDiagnostic::MissingGlyph { .. })),
+            "CJK 样例不得出现豆腐块：{:?}",
+            app.text_diagnostics()
+        );
+        assert!(
+            app.a11y_diagnostics().is_empty(),
+            "所有交互节点都有可访问名、自绘节点都有替代文本：{:?}",
+            app.a11y_diagnostics()
+        );
+        assert_eq!(app.focused(window), None, "`build_into` 不预置焦点");
+    }
+
+    #[test]
+    fn tab_order_visits_the_documented_seven_labels() {
+        let (mut test, window, _scene) = setup();
+        test.enable_a11y_capture();
+        // 先跑一帧：布局盒与 `bind_style` 的 `interactive` 都要先落地。
+        frame(&mut test);
+
+        let mut visited = Vec::new();
+        let mut labels = Vec::new();
+        for _ in 0..7 {
+            let focused = test.app_mut().focus_next(window).expect("下一个可聚焦节点");
+            visited.push(focused);
+            frame(&mut test);
+            let snapshot = test.a11y().expect("焦点变化必须产生 a11y 交付");
+            let label = snapshot
+                .node_for(focused)
+                .and_then(|node| node.label_text())
+                .unwrap_or("<unknown>")
+                .to_owned();
+            labels.push(label);
+        }
+        assert_eq!(
+            labels,
+            [
+                "色块 1（红）",
+                "色块 2（绿）",
+                "色块 3（蓝）",
+                "选项 A",
+                "选项 B",
+                // 焦点面板用短名（「缩放滑块」/「输入框」），a11y 名字是完整可访问名。
+                "缩放比例",
+                "输入法测试输入框",
+            ],
+            "Tab 序必须与设计文档 §1.1 一致"
+        );
+
+        let wrapped = test.app_mut().focus_next(window).expect("回绕");
+        assert_eq!(wrapped, visited[0], "第 8 次 Tab 必须回绕到第一个");
+    }
+
+    #[cfg(feature = "hud")]
+    #[test]
+    fn f12_toggles_the_hud_and_snapshot_build_has_none() {
+        use kytrix_gui::event::{Event, Key};
+
+        use super::{
+            dispatch_event,
+            test_support::{press, setup_installed},
+        };
+
+        let (mut test, window, _scene) = setup();
+        assert!(
+            !test.app().debug_hud_enabled(window),
+            "snapshot 路径（build_into）不得安装 HUD"
+        );
+        frame(&mut test);
+
+        let (mut test, window, mut scene) = setup_installed();
+        assert!(test.app().debug_hud_enabled(window), "真实路径默认开启 HUD");
+        frame(&mut test);
+
+        dispatch_event(
+            &mut scene,
+            test.app_mut(),
+            &Event::Input(press(Key::Function(12))),
+        );
+        frame(&mut test);
+        assert!(!test.app().debug_hud_enabled(window), "F12 必须隐藏 HUD");
+
+        dispatch_event(
+            &mut scene,
+            test.app_mut(),
+            &Event::Input(press(Key::Function(12))),
+        );
+        frame(&mut test);
+        assert!(
+            test.app().debug_hud_enabled(window),
+            "第二次 F12 必须重新显示 HUD"
+        );
+    }
+
+    #[test]
+    fn preview_seeds_the_snapshot_state() {
+        let (mut test, window, scene) = setup();
+        test.enable_a11y_capture();
+        // 先跑一帧让 `interactive: true` 落地，否则 `set_focus` 会拒绝尚未求值的节点。
+        frame(&mut test);
+        scene.preview(test.app_mut());
+        frame(&mut test);
+
+        assert_eq!(ime_text(&scene, test.app()).as_str(), "你好，Kytrix");
+
+        let snapshot = test.a11y().expect("preview 的状态变化必须产生 a11y 交付");
+        let slider = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.role == A11yRole::Slider)
+            .expect("滑块");
+        assert_eq!(slider.value.as_deref(), Some("70"), "种子滑块必须是 70%");
+        let radio_b = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.label_text() == Some("选项 B"))
+            .expect("选项 B");
+        assert_eq!(radio_b.checked, Some(true), "种子必须选中单选 B");
+        let swatch_2 = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.label_text() == Some("色块 2（绿）"))
+            .expect("色块 2");
+        assert_eq!(swatch_2.checked, Some(true), "种子必须选中色块 2");
+
+        let preview_focus = test.app().focused(window).expect("preview 必须给焦点");
+        // Tab 序的最后一个可聚焦节点是输入框；清空焦点后 `focus_prev` 取到的就是它。
+        let input = {
+            let app = test.app_mut();
+            let _ = app.set_focus(window, None);
+            app.focus_prev(window).expect("输入框")
+        };
+        assert_eq!(
+            preview_focus, input,
+            "截图种子必须把焦点给输入框（光标 + 焦点环可见）"
+        );
+    }
 }

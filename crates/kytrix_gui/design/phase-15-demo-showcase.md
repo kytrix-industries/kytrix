@@ -1,6 +1,9 @@
 # P15：demo 展示扩展（焦点 / CJK / 输入法 / 无障碍）
 
-> 目标：把 `crates/kytrix_gui_demo` 从一个「三色块 + 一行文本」的冒烟示例，扩成能**肉眼验证**引擎
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；当前运行/测试
+> 命令见 `design/phase-18-demo-example.md`。本文保留 P15 的设计与实测记录，路径已同步为 example。
+>
+> 目标：把 demo 从一个「三色块 + 一行文本」的冒烟示例，扩成能**肉眼验证**引擎
 > 四类能力的展示场景：焦点与键盘导航、CJK 排版、输入法（IME）组合与提交、无障碍（AccessKit）语义。
 > 本文是本次改动的设计基线；实现与本文不一致处记入 `design/DEVIATIONS.md`。
 
@@ -10,12 +13,12 @@
 
 | 项 | 决定 |
 |---|---|
-| 范围 | `crates/kytrix_gui_demo/**` + 文档；引擎只做**被实测暴露的三处既有缺口**修复（F-151 勾选态通道 / F-152 回投任务唤醒 / F-153 文本变化重发 a11y） |
+| 范围 | `crates/kytrix_gui/examples/demo/**` + 文档；引擎只做**被实测暴露的三处既有缺口**修复（F-151 勾选态通道 / F-152 回投任务唤醒 / F-153 文本变化重发 a11y） |
 | 窗口 | 逻辑 `960×740`，`Scale::ONE`；DPI 由平台覆盖（本机 1.25 ⇒ 物理 1200×925） |
 | 布局 | 绝对定位卡片网格（2 列 × 3 行）+ 顶部标题；所有坐标是被父卡片内容盒的相对值 |
 | 焦点 | 7 个可聚焦节点：3 色块 → 单选 A → 单选 B → 缩放滑块 → 输入框；Tab / Shift+Tab 循环，焦点环 + 状态文字 |
 | CJK | 4 条单行脚本样例（简 / 繁 / 日 / 韩）+ 1 段中英混排自动换行段落；断言无 `MissingGlyph` |
-| IME | 自建 `ImeField` 单行模型（`Start/Preedit/Commit/End` + `Text` + Backspace + Enter），事件回显 + 内联组合串（Windows MSPY 组合期不给组合串，见 V-104；内联串由 `--snapshot` 种子状态演示） |
+| IME | 自建 `ImeField` 单行模型（`Start/Preedit/Commit/End` + `Text` + Backspace + Enter），事件回显 + 内联组合串（Windows MSPY 组合期不给组合串，见 V-104；内联串由 `snapshot_demo` 种子状态演示） |
 | 无障碍 | 色块 = `RadioButton`（`checked`）、单选 = `RadioButton`（`checked`）、滑块 = `Slider`（`value` + `SetValue`）、输入框 = `TextInput`（`value` + `SetValue`）；全部带可访问名 |
 | 测试 | 单元测试（IME 模型 / 焦点视图 / 滑块状态）+ 集成测试（建树、Tab 序、a11y 快照、CJK 无豆腐、选中态、方向键→a11y value） |
 
@@ -139,24 +142,23 @@ DFS 先序 = 挂载顺序，因此**挂载顺序即 Tab 序**：
 ## 3. 模块结构
 
 ```text
-crates/kytrix_gui_demo/
-├── Cargo.toml            # + smol_str；dev-dep kytrix_gui/test-support（集成测试用）
-└── src/
-    ├── lib.rs            # 只有 `pub mod scene;`
-    ├── main.rs           # 参数解析 + runtime + 两个入口（窗口 / --snapshot）
-    └── scene.rs          # 模块根：常量、`Scene`、build_into / install / preview / tick
-    └── scene/
-        ├── card.rs       # 卡片/文字/绝对定位样式助手
-        ├── swatch.rs     # ① 3 个色块
-        ├── focus.rs      # ② 焦点视图 + 状态文字
-        ├── cjk.rs        # ③ CJK 样例
-        ├── a11y.rs       # ④ 单选 + 滑块（含 SetValue handler）
-        ├── ime.rs        # ⑤ ImeField 模型 + 输入框
-        └── resources.rs  # ⑥ PNG 图标 + 滚动列表
+crates/kytrix_gui/examples/demo/
+├── main.rs           # example "demo"：真实窗口
+├── snapshot.rs       # example "snapshot_demo"：--snapshot [path]
+├── scene.rs          # 模块根：常量、`Scene`、build_into / install / preview / tick
+└── scene/
+    ├── card.rs       # 卡片/文字/绝对定位样式助手
+    ├── swatch.rs     # ① 3 个色块
+    ├── focus.rs      # ② 焦点视图 + 状态文字
+    ├── cjk.rs        # ③ CJK 样例
+    ├── a11y.rs       # ④ 单选 + 滑块（含 SetValue handler）
+    ├── ime.rs        # ⑤ ImeField 模型 + 输入框
+    ├── resources.rs  # ⑥ PNG 图标 + 滚动列表
+    └── test_support.rs # 场景测试搭建（仅 test + test-support）
 ```
 
 `Scene` 只暴露 `open` / `build_into` / `install` / `preview`；信号与节点句柄是私有字段（子模块可读）。
-`lib.rs` 只做模块声明（AGENTS §5.5）。
+两个 example 源文件通过 `pub mod scene;` 共用同一份场景模块（P18）。
 
 ---
 
@@ -169,9 +171,9 @@ crates/kytrix_gui_demo/
 | 单元 | `scene/a11y.rs` | 滑块百分比文案、`SetValue` 解析（钳制 1..=10）、单选切换、截图种子状态 |
 | 单元 | `scene/swatch.rs` | 选中说明文案与 `LABELS` / `HEX` 对齐 |
 | 单元 | `scene/cjk.rs` | 四条样例覆盖简/繁/日/韩且都含 CJK；混排段落同时含 ASCII 与 CJK |
-| 集成 | `tests/scene.rs` | 首帧提交 + 图元数 + `Canvas` 绝对坐标；CJK 无 `MissingGlyph`；Tab 7 个不同节点后回绕；点击色块后 `checked == Some(true)`；a11y 快照含 `TextInput` / `Slider` / `RadioButton`、单选 `checked` 正确、诊断为空；`←/→` 改滑块后 a11y `value` 更新且**等宽状态行**也重发；IME 事件只在输入框聚焦时生效；`Start`→Esc 不关窗（覆盖按时发 `Start` 或 `Preedit` 的平台；Linux/macOS 经 `Preedit` 进入组合，本机 MSPY 组合期不发，见 V-104）、失焦收组合后 Esc 可关窗（节点失焦与窗口失焦各一例）；截图种子状态（色块 2 / 单选 B / 滑块 70% / 焦点在输入框） |
+| 场景测试 | `examples/demo/scene*` | 首帧提交 + 图元数 + `Canvas` 绝对坐标；CJK 无 `MissingGlyph`；Tab 7 个不同节点后回绕；点击色块后 `checked == Some(true)`；a11y 快照含 `TextInput` / `Slider` / `RadioButton`、单选 `checked` 正确、诊断为空；`←/→` 改滑块后 a11y `value` 更新且**等宽状态行**也重发；IME 事件只在输入框聚焦时生效；`Start`→Esc 不关窗（覆盖按时发 `Start` 或 `Preedit` 的平台；Linux/macOS 经 `Preedit` 进入组合，本机 MSPY 组合期不发，见 V-104）、失焦收组合后 Esc 可关窗（节点失焦与窗口失焦各一例）；截图种子状态（色块 2 / 单选 B / 滑块 70% / 焦点在输入框） |
 
-`--snapshot` 路径额外调用 `Scene::preview`：把 `active=1`、`radio=B`、`scale=70%`、输入框种子为
+`snapshot_demo` 路径额外调用 `Scene::preview`：把 `active=1`、`radio=B`、`scale=70%`、输入框种子为
 `committed="你好，Kytrix"` + `preedit="shi li"`，并把焦点给输入框，保证离屏截图能同时看到四类能力。
 `preview` 之前先跑一帧：输入框靠 `bind_style` 的 `interactive: Some(true)` 才能被 `set_focus` 接受。
 
@@ -190,7 +192,7 @@ crates/kytrix_gui_demo/
 
 ### 6.1 离屏快照
 
-`cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo-showcase.png` →
+`cargo run -p kytrix_gui --example snapshot_demo --features test-support -- --snapshot out\demo-showcase.png` →
 `960×740` WARP 读回；种子状态下可见：色块 2 选中、单选 B、滑块 70%、输入框「你好，Kytrixshi li|」、
 焦点环在输入框、CJK 四行 + 混排两行、图标与滚动列表（内容 20 行，视口约 5 行）。
 

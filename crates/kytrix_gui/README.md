@@ -5,7 +5,7 @@ Kytrix 自研跨平台 GUI 引擎（`crates/kytrix_gui`）。三平台原生图�
 
 > 本 crate `publish = false`：它是产品的一部分，不是独立发布的库。
 >
-> **依赖状态**：引擎子树（`kytrix_gui` / `kytrix_gui_demo`）的依赖已清零 —— `cargo tree -p kytrix_gui`
+> **依赖状态**：引擎子树（`kytrix_gui`）的依赖已清零 —— `cargo tree -p kytrix_gui`
 > 里**没有** `gpui-*` / `wgpu` / `winit` / Vello。workspace 的产品侧（`crates/kytrix`、`base_ui` 等）**仍有**
 > `gpui-kit` / `gpui-pre-*`，那是 M8 的迁移范围，不在本 crate 的验收面内。
 
@@ -57,17 +57,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | 层    | 覆盖                                   | 命令                                                                                                                                                                                                              |
 |-------|----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API | `cargo test -p kytrix_gui` ← **只跑这些**                                                                                                                                                                         |
+| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API + demo 的 23 项单元测试 | `cargo test -p kytrix_gui` ← 不跑 13 项场景测试（需要 `test-support`）                                                                                                                                             |
 | L2    | 帧记录 / 布局命中 / HUD 集成测试       | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features "hud,test-support" --test hud`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
+| L2    | demo example 的场景测试                | `cargo test -p kytrix_gui --features "hud,test-support" --example demo`                                                                                                                                            |
 | L3    | 像素 golden（Windows WARP）            | `cargo test -p kytrix_gui --features test-support --test snapshot`                                                                                                                                                |
 | L4    | criterion 基准（非门禁）               | `cargo bench -p kytrix_gui --bench perf --no-run` / `cargo bench -p kytrix_gui --bench perf`                                                                                                                      |
 
 ```powershell
-# 全部（L0–L3）：注意 `--features test-support`，否则集成测试不会编译
+# 全部（L0–L3 + demo 场景）：注意 `--features test-support`，否则集成测试/场景测试不会编译
 cargo test -p kytrix_gui --features test-support
 
 # P17：Debug HUD 的公开 API 集成测试（`hud` feature）
 cargo test -p kytrix_gui --features "hud,test-support" --test hud
+
+# P18：demo example 的 36 项测试（23 单测 + 13 场景，含 HUD F12）；--example 聚焦运行
+cargo test -p kytrix_gui --features "hud,test-support" --example demo
 
 # 单独跑某一层
 cargo test -p kytrix_gui --features test-support --test frame_record
@@ -82,32 +86,35 @@ Remove-Item Env:UPDATE_GOLDEN
 cargo test -p kytrix_gui --release --features test-support
 
 # 门禁
-cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings
-cargo +nightly fmt -p kytrix_gui -p kytrix_gui_demo -- --check
+cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+cargo +nightly fmt -p kytrix_gui -- --check
 cargo doc -p kytrix_gui --no-deps
 ```
 
-最小示例（真实窗口 + WARP 离屏快照）：
+示例（真实窗口 + WARP 离屏快照，P18 起不再是独立 crate）：
 
 ```powershell
-cargo run -p kytrix_gui_demo
-cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo-showcase.png
-# 直接跑 release（仍需 `--features snapshot` 才有 `--snapshot`）
-cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\demo-showcase.png
+cargo run -p kytrix_gui --example demo
+cargo run -p kytrix_gui --example demo --features hud          # 右上角 HUD，F12 切换
+cargo run -p kytrix_gui --example snapshot_demo --features test-support -- --snapshot out\demo-showcase.png
+# 直接跑 release（snapshot_demo 同样需要 test-support）
+cargo run --release -p kytrix_gui --example snapshot_demo --features test-support -- --snapshot out\demo-showcase.png
 ```
 
-- demo 现在覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
+- `demo` 覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
   焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显 +
   `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、 **无障碍**（AccessKit 角色 / 名称 /
-  `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、 **滚动列表**。`--snapshot` 会先 `Scene::preview`
-  播种一套可截图的组合态（含内联组合串）。
-- **Debug HUD**（`design/phase-17-debug-hud.md`）：demo 默认启用 `kytrix_gui` 的 `hud` feature，
-  右上角显示 FPS / 帧时间 / CPU/GPU/Draw / Upload/Present / 分辨率/DPI/后端；F12 隐藏/显示。
-  `--snapshot` 不安装 HUD；`cargo run -p kytrix_gui_demo --no-default-features` 构建无 HUD demo。
-- demo 的集成测试（`cargo test -p kytrix_gui_demo`）用 dev-dependency 的 `kytrix_gui/test-support`
-  跑无 GPU 帧驱动 + a11y 快照，与主二进制无关。
-- demo 自己的门禁：`cargo test -p kytrix_gui_demo` +
-  `cargo +nightly clippy -p kytrix_gui_demo --all-targets --all-features -- -D warnings`。
+  `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、 **滚动列表**。`snapshot_demo` 会先
+  `Scene::preview` 播种一套可截图的组合态（含内联组合串），且不安装 HUD。
+- **Debug HUD**（`design/phase-17-debug-hud.md`）：`kytrix_gui` 的 `hud` feature 默认关闭；`demo`
+  加 `--features hud` 后右上角显示 FPS / 帧时间 / CPU/GPU/Draw / Upload/Present / 分辨率/DPI/后端，
+  F12 隐藏/显示。`snapshot_demo` 不安装 HUD。
+- 两个 example 共用 `examples/demo/scene*`（`design/phase-18-demo-example.md`）；`main.rs` 只负责
+  启动，`snapshot.rs` 只负责离屏读回，场景代码与测试都在 `scene` 模块。
+- demo 的测试是 example 内 unit test，不是普通 integration test。`cargo test -p kytrix_gui`
+  会跑其中 23 项单元测试；13 项场景测试需要 `--features test-support`。聚焦命令：
+  `cargo test -p kytrix_gui --features "hud,test-support" --example demo`（无 HUD 为 35 项，
+  带 HUD 为 36 项）。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - 缺 shader 工具链时设 `KYTRIX_GUI_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
 - 交叉 target：`cargo check -p kytrix_gui --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`

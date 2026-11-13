@@ -1,5 +1,8 @@
 # Phase 12 · macOS（Metal）+ Linux（Vulkan / Wayland）后端 — 详细设计（v1）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 依据：`custom-gui-engine-design.md` §2.1 / §2.2 / §2.5 / §2.6 / §2.7 / §2.8 / §2.9、§2.10、§8.1 / §8.2 / §8.3、
 > §7.6、§9.4；`design/phase-08-d3d12.md`（共享层契约 / `FramePlan` / retire / readback / `Present1` 语义）；
 > `design/phase-09-win32-demo.md`（平台层形状 / `Dispatcher` / `Event` 映射）；`design/phase-11-a11y.md` §12（P12 交接）；

@@ -1,5 +1,8 @@
 # P16：IME 精确光标（caret）定位
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；当前命令见
+> `design/phase-18-demo-example.md`。
+>
 > 背景：P15 的 demo 在实机上暴露了 IME UI 定位错误。Win32 只在 `WM_IME_STARTCOMPOSITION`
 > 用「最后指针位置」调用 `ImmSetCompositionWindow(CFS_POINT)`；窗口首次启动、尚无指针事件时该值是
 > `(0,0)`，且引擎从未调用 `ImmSetCandidateWindow`。macOS 的 `firstRectForCharacterRange` 固定返回
@@ -13,7 +16,7 @@
 
 | 项 | 决定 |
 |---|---|
-| 范围 | `crates/kytrix_gui` 的 `Window` / `NodeTree` / 三平台 IME 通路 + `crates/kytrix_gui_demo` 的输入框接线 + 文档 |
+| 范围 | `crates/kytrix_gui` 的 `Window` / `NodeTree` / 三平台 IME 通路 + demo example 的输入框接线 + 文档 |
 | API | `App::set_ime_cursor_area(window, text_node, byte_index)` / `App::clear_ime_cursor_area(window)` / `App::ime_cursor_area(window)` |
 | 几何 | `NodeTree::text_caret_rect` 用 parley `Cursor::geometry` 计算**文本盒局部**矩形（1 逻辑像素宽）；`Window::text_caret_rect` 加上节点绝对 bounds、content offset 与祖先滚动偏移 |
 | 坐标 | 公开 API 全部是**窗口客户区逻辑坐标**、左上原点；平台层负责转物理/屏幕坐标 |
@@ -184,7 +187,7 @@ node kind 是 Text
 | 单元 | `src/node/tree.rs` / `src/app.rs` | `text_caret_rect` 的未 shape / 非文本 / 越界 / 非 char boundary / 文本内容与 shape 不一致错误；空文本回退高度 |
 | 单元 | `src/app.rs` | `set_ime_cursor_area` 错误面；set/get/clear 状态；未 shape 时 `ime_cursor_area` 返回 `TextShape`；首次 `App::frame` 后解析；非 char boundary；带 padding/border 的节点绝对坐标；滚动容器内 caret 随 offset 移动 |
 | 单元 | `src/platform/windows/ime.rs` | `caret_forms`：candidate 左上 + exclude 区域，composition 底边；scale=1.25 的物理表单值；真实隐藏 HWND 只 smoke-check `ImmGet*` 在可用时读回的 `rcArea`（`CFS_POINT` 允许 IME 调整，不断言 `ptCurrentPos` 完全相等；失败/无上下文打印原因并跳过） |
-| 集成 | `crates/kytrix_gui_demo/tests/scene.rs` | 输入框聚焦后 hint 落在输入框内；空文本与提交「你好」后 x 增大；失焦后 `Ok(None)` |
+| 场景 | `crates/kytrix_gui/examples/demo/scene/ime.rs` | 输入框聚焦后 hint 落在输入框内；空文本与提交「你好」后 x 增大；失焦后 `Ok(None)` |
 | 静态 | 三平台 | Windows 实跑；macOS/Linux `cargo check` + 既有静态边界（V-82/V-84、V-107） |
 
 ## 7. 非目标
@@ -199,9 +202,9 @@ node kind 是 Text
 ```powershell
 cargo test -p kytrix_gui
 cargo test -p kytrix_gui --features test-support
-cargo test -p kytrix_gui_demo
-cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings
-cargo +nightly fmt -p kytrix_gui -p kytrix_gui_demo -- --check
+cargo test -p kytrix_gui --example demo --features "hud,test-support"
+cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+cargo +nightly fmt -p kytrix_gui -- --check
 cargo doc -p kytrix_gui --no-deps
 cargo check -p kytrix_gui --target x86_64-unknown-linux-gnu
 cargo check -p kytrix_gui --target aarch64-apple-darwin
@@ -211,7 +214,7 @@ cargo check -p kytrix_gui --target aarch64-apple-darwin
 
 - `cargo test -p kytrix_gui`：666 passed / 1 ignored。
 - `cargo test -p kytrix_gui --features test-support`：721 passed / 1 ignored；集成 `frame_record` 6、`layout` 4、`snapshot` 8。
-- `cargo test -p kytrix_gui_demo --all-features`：23 单元 + 12 集成全过。
+- **（迁移前命令）** `cargo test -p kytrix_gui_demo --all-features`：23 单元 + 12 集成全过。
 - `cargo +nightly clippy ... --all-targets --all-features -- -D warnings`、`cargo +nightly fmt -- --check`、`cargo doc -p kytrix_gui --no-deps` 全过。
 - Linux/macOS 交叉 `cargo check`（`KYTRIX_GUI_SKIP_SHADERS=1`）全过。
 - Win32 probe：隐藏 HWND 上 `ImmSetCompositionWindow`/`ImmSetCandidateWindow` 后 `ImmGetCompositionWindow`/`ImmGetCandidateWindow` 读回 `rcArea=(100,200,101,220)`，与输入 area 一致；`CFS_POINT` 的 `ptCurrentPos` 不强制逐像素相等。

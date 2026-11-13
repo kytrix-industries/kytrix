@@ -394,3 +394,122 @@ mod tests {
         assert_eq!(state.status_line().as_str(), "最近 AT 动作：SetValue → 70%");
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod showcase_tests {
+    use kytrix_gui::{
+        a11y::{A11yAction, A11yRole},
+        event::{Event, Key},
+    };
+
+    use crate::scene::{
+        dispatch_event,
+        test_support::{frame, press, setup, setup_installed},
+    };
+
+    #[test]
+    fn the_a11y_tree_exposes_roles_names_and_values() {
+        let (mut test, _window, _scene) = setup();
+        test.enable_a11y_capture();
+        frame(&mut test);
+
+        let snapshot = test.a11y().expect("捕获打开时首帧必有 a11y 交付");
+        assert!(snapshot.full, "首笔必须是全树");
+
+        let labels: Vec<(&str, A11yRole)> = snapshot
+            .nodes()
+            .iter()
+            .filter_map(|node| node.label_text().map(|text| (text, node.role)))
+            .collect();
+        for expected in [
+            ("输入法测试输入框", A11yRole::TextInput),
+            ("缩放比例", A11yRole::Slider),
+            ("选项 A", A11yRole::RadioButton),
+            ("选项 B", A11yRole::RadioButton),
+            ("色块 1（红）", A11yRole::RadioButton),
+            ("色块 3（蓝）", A11yRole::RadioButton),
+            ("Kytrix 图标（2× 放大）", A11yRole::Image),
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "a11y 树缺少 {expected:?}；实际标签：{labels:?}"
+            );
+        }
+
+        let input = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.role == A11yRole::TextInput)
+            .expect("输入框必须在 a11y 树里");
+        assert_eq!(input.value.as_deref(), Some(""), "未输入时 value 是空串");
+        assert!(
+            input.actions.contains(&A11yAction::SetValue),
+            "TextInput 必须支持 SetValue：{:?}",
+            input.actions
+        );
+
+        let slider = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.role == A11yRole::Slider)
+            .expect("滑块必须在 a11y 树里");
+        assert_eq!(slider.value.as_deref(), Some("60"), "默认 6 档 = 60%");
+
+        let radio_a = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.label_text() == Some("选项 A"))
+            .expect("选项 A");
+        assert_eq!(radio_a.checked, Some(true), "默认选中选项 A");
+        let radio_b = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.label_text() == Some("选项 B"))
+            .expect("选项 B");
+        assert_eq!(radio_b.checked, Some(false), "选项 B 必须显式未勾选");
+    }
+
+    #[test]
+    fn arrow_key_updates_the_slider_and_its_a11y_value() {
+        let (mut test, window, mut scene) = setup_installed();
+        test.enable_a11y_capture();
+        frame(&mut test);
+
+        {
+            let app = test.app_mut();
+            // 输入框是第 7 个、滑块是第 6 个可聚焦节点：反向两次落在滑块上。
+            let _ = app.focus_prev(window).expect("输入框");
+            let focused = app.focus_prev(window).expect("滑块");
+            assert_eq!(app.focused(window), Some(focused));
+            dispatch_event(&mut scene, app, &Event::Input(press(Key::ArrowRight)));
+        }
+        frame(&mut test);
+        // 第二步：70% → 80%，状态行与上一笔**等宽**（只靠 LAYOUT 变化触发 a11y 重发是不够的）。
+        {
+            let app = test.app_mut();
+            dispatch_event(&mut scene, app, &Event::Input(press(Key::ArrowRight)));
+        }
+        frame(&mut test);
+
+        let snapshot = test.a11y().expect("A11Y 变化必须产生交付");
+        let slider = snapshot
+            .nodes()
+            .iter()
+            .find(|node| node.role == A11yRole::Slider)
+            .expect("滑块的增量记录");
+        assert_eq!(
+            slider.value.as_deref(),
+            Some("80"),
+            "方向键改状态后 `bind_a11y` 的 value 必须重发"
+        );
+        let status = snapshot
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.label_text()
+                    .is_some_and(|text| text.starts_with("最近 AT 动作"))
+            })
+            .expect("等宽替换后的状态行也必须重发（文本内容变化 → A11Y）");
+        assert_eq!(status.value.as_deref(), Some("最近 AT 动作：方向键 → 80%"));
+    }
+}

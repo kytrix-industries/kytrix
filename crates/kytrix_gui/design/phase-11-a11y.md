@@ -1,5 +1,8 @@
 # Phase 11 · 无障碍（AccessKit）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 上游：`custom-gui-engine-design.md` §7（全章）、§4.4（`hit_test`）、§8.4（焦点 / 滚动）、§9.1（诊断）、§1.3（公开面白名单）、
 > §3.4（失效传播）；`design/phase-01-foundation.md` 附录 A.3 / §4 / §6.2；`design/phase-03-node-state.md`
 > （`Node` / `A11Y` 脏位 / `ReadCtx`）；`design/phase-06-paint-runtime.md`（`RenderedFrame` / 帧门禁）；

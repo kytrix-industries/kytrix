@@ -1,5 +1,8 @@
 # Phase 10 · 交互机制 + Action 分发 — 详细设计（v1）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 依据：`custom-gui-engine-design.md` §3.6（事件 → Action → 状态 → 失效闭环）/ §3.7（高频状态与动画）/ §4.4（`hit_test`）/
 > §4.9（`Style` / `StylePatch`）/ §7.7 / §7.8（a11y 的 Action 与焦点映射，本阶段**只留接口**）/ §8.4（通用交互机制）/ 附录 A；
 > `design/phase-03-node-state.md`（`ReadCtx` / `Signal` / `Transient` / `DirtyFlags` / §9.5）/ `design/phase-04-layout.md`

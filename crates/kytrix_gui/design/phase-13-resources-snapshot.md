@@ -1,5 +1,8 @@
 # Phase 13 · 资源、像素 golden、bench、诊断 — 详细设计（v1）
 
+> **P18 迁移**：demo 已并入 `crates/kytrix_gui/examples/demo/`，不再是独立 crate；本文中的
+> `crates/kytrix_gui_demo` 路径与命令是当时的历史记录，当前命令见 `design/phase-18-demo-example.md`。
+>
 > 编号说明：主设计文档与本仓 `design/phase-0*.md` 的排期把「资源」记为 **P15**、把「像素快照 / bench」记为 **P18**。
 > 本阶段（实施排期第 13 个）**同时**收口这两项，外加 §9.1 的四个诊断导出。文中出现 `P15` / `P18` 时指的是
 > **上游文档的阶段编号**，与本阶段的「P13」是同一次交付的两个切片。

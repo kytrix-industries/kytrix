@@ -85,3 +85,39 @@ mod tests {
         assert!(MIXED.chars().any(is_cjk));
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod showcase_tests {
+    use kytrix_gui::test_support::record::PrimitiveKind;
+
+    use crate::scene::test_support::{frame, setup};
+
+    #[test]
+    fn the_cjk_paragraph_wraps_within_its_card() {
+        let (mut test, _window, _scene) = setup();
+        frame(&mut test);
+        let frame = test
+            .frame_record()
+            .frame
+            .as_ref()
+            .expect("提交帧必须有绘制快照");
+
+        // 混排段落：卡片 x=24 + 18 = 42 起、宽 544；只数 CJK 卡片（x < 604）里的字形 run，
+        // 否则右侧 ④ 卡片同 y 区间的状态/提示文字也会被算进来。
+        let wrapped = frame
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                primitive.kind == PrimitiveKind::GlyphRun
+                    && primitive.bounds.min().x < 604.0
+                    && primitive.bounds.min().y >= 405.0
+                    && primitive.bounds.max().y <= 462.0
+                    && primitive.bounds.size.width > 40.0
+            })
+            .count();
+        assert!(
+            wrapped >= 2,
+            "544px 内的长段落必须折行（至少 2 条 run）：{wrapped}"
+        );
+    }
+}

@@ -9,8 +9,23 @@ build = "build.rs"
 # 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle/诊断）。**不进发布物**（I7 / §6.6）；
 # 集成测试 `tests/frame_record.rs` 与 `tests/snapshot.rs` 通过 `required-features` 依赖它。
 test-support = []
-# P17：内置 Debug HUD（`App::set_debug_hud`）。默认关闭；demo 通过自身默认 feature 打开。
+# P17：内置 Debug HUD（`App::set_debug_hud`）。默认关闭；example `demo` 显式 `--features hud` 打开。
 hud = []
+
+# P18：原 `kytrix_gui_demo` crate 并入为 example。`demo` 是可运行窗口；`snapshot_demo`
+# 与它共用 `examples/demo/scene*`，离屏截图需要引擎的测试基建。
+[[example]]
+name = "demo"
+path = "examples/demo/main.rs"
+# 显式 example 的 test 默认是 false；不写 true 时 `cargo test --example demo` 会跑 0 项。
+test = true
+
+[[example]]
+name = "snapshot_demo"
+path = "examples/demo/snapshot.rs"
+required-features = ["test-support"]
+# 默认 cargo test 只跑 demo 的共享测试副本；--all-targets 仍会跑两个 example。
+test = false
 
 [[test]]
 name = "frame_record"

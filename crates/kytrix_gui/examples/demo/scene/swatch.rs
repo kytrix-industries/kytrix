@@ -141,3 +141,52 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod showcase_tests {
+    use kytrix_gui::{
+        a11y::A11yRole,
+        event::{InputEvent, Modifiers, PointerButton},
+        math::Point,
+    };
+
+    use crate::scene::test_support::{frame, setup_installed};
+
+    #[test]
+    fn clicking_a_swatch_selects_it_for_the_a11y_tree() {
+        let (mut test, window, _scene) = setup_installed();
+        test.enable_a11y_capture();
+        frame(&mut test);
+
+        // 色块 2 的中心：卡片 (24,80) + 卡片内 (202,42,150,88)。
+        let center = Point::new(24.0 + 202.0 + 75.0, 80.0 + 42.0 + 44.0);
+        let _ = test.inject(InputEvent::PointerDown {
+            position: center,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+        });
+        let _ = test.inject(InputEvent::PointerUp {
+            position: center,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+        });
+        frame(&mut test);
+
+        let focused = test
+            .app()
+            .focused(window)
+            .expect("点击色块后焦点落在它上面");
+        let snapshot = test.a11y().expect("选中态变化必须产生 a11y 交付");
+        let record = snapshot
+            .node_for(focused)
+            .expect("被点中的色块必须出现在增量交付里");
+        assert_eq!(record.role, A11yRole::RadioButton);
+        assert_eq!(
+            record.checked,
+            Some(true),
+            "点击后必须写 Toggled（RadioButton 的选中态通道是 checked，不是 selected）"
+        );
+        assert_eq!(record.selected, None, "selected 不参与 RadioButton 语义");
+        assert!(test.app().a11y_diagnostics().is_empty());
+    }
+}
