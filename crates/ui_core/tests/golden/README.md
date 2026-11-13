@@ -6,9 +6,9 @@
 |---------------|-----------------------------------|-----------------------------------|
 | `warp/`       | Windows WARP（D3D12 软件设备）    | 既有                              |
 | `lavapipe/`   | Linux Mesa llvmpipe（软件 Vulkan）| 2026-11-13 新增（见下）           |
-| `metal-real/` | macOS 实机 GPU                    | **缺**：需实机 runner 产出基线    |
+| `metal-real/` | macOS 实机 GPU（Intel Iris Plus 655 / Metal 3） | 2026-11-13 新增（13 份） |
 
-`SnapshotCase::golden_path()` 按 `device_dir()` 取目录；`skip_reason()` 只在 macOS 返回原因。
+`SnapshotCase::golden_path()` 按 `device_dir()` 取目录。三个平台都跑；每个平台只和自己的基线比。
 
 ## 字节语义（重要）
 
@@ -50,6 +50,10 @@ cargo test -p ui_core --features test-support --test snapshot
 # Linux / lavapipe（需要一个可用的 Vulkan 设备；无设备时 snapshot 走 test-only 离屏实例）
 UPDATE_GOLDEN=1 cargo test -p ui_core --features test-support --test snapshot -- --nocapture
 cargo test -p ui_core --features test-support --test snapshot
+
+# macOS / Metal（离屏渲染器，无真实窗口；实机 GPU 产出 metal-real/）
+UPDATE_GOLDEN=1 cargo test -p ui_core --features test-support --test snapshot -- --nocapture
+cargo test -p ui_core --features test-support --test snapshot
 ```
 
 `UPDATE_GOLDEN` 存在即写（不看值）；写完同一次运行里会立刻读回并比较，形成自检。
@@ -65,8 +69,9 @@ cargo test -p ui_core --features test-support --test snapshot
 `max_channel_diff` / `avg_channel_diff` 只进报告，不参与判定。校准只改常量 + 本文档，不改机制。
 
 **跨设备不可比**：`lavapipe/` 与 `warp/` 的同名 case 逐通道差 `max` 64–164、`mean` 0.004–0.063，
-超 1 的像素 3–104 个（合计 < 0.3%），集中在 AA 边缘与阴影渐变（`../../design/DEVIATIONS.md` V-112）。
-每个平台只跟自己目录里的基线比。
+超 1 的像素 3–104 个（合计 < 0.3%）；`metal-real/` 与 `warp/` 只差 1 个通道级（13/13 case `over=0`），
+与 `lavapipe/` 的差同 warp-vs-lavapipe 分布。差异集中在 AA 边缘与阴影渐变
+（`../../design/DEVIATIONS.md` V-112 / S-138）。每个平台只跟自己目录里的基线比。
 
 ## 失败时
 
@@ -78,8 +83,8 @@ cargo test -p ui_core --features test-support --test snapshot
 | 平台 | 状态 |
 |------|------|
 | Windows | 跑（WARP 是系统组件） |
-| Linux | 跑（Vulkan 离屏渲染器，`Renderer::with_headless`，F-150）；宿主无可用设备时 `snapshot` 返回 `Gpu`，该用例打印 skip 并返回 |
-| macOS | `skip_reason()` 返回原因 ⇒ 每个 case 打印一行 `skip <name>: <reason>` 并返回（`metal-real/` 尚无基线） |
+| Linux | 跑（Vulkan 离屏渲染器，`Renderer::with_headless`，F-150）；宿主无可用设备时 `snapshot` 返回 `Gpu`，该用例失败（CI 必须提供 lavapipe） |
+| macOS | 跑（Metal 离屏渲染器，`metal-real/` 实机基线） |
 
 - Windows 上的 `SnapshotError::Gpu` 是**测试失败**（设备/渲染/读回真故障），不是跳过（I10）。
 - Linux 上「宿主没有 Vulkan 设备」是环境缺失，`snapshot_result_is_typed_per_platform` 会打印原因后返回；

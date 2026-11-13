@@ -10,11 +10,13 @@ use std::{
 };
 
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, Sel},
 };
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSTextInputClient, NSView};
+use objc2_app_kit::{
+    NSEvent, NSEventModifierFlags, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
+};
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRange, NSRect, NSSize, NSString,
     NSUInteger,
@@ -387,12 +389,33 @@ impl GuiView {
             ime_cursor: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
-        unsafe {
+        let this: Retained<Self> = unsafe {
             msg_send![
                 super(this),
                 initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0))
             ]
-        }
+        };
+        // 鼠标移出窗口需要 `NSTrackingArea` 才会产生 `mouseExited:`（§7.2）；`InVisibleRect`
+        // 让区域随 view 尺寸自动更新，`ActiveInKeyWindow` 与 Win32 的 hover 语义一致。
+        // 不声明 `.MouseMoved`：窗口的 `acceptsMouseMovedEvents` 已经投递 `mouseMoved:`，
+        // 两者同时开启会让每个移动产生两次 `PointerMove`（实机探针复现）。
+        //
+        // SAFETY: owner 是刚初始化、即将返回给调用方的 `this`（NSView 存活期覆盖 tracking area）；
+        // `userInfo = None`；rect 被 `InVisibleRect` 忽略。
+        let owner: &AnyObject = unsafe { &*(&*this as *const Self).cast::<AnyObject>() };
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveInKeyWindow
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(owner),
+                None,
+            )
+        };
+        this.addTrackingArea(&tracking);
+        this
     }
 
     /// 首显前安装 a11y adapter（`None` = 已经装过）。
@@ -492,8 +515,19 @@ impl GuiView {
 }
 
 /// `AnyObject`（`NSString` / `NSAttributedString`）→ `String`。
+///
+/// AppKit 的 `insertText:` 可能给 `NSString`，而 `setMarkedText:` 给带下划线属性的
+/// `NSAttributedString`；后者的 `-description` 会连同 `NSUnderline` 等属性一起输出，
+/// 不能作为文本内容使用（真实输入法实测：预编辑串被污染成 `ni'hao{ NSUnderline = 2; … }`）。
 fn object_text(object: &AnyObject) -> String {
-    // SAFETY: `description` 对所有 NSObject 都成立；文本类返回其内容。
+    if let Some(attributed) = object.downcast_ref::<NSAttributedString>() {
+        return attributed.string().to_string();
+    }
+    if let Some(text) = object.downcast_ref::<NSString>() {
+        return text.to_string();
+    }
+    // 非文本对象不在 `NSTextInputClient` 契约内；保留 description 作为诊断用回退。
+    // SAFETY: `description` 对所有 NSObject 都成立，且返回 NSString。
     let description: Retained<NSString> = unsafe { msg_send![object, description] };
     description.to_string()
 }
@@ -534,4 +568,48 @@ fn map_keycode(code: u16) -> Option<Key> {
         other => Key::Other(other),
     };
     Some(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2::{AnyThread, msg_send, rc::Retained, runtime::AnyObject};
+    use objc2_app_kit::NSUnderlineStyleAttributeName;
+    use objc2_foundation::{NSMutableAttributedString, NSNumber, NSRange, NSString};
+
+    use super::object_text;
+
+    fn as_any_object<T>(object: &T) -> &AnyObject {
+        // SAFETY: 测试里传入的都是 NSObject 子类；AnyObject 是同一对象的类型擦除视图。
+        unsafe { &*(object as *const T).cast::<AnyObject>() }
+    }
+
+    #[test]
+    fn object_text_reads_plain_strings() {
+        let plain = NSString::from_str("ni'hao");
+        assert_eq!(object_text(as_any_object(&*plain)), "ni'hao");
+    }
+
+    #[test]
+    fn object_text_strips_attributed_string_attributes() {
+        let plain = NSString::from_str("ni'hao");
+        let attributed =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &plain);
+        let underline = NSNumber::numberWithInteger(2);
+        // SAFETY: `NSUnderlineStyleAttributeName` 是本测试刚创建的字符串上的合法属性键；
+        // value 是 NSNumber（2 = 单下划线）。
+        unsafe {
+            attributed.addAttribute_value_range(
+                NSUnderlineStyleAttributeName,
+                as_any_object(&*underline),
+                NSRange::new(0, plain.length()),
+            );
+        }
+        // 夹具必须真的带属性，否则 `-description` 不会复现污染。
+        let description: Retained<NSString> = unsafe { msg_send![&*attributed, description] };
+        assert!(
+            description.to_string().contains("NSUnderline"),
+            "attributed fixture must carry attributes: {description}"
+        );
+        assert_eq!(object_text(as_any_object(&*attributed)), "ni'hao");
+    }
 }

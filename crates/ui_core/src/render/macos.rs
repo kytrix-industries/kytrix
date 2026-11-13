@@ -10,7 +10,8 @@ pub(crate) mod pipeline;
 pub(crate) mod queue;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod readback;
+pub(crate) mod renderer;
 pub(crate) mod swapchain;
 pub(crate) mod timer;
 
-pub(crate) use compositor::Renderer;
+pub(crate) use renderer::Renderer;

@@ -13,11 +13,6 @@ use crate::render::timer::{GpuTimerSample, Section};
 pub(crate) struct GpuTimer;
 
 impl GpuTimer {
-    /// 恒可用（Metal 的 command buffer 一定有起止时间）。
-    pub(crate) fn new() -> Option<Self> {
-        Some(Self)
-    }
-
     /// 命令缓冲完成后调用：`(GPUStartTime, GPUEndTime)` 秒 → 纳秒。
     pub(crate) fn resolve(
         &self,

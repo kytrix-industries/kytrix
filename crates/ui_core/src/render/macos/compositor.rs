@@ -8,6 +8,7 @@
 
 use std::time::Instant;
 
+use bytes::Bytes;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
@@ -34,7 +35,6 @@ use crate::{
             pipeline::Pipeline,
             queue::Queue,
             swapchain::Swapchain,
-            timer::GpuTimer,
         },
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
@@ -45,8 +45,8 @@ use crate::{
 /// `RootUniform` 的字节数（P07 §2.7：112 B）。
 const ROOT_UNIFORM_BYTES: usize = 112;
 
-/// 一个窗口的 GPU 渲染器（`Window.renderer` 的载荷）。
-pub(crate) struct Renderer {
+/// 一个 GPU 渲染器（窗口路径由 render 线程独占；离屏路径同步调用）。
+pub(crate) struct GpuRenderer {
     device: Device,
     queue: Queue,
     pipeline: Pipeline,
@@ -54,16 +54,53 @@ pub(crate) struct Renderer {
     persist: Persist,
     upload: UploadArena,
     root: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    timer: Option<GpuTimer>,
     swapchain: Option<Swapchain>,
     clear_color: [f32; 4],
     surface: (u32, u32),
-    clips: Vec<GpuClipEntry>,
+    scale: f64,
     #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
 }
 
-impl Renderer {
+// SAFETY: `GpuRenderer` 在构造完成后只整体移动一次到 render 线程，此后主线程不再访问
+// 其中任何 Metal 对象（`CAMetalLayer` 的绘制属性也只由 worker 写）。Metal 对象本身按
+// Apple 文档允许跨线程使用；这里保证的是「单线程独占」而不是共享。`WindowRenderer`
+// 只持有 layer 的额外 retain 供 `NSView::setLayer` 使用，不读写绘制属性。
+unsafe impl Send for GpuRenderer {}
+
+/// 一帧的 CPU→GPU 快照（render 线程只消费它，不再借用 `Window` 的实例缓冲）。
+///
+/// 实例字节、绘制序、裁剪表必须一起过线：worker 拿到的必须是**同一帧**的三份数据。
+pub(crate) struct FramePayload {
+    instances: Bytes,
+    ops: Vec<FrameOp>,
+    clips: Vec<GpuClipEntry>,
+}
+
+impl FramePayload {
+    /// 从主线程的编码结果复制一份。复制是线程边界的所有权转移，不是可选优化。
+    pub(crate) fn from_buffer(buffer: &InstanceBuffer) -> Self {
+        let mut clips = Vec::with_capacity(buffer.clips().len());
+        buffer.write_clips_gpu(&mut clips);
+        Self {
+            instances: Bytes::copy_from_slice(buffer.as_bytes()),
+            ops: buffer.ops().to_vec(),
+            clips,
+        }
+    }
+
+    /// 空载荷（邮箱/线程单元测试用；真实帧必须走 `from_buffer`）。
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            instances: Bytes::new(),
+            ops: Vec::new(),
+            clips: Vec::new(),
+        }
+    }
+}
+
+impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备 + 默认图集页。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
         Self::with_device(Device::new()?, size, ATLAS_PAGE)
@@ -82,6 +119,7 @@ impl Renderer {
     pub(crate) fn new_for_layer(size: (u32, u32), scale: f64) -> Result<Self, EngineError> {
         let mut renderer = Self::with_device(Device::new()?, size, ATLAS_PAGE)?;
         renderer.swapchain = Some(Swapchain::new(&renderer.device, size, scale)?);
+        renderer.scale = scale;
         Ok(renderer)
     }
 
@@ -96,7 +134,6 @@ impl Renderer {
         let mut device = device;
         let persist = Persist::new(&mut device, size)?;
         let upload = UploadArena::new(&mut device)?;
-        let timer = GpuTimer::new();
         Ok(Self {
             device,
             queue,
@@ -105,17 +142,36 @@ impl Renderer {
             persist,
             upload,
             root,
-            timer,
             swapchain: None,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             surface: (size.0.max(1), size.1.max(1)),
-            clips: Vec::with_capacity(8),
+            scale: 1.0,
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
     }
 
-    /// 绘图图层的强引用（平台层用它挂到 `NSView`，并在缩放变化时更新 `contentsScale`）。
+    /// 窗口路径：worker 在每一帧前同步尺寸与 DPI（主线程不再写 `CAMetalLayer`）。
+    ///
+    /// 返回 `true` 表示尺寸或 scale 变了：worker 必须把本帧提升为全量，主线程的
+    /// `FramePlan` 可能仍是 partial（DPI 变化时逻辑尺寸可能不变）。
+    pub(crate) fn prepare_frame(
+        &mut self,
+        surface: (u32, u32),
+        scale: f64,
+    ) -> Result<bool, EngineError> {
+        let surface = (surface.0.max(1), surface.1.max(1));
+        let size_changed = surface != self.surface;
+        let scale_changed = (scale - self.scale).abs() > f64::EPSILON;
+        if size_changed || scale_changed {
+            self.resize_with_scale(surface, scale)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 绘图图层的强引用（平台层只把它挂到 `NSView`；绘制属性由 render 线程写）。
     pub(crate) fn layer_handle(&self) -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
         self.swapchain.as_ref().map(|swapchain| {
             let layer = swapchain.layer();
@@ -134,22 +190,39 @@ impl Renderer {
 
     /// resize：重建持久 offscreen（旧纹理走 retire）+ 调图层 `drawableSize`。
     ///
-    /// 同步提交下「等 GPU 空闲」是恒真（[`Queue::wait_idle`] 是 no-op）。
+    /// 必须先 `wait_idle`：异步提交下旧 persist/upload 仍可能被在飞命令引用。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
+        self.resize_with_scale(size, self.scale)
+    }
+
+    /// 尺寸与 scale 一起更新：scale 变化（显示模式切换）不一定改变物理尺寸。
+    pub(crate) fn resize_with_scale(
+        &mut self,
+        size: (u32, u32),
+        scale: f64,
+    ) -> Result<(), EngineError> {
         let size = (size.0.max(1), size.1.max(1));
+        let scale_changed = (scale - self.scale).abs() > f64::EPSILON;
         if size == self.surface {
+            if scale_changed {
+                self.scale = scale;
+                if let Some(swapchain) = self.swapchain.as_mut() {
+                    swapchain.set_scale(scale);
+                }
+            }
             return Ok(());
         }
-        self.queue.wait_idle();
+        self.queue.wait_idle(&mut self.device)?;
         if let Some(swapchain) = self.swapchain.as_mut() {
-            swapchain.resize(size);
+            swapchain.resize(size, scale);
         }
         self.persist.recreate(&mut self.device, size)?;
         self.surface = size;
+        self.scale = scale;
         Ok(())
     }
 
-    /// 一帧的全部 GPU 工作（同步提交）。
+    /// 一帧的全部 GPU 工作（命令提交异步；窗口路径不等待 GPU 完成）。
     pub(crate) fn submit(
         &mut self,
         index: FrameIndex,
@@ -157,9 +230,26 @@ impl Renderer {
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
     ) -> Result<crate::render::RenderStats, EngineError> {
+        let payload = FramePayload::from_buffer(buffer);
+        Ok(self
+            .submit_payload(index, &payload, frame, timings)?
+            .unwrap_or_default())
+    }
+
+    /// 提交一份已经跨线程复制好的帧快照。
+    ///
+    /// `None` = 本帧没拿到 drawable（worker 会保留 job 重试）；`Some` = 已 commit。
+    pub(crate) fn submit_payload(
+        &mut self,
+        index: FrameIndex,
+        payload: &FramePayload,
+        frame: &mut FramePlan,
+        timings: &mut FrameTimings,
+    ) -> Result<Option<crate::render::RenderStats>, EngineError> {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
+        let pending_gpu = self.queue.poll_completed(&mut self.device)?;
         timings.reset(index);
         debug_assert_eq!(
             timings.frame(),
@@ -167,32 +257,37 @@ impl Renderer {
             "timings must be reset for this frame"
         );
         debug_assert!(timings.samples().is_empty(), "timings must start empty");
+        // GPU 时间来自上一帧已经完成的 command buffer（异步提交下没有本帧的同步结果）。
+        if let Some(sample) = pending_gpu {
+            timings.push(sample);
+        }
         let frame_started = Instant::now();
         // **不要**按 `copy_plan()` 做局部拷贝：drawable 的内容跨帧无保证（结论 #4 / F-121）。
-        // 这里只断言「partial 帧确实带 dirty 集」，本帧仍然整面 blit。
+        // `fresh` 的 partial 帧（换 scale/首帧）仍会整面画；只有真正的 partial 才要求带 dirty 集。
         debug_assert!(
-            !matches!(frame.plan(), Plan::Partial(_)) || frame.present_dirty().is_some(),
+            !matches!(frame.plan(), Plan::Partial(_))
+                || frame.is_full()
+                || frame.present_dirty().is_some(),
             "partial plans must carry their dirty set"
         );
-        buffer.write_clips_gpu(&mut self.clips);
         // 先拿 drawable：拿不到就没有可写目标，**不要**开始这一帧（否则 ring 前进但没有提交，
-        // 下一次 `begin` 的断言会把这一帧算成丢帧）。
+        // 下一次 `begin` 的断言会把这一帧算成丢帧）。窗口路径由 worker 重试本帧。
         let drawable = match self.swapchain.as_ref() {
             Some(swapchain) => match swapchain.next_drawable() {
                 Some(drawable) => Some(drawable),
-                None => return Ok(crate::render::RenderStats::default()),
+                None => return Ok(None),
             },
             None => None,
         };
-        let (slot, command) = self.queue.begin(index)?;
+        let (slot, command) = self.queue.begin(index, &mut self.device)?;
 
         let uploaded = self.upload.write(
             &mut self.device,
             &mut self.queue,
             index,
             slot.index,
-            buffer.as_bytes(),
-            &self.clips,
+            &payload.instances,
+            &payload.clips,
         )?;
         let (instance_count, _clip_count) = uploaded;
         write_root(&self.root, self.surface);
@@ -233,7 +328,7 @@ impl Renderer {
             match full {
                 true => {
                     encoder.setScissorRect(whole_scissor(self.surface));
-                    draw_calls = draw_ops(&encoder, buffer, instance_count)?;
+                    draw_calls = draw_ops(&encoder, &payload.ops, instance_count)?;
                 }
                 false => match frame.plan() {
                     Plan::Idle | Plan::Full => {}
@@ -242,7 +337,7 @@ impl Renderer {
                             encoder.setScissorRect(scissor_for(rect));
                             draw_calls = draw_calls.saturating_add(draw_ops(
                                 &encoder,
-                                buffer,
+                                &payload.ops,
                                 instance_count,
                             )?);
                         }
@@ -261,35 +356,23 @@ impl Renderer {
             }
             Ok(())
         };
-        if let Err(error) = draw_result {
-            return Err(self.classify(Some(&error_message(&error))));
+        draw_result?;
+
+        // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时
+        // 立即归还给 CAMetalLayer，而不是等 `waitUntilCompleted` 返回后才 present。
+        // 旧顺序（wait → present）会让 3 张 drawable 在同步等待期间一直被占用，
+        // 遇到 AX 查询/遮挡等合成器暂停场景会卡死在 `nextDrawable`（macOS 实机复现）。
+        if let Some(drawable) = drawable.as_ref() {
+            let mtl_drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
+            command.presentDrawable(mtl_drawable);
         }
 
-        if let Err(error) = self.queue.submit(slot, &command) {
-            // 命令缓冲失败：优先分类为设备丢失（粘性），否则原样返回。
-            let buffer_error = command.error();
-            if let Some(lost) = self
-                .device
-                .note_failure(buffer_error.as_deref(), index.get() as u64)
-            {
-                return Err(lost);
-            }
-            return Err(error);
-        }
-
-        if let Some(timer) = self.timer.as_ref()
-            && let Some(sample) = timer.resolve(&command)
-        {
-            timings.push(sample);
-        }
+        // 异步提交：commit 后立即返回，完成状态在下一次 submit / wait_idle 轮询。
+        self.queue.submit(index, slot, &command)?;
 
         let present_started = Instant::now();
-        if let Some(drawable) = drawable.as_ref() {
-            // `MTLDrawable::present`（`presentDrawable:` 的等价物，`commit` 之后调用）。
-            Swapchain::present_drawable(drawable);
-        }
-        if let Some(swapchain) = self.swapchain.as_mut()
-            && drawable.is_some()
+        if drawable.is_some()
+            && let Some(swapchain) = self.swapchain.as_mut()
         {
             swapchain.presented();
         }
@@ -304,17 +387,16 @@ impl Renderer {
             "at most three sections per frame"
         );
 
-        self.queue.release_completed(index, &mut self.device);
-        Ok(crate::render::RenderStats {
+        Ok(Some(crate::render::RenderStats {
             draw_calls,
             instances: instance_count,
-        })
+        }))
     }
 
     /// 读回持久 offscreen（快照；同步等待 GPU 完成）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
-        self.queue.wait_idle();
+        self.queue.wait_idle(&mut self.device)?;
         self.readback.capture(
             &self.device,
             &self.queue,
@@ -378,23 +460,13 @@ impl Renderer {
             });
         }
     }
-
-    /// 把 GPU 错误归类为设备丢失（粘性）或原样返回。
-    fn classify(&mut self, message: Option<&str>) -> EngineError {
-        let error =
-            message.map(|message| smol_str::format_smolstr!("metal submit failed: {message}"));
-        match error {
-            Some(detail) => EngineError::Swapchain { detail },
-            None => EngineError::AppInit {
-                detail: smol_str::SmolStr::new_static("metal submit failed"),
-            },
-        }
-    }
 }
 
-/// 错误消息（`classify` 的输入；`EngineError` 不可 `Clone`）。
-fn error_message(error: &EngineError) -> String {
-    error.to_string()
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        // 异步提交：退出/销毁前必须等 GPU 完成，否则 resources 在命令缓冲仍被 GPU 引用时释放。
+        let _ = self.queue.wait_idle(&mut self.device);
+    }
 }
 
 /// 持久 offscreen（唯一绘制目标；`BGRA8Unorm_sRGB` / Private）。
@@ -418,7 +490,7 @@ impl Persist {
     fn recreate(&mut self, device: &mut Device, size: (u32, u32)) -> Result<(), EngineError> {
         let texture = create_target(device, size)?;
         let handle = device.allocate(GpuObject::Texture(texture.clone()));
-        // 同步提交：`wait_idle` 之后旧纹理可以立即释放。
+        // `wait_idle` 之后旧纹理可以立即释放（窗口路径的提交是异步的）。
         device.release(self.handle);
         self.texture = texture;
         self.handle = handle;
@@ -581,11 +653,11 @@ fn write_root(buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>, surface: (u32
 
 fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    buffer: &InstanceBuffer,
+    ops: &[FrameOp],
     instance_count: u32,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
-    for op in buffer.ops() {
+    for op in ops {
         match *op {
             FrameOp::Instances { start, len } => {
                 if len == 0 {

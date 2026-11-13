@@ -18,7 +18,6 @@ use std::{
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopMode, CFRunLoopSource,
     CFRunLoopSourceContext, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-    kCFRunLoopDefaultMode,
 };
 
 /// 泵回调（`event_loop::pump_callback`）。
@@ -57,14 +56,8 @@ fn lock() -> Option<MutexGuard<'static, Option<Box<Wake>>>> {
     }
 }
 
-/// default run loop mode（CF 的 `kCFRunLoopDefaultMode`；读取 extern static 需要 unsafe）。
-fn default_mode() -> &'static CFRunLoopMode {
-    // SAFETY: Foundation 保证该 static 在进程生命周期内非空。
-    unsafe { kCFRunLoopDefaultMode }.expect("kCFRunLoopDefaultMode is never null")
-}
-
-/// `common modes` 的定时器（滚动/事件跟踪期间也继续 tick）。
-fn common_mode() -> Option<&'static CFRunLoopMode> {
+/// `common modes`（live resize / 全屏转场 / 滚动跟踪期间也继续泵）。
+pub(crate) fn common_mode() -> Option<&'static CFRunLoopMode> {
     // SAFETY: Foundation 保证该 static 在进程生命周期内非空。
     unsafe { kCFRunLoopCommonModes }
 }
@@ -90,14 +83,16 @@ pub(crate) fn install(state: *mut c_void, perform: PerformFn, timer_fn: TimerFn)
     let Some(source) = (unsafe { CFRunLoopSource::new(None, 0, &mut context) }) else {
         return false;
     };
-    // CF 要求非空 mode（传 `None` 会被当作未定义行为）：source 挂 default mode。
-    run_loop.add_source(Some(&source), Some(default_mode()));
+    // CF 要求非空 mode（传 `None` 会被当作未定义行为）。source 必须挂 common modes：
+    // AppKit 的 live resize / 原生全屏转场运行在 tracking/nested run loop，只挂 default
+    // mode 会让泵在转场期间完全饿死（macOS 全屏停在旧帧快照的根因）。
+    run_loop.add_source(Some(&source), common_mode());
     let Some(mut guard) = lock() else {
         return false;
     };
     // 重复安装：先卸掉旧的（正常路径只调一次；这样即便重入也不会泄漏 run loop 引用）。
     if let Some(previous) = guard.take() {
-        run_loop.remove_source(Some(&previous.source), Some(default_mode()));
+        run_loop.remove_source(Some(&previous.source), common_mode());
     }
     *guard = Some(Box::new(Wake {
         run_loop,
@@ -120,7 +115,7 @@ pub(crate) fn uninstall() {
         return;
     };
     wake.run_loop
-        .remove_source(Some(&wake.source), Some(default_mode()));
+        .remove_source(Some(&wake.source), common_mode());
     if let Some(timer) = wake.timer.borrow_mut().take() {
         wake.run_loop.remove_timer(Some(&timer), common_mode());
         timer.invalidate();

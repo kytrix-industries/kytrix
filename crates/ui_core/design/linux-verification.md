@@ -332,9 +332,9 @@ Windows 侧（同一份改动）：
 |------|------|------|
 | `warp/` | Windows WARP | 既有 13 份 |
 | `lavapipe/` | Linux Mesa llvmpipe | **本轮新增 13 份** |
-| `metal-real/` | macOS 真实 GPU | 仍缺（`skip_reason()` 明确说明，需实机 runner） |
+| `metal-real/` | macOS 真实 GPU | 2026-11-13 由 macOS 实机补齐（见 [`macos-verification.md`](macos-verification.md)） |
 
-`SnapshotCase::golden_path()` 改为按 `device_dir()` 取目录，`skip_reason()` 只在 macOS 返回原因。
+`SnapshotCase::golden_path()` 按 `device_dir()` 取目录；三个平台都各自比对（`skip_reason()` 已由 S-138 删除）。
 
 ### 5.2 生成方式
 
@@ -375,7 +375,7 @@ cargo test -p ui_core --features test-support --test snapshot
 
 | 项 | 说明 |
 |----|------|
-| macOS `metal-real/` golden | 无实机 GPU runner，`skip_reason()` 明确跳过 |
+| macOS `metal-real/` golden | 已由 macOS 实机补齐（13 份，见 S-138） |
 | 真实输入法（拼音/日文）组合 | VM 装了 `ibus-libpinyin` / `fcitx5`，但 GNOME 会话未启用输入法；本轮用 `wtype` 直出字符 + `zwp_text_input_v3` 协议流验证 caret 定位，**组合串的真实输入法行为未验证** |
 | 多显示器 / 混合 DPI | VM 单输出 |
 | KDE / Sway 作为产品目标合成器 | 只验了 mutter（GNOME）与 sway（测试夹具） |

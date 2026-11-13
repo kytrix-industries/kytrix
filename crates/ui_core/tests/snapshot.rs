@@ -1,16 +1,15 @@
-//! L3 集成测试：像素 golden（Windows WARP）。
+//! L3 集成测试：像素 golden（Windows WARP / Linux lavapipe / macOS Metal）。
 //!
 //! 运行：`cargo test -p ui_core --features test-support --test snapshot`
 //! 生成/更新：`$env:UPDATE_GOLDEN='1'`（PowerShell）或 `UPDATE_GOLDEN=1`（bash）后重跑同一条命令。
 //!
-//! macOS / Linux：`skip_reason()` 非空 ⇒ 打印原因并返回（跨设备比 warp golden 必然失败，
-//! 见 `design/phase-13-resources-snapshot.md` §9.6）。Windows 上的 GPU 失败是**测试失败**，不是跳过。
+//! golden 按设备类型分目录（D14），每个平台只和自己的基线比；GPU 失败是**测试失败**，不是跳过。
 
 use ui_core::{
     math::Scale,
     test_support::snapshot::{
         GoldenError, SnapshotCase, SnapshotImage, SnapshotScene, SnapshotTheme, Tolerance,
-        assert_golden, compare, gpu_guard, skip_reason,
+        assert_golden, compare, gpu_guard,
     },
 };
 
@@ -24,12 +23,8 @@ fn case(scene: SnapshotScene, theme: SnapshotTheme, scale: f32) -> SnapshotCase 
     }
 }
 
-/// 跑一个 case：非 Windows 跳过；Windows 上任何失败都 panic（带 golden 名）。
+/// 跑一个 case：任何失败都 panic（带 golden 名）。
 fn run(case: SnapshotCase) {
-    if let Some(reason) = skip_reason() {
-        eprintln!("skip {}: {reason}", case.golden_name());
-        return;
-    }
     let _guard = gpu_guard();
     match assert_golden(case, Tolerance::default()) {
         Ok(diff) => eprintln!(

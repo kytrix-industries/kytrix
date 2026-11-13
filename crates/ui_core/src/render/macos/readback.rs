@@ -104,7 +104,7 @@ impl Readback {
                 total,
             );
         }
-        for pixel in rgba8.chunks_exact_mut(4) {
+        for pixel in rgba8.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         Ok(ReadbackImage {

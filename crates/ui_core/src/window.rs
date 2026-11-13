@@ -623,6 +623,15 @@ impl Window {
         self.image_page_received = false;
     }
 
+    /// 轮询 render 线程的完成/错误反馈（macOS 窗口路径；空闲时也要跑）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn poll_renderer(&mut self) -> Result<(), EngineError> {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.poll()?;
+        }
+        Ok(())
+    }
+
     /// 启用**离屏** GPU 渲染（headless 行为不变：不调用就恒为 `None`）。
     ///
     /// P09 的原生窗口层会在此之后 attach swapchain；本方法本身只把窗口的绘制目标变成
@@ -801,6 +810,8 @@ impl Window {
         let surface = self.physical_surface();
         let frame = Rect::new(0.0, 0.0, self.size().width, self.size().height)
             .to_physical_covering(self.scale);
+        #[cfg(target_os = "macos")]
+        renderer.set_scale(f64::from(self.scale.factor()));
         let fresh = renderer.surface() != surface || renderer.is_fresh();
         if fresh {
             renderer.resize(surface)?;
@@ -926,18 +937,38 @@ impl Window {
         use crate::render::timer::Section;
 
         let (physical_width, physical_height) = self.physical_surface();
-        let upload_time = self
+        let mut upload_time = self
             .timings
             .sample(Section::Upload)
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
-        let gpu_time = self
+        let mut gpu_time = self
             .timings
             .sample(Section::Gpu)
             .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns));
-        let present_time = self
+        let mut present_time = self
             .timings
             .sample(Section::Present)
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
+        // macOS 窗口路径的 GPU 工作已移到 render 线程：主线程没有本帧的 samples，
+        // 用最近完成帧的 worker 采样补齐（HUD 允许领先一帧）。
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self.renderer.as_ref() {
+            upload_time = upload_time.or_else(|| {
+                renderer
+                    .timing_sample(Section::Upload)
+                    .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
+            });
+            gpu_time = gpu_time.or_else(|| {
+                renderer
+                    .timing_sample(Section::Gpu)
+                    .map(|sample| std::time::Duration::from_nanos(sample.gpu_ns))
+            });
+            present_time = present_time.or_else(|| {
+                renderer
+                    .timing_sample(Section::Present)
+                    .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns))
+            });
+        }
         crate::debug_hud::DebugHudMetrics {
             frame_index: self.frame_index(),
             frame_interval: self.frame_interval,

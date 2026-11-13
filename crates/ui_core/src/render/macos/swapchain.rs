@@ -4,7 +4,7 @@
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSSize;
-use objc2_metal::{MTLDrawable, MTLPixelFormat};
+use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use crate::{
@@ -30,7 +30,10 @@ impl Swapchain {
         layer.setOpaque(true);
         // 需要把 persist blit **进** drawable：`framebufferOnly` 只保证 render target 用法。
         layer.setFramebufferOnly(false);
-        layer.setAllowsNextDrawableTimeout(false);
+        // `nextDrawable` 现在只在 render 线程调用。仍保留超时：合成器暂停
+        // （AX 查询 / 窗口被遮挡 / 屏幕录制）或关机时，worker 可以把 `None` 当作
+        // 「本帧没拿到 drawable」重试，而不是永远卡在 `nextDrawable`。
+        layer.setAllowsNextDrawableTimeout(true);
         layer.setMaximumDrawableCount(3);
         layer.setDisplaySyncEnabled(true);
         layer.setContentsScale(scale);
@@ -71,18 +74,26 @@ impl Swapchain {
         self.layer.nextDrawable()
     }
 
-    /// resize：只改 `drawableSize`（图层本身不重建）→ 下一次 present 全量。
-    pub(crate) fn resize(&mut self, size: (u32, u32)) {
+    /// resize：改 `contentsScale` 与 `drawableSize`（图层本身不重建）→ 下一次 present 全量。
+    ///
+    /// 调用方（render 线程）把 `NativeWindow` 读到的 scale 一起传进来；主线程不再写图层属性。
+    pub(crate) fn resize(&mut self, size: (u32, u32), scale: f64) {
         let size = (size.0.max(1), size.1.max(1));
-        self.layer.setContentsScale(self.scale);
+        self.scale = scale;
+        self.layer.setContentsScale(scale);
         self.layer
             .setDrawableSize(NSSize::new(f64::from(size.0), f64::from(size.1)));
         self.size = size;
         self.fresh = true;
     }
 
-    /// `MTLDrawable` 的 `present`（`presentDrawable:` 的等价物；同步提交后在 `commit` 之后调用）。
-    pub(crate) fn present_drawable(drawable: &ProtocolObject<dyn CAMetalDrawable>) {
-        drawable.present();
+    /// 只更新 DPI（显示模式切换时物理尺寸可能不变）；下一次仍按全量画。
+    pub(crate) fn set_scale(&mut self, scale: f64) {
+        if (scale - self.scale).abs() <= f64::EPSILON {
+            return;
+        }
+        self.scale = scale;
+        self.layer.setContentsScale(scale);
+        self.fresh = true;
     }
 }

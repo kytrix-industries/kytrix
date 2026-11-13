@@ -32,7 +32,7 @@ name = "frame_record"
 path = "tests/frame_record.rs"
 required-features = ["test-support"]
 
-# P13：像素 golden（Windows WARP；mac/Linux 由 `skip_reason()` 跳过）。
+# P13：像素 golden（Windows WARP / Linux lavapipe / macOS Metal，按设备分目录）。
 [[test]]
 name = "snapshot"
 path = "tests/snapshot.rs"

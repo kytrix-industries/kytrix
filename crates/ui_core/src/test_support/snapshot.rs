@@ -4,9 +4,8 @@
 //! [`capture`] 的顺序是「建 `TestApp` → [`mount`] 合成场景 → `drain()` → `snapshot`」。
 //! `SnapshotCase` 的 `scene` / `theme` 只决定「挂哪个场景」与「golden 文件名」，不参与渲染本身。
 //!
-//! 平台策略（§9.6）：v1 的 golden 只由 **Windows WARP** 产出；macOS / Linux 由 [`skip_reason`]
-//! 显式跳过并打印原因（跨设备比 warp golden 会永久红）。`golden` 的字节是读回原样
-//! （预乘 sRGB RGBA8），不反预乘。
+//! 平台策略（§9.6 / D14）：golden 按**设备类型**分目录；三个平台各自产出并与自己的基线比对
+//! （跨设备比同一份 golden 会永久红）。`golden` 的字节是读回原样（预乘 sRGB RGBA8），不反预乘。
 
 use std::{
     fmt,
@@ -540,26 +539,6 @@ pub fn assert_golden(
         });
     }
     Ok(diff)
-}
-
-/// 本平台是否跳过像素 golden（`Some(原因)` = 跳过）。
-///
-/// golden 按**设备类型**分目录（D14）：Windows 用 WARP、Linux 用 lavapipe、macOS 用真实 Metal
-/// （`metal-real/` 尚无基线，需在实机 GPU runner 上产出）。
-#[must_use]
-pub fn skip_reason() -> Option<&'static str> {
-    #[cfg(windows)]
-    {
-        None
-    }
-    #[cfg(target_os = "linux")]
-    {
-        None
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some("no metal-real/ baseline yet (produced on a real-GPU runner, D14)")
-    }
 }
 
 /// 进程内串行化 GPU 快照（多个 `#[test]` 并行会各自建 WARP 设备并互相拖垮）。
@@ -1235,16 +1214,6 @@ mod tests {
         );
         let decoded = image::load_from_memory(&bytes).expect("png");
         assert_eq!((decoded.width(), decoded.height()), (16, 16));
-    }
-
-    #[test]
-    fn skip_reason_is_platform_specific() {
-        // Windows（WARP）与 Linux（lavapipe）都有 golden 目录；macOS 的 `metal-real/` 尚无基线。
-        if cfg!(any(windows, target_os = "linux")) {
-            assert!(super::skip_reason().is_none());
-        } else {
-            assert!(super::skip_reason().is_some());
-        }
     }
 
     #[test]

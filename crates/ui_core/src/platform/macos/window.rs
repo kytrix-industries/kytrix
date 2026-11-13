@@ -5,8 +5,8 @@
 
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSCursor, NSWindow, NSWindowButton,
-    NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSWindow,
+    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CAMetalLayer;
@@ -32,8 +32,6 @@ pub(crate) struct NativeWindow {
     id: WindowId,
     window: Retained<NSWindow>,
     view: Retained<GuiView>,
-    /// 渲染器的图层（`attach_layer` 后保存；缩放变化时更新 `contentsScale`）。
-    layer: Option<Retained<CAMetalLayer>>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -81,16 +79,29 @@ impl NativeWindow {
         window.setTitle(&NSString::from_str(options.title.as_str()));
         window.setTitlebarAppearsTransparent(true);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-        window.setOpaque(false);
-        window.setBackgroundColor(Some(&NSColor::clearColor()));
+        // fullscreen 转场使用不透明窗口；透明窗口会让 AppKit 的全屏 Space 停在过渡快照上
+        // （实测：view/layer 已 1680×1050，屏幕仍显示旧 960×740 快照）。引擎自己画满背景，
+        // 不需要窗口透明。
+        window.setOpaque(true);
+        window.setBackgroundColor(Some(&NSColor::blackColor()));
         window.setAcceptsMouseMovedEvents(true);
         window.setContentMinSize(NSSize::new(
             f64::from(MIN_SIZE_LOGICAL.0),
             f64::from(MIN_SIZE_LOGICAL.1),
         ));
+        // 显式声明该窗口是原生全屏的 primary 窗口；默认 collectionBehavior=0 时
+        // AppKit 的 fullscreen 转场会停在过渡快照上（实测：窗口/view/layer 都已
+        // 1680×1050，但屏幕仍显示旧的 960×740 快照）。
+        window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
 
         let view = GuiView::new(mtm);
         window.setContentView(Some(&view));
+        // 原生全屏转场由 AppKit 直接改 window frame；contentView 必须随宽度/高度伸缩，
+        // 否则引擎看到的一直是 960×740，layer/drawable 也不会覆盖全屏窗口。
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
         view.setWantsLayer(true);
         window.makeFirstResponder(Some(&view));
 
@@ -117,7 +128,6 @@ impl NativeWindow {
             id,
             window,
             view,
-            layer: None,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
@@ -146,16 +156,11 @@ impl NativeWindow {
     }
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
-    pub(crate) fn attach_layer(&mut self, layer: Retained<CAMetalLayer>) {
+    ///
+    /// 只在这里把 layer 交给 AppKit；之后的 `contentsScale` / `drawableSize` 全部由 render
+    /// 线程写（主线程再写会与 `nextDrawable` 竞争）。
+    pub(crate) fn attach_layer(&self, layer: Retained<CAMetalLayer>) {
         self.view.setLayer(Some(&layer));
-        self.layer = Some(layer);
-    }
-
-    /// 缩放变化：把新 `contentsScale` 交给图层（`drawableSize` 由下一次 `resize` 复核）。
-    fn update_layer_scale(&mut self, scale: f64) {
-        if let Some(layer) = self.layer.as_ref() {
-            layer.setContentsScale(scale);
-        }
     }
 
     pub(crate) fn show(&self) {
@@ -198,7 +203,6 @@ impl NativeWindow {
             self.seen_scale = factor;
             self.scale = scale;
             self.view.set_scale(factor);
-            self.update_layer_scale(factor);
             if let Some(window) = app.window_mut(self.id) {
                 window.set_scale(scale);
             }

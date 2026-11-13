@@ -2403,6 +2403,15 @@ impl App {
         }
     }
 
+    /// 轮询每个窗口的 render 线程反馈（macOS 窗口路径；设备丢失/编码失败在这里冒泡）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn poll_renderers(&mut self) -> Result<(), EngineError> {
+        for window in self.windows.values_mut() {
+            window.poll_renderer()?;
+        }
+        Ok(())
+    }
+
     // ── P06：完整帧（styles → text → layout → layout_text → paint → commit）────────
 
     /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
