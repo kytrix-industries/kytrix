@@ -34,19 +34,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 架构（模块与依赖方向）
 
-| 模块 | 职责 |
-|---|---|
+| 模块             | 职责                                                                                                                 |
+|------------------|----------------------------------------------------------------------------------------------------------------------|
 | `app` / `window` | `Application`（三平台事件循环入口）、`App`（状态表 + 依赖图 + 窗口集合 + runtime 句柄）、`Window` / `FrameScheduler` |
-| `node` | `NodeId`（带代际）/ `NodeTree` / `Signal`+`Derived` / 依赖图 / 脏位 |
-| `layout` | taffy `LayoutPartialTree` 适配、measure、命中测试 |
-| `text` | Parley 塑形、字形光栅（skrifa/swash）、字形图集、`ShapedLine` 缓存、行内流 |
-| `paint` | `Color`/`ColorResolver`、8 类 `Primitive`、`Scene`/lane、`GpuPrimitive` 编码、`Canvas`、`Geometry` |
-| `render` | 共享层（图集分配器 / damage / retire / timer）+ 三平台后端（按 `cfg` 编译期选定一份） |
-| `platform` | 三平台窗口/事件/IME/剪贴板/DPI/AT-SPI/NSAccessibility/UIA |
-| `resources` | `ResourceCache`：字节 → PNG/JPEG/WebP 解码 → 线性预乘 sRGB BGRA8 → 图片图集 tile |
-| `a11y` | AccessKit 数据模型、节点树映射、Action 分发、诊断 |
-| `interaction` | 焦点 / 滚动 / 虚拟列表 / 浮层 / 拖拽 / 动画 |
-| `test_support` | **仅 `test-support`**：`TestApp` / `Probe` / `FrameRecord` / 像素快照 / 诊断（不进发布物） |
+| `node`           | `NodeId`（带代际）/ `NodeTree` / `Signal`+`Derived` / 依赖图 / 脏位                                                  |
+| `layout`         | taffy `LayoutPartialTree` 适配、measure、命中测试                                                                    |
+| `text`           | Parley 塑形、字形光栅（skrifa/swash）、字形图集、`ShapedLine` 缓存、行内流                                           |
+| `paint`          | `Color`/`ColorResolver`、8 类 `Primitive`、`Scene`/lane、`GpuPrimitive` 编码、`Canvas`、`Geometry`                   |
+| `render`         | 共享层（图集分配器 / damage / retire / timer）+ 三平台后端（按 `cfg` 编译期选定一份）                                |
+| `platform`       | 三平台窗口/事件/IME/剪贴板/DPI/AT-SPI/NSAccessibility/UIA                                                            |
+| `resources`      | `ResourceCache`：字节 → PNG/JPEG/WebP 解码 → 线性预乘 sRGB BGRA8 → 图片图集 tile                                     |
+| `a11y`           | AccessKit 数据模型、节点树映射、Action 分发、诊断                                                                    |
+| `interaction`    | 焦点 / 滚动 / 虚拟列表 / 浮层 / 拖拽 / 动画                                                                          |
+| `test_support`   | **仅 `test-support`**：`TestApp` / `Probe` / `FrameRecord` / 像素快照 / 诊断（不进发布物）                           |
 
 依赖方向只向下：`app → (node, layout, text, paint, render, platform, resources, a11y, interaction)`；
 `render`/`platform` 内部按 `#[cfg]` 选定单一后端（无 trait / 无运行时枚举）。
@@ -55,12 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 测试分四层，**命令不同、覆盖不同**（混用会少测）：
 
-| 层 | 覆盖 | 命令 |
-|---|---|---|
-| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API | `cargo test -p kytrix_gui` ← **只跑这些** |
-| L2 | 帧记录 / 布局命中 / HUD 集成测试 | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features "hud,test-support" --test hud`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
-| L3 | 像素 golden（Windows WARP） | `cargo test -p kytrix_gui --features test-support --test snapshot` |
-| L4 | criterion 基准（非门禁） | `cargo bench -p kytrix_gui --bench perf --no-run` / `cargo bench -p kytrix_gui --bench perf` |
+| 层    | 覆盖                                   | 命令                                                                                                                                                                                                              |
+|-------|----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API | `cargo test -p kytrix_gui` ← **只跑这些**                                                                                                                                                                         |
+| L2    | 帧记录 / 布局命中 / HUD 集成测试       | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features "hud,test-support" --test hud`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
+| L3    | 像素 golden（Windows WARP）            | `cargo test -p kytrix_gui --features test-support --test snapshot`                                                                                                                                                |
+| L4    | criterion 基准（非门禁）               | `cargo bench -p kytrix_gui --bench perf --no-run` / `cargo bench -p kytrix_gui --bench perf`                                                                                                                      |
 
 ```powershell
 # 全部（L0–L3）：注意 `--features test-support`，否则集成测试不会编译
@@ -98,15 +98,16 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 
 - demo 现在覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
   焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显 +
-  `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、
-  **无障碍**（AccessKit 角色 / 名称 / `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、
-  **滚动列表**。`--snapshot` 会先 `Scene::preview` 播种一套可截图的组合态（含内联组合串）。
+  `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、 **无障碍**（AccessKit 角色 / 名称 /
+  `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、 **滚动列表**。`--snapshot` 会先 `Scene::preview`
+  播种一套可截图的组合态（含内联组合串）。
 - **Debug HUD**（`design/phase-17-debug-hud.md`）：demo 默认启用 `kytrix_gui` 的 `hud` feature，
   右上角显示 FPS / 帧时间 / CPU/GPU/Draw / Upload/Present / 分辨率/DPI/后端；F12 隐藏/显示。
   `--snapshot` 不安装 HUD；`cargo run -p kytrix_gui_demo --no-default-features` 构建无 HUD demo。
 - demo 的集成测试（`cargo test -p kytrix_gui_demo`）用 dev-dependency 的 `kytrix_gui/test-support`
   跑无 GPU 帧驱动 + a11y 快照，与主二进制无关。
-- demo 自己的门禁：`cargo test -p kytrix_gui_demo` + `cargo +nightly clippy -p kytrix_gui_demo --all-targets --all-features -- -D warnings`。
+- demo 自己的门禁：`cargo test -p kytrix_gui_demo` +
+  `cargo +nightly clippy -p kytrix_gui_demo --all-targets --all-features -- -D warnings`。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - 缺 shader 工具链时设 `KYTRIX_GUI_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
 - 交叉 target：`cargo check -p kytrix_gui --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
@@ -115,13 +116,13 @@ cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\dem
 
 ## 文档与偏差入口
 
-| 文档 | 内容 |
-|---|---|
-| `../../custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量） |
-| `../../design/phase-01…17-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
-| `../../design/DEVIATIONS.md` | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里 |
-| `../../AGENTS.md` | 仓库纪律（模块/测试/错误/依赖） |
-| `src/render/shaders/contract.md` | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |
+| 文档                                 | 内容                                                              |
+|--------------------------------------|-------------------------------------------------------------------|
+| `design/custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量）                                 |
+| `../../design/phase-01…17-*.md`      | 每个实施阶段的详细设计（本 crate 的实现规格）                     |
+| `design/DEVIATIONS.md`               | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里        |
+| `../../AGENTS.md`                    | 仓库纪律（模块/测试/错误/依赖）                                   |
+| `src/render/shaders/contract.md`     | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |
 
 **偏差纪律**：任何与 `design/*` 不同的实现选择，必须先在 `design/DEVIATIONS.md` 追加条目
 （`F-xxx` 事实偏差 / `S-xxx` 实现纪律 / `V-xx` 待复核），再改代码；不写「以后再说」的兼容层。

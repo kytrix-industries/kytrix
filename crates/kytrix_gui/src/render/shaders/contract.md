@@ -9,23 +9,23 @@
 4. 触发像素快照回归（主设计 I8）。
 
 `crates/kytrix_gui/build.rs` 会在**每次构建**时比对本文件的锚点与三套源码的结构体/常量，漂移即构建失败（见
-`design/phase-07-shaders.md` §6）。设计依据：主设计 §2.3/§2.11/§5.4/§5.8、P01 §7（AA）、P02 §8/§9/§10、P06 §7。
+`../../../design/phase-07-shaders.md` §6）。设计依据：主设计 §2.3/§2.11/§5.4/§5.8、P01 §7（AA）、P02 §8/§9/§10、P06 §7。
 
 ---
 
 ## 1. `GpuPrimitive`：128 B / 16 B 对齐
 
-| offset | 字节 | 字段 | 类型 | 语义 |
-|---|---|---|---|---|
-| **0** | 16 | `bounds` | `[f32;4]` / `float4` / `vec4` | `x, y, w, h`：SDF 图元为**物理像素、未取整浮点**；图集图元为**整数矩形的浮点表示** |
-| 16 | 16 | `corner_radius` | 同上 | `tl, tr, br, bl`（物理像素，逐角 `<= min(w,h)/2`，编码器已 clamp） |
-| 32 | 16 | `color0` | 同上 | **linear premultiplied** sRGB RGBA：实色 / 渐变起色 / 阴影色 / 字形色 / 图片调制色 |
-| 48 | 16 | `color1` | 同上 | 渐变终色 **或** 边框色（互斥）；无则全 0 |
-| 64 | 16 | `params0` | 同上 | `border_width, shadow_blur, gradient_kind, aa_padding`（物理像素） |
-| 80 | 16 | `params1` | 同上 | `clip_index, texture_index, kind, flags`（**整数编码进 f32**） |
-| 96 | 16 | `uv` | 同上 | 图集 tile `u0, v0, u1, v1`（归一化，**用边**，无半纹素偏移） |
-| 112 | 16 | `clip_rect` | 同上 | clip 链**交集 AABB**（物理浮点，`x, y, w, h`） |
-| **128** | — | **总计** | — | `size_of == 128`、`align_of == 16`、8 个 `offset_of!` 断言（已落地 `paint/instance.rs`） |
+| offset  | 字节 | 字段            | 类型                          | 语义                                                                                     |
+|---------|------|-----------------|-------------------------------|------------------------------------------------------------------------------------------|
+| **0**   | 16   | `bounds`        | `[f32;4]` / `float4` / `vec4` | `x, y, w, h`：SDF 图元为**物理像素、未取整浮点**；图集图元为**整数矩形的浮点表示**       |
+| 16      | 16   | `corner_radius` | 同上                          | `tl, tr, br, bl`（物理像素，逐角 `<= min(w,h)/2`，编码器已 clamp）                       |
+| 32      | 16   | `color0`        | 同上                          | **linear premultiplied** sRGB RGBA：实色 / 渐变起色 / 阴影色 / 字形色 / 图片调制色       |
+| 48      | 16   | `color1`        | 同上                          | 渐变终色 **或** 边框色（互斥）；无则全 0                                                 |
+| 64      | 16   | `params0`       | 同上                          | `border_width, shadow_blur, gradient_kind, aa_padding`（物理像素）                       |
+| 80      | 16   | `params1`       | 同上                          | `clip_index, texture_index, kind, flags`（**整数编码进 f32**）                           |
+| 96      | 16   | `uv`            | 同上                          | 图集 tile `u0, v0, u1, v1`（归一化，**用边**，无半纹素偏移）                             |
+| 112     | 16   | `clip_rect`     | 同上                          | clip 链**交集 AABB**（物理浮点，`x, y, w, h`）                                           |
+| **128** | —    | **总计**        | —                             | `size_of == 128`、`align_of == 16`、8 个 `offset_of!` 断言（已落地 `paint/instance.rs`） |
 
 硬约束：
 
@@ -42,15 +42,15 @@
 
 ## 2. `kind` / `texture_index` / `gradient_kind` / `flags`
 
-| `kind` | 值 | 产生者 | FS 分支 |
-|---|---|---|---|
-| `KIND_QUAD` | **0** | `Primitive::Quad` | SDF + 实色/渐变/边框 |
-| `KIND_GLYPH` | **1** | `Primitive::GlyphRun`（每字形 1 实例） | `color0 × texel.r` |
-| `KIND_IMAGE` | **2** | `Primitive::Image` | `texel × color0` |
-| `KIND_SHADOW` | **3** | `Primitive::Shadow` | SDF + erf 解析阴影 |
-| 保留 | 4 | — | Path 两阶段 coverage（v1 不用，F-26） |
-| 保留 | 5 | — | Geometry 实例化表达（v1 走 geometry 通道） |
-| 保留 | 6–7 | — | 应用自定义（v1 不做，F-29） |
+| `kind`        | 值    | 产生者                                 | FS 分支                                    |
+|---------------|-------|----------------------------------------|--------------------------------------------|
+| `KIND_QUAD`   | **0** | `Primitive::Quad`                      | SDF + 实色/渐变/边框                       |
+| `KIND_GLYPH`  | **1** | `Primitive::GlyphRun`（每字形 1 实例） | `color0 × texel.r`                         |
+| `KIND_IMAGE`  | **2** | `Primitive::Image`                     | `texel × color0`                           |
+| `KIND_SHADOW` | **3** | `Primitive::Shadow`                    | SDF + erf 解析阴影                         |
+| 保留          | 4     | —                                      | Path 两阶段 coverage（v1 不用，F-26）      |
+| 保留          | 5     | —                                      | Geometry 实例化表达（v1 走 geometry 通道） |
+| 保留          | 6–7   | —                                      | 应用自定义（v1 不做，F-29）                |
 
 `texture_index`：`TEXTURE_GLYPH = 0`（R8 覆盖度图集）、`TEXTURE_IMAGE = 1`（BGRA8 sRGB 图集）。
 `gradient_kind`：`NONE = 0`、`HORIZONTAL = 1`、`VERTICAL = 2`、`RADIAL = 3`。
@@ -66,14 +66,14 @@ shader **不使用** `FLAG_OPAQUE`：它只供 P09 选「无混合管线变体�
 
 ## 3. 颜色空间与混合（唯一转换点）
 
-| 项 | 约定 |
-|---|---|
-| 输入 | `color0`/`color1` 是 **linear sRGB、alpha 已预乘**（`LinearPremulRgba`）；shader **不做** sRGB→linear、**不做**预乘 |
-| 计算 | 全程 linear；SDF AA、边框、渐变、阴影、clip mask 都在 linear premultiplied 空间相乘/相加 |
-| 输出 | 片元输出 **linear premultiplied RGBA**，写进 **sRGB 格式**的渲染目标：D3D12 `*_UNORM_SRGB` / Metal `*.bgra8Unorm_srgb` / Vulkan `*_SRGB` |
-| 编码 | linear→sRGB 由目标格式在写回时完成**一次**；混合发生在编码前的 linear 值上 |
-| 禁止 | shader 内 `pow(x, 2.2)` / `pow(x, 1/2.2)` / 手写 sRGB 曲线；对 R8 字形图集声明 sRGB 格式；对 sRGB 纹理再手动解码 |
-| 函数锚点 | `apply_gamma(linear)` 在 v1 是**恒等函数**（`return c;`）：编码点只有目标格式一处 |
+| 项       | 约定                                                                                                                                     |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------|
+| 输入     | `color0`/`color1` 是 **linear sRGB、alpha 已预乘**（`LinearPremulRgba`）；shader **不做** sRGB→linear、**不做**预乘                      |
+| 计算     | 全程 linear；SDF AA、边框、渐变、阴影、clip mask 都在 linear premultiplied 空间相乘/相加                                                 |
+| 输出     | 片元输出 **linear premultiplied RGBA**，写进 **sRGB 格式**的渲染目标：D3D12 `*_UNORM_SRGB` / Metal `*.bgra8Unorm_srgb` / Vulkan `*_SRGB` |
+| 编码     | linear→sRGB 由目标格式在写回时完成**一次**；混合发生在编码前的 linear 值上                                                               |
+| 禁止     | shader 内 `pow(x, 2.2)` / `pow(x, 1/2.2)` / 手写 sRGB 曲线；对 R8 字形图集声明 sRGB 格式；对 sRGB 纹理再手动解码                         |
+| 函数锚点 | `apply_gamma(linear)` 在 v1 是**恒等函数**（`return c;`）：编码点只有目标格式一处                                                        |
 
 blend state（三平台逐字相同）：
 
@@ -87,14 +87,14 @@ write_mask = R | G | B | A
 
 ## 4. 函数集（三套源码同名同语义）
 
-| 函数 | 语义（逐字实现） |
-|---|---|
-| `sd_rounded_rect(p, half_size, radii)` | 按象限取半径；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r` |
-| `aa_coverage(d)` | `w = max(fwidth(d), 1e-5); saturate(0.5 - d / w)`（1 px 解析 AA，`d` 单位 = 物理像素） |
-| `analytic_shadow(d, blur)` | `σ = max(blur/3, 0.35)`；`0.5 × (1 − erf(d / (σ√2)))`；`erf` 用 Abramowitz–Stegun 7.1.26 |
+| 函数                                        | 语义（逐字实现）                                                                                                    |
+|---------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `sd_rounded_rect(p, half_size, radii)`      | 按象限取半径；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r`                            |
+| `aa_coverage(d)`                            | `w = max(fwidth(d), 1e-5); saturate(0.5 - d / w)`（1 px 解析 AA，`d` 单位 = 物理像素）                              |
+| `analytic_shadow(d, blur)`                  | `σ = max(blur/3, 0.35)`；`0.5 × (1 − erf(d / (σ√2)))`；`erf` 用 Abramowitz–Stegun 7.1.26                            |
 | `gradient_eval(kind, p, half_size, c0, c1)` | 线性 `(p.x+hx)/(2hx)`；垂直 `(p.y+hy)/(2hy)`；径向 `length(p)/min(hx,hy)`；`saturate(t)` 后 `lerp`（premultiplied） |
-| `clip_mask(world_px, clip_index)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链 ≤ 8 层，`m *= aa_coverage(sd_rounded_rect(...))` |
-| `apply_gamma(c)` | v1 恒等（见 §3） |
+| `clip_mask(world_px, clip_index)`           | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链 ≤ 8 层，`m *= aa_coverage(sd_rounded_rect(...))`                          |
+| `apply_gamma(c)`                            | v1 恒等（见 §3）                                                                                                    |
 
 `fwidth` 纪律：只在**实例级一致**的分支里调用（`kind` / `border_width` / `clip_index` 都是逐实例常量）。因此
 `clip_mask` **不做**逐片元 AABB 早退；被完全裁掉的实例由顶点着色器的 `clip_rect` 夹紧退化成零面积四边形解决。
@@ -117,10 +117,10 @@ world_px = lerp(lo, hi, corner01)        // corner01 ∈ {0,1}²
 
 坐标：用户空间恒为**左上原点、Y 向下、物理像素**；`z = 0, w = 1`。
 
-| API | NDC |
-|---|---|
+| API           | NDC                            |
+|---------------|--------------------------------|
 | D3D12 / Metal | `(x·2/w_px − 1, 1 − y·2/h_px)` |
-| Vulkan | `(x·2/w_px − 1, y·2/h_px − 1)` |
+| Vulkan        | `(x·2/w_px − 1, y·2/h_px − 1)` |
 
 FS **不依赖** `SV_Position` 的像素中心约定：片元只用插值出来的 `local_px` / `world_px`。
 
@@ -133,37 +133,37 @@ uber-quad 无顶点缓冲：`SV_VertexID` / `vertex_id` / `gl_VertexIndex` 取 4
 `RootUniform`：`frame` @ 0（32 B）+ `draw` @ 32（80 B）。三平台各一个常量槽位（D3D12 root constants `b0` /
 Metal `buffer(2)` / Vulkan push constants `[0, 112)`）。
 
-| offset | 字段 | 语义 |
-|---|---|---|
-| 0 | `frame.viewport` | `(w_px, h_px, 2/w_px, 2/h_px)` |
-| 16 | `frame.params` | `(scale, 0, 0, 0)`；**只**用于 geometry 的逻辑→物理换算 |
-| 32 | `draw.basis` | `(m11, m12, m21, m22)`；`x' = m11·x + m21·y + tx`、`y' = m12·x + m22·y + ty` |
-| 48 | `draw.translation` | `(tx, ty, 0, 0)` |
-| 64 | `draw.color0` | linear premultiplied（`Ui` 的填充色 / `Textured` 的调制色） |
-| 80 | `draw.clip_rect` | 该 draw 的 clip 交集 AABB（物理浮点，`x,y,w,h`） |
-| 96 | `draw.clip` | `.x = clip_index`（0 = 无裁剪），`.yzw` 保留恒 0 |
+| offset | 字段               | 语义                                                                         |
+|--------|--------------------|------------------------------------------------------------------------------|
+| 0      | `frame.viewport`   | `(w_px, h_px, 2/w_px, 2/h_px)`                                               |
+| 16     | `frame.params`     | `(scale, 0, 0, 0)`；**只**用于 geometry 的逻辑→物理换算                      |
+| 32     | `draw.basis`       | `(m11, m12, m21, m22)`；`x' = m11·x + m21·y + tx`、`y' = m12·x + m22·y + ty` |
+| 48     | `draw.translation` | `(tx, ty, 0, 0)`                                                             |
+| 64     | `draw.color0`      | linear premultiplied（`Ui` 的填充色 / `Textured` 的调制色）                  |
+| 80     | `draw.clip_rect`   | 该 draw 的 clip 交集 AABB（物理浮点，`x,y,w,h`）                             |
+| 96     | `draw.clip`        | `.x = clip_index`（0 = 无裁剪），`.yzw` 保留恒 0                             |
 
 `ClipEntry`（P09 从 CPU `ClipChain` 转换上传；**表项 0 恒为哨兵**）：
 
-| offset | 字段 | 语义 |
-|---|---|---|
-| 0 | `rect` | 本层 clip `x, y, w, h`（物理像素） |
-| 16 | `corner_radius` | `tl, tr, br, bl`（物理像素） |
-| 32 | `meta` | `.x = parent`（0 = 无裁剪），`.yzw` 保留恒 0 |
+| offset | 字段            | 语义                                         |
+|--------|-----------------|----------------------------------------------|
+| 0      | `rect`          | 本层 clip `x, y, w, h`（物理像素）           |
+| 16     | `corner_radius` | `tl, tr, br, bl`（物理像素）                 |
+| 32     | `meta`          | `.x = parent`（0 = 无裁剪），`.yzw` 保留恒 0 |
 
 **哨兵陷阱**：CPU 表项 0 的 `aabb = [f32::MIN, f32::MIN, f32::MAX, f32::MAX]` 按其 `(x,y,w,h)` 语义算出的右/下边界是
 `MIN+MAX = 0`，**不是**无穷大矩形。任何对 `clip_rect` 的算术都必须在 `clip_index != 0` 时进行；表项 0 不得被读取。
 
 ## 7. 绑定表与管线状态
 
-| 逻辑资源 | D3D12 | Metal | Vulkan |
-|---|---|---|---|
+| 逻辑资源                  | D3D12                                 | Metal                                      | Vulkan                                    |
+|---------------------------|---------------------------------------|--------------------------------------------|-------------------------------------------|
 | `instances`（128 B 步进） | SRV `t0`（`StructureByteStride=128`） | `device const GpuPrimitive* [[buffer(0)]]` | set 0 binding 0，std430 `readonly buffer` |
-| `clips`（48 B 步进） | SRV `t1` | `[[buffer(1)]]` | binding 1，std430 |
-| `root`（112 B） | root constants `b0`（28 DWORD） | `[[buffer(2)]]` | push constants `[0, 112)` |
-| glyph 图集（R8） | SRV `t2` | `[[texture(0)]]` | binding 4（combined `sampler2D`） |
-| image 图集（BGRA8 sRGB） | SRV `t3` | `[[texture(1)]]` | binding 5（combined `sampler2D`） |
-| sampler | static `s0` | `[[sampler(0)]]` | 同上 |
+| `clips`（48 B 步进）      | SRV `t1`                              | `[[buffer(1)]]`                            | binding 1，std430                         |
+| `root`（112 B）           | root constants `b0`（28 DWORD）       | `[[buffer(2)]]`                            | push constants `[0, 112)`                 |
+| glyph 图集（R8）          | SRV `t2`                              | `[[texture(0)]]`                           | binding 4（combined `sampler2D`）         |
+| image 图集（BGRA8 sRGB）  | SRV `t3`                              | `[[texture(1)]]`                           | binding 5（combined `sampler2D`）         |
+| sampler                   | static `s0`                           | `[[sampler(0)]]`                           | 同上                                      |
 
 采样器：`FILTER = LINEAR`、`ADDRESS = CLAMP_TO_EDGE`、无 mip（`LOD = 0`）、无比较、无各向异性。
 
@@ -177,20 +177,20 @@ Metal `buffer(2)` / Vulkan push constants `[0, 112)`）。
 
 geometry 顶点布局（P02 §9.4 冻结）：
 
-| pipeline | stride | 布局 |
-|---|---|---|
-| `Ui` | 8 B | `position: float2`（逻辑像素） |
-| `Textured { atlas }` | 16 B | `position: float2` + `uv: float2`（归一化到对应图集页） |
+| pipeline             | stride | 布局                                                    |
+|----------------------|--------|---------------------------------------------------------|
+| `Ui`                 | 8 B    | `position: float2`（逻辑像素）                          |
+| `Textured { atlas }` | 16 B   | `position: float2` + `uv: float2`（归一化到对应图集页） |
 
 ## 8. 图集采样
 
-| 项 | 约定 |
-|---|---|
-| UV | `AtlasTile::uv()` 的**边**约定；**不加**半纹素偏移；三平台纹理原点都是左上、v 向下，**不做 v 翻转** |
-| glyph 图集 | `R8_UNORM`（线性覆盖度，**非** sRGB）；`out = color0 × texel.r`（4 分量同乘） |
-| image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0` |
-| 纹理视图 | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
-| 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`） |
+| 项         | 约定                                                                                                                                           |
+|------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| UV         | `AtlasTile::uv()` 的**边**约定；**不加**半纹素偏移；三平台纹理原点都是左上、v 向下，**不做 v 翻转**                                            |
+| glyph 图集 | `R8_UNORM`（线性覆盖度，**非** sRGB）；`out = color0 × texel.r`（4 分量同乘）                                                                  |
+| image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0`                                                         |
+| 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
+| 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`）                         |
 
 ## 9. 禁止项
 
