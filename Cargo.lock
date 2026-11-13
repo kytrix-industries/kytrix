@@ -5687,49 +5687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kytrix_gui"
-version = "0.0.3"
-dependencies = [
- "accesskit 0.25.2",
- "accesskit_macos 0.27.2",
- "accesskit_unix 0.24.1",
- "accesskit_windows 0.35.2",
- "ahash",
- "ash",
- "bitflags 2.13.2",
- "bytemuck",
- "bytes",
- "calloop",
- "calloop-wayland-source",
- "color",
- "criterion",
- "dispatch2",
- "etagere 0.3.0",
- "fontique",
- "image",
- "lyon",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation 0.3.2",
- "objc2-metal 0.3.2",
- "objc2-quartz-core 0.3.2",
- "parley",
- "skrifa 0.44.0",
- "smallvec",
- "smol_str",
- "swash",
- "taffy",
- "thiserror 2.0.21",
- "tokio",
- "wayland-client",
- "wayland-protocols",
- "windows 0.62.2",
- "xkbcommon 0.9.0",
-]
-
-[[package]]
 name = "kytrix_proto"
 version = "0.1.0"
 source = "git+https://github.com/kytrix-industries/kytrix_proto?rev=fdb7d2b533c7737773aa5e0e7cb254dcc190f64b#fdb7d2b533c7737773aa5e0e7cb254dcc190f64b"
@@ -10531,6 +10488,49 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui_core"
+version = "0.0.3"
+dependencies = [
+ "accesskit 0.25.2",
+ "accesskit_macos 0.27.2",
+ "accesskit_unix 0.24.1",
+ "accesskit_windows 0.35.2",
+ "ahash",
+ "ash",
+ "bitflags 2.13.2",
+ "bytemuck",
+ "bytes",
+ "calloop",
+ "calloop-wayland-source",
+ "color",
+ "criterion",
+ "dispatch2",
+ "etagere 0.3.0",
+ "fontique",
+ "image",
+ "lyon",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "parley",
+ "skrifa 0.44.0",
+ "smallvec",
+ "smol_str",
+ "swash",
+ "taffy",
+ "thiserror 2.0.21",
+ "tokio",
+ "wayland-client",
+ "wayland-protocols",
+ "windows 0.62.2",
+ "xkbcommon 0.9.0",
 ]
 
 [[package]]

@@ -1,0 +1,155 @@
+[package]
+name = "ui_core"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[features]
+# 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle/诊断）。**不进发布物**（I7 / §6.6）；
+# 集成测试 `tests/frame_record.rs` 与 `tests/snapshot.rs` 通过 `required-features` 依赖它。
+test-support = []
+# P17：内置 Debug HUD（`App::set_debug_hud`）。默认关闭；example `demo` 显式 `--features hud` 打开。
+hud = []
+
+# P18：原 `ui_core_demo` crate 并入为 example。`demo` 是可运行窗口；`snapshot_demo`
+# 与它共用 `examples/demo/scene*`，离屏截图需要引擎的测试基建。
+[[example]]
+name = "demo"
+path = "examples/demo/main.rs"
+# 显式 example 的 test 默认是 false；不写 true 时 `cargo test --example demo` 会跑 0 项。
+test = true
+
+[[example]]
+name = "snapshot_demo"
+path = "examples/demo/snapshot.rs"
+required-features = ["test-support"]
+# 默认 cargo test 只跑 demo 的共享测试副本；--all-targets 仍会跑两个 example。
+test = false
+
+[[test]]
+name = "frame_record"
+path = "tests/frame_record.rs"
+required-features = ["test-support"]
+
+# P13：像素 golden（Windows WARP；mac/Linux 由 `skip_reason()` 跳过）。
+[[test]]
+name = "snapshot"
+path = "tests/snapshot.rs"
+required-features = ["test-support"]
+
+# P14：L1 布局/命中的跨模块集成断言（`TestApp` + `Probe`）。
+[[test]]
+name = "layout"
+path = "tests/layout.rs"
+required-features = ["test-support"]
+
+# P17：Debug HUD 的公开 API / 命中穿透 / 持续帧 / 500 ms 汇总。
+[[test]]
+name = "hud"
+path = "tests/hud.rs"
+required-features = ["hud", "test-support"]
+
+# P13：L4 基准（criterion 自带 harness）。
+[[bench]]
+name = "perf"
+path = "benches/perf.rs"
+harness = false
+
+[dev-dependencies]
+# P13：只测 CPU 侧 pass。workspace 已关掉 criterion 的默认 features（无 plotters/rayon，S-130）。
+criterion = { workspace = true }
+# P14：`tests/layout.rs` 构造 taffy 样式（`Style.inner` 的公开类型；已在依赖图内，不加包）。
+taffy = { workspace = true }
+
+[dependencies]
+# P01 实际使用
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+
+# P02 颜色 / 绘制契约
+bitflags = { workspace = true }
+bytes = { workspace = true }
+bytemuck = { workspace = true }
+color = { workspace = true }
+lyon = { workspace = true }
+
+# P03 节点 / 状态 / 容器
+ahash = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true }
+
+# P05 布局 / P06 文本
+fontique = { workspace = true }
+parley = { workspace = true }
+skrifa = { workspace = true }
+swash = { workspace = true }
+taffy = { workspace = true }
+
+# P09 渲染共享层
+etagere = { workspace = true }
+
+# P13 资源解码（workspace 已钉 0.25.10；六个 codec feature 已在 base_ui 的依赖图内）
+image = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    # 窗口 / 事件 / DPI / IME
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    # D3D12 / DXGI
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+accesskit = { workspace = true }
+accesskit_windows = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-quartz-core = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
+accesskit = { workspace = true }
+accesskit_macos = { workspace = true }
+# metallib 加载：MTLDevice::newLibraryWithData:error: 收 DispatchData（已在 Cargo.lock，零新 crate）
+dispatch2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+accesskit = { workspace = true }
+accesskit_unix = { workspace = true }
+ash = { workspace = true }
+calloop = { workspace = true }
+calloop-wayland-source = { workspace = true }
+wayland-client = { workspace = true, features = ["system"] }
+wayland-protocols = { workspace = true }
+xkbcommon = { workspace = true }
+
+[lints]
+workspace = true

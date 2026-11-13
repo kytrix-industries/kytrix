@@ -2,20 +2,20 @@ name: GUI CI
 
 # Engine-only gate. The product crates (`crates/kytrix`, `base_ui`, …) still depend on
 # `gpui-*` and are not buildable off Windows yet (M8 scope), so every command here is
-# scoped to `-p kytrix_gui`.
+# scoped to `-p ui_core`.
 #
 # Not yet proven on hosted runners: this file has only been syntax-checked locally.
 # First green run must be recorded in design/DEVIATIONS.md V-102.
 on:
   push:
     paths:
-      - "crates/kytrix_gui/**"
+      - "../../crates/ui_core/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/gui-ci.yml"
   pull_request:
     paths:
-      - "crates/kytrix_gui/**"
+      - "../../crates/ui_core/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/gui-ci.yml"
@@ -74,23 +74,23 @@ jobs:
           "KYTRIX_DXC=$($dxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Test (unit)
-        run: cargo test -p kytrix_gui
+        run: cargo test -p ui_core
 
       # Includes the demo example's 36 tests (23 unit + 13 scene, HUD + test-support).
       - name: "Test (test-support + HUD + demo)"
-        run: cargo test -p kytrix_gui --features "hud,test-support"
+        run: cargo test -p ui_core --features "hud,test-support"
 
       - name: Pixel goldens (WARP)
-        run: cargo test -p kytrix_gui --features test-support --test snapshot -- --nocapture
+        run: cargo test -p ui_core --features test-support --test snapshot -- --nocapture
 
       - name: Clippy
-        run: cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+        run: cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings
 
       - name: Format
-        run: cargo +nightly fmt -p kytrix_gui -- --check
+        run: cargo +nightly fmt -p ui_core -- --check
 
       - name: Benches compile
-        run: cargo bench -p kytrix_gui --bench perf --no-run
+        run: cargo bench -p ui_core --bench perf --no-run
 
   linux:
     name: linux (Vulkan / Wayland)
@@ -122,18 +122,18 @@ jobs:
             pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools fonts-noto-cjk
 
       - name: Test (unit)
-        run: cargo test -p kytrix_gui
+        run: cargo test -p ui_core
 
       # `--test snapshot` prints one `skip <case>: …` line per golden on non-Windows
       # (WARP-only baselines) and exits 0; see tests/golden/README.md.
       - name: Test (test-support)
-        run: cargo test -p kytrix_gui --features test-support
+        run: cargo test -p ui_core --features test-support
 
       - name: Clippy
-        run: cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+        run: cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings
 
       - name: Format
-        run: cargo +nightly fmt -p kytrix_gui -- --check
+        run: cargo +nightly fmt -p ui_core -- --check
 
   macos:
     name: macos (Metal)
@@ -157,13 +157,13 @@ jobs:
       # goldens are WARP-only and skip, but `snapshot_result_is_typed_per_platform`
       # asserts that the real Metal offscreen readback path still works.
       - name: Test (unit)
-        run: cargo test -p kytrix_gui
+        run: cargo test -p ui_core
 
       - name: Test (test-support)
-        run: cargo test -p kytrix_gui --features test-support
+        run: cargo test -p ui_core --features test-support
 
       - name: Clippy
-        run: cargo +nightly clippy -p kytrix_gui --all-targets --all-features -- -D warnings
+        run: cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings
 
       - name: Format
-        run: cargo +nightly fmt -p kytrix_gui -- --check
+        run: cargo +nightly fmt -p ui_core -- --check
