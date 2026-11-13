@@ -51,8 +51,8 @@ impl MacA11y {
             });
         }
         let actions = MacActions { dispatcher, window };
-        // SAFETY: `pointer` 指向本窗口持有的 `GuiView`（`NativeWindow` 的生命周期覆盖 adapter）；
-        // 已确认在主线程，符合 `Adapter::new` 的文档要求。
+        // SAFETY: `pointer` 指向本窗口持有的 `GuiView`（`NativeWindow` 的生命周期覆盖 adapter），
+        // 且已确认在主线程 —— 这正是 `Adapter::new` 文档要求的两条前提。
         let adapter = unsafe { Adapter::new(pointer, false, actions) };
         Ok(Self {
             adapter,

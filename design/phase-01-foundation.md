@@ -1165,6 +1165,11 @@ cargo tree -p kytrix_gui -e normal | Select-String 'accesskit v|parley v|skrifa 
 | N16 | 采纳 | 记录 `clippy.toml` 的 `disallowed-methods` 属应用层 M8 范围；引擎 P08+ 禁用这两个 API，确需阻塞任务时在 M8 同批改写 lint | DEVIATIONS M-08 |
 | N17 | 采纳 | `Transform` 仅 2D；uniform 契约为两个 vec4（6 有效 + 2 padding）；删除 `Scale::is_integral`、`Edges::horizontal/vertical`、`Transform::is_identity`（无落点） | §6.3.2、§8.1-24、DEVIATIONS F-14 |
 
+> **注（P14）**：P01 早期表述里的「零 `unsafe`」门禁**已演进**为「`unsafe` 只允许出现在 FFI 边界
+> （`platform/**`、`render/{windows,macos,linux}/**`），且每块必须带 `// SAFETY:` 说明」——见
+> `design/DEVIATIONS.md` 的代码形态条目（如 S-xx / V-102 同批）。旧表述**不得**再作为审查失败依据；
+> 引擎自身的纯 Rust 层仍然零 `unsafe`。
+
 ---
 
 ## 附录 A：后续阶段 API 事实备忘录

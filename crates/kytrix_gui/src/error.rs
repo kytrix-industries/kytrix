@@ -93,6 +93,22 @@ pub enum EngineError {
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
 
+    /// clip 嵌套超过 `MAX_CLIP_DEPTH`（8 层，`design/phase-02-paint-foundation.md` §7.2）。
+    ///
+    /// paint 在 **release 也必须失败**：静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14
+    /// 审查）。唯一生产者是 `PaintPass`；触发后本帧中止，damage/dirty 保留待下一帧重试。
+    #[error(
+        "clip nesting at {node:?} reaches depth {depth}, exceeding the limit of {limit} levels"
+    )]
+    ClipDepthExceeded {
+        /// 触发越界的节点（自身或最近一层 `Clip::Bounds` 祖先）。
+        node: NodeId,
+        /// 需要的层数（`limit + 1`）。
+        depth: usize,
+        /// 上限（`paint::scene::MAX_CLIP_DEPTH`，8）。
+        limit: u8,
+    },
+
     /// 静态几何注册 / 查找失败（设计 §4.8）。首个生产者是 P08 的渲染层：
     /// `FrameOp::Geometry` 的 `GeometryId` 没有对应的 GPU 缓冲（`GeometryStore` 属 P09）。
     #[error("geometry registration failed: {detail}")]
@@ -190,6 +206,11 @@ mod tests {
             },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
+            },
+            EngineError::ClipDepthExceeded {
+                node: NodeId::for_test(6, 1),
+                depth: 9,
+                limit: 8,
             },
             EngineError::GeometryRegister {
                 detail: SmolStr::new_static("geometry id 0:0 has no GPU buffers"),

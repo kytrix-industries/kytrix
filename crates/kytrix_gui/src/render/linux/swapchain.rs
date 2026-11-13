@@ -18,6 +18,7 @@ const FRAMES: usize = crate::render::frame::MAX_FRAMES_IN_FLIGHT;
 
 /// swapchain + 每帧的 render-finished 信号量。
 pub(crate) struct Swapchain {
+    device: ash::Device,
     raw: vk::SwapchainKHR,
     fn_: ash::khr::swapchain::Device,
     images: Vec<vk::Image>,
@@ -130,6 +131,7 @@ impl Swapchain {
         }
 
         Ok(Self {
+            device: device.raw().clone(),
             raw,
             fn_,
             images,
@@ -265,6 +267,9 @@ impl Swapchain {
                 device.raw().destroy_semaphore(semaphore, None);
             }
         }
+        // `replacement` 的 Drop 只剩空句柄（信号量已经接管 / 旧句柄已销毁）。
+        replacement.acquire = vk::Semaphore::null();
+        replacement.render_finished = [vk::Semaphore::null(); FRAMES];
         self.raw = new_raw;
         self.images = new_images;
         self.format = replacement.format;
@@ -284,13 +289,20 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        // `resize` 会把被替换下来的句柄置空（句柄已交给新结构）。
-        if self.raw == vk::SwapchainKHR::null() {
-            return;
-        }
-        // SAFETY: 句柄归本结构独占；`Renderer::drop` 先 `wait_idle`。
+        // `resize` 会把被替换下来的句柄置空（句柄已交给新结构，或已就地销毁）。
+        // SAFETY: 句柄归本结构独占；`Renderer::drop` 先 `queue_wait_idle`，`resize` 也先等空闲。
         unsafe {
-            self.fn_.destroy_swapchain(self.raw, None);
+            if self.raw != vk::SwapchainKHR::null() {
+                self.fn_.destroy_swapchain(self.raw, None);
+            }
+            if self.acquire != vk::Semaphore::null() {
+                self.device.destroy_semaphore(self.acquire, None);
+            }
+            for semaphore in self.render_finished {
+                if semaphore != vk::Semaphore::null() {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
+            }
         }
     }
 }

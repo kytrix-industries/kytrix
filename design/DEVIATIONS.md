@@ -2244,3 +2244,25 @@
 | `compare` 在 release 静默少比 | 新增 `GoldenError::Malformed`，长度不符返回**显式错误**（不再用 `debug_assert`）；新增 `compare_rejects_a_malformed_buffer_in_every_profile` |
 | LUT 测试采样太少 | 全 256×256 组合逐一对比标量公式；另加 `premultiply_fast_paths_are_byte_exact` |
 | `DependencyGraph::dump` 路径与文档不符 | 实际是 `DependencyGraph::dependents()`（`cfg test-support`）+ `diagnostics::dependency_dump`；文档 §4.3 / §11.3 已同步 |
+
+---
+
+## 十九、P14 · 文档与交付修复（2026-11-13）
+
+| 编号 | 条目 | 内容 |
+|---|---|---|
+| **S-132** | `test_support/oracle.rs` **并入 `app.rs`**（无独立文件） | P01 §3 的文件树写的是 `test_support/{probe,frame_record,snapshot,oracle}.rs`。实际落地**没有** `oracle.rs`：oracle 的两个入口 `TestApp::oracle_diff` / `TestApp::assert_oracle` 直接写在 `test_support/app.rs`。理由：①oracle 必须独占调用 `Window::force_full_repaint` 再逐 lane 比较，天然属于 `TestApp` 的职责；②拆独立文件会把 `impl TestApp` 劈成两处，违反 `multiple_inherent_impl = forbid`；③独立文件只会多一层 `pub(crate)` 转发。P13 附录 B 已按「取消」记录，本条是**唯一权威登记** |
+| **S-133** | **`tests/layout.rs`（L1 跨模块集成）** | 新增 `crates/kytrix_gui/tests/layout.rs`（`required-features = ["test-support"]`），4 个用例：flex 行/列主轴位置、固定尺寸 + padding、命中测试回退到父节点、滚动偏移后的命中。与 `src/layout/**` 的内联单测互补：内联单测测 taffy 适配器与 `hit_test` 纯函数，这里测「挂树 → 布局 → `Probe`」整链。`taffy` 因此同时成为 dev-dependency（`workspace = true`，无新增包） |
+| **V-102** | **L3 平台策略 + CI 三平台 job 待补** | ①**L3（像素 golden）v1 只认 Windows WARP**：macOS 的 `new_offscreen` 能真读回但没有可用 golden 基线（`metal-real/` 尚未产出），Linux 的 `new_offscreen` 在构造期即返回 `UnsupportedGpu`（F-137）。因此 `test_support::snapshot::skip_reason()` 在非 Windows 返回原因，`tests/snapshot.rs` 每个 case 打印一行 `skip <case>: …` 并 **exit 0**（不是失败，也不是静默）。跨设备容差量化仍按 **V-95** 推进。②`.github/workflows/gui-ci.yml` 已写出 windows / ubuntu / macos 三个 job（本地只做了 YAML 语法 + 结构校验，**未在 runner 上跑过**）；首次三平台全绿后回填本条，并把 golden 扩到 `metal-real/` |
+
+**同批文档修复（无编号）**：`crates/kytrix_gui/README.md` 的测试命令改为**分层**（`cargo test -p kytrix_gui` 只跑 L0/L1 单测；L2/L3 必须 `--features test-support`，含 `--test frame_record` / `--test layout` / `--test snapshot`），并补齐 release、bench、`UPDATE_GOLDEN=1`、demo 运行命令与依赖状态说明（引擎子树零 `gpui-*`，产品侧仍未迁移，M8 范围外）；`design/phase-01-foundation.md` §11 加注「unsafe 门禁已演进为 FFI-only + SAFETY」。
+
+---
+
+## 二十、P14 终审 · 实例编码与 clip 深度（2026-11-13）
+
+| 编号 | 条目 | 内容 |
+|---|---|---|
+| **F-149** | **`GpuPrimitive.clip_rect` 的语义修正为契约的 `(x, y, w, h)`** | P06 编码器把内部 `ClipChain.aabb`（`(x0, y0, x1, y1)`，为求交方便）直接写进了 `clip_rect`，而 `contract.md` §2/§5 与三套 shader 按 `clip_rect.xy` + `clip_rect.zw` 读 `(x, y, w, h)`。原点为 0 的 clip 恰好两种表示相同，**负原点 clip（`Canvas::push_clip` 允许）会把右/下内容裁掉**。修复：`FrameEncoder::clip_rect()` 在写入前做 `(x0, y0, x1−x0, y1−y0)`，无裁剪哨兵保持不变（`clip_index == 0` 时 shader 不读）。空交集产生负 `w/h` 是合法的，shader 用 `max(clip_rect.zw, 0)` 夹成零面积。回归：`negative_origin_clip_encodes_xywh`（scale=2、负原点，断言物理 `(-20, -10, 40, 40)`，旧实现为 `(-20, -10, 20, 30)`） |
+| **F-150** | **`EngineError::ClipDepthExceeded`：clip 嵌套 > `MAX_CLIP_DEPTH`（8）在 release 也硬失败** | P06 的 `paint_node` 只是把祖先前缀 `Scene::push` 进去；`Lane::push` 的上限只有 `debug_assert`，release 下第 9 层会把最外层丢掉 ⇒ 子内容越界可见。现在 `PaintPass::run` / `Window::paint_frame` 返回 `Result`，超限返回 `{ node, depth, limit }`；`Window::frame` / `App::frame` 中止本帧（不提交、`FrameIndex` 不变）。这是 P01 §6.2.2 冻结表之外的**新增变体**（与 `NotScrollable`/`UnknownWindow` 同类，按 F-xxx 登记，表本身不回填）。回归：`clip_depth_over_limit_is_an_error`（9 层 → `node` = 最内层、`depth == 9`）、`clip_depth_at_limit_is_allowed`（8 层正常）；`error.rs::all_variants` 同步 |
+| **V-103** | clip 深度硬失败的可用性边界 | `MAX_CLIP_DEPTH` 仍与三套 shader 的固定数组长度绑定为 **8**；超过 8 层的合法 UI 现在会**整帧失败**（而不是错画），应用只能自行展平嵌套（把多层 clip 合并成一层 AABB 或裁剪子树）。P14 的三平台 goldens 没有覆盖 >8 层；若真实应用触达，需在 P15 评估「paint 侧把多余 clip 折叠进上一层 AABB」的降级路径（本轮按审查要求选择硬失败，不做静默降级） |

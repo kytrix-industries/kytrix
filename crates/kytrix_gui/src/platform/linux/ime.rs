@@ -5,7 +5,7 @@
 
 use smol_str::SmolStr;
 
-use crate::event::ImeEvent;
+use crate::{event::ImeEvent, platform::ime::CommitDeduper};
 
 /// 一个窗口的 IME 状态（主线程独占；由 `WaylandState` 持有）。
 #[derive(Debug, Default)]
@@ -14,8 +14,8 @@ pub(crate) struct ImeState {
     pending_preedit: Option<Option<String>>,
     /// `done` 之前的 commit。
     pending_commit: Option<String>,
-    /// 上一次生效的 commit（去重：GNOME 的部分版本会重复发）。
-    last_commit: SmolStr,
+    /// 提交去重（同一批 `done` 内的重复回调才吞；跨批的相同文本是合法输入）。
+    dedupe: CommitDeduper,
     /// 当前是否处于组合态。
     composing: bool,
 }
@@ -27,6 +27,8 @@ impl ImeState {
 
     pub(crate) fn note_preedit(&mut self, text: Option<String>) {
         self.pending_preedit = Some(text);
+        // 新的组合串开始 ⇒ 下一次提交是新的内容。
+        self.dedupe.reset();
     }
 
     pub(crate) fn note_commit(&mut self, text: Option<String>) {
@@ -38,9 +40,9 @@ impl ImeState {
         let mut events = Vec::with_capacity(2);
         if let Some(commit) = self.pending_commit.take() {
             self.composing = false;
-            let next = SmolStr::new(commit.as_str());
-            if !commit.is_empty() && next != self.last_commit {
-                self.last_commit = next;
+            // 一次 `done` = 一批提交；批内的重复才吞掉（GNOME 的部分版本会重复发）。
+            self.dedupe.begin_key();
+            if self.dedupe.note(commit.as_str()) {
                 events.push(ImeEvent::Commit(SmolStr::new(commit)));
             }
         }

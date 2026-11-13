@@ -169,6 +169,7 @@ struct LostInfo {
 impl Device {
     /// 产品路径：第一个非软件 DXGI 适配器 → D3D12 设备 → 采 caps → 校验 D8。
     pub(crate) fn new() -> Result<Self, EngineError> {
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .map_err(|error| init_error_from("CreateDXGIFactory2", error))?;
         let adapter = pick_hardware_adapter(&factory)?;
@@ -178,8 +179,10 @@ impl Device {
     /// test / CI：WARP 设备（不编译进发布物；D8 的软件回退禁令由 `cfg` 保证）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_warp() -> Result<Self, EngineError> {
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .map_err(|error| init_error_from("CreateDXGIFactory2", error))?;
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter() }
             .map_err(|error| init_error_from("EnumWarpAdapter", error))?;
         let adapter: IDXGIAdapter1 = adapter
@@ -191,12 +194,14 @@ impl Device {
     fn from_adapter(adapter: &IDXGIAdapter1, warp: bool) -> Result<Self, EngineError> {
         enable_dred();
         let mut device: Option<ID3D12Device> = None;
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }
             .map_err(|error| init_error_from("D3D12CreateDevice", error))?;
         let raw = device.ok_or_else(|| EngineError::AppInit {
             detail: SmolStr::new_static("d3d12 D3D12CreateDevice returned no device"),
         })?;
 
+        // SAFETY: `unsafe fn` 契约由调用点保证：设备刚创建且适配器存活。
         let caps = unsafe { collect_caps(&raw, adapter, warp) };
         caps.check()?;
         debug_assert!(
@@ -234,6 +239,7 @@ impl Device {
                 },
             },
         };
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             self.raw
                 .CreateRenderTargetView(resource, Some(&desc), handle)
@@ -264,6 +270,7 @@ impl Device {
         if self.lost.is_some() {
             return self.lost_error();
         }
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let reason = match unsafe { self.raw.GetDeviceRemovedReason() } {
             Ok(()) => return None,
             Err(error) => error.code(),
@@ -295,6 +302,7 @@ impl Device {
         let mut body = String::from("kytrix d3d12 device removed diagnostics\n");
         match self.raw.cast::<ID3D12DeviceRemovedExtendedData>() {
             Ok(dred) => {
+                // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
                 match unsafe { dred.GetAutoBreadcrumbsOutput() } {
                     Ok(output) => {
                         let _ = std::fmt::write(
@@ -312,6 +320,7 @@ impl Device {
                         );
                     }
                 }
+                // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
                 match unsafe { dred.GetPageFaultAllocationOutput() } {
                     Ok(output) => {
                         let _ = std::fmt::write(
@@ -343,8 +352,10 @@ impl Device {
 fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, EngineError> {
     let mut index = 0u32;
     loop {
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         match unsafe { factory.EnumAdapters1(index) } {
             Ok(adapter) => {
+                // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
                 let desc = unsafe { adapter.GetDesc1() }
                     .map_err(|error| init_error_from("GetDesc1", error))?;
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
@@ -366,9 +377,11 @@ fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, Engin
 /// 在建设备**之前**打开 DRED（breadcrumbs + page fault）；接口不可用时静默跳过。
 fn enable_dred() {
     let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+    // SAFETY: 调试层接口是可选能力：本机缺 SDK 组件时返回错误并被跳过。
     if unsafe { D3D12GetDebugInterface(&mut settings) }.is_ok()
         && let Some(settings) = settings
     {
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             settings.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             settings.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
@@ -378,6 +391,7 @@ fn enable_dred() {
 
 /// 采集 D8 检测项（顺序与主设计 §2.2 的 8 项表一致；每项失败都只填默认值）。
 unsafe fn collect_caps(device: &ID3D12Device, adapter: &IDXGIAdapter1, warp: bool) -> GpuCaps {
+    // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
     let desc = unsafe { adapter.GetDesc1() }.unwrap_or_default();
     let name_len = desc
         .Description
@@ -576,6 +590,7 @@ mod tests {
             VisibleNodeMask: 1,
         };
         let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             device.raw().CreateCommittedResource(
                 &heap,

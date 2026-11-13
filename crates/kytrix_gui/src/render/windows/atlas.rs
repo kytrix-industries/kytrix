@@ -33,7 +33,8 @@ pub(crate) const ATLAS_PAGE: u32 = 2048;
 ///
 /// 一次 `record_uploads` 里的多条 `CopyTextureRegion` 都在同一提交、同一个 staging 上，
 /// **不能分块复用同一个缓冲**（后面的 CPU 写入会覆盖前面的内容，GPU 执行时读到的全是最后一块
-/// —— V-64 的根因）。因此一次上传的每一行都必须在 staging 里各有位置。
+/// —— V-64 的根因）。因此一次上传的每一行都必须在 staging 里各有位置：容量按**本次上传的
+/// 总行数**保证，各段按累计行偏移落位。
 const STAGING_ROWS: u32 = 256;
 
 const PITCH_ALIGNMENT: u32 = 256;
@@ -41,13 +42,24 @@ const PITCH_ALIGNMENT: u32 = 256;
 /// 一张图集纹理 + 每 in-flight 槽的 staging。
 struct AtlasTexture {
     resource: ID3D12Resource,
-    /// 每槽一块 staging；容量按**本次上传的最大行数**增长（见 [`STAGING_ROWS`]）。
+    /// 每槽一块 staging；容量按**该槽本次上传的总行数**增长（见 [`STAGING_ROWS`]）。
     staging: Vec<ID3D12Resource>,
-    /// 当前 staging 能容纳的行数。
-    staging_rows: u32,
+    /// **每个 in-flight 槽**当前的 staging 行数容量。
+    ///
+    /// 必须是按槽的数组：只记一个全局值会让「槽 0 已扩容到 N 行、槽 1 仍是 256 行」时
+    /// 槽 1 的写入越界（V-64 的第二个根因）。
+    staging_rows: [u32; MAX_FRAMES_IN_FLIGHT],
     page: u32,
     row_pitch: u32,
     texel_bytes: u32,
+}
+
+/// 一次 staging 写入的行区间：源页起点、staging 起点、行数。
+#[derive(Clone, Copy)]
+struct Chunk {
+    source_row: u32,
+    staging_row: u32,
+    rows: u32,
 }
 
 /// 待上传的一页内容（整页 `pixels` + 脏行区间）。
@@ -146,7 +158,7 @@ impl AtlasTexture {
         Ok(Self {
             resource,
             staging,
-            staging_rows: STAGING_ROWS,
+            staging_rows: [STAGING_ROWS; MAX_FRAMES_IN_FLIGHT],
             page,
             row_pitch,
             texel_bytes: texel,
@@ -176,11 +188,25 @@ impl AtlasTexture {
             pending.rows.spans()
         };
         // 每一段必须在 staging 里**各有位置**：同一 staging 上先写后画的多次拷贝会在 GPU 执行时
-        // 读到最后一块的字节（V-64）。
+        // 读到最后一块的字节（V-64）。因此先按本帧所有段的**总行数**保证容量，再按累计行偏移
+        // 把各段顺序落位。
+        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
+        self.ensure_staging(device, slot, total_rows)?;
+        let mut staging_row = 0;
         for span in spans {
             let rows = span.end - span.start;
-            self.ensure_staging(device, slot, rows)?;
-            self.upload_chunk(list, slot, kind, pending, span.start, rows)?;
+            self.upload_chunk(
+                list,
+                slot,
+                kind,
+                pending,
+                Chunk {
+                    source_row: span.start,
+                    staging_row,
+                    rows,
+                },
+            )?;
+            staging_row += rows;
         }
 
         barrier(
@@ -192,46 +218,51 @@ impl AtlasTexture {
         Ok(())
     }
 
-    /// 保证第 `slot` 个 staging 能容纳 `rows` 行（不够就重建；一次性扩容，之后复用）。
+    /// 保证第 `slot` 个 staging 能容纳 `rows` 行（不够就重建；扩容后该槽复用）。
+    ///
+    /// 只改**这一个槽**的容量记录：其它槽的缓冲没有变大，必须继续按自己的容量判断（V-64）。
     fn ensure_staging(
         &mut self,
         device: &Device,
         slot: usize,
         rows: u32,
     ) -> Result<(), EngineError> {
-        if rows <= self.staging_rows {
+        if rows <= self.staging_rows[slot] {
             return Ok(());
         }
         let bytes = u64::from(self.row_pitch) * u64::from(rows);
         let staging = create_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD)?;
         self.staging[slot] = staging;
-        self.staging_rows = rows;
+        self.staging_rows[slot] = rows;
         Ok(())
     }
 
+    /// 把一段行写进 staging 的指定起点，并录制一次拷贝。
     fn upload_chunk(
         &self,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
         kind: AtlasKind,
         pending: &PendingUpload,
-        start: u32,
-        rows: u32,
+        chunk: Chunk,
     ) -> Result<(), EngineError> {
         let staging = &self.staging[slot];
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `staging[slot]` 由 `ensure_staging` 保证容量 ≥ 本帧总行数；
+        // `staging_row + rows` 不超过该容量，源页由 `queue_upload` 的 debug_assert 保证尺寸。
         unsafe { staging.Map(0, None, Some(&mut pointer)) }
             .map_err(|error| init_error_from("Map(atlas staging)", error))?;
-        // SAFETY: staging 容量 = row_pitch * STAGING_ROWS，`rows <= STAGING_ROWS`；
-        // 源页由 `queue_upload` 的 debug_assert 保证尺寸。
+        // SAFETY: COM `QueryInterface` 转换：源接口非空且存活，失败以 `Result` 返回。
         unsafe {
-            for row in 0..rows {
-                let source_row = start + row;
+            for row in 0..chunk.rows {
+                let source_row = chunk.source_row + row;
                 let source = pending
                     .pixels
                     .as_ptr()
                     .add((source_row * self.page * self.texel_bytes) as usize);
-                let destination = pointer.cast::<u8>().add((row * self.row_pitch) as usize);
+                let destination = pointer
+                    .cast::<u8>()
+                    .add(((chunk.staging_row + row) * self.row_pitch) as usize);
                 std::ptr::copy_nonoverlapping(
                     source,
                     destination,
@@ -239,14 +270,16 @@ impl AtlasTexture {
                 );
             }
         }
+        // SAFETY: 映射区间在 `Map`/`Unmap` 之间独占使用，写入已完成。
         unsafe { staging.Unmap(0, None) };
 
         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-            Offset: 0,
+            // 每段各自的行偏移（同一 staging 上多段不能再共用 offset 0，否则 GPU 只读到末段）。
+            Offset: u64::from(chunk.staging_row) * u64::from(self.row_pitch),
             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                 Format: texture_format(kind),
                 Width: self.page,
-                Height: rows,
+                Height: chunk.rows,
                 Depth: 1,
                 RowPitch: self.row_pitch,
             },
@@ -266,7 +299,7 @@ impl AtlasTexture {
             },
         };
         // SAFETY: 两个 location 与 `placed` 在调用期间有效，行区间已由 `DirtyRows` 保证在页内。
-        unsafe { list.CopyTextureRegion(&destination, 0, start, 0, &source, None) };
+        unsafe { list.CopyTextureRegion(&destination, 0, chunk.source_row, 0, &source, None) };
         // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
         unsafe {
             core::mem::ManuallyDrop::drop(&mut destination.pResource);
@@ -386,6 +419,7 @@ fn create_resource(
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.raw().CreateCommittedResource(
             &heap,
@@ -476,5 +510,143 @@ mod tests {
         let page = vec![0x7Fu8; (TEST_PAGE * TEST_PAGE) as usize];
         atlas.queue_upload(AtlasKind::Glyph, &page, rows);
         assert!(atlas.has_pending());
+    }
+    /// staging 容量必须**按 in-flight 槽**记录（V-64）。
+    ///
+    /// 场景：槽 0 先做「字形整页」（512 行 > `STAGING_ROWS`）把该槽扩容到 512 行；随后槽 1 做
+    /// 「图片整页」（同样 512 行）。若容量是全局单值，槽 1 会按 512 行的记录跳过扩容，进而把
+    /// 512×2048 B 写进只有 256×2048 B 的缓冲 —— 堆越界写。
+    const BIG_PAGE: u32 = 512;
+
+    #[test]
+    fn cross_slot_staging_capacity_is_per_slot() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        use windows::Win32::Graphics::{
+            Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM},
+        };
+
+        use crate::render::windows::{queue::Queue, readback::Readback};
+
+        let device = Device::new_warp().expect("WARP device");
+        let mut queue = Queue::new(&device).expect("queue");
+        let mut atlas = AtlasTextures::new(&device, BIG_PAGE).expect("atlas");
+
+        // 槽 0：字形整页（512 行）。
+        let glyph = vec![0x11u8; (BIG_PAGE * BIG_PAGE) as usize];
+        let mut rows = DirtyRows::default();
+        rows.mark(0, BIG_PAGE);
+        atlas.queue_upload(AtlasKind::Glyph, &glyph, rows);
+        queue
+            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
+            .expect("glyph upload");
+
+        // 槽 1：图片整页（512 行 × 4 B；行 pitch 2048）。
+        let mut image = vec![0u8; (BIG_PAGE * BIG_PAGE * 4) as usize];
+        for texel in image.as_chunks_mut::<4>().0 {
+            *texel = [0x33, 0x44, 0x55, 0xFF];
+        }
+        let mut rows = DirtyRows::default();
+        rows.mark(0, BIG_PAGE);
+        atlas.queue_upload(AtlasKind::Image, &image, rows);
+        queue
+            .submit_immediate(|list| atlas.record_uploads(&device, list, 1))
+            .expect("image upload");
+
+        // 两个独立的读回器：R8 与 BGRA8 的行 pitch 不同（`Readback` 按尺寸/格式缓存）。
+        let mut glyph_readback = Readback::new();
+        let glyph_image = glyph_readback
+            .capture_from(
+                &device,
+                &mut queue,
+                atlas.texture(AtlasKind::Glyph),
+                (BIG_PAGE, BIG_PAGE),
+                DXGI_FORMAT_R8_UNORM,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )
+            .expect("glyph readback");
+        let glyph_row = |row: u32| glyph_image.rgba8[(row * BIG_PAGE * 4) as usize];
+        assert_eq!(glyph_row(0), 0x11, "glyph row 0");
+        assert_eq!(glyph_row(BIG_PAGE - 1), 0x11, "glyph last row");
+
+        let mut image_readback = Readback::new();
+        let image_image = image_readback
+            .capture_from(
+                &device,
+                &mut queue,
+                atlas.texture(AtlasKind::Image),
+                (BIG_PAGE, BIG_PAGE),
+                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )
+            .expect("image readback");
+        let image_row = |row: u32| {
+            let index = (row * BIG_PAGE * 4) as usize;
+            [
+                image_image.rgba8[index],
+                image_image.rgba8[index + 1],
+                image_image.rgba8[index + 2],
+                image_image.rgba8[index + 3],
+            ]
+        };
+        assert_eq!(image_row(0), [0x55, 0x44, 0x33, 0xFF], "image row 0");
+        assert_eq!(
+            image_row(BIG_PAGE - 1),
+            [0x55, 0x44, 0x33, 0xFF],
+            "image last row"
+        );
+    }
+
+    /// 多脏段必须各自落位：每段写到 staging 自己的行偏移，`CopyTextureRegion` 的
+    /// `PlacedFootprint.Offset` 也必须跟着走（V-64；旧的「全部写 offset 0」会让两段都读到末段）。
+    #[test]
+    fn multi_span_upload_places_each_span_at_its_own_offset() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        use windows::Win32::Graphics::{
+            Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+        };
+
+        use crate::render::windows::{queue::Queue, readback::Readback};
+
+        let device = Device::new_warp().expect("WARP device");
+        let mut queue = Queue::new(&device).expect("queue");
+        let mut atlas = AtlasTextures::new(&device, BIG_PAGE).expect("atlas");
+
+        let mut page = vec![0u8; (BIG_PAGE * BIG_PAGE) as usize];
+        for row in 10..20 {
+            let start = (row * BIG_PAGE) as usize;
+            page[start..start + BIG_PAGE as usize].fill(0x44);
+        }
+        for row in 300..320 {
+            let start = (row * BIG_PAGE) as usize;
+            page[start..start + BIG_PAGE as usize].fill(0x55);
+        }
+        let mut rows = DirtyRows::default();
+        rows.mark(10, 20);
+        rows.mark(300, 320);
+        atlas.queue_upload(AtlasKind::Glyph, &page, rows);
+        queue
+            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
+            .expect("upload");
+
+        let mut readback = Readback::new();
+        let image = readback
+            .capture_from(
+                &device,
+                &mut queue,
+                atlas.texture(AtlasKind::Glyph),
+                (BIG_PAGE, BIG_PAGE),
+                DXGI_FORMAT_R8_UNORM,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )
+            .expect("readback");
+        let row = |row: u32| image.rgba8[(row * BIG_PAGE * 4) as usize];
+        assert_eq!(row(0), 0, "untouched row before the first span");
+        assert_eq!(row(15), 0x44, "first span content");
+        assert_eq!(row(100), 0, "gap between the spans stays untouched");
+        assert_eq!(row(299), 0, "row before the second span");
+        assert_eq!(row(305), 0x55, "second span content");
+        assert_eq!(row(511), 0, "untouched row after the last span");
     }
 }

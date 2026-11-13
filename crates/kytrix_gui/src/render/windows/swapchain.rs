@@ -51,6 +51,7 @@ impl Swapchain {
         let desc = swap_chain_desc(size);
         let window = HWND(hwnd as *mut core::ffi::c_void);
         let raw: IDXGISwapChain1 =
+            // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
             unsafe { factory.CreateSwapChainForHwnd(queue.raw(), window, &desc, None, None) }
                 .map_err(|error| EngineError::UnsupportedGpu {
                     os: "windows",
@@ -64,6 +65,7 @@ impl Swapchain {
     }
 
     fn validate(raw: IDXGISwapChain1, size: (u32, u32)) -> Result<Self, EngineError> {
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let actual = unsafe { raw.GetDesc1() }
             .map_err(|error| init_error_from("SwapChain::GetDesc1", error))?;
         if actual.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || actual.BufferCount < 2 {
@@ -97,7 +99,9 @@ impl Swapchain {
             .raw
             .cast()
             .map_err(|error| init_error_from("cast IDXGISwapChain3", error))?;
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let index = unsafe { chain.GetCurrentBackBufferIndex() };
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe { self.raw.GetBuffer(index) }.map_err(|error| EngineError::Swapchain {
             detail: smol_str::format_smolstr!(
                 "GetBuffer({index}): {:#010X}",
@@ -131,6 +135,7 @@ impl Swapchain {
             pScrollRect: std::ptr::null_mut(),
             pScrollOffset: std::ptr::null_mut(),
         };
+        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let hr = unsafe { self.raw.Present1(sync, DXGI_PRESENT(0), &params) };
         if hr.is_ok() {
             frame.presented();
@@ -148,6 +153,7 @@ impl Swapchain {
 
     /// `ResizeBuffers(0,0,0,UNKNOWN,0)`：调用前必须已有 `queue.wait_idle()` 且不持有 back buffer 引用。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             self.raw.ResizeBuffers(
                 0,
@@ -186,6 +192,7 @@ fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
 }
 
 fn create_factory() -> Result<IDXGIFactory4, EngineError> {
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| init_error_from("CreateDXGIFactory2", error))
 }

@@ -1695,6 +1695,13 @@ cargo tree -p kytrix_gui -e normal --depth 1
 | N3 `App::frame` 中止 | 所有失败分支（含窗口查找失败）都 `abort_frame`，不把调度器留在 `Draining` |
 | N1 补测 | `resize_forces_full_damage`、`text_glyphs_use_border_and_padding_offset`、`image_maps_to_atlas_quad`、`settle_frame` 的 A11Y 保留断言、`background_and_border` 的 damage 非空断言；集成侧 `assert_oracle()` 真正调用、`FrameOutcome` 断言改为「首帧 Committed / 次帧 Idle」 |
 
+### 17.1 P14 终审追加（2026-11-13）
+
+| 条目 | 修订 |
+|---|---|
+| **`clip_rect` 语义** | `GpuPrimitive.clip_rect` 必须写契约的 `(x, y, w, h)`（`contract.md` §2、`quad.vert.glsl` 的 `.xy` + `.zw`），不再直接写内部 `aabb` 的 `(x0, y0, x1, y1)`；负原点 clip 曾因此裁掉右/下内容。见 DEVIATIONS **F-149**，回归 `negative_origin_clip_encodes_xywh` |
+| **clip 深度 > 8** | `PaintPass::run` / `Window::paint_frame` 改为 `Result`：超限返回新增的 `EngineError::ClipDepthExceeded { node, depth, limit }`（release 也失败，不再静默丢最外层）；`Window::frame` / `App::frame` 中止本帧。见 **F-150** / **V-103**，回归 `clip_depth_over_limit_is_an_error` + `clip_depth_at_limit_is_allowed` |
+
 ---
 
 *文档完 · 本文只描述 Phase 06 的 CPU 侧实现与契约；不含 GPU 资源、平台翻译与像素快照设备。*

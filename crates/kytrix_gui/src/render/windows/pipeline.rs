@@ -101,8 +101,10 @@ impl Pipeline {
         let geometry_ps_image = shader(GEOMETRY_PS_IMAGE, "geometry.ps_textured_image.dxil")?;
         let geometry_ps_glyph = shader(GEOMETRY_PS_GLYPH, "geometry.ps_textured_glyph.dxil")?;
 
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let root_signature = unsafe { build_root_signature(device) }?;
 
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let quad = unsafe {
             create_pipeline_state(
                 device,
@@ -114,6 +116,7 @@ impl Pipeline {
             )
         }?;
         let ui_layout = [input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0)];
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let geometry_ui = unsafe {
             create_pipeline_state(
                 device,
@@ -128,6 +131,7 @@ impl Pipeline {
             input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0),
             input_element(c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 0, 8),
         ];
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let geometry_image = unsafe {
             create_pipeline_state(
                 device,
@@ -138,6 +142,7 @@ impl Pipeline {
                 Some(&textured_layout),
             )
         }?;
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let geometry_glyph = unsafe {
             create_pipeline_state(
                 device,
@@ -149,6 +154,7 @@ impl Pipeline {
             )
         }?;
 
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let srv_heap: ID3D12DescriptorHeap = unsafe {
             device
                 .raw()
@@ -160,6 +166,7 @@ impl Pipeline {
                 })
         }
         .map_err(|error| init_error_from("CreateDescriptorHeap(CBV_SRV_UAV)", error))?;
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let descriptor_size = unsafe {
             device
                 .raw()
@@ -203,6 +210,7 @@ impl Pipeline {
 
     /// 某槽的 4-SRV 表基址（root parameter 1 的描述符表起点）。
     pub(crate) fn slot_table(&self, slot: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
         let base = unsafe { self.srv_heap.GetGPUDescriptorHandleForHeapStart() };
         D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: base.ptr + u64::from(self.descriptor_size) * (slot * SLOT_SRVS) as u64,
@@ -223,6 +231,7 @@ impl Pipeline {
         // `NumElements = 0` 的 SRV 非法（本机实测会让设备丢失）：空帧至少给 1 个元素。
         let instances_srv = buffer_srv(instance_count.max(1), 128);
         let clips_srv = buffer_srv(clip_count.max(1), 48);
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             device.raw().CreateShaderResourceView(
                 instances,
@@ -246,6 +255,7 @@ impl Pipeline {
         let srv = texture_srv(kind);
         for slot in 0..SLOT_COUNT {
             let index = slot * SLOT_SRVS + offset;
+            // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
             unsafe {
                 device
                     .raw()
@@ -255,6 +265,7 @@ impl Pipeline {
     }
 
     fn cpu_handle(&self, index: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
         let base = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: base.ptr + (self.descriptor_size * index as u32) as usize,
@@ -369,6 +380,7 @@ unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, E
 
     let mut blob: Option<ID3DBlob> = None;
     let mut error_blob: Option<ID3DBlob> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         D3D12SerializeRootSignature(
             &desc,
@@ -381,10 +393,12 @@ unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, E
     let blob = blob.ok_or_else(|| EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("d3d12 SerializeRootSignature returned no blob"),
     })?;
+    // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
     let bytes = unsafe {
         std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
     };
     let _ = error_blob;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe { device.raw().CreateRootSignature(0, bytes) }
         .map_err(|error| init_error_from("CreateRootSignature", error))
 }
@@ -543,7 +557,9 @@ impl GeometryRegistry {
     ) -> Result<(), EngineError> {
         let vertex = upload_buffer(device, vertex_bytes)?;
         let index = upload_buffer(device, index_bytes)?;
+        // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
         let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
+        // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
         let index_location = unsafe { index.GetGPUVirtualAddress() };
         let vertex_handle = device.allocate(vertex);
         let index_handle = device.allocate(index);
@@ -603,6 +619,7 @@ fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, En
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.raw().CreateCommittedResource(
             &heap,
@@ -618,9 +635,12 @@ fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, En
         detail: smol_str::SmolStr::new_static("d3d12 CreateCommittedResource returned no resource"),
     })?;
     let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
     unsafe { resource.Map(0, None, Some(&mut pointer)) }
         .map_err(|error| init_error_from("Map(upload)", error))?;
+    // SAFETY: COM `QueryInterface` 转换：源接口非空且存活，失败以 `Result` 返回。
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len()) };
+    // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
     unsafe { resource.Unmap(0, None) };
     Ok(resource)
 }

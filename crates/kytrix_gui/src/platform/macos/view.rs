@@ -84,24 +84,24 @@ define_class!(
         fn key_down(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
             let modifiers = self.modifiers();
-            // **IME 先**：输入法可能吞掉这个键（组合/提交走 NSTextInputClient 回调），
-            // 之后再看是否还要发普通 `Key`（与 Win32 的 TranslateMessage → WM_KEYDOWN 顺序一致）。
+            // 新按键边界：同一按键内的重复 `insertText:` 才去重（`"ll"` / 双空格必须都能进）。
+            self.ivars().ime.borrow_mut().begin_key();
+            // **IME 先**：输入法可能吞掉这个键（组合/提交走 NSTextInputClient 回调）。
             if let Some(context) = self.inputContext() {
                 context.handleEvent(event);
             }
             let composing = self.ivars().ime.borrow().has_marked();
-            // `insertText:` 刚提交过 ⇒ 本键的 `characters` 就是同一段文本，不能再发一次。
+            // 本键的正文是否已经由 IME 交付（`insertText:` 真的发出过 `Commit`）。
             let commit_consumed = self.ivars().suppress_text.replace(false);
-            if !composing
-                && !commit_consumed
-                && let Some(key) = map_keycode(event.keyCode())
-            {
+            // `Key` **永不**被 IME 抑制：快捷键要能看到物理按键（与 Win32 一致）。
+            if let Some(key) = map_keycode(event.keyCode()) {
                 self.push_event(Event::Input(InputEvent::Key {
                     key,
                     state: KeyState::Down,
                     modifiers,
                 }));
             }
+            // `Text` 只在「正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
             if !composing
                 && !commit_consumed
                 && !modifiers.intersects(Modifiers::CONTROL | Modifiers::META)
@@ -248,8 +248,11 @@ define_class!(
         }
     }
 
+    // SAFETY: `NSTextInputClient` 的每个方法都是 AppKit 在主线程同步调用的；
+    // 实现里只碰 `ImeState` 与 view 的事件队列（都没有跨线程访问），签名由 objc2 编译期校验。
     unsafe impl NSTextInputClient for GuiView {
         #[unsafe(method(insertText:replacementRange:))]
+        // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；参数按 ObjC 约定保证非空。
         unsafe fn insert_text_replacement_range(&self, text: &AnyObject, _range: NSRange) {
             let value = object_text(text);
             if value.is_empty() {
@@ -257,19 +260,22 @@ define_class!(
             }
             let first = self.ivars().ime.borrow_mut().note_commit(&value);
             self.ivars().ime.borrow_mut().clear_marked();
-            // 这次按键的正文到这里就算消费掉了（`key_down` 不会再发 `Text`）。
-            self.ivars().suppress_text.set(true);
+            // 只有「真的交付了正文」才抑制本按键的 `Text`；重复回调（`first == false`）时
+            // 同一次按键的正文已经交付过，抑制标记仍然有效。
             if first {
+                self.ivars().suppress_text.set(true);
                 self.push_event(Event::Ime(ImeEvent::Commit(smol_str::SmolStr::new(value))));
             }
         }
 
         #[unsafe(method(doCommandBySelector:))]
+        // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；参数按 ObjC 约定保证非空。
         unsafe fn do_command_by_selector(&self, _selector: Sel) {
             // 命令选择器（方向键 / 回车等）已由 `keyDown:` 转成 `Key` 事件；这里吞掉。
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
+        // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；参数按 ObjC 约定保证非空。
         unsafe fn set_marked_text(&self, text: &AnyObject, selected: NSRange, _replacement: NSRange) {
             let value = object_text(text);
             let utf16: Vec<u16> = value.encode_utf16().collect();
@@ -314,6 +320,7 @@ define_class!(
         }
 
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
+        // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；`actualRange` 可为空或不写。
         unsafe fn attributed_substring(
             &self,
             _range: NSRange,
@@ -328,6 +335,7 @@ define_class!(
         }
 
         #[unsafe(method(firstRectForCharacterRange:actualRange:))]
+        // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；参数按 ObjC 约定保证非空。
         unsafe fn first_rect(&self, range: NSRange, actual: NonNull<NSRange>) -> NSRect {
             // `actualRange` 必须写回（不写会让输入法拿到未定义值）。
             // SAFETY: AppKit 传进来的 `actualRange` 指向本方法可写的 `NSRange`。

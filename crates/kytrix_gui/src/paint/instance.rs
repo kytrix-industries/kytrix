@@ -87,7 +87,8 @@ impl ClipChainId {
     }
 }
 
-/// 一层 clip（P02 §8.7）。`aabb` 是从根到本层的交集，写进 `GpuPrimitive.clip_rect`。
+/// 一层 clip（P02 §8.7）。`aabb` 是从根到本层的**交集**，内部按 `(x0, y0, x1, y1)` 存
+/// （求交方便）；写进 `GpuPrimitive.clip_rect` 前转成契约要求的 `(x, y, w, h)`。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClipChain {
     parent: Option<ClipChainId>,
@@ -505,8 +506,17 @@ impl FrameEncoder<'_> {
         (self.current_chain().0, self.clip_rect())
     }
 
+    /// 当前 clip 链交集，按 GPU 契约写成 `(x, y, w, h)`（`contract.md` §2 / `quad.vert.glsl`
+    /// 的 `clip_rect.xy` + `clip_rect.zw`）。无裁剪时给哨兵（shader 以 `clip_index == 0` 跳过）。
     fn clip_rect(&self) -> [f32; 4] {
-        self.chain_aabb(self.current_chain())
+        let chain = self.current_chain();
+        if chain == ClipChainId::NONE {
+            return [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+        }
+        let aabb = self.chain_aabb(chain);
+        // 内部 `aabb` 是 `(x0, y0, x1, y1)`（求交方便）；契约要 `(x, y, w, h)`。
+        // 空交集产生负 `w/h` 是合法的：shader 用 `max(clip_rect.zw, 0)` 夹成零面积。
+        [aabb[0], aabb[1], aabb[2] - aabb[0], aabb[3] - aabb[1]]
     }
 
     fn emit_quad(&mut self, quad: &crate::paint::primitive::Quad) {
@@ -765,6 +775,31 @@ mod tests {
         assert_eq!(instance.clip_rect, [f32::MIN, f32::MIN, f32::MAX, f32::MAX]);
         assert_eq!(instance.uv, [0.0; 4]);
         assert_eq!(instance.color1, [0.0; 4]);
+    }
+
+    #[test]
+    fn negative_origin_clip_encodes_xywh() {
+        // 回归：clip_rect 必须按 contract.md / quad.vert.glsl 的 `(x, y, w, h)` 写，
+        // 而不是内部 AABB 的 `(x0, y0, x1, y1)`——否则负原点 clip 会把右/下内容裁掉。
+        let mut canvas = crate::paint::canvas::Canvas::new(rect(0.0, 0.0, 100.0, 100.0));
+        assert!(canvas.push_clip(ClipRect {
+            rect: rect(-10.0, -5.0, 20.0, 20.0),
+            corner_radius: [0.0; 4],
+        }));
+        canvas.push_quad(Quad {
+            bounds: rect(0.0, 0.0, 30.0, 30.0),
+            corner_radius: [0.0; 4],
+            paint: solid(),
+        });
+        assert!(canvas.pop_clip());
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, Primitive::Canvas(canvas)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        assert_eq!(instance.params1[0], 1.0, "clip_index 必须非 0");
+        // scale = 2.0 ⇒ 物理 (-20, -10, 40, 40)；旧实现会写成 (-20, -10, 20, 30)。
+        assert_eq!(instance.clip_rect, [-20.0, -10.0, 40.0, 40.0]);
     }
 
     #[test]

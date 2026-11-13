@@ -17,6 +17,8 @@ pub(crate) const ATLAS_PAGE: u32 = 2048;
 /// 一张图集页。
 struct AtlasTexture {
     image: vk::Image,
+    /// image 的设备内存（与 `image` 成对释放）。
+    memory: vk::DeviceMemory,
     view: vk::ImageView,
     sampler: vk::Sampler,
     staging: vk::Buffer,
@@ -199,6 +201,7 @@ impl AtlasTexture {
 
         Ok(Self {
             image,
+            memory,
             view,
             sampler,
             staging,
@@ -341,7 +344,9 @@ impl Drop for AtlasTextures {
             unsafe {
                 self.device.destroy_sampler(texture.sampler, None);
                 self.device.destroy_image_view(texture.view, None);
+                // Vulkan 要求先销毁 image，再释放它的内存。
                 self.device.destroy_image(texture.image, None);
+                self.device.free_memory(texture.memory, None);
                 self.device.destroy_buffer(texture.staging, None);
                 self.device.free_memory(texture.staging_memory, None);
             }

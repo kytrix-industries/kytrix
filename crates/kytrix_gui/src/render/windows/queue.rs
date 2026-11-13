@@ -45,6 +45,7 @@ impl Drop for Queue {
 
 impl Queue {
     pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let raw: ID3D12CommandQueue = unsafe {
             device.raw().CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -58,26 +59,31 @@ impl Queue {
         let mut allocators = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut lists = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
             let allocator: ID3D12CommandAllocator = unsafe {
                 device
                     .raw()
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
             }
             .map_err(|error| init_error_from("CreateCommandAllocator", error))?;
+            // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
             let list: ID3D12GraphicsCommandList = unsafe {
                 device
                     .raw()
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
             }
             .map_err(|error| init_error_from("CreateCommandList", error))?;
+            // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
             unsafe { list.Close() }.map_err(|error| init_error_from("Close", error))?;
             allocators.push(allocator);
             lists.push(list);
         }
 
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let fence: ID3D12Fence = unsafe { device.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }
             .map_err(|error| init_error_from("CreateFence", error))?;
         // `CreateEventW` 需要 `Win32_Security` feature（DEVIATIONS F-79）。
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表在提交前独占。
         let event = unsafe { CreateEventW(None, false, false, None) }
             .map_err(|error| init_error_from("CreateEventW", error))?;
 
@@ -97,9 +103,11 @@ impl Queue {
         let slot = self.ring.acquire(index);
         self.wait_for(slot.wait_value)?;
         let allocator = &self.allocators[slot.index];
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         unsafe { allocator.Reset() }
             .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
         let list = &self.lists[slot.index];
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { list.Reset(allocator, None) }
             .map_err(|error| init_error_from("CommandList::Reset", error))?;
         Ok(slot)
@@ -113,11 +121,14 @@ impl Queue {
     /// 关闭 → 执行 → `Signal` → 同步等待到达。
     pub(crate) fn submit(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
         let list = &self.lists[slot.index];
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
         let command_list: ID3D12CommandList = list
             .cast()
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.ExecuteCommandLists(&[Some(command_list)]) };
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.wait_for(slot.signal_value)?;
@@ -160,18 +171,23 @@ impl Queue {
     ) -> Result<(), EngineError> {
         self.wait_idle()?;
         let allocator = &self.allocators[0];
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         unsafe { allocator.Reset() }
             .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
         let list = &self.lists[0];
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { list.Reset(allocator, None) }
             .map_err(|error| init_error_from("CommandList::Reset", error))?;
         record(list)?;
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
         let command_list: ID3D12CommandList = list
             .cast()
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.ExecuteCommandLists(&[Some(command_list)]) };
         let value = self.ring.reserve();
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.Signal(&self.fence, value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.wait_for(value)
@@ -200,6 +216,7 @@ impl Queue {
     }
 
     pub(crate) fn timestamp_frequency(&self) -> Result<u64, EngineError> {
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         unsafe { self.raw.GetTimestampFrequency() }
             .map_err(|error| init_error_from("GetTimestampFrequency", error))
     }
@@ -209,9 +226,11 @@ impl Queue {
     }
 
     fn wait_for(&self, value: u64) -> Result<(), EngineError> {
+        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
         if value == 0 || unsafe { self.fence.GetCompletedValue() } >= value {
             return Ok(());
         }
+        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.fence.SetEventOnCompletion(value, self.event) }
             .map_err(|error| init_error_from("SetEventOnCompletion", error))?;
         let wait = unsafe { WaitForSingleObject(self.event, INFINITE) };
@@ -235,9 +254,11 @@ pub(crate) fn enable_debug_layer_once() {
         return;
     }
     let mut debug: Option<ID3D12Debug> = None;
+    // SAFETY: 调试层接口是可选能力：本机缺 SDK 组件时返回错误并被跳过。
     if unsafe { D3D12GetDebugInterface(&mut debug) }.is_ok()
         && let Some(debug) = debug
     {
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         unsafe { debug.EnableDebugLayer() };
     }
 }

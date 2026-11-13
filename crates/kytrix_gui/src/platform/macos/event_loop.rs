@@ -121,8 +121,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         // ② 阻塞等待：NSEvent 到达；唤醒源 / 动画定时器在 run loop 上执行泵。
         if let Some(event) = ns_app.nextEventMatchingMask_untilDate_inMode_dequeue(
             NSEventMask::Any,
-            // SAFETY: `NSDefaultRunLoopMode` 是 Foundation 的静态常量（进程生命周期内有效）。
             Some(&NSDate::distantFuture()),
+            // SAFETY: `NSDefaultRunLoopMode` 是 Foundation 的静态常量（进程生命周期内有效）。
             unsafe { NSDefaultRunLoopMode },
             true,
         ) {
@@ -237,6 +237,11 @@ fn frame_all(app: &mut App) -> Result<(), EngineError> {
 }
 
 /// 唤醒源的 `perform` 回调：主线程、run loop 上执行泵。
+///
+/// # Safety
+///
+/// 只由 CoreFoundation 调用：`info` 必须是 `run` 安装时传入的 `LoopState` 指针，且调用发生在
+/// 主线程、主线程正阻塞在 run loop 里（此时没有其它 `&mut App` 存活）。
 unsafe extern "C-unwind" fn pump_callback(info: *mut c_void) {
     if info.is_null() {
         return;
@@ -260,6 +265,10 @@ unsafe extern "C-unwind" fn pump_callback(info: *mut c_void) {
 }
 
 /// 动画定时器回调：与 `pump_callback` 同一份泵。
+///
+/// # Safety
+///
+/// 同 [`pump_callback`]：`info` 是 `run` 安装的 `LoopState` 指针，调用只在主线程发生。
 unsafe extern "C-unwind" fn timer_callback(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
     if info.is_null() {
         return;

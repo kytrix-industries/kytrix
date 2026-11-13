@@ -36,6 +36,7 @@ impl GpuTimer {
             return Ok(None);
         };
         let mut heap_out: Option<ID3D12QueryHeap> = None;
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         if unsafe {
             device.raw().CreateQueryHeap(
                 &D3D12_QUERY_HEAP_DESC {
@@ -67,6 +68,7 @@ impl GpuTimer {
 
     /// 帧起 timestamp（在列表开头调用）。
     pub(crate) fn begin(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             list.EndQuery(
                 &self.heap,
@@ -80,6 +82,7 @@ impl GpuTimer {
     pub(crate) fn end(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let index = (slot as u32) * TIMESTAMPS_PER_FRAME + 1;
         let resolve = &self.resolve[slot];
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
             list.ResolveQueryData(
@@ -97,12 +100,14 @@ impl GpuTimer {
     pub(crate) fn resolve(&self, slot: usize) -> Option<GpuTimerSample> {
         let buffer = &self.resolve[slot];
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
         unsafe { buffer.Map(0, None, Some(&mut pointer)) }.ok()?;
         // SAFETY: READBACK heap 的 16 B 映射区，两个 u64 由 `ResolveQueryData` 写入。
         let (start, end) = unsafe {
             let base = pointer.cast::<u64>();
             (*base, *base.add(1))
         };
+        // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
         unsafe { buffer.Unmap(0, None) };
         let ticks = end.wrapping_sub(start);
         Some(GpuTimerSample {
@@ -136,6 +141,7 @@ fn create_readback(device: &Device, bytes: u64) -> Result<ID3D12Resource, Engine
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.raw().CreateCommittedResource(
             &heap,

@@ -380,6 +380,9 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     install_dpi_awareness();
     install_input_thresholds(&mut app);
     let dispatcher = app.dispatcher();
+    // 线程消息兜底的目标：首窗关闭后 `PostMessageW` 会失败，`wake()` 必须还能叫醒 `GetMessageW`。
+    // SAFETY: 无参数，返回调用线程的 id（只用于 `PostThreadMessageW`）。
+    dispatcher.bind_thread(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
 
     let requests: Vec<(WindowId, WindowOptions)> = app
         .windows()
@@ -470,7 +473,7 @@ fn pump(
         }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
-        if close_requested_windows(&mut app, &mut windows)? {
+        if close_requested_windows(&mut app, &mut windows, &dispatcher)? {
             return Ok(());
         }
 
@@ -498,11 +501,10 @@ fn pump(
             return Ok(());
         }
         if result.0 == -1 {
+            // SAFETY: 无参数、无指针的线程局部查询；`GetMessageW == -1` 之后调用才有效。
+            let last_error = unsafe { windows::Win32::Foundation::GetLastError() }.0;
             return Err(EngineError::WindowCreate {
-                detail: smol_str::format_smolstr!(
-                    "GetMessageW: GetLastError={}",
-                    unsafe { windows::Win32::Foundation::GetLastError() }.0
-                ),
+                detail: smol_str::format_smolstr!("GetMessageW: GetLastError={last_error}"),
             });
         }
         // SAFETY: `message` 已由 `GetMessageW` 填充。
@@ -616,6 +618,7 @@ fn apply_event(
 fn close_requested_windows(
     app: &mut App,
     windows: &mut Vec<NativeWindow>,
+    dispatcher: &Arc<Dispatcher>,
 ) -> Result<bool, EngineError> {
     let mut closed = false;
     for native in windows.iter_mut() {
@@ -628,8 +631,22 @@ fn close_requested_windows(
     }
     if closed {
         windows.retain(|native| !native.is_destroyed());
+        retarget_wake(windows, dispatcher);
     }
     Ok(windows.is_empty() || app.windows().next().is_none())
+}
+
+/// 唤醒目标 / 剪贴板属主跟随存活的第一个窗口；一个不剩就清空（`wake` 改走线程消息）。
+///
+/// 目标窗口销毁后 `PostMessageW` 会失败，若不改指，`GetMessageW` 会永久阻塞（P14 审查 #2）。
+fn retarget_wake(windows: &[NativeWindow], dispatcher: &Arc<Dispatcher>) {
+    match windows.first() {
+        Some(native) => {
+            dispatcher.attach(native.hwnd_raw());
+            crate::platform::windows::clipboard::set_owner(native.hwnd_raw());
+        }
+        None => dispatcher.detach(),
+    }
 }
 
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。

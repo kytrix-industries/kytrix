@@ -574,7 +574,11 @@ impl Window {
     }
 
     /// lane 重建/复用 + damage + 实例编码（`design/phase-06-paint-runtime.md` §9.6）。
-    pub(crate) fn paint_frame(&mut self) -> PaintReport {
+    ///
+    /// # Errors
+    /// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过上限（release 也失败，见 P14 审查）。
+    /// 返回 `Err` 时本帧未提交：调用方必须 `abort_frame`，damage/dirty 保留待重试。
+    pub(crate) fn paint_frame(&mut self) -> Result<PaintReport, EngineError> {
         // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
         for lane in self.tree.drain_removed_lanes() {
             self.scene.release_lane(lane);
@@ -595,14 +599,14 @@ impl Window {
         // P11：只有 `A11Y` 脏（`bind_a11y` 重算）的帧**没有任何像素要画**：早退让 lane 保持
         // `REUSABLE`、damage 保持空，帧末门禁把本帧退回 `Idle`（P11 审查 #6）。
         if !has_damage && !self.needs_node_repaint() {
-            return PaintReport {
+            return Ok(PaintReport {
                 rebuilt: 0,
                 damage: crate::render::damage::DamageSummary::default(),
                 #[cfg(feature = "test-support")]
                 instances: 0,
                 #[cfg(feature = "test-support")]
                 log: crate::test_support::record::PaintLog::default(),
-            };
+            });
         }
         self.paint_order.clear();
         let focused = self.focus.focused();
@@ -617,7 +621,7 @@ impl Window {
             #[cfg(feature = "test-support")]
             log: PaintLog::default(),
         };
-        let mut report = pass.run();
+        let mut report = pass.run()?;
         let buffer = self.encoder.encode(&self.scene, scale, &self.resolver);
         #[cfg(feature = "test-support")]
         {
@@ -628,7 +632,7 @@ impl Window {
             let _ = buffer;
             let _ = &mut report;
         }
-        report
+        Ok(report)
     }
 
     /// 提交（或在中止条件下退回 `Idle`）。
@@ -749,7 +753,13 @@ impl Window {
                 return Err(error);
             }
         }
-        let report = self.paint_frame();
+        let report = match self.paint_frame() {
+            Ok(report) => report,
+            Err(error) => {
+                self.abort_frame(ticket);
+                return Err(error);
+            }
+        };
         self.commit_frame(ticket, report)
     }
 

@@ -21,6 +21,12 @@ name = "snapshot"
 path = "tests/snapshot.rs"
 required-features = ["test-support"]
 
+# P14：L1 布局/命中的跨模块集成断言（`TestApp` + `Probe`）。
+[[test]]
+name = "layout"
+path = "tests/layout.rs"
+required-features = ["test-support"]
+
 # P13：L4 基准（criterion 自带 harness）。
 [[bench]]
 name = "perf"
@@ -30,6 +36,8 @@ harness = false
 [dev-dependencies]
 # P13：只测 CPU 侧 pass。workspace 已关掉 criterion 的默认 features（无 plotters/rayon，S-130）。
 criterion = { workspace = true }
+# P14：`tests/layout.rs` 构造 taffy 样式（`Style.inner` 的公开类型；已在依赖图内，不加包）。
+taffy = { workspace = true }
 
 [dependencies]
 # P01 实际使用

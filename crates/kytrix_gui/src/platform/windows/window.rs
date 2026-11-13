@@ -58,6 +58,7 @@ impl NativeWindow {
         options: &WindowOptions,
         dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
+        // SAFETY: 取本进程模块句柄（`None` = 当前可执行文件）；只读，不转移所有权。
         let instance = unsafe { GetModuleHandleW(None) }
             .map_err(|error| window_error("GetModuleHandleW", error))?;
         register_class(instance)?;
@@ -69,6 +70,8 @@ impl NativeWindow {
             physical_client(options.size, options.scale),
             dpi::system_dpi(),
         );
+        // SAFETY: `class` / `title` 是本函数栈上的 NUL 结尾 UTF-16 缓冲，`CreateWindowExW`
+        // 同步拷贝；父窗口/菜单为空，实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -225,10 +228,18 @@ impl NativeWindow {
         if !app.a11y_pending(window) {
             return;
         }
-        let state = self.state_mut();
-        state
-            .a11y_mut()
-            .update(|| crate::a11y::adapter::build_update(app, window));
+        // 短借用：`QueuedEvents::raise` 会**同步**派发嵌套 `WM_GETOBJECT`，所以只能在不持有
+        // `&mut WndProcState` 时调用（同 P11 的 `WM_GETOBJECT` / `focus_changed` 纪律）。
+        // 丢弃 `Option<QueuedEvents>` 等于只交付首棵树、后续事件全丢（P14 审查 #1）。
+        let events = {
+            let state = self.state_mut();
+            state
+                .a11y_mut()
+                .update(|| crate::a11y::adapter::build_update(app, window))
+        };
+        if let Some(events) = events {
+            events.raise();
+        }
     }
 
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。

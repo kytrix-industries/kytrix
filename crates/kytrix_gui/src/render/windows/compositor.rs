@@ -116,6 +116,7 @@ impl Renderer {
         pipeline.write_atlas(&device, AtlasKind::Glyph, atlas.texture(AtlasKind::Glyph));
         pipeline.write_atlas(&device, AtlasKind::Image, atlas.texture(AtlasKind::Image));
 
+        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let rtv_heap: ID3D12DescriptorHeap = unsafe {
             device
                 .raw()
@@ -127,6 +128,7 @@ impl Renderer {
                 })
         }
         .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
+        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
         let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
 
         let mut device = device;
@@ -269,6 +271,7 @@ impl Renderer {
                                 right: rect.x1,
                                 bottom: rect.y1,
                             };
+                            // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
                             unsafe { list.RSSetScissorRects(&[scissor]) };
                             draw_ops(list, pipeline, buffer, geometry, &root, scissor)?;
                         }
@@ -515,6 +518,7 @@ fn write_upload(resource: &ID3D12Resource, bytes: &[u8]) -> Result<(), EngineErr
         return Ok(());
     }
     let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
     unsafe { resource.Map(0, None, Some(&mut pointer)) }
         .map_err(|error| init_error_from("Map(upload)", error))?;
     // SAFETY: 上传缓冲容量在 `UploadArena::write` 里已按 `bytes.len()` 扩容。
@@ -532,6 +536,7 @@ fn bind_frame(
     slot: usize,
     root: &[f32; ROOT_UNIFORM_DWORDS],
 ) {
+    // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
     unsafe {
         list.SetDescriptorHeaps(&[Some(pipeline.heap().clone())]);
         list.SetGraphicsRootSignature(pipeline.root_signature());
@@ -838,6 +843,7 @@ fn create_target(device: &mut Device, size: (u32, u32)) -> Result<ID3D12Resource
         },
     };
     let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.raw().CreateCommittedResource(
             &heap,
@@ -877,6 +883,7 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.raw().CreateCommittedResource(
             &heap,
@@ -1408,6 +1415,7 @@ mod tests {
             value.encode_utf16().chain(std::iter::once(0)).collect()
         }
 
+        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
         let instance = unsafe { GetModuleHandleW(None) }.expect("module handle");
         let class = wide("KytrixGuiP08Test");
         let window_class = WNDCLASSW {
@@ -1416,8 +1424,10 @@ mod tests {
             lpszClassName: PCWSTR(class.as_ptr()),
             ..WNDCLASSW::default()
         };
+        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
         let _ = unsafe { RegisterClassW(&window_class) };
         let title = wide("kg-p08");
+        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
         let hwnd = unsafe {
             CreateWindowExW(
                 Default::default(),

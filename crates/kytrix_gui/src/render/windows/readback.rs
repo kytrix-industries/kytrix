@@ -117,6 +117,7 @@ impl Readback {
         })?;
 
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
         unsafe { buffer.Map(0, None, Some(&mut pointer)) }
             .map_err(|error| init_error_from("Map(readback)", error))?;
         let mut rgba8 = Vec::with_capacity((size.0 * size.1 * 4) as usize);
@@ -146,6 +147,7 @@ impl Readback {
                 }
             }
         }
+        // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
         unsafe { buffer.Unmap(0, None) };
         Ok(ReadbackImage {
             width: size.0,
@@ -179,6 +181,7 @@ impl Readback {
         let mut rows = 0u32;
         let mut row_size = 0u64;
         let mut total = 0u64;
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             device.raw().GetCopyableFootprints(
                 &desc,
@@ -214,6 +217,7 @@ impl Readback {
             VisibleNodeMask: 1,
         };
         let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             device.raw().CreateCommittedResource(
                 &heap,

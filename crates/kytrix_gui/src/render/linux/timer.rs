@@ -49,8 +49,9 @@ impl GpuTimer {
     pub(crate) fn begin(&self, command: vk::CommandBuffer, slot: usize) {
         // SAFETY: query 索引在池容量内（2 × 槽位）。
         unsafe {
+            // begin/end 是两条 query：必须一起 reset（否则第二帧起 end 的时间戳是脏值）。
             self.device
-                .cmd_reset_query_pool(command, self.pool, index(slot), 1);
+                .cmd_reset_query_pool(command, self.pool, index(slot), QUERIES_PER_FRAME);
             self.device.cmd_write_timestamp(
                 command,
                 vk::PipelineStageFlags::TOP_OF_PIPE,

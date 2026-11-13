@@ -14,6 +14,7 @@ use smallvec::SmallVec;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{LaneOutcome, LanePaintEntry, PaintLog};
 use crate::{
+    error::EngineError,
     math::{PhysicalRect, Point, Rect, Scale},
     node::{
         dirty::DirtyFlags,
@@ -26,7 +27,7 @@ use crate::{
             ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, PositionedGlyph, Primitive, Quad,
             QuadPaint, Shadow,
         },
-        scene::{LaneId, Scene},
+        scene::{LaneId, MAX_CLIP_DEPTH, Scene},
         style::{Clip, PaintSpec, StylePatch},
     },
     render::damage::{DamageAccumulator, DamageSummary},
@@ -63,7 +64,11 @@ pub(crate) struct PaintReport {
 
 impl PaintPass<'_> {
     /// 执行整帧 paint（唯一入口，消费者：`Window::paint_frame`）。
-    pub(crate) fn run(&mut self) -> PaintReport {
+    ///
+    /// # Errors
+    /// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过 `MAX_CLIP_DEPTH`。release 也必须失败——
+    /// 静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14 审查）。
+    pub(crate) fn run(&mut self) -> Result<PaintReport, EngineError> {
         let tree = &mut *self.tree;
         let scene = &mut *self.scene;
         let damage = &mut *self.damage;
@@ -85,17 +90,17 @@ impl PaintPass<'_> {
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
-        paint_node(&mut context, root, false, &mut clip, Point::ZERO);
+        paint_node(&mut context, root, false, &mut clip, Point::ZERO)?;
         context.scene.set_order(context.order);
         let damage = context.damage.finish(frame);
-        PaintReport {
+        Ok(PaintReport {
             rebuilt: context.rebuilt,
             damage,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
             log: context.log,
-        }
+        })
     }
 }
 
@@ -165,15 +170,15 @@ fn paint_node(
     parent_hidden: bool,
     clip: &mut ClipContext,
     offset: Point,
-) {
+) -> Result<(), EngineError> {
     let Ok(target) = context.tree.get(node) else {
-        return;
+        return Ok(());
     };
     let hidden =
         parent_hidden || matches!(target.style().inner.display, taffy::style::Display::None);
     if hidden {
         hide_subtree(context, node, clip, offset);
-        return;
+        return Ok(());
     }
     let current_key = clip.key();
     // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **滚动偏移戳一致**（祖先滚动会移动
@@ -206,7 +211,7 @@ fn paint_node(
 
     let (children, clip_bounds) = {
         let Ok(target) = context.tree.get(node) else {
-            return;
+            return Ok(());
         };
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
         // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
@@ -221,6 +226,14 @@ fn paint_node(
         (children, clip_bounds)
     };
     if let Some(padding_box) = clip_bounds {
+        // release 可见的硬失败：静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14 审查）。
+        if clip.rects.len() >= usize::from(MAX_CLIP_DEPTH) {
+            return Err(EngineError::ClipDepthExceeded {
+                node,
+                depth: clip.rects.len() + 1,
+                limit: MAX_CLIP_DEPTH,
+            });
+        }
         clip.push(padding_box, context.scale);
     }
     // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
@@ -230,11 +243,12 @@ fn paint_node(
             .scroll_slot(node)
             .map_or(Point::ZERO, |slot| slot.offset);
     for child in children {
-        paint_node(context, child, false, clip, child_offset);
+        paint_node(context, child, false, clip, child_offset)?;
     }
     if clip_bounds.is_some() {
         clip.pop(context.scale);
     }
+    Ok(())
 }
 
 /// 隐藏子树：清空每条 lane（保留分配），并把旧像素并入 damage；`clip_key` 置空
@@ -672,7 +686,7 @@ mod tests {
             }
         }
 
-        fn paint(&mut self) -> super::PaintReport {
+        fn try_paint(&mut self) -> Result<super::PaintReport, crate::error::EngineError> {
             self.damage.reset(scale());
             self.order.clear();
             let mut pass = PaintPass {
@@ -687,6 +701,10 @@ mod tests {
                 log: crate::test_support::record::PaintLog::default(),
             };
             pass.run()
+        }
+
+        fn paint(&mut self) -> super::PaintReport {
+            self.try_paint().expect("paint")
         }
 
         fn mark_paint(&mut self, node: crate::node::id::NodeId) {
@@ -1046,5 +1064,53 @@ mod tests {
         let report = h.paint();
         assert_eq!(report.rebuilt, 0, "全透明渐变不产生像素");
         assert_eq!(report.damage.rects, 0);
+    }
+
+    /// 叠 `depth` 层 `Clip::Bounds`，返回最内层节点。
+    fn nest_clips(h: &mut Harness, depth: usize) -> crate::node::id::NodeId {
+        let root = h.tree.root();
+        let mut parent = root;
+        for _ in 0..depth {
+            let mut style = fixed_style(100.0, 100.0);
+            style.clip = Clip::Bounds;
+            parent = NodeBuilder::boxed()
+                .style(style)
+                .build(&mut h.tree, parent)
+                .expect("挂载");
+        }
+        layout_all(&mut h.tree);
+        parent
+    }
+
+    #[test]
+    fn clip_depth_at_limit_is_allowed() {
+        let mut h = Harness::new();
+        let deepest = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH));
+        // 最内层节点的祖先链 = 7 层（第 8 层是它自己的子树），允许。
+        let _ = h.paint();
+        assert!(
+            h.tree
+                .clip_key(deepest)
+                .is_some_and(|(depth, _)| depth == 7)
+        );
+    }
+
+    #[test]
+    fn clip_depth_over_limit_is_an_error() {
+        // release 下也必须硬失败：静默丢最外层 clip 会让子内容越界可见（P14 审查）。
+        let mut h = Harness::new();
+        let deepest = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH) + 1);
+        let error = match h.try_paint() {
+            Err(error) => error,
+            Ok(_) => panic!("9 层 Clip::Bounds 必须报错（不能静默丢最外层）"),
+        };
+        match error {
+            crate::error::EngineError::ClipDepthExceeded { node, depth, limit } => {
+                assert_eq!(node, deepest);
+                assert_eq!(depth, usize::from(crate::paint::scene::MAX_CLIP_DEPTH) + 1);
+                assert_eq!(limit, crate::paint::scene::MAX_CLIP_DEPTH);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

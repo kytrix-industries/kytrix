@@ -4,6 +4,10 @@ Kytrix 自研跨平台 GUI 引擎（`crates/kytrix_gui`）。三平台原生图�
 自建事件循环、细粒度依赖追踪 + 脏矩形、Parley 文本、AccessKit 无障碍。
 
 > 本 crate `publish = false`：它是产品的一部分，不是独立发布的库。
+>
+> **依赖状态**：引擎子树（`kytrix_gui` / `kytrix_gui_demo`）的依赖已清零 —— `cargo tree -p kytrix_gui`
+> 里**没有** `gpui-*` / `wgpu` / `winit` / Vello。workspace 的产品侧（`crates/kytrix`、`base_ui` 等）**仍有**
+> `gpui-kit` / `gpui-pre-*`，那是 M8 的迁移范围，不在本 crate 的验收面内。
 
 ## 快速开始
 
@@ -28,13 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-最小示例（真实窗口 + WARP 离屏快照）：
-
-```text
-cargo run -p kytrix_gui_demo
-cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
-```
-
 ## 架构（模块与依赖方向）
 
 | 模块 | 职责 |
@@ -56,25 +53,30 @@ cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
 
 ## 测试 / golden / bench 命令
 
-```powershell
-# L0–L2：单测 + 集成（默认 features）
-cargo test -p kytrix_gui
-# 测试基建（TestApp / 帧记录 / 像素快照 / 诊断）
-cargo test -p kytrix_gui --features test-support
-cargo test -p kytrix_gui --features test-support --test frame_record
+测试分四层，**命令不同、覆盖不同**（混用会少测）：
 
-# L3：像素 golden（Windows WARP；mac/Linux 显式 skip 并打印原因）
+| 层 | 覆盖 | 命令 |
+|---|---|---|
+| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API | `cargo test -p kytrix_gui` ← **只跑这些** |
+| L2 | 帧记录 / 布局命中集成测试 | `cargo test -p kytrix_gui --features test-support --test frame_record`<br>`cargo test -p kytrix_gui --features test-support --test layout` |
+| L3 | 像素 golden（Windows WARP） | `cargo test -p kytrix_gui --features test-support --test snapshot` |
+| L4 | criterion 基准（非门禁） | `cargo bench -p kytrix_gui --bench perf --no-run` / `cargo bench -p kytrix_gui --bench perf` |
+
+```powershell
+# 全部（L0–L3）：注意 `--features test-support`，否则集成测试不会编译
+cargo test -p kytrix_gui --features test-support
+
+# 单独跑某一层
+cargo test -p kytrix_gui --features test-support --test frame_record
+cargo test -p kytrix_gui --features test-support --test layout
 cargo test -p kytrix_gui --features test-support --test snapshot -- --nocapture
-# 生成 / 更新 golden（写完立刻自检）
+
+# 生成 / 更新 golden（写完立刻读回自检；不入库热力图见 tests/golden/README.md）
 $env:UPDATE_GOLDEN = '1'; cargo test -p kytrix_gui --features test-support --test snapshot
 Remove-Item Env:UPDATE_GOLDEN
 
-# release 下的探针一致性
+# release 下的探针一致性（debug_assert 门控的用例不跑）
 cargo test -p kytrix_gui --release --features test-support
-
-# L4：基准（criterion；**非合并门禁**，CI 只要求可编译）
-cargo bench -p kytrix_gui --bench perf --no-run
-cargo bench -p kytrix_gui --bench perf
 
 # 门禁
 cargo +nightly clippy -p kytrix_gui -p kytrix_gui_demo --all-targets --all-features -- -D warnings
@@ -82,17 +84,27 @@ cargo +nightly fmt -p kytrix_gui -p kytrix_gui_demo -- --check
 cargo doc -p kytrix_gui --no-deps
 ```
 
+最小示例（真实窗口 + WARP 离屏快照）：
+
+```powershell
+cargo run -p kytrix_gui_demo
+cargo run -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
+# 直接跑 release（仍需 `--features snapshot` 才有 `--snapshot`）
+cargo run --release -p kytrix_gui_demo --features snapshot -- --snapshot out\demo.png
+```
+
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - 缺 shader 工具链时设 `KYTRIX_GUI_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
 - 交叉 target：`cargo check -p kytrix_gui --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
   （Linux 需要 `pkg-config` stub 提供 `fontconfig`，见 `design/DEVIATIONS.md` V-04）。
+- CI：[`.github/workflows/gui-ci.yml`](../../.github/workflows/gui-ci.yml)（windows / ubuntu / macos 三个 job）。
 
 ## 文档与偏差入口
 
 | 文档 | 内容 |
 |---|---|
 | `../../custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量） |
-| `../../design/phase-01…13-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
+| `../../design/phase-01…14-*.md` | 每个实施阶段的详细设计（本 crate 的实现规格） |
 | `../../design/DEVIATIONS.md` | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里 |
 | `../../AGENTS.md` | 仓库纪律（模块/测试/错误/依赖） |
 | `src/render/shaders/contract.md` | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |
@@ -105,5 +117,6 @@ cargo doc -p kytrix_gui --no-deps
 - 所有依赖在 workspace 根 `Cargo.toml` 声明，本 crate 只 `workspace = true`。
 - **禁止**：`wgpu` / `naga` / `gpui-*` / `winit` / Vello 系 / `cosmic-text` 主链路；
   `usvg` 不进本 crate（构建期 SVG 归 `base_ui`，`DEVIATIONS` F-11）。
-- `image`（资源解码）与 `criterion`（bench，关默认 features）是 P13 新增的两项。
+- `image`（资源解码）与 `criterion`（bench，关默认 features）是 P13 新增的两项；
+  `taffy` 是本 crate 既有依赖，P14 起同时作为 **dev-dependency** 供 `tests/layout.rs` 构造样式。
 - 测试基建（`test_support`）只在 `--features test-support` 下编译，发布物零符号。

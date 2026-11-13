@@ -10,6 +10,12 @@
 //! 三份实现都必须提供：`run(app)`、`window::NativeWindow`、`dpi`、`ime`、`clipboard`、`a11y`。
 
 pub(crate) mod dispatcher;
+/// IME 提交去重的纯逻辑（macOS / Linux 共用）。
+///
+/// 只在真正消费它的平台 + 测试构建里编译：Windows 的 lib 构建没有消费者，
+/// 而 `cargo test`（`cfg(test)`）仍能在开发机上跑到这里的单测。
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) mod ime;
 
 #[cfg(windows)]
 pub(crate) mod event;

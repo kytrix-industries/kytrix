@@ -2272,7 +2272,13 @@ impl App {
         // 图集页上传（P13：广播给所有窗口的渲染器；两张页分开、顺序固定以便帧记录复现）。
         self.upload_atlas_pages();
         let paint = match self.windows.get_mut(&window) {
-            Some(target) => target.paint_frame(),
+            Some(target) => match target.paint_frame() {
+                Ok(report) => report,
+                Err(error) => {
+                    self.abort_frame(window, ticket);
+                    return Some(Err(error));
+                }
+            },
             None => {
                 self.abort_frame(window, ticket);
                 return None;
