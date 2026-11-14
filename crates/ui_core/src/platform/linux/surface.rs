@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, event_created_child,
+    Connection, Dispatch, Proxy, QueueHandle,
+    backend::ObjectId,
+    event_created_child,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
@@ -40,7 +42,12 @@ use crate::{
     event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
     math::{Point, Rect, Scale, Size},
     platform::linux::{
-        a11y::UnixA11y, clipboard::Clipboard, dpi, frame_gate::FrameGate, ime::ImeState, window,
+        a11y::UnixA11y,
+        clipboard::Clipboard,
+        dpi,
+        frame_gate::{CallbackToken, FrameGate},
+        ime::ImeState,
+        window,
     },
 };
 
@@ -102,6 +109,11 @@ pub(crate) struct WaylandState {
     close_requested: bool,
     /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 超时兜底见 `frame_gate`）。
     frame_gate: FrameGate,
+    /// 最近一次 `wl_surface.frame` 的回调对象 id 与门禁令牌。
+    ///
+    /// 门禁的活性兜底会放弃旧 callback 再挂新的；回调事件只带自己这个对象，因此靠 id 区分
+    /// 「当前请求的 callback」与「被兜底放弃、迟到的旧 callback」，令牌只对匹配的回调生效。
+    frame_callback: Option<(ObjectId, CallbackToken)>,
 }
 
 impl WaylandState {
@@ -214,6 +226,7 @@ impl WaylandState {
             maximized: false,
             close_requested: false,
             frame_gate: FrameGate::new(),
+            frame_callback: None,
         };
         Ok((state, queue))
     }
@@ -326,9 +339,11 @@ impl WaylandState {
 
     /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
     pub(crate) fn request_frame(&mut self) {
-        if self.frame_gate.request(Instant::now()) {
-            self.surface.frame(&self.queue_handle, ());
-        }
+        let Some(token) = self.frame_gate.request(Instant::now()) else {
+            return;
+        };
+        let callback = self.surface.frame(&self.queue_handle, ());
+        self.frame_callback = Some((callback.id(), token));
     }
 
     pub(crate) fn frame_ready(&self) -> bool {
@@ -591,14 +606,24 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
 impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &wl_callback::WlCallback,
+        callback: &wl_callback::WlCallback,
         event: wl_callback::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            state.frame_gate.on_callback();
+            let Some((pending, token)) = state.frame_callback.as_ref() else {
+                return;
+            };
+            // 被活性兜底放弃的旧 callback 迟到：对象 id 不匹配，不能动当前请求的挂起状态
+            // （`expire` 之后重新挂上的 callback 才是门禁要等的那一个）。
+            if pending != &callback.id() {
+                return;
+            }
+            let token = *token;
+            state.frame_callback = None;
+            state.frame_gate.on_callback(token);
         }
     }
 }

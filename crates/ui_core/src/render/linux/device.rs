@@ -255,11 +255,14 @@ impl Device {
             .timeline_semaphore(true)
             .descriptor_indexing(true)
             .runtime_descriptor_array(caps.runtime_descriptor_array);
+        // `VK_KHR_swapchain` 依赖实例扩展 `VK_KHR_surface`；离屏实例（快照 / 单测）没有
+        // surface，启用该设备扩展会被 validation 判为缺少依赖（VUID-vkCreateDevice-…-01387）。
+        let enable_swapchain = caps.swapchain && surface_fn.is_some();
         let mut extension_pointers = Vec::with_capacity(2);
-        if caps.swapchain {
+        if enable_swapchain {
             extension_pointers.push(ash::khr::swapchain::NAME.as_ptr());
         }
-        if incremental_present {
+        if incremental_present && enable_swapchain {
             extension_pointers.push(ash::khr::incremental_present::NAME.as_ptr());
         }
         let create = vk::DeviceCreateInfo::default()
@@ -491,6 +494,12 @@ impl Device {
             }
         });
         destroyed
+    }
+
+    /// 尚未释放的 retire 句柄数（测试：一次性 staging 的生命周期）。
+    #[cfg(test)]
+    pub(crate) fn pending_retired(&self) -> usize {
+        self.retire.pending()
     }
 
     pub(crate) fn retire(&mut self, index: FrameIndex, handle: GpuResourceHandle) {

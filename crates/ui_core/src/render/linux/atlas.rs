@@ -1,4 +1,12 @@
 //! 图集纹理：`R8_UNORM` 字形 + `B8G8R8A8_SRGB` 图片，staging 上传（`design/phase-12-macos-linux.md` §6.5）。
+//!
+//! **staging 是每次上传一次性的 `VkBuffer`**（与 macOS 本轮修复同一策略）：Linux 最多允许
+//! [`MAX_FRAMES_IN_FLIGHT`](crate::render::frame::MAX_FRAMES_IN_FLIGHT) 帧在飞 —— 活性兜底会在
+//! present 卡死时放行第二帧（这正是它存在的目的），所以不能假设「在飞 ≤ 1」。复用一块 staging
+//! 会让后一帧录制时的 CPU 写入覆盖前一帧 GPU `cmd_copy_buffer_to_image` 仍在读的字节。这里每次
+//! 上传只分配**本次脏行大小**的 host-visible 缓冲，录制时使用，随后按**本帧序号**进入 retire
+//! 队列，由 timeline 完成推进释放（I4）。内存只随在飞帧的脏行增长（而不是固定按「页 × 槽位」
+//! 放大），上传又是低频路径，分配的代价远小于一次整页 memcpy。
 
 use ash::vk;
 
@@ -7,28 +15,22 @@ use crate::{
     paint::atlas::AtlasKind,
     render::{
         atlas::DirtyRows,
-        linux::device::{Device, init_error},
+        linux::device::{Device, GpuObject, init_error},
+        retire::GpuResourceHandle,
     },
+    window::FrameIndex,
 };
 
 /// 图集页边长（与 Win32 / Metal 同值）。
 pub(crate) const ATLAS_PAGE: u32 = 2048;
 
 /// 一张图集页。
-///
-/// **staging 只有一份**（设计假设：在飞 ≤ 1，§7.3）：`frame_ready` 门禁保证 UI 只在上一帧的
-/// `wl_callback.done` 之后才发布下一帧，而该回调意味着合成器已经取走上一帧的 image ——
-/// 其 `render_finished` 依赖的 copy 必然完成，CPU 写 staging 与 GPU 读 staging 不会重叠。
-/// 若将来放开在飞帧数，必须按帧槽拆分 staging（每槽一块，约 page²×texel 字节）或先等该帧
-/// fence 再写。
 struct AtlasTexture {
     image: vk::Image,
     /// image 的设备内存（与 `image` 成对释放）。
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     sampler: vk::Sampler,
-    staging: vk::Buffer,
-    staging_memory: vk::DeviceMemory,
     page: u32,
     texel_bytes: u32,
     /// 首次上传前是 `UNDEFINED`，之后是 `SHADER_READ_ONLY_OPTIMAL`。
@@ -84,16 +86,29 @@ impl AtlasTextures {
         self.glyph.pending.is_some() || self.image.pending.is_some()
     }
 
-    /// 把待上传的行写进 staging 并编码 `cmd_copy_buffer_to_image`（一帧的 command buffer 里）。
-    pub(crate) fn record_uploads(&mut self, device: &Device, command: vk::CommandBuffer) {
-        self.glyph.record_upload(device, command);
-        self.image.record_upload(device, command);
+    /// 给待上传的行分配**本帧专用** staging、写进去并编码 `cmd_copy_buffer_to_image`。
+    ///
+    /// staging 以 `index` 进入 retire 队列：timeline 确认该帧完成之前，GPU 可能仍在读它，
+    /// 因此即使下一帧立刻录制自己的上传也不会覆盖（每帧一块一次性缓冲，不共享）。
+    pub(crate) fn record_uploads(
+        &mut self,
+        device: &mut Device,
+        index: FrameIndex,
+        command: vk::CommandBuffer,
+    ) -> Result<(), EngineError> {
+        self.glyph.record_upload(device, index, command)?;
+        self.image.record_upload(device, index, command)
     }
 }
 
 impl AtlasTexture {
     fn new(device: &Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
         let format = texture_format(kind);
+        // 产品路径只采样 / 上传，不读回图集；单测要验证「两帧各自的 staging 落到了自己的行」，
+        // 因此 `cfg(test)` 下额外允许 `TRANSFER_SRC`（usage 是创建参数，测试无法事后追加）。
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        #[cfg(test)]
+        let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC;
         // SAFETY: 句柄归本结构独占；`Drop` 里销毁。
         let image = unsafe {
             device.raw().create_image(
@@ -109,7 +124,7 @@ impl AtlasTexture {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .usage(usage)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
@@ -170,48 +185,11 @@ impl AtlasTexture {
         }
         .map_err(|error| init_error("create_sampler(atlas)", format!("{error:?}")))?;
 
-        let staging_bytes = u64::from(page) * u64::from(page) * u64::from(texel_bytes(kind));
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
-        let staging = unsafe {
-            device.raw().create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(staging_bytes)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-        }
-        .map_err(|error| init_error("create_buffer(atlas staging)", format!("{error:?}")))?;
-        // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
-        let staging_requirements = unsafe { device.raw().get_buffer_memory_requirements(staging) };
-        let staging_type = device
-            .memory_type(
-                staging_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| init_error("atlas staging memory", "no host-visible memory type"))?;
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
-        let staging_memory = unsafe {
-            device.raw().allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(staging_requirements.size)
-                    .memory_type_index(staging_type),
-                None,
-            )
-        }
-        .map_err(|error| init_error("allocate_memory(atlas staging)", format!("{error:?}")))?;
-        // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定/写入的范围在其分配内。
-        unsafe { device.raw().bind_buffer_memory(staging, staging_memory, 0) }.map_err(
-            |error| init_error("bind_buffer_memory(atlas staging)", format!("{error:?}")),
-        )?;
-
         Ok(Self {
             image,
             memory,
             view,
             sampler,
-            staging,
-            staging_memory,
             page,
             texel_bytes: texel_bytes(kind),
             initialized: false,
@@ -239,9 +217,14 @@ impl AtlasTexture {
         });
     }
 
-    fn record_upload(&mut self, device: &Device, command: vk::CommandBuffer) {
+    fn record_upload(
+        &mut self,
+        device: &mut Device,
+        index: FrameIndex,
+        command: vk::CommandBuffer,
+    ) -> Result<(), EngineError> {
         let Some(pending) = self.pending.take() else {
-            return;
+            return Ok(());
         };
         let row_bytes = (self.page * self.texel_bytes) as usize;
         let first = if pending.full { 0 } else { pending.y0 };
@@ -250,27 +233,19 @@ impl AtlasTexture {
         } else {
             pending.rows
         };
+        if rows == 0 {
+            return Ok(());
+        }
         let offset = first as usize * row_bytes;
         let length = rows as usize * row_bytes;
         if offset + length > pending.pixels.len() {
-            return;
+            return Ok(());
         }
-        // SAFETY: staging 容量 = page² × texel ≥ offset + length；映射范围在缓冲内。
-        unsafe {
-            let pointer = device.raw().map_memory(
-                self.staging_memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
-            );
-            if let Ok(pointer) = pointer {
-                std::ptr::copy_nonoverlapping(
-                    pending.pixels.as_ptr().add(offset),
-                    pointer.cast::<u8>().add(offset),
-                    length,
-                );
-                device.raw().unmap_memory(self.staging_memory);
-            }
+        // 一次性 staging 只装本次行区间（`length` 字节）；缓冲在 `index` 完成之前不得释放。
+        let staging = OneShotStaging::new(device, length as u64)?;
+        if let Err(error) = staging.write(device, offset, &pending.pixels, length) {
+            staging.retire(device, index);
+            return Err(error);
         }
 
         let range = vk::ImageSubresourceRange::default()
@@ -289,7 +264,8 @@ impl AtlasTexture {
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::SHADER_READ)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        // SAFETY: barrier 与 copy 的目标都是本结构独占的资源，范围在图像边界内。
+        // SAFETY: barrier 与 copy 的目标都是本结构独占的资源，范围在图像边界内；staging 是
+        // 本次上传独占的缓冲，大小 = `length`，行布局与 `image_extent` 一致（紧密排列）。
         unsafe {
             device.raw().cmd_pipeline_barrier(
                 command,
@@ -302,13 +278,15 @@ impl AtlasTexture {
             );
             device.raw().cmd_copy_buffer_to_image(
                 command,
-                self.staging,
+                staging.buffer,
                 self.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[vk::BufferImageCopy::default()
-                    .buffer_offset(offset as u64)
-                    .buffer_row_length(self.page)
-                    .buffer_image_height(rows)
+                    // staging 从第 0 字节开始，行紧密排列（`buffer_row_length = 0` 表示按
+                    // `image_extent.width × texel` 紧密排列）。
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
                     // 局部上传：目标从 `first` 行开始（缺这个字段会从第 0 行覆写整页）。
                     .image_offset(vk::Offset3D {
                         x: 0,
@@ -343,7 +321,115 @@ impl AtlasTexture {
                 &[to_sampled],
             );
         }
+        // GPU 读这块 staging 的 copy 与本帧提交同生命周期：帧完成（timeline 的连续完成前沿
+        // 到达 `index`）之前不得释放，因此只登记句柄（I4）。
+        staging.retire(device, index);
         self.initialized = true;
+        Ok(())
+    }
+}
+
+/// 一次上传专用的 staging（大小 = 本次行区间）。
+///
+/// 两个句柄以 `GpuResourceHandle` 的形式进入设备的 retire 队列：真正的 `vkDestroyBuffer` /
+/// `vkFreeMemory` 由 timeline 完成推进触发，Atlas 不再持有跨帧的 staging 状态。
+struct OneShotStaging {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    buffer_handle: GpuResourceHandle,
+    memory_handle: GpuResourceHandle,
+}
+
+impl OneShotStaging {
+    fn new(device: &mut Device, bytes: u64) -> Result<Self, EngineError> {
+        // SAFETY: 句柄归本结构独占；成功路径交给 retire 队列，失败路径在下面就地销毁。
+        let buffer = unsafe {
+            device.raw().create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bytes)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .map_err(|error| init_error("create_buffer(atlas staging)", format!("{error:?}")))?;
+        // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
+        let requirements = unsafe { device.raw().get_buffer_memory_requirements(buffer) };
+        let memory_type = device
+            .memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| init_error("atlas staging memory", "no host-visible memory type"))?;
+        // SAFETY: 句柄与参数都由本结构独占，调用期间有效。
+        let memory = match unsafe {
+            device.raw().allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
+        } {
+            Ok(memory) => memory,
+            Err(error) => {
+                // SAFETY: buffer 已创建且尚未交给 retire 队列。
+                unsafe { device.raw().destroy_buffer(buffer, None) };
+                return Err(init_error(
+                    "allocate_memory(atlas staging)",
+                    format!("{error:?}"),
+                ));
+            }
+        };
+        // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定范围在其分配内。
+        if let Err(error) = unsafe { device.raw().bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: 两个句柄都还没有进入 retire 队列。
+            unsafe {
+                device.raw().destroy_buffer(buffer, None);
+                device.raw().free_memory(memory, None);
+            }
+            return Err(init_error(
+                "bind_buffer_memory(atlas staging)",
+                format!("{error:?}"),
+            ));
+        }
+        let buffer_handle = device.allocate(GpuObject::Buffer(buffer));
+        let memory_handle = device.allocate(GpuObject::Memory(memory));
+        Ok(Self {
+            buffer,
+            memory,
+            buffer_handle,
+            memory_handle,
+        })
+    }
+
+    /// 从 `pixels[offset..offset + length]` 拷进 staging（staging 容量恰为 `length`）。
+    fn write(
+        &self,
+        device: &Device,
+        offset: usize,
+        pixels: &[u8],
+        length: usize,
+    ) -> Result<(), EngineError> {
+        // SAFETY: staging 容量 = length；映射范围在分配内。
+        unsafe {
+            let pointer = device
+                .raw()
+                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|error| init_error("map_memory(atlas staging)", format!("{error:?}")))?;
+            std::ptr::copy_nonoverlapping(
+                pixels.as_ptr().add(offset),
+                pointer.cast::<u8>(),
+                length,
+            );
+            device.raw().unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+
+    /// 本帧完成前不得释放：两个句柄按帧序号进入 retire 队列（先 buffer 后 memory）。
+    fn retire(self, device: &mut Device, index: FrameIndex) {
+        device.retire(index, self.buffer_handle);
+        device.retire(index, self.memory_handle);
     }
 }
 
@@ -357,8 +443,6 @@ impl Drop for AtlasTextures {
                 // Vulkan 要求先销毁 image，再释放它的内存。
                 self.device.destroy_image(texture.image, None);
                 self.device.free_memory(texture.memory, None);
-                self.device.destroy_buffer(texture.staging, None);
-                self.device.free_memory(texture.staging_memory, None);
             }
         }
     }
@@ -377,5 +461,312 @@ fn texel_bytes(kind: AtlasKind) -> u32 {
     match kind {
         AtlasKind::Glyph => 1,
         AtlasKind::Image => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk;
+
+    use super::AtlasTextures;
+    use crate::{
+        paint::atlas::AtlasKind,
+        render::{
+            atlas::DirtyRows,
+            linux::{device::Device, instance::VulkanInstance},
+        },
+        window::FrameIndex,
+    };
+
+    /// 小页（16²）够验证行落位；真实页 2048² 在单测里代价过高。
+    const TEST_PAGE: u32 = 16;
+
+    /// 一张图集页的整页像素（BGRA8，行优先；初始全 0）。
+    fn page() -> Vec<u8> {
+        vec![0u8; (TEST_PAGE * TEST_PAGE) as usize * 4]
+    }
+
+    /// 往整页图里写一行 BGRA 颜色。
+    fn fill_row(pixels: &mut [u8], row: u32, colour: [u8; 4]) {
+        let start = row as usize * TEST_PAGE as usize * 4;
+        for texel in pixels[start..start + TEST_PAGE as usize * 4]
+            .as_chunks_mut::<4>()
+            .0
+        {
+            *texel = colour;
+        }
+    }
+
+    fn rows(y0: u32, y1: u32) -> DirtyRows {
+        let mut rows = DirtyRows::default();
+        rows.mark(y0, y1);
+        rows
+    }
+
+    fn command_pool(device: &Device) -> vk::CommandPool {
+        // SAFETY: 池归测试独占；结束时销毁。
+        unsafe {
+            device
+                .raw()
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(device.queue_family())
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .expect("command pool")
+        }
+    }
+
+    fn allocate(device: &Device, pool: vk::CommandPool, count: u32) -> Vec<vk::CommandBuffer> {
+        // SAFETY: 池由调用方持有，命令缓冲在提交完成后释放。
+        unsafe {
+            device
+                .raw()
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(count),
+                )
+                .expect("command buffers")
+        }
+    }
+
+    fn begin(device: &Device, command: vk::CommandBuffer) {
+        // SAFETY: 命令缓冲由本测试独占，提交前只录制一次。
+        unsafe {
+            device
+                .raw()
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin command buffer");
+        }
+    }
+
+    fn end(device: &Device, command: vk::CommandBuffer) {
+        // SAFETY: 录制收尾；随后提交并等待。
+        unsafe {
+            device
+                .raw()
+                .end_command_buffer(command)
+                .expect("end command buffer");
+        }
+    }
+
+    fn submit_and_wait(device: &Device, command: vk::CommandBuffer) {
+        let commands = [command];
+        // SAFETY: 命令缓冲已录制完毕；同步等待只发生在测试里。
+        unsafe {
+            device
+                .raw()
+                .queue_submit(
+                    device.queue(),
+                    &[vk::SubmitInfo::default().command_buffers(&commands)],
+                    vk::Fence::null(),
+                )
+                .expect("queue submit");
+            device
+                .raw()
+                .queue_wait_idle(device.queue())
+                .expect("queue wait idle");
+        }
+    }
+
+    /// 读回图集页某一行的前 4 字节（原始存储字节 = BGRA，不做通道交换）。
+    fn read_row(device: &Device, pool: vk::CommandPool, image: vk::Image, row: u32) -> [u8; 4] {
+        let bytes = u64::from(TEST_PAGE) * 4;
+        // SAFETY: 句柄归本测试独占；提交并等待后读回，结束时销毁。
+        unsafe {
+            let buffer = device
+                .raw()
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(bytes)
+                        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .expect("readback buffer");
+            let requirements = device.raw().get_buffer_memory_requirements(buffer);
+            let memory_type = device
+                .memory_type(
+                    requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .expect("host-visible readback memory");
+            let memory = device
+                .raw()
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type),
+                    None,
+                )
+                .expect("readback memory");
+            device
+                .raw()
+                .bind_buffer_memory(buffer, memory, 0)
+                .expect("bind readback memory");
+
+            let command = allocate(device, pool, 1)[0];
+            begin(device, command);
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let to_src = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            device.raw().cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src],
+            );
+            device.raw().cmd_copy_image_to_buffer(
+                command,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .image_offset(vk::Offset3D {
+                        x: 0,
+                        y: row as i32,
+                        z: 0,
+                    })
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: TEST_PAGE,
+                        height: 1,
+                        depth: 1,
+                    })],
+            );
+            let back = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            device.raw().cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[back],
+            );
+            end(device, command);
+            submit_and_wait(device, command);
+
+            let pointer = device
+                .raw()
+                .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
+                .expect("map readback");
+            let mut pixel = [0u8; 4];
+            std::ptr::copy_nonoverlapping(pointer.cast::<u8>(), pixel.as_mut_ptr(), 4);
+            device.raw().unmap_memory(memory);
+            device.raw().free_command_buffers(pool, &[command]);
+            device.raw().destroy_buffer(buffer, None);
+            device.raw().free_memory(memory, None);
+            pixel
+        }
+    }
+
+    /// P1 回归：两帧在飞时各自持有自己的 staging。
+    ///
+    /// 旧实现是**每张页一块**复用 staging：第 2 帧录制时的 CPU `memcpy` 会把第 1 帧还在等
+    /// GPU copy 的字节覆盖掉（同一页、同一偏移），于是第 1 帧把第 2 帧的像素写进了自己的行。
+    /// 这里把两帧都**先录制、再提交**（相当于第 1 帧在飞时第 2 帧开始录制），一次性 staging
+    /// 让两次上传互不干扰：第 5 行必须是第 1 帧的颜色，第 7 行必须是第 2 帧的颜色。
+    #[test]
+    fn consecutive_uploads_do_not_share_staging_while_frames_are_in_flight() {
+        let instance = VulkanInstance::new_headless().expect("headless Vulkan instance");
+        let mut device = Device::new(&instance).expect("Vulkan device");
+        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let pool = command_pool(&device);
+        let commands = allocate(&device, pool, 2);
+
+        // 第 1 帧：第 5 行 = 不透明深蓝（BGRA）。
+        let mut first_page = page();
+        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
+        atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
+        begin(&device, commands[0]);
+        atlas
+            .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
+            .expect("record frame 1");
+        end(&device, commands[0]);
+        assert_eq!(
+            device.pending_retired(),
+            2,
+            "每次上传各自一块一次性 staging（buffer + memory）"
+        );
+
+        // 第 2 帧：第 7 行 = 不透明橙。第 1 帧还没提交/完成。
+        let mut second_page = page();
+        fill_row(&mut second_page, 7, [0x44, 0x55, 0x66, 0xFF]);
+        atlas.queue_upload(AtlasKind::Image, second_page, rows(7, 8));
+        begin(&device, commands[1]);
+        atlas
+            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
+            .expect("record frame 2");
+        end(&device, commands[1]);
+        assert_eq!(
+            device.pending_retired(),
+            4,
+            "两帧都在飞时两块 staging 都不得释放"
+        );
+
+        // 第 1 帧完成：只释放它自己的 staging。
+        submit_and_wait(&device, commands[0]);
+        assert_eq!(
+            device.drain_retire(FrameIndex::from_raw(1)),
+            2,
+            "第 1 帧只释放自己的 buffer + memory"
+        );
+        assert_eq!(
+            device.pending_retired(),
+            2,
+            "第 2 帧的 staging 必须活到第 2 帧完成"
+        );
+        submit_and_wait(&device, commands[1]);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(2)), 2);
+        assert_eq!(device.pending_retired(), 0, "两帧都完成后不得残留句柄");
+
+        assert_eq!(
+            read_row(&device, pool, atlas.image.image, 5),
+            [0x11, 0x22, 0x33, 0xFF],
+            "第 1 帧的行"
+        );
+        assert_eq!(
+            read_row(&device, pool, atlas.image.image, 7),
+            [0x44, 0x55, 0x66, 0xFF],
+            "第 2 帧的行"
+        );
+        assert_eq!(
+            read_row(&device, pool, atlas.image.image, 6),
+            [0, 0, 0, 0],
+            "未上传的行保持原样"
+        );
+
+        // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
+        unsafe { device.raw().destroy_command_pool(pool, None) };
     }
 }
