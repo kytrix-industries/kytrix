@@ -116,6 +116,13 @@ impl Dispatcher {
         self.frame_pending.swap(false, Ordering::AcqRel)
     }
 
+    /// 只读检查「有一帧要画」（Linux 帧门禁的活性兜底用：门禁关闭时唤醒必须留在队列里，
+    /// 但要能判断它是否存在，不能消费）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn frame_wake_pending(&self) -> bool {
+        self.frame_pending.load(Ordering::Acquire)
+    }
+
     /// 入队一个主线程任务并唤醒。
     pub(crate) fn push(&self, task: UserTask) {
         if let Ok(mut tasks) = self.tasks.lock() {

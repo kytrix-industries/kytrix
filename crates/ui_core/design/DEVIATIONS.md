@@ -2465,3 +2465,17 @@ macOS/Metal 异步窗口管线（`16f2045`）的对抗性审查发现 1 个 P0�
 | **F-181** | **三平台图集上传按 `Vec<u8>` 所有权移动** | GPU 侧 `GpuRenderer::queue_atlas_upload` / `AtlasTextures::queue_upload` 原收 `&[u8]`，待上传槽自己分配 `Vec` 再整页拷贝；图片页 2048² 是 16 MiB，每次上传白付第二次拷贝。现在入口收 `Vec<u8>`，同一块内存移进待上传槽，blit 时直接读它；UI → GPU 线程的那一次拷贝仍在（跨线程边界，不可避免）。落点：`render/{windows,macos,linux}/compositor.rs::queue_atlas_upload` + `render/*/atlas.rs::queue_upload`；Windows 先落（§15.1），Linux/macOS 本轮同步（`d6f56fb` / `8c02aa0`） |
 | **F-182** | **Windows 关闭时允许「waitable 已消费但不 present」的唯一例外** | §6.3 的 token 守恒（消费 waitable ⇒ 本帧必须 present）原先把关闭也当不变量；但关闭可能恰好发生在 waitable 已被消费、尚未取帧的时刻：此时 present 没有必要（swapchain 随即销毁），再等一次 waitable 会挂死关闭。现在 `wait_for_waitable` 返回后调用方先检查 shutdown，已关闭就直接退出（不取帧、不 present）；其余两个不画出口（取帧失败、Idle）仍保留 `debug_assert!` 不变量——`window.rs` 不会在目标未重建时发布 Idle 计划。落点：`render/windows/renderer.rs::wait_for_waitable` + `async-render-pipeline.md` §6.3（F-182） |
 
+
+---
+
+## 三十、Linux 帧门禁的 Idle / OUT_OF_DATE 永久停更（2026-11-14）
+
+最终对抗性审查的 P1：Linux 平台泵的帧门禁在「Idle 帧 / present `OUT_OF_DATE`」下无法恢复。
+虽是既有缺陷（`async-render-pipeline.md` §15.2 曾登记为未闭环），但它会让窗口永久停更、阻塞
+发布，本轮一并修复；共享的 `App::frame` 契约不变（没有拆分 encode/commit）。同轮还删除了
+workspace 级未使用依赖（`lyon` / `usvg` / `ui_core`，见 `chore(deps)` 提交与
+`async-render-pipeline.md` §15.7）。
+
+| 编号 | 条目 | 内容 |
+|------|------|------|
+| **F-183** | **Linux 帧门禁：Idle 不消费门禁 + 200 ms 活性兜底** | 原 `WaylandState` 只有 `frame_ready: bool`：`event_loop` 在 `app.frame()` **之前**无条件 `request_frame()`（挂 `wl_surface.frame` 并关门），而 callback 只在 `wl_surface.commit` 之后回来。① `FrameOutcome::Idle`（a11y-only 变化 / damage 全被裁空）与中止帧不 publish、不 commit；② present `OUT_OF_DATE` 时 WSI 可能没有 attach/commit —— 两条路径都不 commit，callback 永不回来，门禁永久关闭、窗口停更。修复：新增纯逻辑 `FrameGate`（`ready` / `requested` / `closed_at`）。`request` 幂等（已有挂起 callback 时不重复发协议请求）；Idle / 中止帧走 `note_frame_not_committed` 立即重开门禁但**保留**挂起 callback（下一次真正 commit 时自然返回；多个 callback 合法，清掉会让 Idle 循环无限堆积）；`wl_callback.done` 清 `requested` 并开门。present `OUT_OF_DATE` 由事件循环的活性兜底覆盖：有 `frame_wake` 且门禁关闭超过 `GATE_TIMEOUT = 200 ms` 时强制开门并重新挂号，`dispatch` 的阻塞上限按剩余超时压缩（否则门禁关闭期间唤醒位留在队列里，泵会睡到 1 h）。200 ms **不是呈现节奏**（正常 callback 在合成器 vsync 内返回）；没有改用 GPU→UI repaint 通知：那需要 `Shared` 新标志 + `poll` 暴露 + UI 侧强制全量 damage，而兜底已覆盖同一路径且不改共享帧契约。落点：`platform/linux/frame_gate.rs`（+5 单测）、`surface.rs`、`event_loop.rs`、`platform/dispatcher.rs::frame_wake_pending`；`async-render-pipeline.md` §15.2 的未闭环条目移入 §15.7 |

@@ -6,7 +6,7 @@
 //! 约束（D25 / I16）：只走 Wayland；缺 `xdg_wm_base` / `wl_compositor` / `wl_seat` 一律
 //! `EngineError::WaylandCompositor`，**不回退 X11**。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 use wayland_client::{
@@ -39,7 +39,9 @@ use crate::{
     error::EngineError,
     event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
     math::{Point, Rect, Scale, Size},
-    platform::linux::{a11y::UnixA11y, clipboard::Clipboard, dpi, ime::ImeState, window},
+    platform::linux::{
+        a11y::UnixA11y, clipboard::Clipboard, dpi, frame_gate::FrameGate, ime::ImeState, window,
+    },
 };
 
 /// 客户端自报的 app id（compositor 用来匹配桌面文件）。
@@ -98,8 +100,8 @@ pub(crate) struct WaylandState {
     /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
     maximized: bool,
     close_requested: bool,
-    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交。
-    frame_ready: bool,
+    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 超时兜底见 `frame_gate`）。
+    frame_gate: FrameGate,
 }
 
 impl WaylandState {
@@ -211,7 +213,7 @@ impl WaylandState {
             configured: false,
             maximized: false,
             close_requested: false,
-            frame_ready: true,
+            frame_gate: FrameGate::new(),
         };
         Ok((state, queue))
     }
@@ -322,14 +324,31 @@ impl WaylandState {
         &mut self.clipboard
     }
 
-    /// 请求一帧回调（提交之后调用；`frame_ready == false` 期间不再提交）。
+    /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
     pub(crate) fn request_frame(&mut self) {
-        self.surface.frame(&self.queue_handle, ());
-        self.frame_ready = false;
+        if self.frame_gate.request(Instant::now()) {
+            self.surface.frame(&self.queue_handle, ());
+        }
     }
 
     pub(crate) fn frame_ready(&self) -> bool {
-        self.frame_ready
+        self.frame_gate.is_ready()
+    }
+
+    /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
+    pub(crate) fn note_frame_not_committed(&mut self) {
+        self.frame_gate.note_not_committed();
+    }
+
+    /// 活性兜底：门禁关闭超过 `GATE_TIMEOUT` 时强制打开。只覆盖「publish 了但没 commit」
+    /// （present `OUT_OF_DATE` 等），正常路径不会触发；**不是**呈现节奏（F-183）。
+    pub(crate) fn expire_frame_gate(&mut self, now: Instant) -> bool {
+        self.frame_gate.expire(now)
+    }
+
+    /// 距离活性兜底还有多久（门禁打开时 `None`）；事件循环用它压缩阻塞等待。
+    pub(crate) fn frame_gate_remaining(&self, now: Instant) -> Option<Duration> {
+        self.frame_gate.time_until_expiry(now)
     }
 
     /// IME 的激活/停用（focus 变化时由键盘事件驱动）。
@@ -579,7 +598,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            state.frame_ready = true;
+            state.frame_gate.on_callback();
         }
     }
 }

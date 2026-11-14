@@ -6,7 +6,7 @@
 //! 2. 建 `Renderer`（Vulkan WSI 需要 `wl_display*` / `wl_surface*`）；
 //! 3. 循环：drain 事件 → 同步窗口状态 → 钩子 → 按需提交 → 回投任务 → a11y → 阻塞等待。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::{EventLoop, ping::make_ping};
 
@@ -19,6 +19,7 @@ use crate::{
         wake, window,
     },
     render::backend::Renderer,
+    window::FrameOutcome,
 };
 
 /// 连续帧（动画 / P17 HUD）的定时器间隔（60 Hz）。
@@ -159,10 +160,20 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             //
             // 先判 `frame_ready` 再消费唤醒：上一帧还没 present 时，唤醒必须留在队列里；
             // frame callback 到达后下一轮会重新看到它。反过来先消费会把 resize 的最后一帧丢掉。
+            //
+            // 门禁原本会在两种「publish 了但不会 commit」的情况下永久关闭（F-183）：
+            // Idle（`App::frame` 返回 `Idle`，没有 publish/commit）由 `note_frame_not_committed`
+            // 立即重开；present `OUT_OF_DATE`（WSI 没有 attach/commit）由下面的 200 ms 活性
+            // 兜底覆盖。兜底**不是**呈现节奏：正常帧的 callback 在合成器 vsync 内返回。
+            let now = Instant::now();
+            if dispatcher.frame_wake_pending() {
+                state.expire_frame_gate(now);
+            }
             if state.frame_ready() && dispatcher.take_frame_wake() {
                 state.request_frame();
                 match app.frame(id) {
-                    None | Some(Ok(_)) => {}
+                    None | Some(Ok(FrameOutcome::Idle)) => state.note_frame_not_committed(),
+                    Some(Ok(FrameOutcome::Committed(_))) => {}
                     Some(Err(error)) => return Err(error),
                 }
             }
@@ -187,6 +198,13 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             }
             let timeout = if app.needs_continuous_frames() {
                 FRAME_TICK
+            } else if dispatcher.frame_wake_pending() {
+                // 门禁关闭时不能睡到 `IDLE_TIMEOUT`：F-183 的活性兜底要在 200 ms 内有机会
+                // 执行（唤醒位在门禁关闭期间必须留在队列里，见 ④）。门禁打开时 `None`，
+                // 回到事件驱动。
+                state
+                    .frame_gate_remaining(Instant::now())
+                    .unwrap_or(surface::IDLE_TIMEOUT)
             } else {
                 surface::IDLE_TIMEOUT
             };

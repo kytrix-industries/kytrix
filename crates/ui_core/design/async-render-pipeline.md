@@ -828,14 +828,6 @@ Vulkan / Wayland：
   （本轮之前就存在，与窗口异步管线无关）。**已知、未修**：它属于离屏/读回路径的同步用法，本轮
   没有触碰；修它需要单独复核该路径的 barrier/同步并重跑 13 份 golden，因此本轮只把结论限定在
   窗口路径（10 s 0 error / 0 `SYNC-HAZARD`）。
-- **`lyon` / workspace unused deps**：`lyon` 已在 workspace 与 `ui_core` 的依赖里，但 `src/` 没有
-  消费者（路径三角化尚未落到几何录制路径）。**已知、未修**：它是 workspace 级
-  unused-dependency 提示（不是 clippy error）；删掉它牵涉路径/描边的后续落点，等该功能定案再
-  接入或删除。
-- **Linux `request_frame` 的 Idle 门禁**（既有）：`event_loop.rs` 在 `app.frame()` **之前**无
-  条件 `state.request_frame()`，而该帧可能最终是 Idle（不发布、不 present）：wl frame callback
-  没有对应的 commit，`frame_ready` 可能停在 false。**已知、未修**：修它要把「本帧是否有像素」
-  提前到 `request_frame` 之前（拆分 encode/commit），会改动共享 `App::frame` 契约；本轮只登记。
 
 ### 15.3 实现修订中的条款（已全部闭环）
 
@@ -860,7 +852,7 @@ publish feedback on timeline completion`）。实机口径：Ubuntu 26.04 / lava
 | **P2 反馈改到完成时** | 提交时把 `{index, stats, CPU samples, published_at, timeline_value(signal), slot}` 放进 pending 队列；每轮循环用 `vkGetSemaphoreCounterValue` 非阻塞推进，观察到完成之后按提交顺序发布 `FrameFeedback { index, stats, samples(+此处 resolve 的 GPU 采样), completed_at, latency }`，retire 在同一观测点推进。GPU 采样不再在提交点读（避免读在飞槽），只在完成之后 resolve。等待策略：pending 非空时 `Condvar::wait_timeout(4ms)`，其余无限等待（0 自旋）——避免最后一帧的反馈永远不发布 |
 | **P2 samples 断言** | `feedback.samples.len() <= 4` → `<= 3`（Upload / Gpu / Present，`FrameTimings` 只有这三段） |
 | **P2 atlas staging 只有一份** | 本次不改：`frame_ready` 门禁把在飞帧压到 ≤ 1（UI 只在上一帧的 `wl_callback.done` 之后发布下一帧，而该回调意味着合成器已取走上一帧 image、其 `render_finished` 依赖的 copy 必然完成），CPU 写 staging 与 GPU 读 staging 不会重叠。代码与 §7.3 已显式登记该设计假设：**在飞 ≤ 1**；放开在飞帧数时必须按帧槽拆分 staging 或先等该帧 fence |
-| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**（该修订落地时；当前 634，见 §15.5）；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积；当轮数值，当前 2.1–3.1 ms 见 §15.5）；关闭见上 |
+| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**（该修订落地时；当前 639，见 §15.6）；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积；当轮数值，当前 2.1–3.1 ms 见 §15.6）；关闭见上 |
 
 ### 15.5 第二轮闭环（F-176 … F-182，2026-11-14）
 
@@ -883,12 +875,28 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
 | 平台 | lib 单测 | HUD `Latency`（demo + HUD） | 说明 |
 |---|---|---|---|
 | Windows | 695 passed / 0 failed / 1 ignored | 7.8–10.2 ms | 跨 10 s 多次采样，不累积；其中大部分是 waitable 的 vsync 排队（I3 的既有语义） |
-| Linux | 634 passed / 0 failed | 2.1–3.1 ms | headless sway + lavapipe，不累积 |
+| Linux | 639 passed / 0 failed | 2.1–3.1 ms | headless sway + lavapipe，不累积 |
 | macOS | 648 passed / 0 failed | 3.1–3.7 ms | 同一台 Intel Iris Plus 655，不累积（`b4ea69e` 基线重测 2.90–3.41 ms） |
 
 - 测试数字是 `cargo test -p ui_core --lib` 口径（默认 feature）；feature 组合会改变数量（同一
   HEAD 加 `--features "hud,test-support"` 时 Windows 为 756 passed / 1 ignored），比较时只与
   同口径历史值比。整套（含集成）数字见各平台验证文档。
+- Linux 的 639 含 F-183 新增的 5 条 `FrameGate` 单测（`platform/linux/frame_gate.rs`，只在
+  Linux 构建里编译；Windows / macOS 的数字不受影响）。
 - `Latency` 是「UI 发布 → GPU 线程观察到完成」，**跨 10 s 不增长**；绝对值随机器、驱动、合成器
   与负载变化（同一台机不同 run 也可差 1 ms 以上），只作同机回归对比，不作跨平台契约。
+
+### 15.7 第三轮闭环（F-183 + 未使用依赖，2026-11-14）
+
+- **Linux `request_frame` 的 Idle 门禁（既有，F-183）**：`FrameGate` 在 `FrameOutcome::Idle`
+  与中止帧（`App::frame` 返回 `None`）时立即重开门禁，并**保留**挂起 callback（下一次 commit
+  时自然返回）；present `OUT_OF_DATE`（WSI 没有 attach/commit）由 200 ms 活性兜底覆盖，
+  `dispatch` 的阻塞上限按剩余兜底时间压缩，避免门禁关闭期间泵睡到 1 h。200 ms 不是呈现节奏，
+  `App::frame` 的共享契约不变（没有拆分 encode/commit）。偏差与完整理由见
+  [`DEVIATIONS.md`](DEVIATIONS.md) §30。
+- **workspace 未使用依赖（P2）**：删除根 `Cargo.toml` 的 `lyon` / `usvg` / `ui_core` 三个没有
+  任何成员用 `workspace = true` 引用的声明，以及 `crates/ui_core/Cargo.toml` 的 `lyon` 成员
+  依赖；`cargo check` 不再报 `unused dependency` / `unused workspace dependency`。`lyon` /
+  `usvg` 仍是第三方 crate（如 `gpui-pre`）的传递依赖，所以 `Cargo.lock` 只删掉 `ui_core`
+  条目里的 `lyon` 一行。
 
