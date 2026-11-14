@@ -1,8 +1,8 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**待审查**（本文件不含实现；实现前先过设计评审 + §11 的三项实测）
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164、`macos-verification.md` §2.9
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-169、`macos-verification.md` §2.9
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -138,10 +138,10 @@ GPU
 pub(crate) struct FrameRequest {
     pub index: FrameIndex,          // UI 侧提交序号
     pub payload: FramePayload,      // instances: Bytes + ops: Vec<FrameOp> + clips: Vec<GpuClipEntry>
+                                    //   + geometry: Vec<GeometryDraw>（第四份数据，§4.2）
     pub plan: Plan,                 // Full | Partial(DamageRects) | Idle（来自 UI 的 damage）
-    pub surface: (u32, u32),        // 物理像素
-    pub scale: f32,                 // DPI（macOS 写图层 / 诊断）
-    pub published_at: Instant,      // HUD：发布延迟
+    pub surface: (u32, u32),        // 物理像素（UI 的发布目标）
+    pub published_at: Instant,      // HUD：latency 的起点
 }
 // `FramePlan` 的 `fresh` 不再由 UI 线程决定：GPU 线程用自己的「目标是新建/重建」状态
 // 在渲染前构造本地 FramePlan::new(plan, fresh)，present 成功后 presented()。
@@ -151,24 +151,45 @@ pub(crate) struct FrameFeedback {
     pub index: FrameIndex,
     pub stats: RenderStats,
     pub samples: Vec<GpuTimerSample>,
-    pub completed_at: Instant,      // 命令缓冲完成时刻（近似呈现时刻），HUD 的 publish→完成 延迟
+    // GPU 线程**观察到该帧 GPU 工作完成**的时刻（fence / timeline / completed handler），
+    // 不是 Present 返回的时刻。
+    pub completed_at: Instant,
+    // completed_at - published_at（UI 发布 → GPU 完成），HUD 的 publish→present。
+    pub latency: Duration,
 }
 ```
 
-`FrameOutcome::Committed(index)` 的语义随之变成「**已交付 GPU 线程**」（不等于已呈现）；窗口路径的 `RenderStats`/GPU 采样从 `poll()` 取（落后 ≤1 帧），离屏路径保持同步返回。
+`FrameFeedback` 的跨平台契约：GPU 线程必须在**观察到**完成之后才发布反馈（fence / timeline /
+completed handler），按提交顺序发布，允许覆盖尚未被 UI 线程取走的上一条（反馈槽是最新者胜，
+不是队列）。`latency` 与 `completed_at` 由同一个完成观测点给出，二者对同一帧满足
+`latency = completed_at - published_at`。
+
+`FrameRequest.scale` 已删除：三个平台都没有功能消费者（只在 GPU 线程做过 `scale > 0` 的
+debug 断言）。DPI 的跨线程传递只保留 macOS 的 `set_layer_scale(surface, scale)`（主线程写
+CA 图层，§5.3）。
+
+`FrameOutcome::Committed(index)` 的语义随之变成「**已交付 GPU 线程**」（不等于已呈现；纯 Idle
+计划被门禁跳过时也不会交付）；窗口路径的 `RenderStats`/GPU 采样从 `poll()` 取（落后 ≤1 帧），
+离屏路径保持同步返回。
 
 ### 4.2 最新帧槽：合并而不是排队（I5）
 
 UI 线程 `publish`：
 
-1. 若已有未取走的 `FrameRequest`：保留**新**的 payload/surface/scale，把**旧的 damage** 合并进新的 plan：任一 `Full` ⇒ `Full`；否则矩形并集，超过 `MAX_DAMAGE_RECTS` ⇒ `Full`。旧请求的 `index` 丢弃（它不会产生 GPU 工作）。
+1. 若已有未取走的 `FrameRequest`：保留**新**的 payload/surface，把**旧的 damage** 合并进新的 plan：任一 `Full` ⇒ `Full`；否则矩形并集，超过 `MAX_DAMAGE_RECTS` ⇒ `Full`。旧请求的 `index` 丢弃（它不会产生 GPU 工作）。
 2. 替换槽位，唤醒 GPU 线程。
+
+`FramePayload` 是**四份**一起过线的数据：`instances`（`Bytes`）+ `ops` + `clips` + `geometry`
+（F-166）。`geometry` 是 `FrameOp::Geometry.index` 的下标表，**必须与 `ops` 同帧过线**：`ops`
+里的下标只有配合同一帧的表才有意义，拆开或延后一帧会把几何画到错误的帧上。目前只有 Windows
+的录制路径消费它（macOS / Linux 的 `FrameOp::Geometry` 还没有 GPU 缓冲来源），但三平台的
+`FramePayload` 形状保持一致：它是「一帧的全部 CPU 侧数据」，不是按平台裁剪的数据包。
 
 图集上传单独一个「每 `AtlasKind` 只留最新」的槽：新的像素覆盖旧的，`DirtyRows` 取并集（`DirtyRows::merge`，`render/atlas.rs:244`）；若发生覆盖，则把并集标记为整页（`mark(0, u32::MAX)`）——因为被丢掉的中间上传的脏行永远不会再补。上传在 GPU 线程录制下一帧时先于绘制执行。
 
 **为什么合并 damage 是对的**：persist 纹理在 GPU 线程上跨帧保留（Windows 是 `FLIP_SEQUENTIAL` 的后备缓冲 + persist 双份，Metal/Vulkan 是 persist），被跳过的帧没有写进 persist，所以它的 damage 必须由后继帧补画。合并后不需要「强制全量」。
 
-**代价（明说）**：每帧一次 payload 拷贝（instances + ops + clips）。这是线程边界的所有权转移，不是可选优化；1 万实例约 1.3 MB，量级远小于一次布局/文本 shaping。macOS 今天已经在付这笔拷贝（`FramePayload::from_buffer`），本次把同样的代价带到另外两个平台。
+**代价（明说）**：每帧一次 payload 拷贝（instances + ops + clips + geometry）。这是线程边界的所有权转移，不是可选优化；1 万实例约 1.3 MB，量级远小于一次布局/文本 shaping。macOS 今天已经在付这笔拷贝（`FramePayload::from_buffer`），本次把同样的代价带到另外两个平台。
 
 ### 4.3 序号与 retire
 
@@ -181,7 +202,7 @@ UI 线程 `publish`：
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
 - 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
-- **surface/scale 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。
+- **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 走 `set_layer_scale`（§5.3），Windows/Linux 的物理像素由平台层算好后再作为 `surface` 出现。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
@@ -294,7 +315,7 @@ loop {
 
 - 窗口尺寸变化：平台层 `sync_state` 读 AppKit 的 frame/backing scale → 主线程写 `drawableSize`/`contentsScale` → 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
 - 不等待任何在飞帧：旧 persist 被在飞命令缓冲引用，由 retire 在完成后释放；GPU 线程立即改用新 persist。
-- drawable 尺寸与请求尺寸可能差一帧（AppKit 已改、UI 还没发布新 surface）：GPU 线程以 **drawable 的实际尺寸**为准重建 persist 并 `Full`；`surface` 只用于判断「是否需要重建」。
+- drawable 尺寸与请求尺寸可能差一帧（AppKit 已改、UI 还没发布新 surface）：**macOS 以 drawable 的实际尺寸为重建真值**（persist 尺寸与 `Full` 判定都由它决定）；`FrameRequest.surface` 仍保留给 UI 侧判断「是否需要发布」（§4.4 的兜底门禁），GPU 线程不拿它当 macOS 的重建依据。
 - DPI 变化但物理尺寸不变：`set_layer_scale` 更新 `contentsScale`，`drawableSize` 由 AppKit 依 bounds×scale 派生（若派生滞后，下一帧按实际 drawable 尺寸重建）。
 
 ### 5.5 空闲与连续帧
@@ -420,7 +441,7 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 - `WM_SIZE`/`WM_DPICHANGED`：只更新 `Window` 的 size/scale 并 `dispatcher.wake()`（GPU 线程的 `resize_pending` 由下一帧的 `FrameRequest.surface` 派生，§4.4）。
 - 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
-- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)`，GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等。关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）边泵消息边等退出，超时 2s 记错误后放弃。
+- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)`，GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
 - 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
 
 ---
@@ -461,15 +482,18 @@ loop {
     let Some(frame) = take_latest_frame() else { continue };
     if frame.surface != surface { recreate_swapchain(); }
 
-    // 先 acquire（可能 OUT_OF_DATE）再复位 fence：避免 acquire 失败重试时留下未 signal 的 fence。
-    // acquire 只碰 WSI，不碰本槽的命令缓冲/上传缓冲，所以顺序安全。
-    // timeout 用有限值（100ms）而不是 UINT64_MAX：只有这样才能在遮挡/合成器停摆时响应 shutdown。
+    // ① 先等槽 fence，再 acquire。反过来的话：acquire 会 signal image_available[slot]，而该
+    //    二值信号量可能仍被本槽上一次提交的 wait 持有，对已 signal 的信号量再次 signal 是
+    //    非法用法（VUID-vkAcquireNextImageKHR-semaphore-01286）。这也是 Khronos 的
+    //    frames-in-flight 顺序。fence 的复位仍只在 submit 之前（acquire 失败时不留下
+    //    「已复位、无人 signal」的槽）。
+    wait_for_fences(fence[slot], TRUE, UINT64_MAX);   // 允许阻塞：GPU 线程
+
+    // ② acquire：节奏原语（I3）。timeout 用有限值（100ms）而不是 UINT64_MAX：只有这样才能在
+    //    遮挡/合成器停摆时响应 shutdown。
     let image = acquire_next_image(swapchain, ACQUIRE_TIMEOUT_NS, image_available[slot], null)?;
     if image == NOT_READY { continue; }               // 回循环顶部检查 shutdown / 新帧
     // OUT_OF_DATE ⇒ 重建 swapchain 后重试一次；SUBOPTIMAL ⇒ 本帧照常，present 后重建
-
-    wait_for_fences(fence[slot], TRUE, UINT64_MAX);   // 允许阻塞：GPU 线程
-    reset_fences(fence[slot]);
 
     reset_command_buffer(slot);
     begin_command_buffer(slot);
@@ -480,13 +504,19 @@ loop {
     barrier(PRESENT_SRC);
     end_command_buffer();
 
-    submit(wait: image_available[slot] @ COLOR_ATTACHMENT_OUTPUT,
+    reset_fences(fence[slot]);                        // 复位之后必须立刻 submit
+    // 本帧第一次使用 swapchain image 的是 persist→image 的 copy（TRANSFER 阶段），
+    // 所以 image_available 的 wait stage 必须是 TRANSFER，不是 COLOR_ATTACHMENT_OUTPUT。
+    submit(wait: image_available[slot] @ TRANSFER,
            signal: [render_finished[image], timeline_value],
            fence: fence[slot]);
     present(wait: render_finished[image], swapchain, image);   // OUT_OF_DATE/SUBOPTIMAL 处理见 §7.4
     frame.presented();
 }
 ```
+
+- 槽 fence 是「复用命令缓冲 / 上传缓冲」与「安全地再次 signal `image_available[slot]`」的共同前置条件，因此必须在 acquire 之前等（§7.2 的两条硬规则不因此改变）。
+- **实现修订中**：平台代码的「先等槽 fence、再 acquire」顺序已与本文一致；`image_available` 的 wait stage 仍是 `COLOR_ATTACHMENT_OUTPUT`，由平台 SubAgent 改为 `TRANSFER`（F-168，§15.3）。
 
 - 等待只发生在 GPU 线程；UI 线程的 `publish` 不碰 Vulkan。
 - `vkQueuePresentKHR` 内部会 `wl_display_flush`（Mesa 实现），因此 GPU 线程必须能安全地操作连接（§7.5）。
@@ -531,7 +561,7 @@ recreate_swapchain():
 
 - `VK_ERROR_DEVICE_LOST` ⇒ 粘性 `EngineError::DeviceLost`；`OUT_OF_DATE/SURFACE_LOST` 按 §7.4 重建；`SUBOPTIMAL` 只标记重建。
 - `vkQueueSubmit`/`vkQueuePresentKHR` 失败一律先分类 device-lost，再落到 `EngineError::Swapchain`（沿用现状）。
-- 关闭：GPU 线程 `vkDeviceWaitIdle`（允许，退出路径）→ 销毁 swapchain/persist/命令池 → join。`acquire` 的 100ms 上限保证遮挡/合成器停摆时 join 有界（最坏多等一个超时周期）。
+- 关闭：UI 线程 signal shutdown 后**直接 `join`**（不再 2 s 超时后 detach；§6.7 的「UI 线程允许在关闭时等待」同样适用，F-169）。GPU 线程 `vkDeviceWaitIdle`（允许，退出路径）→ 销毁 swapchain/persist/命令池 → 退出。`acquire` 的 100 ms 上限保证遮挡/合成器停摆时 join 有界（最坏多等一个超时周期）。
 
 ---
 
@@ -586,9 +616,9 @@ UI 线程上没有任何一行等待。
 | `render/windows/renderer.rs` **新增** | 门面（最新帧槽/图集槽/反馈/线程句柄），对应 macOS 的 `renderer.rs` |
 | `render/windows/queue.rs` | `submit` 去掉 `wait_for`；新增 `reset_slot`/`wait_slot_fence`；`submit_immediate` 仅测试保留 |
 | `render/windows/swapchain.rs` | 加 `IDXGISwapChain2`、waitable、`SetMaximumFrameLatency(2)`、`present1`、`resize`（带 flag）、`waitable()` |
-| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）与窗口循环 `gpu_loop`；`resize` 改由 GPU 线程调 |
+| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`resize` 改由 GPU 线程调 |
 | `render/linux/swapchain.rs` | 每 image 一个 `render_finished`；`create` 带 `old`；新增 `recreate`/`retire`；present mode 改 `MAILBOX` |
-| `render/linux/compositor.rs` | 拆出 `GpuRenderer` + `gpu_loop`；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进 |
+| `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进 |
 | `render/linux/renderer.rs` **新增** | 门面（同 Windows） |
 | `render/macos/renderer.rs` | 重写：display link 委托 + 最新帧/最新 drawable 槽 + GPU 循环；删除 mailbox 的 `requeue/wait_retry/poll_completed` |
 | `render/macos/queue.rs` | 删除 `Submitted` 轮询与 `waitUntilCompleted` 背压；`begin` 只取槽；`submit` 只 commit；完成走 `addCompletedHandler` |
@@ -690,3 +720,43 @@ Vulkan / Wayland：
 - [VkSwapchainCreateInfoKHR (oldSwapchain)](https://registry.khronos.org/vulkan/specs/latest/man/html/VkSwapchainCreateInfoKHR.html)、[vkDestroySwapchainKHR](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySwapchainKHR.html)
 - [Vulkan WSI: Wayland Platform](https://github.com/KhronosGroup/Vulkan-Docs/raw/main/chapters/VK_KHR_surface/wsi.adoc)、[swapchain_recreation sample](https://docs.vulkan.org/samples/latest/samples/api/swapchain_recreation/README.html)
 - [VK_KHR_timeline_semaphore](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_timeline_semaphore.html)
+
+---
+
+## 15. 审查修订记录（2026-11-14）
+
+实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；平台实现由后续
+SubAgent 落实的条目单独标「实现修订中」（§15.3）。
+
+### 15.1 本批已闭环
+
+| 项 | 修订 |
+|---|---|
+| `FrameFeedback` 完成语义（P1） | 新增 `latency: Duration = completed_at - published_at`；`completed_at` 明确定义为 GPU 线程**观察到完成**（fence / timeline / completed handler）的时刻；写入跨平台契约：观察到完成才发布、按提交顺序发布、允许覆盖尚未被 UI 取走的上一条（§4.1）。三平台构造点先按当前发布点填 `latency`，平台 SubAgent 随后把发布点移到完成时 |
+| HUD「publish→present」（P1） | HUD 增加 `Latency` 一行（放在 `Present` 之后，符合因果顺序）；`DebugHudMetrics.latency` 来自 `FrameFeedback.latency`，500 ms 平均口径与其它指标一致；`LINES` 10→11、面板高 184→200（§10.3） |
+| `FrameRequest.scale` 死字段（P2） | 三平台都没有功能消费者（只剩 `scale > 0` 的 debug 断言）；删除字段、`window.rs` 的赋值与三平台断言（§4.1） |
+| `FrameOutcome::Committed` 契约（P2） | 文档改为「已交付 GPU 线程」（不等于已呈现；纯 Idle 计划被门禁跳过时也不会交付）；`commit_frame` 的 `# Errors` 改为「窗口路径的 GPU 错误只在 `poll_renderer` 冒泡，`commit_frame` 只在编码/结算失败时返回 `Err`」 |
+| retire 跨过被跳过的序号（P2） | 补单测：提交 1/3/5（2、4 被跳过），`on_completed(4)` 只释放 `retire_at <= 4` 的 1/3，5 保留；`on_completed(5)` 再释放 5（§4.3 / §10.1） |
+| `needs_continuous_frames`（P2） | 重写为单一表达式（去掉 `if … { return true }`），修复新 nightly 的 `clippy::needless_bool`（Linux/macOS 的 `-D warnings` 会因此失败） |
+| 打包最低系统版本（P2） | `Packager.toml` 增加 `[macos] minimumSystemVersion = "14.0"`，与 `.cargo/config.toml` 的 `MACOSX_DEPLOYMENT_TARGET` 一致 |
+
+### 15.2 仍未闭环
+
+- **live resize 探针**（§11 探针 1）：`CAMetalDisplayLink` 在 live resize / 全屏转场期间的
+  回调行为只在普通窗口下验过，drag-resize 连续帧没有形成实机结论。
+- **设备丢失注入**（§10.2）：三平台的错误分类已有单测，但没有 D3D12 debug layer /
+  `VK_EXT_device_fault` / Metal 错误注入的实机用例。
+- **多窗口**（§10.2）：每窗口一条 GPU 线程的结构已就位，但「一个窗口 resize 不影响另一个
+  窗口帧率」未实测。
+- **HUD 实机数值**（§10.3）：`Latency` 行与 publish→present 的 58–60 fps 口径未在三平台
+  实机上采样记录。
+
+### 15.3 实现修订中
+
+以下条款的**文档**已按修订后的语义改写，平台代码由后续 SubAgent 落实：
+
+- §6.7 / §7.7 的关闭握手：不再「2 s 超时后 detach」；UI 线程在关闭时允许等待 GPU 线程退出
+  （Windows 用消息泵无限等，Linux/macOS 直接 `join`，有界于 `acquire` 的 100 ms 超时），F-169。
+- §7.3 的 `image_available` wait stage：平台代码的「先等槽 fence、再 acquire」顺序已与本文一致，
+  但 wait stage 仍是 `COLOR_ATTACHMENT_OUTPUT`，需改为 `TRANSFER`（F-168）。
+

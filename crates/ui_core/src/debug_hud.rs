@@ -28,7 +28,7 @@ use crate::{
 /// HUD 面板逻辑宽度。
 const WIDTH: f32 = 244.0;
 /// HUD 面板逻辑高度。
-const HEIGHT: f32 = 184.0;
+const HEIGHT: f32 = 200.0;
 /// 右上角边距。
 const MARGIN: f32 = 12.0;
 /// 文本左边距。
@@ -40,7 +40,7 @@ const LINE_HEIGHT: f32 = 16.0;
 /// 文本宽度。
 const TEXT_WIDTH: f32 = 224.0;
 /// 文本行数。
-pub(crate) const LINES: usize = 10;
+pub(crate) const LINES: usize = 11;
 /// 指标汇总间隔。
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -52,13 +52,14 @@ const INITIAL_LINES: [&str; LINES] = [
     "GPU     --",
     "Upload  --",
     "Present --",
+    "Latency --",
     "Draw    --",
     "Prims   --",
     "Inst    --",
     "0x0 @ 0.00x",
 ];
 
-/// 10 个文本节点的稳定调试 id。
+/// 11 个文本节点的稳定调试 id。
 const LINE_IDS: [&str; LINES] = [
     "debug-hud.line-0",
     "debug-hud.line-1",
@@ -70,6 +71,7 @@ const LINE_IDS: [&str; LINES] = [
     "debug-hud.line-7",
     "debug-hud.line-8",
     "debug-hud.line-9",
+    "debug-hud.line-10",
 ];
 
 /// 窗口最后提交帧的可观察指标（`Window::debug_hud_metrics` 的载荷）。
@@ -87,6 +89,8 @@ pub(crate) struct DebugHudMetrics {
     pub gpu_time: Option<Duration>,
     /// 后端的 Present CPU 时间。
     pub present_time: Option<Duration>,
+    /// UI 发布 → GPU 完成的时长（`FrameFeedback::latency`；窗口路径只有落后 ≤1 帧的值）。
+    pub latency: Option<Duration>,
     /// 实际发出的 draw call 数。
     pub draw_calls: u32,
     /// 实例缓冲条目数。
@@ -117,6 +121,8 @@ pub(crate) struct DebugHudState {
     gpu_count: u32,
     present_sum: Duration,
     present_count: u32,
+    latency_sum: Duration,
+    latency_count: u32,
     last_draw_calls: u32,
     last_primitives: usize,
     last_instances: u32,
@@ -139,6 +145,7 @@ struct Snapshot {
     gpu_ms: Option<f32>,
     upload_ms: Option<f32>,
     present_ms: Option<f32>,
+    latency_ms: Option<f32>,
     draw_calls: u32,
     primitives: usize,
     instances: u32,
@@ -198,6 +205,8 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
         gpu_count: 0,
         present_sum: Duration::ZERO,
         present_count: 0,
+        latency_sum: Duration::ZERO,
+        latency_count: 0,
         last_draw_calls: 0,
         last_primitives: 0,
         last_instances: 0,
@@ -230,6 +239,10 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
             state.present_sum += present;
             state.present_count = state.present_count.saturating_add(1);
         }
+        if let Some(latency) = metrics.latency {
+            state.latency_sum += latency;
+            state.latency_count = state.latency_count.saturating_add(1);
+        }
         state.last_draw_calls = metrics.draw_calls;
         state.last_primitives = metrics.primitives;
         state.last_instances = metrics.instances;
@@ -243,6 +256,7 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
             gpu_ms: average_ms(state.gpu_sum, state.gpu_count),
             upload_ms: average_ms(state.upload_sum, state.upload_count),
             present_ms: average_ms(state.present_sum, state.present_count),
+            latency_ms: average_ms(state.latency_sum, state.latency_count),
             draw_calls: state.last_draw_calls,
             primitives: state.last_primitives,
             instances: state.last_instances,
@@ -262,6 +276,8 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
         state.gpu_count = 0;
         state.present_sum = Duration::ZERO;
         state.present_count = 0;
+        state.latency_sum = Duration::ZERO;
+        state.latency_count = 0;
     }
 
     window.request_damage(hud_rect(window.size()));
@@ -367,6 +383,7 @@ fn format_lines(snapshot: &Snapshot) -> [SmolStr; LINES] {
         format_smolstr!("GPU     {}", ms_text(snapshot.gpu_ms)),
         format_smolstr!("Upload  {}", ms_text(snapshot.upload_ms)),
         format_smolstr!("Present {}", ms_text(snapshot.present_ms)),
+        format_smolstr!("Latency {}", ms_text(snapshot.latency_ms)),
         format_smolstr!("Draw    {}", count_text(snapshot.draw_calls)),
         format_smolstr!("Prims   {}", count_text(snapshot.primitives)),
         format_smolstr!("Inst    {}", count_text(snapshot.instances)),
@@ -441,7 +458,7 @@ mod tests {
         assert_eq!(rect.origin.x, 960.0 - 244.0 - 12.0);
         assert_eq!(rect.origin.y, 12.0);
         assert_eq!(rect.size.width, 244.0);
-        assert_eq!(rect.size.height, 184.0);
+        assert_eq!(rect.size.height, 200.0);
     }
 
     #[test]
@@ -451,11 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn initial_lines_are_ten_placeholders_without_fake_zeroes() {
+    fn initial_lines_are_eleven_placeholders_without_fake_zeroes() {
         let lines = initial_lines();
         assert_eq!(lines.len(), LINES);
         assert_eq!(lines[0].as_str(), "FPS     --");
-        assert_eq!(lines[6].as_str(), "Draw    --");
+        assert_eq!(lines[6].as_str(), "Latency --");
+        assert_eq!(lines[7].as_str(), "Draw    --");
     }
 
     #[test]
@@ -467,6 +485,7 @@ mod tests {
             gpu_ms: Some(1.1),
             upload_ms: Some(0.08),
             present_ms: Some(0.3),
+            latency_ms: Some(4.5),
             draw_calls: 12,
             primitives: 48,
             instances: 52,
@@ -480,11 +499,12 @@ mod tests {
         assert_eq!(lines[3].as_str(), "GPU     1.10 ms");
         assert_eq!(lines[4].as_str(), "Upload  0.08 ms");
         assert_eq!(lines[5].as_str(), "Present 0.30 ms");
-        assert_eq!(lines[6].as_str(), "Draw    12");
-        assert_eq!(lines[7].as_str(), "Prims   48");
-        assert_eq!(lines[8].as_str(), "Inst    52");
-        assert!(lines[9].starts_with("960x740 @ 1.25x "));
-        assert!(lines[9].ends_with(backend_name()));
+        assert_eq!(lines[6].as_str(), "Latency 4.50 ms");
+        assert_eq!(lines[7].as_str(), "Draw    12");
+        assert_eq!(lines[8].as_str(), "Prims   48");
+        assert_eq!(lines[9].as_str(), "Inst    52");
+        assert!(lines[10].starts_with("960x740 @ 1.25x "));
+        assert!(lines[10].ends_with(backend_name()));
 
         let unknown = format_lines(&Snapshot {
             physical_width: 800,
@@ -494,8 +514,9 @@ mod tests {
         });
         assert_eq!(unknown[0].as_str(), "FPS     --");
         assert_eq!(unknown[3].as_str(), "GPU     --");
-        assert_eq!(unknown[7].as_str(), "Prims   0");
-        assert!(unknown[9].starts_with("800x600 @ 1.00x "));
+        assert_eq!(unknown[6].as_str(), "Latency --", "缺失值不能用 0 冒充");
+        assert_eq!(unknown[8].as_str(), "Prims   0");
+        assert!(unknown[10].starts_with("800x600 @ 1.00x "));
     }
 
     #[test]

@@ -160,6 +160,25 @@ mod tests {
     }
 
     #[test]
+    fn skipped_frame_indices_do_not_block_retirement() {
+        // 提交序号 1、3、5（2、4 被跳过：没有 GPU 工作，也就不会出现在完成通知里）。
+        let mut queue = RetireQueue::new();
+        for frame in [1, 3, 5] {
+            queue.retire(index(frame), handle(frame));
+        }
+
+        // 完成通知只报「真正提交过」的最大序号 4（§4.3：completed 直接跨过被跳过的序号）。
+        let mut freed = Vec::new();
+        assert_eq!(queue.on_completed(index(4), &mut |h| freed.push(h)), 2);
+        assert_eq!(freed, vec![handle(1), handle(3)]);
+        assert_eq!(queue.pending(), 1, "5 的句柄不得提前释放");
+
+        assert_eq!(queue.on_completed(index(5), &mut |h| freed.push(h)), 1);
+        assert_eq!(freed, vec![handle(1), handle(3), handle(5)]);
+        assert_eq!(queue.pending(), 0);
+    }
+
+    #[test]
     fn empty_queue_is_stable() {
         let mut queue = RetireQueue::new();
         assert_eq!(queue.pending(), 0);

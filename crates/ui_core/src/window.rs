@@ -158,7 +158,8 @@ pub(crate) enum FrameState {
 pub enum FrameOutcome {
     /// 本帧没有像素要画：不跑 pass、不编码、不提交、`FrameIndex` 不变（I3）。
     Idle,
-    /// 已提交；序号 = 本次提交后的 `FrameIndex`。
+    /// 已交付 GPU 线程（**不等于**已呈现；纯 Idle 计划被门禁跳过时也不会交付）。
+    /// 序号 = 本次提交后的 `FrameIndex`。
     Committed(FrameIndex),
 }
 
@@ -279,6 +280,9 @@ pub struct Window {
     /// 最近一帧的实际 GPU 绘制统计（P17 HUD）。
     #[cfg(feature = "hud")]
     render_stats: crate::render::RenderStats,
+    /// 最近一次反馈帧的「发布 → GPU 完成」时长（HUD 的 Latency 行；窗口路径落后 ≤1 帧）。
+    #[cfg(feature = "hud")]
+    last_frame_latency: Option<std::time::Duration>,
     /// 最近一帧的 CPU 时间（`begin_frame` → `paint_frame` 结束）。
     #[cfg(feature = "hud")]
     frame_cpu: Option<std::time::Duration>,
@@ -325,6 +329,8 @@ impl Window {
             ime_cursor: None,
             #[cfg(feature = "hud")]
             render_stats: crate::render::RenderStats::default(),
+            #[cfg(feature = "hud")]
+            last_frame_latency: None,
             #[cfg(feature = "hud")]
             frame_cpu: None,
             #[cfg(feature = "hud")]
@@ -671,13 +677,21 @@ impl Window {
     /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
     ///
     /// GPU 线程以错误退出后这里会持续返回同一个错误（粘性），平台泵在下一轮冒泡出去。
+    /// 反馈本身由渲染器消费（统计 / GPU 采样），这里只把 HUD 需要的发布时间延迟记到窗口上：
+    /// 反馈是最新者胜，窗口永远拿到最近一次完成帧的 `latency`。
     pub(crate) fn poll_renderer(&mut self) -> Result<(), EngineError> {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        // 三平台窗口路径一致：反馈（统计 / GPU 采样）由渲染器内部消费，这里只把错误冒泡。
-        // 离屏路径的 `poll` 恒为 `Ok(None)`。
-        let _ = renderer.poll()?;
+        // 三平台窗口路径一致：`poll` 返回 `Result<Option<FrameFeedback>, EngineError>`，
+        // 离屏路径恒为 `Ok(None)`。
+        let feedback = renderer.poll()?;
+        #[cfg(feature = "hud")]
+        if let Some(feedback) = feedback {
+            self.last_frame_latency = Some(feedback.latency);
+        }
+        #[cfg(not(feature = "hud"))]
+        let _ = feedback;
         Ok(())
     }
 
@@ -800,8 +814,9 @@ impl Window {
     /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画 ⇒ 不提交、`FrameIndex` 不变。
     ///
     /// # Errors
-    /// 挂了渲染器时，GPU 提交失败（device lost / present 失败 / swapchain 重建失败）会原样返回；
-    /// 此时 `FrameIndex` 已递增、damage 已结算，调用方**不得**重试本帧。
+    /// 窗口路径的 GPU 错误（device lost / present 失败 / swapchain 重建失败）**不**从这里返回：
+    /// 本方法只把帧发布给 GPU 线程（不等待），错误由 `poll_renderer` 粘性冒泡。本方法自身只在
+    /// 编码/帧结算失败时返回 `Err`；返回 `Err` 时本帧不得重试。
     pub(crate) fn commit_frame(
         &mut self,
         ticket: FrameTicket,
@@ -887,7 +902,6 @@ impl Window {
             payload: FramePayload::from_buffer(self.instance_buffer()),
             plan,
             surface,
-            scale: self.scale.factor(),
             published_at: Instant::now(),
         })
     }
@@ -978,6 +992,7 @@ impl Window {
         self.frame_interval = None;
         self.last_commit_at = None;
         self.frame_started_at = None;
+        self.last_frame_latency = None;
     }
 
     /// 记录一次提交的时间戳（P17 HUD 的帧间隔/FPS 来源）。
@@ -1037,6 +1052,7 @@ impl Window {
             upload_time,
             gpu_time,
             present_time,
+            latency: self.last_frame_latency,
             draw_calls: self.render_stats.draw_calls,
             instances: self.render_stats.instances,
             primitives: self.scene.primitive_count(),

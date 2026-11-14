@@ -29,7 +29,7 @@
 
 - 给 `ui_core` 提供可复用的运行时 Debug HUD，而不是 demo 私有实现。
 - 显示常用引擎调试数据：**FPS、平均帧时间、DrawCall、图元数、GPU 实例数、CPU/GPU 帧耗时、
-  Upload/Present 耗时、物理分辨率、DPI 缩放、渲染后端**。
+  Upload/Present 耗时、UI 发布 → GPU 完成的延迟、物理分辨率、DPI 缩放、渲染后端**。
 - HUD 可见时给出真实的可观察帧率：持续驱动窗口出帧，而不是只在应用恰好重绘时更新。
 - HUD 不能改变文档布局、不能截获指针/键盘焦点、不能出现在无障碍树中。
 - 通过 Cargo feature 可完全关闭；关闭后不编译 HUD 代码，也不改变平台事件循环行为。
@@ -69,7 +69,7 @@ pub fn set_debug_hud(&mut self, window: WindowId, enabled: bool) -> Result<(), E
 
 - 窗口不存在 ⇒ `EngineError::UnknownWindow`（**无论 `enabled` 是 true 还是 false**）。
 - `true`：已开启且 HUD 子树仍存在 ⇒ 幂等 no-op；map 中的句柄已陈旧（应用手动删了子树）⇒ 重建。
-- 首次开启：在 root 末尾挂载 HUD 子树（节点 id：`debug-hud` / `debug-hud.line-0` … `debug-hud.line-9`），
+- 首次开启：在 root 末尾挂载 HUD 子树（节点 id：`debug-hud` / `debug-hud.line-0` … `debug-hud.line-10`），
   重置该窗口的 HUD 提交时间基准并请求一帧。
 - `false`：移除 HUD 子树和采样状态；不存在的 HUD 是 no-op（窗口仍必须存在）。
 - 关闭后再开启会重新建树、重新从 0 采样；不保留旧文本。
@@ -93,9 +93,9 @@ demo / 应用不需要知道 HUD 内部结构。避免为「未来自定义样�
 
 ### 3.1 视觉
 
-- 固定面板 `244 × 184` 逻辑像素，右上角 `12 px` 边距。
+- 固定面板 `244 × 200` 逻辑像素，右上角 `12 px` 边距。
 - 背景 `#0A0E14`、约 86% 不透明；1 px 边框 `#374658`，8 px 圆角。
-- 单行文本：字号 `11.5`、行高 `1.3`、颜色 `#DCE2EB`；10 行，行距固定 `16 px`。
+- 单行文本：字号 `11.5`、行高 `1.3`、颜色 `#DCE2EB`；11 行，行距固定 `16 px`。
 - 标签全部英文缩写，值宽度用空格补齐；没有字体依赖（沿用引擎 `FontStack::system_ui`）。
 
 面板宽度 / 高度为常量；文本节点用 `LayoutOverride` 固定在面板内。窗口变窄时 HUD 可以越出左边界
@@ -105,14 +105,14 @@ demo / 应用不需要知道 HUD 内部结构。避免为「未来自定义样�
 
 ```text
 root
-└── Box[debug-hud]                    absolute, right:12, top:12, 244×184
+└── Box[debug-hud]                    absolute, right:12, top:12, 244×200
     ├── Text[debug-hud.line-0]        LayoutOverride(10, 8, 224, 16)
     ├── Text[debug-hud.line-1]        LayoutOverride(10, 24, 224, 16)
     ├── ...
-    └── Text[debug-hud.line-9]        LayoutOverride(10, 152, 224, 16)
+    └── Text[debug-hud.line-10]       LayoutOverride(10, 168, 224, 16)
 ```
 
-- 10 个固定文本节点，每行独立 `LayoutOverride`；不使用多行字符串，避免依赖 parley 对
+- 11 个固定文本节点，每行独立 `LayoutOverride`；不使用多行字符串，避免依赖 parley 对
   `\n` 的断行/行高细节，也让行距完全由 HUD 常量决定。
 - HUD 根节点 `hit_shape(|_| false)`，每个文本节点同样；所有节点 `A11yOverride { hidden: true }`。
 - HUD 不声明 `Action` / `Drag` / `FocusRing`，因此不会进入 Tab 序；**不使用 `bind_style`**
@@ -128,7 +128,7 @@ root
 
 ### 3.3 文本行
 
-固定 10 行：
+固定 11 行：
 
 ```text
 FPS     60.0
@@ -137,6 +137,7 @@ CPU      0.42 ms
 GPU      1.10 ms
 Upload   0.08 ms
 Present  0.30 ms
+Latency  4.50 ms
 Draw       12
 Prims      48
 Inst       52
@@ -151,6 +152,9 @@ Inst       52
 - `GPU`：后端 timestamp（Windows D3D12 query / Metal GPUStart-End / Vulkan query）的平均值；
   计时不可用显示 `--`。
 - `Upload` / `Present`：`FrameTimings` 的 CPU 段平均值；不可用显示 `--`。
+- `Latency`：UI 发布 → GPU 线程**观察到该帧完成**的时长（`FrameFeedback::latency =
+  completed_at - published_at`，见 `async-render-pipeline.md` §4.1）；窗口路径落后 ≤1 帧，
+  首个反馈到达前显示 `--`。放在 `Present` 之后：它是发布之后的因果结果。
 - `Draw`：上一提交帧实际发出的 API draw call 数（三平台后端逐次计数；含 HUD 自身）。
 - `Prims`：上一提交帧 `Scene::primitive_count()`（按绘制序，包含 clip 指令）。
 - `Inst`：上一提交帧 `Renderer::submit` 回报的实例数（与 `InstanceBuffer` 条目数同源，
@@ -181,8 +185,8 @@ Inst       52
 
 - `FPS = interval_count / interval_sum`（`interval_sum` 单位为秒；`None`/零间隔不计入）；
 - `Frame = interval_sum / interval_count`（毫秒）；
-- `CPU/GPU/Upload/Present = sum / count`（各自可用样本数）；
-- 生成 `[SmolStr; 10]` 并存入 `DebugHudState.pending_text`，**不**在这里改树；
+- `CPU/GPU/Upload/Present/Latency = sum / count`（各自可用样本数）；
+- 生成 `[SmolStr; 11]` 并存入 `DebugHudState.pending_text`，**不**在这里改树；
 - 清空累计器，下一窗从 0 开始。
 
 首个 500 ms 窗口内显示初始占位文本；至少两个提交帧后才有 FPS 数值。
@@ -190,7 +194,7 @@ Inst       52
 文本写入分两段（`App::frame` 内）：
 
 1. 帧门禁之前：`prepare_frame` 采样并只写 `pending_text` + 请求 HUD damage；
-2. `refresh_styles` 之后、`refresh_text` 之前：`apply_frame` 把 `pending_text` 直接写入 10 个文本节点
+2. `refresh_styles` 之后、`refresh_text` 之前：`apply_frame` 把 `pending_text` 直接写入 11 个文本节点
    （`NodeTree::set_text_content`）并 `mark_paint`；
 3. 提交成功后 `finish_frame` 才清 `pending_text`。若本帧在中途中止，下一帧 `apply_frame` 会重写同一文本
    并重新标 PAINT，避免无绑定节点被下一次 `refresh_styles` 的 ghost 分支吞掉。
@@ -199,7 +203,7 @@ Inst       52
 `mark_paint` 发生在 `refresh_styles` **之后**，不会被样式 pass 的 `clear_paint` 吞掉；随后
 `refresh_text` 按新内容重新 shape。首个 500 ms 内只有占位文本，不需要信号驱动。
 
-10 个文本节点都有 `LayoutOverride`（尺寸固定），因此 `refresh_text` 对它们**不**置 `LAYOUT`：
+11 个文本节点都有 `LayoutOverride`（尺寸固定），因此 `refresh_text` 对它们**不**置 `LAYOUT`：
 文本 intrinsic size 变化不影响布局；`layout_text` 仍会按新 `ShapedText` 重排/重建 `ShapedLine`，
 HUD 更新不会触发全窗口重排（实现于 `App::refresh_text` 的 `fixed_layout` 分支）。
 
@@ -233,7 +237,7 @@ pub(crate) struct RenderStats {
 `Window` 保存最近一次 `RenderStats`；测试用 `TestApp` 无渲染器时保持默认 0。
 Windows 的 WARP 测试同时覆盖 full（1 次）与 partial（2 个 scissor = 2 次）两种规则。
 
-### 4.3 CPU / GPU / Upload / Present
+### 4.3 CPU / GPU / Upload / Present / Latency
 
 现有 `FrameTimings` 已经由三平台后端填充 `Upload` / `Gpu` / `Present`。给 `FrameTimings` 增加
 crate 私有只读 `sample(Section) -> Option<GpuTimerSample>`；HUD 在提交后读取并累积。
@@ -245,21 +249,19 @@ HUD 需要在应用没有其他动画时也持续出帧，否则 FPS 无法反�
 
 ```rust
 pub(crate) fn needs_continuous_frames(&self) -> bool {
-    if self.has_animations() {
-        return true;
-    }
     #[cfg(feature = "hud")]
     {
-        // 只统计 root 仍存在的 HUD（应用手动删树时不会永久空转）。
-        self.debug_hud.iter().any(|(window, state)| {
-            self.windows
-                .get(window)
-                .is_some_and(|target| target.tree().get(state.root()).is_ok())
-        })
+        self.has_animations()
+            || self.debug_hud.iter().any(|(window, state)| {
+                // 只统计 root 仍存在的 HUD（应用手动删树时不会永久空转）。
+                self.windows
+                    .get(window)
+                    .is_some_and(|target| target.tree().get(state.root()).is_ok())
+            })
     }
     #[cfg(not(feature = "hud"))]
     {
-        false
+        self.has_animations()
     }
 }
 ```
@@ -316,7 +318,7 @@ pub(crate) fn needs_continuous_frames(&self) -> bool {
 
 | 层   | 位置                               | 断言                                                                                                                                       |
 |------|------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| 单元 | `src/debug_hud.rs`                 | 格式：10 行固定顺序、未知 GPU 为 `--`、FPS/CPU/GPU/Upload/Present、分辨率/DPI/后端；`hud_rect` 随窗口宽高变化                              |
+| 单元 | `src/debug_hud.rs`                 | 格式：11 行固定顺序、未知 GPU/Latency 为 `--`、FPS/CPU/GPU/Upload/Present/Latency、分辨率/DPI/后端；`hud_rect` 随窗口宽高变化 |
 | 单元 | `src/render/stats.rs`              | `RenderStats` 默认值、字段语义                                                                                                             |
 | 单元 | `src/render/windows/compositor.rs` | 已知 ops 的 draw call 计数（Instances 1 次 + Geometry 1 次；空 len 不计）                                                                  |
 | 单元 | `src/render/timer.rs`              | `FrameTimings::sample` 缺失/存在、同段首条；分段值语义                                                                                     |
@@ -349,6 +351,8 @@ cargo check -p ui_core --features hud --target aarch64-apple-darwin
   HUD 反映的是引擎提交节奏。
 - CPU 行不含 GPU 提交与 Present 等待；GPU/Upload/Present 分开显示。offscreen 窗口没有 swapchain 时
   Present 段可能是 0.00 ms 而不是 `--`。
+- `Latency` 只有窗口路径有值（来自 `FrameFeedback`），且落后 ≤1 帧；离屏/快照路径恒为 `--`。
+  它测量的是「UI 发布 → GPU 线程观察到完成」，不是「Present 到屏幕」的完整显示延迟。
 - 小窗口上 HUD 面板可能占 damage 面积 > 50%，`DamageAccumulator` 会退化为 full damage；此时
   “partial 提交”不成立，但 HUD 仍持续出帧（功能正确，带宽不最优）。
 - 窗口最小化/被完全遮挡时不做可见性过滤，HUD 可见期间仍按 tick 唤醒（§5）。

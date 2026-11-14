@@ -57,3 +57,9 @@ preinstallSection = "ManifestDPIAware true"
 depends = ["libxkbcommon0", "libwayland-client0", "libxcb1", "libvulkan1"]
 section = "utils"
 priority = "optional"
+
+# macOS: CAMetalDisplayLink (the async present-pacing primitive) is macOS 14.0+
+# (design/async-render-pipeline.md §5.3). Keep this equal to MACOSX_DEPLOYMENT_TARGET
+# in .cargo/config.toml; it becomes LSMinimumSystemVersion in the .app bundle.
+[macos]
+minimumSystemVersion = "14.0"

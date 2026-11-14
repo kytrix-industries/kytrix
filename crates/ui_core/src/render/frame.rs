@@ -8,7 +8,7 @@
 //! `FrameIndex` 本身留在 `window.rs`（P06 的公开 API 返回类型，DEVIATIONS F-74）；本模块只提供
 //! 「槽位 + 需要等待/将要 signal 的 fence 值」（`render/windows/queue.rs` 消费）与帧交付数据。
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -94,21 +94,27 @@ pub(crate) struct FrameRequest {
     pub plan: Plan,
     /// 目标物理像素（resize 的唯一来源，§4.4）。
     pub surface: (u32, u32),
-    /// DPI 比例（macOS 写图层 / 诊断）。
-    pub scale: f32,
-    /// HUD 的发布延迟基准。
+    /// HUD 的发布延迟基准（[`FrameFeedback::latency`] 的起点）。
     pub published_at: Instant,
 }
 
 /// GPU 线程 → UI 线程的一帧反馈（§4.1）。
 ///
 /// 窗口路径的 `RenderStats` / GPU 采样从这里取（落后 ≤1 帧）；离屏路径保持同步返回。
+///
+/// **跨平台契约**：GPU 线程必须在**观察到**该帧的 GPU 工作完成之后才发布反馈（fence /
+/// timeline / completed handler），不得在只是「提交了」的时候发布；反馈按提交顺序发布；
+/// 允许覆盖尚未被 UI 线程取走的上一条（反馈槽是最新者胜，不是队列）。
 pub(crate) struct FrameFeedback {
     pub index: FrameIndex,
     pub stats: RenderStats,
     pub samples: Vec<GpuTimerSample>,
-    /// 命令列表完成时刻（近似呈现时刻），HUD 的 publish→完成 延迟。
+    /// GPU 线程**观察到该帧 GPU 工作完成**的时刻（fence / timeline / completed handler），
+    /// 不是 `Present` 返回的时刻。
     pub completed_at: Instant,
+    /// `completed_at - published_at`：UI 线程发布本帧到 GPU 完成的时长（HUD 的
+    /// publish→present 一栏）。起点是 [`FrameRequest::published_at`]。
+    pub latency: Duration,
 }
 
 /// 最新帧槽：**最新者胜 + damage 合并**（§4.2 / I5）。
@@ -125,7 +131,7 @@ impl LatestFrame {
         Self { pending: None }
     }
 
-    /// 放入一帧；已有未取走的帧时保留**新**的 payload/surface/scale，把旧的 damage 合并进新的
+    /// 放入一帧；已有未取走的帧时保留**新**的 payload/surface，把旧的 damage 合并进新的
     /// plan（[`Plan::merge`]），旧请求的 `index` 丢弃 —— 它不会产生任何 GPU 工作。
     pub(crate) fn publish(&mut self, request: FrameRequest) {
         let Some(previous) = self.pending.as_mut() else {
@@ -250,7 +256,6 @@ mod tests {
             payload: FramePayload::empty(),
             plan,
             surface: (64, 64),
-            scale: 1.0,
             published_at: Instant::now(),
         }
     }

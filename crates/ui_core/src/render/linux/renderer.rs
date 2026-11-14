@@ -332,6 +332,15 @@ impl WindowRenderer {
                     || feedback.completed_at >= published),
             "frame feedback completed before it was published"
         );
+        // `latency` 的定义是 `completed_at - published_at`：本帧的发布时刻可查时，它不能超过
+        // 反馈自己记录的完成延迟（Linux 的 `latency` 与 `completed_at` 各取一次 `now`）。
+        debug_assert!(
+            self.last_published
+                .is_none_or(|(index, published)| index != feedback.index
+                    || feedback.latency
+                        <= feedback.completed_at.saturating_duration_since(published)),
+            "frame latency must not exceed the feedback's completion delay"
+        );
         #[cfg(feature = "hud")]
         {
             self.samples = feedback.samples.clone();
@@ -565,11 +574,6 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
             shared.wait_for_work();
             continue;
         };
-        // 发布侧契约：帧必须带正的 DPI 比例（Linux 的物理像素由平台层算好，`scale` 只作诊断）。
-        debug_assert!(
-            request.scale > 0.0,
-            "the published frame must carry a positive DPI scale"
-        );
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
@@ -593,6 +597,8 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
                     index: request.index,
                     stats,
                     samples,
+                    // UI 发布 → GPU 完成（当前发布点在 present 返回后）。
+                    latency: Instant::now().saturating_duration_since(request.published_at),
                     // 命令缓冲完成时刻（近似呈现时刻）。
                     completed_at: Instant::now(),
                 });
@@ -661,7 +667,6 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
-            scale: 1.0,
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, Plan::Full));

@@ -1898,20 +1898,18 @@ impl App {
 
     /// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
     pub(crate) fn needs_continuous_frames(&self) -> bool {
-        if self.has_animations() {
-            return true;
-        }
         #[cfg(feature = "hud")]
         {
-            self.debug_hud.iter().any(|(window, state)| {
-                self.windows
-                    .get(window)
-                    .is_some_and(|target| target.tree().get(state.root()).is_ok())
-            })
+            self.has_animations()
+                || self.debug_hud.iter().any(|(window, state)| {
+                    self.windows
+                        .get(window)
+                        .is_some_and(|target| target.tree().get(state.root()).is_ok())
+                })
         }
         #[cfg(not(feature = "hud"))]
         {
-            false
+            self.has_animations()
         }
     }
 

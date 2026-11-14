@@ -473,6 +473,14 @@ impl WindowRenderer {
                     || feedback.completed_at >= published),
             "frame feedback completed before it was published"
         );
+        // `latency` 的定义是 `completed_at - published_at`（macOS 用同一个 `completed_at` 计算）。
+        debug_assert!(
+            self.last_published
+                .is_none_or(|(index, published)| index != feedback.index
+                    || feedback.latency
+                        <= feedback.completed_at.saturating_duration_since(published)),
+            "frame latency must not exceed the feedback's completion delay"
+        );
         #[cfg(feature = "hud")]
         {
             self.samples = feedback.samples.clone();
@@ -787,8 +795,11 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
     enter_gpu_thread();
     // 退出（含 panic）时通知 UI 线程；`Drop` 的 `recv_timeout` 因此有界。
     let _exit = ExitSignal(done);
-    // 已提交、等完成通知的帧的统计（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。
-    let mut submitted: VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>)> = VecDeque::new();
+    // 已提交、等完成通知的帧的统计与发布时刻（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。
+    // 元组末项是 `FrameRequest::published_at`：macOS 的反馈在**完成通知**里发布，
+    // 那时 `request` 已经不在作用域内，所以发布基准要随提交一起记账。
+    let mut submitted: VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)> =
+        VecDeque::new();
     loop {
         shared.wait_for_work();
         if let Err(error) = drain_completions(&mut renderer, &shared, &mut submitted) {
@@ -818,10 +829,6 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
             renderer.release_upload_slot();
             continue;
         };
-        debug_assert!(
-            request.scale > 0.0,
-            "the published frame must carry a positive DPI scale"
-        );
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
@@ -850,7 +857,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
         match renderer.submit_frame(&request, &drawable.0, &mut frame, completed) {
             Ok((stats, samples)) => {
                 shared.note_submitted();
-                submitted.push_back((index, stats, samples));
+                submitted.push_back((index, stats, samples, request.published_at));
             }
             Err(error) => {
                 shared.publish_error(error);
@@ -865,21 +872,25 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
 fn drain_completions(
     renderer: &mut GpuRenderer,
     shared: &Shared,
-    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>)>,
+    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)>,
 ) -> Result<(), EngineError> {
     for completion in shared.take_completions() {
         let index = completion.index;
         let sample = renderer.on_frame_completed(index, &completion.buffer.0)?;
-        let (stats, mut samples) = take_submitted(submitted, index).unwrap_or_default();
+        let (stats, mut samples, published_at) = take_submitted(submitted, index)
+            .unwrap_or_else(|| (RenderStats::default(), Vec::new(), Instant::now()));
         if let Some(sample) = sample {
             samples.push(sample);
         }
+        let completed_at = Instant::now();
         shared.publish_feedback(FrameFeedback {
             index,
             stats,
             samples,
+            // UI 发布 → 观察到 GPU 完成（HUD 的 publish→present）。
+            latency: completed_at.saturating_duration_since(published_at),
             // 完成通知到达（GPU 线程被唤醒）的时刻，近似呈现时刻。
-            completed_at: Instant::now(),
+            completed_at,
         });
     }
     Ok(())
@@ -887,13 +898,15 @@ fn drain_completions(
 
 /// 取走某帧提交时记录的统计（完成通知理论上按提交顺序到达，这里按序号匹配，不依赖顺序）。
 fn take_submitted(
-    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>)>,
+    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)>,
     index: FrameIndex,
-) -> Option<(RenderStats, Vec<GpuTimerSample>)> {
-    let position = submitted.iter().position(|(frame, _, _)| *frame == index)?;
+) -> Option<(RenderStats, Vec<GpuTimerSample>, Instant)> {
+    let position = submitted
+        .iter()
+        .position(|(frame, _, _, _)| *frame == index)?;
     submitted
         .remove(position)
-        .map(|(_, stats, samples)| (stats, samples))
+        .map(|(_, stats, samples, published_at)| (stats, samples, published_at))
 }
 
 #[cfg(test)]
@@ -946,7 +959,6 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
-            scale: 1.0,
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, crate::render::compositor::Plan::Full));
