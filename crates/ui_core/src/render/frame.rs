@@ -160,7 +160,7 @@ pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 /// 一帧要用的槽位与 fence 值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameSlot {
-    /// ring 槽位（`0..MAX_FRAMES_IN_FLIGHT`）。
+    /// ring 槽位（`0..MAX_FRAMES_IN_FLIGHT`），来自 [`InFlightRing::acquire`] 的轮转。
     pub index: usize,
     /// 进入本帧前必须等待到达的 fence 值（0 = 该槽从未使用，无需等待）。
     pub wait_value: u64,
@@ -168,9 +168,11 @@ pub(crate) struct FrameSlot {
     pub signal_value: u64,
 }
 
-/// ring 的 fence 记账（唯一状态是「每个槽最后一次提交的值」）。
+/// ring 的 fence 记账 + 槽位轮转（「每个槽最后一次提交的值」+ 下一次提交的槽位）。
 pub(crate) struct InFlightRing {
     slot_values: [u64; MAX_FRAMES_IN_FLIGHT],
+    /// 下一次 [`InFlightRing::acquire`] 给出的槽位（0 → 1 → 2 → 0）。
+    next_slot: usize,
     next_value: u64,
 }
 
@@ -178,16 +180,25 @@ impl InFlightRing {
     pub(crate) const fn new() -> Self {
         Self {
             slot_values: [0; MAX_FRAMES_IN_FLIGHT],
+            next_slot: 0,
             next_value: 0,
         }
     }
 
-    /// 取本帧槽位（不修改状态；提交成功后才 [`InFlightRing::advance`]）。
-    pub(crate) fn acquire(&self, index: FrameIndex) -> FrameSlot {
-        let slot = slot_of(index);
+    /// 取本帧槽位：按**提交次数**轮转（0 → 1 → 2 → 0），不推进 fence 记账（提交成功后才
+    /// [`InFlightRing::advance`]）。
+    ///
+    /// 槽位**不能**由 `FrameIndex` 取模决定：最新帧槽合并时会丢掉被覆盖帧的序号
+    /// （[`LatestFrame`]），序号在一次提交与下一次提交之间的跨度可以是任意值；而平台的背压
+    /// 原语（macOS 的三 permit semaphore、三槽上传缓冲）按提交次数轮转。两者不同源时，跨度
+    /// 为 3 的倍数的两个提交会落到同一个上传槽 —— 后一个在 CPU 上重写 GPU 仍在读的缓冲
+    /// （内容损坏，Metal validation 检测不到）。
+    pub(crate) fn acquire(&mut self) -> FrameSlot {
+        let index = self.next_slot;
+        self.next_slot = (index + 1) % MAX_FRAMES_IN_FLIGHT;
         FrameSlot {
-            index: slot,
-            wait_value: self.slot_values[slot],
+            index,
+            wait_value: self.slot_values[index],
             signal_value: self.next_value + 1,
         }
     }
@@ -204,12 +215,6 @@ impl InFlightRing {
     }
 }
 
-/// `FrameIndex` → ring 槽位。`0` 是「从未提交」的非法值（`FrameScheduler::commit` 保证 ≥ 1）。
-fn slot_of(index: FrameIndex) -> usize {
-    debug_assert!(index.get() >= 1, "FrameIndex 0 从未提交");
-    (index.get() as usize) % MAX_FRAMES_IN_FLIGHT
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -222,12 +227,6 @@ mod tests {
         render::compositor::{DamageRects, Plan},
         window::FrameIndex,
     };
-
-    fn index(value: u32) -> FrameIndex {
-        // `FrameIndex` 的字段是私有的；测试用 `Default` + 提交语义之外的路径不可用，
-        // 因此这里通过 `FrameIndex` 的公开构造面（同一 crate 内）走 `From` 语义的替身。
-        FrameIndex::from_raw(value)
-    }
 
     fn partial(rects: &[PhysicalRect]) -> Plan {
         let mut plan = DamageRects::new();
@@ -249,20 +248,17 @@ mod tests {
 
     #[test]
     fn slots_cycle_through_the_ring() {
-        let ring = InFlightRing::new();
-        let slots: Vec<usize> = (1..=7)
-            .map(|value| ring.acquire(index(value)).index)
-            .collect();
-        assert_eq!(slots, vec![1, 2, 0, 1, 2, 0, 1]);
-        assert_eq!(slots.len(), 7);
+        let mut ring = InFlightRing::new();
+        let slots: Vec<usize> = (0..7).map(|_| ring.acquire().index).collect();
+        assert_eq!(slots, vec![0, 1, 2, 0, 1, 2, 0]);
         assert_eq!(MAX_FRAMES_IN_FLIGHT, 3);
     }
 
     #[test]
     fn first_use_of_each_slot_has_no_wait() {
         let mut ring = InFlightRing::new();
-        for value in 1..=3 {
-            let slot = ring.acquire(index(value));
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let slot = ring.acquire();
             assert_eq!(slot.wait_value, 0, "slot {} must not wait", slot.index);
             ring.advance(slot);
         }
@@ -271,16 +267,16 @@ mod tests {
     #[test]
     fn wait_value_is_the_previous_submission_of_that_slot() {
         let mut ring = InFlightRing::new();
-        let first = ring.acquire(index(1));
+        let first = ring.acquire();
         ring.advance(first);
-        let second = ring.acquire(index(2));
+        let second = ring.acquire();
         ring.advance(second);
-        let third = ring.acquire(index(3));
+        let third = ring.acquire();
         ring.advance(third);
 
-        // frame 4 落在 slot 1（frame 1 的槽），必须等 frame 1 的 signal 值。
-        let fourth = ring.acquire(index(4));
-        assert_eq!(fourth.index, 1);
+        // 第 4 次提交回到 slot 0（第 1 次提交的槽），必须等第 1 次的 signal 值。
+        let fourth = ring.acquire();
+        assert_eq!(fourth.index, 0);
         assert_eq!(fourth.wait_value, first.signal_value);
         assert_eq!(fourth.signal_value, 4);
     }
@@ -289,8 +285,8 @@ mod tests {
     fn signal_values_are_monotonic() {
         let mut ring = InFlightRing::new();
         let mut previous = 0;
-        for value in 1..=9 {
-            let slot = ring.acquire(index(value));
+        for _ in 0..9 {
+            let slot = ring.acquire();
             assert_eq!(slot.signal_value, previous + 1);
             previous = slot.signal_value;
             ring.advance(slot);
@@ -301,16 +297,55 @@ mod tests {
     #[test]
     fn advance_only_touches_its_own_slot() {
         let mut ring = InFlightRing::new();
-        let slot = ring.acquire(index(2));
+        let first = ring.acquire();
+        ring.advance(first);
+        let second = ring.acquire();
+        // 手动写入一个非连续的值：它只能影响 slot 1 的记账。
         ring.advance(FrameSlot {
-            index: 2,
+            index: second.index,
             wait_value: 0,
             signal_value: 41,
         });
-        let again = ring.acquire(index(2));
-        assert_eq!(again.wait_value, 41);
-        assert_eq!(ring.acquire(index(3)).wait_value, 0);
-        let _ = slot;
+        // slot 2 从未提交过，等待值必须是 0（不能被 slot 1 的 41 污染）。
+        let third = ring.acquire();
+        assert_eq!(third.index, 2);
+        assert_eq!(third.wait_value, 0);
+        ring.advance(third);
+        // 回到 slot 0：等待值仍是第 1 次提交的值。
+        let fourth = ring.acquire();
+        assert_eq!(fourth.index, 0);
+        assert_eq!(fourth.wait_value, first.signal_value);
+    }
+
+    /// P0 回归：最新帧槽只在真正取走时产生 GPU 工作，被覆盖帧的序号被丢弃。
+    ///
+    /// 这里每 3 个序号才取走一帧（1、4、7、10）：旧实现用 `index % 3` 会一直命中同一个槽，
+    /// 而三槽 semaphore / 上传缓冲按提交次数轮转 —— 两者不同源，新帧会重写 GPU 仍在读的
+    /// 上传缓冲。槽位改为按提交次数轮转后，任何 3 次连续提交都必须落在 3 个不同的槽上。
+    #[test]
+    fn dropped_frame_indices_cannot_reuse_an_upload_slot() {
+        let mut frame = LatestFrame::new();
+        let mut ring = InFlightRing::new();
+        let mut submitted = Vec::new();
+        for value in 1..=10 {
+            frame.publish(request(value, Plan::Full));
+            if value % 3 != 1 {
+                // 被后继帧覆盖：该序号不产生 GPU 工作。
+                continue;
+            }
+            let frame = frame.take().expect("pending frame");
+            assert_eq!(frame.index.get(), value, "被覆盖的序号必须被丢弃");
+            let slot = ring.acquire();
+            let recent = &submitted[submitted.len().saturating_sub(2)..];
+            assert!(
+                !recent.contains(&slot.index),
+                "slot {} reused within three submissions (recent: {recent:?})",
+                slot.index
+            );
+            submitted.push(slot.index);
+            ring.advance(slot);
+        }
+        assert_eq!(submitted, vec![0, 1, 2, 0]);
     }
 
     // ── §4.2：最新帧槽 ───────────────────────────────────────────────────────

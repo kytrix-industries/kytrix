@@ -104,9 +104,10 @@ impl Queue {
         })
     }
 
-    /// 本帧的槽位与 fence 值（不修改状态；提交时才推进记账）。
-    pub(crate) fn acquire_slot(&self, index: FrameIndex) -> FrameSlot {
-        self.ring.acquire(index)
+    /// 本帧的槽位与 fence 值：槽位按**提交次数**轮转（与三槽 allocator/list 同源），
+    /// 提交时才推进 fence 记账。
+    pub(crate) fn acquire_slot(&mut self) -> FrameSlot {
+        self.ring.acquire()
     }
 
     /// 等到 `value` 到达（`0` = 该槽从未使用，直接返回）。
@@ -338,8 +339,12 @@ mod tests {
         let device = Device::new_warp().expect("WARP device");
         let mut queue = Queue::new(&device).expect("queue");
         for value in 1..=7u32 {
-            let slot = queue.acquire_slot(index(value));
-            assert_eq!(slot.index, (value as usize) % 3);
+            let slot = queue.acquire_slot();
+            assert_eq!(
+                slot.index,
+                (value as usize - 1) % 3,
+                "槽位按提交次数轮转，不从 FrameIndex 取模"
+            );
             queue.wait_slot_fence(slot.wait_value).expect("slot fence");
             queue.reset_slot(slot).expect("reset slot");
             queue.submit(index(value), slot).expect("submit");

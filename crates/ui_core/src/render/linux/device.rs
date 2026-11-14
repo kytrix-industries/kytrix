@@ -381,10 +381,14 @@ impl Device {
 
     /// 取本帧的 ring 槽位（**纯记账**，不碰 GPU；提交成功后才 [`Device::advance`]）。
     ///
-    /// 同一帧可能因 `NOT_READY` / `OUT_OF_DATE` 重试多次：本调用是幂等的（`acquire` 不推进状态），
-    /// 重试得到相同的槽位与 signal 值。
-    pub(crate) fn slot(&self, index: FrameIndex) -> FrameSlot {
-        let slot = self.ring.acquire(index);
+    /// 槽位按**提交次数**轮转（0 → 1 → 2 → 0），与三槽 fence / `image_available` 同源；
+    /// 不能由请求序号取模决定（最新帧槽合并会丢掉被覆盖帧的序号，见
+    /// [`crate::render::frame::InFlightRing::acquire`]）。
+    ///
+    /// 同一帧可能因 `NOT_READY` / `OUT_OF_DATE` 重试多次：每次重试会轮到下一个槽，这不影响
+    /// 正确性（每槽在 acquire 之前都等自己的 fence），`signal_value` 仍随提交单调递增。
+    pub(crate) fn slot(&mut self) -> FrameSlot {
+        let slot = self.ring.acquire();
         debug_assert_eq!(
             self.ring.last_signaled(),
             slot.signal_value.saturating_sub(1),

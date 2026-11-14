@@ -212,13 +212,13 @@ impl GpuRenderer {
         self.swapchain.as_ref().map(Swapchain::waitable)
     }
 
-    /// 取本帧的 ring 槽（只读记账；提交成功后才推进）。
-    pub(crate) fn acquire_slot(&self, index: FrameIndex) -> FrameSlot {
+    /// 取本帧的 ring 槽（**按提交次数轮转**；提交成功后才推进 fence 记账）。
+    pub(crate) fn acquire_slot(&mut self) -> FrameSlot {
         debug_assert!(
             on_gpu_thread(),
             "window frame slots may only be acquired on the kytrix-d3d12 thread"
         );
-        self.queue.acquire_slot(index)
+        self.queue.acquire_slot()
     }
 
     /// 等本帧槽上一次提交完成（复用 allocator / timestamp 读回缓冲的前置条件）。
@@ -310,7 +310,7 @@ impl GpuRenderer {
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
     ) -> Result<RenderStats, EngineError> {
-        let slot = self.queue.acquire_slot(index);
+        let slot = self.queue.acquire_slot();
         self.queue
             .wait_slot_fence(slot.wait_value)
             .map_err(|error| self.classify(error))?;

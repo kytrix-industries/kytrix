@@ -616,7 +616,7 @@ fn run_gpu_loop(
         if frame.is_idle() {
             continue;
         }
-        let slot = renderer.acquire_slot(request.index);
+        let slot = renderer.acquire_slot();
         renderer.wait_slot_fence(slot)?;
         // 该槽的上一帧刚被等到：在录制覆盖它的 timestamp 读回缓冲**之前**发布它的反馈
         // （`ResolveQueryData` 的写入与 CPU 读回共用这一块缓冲，必须按完成顺序串行化）。

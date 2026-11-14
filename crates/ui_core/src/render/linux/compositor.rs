@@ -270,7 +270,7 @@ impl GpuRenderer {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
-        let slot = self.device.slot(request.index);
+        let slot = self.device.slot();
         // ① 槽 fence：复用命令缓冲 / 上传缓冲的**前置条件**（允许阻塞：GPU 线程，§8.2）。
         //
         // 必须在 acquire **之前**：`image_available[slot]` 由 `acquire` signal，而该信号量可能
@@ -387,7 +387,7 @@ impl GpuRenderer {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
-        let slot = self.device.slot(index);
+        let slot = self.device.slot();
         // 离屏路径本来就同步：复用槽位前等 fence（与窗口路径同一前置条件）。
         self.device.wait_slot(slot)?;
         let stats = self.record_and_submit(index, slot, payload, frame, None, timings)?;
