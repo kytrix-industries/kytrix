@@ -561,6 +561,8 @@ struct State {
     feedback: Option<FrameFeedback>,
     error: Option<EngineError>,
     shutdown: bool,
+    /// 关闭请求的时刻：[`Shared::wait_for_work`] 的 grace 从它起算（跨多次等待累计）。
+    shutdown_at: Option<Instant>,
     /// GPU 线程已经退出（`publish` 从此是 no-op）。
     terminated: bool,
 }
@@ -577,6 +579,7 @@ impl State {
             feedback: None,
             error: None,
             shutdown: false,
+            shutdown_at: None,
             terminated: false,
         }
     }
@@ -793,23 +796,24 @@ impl Shared {
     /// 空闲：睡在 condvar 上直到「有完成通知 / 有帧且有 drawable / 关闭且无在飞帧」。
     ///
     /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 `Drop` 的 `join` 永久挂住
-    /// UI）：用 100 ms 超时轮询，累计超过 [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。
-    /// 正常路径（关闭后在飞帧很快归零、或未关闭）仍然是无超时等待。
+    /// UI）：用 100 ms 超时轮询，从关闭请求起**累计**超过 [`SHUTDOWN_GRACE`] 返回
+    /// [`WaitOutcome::TimedOut`]。正常路径（关闭后在飞帧很快归零、或未关闭）仍然是无超时等待。
     fn wait_for_work(&self) -> WaitOutcome {
         let mut state = self.lock();
-        let mut shutdown_wait: Option<Instant> = None;
         loop {
             if state.has_work() {
                 return WaitOutcome::Work;
             }
             if state.shutdown {
-                let started = *shutdown_wait.get_or_insert_with(Instant::now);
-                if started.elapsed() >= SHUTDOWN_GRACE {
+                let started = state.shutdown_at.unwrap_or_else(Instant::now);
+                let elapsed = started.elapsed();
+                if elapsed >= SHUTDOWN_GRACE {
                     return WaitOutcome::TimedOut;
                 }
+                let timeout = SHUTDOWN_POLL.min(SHUTDOWN_GRACE - elapsed);
                 state = self
                     .work
-                    .wait_timeout(state, SHUTDOWN_POLL)
+                    .wait_timeout(state, timeout)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             } else {
@@ -916,7 +920,10 @@ impl Shared {
     }
 
     fn request_shutdown(&self) {
-        self.lock().shutdown = true;
+        let mut state = self.lock();
+        state.shutdown = true;
+        state.shutdown_at = Some(Instant::now());
+        drop(state);
         self.wake();
     }
 }
@@ -1420,11 +1427,8 @@ mod tests {
     #[test]
     fn shutdown_wait_is_bounded_when_completions_never_arrive() {
         let shared = Arc::new(Shared::new());
-        {
-            let mut state = shared.lock();
-            state.shutdown = true;
-            state.in_flight = 1;
-        }
+        shared.lock().in_flight = 1;
+        shared.request_shutdown();
         let worker = Arc::clone(&shared);
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
