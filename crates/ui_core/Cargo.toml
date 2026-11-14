@@ -72,7 +72,6 @@ bitflags = { workspace = true }
 bytes = { workspace = true }
 bytemuck = { workspace = true }
 color = { workspace = true }
-lyon = { workspace = true }
 
 # P03 节点 / 状态 / 容器
 ahash = { workspace = true }
