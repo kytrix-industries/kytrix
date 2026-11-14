@@ -875,7 +875,7 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
 | 平台 | lib 单测 | HUD `Latency`（demo + HUD） | 说明 |
 |---|---|---|---|
 | Windows | 695 passed / 0 failed / 1 ignored | 7.8–10.2 ms | 跨 10 s 多次采样，不累积；其中大部分是 waitable 的 vsync 排队（I3 的既有语义） |
-| Linux | 641 passed / 0 failed | 1.68–1.76 ms | headless sway + lavapipe，1276×678 窗口；2/6/10 s 采样不累积（2026-11-15 复测；§15.4 的 2.1–3.1 ms 是上一轮） |
+| Linux | 641 passed / 0 failed | 1.68–2.33 ms | headless sway + lavapipe，1276×678 窗口；2/6/10 s 采样不累积（2026-11-15 两轮：1.76/1.68/1.68 与 2.33/1.74/1.83 ms；§15.4 的 2.1–3.1 ms 是上一轮） |
 | macOS | 652 passed / 0 failed | 默认 1920×1556：3.35–11.55 ms；1800×1200：2.91–3.59 ms | 同一台 Intel Iris Plus 655；范围随 drawable 像素面积变化，同尺寸跨 10 s 不累积（`b4ea69e` 基线重测 2.90–3.41 ms；此前文档的 648 是旧基线） |
 
 - 测试数字是 `cargo test -p ui_core --lib` 口径（默认 feature）；feature 组合会改变数量（同一
@@ -933,7 +933,8 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
   `cargo +nightly fmt --check` 全绿；`VK_LAYER_VALIDATE_SYNC=1` demo 10 s **0 SYNC-HAZARD**
   （只剩 `VALIDATION-SETTINGS` 的 deprecated-layers 提示）；普通 validation 10 s **0 error /
   0 warning**；resize 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；`swaymsg kill` exit 0、
-  关闭 110–113 ms；HUD `Latency` 2 s / 6 s / 10 s = 1.76 / 1.68 / 1.68 ms（不累积）。
+  关闭 110–113 ms；HUD `Latency` 两轮 2 s / 6 s / 10 s 采样为 1.76 / 1.68 / 1.68 ms 与
+  2.33 / 1.74 / 1.83 ms（同尺寸不累积；run 间浮动 <1 ms，符合「只作同机对比」的口径）。
   Windows **695 passed / 1 ignored**、macOS **652 passed**（两平台的代码未变，仅复核）。
 - **workspace 级 clippy 的既有失败（与轮次无关）**：从仓库根跑
   `cargo +nightly clippy --all-targets -- -D warnings` 会在 `crates/network` 的
