@@ -729,6 +729,11 @@ impl Shared {
         self.lock().published_surface
     }
 
+    /// 取走当前帧，但**仅当**它的目标尺寸与 drawable 的实际纹理尺寸一致（±1 px）。
+    ///
+    /// 不一致时返回 `None` 并把帧留在最新帧槽里（它的 damage 不能丢）：调用方丢弃这个陈旧
+    /// drawable、跳过本 vsync（P1）。`force` = 连续多次不一致之后的退化路径（按 drawable 的
+    /// 实际尺寸渲染 + 全量，见 [`MAX_SURFACE_MISMATCHES`]）。
     fn take_frame_for_drawable(&self, target: (u32, u32), force: bool) -> Option<FrameRequest> {
         let mut state = self.lock();
         let surface = state.published_surface?;
