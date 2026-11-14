@@ -851,8 +851,8 @@ publish feedback on timeline completion`）。实机口径：Ubuntu 26.04 / lava
 | **P1 panic 出路**（F-170） | 新增 `PanicGuard`：`gpu_loop` 展开时（`std::thread::panicking()`）向共享错误槽发布 `EngineError::AppInit { detail: "kytrix-vulkan thread panicked" }` 并置 `terminated`，`poll()` 不会静默停摆；正常退出 `disarm()`，不覆盖循环已发布的错误，`publish_panic` 也不覆盖已有错误（3 条单测） |
 | **P2 反馈改到完成时** | 提交时把 `{index, stats, CPU samples, published_at, timeline_value(signal), slot}` 放进 pending 队列；每轮循环用 `vkGetSemaphoreCounterValue` 非阻塞推进，观察到完成之后按提交顺序发布 `FrameFeedback { index, stats, samples(+此处 resolve 的 GPU 采样), completed_at, latency }`，retire 在同一观测点推进。GPU 采样不再在提交点读（避免读在飞槽），只在完成之后 resolve。等待策略：pending 非空时 `Condvar::wait_timeout(4ms)`，其余无限等待（0 自旋）——避免最后一帧的反馈永远不发布 |
 | **P2 samples 断言** | `feedback.samples.len() <= 4` → `<= 3`（Upload / Gpu / Present，`FrameTimings` 只有这三段） |
-| **P2 atlas staging 只有一份** | 本次不改：`frame_ready` 门禁把在飞帧压到 ≤ 1（UI 只在上一帧的 `wl_callback.done` 之后发布下一帧，而该回调意味着合成器已取走上一帧 image、其 `render_finished` 依赖的 copy 必然完成），CPU 写 staging 与 GPU 读 staging 不会重叠。代码与 §7.3 已显式登记该设计假设：**在飞 ≤ 1**；放开在飞帧数时必须按帧槽拆分 staging 或先等该帧 fence |
-| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**（该修订落地时；当前 639，见 §15.6）；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积；当轮数值，当前 2.1–3.1 ms 见 §15.6）；关闭见上 |
+| **P2 atlas staging 只有一份** | 本次不改：`frame_ready` 门禁把在飞帧压到 ≤ 1（UI 只在上一帧的 `wl_callback.done` 之后发布下一帧，而该回调意味着合成器已取走上一帧 image、其 `render_finished` 依赖的 copy 必然完成），CPU 写 staging 与 GPU 读 staging 不会重叠。代码与 §7.3 已显式登记该设计假设：**在飞 ≤ 1**；放开在飞帧数时必须按帧槽拆分 staging 或先等该帧 fence。**（F-183 复审后已改为每次上传一次性 staging，见 §15.8：活性兜底本身就会放行第二帧，staging 不再依赖「在飞 ≤ 1」。）** |
+| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**（该修订落地时；当前 641，见 §15.6 / §15.8）；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积；当轮数值，当前 1.68–1.76 ms 见 §15.6 / §15.8）；关闭见上 |
 
 ### 15.5 第二轮闭环（F-176 … F-182，2026-11-14）
 
@@ -875,16 +875,18 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
 | 平台 | lib 单测 | HUD `Latency`（demo + HUD） | 说明 |
 |---|---|---|---|
 | Windows | 695 passed / 0 failed / 1 ignored | 7.8–10.2 ms | 跨 10 s 多次采样，不累积；其中大部分是 waitable 的 vsync 排队（I3 的既有语义） |
-| Linux | 639 passed / 0 failed | 2.1–3.1 ms | headless sway + lavapipe，不累积 |
-| macOS | 652 passed / 0 failed | 3.1–3.7 ms | 同一台 Intel Iris Plus 655，不累积（`b4ea69e` 基线重测 2.90–3.41 ms；本轮重测为 652，此前文档的 648 是旧基线） |
+| Linux | 641 passed / 0 failed | 1.68–1.76 ms | headless sway + lavapipe，1276×678 窗口；2/6/10 s 采样不累积（2026-11-15 复测；§15.4 的 2.1–3.1 ms 是上一轮） |
+| macOS | 652 passed / 0 failed | 默认 1920×1556：3.35–11.55 ms；1800×1200：2.91–3.59 ms | 同一台 Intel Iris Plus 655；范围随 drawable 像素面积变化，同尺寸跨 10 s 不累积（`b4ea69e` 基线重测 2.90–3.41 ms；此前文档的 648 是旧基线） |
 
 - 测试数字是 `cargo test -p ui_core --lib` 口径（默认 feature）；feature 组合会改变数量（同一
   HEAD 加 `--features "hud,test-support"` 时 Windows 为 756 passed / 1 ignored），比较时只与
   同口径历史值比。整套（含集成）数字见各平台验证文档。
-- Linux 的 639 含 F-183 新增的 5 条 `FrameGate` 单测（`platform/linux/frame_gate.rs`，只在
+- Linux 的 641 = F-183 的 5 条 `FrameGate` 单测 + 本轮（§15.8）新增的 1 条迟到 callback 单测
+  + 1 条图集 staging 单测（`platform/linux/frame_gate.rs` / `render/linux/atlas.rs`，只在
   Linux 构建里编译；Windows / macOS 的数字不受影响）。
-- `Latency` 是「UI 发布 → GPU 线程观察到完成」，**跨 10 s 不增长**；绝对值随机器、驱动、合成器
-  与负载变化（同一台机不同 run 也可差 1 ms 以上），只作同机回归对比，不作跨平台契约。
+- `Latency` 是「UI 发布 → GPU 线程观察到完成」，**同一窗口尺寸下跨 10 s 不增长**；绝对值随
+  窗口像素面积、机器、驱动、合成器与负载变化（同一台机不同 run 也可差 1 ms 以上），只作
+  同机、同尺寸回归对比，不作跨平台契约。
 
 ### 15.7 第三轮闭环（F-183 + 未使用依赖，2026-11-14）
 
@@ -899,4 +901,43 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
   依赖；`cargo check` 不再报 `unused dependency` / `unused workspace dependency`。`lyon` /
   `usvg` 仍是第三方 crate（如 `gpui-pre`）的传递依赖，所以 `Cargo.lock` 只删掉 `ui_core`
   条目里的 `lyon` 一行。
+
+### 15.8 第四轮闭环（F-183 复审：迟到 callback + 一次性 staging，2026-11-15）
+
+最终复审在 Linux 发现两个仍会让**两帧同时在飞**的 P1。活性兜底本身就会在 present 卡死时放行
+第二帧（这是它存在的目的），因此门禁的「最多一个挂起 callback」与图集 staging 的「在飞 ≤ 1」
+都不能只靠恢复门禁来保证。
+
+- **迟到 callback 的归属**（`platform/linux/frame_gate.rs`、`platform/linux/surface.rs`）：旧
+  实现用 `requested: bool`——`expire` 清标志后新 `request` 会真的再挂一个 callback，而旧
+  callback 迟到时 `on_callback` 无条件清标志并开门，把**新请求**的 pending 清掉，第 3 次
+  `request` 又能再挂一个，门禁的「最多一个挂起 callback」被破坏。改为 `CallbackToken`（每次
+  `request` 发新令牌）：`expire` 放弃当前令牌，`on_callback(token)` 只接受当前令牌，迟到 /
+  重复的旧回调直接忽略。平台层用 `wl_callback` 的 `ObjectId` 把 `done` 事件归属到令牌（令牌
+  只跟当前请求走）。没有用计数模型：旧 callback 与新 callback 都只能让计数 -1，无法区分归属
+  —— 要么迟到回调消耗新请求的计数，要么 Idle 路径（`note_not_committed` 重开门禁）重新开始
+  无限堆积 callback。`note_not_committed` 仍然立即开门并保留挂起的令牌；`ready` 语义不变。
+- **图集 staging**（`render/linux/atlas.rs`）：改为**每次上传一块一次性 `VkBuffer`**（只装本次
+  脏行），录制时使用，提交后按本帧序号进 `RetireQueue`，timeline 完成推进释放（I4）。选择它
+  而不是「按 3 个 in-flight 槽拆 3 份」：per-slot 是 3×整页（字形 4 MiB + 图片 16 MiB →
+  60 MiB 常驻），一次性只随在飞帧的脏行增长；上传是低频路径，分配/映射代价可忽略。与 macOS
+  本轮的修复同策略，生命周期由完成前沿显式保证，而不是依赖槽 fence 的隐式关系。顺带修正
+  离屏 / 单测的 `VkDeviceCreateInfo`：没有 `VK_KHR_surface` 的 headless 实例不再启用依赖它的
+  `VK_KHR_swapchain` / `VK_KHR_incremental_present`（validation 的 -01387 消失）。
+- **回归**：`a_late_callback_after_the_liveness_expiry_does_not_clear_the_new_request`（旧实现
+  实测 FAIL：迟到的旧 callback 之后第 3 次 `request` 又挂了一个；新实现：仍有 1 个挂起、第 3
+  次 `request` 返回 `None`）；`consecutive_uploads_do_not_share_staging_while_frames_are_in_flight`
+  （两帧先录制后提交，按帧释放各自 staging，读回第 5 / 7 行各自颜色，未上传行保持 0）。
+- **验证（2026-11-15，lavapipe / headless sway）**：lib **641 passed / 0 failed**；snapshot
+  **8/8**；hud **7/7**；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 与
+  `cargo +nightly fmt --check` 全绿；`VK_LAYER_VALIDATE_SYNC=1` demo 10 s **0 SYNC-HAZARD**
+  （只剩 `VALIDATION-SETTINGS` 的 deprecated-layers 提示）；普通 validation 10 s **0 error /
+  0 warning**；resize 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；`swaymsg kill` exit 0、
+  关闭 110–113 ms；HUD `Latency` 2 s / 6 s / 10 s = 1.76 / 1.68 / 1.68 ms（不累积）。
+  Windows **695 passed / 1 ignored**、macOS **652 passed**（两平台的代码未变，仅复核）。
+- **workspace 级 clippy 的既有失败（与轮次无关）**：从仓库根跑
+  `cargo +nightly clippy --all-targets -- -D warnings` 会在 `crates/network` 的
+  `transport/subscription.rs:194/231` 报 2 条 `redundant_clone`（`status()` 已按值返回
+  `SubscriptionStatus`，调用点的 `.clone()` 确实多余）；这两行在 `ff03aed` 就存在，本轮的
+  `ui_core` 改动不涉及该 crate。`-p ui_core` 的口径全绿。
 

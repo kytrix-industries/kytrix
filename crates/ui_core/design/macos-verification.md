@@ -243,9 +243,11 @@ within 4 vsyncs; rendering at the drawable size (full frame) from now on`。修�
 现已被粘性退化取代。
 
 **其余验证**：`MTL_DEBUG_LAYER=1` 跑 10 s + HUD 连续帧（含持续尺寸不一致的退化路径）→
-0 validation error；HUD 的 `Latency` 行在同一台机的最新实测为 **3.11–3.74 ms**（`b4ea69e` 基线
-重测 **2.90–3.41 ms**；FPS 58–60、Frame 16.65–17.29 ms），该数值随机器/负载变化，只作同机对比
-（旧记录的 12.2–13.0 ms 来自另一环境，不作契约）。**反馈按提交顺序发布**（F-180）：Metal 完成
+0 validation error；HUD 的 `Latency` 行在同一台机的最新实测：**默认窗口 1920×1556 下
+3.35–11.55 ms**，**窗口缩到 1800×1200 后 2.91–3.59 ms**（`b4ea69e` 基线重测 2.90–3.41 ms；
+FPS 58–60、Frame 16.65–17.29 ms）。范围随窗口像素面积 / 机器 / 负载变化（更大的 drawable
+要等更久），只作同机、同尺寸对比；同一尺寸下跨 10 s 采样**不累积**。旧记录的 12.2–13.0 ms
+来自另一环境，不作契约。**反馈按提交顺序发布**（F-180）：Metal 完成
 回调可以乱序，`FeedbackQueue` 只在 `CompletionOrder` 的连续前缀推进时从队首发布，HUD 的
 `Latency` 不会被更旧帧的完成覆盖。**关闭有界**（F-179）：`Drop` 直接 `join`，等待由
 `SHUTDOWN_GRACE = 2 s` 兜底（从 `request_shutdown` 起累计、100 ms 轮询封顶）；程序化
