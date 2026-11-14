@@ -19,18 +19,15 @@
 //! - **I3**：节奏来自 `CAMetalDisplayLink`（主 run loop 的 **common modes**）；空闲 `isPaused = true`，
 //!   有帧请求 / 在飞帧 / 连续帧时恢复。
 //!
-//! 关闭握手（§4.5）：`Drop` 里停 display link → signal shutdown → 有界等待 GPU 线程（2 s）；
+//! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → `join` GPU 线程；
 //! GPU 线程在退出前自行 drain 在飞帧（完成通知到达后才释放旧资源，I4）。
 
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError,
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
-    },
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use objc2::{
@@ -65,9 +62,6 @@ use crate::{
     },
     window::FrameIndex,
 };
-
-/// 关闭握手的等待上限（UI 线程**唯一**允许等 GPU 线程的时刻，§4.5）。
-const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// drawable 尺寸与请求尺寸连续不一致的 vsync 上限（`request.surface` 是 resize 的唯一来源）。
 ///
@@ -352,8 +346,6 @@ impl DisplayLinkDelegate {
 struct WindowRenderer {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    /// GPU 线程退出信号（`ExitSignal` 在退出 / panic 时发送）。
-    done: Receiver<()>,
     layer: Retained<CAMetalLayer>,
     display_link: Retained<CAMetalDisplayLink>,
     /// `delegate` 是 **weak** 属性（objc2 与 Apple 文档都如此）：必须由门面持有强引用，
@@ -400,18 +392,16 @@ impl WindowRenderer {
             display_link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes);
         }
 
-        let (done, done_rx) = mpsc::channel();
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("kytrix-metal".to_owned())
-            .spawn(move || gpu_loop(gpu, worker, done))
+            .spawn(move || gpu_loop(gpu, worker))
             .map_err(|error| EngineError::AppInit {
                 detail: format_smolstr!("spawn kytrix-metal thread: {error}"),
             })?;
         Ok(Self {
             shared,
             thread: Some(thread),
-            done: done_rx,
             layer,
             display_link,
             _delegate: delegate,
@@ -511,28 +501,11 @@ impl Drop for WindowRenderer {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // UI 线程唯一允许的等待点：signal shutdown 之后有界等待 GPU 线程退出（§4.5）。
-        match self.done.recv_timeout(JOIN_TIMEOUT) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                let _ = thread.join();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // 放弃 join（线程可能卡在驱动的等待里）：detach，避免把 UI 线程一起拖死。
-                eprintln!(
-                    "kytrix: the kytrix-metal thread did not exit within {}s; abandoning the join",
-                    JOIN_TIMEOUT.as_secs()
-                );
-            }
-        }
-    }
-}
-
-/// GPU 线程退出（含 panic）时通知 UI 线程，保证 `Drop` 的等待有界。
-struct ExitSignal(Sender<()>);
-
-impl Drop for ExitSignal {
-    fn drop(&mut self) {
-        let _ = self.0.send(());
+        // 关闭握手（F-169）：**直接 join**，不超时 detach。GPU 循环没有无限等待（三槽 semaphore
+        // 用 `DISPATCH_TIME_NOW`、`commit` 立即返回、shutdown 分支在在飞帧 drain 完后退出）；
+        // 放弃等待会让 GPU 线程在 UI 归还 `CAMetalLayer` / `App` 之后仍触碰 Metal 对象
+        // （use-after-free）。panic 时 `join` 立即返回 `Err`，错误已由 `PanicGuard` 交给 `poll`。
+        let _ = thread.join();
     }
 }
 
@@ -873,10 +846,8 @@ impl Drop for PanicGuard {
 }
 
 /// GPU 线程主循环（§5.2）。
-fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
+fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
-    // 退出（含 panic）时通知 UI 线程；`Drop` 的 `recv_timeout` 因此有界。
-    let _exit = ExitSignal(done);
     // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）；正常路径 disarm。
     let guard = PanicGuard::new(Arc::clone(&shared));
     // 已提交、等完成通知的帧的统计与发布时刻（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。
