@@ -355,12 +355,17 @@ impl OneShotStaging {
         .map_err(|error| init_error("create_buffer(atlas staging)", format!("{error:?}")))?;
         // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
         let requirements = unsafe { device.raw().get_buffer_memory_requirements(buffer) };
-        let memory_type = device
-            .memory_type(
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| init_error("atlas staging memory", "no host-visible memory type"))?;
+        let Some(memory_type) = device.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) else {
+            // SAFETY: buffer 已创建且尚未交给 retire 队列。
+            unsafe { device.raw().destroy_buffer(buffer, None) };
+            return Err(init_error(
+                "atlas staging memory",
+                "no host-visible memory type",
+            ));
+        };
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效。
         let memory = match unsafe {
             device.raw().allocate_memory(
