@@ -63,8 +63,11 @@ impl AtlasTextures {
         }
     }
 
-    /// 登记一次脏行上传（像素由调用方拥有，拷进来后由本模块负责写 staging）。
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    /// 登记一次脏行上传。
+    ///
+    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
+    /// 16 MiB（图片页）；与 Windows 的 `AtlasTextures::queue_upload` 同一约定。
+    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
         let texture = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
@@ -119,7 +122,7 @@ impl AtlasTexture {
         })
     }
 
-    fn queue_upload(&mut self, pixels: &[u8], rows: DirtyRows) {
+    fn queue_upload(&mut self, pixels: Vec<u8>, rows: DirtyRows) {
         let spans = rows.spans();
         if spans.is_empty() {
             return;
@@ -131,7 +134,7 @@ impl AtlasTexture {
             y0: first,
             rows: last.saturating_sub(first),
             full,
-            pixels: Some(pixels.to_vec()),
+            pixels: Some(pixels),
         });
     }
 

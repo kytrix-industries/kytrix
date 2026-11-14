@@ -27,7 +27,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use objc2::{
@@ -52,7 +52,7 @@ use crate::{
     render::{
         DirtyRows, RenderStats,
         compositor::FramePlan,
-        frame::{FrameFeedback, FrameRequest, LatestFrame},
+        frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         macos::{
             compositor::GpuRenderer,
             device::{Device, enter_gpu_thread},
@@ -68,8 +68,16 @@ use crate::{
 /// 正常路径要求两者一致（±1 px，吸收 DPI 取整）：不一致说明这个 drawable 还是上一轮 layout
 /// 的产物，用它消费最新帧会把最后一帧按旧尺寸画完 —— 此后 pacing 暂停、没有新帧，窗口永久
 /// 停在旧尺寸画面。连续超过本上限仍不一致时，说明不是「等一下就有新 drawable」而是取整误差，
-/// 退化为「按 drawable 实际尺寸渲染 + 全量」，避免永久停更。
+/// 退化为「按 drawable 实际尺寸渲染 + 全量」，避免永久停更。退化状态是**粘性**的：见
+/// [`SurfaceMismatch`]。
 const MAX_SURFACE_MISMATCHES: u32 = 4;
+
+/// 关闭握手等待在飞帧完成的上界（驱动挂死时 `Drop` 的 `join` 不能无限等待，见
+/// [`Shared::wait_for_work`]）。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// 关闭握手的轮询间隔：只在 `shutdown && in_flight > 0` 时生效。
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 /// 门面：窗口路径是「最新帧槽 + 最新 drawable 槽 + GPU 线程」，离屏路径是同步渲染器。
 ///
@@ -187,9 +195,15 @@ impl Renderer {
     }
 
     /// 把一页图集像素交给 GPU 线程（每 `AtlasKind` 只留最新，§4.2）。
+    ///
+    /// 门面收切片（`window.rs` 的公共入口只持有切片），窗口路径在 UI→GPU 边界复制一次进
+    /// [`AtlasSlots`]；GPU 线程消费时按**所有权**移动给 `AtlasTextures`，不再复制第二遍整页
+    /// （图片页 16 MiB）。离屏路径没有跨线程槽位，直接复制一份。
     pub(crate) fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
         match &mut self.target {
-            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels, rows),
+            RenderTarget::Offscreen(gpu) => {
+                gpu.queue_atlas_upload(kind, pixels.to_vec(), rows);
+            }
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
         }
     }
@@ -502,9 +516,10 @@ impl Drop for WindowRenderer {
             return;
         };
         // 关闭握手（F-169）：**直接 join**，不超时 detach。GPU 循环没有无限等待（三槽 semaphore
-        // 用 `DISPATCH_TIME_NOW`、`commit` 立即返回、shutdown 分支在在飞帧 drain 完后退出）；
-        // 放弃等待会让 GPU 线程在 UI 归还 `CAMetalLayer` / `App` 之后仍触碰 Metal 对象
-        // （use-after-free）。panic 时 `join` 立即返回 `Err`，错误已由 `PanicGuard` 交给 `poll`。
+        // 用 `DISPATCH_TIME_NOW`、`commit` 立即返回、shutdown 分支在在飞帧 drain 完后退出；
+        // 如果驱动永不回调完成，等待有 [`SHUTDOWN_GRACE`] 上界）。放弃等待会让 GPU 线程在 UI
+        // 归还 `CAMetalLayer` / `App` 之后仍触碰 Metal 对象（use-after-free）。panic 时 `join`
+        // 立即返回 `Err`，错误已由 `PanicGuard` 交给 `poll`。
         let _ = thread.join();
     }
 }
@@ -567,11 +582,24 @@ impl State {
     }
 
     /// GPU 线程的等待条件：有完成通知 / 有帧且有 drawable / 关闭且已无在飞帧。
+    ///
+    /// 关闭开始后不再开新帧：只等完成通知（`in_flight` 归零或有通知可 drain）。否则残留的
+    /// 「待画帧 + drawable」会让循环空转，也会让 [`Shared::wait_for_work`] 的 grace 永远不生效。
     fn has_work(&self) -> bool {
-        (self.shutdown && self.in_flight == 0)
-            || !self.completions.is_empty()
-            || (self.frame.has_pending() && self.drawable.is_some())
+        if self.shutdown {
+            return self.in_flight == 0 || !self.completions.is_empty();
+        }
+        !self.completions.is_empty() || (self.frame.has_pending() && self.drawable.is_some())
     }
+}
+
+/// [`Shared::wait_for_work`] 的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// 有新工作，或关闭后的在飞帧已归零（循环的下一个检查点负责退出）。
+    Work,
+    /// 关闭后等待在飞帧完成超过 [`SHUTDOWN_GRACE`]（驱动没有回调）。
+    TimedOut,
 }
 
 struct Completion {
@@ -646,6 +674,59 @@ fn surface_within_tolerance(requested: (u32, u32), drawable: (u32, u32)) -> bool
     requested.0.abs_diff(drawable.0) <= 1 && requested.1.abs_diff(drawable.1) <= 1
 }
 
+/// 尺寸不一致时本 vsync 的处理方式（[`SurfaceMismatch::observe`] 的结论）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceVerdict {
+    /// 尺寸一致（或没有待画帧）：按正常路径绘制。
+    Ready,
+    /// 还不值得退化：丢弃这个陈旧 drawable、跳过本 vsync，等下个 vsync 的新 drawable。
+    Skip,
+    /// 粘性退化：按 drawable 实际尺寸全量绘制，直到请求尺寸重新落在容差内。
+    Degraded,
+}
+
+/// drawable 尺寸与请求尺寸不一致的退化状态（P1 的粘性修复）。
+///
+/// 连续 [`MAX_SURFACE_MISMATCHES`] 个 vsync 不一致后进入退化。状态**粘性**：不能每次成功提交
+/// 后归零，否则持续 >1 px 不一致会在「跳 4 个 vsync + 画一帧」之间固定循环（~11 fps）并每轮
+/// 重新打印诊断；进入退化后每个 vsync 都画，只有请求尺寸与 drawable 重新在容差内才清除并归零。
+struct SurfaceMismatch {
+    consecutive: u32,
+    degraded: bool,
+}
+
+impl SurfaceMismatch {
+    const fn new() -> Self {
+        Self {
+            consecutive: 0,
+            degraded: false,
+        }
+    }
+
+    /// 观察本 vsync 的请求尺寸与 drawable 尺寸，推进退化状态机。
+    fn observe(&mut self, requested: Option<(u32, u32)>, drawable: (u32, u32)) -> SurfaceVerdict {
+        let Some(requested) = requested else {
+            return SurfaceVerdict::Ready;
+        };
+        if surface_within_tolerance(requested, drawable) {
+            // 尺寸重新一致：清除退化 episode 并归零，下一次不一致重新计数。
+            self.consecutive = 0;
+            self.degraded = false;
+            return SurfaceVerdict::Ready;
+        }
+        if self.degraded {
+            return SurfaceVerdict::Degraded;
+        }
+        self.consecutive += 1;
+        if self.consecutive <= MAX_SURFACE_MISMATCHES {
+            SurfaceVerdict::Skip
+        } else {
+            self.degraded = true;
+            SurfaceVerdict::Degraded
+        }
+    }
+}
+
 impl Shared {
     fn new() -> Self {
         Self {
@@ -710,13 +791,33 @@ impl Shared {
     }
 
     /// 空闲：睡在 condvar 上直到「有完成通知 / 有帧且有 drawable / 关闭且无在飞帧」。
-    fn wait_for_work(&self) {
+    ///
+    /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 `Drop` 的 `join` 永久挂住
+    /// UI）：用 100 ms 超时轮询，累计超过 [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。
+    /// 正常路径（关闭后在飞帧很快归零、或未关闭）仍然是无超时等待。
+    fn wait_for_work(&self) -> WaitOutcome {
         let mut state = self.lock();
-        while !state.has_work() {
-            state = self
-                .work
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+        let mut shutdown_wait: Option<Instant> = None;
+        loop {
+            if state.has_work() {
+                return WaitOutcome::Work;
+            }
+            if state.shutdown {
+                let started = *shutdown_wait.get_or_insert_with(Instant::now);
+                if started.elapsed() >= SHUTDOWN_GRACE {
+                    return WaitOutcome::TimedOut;
+                }
+                state = self
+                    .work
+                    .wait_timeout(state, SHUTDOWN_POLL)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            } else {
+                state = self
+                    .work
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
     }
 
@@ -855,16 +956,23 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
     // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）；正常路径 disarm。
     let guard = PanicGuard::new(Arc::clone(&shared));
-    // 已提交、等完成通知的帧的统计与发布时刻（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。
-    // 元组末项是 `FrameRequest::published_at`：macOS 的反馈在**完成通知**里发布，
-    // 那时 `request` 已经不在作用域内，所以发布基准要随提交一起记账。
-    let mut submitted: VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)> =
-        VecDeque::new();
-    // 连续「drawable 与请求尺寸不一致」的 vsync 数（P1；匹配 / 退化提交后归零）。
-    let mut surface_mismatches = 0u32;
+    // 已提交帧的统计与发布时刻（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。按提交顺序保存，
+    // 只有 `CompletionOrder` 的连续前缀推进时才发布（完成回调可以乱序到达，见 [`FeedbackQueue`]）。
+    let mut feedback = FeedbackQueue::new();
+    // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
+    let mut surface = SurfaceMismatch::new();
     loop {
-        shared.wait_for_work();
-        if let Err(error) = drain_completions(&mut renderer, &shared, &mut submitted) {
+        if shared.wait_for_work() == WaitOutcome::TimedOut {
+            // 驱动没有回调完成：继续等会让 `Drop` 的 `join` 永久挂住 UI。Metal 的命令缓冲自己
+            // 持有资源引用，退出时释放 device/queue 不会 UAF。
+            eprintln!(
+                "kytrix: metal shutdown waited {} s for {} in-flight frame(s) without a completion callback; exiting the GPU thread",
+                SHUTDOWN_GRACE.as_secs(),
+                shared.in_flight()
+            );
+            break;
+        }
+        if let Err(error) = drain_completions(&mut renderer, &shared, &mut feedback) {
             shared.publish_error(error);
             break;
         }
@@ -889,23 +997,22 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
         //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后 pacing 暂停、没有新帧
         //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
         //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
-        let mut degrade = false;
-        if let Some(requested) = shared.published_surface()
-            && !surface_within_tolerance(requested, target)
-        {
-            surface_mismatches += 1;
-            if surface_mismatches <= MAX_SURFACE_MISMATCHES {
-                continue;
-            }
-            if surface_mismatches == MAX_SURFACE_MISMATCHES + 1 {
-                // 只记录一次：之后按 drawable 实际尺寸继续画，不能每帧刷日志。
-                eprintln!(
-                    "kytrix: metal drawable {}x{} never matched the requested {}x{} within {} vsyncs; rendering at the drawable size (full frame)",
-                    target.0, target.1, requested.0, requested.1, MAX_SURFACE_MISMATCHES
-                );
-            }
-            degrade = true;
+        //    连续超过 `MAX_SURFACE_MISMATCHES` 次后进入**粘性**退化：之后每个 vsync 都按 drawable
+        //    尺寸全量画，直到尺寸重新在容差内（诊断只在进入退化时打印一次）。
+        let requested = shared.published_surface();
+        let was_degraded = surface.degraded;
+        let verdict = surface.observe(requested, target);
+        if !was_degraded && surface.degraded {
+            let requested = requested.unwrap_or(target);
+            eprintln!(
+                "kytrix: metal drawable {}x{} never matched the requested {}x{} within {} vsyncs; rendering at the drawable size (full frame) from now on",
+                target.0, target.1, requested.0, requested.1, MAX_SURFACE_MISMATCHES
+            );
         }
+        if verdict == SurfaceVerdict::Skip {
+            continue;
+        }
+        let degrade = verdict == SurfaceVerdict::Degraded;
         // ③ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
         //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
         if !renderer.try_acquire_upload_slot() {
@@ -916,9 +1023,9 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
             renderer.release_upload_slot();
             continue;
         };
-        // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
+        // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
-            renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
+            renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
         }
         let resized = match renderer.prepare_target(target) {
             Ok(resized) => resized,
@@ -940,9 +1047,9 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
         };
         match renderer.submit_frame(&request, &drawable.0, &mut frame, completed) {
             Ok((stats, samples)) => {
-                surface_mismatches = 0;
+                // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
                 shared.note_submitted();
-                submitted.push_back((index, stats, samples, request.published_at));
+                feedback.push(index, stats, samples, request.published_at);
             }
             Err(error) => {
                 shared.publish_error(error);
@@ -954,62 +1061,157 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     guard.disarm();
 }
 
-/// 处理完成通知：读 GPU 时间、推进 retire、发布反馈（**只**在 GPU 线程）。
+/// 处理完成通知：读 GPU 时间、推进 retire、按提交顺序发布反馈（**只**在 GPU 线程）。
 fn drain_completions(
     renderer: &mut GpuRenderer,
     shared: &Shared,
-    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)>,
+    feedback: &mut FeedbackQueue,
 ) -> Result<(), EngineError> {
     for completion in shared.take_completions() {
         let index = completion.index;
-        let sample = renderer.on_frame_completed(index, &completion.buffer.0)?;
-        let (stats, mut samples, published_at) = take_submitted(submitted, index)
-            .unwrap_or_else(|| (RenderStats::default(), Vec::new(), Instant::now()));
-        if let Some(sample) = sample {
-            samples.push(sample);
+        let (sample, frontier) = renderer.on_frame_completed(index, &completion.buffer.0)?;
+        feedback.complete(index, sample);
+        if let Some(frontier) = frontier {
+            feedback.pop_ready(frontier, |frame| shared.publish_feedback(frame));
         }
-        let completed_at = Instant::now();
-        shared.publish_feedback(FrameFeedback {
-            index,
-            stats,
-            samples,
-            // UI 发布 → 观察到 GPU 完成（HUD 的 publish→present）。
-            latency: completed_at.saturating_duration_since(published_at),
-            // 完成通知到达（GPU 线程被唤醒）的时刻，近似呈现时刻。
-            completed_at,
-        });
     }
     Ok(())
 }
 
-/// 取走某帧提交时记录的统计（完成通知理论上按提交顺序到达，这里按序号匹配，不依赖顺序）。
-fn take_submitted(
-    submitted: &mut VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)>,
+/// 一帧的提交记账（反馈的统计与发布基准）。
+struct SubmittedFrame {
     index: FrameIndex,
-) -> Option<(RenderStats, Vec<GpuTimerSample>, Instant)> {
-    let position = submitted
-        .iter()
-        .position(|(frame, _, _, _)| *frame == index)?;
-    submitted
-        .remove(position)
-        .map(|(_, stats, samples, published_at)| (stats, samples, published_at))
+    stats: RenderStats,
+    samples: Vec<GpuTimerSample>,
+    published_at: Instant,
+    /// 完成通知到达的时刻（`None` = 仍在飞）。
+    completed_at: Option<Instant>,
+}
+
+/// 按提交顺序发布反馈的队列（`render/frame.rs` 的跨平台契约）。
+///
+/// Apple 只保证同一队列 command buffer 的**开始**顺序，完成回调可以乱序到达。按回调顺序发布
+/// 会让 HUD 在乱序时用更旧帧的 `latency` 覆盖新值。这里把完成数据记到各自的提交槽上，只有
+/// `CompletionOrder` 的连续前缀推进时（[`FeedbackQueue::pop_ready`]）才从队首按提交顺序弹出并
+/// 发布；被跳过的帧（不产生 GPU 工作）不在队列里，不影响顺序。
+struct FeedbackQueue {
+    submitted: VecDeque<SubmittedFrame>,
+}
+
+impl FeedbackQueue {
+    fn new() -> Self {
+        Self {
+            submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
+        }
+    }
+
+    /// 提交成功：按提交顺序入队本帧的统计与发布基准。
+    fn push(
+        &mut self,
+        index: FrameIndex,
+        stats: RenderStats,
+        samples: Vec<GpuTimerSample>,
+        published_at: Instant,
+    ) {
+        self.submitted.push_back(SubmittedFrame {
+            index,
+            stats,
+            samples,
+            published_at,
+            completed_at: None,
+        });
+    }
+
+    /// 完成通知到达：记录 GPU 采样与完成时刻；**不**发布（可能还在等更早的帧）。
+    fn complete(&mut self, index: FrameIndex, sample: Option<GpuTimerSample>) {
+        let position = self.submitted.iter().position(|frame| frame.index == index);
+        debug_assert!(
+            position.is_some(),
+            "completion for frame {} without a submission",
+            index.get()
+        );
+        let Some(frame) = position.and_then(|position| self.submitted.get_mut(position)) else {
+            return;
+        };
+        if let Some(sample) = sample {
+            frame.samples.push(sample);
+        }
+        frame.completed_at = Some(Instant::now());
+    }
+
+    /// `CompletionOrder` 的连续前缀推进到 `frontier`：按提交顺序弹出已完成帧并发布。
+    fn pop_ready(&mut self, frontier: FrameIndex, mut publish: impl FnMut(FrameFeedback)) {
+        while let Some(front) = self.submitted.front() {
+            if front.index > frontier {
+                break;
+            }
+            let completed_at = front.completed_at;
+            debug_assert!(
+                completed_at.is_some(),
+                "completion frontier passed an incomplete frame"
+            );
+            let Some(completed_at) = completed_at else {
+                break;
+            };
+            let frame = self.submitted.pop_front().expect("front exists");
+            publish(FrameFeedback {
+                index: frame.index,
+                stats: frame.stats,
+                samples: frame.samples,
+                // UI 发布 → 观察到 GPU 完成（HUD 的 publish→present）。
+                latency: completed_at.saturating_duration_since(frame.published_at),
+                // 完成通知到达（GPU 线程被唤醒）的时刻，近似呈现时刻。
+                completed_at,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, StickyError, pacing_paused, surface_within_tolerance};
+    use super::{
+        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, SHUTDOWN_GRACE, Shared, StickyError,
+        SurfaceMismatch, SurfaceVerdict, WaitOutcome, pacing_paused, surface_within_tolerance,
+    };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRows, compositor::Plan, frame::LatestFrame},
+        render::{DirtyRows, RenderStats, compositor::Plan, frame::LatestFrame},
+        window::FrameIndex,
     };
 
     fn stale_rows(y0: u32, y1: u32) -> DirtyRows {
         let mut rows = DirtyRows::default();
         rows.mark(y0, y1);
         rows
+    }
+
+    fn index(value: u32) -> FrameIndex {
+        FrameIndex::from_raw(value)
+    }
+
+    fn request(index: u32, surface: (u32, u32)) -> crate::render::frame::FrameRequest {
+        crate::render::frame::FrameRequest {
+            index: FrameIndex::from_raw(index),
+            payload: crate::render::frame::FramePayload::empty(),
+            plan: Plan::Full,
+            surface,
+            published_at: Instant::now(),
+        }
+    }
+
+    fn stats(draw_calls: u32) -> RenderStats {
+        RenderStats {
+            draw_calls,
+            instances: draw_calls * 10,
+        }
     }
 
     #[test]
@@ -1079,6 +1281,161 @@ mod tests {
             !surface_within_tolerance((1400, 1040), (2500, 1700)),
             "上一轮 layout 的 drawable 必须被拒绝（P1）"
         );
+    }
+
+    #[test]
+    fn one_pixel_rounding_never_degrades() {
+        let mut surface = SurfaceMismatch::new();
+        for _ in 0..(MAX_SURFACE_MISMATCHES * 3) {
+            assert_eq!(
+                surface.observe(Some((1400, 1040)), (1401, 1039)),
+                SurfaceVerdict::Ready,
+                "±1 px 的取整差必须直接绘制"
+            );
+            assert!(!surface.degraded);
+        }
+    }
+
+    #[test]
+    fn surface_degradation_is_sticky_until_the_sizes_match_again() {
+        let mut surface = SurfaceMismatch::new();
+        for _ in 0..MAX_SURFACE_MISMATCHES {
+            assert_eq!(
+                surface.observe(Some((1400, 1040)), (1402, 1040)),
+                SurfaceVerdict::Skip,
+                "前 MAX_SURFACE_MISMATCHES 个 vsync 等新 drawable"
+            );
+            assert!(!surface.degraded);
+        }
+        assert_eq!(
+            surface.observe(Some((1400, 1040)), (1402, 1040)),
+            SurfaceVerdict::Degraded
+        );
+        // 粘性：持续 >1 px 不一致时**每个** vsync 都退化绘制，不再跳 4 个画 1 个。
+        for _ in 0..10 {
+            assert_eq!(
+                surface.observe(Some((1400, 1040)), (1402, 1040)),
+                SurfaceVerdict::Degraded
+            );
+        }
+        // 尺寸重新在容差内：清除退化并归零。
+        assert_eq!(
+            surface.observe(Some((1400, 1040)), (1401, 1039)),
+            SurfaceVerdict::Ready
+        );
+        assert!(!surface.degraded);
+        assert_eq!(surface.consecutive, 0);
+        // 新的一次不一致重新计数（不继承上一个 episode 的退化）。
+        assert_eq!(
+            surface.observe(Some((1400, 1040)), (1402, 1040)),
+            SurfaceVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn a_stale_drawable_cannot_consume_the_pending_frame() {
+        let shared = Shared::new();
+        shared.publish_frame(request(1, (1800, 1400)));
+        assert!(
+            shared
+                .take_frame_for_drawable((1920, 1556), false)
+                .is_none(),
+            "陈旧 drawable 不能消费最新帧（P1）"
+        );
+        assert!(shared.has_pending_frame(), "帧必须留在槽里等新 drawable");
+        assert_eq!(
+            shared.published_surface(),
+            Some((1800, 1400)),
+            "取帧失败不能清掉目标尺寸"
+        );
+        let frame = shared
+            .take_frame_for_drawable((1801, 1399), false)
+            .expect("1 px 取整差仍在容差内");
+        assert_eq!(frame.index.get(), 1);
+        assert!(!shared.has_pending_frame());
+        assert_eq!(
+            shared.published_surface(),
+            None,
+            "取帧与 published_surface 必须在同一把锁里清空"
+        );
+    }
+
+    #[test]
+    fn the_degraded_path_can_force_consume_a_mismatched_frame() {
+        let shared = Shared::new();
+        shared.publish_frame(request(7, (1800, 1400)));
+        let frame = shared
+            .take_frame_for_drawable((1920, 1556), true)
+            .expect("退化路径按 drawable 尺寸消费帧");
+        assert_eq!(frame.index.get(), 7);
+        assert_eq!(frame.surface, (1800, 1400), "请求本身的目标尺寸不改");
+        assert_eq!(shared.published_surface(), None);
+    }
+
+    /// 完成回调乱序时，反馈必须按**提交顺序**发布：第 2 帧先完成不能先发布，第 1 帧完成后
+    /// 连续前缀推进，按 1 → 2 发布；每帧的 latency 用它自己的发布基准。
+    #[test]
+    fn out_of_order_completions_publish_in_submission_order() {
+        let mut feedback = FeedbackQueue::new();
+        let base = Instant::now();
+        feedback.push(
+            index(1),
+            stats(1),
+            Vec::new(),
+            base - Duration::from_millis(100),
+        );
+        feedback.push(index(2), stats(2), Vec::new(), base);
+        feedback.push(index(3), stats(3), Vec::new(), base);
+        // 第 2、3 帧先完成：连续前缀（第 1 帧）未到，不能发布。
+        feedback.complete(index(2), None);
+        feedback.complete(index(3), None);
+        let mut published = Vec::new();
+        // 第 1 帧完成：`CompletionOrder` 的前沿一次推进到 3，按提交顺序发布 1、2、3。
+        feedback.complete(index(1), None);
+        feedback.pop_ready(index(3), |frame| published.push(frame));
+
+        assert_eq!(
+            published
+                .iter()
+                .map(|frame| frame.index.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "反馈按提交顺序发布"
+        );
+        assert_eq!(published[0].stats.draw_calls, 1);
+        assert_eq!(published[1].stats.draw_calls, 2);
+        assert_eq!(published[2].stats.draw_calls, 3);
+        assert!(
+            published[0].latency >= Duration::from_millis(90),
+            "第 1 帧的 latency 用自己的发布基准，不是更旧帧的完成时刻"
+        );
+        assert!(
+            published[1].latency < Duration::from_millis(90),
+            "第 2 帧不能被更旧帧的 latency 污染"
+        );
+        assert!(feedback.submitted.is_empty(), "发布后队列清空");
+    }
+
+    #[test]
+    fn shutdown_wait_is_bounded_when_completions_never_arrive() {
+        let shared = Arc::new(Shared::new());
+        {
+            let mut state = shared.lock();
+            state.shutdown = true;
+            state.in_flight = 1;
+        }
+        let worker = Arc::clone(&shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(worker.wait_for_work());
+        });
+        let started = Instant::now();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(6)),
+            Ok(WaitOutcome::TimedOut),
+            "驱动永不回调完成时关闭等待必须有界（join 不能挂住 UI）"
+        );
+        assert!(started.elapsed() >= SHUTDOWN_GRACE, "必须等满 grace 才放弃");
     }
 
     /// 离屏路径（快照 / golden）仍是**同步**语义，并且与窗口路径共用同一套 GPU 对象：

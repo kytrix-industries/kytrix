@@ -158,19 +158,23 @@ impl Queue {
     }
 
     /// 完成通知到达（GPU 线程 drain）：读 GPU 时间 + 推进**连续前缀**的 retire。
+    ///
+    /// 返回 GPU 采样与新的**连续完成前沿**（只有连续前缀推进时才发布反馈，见
+    /// `renderer::FeedbackQueue`；没有推进时为 `None`）。
     pub(crate) fn on_completed(
         &mut self,
         index: FrameIndex,
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         device: &mut Device,
-    ) -> Option<GpuTimerSample> {
+    ) -> (Option<GpuTimerSample>, Option<FrameIndex>) {
         let sample = self.timer.resolve(buffer);
-        if let Some(frontier) = self.order.note(index) {
+        let frontier = self.order.note(index);
+        if let Some(frontier) = frontier {
             self.retire.on_completed(frontier, &mut |handle| {
                 device.release(handle);
             });
         }
-        sample
+        (sample, frontier)
     }
 
     /// 已提交命令缓冲的失败分类：设备丢失（粘性）/ 其余 `Swapchain`。
@@ -204,7 +208,7 @@ impl Queue {
         if buffer.status() == MTLCommandBufferStatus::Error {
             return Err(self.failure(index, buffer, device));
         }
-        Ok(self.on_completed(index, buffer, device))
+        Ok(self.on_completed(index, buffer, device).0)
     }
 }
 

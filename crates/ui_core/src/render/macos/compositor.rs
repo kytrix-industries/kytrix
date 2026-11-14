@@ -262,11 +262,14 @@ impl GpuRenderer {
     }
 
     /// 完成通知到达（`kytrix-metal` 线程 drain）：失败分类 / GPU 时间 / retire（I4）。
+    ///
+    /// 第二个返回值是新的**连续完成前沿**（`CompletionOrder`）：调用方只在它推进时按提交
+    /// 顺序发布反馈（完成回调可能乱序，见 `renderer::FeedbackQueue`）。
     pub(crate) fn on_frame_completed(
         &mut self,
         index: FrameIndex,
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-    ) -> Result<Option<GpuTimerSample>, EngineError> {
+    ) -> Result<(Option<GpuTimerSample>, Option<FrameIndex>), EngineError> {
         debug_assert!(
             on_gpu_thread(),
             "command buffer completions may only be drained on the kytrix-metal thread"
@@ -303,10 +306,13 @@ impl GpuRenderer {
     }
 
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
+    ///
+    /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
+    /// 之间再复制一次整页（图片页 16 MiB）；与 Windows 的 `queue_atlas_upload` 同一约定。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        pixels: &[u8],
+        pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
         self.debug_assert_gpu_thread("queue_atlas_upload");
@@ -402,7 +408,13 @@ impl GpuRenderer {
                     Plan::Idle | Plan::Full => {}
                     Plan::Partial(damage) => {
                         for rect in damage.as_slice() {
-                            encoder.setScissorRect(scissor_for(rect, self.surface));
+                            // `request.surface` 与 drawable 允许 1 px 取整差：裁剪后可能没有
+                            // 面积（`x == surface.0` 等）。0 面积的 scissor 是 Metal validation
+                            // 的未定义边缘，直接跳过这个 damage 矩形。
+                            let Some(scissor) = scissor_for(rect, self.surface) else {
+                                continue;
+                            };
+                            encoder.setScissorRect(scissor);
                             draw_calls = draw_calls.saturating_add(draw_ops(
                                 &encoder,
                                 payload,
@@ -711,19 +723,105 @@ fn whole_scissor(surface: (u32, u32)) -> MTLScissorRect {
     }
 }
 
-/// damage 矩形 → scissor，**裁剪到实际目标尺寸**：`request.surface` 与 drawable 之间允许 1 px 的
-/// DPI 取整差（见 `renderer.rs` 的尺寸校验），越界的 scissor 会被 Metal validation 拒绝。
-fn scissor_for(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> MTLScissorRect {
-    let x = rect.x0.max(0) as u32;
-    let y = rect.y0.max(0) as u32;
-    MTLScissorRect {
-        x: x as usize,
-        y: y as usize,
-        width: rect.width().max(0).min(surface.0.saturating_sub(x) as i32) as usize,
-        height: rect.height().max(0).min(surface.1.saturating_sub(y) as i32) as usize,
+/// damage 矩形 → scissor，**裁剪到实际目标尺寸**；裁剪后没有面积时返回 `None`（调用点跳过）。
+///
+/// `request.surface` 与 drawable 之间允许 1 px 的 DPI 取整差（见 `renderer.rs` 的尺寸校验），
+/// 因此 damage 矩形可能比实际目标（drawable 尺寸）多出边界像素。只夹 `width/height` 会把 `x/y`
+/// 留在目标之外（`x == surface.0` 时 `width = 0`），越界或 0 面积的 `MTLScissorRect` 会被 Metal
+/// validation 拒绝；这里先把起止点都夹到 `[0, surface]`，再判断面积。
+fn scissor_for(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> Option<MTLScissorRect> {
+    let limit_x = surface.0.min(i32::MAX as u32) as i32;
+    let limit_y = surface.1.min(i32::MAX as u32) as i32;
+    let x0 = rect.x0.clamp(0, limit_x);
+    let y0 = rect.y0.clamp(0, limit_y);
+    let x1 = rect.x1.clamp(0, limit_x);
+    let y1 = rect.y1.clamp(0, limit_y);
+    let width = x1.saturating_sub(x0) as u32;
+    let height = y1.saturating_sub(y0) as u32;
+    if width == 0 || height == 0 {
+        return None;
     }
+    Some(MTLScissorRect {
+        x: x0 as usize,
+        y: y0 as usize,
+        width: width as usize,
+        height: height as usize,
+    })
 }
 
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scissor_for, whole_scissor};
+    use crate::math::PhysicalRect;
+
+    #[test]
+    fn damage_inside_the_surface_is_preserved() {
+        let scissor = scissor_for(&PhysicalRect::new(4, 6, 40, 60), (100, 80)).expect("scissor");
+        assert_eq!(scissor.x, 4);
+        assert_eq!(scissor.y, 6);
+        assert_eq!(scissor.width, 36);
+        assert_eq!(scissor.height, 54);
+    }
+
+    /// Partial damage 与 1 px 容差的交界：damage 坐标在 `request.surface` 空间，drawable 可以比
+    /// 它小 1 px（DPI 取整）。越界像素必须被裁掉，而不是产生越界 / 0 面积的 scissor。
+    #[test]
+    fn one_pixel_dpi_rounding_clips_damage_to_the_drawable() {
+        // 请求 1400 宽，drawable 1399 宽；damage 横跨右边缘。
+        let scissor =
+            scissor_for(&PhysicalRect::new(1398, 10, 1401, 20), (1399, 1040)).expect("scissor");
+        assert_eq!(scissor.x, 1398);
+        assert_eq!(scissor.y, 10);
+        assert_eq!(scissor.width, 1, "只保留落在 drawable 内的 1 px");
+        assert_eq!(scissor.height, 10);
+    }
+
+    #[test]
+    fn a_partial_damage_rect_past_the_edge_is_skipped_not_left_empty() {
+        // `x == surface.0` 会裁剪出 0 宽矩形：不是合法 scissor，调用点必须跳过。
+        let surface = (1399, 1040);
+        assert!(
+            scissor_for(&PhysicalRect::new(1399, 0, 1400, 1040), surface).is_none(),
+            "整列都在 drawable 之外"
+        );
+        // 同一 damage 往左扩展 1 px 后仍可画：不能把整个矩形丢掉。
+        let scissor =
+            scissor_for(&PhysicalRect::new(1398, 0, 1400, 1040), surface).expect("scissor");
+        assert_eq!((scissor.x, scissor.width), (1398, 1));
+    }
+
+    #[test]
+    fn a_damage_rect_entirely_outside_the_surface_has_no_scissor() {
+        let surface = (1400, 1040);
+        for rect in [
+            PhysicalRect::new(1400, 0, 1420, 10),
+            PhysicalRect::new(-20, 0, 0, 10),
+            PhysicalRect::new(0, 1040, 10, 1060),
+            PhysicalRect::new(0, -20, 10, 0),
+            PhysicalRect::new(2000, 2000, 2010, 2010),
+        ] {
+            assert!(
+                scissor_for(&rect, surface).is_none(),
+                "{rect:?} 在目标之外必须没有 scissor"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_straddling_the_origin_is_clamped_to_zero() {
+        let scissor = scissor_for(&PhysicalRect::new(-8, -4, 6, 10), (100, 50)).expect("scissor");
+        assert_eq!((scissor.x, scissor.y), (0, 0));
+        assert_eq!((scissor.width, scissor.height), (6, 10));
+    }
+
+    #[test]
+    fn the_full_frame_scissor_covers_the_target() {
+        let scissor = whole_scissor((1400, 1040));
+        assert_eq!((scissor.x, scissor.y), (0, 0));
+        assert_eq!((scissor.width, scissor.height), (1400, 1040));
+    }
 }
