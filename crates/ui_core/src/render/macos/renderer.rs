@@ -1177,8 +1177,9 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, SHUTDOWN_GRACE, Shared, StickyError,
-        SurfaceMismatch, SurfaceVerdict, WaitOutcome, pacing_paused, surface_within_tolerance,
+        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, SHUTDOWN_GRACE, SendCommandBuffer,
+        Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome, pacing_paused,
+        surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
@@ -1436,6 +1437,37 @@ mod tests {
             "驱动永不回调完成时关闭等待必须有界（join 不能挂住 UI）"
         );
         assert!(started.elapsed() >= SHUTDOWN_GRACE, "必须等满 grace 才放弃");
+    }
+
+    /// F-169 的「terminated-only」语义：关闭期间必须继续收完成通知（关闭握手靠它把在飞帧
+    /// drain 到 0），只有 GPU 线程已经退出（`terminated`）之后的通知才可以丢弃。
+    #[test]
+    fn completion_notifications_are_dropped_only_after_termination() {
+        use objc2_metal::{MTLCommandQueue, MTLDevice};
+
+        use crate::render::macos::device::Device;
+
+        let shared = Shared::new();
+        let device = Device::new().expect("metal device");
+        let queue = device.raw().newCommandQueue().expect("command queue");
+        let buffer = || SendCommandBuffer(queue.commandBuffer().expect("command buffer"));
+        shared.request_shutdown();
+        shared.lock().in_flight = 2;
+        shared.push_completion(index(1), buffer());
+        let completions = shared.take_completions();
+        assert_eq!(
+            completions.len(),
+            1,
+            "shutdown 期间的完成通知必须入队（关闭握手 drain 在飞帧）"
+        );
+        assert_eq!(shared.in_flight(), 1, "drain 必须按完成数减少在飞帧");
+
+        shared.mark_terminated();
+        shared.push_completion(index(2), buffer());
+        assert!(
+            shared.take_completions().is_empty(),
+            "terminated 之后不再入队（消费者已退出，继续入队只会泄漏命令缓冲）"
+        );
     }
 
     /// 离屏路径（快照 / golden）仍是**同步**语义，并且与窗口路径共用同一套 GPU 对象：
