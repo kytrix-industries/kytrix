@@ -1,6 +1,13 @@
-//! 物理设备选择、D8 采集、逻辑设备与同步原语（`design/phase-12-macos-linux.md` §6.2）。
+//! 物理设备选择、D8 采集、逻辑设备与同步原语（`design/phase-12-macos-linux.md` §6.2、
+//! `design/async-render-pipeline.md` §7.2）。
+//!
+//! 同步原语的所有权（§7.2 的两条硬规则）：
+//! - `VkFence` 每帧槽一个（`InFlightRing` 记账，复用命令/上传缓冲的前置条件）；
+//! - `image_available` 二值信号量**每帧槽一个**（acquire 时 signal、submit 时 wait）；
+//! - `render_finished` 二值信号量**每 swapchain image 一个**（在 `swapchain.rs`，按 image 索引）；
+//! - timeline 信号量 1 个：每帧 signal 一个值，**只用于 retire 记账**，绝不用于 acquire/present。
 
-use std::path::PathBuf;
+use std::{cell::Cell, path::PathBuf};
 
 use ash::vk;
 use smol_str::SmolStr;
@@ -90,6 +97,23 @@ impl GpuCaps {
 /// `GpuResourceHandle` 的 `kind`：Vulkan 资源（image / buffer / memory / view / sampler）。
 const HANDLE_KIND_OBJECT: u8 = 1;
 
+thread_local! {
+    /// 当前线程是否是 `kytrix-vulkan` GPU 线程（`design/async-render-pipeline.md` §10.1 的归属断言）。
+    static ON_GPU_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 标记当前线程为 GPU 线程（`render/linux/renderer.rs` 的循环入口调用一次）。
+pub(crate) fn enter_gpu_thread() {
+    ON_GPU_THREAD.set(true);
+}
+
+/// 所有**窗口路径**的 Vulkan 调用都必须在 GPU 线程上（对象构造阶段除外，§3.1）。
+///
+/// 离屏 / 快照路径由门面在 UI 线程同步调用，因此断言只放在「窗口目标」的分支上。
+pub(crate) fn on_gpu_thread() -> bool {
+    ON_GPU_THREAD.get()
+}
+
 /// 句柄表里的 Vulkan 资源（`GpuResourceHandle` 的载荷）。
 pub(crate) enum GpuObject {
     Buffer(vk::Buffer),
@@ -110,6 +134,8 @@ pub(crate) struct Device {
     timestamp_valid_bits: u32,
     timeline: vk::Semaphore,
     fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    /// acquire 的 `image_available`（每帧槽一个，§7.2）：跨 swapchain 重建存活。
+    image_available: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     ring: InFlightRing,
     retire: RetireQueue,
     resources: ResourceTable,
@@ -274,7 +300,7 @@ impl Device {
 
         let mut fences = [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT];
         for fence in fences.iter_mut() {
-            // 必须带 `SIGNALED`：`begin` 会等 fence，首帧（以及早退后未提交的槽）不能永远等下去。
+            // 必须带 `SIGNALED`：槽位复用时先等 fence，首帧（以及早退后未提交的槽）不能永远等下去。
             // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
             *fence = unsafe {
                 raw.create_fence(
@@ -283,6 +309,16 @@ impl Device {
                 )
             }
             .map_err(|error| init_error("create_fence", format!("{error:?}")))?;
+        }
+        // 每帧槽一个二值信号量（§7.2）：acquire 时 signal、submit 时在 COLOR_ATTACHMENT_OUTPUT 等它。
+        // 它只属于帧槽（不属于 swapchain），所以重建 swapchain 时保留、无需重建。
+        let mut image_available = [vk::Semaphore::null(); MAX_FRAMES_IN_FLIGHT];
+        for semaphore in image_available.iter_mut() {
+            // SAFETY: 句柄与参数都由本结构独占；`Drop` 里销毁。
+            *semaphore = unsafe { raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                .map_err(|error| {
+                    init_error("create_semaphore(image_available)", format!("{error:?}"))
+                })?;
         }
 
         Ok(Self {
@@ -296,6 +332,7 @@ impl Device {
             timestamp_valid_bits,
             timeline,
             fences,
+            image_available,
             ring: InFlightRing::new(),
             retire: RetireQueue::new(),
             resources: ResourceTable::new(),
@@ -341,25 +378,42 @@ impl Device {
         })
     }
 
-    /// 起步：等本槽 fence（**超时 0**，未 signal 就继续）→ 取 `FrameSlot`。
+    /// 取本帧的 ring 槽位（**纯记账**，不碰 GPU；提交成功后才 [`Device::advance`]）。
     ///
-    /// fence 在创建时带 `SIGNALED`，且只在 `reset_fence`（提交前）被重置 ⇒ 早退
-    /// （`OUT_OF_DATE` / Geometry 注册失败）不会把槽卡死；这里不 reset，避免
-    /// 「reset 之后不再提交」的经典死锁。
-    pub(crate) fn begin(&mut self, index: FrameIndex) -> Result<FrameSlot, EngineError> {
+    /// 同一帧可能因 `NOT_READY` / `OUT_OF_DATE` 重试多次：本调用是幂等的（`acquire` 不推进状态），
+    /// 重试得到相同的槽位与 signal 值。
+    pub(crate) fn slot(&self, index: FrameIndex) -> FrameSlot {
         let slot = self.ring.acquire(index);
         debug_assert_eq!(
             self.ring.last_signaled(),
             slot.signal_value.saturating_sub(1),
             "ring must advance exactly one step per submitted frame"
         );
+        slot
+    }
+
+    /// 本帧槽的 `image_available` 二值信号量（§7.2：每帧槽一个）。
+    pub(crate) fn image_available(&self, slot: usize) -> vk::Semaphore {
+        self.image_available[slot]
+    }
+
+    /// 等本槽上一次提交完成（**允许阻塞**：只发生在 GPU 线程，§8.2）。
+    ///
+    /// fence 在创建时带 `SIGNALED`，且只在 `reset_fence`（提交前）被重置 ⇒ 早退
+    /// （`NOT_READY` / `OUT_OF_DATE` / Geometry 注册失败）不会把槽卡死。
+    pub(crate) fn wait_slot(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
         let fences = [self.fences[slot.index]];
-        // SAFETY: fence 由本设备创建；0 = 立即返回（未完成的提交已由上一次 `queue_submit` 的等待覆盖）。
-        match unsafe { self.raw.wait_for_fences(&fences, true, 0) } {
-            Ok(()) | Err(vk::Result::TIMEOUT) => {}
-            Err(error) => return Err(init_error("wait_for_fences", format!("{error:?}"))),
+        // SAFETY: fence 由本设备创建；`u64::MAX` = 等到它 signal（该槽上一次提交完成）。
+        match unsafe { self.raw.wait_for_fences(&fences, true, u64::MAX) } {
+            Ok(()) => Ok(()),
+            // §7.7：设备丢失优先分类成粘性 `DeviceLost`，不降级成泛化的 `AppInit`。
+            Err(error) => {
+                if let Some(lost) = self.note_failure(error, 0) {
+                    return Err(lost);
+                }
+                Err(init_error("wait_for_fences", format!("{error:?}")))
+            }
         }
-        Ok(slot)
     }
 
     /// 提交前重置本槽 fence（唯一的 reset 点：`queue_submit` 会立刻让它 signal）。
@@ -378,21 +432,14 @@ impl Device {
         self.ring.advance(slot);
     }
 
-    /// 等一次提交（resize / 快照 / 退出）：timeline 值即 `FrameIndex`。
-    pub(crate) fn wait_idle(&mut self, value: u64) -> Result<(), EngineError> {
-        let semaphores = [self.timeline];
-        let values = [value];
-        // SAFETY: timeline semaphore 由本设备创建；`u64::MAX` = 永久等待。
-        unsafe {
-            self.raw.wait_semaphores(
-                &vk::SemaphoreWaitInfo::default()
-                    .semaphores(&semaphores)
-                    .values(&values),
-                u64::MAX,
-            )
-        }
-        .map(|_| ())
-        .map_err(|error| init_error("wait_semaphores", format!("{error:?}")))
+    /// 非阻塞读 timeline 的完成值（retire 记账，§4.3 / I4）。
+    ///
+    /// timeline **只用于 retire**：`acquire` / `present` 一律用二值信号量（§7.2 硬规则 2），
+    /// 帧的完成也一律用 fence 观察；这里没有 `wait_semaphores`。
+    pub(crate) fn completed_value(&self) -> Result<u64, EngineError> {
+        // SAFETY: timeline semaphore 由本设备创建，只读查询。
+        unsafe { self.raw.get_semaphore_counter_value(self.timeline) }
+            .map_err(|error| init_error("get_semaphore_counter_value", format!("{error:?}")))
     }
 
     pub(crate) fn timeline(&self) -> vk::Semaphore {
@@ -448,10 +495,13 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // SAFETY: 所有子资源必须由调用方先销毁（`Renderer::drop` 保证顺序）。
+        // SAFETY: 所有子资源必须由调用方先销毁（`GpuRenderer::drop` 保证顺序）。
         unsafe {
             for fence in self.fences {
                 self.raw.destroy_fence(fence, None);
+            }
+            for semaphore in self.image_available {
+                self.raw.destroy_semaphore(semaphore, None);
             }
             self.raw.destroy_semaphore(self.timeline, None);
             self.raw.destroy_device(None);

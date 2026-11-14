@@ -43,7 +43,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let size = state.size();
     let (display, surface_ptr) = state.raw_pointers();
     let physical = crate::platform::linux::dpi::physical_size(size, scale);
-    let renderer = Renderer::new_for_surface(display, surface_ptr, physical, scale.factor())?;
+    let renderer = Renderer::new_for_surface(display, surface_ptr, physical)?;
 
     let id = app
         .windows()
@@ -104,6 +104,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 // 要等下一次协议事件才出帧。
                 dispatcher.wake();
             }
+            // ①b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去
+            // （`design/async-render-pipeline.md` §7.7）。所有 Vulkan 工作都在 `kytrix-vulkan`
+            // 线程上，UI 线程只读反馈（I1）。
+            app.poll_renderers()?;
             // ② 窗口状态镜像：**只在值变化时**设置（`set_size` 会推进 scale epoch、
             // 置 full-damage、重排根 LAYOUT，每轮无条件调用会让 UI 永久失效）。
             let scale_now = state.scale();
@@ -149,8 +153,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     crate::window::WindowControl::BeginResize(edge) => state.begin_resize(edge),
                 }
             }
-            // ④ 提交一帧。`wl_callback` 必须在**提交（present 触发 commit）之前**请求，
-            // 否则 `done` 永远不会到达（Wayland 的 frame 回调只在 commit 之后生效）。
+            // ④ 提交一帧。`wl_callback` 必须在 **publish 之前**请求（§7.5 第 3 条）：
+            // WSI 的 `attach/commit` 发生在 GPU 线程 present 时，而 `frame` 回调只在 commit
+            // 之后生效 —— 先挂回调、再把帧放进最新帧槽，GPU 线程的 present 才能让它回来。
             //
             // 先判 `frame_ready` 再消费唤醒：上一帧还没 present 时，唤醒必须留在队列里；
             // frame callback 到达后下一轮会重新看到它。反过来先消费会把 resize 的最后一帧丢掉。

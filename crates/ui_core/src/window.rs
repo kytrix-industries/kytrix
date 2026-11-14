@@ -675,15 +675,9 @@ impl Window {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        #[cfg(windows)]
-        {
-            // Windows：反馈（统计 / GPU 采样）由渲染器内部消费，这里只把错误冒泡。
-            let _ = renderer.poll()?;
-        }
-        #[cfg(not(windows))]
-        {
-            renderer.poll()?;
-        }
+        // 三平台窗口路径一致：反馈（统计 / GPU 采样）由渲染器内部消费，这里只把错误冒泡。
+        // 离屏路径的 `poll` 恒为 `Ok(None)`。
+        let _ = renderer.poll()?;
         Ok(())
     }
 
@@ -1004,7 +998,7 @@ impl Window {
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
         // 窗口路径的 GPU 工作已移到 GPU 线程：主线程没有本帧的 samples，
         // 用最近完成帧的采样补齐（HUD 允许落后一帧）。
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         let (upload_time, gpu_time, present_time) = match self.renderer.as_ref() {
             Some(renderer) => (
                 upload_time.or_else(|| {
