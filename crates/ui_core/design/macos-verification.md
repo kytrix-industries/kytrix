@@ -4,8 +4,9 @@
 > 记录每个修复的用户决策与复现证据。
 >
 > 本文是**执行记录**；与设计文档不同的实现事实按纪律登记到
-> [`DEVIATIONS.md`](DEVIATIONS.md)（本轮新增 F-157 … F-165、S-138、V-114 … V-119；
-> V-114/V-119 已由 F-164 关闭，保留编号作为历史）。
+> [`DEVIATIONS.md`](DEVIATIONS.md)（首轮新增 F-157 … F-165、S-138、V-114 … V-119；
+> V-114/V-119 已由 F-164 关闭，保留编号作为历史；三平台异步管线的两轮审查修订见
+> §27/§28 的 F-166 … F-175 与 §29 的 F-176 … F-182）。
 
 ---
 
@@ -73,10 +74,13 @@ HUD 以 60fps 连续出帧时，对 demo 做一次完整 AX 树遍历会超过 1
 **修复**（用户选 A）：
 - 在 command buffer `commit` 之前调用 `MTLCommandBuffer::presentDrawable:`（Apple 推荐生命周期）；
 - `allowsNextDrawableTimeout(true)` 作为安全网；`nextDrawable` 返回 `None` 时按「本帧跳过」处理。
+  **已被 F-164 取代**：窗口路径改用 `CAMetalDisplayLink`，不再调用 `nextDrawable`，
+  `next_drawable` / `allowsNextDrawableTimeout` 已删除；本节保留为当时的修复记录。
 
-**后续架构改造（用户批准）**：macOS 窗口路径先改为异步提交（`Queue::submit` 只 commit，完成后轮询，
-§2.8），随后把整个 `GpuRenderer` 移到独立 render 线程（F-164，§2.9）：`nextDrawable`、编码、
-`presentDrawable` 都不再经过主线程。HUD/动画 60fps 时完整 AX 树 0.20s；V-114/V-119 关闭。
+**后续架构改造（用户批准）**：macOS 窗口路径先改为异步提交（`Queue::submit` 只 commit，完成后
+轮询 `status`；该完成通知后来由 F-164 的 `addCompletedHandler` 取代），随后把整个 `GpuRenderer`
+移到独立 render 线程（F-164，§2.9）：`nextDrawable`、编码、`presentDrawable` 都不再经过主线程。
+HUD/动画 60fps 时完整 AX 树 0.20s；V-114/V-119 关闭。
 命令提交仍异步，GPU 时间采样从上一帧读取（HUD 显示可能领先一帧）。
 
 ### 2.3 macOS clippy 门禁 4 个 error
@@ -118,7 +122,7 @@ Esc 与 Ctrl+Cmd+F 都不能退出，只能杀进程。直接写 `AXFullScreen` 
 1. 主循环换 `NSApplication::run()`，pump 由 `CFRunLoopObserver` + wake source + timer 驱动，全部挂 common modes；
 2. `contentView` 设置 `ViewWidthSizable|ViewHeightSizable`；
 3. 窗口 `setOpaque(true)` + 黑色背景，并显式 `collectionBehavior = FullScreenPrimary`；
-4. 命令提交异步化（queue 轮询完成，不阻塞主线程）。
+4. 命令提交异步化（queue 轮询完成，不阻塞主线程；完成通知后被 F-164 的 `addCompletedHandler` 取代）。
 
 结果：**HUD 关闭**时 AXFullScreenButton 进出全屏正常（1680×1050 → 恢复 960×740，AX 树为 AXStandardWindow
 且控件/子节点齐全，无残留）；demo 固定 960×740 布局，全屏四周黑底属预期。**HUD 开启**（连续 60fps）时
@@ -139,7 +143,7 @@ HUD 开启的全屏也正常（1680×1050，AX 树完整，58–60fps）。
 | 项 | 旧 | 新 | Windows/Linux 影响 |
 |----|----|----|---------------------|
 | 事件循环 | 引擎自持 `nextEventMatchingMask` + source 只 default mode | `NSApplication::run()`；observer/source/timer 全挂 common modes；退出先撤 source/timer，再投空事件 + `NSApp.stop`（F-165） | 无（只改 `platform/macos/event_loop.rs` / `wake.rs`） |
-| 命令提交 | `commit` + `waitUntilCompleted` | `commit` 后立即返回；3 槽 in-flight 轮询 `status`，完成后 resolve timer + retire | 无（只改 `render/macos/queue.rs` / `compositor.rs`） |
+| 命令提交 | `commit` + `waitUntilCompleted` | `commit` 后立即返回；3 槽 in-flight 轮询 `status`，完成后 resolve timer + retire（**已被 F-164 及三平台异步管线取代**：完成通知改 `addCompletedHandler`，不再轮询 `status()`；`status()` 只在完成回调/读回里检查 `Error`） | 无（只改 `render/macos/queue.rs` / `compositor.rs`） |
 | GPU 读回 | 同步等待 | `wait_idle` 只用于 resize/readback/shutdown；离屏 golden 仍同步 | 无 |
 | 窗口属性 | 透明、无 collectionBehavior、contentView 无 autoresizing | opaque + FullScreenPrimary + autoresizing | 无 |
 
@@ -148,6 +152,11 @@ HUD 开启的全屏也正常（1680×1050，AX 树完整，58–60fps）。
 V-114 / V-119 关闭。
 
 ### 2.9 窗口 render 线程（F-164）
+
+> **已被取代（F-166 … F-182）**：本节记录的 mailbox + 100 ms 重试 +「拿不到 drawable 强制全量」
+> 随后被三平台异步管线替换——窗口路径改用 `CAMetalDisplayLink`（drawable 由 display link 提供），
+> 删除了邮箱与重试定时器；被覆盖帧的 damage 合并进后继帧，不再靠「强制全量」补救。本节保留为
+> F-164 的落地记录，当前机制见 [`async-render-pipeline.md`](async-render-pipeline.md) §5。
 
 **目标**：主线程不再调用 `CAMetalLayer::nextDrawable`，也不在编码/呈现上被合成器暂停拖住。
 
@@ -192,7 +201,8 @@ HUD 开、HUD 关、Esc 三条关窗路径均实测进程退出。
 ### 2.11 Metal 异步管线回归修复（P0/P1/P2，2026-11-14）
 
 异步窗口管线（`16f2045`）的对抗性审查在 macOS/Metal 上发现 1 个 P0（实机复现）、1 个 P1 与若干
-P2。修复与偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md) §28（F-171 … F-175）；本节只记录实测证据。
+P2；第二轮又修了粘性退化、0 面积 scissor、有界关闭与反馈发布顺序。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §28（F-171 … F-175）与 §29（F-176 … F-182）；本节只记录实测证据。
 
 **P0：上传槽位与三槽 semaphore 不同源（F-171）**。临时探针在 GPU 线程记录每个槽上次提交的命令
 缓冲，并在 `begin`（CPU memcpy 之前）打印它的 `status`。GPU-bound（每帧 300 次整面 blit）12 s：
@@ -225,16 +235,29 @@ PROBE t=1336 take prev=1 next=2 gap=1 req=(1800, 1400) drawable=(1800, 1400)
 PROBE t=1337 submit idx=2 req=(1800, 1400) drawable=(1800, 1400) full=true   # 新尺寸完成一次 present
 ```
 
-持续不一致（请求比 drawable 大 2 px）时退化路径生效：每 4 个 vsync 跳过，第 5 个按 drawable 尺寸
-全量提交并记录诊断——`metal drawable 1920x1556 never matched the requested 1922x1558 within 4
-vsyncs; rendering at the drawable size (full frame)`，4 s 内 45 次提交、0 validation error。
+持续不一致（请求比 drawable 大 2 px）时退化路径生效：连续 4 个 vsync 不一致后进入**粘性退化**，
+此后每个 vsync 都按 drawable 的实际尺寸全量渲染，直到请求尺寸与 drawable 重新落在 1 px 容差内；
+诊断每次退化 episode 只打印一次——`metal drawable 1920x1556 never matched the requested 1922x1558
+within 4 vsyncs; rendering at the drawable size (full frame) from now on`。修复前同一场景是
+「跳 4 个 vsync、第 5 个按 drawable 尺寸渲染」并每轮重新打印（4 s 仅 45 次提交，约 11 fps），
+现已被粘性退化取代。
 
-**其余验证**：`MTL_DEBUG_LAYER=1` 跑 10 s + HUD 连续帧 → 0 validation error；HUD 的 `Latency` 行
-稳定在 12.2–13.0 ms（FPS 58–60、Frame 16.65–17.29 ms，同一 run 的打印见提交信息）；程序化
-`App::close_window`（GPU-bound、2–3 帧在飞）→ exit 0、join 正常（F-175 的 `||` 变体在同一场景
-会卡满 2 s 超时并打印 `abandoning the join`，实测 6 s 退出）。
+**其余验证**：`MTL_DEBUG_LAYER=1` 跑 10 s + HUD 连续帧（含持续尺寸不一致的退化路径）→
+0 validation error；HUD 的 `Latency` 行在同一台机的最新实测为 **3.11–3.74 ms**（`b4ea69e` 基线
+重测 **2.90–3.41 ms**；FPS 58–60、Frame 16.65–17.29 ms），该数值随机器/负载变化，只作同机对比
+（旧记录的 12.2–13.0 ms 来自另一环境，不作契约）。**反馈按提交顺序发布**（F-180）：Metal 完成
+回调可以乱序，`FeedbackQueue` 只在 `CompletionOrder` 的连续前缀推进时从队首发布，HUD 的
+`Latency` 不会被更旧帧的完成覆盖。**关闭有界**（F-179）：`Drop` 直接 `join`，等待由
+`SHUTDOWN_GRACE = 2 s` 兜底（从 `request_shutdown` 起累计、100 ms 轮询封顶）；程序化
+`App::close_window`（GPU-bound、2–3 帧在飞）→ exit 0、无 detach，驱动不回调完成时最多 2 s
+后打印诊断并退出（F-175 的 `||` 变体是反例：丢弃完成通知、join 卡满后 detach，实测 6 s）。
 
 ## 3. 修复与决策记录
+
+> 下表是**当时的决策记录**。M2 / M10 / M11 涉及的 `nextDrawable`、轮询 `status()`、邮箱重试与
+> 「强制全量」已被 F-164 与 F-166 … F-182 的异步管线取代（完成通知改为 `addCompletedHandler`，
+> `next_drawable` / `allowsNextDrawableTimeout` 已删除，damage 合并取代强制全量）；机制说明见
+> §2.2 / §2.8 / §2.9 的「已被取代」注记。
 
 | # | 决策点 | 选项 | 用户选择 | 实施 |
 |---|--------|------|----------|------|

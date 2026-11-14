@@ -1,8 +1,8 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15。
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-182）。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-169、`macos-verification.md` §2.9
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-182（§27–§29）、`macos-verification.md` §2.9/§2.11
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -31,6 +31,12 @@
 ---
 
 ## 1. 现状审查：为什么必须重写
+
+> **状态：本节记录重写前的实现**（`523763a` / `6b5f6cd` / `16f2045` 之前）。其中的
+> `nextDrawable`、`allowsNextDrawableTimeout`、`status()` 轮询、`waitUntilCompleted` 背压与
+> 「强制全量」都**已被取代**（F-164、F-166 … F-182）：macOS 窗口路径改用 `CAMetalDisplayLink`
+> 与 `addCompletedHandler`，`next_drawable` / `allowsNextDrawableTimeout` 已从窗口路径删除，
+> damage 合并（§4.2）取代了强制全量。保留本节用于追溯「为什么必须重写」。
 
 ### 1.1 Windows / Linux：同步管线把 GPU 与合成器接在 UI 线程上
 
@@ -193,6 +199,7 @@ UI 线程 `publish`：
 
 ### 4.3 序号与 retire
 
+- in-flight 槽位由 `InFlightRing::acquire` 按 **acquire 次数**轮转（0 → 1 → 2 → 0），不由 `FrameIndex` 取模：最新帧槽合并会丢掉被覆盖帧的序号，序号跨度可以是任意值；Linux 的 `NOT_READY` / `OUT_OF_DATE` 重试还会多消费一次 acquire 而不提交（F-176）。
 - GPU 线程只对**真正录制并提交**的帧推进自己的 `submitted` 序号；`RetireQueue` 用 `FrameIndex` 记账（`render/retire.rs`）。
 - 某帧被跳过（没有 GPU 工作）时，它的序号不会出现在完成通知里；后继帧完成时 `completed` 直接跨过它，`retire_at <= completed` 的条目照常释放——语义正确（该帧从未引用任何资源）。
 - 资源重建（persist/upload 扩容）产生的旧句柄在**重建发生时**入队，tag = 当前最后提交序号；完成通知到达后才真正释放。
@@ -264,37 +271,40 @@ sync_pacing(continuous)                 retire / 计时 / 反馈
 ```text
 loop {
     wait(condvar)                           // 有请求/有 drawable/有完成/关闭
-    drain_completions()                     // 完成通知入队者：只在这里动 retire 与计时
+    drain_completions()                     // 完成通知入队者：只在这里动 retire、反馈与计时
 
     if !has_pending_frame() { continue }     // 没有脏区就不画，drawable 留给下一个 vsync
     let Some(drawable) = take_latest_drawable() else { continue };
-    // ① 三缓冲背压：非阻塞，失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）
-    if dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) != 0 { continue; }   // I1：绝不等 GPU
-    let Some(frame) = take_latest_frame() else { sem.signal(); continue };   // 防御：归还槽位
+    let target = drawable.texture.size;      // drawable 的实际像素尺寸
 
-    // ② 目标校验：drawable 的实际像素尺寸 = 本帧渲染尺寸
-    if persist.size != drawable.texture.size { recreate_persist(drawable.texture.size); }
+    // ① 尺寸校验必须在**占槽与取帧之前**（F-172）：drawable 可能还是上一轮 layout 的产物。
+    //    不一致（>1 px，吸收 DPI 取整）⇒ 丢弃这个陈旧 drawable、跳过本 vsync，帧留在最新帧槽
+    //    （pending 让 display link 保持运行）。连续 4 个 vsync 仍不一致 ⇒ **粘性退化**（F-179）：
+    //    之后每个 vsync 都按 drawable 尺寸全量画，直到请求尺寸重新落回容差内；诊断只打印一次。
+    let verdict = mismatch.observe(shared.published_surface(), target);   // Ready / Skip / Degraded
+    if verdict == Skip { continue }
+    let degrade = verdict == Degraded;
 
-    // ③ 录制（一条 command buffer）
-    let cb = queue.commandBuffer();
-    upload_instances_clips(slot, &frame.payload);          // slot = ring 槽（3）
-    blit_atlas_uploads(&cb);                                // 本帧到期的最新图集页
-    render_pass(&cb, persist, frame.plan /* Full→Clear+全画, Partial→Load+scissor */);
-    blit_persist_to_drawable(&cb, persist, drawable.texture); // 整面，见 §5.6
-    cb.presentDrawable(drawable);                          // 必须在 commit 前
-    cb.addCompletedHandler(move |cb| {                     // 异步完成通知
-        sem.signal();
-        completion_tx.push(Completion { index, cb: cb.clone() });
-        wake_gpu_thread();
-    });
-    cb.commit();                                           // 立即返回
-    last_submitted = index;
+    // ② 三缓冲背压：非阻塞，失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）
+    if !renderer.try_acquire_upload_slot() { continue }   // I1：绝不等 GPU
+    // ③ 取帧时再校验一次尺寸（两次加锁之间可能发布了新帧）；失败则归还槽位、帧留在槽里。
+    let Some(frame) = shared.take_frame_for_drawable(target, degrade) else {
+        renderer.release_upload_slot();
+        continue;
+    };
+    for upload in shared.take_atlas() { renderer.queue_atlas_upload(upload) }   // Vec<u8> 移动（F-181）
+
+    // ④ 录制（一条 command buffer）；槽位按 acquire 次数轮转（F-176）
+    let resized = renderer.prepare_target(target)?;          // persist 跟 drawable，旧句柄按 §4.3 retire
+    let mut plan = FramePlan::new(frame.plan, resized || renderer.is_fresh() || degrade);
+    if plan.is_idle() { renderer.release_upload_slot(); continue }   // 无像素 ⇒ 不产生 GPU 工作
+    renderer.submit_frame(&frame, &drawable, &mut plan, completed_handler)?;   // commit 后立即返回
 }
 ```
 
-- `sem` = `dispatch_semaphore_create(3)`（Apple 官方「Synchronizing CPU and GPU work」的三缓冲模式）。它保护的是**三槽上传缓冲**与 GPU 队列深度（不是 drawable 池）：在飞 command buffer 超过 3 个就会覆盖别的槽的实例字节。**等待用 `DISPATCH_TIME_NOW`**，失败即跳帧；`signal` 在 completed handler 里。
-- 完成通知里不碰 retire/计时（避免跨线程改 GPU 线程状态）：只 signal + 入队 + 唤醒，真正的 `retire.on_completed` 与 `GpuTimer::resolve` 在 GPU 线程上做（`GpuTimer` 读 `GPUStartTime/GPUEndTime`，可在任意线程读，但放到 GPU 线程便于状态集中）。
-- 绘制仍用今天的 persist + damage scissor；`Full` 时 `Clear`，`Partial` 时 `Load`。
+- `renderer.try_acquire_upload_slot()` 背后是 `dispatch_semaphore_create(3)`（Apple 官方「Synchronizing CPU and GPU work」的三缓冲模式）。它保护的是**三槽上传缓冲**与 GPU 队列深度（不是 drawable 池）：在飞 command buffer 超过 3 个就会覆盖别的槽的实例字节。**等待用 `DISPATCH_TIME_NOW`**，失败即跳帧；`signal` 在 completed handler 里（帧没提交时用 `release_upload_slot()` 归还）。占槽在尺寸校验之后：占槽后放弃会让 semaphore 与 ring 槽位不同源。
+- 完成通知里不碰 retire/计时（避免跨线程改 GPU 线程状态）：只 signal + 入队 + 唤醒，真正的 `retire.on_completed` 与 `GpuTimer::resolve` 在 GPU 线程上做（`GpuTimer` 读 `GPUStartTime/GPUEndTime`，可在任意线程读，但放到 GPU 线程便于状态集中）。完成回调可以乱序，反馈由 `FeedbackQueue` 按 `CompletionOrder` 的连续前缀**按提交顺序**发布（F-180）。
+- 绘制仍用今天的 persist + damage scissor；`Full` 时 `Clear`，`Partial` 时 `Load`。`Partial` 的 scissor 夹到目标尺寸，零面积矩形直接跳过（F-179：1 px 容差下 0 宽 scissor 会被 Metal validation 拒绝）。
 - `frame.plan` 若为 `Partial` 但本帧是重建后的首帧，GPU 线程升级为 `Full`（对应今天的 `fresh`，但判定权在资源所有者手上）。
 
 ### 5.3 主线程职责（display link 与图层）
@@ -315,7 +325,8 @@ loop {
 
 - 窗口尺寸变化：平台层 `sync_state` 读 AppKit 的 frame/backing scale → 主线程写 `drawableSize`/`contentsScale` → 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
 - 不等待任何在飞帧：旧 persist 被在飞命令缓冲引用，由 retire 在完成后释放；GPU 线程立即改用新 persist。
-- drawable 尺寸与请求尺寸可能差一帧（AppKit 已改、UI 还没发布新 surface）：**macOS 以 drawable 的实际尺寸为重建真值**（persist 尺寸与 `Full` 判定都由它决定）；`FrameRequest.surface` 仍保留给 UI 侧判断「是否需要发布」（§4.4 的兜底门禁），GPU 线程不拿它当 macOS 的重建依据。
+- drawable 尺寸与请求尺寸可能差一帧（AppKit 已改、UI 还没发布新 surface）：GPU 线程在**占槽与取帧之前**比较两者（1 px 容差吸收 DPI 取整）；不一致就丢弃陈旧 drawable、跳过本 vsync，帧留在最新帧槽（F-172）。persist 尺寸与 `Full` 判定以最终采用的 drawable 尺寸为准。
+- 连续 4 个 vsync 仍不一致 ⇒ **粘性退化**（F-179）：此后每个 vsync 都按 drawable 尺寸全量渲染，直到请求尺寸重新落回容差内，诊断每次退化 episode 只打印一次。`Partial` 的 scissor 会夹到目标尺寸，零面积矩形直接跳过（1 px 容差下 0 宽 scissor 会被 Metal validation 拒绝）。
 - DPI 变化但物理尺寸不变：`set_layer_scale` 更新 `contentsScale`，`drawableSize` 由 AppKit 依 bounds×scale 派生（若派生滞后，下一帧按实际 drawable 尺寸重建）。
 
 ### 5.5 空闲与连续帧
@@ -392,7 +403,8 @@ loop {
                                             // waitable 没被消费，不能再等它（驱动/遮挡会让关闭挂死）
     }
     if shutdown { return; }             // 关闭：waitable 即使刚被消费也不 present（swapchain 随即
-                                        // 销毁，没有下一帧需要这个令牌）
+                                        // 销毁，没有下一帧需要这个令牌）；这是 token 守恒的**唯一**
+                                        // 例外（F-182）：其余两个不画出口仍是断言，不是可走路径。
     // **token 守恒：消费 waitable ⇒ 本帧必须 present。** 两个「不画」的出口（取帧失败、Idle 帧）
     // 都必须在消费之前判掉：`has_pending_frame()` 已保证取得到帧（帧槽只有本线程消费），而
     // `window.rs` 在目标未重建时根本不发布 Idle 计划（surface 变化会先 resize 并把 fresh 置真）。
@@ -401,7 +413,7 @@ loop {
     if frame.plan == Idle && !is_fresh { unreachable!("idle frames are never published") };
     if frame.surface != surface { do_resize(frame.surface)?; }   // 见 §6.4；任何错误 ⇒ 显式失败
 
-    let slot = ring.acquire(frame.index);
+    let slot = ring.acquire();                              // 按 acquire 次数轮转，不由 FrameIndex 取模（F-176）
     queue.wait_slot_fence(slot);                            // 复用 allocator 前必须等（通常已完成）
     drain_completed();                                      // 该槽上一帧的 timestamp 必须在被覆盖前读走
     queue.reset_allocator_list(slot);
@@ -521,6 +533,10 @@ loop {
     drain_timeline();                          // 非阻塞推进 retire
     let Some(frame) = take_latest_frame() else { continue };
     if frame.surface != surface { recreate_swapchain(); }
+
+    // ⓪ 取本帧槽位：按 **acquire 次数**轮转（0 → 1 → 2 → 0），不由帧序号取模（F-176）。
+    //    重试（NOT_READY / OUT_OF_DATE）会消费一次 acquire 而不提交，下一次自然落到下一个槽。
+    let slot = ring.acquire();
 
     // ① 先等槽 fence，再 acquire。反过来的话：acquire 会 signal image_available[slot]，而该
     //    二值信号量可能仍被本槽上一次提交的 wait 持有，对已 signal 的信号量再次 signal 是
@@ -670,7 +686,7 @@ UI 线程上没有任何一行等待。
 | `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸 |
 | `lib.rs` / `render.rs` | 模块声明更新（新增两个 `renderer.rs`） |
 
-### 9.2 删除
+### 9.2 删除（已全部落地：F-164、F-166 … F-182）
 
 - `render/macos/renderer.rs` 的 `Mailbox`/`MailboxState`/`Work`/`requeue`/`wait_retry`/`FrameJob` 的邮箱语义（保留「线程 + 最新帧」这一层，但实现按 §4.2 重写）。
 - `render/macos/queue.rs` 的 `Submitted` 数组、`poll_completed`、`waitUntilCompleted`。
@@ -767,8 +783,9 @@ Vulkan / Wayland：
 
 ## 15. 审查修订记录（2026-11-14）
 
-实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；平台实现由后续
-SubAgent 落实的条目单独标「实现修订中」（§15.3）。
+实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；第一轮
+（F-166 … F-175）见 §15.1–§15.4，第二轮（F-176 … F-182）与三平台当前实测数字见
+§15.5–§15.6。
 
 ### 15.1 本批已闭环
 
@@ -792,25 +809,42 @@ SubAgent 落实的条目单独标「实现修订中」（§15.3）。
 
 ### 15.2 仍未闭环
 
-- **live resize 探针**（§11 探针 1）：`CAMetalDisplayLink` 在 live resize / 全屏转场期间的
-  回调行为只在普通窗口下验过，drag-resize 连续帧没有形成实机结论。
-- **设备丢失注入**（§10.2）：三平台的错误分类已有单测，但没有 D3D12 debug layer /
-  `VK_EXT_device_fault` / Metal 错误注入的实机用例。
-- **多窗口**（§10.2）：每窗口一条 GPU 线程的结构已就位，但「一个窗口 resize 不影响另一个
-  窗口帧率」未实测。
-- **HUD 实机数值**（§10.3）：Windows 已采样（demo + HUD：64 fps、`Latency` ≈ 7–9 ms，跨 10 s
-  不增长；其中完成观测点本身 ≈ 0.1 ms，其余是 waitable 的 vsync 排队——I3 的既有语义）；
-  Linux 已采样（headless sway + lavapipe，demo + HUD：59.7–60.1 fps、`Latency` 在 2 s / 6 s / 10 s
-  三次采样为 1.80 / 1.96 / 1.89 ms（不累积；syncval 下 1.90 ms），`Gpu` 1.24–1.58 ms，
-  完成观测点自身 < 1 ms）。macOS 尚未采样。
+> 本节逐条注明「已知、未修、原因」。这些都是**已登记**的边界，不是待办清单：修它们需要新的
+> 夹具 / 设备 / 功能落点，本轮只保证不把未验证的东西写成已闭环。
 
-### 15.3 实现修订中
+- **live resize 探针**（§11 探针 1）：`CAMetalDisplayLink` 的 common-modes 回调只在普通窗口下
+  验过；drag-resize 的连续帧与全屏转场期间的回调节奏没有形成实机结论。**已知、未修**：需要能
+  持续拖动窗口的 GUI 夹具（AX 只能离散设尺寸，构造不出 AppKit 的 live-resize run loop），
+  本轮没有投入。
+- **设备丢失注入**（§10.2）：三平台的错误分类都有单测，但没有 D3D12 debug layer /
+  `VK_EXT_device_fault` / Metal 错误注入的实机用例。**已知、未修**：注入需要驱动/调试层支持与
+  独立夹具，且会破坏正常工作环境；留作专项验证，不影响本轮「错误粘性冒泡」的代码路径。
+- **多窗口**（§10.2）：每窗口一条 GPU 线程的结构已就位，但「一个窗口 resize 不影响另一个窗口
+  帧率」未实测。**已知、未修**：demo 是单窗口，需要额外的多窗口夹具与两套 swapchain 采样。
+- **120Hz / 全屏转场**（§10.2）：只有 60Hz 内建显示器，120Hz（ProMotion / 外接高刷）未验；
+  全屏转场只在 HUD 开/关两条 AX 路径下验过，未在 live 转场期间采样 display link 回调。
+  **已知、未修**：硬件与夹具都不具备（本机 Intel Iris Plus 655 只有 60Hz）。
+- **Linux snapshot 既有 VUID**：Linux 离屏 snapshot 用例在 validation 层下会报**既有** VUID
+  （本轮之前就存在，与窗口异步管线无关）。**已知、未修**：它属于离屏/读回路径的同步用法，本轮
+  没有触碰；修它需要单独复核该路径的 barrier/同步并重跑 13 份 golden，因此本轮只把结论限定在
+  窗口路径（10 s 0 error / 0 `SYNC-HAZARD`）。
+- **`lyon` / workspace unused deps**：`lyon` 已在 workspace 与 `ui_core` 的依赖里，但 `src/` 没有
+  消费者（路径三角化尚未落到几何录制路径）。**已知、未修**：它是 workspace 级
+  unused-dependency 提示（不是 clippy error）；删掉它牵涉路径/描边的后续落点，等该功能定案再
+  接入或删除。
+- **Linux `request_frame` 的 Idle 门禁**（既有）：`event_loop.rs` 在 `app.frame()` **之前**无
+  条件 `state.request_frame()`，而该帧可能最终是 Idle（不发布、不 present）：wl frame callback
+  没有对应的 commit，`frame_ready` 可能停在 false。**已知、未修**：修它要把「本帧是否有像素」
+  提前到 `request_frame` 之前（拆分 encode/commit），会改动共享 `App::frame` 契约；本轮只登记。
 
-以下条款的**文档**已按修订后的语义改写，平台代码由后续 SubAgent 落实：
+### 15.3 实现修订中的条款（已全部闭环）
 
-- §7.7 的关闭握手（macOS 部分）：Windows / Linux 已落实（Linux 见 §15.4）；macOS 的
-  `Renderer::drop` 仍是 `recv_timeout` 2 s 后 detach，需改为直接 `join`（有界于 `acquire`
-  的 100 ms 超时），F-169。
+原「实现修订中」清单只剩 macOS 关闭握手一项，现已闭环：
+
+- §7.7 的关闭握手：Windows（消息泵无限等，F-169）、Linux（直接 `join`，§15.4）已落实；macOS
+  也已删除 `recv_timeout` + detach 与 `ExitSignal`，`Drop` 直接 `join`，等待由
+  `SHUTDOWN_GRACE = 2 s` 兜底（从 `request_shutdown` 起累计，F-169 / F-179）。**本清单已空**，
+  不再有「实现修订中」的条目。
 
 ### 15.4 Linux 修订记录
 
@@ -826,5 +860,35 @@ publish feedback on timeline completion`）。实机口径：Ubuntu 26.04 / lava
 | **P2 反馈改到完成时** | 提交时把 `{index, stats, CPU samples, published_at, timeline_value(signal), slot}` 放进 pending 队列；每轮循环用 `vkGetSemaphoreCounterValue` 非阻塞推进，观察到完成之后按提交顺序发布 `FrameFeedback { index, stats, samples(+此处 resolve 的 GPU 采样), completed_at, latency }`，retire 在同一观测点推进。GPU 采样不再在提交点读（避免读在飞槽），只在完成之后 resolve。等待策略：pending 非空时 `Condvar::wait_timeout(4ms)`，其余无限等待（0 自旋）——避免最后一帧的反馈永远不发布 |
 | **P2 samples 断言** | `feedback.samples.len() <= 4` → `<= 3`（Upload / Gpu / Present，`FrameTimings` 只有这三段） |
 | **P2 atlas staging 只有一份** | 本次不改：`frame_ready` 门禁把在飞帧压到 ≤ 1（UI 只在上一帧的 `wl_callback.done` 之后发布下一帧，而该回调意味着合成器已取走上一帧 image、其 `render_finished` 依赖的 copy 必然完成），CPU 写 staging 与 GPU 读 staging 不会重叠。代码与 §7.3 已显式登记该设计假设：**在飞 ≤ 1**；放开在飞帧数时必须按帧槽拆分 staging 或先等该帧 fence |
-| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积）；关闭见上 |
+| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**（该修订落地时；当前 634，见 §15.5）；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积；当轮数值，当前 2.1–3.1 ms 见 §15.5）；关闭见上 |
+
+### 15.5 第二轮闭环（F-176 … F-182，2026-11-14）
+
+macOS 异步回归的 P2（`8c02aa0`）、Linux 反馈判据与 Windows panic/关闭例外（`d6f56fb`）、关闭
+grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部落地；偏差与原因见
+[`DEVIATIONS.md`](DEVIATIONS.md) §29。
+
+| 项 | 修订 | 落点 |
+|---|---|---|
+| 槽位轮转口径（F-176） | `InFlightRing::acquire` 按 **acquire 次数**轮转；Linux 的 `NOT_READY` / `OUT_OF_DATE` 重试会多消费一次 acquire 而不提交，F-171 的「提交次数」措辞据此更正 | `render/frame.rs`（+ `acquire_rotates_slots_by_acquisition_count`）、Linux `Device::slot` |
+| Linux 完成判据（F-177） | 反馈完成判据改为 `submit` 返回的 timeline 值（非 ring 计数）：帧序号 1/4/7 跳号时不再误发布在飞帧 | `render/linux/renderer.rs`（+ `only_frames_whose_timeline_value_completed_are_published`） |
+| 三平台 panic 出路（F-178） | Windows 补 `PanicGuard`：GPU 线程展开也以粘性 `EngineError::AppInit` 回到 `poll()`；三平台同构 | `render/{windows,linux,macos}/renderer.rs` |
+| macOS 退化 / scissor / 关闭（F-179） | 粘性退化（每 vsync 按 drawable 尺寸全量，直到尺寸重新匹配；诊断每 episode 一次）；0 面积 scissor 跳过；`SHUTDOWN_GRACE = 2 s` 有界 join（从 shutdown 请求起累计） | `render/macos/renderer.rs`、`render/macos/compositor.rs` |
+| macOS 反馈顺序（F-180） | `FeedbackQueue` + `CompletionOrder` 连续前缀：完成回调乱序也按提交顺序发布 | `render/macos/renderer.rs`、`render/macos/queue.rs` |
+| 图集所有权（F-181） | 三平台 GPU 侧 `queue_atlas_upload` / `queue_upload` 收 `Vec<u8>` 并按所有权移动，去掉槽 → 纹理的第二次 16 MiB 拷贝 | `render/*/compositor.rs`、`render/*/atlas.rs` |
+| Windows 关闭例外（F-182） | 关闭时允许「waitable 已消费但不 present」（swapchain 随即销毁）；token 守恒的其他两个不画出口仍是断言 | `render/windows/renderer.rs`、§6.3 |
+
+### 15.6 三平台当前实测数字（2026-11-14）
+
+| 平台 | lib 单测 | HUD `Latency`（demo + HUD） | 说明 |
+|---|---|---|---|
+| Windows | 695 passed / 0 failed / 1 ignored | 7.8–10.2 ms | 跨 10 s 多次采样，不累积；其中大部分是 waitable 的 vsync 排队（I3 的既有语义） |
+| Linux | 634 passed / 0 failed | 2.1–3.1 ms | headless sway + lavapipe，不累积 |
+| macOS | 648 passed / 0 failed | 3.1–3.7 ms | 同一台 Intel Iris Plus 655，不累积（`b4ea69e` 基线重测 2.90–3.41 ms） |
+
+- 测试数字是 `cargo test -p ui_core --lib` 口径（默认 feature）；feature 组合会改变数量（同一
+  HEAD 加 `--features "hud,test-support"` 时 Windows 为 756 passed / 1 ignored），比较时只与
+  同口径历史值比。整套（含集成）数字见各平台验证文档。
+- `Latency` 是「UI 发布 → GPU 线程观察到完成」，**跨 10 s 不增长**；绝对值随机器、驱动、合成器
+  与负载变化（同一台机不同 run 也可差 1 ms 以上），只作同机回归对比，不作跨平台契约。
 

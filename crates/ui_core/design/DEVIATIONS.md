@@ -2439,3 +2439,29 @@ macOS/Metal 异步窗口管线（`16f2045`）的对抗性审查发现 1 个 P0�
 | **F-174** | **macOS GPU 线程 panic 必须让 `poll()` 看到**                  | 与 F-170 同一缺陷的 macOS 版本：`mark_terminated` 只在正常 break 后执行，panic 展开时 UI 无感知。`gpu_loop` 增加与 Linux 同构的 `PanicGuard`：展开时向 `Shared` 发布 `EngineError::AppInit { detail: "kytrix-metal thread panicked" }` 并置 `terminated`（不覆盖循环已发布的错误），正常路径 `disarm()` |
 | **F-175** | **完成通知只在消费者已退出时丢弃（`terminated`，不是 `shutdown`）** | 审查原判「`push_completion` 的 `shutdown && terminated` 应为 `||`」。实测 `\|\|` 会破坏关闭握手：`Drop` 先 `request_shutdown` 再等 GPU 线程 drain 在飞帧，若此时丢弃完成通知，`in_flight` 永远不归零，`join` 卡满超时后 detach（GPU-bound 关闭实测 6 s 且打印 `abandoning the join`）。正确语义是**只**在消费者已经退出（`terminated`，没有线程会 drain）后丢弃；`shutdown` 期间完成通知必须继续入队。修正后同一场景 4 s 退出、无 detach |
 
+---
+
+## 二十九、三平台异步管线第二轮修复（2026-11-14）
+
+三平台异步管线（`523763a` / `6b5f6cd` / `16f2045`）落地后的第二轮修复：macOS 异步回归的 P2
+（`8c02aa0`）、Linux 反馈判据与 Windows panic/关闭例外（`d6f56fb`）、关闭 grace 计时
+（`69830d2`）与完成通知门禁测试（`68758de`）。逐项证据见 `macos-verification.md` §2.11 与
+`async-render-pipeline.md` §15.5–§15.6；本节只登记偏差（原因 + 落点）。
+
+> 历史条目的读法：F-158 / F-161 / F-163 / F-164 里关于 `nextDrawable`、
+> `allowsNextDrawableTimeout`、轮询 `status()`、「强制全量」的描述是**渐进式改造的历史记录**，
+> 窗口路径现由 F-166 … F-182 的异步管线取代：macOS 改用 `CAMetalDisplayLink`（drawable 由
+> display link 提供），完成通知用 `addCompletedHandler`，`next_drawable` /
+> `allowsNextDrawableTimeout` 已删除，被覆盖帧的 damage 合并进后继帧。按「不改写历史条目」
+> 的纪律，历史行保留原文，以本说明与 F-164 条末的「已被取代」注记合读。
+
+| 编号 | 条目 | 内容 |
+|------|------|------|
+| **F-176** | **in-flight 槽位按 acquire 次数轮转（F-171 的措辞修正）** | F-171 写作「按提交次数轮转」，但轮转点在 `InFlightRing::acquire`：Linux 的 `NOT_READY` / `OUT_OF_DATE` 重试会再消费一次 acquire 而不提交（下一次 acquire 落到下一个槽），macOS 在 `begin` 取槽、Windows 在 `acquire_slot` 取槽，`advance` 只更新 fence 记账。若把轮转点理解成「提交成功」就会与三槽 fence / `image_available` 不同源。落点：`render/frame.rs` 的 `InFlightRing::acquire` 文档与单测 `acquire_rotates_slots_by_acquisition_count`、Linux `Device::slot` 与 `renderer.rs::completed_frames` 注释；F-171 原文保留，本条为措辞更正 |
+| **F-177** | **Linux 反馈完成判据用 submit 返回的 timeline 值，不是 ring 计数** | `SubmittedFrame` 原存 ring 的提交计数（1、2、3…），而 timeline 值来自帧序号、会跳号（最新帧槽合并 / 门禁跳过的帧不产生 GPU 工作）：序号 1、4、7 提交后，`vkGetSemaphoreCounterValue` 观测到 4 时若拿 ring 计数比较，会把仍在飞的 7 也发布出去（`completed_at` / `latency` 归属错帧、resolve 读在飞 query）。现在 `record_and_submit` 返回本帧 signal 的 timeline 值，`SubmittedFrame.timeline_value` 用它判定。落点：`render/linux/renderer.rs`（`submit_frame` 返回值、`completed_frames`）+ 回归单测 `only_frames_whose_timeline_value_completed_are_published`（提交 1/4/7，timeline 4 只发布 1、4，7 保留） |
+| **F-178** | **三平台 GPU 线程 panic 都以粘性 `EngineError` 回到 UI** | Linux/macOS 已有 `PanicGuard`（F-170/F-174），Windows 原缺：GPU 线程展开后 `poll()` 永远看不到错误，平台泵一直轮询已死线程。现在三平台同一形状：`PanicGuard::new(shared)` 在 `gpu_loop` 入口武装，`Drop` 里 `std::thread::panicking()` 为真时发布 `EngineError::AppInit { detail: "kytrix-{vulkan,metal,d3d12} thread panicked" }` 并置 `terminated`，正常退出 `disarm()`，不覆盖循环已发布的错误。落点：`render/{linux,macos,windows}/renderer.rs`；单测 `a_panicking_gpu_thread_publishes_an_error`（Windows / Linux）与 Linux `a_panic_keeps_an_already_published_error` |
+| **F-179** | **macOS 粘性退化 + 0 面积 scissor 裁剪 + 2 s shutdown grace** | ①F-172 的「连续 4 次不一致后退化」原在每次成功提交时清零，持续 >1 px 不一致会固定成「跳 4 个 vsync、画 1 帧」（约 11 fps）并每轮重打印诊断。现在退化状态**粘性**：进入后每个 vsync 都按 drawable 尺寸全量渲染，直到请求尺寸与 drawable 重新在 1 px 容差内；诊断每次 episode 只打印一次。②`scissor_for` 把矩形两端夹到目标尺寸、0 面积返回 `None`（1 px 容差下 `x == surface.0` 的 0 宽 scissor 会被 Metal validation 拒绝），`Partial` 循环跳过它。③`Drop` 的 `join` 由 `SHUTDOWN_GRACE = 2 s` 兜底：从 `request_shutdown` 起**累计**计时（100 ms 轮询封顶），驱动永不回调完成时打印诊断并退出 GPU 线程，不 detach。落点：`render/macos/renderer.rs`（`SurfaceMismatch`、`WaitOutcome::TimedOut`、`shutdown_at`）、`render/macos/compositor.rs::scissor_for`；单测 `one_pixel_rounding_never_degrades` / `surface_degradation_is_sticky_until_the_sizes_match_again` / `shutdown_wait_is_bounded_when_completions_never_arrive` / `a_damage_rect_entirely_outside_the_surface_has_no_scissor` |
+| **F-180** | **macOS 反馈按提交顺序发布（`CompletionOrder` 连续前缀）** | Apple 只保证同一队列 command buffer 的**开始**顺序，完成回调可以乱序；按回调顺序发布会让更旧帧的 `latency` 覆盖 HUD 的新值，也违反 `render/frame.rs` 的跨平台契约。新增 `FeedbackQueue`：提交时按顺序入队，完成时只记录 `completed_at` 与 GPU 采样（容忍乱序），`CompletionOrder` 的连续前缀推进时才从队首发布；被跳过的帧不在队列里，不影响顺序。落点：`render/macos/renderer.rs::FeedbackQueue`、`render/macos/queue.rs::CompletionOrder`；单测 `out_of_order_completions_publish_in_submission_order`、`in_order_completions_advance_immediately`、`an_out_of_order_completion_waits_for_the_prefix` |
+| **F-181** | **三平台图集上传按 `Vec<u8>` 所有权移动** | GPU 侧 `GpuRenderer::queue_atlas_upload` / `AtlasTextures::queue_upload` 原收 `&[u8]`，待上传槽自己分配 `Vec` 再整页拷贝；图片页 2048² 是 16 MiB，每次上传白付第二次拷贝。现在入口收 `Vec<u8>`，同一块内存移进待上传槽，blit 时直接读它；UI → GPU 线程的那一次拷贝仍在（跨线程边界，不可避免）。落点：`render/{windows,macos,linux}/compositor.rs::queue_atlas_upload` + `render/*/atlas.rs::queue_upload`；Windows 先落（§15.1），Linux/macOS 本轮同步（`d6f56fb` / `8c02aa0`） |
+| **F-182** | **Windows 关闭时允许「waitable 已消费但不 present」的唯一例外** | §6.3 的 token 守恒（消费 waitable ⇒ 本帧必须 present）原先把关闭也当不变量；但关闭可能恰好发生在 waitable 已被消费、尚未取帧的时刻：此时 present 没有必要（swapchain 随即销毁），再等一次 waitable 会挂死关闭。现在 `wait_for_waitable` 返回后调用方先检查 shutdown，已关闭就直接退出（不取帧、不 present）；其余两个不画出口（取帧失败、Idle）仍保留 `debug_assert!` 不变量——`window.rs` 不会在目标未重建时发布 Idle 计划。落点：`render/windows/renderer.rs::wait_for_waitable` + `async-render-pipeline.md` §6.3（F-182） |
+
