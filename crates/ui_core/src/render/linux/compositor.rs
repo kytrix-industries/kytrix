@@ -56,12 +56,14 @@ const OFFSCREEN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 /// 一帧异步提交的结果（窗口路径）。
 pub(crate) enum Submitted {
-    /// 已提交（可能已呈现）；`stats` / `samples` 是本帧的；`slot` 是提交用的 ring 槽与 timeline 值
-    /// （完成观测点据此 resolve GPU 采样，§4.1）。
+    /// 已提交（可能已呈现）；`stats` / `samples` 是本帧的，`slot` 是提交用的 ring 槽位
+    /// （完成观测点据此 resolve GPU 采样），`timeline_value` 是本帧 submit 时 signal 的 timeline
+    /// 值（完成判据，§4.1）。
     Presented {
         stats: RenderStats,
         samples: Vec<GpuTimerSample>,
-        slot: FrameSlot,
+        slot: usize,
+        timeline_value: u64,
     },
     /// 本帧没有产生 GPU 工作（acquire 未就绪 / 刚重建 swapchain）：调用方保留帧请求重试。
     Retry,
@@ -311,9 +313,10 @@ impl GpuRenderer {
         };
         self.out_of_date = 0;
 
-        // ③ 录制 + 提交（`vkQueueSubmit` 后立即返回）。
+        // ③ 录制 + 提交（`vkQueueSubmit` 后立即返回）。返回本帧 submit 时 signal 的 timeline 值：
+        // 完成判据必须与 `vkGetSemaphoreCounterValue` 同源，不能拿 ring 的提交计数去比。
         let mut timings = FrameTimings::new();
-        let stats = self.record_and_submit(
+        let (stats, timeline_value) = self.record_and_submit(
             request.index,
             slot,
             &request.payload,
@@ -353,7 +356,7 @@ impl GpuRenderer {
             }
         }
         self.submitted.push_back(InFlightFrame {
-            signal: u64::from(request.index.get()),
+            signal: timeline_value,
             index: request.index,
         });
         // GPU 采样**不在这里** resolve：该槽的 timestamp 可能还被在飞帧写；完成观测点
@@ -368,7 +371,8 @@ impl GpuRenderer {
         Ok(Submitted::Presented {
             stats,
             samples,
-            slot,
+            slot: slot.index,
+            timeline_value,
         })
     }
 
@@ -390,7 +394,7 @@ impl GpuRenderer {
         let slot = self.device.slot();
         // 离屏路径本来就同步：复用槽位前等 fence（与窗口路径同一前置条件）。
         self.device.wait_slot(slot)?;
-        let stats = self.record_and_submit(index, slot, payload, frame, None, timings)?;
+        let (stats, _) = self.record_and_submit(index, slot, payload, frame, None, timings)?;
         self.finish_sync(index, slot, timings)?;
         Ok(stats)
     }
@@ -431,10 +435,13 @@ impl GpuRenderer {
     }
 
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
+    ///
+    /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
+    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        pixels: &[u8],
+        pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
         self.atlas.queue_upload(kind, pixels, rows);
@@ -510,7 +517,8 @@ impl GpuRenderer {
         self.readback()
     }
 
-    /// 录制 + 提交一帧（不呈现、不等完成）。返回本帧槽位供调用方等 fence / 呈现。
+    /// 录制 + 提交一帧（不呈现、不等完成）。返回本帧的统计与 submit 时 signal 的 timeline 值
+    /// （调用方按它判断完成，不自己重复计算）。
     fn record_and_submit(
         &mut self,
         index: FrameIndex,
@@ -519,7 +527,7 @@ impl GpuRenderer {
         frame: &mut FramePlan,
         image_index: Option<u32>,
         timings: &mut FrameTimings,
-    ) -> Result<RenderStats, EngineError> {
+    ) -> Result<(RenderStats, u64), EngineError> {
         timings.reset(index);
         debug_assert_eq!(
             timings.frame(),
@@ -582,13 +590,18 @@ impl GpuRenderer {
                 .map_err(|error| init_error("end_command_buffer", format!("{error:?}")))?;
         }
 
-        self.submit_commands(slot, command, u64::from(index.get()), image_index)?;
+        // timeline 值 = 本帧序号：完成观测点（`vkGetSemaphoreCounterValue`）与 retire 都按它推进。
+        let timeline_value = u64::from(index.get());
+        self.submit_commands(slot, command, timeline_value, image_index)?;
         self.device.advance(slot);
         self.last_index = index;
-        Ok(RenderStats {
-            draw_calls,
-            instances: (payload.instances().len() / 128) as u32,
-        })
+        Ok((
+            RenderStats {
+                draw_calls,
+                instances: (payload.instances().len() / 128) as u32,
+            },
+            timeline_value,
+        ))
     }
 
     /// 同步路径的收尾：等本帧完成 → 读本帧 GPU 时间 → 推进 retire（I4）。

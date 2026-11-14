@@ -385,9 +385,19 @@ loop {
     //    阻塞发生在 GPU 线程，最多一个 vsync。等待期间 completion 到达 ⇒ 先 drain 再继续等同一个
     //    waitable（auto-reset 只能消费一次）。**先等 waitable 再取帧**：渲染的是「此刻最新」的
     //    快照，而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
-    WaitForMultipleObjects([waitable, completion_event], INFINITE);   // completion 分支先 drain
-    if shutdown { break; }
-    let Some(frame) = take_latest_frame() else { continue };
+    loop {
+        if WaitForMultipleObjects([waitable, completion_event], INFINITE) == waitable { break; }
+        drain_completed();                  // completion 分支：帧完成，先发反馈再继续等
+        if shutdown { return; }             // 关闭：`request_shutdown` 置位 completion 把这里唤醒；
+                                            // waitable 没被消费，不能再等它（驱动/遮挡会让关闭挂死）
+    }
+    if shutdown { return; }
+    // **token 守恒：消费 waitable ⇒ 本帧必须 present。** 两个「不画」的出口（取帧失败、Idle 帧）
+    // 都必须在消费之前判掉：`has_pending_frame()` 已保证取得到帧（帧槽只有本线程消费），而
+    // `window.rs` 在目标未重建时根本不发布 Idle 计划（surface 变化会先 resize 并把 fresh 置真）。
+    // 实现里这两个出口保留为不变量断言（`debug_assert!`），不是可走路径。
+    let Some(frame) = take_latest_frame() else { unreachable!("pending frame was checked") };
+    if frame.plan == Idle && !is_fresh { unreachable!("idle frames are never published") };
     if frame.surface != surface { do_resize(frame.surface)?; }   // 见 §6.4；任何错误 ⇒ 显式失败
 
     let slot = ring.acquire(frame.index);
@@ -470,7 +480,7 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 - `WM_SIZE`/`WM_DPICHANGED`：只更新 `Window` 的 size/scale 并 `dispatcher.wake()`（GPU 线程的 `resize_pending` 由下一帧的 `FrameRequest.surface` 派生，§4.4）。
 - 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
-- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)`，GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
+- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
 - 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
 
 ---
@@ -546,7 +556,7 @@ loop {
 
 - 槽 fence 是「复用命令缓冲 / 上传缓冲」与「安全地再次 signal `image_available[slot]`」的共同前置条件，因此必须在 acquire 之前等（§7.2 的两条硬规则不因此改变）。
 - `image_available` 的 wait stage 与 swapchain image 首个 layout transition 的 `srcStageMask` **都必须是 `TRANSFER`**（dst 已经是 `TRANSFER`）：本后端不直接往 swapchain image 上画，首次访问是 transition + 整面 copy。写成 `COLOR_ATTACHMENT_OUTPUT` / `TOP_OF_PIPE` 时 transition 与 acquire 信号量没有依赖链，syncval 报 `SYNC-HAZARD-WRITE-AFTER-READ`（F-168，§15.4）。
-- 反馈只在**观察到 timeline 完成**时发布（§15.4）：每轮循环先 `vkGetSemaphoreCounterValue` 推进 retire，再按提交顺序发布 `signal <= 完成值` 的帧；有在飞帧时 condvar 用 4 ms 超时（完成不会唤醒 condvar），否则无限等待（0 自旋）。
+- 反馈只在**观察到 timeline 完成**时发布（§15.4）：每轮循环先 `vkGetSemaphoreCounterValue` 推进 retire，再按提交顺序发布 `timeline_value <= 完成值` 的帧（`timeline_value` 是本帧 submit 时 signal 的值 = 帧序号，**不是** ring 的提交计数——帧序号会跳号，两者不同源）；有在飞帧时 condvar 用 4 ms 超时（完成不会唤醒 condvar），否则无限等待（0 自旋）。
 
 - 等待只发生在 GPU 线程；UI 线程的 `publish` 不碰 Vulkan。
 - `vkQueuePresentKHR` 内部会 `wl_display_flush`（Mesa 实现），因此 GPU 线程必须能安全地操作连接（§7.5）。

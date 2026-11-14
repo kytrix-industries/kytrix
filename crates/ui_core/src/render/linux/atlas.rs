@@ -72,7 +72,7 @@ impl AtlasTextures {
         self.glyph.sampler
     }
 
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
         match kind {
             AtlasKind::Glyph => self.glyph.queue_upload(pixels, rows),
             AtlasKind::Image => self.image.queue_upload(pixels, rows),
@@ -219,7 +219,11 @@ impl AtlasTexture {
         })
     }
 
-    fn queue_upload(&mut self, pixels: &[u8], rows: DirtyRows) {
+    /// 入队一页的脏行（整页 `pixels` 的布局 = `page * page * texel`）。
+    ///
+    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
+    /// 16 MiB（图片页）。
+    fn queue_upload(&mut self, pixels: Vec<u8>, rows: DirtyRows) {
         let spans = rows.spans();
         if spans.is_empty() {
             return;
@@ -231,7 +235,7 @@ impl AtlasTexture {
             y0: first,
             rows: last.saturating_sub(first),
             full,
-            pixels: pixels.to_vec(),
+            pixels,
         });
     }
 

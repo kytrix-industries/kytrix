@@ -2583,13 +2583,13 @@ impl App {
         };
         let outcome = target.commit_frame(ticket, paint);
         #[cfg(feature = "hud")]
-        if matches!(outcome, Ok(FrameOutcome::Committed(_))) {
+        if matches!(outcome, FrameOutcome::Committed(_)) {
             if let Some(state) = self.debug_hud.get_mut(&window) {
                 debug_hud::finish_frame(state);
             }
             target.note_debug_hud_commit(committed_at);
         }
-        Some(outcome)
+        Some(Ok(outcome))
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。

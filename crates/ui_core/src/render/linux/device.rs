@@ -381,7 +381,7 @@ impl Device {
 
     /// 取本帧的 ring 槽位（**纯记账**，不碰 GPU；提交成功后才 [`Device::advance`]）。
     ///
-    /// 槽位按**提交次数**轮转（0 → 1 → 2 → 0），与三槽 fence / `image_available` 同源；
+    /// 槽位按 **acquire 次数**轮转（0 → 1 → 2 → 0），与三槽 fence / `image_available` 同源；
     /// 不能由请求序号取模决定（最新帧槽合并会丢掉被覆盖帧的序号，见
     /// [`crate::render::frame::InFlightRing::acquire`]）。
     ///

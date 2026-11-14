@@ -813,15 +813,15 @@ impl Window {
     ///
     /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画 ⇒ 不提交、`FrameIndex` 不变。
     ///
-    /// # Errors
     /// 窗口路径的 GPU 错误（device lost / present 失败 / swapchain 重建失败）**不**从这里返回：
-    /// 本方法只把帧发布给 GPU 线程（不等待），错误由 `poll_renderer` 粘性冒泡。本方法自身只在
-    /// 编码/帧结算失败时返回 `Err`；返回 `Err` 时本帧不得重试。
+    /// 本方法只把帧发布给 GPU 线程（不等待），错误由 `poll_renderer` 粘性冒泡。编码 / 帧结算
+    /// 已在 `paint_frame` 与布局阶段完成，本方法体内没有任何可失败的步骤，因此返回
+    /// [`FrameOutcome`] 而不是恒 `Ok` 的 `Result`。
     pub(crate) fn commit_frame(
         &mut self,
         ticket: FrameTicket,
         report: PaintReport,
-    ) -> Result<FrameOutcome, EngineError> {
+    ) -> FrameOutcome {
         let has_pixels = report.rebuilt > 0 || report.damage.full || report.damage.rects > 0;
         // 默认构建也算的读点：摘要计数必须与累加器的实际矩形数一致（P07 消费同一累加器）。
         debug_assert_eq!(
@@ -838,7 +838,7 @@ impl Window {
             }
             #[cfg(feature = "test-support")]
             self.record_idle();
-            return Ok(FrameOutcome::Idle);
+            return FrameOutcome::Idle;
         }
         let index = self.scheduler.commit(ticket);
         self.tree.settle_frame();
@@ -871,7 +871,7 @@ impl Window {
             );
             self.record = Some(record);
         }
-        Ok(FrameOutcome::Committed(index))
+        FrameOutcome::Committed(index)
     }
 
     /// 把本帧交给 GPU：窗口路径只构造 `FrameRequest` 并 `publish`（**不等待**，I1）。
@@ -952,7 +952,7 @@ impl Window {
                 return Err(error);
             }
         };
-        self.commit_frame(ticket, report)
+        Ok(self.commit_frame(ticket, report))
     }
 
     /// 最近一帧的调度记录（仅 `test-support`）。

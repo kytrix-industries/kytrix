@@ -1,16 +1,20 @@
 //! 窗口渲染门面 + 每窗口一条 `kytrix-d3d12` GPU 线程
 //! （`design/async-render-pipeline.md` §4.5 / §6）。
 //!
-//! ```
+//! ```text
 //! UI 线程                                  kytrix-d3d12 线程（每窗口）
 //! ────────────────────────────────────    ──────────────────────────────────────────
-//! 窗口消息（WM_SIZE 只记录尺寸）           循环：等 work event
-//! publish(FrameRequest) ──► 最新帧槽            → 取最新帧 + 图集槽
-//! queue_atlas_upload ─────► 图集槽              → surface 变化则 resize
-//! poll() ◄──────────────── 反馈槽               → 等 waitable（每帧恰好一次）
-//!                                               → 录制 → Execute → Signal
-//!                                               → Present1(1, 0, dirty) → retire
+//! 窗口消息（WM_SIZE 只记录尺寸）           循环：等 work / completion → 空转或取帧
+//! publish(FrameRequest) ──► 最新帧槽            → 等 waitable（呈现背压，每帧恰好一次）
+//! queue_atlas_upload ─────► 图集槽              → 取「此刻最新」帧 + 图集槽
+//! poll() ◄──────────────── 反馈槽               → surface 变化则 resize
+//!                                               → 槽 fence → 录制 → Execute → Signal
+//!                                               → Present1(1, 0, dirty)
+//!                                               → 完成观测点：retire + 反馈
 //! ```
+//!
+//! 反馈在**完成观测点**发布（fence 的 `SetEventOnCompletion` 唤醒），不是 `Present1` 返回的时刻；
+//! retire 与反馈同一观测点推进（§4.1 / §6.5）。
 //!
 //! 三条硬约束：
 //! - **I1**：UI 线程只做「加锁拷贝 + `SetEvent`」，没有 fence wait / `ResizeBuffers` / `Present`。
@@ -371,6 +375,36 @@ impl Drop for WindowRenderer {
     }
 }
 
+/// GPU 线程的 panic 出路：展开时把错误交给 UI（`poll()` 不会静默卡死），并标记线程已终止。
+///
+/// 正常退出时 [`PanicGuard::disarm`] 消费自己，**不覆盖**循环已经发布的错误（§6.7）。
+struct PanicGuard {
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl PanicGuard {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    /// 正常退出：GPU 线程已经按自己的错误路径收尾，guard 不再发布任何东西。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if self.armed && std::thread::panicking() {
+            self.shared.publish_panic();
+        }
+    }
+}
+
 /// UI 线程与 GPU 线程共享的最新帧 / 图集 / 反馈槽 + 唤醒事件。
 struct Shared {
     state: Mutex<State>,
@@ -530,6 +564,19 @@ impl Shared {
         state.error = Some(error);
     }
 
+    /// GPU 线程 panic：`poll` 必须看到一条错误而不是静默停摆；不覆盖已有错误，并让后续
+    /// `publish` 变成 no-op。
+    fn publish_panic(&self) {
+        let mut state = self.lock();
+        state.feedback = None;
+        if state.error.is_none() {
+            state.error = Some(EngineError::AppInit {
+                detail: SmolStr::new_static("kytrix-d3d12 thread panicked"),
+            });
+        }
+        state.terminated = true;
+    }
+
     fn take_feedback(&self) -> Option<FrameFeedback> {
         self.lock().feedback.take()
     }
@@ -544,6 +591,13 @@ impl Shared {
 
     fn request_shutdown(&self) {
         self.lock().shutdown = true;
+        // GPU 线程可能正阻塞在 [waitable, completion] 上（`work` 不在那个等待集合里）：置位
+        // completion 让它从呈现背压里醒来看 shutdown。completion 是 auto-reset；没有等待者时
+        // 置位也不会丢事件——下一次等待立刻返回，循环重新检查 shutdown。
+        // SAFETY: 事件句柄在 `Shared` 存活期间有效；`SetEvent` 可从任意线程调用。
+        unsafe {
+            let _ = SetEvent(self.completion);
+        }
         self.wake();
     }
 }
@@ -562,15 +616,26 @@ struct SubmittedFrame {
 }
 
 /// GPU 线程主循环（§6.3）。
-fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
+fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
+    // panic 出路：展开时把错误交给 UI（`poll()` 不会静默卡死），并标记线程已终止。
+    let guard = PanicGuard::new(Arc::clone(&shared));
+    // `GpuRenderer` 必须是**局部** `Option`：循环结束后显式 drop（等 GPU 完成、丢掉 back buffer
+    // 引用，再销毁 swapchain / 设备），`join` 返回时 teardown 一定已经完成（§6.7）。
+    let mut renderer = Some(renderer);
     let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
-    if let Err(error) = run_gpu_loop(&mut renderer, &shared, &mut submitted) {
+    if let Err(error) = run_gpu_loop(
+        renderer
+            .as_mut()
+            .expect("renderer is present until teardown"),
+        &shared,
+        &mut submitted,
+    ) {
         shared.publish_error(error);
     }
+    drop(renderer.take());
     shared.mark_terminated();
-    // 离开作用域时 `GpuRenderer` 被 drop：等 GPU 完成、丢掉 back buffer 引用，再销毁
-    // swapchain / 设备（§6.7 的关闭顺序）。
+    guard.disarm();
 }
 
 fn run_gpu_loop(
@@ -598,7 +663,11 @@ fn run_gpu_loop(
         if shared.shutdown_requested() {
             return Ok(());
         }
+        // waitable 一旦被消费就必须 present（§6.3 的 token 守恒）：`has_pending_frame()` 已在
+        // 等待之前为真，且帧槽只有本线程取走，因此这里必然取得到帧；取不到只可能是未来的
+        // 重构违反了「等待前先确认有活」。
         let Some(request) = shared.take_frame() else {
+            debug_assert!(false, "waitable consumed without a pending frame");
             continue;
         };
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
@@ -612,8 +681,11 @@ fn run_gpu_loop(
             renderer.resize(request.surface)?;
         }
         // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
+        // 但 waitable 已经被消费：这样的帧不能走到这里（`window.rs` 在目标未重建时根本不发布
+        // Idle 计划；surface 变化会先 resize 并把 `fresh` 置真），因此只作不变量断言。
         let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
         if frame.is_idle() {
+            debug_assert!(false, "idle frame consumed a waitable token");
             continue;
         }
         let slot = renderer.acquire_slot();
@@ -678,7 +750,8 @@ fn wait_for_work_or_completion(shared: &Shared) -> Result<(), EngineError> {
 /// 等帧延迟 waitable；期间 completion 到达就先发布反馈、再继续等（不把反馈拖到下一帧）。
 ///
 /// waitable 是 auto-reset：一旦这个循环消费了它，本帧就不允许再等第二次（否则会白等一个
-/// vsync），因此返回 `Ok` 之后调用方直接开始录制。
+/// vsync），因此返回 `Ok` 之后调用方直接开始录制。**只有 waitable 分支才是消费**；completion
+/// 分支（帧完成 / 关闭）没有消费 waitable，返回后调用方必须自己检查 shutdown（§6.3）。
 fn wait_for_waitable(
     renderer: &mut GpuRenderer,
     shared: &Shared,
@@ -692,6 +765,11 @@ fn wait_for_waitable(
             return Ok(());
         }
         drain_completed(renderer, shared, submitted);
+        // 关闭：`request_shutdown` 置位 completion 把我们从这里唤醒。此时 waitable 没有被
+        // 消费，不能再去等它（驱动/遮挡让它不再 signal 时关闭会永不返回）——直接早退。
+        if shared.shutdown_requested() {
+            return Ok(());
+        }
     }
 }
 
@@ -772,9 +850,11 @@ fn pump_messages() -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, StickyError};
+    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
@@ -847,5 +927,96 @@ mod tests {
         });
         let text = sticky.to_error().to_string();
         assert!(text.contains("ResizeBuffers"), "{text}");
+    }
+
+    fn test_shared() -> Arc<Shared> {
+        // SAFETY: 无名称 auto-reset 事件；句柄由 `Shared` 独占并在最后一个引用释放时关闭。
+        let work =
+            unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) }
+                .expect("work event");
+        // SAFETY: 同上。
+        let completion =
+            unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) }
+                .expect("completion event");
+        Arc::new(Shared {
+            state: Mutex::new(State::new()),
+            work,
+            completion,
+        })
+    }
+
+    #[test]
+    fn a_panicking_gpu_thread_publishes_an_error() {
+        let shared = test_shared();
+        let worker = Arc::clone(&shared);
+        // 关掉默认 hook：这条 panic 是测试输入，不是测试失败。
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PanicGuard::new(worker);
+            panic!("injected gpu thread panic");
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the guard must run during unwinding");
+
+        let error = shared.take_error().expect("panic must reach poll()");
+        match error {
+            EngineError::AppInit { detail } => {
+                assert_eq!(detail, "kytrix-d3d12 thread panicked");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            !shared.shutdown_requested(),
+            "a panic only terminates the thread, it does not fake a shutdown"
+        );
+    }
+
+    #[test]
+    fn a_normal_exit_does_not_overwrite_the_loop_error() {
+        let shared = test_shared();
+        shared.publish_error(EngineError::Swapchain {
+            detail: SmolStr::new_static("ResizeBuffers failed"),
+        });
+        // 正常退出：guard 被 disarm，不发布任何东西。
+        PanicGuard::new(Arc::clone(&shared)).disarm();
+        match shared.take_error().expect("the loop error stays visible") {
+            EngineError::Swapchain { detail } => {
+                assert!(detail.contains("ResizeBuffers"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panic_keeps_an_already_published_error() {
+        let shared = test_shared();
+        shared.publish_error(EngineError::DeviceLost {
+            reason: SmolStr::new_static("DXGI_ERROR_DEVICE_REMOVED"),
+            log_path: std::path::PathBuf::from("logs/dred.txt"),
+        });
+        shared.publish_panic();
+        match shared.take_error().expect("first error wins") {
+            EngineError::DeviceLost { reason, .. } => {
+                assert_eq!(reason, "DXGI_ERROR_DEVICE_REMOVED");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_shutdown_signals_the_completion_wait_set() {
+        // P1 回归：GPU 线程可能阻塞在 [waitable, completion] 上，关闭必须能通过 completion
+        // 把它唤醒（`work` 不在那个等待集合里）。
+        let shared = test_shared();
+        shared.request_shutdown();
+        // SAFETY: 句柄由 `shared` 持有；0 超时的查询无副作用。
+        let wait =
+            unsafe { windows::Win32::System::Threading::WaitForSingleObject(shared.completion, 0) };
+        assert_eq!(
+            wait,
+            windows::Win32::Foundation::WAIT_OBJECT_0,
+            "request_shutdown must signal completion"
+        );
     }
 }

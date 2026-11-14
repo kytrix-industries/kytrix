@@ -185,8 +185,9 @@ impl InFlightRing {
         }
     }
 
-    /// 取本帧槽位：按**提交次数**轮转（0 → 1 → 2 → 0），不推进 fence 记账（提交成功后才
-    /// [`InFlightRing::advance`]）。
+    /// 取本帧槽位：按 **acquire 次数**轮转（0 → 1 → 2 → 0），不推进 fence 记账（提交成功后才
+    /// [`InFlightRing::advance`]）。正常路径每次 acquire 恰好对应一次提交；`NOT_READY` /
+    /// `OUT_OF_DATE` 重试会多消费一次 acquire 而不提交（复用槽之前由调用方等的槽 fence 保证安全）。
     ///
     /// 槽位**不能**由 `FrameIndex` 取模决定：最新帧槽合并时会丢掉被覆盖帧的序号
     /// （[`LatestFrame`]），序号在一次提交与下一次提交之间的跨度可以是任意值；而平台的背压
@@ -317,13 +318,15 @@ mod tests {
         assert_eq!(fourth.wait_value, first.signal_value);
     }
 
-    /// P0 回归：最新帧槽只在真正取走时产生 GPU 工作，被覆盖帧的序号被丢弃。
+    /// P0 回归：**不重试时**槽位按 acquire 次数轮转（0 → 1 → 2），与 `FrameIndex` 无关。
     ///
     /// 这里每 3 个序号才取走一帧（1、4、7、10）：旧实现用 `index % 3` 会一直命中同一个槽，
     /// 而三槽 semaphore / 上传缓冲按提交次数轮转 —— 两者不同源，新帧会重写 GPU 仍在读的
-    /// 上传缓冲。槽位改为按提交次数轮转后，任何 3 次连续提交都必须落在 3 个不同的槽上。
+    /// 上传缓冲。本测试只覆盖「每次 acquire 都提交」这一条路径：`NOT_READY` / `OUT_OF_DATE`
+    /// 重试也会消费一次 acquire 而不提交（`renderer::run_gpu_loop` 保留 pending 帧），那种
+    /// 交错下相邻两次提交不保证落在不同槽（复用槽之前由槽 fence 等待保证安全），不在本测试内。
     #[test]
-    fn dropped_frame_indices_cannot_reuse_an_upload_slot() {
+    fn acquire_rotates_slots_by_acquisition_count() {
         let mut frame = LatestFrame::new();
         let mut ring = InFlightRing::new();
         let mut submitted = Vec::new();
@@ -339,7 +342,7 @@ mod tests {
             let recent = &submitted[submitted.len().saturating_sub(2)..];
             assert!(
                 !recent.contains(&slot.index),
-                "slot {} reused within three submissions (recent: {recent:?})",
+                "slot {} reused within three acquisitions (recent: {recent:?})",
                 slot.index
             );
             submitted.push(slot.index);

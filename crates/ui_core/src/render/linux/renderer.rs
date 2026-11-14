@@ -161,7 +161,7 @@ impl Renderer {
     /// 把一页图集像素交给 GPU 线程（每 `AtlasKind` 只留最新，§4.2）。
     pub(crate) fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
         match &mut self.target {
-            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels, rows),
+            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels.to_vec(), rows),
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
         }
     }
@@ -590,8 +590,8 @@ struct SubmittedFrame {
     samples: Vec<GpuTimerSample>,
     /// HUD 的 `latency` 起点（`FrameRequest::published_at`）。
     published_at: Instant,
-    /// 本帧 submit 时 signal 的 timeline 值（完成判据）。
-    signal_value: u64,
+    /// 本帧 submit 时 signal 的 timeline 值（完成判据；**不是** ring 的提交计数）。
+    timeline_value: u64,
     /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
     slot: usize,
 }
@@ -650,9 +650,9 @@ fn run_gpu_loop(
             shared.wait_for_work(!submitted.is_empty());
             continue;
         };
-        // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
+        // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
-            renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
+            renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
         }
         // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
         if request.surface != renderer.surface() {
@@ -669,14 +669,15 @@ fn run_gpu_loop(
                 stats,
                 samples,
                 slot,
+                timeline_value,
             } => {
                 submitted.push_back(SubmittedFrame {
                     index: request.index,
                     stats,
                     samples,
                     published_at: request.published_at,
-                    signal_value: slot.signal_value,
-                    slot: slot.index,
+                    timeline_value,
+                    slot,
                 });
                 pending = None;
             }
@@ -693,11 +694,7 @@ fn drain_completed(
     submitted: &mut VecDeque<SubmittedFrame>,
 ) -> Result<(), EngineError> {
     let completed = renderer.drain_completed()?;
-    while submitted
-        .front()
-        .is_some_and(|frame| frame.signal_value <= completed)
-    {
-        let frame = submitted.pop_front().expect("front was checked above");
+    for frame in completed_frames(submitted, completed) {
         let mut samples = frame.samples;
         // GPU 采样必须在 timeline 确认完成之后 resolve（不读在飞槽的 timestamp）。
         if let Some(sample) = renderer.resolve_frame_timer(frame.slot) {
@@ -717,17 +714,44 @@ fn drain_completed(
     Ok(())
 }
 
+/// 按提交顺序取出 timeline 已确认完成的帧。
+///
+/// 完成判据是本帧 submit 时 signal 的 timeline 值，**不是** ring 的提交计数：槽位按 acquire
+/// 次数轮转（1、2、3…），timeline 值来自帧序号；帧序号会跳号（最新帧槽合并、空闲 / 门禁跳过的帧
+/// 不产生 GPU 工作），两者不同源。拿 ring 计数去比，序号一跳号就会把仍在飞的帧误判为完成。
+fn completed_frames<'a>(
+    submitted: &'a mut VecDeque<SubmittedFrame>,
+    completed: u64,
+) -> impl Iterator<Item = SubmittedFrame> + 'a {
+    std::iter::from_fn(move || {
+        if submitted
+            .front()
+            .is_some_and(|frame| frame.timeline_value <= completed)
+        {
+            submitted.pop_front()
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::{
+        sync::{Arc, Condvar, Mutex},
+        time::Instant,
+    };
 
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
+    use super::{
+        AtlasSlots, PanicGuard, Shared, State, StickyError, SubmittedFrame, completed_frames,
+    };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRows, compositor::Plan, frame::LatestFrame},
+        render::{DirtyRows, RenderStats, compositor::Plan, frame::LatestFrame},
+        window::FrameIndex,
     };
 
     fn stale_rows(y0: u32, y1: u32) -> DirtyRows {
@@ -774,6 +798,38 @@ mod tests {
         frame.publish(request(1, Plan::Full));
         frame.publish(request(2, Plan::Idle));
         assert_eq!(frame.take().expect("frame").plan, Plan::Full);
+    }
+
+    #[test]
+    fn only_frames_whose_timeline_value_completed_are_published() {
+        // P1 回归：提交序号 1/4/7（跳号来自最新帧槽合并 / 门禁跳过的帧）。ring 的提交计数是
+        // 1/2/3，若拿它当完成判据，timeline 观测到 4 时会把仍在飞的 7 也发布出去
+        // （completed_at / latency 归属错帧、resolve 读在飞 query）。
+        let mut submitted = std::collections::VecDeque::new();
+        for index in [1u32, 4, 7] {
+            submitted.push_back(SubmittedFrame {
+                index: FrameIndex::from_raw(index),
+                stats: RenderStats::default(),
+                samples: Vec::new(),
+                published_at: Instant::now(),
+                timeline_value: u64::from(index),
+                slot: 0,
+            });
+        }
+        let done: Vec<FrameIndex> = completed_frames(&mut submitted, 4)
+            .map(|frame| frame.index)
+            .collect();
+        assert_eq!(
+            done,
+            vec![FrameIndex::from_raw(1), FrameIndex::from_raw(4)],
+            "timeline 4 只覆盖 1 和 4"
+        );
+        assert_eq!(
+            submitted.front().map(|frame| frame.index),
+            Some(FrameIndex::from_raw(7)),
+            "timeline 4 不覆盖 7：仍在飞的帧不得发布"
+        );
+        assert_eq!(submitted.len(), 1, "只弹出已完成的帧");
     }
 
     #[test]
