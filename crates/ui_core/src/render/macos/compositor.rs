@@ -67,6 +67,9 @@ pub(crate) struct GpuRenderer {
     fresh: bool,
     /// 最后一次**提交**的帧序号：重建产生的旧句柄以它作为 retire 的 tag（§4.3）。
     last_index: FrameIndex,
+    /// 本渲染器是否是**窗口**目标（§10.1 的线程归属断言只对窗口路径成立：离屏 / 快照由门面
+    /// 在 UI 线程同步调用）。
+    window_target: bool,
     #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
 }
@@ -79,7 +82,7 @@ unsafe impl Send for GpuRenderer {}
 impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备 + 默认图集页。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, ATLAS_PAGE)
+        Self::with_device(Device::new()?, size, ATLAS_PAGE, false)
     }
 
     /// 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
@@ -88,15 +91,20 @@ impl GpuRenderer {
         size: (u32, u32),
         atlas_page: u32,
     ) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, atlas_page)
+        Self::with_device(Device::new()?, size, atlas_page, false)
     }
 
     /// 真实窗口：设备由主线程建好（图层已绑定它），这里只接管 GPU 侧对象。
     pub(crate) fn new_window(device: Device, size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(device, size, ATLAS_PAGE)
+        Self::with_device(device, size, ATLAS_PAGE, true)
     }
 
-    fn with_device(device: Device, size: (u32, u32), atlas_page: u32) -> Result<Self, EngineError> {
+    fn with_device(
+        device: Device,
+        size: (u32, u32),
+        atlas_page: u32,
+        window_target: bool,
+    ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let queue = Queue::new(&device)?;
         let pipeline = Pipeline::new(&device, MTLPixelFormat::BGRA8Unorm_sRGB)?;
@@ -120,9 +128,20 @@ impl GpuRenderer {
             surface: size,
             fresh: true,
             last_index: FrameIndex::default(),
+            window_target,
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
+    }
+
+    /// §10.1 的线程归属断言：**窗口**渲染器的所有入口只属于 `kytrix-metal` 线程。
+    ///
+    /// 离屏 / 快照渲染器由门面在 UI 线程同步调用，因此不能做无条件断言（否则快照路径误报）。
+    fn debug_assert_gpu_thread(&self, entry: &'static str) {
+        debug_assert!(
+            !self.window_target || on_gpu_thread(),
+            "Metal window target: {entry} may only run on the kytrix-metal thread"
+        );
     }
 
     /// 当前目标的物理尺寸（GPU 线程侧的真值；重建后更新）。
@@ -150,6 +169,7 @@ impl GpuRenderer {
     /// 旧 persist 可能仍被在飞命令缓冲引用，因此它按「当前最后提交序号」入 retire 队列，
     /// 完成通知到达后才释放（I4）。返回 `true` 表示本帧必须全量。
     pub(crate) fn prepare_target(&mut self, size: (u32, u32)) -> Result<bool, EngineError> {
+        self.debug_assert_gpu_thread("prepare_target");
         let size = (size.0.max(1), size.1.max(1));
         if size == self.surface {
             return Ok(false);
@@ -193,7 +213,8 @@ impl GpuRenderer {
         let mtl_drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
         command.presentDrawable(mtl_drawable);
         let present_started = Instant::now();
-        self.queue.submit(slot, &command, completed)?;
+        self.queue
+            .submit(request.index, slot, &command, completed)?;
         self.fresh = false;
         frame.presented();
         self.last_index = request.index;
@@ -259,6 +280,7 @@ impl GpuRenderer {
     /// 读回持久 offscreen（快照；`submit_snapshot` 已保证本帧完成）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
+        self.debug_assert_gpu_thread("readback");
         self.readback.capture(
             &self.device,
             &self.queue,
@@ -287,6 +309,7 @@ impl GpuRenderer {
         pixels: &[u8],
         rows: crate::render::atlas::DirtyRows,
     ) {
+        self.debug_assert_gpu_thread("queue_atlas_upload");
         self.atlas.queue_upload(kind, pixels, rows);
     }
 
@@ -308,6 +331,7 @@ impl GpuRenderer {
         ),
         EngineError,
     > {
+        self.debug_assert_gpu_thread("record_frame");
         debug_assert_eq!(
             timings.frame(),
             index,
@@ -321,7 +345,7 @@ impl GpuRenderer {
             "partial plans must carry their dirty set"
         );
         let frame_started = Instant::now();
-        let (slot, command) = self.queue.begin(index)?;
+        let (slot, command) = self.queue.begin()?;
         let (instance_count, _clip_count) = self.upload.write(
             &mut self.device,
             &mut self.queue,
@@ -378,7 +402,7 @@ impl GpuRenderer {
                     Plan::Idle | Plan::Full => {}
                     Plan::Partial(damage) => {
                         for rect in damage.as_slice() {
-                            encoder.setScissorRect(scissor_for(rect));
+                            encoder.setScissorRect(scissor_for(rect, self.surface));
                             draw_calls = draw_calls.saturating_add(draw_ops(
                                 &encoder,
                                 payload,
@@ -687,12 +711,16 @@ fn whole_scissor(surface: (u32, u32)) -> MTLScissorRect {
     }
 }
 
-fn scissor_for(rect: &crate::math::PhysicalRect) -> MTLScissorRect {
+/// damage 矩形 → scissor，**裁剪到实际目标尺寸**：`request.surface` 与 drawable 之间允许 1 px 的
+/// DPI 取整差（见 `renderer.rs` 的尺寸校验），越界的 scissor 会被 Metal validation 拒绝。
+fn scissor_for(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> MTLScissorRect {
+    let x = rect.x0.max(0) as u32;
+    let y = rect.y0.max(0) as u32;
     MTLScissorRect {
-        x: rect.x0.max(0) as usize,
-        y: rect.y0.max(0) as usize,
-        width: rect.width().max(0) as usize,
-        height: rect.height().max(0) as usize,
+        x: x as usize,
+        y: y as usize,
+        width: rect.width().max(0).min(surface.0.saturating_sub(x) as i32) as usize,
+        height: rect.height().max(0).min(surface.1.saturating_sub(y) as i32) as usize,
     }
 }
 

@@ -5,7 +5,8 @@
 //!   立即返回（I2）；
 //! - 槽位复用：`dispatch_semaphore`(3) 用 `DISPATCH_TIME_NOW` **非阻塞**获取（I1），拿不到就是
 //!   跳帧；`signal` 只在完成回调里；
-//! - 延迟销毁：旧 persist / 旧上传缓冲按 `FrameIndex` 入 `RetireQueue`，完成通知到达后释放（I4）。
+//! - 延迟销毁：旧 persist / 旧上传缓冲按 `FrameIndex` 入 `RetireQueue`，**连续完成前缀**推进后
+//!   才释放（I4；Metal 只保证 command buffer 的开始顺序，完成回调可能乱序）。
 //!
 //! 三槽 semaphore 保护的是**三槽上传缓冲与 GPU 队列深度**（在飞 command buffer 超过 3 个就会
 //! 覆盖别人的实例字节），不是 drawable 池 —— drawable 由 `CAMetalDisplayLink` 提供。
@@ -13,7 +14,7 @@
 //! 离屏/快照路径仍是同步语义（§4.5 下半段）：`submit_blocking` 在 GPU 线程上等本帧完成，
 //! 那里没有 UI 线程可阻塞。
 
-use std::ptr::NonNull;
+use std::{collections::VecDeque, ptr::NonNull};
 
 use block2::RcBlock;
 use dispatch2::{DispatchRetained, DispatchSemaphore, DispatchTime};
@@ -40,6 +41,8 @@ pub(crate) struct Queue {
     ring: InFlightRing,
     /// 三槽上传缓冲 / GPU 队列深度（Apple「Synchronizing CPU and GPU work」的三缓冲模式）。
     slots: DispatchRetained<DispatchSemaphore>,
+    /// retire 的完成顺序（Metal 的完成回调可以乱序到达，见 [`CompletionOrder`]）。
+    order: CompletionOrder,
     retire: RetireQueue,
     timer: GpuTimer,
 }
@@ -54,6 +57,7 @@ impl Queue {
             raw,
             ring: InFlightRing::new(),
             slots: DispatchSemaphore::new(MAX_FRAMES_IN_FLIGHT as isize),
+            order: CompletionOrder::new(),
             retire: RetireQueue::new(),
             timer: GpuTimer,
         })
@@ -72,11 +76,13 @@ impl Queue {
     }
 
     /// 取本帧槽位并建一块命令缓冲：**不等待任何 GPU 工作**。
+    ///
+    /// 槽位按**提交次数**轮转，与三槽 semaphore 同源：调用方必须先 `try_acquire` 成功，且每次
+    /// 成功的 permit 对应恰好一次 `begin` + `submit`（否则上传槽会与 permit 错位）。
     pub(crate) fn begin(
         &mut self,
-        index: FrameIndex,
     ) -> Result<(FrameSlot, Retained<ProtocolObject<dyn MTLCommandBuffer>>), EngineError> {
-        let slot = self.ring.acquire(index);
+        let slot = self.ring.acquire();
         let buffer = self
             .raw
             .commandBuffer()
@@ -90,6 +96,7 @@ impl Queue {
     /// 回调先 `signal` 三槽 semaphore，再把命令缓冲交给调用方（GPU 线程用它在 drain 时读 GPU 时间）。
     pub(crate) fn submit(
         &mut self,
+        index: FrameIndex,
         slot: FrameSlot,
         buffer: &Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
@@ -109,6 +116,7 @@ impl Queue {
         unsafe { buffer.addCompletedHandler(RcBlock::as_ptr(&block)) };
         buffer.commit();
         self.ring.advance(slot);
+        self.order.submit(index);
         debug_assert_eq!(
             self.ring.last_signaled(),
             slot.signal_value,
@@ -129,6 +137,7 @@ impl Queue {
     ) -> Result<Option<GpuTimerSample>, EngineError> {
         buffer.commit();
         self.ring.advance(slot);
+        self.order.submit(index);
         buffer.waitUntilCompleted();
         self.finish(index, buffer, device)
     }
@@ -148,7 +157,7 @@ impl Queue {
         self.retire.retire(index, handle);
     }
 
-    /// 完成通知到达（GPU 线程 drain）：读 GPU 时间 + 释放 `retire_at <= index` 的旧资源。
+    /// 完成通知到达（GPU 线程 drain）：读 GPU 时间 + 推进**连续前缀**的 retire。
     pub(crate) fn on_completed(
         &mut self,
         index: FrameIndex,
@@ -156,9 +165,11 @@ impl Queue {
         device: &mut Device,
     ) -> Option<GpuTimerSample> {
         let sample = self.timer.resolve(buffer);
-        self.retire.on_completed(index, &mut |handle| {
-            device.release(handle);
-        });
+        if let Some(frontier) = self.order.note(index) {
+            self.retire.on_completed(frontier, &mut |handle| {
+                device.release(handle);
+            });
+        }
         sample
     }
 
@@ -194,5 +205,102 @@ impl Queue {
             return Err(self.failure(index, buffer, device));
         }
         Ok(self.on_completed(index, buffer, device))
+    }
+}
+
+/// retire 的完成顺序：已提交序号 FIFO + 已完成序号集合，只有**连续前缀**完成才推进。
+///
+/// Apple 只保证同一队列 command buffer 的**开始**顺序（提交顺序），不保证完成回调的顺序。
+/// 直接按回调里的序号推进 [`RetireQueue`] 会在较大序号先到时释放仍被较早帧使用的旧 persist
+/// （旧 persist 还在较早帧的命令缓冲里被读）。Windows / Linux 的单调 fence / timeline 天然
+/// 满足这个顺序，因此本结构只在 macOS 需要。
+struct CompletionOrder {
+    /// 已提交、尚未推进 retire 的帧序号（提交顺序）。
+    submitted: VecDeque<FrameIndex>,
+    /// 已完成、但前面还有未完成帧的序号（在飞帧最多 `MAX_FRAMES_IN_FLIGHT` 个）。
+    completed: Vec<FrameIndex>,
+}
+
+impl CompletionOrder {
+    fn new() -> Self {
+        Self {
+            submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
+            completed: Vec::with_capacity(MAX_FRAMES_IN_FLIGHT),
+        }
+    }
+
+    /// 记录一次提交（`commit` 之后调用）。
+    fn submit(&mut self, index: FrameIndex) {
+        self.submitted.push_back(index);
+    }
+
+    /// 记录一次完成，返回新到达的**连续完成前沿**（没有推进时为 `None`）。
+    fn note(&mut self, index: FrameIndex) -> Option<FrameIndex> {
+        debug_assert!(
+            self.submitted.contains(&index),
+            "completion for frame {} without a submission",
+            index.get()
+        );
+        self.completed.push(index);
+        let mut frontier = None;
+        while let Some(front) = self.submitted.front().copied() {
+            if !self.completed.contains(&front) {
+                break;
+            }
+            self.submitted.pop_front();
+            self.completed.retain(|done| *done != front);
+            frontier = Some(front);
+        }
+        frontier
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompletionOrder;
+    use crate::window::FrameIndex;
+
+    fn index(value: u32) -> FrameIndex {
+        FrameIndex::from_raw(value)
+    }
+
+    #[test]
+    fn in_order_completions_advance_immediately() {
+        let mut order = CompletionOrder::new();
+        for value in 1..=3 {
+            order.submit(index(value));
+        }
+        assert_eq!(order.note(index(1)), Some(index(1)));
+        assert_eq!(order.note(index(2)), Some(index(2)));
+        assert_eq!(order.note(index(3)), Some(index(3)));
+    }
+
+    #[test]
+    fn an_out_of_order_completion_waits_for_the_prefix() {
+        let mut order = CompletionOrder::new();
+        for value in 1..=3 {
+            order.submit(index(value));
+        }
+        // 3 先完成：前沿不动（不能释放 3 引用的旧资源）。
+        assert_eq!(order.note(index(3)), None);
+        // 1 完成：前沿到 1（2 还没完成，不能跨过它）。
+        assert_eq!(order.note(index(1)), Some(index(1)));
+        // 2 完成：1..=3 全部完成，前沿一次推到 3。
+        assert_eq!(order.note(index(2)), Some(index(3)));
+        // 之后的提交从新的前缀继续。
+        order.submit(index(4));
+        assert_eq!(order.note(index(4)), Some(index(4)));
+    }
+
+    #[test]
+    fn skipped_submissions_do_not_block_the_prefix() {
+        // 被合并掉的序号不产生提交，因此也不在 FIFO 里；前缀只按真正提交的序号推进。
+        let mut order = CompletionOrder::new();
+        for value in [1, 4, 7] {
+            order.submit(index(value));
+        }
+        assert_eq!(order.note(index(7)), None);
+        assert_eq!(order.note(index(1)), Some(index(1)));
+        assert_eq!(order.note(index(4)), Some(index(7)));
     }
 }

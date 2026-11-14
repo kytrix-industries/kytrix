@@ -69,6 +69,14 @@ use crate::{
 /// 关闭握手的等待上限（UI 线程**唯一**允许等 GPU 线程的时刻，§4.5）。
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// drawable 尺寸与请求尺寸连续不一致的 vsync 上限（`request.surface` 是 resize 的唯一来源）。
+///
+/// 正常路径要求两者一致（±1 px，吸收 DPI 取整）：不一致说明这个 drawable 还是上一轮 layout
+/// 的产物，用它消费最新帧会把最后一帧按旧尺寸画完 —— 此后 pacing 暂停、没有新帧，窗口永久
+/// 停在旧尺寸画面。连续超过本上限仍不一致时，说明不是「等一下就有新 drawable」而是取整误差，
+/// 退化为「按 drawable 实际尺寸渲染 + 全量」，避免永久停更。
+const MAX_SURFACE_MISMATCHES: u32 = 4;
+
 /// 门面：窗口路径是「最新帧槽 + 最新 drawable 槽 + GPU 线程」，离屏路径是同步渲染器。
 ///
 /// 两个分支都是 **macOS 后端内部**的目标区分（离屏 / 窗口），不是跨平台抽象：
@@ -549,6 +557,12 @@ struct Shared {
 
 struct State {
     frame: LatestFrame,
+    /// 最新帧槽里那一帧的目标尺寸（`FrameRequest::surface`）。
+    ///
+    /// GPU 线程必须**在取帧之前**用它校验 drawable 的纹理尺寸（P1）：drawable 可能还是上一轮
+    /// layout 的产物。`take_frame_for_drawable` 取走帧时同步清空，因此它与 `frame` 一一对应
+    /// （同一把锁里维护）。
+    published_surface: Option<(u32, u32)>,
     atlas: AtlasSlots,
     /// 最新 drawable（display link 每 vsync 覆盖旧的；GPU 线程取走即清空）。
     drawable: Option<SendDrawable>,
@@ -567,6 +581,7 @@ impl State {
     const fn new() -> Self {
         Self {
             frame: LatestFrame::new(),
+            published_surface: None,
             atlas: AtlasSlots::new(),
             drawable: None,
             completions: VecDeque::new(),
@@ -649,6 +664,15 @@ fn pacing_paused(continuous: bool, pending_frame: bool, in_flight: usize) -> boo
     !(continuous || pending_frame || in_flight > 0)
 }
 
+/// 请求的目标尺寸与 drawable 的实际尺寸是否一致（容差 1 px）。
+///
+/// 1 px 只用于吸收 DPI / 图层取整：`set_layer_scale` 写的是 `surface × scale` 的 covering
+/// 结果，drawable 纹理由图层按同一个 `drawableSize` 分配，理论上逐像素相等；差 1 px 不值得
+/// 再等一个 vsync（真差一整个 layout 时差值远大于 1）。
+fn surface_within_tolerance(requested: (u32, u32), drawable: (u32, u32)) -> bool {
+    requested.0.abs_diff(drawable.0) <= 1 && requested.1.abs_diff(drawable.1) <= 1
+}
+
 impl Shared {
     fn new() -> Self {
         Self {
@@ -672,6 +696,7 @@ impl Shared {
         if state.shutdown || state.terminated {
             return;
         }
+        state.published_surface = Some(request.surface);
         state.frame.publish(request);
         drop(state);
         self.wake();
@@ -700,7 +725,10 @@ impl Shared {
     /// 完成回调（Metal 的任意线程）：入队 + 唤醒 GPU 线程（**不**碰 retire / 计时）。
     fn push_completion(&self, index: FrameIndex, buffer: SendCommandBuffer) {
         let mut state = self.lock();
-        if state.shutdown && state.terminated {
+        // 只丢弃「消费者已经退出」之后的完成通知：`terminated` 之后没有线程会 drain，继续入队
+        // 只会泄漏命令缓冲。**不能**在 `shutdown` 时就丢弃 —— 关闭握手正是靠这些通知把在飞帧
+        // drain 到 0（§4.5），丢了会让 GPU 线程永远等下去（`Drop` 最终只能放弃 join）。
+        if state.terminated {
             return;
         }
         state.completions.push_back(Completion { index, buffer });
@@ -723,8 +751,19 @@ impl Shared {
         self.lock().frame.has_pending()
     }
 
-    fn take_frame(&self) -> Option<FrameRequest> {
-        self.lock().frame.take()
+    /// 最新帧槽里那一帧的目标尺寸（**不取帧**）：GPU 线程在占槽/取帧之前用它校验 drawable。
+    fn published_surface(&self) -> Option<(u32, u32)> {
+        self.lock().published_surface
+    }
+
+    fn take_frame_for_drawable(&self, target: (u32, u32), force: bool) -> Option<FrameRequest> {
+        let mut state = self.lock();
+        let surface = state.published_surface?;
+        if !force && !surface_within_tolerance(surface, target) {
+            return None;
+        }
+        state.published_surface = None;
+        state.frame.take()
     }
 
     fn take_drawable(&self) -> Option<SendDrawable> {
@@ -772,6 +811,19 @@ impl Shared {
         state.error = Some(error);
     }
 
+    /// GPU 线程 panic：`poll` 必须看到一条错误而不是静默停摆；不覆盖已有错误，并让后续
+    /// `publish` / 完成回调变成 no-op（与 Linux 的 `publish_panic` 同一语义）。
+    fn publish_panic(&self) {
+        let mut state = self.lock();
+        state.feedback = None;
+        if state.error.is_none() {
+            state.error = Some(EngineError::AppInit {
+                detail: SmolStr::new_static("kytrix-metal thread panicked"),
+            });
+        }
+        state.terminated = true;
+    }
+
     fn take_feedback(&self) -> Option<FrameFeedback> {
         self.lock().feedback.take()
     }
@@ -790,16 +842,50 @@ impl Shared {
     }
 }
 
+/// GPU 线程的 panic 出路：展开时把错误交给 UI（`poll()` 不会静默卡死），并标记线程已终止。
+///
+/// 正常退出时 [`PanicGuard::disarm`] 消费自己，**不覆盖**循环已经发布的错误。
+struct PanicGuard {
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl PanicGuard {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    /// 正常退出：GPU 线程已经按自己的错误路径收尾，guard 不再发布任何东西。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if self.armed && std::thread::panicking() {
+            self.shared.publish_panic();
+        }
+    }
+}
+
 /// GPU 线程主循环（§5.2）。
 fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
     enter_gpu_thread();
     // 退出（含 panic）时通知 UI 线程；`Drop` 的 `recv_timeout` 因此有界。
     let _exit = ExitSignal(done);
+    // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）；正常路径 disarm。
+    let guard = PanicGuard::new(Arc::clone(&shared));
     // 已提交、等完成通知的帧的统计与发布时刻（完成时拼成 `FrameFeedback`；落后 ≤1 帧）。
     // 元组末项是 `FrameRequest::published_at`：macOS 的反馈在**完成通知**里发布，
     // 那时 `request` 已经不在作用域内，所以发布基准要随提交一起记账。
     let mut submitted: VecDeque<(FrameIndex, RenderStats, Vec<GpuTimerSample>, Instant)> =
         VecDeque::new();
+    // 连续「drawable 与请求尺寸不一致」的 vsync 数（P1；匹配 / 退化提交后归零）。
+    let mut surface_mismatches = 0u32;
     loop {
         shared.wait_for_work();
         if let Err(error) = drain_completions(&mut renderer, &shared, &mut submitted) {
@@ -820,12 +906,37 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
         let Some(drawable) = shared.take_drawable() else {
             continue;
         };
-        // ① 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
+        // ① drawable 的实际像素尺寸就是本帧的渲染尺寸（§5.4）。
+        let texture = drawable.0.texture();
+        let target = (texture.width() as u32, texture.height() as u32);
+        // ② resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
+        //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后 pacing 暂停、没有新帧
+        //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
+        //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
+        let mut degrade = false;
+        if let Some(requested) = shared.published_surface()
+            && !surface_within_tolerance(requested, target)
+        {
+            surface_mismatches += 1;
+            if surface_mismatches <= MAX_SURFACE_MISMATCHES {
+                continue;
+            }
+            if surface_mismatches == MAX_SURFACE_MISMATCHES + 1 {
+                // 只记录一次：之后按 drawable 实际尺寸继续画，不能每帧刷日志。
+                eprintln!(
+                    "kytrix: metal drawable {}x{} never matched the requested {}x{} within {} vsyncs; rendering at the drawable size (full frame)",
+                    target.0, target.1, requested.0, requested.1, MAX_SURFACE_MISMATCHES
+                );
+            }
+            degrade = true;
+        }
+        // ③ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
+        //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
         if !renderer.try_acquire_upload_slot() {
             continue;
         }
-        let Some(request) = shared.take_frame() else {
-            // 防御：取到槽但没有帧要画，归还槽位。
+        let Some(request) = shared.take_frame_for_drawable(target, degrade) else {
+            // 尺寸在两次加锁之间又变了（新帧发布）：归还槽位，帧留在槽里。
             renderer.release_upload_slot();
             continue;
         };
@@ -833,9 +944,6 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
         }
-        // ② 目标校验：drawable 的**实际**像素尺寸就是本帧的渲染尺寸（§5.4）。
-        let texture = drawable.0.texture();
-        let target = (texture.width() as u32, texture.height() as u32);
         let resized = match renderer.prepare_target(target) {
             Ok(resized) => resized,
             Err(error) => {
@@ -843,7 +951,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
                 break;
             }
         };
-        let mut frame = FramePlan::new(request.plan, resized || renderer.is_fresh());
+        let mut frame = FramePlan::new(request.plan, resized || renderer.is_fresh() || degrade);
         if frame.is_idle() {
             // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
             renderer.release_upload_slot();
@@ -856,6 +964,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
         };
         match renderer.submit_frame(&request, &drawable.0, &mut frame, completed) {
             Ok((stats, samples)) => {
+                surface_mismatches = 0;
                 shared.note_submitted();
                 submitted.push_back((index, stats, samples, request.published_at));
             }
@@ -866,6 +975,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
         }
     }
     shared.mark_terminated();
+    guard.disarm();
 }
 
 /// 处理完成通知：读 GPU 时间、推进 retire、发布反馈（**只**在 GPU 线程）。
@@ -913,7 +1023,7 @@ fn take_submitted(
 mod tests {
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, StickyError, pacing_paused};
+    use super::{AtlasSlots, StickyError, pacing_paused, surface_within_tolerance};
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
@@ -975,6 +1085,24 @@ mod tests {
         assert!(!pacing_paused(false, true, 0), "有未取走的帧请求必须跑");
         assert!(!pacing_paused(false, false, 1), "有在飞帧必须跑");
         assert!(pacing_paused(false, false, 0), "空闲：display link 暂停");
+    }
+
+    #[test]
+    fn drawable_size_tolerance_absorbs_one_pixel_of_dpi_rounding() {
+        assert!(surface_within_tolerance((1400, 1040), (1400, 1040)));
+        assert!(
+            surface_within_tolerance((1400, 1040), (1401, 1039)),
+            "±1 px 是 DPI 取整，不值得再等一个 vsync"
+        );
+        assert!(
+            !surface_within_tolerance((1400, 1040), (1402, 1040)),
+            "差 2 px 已经不是取整"
+        );
+        assert!(!surface_within_tolerance((1400, 1040), (1400, 1042)));
+        assert!(
+            !surface_within_tolerance((1400, 1040), (2500, 1700)),
+            "上一轮 layout 的 drawable 必须被拒绝（P1）"
+        );
     }
 
     /// 离屏路径（快照 / golden）仍是**同步**语义，并且与窗口路径共用同一套 GPU 对象：
