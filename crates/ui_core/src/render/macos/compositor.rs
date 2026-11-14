@@ -12,7 +12,7 @@
 //! 线程纪律：窗口路径的所有成员只属于 `kytrix-metal` 线程；persist 重建**不等待在飞帧**，
 //! 旧纹理按帧序号进 retire 队列（§4.3 / I4）。图层属性一个都不在这里写（§5.3）。
 
-use std::time::Instant;
+use std::{ffi::c_void, ptr::NonNull, time::Instant};
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -59,7 +59,6 @@ pub(crate) struct GpuRenderer {
     atlas: AtlasTextures,
     persist: Persist,
     upload: UploadArena,
-    root: Retained<ProtocolObject<dyn MTLBuffer>>,
     clear_color: [f32; 4],
     /// 当前持久目标 / drawable 的物理尺寸（drawable 的实际尺寸是最后真值，§5.4）。
     surface: (u32, u32),
@@ -109,10 +108,6 @@ impl GpuRenderer {
         let queue = Queue::new(&device)?;
         let pipeline = Pipeline::new(&device, MTLPixelFormat::BGRA8Unorm_sRGB)?;
         let atlas = AtlasTextures::new(&device, atlas_page)?;
-        let root = device
-            .raw()
-            .newBufferWithLength_options(ROOT_UNIFORM_BYTES, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| init_error("newBufferWithLength_options(root)", "returned nil"))?;
         let mut device = device;
         let persist = Persist::new(&mut device, size)?;
         let upload = UploadArena::new(&mut device)?;
@@ -123,7 +118,6 @@ impl GpuRenderer {
             atlas,
             persist,
             upload,
-            root,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             surface: size,
             fresh: true,
@@ -360,7 +354,6 @@ impl GpuRenderer {
             payload.instances(),
             payload.clips(),
         )?;
-        write_root(&self.root, self.surface);
         timings.push(GpuTimerSample {
             section: Section::Upload,
             cpu_ns: elapsed_ns(frame_started),
@@ -373,7 +366,9 @@ impl GpuRenderer {
             let blit = command
                 .blitCommandEncoder()
                 .ok_or_else(|| init_error("blitCommandEncoder(atlas)", "returned nil"))?;
-            self.atlas.record_uploads(&blit);
+            // 上传缓冲以本帧序号进入 retire：在飞帧的 staging 不会被下一帧覆盖（见 `atlas.rs`）。
+            self.atlas
+                .record_uploads(&mut self.device, &mut self.queue, index, &blit)?;
             blit.endEncoding();
         }
         {
@@ -447,9 +442,19 @@ impl GpuRenderer {
     fn bind(&self, encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, slot: usize) {
         encoder.setRenderPipelineState(self.pipeline.quad());
         let (instances, clips) = self.upload.slot(slot);
-        // SAFETY: 缓冲/纹理都在本渲染器生命周期内；索引与 P07 的绑定表逐字一致。
+        // `RootUniform` 用 `setVertexBytes`（≤ 4 KB）在**录制时复制**进命令缓冲：没有跨帧的
+        // CPU 可写缓冲，因此在飞帧读到的永远是它自己那一帧的常量（D3D12 root constants /
+        // Vulkan push constants 的等价物）。单个 shared buffer + 每帧 `write` 会让异步执行的
+        // 旧帧读到新帧的 viewport / 尺寸。
+        let root = RootUniform::new(self.surface);
+        // SAFETY: 缓冲/纹理都在本渲染器生命周期内；索引与 P07 的绑定表逐字一致；
+        // `root` 在本次调用期间存活（`setVertexBytes` 复制它的字节）。
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(Some(&self.root), 0, 2);
+            encoder.setVertexBytes_length_atIndex(
+                NonNull::new(root.0.as_ptr().cast_mut().cast::<c_void>()).expect("stack pointer"),
+                ROOT_UNIFORM_BYTES,
+                2,
+            );
             encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
             encoder.setFragmentBuffer_offset_atIndex(Some(instances), 0, 0);
             encoder.setFragmentBuffer_offset_atIndex(Some(clips), 0, 1);
@@ -628,22 +633,22 @@ fn write_upload(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: &[u8]) {
 }
 
 /// `RootUniform`（112 B）：`frame @0`、`draw @32`；实例绘制只用 `frame.viewport`（P07 §2.7）。
-fn write_root(buffer: &ProtocolObject<dyn MTLBuffer>, surface: (u32, u32)) {
-    let width = surface.0 as f32;
-    let height = surface.1 as f32;
-    let mut uniform = [0.0f32; ROOT_UNIFORM_BYTES / 4];
-    uniform[0] = width;
-    uniform[1] = height;
-    uniform[2] = if width > 0.0 { 2.0 / width } else { 0.0 };
-    uniform[3] = if height > 0.0 { 2.0 / height } else { 0.0 };
-    let bytes = bytemuck::cast_slice::<f32, u8>(&uniform);
-    // SAFETY: root buffer 恒 112 B（构造时分配）；只写同一长度。
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            buffer.contents().as_ptr().cast::<u8>(),
-            bytes.len(),
-        );
+///
+/// CPU 侧字节，16 B 对齐（shader 按 `float4` 常量布局读）：`setVertexBytes` 要求数据可读，
+/// Metal 在录制时把它复制进命令缓冲。
+#[repr(C, align(16))]
+struct RootUniform([f32; ROOT_UNIFORM_BYTES / 4]);
+
+impl RootUniform {
+    fn new(surface: (u32, u32)) -> Self {
+        let width = surface.0 as f32;
+        let height = surface.1 as f32;
+        let mut uniform = [0.0f32; ROOT_UNIFORM_BYTES / 4];
+        uniform[0] = width;
+        uniform[1] = height;
+        uniform[2] = if width > 0.0 { 2.0 / width } else { 0.0 };
+        uniform[3] = if height > 0.0 { 2.0 / height } else { 0.0 };
+        Self(uniform)
     }
 }
 

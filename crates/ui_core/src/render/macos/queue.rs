@@ -157,6 +157,12 @@ impl Queue {
         self.retire.retire(index, handle);
     }
 
+    /// 尚未释放的 retire 句柄数（GPU 测试断言「在飞帧的 staging 不得提前释放」）。
+    #[cfg(test)]
+    pub(crate) fn retired_handles(&self) -> usize {
+        self.retire.pending()
+    }
+
     /// 完成通知到达（GPU 线程 drain）：读 GPU 时间 + 推进**连续前缀**的 retire。
     ///
     /// 返回 GPU 采样与新的**连续完成前沿**（只有连续前缀推进时才发布反馈，见

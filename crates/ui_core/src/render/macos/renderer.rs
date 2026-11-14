@@ -1184,9 +1184,9 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, SHUTDOWN_GRACE, SendCommandBuffer,
-        Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome, pacing_paused,
-        surface_within_tolerance,
+        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, PanicGuard, SHUTDOWN_GRACE,
+        SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome,
+        pacing_paused, surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
@@ -1525,5 +1525,60 @@ mod tests {
         });
         let text = sticky.to_error().to_string();
         assert!(text.contains("MTLCommandBuffer"), "{text}");
+    }
+
+    /// 与 Linux / Windows 的同构测试：GPU 线程 panic 后 `poll()` 必须看到一条粘性错误，
+    /// 而不是静默停摆。
+    #[test]
+    fn a_panicking_gpu_thread_publishes_an_error() {
+        let shared = Arc::new(Shared::new());
+        let worker = Arc::clone(&shared);
+        // 关掉默认 hook：这条 panic 是测试输入，不是测试失败。
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PanicGuard::new(worker);
+            panic!("injected gpu thread panic");
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the guard must run during unwinding");
+
+        let error = shared.take_error().expect("panic must reach poll()");
+        match error {
+            EngineError::AppInit { detail } => {
+                assert_eq!(detail, "kytrix-metal thread panicked");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            !shared.shutdown_requested(),
+            "a panic only terminates the thread, it does not fake a shutdown"
+        );
+    }
+
+    /// panic 只填补**空**错误槽：循环已经发布的错误是更具体的原因，不能被覆盖。
+    #[test]
+    fn a_panic_keeps_an_already_published_error() {
+        let shared = Arc::new(Shared::new());
+        shared.publish_error(EngineError::DeviceLost {
+            reason: SmolStr::new_static("MTLCommandBufferError(11)"),
+            log_path: std::path::PathBuf::from("logs/metal.txt"),
+        });
+        let worker = Arc::clone(&shared);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PanicGuard::new(worker);
+            panic!("injected gpu thread panic");
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the guard must run during unwinding");
+
+        match shared.take_error().expect("first error wins") {
+            EngineError::DeviceLost { reason, .. } => {
+                assert_eq!(reason, "MTLCommandBufferError(11)");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
