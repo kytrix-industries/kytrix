@@ -876,7 +876,7 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
 |---|---|---|---|
 | Windows | 695 passed / 0 failed / 1 ignored | 7.8–10.2 ms | 跨 10 s 多次采样，不累积；其中大部分是 waitable 的 vsync 排队（I3 的既有语义） |
 | Linux | 639 passed / 0 failed | 2.1–3.1 ms | headless sway + lavapipe，不累积 |
-| macOS | 648 passed / 0 failed | 3.1–3.7 ms | 同一台 Intel Iris Plus 655，不累积（`b4ea69e` 基线重测 2.90–3.41 ms） |
+| macOS | 652 passed / 0 failed | 3.1–3.7 ms | 同一台 Intel Iris Plus 655，不累积（`b4ea69e` 基线重测 2.90–3.41 ms；本轮重测为 652，此前文档的 648 是旧基线） |
 
 - 测试数字是 `cargo test -p ui_core --lib` 口径（默认 feature）；feature 组合会改变数量（同一
   HEAD 加 `--features "hud,test-support"` 时 Windows 为 756 passed / 1 ignored），比较时只与
