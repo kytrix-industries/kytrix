@@ -17,18 +17,21 @@
 //! - **I3**：节奏来自 `vkAcquireNextImageKHR` + Wayland 合成器（`MAILBOX`），100 ms 超时只为响应
 //!   shutdown；等待只发生在 GPU 线程。
 //!
-//! 关闭握手（§4.5 / §7.7）：`Drop` 里 signal shutdown + 有界等待（`recv_timeout`，2 s）后 join。
-//! GPU 线程在退出前自己 drain 在飞帧（`GpuRenderer::drop` 的 `vkDeviceWaitIdle` 允许，退出路径）。
+//! 关闭握手（§4.5 / §7.7）：`Drop` 里 signal shutdown 后**直接 `join`**（无超时）。有界性来自
+//! `vkAcquireNextImageKHR` 的 100 ms 上限：GPU 线程最多再等一个超时周期就会看到 shutdown。
+//! GPU 线程在退出前自己 drain 在飞帧（`GpuRenderer::drop` 的 `vkDeviceWaitIdle` 允许，退出路径），
+//! 而且 **teardown 完成之后**才让 UI 观察到线程结束（`join` 返回即 teardown 完成）。
+//!
+//! panic 出路：GPU 线程展开时 [`PanicGuard`] 会向共享错误槽发布 `AppInit`，平台泵的 `poll()`
+//! 因此看到错误而不是静默停摆（不覆盖循环已经发布的错误）。
 //!
 //! WSI 线程模型（§7.5）：`vkCreateWaylandSurfaceKHR` 创建的 WSI 私有 `wl_event_queue` 完全由
 //! Mesa 内部 dispatch；应用只 dispatch 自己的默认队列（calloop 的 `WaylandSource`）。
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
-    sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError,
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
-    },
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -40,25 +43,26 @@ use crate::paint::instance::InstanceBuffer;
 #[cfg(feature = "test-support")]
 use crate::render::linux::readback::ReadbackImage;
 #[cfg(feature = "hud")]
-use crate::render::timer::{GpuTimerSample, Section};
+use crate::render::timer::Section;
 use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
         DirtyRows, RenderStats,
         compositor::FramePlan,
-        frame::{FrameFeedback, FrameRequest, LatestFrame},
+        frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         linux::{
             compositor::{GpuRenderer, Submitted},
             device::enter_gpu_thread,
         },
-        timer::FrameTimings,
+        timer::{FrameTimings, GpuTimerSample},
     },
     window::FrameIndex,
 };
 
-/// 关闭握手的等待上限（UI 线程**唯一**允许等 GPU 线程的时刻，§4.5）。
-const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// 有在飞帧时的完成观测周期：timeline 的完成不会唤醒 condvar，无限等待会让最后一帧的反馈
+/// 永远不发布（§4.1 的完成语义）。
+const FEEDBACK_POLL: Duration = Duration::from_millis(4);
 
 /// 门面：窗口路径是「最新帧槽 + GPU 线程句柄」，离屏路径是同步渲染器。
 ///
@@ -262,8 +266,6 @@ impl StickyError {
 struct WindowRenderer {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    /// GPU 线程退出信号（`ExitSignal` 在退出 / panic 时发送）。
-    done: Receiver<()>,
     /// 最近一次**发布**的目标尺寸（`publish` 里更新）。
     surface: (u32, u32),
     stats: RenderStats,
@@ -279,18 +281,16 @@ impl WindowRenderer {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
         });
-        let (done, done_rx) = mpsc::channel();
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("kytrix-vulkan".to_owned())
-            .spawn(move || gpu_loop(gpu, worker, done))
+            .spawn(move || gpu_loop(gpu, worker))
             .map_err(|error| EngineError::AppInit {
                 detail: format_smolstr!("spawn kytrix-vulkan thread: {error}"),
             })?;
         Ok(Self {
             shared,
             thread: Some(thread),
-            done: done_rx,
             surface: (size.0.max(1), size.1.max(1)),
             stats: RenderStats::default(),
             #[cfg(feature = "hud")]
@@ -323,8 +323,8 @@ impl WindowRenderer {
             "feedback must name a committed frame"
         );
         debug_assert!(
-            feedback.samples.len() <= 4,
-            "at most four GPU sections per frame"
+            feedback.samples.len() <= 3,
+            "at most three GPU sections per frame"
         );
         debug_assert!(
             self.last_published
@@ -355,28 +355,42 @@ impl Drop for WindowRenderer {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // UI 线程唯一允许的等待点：signal shutdown 之后有界等待 GPU 线程退出（§4.5）。
-        match self.done.recv_timeout(JOIN_TIMEOUT) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                let _ = thread.join();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // 放弃 join（线程可能卡在驱动的等待里）：detach，避免把 UI 线程一起拖死。
-                eprintln!(
-                    "kytrix: the kytrix-vulkan thread did not exit within {}s; abandoning the join",
-                    JOIN_TIMEOUT.as_secs()
-                );
-            }
-        }
+        // UI 线程唯一允许的等待点（§4.5 / §7.7）：`acquire` 的 100 ms 上限保证 GPU 线程在
+        // 一个超时周期内看到 shutdown，随后 `GpuRenderer::drop` 的 `vkDeviceWaitIdle` 结束在飞
+        // 工作。`join` **没有超时**：放弃等待会让 GPU 线程在 UI 归还 `wl_surface` 之后仍触碰
+        // 已释放资源（use-after-free）；也不再需要单独的退出信号 —— `join` 返回即 teardown 完成。
+        // `Err` 只表示 GPU 线程 panic：`PanicGuard` 已把错误交给 `poll`，默认 hook 也已打印。
+        let _ = thread.join();
     }
 }
 
-/// GPU 线程退出（含 panic）时通知 UI 线程，保证 `Drop` 的等待有界。
-struct ExitSignal(Sender<()>);
+/// GPU 线程的 panic 出路：展开时把错误交给 UI（`poll()` 不会静默卡死），并标记线程已终止。
+///
+/// 正常退出时 [`PanicGuard::disarm`] 消费自己，**不覆盖**循环已经发布的错误（§7.7）。
+struct PanicGuard {
+    shared: Arc<Shared>,
+    armed: bool,
+}
 
-impl Drop for ExitSignal {
+impl PanicGuard {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    /// 正常退出：GPU 线程已经按自己的错误路径收尾，guard 不再发布任何东西。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PanicGuard {
     fn drop(&mut self) {
-        let _ = self.0.send(());
+        if self.armed && std::thread::panicking() {
+            self.shared.publish_panic();
+        }
     }
 }
 
@@ -492,8 +506,21 @@ impl Shared {
     }
 
     /// 空闲：睡在 condvar 上直到有帧或关闭（0 自旋唤醒）。
-    fn wait_for_work(&self) {
+    ///
+    /// 有在飞帧（`wait_completion == true`）时用 [`FEEDBACK_POLL`] 的有限等待：timeline 的完成
+    /// 不会唤醒 condvar，无限等待会让最后一帧的反馈永远不发布（§4.1 的完成语义）。
+    fn wait_for_work(&self, wait_completion: bool) {
         let mut state = self.lock();
+        if wait_completion {
+            if state.shutdown || state.frame.has_pending() {
+                return;
+            }
+            let _ = self
+                .work
+                .wait_timeout(state, FEEDBACK_POLL)
+                .unwrap_or_else(PoisonError::into_inner);
+            return;
+        }
         while !state.shutdown && !state.frame.has_pending() {
             state = self
                 .work
@@ -524,6 +551,19 @@ impl Shared {
         state.error = Some(error);
     }
 
+    /// GPU 线程 panic：`poll` 必须看到一条错误而不是静默停摆；不覆盖已有错误，并让后续
+    /// `publish` 变成 no-op。
+    fn publish_panic(&self) {
+        let mut state = self.lock();
+        state.feedback = None;
+        if state.error.is_none() {
+            state.error = Some(EngineError::AppInit {
+                detail: SmolStr::new_static("kytrix-vulkan thread panicked"),
+            });
+        }
+        state.terminated = true;
+    }
+
     fn take_feedback(&self) -> Option<FrameFeedback> {
         self.lock().feedback.take()
     }
@@ -542,11 +582,48 @@ impl Shared {
     }
 }
 
+/// 已提交、尚未被 timeline 确认完成的帧（提交顺序 = 反馈发布顺序，§4.1）。
+struct SubmittedFrame {
+    index: FrameIndex,
+    stats: RenderStats,
+    /// 提交时的 CPU 采样（Upload / Present）；GPU 采样在完成观测点追加。
+    samples: Vec<GpuTimerSample>,
+    /// HUD 的 `latency` 起点（`FrameRequest::published_at`）。
+    published_at: Instant,
+    /// 本帧 submit 时 signal 的 timeline 值（完成判据）。
+    signal_value: u64,
+    /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
+    slot: usize,
+}
+
 /// GPU 线程主循环（§7.3）。
-fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
+fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
-    // 退出（含 panic）时通知 UI 线程；`Drop` 的 `recv_timeout` 因此有界。
-    let _exit = ExitSignal(done);
+    // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）。
+    let guard = PanicGuard::new(Arc::clone(&shared));
+    // `GpuRenderer` 必须是**局部** `Option`：循环结束后显式 drop（`vkDeviceWaitIdle` + 销毁
+    // swapchain / persist / 设备），UI 的 `join` 返回时 teardown 一定已经完成（§7.7）。
+    let mut renderer = Some(renderer);
+    let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
+    if let Err(error) = run_gpu_loop(
+        renderer
+            .as_mut()
+            .expect("renderer is present until teardown"),
+        &shared,
+        &mut submitted,
+    ) {
+        shared.publish_error(error);
+    }
+    drop(renderer.take());
+    shared.mark_terminated();
+    guard.disarm();
+}
+
+fn run_gpu_loop(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    submitted: &mut VecDeque<SubmittedFrame>,
+) -> Result<(), EngineError> {
     // 已从最新帧槽取出、但还没产生 GPU 工作的帧。`NOT_READY` / `OUT_OF_DATE` 时**保留**它：
     // 丢掉会把它的 damage 一起丢掉（persist 里那块像素永远不会被补画，I5）。
     let mut pending: Option<FrameRequest> = None;
@@ -562,16 +639,15 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
                 }
             });
         }
+        // ② 完成观测点（唯一）：按提交顺序发布反馈 + 推进 retire（旧 swapchain / 旧 persist 在
+        // 这里真正释放）。timeline 只读不等待（§7.2 硬规则 2）。
+        drain_completed(renderer, shared, submitted)?;
         if shared.shutdown_requested() {
-            break;
-        }
-        // 非阻塞推进 retire（timeline 只在这里读；旧 swapchain / 旧 persist 在此真正释放）。
-        if let Err(error) = renderer.drain_completed() {
-            shared.publish_error(error);
-            break;
+            return Ok(());
         }
         let Some(request) = pending.as_ref() else {
-            shared.wait_for_work();
+            // 有在飞帧时用有限等待定期回来观察完成（见 `Shared::wait_for_work`）。
+            shared.wait_for_work(!submitted.is_empty());
             continue;
         };
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
@@ -579,11 +655,8 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
             renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
         }
         // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
-        if request.surface != renderer.surface()
-            && let Err(error) = renderer.resize(request.surface)
-        {
-            shared.publish_error(error);
-            break;
+        if request.surface != renderer.surface() {
+            renderer.resize(request.surface)?;
         }
         let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
         // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
@@ -591,37 +664,66 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, done: Sender<()>) {
             pending = None;
             continue;
         }
-        match renderer.submit_frame(request, &mut frame) {
-            Ok(Submitted::Presented { stats, samples }) => {
-                shared.publish_feedback(FrameFeedback {
+        match renderer.submit_frame(request, &mut frame)? {
+            Submitted::Presented {
+                stats,
+                samples,
+                slot,
+            } => {
+                submitted.push_back(SubmittedFrame {
                     index: request.index,
                     stats,
                     samples,
-                    // UI 发布 → GPU 完成（当前发布点在 present 返回后）。
-                    latency: Instant::now().saturating_duration_since(request.published_at),
-                    // 命令缓冲完成时刻（近似呈现时刻）。
-                    completed_at: Instant::now(),
+                    published_at: request.published_at,
+                    signal_value: slot.signal_value,
+                    slot: slot.index,
                 });
                 pending = None;
             }
             // 保留待画帧：下一次 acquire 会阻塞到超时 / 下一张图，不会自旋。
-            Ok(Submitted::Retry) => {}
-            Err(error) => {
-                shared.publish_error(error);
-                break;
-            }
+            Submitted::Retry => {}
         }
     }
-    shared.mark_terminated();
-    // 离开作用域时 `GpuRenderer` 被 drop：`vkDeviceWaitIdle` → 销毁 swapchain / persist / 设备
-    // （§7.7 的退出路径）。
+}
+
+/// 发布已观察到完成的帧（提交顺序）并推进 retire —— 与 Windows 同一观测点（§4.1）。
+fn drain_completed(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    submitted: &mut VecDeque<SubmittedFrame>,
+) -> Result<(), EngineError> {
+    let completed = renderer.drain_completed()?;
+    while submitted
+        .front()
+        .is_some_and(|frame| frame.signal_value <= completed)
+    {
+        let frame = submitted.pop_front().expect("front was checked above");
+        let mut samples = frame.samples;
+        // GPU 采样必须在 timeline 确认完成之后 resolve（不读在飞槽的 timestamp）。
+        if let Some(sample) = renderer.resolve_frame_timer(frame.slot) {
+            samples.push(sample);
+        }
+        // 观察到完成的时刻（timeline 非阻塞查询），不是 `Present` 返回的时刻。
+        let completed_at = Instant::now();
+        shared.publish_feedback(FrameFeedback {
+            index: frame.index,
+            stats: frame.stats,
+            samples,
+            completed_at,
+            // UI 发布 → GPU 完成（HUD 的 publish→present）。
+            latency: completed_at.saturating_duration_since(frame.published_at),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Condvar, Mutex};
+
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, StickyError};
+    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
@@ -694,5 +796,73 @@ mod tests {
         });
         let text = sticky.to_error().to_string();
         assert!(text.contains("create_swapchain_khr"), "{text}");
+    }
+
+    #[test]
+    fn a_panicking_gpu_thread_publishes_an_error() {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        // 关掉默认 hook：这条 panic 是测试输入，不是测试失败。
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PanicGuard::new(worker);
+            panic!("injected gpu thread panic");
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the guard must run during unwinding");
+
+        let error = shared.take_error().expect("panic must reach poll()");
+        match error {
+            EngineError::AppInit { detail } => {
+                assert_eq!(detail, "kytrix-vulkan thread panicked");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            !shared.shutdown_requested(),
+            "a panic only terminates the thread, it does not fake a shutdown"
+        );
+    }
+
+    #[test]
+    fn a_normal_exit_does_not_overwrite_the_loop_error() {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        });
+        shared.publish_error(EngineError::Swapchain {
+            detail: SmolStr::new_static("recreate_swapchain_khr failed"),
+        });
+        // 正常退出：guard 被 disarm，不发布任何东西。
+        PanicGuard::new(Arc::clone(&shared)).disarm();
+        match shared.take_error().expect("the loop error stays visible") {
+            EngineError::Swapchain { detail } => {
+                assert!(detail.contains("recreate_swapchain_khr"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panic_keeps_an_already_published_error() {
+        let shared = Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        };
+        shared.publish_error(EngineError::DeviceLost {
+            reason: SmolStr::new_static("VK_ERROR_DEVICE_LOST"),
+            log_path: std::path::PathBuf::from("logs/vk.txt"),
+        });
+        shared.publish_panic();
+        match shared.take_error().expect("first error wins") {
+            EngineError::DeviceLost { reason, .. } => {
+                assert_eq!(reason, "VK_ERROR_DEVICE_LOST");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

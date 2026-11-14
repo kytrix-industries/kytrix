@@ -56,13 +56,22 @@ const OFFSCREEN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 /// 一帧异步提交的结果（窗口路径）。
 pub(crate) enum Submitted {
-    /// 已提交（可能已呈现）；`stats` / `samples` 是本帧的。
+    /// 已提交（可能已呈现）；`stats` / `samples` 是本帧的；`slot` 是提交用的 ring 槽与 timeline 值
+    /// （完成观测点据此 resolve GPU 采样，§4.1）。
     Presented {
         stats: RenderStats,
         samples: Vec<GpuTimerSample>,
+        slot: FrameSlot,
     },
     /// 本帧没有产生 GPU 工作（acquire 未就绪 / 刚重建 swapchain）：调用方保留帧请求重试。
     Retry,
+}
+
+/// 已提交、尚未被 timeline 确认完成的帧（timeline 信号值 → 序号）。
+#[derive(Clone, Copy)]
+struct InFlightFrame {
+    signal: u64,
+    index: FrameIndex,
 }
 
 /// 一个窗口的 GPU 渲染器（**GPU 线程独占**；离屏路径由门面同步调用）。
@@ -90,11 +99,11 @@ pub(crate) struct GpuRenderer {
     fresh: bool,
     /// 最后一次**真正提交**的帧序号（重建资源入 retire 队列时的 tag，§4.3）。
     last_index: FrameIndex,
-    /// 已提交、尚未被 timeline 确认完成的 `(signal 值, FrameIndex)`。
+    /// 已提交、尚未被 timeline 确认完成的 `(timeline 值, 序号)`。
     ///
     /// `FrameIndex` 有跳号（GPU 线程跳过的帧不产生 GPU 工作），因此不能用 timeline 值反推
     /// 序号：这里记下每个真正提交的帧，完成时直接拿到对应的真实序号。
-    submitted: VecDeque<(u64, FrameIndex)>,
+    submitted: VecDeque<InFlightFrame>,
     /// timeline 已确认完成的最大帧序号（retire 的推进点）。
     completed: FrameIndex,
     /// present 成功后需要重建 swapchain（`SUBOPTIMAL`，§7.3）。
@@ -343,17 +352,12 @@ impl GpuRenderer {
                 self.rebuild_swapchain = true;
             }
         }
-        self.submitted
-            .push_back((u64::from(request.index.get()), request.index));
-
-        // 非阻塞：读到的是该槽**最近一次**完成的 timestamp（GPU 可能还没完成本帧）。
-        if let Some(sample) = self
-            .timer
-            .as_ref()
-            .and_then(|timer| timer.resolve(slot.index))
-        {
-            timings.push(sample);
-        }
+        self.submitted.push_back(InFlightFrame {
+            signal: u64::from(request.index.get()),
+            index: request.index,
+        });
+        // GPU 采样**不在这里** resolve：该槽的 timestamp 可能还被在飞帧写；完成观测点
+        // （[`Self::resolve_frame_timer`]）只在 timeline 确认之后调用（§4.1）。
         let samples = timings.samples().to_vec();
 
         // SUBOPTIMAL：present 之后立刻重建（§7.3），旧 swapchain 进延迟销毁队列。
@@ -361,7 +365,11 @@ impl GpuRenderer {
             self.rebuild_swapchain = false;
             self.recreate_swapchain()?;
         }
-        Ok(Submitted::Presented { stats, samples })
+        Ok(Submitted::Presented {
+            stats,
+            samples,
+            slot,
+        })
     }
 
     /// 离屏 / 快照路径：提交一份跨线程快照并**同步**等完成（§4.5 的下半段）。
@@ -389,19 +397,21 @@ impl GpuRenderer {
 
     /// 窗口路径的非阻塞 retire 推进（GPU 循环每轮调用，I4）。
     ///
-    /// timeline 只在这里读（§7.2 硬规则 2：不用于 acquire/present）。旧 swapchain / 旧 persist
-    /// 在本方法里真正 drop —— 即「等对应帧完成之后才释放」。
-    pub(crate) fn drain_completed(&mut self) -> Result<(), EngineError> {
+    /// 返回 timeline 的完成值（`vkGetSemaphoreCounterValue`，**不等待**）。调用方按提交顺序
+    /// 发布 `signal <= 完成值` 的帧反馈 —— 与 retire 同一观测点（§4.1）。timeline 只在这里读
+    /// （§7.2 硬规则 2：不用于 acquire/present）。旧 swapchain / 旧 persist 在本方法里真正
+    /// drop —— 即「等对应帧完成之后才释放」。
+    pub(crate) fn drain_completed(&mut self) -> Result<u64, EngineError> {
         if self.swapchain.is_none() {
-            return Ok(());
+            return Ok(0);
         }
         let value = self.device.completed_value()?;
-        while let Some((signal, index)) = self.submitted.front().copied() {
-            if signal > value {
+        while let Some(frame) = self.submitted.front().copied() {
+            if frame.signal > value {
                 break;
             }
             self.submitted.pop_front();
-            self.completed = index;
+            self.completed = frame.index;
         }
         if self.completed != FrameIndex::default() {
             self.device.drain_retire(self.completed);
@@ -409,7 +419,15 @@ impl GpuRenderer {
             self.retired_swapchains
                 .retain(|(armed, _)| armed.is_none_or(|at| at > self.completed));
         }
-        Ok(())
+        Ok(value)
+    }
+
+    /// 该帧**完成之后**读它的 GPU 时间（fence / timeline 已确认，timestamp 不再被写）。
+    ///
+    /// 必须在完成观测点调用：提交点读到的可能仍是该槽上一帧的值（§4.1）。在飞 ≤ 1 的门禁
+    /// （`frame_ready`，§7.3）保证本槽在下一次录制覆盖 query 对之前已经被观测并发布。
+    pub(crate) fn resolve_frame_timer(&self, slot: usize) -> Option<GpuTimerSample> {
+        self.timer.as_ref().and_then(|timer| timer.resolve(slot))
     }
 
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
@@ -826,9 +844,13 @@ impl GpuRenderer {
                 &[],
                 &[to_src],
             );
+            // swapchain image 的首次使用是本次 layout transition + 整面 copy（都是 TRANSFER）：
+            // src/dst 都必须是 TRANSFER，才能排在 `image_available` 的 acquire wait（同样在
+            // TRANSFER 阶段）之后。用 `TOP_OF_PIPE` 会与 acquire 信号量没有依赖链，syncval 报
+            // `SYNC-HAZARD-WRITE-AFTER-READ`（F-168）。
             self.device.raw().cmd_pipeline_barrier(
                 command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -887,7 +909,10 @@ impl GpuRenderer {
             .map(|_| self.device.image_available(slot.index))
             .into_iter()
             .collect();
-        let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        // 第一次使用 swapchain image 的是 TRANSFER 阶段（layout transition + 整面 copy），
+        // 不是 `COLOR_ATTACHMENT_OUTPUT`（本后端不直接往 swapchain image 上画）。在错误的阶段
+        // 等待会让 acquire 与 copy 之间没有依赖链（F-168，§7.3）。
+        let stages = [vk::PipelineStageFlags::TRANSFER];
         let mut signals = Vec::with_capacity(2);
         if let Some(image_index) = image_index {
             let swapchain = self.swapchain.as_ref().expect("image implies swapchain");

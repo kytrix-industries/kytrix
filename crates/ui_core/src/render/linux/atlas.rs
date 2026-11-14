@@ -15,6 +15,12 @@ use crate::{
 pub(crate) const ATLAS_PAGE: u32 = 2048;
 
 /// 一张图集页。
+///
+/// **staging 只有一份**（设计假设：在飞 ≤ 1，§7.3）：`frame_ready` 门禁保证 UI 只在上一帧的
+/// `wl_callback.done` 之后才发布下一帧，而该回调意味着合成器已经取走上一帧的 image ——
+/// 其 `render_finished` 依赖的 copy 必然完成，CPU 写 staging 与 GPU 读 staging 不会重叠。
+/// 若将来放开在飞帧数，必须按帧槽拆分 staging（每槽一块，约 page²×texel 字节）或先等该帧
+/// fence 再写。
 struct AtlasTexture {
     image: vk::Image,
     /// image 的设备内存（与 `image` 成对释放）。

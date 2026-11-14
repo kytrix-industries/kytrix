@@ -310,7 +310,8 @@ impl Device {
             }
             .map_err(|error| init_error("create_fence", format!("{error:?}")))?;
         }
-        // 每帧槽一个二值信号量（§7.2）：acquire 时 signal、submit 时在 COLOR_ATTACHMENT_OUTPUT 等它。
+        // 每帧槽一个二值信号量（§7.2）：acquire 时 signal、submit 时在 TRANSFER 等它
+        // （swapchain image 的首次使用是 layout transition + 整面 copy，F-168）。
         // 它只属于帧槽（不属于 swapchain），所以重建 swapchain 时保留、无需重建。
         let mut image_available = [vk::Semaphore::null(); MAX_FRAMES_IN_FLIGHT];
         for semaphore in image_available.iter_mut() {
