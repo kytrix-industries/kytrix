@@ -15,7 +15,7 @@
 use std::{cell::Cell, time::Instant};
 
 use windows::Win32::{
-    Foundation::RECT,
+    Foundation::{HANDLE, RECT},
     Graphics::{
         Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
         Direct3D12::*,
@@ -205,12 +205,66 @@ impl GpuRenderer {
 
     /// 帧延迟 waitable（窗口路径的节奏原语，只有 GPU 线程等它）。
     pub(crate) fn waitable(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        debug_assert!(
+            on_gpu_thread(),
+            "the frame-latency waitable may only be waited on the kytrix-d3d12 thread"
+        );
         self.swapchain.as_ref().map(Swapchain::waitable)
+    }
+
+    /// 取本帧的 ring 槽（只读记账；提交成功后才推进）。
+    pub(crate) fn acquire_slot(&self, index: FrameIndex) -> FrameSlot {
+        debug_assert!(
+            on_gpu_thread(),
+            "window frame slots may only be acquired on the kytrix-d3d12 thread"
+        );
+        self.queue.acquire_slot(index)
+    }
+
+    /// 等本帧槽上一次提交完成（复用 allocator / timestamp 读回缓冲的前置条件）。
+    ///
+    /// 调用方紧接着要 [`GpuRenderer::resolve_frame_timer`] 读上一帧的 timestamp，因此这里等完
+    /// 之后必须先把上一帧的反馈发布掉，再录当前帧（否则 `ResolveQueryData` 会覆盖旧样本）。
+    pub(crate) fn wait_slot_fence(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "window slot fences may only be waited on the kytrix-d3d12 thread"
+        );
+        self.queue
+            .wait_slot_fence(slot.wait_value)
+            .map_err(|error| self.classify(error))
+    }
+
+    /// 请求 `ID3D12Fence::SetEventOnCompletion`：该帧 GPU 工作完成时置位 `event`（不轮询）。
+    pub(crate) fn set_completion_event(
+        &mut self,
+        signal_value: u64,
+        event: HANDLE,
+    ) -> Result<(), EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "completion events may only be armed on the kytrix-d3d12 thread"
+        );
+        self.queue
+            .set_completion_event(signal_value, event)
+            .map_err(|error| self.classify(error))
+    }
+
+    /// 队列 fence 的已完成值（非阻塞；完成通知的唯一判据）。
+    pub(crate) fn completed_value(&self) -> u64 {
+        debug_assert!(
+            on_gpu_thread(),
+            "the queue fence may only be observed on the kytrix-d3d12 thread"
+        );
+        self.queue.completed_value()
     }
 
     /// resize（§6.4）：先排空到「最后提交值」（**只等这一次**），复位全部命令列表丢弃对旧
     /// back buffer 的引用，`ResizeBuffers`（flag 原样）+ 重建 persist；旧 persist 入 retire
     /// 队列（I4），下次完成通知后释放。
+    ///
+    /// 每一步失败都走 [`GpuRenderer::classify`]（设备丢失优先归类）；调用方（GPU 循环）收到任何
+    /// 错误都会发布粘性错误并退出线程，不再「下一轮重试」（§6.6）。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         // 窗口目标（有 swapchain）的 resize 只能发生在 GPU 线程（§6.4）；离屏目标由门面同步调用。
         debug_assert!(
@@ -221,15 +275,24 @@ impl GpuRenderer {
         if size == self.surface {
             return Ok(());
         }
-        self.queue.wait_idle()?;
-        self.queue.reset_in_flight_lists()?;
-        if let Some(swapchain) = self.swapchain.as_mut() {
-            swapchain.resize(size)?;
-        }
+        self.queue
+            .wait_idle()
+            .map_err(|error| self.classify(error))?;
+        self.queue
+            .reset_in_flight_lists()
+            .map_err(|error| self.classify(error))?;
+        let resized = match self.swapchain.as_mut() {
+            Some(swapchain) => swapchain.resize(size),
+            None => Ok(()),
+        };
+        resized.map_err(|error| self.classify(error))?;
         // RTV 句柄由堆派生（堆是所有者；`Persist` 只缓存句柄本身）。
         // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
         let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
-        let old = self.persist.recreate(&mut self.device, size, rtv)?;
+        let old = self
+            .persist
+            .recreate(&mut self.device, size, rtv)
+            .map_err(|error| self.classify(error))?;
         self.queue.retire(self.last_index, old);
         self.surface = size;
         self.fresh = true;
@@ -247,7 +310,12 @@ impl GpuRenderer {
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
     ) -> Result<RenderStats, EngineError> {
+        let slot = self.queue.acquire_slot(index);
+        self.queue
+            .wait_slot_fence(slot.wait_value)
+            .map_err(|error| self.classify(error))?;
         let (stats, slot) = self.submit_recorded(
+            slot,
             index,
             payload.instances(),
             payload.clips(),
@@ -310,19 +378,25 @@ impl GpuRenderer {
 
     /// 提交一份跨线程帧快照（窗口路径：**不等** GPU 完成，I2）。
     ///
-    /// 调用方（GPU 循环）已经在渲染前等过 DXGI 的帧延迟 waitable（I3），并在
-    /// `request.surface` 变化时先调用 [`GpuRenderer::resize`]。
+    /// 调用方（GPU 循环）已经等过 DXGI 的帧延迟 waitable（I3）、并在 `request.surface` 变化时
+    /// 先调用 [`GpuRenderer::resize`]；`slot` 是调用方已等到上一帧完成、尚未复位的 ring 槽
+    /// （[`GpuRenderer::acquire_slot`] + [`GpuRenderer::wait_slot_fence`]）。
+    ///
+    /// 本方法**不**读 timestamp、不推进 retire：这两件事只允许在观察到该帧 fence 完成之后做
+    /// （[`GpuRenderer::resolve_frame_timer`] / [`GpuRenderer::release_completed`]，§4.1 / §6.5）。
     pub(crate) fn submit_frame(
         &mut self,
         request: &FrameRequest,
         frame: &mut FramePlan,
+        slot: FrameSlot,
     ) -> Result<(RenderStats, Vec<GpuTimerSample>), EngineError> {
         debug_assert!(
             on_gpu_thread(),
             "D3D12 window frames may only be submitted on the kytrix-d3d12 thread"
         );
         let mut timings = FrameTimings::new();
-        let (stats, slot) = self.submit_recorded(
+        let (stats, _) = self.submit_recorded(
+            slot,
             request.index,
             request.payload.instances(),
             request.payload.clips(),
@@ -356,22 +430,35 @@ impl GpuRenderer {
             cpu_ns: elapsed_ns(present_started),
             gpu_ns: 0,
         });
-        // 非阻塞：读到的是该槽**最近一次**完成的 timestamp（GPU 可能刚完成本帧，也可能还差一帧）。
-        if let Some(sample) = self
-            .timer
-            .as_ref()
-            .and_then(|timer| timer.resolve(slot.index))
-        {
-            timings.push(sample);
-        }
-        // I4：只把 fence 已到达的帧所引用的旧资源交回 device。
-        self.queue.release_completed(&mut self.device);
         Ok((stats, timings.samples().to_vec()))
     }
 
-    /// 录制 + 提交一帧（不呈现、不等完成）。返回本帧槽位供调用方等 fence / 呈现。
+    /// 观察完成之后读本槽的 GPU 时间（`timestamp` 读回缓冲此时不再被 GPU 写）。
+    ///
+    /// 调用前置条件：该槽的 fence 已完成（[`GpuRenderer::wait_slot_fence`] 或
+    /// [`GpuRenderer::completed_value`] 越过其 signal 值）。
+    pub(crate) fn resolve_frame_timer(&self, slot: usize) -> Option<GpuTimerSample> {
+        debug_assert!(
+            on_gpu_thread(),
+            "GPU timestamps may only be resolved on the kytrix-d3d12 thread"
+        );
+        self.timer.as_ref()?.resolve(slot)
+    }
+
+    /// **非阻塞**推进 retire：fence 已到达的帧（含被跳过的序号，§4.3）及更早的句柄交回
+    /// `device` 真正释放。只在观察到完成之后调用（I4）。
+    pub(crate) fn release_completed(&mut self) {
+        debug_assert!(
+            on_gpu_thread(),
+            "the retire queue may only be advanced on the kytrix-d3d12 thread"
+        );
+        self.queue.release_completed(&mut self.device);
+    }
+
+    /// 录制 + 提交一帧（不呈现、不等完成）。调用方先取槽并等该槽上一帧完成（§6.5）。
     fn submit_recorded(
         &mut self,
+        slot: FrameSlot,
         index: FrameIndex,
         instances: &[u8],
         clips: &[GpuClipEntry],
@@ -391,10 +478,6 @@ impl GpuRenderer {
         );
         let frame_started = Instant::now();
 
-        let slot = self.queue.acquire_slot(index);
-        self.queue
-            .wait_slot_fence(slot.wait_value)
-            .map_err(|error| self.classify(error))?;
         self.queue
             .reset_slot(slot)
             .map_err(|error| self.classify(error))?;
@@ -436,12 +519,19 @@ impl GpuRenderer {
     }
 
     /// 图集上传入口：P09 的字形页（整页）与 P15 的图片页共用（GPU 线程消费）。
+    ///
+    /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
+    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        pixels: &[u8],
+        pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
+        debug_assert!(
+            self.swapchain.is_none() || on_gpu_thread(),
+            "window atlas uploads may only be queued on the kytrix-d3d12 thread"
+        );
         self.atlas.queue_upload(kind, pixels, rows);
     }
 
@@ -620,7 +710,7 @@ impl FrameRecorder<'_> {
                 }
             }
             if let Some(swapchain) = self.swapchain {
-                copy_to_back(list, self.persist, swapchain, frame.copy_plan())?;
+                copy_to_back(list, self.persist, swapchain, copy_plan(*frame))?;
             }
             if let Some(timer) = self.timer {
                 timer.end(list, slot.index);
@@ -883,6 +973,21 @@ fn draw_ops(
         }
     }
     Ok(draw_calls)
+}
+
+/// copy 到 back buffer 的范围：`fresh`（新建 / resize 后首帧）时强制全量。
+///
+/// 只有 D3D12 后端需要这个规则（F-121：Metal / Vulkan 的 present 目标跨帧内容无保证，两平台
+/// 每帧整面写入）。`present_dirty() == None` 恰好同时覆盖 `fresh` 与 `Plan::Full`；`Idle` 必须
+/// 单独先判，否则会被当成全量。
+fn copy_plan(frame: FramePlan) -> Plan {
+    if frame.is_idle() {
+        return Plan::Idle;
+    }
+    match frame.present_dirty() {
+        Some(damage) => Plan::Partial(damage),
+        None => Plan::Full,
+    }
 }
 
 fn copy_to_back(
@@ -1165,7 +1270,7 @@ mod tests {
         core::PCWSTR,
     };
 
-    use super::{GpuRenderer, geometry_root, root_uniform};
+    use super::{GpuRenderer, copy_plan, geometry_root, root_uniform};
     use crate::{
         math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
         paint::{
@@ -1270,6 +1375,25 @@ mod tests {
         assert_eq!(uniform[8], 1.0);
         assert_eq!(uniform[11], 1.0);
         assert_eq!(uniform.len(), 28);
+    }
+
+    /// D3D12 的 copy 范围：`fresh` 时全量，`presented()` 之后恢复局部（等价覆盖原共享层单测）。
+    #[test]
+    fn a_fresh_swapchain_forces_a_full_copy_until_presented() {
+        let rect = PhysicalRect::new(0, 0, 10, 10);
+        let partial = partial_plan(&[rect], (100, 50)).plan();
+        assert!(matches!(partial, Plan::Partial(_)));
+        let mut frame = FramePlan::new(partial, true);
+        assert_eq!(copy_plan(frame), Plan::Full, "fresh ⇒ 全量 copy");
+        frame.presented();
+        assert_eq!(copy_plan(frame), partial, "present 成功后恢复局部 copy");
+        assert_eq!(copy_plan(FramePlan::new(Plan::Full, false)), Plan::Full);
+        assert_eq!(copy_plan(FramePlan::new(Plan::Idle, false)), Plan::Idle);
+        assert_eq!(
+            copy_plan(FramePlan::new(Plan::Idle, true)),
+            Plan::Full,
+            "fresh 的空帧仍然要全量 copy"
+        );
     }
 
     /// 逐 dword 对照 `common.hlsl` 的 `GeometryDrawUniform`（B1）。
@@ -1521,7 +1645,7 @@ mod tests {
         }
         let mut rows = crate::render::atlas::DirtyRows::default();
         rows.mark(0, page);
-        renderer.queue_atlas_upload(AtlasKind::Image, &pixels, rows);
+        renderer.queue_atlas_upload(AtlasKind::Image, pixels, rows);
 
         let tile = AtlasTile {
             atlas: AtlasKind::Image,
@@ -1567,7 +1691,7 @@ mod tests {
         }
         let mut rows = crate::render::atlas::DirtyRows::default();
         rows.mark(0, page);
-        renderer.queue_atlas_upload(AtlasKind::Glyph, &pixels, rows);
+        renderer.queue_atlas_upload(AtlasKind::Glyph, pixels, rows);
         let tile = AtlasTile {
             atlas: AtlasKind::Glyph,
             u0: 1.0 / page as f32,

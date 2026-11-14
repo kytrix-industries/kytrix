@@ -374,18 +374,25 @@ waitable = chain2.GetFrameLatencyWaitableObject();
 ```text
 loop {
     // 两个等待点，各自消费自己的对象，绝不在同一帧里重复等 waitable（auto-reset，重复等会白等一个 vsync）
-    if !has_pending_frame() { WaitForSingleObject(work_event, INFINITE); }   // 空闲：睡到有活
+    drain_completed();                                       // 观察到完成：发布反馈 + retire（见下）
+    if shutdown { break; }
+    if !has_pending_frame() {
+        // 空闲：work（新帧/关闭）或 completion（在飞帧完成）任一到达；两者都是 auto-reset。
+        WaitForMultipleObjects([work_event, completion_event], INFINITE);
+        continue;
+    }
+    // ① 呈现背压：DXGI 的官方要求——每帧开始渲染前等 waitable（含 resize 后的第一帧）。
+    //    阻塞发生在 GPU 线程，最多一个 vsync。等待期间 completion 到达 ⇒ 先 drain 再继续等同一个
+    //    waitable（auto-reset 只能消费一次）。**先等 waitable 再取帧**：渲染的是「此刻最新」的
+    //    快照，而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
+    WaitForMultipleObjects([waitable, completion_event], INFINITE);   // completion 分支先 drain
     if shutdown { break; }
     let Some(frame) = take_latest_frame() else { continue };
-    if frame.surface != surface { resize_pending = Some(frame.surface); }
-    if let Some(size) = resize_pending { do_resize(size); }   // 见 §6.4
-
-    // ① 呈现背压：DXGI 的官方要求——每帧开始渲染前等 waitable（含 resize 后的第一帧）。
-    //    阻塞发生在 GPU 线程，最多一个 vsync。
-    WaitForSingleObject(waitable, INFINITE);
+    if frame.surface != surface { do_resize(frame.surface)?; }   // 见 §6.4；任何错误 ⇒ 显式失败
 
     let slot = ring.acquire(frame.index);
     queue.wait_slot_fence(slot);                            // 复用 allocator 前必须等（通常已完成）
+    drain_completed();                                      // 该槽上一帧的 timestamp 必须在被覆盖前读走
     queue.reset_allocator_list(slot);
     record(list, slot, &frame);                             // upload / draw persist / copy to backbuffer
     list.Close();
@@ -393,13 +400,28 @@ loop {
     queue.Signal(fence, slot.signal_value);                 // 提交序号
     swapchain.present1(&mut frame_plan, /*sync*/ 1);        // 异步；失败分类见 §6.6
     frame_plan.presented();
-    queue.release_completed(frame.index, &mut device);      // retire
-    publish_feedback(...);
+    // 不在提交点发布反馈：把本帧的统计与发布时刻记账，等 fence 的完成通知。
+    pending.push_back({ index, stats, cpu_samples, published_at });
+    fence.SetEventOnCompletion(slot.signal_value, completion_event);
 }
+
+// 只允许在「观察到该帧完成」之后执行（fence 值 / SetEventOnCompletion 醒来）：
+drain_completed():
+    while pending.front().signal_value <= fence.GetCompletedValue():
+        frame = pending.pop_front();
+        samples = frame.cpu_samples + timer.resolve(frame.slot);   // 该槽的 timestamp 不再被写
+        completed_at = Instant::now();
+        publish_feedback(FrameFeedback {
+            index, stats, samples,
+            completed_at,                                          // GPU 线程观察到完成
+            latency: completed_at - frame.published_at,
+        });
+    queue.release_completed(&mut device);                      // retire（同一观测点，推进到已完成值）
 ```
 
 - `Present1(1, 0, dirty)`：`sync=1` 保持 vsync（与 macOS `displaySyncEnabled`、Vulkan `MAILBOX` 的观感一致：不撕裂）；dirty rect 语义完全沿用 `FramePlan`（`fresh` ⇒ 全量、矩形必须夹紧，F-72 三条继续成立）。
 - 不在 UI 线程调用任何 DXGI/D3D12 的等待函数；UI 线程只在 `WM_SIZE` 更新 `Window` 尺寸并 `wake`，新尺寸随下一帧的 `FrameRequest.surface` 到达（§4.4）。
+- 反馈与 retire 都只在完成观测点推进：提交点只做 `SetEventOnCompletion`（§4.1 的跨平台契约；`completed_at` 不是 `Present1` 返回的时刻）。
 - 录制仍在一条 direct list 上（单线程录制；D3D12 的 list 本来就不是自由线程的，官方模型是「list 可并发录制、队列串行提交」，我们只有一条录制流，不需要多 list）。
 
 ### 6.4 resize 协议（GPU 线程）
@@ -434,8 +456,15 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 | 症状 | 处理 |
 |---|---|
 | `Present1` 返回 `DXGI_ERROR_DEVICE_REMOVED` / `DEVICE_RESET` | 粘性 `EngineError::DeviceLost`，通知 UI，停止线程 |
-| `ResizeBuffers` 返回 `DXGI_ERROR_INVALID_CALL` | 说明还有引用/未等完成：记 `EngineError::Swapchain`，下一轮重试（不 panic） |
+| `ResizeBuffers` 返回 `DXGI_ERROR_INVALID_CALL`（或 resize 链上任何其它错误） | **显式失败**：`GpuRenderer::resize` 的每一步都先走 `classify()`（DeviceLost 优先归类），GPU 循环收到任何 resize 错误都 `publish_error` + 置粘性错误 + 退出线程。**不重试、不丢弃已取走的帧**（与 Linux/macOS 一致） |
 | 最小化/遮挡 | 正常 `Present1`（DWM 丢弃）；不额外节流（waitable 自己会回到可用状态） |
+
+`ResizeBuffers` 的 `DXGI_ERROR_INVALID_CALL` 只可能来自「还有引用 / GPU 未完成」这类**实现错误**：
+本设计的前置条件（§6.4 的 `wait_fence(last_signal)` + `reset_in_flight_lists()` + 按帧重新
+`GetBuffer`）已经保证二者成立，用户输入无法触发它。因此「下一轮重试」是错误策略：surface 已经
+变化而目标没有重建，每一帧都会在同一个调用上失败，UI 只会看到画面不再更新（无声失败）；重试
+也掩盖了真正的引用泄漏。把 resize 错误统一成显式失败后，「不静默、不冻结、不丢帧」三条同时
+成立：UI 在 `poll_renderer` 里拿到粘性错误并退出。
 
 ### 6.7 主线程职责
 
@@ -584,7 +613,7 @@ recreate_swapchain():
 | 平台 | 调用 | 上界 | 为什么可接受 |
 |---|---|---|---|
 | Metal | `dispatch_semaphore_wait(NOW)` | 0（失败即跳帧） | 不阻塞 |
-| D3D12 | `WaitForMultipleObjectsEx(work, waitable)` | 一个 vsync | GPU 线程就是呈现线程，这是它该等的地方 |
+| D3D12 | `WaitForMultipleObjects(work, completion)`（空闲）/ `(waitable, completion)`（渲染前） | 一个 vsync | GPU 线程就是呈现线程，这是它该等的地方；completion 分支只用来及时发布反馈 |
 | D3D12 | 槽 fence | 该帧 GPU 时间 | 复用 allocator 的前置条件 |
 | D3D12 | `ResizeBuffers` | 分配 + 释放旧缓冲 | 已保证 GPU 完成、无引用 |
 | Vulkan | `vkAcquireNextImageKHR(100ms)` | 一个 vsync（合成器节流）；超时回循环 | 这就是 Vulkan 的节奏原语；有限超时只用来响应 shutdown |
@@ -739,6 +768,14 @@ SubAgent 落实的条目单独标「实现修订中」（§15.3）。
 | retire 跨过被跳过的序号（P2） | 补单测：提交 1/3/5（2、4 被跳过），`on_completed(4)` 只释放 `retire_at <= 4` 的 1/3，5 保留；`on_completed(5)` 再释放 5（§4.3 / §10.1） |
 | `needs_continuous_frames`（P2） | 重写为单一表达式（去掉 `if … { return true }`），修复新 nightly 的 `clippy::needless_bool`（Linux/macOS 的 `-D warnings` 会因此失败） |
 | 打包最低系统版本（P2） | `Packager.toml` 增加 `[macos] minimumSystemVersion = "14.0"`，与 `.cargo/config.toml` 的 `MACOSX_DEPLOYMENT_TARGET` 一致 |
+| Windows 反馈发布点（P2） | `FrameFeedback` 改为 GPU 线程**观察到 fence 完成**时发布：提交时把 `{index, stats, CPU samples, published_at, signal}` 入 pending 队列，`SetEventOnCompletion` + `WaitForMultipleObjects([work_event, completion_event])` 明确唤醒（不轮询）；完成观测点按提交顺序发布、在同一处 resolve GPU 采样并推进 retire。`latency = completed_at - published_at`，两者同源（§4.1 / §6.5） |
+| Windows resize 显式失败（P2，原 P1 症状） | `GpuRenderer::resize` 每一步都 `classify()`；GPU 循环收到任何 resize 错误都 `publish_error` + 粘性错误 + 退出线程，不再 `continue` 丢帧（§6.6） |
+| Windows 关闭握手（P2） | 删除 `JOIN_TIMEOUT` 与 2 s detach：`MsgWaitForMultipleObjects(... INFINITE ...)` 边泵消息边等 GPU 线程句柄（仅 `WAIT_FAILED` 记录后放弃，§6.7 / F-169） |
+| Windows 图集所有权与校验（P2） | `GpuRenderer::queue_atlas_upload` / `AtlasTextures::queue_upload` 改收 `Vec<u8>` 并**按所有权移动**（去掉槽 → 纹理的第二次 16 MiB 拷贝）；整页尺寸校验 `debug_assert_eq!` → 始终生效的 `assert_eq!`（release 下不再越界读） |
+| Windows GPU 线程断言（P2） | 窗口路径入口补 `debug_assert!(on_gpu_thread())`（`waitable` / `queue_atlas_upload` / `acquire_slot` / `wait_slot_fence` / `set_completion_event` / `completed_value` / `resolve_frame_timer` / `release_completed`）；离屏路径不加 |
+| Windows `Swapchain::size`（P2） | 只写不读的死字段删除 |
+| 共享层 `cfg(windows)` 清零（P2） | `FramePlan::copy_plan` 移到 `render/windows/compositor.rs`（等价单测随迁）；`InFlightRing::reserve` 删除，`Queue::submit_immediate` 改用槽 0 的真实 fence 记账 |
+| Windows resize 测试 fixture（P2） | `minimum_size_clamps_the_dragged_edge` 的抓取点改为左边缘 `(100, 300)`（`session()` 显式收 cursor）；生产 clamp 逻辑未改 |
 
 ### 15.2 仍未闭环
 
@@ -748,15 +785,17 @@ SubAgent 落实的条目单独标「实现修订中」（§15.3）。
   `VK_EXT_device_fault` / Metal 错误注入的实机用例。
 - **多窗口**（§10.2）：每窗口一条 GPU 线程的结构已就位，但「一个窗口 resize 不影响另一个
   窗口帧率」未实测。
-- **HUD 实机数值**（§10.3）：`Latency` 行与 publish→present 的 58–60 fps 口径未在三平台
-  实机上采样记录。
+- **HUD 实机数值**（§10.3）：Windows 已采样（demo + HUD：64 fps、`Latency` ≈ 7–9 ms，跨 10 s
+  不增长；其中完成观测点本身 ≈ 0.1 ms，其余是 waitable 的 vsync 排队——I3 的既有语义）；
+  macOS/Linux 尚未采样。
 
 ### 15.3 实现修订中
 
 以下条款的**文档**已按修订后的语义改写，平台代码由后续 SubAgent 落实：
 
-- §6.7 / §7.7 的关闭握手：不再「2 s 超时后 detach」；UI 线程在关闭时允许等待 GPU 线程退出
-  （Windows 用消息泵无限等，Linux/macOS 直接 `join`，有界于 `acquire` 的 100 ms 超时），F-169。
+- §7.7 的关闭握手（Linux/macOS 部分）：Windows 已落实（`MsgWaitForMultipleObjects` 无限边泵
+  边等，见 §15.1）；Linux/macOS 的 `Renderer::drop` 仍是 `recv_timeout` 2 s 后 detach，需改为
+  直接 `join`（有界于 `acquire` 的 100 ms 超时），F-169。
 - §7.3 的 `image_available` wait stage：平台代码的「先等槽 fence、再 acquire」顺序已与本文一致，
   但 wait stage 仍是 `COLOR_ATTACHMENT_OUTPUT`，需改为 `TRANSFER`（F-168）。
 

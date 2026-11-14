@@ -20,20 +20,22 @@
 //!
 //! 关窗握手（§6.7）：UI 线程**不能**直接 `join` —— DXGI 的 `Present` 可能同步 `SendMessage`
 //! 到窗口的消息泵线程，直接 join 会和「消息泵停转」互等。`Drop` 用 `MsgWaitForMultipleObjects`
-//! 边泵消息边等 GPU 线程句柄，2 秒超时后放弃 join。
+//! 边泵消息边等 GPU 线程句柄，**没有超时**（无限等到线程退出；只有 `WAIT_FAILED` 这类异常才
+//! 记录并放弃）。
 
 use std::{
+    collections::VecDeque,
     os::windows::io::AsRawHandle,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use smol_str::{SmolStr, format_smolstr};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
-    System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject},
+    System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects},
     UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostQuitMessage,
         QS_ALLINPUT, TranslateMessage, WM_QUIT,
@@ -43,7 +45,7 @@ use windows::Win32::{
 #[cfg(feature = "test-support")]
 use crate::paint::instance::InstanceBuffer;
 #[cfg(feature = "hud")]
-use crate::render::timer::{GpuTimerSample, Section};
+use crate::render::timer::Section;
 #[cfg(feature = "test-support")]
 use crate::render::windows::readback::ReadbackImage;
 use crate::{
@@ -52,8 +54,8 @@ use crate::{
     render::{
         DirtyRows, RenderStats,
         compositor::FramePlan,
-        frame::{FrameFeedback, FrameRequest, LatestFrame},
-        timer::FrameTimings,
+        frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
+        timer::{FrameTimings, GpuTimerSample},
         windows::{
             compositor::{GpuRenderer, enter_gpu_thread},
             device::init_error_from,
@@ -61,9 +63,6 @@ use crate::{
     },
     window::FrameIndex,
 };
-
-/// 关闭握手的等待上限（§6.7）。
-const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 门面：窗口路径是「最新帧槽 + GPU 线程句柄」，离屏路径是同步渲染器。
 ///
@@ -158,7 +157,7 @@ impl Renderer {
     /// 把一页图集像素交给 GPU 线程（每 `AtlasKind` 只留最新，§4.2）。
     pub(crate) fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
         match &mut self.target {
-            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels, rows),
+            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels.to_vec(), rows),
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
         }
     }
@@ -274,13 +273,25 @@ struct WindowRenderer {
 
 impl WindowRenderer {
     fn new(gpu: GpuRenderer, size: (u32, u32)) -> Result<Self, EngineError> {
-        // `CreateEventW` 需要 `Win32_Security` feature（DEVIATIONS F-79）；auto-reset。
+        // `CreateEventW` 需要 `Win32_Security` feature（DEVIATIONS F-79）；两个都是 auto-reset。
         // SAFETY: 无名称的 auto-reset 事件；句柄由 `Shared` 独占并在最后一个引用释放时关闭。
         let work = unsafe { CreateEventW(None, false, false, None) }
             .map_err(|error| init_error_from("CreateEventW(work)", error))?;
+        // SAFETY: 同上；失败时先关闭已经创建的 `work`，不泄漏句柄。
+        let completion = match unsafe { CreateEventW(None, false, false, None) } {
+            Ok(event) => event,
+            Err(error) => {
+                // SAFETY: `work` 由本函数独占，尚未交给 `Shared`。
+                unsafe {
+                    let _ = CloseHandle(work);
+                }
+                return Err(init_error_from("CreateEventW(completion)", error));
+            }
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work,
+            completion,
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -365,17 +376,21 @@ struct Shared {
     state: Mutex<State>,
     /// `publish` / 关闭之后的唤醒原语（auto-reset）。
     work: HANDLE,
+    /// 在飞帧的 fence 完成通知（auto-reset；GPU 线程用 `SetEventOnCompletion` 设置）。
+    completion: HANDLE,
 }
 
-// SAFETY: `work` 是进程范围的内核事件句柄；事件对象本身线程安全，`SetEvent` /
-// `WaitForSingleObject` 允许跨线程使用。句柄由 `Shared::drop` 在最后一个引用释放时关闭。
+// SAFETY: `work` / `completion` 是进程范围的内核事件句柄；事件对象本身线程安全，
+// `SetEvent` / `WaitForMultipleObjects` 允许跨线程使用。句柄由 `Shared::drop` 在最后一个
+// 引用释放时关闭。
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // SAFETY: 句柄由本结构独占，最后一个引用释放时关闭一次。
+        // SAFETY: 两个句柄都由本结构独占，最后一个引用释放时各关闭一次。
         unsafe {
+            let _ = CloseHandle(self.completion);
             let _ = CloseHandle(self.work);
         }
     }
@@ -533,109 +548,200 @@ impl Shared {
     }
 }
 
+/// 已提交、尚未观察到 fence 完成的帧（提交顺序 = 反馈发布顺序，§4.1）。
+struct SubmittedFrame {
+    index: FrameIndex,
+    stats: RenderStats,
+    /// 提交时的 CPU 采样（Upload / Present）；GPU 采样在完成观测点追加。
+    samples: Vec<GpuTimerSample>,
+    /// HUD 的 `latency` 起点（`FrameRequest::published_at`）。
+    published_at: Instant,
+    signal_value: u64,
+    /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
+    slot: usize,
+}
+
 /// GPU 线程主循环（§6.3）。
 fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
-    loop {
-        // 空闲：睡在 work event 上（**没有**待画帧时不等 waitable，I3 的「每帧恰好一次」）。
-        if !shared.has_pending_frame() {
-            // SAFETY: work event 由 `Shared` 持有，UI 线程的 `Drop` 在 join 之后才释放它。
-            unsafe { WaitForSingleObject(shared.work, INFINITE) };
-        }
-        if shared.shutdown_requested() {
-            break;
-        }
-        let Some(request) = shared.take_frame() else {
-            continue;
-        };
-        // 图集像素在本帧录制前落地（上传先于绘制，§4.2）。
-        for upload in shared.take_atlas().into_iter().flatten() {
-            renderer.queue_atlas_upload(upload.kind, &upload.pixels, upload.rows);
-        }
-        // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
-        if request.surface != renderer.surface() {
-            match renderer.resize(request.surface) {
-                Ok(()) => {}
-                Err(error) if matches!(&error, EngineError::DeviceLost { .. }) => {
-                    shared.publish_error(error);
-                    break;
-                }
-                Err(_) => {
-                    // §6.6：非设备丢失的 swapchain 失败（如 `DXGI_ERROR_INVALID_CALL`）不 panic、
-                    // 不忙等：本帧放弃，下一次发布的帧会再比较 surface 并重试。重试成功的那一帧
-                    // 强制全量（`fresh`），所以被放弃帧的 damage 不会留下错误像素。
-                    continue;
-                }
-            }
-        }
-        // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
-        let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
-        if frame.is_idle() {
-            continue;
-        }
-        // I3：每帧渲染前**恰好**等一次 waitable（含首帧、含 resize 后首帧）。
-        if let Some(waitable) = renderer.waitable() {
-            // SAFETY: waitable 由该 swapchain 独占持有，只在 GPU 线程等待。
-            unsafe { WaitForSingleObject(waitable, INFINITE) };
-        }
-        match renderer.submit_frame(&request, &mut frame) {
-            Ok((stats, samples)) => shared.publish_feedback(FrameFeedback {
-                index: request.index,
-                stats,
-                samples,
-                // UI 发布 → GPU 完成（当前发布点在 present 返回后）。
-                latency: Instant::now().saturating_duration_since(request.published_at),
-                // 命令列表完成时刻（近似呈现时刻）。
-                completed_at: Instant::now(),
-            }),
-            Err(error) => {
-                shared.publish_error(error);
-                break;
-            }
-        }
+    let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
+    if let Err(error) = run_gpu_loop(&mut renderer, &shared, &mut submitted) {
+        shared.publish_error(error);
     }
     shared.mark_terminated();
     // 离开作用域时 `GpuRenderer` 被 drop：等 GPU 完成、丢掉 back buffer 引用，再销毁
     // swapchain / 设备（§6.7 的关闭顺序）。
 }
 
-/// 边泵消息边等 GPU 线程退出（§6.7），超时后放弃 join。
+fn run_gpu_loop(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    submitted: &mut VecDeque<SubmittedFrame>,
+) -> Result<(), EngineError> {
+    loop {
+        // 完成通知的唯一处理点：按提交顺序发布反馈 + 推进 retire（§4.1 / §6.5）。
+        drain_completed(renderer, shared, submitted);
+        if shared.shutdown_requested() {
+            return Ok(());
+        }
+        if !shared.has_pending_frame() {
+            // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
+            // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
+            wait_for_work_or_completion(shared)?;
+            continue;
+        }
+        // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
+        // 渲染的是最新快照而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
+        // 等待期间 completion 也可能到达：先发布反馈再继续等同一个 waitable（auto-reset 只能
+        // 消费一次，不能「等到了又重等」）。
+        wait_for_waitable(renderer, shared, submitted)?;
+        if shared.shutdown_requested() {
+            return Ok(());
+        }
+        let Some(request) = shared.take_frame() else {
+            continue;
+        };
+        // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
+        for upload in shared.take_atlas().into_iter().flatten() {
+            renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
+        }
+        // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
+        // §6.6：任何 resize 错误（含非设备丢失的 `DXGI_ERROR_INVALID_CALL`）都是显式失败——
+        // 不重试、不丢帧：发布粘性错误并退出线程（与 Linux/macOS 一致）。
+        if request.surface != renderer.surface() {
+            renderer.resize(request.surface)?;
+        }
+        // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
+        let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
+        if frame.is_idle() {
+            continue;
+        }
+        let slot = renderer.acquire_slot(request.index);
+        renderer.wait_slot_fence(slot)?;
+        // 该槽的上一帧刚被等到：在录制覆盖它的 timestamp 读回缓冲**之前**发布它的反馈
+        // （`ResolveQueryData` 的写入与 CPU 读回共用这一块缓冲，必须按完成顺序串行化）。
+        drain_completed(renderer, shared, submitted);
+        let (stats, samples) = renderer.submit_frame(&request, &mut frame, slot)?;
+        submitted.push_back(SubmittedFrame {
+            index: request.index,
+            stats,
+            samples,
+            published_at: request.published_at,
+            signal_value: slot.signal_value,
+            slot: slot.index,
+        });
+        // 明确唤醒：该帧 GPU 工作完成时 fence 置位 `completion`（auto-reset），不忙轮询。
+        renderer.set_completion_event(slot.signal_value, shared.completion)?;
+    }
+}
+
+/// 发布已观察到完成的帧（提交顺序）并推进 retire。
+fn drain_completed(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    submitted: &mut VecDeque<SubmittedFrame>,
+) {
+    let completed = renderer.completed_value();
+    let mut observed = false;
+    while submitted
+        .front()
+        .is_some_and(|frame| frame.signal_value <= completed)
+    {
+        let frame = submitted.pop_front().expect("front was checked above");
+        let mut samples = frame.samples;
+        if let Some(sample) = renderer.resolve_frame_timer(frame.slot) {
+            samples.push(sample);
+        }
+        // 观察到完成的时刻（fence / `SetEventOnCompletion` 醒来），不是 Present 返回的时刻。
+        let completed_at = Instant::now();
+        shared.publish_feedback(FrameFeedback {
+            index: frame.index,
+            stats: frame.stats,
+            samples,
+            completed_at,
+            // UI 发布 → GPU 完成（HUD 的 publish→present）。
+            latency: completed_at.saturating_duration_since(frame.published_at),
+        });
+        observed = true;
+    }
+    if observed {
+        // I4：只把 fence 已到达的帧所引用的旧资源交回 device。
+        renderer.release_completed();
+    }
+}
+
+/// 空闲等待：`[work_event, completion_event]`（都是 auto-reset，不会自旋）。
+fn wait_for_work_or_completion(shared: &Shared) -> Result<(), EngineError> {
+    wait_for_pair(shared.work, shared.completion, "work, completion").map(|_| ())
+}
+
+/// 等帧延迟 waitable；期间 completion 到达就先发布反馈、再继续等（不把反馈拖到下一帧）。
+///
+/// waitable 是 auto-reset：一旦这个循环消费了它，本帧就不允许再等第二次（否则会白等一个
+/// vsync），因此返回 `Ok` 之后调用方直接开始录制。
+fn wait_for_waitable(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    submitted: &mut VecDeque<SubmittedFrame>,
+) -> Result<(), EngineError> {
+    let Some(waitable) = renderer.waitable() else {
+        return Ok(());
+    };
+    loop {
+        if wait_for_pair(waitable, shared.completion, "waitable, completion")? == 0 {
+            return Ok(());
+        }
+        drain_completed(renderer, shared, submitted);
+    }
+}
+
+/// `WaitForMultipleObjects([low, high])`；返回被 signal 的句柄下标（0 或 1）。
+fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<usize, EngineError> {
+    // SAFETY: 两个句柄都由 `Shared`（或 swapchain）持有，调用方保证它们的生命周期覆盖本次等待。
+    let wait = unsafe { WaitForMultipleObjects(&[low, high], false, INFINITE) };
+    match wait.0 {
+        0 => Ok(0),
+        1 => Ok(1),
+        // 无超时 + 无 mutex：只剩 `WAIT_FAILED`（或驱动返回的异常值）。
+        _ => Err(EngineError::AppInit {
+            detail: format_smolstr!(
+                "WaitForMultipleObjects({label}) failed: {wait:?} ({})",
+                std::io::Error::last_os_error()
+            ),
+        }),
+    }
+}
+
+/// 边泵消息边等 GPU 线程退出（§6.7），**没有超时**。
 ///
 /// 不能直接 `join`：DXGI 的 `Present` 可能同步 `SendMessage` 到本线程的消息泵，而本线程正在
 /// join 里等 GPU 线程 —— 互等。这里用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）在
-/// 等待期间继续派发消息。
+/// 等待期间继续派发消息，直到线程句柄 signaled；只有 `WAIT_FAILED` 这类异常才记录并放弃。
 fn join_with_message_pump(thread: JoinHandle<()>) {
     // `JoinHandle` 的平台句柄在 join / drop 之前有效；这里只读它（RawHandle 是 Copy）。
     let handle = HANDLE(thread.as_raw_handle());
-    let deadline = Instant::now() + JOIN_TIMEOUT;
-    let mut exited = false;
     let mut quit = None;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: `handle` 由 `thread` 持有；`QS_ALLINPUT` 只观察本线程的消息队列。
         let wait =
-            unsafe { MsgWaitForMultipleObjects(Some(&[handle]), false, millis, QS_ALLINPUT) };
+            unsafe { MsgWaitForMultipleObjects(Some(&[handle]), false, INFINITE, QS_ALLINPUT) };
         if wait == WAIT_OBJECT_0 {
-            exited = true;
+            let _ = thread.join();
             break;
         }
         if wait.0 == WAIT_OBJECT_0.0 + 1 {
-            // 有消息：先派发，再重新计算剩余时间（关闭期间窗口仍然存活）。
+            // 有消息：先派发，再继续等（关闭期间窗口仍然存活）。
             quit = pump_messages().or(quit);
             continue;
         }
-        // 其余（WAIT_TIMEOUT / WAIT_FAILED / WAIT_ABANDONED_*）：超时或异常，放弃等待。
-        break;
-    }
-    if exited {
-        let _ = thread.join();
-    } else {
-        // 放弃 join（线程可能卡在驱动的等待里）：detach，避免把 UI 线程一起拖死。
+        // 异常（`WAIT_FAILED`；无超时 + 无 mutex，不会出现 `WAIT_TIMEOUT` / `WAIT_ABANDONED_*`）：
+        // 记录后放弃 join，避免把 UI 线程一起拖死。`thread` 在此 drop（detach）。
         eprintln!(
-            "kytrix: the kytrix-d3d12 thread did not exit within {}s; abandoning the join",
-            JOIN_TIMEOUT.as_secs()
+            "kytrix: MsgWaitForMultipleObjects while joining the kytrix-d3d12 thread failed: {:?} ({})",
+            wait,
+            std::io::Error::last_os_error()
         );
+        break;
     }
     if let Some(code) = quit {
         // 关闭握手期间取出的 `WM_QUIT` 还回去：泵的下一轮必须仍然看到它。

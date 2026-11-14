@@ -871,10 +871,13 @@ mod resize_tests {
 
     use super::{ResizeSession, is_resize_hit, resized_rect};
 
-    fn session(hit: u32) -> ResizeSession {
+    /// 缩放起点与抓取点必须一致：`HTLEFT`/`HTTOPLEFT`/`HTBOTTOMLEFT` 的按下点在**左边缘**，
+    /// 右键/上边/下边同理。抓取点由调用方显式给出（旧的固定 `(500, 300)` 让左边缘的 `dx`
+    /// 从窗口右边缘起算，算术上不可能触发最小宽度钳制）。
+    fn session(hit: u32, cursor: POINT) -> ResizeSession {
         ResizeSession {
             hit,
-            cursor: POINT { x: 500, y: 300 },
+            cursor,
             window: RECT {
                 left: 100,
                 top: 100,
@@ -893,7 +896,11 @@ mod resize_tests {
 
     #[test]
     fn dragging_the_right_edge_changes_only_the_width() {
-        let rect = resized_rect(session(HTRIGHT), POINT { x: 540, y: 280 }, (320, 200));
+        let rect = resized_rect(
+            session(HTRIGHT, POINT { x: 500, y: 300 }),
+            POINT { x: 540, y: 280 },
+            (320, 200),
+        );
 
         assert_eq!(rect.left, 100);
         assert_eq!(rect.right, 540);
@@ -903,7 +910,11 @@ mod resize_tests {
 
     #[test]
     fn dragging_the_top_left_corner_moves_the_origin() {
-        let rect = resized_rect(session(HTTOPLEFT), POINT { x: 480, y: 280 }, (320, 200));
+        let rect = resized_rect(
+            session(HTTOPLEFT, POINT { x: 100, y: 100 }),
+            POINT { x: 80, y: 80 },
+            (320, 200),
+        );
 
         assert_eq!(rect.left, 80);
         assert_eq!(rect.top, 80);
@@ -913,7 +924,13 @@ mod resize_tests {
 
     #[test]
     fn minimum_size_clamps_the_dragged_edge() {
-        let rect = resized_rect(session(HTLEFT), POINT { x: 490, y: 300 }, (320, 200));
+        // 左边缘抓取点在 (100, 300)：拖动到 (490, 300) 时 dx = 390，左边越过右边界，
+        // 钳制到 right - min_width = 500 - 320 = 180。
+        let rect = resized_rect(
+            session(HTLEFT, POINT { x: 100, y: 300 }),
+            POINT { x: 490, y: 300 },
+            (320, 200),
+        );
         assert_eq!(
             rect.right - rect.left,
             320,

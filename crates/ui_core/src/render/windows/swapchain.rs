@@ -44,7 +44,6 @@ pub(crate) struct Swapchain {
     chain2: IDXGISwapChain2,
     /// `GetFrameLatencyWaitableObject` 的句柄；本结构独占，`Drop` 时关闭。
     waitable: HANDLE,
-    size: (u32, u32),
 }
 
 impl Swapchain {
@@ -75,15 +74,11 @@ impl Swapchain {
         // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         unsafe { chain2.SetMaximumFrameLatency(2) }
             .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
-        let swapchain = Self::validate(raw, chain2, size)?;
+        let swapchain = Self::validate(raw, chain2)?;
         Ok(swapchain)
     }
 
-    fn validate(
-        raw: IDXGISwapChain1,
-        chain2: IDXGISwapChain2,
-        size: (u32, u32),
-    ) -> Result<Self, EngineError> {
+    fn validate(raw: IDXGISwapChain1, chain2: IDXGISwapChain2) -> Result<Self, EngineError> {
         // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let actual = unsafe { raw.GetDesc1() }
             .map_err(|error| init_error_from("SwapChain::GetDesc1", error))?;
@@ -103,7 +98,6 @@ impl Swapchain {
             raw,
             chain2,
             waitable,
-            size,
         })
     }
 
@@ -199,7 +193,6 @@ impl Swapchain {
             }
             self.waitable = waitable;
         }
-        self.size = size;
         Ok(())
     }
 }

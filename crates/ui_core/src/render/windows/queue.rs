@@ -152,6 +152,28 @@ impl Queue {
         Ok(())
     }
 
+    /// 请求在 `value` 到达时置位 `event`（`ID3D12Fence::SetEventOnCompletion`）。
+    ///
+    /// 这是**完成通知**的原语（§6.5 / §8.1），不是等待：GPU 线程随后用
+    /// `WaitForMultipleObjects([work, completion])` 睡到有活或本帧完成，不轮询 `GetCompletedValue`。
+    /// 若 fence 已经越过 `value`，Windows 会立即置位该事件。
+    pub(crate) fn set_completion_event(
+        &self,
+        value: u64,
+        event: HANDLE,
+    ) -> Result<(), EngineError> {
+        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；`event` 由调用方保证在 `value` 到达前存活
+        // （Windows 层里它是 `Shared` 的 auto-reset 事件，晚于 GPU 线程释放）。
+        unsafe { self.fence.SetEventOnCompletion(value, event) }
+            .map_err(|error| init_error_from("SetEventOnCompletion(completion)", error))
+    }
+
+    /// fence 的已完成值（非阻塞；`release_completed` 与 GPU 循环的完成判据）。
+    pub(crate) fn completed_value(&self) -> u64 {
+        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// 等到最后一次提交完成（resize / 读回 / 退出）。
     pub(crate) fn wait_idle(&mut self) -> Result<(), EngineError> {
         self.wait_for(self.ring.last_signaled())
@@ -179,7 +201,8 @@ impl Queue {
     }
 
     /// 帧外的一次性提交（读回）：等 idle → 用槽 0 录制 → 提交 → 等完成。
-    /// 不推进 ring 的槽位（只预留一个 fence 值），调用前后都必须 idle。
+    ///
+    /// 调用前后都必须 idle；提交成功后把槽 0 的 fence 记账推进到本次 signal 值。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn submit_immediate(
         &mut self,
@@ -202,11 +225,20 @@ impl Queue {
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
         // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.ExecuteCommandLists(&[Some(command_list)]) };
-        let value = self.ring.reserve();
+        // 帧外提交也占一个单调递增的 fence 值，并把**实际使用的槽 0** 的记账推进到该值：
+        // 调用前的 `wait_idle` 已等到最后提交值（≥ 槽 0 的上一帧），因此 `wait_value` 就是那条
+        // 已经满足的前置条件；这不是只推进 `next_value` 的旁路（`InFlightRing::reserve` 已删除，
+        // 共享层不再含 Windows cfg）。
+        let slot = FrameSlot {
+            index: 0,
+            wait_value: self.ring.last_signaled(),
+            signal_value: self.ring.last_signaled() + 1,
+        };
         // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
-        unsafe { self.raw.Signal(&self.fence, value) }
+        unsafe { self.raw.Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
-        self.wait_for(value)
+        self.ring.advance(slot);
+        self.wait_for(slot.signal_value)
     }
 
     /// 延迟销毁：本帧用过的资源至少要活到 `index` 的 fence 完成。
@@ -219,8 +251,7 @@ impl Queue {
     ///
     /// 只读 `GetCompletedValue`，不等 GPU（I2 / I4）。
     pub(crate) fn release_completed(&mut self, device: &mut Device) -> usize {
-        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
-        let completed = unsafe { self.fence.GetCompletedValue() };
+        let completed = self.completed_value();
         let mut highest = None;
         while let Some((_, value)) = self.submitted.front() {
             if *value > completed {

@@ -202,19 +202,6 @@ impl InFlightRing {
     pub(crate) fn last_signaled(&self) -> u64 {
         self.next_value
     }
-
-    /// 给「帧外一次性提交」（readback / resize / 图集上传）预留一个 fence 值。
-    ///
-    /// 只推进 `next_value`、不动槽位：后续真正帧的 signal 值继续单调递增。
-    ///
-    /// 唯一调用方是 Windows 的 `Queue::submit_immediate`；macOS/Linux 后端没有帧外提交，
-    /// 因此这层 `cfg` 必须同时包含 `windows`，否则非 Windows 目标下是 `dead_code`
-    /// （`--all-features` 也会把 `test-support` 打开）。
-    #[cfg(all(windows, any(test, feature = "test-support")))]
-    pub(crate) fn reserve(&mut self) -> u64 {
-        self.next_value += 1;
-        self.next_value
-    }
 }
 
 /// `FrameIndex` → ring 槽位。`0` 是「从未提交」的非法值（`FrameScheduler::commit` 保证 ≥ 1）。

@@ -122,18 +122,10 @@ impl FramePlan {
         self.plan
     }
 
-    /// copy 到 back buffer 的范围：`fresh` 时**强制全量**。
-    ///
-    /// 只有 D3D12 后端消费（`F-121`：Metal / Vulkan 的 present 目标跨帧内容无保证，
-    /// 两平台每帧整面写入，不看这个值）。
-    #[cfg(any(windows, test))]
-    pub(crate) fn copy_plan(self) -> Plan {
-        if self.fresh { Plan::Full } else { self.plan }
-    }
-
     /// 本帧的 dirty 集：`None` = 全量（D3D12 的 `DirtyRectsCount = 0`）。
     ///
-    /// **消费方**：D3D12 用它做 `DirtyRect` 拷贝，Vulkan 用它生成
+    /// **消费方**：D3D12 用它同时派生 `Present1` 的 dirty rect 与 copy 范围（`fresh` ⇒ 全量
+    /// copy 的规则在 Windows 后端的 `copy_plan` 里），Vulkan 用它生成
     /// `VK_KHR_incremental_present` 的 region hint；Metal 不消费（无对应扩展，F-121）。
     /// 任何后端都**不得**把它当作「必须跳过的像素」：present 目标跨帧内容在 Metal/Vulkan 上
     /// 没有保证，draw/persist 侧仍按 `plan()` 的 scissor 处理。
@@ -220,19 +212,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_swapchain_forces_full_copy_and_present() {
+    fn a_fresh_swapchain_presents_without_dirty_rects_until_presented() {
         let rect = PhysicalRect::new(0, 0, 10, 10);
         let mut frame = FramePlan::new(plan(partial(1), &[rect], surface()), true);
-        // 绘制仍是局部，但 copy 与 present 必须全量（back buffer 上是上一帧的残留）。
+        // 绘制仍是局部，但 present 必须全量（back buffer 上是上一帧的残留）。
         assert!(matches!(frame.plan(), Plan::Partial(_)));
-        assert_eq!(frame.copy_plan(), Plan::Full);
         assert_eq!(frame.present_dirty(), None);
         assert!(frame.is_full() && frame.is_fresh());
 
         // 只有 present 成功之后才清 fresh。
         frame.presented();
         assert!(!frame.is_fresh());
-        assert!(matches!(frame.copy_plan(), Plan::Partial(_)));
         assert!(frame.present_dirty().is_some());
     }
 
@@ -240,14 +230,12 @@ mod tests {
     fn a_full_plan_presents_without_dirty_rects() {
         let frame = FramePlan::new(Plan::Full, false);
         assert_eq!(frame.present_dirty(), None);
-        assert_eq!(frame.copy_plan(), Plan::Full);
     }
 
     #[test]
     fn an_idle_plan_stays_idle() {
         let frame = FramePlan::new(Plan::Idle, false);
         assert!(frame.is_idle());
-        assert_eq!(frame.copy_plan(), Plan::Idle);
         assert_eq!(frame.present_dirty(), None);
     }
 

@@ -98,21 +98,27 @@ impl AtlasTextures {
     }
 
     /// 入队一页的脏行（整页 `pixels` 的布局 = `page * page * texel`）。
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    ///
+    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
+    /// 16 MiB（图片页）。页尺寸在这里用**始终生效**的断言校验：release 下的越界读会直接读穿
+    /// 堆（`debug_assert_eq!` 只保护调试构建）。
+    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
         let page = match kind {
             AtlasKind::Glyph => self.glyph.page,
             AtlasKind::Image => self.image.page,
         };
         let expected = (page * page) as usize * texel_bytes(kind) as usize;
-        debug_assert_eq!(pixels.len(), expected, "atlas page size mismatch");
+        assert_eq!(
+            pixels.len(),
+            expected,
+            "atlas page size mismatch for {kind:?}: expected {expected} bytes for a {page}×{page} page, got {}",
+            pixels.len()
+        );
         let slot = match kind {
             AtlasKind::Glyph => 0,
             AtlasKind::Image => 1,
         };
-        self.pending[slot] = Some(PendingUpload {
-            pixels: pixels.to_vec(),
-            rows,
-        });
+        self.pending[slot] = Some(PendingUpload { pixels, rows });
     }
 
     /// 在本帧命令列表里录制「staging 写入 + 逐区间 `CopyTextureRegion`」。
@@ -249,7 +255,7 @@ impl AtlasTexture {
         let staging = &self.staging[slot];
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
         // SAFETY: `staging[slot]` 由 `ensure_staging` 保证容量 ≥ 本帧总行数；
-        // `staging_row + rows` 不超过该容量，源页由 `queue_upload` 的 debug_assert 保证尺寸。
+        // `staging_row + rows` 不超过该容量，源页由 `queue_upload` 的整页尺寸断言保证。
         unsafe { staging.Map(0, None, Some(&mut pointer)) }
             .map_err(|error| init_error_from("Map(atlas staging)", error))?;
         // SAFETY: COM `QueryInterface` 转换：源接口非空且存活，失败以 `Result` 返回。
@@ -469,7 +475,7 @@ mod tests {
         page[row..row + TEST_PAGE as usize].fill(0xAB);
         let mut rows = DirtyRows::default();
         rows.mark(5, 6);
-        atlas.queue_upload(AtlasKind::Glyph, &page, rows);
+        atlas.queue_upload(AtlasKind::Glyph, page, rows);
         assert!(atlas.has_pending());
 
         queue
@@ -508,7 +514,7 @@ mod tests {
         let mut rows = DirtyRows::default();
         rows.mark(4, 6);
         let page = vec![0x7Fu8; (TEST_PAGE * TEST_PAGE) as usize];
-        atlas.queue_upload(AtlasKind::Glyph, &page, rows);
+        atlas.queue_upload(AtlasKind::Glyph, page, rows);
         assert!(atlas.has_pending());
     }
     /// staging 容量必须**按 in-flight 槽**记录（V-64）。
@@ -536,7 +542,7 @@ mod tests {
         let glyph = vec![0x11u8; (BIG_PAGE * BIG_PAGE) as usize];
         let mut rows = DirtyRows::default();
         rows.mark(0, BIG_PAGE);
-        atlas.queue_upload(AtlasKind::Glyph, &glyph, rows);
+        atlas.queue_upload(AtlasKind::Glyph, glyph, rows);
         queue
             .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
             .expect("glyph upload");
@@ -548,7 +554,7 @@ mod tests {
         }
         let mut rows = DirtyRows::default();
         rows.mark(0, BIG_PAGE);
-        atlas.queue_upload(AtlasKind::Image, &image, rows);
+        atlas.queue_upload(AtlasKind::Image, image, rows);
         queue
             .submit_immediate(|list| atlas.record_uploads(&device, list, 1))
             .expect("image upload");
@@ -625,7 +631,7 @@ mod tests {
         let mut rows = DirtyRows::default();
         rows.mark(10, 20);
         rows.mark(300, 320);
-        atlas.queue_upload(AtlasKind::Glyph, &page, rows);
+        atlas.queue_upload(AtlasKind::Glyph, page, rows);
         queue
             .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
             .expect("upload");
