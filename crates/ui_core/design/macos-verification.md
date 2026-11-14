@@ -189,6 +189,51 @@ HUD 开启时用 AXCloseButton 关窗：日志确认泵已处理 `CloseRequested
 `NSEventType::ApplicationDefined` 空事件，最后 `NSApp.stop(None)` + `CFRunLoop::stop`/`wake_up`。
 HUD 开、HUD 关、Esc 三条关窗路径均实测进程退出。
 
+### 2.11 Metal 异步管线回归修复（P0/P1/P2，2026-11-14）
+
+异步窗口管线（`16f2045`）的对抗性审查在 macOS/Metal 上发现 1 个 P0（实机复现）、1 个 P1 与若干
+P2。修复与偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md) §28（F-171 … F-175）；本节只记录实测证据。
+
+**P0：上传槽位与三槽 semaphore 不同源（F-171）**。临时探针在 GPU 线程记录每个槽上次提交的命令
+缓冲，并在 `begin`（CPU memcpy 之前）打印它的 `status`。GPU-bound（每帧 300 次整面 blit）12 s：
+
+```text
+PROBE t=1058 publish idx=62 surface=(1920, 1556)
+PROBE t=1058 take prev=56 next=62 gap=6 req=(1920, 1556) drawable=(1920, 1556)
+PROBE t=1058 begin idx=62 slot=0 prev=MTLCommandBufferStatus(4)     # 4 = Completed
+PROBE t=1066 submit idx=62 req=(1920, 1556) drawable=(1920, 1556) full=false
+...
+PROBE t=11992 slot-report reuses=103 prev_completed=103 collisions=0 \
+    old_mapping_reuses=103 old_mapping_would_overwrite=39
+```
+
+gap 分布含 `gap=6`×37、`gap=12`×5、`gap=3`×1（3 的倍数共 43 次）。修复后 103 次槽复用全部看到
+`Completed`、0 次冲突；按旧映射（`index % 3`）其中 **39 次会重写仍在飞的槽**。
+
+**P1：resize 后消费陈旧 drawable（F-172）**。一次性程序化 resize（之后无任何输入），修复前/后：
+
+```text
+# 修复前（绕过尺寸校验）
+PROBE t=1346 take prev=1 next=2 gap=1 req=(1800, 1400) drawable=(1920, 1556)
+PROBE t=1347 submit idx=2 req=(1800, 1400) drawable=(1920, 1556) full=true
+PROBE t=1355 pacing paused=true pending=false in_flight=0      # 之后再无提交：窗口停在旧尺寸画面
+
+# 修复后
+PROBE t=1333 publish idx=2 surface=(1800, 1400)
+PROBE t=1333 skip-stale vsync=1 drawable=(1920, 1556) requested=(1800, 1400)
+PROBE t=1336 take prev=1 next=2 gap=1 req=(1800, 1400) drawable=(1800, 1400)
+PROBE t=1337 submit idx=2 req=(1800, 1400) drawable=(1800, 1400) full=true   # 新尺寸完成一次 present
+```
+
+持续不一致（请求比 drawable 大 2 px）时退化路径生效：每 4 个 vsync 跳过，第 5 个按 drawable 尺寸
+全量提交并记录诊断——`metal drawable 1920x1556 never matched the requested 1922x1558 within 4
+vsyncs; rendering at the drawable size (full frame)`，4 s 内 45 次提交、0 validation error。
+
+**其余验证**：`MTL_DEBUG_LAYER=1` 跑 10 s + HUD 连续帧 → 0 validation error；HUD 的 `Latency` 行
+稳定在 12.2–13.0 ms（FPS 58–60、Frame 16.65–17.29 ms，同一 run 的打印见提交信息）；程序化
+`App::close_window`（GPU-bound、2–3 帧在飞）→ exit 0、join 正常（F-175 的 `||` 变体在同一场景
+会卡满 2 s 超时并打印 `abandoning the join`，实测 6 s 退出）。
+
 ## 3. 修复与决策记录
 
 | # | 决策点 | 选项 | 用户选择 | 实施 |
