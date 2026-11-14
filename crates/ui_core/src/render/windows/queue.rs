@@ -1,8 +1,11 @@
-//! 命令队列 / 每 in-flight 槽的 allocator + list / fence 等待 / retire 排空
-//! （`design/phase-08-d3d12.md` §5.2）。
+//! 命令队列 / 每 in-flight 槽的 allocator + list / fence 记账 / retire 排空
+//! （`design/phase-08-d3d12.md` §5.2、`design/async-render-pipeline.md` §6.3 / §6.5）。
 //!
-//! 本阶段**同步提交**：`submit` 在 `Signal` 之后立刻等到 fence 到达。ring 结构仍按
-//! `MAX_FRAMES_IN_FLIGHT` 组织（P09 异步化不改结构）。
+//! **提交是异步的**（I2）：`submit` 关闭列表、`ExecuteCommandLists`、`Signal` 之后立刻返回，
+//! 完成状态只通过 fence 观察。等待点在调用方（GPU 线程）：复用槽位前 `wait_slot_fence`，
+//! resize / 读回 / 退出前 `wait_idle`。
+
+use std::collections::VecDeque;
 
 use windows::{
     Win32::{
@@ -23,7 +26,7 @@ use crate::{
     window::FrameIndex,
 };
 
-/// 直接队列 + 每槽 allocator/list + fence。
+/// 直接队列 + 每槽 allocator/list + fence + 提交记账。
 pub(crate) struct Queue {
     raw: ID3D12CommandQueue,
     allocators: Vec<ID3D12CommandAllocator>,
@@ -31,6 +34,8 @@ pub(crate) struct Queue {
     fence: ID3D12Fence,
     event: HANDLE,
     ring: InFlightRing,
+    /// 已提交但**尚未确认完成**的帧（FIFO：帧序号 + 它的 signal 值）。
+    submitted: VecDeque<(FrameIndex, u64)>,
     retire: RetireQueue,
 }
 
@@ -94,32 +99,43 @@ impl Queue {
             fence,
             event,
             ring: InFlightRing::new(),
+            submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
             retire: RetireQueue::new(),
         })
     }
 
-    /// 等待该槽的 fence → 复位 allocator/list。返回本帧的槽位与 fence 值。
-    pub(crate) fn begin(&mut self, index: FrameIndex) -> Result<FrameSlot, EngineError> {
-        let slot = self.ring.acquire(index);
-        self.wait_for(slot.wait_value)?;
+    /// 本帧的槽位与 fence 值（不修改状态；提交时才推进记账）。
+    pub(crate) fn acquire_slot(&self, index: FrameIndex) -> FrameSlot {
+        self.ring.acquire(index)
+    }
+
+    /// 等到 `value` 到达（`0` = 该槽从未使用，直接返回）。
+    ///
+    /// 只允许在 GPU 线程（复用 allocator 的前置条件）或离屏同步路径（读回 / 退出）调用。
+    pub(crate) fn wait_slot_fence(&self, value: u64) -> Result<(), EngineError> {
+        self.wait_for(value)
+    }
+
+    /// 复位该槽的 allocator + list（调用方必须先 `wait_slot_fence(slot.wait_value)`）。
+    pub(crate) fn reset_slot(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
         let allocator = &self.allocators[slot.index];
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 该槽上一次提交已由 `wait_slot_fence` 等到完成，allocator 不再被 GPU 使用。
         unsafe { allocator.Reset() }
             .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
         let list = &self.lists[slot.index];
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；列表上一次已关闭。
         unsafe { list.Reset(allocator, None) }
             .map_err(|error| init_error_from("CommandList::Reset", error))?;
-        Ok(slot)
+        Ok(())
     }
 
-    /// 正在录制的命令列表（`begin` 之后有效）。
+    /// 正在录制的命令列表（`reset_slot` 之后有效）。
     pub(crate) fn list(&self, slot: FrameSlot) -> &ID3D12GraphicsCommandList {
         &self.lists[slot.index]
     }
 
-    /// 关闭 → 执行 → `Signal` → 同步等待到达。
-    pub(crate) fn submit(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
+    /// 关闭 → 执行 → `Signal`，**立即返回**（I2：完成通知只走 fence）。
+    pub(crate) fn submit(&mut self, index: FrameIndex, slot: FrameSlot) -> Result<(), EngineError> {
         let list = &self.lists[slot.index];
         // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
@@ -131,12 +147,12 @@ impl Queue {
         // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.raw.Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
-        self.wait_for(slot.signal_value)?;
         self.ring.advance(slot);
+        self.submitted.push_back((index, slot.signal_value));
         Ok(())
     }
 
-    /// 等到最后一次提交完成（resize / 快照 / 退出）。
+    /// 等到最后一次提交完成（resize / 读回 / 退出）。
     pub(crate) fn wait_idle(&mut self) -> Result<(), EngineError> {
         self.wait_for(self.ring.last_signaled())
     }
@@ -162,7 +178,7 @@ impl Queue {
         Ok(())
     }
 
-    /// 帧外的一次性提交（readback / resize）：等 idle → 用槽 0 录制 → 提交 → 等完成。
+    /// 帧外的一次性提交（读回）：等 idle → 用槽 0 录制 → 提交 → 等完成。
     /// 不推进 ring 的槽位（只预留一个 fence 值），调用前后都必须 idle。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn submit_immediate(
@@ -198,15 +214,27 @@ impl Queue {
         self.retire.retire(index, handle);
     }
 
-    /// 把 `completed` 及更早的句柄交回 `device`（真正 drop COM 对象）。返回释放数。
-    pub(crate) fn release_completed(
-        &mut self,
-        completed: FrameIndex,
-        device: &mut Device,
-    ) -> usize {
-        self.retire.on_completed(completed, &mut |handle| {
-            device.release(handle);
-        })
+    /// **非阻塞**推进 retire：fence 已到达的帧（含被跳过的序号，§4.3）及更早的句柄交回
+    /// `device` 真正释放。返回释放数。
+    ///
+    /// 只读 `GetCompletedValue`，不等 GPU（I2 / I4）。
+    pub(crate) fn release_completed(&mut self, device: &mut Device) -> usize {
+        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let mut highest = None;
+        while let Some((_, value)) = self.submitted.front() {
+            if *value > completed {
+                break;
+            }
+            let (index, _) = self.submitted.pop_front().expect("front checked above");
+            highest = Some(index);
+        }
+        match highest {
+            Some(index) => self.retire.on_completed(index, &mut |handle| {
+                device.release(handle);
+            }),
+            None => 0,
+        }
     }
 
     /// 尚未释放的句柄数（诊断 / 测试）。
@@ -279,9 +307,13 @@ mod tests {
         let device = Device::new_warp().expect("WARP device");
         let mut queue = Queue::new(&device).expect("queue");
         for value in 1..=7u32 {
-            let slot = queue.begin(index(value)).expect("begin");
+            let slot = queue.acquire_slot(index(value));
             assert_eq!(slot.index, (value as usize) % 3);
-            queue.submit(slot).expect("submit");
+            queue.wait_slot_fence(slot.wait_value).expect("slot fence");
+            queue.reset_slot(slot).expect("reset slot");
+            queue.submit(index(value), slot).expect("submit");
+            // 提交本身不等 GPU（I2）：完成状态由调用方按 fence 观察。
+            queue.wait_slot_fence(slot.signal_value).expect("signaled");
         }
         queue.wait_idle().expect("idle");
         assert_eq!(queue.pending_retire(), 0);

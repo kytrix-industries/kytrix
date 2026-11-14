@@ -1,10 +1,18 @@
 //! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → copy 到 back buffer → `Present1`
-//! （`design/phase-08-d3d12.md` §5.6 / §6）。
+//! （`design/phase-08-d3d12.md` §5.6 / §6、`design/async-render-pipeline.md` §6.3）。
 //!
 //! 结构要点（DEVIATIONS F-71）：**只有持久 offscreen 是绘制目标**；swapchain 的 back buffer
 //! 只作 `COPY_DEST`（不建 RTV、不挂 scissor 绘制），因此不对它持有 RTV 引用（resize 前提）。
+//!
+//! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程独占**
+//! 的对象（device / queue / swapchain / persist / upload / retire / 计时），构造发生在窗口创建时
+//! （UI 线程），构造完成后整体移交给 `kytrix-d3d12` 线程（[`super::renderer`]）。离屏 / 快照路径
+//! 不走线程：`GpuRenderer` 由门面同步调用，语义与 golden 不变（§4.5 的下半段）。
+//!
+//! 提交是异步的（I2）：`ExecuteCommandLists` 后立即返回；节奏来自 DXGI 的帧延迟 waitable
+//! （由 GPU 循环在每帧录制前等一次），完成通知只通过 fence 观察。
 
-use std::time::Instant;
+use std::{cell::Cell, time::Instant};
 
 use windows::Win32::{
     Foundation::RECT,
@@ -19,16 +27,20 @@ use windows::Win32::{
 };
 
 #[cfg(any(test, feature = "test-support"))]
+use crate::paint::instance::InstanceBuffer;
+#[cfg(any(test, feature = "test-support"))]
 use crate::render::windows::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
     paint::{
         atlas::AtlasKind,
-        instance::{FrameOp, GpuClipEntry, InstanceBuffer},
+        geometry::GeometryId,
+        instance::{FrameOp, GpuClipEntry},
     },
     render::{
+        RenderStats,
         compositor::{FramePlan, Plan},
-        frame::MAX_FRAMES_IN_FLIGHT,
+        frame::{FramePayload, FrameRequest, FrameSlot, MAX_FRAMES_IN_FLIGHT},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
         windows::{
@@ -50,8 +62,23 @@ const TEST_ATLAS_PAGE: u32 = 64;
 /// `RootUniform` 的字节数（P07 §2.7：112 B = 28 DWORD）。
 const ROOT_UNIFORM_DWORDS: usize = 28;
 
-/// 一个窗口的 GPU 渲染器（`Window.renderer` 的载荷）。
-pub(crate) struct Renderer {
+thread_local! {
+    /// 当前线程是否是 `kytrix-d3d12` GPU 线程（§10.1 的线程归属断言）。
+    static ON_GPU_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 标记当前线程为 GPU 线程（`render/windows/renderer.rs` 的循环在入口调用一次）。
+pub(crate) fn enter_gpu_thread() {
+    ON_GPU_THREAD.set(true);
+}
+
+/// 所有 GPU / DXGI 调用都必须在 GPU 线程上（对象构造阶段除外，§3.1）。
+fn on_gpu_thread() -> bool {
+    ON_GPU_THREAD.get()
+}
+
+/// 一个窗口的 GPU 渲染器（**GPU 线程独占**；离屏路径由门面同步调用）。
+pub(crate) struct GpuRenderer {
     device: Device,
     queue: Queue,
     pipeline: Pipeline,
@@ -64,12 +91,22 @@ pub(crate) struct Renderer {
     rtv_heap: ID3D12DescriptorHeap,
     clear_color: [f32; 4],
     surface: (u32, u32),
-    clips: Vec<GpuClipEntry>,
+    /// 下一次 present 是否必须全量：新建 / resize 之后为 `true`，present 成功后清除。
+    ///
+    /// 离屏目标没有 present，因此它恒为 `true` —— 与移交给 GPU 线程之前的离屏语义一致。
+    fresh: bool,
+    /// 最后一次**真正提交**的帧序号（重建资源入 retire 队列时的 tag，§4.3）。
+    last_index: FrameIndex,
     #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
 }
 
-impl Renderer {
+// SAFETY: `GpuRenderer` 在构造完成后只整体移动一次到 `kytrix-d3d12` 线程，此后 UI 线程不再
+// 访问其中任何对象；D3D12/DXGI 对象本身允许跨线程使用，这里保证的是「单线程独占」而不是共享。
+// `Queue` 里的 fence 事件句柄（`HANDLE`）与 swapchain 的 waitable 句柄只在该线程上使用。
+unsafe impl Send for GpuRenderer {}
+
+impl GpuRenderer {
     /// 产品路径：硬件设备 + 离屏目标（P09 在此之后 attach 原生窗口）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
         Self::with_device(
@@ -128,7 +165,7 @@ impl Renderer {
                 })
         }
         .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
-        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
+        // SAFETY: 描述符堆由 `Pipeline` / `GpuRenderer` 持有，句柄在堆生命周期内有效。
         let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
 
         let mut device = device;
@@ -148,26 +185,39 @@ impl Renderer {
             swapchain: None,
             rtv_heap,
             clear_color: [0.0, 0.0, 0.0, 0.0],
-            surface: size,
-            clips: Vec::with_capacity(8),
+            surface: (size.0.max(1), size.1.max(1)),
+            fresh: true,
+            last_index: FrameIndex::default(),
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
     }
 
-    /// 当前离屏目标的物理尺寸。
+    /// 当前目标的物理尺寸（GPU 线程侧的真值；resize 后更新）。
     pub(crate) fn surface(&self) -> (u32, u32) {
         self.surface
     }
 
     /// 下一次 present 是否必须全量（新建 / resize 之后为 `true`）。
     pub(crate) fn is_fresh(&self) -> bool {
-        self.swapchain.as_ref().is_none_or(Swapchain::is_fresh)
+        self.fresh
     }
 
-    /// resize：等 GPU 空闲 → 复位全部命令列表（丢弃 back buffer 引用）→ `ResizeBuffers` →
-    /// 重建持久 offscreen（DEVIATIONS F-86 / V-55）。
+    /// 帧延迟 waitable（窗口路径的节奏原语，只有 GPU 线程等它）。
+    pub(crate) fn waitable(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        self.swapchain.as_ref().map(Swapchain::waitable)
+    }
+
+    /// resize（§6.4）：先排空到「最后提交值」（**只等这一次**），复位全部命令列表丢弃对旧
+    /// back buffer 的引用，`ResizeBuffers`（flag 原样）+ 重建 persist；旧 persist 入 retire
+    /// 队列（I4），下次完成通知后释放。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
+        // 窗口目标（有 swapchain）的 resize 只能发生在 GPU 线程（§6.4）；离屏目标由门面同步调用。
+        debug_assert!(
+            self.swapchain.is_none() || on_gpu_thread(),
+            "resizing a window target may only run on the kytrix-d3d12 thread"
+        );
+        let size = (size.0.max(1), size.1.max(1));
         if size == self.surface {
             return Ok(());
         }
@@ -176,154 +226,223 @@ impl Renderer {
         if let Some(swapchain) = self.swapchain.as_mut() {
             swapchain.resize(size)?;
         }
-        self.persist.recreate(&mut self.device, size)?;
+        // RTV 句柄由堆派生（堆是所有者；`Persist` 只缓存句柄本身）。
+        // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
+        let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let old = self.persist.recreate(&mut self.device, size, rtv)?;
+        self.queue.retire(self.last_index, old);
         self.surface = size;
+        self.fresh = true;
         Ok(())
     }
 
-    /// 一帧的全部 GPU 工作（同步提交）。
-    pub(crate) fn submit(
+    /// 离屏 / 快照路径：提交一份跨线程快照并**同步**等完成（§4.5 的下半段）。
+    ///
+    /// `frame` 由调用方构造（`fresh` 的判定权在资源所有者手上，§4.1）；窗口路径用
+    /// [`GpuRenderer::submit_frame`]（异步，完成状态由 GPU 循环按 fence 推进）。
+    pub(crate) fn submit_snapshot(
+        &mut self,
+        index: FrameIndex,
+        payload: &FramePayload,
+        frame: &mut FramePlan,
+        timings: &mut FrameTimings,
+    ) -> Result<RenderStats, EngineError> {
+        let (stats, slot) = self.submit_recorded(
+            index,
+            payload.instances(),
+            payload.clips(),
+            payload.ops(),
+            |op| {
+                payload
+                    .geometry()
+                    .get(op as usize)
+                    .map(|draw| draw.id)
+                    .ok_or_else(|| EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
+                    })
+            },
+            frame,
+            timings,
+        )?;
+        self.finish_sync(slot, timings)?;
+        Ok(stats)
+    }
+
+    /// 测试 / 快照的便捷入口：把 `InstanceBuffer` 复制成快照后同步提交。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn submit_buffer(
         &mut self,
         index: FrameIndex,
         buffer: &InstanceBuffer,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
-    ) -> Result<crate::render::RenderStats, EngineError> {
-        if let Some(error) = self.device.lost_error() {
-            return Err(error);
-        }
-        timings.reset(index);
-        let frame_started = Instant::now();
+    ) -> Result<RenderStats, EngineError> {
+        let payload = FramePayload::from_buffer(buffer);
+        self.submit_snapshot(index, &payload, frame, timings)
+    }
 
-        buffer.write_clips_gpu(&mut self.clips);
-        let slot = match self.queue.begin(index) {
-            Ok(slot) => slot,
-            Err(error) => return Err(self.classify(error)),
-        };
-
-        let Renderer {
-            device,
-            queue,
-            pipeline,
-            atlas,
-            persist,
-            upload,
-            geometry,
-            timer,
-            swapchain,
-            rtv_heap,
-            clear_color,
-            surface,
-            clips,
-            ..
-        } = self;
-        let _ = rtv_heap;
-
-        let uploaded = upload.write(device, queue, index, slot.index, buffer.as_bytes(), clips);
-        let (instance_count, clip_count) = uploaded?;
-        pipeline.write_slot(
-            device,
-            slot.index,
-            upload.slot(slot.index).instances(),
-            instance_count,
-            upload.slot(slot.index).clips(),
-            clip_count,
-        );
-        timings.push(GpuTimerSample {
-            section: Section::Upload,
-            cpu_ns: elapsed_ns(frame_started),
-            gpu_ns: 0,
-        });
-
-        let width = surface.0 as f32;
-        let height = surface.1 as f32;
-        let root = root_uniform(width, height);
-        let full = frame.is_full();
-        let scissor_whole = RECT {
-            left: 0,
-            top: 0,
-            right: surface.0 as i32,
-            bottom: surface.1 as i32,
-        };
-
-        let mut draw_calls = 0u32;
-        let draw_result = {
-            let list = queue.list(slot);
-            if let Some(timer) = timer.as_ref() {
-                timer.begin(list, slot.index);
-            }
-            if atlas.has_pending() {
-                atlas.record_uploads(device, list, slot.index)?;
-            }
-            if full {
-                // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）。
-                unsafe { list.ClearRenderTargetView(persist.rtv, clear_color, None) };
-            }
-            bind_frame(list, pipeline, persist, slot.index, &root);
-            match full {
-                true => {
-                    draw_calls = draw_ops(list, pipeline, buffer, geometry, &root, scissor_whole)?;
-                }
-                false => match frame.plan() {
-                    Plan::Idle | Plan::Full => {}
-                    Plan::Partial(damage) => {
-                        for rect in damage.as_slice() {
-                            let scissor = RECT {
-                                left: rect.x0,
-                                top: rect.y0,
-                                right: rect.x1,
-                                bottom: rect.y1,
-                            };
-                            // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
-                            unsafe { list.RSSetScissorRects(&[scissor]) };
-                            draw_calls = draw_calls.saturating_add(draw_ops(
-                                list, pipeline, buffer, geometry, &root, scissor,
-                            )?);
-                        }
-                    }
-                },
-            }
-            if let Some(swapchain) = swapchain.as_ref() {
-                copy_to_back(list, persist, swapchain, frame.copy_plan())?;
-            }
-            if let Some(timer) = timer.as_ref() {
-                timer.end(list, slot.index);
-            }
-            Ok(())
-        };
-        if let Err(error) = draw_result {
-            return Err(self.classify(error));
-        }
-
-        if let Err(error) = self.queue.submit(slot) {
-            return Err(self.classify(error));
-        }
-
-        if let Some(timer) = self.timer.as_ref()
-            && let Some(sample) = timer.resolve(slot.index)
+    /// 同步路径的收尾：等本帧完成 → 读本帧 GPU 时间 → 推进 retire（I4）。
+    fn finish_sync(
+        &mut self,
+        slot: FrameSlot,
+        timings: &mut FrameTimings,
+    ) -> Result<(), EngineError> {
+        // 同步语义：本帧命令必须完成，GPU 时间与随后的读回才有意义。
+        self.queue
+            .wait_slot_fence(slot.signal_value)
+            .map_err(|error| self.classify(error))?;
+        if let Some(sample) = self
+            .timer
+            .as_ref()
+            .and_then(|timer| timer.resolve(slot.index))
         {
             timings.push(sample);
         }
-        debug_assert_eq!(timings.frame(), index);
-        debug_assert!(timings.samples().len() <= 3);
-
         let present_started = Instant::now();
-        if let Some(swapchain) = self.swapchain.as_mut()
-            && let Err(error) = swapchain.present(frame, 1)
-        {
-            return Err(self.classify(error));
-        }
         timings.push(GpuTimerSample {
             section: Section::Present,
             cpu_ns: elapsed_ns(present_started),
             gpu_ns: 0,
         });
+        self.queue.release_completed(&mut self.device);
+        Ok(())
+    }
 
-        self.queue.release_completed(index, &mut self.device);
-        Ok(crate::render::RenderStats {
-            draw_calls,
-            instances: instance_count,
-        })
+    /// 提交一份跨线程帧快照（窗口路径：**不等** GPU 完成，I2）。
+    ///
+    /// 调用方（GPU 循环）已经在渲染前等过 DXGI 的帧延迟 waitable（I3），并在
+    /// `request.surface` 变化时先调用 [`GpuRenderer::resize`]。
+    pub(crate) fn submit_frame(
+        &mut self,
+        request: &FrameRequest,
+        frame: &mut FramePlan,
+    ) -> Result<(RenderStats, Vec<GpuTimerSample>), EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "D3D12 window frames may only be submitted on the kytrix-d3d12 thread"
+        );
+        let mut timings = FrameTimings::new();
+        let (stats, slot) = self.submit_recorded(
+            request.index,
+            request.payload.instances(),
+            request.payload.clips(),
+            request.payload.ops(),
+            |op| {
+                request
+                    .payload
+                    .geometry()
+                    .get(op as usize)
+                    .map(|draw| draw.id)
+                    .ok_or_else(|| EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
+                    })
+            },
+            frame,
+            &mut timings,
+        )?;
+
+        let present_started = Instant::now();
+        let presented = match self.swapchain.as_mut() {
+            // §6.3：`Present1(1, 0, dirty)` —— sync = 1 保持 vsync。
+            Some(swapchain) => swapchain.present1(frame, 1),
+            None => Ok(()),
+        };
+        if let Err(error) = presented {
+            return Err(self.classify(error));
+        }
+        self.fresh = false;
+        timings.push(GpuTimerSample {
+            section: Section::Present,
+            cpu_ns: elapsed_ns(present_started),
+            gpu_ns: 0,
+        });
+        // 非阻塞：读到的是该槽**最近一次**完成的 timestamp（GPU 可能刚完成本帧，也可能还差一帧）。
+        if let Some(sample) = self
+            .timer
+            .as_ref()
+            .and_then(|timer| timer.resolve(slot.index))
+        {
+            timings.push(sample);
+        }
+        // I4：只把 fence 已到达的帧所引用的旧资源交回 device。
+        self.queue.release_completed(&mut self.device);
+        Ok((stats, timings.samples().to_vec()))
+    }
+
+    /// 录制 + 提交一帧（不呈现、不等完成）。返回本帧槽位供调用方等 fence / 呈现。
+    fn submit_recorded(
+        &mut self,
+        index: FrameIndex,
+        instances: &[u8],
+        clips: &[GpuClipEntry],
+        ops: &[FrameOp],
+        resolve: impl FnMut(u32) -> Result<GeometryId, EngineError>,
+        frame: &mut FramePlan,
+        timings: &mut FrameTimings,
+    ) -> Result<(RenderStats, FrameSlot), EngineError> {
+        if let Some(error) = self.device.lost_error() {
+            return Err(error);
+        }
+        timings.reset(index);
+        debug_assert_eq!(
+            timings.frame(),
+            index,
+            "timings must be reset for this frame"
+        );
+        let frame_started = Instant::now();
+
+        let slot = self.queue.acquire_slot(index);
+        self.queue
+            .wait_slot_fence(slot.wait_value)
+            .map_err(|error| self.classify(error))?;
+        self.queue
+            .reset_slot(slot)
+            .map_err(|error| self.classify(error))?;
+
+        let stats = {
+            // 借用拆分：录制只碰这些字段，`surface` / `fresh` / `last_index` 留在外层。
+            let mut recorder = FrameRecorder {
+                device: &mut self.device,
+                queue: &mut self.queue,
+                pipeline: &self.pipeline,
+                atlas: &mut self.atlas,
+                persist: &self.persist,
+                upload: &mut self.upload,
+                geometry: &self.geometry,
+                timer: self.timer.as_ref(),
+                swapchain: self.swapchain.as_ref(),
+                clear_color: self.clear_color,
+                surface: self.surface,
+            };
+            recorder.record(
+                slot,
+                index,
+                instances,
+                clips,
+                ops,
+                resolve,
+                frame,
+                timings,
+                frame_started,
+            )
+        }
+        .map_err(|error| self.classify(error))?;
+
+        self.queue
+            .submit(index, slot)
+            .map_err(|error| self.classify(error))?;
+        self.last_index = index;
+        Ok((stats, slot))
+    }
+
+    /// 图集上传入口：P09 的字形页（整页）与 P15 的图片页共用（GPU 线程消费）。
+    pub(crate) fn queue_atlas_upload(
+        &mut self,
+        kind: AtlasKind,
+        pixels: &[u8],
+        rows: crate::render::atlas::DirtyRows,
+    ) {
+        self.atlas.queue_upload(kind, pixels, rows);
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。
@@ -346,7 +465,7 @@ impl Renderer {
     ) -> Result<ReadbackImage, EngineError> {
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
-        self.submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)?;
+        self.submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)?;
         self.readback()
     }
 
@@ -354,16 +473,6 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn set_clear_color(&mut self, color: [f32; 4]) {
         self.clear_color = color;
-    }
-
-    /// 图集上传入口：P09 的字形页（整页）与 P15 的图片页共用。
-    pub(crate) fn queue_atlas_upload(
-        &mut self,
-        kind: AtlasKind,
-        pixels: &[u8],
-        rows: crate::render::atlas::DirtyRows,
-    ) {
-        self.atlas.queue_upload(kind, pixels, rows);
     }
 
     /// 测试用的静态几何注册入口（P09 的 `GeometryStore` 接上后语义不变）。
@@ -394,6 +503,137 @@ impl Renderer {
     }
 }
 
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        // 退出路径：等 GPU 完成所有在飞提交，并丢掉命令列表对 back buffer 的引用，
+        // 之后才销毁 swapchain / 设备（§6.7 的关闭握手由门面负责线程 join）。
+        let _ = self.queue.wait_idle();
+        let _ = self.queue.reset_in_flight_lists();
+    }
+}
+
+/// 一帧录制所需的 GPU 线程独占对象（借用拆分：`GpuRenderer` 的字段在这里按用途分组）。
+struct FrameRecorder<'a> {
+    device: &'a mut Device,
+    queue: &'a mut Queue,
+    pipeline: &'a Pipeline,
+    atlas: &'a mut AtlasTextures,
+    persist: &'a Persist,
+    upload: &'a mut UploadArena,
+    geometry: &'a GeometryRegistry,
+    timer: Option<&'a GpuTimer>,
+    swapchain: Option<&'a Swapchain>,
+    clear_color: [f32; 4],
+    surface: (u32, u32),
+}
+
+impl FrameRecorder<'_> {
+    /// 上传 + 图集 + clear/scissor 绘制 + copy 到 back buffer + 计时（不提交）。
+    fn record(
+        &mut self,
+        slot: FrameSlot,
+        index: FrameIndex,
+        instances: &[u8],
+        clips: &[GpuClipEntry],
+        ops: &[FrameOp],
+        mut resolve: impl FnMut(u32) -> Result<GeometryId, EngineError>,
+        frame: &mut FramePlan,
+        timings: &mut FrameTimings,
+        frame_started: Instant,
+    ) -> Result<RenderStats, EngineError> {
+        let (instance_count, clip_count) =
+            self.upload
+                .write(self.device, self.queue, index, slot.index, instances, clips)?;
+        self.pipeline.write_slot(
+            self.device,
+            slot.index,
+            self.upload.slot(slot.index).instances(),
+            instance_count,
+            self.upload.slot(slot.index).clips(),
+            clip_count,
+        );
+        timings.push(GpuTimerSample {
+            section: Section::Upload,
+            cpu_ns: elapsed_ns(frame_started),
+            gpu_ns: 0,
+        });
+
+        let width = self.surface.0 as f32;
+        let height = self.surface.1 as f32;
+        let root = root_uniform(width, height);
+        let full = frame.is_full();
+        let scissor_whole = RECT {
+            left: 0,
+            top: 0,
+            right: self.surface.0 as i32,
+            bottom: self.surface.1 as i32,
+        };
+
+        let mut draw_calls = 0u32;
+        {
+            let list = self.queue.list(slot);
+            if let Some(timer) = self.timer {
+                timer.begin(list, slot.index);
+            }
+            if self.atlas.has_pending() {
+                self.atlas.record_uploads(self.device, list, slot.index)?;
+            }
+            if full {
+                // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）。
+                unsafe { list.ClearRenderTargetView(self.persist.rtv, &self.clear_color, None) };
+            }
+            bind_frame(list, self.pipeline, self.persist, slot.index, &root);
+            match full {
+                true => {
+                    draw_calls = draw_ops(
+                        list,
+                        self.pipeline,
+                        ops,
+                        self.geometry,
+                        &mut resolve,
+                        &root,
+                        scissor_whole,
+                    )?;
+                }
+                false => {
+                    if let Plan::Partial(damage) = frame.plan() {
+                        for rect in damage.as_slice() {
+                            let scissor = RECT {
+                                left: rect.x0,
+                                top: rect.y0,
+                                right: rect.x1,
+                                bottom: rect.y1,
+                            };
+                            // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
+                            unsafe { list.RSSetScissorRects(&[scissor]) };
+                            draw_calls = draw_calls.saturating_add(draw_ops(
+                                list,
+                                self.pipeline,
+                                ops,
+                                self.geometry,
+                                &mut resolve,
+                                &root,
+                                scissor,
+                            )?);
+                        }
+                    }
+                }
+            }
+            if let Some(swapchain) = self.swapchain {
+                copy_to_back(list, self.persist, swapchain, frame.copy_plan())?;
+            }
+            if let Some(timer) = self.timer {
+                timer.end(list, slot.index);
+            }
+        }
+
+        Ok(RenderStats {
+            draw_calls,
+            instances: instance_count,
+        })
+    }
+}
+
 /// 持久 offscreen（唯一绘制目标；资源格式 UNORM + RTV 视图 sRGB，DEVIATIONS F-80）。
 struct Persist {
     texture: ID3D12Resource,
@@ -419,16 +659,22 @@ impl Persist {
         })
     }
 
-    fn recreate(&mut self, device: &mut Device, size: (u32, u32)) -> Result<(), EngineError> {
+    /// 重建；返回旧纹理的句柄（调用方决定 retire 还是立即释放，I4）。
+    fn recreate(
+        &mut self,
+        device: &mut Device,
+        size: (u32, u32),
+        rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Result<GpuResourceHandle, EngineError> {
         let texture = create_target(device, size)?;
         let handle = device.allocate(texture.clone());
-        device.create_render_target_view(&texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, self.rtv);
-        // resize 前已经 `wait_idle`，旧资源可立即释放。
-        device.release(self.handle);
+        device.create_render_target_view(&texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, rtv);
+        self.rtv = rtv;
+        let old = self.handle;
         self.texture = texture;
         self.handle = handle;
         self.size = size;
-        Ok(())
+        Ok(old)
     }
 }
 
@@ -566,14 +812,15 @@ fn bind_frame(
 fn draw_ops(
     list: &ID3D12GraphicsCommandList,
     pipeline: &Pipeline,
-    buffer: &InstanceBuffer,
+    ops: &[FrameOp],
     geometry: &GeometryRegistry,
+    resolve: &mut impl FnMut(u32) -> Result<GeometryId, EngineError>,
     root: &[f32; ROOT_UNIFORM_DWORDS],
     scissor: RECT,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     let mut quad_bound = false;
-    for op in buffer.ops() {
+    for op in ops {
         match *op {
             FrameOp::Instances { start, len } => {
                 if len == 0 {
@@ -603,13 +850,7 @@ fn draw_ops(
                 clip_index,
                 clip_rect,
             } => {
-                let draw = buffer
-                    .geometry()
-                    .get(index as usize)
-                    .map(|draw| draw.id)
-                    .ok_or_else(|| EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
-                    })?;
+                let draw = resolve(index)?;
                 let entry = geometry
                     .lookup(draw)
                     .ok_or_else(|| EngineError::GeometryRegister {
@@ -643,6 +884,7 @@ fn draw_ops(
     }
     Ok(draw_calls)
 }
+
 fn copy_to_back(
     list: &ID3D12GraphicsCommandList,
     persist: &Persist,
@@ -910,7 +1152,6 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
         detail: smol_str::SmolStr::new_static("d3d12 upload buffer missing"),
     })
 }
-
 #[cfg(test)]
 mod tests {
     use windows::{
@@ -924,7 +1165,7 @@ mod tests {
         core::PCWSTR,
     };
 
-    use super::{Renderer, geometry_root, root_uniform};
+    use super::{GpuRenderer, geometry_root, root_uniform};
     use crate::{
         math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
         paint::{
@@ -950,8 +1191,8 @@ mod tests {
     }
 
     /// WARP 设备不可用时**跳过并诊断**（设计允许；设备被移除过的进程里 WARP 创建可能失败）。
-    fn warp_renderer(size: (u32, u32)) -> Option<Renderer> {
-        match Renderer::new_warp_offscreen(size) {
+    fn warp_renderer(size: (u32, u32)) -> Option<GpuRenderer> {
+        match GpuRenderer::new_warp_offscreen(size) {
             Ok(renderer) => Some(renderer),
             Err(error) => {
                 eprintln!("skip: WARP renderer unavailable: {error}");
@@ -1100,7 +1341,7 @@ mod tests {
         let mut frame = full_plan((8, 8));
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
         let image = renderer.readback().expect("readback");
         // probe：persist 资源 UNORM + RTV 视图 SRGB ⇒ clear(0.5) 的 RGB 只编码一次 = 188；
@@ -1123,7 +1364,7 @@ mod tests {
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         let stats = renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
         assert_eq!(stats.draw_calls, 1, "one non-empty instance op = one draw");
         assert_eq!(stats.instances, 1);
@@ -1149,7 +1390,7 @@ mod tests {
 
         let mut first = full_plan((64, 64));
         let stats = renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
             .expect("full frame");
         assert_eq!(stats.draw_calls, 1, "full frame has one scissor pass");
 
@@ -1159,7 +1400,7 @@ mod tests {
         ];
         let mut second = partial_plan(&damage, (64, 64));
         let stats = renderer
-            .submit(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
             .expect("partial frame");
         assert_eq!(
             stats.draw_calls, 2,
@@ -1185,7 +1426,7 @@ mod tests {
         let mut first = full_plan(size);
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
             .expect("first frame");
 
         let red = one_lane_scene(quad(
@@ -1198,7 +1439,7 @@ mod tests {
         let mut second = partial_plan(&damage, size);
         assert!(matches!(second.plan(), Plan::Partial(_)));
         renderer
-            .submit(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
             .expect("second frame");
 
         let image = renderer.readback().expect("readback");
@@ -1247,7 +1488,7 @@ mod tests {
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
         let image = renderer.readback().expect("readback");
         assert_eq!(
@@ -1300,7 +1541,7 @@ mod tests {
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
         let image = renderer.readback().expect("readback");
         assert_eq!(pixel(&image, 64, 16, 16), [0, 0, 255, 255], "blue texel");
@@ -1313,7 +1554,8 @@ mod tests {
 
     /// 在给定页尺寸上做一次「上传 → 画字形 → 读回」的可见性探测。
     fn glyph_probe(page: u32) -> bool {
-        let Some(mut renderer) = super::Renderer::new_warp_offscreen_with_page((64, 64), page).ok()
+        let Some(mut renderer) =
+            super::GpuRenderer::new_warp_offscreen_with_page((64, 64), page).ok()
         else {
             return false;
         };
@@ -1347,7 +1589,7 @@ mod tests {
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         if renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .is_err()
         {
             return false;
@@ -1383,7 +1625,7 @@ mod tests {
         let mut frame = full_plan((63, 17));
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("submit");
         let image = renderer.readback().expect("readback");
         assert_eq!((image.width, image.height), (63, 17));
@@ -1408,7 +1650,7 @@ mod tests {
         let mut frame = full_plan((32, 32));
         let mut timings = FrameTimings::new();
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("first submit");
 
         renderer.resize((96, 64)).expect("resize");
@@ -1417,7 +1659,7 @@ mod tests {
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
         let mut frame = full_plan((96, 64));
         renderer
-            .submit(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
             .expect("submit after resize");
         let image = renderer.readback().expect("readback");
         assert_eq!((image.width, image.height), (96, 64));
@@ -1493,7 +1735,7 @@ mod tests {
         }
         .expect("hidden window");
 
-        let Ok(mut renderer) = Renderer::new_for_hwnd(hwnd.0 as isize, (64, 64)) else {
+        let Ok(mut renderer) = GpuRenderer::new_for_hwnd(hwnd.0 as isize, (64, 64)) else {
             eprintln!("skip: no hardware D3D12 device for the swapchain test");
             return;
         };
@@ -1503,12 +1745,12 @@ mod tests {
         let mut timings = FrameTimings::new();
         let mut first = full_plan((64, 64));
         renderer
-            .submit(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
             .expect("presented frame");
         let damage = [PhysicalRect::new(0, 0, 32, 32)];
         let mut second = partial_plan(&damage, (64, 64));
         renderer
-            .submit(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
             .expect("dirty frame");
     }
 }

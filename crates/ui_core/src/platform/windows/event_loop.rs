@@ -586,6 +586,21 @@ fn pump(
     mut windows: Vec<NativeWindow>,
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
+    let result = pump_loop(&mut app, &mut windows, &dispatcher);
+    // 关闭顺序（`design/async-render-pipeline.md` §6.7）：先 drop `App`（`Window` →
+    // `Renderer::drop` 里的 GPU 线程 join 握手，期间窗口必须仍然存活），再销毁原生窗口。
+    // 反过来会让 GPU 线程在 HWND 已销毁之后还去 `Present`。
+    drop(app);
+    drop(windows);
+    result
+}
+
+/// 消息泵主体（每轮：消息 → 平台事件 → GPU 反馈 → 关闭 → 应用钩子 + 提交帧 → 阻塞等待）。
+fn pump_loop(
+    app: &mut App,
+    windows: &mut Vec<NativeWindow>,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<(), EngineError> {
     let mut message = MSG::default();
     let mut frame_timer: Option<usize> = None;
     loop {
@@ -608,9 +623,12 @@ fn pump(
 
         // ② 平台事件 → App。
         app.sync_clock();
-        collect_events(&mut app, &mut windows, &dispatcher)?;
+        collect_events(app, windows, dispatcher)?;
 
-        // ②b 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
+        // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
+        app.poll_renderers()?;
+
+        // ②c 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             if let Some(cursor) = app.take_cursor_change() {
@@ -644,26 +662,26 @@ fn pump(
         }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
-        if close_requested_windows(&mut app, &mut windows, &dispatcher)? {
+        if close_requested_windows(app, windows, dispatcher)? {
             return Ok(());
         }
 
         // ④ 应用钩子（读事件 / 写状态），再提交本帧；两段门禁在 `App::frame` 里，闲时是 `Idle`。
         app.run_frame_hook();
         if dispatcher.take_frame_wake() {
-            frame_all(&mut app)?;
+            frame_all(app)?;
         }
 
         // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter
         // 一次机会；`App::a11y_pending` 是 O(1) 过滤，adapter 不活跃时闭包根本不执行（懒激活）。
         for native in windows.iter_mut() {
-            native.update_a11y(&mut app);
-            native.sync_ime_cursor_area(&app);
+            native.update_a11y(app);
+            native.sync_ime_cursor_area(app);
         }
 
         // ⑤ 跨线程回投的任务。
         for task in dispatcher.drain_tasks() {
-            task.run(&mut app);
+            task.run(app);
         }
 
         // ⑥ 阻塞等待（I3）：没有消息时停在这里。
@@ -756,6 +774,8 @@ fn apply_event(
         PlatformEvent::Text(text) => Event::Input(InputEvent::Text { text }),
         PlatformEvent::Ime(ime) => Event::Ime(ime),
         PlatformEvent::Resize { width, height } => {
+            // 只记录尺寸并唤醒（`design/async-render-pipeline.md` §6.7）：`ResizeBuffers` 与
+            // persist 重建都在 GPU 线程按下一帧的 `FrameRequest.surface` 做，UI 线程不等待。
             native.note_client_resize((width, height));
             let size = native.logical_size();
             if let Some(window) = app.window_mut(id) {
@@ -765,6 +785,7 @@ fn apply_event(
             Event::Resized { size }
         }
         PlatformEvent::Dpi { dpi, suggested } => {
+            // DPI 同理：只更新窗口尺寸/比例并唤醒；目标重建由 GPU 线程消费新的 surface。
             let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
                 factor: dpi as f32 / dpi::BASE_DPI as f32,
             })?;

@@ -3,6 +3,8 @@
 //! 设计见 `design/phase-03-node-state.md` §5.2 / §15。P03 是 headless 的：只保存参数，不驱动平台
 //! （平台窗口句柄、DPI 事件、标题栏属 P12）。
 
+use std::time::Instant;
+
 use smol_str::SmolStr;
 
 #[cfg(feature = "test-support")]
@@ -21,8 +23,9 @@ use crate::{
     },
     render::{
         backend::Renderer,
-        compositor::{FramePlan, Plan, plan},
+        compositor::{Plan, plan},
         damage::{DamageAccumulator, DamageSummary},
+        frame::{FramePayload, FrameRequest},
         timer::FrameTimings,
     },
 };
@@ -665,10 +668,20 @@ impl Window {
         self.image_page_received = false;
     }
 
-    /// 轮询 render 线程的完成/错误反馈（macOS 窗口路径；空闲时也要跑）。
-    #[cfg(target_os = "macos")]
+    /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
+    ///
+    /// GPU 线程以错误退出后这里会持续返回同一个错误（粘性），平台泵在下一轮冒泡出去。
     pub(crate) fn poll_renderer(&mut self) -> Result<(), EngineError> {
-        if let Some(renderer) = self.renderer.as_mut() {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        #[cfg(windows)]
+        {
+            // Windows：反馈（统计 / GPU 采样）由渲染器内部消费，这里只把错误冒泡。
+            let _ = renderer.poll()?;
+        }
+        #[cfg(not(windows))]
+        {
             renderer.poll()?;
         }
         Ok(())
@@ -810,9 +823,8 @@ impl Window {
         let index = self.scheduler.commit(ticket);
         self.tree.settle_frame();
         if let Some(mut renderer) = self.renderer.take() {
-            let result = self.submit_gpu(&mut renderer, index, report.damage);
+            let stats = self.submit_gpu(&mut renderer, index, report.damage);
             self.renderer = Some(renderer);
-            let stats = result?;
             #[cfg(feature = "hud")]
             {
                 self.render_stats = stats;
@@ -842,38 +854,37 @@ impl Window {
         Ok(FrameOutcome::Committed(index))
     }
 
-    /// 把本帧交给 GPU（headless 不进入；`renderer` 由调用方临时取出以避免借用冲突）。
+    /// 把本帧交给 GPU：窗口路径只构造 `FrameRequest` 并 `publish`（**不等待**，I1）。
+    ///
+    /// 返回最近一次**已完成**帧的统计（窗口路径落后 ≤1 帧，HUD 允许）；GPU 线程的错误在
+    /// `poll_renderer` 里冒泡，提交路径没有同步错误。
     fn submit_gpu(
         &mut self,
         renderer: &mut Renderer,
         index: FrameIndex,
         damage: DamageSummary,
-    ) -> Result<crate::render::RenderStats, EngineError> {
+    ) -> crate::render::RenderStats {
         let surface = self.physical_surface();
         let frame = Rect::new(0.0, 0.0, self.size().width, self.size().height)
             .to_physical_covering(self.scale);
+        let plan = plan(damage, self.damage.rects(), frame);
+        // §4.4 兜底：没有像素要画且目标尺寸没变 ⇒ 不发布（省掉一次跨线程拷贝）。尺寸/DPI
+        // 变化时必须发布——否则 GPU 线程永远看不到新的 `surface`，也就不会重建目标。
+        if plan == Plan::Idle && renderer.surface() == surface {
+            return crate::render::RenderStats::default();
+        }
         #[cfg(target_os = "macos")]
         renderer.set_scale(f64::from(self.scale.factor()));
-        let fresh = renderer.surface() != surface || renderer.is_fresh();
-        if fresh {
-            renderer.resize(surface)?;
-        }
-        let plan = plan(damage, self.damage.rects(), frame);
-        if plan == Plan::Idle && !fresh {
-            return Ok(crate::render::RenderStats::default());
-        }
-        let mut frame_plan = FramePlan::new(plan, fresh);
-        if frame_plan.is_idle() {
-            return Ok(crate::render::RenderStats::default());
-        }
-        let Window {
-            encoder,
-            timings,
-            damage,
-            ..
-        } = self;
-        let _ = damage;
-        renderer.submit(index, encoder.buffer(), &mut frame_plan, timings)
+        // 窗口路径的 GPU 采样来自 `poll` 的反馈；本帧的同步采样表清空以免 HUD 显示过期数据。
+        self.timings.reset(index);
+        renderer.publish(FrameRequest {
+            index,
+            payload: FramePayload::from_buffer(self.instance_buffer()),
+            plan,
+            surface,
+            scale: self.scale.factor(),
+            published_at: Instant::now(),
+        })
     }
 
     /// 中止（错误路径）：不结算、不递增序号（damage/dirty 保留，下一次重试）。
@@ -991,9 +1002,9 @@ impl Window {
             .timings
             .sample(Section::Present)
             .map(|sample| std::time::Duration::from_nanos(sample.cpu_ns));
-        // macOS 窗口路径的 GPU 工作已移到 render 线程：主线程没有本帧的 samples，
-        // 用最近完成帧的 worker 采样补齐（HUD 允许领先一帧）。
-        #[cfg(target_os = "macos")]
+        // 窗口路径的 GPU 工作已移到 GPU 线程：主线程没有本帧的 samples，
+        // 用最近完成帧的采样补齐（HUD 允许落后一帧）。
+        #[cfg(any(windows, target_os = "macos"))]
         let (upload_time, gpu_time, present_time) = match self.renderer.as_ref() {
             Some(renderer) => (
                 upload_time.or_else(|| {

@@ -2447,8 +2447,9 @@ impl App {
         }
     }
 
-    /// 轮询每个窗口的 render 线程反馈（macOS 窗口路径；设备丢失/编码失败在这里冒泡）。
-    #[cfg(target_os = "macos")]
+    /// 轮询每个窗口的 GPU 线程反馈（三平台窗口路径；设备丢失 / 呈现失败在这里冒泡）。
+    ///
+    /// 平台泵**每轮**调用（空闲时也要跑）：错误是粘性的，早一轮读到就能早一轮退出。
     pub(crate) fn poll_renderers(&mut self) -> Result<(), EngineError> {
         for window in self.windows.values_mut() {
             window.poll_renderer()?;

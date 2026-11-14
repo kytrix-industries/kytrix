@@ -190,7 +190,6 @@ impl InstanceBuffer {
     }
 
     /// `FrameOp::Geometry.index` 的下标表。
-    #[cfg(windows)]
     pub(crate) fn geometry(&self) -> &[GeometryDraw] {
         &self.geometry
     }

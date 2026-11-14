@@ -75,6 +75,29 @@ impl Plan {
     pub(crate) fn is_full(self) -> bool {
         matches!(self, Self::Full)
     }
+
+    /// 两帧的 damage 合并（`design/async-render-pipeline.md` §4.2 / I5）。
+    ///
+    /// UI 线程的「最新帧槽」覆盖旧请求时，旧请求的像素工作没有发生（GPU 线程只会画最新的那份
+    /// 快照），所以它的 damage 必须由后继帧补画：**并集**而不是交集。
+    ///
+    /// 规则（逐字对照 §4.2）：任一 `Full` ⇒ `Full`；否则矩形并集；并集超过
+    /// `MAX_DAMAGE_RECTS` ⇒ `Full`（`Present1` / scissor 的固定容量不能溢出）。
+    pub(crate) fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Idle, other) | (other, Self::Idle) => other,
+            (Self::Partial(older), Self::Partial(newer)) => {
+                let mut merged = DamageRects::new();
+                for rect in older.as_slice().iter().chain(newer.as_slice()) {
+                    if !merged.push(*rect) {
+                        return Self::Full;
+                    }
+                }
+                Self::Partial(merged)
+            }
+        }
+    }
 }
 
 /// 本帧的**唯一**提交状态：绘制范围 `plan` + 「swapchain 是否新建/重建」合并在一起。
@@ -267,5 +290,67 @@ mod tests {
         assert_eq!(rects.len(), MAX_DAMAGE_RECTS);
         assert!(!rects.push(rect));
         assert!(!rects.is_empty());
+    }
+
+    // ── §4.2：最新帧槽的 damage 合并 ─────────────────────────────────────────
+
+    fn partial_plan(rects: &[PhysicalRect]) -> Plan {
+        let mut plan = DamageRects::new();
+        for rect in rects {
+            assert!(plan.push(*rect));
+        }
+        Plan::Partial(plan)
+    }
+
+    #[test]
+    fn merging_with_full_is_full_in_both_orders() {
+        let partial = partial_plan(&[PhysicalRect::new(0, 0, 4, 4)]);
+        assert_eq!(partial.merge(Plan::Full), Plan::Full);
+        assert_eq!(Plan::Full.merge(partial), Plan::Full);
+        assert_eq!(Plan::Idle.merge(Plan::Full), Plan::Full);
+        assert_eq!(Plan::Full.merge(Plan::Full), Plan::Full);
+    }
+
+    #[test]
+    fn merging_with_idle_keeps_the_other_plan() {
+        let partial = partial_plan(&[PhysicalRect::new(1, 2, 3, 4)]);
+        assert_eq!(partial.merge(Plan::Idle), partial);
+        assert_eq!(Plan::Idle.merge(partial), partial);
+        assert_eq!(Plan::Idle.merge(Plan::Idle), Plan::Idle);
+    }
+
+    #[test]
+    fn merging_two_partials_unions_the_rectangles() {
+        let older = [
+            PhysicalRect::new(0, 0, 8, 8),
+            PhysicalRect::new(16, 0, 24, 8),
+        ];
+        let newer = [PhysicalRect::new(0, 16, 8, 24)];
+        let merged = partial_plan(&older).merge(partial_plan(&newer));
+        match merged {
+            Plan::Partial(rects) => {
+                // 旧帧的 damage 在前、新帧的在后：补画顺序与产出顺序一致。
+                let expected: Vec<PhysicalRect> =
+                    older.iter().chain(newer.iter()).copied().collect();
+                assert_eq!(rects.as_slice(), expected.as_slice());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merged_rects_beyond_capacity_degrade_to_full() {
+        let older: Vec<PhysicalRect> = (0..MAX_DAMAGE_RECTS)
+            .map(|index| PhysicalRect::new(index as i32, 0, index as i32 + 1, 1))
+            .collect();
+        let newer = [PhysicalRect::new(0, 8, 1, 9)];
+        assert_eq!(
+            partial_plan(&older).merge(partial_plan(&newer)),
+            Plan::Full,
+            "17 个矩形超出固定容量 ⇒ 全量"
+        );
+        // 恰好装满不算超限。
+        let exactly = partial_plan(&older[..MAX_DAMAGE_RECTS - 1]).merge(partial_plan(&newer));
+        assert!(matches!(exactly, Plan::Partial(rects) if rects.len() == MAX_DAMAGE_RECTS));
     }
 }
