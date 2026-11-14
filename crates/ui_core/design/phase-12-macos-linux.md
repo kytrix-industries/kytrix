@@ -937,6 +937,11 @@ pub(crate) struct AtlasTextures {
 
 ### 6.6 `linux/compositor.rs` — `Renderer` + barrier 表
 
+> 本节记录 P12 落地时的同步形态；窗口路径此后改为 `async-render-pipeline.md` §7 的「每窗口一条
+> `kytrix-vulkan` 线程 + fence/timeline 观察完成」异步提交（§7.3 的序列与下面的 barrier 表
+> 一致）。`Renderer` 现已拆成 `GpuRenderer`（本文件）+ `render/linux/renderer.rs`（门面/线程，
+> F-167）；步骤 1/13 的 `wait_for_fences` 在异步路径里只保留「复用槽位之前」的那一次。
+
 ```rust
 pub(crate) struct Renderer {
     instance: Instance,
@@ -977,7 +982,11 @@ submit(index, buffer, plan, timings):
   9. cmd_copy_image(persist 整面 → swapchain image 整面)        // 每帧整面（§0 #4）
  10. swapchain image：TRANSFER_DST_OPTIMAL → PRESENT_SRC_KHR
  11. timer：cmd_reset_query_pool + write_timestamp(TOP_OF_PIPE, 0) … write_timestamp(BOTTOM_OF_PIPE, 1)
- 12. end_command_buffer → queue_submit(wait: acquire_semaphore(STAGE_COLOR_ATTACHMENT_OUTPUT), signal: render_finished[slot] + timeline=index)
+ 12. end_command_buffer → queue_submit(wait: acquire_semaphore(STAGE_TRANSFER), signal: render_finished[slot] + timeline=index)
+     // acquire 的 wait stage 必须是 TRANSFER：本帧第一次使用 swapchain image 的是第 8 步的
+     // layout transition + 第 9 步的 copy（《async-render-pipeline》§7.3 / F-168；写成
+     // COLOR_ATTACHMENT_OUTPUT 时 transition 与 acquire 信号量没有依赖链，syncval 报
+     // SYNC-HAZARD-WRITE-AFTER-READ）
  13. wait_for_fences(fences[slot])（signal 的 fence）
  14. queue_present(wait: render_finished[slot], image_index, pNext = present_regions hint)
  15. drain_retire(index)；timings：Upload / Gpu（query pool）/ Present
@@ -989,7 +998,7 @@ submit(index, buffer, plan, timings):
 |-----------------|----------------------------------------------------------|----------------------------------------|---------------------------|
 | persist         | `COLOR_ATTACHMENT_OPTIMAL` → `TRANSFER_SRC_OPTIMAL`      | `COLOR_ATTACHMENT_OUTPUT` → `TRANSFER` | draw 之后                 |
 | persist         | `TRANSFER_SRC_OPTIMAL` → `COLOR_ATTACHMENT_OPTIMAL`      | `TRANSFER` → `COLOR_ATTACHMENT_OUTPUT` | copy 之后（下一帧绘制前） |
-| swapchain image | `UNDEFINED` → `TRANSFER_DST_OPTIMAL`                     | `TOP_OF_PIPE` → `TRANSFER`             | copy 之前                 |
+| swapchain image | `UNDEFINED` → `TRANSFER_DST_OPTIMAL`                     | `TRANSFER` → `TRANSFER`                | copy 之前                 |
 | swapchain image | `TRANSFER_DST_OPTIMAL` → `PRESENT_SRC_KHR`               | `TRANSFER` → `BOTTOM_OF_PIPE`          | copy 之后                 |
 | 图集纹理        | `SHADER_READ_ONLY` → `TRANSFER_DST` → `SHADER_READ_ONLY` | 见 §6.5                                | 仅有脏行时                |
 | 上传 buffer     | 无（HOST_COHERENT，fence 保证不重叠）                    | —                                      | —                         |

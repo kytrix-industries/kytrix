@@ -493,7 +493,7 @@ poll() ◄──────────────── 反馈槽            
 | 原语 | 数量 | 用途 |
 |---|---|---|
 | `VkFence` | 每帧槽（3） | 复用该槽的命令缓冲/上传缓冲前等待；`Submit` 时 signal |
-| `image_available` 二值信号量 | 每帧槽（3） | `acquire` 时 signal，`Submit` 时 wait（`COLOR_ATTACHMENT_OUTPUT`） |
+| `image_available` 二值信号量 | 每帧槽（3） | `acquire` 时 signal，`Submit` 时 wait（`TRANSFER`：swapchain image 的首次使用是 layout transition + 整面 copy） |
 | `render_finished` 二值信号量 | **每 swapchain image** | `Submit` 时 signal，`Present` 时 wait |
 | timeline 信号量 | 1 | 每帧 signal 一个值；retire 用 `vkGetSemaphoreCounterValue` 推进 |
 
@@ -545,7 +545,8 @@ loop {
 ```
 
 - 槽 fence 是「复用命令缓冲 / 上传缓冲」与「安全地再次 signal `image_available[slot]`」的共同前置条件，因此必须在 acquire 之前等（§7.2 的两条硬规则不因此改变）。
-- **实现修订中**：平台代码的「先等槽 fence、再 acquire」顺序已与本文一致；`image_available` 的 wait stage 仍是 `COLOR_ATTACHMENT_OUTPUT`，由平台 SubAgent 改为 `TRANSFER`（F-168，§15.3）。
+- `image_available` 的 wait stage 与 swapchain image 首个 layout transition 的 `srcStageMask` **都必须是 `TRANSFER`**（dst 已经是 `TRANSFER`）：本后端不直接往 swapchain image 上画，首次访问是 transition + 整面 copy。写成 `COLOR_ATTACHMENT_OUTPUT` / `TOP_OF_PIPE` 时 transition 与 acquire 信号量没有依赖链，syncval 报 `SYNC-HAZARD-WRITE-AFTER-READ`（F-168，§15.4）。
+- 反馈只在**观察到 timeline 完成**时发布（§15.4）：每轮循环先 `vkGetSemaphoreCounterValue` 推进 retire，再按提交顺序发布 `signal <= 完成值` 的帧；有在飞帧时 condvar 用 4 ms 超时（完成不会唤醒 condvar），否则无限等待（0 自旋）。
 
 - 等待只发生在 GPU 线程；UI 线程的 `publish` 不碰 Vulkan。
 - `vkQueuePresentKHR` 内部会 `wl_display_flush`（Mesa 实现），因此 GPU 线程必须能安全地操作连接（§7.5）。
@@ -590,7 +591,8 @@ recreate_swapchain():
 
 - `VK_ERROR_DEVICE_LOST` ⇒ 粘性 `EngineError::DeviceLost`；`OUT_OF_DATE/SURFACE_LOST` 按 §7.4 重建；`SUBOPTIMAL` 只标记重建。
 - `vkQueueSubmit`/`vkQueuePresentKHR` 失败一律先分类 device-lost，再落到 `EngineError::Swapchain`（沿用现状）。
-- 关闭：UI 线程 signal shutdown 后**直接 `join`**（不再 2 s 超时后 detach；§6.7 的「UI 线程允许在关闭时等待」同样适用，F-169）。GPU 线程 `vkDeviceWaitIdle`（允许，退出路径）→ 销毁 swapchain/persist/命令池 → 退出。`acquire` 的 100 ms 上限保证遮挡/合成器停摆时 join 有界（最坏多等一个超时周期）。
+- 关闭：UI 线程 signal shutdown 后**直接 `join`**（不再 2 s 超时后 detach；§6.7 的「UI 线程允许在关闭时等待」同样适用，F-169）。GPU 线程 `vkDeviceWaitIdle`（允许，退出路径）→ 销毁 swapchain/persist/命令池 → 退出。`acquire` 的 100 ms 上限保证遮挡/合成器停摆时 join 有界（最坏多等一个超时周期）。`join` 返回即 teardown 完成（`GpuRenderer` 在通知之前显式 drop）。
+- panic 出路：GPU 线程展开时 `PanicGuard` 把 `EngineError::AppInit { detail: "kytrix-vulkan thread panicked" }` 发布到共享错误槽（不覆盖循环已发布的错误，并置 `terminated`），平台泵的 `poll()` 因此看到错误而不是静默停摆（F-170）。
 
 ---
 
@@ -787,15 +789,31 @@ SubAgent 落实的条目单独标「实现修订中」（§15.3）。
   窗口帧率」未实测。
 - **HUD 实机数值**（§10.3）：Windows 已采样（demo + HUD：64 fps、`Latency` ≈ 7–9 ms，跨 10 s
   不增长；其中完成观测点本身 ≈ 0.1 ms，其余是 waitable 的 vsync 排队——I3 的既有语义）；
-  macOS/Linux 尚未采样。
+  Linux 已采样（headless sway + lavapipe，demo + HUD：59.7–60.1 fps、`Latency` 在 2 s / 6 s / 10 s
+  三次采样为 1.80 / 1.96 / 1.89 ms（不累积；syncval 下 1.90 ms），`Gpu` 1.24–1.58 ms，
+  完成观测点自身 < 1 ms）。macOS 尚未采样。
 
 ### 15.3 实现修订中
 
 以下条款的**文档**已按修订后的语义改写，平台代码由后续 SubAgent 落实：
 
-- §7.7 的关闭握手（Linux/macOS 部分）：Windows 已落实（`MsgWaitForMultipleObjects` 无限边泵
-  边等，见 §15.1）；Linux/macOS 的 `Renderer::drop` 仍是 `recv_timeout` 2 s 后 detach，需改为
-  直接 `join`（有界于 `acquire` 的 100 ms 超时），F-169。
-- §7.3 的 `image_available` wait stage：平台代码的「先等槽 fence、再 acquire」顺序已与本文一致，
-  但 wait stage 仍是 `COLOR_ATTACHMENT_OUTPUT`，需改为 `TRANSFER`（F-168）。
+- §7.7 的关闭握手（macOS 部分）：Windows / Linux 已落实（Linux 见 §15.4）；macOS 的
+  `Renderer::drop` 仍是 `recv_timeout` 2 s 后 detach，需改为直接 `join`（有界于 `acquire`
+  的 100 ms 超时），F-169。
+
+### 15.4 Linux 修订记录
+
+Linux/Vulkan 后端的对抗性审查修复（`fix(linux): wait acquire at TRANSFER, join on shutdown,
+publish feedback on timeline completion`）。实机口径：Ubuntu 26.04 / lavapipe / headless sway
+（`WLR_BACKENDS=headless` + `WLR_RENDERER=pixman`），demo + HUD 10 s。
+
+| 项 | 修订 |
+|---|---|
+| **P0 acquire 信号量的 wait stage**（F-168） | `image_available[slot]` 的 `wait_dst_stage_mask` 改为 `TRANSFER`；`copy_to_swapchain` 的 `UNDEFINED → TRANSFER_DST` barrier 的 `srcStageMask` 由 `TOP_OF_PIPE` 改为 `TRANSFER`（dst 已是 `TRANSFER`）。本实现不直接往 swapchain image 上画，首次访问就是 transition + 整面 copy，因此只留 `TRANSFER`。修复前 syncval 稳定报 4 条 `SYNC-HAZARD-WRITE-AFTER-READ`（`vkCmdPipelineBarrier` 与 `vkAcquireNextImageKHR` 无依赖链），修复后 syncval 10 s **0 条**。`incremental_present` 的 `pNext` 不受影响（§7.3） |
+| **P1 关闭握手**（F-169） | 删除 `ExitSignal`、`JOIN_TIMEOUT`、`recv_timeout(2s)` + detach：`WindowRenderer::drop` 只做 `signal shutdown → thread.join()`（无超时）。`gpu_loop` 持有局部 `Option<GpuRenderer>`，循环结束显式 `drop(renderer.take())` 之后线程才返回，因此 `join` 返回 = teardown（`vkDeviceWaitIdle` / swapchain / persist / device）已完成。实机 `swaymsg kill` 与 `wtype -k Escape` 均 exit 0、关闭 109–116 ms，无 join 卡住 |
+| **P1 panic 出路**（F-170） | 新增 `PanicGuard`：`gpu_loop` 展开时（`std::thread::panicking()`）向共享错误槽发布 `EngineError::AppInit { detail: "kytrix-vulkan thread panicked" }` 并置 `terminated`，`poll()` 不会静默停摆；正常退出 `disarm()`，不覆盖循环已发布的错误，`publish_panic` 也不覆盖已有错误（3 条单测） |
+| **P2 反馈改到完成时** | 提交时把 `{index, stats, CPU samples, published_at, timeline_value(signal), slot}` 放进 pending 队列；每轮循环用 `vkGetSemaphoreCounterValue` 非阻塞推进，观察到完成之后按提交顺序发布 `FrameFeedback { index, stats, samples(+此处 resolve 的 GPU 采样), completed_at, latency }`，retire 在同一观测点推进。GPU 采样不再在提交点读（避免读在飞槽），只在完成之后 resolve。等待策略：pending 非空时 `Condvar::wait_timeout(4ms)`，其余无限等待（0 自旋）——避免最后一帧的反馈永远不发布 |
+| **P2 samples 断言** | `feedback.samples.len() <= 4` → `<= 3`（Upload / Gpu / Present，`FrameTimings` 只有这三段） |
+| **P2 atlas staging 只有一份** | 本次不改：`frame_ready` 门禁把在飞帧压到 ≤ 1（UI 只在上一帧的 `wl_callback.done` 之后发布下一帧，而该回调意味着合成器已取走上一帧 image、其 `render_finished` 依赖的 copy 必然完成），CPU 写 staging 与 GPU 读 staging 不会重叠。代码与 §7.3 已显式登记该设计假设：**在飞 ≤ 1**；放开在飞帧数时必须按帧槽拆分 staging 或先等该帧 fence |
+| 验证 | `cargo check -p ui_core --all-targets` 与 `--features hud,test-support` 全绿；lib tests **632 passed / 0 failed**；snapshot 8/8；hud 7/7；`cargo +nightly clippy -p ui_core --all-targets -- -D warnings` 全绿；`cargo +nightly fmt --check` 全绿；实机普通 validation 10 s **0 error / 0 warning**；syncval 10 s **0 SYNC-HAZARD**（评审复现用的 `VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT` 旧写法只剩 `VALIDATION-SETTINGS` 的弃用提示，不是 API 用法告警；改用 `VK_LAYER_VALIDATE_SYNC=1` 时日志完全为空）；resize 1280×720 → 900×600 → 640×480 正常（HUD `640x480 @ 1.00x Vulkan`）；HUD `Latency` 在 2 s / 6 s / 10 s 为 1.80 / 1.96 / 1.89 ms（不累积）；关闭见上 |
 
