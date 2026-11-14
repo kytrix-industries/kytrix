@@ -88,6 +88,23 @@ impl RetireQueue {
         released
     }
 
+    /// 丢弃全部待释放句柄（teardown：调用方保证 GPU 已空闲）。返回释放的句柄数。
+    ///
+    /// 正常路径只应由 [`RetireQueue::on_completed`] 推进：没提交的帧（错误路径）永远不会
+    /// 完成，它们的句柄只能在 teardown 一次性释放。目前只有 Linux 的 `Device::drop` 需要它
+    /// （其它后端的错误路径不把未提交的句柄放进 retire 队列）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn drain_all(&mut self, free: &mut impl FnMut(GpuResourceHandle)) -> usize {
+        let mut released = 0;
+        while let Some((_, handles)) = self.frames.pop_front() {
+            for handle in handles {
+                free(handle);
+                released += 1;
+            }
+        }
+        released
+    }
+
     /// 尚未释放的句柄数（测试 / 诊断）。
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {

@@ -496,6 +496,23 @@ impl Device {
         destroyed
     }
 
+    /// 释放 retire 队列里的**全部**句柄（teardown 专用；调用方保证 GPU 已空闲）。
+    ///
+    /// 正常路径由 fence / timeline 推进 [`Device::drain_retire`]。但 map 失败、录制后失败、
+    /// device lost 的帧永远不会 submit，也就永远到不了它 retire 时登记的序号 —— 那些句柄只能
+    /// 在 teardown 一次性释放。[`Device::drop`] 在 `vkDestroyDevice` 之前调用本方法。
+    pub(crate) fn drain_all_retired(&mut self) -> usize {
+        let raw = self.raw.clone();
+        let mut destroyed = 0;
+        self.retire.drain_all(&mut |handle| {
+            if let Some(object) = self.resources.take(handle) {
+                object.destroy(&raw);
+                destroyed += 1;
+            }
+        });
+        destroyed
+    }
+
     /// 尚未释放的 retire 句柄数（测试：一次性 staging 的生命周期）。
     #[cfg(test)]
     pub(crate) fn pending_retired(&self) -> usize {
@@ -509,6 +526,10 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        // 未提交的错误路径（map 失败 / 录制后失败 / device lost）留下的 retire 句柄在这里
+        // 兜底释放：`GpuRenderer::drop` 已经 `queue_wait_idle`，必须在 `vkDestroyDevice` 之前
+        // 真正销毁它们，而不是留给设备隐式回收。
+        self.drain_all_retired();
         // SAFETY: 所有子资源必须由调用方先销毁（`GpuRenderer::drop` 保证顺序）。
         unsafe {
             for fence in self.fences {

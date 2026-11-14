@@ -244,6 +244,9 @@ impl AtlasTexture {
         // 一次性 staging 只装本次行区间（`length` 字节）；缓冲在 `index` 完成之前不得释放。
         let staging = OneShotStaging::new(device, length as u64)?;
         if let Err(error) = staging.write(device, offset, &pending.pixels, length) {
+            // 这一帧不会再 submit（录制被错误中止）：它的序号永远不会出现在 timeline 上，
+            // `drain_retire(last_index)` 到不了这里。仍按正常生命周期 retire，由 teardown 的
+            // [`Device::drain_all_retired`] 兜底释放（map 失败 / 录制后失败 / device lost 同路）。
             staging.retire(device, index);
             return Err(error);
         }
@@ -697,10 +700,10 @@ mod tests {
 
     /// P1 回归：两帧在飞时各自持有自己的 staging。
     ///
-    /// 旧实现是**每张页一块**复用 staging：第 2 帧录制时的 CPU `memcpy` 会把第 1 帧还在等
-    /// GPU copy 的字节覆盖掉（同一页、同一偏移），于是第 1 帧把第 2 帧的像素写进了自己的行。
-    /// 这里把两帧都**先录制、再提交**（相当于第 1 帧在飞时第 2 帧开始录制），一次性 staging
-    /// 让两次上传互不干扰：第 5 行必须是第 1 帧的颜色，第 7 行必须是第 2 帧的颜色。
+    /// 旧实现是**每张页一块**复用 staging：第 2 帧录制时的 CPU `memcpy` 会把第 1 帧还没提交
+    /// 的 copy 要读的字节覆盖掉。这里让两帧上传**同一行**、都先录制再提交（第 1 帧在飞时第 2
+    /// 帧开始录制）：旧实现下第 1 帧提交后读到的是第 2 帧的橙色（同一行、同一偏移），像素断言
+    /// 直接失败；一次性 staging 下第 1 帧必须读到自己写入的深蓝，第 2 帧再把它覆盖成橙色。
     #[test]
     fn consecutive_uploads_do_not_share_staging_while_frames_are_in_flight() {
         let instance = VulkanInstance::new_headless().expect("headless Vulkan instance");
@@ -709,7 +712,7 @@ mod tests {
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
-        // 第 1 帧：第 5 行 = 不透明深蓝（BGRA）。
+        // 第 1 帧：第 5 行 = 不透明深蓝（BGRA）。先只录制，不提交。
         let mut first_page = page();
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
         atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
@@ -718,29 +721,34 @@ mod tests {
             .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
             .expect("record frame 1");
         end(&device, commands[0]);
-        assert_eq!(
-            device.pending_retired(),
-            2,
-            "每次上传各自一块一次性 staging（buffer + memory）"
-        );
 
-        // 第 2 帧：第 7 行 = 不透明橙。第 1 帧还没提交/完成。
+        // 第 2 帧：**同一行** = 不透明橙。第 1 帧还没提交/完成：旧实现会在这里覆盖第 1 帧
+        // staging 里的字节。
         let mut second_page = page();
-        fill_row(&mut second_page, 7, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, second_page, rows(7, 8));
+        fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
+        atlas.queue_upload(AtlasKind::Image, second_page, rows(5, 6));
         begin(&device, commands[1]);
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
             .expect("record frame 2");
         end(&device, commands[1]);
+
+        // 第 1 帧完成：它写进第 5 行的必须是**自己的**深蓝，而不是第 2 帧的橙。旧实现（两张页
+        // 共用一块 staging）会在这里失败 —— 像素先于任何 retire 计数断言暴露共享写入。
+        submit_and_wait(&device, commands[0]);
+        assert_eq!(
+            read_row(&device, pool, atlas.image.image, 5),
+            [0x11, 0x22, 0x33, 0xFF],
+            "第 1 帧的 copy 必须读到自己 staging 的字节（旧实现读到的是第 2 帧覆盖后的橙）"
+        );
+        // 两帧各自的 staging（buffer + memory）都还在：提交完成 != retire 推进，第 2 帧也
+        // 还没提交。
         assert_eq!(
             device.pending_retired(),
             4,
-            "两帧都在飞时两块 staging 都不得释放"
+            "每次上传各自一块一次性 staging，两帧都在飞时都不得释放"
         );
-
-        // 第 1 帧完成：只释放它自己的 staging。
-        submit_and_wait(&device, commands[0]);
+        // 只释放第 1 帧自己的 staging：第 2 帧还没提交，完成前沿到不了它。
         assert_eq!(
             device.drain_retire(FrameIndex::from_raw(1)),
             2,
@@ -751,24 +759,87 @@ mod tests {
             2,
             "第 2 帧的 staging 必须活到第 2 帧完成"
         );
-        submit_and_wait(&device, commands[1]);
-        assert_eq!(device.drain_retire(FrameIndex::from_raw(2)), 2);
-        assert_eq!(device.pending_retired(), 0, "两帧都完成后不得残留句柄");
 
+        // 第 2 帧完成：后一帧覆盖前一帧，之后再释放它的 staging。
+        submit_and_wait(&device, commands[1]);
         assert_eq!(
             read_row(&device, pool, atlas.image.image, 5),
-            [0x11, 0x22, 0x33, 0xFF],
-            "第 1 帧的行"
-        );
-        assert_eq!(
-            read_row(&device, pool, atlas.image.image, 7),
             [0x44, 0x55, 0x66, 0xFF],
-            "第 2 帧的行"
+            "后一帧的像素覆盖前一帧"
         );
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(2)), 2);
+        assert_eq!(device.pending_retired(), 0, "两帧都完成后不得残留句柄");
         assert_eq!(
             read_row(&device, pool, atlas.image.image, 6),
             [0, 0, 0, 0],
             "未上传的行保持原样"
+        );
+
+        // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
+        unsafe { device.raw().destroy_command_pool(pool, None) };
+    }
+
+    /// P2 回归：未提交的帧 retire 的 staging 由 teardown drain 释放。
+    ///
+    /// `map_memory` 失败无法注入，但失败路径的后果与这里一致：`record_upload` 先把 staging
+    /// `retire(index)` 再返回 `Err`，而该帧永远不会 submit ⇒ timeline 永远到不了这个序号。
+    /// 旧的 teardown（`drain_retire(last_index)`）只推进到最后一个**成功提交**的帧，放不掉它：
+    /// 两个句柄留在 `ResourceTable` 里直到 `vkDestroyDevice`。`Device::drop` 现在先
+    /// [`Device::drain_all_retired`]，覆盖 map 失败 / 录制后失败 / device lost 三条错误路径。
+    #[test]
+    fn teardown_drain_releases_retired_staging_of_a_frame_that_never_submitted() {
+        let instance = VulkanInstance::new_headless().expect("headless Vulkan instance");
+        let mut device = Device::new(&instance).expect("Vulkan device");
+        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let pool = command_pool(&device);
+        let commands = allocate(&device, pool, 2);
+
+        // 第 1 帧真正提交并完成：`last_index` 推进到 1。
+        let mut first_page = page();
+        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
+        atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
+        begin(&device, commands[0]);
+        atlas
+            .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
+            .expect("record frame 1");
+        end(&device, commands[0]);
+        submit_and_wait(&device, commands[0]);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 2);
+
+        // 第 2 帧：staging 已 retire 在序号 2，但录制随后的失败让这一帧从未 submit。
+        let mut second_page = page();
+        fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
+        atlas.queue_upload(AtlasKind::Image, second_page, rows(5, 6));
+        begin(&device, commands[1]);
+        atlas
+            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
+            .expect("record frame 2");
+        end(&device, commands[1]);
+        assert_eq!(device.pending_retired(), 2);
+
+        // 旧 teardown 只 drain 到 `last_index`（= 1）：这两个句柄留在表里。
+        assert_eq!(
+            device.drain_retire(FrameIndex::from_raw(1)),
+            0,
+            "未提交的序号不参与完成前沿"
+        );
+        assert_eq!(
+            device.pending_retired(),
+            2,
+            "旧 teardown 路径会把它们留到 vkDestroyDevice"
+        );
+
+        // 新的 teardown drain：设备销毁前把剩下的句柄全部真正释放。
+        assert_eq!(
+            device.drain_all_retired(),
+            2,
+            "teardown 必须销毁未提交帧的 buffer + memory"
+        );
+        assert_eq!(device.pending_retired(), 0, "teardown 之后不得残留句柄");
+        assert_eq!(
+            read_row(&device, pool, atlas.image.image, 5),
+            [0x11, 0x22, 0x33, 0xFF],
+            "未提交的帧没有改动图集：第 5 行仍是第 1 帧的深蓝"
         );
 
         // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
