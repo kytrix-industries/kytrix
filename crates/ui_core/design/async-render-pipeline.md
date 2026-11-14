@@ -391,7 +391,8 @@ loop {
         if shutdown { return; }             // 关闭：`request_shutdown` 置位 completion 把这里唤醒；
                                             // waitable 没被消费，不能再等它（驱动/遮挡会让关闭挂死）
     }
-    if shutdown { return; }
+    if shutdown { return; }             // 关闭：waitable 即使刚被消费也不 present（swapchain 随即
+                                        // 销毁，没有下一帧需要这个令牌）
     // **token 守恒：消费 waitable ⇒ 本帧必须 present。** 两个「不画」的出口（取帧失败、Idle 帧）
     // 都必须在消费之前判掉：`has_pending_frame()` 已保证取得到帧（帧槽只有本线程消费），而
     // `window.rs` 在目标未重建时根本不发布 Idle 计划（surface 变化会先 resize 并把 fresh 置真）。

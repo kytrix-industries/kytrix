@@ -658,9 +658,11 @@ fn run_gpu_loop(
         // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
         // 渲染的是最新快照而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
         // 等待期间 completion 也可能到达：先发布反馈再继续等同一个 waitable（auto-reset 只能
-        // 消费一次，不能「等到了又重等」）。
+        // 消费一次，不能「等到了又重等」；关闭是这条规则的唯一例外，见 `wait_for_waitable`）。
         wait_for_waitable(renderer, shared, submitted)?;
         if shared.shutdown_requested() {
+            // 关闭：waitable 可能刚被消费（它与关闭同时到达），本帧不 present —— swapchain 随
+            // 线程退出一起销毁，没有下一帧需要这个令牌。
             return Ok(());
         }
         // waitable 一旦被消费就必须 present（§6.3 的 token 守恒）：`has_pending_frame()` 已在
