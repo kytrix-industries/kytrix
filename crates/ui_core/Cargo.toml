@@ -138,6 +138,8 @@ objc2-core-foundation = { workspace = true }
 objc2-core-graphics = { workspace = true }
 accesskit = { workspace = true }
 accesskit_macos = { workspace = true }
+# 完成通知：`MTLCommandBuffer::addCompletedHandler:` 收 ObjC block（已在 Cargo.lock）。
+block2 = { workspace = true }
 # metallib 加载：MTLDevice::newLibraryWithData:error: 收 DispatchData（已在 Cargo.lock，零新 crate）
 dispatch2 = { workspace = true }
 

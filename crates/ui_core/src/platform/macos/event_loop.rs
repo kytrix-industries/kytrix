@@ -77,7 +77,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         let native = NativeWindow::create(mtm, id, &options, &dispatcher)?;
         let scale = native.scale();
         let size = native.physical_size();
-        let renderer = Renderer::new_for_layer(size, f64::from(scale.factor()))?;
+        let renderer = Renderer::new_for_layer(
+            size,
+            f64::from(scale.factor()),
+            native.maximum_frames_per_second(),
+        )?;
         {
             let layer = renderer
                 .layer_handle()
@@ -230,6 +234,14 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     let wake = state.dispatcher.take_frame_wake();
     if wake || (tick && app.needs_continuous_frames()) {
         frame_all(app)?;
+    }
+
+    // display link 的节奏（§5.3）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停（空闲 0 唤醒）。
+    let continuous = app.needs_continuous_frames();
+    for native in state.windows.iter() {
+        if let Some(window) = app.window_mut(native.id()) {
+            window.sync_pacing(continuous);
+        }
     }
 
     // 交互反馈：光标（v1 只支持系统箭头）；macOS 的指针捕获是隐式的，请求直接丢弃。

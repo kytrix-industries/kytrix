@@ -145,8 +145,8 @@ impl NativeWindow {
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
     ///
-    /// 只在这里把 layer 交给 AppKit；之后的 `contentsScale` / `drawableSize` 全部由 render
-    /// 线程写（主线程再写会与 `nextDrawable` 竞争）。
+    /// 只在这里把 layer 交给 AppKit；`contentsScale` / `drawableSize` 的唯一写者是**主线程**的
+    /// `Renderer::set_layer_scale`（§5.3），GPU 线程只读 drawable 的实际尺寸。
     pub(crate) fn attach_layer(&self, layer: Retained<CAMetalLayer>) {
         self.view.setLayer(Some(&layer));
     }
@@ -171,6 +171,15 @@ impl NativeWindow {
     /// 物理像素尺寸（建渲染器 / resize 的唯一输入）。
     pub(crate) fn physical_size(&self) -> (u32, u32) {
         dpi::physical_size(self.logical_size, self.scale)
+    }
+
+    /// 窗口所在屏幕的最大刷新率（display link 的 `preferredFrameRateRange` 上界，§5.3）。
+    ///
+    /// 取不到屏幕（完全离屏 / 无显示器）时退回 60 Hz；高刷屏由系统给真值。
+    pub(crate) fn maximum_frames_per_second(&self) -> f32 {
+        self.window
+            .screen()
+            .map_or(60.0, |screen| screen.maximumFramesPerSecond() as f32)
     }
 
     /// 取走本轮平台事件。

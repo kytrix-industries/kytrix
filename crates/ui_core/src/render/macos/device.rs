@@ -14,6 +14,24 @@ use smol_str::SmolStr;
 
 use crate::{error::EngineError, render::retire::GpuResourceHandle};
 
+thread_local! {
+    /// 当前线程是否是 `kytrix-metal` GPU 线程（`design/async-render-pipeline.md` §10.1 的
+    /// 线程归属断言）。
+    static ON_GPU_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 标记当前线程为 GPU 线程（`render/macos/renderer.rs` 的循环入口调用一次）。
+pub(crate) fn enter_gpu_thread() {
+    ON_GPU_THREAD.set(true);
+}
+
+/// 所有**窗口路径**的 Metal 提交都必须在 GPU 线程上（对象构造阶段除外，§3.1）。
+///
+/// 离屏 / 快照路径由门面在 UI 线程同步调用，因此断言只放在「窗口目标」的入口上。
+pub(crate) fn on_gpu_thread() -> bool {
+    ON_GPU_THREAD.get()
+}
+
 /// D8 硬基线（错误文案与安装器共用的唯一来源）。
 pub(crate) const D8_REQUIRED: &str =
     "Metal device / Argument Buffers Tier 2 / maxBufferLength >= 256 MiB";

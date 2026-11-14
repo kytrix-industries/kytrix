@@ -10501,6 +10501,7 @@ dependencies = [
  "ahash",
  "ash",
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "bytemuck",
  "bytes",
  "calloop",

@@ -69,6 +69,9 @@ ash = { version = "0.38.0", default-features = false, features = [
 base64 = "0.23.1"
 bindgen = "0.73.2"
 bitflags = "2.13.2"
+# Metal 的 `addCompletedHandler:`（异步完成通知）收 ObjC block；已在 Cargo.lock 的
+# objc2 传递依赖里（0.6.2），这里只把它提为直接依赖，不引入新 crate（§5.2）。
+block2 = "0.6.2"
 boa_engine = "0.22.0"
 bs58 = "0.5.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -176,6 +179,7 @@ objc2-foundation = { version = "0.3.2", features = [
 objc2-metal = { version = "0.3.2", features = [
     "std",
     "alloc",
+    "block2",
     "MTLBlitCommandEncoder",
     "MTLBuffer",
     "MTLCommandBuffer",
@@ -198,9 +202,12 @@ objc2-metal = { version = "0.3.2", features = [
 objc2-quartz-core = { version = "0.3.2", features = [
     "std",
     "alloc",
-    "CAMetalLayer",
-    "CATransaction",
+    "CAFrameRateRange",
     "CALayer",
+    "CATransaction",
+    "CAMetalDisplayLink",
+    "CAMetalLayer",
+    "objc2-metal",
 ] }
 p256 = "0.14.0"
 parking_lot = "0.13.0"

@@ -681,6 +681,17 @@ impl Window {
         Ok(())
     }
 
+    /// display link 的暂停/恢复（macOS 平台泵**每轮**调用一次，§5.3 / I3）。
+    ///
+    /// 三平台里只有 macOS 需要它：Windows/Linux 的节奏完全由事件 / 合成器驱动，没有可暂停的源。
+    /// 离屏渲染器的 `sync_pacing` 是空操作。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn sync_pacing(&mut self, continuous: bool) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.sync_pacing(continuous);
+        }
+    }
+
     /// 启用**离屏** GPU 渲染（headless 行为不变：不调用就恒为 `None`）。
     ///
     /// P09 的原生窗口层会在此之后 attach swapchain；本方法本身只把窗口的绘制目标变成
@@ -868,7 +879,7 @@ impl Window {
             return crate::render::RenderStats::default();
         }
         #[cfg(target_os = "macos")]
-        renderer.set_scale(f64::from(self.scale.factor()));
+        renderer.set_layer_scale(surface, self.scale.factor());
         // 窗口路径的 GPU 采样来自 `poll` 的反馈；本帧的同步采样表清空以免 HUD 显示过期数据。
         self.timings.reset(index);
         renderer.publish(FrameRequest {

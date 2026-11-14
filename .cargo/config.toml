@@ -1,3 +1,9 @@
 [alias]
 # Runs the workspace tooling crate: `cargo xtask bump-version <major|minor|patch>`.
 xtask = "run --package xtask --"
+
+[env]
+# `CAMetalDisplayLink`（异步呈现节奏的唯一原生原语）要求 macOS 14.0+
+# （`design/async-render-pipeline.md` §5.3）。强制覆盖环境里的旧值，避免机器上的
+# 全局设置悄悄把部署目标降回 11.0；打包的 `LSMinimumSystemVersion` 同步到 14.0。
+MACOSX_DEPLOYMENT_TARGET = { value = "14.0", force = true }

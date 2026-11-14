@@ -1,40 +1,46 @@
 //! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → 整面 blit 到 drawable → present
-//! （`design/phase-12-macos-linux.md` §5.6 / §5.9）。
+//! （`design/async-render-pipeline.md` §5.2 / §5.6）。
+//!
+//! **本模块不取 drawable**：窗口路径的 drawable 由 `CAMetalDisplayLink` 的 update 提供，
+//! `CAMetalLayer::nextDrawable` 已删除（§5.7）。离屏/快照路径不给 drawable，只画进 persist。
 //!
 //! **两条与 Windows 不同的硬约束**（F-121）：
-//! 1. `FramePlan::copy_plan()` / `present_dirty()` 是 D3D12 专用：macOS/Present 目标的内容跨帧无保证，
+//! 1. `FramePlan::copy_plan()` / `present_dirty()` 是 D3D12 专用：Metal 的 present 目标内容跨帧无保证，
 //!    因此**每帧整面 blit**；`plan()`（scissor）与 `is_full()`（clear）仍是共用语义。
 //! 2. 没有 barrier / 资源状态机：Metal 自动跟踪 hazard。
+//!
+//! 线程纪律：窗口路径的所有成员只属于 `kytrix-metal` 线程；persist 重建**不等待在飞帧**，
+//! 旧纹理按帧序号进 retire 队列（§4.3 / I4）。图层属性一个都不在这里写（§5.3）。
 
 use std::time::Instant;
 
-use bytes::Bytes;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLDevice, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction,
-    MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLDevice, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions, MTLScissorRect, MTLSize,
+    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::paint::instance::InstanceBuffer;
 #[cfg(any(test, feature = "test-support"))]
 use crate::render::macos::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
     paint::{
         atlas::AtlasKind,
-        instance::{FrameOp, GpuClipEntry, InstanceBuffer},
+        instance::{FrameOp, GpuClipEntry},
     },
     render::{
         compositor::{FramePlan, Plan},
-        frame::MAX_FRAMES_IN_FLIGHT,
+        frame::{FramePayload, MAX_FRAMES_IN_FLIGHT},
         macos::{
             atlas::{ATLAS_PAGE, AtlasTextures},
-            device::{Device, GpuObject, init_error},
+            device::{Device, GpuObject, init_error, on_gpu_thread},
             pipeline::Pipeline,
             queue::Queue,
-            swapchain::Swapchain,
         },
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
@@ -45,7 +51,7 @@ use crate::{
 /// `RootUniform` 的字节数（P07 §2.7：112 B）。
 const ROOT_UNIFORM_BYTES: usize = 112;
 
-/// 一个 GPU 渲染器（窗口路径由 render 线程独占；离屏路径同步调用）。
+/// 一个 GPU 渲染器（窗口路径由 `kytrix-metal` 线程独占；离屏路径同步调用）。
 pub(crate) struct GpuRenderer {
     device: Device,
     queue: Queue,
@@ -53,52 +59,22 @@ pub(crate) struct GpuRenderer {
     atlas: AtlasTextures,
     persist: Persist,
     upload: UploadArena,
-    root: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    swapchain: Option<Swapchain>,
+    root: Retained<ProtocolObject<dyn MTLBuffer>>,
     clear_color: [f32; 4],
+    /// 当前持久目标 / drawable 的物理尺寸（drawable 的实际尺寸是最后真值，§5.4）。
     surface: (u32, u32),
-    scale: f64,
+    /// 下一次 present 是否必须全量（新建 / 重建之后为 `true`）。
+    fresh: bool,
+    /// 最后一次**提交**的帧序号：重建产生的旧句柄以它作为 retire 的 tag（§4.3）。
+    last_index: FrameIndex,
     #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
 }
 
-// SAFETY: `GpuRenderer` 在构造完成后只整体移动一次到 render 线程，此后主线程不再访问
-// 其中任何 Metal 对象（`CAMetalLayer` 的绘制属性也只由 worker 写）。Metal 对象本身按
-// Apple 文档允许跨线程使用；这里保证的是「单线程独占」而不是共享。`WindowRenderer`
-// 只持有 layer 的额外 retain 供 `NSView::setLayer` 使用，不读写绘制属性。
+// SAFETY: `GpuRenderer` 在构造完成后只整体移动一次到 `kytrix-metal` 线程，此后主线程不再访问
+// 其中任何 Metal 对象；`CAMetalLayer` 甚至不在本结构里（§5.3 的唯一写者是主线程）。
+// Metal 对象本身按 Apple 文档允许跨线程使用；这里保证的是「单线程独占」而不是共享。
 unsafe impl Send for GpuRenderer {}
-
-/// 一帧的 CPU→GPU 快照（render 线程只消费它，不再借用 `Window` 的实例缓冲）。
-///
-/// 实例字节、绘制序、裁剪表必须一起过线：worker 拿到的必须是**同一帧**的三份数据。
-pub(crate) struct FramePayload {
-    instances: Bytes,
-    ops: Vec<FrameOp>,
-    clips: Vec<GpuClipEntry>,
-}
-
-impl FramePayload {
-    /// 从主线程的编码结果复制一份。复制是线程边界的所有权转移，不是可选优化。
-    pub(crate) fn from_buffer(buffer: &InstanceBuffer) -> Self {
-        let mut clips = Vec::with_capacity(buffer.clips().len());
-        buffer.write_clips_gpu(&mut clips);
-        Self {
-            instances: Bytes::copy_from_slice(buffer.as_bytes()),
-            ops: buffer.ops().to_vec(),
-            clips,
-        }
-    }
-
-    /// 空载荷（邮箱/线程单元测试用；真实帧必须走 `from_buffer`）。
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self {
-            instances: Bytes::new(),
-            ops: Vec::new(),
-            clips: Vec::new(),
-        }
-    }
-}
 
 impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备 + 默认图集页。
@@ -115,15 +91,13 @@ impl GpuRenderer {
         Self::with_device(Device::new()?, size, atlas_page)
     }
 
-    /// 真实窗口的图层（平台层在建窗后调用；`layer()` 交给 `NSView::setLayer`）。
-    pub(crate) fn new_for_layer(size: (u32, u32), scale: f64) -> Result<Self, EngineError> {
-        let mut renderer = Self::with_device(Device::new()?, size, ATLAS_PAGE)?;
-        renderer.swapchain = Some(Swapchain::new(&renderer.device, size, scale)?);
-        renderer.scale = scale;
-        Ok(renderer)
+    /// 真实窗口：设备由主线程建好（图层已绑定它），这里只接管 GPU 侧对象。
+    pub(crate) fn new_window(device: Device, size: (u32, u32)) -> Result<Self, EngineError> {
+        Self::with_device(device, size, ATLAS_PAGE)
     }
 
     fn with_device(device: Device, size: (u32, u32), atlas_page: u32) -> Result<Self, EngineError> {
+        let size = (size.0.max(1), size.1.max(1));
         let queue = Queue::new(&device)?;
         let pipeline = Pipeline::new(&device, MTLPixelFormat::BGRA8Unorm_sRGB)?;
         let atlas = AtlasTextures::new(&device, atlas_page)?;
@@ -142,241 +116,87 @@ impl GpuRenderer {
             persist,
             upload,
             root,
-            swapchain: None,
             clear_color: [0.0, 0.0, 0.0, 0.0],
-            surface: (size.0.max(1), size.1.max(1)),
-            scale: 1.0,
+            surface: size,
+            fresh: true,
+            last_index: FrameIndex::default(),
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
     }
 
-    /// 窗口路径：worker 在每一帧前同步尺寸与 DPI（主线程不再写 `CAMetalLayer`）。
-    ///
-    /// 返回 `true` 表示尺寸或 scale 变了：worker 必须把本帧提升为全量，主线程的
-    /// `FramePlan` 可能仍是 partial（DPI 变化时逻辑尺寸可能不变）。
-    pub(crate) fn prepare_frame(
-        &mut self,
-        surface: (u32, u32),
-        scale: f64,
-    ) -> Result<bool, EngineError> {
-        let surface = (surface.0.max(1), surface.1.max(1));
-        let size_changed = surface != self.surface;
-        let scale_changed = (scale - self.scale).abs() > f64::EPSILON;
-        if size_changed || scale_changed {
-            self.resize_with_scale(surface, scale)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// 绘图图层的强引用（平台层只把它挂到 `NSView`；绘制属性由 render 线程写）。
-    pub(crate) fn layer_handle(&self) -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
-        self.swapchain.as_ref().map(|swapchain| {
-            let layer = swapchain.layer();
-            // SAFETY: 图层由 swapchain 持有且非空；retain 后由返回的 `Retained` 管理。
-            unsafe { Retained::retain(layer as *const _ as *mut _) }.expect("layer is non-null")
-        })
-    }
-
+    /// 当前目标的物理尺寸（GPU 线程侧的真值；重建后更新）。
     pub(crate) fn surface(&self) -> (u32, u32) {
         self.surface
     }
 
+    /// 下一次 present 是否必须全量（新建 / 重建之后为 `true`）。
     pub(crate) fn is_fresh(&self) -> bool {
-        self.swapchain.as_ref().is_none_or(Swapchain::is_fresh)
+        self.fresh
     }
 
-    /// resize：重建持久 offscreen（旧纹理走 retire）+ 调图层 `drawableSize`。
+    /// 非阻塞取一个上传槽（三缓冲背压，I1）：`false` = 三帧在飞，本帧跳帧。
+    pub(crate) fn try_acquire_upload_slot(&mut self) -> bool {
+        self.queue.try_acquire()
+    }
+
+    /// 归还一个已经取到、但本帧没有提交的槽位（防御路径）。
+    pub(crate) fn release_upload_slot(&mut self) {
+        self.queue.release();
+    }
+
+    /// 目标尺寸变化时重建 persist：**不等待在飞帧**（§5.4）。
     ///
-    /// 必须先 `wait_idle`：异步提交下旧 persist/upload 仍可能被在飞命令引用。
-    pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        self.resize_with_scale(size, self.scale)
-    }
-
-    /// 尺寸与 scale 一起更新：scale 变化（显示模式切换）不一定改变物理尺寸。
-    pub(crate) fn resize_with_scale(
-        &mut self,
-        size: (u32, u32),
-        scale: f64,
-    ) -> Result<(), EngineError> {
+    /// 旧 persist 可能仍被在飞命令缓冲引用，因此它按「当前最后提交序号」入 retire 队列，
+    /// 完成通知到达后才释放（I4）。返回 `true` 表示本帧必须全量。
+    pub(crate) fn prepare_target(&mut self, size: (u32, u32)) -> Result<bool, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
-        let scale_changed = (scale - self.scale).abs() > f64::EPSILON;
         if size == self.surface {
-            if scale_changed {
-                self.scale = scale;
-                if let Some(swapchain) = self.swapchain.as_mut() {
-                    swapchain.set_scale(scale);
-                }
-            }
-            return Ok(());
+            return Ok(false);
         }
-        self.queue.wait_idle(&mut self.device)?;
-        if let Some(swapchain) = self.swapchain.as_mut() {
-            swapchain.resize(size, scale);
-        }
-        self.persist.recreate(&mut self.device, size)?;
+        let old = self.persist.recreate(&mut self.device, size)?;
+        self.queue.retire(self.last_index, old);
         self.surface = size;
-        self.scale = scale;
-        Ok(())
+        self.fresh = true;
+        Ok(true)
     }
 
-    /// 一帧的全部 GPU 工作（命令提交异步；窗口路径不等待 GPU 完成）。
-    pub(crate) fn submit(
-        &mut self,
-        index: FrameIndex,
-        buffer: &InstanceBuffer,
-        frame: &mut FramePlan,
-        timings: &mut FrameTimings,
-    ) -> Result<crate::render::RenderStats, EngineError> {
-        let payload = FramePayload::from_buffer(buffer);
-        Ok(self
-            .submit_payload(index, &payload, frame, timings)?
-            .unwrap_or_default())
-    }
-
-    /// 提交一份已经跨线程复制好的帧快照。
+    /// 窗口路径：把一帧画进 persist 后整面 blit 到 `drawable`，登记完成通知并 `commit`（I2）。
     ///
-    /// `None` = 本帧没拿到 drawable（worker 会保留 job 重试）；`Some` = 已 commit。
-    pub(crate) fn submit_payload(
+    /// 调用方（GPU 循环）已经：取到 drawable、非阻塞拿到三槽上传槽、按 drawable 实际尺寸
+    /// 调过 [`GpuRenderer::prepare_target`]、并构造好 `frame`。
+    pub(crate) fn submit_frame(
         &mut self,
-        index: FrameIndex,
-        payload: &FramePayload,
+        request: &crate::render::frame::FrameRequest,
+        drawable: &ProtocolObject<dyn CAMetalDrawable>,
         frame: &mut FramePlan,
-        timings: &mut FrameTimings,
-    ) -> Result<Option<crate::render::RenderStats>, EngineError> {
+        completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
+    ) -> Result<(crate::render::RenderStats, Vec<GpuTimerSample>), EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "Metal window frames may only be submitted on the kytrix-metal thread"
+        );
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
-        let pending_gpu = self.queue.poll_completed(&mut self.device)?;
-        timings.reset(index);
-        debug_assert_eq!(
-            timings.frame(),
-            index,
-            "timings must be reset for this frame"
-        );
-        debug_assert!(timings.samples().is_empty(), "timings must start empty");
-        // GPU 时间来自上一帧已经完成的 command buffer（异步提交下没有本帧的同步结果）。
-        if let Some(sample) = pending_gpu {
-            timings.push(sample);
-        }
-        let frame_started = Instant::now();
-        // **不要**按 `copy_plan()` 做局部拷贝：drawable 的内容跨帧无保证（结论 #4 / F-121）。
-        // `fresh` 的 partial 帧（换 scale/首帧）仍会整面画；只有真正的 partial 才要求带 dirty 集。
-        debug_assert!(
-            !matches!(frame.plan(), Plan::Partial(_))
-                || frame.is_full()
-                || frame.present_dirty().is_some(),
-            "partial plans must carry their dirty set"
-        );
-        // 先拿 drawable：拿不到就没有可写目标，**不要**开始这一帧（否则 ring 前进但没有提交，
-        // 下一次 `begin` 的断言会把这一帧算成丢帧）。窗口路径由 worker 重试本帧。
-        let drawable = match self.swapchain.as_ref() {
-            Some(swapchain) => match swapchain.next_drawable() {
-                Some(drawable) => Some(drawable),
-                None => return Ok(None),
-            },
-            None => None,
-        };
-        let (slot, command) = self.queue.begin(index, &mut self.device)?;
-
-        let uploaded = self.upload.write(
-            &mut self.device,
-            &mut self.queue,
-            index,
-            slot.index,
-            &payload.instances,
-            &payload.clips,
+        let mut timings = FrameTimings::new();
+        timings.reset(request.index);
+        let (slot, command, stats) = self.record_frame(
+            request.index,
+            &request.payload,
+            frame,
+            Some(drawable),
+            &mut timings,
         )?;
-        let (instance_count, _clip_count) = uploaded;
-        write_root(&self.root, self.surface);
-        timings.push(GpuTimerSample {
-            section: Section::Upload,
-            cpu_ns: elapsed_ns(frame_started),
-            gpu_ns: 0,
-        });
-
-        let full = frame.is_full();
-        let mut draw_calls = 0u32;
-
-        if self.atlas.has_pending() {
-            let blit = command
-                .blitCommandEncoder()
-                .ok_or_else(|| init_error("blitCommandEncoder(atlas)", "returned nil"))?;
-            self.atlas.record_uploads(&blit);
-            blit.endEncoding();
-        }
-
-        let draw_result = {
-            let pass = MTLRenderPassDescriptor::new();
-            // SAFETY: 索引 0 恒存在（渲染通道至少一个颜色附件槽）。
-            let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-            color.setTexture(Some(self.persist.texture()));
-            color.setLoadAction(if full {
-                MTLLoadAction::Clear
-            } else {
-                MTLLoadAction::Load
-            });
-            color.setStoreAction(MTLStoreAction::Store);
-            color.setClearColor(self.clear_color(full));
-            let encoder = command
-                .renderCommandEncoderWithDescriptor(&pass)
-                .ok_or_else(|| init_error("renderCommandEncoder", "returned nil"))?;
-            self.bind(&encoder, slot.index);
-            // 逐 scissor 画：全帧 = 整面一次；局部 = 每个 damage 矩形一次。
-            match full {
-                true => {
-                    encoder.setScissorRect(whole_scissor(self.surface));
-                    draw_calls = draw_ops(&encoder, &payload.ops, instance_count)?;
-                }
-                false => match frame.plan() {
-                    Plan::Idle | Plan::Full => {}
-                    Plan::Partial(damage) => {
-                        for rect in damage.as_slice() {
-                            encoder.setScissorRect(scissor_for(rect));
-                            draw_calls = draw_calls.saturating_add(draw_ops(
-                                &encoder,
-                                &payload.ops,
-                                instance_count,
-                            )?);
-                        }
-                    }
-                },
-            }
-            encoder.endEncoding();
-
-            if let Some(drawable) = drawable.as_ref() {
-                let target = drawable.texture();
-                let blit = command
-                    .blitCommandEncoder()
-                    .ok_or_else(|| init_error("blitCommandEncoder", "returned nil"))?;
-                blit_persist_to(&blit, self.persist.texture(), &target, self.surface);
-                blit.endEncoding();
-            }
-            Ok(())
-        };
-        draw_result?;
-
-        // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时
-        // 立即归还给 CAMetalLayer，而不是等 `waitUntilCompleted` 返回后才 present。
-        // 旧顺序（wait → present）会让 3 张 drawable 在同步等待期间一直被占用，
-        // 遇到 AX 查询/遮挡等合成器暂停场景会卡死在 `nextDrawable`（macOS 实机复现）。
-        if let Some(drawable) = drawable.as_ref() {
-            let mtl_drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
-            command.presentDrawable(mtl_drawable);
-        }
-
-        // 异步提交：commit 后立即返回，完成状态在下一次 submit / wait_idle 轮询。
-        self.queue.submit(index, slot, &command)?;
-
+        // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时立即
+        // 归还给 `CAMetalLayer`，而不是等某个同步等待之后。
+        let mtl_drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
+        command.presentDrawable(mtl_drawable);
         let present_started = Instant::now();
-        if drawable.is_some()
-            && let Some(swapchain) = self.swapchain.as_mut()
-        {
-            swapchain.presented();
-        }
+        self.queue.submit(slot, &command, completed)?;
+        self.fresh = false;
         frame.presented();
+        self.last_index = request.index;
         timings.push(GpuTimerSample {
             section: Section::Present,
             cpu_ns: elapsed_ns(present_started),
@@ -386,17 +206,59 @@ impl GpuRenderer {
             timings.samples().len() <= 3,
             "at most three sections per frame"
         );
-
-        Ok(Some(crate::render::RenderStats {
-            draw_calls,
-            instances: instance_count,
-        }))
+        Ok((stats, timings.samples().to_vec()))
     }
 
-    /// 读回持久 offscreen（快照；同步等待 GPU 完成）。
+    /// 离屏 / 快照：画进 persist 后**同步**等本帧完成（readback 的可读性前提，§4.5 下半段）。
+    pub(crate) fn submit_snapshot(
+        &mut self,
+        index: FrameIndex,
+        payload: &FramePayload,
+        frame: &mut FramePlan,
+        timings: &mut FrameTimings,
+    ) -> Result<crate::render::RenderStats, EngineError> {
+        if let Some(error) = self.device.lost_error() {
+            return Err(error);
+        }
+        timings.reset(index);
+        let (slot, command, stats) = self.record_frame(index, payload, frame, None, timings)?;
+        if let Some(sample) = self
+            .queue
+            .submit_blocking(index, slot, &command, &mut self.device)?
+        {
+            timings.push(sample);
+        }
+        let present_started = Instant::now();
+        self.fresh = false;
+        frame.presented();
+        self.last_index = index;
+        timings.push(GpuTimerSample {
+            section: Section::Present,
+            cpu_ns: elapsed_ns(present_started),
+            gpu_ns: 0,
+        });
+        Ok(stats)
+    }
+
+    /// 完成通知到达（`kytrix-metal` 线程 drain）：失败分类 / GPU 时间 / retire（I4）。
+    pub(crate) fn on_frame_completed(
+        &mut self,
+        index: FrameIndex,
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<Option<GpuTimerSample>, EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "command buffer completions may only be drained on the kytrix-metal thread"
+        );
+        if buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(self.queue.failure(index, buffer, &mut self.device));
+        }
+        Ok(self.queue.on_completed(index, buffer, &mut self.device))
+    }
+
+    /// 读回持久 offscreen（快照；`submit_snapshot` 已保证本帧完成）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
-        self.queue.wait_idle(&mut self.device)?;
         self.readback.capture(
             &self.device,
             &self.queue,
@@ -411,9 +273,10 @@ impl GpuRenderer {
         &mut self,
         buffer: &InstanceBuffer,
     ) -> Result<ReadbackImage, EngineError> {
+        let payload = FramePayload::from_buffer(buffer);
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
-        self.submit(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)?;
+        self.submit_snapshot(FrameIndex::from_raw(1), &payload, &mut frame, &mut timings)?;
         self.readback()
     }
 
@@ -427,15 +290,122 @@ impl GpuRenderer {
         self.atlas.queue_upload(kind, pixels, rows);
     }
 
-    fn clear_color(&self, full: bool) -> MTLClearColor {
-        let [r, g, b, a] = self.clear_color;
-        let _ = full;
-        MTLClearColor {
-            red: f64::from(r),
-            green: f64::from(g),
-            blue: f64::from(b),
-            alpha: f64::from(a),
+    /// 录制一帧（不呈现、不提交）：取槽 → 上传 → 图集 blit → persist 绘制 → 整面 blit。
+    ///
+    /// 返回本帧槽位与命令缓冲；调用方决定是异步 `submit` 还是同步 `submit_blocking`。
+    fn record_frame(
+        &mut self,
+        index: FrameIndex,
+        payload: &FramePayload,
+        frame: &FramePlan,
+        drawable: Option<&ProtocolObject<dyn CAMetalDrawable>>,
+        timings: &mut FrameTimings,
+    ) -> Result<
+        (
+            crate::render::frame::FrameSlot,
+            Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+            crate::render::RenderStats,
+        ),
+        EngineError,
+    > {
+        debug_assert_eq!(
+            timings.frame(),
+            index,
+            "timings must be reset for this frame"
+        );
+        // **不要**按 `copy_plan()` 做局部拷贝：drawable 的内容跨帧无保证（结论 #4 / F-121）。
+        debug_assert!(
+            !matches!(frame.plan(), Plan::Partial(_))
+                || frame.is_full()
+                || frame.present_dirty().is_some(),
+            "partial plans must carry their dirty set"
+        );
+        let frame_started = Instant::now();
+        let (slot, command) = self.queue.begin(index)?;
+        let (instance_count, _clip_count) = self.upload.write(
+            &mut self.device,
+            &mut self.queue,
+            index,
+            slot.index,
+            payload.instances(),
+            payload.clips(),
+        )?;
+        write_root(&self.root, self.surface);
+        timings.push(GpuTimerSample {
+            section: Section::Upload,
+            cpu_ns: elapsed_ns(frame_started),
+            gpu_ns: 0,
+        });
+
+        let full = frame.is_full();
+        let mut draw_calls = 0u32;
+        if self.atlas.has_pending() {
+            let blit = command
+                .blitCommandEncoder()
+                .ok_or_else(|| init_error("blitCommandEncoder(atlas)", "returned nil"))?;
+            self.atlas.record_uploads(&blit);
+            blit.endEncoding();
         }
+        {
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: 索引 0 恒存在（渲染通道至少一个颜色附件槽）。
+            let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            color.setTexture(Some(self.persist.texture()));
+            color.setLoadAction(if full {
+                MTLLoadAction::Clear
+            } else {
+                MTLLoadAction::Load
+            });
+            color.setStoreAction(MTLStoreAction::Store);
+            let [r, g, b, a] = self.clear_color;
+            color.setClearColor(MTLClearColor {
+                red: f64::from(r),
+                green: f64::from(g),
+                blue: f64::from(b),
+                alpha: f64::from(a),
+            });
+            let encoder = command
+                .renderCommandEncoderWithDescriptor(&pass)
+                .ok_or_else(|| init_error("renderCommandEncoder", "returned nil"))?;
+            self.bind(&encoder, slot.index);
+            // 逐 scissor 画：全帧 = 整面一次；局部 = 每个 damage 矩形一次。
+            match full {
+                true => {
+                    encoder.setScissorRect(whole_scissor(self.surface));
+                    draw_calls = draw_ops(&encoder, payload, instance_count)?;
+                }
+                false => match frame.plan() {
+                    Plan::Idle | Plan::Full => {}
+                    Plan::Partial(damage) => {
+                        for rect in damage.as_slice() {
+                            encoder.setScissorRect(scissor_for(rect));
+                            draw_calls = draw_calls.saturating_add(draw_ops(
+                                &encoder,
+                                payload,
+                                instance_count,
+                            )?);
+                        }
+                    }
+                },
+            }
+            encoder.endEncoding();
+        }
+        if let Some(drawable) = drawable {
+            let target = drawable.texture();
+            let blit = command
+                .blitCommandEncoder()
+                .ok_or_else(|| init_error("blitCommandEncoder", "returned nil"))?;
+            blit_persist_to(&blit, self.persist.texture(), &target, self.surface);
+            blit.endEncoding();
+        }
+        Ok((
+            slot,
+            command,
+            crate::render::RenderStats {
+                draw_calls,
+                instances: instance_count,
+            },
+        ))
     }
 
     fn bind(&self, encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, slot: usize) {
@@ -462,40 +432,30 @@ impl GpuRenderer {
     }
 }
 
-impl Drop for GpuRenderer {
-    fn drop(&mut self) {
-        // 异步提交：退出/销毁前必须等 GPU 完成，否则 resources 在命令缓冲仍被 GPU 引用时释放。
-        let _ = self.queue.wait_idle(&mut self.device);
-    }
-}
-
 /// 持久 offscreen（唯一绘制目标；`BGRA8Unorm_sRGB` / Private）。
 struct Persist {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     handle: GpuResourceHandle,
-    size: (u32, u32),
 }
 
 impl Persist {
     fn new(device: &mut Device, size: (u32, u32)) -> Result<Self, EngineError> {
         let texture = create_target(device, size)?;
         let handle = device.allocate(GpuObject::Texture(texture.clone()));
-        Ok(Self {
-            texture,
-            handle,
-            size,
-        })
+        Ok(Self { texture, handle })
     }
 
-    fn recreate(&mut self, device: &mut Device, size: (u32, u32)) -> Result<(), EngineError> {
+    /// 换一张新尺寸纹理，返回**旧句柄**（调用方把它交给 retire 队列，§4.3）。
+    fn recreate(
+        &mut self,
+        device: &mut Device,
+        size: (u32, u32),
+    ) -> Result<GpuResourceHandle, EngineError> {
         let texture = create_target(device, size)?;
         let handle = device.allocate(GpuObject::Texture(texture.clone()));
-        // `wait_idle` 之后旧纹理可以立即释放（窗口路径的提交是异步的）。
-        device.release(self.handle);
+        let old = std::mem::replace(&mut self.handle, handle);
         self.texture = texture;
-        self.handle = handle;
-        self.size = size;
-        Ok(())
+        Ok(old)
     }
 
     fn texture(&self) -> &ProtocolObject<dyn MTLTexture> {
@@ -507,7 +467,7 @@ fn create_target(
     device: &Device,
     size: (u32, u32),
 ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, EngineError> {
-    // SAFETY: 纯构造函数；尺寸至少 1（`with_device` 已夹紧）。
+    // SAFETY: 纯构造函数；尺寸至少 1（调用方已夹紧）。
     let descriptor = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
             MTLPixelFormat::BGRA8Unorm_sRGB,
@@ -530,10 +490,10 @@ struct UploadArena {
 }
 
 struct UploadSlot {
-    instances: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    instances: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_handle: GpuResourceHandle,
     instance_capacity: u32,
-    clips: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    clips: Retained<ProtocolObject<dyn MTLBuffer>>,
     clip_handle: GpuResourceHandle,
     clip_capacity: u32,
 }
@@ -562,8 +522,8 @@ impl UploadArena {
         &self,
         slot: usize,
     ) -> (
-        &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-        &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        &Retained<ProtocolObject<dyn MTLBuffer>>,
+        &Retained<ProtocolObject<dyn MTLBuffer>>,
     ) {
         let slot = &self.slots[slot];
         (&slot.instances, &slot.clips)
@@ -610,14 +570,14 @@ impl UploadArena {
 fn create_upload(
     device: &Device,
     bytes: u64,
-) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>, EngineError> {
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, EngineError> {
     device
         .raw()
         .newBufferWithLength_options(bytes as usize, MTLResourceOptions::StorageModeShared)
         .ok_or_else(|| init_error("newBufferWithLength_options(upload)", "returned nil"))
 }
 
-fn write_upload(buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>, bytes: &[u8]) {
+fn write_upload(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -632,7 +592,7 @@ fn write_upload(buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>, bytes: &[u8
 }
 
 /// `RootUniform`（112 B）：`frame @0`、`draw @32`；实例绘制只用 `frame.viewport`（P07 §2.7）。
-fn write_root(buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>, surface: (u32, u32)) {
+fn write_root(buffer: &ProtocolObject<dyn MTLBuffer>, surface: (u32, u32)) {
     let width = surface.0 as f32;
     let height = surface.1 as f32;
     let mut uniform = [0.0f32; ROOT_UNIFORM_BYTES / 4];
@@ -653,11 +613,11 @@ fn write_root(buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>, surface: (u32
 
 fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    ops: &[FrameOp],
+    payload: &FramePayload,
     instance_count: u32,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
-    for op in ops {
+    for op in payload.ops() {
         match *op {
             FrameOp::Instances { start, len } => {
                 if len == 0 {
@@ -677,9 +637,12 @@ fn draw_ops(
                 draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry { index, .. } => {
+                // Metal 还没有几何 GPU 缓冲（`GeometryStore` 在 P13）。这里顺带校验 `ops` 与
+                // **同帧**的几何表一致：下标越界是编码错误，不是「没有缓冲」。
+                let in_table = payload.geometry().get(index as usize).is_some();
                 return Err(EngineError::GeometryRegister {
                     detail: smol_str::format_smolstr!(
-                        "geometry op index {index} has no GPU buffers (GeometryStore lands in P13)"
+                        "geometry op index {index} (in_table={in_table}) has no GPU buffers (GeometryStore lands in P13)"
                     ),
                 });
             }
@@ -690,12 +653,12 @@ fn draw_ops(
 
 /// 整面 blit（**每帧**，因为 drawable 内容跨帧无保证）。
 fn blit_persist_to(
-    blit: &ProtocolObject<dyn objc2_metal::MTLBlitCommandEncoder>,
+    blit: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     persist: &ProtocolObject<dyn MTLTexture>,
     target: &ProtocolObject<dyn MTLTexture>,
     size: (u32, u32),
 ) {
-    // SAFETY: 源/目标都是本渲染器独占的纹理；尺寸一致（persist 与 drawable 都由 surface 决定）。
+    // SAFETY: 源/目标都是本渲染器独占的纹理；尺寸一致（persist 由 drawable 的实际尺寸决定）。
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
             persist,
