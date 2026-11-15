@@ -264,6 +264,15 @@ pub struct Window {
     /// `size × scale` 的 covering；`true` 之后平台真值是唯一来源，这两个方法**不得**用 covering
     /// 覆盖它（F-186 / F-189 / V-122）。
     surface_from_platform: bool,
+    /// Linux：整数回退的 `wl_surface` buffer scale（fractional 路径固定 1）。
+    ///
+    /// buffer 尺寸按 `round(逻辑 × scale)` 产出；Wayland 的逻辑尺寸已在平台层取整，整数回退下
+    /// buffer 因此严格是 `buffer_scale` 的整数倍（否则 `wl_surface.attach` 报 `invalid_size`）。
+    /// `buffer_scale` 必须等于整数 scale，surface 的逻辑尺寸才等于 `buffer / buffer_scale`，
+    /// 否则 compositor 会把整面放大 N×（V-110 / V-122 ④）。平台层用 `set_buffer_scale` 写入，
+    /// 随 [`FrameRequest`] 过线，GPU 线程在 present 前与 attach/commit 同一次生效。
+    #[cfg(target_os = "linux")]
+    buffer_scale: i32,
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
     /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
@@ -338,6 +347,8 @@ impl Window {
             scale,
             surface,
             surface_from_platform: false,
+            #[cfg(target_os = "linux")]
+            buffer_scale: 1,
             scale_epoch: 0,
             scheduler: FrameScheduler::new(),
             encoder: InstanceEncoder::new(),
@@ -603,6 +614,16 @@ impl Window {
         }
         self.surface = surface;
         self.full_damage_pending = true;
+    }
+
+    /// Linux：写入整数回退的 `wl_surface` buffer scale（fractional 路径恒 1）。
+    ///
+    /// **不**标 damage / layout、**不**动 `scale_epoch`：它只是渲染目标的属性，随
+    /// [`FrameRequest`] 过线，由 GPU 线程在 present 前与 attach/commit 同一次生效（V-110）。
+    /// scale 本身的布局变化由 `set_scale` 负责；同值调用是 no-op，钳到 ≥1。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_buffer_scale(&mut self, scale: i32) {
+        self.buffer_scale = scale.max(1);
     }
 
     // ── P11：a11y（快照交付 + 捕获） ─────────────────────────────────────────
@@ -1049,6 +1070,10 @@ impl Window {
             // `wp_viewport.set_destination`（destination 与 buffer 必须成对，D1 / D2）。
             #[cfg(target_os = "linux")]
             surface_local: self.size(),
+            // 整数回退的 buffer scale：与 attach/commit 同一次生效（fractional 模式恒 1，
+            // 整数回退 = N；surface 的逻辑尺寸因此等于 `surface / buffer_scale`，V-110）。
+            #[cfg(target_os = "linux")]
+            buffer_scale: self.buffer_scale,
             published_at: Instant::now(),
         })
     }
@@ -1465,6 +1490,23 @@ mod tests {
         window.set_surface((10, 20));
         assert_eq!(window.physical_surface(), (10, 20));
         assert!(window.full_damage_pending);
+    }
+
+    /// Linux：整数回退的 buffer scale 默认 1（fractional 路径也固定 1），钳到 ≥1。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffer_scale_defaults_to_one_and_clamps() {
+        let mut window = window();
+        assert_eq!(window.buffer_scale, 1, "默认 1（fractional 路径恒 1）");
+
+        window.set_buffer_scale(0);
+        assert_eq!(
+            window.buffer_scale, 1,
+            "0 必须钳到 1（wl_surface 不接受 0）"
+        );
+
+        window.set_buffer_scale(2);
+        assert_eq!(window.buffer_scale, 2, "整数回退写入 N");
     }
 
     /// F-186 / F-189 / V-122：平台写入真实目标之后，`set_size` / `set_scale` 只做布局 / DPI

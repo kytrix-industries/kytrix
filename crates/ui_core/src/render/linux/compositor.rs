@@ -17,6 +17,7 @@
 use std::{collections::VecDeque, time::Instant};
 
 use ash::vk;
+use wayland_client::protocol::wl_surface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use crate::{
@@ -98,12 +99,21 @@ pub(crate) struct GpuRenderer {
     timer: Option<GpuTimer>,
     /// persist 的 clear color（linear；窗口背景色，离屏保持透明黑）。
     clear_color: [f32; 4],
-    /// `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无 destination /
-    /// `buffer_scale` 回退，见 V-122）：destination 由 GPU 线程在 present **之前**写入，与 WSI 的
+    /// `wp_viewport`（`None` = 整数回退：没有 viewporter 或没有 fractional manager，
+    /// 见 V-110）：destination 由 GPU 线程在 present **之前**写入，与 WSI 的
     /// `wl_surface.commit` 同一次生效（D1 / D2）。
     viewport: Option<WpViewport>,
     /// 最近一次真正写入 `wp_viewport` 的 destination（`None` = 还没写过）。只在变化时下发。
     last_destination: Option<(i32, i32)>,
+    /// `wl_surface` 的代理副本（GPU 线程写 `set_buffer_scale` 用；`None` = 离屏路径）。
+    ///
+    /// 与 `viewport` 一样，窗口系统状态必须在 `vkQueuePresentKHR` **之前**写入，才能与 WSI 的
+    /// attach/commit 同一次生效。
+    wl_surface: Option<wl_surface::WlSurface>,
+    /// 最近一次写入 `wl_surface.set_buffer_scale` 的值（初始 1 = 协议默认值）。
+    ///
+    /// fractional 模式恒为 1（destination 负责缩放）；整数回退是整数 scale `N`（V-110）。
+    last_buffer_scale: i32,
     surface: (u32, u32),
     /// 渲染目标格式（swapchain 的格式，或离屏时的 `B8G8R8A8_SRGB`）。
     format: vk::Format,
@@ -133,17 +143,18 @@ pub(crate) struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    /// 真实窗口（Wayland surface 的裸指针由平台层提供）。
+    /// 真实窗口（Wayland surface 的裸指针由平台层提供，`surface` 是同一对象的代理副本）。
     ///
     /// `background` 是 persist 的 clear color（linear，`render::color::background_linear`）；
-    /// `viewport` 是 `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无
-    /// destination / `buffer_scale` 回退，见 V-122）。
+    /// `viewport` 是 `wp_viewport`（`None` = 整数回退，见 V-110）。`surface` 用来在 present 前写
+    /// 整数回退的 `set_buffer_scale`（fractional 模式恒 1，等价于不调用）。
     pub(crate) fn new_for_surface(
         display: *mut std::ffi::c_void,
         surface_ptr: *mut std::ffi::c_void,
         size: (u32, u32),
         background: [f32; 4],
         viewport: Option<WpViewport>,
+        surface: wl_surface::WlSurface,
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let instance = VulkanInstance::new(display, surface_ptr)?;
@@ -157,6 +168,7 @@ impl GpuRenderer {
             ATLAS_PAGE,
             background,
             viewport,
+            Some(surface),
         )
     }
 
@@ -188,7 +200,9 @@ impl GpuRenderer {
         let instance = VulkanInstance::new_headless()?;
         let device = Device::new(&instance)?;
         // 离屏路径没有窗口背景色：保持既有的透明黑（golden / 快照不变）。
-        Self::with_device(instance, device, None, size, atlas_page, [0.0; 4], None)
+        Self::with_device(
+            instance, device, None, size, atlas_page, [0.0; 4], None, None,
+        )
     }
 
     fn with_device(
@@ -199,6 +213,7 @@ impl GpuRenderer {
         atlas_page: u32,
         clear_color: [f32; 4],
         viewport: Option<WpViewport>,
+        wl_surface: Option<wl_surface::WlSurface>,
     ) -> Result<Self, EngineError> {
         let mut device = device;
         let format = swapchain
@@ -225,6 +240,8 @@ impl GpuRenderer {
             clear_color,
             viewport,
             last_destination: None,
+            wl_surface,
+            last_buffer_scale: 1,
             surface: size,
             format,
             fresh: true,
@@ -365,15 +382,47 @@ impl GpuRenderer {
         // ③b destination：必须在 `vkQueuePresentKHR` **之前**写入（WSI 规范要求窗口系统变更先于
         // present；present 内部的 `wl_surface.commit` 会让 attach 与 destination 原子生效）。
         // 与 buffer 同帧（`request.surface_local` 来自同一 UI 帧），旧 buffer 不会被新 destination
-        // 单独缩放（D1 / D2）。没有 viewporter 时什么都不做：`wp_fractional_scale_v1` 与 viewporter
-        // 独立 bound，仍可能按分数 scale 出 buffer，没有 destination / `buffer_scale` 回退 ——
-        // 既有缺口（V-122），本轮不实现 fallback。
+        // 单独缩放（D1 / D2）。整数回退（没有 viewporter / fractional manager）没有 destination：
+        // 它的 `set_buffer_scale` 在同一次 present 之前写入（见下），两套路径互斥（V-110）。
         if let Some(viewport) = self.viewport.as_ref()
             && let Some((width, height)) =
                 destination_update(self.last_destination, request.surface_local)
         {
             viewport.set_destination(width, height);
             self.last_destination = Some((width, height));
+        }
+
+        // ③c 整数回退的 buffer scale：必须与 ③b 的 destination 一样在 `vkQueuePresentKHR`
+        // **之前**写入（同一次 `wl_surface.commit` 生效），否则本帧 buffer 会按旧的 scale 显示。
+        // fractional 模式恒为 1（destination 负责缩放）；整数回退可能 >1（N=1 时为 1，V-110）。
+        //
+        // `wl_surface.attach` 要求 buffer 尺寸是 buffer_scale 的整数倍，否则 `invalid_size`
+        // （wlroots 丢弃 commit，严格 compositor 断连）；平台层把 Wayland 逻辑尺寸取整后
+        // buffer = `round(L × N)` 天然满足，这里只做 debug 期不变量检查。
+        debug_assert!(
+            request.buffer_scale >= 1,
+            "buffer_scale must be >= 1, got {}",
+            request.buffer_scale
+        );
+        debug_assert!(
+            request.buffer_scale == 1
+                || (request
+                    .surface
+                    .0
+                    .is_multiple_of(request.buffer_scale as u32)
+                    && request
+                        .surface
+                        .1
+                        .is_multiple_of(request.buffer_scale as u32)),
+            "buffer {:?} is not a multiple of buffer_scale {} (wl_surface.invalid_size)",
+            request.surface,
+            request.buffer_scale
+        );
+        if let Some(surface) = self.wl_surface.as_ref()
+            && request.buffer_scale != self.last_buffer_scale
+        {
+            surface.set_buffer_scale(request.buffer_scale);
+            self.last_buffer_scale = request.buffer_scale;
         }
 
         // ④ present：等**这张 image** 的 render-finished（§7.2 硬规则 1）。

@@ -51,8 +51,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let (mut state, mut queue) = WaylandState::new(initial_size, initial_title)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
-    // 首个 configure 之后才知道真实尺寸。buffer 尺寸按 fractional-scale 协议取
-    // `round(逻辑 × scale)`；`wp_viewport.set_destination` 由 GPU 线程在 present 前写入。
+    // 首个 configure 之后才知道真实尺寸。buffer 尺寸按 `round(逻辑 × scale)` 取：fractional
+    // 模式下 `wp_viewport.set_destination` 由 GPU 线程在 present 前写入；整数回退下
+    // `wl_surface.set_buffer_scale(N)` 与 buffer 同一次 present 生效（V-110）。
     let scale = state.scale();
     let size = state.size();
     let physical = dpi::physical_size(size, scale);
@@ -99,11 +100,15 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         physical,
         initial_background,
         state.take_viewport(),
+        state.surface_clone(),
     )?;
     if let Some(window) = app.window_mut(id) {
         window.set_renderer(renderer);
         window.set_scale(scale);
         window.set_size(size);
+        // 整数回退的 `wl_surface` buffer scale：GPU 线程在 present 前与 buffer 同一次生效
+        // （fractional 模式恒 1）。必须在 `set_surface` 之前写入，第一帧就带上正确的 scale。
+        window.set_buffer_scale(state.buffer_scale());
         // `set_size` / `set_scale` 的 covering 只是平台真值写入前的估算；真实的 Wayland buffer
         // 尺寸（`round(逻辑 × scale)`）必须在这里写入（F-186 / V-122）。
         window.set_surface(physical);
@@ -146,6 +151,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 if size_now != last_size {
                     window.set_size(size_now);
                 }
+                // 整数回退的 buffer scale（fractional 模式恒 1）；同值 no-op。每轮写入保证
+                // scale 变化后第一帧的 buffer_scale 与 buffer 尺寸同帧成对（V-110）。
+                window.set_buffer_scale(state.buffer_scale());
                 // 每轮写入真实的 Wayland buffer 尺寸（`round(逻辑 × scale)`）；同值 no-op。
                 window.set_surface(dpi::physical_size(size_now, scale_now));
             }

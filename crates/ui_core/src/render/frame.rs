@@ -104,6 +104,13 @@ pub(crate) struct FrameRequest {
     /// destination，present 之前一次生效（D1 / D2）。
     #[cfg(target_os = "linux")]
     pub surface_local: Size,
+    /// 整数回退的 `wl_surface` buffer scale（Linux 专用；fractional 模式为 1）。
+    ///
+    /// 与 `surface` / `surface_local` 同帧成对：整数 `N` 下 `surface = round(surface_local × N)`，
+    /// `buffer_scale` 必须是 `N`，surface 的逻辑尺寸才等于 `surface / N`；否则 compositor 会把
+    /// 整面放大 `N×`（V-110）。GPU 线程在 present 前写入，与 attach/commit 同一次生效。
+    #[cfg(target_os = "linux")]
+    pub buffer_scale: i32,
     /// HUD 的发布延迟基准（[`FrameFeedback::latency`] 的起点）。
     pub published_at: Instant,
 }
@@ -255,6 +262,8 @@ mod tests {
             surface: (64, 64),
             #[cfg(target_os = "linux")]
             surface_local: crate::math::Size::new(64.0, 64.0),
+            #[cfg(target_os = "linux")]
+            buffer_scale: 1,
             published_at: Instant::now(),
         }
     }
@@ -422,10 +431,12 @@ mod tests {
         assert_eq!(slot.take().expect("latest frame").plan, Plan::Full);
     }
 
-    /// Linux：buffer 尺寸与逻辑尺寸必须成对来自最新帧。
+    /// Linux：buffer 尺寸、逻辑尺寸与 buffer scale 必须成对来自最新帧。
     ///
     /// destination（`surface_local`）与 swapchain（`surface`）是新帧的两个面，覆盖时保留旧的
-    /// 任何一个都会让 compositor 用错尺寸 —— 旧内容被缩放（D1）或整面重采样（D3）。
+    /// 任何一个都会让 compositor 用错尺寸 —— 旧内容被缩放（D1）或整面重采样（D3）。整数回退的
+    /// `buffer_scale` 同理：它必须与这一帧的 buffer 尺寸出自同一帧，否则 surface 的逻辑尺寸
+    /// 会被乘 / 除错（V-110）。
     #[cfg(target_os = "linux")]
     #[test]
     fn replacing_a_frame_keeps_surface_and_surface_local_paired() {
@@ -435,11 +446,13 @@ mod tests {
         slot.publish(FrameRequest {
             surface: (800, 600),
             surface_local: Size::new(800.0, 600.0),
+            buffer_scale: 1,
             ..request(1, Plan::Full)
         });
         slot.publish(FrameRequest {
             surface: (876, 626),
             surface_local: Size::new(701.0, 501.0),
+            buffer_scale: 2,
             ..request(2, Plan::Full)
         });
 
@@ -450,5 +463,6 @@ mod tests {
             Size::new(701.0, 501.0),
             "destination 与 buffer 必须同帧成对"
         );
+        assert_eq!(frame.buffer_scale, 2, "buffer scale 与 buffer 必须同帧成对");
     }
 }

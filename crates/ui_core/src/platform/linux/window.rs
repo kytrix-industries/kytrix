@@ -9,8 +9,10 @@
 //! 320×200 直接就是逻辑值；因此它只需在建窗时（`wl_surface` 首个 commit 之前）设置一次
 //! （V-122 ⑦）。
 //!
-//! 没有 viewporter 的退化路径（V-122 ④ / P2-5）不在本方法保证范围内：那时 surface-local
-//! 坐标与逻辑尺寸不再一一对应，本方法写入的 320×200 不保证是期望的最小客户区。
+//! 没有 viewporter 时走整数回退（buffer = `round(逻辑 × N)`、`wl_surface.set_buffer_scale(N)`，
+//! 见 `surface.rs`）：Wayland 的逻辑尺寸已在平台层取整，buffer 严格是 N 的整数倍（否则
+//! `wl_surface.attach` 报 `invalid_size`），surface 的逻辑尺寸因此等于 `buffer / N`，
+//! 本方法写入的 320×200 仍是期望的最小客户区。
 
 use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
 

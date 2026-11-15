@@ -37,6 +37,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
+use wayland_client::protocol::wl_surface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 #[cfg(feature = "test-support")]
@@ -109,9 +110,9 @@ impl Renderer {
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-vulkan` 线程。
     ///
     /// `background` 是窗口背景色（persist 的 clear color，linear）。`viewport` 是
-    /// `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无 destination /
-    /// `buffer_scale` 回退，见 V-122）：GPU 线程在 present 前用它写逻辑尺寸，destination 与 buffer
-    /// 必须同一次生效（D1 / D2）。
+    /// `wp_viewport`（`None` = 整数回退，见 V-110）：GPU 线程在 present 前用它写逻辑尺寸，
+    /// destination 与 buffer 必须同一次生效（D1 / D2）。`surface` 是同一个 `wl_surface` 的代理
+    /// 副本，GPU 线程在 present 前用它写整数回退的 `set_buffer_scale`。
     ///
     /// # Errors
     /// 设备 / swapchain 创建失败，或 GPU 线程无法启动（`AppInit`）。
@@ -121,6 +122,7 @@ impl Renderer {
         size: (u32, u32),
         background: Color,
         viewport: Option<WpViewport>,
+        surface: wl_surface::WlSurface,
     ) -> Result<Self, EngineError> {
         let gpu = GpuRenderer::new_for_surface(
             display,
@@ -128,6 +130,7 @@ impl Renderer {
             size,
             background_linear(background),
             viewport,
+            surface,
         )?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
@@ -905,6 +908,7 @@ mod tests {
             plan,
             surface: (1, 1),
             surface_local: crate::math::Size::new(1.0, 1.0),
+            buffer_scale: 1,
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, Plan::Full));
