@@ -8,8 +8,8 @@
 //! 设计见 `design/phase-08-d3d12.md` §3.1、`design/phase-12-macos-linux.md` §3.1 / §4.2（S-123 收口）。
 
 pub(crate) mod atlas;
-/// 背景色编码（Windows / macOS 消费；Linux 本轮不接背景色，不参与编译 —— 避免 dead_code）。
-#[cfg(any(windows, target_os = "macos", test))]
+/// 背景色编码（三平台消费：Windows 用 sRGB 字节、macOS 用 layer + linear、Linux 用 linear；
+/// 各平台未使用的编码函数按 `cfg` 不参与编译 —— 避免 dead_code）。
 pub(crate) mod color;
 pub(crate) mod compositor;
 pub(crate) mod damage;

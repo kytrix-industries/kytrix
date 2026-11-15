@@ -26,8 +26,8 @@
    objc2 **不能统一**（0.6.5 与 accesskit_macos 的 0.5.3 共存，但桥接为裸指针，零成本）； **taffy 冻结 `=0.15.0`**（
    `gpui-fast 0.1.14` 精确钉 `=0.15.0`，`^0.15.1` 与它无解）；
    windows 0.62.2 需补 **`Win32_Graphics_Dxgi_Common`** 与 **`Win32_UI_Controls`**。
-4. **Phase 01 API**：`EngineError`（本阶段 6 个变体 + 完整冻结变体表）、`math` 数值类型与 **三种换算语义**（未取整浮点 /
-   逐边取整 / 向外覆盖）+ **128B AA 契约**（§7）。
+4. **Phase 01 API**：`EngineError`（本阶段 6 个变体 + 完整冻结变体表）、`math` 数值类型与 **四种换算语义**（未取整浮点 /
+   逐边取整 / 尺寸整体 round / 向外覆盖）+ **128B AA 契约**（§7）。
 5. **无阻塞性问题**；风险与待复核项见 §10。
 
 ---
@@ -722,7 +722,7 @@ pub enum EngineError {
 
 #### 6.3.1 原则
 
-- 只存**逻辑像素 `f32`**；物理像素只出现在 `to_physical_f32` / `to_physical` / `to_physical_covering`（I11）。
+- 只存**逻辑像素 `f32`**；物理像素只出现在 `to_physical_f32` / `to_physical` / `to_physical_rounded` / `to_physical_covering`（I11）。
 - 不做 GPUI 兼容形状（`Pixels`/`Bounds`/`px()`），不做通用变换栈。
 - 只放后续 Phase 已确定需要的能力；派生 `Debug, Clone, Copy, Default, PartialEq`（`PhysicalRect` 另加 `Eq`）； **不实现**
   `Hash`/`Ord`（浮点无全序）。
@@ -818,6 +818,10 @@ impl Rect {
     /// 逐边取整的物理像素矩形：图集图元（GlyphRun/Image）四边形，1:1 采样无重采样模糊（§7.2）。
     pub fn to_physical(self, scale: Scale) -> PhysicalRect;
 
+    /// 尺寸整体 `round`（half away from zero）的物理像素矩形：窗口 buffer 尺寸
+    /// （Wayland fractional-scale 要求 `round(logical × scale)`）；不是图元 / damage 的路径。
+    pub fn to_physical_rounded(self, scale: Scale) -> PhysicalRect;
+
     /// 向外 floor/ceil 的物理像素矩形：damage 与 scissor 的安全侧（§7.3）。
     pub fn to_physical_covering(self, scale: Scale) -> PhysicalRect;
 }
@@ -904,7 +908,7 @@ impl PhysicalRect {
 
 #### 6.3.3 语义细节
 
-- **非有限值**：`to_physical` / `to_physical_covering` / `to_physical_f32` 在任一输入分量非有限
+- **非有限值**：`to_physical` / `to_physical_rounded` / `to_physical_covering` / `to_physical_f32` 在任一输入分量非有限
   （NaN / ±inf，或 `scale` 非法）时返回**空矩形**（整数版 `(0,0,0,0)`，浮点版 `[0.0; 4]`），不 panic。
 - **转换顺序**：先 `saturate` 到 i32 安全域（`i32::MIN as f32 ..= i32::MAX as f32`）再 `round`/`floor`/`ceil` 转整型，
   **转换后**再 clamp 不变量（`x1 = x1.max(x0)`），避免 `as` 饱和产生逆序。
@@ -922,13 +926,21 @@ impl PhysicalRect {
 
 ## 7. 像素换算与 AA 契约（I11）
 
-### 7.1 三种换算语义（职责分离，取代 v1 的二分法）
+### 7.1 四种换算语义（职责分离，取代 v1 的二分法）
 
 | 函数                         | 输出           | 语义                                                              | 唯一用途                                                                                |
 |------------------------------|----------------|-------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
 | `Rect::to_physical_f32`      | `[f32; 4]`     | `x0 = x·s`、`x1 = (x + w)·s`、`w = x1 − x0`（y 同理），**不取整** | SDF 图元（`Quad` 含圆角/边框/渐变、`Shadow`）的 `GpuPrimitive.bounds`，以及 `clip_rect` |
 | `Rect::to_physical`          | `PhysicalRect` | **逐边** `round(edge·s)`（.5 远离零）                             | 图集图元（`GlyphRun`/`Image`）的四边形，保证纹素 1:1 无重采样                           |
+| `Rect::to_physical_rounded`  | `PhysicalRect` | **尺寸整体** `round(w·s)` / `round(h·s)`（.5 远离零；原点逐坐标取整） | 窗口 buffer 尺寸（Wayland `round(logical × scale)`；F-191），不用于图元 / damage      |
 | `Rect::to_physical_covering` | `PhysicalRect` | `floor(min·s)` / `ceil(max·s)`                                    | **damage** 与 **scissor**（安全侧，宁多勿少）                                           |
+
+`to_physical_rounded` 是 2026-11-15 为 Linux live-resize 增加的第四种语义：Wayland 的
+`wp_fractional_scale_v1` 要求 toplevel buffer 尺寸按 `round(logical × scale)`（half away from
+zero）计算。它与逐边取整的 `to_physical` 不同——后者分别 `round` 两条边，宽度可能与
+`round(w·s)` 差 1 px；只有 `Rect::new(0, 0, w, h)` 的 rounded 结果恰好是 `(round(w·s), round(h·s))`。
+除窗口 buffer 外不使用它（图元仍走 `to_physical`，damage/scissor 仍走 `covering`），见
+`async-render-pipeline.md` §4.4 / §7.5 与 DEVIATIONS F-191。
 
 ### 7.2 AA 契约（128 B `GpuPrimitive` 不变）
 

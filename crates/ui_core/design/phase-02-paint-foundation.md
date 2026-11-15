@@ -98,7 +98,7 @@
 |---------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **I2** 一套数据契约             | `paint::primitive::Primitive` 是唯一绘制指令定义；`paint::instance::GpuPrimitive`（P07 落地）是唯一 CPU→GPU 布局；`paint::atlas::AtlasTile` 是唯一图集引用；`paint::geometry::GeometryDesc` 是唯一静态几何描述 |
 | **I8** 三套 shader 共享字节布局 | §8 的 offset/kind/flags/params 表就是 `render/shaders/contract.md`（P10）的镜像来源；任何改动必须同时改 Rust + 三份 shader                                                                                     |
-| **I11** 逻辑存储 / 物理绘制     | `Primitive` 全逻辑 `f32`；只有 `instance` 编码处调用 `math` 的三种换算（P01 §7.1）                                                                                                                             |
+| **I11** 逻辑存储 / 物理绘制     | `Primitive` 全逻辑 `f32`；只有 `instance` 编码处调用 `math` 的三种绘制换算（第四种 `to_physical_rounded` 只用于窗口 buffer；P01 §7.1）                                                                                                                             |
 | **I12** 指令与像素分别验证      | §13 列出 `test_support` 需要的**全部只读面**；`Primitive`/`Scene`/`AtlasTile` 可 `PartialEq` 比较（§3.8 full-refresh oracle 直接比较 `(Primitive, order, bounds)`）                                            |
 | **I15** 颜色只有引擎一份语义    | `Color`/`ColorResolver` 是唯一定义；`color 0.3.3` 只出现在 `paint/color.rs` 一个文件的 `use` 里（§5.7）                                                                                                        |
 | **D2** 不内化 GPUI / 不引重依赖 | 只用 workspace 已冻结的 `color`/`bytemuck`/`bytes`/`etagere`/`lyon`                                                                                                                                            |
@@ -694,7 +694,7 @@ interpolate(from, to, t):
 | 单位     | 全部 `f32` **逻辑像素**；没有任何图元携带自己的物理像素字段                                                                                               |
 | 矩形     | `math::Rect`，半开区间 `[min, max)`；空矩形不绘制、不参与 damage（P01 §6.3.2）                                                                            |
 | 变换     | `Quad`/`GlyphRun`/`Image`/`Shadow`/`Path`/`Clip` **无变换栈**，坐标已由 paint 阶段展开为绝对值。唯一例外是 `GeometryDraw.transform`（uniform 变换，§9.6） |
-| 物理像素 | 只在 `paint/instance.rs` 编码时出现（P01 §7.1 的三种换算），`Primitive` 本身零物理像素                                                                    |
+| 物理像素 | 只在 `paint/instance.rs` 编码时出现（P01 §7.1 的三种绘制换算；第四种 `to_physical_rounded` 只用于窗口 buffer），`Primitive` 本身零物理像素                                                                    |
 
 > 为什么不做 per-primitive transform：设计 §5.3/§5.4 的 uber-quad 只有 `bounds`，没有矩阵槽；128 B 也没有空间。
 > 变换在 paint 阶段（P07）随 clip 一起展开，这让 damage（§12）能在逻辑空间直接取 AABB。

@@ -1,8 +1,8 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-189）。
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-192）。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-189（§27–§32）、`macos-verification.md` §2.9/§2.11/§2.12
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-192（§27–§33）、`macos-verification.md` §2.9/§2.11/§2.12、`linux-verification.md` §4.7
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -147,6 +147,8 @@ pub(crate) struct FrameRequest {
                                     //   + geometry: Vec<GeometryDraw>（第四份数据，§4.2）
     pub plan: Plan,                 // Full | Partial(DamageRects) | Idle（来自 UI 的 damage）
     pub surface: (u32, u32),        // 物理像素（UI 的发布目标）
+    #[cfg(target_os = "linux")]
+    pub surface_local: Size,        // 逻辑尺寸（surface-local）：GPU 线程 present 前写 viewport destination
     pub published_at: Instant,      // HUD：latency 的起点
 }
 // `FramePlan` 的 `fresh` 不再由 UI 线程决定：GPU 线程用自己的「目标是新建/重建」状态
@@ -174,6 +176,12 @@ completed handler），按提交顺序发布，允许覆盖尚未被 UI 线程�
 debug 断言）。DPI 的跨线程传递只保留 macOS 的 `set_layer_scale(surface, scale)`（主线程写
 CA 图层，§5.3）；macOS 的真实像素尺寸不再靠 `scale` 乘出来，而是随 `surface`（真实 backing，
 F-187）一起过线。
+
+Linux 的 `surface_local` 与 `surface` 必须来自**同一帧**：`surface` 是
+`round(surface_local × scale)` 的 buffer 尺寸，`surface_local` 是 compositor 显示用的逻辑尺寸
+（present 前 `set_destination(ceil(...))`）。最新帧槽覆盖时两者一起替换，拆开或延后一帧会让
+compositor 用错尺寸——旧 buffer 被新 destination 单独缩放（D1）或整面被 0.999× 重采样（D3）。
+落点与实测见 §7.3 / §15.11、F-190 / F-191。
 
 `FrameOutcome::Committed(index)` 的语义随之变成「**已交付 GPU 线程**」（不等于已呈现；纯 Idle
 计划被门禁跳过时也不会交付）；窗口路径的 `RenderStats`/GPU 采样从 `poll()` 取（落后 ≤1 帧），
@@ -209,11 +217,12 @@ UI 线程 `publish`：
 
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
-- **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍是 0×0；等价改造未做）。
+- **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = **真实 Wayland buffer**（`round(logical × scale)`，`platform/linux/dpi.rs::physical_size`，在 `run` 与每轮 configure / scale 变化之后由 `Window::set_surface` 写入；fractional-scale 协议要求 round，不是 covering 的 ceil，F-191）。
 - 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
 - **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
+- **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
-- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`，它有三份 `#[cfg]` 实现（Windows / macOS = `surface`，Linux = covering 原值，F-186 / F-189）。
+- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
 
@@ -389,7 +398,7 @@ waitable = chain2.GetFrameLatencyWaitableObject();
 
 - `DXGI_SCALING_NONE`（[DXGI_SCALING](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling)）：resize 期间 DWM **不**把旧 buffer 拉伸到新客户区，新暴露的右/下区域由 [`IDXGISwapChain1::SetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-setbackgroundcolor) 填充。旧的 `STRETCH` 实测在 300×200 跳变时把整帧放大 1.25×（card 907×269）、文字发虚（F-184）。
 - **背景色编码（实测偏差，S-139）**：官方说 “we recommend that you perform floating point operations in a linear color space”，但在本路径（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE` 的 HWND swapchain）上 `DXGI_RGBA` 的 float **按 sRGB 编码字节直写**：传 linear 值得到 `(1,1,2)`，传 sRGB 编码分量得到 `(11,14,19)`（= `#0B0E13`）。实现固定走共享的 `render/color.rs::background_srgb`（`Color` → 不透明化（alpha=1、不改 RGB）→ `ColorResolver::resolve`（linear、alpha=1 ⇒ 非预乘）→ IEC 61966-2-1 linear→sRGB encode → `DXGI_RGBA`（alpha=1））；macOS 的 `NSColor`/`CGColor` 复用同一个函数（S-141）。
-- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；Windows / macOS 影响窗口底色，Linux 只记录、后续接；demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；Windows 下一次 `Present1` 生效，§6.3）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。macOS 的对应契约见 §5.3（layer sRGB + clear linear + `NSWindow` 创建期，F-188）。
+- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；三平台都影响窗口底色：Windows = `SetBackgroundColor` 的 sRGB 字节，macOS = layer sRGB + clear linear，Linux = persist clear 的 **linear** 值；demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；Windows 下一次 `Present1` 生效，§6.3；macOS / Linux 见 F-188 / F-192）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。macOS 的对应契约见 §5.3（layer sRGB + clear linear + `NSWindow` 创建期，F-188）；Linux 见 §7.3 / §7.5（S-143 / F-192）。
 - 保留 `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy dirty 区）与 `FRAME_LATENCY_WAITABLE_OBJECT`（§6.3 每帧等一次）。
 - 该 flag 让 swapchain **自带有独立的最大排队帧信号量**；不设时同一进程内所有 swapchain 共享同一个隐式帧延迟计数（Chromium 的实测结论，见 [Chromium issue 40890504](https://issues.chromium.org/issues/40890504)）。
 - 官方要求：**每帧开始渲染前等待该句柄，包括第一帧**（[GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)）。等待发生在 GPU 线程，不违反 I1。
@@ -517,7 +526,7 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 - `WM_SIZE`/`WM_DPICHANGED`：更新 `Window` 的 size/scale 与**真实客户区 surface**（`set_surface`；`WM_SIZE` 的 lParam 就是新客户区的物理宽高，`WM_DPICHANGED` 回读 `client_size()` 且最小化时用 `IsIconic` 跳过），然后 `dispatcher.wake()`。GPU 线程的目标尺寸由下一帧的 `FrameRequest.surface` 派生（§4.4）。
 - 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
-- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。编码走共享 `render/color.rs::background_srgb`（S-139）。macOS 已接同一契约（layer sRGB + clear linear，F-188 / S-141），Linux 只记录参数、本轮无渲染效果（S-140）。
+- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。编码走共享 `render/color.rs::background_srgb`（S-139）。macOS 已接同一契约（layer sRGB + clear linear，F-188 / S-141）；Linux 也已接（persist clear 的 **linear** 值 + `Shared` 背景槽，F-192 / S-143）。
 - **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
 - 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
 
@@ -532,9 +541,14 @@ UI 线程（calloop：wl_display 默认队列）      kytrix-vulkan 线程（每
 ────────────────────────────────────────    ─────────────────────────────────────────
 输入/configure/IME/剪贴板                    循环：等事件 → 取最新帧
 wl_surface.frame 回调（frame_ready）              → 槽 fence → acquire（可阻塞）
-publish(FrameRequest) ──► 最新帧槽                → 录制 → submit → present
-poll() ◄──────────────── 反馈槽                    → 完成通知入队 → retire（timeline）
+publish(FrameRequest{surface,                  → 录制 → set_destination（present 前）
+  surface_local}) ──► 最新帧槽                 → submit → present（attach + destination 原子）
+poll() ◄──────────────── 反馈槽                → 完成通知入队 → retire（timeline）
 ```
+
+UI 线程**不再 commit `wl_surface`**（唯一例外是建窗的首个 commit，用来拿到首个 configure）；
+`wp_viewport` 在 `WaylandState::take_viewport()` 之后由 GPU 线程持有，destination 与 buffer 在
+present 里同一次生效（§7.5 / F-190）。
 
 ### 7.2 同步原语（按 Khronos 的 frames-in-flight 模式）
 
@@ -557,6 +571,7 @@ loop {
     wait(condvar)                              // 事件/关闭；允许阻塞
     drain_timeline();                          // 非阻塞推进 retire
     let Some(frame) = take_latest_frame() else { continue };
+    // frame.surface = round(logical × scale)（平台层 set_surface 写入）；不是 covering。
     if frame.surface != surface { recreate_swapchain(); }
 
     // ⓪ 取本帧槽位：按 **acquire 次数**轮转（0 → 1 → 2 → 0），不由帧序号取模（F-176）。
@@ -591,10 +606,27 @@ loop {
     submit(wait: image_available[slot] @ TRANSFER,
            signal: [render_finished[image], timeline_value],
            fence: fence[slot]);
+
+    // ③b destination：必须在 vkQueuePresentKHR **之前**写（WSI 规范要求窗口系统变更先于
+    //    present；present 内部的 `wl_surface.commit` 让 attach 与 destination **同一次**生效）。
+    //    只在变化时下发；`frame.surface_local` 与 `frame.surface` 来自同一 UI 帧，旧 buffer 不会
+    //    被新 destination 单独缩放（D1 / D2）。没有 viewporter ⇒ 跳过（无 destination /
+    //    buffer_scale 回退，V-122 P2-5）。
+    if let Some(viewport) = viewport {
+        if let Some((width, height)) = destination_update(last_destination, frame.surface_local) {
+            viewport.set_destination(width, height);   // ceil(logical)，至少 1 px
+            last_destination = Some((width, height));
+        }
+    }
+
     present(wait: render_finished[image], swapchain, image);   // OUT_OF_DATE/SUBOPTIMAL 处理见 §7.4
     frame.presented();
 }
 ```
+
+- **destination 与 buffer 的唯一配点**：`wp_viewport` 从 UI 线程移交后只由 GPU 线程使用；`set_destination` 写的是**逻辑尺寸**（`ceil(logical)`，至少 1 px），buffer 是 `round(logical × scale)`，两者按上面的顺序在同一次 present commit 里原子生效。没有 viewporter 时什么都不做（无 destination / `buffer_scale` 回退，V-122 P2-5）。`Drop` 时先 `viewport.destroy()`：renderer 在 `WaylandState` 之前 drop，销毁时 `wl_surface` 仍存活。
+- **UI 线程不 commit `wl_surface`**：删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` 与 IME 两处 surface commit 后，`wl_surface.frame` 回调只由 present 触发，FrameGate 的「≤1 在飞」重新成立（D4）。`zwp_text_input_v3` 的状态在它自己的 `commit` 生效（v1 不需要 surface commit）。
+- **背景 clear**：persist 的 `clear_color` 是窗口背景色（`render/color.rs::background_linear`，按 **linear** 写 Vulkan sRGB attachment，S-143）；UI 线程只写 `Shared` 背景槽 + `wake`（并标 full damage），GPU 线程在空闲或取帧后应用（`wait_for_work` 把待应用色算工作）。下一次全量录制生效；**调用方需在之后触发一帧**（与 Windows 相同）；不引入 seed 帧（F-192）。
 
 - 槽 fence 是「复用命令缓冲 / 上传缓冲」与「安全地再次 signal `image_available[slot]`」的共同前置条件，因此必须在 acquire 之前等（§7.2 的两条硬规则不因此改变）。
 - `image_available` 的 wait stage 与 swapchain image 首个 layout transition 的 `srcStageMask` **都必须是 `TRANSFER`**（dst 已经是 `TRANSFER`）：本后端不直接往 swapchain image 上画，首次访问是 transition + 整面 copy。写成 `COLOR_ATTACHMENT_OUTPUT` / `TOP_OF_PIPE` 时 transition 与 acquire 信号量没有依赖链，syncval 报 `SYNC-HAZARD-WRITE-AFTER-READ`（F-168，§15.4）。
@@ -628,9 +660,10 @@ recreate_swapchain():
 
 1. **WSI 有自己的事件队列**：规范要求每次 `vkCreateWaylandSurfaceKHR` 都新建一个 `wl_event_queue`，实现创建的所有 Wayland 对象都挂在这个队列上；应用**不得**自己 dispatch 这些对象（[Vulkan WSI: Wayland Platform](https://github.com/KhronosGroup/Vulkan-Docs/raw/main/chapters/VK_KHR_surface/wsi.adoc)）。Mesa 的实现与此一致，并在 `present` 里 `wl_display_flush`、在 `acquire` 里 dispatch 自己的队列。
 2. **应用默认队列仍归 calloop**：输入/configure/IME/`wl_surface.frame` 回调都在 UI 线程的 `WaylandSource` 上。`wl_display` 的多线程规则是「同一时刻只有一个 reader」，libwayland 用 `reader_count` + 条件变量协调；calloop-wayland-source 已显式容忍「另一个线程先读了 socket」的情况（`WouldBlock` 分支）。
-3. **帧回调请求必须早于 present**：UI 线程在 `publish` **之前**调用 `state.request_frame()`（现状已经是这个顺序），WSI 的 `attach/commit` 在 present 时发生，因此 `wl_callback.done` 一定能到达。
-4. **`wl_surface` 状态变更只能在 present 之前发**：`wp_viewport.set_destination` / `set_buffer_scale` 这类窗口变更按规范必须在 `vkQueuePresentKHR` 之前发给合成器（§7.5 第 1 条的规范原文）。现有 `surface.rs` 的 `commit()` 与 WSI 的 commit 共用同一连接、由 libwayland 串行化；实现时把这些请求全部放在 UI 线程的「发布之前」段（`sync_viewport` 已经在那个位置），禁止在 present 之后补发。
-5. **合成器节流优先**：即使 GPU 线程阻塞在 `acquire`，UI 线程也不受影响；帧回调让 UI 只在合成器需要时产帧。
+3. **帧回调请求必须早于 present，且只能由 present 触发**：UI 线程在 `publish` **之前**调用 `state.request_frame()`，WSI 的 `attach/commit` 在 present 时发生，因此 `wl_callback.done` 一定能到达；`wl_surface.frame` 只在 `wl_surface.commit` 之后生效，而 UI 线程已不再 commit（见第 4 条），所以 FrameGate 的「≤1 在飞」不会被提前回调破坏（D4）。`zwp_text_input_v3` 的状态在它自己的 `commit` 生效，v1 不需要 surface commit。
+4. **`wl_surface` 状态变更只由 GPU 线程在 present 之前发**：`wp_viewport.set_destination` 这类窗口变更按规范必须在 `vkQueuePresentKHR` 之前发给合成器。建窗后 `WpViewport` 经 `WaylandState::take_viewport()` 交给 GPU 线程（`Renderer::new_for_surface(..., viewport)`），由 `GpuRenderer` 在 present 前写 destination，与 WSI 的 attach/commit **同一次**生效；UI 线程**不** commit `wl_surface`（唯一例外：建窗的首个 commit 用来取得首个 configure），也不再调 `set_buffer_scale(1)`（fractional-scale 要求 buffer scale 恰为 1，默认即 1）。旧的 `sync_viewport` + 单独 `commit()`（未 attach 新 buffer）已删除。
+5. **buffer 尺寸按 fractional-scale 协议取 `round(logical × scale)`**：不是 covering 的 ceil；1.25 / 1.75 下多 1 px 会让整面被合成器以 0.999× 重采样（D3）。`viewport_destination` 保持 `ceil(logical)`。
+6. **合成器节流优先**：即使 GPU 线程阻塞在 `acquire`，UI 线程也不受影响；帧回调让 UI 只在合成器需要时产帧。
 
 ### 7.6 present mode：`MAILBOX`
 
@@ -701,15 +734,17 @@ UI 线程上没有任何一行等待。
 | `render/windows/swapchain.rs` | 加 `IDXGISwapChain2`、waitable、`SetMaximumFrameLatency(1)`、`DXGI_SCALING_NONE` + `SetBackgroundColor`（创建后 / `ResizeBuffers` 后，S-139）、`present1`、`resize`（带 flag）、`waitable()` |
 | `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`resize` 改由 GPU 线程调 |
 | `render/linux/swapchain.rs` | 每 image 一个 `render_finished`；`create` 带 `old`；新增 `recreate`/`retire`；present mode 改 `MAILBOX` |
-| `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进 |
-| `render/linux/renderer.rs` **新增** | 门面（同 Windows） |
+| `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进；持有 `WpViewport` + `last_destination`，present 前写 destination（F-190）；`set_clear_color` / 初始 `clear_color` = `background_linear`（F-192） |
+| `render/linux/renderer.rs` **新增** | 门面（同 Windows）；`new_for_surface(..., background, viewport)`；`Shared`/`State` 背景槽（F-192） |
+| `platform/linux/surface.rs` | 删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` / IME 两处 `wl_surface.commit()`；新增 `take_viewport()`（D1 / D4） |
+| `platform/linux/event_loop.rs` | 删 `sync_viewport()` 调用；每轮 configure / scale 变化后 `window.set_surface(physical_size(...))`（round）；建渲染器传 `background` 与 `take_viewport()`（F-190 / F-191 / F-192） |
 | `render/macos/renderer.rs` | 重写：display link 委托 + 最新帧/最新 drawable 槽 + GPU 循环；删除 mailbox 的 `requeue/wait_retry/poll_completed` |
 | `render/macos/queue.rs` | 删除 `Submitted` 轮询与 `waitUntilCompleted` 背压；`begin` 只取槽；`submit` 只 commit；完成走 `addCompletedHandler` |
 | `render/macos/swapchain.rs` | 删除 `next_drawable`；加 display link 相关（或移到 `renderer.rs`）；`contentsGravity` / `backgroundColor` / `contentsScale` / `drawableSize` 的唯一写入口（主线程，F-187 / F-188） |
 | `render/macos/compositor.rs` | `submit_payload` 改为「给定 drawable 渲染」；persist 重建不等待；图层属性写接口移到 `renderer.rs`；persist `clear_color` = 背景色 linear（F-188） |
-| `render/color.rs` **新增（2026-11-15）** | 共享背景色编码：`background_srgb`（Windows DXGI / macOS `CGColor`）与 `background_linear`（macOS clear），共用 `opaque + ColorResolver`（F-188 / S-141） |
-| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186 / F-189）与 `background`（F-184 / F-188） |
-| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7）；macOS 在 Dpi / Resized 之后把真实 backing 写进 `Window::set_surface`（§5.3） |
+| `render/color.rs` **新增（2026-11-15）** | 共享背景色编码：`background_srgb`（Windows DXGI / macOS `CGColor`）与 `background_linear`（macOS / Linux 的 sRGB 渲染目标 clear），共用 `opaque + ColorResolver`（F-188 / S-141 / S-143） |
+| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`（Linux 填 `surface_local`，F-191）；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186 / F-189 / F-191）与 `background`（F-184 / F-188 / F-192） |
+| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7）；macOS 在 Dpi / Resized 之后把真实 backing 写进 `Window::set_surface`（§5.3）；Linux 每轮写 `round(logical × scale)` 的 Wayland buffer（F-191） |
 | `lib.rs` / `render.rs` | 模块声明更新（新增两个 `renderer.rs`） |
 
 ### 9.2 删除（已全部落地：F-164、F-166 … F-182）
@@ -740,7 +775,8 @@ UI 线程上没有任何一行等待。
 | live resize 连续拖动 2s | UI 线程单次 `frame` 耗时 max < 4ms；无 `ResizeBuffers`/`acquire`/`nextDrawable` 出现在 UI 线程的 sample 里；画面跟随拖动 |
 | live resize 无整帧缩放（Windows，`SCALING_NONE`） | 拖动期间卡片 bbox 恒定（911 帧：725×220，`stretch_w = 1.00000`）、文字/HUD 不缩放且锐度不降；新暴露的右/下区域 = 窗口背景色且 ≤ 2 帧；缩小时右/下裁切、右锚 HUD 滞后 1–2 帧后回位（可接受） |
 | live resize 无整帧缩放（macOS，`kCAGravityBottomLeft` + 真实 backing） | stale 帧卡片 bbox = 静止 bbox（1108×350，1.000×/1.000×）并贴**视觉左上**；卡片文字锐度不降（Laplacian 808 vs 800，+1%；旧 HEAD 624，-22%）；新暴露的右/下条带 = 窗口背景色（(13,15,19) ≈ `#0B0E13`，对静止背景 Δ≤1，无黑/白条）；缩小时右/下裁切、放大时新暴露条带 ≤ 1–2 帧；连续 sweep 卡片高 174–175 恒定；最小化 3 s 恢复 1:1、Esc exit 0、stderr 空。**1x / 真实鼠标拖拽未测**（V-121） |
-| 窗口背景色（`#0B0E13`） | Windows：resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照）。macOS：条带 (13,15,19)/(14,15,19)（F-188） |
+| live resize 无整帧缩放（Linux，destination 与 buffer 原子） | `WAYLAND_DEBUG`：1218 次 destination 变更 **1218 次与 attach 同一次 commit**（0 次无 attach、0 mismatch、0 次 `set_buffer_scale`；旧 HEAD 273/294 次无 attach）；buffer = `round(logical×scale)`（701×501@1.25 ⇒ 876×626，旧 877×627）；卡片 bbox 恒定（1.25：725×220；1.0：580×176）、文字锐度不降（Laplacian 1.25：1715.34；1.0：2019.30；旧 HEAD 1.25：616–1048）；2802 次 resize / 3583 次 present、FrameGate 最大间隔 79.6 ms、exit 0、validation 0 VUID；缩小时右/下裁切（1.0：576×176 / 580×134）。1.25 下 7/70 帧整窗变软（bbox 不变，归因 sway 分数缩放采样）；**Mutter/KWin、真实指针拖拽未测**（V-122） |
+| 窗口背景色（`#0B0E13`） | Windows：resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照）。macOS：条带 (13,15,19)/(14,15,19)（F-188）。Linux：clear 夹具 `#0B0E13`→(11,14,19)、`#402080`→(64,32,128)（linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见）；`set_background_color` 经 `Shared` 槽在 GPU 线程空闲 / 下一帧录制前应用（F-192 / S-143） |
 | resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface`），5 s 恢复像素差 0.067% |
 | 真实 DPI 150% / 175% | **未实测**（V-120）：本轮实机只跑 125%（DPI=120）；175% 只有 `256.8 × 1.75 = 449.4` 的取整事实（covering 到 450） |
 | 空闲 2s | 0 帧；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程无自旋唤醒 |
@@ -757,7 +793,7 @@ UI 线程上没有任何一行等待。
 
 ---
 
-## 11. 探针与验证项（P0 三项 + Windows / macOS resize 追加）
+## 11. 探针与验证项（P0 三项 + Windows / macOS / Linux resize 追加）
 
 | # | 假设 | 实验 | 不成立时的结论 |
 |---|---|---|---|
@@ -771,10 +807,16 @@ UI 线程上没有任何一行等待。
 | 8 | macOS 条带颜色与页面背景的 8-bit 差（layer sRGB + clear linear） | resize 帧截取窗口右/下条带与静止页面的同一像素区域，比较 RGB | **已实测**：条带 (13,15,19)/(14,15,19)，静止背景 (12,14,18)，Δ≤1（≈ `#0B0E13`，无黑/白条、无二次编码）。两种编码不能互换（S-141） |
 | 9 | drawable 池重建是否掉帧 / 是否出现拉伸帧 | live resize 连续 sweep 录屏，逐帧量卡片 bbox 与高度 | 录屏 54–58 fps（录屏口径，不是引擎 FPS）；卡片高 174–175 恒定、无拉伸帧；`Skip` 只跳 vsync 不产生拉伸。GPU 侧未单独统计掉帧（HUD FPS 是提交率，不代表呈现） |
 | 10 | display link 在 AppKit 的 resize 期间是否仍回调（common modes） | AX 连续 `setSize`（约 28 ms/步）+ 单次跳变 960×778 → 1400×950，统计每个尺寸是否有新 drawable 被消费 | **已实测**：resize 期间 display link 持续给 drawable（逐档 resize 的 stale 帧只跳一个 vsync，下一次取到的 drawable 就匹配新尺寸）；**真实鼠标拖拽**（`NSEventTrackingRunLoopMode`）与 1x 未验（V-121） |
+| 11 | Linux `wp_viewport.set_destination` 与 buffer 能否在**同一次** present 提交里原子生效 | `WAYLAND_DEBUG=1` 统计每次 destination 变更前后是否有 attach + commit；旧 / 新代码各跑 1.0 / 1.25 的 jump + sweep | **已实测**：旧 HEAD `8598fe3` 273/294 次 destination 变更无 attach（旧 buffer 被缩放）；新代码 1218/1218 与 attach 同一次 commit（0 无 attach、0 mismatch、0 `set_buffer_scale`）⇒ F-190 |
+| 12 | fractional-scale 的 buffer 尺寸是 `round` 还是 `ceil` | 1.25 下 701×501 逻辑：比较 buffer 实际尺寸与 `round(701×1.25)` / `ceil(...)`，并量文字 Laplacian | **已实测**：旧 ceil 877×627（整面 0.999× 重采样），新 round 876×626；卡片 bbox 恒定、Laplacian 1715.34（旧 616–1048）⇒ F-191 |
+| 13 | Vulkan sRGB attachment 的 clear 值按 linear 还是 sRGB 字节解释 | 无根节点的 `/tmp` 临时夹具分别 clear `#0B0E13` 与 `#402080`，`grim` 后读像素 | **已实测**：`(11,14,19)` / `(64,32,128)`，linear clear → sRGB 往返正确（与 Windows S-139 的 sRGB 字节直写相反、与 macOS S-141 的 clear linear 一致）⇒ S-143 |
+| 14 | Linux resize 期间是否有 `OUT_OF_DATE` 重试、Mutter / KWin 的行为是否与 sway 一致 | 逐次统计 `vkQueuePresentKHR` / `OUT_OF_DATE`；在 Mutter / KWin 上重复同一 resize 序列 | **未验**（V-122）：只做了 headless sway 1.11 / wlroots 0.19 / lavapipe；`OUT_OF_DATE` 未逐次计数、Mutter / KWin 未跑 |
 
 前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows
 resize 修复时新增的验证项（未闭环部分登记 V-120）；7–10 是同一天 macOS live-resize 修复新增的
-验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项登记 V-121）。
+验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项登记 V-121）；11–14 是同一轮
+Linux live-resize 修复新增的验证项（结论见 §7.3 / §7.5 / §15.11，协议事实登记 S-144，未验证项
+登记 V-122）。
 
 ---
 
@@ -817,10 +859,11 @@ D3D12 / DXGI：
 - [D3D12HelloFrameBuffering](https://github.com/microsoft/DirectX-Graphics-Samples/blob/master/Samples/Desktop/D3D12HelloWorld/src/HelloFrameBuffering/D3D12HelloFrameBuffering.cpp)
 
 Vulkan / Wayland：
-- [Frames in flight](https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html)、[vkAcquireNextImageKHR](https://registry.khronos.org/vulkan/specs/latest/man/html/vkAcquireNextImageKHR.html)、[VkPresentModeKHR](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentModeKHR.html)
+- [Frames in flight](https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html)、[vkAcquireNextImageKHR](https://registry.khronos.org/vulkan/specs/latest/man/html/vkAcquireNextImageKHR.html)、[VkPresentModeKHR](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentModeKHR.html)、[vkQueuePresentKHR](https://registry.khronos.org/vulkan/specs/latest/man/html/vkQueuePresentKHR.html)
 - [VkSwapchainCreateInfoKHR (oldSwapchain)](https://registry.khronos.org/vulkan/specs/latest/man/html/VkSwapchainCreateInfoKHR.html)、[vkDestroySwapchainKHR](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySwapchainKHR.html)
 - [Vulkan WSI: Wayland Platform](https://github.com/KhronosGroup/Vulkan-Docs/raw/main/chapters/VK_KHR_surface/wsi.adoc)、[swapchain_recreation sample](https://docs.vulkan.org/samples/latest/samples/api/swapchain_recreation/README.html)
 - [VK_KHR_timeline_semaphore](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_timeline_semaphore.html)
+- [viewporter](https://wayland.app/protocols/viewporter)（`wp_viewport.set_destination` 改变 surface 尺寸并缩放 buffer）、[fractional-scale-v1](https://wayland.app/protocols/fractional-scale-v1)（buffer = `round(logical × scale)`、`buffer_scale = 1`）、[xdg-shell](https://wayland.app/protocols/xdg-shell)（configure 尺寸是 surface-local 逻辑尺寸）、[wl_surface](https://wayland.app/protocols/wayland#wl_surface)（`commit` / `frame` 回调语义）
 
 ---
 
@@ -828,8 +871,9 @@ Vulkan / Wayland：
 
 实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；第一轮
 （F-166 … F-175）见 §15.1–§15.4，第二轮（F-176 … F-182）与三平台当前实测数字见
-§15.5–§15.6；F-183 复审、Windows live-resize（F-184 … F-186 / S-139 / S-140）与 macOS
-live-resize（F-187 … F-189 / S-141 / S-142）见 §15.7–§15.10。
+§15.5–§15.6；F-183 复审、Windows live-resize（F-184 … F-186 / S-139 / S-140）、macOS
+live-resize（F-187 … F-189 / S-141 / S-142）与 Linux live-resize（F-190 … F-192 /
+S-143 / S-144 / V-122）见 §15.7–§15.11。
 
 ### 15.1 本批已闭环
 
@@ -1044,4 +1088,58 @@ macOS 的 live resize 把旧 drawable 交给 CoreAnimation 缩放：`CAMetalLaye
   `platform/macos/dpi.rs`（删 `physical_size`）、`window.rs`（`surface` / `set_surface` /
   `frame_rect` / `background` 文档与 `cfg(any(windows, target_os = "macos"))`）、
   `render/windows/{renderer,compositor}.rs`（改用 `background_srgb`，删除 `background_rgba`）。
+
+> **注**：本节是 macOS 轮次的原记录（当时 Linux 未改）；Linux 的等价改造由紧接着的 §15.11 闭环
+> （F-190 … F-192 / S-143 / S-144 / V-122）。
+
+### 15.11 第七轮闭环（Linux live resize：destination 与 buffer 原子 + 真实 buffer + 背景 clear，2026-11-15）
+
+Wayland 的 live resize 同时踩了四个独立缺陷：`sync_viewport` 把新 destination 单独
+`wl_surface.commit()`（不 attach 新 buffer），compositor 立刻按新 destination 缩放**旧** buffer；
+UI 线程的 commit 与 GPU 线程 WSI present 的 commit 没有 happens-before；buffer 用 covering 的
+`ceil` 而不是 fractional-scale 要求的 `round`；UI 线程的 commit 又会提前触发 `wl_surface.frame`
+回调，破坏 FrameGate 的「≤1 在飞」。本轮只改 Linux 窗口路径 + 共享层（`surface` / `frame_rect` /
+`background` 的 `cfg` 扩到 Linux 与颜色编码）；Windows / macOS 的已提交行为不变。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §33（F-190 … F-192 / S-143 / S-144 / V-122），实机证据见
+[`linux-verification.md`](linux-verification.md) §4.7。
+
+| 项 | 结论 |
+|---|---|
+| D1 destination 单独 commit | `platform/linux/surface.rs::sync_viewport` 调 `set_destination` + `set_buffer_scale(1)` + `wl_surface.commit()`（未 attach）⇒ compositor 立即缩放旧 buffer。实测旧 HEAD `8598fe3`：273/294 次 destination 变更无 attach；1.25 静止 buffer 877×627、卡片 bbox 435–774 被拉伸、文字 Laplacian 616–1048，22 ms 后才等到新 buffer |
+| D2 跨线程 commit 无序 | UI 线程的 `wl_surface.commit` 与 GPU 线程 WSI 的 present commit 无 happens-before；旧 buffer 可能在 destination 之后 attach ⇒ 修复必须把 destination 移到 GPU 线程、present 之前 |
+| D3 buffer 取整 | `physical_size` 用 covering（ceil）；fractional-scale 协议要求 `round(logical × scale)`。1.25 / 1.75 下多 1 px ⇒ 整面被 compositor 以 0.999× 重采样（文字轻微发虚）。新增 `Rect::to_physical_rounded`（half away from zero），`platform/linux/dpi.rs::physical_size` 改 round；`viewport_destination` 保持 `ceil(logical)` |
+| D4 frame callback 提前 | UI 线程的 commit（`sync_viewport` + IME 两处）提前触发 `wl_surface.frame` 回调；FrameGate 的 ≤1 在飞前提失效。删除三处 `wl_surface.commit()`（保留建窗初始 commit），IME v1 状态只走 `zwp_text_input_v3.commit` |
+| 原子化 | `WaylandState::take_viewport()` 把 `WpViewport` 交给 `Renderer::new_for_surface(..., background, viewport)`；`GpuRenderer` 持有 viewport + `last_destination`，在 `vkQueuePresentKHR` **之前**按 `FrameRequest.surface_local` 写 `set_destination(ceil(logical))`（只在变化时）；present 内部的 attach/commit 让两者**同一次**生效。`Drop` 里 `viewport.destroy()`（surface 仍存活） |
+| surface | `Window.surface` = 平台层写入的真实 Wayland buffer：`run` 与每轮 configure / scale 变化后 `window.set_surface(dpi::physical_size(...))`（同值 no-op）；`frame_rect()` 三平台统一为 `surface`（Linux 不再用 covering；`set_surface` 的 0 尺寸 clamp 1） |
+| 同帧配对 | `FrameRequest` 加 `#[cfg(target_os = "linux")] surface_local: Size`（`Window::submit_gpu` 填 `self.size()`）；最新帧槽覆盖时 `surface` 与 `surface_local` 一起替换（单测 `replacing_a_frame_keeps_surface_and_surface_local_paired`） |
+| 背景色 | `WindowOptions.background` / `set_background_color` 在 Linux 生效：构造时 `background_linear(WindowOptions.background)` 写 persist `clear_color`，运行期经 `Shared` 背景槽（GPU 线程空闲 / 取帧后各应用一次；`wait_for_work` 把待应用背景色也算工作）；clear 按 **linear** 写 Vulkan sRGB attachment（S-143）。`set_background_color` 标 full damage，下一次全量录制生效 |
+| 不 seed 帧 | 不改 destination 时旧 buffer 不会被缩放；Wayland 窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局。没有 Windows 的「背景条中间态」，因此不引入额外的旧 layout 帧（F-192） |
+| 实测（headless sway 1.11 / wlroots 0.19 / lavapipe） | 1.25：701×501 → buffer **876×626**（round；旧 877×627）、destination 701×501，`create_buffer → set_destination → attach → commit` 相邻无中间 commit；卡片 725×220 恒定、静止 Laplacian 1715.34（旧 616–1048）；1.0：卡片 580×176 恒定、Laplacian 2019.30；2802 次 resize / 3583 次 present，**1218 次 destination 变更 1218 次原子**（0 无 attach、0 mismatch、0 `set_buffer_scale`）；FrameGate 最大间隔 79.6 ms；HUD 静止 59.1 fps / 2.13 ms、拖动 39.2 / 6.28 ms；exit 0、validation 0 VUID。1.25 下 7/70 帧整窗变软（bbox 不变；稳定复测 1715.34，归因 sway 分数缩放采样，不是旧 buffer 缩放）；缩小（1.0）右裁 576×176、下裁 580×134 |
+| clear 夹具 | `/tmp` 临时夹具（无根节点）：`#0B0E13` → 像素 `(11,14,19)`、`#402080` → `(64,32,128)`，证明 linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见（F-192 / S-143） |
+| 未验证 | Mutter / KWin、真实指针拖拽、逐次 `OUT_OF_DATE` / `vkQueuePresentKHR` 计数、无 viewporter 回退（实现没有 destination / `buffer_scale` 回退，V-122 P2-5）、1.25 sway 瞬态采样、HUD OCR；`apply_min_size` 的物理/逻辑 bug 仍存在（V-122） |
+
+- **探针环境与方法**：headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1` 1280×720；
+  `swaymsg resize set` 做程序化 jump / sweep（没有真实指针拖拽），`grim` 逐帧截图，
+  `WAYLAND_DEBUG=1` 统计 commit / attach / destination。判据：每次 destination 变更是否有
+  attach 同行、buffer 尺寸是否等于 `round(logical × scale)`、卡片 bbox 是否恒定、卡片文字区域的
+  Laplacian 方差（锐度）、缩小时是否裁切、soak 计数与 validation 输出。逐项结果见
+  [`linux-verification.md`](linux-verification.md) §4.7。
+- **新增单测**：`math.rs` **5 条**（`physical_rounded_buffer_size_table` /
+  `physical_rounded_non_integer_product_rounds_not_ceils` / `..._rounds_half_away_from_zero`
+  / `..._rounds_the_size_not_the_edges` / `..._non_finite_is_empty`）、`platform/linux/dpi.rs` 2 条
+  （`physical_size_rounds_the_buffer_size` / `viewport_destination_is_the_logical_size_rounded_up`）、
+  `render/frame.rs` 1 条（`replacing_a_frame_keeps_surface_and_surface_local_paired`）、
+  `render/linux/compositor.rs` 2 条（`a_destination_is_written_only_when_it_changes` /
+  `the_destination_is_the_logical_size_rounded_up`）、`render/linux/renderer.rs` 2 条（待应用背景色
+  只取一次；shutdown / terminated 后丢弃）、`window.rs` Linux
+  `frame_rect_uses_the_platform_buffer_on_linux`（含 0 尺寸 → 1×1）。Linux 专属用例在
+  `cfg(target_os = "linux")` 下编译。
+- **落点**：`math.rs`（`to_physical_rounded`）、`platform/linux/dpi.rs`（`physical_size` round）、
+  `platform/linux/surface.rs`（删 `sync_viewport` / `viewport_applied` / `set_buffer_scale` / IME
+  commit；`take_viewport`）、`platform/linux/event_loop.rs`（每轮 `set_surface`、传 background /
+  viewport）、`render/linux/renderer.rs`（`new_for_surface(..., background, viewport)` /
+  `set_background_color` / `Shared` 背景槽）、`render/linux/compositor.rs`（viewport /
+  `last_destination` / present 前 destination / `set_clear_color` / Drop destroy）、
+  `render/color.rs`（`background_linear` 覆盖 Linux）、`render/frame.rs`（`surface_local`）、
+  `window.rs`（`surface` / `set_surface` / `frame_rect` / `background` 的 Linux `cfg`）。
 

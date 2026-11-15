@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+#[cfg(target_os = "linux")]
+use crate::math::Size;
 use crate::{
     paint::{
         instance::{FrameOp, GpuClipEntry, InstanceBuffer},
@@ -94,6 +96,14 @@ pub(crate) struct FrameRequest {
     pub plan: Plan,
     /// 目标物理像素（resize 的唯一来源，§4.4）。
     pub surface: (u32, u32),
+    /// 窗口的逻辑尺寸（surface-local 坐标；Linux 专用）。
+    ///
+    /// Linux 的 Wayland buffer 尺寸是 `round(surface_local × scale)`，而
+    /// `wp_viewport.set_destination` 必须写逻辑尺寸（compositor 按它显示 buffer）。两者必须来自
+    /// **同一帧**：GPU 线程按本帧的 `surface` 重建 swapchain、按本帧的 `surface_local` 写
+    /// destination，present 之前一次生效（D1 / D2）。
+    #[cfg(target_os = "linux")]
+    pub surface_local: Size,
     /// HUD 的发布延迟基准（[`FrameFeedback::latency`] 的起点）。
     pub published_at: Instant,
 }
@@ -243,6 +253,8 @@ mod tests {
             payload: FramePayload::empty(),
             plan,
             surface: (64, 64),
+            #[cfg(target_os = "linux")]
+            surface_local: crate::math::Size::new(64.0, 64.0),
             published_at: Instant::now(),
         }
     }
@@ -408,5 +420,35 @@ mod tests {
         slot.publish(request(1, partial(&[PhysicalRect::new(0, 0, 4, 4)])));
         slot.publish(request(2, Plan::Full));
         assert_eq!(slot.take().expect("latest frame").plan, Plan::Full);
+    }
+
+    /// Linux：buffer 尺寸与逻辑尺寸必须成对来自最新帧。
+    ///
+    /// destination（`surface_local`）与 swapchain（`surface`）是新帧的两个面，覆盖时保留旧的
+    /// 任何一个都会让 compositor 用错尺寸 —— 旧内容被缩放（D1）或整面重采样（D3）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacing_a_frame_keeps_surface_and_surface_local_paired() {
+        use crate::math::Size;
+
+        let mut slot = LatestFrame::new();
+        slot.publish(FrameRequest {
+            surface: (800, 600),
+            surface_local: Size::new(800.0, 600.0),
+            ..request(1, Plan::Full)
+        });
+        slot.publish(FrameRequest {
+            surface: (876, 626),
+            surface_local: Size::new(701.0, 501.0),
+            ..request(2, Plan::Full)
+        });
+
+        let frame = slot.take().expect("latest frame");
+        assert_eq!(frame.surface, (876, 626), "swapchain 目标来自新帧");
+        assert_eq!(
+            frame.surface_local,
+            Size::new(701.0, 501.0),
+            "destination 与 buffer 必须同帧成对"
+        );
     }
 }

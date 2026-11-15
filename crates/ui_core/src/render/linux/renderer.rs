@@ -37,6 +37,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 #[cfg(feature = "test-support")]
 use crate::paint::instance::InstanceBuffer;
@@ -46,9 +47,10 @@ use crate::render::linux::readback::ReadbackImage;
 use crate::render::timer::Section;
 use crate::{
     error::EngineError,
-    paint::atlas::AtlasKind,
+    paint::{atlas::AtlasKind, color::Color},
     render::{
         DirtyRows, RenderStats,
+        color::background_linear,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         linux::{
@@ -106,14 +108,27 @@ impl Renderer {
 
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-vulkan` 线程。
     ///
+    /// `background` 是窗口背景色（persist 的 clear color，linear）。`viewport` 是
+    /// `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无 destination /
+    /// `buffer_scale` 回退，见 V-122）：GPU 线程在 present 前用它写逻辑尺寸，destination 与 buffer
+    /// 必须同一次生效（D1 / D2）。
+    ///
     /// # Errors
     /// 设备 / swapchain 创建失败，或 GPU 线程无法启动（`AppInit`）。
     pub(crate) fn new_for_surface(
         display: *mut std::ffi::c_void,
         surface_ptr: *mut std::ffi::c_void,
         size: (u32, u32),
+        background: Color,
+        viewport: Option<WpViewport>,
     ) -> Result<Self, EngineError> {
-        let gpu = GpuRenderer::new_for_surface(display, surface_ptr, size)?;
+        let gpu = GpuRenderer::new_for_surface(
+            display,
+            surface_ptr,
+            size,
+            background_linear(background),
+            viewport,
+        )?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
             error: None,
@@ -163,6 +178,16 @@ impl Renderer {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels.to_vec(), rows),
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
+        }
+    }
+
+    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，clear color 由 GPU 线程应用）。
+    ///
+    /// 离屏目标没有背景色（从不 present），是 no-op。
+    pub(crate) fn set_background_color(&mut self, color: Color) {
+        match &self.target {
+            RenderTarget::Offscreen(_) => {}
+            RenderTarget::Window(window) => window.set_background_color(color),
         }
     }
 
@@ -310,6 +335,11 @@ impl WindowRenderer {
         self.shared.queue_atlas(kind, pixels, rows);
     }
 
+    /// persist clear color（linear）：交给 GPU 线程，在空闲或录制下一帧前应用。
+    fn set_background_color(&self, color: Color) {
+        self.shared.set_background(background_linear(color));
+    }
+
     fn poll(&mut self) -> Result<Option<FrameFeedback>, EngineError> {
         if let Some(error) = self.shared.take_error() {
             return Err(error);
@@ -408,6 +438,8 @@ struct State {
     shutdown: bool,
     /// GPU 线程已经退出（`publish` 从此是 no-op）。
     terminated: bool,
+    /// 待应用的 persist clear color（linear；最新者胜，GPU 线程空闲 / 取帧后都会取走）。
+    background: Option<[f32; 4]>,
 }
 
 impl State {
@@ -419,7 +451,16 @@ impl State {
             error: None,
             shutdown: false,
             terminated: false,
+            background: None,
         }
+    }
+
+    /// GPU 线程的等待条件：关闭 / 有帧 / 有待应用背景色。
+    ///
+    /// 待应用背景色也是工作：`set_background` 用 condvar 唤醒，等待条件不看它，这次唤醒会
+    /// 被当成伪唤醒直接睡回去，颜色要等下一帧才落地（改色不要求提交一帧）。
+    fn has_work(&self) -> bool {
+        self.shutdown || self.frame.has_pending() || self.background.is_some()
     }
 }
 
@@ -505,14 +546,33 @@ impl Shared {
         state.atlas.queue(kind, pixels, rows);
     }
 
+    /// 排队一笔 persist clear color（最新者胜）：GPU 线程空闲或录制下一帧前应用。
+    fn set_background(&self, linear: [f32; 4]) {
+        let mut state = self.lock();
+        if state.shutdown || state.terminated {
+            return;
+        }
+        state.background = Some(linear);
+        drop(state);
+        self.wake();
+    }
+
+    /// 取走待应用的 clear color（取一次清空）。
+    fn take_background(&self) -> Option<[f32; 4]> {
+        self.lock().background.take()
+    }
+
     /// 空闲：睡在 condvar 上直到有帧或关闭（0 自旋唤醒）。
     ///
     /// 有在飞帧（`wait_completion == true`）时用 [`FEEDBACK_POLL`] 的有限等待：timeline 的完成
     /// 不会唤醒 condvar，无限等待会让最后一帧的反馈永远不发布（§4.1 的完成语义）。
+    ///
+    /// 等待条件是 [`State::has_work`]（含待应用背景色）：`set_background` 的唤醒不能被当成
+    /// 伪唤醒睡回去（改色不要求提交一帧）。
     fn wait_for_work(&self, wait_completion: bool) {
         let mut state = self.lock();
         if wait_completion {
-            if state.shutdown || state.frame.has_pending() {
+            if state.has_work() {
                 return;
             }
             let _ = self
@@ -521,7 +581,7 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner);
             return;
         }
-        while !state.shutdown && !state.frame.has_pending() {
+        while !state.has_work() {
             state = self
                 .work
                 .wait(state)
@@ -645,11 +705,19 @@ fn run_gpu_loop(
         if shared.shutdown_requested() {
             return Ok(());
         }
+        // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
+        if let Some(linear) = shared.take_background() {
+            renderer.set_clear_color(linear);
+        }
         let Some(request) = pending.as_ref() else {
             // 有在飞帧时用有限等待定期回来观察完成（见 `Shared::wait_for_work`）。
             shared.wait_for_work(!submitted.is_empty());
             continue;
         };
+        // 等帧期间到达的背景色：与帧一起落地（仍然是录制前，不引入新的 GPU 调用点）。
+        if let Some(linear) = shared.take_background() {
+            renderer.set_clear_color(linear);
+        }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
@@ -784,6 +852,49 @@ mod tests {
     }
 
     #[test]
+    fn a_background_change_is_taken_exactly_once() {
+        let shared = Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        };
+        assert!(!shared.lock().has_work(), "空槽不是 GPU 线程的工作");
+
+        shared.set_background([0.25, 0.5, 0.75, 1.0]);
+        // 等待条件必须把背景色当工作，否则 `set_background` 的唤醒会被当成伪唤醒睡回去。
+        assert!(shared.lock().has_work(), "待应用背景色必须唤醒 GPU 线程");
+        assert_eq!(
+            shared.take_background(),
+            Some([0.25, 0.5, 0.75, 1.0]),
+            "the GPU thread takes the pending background color once"
+        );
+        assert_eq!(shared.take_background(), None, "take clears the slot");
+        assert!(!shared.lock().has_work(), "取走之后不再是工作");
+    }
+
+    #[test]
+    fn a_background_change_after_shutdown_or_termination_is_dropped() {
+        let shared = Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        };
+        shared.request_shutdown();
+        shared.set_background([1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            shared.take_background(),
+            None,
+            "the GPU loop exits before applying a pending background color"
+        );
+
+        let terminated = Shared {
+            state: Mutex::new(State::new()),
+            work: Condvar::new(),
+        };
+        terminated.mark_terminated();
+        terminated.set_background([0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(terminated.take_background(), None);
+    }
+
+    #[test]
     fn the_latest_frame_merges_the_dropped_damage() {
         // 门面把「最新帧槽」原样用在这里：覆盖时合并 damage（§4.2）。
         let mut frame = LatestFrame::new();
@@ -793,6 +904,7 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
+            surface_local: crate::math::Size::new(1.0, 1.0),
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, Plan::Full));

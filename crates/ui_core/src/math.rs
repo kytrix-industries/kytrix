@@ -1,10 +1,11 @@
 //! 逻辑像素几何与「逻辑 → 物理像素」的唯一换算点（I11）。
 //!
-//! 所有几何以逻辑像素 `f32` 存储，只在 paint / present 边界做一次缩放与舍入。换算分三种语义，
+//! 所有几何以逻辑像素 `f32` 存储，只在 paint / present 边界做一次缩放与舍入。换算分四种语义，
 //! 职责严格分离（见 `design/phase-01-foundation.md` §7）：
 //!
 //! - [`Rect::to_physical_f32`]：不取整的物理浮点矩形，用于 SDF 图元的 `GpuPrimitive.bounds` 与 `clip_rect`；
 //! - [`Rect::to_physical`]：逐边取整，用于图集图元（`GlyphRun` / `Image`）的四边形；
+//! - [`Rect::to_physical_rounded`]：尺寸整体 `round`（half away from zero），用于窗口 buffer 尺寸；
 //! - [`Rect::to_physical_covering`]：向外 floor/ceil，用于 damage 与 scissor 的安全侧。
 //!
 //! 逐边取整保证相邻图元共享边精确重合（无 1px 缝）：同一逻辑坐标只有一种表达式，
@@ -270,6 +271,28 @@ impl Rect {
         let y1 = round_physical((self.origin.y + self.size.height) * factor);
 
         PhysicalRect::from_edges(x0, y0, x1, y1)
+    }
+
+    /// 尺寸 `round`（half away from zero）的物理像素矩形：窗口 buffer 尺寸。
+    ///
+    /// 与 [`Rect::to_physical`] 的逐边取整不同，原点逐坐标取整、**尺寸整体取整**：
+    /// `Rect::new(0, 0, w, h)` 的结果恰好是 `(round(w·s), round(h·s))`。Wayland 的
+    /// `wp_fractional_scale_v1` 要求 toplevel 的 buffer 尺寸按 `round(logical × scale)` 计算
+    /// （half away from zero），对两条边分别取整会让宽度差 1 px —— 整面 buffer 被 compositor
+    /// 以 0.999× 重采样（1.25 / 1.75 下文字发虚）。
+    pub fn to_physical_rounded(self, scale: Scale) -> PhysicalRect {
+        if !self.is_convertible() {
+            return EMPTY_PHYSICAL;
+        }
+
+        let factor = scale.factor();
+        let x0 = round_physical(self.origin.x * factor);
+        let y0 = round_physical(self.origin.y * factor);
+        let width = round_physical(self.size.width * factor);
+        let height = round_physical(self.size.height * factor);
+
+        // 饱和相加：`round_physical` 已夹到 `i32` 端点，直接相加仍可能溢出。
+        PhysicalRect::from_edges(x0, y0, x0.saturating_add(width), y0.saturating_add(height))
     }
 
     /// 向外 floor/ceil 的物理像素矩形：damage 与 scissor 的安全侧。
@@ -754,6 +777,89 @@ mod tests {
             rect.to_physical_covering(scale),
             PhysicalRect::new(10, 20, 11, 21)
         );
+    }
+
+    /// `wp_fractional_scale_v1` 的 toplevel buffer 尺寸：`round(logical × scale)`。
+    #[test]
+    fn physical_rounded_buffer_size_table() {
+        for (factor, expected) in [
+            (1.0, (800, 600)),
+            (1.25, (1000, 750)),
+            (1.5, (1200, 900)),
+            (1.75, (1400, 1050)),
+            (2.0, (1600, 1200)),
+        ] {
+            let rect = Rect::new(0.0, 0.0, 800.0, 600.0).to_physical_rounded(scale(factor));
+            assert_eq!(
+                (rect.width(), rect.height()),
+                expected,
+                "scale {factor} 的 buffer 尺寸"
+            );
+        }
+    }
+
+    /// 非整数积：`round` 与 `ceil` 的差异必须被钉住（1.75 下 256.8 × 100.5）。
+    #[test]
+    fn physical_rounded_non_integer_product_rounds_not_ceils() {
+        let rect = Rect::new(0.0, 0.0, 256.8, 100.5);
+        let scale = scale(1.75);
+
+        let rounded = rect.to_physical_rounded(scale);
+        assert_eq!(
+            (rounded.width(), rounded.height()),
+            (449, 176),
+            "256.8 × 1.75 = 449.4 → 449；100.5 × 1.75 = 175.875 → 176"
+        );
+        let covering = rect.to_physical_covering(scale);
+        assert_eq!(
+            (covering.width(), covering.height()),
+            (450, 176),
+            "旧的向外取整在 x 上多 1 px（449.4 → 450）"
+        );
+    }
+
+    #[test]
+    fn physical_rounded_rounds_half_away_from_zero() {
+        let scale = scale(1.0);
+
+        // 正好 .5：远离零（不是银行家舍入）。
+        assert_eq!(
+            Rect::new(0.0, 0.0, 2.5, 3.5).to_physical_rounded(scale),
+            PhysicalRect::new(0, 0, 3, 4)
+        );
+        // 负坐标：原点逐坐标远离零，尺寸仍按正数取整。
+        assert_eq!(
+            Rect::new(-2.5, -1.5, 4.0, 6.0).to_physical_rounded(scale),
+            PhysicalRect::new(-3, -2, 1, 4)
+        );
+    }
+
+    /// 尺寸**整体**取整（不是两条边分别取整）：`round(w·s)` 与 `round(x·s)` 分开算。
+    #[test]
+    fn physical_rounded_rounds_the_size_not_the_edges() {
+        let rect = Rect::new(0.3, 0.0, 10.3, 10.0).to_physical_rounded(scale(1.5));
+
+        assert_eq!(rect.x0, 0, "0.3 × 1.5 = 0.45 → 0");
+        assert_eq!(rect.width(), 15, "10.3 × 1.5 = 15.45 → 15（逐边会是 16）");
+        assert_eq!(rect.height(), 15);
+    }
+
+    #[test]
+    fn physical_rounded_non_finite_is_empty() {
+        let scale = scale(1.5);
+        let bad = [
+            Rect::new(f32::NAN, 0.0, 10.0, 10.0),
+            Rect::new(0.0, f32::INFINITY, 10.0, 10.0),
+            Rect::new(0.0, 0.0, f32::INFINITY, 10.0),
+            Rect::new(0.0, 0.0, 10.0, f32::NEG_INFINITY),
+        ];
+
+        for rect in bad {
+            assert!(
+                rect.to_physical_rounded(scale).is_empty(),
+                "{rect:?} 必须为空"
+            );
+        }
     }
 
     #[test]

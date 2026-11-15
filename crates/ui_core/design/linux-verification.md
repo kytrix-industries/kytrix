@@ -5,6 +5,11 @@
 >
 > 本文是**执行记录**；与设计文档不同的实现事实按纪律登记到
 > [`DEVIATIONS.md`](DEVIATIONS.md)（本轮新增 F-145 … F-150、S-135 … S-137、V-110 … V-113）。
+>
+> **2026-11-15 追加**：live resize 的第七轮闭环（destination 与 buffer 原子、buffer = round、
+> Linux 背景 clear）单独记在 §4.7；偏差登记 §33（F-190 … F-192 / S-143 / S-144 / V-122），
+> 设计落点见 [`async-render-pipeline.md`](async-render-pipeline.md) §7.1–§7.5 / §15.11。
+> 本文前面的探针记录保持原样（不改写历史）。
 
 ---
 
@@ -47,6 +52,12 @@ mutter 不实现 `wlr-screencopy`，也没有输入注入接口。因此**嵌套
 - `wayland-info` / `WAYLAND_DEBUG=1` 读协议流。
 
 另外用 `WLR_BACKENDS=headless` + `WLR_LIBINPUT_NO_DEVICES=1` 的 sway 复现「seat 无任何能力」的场景（B5）。
+
+live resize 的第七轮（2026-11-15）另用 **headless sway 1.11 / wlroots 0.19 / lavapipe**：
+内置输出 `HEADLESS-1` 1280×720，`swaymsg resize set` 做程序化 jump / sweep（没有真实指针拖拽），
+`grim` 逐帧截图，`WAYLAND_DEBUG=1` 统计 `commit` / `attach` / `set_destination`。窗口在 1.0 与
+1.25 两种缩放下各跑一段静止 + 连续 resize；clear 颜色另用 `/tmp` 临时夹具（无根节点）验证。
+方法、判据与旧 / 新数据见 §4.7。
 
 ### 1.3 源码部署
 
@@ -273,6 +284,8 @@ Windows 侧（同一份改动）：
 | 真实窗口出帧 | 嵌套 sway 跑 `demo`，`grim` 截屏 | ✅ 1280×720，Vulkan/lavapipe，HUD 显示 `1.00x` |
 | 整帧内容 | 截图逐块核对 | ✅ 六张卡片、CJK、色块、图片图集、滚动列表全部正确 |
 | resize | `swaymsg resize set 1100 720` / `500 400` | ✅ 重排正确（修复前必失败，B6） |
+| live resize（destination 与 buffer 原子） | `WAYLAND_DEBUG=1` + `swaymsg resize set` 连续 jump / sweep（1.0 / 1.25） | ✅ 1218 次 destination 变更 1218 次与 attach 同一次 commit（旧 273/294 次无 attach）；buffer = `round(logical×scale)`（876×626，旧 877×627）；卡片 bbox 恒定（725×220 / 580×176）、Laplacian 1715.34 / 2019.30；2802 次 resize / 3583 次 present、exit 0、validation 0。详见 §4.7 |
+| 窗口背景色（Linux clear） | `/tmp` 临时夹具 clear `#0B0E13` / `#402080`，`grim` 读像素 | ✅ (11,14,19) / (64,32,128)，linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见（F-192 / S-143） |
 | 全屏 | `swaymsg fullscreen enable/disable` | ✅ 1280×720 ↔ 恢复 |
 | DPI | `swaymsg output WL-1 scale 2` / `1.5` / `1` | ✅ `preferred_scale` 120→240→180→120；HUD 显示 `2.00x` / `1.50x`，逻辑尺寸随之重排 |
 | 空闲 0 帧 | 无 HUD，`WAYLAND_DEBUG` 统计 5 s 内 commit | ✅ **0 次 commit / 0% CPU**（设计目标达成） |
@@ -319,6 +332,46 @@ Windows 侧（同一份改动）：
 |------|------|
 | 嵌套 sway（键盘 + 指针，`capabilities: 3`） | ✅ 全部输入功能可用 |
 | headless sway（`capabilities: 0`） | ✅ 进程存活、窗口正常渲染（修复前 `wl_seat error 0` 断开） |
+
+### 4.7 live resize（2026-11-15，第七轮闭环）
+
+**方法**：headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1` 1280×720；`swaymsg resize set`
+做 jump（固定尺寸）与 sweep（逐档）；`grim` 截图，`WAYLAND_DEBUG=1` 记录协议流；1.0 与 1.25
+各跑一遍。判据：
+
+1. destination 与 buffer 原子：每次 `set_destination` 与 `attach` / `commit` 相邻（无中间 commit）；
+2. buffer 尺寸 = `round(logical × scale)`，destination = `ceil(logical)`；
+3. 卡片 bbox 在 resize 期间恒定（不被拉伸）、文字 Laplacian 不降；
+4. 缩小时右 / 下裁切（不是拉伸 / 黑边）；
+5. soak 计数、exit code、validation 输出。
+
+**旧 HEAD `8598fe3`（对照）**：1.0 jump 1452 commit / **273 次 destination 变更无 attach**；
+1.25 静止 buffer **877×627**（ceil），协议顺序是 `set_destination` → `set_buffer_scale(1)` →
+`commit()`（无 attach），22 ms 后才等到新 buffer；1.25 jump 卡片 bbox 696–774×212–238、
+Laplacian 615.8–1013.2（旧 buffer 被拉伸）。
+
+**新代码**：
+
+| 项 | 1.0 | 1.25 |
+|---|---|---|
+| 静止 buffer / destination | 960×700 / 960×700 | **876×626** / 701×501 |
+| 卡片 bbox（jump / sweep） | 580×176 恒定 | 725×220 恒定 |
+| 卡片文字 Laplacian | 2019.30（恒定） | 1715.34（静止）；resize 瞬态 7/70 帧整窗变软（bbox 不变，稳定复测 1715.34） |
+| 裁切（缩小） | 右裁 576×176、下裁 580×134 | 未单独量（同判据） |
+
+- **协议**：`create_buffer(876,626)` → `set_destination(701,501)` → `attach` → `commit` 相邻，
+  无中间 commit；全程 1218 次 destination 变更 **1218 次原子**（0 次无 attach、0 mismatch、
+  0 次 `set_buffer_scale`）。
+- **soak**：2802 次 resize / 3583 次 present；FrameGate 最大间隔 79.6 ms；HUD 静止
+  59.1 fps / Latency 2.13 ms、拖动 39.2 / 6.28 ms；`swaymsg kill` exit 0；validation 0 VUID / 错误。
+- **clear 夹具**：`#0B0E13` → 像素 (11,14,19)、`#402080` → (64,32,128)；证明 Vulkan sRGB
+  attachment 的 clear 按 linear 解释（S-143）。demo 根节点铺满，正常帧内看不到 clear。
+- **归因**：1.25 的 7/70 帧整窗变软 bbox 不变、稳定后 Laplacian 回到 1715.34，是 sway 分数缩放
+  的采样瞬态，不是旧 buffer 被 destination 缩放（旧代码的 bbox 会变、Laplacian 616–1048）。
+- **限制**：Mutter / KWin 未跑；真实指针拖拽未构造（只用 `swaymsg resize set`）；逐次
+  `OUT_OF_DATE` / `vkQueuePresentKHR` 计数未统计；无 viewporter 回退未验（且实现没有 destination /
+  `buffer_scale` 回退，V-122 P2-5）；1.25 sway 瞬态未独立归因；HUD OCR 未验；`apply_min_size` 的
+  物理 / 逻辑 bug 仍存在。全部登记 V-122。
 
 ---
 
@@ -382,6 +435,11 @@ cargo test -p ui_core --features test-support --test snapshot
 | AT-SPI 真实读屏器联动 | 只验了树结构与 `do_action`，未接 Orca |
 | a11y 子节点顺序 | 引擎按 demo 建树顺序输出（① ④ ⑤ ⑥ ③ ②），与 Windows 一致；属应用侧布局，非 Linux 缺陷。**观察项**，未改动 |
 | `Wayland` 的 `wl_output` 整数 scale | 只走 `wp_fractional_scale_v1`；无该扩展的合成器回退路径未实机验证 |
+| live resize：Mutter / KWin | 只跑了 headless sway 1.11 / wlroots 0.19；GNOME mutter 与 KWin 的 destination / configure 时序未验（V-122） |
+| live resize：真实指针拖拽 | 本轮用 `swaymsg resize set` 程序化 resize，没有构造真实指针拖动（`wtype` 只注入键盘）；拖动 / 缩放边缘的输入路径未验（V-122） |
+| `OUT_OF_DATE` / `vkQueuePresentKHR` 逐次计数 | 未逐次统计 present 返回值；soak 只有总数与 exit code（V-122） |
+| 无 viewporter 回退 | `WpViewporter` 缺失时的回退路径未验；当前实现跳 destination 写入（V-122） |
+| `apply_min_size` 的物理 / 逻辑值 | Linux 的 `apply_min_size` 既有 bug（物理 / 逻辑混用）未在本轮修复，后续项（V-122） |
 
 ### 6.1 测试夹具的坑（不是引擎缺陷）
 

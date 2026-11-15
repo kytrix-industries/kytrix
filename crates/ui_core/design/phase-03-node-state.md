@@ -520,8 +520,10 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
-    /// 窗口背景色（resize 期间新暴露区域的底色：Windows 客户区之外、macOS 旧 drawable 之外）。
-    /// 默认 `Color::BLACK`（**不是** `Color::default()` 的透明）；Windows / macOS 生效，Linux 只保存参数。
+    /// 窗口背景色（resize 期间新暴露区域的底色：Windows 客户区之外、macOS 旧 drawable 之外、
+    /// Linux 新 buffer 内未被内容覆盖的像素）。默认 `Color::BLACK`（**不是** `Color::default()`
+    /// 的透明）；三平台生效，编码分平台（Windows sRGB 字节 / macOS layer sRGB + clear linear /
+    /// Linux clear linear）。
     pub background: Color,
 }
 
@@ -537,7 +539,7 @@ pub struct Window {
     scene: Scene,
     scale: Scale,
     /// 渲染目标的物理像素尺寸：Windows = 平台层写的真实客户区；macOS = 真实 backing；
-    /// Linux = `size × scale` 的 covering。
+    /// Linux = 真实 Wayland buffer（`round(logical × scale)`）。
     surface: (u32, u32),
 }
 
@@ -559,14 +561,15 @@ impl Window {
 
     /// 运行期改写背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给平台层。
     /// Windows：标全量重绘，下一次 `Present1` 生效；macOS：标全量重绘，layer 立刻写、clear 交给
-    /// GPU 线程；Linux 只更新参数。
+    /// GPU 线程；Linux：标全量重绘，clear color（linear）交给 GPU 线程，下一次全量录制生效。
+    /// 三平台都需要**调用方在之后触发一帧**（改色本身不产帧；与 Windows 的既有契约一致）。
     pub fn set_background_color(&mut self, color: Color);
 
     #[must_use]
     pub fn scale(&self) -> Scale;
 
     /// 逻辑尺寸变化（P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存，并先按
-    /// `size × scale` 重算 covering surface（Windows / macOS 平台层随后用真值覆盖）。
+    /// `size × scale` 重算 covering surface（三平台随后都由平台层 `set_surface` 用真值覆盖）。
     pub fn set_size(&mut self, size: Size);
 
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT|PAINT`（§3.4「窗口尺寸/DPI → 根 LAYOUT」）。
@@ -575,25 +578,29 @@ impl Window {
     pub fn set_scale(&mut self, scale: Scale);
 
     /// 平台层：写入真实渲染目标物理像素（Windows `WM_SIZE` / `WM_DPICHANGED`、macOS
-    /// `convertSizeToBacking` 之后；macOS 还会先刷新图层再 early-return）。
+    /// `convertSizeToBacking`、Linux `round(logical × scale)` 的 Wayland buffer 之后；
+    /// macOS 还会先刷新图层再 early-return）。
     /// 值变化标全量重绘；不标 layout、不动 `scale_epoch`。
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn set_surface(&mut self, surface: (u32, u32));
 
-    /// `paint_frame` / `commit_frame` / `submit_gpu` 的唯一 frame 来源（分平台 `#[cfg]` 实现）。
+    /// `paint_frame` / `commit_frame` / `submit_gpu` 的唯一 frame 来源（三平台都用 `surface`）。
     fn frame_rect(&self) -> PhysicalRect;
 }
 ```
 
-> **2026-11-15 补充（F-184 / F-186 / F-187 / F-188 / F-189）**：`background`、`surface`、
-> `set_surface`、`set_background_color`、`frame_rect()` 是 Windows live-resize 修复带进公开面/内部
-> 状态的增量，macOS 在同一轮接上等价契约。`WindowOptions` 新增字段后，结构体字面量必须补
-> `background`（或 `..WindowOptions::default()`），否则不编译。`surface` 在 Windows 是真实客户区、
-> 在 macOS 是真实 backing，`set_size` / `set_scale` 只先重算 covering、随后被 `set_surface` 覆盖
-> （应用代码不应在活窗口上调用二者来「改渲染目标」）；macOS 的 `set_surface` 在值比较**之前**刷新
-> `contentsScale` / `drawableSize`。Linux 的 `frame_rect()` 仍是 `size × scale` 的 covering
-> （0 尺寸仍 0×0），`WindowOptions.background` 在 Linux 只记录、无渲染效果（等价改造未做，详见
-> `async-render-pipeline.md` §4.4 / §5.3 / §6.2 / §6.7）。
+> **2026-11-15 补充（F-184 / F-186 / F-187 / F-188 / F-189 / F-190 / F-191 / F-192）**：`background`、
+> `surface`、`set_surface`、`set_background_color`、`frame_rect()` 是 Windows live-resize 修复带进
+> 公开面/内部状态的增量，macOS 与 Linux 在后续轮次接上等价契约。`WindowOptions` 新增字段后，结构体
+> 字面量必须补 `background`（或 `..WindowOptions::default()`），否则不编译。`surface` 在 Windows 是
+> 真实客户区、在 macOS 是真实 backing、在 Linux 是真实 Wayland buffer（`round(logical × scale)`）；
+> `set_size` / `set_scale` 只先重算 covering、随后被 `set_surface` 覆盖（应用代码不应在活窗口上调用
+> 二者来「改渲染目标」）；macOS 的 `set_surface` 在值比较**之前**刷新 `contentsScale` /
+> `drawableSize`。`frame_rect()` 三平台都用 `surface`（0 尺寸由 `set_surface` clamp 1），
+> `WindowOptions.background` 三平台都有渲染效果（Linux 是 persist clear 的 linear 值）。Linux 的
+> `submit_gpu` 发布的 `FrameRequest` 还带 Linux-only 的 `surface_local: Size`（逻辑尺寸，与
+> `surface` 同帧成对；GPU 线程 present 前用它写 `wp_viewport.set_destination`，F-190 / F-191）。
+> 详见 `async-render-pipeline.md` §4.1 / §4.4 / §7.3 / §7.5 与 DEVIATIONS §33。
 
 | 决策                                             | 结论                                          | 理由                                                                                                                     |
 |--------------------------------------------------|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
@@ -602,8 +609,8 @@ impl Window {
 | `Window::tree_mut` 交出 `&mut NodeTree` 的安全性 | 允许                                          | 应用层只能改结构与样式（`Style` 是值、`build` 只追加）；`Node` 字段全私有，`Signal` 值只能经 `App::write`（I6）          |
 | `Window` 是否 `Drop` 时清理依赖图                | 否                                            | `Drop` 拿不到 `&mut DependencyGraph`；清理在 `App::close_window`（唯一入口）                                             |
 | `Scene` 的可构造性                               | **不可**（`pub(crate) fn empty()`，见 §13.2） | 裁决 ③ 的约束：`Scene` 不实现 `Clone`/`Default`、无公开构造器 → 应用层既不能克隆也不能伪造场景，只能读 `Window::scene()` |
-| `WindowOptions.background` 的默认值              | `Color::BLACK`（不透明）                      | `Color::default()` 是透明；窗口底色不能透出桌面/旧 buffer。Windows 的 `SetBackgroundColor` alpha 被 `ALPHA_MODE_IGNORE` 忽略，macOS 的两种编码都强制 alpha=1（F-184 / F-188 / S-139 / S-141） |
-| `Window.surface` 为什么独立于 `size × scale`     | Windows = 真实客户区；macOS = 真实 backing；Linux = covering | covering 与平台真值的取整差会留 1 px 未绘制（Windows 175% 下 `256.8 × 1.75 = 449.4`，covering 450），或让文字不与物理像素 1:1（macOS `convertSizeToBacking` 的 round 值）；Linux 未改（F-186 / F-189） |
+| `WindowOptions.background` 的默认值              | `Color::BLACK`（不透明）                      | `Color::default()` 是透明；窗口底色不能透出桌面/旧 buffer。Windows 的 `SetBackgroundColor` alpha 被 `ALPHA_MODE_IGNORE` 忽略，macOS 的两种编码都强制 alpha=1，Linux 的 Vulkan clear 按 linear 写 sRGB attachment（F-184 / F-188 / F-192 / S-139 / S-141 / S-143） |
+| `Window.surface` 为什么独立于 `size × scale`     | Windows = 真实客户区；macOS = 真实 backing；Linux = 真实 Wayland buffer（round） | covering 与平台真值的取整差会留 1 px 未绘制（Windows 175% 下 `256.8 × 1.75 = 449.4`，covering 450），或让文字不与物理像素 1:1（macOS `convertSizeToBacking` 的 round 值、Linux fractional-scale 的 `round(logical × scale)`）；三平台都用平台真值（F-186 / F-189 / F-191） |
 
 ### 5.3 `NodeTree` / `Node` 公开到什么程度
 

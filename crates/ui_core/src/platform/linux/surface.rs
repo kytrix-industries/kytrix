@@ -84,6 +84,9 @@ pub(crate) struct WaylandState {
     /// 分数缩放（v1 只读 `preferred_scale`；对象必须保活）。
     _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     /// 分数缩放的落地窗口（`set_destination` 让 compositor 做非整数缩放，D-5）。
+    ///
+    /// 建窗后移交给窗口渲染器（[`WaylandState::take_viewport`]）：destination 必须与 buffer 在
+    /// 同一次 present 里生效，只有 GPU 线程持有它才能在 `vkQueuePresentKHR` 之前写入（D1 / D2）。
     viewport: Option<WpViewport>,
     /// 只为保活（`configure` 事件只做记录）。
     _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
@@ -100,8 +103,6 @@ pub(crate) struct WaylandState {
     pointer_pos: Point,
     size: Size,
     scale: Scale,
-    /// 最近一次 `size/scale` 是否已经下发到 viewport（避免每轮 commit）。
-    viewport_applied: Option<(u32, u32)>,
     focused: bool,
     configured: bool,
     /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
@@ -220,7 +221,6 @@ impl WaylandState {
             pointer_pos: Point::new(0.0, 0.0),
             size: Size::new(size.width.max(1.0), size.height.max(1.0)),
             scale: Scale::ONE,
-            viewport_applied: None,
             focused: false,
             configured: false,
             maximized: false,
@@ -267,24 +267,18 @@ impl WaylandState {
         self.focused
     }
 
-    /// 尺寸 / 缩放变化后把逻辑尺寸交给 `wp_viewport.set_destination`（D-5）。
+    /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = compositor 支持分数缩放）。
     ///
-    /// 没有 viewporter（compositor 不支持）⇒ 什么都不做：此时只能靠整数倍率 + buffer scale。
-    pub(crate) fn sync_viewport(&mut self) {
-        let Some(viewport) = self.viewport.as_ref() else {
-            return;
-        };
-        let (width, height) = dpi::viewport_destination(self.size);
-        let key = (width as u32, height as u32);
-        if self.viewport_applied == Some(key) {
-            return;
-        }
-        self.viewport_applied = Some(key);
-        viewport.set_destination(width, height);
-        // 有 viewport 时 `buffer_scale` **必须**是 1：缩放由 destination 完成，
-        // 再设整数倍率会变成双重缩放（buffer 尺寸本身已经是物理像素）。
-        self.surface.set_buffer_scale(1);
-        self.surface.commit();
+    /// `None` **不**保证不会发生分数缩放：`wp_fractional_scale_v1` 与 viewporter 是独立 bound
+    /// 的，没有 viewporter 时 compositor 仍可能广告分数 scale —— buffer 会按分数 scale 变大，
+    /// 而没有 destination / `buffer_scale` 回退。这是既有缺口（V-122），本轮不实现 fallback。
+    ///
+    /// destination 只能与 buffer 同一次 present 生效：旧实现由 UI 线程单独 `set_destination` +
+    /// `wl_surface.commit()`（未 attach 新 buffer）会让 compositor 立刻把旧 buffer 按新 destination
+    /// 缩放，而且这次 commit 会提前触发 frame callback、破坏 FrameGate。现在 UI 线程不再碰
+    /// viewport（也不再 commit `wl_surface`）。
+    pub(crate) fn take_viewport(&mut self) -> Option<WpViewport> {
+        self.viewport.take()
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {
@@ -373,7 +367,9 @@ impl WaylandState {
         };
         if focused {
             // v3：enable 会重置此前 set_cursor_rectangle 的状态；必须先 enable，再设矩形，再 commit。
-            // 当前绑定 version 1；若未来绑 v2+，cursor rectangle 还需 surface 的 wl_surface.commit。
+            // 绑定 version 1：状态在 `zwp_text_input_v3.commit` 生效（v2+ 的 cursor rectangle 才需要
+            // surface 的 `wl_surface.commit`）。**不** commit `wl_surface`：UI 线程的 commit 会提前
+            // 触发 frame callback、破坏 FrameGate 的「≤1 在飞」（D4）。
             text_input.enable();
             let area = self
                 .ime_cursor_area
@@ -390,7 +386,6 @@ impl WaylandState {
             self.ime_cursor_applied = None;
         }
         text_input.commit();
-        self.surface.commit();
     }
 
     /// 保存 IME caret 区域；已聚焦时立即下发（`commit` 是 v3 的生效点）。
@@ -415,7 +410,6 @@ impl WaylandState {
             }
             text_input.commit();
         }
-        self.surface.commit();
     }
 
     /// 从 `App` 同步当前窗口的 IME caret 区域（每轮泵调用，独立于帧门禁）。

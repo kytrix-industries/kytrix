@@ -17,10 +17,13 @@
 use std::{collections::VecDeque, time::Instant};
 
 use ash::vk;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use crate::{
     error::EngineError,
+    math::Size,
     paint::{atlas::AtlasKind, instance::FrameOp},
+    platform::linux::dpi,
     render::{
         RenderStats,
         compositor::{FramePlan, Plan},
@@ -93,7 +96,14 @@ pub(crate) struct GpuRenderer {
     command_pool: vk::CommandPool,
     commands: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
     timer: Option<GpuTimer>,
+    /// persist 的 clear color（linear；窗口背景色，离屏保持透明黑）。
     clear_color: [f32; 4],
+    /// `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无 destination /
+    /// `buffer_scale` 回退，见 V-122）：destination 由 GPU 线程在 present **之前**写入，与 WSI 的
+    /// `wl_surface.commit` 同一次生效（D1 / D2）。
+    viewport: Option<WpViewport>,
+    /// 最近一次真正写入 `wp_viewport` 的 destination（`None` = 还没写过）。只在变化时下发。
+    last_destination: Option<(i32, i32)>,
     surface: (u32, u32),
     /// 渲染目标格式（swapchain 的格式，或离屏时的 `B8G8R8A8_SRGB`）。
     format: vk::Format,
@@ -124,16 +134,30 @@ pub(crate) struct GpuRenderer {
 
 impl GpuRenderer {
     /// 真实窗口（Wayland surface 的裸指针由平台层提供）。
+    ///
+    /// `background` 是 persist 的 clear color（linear，`render::color::background_linear`）；
+    /// `viewport` 是 `wp_viewport`（`None` = 没有 `wp_viewporter`，不代表不支持分数缩放；无
+    /// destination / `buffer_scale` 回退，见 V-122）。
     pub(crate) fn new_for_surface(
         display: *mut std::ffi::c_void,
         surface_ptr: *mut std::ffi::c_void,
         size: (u32, u32),
+        background: [f32; 4],
+        viewport: Option<WpViewport>,
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let instance = VulkanInstance::new(display, surface_ptr)?;
         let device = Device::new(&instance)?;
         let swapchain = Swapchain::new(&instance, &device, size)?;
-        Self::with_device(instance, device, Some(swapchain), size, ATLAS_PAGE)
+        Self::with_device(
+            instance,
+            device,
+            Some(swapchain),
+            size,
+            ATLAS_PAGE,
+            background,
+            viewport,
+        )
     }
 
     /// 离屏渲染器（无窗口 / 快照）：不建 surface 与 swapchain，只渲染到持久 `persist`。
@@ -163,7 +187,8 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let instance = VulkanInstance::new_headless()?;
         let device = Device::new(&instance)?;
-        Self::with_device(instance, device, None, size, atlas_page)
+        // 离屏路径没有窗口背景色：保持既有的透明黑（golden / 快照不变）。
+        Self::with_device(instance, device, None, size, atlas_page, [0.0; 4], None)
     }
 
     fn with_device(
@@ -172,6 +197,8 @@ impl GpuRenderer {
         swapchain: Option<Swapchain>,
         size: (u32, u32),
         atlas_page: u32,
+        clear_color: [f32; 4],
+        viewport: Option<WpViewport>,
     ) -> Result<Self, EngineError> {
         let mut device = device;
         let format = swapchain
@@ -195,7 +222,9 @@ impl GpuRenderer {
             command_pool,
             commands,
             timer,
-            clear_color: [0.0, 0.0, 0.0, 0.0],
+            clear_color,
+            viewport,
+            last_destination: None,
             surface: size,
             format,
             fresh: true,
@@ -215,6 +244,14 @@ impl GpuRenderer {
 
     pub(crate) fn surface(&self) -> (u32, u32) {
         self.surface
+    }
+
+    /// 改 persist 的 clear color（linear；窗口背景色）。
+    ///
+    /// 只写本结构的状态，下一次**全量**录制（`clear` 分支的 render pass）读它；背景色变化由
+    /// `Window` 标全量 damage 保证。GPU 线程调用（离屏路径不设背景色）。
+    pub(crate) fn set_clear_color(&mut self, color: [f32; 4]) {
+        self.clear_color = color;
     }
 
     /// 下一次 present 是否必须全量（新建 / 重建之后为 `true`）。
@@ -324,6 +361,20 @@ impl GpuRenderer {
             Some(image_index),
             &mut timings,
         )?;
+
+        // ③b destination：必须在 `vkQueuePresentKHR` **之前**写入（WSI 规范要求窗口系统变更先于
+        // present；present 内部的 `wl_surface.commit` 会让 attach 与 destination 原子生效）。
+        // 与 buffer 同帧（`request.surface_local` 来自同一 UI 帧），旧 buffer 不会被新 destination
+        // 单独缩放（D1 / D2）。没有 viewporter 时什么都不做：`wp_fractional_scale_v1` 与 viewporter
+        // 独立 bound，仍可能按分数 scale 出 buffer，没有 destination / `buffer_scale` 回退 ——
+        // 既有缺口（V-122），本轮不实现 fallback。
+        if let Some(viewport) = self.viewport.as_ref()
+            && let Some((width, height)) =
+                destination_update(self.last_destination, request.surface_local)
+        {
+            viewport.set_destination(width, height);
+            self.last_destination = Some((width, height));
+        }
 
         // ④ present：等**这张 image** 的 render-finished（§7.2 硬规则 1）。
         let present_started = Instant::now();
@@ -989,6 +1040,12 @@ impl GpuRenderer {
 
 impl Drop for GpuRenderer {
     fn drop(&mut self) {
+        // 协议对象先于 `wl_surface` 销毁：renderer 在 `WaylandState` 之前 drop（`event_loop` 的
+        // 显式顺序），因此这里销毁 viewport 时 surface 仍然存活。请求发不出去（连接已断）也无害：
+        // wayland-client 的 destructor 忽略错误，服务端随连接关闭清理。
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
         // 退出路径（§7.7）：`vkDeviceWaitIdle` 允许，且这是唯一一次。之后所有延迟销毁的资源
         // 都可以直接释放（旧 swapchain / 旧 persist / retire 队列里的句柄）。
         // SAFETY: 队列由本结构的设备创建；销毁命令池前必须等队列空闲。
@@ -1385,4 +1442,56 @@ fn root_uniform(extent: vk::Extent2D) -> [f32; ROOT_UNIFORM_BYTES as usize / 4] 
 
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos() as u64
+}
+
+/// 本帧要写入的 destination（`None` = 与上次相同，不调用协议）。
+///
+/// `wp_viewport.set_destination` 写**逻辑尺寸**（向上取整）：compositor 按它显示 buffer，而
+/// buffer 是 `round(逻辑 × scale)`。只在变化时下发 —— 每帧一次协议请求没有必要，而且新的
+/// destination 必须与新的 buffer 配对出现（D1 / D2）。
+fn destination_update(last: Option<(i32, i32)>, surface_local: Size) -> Option<(i32, i32)> {
+    let destination = dpi::viewport_destination(surface_local);
+    (last != Some(destination)).then_some(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::destination_update;
+    use crate::math::Size;
+
+    #[test]
+    fn a_destination_is_written_only_when_it_changes() {
+        assert_eq!(
+            destination_update(None, Size::new(800.0, 600.0)),
+            Some((800, 600))
+        );
+        assert_eq!(
+            destination_update(Some((800, 600)), Size::new(800.0, 600.0)),
+            None,
+            "逻辑尺寸没变就不下发"
+        );
+        assert_eq!(
+            destination_update(Some((800, 600)), Size::new(701.0, 501.0)),
+            Some((701, 501))
+        );
+    }
+
+    #[test]
+    fn the_destination_is_the_logical_size_rounded_up() {
+        // 与 buffer 尺寸（`round(701 × 1.25) = 876`）无关：destination 永远是逻辑尺寸。
+        assert_eq!(
+            destination_update(None, Size::new(701.0, 501.0)),
+            Some((701, 501))
+        );
+        assert_eq!(
+            destination_update(None, Size::new(700.2, 500.8)),
+            Some((701, 501)),
+            "小数逻辑尺寸向上取整，否则最右 / 最下 1 px 被裁掉"
+        );
+        assert_eq!(
+            destination_update(None, Size::new(0.0, 0.0)),
+            Some((1, 1)),
+            "退化尺寸至少 1 px"
+        );
+    }
 }

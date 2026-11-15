@@ -522,15 +522,16 @@ impl Swapchain {
 `nextDrawable() == None`（drawable 池被占满）⇒ **本帧跳过**（不录 GPU 工作、不推进 `FrameIndex` 的 GPU 部分，
 但 `FrameIndex` 已递增）→ 返回 `Ok(())` 并记 `Section::Present` 为 0；**不**报错（不是失败）。
 
-> **2026-11-15 平台差异（F-186 / F-187 / F-188 / F-189）**：Windows 的渲染目标现在是平台层写入的
+> **2026-11-15 平台差异（F-186 / F-187 / F-188 / F-189 / F-191）**：Windows 的渲染目标现在是平台层写入的
 > 真实客户区，macOS 是 `convertSizeToBacking` 的**真实 backing**（同样由 `Window::set_surface` 写入，
-> `frame_rect()` 用 `surface`），两者都覆盖 `set_size` / `set_scale` 先算出的 covering；Linux 仍按
-> `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍 0×0，等价改造未做）。
-> `WindowOptions.background` 在 Windows 与 macOS 生效：macOS 走 layer `backgroundColor`（sRGB CGColor）
-> + persist `clear_color`（linear）+ 创建期 `NSWindow.backgroundColor`（F-188）；图层的
-> `contentsGravity = kCAGravityBottomLeft` 让 resize 期间的旧 drawable 保持 1:1、不再被 CA 缩放
-> （F-187）。`drawableSize` 由真实 backing 写入，不再用 `size × scale` 派生。Linux 的 resize 填充语义
-> 仍由合成器决定，不得把 Windows / macOS 的结论外推。
+> `frame_rect()` 用 `surface`）；Linux 现在也是平台层写入的**真实 Wayland buffer**
+> （`round(logical × scale)`，`frame_rect()` 同样用 `surface`，旧的 covering 已删除），三平台一致。
+> `WindowOptions.background` 在 Windows、macOS 与 Linux 都生效：macOS 走 layer `backgroundColor`
+> （sRGB CGColor）+ persist `clear_color`（linear）+ 创建期 `NSWindow.backgroundColor`（F-188）；
+> Linux 走 persist `clear_color`（linear，F-192）。图层的 `contentsGravity = kCAGravityBottomLeft`
+> 让 resize 期间的旧 drawable 保持 1:1、不再被 CA 缩放（F-187）；Linux 的旧 buffer 也不再被新的
+> destination 单独缩放（destination 与 buffer 同一次 present 生效，F-190）。`drawableSize` 由真实
+> backing 写入，不再用 `size × scale` 派生。Linux 的 Mutter / KWin 与真实指针拖拽仍未验证（V-122）。
 
 ### 5.4 `macos/pipeline.rs`
 
@@ -632,8 +633,10 @@ pub(crate) struct Renderer {
 }
 impl Renderer {
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError>;
-    /// `view` 是 `NSView*` 的裸指针（与 Windows 的 `new_for_hwnd(isize)` 同形：`render/` 不 import `objc2_app_kit` 类型）。
-    pub(crate) fn new_for_view(view: *mut c_void, size: (u32, u32), scale: f64) -> Result<Self, EngineError>;
+    /// P12 原为 `new_for_view(view, size, scale)`（同步渲染器）。窗口路径现为
+    /// `new_for_layer(size, scale, max_frame_rate, background)`（F-164 / F-166…F-182）：
+    /// 构造后整体移交 GPU 线程，`resize` / 同步 `submit` 不再出现在窗口门面上。
+    pub(crate) fn new_for_layer(size: (u32, u32), scale: f64, max_frame_rate: f32, background: Color) -> Result<Self, EngineError>;
     pub(crate) fn surface(&self) -> (u32, u32);
     pub(crate) fn is_fresh(&self) -> bool;
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError>;
@@ -645,6 +648,11 @@ impl Renderer {
     pub(crate) fn register_geometry(&mut self, id: GeometryId, desc: &GeometryDesc) -> Result<(), EngineError>;
 }
 ```
+
+> **2026-11-15（F-164 / F-166…F-189）**：本节其余 API（`resize` / 同步 `submit` 等）是 P12
+> 落地时的同步形态；窗口路径此后改为
+> [`async-render-pipeline.md`](async-render-pipeline.md) §5 的「每个窗口一条 GPU 线程 +
+> 最新帧槽 + `CAMetalDisplayLink`」，历史伪代码只用于追溯设计，不再对应窗口代码。
 
 `submit` 逐步（与 P08 §6.2 的 1:1 对照）：
 
@@ -1062,11 +1070,13 @@ impl GpuTimer {
 
 | 项                     | 结论                                                                                                                      |
 |------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| 谁 commit `wl_surface` | **Vulkan WSI**（`vkQueuePresentKHR` 内部 attach/commit）；平台层**不得**再对同一 surface `commit()`（会与 WSI 抢 buffer） |
+| 谁 commit `wl_surface` | **GPU 线程**：Vulkan WSI 在 `vkQueuePresentKHR` 内部 attach/commit；UI 线程只在建窗时 commit 一次（取首个 configure），渲染期**不 commit**（D1 / D2 / D4，F-190） |
+| destination            | `wp_viewport.set_destination(ceil(logical))` 由 GPU 线程在 present **之前**写（`FrameRequest.surface_local`，只在变化时下发）；与 buffer 同一次 present commit 原子生效（F-190） |
+| buffer 尺寸            | `round(logical × scale)`（fractional-scale 协议；不是 covering 的 ceil，F-191）                                           |
 | swapchain image 内容   | present 之后**未定义** ⇒ 每帧整面 copy（§0 #4）                                                                           |
 | 局部 present           | 只有 `VK_KHR_incremental_present` 的 hint，且**只**在 `present_dirty()` 为 `Some` 时挂；`fresh` 帧不挂                    |
-| 帧节流                 | `FIFO` present mode（vsync）；`wl_surface.frame` 回调**不**用于渲染节流（WSI 自己管），只用于「空闲时不提交」的门禁       |
-| resize                 | `xdg_toplevel.configure` → 平台层 `Window::set_size`（逻辑）→ `commit_frame` 里 `surface != extent` ⇒ `resize`            |
+| 帧节流                 | `MAILBOX` present mode（最新帧替换待呈现帧，`async-render-pipeline.md` §7.6）；`wl_surface.frame` 回调**不**用于渲染节流，只用于「空闲时不提交」的门禁（`FrameGate`，F-183） |
+| resize                 | `xdg_toplevel.configure` → 平台层 `Window::set_size`（逻辑）→ `Window::set_surface(round(logical × scale))` → `commit_frame` 里 `surface != extent` ⇒ `resize`；不做 seed 帧（F-192） |
 | `wl_buffer` 释放       | WSI 内部管理（引擎不碰 `wl_buffer`）                                                                                      |
 
 ---
@@ -1098,7 +1108,7 @@ Application::run(app):
  3. for (id, window) in app.windows():
       a. NativeWindow::create(mtm, title, logical_size)          // NSWindow + GuiView（隐藏：不 makeKeyAndOrderFront）
       b. scale = window.backingScaleFactor() → Scale::new(scale as f32).ok_or(EngineError::InvalidDpiScale { factor })?
-      c. Renderer::new_for_view(view_ptr, physical(size, scale), scale)?   // Device::new → caps.check()
+      c. Renderer::new_for_layer(backing, scale, max_frame_rate, background)?   // P12 原为 new_for_view(view_ptr, physical(size, scale), scale)；现为异步 GPU 线程门面（F-164 / F-166…F-189，backing = convertSizeToBacking 的 round 值，F-187）
       d. Window::set_renderer(renderer)；window.set_scale(scale)
       e. a11y adapter（§7.7）**必须在窗口首次显示之前**构造
  4. window.show()（makeKeyAndOrderFront）
@@ -1228,12 +1238,12 @@ metal_layer.setDrawableSize(physical size)
 > feature 提供**
 > （probe 实测），但 P12 刻意走通知而不是 delegate：`App` 的生命周期由泵掌握，delegate 会引入第二个回调入口。
 
-> **2026-11-15（F-186 / F-187 / F-188 / F-189）**：尺寸回读仍是逻辑尺寸（`Window::set_size`），但
+> **2026-11-15（F-186 / F-187 / F-188 / F-189 / F-191）**：尺寸回读仍是逻辑尺寸（`Window::set_size`），但
 > macOS 的渲染目标已是平台层写入的**真实 backing**：`sync_state` 在 Dpi / Resized 之后调
 > `convertSizeToBacking` 并 `Window::set_surface(backing)`（先刷新 `contentsScale` / `drawableSize`，
-> 再走同值 early-return），`frame_rect()` 因此与 Windows 一样用 `surface`（Linux 仍是 covering）。
-> `WindowOptions.background` 在 macOS 生效：创建期写 `NSWindow.backgroundColor`（首帧前的底色），
-> 运行期写 layer（sRGB）与 persist clear（linear）。
+> 再走同值 early-return），`frame_rect()` 因此与 Windows 一样用 `surface`。Linux 现在也用 `surface`
+> （真实 Wayland buffer，round；F-191）。`WindowOptions.background` 在 macOS 生效：创建期写
+> `NSWindow.backgroundColor`（首帧前的底色），运行期写 layer（sRGB）与 persist clear（linear）。
 
 ### 7.4 `macos/dpi.rs`
 
@@ -1382,12 +1392,14 @@ Application::run(app):
       任一缺失或版本不足 ⇒ WaylandCompositor { detail: "… not advertised" }（I16：不回退 X11）
  4. wl_surface + xdg_surface + xdg_toplevel（§8.2）；首帧前 surface.commit()
  5. roundtrip 一次，拿到首个 configure（尺寸 + states）与分数缩放
- 6. Renderer::new_for_surface(display_ptr, surface_ptr, physical(size, scale), scale)?
-       // Instance::new → Device::new → Swapchain::new → Pipeline/Atlas/Persist
- 7. a11y adapter（§8.7）**在窗口首次提交前**构造
- 8. EventLoop::try_new() + calloop::ping::make_ping() + WaylandSource::new(conn, queue).insert(handle)
- 9. AppHandle::wake() ⇒ 首帧；loop_.dispatch(Duration, &mut state) 直到 exit
-10. shutdown：device_wait_idle → drop swapchain/device/instance → a11y drop
+ 6. Renderer::new_for_surface(display_ptr, surface_ptr, physical(size, scale), background, viewport)?
+       // Instance::new → Device::new → Swapchain::new → Pipeline/Atlas/Persist；physical = round(logical × scale)，
+       // background = background_linear(WindowOptions.background)，viewport = WaylandState::take_viewport()
+ 7. window.set_surface(physical)                  // 真实 Wayland buffer；set_size / set_scale 先算的 covering 随后被覆盖
+ 8. a11y adapter（§8.7）**在窗口首次提交前**构造
+ 9. EventLoop::try_new() + calloop::ping::make_ping() + WaylandSource::new(conn, queue).insert(handle)
+10. AppHandle::wake() ⇒ 首帧；loop_.dispatch(Duration, &mut state) 直到 exit
+11. shutdown：device_wait_idle → drop swapchain/device/instance → a11y drop
 ```
 
 **泵（每次 `dispatch` 前后各跑一次 pump）**：
@@ -1436,35 +1448,51 @@ pub(crate) struct NativeSurface {
 | 移动 / 缩放                                                | `xdg_toplevel::move(&seat, serial)` / `resize(&seat, serial, XdgToplevelResizeEdge)`（标题栏拖拽由引擎自绘区域触发）                                        |
 | 最大化 / 全屏                                              | `set_maximized()` / `unset_maximized()`（自绘标题栏的双击行为）                                                                                             |
 | 分数缩放                                                   | `wp_fractional_scale_manager_v1.get_fractional_scale(&surface)` → `Event::PreferredScale { scale }`（单位 **1/120**）⇒ `Scale::new(scale as f32 / 120.0)`   |
-| 整数缩放回退                                               | 无 fractional 扩展时用 `wl_surface::Event::Enter(output)` + `wl_output::Event::Scale(n)`（整数）                                                            |
-| 缓冲尺寸                                                   | `physical = (logical × scale).ceil()`（覆盖式取整，`Round::Covering`，与 Win32 同源）                                                                       |
-| viewporter                                                 | 仅当「`scale × 120` 不是 120 的整数倍」时创建 `wp_viewporter.get_viewport(&surface)` 并 `set_destination(logical)`（否则不建，避免多余协议对象）            |
+| 整数缩放回退                                               | **未实现**（V-122）：`dispatch_unit!(wl_output::WlOutput)` 是 no-op，当前只有 `wp_fractional_scale_v1`；无 viewporter 时无 destination / `buffer_scale` 回退 |
+| 缓冲尺寸                                                   | `physical = round(logical × scale)`（half away from zero，至少 1 px）。fractional-scale 协议要求 round；`ceil` 在 1.25 / 1.75 下多 1 px，会让整面被 compositor 以 0.999× 重采样（F-191）                          |
+| viewporter                                                 | `WpViewporter` 全局存在即创建（不再按整数倍率判断）；`Option` = 没有 viewporter，**不**代表 compositor 不支持分数缩放（无 destination / `buffer_scale` 回退，V-122 P2-5）；destination 由 GPU 线程在 present 前写 `ceil(logical)`，与 buffer 同一次 commit 生效（F-190）                                              |
 | 客户端装饰                                                 | 有 `zxdg_decoration_manager_v1` ⇒ `get_toplevel_decoration(&toplevel).set_mode(ClientSide)`；**没有也不失败**（compositor 可能加自己的装饰；L5 记录，V-86） |
-| `wl_surface.set_buffer_scale`                              | **不设置**（WSI + fractional scale 管；设了会与 viewporter 冲突）                                                                                           |
+| `wl_surface.set_buffer_scale`                              | **不调用**（默认即 1；fractional-scale 要求 `buffer_scale = 1`；旧的 `set_buffer_scale(1)` 已随 `sync_viewport` 删除）                                                                                                      |
+| `wl_surface.commit`                                        | UI 线程只在建窗时 commit 一次（取得首个 configure）；渲染期**不 commit**，attach 与 destination 都由 WSI 在 present 内部同一次 commit（D1 / D2 / D4）                                                                        |
+
+> **2026-11-15（F-190 / F-191）**：`viewport` 字段建窗后经 `WaylandState::take_viewport()` 移交窗口
+> 渲染器（`WaylandState` 不再持有），`GpuRenderer` 在 `vkQueuePresentKHR` 前写 destination、`Drop`
+> 时 `destroy`。删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` 与 IME 两处
+> `wl_surface.commit()`；`FrameRequest.surface_local` 与 `surface` 同帧过线，destination 与 buffer
+> 成对（§8.4）。实机数据与未验证项见 [`linux-verification.md`](linux-verification.md) §4.7 / V-122。
 
 ### 8.3 `linux/window.rs`
 
 | 项       | 值                                                                                                                                    |
 |----------|---------------------------------------------------------------------------------------------------------------------------------------|
-| 逻辑尺寸 | `Size`（引擎单位），物理 = `× scale` 的 covering                                                                                      |
+| 逻辑尺寸 | `Size`（引擎单位）；物理 = `round(logical × scale)` 的 Wayland buffer，由平台层每轮 `Window::set_surface` 写入（同值 no-op）           |
+| 渲染目标 | `Window.surface` = 真实 Wayland buffer；`frame_rect()` 三平台统一为 `surface`（Linux 不再用 covering；0 尺寸 clamp 1）                 |
+| 背景色   | `WindowOptions.background` → persist `clear_color`（**linear**，Vulkan sRGB attachment）；`set_background_color` 标 full damage + `Shared` 槽（F-192） |
 | 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），物理值给 `set_min_size`                                                     |
 | 标题栏   | 平台层不绘制标题栏，只提供 `App::request_window_control`（minimize / toggle-maximize / move / resize）；demo 在 `scene/chrome.rs` 自绘标题栏与按钮 |
 | 关闭     | `toplevel.destroy()` + `surface.destroy()`；`LinuxLoop` 见 `app.windows()` 空即退出                                                   |
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |
 | 键盘焦点 | `wl_keyboard::Event::Enter/Leave` ⇒ `FocusChanged { focused }`                                                                        |
 
-> **2026-11-15（F-186 / F-189 / V-121）**：Linux 的渲染目标仍是 `physical = (logical × scale)` 的
-> covering（`frame_rect()` 保持旧值；Windows 与 macOS 已改为平台真值），`WindowOptions.background`
-> 在 Linux 只记录、无渲染效果；resize 期间新暴露区域的填充语义由合成器决定。**等价改造仍未做**
-> （`frame_rect` / `set_surface` / 背景色 / live-resize 条带），留待下一提交；不得把 Windows 的
-> `SCALING_NONE` 或 macOS 的 `kCAGravityBottomLeft` 结论外推。
+> **2026-11-15（F-186 / F-189 / F-190 / F-191 / F-192 / V-122）**：Linux 的渲染目标现在是平台层写入的
+> **真实 Wayland buffer**（`physical = round(logical × scale)`；`frame_rect()` 用 `surface`，
+> Windows / macOS 同形），`WindowOptions.background` 在 Linux 生效（persist clear 的 **linear** 值）。
+> resize 期间旧 buffer 不再被新 destination 单独缩放：destination 与 buffer 在同一次 present 里
+> 原子生效，不做 seed 帧；缩小时右 / 下裁切、没有 Windows 的背景条中间态。Mutter / KWin 与真实
+> 指针拖拽未验证（V-122）；不得把 Windows 的 `SCALING_NONE` 或 macOS 的 `kCAGravityBottomLeft`
+> 结论直接外推成 sway 之外的实测结论。
 
 ### 8.4 `linux/dpi.rs`
 
 ```rust
 pub(crate) fn scale_from(preferred_scale: i32) -> Result<Scale, EngineError>;   // 120 ⇒ 1.0（Scale::new(v/120f32)，None ⇒ InvalidDpiScale）
+pub(crate) fn physical_size(size: Size, scale: Scale) -> (u32, u32);            // round(logical × scale)，至少 1 px（fractional-scale 协议，F-191）
+pub(crate) fn viewport_destination(size: Size) -> (i32, i32);                   // ceil(logical)，至少 1 px；GPU 线程 present 前写给 wp_viewport
 ```
 
+- `physical_size` 用 **round**（half away from zero），不是 covering 的 ceil：1.25 下 701×501 →
+  876×626（ceil 是 877×627），差的 1 px 会让整面被 compositor 以 0.999× 重采样。
+- `viewport_destination` 保持 **ceil**：compositor 按它显示 buffer，最右 / 最下 1 px 不能被裁掉。
 - 分数缩放事件 ⇒ `Event::DpiChanged { dpi: (scale*96).round() as u32, scale }`（字段对齐见 §7.4）。
 - 缩放变化 ⇒ offscreen/swapchain 重建 + 根 `LAYOUT` + 文本 measure 版本递增；**VBO/实例容量不重建**。
 - `wl_output::Event::Scale` 只在**同一 output** 上变化时触发；多显示器跨 output 移动时以 `wl_surface::Event::Enter` 的
@@ -1785,7 +1813,7 @@ git diff -- Cargo.toml crates/ui_core/Cargo.toml          # 期望只有 dispatc
 | R-2  | **MSL / SPIR-V 未在本机编译**（无 `xcrun` / `glslangValidator`）                                  | 中：shader 写错要到 CI 才发现                         | `build.rs` 已有三平台编译 + magic 校验；CI 必须加 macOS runner（`xcrun metal`）与 Linux `glslang-tools`（V-83 的一部分）                          |
 | R-3  | **objc2 双版本**（`0.5.3`（accesskit_macos）+ `0.6.5`（引擎））                                   | 中：`NSPoint`/`NSArray`/`NSObject` 跨版本不可直接互传 | 已按「裸指针 + `Retained::retain` + `cast`」隔离（§7.7）；`accesskit_macos` 升级到 0.6 线时删掉 `cast` 与 `retain` 包装（一次性重构，不留兼容层） |
 | R-4  | **Metal argument buffer / 纹理槽上限**（未来 ≥3 页图集）                                          | 低（v1 只用 2 张纹理）                                | §5.10 的分批策略；D8 保留 Tier2 检测；v1 不引 argument buffer（F-119）                                                                            |
-| R-5  | **分数缩放 + viewporter 的 compositor 实现差异**（GNOME 的 `preferred_scale` 与 buffer 尺寸约束） | 中：模糊或过扫描                                      | §8.2 的「物理尺寸 = ceil(logical × scale) + viewporter destination = logical」；V-83 要求三 compositor 实测                                       |
+| R-5  | **分数缩放 + viewporter 的 compositor 实现差异**（GNOME 的 `preferred_scale` 与 buffer 尺寸约束） | 中：模糊或过扫描                                      | §8.2 的「物理尺寸 = round(logical × scale) + viewporter destination = ceil(logical)，二者同一次 present commit」；V-83 / V-122 要求三 compositor 实测                                                                                  |
 | R-6  | **`VK_KHR_incremental_present` 支持率**（presentation engine 可忽略）                             | 低：仅省电/省带宽的 hint                              | §0 #10：引擎不依赖；`present_dirty()` 只喂 hint                                                                                                   |
 | R-7  | **整面 copy 的带宽成本**（两个新后端每帧写满，D3D12 是局部）                                      | 中：4K/高刷下带宽翻倍                                 | 这是「无局部 present」的必然代价（主设计 §2.5 已接受）；L4 基准量化（V-91）；优化方向只有「跳过整帧」（已有）                                     |
 | R-8  | **macOS 自绘标题栏后交通灯只剩关闭键**                                                            | 低：用户失去最小化/最大化按钮                         | F-127：P13 的窗口控件必须补等价按钮；v1 保留 `Cmd+M` / 双击缩放的系统行为                                                                         |

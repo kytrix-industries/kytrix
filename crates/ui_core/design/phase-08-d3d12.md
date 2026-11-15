@@ -928,7 +928,7 @@ commit_frame(ticket, report):
 > `renderer.submit` 的同步提交是 P08 的历史流程；窗口路径现在是「构造 `FrameRequest` 发布到
 > 最新帧槽，GPU 线程 resize / 录制 / present」（`async-render-pipeline.md` §4 / §6）。其中
 > `surface = size × scale（covering）` 在 Windows 上已改为平台层写入的**真实客户区**（F-186）；
-> macOS/Linux 仍保持 covering。
+> macOS 由 §32、Linux 由 §33 取代（历史记录）。
 
 - **错误语义**：`renderer.submit` 的 `Err` 直接返回给 `App::frame`（`Some(Err(e))`）；`FrameIndex` **已经**递增（帧确实提交过），
   dirty/damage 已在 `settle_frame` 结算 —— 因此**不重试本帧**，错误向上冒泡（device lost 时后续帧会持续返回同一错误，见

@@ -1,12 +1,13 @@
-//! 窗口背景色：引擎颜色 → 平台编码（共享层；Windows / macOS 消费，Linux 本轮不接背景色）。
+//! 窗口背景色：引擎颜色 → 平台编码（共享层；Windows / macOS / Linux 消费）。
 //!
 //! 背景色没有透明度（alpha 恒 1），但两条呈现路径需要**不同编码**：
 //!
 //! - **sRGB 编码**（[`background_srgb`]）：DXGI 的 `SetBackgroundColor` 在 UNORM flip swapchain 上
 //!   按 sRGB 字节直写（S-139 实测：字面量 linear 值只会得到 `linear × 255`，官方 "recommend
 //!   linear" 不适用于该路径）；`NSColor` / `CGColor` 的 sRGB 颜色空间同样要编码后的分量。
-//! - **linear**（[`background_linear`]）：Metal 的 `BGRA8Unorm_sRGB` 渲染目标在 clear 时按 linear
-//!   值写入（硬件做 sRGB 编码），传编码值会偏亮。
+//! - **linear**（[`background_linear`]）：Metal 的 `BGRA8Unorm_sRGB` / Vulkan 的 `*_SRGB` 渲染目标
+//!   在 clear 时按 linear 值写入（硬件做 sRGB 编码），传编码值会偏亮。macOS（persist clear）与
+//!   Linux（Vulkan persist clear）走这条路径。
 //!
 //! 两条路径都从「alpha 置 1 + [`ColorResolver::resolve`]」的同一份结果出发，颜色语义只有一处。
 
@@ -54,8 +55,11 @@ fn opaque(color: Color) -> Color {
 /// 引擎颜色 → **sRGB 编码**的 RGBA（未预乘、alpha 恒 1）。
 ///
 /// 给按 sRGB 字节直写的平台入口用：Windows `SetBackgroundColor`、macOS `NSColor` / `CGColor`。
+/// Linux（Vulkan sRGB attachment）走 [`background_linear`]，不使用本函数，因此它在 Linux 的
+/// 产品构建里不参与编译（测试构建仍覆盖它）。
 /// alpha = 1 ⇒ `resolve` 的线性分量就是未预乘的 linear RGB（已 clamp 到 `[0, 1]`）；再按
 /// IEC 61966-2-1 的传递函数编码。
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
     let linear = ColorResolver::default().resolve(opaque(color)).components;
     let encode = |component: f32| {
@@ -69,11 +73,12 @@ pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
     [encode(linear[0]), encode(linear[1]), encode(linear[2]), 1.0]
 }
 
-/// 引擎颜色 → **linear** 的 RGBA（alpha 恒 1），给 Metal 的 sRGB 渲染目标 clear 用。
+/// 引擎颜色 → **linear** 的 RGBA（alpha 恒 1），给 sRGB 渲染目标的 clear 用。
 ///
-/// Windows 的 `SetBackgroundColor` 走 [`background_srgb`]（按字节直写），不需要本函数；因此它在
-/// 非 macOS 的产品构建里不参与编译（测试构建仍覆盖它）。
-#[cfg(any(target_os = "macos", test))]
+/// macOS 的 Metal persist clear 与 Linux 的 Vulkan persist clear 都用它（硬件按 sRGB 渲染目标做
+/// 编码）。Windows 的 `SetBackgroundColor` 走 [`background_srgb`]（按字节直写），因此它在 Windows
+/// 的产品构建里不参与编译（测试构建仍覆盖它）。
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn background_linear(color: Color) -> [f32; 4] {
     let linear = ColorResolver::default().resolve(opaque(color)).components;
     [linear[0], linear[1], linear[2], 1.0]

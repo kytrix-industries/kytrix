@@ -15,6 +15,7 @@ use crate::{
     error::EngineError,
     platform::linux::{
         a11y::UnixA11y,
+        dpi,
         surface::{self, WaylandState},
         wake, window,
     },
@@ -32,19 +33,37 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
 
-    let (initial_size, initial_title) = app.windows().next().map_or(
-        (crate::math::Size::new(800.0, 600.0), "Kytrix"),
-        |(_, window)| (window.size(), window.options().title.as_str()),
+    let (initial_size, initial_title, initial_background) = app.windows().next().map_or(
+        (
+            crate::math::Size::new(800.0, 600.0),
+            "Kytrix",
+            crate::paint::color::Color::BLACK,
+        ),
+        |(_, window)| {
+            (
+                window.size(),
+                window.options().title.as_str(),
+                window.options().background,
+            )
+        },
     );
     let (mut state, mut queue) = WaylandState::new(initial_size, initial_title)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
-    // 首个 configure 之后才知道真实尺寸；`wp_viewport.set_destination` 让 compositor 做分数缩放。
+    // 首个 configure 之后才知道真实尺寸。buffer 尺寸按 fractional-scale 协议取
+    // `round(逻辑 × scale)`；`wp_viewport.set_destination` 由 GPU 线程在 present 前写入。
     let scale = state.scale();
     let size = state.size();
+    let physical = dpi::physical_size(size, scale);
     let (display, surface_ptr) = state.raw_pointers();
-    let physical = crate::platform::linux::dpi::physical_size(size, scale);
-    let renderer = Renderer::new_for_surface(display, surface_ptr, physical)?;
+    // viewport 的所有权交给渲染器：destination 必须与 buffer 同一次 present 生效（D1 / D2）。
+    let renderer = Renderer::new_for_surface(
+        display,
+        surface_ptr,
+        physical,
+        initial_background,
+        state.take_viewport(),
+    )?;
 
     let id = app
         .windows()
@@ -57,6 +76,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         window.set_renderer(renderer);
         window.set_scale(scale);
         window.set_size(size);
+        // `set_size` 先按 covering 重算 surface；这里覆盖成 Wayland buffer 的真实尺寸。
+        window.set_surface(physical);
     }
     window::apply_min_size(state.toplevel(), scale);
 
@@ -120,6 +141,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 if size_now != last_size {
                     window.set_size(size_now);
                 }
+                // 每轮写入真实的 Wayland buffer 尺寸（`round(逻辑 × scale)`）；同值 no-op。
+                window.set_surface(dpi::physical_size(size_now, scale_now));
             }
             if scale_now != last_scale {
                 last_scale = scale_now;
@@ -128,8 +151,6 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             if size_now != last_size {
                 last_size = size_now;
             }
-            // 分数缩放落地：逻辑尺寸交给 `wp_viewport.set_destination`（compositor 做像素缩放）。
-            state.sync_viewport();
             a11y.focus_changed(state.is_focused());
             // 交互反馈：Linux 没有全局光标 API（由客户端自绘），请求直接消费掉。
             let _ = app.take_cursor_change();
@@ -165,9 +186,15 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // Idle（`App::frame` 返回 `Idle`，没有 publish/commit）由 `note_frame_not_committed`
             // 立即重开；present `OUT_OF_DATE`（WSI 没有 attach/commit）由下面的 200 ms 活性
             // 兜底覆盖。兜底**不是**呈现节奏：正常帧的 callback 在合成器 vsync 内返回。
+            //
+            // 兜底必须**每轮无条件**检查：唤醒位只在 `take_frame_wake` 被消费，而它又被
+            // `frame_ready` 门控 —— 门禁关闭期间某轮已经消费过唤醒位时，用「唤醒位是否存在」
+            // 门控兜底会让它永远不执行（F-183）。
             let now = Instant::now();
-            if dispatcher.frame_wake_pending() {
-                state.expire_frame_gate(now);
+            if state.expire_frame_gate(now) {
+                // 兜底强制开门后补一次唤醒：唤醒位可能已被上一轮取走，否则门禁虽开却没有一帧
+                // 驱动重试。本轮 ④ 随后的 `take_frame_wake` 会消费这次唤醒。
+                dispatcher.wake();
             }
             if state.frame_ready() && dispatcher.take_frame_wake() {
                 state.request_frame();
@@ -198,15 +225,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             }
             let timeout = if app.needs_continuous_frames() {
                 FRAME_TICK
-            } else if dispatcher.frame_wake_pending() {
-                // 门禁关闭时不能睡到 `IDLE_TIMEOUT`：F-183 的活性兜底要在 200 ms 内有机会
-                // 执行（唤醒位在门禁关闭期间必须留在队列里，见 ④）。门禁打开时 `None`，
-                // 回到事件驱动。
+            } else {
+                // 门禁关闭时必须睡到兜底到期（不能睡 `IDLE_TIMEOUT`）：兜底每轮无条件检查，
+                // 不再依赖唤醒位留在队列里。门禁打开时 `None` ⇒ 回到事件驱动。
                 state
                     .frame_gate_remaining(Instant::now())
                     .unwrap_or(surface::IDLE_TIMEOUT)
-            } else {
-                surface::IDLE_TIMEOUT
             };
             // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。
             if app.windows().next().is_none() {

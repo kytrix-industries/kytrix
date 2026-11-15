@@ -112,8 +112,10 @@ pub struct WindowOptions {
     ///
     /// Windows：`DXGI_SCALING_NONE` 下客户区超出 back buffer 的部分由 `IDXGISwapChain1::
     /// SetBackgroundColor` 填充（sRGB 编码字节）；macOS：`CAMetalLayer.backgroundColor`
-    /// （sRGB `CGColor`）+ persist 的 clear color（linear，Metal sRGB 渲染目标）。
-    /// Linux 本轮只保存参数。alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
+    /// （sRGB `CGColor`）+ persist 的 clear color（linear，Metal sRGB 渲染目标）；
+    /// Linux：Vulkan sRGB attachment 的 clear color（linear，`render::color::background_linear`），
+    /// 由 GPU 线程在录制前应用（旧 buffer 不会被缩放，clear 只填新布局里未被内容覆盖的像素）。
+    /// alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
     /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
     pub background: Color,
 }
@@ -248,8 +250,9 @@ pub struct Window {
     /// 渲染目标的物理像素尺寸。
     ///
     /// Windows 是平台层给的真实客户区（`set_surface`），macOS 是 AppKit 的真实 backing
-    /// （`convertSizeToBacking`，同样由 `set_surface` 写入）；但 `set_size` / `set_scale` 会先按
-    /// `size × scale` 的 covering 重算一次，平台层随后用真值覆盖。Linux 恒等于 covering。
+    /// （`convertSizeToBacking`，同样由 `set_surface` 写入），Linux 是 Wayland buffer 的真实
+    /// 像素尺寸（`round(逻辑 × scale)`，同样由平台层 `set_surface` 写入）；`set_size` / `set_scale`
+    /// 会先按 `size × scale` 的 covering 重算一次，平台层随后用真值覆盖。
     surface: (u32, u32),
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
@@ -473,13 +476,14 @@ impl Window {
     /// macOS 上值变化同样标全量重绘：`CAMetalLayer.backgroundColor` 立刻在主线程写，persist 的
     /// clear color 经共享槽交给 GPU 线程（同样在空闲或下一帧录制前应用）。
     ///
-    /// Linux 本轮只更新参数。
+    /// Linux 上值变化同样标全量重绘：clear color（linear）经共享槽交给 GPU 线程，在空闲或下一帧
+    /// 录制前写进持久目标，下一次 present 生效。
     pub fn set_background_color(&mut self, color: Color) {
         if self.options.background == color {
             return;
         }
         self.options.background = color;
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             // 背景色不是绘制图元：没有 damage 的帧可能永远不被 present，必须显式标全量。
             self.full_damage_pending = true;
@@ -547,7 +551,7 @@ impl Window {
     }
 
     /// 平台层：写入真实渲染目标物理尺寸（Windows `WM_SIZE` / `WM_DPICHANGED`、macOS
-    /// `convertSizeToBacking` 之后）。
+    /// `convertSizeToBacking` 之后、Linux `round(逻辑 × scale)` 的 Wayland buffer 尺寸）。
     ///
     /// 值变化 ⇒ 标全量重绘（新暴露的像素没有对应 damage）；**不**标 layout、**不**动
     /// `scale_epoch`：本方法只改渲染目标，不改布局；DPI 的布局变化由 `set_scale` / `set_size` 负责。
@@ -555,7 +559,7 @@ impl Window {
     /// macOS 还必须在这里刷新图层属性（`contentsScale` / `drawableSize`）：这是主线程的写入口，
     /// 且必须在「值没变就返回」**之前**执行 —— DPI 变化但 surface 恰好相同时也要更新
     /// `contentsScale`。只变 scale 时也必须刷新。
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn set_surface(&mut self, surface: (u32, u32)) {
         let surface = (surface.0.max(1), surface.1.max(1));
         #[cfg(target_os = "macos")]
@@ -792,27 +796,18 @@ impl Window {
         Ok(())
     }
 
-    /// 窗口的物理像素尺寸（Windows = 真实客户区；macOS = 真实 backing；Linux = covering）。
+    /// 窗口的物理像素尺寸（三平台都是平台层写入的真实渲染目标）。
     fn physical_surface(&self) -> (u32, u32) {
         self.surface
     }
 
     /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
     ///
-    /// Windows：真实客户区（平台层给的客户区，至少 1 px）；macOS：真实 backing（`set_surface`
-    /// 写入，文字按真实像素 1:1）。
-    #[cfg(any(windows, target_os = "macos"))]
+    /// 三平台一致：平台层通过 `set_surface` 写入的真实渲染目标 —— Windows 真实客户区
+    /// （至少 1 px）、macOS 真实 backing（`convertSizeToBacking`，文字按真实像素 1:1）、
+    /// Linux Wayland buffer 的 `round(逻辑 × scale)`（文字按 buffer 像素 1:1）。
     fn frame_rect(&self) -> PhysicalRect {
         PhysicalRect::new(0, 0, self.surface.0 as i32, self.surface.1 as i32)
-    }
-
-    /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
-    ///
-    /// Linux：保持旧值（`size × scale` 的 covering **原始结果**，0 尺寸 ⇒ 0×0；surface 的
-    /// `max(1)` 只约束渲染目标，不改变 frame）。
-    #[cfg(target_os = "linux")]
-    fn frame_rect(&self) -> PhysicalRect {
-        Rect::new(0.0, 0.0, self.size().width, self.size().height).to_physical_covering(self.scale)
     }
 
     /// 是否有节点需要重建 lane（`LAYOUT` / `PAINT` / `REUSABLE` 不在）。
@@ -997,6 +992,10 @@ impl Window {
             payload: FramePayload::from_buffer(self.instance_buffer()),
             plan,
             surface,
+            // Linux：逻辑尺寸与 `surface`（buffer 尺寸）同帧过线，GPU 线程在 present 前用它写
+            // `wp_viewport.set_destination`（destination 与 buffer 必须成对，D1 / D2）。
+            #[cfg(target_os = "linux")]
+            surface_local: self.size(),
             published_at: Instant::now(),
         })
     }
@@ -1167,8 +1166,9 @@ impl Window {
 
 /// `size × scale` 的 covering 物理尺寸（向外 floor/ceil，至少 1 px）。
 ///
-/// Linux 恒等于它；Windows / macOS 只是 `set_size` / `set_scale` 重算出的初值，平台层随后用
-/// `Window::set_surface` 写入真值（真实客户区 / backing，不是只有首帧前）。
+/// 平台层在 `set_size` / `set_scale` 之后、下一帧之前用 [`Window::set_surface`] 写入真值
+/// （Windows 真实客户区 / macOS backing / Linux `round(逻辑 × scale)` 的 Wayland buffer），
+/// 因此 covering 只是初值，不是只有首帧前。
 fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
     let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
     (rect.width().max(1) as u32, rect.height().max(1) as u32)
@@ -1247,10 +1247,10 @@ mod tests {
 
         window.set_background_color(Color::WHITE);
         assert_eq!(window.options().background, Color::WHITE);
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         assert!(
             window.full_damage_pending,
-            "改色必须标一帧，否则 SetBackgroundColor / layer 背景可能永不被 present"
+            "改色必须标一帧，否则背景色可能永不被 present"
         );
 
         // 同值 no-op：清掉 damage 之后再调同值，不得重新置位。
@@ -1279,28 +1279,28 @@ mod tests {
         );
     }
 
-    /// Linux 的退化尺寸：`frame_rect` 仍是 0×0（钉住 Linux 的旧行为；本机不跑）。
+    /// Linux：`frame_rect` 用平台层写入的真实 Wayland buffer 尺寸（`set_surface`），
+    /// 不再是 `size × scale` 的 covering（文字按 buffer 像素 1:1）。
     #[cfg(target_os = "linux")]
     #[test]
-    fn frame_rect_keeps_the_raw_covering_for_degenerate_sizes() {
+    fn frame_rect_uses_the_platform_buffer_on_linux() {
         use crate::math::PhysicalRect;
 
         let mut window = window();
-        window.set_size(Size::new(800.0, 600.0));
+        // 初值是 covering（800×600）；平台层随后在 event_loop 里写入 round 后的 buffer。
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
+        window.set_surface((999, 777));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
 
-        for size in [
-            Size::new(0.0, 0.0),
-            Size::new(f32::NAN, 10.0),
-            Size::new(10.0, f32::INFINITY),
-        ] {
-            window.set_size(size);
-            assert_eq!(
-                window.frame_rect(),
-                PhysicalRect::new(0, 0, 0, 0),
-                "size {size:?} 的 frame 必须是 0×0（surface 的 max(1) 不参与）"
-            );
-        }
+        // `set_size` 先按 covering 重算 surface；平台层下一轮用 round 覆写。
+        window.set_size(Size::new(256.8, 100.5));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 257, 101));
+        window.set_surface((449, 176));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
+
+        // 0 尺寸由 `set_surface` 钳到 1 px（不能给 swapchain 0 尺寸）。
+        window.set_surface((0, 0));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1, 1));
     }
 
     /// macOS：`frame_rect` 用平台层写入的真实 backing surface，不再是 covering（文字 1:1）。
@@ -1333,7 +1333,8 @@ mod tests {
         );
         assert_eq!(window.physical_surface(), (800, 600));
 
-        // 125 / 150 / 175%：surface = 逻辑尺寸 × scale 的 covering（向外取整）。
+        // 125 / 150 / 175%：`set_scale` / `set_size` 先把 surface 重算成 covering（向外取整）；
+        // 平台层随后用 `set_surface` 写真值（Linux 是 round 的 Wayland buffer）。
         for (factor, expected) in [
             (1.25, (1000, 750)),
             (1.5, (1200, 900)),
@@ -1360,7 +1361,7 @@ mod tests {
         assert_eq!(window.physical_surface(), (1, 1));
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
         let mut window = window();
