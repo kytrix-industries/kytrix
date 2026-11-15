@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         title: "hello".into(),
         size: Size::new(640.0, 400.0),
         scale: Scale::ONE,
-        background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]), // Windows 窗口底色（resize 期间新暴露区域）
+        background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]), // Windows/macOS 窗口底色（resize 期间新暴露区域；Linux 后续）
     });
     let root = app.window(window).expect("window").tree().root();
     let _ = NodeBuilder::boxed()
@@ -33,7 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`WindowOptions.background` 默认 `Color::BLACK`（不透明），仅 Windows 影响窗口底色；其余字段可以
+`WindowOptions.background` 默认 `Color::BLACK`（不透明），Windows 与 macOS 影响窗口底色
+（resize 期间新暴露区域；macOS 走 layer 背景色 + GPU clear，Linux 尚未接、后续补）；其余字段可以
 用 `..WindowOptions::default()` 省略。
 
 ## 架构（模块与依赖方向）

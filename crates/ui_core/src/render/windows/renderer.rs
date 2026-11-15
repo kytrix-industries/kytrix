@@ -54,12 +54,10 @@ use crate::render::timer::Section;
 use crate::render::windows::readback::ReadbackImage;
 use crate::{
     error::EngineError,
-    paint::{
-        atlas::AtlasKind,
-        color::{Color, ColorResolver},
-    },
+    paint::{atlas::AtlasKind, color::Color},
     render::{
         DirtyRows, RenderStats,
+        color::background_srgb,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         timer::{FrameTimings, GpuTimerSample},
@@ -120,7 +118,7 @@ impl Renderer {
         size: (u32, u32),
         background: Color,
     ) -> Result<Self, EngineError> {
-        let gpu = GpuRenderer::new_for_hwnd(hwnd, size, background_rgba(background))?;
+        let gpu = GpuRenderer::new_for_hwnd(hwnd, size, background_srgb(background))?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
             error: None,
@@ -180,7 +178,7 @@ impl Renderer {
         match &self.target {
             RenderTarget::Offscreen(_) => {}
             RenderTarget::Window(window) => {
-                window.set_background_color(background_rgba(color));
+                window.set_background_color(background_srgb(color));
             }
         }
     }
@@ -235,62 +233,6 @@ impl Renderer {
             }),
         }
     }
-}
-
-/// 引擎颜色 → `IDXGISwapChain1::SetBackgroundColor` 的 **sRGB 编码** RGBA（未预乘、alpha 恒 1）。
-///
-/// `SetBackgroundColor` 在 UNORM flip swapchain 上按 sRGB 编码字节直写（实测 S-139：字面量
-/// linear 值只会得到 `linear × 255`）；**不要传 linear**，官方 "recommend linear" 不适用于本路径。
-/// alpha 会被 `ALPHA_MODE_IGNORE` 忽略，这里仍显式写 1.0。
-///
-/// 背景色没有透明度：先把 alpha 置 1（不改 RGB）再解析。`with_opacity(1.0)` 只乘 alpha，**不会**
-/// 把 0.5 变成 1；而 [`ColorResolver::resolve`] 输出的是**预乘**值，直接用半透明颜色会让
-/// 半透明白变成灰色。
-fn background_rgba(color: Color) -> [f32; 4] {
-    let opaque = match color {
-        Color::Srgb { r, g, b, .. } => Color::Srgb {
-            r,
-            g,
-            b,
-            alpha: 1.0,
-        },
-        Color::LinearSrgb { r, g, b, .. } => Color::LinearSrgb {
-            r,
-            g,
-            b,
-            alpha: 1.0,
-        },
-        Color::DisplayP3 { r, g, b, .. } => Color::DisplayP3 {
-            r,
-            g,
-            b,
-            alpha: 1.0,
-        },
-        Color::Oklab { l, a, b, .. } => Color::Oklab {
-            l,
-            a,
-            b,
-            alpha: 1.0,
-        },
-        Color::Oklch { l, c, h, .. } => Color::Oklch {
-            l,
-            c,
-            h,
-            alpha: 1.0,
-        },
-    };
-    // alpha = 1 ⇒ `resolve` 的线性分量就是未预乘的 linear RGB（已 clamp 到 `[0, 1]`）。
-    let linear = ColorResolver::default().resolve(opaque).components;
-    // linear → sRGB 编码（IEC 61966-2-1 的传递函数）。
-    let encode = |component: f32| {
-        let c = component.clamp(0.0, 1.0);
-        if c <= 0.003_130_8 {
-            12.92 * c
-        } else {
-            1.055 * c.powf(1.0 / 2.4) - 0.055
-        }
-    };
-    [encode(linear[0]), encode(linear[1]), encode(linear[2]), 1.0]
 }
 
 /// 粘性错误的重建源（§4.5：GPU 线程退出后 `poll` 持续返回同一错误）。
@@ -962,10 +904,10 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError, background_rgba};
+    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
     use crate::{
         error::EngineError,
-        paint::{atlas::AtlasKind, color::Color},
+        paint::atlas::AtlasKind,
         render::{DirtyRows, compositor::Plan, frame::LatestFrame},
     };
 
@@ -1155,77 +1097,5 @@ mod tests {
         terminated.mark_terminated();
         terminated.set_background([0.0, 1.0, 0.0, 1.0]);
         assert_eq!(terminated.take_background(), None);
-    }
-
-    /// `round(component × 255)`：8-bit 缓冲实际收到的字节（`SetBackgroundColor` 按字节直写）。
-    fn bytes(rgba: [f32; 4]) -> [u8; 4] {
-        rgba.map(|component| (component * 255.0).round() as u8)
-    }
-
-    #[test]
-    fn the_background_color_is_srgb_encoded_and_never_translucent() {
-        // 实测 S-139：本路径的 UNORM flip swapchain 把 float 原样写进 8-bit 缓冲，所以必须传
-        // sRGB 编码分量；主题色 `#0B0E13` 只有编码后才会落成 (11, 14, 19)。
-        let theme = background_rgba(Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]));
-        let [red, green, blue, alpha] = bytes(theme);
-        assert_eq!([red, green, blue], [11, 14, 19], "8-bit 缓冲收到的字节");
-        assert_eq!(alpha, 255);
-        assert_eq!(theme[3], 1.0, "背景色恒不透明");
-
-        assert_eq!(bytes(background_rgba(Color::BLACK)), [0, 0, 0, 255]);
-        assert_eq!(bytes(background_rgba(Color::WHITE)), [255, 255, 255, 255]);
-        // 半透明白：先不透明化（`with_opacity(1.0)` 不会把 0.5 变成 1，预乘会变灰）。
-        assert_eq!(
-            bytes(background_rgba(Color::srgb(1.0, 1.0, 1.0, 0.5))),
-            [255, 255, 255, 255]
-        );
-
-        // linear 0.5 → sRGB encode 0.7354 → 188（原样写入只会得到 128）。
-        assert_eq!(
-            bytes(background_rgba(Color::linear_srgb(0.5, 0.5, 0.5, 1.0))),
-            [188, 188, 188, 255]
-        );
-
-        // 5 个变体都必须按不透明色处理：半透明白若漏掉 `alpha: 1.0`，预乘后会变灰（188）。
-        for white in [
-            Color::srgb(1.0, 1.0, 1.0, 0.5),
-            Color::linear_srgb(1.0, 1.0, 1.0, 0.5),
-            Color::display_p3(1.0, 1.0, 1.0, 0.5),
-            Color::oklab(1.0, 0.0, 0.0, 0.5),
-            Color::oklch(1.0, 0.0, 0.0, 0.5),
-        ] {
-            let rgba = background_rgba(white);
-            assert_eq!(
-                bytes(rgba),
-                [255, 255, 255, 255],
-                "{white:?} 必须是不透明白"
-            );
-            assert_eq!(rgba[3], 1.0, "{white:?} 的 alpha 必须是 1");
-        }
-
-        // 宽色域变体的已知黑端点：与 sRGB 同样的字节结果 + alpha 恒 1。
-        for black in [
-            Color::oklab(0.0, 0.0, 0.0, 1.0),
-            Color::display_p3(0.0, 0.0, 0.0, 0.5),
-            Color::oklch(0.0, 0.0, 0.0, 1.0),
-        ] {
-            let rgba = background_rgba(black);
-            assert_eq!(bytes(rgba), [0, 0, 0, 255], "{black:?}");
-            assert_eq!(rgba[3], 1.0, "{black:?} 的 alpha 必须是 1");
-        }
-
-        // 分量恒在 `[0, 1]`（越界 / NaN 输入由 resolver 与 encode 收敛）。
-        for color in [
-            Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
-            Color::BLACK,
-            Color::WHITE,
-            Color::srgb(2.0, -1.0, f32::NAN, 1.0),
-            Color::display_p3(1.0, 0.0, 0.0, 0.25),
-            Color::oklch(0.5, 0.4, 30.0, 0.0),
-        ] {
-            for component in background_rgba(color) {
-                assert!((0.0..=1.0).contains(&component), "{color:?} → {component}");
-            }
-        }
     }
 }

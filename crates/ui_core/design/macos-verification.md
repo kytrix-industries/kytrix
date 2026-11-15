@@ -6,7 +6,8 @@
 > 本文是**执行记录**；与设计文档不同的实现事实按纪律登记到
 > [`DEVIATIONS.md`](DEVIATIONS.md)（首轮新增 F-157 … F-165、S-138、V-114 … V-119；
 > V-114/V-119 已由 F-164 关闭，保留编号作为历史；三平台异步管线的两轮审查修订见
-> §27/§28 的 F-166 … F-175 与 §29 的 F-176 … F-182）。
+> §27/§28 的 F-166 … F-175 与 §29 的 F-176 … F-182；Windows live resize 见 §31 的
+> F-184 … F-186，macOS live resize 见 §32 的 F-187 … F-189）。
 
 ---
 
@@ -21,6 +22,7 @@
 | 像素 golden | 新增 `tests/golden/metal-real/` 13 份；与 `warp/` 的最大逐通道差 **1**（超容差 0），与 `lavapipe/` 的差与 Linux 软件光栅一致（§5） |
 | 测试门禁 | 数值见 §4.1；三平台行为差异只在 GPU/字体/IME 环境 |
 | 截图弹窗 | macOS 15 的 ScreenCaptureKit「绕过窗口选择器」提示只在 **root 进程**调用 `screencapture` 时出现；改为以 console 用户运行后不再弹出（§6.1） |
+| live resize | 旧 drawable 不再被 CA 缩放：`kCAGravityBottomLeft` + 真实 backing + layer/clear 背景色（F-187 / F-188）。stale 卡片 1108×350（1.000×，旧 HEAD 1624×430）、文字 Laplacian +1%、条带对背景 Δ≤1；1x / 真实鼠标拖拽未验（§2.12 / V-121） |
 
 ---
 
@@ -254,6 +256,52 @@ FPS 58–60、Frame 16.65–17.29 ms）。范围随窗口像素面积 / 机器 /
 `App::close_window`（GPU-bound、2–3 帧在飞）→ exit 0、无 detach，驱动不回调完成时最多 2 s
 后打印诊断并退出（F-175 的 `||` 变体是反例：丢弃完成通知、join 卡满后 detach，实测 6 s）。
 
+### 2.12 live resize：旧 drawable 不缩放 + 背景条（F-187 / F-188，2026-11-15）
+
+**症状**：拖动窗口时卡片被非等比拉伸、文字发虚。旧 HEAD `8598fe398` 的 stale 帧卡片
+1624×430（静止 1108×350，即 1.466× / 1.229×），卡片文字 Laplacian 624 vs 静止 798（-22%）。
+
+**根因**：`CAMetalLayer.contentsGravity` 默认 `resize`；AppKit 在 resize 时同步放大 layer
+bounds，`drawableSize` **不会**自动跟随；引擎又在 `submit_gpu` 用布局 covering
+（`size × scale`）写 `drawableSize`，于是旧 drawable 被 CA 缩放到新的 bounds。
+
+**修复**（细节见 DEVIATIONS §32 与 `async-render-pipeline.md` §5.3 / §5.4）：
+
+- `contentsGravity = kCAGravityBottomLeft`。本视图 `isFlipped = true`，CA 的 `bottomLeft` 才是
+  **视觉左上**；实测 `TopLeft` 会把旧内容贴到左下、条带出现在上/右侧（S-142）。
+- `Window.surface` = `NSView.convertSizeToBacking(view.bounds.size)` 的 round 值（不是 ceil、至少
+  1 px）；`drawableSize` / `contentsScale` 只由主线程写，`sync_state` 的 Dpi / Resized 之后
+  `set_surface`（先刷新图层、再走同值 early-return）。
+- `CAMetalLayer.backgroundColor`（sRGB `CGColor`）填旧 drawable **之外**；persist `clear_color`
+  （linear）填新 drawable **之内**；`NSWindow.backgroundColor` 只在创建期写一次（F-188 / S-141）。
+- F-172 的 `Skip` 不改：旧 drawable 按 1:1 贴视觉左上、新条带 = 背景色，跳一个 vsync 视觉正确。
+
+**方法 / 数据**：macOS 15.8.1 / Intel Iris Plus 655 / 内建 2560×1600 @2x；真实窗口 client
+960×778（含 38 pt 安全区）⇒ 2x backing 1920×1556；iTerm2 会话录屏 54–58 fps（**录屏口径**，不是
+引擎 FPS）；AX 连续 `setSize`（约 28 ms/步）加一次 960×778 → 1400×950 跳变。判据：逐帧取窗口
+区域，比较 stale 帧与静止帧的卡片 bbox、量卡片文字区域 Laplacian 方差（锐度）、取新暴露条带与
+静止背景的 RGB。
+
+```text
+# 旧 HEAD 8598fe398（contentsGravity 仍是默认 resize）
+stale 卡片 1624×430（静止 1108×350）→ 1.466× / 1.229× 非等比
+卡片文字 Laplacian 624 vs 静止 798（-22%）
+
+# 新代码（kCAGravityBottomLeft + 真实 backing + layer/clear 背景色）
+stale 卡片 1108×350 = 静止尺寸（1.000× / 1.000×）
+贴视觉左上：y0 = 128/129、h = 174/175（连续 sweep 期间 174–175 恒定）
+卡片文字 808 vs 800（+1%）；标题 3272 vs 3279（-0.2%）
+条带 RGB (13,15,19)/(14,15,19) vs 静止背景 (12,14,18) ≈ #0B0E13（Δ≤1，无黑/白条）
+最小化 3 s 恢复 1:1；Esc exit 0；stderr 空
+```
+
+**未验证**：1x 显示模式（本轮未切显示模式）、真实鼠标拖拽（AX 连续 `setSize` 只是近似，未构造
+`NSEventTrackingRunLoopMode` 下的拖动）、多显示器 / 混合 DPI、ProMotion、`preferredFrameLatency`、
+广色域条带接缝 / `layer.colorspace`（V-121）。
+
+> 历史记录不改写：§2.9 / §2.11 的 F-172（陈旧 drawable 跳过）与异步管线结论保持原文；本节只
+> 追加 live resize 的新观察，两者结论不冲突（F-172 的状态机本轮未改）。
+
 ## 3. 修复与决策记录
 
 > 下表是**当时的决策记录**。M2 / M10 / M11 涉及的 `nextDrawable`、轮询 `status()`、邮箱重试与
@@ -302,6 +350,10 @@ FPS 58–60、Frame 16.65–17.29 ms）。范围随窗口像素面积 / 机器 /
 | HUD | 右上角面板 | ✅ FPS 58–60 / Frame 16.67ms / CPU 1.18–2.21ms / GPU 0.89–2.08ms / Draw 1 / Prims 251 / 1920×1480 @2.00x Metal |
 | 整帧内容 | 用户身份 `screencapture -l` 窗口截图 | ✅ 六张卡片、焦点环、CJK 简/繁/日/韩、色块、PNG 图集、滚动列表 |
 | resize | AX 设 1200×800（实际 1200×771）、960×740 | ✅ 物理 2400×1542 @2x；重排、无崩溃；HUD 仍 60fps |
+| live resize 拖动 / 跳变（F-187） | AX 连续 `setSize`（约 28 ms/步）+ 单次 960×778 → 1400×950；录屏逐帧量卡片 bbox | ✅ stale 卡片 1108×350 = 静止尺寸（1.000× / 1.000×）、贴视觉左上（y0 = 128/129、h = 174/175）；旧 HEAD 1624×430（1.466× / 1.229×） |
+| live resize 文字锐度 | 卡片文字区域 Laplacian 方差（stale vs 静止） | ✅ 808 vs 800（+1%）；标题 3272 vs 3279（-0.2%）；旧 HEAD 624（-22%） |
+| live resize 背景条 | 取新暴露的右/下条带与静止页面背景 RGB | ✅ (13,15,19)/(14,15,19) vs (12,14,18)，Δ≤1（≈ `#0B0E13`），无黑/白条（F-188 / S-141） |
+| live resize 缩小 / 最小化 | 缩小拖动；AX 最小化 3 s 后恢复 | ✅ 缩小时右/下裁切（无拉伸/黑边）；恢复 1:1；Esc exit 0、stderr 空 |
 | 全屏（HUD 关） | `AXFullScreenButton` 正常路径 | ✅ 进入 1680×1050、AXStandardWindow/子节点齐全；退出恢复 960×740，无残留（固定 960×740 布局，四周黑底属预期） |
 | 全屏（HUD 开） | 连续 60fps + 全屏 | ✅ 进入/退出正常；HUD 58–60fps；完整 AX 树 0.20s；无 AXUnknown 旧快照（F-164） |
 | DPI | 显示模式 1680×1050@2 ↔ 1650×1050@1 ↔ 恢复 | ✅ `DpiChanged { dpi: 192, scale: 2.0 }` / `{ dpi: 96, scale: 1.0 }`；进程存活 |
@@ -417,6 +469,9 @@ root 身份调用 `screencapture` 会触发 macOS 15 的
 | 项 | 说明 |
 |----|------|
 | 多显示器 / 混合 DPI | 只验单内建 Retina + 1x/2x 显示模式切换；无外接显示器 |
+| live resize 1x / 真实鼠标拖拽 | live resize 只在 2x + AX 连续 `setSize` 下验：未切 1x 显示模式，未构造真实鼠标拖动（`NSEventTrackingRunLoopMode`）。V-121 |
+| ProMotion / 高刷 | 本机内建 60 Hz；`preferredFrameRateRange` 上界与 `preferredFrameLatency` 未验。V-121 |
+| 广色域条带接缝 | 条带与页面背景的 8-bit 差 Δ≤1 已测；Display P3 输出与 `layer.colorspace` 未验。V-121 |
 | 真实 VoiceOver 联动 | 只验 AX API；未开 VoiceOver 做朗读/焦点环联动 |
 | Sogou 候选窗焦点 | 早期按键不进入应用的现象未在干净 Apple Pinyin 复现；第三方 IME 候选窗行为未定位。V-116 |
 | App 隐藏 | `NSRunningApplication.hide()` 助手返回 false；未可靠实测（代码按 `isHidden` 排除误关） |
@@ -469,4 +524,13 @@ cargo test -p ui_core --features test-support --test snapshot
 swiftc displaymode.swift -o displaymode
 ./displaymode list
 ./displaymode set1x 1650 1050   # 切到 1x，3s 后恢复原模式
+
+# live resize（§2.12 / F-187 / F-188）：录屏 + AX 连续 setSize
+# 录屏用 console 用户身份（root 会触发 TCC 弹窗，§4.8）；窗口区域坐标先由 CGWindowList 读
+sudo -u chenbaiyu screencapture -x -v -R <x>,<y>,<w>,<h> out/live-resize.mov
+# AX 逐档 resize（约 28 ms/步），末尾追加一次 960×778 → 1400×950 的跳变
+osascript -e 'tell application "System Events" to tell process "demo" to set size of window 1 to {1200, 900}'
 ```
+
+判据与实测数据见 §2.12；逐帧分析（卡片 bbox、文字 Laplacian、条带取样）是仓库外一次性脚本，
+未入库。

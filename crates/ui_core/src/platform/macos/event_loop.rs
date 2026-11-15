@@ -76,11 +76,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     for (id, options) in requests {
         let native = NativeWindow::create(mtm, id, &options, &dispatcher)?;
         let scale = native.scale();
-        let size = native.physical_size();
+        let size = native.backing_size();
         let renderer = Renderer::new_for_layer(
             size,
             f64::from(scale.factor()),
             native.maximum_frames_per_second(),
+            options.background,
         )?;
         {
             let layer = renderer
@@ -94,6 +95,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             window.set_renderer(renderer);
             window.set_scale(scale);
             window.set_size(native.logical_size());
+            // `set_size` 先按 covering 重算 surface；这里覆盖成 AppKit 的真实 backing。
+            window.set_surface(size);
         }
         native.show();
         windows.push(native);

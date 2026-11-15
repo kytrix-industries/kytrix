@@ -59,6 +59,10 @@ pub(crate) struct GpuRenderer {
     atlas: AtlasTextures,
     persist: Persist,
     upload: UploadArena,
+    /// 全量帧的 clear color（**linear**：`BGRA8Unorm_sRGB` 的 clear 由硬件做 sRGB 编码）。
+    ///
+    /// 窗口路径 = `WindowOptions.background` 的 linear 值（persist 重建后新 drawable 内的条带）；
+    /// 离屏 / 快照路径保持 `[0, 0, 0, 0]`（透明，快照语义）。
     clear_color: [f32; 4],
     /// 当前持久目标 / drawable 的物理尺寸（drawable 的实际尺寸是最后真值，§5.4）。
     surface: (u32, u32),
@@ -81,7 +85,7 @@ unsafe impl Send for GpuRenderer {}
 impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备 + 默认图集页。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, ATLAS_PAGE, false)
+        Self::with_device(Device::new()?, size, ATLAS_PAGE, false, [0.0; 4])
     }
 
     /// 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
@@ -90,12 +94,19 @@ impl GpuRenderer {
         size: (u32, u32),
         atlas_page: u32,
     ) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, atlas_page, false)
+        Self::with_device(Device::new()?, size, atlas_page, false, [0.0; 4])
     }
 
     /// 真实窗口：设备由主线程建好（图层已绑定它），这里只接管 GPU 侧对象。
-    pub(crate) fn new_window(device: Device, size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(device, size, ATLAS_PAGE, true)
+    ///
+    /// `background_linear` 是 persist clear color（linear）：重建 persist 后新 drawable 内部的
+    /// 条带由它填（旧 drawable 之外的条带由 layer 的 `backgroundColor` 填）。
+    pub(crate) fn new_window(
+        device: Device,
+        size: (u32, u32),
+        background_linear: [f32; 4],
+    ) -> Result<Self, EngineError> {
+        Self::with_device(device, size, ATLAS_PAGE, true, background_linear)
     }
 
     fn with_device(
@@ -103,6 +114,7 @@ impl GpuRenderer {
         size: (u32, u32),
         atlas_page: u32,
         window_target: bool,
+        clear_color: [f32; 4],
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let queue = Queue::new(&device)?;
@@ -118,7 +130,7 @@ impl GpuRenderer {
             atlas,
             persist,
             upload,
-            clear_color: [0.0, 0.0, 0.0, 0.0],
+            clear_color,
             surface: size,
             fresh: true,
             last_index: FrameIndex::default(),
@@ -173,6 +185,16 @@ impl GpuRenderer {
         self.surface = size;
         self.fresh = true;
         Ok(true)
+    }
+
+    /// 改窗口背景色（GPU 线程）：写 persist 的 clear color（**linear**，不是 sRGB 编码）。
+    ///
+    /// 新 drawable **内部**的条带由下一次全量帧的 clear 填上；旧 drawable **之外**的区域由主线程
+    /// 写的 layer `backgroundColor` 负责。只被窗口路径调用（`Renderer::set_background_color` 的
+    /// 离屏分支是 no-op）。
+    pub(crate) fn set_background_color(&mut self, linear: [f32; 4]) {
+        self.debug_assert_gpu_thread("set_background_color");
+        self.clear_color = linear;
     }
 
     /// 窗口路径：把一帧画进 persist 后整面 blit 到 `drawable`，登记完成通知并 `commit`（I2）。

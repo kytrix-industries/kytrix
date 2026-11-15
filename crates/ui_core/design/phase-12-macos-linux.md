@@ -513,7 +513,7 @@ impl Swapchain {
 | `maximumDrawableCount`      | `3`                                | 与 `MAX_FRAMES_IN_FLIGHT` 对齐                                                |
 | `allowsNextDrawableTimeout` | `false`                            | 超时返回 `None` 会让本帧空转；宁可阻塞（同步提交下由 present 节流）           |
 | `displaySyncEnabled`        | `true`                             | 由 CoreAnimation 做 vsync 节流（等价 D3D12 的 `sync_interval = 1`）           |
-| `drawableSize`              | `(size.0 × scale, size.1 × scale)` | **物理像素**；`contentsScale` 不参与渲染尺寸                                  |
+| `drawableSize`              | **真实 backing**（`convertSizeToBacking` round，2026-11-15 起） | **物理像素**；`contentsScale` 不参与渲染尺寸；不再用 `size × scale` 派生（F-187） |
 | `presentsWithTransaction`   | 默认 `false`                       | 渲染与图层提交解耦（性能）                                                    |
 
 **无局部 present（定死）**：`nextDrawable()` 的 3 张纹理由系统轮转，**跨帧内容无保证** ⇒ 每帧必须写满整面：
@@ -522,11 +522,15 @@ impl Swapchain {
 `nextDrawable() == None`（drawable 池被占满）⇒ **本帧跳过**（不录 GPU 工作、不推进 `FrameIndex` 的 GPU 部分，
 但 `FrameIndex` 已递增）→ 返回 `Ok(())` 并记 `Section::Present` 为 0；**不**报错（不是失败）。
 
-> **2026-11-15 平台差异（F-186 / S-140）**：Windows 的渲染目标现在是平台层写入的真实客户区
-> （`Window::set_surface`），macOS 仍按 `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸
-> 仍 0×0）。`WindowOptions.background` 在 macOS 只记录、本轮无渲染效果：窗口底色仍由 `NSWindow` /
-> `CAMetalLayer` 决定，`contentsGravity` 默认会缩放图层内容（不是 `SCALING_NONE` 的 1:1）；是否
-> 做等价改造（`contentsGravity` / `drawableSize` 时序）待后续评估，不得把 Windows 的结论外推。
+> **2026-11-15 平台差异（F-186 / F-187 / F-188 / F-189）**：Windows 的渲染目标现在是平台层写入的
+> 真实客户区，macOS 是 `convertSizeToBacking` 的**真实 backing**（同样由 `Window::set_surface` 写入，
+> `frame_rect()` 用 `surface`），两者都覆盖 `set_size` / `set_scale` 先算出的 covering；Linux 仍按
+> `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍 0×0，等价改造未做）。
+> `WindowOptions.background` 在 Windows 与 macOS 生效：macOS 走 layer `backgroundColor`（sRGB CGColor）
+> + persist `clear_color`（linear）+ 创建期 `NSWindow.backgroundColor`（F-188）；图层的
+> `contentsGravity = kCAGravityBottomLeft` 让 resize 期间的旧 drawable 保持 1:1、不再被 CA 缩放
+> （F-187）。`drawableSize` 由真实 backing 写入，不再用 `size × scale` 派生。Linux 的 resize 填充语义
+> 仍由合成器决定，不得把 Windows / macOS 的结论外推。
 
 ### 5.4 `macos/pipeline.rs`
 
@@ -1197,6 +1201,12 @@ metal_layer.setDrawableSize(physical size)
 `makeBackingLayer` 与 `setLayer` 二者只做一份：**用 `makeBackingLayer`**（AppKit 在 `wantsLayer` 转 true 时调用一次），
 `layer` 由 ivars 缓存，`Renderer` 通过 `view.layer()` 拿到它。`CAMetalLayer` 的其余参数见 §5.3。
 
+> **2026-11-15（F-187 / F-188）**：`makeBackingLayer` 里除 §5.3 的参数外还写
+> `contentsGravity = kCAGravityBottomLeft`（flipped view 下 = 视觉左上）与 `backgroundColor`
+> （sRGB `CGColor`，旧 drawable 之外的条带）。`contentsScale` / `drawableSize` 的初值只是建窗值：
+> `NativeWindow::sync_state` 每轮用 `convertSizeToBacking(view.bounds.size)`（round）重算，经
+> `Window::set_surface` 写进图层（先刷新图层、再 early-return）；GPU 线程不写任何图层属性。
+
 **事件收集**：`GuiView` 只把事件 push 进 `ViewIvars.events`（`RefCell<Vec<Event>>`），**不碰 `App`**
 （与 Win32 `WndProc` 同一纪律：平台回调里没有 `&mut App`）。泵在 `WakeSource` 回调里 drain 并 dispatch。
 
@@ -1218,16 +1228,23 @@ metal_layer.setDrawableSize(physical size)
 > feature 提供**
 > （probe 实测），但 P12 刻意走通知而不是 delegate：`App` 的生命周期由泵掌握，delegate 会引入第二个回调入口。
 
-> **2026-11-15（F-186 / S-140）**：上表的尺寸回读仍只写逻辑尺寸（`Window::set_size`）；macOS 的
-> 渲染目标继续由 `frame_rect()` 按 `size × scale` 的 covering 推导（Windows 已改为平台层写入的真实
-> 客户区）。`WindowOptions.background` 在 macOS 只记录，本轮不改渲染行为。
+> **2026-11-15（F-186 / F-187 / F-188 / F-189）**：尺寸回读仍是逻辑尺寸（`Window::set_size`），但
+> macOS 的渲染目标已是平台层写入的**真实 backing**：`sync_state` 在 Dpi / Resized 之后调
+> `convertSizeToBacking` 并 `Window::set_surface(backing)`（先刷新 `contentsScale` / `drawableSize`，
+> 再走同值 early-return），`frame_rect()` 因此与 Windows 一样用 `surface`（Linux 仍是 covering）。
+> `WindowOptions.background` 在 macOS 生效：创建期写 `NSWindow.backgroundColor`（首帧前的底色），
+> 运行期写 layer（sRGB）与 persist clear（linear）。
 
 ### 7.4 `macos/dpi.rs`
 
 ```rust
 pub(crate) fn scale_from(backing_scale_factor: f64) -> Result<Scale, EngineError>;   // Scale::new(f32) → None ⇒ InvalidDpiScale { factor }
-pub(crate) fn physical(size: Size, scale: Scale) -> (u32, u32);                       // covering，至少 1 px
 ```
+
+> **2026-11-15（F-187）**：`dpi::physical(size, scale)` 已删除 —— 物理像素不再由 `size × scale` 的
+> covering 推导，而是 `NativeWindow::backing_size()`
+> （`view.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px）。`scale_from` /
+> `dpi_from_scale` 不变。
 
 - 事件：`viewDidChangeBackingProperties` / `NSWindowDidChangeBackingPropertiesNotification` ⇒
   `Event::DpiChanged { dpi: (scale*96).round() as u32, scale }`（`dpi` 只为与 Win32 的字段对齐；引擎只读 `scale`）。
@@ -1436,9 +1453,11 @@ pub(crate) struct NativeSurface {
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |
 | 键盘焦点 | `wl_keyboard::Event::Enter/Leave` ⇒ `FocusChanged { focused }`                                                                        |
 
-> **2026-11-15（F-186 / S-140）**：Linux 的渲染目标仍是 `physical = (logical × scale)` 的 covering
-> （`frame_rect()` 保持旧值；Windows 已改为真实客户区）。`WindowOptions.background` 在 Linux 只记录、
-> 本轮无渲染效果；resize 期间新暴露区域的填充语义由合成器决定（本引擎不做等价 `SCALING_NONE` 改造）。
+> **2026-11-15（F-186 / F-189 / V-121）**：Linux 的渲染目标仍是 `physical = (logical × scale)` 的
+> covering（`frame_rect()` 保持旧值；Windows 与 macOS 已改为平台真值），`WindowOptions.background`
+> 在 Linux 只记录、无渲染效果；resize 期间新暴露区域的填充语义由合成器决定。**等价改造仍未做**
+> （`frame_rect` / `set_surface` / 背景色 / live-resize 条带），留待下一提交；不得把 Windows 的
+> `SCALING_NONE` 或 macOS 的 `kCAGravityBottomLeft` 结论外推。
 
 ### 8.4 `linux/dpi.rs`
 

@@ -137,7 +137,7 @@ impl GpuRenderer {
     /// 用**硬件**设备：WARP 设备不能 present 到 HWND（本机实测 `Present1` 直接
     /// `DXGI_ERROR_DEVICE_REMOVED`），因此无硬件设备的 CI 上由调用方跳过。
     ///
-    /// `background` 是 sRGB 编码的 RGBA（`renderer::background_rgba` 的输出；`SCALING_NONE` 下
+    /// `background` 是 sRGB 编码的 RGBA（`render::color::background_srgb` 的输出；`SCALING_NONE` 下
     /// resize 期间新暴露的客户区由它填充）。
     pub(crate) fn new_for_hwnd(
         hwnd: isize,
@@ -1889,8 +1889,8 @@ mod tests {
         .expect("hidden window");
 
         // 背景色原样传给 DXGI（`[0.25, 0.5, 0.75, 1.0]` 精确可表示）：本测试只验证
-        // `SetBackgroundColor` / `GetBackgroundColor` 的 round-trip，不覆盖 `background_rgba`
-        // 的 sRGB 编码语义（那由 renderer.rs 的单测负责）。
+        // `SetBackgroundColor` / `GetBackgroundColor` 的 round-trip，不覆盖 `background_srgb`
+        // 的 sRGB 编码语义（那由 render/color.rs 的单测负责）。
         let background = [0.25, 0.5, 0.75, 1.0];
         let Ok(mut renderer) = GpuRenderer::new_for_hwnd(hwnd.0 as isize, (64, 64), background)
         else {

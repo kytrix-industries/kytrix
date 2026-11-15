@@ -48,9 +48,10 @@ use crate::render::macos::readback::ReadbackImage;
 use crate::render::timer::Section;
 use crate::{
     error::EngineError,
-    paint::atlas::AtlasKind,
+    paint::{atlas::AtlasKind, color::Color},
     render::{
         DirtyRows, RenderStats,
+        color::background_linear,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         macos::{
@@ -122,19 +123,23 @@ impl Renderer {
     /// 真实窗口：主线程建图层（GPU 侧对象随后整体移交），建 `CAMetalDisplayLink` 并挂到
     /// 主 run loop 的 common modes。
     ///
+    /// `background` 同时写进图层的 `backgroundColor`（sRGB，旧 drawable 之外）与 persist 的
+    /// clear color（linear，新 drawable 内部）。
+    ///
     /// # Errors
     /// 设备 / 管线创建失败、`CAMetalDisplayLink` 无法创建（`AppInit`），或 GPU 线程无法启动。
     pub(crate) fn new_for_layer(
         size: (u32, u32),
         scale: f64,
         max_frame_rate: f32,
+        background: Color,
     ) -> Result<Self, EngineError> {
         let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
             detail: SmolStr::new_static("CAMetalDisplayLink requires the main thread"),
         })?;
         let device = Device::new()?;
-        let layer = swapchain::new_layer(&device, size, scale)?;
-        let gpu = GpuRenderer::new_window(device, size)?;
+        let layer = swapchain::new_layer(&device, size, scale, background)?;
+        let gpu = GpuRenderer::new_window(device, size, background_linear(background))?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(
                 mtm,
@@ -212,6 +217,15 @@ impl Renderer {
     pub(crate) fn set_layer_scale(&mut self, surface: (u32, u32), scale: f32) {
         if let RenderTarget::Window(window) = &mut self.target {
             window.set_layer_scale(surface, scale);
+        }
+    }
+
+    /// 改窗口背景色（主线程）：layer 立刻写；persist 的 clear color 交给 GPU 线程。
+    ///
+    /// 离屏目标没有背景色（从不 present），是 no-op。
+    pub(crate) fn set_background_color(&mut self, color: Color) {
+        if let RenderTarget::Window(window) = &mut self.target {
+            window.set_background_color(color);
         }
     }
 
@@ -365,7 +379,7 @@ struct WindowRenderer {
     /// `delegate` 是 **weak** 属性（objc2 与 Apple 文档都如此）：必须由门面持有强引用，
     /// 否则回调会打在已释放的对象上（§5.1）。
     _delegate: Retained<DisplayLinkDelegate>,
-    /// 最近一次**发布**的目标尺寸（`publish` 里更新）。
+    /// 最近一次**发布**的目标尺寸（`publish` 里更新；macOS 是 `Window.surface` 的真实 backing）。
     surface: (u32, u32),
     /// 最近一次写进图层的物理尺寸 / DPI（避免每帧重复写 CA 属性，§5.3）。
     layer_size: (u32, u32),
@@ -453,6 +467,15 @@ impl WindowRenderer {
         swapchain::set_layer_size(&self.layer, size, scale);
         self.layer_size = size;
         self.layer_scale = scale;
+    }
+
+    /// 先写主线程独占的图层背景色，再把 persist 的 clear color（linear）交给 GPU 线程。
+    ///
+    /// 顺序不能反：图层属性只能在主线程写，而 GPU 线程一被唤醒就要读共享槽；两者都来自同一个
+    /// `Color`，所以条带颜色永远一致。
+    fn set_background_color(&self, color: Color) {
+        swapchain::set_layer_background(&self.layer, color);
+        self.shared.set_background(background_linear(color));
     }
 
     fn sync_pacing(&mut self, continuous: bool) {
@@ -565,6 +588,8 @@ struct State {
     shutdown_at: Option<Instant>,
     /// GPU 线程已经退出（`publish` 从此是 no-op）。
     terminated: bool,
+    /// 待应用的 persist clear color（linear；最新者胜，GPU 线程空闲 / 取帧后都会取走）。
+    background: Option<[f32; 4]>,
 }
 
 impl State {
@@ -581,18 +606,24 @@ impl State {
             shutdown: false,
             shutdown_at: None,
             terminated: false,
+            background: None,
         }
     }
 
-    /// GPU 线程的等待条件：有完成通知 / 有帧且有 drawable / 关闭且已无在飞帧。
+    /// GPU 线程的等待条件：有完成通知 / 有帧且有 drawable / 有待应用背景色 / 关闭且已无在飞帧。
     ///
     /// 关闭开始后不再开新帧：只等完成通知（`in_flight` 归零或有通知可 drain）。否则残留的
     /// 「待画帧 + drawable」会让循环空转，也会让 [`Shared::wait_for_work`] 的 grace 永远不生效。
+    ///
+    /// 待应用背景色也是工作：`set_background` 用 condvar 唤醒，若等待条件不看它，这次唤醒会
+    /// 被当作伪唤醒直接睡回去，颜色永远不落地（Windows 的事件句柄没有这个问题）。
     fn has_work(&self) -> bool {
         if self.shutdown {
             return self.in_flight == 0 || !self.completions.is_empty();
         }
-        !self.completions.is_empty() || (self.frame.has_pending() && self.drawable.is_some())
+        !self.completions.is_empty()
+            || self.background.is_some()
+            || (self.frame.has_pending() && self.drawable.is_some())
     }
 }
 
@@ -670,9 +701,10 @@ fn pacing_paused(continuous: bool, pending_frame: bool, in_flight: usize) -> boo
 
 /// 请求的目标尺寸与 drawable 的实际尺寸是否一致（容差 1 px）。
 ///
-/// 1 px 只用于吸收 DPI / 图层取整：`set_layer_scale` 写的是 `surface × scale` 的 covering
-/// 结果，drawable 纹理由图层按同一个 `drawableSize` 分配，理论上逐像素相等；差 1 px 不值得
-/// 再等一个 vsync（真差一整个 layout 时差值远大于 1）。
+/// 1 px 只用于吸收 DPI / 图层取整：`set_layer_scale` 写的 `drawableSize` 就是
+/// `Window.surface`（macOS 是 AppKit 的真实 backing），drawable 纹理由图层按同一个
+/// `drawableSize` 分配，理论上逐像素相等；差 1 px 不值得再等一个 vsync（真差一整个 layout
+/// 时差值远大于 1）。
 fn surface_within_tolerance(requested: (u32, u32), drawable: (u32, u32)) -> bool {
     requested.0.abs_diff(drawable.0) <= 1 && requested.1.abs_diff(drawable.1) <= 1
 }
@@ -683,6 +715,10 @@ enum SurfaceVerdict {
     /// 尺寸一致（或没有待画帧）：按正常路径绘制。
     Ready,
     /// 还不值得退化：丢弃这个陈旧 drawable、跳过本 vsync，等下个 vsync 的新 drawable。
+    ///
+    /// 视觉正确：图层 `contentsGravity = bottomLeft`（flipped NSView 下即视觉左上）让旧
+    /// drawable 保持 1:1（不缩放），`backgroundColor` 补齐新暴露的条带，所以跳过一个 vsync
+    /// 不会看到拉伸/发虚。
     Skip,
     /// 粘性退化：按 drawable 实际尺寸全量绘制，直到请求尺寸重新落在容差内。
     Degraded,
@@ -766,6 +802,22 @@ impl Shared {
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
         state.atlas.queue(kind, pixels, rows);
+    }
+
+    /// 排队一笔 persist clear color（最新者胜）：GPU 线程空闲或录制下一帧前应用。
+    fn set_background(&self, linear: [f32; 4]) {
+        let mut state = self.lock();
+        if state.shutdown || state.terminated {
+            return;
+        }
+        state.background = Some(linear);
+        drop(state);
+        self.wake();
+    }
+
+    /// 取走待应用的 clear color（取一次清空）。
+    fn take_background(&self) -> Option<[f32; 4]> {
+        self.lock().background.take()
     }
 
     /// display link delegate（主线程）：把这一帧的 drawable 放进最新 drawable 槽并唤醒 GPU 线程。
@@ -969,6 +1021,10 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
     let mut surface = SurfaceMismatch::new();
     loop {
+        // 空闲等待前应用一次待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
+        if let Some(linear) = shared.take_background() {
+            renderer.set_background_color(linear);
+        }
         if shared.wait_for_work() == WaitOutcome::TimedOut {
             // 驱动没有回调完成：继续等会让 `Drop` 的 `join` 永久挂住 UI。Metal 的命令缓冲自己
             // 持有资源引用，退出时释放 device/queue 不会 UAF。
@@ -1030,6 +1086,10 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
             renderer.release_upload_slot();
             continue;
         };
+        // 等 drawable / 配额期间到达的背景色：与帧一起落地（仍是录制前，不引入新的 GPU 调用点）。
+        if let Some(linear) = shared.take_background() {
+            renderer.set_background_color(linear);
+        }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
@@ -1378,6 +1438,40 @@ mod tests {
         assert_eq!(frame.index.get(), 7);
         assert_eq!(frame.surface, (1800, 1400), "请求本身的目标尺寸不改");
         assert_eq!(shared.published_surface(), None);
+    }
+
+    /// 背景色是 condvar 的等待条件之一：没有它，`set_background` 的唤醒会被当成伪唤醒睡回去。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pending_background_color_wakes_the_gpu_loop() {
+        let shared = Shared::new();
+        assert!(!shared.lock().has_work(), "空闲：没有工作");
+        shared.set_background([0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(
+            shared.wait_for_work(),
+            WaitOutcome::Work,
+            "待应用背景色必须让 GPU 线程从等待中返回"
+        );
+        assert_eq!(shared.take_background(), Some([0.25, 0.5, 0.75, 1.0]));
+        assert_eq!(shared.take_background(), None, "取一次清空");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_background_change_after_shutdown_or_termination_is_dropped() {
+        let shared = Shared::new();
+        shared.request_shutdown();
+        shared.set_background([1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            shared.take_background(),
+            None,
+            "GPU 线程在应用背景色之前已退出"
+        );
+
+        let terminated = Shared::new();
+        terminated.mark_terminated();
+        terminated.set_background([0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(terminated.take_background(), None);
     }
 
     /// 完成回调乱序时，反馈必须按**提交顺序**发布：第 2 帧先完成不能先发布，第 1 帧完成后

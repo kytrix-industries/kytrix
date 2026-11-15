@@ -83,7 +83,15 @@ impl NativeWindow {
         // （实测：view/layer 已 1680×1050，屏幕仍显示旧 960×740 快照）。引擎自己画满背景，
         // 不需要窗口透明。
         window.setOpaque(true);
-        window.setBackgroundColor(Some(&NSColor::blackColor()));
+        // 首帧（layer 第一次 present）之前由 AppKit 填底色；与 layer 背景色同源（sRGB）。
+        let [red, green, blue, _] = crate::render::color::background_srgb(options.background);
+        let background = NSColor::colorWithSRGBRed_green_blue_alpha(
+            f64::from(red),
+            f64::from(green),
+            f64::from(blue),
+            1.0,
+        );
+        window.setBackgroundColor(Some(&background));
         window.setAcceptsMouseMovedEvents(true);
         window.setContentMinSize(NSSize::new(
             f64::from(MIN_SIZE_LOGICAL.0),
@@ -168,9 +176,16 @@ impl NativeWindow {
         self.logical_size
     }
 
-    /// 物理像素尺寸（建渲染器 / resize 的唯一输入）。
-    pub(crate) fn physical_size(&self) -> (u32, u32) {
-        dpi::physical_size(self.logical_size, self.scale)
+    /// 真实 backing 像素尺寸（`Window.surface` / `CAMetalLayer.drawableSize` 的唯一整数）。
+    ///
+    /// `convertSizeToBacking(view.bounds.size)` 是 AppKit 实际分配的像素数（round，不是 ceil；
+    /// 至少 1 px）；`size × scale` 的 covering 只是布局估算，半像素对齐时可能差 1 px。
+    pub(crate) fn backing_size(&self) -> (u32, u32) {
+        let backing = self.view.convertSizeToBacking(self.view.bounds().size);
+        (
+            (backing.width.round() as u32).max(1),
+            (backing.height.round() as u32).max(1),
+        )
     }
 
     /// 窗口所在屏幕的最大刷新率（display link 的 `preferredFrameRateRange` 上界，§5.3）。
@@ -194,6 +209,8 @@ impl NativeWindow {
         dispatcher: &std::sync::Arc<Dispatcher>,
     ) -> Result<(), EngineError> {
         let mut events: Vec<Event> = Vec::new();
+        // 真实 backing 每轮算一次：Dpi / Resized 都要把它写进渲染目标（与事件顺序无关）。
+        let backing = self.backing_size();
         let factor = self.window.backingScaleFactor();
         if (factor - self.seen_scale).abs() > f64::EPSILON {
             let scale = dpi::scale_from(factor)?;
@@ -202,6 +219,8 @@ impl NativeWindow {
             self.view.set_scale(factor);
             if let Some(window) = app.window_mut(self.id) {
                 window.set_scale(scale);
+                // DPI 变化但 surface 恰好相同时也要刷新 `contentsScale`（`set_surface` 内部先写图层）。
+                window.set_surface(backing);
             }
             events.push(Event::DpiChanged {
                 dpi: dpi::dpi_from_scale(scale),
@@ -217,6 +236,8 @@ impl NativeWindow {
             self.logical_size = logical;
             if let Some(window) = app.window_mut(self.id) {
                 window.set_size(logical);
+                // `set_size` 先按 covering 重算；这里覆盖成 AppKit 的真实 backing。
+                window.set_surface(backing);
             }
             events.push(Event::Resized { size: logical });
         }

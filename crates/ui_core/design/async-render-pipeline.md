@@ -1,8 +1,8 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-186）。
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-189）。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-186（§27–§31）、`macos-verification.md` §2.9/§2.11
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-189（§27–§32）、`macos-verification.md` §2.9/§2.11/§2.12
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -172,7 +172,8 @@ completed handler），按提交顺序发布，允许覆盖尚未被 UI 线程�
 
 `FrameRequest.scale` 已删除：三个平台都没有功能消费者（只在 GPU 线程做过 `scale > 0` 的
 debug 断言）。DPI 的跨线程传递只保留 macOS 的 `set_layer_scale(surface, scale)`（主线程写
-CA 图层，§5.3）。
+CA 图层，§5.3）；macOS 的真实像素尺寸不再靠 `scale` 乘出来，而是随 `surface`（真实 backing，
+F-187）一起过线。
 
 `FrameOutcome::Committed(index)` 的语义随之变成「**已交付 GPU 线程**」（不等于已呈现；纯 Idle
 计划被门禁跳过时也不会交付）；窗口路径的 `RenderStats`/GPU 采样从 `poll()` 取（落后 ≤1 帧），
@@ -208,11 +209,11 @@ UI 线程 `publish`：
 
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
-- **surface 的定义分平台**：Windows = 平台层给的**真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS/Linux = `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍是 0×0）。
+- **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍是 0×0；等价改造未做）。
 - 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
-- **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 走 `set_layer_scale`（§5.3），Windows/Linux 的物理像素由平台层算好后再作为 `surface` 出现。
+- **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
-- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`（Windows 与 macOS/Linux 各一份 `#[cfg]` 实现，F-186）。
+- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`，它有三份 `#[cfg]` 实现（Windows / macOS = `surface`，Linux = covering 原值，F-186 / F-189）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
 
@@ -281,7 +282,8 @@ loop {
 
     // ① 尺寸校验必须在**占槽与取帧之前**（F-172）：drawable 可能还是上一轮 layout 的产物。
     //    不一致（>1 px，吸收 DPI 取整）⇒ 丢弃这个陈旧 drawable、跳过本 vsync，帧留在最新帧槽
-    //    （pending 让 display link 保持运行）。连续 4 个 vsync 仍不一致 ⇒ **粘性退化**（F-179）：
+    //    （pending 让 display link 保持运行）。Skip 视觉正确：旧 drawable 按 bottomLeft 贴视觉左上、
+    //    保持 1:1，新条带由图层背景色补齐（§5.4）。连续 4 个 vsync 仍不一致 ⇒ **粘性退化**（F-179）：
     //    之后每个 vsync 都按 drawable 尺寸全量画，直到请求尺寸重新落回容差内；诊断只打印一次。
     let verdict = mismatch.observe(shared.published_surface(), target);   // Ready / Skip / Degraded
     if verdict == Skip { continue }
@@ -313,11 +315,14 @@ loop {
 
 - `CAMetalDisplayLink::initWithMetalLayer:`（macOS 14.0+）在**主线程**创建；`setDelegate:`；`addToRunLoop:forMode:` 挂主 run loop 的 **common modes**（`NSRunLoopCommonModes`），目的是让 live resize（AppKit 在 `NSEventTrackingRunLoopMode` 里跑）与全屏转场期间仍然回调（[add(to:forMode:)](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/add(to:formode:))；**该行为由 §11 探针 1 实测**）。
 - **部署目标必须提升到 macOS 14.0**（`CAMetalDisplayLink` 的可用性）；在 `.cargo/config.toml` 设 `MACOSX_DEPLOYMENT_TARGET=14.0`，打包的 `LSMinimumSystemVersion` 同步到 14.0。旧系统不支持是产品决策，不做运行期可用性分支（AGENTS §1.1）。
-- `preferredFrameRateRange`：`CAFrameRateRange::new(30.0, screen.maximumFramesPerSecond, screen.maximumFramesPerSecond)`；系统可能因低电量/散热下调，按系统给的来。`preferredFrameLatency` 不设（文档无语义细节）。
-- 图层属性（唯一写者 = 主线程）：
-  - `contentsScale`、`drawableSize` 在**平台层同步窗口状态时**写（`NativeWindow::sync_state` 已知 size/scale，`renderer.set_layer_scale(surface, scale)`）；
+- `preferredFrameRateRange`：`CAFrameRateRange::new(30.0, screen.maximumFramesPerSecond, screen.maximumFramesPerSecond)`；系统可能因低电量/散热下调，按系统给的来。`preferredFrameLatency` 不设（文档无语义细节；本轮未验，V-121）。
+- 图层属性（唯一写者 = 主线程；GPU 线程一个都不碰）：
+  - `contentsGravity = kCAGravityBottomLeft`：**live resize 的关键一条**。默认 `resize` 会在 AppKit 已放大 layer bounds、而 `drawableSize` 还是旧值时把旧 drawable 拉伸/发虚（F-187）。本视图 `isFlipped = true`，CA 的 `bottomLeft` 才是**视觉左上**；实测 `TopLeft` 会把旧内容贴到左下、条带出现在上/右侧。
+  - `backgroundColor` = sRGB `CGColor`（alpha 1）：旧 drawable **之外**、AppKit 刚暴露的新条带由它填（F-188 / S-141）。新 drawable **内部**的条带由 persist 的 clear color（linear）填，两处来自同一个 `Color`。
+  - `contentsScale` / `drawableSize` = **真实 backing**：`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值（不是 ceil，至少 1 px），由 `NativeWindow::sync_state` 每轮算一次，Dpi / Resized 之后经 `Window::set_surface` 写进图层（macOS 上 `set_surface` **先**刷新图层、再走同值 early-return）；`Window.surface` 与 `drawableSize` 是同一个整数（F-187 / F-189）。`drawableSize` **不**由 AppKit 依 bounds × scale 派生（旧文档的错误说法），也不用布局 covering。
+  - `submit_gpu` 仍会在发布前调 `renderer.set_layer_scale(surface, scale)`：`surface` 此时已是平台真值，这条只作「发布的目标尺寸与图层一致」的安全网（例如平台层还没跑过 `sync_state` 的首帧）。
   - 不再由 GPU 线程写（消除今天未定义行为的跨线程写）。
-- `presentsWithTransaction = false`（默认，异步呈现）、`displaySyncEnabled = true`（默认，vsync）、`framebufferOnly = false`（需要 blit 进 drawable）、`maximumDrawableCount = 3`（只允许 2 或 3）。
+- 图层的其余参数：`opaque = true`（`CAMetalLayer` 默认就是 true，仍显式写）、`masksToBounds` 默认 false 不改、`presentsWithTransaction = false`（默认，异步呈现）、`displaySyncEnabled = true`（默认，vsync）、`framebufferOnly = false`（需要 blit 进 drawable）、`maximumDrawableCount = 3`（只允许 2 或 3）、`allowsNextDrawableTimeout` 不写（`nextDrawable` 已删除，drawable 来自 display link，F-166）。
 - `sync_pacing(continuous)`（主线程调用，每次泵一轮）：
   - 需要跑：`continuous || 有未取走的帧请求 || 有在飞帧` ⇒ `setPaused(false)`；
   - 否则 `setPaused(true)`（空闲时 0 唤醒）。
@@ -325,11 +330,13 @@ loop {
 
 ### 5.4 resize / DPI
 
-- 窗口尺寸变化：平台层 `sync_state` 读 AppKit 的 frame/backing scale → 主线程写 `drawableSize`/`contentsScale` → 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
+- 窗口尺寸变化：平台层 `sync_state` 用 `NSView.convertSizeToBacking(view.bounds.size)` 读**真实 backing**（round）→ 先 `set_size`（逻辑尺寸：布局/覆盖重算）→ 再 `set_surface(backing)`（刷新 `contentsScale`/`drawableSize`，并把 `Window.surface` 覆盖成真值）→ 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
 - 不等待任何在飞帧：旧 persist 被在飞命令缓冲引用，由 retire 在完成后释放；GPU 线程立即改用新 persist。
-- drawable 尺寸与请求尺寸可能差一帧（AppKit 已改、UI 还没发布新 surface）：GPU 线程在**占槽与取帧之前**比较两者（1 px 容差吸收 DPI 取整）；不一致就丢弃陈旧 drawable、跳过本 vsync，帧留在最新帧槽（F-172）。persist 尺寸与 `Full` 判定以最终采用的 drawable 尺寸为准。
+- drawable 的实际尺寸 = 真实 backing：`drawableSize` 写的就是 `Window.surface` 的那个整数（[CAMetalLayer.drawableSize](https://developer.apple.com/documentation/quartzcore/cametallayer/drawablesize)），不是 `bounds × contentsScale` 的派生值。AppKit 已改 bounds、UI 还没发布新 surface 时两者仍可能差一帧：GPU 线程在**占槽与取帧之前**比较（1 px 容差吸收 DPI 取整）；不一致就丢弃陈旧 drawable、跳过本 vsync，帧留在最新帧槽（F-172）。persist 尺寸与 `Full` 判定以最终采用的 drawable 尺寸为准。
+- **`Skip` 在 `bottomLeft` + `backgroundColor` 下视觉正确**（F-187 / F-188）：旧 drawable 保持 1:1 贴在视觉左上，新暴露的右/下区域由图层背景色补齐，所以跳一个 vsync 不会看到拉伸/发虚——这是 F-172 状态机**不改**的前提。实测（macOS 15.8.1 / Iris Plus 655 / 2x）：旧 HEAD `8598fe398` 的 stale 卡片 1624×430（1.466×/1.229× 非等比、文字 Laplacian -22%）；新代码 1108×350（1.000×/1.000× = 静止尺寸）、贴左上（y0 = 128/129、h = 174/175，连续 sweep 恒定）、卡片文字 808 vs 800（+1%）、标题 3272 vs 3279（-0.2%）、条带 RGB (13,15,19)/(14,15,19) 对静止背景 (12,14,18)（Δ≤1）。`Degraded` 只作活性保底：持续 >1 px 不一致时按 drawable 尺寸全量画，不至于永久停更。
+- 缩小时旧 drawable 比 layer 大：`bottomLeft` 锚定下右/下被裁切（旧内容仍是 1:1，不出黑边/拉伸）；放大时新条带 = 背景色。两者都是接受的行为（§10.2）。
 - 连续 4 个 vsync 仍不一致 ⇒ **粘性退化**（F-179）：此后每个 vsync 都按 drawable 尺寸全量渲染，直到请求尺寸重新落回容差内，诊断每次退化 episode 只打印一次。`Partial` 的 scissor 会夹到目标尺寸，零面积矩形直接跳过（1 px 容差下 0 宽 scissor 会被 Metal validation 拒绝）。
-- DPI 变化但物理尺寸不变：`set_layer_scale` 更新 `contentsScale`，`drawableSize` 由 AppKit 依 bounds×scale 派生（若派生滞后，下一帧按实际 drawable 尺寸重建）。
+- DPI 变化但物理像素不变：`set_surface` 的图层刷新在「同值 early-return」**之前**，`contentsScale` 一定更新；`drawableSize` 不变（像素数没变），drawable 不需要重建。
 
 ### 5.5 空闲与连续帧
 
@@ -381,8 +388,8 @@ waitable = chain2.GetFrameLatencyWaitableObject();
 ```
 
 - `DXGI_SCALING_NONE`（[DXGI_SCALING](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling)）：resize 期间 DWM **不**把旧 buffer 拉伸到新客户区，新暴露的右/下区域由 [`IDXGISwapChain1::SetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-setbackgroundcolor) 填充。旧的 `STRETCH` 实测在 300×200 跳变时把整帧放大 1.25×（card 907×269）、文字发虚（F-184）。
-- **背景色编码（实测偏差，S-139）**：官方说 “we recommend that you perform floating point operations in a linear color space”，但在本路径（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE` 的 HWND swapchain）上 `DXGI_RGBA` 的 float **按 sRGB 编码字节直写**：传 linear 值得到 `(1,1,2)`，传 sRGB 编码分量得到 `(11,14,19)`（= `#0B0E13`）。实现固定走 `Color` → 不透明化（alpha=1、不改 RGB）→ `ColorResolver::resolve`（linear、alpha=1 ⇒ 非预乘）→ IEC 61966-2-1 linear→sRGB encode → `DXGI_RGBA`（alpha=1），见 `render/windows/renderer.rs::background_rgba`。
-- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；仅 Windows 影响窗口底色，demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；下一次 `Present1` 生效，§6.3）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。
+- **背景色编码（实测偏差，S-139）**：官方说 “we recommend that you perform floating point operations in a linear color space”，但在本路径（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE` 的 HWND swapchain）上 `DXGI_RGBA` 的 float **按 sRGB 编码字节直写**：传 linear 值得到 `(1,1,2)`，传 sRGB 编码分量得到 `(11,14,19)`（= `#0B0E13`）。实现固定走共享的 `render/color.rs::background_srgb`（`Color` → 不透明化（alpha=1、不改 RGB）→ `ColorResolver::resolve`（linear、alpha=1 ⇒ 非预乘）→ IEC 61966-2-1 linear→sRGB encode → `DXGI_RGBA`（alpha=1））；macOS 的 `NSColor`/`CGColor` 复用同一个函数（S-141）。
+- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；Windows / macOS 影响窗口底色，Linux 只记录、后续接；demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；Windows 下一次 `Present1` 生效，§6.3）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。macOS 的对应契约见 §5.3（layer sRGB + clear linear + `NSWindow` 创建期，F-188）。
 - 保留 `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy dirty 区）与 `FRAME_LATENCY_WAITABLE_OBJECT`（§6.3 每帧等一次）。
 - 该 flag 让 swapchain **自带有独立的最大排队帧信号量**；不设时同一进程内所有 swapchain 共享同一个隐式帧延迟计数（Chromium 的实测结论，见 [Chromium issue 40890504](https://issues.chromium.org/issues/40890504)）。
 - 官方要求：**每帧开始渲染前等待该句柄，包括第一帧**（[GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)）。等待发生在 GPU 线程，不违反 I1。
@@ -510,7 +517,7 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 - `WM_SIZE`/`WM_DPICHANGED`：更新 `Window` 的 size/scale 与**真实客户区 surface**（`set_surface`；`WM_SIZE` 的 lParam 就是新客户区的物理宽高，`WM_DPICHANGED` 回读 `client_size()` 且最小化时用 `IsIconic` 跳过），然后 `dispatcher.wake()`。GPU 线程的目标尺寸由下一帧的 `FrameRequest.surface` 派生（§4.4）。
 - 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
-- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。macOS/Linux 只记录参数，本轮无渲染效果（S-140）。
+- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。编码走共享 `render/color.rs::background_srgb`（S-139）。macOS 已接同一契约（layer sRGB + clear linear，F-188 / S-141），Linux 只记录参数、本轮无渲染效果（S-140）。
 - **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
 - 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
 
@@ -698,10 +705,11 @@ UI 线程上没有任何一行等待。
 | `render/linux/renderer.rs` **新增** | 门面（同 Windows） |
 | `render/macos/renderer.rs` | 重写：display link 委托 + 最新帧/最新 drawable 槽 + GPU 循环；删除 mailbox 的 `requeue/wait_retry/poll_completed` |
 | `render/macos/queue.rs` | 删除 `Submitted` 轮询与 `waitUntilCompleted` 背压；`begin` 只取槽；`submit` 只 commit；完成走 `addCompletedHandler` |
-| `render/macos/swapchain.rs` | 删除 `next_drawable`；加 display link 相关（或移到 `renderer.rs`）；保留 `drawableSize`/`scale` 设置（改由主线程调用） |
-| `render/macos/compositor.rs` | `submit_payload` 改为「给定 drawable 渲染」；persist 重建不等待；图层属性写接口移到 `renderer.rs` |
-| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186）与 `background`（F-184） |
-| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7） |
+| `render/macos/swapchain.rs` | 删除 `next_drawable`；加 display link 相关（或移到 `renderer.rs`）；`contentsGravity` / `backgroundColor` / `contentsScale` / `drawableSize` 的唯一写入口（主线程，F-187 / F-188） |
+| `render/macos/compositor.rs` | `submit_payload` 改为「给定 drawable 渲染」；persist 重建不等待；图层属性写接口移到 `renderer.rs`；persist `clear_color` = 背景色 linear（F-188） |
+| `render/color.rs` **新增（2026-11-15）** | 共享背景色编码：`background_srgb`（Windows DXGI / macOS `CGColor`）与 `background_linear`（macOS clear），共用 `opaque + ColorResolver`（F-188 / S-141） |
+| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186 / F-189）与 `background`（F-184 / F-188） |
+| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7）；macOS 在 Dpi / Resized 之后把真实 backing 写进 `Window::set_surface`（§5.3） |
 | `lib.rs` / `render.rs` | 模块声明更新（新增两个 `renderer.rs`） |
 
 ### 9.2 删除（已全部落地：F-164、F-166 … F-182）
@@ -731,7 +739,8 @@ UI 线程上没有任何一行等待。
 |---|---|
 | live resize 连续拖动 2s | UI 线程单次 `frame` 耗时 max < 4ms；无 `ResizeBuffers`/`acquire`/`nextDrawable` 出现在 UI 线程的 sample 里；画面跟随拖动 |
 | live resize 无整帧缩放（Windows，`SCALING_NONE`） | 拖动期间卡片 bbox 恒定（911 帧：725×220，`stretch_w = 1.00000`）、文字/HUD 不缩放且锐度不降；新暴露的右/下区域 = 窗口背景色且 ≤ 2 帧；缩小时右/下裁切、右锚 HUD 滞后 1–2 帧后回位（可接受） |
-| 窗口背景色（`#0B0E13`） | resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照） |
+| live resize 无整帧缩放（macOS，`kCAGravityBottomLeft` + 真实 backing） | stale 帧卡片 bbox = 静止 bbox（1108×350，1.000×/1.000×）并贴**视觉左上**；卡片文字锐度不降（Laplacian 808 vs 800，+1%；旧 HEAD 624，-22%）；新暴露的右/下条带 = 窗口背景色（(13,15,19) ≈ `#0B0E13`，对静止背景 Δ≤1，无黑/白条）；缩小时右/下裁切、放大时新暴露条带 ≤ 1–2 帧；连续 sweep 卡片高 174–175 恒定；最小化 3 s 恢复 1:1、Esc exit 0、stderr 空。**1x / 真实鼠标拖拽未测**（V-121） |
+| 窗口背景色（`#0B0E13`） | Windows：resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照）。macOS：条带 (13,15,19)/(14,15,19)（F-188） |
 | resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface`），5 s 恢复像素差 0.067% |
 | 真实 DPI 150% / 175% | **未实测**（V-120）：本轮实机只跑 125%（DPI=120）；175% 只有 `256.8 × 1.75 = 449.4` 的取整事实（covering 到 450） |
 | 空闲 2s | 0 帧；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程无自旋唤醒 |
@@ -748,7 +757,7 @@ UI 线程上没有任何一行等待。
 
 ---
 
-## 11. 探针与验证项（P0 三项 + Windows resize 追加）
+## 11. 探针与验证项（P0 三项 + Windows / macOS resize 追加）
 
 | # | 假设 | 实验 | 不成立时的结论 |
 |---|---|---|---|
@@ -758,8 +767,14 @@ UI 线程上没有任何一行等待。
 | 4 | `SetBackgroundColor` 的 `DXGI_RGBA` 按 linear 还是 sRGB 编码解释 | 同一 HWND swapchain（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE`）分别传 linear 与 sRGB 编码的主题色，截取 resize 条带像素 | **已实测**：按 sRGB 编码字节直写。linear 值 ⇒ 条带 `(1,1,2)`；sRGB 编码 ⇒ `(11,14,19)`（= `#0B0E13`，229 个新尺寸帧 100% 像素）。官方 “recommend linear” 在本路径不适用 ⇒ S-139 |
 | 5 | `ResizeBuffers` 是否保留背景色 | 创建后设置、`ResizeBuffers` 后 `GetBackgroundColor` 回读 | 官方未承诺；隐藏窗口测试在**重设后**回读 == 设定，无法区分 DXGI 是否保留（未做不重设对照）。实现不依赖：`Swapchain::resize` 后无条件重设（S-139 / V-120） |
 | 6 | `SetMaximumFrameLatency` 的默认值口径 | 读 Set/Get 两份官方文档；创建后 `GetMaximumFrameLatency()` 实机断言 | `IDXGISwapChain2` 的 Set/Get 两页当前都写默认 1（`IDXGIDevice1::SetMaximumFrameLatency` 才是 3；此前记录的「Set 3 / Get 1」冲突未复现）；实现显式 `SetMaximumFrameLatency(1)`，实机 `Get == 1`（F-185 / V-120） |
+| 7 | `contentsGravity` 在 **flipped** `NSView` 下哪个常量才是视觉左上 | 同一窗口、同一 resize 序列分别用 `kCAGravityTopLeft` 与 `kCAGravityBottomLeft`，录屏逐帧看旧内容贴在哪条边、条带出现在哪侧 | **已实测**：`TopLeft` 把旧内容贴左下（条带在上/右），`BottomLeft` 才贴视觉左上（条带在右/下）。结论写进 `LIVE_RESIZE_GRAVITY` 注释与 S-142；不要按「TopLeft = 左上」的字面直觉改 |
+| 8 | macOS 条带颜色与页面背景的 8-bit 差（layer sRGB + clear linear） | resize 帧截取窗口右/下条带与静止页面的同一像素区域，比较 RGB | **已实测**：条带 (13,15,19)/(14,15,19)，静止背景 (12,14,18)，Δ≤1（≈ `#0B0E13`，无黑/白条、无二次编码）。两种编码不能互换（S-141） |
+| 9 | drawable 池重建是否掉帧 / 是否出现拉伸帧 | live resize 连续 sweep 录屏，逐帧量卡片 bbox 与高度 | 录屏 54–58 fps（录屏口径，不是引擎 FPS）；卡片高 174–175 恒定、无拉伸帧；`Skip` 只跳 vsync 不产生拉伸。GPU 侧未单独统计掉帧（HUD FPS 是提交率，不代表呈现） |
+| 10 | display link 在 AppKit 的 resize 期间是否仍回调（common modes） | AX 连续 `setSize`（约 28 ms/步）+ 单次跳变 960×778 → 1400×950，统计每个尺寸是否有新 drawable 被消费 | **已实测**：resize 期间 display link 持续给 drawable（逐档 resize 的 stale 帧只跳一个 vsync，下一次取到的 drawable 就匹配新尺寸）；**真实鼠标拖拽**（`NSEventTrackingRunLoopMode`）与 1x 未验（V-121） |
 
-前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows resize 修复时新增的验证项，结论已写入上表，未闭环部分登记 V-120。
+前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows
+resize 修复时新增的验证项（未闭环部分登记 V-120）；7–10 是同一天 macOS live-resize 修复新增的
+验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项登记 V-121）。
 
 ---
 
@@ -785,7 +800,10 @@ UI 线程上没有任何一行等待。
 
 Metal：
 - [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink)、[Update](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/update)、[add(to:forMode:)](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/add(to:formode:))
-- [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer/)、[nextDrawable](https://developer.apple.com/documentation/quartzcore/cametallayer/nextdrawable/)、[maximumDrawableCount](https://developer.apple.com/documentation/quartzcore/cametallayer/maximumdrawablecount)
+- [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer/)、[drawableSize](https://developer.apple.com/documentation/quartzcore/cametallayer/drawablesize)、[nextDrawable](https://developer.apple.com/documentation/quartzcore/cametallayer/nextdrawable/)、[maximumDrawableCount](https://developer.apple.com/documentation/quartzcore/cametallayer/maximumdrawablecount)
+- [CALayer.contentsGravity](https://developer.apple.com/documentation/quartzcore/calayer/contentsgravity)（默认 `resize`）、[kCAGravityBottomLeft](https://developer.apple.com/documentation/quartzcore/calayercontentsgravity/bottomleft)、[contentsAreFlipped()](<https://developer.apple.com/documentation/quartzcore/calayer/contentsareflipped()>)、[isOpaque](https://developer.apple.com/documentation/quartzcore/calayer/isopaque)、[backgroundColor](https://developer.apple.com/documentation/quartzcore/calayer/backgroundcolor)、[contentsScale](https://developer.apple.com/documentation/quartzcore/calayer/contentsscale)
+- [NSView.convertSizeToBacking: / convertToBacking(_:)](https://developer.apple.com/documentation/appkit/nsview/converttobacking(_:)-4ra9y)、[NSView.isFlipped](https://developer.apple.com/documentation/appkit/nsview/isflipped)
+- [CGColor](https://developer.apple.com/documentation/coregraphics/cgcolor)、[CGColor(srgbRed:green:blue:alpha:)](https://developer.apple.com/documentation/coregraphics/cgcolor/init(srgbred:green:blue:alpha:))
 - [Synchronizing CPU and GPU work](https://developer.apple.com/documentation/metal/synchronizing-cpu-and-gpu-work)、[Triple Buffering](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/TripleBuffering.html)
 - [MTLCommandBuffer addCompletedHandler](https://developer.apple.com/documentation/metal/mtlcommandbuffer/addcompletedhandler(_:))、[presentDrawable](https://developer.apple.com/documentation/metal/mtlcommandbuffer/presentdrawable(_:))
 
@@ -810,7 +828,8 @@ Vulkan / Wayland：
 
 实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；第一轮
 （F-166 … F-175）见 §15.1–§15.4，第二轮（F-176 … F-182）与三平台当前实测数字见
-§15.5–§15.6；F-183 复审与 Windows live-resize（F-184 … F-186 / S-139 / S-140）见 §15.7–§15.9。
+§15.5–§15.6；F-183 复审、Windows live-resize（F-184 … F-186 / S-139 / S-140）与 macOS
+live-resize（F-187 … F-189 / S-141 / S-142）见 §15.7–§15.10。
 
 ### 15.1 本批已闭环
 
@@ -984,4 +1003,45 @@ Windows / 硬件 D3D12 / 3840×2160 @125%，窗口 DPI=120，demo client 1200×9
 | 背景色契约 | `WindowOptions.background`（默认 BLACK、不透明、仅 Windows）+ `set_background_color`；GPU 线程两个应用点，下一次 `Present1` 生效（§6.3 / §6.7） |
 | 实测（125%） | 300×200 跳变：stale 帧 9.4–11.7 ms、卡片恒 725×220、条带 100% `(11,14,19)`（229 帧 / 3 次跳变）、首原生帧 42.3–46.0 ms、HUD lap 4687.5–4696.3；911 帧拖动 `stretch_w = 1.00000`、HUD lap 4707.5–4936.2（静止 4633.7，无下降）；200 次 resize（fails=0，4.58 s）后条带不变；缩小 1500×1125→1350×1000 首帧裁切、~33 ms 后回位；60.2 s soak Latency 1.88–13.23 ms、FPS 63.9/64.0/60.6；最小化 5 s 恢复像素差 0.067%；Esc 关窗 90 ms / exit 0 / stderr 0 字节；无 `0x887A0001`（§10.2 / §11） |
 | 未验证 | 150% / 175% 真实 DPI、最小化 + `WM_DPICHANGED` 组合、`ResizeBuffers` 是否保留背景色、`SetMaximumFrameLatency` 默认值文档口径、HUD FPS 与旧口径 58–60、隐藏窗口测试仍 `#[ignore]`、非 Windows `frame_rect` 0×0 仅编译检查（V-120） |
+
+### 15.10 第六轮闭环（macOS live resize：`kCAGravityBottomLeft` + 真实 backing + 背景色，2026-11-15）
+
+macOS 的 live resize 把旧 drawable 交给 CoreAnimation 缩放：`CAMetalLayer.contentsGravity` 默认
+`resize`，AppKit 在 resize 时同步放大 layer bounds，而 `drawableSize` 不会自动跟随；引擎又在
+`submit_gpu` 用**布局 covering**（`size × scale`）写 `drawableSize`。结果是 stale 帧被 CA 拉伸
+（1.466×/1.229× 非等比）、文字发虚。本轮只改 macOS 窗口路径 + 共享颜色编码；Windows 只把
+`background_rgba` 换成共享的 `render/color.rs::background_srgb`（行为不变），Linux 未做等价改造
+（`frame_rect` 仍是 covering，resize 期间新区域由合成器决定）。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §32（F-187 … F-189 / S-141 / S-142 / V-121）。
+
+| 项 | 结论 |
+|---|---|
+| 根因 | `contentsGravity = resize`（默认）+ AppKit 同步放大 layer bounds + `drawableSize` 不自动跟随 + `submit_gpu` 用布局 covering 写 `drawableSize` ⇒ 旧 drawable 被 CA 缩放 |
+| 贴放 | `contentsGravity = kCAGravityBottomLeft`：本视图 `isFlipped = true`，CA 的 `bottomLeft` 才是视觉左上（`TopLeft` 实测把旧内容贴左下、条带在上/右） |
+| 真实 backing | `NSView.convertSizeToBacking(view.bounds.size)` 的 round 值（不是 ceil）、至少 1 px；`Window.surface` 与 `drawableSize` 是同一个整数；`sync_state` 的 Dpi / Resized 之后 `set_surface`（先刷新图层、再 early-return）；`submit_gpu` 的 `set_layer_scale` 只作安全网 |
+| 背景条 | 两处编码（S-141）：layer `backgroundColor`（sRGB `CGColor`，旧 drawable **之外**）+ persist `clear_color`（**linear**，新 drawable **之内**）+ `NSWindow.backgroundColor`（仅创建期）；`render/color.rs` 共享 `background_srgb` / `background_linear`，Windows 复用前者 |
+| F-172 | 不改：surface = 真实 backing 后 requested/drawable 恒等，resize 瞬间的旧 drawable 走 `Skip`（旧内容 1:1 + 图层背景色），`Degraded` 只作活性保底 |
+| 实测（2x） | 旧 HEAD `8598fe398` stale 卡片 1624×430（1.466×/1.229×、文字 Laplacian -22%）→ 新代码 1108×350（1.000×/1.000×）、贴左上（y0 = 128/129、h = 174/175，连续 sweep 174–175 恒定）、卡片文字 808 vs 800（+1%）、标题 3272 vs 3279（-0.2%）、条带 (13,15,19)/(14,15,19) 对静止 (12,14,18)（Δ≤1）；最小化 3 s 恢复 1:1、Esc exit 0、stderr 空 |
+| 未验证 | 1x 显示模式、真实鼠标拖拽、多显示器 / 混合 DPI、ProMotion、`preferredFrameLatency`、广色域条带接缝 / `layer.colorspace`；Linux 等价改造（V-121） |
+
+- **探针环境与方法**：macOS 15.8.1 / Intel Iris Plus 655 / 内建 2560×1600 @2x；真实窗口 + iTerm2
+  会话录屏（54–58 fps，**录屏口径**、不是引擎 FPS）；AX 连续 `setSize`（约 28 ms/步）与单次跳变
+  960×778 → 1400×950；窗口 client 960×778（含 38 pt 安全区）⇒ 2x backing 1920×1556。判据：录屏
+  逐帧取窗口区域，比较 stale 帧与静止帧的卡片 bbox（倍数）、量卡片文字区域的 Laplacian 方差
+  （锐度）、取新暴露条带与静止背景的 RGB。逐帧证据见
+  [`macos-verification.md`](macos-verification.md) §2.12。
+- **新增 / 迁移单测**：`render/color.rs` 2 条（sRGB 编码那条从 `render/windows/renderer.rs` 迁入，
+  linear clear 新增；两平台共享）、`render/macos/swapchain.rs` 1 条
+  （`LIVE_RESIZE_GRAVITY` 的字面值 == `bottomLeft`）、`render/macos/renderer.rs` 2 条（待应用背景色
+  必须唤醒 GPU 循环；shutdown / terminated 之后丢弃）、`window.rs` 1 条 macOS
+  `frame_rect() == 平台 backing`。macOS 专属用例在 `cfg(target_os = "macos")` 下编译。
+- **落点**：`render/macos/swapchain.rs`（`new_layer` / `LIVE_RESIZE_GRAVITY` / `set_layer_background`
+  / `set_layer_size`）、`render/macos/renderer.rs`（`new_for_layer(background)` /
+  `set_background_color` / `Shared::{set,take}_background` / `has_work`）、
+  `render/macos/compositor.rs`（`clear_color` / `set_background_color`）、`render/color.rs`（新文件）、
+  `platform/macos/window.rs`（`backing_size` / `sync_state` / `NSWindow.backgroundColor`）、
+  `platform/macos/event_loop.rs`（建渲染器用真实 backing、首帧前 `set_surface`）、
+  `platform/macos/dpi.rs`（删 `physical_size`）、`window.rs`（`surface` / `set_surface` /
+  `frame_rect` / `background` 文档与 `cfg(any(windows, target_os = "macos"))`）、
+  `render/windows/{renderer,compositor}.rs`（改用 `background_srgb`，删除 `background_rgba`）。
 

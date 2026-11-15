@@ -108,9 +108,12 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
-    /// 窗口背景色：`DXGI_SCALING_NONE` 下客户区超出 back buffer 的底色（DWM 不再拉伸旧 buffer）。
+    /// 窗口背景色：resize 期间新暴露区域（旧 buffer / 旧 drawable 之外）的底色。
     ///
-    /// 仅 Windows 生效；alpha 忽略（`ALPHA_MODE_IGNORE`）；下一次 `Present1` 生效（通常下一帧）。
+    /// Windows：`DXGI_SCALING_NONE` 下客户区超出 back buffer 的部分由 `IDXGISwapChain1::
+    /// SetBackgroundColor` 填充（sRGB 编码字节）；macOS：`CAMetalLayer.backgroundColor`
+    /// （sRGB `CGColor`）+ persist 的 clear color（linear，Metal sRGB 渲染目标）。
+    /// Linux 本轮只保存参数。alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
     /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
     pub background: Color,
 }
@@ -244,8 +247,9 @@ pub struct Window {
     scale: Scale,
     /// 渲染目标的物理像素尺寸。
     ///
-    /// Windows 是平台层给的真实客户区（`set_surface`）；但 `set_size` / `set_scale` 会先按
-    /// `size × scale` 的 covering 重算一次，平台层随后用真实客户区覆盖。其它平台恒等于 covering。
+    /// Windows 是平台层给的真实客户区（`set_surface`），macOS 是 AppKit 的真实 backing
+    /// （`convertSizeToBacking`，同样由 `set_surface` 写入）；但 `set_size` / `set_scale` 会先按
+    /// `size × scale` 的 covering 重算一次，平台层随后用真值覆盖。Linux 恒等于 covering。
     surface: (u32, u32),
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
@@ -460,19 +464,22 @@ impl Window {
         &self.options
     }
 
-    /// 改窗口背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给 GPU 线程。
+    /// 改窗口背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给平台层。
     ///
     /// Windows 上值变化会标全量重绘：`SetBackgroundColor` 只在下一次 `Present1` 生效，调用方应在
     /// 之后触发一帧（平台事件 / 主题重绘 / 动画 / HUD tick 均可）。GPU 侧在空闲或下一帧录制前应用；
     /// UI 线程只写共享槽并唤醒，不直接调 DXGI（I1）。
     ///
-    /// 仅 Windows 影响窗口底色；其它平台只更新参数（本轮）。
+    /// macOS 上值变化同样标全量重绘：`CAMetalLayer.backgroundColor` 立刻在主线程写，persist 的
+    /// clear color 经共享槽交给 GPU 线程（同样在空闲或下一帧录制前应用）。
+    ///
+    /// Linux 本轮只更新参数。
     pub fn set_background_color(&mut self, color: Color) {
         if self.options.background == color {
             return;
         }
         self.options.background = color;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             // 背景色不是绘制图元：没有 damage 的帧可能永远不被 present，必须显式标全量。
             self.full_damage_pending = true;
@@ -539,13 +546,22 @@ impl Window {
         self.surface = covering_surface(self.size(), self.scale);
     }
 
-    /// Windows 平台层：写入真实客户区物理尺寸（`WM_SIZE` / `WM_DPICHANGED` 之后）。
+    /// 平台层：写入真实渲染目标物理尺寸（Windows `WM_SIZE` / `WM_DPICHANGED`、macOS
+    /// `convertSizeToBacking` 之后）。
     ///
     /// 值变化 ⇒ 标全量重绘（新暴露的像素没有对应 damage）；**不**标 layout、**不**动
     /// `scale_epoch`：本方法只改渲染目标，不改布局；DPI 的布局变化由 `set_scale` / `set_size` 负责。
-    #[cfg(windows)]
+    ///
+    /// macOS 还必须在这里刷新图层属性（`contentsScale` / `drawableSize`）：这是主线程的写入口，
+    /// 且必须在「值没变就返回」**之前**执行 —— DPI 变化但 surface 恰好相同时也要更新
+    /// `contentsScale`。只变 scale 时也必须刷新。
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn set_surface(&mut self, surface: (u32, u32)) {
         let surface = (surface.0.max(1), surface.1.max(1));
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_layer_scale(surface, self.scale.factor());
+        }
         if self.surface == surface {
             return;
         }
@@ -776,24 +792,25 @@ impl Window {
         Ok(())
     }
 
-    /// 窗口的物理像素尺寸（Windows = 真实客户区；其它平台 = `size × scale` 的 covering）。
+    /// 窗口的物理像素尺寸（Windows = 真实客户区；macOS = 真实 backing；Linux = covering）。
     fn physical_surface(&self) -> (u32, u32) {
         self.surface
     }
 
     /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
     ///
-    /// Windows：真实 surface（平台层给的客户区，至少 1 px）。
-    #[cfg(windows)]
+    /// Windows：真实客户区（平台层给的客户区，至少 1 px）；macOS：真实 backing（`set_surface`
+    /// 写入，文字按真实像素 1:1）。
+    #[cfg(any(windows, target_os = "macos"))]
     fn frame_rect(&self) -> PhysicalRect {
         PhysicalRect::new(0, 0, self.surface.0 as i32, self.surface.1 as i32)
     }
 
     /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
     ///
-    /// 非 Windows：保持旧值（`size × scale` 的 covering **原始结果**，0 尺寸 ⇒ 0×0；surface 的
+    /// Linux：保持旧值（`size × scale` 的 covering **原始结果**，0 尺寸 ⇒ 0×0；surface 的
     /// `max(1)` 只约束渲染目标，不改变 frame）。
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn frame_rect(&self) -> PhysicalRect {
         Rect::new(0.0, 0.0, self.size().width, self.size().height).to_physical_covering(self.scale)
     }
@@ -1150,8 +1167,8 @@ impl Window {
 
 /// `size × scale` 的 covering 物理尺寸（向外 floor/ceil，至少 1 px）。
 ///
-/// 非 Windows 平台恒等于它；Windows 只是 `set_size` / `set_scale` 重算出的初值，平台层随后用
-/// `Window::set_surface` 写入真实客户区（不是只有首帧前）。
+/// Linux 恒等于它；Windows / macOS 只是 `set_size` / `set_scale` 重算出的初值，平台层随后用
+/// `Window::set_surface` 写入真值（真实客户区 / backing，不是只有首帧前）。
 fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
     let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
     (rect.width().max(1) as u32, rect.height().max(1) as u32)
@@ -1230,10 +1247,10 @@ mod tests {
 
         window.set_background_color(Color::WHITE);
         assert_eq!(window.options().background, Color::WHITE);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         assert!(
             window.full_damage_pending,
-            "改色必须标一帧，否则 SetBackgroundColor 可能永不被 present"
+            "改色必须标一帧，否则 SetBackgroundColor / layer 背景可能永不被 present"
         );
 
         // 同值 no-op：清掉 damage 之后再调同值，不得重新置位。
@@ -1262,8 +1279,8 @@ mod tests {
         );
     }
 
-    /// 非 Windows 的退化尺寸：`frame_rect` 仍是 0×0（钉住 macOS/Linux 的旧行为；本机不跑）。
-    #[cfg(not(windows))]
+    /// Linux 的退化尺寸：`frame_rect` 仍是 0×0（钉住 Linux 的旧行为；本机不跑）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn frame_rect_keeps_the_raw_covering_for_degenerate_sizes() {
         use crate::math::PhysicalRect;
@@ -1284,6 +1301,25 @@ mod tests {
                 "size {size:?} 的 frame 必须是 0×0（surface 的 max(1) 不参与）"
             );
         }
+    }
+
+    /// macOS：`frame_rect` 用平台层写入的真实 backing surface，不再是 covering（文字 1:1）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn frame_rect_uses_the_platform_backing_on_macos() {
+        use crate::math::PhysicalRect;
+
+        let mut window = window();
+        // 初值是 covering（800×600）；平台层随后写入真实 backing。
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
+        window.set_surface((1234, 777));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
+
+        // `set_size` 先按 covering 重算 surface；平台层下一轮再用真实 backing 覆盖。
+        window.set_size(Size::new(256.8, 100.5));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 257, 101));
+        window.set_surface((449, 176));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
     }
 
     #[test]
@@ -1324,7 +1360,7 @@ mod tests {
         assert_eq!(window.physical_surface(), (1, 1));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
         let mut window = window();
