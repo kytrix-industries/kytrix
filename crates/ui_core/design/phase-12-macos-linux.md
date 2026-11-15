@@ -31,7 +31,7 @@
 | 10 | **`VK_KHR_incremental_present` 只作 hint**：可用则把 `VkPresentRegionsKHR` 挂 `pNext`，不可用/被 presentation engine 忽略都**不影响正确性**（因为每帧整面 copy）；引擎**不依赖**它生效                                                                                                                                                                                  | §6.3；主设计 §2.6          |
 | 11 | **平台层：macOS = `NSApplication` + `CFRunLoopSource` 唤醒 + `CFRunLoopTimer`；Linux = `calloop::EventLoop` + `WaylandSource` + `calloop::ping`**。macOS **不**用 `NSApplicationDelegate` 以外的 run loop 改写、**不**用 libdispatch（无 `dispatch_async` 依赖）；唤醒一律「先置位再 signal」，与 Win32 的 `PostMessageW` 合并策略同构                                  | §7.1 / §8.1                |
 | 12 | **公共 `Event` / `InputEvent` / `ImeEvent` 是三平台唯一事件契约**；`platform/event.rs`（含 `translate` / `PlatformEvent`）**保持 Windows 专用不重构**，mac/Linux 各自的 `event.rs` 直接构造公共 `Event` 后调 `App::dispatch`                                                                                                                                            | §3.2；§7.8 / §8.8          |
-| 13 | **不新增 `EngineError` 变体**：`UnsupportedGpu` / `DeviceLost` / `WaylandCompositor` / `ShaderLoad` / `Swapchain` / `AppInit` / `WindowCreate` / `Clipboard` / `InvalidDpiScale` / `A11yInit` 已覆盖 P12 全部失败路径                                                                                                                                                   | §9.1                       |
+| 13 | **P12 不新增 `EngineError` 变体**：`UnsupportedGpu` / `DeviceLost` / `WaylandCompositor` / `ShaderLoad` / `Swapchain` / `AppInit` / `WindowCreate` / `Clipboard` / `InvalidDpiScale` / `A11yInit` 已覆盖 P12 全部失败路径。**例外**：2026-11-15 的 Windows DirectComposition 重写追加了 `Composition { detail }`（DEVIATIONS §36 F-204；运行时几何 / `Commit` / `SetContent` / 换链），它只由 Windows 平台层产生，不改变本阶段「macOS/Linux 不新增」的范围 | §9.1                       |
 | 14 | **a11y 三平台直连**（§7.6 / D22）：macOS `accesskit_macos::Adapter::new(*mut c_void, …)`（`unsafe`、**主线程**）、`hit_test` / `view_children` / `focus` 返回**裸指针**且点是 **objc2 0.2 线**的 `NSPoint`；Linux `accesskit_unix::Adapter::new(activation, action, deactivation)`，`request_initial_tree → None` 合法（进 `Pending`），`update_if_active` **无返回值** | §7.7 / §8.7；F-124         |
 | 15 | **Cargo 零新增依赖**：唯一直依赖增量是 `dispatch2 = "0.3.1"`（已在 lock、已由 objc2-metal default 启用）——列为 D-2 裁决；不引入 `block2` / `dispatch2` 之外任何 crate，不加 `x11` / `system` / `wayland-cursor`                                                                                                                                                         | §2.5 / §12                 |
 | 16 | **无 GLES / 无 X11 / 无 winit**（I16 / D25）：Linux 只走 Wayland，`cargo tree` 不得出现 `x11*` / `xcb*` / `winit`。**实现更正**：`wayland-client` 必须开 `system`（Vulkan WSI 要真实 `wl_display*`/`wl_surface*`，纯 Rust 后端只有令牌），因此 `wayland-sys` + `libwayland-client` 必然出现在树里（F-135）                                                              | §11.2                      |
@@ -104,7 +104,7 @@ crates/ui_core/src/
 | Linux X11 / XWayland / GLES 回退                                     | D25 / I16，永久不做                       |
 | Wayland 服务端装饰、窗口圆角/阴影的系统侧效果                        | 不做（自绘标题栏 + 客户端装饰）           |
 | mac/Linux 的 `TestApp::snapshot` 真实像素                            | P18（P12 只编译 `readback.rs`，见 §11.1） |
-| 新 `EngineError` 变体 / 新 crate / `serde` 面                        | 不需要                                    |
+| 新 `EngineError` 变体 / 新 crate / `serde` 面                        | 不需要（唯一例外：2026-11-15 Windows 的 `Composition`，见 DEVIATIONS §36 F-204） |
 
 ---
 
@@ -1497,7 +1497,7 @@ pub(crate) struct NativeSurface {
 > Windows / macOS 同形），`WindowOptions.background` 在 Linux 生效（persist clear 的 **linear** 值）。
 > resize 期间旧 buffer 不再被新 destination 单独缩放：destination 与 buffer 在同一次 present 里
 > 原子生效，不做 seed 帧；缩小时右 / 下裁切、没有 Windows 的背景条中间态。Mutter / KWin 与真实
-> 指针拖拽未验证（V-122）；不得把 Windows 的 `SCALING_NONE` 或 macOS 的 `kCAGravityBottomLeft`
+> 指针拖拽未验证（V-122）；不得把 Windows 的 DirectComposition 组合交换链或 macOS 的 `kCAGravityBottomLeft`
 > 结论直接外推成 sway 之外的实测结论。
 
 ### 8.4 `linux/dpi.rs`

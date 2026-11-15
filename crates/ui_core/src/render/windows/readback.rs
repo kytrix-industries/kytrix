@@ -105,8 +105,21 @@ impl Readback {
                     SubresourceIndex: 0,
                 },
             };
-            // SAFETY: footprint 由 `GetCopyableFootprints` 计算，源纹理处于 COPY_SOURCE。
-            unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source_location, None) };
+            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标是 grow-only buffer，
+            // 内容只是左上角的子矩形），`pSrcBox = NULL` 会把整块源塞进更小的 footprint。
+            let region = D3D12_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: size.0,
+                bottom: size.1,
+                back: 1,
+            };
+            // SAFETY: footprint 由 `GetCopyableFootprints` 计算，源纹理处于 COPY_SOURCE，
+            // 源盒在源资源内且与 footprint 同尺寸。
+            unsafe {
+                list.CopyTextureRegion(&destination, 0, 0, 0, &source_location, Some(&region))
+            };
             // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
             unsafe {
                 core::mem::ManuallyDrop::drop(&mut destination.pResource);

@@ -108,14 +108,15 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
-    /// 窗口背景色：resize 期间新暴露区域（旧 buffer / 旧 drawable 之外）的底色。
+    /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear），窗口 resize 时的拉伸由平台负责。
     ///
     /// 平台差异：
-    /// - Windows：只填 DXGI 旧 back buffer **之外**的客户区（`DXGI_SCALING_NONE` 下由
-    ///   `IDXGISwapChain1::SetBackgroundColor` 填充，sRGB 编码字节）；persist 的 clear 仍是
-    ///   透明黑，帧内未被内容覆盖的像素不受它影响。
+    /// - Windows：persist clear 的**未覆盖像素**（linear，与 macOS/Linux 同一条路径）。
+    ///   DirectComposition 的组合交换链**没有**可用的 `SetBackgroundColor`（probe 实测返回 OK
+    ///   但惰性），客户区完全由 visual 合成，因此不存在「旧 buffer 之外的新客户区」这种中间态：
+    ///   拉伸中的像素来自上一帧内容。
     /// - macOS：既填旧 drawable **之外**的 `CAMetalLayer.backgroundColor`（sRGB `CGColor`），
-    ///   也用于 persist clear 的**未覆盖像素**（linear，Metal sRGB 渲染目标）。
+    ///   也用于 persist clear 的**未覆盖像素**（linear，`render::color::background_linear`）。
     /// - Linux：只用于 persist clear 的**未覆盖像素**（linear，Vulkan sRGB attachment，
     ///   `render::color::background_linear`）；旧 buffer 不会被缩放，没有 Windows 的背景条中间态。
     ///
@@ -491,9 +492,9 @@ impl Window {
 
     /// 改窗口背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给平台层。
     ///
-    /// Windows 上值变化会标全量重绘：`SetBackgroundColor` 只在下一次 `Present1` 生效，调用方应在
-    /// 之后触发一帧（平台事件 / 主题重绘 / 动画 / HUD tick 均可）。GPU 侧在空闲或下一帧录制前应用；
-    /// UI 线程只写共享槽并唤醒，不直接调 DXGI（I1）。
+    /// Windows 上值变化会标全量重绘：组合交换链没有可用的 `SetBackgroundColor`，新颜色只作为
+    /// persist 的 clear color（linear）生效，因此必须有下一帧（平台事件 / 主题重绘 / 动画 /
+    /// HUD tick 均可）。GPU 侧在空闲或下一帧录制前取走它；UI 线程只写共享槽并唤醒（I1）。
     ///
     /// macOS 上值变化同样标全量重绘：`CAMetalLayer.backgroundColor` 立刻在主线程写，persist 的
     /// clear color 经共享槽交给 GPU 线程（同样在空闲或下一帧录制前应用）。
@@ -854,6 +855,28 @@ impl Window {
         self.surface
     }
 
+    /// 最近一次**完成 present** 的内容尺寸（物理像素）。
+    ///
+    /// Windows 的 DirectComposition 几何用它：交换链里实际有内容的区域就是这个尺寸，visual 的
+    /// 裁剪框按它设置，再按当前客户区缩放 —— 拖动中拉伸上一帧，静止时 1:1。
+    ///
+    /// 没有渲染器（headless / 平台尚未 attach）时等于本帧目标尺寸：没有「已呈现内容」可言。
+    #[cfg(windows)]
+    pub(crate) fn presented_surface(&self) -> (u32, u32) {
+        match self.renderer.as_ref() {
+            Some(renderer) => renderer.presented_surface(),
+            None => self.surface,
+        }
+    }
+
+    /// 合成几何兜底标记：GPU 线程的两次唤醒都失败时置位，泵的 ②b′ 消费后强制重算几何。
+    #[cfg(windows)]
+    pub(crate) fn take_composition_pending(&self) -> bool {
+        self.renderer
+            .as_ref()
+            .is_some_and(Renderer::take_composition_pending)
+    }
+
     /// 本帧的物理矩形（`paint_frame` / `commit_frame` 的唯一来源）。
     ///
     /// 三平台一致：平台层通过 `set_surface` 写入的真实渲染目标 —— Windows 真实客户区
@@ -978,8 +1001,12 @@ impl Window {
         }
         // 本帧只算一次：`submit_gpu` 消费同一份 `plan`（目标尺寸也来自同一次 `frame_rect`）。
         let frame = self.frame_rect();
-        let plan = plan(report.damage, self.damage.rects(), frame);
         let renderer_surface = self.renderer.as_ref().map(Renderer::surface);
+        let plan = plan(report.damage, self.damage.rects(), frame);
+        // Windows：目标尺寸变化必须整帧重画（`set_content_size` 在 buffer 内是纯 CPU 记账，
+        // `Plan::Idle` 会消费帧延迟 token 却不 present）。macOS / Linux 保持原规则。
+        #[cfg(windows)]
+        let plan = surface_change_plan(plan, renderer_surface, self.surface);
         if !frame_reaches_gpu(plan, renderer_surface, self.surface) {
             // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
             // 状态（damage / prev_layout / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
@@ -1257,7 +1284,11 @@ fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
 ///   交付，帧仍按 `Committed` 结算。
 /// - 有渲染器 ⇒ `plan != Plan::Idle || renderer_surface != Some(surface)`。`Plan::Idle` 只表示
 ///   没有像素要画；若 `surface`（本帧目标尺寸）与渲染器最近一次发布的目标尺寸不同，GPU 线程
-///   仍必须重建渲染目标，因此算有工作。
+///   仍必须处理新目标尺寸，因此算有工作。
+///
+/// Windows 的 `commit_frame` 在调用本函数之前先用 [`surface_change_plan`] 把「目标尺寸变了」
+/// 夹成 `Plan::Full`：组合交换链是 grow-only buffer，`set_content_size` 在 buffer 内不会重建
+/// 任何资源，`Plan::Idle` 发布只会消费帧延迟 token 而不 present。
 ///
 /// 返回 `false` 的帧不会 publish：`commit_frame` 必须把它按 `Idle` 结算，否则 Linux 帧门禁
 /// 会等一次永远不会到来的 `wl_callback`（V-122 ⑧ / F-183）。
@@ -1272,8 +1303,30 @@ fn frame_reaches_gpu(
     }
 }
 
+/// Windows：目标尺寸变化一律映射成 `Plan::Full`（任何输入计划）。
+///
+/// 组合交换链是 grow-only 的 buffer，`set_content_size` 在 buffer 内只是 CPU 记账；一个
+/// `Plan::Idle` 的发布会让 GPU 线程消费一次帧延迟 waitable token 却不 present（DXGI 的 token
+/// 守恒被破坏，下一帧白等一个 vsync）。`Plan::Partial` 的 damage 是**按旧目标**算的：新暴露的
+/// 像素没有 damage，只画旧矩形会在新客户区留下未初始化内容，因此同样整帧重画。
+/// macOS / Linux 的 GPU 线程会按新 surface 重建 swapchain，保持 [`frame_reaches_gpu`] 原规则。
+#[cfg(windows)]
+fn surface_change_plan(
+    plan: Plan,
+    renderer_surface: Option<(u32, u32)>,
+    surface: (u32, u32),
+) -> Plan {
+    if renderer_surface.is_some_and(|published| published != surface) {
+        Plan::Full
+    } else {
+        plan
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::surface_change_plan;
     use super::{
         FrameIndex, FrameOutcome, Window, WindowId, WindowOptions, covering_surface,
         frame_reaches_gpu,
@@ -1777,6 +1830,52 @@ mod tests {
             frame_reaches_gpu(Plan::Idle, Some((99, 50)), surface),
             "Idle 但目标尺寸变了 ⇒ GPU 线程仍要重建目标"
         );
+    }
+
+    /// P2-4：Windows 的目标尺寸变化必须变成非 `Idle` 计划 —— `set_content_size` 在 buffer 内
+    /// 只是 CPU 记账，`Idle` 发布会让 GPU 线程消费 waitable token 却不 present。
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_surface_change_never_publishes_an_idle_plan() {
+        let surface = (100, 50);
+        assert_eq!(
+            surface_change_plan(Plan::Idle, Some((99, 50)), surface),
+            Plan::Full,
+            "目标尺寸变了 ⇒ 整帧重画（新暴露的像素没有 damage）"
+        );
+        assert_eq!(
+            surface_change_plan(Plan::Idle, Some(surface), surface),
+            Plan::Idle,
+            "尺寸没变 ⇒ 保持 Idle（不凭空产生 GPU 工作）"
+        );
+        assert_eq!(
+            surface_change_plan(Plan::Idle, None, surface),
+            Plan::Idle,
+            "没有渲染器时由 frame_reaches_gpu 决定，不在这里造 Full"
+        );
+
+        let mut rects = DamageRects::new();
+        assert!(rects.push(PhysicalRect::new(0, 0, 4, 4)));
+        assert_eq!(
+            surface_change_plan(Plan::Partial(rects), Some((99, 50)), surface),
+            Plan::Full,
+            "目标尺寸变了：Partial 的 damage 是按旧目标算的，必须整帧重画"
+        );
+        assert_eq!(
+            surface_change_plan(Plan::Partial(rects), Some(surface), surface),
+            Plan::Partial(rects),
+            "尺寸没变：Partial 原样保留"
+        );
+        assert_eq!(
+            surface_change_plan(Plan::Partial(rects), None, surface),
+            Plan::Partial(rects),
+            "没有渲染器：不在这里造 Full"
+        );
+        assert!(frame_reaches_gpu(
+            surface_change_plan(Plan::Idle, Some((99, 50)), surface),
+            Some((99, 50)),
+            surface
+        ));
     }
 
     /// P2-1 / V-122 ⑧（端到端）：真实 renderer 下「有像素但 `plan == Plan::Idle`、目标尺寸

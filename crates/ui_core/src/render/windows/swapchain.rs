@@ -1,27 +1,32 @@
-//! FLIP_SEQUENTIAL swapchain / `Present1` dirty rects / GPU 线程侧的 resize
-//! （`design/phase-08-d3d12.md` §5.3 / §6.4、`design/async-render-pipeline.md` §6.2 / §6.4）。
+//! **组合**交换链（`CreateSwapChainForComposition`）/ `Present1` dirty rects
+//! （`design/phase-08-d3d12.md` §5.3 / §6.4、`design/DEVIATIONS.md` §36 F-199）。
 //!
-//! 三条实测硬约束（DEVIATIONS F-72）在这里集中实现：
-//! ① 创建后 / `ResizeBuffers` 后**第一次 present 必须全量**（`DirtyRectsCount = 0`）；
-//! ② dirty rect 必须非空且完全落在 surface 内（由共享层 `compositor::plan` 夹紧）；
-//! ③ `pPresentParameters` 永不为 NULL。
+//! 窗口路径的交换链不是 HWND swapchain：它的内容经 `IDCompositionVisual::SetContent` 交给
+//! DirectComposition（`platform/windows/composition.rs`），窗口的客户区由 DComp 合成。
+//!
+//! 四条实测硬约束（probe `caps.log` / `present.log` / `resize.log`）：
+//! ① `DXGI_SCALING_STRETCH` 是**唯一**可用的缩放模式（`SCALING_NONE` 创建即 `0x887A0001`）；
+//! ② 组合交换链在**第一次 `Present` 之后不能 `ResizeBuffers`**（`0x887A0001`），所以 buffer 是
+//!    grow-only 的桶（`platform/windows/composition.rs` 的 `buffer_size`）：内容越过它时整条
+//!    交换链被替换（`render/windows/compositor.rs` 的 `GpuRenderer::grow`），窗口 resize 本身
+//!    只改 visual 几何；
+//! ③ 创建后的**第一次 present 必须全量**（`DirtyRectsCount = 0`）；
+//! ④ dirty rect 必须非空且完全落在 buffer 内（越界 / 负坐标都是 `DXGI_ERROR_INVALID_CALL`）。
 //!
 //! 呈现节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 对象
 //! （`design/async-render-pipeline.md` §6.2）：`SetMaximumFrameLatency(1)` + 每帧渲染前等一次
-//! 该句柄。flag 是 swapchain 自己的帧延迟信号量，不与同进程其它 swapchain 共享隐式计数。
-//!
-//! 缩放策略是 `DXGI_SCALING_NONE` + `SetBackgroundColor`：resize 期间 DWM 不拉伸旧 buffer，
-//! 新暴露的客户区由 DXGI 用背景色填充（拉伸旧 buffer 会让卡片变形、文字发虚）。
+//! 该句柄。`SetBackgroundColor` 在组合交换链上是**惰性**的（probe：返回 OK 但不影响合成），
+//! 因此背景色只走 persist 的 clear（`render/color.rs`）。
 //!
 //! 格式：`B8G8R8A8_UNORM`（sRGB flip swapchain 在本机创建即失败，DEVIATIONS F-80）。
 
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, RECT},
+        Foundation::{CloseHandle, HANDLE, RECT},
         Graphics::{
             Direct3D12::*,
             Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+                Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
                 *,
             },
         },
@@ -41,75 +46,51 @@ use crate::{
 /// flip-model 的 back buffer 数（主设计 §2.4 的 `BufferCount >= 2`；本设计取 3）。
 pub(crate) const BUFFER_COUNT: u32 = 3;
 
-/// 一个 flip swapchain + 它的帧延迟 waitable（auto-reset，每帧等一次）。
+/// 一条组合交换链 + 它的帧延迟 waitable（auto-reset，每帧等一次）。
 pub(crate) struct Swapchain {
     raw: IDXGISwapChain1,
-    chain2: IDXGISwapChain2,
-    /// `GetFrameLatencyWaitableObject` 的句柄；本结构独占，`Drop` 时关闭。
+    /// `GetFrameLatencyWaitableObject` 的句柄；由 swapchain 拥有，本结构 `Drop` 时关闭。
     waitable: HANDLE,
-    /// DXGI 的背景色（官方未承诺 `ResizeBuffers` 保留背景色；本实现不依赖它，重建后无条件重设）。
-    background: DXGI_RGBA,
+    /// 首个 present 必须是全量（`DirtyRectsCount = 0`）：back buffer 的内容在第一次 present
+    /// 之前未定义，给局部矩形会让其余区域露出垃圾（F-72 ①）。成功后清除。
+    first_present: bool,
 }
 
 impl Swapchain {
-    /// 隐藏 / 真实 HWND 的 swapchain（P09 的窗口层与隐藏窗口 probe 共用）。
-    pub(crate) fn for_hwnd(
-        queue: &Queue,
-        hwnd: isize,
-        size: (u32, u32),
-        background: [f32; 4],
-    ) -> Result<Self, EngineError> {
+    /// `buffer` 是这条交换链的尺寸（grow-only 桶，物理像素）。
+    ///
+    /// 不能再 `ResizeBuffers`：内容越过 `buffer` 时调用方整条替换交换链（新的
+    /// [`Swapchain::for_composition`]），旧的在新 `SetContent` + `Commit` 之后丢弃。
+    pub(crate) fn for_composition(queue: &Queue, buffer: (u32, u32)) -> Result<Self, EngineError> {
         let factory = create_factory()?;
-        let desc = swap_chain_desc(size);
-        let window = HWND(hwnd as *mut core::ffi::c_void);
+        let desc = composition_desc(buffer);
+        // SAFETY: COM 调用：工厂 / 队列 / 描述符在调用期间有效；`NULL` output 表示不限制到
+        // 某个显示器；失败按 HRESULT 处理。
         let raw: IDXGISwapChain1 =
-            // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
-            unsafe { factory.CreateSwapChainForHwnd(queue.raw(), window, &desc, None, None) }
-                .map_err(|error| EngineError::UnsupportedGpu {
-                    os: "windows",
-                    required: "FLIP_SEQUENTIAL / BufferCount >= 2",
-                    actual: smol_str::format_smolstr!(
-                        "CreateSwapChainForHwnd: {:#010X}",
+            unsafe { factory.CreateSwapChainForComposition(queue.raw(), &desc, None) }.map_err(
+                |error| EngineError::Swapchain {
+                    detail: smol_str::format_smolstr!(
+                        "CreateSwapChainForComposition({}x{}): {:#010X}",
+                        desc.Width,
+                        desc.Height,
                         error.code().0 as u32
                     ),
-                })?;
+                },
+            )?;
         let chain2: IDXGISwapChain2 = raw
             .cast()
             .map_err(|error| init_error_from("cast IDXGISwapChain2", error))?;
-        // `max latency=1` 减小 CPU 侧排队深度；resize 期间不拉伸旧 buffer 由 `SCALING_NONE` 保证。
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
+        // flag 是创建参数（probe：没有它 `SetMaximumFrameLatency` 直接失败）：CPU 侧排队深度 1。
+        // SAFETY: swapchain 句柄由 `raw` 持有；参数是值。
         unsafe { chain2.SetMaximumFrameLatency(1) }
             .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
-        let swapchain = Self::validate(raw, chain2, dxgi_rgba(background))?;
-        swapchain.apply_background()?;
-        Ok(swapchain)
-    }
-
-    fn validate(
-        raw: IDXGISwapChain1,
-        chain2: IDXGISwapChain2,
-        background: DXGI_RGBA,
-    ) -> Result<Self, EngineError> {
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
-        let actual = unsafe { raw.GetDesc1() }
-            .map_err(|error| init_error_from("SwapChain::GetDesc1", error))?;
-        if actual.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || actual.BufferCount < 2 {
-            return Err(EngineError::UnsupportedGpu {
-                os: "windows",
-                required: "FLIP_SEQUENTIAL / BufferCount >= 2",
-                actual: smol_str::format_smolstr!(
-                    "SwapEffect={} / BufferCount={}",
-                    actual.SwapEffect.0,
-                    actual.BufferCount
-                ),
-            });
-        }
+        // `chain2` 只是访问 `IDXGISwapChain2` 的临时引用：waitable 由 swapchain 本体拥有，
+        // 句柄在 `raw` 存活期间有效，因此这里之后不再需要保存接口指针。
         let waitable = frame_latency_waitable(&chain2)?;
         Ok(Self {
             raw,
-            chain2,
             waitable,
-            background,
+            first_present: true,
         })
     }
 
@@ -118,39 +99,23 @@ impl Swapchain {
         self.waitable
     }
 
-    /// 改背景色并立即应用（GPU 线程；`ResizeBuffers` 之后由 [`Swapchain::resize`] 重设）。
-    pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) -> Result<(), EngineError> {
-        self.background = dxgi_rgba(rgba);
-        self.apply_background()
-    }
-
-    /// `IDXGISwapChain1::SetBackgroundColor`（sRGB 编码 RGBA，不是 linear；`SCALING_NONE` 下
-    /// resize 期间新暴露的客户区由它填充）。
-    fn apply_background(&self) -> Result<(), EngineError> {
-        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；`background` 是栈上 `DXGI_RGBA`，
-        // DXGI 只读它。
-        unsafe { self.raw.SetBackgroundColor(&self.background) }.map_err(|error| {
-            EngineError::Swapchain {
-                detail: smol_str::format_smolstr!(
-                    "SetBackgroundColor: {:#010X}",
-                    error.code().0 as u32
-                ),
-            }
-        })
+    /// 组合交换链本体（`IDCompositionVisual::SetContent` 的输入）。
+    pub(crate) fn raw(&self) -> &IDXGISwapChain1 {
+        &self.raw
     }
 
     /// 当前 back buffer（**每帧重新问 DXGI**；flip model 的 current index 会随 present 轮转）。
     ///
-    /// 调用方只在录制 copy 期间持有，**不得**跨帧保留（resize 前提）。
+    /// 调用方只在录制 copy 期间持有，**不得**跨帧保留。
     pub(crate) fn back_buffer(&self) -> Result<ID3D12Resource, EngineError> {
         // flip model 的 current index 在 `IDXGISwapChain3` 上。
         let chain: IDXGISwapChain3 = self
             .raw
             .cast()
             .map_err(|error| init_error_from("cast IDXGISwapChain3", error))?;
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
+        // SAFETY: swapchain 句柄由本结构持有；查询无副作用。
         let index = unsafe { chain.GetCurrentBackBufferIndex() };
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+        // SAFETY: COM 调用：swapchain 句柄有效，输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe { self.raw.GetBuffer(index) }.map_err(|error| EngineError::Swapchain {
             detail: smol_str::format_smolstr!(
                 "GetBuffer({index}): {:#010X}",
@@ -159,21 +124,22 @@ impl Swapchain {
         })
     }
 
-    /// `Present1`：dirty 集由 [`FramePlan`] 决定（`fresh` ⇒ 全量，F-72 ①）。
+    /// `Present1`：dirty 集由 [`frame_dirty_rects`] 决定（首次全量、全量帧只给内容矩形）。
     ///
-    /// **成功之后**才清除 `FramePlan` 的 fresh：失败时下一帧仍按首帧全量处理。
-    pub(crate) fn present1(&mut self, frame: &mut FramePlan, sync: u32) -> Result<(), EngineError> {
+    /// **成功之后**才清除 `first_present` / `FramePlan` 的 fresh：失败时下一帧仍按首帧全量处理。
+    pub(crate) fn present1(
+        &mut self,
+        frame: &mut FramePlan,
+        sync: u32,
+        content: (u32, u32),
+    ) -> Result<(), EngineError> {
         let mut rects = [RECT {
             left: 0,
             top: 0,
             right: 0,
             bottom: 0,
         }; MAX_DAMAGE_RECTS];
-        let count = match frame.present_dirty() {
-            Some(damage) => fill_rects(&damage, &mut rects),
-            None => 0,
-        };
-
+        let count = frame_dirty_rects(self.first_present, *frame, content, &mut rects);
         let params = DXGI_PRESENT_PARAMETERS {
             DirtyRectsCount: count,
             pDirtyRects: if count == 0 {
@@ -184,10 +150,11 @@ impl Swapchain {
             pScrollRect: std::ptr::null_mut(),
             pScrollOffset: std::ptr::null_mut(),
         };
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
+        // SAFETY: COM 调用：swapchain 句柄有效；`rects` / `params` 在调用期间存活。
         let hr = unsafe { self.raw.Present1(sync, DXGI_PRESENT(0), &params) };
         if hr.is_ok() {
             frame.presented();
+            self.first_present = false;
             Ok(())
         } else {
             Err(EngineError::Swapchain {
@@ -198,77 +165,49 @@ impl Swapchain {
             })
         }
     }
-
-    /// `ResizeBuffers(0, w, h, UNKNOWN, FRAME_LATENCY_WAITABLE_OBJECT)`（§6.4）。
-    ///
-    /// 前置条件（调用方保证）：GPU 已完成全部在飞提交、命令列表已复位（不再持有 back buffer
-    /// 引用）。flag **必须原样传入**，否则重建后 waitable 失效 / 帧延迟语义丢失。
-    pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
-        unsafe {
-            self.raw.ResizeBuffers(
-                0,
-                size.0.max(1),
-                size.1.max(1),
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-            )
-        }
-        .map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!("ResizeBuffers: {:#010X}", error.code().0 as u32),
-        })?;
-        // 探针 2（§11）：某些驱动在 resize 后会换一个 waitable 句柄。不同则关掉旧的。
-        let waitable = frame_latency_waitable(&self.chain2)?;
-        if waitable != self.waitable {
-            // SAFETY: 旧句柄由本结构独占；新句柄已取到并即将替换。
-            unsafe {
-                let _ = CloseHandle(self.waitable);
-            }
-            self.waitable = waitable;
-        }
-        // 官方未承诺 `ResizeBuffers` 保留背景色：不依赖它，重建后无条件重设（否则 resize 后的
-        // 新客户区可能是黑色）。
-        self.apply_background()?;
-        Ok(())
-    }
-
-    /// 测试探针：DXGI 当前的背景色（隐藏窗口实机验收）。
-    #[cfg(test)]
-    pub(crate) fn background_color(&self) -> Result<DXGI_RGBA, EngineError> {
-        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；返回值按值拷出。
-        unsafe { self.raw.GetBackgroundColor() }.map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!(
-                "GetBackgroundColor: {:#010X}",
-                error.code().0 as u32
-            ),
-        })
-    }
-
-    /// 测试探针：`IDXGISwapChain2::GetMaximumFrameLatency`（隐藏窗口实机验收）。
-    #[cfg(test)]
-    pub(crate) fn maximum_frame_latency(&self) -> Result<u32, EngineError> {
-        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；输出是栈上 `u32`。
-        unsafe { self.chain2.GetMaximumFrameLatency() }.map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!(
-                "GetMaximumFrameLatency: {:#010X}",
-                error.code().0 as u32
-            ),
-        })
-    }
 }
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        // SAFETY: waitable 由本结构独占（resize 后已换成新句柄）；`Drop` 只执行一次。
+        // SAFETY: waitable 由本结构独占；`Drop` 只执行一次（swapchain 不重建，句柄不会变）。
         unsafe {
             let _ = CloseHandle(self.waitable);
         }
     }
 }
 
+/// 本帧的 `Present1` dirty 集（返回矩形数；`0` = 整面）。
+///
+/// 首次 present 必须整面（约束 ③）；之后的全量帧只呈现**内容子矩形** —— buffer 是内容 + 余量
+/// 的桶，其余部分永远不可见（也就是不该为了它做一次全 buffer 的合成）。
+fn frame_dirty_rects(
+    first_present: bool,
+    frame: FramePlan,
+    content: (u32, u32),
+    out: &mut [RECT; MAX_DAMAGE_RECTS],
+) -> u32 {
+    if first_present {
+        return 0;
+    }
+    if frame.is_full() {
+        out[0] = RECT {
+            left: 0,
+            top: 0,
+            right: content.0.max(1) as i32,
+            bottom: content.1.max(1) as i32,
+        };
+        return 1;
+    }
+    match frame.present_dirty() {
+        Some(damage) => fill_rects(&damage, out),
+        // 非全量、非 fresh 的空帧不会走到 present（GPU 循环把它按 Idle 拦下）。
+        None => 0,
+    }
+}
+
 /// 取帧延迟 waitable；失败（NULL）按强类型 swapchain 错误上报，绝不拿 NULL 去 `INFINITE` 等待。
 fn frame_latency_waitable(chain: &IDXGISwapChain2) -> Result<HANDLE, EngineError> {
-    // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
+    // SAFETY: swapchain 句柄由调用方持有；返回值按值取出。
     let waitable = unsafe { chain.GetFrameLatencyWaitableObject() };
     if waitable.is_invalid() {
         return Err(EngineError::Swapchain {
@@ -280,17 +219,8 @@ fn frame_latency_waitable(chain: &IDXGISwapChain2) -> Result<HANDLE, EngineError
     Ok(waitable)
 }
 
-/// sRGB 编码 RGBA → `DXGI_RGBA`（`SetBackgroundColor` / `GetBackgroundColor` 的交换类型）。
-fn dxgi_rgba(rgba: [f32; 4]) -> DXGI_RGBA {
-    DXGI_RGBA {
-        r: rgba[0],
-        g: rgba[1],
-        b: rgba[2],
-        a: rgba[3],
-    }
-}
-
-fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
+/// 组合交换链描述（probe `caps.log` 的「baseline」行）。
+fn composition_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
     DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0.max(1),
         Height: size.1.max(1),
@@ -302,21 +232,21 @@ fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
         },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: BUFFER_COUNT,
-        // NONE：resize 期间 DWM 不把旧 buffer 拉伸到新客户区（拉伸会让卡片变形、文字发虚）。
-        Scaling: DXGI_SCALING_NONE,
+        // 组合交换链只接受 STRETCH（`SCALING_NONE` / `SCALING` 其它值创建即 0x887A0001）。
+        Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
         Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
     }
 }
 
 fn create_factory() -> Result<IDXGIFactory4, EngineError> {
-    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+    // SAFETY: COM 创建调用：工厂句柄是输出，失败按 HRESULT 处理。
     unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| init_error_from("CreateDXGIFactory2", error))
 }
 
-/// `PhysicalRect` → `RECT`（半开区间 → Win32 的闭区间右/下边界）。
+/// `DamageRects` → `RECT`（半开区间 → Win32 的闭区间右/下边界）。
 fn fill_rects(damage: &DamageRects, out: &mut [RECT; MAX_DAMAGE_RECTS]) -> u32 {
     let mut count = 0;
     for rect in damage.as_slice() {
@@ -335,40 +265,101 @@ fn fill_rects(damage: &DamageRects, out: &mut [RECT; MAX_DAMAGE_RECTS]) -> u32 {
 mod tests {
     use windows::Win32::Graphics::Dxgi::{
         Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM},
-        DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+        DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
         DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     };
 
-    use super::{BUFFER_COUNT, swap_chain_desc};
+    use super::{BUFFER_COUNT, composition_desc, frame_dirty_rects};
+    use crate::{
+        math::PhysicalRect,
+        render::{
+            compositor::{DamageRects, FramePlan, Plan},
+            damage::MAX_DAMAGE_RECTS,
+        },
+    };
+
+    fn rects() -> [windows::Win32::Foundation::RECT; MAX_DAMAGE_RECTS] {
+        [windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        }; MAX_DAMAGE_RECTS]
+    }
+
+    fn partial(rects: &[PhysicalRect]) -> Plan {
+        let mut damage = DamageRects::new();
+        for rect in rects {
+            assert!(damage.push(*rect));
+        }
+        Plan::Partial(damage)
+    }
 
     #[test]
-    fn flip_sequential_contract_is_written_down() {
-        let desc = swap_chain_desc((256, 256));
+    fn the_composition_desc_is_stretch_flip_sequential_with_three_buffers() {
+        let desc = composition_desc((1000, 700));
+        // 组合交换链只接受 STRETCH（probe `caps.log`：SCALING_NONE 创建即 0x887A0001）。
+        assert_eq!(desc.Scaling, DXGI_SCALING_STRETCH);
         assert_eq!(desc.SwapEffect, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
         assert_eq!(desc.BufferCount, BUFFER_COUNT);
         assert!(desc.BufferCount >= 2);
+        assert_eq!(desc.Width, 1000);
+        assert_eq!(desc.Height, 700);
         // sRGB flip swapchain 在本机创建即失败（DEVIATIONS F-80）：格式固定 UNORM。
         assert_eq!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM);
         assert_eq!(desc.SampleDesc.Count, 1);
-        // resize 期间 DWM 不拉伸旧 buffer（修复卡片拉伸 / 文字发虚）。
-        assert_eq!(desc.Scaling, DXGI_SCALING_NONE);
         assert_eq!(
             desc.AlphaMode, DXGI_ALPHA_MODE_IGNORE,
-            "背景色 alpha 不参与合成（整窗由引擎绘制）"
+            "组合交换链上没有可用的 SetBackgroundColor，窗口不透明"
+        );
+        assert_eq!(
+            desc.Flags, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+            "waitable 是呈现节奏的唯一原语（SetMaximumFrameLatency 需要它）"
         );
     }
 
     #[test]
-    fn the_frame_latency_waitable_flag_is_always_created_and_resized_with_it() {
-        let desc = swap_chain_desc((64, 64));
+    fn the_desc_never_asks_for_a_zero_sized_buffer() {
+        let desc = composition_desc((0, 0));
+        assert_eq!((desc.Width, desc.Height), (1, 1));
+    }
+
+    #[test]
+    fn the_first_present_is_the_whole_surface() {
+        let mut out = rects();
+        // 即便本帧是局部 damage，首次 present 也必须是整面（约束 ③）。
+        let frame = FramePlan::new(partial(&[PhysicalRect::new(0, 0, 10, 10)]), false);
+        assert_eq!(frame_dirty_rects(true, frame, (800, 600), &mut out), 0);
+    }
+
+    #[test]
+    fn a_full_frame_presents_only_the_content_sub_rect() {
+        let mut out = rects();
+        let frame = FramePlan::new(Plan::Full, false);
+        assert_eq!(frame_dirty_rects(false, frame, (800, 600), &mut out), 1);
         assert_eq!(
-            desc.Flags, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
-            "flag 让 swapchain 拥有独立的帧延迟信号量（§6.2）"
+            (out[0].left, out[0].top, out[0].right, out[0].bottom),
+            (0, 0, 800, 600),
+            "buffer 比客户区大，全量帧也只呈现内容那部分"
         );
-        // `resize` 里同一条 flag 原样传给 `ResizeBuffers`（§6.4）；这里断言常量不会漂移。
+    }
+
+    #[test]
+    fn a_partial_frame_presents_its_damage_rects() {
+        let mut out = rects();
+        let damage = [
+            PhysicalRect::new(0, 0, 32, 16),
+            PhysicalRect::new(32, 16, 64, 32),
+        ];
+        let frame = FramePlan::new(partial(&damage), false);
+        assert_eq!(frame_dirty_rects(false, frame, (800, 600), &mut out), 2);
         assert_eq!(
-            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0, 0x40,
-            "DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT"
+            (out[0].left, out[0].top, out[0].right, out[0].bottom),
+            (0, 0, 32, 16)
+        );
+        assert_eq!(
+            (out[1].left, out[1].top, out[1].right, out[1].bottom),
+            (32, 16, 64, 32)
         );
     }
 }

@@ -32,18 +32,25 @@ use crate::{
     event::{Event, InputEvent},
     math::PhysicalRect,
     platform::{
-        dispatcher::{Dispatcher, WM_APP_FRAME_WAKE},
+        dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::{
             PlatformEvent, PointerKind, TranslateState, hiword_signed, loword_signed, translate,
         },
-        windows::{dpi, window::NativeWindow},
+        windows::{composition, dpi, window::NativeWindow},
     },
     render::backend::Renderer,
-    window::{WindowId, WindowOptions},
+    window::{Window, WindowId, WindowOptions},
 };
 
 /// 连续帧定时器 id（动画 / P17 HUD 共用；`wndproc` 用它唤醒；P09 probe 实测 1 ms → 16.0 ms）。
 const FRAME_TIMER_ID: usize = 1;
+
+/// 自绘边框缩放的合并定时器 id（与 [`FRAME_TIMER_ID`] 分开）。
+///
+/// 1 ms 定时器在 P09 probe 里实测合并到 16.0 ms ⇒ ~60 Hz：鼠标以 1000 Hz 上报时，窗口矩形与
+/// DComp 几何、`App::frame` 都只按这个节奏推进（P1-2b）。`WM_TIMER` 是低优先级消息，连续的
+/// 鼠标消息可能让它延迟；抬起 / 失去捕获时的最终 apply 保证窗口不会停在旧位置（不忙等）。
+const RESIZE_TIMER_ID: usize = 2;
 
 /// 用系统设置初始化输入阈值（双击时间 + 拖拽/双击的距离容差，§5.4）。
 fn install_input_thresholds(app: &mut App) {
@@ -167,15 +174,17 @@ pub(crate) struct WndProcState {
     a11y: crate::platform::windows::a11y::WindowsA11y,
 }
 
-/// 一次自绘边框缩放的起点。
+/// 一次自绘边框缩放的起点 + 最新光标。
 #[derive(Clone, Copy)]
 struct ResizeSession {
     /// `WM_NCHITTEST` 的 `HT*` 值。
     hit: u32,
-    /// 按下时的屏幕坐标。
+    /// 按下时的屏幕坐标（`resized_rect` 的基准，不随移动变化）。
     cursor: POINT,
     /// 按下时的窗口矩形（物理像素）。
     window: RECT,
+    /// 最新一次 `WM_MOUSEMOVE` 的屏幕坐标；定时器 tick / 抬起时按它算窗口矩形。
+    latest: POINT,
 }
 
 impl WndProcState {
@@ -239,6 +248,9 @@ impl WndProcState {
     }
 
     /// 开始自绘边框缩放：记录起点并抓鼠标（不再把消息交给 `DefWindowProcW` 的模态循环）。
+    ///
+    /// 同时启动 [`RESIZE_TIMER_ID`] 合并定时器：`WM_MOUSEMOVE` 只更新最新光标，真正的
+    /// `SetWindowPos` 由定时器 tick 合并成 ~60 Hz（P1-2b）。
     fn begin_resize(&mut self, hwnd: HWND, hit: u32) {
         let mut cursor = POINT::default();
         let mut window = RECT::default();
@@ -255,22 +267,38 @@ impl WndProcState {
             hit,
             cursor,
             window,
+            latest: cursor,
         });
+        // 1 ms 定时器（probe：实测合并到 16.0 ms）。失败不重试：抬起时的最终 apply 仍保证
+        // 窗口落在最后的位置，只是拖动中没有中间几何更新。
+        // SAFETY: `hwnd` 存活；`KillTimer` 用同一个 id（`end_resize`）。
+        let _ = unsafe { SetTimer(Some(hwnd), RESIZE_TIMER_ID, 1, None) };
         // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
         unsafe { SetCursor(Some(resize_cursor(hit))) };
     }
 
-    /// 按当前鼠标位置移动窗口边框（物理像素）。
-    fn resize_step(&mut self, hwnd: HWND) {
-        let Some(session) = self.resize else {
+    /// 记录最新光标位置并保持缩放光标。
+    ///
+    /// **不**移动窗口：`SetWindowPos` 只发生在定时器 tick、抬起与失去捕获时（P1-2b）。
+    fn note_resize_cursor(&mut self) {
+        let Some(session) = self.resize.as_mut() else {
             return;
         };
         let mut cursor = POINT::default();
         // SAFETY: `cursor` 是本函数栈上的输出值。
-        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
-            return;
+        if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+            session.latest = cursor;
         }
-        let next = resized_rect(session, cursor, self.min_size);
+        // SAFETY: 同 `begin_resize`。
+        unsafe { SetCursor(Some(resize_cursor(session.hit))) };
+    }
+
+    /// 按最新光标位置应用一次窗口矩形（定时器 tick / 抬起 / 失去捕获的唯一 `SetWindowPos` 点）。
+    fn apply_resize(&mut self, hwnd: HWND) {
+        let Some(session) = self.resize else {
+            return;
+        };
+        let next = resized_rect(session, session.latest, self.min_size);
         let width = next.right - next.left;
         let height = next.bottom - next.top;
         if width <= 0 || height <= 0 {
@@ -288,13 +316,13 @@ impl WndProcState {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
         };
-        // SAFETY: 同 `begin_resize`。
-        unsafe { SetCursor(Some(resize_cursor(session.hit))) };
     }
 
-    /// 结束自绘边框缩放并释放鼠标捕获。
-    fn end_resize(&mut self) {
+    /// 结束自绘边框缩放：杀掉合并定时器并释放鼠标捕获。
+    fn end_resize(&mut self, hwnd: HWND) {
         if self.resize.take().is_some() {
+            // SAFETY: `id` 由 `begin_resize` 在同一 hwnd 上创建；已过期 / 失败时是 no-op。
+            let _ = unsafe { KillTimer(Some(hwnd), RESIZE_TIMER_ID) };
             // SAFETY: 只释放本线程的捕获；没有捕获时是 no-op。
             let _ = unsafe { ReleaseCapture() };
         }
@@ -358,16 +386,29 @@ pub(crate) extern "system" fn wndproc(
             }
             if state.resize.is_some() {
                 match msg {
+                    // 只记录最新光标：`SetWindowPos` 由定时器 tick / 抬起 / 失去捕获合并（P1-2b）。
                     WM_MOUSEMOVE => {
-                        state.resize_step(hwnd);
+                        state.note_resize_cursor();
+                        return LRESULT(0);
+                    }
+                    WM_TIMER if wparam.0 == RESIZE_TIMER_ID => {
+                        state.apply_resize(hwnd);
+                        // 每个 tick 至多一帧：泵的 ②b′ 会按最终客户区重算几何。
+                        state.wake();
                         return LRESULT(0);
                     }
                     WM_LBUTTONUP => {
-                        state.end_resize();
+                        state.note_resize_cursor();
+                        state.apply_resize(hwnd);
+                        state.end_resize(hwnd);
+                        state.wake();
                         return LRESULT(0);
                     }
                     WM_CAPTURECHANGED => {
-                        state.resize = None;
+                        // 捕获被系统收回（Alt+Tab / 弹出菜单等）：用最新位置收尾，不留半移动的窗口。
+                        state.note_resize_cursor();
+                        state.apply_resize(hwnd);
+                        state.end_resize(hwnd);
                         return LRESULT(0);
                     }
                     _ => {}
@@ -417,6 +458,13 @@ pub(crate) extern "system" fn wndproc(
         let state = &mut *state;
         if msg == WM_APP_FRAME_WAKE {
             // `Dispatcher::wake` 已置位，这里只需要返回。
+            return LRESULT(0);
+        }
+        if msg == WM_APP_COMPOSITION_WAKE {
+            // GPU 线程在帧**完成**后通知「交换链里的内容尺寸变了」。这个通知**不请求新帧**：
+            // 消息本身已经把 `GetMessageW` 唤醒，泵的 ②b′ 几何 pass 每轮都按
+            // `presented_surface` / 客户区重算（同值几何是 no-op）。若在这里 `state.wake()`，
+            // 每次完成 present 都会额外产生一次 `App::frame`（HUD 下是真实的 paint + present）。
             return LRESULT(0);
         }
         if msg == WM_TIMER {
@@ -561,9 +609,9 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        let native = NativeWindow::create(id, &options, dispatcher.clone())?;
+        let mut native = NativeWindow::create(id, &options, dispatcher.clone())?;
         let client = native.client_size();
-        let renderer = Renderer::new_for_hwnd(native.hwnd_raw(), client, options.background)?;
+        let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         if let Some(window) = app.window_mut(id) {
             window.set_renderer(renderer);
             window.set_scale(native.scale());
@@ -571,6 +619,14 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
             // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
             window.set_surface(client);
         }
+        // 首帧已经由 `new_for_hwnd` prime 并 present（客户区在第一次 present 之前完全透明），
+        // 这里把 visual 的几何对齐成「内容 = 客户区」的 1:1 状态，再显示窗口。
+        {
+            let target = native.composition();
+            let mut target = composition::lock(&target);
+            target.set_geometry(client, client)?;
+        }
+        native.note_composition_geometry((client, client));
         native.show();
         windows.push(native);
     }
@@ -629,6 +685,36 @@ fn pump_loop(
 
         // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
         app.poll_renderers()?;
+
+        // ②b′ DirectComposition 几何：内容尺寸 = 最近一次**完成 present** 的尺寸，客户区 = 当前
+        // 客户区。拖动中两者不等 ⇒ visual 拉伸上一帧内容；静止时相等 ⇒ 1:1。GPU 线程在每帧完成
+        // 后 post `WM_APP_COMPOSITION_WAKE`（只唤醒、不请求帧），所以「最后一帧」的 1:1 也会在
+        // 下一次泵迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，
+        // 不逐条 `Commit`（P1-2a）。
+        for native in windows.iter_mut() {
+            // 最小化时 `GetClientRect` 是 0×0（会钳成 1×1）：不要拿它当几何。
+            if native.is_minimized() {
+                continue;
+            }
+            let client = native.client_size();
+            let presented = app
+                .window(native.id())
+                .map(Window::presented_surface)
+                .unwrap_or(client);
+            // `presented` 是待处理状态本身：每次泵迭代都读它，消息丢了也只是晚一轮（同值 no-op）。
+            // `pending` 是 GPU 线程两次唤醒都失败时的兜底标记；正常情况下靠与本窗口上次成功应用
+            // 的 `(presented, client)` 比较，避免输入风暴下每轮都进一次互斥锁。
+            let pending = app
+                .window(native.id())
+                .is_some_and(Window::take_composition_pending);
+            if !pending && native.composition_geometry() == Some((presented, client)) {
+                continue;
+            }
+            let target = native.composition();
+            let mut target = composition::lock(&target);
+            target.set_geometry(presented, client)?;
+            native.note_composition_geometry((presented, client));
+        }
 
         // ②c 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
         if let Some(native) = windows.first_mut() {
@@ -776,26 +862,40 @@ fn apply_event(
         PlatformEvent::Text(text) => Event::Input(InputEvent::Text { text }),
         PlatformEvent::Ime(ime) => Event::Ime(ime),
         PlatformEvent::Resize { width, height } => {
-            // 只记录尺寸并唤醒（`design/async-render-pipeline.md` §6.7）：`ResizeBuffers` 与
-            // persist 重建都在 GPU 线程按下一帧的 `FrameRequest.surface` 做，UI 线程不等待。
-            native.note_client_resize((width, height));
-            let size = native.logical_size();
-            if let Some(window) = app.window_mut(id) {
-                window.set_size(size);
-                // 目标尺寸 = 真实客户区（`WM_SIZE` 的 lParam 就是新的客户区宽高）。
-                window.set_surface((width, height));
-            }
+            // 最小化时 `WM_SIZE` 是 0×0：**保留上一次真实逻辑尺寸**，不写 `set_size` /
+            // `set_surface`（否则布局被压成 0、恢复时先渲染一整面单色，P2-3）；恢复窗口的
+            // `WM_SIZE` 会给出真实客户区。几何由 ②b′ 统一应用（这里不逐条 `Commit`，P1-2a）。
+            let size = if native.is_minimized() {
+                native.logical_size()
+            } else {
+                // 只记录尺寸并唤醒（`design/async-render-pipeline.md` §6.7）：内容重画发生在 GPU
+                // 线程按下一帧的 `FrameRequest.surface` 做，UI 线程不等待。
+                native.note_client_resize((width, height));
+                let size = native.logical_size();
+                if let Some(window) = app.window_mut(id) {
+                    window.set_size(size);
+                    // 目标尺寸 = 真实客户区（`WM_SIZE` 的 lParam 就是新的客户区宽高）。
+                    window.set_surface((width, height));
+                }
+                size
+            };
             dispatcher.wake();
             Event::Resized { size }
         }
         PlatformEvent::Dpi { dpi, suggested } => {
-            // DPI 同理：只更新窗口尺寸/比例并唤醒；目标重建由 GPU 线程消费新的 surface。
+            // DPI 同理：只更新窗口尺寸/比例并唤醒；内容重画由 GPU 线程消费新的 surface，
+            // 几何由 ②b′ 统一应用（P1-2a）。
             let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
                 factor: dpi as f32 / dpi::BASE_DPI as f32,
             })?;
             native.apply_scale(scale, dpi)?;
             if let Some(rect) = suggested {
-                native.place(rect)?;
+                // 最小化时系统建议的矩形会改掉恢复后的大小；与 `apply_scale` 的守卫一致：
+                // 0×0 / 最小化窗口不移动、不缩放（P2-3）。
+                let logical = native.logical_size();
+                if !native.is_minimized() && logical.width > 0.0 && logical.height > 0.0 {
+                    native.place(rect)?;
+                }
             }
             if let Some(window) = app.window_mut(id) {
                 window.set_scale(scale);
@@ -894,6 +994,7 @@ mod resize_tests {
                 right: 500,
                 bottom: 400,
             },
+            latest: cursor,
         }
     }
 
@@ -948,5 +1049,157 @@ mod resize_tests {
         );
         assert_eq!(rect.right, 500);
         assert_eq!(rect.left, 180);
+    }
+}
+
+#[cfg(test)]
+mod wndproc_tests {
+    use std::sync::Arc;
+
+    use windows::Win32::{
+        Foundation::{HWND, RECT, WPARAM},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTRIGHT, RegisterClassW,
+            SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_LBUTTONUP, WM_MOUSEMOVE,
+            WM_NCLBUTTONDOWN, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+        },
+    };
+
+    use super::{WndProcState, wndproc};
+    use crate::{
+        platform::dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
+        window::WindowId,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 建一个**隐藏**窗口并挂上生产 `WndProc` + `WndProcState`（`GWLP_USERDATA` 指向它）。
+    fn hidden_window(
+        tag: &str,
+        dispatcher: Arc<Dispatcher>,
+    ) -> (HWND, *mut WndProcState, Vec<u16>) {
+        let class_name = wide(tag);
+        // SAFETY: 进程级模块句柄；类名是 NUL 结尾的宽字符串，`RegisterClassW` 同步拷贝。
+        let instance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: 同上；每个测试用唯一的类名，只注册一次。
+        let atom = unsafe { RegisterClassW(&class) };
+        assert_ne!(atom, 0, "RegisterClassW");
+        // SAFETY: 类已注册；`WS_OVERLAPPEDWINDOW` 不含 `WS_VISIBLE` ⇒ 窗口保持隐藏。
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::PCWSTR(class_name.as_ptr()),
+                windows::core::PCWSTR(class_name.as_ptr()),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                320,
+                240,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let state = match WndProcState::new(dispatcher, hwnd, WindowId::for_test(1)) {
+            Ok(state) => Box::into_raw(Box::new(state)),
+            Err(error) => {
+                // SAFETY: 窗口由本函数创建、尚未交给其它所有者。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                panic!("WndProcState::new: {error}");
+            }
+        };
+        // SAFETY: `hwnd` 由本函数创建；`state` 的所有权由测试通过 `destroy_hidden_window` 回收。
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
+        (hwnd, state, class_name)
+    }
+
+    /// 先销毁窗口（此后不会再有消息），再回收 `WndProcState`（与 `NativeWindow::drop` 同序）。
+    fn destroy_hidden_window(hwnd: HWND, state: *mut WndProcState) {
+        // SAFETY: 窗口与状态都由本测试独占，且只回收一次。
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            drop(Box::from_raw(state));
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// P1-1 回归：`WM_APP_COMPOSITION_WAKE` 只唤醒泵，**不**置帧唤醒位。
+    ///
+    /// 旧实现调用 `state.wake()`：每次帧完成都会让泵多跑一次 `App::frame`（HUD 下是真实的
+    /// paint + present），完成通知因此变成了额外的帧源。
+    #[test]
+    fn the_composition_wake_does_not_request_a_frame() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) =
+            hidden_window("KytrixWndProcCompositionWake", Arc::clone(&dispatcher));
+        // 窗口创建 / a11y 构造不应留下待处理帧；清一次让断言只测被发送的消息。
+        let _ = dispatcher.take_frame_wake();
+
+        // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入 `wndproc`。
+        unsafe {
+            SendMessageW(hwnd, WM_APP_COMPOSITION_WAKE, None, None);
+        }
+
+        assert!(
+            !dispatcher.take_frame_wake(),
+            "合成通知必须只唤醒 GetMessageW，不得请求 App::frame"
+        );
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// P1-2b 回归：缩放期间的 `WM_MOUSEMOVE` 只记录光标，不移动窗口（`SetWindowPos` 在定时器
+    /// tick / 抬起时合并）。旧实现每个鼠标消息都 `SetWindowPos` ⇒ 348 Hz 上报时 FPS 193.8。
+    #[test]
+    fn mouse_move_during_a_resize_does_not_move_the_window() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) =
+            hidden_window("KytrixWndProcResizePacing", Arc::clone(&dispatcher));
+
+        let mut before = RECT::default();
+        // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入 `wndproc`。
+        unsafe {
+            // 按下右边框：进入自绘缩放（定时器启动），不交给 DefWindowProcW 的模态循环。
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTRIGHT as usize)), None);
+            GetWindowRect(hwnd, &mut before).expect("GetWindowRect");
+            SendMessageW(hwnd, WM_MOUSEMOVE, None, None);
+        }
+        let mut after = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
+        }
+        assert_eq!(
+            (after.left, after.top, after.right, after.bottom),
+            (before.left, before.top, before.right, before.bottom),
+            "WM_MOUSEMOVE 不得直接 SetWindowPos"
+        );
+
+        // 抬起：最终 apply（可能按真实光标位置移动窗口）+ 杀定时器 + 释放捕获。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_LBUTTONUP, None, None);
+        }
+        destroy_hidden_window(hwnd, state);
     }
 }

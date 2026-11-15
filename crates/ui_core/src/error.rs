@@ -59,6 +59,14 @@ pub enum EngineError {
     #[error("swapchain reconfiguration failed: {detail}")]
     Swapchain { detail: SmolStr },
 
+    /// DirectComposition 的**运行时**调用失败（visual 几何 / `Commit` / 交换链切换）。
+    ///
+    /// [`EngineError::AppInit`] 只用于 `Composition::new` 的 COM 创建阶段（窗口还建不出来）；
+    /// 首帧 setup 与窗口生命周期内的 `SetContent` / `Commit` 失败都归这里（窗口已经存在，只是
+    /// 不能再合成）。`detail` 带失败的操作名。
+    #[error("DirectComposition call failed: {detail}")]
+    Composition { detail: SmolStr },
+
     /// 平台报告的 DPI 缩放因子非法（非有限值或 `<= 0`）。唯一生产者是平台层 DPI 事件处理。
     #[error("invalid DPI scale factor {factor}: must be finite and greater than zero")]
     InvalidDpiScale { factor: f32 },
@@ -187,6 +195,9 @@ mod tests {
             },
             EngineError::Swapchain {
                 detail: SmolStr::new_static("CreateSwapChainForHwnd failed"),
+            },
+            EngineError::Composition {
+                detail: SmolStr::new_static("set_geometry: 0x8007000E"),
             },
             EngineError::InvalidDpiScale { factor: 0.0 },
             EngineError::StaleNode {
@@ -395,6 +406,18 @@ mod tests {
         .to_string();
 
         assert!(text.contains("resize failed"), "{text}");
+    }
+
+    #[test]
+    fn composition_display_names_the_failing_operation() {
+        let text = EngineError::Composition {
+            detail: SmolStr::new_static("Device::Commit: 0x8007000E"),
+        }
+        .to_string();
+
+        assert!(text.contains("DirectComposition"), "{text}");
+        assert!(text.contains("Device::Commit"), "{text}");
+        assert!(text.contains("0x8007000E"), "{text}");
     }
 
     #[test]

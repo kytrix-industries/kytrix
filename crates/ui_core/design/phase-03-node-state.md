@@ -625,7 +625,7 @@ impl Window {
 | `Window::tree_mut` 交出 `&mut NodeTree` 的安全性 | 允许                                          | 应用层只能改结构与样式（`Style` 是值、`build` 只追加）；`Node` 字段全私有，`Signal` 值只能经 `App::write`（I6）          |
 | `Window` 是否 `Drop` 时清理依赖图                | 否                                            | `Drop` 拿不到 `&mut DependencyGraph`；清理在 `App::close_window`（唯一入口）                                             |
 | `Scene` 的可构造性                               | **不可**（`pub(crate) fn empty()`，见 §13.2） | 裁决 ③ 的约束：`Scene` 不实现 `Clone`/`Default`、无公开构造器 → 应用层既不能克隆也不能伪造场景，只能读 `Window::scene()` |
-| `WindowOptions.background` 的默认值              | `Color::BLACK`（不透明）                      | `Color::default()` 是透明；窗口底色不能透出桌面/旧 buffer。Windows 的 `SetBackgroundColor` alpha 被 `ALPHA_MODE_IGNORE` 忽略，macOS 的两种编码都强制 alpha=1，Linux 的 Vulkan clear 按 linear 写 sRGB attachment（F-184 / F-188 / F-192 / S-139 / S-141 / S-143） |
+| `WindowOptions.background` 的默认值              | `Color::BLACK`（不透明）                      | `Color::default()` 是透明；窗口底色不能透出桌面/旧 buffer。Windows 的 DirectComposition persist clear 按 **linear** 写 sRGB 渲染目标（组合交换链没有可用的 `SetBackgroundColor`，§36 F-203 / S-151），macOS 的两种编码都强制 alpha=1，Linux 的 Vulkan clear 按 linear 写 sRGB attachment（F-184 / F-188 / F-192 / S-141 / S-143） |
 | `Window.surface` 为什么独立于 `size × scale`     | Windows = 真实客户区；macOS = 真实 backing；Linux = 真实 Wayland buffer（round） | covering 与平台真值的取整差会留 1 px 未绘制（Windows 175% 下 `256.8 × 1.75 = 449.4`，covering 450），或让文字不与物理像素 1:1（macOS `convertSizeToBacking` 的 round 值、Linux fractional-scale 的 `round(logical × scale)`）；三平台都用平台真值（F-186 / F-189 / F-191） |
 
 ### 5.3 `NodeTree` / `Node` 公开到什么程度

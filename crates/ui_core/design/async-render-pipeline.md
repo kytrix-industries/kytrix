@@ -1,8 +1,10 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-192）。
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-198）。
+> **Windows 窗口路径已于 2026-11-15 改为 DirectComposition 组合交换链**（§6 / §15.14，
+> DEVIATIONS §36）：窗口不再用 HWND swapchain，resize 不再 `ResizeBuffers`。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-192（§27–§33）、`macos-verification.md` §2.9/§2.11/§2.12、`linux-verification.md` §4.7
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-198（§27–§35）与 §36（F-199…F-204 / S-148…S-151 / V-125…V-130）、`macos-verification.md` §2.9/§2.11/§2.12、`linux-verification.md` §4.7
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -14,15 +16,15 @@
 | | macOS / Metal | Windows / D3D12 | Linux / Vulkan |
 |---|---|---|---|
 | GPU 线程 | 每窗口一条 `kytrix-metal` 线程（无 run loop） | 每窗口一条 `kytrix-d3d12` 线程（消息泵） | 每窗口一条 `kytrix-vulkan` 线程 |
-| 呈现节奏（原生） | `CAMetalDisplayLink`（主 run loop，common modes） | `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 句柄 | `vkAcquireNextImageKHR` + Wayland 合成器节流（`MAILBOX`） |
-| 完成通知 | `addCompletedHandler` + `dispatch_semaphore`(3) | `ID3D12Fence` + 每槽 fence 值 | 每帧 `VkFence` + timeline semaphore |
+| 呈现节奏（原生） | `CAMetalDisplayLink`（主 run loop，common modes） | `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 句柄（组合交换链） | `vkAcquireNextImageKHR` + Wayland 合成器节流（`MAILBOX`） |
+| 完成通知 | `addCompletedHandler` + `dispatch_semaphore`(3) | `ID3D12Fence` + 每槽 fence 值 + `WM_APP_COMPOSITION_WAKE`（完成观测点通知几何） | 每帧 `VkFence` + timeline semaphore |
 | 每帧阻塞点（只允许在 GPU 线程） | 3 槽 semaphore（非阻塞失败即跳帧） | waitable 句柄 + 槽 fence | `acquire`（100ms 上限，超时回循环）+ 槽 fence |
-| resize 在哪个线程 | GPU 线程（只重建 persist，图层属性由主线程写） | GPU 线程（`ResizeBuffers` + 重建 persist） | GPU 线程（`oldSwapchain` 重建，无 `vkDeviceWaitIdle`） |
+| resize 在哪个线程 | GPU 线程（只重建 persist，图层属性由主线程写） | UI 线程只改 visual 几何（DComp `SetScale` + `Commit`）；GPU 线程按新内容尺寸重画，内容越过 grow-only buffer 时才换交换链（先 prime） | GPU 线程（`oldSwapchain` 重建，无 `vkDeviceWaitIdle`） |
 | UI 线程是否可能等 GPU | **否** | **否** | **否** |
 
 **异步管线的定义（五条不变量，实现与验收都按这个判）**
 
-1. **I1 UI 线程零 GPU 等待**：布局/绘制编码/发布帧期间不出现任何会等待 GPU 或合成器的调用（fence wait、`waitUntilCompleted`、`vkDeviceWaitIdle`、`ResizeBuffers`、阻塞式 `nextDrawable`）。
+1. **I1 UI 线程零 GPU 等待**：布局/绘制编码/发布帧期间不出现任何会等待 GPU 或合成器的调用（fence wait、`waitUntilCompleted`、`vkDeviceWaitIdle`、`ResizeBuffers`、阻塞式 `nextDrawable`）。Windows 窗口路径已无 `ResizeBuffers`（组合交换链不能 resize，§6.4）；UI 线程只做 `IDCompositionVisual` 的 `SetScale` / `SetClip` / `Commit`，它们不等 GPU。
 2. **I2 提交即返回**：CPU 提交后立刻返回；完成状态只通过平台原生完成通知回到渲染线程。
 3. **I3 节奏由平台给**：呈现时刻由 display link / DXGI waitable / Vulkan acquire 决定，不用自建定时器冒充 vsync。
 4. **I4 资源按提交序号延迟释放**：重建/扩容产生的旧资源进 retire 队列，等对应帧完成才释放；帧路径上没有「等 GPU 再释放」。
@@ -51,6 +53,10 @@
 | Linux | `render/linux/swapchain.rs:187` | `acquire_next_image(..., u64::MAX, ...)` 在 UI 线程 | 合成器慢时 UI 线程阻塞在 acquire |
 
 结论：这两条后端不是「异步提交」，只是「每帧把 GPU 排空」。`InFlightRing`/三槽结构在同步语义下退化成摆设（实际最多 1 帧在飞）。
+
+> **2026-11-15 追加**：第 3 行的 `wait_idle + ResizeBuffers` 已从 Windows 窗口路径删除——窗口改为
+> DirectComposition 组合交换链，`ResizeBuffers` 在第一次 present 之后固定失败（§6.4 / §15.14）；
+> 本节其余行仍是重写前的历史记录。
 
 ### 1.2 macOS：线程方向对了，机制是自造的（mailbox 的六个错误）
 
@@ -88,7 +94,7 @@
 
 - 多窗口共享一个 `ID3D12Device` / `VkInstance`（当前每窗口一套，见 §3.3）。
 - 多线程并行录制命令（UI 只有一条录制流）。
-- HDR、`ALLOW_TEARING`、可变刷新率策略、DirectComposition 改造。
+- HDR、`ALLOW_TEARING`、可变刷新率策略。DirectComposition 窗口合成已不属于非目标：Windows 窗口路径已改为组合交换链 + visual 变换（§6 / §15.14）。
 - 直接渲染进 drawable（macOS 仍保留 persist + 整面 blit，见 §5.6 的说明）。
 
 ---
@@ -217,12 +223,12 @@ UI 线程 `publish`：
 
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
-- **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = **真实 Wayland buffer**（`round(logical × scale)`，`platform/linux/dpi.rs::physical_size`，在 `run` 与每轮 configure / scale 变化之后由 `Window::set_surface` 写入；fractional-scale 协议要求 round，不是 covering 的 ceil，F-191）。
-- 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
-- **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
+- **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）。Windows 的窗口路径还另有一份**最近一次完成 present 的内容尺寸** `Window::presented_surface()`：绘制 / copy / present 用当前内容，DirectComposition visual 的缩放 / 裁剪用 presented（§6.4）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = **真实 Wayland buffer**（`round(logical × scale)`，`platform/linux/dpi.rs::physical_size`，在 `run` 与每轮 configure / scale 变化之后由 `Window::set_surface` 写入；fractional-scale 协议要求 round，不是 covering 的 ceil，F-191）。
+- 不同 ⇒ 先做本平台的重建，**Windows 例外**：内容仍在 grow-only buffer 内时只是 GPU 侧 CPU 记账（不重建任何资源），越过 buffer 才换持久目标 + 组合交换链并先 prime（F-199 / F-202）；Vulkan 新 swapchain；Metal 只重建 persist。之后渲染，并强制该帧 `Full`。
+- **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。Windows 的 `commit_frame` 在 `surface_change_plan` 里把目标尺寸变化一律夹成 `Plan::Full`（`window.rs`）：`Plan::Idle` 发布会消费 waitable token 却不 present，`Partial` 的 damage 是按旧目标算的、新暴露像素没有 damage。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
 - **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。**整数回退没有 destination**：`wl_surface.set_buffer_scale(N)` 由 GPU 线程在 present 前与 attach/commit 同一次生效，buffer = `round(logical × N)`（§15.13）。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
-- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` 都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）；`submit_gpu` 不再自行调用 `frame_rect()`，它消费 `commit_frame` 用同一份 damage 与 frame 算好的 `plan`（目标尺寸仍取 `physical_surface()`，F-193）。
+- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。Windows 的 dirty rect 现在落在**内容子矩形**内（buffer 比内容大，全量帧也只声明 `(0,0,content)`，`swapchain.rs::frame_dirty_rects`）。`paint_frame` / `commit_frame` 都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）；`submit_gpu` 不再自行调用 `frame_rect()`，它消费 `commit_frame` 用同一份 damage 与 frame 算好的 `plan`（目标尺寸仍取 `physical_surface()`，F-193）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
 
@@ -371,88 +377,92 @@ loop {
 ```
 UI 线程                                  kytrix-d3d12 线程（每窗口）
 ────────────────────────────────────    ──────────────────────────────────────────
-窗口消息（WM_SIZE 只更新尺寸/客户区，不 resize）
-publish(FrameRequest) ──► 最新帧槽      循环：等 work event / waitable
-queue_atlas_upload ─────► 图集槽              → 取最新帧
-poll() ◄──────────────── 反馈槽               → 槽 fence（通常已完成）
-                                              → 录制 → Execute → Signal
-                                              → Present1(1, 0, dirty)
-                                              → retire / 反馈
+窗口消息（WM_SIZE / DPI 只记录尺寸）     循环：等 work event / waitable
+publish(FrameRequest) ──► 最新帧槽       → 等 waitable（呈现背压，每帧一次）
+queue_atlas_upload ─────► 图集槽         → 取最新帧
+poll() ◄──────────────── 反馈槽          → 内容越过 grow-only buffer？grow：换链 + prime
+②b′ 每轮按 presented/client 重设        → 槽 fence → 录制 → Execute → Signal
+    DComp visual 的 scale/clip           → Present1(1, dirty=内容子矩形)
+                                         → 完成观测点：retire + 反馈 + presented 尺寸
+                                         → post WM_APP_COMPOSITION_WAKE（只唤醒，不请求帧）
 ```
 
-### 6.2 swapchain 创建（关键 flags）
+窗口是 `WS_EX_NOREDIRECTIONBITMAP`：客户区的全部像素来自 `IDCompositionVisual` 里的组合交换链，
+没有 HWND swapchain、没有 GDI 重定向表面（DEVIATIONS §36 F-199）。
+
+### 6.2 合成目标与 swapchain 创建（关键 flags）
+
+窗口先建 DirectComposition 合成树（`platform/windows/composition.rs`）：
+`DCompositionCreateDevice2(NULL) -> IDCompositionDevice`（**不传** D3D12 设备；probe `caps.log`），
+`CreateTargetForHwnd(hwnd, false)` + `CreateVisual` + `CreateScaleTransform` +
+`CreateRectangleClip`，`target.SetRoot(visual)`，visual 固定 `LINEAR` 插值。
 
 ```rust
+// 组合交换链（CreateSwapChainForComposition，无 HWND）
 DXGI_SWAP_CHAIN_DESC1 {
-    Format: DXGI_FORMAT_B8G8R8A8_UNORM,     // 现状（F-80），不改
-    BufferCount: 3,                          // BUFFER_COUNT 保持
-    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, // 内容保留 ⇒ 可以只 copy dirty 区
-    Scaling: DXGI_SCALING_NONE,              // resize 期间 DWM 不拉伸旧 buffer
-    AlphaMode: DXGI_ALPHA_MODE_IGNORE,       // 背景色 alpha 不参与合成
+    Format: DXGI_FORMAT_B8G8R8A8_UNORM,       // F-80：sRGB flip chain 创建即失败
+    BufferCount: 3,
+    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    Scaling: DXGI_SCALING_STRETCH,            // 唯一可用（SCALING_NONE 创建即 0x887A0001）
+    AlphaMode: DXGI_ALPHA_MODE_IGNORE,
     Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
 }
-raw.SetBackgroundColor(sRGB 编码的 RGBA);      // 创建后 + 每次 ResizeBuffers 后（S-139）
-chain2.SetMaximumFrameLatency(1);             // CPU 排队深度 1（F-185）
+chain2.SetMaximumFrameLatency(1);             // 需要 waitable flag
 waitable = chain2.GetFrameLatencyWaitableObject();
+// 先 prime（全量背景 + Present1 + 等 fence），再 visual.SetContent(chain) + Commit
 ```
 
-- `DXGI_SCALING_NONE`（[DXGI_SCALING](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling)）：resize 期间 DWM **不**把旧 buffer 拉伸到新客户区，新暴露的右/下区域由 [`IDXGISwapChain1::SetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-setbackgroundcolor) 填充。旧的 `STRETCH` 实测在 300×200 跳变时把整帧放大 1.25×（card 907×269）、文字发虚（F-184）。
-- **背景色编码（实测偏差，S-139）**：官方说 “we recommend that you perform floating point operations in a linear color space”，但在本路径（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE` 的 HWND swapchain）上 `DXGI_RGBA` 的 float **按 sRGB 编码字节直写**：传 linear 值得到 `(1,1,2)`，传 sRGB 编码分量得到 `(11,14,19)`（= `#0B0E13`）。实现固定走共享的 `render/color.rs::background_srgb`（`Color` → 不透明化（alpha=1、不改 RGB）→ `ColorResolver::resolve`（linear、alpha=1 ⇒ 非预乘）→ IEC 61966-2-1 linear→sRGB encode → `DXGI_RGBA`（alpha=1））；macOS 的 `NSColor`/`CGColor` 复用同一个函数（S-141）。
-- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；三平台都影响窗口底色：Windows = `SetBackgroundColor` 的 sRGB 字节，macOS = layer sRGB + clear linear，Linux = persist clear 的 **linear** 值；demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；Windows 下一次 `Present1` 生效，§6.3；macOS / Linux 见 F-188 / F-192）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。macOS 的对应契约见 §5.3（layer sRGB + clear linear + `NSWindow` 创建期，F-188）；Linux 见 §7.3 / §7.5（S-143 / F-192）。
-- 保留 `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy dirty 区）与 `FRAME_LATENCY_WAITABLE_OBJECT`（§6.3 每帧等一次）。
-- 该 flag 让 swapchain **自带有独立的最大排队帧信号量**；不设时同一进程内所有 swapchain 共享同一个隐式帧延迟计数（Chromium 的实测结论，见 [Chromium issue 40890504](https://issues.chromium.org/issues/40890504)）。
-- 官方要求：**每帧开始渲染前等待该句柄，包括第一帧**（[GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)）。等待发生在 GPU 线程，不违反 I1。
-- `SetMaximumFrameLatency` 必须在 `IDXGISwapChain2` 上调（不是 `IDXGIDevice1`，[SetMaximumFrameLatency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency)）；`ResizeBuffers` 时 flag 必须原样传入（[DXGI_SWAP_CHAIN_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_chain_flag)）。
+- `DXGI_SCALING_STRETCH` 在组合交换链上不是「让 DWM 拉伸旧 buffer」的 STRETCH：交换链尺寸 = grow-only buffer（内容 + 512 余量、256 对齐），客户区缩放由 visual 自己承担（§6.4），这里只是 DXGI 唯一接受的枚举值（S-149）。
+- **没有 `SetBackgroundColor`**：在组合交换链上返回 `S_OK` 但惰性（S-151）。背景色是 persist 的 clear color（linear，`render/color.rs::background_linear`），首帧 prime 时 clear；运行期改色只标 full damage + 写共享槽（F-203）。
+- **没有 `ResizeBuffers`**：第一次 present 之后固定失败（S-149）。内容越过 buffer 时整条替换交换链（先 prime 再 attach，F-202）。
+- `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy 内容子矩形）与 waitable 保留；`Present1` 的 `sync=1` 保持 vsync。新链的 waitable token 没有显式消费（V-130）；`SetMaximumFrameLatency` 必须在 `IDXGISwapChain2` 上调（不是 `IDXGIDevice1`），且没有 waitable flag 时该调用直接失败（S-149）。
 
 ### 6.3 每帧序列（GPU 线程）
 
 ```text
 loop {
-    // 两个等待点，各自消费自己的对象，绝不在同一帧里重复等 waitable（auto-reset，重复等会白等一个 vsync）
-    drain_completed();                                       // 观察到完成：发布反馈 + retire（见下）
+    // 完成观测点：发布反馈 + 推进 retire + 发布 presented 尺寸（见下）
+    drain_completed();
     if shutdown { break; }
     // 背景色应用点 (a)：空闲也要落地待定背景色（改色不要求提交一帧；UI 只写共享槽 + wake）。
-    if let Some(rgba) = shared.take_background() { swapchain.set_background_color(rgba)?; }
+    if let Some(rgba) = shared.take_background() { renderer.set_background_color(rgba); }
     if !has_pending_frame() {
         // 空闲：work（新帧/关闭）或 completion（在飞帧完成）任一到达；两者都是 auto-reset。
         WaitForMultipleObjects([work_event, completion_event], INFINITE);
         continue;
     }
-    // ① 呈现背压：DXGI 的官方要求——每帧开始渲染前等 waitable（含 resize 后的第一帧）。
-    //    阻塞发生在 GPU 线程，最多一个 vsync。等待期间 completion 到达 ⇒ 先 drain 再继续等同一个
-    //    waitable（auto-reset 只能消费一次）。**先等 waitable 再取帧**：渲染的是「此刻最新」的
-    //    快照，而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
+    // ① 呈现背压：DXGI 的官方要求——每帧开始渲染前等 waitable（含第一帧）。
+    //    等待期间 completion 到达 ⇒ 先 drain 再继续等同一个 waitable（auto-reset 只能消费一次）。
     loop {
         if WaitForMultipleObjects([waitable, completion_event], INFINITE) == waitable { break; }
-        drain_completed();                  // completion 分支：帧完成，先发反馈再继续等
-        if shutdown { return; }             // 关闭：`request_shutdown` 置位 completion 把这里唤醒；
-                                            // waitable 没被消费，不能再等它（驱动/遮挡会让关闭挂死）
+        drain_completed();
+        if shutdown { return; }
     }
-    if shutdown { return; }             // 关闭：waitable 即使刚被消费也不 present（swapchain 随即
-                                        // 销毁，没有下一帧需要这个令牌）；这是 token 守恒的**唯一**
-                                        // 例外（F-182）：其余两个不画出口仍是断言，不是可走路径。
-    // **token 守恒：消费 waitable ⇒ 本帧必须 present。** 两个「不画」的出口（取帧失败、Idle 帧）
-    // 都必须在消费之前判掉：`has_pending_frame()` 已保证取得到帧（帧槽只有本线程消费），而
-    // `window.rs` 在目标未重建时根本不发布 Idle 计划（surface 变化会先 resize 并把 fresh 置真）。
-    // 实现里这两个出口保留为不变量断言（`debug_assert!`），不是可走路径。
-    let Some(frame) = take_latest_frame() else { unreachable!("pending frame was checked") };
-    if frame.plan == Idle && !is_fresh { unreachable!("idle frames are never published") };
-    // 背景色应用点 (b)：等 waitable 期间到达的背景色与帧一起落地（仍在 resize / 录制之前）。
-    if let Some(rgba) = shared.take_background() { swapchain.set_background_color(rgba)?; }
-    if frame.surface != surface { do_resize(frame.surface)?; }   // 见 §6.4；任何错误 ⇒ 显式失败
+    if shutdown { return; }             // waitable 刚被消费也不 present；token 守恒的唯一例外（F-182）
+    let Some(request) = take_latest_frame() else { unreachable!("pending frame was checked") };
+    // 取帧之后、可能 grow 之前再排空一次完成通知：grow 会 wait_idle 并复用 ring 槽，
+    // 未 drain 的帧的 timestamp 读回缓冲会被 prime 的录制覆盖（GPU 采样错帧）。
+    drain_completed();
+    // 背景色应用点 (b)：等 waitable 期间到达的背景色与帧一起落地（仍在 grow / 录制之前）。
+    if let Some(rgba) = shared.take_background() { renderer.set_background_color(rgba); }
+    for upload in shared.take_atlas().into_iter().flatten() {
+        renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
+    }
+    // ② 内容尺寸：buffer 内是纯 CPU 记账；越过 grow-only buffer 时在这里重建持久目标 +
+    //    组合交换链（先 prime 新链，再 SetContent + Commit，见 §6.4 / F-202）。
+    renderer.set_content_size(request.surface)?;
 
     let slot = ring.acquire();                              // 按 acquire 次数轮转，不由 FrameIndex 取模（F-176）
     queue.wait_slot_fence(slot);                            // 复用 allocator 前必须等（通常已完成）
     drain_completed();                                      // 该槽上一帧的 timestamp 必须在被覆盖前读走
     queue.reset_allocator_list(slot);
-    record(list, slot, &frame);                             // upload / draw persist / copy to backbuffer
+    record(list, slot, &frame);                             // upload / draw persist / copy 内容子矩形
     list.Close();
     queue.ExecuteCommandLists(&[list]);                     // 异步，立即返回
     queue.Signal(fence, slot.signal_value);                 // 提交序号
-    swapchain.present1(&mut frame_plan, /*sync*/ 1);        // 异步；失败分类见 §6.6
-    frame_plan.presented();
+    swapchain.present1(&mut frame_plan, /*sync*/ 1, request.surface); // 异步；dirty 见下
     // 不在提交点发布反馈：把本帧的统计与发布时刻记账，等 fence 的完成通知。
-    pending.push_back({ index, stats, cpu_samples, published_at });
+    pending.push_back({ index, stats, cpu_samples, published_at, surface: request.surface });
     fence.SetEventOnCompletion(slot.signal_value, completion_event);
 }
 
@@ -467,39 +477,57 @@ drain_completed():
             completed_at,                                          // GPU 线程观察到完成
             latency: completed_at - frame.published_at,
         });
+        publish_presented(frame.surface);                          // 交换链里已有这么大一块内容
+        if presented_changed { post(WM_APP_COMPOSITION_WAKE); }    // 只唤醒泵，不请求帧
     queue.release_completed(&mut device);                      // retire（同一观测点，推进到已完成值）
 ```
 
-- `Present1(1, 0, dirty)`：`sync=1` 保持 vsync（与 macOS `displaySyncEnabled`、Vulkan `MAILBOX` 的观感一致：不撕裂）；dirty rect 语义完全沿用 `FramePlan`（`fresh` ⇒ 全量、矩形必须夹紧，F-72 三条继续成立）。
-- GPU 循环里只有两个 `take_background` 应用点：空闲（等待 work/completion 之前）与取帧之后、resize/录制之前（伪代码 (a) (b)）；`ResizeBuffers` 内的重设是同一存储值的重新应用，不是新的取色点。`SetBackgroundColor` 只在下一次 `Present1` 生效（官方），因此 UI 线程任意时刻改色都合法，实际可见时间由 GPU 线程的下一次应用点 + present 决定；`shutdown` / `terminated` 之后的改色请求直接丢弃（`Shared::set_background` no-op），GPU 线程退出前不再应用待定色。应用背景色不消费 waitable、不是 present 出口，token 守恒不变（F-182 的关闭例外是唯一例外）。
-- 不在 UI 线程调用任何 DXGI/D3D12 的等待函数；UI 线程只在 `WM_SIZE`/`WM_DPICHANGED` 更新 `Window` 尺寸、scale 与真实客户区 surface（`set_surface`）并 `wake`，新尺寸随下一帧的 `FrameRequest.surface` 到达（§4.4 / §6.7）。
-- 反馈与 retire 都只在完成观测点推进：提交点只做 `SetEventOnCompletion`（§4.1 的跨平台契约；`completed_at` 不是 `Present1` 返回的时刻）。
+- `Present1(1, 0, dirty)`：`sync=1` 保持 vsync（与 macOS `displaySyncEnabled`、Vulkan `MAILBOX` 的观感一致：不撕裂）；首次 present 必须全量（`DirtyRectsCount = 0`），之后 `Full` 帧只声明**内容子矩形** `(0, 0, content)`（buffer 比内容大，其余部分永远不可见），`Partial` 帧声明 damage（必须非空、完全落在内容内，F-72 ② / S-149）。
+- GPU 循环里只有两个 `take_background` 应用点：空闲（等待 work/completion 之前）与取帧之后、grow/录制之前（伪代码 (a) (b)）；**没有** `Swapchain::set_background_color`，它现在只是 `GpuRenderer.clear_color`，下一次 `Plan::Full` 的 clear 生效。`shutdown` / `terminated` 之后的改色请求直接丢弃（`Shared::set_background` no-op）。应用背景色不消费 waitable、不是 present 出口，token 守恒不变。
+- 不在 UI 线程调用任何 DXGI/D3D12 的等待函数；UI 线程只在 `WM_SIZE`/`WM_DPICHANGED` 更新 `Window` 尺寸、scale 与真实客户区 surface（`set_surface`）并 `wake`，新尺寸随下一帧的 `FrameRequest.surface` 到达（§4.4 / §6.7）。Windows 的 `WM_SIZE` 在最小化时保留上一次真实尺寸，不写 0×0（§6.7）。
+- 反馈、retire 与 **presented 尺寸**都只在完成观测点推进：提交点只做 `SetEventOnCompletion`（§4.1 的跨平台契约；`completed_at` 不是 `Present1` 返回的时刻）。`presented` 只在新旧值不同时 post `WM_APP_COMPOSITION_WAKE`；该消息只唤醒 `GetMessageW`，**不置帧唤醒位**（`event_loop.rs` 的 `WM_APP_COMPOSITION_WAKE` 分支直接返回），否则每次完成 present 都会额外产生一次 `App::frame`。
+- 消费 waitable ⇒ 本帧必须 present。Idle 计划不会发布：Windows 的 `commit_frame` 用 `surface_change_plan` 把目标尺寸变化夹成 `Plan::Full`，而 `set_content_size` 在 buffer 内只是 CPU 记账；其余「不画」出口保留为不变量断言（F-182）。
 - 录制仍在一条 direct list 上（单线程录制；D3D12 的 list 本来就不是自由线程的，官方模型是「list 可并发录制、队列串行提交」，我们只有一条录制流，不需要多 list）。
+- `grow` 是这条循环里唯一会**等 GPU** 的路径：`wait_idle` + 重置全部 in-flight list（释放旧 back buffer 引用）→ 新建 persist + 交换链 → prime（等 fence）→ `SetContent` + `Commit` → 丢弃旧对象。内容不越过 buffer 时 resize 没有 GPU 等待、没有资源重建（F-199 / F-202）。
 
-### 6.4 resize 协议（GPU 线程）
+### 6.4 resize 协议（DComp 几何 + grow-only buffer）
+
+窗口 resize 分成两条互不等待的路径：
 
 ```text
-GPU 线程收到 FrameRequest，surface != 当前 surface：
-  if resize_pending.is_some() {
-      // 先把在飞帧排空到「最后提交值」——只在这里等，且只等一次；UI 线程不受影响
-      wait_fence(last_signal);
-      reset_in_flight_lists();                    // 丢掉对旧 back buffer 的引用
-      swapchain.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
-                              FRAME_LATENCY_WAITABLE_OBJECT);   // flag 原样
-      backbuffers = GetBuffer(0..3);  rtv = 重建;
-      swapchain.set_background_color(background);               // 官方未承诺保留 ⇒ 无条件重设（S-139）
-      persist.recreate(w, h);                     // 旧 persist 走 retire
-      let again = chain2.GetFrameLatencyWaitableObject();       // 见 §11 验证项 2
-      if again != waitable { CloseHandle(waitable); waitable = again; }
-      surface = (w, h); fresh = true;
-  }
+UI 线程（泵的 ②b′，每个泵迭代一次；最小化时跳过）：
+  client    = GetClientRect()                      // 物理像素
+  presented = Window::presented_surface()          // 最近一次**完成 present** 的内容尺寸
+  if (presented, client) != 上次成功应用的几何:
+      scale.SetScaleX2(client.w / presented.w)
+      scale.SetScaleY2(client.h / presented.h)
+      clip.SetLeft2(0); clip.SetTop2(0)
+      clip.SetRight2(presented.w); clip.SetBottom2(presented.h)  // 内容坐标，随 scale 变换
+      device.Commit()                              // 一次 Commit 提交整批属性
+
+GPU 线程（取到 FrameRequest 之后）：
+  if request.surface == 当前内容: 无工作
+  else if request.surface 在 buffer 内:
+      surface = request.surface                    // 纯 CPU 记账；下一帧是 Full
+  else:
+      grow(request.surface):
+          wait_idle(); reset_in_flight_lists()     // 释放旧 back buffer 引用
+          new_persist  = Persist::new(buffer)      // buffer = 逐轴 max(当前, buffer_size(content))
+          new_chain    = Swapchain::for_composition(queue, buffer)
+          prime(new_chain, buffer, content)        // 全量背景 clear + Present1(sync=0) + 等 fence
+          visual.SetContent(new_chain); device.Commit()
+          替换字段 / retire 旧 persist / drop 旧 chain；fresh = false
 ```
 
-- 官方要求：`ResizeBuffers` 前必须释放全部 back buffer 引用、且 GPU 已完成相关工作（[ResizeBuffers](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-resizebuffers)）。
-- resize 后第一帧强制 `Full`（新的后备缓冲内容未定义；`FLIP_SEQUENTIAL` 只保证「同一缓冲跨 present 保留」）。
-- **resize 目标 = 真实客户区**：`w, h` 来自 `FrameRequest.surface`，即平台层写入的 `Window.surface`（§4.4 / §6.7），不再是 `size × scale` 的 covering。`Window::set_surface` 在 `WM_SIZE` 后直接用 lParam 的客户区物理尺寸，`WM_DPICHANGED` 后回读 `client_size()`；最小化时 `GetClientRect` 是 0×0，不拿它当目标，**不重建 1×1**（§6.7 的 `IsIconic` guard）。
-- `ResizeBuffers` 之后**无条件重设背景色**：官方没有承诺 `ResizeBuffers` 保留 `SetBackgroundColor`（[GetBackgroundColor](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值），所以 `Swapchain::resize` 末尾总调 `apply_background`，不依赖重建前的值（S-139）。
-- 实现不在 resize 后重设 `SetMaximumFrameLatency`；waitable 句柄按上面的伪代码重取（§11 验证项 2）。
+- **UI 线程的几何是唯一周期应用点**：`WM_SIZE` / `WM_DPICHANGED` 只记录尺寸，不逐条 `Commit`（P1-2a）。`set_geometry` 同值 no-op；GPU 线程在完成观测点 post `WM_APP_COMPOSITION_WAKE` 只唤醒泵，让「最后一帧的 1:1」在下一轮落地（消息丢了最多晚一轮，`Shared::presented` 才是待处理状态）。
+- **静止 / 拖动**：静止时 `presented == client` ⇒ `scale = (1,1)`、1:1 清晰；拖动中 `presented` 是上一帧内容、`client` 已变 ⇒ 拉伸上一帧铺满客户区，HUD / 边缘不再落后（§36 F-200）。**没有 1/dpi 因子**：visual 的单位是物理像素（S-148）。
+- **resize 目标 = 真实客户区**：`client` 来自平台层写入的 `Window.surface`（`GetClientRect` / `WM_SIZE` 的 lParam / `WM_DPICHANGED` 后回读），不是 `size × scale` 的 covering；最小化时 `GetClientRect` 是 0×0，不拿它当几何、不重建 1×1（§6.7 的 `IsIconic` guard）。
+- **没有 `ResizeBuffers`**：组合交换链在第一次 present 之后恒 `0x887A0001`（S-149），所以 buffer 是 grow-only 高水位：`buffer_size(content) = min(round_up_256(content + 512), 16384)`（`platform/windows/composition.rs::buffer_size`），GPU 侧再与当前 buffer 逐轴取大（`grown_buffer`）。内容仍在 buffer 内时 resize **没有 GPU 等待、没有资源重建**；只有越过 buffer 才 `grow`。VRAM 因此是「历史最大桶」，缩小时不还（V-128）。
+- **grow 的顺序固定为 prime-before-attach**（F-202）：新交换链先全量 clear + `Present1(sync=0)` 并等队列 fence，**然后**才 `SetContent(new) + Commit`；反过来会在 Commit 与 prime 之间露出一帧桌面（已 attach 但未 present 的链在合成器里透明，S-150）。旧对象在视觉切换之后才 drop。代价是越过边界的那一帧只呈现背景色。
+- **首帧**：`Renderer::new_for_hwnd` → `GpuRenderer::new_for_composition` 用 `buffer_size(client)` 建链、prime、attach；`run` 在 `ShowWindow` 之前 `set_geometry(client, client)` 把几何设成 1:1（`platform/windows/event_loop.rs:609-632`）。`WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前完全透明（S-150），所以 prime 必须先于 show。
+- **内容 / buffer 分离**：绘制、viewport、scissor、root uniform、copy、`Present1` dirty 全部按**内容**子矩形；只有资源创建与 clear 用 buffer。`Full` 帧的 `Present1` 只声明 `(0,0,content)`，不是整块 buffer（`swapchain.rs::frame_dirty_rects`）。
+- **waitable**：窗口 resize 不再重建或重取 waitable（不 `ResizeBuffers`）；`grow` 换上的新链自带一个新 waitable，其首个 token 没有显式消费（V-130）。
+- **teardown**：`Composition::shutdown` 在 `DestroyWindow` 之前 `SetRoot(NULL)` + `Commit`，再按 target → visual → scale/clip → device 的顺序释放；关闭顺序保证 GPU 线程已退出（`Renderer::drop` join 后才销毁窗口）。
 
 ### 6.5 fence / retire
 
@@ -512,23 +540,25 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 | 症状 | 处理 |
 |---|---|
 | `Present1` 返回 `DXGI_ERROR_DEVICE_REMOVED` / `DEVICE_RESET` | 粘性 `EngineError::DeviceLost`，通知 UI，停止线程 |
-| `ResizeBuffers` 返回 `DXGI_ERROR_INVALID_CALL`（或 resize 链上任何其它错误） | **显式失败**：`GpuRenderer::resize` 的每一步都先走 `classify()`（DeviceLost 优先归类），GPU 循环收到任何 resize 错误都 `publish_error` + 置粘性错误 + 退出线程。**不重试、不丢弃已取走的帧**（与 Linux/macOS 一致） |
-| 最小化/遮挡 | 正常 `Present1`（DWM 丢弃）；不额外节流（waitable 自己会回到可用状态） |
+| `grow` 失败（新 persist / 新交换链 / prime / `SetContent` / `Commit`） | **显式失败**：`GpuRenderer::grow` 的每一步都先走 `classify()`（DeviceLost 优先归类），GPU 循环收到任何 `grow` 错误都 `publish_error` + 置粘性错误 + 退出线程。**不重试、不丢弃已取走的帧**（与 Linux/macOS 一致）。 |
+| `set_geometry` / `Device::Commit` 失败（UI 线程 DComp） | `EngineError::Composition` 从泵冒泡（窗口已存在，只是不能合成）；`AppInit` 只用于 `Composition::new` 的 COM 创建阶段（F-204）。 |
+| 最小化/遮挡 | 正常 `Present1`（DWM 丢弃）；不额外节流（waitable 自己会回到可用状态）；最小化时几何 pass 跳过。 |
 
-`ResizeBuffers` 的 `DXGI_ERROR_INVALID_CALL` 只可能来自「还有引用 / GPU 未完成」这类**实现错误**：
-本设计的前置条件（§6.4 的 `wait_fence(last_signal)` + `reset_in_flight_lists()` + 按帧重新
-`GetBuffer`）已经保证二者成立，用户输入无法触发它。因此「下一轮重试」是错误策略：surface 已经
-变化而目标没有重建，每一帧都会在同一个调用上失败，UI 只会看到画面不再更新（无声失败）；重试
-也掩盖了真正的引用泄漏。把 resize 错误统一成显式失败后，「不静默、不冻结、不丢帧」三条同时
-成立：UI 在 `poll_renderer` 里拿到粘性错误并退出。
+窗口路径已没有 `ResizeBuffers`：组合交换链在第一次 present 之后恒 `0x887A0001`（S-149），这不是
+「还有引用 / GPU 未完成」的实现错误，而是 API 的固定限制；当前设计用 grow-only buffer + 整条换链
+规避（F-199 / F-202），所以旧版「resize 失败 ⇒ 重试还是退出」的讨论不再适用。离屏路径的
+`GpuRenderer::resize` 仍用 `wait_idle` + 重建 persist（没有 swapchain），其 `classify` 规则不变。
 
 ### 6.7 主线程职责
 
-- `WM_SIZE`/`WM_DPICHANGED`：更新 `Window` 的 size/scale 与**真实客户区 surface**（`set_surface`；`WM_SIZE` 的 lParam 就是新客户区的物理宽高，`WM_DPICHANGED` 回读 `client_size()` 且最小化时用 `IsIconic` 跳过），然后 `dispatcher.wake()`。GPU 线程的目标尺寸由下一帧的 `FrameRequest.surface` 派生（§4.4）。
-- 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
-- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。编码走共享 `render/color.rs::background_srgb`（S-139）。macOS 已接同一契约（layer sRGB + clear linear，F-188 / S-141）；Linux 也已接（persist clear 的 **linear** 值 + `Shared` 背景槽，F-192 / S-143）。
-- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
-- 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
+- `WM_SIZE`/`WM_DPICHANGED`：更新 `Window` 的 size/scale 与**真实客户区 surface**（`set_surface`；`WM_SIZE` 的 lParam 就是新客户区的物理宽高，`WM_DPICHANGED` 回读 `client_size()` 且最小化时用 `IsIconic` 跳过），然后 `dispatcher.wake()`。GPU 线程的目标尺寸由下一帧的 `FrameRequest.surface` 派生（§4.4）。**不逐条 `Commit` DComp 属性**。
+- **②b′（每轮泵迭代）**：`poll_renderers` 之后，按「`Window::presented_surface()` + `NativeWindow::client_size()`」重设 visual 的 scale/clip（同值 no-op；最小化跳过）；每个窗口缓存上次成功应用的 `(presented, client)`，只有变化或 GPU 兜底标记置位时才拿 `Arc<Mutex<Composition>>` 互斥锁。这是几何的唯一周期应用点。
+- **自绘边框缩放（P12）**：`WM_NCLBUTTONDOWN` 进入 `ResizeSession` 并启动 1 ms `WM_TIMER(RESIZE_TIMER_ID)`；`WM_MOUSEMOVE` 只记录最新光标，`SetWindowPos` 只在定时器 tick / `WM_LBUTTONUP` / `WM_CAPTURECHANGED` 执行，按 user32 的定时器粒度合并到 ~60 Hz（F-201）。这把 1000 Hz 鼠标从「每个 `WM_MOUSEMOVE` 一次 `WM_SIZE` + 帧 + present」降到 ~60 次/秒。
+- **`WM_APP_COMPOSITION_WAKE`**：只把 `GetMessageW` 唤醒；**不**置帧唤醒位。几何在 ②b′ 里按 `Shared::presented` 重算，消息丢了最多晚一轮；两次 post 都失败时置 `composition_pending` 兜底（V-130）。
+- 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`（join GPU 线程），再 `Composition::shutdown`，最后 `DestroyWindow`）。
+- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点写入 `clear_color`，下一次 `Plan::Full` 的 clear 生效。组合交换链没有可用的 `SetBackgroundColor`（S-151），Windows 走 `background_linear`；macOS 仍是 layer sRGB + clear linear（F-188 / S-141），Linux 是 persist clear 的 linear（F-192 / S-143）。
+- **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。`Composition::shutdown` 在 `DestroyWindow` 之前调用（F-204）。
+- 平台泵的 1 ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏；缩放合并定时器是另一个 id（`RESIZE_TIMER_ID`）。
 
 ---
 
@@ -689,9 +719,9 @@ recreate_swapchain():
 |---|---|---|---|
 | 提交异步 | `MTLCommandBuffer.commit` | `ExecuteCommandLists`（异步，返回 void） | `vkQueueSubmit` |
 | 完成通知 | `addCompletedHandler` | `ID3D12Fence::SetEventOnCompletion` / 槽 fence | `VkFence` / timeline |
-| 节奏 | `CAMetalDisplayLink` | `FRAME_LATENCY_WAITABLE_OBJECT` | `vkAcquireNextImageKHR` + 合成器 |
-| 背压 | 3 drawable + semaphore(3) | `SetMaximumFrameLatency(1)` + waitable（`SCALING_NONE`，F-185） | image 数 + fence |
-| resize | 重建 persist（无等待） | `ResizeBuffers`（GPU 线程） | `oldSwapchain`（无 wait idle） |
+| 节奏 | `CAMetalDisplayLink` | `FRAME_LATENCY_WAITABLE_OBJECT`（组合交换链） | `vkAcquireNextImageKHR` + 合成器 |
+| 背压 | 3 drawable + semaphore(3) | `SetMaximumFrameLatency(1)` + waitable（grow 换链时沿用） | image 数 + fence |
+| resize | 重建 persist（无等待） | visual `SetScale` / `SetClip` + `Commit`（无 GPU 等待）；内容越过 grow-only buffer 才换链并先 prime | `oldSwapchain`（无 wait idle） |
 | 延迟释放 | completion handler → retire | fence 值 → retire | timeline 值 → retire |
 | 局部更新 | persist + scissor + 整面 blit | persist + scissor + dirty rect copy + `Present1` | persist + scissor + 整面 copy（+ incremental hint） |
 
@@ -702,7 +732,7 @@ recreate_swapchain():
 | Metal | `dispatch_semaphore_wait(NOW)` | 0（失败即跳帧） | 不阻塞 |
 | D3D12 | `WaitForMultipleObjects(work, completion)`（空闲）/ `(waitable, completion)`（渲染前） | 一个 vsync | GPU 线程就是呈现线程，这是它该等的地方；completion 分支只用来及时发布反馈 |
 | D3D12 | 槽 fence | 该帧 GPU 时间 | 复用 allocator 的前置条件 |
-| D3D12 | `ResizeBuffers` | 分配 + 释放旧缓冲 | 已保证 GPU 完成、无引用 |
+| D3D12 | `grow`：`wait_idle` + prime 的槽 fence | 一次 GPU 完成 + 一帧 prime | 只在内容越过 grow-only buffer 时发生；是窗口路径唯一的资源重建点 |
 | Vulkan | `vkAcquireNextImageKHR(100ms)` | 一个 vsync（合成器节流）；超时回循环 | 这就是 Vulkan 的节奏原语；有限超时只用来响应 shutdown |
 | Vulkan | 槽 fence | 该帧 GPU 时间 | 复用命令缓冲的前置条件 |
 
@@ -729,10 +759,11 @@ UI 线程上没有任何一行等待。
 |---|---|
 | `render/frame.rs` | 新增 `FramePayload`（从 macOS 移入）、`FrameRequest`、`FrameFeedback`、`merge_plan` 的纯函数测试 |
 | `render/compositor.rs` | 新增 `Plan::merge`（Full 优先、矩形并集、超限降级 Full）+ 单测 |
-| `render/windows/renderer.rs` **新增** | 门面（最新帧槽/图集槽/反馈/线程句柄），对应 macOS 的 `renderer.rs` |
+| `render/windows/renderer.rs` **新增** | 门面（最新帧槽/图集槽/反馈/线程句柄），对应 macOS 的 `renderer.rs`；完成观测点发布 `presented` 并 post `WM_APP_COMPOSITION_WAKE`（只唤醒）；`grow` 前后 drain 完成通知 |
 | `render/windows/queue.rs` | `submit` 去掉 `wait_for`；新增 `reset_slot`/`wait_slot_fence`；`submit_immediate` 仅测试保留 |
-| `render/windows/swapchain.rs` | 加 `IDXGISwapChain2`、waitable、`SetMaximumFrameLatency(1)`、`DXGI_SCALING_NONE` + `SetBackgroundColor`（创建后 / `ResizeBuffers` 后，S-139）、`present1`、`resize`（带 flag）、`waitable()` |
-| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`resize` 改由 GPU 线程调 |
+| `platform/windows/composition.rs` **新增** | DComp 合成树（device/target/visual/scale/clip，`Arc<Mutex<Composition>>` 串行化）、`buffer_size` grow-only 桶、`visual_geometry`、`shutdown`；`Composition` 运行时错误 = `EngineError::Composition`（§36 F-199 / F-200 / F-204） |
+| `render/windows/swapchain.rs` | 只保留组合交换链：`CreateSwapChainForComposition`（`STRETCH` + `FLIP_SEQUENTIAL` + 3 + waitable）、`SetMaximumFrameLatency(1)`、`present1(frame, sync, content)`（首帧全量、全量帧只声明内容子矩形）、`waitable()`；没有 `for_hwnd` / `resize`（§36 F-199 / S-149） |
+| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`set_content_size` 在 buffer 内纯记账、越界 `grow`（重建 persist + 交换链，先 prime 再 `SetContent`）；`resize` 只服务离屏路径 |
 | `render/linux/swapchain.rs` | 每 image 一个 `render_finished`；`create` 带 `old`；新增 `recreate`/`retire`；present mode 改 `MAILBOX` |
 | `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进；持有 `WpViewport` + `last_destination`，present 前写 destination（F-190）；`set_clear_color` / 初始 `clear_color` = `background_linear`（F-192） |
 | `render/linux/renderer.rs` **新增** | 门面（同 Windows）；`new_for_surface(..., background, viewport)`；`Shared`/`State` 背景槽（F-192） |
@@ -743,8 +774,8 @@ UI 线程上没有任何一行等待。
 | `render/macos/swapchain.rs` | 删除 `next_drawable`；加 display link 相关（或移到 `renderer.rs`）；`contentsGravity` / `backgroundColor` / `contentsScale` / `drawableSize` 的唯一写入口（主线程，F-187 / F-188） |
 | `render/macos/compositor.rs` | `submit_payload` 改为「给定 drawable 渲染」；persist 重建不等待；图层属性写接口移到 `renderer.rs`；persist `clear_color` = 背景色 linear（F-188） |
 | `render/color.rs` **新增（2026-11-15）** | 共享背景色编码：`background_srgb`（Windows DXGI / macOS `CGColor`）与 `background_linear`（macOS / Linux 的 sRGB 渲染目标 clear），共用 `opaque + ColorResolver`（F-188 / S-141 / S-143） |
-| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`（Linux 填 `surface_local`，F-191）；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186 / F-189 / F-191）与 `background`（F-184 / F-188 / F-192） |
-| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7）；macOS 在 Dpi / Resized 之后把真实 backing 写进 `Window::set_surface`（§5.3）；Linux 每轮写 `round(logical × scale)` 的 Wayland buffer（F-191） |
+| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`（Linux 填 `surface_local`，F-191）；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186 / F-189 / F-191）、Windows 的 `presented_surface()` / `take_composition_pending()` 与 `surface_change_plan`（尺寸变化夹成 `Full`），以及 `background`（F-184 / F-188 / F-192 / §36 F-203） |
+| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7），并在泵的 ②b′ 每轮按 presented/client 重设 DComp 几何（同值 no-op）；缩放期间用 1 ms `WM_TIMER` 合并 `SetWindowPos`（§36 F-201）；`WM_APP_COMPOSITION_WAKE` 只唤醒、不请求帧。macOS 在 Dpi / Resized 之后把真实 backing 写进 `Window::set_surface`（§5.3）；Linux 每轮写 `round(logical × scale)` 的 Wayland buffer（F-191） |
 | `lib.rs` / `render.rs` | 模块声明更新（新增两个 `renderer.rs`） |
 
 ### 9.2 删除（已全部落地：F-164、F-166 … F-182）
@@ -773,14 +804,14 @@ UI 线程上没有任何一行等待。
 | 用例 | 通过判据 |
 |---|---|
 | live resize 连续拖动 2s | UI 线程单次 `frame` 耗时 max < 4ms；无 `ResizeBuffers`/`acquire`/`nextDrawable` 出现在 UI 线程的 sample 里；画面跟随拖动 |
-| live resize 无整帧缩放（Windows，`SCALING_NONE`） | 拖动期间卡片 bbox 恒定（911 帧：725×220，`stretch_w = 1.00000`）、文字/HUD 不缩放且锐度不降；新暴露的右/下区域 = 窗口背景色且 ≤ 2 帧；缩小时右/下裁切、右锚 HUD 滞后 1–2 帧后回位（可接受） |
+| live resize 无整帧缩放（Windows，DirectComposition visual） | 真实鼠标快速拖动（604 Hz）：**FPS 63.9 / Frame 15.65 ms / CPU 0.74 ms / Present 0.24 ms**；静止与拖动结束都是 `scale = (1,1)` 的 1:1（标题 / 卡片 pixel-identical，max diff 0），拖动中 DWM 按 `client/content` 拉伸上一帧、HUD 与右缘不再滞后（合成 sweep：间隙 8–21 px vs 静止 15 px、几何滞后 −1…5 px、追平 34 ms / 2 帧）；背景精确 `(11,14,19)`、无透明条。debug 为 CPU-bound（44.8 FPS / CPU 13.59 ms），无 30 fps 平台期；1000 Hz / 高刷新率 / 混合 DPI 未测（V-125 / V-126） |
 | live resize 无整帧缩放（macOS，`kCAGravityBottomLeft` + 真实 backing） | stale 帧卡片 bbox = 静止 bbox（1108×350，1.000×/1.000×）并贴**视觉左上**；卡片文字锐度不降（Laplacian 808 vs 800，+1%；旧 HEAD 624，-22%）；新暴露的右/下条带 = 窗口背景色（(13,15,19) ≈ `#0B0E13`，对静止背景 Δ≤1，无黑/白条）；缩小时右/下裁切、放大时新暴露条带 ≤ 1–2 帧；连续 sweep 卡片高 174–175 恒定；最小化 3 s 恢复 1:1、Esc exit 0、stderr 空。**1x / 真实鼠标拖拽未测**（V-121） |
 | live resize 无整帧缩放（Linux，destination 与 buffer 原子） | `WAYLAND_DEBUG`：1218 次 destination 变更 **1218 次与 attach 同一次 commit**（0 次无 attach、0 mismatch、0 次 `set_buffer_scale`；旧 HEAD 273/294 次无 attach）；buffer = `round(logical×scale)`（701×501@1.25 ⇒ 876×626，旧 877×627）；卡片 bbox 恒定（1.25：725×220；1.0：580×176）、文字锐度不降（Laplacian 1.25：1715.34；1.0：2019.30；旧 HEAD 1.25：616–1048）；2802 次 resize / 3583 次 present、FrameGate 最大间隔 79.6 ms、exit 0、validation 0 VUID；缩小时右/下裁切（1.0：576×176 / 580×134）。1.25 下 7/70 帧整窗变软（bbox 不变，归因 sway 分数缩放采样）；**Mutter/KWin、真实指针拖拽未测**（V-122） |
-| 窗口背景色（`#0B0E13`） | Windows：resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照）。macOS：条带 (13,15,19)/(14,15,19)（F-188）。Linux：clear 夹具 `#0B0E13`→(11,14,19)、`#402080`→(64,32,128)（linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见）；`set_background_color` 经 `Shared` 槽在 GPU 线程空闲 / 下一帧录制前应用（F-192 / S-143） |
-| resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface`），5 s 恢复像素差 0.067% |
-| 真实 DPI 150% / 175% | **未实测**（V-120）：本轮实机只跑 125%（DPI=120）；175% 只有 `256.8 × 1.75 = 449.4` 的取整事实（covering 到 450） |
+| 窗口背景色（`#0B0E13`） | Windows：不再有 resize 背景条；背景是 persist clear，静止 / 拖动后背景 100% 像素 = `(11,14,19)`，首帧 prime 即背景（启动无桌面穿透）；`set_background_color` 在下一次 `Plan::Full` 生效（`clear_color`，linear），组合交换链上的 `SetBackgroundColor` 惰性、已不使用（§36 F-203 / S-151）。macOS：条带 (13,15,19)/(14,15,19)（F-188）。Linux：clear 夹具 `#0B0E13`→(11,14,19)、`#402080`→(64,32,128)（linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见）；`set_background_color` 经 `Shared` 槽在 GPU 线程空闲 / 下一帧录制前应用（F-192 / S-143） |
+| resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface` 与 DComp 几何），恢复后最大化 client 3840×2071、200×150 钳到 400×250 outer 均正常 |
+| 真实 DPI 150% / 175% / 混合多显示器 | **未实测**（V-125 / V-126）：本轮实机只跑 125%（DPI=120）单显示器；150% / 175% / 跨屏不同 DPI 的 DComp visual 1:1 与 grow 未验 |
 | 空闲 2s | 0 帧；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程无自旋唤醒 |
-| 连续帧（HUD/动画）60s | 帧率由显示器决定；HUD 的 FPS 是**提交率**（本机 60Hz 实测 63.9/64.0/60.6，旧版本同环境 61.6–64.4，非回归；与旧口径 58–60 不一致 ⇒ V-120）；无累积延迟（Latency 1.88–13.23 ms） |
+| 连续帧（HUD/动画）60s | 帧率由显示器决定；HUD 的 FPS 是**提交率**（Windows 最终树 63.9 / 15.65 ms / CPU 0.74 ms；旧 HWND 记录 63.9/64.0/60.6）；无累积延迟（Latency 1.88–13.23 ms） |
 | 全屏转场（macOS）/ 遮挡（Win/Linux） | 不阻塞 UI；恢复后继续出帧 |
 | 设备丢失注入（D3D12 debug layer / `VK_EXT_device_fault` / Metal 错误） | UI 线程收到粘性错误并退出，不 panic |
 | 多窗口 | 各窗口独立节奏；一个窗口 resize 不改变另一个窗口帧率 |
@@ -798,10 +829,10 @@ UI 线程上没有任何一行等待。
 | # | 假设 | 实验 | 不成立时的结论 |
 |---|---|---|---|
 | 1 | `CAMetalDisplayLink` 在主 run loop **common modes** 下，live resize / 全屏转场期间仍回调；暂停/恢复 `isPaused` 不丢 drawable | 200 行探针窗口：拖动缩放 10s + 全屏进出各 5 次，统计回调次数与 drawable 尺寸变化 | 若 live resize 期间不回调：把 display link 同时挂 `.eventTracking`（同 run loop 多 mode）再测；仍不回调则本设计的 macOS 段需要重做（评审决定），**不预置运行期分支** |
-| 2 | `ResizeBuffers` 后 `GetFrameLatencyWaitableObject` 返回的句柄仍有效（或返回新句柄），`SetMaximumFrameLatency` 不需重设 | 连续 resize 200 次，每次 resize 后记录句柄值与 `GetMaximumFrameLatency`，并 present 一帧 | 若句柄失效：每次 resize 后重取并比较，不同则关闭旧的（已写进 §6.4 伪代码） |
+| 2 | `ResizeBuffers` 后 `GetFrameLatencyWaitableObject` 返回的句柄仍有效（或返回新句柄），`SetMaximumFrameLatency` 不需重设 | 连续 resize 200 次，每次 resize 后记录句柄值与 `GetMaximumFrameLatency`，并 present 一帧 | **已被 §15.14 / DEVIATIONS §36 F-199 取代**：窗口路径不再 `ResizeBuffers`；grow 换上的新链自带新 waitable，其首个 token 未显式消费（V-130）。本项只保留 HWND 时代的历史结论。 |
 | 3 | GPU 线程 + calloop 并发操作同一 `wl_display`（WSI 私有队列）稳定 | 探针：GPU 线程 present 10k 帧 + UI 线程同时拖动 resize 200 次；`WAYLAND_DEBUG=1` 找协议错误；用 `perf` 看 UI 线程是否自旋 | 若出现自旋/协议错误：`acquire` 改 `timeout=0`、由 frame callback 驱动重试（引入跳帧重试状态机），需评审 |
-| 4 | `SetBackgroundColor` 的 `DXGI_RGBA` 按 linear 还是 sRGB 编码解释 | 同一 HWND swapchain（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE`）分别传 linear 与 sRGB 编码的主题色，截取 resize 条带像素 | **已实测**：按 sRGB 编码字节直写。linear 值 ⇒ 条带 `(1,1,2)`；sRGB 编码 ⇒ `(11,14,19)`（= `#0B0E13`，229 个新尺寸帧 100% 像素）。官方 “recommend linear” 在本路径不适用 ⇒ S-139 |
-| 5 | `ResizeBuffers` 是否保留背景色 | 创建后设置、`ResizeBuffers` 后 `GetBackgroundColor` 回读 | 官方未承诺；隐藏窗口测试在**重设后**回读 == 设定，无法区分 DXGI 是否保留（未做不重设对照）。实现不依赖：`Swapchain::resize` 后无条件重设（S-139 / V-120） |
+| 4 | `SetBackgroundColor` 的 `DXGI_RGBA` 按 linear 还是 sRGB 编码解释 | 同一 HWND swapchain（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE`）分别传 linear 与 sRGB 编码的主题色，截取 resize 条带像素 | **历史（HWND）**：按 sRGB 编码字节直写；linear 值 ⇒ 条带 `(1,1,2)`，sRGB 编码 ⇒ `(11,14,19)`（S-139）。**组合交换链上该 API 惰性**（返回 OK 但不参与合成，S-151），Windows 已改用 persist clear 的 linear（§36 F-203）；本项结论不再适用于当前窗口路径。 |
+| 5 | `ResizeBuffers` 是否保留背景色 | 创建后设置、`ResizeBuffers` 后 `GetBackgroundColor` 回读 | **已过时**：窗口路径不再 `ResizeBuffers`，`SetBackgroundColor` 也不再使用；grow 的新链由 prime 的 full clear 直接写成背景色（§36 F-202 / F-203）。 |
 | 6 | `SetMaximumFrameLatency` 的默认值口径 | 读 Set/Get 两份官方文档；创建后 `GetMaximumFrameLatency()` 实机断言 | `IDXGISwapChain2` 的 Set/Get 两页当前都写默认 1（`IDXGIDevice1::SetMaximumFrameLatency` 才是 3；此前记录的「Set 3 / Get 1」冲突未复现）；实现显式 `SetMaximumFrameLatency(1)`，实机 `Get == 1`（F-185 / V-120） |
 | 7 | `contentsGravity` 在 **flipped** `NSView` 下哪个常量才是视觉左上 | 同一窗口、同一 resize 序列分别用 `kCAGravityTopLeft` 与 `kCAGravityBottomLeft`，录屏逐帧看旧内容贴在哪条边、条带出现在哪侧 | **已实测**：`TopLeft` 把旧内容贴左下（条带在上/右），`BottomLeft` 才贴视觉左上（条带在右/下）。结论写进 `LIVE_RESIZE_GRAVITY` 注释与 S-142；不要按「TopLeft = 左上」的字面直觉改 |
 | 8 | macOS 条带颜色与页面背景的 8-bit 差（layer sRGB + clear linear） | resize 帧截取窗口右/下条带与静止页面的同一像素区域，比较 RGB | **已实测**：条带 (13,15,19)/(14,15,19)，静止背景 (12,14,18)，Δ≤1（≈ `#0B0E13`，无黑/白条、无二次编码）。两种编码不能互换（S-141） |
@@ -809,14 +840,21 @@ UI 线程上没有任何一行等待。
 | 10 | display link 在 AppKit 的 resize 期间是否仍回调（common modes） | AX 连续 `setSize`（约 28 ms/步）+ 单次跳变 960×778 → 1400×950，统计每个尺寸是否有新 drawable 被消费 | **已实测**：resize 期间 display link 持续给 drawable（逐档 resize 的 stale 帧只跳一个 vsync，下一次取到的 drawable 就匹配新尺寸）；**真实鼠标拖拽**（`NSEventTrackingRunLoopMode`）与 1x 未验（V-121） |
 | 11 | Linux `wp_viewport.set_destination` 与 buffer 能否在**同一次** present 提交里原子生效 | `WAYLAND_DEBUG=1` 统计每次 destination 变更前后是否有 attach + commit；旧 / 新代码各跑 1.0 / 1.25 的 jump + sweep | **已实测**：旧 HEAD `8598fe3` 273/294 次 destination 变更无 attach（旧 buffer 被缩放）；新代码 1218/1218 与 attach 同一次 commit（0 无 attach、0 mismatch、0 `set_buffer_scale`）⇒ F-190 |
 | 12 | fractional-scale 的 buffer 尺寸是 `round` 还是 `ceil` | 1.25 下 701×501 逻辑：比较 buffer 实际尺寸与 `round(701×1.25)` / `ceil(...)`，并量文字 Laplacian | **已实测**：旧 ceil 877×627（整面 0.999× 重采样），新 round 876×626；卡片 bbox 恒定、Laplacian 1715.34（旧 616–1048）⇒ F-191 |
-| 13 | Vulkan sRGB attachment 的 clear 值按 linear 还是 sRGB 字节解释 | 无根节点的 `/tmp` 临时夹具分别 clear `#0B0E13` 与 `#402080`，`grim` 后读像素 | **已实测**：`(11,14,19)` / `(64,32,128)`，linear clear → sRGB 往返正确（与 Windows S-139 的 sRGB 字节直写相反、与 macOS S-141 的 clear linear 一致）⇒ S-143 |
+| 13 | Vulkan sRGB attachment 的 clear 值按 linear 还是 sRGB 字节解释 | 无根节点的 `/tmp` 临时夹具分别 clear `#0B0E13` 与 `#402080`，`grim` 后读像素 | **已实测**：`(11,14,19)` / `(64,32,128)`，linear clear → sRGB 往返正确，与 macOS S-141 的 clear linear 一致。Windows 现已同走 linear clear（§36 F-203）；S-139 的 sRGB 字节直写只属 HWND 时代。 |
 | 14 | Linux resize 期间是否有 `OUT_OF_DATE` 重试、Mutter / KWin 的行为是否与 sway 一致 | 逐次统计 `vkQueuePresentKHR` / `OUT_OF_DATE`；在 Mutter / KWin 上重复同一 resize 序列 | **未验**（V-122）：只做了 headless sway 1.11 / wlroots 0.19 / lavapipe；`OUT_OF_DATE` 未逐次计数、Mutter / KWin 未跑 |
+| 15 | `DCompositionCreateDevice2` 能否不传 D3D12 设备、以及传 D3D12 设备是否可用 | 分别以 `NULL` / `IDCompositionDevice` / `DesktopDevice` / `Device2` 的 IID 创建，再以 D3D12 设备重试；每个对象做 target/visual/scale/clip/`SetContent` | **已实测**：`NULL` + `IDCompositionDevice` 或 `DesktopDevice` 均可用；`Device2` IID 不支持；传 D3D12 设备三种 IID 全部 `0x80004002` ⇒ S-149；实现固定 `NULL -> IDCompositionDevice`。 |
+| 16 | 组合交换链的创建参数矩阵 | 逐项改 `Scaling` / `SwapEffect` / `BufferCount` / 格式 / alpha / flags / 尺寸，记录创建 HRESULT 与 `SetMaximumFrameLatency` | **已实测**：`STRETCH` 是唯一可用 scaling（`SCALING_NONE` 创建即 `0x887A0001`）；3 buffers + `FLIP_SEQUENTIAL` + BGRA8 + `ALPHA_MODE_IGNORE` + waitable flag 可用；1 buffer / bitblt / sRGB / 0×0 失败；`SetMaximumFrameLatency` 需要 flag ⇒ S-149。 |
+| 17 | 组合交换链在第一次 present 之后能否 `ResizeBuffers` | 首次 present 后分别对 attached + `SetContent`、detached、丢掉 scene 的链调 resize；另用从未 present 的新链对照 | **已实测**：present 之后全部 `0x887A0001`；只有从未 present 的新链可 resize ⇒ S-149；设计改为 grow-only buffer + 整条换链（F-199）。 |
+| 18 | `WS_EX_NOREDIRECTIONBITMAP` 客户区在第一次 present 之前是什么 | 洋红底垫在窗口后，依次截「无 target / 空 visual / 画好未 attach / attach 未 present / 第一次 present」 | **已实测**：前四种 100% 透明（479k px 全洋红），present 后才出现内容 ⇒ S-150；所以 prime 必须先于 `ShowWindow`（F-202）。 |
+| 19 | visual 的缩放 / 裁剪语义与单位（物理像素、clip 是否随 scale 变换） | 800×600 链在 125% DPI 下依次改 scale 0.8 / 1.0 / 1.25、clip 400×300、客户区 1000×700；逐像素量红/绿/白区域与洋红露出 | **已实测**：identity 1:1（无 1/dpi）；`scale = client/content` + `clip = content` 恰好铺满；clip 被 scale 放大；按 1/dpi 再除会露出洋红 ⇒ S-148 / F-200。 |
+| 20 | `SetBackgroundColor` 在组合交换链上是否生效 | 设置 `(0.25,0.5,0.75,1)` 后 present 多帧，比较像素与 `GetBackgroundColor` 回读 | **已实测**：回读同值、像素完全不变（惰性）⇒ S-151；背景只能走 persist clear（F-203）。 |
 
 前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows
-resize 修复时新增的验证项（未闭环部分登记 V-120）；7–10 是同一天 macOS live-resize 修复新增的
-验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项登记 V-121）；11–14 是同一轮
-Linux live-resize 修复新增的验证项（结论见 §7.3 / §7.5 / §15.11，协议事实登记 S-144，未验证项
-登记 V-122）。
+resize 修复时新增的验证项（未闭环部分登记 V-120，Windows 部分已被 §15.14 取代）；7–10 是同一天
+macOS live-resize 修复新增的验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项
+登记 V-121）；11–14 是同一轮 Linux live-resize 修复新增的验证项（结论见 §7.3 / §7.5 / §15.11，
+协议事实登记 S-144，未验证项登记 V-122）；15–20 是 Windows DirectComposition 重写新增的 probe
+（结论见 §15.14 与 DEVIATIONS §36 S-148 … S-151，未验证项登记 V-125 … V-130）。
 
 ---
 
@@ -1031,6 +1069,12 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
   `ui_core` 改动不涉及该 crate。`-p ui_core` 的口径全绿。
 
 ### 15.9 第五轮闭环（Windows live resize：`SCALING_NONE` + 真实客户区 + 背景色契约，2026-11-15）
+
+> **历史章节（2026-11-15 晚些时候被 §15.14 取代）**：本轮记录的是 HWND flip swapchain +
+> `DXGI_SCALING_NONE` + `SetBackgroundColor` 的方案。§15.14 已把 Windows 窗口路径改为
+> DirectComposition 组合交换链（不再 `ResizeBuffers`、不再 `SetBackgroundColor` 背景条）；
+> 本节保留为历史，当前行为见 §6 / §15.14 与 DEVIATIONS §36。`SetMaximumFrameLatency(1)` 与
+> 「surface = 真实客户区」仍成立。
 
 本轮只改 Windows 窗口路径；macOS/Linux 渲染行为零变化（S-140）。偏差登记见
 [`DEVIATIONS.md`](DEVIATIONS.md) §31（F-184 … F-186 / S-139 / S-140 / V-120）。修复前
@@ -1271,4 +1315,77 @@ S-146 / S-147）：
   （`buffer_scale` 字段与 `set_buffer_scale`、`FrameRequest` 构造）、`render/frame.rs`
   （`FrameRequest.buffer_scale` 契约与配对测试）、`render/linux/compositor.rs`（present 前
   `set_buffer_scale` + `debug_assert` 不变量）、`render/linux/renderer.rs`（`wl_surface` 副本）。
+
+### 15.14 第十轮闭环：Windows DirectComposition resize 重写（2026-11-15）
+
+§15.9 的 HWND + `SCALING_NONE` + `SetBackgroundColor` 只能把新暴露区域填成背景色，内容仍要等
+GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风暴压到 ~30 fps，HUD / 边缘滞后
+1–2 帧。本轮把 Windows 窗口改为 `WS_EX_NOREDIRECTIONBITMAP` + **DirectComposition 组合交换链**：
+客户区全部像素来自 visual，DWM 直接拉伸上一帧，UI 线程一次 `SetScale` + `Commit` 贴住窗口边缘，
+GPU 线程只把新内容画成 1:1；`ResizeBuffers` 不再出现在窗口路径。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §36（F-199 … F-204 / S-148 … S-151 / V-125 … V-130）；probe
+产物在 `target/tmp/dcomp-probe/`，实机证据在 `target/tmp/verify-dcomp/`。
+
+**机制表**：
+
+| 项 | 结论 | 代码位置 |
+|---|---|---|
+| 合成目标 | `DCompositionCreateDevice2(NULL) -> IDCompositionDevice`；`CreateTargetForHwnd(hwnd, false)` + visual + scale + clip；所有 DComp 调用经 `Arc<Mutex<Composition>>` 串行化；`shutdown` 在 `DestroyWindow` 之前 | `platform/windows/composition.rs`；`platform/windows/window.rs` |
+| 交换链 | `CreateSwapChainForComposition` + `STRETCH` + `FLIP_SEQUENTIAL` + 3 + BGRA8 + `IGNORE` + waitable；`SetMaximumFrameLatency(1)`；没有 `for_hwnd` / `resize` | `render/windows/swapchain.rs` |
+| buffer | grow-only 高水位：`min(round_up_256(content + 512), 16384)`，GPU 侧逐轴取大；内容越界才重建 persist + 链 | `platform/windows/composition.rs::buffer_size`；`render/windows/compositor.rs::grown_buffer` |
+| 几何 | visual 单位 = 物理像素；`scale = client/content`、`clip = (0,0,content)`（内容坐标、随 scale 变换）；UI 泵的 ②b′ 每轮应用，GPU 只在 grow 时 `SetContent` + `Commit` | `platform/windows/composition.rs::visual_geometry`；`platform/windows/event_loop.rs` |
+| prime | 新链先全量背景 clear + `Present1(sync=0)` + 等队列 fence，然后 `SetContent + Commit`；首帧在 `ShowWindow` 之前 | `render/windows/compositor.rs::new_for_composition` / `prime_detached` / `grow` |
+| 缩放节奏 | `WM_MOUSEMOVE` 只记录光标；1 ms `WM_TIMER(RESIZE_TIMER_ID)` / 抬起 / 失去捕获才 `SetWindowPos`，合并到 ~60 Hz | `platform/windows/event_loop.rs` |
+| 完成通知 | 完成观测点发布 `presented`；只在尺寸变化时 post `WM_APP_COMPOSITION_WAKE`（只唤醒，不请求帧）；两次 post 失败置 `composition_pending` 兜底 | `render/windows/renderer.rs`；`window.rs` |
+| 背景 | persist clear 的 linear 值；组合交换链的 `SetBackgroundColor` 惰性、已删除；改色只标 full damage + 写共享槽 | `render/color.rs`；`render/windows/compositor.rs` |
+| 错误 | `EngineError::Composition` = DComp 运行时失败；`AppInit` 只用于 `Composition::new` 的 COM 创建 | `error.rs`；`platform/windows/composition.rs` |
+
+**probe 结论**（完整日志 `caps.log` / `dpi.log` / `present.log` / `resize.log`）：
+
+| 项 | 结论 |
+|---|---|
+| 设备 | `NULL` + `IDCompositionDevice` / `DesktopDevice` 可用；`Device2` IID 不支持；传 D3D12 设备全部 `0x80004002` |
+| 交换链 | `STRETCH` 是唯一可用 scaling（`SCALING_NONE` 创建即 `0x887A0001`）；3 + `FLIP_SEQUENTIAL` + BGRA8 + `IGNORE` + waitable 可用；`SetMaximumFrameLatency` 需要 waitable flag |
+| resize | 第一次 present 之后 `ResizeBuffers` 恒 `0x887A0001`（attached / detached / 丢 scene 都一样）；只有从未 present 的新链可 resize |
+| `Present1` | dirty rect 生效；越界 / 负坐标失败；首帧必须全量 |
+| visual | 125% 下 800×600 链 1:1（无 1/dpi）；`scale = client/content` + `clip = content` 铺满；clip 随 scale 变换 |
+| 首帧 | 第一次 present 前客户区 100% 透明；attach 但未 present 同样透明 ⇒ prime 先于 show |
+| 背景 | `SetBackgroundColor` 返回 OK、回读同值，但像素完全不变（惰性） |
+
+**最终树实机验证矩阵**（Windows 11，单显示器 3840×2160 @125%，RTX 5080；release demo
+`--features hud`；详细日志 `target/tmp/verify-dcomp/REPORT2.md`）：
+
+| 用例 | 结果 |
+|---|---|
+| 真实鼠标快速拖动（604 Hz，1200×925 → 900×685 → 1200×925） | **PASS**：FPS 63.9 / Frame 15.65 ms / CPU 0.74 ms / Present 0.24 ms；同夹具 REPORT2 hold / rest 为 63.6 / 64.0 FPS、15.71 / 15.62 ms；最终标题与卡片 pixel-identical（max diff 0），背景 `(11,14,19)`，无透明条 |
+| debug 同拖动 | **PASS**：FPS 44.8 / CPU 13.59 ms（CPU-bound），无 30 fps 平台期 |
+| 启动 | **PASS**：`ShowWindow` 后无桌面穿透 / 黑帧；首个可见内容帧 = prime 背景，下一帧 = 场景；窗口在 prime 后出现 |
+| 合成 / posted 长 sweep | **PASS**：HUD 间隙 8–21 px（静止 15），几何滞后 −1…5 px，追平 34 ms / 2 帧，最终 1:1 |
+| 增长 / VRAM | **PASS**：1200×925 → 1792×1536（118.6 MB）；1882×1253 → 2560×1792（+29.4 MB）；1882×2053 → 2560×2816（+41.9 MB）；1200×1400 → 2000×600 角部 0 增量；3782×603 → 4352×2816（+80.74 MB，仅宽）；900×700 不重建 |
+| 最小化 / 最大化 / 小窗 | **PASS**：恢复、client 3840×2071、200×150 钳到 400×250 outer，均正常渲染 |
+| 退出 | **PASS**：Esc / `WM_CLOSE` exit 0，stderr 空，无 device-loss 输出 |
+| 单跳 / 缩小 / 恢复 | **PASS**：无黑帧 / 空白帧；缩小裁切清晰；最终 1:1 |
+| 离屏 / 快照 / golden | 零语义变化：`GpuRenderer::resize` 只服务离屏（无 swapchain），golden 与快照仍走 persist 读回 |
+
+**未验证 / 残留风险**（V-125 … V-130）：真实鼠标只到 604–626 Hz，1000 Hz 与 120/144/240 Hz 未测
+（V-125）；混合 DPI 多显示器未测（V-126）；pre-attach 的 `Present1` 保留只由运行时视频验证
+（V-127）；grow-only 高水位不还 VRAM、无 shrink 策略（V-128）；60 Hz 定时器低优先级 / 捕获 /
+`SetTimer` 失败（V-129）；新链 waitable token 未显式消费、合成唤醒兜底不能自唤醒（V-130）。
+
+**新增单测与落点**：
+
+- `platform/windows/composition.rs`：`visual_geometry` 4 条（identity、放大铺满、缩小压缩、0 尺寸
+  clamp）、`buffer_size` 2 条（512 下限 / 256 对齐 / 确定性；16384 上限与超限 `Swapchain` 错误）。
+- `window.rs`：`a_windows_surface_change_never_publishes_an_idle_plan` 覆盖 `surface_change_plan`
+  （目标变化 ⇒ `Full`，尺寸不变保持原计划，无 renderer 时不造 `Full`）。
+- `render/windows/compositor.rs`：`grown_buffer` 高水位（1 条用例覆盖 corner / 反向 / 无需增长）；
+  `grow` 失败（无 composition target / 内容 > 16384）显式错误；`resize_then_submit_keeps_the_capacity_contract`
+  变为离屏路径。
+- `render/windows/swapchain.rs`：`composition_desc` 断言 `STRETCH` / `FLIP_SEQUENTIAL` / 3 /
+  BGRA8 / IGNORE / waitable；首帧全量；全量帧只声明内容子矩形；dirty 矩形。
+- `platform/windows/event_loop.rs`：`WM_APP_COMPOSITION_WAKE` 不置帧唤醒位；缩放期间
+  `WM_MOUSEMOVE` 不移动窗口。
+- 落点：`platform/windows/composition.rs`（新增）、`render/windows/{swapchain,compositor,renderer,
+  queue,readback}.rs`、`platform/windows/{window,event_loop}.rs`、`render/{color,compositor,frame}.rs`、
+  `window.rs`、`error.rs`、`platform/dispatcher.rs`。
 

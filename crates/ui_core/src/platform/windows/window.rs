@@ -3,8 +3,11 @@
 //!
 //! P09 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
 //! 自绘标题栏留 P12。
+//!
+//! 客户区**没有**系统的重定向表面（`WS_EX_NOREDIRECTIONBITMAP`）：窗口的全部像素由
+//! [`Composition`] 合成的组合交换链提供，resize 时 DWM 直接拉伸上一帧内容。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::{
     Foundation::{HWND, RECT},
@@ -20,6 +23,7 @@ use crate::{
     platform::{
         dispatcher::Dispatcher,
         windows::{
+            composition::{self, Composition},
             dpi,
             event_loop::{WndProcState, wndproc},
         },
@@ -43,8 +47,18 @@ fn load_arrow_cursor() -> HCURSOR {
 pub(crate) struct NativeWindow {
     id: WindowId,
     hwnd: HWND,
+    /// DirectComposition 合成目标：引用 HWND，因此 `destroy` 先 `shutdown` 它再销毁窗口。
+    ///
+    /// 与窗口的 `GpuRenderer` 共享（`Arc<Mutex<_>>`）：GPU 线程只在内容越过 buffer 时把 visual
+    /// 切到新交换链（`GpuRenderer::grow`），其余 DComp 调用都在 UI 线程；互斥锁串行化全部调用。
+    composition: Arc<Mutex<Composition>>,
     /// `GWLP_USERDATA` 指向它；`Drop` 时回收。
     state: *mut WndProcState,
+    /// 最近一次成功应用到合成树的 `(presented, client)`。
+    ///
+    /// 泵的 ②b′ 只在它与「本轮的 presented / 客户区」不同、或 GPU 线程的兜底标记置位时才
+    /// 碰 `Composition`（同值 `set_geometry` 本来也是 no-op，这里省掉每轮一次互斥锁 / 比较）。
+    composition_geometry: Option<((u32, u32), (u32, u32))>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
@@ -75,9 +89,12 @@ impl NativeWindow {
         );
         // SAFETY: `class` / `title` 是本函数栈上的 NUL 结尾 UTF-16 缓冲，`CreateWindowExW`
         // 同步拷贝；父窗口/菜单为空，实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
+        //
+        // `WS_EX_NOREDIRECTIONBITMAP`：客户区不做系统重定向表面，全部像素来自 DirectComposition
+        // （没有它，DComp 内容会和 GDI 重定向表面叠在一起，resize 时还会多一层 DWM 拉伸）。
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_NOREDIRECTIONBITMAP,
                 windows::core::PCWSTR(class.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
@@ -107,16 +124,39 @@ impl NativeWindow {
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
 
+        // 合成目标在窗口显示之前建立：`WS_EX_NOREDIRECTIONBITMAP` 的客户区只有 DComp 内容。
+        let composition = match Composition::new(hwnd) {
+            Ok(composition) => Arc::new(Mutex::new(composition)),
+            Err(error) => {
+                // SAFETY: 窗口与 `state` 都还没有其它所有者（窗口未显示，`state` 刚由
+                // `Box::into_raw` 产生）；销毁窗口之后才能回收 `WndProc` 状态。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                    drop(Box::from_raw(state));
+                }
+                return Err(error);
+            }
+        };
+
         let mut window = Self {
             id,
             hwnd,
+            composition,
             state,
+            composition_geometry: None,
             scale: Scale::ONE,
             logical_size: options.size,
             ime_area: None,
         };
         window.apply_dpi_and_size(options.size)?;
         Ok(window)
+    }
+
+    /// 合成目标（`render/windows` 在 GPU 线程启动之前挂上组合交换链）。
+    ///
+    /// 返回 `Arc` 的克隆：调用方（`Renderer::new_for_hwnd`）需要把它带进 GPU 线程共享。
+    pub(crate) fn composition(&self) -> Arc<Mutex<Composition>> {
+        Arc::clone(&self.composition)
     }
 
     /// 句柄的 `isize` 形式（引擎内部唯一允许的「无类型」传递）。
@@ -137,6 +177,16 @@ impl NativeWindow {
     /// 当前客户区逻辑尺寸。
     pub(crate) fn logical_size(&self) -> Size {
         self.logical_size
+    }
+
+    /// 最近一次成功应用到合成树的 `(presented, client)`（泵的 ②b′ 缓存；`None` = 尚未应用）。
+    pub(crate) fn composition_geometry(&self) -> Option<((u32, u32), (u32, u32))> {
+        self.composition_geometry
+    }
+
+    /// 记录一次成功的合成几何应用。
+    pub(crate) fn note_composition_geometry(&mut self, geometry: ((u32, u32), (u32, u32))) {
+        self.composition_geometry = Some(geometry);
     }
 
     /// 客户区物理尺寸（创建渲染器 / resize 的唯一输入）。
@@ -176,6 +226,21 @@ impl NativeWindow {
         let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
+        self.scale = scale;
+        let min = (
+            (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
+            (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
+        );
+        // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
+        unsafe {
+            (*self.state).set_min_size(min);
+        }
+        // 0×0 的请求尺寸没有可用的窗口矩形（`physical_client` 只会钳成 1 px）：只记账 DPI，
+        // 等平台 resize / `WM_DPICHANGED` 给出真实尺寸。`apply_scale` 有同样的守卫。
+        if size.width <= 0.0 || size.height <= 0.0 {
+            self.logical_size = size;
+            return Ok(());
+        }
         let window_size = dpi::window_size_for_client(physical_client(size, scale), dpi);
         // SAFETY: 窗口存活；只改尺寸与位置，不重新创建。
         unsafe {
@@ -192,19 +257,10 @@ impl NativeWindow {
         .map_err(|error| window_error("SetWindowPos", error))?;
         // 回读：客户区由系统按真实边框算出，逻辑尺寸以它为准（round 之后可能与请求差 1 px）。
         let client = self.client_size();
-        self.scale = scale;
         self.logical_size = Size::new(
             scale.to_logical(client.0 as f32),
             scale.to_logical(client.1 as f32),
         );
-        let min = (
-            (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
-            (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
-        );
-        // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
-        unsafe {
-            (*self.state).set_min_size(min);
-        }
         Ok(())
     }
 
@@ -295,6 +351,13 @@ impl NativeWindow {
         unsafe {
             (*self.state).set_min_size(min);
         }
+        // 最小化时客户区是 0×0、`logical_size` 保留着上一次真实尺寸：不能拿 0 或最小尺寸去
+        // 重排窗口（那会把恢复后的窗口压成最小尺寸，P2-3）。恢复时的 `WM_SIZE` /
+        // `WM_DPICHANGED` 会重新走到这里。
+        if self.is_minimized() || self.logical_size.width <= 0.0 || self.logical_size.height <= 0.0
+        {
+            return Ok(());
+        }
         // 让窗口按新的 DPI 重新计算非客户区（`WM_NCCALCSIZE` 由系统标题栏处理）。
         let window_size =
             dpi::window_size_for_client(physical_client(self.logical_size, scale), dpi);
@@ -328,6 +391,11 @@ impl NativeWindow {
         if self.hwnd.is_invalid() {
             return;
         }
+        // 顺序（`design/DEVIATIONS.md` §36 F-204）：合成目标引用 HWND，必须**在 HWND 仍然存活时**把 visual 从
+        // 窗口上摘下来并释放全部 DComp COM 对象（`SetRoot(NULL)` + `Commit`，再逐个 drop）。
+        // 关闭顺序保证 GPU 线程已经退出（`pump` 先 drop `App`，`Renderer::drop` join 线程），
+        // 因此这里能拿到互斥锁且不会再有人碰合成树。
+        composition::lock(&self.composition).shutdown();
         // SAFETY: 窗口存活；销毁后把句柄置空避免二次销毁。
         unsafe {
             let _ = DestroyWindow(self.hwnd);

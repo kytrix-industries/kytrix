@@ -18,7 +18,7 @@
 | 1  | **共享层零 unsafe、零平台类型**：`render/{device,frame,retire,compositor,timer}.rs` 全是安全 Rust 的纯数据 + 纯函数；`unsafe` 只出现在 `render/windows/**`（每个块带 `// SAFETY:`）                                                                                                                                                                                    | I1/I9；单后端用 `#[cfg(windows)]` 而非 trait/枚举分派                                                        |
 | 2  | **D8 用 probe 里已验证的查询路径**；`HighestShaderModel` 必须**先填期望上限**（6_8）再查（本机填 6_0 会真的返回 6_0 → 误杀 RTX 5080）                                                                                                                                                                                                                                  | 本机 probe §2.2；F-73                                                                                        |
 | 3  | **持久 offscreen 是唯一绘制目标**；swapchain back buffer **只作 copy 目的地**（不建 RTV、不挂 scissor 绘制）。每帧：`draw(persist, scissor=damage)` → `CopyTextureRegion(persist→back, box=damage)` → `Present1(dirty=damage)`。**persist 资源格式 = `B8G8R8A8_UNORM`，RTV 视图格式 = `B8G8R8A8_UNORM_SRGB`**（编码一次），swapchain 同为 `*_UNORM`（同格式才能 copy） | 少一遍 draw；不对 swapchain buffer 持 RTV 引用（resize 前提）；probe §2.5 的像素结果 + §2.3 的格式互操作实测 |
-| 4  | **Present1 三条实测硬约束**：①swapchain 创建后/每次 `ResizeBuffers` 后**第一次 present 必须全量**（`DirtyRectsCount = 0`），否则 `0x887A0001`；②dirty rect 必须**非空且完全落在 surface 内**；③`pPresentParameters` **不得为 NULL**（本机直接 AV 终止进程）                                                                                                            | probe §2.6；主设计 §2.4 的四条约束不含这三条                                                                 |
+| 4  | **Present1 三条实测硬约束**：①swapchain 创建后**第一次 present 必须全量**（`DirtyRectsCount = 0`），否则 `0x887A0001`；②dirty rect 必须**非空且完全落在内容范围内**；③`pPresentParameters` **不得为 NULL**（本机直接 AV 终止进程）。窗口 swapchain 现为组合交换链，不再 `ResizeBuffers`（DEVIATIONS §36 / F-199 / S-149）                                                                                                            | probe §2.6；主设计 §2.4 的四条约束不含这三条；窗口目标见 `async-render-pipeline.md` §6.4 |
 | 5  | **D3D12 没有 `CopySubresourceRegion1`**（那是 D3D11.3 `ID3D11DeviceContext1`）；等价物是 `CopyTextureRegion` + `D3D12_BOX`。区域求交在共享层 `render/compositor.rs` 做完，不引 Win32 `IntersectRect`                                                                                                                                                                   | windows 0.62.2 源码事实；F-70                                                                                |
 | 6  | 帧流程 = `begin(等 slot fence → 复位 allocator/list → drain retire) → 上传(实例/图集脏行/root 常量) → draw persist(逐 damage scissor) → copy persist→back → Present1 → signal → (同步)等本帧`                                                                                                                                                                          | §6；probe §2.5/§2.7 的 ring 实测                                                                             |
 | 7  | 只有 descriptor table（SRV `t0..t3`）+ 28 DWORD root constant（`b0`）+ **静态采样器** `s0`；根签名 blob **184 B**。**不启用** SM 6.6 `ResourceDescriptorHeap`                                                                                                                                                                                                          | probe §2.4（blob 184 B、PSO/DSV 全绿）；S-74（WARP 报 SM 6.8/Tier3，启用会让 CI golden 与真机分叉）          |
@@ -119,7 +119,7 @@ warp caps:     FL=12_1 SM=6_8 binding_tier=3 heap_tier=2 tiled=3 min_precision=3
 | 4 | `D3D12_FEATURE_D3D12_OPTIONS`                                             | `ResourceBindingTier = 3`（≥2 ✓）、`ResourceHeapTier = 2`、`TiledResourcesTier = 4`（WARP 3）、`MinPrecisionSupport = 2`（WARP 3）                                        |
 | 5 | `OPTIONS4.Native16BitShaderOpsSupported`                                  | 两者 `true`（不加门槛，只记录）                                                                                                                                            |
 | 6 | `D3D12_FEATURE_ROOT_SIGNATURE` / `OPTIONS19.MaxSamplerDescriptorHeapSize` | `HighestVersion = 1`（V1_0）；`MaxSamplerDescriptorHeapSize` 硬件 **4080** / WARP **2097152**                                                                              |
-| 7 | FLIP_SEQUENTIAL + BufferCount ≥ 2                                         | 创建成功；`GetDesc1` 回读 `format=DXGI_FORMAT(87)=B8G8R8A8_UNORM`、`buffercount=3`、`SwapEffect=3`、`Scaling=0(STRETCH)`、`flags=0`。**`Scaling` 已于 2026-11-15 改为 `DXGI_SCALING_NONE`（F-184），本行是当时的 probe 记录**，现行为见 `async-render-pipeline.md` §6.2 |
+| 7 | FLIP_SEQUENTIAL + BufferCount ≥ 2                                         | 创建成功；`GetDesc1` 回读 `format=DXGI_FORMAT(87)=B8G8R8A8_UNORM`、`buffercount=3`、`SwapEffect=3`、`Scaling=0(STRETCH)`、`flags=0`。**窗口路径已于 2026-11-15 改为组合交换链（`CreateSwapChainForComposition` + `DXGI_SCALING_STRETCH` + waitable，DEVIATIONS §36 F-199 / S-149），本行是当时的 HWND probe 记录**，现行为见 `async-render-pipeline.md` §6.2 |
 | 8 | 可选 SM6.6 / Tier3                                                        | **两者都满足**（硬件 Tier3 + SM6.8，WARP 同）→ 若启用 `ResourceDescriptorHeap`，CI 的 WARP golden 会走与真机不同的路径（主设计 §6.4 的同一条警告）→ 决定**不启用**（S-74） |
 
 ### 2.3 offscreen clear + readback（sRGB 语义与 footprint，实测）
@@ -205,10 +205,11 @@ frame2: damage = (128,128,48,32)
 `CreateSwapChainForHwnd(queue, hwnd, {256×256, B8G8R8A8_UNORM, BufferCount 3, FLIP_SEQUENTIAL, STRETCH, IGNORE})` 成功，
 `GetDesc1` 回读与请求一致。逐条调用结果：
 
-> **已被 `async-render-pipeline.md` §6.2/§6.4 取代（2026-11-15，F-184 / F-186 / S-139）**：本段是
-> `DXGI_SCALING_STRETCH` 下的历史 probe；窗口 swapchain 现为 `DXGI_SCALING_NONE` + 创建后
-> `SetBackgroundColor`（sRGB 编码），resize 目标也改为真实客户区，见 `async-render-pipeline.md`
-> §6.2/§6.4。下面的 `Present1` 三条约束（F-72）本身仍然成立。
+> **历史 probe（HWND swapchain）**：本段是 P08 的 `CreateSwapChainForHwnd` 记录。窗口路径已于
+> 2026-11-15 改为 `CreateSwapChainForComposition` + `IDCompositionVisual`（`STRETCH` + waitable，
+> 无 `SetBackgroundColor`、无 `ResizeBuffers`；DEVIATIONS §36 F-199 / S-149）。下表里「第一次
+> present 必须全量」「dirty rect 非空且落在内容内」「`pPresentParameters` 非 NULL」三条仍成立，
+> 其余 HWND 专属结论只用于追溯；现行为见 `async-render-pipeline.md` §6.2 / §6.4。
 
 | 调用                                                                      | 结果                                                   |
 |---------------------------------------------------------------------------|--------------------------------------------------------|
@@ -237,7 +238,13 @@ frame2: damage = (128,128,48,32)
 > 与「flip model 只支持 `Count = 1`」一致 ⇒ 主设计 §2.4 约束 3 的「MSAA swapchain 不支持 dirty/scroll」在 D3D12 上
 > 根本走不到（创建即失败），**不是**运行时分支。
 
-### 2.7 resize（**本机受限**，最小复现与替代）
+### 2.7 resize（历史：HWND `ResizeBuffers`；当前窗口目标为组合交换链）
+
+> **当前设计（2026-11-15）**：Windows 窗口路径不再调用 `ResizeBuffers`。窗口是
+> `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`，第一次 present 之后
+> `ResizeBuffers` 在可见窗口上也恒 `0x887A0001`（`target/tmp/dcomp-probe/resize.log`，DEVIATIONS
+> §36 S-149）；buffer 改为 grow-only 高水位，内容越过 buffer 时整条换链并先 prime（§36 F-199 /
+> F-202，`async-render-pipeline.md` §6.4）。下表与最小复现是 P08 的 HWND 时代记录，保留用于追溯。
 
 | 场景                                                                                                                      | 结果                                                           |
 |---------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
@@ -253,12 +260,11 @@ frame2: damage = (128,128,48,32)
 **最小复现**：`CreateSwapChainForHwnd`（隐藏 `WS_POPUP`，256×256，FLIP_SEQUENTIAL，BufferCount 3）→ `GetBuffer(0)` →
 `ClearRenderTargetView` → `Present(1,0)` → `ResizeBuffers(0,0,0,DXGI_FORMAT_UNKNOWN,0)`。
 
-**替代/处置**：本机是**非交互会话 + 隐藏窗口**（DWM 不消费 flip 队列），无法验证「present 之后再 resize」。P08 的定案：
-①resize 的**纯逻辑**（何时 full、何时重建 persist、绝不重建实例容量）用单测覆盖；②`ResizeBuffers` 的调用顺序
-（`wait_idle` → 释放所有 back buffer 引用与承载 RTV 的堆 → `list.Reset` → `ResizeBuffers(0,0,0,UNKNOWN,0)`）按 probe
-失败路径反推；
-③**P09 必须在可见窗口 + 真实桌面会话**上补一条 resize 实机验证（进 §11 R-5 与 V-55）；
-④`ResizeBuffers` 失败一律 `EngineError::Swapchain { detail }` **不重试**（失败会污染 allocator）。
+**当时的处置（P08/P09）**：本机是**非交互会话 + 隐藏窗口**（DWM 不消费 flip 队列），无法验证「present 之后再 resize」。
+P08 用纯逻辑单测覆盖 resize 的 full / persist 重建，`ResizeBuffers` 失败一律 `EngineError::Swapchain`
+**不重试**（失败会污染 allocator）；P09 实机闭环（§2.7 的 F-86 泄漏修复）后 HWND 路径曾可用。
+**当前处置**：窗口路径已删除 `ResizeBuffers`（组合交换链不可 resize），`grow` 的每一步失败以
+`EngineError::Composition` / `Swapchain` 显式失败、不重试；离屏路径仍用 `wait_idle` + 重建 persist。
 
 ### 2.8 in-flight ring / GPU timestamp / device lost + DRED
 
@@ -295,7 +301,7 @@ frame2: damage = (128,128,48,32)
 | 项                             | 最小复现                                                                                                 | 替代                                                                                      |
 |--------------------------------|----------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------|
 | D3D12 debug layer              | `D3D12GetDebugInterface::<ID3D12Debug>` → `0x887A002D`                                                   | DRED + WARP 像素断言；debug layer **不得**成为启动前提（缺 SDK 组件就失败会杀掉所有装机） |
-| present 之后的 `ResizeBuffers` | §2.7 的 5 步                                                                                             | 纯逻辑单测 + P09 实机验证（V-55）；失败即致命                                             |
+| present 之后的 `ResizeBuffers` | §2.7 的 5 步（历史 HWND）                                                                                | **已不再使用**：组合交换链在第一次 present 之后固定失败（§36 S-149），窗口目标改为 grow-only buffer + 整条换链（§36 F-199 / F-202） |
 | `Present1(NULL)`               | 直接调用 → 进程终止                                                                                      | 永远传零填充结构（`DirtyRectsCount = 0`）                                                 |
 | MSAA swapchain                 | `Count=4 + DISCARD` 创建 → `0x887A0001`                                                                  | 不需要运行时分支（flip 只支持 Count 1）                                                   |
 | `Win32_Security` 缺失          | `CreateEventW` → `error[E0425]: cannot find function ... not found in windows::Win32::System::Threading` | 加 feature（F-79）                                                                        |
@@ -545,7 +551,7 @@ pub(crate) enum Plan {
 /// 三条输入：本帧 damage 摘要、合并后的物理矩形、surface 的物理矩形。
 ///
 /// 规则（逐字）：
-/// 1. `swapchain_fresh`（新建/`ResizeBuffers` 后/`damage.full`）→ `Full`；
+/// 1. `swapchain_fresh`（新建 / prime 之后 / `damage.full`）→ `Full`；
 /// 2. 逐个与 `surface` 求交，**丢弃空矩形**；任何越界都被夹紧（probe：越界 dirty rect → INVALID_CALL）；
 /// 3. 夹紧后为空 → `Idle`；
 /// 4. 数量 > `MAX_DAMAGE_RECTS` → `Full`（与 `DamageAccumulator` 的阈值同源，防御第二真值）。
@@ -676,39 +682,50 @@ impl Queue {
 
 ### 5.3 `windows/swapchain.rs`
 
+> **2026-11-15 重写（DEVIATIONS §36 F-199 / S-149）**：窗口 swapchain 改为组合交换链
+> （`CreateSwapChainForComposition`），不再有 `for_hwnd` / `resize`。下面的 P08 结构是历史；
+> 当前结构见本节的「当前实现」。
+
+**当前实现**（`crates/ui_core/src/render/windows/swapchain.rs`）：
+
+```rust
+pub(crate) struct Swapchain {
+    raw: IDXGISwapChain1,
+    waitable: HANDLE,       // FRAME_LATENCY_WAITABLE_OBJECT，Drop 时 CloseHandle
+    first_present: bool,    // 第一次 present 必须全量（DirtyRectsCount = 0）
+}
+
+impl Swapchain {
+    /// `buffer` 是 grow-only 桶（内容 + 512 余量、256 对齐）；不再 `ResizeBuffers`。
+    pub(crate) fn for_composition(queue: &Queue, buffer: (u32, u32)) -> Result<Self, EngineError>;
+    pub(crate) fn waitable(&self) -> HANDLE;
+    pub(crate) fn raw(&self) -> &IDXGISwapChain1;   // IDCompositionVisual::SetContent 的输入
+    pub(crate) fn back_buffer(&self) -> Result<ID3D12Resource, EngineError>;
+    /// `content` 是内容子矩形；首帧全量、Full 帧只声明内容、Partial 帧声明 damage。
+    pub(crate) fn present1(&mut self, frame: &mut FramePlan, sync: u32,
+                           content: (u32, u32)) -> Result<(), EngineError>;
+}
+```
+
+**创建参数（定死）**：`{ Width/Height = buffer, Format: B8G8R8A8_UNORM, Stereo: false,
+SampleDesc {1,0}, BufferUsage: RENDER_TARGET_OUTPUT, BufferCount: 3,
+Scaling: DXGI_SCALING_STRETCH, SwapEffect: FLIP_SEQUENTIAL, AlphaMode: IGNORE,
+Flags: FRAME_LATENCY_WAITABLE_OBJECT }`。创建后 `SetMaximumFrameLatency(1)`（没有 waitable flag
+会失败），再取 `GetFrameLatencyWaitableObject`。`SCALING_NONE` / 1 buffer / bitblt / sRGB / 0×0
+的创建全部失败 `0x887A0001`（probe `caps.log`，S-149）。**没有** `SetBackgroundColor`（惰性，
+S-151）、**没有** `ResizeBuffers`（present 后固定失败，S-149）。
+
+**历史（P08）结构**（保留用于追溯；不要照它实现）：
+
 ```rust
 pub(crate) struct Swapchain {
     raw: IDXGISwapChain1,
     size: (u32, u32),
     format: DXGI_FORMAT,      // B8G8R8A8_UNORM（sRGB flip swapchain 被拒，见 §2.3）
-    fresh: bool,              // 创建后 / ResizeBuffers 后 = true ⇒ 第一次 present 必须全量
+    fresh: bool,              // 创建后 = true ⇒ 第一次 present 必须全量
 }
-
-impl Swapchain {
-    pub(crate) fn for_hwnd(queue: &ID3D12CommandQueue, hwnd: HWND, size: (u32, u32))
-                           -> Result<Self, EngineError>;                 // P09 调用
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn for_composition(queue: &ID3D12CommandQueue, size: (u32, u32))
-                                  -> Result<Self, EngineError>;                 // 无 HWND（probe §2.6 已验证 Present1 可用）
-    /// `plan` 由调用方给（`Full` ⇒ `DirtyRectsCount = 0`）。
-    pub(crate) fn present(&mut self, plan: Plan, sync: u32) -> Result<(), EngineError>;
-    pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError>;
-    pub(crate) fn back_buffer(&self) -> Result<ID3D12Resource, EngineError>;
-}
+// for_hwnd / resize / present(plan, sync) —— 均已被组合交换链路径删除。
 ```
-
-**创建参数（定死）**：`{ Width/Height, Format: DXGI_FORMAT_B8G8R8A8_UNORM, Stereo: false, SampleDesc {1,0},
-BufferUsage: RENDER_TARGET_OUTPUT, BufferCount: 3, Scaling: STRETCH, SwapEffect: FLIP_SEQUENTIAL,
-AlphaMode: IGNORE, Flags: 0 }`。创建后 `GetDesc1()` 复核 `SwapEffect == FLIP_SEQUENTIAL && BufferCount >= 2`，否则
-`EngineError::UnsupportedGpu { required: "…FLIP_SEQUENTIAL / BufferCount >= 2", actual }`。
-
-> **2026-11-15 修订（被 `async-render-pipeline.md` §6.2/§6.4 取代）**：`Scaling` 改为
-> `DXGI_SCALING_NONE`，创建后与每次 `ResizeBuffers` 后调用 `SetBackgroundColor`（**sRGB 编码**，
-> 不是官方建议的 linear；本机实测见 S-139），`SetMaximumFrameLatency(1)`（F-185）；
-> `FLIP_SEQUENTIAL`、3 buffers、`AlphaMode: IGNORE` 与 flag 保留。`resize` 的目标尺寸来自
-> 真实客户区（F-186），`ResizeBuffers` 后无条件重设背景色。本节其余创建参数（format、
-> 无 RTV、`CopyTextureRegion` 同格式）仍有效；`resize` 的 `wait_idle` 顺序是 P08 的历史流程
-> （P09 后改为 GPU 线程的 §6.4 协议）。
 
 **为什么 swapchain 用 `*_UNORM` 而不是 `*_UNORM_SRGB`**：①probe 实测 **sRGB flip swapchain 创建即失败**
 （`0x887A0001`，§2.3），所以 `*_SRGB` 不是可选项；②`CopyTextureRegion` 要求源/目标**同格式**，而 persist 的资源格式必须是
@@ -718,22 +735,23 @@ UNORM 才能与 swapchain 匹配；③编码只发生一次——在 persist 的
 ⇒ golden/快照读回的对象是 **persist**（UNORM 资源里的 sRGB 编码字节），与 present 路径解耦；读回的 footprint 描述用
 **资源格式**。
 
-**`present` 的实现**（逐字）：
+**`present1` 的 dirty 规则**（当前）：
 
 ```text
-let rects: [RECT; 16];  let n = match plan { Full => 0, Partial(r) => r.len() };
-if self.fresh { n = 0; self.fresh = false; }            // F-72 ①：首帧/重建后必须全量
-let params = DXGI_PRESENT_PARAMETERS { DirtyRectsCount: n,
-    pDirtyRects: if n == 0 { null_mut() } else { rects.as_mut_ptr() },
-    pScrollRect: null_mut(), pScrollOffset: null_mut() };  // 滚动提示 P12 再做（F-61 的 ScrollHint 延后）
-let hr = raw.Present1(sync, DXGI_PRESENT(0), &params);     // 永不为 NULL（F-72 ③）
-hr.ok()?;                                                  // 失败 → removed_reason() 分类
+if first_present { count = 0; }                        // 首帧全量（F-72 ①）
+else if frame.is_full() { count = 1; rect = (0,0,content); }  // 只呈现内容子矩形
+else { count = frame.present_dirty().len(); rects = damage; } // 必须非空且落在内容内
+let params = DXGI_PRESENT_PARAMETERS { DirtyRectsCount: count,
+    pDirtyRects: if count == 0 { null_mut() } else { rects.as_mut_ptr() },
+    pScrollRect: null_mut(), pScrollOffset: null_mut() };      // F-72 ③：永不为 NULL
+let hr = raw.Present1(sync, DXGI_PRESENT(0), &params);
+hr.ok()?;                                                      // 失败 → removed_reason() 分类
 ```
 
-- **滚动**：P08 **不**发 scroll rect（`ScrollHint` 仍是 P12 的产物，F-61）；只留 `present` 的 `params` 位置。
-- **`resize`**：`queue.wait_idle()` → drop 所有 back buffer 引用（P08 不建 RTV ⇒ 只有 `GetBuffer` 的临时引用）→
-  `list.Reset`（在 `Queue::wait_idle` 内）→ `ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))` →
-  `fresh = true`。失败 → `EngineError::Swapchain { detail }`，**不重试**（§2.7）。
+- **滚动**：P08 **不**发 scroll rect（`ScrollHint` 仍是 P12 的产物，F-61）；只留 `present1` 的 `params` 位置。
+- **resize**：**没有这个方法**。内容越过 buffer 时由 `GpuRenderer::grow` 整条替换交换链（先 prime 再
+  `SetContent`，`async-render-pipeline.md` §6.4 / DEVIATIONS §36 F-199 / F-202）；组合交换链在第一次 present
+  之后 `ResizeBuffers` 恒 `0x887A0001`（S-149）。
 
 ### 5.4 `windows/pipeline.rs`
 
@@ -982,11 +1000,11 @@ submit(index, buffer, plan, timings):
 |----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 资源格式             | `DXGI_FORMAT_B8G8R8A8_UNORM`；**RTV 视图格式 = `DXGI_FORMAT_B8G8R8A8_UNORM_SRGB`**（P07 §2.3 的唯一编码点；probe §2.3 实测 clear(0.5)→188）                                     |
 | 采样                 | `SampleDesc { Count: 1, Quality: 0 }`、`MipLevels 1`、`ArraySize 1`、`Flags = ALLOW_RENDER_TARGET`                                                                              |
-| 尺寸                 | = surface 的物理像素（`size × scale` 的 covering 结果）；resize 时重建                                                                                                          |
+| 尺寸                 | 窗口路径 = grow-only buffer（内容 + 512 余量、256 对齐；DEVIATIONS §36 F-199）；离屏路径 = 请求的物理像素。绘制 / copy / present 只按**内容**子矩形，`fresh` 帧才覆盖整块 buffer |
 | 内容权威             | **是**：damage 外的像素永远由它保持；back buffer 只是它的「本帧脏矩形切片」                                                                                                     |
-| 全帧帧               | 先 `ClearRenderTargetView(clear_color)` 再画（不清会留下上一帧的残影；damage 外的像素在这一帧本来就会被重画或清掉）                                                             |
+| 全帧帧               | 先 `ClearRenderTargetView(clear_color)` 再画（不清会留下上一帧的残影；damage 外的像素在这一帧本来就会被重画或清掉）；`fresh` 时 clear 整块 buffer，否则只保证内容子矩形 |
 | 局部帧               | 不 clear；scissor 内先画覆盖上一帧内容（premultiplied 混合需要正确底子 → 因为 persist 是完整的，直接画即正确）                                                                  |
-| 与 swapchain 的 copy | `CopyTextureRegion`（**同格式 `B8G8R8A8_UNORM`**、1:1、无缩放），`SRC_BOX = damage`，`DST = (damage.left, damage.top)`；`Full` 时用 `CopyResource`（整面，probe frame1 已验证） |
+| 与 swapchain 的 copy | `CopyTextureRegion`（**同格式 `B8G8R8A8_UNORM`**、1:1、无缩放），`SRC_BOX = damage`，`DST = (damage.left, damage.top)`；`Full` 也走 `CopyTextureRegion`（`fresh` 拷整块 buffer，其余只拷内容子矩形；`CopyResource` 在 flip model 下会被拒绝，F-82） |
 | N-buffer 陈旧        | **不需要**「拷回前 N−1 帧」：本帧的每个 damage 矩形在 present 前都被写成了正确内容（copy + 可能的重画），而 present 只声明这些矩形。`fresh`/`Full` 帧会把整面写一遍             |
 
 ### 6.4 `Present1` 四条硬约束 → 落地检查单
@@ -1002,7 +1020,7 @@ submit(index, buffer, plan, timings):
 
 | # | 规则                                                                            | 违反后果             |
 |---|---------------------------------------------------------------------------------|----------------------|
-| 5 | 创建后 / `ResizeBuffers` 后**第一次 present 必须全量**（`DirtyRectsCount = 0`） | `0x887A0001`         |
+| 5 | 创建后**第一次 present 必须全量**（`DirtyRectsCount = 0`；组合交换链不再有 `ResizeBuffers`） | `0x887A0001`         |
 | 6 | dirty rect 必须**非空且完全落在 surface 内**                                    | `0x887A0001`         |
 | 7 | `pPresentParameters` **不得为 NULL**                                            | 进程终止（AV）       |
 | 8 | `pScrollOffset` 必须与 `pScrollRect` 成对（DXGI 不校验）                        | 视觉错位（无错误码） |
@@ -1260,10 +1278,13 @@ assert!(error.to_string().contains("FL 11_0 / SM 6_0 / BindingTier 1"));
 `swapchain` 的 FLIP_SEQUENTIAL/BufferCount 失败路径同理：`Swapchain::validate(&desc1)` 抽成纯函数，单测注入
 `SwapEffect = DISCARD` 的 `DXGI_SWAP_CHAIN_DESC1` 断言 `UnsupportedGpu`。
 
-### 10.4 交互式/实机验证（不进 CI，登记为 V-55）
+### 10.4 交互式/实机验证（历史：HWND；当前由 demo 实机覆盖）
 
-- `ui_core_D3D12_HWND_TESTS=1` 时才跑：真 HWND（隐藏窗口）建 swapchain → `Present1(dirty)` → `ResizeBuffers`。
-  本机非交互会话下 resize 段已知失败（§2.7），**默认 `#[ignore]`** 且不计入门禁；P09 在可见窗口会话上把它转正。
+- **历史**：`ui_core_D3D12_HWND_TESTS=1` 时才跑真 HWND（隐藏窗口）建 swapchain → `Present1(dirty)` →
+  `ResizeBuffers`；本机非交互会话下 resize 段失败（§2.7），默认 `#[ignore]`。P09 曾把它转正。
+- **当前**：窗口路径已无 HWND swapchain / `ResizeBuffers`（组合交换链，DEVIATIONS §36 F-199）；
+  `resize.log` 的 probe 与 release demo 的实机矩阵（DEVIATIONS §36.5 / `async-render-pipeline.md` §15.14）
+  覆盖同一路径，不再依赖这个 ignore 测试。
 
 ---
 
@@ -1275,7 +1296,7 @@ assert!(error.to_string().contains("FL 11_0 / SM 6_0 / BindingTier 1"));
 | R-2 | **`windows 0.62.2` 的方法名/返回类型差异**（`Present1 -> HRESULT`、`ResizeBuffers -> Result`、`RemoveDevice` 在 `ID3D12Device5`、`CreateEventW` 被 `Win32_Security` 门控） | 编译期即失败                | §2.9 的逐条事实 + F-79；实现期以 §2.9 为清单                                                                                            |
 | R-3 | **WARP 能力集**（本机 WARP = FL 12_1 / SM 6_8 / Tier3，`max_sampler_heap = 2097152` 与硬件 4080 不同）                                                                     | CI golden 与真机分叉        | 不启用 SM6.6 路径（S-74）；快照只比结构与容差内像素；golden 按设备分组（主设计 §6.4）                                                   |
 | R-4 | **readback 同步与格式**（早 `Map` 读到垃圾、`RowPitch` 手算错、忘记 `Unmap`、footprint 用视图格式而非**资源格式**）                                                        | 快照随机花屏/UB/尺寸错      | `GetCopyableFootprints` 唯一来源且用资源格式（`B8G8R8A8_UNORM`）；每槽独立 READBACK buffer；probe §2.3 的数字写进单测（256×256 → 1024） |
-| R-5 | **`ResizeBuffers` 在本机（非交互会话 + 隐藏窗口）失败**，且失败会污染 allocator                                                                                            | resize 路径无法在本机验证   | §2.7 的处置（纯逻辑单测 + 失败即致命 + P09 实机 V-55）；实现期**不得**把「失败重试」写成兜底                                            |
+| R-5 | **`ResizeBuffers` 在本机（非交互会话 + 隐藏窗口）失败**，且失败会污染 allocator。**2026-11-15（§36）已闭环**：组合交换链在第一次 present 之后固定失败（S-149），窗口路径不再 resize；grow 用整条换链 + prime。 | resize 路径无法在本机验证 | 历史处置（纯逻辑单测 + 失败即致命）；当前 `grow` 失败显式冒泡，**不得**写成「失败重试」 |
 | R-6 | **`Present1` 兼容性**（首帧全量、空/越界矩形、NULL 指针）                                                                                                                  | 首帧黑屏或进程终止          | F-72 的三条 + `fresh` 状态机 + `plan` 的夹紧；`present` 里 `debug_assert!(n > 0                                                         || full)` |
 | R-7 | **compositor 性能**（每 damage 矩形一次 draw 循环；16 矩形 × 8 段 = 128 draw）                                                                                             | 脏区多时 CPU 录制变慢       | damage 阈值 16/50% 已有（P06）；每帧 draw 录制 ~128 次、可忽略；P18 的 L4 基准量化（`Present`/`Gpu` 段已有采样）                        |
 | R-8 | **device lost 后仍被调用**（错误对象被吞）                                                                                                                                 | 崩溃/UB                     | `lost` 粘性 + `submit` 入口早退 + 单测（`RemoveDevice` 后二次 submit 返回同一错误）                                                     |
@@ -1304,7 +1325,7 @@ assert!(error.to_string().contains("FL 11_0 / SM 6_0 / BindingTier 1"));
 |----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **F-70** | 主设计 §2.4 的 `CopySubresourceRegion1` 在 **D3D12 不存在**（那是 D3D11.3 `ID3D11DeviceContext1`）；`windows 0.62.2` 只暴露 `CopyTextureRegion`。P08 用 `CopyTextureRegion` + `D3D12_BOX`，区域求交在共享层 `render/compositor.rs`（不用 Win32 `IntersectRect`）                                                                                                                |
 | **F-71** | 帧结构改为「**persist 是唯一绘制目标**，swapchain back buffer 只作 `COPY_DEST`（不建 RTV、不逐 scissor 画到 back）」；主设计 §2.4 的「copy 到 back 再画」被取代                                                                                                                                                                                                                 |
-| **F-72** | `Present1` 三条**实现期实测**约束：①创建后/`ResizeBuffers` 后第一次 present 必须全量；②dirty rect 非空且完全在 surface 内；③`pPresentParameters` 不得为 NULL。违反 ①② → `0x887A0001`，违反 ③ → 进程终止                                                                                                                                                                         |
+| **F-72** | `Present1` 三条**实现期实测**约束：①创建后第一次 present 必须全量（窗口路径已无 `ResizeBuffers`，DEVIATIONS §36 S-149）；②dirty rect 非空且完全落在**内容**内；③`pPresentParameters` 不得为 NULL。违反 ①② → `0x887A0001`，违反 ③ → 进程终止。**2026-11-15（§36）**：窗口路径改为组合交换链，规则①的「`ResizeBuffers` 后」只保留历史意义；首帧全量、②③仍成立 |
 | **F-73** | `D3D12_FEATURE_DATA_SHADER_MODEL.HighestShaderModel` 是**入参**，必须先填期望上限（6_8）再查；填 `6_0` 会得到 `6_0`（本机实测会把 RTX 5080 误判为 SM 6.0）                                                                                                                                                                                                                      |
 | **F-74** | `FrameIndex` 留在 `window.rs`；`render/frame.rs` 只有 `MAX_FRAMES_IN_FLIGHT` / `slot` / `InFlightRing`（D-1）                                                                                                                                                                                                                                                                   |
 | **F-75** | `SnapshotError` 增 `Gpu { detail: SmolStr }`；`TestApp::snapshot` 在 `cfg(windows)` 用 WARP 真渲染，其余平台仍 `NoRenderer`                                                                                                                                                                                                                                                     |
@@ -1316,7 +1337,7 @@ assert!(error.to_string().contains("FL 11_0 / SM 6_0 / BindingTier 1"));
 | **S-73** | `render/windows.rs` 是模块根（只 `mod` + `pub(crate) use`）；`Renderer` 定义在 `windows/compositor.rs`（lint `definition_in_module_root`）                                                                                                                                                                                                                                      |
 | **S-74** | **不启用** SM 6.6 `ResourceDescriptorHeap` / Tier3 加速：WARP 报 SM 6.8/Tier3，启用会让 CI golden 与真机走不同 shader 路径（主设计 §6.4 的同一条警告）                                                                                                                                                                                                                          |
 | **S-75** | descriptor 堆**静态分区**（每 in-flight 槽 4 个 SRV + 2 个备用，无动态索引回收）；`GpuResourceHandle` 的 `kind=2/3` 编码为 P09 预留，P08 只产生 `kind=1`                                                                                                                                                                                                                        |
-| **V-55** | 「present 之后的 `ResizeBuffers`」在**本机非交互会话 + 隐藏窗口**下无法验证（`0x887A0001`，含 waitable/泵消息/释放全部引用三种尝试）；P08 以纯逻辑单测 + 「失败即 `EngineError::Swapchain`、不重试」处置，**P09 必须在可见窗口会话补实机验证**                                                                                                                                  |
+| **V-55** | 「present 之后的 `ResizeBuffers`」在**本机非交互会话 + 隐藏窗口**下无法验证（`0x887A0001`，含 waitable/泵消息/释放全部引用三种尝试）；P08 以纯逻辑单测 + 「失败即 `EngineError::Swapchain`、不重试」处置，**P09 必须在可见窗口会话补实机验证**。**2026-11-15 已闭环（§36 S-149）**：可见窗口 + 组合交换链上，第一次 present 之后 `ResizeBuffers` 仍恒 `0x887A0001`；当前窗口路径不再 resize，内容越过 buffer 时整条换链并先 prime（§36 F-199 / F-202）。 |
 
 ---
 

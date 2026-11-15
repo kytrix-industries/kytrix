@@ -2,7 +2,17 @@
 //! （`design/phase-08-d3d12.md` §5.6 / §6、`design/async-render-pipeline.md` §6.3）。
 //!
 //! 结构要点（DEVIATIONS F-71）：**只有持久 offscreen 是绘制目标**；swapchain 的 back buffer
-//! 只作 `COPY_DEST`（不建 RTV、不挂 scissor 绘制），因此不对它持有 RTV 引用（resize 前提）。
+//! 只作 `COPY_DEST`（不建 RTV、不挂 scissor 绘制）。
+//!
+//! **buffer / content 分离 + 内容取桶**（`design/DEVIATIONS.md` §36 F-199）：组合交换链在第一次 present
+//! 之后不能 `ResizeBuffers`（probe `resize.log`），所以持久目标与交换链按
+//! [`buffer_size`] 的桶尺寸创建（内容 + 512 余量、256 对齐），而 [`GpuRenderer::surface`] 是
+//! **当前内容**尺寸 —— 绘制、viewport、scissor、root uniform、copy、present dirty 全部按内容
+//! 子矩形，只有资源创建与 clear 用 buffer。窗口 resize 因此不需要任何 GPU 等待或资源重建；
+//! 只有内容**越过** buffer 时才走 [`GpuRenderer::grow`]：等 idle → 新建持久目标 + 交换链 →
+//! prime 新交换链一帧背景色（等 GPU fence）→ 把 visual 切过去并 `Commit` → 丢弃旧对象
+//! （越过边界时会闪一帧背景，见 `grow` 的注释）。visual 的拉伸由 UI 线程的 DirectComposition
+//! 几何负责（`platform/windows/composition.rs`）。
 //!
 //! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程独占**
 //! 的对象（device / queue / swapchain / persist / upload / retire / 计时），构造发生在窗口创建时
@@ -12,7 +22,11 @@
 //! 提交是异步的（I2）：`ExecuteCommandLists` 后立即返回；节奏来自 DXGI 的帧延迟 waitable
 //! （由 GPU 循环在每帧录制前等一次），完成通知只通过 fence 观察。
 
-use std::{cell::Cell, time::Instant};
+use std::{
+    cell::Cell,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use windows::Win32::{
     Foundation::{HANDLE, RECT},
@@ -37,6 +51,7 @@ use crate::{
         geometry::GeometryId,
         instance::{FrameOp, GpuClipEntry},
     },
+    platform::windows::composition::{self, Composition, buffer_size},
     render::{
         RenderStats,
         compositor::{FramePlan, Plan},
@@ -87,11 +102,25 @@ pub(crate) struct GpuRenderer {
     upload: UploadArena,
     geometry: GeometryRegistry,
     timer: Option<GpuTimer>,
+    /// 组合交换链（窗口路径）；内容越过 buffer 时整条替换（`grow`）。
     swapchain: Option<Swapchain>,
+    /// 合成目标（窗口路径）：GPU 线程在 `grow` 时把 visual 切到新交换链。
+    ///
+    /// 与 `NativeWindow` 共享（`Arc<Mutex<_>>`）：所有 DComp 调用由互斥锁串行化，GPU 线程只在
+    /// `grow` 里持锁做一次 `SetContent` + `Commit`（见 `platform/windows/composition.rs`）。
+    composition: Option<Arc<Mutex<Composition>>>,
     rtv_heap: ID3D12DescriptorHeap,
     clear_color: [f32; 4],
+    /// 合成面尺寸（持久目标 + 组合交换链的 grow-only 高水位，见 `grown_buffer`）。
+    ///
+    /// 初值来自 [`buffer_size`]（内容 + 512 余量、256 对齐）；只在内容越过它时按
+    /// [`GpuRenderer::grow`] 逐轴取大重建。缩小时不还 VRAM（组合交换链也不能
+    /// `ResizeBuffers`）。
+    buffer: (u32, u32),
+    /// 当前**内容**尺寸（绘制 / copy / present 的范围；窗口客户区变化时只改这个字段）。
     surface: (u32, u32),
-    /// 下一次 present 是否必须全量：新建 / resize 之后为 `true`，present 成功后清除。
+    /// 下一次 present 是否必须全量：组合交换链刚建好之后为 `true`，第一次 present 成功后清除
+    /// （首次 present 与首次 copy 都必须覆盖整块 buffer，见 `copy_to_back` / `present1`）。
     ///
     /// 离屏目标没有 present，因此它恒为 `true` —— 与移交给 GPU 线程之前的离屏语义一致。
     fresh: bool,
@@ -105,6 +134,22 @@ pub(crate) struct GpuRenderer {
 // 访问其中任何对象；D3D12/DXGI 对象本身允许跨线程使用，这里保证的是「单线程独占」而不是共享。
 // `Queue` 里的 fence 事件句柄（`HANDLE`）与 swapchain 的 waitable 句柄只在该线程上使用。
 unsafe impl Send for GpuRenderer {}
+
+/// `submit_recorded` 的呈现目标。
+enum PresentTarget<'a> {
+    /// 常规帧：`GpuRenderer` 自己的交换链 + 当前 `buffer` / `surface`。
+    Own,
+    /// prime 帧：调用方传入的、**还没挂到 visual 上**的新交换链（显式 buffer / content）。
+    ///
+    /// prime 不写 GPU timer：它会复用某个 ring 槽，若在槽的 timestamp 读回缓冲里录制新样本，
+    /// 该槽上一帧尚未 `drain_completed` 的 GPU 采样就会被覆盖（错帧；drain 在 grow 之前，
+    /// 但 `grow` 内部的 `wait_idle` 仍可能让一帧在 drain 之后才完成）。
+    Detached {
+        swapchain: &'a Swapchain,
+        buffer: (u32, u32),
+        content: (u32, u32),
+    },
+}
 
 impl GpuRenderer {
     /// 产品路径：硬件设备 + 离屏目标（P09 在此之后 attach 原生窗口）。
@@ -132,29 +177,42 @@ impl GpuRenderer {
         Self::with_device(Device::new_warp()?, size, atlas_page)
     }
 
-    /// 真实 HWND 的 swapchain（P09 的窗口层）。
+    /// 组合交换链路径（Windows 窗口）。
     ///
-    /// 用**硬件**设备：WARP 设备不能 present 到 HWND（本机实测 `Present1` 直接
-    /// `DXGI_ERROR_DEVICE_REMOVED`），因此无硬件设备的 CI 上由调用方跳过。
+    /// `content` 是当前客户区（物理像素）；`buffer` 由 [`buffer_size`] 给出（内容 + 余量、256
+    /// 对齐），此后窗口 resize 只改内容尺寸（[`GpuRenderer::set_content_size`]），只有内容越过
+    /// buffer 时才重建资源（[`GpuRenderer::grow`]）。
     ///
-    /// `background` 是 sRGB 编码的 RGBA（`render::color::background_srgb` 的输出；`SCALING_NONE` 下
-    /// resize 期间新暴露的客户区由它填充）。
-    pub(crate) fn new_for_hwnd(
-        hwnd: isize,
-        size: (u32, u32),
+    /// 本方法在 UI 线程、GPU 线程启动之前运行。顺序（P1-B）：先创建交换链并 prime 一帧背景色
+    /// （第一次 present，必须全量；客户区在第一次 present 之前是**完全透明**的，probe
+    /// `dpi.log` 03/04），**再**把它挂到 [`Composition`] 的 visual 上并 `Commit`。已 attach 但
+    /// 从未 present 的交换链在合成器里是透明的，反过来做会让 `ShowWindow` 之前的一帧露出桌面。
+    pub(crate) fn new_for_composition(
+        composition: Arc<Mutex<Composition>>,
+        content: (u32, u32),
         background: [f32; 4],
     ) -> Result<Self, EngineError> {
+        let content = (content.0.max(1), content.1.max(1));
+        let buffer = buffer_size(content)?;
         let mut renderer = Self::with_device(
             Device::new()?,
-            size,
+            buffer,
             crate::render::windows::atlas::ATLAS_PAGE,
         )?;
-        renderer.swapchain = Some(Swapchain::for_hwnd(
-            &renderer.queue,
-            hwnd,
-            size,
-            background,
-        )?);
+        renderer.clear_color = background;
+        let mut swapchain = Swapchain::for_composition(&renderer.queue, buffer)?;
+        // prime 用显式的 swapchain / buffer / content；此刻 visual 还没有任何内容。
+        renderer.prime_detached(&mut swapchain, buffer, content)?;
+        {
+            let target = composition::lock(&composition);
+            target.set_content(swapchain.raw())?;
+            target.commit()?;
+        }
+        renderer.swapchain = Some(swapchain);
+        renderer.surface = content;
+        // prime 已经做过新交换链的第一次 present，后续帧不再是 `fresh`。
+        renderer.fresh = false;
+        renderer.composition = Some(composition);
         Ok(renderer)
     }
 
@@ -195,8 +253,10 @@ impl GpuRenderer {
             geometry: GeometryRegistry::new(),
             timer,
             swapchain: None,
+            composition: None,
             rtv_heap,
             clear_color: [0.0, 0.0, 0.0, 0.0],
+            buffer: (size.0.max(1), size.1.max(1)),
             surface: (size.0.max(1), size.1.max(1)),
             fresh: true,
             last_index: FrameIndex::default(),
@@ -205,12 +265,18 @@ impl GpuRenderer {
         })
     }
 
-    /// 当前目标的物理尺寸（GPU 线程侧的真值；resize 后更新）。
+    /// 当前**内容**尺寸（GPU 线程侧的真值；窗口 resize 只改这个字段）。
     pub(crate) fn surface(&self) -> (u32, u32) {
         self.surface
     }
 
-    /// 下一次 present 是否必须全量（新建 / resize 之后为 `true`）。
+    /// 当前的合成面尺寸（测试：内容可以小于它；越过它时 `grow` 按新内容重建一个桶）。
+    #[cfg(test)]
+    pub(crate) fn buffer(&self) -> (u32, u32) {
+        self.buffer
+    }
+
+    /// 下一次 present 是否必须全量（组合交换链刚建好时为 `true`，首帧 present 后清除）。
     pub(crate) fn is_fresh(&self) -> bool {
         self.fresh
     }
@@ -271,17 +337,98 @@ impl GpuRenderer {
         self.queue.completed_value()
     }
 
-    /// resize（§6.4）：先排空到「最后提交值」（**只等这一次**），复位全部命令列表丢弃对旧
-    /// back buffer 的引用，`ResizeBuffers`（flag 原样）+ 重建 persist；旧 persist 入 retire
-    /// 队列（I4），下次完成通知后释放。
+    /// 内容尺寸变化（窗口路径）：内容仍在 buffer 内时是**纯 CPU 记账**；越过 buffer 时走
+    /// [`GpuRenderer::grow`] 重建持久目标 + 组合交换链（grow-only 桶）。
     ///
-    /// 每一步失败都走 [`GpuRenderer::classify`]（设备丢失优先归类）；调用方（GPU 循环）收到任何
-    /// 错误都会发布粘性错误并退出线程，不再「下一轮重试」（§6.6）。
+    /// 窗口的 resize 已经把整帧标成全量 damage（`Window::set_surface`），下一帧的
+    /// `FramePlan` 是 `Full`，不需要在这里碰 `fresh`。
+    pub(crate) fn set_content_size(&mut self, content: (u32, u32)) -> Result<(), EngineError> {
+        let content = (content.0.max(1), content.1.max(1));
+        if content == self.surface {
+            return Ok(());
+        }
+        if content.0 <= self.buffer.0 && content.1 <= self.buffer.1 {
+            self.surface = content;
+            return Ok(());
+        }
+        self.grow(content)
+    }
+
+    /// 内容越过 buffer：重建持久目标 + 组合交换链，并把 visual 切到新交换链。
+    ///
+    /// 组合交换链在第一次 present 之后不能 `ResizeBuffers`，所以只能整条替换。顺序：
+    /// 1. `wait_idle` + 重置全部 in-flight 命令列表：释放旧 back buffer 的引用，之后旧交换链
+    ///    才能随字段替换真正释放（否则三个 buffer 被命令列表钉住）。
+    /// 2. 在旧对象仍完好时创建新的持久目标与交换链（创建失败 ⇒ 原状态不变，错误冒泡）。
+    /// 3. **先**用新的 buffer / content prime 新交换链（全量背景 + 等 GPU fence），**然后**才
+    ///    `SetContent(新) + Commit`（P1-B：已 attach 但从未 present 的交换链在合成器里是透明的，
+    ///    反过来做会在 Commit 与 prime 之间露出一帧桌面）。
+    /// 4. 视觉切换**之后**才替换字段（旧 swapchain / 旧 persist 在此 drop；旧 persist 的纹理
+    ///    句柄按最后一帧序号进 retire 队列）。
+    /// 5. `fresh = false`（prime 已经做了新交换链的第一次全量 present），下一帧按内容子矩形 copy。
+    ///
+    /// 代价：越过 buffer 边界的那一帧只呈现背景色（在 UI 线程把几何收回 1:1 之前会看到一帧纯
+    /// 背景，而不是桌面或未定义像素）。这是「第一次 present 之后不能 `ResizeBuffers`」的必然
+    /// 结果，比整窗黑一帧好。
+    fn grow(&mut self, content: (u32, u32)) -> Result<(), EngineError> {
+        // grow-only 高水位：新桶 = 逐轴取「按内容算出的桶」与「当前 buffer」的最大值（见
+        // [grown_buffer]）。上限检查在 max 之后：`buffer_size` 已经拒绝 > 16384 的内容，
+        // 而当前 buffer 永远 ≤ 上限。
+        let buffer = grown_buffer(self.buffer, content)?;
+        let Some(composition) = self.composition.clone() else {
+            return Err(EngineError::Composition {
+                detail: smol_str::SmolStr::new_static(
+                    "content exceeds the buffer on a renderer without a composition target",
+                ),
+            });
+        };
+        // 1. GPU 完成 + 丢掉命令列表对旧 back buffer 的引用。
+        self.queue
+            .wait_idle()
+            .map_err(|error| self.classify(error))?;
+        self.queue
+            .reset_in_flight_lists()
+            .map_err(|error| self.classify(error))?;
+        // 2. 新对象在旧对象销毁之前创建（失败时旧状态仍然完好）。
+        // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
+        let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let persist =
+            Persist::new(&mut self.device, buffer, rtv).map_err(|error| self.classify(error))?;
+        let mut swapchain = Swapchain::for_composition(&self.queue, buffer)?;
+        // 3. **先**把新交换链 prime 一次（全量背景 + 等 GPU fence），**再**挂到 visual 上：
+        //    已 attach 但从未 present 的交换链在合成器里是透明的（P1-B）。prime 用显式的新
+        //    `swapchain` / `buffer` / `content` 记账，旧 visual 在这期间继续显示旧内容。
+        //    旧 persist 先换下来、但保持存活到视觉切换之后；prime 用的是新 persist。
+        let retired_index = self.last_index;
+        let old_persist = std::mem::replace(&mut self.persist, persist);
+        self.prime_detached(&mut swapchain, buffer, content)?;
+        {
+            let target = composition::lock(&composition);
+            target.set_content(swapchain.raw())?;
+            target.commit()?;
+        }
+        // 4. 视觉切换**之后**才替换 / 丢弃旧对象（旧 swapchain 的已 present 内容可能仍被
+        //    DWM 引用到下一次 `Commit`，本地变量保证它活到 `Commit` 之后）。
+        let _old_swapchain = self.swapchain.replace(swapchain);
+        self.queue.retire(retired_index, old_persist.handle);
+        self.buffer = buffer;
+        self.surface = content;
+        // prime 已经做过新交换链的第一次 present，后续帧不再是 `fresh`。
+        self.fresh = false;
+        Ok(())
+    }
+
+    /// 离屏 / 快照路径的尺寸变化：重建持久目标（**没有** swapchain）。
+    ///
+    /// 窗口路径不经过这里：内容尺寸由 [`GpuRenderer::set_content_size`] 记账，buffer 由
+    /// [`GpuRenderer::grow`] 重建（组合交换链不能 `ResizeBuffers`）。
+    ///
+    /// 每一步失败都走 [`GpuRenderer::classify`]（设备丢失优先归类）；调用方收到任何错误都会
+    /// 直接冒泡（§6.6：不重试）。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        // 窗口目标（有 swapchain）的 resize 只能发生在 GPU 线程（§6.4）；离屏目标由门面同步调用。
         debug_assert!(
-            self.swapchain.is_none() || on_gpu_thread(),
-            "resizing a window target may only run on the kytrix-d3d12 thread"
+            self.swapchain.is_none(),
+            "window targets never resize their composition swapchain"
         );
         let size = (size.0.max(1), size.1.max(1));
         if size == self.surface {
@@ -290,14 +437,6 @@ impl GpuRenderer {
         self.queue
             .wait_idle()
             .map_err(|error| self.classify(error))?;
-        self.queue
-            .reset_in_flight_lists()
-            .map_err(|error| self.classify(error))?;
-        let resized = match self.swapchain.as_mut() {
-            Some(swapchain) => swapchain.resize(size),
-            None => Ok(()),
-        };
-        resized.map_err(|error| self.classify(error))?;
         // RTV 句柄由堆派生（堆是所有者；`Persist` 只缓存句柄本身）。
         // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
         let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
@@ -306,31 +445,76 @@ impl GpuRenderer {
             .recreate(&mut self.device, size, rtv)
             .map_err(|error| self.classify(error))?;
         self.queue.retire(self.last_index, old);
+        self.buffer = size;
         self.surface = size;
         self.fresh = true;
         Ok(())
     }
 
-    /// 改窗口背景色（GPU 线程；离屏目标 no-op）。
+    /// 改窗口背景色（GPU 线程；离屏目标不使用它）。
     ///
-    /// 背景色只影响 DXGI（resize 期间新暴露的客户区；alpha 被 `ALPHA_MODE_IGNORE` 忽略），
-    /// 不改变 persist 的 clear color 或绘制内容。
-    pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) -> Result<(), EngineError> {
+    /// 组合交换链没有可用的 `SetBackgroundColor`（probe：返回 OK 但惰性），背景色是持久目标的
+    /// clear color（linear，`render::color::background_linear`）：下一次 `Plan::Full` 的 clear
+    /// 生效。窗口的 `set_background_color` 已经标了全量 damage，这里**不**碰 `fresh`（那会让
+    /// 整块 buffer 全量 copy + present）。
+    pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) {
         debug_assert!(
             self.swapchain.is_none() || on_gpu_thread(),
             "window background changes may only run on the kytrix-d3d12 thread"
         );
-        let Some(swapchain) = self.swapchain.as_mut() else {
-            return Ok(());
-        };
-        swapchain
-            .set_background_color(rgba)
-            .map_err(|error| self.classify(error))
+        self.clear_color = rgba;
     }
 
-    /// 离屏 / 快照路径：提交一份跨线程快照并**同步**等完成（§4.5 的下半段）。
+    /// 把一帧背景色 prime 进 `swapchain`（全量 clear + 等 GPU fence），**不碰 visual**。
     ///
-    /// `frame` 由调用方构造（`fresh` 的判定权在资源所有者手上，§4.1）；窗口路径用
+    /// 用于新交换链的第一次 present：组合交换链的第一次 present 必须是全量
+    /// （`DirtyRectsCount = 0`），而 `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前
+    /// 完全透明。`grow` 必须在 `SetContent` **之前**调用本方法：已 attach 但从未 present 的
+    /// 交换链在合成器里是透明的，若先 `SetContent` + `Commit` 再 prime，中间一次 DWM 合成就会
+    /// 露出桌面（P1-B）。这里用显式的 `swapchain` / `buffer` / `content`，而不是
+    /// `self.swapchain`（它可能还是旧的）。
+    ///
+    /// `sync = 0`：prime 不是用户可见帧，不值得等 vsync —— 但**必须**等这一帧的队列 fence
+    /// （P2-1）：`Present1` 返回只是 CPU 侧入队，`ShowWindow` / 后续帧的 waitable 之前必须有
+    /// 已完成的合成内容。
+    fn prime_detached(
+        &mut self,
+        swapchain: &mut Swapchain,
+        buffer: (u32, u32),
+        content: (u32, u32),
+    ) -> Result<(), EngineError> {
+        let slot = self.queue.acquire_slot();
+        self.queue
+            .wait_slot_fence(slot.wait_value)
+            .map_err(|error| self.classify(error))?;
+        let payload = FramePayload::empty();
+        let mut frame = FramePlan::new(Plan::Full, true);
+        let mut timings = FrameTimings::new();
+        self.submit_recorded(
+            slot,
+            FrameIndex::default(),
+            &payload,
+            &mut frame,
+            &mut timings,
+            PresentTarget::Detached {
+                swapchain,
+                buffer,
+                content,
+            },
+        )?;
+        swapchain
+            .present1(&mut frame, 0, content)
+            .map_err(|error| self.classify(error))?;
+        // 等到本帧的 GPU 工作完成（`FrameSlot::signal_value`），不是 `Present1` 的 CPU 返回。
+        self.queue
+            .wait_slot_fence(slot.signal_value)
+            .map_err(|error| self.classify(error))?;
+        Ok(())
+    }
+
+    /// 离屏 / 快照路径（以及窗口的首次 present）：提交一份快照并**同步**等完成（§4.5 的下半段）。
+    ///
+    /// `frame` 由调用方构造（`fresh` 的判定权在资源所有者手上，§4.1）；窗口路径的常规帧用
     /// [`GpuRenderer::submit_frame`]（异步，完成状态由 GPU 循环按 fence 推进）。
     pub(crate) fn submit_snapshot(
         &mut self,
@@ -343,24 +527,8 @@ impl GpuRenderer {
         self.queue
             .wait_slot_fence(slot.wait_value)
             .map_err(|error| self.classify(error))?;
-        let (stats, slot) = self.submit_recorded(
-            slot,
-            index,
-            payload.instances(),
-            payload.clips(),
-            payload.ops(),
-            |op| {
-                payload
-                    .geometry()
-                    .get(op as usize)
-                    .map(|draw| draw.id)
-                    .ok_or_else(|| EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
-                    })
-            },
-            frame,
-            timings,
-        )?;
+        let (stats, slot) =
+            self.submit_recorded(slot, index, payload, frame, timings, PresentTarget::Own)?;
         self.finish_sync(slot, timings)?;
         Ok(stats)
     }
@@ -407,9 +575,9 @@ impl GpuRenderer {
 
     /// 提交一份跨线程帧快照（窗口路径：**不等** GPU 完成，I2）。
     ///
-    /// 调用方（GPU 循环）已经等过 DXGI 的帧延迟 waitable（I3）、并在 `request.surface` 变化时
-    /// 先调用 [`GpuRenderer::resize`]；`slot` 是调用方已等到上一帧完成、尚未复位的 ring 槽
-    /// （[`GpuRenderer::acquire_slot`] + [`GpuRenderer::wait_slot_fence`]）。
+    /// 调用方（GPU 循环）已经等过 DXGI 的帧延迟 waitable（I3）、并用
+    /// [`GpuRenderer::set_content_size`] 把内容尺寸对齐到本帧；`slot` 是调用方已等到上一帧完成、
+    /// 尚未复位的 ring 槽（[`GpuRenderer::acquire_slot`] + [`GpuRenderer::wait_slot_fence`]）。
     ///
     /// 本方法**不**读 timestamp、不推进 retire：这两件事只允许在观察到该帧 fence 完成之后做
     /// （[`GpuRenderer::resolve_frame_timer`] / [`GpuRenderer::release_completed`]，§4.1 / §6.5）。
@@ -427,27 +595,16 @@ impl GpuRenderer {
         let (stats, _) = self.submit_recorded(
             slot,
             request.index,
-            request.payload.instances(),
-            request.payload.clips(),
-            request.payload.ops(),
-            |op| {
-                request
-                    .payload
-                    .geometry()
-                    .get(op as usize)
-                    .map(|draw| draw.id)
-                    .ok_or_else(|| EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
-                    })
-            },
+            &request.payload,
             frame,
             &mut timings,
+            PresentTarget::Own,
         )?;
 
         let present_started = Instant::now();
         let presented = match self.swapchain.as_mut() {
-            // §6.3：`Present1(1, 0, dirty)` —— sync = 1 保持 vsync。
-            Some(swapchain) => swapchain.present1(frame, 1),
+            // §6.3：`Present1(1, dirty)` —— sync = 1 保持 vsync。
+            Some(swapchain) => swapchain.present1(frame, 1, self.surface),
             None => Ok(()),
         };
         if let Err(error) = presented {
@@ -485,16 +642,17 @@ impl GpuRenderer {
     }
 
     /// 录制 + 提交一帧（不呈现、不等完成）。调用方先取槽并等该槽上一帧完成（§6.5）。
+    ///
+    /// `target` 决定录制的呈现目标：常规帧用自己的交换链；`prime_detached` 用**还没挂到
+    /// visual 上**的新交换链（内容越过 buffer 时它必须先被 present，见 `grow`）。
     fn submit_recorded(
         &mut self,
         slot: FrameSlot,
         index: FrameIndex,
-        instances: &[u8],
-        clips: &[GpuClipEntry],
-        ops: &[FrameOp],
-        resolve: impl FnMut(u32) -> Result<GeometryId, EngineError>,
+        payload: &FramePayload,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
+        target: PresentTarget<'_>,
     ) -> Result<(RenderStats, FrameSlot), EngineError> {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
@@ -512,7 +670,20 @@ impl GpuRenderer {
             .map_err(|error| self.classify(error))?;
 
         let stats = {
-            // 借用拆分：录制只碰这些字段，`surface` / `fresh` / `last_index` 留在外层。
+            let (swapchain, buffer, content, timer) = match target {
+                PresentTarget::Own => (
+                    self.swapchain.as_ref(),
+                    self.buffer,
+                    self.surface,
+                    self.timer.as_ref(),
+                ),
+                PresentTarget::Detached {
+                    swapchain,
+                    buffer,
+                    content,
+                } => (Some(swapchain), buffer, content, None),
+            };
+            // 借用拆分：录制只碰这些字段，`buffer` / `surface` / `fresh` / `last_index` 留在外层。
             let mut recorder = FrameRecorder {
                 device: &mut self.device,
                 queue: &mut self.queue,
@@ -521,22 +692,13 @@ impl GpuRenderer {
                 persist: &self.persist,
                 upload: &mut self.upload,
                 geometry: &self.geometry,
-                timer: self.timer.as_ref(),
-                swapchain: self.swapchain.as_ref(),
+                timer,
+                swapchain,
                 clear_color: self.clear_color,
-                surface: self.surface,
+                buffer,
+                content,
             };
-            recorder.record(
-                slot,
-                index,
-                instances,
-                clips,
-                ops,
-                resolve,
-                frame,
-                timings,
-                frame_started,
-            )
+            recorder.record(slot, index, payload, frame, timings, frame_started)
         }
         .map_err(|error| self.classify(error))?;
 
@@ -588,12 +750,6 @@ impl GpuRenderer {
         self.readback()
     }
 
-    /// 测试用的 clear 颜色（sRGB 编码断言需要非透明/半透明值）。
-    #[cfg(test)]
-    pub(crate) fn set_clear_color(&mut self, color: [f32; 4]) {
-        self.clear_color = color;
-    }
-
     /// 测试用的静态几何注册入口（P09 的 `GeometryStore` 接上后语义不变）。
     #[cfg(test)]
     pub(crate) fn register_geometry(
@@ -631,6 +787,16 @@ impl Drop for GpuRenderer {
     }
 }
 
+/// 增长后的 buffer：逐轴取「当前 buffer」与「按内容算出的桶」的较大值（grow-only 高水位）。
+///
+/// 只按内容算时，corner drag（一轴变大、另一轴变小）会把已经开好的另一轴换小；而视觉切换那一
+/// 帧的旧 clip 仍指向旧内容，就会采样到新交换链之外（未定义像素 / 露出桌面）。逐轴取大保证
+/// 「旧 presented 内容 ≤ 旧 buffer ≤ 新 buffer」，P1-B 的中间帧因此始终有定义。
+fn grown_buffer(current: (u32, u32), content: (u32, u32)) -> Result<(u32, u32), EngineError> {
+    let required = buffer_size(content)?;
+    Ok((required.0.max(current.0), required.1.max(current.1)))
+}
+
 /// 一帧录制所需的 GPU 线程独占对象（借用拆分：`GpuRenderer` 的字段在这里按用途分组）。
 struct FrameRecorder<'a> {
     device: &'a mut Device,
@@ -643,7 +809,10 @@ struct FrameRecorder<'a> {
     timer: Option<&'a GpuTimer>,
     swapchain: Option<&'a Swapchain>,
     clear_color: [f32; 4],
-    surface: (u32, u32),
+    /// grow-only 的合成面尺寸（只有资源创建与 clear 用它）。
+    buffer: (u32, u32),
+    /// 当前内容尺寸（viewport / scissor / root uniform / copy / present 的范围）。
+    content: (u32, u32),
 }
 
 impl FrameRecorder<'_> {
@@ -652,17 +821,19 @@ impl FrameRecorder<'_> {
         &mut self,
         slot: FrameSlot,
         index: FrameIndex,
-        instances: &[u8],
-        clips: &[GpuClipEntry],
-        ops: &[FrameOp],
-        mut resolve: impl FnMut(u32) -> Result<GeometryId, EngineError>,
+        payload: &FramePayload,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
         frame_started: Instant,
     ) -> Result<RenderStats, EngineError> {
-        let (instance_count, clip_count) =
-            self.upload
-                .write(self.device, self.queue, index, slot.index, instances, clips)?;
+        let (instance_count, clip_count) = self.upload.write(
+            self.device,
+            self.queue,
+            index,
+            slot.index,
+            payload.instances(),
+            payload.clips(),
+        )?;
         self.pipeline.write_slot(
             self.device,
             slot.index,
@@ -677,15 +848,23 @@ impl FrameRecorder<'_> {
             gpu_ns: 0,
         });
 
-        let width = self.surface.0 as f32;
-        let height = self.surface.1 as f32;
-        let root = root_uniform(width, height);
+        let root = root_uniform(self.content.0 as f32, self.content.1 as f32);
         let full = frame.is_full();
         let scissor_whole = RECT {
             left: 0,
             top: 0,
-            right: self.surface.0 as i32,
-            bottom: self.surface.1 as i32,
+            right: self.content.0 as i32,
+            bottom: self.content.1 as i32,
+        };
+        // 几何绘制的下标表与 ops 同帧：`FrameOp::Geometry.index` 只有配合同一帧的表才有意义。
+        let mut resolve = |op: u32| {
+            payload
+                .geometry()
+                .get(op as usize)
+                .map(|draw| draw.id)
+                .ok_or_else(|| EngineError::GeometryRegister {
+                    detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
+                })
         };
 
         let mut draw_calls = 0u32;
@@ -698,16 +877,40 @@ impl FrameRecorder<'_> {
                 self.atlas.record_uploads(self.device, list, slot.index)?;
             }
             if full {
-                // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）。
-                unsafe { list.ClearRenderTargetView(self.persist.rtv, &self.clear_color, None) };
+                // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把几何收回
+                // 1:1 之前，visual 的 clip 可能仍指向旧内容（P1-A 保证它 ≤ 新 buffer），只有整块
+                // 背景色能保证那一帧既不是桌面、也不是未定义像素（P1-B）。
+                // 普通全量帧只清内容矩形：buffer 的其余部分永远不可见（copy / present dirty 都
+                // 夹在内容子矩形内），省掉大 buffer 的全量 clear 带宽。
+                let content_rect = [RECT {
+                    left: 0,
+                    top: 0,
+                    right: self.content.0 as i32,
+                    bottom: self.content.1 as i32,
+                }];
+                let rects = if frame.is_fresh() {
+                    None
+                } else {
+                    Some(content_rect.as_slice())
+                };
+                // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）；
+                // `rects` 在调用期间存活且落在 buffer 内（内容 ≤ buffer）。
+                unsafe { list.ClearRenderTargetView(self.persist.rtv, &self.clear_color, rects) };
             }
-            bind_frame(list, self.pipeline, self.persist, slot.index, &root);
+            bind_frame(
+                list,
+                self.pipeline,
+                self.persist,
+                slot.index,
+                &root,
+                self.content,
+            );
             match full {
                 true => {
                     draw_calls = draw_ops(
                         list,
                         self.pipeline,
-                        ops,
+                        payload.ops(),
                         self.geometry,
                         &mut resolve,
                         &root,
@@ -728,7 +931,7 @@ impl FrameRecorder<'_> {
                             draw_calls = draw_calls.saturating_add(draw_ops(
                                 list,
                                 self.pipeline,
-                                ops,
+                                payload.ops(),
                                 self.geometry,
                                 &mut resolve,
                                 &root,
@@ -739,7 +942,14 @@ impl FrameRecorder<'_> {
                 }
             }
             if let Some(swapchain) = self.swapchain {
-                copy_to_back(list, self.persist, swapchain, copy_plan(*frame))?;
+                copy_to_back(
+                    list,
+                    self.persist,
+                    swapchain,
+                    *frame,
+                    self.buffer,
+                    self.content,
+                )?;
             }
             if let Some(timer) = self.timer {
                 timer.end(list, slot.index);
@@ -758,7 +968,6 @@ struct Persist {
     texture: ID3D12Resource,
     handle: GpuResourceHandle,
     rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
-    size: (u32, u32),
 }
 
 impl Persist {
@@ -774,7 +983,6 @@ impl Persist {
             texture,
             handle,
             rtv,
-            size,
         })
     }
 
@@ -792,7 +1000,6 @@ impl Persist {
         let old = self.handle;
         self.texture = texture;
         self.handle = handle;
-        self.size = size;
         Ok(old)
     }
 }
@@ -908,6 +1115,7 @@ fn bind_frame(
     persist: &Persist,
     slot: usize,
     root: &[f32; ROOT_UNIFORM_DWORDS],
+    content: (u32, u32),
 ) {
     // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
     unsafe {
@@ -917,11 +1125,13 @@ fn bind_frame(
         list.SetGraphicsRoot32BitConstants(0, ROOT_UNIFORM_DWORDS as u32, root.as_ptr().cast(), 0);
         list.SetGraphicsRootDescriptorTable(1, pipeline.slot_table(slot));
         list.OMSetRenderTargets(1, Some(&persist.rtv), false, None);
+        // 视口 = **内容**尺寸（不是 buffer）：Ndc 坐标由 root uniform 的内容尺寸给出，
+        // 两者必须是同一个矩形，否则内容会被拉伸到整块 buffer 上。
         list.RSSetViewports(&[D3D12_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
-            Width: persist.size.0 as f32,
-            Height: persist.size.1 as f32,
+            Width: content.0 as f32,
+            Height: content.1 as f32,
             MinDepth: 0.0,
             MaxDepth: 1.0,
         }]);
@@ -1004,7 +1214,7 @@ fn draw_ops(
     Ok(draw_calls)
 }
 
-/// copy 到 back buffer 的范围：`fresh`（新建 / resize 后首帧）时强制全量。
+/// copy 到 back buffer 的范围：`fresh`（交换链刚建好）时强制整块 buffer。
 ///
 /// 只有 D3D12 后端需要这个规则（F-121：Metal / Vulkan 的 present 目标跨帧内容无保证，两平台
 /// 每帧整面写入）。`present_dirty() == None` 恰好同时覆盖 `fresh` 与 `Plan::Full`；`Idle` 必须
@@ -1019,11 +1229,23 @@ fn copy_plan(frame: FramePlan) -> Plan {
     }
 }
 
+/// 全量帧要 copy 的物理范围：`fresh`（交换链刚建好）⇒ 整块 buffer（back buffer 的内容未定义），
+/// 其余全量帧 ⇒ 只有**内容**子矩形（buffer 的其余部分永远不可见）。
+fn copy_extent(frame: FramePlan, buffer: (u32, u32), content: (u32, u32)) -> (u32, u32) {
+    if frame.is_fresh() { buffer } else { content }
+}
+
+/// copy 持久目标 → back buffer。
+///
+/// `buffer` / `content` 都是物理像素：只有 `fresh`（组合交换链刚建好、第一次 present 必须整面）
+/// 才拷整块 buffer；其余全量帧只拷内容子矩形，局部帧逐 damage 矩形（永远落在内容之内）。
 fn copy_to_back(
     list: &ID3D12GraphicsCommandList,
     persist: &Persist,
     swapchain: &Swapchain,
-    plan: Plan,
+    frame: FramePlan,
+    buffer: (u32, u32),
+    content: (u32, u32),
 ) -> Result<(), EngineError> {
     let back = swapchain.back_buffer()?;
     transition(
@@ -1038,12 +1260,12 @@ fn copy_to_back(
         D3D12_RESOURCE_STATE_PRESENT,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
-    match plan {
+    match copy_plan(frame) {
         // 全帧也用 `CopyTextureRegion`（与局部同一路径，逐矩形）：
         // swapchain back buffer 上 `CopyResource` 在 flip model 下会被拒绝（本机实测 DEVICE_REMOVED）。
         Plan::Full => {
-            let whole =
-                crate::math::PhysicalRect::new(0, 0, persist.size.0 as i32, persist.size.1 as i32);
+            let whole = copy_extent(frame, buffer, content);
+            let whole = crate::math::PhysicalRect::new(0, 0, whole.0 as i32, whole.1 as i32);
             copy_rect(list, &persist.texture, &back, &whole);
         }
         Plan::Partial(damage) => {
@@ -1136,8 +1358,8 @@ fn transition(
     // SAFETY: `barrier` 在本次调用期间独占；`slice::from_ref` 不转移所有权。
     unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
     // SAFETY: union 载荷与 `pResource` 都是 `ManuallyDrop`，结构体 drop **不会**释放 COM 引用；
-    // 被 barrier 过的资源（尤其是 swapchain back buffer）会被永久钉住，导致 `ResizeBuffers`
-    // 返回 `DXGI_ERROR_INVALID_CALL`（DEVIATIONS F-86）。记录已经提交，这里显式释放。
+    // 被 barrier 过的资源（尤其是 swapchain back buffer）会被永久钉住（back buffer 全部泄漏，
+    // 退出时 swapchain 也带着引用被销毁，DEVIATIONS F-86）。记录已经提交，这里显式释放。
     unsafe {
         let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
         core::mem::ManuallyDrop::drop(&mut transition.pResource);
@@ -1288,19 +1510,9 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
 }
 #[cfg(test)]
 mod tests {
-    use windows::{
-        Win32::{
-            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-            System::LibraryLoader::GetModuleHandleW,
-            UI::WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW, WS_POPUP,
-            },
-        },
-        core::PCWSTR,
-    };
-
-    use super::{GpuRenderer, copy_plan, geometry_root, root_uniform};
+    use super::{GpuRenderer, copy_extent, copy_plan, geometry_root, grown_buffer, root_uniform};
     use crate::{
+        error::EngineError,
         math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
         paint::{
             atlas::{AtlasKind, AtlasTile},
@@ -1487,7 +1699,7 @@ mod tests {
         let Some(mut renderer) = warp_renderer((8, 8)) else {
             return;
         };
-        renderer.set_clear_color([0.5, 0.5, 0.5, 0.5]);
+        renderer.set_background_color([0.5, 0.5, 0.5, 0.5]);
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
@@ -1567,7 +1779,7 @@ mod tests {
         let Some(mut renderer) = warp_renderer((64, 64)) else {
             return;
         };
-        renderer.set_clear_color([1.0, 1.0, 1.0, 1.0]);
+        renderer.set_background_color([1.0, 1.0, 1.0, 1.0]);
         let size = (64, 64);
 
         let blue = one_lane_scene(quad(
@@ -1833,124 +2045,124 @@ mod tests {
         assert_eq!(image.rgba8.len(), 16 * 8 * 4);
     }
 
-    /// `Present1` 的实机往返（硬件设备 + 隐藏窗口）。
-    ///
-    /// **默认忽略**：本机非交互会话 + 隐藏窗口下 `GetDeviceRemovedReason` 在录制后就返回
-    /// `0x887A0001`（DEVIATIONS V-57），swapchain 的实机验收属 P09 的可见窗口会话（V-55）。
-    /// 手动跑：`cargo test -p ui_core --lib -- --ignored hidden_window`。
+    /// 全量帧的 copy 范围：`fresh`（交换链刚建好）整块 buffer，之后只拷内容子矩形。
     #[test]
-    #[ignore = "V-55/V-57: real Present1 needs a visible-window session (P09 gate)"]
-    fn hidden_window_swapchain_accepts_a_full_present() {
+    fn a_full_frame_copies_the_content_unless_the_swapchain_is_fresh() {
+        let buffer = (1000, 700);
+        let content = (800, 600);
+        assert_eq!(
+            copy_extent(FramePlan::new(Plan::Full, true), buffer, content),
+            buffer,
+            "第一次 present 之前 back buffer 的内容未定义"
+        );
+        assert_eq!(
+            copy_extent(FramePlan::new(Plan::Full, false), buffer, content),
+            content,
+            "之后的全量帧只写可见的内容子矩形"
+        );
+        let fresh_partial = FramePlan::new(
+            partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], content).plan(),
+            true,
+        );
+        assert_eq!(copy_extent(fresh_partial, buffer, content), buffer);
+    }
+
+    /// 内容子矩形：绘制与读回都只按内容尺寸，grow-only buffer 不参与（`design/DEVIATIONS.md` §36 F-199）。
+    #[test]
+    fn the_content_size_is_independent_of_the_buffer() {
         let _guard = lock();
-
-        extern "system" fn wndproc(
-            hwnd: HWND,
-            msg: u32,
-            wparam: WPARAM,
-            lparam: LPARAM,
-        ) -> LRESULT {
-            // SAFETY: 只把消息转发给默认处理。
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
-        fn wide(value: &str) -> Vec<u16> {
-            value.encode_utf16().chain(std::iter::once(0)).collect()
-        }
-
-        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
-        let instance = unsafe { GetModuleHandleW(None) }.expect("module handle");
-        let class = wide("KytrixGuiP08Test");
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(wndproc),
-            hInstance: instance.into(),
-            lpszClassName: PCWSTR(class.as_ptr()),
-            ..WNDCLASSW::default()
-        };
-        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
-        let _ = unsafe { RegisterClassW(&window_class) };
-        let title = wide("kg-p08");
-        // SAFETY: 测试用隐藏窗口：Win32 句柄只在当前测试线程内使用，不跨线程。
-        let hwnd = unsafe {
-            CreateWindowExW(
-                Default::default(),
-                PCWSTR(class.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                WS_POPUP,
-                0,
-                0,
-                64,
-                64,
-                None,
-                None,
-                Some(instance.into()),
-                None,
-            )
-        }
-        .expect("hidden window");
-
-        // 背景色原样传给 DXGI（`[0.25, 0.5, 0.75, 1.0]` 精确可表示）：本测试只验证
-        // `SetBackgroundColor` / `GetBackgroundColor` 的 round-trip，不覆盖 `background_srgb`
-        // 的 sRGB 编码语义（那由 render/color.rs 的单测负责）。
-        let background = [0.25, 0.5, 0.75, 1.0];
-        let Ok(mut renderer) = GpuRenderer::new_for_hwnd(hwnd.0 as isize, (64, 64), background)
-        else {
-            eprintln!("skip: no hardware D3D12 device for the swapchain test");
+        let Some(mut renderer) = warp_renderer((64, 64)) else {
             return;
         };
-        // 创建后：DXGI 已经拿到背景色，帧延迟是 1（不是旧的 2）。
-        let created = renderer
-            .swapchain
-            .as_ref()
-            .expect("new_for_hwnd creates a swapchain")
-            .background_color()
-            .expect("GetBackgroundColor after create");
-        assert_eq!(
-            (created.r, created.g, created.b, created.a),
-            (background[0], background[1], background[2], background[3]),
-            "creation-time background color"
-        );
-        assert_eq!(
-            renderer
-                .swapchain
-                .as_ref()
-                .expect("swapchain")
-                .maximum_frame_latency()
-                .expect("GetMaximumFrameLatency"),
-            1,
-            "SetMaximumFrameLatency(1)"
-        );
-        let scene = Scene::empty();
+        assert_eq!(renderer.buffer(), (64, 64));
+        renderer
+            .set_content_size((32, 24))
+            .expect("shrink the content");
+        assert_eq!(renderer.surface(), (32, 24));
+        assert_eq!(renderer.buffer(), (64, 64), "buffer 不随内容变化");
+
+        // 铺满整个 buffer 的红块：内容子矩形之外的像素必须不参与本帧。
+        let scene = one_lane_scene(quad(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        ));
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let mut frame = full_plan((32, 24));
         let mut timings = FrameTimings::new();
-        let mut first = full_plan((64, 64));
         renderer
-            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
-            .expect("presented frame");
-        let damage = [PhysicalRect::new(0, 0, 32, 32)];
-        let mut second = partial_plan(&damage, (64, 64));
-        renderer
-            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
-            .expect("dirty frame");
-        // 重设：官方未承诺 `ResizeBuffers` 保留背景色，本实现不依赖它——重建后无条件重设。
-        renderer
-            .swapchain
-            .as_mut()
-            .expect("swapchain")
-            .resize((48, 32))
-            .expect("ResizeBuffers");
-        let resized = renderer
-            .swapchain
-            .as_ref()
-            .expect("swapchain")
-            .background_color()
-            .expect("GetBackgroundColor after resize");
-        // 这条断言只证明「重设后 round-trip 成功」，**不**证明 `ResizeBuffers` 真的丢了背景色
-        // （DXGI 未承诺保留，也没有可移植的观测手段）。
-        assert_eq!(
-            (resized.r, resized.g, resized.b, resized.a),
-            (background[0], background[1], background[2], background[3]),
-            "background color must be re-applied after ResizeBuffers"
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .expect("content frame");
+        let image = renderer.readback().expect("readback");
+        assert_eq!((image.width, image.height), (32, 24), "读回范围 = 内容尺寸");
+        assert_eq!(pixel(&image, 32, 31, 23), [255, 0, 0, 255]);
+    }
+
+    /// 内容越过 grow-only 桶、但渲染器没有合成目标（离屏）：显式 `Composition` 错误，不静默
+    /// 裁剪。真实窗口路径的 grow 需要 DComp + HWND，由 release demo 的运行时冒烟覆盖。
+    #[test]
+    fn growing_beyond_the_buffer_without_a_composition_target_is_an_error() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((32, 32)) else {
+            return;
+        };
+        match renderer.set_content_size((33, 32)) {
+            Err(EngineError::Composition { detail }) => {
+                assert!(detail.contains("composition target"), "{detail}");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(
+            renderer.set_content_size((32, 32)).is_ok(),
+            "同值必须是 no-op"
         );
+    }
+
+    /// 内容超过 16384 硬上限：`buffer_size` 的 `Swapchain` 错误必须先于任何 GPU 工作。
+    #[test]
+    fn content_beyond_the_maximum_buffer_is_an_error() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((32, 32)) else {
+            return;
+        };
+        match renderer.set_content_size((16_385, 32)) {
+            Err(EngineError::Swapchain { detail }) => {
+                assert!(detail.contains("16385"), "{detail}");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// P1-A：corner drag（一轴变大、另一轴变小）时，另一轴必须保留旧 buffer 的高水位。
+    ///
+    /// 视觉切换那一帧的旧 clip 仍可能指向旧内容，旧内容 ≤ 旧 buffer；只有新 buffer 逐轴 ≥
+    /// 旧 buffer，中间帧才不可能采样到未定义像素。
+    #[test]
+    fn growth_keeps_the_other_axis_at_the_high_water_mark() {
+        // buffer 2560×1792，新内容 2800×600：宽度增长，高度不得按内容缩回 1280。
+        let grown = grown_buffer((2560, 1792), (2800, 600)).expect("grows");
+        assert_eq!(grown, (3328, 1792));
+        assert!(
+            grown.1 >= 1792,
+            "高度必须保留旧 buffer（旧 clip 仍可能指向旧内容）: {grown:?}"
+        );
+        // 另一方向同理。
+        assert_eq!(
+            grown_buffer((2560, 1792), (1200, 2400)).expect("grows"),
+            (2560, 3072)
+        );
+        // 当前 buffer 比按内容算出的桶大：新桶不得缩小。
+        let covered = grown_buffer((3328, 2048), (2000, 600)).expect("fits");
+        assert!(covered.0 >= 3328 && covered.1 >= 2048, "{covered:?}");
+        // 就算内容完全落在当前 buffer 内，纯函数也不会把桶算小（防御性）。
+        assert_eq!(
+            grown_buffer((2560, 1792), (2000, 600)).expect("fits"),
+            (2560, 1792)
+        );
+        // 上限检查在 max 之后仍然生效。
+        assert!(matches!(
+            grown_buffer((1536, 1280), (16_385, 100)),
+            Err(EngineError::Swapchain { .. })
+        ));
     }
 }

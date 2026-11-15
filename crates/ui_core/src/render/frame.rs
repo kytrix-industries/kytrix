@@ -73,8 +73,9 @@ impl FramePayload {
         &self.geometry
     }
 
-    /// 空载荷（槽位/线程单元测试用；真实帧必须走 [`FramePayload::from_buffer`]）。
-    #[cfg(test)]
+    /// 空载荷（窗口首帧 priming 与槽位/线程单元测试用；真实帧必须走
+    /// [`FramePayload::from_buffer`]）。只有 Windows 的首帧 priming 在产品构建里需要它。
+    #[cfg(any(windows, test))]
     pub(crate) fn empty() -> Self {
         Self {
             instances: Bytes::new(),

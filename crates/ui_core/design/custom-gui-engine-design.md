@@ -541,14 +541,23 @@ pub enum EngineError {
     ShaderLoad { target: &'static str, path: PathBuf },
     #[error("swapchain 重建失败：{0}")]
     Swapchain(String),
+    #[error("DirectComposition 调用失败：{detail}")]
+    Composition { detail: String },
 }
 ```
+
+> 上面的 5 + 1 个变体只是 v1 初稿；**完整冻结表**见 `phase-01-foundation.md` §6.2.2（18 个变体）。
+> `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
+> `SetContent` / 换链）；`AppInit` 只覆盖 `Composition::new` 的 COM 创建（DEVIATIONS §36 F-204）。
 
 - **不做静默降级**（I10）：`UnsupportedGpu` / `WaylandCompositor` 直接退出，退出码非 0，日志含实际检测值。Linux 若未运行
   Wayland 会话或 compositor 缺少 `xdg_wm_base`，给出可读错误并退出，**不回退任何其他窗口系统**（I16）。
 - **device lost**：停止提交、走可读错误、保留 DRED / validation layer 输出；不尝试在同进程内重建设备。
-- **尺寸变化**：重建 swapchain / offscreen / depth，但**不重建 `Geometry` VBO 与实例缓冲容量**，只更新 uniform 与
-  scissor —— 这是消除 17.5 ms/次改尺寸成本的关键。
+- **尺寸变化**：Windows 窗口目标（2026-11-15 起）是 DirectComposition 组合交换链，resize 只改
+  visual 几何与内容尺寸，不 `ResizeBuffers`；内容越过 grow-only buffer 时才整条换链并先 prime
+  （DEVIATIONS §36 F-199 / F-202）。离屏 / macOS / Linux 仍重建 persist / swapchain / depth，
+  但**不重建 `Geometry` VBO 与实例缓冲容量**，只更新 uniform 与 scissor —— 这是消除 17.5 ms/次
+  改尺寸成本的关键。
 
 ### 2.10 `GpuTimer` 统一接口
 

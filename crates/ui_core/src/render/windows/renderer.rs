@@ -7,20 +7,23 @@
 //! 窗口消息（WM_SIZE 只记录尺寸）           循环：等 work / completion → 空转或取帧
 //! publish(FrameRequest) ──► 最新帧槽            → 等 waitable（呈现背压，每帧恰好一次）
 //! queue_atlas_upload ─────► 图集槽              → 取「此刻最新」帧 + 图集槽
-//! poll() ◄──────────────── 反馈槽               → surface 变化则 resize
+//! poll() ◄──────────────── 反馈槽               → 内容尺寸变化则 set_content_size
+//!                                               （buffer 内纯 CPU；越过则 grow 重建交换链）
 //!                                               → 槽 fence → 录制 → Execute → Signal
-//!                                               → Present1(1, 0, dirty)
-//!                                               → 完成观测点：retire + 反馈
+//!                                               → Present1(1, dirty)
+//! WM_APP_COMPOSITION_WAKE ◄─ PostMessage       → 完成观测点：retire + 反馈 + presented 尺寸
 //! ```
 //!
-//! 反馈在**完成观测点**发布（fence 的 `SetEventOnCompletion` 唤醒），不是 `Present1` 返回的时刻；
-//! retire 与反馈同一观测点推进（§4.1 / §6.5）。
+//! 反馈与 presented 尺寸都在**完成观测点**发布（fence 的 `SetEventOnCompletion` 唤醒），不是
+//! `Present1` 返回的时刻；retire 与反馈同一观测点推进（§4.1 / §6.5）。`presented` 尺寸变了才
+//! post 一次合成唤醒：UI 线程据此把 DirectComposition visual 的缩放置回 1:1（`poll` 每轮都会
+//! 重算几何，所以静止时不需要额外消息）。
 //!
 //! 三条硬约束：
-//! - **I1**：UI 线程只做「加锁拷贝 + `SetEvent`」，没有 fence wait / `ResizeBuffers` / `Present`。
+//! - **I1**：UI 线程只做「加锁拷贝 + `SetEvent`」，没有 fence wait / `Present`。
 //! - **I2**：`ExecuteCommandLists` 后立即返回；完成通知只通过 fence（资源按序号延迟释放，I4）。
 //! - **I3**：节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 句柄，
-//!   只在 GPU 线程等待，且每帧（含首帧、含 resize 后首帧）恰好等一次。
+//!   只在 GPU 线程等待，且每帧（含首帧）恰好等一次。
 //!
 //! 关窗握手（§6.7）：UI 线程**不能**直接 `join` —— DXGI 的 `Present` 可能同步 `SendMessage`
 //! 到窗口的消息泵线程，直接 join 会和「消息泵停转」互等。`Drop` 用 `MsgWaitForMultipleObjects`
@@ -31,18 +34,23 @@ use std::{
     collections::VecDeque,
     os::windows::io::AsRawHandle,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Instant,
 };
 
 use smol_str::{SmolStr, format_smolstr};
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
-    System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects},
+    Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM},
+    System::Threading::{
+        CreateEventW, GetCurrentThreadId, INFINITE, SetEvent, WaitForMultipleObjects,
+    },
     UI::WindowsAndMessaging::{
-        DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostQuitMessage,
-        QS_ALLINPUT, TranslateMessage, WM_QUIT,
+        DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostMessageW,
+        PostQuitMessage, PostThreadMessageW, QS_ALLINPUT, TranslateMessage, WM_QUIT,
     },
 };
 
@@ -55,9 +63,13 @@ use crate::render::windows::readback::ReadbackImage;
 use crate::{
     error::EngineError,
     paint::{atlas::AtlasKind, color::Color},
+    platform::{
+        dispatcher::WM_APP_COMPOSITION_WAKE,
+        windows::composition::{self, Composition},
+    },
     render::{
         DirtyRows, RenderStats,
-        color::background_srgb,
+        color::background_linear,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         timer::{FrameTimings, GpuTimerSample},
@@ -111,25 +123,52 @@ impl Renderer {
 
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-d3d12` 线程。
     ///
+    /// `composition` 与 `NativeWindow` 共享：visual 在这里（GPU 线程启动之前、`ShowWindow`
+    /// 之前）就挂上组合交换链并 present 首帧；此后 GPU 线程只在内容越过 buffer 时把 visual
+    /// 切到新交换链（`GpuRenderer::grow`），其余 DComp 调用都在 UI 线程，互斥锁串行化。
+    ///
     /// # Errors
-    /// 设备 / swapchain 创建失败，或 GPU 线程无法启动（`AppInit`）。
+    /// 设备 / 组合交换链创建失败，或 GPU 线程无法启动（`AppInit` / `Composition` / `Swapchain`）。
     pub(crate) fn new_for_hwnd(
-        hwnd: isize,
+        composition: Arc<Mutex<Composition>>,
         size: (u32, u32),
         background: Color,
     ) -> Result<Self, EngineError> {
-        let gpu = GpuRenderer::new_for_hwnd(hwnd, size, background_srgb(background))?;
+        // 合成通知（`WM_APP_COMPOSITION_WAKE`）的目标是 UI 线程的窗口：在把 `Arc` 交给 GPU 线程
+        // 之前取一次句柄（`Shared` 只存 `isize`，不持有 `Composition`）。
+        let hwnd = composition::lock(&composition).hwnd_raw();
+        let gpu =
+            GpuRenderer::new_for_composition(composition, size, background_linear(background))?;
         Ok(Self {
-            target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
+            target: RenderTarget::Window(WindowRenderer::new(gpu, size, hwnd)?),
             error: None,
         })
     }
 
-    /// 最近一次**发布**的目标尺寸（UI 侧记录；GPU 线程按它判断是否重建，§4.4）。
+    /// 最近一次**发布**的目标尺寸（UI 侧记录；GPU 线程消费它做内容尺寸记账，§4.4）。
     pub(crate) fn surface(&self) -> (u32, u32) {
         match &self.target {
             RenderTarget::Offscreen(gpu) => gpu.surface(),
             RenderTarget::Window(window) => window.surface,
+        }
+    }
+
+    /// 最近一次**完成 present** 的内容尺寸（Windows：DirectComposition 几何的唯一输入）。
+    pub(crate) fn presented_surface(&self) -> (u32, u32) {
+        match &self.target {
+            RenderTarget::Offscreen(gpu) => gpu.surface(),
+            RenderTarget::Window(window) => window.presented_surface(),
+        }
+    }
+
+    /// 取走「合成几何可能过期」的兜底标记（UI 线程的泵在 ②b′ 消费）。
+    ///
+    /// 只有窗口目标有合成几何；离屏目标恒 `false`。标记只会在 GPU 线程的两次唤醒都失败时
+    /// 置位（`Shared::notify_ui`）。
+    pub(crate) fn take_composition_pending(&self) -> bool {
+        match &self.target {
+            RenderTarget::Offscreen(_) => false,
+            RenderTarget::Window(window) => window.take_composition_pending(),
         }
     }
 
@@ -171,14 +210,15 @@ impl Renderer {
         }
     }
 
-    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，`SetBackgroundColor` 在 GPU 线程执行）。
+    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，clear color 在 GPU 线程的下一帧生效）。
     ///
-    /// 离屏目标没有背景色（从不 present），是 no-op。
+    /// 组合交换链没有可用的 `SetBackgroundColor`：背景色是持久目标的 clear color（linear），
+    /// 与 macOS / Linux 同一条路径。离屏目标没有背景色（从不 present），是 no-op。
     pub(crate) fn set_background_color(&mut self, color: Color) {
         match &self.target {
             RenderTarget::Offscreen(_) => {}
             RenderTarget::Window(window) => {
-                window.set_background_color(background_srgb(color));
+                window.set_background_color(background_linear(color));
             }
         }
     }
@@ -242,6 +282,7 @@ impl Renderer {
 enum StickyError {
     DeviceLost { reason: SmolStr, log_path: PathBuf },
     Swapchain { detail: SmolStr },
+    Composition { detail: SmolStr },
     AppInit { detail: SmolStr },
     GeometryRegister { detail: SmolStr },
 }
@@ -251,6 +292,7 @@ impl StickyError {
         match error {
             EngineError::DeviceLost { reason, log_path } => Self::DeviceLost { reason, log_path },
             EngineError::Swapchain { detail } => Self::Swapchain { detail },
+            EngineError::Composition { detail } => Self::Composition { detail },
             EngineError::AppInit { detail } => Self::AppInit { detail },
             EngineError::GeometryRegister { detail } => Self::GeometryRegister { detail },
             // 其余变体不会从 GPU 线程产生；降级成 `AppInit` 并保留原始文案（不静默）。
@@ -267,6 +309,9 @@ impl StickyError {
                 log_path: log_path.clone(),
             },
             Self::Swapchain { detail } => EngineError::Swapchain {
+                detail: detail.clone(),
+            },
+            Self::Composition { detail } => EngineError::Composition {
                 detail: detail.clone(),
             },
             Self::AppInit { detail } => EngineError::AppInit {
@@ -293,7 +338,7 @@ struct WindowRenderer {
 }
 
 impl WindowRenderer {
-    fn new(gpu: GpuRenderer, size: (u32, u32)) -> Result<Self, EngineError> {
+    fn new(gpu: GpuRenderer, size: (u32, u32), hwnd: isize) -> Result<Self, EngineError> {
         // `CreateEventW` 需要 `Win32_Security` feature（DEVIATIONS F-79）；两个都是 auto-reset。
         // SAFETY: 无名称的 auto-reset 事件；句柄由 `Shared` 独占并在最后一个引用释放时关闭。
         let work = unsafe { CreateEventW(None, false, false, None) }
@@ -309,10 +354,16 @@ impl WindowRenderer {
                 return Err(init_error_from("CreateEventW(completion)", error));
             }
         };
+        let surface = (size.0.max(1), size.1.max(1));
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work,
             completion,
+            hwnd,
+            // SAFETY: 只查询调用线程的 id；本构造发生在 UI 线程（GPU 线程随后才 spawn）。
+            thread: unsafe { GetCurrentThreadId() },
+            presented: AtomicU64::new(pack_size(surface)),
+            composition_pending: AtomicBool::new(false),
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -324,12 +375,22 @@ impl WindowRenderer {
         Ok(Self {
             shared,
             thread: Some(thread),
-            surface: (size.0.max(1), size.1.max(1)),
+            surface,
             stats: RenderStats::default(),
             #[cfg(feature = "hud")]
             samples: Vec::with_capacity(3),
             last_published: None,
         })
+    }
+
+    /// 最近一次**完成 present** 的内容尺寸（GPU 线程在完成观测点发布）。
+    fn presented_surface(&self) -> (u32, u32) {
+        unpack_size(self.shared.presented.load(Ordering::Acquire))
+    }
+
+    /// 合成几何兜底标记（UI 线程在泵的 ②b′ 消费）。
+    fn take_composition_pending(&self) -> bool {
+        self.shared.take_composition_pending()
     }
 
     fn publish(&mut self, request: FrameRequest) -> RenderStats {
@@ -433,6 +494,14 @@ struct Shared {
     work: HANDLE,
     /// 在飞帧的 fence 完成通知（auto-reset；GPU 线程用 `SetEventOnCompletion` 设置）。
     completion: HANDLE,
+    /// 窗口句柄（`WM_APP_COMPOSITION_WAKE` 的目标；UI 线程的 `NativeWindow` 晚于本结构释放）。
+    hwnd: isize,
+    /// 主线程 id：窗口消息投不进去时 `notify_ui` 退回 `PostThreadMessageW`（不能丢最后 1:1）。
+    thread: u32,
+    /// 最近一次**完成 present** 的内容尺寸（`width << 32 | height`；`Acquire`/`Release` 配对）。
+    presented: AtomicU64,
+    /// 两次唤醒都失败时的兜底标记：UI 线程在泵的几何 pass 里消费它并重算一次几何。
+    composition_pending: AtomicBool,
 }
 
 // SAFETY: `work` / `completion` 是进程范围的内核事件句柄；事件对象本身线程安全，
@@ -578,6 +647,55 @@ impl Shared {
         self.lock().background.take()
     }
 
+    /// 发布「最近一次完成 present 的内容尺寸」；尺寸变化时唤醒 UI 线程重算合成几何。
+    ///
+    /// 尺寸没变就不 post：几何只依赖这个尺寸，动画帧不该让泵多跑一轮。
+    fn publish_presented(&self, surface: (u32, u32)) {
+        let packed = pack_size(surface);
+        if self.presented.swap(packed, Ordering::AcqRel) != packed {
+            self.notify_ui();
+        }
+    }
+
+    /// 让 UI 线程多跑一轮泵（`poll_renderers` + ②b′ DComp 几何）。
+    ///
+    /// 只是通知，不改变 GPU 侧状态：`Shared::presented` 才是待处理状态本身，UI 线程每轮泵迭代
+    /// 都会读它并重算几何（同值 no-op），所以消息丢失最多让 1:1 晚一轮。窗口消息投不进去
+    /// （队列满 / 句柄已失效）时退回线程消息；**两种投递都失败**时置
+    /// `Shared::composition_pending`，泵下一次因任何其它原因醒来时会消费它并强制重算几何。
+    fn notify_ui(&self) {
+        // SAFETY: `hwnd` 由 UI 线程的 `NativeWindow` 持有且晚于 GPU 线程释放；`PostMessageW`
+        // 只入队，不解引用其它指针（句柄失效时返回错误）。
+        let posted = unsafe {
+            PostMessageW(
+                Some(HWND(self.hwnd as *mut core::ffi::c_void)),
+                WM_APP_COMPOSITION_WAKE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if posted.is_ok() {
+            return;
+        }
+        if self.thread != 0 {
+            // SAFETY: `thread` 是 UI 线程 id（构造时由 `GetCurrentThreadId` 取得）；只入队消息。
+            let posted = unsafe {
+                PostThreadMessageW(self.thread, WM_APP_COMPOSITION_WAKE, WPARAM(0), LPARAM(0))
+            };
+            if posted.is_ok() {
+                return;
+            }
+        }
+        // 两次唤醒都失败（队列满时通常还有别的消息在队列里；线程已退出时泵也不再需要几何）：
+        // 留下标记，UI 线程下一次泵迭代消费它并重算几何，最后的 1:1 不会丢。
+        self.composition_pending.store(true, Ordering::Release);
+    }
+
+    /// 取走「合成几何可能过期」的兜底标记（UI 线程，泵的 ②b′ 消费）。
+    fn take_composition_pending(&self) -> bool {
+        self.composition_pending.swap(false, Ordering::AcqRel)
+    }
+
     fn has_pending_frame(&self) -> bool {
         self.lock().frame.has_pending()
     }
@@ -653,6 +771,8 @@ struct SubmittedFrame {
     signal_value: u64,
     /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
     slot: usize,
+    /// 本帧 present 的内容尺寸（完成时发布给 UI 线程的合成几何）。
+    surface: (u32, u32),
 }
 
 /// GPU 线程主循环（§6.3）。
@@ -691,7 +811,7 @@ fn run_gpu_loop(
         }
         // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
         if let Some(rgba) = shared.take_background() {
-            renderer.set_background_color(rgba)?;
+            renderer.set_background_color(rgba);
         }
         if !shared.has_pending_frame() {
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
@@ -716,23 +836,25 @@ fn run_gpu_loop(
             debug_assert!(false, "waitable consumed without a pending frame");
             continue;
         };
+        // 取帧之后、可能 `grow` 之前再排空一次完成通知：`grow` 会 `wait_idle` 并用 `prime`
+        // 占用一个 ring 槽，未 drain 的帧的 timestamp 读回缓冲会被 prime 的录制覆盖
+        // （`ResolveQueryData` 的写入与 CPU 读回共用同一块缓冲 → GPU 采样错帧）。
+        drain_completed(renderer, shared, submitted);
         // 等 waitable 期间到达的背景色：与帧一起落地（仍然是录制前，不引入新的 GPU 调用点）。
         if let Some(rgba) = shared.take_background() {
-            renderer.set_background_color(rgba)?;
+            renderer.set_background_color(rgba);
         }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
         }
-        // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
-        // §6.6：任何 resize 错误（含非设备丢失的 `DXGI_ERROR_INVALID_CALL`）都是显式失败——
-        // 不重试、不丢帧：发布粘性错误并退出线程（与 Linux/macOS 一致）。
-        if request.surface != renderer.surface() {
-            renderer.resize(request.surface)?;
-        }
-        // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
+        // 内容尺寸变化：buffer 内是纯 CPU 记账（visual 的拉伸由 UI 线程的 DComp 几何负责）；
+        // 越过 grow-only buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
+        // 重建失败（含内容 > 16384）以粘性错误退出，不静默裁剪。
+        renderer.set_content_size(request.surface)?;
+        // 没有像素要画（Idle 且内容尺寸未变）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
         // 但 waitable 已经被消费：这样的帧不能走到这里（`window.rs` 在目标未重建时根本不发布
-        // Idle 计划；surface 变化会先 resize 并把 `fresh` 置真），因此只作不变量断言。
+        // Idle 计划；内容尺寸变化必然伴随全量 damage），因此只作不变量断言。
         let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
         if frame.is_idle() {
             debug_assert!(false, "idle frame consumed a waitable token");
@@ -751,6 +873,7 @@ fn run_gpu_loop(
             published_at: request.published_at,
             signal_value: slot.signal_value,
             slot: slot.index,
+            surface: request.surface,
         });
         // 明确唤醒：该帧 GPU 工作完成时 fence 置位 `completion`（auto-reset），不忙轮询。
         renderer.set_completion_event(slot.signal_value, shared.completion)?;
@@ -784,6 +907,9 @@ fn drain_completed(
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
         });
+        // 「交换链里现在有这么大一块内容」：这是 UI 线程重算 DComp 几何的正确时点（合成内容
+        // 已经落地），尺寸变化时才 post 唤醒。
+        shared.publish_presented(frame.surface);
         observed = true;
     }
     if observed {
@@ -898,13 +1024,26 @@ fn pump_messages() -> Option<i32> {
     }
 }
 
+/// `(宽, 高)` → 单个 `u64`（`width << 32 | height`），给无锁的 `presented` 槽用。
+fn pack_size(surface: (u32, u32)) -> u64 {
+    (u64::from(surface.0) << 32) | u64::from(surface.1)
+}
+
+/// [`pack_size`] 的逆。
+fn unpack_size(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
+    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError, pack_size, unpack_size};
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
@@ -973,10 +1112,18 @@ mod tests {
         }
 
         let sticky = StickyError::capture(EngineError::Swapchain {
-            detail: SmolStr::new_static("ResizeBuffers: 0x887A0001"),
+            detail: SmolStr::new_static("Present1(1 dirty rects): 0x887A0001"),
         });
         let text = sticky.to_error().to_string();
-        assert!(text.contains("ResizeBuffers"), "{text}");
+        assert!(text.contains("Present1"), "{text}");
+
+        // P2-5：运行期 DComp 失败必须保持 `Composition`，不能被降级成 `AppInit`。
+        let sticky = StickyError::capture(EngineError::Composition {
+            detail: SmolStr::new_static("set_geometry: 0x8007000E"),
+        });
+        let text = sticky.to_error().to_string();
+        assert!(text.contains("DirectComposition"), "{text}");
+        assert!(text.contains("set_geometry"), "{text}");
     }
 
     fn test_shared() -> Arc<Shared> {
@@ -992,7 +1139,39 @@ mod tests {
             state: Mutex::new(State::new()),
             work,
             completion,
+            // `hwnd = 0`：`PostMessageW(NULL, ...)` 是线程消息，测试里没有窗口也能投递。
+            hwnd: 0,
+            thread: 0,
+            presented: AtomicU64::new(pack_size((1, 1))),
+            composition_pending: AtomicBool::new(false),
         })
+    }
+
+    /// `presented` 槽：尺寸变化才 post（动画帧不唤醒 UI），打包/拆包可逆。
+    #[test]
+    fn the_presented_size_wakes_the_ui_only_when_it_changes() {
+        let shared = test_shared();
+        assert_eq!(
+            unpack_size(shared.presented.load(Ordering::Acquire)),
+            (1, 1)
+        );
+
+        shared.publish_presented((800, 600));
+        assert_eq!(
+            unpack_size(shared.presented.load(Ordering::Acquire)),
+            (800, 600)
+        );
+        // 同尺寸再发布：不改变槽位（也不会 post —— 这里无法观察消息，由 `notify_ui` 的
+        // 调用点断言：`swap` 的返回值相等时提前返回）。
+        let before = shared
+            .presented
+            .swap(pack_size((800, 600)), Ordering::AcqRel);
+        assert_eq!(unpack_size(before), (800, 600));
+        shared.publish_presented((640, 480));
+        assert_eq!(
+            unpack_size(shared.presented.load(Ordering::Acquire)),
+            (640, 480)
+        );
     }
 
     #[test]
@@ -1026,13 +1205,13 @@ mod tests {
     fn a_normal_exit_does_not_overwrite_the_loop_error() {
         let shared = test_shared();
         shared.publish_error(EngineError::Swapchain {
-            detail: SmolStr::new_static("ResizeBuffers failed"),
+            detail: SmolStr::new_static("content 3000x2000 exceeds the composition buffer"),
         });
         // 正常退出：guard 被 disarm，不发布任何东西。
         PanicGuard::new(Arc::clone(&shared)).disarm();
         match shared.take_error().expect("the loop error stays visible") {
             EngineError::Swapchain { detail } => {
-                assert!(detail.contains("ResizeBuffers"), "{detail}");
+                assert!(detail.contains("composition buffer"), "{detail}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

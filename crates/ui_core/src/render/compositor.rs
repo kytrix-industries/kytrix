@@ -149,7 +149,12 @@ impl FramePlan {
         self.fresh || self.plan.is_full()
     }
 
-    #[cfg(test)]
+    /// `fresh` 是否仍然成立：`true` = 交换链刚建好，第一次 present 之前 back buffer 的内容未定义。
+    ///
+    /// 消费方：D3D12 后端的 `copy_to_back`（fresh ⇒ 整块 buffer，否则只拷内容子矩形）与
+    /// `swapchain` 的首帧 present 规则。macOS / Linux 的 present 目标跨帧内容无保证、每帧整面
+    /// 写入，不需要这个判据。
+    #[cfg(any(windows, test))]
     pub(crate) fn is_fresh(self) -> bool {
         self.fresh
     }

@@ -3,7 +3,7 @@
 //!
 //! **提交是异步的**（I2）：`submit` 关闭列表、`ExecuteCommandLists`、`Signal` 之后立刻返回，
 //! 完成状态只通过 fence 观察。等待点在调用方（GPU 线程）：复用槽位前 `wait_slot_fence`，
-//! resize / 读回 / 退出前 `wait_idle`。
+//! 离屏 resize / 读回 / 退出前 `wait_idle`。
 
 use std::collections::VecDeque;
 
@@ -175,16 +175,17 @@ impl Queue {
         unsafe { self.fence.GetCompletedValue() }
     }
 
-    /// 等到最后一次提交完成（resize / 读回 / 退出）。
+    /// 等到最后一次提交完成（离屏 resize / 读回 / 退出）。
     pub(crate) fn wait_idle(&mut self) -> Result<(), EngineError> {
         self.wait_for(self.ring.last_signaled())
     }
 
-    /// 复位**所有** in-flight 槽的 allocator + list 并立即关闭列表（resize 前必须调用）。
+    /// 复位**所有** in-flight 槽的 allocator + list 并立即关闭列表（只用于退出路径）。
     ///
-    /// 关闭的 command list 仍记录着它引用过的资源；不 Reset 的话，swapchain 的 back buffer
-    /// 会一直有引用，`ResizeBuffers` 返回 `DXGI_ERROR_INVALID_CALL`（DEVIATIONS F-86）。
-    /// 调用方必须先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
+    /// 关闭的 command list 仍记录着它引用过的资源；不 Reset 的话 swapchain 的 back buffer 会一直
+    /// 有引用（三个 buffer 全部泄漏，swapchain 也带着引用被销毁，DEVIATIONS F-86）。窗口目标的
+    /// 交换链是固定的、不再重建，所以这条清理由 [`super::compositor::GpuRenderer`] 的 `Drop`
+    /// 独占。调用方必须先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
     pub(crate) fn reset_in_flight_lists(&mut self) -> Result<(), EngineError> {
         for index in 0..self.allocators.len() {
             let allocator = &self.allocators[index];

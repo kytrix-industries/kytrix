@@ -19,7 +19,7 @@
 | 1  | **`platform/` 私有（I9），`Event` / `InputEvent` 公开在 `src/event.rs`**；`platform::event` 只做 `WM_* → PlatformEvent → Event::Input` 的纯函数翻译                                                     | 公开白名单要能命名 `Event`/`InputEvent`；`HWND`/`MSG` 不得出平台层；翻译层零 Win32 类型 → 可单测                                     |
 | 2  | **唤醒合并**：`Dispatcher.wake()` 先 `pending.store(true)`、再 `PostMessageW(WM_APP+1)`，只有 `compare_exchange(false→true)` 成功者才 post                                                              | probe §7：`PostMessageW` 队列上限 **10,000**（第 10001 条 `0x80070718` / `GetLastError=1816`）                                       |
 | 3  | **窗口：初始隐藏 → device/swapchain → `ShowWindow`**；标题栏 P09 **用系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`），自绘标题栏留 P12                                       | probe §2/§8：默认非客户区 480×320 → 客户 462×273；自绘（返回 0）客户区 = 窗口矩形 802×602                                            |
-| 4  | **resize = `ResizeBuffers` + 重建 persist，不重建 VBO/实例缓冲**；调用前必须 `allocator.Reset` + `list.Reset`（丢弃命令列表记录的 back buffer 引用），且**修掉 P08 的两处 `ManuallyDrop` COM 引用泄漏** | probe §11：泄漏时 `ResizeBuffers` 恒 `0x887A0001`；双层释放后同尺寸/变尺寸**都 `S_OK`**（V-55 在本机闭环，见 F-86）                  |
+| 4  | **resize = `ResizeBuffers` + 重建 persist，不重建 VBO/实例缓冲**；调用前必须 `allocator.Reset` + `list.Reset`（丢弃命令列表记录的 back buffer 引用），且**修掉 P08 的两处 `ManuallyDrop` COM 引用泄漏**。**2026-11-15 已被§36 取代**：窗口改为组合交换链，第一次 present 后不能 `ResizeBuffers`；buffer 是 grow-only 桶，内容越界才换链并先 prime（DEVIATIONS §36 F-199 / F-202） | probe §11：泄漏时 `ResizeBuffers` 恒 `0x887A0001`；双层释放后同尺寸/变尺寸**都 `S_OK`**（V-55 在本机闭环，见 F-86）。当前行为见 `async-render-pipeline.md` §6.4 |
 | 5  | **`WM_PAINT` 一律 `BeginPaint`/`EndPaint` 验证**，不做任何绘制                                                                                                                                          | probe §4：不验证时 100 ms 内 **24,576** 次 `WM_PAINT`（风暴）                                                                        |
 | 6  | **输入走 `TranslateMessage` + `WM_CHAR`**（死键/组合由 OS 完成一次），引擎不自己跑 `ToUnicodeEx`                                                                                                        | probe §9：合成 `WM_KEYDOWN` 经 `TranslateMessage` 产生 `WM_CHAR(0x61)`；§14 的死键语义只在「不用 `WM_CHAR`」时才需要                 |
 | 7  | **DPI：物理→逻辑只经 `Scale::to_logical`**（唯一反向换算点）；`WM_DPICHANGED` 的 `wParam` 低/高 16 位 = `dpi_x`/`dpi_y`；非 96 dpi 必须用 `AdjustWindowRectExForDpi`                                    | probe §3：frame 在 96 dpi 是 16×39，在 120 dpi 是 18×47；§9：`wParam=0x00C000C0` → `(192,192)`                                       |
@@ -34,7 +34,7 @@
 | #      | 裁决                                                                                      | 被否掉的替代                                                                                           | 依据                                                      |
 |--------|-------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
 | **A1** | 公开 `event.rs`（`Event`/`InputEvent`…）+ 私有 `platform/`，翻译层是无 Win32 类型的纯函数 | 把 `Event` 放 `platform`（公开类型不可命名）；翻译写在 `wndproc` 里（不可单测）                        | I9 + 白名单 §1.3 + probe 全部消息可用 `SendMessageW` 合成 |
-| **A2** | resize = `ResizeBuffers` + 重建 persist，**并先修 F-86 的 `ManuallyDrop` 泄漏**           | ①重建整条 swapchain（probe 变体 26：`E_ACCESSDENIED`）；②接受 `0x887A0001` 当作环境限制（F-86 已证伪） | probe §2.7：修复后同尺寸/变尺寸都 `S_OK`                  |
+| **A2** | ~~resize = `ResizeBuffers` + 重建 persist，**并先修 F-86 的 `ManuallyDrop` 泄漏**~~ **已被 2026-11-15 的 §36 取代**：窗口改为组合交换链（grow-only buffer，越界才换链 + prime） | 当时否掉：①重建整条 swapchain（probe 变体 26：`E_ACCESSDENIED`）；②接受 `0x887A0001` 当作环境限制（F-86 已证伪）。当前 `ResizeBuffers` 在 first present 后固定失败（S-149），整条换链正是现在的实现（F-199） | probe §2.7：修复后同尺寸/变尺寸都 `S_OK`（历史）；当前见 §36 |
 | **A3** | P09 **用系统标题栏**（`WM_NCCALCSIZE` 交 `DefWindowProcW`）                               | 直接上自绘标题栏（要同时做 `WM_NCHITTEST`/拖拽/双击最大化，属 P12）                                    | probe §8：两种模式的客户区都已实测                        |
 | **A4** | 字符输入走 `TranslateMessage` + `WM_CHAR`，引擎不跑 `ToUnicodeEx`                         | 自己维护 dead-key pending 状态（多一套状态机 + 与 IME 竞争）                                           | probe §9/§14                                              |
 | **A5** | 唤醒合并（`AtomicBool` + 首次 post）+ 泵 `drain → 处理 → 阻塞`，`WM_QUIT` 显式识别        | 每次事件都 `PostMessageW`（10,000 上限）；`GetMessageW` 单条阻塞（会漏排队事件）                       | probe §2.2                                                |
@@ -68,8 +68,8 @@ crates/ui_core_demo/
 
 **修改**：`lib.rs`（`pub mod event;` + `mod platform;`）、`app.rs`（`Application` / `AppHandle` / `App::handle` /
 `App::drain_events` / `App::dispatch` / 退出条件）、`window.rs`（`set_renderer` 调用点 + `attach_native`）、
-`render/windows/swapchain.rs`（`for_hwnd` / `validate` 去掉 `#[cfg(test)]`）、
-`render/windows/compositor.rs`（`Renderer::new_for_hwnd` 去 `#[cfg(test)]` + `resize` 前 reset 列表）、
+`render/windows/swapchain.rs`（`for_composition` / `validate` 去掉 `#[cfg(test)]`；HWND `for_hwnd` 已删除）、
+`render/windows/compositor.rs`（`Renderer::new_for_hwnd` 去 `#[cfg(test)]`；窗口路径改为 `new_for_composition` + `set_content_size` / `grow`）、
 `render/windows/queue.rs`（`wait_idle` 之后追加 `reset_all_lists`）、`error.rs`（新增 `WindowCreate`）、
 `test_support/{input,app}.rs`（改用公开 `event::InputEvent`，删掉重复定义）、`Cargo.toml`（workspace member 加 demo）。
 
@@ -152,22 +152,28 @@ crates/ui_core_demo/
 | 当前键盘布局                                  | 无死键（所有 `VK_OEM_*` 均返回 1 个字符）                                                                                                                                                                                                        |
 | 德语布局（`LoadKeyboardLayoutA("00000407")`） | `VK_OEM_5`（´）= **-1（死键）**；随后 `ToUnicodeEx(VK_A)` → `â`（**一次调用即组合**）；`VK_OEM_6` 一次返回 **2** 个码元 `^´` ⇒ 缓冲区必须 ≥ 8 u16、必须按返回值切片                                                                              |
 
-### 2.6 D3D12 HWND swapchain + `Present1`（probe §11）
+### 2.6 D3D12 HWND swapchain + `Present1`（历史 probe §11；当前为组合交换链）
 
 | 实测                                    | 结果                                                                                                                                                           |
 |-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `CreateSwapChainForHwnd`（隐藏窗口）    | ok；`GetDesc1`：`format=87 (B8G8R8A8_UNORM)` / `bufferCount=3` / `SwapEffect=3 (FLIP_SEQUENTIAL)` / `Scaling=0 (STRETCH)` / `AlphaMode=3 (IGNORE)` / `flags=0`。**`Scaling` 已于 2026-11-15 改为 `DXGI_SCALING_NONE`（F-184），本行是当时的 probe 记录**，现行为见 `async-render-pipeline.md` §6.2 |
+| `CreateSwapChainForHwnd`（隐藏窗口）    | ok；`GetDesc1`：`format=87 (B8G8R8A8_UNORM)` / `bufferCount=3` / `SwapEffect=3 (FLIP_SEQUENTIAL)` / `Scaling=0 (STRETCH)` / `AlphaMode=3 (IGNORE)` / `flags=0`。**历史 HWND probe**；窗口路径已于 2026-11-15 改为组合交换链（`CreateSwapChainForComposition` + `STRETCH` + waitable，DEVIATIONS §36 F-199 / S-149），现行为见 `async-render-pipeline.md` §6.2 |
 | ① 隐藏窗口 + 首帧全量 `Present1`        | **`S_OK`**（`0x00000000`），设备 `S_OK`                                                                                                                        |
 | ② `ShowWindow` 之后全量 `Present1`      | `S_OK`                                                                                                                                                         |
 | ③ 局部 dirty `(8,8)-(24,24)` `Present1` | `S_OK`                                                                                                                                                         |
 | ④ 越界 dirty rect                       | `0x887A0001`（复验 P08 F-72 ②）；失败后设备未丢                                                                                                                |
-| ⑤ present 之后 `ResizeBuffers`          | **`0x887A0001`**（P08 V-55 的同一现象）                                                                                                                        |
+| ⑤ present 之后 `ResizeBuffers`          | **`0x887A0001`**（P08 V-55 的同一现象；2026-11-15 的组合交换链 probe 复现同一固定限制，DEVIATIONS §36 S-149）                                                     |
 
 > **①与 P08 V-57 的对照**：P08 在测试进程里隐藏窗口 present 失败（设备移除）。
 > 本 probe（独立进程）隐藏窗口首帧 present **成功**，且随后显示/局部/越界三种调用行为与 P08 §2.6 完全一致
 > ⇒ **V-57 是进程内状态污染（V-59 同源），不是"隐藏窗口不能 present"**。
 
 ### 2.7 `ResizeBuffers` 根因（P08 V-55 的闭环）
+
+> **历史章节（2026-11-15 之后）**：本节解释 HWND flip swapchain 时代 `ResizeBuffers` 为什么
+> `0x887A0001`（COM 引用泄漏），以及 F-86 的修复。**当前窗口路径已不再调用 `ResizeBuffers`**：
+> 组合交换链在第一次 present 之后固定失败（DEVIATIONS §36 S-149），buffer 改为 grow-only +
+> 整条换链（§36 F-199 / F-202）。下面的泄漏事实仍是 `ManuallyDrop` 双层释放的契约，但不是当前
+> resize 失败的原因。
 
 `kg-p09-resize` 用 20 个变体（每变体独立进程）穷举，结论：
 
@@ -212,7 +218,7 @@ std::mem::ManuallyDrop::drop( & mut src.pResource);
 > 只有前两行会影响 `ResizeBuffers`；其余三处是同一类 bug 的其它实例（长跑会持续泄漏 COM 对象），P09
 > 一并修，避免"修了 resize 又留下别的钉住点"。
 
-**resize 的调用顺序（probe 验证）**：
+**resize 的调用顺序（历史 HWND probe；当前已删除）**：
 `queue.wait_idle()` → 释放全部 back buffer 引用（P08 不建 RTV，只有 `GetBuffer` 临时引用）→
 `allocator.Reset()` + `list.Reset(allocator, None)`（**丢弃命令列表记录的 back buffer 引用**）→
 `ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0)` → `fresh = true`。
@@ -237,7 +243,7 @@ std::mem::ManuallyDrop::drop( & mut src.pResource);
 |---------------------------------------|-------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 真实 IME 输入（候选窗、preedit 光标） | 本机有 `HIMC` 但无输入法实际输入；`WM_IME_*` 只能合成             | P09 只实现消息通路 + `ImmSetCompositionWindow`；P16 追加 `App::set_ime_cursor_area` / `ImmSetCandidateWindow(CFS_EXCLUDE)` 的 caret 定位（F-154），preedit/TSF 语义仍留平台矩阵（V-61 / V-104） |
 | dead key 的 `WM_CHAR` 组合            | 只能验证 `ToUnicodeEx` 的 -1/组合语义；无法用真实键盘产生死键消息 | 走 `TranslateMessage`+`WM_CHAR`（OS 组合），单测钉死 `WM_CHAR` 的消费路径                                                                                                                       |
-| 多 swapchain / 同 HWND 重建           | 泄漏引用时 `E_ACCESSDENIED`；修复后未再验证「重建」路线           | P09 选 `ResizeBuffers`（已闭环），不引入第二条 resize 路径                                                                                                                                      |
+| 多 swapchain / 同 HWND 重建           | 泄漏引用时 `E_ACCESSDENIED`；修复后未再验证「重建」路线           | 历史 HWND 方案选 `ResizeBuffers`；**当前已改为组合交换链的整条换链**（grow 时先 prime，DEVIATIONS §36 F-199 / F-202），不再是第二套 resize 路径 |
 | 无桌面 CI 的 present                  | 无交互桌面时只能看 `Present1` 返回值，不能看像素                  | demo 的 `--snapshot`（WARP 离屏）做像素断言；present 人工验收（V-62）                                                                                                                           |
 | 真实 DPI 变化（跨屏拖动）             | 无第二显示器/无交互桌面                                           | 合成 `WM_DPICHANGED` 走通换算；实机由 P12 的 L5 矩阵补                                                                                                                                          |
 
@@ -506,6 +512,7 @@ D8 检测在 3c 内部（`Renderer::new_for_hwnd` → `Device::new` → `GpuCaps
 |----------|-------------------------------------------------------------------------------------------------------------|
 | class    | `KytrixGuiWindow`（`hInstance = GetModuleHandleW(None)`；`hbrBackground = null`：**引擎自己画**，不擦背景） |
 | style    | `WS_OVERLAPPEDWINDOW`（`WS_CAPTION                                                                          |WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX`）；**先不带** `WS_VISIBLE` |
+| ex style | `WS_EX_NOREDIRECTIONBITMAP`（2026-11-15 起；客户区全部像素来自 DirectComposition 组合交换链，DEVIATIONS §36 F-199） |
 | size     | `SetWindowPos` 到 `AdjustWindowRectExForDpi(client = logical×scale, dpi)` 的窗口尺寸                        |
 | owner    | 无（`None`）；v1 单窗口                                                                                     |
 | 标题     | `WindowOptions.title`（`SmolStr` → `Vec<u16>`，截断到 1024 u16）                                            |
@@ -522,20 +529,22 @@ D8 检测在 3c 内部（`Renderer::new_for_hwnd` → `Device::new` → `GpuCaps
 
 ```text
 WM_SIZE(w, l):
-  if wParam == SIZE_MINIMIZED: return                      // 最小化不重建（也只丢弃 SIZE_MINIMIZED）
+  if wParam == SIZE_MINIMIZED: 保留上一次逻辑尺寸 / surface，不写 0×0    // P2-3
   physical = (LOWORD(l), HIWORD(l))                        // = 新的客户区物理尺寸
   logical  = scale.to_logical(每个分量)                     // I11
   window.set_size(logical)                                 // 标根 LAYOUT + full_damage_pending
   window.set_surface(physical)                             // 真实渲染目标（F-186；值变化标全量）
-  dispatcher.wake()                                        // 下一帧提交时 resize
-下一帧（2026-11-15 后为异步）：GPU 线程按 FrameRequest.surface 比较并 resize（§2.7 顺序）
+  dispatcher.wake()                                        // 内容尺寸随下一帧 FrameRequest.surface 过线
+泵的 ②b′（每轮）：按 Window::presented_surface() + client_size() 重设 DComp visual 的 scale/clip
+GPU 线程（下一帧）：set_content_size(physical)；buffer 内纯记账，越界才 grow（先 prime 再 SetContent）
 ```
 
-- `set_surface` 必须写在 `set_size` 之后：`set_size` 会先按 `size × scale` 重算 covering，`set_surface` 用真实客户区覆盖它；两者都标全量，不重复。
-- 最小化只丢弃 `SIZE_MINIMIZED` 的 `WM_SIZE`；其它 `WM_SIZE`（恢复 / 拖动）照常更新 size + surface。最小化期间 `WM_DPICHANGED` 的 `GetClientRect` 是 0×0（`client_size()` 钳成 1×1），此时用 `IsIconic` 跳过 `set_surface`，目标保持 `set_scale` 重算的 covering；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖。
-- P09 同步管线里的 `fresh = renderer.surface() != physical` 已由 GPU 线程按 `async-render-pipeline.md` §6.4 取代；UI 线程不再算 `fresh`。
-- **VBO / 实例缓冲不重建**：`InstanceBuffer` 容量跨帧保留，只有 persist 纹理与 swapchain buffer 重建（主设计 §5.5 / §9.3）。
-- `ResizeBuffers` 失败 ⇒ `EngineError::Swapchain`，**不重试**（P08 §2.7 的结论不变；现在失败概率已被 F-86 降到"真故障"）。
+- `set_surface` 必须写在 `set_size` 之后：`set_size` 会先按 `size × scale` 重算 covering，`set_surface` 用真实客户区覆盖它；两者都标全量，不重复（F-194 之后平台真值写入后 `set_size` 不再覆盖）。
+- 最小化只丢弃 `SIZE_MINIMIZED` 的 `WM_SIZE`；其它 `WM_SIZE`（恢复 / 拖动）照常更新 size + surface。最小化期间 `WM_DPICHANGED` 的 `GetClientRect` 是 0×0（`client_size()` 钳成 1×1），此时用 `IsIconic` 跳过 `set_surface`；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖。DComp 几何 pass 在最小化时也跳过。
+- P09 同步管线里的 `fresh = renderer.surface() != physical` 已由 GPU 线程按 `async-render-pipeline.md` §6.4 取代；UI 线程不再算 `fresh`。Windows 的 `commit_frame` 用 `surface_change_plan` 把尺寸变化夹成 `Full`（`Plan::Idle` 会消费 waitable 而不 present）。
+- **没有 `ResizeBuffers`**：窗口是组合交换链（第一次 present 之后 resize 恒 `0x887A0001`，DEVIATIONS §36 S-149）；buffer 是 grow-only 高水位，内容越过它才整条换链并先 prime（§36 F-199 / F-202）。拖动中的视觉拉伸由 UI 线程的 DComp 几何负责。
+- **自绘边框缩放节奏**：`WM_MOUSEMOVE` 只记录最新光标，`SetWindowPos` 由 1 ms `WM_TIMER(RESIZE_TIMER_ID)` / 抬起 / 失去捕获合并到 ~60 Hz（§36 F-201），不再按 1000 Hz 鼠标风暴逐条 `WM_SIZE` + present。
+- **VBO / 实例缓冲不重建**：`InstanceBuffer` 容量跨帧保留，窗口 resize 只改 persist / back buffer 的可见内容范围（主设计 §5.5 / §9.3）。
 - 最小尺寸：`WM_GETMINMAXINFO` 拦住用户拖拽；`WM_SIZE` 里再 `clamp(320,200)` 一次（外部 `SetWindowPos` 会绕过
   `GetMinMaxInfo` 的部分路径，probe §8）。
 
@@ -712,13 +721,13 @@ cargo run -p ui_core_demo --features snapshot -- --snapshot out\demo.png
 
 | #   | 风险                                                                                                                   | 处置                                                                                                                                                                                                                    |
 |-----|------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| R-1 | **`ResizeBuffers` 的剩余不确定性**：probe 只在本机（RTX 5080 / 非交互会话）闭环；其它驱动、多显示器、混合 DPI 下未验证 | 保留 P08 的「失败即 `Swapchain`、不重试」；登记 V-60（本轮已把根因写死）；P12 的 L5 矩阵补实机                                                                                                                          |
-| R-2 | **present 与消息泵的同步**：`Present1(sync=1)` 在泵线程内阻塞，会推迟消息处理（本机实测每次 present 几毫秒，可接受）   | P09 保持同步提交；P13 再评估 `FRAME_LATENCY_WAITABLE_OBJECT`（本机创建该 flag 的 swapchain 直接失败，probe §2.7 变体 6）                                                                                                |
+| R-1 | **`ResizeBuffers` 的剩余不确定性**（历史 HWND）：probe 只在本机（RTX 5080 / 非交互会话）闭环；其它驱动、多显示器、混合 DPI 下未验证 | 当前窗口路径已无 `ResizeBuffers`（§36 S-149 是固定限制）；grow 的失败显式冒泡、不重试；混合 DPI 多屏的 DComp 路径未测（§36 V-126） |
+| R-2 | **present 与消息泵的同步**（历史 P09 同步管线）：`Present1(sync=1)` 在泵线程内阻塞，会推迟消息处理 | **已由异步管线解决**（DEVIATIONS §27 / `async-render-pipeline.md` §6）：`Present1` 只在 `kytrix-d3d12` 线程，UI 线程不等待；waitable 已启用（`FRAME_LATENCY_WAITABLE_OBJECT`）。 |
 | R-3 | **非 Windows 构建**：`platform` 不编译 ⇒ `Application` 不存在，`ui_core_demo` 无法在 CI 的 Linux/macOS 上编译          | demo 的 `[[bin]]` 加 `required-features`？更简单：demo 的 `main.rs` 用 `#[cfg(windows)]` 的 `fn main` + 非 Windows 的 `fn main(){ println!("windows only") }`；CI 的跨平台检查只 `cargo check -p ui_core`（P08 已如此） |
 | R-4 | **`WM_PAINT` 风暴**：漏一次 `EndPaint` 就 100 ms 内 2.4 万条消息，CPU 打满                                             | `wndproc` 的 `WM_PAINT` 分支只有 `BeginPaint`/`EndPaint` 两行；单测不覆盖（需要窗口），靠 demo 的人工跑 + code review                                                                                                   |
 | R-5 | **IME 复杂度**：组合串/候选窗/去重在真实输入法（微软拼音、日文）下有组合顺序差异                                       | P09 只做消息通路 + `ImmSetCompositionWindow`；`WM_CHAR` 兜底；P12 用真实输入法补（V-61）                                                                                                                                |
 | R-6 | **demo 在无桌面 CI 上不能 present**                                                                                    | `--snapshot` 是 CI 路径；present 属人工验收（V-62），并在 `README`/PR 里写明                                                                                                                                            |
-| R-7 | **`ManuallyDrop` 修复的回归风险**：修 `transition`/`copy_rect` 时若漏一处就回到 `0x887A0001`                           | 修完后必须跑 `hidden_window_swapchain_accepts_a_full_present` 的**取消 `#[ignore]`** 版本 + demo 的手动 resize；单测断言「同一 back buffer 的引用计数不增长」不可行，改为 demo 连点 resize 20 次不失败                  |
+| R-7 | **`ManuallyDrop` 修复的回归风险**：修 `transition`/`copy_rect` 时若漏一处就回到 `0x887A0001`                           | 历史 HWND resize 的回归测试；当前窗口路径不再 `ResizeBuffers`（§36 S-149），但 `ManuallyDrop` 双层释放仍是 `queue.rs` / `readback.rs` 的契约，改动后跑离屏/快照与 demo 冒烟。注意：窗口的 `0x887A0001` 现在是组合交换链的固定限制，不是泄漏 |
 | R-8 | **`WM_QUIT` 消费**（probe 首轮真事故）                                                                                 | 泵循环显式 `if msg.message == WM_QUIT { break }`；单测用 `PeekMessageW` 的伪造消息不可行，写进 `event_loop.rs` 的注释与 review checklist                                                                                |
 
 ---

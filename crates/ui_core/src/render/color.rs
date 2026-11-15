@@ -2,12 +2,12 @@
 //!
 //! 背景色没有透明度（alpha 恒 1），但两条呈现路径需要**不同编码**：
 //!
-//! - **sRGB 编码**（[`background_srgb`]）：DXGI 的 `SetBackgroundColor` 在 UNORM flip swapchain 上
-//!   按 sRGB 字节直写（S-139 实测：字面量 linear 值只会得到 `linear × 255`，官方 "recommend
-//!   linear" 不适用于该路径）；`NSColor` / `CGColor` 的 sRGB 颜色空间同样要编码后的分量。
-//! - **linear**（[`background_linear`]）：Metal 的 `BGRA8Unorm_sRGB` / Vulkan 的 `*_SRGB` 渲染目标
-//!   在 clear 时按 linear 值写入（硬件做 sRGB 编码），传编码值会偏亮。macOS（persist clear）与
-//!   Linux（Vulkan persist clear）走这条路径。
+//! - **linear**（[`background_linear`]）：sRGB 渲染目标的 clear 值（硬件做 sRGB 编码），传编码值
+//!   会偏亮。Windows（DirectComposition 的 persist clear）、macOS（Metal persist clear）与
+//!   Linux（Vulkan persist clear）都走这条路径。
+//! - **sRGB 编码**（[`background_srgb`]）：按 sRGB 字节直写的平台入口，即 AppKit 的
+//!   `NSColor` / `CGColor`（`CAMetalLayer.backgroundColor`）。DirectComposition 的组合交换链上
+//!   `SetBackgroundColor` 是惰性的（probe 实测返回 OK 但不参与合成），Windows 已不再使用它。
 //!
 //! 两条路径都从「alpha 置 1 + [`ColorResolver::resolve`]」的同一份结果出发，颜色语义只有一处。
 
@@ -54,12 +54,12 @@ fn opaque(color: Color) -> Color {
 
 /// 引擎颜色 → **sRGB 编码**的 RGBA（未预乘、alpha 恒 1）。
 ///
-/// 给按 sRGB 字节直写的平台入口用：Windows `SetBackgroundColor`、macOS `NSColor` / `CGColor`。
-/// Linux（Vulkan sRGB attachment）走 [`background_linear`]，不使用本函数，因此它在 Linux 的
-/// 产品构建里不参与编译（测试构建仍覆盖它）。
+/// 给按 sRGB 字节直写的平台入口用：macOS 的 `NSColor` / `CGColor`（`CAMetalLayer.backgroundColor`）。
+/// Windows（组合交换链的 persist clear）与 Linux（Vulkan sRGB attachment）走
+/// [`background_linear`]，因此本函数在它们的构建里不参与编译（测试构建仍覆盖它）。
 /// alpha = 1 ⇒ `resolve` 的线性分量就是未预乘的 linear RGB（已 clamp 到 `[0, 1]`）；再按
 /// IEC 61966-2-1 的传递函数编码。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
     let linear = ColorResolver::default().resolve(opaque(color)).components;
     let encode = |component: f32| {
@@ -75,10 +75,10 @@ pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
 
 /// 引擎颜色 → **linear** 的 RGBA（alpha 恒 1），给 sRGB 渲染目标的 clear 用。
 ///
-/// macOS 的 Metal persist clear 与 Linux 的 Vulkan persist clear 都用它（硬件按 sRGB 渲染目标做
-/// 编码）。Windows 的 `SetBackgroundColor` 走 [`background_srgb`]（按字节直写），因此它在 Windows
-/// 的产品构建里不参与编译（测试构建仍覆盖它）。
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+/// Windows 的 DirectComposition persist clear、macOS 的 Metal persist clear 与 Linux 的 Vulkan
+/// persist clear 都用它（硬件按 sRGB 渲染目标做编码）。只有 macOS 的 `CAMetalLayer` 走
+/// [`background_srgb`]（按字节直写）。
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn background_linear(color: Color) -> [f32; 4] {
     let linear = ColorResolver::default().resolve(opaque(color)).components;
     [linear[0], linear[1], linear[2], 1.0]
