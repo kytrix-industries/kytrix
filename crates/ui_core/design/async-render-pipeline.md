@@ -222,7 +222,7 @@ resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU �
 - **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
 - **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
-- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）。
+- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` 都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）；`submit_gpu` 不再自行调用 `frame_rect()`，它消费 `commit_frame` 用同一份 damage 与 frame 算好的 `plan`（目标尺寸仍取 `physical_surface()`，F-193）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
 
@@ -339,7 +339,7 @@ loop {
 
 ### 5.4 resize / DPI
 
-- 窗口尺寸变化：平台层 `sync_state` 用 `NSView.convertSizeToBacking(view.bounds.size)` 读**真实 backing**（round）→ 先 `set_size`（逻辑尺寸：布局/覆盖重算）→ 再 `set_surface(backing)`（刷新 `contentsScale`/`drawableSize`，并把 `Window.surface` 覆盖成真值）→ 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
+- 窗口尺寸变化：平台层 `sync_state` 用 `NSView.convertSizeToBacking(view.bounds.size)` 读**真实 backing**（round）→ 先 `set_size`（逻辑尺寸：布局 / DPI 失效；平台真值已写入时**不再**重算 `surface`，F-194）→ 再 `set_surface(backing)`（真实 backing 的**写入口**：刷新 `contentsScale`/`drawableSize`，并把 `Window.surface` 写成真值）→ 下一帧 `FrameRequest.surface` 变化 → GPU 线程重建 persist（新纹理 + 旧句柄按 §4.3 retire）→ 该帧 `Full`。
 - 不等待任何在飞帧：旧 persist 被在飞命令缓冲引用，由 retire 在完成后释放；GPU 线程立即改用新 persist。
 - drawable 的实际尺寸 = 真实 backing：`drawableSize` 写的就是 `Window.surface` 的那个整数（[CAMetalLayer.drawableSize](https://developer.apple.com/documentation/quartzcore/cametallayer/drawablesize)），不是 `bounds × contentsScale` 的派生值。AppKit 已改 bounds、UI 还没发布新 surface 时两者仍可能差一帧：GPU 线程在**占槽与取帧之前**比较（1 px 容差吸收 DPI 取整）；不一致就丢弃陈旧 drawable、跳过本 vsync，帧留在最新帧槽（F-172）。persist 尺寸与 `Full` 判定以最终采用的 drawable 尺寸为准。
 - **`Skip` 在 `bottomLeft` + `backgroundColor` 下视觉正确**（F-187 / F-188）：旧 drawable 保持 1:1 贴在视觉左上，新暴露的右/下区域由图层背景色补齐，所以跳一个 vsync 不会看到拉伸/发虚——这是 F-172 状态机**不改**的前提。实测（macOS 15.8.1 / Iris Plus 655 / 2x）：旧 HEAD `8598fe398` 的 stale 卡片 1624×430（1.466×/1.229× 非等比、文字 Laplacian -22%）；新代码 1108×350（1.000×/1.000× = 静止尺寸）、贴左上（y0 = 128/129、h = 174/175，连续 sweep 恒定）、卡片文字 808 vs 800（+1%）、标题 3272 vs 3279（-0.2%）、条带 RGB (13,15,19)/(14,15,19) 对静止背景 (12,14,18)（Δ≤1）。`Degraded` 只作活性保底：持续 >1 px 不一致时按 drawable 尺寸全量画，不至于永久停更。
@@ -1043,13 +1043,13 @@ Windows / 硬件 D3D12 / 3840×2160 @125%，窗口 DPI=120，demo client 1200×9
 | swapchain | `FLIP_SEQUENTIAL` + `DXGI_SCALING_NONE` + `SetBackgroundColor`（创建后 / `ResizeBuffers` 后）；3 buffers 与 waitable flag 保留（§6.2 / F-184） |
 | 背景色编码 | 本路径按 sRGB 编码字节直写：linear 主题色 ⇒ `(1,1,2)`，sRGB 编码 ⇒ `(11,14,19)`；官方 “recommend linear” 不适用（§6.2 / S-139） |
 | 帧延迟 | `SetMaximumFrameLatency(2 → 1)`；隐藏窗口实机 `GetMaximumFrameLatency() == 1`（F-185） |
-| surface | Windows = 真实客户区（`run` / `WM_SIZE` / `WM_DPICHANGED` 后 `set_surface`；最小化 `IsIconic` 跳过）；`paint_frame` / `commit_frame` / `submit_gpu` 走 `frame_rect()`（§4.4 / §6.4 / F-186） |
+| surface | Windows = 真实客户区（`run` / `WM_SIZE` / `WM_DPICHANGED` 后 `set_surface`；最小化 `IsIconic` 跳过）；`paint_frame` / `commit_frame` 走 `frame_rect()`（§4.4 / §6.4 / F-186）；**2026-11-15 追加（第八轮 §15.12）**：`submit_gpu` 不再自行调 `frame_rect()`，改消费 `commit_frame` 算好的 `plan`（F-193） |
 | 背景色契约 | `WindowOptions.background`（默认 BLACK、不透明、仅 Windows）+ `set_background_color`；GPU 线程两个应用点，下一次 `Present1` 生效（§6.3 / §6.7） |
 | 实测（125%） | 300×200 跳变：stale 帧 9.4–11.7 ms、卡片恒 725×220、条带 100% `(11,14,19)`（229 帧 / 3 次跳变）、首原生帧 42.3–46.0 ms、HUD lap 4687.5–4696.3；911 帧拖动 `stretch_w = 1.00000`、HUD lap 4707.5–4936.2（静止 4633.7，无下降）；200 次 resize（fails=0，4.58 s）后条带不变；缩小 1500×1125→1350×1000 首帧裁切、~33 ms 后回位；60.2 s soak Latency 1.88–13.23 ms、FPS 63.9/64.0/60.6；最小化 5 s 恢复像素差 0.067%；Esc 关窗 90 ms / exit 0 / stderr 0 字节；无 `0x887A0001`（§10.2 / §11） |
 | 未验证 | 150% / 175% 真实 DPI、最小化 + `WM_DPICHANGED` 组合、`ResizeBuffers` 是否保留背景色、`SetMaximumFrameLatency` 默认值文档口径、HUD FPS 与旧口径 58–60、隐藏窗口测试仍 `#[ignore]`、非 Windows `frame_rect` 0×0 仅编译检查（V-120） |
 
 > **注**：本节是 Windows 轮次的原记录（当时 macOS / Linux 未改）；后续轮次（macOS §15.10 /
-> Linux §15.11）已扩展，勿与 HEAD 当前行为混读。表中「仅 Windows」「非 Windows `frame_rect` 0×0」
+> Linux §15.11 / 第八轮 §15.12）已扩展，勿与 HEAD 当前行为混读。表中「仅 Windows」「非 Windows `frame_rect` 0×0」
 > 属于当时记录，正文保留。
 
 ### 15.10 第六轮闭环（macOS live resize：`kCAGravityBottomLeft` + 真实 backing + 背景色，2026-11-15）
@@ -1120,7 +1120,7 @@ UI 线程的 commit 与 GPU 线程 WSI present 的 commit 没有 happens-before�
 | 不 seed 帧 | 不改 destination 时旧 buffer 不会被缩放；Wayland 窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局。没有 Windows 的「背景条中间态」，因此不引入额外的旧 layout 帧（F-192） |
 | 实测（headless sway 1.11 / wlroots 0.19 / lavapipe） | 1.25：701×501 → buffer **876×626**（round；旧 877×627）、destination 701×501，`create_buffer → set_destination → attach → commit` 相邻无中间 commit；卡片 725×220 恒定、静止 Laplacian 1715.34（旧 616–1048）；1.0：卡片 580×176 恒定、Laplacian 2019.30；2802 次 resize / 3583 次 present，**1218 次 destination 变更 1218 次原子**（0 无 attach、0 mismatch、0 `set_buffer_scale`）；FrameGate 最大间隔 79.6 ms；HUD 静止 59.1 fps / 2.13 ms、拖动 39.2 / 6.28 ms；exit 0、validation 0 VUID。1.25 下 7/70 帧整窗变软（bbox 不变；稳定复测 1715.34，归因 sway 分数缩放采样，不是旧 buffer 缩放）；缩小（1.0）右裁 576×176、下裁 580×134 |
 | clear 夹具 | `/tmp` 临时夹具（无根节点）：`#0B0E13` → 像素 `(11,14,19)`、`#402080` → `(64,32,128)`，证明 linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见（F-192 / S-143） |
-| 未验证 | Mutter / KWin、真实指针拖拽、逐次 `OUT_OF_DATE` / `vkQueuePresentKHR` 计数、无 viewporter 回退（实现没有 destination / `buffer_scale` 回退，V-122 P2-5）、1.25 sway 瞬态采样、HUD OCR；`apply_min_size` 的物理/逻辑 bug 仍存在（V-122） |
+| 未验证 | Mutter / KWin、真实指针拖拽、逐次 `OUT_OF_DATE` / `vkQueuePresentKHR` 计数、无 viewporter 回退（实现没有 destination / `buffer_scale` 回退，V-122 P2-5）、1.25 sway 瞬态采样、HUD OCR（`apply_min_size` 已在第八轮修复，见 §15.12） |
 
 - **探针环境与方法**：headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1` 1280×720；
   `swaymsg resize set` 做程序化 jump / sweep（没有真实指针拖拽），`grim` 逐帧截图，
@@ -1146,4 +1146,60 @@ UI 线程的 commit 与 GPU 线程 WSI present 的 commit 没有 happens-before�
   `last_destination` / present 前 destination / `set_clear_color` / Drop destroy）、
   `render/color.rs`（`background_linear` 覆盖 Linux）、`render/frame.rs`（`surface_local`）、
   `window.rs`（`surface` / `set_surface` / `frame_rect` / `background` 的 Linux `cfg`）。
+
+> 第八轮（V-122 残留：`Committed` ⇒ publish / surface 归属 / min size / setup 顺序）见 §15.12。
+
+### 15.12 第八轮闭环：V-122 残留（2026-11-15）
+
+第七轮之后剩下的 V-122 ⑧（`Committed` 不 publish）、⑨（renderer 挂载后的 setup 早退
+drop-order）、⑦（min size 物理 / 逻辑）与 F-186 / F-189 的 surface 归属残留，本轮一次收掉。
+跨平台帧契约只在「有 renderer 的 `Committed` 帧恰好 publish 一次」上收紧，`App::frame` 的签名
+与返回类型不变。偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md) §34（F-193 … F-196 / S-145），
+实机证据见 [`linux-verification.md`](linux-verification.md) §4.8 与
+[`macos-verification.md`](macos-verification.md) §2.12。
+
+| 项 | 结论 |
+|---|---|
+| F-193 `Committed` ⇒ publish | `commit_frame` 用纯函数 `frame_reaches_gpu(plan, renderer_surface, surface)` 判定本帧是否产生 GPU 工作：无 renderer（headless / 纯 CPU 帧）⇒ `true`（仍按 `Committed`）；有 renderer ⇒ `plan != Plan::Idle \|\| renderer_surface != Some(surface)`。false 时**先 `tree.settle_frame()`** 再按 `FrameOutcome::Idle` 结算（`scheduler.abort`、不推进 `FrameIndex`、不 publish）——paint 已消费 lane 与 damage，节点状态必须像已提交帧一样复位。`submit_gpu` 删除「`Plan::Idle` + surface 相同 ⇒ 跳过 publish」早退，改为接收算好的 `Plan`（目标尺寸仍取 `physical_surface()`）；有 renderer 的 `Committed` 帧恰好 publish 一次。目的：Linux `FrameGate` 只认 present 后的 `wl_callback`，旧实现中「Committed 但没 publish」的帧会让门禁等 200 ms 活性兜底（V-122 ⑧ / P2-2） |
+| F-194 surface 归属 | `Window.surface_from_platform: bool`；`set_surface` 在 clamp 之后、同值 early-return **之前**置 `true`；`set_size` / `set_scale` 只在该标志为 `false` 时把 `surface` 重算成 `size × scale` 的 covering，平台真值写入后保留。headless / 快照 / 平台首次写入前行为不变。Windows 最小化 + DPI 变化时跳过 `set_surface`，现在保持上一次平台写入的真实客户区（恢复时 `WM_SIZE` 覆盖）；macOS `sync_state` 与 Linux 每轮都是 setter → `set_surface`，顺序不变。消除 F-186 / F-189 残留：应用代码在活窗口上调用 `set_size` / `set_scale` 不再把渲染目标重置成 covering |
+| F-195 Linux min size | `xdg_toplevel.set_min_size` 收 window geometry 坐标；本仓 `wp_viewport.set_destination(ceil(logical))` 使 surface 尺寸 = 逻辑尺寸（S-145），故直接给 320×200。`apply_min_size(toplevel)` 只在 `WaylandState::new` 的首个 `surface.commit()` 前设置一次；删除 `event_loop` 的 DPI 重发与重复 setup 调用，删除失去唯一调用者的 `WaylandState::toplevel()` |
+| F-196 Linux setup 顺序 | `event_loop::run` 把所有可失败 setup（`WaylandState::new` / roundtrip / devices / id / calloop `EventLoop` / ping / `WaylandSource` / `UnixA11y::new`）排在 `Renderer::new_for_surface` 与 `window.set_renderer` 之前；循环路径仍显式 `drop(app)`。早退时 `app` 内没有 renderer，不会出现 `WaylandState`（`wl_surface`）先于 `Renderer` 释放。panic 展开仍是局部变量先于函数参数 `app` 释放（release `panic=abort`），本轮不覆盖 |
+| S-145 坐标语义 | `set_min_size` 是 window geometry（surface-local 逻辑）坐标，不是 buffer 像素；**没有 viewporter 时**「surface = 逻辑尺寸」不成立，写入的 320×200 不保证是期望的最小客户区（V-122 ④ / P2-5）。buffer 由客户端按 `round(logical × scale)` 算（F-191），compositor 只缩放到 destination |
+
+**三平台实测**（HEAD `6a686cd`，工作树 clean）：
+
+| 平台 | 门禁 | 真机 probe |
+|---|---|---|
+| Windows（主机 125% DPI） | `cargo test -p ui_core --lib` **712 passed / 0 failed / 1 ignored**；`--features "hud,test-support"` lib **774 passed / 1 ignored**（frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37）；`clippy -D warnings` exit 0；`fmt --check` exit 0；`ui_core_SKIP_SHADERS=1 cargo check --target aarch64-apple-darwin`（默认 / features）exit 0；stub `pkg-config` + `PKG_CONFIG_ALLOW_CROSS=1` 的 `x86_64-unknown-linux-gnu`（默认 / features）exit 0 | 初始客户区 1200×925；`SetWindowPos` +300 宽 → 1500×925；再 +200 高 → 1500×1125；260 步 ×3 px 右边界拖动 → 2280×925。主卡片填充 bbox 恒 `(32,102,721,216)`（456/456 流式帧）、绘制盒恒 725×220（baseline / 拉宽 / 加高 / sweep / final）；右侧新暴露条带 median **(11,14,19)**（384/384 采样），底部条带 bg_frac 1.0；标题区 Laplacian **949.63** 恒定（heading 1012.967、卡片内部 990.209 恒定）；`WM_CLOSE` 与 `Esc` 均 exit 0；无 `0x887A0001` |
+| macOS（2x Retina；单显示器 1680×1050 逻辑 / 3360×2100 backing） | `cargo test -p ui_core --lib` **670 passed / 0 failed / 0 ignored**；`--features "hud,test-support"` 全 target **792 passed**（lib 730、frame_record 6、hud 7、layout 4、snapshot 8、demo 37；Metal golden 8/8 真跑）；clippy / fmt exit 0 | 初始 CGWindow 960×778 → AX 1200×800 → 960×740；三种尺寸主卡片填充 bbox **完全相同** `(25,119)–(602.5,292.5)`，标题区 Laplacian **1744.737** 恒定，card_px **1,634,783** 在 960×778 与 1200×800 相同；960×740 vs 1200×800 共同区域仅 **464 px** 不同（0.0163%），960×778 vs 960×740 **225 px**（0.0079%）；右侧 / 底部新区域是背景 `#0B0E13`、无黑边 / 旧内容；exit 0，无 panic / Metal validation |
+| Linux（headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1` 1280×720） | `cargo test -p ui_core --lib` **664 passed / 0 failed / 0 ignored**；`--features "hud,test-support"` lib **724** + frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37（62）；nightly clippy `-D warnings` 与 fmt exit 0 | min size：`WAYLAND_DEBUG=1` 记录 `-> xdg_toplevel#9.set_min_size(320, 200)` 仅 **1 次**，顺序 set_app_id → set_title → set_min_size → 首个 `wl_surface.commit()`；`preferred_scale(150)`；运行中 1.25→1.0→1.25 两次 scale 切换后 set_min_size 计数仍为 1；1.0 复测同样 1 次 `(320,200)`。resize / 退出：1.25 sweep `1100×800`（输出钳到 1024×576）→ `900×700` → `700×560` → `500×400` → `100×100`，每步 alive、`grim` 截图 1280×720 正常，日志无 panic / VUID / validation；`wtype -k Escape` 两次均 exit 0；60 s soak（20 ms 间隔、2043 次）全程存活、错误 0（最终 rect 500×375）。失败路径：`WAYLAND_DISPLAY=wayland-999` → exit 1 `WaylandCompositor`；`VK_ICD_FILENAMES=/nonexistent.json`（calloop / a11y 之后、renderer 挂载前）→ exit 1 `UnsupportedGpu`，两者无 panic / 段错误 |
+
+- **sway 不执行 min size**：sway 1.11 的 `resize set` 不执行 xdg min_size（1.25 下
+  `resize set 100 100` 得到 100×100；CSD / SSD 均如此），因此「compositor 实际钳到 320×200」
+  缺实机几何证据，需 Mutter / KWin 或真实指针拖拽（V-122 ⑦）。协议侧证据成立（1 次、
+  逻辑值、顺序正确、scale 切换不重发），不能把它当成几何钳制已实测。
+- **未验证 / 限制**：
+  - Windows：456 帧 / 9.79 s = **46.6 Hz**；sweep 最宽处 **34.7 Hz**（GDI 抓屏 2280×520 的
+    成本）；2/384 流式采样在 resize 最右缘出现约 **8 px 黑边**、下一帧恢复（未形成持久黑 /
+    白条，不能排除采集时序）。
+  - macOS：本机无 Screen Recording 授权，截图是进程内 `CGWindowListCreateImage`（注入
+    `/tmp` dylib）抓的**真实窗口 surface**，不是桌面合成截图；单显示器固定 2x，**未在真实
+    窗口上制造 DPI / scale 变化**（该路径由单测覆盖）。
+  - Linux：`--features` 的 snapshot 测试打印 22 条 `VUID-vkCmdDraw-None-09600`（8/8 仍 pass；
+    demo 运行 0 条），旧日志已存在，建议另立 issue，不写成本轮回归。V-122 ①–③⑤⑥ 与
+    ④（P2-5）仍未验 / 未实现。
+- **新增 / 相关单测**：`frame_reaches_gpu_tracks_plan_and_target_size`（5 种组合：Full /
+  Partial 有工作；`Idle` + 无 renderer 仍 `Committed`；`Idle` + 同尺寸不 publish；`Idle` +
+  目标尺寸变化仍 publish）、`set_size_and_set_scale_keep_a_platform_written_surface`（平台真值
+  保留；同值 `set_surface` 之后 `set_scale` 不得重算；full damage / 根 `LAYOUT` / `scale_epoch`
+  语义不变）、Windows 真实 D3D12 离屏 `an_idle_plan_with_a_real_renderer_settles_node_damage`
+  （越界节点 → `Plan::Idle`、不 publish、`FrameIndex` 不变、damage 已复位）。既有
+  `idle_frame_does_not_commit_or_increment` 继续覆盖无像素的 Idle 分支；Linux / macOS 的
+  `frame_rect_*` 用例同步改为「平台真值保留」。
+- **落点**：`window.rs`（`frame_reaches_gpu` / `commit_frame` / `submit_gpu` /
+  `surface_from_platform` / `set_surface` / `set_size` / `set_scale` / `frame_rect` 文档）、
+  `node/tree.rs::settle_frame` 文档、`render/compositor.rs::Plan::Idle` 文档、
+  `platform/linux/window.rs`（`apply_min_size`）、`platform/linux/surface.rs`（建窗调用）、
+  `platform/linux/event_loop.rs`（setup 顺序、删 DPI 重发）、`platform/{windows,macos}/event_loop.rs`
+  与 `platform/macos/window.rs` 的注释。
 

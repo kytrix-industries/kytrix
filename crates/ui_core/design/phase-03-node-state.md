@@ -569,23 +569,29 @@ impl Window {
     #[must_use]
     pub fn scale(&self) -> Scale;
 
-    /// 逻辑尺寸变化（P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存，并先按
-    /// `size × scale` 重算 covering surface（三平台随后都由平台层 `set_surface` 用真值覆盖）。
+    /// 逻辑尺寸变化（P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存；只有平台尚未
+    /// 写入真实渲染目标时（headless / 快照 / 首帧前）才用 `size × scale` 的 covering 估算
+    /// `surface`，平台真值写入后保留（§34 F-194）。
     pub fn set_size(&mut self, size: Size);
 
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT|PAINT`（§3.4「窗口尺寸/DPI → 根 LAYOUT」）。
     ///
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
+    /// `surface` 的处理同 `set_size`：平台真值写入后不被 covering 覆盖（§34 F-194）。
     pub fn set_scale(&mut self, scale: Scale);
 
     /// 平台层：写入真实渲染目标物理像素（Windows `WM_SIZE` / `WM_DPICHANGED`、macOS
     /// `convertSizeToBacking`、Linux `round(logical × scale)` 的 Wayland buffer 之后；
     /// macOS 还会先刷新图层再 early-return）。
     /// 值变化标全量重绘；不标 layout、不动 `scale_epoch`。
+    ///
+    /// 调用一次后 `surface` 归平台层所有：`set_size` / `set_scale` 不再用 covering 覆盖它；
+    /// 同值调用也会移交所有权（置标志先于同值 early-return，§34 F-194）。
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn set_surface(&mut self, surface: (u32, u32));
 
-    /// `paint_frame` / `commit_frame` / `submit_gpu` 的唯一 frame 来源（三平台都用 `surface`）。
+    /// `paint_frame` / `commit_frame` 的唯一 frame 来源（三平台都用 `surface`）；
+    /// `submit_gpu` 消费 `commit_frame` 算好的 `plan`，不再自行调用（§34 F-193）。
     fn frame_rect(&self) -> PhysicalRect;
 }
 ```
@@ -595,13 +601,22 @@ impl Window {
 > 公开面/内部状态的增量，macOS 与 Linux 在后续轮次接上等价契约。`WindowOptions` 新增字段后，结构体
 > 字面量必须补 `background`（或 `..WindowOptions::default()`），否则不编译。`surface` 在 Windows 是
 > 真实客户区、在 macOS 是真实 backing、在 Linux 是真实 Wayland buffer（`round(logical × scale)`）；
-> `set_size` / `set_scale` 只先重算 covering、随后被 `set_surface` 覆盖（应用代码不应在活窗口上调用
+> `set_size` / `set_scale` 只在平台真值写入前重算 covering，写入后保留（§34 F-194；应用代码不应在活窗口上调用
 > 二者来「改渲染目标」）；macOS 的 `set_surface` 在值比较**之前**刷新 `contentsScale` /
 > `drawableSize`。`frame_rect()` 三平台都用 `surface`（0 尺寸由 `set_surface` clamp 1），
 > `WindowOptions.background` 三平台都有渲染效果（Linux 是 persist clear 的 linear 值）。Linux 的
 > `submit_gpu` 发布的 `FrameRequest` 还带 Linux-only 的 `surface_local: Size`（逻辑尺寸，与
 > `surface` 同帧成对；GPU 线程 present 前用它写 `wp_viewport.set_destination`，F-190 / F-191）。
 > 详见 `async-render-pipeline.md` §4.1 / §4.4 / §7.3 / §7.5 与 DEVIATIONS §33。
+>
+> **2026-11-15 第八轮追加（§34 F-193 / F-194）**：`frame_rect()` 仍是 `paint_frame` / `commit_frame`
+> 的 frame 来源；`submit_gpu` 不再自行调用它，改为消费 `commit_frame` 用同一份 damage 与 frame
+> 算好的 `plan`（目标尺寸仍取 `physical_surface()`）。`commit_frame` 的第二段门禁新增：有像素但
+> `frame_reaches_gpu == false`（`Plan::Idle` 且目标尺寸未变）⇒ **先 `tree.settle_frame()` 再按
+> `Idle` 结算**（不推进 `FrameIndex`、不 publish；headless 无 renderer 仍按 `Committed`），保证有
+> renderer 的 `Committed` 帧恰好 publish 一次（V-122 ⑧ / P2-2）。`set_surface` 现在在 clamp 之后、
+> 同值 early-return 之前置 `surface_from_platform`；`set_size` / `set_scale` 只在该标志为 false 时
+> 重算 covering（V-122 / F-186 / F-189 残留）。
 
 | 决策                                             | 结论                                          | 理由                                                                                                                     |
 |--------------------------------------------------|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|

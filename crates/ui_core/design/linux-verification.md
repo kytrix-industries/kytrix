@@ -371,7 +371,57 @@ Laplacian 615.8–1013.2（旧 buffer 被拉伸）。
 - **限制**：Mutter / KWin 未跑；真实指针拖拽未构造（只用 `swaymsg resize set`）；逐次
   `OUT_OF_DATE` / `vkQueuePresentKHR` 计数未统计；无 viewporter 回退未验（且实现没有 destination /
   `buffer_scale` 回退，V-122 P2-5）；1.25 sway 瞬态未独立归因；HUD OCR 未验；`apply_min_size` 的
-  物理 / 逻辑 bug 仍存在。全部登记 V-122。
+  物理 / 逻辑问题已由第八轮修复，协议证据见 §4.8。其余登记 V-122。
+
+### 4.8 V-122 残留闭环（2026-11-15，第八轮）
+
+第八轮修掉 V-122 ⑦（min size 物理 / 逻辑）、⑧（`Committed` 不 publish）、⑨（setup 早退
+drop-order）与 F-186 / F-189 的 surface 归属残留。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §34（F-193 … F-196 / S-145），设计落点见
+[`async-render-pipeline.md`](async-render-pipeline.md) §15.12。环境同 §1.2 的 headless
+sway 1.11 / wlroots 0.19 / lavapipe（`HEADLESS-1` 1280×720），HEAD `6a686cd`。
+
+**min size 协议证据**（`WAYLAND_DEBUG=1`）：
+
+| 项 | 记录 |
+|---|---|
+| 请求 | `-> xdg_toplevel#9.set_min_size(320, 200)`，全程 **1 次** |
+| 顺序 | `set_app_id` → `set_title` → `set_min_size` → 首个 `wl_surface.commit()` |
+| scale | `preferred_scale(150)`；运行中 1.25→1.0→1.25 两次切换后计数仍为 1；1.0 复测同样 1 次 `(320,200)` |
+| 判据 | `set_min_size` 收 window geometry 逻辑坐标（S-145）；本仓 viewporter destination 使 surface = 逻辑，320×200 即逻辑值；只在建窗首个 commit 前设一次，DPI 变化不重发 |
+
+**sway 不执行 min size**：sway 1.11 的 `resize set` 不执行 xdg min_size（1.25 下
+`resize set 100 100` 得到 100×100；CSD / SSD 均如此）。因此「compositor 实际把窗口钳到
+320×200」**缺实机几何证据**，需 Mutter / KWin 或真实指针拖拽（协议侧已闭环，几何侧仍待验，
+V-122 ⑦）。
+
+**resize / 退出 / soak**：
+
+| 项 | 结果 |
+|---|---|
+| 1.25 sweep | `1100×800`（输出钳到 1024×576）→ `900×700` → `700×560` → `500×400` → `100×100`；每步 alive，`grim` 截图 1280×720 正常 |
+| 日志 | 无 panic / VUID / validation |
+| 退出 | `wtype -k Escape` 两次均 exit 0 |
+| soak | 60 s（20 ms 间隔、2043 次）全程存活、错误 0（最终 rect 500×375） |
+
+**失败路径**（§34 F-196 的早退安全）：
+
+| 注入 | 结果 |
+|---|---|
+| `WAYLAND_DISPLAY=wayland-999` | exit 1 `WaylandCompositor` |
+| `VK_ICD_FILENAMES=/nonexistent.json`（calloop / a11y 之后、renderer 挂载前） | exit 1 `UnsupportedGpu` |
+
+两者无 panic / 段错误；可失败 setup 全部排在 `Renderer::new_for_surface` 与
+`window.set_renderer` 之前，早退时 `app` 内没有 renderer（V-122 ⑨ / P2-3 已闭环）。
+
+**门禁**（Linux，HEAD `6a686cd`）：`cargo test -p ui_core --lib` **664 passed / 0 failed /
+0 ignored**；`--features "hud,test-support"` lib **724** + frame_record 6 / hud 7 / layout 4 /
+snapshot 8 / demo 37（62）；`cargo +nightly clippy -p ui_core --all-targets --features "test-support hud" -- -D warnings` 与
+`cargo +nightly fmt --check` exit 0。
+
+**已知噪声（非本轮引入）**：`--features` 的 snapshot 测试打印 **22 条**
+`VUID-vkCmdDraw-None-09600`（8/8 仍 pass；demo 运行 0 条）。旧日志已存在，建议另立 issue，
+不写成本轮回归。
 
 ---
 
@@ -439,7 +489,7 @@ cargo test -p ui_core --features test-support --test snapshot
 | live resize：真实指针拖拽 | 本轮用 `swaymsg resize set` 程序化 resize，没有构造真实指针拖动（`wtype` 只注入键盘）；拖动 / 缩放边缘的输入路径未验（V-122） |
 | `OUT_OF_DATE` / `vkQueuePresentKHR` 逐次计数 | 未逐次统计 present 返回值；soak 只有总数与 exit code（V-122） |
 | 无 viewporter 回退 | `WpViewporter` 缺失时的回退路径未验；当前实现跳 destination 写入（V-122） |
-| `apply_min_size` 的物理 / 逻辑值 | Linux 的 `apply_min_size` 既有 bug（物理 / 逻辑混用）未在本轮修复，后续项（V-122） |
+| `apply_min_size` 的物理 / 逻辑值 | 已修（§34 F-195，§4.8 协议证据：`set_min_size(320, 200)` 1 次、顺序正确、scale 切换不重发）；sway 不执行 xdg min size，几何钳制仍待 Mutter / KWin（V-122 ⑦） |
 
 ### 6.1 测试夹具的坑（不是引擎缺陷）
 

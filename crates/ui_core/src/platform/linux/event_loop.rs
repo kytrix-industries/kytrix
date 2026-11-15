@@ -135,8 +135,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // （`design/async-render-pipeline.md` §7.7）。所有 Vulkan 工作都在 `kytrix-vulkan`
             // 线程上，UI 线程只读反馈（I1）。
             app.poll_renderers()?;
-            // ② 窗口状态镜像：**只在值变化时**设置（`set_size` 会推进 scale epoch、
-            // 置 full-damage、重排根 LAYOUT，每轮无条件调用会让 UI 永久失效）。
+            // ② 窗口状态镜像：**只在值变化时**设置（`set_scale` 推进 scale epoch；二者置
+            // full-damage、重排根 LAYOUT，每轮无条件调用会让 UI 永久失效）。
             let scale_now = state.scale();
             let size_now = state.size();
             if let Some(window) = app.window_mut(id) {

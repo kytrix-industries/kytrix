@@ -324,6 +324,8 @@ impl App {
 }
 ```
 
+> **2026-11-15（F-193）**：`submit_gpu` 现为 `fn submit_gpu(&mut self, renderer: &mut Renderer, index: FrameIndex, plan: Plan) -> RenderStats`（`plan` 由 `commit_frame` 用同一份 damage 与 frame 算好；不再接收 `damage` 或返回 `Result`；没有 GPU 工作的帧已在 `commit_frame` 按 `Idle` 结算）。
+
 `Window::commit_frame` / `App::frame` 的语义**不变**：`renderer.submit(...)` 的 `Err` 继续冒泡为 `Some(Err(..))`，
 `FrameIndex` 已递增 ⇒ 不重试本帧。`set_size` / `set_scale` 继续只置 `full_damage_pending`，真正 resize 在下一次
 `submit` 的 `begin`。
@@ -1390,16 +1392,19 @@ Application::run(app):
  2. registry_queue_init::<WaylandState>(&conn)   // 失败 ⇒ WaylandCompositor
  3. globals.bind: wl_compositor(4..=6) / xdg_wm_base(1..=6) / wl_seat(5..=9) / wl_data_device_manager(3..=3)
       任一缺失或版本不足 ⇒ WaylandCompositor { detail: "… not advertised" }（I16：不回退 X11）
- 4. wl_surface + xdg_surface + xdg_toplevel（§8.2）；首帧前 surface.commit()
+ 4. wl_surface + xdg_surface + xdg_toplevel（§8.2）；set_title / set_app_id / set_min_size(320, 200)
+      首帧前 surface.commit()                     // set_min_size 只在首个 commit 前设一次（F-195）
  5. roundtrip 一次，拿到首个 configure（尺寸 + states）与分数缩放
- 6. Renderer::new_for_surface(display_ptr, surface_ptr, physical(size, scale), background, viewport)?
+ 6. 其余**可失败的** setup（必须在 renderer 挂载之前；早退时 app 内没有 renderer，V-122 ⑨ / F-196）：
+      EventLoop::try_new() + calloop::ping::make_ping() + WaylandSource::new(conn, queue).insert(handle)
+      UnixA11y::new()                              // §8.7
+ 7. Renderer::new_for_surface(display_ptr, surface_ptr, physical(size, scale), background, viewport)?
        // Instance::new → Device::new → Swapchain::new → Pipeline/Atlas/Persist；physical = round(logical × scale)，
        // background = background_linear(WindowOptions.background)，viewport = WaylandState::take_viewport()
- 7. window.set_surface(physical)                  // 真实 Wayland buffer；set_size / set_scale 先算的 covering 随后被覆盖
- 8. a11y adapter（§8.7）**在窗口首次提交前**构造
- 9. EventLoop::try_new() + calloop::ping::make_ping() + WaylandSource::new(conn, queue).insert(handle)
-10. AppHandle::wake() ⇒ 首帧；loop_.dispatch(Duration, &mut state) 直到 exit
-11. shutdown：device_wait_idle → drop swapchain/device/instance → a11y drop
+ 8. window.set_renderer(renderer)；window.set_scale(scale)；window.set_size(size)
+    window.set_surface(physical)                  // 真实 Wayland buffer；set_size / set_scale 不再重算平台真值（F-194），这里写真实 buffer
+ 9. AppHandle::wake() ⇒ 首帧；loop_.dispatch(Duration, &mut state) 直到 exit
+10. shutdown：device_wait_idle → drop(app)（循环路径显式；WaylandState 晚于 renderer 释放）→ a11y drop
 ```
 
 **泵（每次 `dispatch` 前后各跑一次 pump）**：
@@ -1444,7 +1449,7 @@ pub(crate) struct NativeSurface {
 | `xdg_toplevel::Event::Close`                               | `Event::CloseRequested` + `xdg_toplevel.destroy()`                                                                                                          |
 | `xdg_toplevel::Event::ConfigureBounds`                     | 记录（v1 不做约束裁剪）                                                                                                                                     |
 | `xdg_wm_base::Event::Ping(serial)`                         | **必须** `pong(serial)`（否则 compositor 判定无响应）                                                                                                       |
-| `set_title` / `set_app_id`                                 | 窗口标题 / `"kytrix"`；`set_min_size(physical(MIN_SIZE_LOGICAL))`                                                                                           |
+| `set_title` / `set_app_id`                                 | 窗口标题 / `"kytrix"`；`set_min_size(320, 200)`（window geometry 逻辑值，S-145；只在首个 commit 前设一次，DPI 变化**不重发**，F-195）                                                                                           |
 | 移动 / 缩放                                                | `xdg_toplevel::move(&seat, serial)` / `resize(&seat, serial, XdgToplevelResizeEdge)`（标题栏拖拽由引擎自绘区域触发）                                        |
 | 最大化 / 全屏                                              | `set_maximized()` / `unset_maximized()`（自绘标题栏的双击行为）                                                                                             |
 | 分数缩放                                                   | `wp_fractional_scale_manager_v1.get_fractional_scale(&surface)` → `Event::PreferredScale { scale }`（单位 **1/120**）⇒ `Scale::new(scale as f32 / 120.0)`   |
@@ -1468,7 +1473,7 @@ pub(crate) struct NativeSurface {
 | 逻辑尺寸 | `Size`（引擎单位）；物理 = `round(logical × scale)` 的 Wayland buffer，由平台层每轮 `Window::set_surface` 写入（同值 no-op）           |
 | 渲染目标 | `Window.surface` = 真实 Wayland buffer；`frame_rect()` 三平台统一为 `surface`（Linux 不再用 covering；0 尺寸 clamp 1）                 |
 | 背景色   | `WindowOptions.background` → persist `clear_color`（**linear**，Vulkan sRGB attachment）；`set_background_color` 标 full damage + `Shared` 槽（F-192） |
-| 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），物理值给 `set_min_size`                                                     |
+| 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），逻辑值给 `set_min_size`（window geometry 坐标；viewporter destination 使 surface = 逻辑，S-145），只在建窗首个 commit 前设一次、DPI 变化不重发（F-195） |
 | 标题栏   | 平台层不绘制标题栏，只提供 `App::request_window_control`（minimize / toggle-maximize / move / resize）；demo 在 `scene/chrome.rs` 自绘标题栏与按钮 |
 | 关闭     | `toplevel.destroy()` + `surface.destroy()`；`LinuxLoop` 见 `app.windows()` 空即退出                                                   |
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |

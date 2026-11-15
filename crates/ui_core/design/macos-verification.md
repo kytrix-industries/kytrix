@@ -299,6 +299,20 @@ stale 卡片 1108×350 = 静止尺寸（1.000× / 1.000×）
 `NSEventTrackingRunLoopMode` 下的拖动）、多显示器 / 混合 DPI、ProMotion、`preferredFrameLatency`、
 广色域条带接缝 / `layer.colorspace`（V-121）。
 
+**2026-11-15 第八轮复核（V-122 残留）**：`set_size` / `set_scale` / `set_surface` 的 macOS 路径
+未变（`sync_state` 的 Dpi / Resized 之后 `set_surface(backing)`；第八轮只让 `set_size` /
+`set_scale` 在平台真值写入后不再用 covering 覆盖 `surface`，F-194）。复核在 HEAD `6a686cd` 上重跑
+三种尺寸：CGWindow 960×778 → AX 1200×800 → 960×740，主卡片填充 bbox 三种尺寸**完全相同**
+`(25,119)–(602.5,292.5)`、标题区 Laplacian **1744.737** 恒定、card_px **1,634,783** 在 960×778
+与 1200×800 相同；960×740 vs 1200×800 共同区域仅 **464 px** 不同（0.0163%），960×778 vs
+960×740 **225 px**（0.0079%）；新暴露的右侧 / 底部区域是背景 `#0B0E13`、无黑边 / 旧内容；exit 0，
+无 panic / Metal validation。门禁：`cargo test -p ui_core --lib` **670 passed / 0 failed / 0
+ignored**，`--features "hud,test-support"` 全 target **792 passed**（lib 730 + frame_record 6 /
+hud 7 / layout 4 / snapshot 8 / demo 37；Metal golden 8/8 真跑），clippy / fmt exit 0。**截图方法与
+限制**：本机无 Screen Recording 授权，截图是进程内 `CGWindowListCreateImage`（注入 `/tmp` dylib）
+抓的**真实窗口 surface**，不是桌面合成截图；单显示器固定 2x，**未在真实窗口上制造 DPI / scale
+变化**（该路径由单测覆盖）。
+
 > 历史记录不改写：§2.9 / §2.11 的 F-172（陈旧 drawable 跳过）与异步管线结论保持原文；本节只
 > 追加 live resize 的新观察，两者结论不冲突（F-172 的状态机本轮未改）。
 
