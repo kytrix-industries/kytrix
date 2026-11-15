@@ -34,9 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `WindowOptions.background` 默认 `Color::BLACK`（不透明），三平台都影响窗口底色，但呈现方式不同：
-Windows 是 persist clear（**linear**）+ 独立 **1×1 背景交换链**（内容 visual 恒 1:1，窗口放大时
-露出的新区域由背景层填充，缩小时只裁掉右/下，没有拉伸 / 回弹；`SetBackgroundColor` 在组合交换链上
-惰性）；macOS 是 layer 背景色 sRGB + GPU clear linear；Linux 是 Vulkan clear 的 linear 值。
+Windows 是 persist clear（**linear**）+ 独立的 **1×1 背景持久目标 / 交换链**（内容 visual 恒 1:1，
+窗口放大时露出的新区域由背景层填充，缩小时只裁掉右/下，没有拉伸 / 回弹；`SetBackgroundColor` 在
+组合交换链上惰性）；macOS 是 layer 背景色 sRGB + GPU clear linear；Linux 是 Vulkan clear 的 linear 值。
 其余字段可以用 `..WindowOptions::default()` 省略。
 
 ## 架构（模块与依赖方向）

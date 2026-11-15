@@ -16,7 +16,8 @@
 //! 1. 组合交换链的 `ResizeBuffers` 只在**第一次 `Present` 之前**可用，之后必然 `0x887A0001`；
 //!    所以 buffer 是 **grow-only 高水位**（[`buffer_size`] 按内容 + 512 余量、256 对齐取桶；
 //!    GPU 侧 `grow` 再与当前 buffer 逐轴取大），只有内容越过它时才重建「持久目标 + 交换链」并
-//!    把 visual 切到新交换链（`GpuRenderer::grow`）。
+//!    把 visual 切到新交换链（`GpuRenderer::grow`）；内容静止 `SHRINK_IDLE` 后 `maybe_shrink`
+//!    把高水位缩回当前内容桶（缩容先拷旧内容，F-207）。
 //! 2. visual 的单位是**物理像素**（与 DPI 无关）：内容 clip 写内容坐标 `(0, 0, content)`；
 //!    背景层 1×1 内容靠 `scale = client_px` 放大到客户区，两者都不再乘 1/dpi。
 //! 3. 内容 visual 没有 transform，所以 clip 就是客户区里的 `(0, 0, content)`：客户区变大时
@@ -27,8 +28,8 @@
 //!
 //! 线程：DComp 对象**不绑定创建线程**，但同一 visual 的并发 `Commit` 与属性写入批次归属未定义
 //! （文档要求应用自己同步），所以本结构用 `Arc<Mutex<Composition>>` 把**所有** DComp 调用串行化：
-//! UI 线程做 visual 几何 / 关闭，GPU 线程只在内容越过 buffer（`set_content`）或背景色变化
-//! （`set_background_content`）时各做一次 `SetContent` + `Commit`。
+//! UI 线程做 visual 几何 / 关闭，GPU 线程只在内容越过 buffer（`set_content`）、高水位缩容
+//! （`maybe_shrink`）或背景色变化（`set_background_content`）时各做一次 `SetContent` + `Commit`。
 //!
 //! 两个错误面：[`Composition::new`] 的 COM 创建阶段失败是 [`EngineError::AppInit`]（窗口还建不
 //! 出来）；**运行时**调用（几何 / 提交 / 交换链切换，含首帧 `SetContent` + `Commit`）失败是
@@ -329,10 +330,11 @@ fn visual_geometry(content: (u32, u32), client: (u32, u32)) -> VisualGeometry {
 /// 下限抬到 512 px），256 对齐把桶限制在有限档位。**不再读虚拟屏幕** —— 旧的固定 buffer 在
 /// 6000×3840 的桌面上每个窗口白占 ~352 MiB，且显示配置变大后内容必然越界、无法恢复。
 ///
-/// GPU 侧的 `grow` 会把这个桶与当前 buffer **逐轴取大**（grow-only 高水位）：每窗口 VRAM 的
-/// 上界是历史最大桶，而不是当前内容的公式值 —— **缩小时不重建、不释放显存**，`content + 512`
-/// 只是「当前内容需要的桶」，不是常驻 VRAM 的精确值。逐轴取大还有一个正确性原因：视觉切换
-/// 那一帧的旧 clip 可能仍指向旧内容，新交换链必须至少覆盖旧 buffer，否则会露出未定义像素
+/// GPU 侧的 `grow` 会把这个桶与当前 buffer **逐轴取大**（历史高水位）：`content + 512` 只是
+/// 「当前内容需要的桶」，不是常驻 VRAM 的精确值。内容静止 `SHRINK_IDLE` 后
+/// `GpuRenderer::maybe_shrink` 把高水位缩回当前内容桶（新目标先 clear、再拷旧内容，然后才切
+/// visual；F-207），所以 VRAM 会回落而不是永久占用。grow 的逐轴取大还有一个正确性原因：视觉
+/// 切换那一帧的旧 clip 可能仍指向旧内容，新交换链必须至少覆盖旧 buffer，否则会露出未定义像素
 /// （P1-A）。
 ///
 /// # Errors

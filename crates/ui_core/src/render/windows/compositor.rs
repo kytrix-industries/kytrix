@@ -16,8 +16,14 @@
 //!
 //! 窗口路径另有**一条 1×1 的组合交换链**作为背景层（`background_swapchain`）：它被 prime 成
 //! 窗口背景色，由 DComp 的 scale 变换铺满客户区，所以窗口放大时露出的新区域是背景色，而不是
-//! 桌面、也不是被拉伸的旧内容（Chrome 语义）。背景色变化时用
-//! [`GpuRenderer::refresh_background`] 换一条新的 1×1 交换链（1×1，代价可忽略）。
+//! 桌面、也不是被拉伸的旧内容（Chrome 语义）。背景层有**独立的 1×1 持久目标**
+//! （`background_persist`，RTV 堆的第二个描述符），改色只 clear / copy 这块 1×1，不再借主
+//! 持久目标；[`GpuRenderer::refresh_background`] 换一条新的 1×1 交换链（1×1，代价可忽略）。
+//!
+//! **高水位缩容**（[`GpuRenderer::maybe_shrink`]）：grow-only 桶在内容静止
+//! [`SHRINK_IDLE`] 之后缩回**当前内容**的桶。组合交换链不能 `ResizeBuffers`，所以整条替换；
+//! 与 `grow` 的差别是内容不能丢：新持久目标先 clear，再从旧持久目标把 `(0, 0, content)` 拷到
+//! 左上角，然后才 prime / 切 visual —— 缩容那一帧可见像素完全不变，不会闪一帧背景色。
 //!
 //! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程独占**
 //! 的对象（device / queue / swapchain / persist / upload / retire / 计时），构造发生在窗口创建时
@@ -30,7 +36,7 @@
 use std::{
     cell::Cell,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use windows::Win32::{
@@ -82,6 +88,13 @@ const TEST_ATLAS_PAGE: u32 = 64;
 /// `RootUniform` 的字节数（P07 §2.7：112 B = 28 DWORD）。
 const ROOT_UNIFORM_DWORDS: usize = 28;
 
+/// 内容尺寸静止多久之后才把 grow-only 高水位缩回当前内容的桶。
+///
+/// 拖动是连续的尺寸变化：`content_since` 每帧刷新，所以拖动中永远不会缩容（也不会在
+/// 「拖大 → 拖小」时反复重建）。静止满 2 s 之后，GPU 循环在没有待画帧时尝试一次
+/// [`GpuRenderer::maybe_shrink`]；缩容 prime 会保留旧内容，可见像素不变。
+const SHRINK_IDLE: Duration = Duration::from_secs(2);
+
 thread_local! {
     /// 当前线程是否是 `kytrix-d3d12` GPU 线程（§10.1 的线程归属断言）。
     static ON_GPU_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -107,32 +120,40 @@ pub(crate) struct GpuRenderer {
     upload: UploadArena,
     geometry: GeometryRegistry,
     timer: Option<GpuTimer>,
-    /// 组合交换链（窗口路径）；内容越过 buffer 时整条替换（`grow`）。
+    /// 组合交换链（窗口路径）；内容越过 buffer 时整条替换（`grow` / `maybe_shrink`）。
     swapchain: Option<Swapchain>,
     /// 背景层（窗口路径）：**1×1** 的组合交换链，内容恒为窗口背景色（`clear_color`）。
     ///
     /// DComp 把它按客户区缩放后铺满内容之外的区域；背景色变化时整条替换
     /// （[`GpuRenderer::refresh_background`]），内容交换链与内容尺寸都不受影响。
     background_swapchain: Option<Swapchain>,
+    /// 背景层自己的 **1×1** 持久目标（窗口路径；离屏目标是 `None`）。
+    ///
+    /// 背景层 prime 只碰这一块（RTV 堆的第二个描述符）：改色不再借主持久目标，也就不会把
+    /// 内容整块清成背景色。生命周期与渲染器一致（`grow` / `maybe_shrink` 只换主持久目标）。
+    background_persist: Option<Persist>,
     /// 背景色已改、背景层还没重建（由 [`GpuRenderer::set_background_color`] 置位，
     /// [`GpuRenderer::refresh_background`] 消费）。
     background_dirty: bool,
-    /// 合成目标（窗口路径）：GPU 线程在 `grow` 时把内容 visual 切到新交换链。
+    /// 合成目标（窗口路径）：GPU 线程在 `grow` / `maybe_shrink` 时把内容 visual 切到新交换链。
     ///
     /// 与 `NativeWindow` 共享（`Arc<Mutex<_>>`）：所有 DComp 调用由互斥锁串行化，GPU 线程只在
-    /// `grow` / `refresh_background` 里持锁做一次 `SetContent` + `Commit`（见
+    /// `grow` / `maybe_shrink` / `refresh_background` 里持锁做一次 `SetContent` + `Commit`（见
     /// `platform/windows/composition.rs`）。
     composition: Option<Arc<Mutex<Composition>>>,
     rtv_heap: ID3D12DescriptorHeap,
     clear_color: [f32; 4],
-    /// 合成面尺寸（持久目标 + 组合交换链的 grow-only 高水位，见 `grown_buffer`）。
+    /// 合成面尺寸（持久目标 + 组合交换链的高水位，见 `grown_buffer`）。
     ///
     /// 初值来自 [`buffer_size`]（内容 + 512 余量、256 对齐）；只在内容越过它时按
-    /// [`GpuRenderer::grow`] 逐轴取大重建。缩小时不还 VRAM（组合交换链也不能
-    /// `ResizeBuffers`）。
+    /// [`GpuRenderer::grow`] 逐轴取大重建。内容静止 [`SHRINK_IDLE`] 之后
+    /// [`GpuRenderer::maybe_shrink`] 把它缩回当前内容的桶（组合交换链不能 `ResizeBuffers`，
+    /// 只能整条替换）。
     buffer: (u32, u32),
     /// 当前**内容**尺寸（绘制 / copy / present 的范围；窗口客户区变化时只改这个字段）。
     surface: (u32, u32),
+    /// `surface` 最后一次变化的时刻（[`GpuRenderer::maybe_shrink`] 的空闲策略输入）。
+    content_since: Instant,
     /// 下一次 present 是否必须全量：组合交换链刚建好之后为 `true`，第一次 present 成功后清除
     /// （首次 present 与首次 copy 都必须覆盖整块 buffer，见 `copy_to_back` / `present1`）。
     ///
@@ -162,7 +183,25 @@ enum PresentTarget<'a> {
         swapchain: &'a Swapchain,
         buffer: (u32, u32),
         content: (u32, u32),
+        /// 这次 prime 录进哪块持久目标。
+        persist: PrimePersist,
+        /// 内容来源：缩容 prime 在切 visual 之前把**旧**持久目标的内容拷进新目标；其余为
+        /// `None`（新建的交换链只 prime 背景色）。
+        source: Option<&'a Persist>,
     },
+}
+
+/// prime 帧的持久目标选择（`FrameRecorder::persist` 的来源）。
+///
+/// 用选择器而不是 `&Persist`：prime 需要 `&mut GpuRenderer` 录制，同时又要借一个字段里的
+/// 持久目标；在 `submit_recorded` 内部按字段借用就是两次不相交的借用，直接传 `&self.persist`
+/// 会和 `&mut self` 冲突。
+#[derive(Clone, Copy)]
+enum PrimePersist {
+    /// 主持久目标（`self.persist`）：grow / 缩容 prime。
+    Main,
+    /// 1×1 背景持久目标（`self.background_persist`）：背景层 prime。
+    Background,
 }
 
 impl GpuRenderer {
@@ -195,14 +234,16 @@ impl GpuRenderer {
     ///
     /// `content` 是当前客户区（物理像素）；`buffer` 由 [`buffer_size`] 给出（内容 + 余量、256
     /// 对齐），此后窗口 resize 只改内容尺寸（[`GpuRenderer::set_content_size`]），只有内容越过
-    /// buffer 时才重建资源（[`GpuRenderer::grow`]）。
+    /// buffer 时才重建资源（[`GpuRenderer::grow`]）；内容静止 [`SHRINK_IDLE`] 之后
+    /// [`GpuRenderer::maybe_shrink`] 把高水位缩回当前内容的桶。
     ///
-    /// 本方法在 UI 线程、GPU 线程启动之前运行。顺序（P1-B）：先创建主交换链与 **1×1 背景
-    /// 交换链**并各 prime 一帧背景色（第一次 present，必须全量；客户区在第一次 present 之前是
-    /// **完全透明**的，probe `dpi.log` 03/04），**再**把两者挂到 [`Composition`] 的 visual 上并
-    /// `Commit`。已 attach 但从未 present 的交换链在合成器里是透明的，反过来做会让 `ShowWindow`
-    /// 之前的一帧露出桌面。背景层先 prime、内容层后 prime：两者用同一个 clear color，顺序不影响
-    /// 首次可见像素，这里只是保持「内容最后」的既有次序。
+    /// 本方法在 UI 线程、GPU 线程启动之前运行。顺序（P1-B）：先创建主交换链、**1×1 背景
+    /// 交换链**与它自己的 **1×1 背景持久目标**，再各 prime 一帧背景色（第一次 present，必须
+    /// 全量；客户区在第一次 present 之前是**完全透明**的，probe `dpi.log` 03/04），**再**把两者
+    /// 挂到 [`Composition`] 的 visual 上并 `Commit`。已 attach 但从未 present 的交换链在合成器
+    /// 里是透明的，反过来做会让 `ShowWindow` 之前的一帧露出桌面。背景层先 prime、内容层后
+    /// prime：两者用同一个 clear color，顺序不影响首次可见像素，这里只是保持「内容最后」的
+    /// 既有次序。
     pub(crate) fn new_for_composition(
         composition: Arc<Mutex<Composition>>,
         content: (u32, u32),
@@ -219,9 +260,20 @@ impl GpuRenderer {
         let mut swapchain = Swapchain::for_composition(&renderer.queue, buffer)?;
         // 背景层是 1×1 的纯色交换链，由 UI 线程的 DComp scale 变换铺满客户区。
         let mut background_swapchain = Swapchain::for_composition(&renderer.queue, (1, 1))?;
-        // prime 用显式的 swapchain / buffer / content；此刻两条 visual 都还没有内容。
-        renderer.prime_detached(&mut background_swapchain, (1, 1), (1, 1))?;
-        renderer.prime_detached(&mut swapchain, buffer, content)?;
+        // 背景层有自己的 1×1 持久目标（RTV 堆的第二个描述符）：改色只 clear / copy 这一块，
+        // 不再顺带清掉整块主内容目标（旧实现的 P2）。必须在 prime 之前建好。
+        let background_rtv = Self::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
+        let background_persist = Persist::new(&mut renderer.device, (1, 1), background_rtv)?;
+        renderer.background_persist = Some(background_persist);
+        // prime 用显式的 swapchain / buffer / content / persist；此刻两条 visual 都还没有内容。
+        renderer.prime_detached(
+            &mut background_swapchain,
+            (1, 1),
+            (1, 1),
+            PrimePersist::Background,
+            None,
+        )?;
+        renderer.prime_detached(&mut swapchain, buffer, content, PrimePersist::Main, None)?;
         {
             let target = composition::lock(&composition);
             target.set_background_content(background_swapchain.raw())?;
@@ -250,14 +302,15 @@ impl GpuRenderer {
                 .raw()
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
+                    // 0 = 内容持久目标；1 = 1×1 背景持久目标（只有窗口路径会创建它）。
+                    NumDescriptors: 2,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                     NodeMask: 0,
                 })
         }
         .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
         // SAFETY: 描述符堆由 `Pipeline` / `GpuRenderer` 持有，句柄在堆生命周期内有效。
-        let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let rtv = Self::rtv_handle(&device, &rtv_heap, 0);
 
         let mut device = device;
         let persist = Persist::new(&mut device, size, rtv)?;
@@ -275,17 +328,38 @@ impl GpuRenderer {
             timer,
             swapchain: None,
             background_swapchain: None,
+            background_persist: None,
             background_dirty: false,
             composition: None,
             rtv_heap,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             buffer: (size.0.max(1), size.1.max(1)),
             surface: (size.0.max(1), size.1.max(1)),
+            content_since: Instant::now(),
             fresh: true,
             last_index: FrameIndex::default(),
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
+    }
+
+    /// RTV 堆里第 `index` 个描述符的 CPU 句柄（0 = 内容，1 = 1×1 背景）。
+    fn rtv_handle(
+        device: &Device,
+        heap: &ID3D12DescriptorHeap,
+        index: u32,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；两个查询都无副作用。
+        let size = unsafe {
+            device
+                .raw()
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+        };
+        // SAFETY: 同上。
+        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + index as usize * size as usize,
+        }
     }
 
     /// 当前**内容**尺寸（GPU 线程侧的真值；窗口 resize 只改这个字段）。
@@ -364,12 +438,14 @@ impl GpuRenderer {
     /// [`GpuRenderer::grow`] 重建持久目标 + 组合交换链（grow-only 桶）。
     ///
     /// 窗口的 resize 已经把整帧标成全量 damage（`Window::set_surface`），下一帧的
-    /// `FramePlan` 是 `Full`，不需要在这里碰 `fresh`。
+    /// `FramePlan` 是 `Full`，不需要在这里碰 `fresh`。每次真实变化都刷新 `content_since`：
+    /// 缩容策略只在内容静止 [`SHRINK_IDLE`] 之后才动手（拖动中永远不缩）。
     pub(crate) fn set_content_size(&mut self, content: (u32, u32)) -> Result<(), EngineError> {
         let content = (content.0.max(1), content.1.max(1));
         if content == self.surface {
             return Ok(());
         }
+        self.content_since = Instant::now();
         if content.0 <= self.buffer.0 && content.1 <= self.buffer.1 {
             self.surface = content;
             return Ok(());
@@ -413,8 +489,7 @@ impl GpuRenderer {
             .reset_in_flight_lists()
             .map_err(|error| self.classify(error))?;
         // 2. 新对象在旧对象销毁之前创建（失败时旧状态仍然完好）。
-        // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
-        let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
         let persist =
             Persist::new(&mut self.device, buffer, rtv).map_err(|error| self.classify(error))?;
         let mut swapchain = Swapchain::for_composition(&self.queue, buffer)?;
@@ -424,7 +499,7 @@ impl GpuRenderer {
         //    旧 persist 先换下来、但保持存活到视觉切换之后；prime 用的是新 persist。
         let retired_index = self.last_index;
         let old_persist = std::mem::replace(&mut self.persist, persist);
-        self.prime_detached(&mut swapchain, buffer, content)?;
+        self.prime_detached(&mut swapchain, buffer, content, PrimePersist::Main, None)?;
         {
             let target = composition::lock(&composition);
             target.set_content(swapchain.raw())?;
@@ -438,6 +513,103 @@ impl GpuRenderer {
         self.surface = content;
         // prime 已经做过新交换链的第一次 present，后续帧不再是 `fresh`。
         self.fresh = false;
+        self.content_since = Instant::now();
+        Ok(())
+    }
+
+    /// grow-only 高水位还有缩小的空间、且内容已经静止 [`SHRINK_IDLE`]。
+    ///
+    /// GPU 循环在**没有待画帧**的空闲路径与**取到帧但尚未录制**的路径各查一次：前者让静止
+    /// 窗口也还显存，后者保证持续出帧（HUD / 动画）时缩容不会被「总有一帧待画」饿死。
+    pub(crate) fn shrink_due(&self) -> bool {
+        self.shrink_candidate().is_some() && self.content_since.elapsed() >= SHRINK_IDLE
+    }
+
+    /// 空闲等待的定时唤醒：还有缩小空间时，等到内容静止满 [`SHRINK_IDLE`] 再醒一次。
+    ///
+    /// 已经是最小桶（或没有合成目标）时返回 `None`：空闲等待保持无限等，不引入周期性唤醒。
+    pub(crate) fn shrink_in(&self) -> Option<Duration> {
+        self.shrink_candidate()?;
+        Some(SHRINK_IDLE.saturating_sub(self.content_since.elapsed()))
+    }
+
+    /// 当前内容对应的、可以缩回去的桶（`None` = 没有合成目标 / 已经是最小桶）。
+    fn shrink_candidate(&self) -> Option<(u32, u32)> {
+        shrink_target(self.buffer, self.surface, self.composition.is_some())
+            .ok()
+            .flatten()
+    }
+
+    /// 把 grow-only 高水位缩回**当前内容**所需的桶（内容保留，视觉切换没有闪帧）。
+    ///
+    /// 组合交换链不能 `ResizeBuffers`，所以与 `grow` 一样整条替换；差别是内容不能丢：
+    /// 1. 决策：`buffer_size(surface)` 不比当前 buffer 小 ⇒ 已经是最小桶，no-op。
+    /// 2. `wait_idle` + 重置全部 in-flight 命令列表（旧 back buffer / 旧持久目标的引用）。
+    /// 3. 旧对象仍完好时创建新持久目标 + 新交换链。
+    /// 4. 新持久目标换进来、旧目标留在栈上；prime 先整块 clear 成 `clear_color`，再把旧目标的
+    ///    `(0, 0, content)` 拷进左上角，然后全量 copy / present 并等队列 fence。
+    /// 5. `SetContent(新) + Commit` 之后才替换 / 丢弃旧对象（旧交换链活到 `Commit` 之后）。
+    /// 6. `buffer = 新桶`、`fresh = false`、`content_since = now`。
+    ///
+    /// 可见像素在整条路径上不变：旧内容原样拷进新持久目标，prime 的是它，切 visual 时内容已经
+    /// 就绪，不需要「先露一帧背景色」（那是 `grow` 越过 buffer 边界时的代价）。
+    ///
+    /// 旧持久目标的纹理在第二次 `reset_in_flight_lists` 之后直接交回 `device`：prime 的命令
+    /// 列表刚刚引用过它，不重置的话纹理要等到下一次同槽录制才真正释放（静止窗口可能永远不释放）。
+    pub(crate) fn maybe_shrink(&mut self) -> Result<(), EngineError> {
+        let Some(buffer) = shrink_target(self.buffer, self.surface, self.composition.is_some())?
+        else {
+            // 已经是最小桶（或没有合成目标）：推迟下一次检查，避免空闲路径立刻重试。
+            self.content_since = Instant::now();
+            return Ok(());
+        };
+        let Some(composition) = self.composition.clone() else {
+            // `shrink_target` 已经把「没有合成目标」判成 `None`；这里只是不构造一个假的 Arc。
+            return Ok(());
+        };
+        debug_assert!(
+            on_gpu_thread(),
+            "the high-water bucket may only shrink on the kytrix-d3d12 thread"
+        );
+        // 1. GPU 完成 + 丢掉命令列表对旧 back buffer / 旧持久目标的引用。
+        self.queue
+            .wait_idle()
+            .map_err(|error| self.classify(error))?;
+        self.queue
+            .reset_in_flight_lists()
+            .map_err(|error| self.classify(error))?;
+        // 2. 新对象在旧对象销毁之前创建（失败时旧状态仍然完好）。
+        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
+        let persist =
+            Persist::new(&mut self.device, buffer, rtv).map_err(|error| self.classify(error))?;
+        let mut swapchain = Swapchain::for_composition(&self.queue, buffer)?;
+        // 3. prime 从旧持久目标拷内容，所以先把新目标换进来、旧目标留在栈上保持存活。
+        let old_persist = std::mem::replace(&mut self.persist, persist);
+        self.prime_detached(
+            &mut swapchain,
+            buffer,
+            self.surface,
+            PrimePersist::Main,
+            Some(&old_persist),
+        )?;
+        {
+            let target = composition::lock(&composition);
+            target.set_content(swapchain.raw())?;
+            target.commit()?;
+        }
+        // 4. 视觉切换之后才替换 / 丢弃旧对象（旧交换链的已 present 内容可能仍被 DWM 引用到
+        //    本次 `Commit` 之后）。
+        let _old_swapchain = self.swapchain.replace(swapchain);
+        // prime 的命令列表刚引用过旧持久目标：重置列表把引用丢掉，再把纹理直接交回 device。
+        self.queue
+            .reset_in_flight_lists()
+            .map_err(|error| self.classify(error))?;
+        let _ = self.device.release(old_persist.handle);
+        drop(old_persist);
+        self.buffer = buffer;
+        // prime 已经做过新交换链的第一次全量 present，后续帧按内容子矩形 copy。
+        self.fresh = false;
+        self.content_since = Instant::now();
         Ok(())
     }
 
@@ -461,8 +633,7 @@ impl GpuRenderer {
             .wait_idle()
             .map_err(|error| self.classify(error))?;
         // RTV 句柄由堆派生（堆是所有者；`Persist` 只缓存句柄本身）。
-        // SAFETY: 描述符堆由本渲染器持有，句柄在堆生命周期内有效。
-        let rtv = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
         let old = self
             .persist
             .recreate(&mut self.device, size, rtv)
@@ -470,6 +641,7 @@ impl GpuRenderer {
         self.queue.retire(self.last_index, old);
         self.buffer = size;
         self.surface = size;
+        self.content_since = Instant::now();
         self.fresh = true;
         Ok(())
     }
@@ -492,10 +664,14 @@ impl GpuRenderer {
 
     /// 把新的背景色落到独立的 **1×1 背景层**（GPU 线程；颜色没变是 no-op）。
     ///
-    /// 背景层是单独一条交换链，已经挂到 visual 上的内容不会因为 `clear_color` 改变而变化，
-    /// 所以换色必须：新建一条 1×1 组合交换链 → prime 新背景色（全量 + 等 GPU fence）→
-    /// `SetContent` + `Commit` → 丢弃旧交换链。顺序与 `grow` 相同（prime 先于 attach，P1-B）。
-    /// 1×1 纹理 + 一次 1×1 copy，代价可忽略；即使当前没有内容帧，背景色也会立刻生效。
+    /// 背景层是单独一条交换链 + 自己的 **1×1 持久目标**（`background_persist`），已经挂到
+    /// visual 上的内容不会因为 `clear_color` 改变而变化，所以换色必须：新建一条 1×1 组合
+    /// 交换链 → 用 1×1 持久目标 prime 新背景色（全量 + 等 GPU fence）→ `SetContent` + `Commit`
+    /// → 丢弃旧交换链。顺序与 `grow` 相同（prime 先于 attach，P1-B）。1×1 纹理 + 一次 1×1
+    /// copy，代价可忽略；即使当前没有内容帧，背景色也会立刻生效。
+    ///
+    /// 主持久目标完全不受影响：旧实现借主 persist prime 1×1，每次改色都会顺带把整块内容目标
+    /// 清成背景色（罕见但错误，且对大 buffer 是整块 clear 带宽）。
     ///
     /// 离屏目标没有合成树：只留下新的 `clear_color`，标记直接消费掉。
     pub(crate) fn refresh_background(&mut self) -> Result<(), EngineError> {
@@ -511,7 +687,13 @@ impl GpuRenderer {
             "background layers may only be replaced on the kytrix-d3d12 thread"
         );
         let mut swapchain = Swapchain::for_composition(&self.queue, (1, 1))?;
-        self.prime_detached(&mut swapchain, (1, 1), (1, 1))?;
+        self.prime_detached(
+            &mut swapchain,
+            (1, 1),
+            (1, 1),
+            PrimePersist::Background,
+            None,
+        )?;
         {
             let target = composition::lock(&composition);
             target.set_background_content(swapchain.raw())?;
@@ -527,14 +709,17 @@ impl GpuRenderer {
     ///
     /// 用于新交换链的第一次 present：组合交换链的第一次 present 必须是全量
     /// （`DirtyRectsCount = 0`），而 `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前
-    /// 完全透明。`grow` / `refresh_background` 必须在 `SetContent` **之前**调用本方法：已 attach
-    /// 但从未 present 的交换链在合成器里是透明的，若先 `SetContent` + `Commit` 再 prime，中间
-    /// 一次 DWM 合成就会露出桌面（P1-B）。这里用显式的 `swapchain` / `buffer` / `content`，而不是
-    /// `self.swapchain`（它可能还是旧的）。
+    /// 完全透明。`new_for_composition` / `grow` / `maybe_shrink` / `refresh_background` 必须在
+    /// `SetContent` **之前**调用本方法：已 attach 但从未 present 的交换链在合成器里是透明的，
+    /// 若先 `SetContent` + `Commit` 再 prime，中间一次 DWM 合成就会露出桌面（P1-B）。这里用显式
+    /// 的 `swapchain` / `persist` / `buffer` / `content`，而不是 `self.swapchain`（它可能还是旧的）。
     ///
-    /// 背景层的 1×1 交换链也走这里（`buffer = content = (1, 1)`）：prime 会先把持久目标整块
-    /// clear 成 `clear_color`，再 copy 左上角 1×1 —— 拷到的必然是背景色；持久目标本身会在下一个
-    /// 全量帧重画（`Window::set_background_color` 已经标了全量 damage）。
+    /// 背景层的 1×1 交换链也走这里（`persist = PrimePersist::Background`、
+    /// `buffer = content = (1, 1)`）：prime 只 clear 那块独立的 1×1 持久目标，再 copy 左上角
+    /// 1×1 —— 拷到的必然是背景色，主持久目标一个像素都不碰。
+    ///
+    /// `source` 是缩容 prime 的内容来源（旧主持久目标），在 clear 之后、绘制之前把
+    /// `(0, 0, content)` 拷进新目标的左上角；其余 prime 为 `None`。
     ///
     /// `sync = 0`：prime 不是用户可见帧，不值得等 vsync —— 但**必须**等这一帧的队列 fence
     /// （P2-1）：`Present1` 返回只是 CPU 侧入队，`ShowWindow` / 后续帧的 waitable 之前必须有
@@ -544,6 +729,8 @@ impl GpuRenderer {
         swapchain: &mut Swapchain,
         buffer: (u32, u32),
         content: (u32, u32),
+        persist: PrimePersist,
+        source: Option<&Persist>,
     ) -> Result<(), EngineError> {
         let slot = self.queue.acquire_slot();
         self.queue
@@ -553,8 +740,8 @@ impl GpuRenderer {
         let mut frame = FramePlan::new(Plan::Full, true);
         let mut timings = FrameTimings::new();
         // prime 不是内容帧：不要让它把 `last_index`（retire 的 tag）推回 `FrameIndex::default()`。
-        // `grow` 已经在 prime 之前取好 `retired_index`；背景层刷新则发生在帧之间，两者都不该
-        // 改变「最后一次内容帧」的记账。
+        // `grow` / `maybe_shrink` 已经在 prime 之前取好 `retired_index`；背景层刷新则发生在帧
+        // 之间，两者都不该改变「最后一次内容帧」的记账。
         let last_index = self.last_index;
         self.submit_recorded(
             slot,
@@ -566,6 +753,8 @@ impl GpuRenderer {
                 swapchain,
                 buffer,
                 content,
+                persist,
+                source,
             },
         )?;
         self.last_index = last_index;
@@ -711,7 +900,8 @@ impl GpuRenderer {
     /// 录制 + 提交一帧（不呈现、不等完成）。调用方先取槽并等该槽上一帧完成（§6.5）。
     ///
     /// `target` 决定录制的呈现目标：常规帧用自己的交换链；`prime_detached` 用**还没挂到
-    /// visual 上**的新交换链（内容越过 buffer 时它必须先被 present，见 `grow`）。
+    /// visual 上**的新交换链 + 显式持久目标（grow / 缩容 prime 用主持久目标，背景层 prime 用
+    /// 1×1 背景持久目标）。
     fn submit_recorded(
         &mut self,
         slot: FrameSlot,
@@ -737,18 +927,36 @@ impl GpuRenderer {
             .map_err(|error| self.classify(error))?;
 
         let stats = {
-            let (swapchain, buffer, content, timer) = match target {
+            let (swapchain, buffer, content, timer, persist, source) = match target {
                 PresentTarget::Own => (
                     self.swapchain.as_ref(),
                     self.buffer,
                     self.surface,
                     self.timer.as_ref(),
+                    &self.persist,
+                    None,
                 ),
                 PresentTarget::Detached {
                     swapchain,
                     buffer,
                     content,
-                } => (Some(swapchain), buffer, content, None),
+                    persist,
+                    source,
+                } => {
+                    let persist = match persist {
+                        PrimePersist::Main => &self.persist,
+                        PrimePersist::Background => {
+                            self.background_persist.as_ref().ok_or_else(|| {
+                                EngineError::Composition {
+                                    detail: smol_str::SmolStr::new_static(
+                                        "background prime without a 1x1 background persist",
+                                    ),
+                                }
+                            })?
+                        }
+                    };
+                    (Some(swapchain), buffer, content, None, persist, source)
+                }
             };
             // 借用拆分：录制只碰这些字段，`buffer` / `surface` / `fresh` / `last_index` 留在外层。
             let mut recorder = FrameRecorder {
@@ -756,11 +964,12 @@ impl GpuRenderer {
                 queue: &mut self.queue,
                 pipeline: &self.pipeline,
                 atlas: &mut self.atlas,
-                persist: &self.persist,
+                persist,
                 upload: &mut self.upload,
                 geometry: &self.geometry,
                 timer,
                 swapchain,
+                source,
                 clear_color: self.clear_color,
                 buffer,
                 content,
@@ -864,6 +1073,27 @@ fn grown_buffer(current: (u32, u32), content: (u32, u32)) -> Result<(u32, u32), 
     Ok((required.0.max(current.0), required.1.max(current.1)))
 }
 
+/// 缩容决策：返回新的 buffer，`None` = 保持当前高水位。
+///
+/// - 没有合成目标（离屏 / 快照）：永不缩容（离屏由 [`GpuRenderer::resize`] 直接重建）。
+/// - 当前内容所需的桶已经覆盖当前 buffer（两轴都 ≥）：已经是最小桶。这也覆盖 `None` 的另一半
+///   语义 —— 内容 > buffer 的 grow-only 不变量被破坏时不得「缩」成更大的桶。
+/// - 否则返回 `buffer_size(content)`：内容 ≤ surface ≤ buffer，所以它逐轴 ≤ 当前 buffer。
+fn shrink_target(
+    buffer: (u32, u32),
+    content: (u32, u32),
+    has_composition: bool,
+) -> Result<Option<(u32, u32)>, EngineError> {
+    if !has_composition {
+        return Ok(None);
+    }
+    let target = buffer_size(content)?;
+    if target == buffer || target.0 > buffer.0 || target.1 > buffer.1 {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
 /// 一帧录制所需的 GPU 线程独占对象（借用拆分：`GpuRenderer` 的字段在这里按用途分组）。
 struct FrameRecorder<'a> {
     device: &'a mut Device,
@@ -875,8 +1105,10 @@ struct FrameRecorder<'a> {
     geometry: &'a GeometryRegistry,
     timer: Option<&'a GpuTimer>,
     swapchain: Option<&'a Swapchain>,
+    /// 缩容 prime 的内容来源（旧主持久目标）；其余帧为 `None`。
+    source: Option<&'a Persist>,
     clear_color: [f32; 4],
-    /// grow-only 的合成面尺寸（只有资源创建与 clear 用它）。
+    /// 高水位的合成面尺寸（只有资源创建与 clear 用它）。
     buffer: (u32, u32),
     /// 当前内容尺寸（viewport / scissor / root uniform / copy / present 的范围）。
     content: (u32, u32),
@@ -963,6 +1195,15 @@ impl FrameRecorder<'_> {
                 // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）；
                 // `rects` 在调用期间存活且落在 buffer 内（内容 ≤ buffer）。
                 unsafe { list.ClearRenderTargetView(self.persist.rtv, &self.clear_color, rects) };
+            }
+            // 缩容 prime：新目标整块已经 clear 成背景色（内容之外不可见），把旧目标的内容原样
+            // 拷进左上角；此后这一帧的绘制 / copy 都发生在新目标上。源目标仍是 `RENDER_TARGET`。
+            if let Some(source) = self.source {
+                debug_assert!(
+                    full && frame.is_fresh(),
+                    "a source-copy prime is a fresh full frame"
+                );
+                copy_content(list, source, self.persist, self.content);
             }
             bind_frame(
                 list,
@@ -1357,6 +1598,46 @@ fn copy_to_back(
     Ok(())
 }
 
+/// 缩容 prime 的内容保留：把 `source` 的 `(0, 0, content)` 拷到 `destination` 的左上角。
+///
+/// 两块持久目标在这一步之前都处于 `RENDER_TARGET`（旧目标刚被 wait_idle，新目标刚 clear），
+/// 这里临时过渡到拷贝状态并在返回前转回：后续 `bind_frame` / `copy_to_back` 仍按「持久目标
+/// 处于 RENDER_TARGET」记账。`destination` 的其余像素保持 clear 出来的背景色，永远不可见
+/// （visual 的 clip 只到内容）。
+fn copy_content(
+    list: &ID3D12GraphicsCommandList,
+    source: &Persist,
+    destination: &Persist,
+    content: (u32, u32),
+) {
+    transition(
+        list,
+        &source.texture,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    );
+    transition(
+        list,
+        &destination.texture,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    let rect = crate::math::PhysicalRect::new(0, 0, content.0 as i32, content.1 as i32);
+    copy_rect(list, &source.texture, &destination.texture, &rect);
+    transition(
+        list,
+        &destination.texture,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+    );
+    transition(
+        list,
+        &source.texture,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+    );
+}
+
 fn copy_rect(
     list: &ID3D12GraphicsCommandList,
     source: &ID3D12Resource,
@@ -1577,7 +1858,12 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
 }
 #[cfg(test)]
 mod tests {
-    use super::{GpuRenderer, copy_extent, copy_plan, geometry_root, grown_buffer, root_uniform};
+    use windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+
+    use super::{
+        GpuRenderer, Persist, copy_content, copy_extent, copy_plan, geometry_root, grown_buffer,
+        root_uniform, shrink_target,
+    };
     use crate::{
         error::EngineError,
         math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
@@ -2157,7 +2443,7 @@ mod tests {
         assert_eq!(copy_extent(fresh_partial, buffer, content), buffer);
     }
 
-    /// 内容子矩形：绘制与读回都只按内容尺寸，grow-only buffer 不参与（`design/DEVIATIONS.md` §36 F-199）。
+    /// 内容子矩形：绘制与读回都只按内容尺寸，高水位 buffer 不参与（`design/DEVIATIONS.md` §36 F-199）。
     #[test]
     fn the_content_size_is_independent_of_the_buffer() {
         let _guard = lock();
@@ -2254,5 +2540,190 @@ mod tests {
             grown_buffer((1536, 1280), (16_385, 100)),
             Err(EngineError::Swapchain { .. })
         ));
+    }
+
+    /// RTV 堆固定两个描述符：0 = 内容，1 = 1×1 背景（按 `GetDescriptorHandleIncrementSize`
+    /// 偏移）。背景层 prime 只写第二个，主持久目标一个像素都不碰。
+    #[test]
+    fn the_rtv_heap_has_a_second_descriptor_for_the_background_layer() {
+        let _guard = lock();
+        let Some(renderer) = warp_renderer((8, 8)) else {
+            return;
+        };
+        let main = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 0);
+        let background = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
+        // SAFETY: 设备 / 堆句柄由渲染器持有，调用期间有效；查询无副作用。
+        let size = unsafe {
+            renderer
+                .device
+                .raw()
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+        };
+        assert_eq!(
+            background.ptr,
+            main.ptr + size as usize,
+            "背景 RTV 必须是堆里的第二个描述符"
+        );
+        assert!(background.ptr > main.ptr);
+    }
+
+    /// 缩容决策：只在内容桶**严格小于**当前高水位、且渲染器有合成目标时返回新桶。
+    #[test]
+    fn the_shrink_decision_only_returns_a_smaller_bucket() {
+        // 1200×925 内容 ⇒ 1792×1536；历史高水位 2560×1792（1900×1300 时开出来的桶）。
+        assert_eq!(
+            shrink_target((2560, 1792), (1200, 925), true).expect("fits"),
+            Some((1792, 1536)),
+            "静止缩小时回到当前内容的桶"
+        );
+        // 单轴缩小也算：宽度 2000 的桶仍是 2560，高度从 1792 缩到 1280。
+        assert_eq!(
+            shrink_target((2560, 1792), (2000, 600), true).expect("fits"),
+            Some((2560, 1280))
+        );
+        // 内容桶 == 当前 buffer：已经是最小桶，不缩（否则会每 2 s 重建一次）。
+        assert_eq!(
+            shrink_target((2560, 1792), (2000, 1200), true).expect("fits"),
+            None
+        );
+        // 没有合成目标（离屏 / 快照）：永不缩容（离屏由 `resize` 直接重建）。
+        assert_eq!(
+            shrink_target((2560, 1792), (1200, 925), false).expect("fits"),
+            None
+        );
+        // 防御：内容比 buffer 还大（grow-only 不变量被破坏）时不得「缩」成更大的桶。
+        assert_eq!(
+            shrink_target((512, 512), (2000, 900), true).expect("fits"),
+            None
+        );
+        // 上限检查仍然生效（内容 > 16384 是显式错误，不静默裁剪）。
+        assert!(matches!(
+            shrink_target((16384, 16384), (16_385, 100), true),
+            Err(EngineError::Swapchain { .. })
+        ));
+    }
+
+    /// 离屏目标没有合成树：`maybe_shrink` 是 no-op，高水位保持不变。
+    #[test]
+    fn an_offscreen_renderer_never_shrinks_the_high_water_bucket() {
+        let _guard = lock();
+        // 1024² 的 buffer 与 32² 的内容桶（768²）才有「可缩」的候选。
+        let Some(mut renderer) = warp_renderer((1024, 1024)) else {
+            return;
+        };
+        renderer
+            .set_content_size((32, 32))
+            .expect("content stays inside the buffer");
+        assert_eq!(renderer.buffer(), (1024, 1024));
+        assert!(
+            renderer.shrink_in().is_none(),
+            "离屏目标没有缩容候选，空闲等待必须保持无限等"
+        );
+        renderer
+            .maybe_shrink()
+            .expect("an offscreen renderer has no composition target to switch");
+        assert_eq!(
+            renderer.buffer(),
+            (1024, 1024),
+            "没有合成目标时不得重建持久目标"
+        );
+    }
+
+    /// 背景层刷新只碰它自己的 1×1 持久目标：主持久目标里的内容一个像素都不能变。
+    ///
+    /// 旧实现借主 persist prime 1×1 背景层，每次改色都会把整块内容目标清成背景色；离屏目标
+    /// 没有背景持久目标（`background_persist = None`），这条断言同时守住那个不变量与「标记必须
+    /// 被消费、不能永真」的既有语义。
+    #[test]
+    fn a_background_refresh_never_touches_the_main_content_persist() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((64, 64)) else {
+            return;
+        };
+        let red = one_lane_scene(quad(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        ));
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&red, Scale::ONE, &resolver());
+        let mut frame = full_plan((64, 64));
+        let mut timings = FrameTimings::new();
+        renderer
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .expect("content frame");
+
+        renderer.set_background_color([0.1, 0.2, 0.3, 1.0]);
+        assert!(renderer.background_dirty);
+        renderer
+            .refresh_background()
+            .expect("an offscreen renderer has no background layer to rebuild");
+        assert!(!renderer.background_dirty, "标记必须被消费");
+        assert!(
+            renderer.background_persist.is_none(),
+            "离屏目标不创建 1×1 背景持久目标"
+        );
+
+        let image = renderer.readback().expect("readback");
+        assert_eq!(
+            pixel(&image, 64, 32, 32),
+            [255, 0, 0, 255],
+            "改背景色不得清掉主持久目标"
+        );
+    }
+
+    /// 缩容 prime 的内容保留：新目标先 clear，再把旧目标的 `(0, 0, content)` 拷到左上角；
+    /// 内容之外保持背景色。WARP 离屏没有合成目标，所以这里直接测录制片段（真实 DComp 窗口
+    /// 的整条 `maybe_shrink` 由 release demo 的运行时冒烟覆盖）。
+    #[test]
+    fn a_shrink_prime_copies_the_old_content_into_the_new_persist() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((64, 64)) else {
+            return;
+        };
+        // 旧内容：整块红。
+        let red = one_lane_scene(quad(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        ));
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&red, Scale::ONE, &resolver());
+        let mut frame = full_plan((64, 64));
+        let mut timings = FrameTimings::new();
+        renderer
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+            .expect("old content");
+        // 新目标 128×128：离屏路径不建背景层，第二个 RTV 描述符在这里空闲可用。
+        let rtv = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
+        let destination = Persist::new(&mut renderer.device, (128, 128), rtv).expect("new persist");
+        let source = std::mem::replace(&mut renderer.persist, destination);
+        {
+            let destination = &renderer.persist;
+            let source = &source;
+            renderer
+                .queue
+                .submit_immediate(|list| {
+                    // 缩容 prime 的固定顺序：先整块 clear，再从旧目标拷内容。
+                    // SAFETY: 两个目标都处于 RENDER_TARGET；清整块不需要矩形。
+                    unsafe {
+                        list.ClearRenderTargetView(destination.rtv, &[1.0, 1.0, 1.0, 1.0], None)
+                    };
+                    copy_content(list, source, destination, (64, 64));
+                    Ok(())
+                })
+                .expect("record the shrink copy");
+        }
+        renderer.surface = (128, 128);
+        let image = renderer.readback().expect("readback");
+        assert_eq!((image.width, image.height), (128, 128));
+        assert_eq!(
+            pixel(&image, 128, 8, 8),
+            [255, 0, 0, 255],
+            "旧内容原样保留在新目标的左上角"
+        );
+        assert_eq!(
+            pixel(&image, 128, 100, 100),
+            [255, 255, 255, 255],
+            "内容之外是 clear 出来的背景色"
+        );
     }
 }

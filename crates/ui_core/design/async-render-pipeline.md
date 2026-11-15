@@ -225,7 +225,7 @@ UI 线程 `publish`：
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
 - **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）。Windows 的窗口路径还另有**最近一次完成 present 的内容尺寸** `Window::presented_surface()`：内容视觉只按它 clip（**恒 1:1，不缩放**），当前客户区只决定 1×1 背景层的 `scale`（§6.4）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = **真实 Wayland buffer**（`round(logical × scale)`，`platform/linux/dpi.rs::physical_size`，在 `run` 与每轮 configure / scale 变化之后由 `Window::set_surface` 写入；fractional-scale 协议要求 round，不是 covering 的 ceil，F-191）。
-- 不同 ⇒ 先做本平台的重建，**Windows 例外**：内容仍在 grow-only buffer 内时只是 GPU 侧 CPU 记账（不重建任何资源），越过 buffer 才换持久目标 + 内容交换链并先 prime（F-199 / F-202）；Vulkan 新 swapchain；Metal 只重建 persist。之后渲染，并强制该帧 `Full`。
+- 不同 ⇒ 先做本平台的重建，**Windows 例外**：内容仍在高水位 buffer 内时只是 GPU 侧 CPU 记账（不重建任何资源），越过 buffer 才换持久目标 + 内容交换链并先 prime（F-199 / F-202）；内容静止 2 s 后 `maybe_shrink` 缩回当前桶（F-207）；Vulkan 新 swapchain；Metal 只重建 persist。之后渲染，并强制该帧 `Full`。
 - **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。Windows 的 `commit_frame` 在 `surface_change_plan` 里把目标尺寸变化一律夹成 `Plan::Full`（`window.rs`）：`Plan::Idle` 发布会消费 waitable token 却不 present，`Partial` 的 damage 是按旧目标算的、新暴露像素没有 damage。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
 - **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。**整数回退没有 destination**：`wl_surface.set_buffer_scale(N)` 由 GPU 线程在 present 前与 attach/commit 同一次生效，buffer = `round(logical × N)`（§15.13）。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
@@ -419,7 +419,7 @@ waitable = chain2.GetFrameLatencyWaitableObject();
 
 - **视觉树（z 序自下而上）**：`root`（无内容）→ `background`（1×1 交换链 + `background_scale = (client_w, client_h)`）→ `content`（真实链，**无 transform**，`content_clip = (0,0,content)`）。内容始终 1:1；窗口放大时露出背景层，缩小时只裁掉右/下（DEVIATIONS §36 F-205 / S-152）。
 - `DXGI_SCALING_STRETCH` 在组合交换链上不是「让 DWM 拉伸旧 buffer」的 STRETCH：交换链尺寸 = grow-only buffer（内容 + 512 余量、256 对齐），内容层没有变换、背景层只放大 1×1 常量色（§6.4），这里只是 DXGI 唯一接受的枚举值（S-149）。
-- **没有 `SetBackgroundColor`**：在组合交换链上返回 `S_OK` 但惰性（S-151）。背景色有两条路径：persist 的 clear color（linear，`render/color.rs::background_linear`），以及独立的 **1×1 背景交换链**——首帧 prime 成背景色；运行期改色标 dirty + 写共享槽，GPU 线程在空闲 / 取帧前用 `refresh_background` 换一条新 1×1 链（F-203 / F-205）。
+- **没有 `SetBackgroundColor`**：在组合交换链上返回 `S_OK` 但惰性（S-151）。背景色有两条路径：persist 的 clear color（linear，`render/color.rs::background_linear`），以及独立的 **1×1 背景交换链 + 独立 1×1 persist**（RTV descriptor 1，F-206）——首帧 prime 成背景色；运行期改色标 dirty + 写共享槽，GPU 线程在空闲 / 取帧前用 `refresh_background` 换一条新 1×1 链（F-203 / F-205 / F-206）。
 - **没有 `ResizeBuffers`**：第一次 present 之后固定失败（S-149）。内容越过 buffer 时整条替换**内容**交换链（先 prime 再 attach，F-202）；1×1 背景链不随窗口尺寸变化。
 - `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy 内容子矩形）与 waitable 保留；`Present1` 的 `sync=1` 保持 vsync。新链的 waitable token 没有显式消费（V-130）；`SetMaximumFrameLatency` 必须在 `IDXGISwapChain2` 上调（不是 `IDXGIDevice1`），且没有 waitable flag 时该调用直接失败（S-149）。
 
@@ -503,7 +503,7 @@ drain_completed():
 - 录制仍在一条 direct list 上（单线程录制；D3D12 的 list 本来就不是自由线程的，官方模型是「list 可并发录制、队列串行提交」，我们只有一条录制流，不需要多 list）。
 - `grow` / `refresh_background` 是这条循环里会**等 GPU** 的路径：`grow` 先 `wait_idle` + 重置 in-flight list（释放旧 back buffer 引用）→ 新建 persist + 内容链 → prime（等 fence）→ `SetContent` + `Commit` → 丢弃旧对象；`refresh_background` 用同样顺序换 1×1 链。内容不越过 buffer 时 resize 没有 GPU 等待、没有资源重建（F-199 / F-202 / F-205）。
 
-### 6.4 resize 协议（DComp 几何 + grow-only buffer）
+### 6.4 resize 协议（DComp 几何 + grow-only 高水位 + 2 s 缩容）
 
 窗口 resize 分成两条互不等待的路径：
 
@@ -534,11 +534,12 @@ GPU 线程（取到 FrameRequest 之后）：
 - **UI 线程的几何是唯一周期应用点**：`WM_SIZE` / `WM_DPICHANGED` 只记录尺寸，不逐条 `Commit`（P1-2a）。`set_geometry` 同值 no-op；GPU 线程在完成观测点 post `WM_APP_COMPOSITION_WAKE` 只唤醒泵，让「最后一帧的几何」在下一轮落地（消息丢了最多晚一轮，`Shared::presented` 才是待处理状态）。
 - **静止 / 拖动**：内容 visual **恒 1:1、没有缩放变换**，`content_clip = (0, 0, presented)`。静止时 `presented == client`，背景层被完全盖住；拖动放大时旧内容保持左上 1:1，露出的右/下是 1×1 背景层（`background_scale = client`），缩小时只裁掉右/下。因此 HUD / 文字在拖动中宽度不变（实测 297 px 恒定），没有拉伸 / 静止回弹（§36 F-205）。**没有 1/dpi 因子**：visual 的单位是物理像素（S-148）；`background_scale` 是客户区物理像素数（S-152）。
 - **resize 目标 = 真实客户区**：`client` 来自平台层写入的 `Window.surface`（`GetClientRect` / `WM_SIZE` 的 lParam / `WM_DPICHANGED` 后回读），不是 `size × scale` 的 covering；最小化时 `GetClientRect` 是 0×0，不拿它当几何、不重建 1×1（§6.7 的 `IsIconic` guard）。
-- **没有 `ResizeBuffers`**：组合交换链在第一次 present 之后恒 `0x887A0001`（S-149），所以 buffer 是 grow-only 高水位：`buffer_size(content) = min(round_up_256(content + 512), 16384)`（`platform/windows/composition.rs::buffer_size`），GPU 侧再与当前 buffer 逐轴取大（`grown_buffer`）。内容仍在 buffer 内时 resize **没有 GPU 等待、没有资源重建**；只有越过 buffer 才 `grow`。VRAM 因此是「历史最大桶」，缩小时不还（V-128）。
+- **没有 `ResizeBuffers`**：组合交换链在第一次 present 之后恒 `0x887A0001`（S-149），所以 buffer 是 grow-only 高水位：`buffer_size(content) = min(round_up_256(content + 512), 16384)`（`platform/windows/composition.rs::buffer_size`），GPU 侧再与当前 buffer 逐轴取大（`grown_buffer`）。内容仍在 buffer 内时 resize **没有 GPU 等待、没有资源重建**；只有越过 buffer 才 `grow`。VRAM 平时是「历史最大桶」，但内容静止 **2 s** 后 `maybe_shrink` 会缩回当前内容的桶（缩容 prime 拷贝旧内容、可见像素不变；F-207 / V-132），所以不是永久占用。
+- **2 s 空闲缩容**：`SHRINK_IDLE = 2 s`；`content_since` 在每次真实内容尺寸变化 / grow / shrink 后刷新。`shrink_target(buffer, surface, has_composition)` 只在「有合成目标 + 内容桶严格更小」时给候选；`maybe_shrink` 的顺序是 `wait_idle` → reset → 新主 persist + 交换链 → clear 新 persist → 把旧 persist 的 `(0,0,surface)` 拷进左上 → 全量 copy + 首帧全量 `Present1` + 等 queue fence → `SetContent + Commit` → 第二次 reset → `device.release(old_persist)` 直接释放（故意不走 retire，顺序安全由 S-153 记录）。触发点：空闲等待的 `shrink_due` / 定时 `shrink_in`，以及 HUD / 连续帧路径取帧后、录制前；新请求会重置 `content_since`，不会抖动。HUD-off 空闲定时路径未验（V-132）。
 - **grow 的顺序固定为 prime-before-attach**（F-202）：新内容交换链先全量 clear + `Present1(sync=0)` 并等队列 fence，**然后**才 `SetContent(new) + Commit`；反过来会在 Commit 与 prime 之间露出一帧桌面（已 attach 但未 present 的链在合成器里透明，S-150）。旧对象在视觉切换之后才 drop。grow 期间旧内容仍 1:1 显示，露出的新区域由背景层覆盖。
-- **首帧**：`Renderer::new_for_hwnd` → `GpuRenderer::new_for_composition` 用 `buffer_size(client)` 建内容链、再建一条 **1×1 背景链**，两条都 prime 后 attach；`run` 在 `ShowWindow` 之前 `set_geometry(client, client)` 把内容 clip 设成客户区、背景 scale 设成客户区（`platform/windows/event_loop.rs:609-632`）。`WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前完全透明（S-150），所以两条链的 prime 都必须先于 show。
+- **首帧**：`Renderer::new_for_hwnd` → `GpuRenderer::new_for_composition` 用 `buffer_size(client)` 建内容链、再建一条 **1×1 背景链**（各自独立的 1×1 persist，RTV descriptor 1；F-206），两条都 prime 后 attach；`run` 在 `ShowWindow` 之前 `set_geometry(client, client)` 把内容 clip 设成客户区、背景 scale 设成客户区（`platform/windows/event_loop.rs:609-632`）。`WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前完全透明（S-150），所以两条链的 prime 都必须先于 show。
 - **内容 / buffer 分离**：绘制、viewport、scissor、root uniform、copy、`Present1` dirty 全部按**内容**子矩形；只有资源创建与 clear 用 buffer。`Full` 帧的 `Present1` 只声明 `(0,0,content)`，不是整块 buffer（`swapchain.rs::frame_dirty_rects`）。
-- **waitable**：窗口 resize 不再重建或重取 waitable（不 `ResizeBuffers`）；`grow` 换上的新内容链自带一个新 waitable，其首个 token 没有显式消费（V-130）。背景层刷新创建的 1×1 链没有帧循环 waitable 消费点。
+- **waitable**：窗口 resize 不再重建或重取 waitable（不 `ResizeBuffers`）；`grow` 换上的新内容链自带一个新 waitable，其首个 token 没有显式消费（V-130）。背景层刷新 / 缩容创建的链没有帧循环 waitable 消费点。
 - **teardown**：`Composition::shutdown` 在 `DestroyWindow` 之前 `SetRoot(NULL)` + `Commit`，再按 root → background / content → background_scale / content_clip → device 的顺序释放；关闭顺序保证 GPU 线程已退出（`Renderer::drop` join 后才销毁窗口）。
 
 ### 6.5 fence / retire
@@ -744,7 +745,7 @@ recreate_swapchain():
 | Metal | `dispatch_semaphore_wait(NOW)` | 0（失败即跳帧） | 不阻塞 |
 | D3D12 | `WaitForMultipleObjects(work, completion)`（空闲）/ `(waitable, completion)`（渲染前） | 一个 vsync | GPU 线程就是呈现线程，这是它该等的地方；completion 分支只用来及时发布反馈 |
 | D3D12 | 槽 fence | 该帧 GPU 时间 | 复用 allocator 的前置条件 |
-| D3D12 | `grow` / `refresh_background`：`wait_idle` + prime 的槽 fence | 一次 GPU 完成 + 一帧 prime | `grow` 只在内容越过 grow-only buffer 时发生；背景刷新只在改色时发生（1×1 链，代价可忽略） |
+| D3D12 | `grow` / `maybe_shrink` / `refresh_background`：`wait_idle` + prime 的槽 fence | 一次 GPU 完成 + 一帧 prime | `grow` 只在内容越过 grow-only buffer 时发生；`maybe_shrink` 只在静止 2 s 且有更小桶时发生；背景刷新只在改色时发生（1×1 链，代价可忽略） |
 | Vulkan | `vkAcquireNextImageKHR(100ms)` | 一个 vsync（合成器节流）；超时回循环 | 这就是 Vulkan 的节奏原语；有限超时只用来响应 shutdown |
 | Vulkan | 槽 fence | 该帧 GPU 时间 | 复用命令缓冲的前置条件 |
 
@@ -773,9 +774,9 @@ UI 线程上没有任何一行等待。
 | `render/compositor.rs` | 新增 `Plan::merge`（Full 优先、矩形并集、超限降级 Full）+ 单测 |
 | `render/windows/renderer.rs` **新增** | 门面（最新帧槽/图集槽/反馈/线程句柄），对应 macOS 的 `renderer.rs`；完成观测点发布 `presented` 并 post `WM_APP_COMPOSITION_WAKE`（只唤醒）；`grow` 前后 drain 完成通知；空闲 / 取帧前 `refresh_background`（1×1 背景层） |
 | `render/windows/queue.rs` | `submit` 去掉 `wait_for`；新增 `reset_slot`/`wait_slot_fence`；`submit_immediate` 仅测试保留 |
-| `platform/windows/composition.rs` **新增** | DComp 视觉树（root / **1×1 背景 visual** / 内容 visual，`Arc<Mutex<Composition>>` 串行化）、`buffer_size` grow-only 桶、`visual_geometry`（`content_clip` + `background_scale`，内容恒 1:1）、`set_background_content`、`refresh_background`、`shutdown`；`Composition` 运行时错误 = `EngineError::Composition`（§36 F-199 / F-205 / F-204） |
+| `platform/windows/composition.rs` **新增** | DComp 视觉树（root / **1×1 背景 visual** / 内容 visual，`Arc<Mutex<Composition>>` 串行化）、`buffer_size` 高水位桶、`visual_geometry`（`content_clip` + `background_scale`，内容恒 1:1）、`set_background_content`、`refresh_background`、`shutdown`；`Composition` 运行时错误 = `EngineError::Composition`（§36 F-199 / F-205 / F-206 / F-204） |
 | `render/windows/swapchain.rs` | 只保留组合交换链：`CreateSwapChainForComposition`（`STRETCH` + `FLIP_SEQUENTIAL` + 3 + waitable）、`SetMaximumFrameLatency(1)`、`present1(frame, sync, content)`（首帧全量、全量帧只声明内容子矩形）、`waitable()`；内容链与 1×1 背景链复用同一构造 / prime 路径；没有 `for_hwnd` / `resize`（§36 F-199 / S-149 / S-152） |
-| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`new_for_composition` 建内容 + **1×1 背景**两条链并各自 prime；`set_content_size` 在 buffer 内纯记账、越界 `grow`（重建 persist + 内容链；先 prime 再 `SetContent`）；`refresh_background` 换 1×1 背景链；`resize` 只服务离屏路径 |
+| `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`new_for_composition` 建内容 + **1×1 背景**两条链并各自 prime（背景用独立 1×1 persist / RTV descriptor 1，F-206）；`set_content_size` 在 buffer 内纯记账、越界 `grow`；`maybe_shrink` 在静止 2 s 后缩回当前桶并拷贝旧内容（F-207）；`refresh_background` 只换背景链；`resize` 只服务离屏路径 |
 | `render/linux/swapchain.rs` | 每 image 一个 `render_finished`；`create` 带 `old`；新增 `recreate`/`retire`；present mode 改 `MAILBOX` |
 | `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进；持有 `WpViewport` + `last_destination`，present 前写 destination（F-190）；`set_clear_color` / 初始 `clear_color` = `background_linear`（F-192） |
 | `render/linux/renderer.rs` **新增** | 门面（同 Windows）；`new_for_surface(..., background, viewport)`；`Shared`/`State` 背景槽（F-192） |
@@ -816,14 +817,15 @@ UI 线程上没有任何一行等待。
 | 用例 | 通过判据 |
 |---|---|
 | live resize 连续拖动 2s | UI 线程单次 `frame` 耗时 max < 4ms；无 `ResizeBuffers`/`acquire`/`nextDrawable` 出现在 UI 线程的 sample 里；画面跟随拖动 |
-| live resize 无整帧缩放（Windows，内容 1:1 + 1×1 背景层） | 真实鼠标快速拖动（592 Hz）：**FPS 62.3 / Frame 16.06 ms / CPU 0.77 ms / Present 0.27 ms**；内容 visual 恒 1:1、HUD panel 顶边宽 **297 px 恒定**（279 个可见帧 0 宽 / 0 窄，59 帧在最大缩小时被完全裁掉、从未缩放），最终标题 / 卡片 pixel-identical（max diff 0）；放大露出的右/下 100% 是 `(11,14,19)`（jump 640×520→1218×972 的 exposed right / bottom 均 `frac=1.0, max 19`），无 desktop / magenta / transparent；背景精确 `(11,14,19)`、无透明条。debug 为 CPU-bound（47.3 FPS / CPU 11.76 ms），无 30 fps 平台期；1000 Hz / 高刷新率 / 混合 DPI 未测（V-125 / V-126） |
+| live resize 无整帧缩放（Windows，内容 1:1 + 1×1 背景层） | 真实鼠标快速拖动（REPORT4）：**FPS 64.0 / Frame 15.62 ms / CPU 0.72 ms / Present 0.19 ms**；内容 visual 恒 1:1、HUD panel 顶边宽 **297 px**（296 个可见帧 0 宽 / 0 窄），最终标题 pixel-identical（max diff 0）；放大露出的右/下 **99.2–100%** 是 `(11,14,19)`（少量“坏”条带只是内容边缘抗锯齿，max 255），无 desktop / magenta / transparent；jump grow 同帧新内容、无可见条带 / 闪帧。no-stretch 初验（REPORT3）为 62.3 FPS / 297 px（279 帧）；debug 47.3 FPS / CPU 11.76 ms，无 30 fps 平台期；1000 Hz / 高刷新率 / 混合 DPI 未测（V-125 / V-126） |
+| 2 s 空闲缩容（Windows） | 内容静止 2 s 后 VRAM 回落到当前内容桶：**190,185,472 → 118,886,400 B**（+2.08 s 采样）；切换期间 **0/113 idle 帧变化**、max diff 0、无 blank/black；最终 HUD 1200×925 / 65.2 FPS。HUD-off 空闲定时路径未验（V-132） |
 | live resize 无整帧缩放（macOS，`kCAGravityBottomLeft` + 真实 backing） | stale 帧卡片 bbox = 静止 bbox（1108×350，1.000×/1.000×）并贴**视觉左上**；卡片文字锐度不降（Laplacian 808 vs 800，+1%；旧 HEAD 624，-22%）；新暴露的右/下条带 = 窗口背景色（(13,15,19) ≈ `#0B0E13`，对静止背景 Δ≤1，无黑/白条）；缩小时右/下裁切、放大时新暴露条带 ≤ 1–2 帧；连续 sweep 卡片高 174–175 恒定；最小化 3 s 恢复 1:1、Esc exit 0、stderr 空。**1x / 真实鼠标拖拽未测**（V-121） |
 | live resize 无整帧缩放（Linux，destination 与 buffer 原子） | `WAYLAND_DEBUG`：1218 次 destination 变更 **1218 次与 attach 同一次 commit**（0 次无 attach、0 mismatch、0 次 `set_buffer_scale`；旧 HEAD 273/294 次无 attach）；buffer = `round(logical×scale)`（701×501@1.25 ⇒ 876×626，旧 877×627）；卡片 bbox 恒定（1.25：725×220；1.0：580×176）、文字锐度不降（Laplacian 1.25：1715.34；1.0：2019.30；旧 HEAD 1.25：616–1048）；2802 次 resize / 3583 次 present、FrameGate 最大间隔 79.6 ms、exit 0、validation 0 VUID；缩小时右/下裁切（1.0：576×176 / 580×134）。1.25 下 7/70 帧整窗变软（bbox 不变，归因 sway 分数缩放采样）；**Mutter/KWin、真实指针拖拽未测**（V-122） |
-| 窗口背景色（`#0B0E13`） | Windows：不再有 resize 背景条；背景是 persist clear（linear）**+ 独立 1×1 背景层**，放大露出的区域 100% `(11,14,19)`（jump 帧实测 `frac=1.0, max 19`），首帧两条链都 prime（启动无桌面穿透）；`set_background_color` 只标 dirty，GPU 线程在空闲 / 取帧前用 `refresh_background` 重建 1×1 链，**不依赖内容帧**；组合交换链上的 `SetBackgroundColor` 惰性、已不使用（§36 F-203 / F-205 / S-151）。macOS：条带 (13,15,19)/(14,15,19)（F-188）。Linux：clear 夹具 `#0B0E13`→(11,14,19)、`#402080`→(64,32,128)（linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见）；`set_background_color` 经 `Shared` 槽在 GPU 线程空闲 / 下一帧录制前应用（F-192 / S-143） |
+| 窗口背景色（`#0B0E13`） | Windows：不再有 resize 背景条；背景是 persist clear（linear）**+ 独立 1×1 背景层（独立 1×1 persist，RTV descriptor 1）**，放大露出的区域 99.2–100% `(11,14,19)`（jump 帧 `frac=1.0, max 19`），首帧两条链都 prime（启动无桌面穿透）；`set_background_color` 只标 dirty，GPU 线程在空闲 / 取帧前用 `refresh_background` 重建 1×1 链，**不碰主 persist、不依赖内容帧**；组合交换链上的 `SetBackgroundColor` 惰性、已不使用（§36 F-203 / F-205 / F-206 / S-151）。macOS：条带 (13,15,19)/(14,15,19)（F-188）。Linux：clear 夹具 `#0B0E13`→(11,14,19)、`#402080`→(64,32,128)（linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见）；`set_background_color` 经 `Shared` 槽在 GPU 线程空闲 / 下一帧录制前应用（F-192 / S-143） |
 | resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface` 与 DComp 几何），恢复后最大化 client 3840×2071、200×150 钳到 400×250 outer 均正常 |
 | 真实 DPI 150% / 175% / 混合多显示器 | **未实测**（V-125 / V-126）：本轮实机只跑 125%（DPI=120）单显示器；150% / 175% / 跨屏不同 DPI 的 DComp visual 1:1 与 grow 未验 |
-| 空闲 2s | 0 帧；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程无自旋唤醒 |
-| 连续帧（HUD/动画）60s | 帧率由显示器决定；HUD 的 FPS 是**提交率**（Windows 最终树 62.3 / 16.06 ms / CPU 0.77 ms；旧 HWND 记录 63.9/64.0/60.6）；无累积延迟（Latency 1.88–13.23 ms） |
+| 空闲 2s | 0 个内容帧；若高水位有更小桶，2 s 时缩容一次（内容保留）；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程除定时缩容外无自旋唤醒 |
+| 连续帧（HUD/动画）60s | 帧率由显示器决定；HUD 的 FPS 是**提交率**（Windows 最终树 64.0 / 15.62 ms / CPU 0.72 ms；旧 HWND 记录 63.9/64.0/60.6）；无累积延迟（Latency 1.88–13.23 ms） |
 | 全屏转场（macOS）/ 遮挡（Win/Linux） | 不阻塞 UI；恢复后继续出帧 |
 | 设备丢失注入（D3D12 debug layer / `VK_EXT_device_fault` / Metal 错误） | UI 线程收到粘性错误并退出，不 panic |
 | 多窗口 | 各窗口独立节奏；一个窗口 resize 不改变另一个窗口帧率 |
@@ -862,14 +864,16 @@ UI 线程上没有任何一行等待。
 | 20 | `SetBackgroundColor` 在组合交换链上是否生效 | 设置 `(0.25,0.5,0.75,1)` 后 present 多帧，比较像素与 `GetBackgroundColor` 回读 | **已实测**：回读同值、像素完全不变（惰性）⇒ S-151；背景只能走 persist clear + 1×1 背景层（F-203 / F-205）。 |
 | 21 | 1×1 背景交换链 + 视觉树 z-order 能否在没有拉伸的前提下填满露出区域 | 建 root / background / content 三层，背景 1×1 + `background_scale = client`，内容无 transform + `clip = content`；做 640×520 → 1218×972 的 jump grow，逐像素量 exposed right / bottom | **已实测**：jump 帧旧内容仍 640×520 1:1；exposed right `700..1150 × 120..400` 与 bottom `120..600 × 620..900` 都是 `frac (11,14,19) = 1.0, max 19`，无 desktop / magenta / transparent；下一帧新内容出现 ⇒ S-152 / F-205 / V-131。 |
 | 22 | 真实拖动中内容 / HUD 是否会被缩放 | release 真实鼠标 592 Hz，1200×925 → 900×685 → 1200×925，逐帧量 HUD panel 顶边宽与最终静态像素 | **已实测**：**297 px 恒定**（279 个可见帧 0 宽 / 0 窄；59 帧最大缩小时完全裁掉，从未缩放）；最终标题 / 卡片 pixel-identical；FPS 62.3 / CPU 0.77 ms ⇒ V-131。 |
+| 23 | 2 s 空闲缩容是否保留内容、VRAM 是否回落 | HUD-on 1200×925 → 1900×1300 → 1900×2100 → 1200×925，静止录屏 60 fps + 进程 dedicated 采样 | **已实测**：190,185,472 → **118,886,400 B**（+2.08 s）；113 个 idle 帧 **0 变化**、max diff 0、无 blank/black；最终 HUD 1200×925 / 65.2 FPS ⇒ F-207 / S-153 / V-132；HUD-off 空闲路径未验。 |
 
 前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows
 resize 修复时新增的验证项（未闭环部分登记 V-120，Windows 部分已被 §15.14 取代）；7–10 是同一天
 macOS live-resize 修复新增的验证项（结论见 §5.3 / §5.4 / §15.10，SDK 事实登记 S-142，未验证项
 登记 V-121）；11–14 是同一轮 Linux live-resize 修复新增的验证项（结论见 §7.3 / §7.5 / §15.11，
 协议事实登记 S-144，未验证项登记 V-122）；15–20 是 Windows DirectComposition 重写新增的 probe
-（结论见 §15.14 与 DEVIATIONS §36 S-148 … S-151，未验证项登记 V-125 … V-130）；21–22 是
-no-stretch 修正新增的验证（结论见 §15.14 / DEVIATIONS §36 F-205 / S-152 / V-131）。
+（结论见 §15.14 与 DEVIATIONS §36 S-148 … S-151，未验证项登记 V-125 … V-130）；21–23 是
+no-stretch 修正新增的验证（结论见 §15.14 / DEVIATIONS §36 F-205 / S-152 / V-131）；23 是 2 s 空闲
+缩容 / 独立背景 persist 的验证（F-206 / F-207 / S-153 / V-132）。
 
 ---
 
@@ -1331,7 +1335,7 @@ S-146 / S-147）：
   （`FrameRequest.buffer_scale` 契约与配对测试）、`render/linux/compositor.rs`（present 前
   `set_buffer_scale` + `debug_assert` 不变量）、`render/linux/renderer.rs`（`wl_surface` 副本）。
 
-### 15.14 第十轮闭环：Windows DirectComposition resize 重写（2026-11-15）
+### 15.14 第十轮闭环：Windows DirectComposition resize 重写 + 收尾缩容（2026-11-15）
 
 §15.9 的 HWND + `SCALING_NONE` + `SetBackgroundColor` 只能把新暴露区域填成背景色，内容仍要等
 GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风暴压到 ~30 fps，HUD / 边缘滞后
@@ -1339,10 +1343,12 @@ GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风
 `ResizeBuffers` 不再出现在窗口路径。**第一版曾用 `scale = client/content` 拉伸上一帧铺满客户区；
 真实拖动后用户反馈这正是要消除的拉伸 / 回弹（HUD 变宽、静止回弹），已改为 Chrome / Zed 式
 「内容 visual 恒 1:1 + 独立 1×1 背景层」**：内容只 clip 到自己的尺寸，放大露出的右/下由 1×1
-背景交换链填 `(11,14,19)`，缩小时只裁掉右/下。当前偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md)
-§36（F-199 … F-205 / S-148 … S-152 / V-125 … V-131）；probe 产物在 `target/tmp/dcomp-probe/`，
-实机证据在 `target/tmp/verify-dcomp/REPORT3.md` 与 `ns-*`（第一版拉伸的 `REPORT2.md` / `fin-*`
-只作历史）。
+背景交换链填 `(11,14,19)`，缩小时只裁掉右/下。**收尾又加了两点**：背景层使用独立的 1×1 持久
+目标（RTV descriptor 1，改色不碰主 persist）；高水位在内容静止 2 s 后缩回当前内容桶（先拷旧内容，
+VRAM 回落）。当前偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md)
+§36（F-199 … F-207 / S-148 … S-153 / V-125 … V-132）；probe 产物在 `target/tmp/dcomp-probe/`，
+实机证据在 `target/tmp/verify-dcomp/REPORT4.md` / `REPORT3.md` 与 `is-*` / `ns-*`（第一版拉伸的
+`REPORT2.md` / `fin-*` 只作历史）。
 
 **机制表**：
 
@@ -1350,12 +1356,13 @@ GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风
 |---|---|---|
 | 合成目标 | `DCompositionCreateDevice2(NULL) -> IDCompositionDevice`；`CreateTargetForHwnd(hwnd, false)` + root / background / content 三个 visual + 背景 scale + 内容 clip；所有 DComp 调用经 `Arc<Mutex<Composition>>` 串行化；`shutdown` 在 `DestroyWindow` 之前 | `platform/windows/composition.rs`；`platform/windows/window.rs` |
 | 交换链 | 内容链与 **1×1 背景链**都用 `CreateSwapChainForComposition` + `STRETCH` + `FLIP_SEQUENTIAL` + 3 + BGRA8 + `IGNORE` + waitable；`SetMaximumFrameLatency(1)`；没有 `for_hwnd` / `resize` | `render/windows/swapchain.rs` |
-| buffer | grow-only 高水位：`min(round_up_256(content + 512), 16384)`，GPU 侧逐轴取大；内容越界才重建 persist + 内容链；1×1 背景链不随尺寸变化 | `platform/windows/composition.rs::buffer_size`；`render/windows/compositor.rs::grown_buffer` |
-| 几何 | visual 单位 = 物理像素；内容 visual **无 transform / 恒 1:1**，`content_clip = (0,0,content)`；背景 visual 是 1×1，`background_scale = (client_w, client_h)`；UI 泵的 ②b′ 每轮应用，GPU 只在 grow 时换内容链、`refresh_background` 时换背景链 | `platform/windows/composition.rs::visual_geometry`；`platform/windows/event_loop.rs` |
-| prime | 每条新链先全量背景 clear + `Present1(sync=0)` + 等队列 fence，然后 `SetContent + Commit`；启动时背景链 + 内容链都在 `ShowWindow` 之前；背景色变化也换新 1×1 链并 prime | `render/windows/compositor.rs::new_for_composition` / `prime_detached` / `grow` / `refresh_background` |
+| buffer | grow-only 高水位：`min(round_up_256(content + 512), 16384)`，GPU 侧逐轴取大；内容越界才重建 persist + 内容链；内容静止 **2 s** 后 `maybe_shrink` 缩回当前内容桶（F-207） | `platform/windows/composition.rs::buffer_size`；`render/windows/compositor.rs::grown_buffer` / `maybe_shrink` |
+| 缩容 | `SHRINK_IDLE = 2 s`；`shrink_target` 只在有合成目标且内容桶严格更小时返回候选；新 persist 先 clear、再把旧 persist `(0,0,surface)` 拷进左上，然后 prime / `SetContent`，旧 persist 直接 `device.release`（F-207 / S-153） | `render/windows/compositor.rs`；`render/windows/renderer.rs` |
+| 几何 | visual 单位 = 物理像素；内容 visual **无 transform / 恒 1:1**，`content_clip = (0,0,content)`；背景 visual 是 1×1，`background_scale = (client_w, client_h)`；UI 泵的 ②b′ 每轮应用，GPU 只在 grow / shrink 时换内容链、`refresh_background` 时换背景链 | `platform/windows/composition.rs::visual_geometry`；`platform/windows/event_loop.rs` |
+| prime | 每条新链先全量背景 clear + `Present1(sync=0)` + 等队列 fence，然后 `SetContent + Commit`；`PrimePersist::{Main,Background}` 选择内容 / 背景 persist；启动时背景链 + 内容链都在 `ShowWindow` 之前；缩容 prime 从旧内容拷完后才切 | `render/windows/compositor.rs::new_for_composition` / `prime_detached` / `grow` / `maybe_shrink` / `refresh_background` |
 | 缩放节奏 | `WM_MOUSEMOVE` 只记录光标；1 ms `WM_TIMER(RESIZE_TIMER_ID)` / 抬起 / 失去捕获才 `SetWindowPos`，合并到 ~60 Hz | `platform/windows/event_loop.rs` |
 | 完成通知 | 完成观测点发布 `presented`；只在尺寸变化时 post `WM_APP_COMPOSITION_WAKE`（只唤醒，不请求帧）；两次 post 失败置 `composition_pending` 兜底 | `render/windows/renderer.rs`；`window.rs` |
-| 背景 | persist clear 的 linear 值 + 独立 **1×1 背景交换链**；`SetBackgroundColor` 惰性、已删除；改色只标 `background_dirty` + 写共享槽，GPU 线程空闲 / 取帧前用 `refresh_background` 重建，不依赖内容帧 | `render/color.rs`；`render/windows/compositor.rs`；`render/windows/renderer.rs` |
+| 背景 | persist clear 的 linear 值 + 独立 **1×1 背景交换链 + 1×1 persist**（RTV descriptor 1）；`SetBackgroundColor` 惰性、已删除；改色只标 `background_dirty` + 写共享槽，GPU 线程空闲 / 取帧前用 `refresh_background` 重建，不碰主 persist、不依赖内容帧 | `render/color.rs`；`render/windows/compositor.rs`；`render/windows/renderer.rs` |
 | 错误 | `EngineError::Composition` = DComp 运行时失败；`AppInit` 只用于 `Composition::new` 的 COM 创建 | `error.rs`；`platform/windows/composition.rs` |
 
 **probe 结论**（完整日志 `caps.log` / `dpi.log` / `present.log` / `resize.log`）：
@@ -1371,25 +1378,28 @@ GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风
 | 背景 | `SetBackgroundColor` 返回 OK、回读同值，但像素完全不变（惰性） |
 
 **最终树实机验证矩阵**（Windows 11，单显示器 3840×2160 @125%，RTX 5080；release demo
-`--features hud`；详细日志 `target/tmp/verify-dcomp/REPORT3.md` 与 `ns-*`）：
+`--features hud`；详细日志 `target/tmp/verify-dcomp/REPORT4.md` / `REPORT3.md` 与 `is-*` / `ns-*`）：
 
 | 用例 | 结果 |
 |---|---|
-| 真实鼠标快速拖动（592 Hz，1200×925 → 900×685 → 1200×925） | **PASS**：FPS 62.3 / Frame 16.06 ms / CPU 0.77 ms / Present 0.27 ms；HUD panel 顶边宽 **297 px 恒定**（279 个可见帧 0 宽 / 0 窄，59 帧最大缩小时被完全裁掉、从未缩放）；最终标题与卡片 pixel-identical（max diff 0），背景 `(11,14,19)`，无透明条 |
+| no-stretch 初验拖动（REPORT3，历史） | **PASS**：FPS 62.3 / Frame 16.06 ms / CPU 0.77 ms / Present 0.27 ms；HUD panel 顶边宽 **297 px 恒定**（279 个可见帧 0 宽 / 0 窄，59 帧最大缩小时被完全裁掉、从未缩放）；最终标题与卡片 pixel-identical（max diff 0），背景 `(11,14,19)`，无透明条 |
+| 收尾真实鼠标拖动（REPORT4） | **PASS**：FPS 64.0 / Frame 15.62 ms / CPU 0.72 ms / Present 0.19 ms（217 步 / 341.5 ms）；HUD 宽 **297 px**（296 个可见帧 0 宽 / 0 窄），最终标题 pixel-identical；条带 18 帧 6–42 px，采样 **99.2%** 精确 `(11,14,19)`、mean `(12.0,14.4,19.4)`，少量“坏”条带只是内容边缘抗锯齿（max 255），从无 desktop / magenta；jump grow 同帧新内容、无可见条带 / 闪帧 |
 | debug 同拖动 | **PASS**：FPS 47.3 / Frame 21.16 ms / CPU 11.76 ms / Present 0.21 ms（CPU-bound），无 30 fps 平台期 |
-| 启动 | **PASS**：`ShowWindow` 后无桌面穿透 / 黑帧；内容链与 1×1 背景链都在 show 前 prime；首个可见内容帧 = 场景背景（frame 42），下一帧 = 场景 |
+| 启动 | **PASS**：`ShowWindow` 后无桌面穿透 / 黑帧；内容链与 1×1 背景链都在 show 前 prime；首个可见内容帧 = 场景背景（REPORT4 frame 49；REPORT3 为 42），下一帧 = 场景 |
 | 决定性 jump grow（640×520 → 1218×972） | **PASS**：旧内容仍 640×520 1:1；exposed right `700..1150 × 120..400` 的 `frac (11,14,19) = 1.0, max 19`，bottom `120..600 × 620..900` 同样 1.0；无 desktop / magenta / transparent |
-| 增长 / VRAM | **PASS**：1200×925 → 1792×1536（**118,812,672 B**）；1882×1253 → 2560×1792（**+29,360,128 B** 精确）；1882×2053 → 2560×2816（**+41,943,040 B** 精确）；1200×1400 → 2000×600 角部 **0 增量**；3782×603 → 4352×2816（**+80,740,352 B**，仅宽）；回到 1200×925 **0 增量** |
+| 增长 / VRAM（REPORT3，缩容前） | **PASS**：1200×925 → 1792×1536（**118,812,672 B**）；1882×1253 → 2560×1792（**+29,360,128 B** 精确）；1882×2053 → 2560×2816（**+41,943,040 B** 精确）；1200×1400 → 2000×600 角部 **0 增量**；3782×603 → 4352×2816（**+80,740,352 B**，仅宽） |
+| 2 s 空闲缩容（REPORT4，HUD on） | **PASS**：118,878,208 → 148,242,432 → 190,185,472 → **118,886,400 B**（1792×1536 桶）；采样器高 +0.98 s / 低 +2.08 s ⇒ 切换 **2.0 s**；60 fps 录制 **113 个 idle 帧 0 变化，max diff 0**，无 blank / black；最终 HUD 1200×925、FPS 65.2、CPU 0.08。**HUD-off 空闲定时路径未验**（V-132） |
 | 最小化 / 最大化 / 小窗 | **PASS**：恢复、client 3840×2071、200×150 钳到 400×250 outer，均正常渲染 |
 | 退出 | **PASS**：Esc / `WM_CLOSE` exit 0，stderr 空，无 device-loss 输出 |
 | 缩小 / 恢复 / 条带 | **PASS**：351 帧 0 blank / black，最终 pixel-identical；增长条带 12–30 px（7 帧：5 帧纯 `(11,14,19)` max 19，2 帧含新内容像素 max 135），从无 desktop / 洋红 |
 | 离屏 / 快照 / golden | 零语义变化：`GpuRenderer::resize` 只服务离屏（无 swapchain），golden 与快照仍走 persist 读回 |
 
-**未验证 / 残留风险**（V-125 … V-131）：真实鼠标只到 592–626 Hz，1000 Hz 与 120/144/240 Hz 未测
+**未验证 / 残留风险**（V-125 … V-132）：真实鼠标只到 592–626 Hz，1000 Hz 与 120/144/240 Hz 未测
 （V-125）；混合 DPI 多显示器未测（V-126）；pre-attach 的 `Present1` 保留只由运行时视频验证
-（V-127）；grow-only 高水位不还 VRAM、无 shrink 策略（V-128）；60 Hz 定时器低优先级 / 捕获 /
-`SetTimer` 失败（V-129）；新链 waitable token 未显式消费、合成唤醒兜底不能自唤醒（V-130）；
-1×1 背景 prime 会顺带清一次主 persist（P2，罕见）、no-stretch 验证只覆盖单机单驱动（V-131）。
+（V-127）；高水位 2 s 缩容只在有合成目标时发生，直接释放顺序见 S-153（V-128）；60 Hz 定时器
+低优先级 / 捕获 / `SetTimer` 失败（V-129）；新链 waitable token 未显式消费、合成唤醒兜底不能
+自唤醒（V-130）；no-stretch 初验只覆盖单机单驱动（V-131）；**HUD-off 空闲定时路径、真实窗口
+改色运行时、direct release 运行时**未验（V-132）。
 
 **新增单测与落点**：
 
@@ -1397,9 +1407,12 @@ GPU 线程重建；真实鼠标快速拖动被 `WM_SIZE → 帧 → present` 风
 - `window.rs`：`a_windows_surface_change_never_publishes_an_idle_plan` 覆盖 `surface_change_plan`
   （目标变化 ⇒ `Full`，尺寸不变保持原计划，无 renderer 时不造 `Full`）。
 - `render/windows/compositor.rs`：`grown_buffer` 高水位（1 条用例覆盖 corner / 反向 / 无需增长）；
-  `grow` 失败（无 composition target / 内容 > 16384）显式错误；`a_background_change_marks_the_layer_dirty_until_the_refresh`
-  覆盖 `set_background_color` → `refresh_background`（离屏无背景层时消费标记）；`resize_then_submit_keeps_the_capacity_contract`
-  变为离屏路径。
+  `the_rtv_heap_has_a_second_descriptor_for_the_background_layer`（descriptor 1 = 1×1 背景）、
+  `the_shrink_decision_only_returns_a_smaller_bucket`、`an_offscreen_renderer_never_shrinks_the_high_water_bucket`、
+  `a_background_refresh_never_touches_the_main_content_persist`（离屏 `background_persist=None`）、
+  `a_shrink_prime_copies_the_old_content_into_the_new_persist`；`grow` / `maybe_shrink` 失败显式错误；
+  `a_background_change_marks_the_layer_dirty_until_the_refresh` 覆盖背景标记消费；`resize_then_submit_keeps_the_capacity_contract`
+  仍走离屏路径。
 - `render/windows/swapchain.rs`：`composition_desc` 断言 `STRETCH` / `FLIP_SEQUENTIAL` / 3 /
   BGRA8 / IGNORE / waitable；首帧全量；全量帧只声明内容子矩形；dirty 矩形。
 - `platform/windows/event_loop.rs`：`WM_APP_COMPOSITION_WAKE` 不置帧唤醒位；缩放期间

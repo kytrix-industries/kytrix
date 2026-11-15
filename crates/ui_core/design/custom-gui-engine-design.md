@@ -554,8 +554,9 @@ pub enum EngineError {
   Wayland 会话或 compositor 缺少 `xdg_wm_base`，给出可读错误并退出，**不回退任何其他窗口系统**（I16）。
 - **device lost**：停止提交、走可读错误、保留 DRED / validation layer 输出；不尝试在同进程内重建设备。
 - **尺寸变化**：Windows 窗口目标（2026-11-15 起）是 DirectComposition 组合交换链，resize 只改
-  visual 几何与内容尺寸，不 `ResizeBuffers`；内容越过 grow-only buffer 时才整条换链并先 prime
-  （DEVIATIONS §36 F-199 / F-202）。离屏 / macOS / Linux 仍重建 persist / swapchain / depth，
+  visual 几何与内容尺寸，不 `ResizeBuffers`；内容越过 grow-only 高水位时才整条换链并先 prime，
+  内容静止 2 s 后缩回当前内容桶（先拷旧内容；DEVIATIONS §36 F-199 / F-202 / F-207）。离屏 /
+  macOS / Linux 仍重建 persist / swapchain / depth，
   但**不重建 `Geometry` VBO 与实例缓冲容量**，只更新 uniform 与 scissor —— 这是消除 17.5 ms/次
   改尺寸成本的关键。
 

@@ -7,9 +7,9 @@
 //! 四条实测硬约束（probe `caps.log` / `present.log` / `resize.log`）：
 //! ① `DXGI_SCALING_STRETCH` 是**唯一**可用的缩放模式（`SCALING_NONE` 创建即 `0x887A0001`）；
 //! ② 组合交换链在**第一次 `Present` 之后不能 `ResizeBuffers`**（`0x887A0001`），所以 buffer 是
-//!    grow-only 的桶（`platform/windows/composition.rs` 的 `buffer_size`）：内容越过它时整条
-//!    交换链被替换（`render/windows/compositor.rs` 的 `GpuRenderer::grow`），窗口 resize 本身
-//!    只改 visual 几何；
+//!    grow-only 高水位桶（`platform/windows/composition.rs` 的 `buffer_size`）：内容越过它时
+//!    整条交换链被替换（`render/windows/compositor.rs` 的 `GpuRenderer::grow`），内容静止 2 s
+//!    后 `maybe_shrink` 换到更小的当前内容桶（先拷旧内容）；窗口 resize 本身只改 visual 几何；
 //! ③ 创建后的**第一次 present 必须全量**（`DirtyRectsCount = 0`）；
 //! ④ dirty rect 必须非空且完全落在 buffer 内（越界 / 负坐标都是 `DXGI_ERROR_INVALID_CALL`）。
 //!
@@ -57,10 +57,11 @@ pub(crate) struct Swapchain {
 }
 
 impl Swapchain {
-    /// `buffer` 是这条交换链的尺寸（grow-only 桶，物理像素）。
+    /// `buffer` 是这条交换链的尺寸（高水位桶，物理像素）。
     ///
     /// 不能再 `ResizeBuffers`：内容越过 `buffer` 时调用方整条替换交换链（新的
-    /// [`Swapchain::for_composition`]），旧的在新 `SetContent` + `Commit` 之后丢弃。
+    /// [`Swapchain::for_composition`]）；内容静止 2 s 后缩容也会替换成更小的桶（先拷旧内容），
+    /// 旧链都在新 `SetContent` + `Commit` 之后丢弃。
     pub(crate) fn for_composition(queue: &Queue, buffer: (u32, u32)) -> Result<Self, EngineError> {
         let factory = create_factory()?;
         let desc = composition_desc(buffer);

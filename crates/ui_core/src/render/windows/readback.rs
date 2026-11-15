@@ -105,7 +105,7 @@ impl Readback {
                     SubresourceIndex: 0,
                 },
             };
-            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标是 grow-only buffer，
+            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标按高水位桶分配，
             // 内容只是左上角的子矩形），`pSrcBox = NULL` 会把整块源塞进更小的 footprint。
             let region = D3D12_BOX {
                 left: 0,

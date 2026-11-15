@@ -34,7 +34,7 @@
 | #      | 裁决                                                                                      | 被否掉的替代                                                                                           | 依据                                                      |
 |--------|-------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
 | **A1** | 公开 `event.rs`（`Event`/`InputEvent`…）+ 私有 `platform/`，翻译层是无 Win32 类型的纯函数 | 把 `Event` 放 `platform`（公开类型不可命名）；翻译写在 `wndproc` 里（不可单测）                        | I9 + 白名单 §1.3 + probe 全部消息可用 `SendMessageW` 合成 |
-| **A2** | ~~resize = `ResizeBuffers` + 重建 persist，**并先修 F-86 的 `ManuallyDrop` 泄漏**~~ **已被 2026-11-15 的 §36 取代**：窗口改为组合交换链（grow-only buffer，越界才换链 + prime） | 当时否掉：①重建整条 swapchain（probe 变体 26：`E_ACCESSDENIED`）；②接受 `0x887A0001` 当作环境限制（F-86 已证伪）。当前 `ResizeBuffers` 在 first present 后固定失败（S-149），整条换链正是现在的实现（F-199） | probe §2.7：修复后同尺寸/变尺寸都 `S_OK`（历史）；当前见 §36 |
+| **A2** | ~~resize = `ResizeBuffers` + 重建 persist，**并先修 F-86 的 `ManuallyDrop` 泄漏**~~ **已被 2026-11-15 的 §36 取代**：窗口改为组合交换链（高水位桶，越界才换链 + prime；静止 2 s 后缩容，F-207） | 当时否掉：①重建整条 swapchain（probe 变体 26：`E_ACCESSDENIED`）；②接受 `0x887A0001` 当作环境限制（F-86 已证伪）。当前 `ResizeBuffers` 在 first present 后固定失败（S-149），整条换链正是现在的实现（F-199） | probe §2.7：修复后同尺寸/变尺寸都 `S_OK`（历史）；当前见 §36 |
 | **A3** | P09 **用系统标题栏**（`WM_NCCALCSIZE` 交 `DefWindowProcW`）                               | 直接上自绘标题栏（要同时做 `WM_NCHITTEST`/拖拽/双击最大化，属 P12）                                    | probe §8：两种模式的客户区都已实测                        |
 | **A4** | 字符输入走 `TranslateMessage` + `WM_CHAR`，引擎不跑 `ToUnicodeEx`                         | 自己维护 dead-key pending 状态（多一套状态机 + 与 IME 竞争）                                           | probe §9/§14                                              |
 | **A5** | 唤醒合并（`AtomicBool` + 首次 post）+ 泵 `drain → 处理 → 阻塞`，`WM_QUIT` 显式识别        | 每次事件都 `PostMessageW`（10,000 上限）；`GetMessageW` 单条阻塞（会漏排队事件）                       | probe §2.2                                                |
@@ -171,8 +171,8 @@ crates/ui_core_demo/
 
 > **历史章节（2026-11-15 之后）**：本节解释 HWND flip swapchain 时代 `ResizeBuffers` 为什么
 > `0x887A0001`（COM 引用泄漏），以及 F-86 的修复。**当前窗口路径已不再调用 `ResizeBuffers`**：
-> 组合交换链在第一次 present 之后固定失败（DEVIATIONS §36 S-149），buffer 改为 grow-only +
-> 整条换链（§36 F-199 / F-202）。下面的泄漏事实仍是 `ManuallyDrop` 双层释放的契约，但不是当前
+> 组合交换链在第一次 present 之后固定失败（DEVIATIONS §36 S-149），buffer 改为 grow-only 高水位 +
+> 2 s 静止缩容（F-207），内容越过/回缩时才整条换链（§36 F-199 / F-202）。下面的泄漏事实仍是 `ManuallyDrop` 双层释放的契约，但不是当前
 > resize 失败的原因。
 
 `kg-p09-resize` 用 20 个变体（每变体独立进程）穷举，结论：
@@ -543,7 +543,7 @@ GPU 线程（下一帧）：set_content_size(physical)；buffer 内纯记账，�
 - `set_surface` 必须写在 `set_size` 之后：`set_size` 会先按 `size × scale` 重算 covering，`set_surface` 用真实客户区覆盖它；两者都标全量，不重复（F-194 之后平台真值写入后 `set_size` 不再覆盖）。
 - 最小化只丢弃 `SIZE_MINIMIZED` 的 `WM_SIZE`；其它 `WM_SIZE`（恢复 / 拖动）照常更新 size + surface。最小化期间 `WM_DPICHANGED` 的 `GetClientRect` 是 0×0（`client_size()` 钳成 1×1），此时用 `IsIconic` 跳过 `set_surface`；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖。DComp 几何 pass 在最小化时也跳过。
 - P09 同步管线里的 `fresh = renderer.surface() != physical` 已由 GPU 线程按 `async-render-pipeline.md` §6.4 取代；UI 线程不再算 `fresh`。Windows 的 `commit_frame` 用 `surface_change_plan` 把尺寸变化夹成 `Full`（`Plan::Idle` 会消费 waitable 而不 present）。
-- **没有 `ResizeBuffers`**：窗口是组合交换链（第一次 present 之后 resize 恒 `0x887A0001`，DEVIATIONS §36 S-149）；buffer 是 grow-only 高水位，内容越过它才整条换**内容**链并先 prime（§36 F-199 / F-202）。**内容 visual 恒 1:1、不随拖动缩放**：放大露出的右/下由独立 **1×1 背景交换链**填背景色，缩小时只裁掉右/下（§36 F-205 / S-152）。
+- **没有 `ResizeBuffers`**：窗口是组合交换链（第一次 present 之后 resize 恒 `0x887A0001`，DEVIATIONS §36 S-149）；buffer 是 grow-only 高水位，内容越过它才整条换**内容**链并先 prime，内容静止 2 s 后缩回当前桶（先拷旧内容，§36 F-199 / F-202 / F-207）。**内容 visual 恒 1:1、不随拖动缩放**：放大露出的右/下由独立 **1×1 背景交换链**填背景色，缩小时只裁掉右/下（§36 F-205 / S-152）。
 - **自绘边框缩放节奏**：`WM_MOUSEMOVE` 只记录最新光标，`SetWindowPos` 由 1 ms `WM_TIMER(RESIZE_TIMER_ID)` / 抬起 / 失去捕获合并到 ~60 Hz（§36 F-201），不再按 1000 Hz 鼠标风暴逐条 `WM_SIZE` + present。
 - **VBO / 实例缓冲不重建**：`InstanceBuffer` 容量跨帧保留，窗口 resize 只改 persist / back buffer 的可见内容范围（主设计 §5.5 / §9.3）。
 - 最小尺寸：`WM_GETMINMAXINFO` 拦住用户拖拽；`WM_SIZE` 里再 `clamp(320,200)` 一次（外部 `SetWindowPos` 会绕过

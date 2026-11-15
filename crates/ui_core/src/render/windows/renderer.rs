@@ -9,6 +9,7 @@
 //! queue_atlas_upload ─────► 图集槽              → 取「此刻最新」帧 + 图集槽
 //! poll() ◄──────────────── 反馈槽               → 内容尺寸变化则 set_content_size
 //!                                               （buffer 内纯 CPU；越过则 grow 重建交换链）
+//!                                               → 内容静止 2 s 且无待画帧 ⇒ maybe_shrink
 //!                                               → 槽 fence → 录制 → Execute → Signal
 //!                                               → Present1(1, dirty)
 //! WM_APP_COMPOSITION_WAKE ◄─ PostMessage       → 完成观测点：retire + 反馈 + presented 尺寸
@@ -39,12 +40,12 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smol_str::{SmolStr, format_smolstr};
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM},
+    Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM},
     System::Threading::{
         CreateEventW, GetCurrentThreadId, INFINITE, SetEvent, WaitForMultipleObjects,
     },
@@ -123,9 +124,11 @@ impl Renderer {
 
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-d3d12` 线程。
     ///
-    /// `composition` 与 `NativeWindow` 共享：内容交换链与 1×1 背景交换链在这里（GPU 线程启动
-    /// 之前、`ShowWindow` 之前）各自 prime 一帧背景色并挂到合成树上；此后 GPU 线程只在内容越过
-    /// buffer 时把内容 visual 切到新交换链（`GpuRenderer::grow`）、在背景色变化时换掉 1×1 背景层
+    /// `composition` 与 `NativeWindow` 共享：内容交换链与 1×1 背景交换链（各自 prime 到独立的
+    /// 持久目标）在这里（GPU 线程启动之前、`ShowWindow` 之前）各自 present 一帧背景色并挂到
+    /// 合成树上；此后 GPU 线程只在内容越过 buffer 时把内容 visual 切到新交换链
+    /// （`GpuRenderer::grow`）、在内容静止后把高水位缩回当前内容的桶
+    /// （`GpuRenderer::maybe_shrink`）、在背景色变化时换掉 1×1 背景层
     /// （`GpuRenderer::refresh_background`），其余 DComp 调用都在 UI 线程，互斥锁串行化。
     ///
     /// # Errors
@@ -818,9 +821,18 @@ fn run_gpu_loop(
             renderer.refresh_background()?;
         }
         if !shared.has_pending_frame() {
+            // 空闲且高水位还有缩小空间：内容静止满 `SHRINK_IDLE` 之后把 buffer 缩回当前内容的
+            // 桶（缩容 prime 拷贝旧内容，视觉切换那一帧没有背景闪）。缩容会 `wait_idle` 并重置
+            // 全部 in-flight 列表，先把已完成帧的反馈发布掉。
+            if renderer.shrink_due() {
+                drain_completed(renderer, shared, submitted);
+                renderer.maybe_shrink()?;
+                continue;
+            }
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
-            // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
-            wait_for_work_or_completion(shared)?;
+            // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。还有缩小空间时带一个
+            // 定时唤醒：静止窗口没有帧，否则永远醒不过来缩容；已经是最小桶时仍是无限等。
+            wait_for_work_or_completion(shared, renderer.shrink_in())?;
             continue;
         }
         // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
@@ -856,9 +868,15 @@ fn run_gpu_loop(
         }
         // 内容尺寸变化：buffer 内是纯 CPU 记账（内容 visual 恒 1:1；放大露出的区域由 1×1
         // 背景层填充，UI 只改内容 clip / 背景 scale）；
-        // 越过 grow-only buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
+        // 越过高水位 buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
         // 重建失败（含内容 > 16384）以粘性错误退出，不静默裁剪。
         renderer.set_content_size(request.surface)?;
+        // 这一帧的内容尺寸自上次变化起已静止 `SHRINK_IDLE` ⇒ 先缩回当前内容的桶、再录这一帧
+        // （缩容 prime 里旧内容已经就位，这一帧的 damage 照常画进新持久目标）。空闲路径上的
+        // 检查保证静止窗口也缩；这里保证持续出帧（HUD / 动画）时「总有一帧待画」不会饿死缩容。
+        if renderer.shrink_due() {
+            renderer.maybe_shrink()?;
+        }
         // 没有像素要画（Idle 且内容尺寸未变）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
         // 但 waitable 已经被消费：这样的帧不能走到这里（`window.rs` 在目标未重建时根本不发布
         // Idle 计划；内容尺寸变化必然伴随全量 damage），因此只作不变量断言。
@@ -926,8 +944,39 @@ fn drain_completed(
 }
 
 /// 空闲等待：`[work_event, completion_event]`（都是 auto-reset，不会自旋）。
-fn wait_for_work_or_completion(shared: &Shared) -> Result<(), EngineError> {
-    wait_for_pair(shared.work, shared.completion, "work, completion").map(|_| ())
+///
+/// `timeout` 只用于缩容的定时唤醒（内容静止满 `SHRINK_IDLE` 后醒一次再检查）；`None` = 无限等。
+/// 超时不是错误：回到循环顶部重新检查待画帧 / 缩容条件。
+fn wait_for_work_or_completion(
+    shared: &Shared,
+    timeout: Option<Duration>,
+) -> Result<(), EngineError> {
+    let millis = timeout.map(|timeout| {
+        u32::try_from(timeout.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1)
+    });
+    // SAFETY: 两个句柄都由 `Shared` 持有，生命周期覆盖本次等待；`timeout = None` ⇒ INFINITE。
+    let wait = unsafe {
+        WaitForMultipleObjects(
+            &[shared.work, shared.completion],
+            false,
+            millis.unwrap_or(INFINITE),
+        )
+    };
+    match wait {
+        WAIT_OBJECT_0 => Ok(()),
+        // `WaitForMultipleObjects` 的第二个对象 = completion。
+        wait if wait.0 == WAIT_OBJECT_0.0 + 1 => Ok(()),
+        // 缩容定时唤醒：不是错误，也不是待画帧。
+        WAIT_TIMEOUT => Ok(()),
+        _ => Err(EngineError::AppInit {
+            detail: format_smolstr!(
+                "WaitForMultipleObjects(work, completion) failed: {wait:?} ({})",
+                std::io::Error::last_os_error()
+            ),
+        }),
+    }
 }
 
 /// 等帧延迟 waitable；期间 completion 到达就先发布反馈、再继续等（不把反馈拖到下一帧）。

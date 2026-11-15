@@ -244,8 +244,9 @@ frame2: damage = (128,128,48,32)
 > `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`，第一次 present 之后
 > `ResizeBuffers` 在可见窗口上也恒 `0x887A0001`（`target/tmp/dcomp-probe/resize.log`，DEVIATIONS
 > §36 S-149）；buffer 改为 grow-only 高水位，内容越过 buffer 时整条换**内容**链并先 prime（§36
-> F-199 / F-202）。内容 visual 恒 1:1；窗口放大露出的右/下由独立的 **1×1 背景交换链**填背景色，
-> 缩小时只裁掉右/下（§36 F-205 / S-152）。下表与最小复现是 P08 的 HWND 时代记录，保留用于追溯。
+> F-199 / F-202）；内容静止 2 s 后 `maybe_shrink` 缩回当前内容桶（先拷旧内容，§36 F-207）。内容
+> visual 恒 1:1；窗口放大露出的右/下由独立的 **1×1 背景交换链**填背景色，缩小时只裁掉右/下
+> （§36 F-205 / S-152）。下表与最小复现是 P08 的 HWND 时代记录，保留用于追溯。
 
 | 场景                                                                                                                      | 结果                                                           |
 |---------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
@@ -697,7 +698,8 @@ pub(crate) struct Swapchain {
 }
 
 impl Swapchain {
-    /// `buffer` 是 grow-only 桶（内容 + 512 余量、256 对齐）；不再 `ResizeBuffers`。
+    /// `buffer` 是 grow-only 高水位桶（内容 + 512 余量、256 对齐）；不再 `ResizeBuffers`。
+    /// 内容静止 2 s 后 `maybe_shrink` 会换成更小的当前内容桶（先拷旧内容，DEVIATIONS §36 F-207）。
     pub(crate) fn for_composition(queue: &Queue, buffer: (u32, u32)) -> Result<Self, EngineError>;
     pub(crate) fn waitable(&self) -> HANDLE;
     pub(crate) fn raw(&self) -> &IDXGISwapChain1;   // IDCompositionVisual::SetContent 的输入
@@ -718,8 +720,9 @@ S-151）、**没有** `ResizeBuffers`（present 后固定失败，S-149）。
 
 窗口路径另有一条 **1×1** 背景交换链（同参数，`GpuRenderer.background_swapchain`）：它由
 `background_scale = (client_w, client_h)` 放大到客户区，颜色来自 persist 的 clear；改色时新建
-一条 1×1 链、prime、`SetContent + Commit`（DEVIATIONS §36 F-205 / S-152）。内容链与背景链在
-`new_for_composition` 里各自 prime 后才 attach；`grow` 只换内容链。
+一条 1×1 链、用**独立的 1×1 persist**（RTV descriptor 1）prime、`SetContent + Commit`
+（DEVIATIONS §36 F-206 / S-152）。内容链与背景链在 `new_for_composition` 里各自 prime 后才
+attach；`grow` 只换内容链（内容静止 2 s 后 `maybe_shrink` 缩回当前桶，F-207）。
 
 **历史（P08）结构**（保留用于追溯；不要照它实现）：
 
@@ -1006,7 +1009,7 @@ submit(index, buffer, plan, timings):
 |----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 资源格式             | `DXGI_FORMAT_B8G8R8A8_UNORM`；**RTV 视图格式 = `DXGI_FORMAT_B8G8R8A8_UNORM_SRGB`**（P07 §2.3 的唯一编码点；probe §2.3 实测 clear(0.5)→188）                                     |
 | 采样                 | `SampleDesc { Count: 1, Quality: 0 }`、`MipLevels 1`、`ArraySize 1`、`Flags = ALLOW_RENDER_TARGET`                                                                              |
-| 尺寸                 | 窗口路径 = grow-only buffer（内容 + 512 余量、256 对齐；DEVIATIONS §36 F-199）；离屏路径 = 请求的物理像素。绘制 / copy / present 只按**内容**子矩形，`fresh` 帧才覆盖整块 buffer |
+| 尺寸                 | 窗口路径 = grow-only 高水位 buffer（内容 + 512 余量、256 对齐；DEVIATIONS §36 F-199），内容静止 2 s 后缩回当前桶（F-207）；离屏路径 = 请求的物理像素。绘制 / copy / present 只按**内容**子矩形，`fresh` 帧才覆盖整块 buffer |
 | 内容权威             | **是**：damage 外的像素永远由它保持；back buffer 只是它的「本帧脏矩形切片」                                                                                                     |
 | 全帧帧               | 先 `ClearRenderTargetView(clear_color)` 再画（不清会留下上一帧的残影；damage 外的像素在这一帧本来就会被重画或清掉）；`fresh` 时 clear 整块 buffer，否则只保证内容子矩形 |
 | 局部帧               | 不 clear；scissor 内先画覆盖上一帧内容（premultiplied 混合需要正确底子 → 因为 persist 是完整的，直接画即正确）                                                                  |
