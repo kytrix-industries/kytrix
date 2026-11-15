@@ -34,8 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `WindowOptions.background` 默认 `Color::BLACK`（不透明），三平台都影响窗口底色（resize 期间新暴露
-区域；Windows 走 `SetBackgroundColor` 的 sRGB 字节，macOS 走 layer 背景色 + GPU clear，Linux 走
-Vulkan clear 的 linear 值）；其余字段可以用 `..WindowOptions::default()` 省略。
+区域），但范围不同：Windows 只填 DXGI 旧 back buffer 之外的客户区（`SetBackgroundColor` 的 sRGB
+字节），persist clear 仍是透明黑，帧内未覆盖像素不受它影响；macOS / Linux 还用于 persist clear 的
+未覆盖像素（macOS：layer 背景色 sRGB + GPU clear linear；Linux：Vulkan clear 的 linear 值）。
+其余字段可以用 `..WindowOptions::default()` 省略。
 
 ## 架构（模块与依赖方向）
 

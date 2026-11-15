@@ -110,11 +110,15 @@ pub struct WindowOptions {
     pub scale: Scale,
     /// 窗口背景色：resize 期间新暴露区域（旧 buffer / 旧 drawable 之外）的底色。
     ///
-    /// Windows：`DXGI_SCALING_NONE` 下客户区超出 back buffer 的部分由 `IDXGISwapChain1::
-    /// SetBackgroundColor` 填充（sRGB 编码字节）；macOS：`CAMetalLayer.backgroundColor`
-    /// （sRGB `CGColor`）+ persist 的 clear color（linear，Metal sRGB 渲染目标）；
-    /// Linux：Vulkan sRGB attachment 的 clear color（linear，`render::color::background_linear`），
-    /// 由 GPU 线程在录制前应用（旧 buffer 不会被缩放，clear 只填新布局里未被内容覆盖的像素）。
+    /// 平台差异：
+    /// - Windows：只填 DXGI 旧 back buffer **之外**的客户区（`DXGI_SCALING_NONE` 下由
+    ///   `IDXGISwapChain1::SetBackgroundColor` 填充，sRGB 编码字节）；persist 的 clear 仍是
+    ///   透明黑，帧内未被内容覆盖的像素不受它影响。
+    /// - macOS：既填旧 drawable **之外**的 `CAMetalLayer.backgroundColor`（sRGB `CGColor`），
+    ///   也用于 persist clear 的**未覆盖像素**（linear，Metal sRGB 渲染目标）。
+    /// - Linux：只用于 persist clear 的**未覆盖像素**（linear，Vulkan sRGB attachment，
+    ///   `render::color::background_linear`）；旧 buffer 不会被缩放，没有 Windows 的背景条中间态。
+    ///
     /// alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
     /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
     pub background: Color,
@@ -506,6 +510,10 @@ impl Window {
     }
 
     /// 逻辑尺寸变化（消费者：P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存。
+    ///
+    /// **警告**：本方法会先把 `surface` 重算为 `size × scale` 的 covering；活窗口改渲染目标必须
+    /// 由平台层调用 `set_surface` 写入真值，应用代码不应在活窗口上调用本方法来改客户区
+    /// （见 F-186 / V-122）。
     pub fn set_size(&mut self, size: Size) {
         self.options.size = size;
         self.full_damage_pending = true;
@@ -539,6 +547,10 @@ impl Window {
     /// **逻辑布局盒与 scale 无关**（I11：布局全用逻辑像素，物理化在 paint/P06），这里只保守地失效。
     ///
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
+    ///
+    /// **警告**：本方法会先把 `surface` 重算为 `size × scale` 的 covering；活窗口改渲染目标必须
+    /// 由平台层调用 `set_surface` 写入真值，应用代码不应在活窗口上调用本方法来改客户区
+    /// （见 F-186 / V-122）。
     pub fn set_scale(&mut self, scale: Scale) {
         self.scale = scale;
         self.scale_epoch = self.scale_epoch.wrapping_add(1);

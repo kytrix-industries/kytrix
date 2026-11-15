@@ -434,7 +434,7 @@ cargo test -p ui_core --features test-support --test snapshot
 | KDE / Sway 作为产品目标合成器 | 只验了 mutter（GNOME）与 sway（测试夹具） |
 | AT-SPI 真实读屏器联动 | 只验了树结构与 `do_action`，未接 Orca |
 | a11y 子节点顺序 | 引擎按 demo 建树顺序输出（① ④ ⑤ ⑥ ③ ②），与 Windows 一致；属应用侧布局，非 Linux 缺陷。**观察项**，未改动 |
-| `Wayland` 的 `wl_output` 整数 scale | 只走 `wp_fractional_scale_v1`；无该扩展的合成器回退路径未实机验证 |
+| `Wayland` 的 `wl_output` 整数 scale | 只走 `wp_fractional_scale_v1`；无该扩展的合成器回退路径**未实现**（V-110；当前只有 `wp_fractional_scale_v1`，无 viewporter 时无 destination / `buffer_scale` 回退） |
 | live resize：Mutter / KWin | 只跑了 headless sway 1.11 / wlroots 0.19；GNOME mutter 与 KWin 的 destination / configure 时序未验（V-122） |
 | live resize：真实指针拖拽 | 本轮用 `swaymsg resize set` 程序化 resize，没有构造真实指针拖动（`wtype` 只注入键盘）；拖动 / 缩放边缘的输入路径未验（V-122） |
 | `OUT_OF_DATE` / `vkQueuePresentKHR` 逐次计数 | 未逐次统计 present 返回值；soak 只有总数与 exit code（V-122） |

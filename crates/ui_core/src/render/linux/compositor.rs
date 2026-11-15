@@ -1040,9 +1040,10 @@ impl GpuRenderer {
 
 impl Drop for GpuRenderer {
     fn drop(&mut self) {
-        // 协议对象先于 `wl_surface` 销毁：renderer 在 `WaylandState` 之前 drop（`event_loop` 的
-        // 显式顺序），因此这里销毁 viewport 时 surface 仍然存活。请求发不出去（连接已断）也无害：
-        // wayland-client 的 destructor 忽略错误，服务端随连接关闭清理。
+        // 协议对象先于 `wl_surface` 销毁：正常路径下 renderer 在 `WaylandState` 之前 drop
+        // （`event_loop` 的显式顺序），因此这里销毁 viewport 时 surface 仍然存活。例外是 renderer
+        // 挂载后的 fallible setup 早退路径（V-122 ⑨，既有 P2-3，本轮不修）。请求发不出去
+        // （连接已断）也无害：wayland-client 的 destructor 忽略错误，服务端随连接关闭清理。
         if let Some(viewport) = self.viewport.take() {
             viewport.destroy();
         }

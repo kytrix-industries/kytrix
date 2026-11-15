@@ -520,9 +520,10 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
-    /// 窗口背景色（resize 期间新暴露区域的底色：Windows 客户区之外、macOS 旧 drawable 之外、
-    /// Linux 新 buffer 内未被内容覆盖的像素）。默认 `Color::BLACK`（**不是** `Color::default()`
-    /// 的透明）；三平台生效，编码分平台（Windows sRGB 字节 / macOS layer sRGB + clear linear /
+    /// 窗口背景色（resize 期间新暴露区域的底色）：Windows 客户区内、旧 back buffer 之外
+    /// （persist clear 仍透明黑）；macOS 旧 drawable 之外 + persist clear 的未覆盖像素；
+    /// Linux persist clear 的未覆盖像素。默认 `Color::BLACK`（**不是** `Color::default()` 的
+    /// 透明）；三平台生效，编码分平台（Windows sRGB 字节 / macOS layer sRGB + clear linear /
     /// Linux clear linear）。
     pub background: Color,
 }

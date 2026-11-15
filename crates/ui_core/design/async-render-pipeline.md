@@ -624,7 +624,7 @@ loop {
 }
 ```
 
-- **destination 与 buffer 的唯一配点**：`wp_viewport` 从 UI 线程移交后只由 GPU 线程使用；`set_destination` 写的是**逻辑尺寸**（`ceil(logical)`，至少 1 px），buffer 是 `round(logical × scale)`，两者按上面的顺序在同一次 present commit 里原子生效。没有 viewporter 时什么都不做（无 destination / `buffer_scale` 回退，V-122 P2-5）。`Drop` 时先 `viewport.destroy()`：renderer 在 `WaylandState` 之前 drop，销毁时 `wl_surface` 仍存活。
+- **destination 与 buffer 的唯一配点**：`wp_viewport` 从 UI 线程移交后只由 GPU 线程使用；`set_destination` 写的是**逻辑尺寸**（`ceil(logical)`，至少 1 px），buffer 是 `round(logical × scale)`，两者按上面的顺序在同一次 present commit 里原子生效。没有 viewporter 时什么都不做（无 destination / `buffer_scale` 回退，V-122 P2-5）。`Drop` 时先 `viewport.destroy()`：正常路径下 renderer 在 `WaylandState` 之前 drop，销毁时 `wl_surface` 仍存活（例外：renderer 挂载后的 fallible setup 早退路径，V-122 ⑨，既有 P2-3，本轮不修）。
 - **UI 线程不 commit `wl_surface`**：删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` 与 IME 两处 surface commit 后，`wl_surface.frame` 回调只由 present 触发，FrameGate 的「≤1 在飞」重新成立（D4）。`zwp_text_input_v3` 的状态在它自己的 `commit` 生效（v1 不需要 surface commit）。
 - **背景 clear**：persist 的 `clear_color` 是窗口背景色（`render/color.rs::background_linear`，按 **linear** 写 Vulkan sRGB attachment，S-143）；UI 线程只写 `Shared` 背景槽 + `wake`（并标 full damage），GPU 线程在空闲或取帧后应用（`wait_for_work` 把待应用色算工作）。下一次全量录制生效；**调用方需在之后触发一帧**（与 Windows 相同）；不引入 seed 帧（F-192）。
 
@@ -1047,6 +1047,10 @@ Windows / 硬件 D3D12 / 3840×2160 @125%，窗口 DPI=120，demo client 1200×9
 | 背景色契约 | `WindowOptions.background`（默认 BLACK、不透明、仅 Windows）+ `set_background_color`；GPU 线程两个应用点，下一次 `Present1` 生效（§6.3 / §6.7） |
 | 实测（125%） | 300×200 跳变：stale 帧 9.4–11.7 ms、卡片恒 725×220、条带 100% `(11,14,19)`（229 帧 / 3 次跳变）、首原生帧 42.3–46.0 ms、HUD lap 4687.5–4696.3；911 帧拖动 `stretch_w = 1.00000`、HUD lap 4707.5–4936.2（静止 4633.7，无下降）；200 次 resize（fails=0，4.58 s）后条带不变；缩小 1500×1125→1350×1000 首帧裁切、~33 ms 后回位；60.2 s soak Latency 1.88–13.23 ms、FPS 63.9/64.0/60.6；最小化 5 s 恢复像素差 0.067%；Esc 关窗 90 ms / exit 0 / stderr 0 字节；无 `0x887A0001`（§10.2 / §11） |
 | 未验证 | 150% / 175% 真实 DPI、最小化 + `WM_DPICHANGED` 组合、`ResizeBuffers` 是否保留背景色、`SetMaximumFrameLatency` 默认值文档口径、HUD FPS 与旧口径 58–60、隐藏窗口测试仍 `#[ignore]`、非 Windows `frame_rect` 0×0 仅编译检查（V-120） |
+
+> **注**：本节是 Windows 轮次的原记录（当时 macOS / Linux 未改）；后续轮次（macOS §15.10 /
+> Linux §15.11）已扩展，勿与 HEAD 当前行为混读。表中「仅 Windows」「非 Windows `frame_rect` 0×0」
+> 属于当时记录，正文保留。
 
 ### 15.10 第六轮闭环（macOS live resize：`kCAGravityBottomLeft` + 真实 backing + 背景色，2026-11-15）
 

@@ -1,4 +1,5 @@
-//! DPI：`wp_fractional_scale_v1`（120 分之几）+ 整数倍率回退（`design/phase-12-macos-linux.md` §8.4）。
+//! DPI：`wp_fractional_scale_v1`（120 分之几）；整数倍率回退未实现（V-110 / V-122，
+//! 见 `design/phase-12-macos-linux.md` §8.4）。
 
 use crate::{
     error::EngineError,
