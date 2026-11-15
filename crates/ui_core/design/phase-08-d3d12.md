@@ -243,8 +243,9 @@ frame2: damage = (128,128,48,32)
 > **当前设计（2026-11-15）**：Windows 窗口路径不再调用 `ResizeBuffers`。窗口是
 > `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`，第一次 present 之后
 > `ResizeBuffers` 在可见窗口上也恒 `0x887A0001`（`target/tmp/dcomp-probe/resize.log`，DEVIATIONS
-> §36 S-149）；buffer 改为 grow-only 高水位，内容越过 buffer 时整条换链并先 prime（§36 F-199 /
-> F-202，`async-render-pipeline.md` §6.4）。下表与最小复现是 P08 的 HWND 时代记录，保留用于追溯。
+> §36 S-149）；buffer 改为 grow-only 高水位，内容越过 buffer 时整条换**内容**链并先 prime（§36
+> F-199 / F-202）。内容 visual 恒 1:1；窗口放大露出的右/下由独立的 **1×1 背景交换链**填背景色，
+> 缩小时只裁掉右/下（§36 F-205 / S-152）。下表与最小复现是 P08 的 HWND 时代记录，保留用于追溯。
 
 | 场景                                                                                                                      | 结果                                                           |
 |---------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
@@ -714,6 +715,11 @@ Flags: FRAME_LATENCY_WAITABLE_OBJECT }`。创建后 `SetMaximumFrameLatency(1)`�
 会失败），再取 `GetFrameLatencyWaitableObject`。`SCALING_NONE` / 1 buffer / bitblt / sRGB / 0×0
 的创建全部失败 `0x887A0001`（probe `caps.log`，S-149）。**没有** `SetBackgroundColor`（惰性，
 S-151）、**没有** `ResizeBuffers`（present 后固定失败，S-149）。
+
+窗口路径另有一条 **1×1** 背景交换链（同参数，`GpuRenderer.background_swapchain`）：它由
+`background_scale = (client_w, client_h)` 放大到客户区，颜色来自 persist 的 clear；改色时新建
+一条 1×1 链、prime、`SetContent + Commit`（DEVIATIONS §36 F-205 / S-152）。内容链与背景链在
+`new_for_composition` 里各自 prime 后才 attach；`grow` 只换内容链。
 
 **历史（P08）结构**（保留用于追溯；不要照它实现）：
 

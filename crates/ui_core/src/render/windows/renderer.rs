@@ -16,8 +16,8 @@
 //!
 //! 反馈与 presented 尺寸都在**完成观测点**发布（fence 的 `SetEventOnCompletion` 唤醒），不是
 //! `Present1` 返回的时刻；retire 与反馈同一观测点推进（§4.1 / §6.5）。`presented` 尺寸变了才
-//! post 一次合成唤醒：UI 线程据此把 DirectComposition visual 的缩放置回 1:1（`poll` 每轮都会
-//! 重算几何，所以静止时不需要额外消息）。
+//! post 一次合成唤醒：UI 线程据此更新 DirectComposition 的内容裁剪 / 背景缩放（`poll` 每轮都会
+//! 重算几何，所以静止时不需要额外消息）。内容 visual 恒 1:1，永远不因 resize 被缩放。
 //!
 //! 三条硬约束：
 //! - **I1**：UI 线程只做「加锁拷贝 + `SetEvent`」，没有 fence wait / `Present`。
@@ -123,9 +123,10 @@ impl Renderer {
 
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-d3d12` 线程。
     ///
-    /// `composition` 与 `NativeWindow` 共享：visual 在这里（GPU 线程启动之前、`ShowWindow`
-    /// 之前）就挂上组合交换链并 present 首帧；此后 GPU 线程只在内容越过 buffer 时把 visual
-    /// 切到新交换链（`GpuRenderer::grow`），其余 DComp 调用都在 UI 线程，互斥锁串行化。
+    /// `composition` 与 `NativeWindow` 共享：内容交换链与 1×1 背景交换链在这里（GPU 线程启动
+    /// 之前、`ShowWindow` 之前）各自 prime 一帧背景色并挂到合成树上；此后 GPU 线程只在内容越过
+    /// buffer 时把内容 visual 切到新交换链（`GpuRenderer::grow`）、在背景色变化时换掉 1×1 背景层
+    /// （`GpuRenderer::refresh_background`），其余 DComp 调用都在 UI 线程，互斥锁串行化。
     ///
     /// # Errors
     /// 设备 / 组合交换链创建失败，或 GPU 线程无法启动（`AppInit` / `Composition` / `Swapchain`）。
@@ -210,10 +211,11 @@ impl Renderer {
         }
     }
 
-    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，clear color 在 GPU 线程的下一帧生效）。
+    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，clear color 与 1×1 背景层在 GPU 线程落地）。
     ///
     /// 组合交换链没有可用的 `SetBackgroundColor`：背景色是持久目标的 clear color（linear），
-    /// 与 macOS / Linux 同一条路径。离屏目标没有背景色（从不 present），是 no-op。
+    /// 与 macOS / Linux 同一条路径；Windows 另外用它重建独立背景层，拖动中露出的新区域立即
+    /// 是这个颜色（DEVIATIONS §36 F-203 / F-205）。离屏目标没有背景色（从不 present），是 no-op。
     pub(crate) fn set_background_color(&mut self, color: Color) {
         match &self.target {
             RenderTarget::Offscreen(_) => {}
@@ -809,9 +811,11 @@ fn run_gpu_loop(
         if shared.shutdown_requested() {
             return Ok(());
         }
-        // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
+        // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。背景色同时
+        // 落在 1×1 背景层上（`refresh_background`），所以不画内容也能立刻看到新底色。
         if let Some(rgba) = shared.take_background() {
             renderer.set_background_color(rgba);
+            renderer.refresh_background()?;
         }
         if !shared.has_pending_frame() {
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
@@ -840,15 +844,18 @@ fn run_gpu_loop(
         // 占用一个 ring 槽，未 drain 的帧的 timestamp 读回缓冲会被 prime 的录制覆盖
         // （`ResolveQueryData` 的写入与 CPU 读回共用同一块缓冲 → GPU 采样错帧）。
         drain_completed(renderer, shared, submitted);
-        // 等 waitable 期间到达的背景色：与帧一起落地（仍然是录制前，不引入新的 GPU 调用点）。
+        // 等 waitable 期间到达的背景色：与帧一起落地（在录制前换掉 1×1 背景层，不引入新的
+        // GPU 调用点）。
         if let Some(rgba) = shared.take_background() {
             renderer.set_background_color(rgba);
+            renderer.refresh_background()?;
         }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
         }
-        // 内容尺寸变化：buffer 内是纯 CPU 记账（visual 的拉伸由 UI 线程的 DComp 几何负责）；
+        // 内容尺寸变化：buffer 内是纯 CPU 记账（内容 visual 恒 1:1；放大露出的区域由 1×1
+        // 背景层填充，UI 只改内容 clip / 背景 scale）；
         // 越过 grow-only buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
         // 重建失败（含内容 > 16384）以粘性错误退出，不静默裁剪。
         renderer.set_content_size(request.surface)?;

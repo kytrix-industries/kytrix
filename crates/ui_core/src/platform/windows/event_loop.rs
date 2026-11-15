@@ -619,8 +619,9 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
             // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
             window.set_surface(client);
         }
-        // 首帧已经由 `new_for_hwnd` prime 并 present（客户区在第一次 present 之前完全透明），
-        // 这里把 visual 的几何对齐成「内容 = 客户区」的 1:1 状态，再显示窗口。
+        // 首帧已经由 `new_for_hwnd` prime 并 present（内容层与背景层都已 attach；客户区在第一次
+        // present 之前完全透明），这里把几何对齐成「内容 = 客户区」（内容 1:1、背景层铺满），
+        // 再显示窗口。
         {
             let target = native.composition();
             let mut target = composition::lock(&target);
@@ -687,10 +688,11 @@ fn pump_loop(
         app.poll_renderers()?;
 
         // ②b′ DirectComposition 几何：内容尺寸 = 最近一次**完成 present** 的尺寸，客户区 = 当前
-        // 客户区。拖动中两者不等 ⇒ visual 拉伸上一帧内容；静止时相等 ⇒ 1:1。GPU 线程在每帧完成
-        // 后 post `WM_APP_COMPOSITION_WAKE`（只唤醒、不请求帧），所以「最后一帧」的 1:1 也会在
-        // 下一次泵迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，
-        // 不逐条 `Commit`（P1-2a）。
+        // 客户区。内容 visual 恒 1:1：拖动中旧内容保持左上角，露出的新区域由背景层填充；静止时
+        // 内容 = 客户区，背景层被完全盖住。GPU 线程在每帧完成后 post
+        // `WM_APP_COMPOSITION_WAKE`（只唤醒、不请求帧），所以「最后一帧」的几何也会在下一次泵
+        // 迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，不逐条
+        // `Commit`（P1-2a）。
         for native in windows.iter_mut() {
             // 最小化时 `GetClientRect` 是 0×0（会钳成 1×1）：不要拿它当几何。
             if native.is_minimized() {

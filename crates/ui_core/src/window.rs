@@ -108,17 +108,17 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
-    /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear），窗口 resize 时的拉伸由平台负责。
+    /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear；Windows 另有独立背景层）。
     ///
     /// 平台差异：
-    /// - Windows：persist clear 的**未覆盖像素**（linear，与 macOS/Linux 同一条路径）。
-    ///   DirectComposition 的组合交换链**没有**可用的 `SetBackgroundColor`（probe 实测返回 OK
-    ///   但惰性），客户区完全由 visual 合成，因此不存在「旧 buffer 之外的新客户区」这种中间态：
-    ///   拉伸中的像素来自上一帧内容。
+    /// - Windows：persist clear 的**未覆盖像素**（linear，与 macOS/Linux 同一条路径），也是
+    ///   独立 1×1 背景层的颜色（DirectComposition 的组合交换链**没有**可用的
+    ///   `SetBackgroundColor`，probe 实测返回 OK 但惰性）。窗口放大时露出的新区域就是这个
+    ///   背景层；旧内容保持 1:1，不会被拉伸（DEVIATIONS §36 F-205 / S-152）。
     /// - macOS：既填旧 drawable **之外**的 `CAMetalLayer.backgroundColor`（sRGB `CGColor`），
     ///   也用于 persist clear 的**未覆盖像素**（linear，`render::color::background_linear`）。
     /// - Linux：只用于 persist clear 的**未覆盖像素**（linear，Vulkan sRGB attachment，
-    ///   `render::color::background_linear`）；旧 buffer 不会被缩放，没有 Windows 的背景条中间态。
+    ///   `render::color::background_linear`）；旧 buffer 不会被缩放，规则与 Windows 的背景层一致。
     ///
     /// alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
     /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
@@ -492,9 +492,10 @@ impl Window {
 
     /// 改窗口背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给平台层。
     ///
-    /// Windows 上值变化会标全量重绘：组合交换链没有可用的 `SetBackgroundColor`，新颜色只作为
-    /// persist 的 clear color（linear）生效，因此必须有下一帧（平台事件 / 主题重绘 / 动画 /
-    /// HUD tick 均可）。GPU 侧在空闲或下一帧录制前取走它；UI 线程只写共享槽并唤醒（I1）。
+    /// Windows 上值变化会标全量重绘：组合交换链没有可用的 `SetBackgroundColor`，新颜色既作为
+    /// persist 的 clear color（linear），也重建独立的 **1×1 背景层**（`refresh_background`）。
+    /// GPU 线程在**空闲等待前**或下一次取帧录制前应用，因此不要求提交内容帧；UI 线程只写共享槽
+    /// 并唤醒（I1）。
     ///
     /// macOS 上值变化同样标全量重绘：`CAMetalLayer.backgroundColor` 立刻在主线程写，persist 的
     /// clear color 经共享槽交给 GPU 线程（同样在空闲或下一帧录制前应用）。
@@ -857,8 +858,9 @@ impl Window {
 
     /// 最近一次**完成 present** 的内容尺寸（物理像素）。
     ///
-    /// Windows 的 DirectComposition 几何用它：交换链里实际有内容的区域就是这个尺寸，visual 的
-    /// 裁剪框按它设置，再按当前客户区缩放 —— 拖动中拉伸上一帧，静止时 1:1。
+    /// Windows 的 DirectComposition 几何用它：交换链里实际有内容的区域就是这个尺寸，内容
+    /// visual 的 clip 按它设置（**不缩放**，恒 1:1）；客户区只决定背景层的缩放
+    /// （DEVIATIONS §36 F-205 / S-152）。
     ///
     /// 没有渲染器（headless / 平台尚未 attach）时等于本帧目标尺寸：没有「已呈现内容」可言。
     #[cfg(windows)]

@@ -535,14 +535,15 @@ WM_SIZE(w, l):
   window.set_size(logical)                                 // 标根 LAYOUT + full_damage_pending
   window.set_surface(physical)                             // 真实渲染目标（F-186；值变化标全量）
   dispatcher.wake()                                        // 内容尺寸随下一帧 FrameRequest.surface 过线
-泵的 ②b′（每轮）：按 Window::presented_surface() + client_size() 重设 DComp visual 的 scale/clip
+泵的 ②b′（每轮）：按 Window::presented_surface() + client_size() 重设内容 clip 与背景 scale
 GPU 线程（下一帧）：set_content_size(physical)；buffer 内纯记账，越界才 grow（先 prime 再 SetContent）
+背景色变化：GPU 线程空闲 / 取帧前 refresh_background（换新 1×1 背景链 + prime + SetContent）
 ```
 
 - `set_surface` 必须写在 `set_size` 之后：`set_size` 会先按 `size × scale` 重算 covering，`set_surface` 用真实客户区覆盖它；两者都标全量，不重复（F-194 之后平台真值写入后 `set_size` 不再覆盖）。
 - 最小化只丢弃 `SIZE_MINIMIZED` 的 `WM_SIZE`；其它 `WM_SIZE`（恢复 / 拖动）照常更新 size + surface。最小化期间 `WM_DPICHANGED` 的 `GetClientRect` 是 0×0（`client_size()` 钳成 1×1），此时用 `IsIconic` 跳过 `set_surface`；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖。DComp 几何 pass 在最小化时也跳过。
 - P09 同步管线里的 `fresh = renderer.surface() != physical` 已由 GPU 线程按 `async-render-pipeline.md` §6.4 取代；UI 线程不再算 `fresh`。Windows 的 `commit_frame` 用 `surface_change_plan` 把尺寸变化夹成 `Full`（`Plan::Idle` 会消费 waitable 而不 present）。
-- **没有 `ResizeBuffers`**：窗口是组合交换链（第一次 present 之后 resize 恒 `0x887A0001`，DEVIATIONS §36 S-149）；buffer 是 grow-only 高水位，内容越过它才整条换链并先 prime（§36 F-199 / F-202）。拖动中的视觉拉伸由 UI 线程的 DComp 几何负责。
+- **没有 `ResizeBuffers`**：窗口是组合交换链（第一次 present 之后 resize 恒 `0x887A0001`，DEVIATIONS §36 S-149）；buffer 是 grow-only 高水位，内容越过它才整条换**内容**链并先 prime（§36 F-199 / F-202）。**内容 visual 恒 1:1、不随拖动缩放**：放大露出的右/下由独立 **1×1 背景交换链**填背景色，缩小时只裁掉右/下（§36 F-205 / S-152）。
 - **自绘边框缩放节奏**：`WM_MOUSEMOVE` 只记录最新光标，`SetWindowPos` 由 1 ms `WM_TIMER(RESIZE_TIMER_ID)` / 抬起 / 失去捕获合并到 ~60 Hz（§36 F-201），不再按 1000 Hz 鼠标风暴逐条 `WM_SIZE` + present。
 - **VBO / 实例缓冲不重建**：`InstanceBuffer` 容量跨帧保留，窗口 resize 只改 persist / back buffer 的可见内容范围（主设计 §5.5 / §9.3）。
 - 最小尺寸：`WM_GETMINMAXINFO` 拦住用户拖拽；`WM_SIZE` 里再 `clamp(320,200)` 一次（外部 `SetWindowPos` 会绕过

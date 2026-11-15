@@ -11,8 +11,13 @@
 //! 子矩形，只有资源创建与 clear 用 buffer。窗口 resize 因此不需要任何 GPU 等待或资源重建；
 //! 只有内容**越过** buffer 时才走 [`GpuRenderer::grow`]：等 idle → 新建持久目标 + 交换链 →
 //! prime 新交换链一帧背景色（等 GPU fence）→ 把 visual 切过去并 `Commit` → 丢弃旧对象
-//! （越过边界时会闪一帧背景，见 `grow` 的注释）。visual 的拉伸由 UI 线程的 DirectComposition
-//! 几何负责（`platform/windows/composition.rs`）。
+//! （越过边界时会闪一帧背景，见 `grow` 的注释）。内容 visual 恒 1:1（不随 resize 缩放）；
+//! UI 线程只更新内容裁剪与背景层缩放（`platform/windows/composition.rs`）。
+//!
+//! 窗口路径另有**一条 1×1 的组合交换链**作为背景层（`background_swapchain`）：它被 prime 成
+//! 窗口背景色，由 DComp 的 scale 变换铺满客户区，所以窗口放大时露出的新区域是背景色，而不是
+//! 桌面、也不是被拉伸的旧内容（Chrome 语义）。背景色变化时用
+//! [`GpuRenderer::refresh_background`] 换一条新的 1×1 交换链（1×1，代价可忽略）。
 //!
 //! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程独占**
 //! 的对象（device / queue / swapchain / persist / upload / retire / 计时），构造发生在窗口创建时
@@ -104,10 +109,19 @@ pub(crate) struct GpuRenderer {
     timer: Option<GpuTimer>,
     /// 组合交换链（窗口路径）；内容越过 buffer 时整条替换（`grow`）。
     swapchain: Option<Swapchain>,
-    /// 合成目标（窗口路径）：GPU 线程在 `grow` 时把 visual 切到新交换链。
+    /// 背景层（窗口路径）：**1×1** 的组合交换链，内容恒为窗口背景色（`clear_color`）。
+    ///
+    /// DComp 把它按客户区缩放后铺满内容之外的区域；背景色变化时整条替换
+    /// （[`GpuRenderer::refresh_background`]），内容交换链与内容尺寸都不受影响。
+    background_swapchain: Option<Swapchain>,
+    /// 背景色已改、背景层还没重建（由 [`GpuRenderer::set_background_color`] 置位，
+    /// [`GpuRenderer::refresh_background`] 消费）。
+    background_dirty: bool,
+    /// 合成目标（窗口路径）：GPU 线程在 `grow` 时把内容 visual 切到新交换链。
     ///
     /// 与 `NativeWindow` 共享（`Arc<Mutex<_>>`）：所有 DComp 调用由互斥锁串行化，GPU 线程只在
-    /// `grow` 里持锁做一次 `SetContent` + `Commit`（见 `platform/windows/composition.rs`）。
+    /// `grow` / `refresh_background` 里持锁做一次 `SetContent` + `Commit`（见
+    /// `platform/windows/composition.rs`）。
     composition: Option<Arc<Mutex<Composition>>>,
     rtv_heap: ID3D12DescriptorHeap,
     clear_color: [f32; 4],
@@ -183,10 +197,12 @@ impl GpuRenderer {
     /// 对齐），此后窗口 resize 只改内容尺寸（[`GpuRenderer::set_content_size`]），只有内容越过
     /// buffer 时才重建资源（[`GpuRenderer::grow`]）。
     ///
-    /// 本方法在 UI 线程、GPU 线程启动之前运行。顺序（P1-B）：先创建交换链并 prime 一帧背景色
-    /// （第一次 present，必须全量；客户区在第一次 present 之前是**完全透明**的，probe
-    /// `dpi.log` 03/04），**再**把它挂到 [`Composition`] 的 visual 上并 `Commit`。已 attach 但
-    /// 从未 present 的交换链在合成器里是透明的，反过来做会让 `ShowWindow` 之前的一帧露出桌面。
+    /// 本方法在 UI 线程、GPU 线程启动之前运行。顺序（P1-B）：先创建主交换链与 **1×1 背景
+    /// 交换链**并各 prime 一帧背景色（第一次 present，必须全量；客户区在第一次 present 之前是
+    /// **完全透明**的，probe `dpi.log` 03/04），**再**把两者挂到 [`Composition`] 的 visual 上并
+    /// `Commit`。已 attach 但从未 present 的交换链在合成器里是透明的，反过来做会让 `ShowWindow`
+    /// 之前的一帧露出桌面。背景层先 prime、内容层后 prime：两者用同一个 clear color，顺序不影响
+    /// 首次可见像素，这里只是保持「内容最后」的既有次序。
     pub(crate) fn new_for_composition(
         composition: Arc<Mutex<Composition>>,
         content: (u32, u32),
@@ -201,14 +217,19 @@ impl GpuRenderer {
         )?;
         renderer.clear_color = background;
         let mut swapchain = Swapchain::for_composition(&renderer.queue, buffer)?;
-        // prime 用显式的 swapchain / buffer / content；此刻 visual 还没有任何内容。
+        // 背景层是 1×1 的纯色交换链，由 UI 线程的 DComp scale 变换铺满客户区。
+        let mut background_swapchain = Swapchain::for_composition(&renderer.queue, (1, 1))?;
+        // prime 用显式的 swapchain / buffer / content；此刻两条 visual 都还没有内容。
+        renderer.prime_detached(&mut background_swapchain, (1, 1), (1, 1))?;
         renderer.prime_detached(&mut swapchain, buffer, content)?;
         {
             let target = composition::lock(&composition);
+            target.set_background_content(background_swapchain.raw())?;
             target.set_content(swapchain.raw())?;
             target.commit()?;
         }
         renderer.swapchain = Some(swapchain);
+        renderer.background_swapchain = Some(background_swapchain);
         renderer.surface = content;
         // prime 已经做过新交换链的第一次 present，后续帧不再是 `fresh`。
         renderer.fresh = false;
@@ -253,6 +274,8 @@ impl GpuRenderer {
             geometry: GeometryRegistry::new(),
             timer,
             swapchain: None,
+            background_swapchain: None,
+            background_dirty: false,
             composition: None,
             rtv_heap,
             clear_color: [0.0, 0.0, 0.0, 0.0],
@@ -367,9 +390,9 @@ impl GpuRenderer {
     ///    句柄按最后一帧序号进 retire 队列）。
     /// 5. `fresh = false`（prime 已经做了新交换链的第一次全量 present），下一帧按内容子矩形 copy。
     ///
-    /// 代价：越过 buffer 边界的那一帧只呈现背景色（在 UI 线程把几何收回 1:1 之前会看到一帧纯
-    /// 背景，而不是桌面或未定义像素）。这是「第一次 present 之后不能 `ResizeBuffers`」的必然
-    /// 结果，比整窗黑一帧好。
+    /// 代价：越过 buffer 边界的那一帧只呈现背景色（在 UI 线程把内容 clip 更新到新尺寸之前会
+    /// 看到一帧纯背景，而不是桌面或未定义像素）。这是「第一次 present 之后不能 `ResizeBuffers`」
+    /// 的必然结果，比整窗黑一帧好。内容 visual 始终 1:1，`grow` 不改变它的缩放。
     fn grow(&mut self, content: (u32, u32)) -> Result<(), EngineError> {
         // grow-only 高水位：新桶 = 逐轴取「按内容算出的桶」与「当前 buffer」的最大值（见
         // [grown_buffer]）。上限检查在 max 之后：`buffer_size` 已经拒绝 > 16384 的内容，
@@ -453,26 +476,65 @@ impl GpuRenderer {
 
     /// 改窗口背景色（GPU 线程；离屏目标不使用它）。
     ///
-    /// 组合交换链没有可用的 `SetBackgroundColor`（probe：返回 OK 但惰性），背景色是持久目标的
-    /// clear color（linear，`render::color::background_linear`）：下一次 `Plan::Full` 的 clear
-    /// 生效。窗口的 `set_background_color` 已经标了全量 damage，这里**不**碰 `fresh`（那会让
-    /// 整块 buffer 全量 copy + present）。
+    /// 组合交换链没有可用的 `SetBackgroundColor`（probe：返回 OK 但惰性），背景色只作为持久
+    /// 目标的 clear color（linear，`render::color::background_linear`）和背景层的 prime 颜色：
+    /// 下一次 `Plan::Full` 的 clear 生效，背景层由 [`GpuRenderer::refresh_background`] 重建。
+    /// 窗口的 `set_background_color` 已经标了全量 damage，这里**不**碰 `fresh`（那会让整块
+    /// buffer 全量 copy + present）。
     pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) {
         debug_assert!(
             self.swapchain.is_none() || on_gpu_thread(),
             "window background changes may only run on the kytrix-d3d12 thread"
         );
         self.clear_color = rgba;
+        self.background_dirty = true;
+    }
+
+    /// 把新的背景色落到独立的 **1×1 背景层**（GPU 线程；颜色没变是 no-op）。
+    ///
+    /// 背景层是单独一条交换链，已经挂到 visual 上的内容不会因为 `clear_color` 改变而变化，
+    /// 所以换色必须：新建一条 1×1 组合交换链 → prime 新背景色（全量 + 等 GPU fence）→
+    /// `SetContent` + `Commit` → 丢弃旧交换链。顺序与 `grow` 相同（prime 先于 attach，P1-B）。
+    /// 1×1 纹理 + 一次 1×1 copy，代价可忽略；即使当前没有内容帧，背景色也会立刻生效。
+    ///
+    /// 离屏目标没有合成树：只留下新的 `clear_color`，标记直接消费掉。
+    pub(crate) fn refresh_background(&mut self) -> Result<(), EngineError> {
+        if !self.background_dirty {
+            return Ok(());
+        }
+        let Some(composition) = self.composition.clone() else {
+            self.background_dirty = false;
+            return Ok(());
+        };
+        debug_assert!(
+            on_gpu_thread(),
+            "background layers may only be replaced on the kytrix-d3d12 thread"
+        );
+        let mut swapchain = Swapchain::for_composition(&self.queue, (1, 1))?;
+        self.prime_detached(&mut swapchain, (1, 1), (1, 1))?;
+        {
+            let target = composition::lock(&composition);
+            target.set_background_content(swapchain.raw())?;
+            target.commit()?;
+        }
+        // 视觉切换之后才丢弃旧背景交换链（DWM 可能仍引用它到本次 `Commit` 之后）。
+        let _old_background = self.background_swapchain.replace(swapchain);
+        self.background_dirty = false;
+        Ok(())
     }
 
     /// 把一帧背景色 prime 进 `swapchain`（全量 clear + 等 GPU fence），**不碰 visual**。
     ///
     /// 用于新交换链的第一次 present：组合交换链的第一次 present 必须是全量
     /// （`DirtyRectsCount = 0`），而 `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前
-    /// 完全透明。`grow` 必须在 `SetContent` **之前**调用本方法：已 attach 但从未 present 的
-    /// 交换链在合成器里是透明的，若先 `SetContent` + `Commit` 再 prime，中间一次 DWM 合成就会
-    /// 露出桌面（P1-B）。这里用显式的 `swapchain` / `buffer` / `content`，而不是
+    /// 完全透明。`grow` / `refresh_background` 必须在 `SetContent` **之前**调用本方法：已 attach
+    /// 但从未 present 的交换链在合成器里是透明的，若先 `SetContent` + `Commit` 再 prime，中间
+    /// 一次 DWM 合成就会露出桌面（P1-B）。这里用显式的 `swapchain` / `buffer` / `content`，而不是
     /// `self.swapchain`（它可能还是旧的）。
+    ///
+    /// 背景层的 1×1 交换链也走这里（`buffer = content = (1, 1)`）：prime 会先把持久目标整块
+    /// clear 成 `clear_color`，再 copy 左上角 1×1 —— 拷到的必然是背景色；持久目标本身会在下一个
+    /// 全量帧重画（`Window::set_background_color` 已经标了全量 damage）。
     ///
     /// `sync = 0`：prime 不是用户可见帧，不值得等 vsync —— 但**必须**等这一帧的队列 fence
     /// （P2-1）：`Present1` 返回只是 CPU 侧入队，`ShowWindow` / 后续帧的 waitable 之前必须有
@@ -490,6 +552,10 @@ impl GpuRenderer {
         let payload = FramePayload::empty();
         let mut frame = FramePlan::new(Plan::Full, true);
         let mut timings = FrameTimings::new();
+        // prime 不是内容帧：不要让它把 `last_index`（retire 的 tag）推回 `FrameIndex::default()`。
+        // `grow` 已经在 prime 之前取好 `retired_index`；背景层刷新则发生在帧之间，两者都不该
+        // 改变「最后一次内容帧」的记账。
+        let last_index = self.last_index;
         self.submit_recorded(
             slot,
             FrameIndex::default(),
@@ -502,6 +568,7 @@ impl GpuRenderer {
                 content,
             },
         )?;
+        self.last_index = last_index;
         swapchain
             .present1(&mut frame, 0, content)
             .map_err(|error| self.classify(error))?;
@@ -877,9 +944,9 @@ impl FrameRecorder<'_> {
                 self.atlas.record_uploads(self.device, list, slot.index)?;
             }
             if full {
-                // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把几何收回
-                // 1:1 之前，visual 的 clip 可能仍指向旧内容（P1-A 保证它 ≤ 新 buffer），只有整块
-                // 背景色能保证那一帧既不是桌面、也不是未定义像素（P1-B）。
+                // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把内容 clip
+                // 更新到新尺寸之前，visual 的 clip 可能仍指向旧内容（P1-A 保证它 ≤ 新 buffer），
+                // 只有整块背景色能保证那一帧既不是桌面、也不是未定义像素（P1-B）。
                 // 普通全量帧只清内容矩形：buffer 的其余部分永远不可见（copy / present dirty 都
                 // 夹在内容子矩形内），省掉大 buffer 的全量 clear 带宽。
                 let content_rect = [RECT {
@@ -1712,6 +1779,29 @@ mod tests {
         // probe：persist 资源 UNORM + RTV 视图 SRGB ⇒ clear(0.5) 的 RGB 只编码一次 = 188；
         // alpha 不参与 sRGB 变换（0.5 → 128）。
         assert_eq!(pixel(&image, 8, 4, 4), [188, 188, 188, 128]);
+    }
+
+    /// 背景色改动只标脏；离屏目标没有背景层，`refresh_background` 必须消费标记（不能永真）。
+    #[test]
+    fn a_background_change_marks_the_layer_dirty_until_the_refresh() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((16, 16)) else {
+            return;
+        };
+        assert!(!renderer.background_dirty);
+        renderer.set_background_color([0.1, 0.2, 0.3, 1.0]);
+        assert!(renderer.background_dirty, "改色必须请求背景层重建");
+        renderer
+            .refresh_background()
+            .expect("an offscreen renderer has no background layer to rebuild");
+        assert!(
+            !renderer.background_dirty,
+            "没有背景层的目标也必须消费标记，否则每帧都会尝试重建"
+        );
+        // 同值 no-op：没有新改动时 refresh 不产生任何工作。
+        renderer
+            .refresh_background()
+            .expect("a clean background layer is a no-op");
     }
 
     #[test]

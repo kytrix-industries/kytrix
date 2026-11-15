@@ -2498,7 +2498,7 @@ S-143 / S-144）。设计落点见
 > `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition 组合交换链（不再 `ResizeBuffers`、不再有
 > `SetBackgroundColor` 背景条），本节的机制描述只用于追溯；**当前行为以 §36 为准**。其中
 > `SetMaximumFrameLatency(1)`（F-185）与 `Window.surface = 真实客户区`（F-186）仍然成立，但
-> surface 的语义已扩展成「内容尺寸 / 已 present 尺寸」两份（§36 F-200）。
+> surface 的语义已扩展成「内容尺寸 / 已 present 尺寸」两份（§36 F-205）。
 
 | 编号 | 条目 | 内容 |
 |------|------|------|
@@ -2691,57 +2691,68 @@ Windows 窗口此前是 `CreateSwapChainForHwnd` 的 HWND flip swapchain：`DXGI
    线程重建；而组合交换链在第一次 present 之后根本不能 `ResizeBuffers`（S-149），HWND 路径的
    「resize 后 1–2 帧追平」是这条路线的上限。
 
-本轮把窗口改为 `WS_EX_NOREDIRECTIONBITMAP` + **DirectComposition 组合交换链**：DWM 直接按新
-客户区拉伸 visual 里的上一帧，UI 线程一次 `SetScale` + `Commit` 就让内容贴住窗口边缘；GPU 线程
-只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 桶，`ResizeBuffers` 不再出现在窗口路径。
+本轮把窗口改为 `WS_EX_NOREDIRECTIONBITMAP` + **DirectComposition 组合交换链**：客户区由视觉树合成，
+GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 桶，`ResizeBuffers` 不再出现在窗口路径。
 设计落点见 [`async-render-pipeline.md`](async-render-pipeline.md) §4.4 / §6.2 / §6.3 / §6.4 /
 §6.7 / §15.14；probe 证据 `target/tmp/dcomp-probe/{caps,dpi,present,resize}.log`，实机证据
-`target/tmp/verify-dcomp/REPORT.md`、`REPORT2.md` 与 `fin-*` / `fix-*`。
+`target/tmp/verify-dcomp/REPORT.md`、`REPORT2.md`、`REPORT3.md` 与 `fin-*` / `fix-*` / `ns-*`。
+
+> **2026-11-15 修正（F-205 / S-152 / V-131）**：第一版把内容 visual 按 `scale = client / content`
+> 拉伸上一帧铺满客户区；真实拖动后用户指出这正是产品要消除的拉伸 / 回弹（HUD 变宽、文字发虚）。
+> 现改为 Chrome / Zed 式 **内容 visual 恒 1:1 + 独立 1×1 背景层**：内容只 clip 到自己的尺寸，
+> 拖大时露出的新区域由背景层填 `(11,14,19)`，缩小时只裁掉右/下。F-200 / S-148 的
+> `scale = client/content` 只保留为第一版历史；当前行为以 **F-205 / S-152** 为准，实测见
+> **V-131** 与 36.5（`REPORT3.md`）。
 
 ### 36.2 决策
 
 | 编号 | 条目 | 内容 |
 |------|------|------|
-| **F-199** | **窗口 = 组合交换链 + grow-only buffer 桶** | 窗口加 `WS_EX_NOREDIRECTIONBITMAP`（`platform/windows/window.rs:93-100`），客户区不再有系统重定向表面；`CreateSwapChainForComposition`（`render/windows/swapchain.rs:64-95`）创建 **`DXGI_SCALING_STRETCH`** + `FLIP_SEQUENTIAL` + 3 buffers + `B8G8R8A8_UNORM` + `ALPHA_MODE_IGNORE` + `FRAME_LATENCY_WAITABLE_OBJECT`，经 `IDCompositionVisual::SetContent` 挂到 visual。`ResizeBuffers` 在第一次 present 后恒失败（S-149），所以 buffer 是 **grow-only 高水位**：`buffer_size(content) = min(round_up_256(content + 512), 16384)`（`platform/windows/composition.rs:266-301`），GPU 侧 `grown_buffer` 再与当前 buffer **逐轴取大**（`render/windows/compositor.rs:790-799`）；内容仍在 buffer 内时 `set_content_size` 只是 CPU 记账（`:340-355`），越界才 `grow` 重建 persist + 交换链（`:357-419`）。`GpuRenderer.surface` 是**当前内容**尺寸，`buffer` 才是桶。上限 16384 显式 `EngineError::Swapchain`，不静默裁剪；**每窗口 VRAM 是历史最大桶（grow-only，默认不缩小）**。 |
-| **F-200** | **visual 几何：物理像素 + scale/clip** | visual 的单位是**物理像素**（与 DPI 无关），没有 1/dpi 因子。`visual_geometry(content, client)`（`platform/windows/composition.rs:250-264`）= `scale = (client_w / content_w, client_h / content_h)`、`clip = (0, 0, content_w, content_h)`（**内容坐标**，clip 会被 visual 的 scale 变换，所以放大 / 缩小都恰好盖住客户区）。静止时 content == client ⇒ `scale = (1, 1)` + 1:1 清晰；拖动中 content 是上一帧内容 ⇒ 拉伸 / 压缩上一帧铺满客户区。UI 线程在泵的 **②b′** 每轮按「最近一次**完成 present** 的内容尺寸 + 当前客户区」应用一次（`platform/windows/event_loop.rs:686-720`）；GPU 线程只在 `grow` 时 `SetContent` / `Commit`，不碰几何。合成树由 `Arc<Mutex<Composition>>` 在 UI 线程与 GPU 线程之间共享，**所有 DComp 调用由互斥锁串行化**（UI：几何 / 关闭；GPU：grow 的一次 `SetContent` + `Commit`）。presented 尺寸由完成观测点发布（`render/windows/renderer.rs:650-658`），`Window::presented_surface()` 读共享槽（`window.rs:858-876`）；`WM_APP_COMPOSITION_WAKE` 只唤醒泵、**不请求帧**；最小化时跳过（0×0 会钳成 1×1）。 |
+| **F-199** | **窗口 = 组合交换链 + grow-only buffer 桶** | 窗口加 `WS_EX_NOREDIRECTIONBITMAP`（`platform/windows/window.rs:93-100`），客户区不再有系统重定向表面；`CreateSwapChainForComposition`（`render/windows/swapchain.rs:64-95`）创建 **`DXGI_SCALING_STRETCH`** + `FLIP_SEQUENTIAL` + 3 buffers + `B8G8R8A8_UNORM` + `ALPHA_MODE_IGNORE` + `FRAME_LATENCY_WAITABLE_OBJECT`，经 `IDCompositionVisual::SetContent` 挂到内容 visual；另有一条 **1×1 背景交换链**挂到背景 visual（F-205）。`ResizeBuffers` 在第一次 present 后恒失败（S-149），所以 buffer 是 **grow-only 高水位**：`buffer_size(content) = min(round_up_256(content + 512), 16384)`（`platform/windows/composition.rs:324-344`），GPU 侧 `grown_buffer` 再与当前 buffer **逐轴取大**（`render/windows/compositor.rs:857-865`）；内容仍在 buffer 内时 `set_content_size` 只是 CPU 记账（`:368-377`），越界才 `grow` 重建 persist + 交换链（`:396-442`）。`GpuRenderer.surface` 是**当前内容**尺寸，`buffer` 才是桶。上限 16384 显式 `EngineError::Swapchain`，不静默裁剪；**每窗口 VRAM 是历史最大桶（grow-only，默认不缩小）**。 |
+| **F-200** | **历史（被 F-205 取代）：visual 几何曾用 `scale = client/content`** | **第一版实现，已废弃**：visual 的单位是**物理像素**（与 DPI 无关），没有 1/dpi 因子。`visual_geometry(content, client)` 曾返回 `scale = (client_w / content_w, client_h / content_h)`、`clip = (0, 0, content_w, content_h)`（**内容坐标**，clip 被 visual 的 scale 变换），静止时 content == client ⇒ `scale = (1, 1)` + 1:1，拖动中则拉伸 / 压缩上一帧铺满客户区。该行为在真实拖动里表现为 HUD 变宽 / 文字发虚 / 静止时回弹，已被 **F-205** 删除；当前的 `visual_geometry` 只返回 `content_clip = content` 与 `background_scale = client`。其余保留：UI 线程在泵的 **②b′** 每轮应用几何；GPU 线程只在 `grow` 时 `SetContent` / `Commit`；合成树由 `Arc<Mutex<Composition>>` 共享、所有 DComp 调用互斥锁串行化；presented 尺寸由完成观测点发布，`WM_APP_COMPOSITION_WAKE` 只唤醒泵、不请求帧；最小化时跳过（0×0 钳成 1×1）。 |
 | **F-201** | **自绘边框缩放按 1 ms `WM_TIMER` 合并到 ~60 Hz** | `WM_MOUSEMOVE` 只更新 `ResizeSession.latest`（不 `SetWindowPos`）；`WM_TIMER(RESIZE_TIMER_ID)`、`WM_LBUTTONUP`、`WM_CAPTURECHANGED` 才调 `apply_resize`（`platform/windows/event_loop.rs:47-53 / 252-331 / 386-415`）。1 ms 定时器在 P09 probe 里实测合并到 ~16 ms（F-88）⇒ 1000 Hz 鼠标只产生 ~60 次/秒的 `SetWindowPos` + 帧 + 几何应用，而不是 1000 次（P1-2b）。抬起 / 失去捕获时的最终 apply 保证窗口不会停在旧位置；`SetTimer` 失败不重试（V-129）。外部合成的 `SetWindowPos` sweep 会绕过该定时器，因此 147–350 fps 的合成数字不代表真实拖动。 |
-| **F-202** | **新交换链先 prime 再挂到 visual（prime-before-attach）** | `GpuRenderer::new_for_composition`（`render/windows/compositor.rs:180-217`）与 `grow`（`:357-419`）的顺序固定为：①旧对象仍完好时创建新 persist + 交换链；②用新 buffer / content 做一次**全量**背景 clear + `Present1(sync = 0)`，并等这一帧的**队列 fence**（`prime_detached`，`:468-513`）；③`SetContent(新) + Commit`；④之后才替换 / 丢弃旧对象，`fresh = false`。第一次 present 必须整面（S-149），且已 attach 但从未 present 的交换链在合成器里是透明的（S-150）——反过来先 `SetContent` 再 prime 会在 `Commit` 与 prime 之间露出桌面。启动路径在 `run` 里 prime 后、`ShowWindow` 之前把几何设成 1:1（`platform/windows/event_loop.rs:609-632`）。代价：越过 buffer 边界的那一帧只呈现背景色（比整窗黑一帧好）。 |
-| **F-203** | **背景 = persist clear（linear），组合交换链上没有 `SetBackgroundColor`** | 组合交换链的 `SetBackgroundColor` 返回 `S_OK` 但**不参与合成**（S-151），所以删除该路径；背景色是持久目标 `clear_color` 的 **linear** 值（`render/color.rs::background_linear`，Windows 产品构建不再编译 `background_srgb`）。首帧 prime 就 clear 成背景色；运行期 `Window::set_background_color` 只标 full damage + 写 GPU 线程共享槽（UI 线程不碰 DXGI，I1），下一次 `Plan::Full` 生效，不自行产帧（`window.rs:492-505`；`render/windows/compositor.rs:454-466`）。客户区没有「旧 buffer 之外」的中间态：拖动中的像素来自上一帧内容，不是背景条。 |
-| **F-204** | **`EngineError::Composition`：DComp 运行时失败的公开变体** | 新增 public 变体 `Composition { detail: SmolStr }`（`error.rs:62-70`），`detail` 带失败操作名（`Visual::SetContent` / `Device::Commit` / `set_geometry` / `grow`）。边界固定：`Composition::new` 的 **COM 创建**阶段（窗口还建不出来）失败仍是 `AppInit`（`platform/windows/composition.rs:303-310`）；首帧 setup 与窗口生命周期内的几何 / 提交 / 交换链切换失败都归 `Composition`（同文件 `:312-316`）。`Composition::shutdown` 在 `DestroyWindow` **之前**释放 target / visual / device（`platform/windows/window.rs:390-399`），teardown 路径由 Esc / `WM_CLOSE` exit 0、stderr 空验证。F-15 冻结表由 17 → **18** 个变体；`phase-01-foundation.md` §6.2.2 第 18 行与 `phase-12-macos-linux.md` 的「不新增变体」例外同步。 |
+| **F-202** | **新交换链先 prime 再挂到 visual（prime-before-attach）** | `GpuRenderer::new_for_composition`（`render/windows/compositor.rs:206-238`）与 `grow`（`:396-442`）的顺序固定为：①旧对象仍完好时创建新 persist + 交换链（启动时还创建一条 **1×1 背景交换链**）；②对每条要 attach 的新链用新 buffer / content 做一次**全量**背景 clear + `Present1(sync = 0)`，并等这一帧的**队列 fence**（`prime_detached`，`:542-580`）；③`SetContent` + `Commit`（启动：先背景链、后内容链；`grow` 只换内容链）；④之后才替换 / 丢弃旧对象，`fresh = false`。第一次 present 必须整面（S-149），且已 attach 但从未 present 的交换链在合成器里是透明的（S-150）——反过来先 `SetContent` 再 prime 会在 `Commit` 与 prime 之间露出桌面。启动路径在 `run` 里 prime 后、`ShowWindow` 之前把几何设成「内容 = 客户区、背景铺满」（`platform/windows/event_loop.rs:609-632`）。代价：内容越过 buffer 边界的那一帧仍呈现旧内容（1:1）+ 背景层，不会拉伸。背景色变化走同一 prime 顺序（`refresh_background`，`:493-524`）。 |
+| **F-203** | **背景 = persist clear（linear）+ 独立 1×1 背景层** | 组合交换链的 `SetBackgroundColor` 返回 `S_OK` 但**不参与合成**（S-151），所以删除该路径；背景色是持久目标 `clear_color` 的 **linear** 值（`render/color.rs::background_linear`，Windows 产品构建不再编译 `background_srgb`），同时是 1×1 背景层的颜色（F-205 / S-152）。首帧两条链都 prime 成背景色；运行期 `Window::set_background_color` 标 full damage + 写 GPU 线程共享槽（UI 线程不碰 DXGI，I1）。GPU 线程在**空闲等待前**与**取帧后录制前**两个点消费：`set_background_color` 只置 `background_dirty`，`refresh_background` 新建 1×1 链、prime、`SetContent + Commit` 并丢弃旧链（不会为了改色强行产一个内容帧；`render/windows/renderer.rs:815-852`）。客户区露出区域由背景层填充，拖动中旧内容保持 1:1、缩小时只裁掉右/下，没有拉伸或背景条追帧。 |
+| **F-204** | **`EngineError::Composition`：DComp 运行时失败的公开变体** | 新增 public 变体 `Composition { detail: SmolStr }`（`error.rs:62-70`），`detail` 带失败操作名（`Visual::SetContent` / `Device::Commit` / `set_geometry` / `grow`）。边界固定：`Composition::new` 的 **COM 创建**阶段（窗口还建不出来）失败仍是 `AppInit`（`platform/windows/composition.rs:363-370`）；首帧 setup 与窗口生命周期内的几何 / 提交 / 交换链切换失败都归 `Composition`（同文件 `:372-376`）。`Composition::shutdown` 在 `DestroyWindow` **之前**释放 target / root / background / content / transforms / device（`platform/windows/window.rs:390-399`），teardown 路径由 Esc / `WM_CLOSE` exit 0、stderr 空验证。F-15 冻结表由 17 → **18** 个变体；`phase-01-foundation.md` §6.2.2 第 18 行与 `phase-12-macos-linux.md` 的「不新增变体」例外同步。 |
+| **F-205** | **内容 visual 恒 1:1 + 独立 1×1 背景层（回归修正，取代 F-200 的拉伸）** | 第一版 `visual_geometry` 用 `scale = client / content`，真实拖动把上一帧放大 / 压缩（HUD 变宽、静止回弹），用户反馈后改为 Chrome / Zed 式两层视觉树：`root`（无内容）→ `background`（**1×1** 组合交换链，`background_scale = (client_w, client_h)`、center `(0, 0)`）→ `content`（真实链，**无 transform**，`content_clip = (0, 0, content)`）。`root.AddVisual(background, true, NULL)` 先加背景，`root.AddVisual(content, true, Some(background))` 再把内容放到背景之上（S-152）。静止时内容 1:1、背景被完全盖住；拖动放大时旧内容保持 1:1 贴左上、露出的右/下是 `(11,14,19)` 背景；缩小时内容只被 clip 裁掉右/下，**不缩放、不回弹**。`visual_geometry` 不再做除法：`content_clip = content`、`background_scale = client`（`platform/windows/composition.rs:304-322`）。UI ②b′ 每轮应用二者；GPU 线程只在内容越界时换内容链（`grow`），在背景色变化时换背景链（`refresh_background`）。1×1 背景链在启动时独立 prime 并 attach（`new_for_composition`）；`set_background_color` 只置 `background_dirty`，GPU 线程在空闲等待前 / 取帧录制前重建（新 1×1 链先 prime 再 `SetContent + Commit`，旧链 Commit 后 drop，`compositor.rs:493-524` / `renderer.rs:815-852`）——不依赖下一帧内容。`Arc<Mutex<Composition>>`、grow-only buffer、60 Hz timer、prime-before-attach、`EngineError::Composition` 全部保留。**P2**：背景层 prime 复用主 persist 的 full clear，改色会顺带清一次主 persist（罕见；`set_background_color` 已标全量 damage，下一全量帧重画）；pre-attach 的 `Present1` 保留仍只由运行时视频验证（V-127）。落点：`platform/windows/composition.rs`（视觉树 / `visual_geometry` / `set_background_content`）、`render/windows/compositor.rs`（`new_for_composition` / `refresh_background` / `prime_detached`）、`render/windows/renderer.rs`（空闲 / 取帧两个背景应用点）、`platform/windows/event_loop.rs`（②b′）。实机见 V-131。 |
 
 ### 36.3 probe 事实
 
 | 编号 | 条目 | 内容 |
 |------|------|------|
-| **S-148** | **DirectComposition visual 的单位是物理像素，clip 随 scale 变换** | probe `dpi.log`（窗口 800×600 客户区、DPI=120 / 125%）：800×600 交换链在窗口里 **1:1**，没有 1/dpi 缩放（`10-identity`）；`scale = 0.8` 得到 640×480（`12`）；`scale = 1.25` 得到 1000×750 并被客户区裁掉（`13`）；客户区改成 1000×700、内容仍是 800×600 时，`scale = client / content = (1.25, 1.1667)` + `clip = (0, 0, 800, 600)` **恰好铺满**（`21` / `24`）；而按「再乘 1/dpi」算出的 `scale = client / (content × 1.25) = (1.0, 0.9333)` 只盖到 800×560，右/下露出洋红（`22`）⇒ **不能再除 DPI**。`clip = 400×300` 在同一次 `(1.25, 1.1667)` 变换下得到 **500×350**（`25`）⇒ **clip 在内容坐标、会被 scale 放大**。 |
+| **S-148** | **DirectComposition visual 单位是物理像素（第一版 scale probe，历史）** | probe `dpi.log`（窗口 800×600 客户区、DPI=120 / 125%）：800×600 交换链在窗口里 **1:1**，没有 1/dpi 缩放（`10-identity`）；`scale = 0.8` 得到 640×480（`12`）；`scale = 1.25` 得到 1000×750 并被客户区裁掉（`13`）；客户区 1000×700 时，第一版按 `scale = client / content = (1.25, 1.1667)` + `clip = (0, 0, 800, 600)` 恰好铺满（`21` / `24`）；按「再乘 1/dpi」算出的 `scale = client / (content × 1.25) = (1.0, 0.9333)` 只盖到 800×560、右/下露出洋红（`22`）⇒ **不能再除 DPI**；`clip = 400×300` 在 `(1.25, 1.1667)` 下得到 **500×350**（`25`）⇒ clip 在内容坐标、会被 scale 变换。**第一版的 `scale = client/content` 已被 F-205 删除**；这些像素结果现在只证明「visual 单位是物理像素」「clip 在内容坐标」两点，不再证明当前几何（当前内容无 transform、恒 1:1；背景层 1×1 按 client 放大，见 S-152）。 |
 | **S-149** | **组合交换链的创建矩阵与 `ResizeBuffers` 固定限制** | `caps.log`：`DCompositionCreateDevice2(NULL)` → `IDCompositionDevice` / `IDCompositionDesktopDevice` 均可（请求 `IDCompositionDevice2` 的 IID 得 `0x80004002`）；**传 D3D12 设备给 `DCompositionCreateDevice2` 则三种 IID 全部 `0x80004002`**。交换链：baseline `STRETCH + FLIP_SEQUENTIAL + 3 + BGRA8 + IGNORE` 成功；`SCALING_NONE` / 1 buffer 的 `FLIP_SEQUENTIAL` / bitblt `SEQUENTIAL` / `B8G8R8A8_UNORM_SRGB` / 0×0 全部创建失败 `0x887A0001`；`FLIP_DISCARD + 2` / `PREMULTIPLIED` / `UNSPECIFIED` alpha / `RGBA8` / `ALLOW_TEARING` 成功；不带 waitable flag 时 `SetMaximumFrameLatency(1)` 失败，带 flag 时 `Ok(1)` 且 waitable 非 NULL。`present.log`：`Present1` 的 400×300 dirty 生效；dirty 越界 / 负坐标都是 `0x887A0001`；`ResizeBuffers(0,0,0)` 是 `0x80070057`。`resize.log`：**第一次 present 之后**不论是 attached + `SetContent`、detached、还是丢掉 scene，`ResizeBuffers` 一律 `0x887A0001`；只有**从未 present 过的新交换链**可 resize（变体 D）。 |
 | **S-150** | **`WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前完全透明** | `dpi.log` 00–04（洋红底色放在窗口后面）：没有 DComp target、空 visual、画好但未 attach、attach 但未 present 四种状态，客户区 **100% 透出洋红**（约 477,994 px）；第一次 `Present` 之后才出现内容（红 / 绿 / 白图案）。因此 `ShowWindow` 之前必须已 prime 并 present（F-202），否则用户会看到桌面/黑色（透明不是黑色）。组合交换链上「已 attach 但从未 present」同样透明。 |
-| **S-151** | **组合交换链上的 `SetBackgroundColor` 是惰性的** | `present.log`：`SetBackgroundColor(0.25, 0.5, 0.75, 1)` 返回 `S_OK`，`GetBackgroundColor` 回读同值，但随后的 `Present` / `Present1` 帧像素与 baseline **完全一致**（30 / 31 / 32 帧的红绿白区域不变）⇒ 该 API 只存储、不参与合成。背景色只能走 persist 的 clear（F-203）。同时确认 `DCompositionCreateDevice2(NULL, IID_IDCompositionDevice)` 是可用入口（不必传 D3D12 设备）。 |
+| **S-151** | **组合交换链上的 `SetBackgroundColor` 是惰性的** | `present.log`：`SetBackgroundColor(0.25, 0.5, 0.75, 1)` 返回 `S_OK`，`GetBackgroundColor` 回读同值，但随后的 `Present` / `Present1` 帧像素与 baseline **完全一致**（30 / 31 / 32 帧的红绿白区域不变）⇒ 该 API 只存储、不参与合成。背景色只能走 persist 的 clear（F-203）与 1×1 背景层（F-205）。同时确认 `DCompositionCreateDevice2(NULL, IID_IDCompositionDevice)` 是可用入口（不必传 D3D12 设备）。 |
+| **S-152** | **1×1 背景交换链 + visual tree z-order** | 视觉树顺序由 `IDCompositionVisual::AddVisual(child, insertAbove, referenceVisual)` 决定：代码先 `root.AddVisual(background, true, NULL)`，再 `root.AddVisual(content, true, Some(background))`，内容显式插到背景**之上**；不依赖 `referenceVisual = NULL` 的具体方向。背景 visual 的内容是一条 **1×1** 组合交换链（`Swapchain::for_composition(queue, (1, 1))`），`background_scale = (client_w, client_h)`、center `(0, 0)` 把 1×1 纯色铺满客户区；DComp 的 `LINEAR` 过滤对常量色没有可见采样。1×1 链同样有 waitable / `SetMaximumFrameLatency(1)`，并且必须先 prime 再 attach（S-150）。改色时新建 1×1 链、prime、`SetContent + Commit`，旧链在 Commit 后 drop（F-203 / F-205）。 |
 
 ### 36.4 残留风险与未验证项
 
 | 编号 | 条目 | 内容 |
 |------|------|------|
-| **V-125** | **真实鼠标 / 高刷新率只覆盖单机单驱动** | 真实鼠标只测到 **604–626 Hz** 注入（207–213 步 / 341–343 ms），1000 Hz 游戏鼠标未测；显示器只有 60 Hz，120 / 144 / 240 Hz 下「60 Hz 定时器 + waitable」是否仍能维持 1:1、是否出现 timer 饥饿未验证。debug 构建是 CPU-bound（44.8 FPS / CPU 13.59 ms），不代表 release 的拖动上限。 |
+| **V-125** | **真实鼠标 / 高刷新率只覆盖单机单驱动** | 真实鼠标只测到 **592–626 Hz** 注入（203–213 步 / 341–343 ms），1000 Hz 游戏鼠标未测；显示器只有 60 Hz，120 / 144 / 240 Hz 下「60 Hz 定时器 + waitable」是否仍能维持 1:1、是否出现 timer 饥饿未验证。debug 构建是 CPU-bound（47.3 FPS / CPU 11.76 ms），不代表 release 的拖动上限。 |
 | **V-126** | **混合 DPI 多显示器未测** | 只在单显示器 3840×2160 @125%（窗口 DPI=120）上跑。跨屏拖动、每屏不同 DPI 的 `WM_DPICHANGED`、visual 物理像素在新 DPI 下的 1:1、以及 grow 与 DPI 变化同帧发生都未实测。 |
-| **V-127** | **pre-attach 的 `Present1` 保留语义只由运行时视频验证** | 「新交换链 prime 后、`SetContent` 之前内容仍在」由启动 / grow 的录屏间接证明（无桌面穿透），**没有** probe 在 attach 前读回 DWM 合成结果；DWM 在显存压力下是否丢弃离屏内容未知。`grow` 后第一帧在内容之外的区域也依赖 DWM 的 dirty-rect 保留（`Present1` 只声明内容子矩形）。 |
+| **V-127** | **pre-attach 的 `Present1` 保留语义只由运行时视频验证** | 「新交换链 prime 后、`SetContent` 之前内容仍在」由启动 / grow 的录屏间接证明（无桌面穿透），**没有** probe 在 attach 前读回 DWM 合成结果；DWM 在显存压力下是否丢弃离屏内容未知。No-stretch 设计里露出区域由独立的 1×1 背景层覆盖，不再依赖 DWM 对内容 dirty-rect 的保留；但内容链 / 背景链在 attach 前的 prime 保留仍只有运行时证据（V-131）。 |
 | **V-128** | **grow-only 高水位只增不减** | 缩小时不还 VRAM（组合交换链不能 `ResizeBuffers`，也没有 shrink 策略）；每窗口 VRAM 上界是历史最大桶。实测增量与 256 桶吻合（见 36.5），但长时间多窗口、反复跨越 16384 上限附近的行为未测；内容 > 16384 是显式 `Swapchain` 错误，不静默裁剪。 |
 | **V-129** | **60 Hz 定时器的低优先级 / 捕获 / 创建失败** | `WM_TIMER` 是低优先级消息，连续鼠标消息下可能延迟（最终 apply 保证不丢终点，但拖动中几何更新可能变稀）；`SetTimer` 返回值被忽略，失败时拖动中无中间几何（只有抬起时 apply）；捕获被系统收回（Alt+Tab / 弹出菜单）依赖 `WM_CAPTURECHANGED`，未在真实交互里压测。 |
-| **V-130** | **新交换链的 waitable token / 合成唤醒兜底** | `grow` 换上的新交换链自带一个新 waitable：其首个 token 没有显式消费，GPU 循环下一次等待可能立即返回（多一帧不节流）；60 Hz 下未观察到可见问题，但未在 1000 Hz / 高刷新率下验证。`WM_APP_COMPOSITION_WAKE` 的两种 `PostMessage` 都失败时只置 `composition_pending`，泵没有自唤醒源，要等下一次其它消息；这只影响「最后一帧 1:1」的落地时延。 |
+| **V-130** | **新交换链的 waitable token / 合成唤醒兜底** | `grow` 换上的新交换链自带一个新 waitable：其首个 token 没有显式消费，GPU 循环下一次等待可能立即返回（多一帧不节流）；60 Hz 下未观察到可见问题，但未在 1000 Hz / 高刷新率下验证。`WM_APP_COMPOSITION_WAKE` 的两种 `PostMessage` 都失败时只置 `composition_pending`，泵没有自唤醒源，要等下一次其它消息；这只影响「最后一帧几何」的落地时延。背景层刷新创建的 1×1 链没有帧循环 waitable 消费点。 |
+| **V-131** | **no-stretch 真实鼠标 / 背景条验证（已通过，附残留）** | `REPORT3.md` / `ns-*`：release 真实鼠标 **592 Hz**（203 步 / 343 ms），1200×925 → 900×685 → 1200×925，**FPS 62.3 / Frame 16.06 ms / CPU 0.77 ms / Present 0.27 ms**；HUD panel 顶边宽 **297 px 恒定**（279 个可见帧 0 宽 / 0 窄；59 帧在最大缩小时被完全裁掉，**从未缩放**）；最终标题 / 卡片 pixel-identical。决定性 jump grow 640×520 → 1218×972：旧内容仍 640×520 1:1，exposed right `700..1150 × 120..400` 的 `frac (11,14,19) = 1.0, max 19`，bottom `120..600 × 620..900` 同样 **1.0**；无 desktop / magenta / transparent，下一帧新内容出现。增长过程小条带 12–30 px（7 帧：5 帧纯 `(11,14,19)` max 19，2 帧含新内容像素 max 135）。debug **47.3 FPS / Frame 21.16 / CPU 11.76**。VRAM / 高水位、startup / rest / minimize / maximize / close 见 36.5，均 PASS。残留：1000 Hz / 120+ Hz / 混合 DPI 仍属 V-125 / V-126；pre-attach `Present1` 仍只有运行时证据（V-127）；1×1 背景 prime 会顺带清一次主 persist（F-205 P2）；只测了单机单驱动。 |
 
 ### 36.5 实机结果（最终树）
 
 环境：Windows 11、单显示器 3840×2160 @125%（窗口 DPI=120）、RTX 5080；release demo
 （`--features hud`）与 debug demo；录制为 ffmpeg gdigrab 1250×1000 @60 fps、无损 ffv1。
-完整记录见 `target/tmp/verify-dcomp/REPORT2.md` 与 `fin-*` / `fix-*`。
+完整记录见 `target/tmp/verify-dcomp/REPORT3.md` 与 `ns-*`（第一版拉伸的 `REPORT2.md` / `fin-*`
+只作历史）。
 
 | 用例 | 结果 |
 |------|------|
-| release 真实鼠标快速拖动（604 Hz，1200×925 → 900×685 → 1200×925） | **FPS 63.9 / Frame 15.65 ms / CPU 0.74 ms / Present 0.24 ms**；同夹具 REPORT2 的 hold / rest 记录为 63.6 / 64.0 FPS、15.71 / 15.62 ms。最终标题与卡片区域 **pixel-identical**（max diff 0），背景精确 `(11,14,19)`，无透明条。 |
-| debug 同一拖动 | **FPS 44.8 / CPU 13.59 ms**（CPU-bound），没有 30 fps 平台期。 |
-| 启动 | `ShowWindow` 之后没有桌面穿透 / 黑帧；首个可见内容帧是场景背景（prime 的背景），下一帧是场景；窗口在 prime 之后才出现。 |
-| 合成 / posted 长 sweep | HUD 间隙 **8–21 px**（静止 15 px），几何滞后 **−1…5 px**，追平 **34 ms / 2 帧**；最终 1:1。 |
-| 增长 / VRAM（进程 dedicated） | 初始 1200×925 → buffer **1792×1536**（**118.6 MB**）；1882×1253 → **2560×1792**（**+29.4 MB**）；1882×2053 → **2560×2816**（**+41.9 MB**）；角部「宽增 / 高减」1200×1400 → 2000×600 **0 增量**（高水位保留）；3782×603 → **4352×2816**（**+80.74 MB**，只增宽，高度 2816 保留）；缩到 900×700 **不重建**。 |
+| release 真实鼠标快速拖动（592 Hz，1200×925 → 900×685 → 1200×925） | **FPS 62.3 / Frame 16.06 ms / CPU 0.77 ms / Present 0.27 ms**；HUD panel 顶边宽 **297 px 恒定**（279 个可见帧 0 宽 / 0 窄，59 帧最大缩小时被完全裁掉、**从未缩放**）；最终标题与卡片区域 **pixel-identical**（max diff 0），背景精确 `(11,14,19)`，无透明条。 |
+| debug 同一拖动 | **FPS 47.3 / Frame 21.16 ms / CPU 11.76 ms / Present 0.21 ms**（CPU-bound），没有 30 fps 平台期。 |
+| 启动 | `ShowWindow` 之后没有桌面穿透 / 黑帧；内容层与 1×1 背景层都在 show 之前 prime；首个可见内容帧是场景背景（frame 42），下一帧是场景。 |
+| 决定性 jump grow（640×520 → 1218×972） | 旧内容仍 **640×520 1:1**；exposed right `700..1150 × 120..400` 的 `frac (11,14,19) = 1.0, max 19`，bottom `120..600 × 620..900` 同样 **1.0**；无 desktop / magenta / transparent；下一帧新内容出现。 |
+| 增长 / VRAM（进程 dedicated） | 初始 1200×925 → buffer **1792×1536**，**118,812,672 B**；1882×1253 → **2560×1792**，**+29,360,128 B**（精确）；1882×2053 → **2560×2816**，**+41,943,040 B**（精确）；角部「宽增 / 高减」1200×1400 → 2000×600 **0 增量**（高水位保留，1982×553 不重建）；3782×603 → **4352×2816**，**+80,740,352 B**（只增宽，高度 2816 保留）；回到 1200×925 **0 增量**。 |
+| 缩小 / 恢复 / 条带 | 351 帧 **0 blank / black**，最终 pixel-identical；增长条带 12–30 px（7 帧：5 帧纯 `(11,14,19)` max 19，2 帧含新内容像素 max 135），从无 desktop / 洋红。 |
 | 鲁棒性 | 最小化→恢复、最大化（client 3840×2071）、恢复、移动、200×150（钳到 400×250 outer）均正常渲染；Esc / `WM_CLOSE` **exit 0**，stderr 空、无 device-loss 输出。 |
 
 ### 36.6 与历史条目的关系
@@ -2749,7 +2760,10 @@ Windows 窗口此前是 `CreateSwapChainForHwnd` 的 HWND flip swapchain：`DXGI
 - **§31（F-184 / F-185 / F-186 / S-139 / S-140 / V-120）**：HWND + `SCALING_NONE` +
   `SetBackgroundColor` 的机制整体被 §36 取代（F-184 / S-139），保留为历史；`SetMaximumFrameLatency(1)`
   （F-185）与 `Window.surface = 真实客户区`（F-186）仍成立，但 Windows 现在把 surface 拆成
-  「当前内容」与「已 present 内容」两份（F-200）。V-120 的 Windows 待办由 V-125 … V-130 接替。
+  「当前内容」与「已 present 内容」两份（F-205）。V-120 的 Windows 待办由 V-125 … V-131 接替。
+- **§36 的第一版 F-200 / S-148**：`scale = client/content` 拉伸上一帧的设计已被 **F-205 / S-152**
+  取代（内容恒 1:1 + 独立 1×1 背景层）；F-200 / S-148 保留为回归历史，当前几何以 F-205 为准。
+  V-131 记录 no-stretch 的 297 px / 背景条实机验证。
 - **§32 S-141**：macOS 的「layer sRGB + clear linear」两种编码不变；其中「与 Windows S-139 相反」
   只描述 HWND 时代，Windows 已不再使用 `SetBackgroundColor`（F-203 / S-151）。
 - **F-72 / V-55 / V-56 / F-86**：`Present1` 的首帧全量、dirty rect 必须非空且落在**内容**内（F-72 ②③）

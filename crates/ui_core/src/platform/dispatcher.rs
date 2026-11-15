@@ -38,7 +38,7 @@ impl UserTask {
 pub(crate) const WM_APP_FRAME_WAKE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
 /// GPU 线程的合成通知（`WM_APP + 2`）：交换链里「刚完成 present 的内容尺寸」变了，UI 线程
-/// 可能还按旧内容尺寸拉伸 visual（`platform/windows/composition.rs`）。
+/// 可能还按旧内容尺寸设置内容 visual 的裁剪框（`platform/windows/composition.rs`）。
 ///
 /// **不请求新帧**（与 [`WM_APP_FRAME_WAKE`] 无关）：消息本身只负责把 `GetMessageW` 唤醒，
 /// 泵在每轮迭代里都会重算一次 DirectComposition 几何（同值 no-op）；若这里置帧唤醒位，每次

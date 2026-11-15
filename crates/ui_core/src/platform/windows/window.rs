@@ -5,7 +5,8 @@
 //! 自绘标题栏留 P12。
 //!
 //! 客户区**没有**系统的重定向表面（`WS_EX_NOREDIRECTIONBITMAP`）：窗口的全部像素由
-//! [`Composition`] 合成的组合交换链提供，resize 时 DWM 直接拉伸上一帧内容。
+//! [`Composition`] 合成的组合交换链提供。内容 visual 恒 1:1（resize 不缩放旧内容）；窗口放大
+//! 露出的新区域由下方独立的背景层填充。
 
 use std::sync::{Arc, Mutex};
 
