@@ -520,10 +520,13 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
+    /// 窗口背景色（`DXGI_SCALING_NONE` 下 resize 期间新暴露客户区的底色）。
+    /// 默认 `Color::BLACK`（**不是** `Color::default()` 的透明）；仅 Windows 影响窗口底色。
+    pub background: Color,
 }
 
 impl Default for WindowOptions {
-    fn default() -> Self;   // title: ""、size: 800×600、scale: Scale::ONE
+    fn default() -> Self;   // title: ""、size: 800×600、scale: Scale::ONE、background: BLACK
 }
 
 /// 一个窗口的全部状态：节点树 + 绘制场景 + DPI + 参数。
@@ -533,6 +536,8 @@ pub struct Window {
     tree: NodeTree,
     scene: Scene,
     scale: Scale,
+    /// 渲染目标的物理像素尺寸：Windows = 平台层写的真实客户区；其它平台 = covering。
+    surface: (u32, u32),
 }
 
 impl Window {
@@ -550,15 +555,41 @@ impl Window {
     pub fn scene(&self) -> &Scene;
     #[must_use]
     pub fn options(&self) -> &WindowOptions;
+
+    /// 运行期改写背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给 GPU 线程。
+    /// Windows 上值变化标全量重绘，下一次 `Present1` 生效；仅 Windows 影响窗口底色。
+    pub fn set_background_color(&mut self, color: Color);
+
     #[must_use]
     pub fn scale(&self) -> Scale;
+
+    /// 逻辑尺寸变化（P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存，并先按
+    /// `size × scale` 重算 covering surface（Windows 平台层随后用真实客户区覆盖）。
+    pub fn set_size(&mut self, size: Size);
 
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT|PAINT`（§3.4「窗口尺寸/DPI → 根 LAYOUT」）。
     ///
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
     pub fn set_scale(&mut self, scale: Scale);
+
+    /// Windows 平台层：写入真实客户区物理尺寸（`WM_SIZE` / `WM_DPICHANGED` 之后，最小化时调用方跳过）。
+    /// 值变化标全量重绘；不标 layout、不动 `scale_epoch`。
+    #[cfg(windows)]
+    pub(crate) fn set_surface(&mut self, surface: (u32, u32));
+
+    /// `paint_frame` / `commit_frame` / `submit_gpu` 的唯一 frame 来源（分平台 `#[cfg]` 实现）。
+    fn frame_rect(&self) -> PhysicalRect;
 }
 ```
+
+> **2026-11-15 补充（F-184 / F-186 / S-140）**：`background`、`surface`、`set_surface`、
+> `set_background_color`、`frame_rect()` 是 Windows live-resize 修复带进公开面/内部状态的增量。
+> `WindowOptions` 新增字段后，结构体字面量必须补 `background`（或 `..WindowOptions::default()`），
+> 否则不编译。Windows 的 `surface` 是平台层写入的真实客户区，`set_size` / `set_scale` 只先重算
+> covering、随后被 `set_surface` 覆盖（应用代码不应在活窗口上调用二者来「改客户区」）；
+> macOS/Linux 的 `frame_rect()` 保持旧的 `size × scale` covering（0 尺寸仍 0×0），
+> `WindowOptions.background` 在两端只记录、本轮无渲染效果（详见 `async-render-pipeline.md`
+> §4.4 / §6.2 / §6.7）。
 
 | 决策                                             | 结论                                          | 理由                                                                                                                     |
 |--------------------------------------------------|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
@@ -567,6 +598,8 @@ impl Window {
 | `Window::tree_mut` 交出 `&mut NodeTree` 的安全性 | 允许                                          | 应用层只能改结构与样式（`Style` 是值、`build` 只追加）；`Node` 字段全私有，`Signal` 值只能经 `App::write`（I6）          |
 | `Window` 是否 `Drop` 时清理依赖图                | 否                                            | `Drop` 拿不到 `&mut DependencyGraph`；清理在 `App::close_window`（唯一入口）                                             |
 | `Scene` 的可构造性                               | **不可**（`pub(crate) fn empty()`，见 §13.2） | 裁决 ③ 的约束：`Scene` 不实现 `Clone`/`Default`、无公开构造器 → 应用层既不能克隆也不能伪造场景，只能读 `Window::scene()` |
+| `WindowOptions.background` 的默认值              | `Color::BLACK`（不透明）                      | `Color::default()` 是透明；窗口底色不能透出桌面/旧 buffer，且 `SetBackgroundColor` 的 alpha 被 `ALPHA_MODE_IGNORE` 忽略（F-184 / S-139） |
+| `Window.surface` 为什么独立于 `size × scale`     | Windows = 真实客户区；其它平台 = covering     | covering 与真实客户区的取整差会留 1 px 未绘制（175% 下 `256.8 × 1.75 = 449.4`，covering 450）；Windows headless/离屏仍走 covering（F-186） |
 
 ### 5.3 `NodeTree` / `Node` 公开到什么程度
 

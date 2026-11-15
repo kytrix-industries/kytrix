@@ -308,6 +308,7 @@ impl Scene {
             title: TITLE.into(),
             size: window_size(),
             scale: ui_core::math::Scale::ONE,
+            background: color(BG_RGBA),
         });
         Self::build_into(app, window)
     }

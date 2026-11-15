@@ -136,13 +136,25 @@ impl GpuRenderer {
     ///
     /// 用**硬件**设备：WARP 设备不能 present 到 HWND（本机实测 `Present1` 直接
     /// `DXGI_ERROR_DEVICE_REMOVED`），因此无硬件设备的 CI 上由调用方跳过。
-    pub(crate) fn new_for_hwnd(hwnd: isize, size: (u32, u32)) -> Result<Self, EngineError> {
+    ///
+    /// `background` 是 sRGB 编码的 RGBA（`renderer::background_rgba` 的输出；`SCALING_NONE` 下
+    /// resize 期间新暴露的客户区由它填充）。
+    pub(crate) fn new_for_hwnd(
+        hwnd: isize,
+        size: (u32, u32),
+        background: [f32; 4],
+    ) -> Result<Self, EngineError> {
         let mut renderer = Self::with_device(
             Device::new()?,
             size,
             crate::render::windows::atlas::ATLAS_PAGE,
         )?;
-        renderer.swapchain = Some(Swapchain::for_hwnd(&renderer.queue, hwnd, size)?);
+        renderer.swapchain = Some(Swapchain::for_hwnd(
+            &renderer.queue,
+            hwnd,
+            size,
+            background,
+        )?);
         Ok(renderer)
     }
 
@@ -297,6 +309,23 @@ impl GpuRenderer {
         self.surface = size;
         self.fresh = true;
         Ok(())
+    }
+
+    /// 改窗口背景色（GPU 线程；离屏目标 no-op）。
+    ///
+    /// 背景色只影响 DXGI（resize 期间新暴露的客户区；alpha 被 `ALPHA_MODE_IGNORE` 忽略），
+    /// 不改变 persist 的 clear color 或绘制内容。
+    pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) -> Result<(), EngineError> {
+        debug_assert!(
+            self.swapchain.is_none() || on_gpu_thread(),
+            "window background changes may only run on the kytrix-d3d12 thread"
+        );
+        let Some(swapchain) = self.swapchain.as_mut() else {
+            return Ok(());
+        };
+        swapchain
+            .set_background_color(rgba)
+            .map_err(|error| self.classify(error))
     }
 
     /// 离屏 / 快照路径：提交一份跨线程快照并**同步**等完成（§4.5 的下半段）。
@@ -1859,10 +1888,37 @@ mod tests {
         }
         .expect("hidden window");
 
-        let Ok(mut renderer) = GpuRenderer::new_for_hwnd(hwnd.0 as isize, (64, 64)) else {
+        // 背景色原样传给 DXGI（`[0.25, 0.5, 0.75, 1.0]` 精确可表示）：本测试只验证
+        // `SetBackgroundColor` / `GetBackgroundColor` 的 round-trip，不覆盖 `background_rgba`
+        // 的 sRGB 编码语义（那由 renderer.rs 的单测负责）。
+        let background = [0.25, 0.5, 0.75, 1.0];
+        let Ok(mut renderer) = GpuRenderer::new_for_hwnd(hwnd.0 as isize, (64, 64), background)
+        else {
             eprintln!("skip: no hardware D3D12 device for the swapchain test");
             return;
         };
+        // 创建后：DXGI 已经拿到背景色，帧延迟是 1（不是旧的 2）。
+        let created = renderer
+            .swapchain
+            .as_ref()
+            .expect("new_for_hwnd creates a swapchain")
+            .background_color()
+            .expect("GetBackgroundColor after create");
+        assert_eq!(
+            (created.r, created.g, created.b, created.a),
+            (background[0], background[1], background[2], background[3]),
+            "creation-time background color"
+        );
+        assert_eq!(
+            renderer
+                .swapchain
+                .as_ref()
+                .expect("swapchain")
+                .maximum_frame_latency()
+                .expect("GetMaximumFrameLatency"),
+            1,
+            "SetMaximumFrameLatency(1)"
+        );
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
@@ -1876,5 +1932,25 @@ mod tests {
         renderer
             .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
             .expect("dirty frame");
+        // 重设：官方未承诺 `ResizeBuffers` 保留背景色，本实现不依赖它——重建后无条件重设。
+        renderer
+            .swapchain
+            .as_mut()
+            .expect("swapchain")
+            .resize((48, 32))
+            .expect("ResizeBuffers");
+        let resized = renderer
+            .swapchain
+            .as_ref()
+            .expect("swapchain")
+            .background_color()
+            .expect("GetBackgroundColor after resize");
+        // 这条断言只证明「重设后 round-trip 成功」，**不**证明 `ResizeBuffers` 真的丢了背景色
+        // （DXGI 未承诺保留，也没有可移植的观测手段）。
+        assert_eq!(
+            (resized.r, resized.g, resized.b, resized.a),
+            (background[0], background[1], background[2], background[3]),
+            "background color must be re-applied after ResizeBuffers"
+        );
     }
 }

@@ -498,6 +498,7 @@ pub fn capture(case: SnapshotCase) -> Result<SnapshotImage, GoldenError> {
         title: SmolStr::new_static("kytrix golden"),
         size: case.size,
         scale: case.scale,
+        ..WindowOptions::default()
     });
     mount(&mut app, case.scene, case.theme);
     app.drain().map_err(|error| GoldenError::Frame {

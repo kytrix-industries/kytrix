@@ -522,6 +522,12 @@ impl Swapchain {
 `nextDrawable() == None`（drawable 池被占满）⇒ **本帧跳过**（不录 GPU 工作、不推进 `FrameIndex` 的 GPU 部分，
 但 `FrameIndex` 已递增）→ 返回 `Ok(())` 并记 `Section::Present` 为 0；**不**报错（不是失败）。
 
+> **2026-11-15 平台差异（F-186 / S-140）**：Windows 的渲染目标现在是平台层写入的真实客户区
+> （`Window::set_surface`），macOS 仍按 `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸
+> 仍 0×0）。`WindowOptions.background` 在 macOS 只记录、本轮无渲染效果：窗口底色仍由 `NSWindow` /
+> `CAMetalLayer` 决定，`contentsGravity` 默认会缩放图层内容（不是 `SCALING_NONE` 的 1:1）；是否
+> 做等价改造（`contentsGravity` / `drawableSize` 时序）待后续评估，不得把 Windows 的结论外推。
+
 ### 5.4 `macos/pipeline.rs`
 
 ```rust
@@ -1212,6 +1218,10 @@ metal_layer.setDrawableSize(physical size)
 > feature 提供**
 > （probe 实测），但 P12 刻意走通知而不是 delegate：`App` 的生命周期由泵掌握，delegate 会引入第二个回调入口。
 
+> **2026-11-15（F-186 / S-140）**：上表的尺寸回读仍只写逻辑尺寸（`Window::set_size`）；macOS 的
+> 渲染目标继续由 `frame_rect()` 按 `size × scale` 的 covering 推导（Windows 已改为平台层写入的真实
+> 客户区）。`WindowOptions.background` 在 macOS 只记录，本轮不改渲染行为。
+
 ### 7.4 `macos/dpi.rs`
 
 ```rust
@@ -1425,6 +1435,10 @@ pub(crate) struct NativeSurface {
 | 关闭     | `toplevel.destroy()` + `surface.destroy()`；`LinuxLoop` 见 `app.windows()` 空即退出                                                   |
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |
 | 键盘焦点 | `wl_keyboard::Event::Enter/Leave` ⇒ `FocusChanged { focused }`                                                                        |
+
+> **2026-11-15（F-186 / S-140）**：Linux 的渲染目标仍是 `physical = (logical × scale)` 的 covering
+> （`frame_rect()` 保持旧值；Windows 已改为真实客户区）。`WindowOptions.background` 在 Linux 只记录、
+> 本轮无渲染效果；resize 期间新暴露区域的填充语义由合成器决定（本引擎不做等价 `SCALING_NONE` 改造）。
 
 ### 8.4 `linux/dpi.rs`
 

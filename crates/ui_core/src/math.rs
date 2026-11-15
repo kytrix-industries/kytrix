@@ -962,6 +962,16 @@ mod tests {
         );
     }
 
+    /// 事实记录：175% 下 `256.8 × 1.75 = 449.4` 物理像素 —— round/floor 得到 449，但窗口
+    /// surface 必须 covering 到 450（少 1 px 就是右侧一条未绘制像素）。
+    #[test]
+    fn covering_at_175_percent_rounds_the_fractional_edge_up() {
+        let rect = Rect::new(0.0, 0.0, 256.8, 1.0);
+
+        assert_eq!(rect.to_physical(scale(1.75)).x1, 449);
+        assert_eq!(rect.to_physical_covering(scale(1.75)).x1, 450);
+    }
+
     #[test]
     fn rect_inset_asymmetric_edges() {
         // CSS 顺序 (top, right, bottom, left)。

@@ -563,11 +563,13 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     for (id, options) in requests {
         let native = NativeWindow::create(id, &options, dispatcher.clone())?;
         let client = native.client_size();
-        let renderer = Renderer::new_for_hwnd(native.hwnd_raw(), client)?;
+        let renderer = Renderer::new_for_hwnd(native.hwnd_raw(), client, options.background)?;
         if let Some(window) = app.window_mut(id) {
             window.set_renderer(renderer);
             window.set_scale(native.scale());
             window.set_size(native.logical_size());
+            // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
+            window.set_surface(client);
         }
         native.show();
         windows.push(native);
@@ -780,6 +782,8 @@ fn apply_event(
             let size = native.logical_size();
             if let Some(window) = app.window_mut(id) {
                 window.set_size(size);
+                // 目标尺寸 = 真实客户区（`WM_SIZE` 的 lParam 就是新的客户区宽高）。
+                window.set_surface((width, height));
             }
             dispatcher.wake();
             Event::Resized { size }
@@ -795,6 +799,12 @@ fn apply_event(
             }
             if let Some(window) = app.window_mut(id) {
                 window.set_scale(scale);
+                // `apply_scale` / `place` 已按新 DPI 重排非客户区：回读真实客户区。
+                // 最小化时 `GetClientRect` 是 0×0（`client_size()` 会钳成 1×1）：跳过 `set_surface`，
+                // 目标保持 `set_scale` 重算的 covering；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖它。
+                if !native.is_minimized() {
+                    window.set_surface(native.client_size());
+                }
             }
             dispatcher.wake();
             Event::DpiChanged { dpi, scale }

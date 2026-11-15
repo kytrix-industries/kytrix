@@ -537,6 +537,7 @@ mod tests {
             title: "text pixels".into(),
             size: crate::math::Size::new(200.0, 60.0),
             scale: Scale::ONE,
+            ..crate::window::WindowOptions::default()
         });
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
@@ -1228,6 +1229,7 @@ mod p11_tests {
             title: SmolStr::new_static("scale"),
             size: crate::math::Size::new(400.0, 300.0),
             scale,
+            ..WindowOptions::default()
         });
         app.enable_a11y_capture();
         let node = mount(&mut app, |tree, root| {

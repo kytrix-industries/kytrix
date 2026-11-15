@@ -4229,6 +4229,7 @@ mod interaction_tests {
             title: "p10".into(),
             size: Size::new(400.0, 300.0),
             scale: Scale::ONE,
+            ..WindowOptions::default()
         });
         (rt, app, window)
     }
@@ -5403,6 +5404,7 @@ mod resources_tests {
             title: "resources".into(),
             size: Size::new(200.0, 120.0),
             scale: crate::math::Scale::ONE,
+            ..WindowOptions::default()
         });
         (rt, app, window)
     }
@@ -5432,6 +5434,7 @@ mod resources_tests {
             title: "second".into(),
             size: Size::new(64.0, 64.0),
             scale: crate::math::Scale::ONE,
+            ..WindowOptions::default()
         });
         assert_ne!(second, window);
         assert_eq!(app.resources().len(), 1);
@@ -5498,6 +5501,7 @@ mod resources_tests {
             title: "second".into(),
             size: Size::new(64.0, 64.0),
             scale: crate::math::Scale::ONE,
+            ..WindowOptions::default()
         });
         app.upload_atlas_pages();
 
@@ -5526,6 +5530,7 @@ mod resources_tests {
             title: "second".into(),
             size: Size::new(64.0, 64.0),
             scale: crate::math::Scale::ONE,
+            ..WindowOptions::default()
         });
         app.window_mut(second)
             .expect("window")

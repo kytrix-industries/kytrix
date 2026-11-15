@@ -41,6 +41,7 @@ fn new_app(handle: &tokio::runtime::Handle) -> Fixture {
         title: SmolStr::new_static("bench"),
         size: VIEWPORT,
         scale: Scale::ONE,
+        ..WindowOptions::default()
     });
     Fixture { app, window }
 }

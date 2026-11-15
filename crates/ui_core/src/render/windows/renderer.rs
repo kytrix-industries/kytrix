@@ -54,7 +54,10 @@ use crate::render::timer::Section;
 use crate::render::windows::readback::ReadbackImage;
 use crate::{
     error::EngineError,
-    paint::atlas::AtlasKind,
+    paint::{
+        atlas::AtlasKind,
+        color::{Color, ColorResolver},
+    },
     render::{
         DirtyRows, RenderStats,
         compositor::FramePlan,
@@ -112,8 +115,12 @@ impl Renderer {
     ///
     /// # Errors
     /// 设备 / swapchain 创建失败，或 GPU 线程无法启动（`AppInit`）。
-    pub(crate) fn new_for_hwnd(hwnd: isize, size: (u32, u32)) -> Result<Self, EngineError> {
-        let gpu = GpuRenderer::new_for_hwnd(hwnd, size)?;
+    pub(crate) fn new_for_hwnd(
+        hwnd: isize,
+        size: (u32, u32),
+        background: Color,
+    ) -> Result<Self, EngineError> {
+        let gpu = GpuRenderer::new_for_hwnd(hwnd, size, background_rgba(background))?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
             error: None,
@@ -163,6 +170,18 @@ impl Renderer {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels.to_vec(), rows),
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
+        }
+    }
+
+    /// 改窗口背景色（UI 线程只写共享槽 + `wake`，`SetBackgroundColor` 在 GPU 线程执行）。
+    ///
+    /// 离屏目标没有背景色（从不 present），是 no-op。
+    pub(crate) fn set_background_color(&mut self, color: Color) {
+        match &self.target {
+            RenderTarget::Offscreen(_) => {}
+            RenderTarget::Window(window) => {
+                window.set_background_color(background_rgba(color));
+            }
         }
     }
 
@@ -216,6 +235,62 @@ impl Renderer {
             }),
         }
     }
+}
+
+/// 引擎颜色 → `IDXGISwapChain1::SetBackgroundColor` 的 **sRGB 编码** RGBA（未预乘、alpha 恒 1）。
+///
+/// `SetBackgroundColor` 在 UNORM flip swapchain 上按 sRGB 编码字节直写（实测 S-139：字面量
+/// linear 值只会得到 `linear × 255`）；**不要传 linear**，官方 "recommend linear" 不适用于本路径。
+/// alpha 会被 `ALPHA_MODE_IGNORE` 忽略，这里仍显式写 1.0。
+///
+/// 背景色没有透明度：先把 alpha 置 1（不改 RGB）再解析。`with_opacity(1.0)` 只乘 alpha，**不会**
+/// 把 0.5 变成 1；而 [`ColorResolver::resolve`] 输出的是**预乘**值，直接用半透明颜色会让
+/// 半透明白变成灰色。
+fn background_rgba(color: Color) -> [f32; 4] {
+    let opaque = match color {
+        Color::Srgb { r, g, b, .. } => Color::Srgb {
+            r,
+            g,
+            b,
+            alpha: 1.0,
+        },
+        Color::LinearSrgb { r, g, b, .. } => Color::LinearSrgb {
+            r,
+            g,
+            b,
+            alpha: 1.0,
+        },
+        Color::DisplayP3 { r, g, b, .. } => Color::DisplayP3 {
+            r,
+            g,
+            b,
+            alpha: 1.0,
+        },
+        Color::Oklab { l, a, b, .. } => Color::Oklab {
+            l,
+            a,
+            b,
+            alpha: 1.0,
+        },
+        Color::Oklch { l, c, h, .. } => Color::Oklch {
+            l,
+            c,
+            h,
+            alpha: 1.0,
+        },
+    };
+    // alpha = 1 ⇒ `resolve` 的线性分量就是未预乘的 linear RGB（已 clamp 到 `[0, 1]`）。
+    let linear = ColorResolver::default().resolve(opaque).components;
+    // linear → sRGB 编码（IEC 61966-2-1 的传递函数）。
+    let encode = |component: f32| {
+        let c = component.clamp(0.0, 1.0);
+        if c <= 0.003_130_8 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    [encode(linear[0]), encode(linear[1]), encode(linear[2]), 1.0]
 }
 
 /// 粘性错误的重建源（§4.5：GPU 线程退出后 `poll` 持续返回同一错误）。
@@ -324,6 +399,10 @@ impl WindowRenderer {
 
     fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
         self.shared.queue_atlas(kind, pixels, rows);
+    }
+
+    fn set_background_color(&self, rgba: [f32; 4]) {
+        self.shared.set_background(rgba);
     }
 
     fn poll(&mut self) -> Result<Option<FrameFeedback>, EngineError> {
@@ -438,6 +517,8 @@ struct State {
     shutdown: bool,
     /// GPU 线程已经退出（`publish` 从此是 no-op）。
     terminated: bool,
+    /// 待应用的背景色（最新者胜；GPU 线程空闲/取帧后都会取走）。
+    background: Option<[f32; 4]>,
 }
 
 impl State {
@@ -449,6 +530,7 @@ impl State {
             error: None,
             shutdown: false,
             terminated: false,
+            background: None,
         }
     }
 }
@@ -536,6 +618,22 @@ impl Shared {
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
         state.atlas.queue(kind, pixels, rows);
+    }
+
+    /// 排队一笔背景色变更（最新者胜）：GPU 线程空闲或录制下一帧前应用。
+    fn set_background(&self, rgba: [f32; 4]) {
+        let mut state = self.lock();
+        if state.shutdown || state.terminated {
+            return;
+        }
+        state.background = Some(rgba);
+        drop(state);
+        self.wake();
+    }
+
+    /// 取走待应用的背景色（取一次清空）。
+    fn take_background(&self) -> Option<[f32; 4]> {
+        self.lock().background.take()
     }
 
     fn has_pending_frame(&self) -> bool {
@@ -649,6 +747,10 @@ fn run_gpu_loop(
         if shared.shutdown_requested() {
             return Ok(());
         }
+        // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
+        if let Some(rgba) = shared.take_background() {
+            renderer.set_background_color(rgba)?;
+        }
         if !shared.has_pending_frame() {
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
             // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
@@ -672,6 +774,10 @@ fn run_gpu_loop(
             debug_assert!(false, "waitable consumed without a pending frame");
             continue;
         };
+        // 等 waitable 期间到达的背景色：与帧一起落地（仍然是录制前，不引入新的 GPU 调用点）。
+        if let Some(rgba) = shared.take_background() {
+            renderer.set_background_color(rgba)?;
+        }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
             renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
@@ -856,10 +962,10 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError};
+    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError, background_rgba};
     use crate::{
         error::EngineError,
-        paint::atlas::AtlasKind,
+        paint::{atlas::AtlasKind, color::Color},
         render::{DirtyRows, compositor::Plan, frame::LatestFrame},
     };
 
@@ -1020,5 +1126,106 @@ mod tests {
             windows::Win32::Foundation::WAIT_OBJECT_0,
             "request_shutdown must signal completion"
         );
+    }
+
+    #[test]
+    fn a_background_change_is_taken_exactly_once() {
+        let shared = test_shared();
+        shared.set_background([0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(
+            shared.take_background(),
+            Some([0.25, 0.5, 0.75, 1.0]),
+            "the GPU thread takes the pending background color once"
+        );
+        assert_eq!(shared.take_background(), None, "take clears the slot");
+    }
+
+    #[test]
+    fn a_background_change_after_shutdown_or_termination_is_dropped() {
+        let shared = test_shared();
+        shared.request_shutdown();
+        shared.set_background([1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            shared.take_background(),
+            None,
+            "the GPU loop exits before applying a pending background color"
+        );
+
+        let terminated = test_shared();
+        terminated.mark_terminated();
+        terminated.set_background([0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(terminated.take_background(), None);
+    }
+
+    /// `round(component × 255)`：8-bit 缓冲实际收到的字节（`SetBackgroundColor` 按字节直写）。
+    fn bytes(rgba: [f32; 4]) -> [u8; 4] {
+        rgba.map(|component| (component * 255.0).round() as u8)
+    }
+
+    #[test]
+    fn the_background_color_is_srgb_encoded_and_never_translucent() {
+        // 实测 S-139：本路径的 UNORM flip swapchain 把 float 原样写进 8-bit 缓冲，所以必须传
+        // sRGB 编码分量；主题色 `#0B0E13` 只有编码后才会落成 (11, 14, 19)。
+        let theme = background_rgba(Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]));
+        let [red, green, blue, alpha] = bytes(theme);
+        assert_eq!([red, green, blue], [11, 14, 19], "8-bit 缓冲收到的字节");
+        assert_eq!(alpha, 255);
+        assert_eq!(theme[3], 1.0, "背景色恒不透明");
+
+        assert_eq!(bytes(background_rgba(Color::BLACK)), [0, 0, 0, 255]);
+        assert_eq!(bytes(background_rgba(Color::WHITE)), [255, 255, 255, 255]);
+        // 半透明白：先不透明化（`with_opacity(1.0)` 不会把 0.5 变成 1，预乘会变灰）。
+        assert_eq!(
+            bytes(background_rgba(Color::srgb(1.0, 1.0, 1.0, 0.5))),
+            [255, 255, 255, 255]
+        );
+
+        // linear 0.5 → sRGB encode 0.7354 → 188（原样写入只会得到 128）。
+        assert_eq!(
+            bytes(background_rgba(Color::linear_srgb(0.5, 0.5, 0.5, 1.0))),
+            [188, 188, 188, 255]
+        );
+
+        // 5 个变体都必须按不透明色处理：半透明白若漏掉 `alpha: 1.0`，预乘后会变灰（188）。
+        for white in [
+            Color::srgb(1.0, 1.0, 1.0, 0.5),
+            Color::linear_srgb(1.0, 1.0, 1.0, 0.5),
+            Color::display_p3(1.0, 1.0, 1.0, 0.5),
+            Color::oklab(1.0, 0.0, 0.0, 0.5),
+            Color::oklch(1.0, 0.0, 0.0, 0.5),
+        ] {
+            let rgba = background_rgba(white);
+            assert_eq!(
+                bytes(rgba),
+                [255, 255, 255, 255],
+                "{white:?} 必须是不透明白"
+            );
+            assert_eq!(rgba[3], 1.0, "{white:?} 的 alpha 必须是 1");
+        }
+
+        // 宽色域变体的已知黑端点：与 sRGB 同样的字节结果 + alpha 恒 1。
+        for black in [
+            Color::oklab(0.0, 0.0, 0.0, 1.0),
+            Color::display_p3(0.0, 0.0, 0.0, 0.5),
+            Color::oklch(0.0, 0.0, 0.0, 1.0),
+        ] {
+            let rgba = background_rgba(black);
+            assert_eq!(bytes(rgba), [0, 0, 0, 255], "{black:?}");
+            assert_eq!(rgba[3], 1.0, "{black:?} 的 alpha 必须是 1");
+        }
+
+        // 分量恒在 `[0, 1]`（越界 / NaN 输入由 resolver 与 encode 收敛）。
+        for color in [
+            Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
+            Color::BLACK,
+            Color::WHITE,
+            Color::srgb(2.0, -1.0, f32::NAN, 1.0),
+            Color::display_p3(1.0, 0.0, 0.0, 0.25),
+            Color::oklch(0.5, 0.4, 30.0, 0.0),
+        ] {
+            for component in background_rgba(color) {
+                assert!((0.0..=1.0).contains(&component), "{color:?} → {component}");
+            }
+        }
     }
 }

@@ -13,10 +13,10 @@ use crate::{
     error::EngineError,
     interaction::{FocusScope, PointerState, scroll},
     layout::LayoutReport,
-    math::{Point, Rect, Scale, Size},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{dirty::DirtyFlags, id::NodeId, tree::NodeTree},
     paint::{
-        color::{ColorResolver, Interpolation},
+        color::{Color, ColorResolver, Interpolation},
         instance::{InstanceBuffer, InstanceEncoder},
         pass::{PaintPass, PaintReport},
         scene::Scene,
@@ -108,6 +108,11 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
+    /// 窗口背景色：`DXGI_SCALING_NONE` 下客户区超出 back buffer 的底色（DWM 不再拉伸旧 buffer）。
+    ///
+    /// 仅 Windows 生效；alpha 忽略（`ALPHA_MODE_IGNORE`）；下一次 `Present1` 生效（通常下一帧）。
+    /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
+    pub background: Color,
 }
 
 impl Default for WindowOptions {
@@ -116,6 +121,7 @@ impl Default for WindowOptions {
             title: SmolStr::new_static(""),
             size: Size::new(800.0, 600.0),
             scale: Scale::ONE,
+            background: Color::BLACK,
         }
     }
 }
@@ -236,6 +242,11 @@ pub struct Window {
     tree: NodeTree,
     scene: Scene,
     scale: Scale,
+    /// 渲染目标的物理像素尺寸。
+    ///
+    /// Windows 是平台层给的真实客户区（`set_surface`）；但 `set_size` / `set_scale` 会先按
+    /// `size × scale` 的 covering 重算一次，平台层随后用真实客户区覆盖。其它平台恒等于 covering。
+    surface: (u32, u32),
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
     /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
@@ -301,12 +312,14 @@ impl Window {
     /// **唯一的构造点**：`Scene::empty()` 与 `NodeTree::new()` 只在这里组合。
     pub(crate) fn new(id: WindowId, options: WindowOptions) -> Self {
         let scale = options.scale;
+        let surface = covering_surface(options.size, scale);
         Self {
             id,
             options,
             tree: NodeTree::new(),
             scene: Scene::empty(),
             scale,
+            surface,
             scale_epoch: 0,
             scheduler: FrameScheduler::new(),
             encoder: InstanceEncoder::new(),
@@ -441,10 +454,32 @@ impl Window {
         &self.scene
     }
 
-    /// 建窗参数快照。
+    /// 建窗参数快照。`background` 可在运行期被 [`Window::set_background_color`] 改写。
     #[must_use]
     pub fn options(&self) -> &WindowOptions {
         &self.options
+    }
+
+    /// 改窗口背景色（同值 no-op）：写 `options.background`；有渲染器时把新颜色交给 GPU 线程。
+    ///
+    /// Windows 上值变化会标全量重绘：`SetBackgroundColor` 只在下一次 `Present1` 生效，调用方应在
+    /// 之后触发一帧（平台事件 / 主题重绘 / 动画 / HUD tick 均可）。GPU 侧在空闲或下一帧录制前应用；
+    /// UI 线程只写共享槽并唤醒，不直接调 DXGI（I1）。
+    ///
+    /// 仅 Windows 影响窗口底色；其它平台只更新参数（本轮）。
+    pub fn set_background_color(&mut self, color: Color) {
+        if self.options.background == color {
+            return;
+        }
+        self.options.background = color;
+        #[cfg(windows)]
+        {
+            // 背景色不是绘制图元：没有 damage 的帧可能永远不被 present，必须显式标全量。
+            self.full_damage_pending = true;
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_background_color(color);
+            }
+        }
     }
 
     /// 当前生效的 DPI 比例。
@@ -466,6 +501,7 @@ impl Window {
         let root = self.tree.root();
         // 与 `set_style` / `set_layout_override` 同一条失效路径（P11：它也标 `A11Y`）。
         self.tree.invalidate_layout(root);
+        self.surface = covering_surface(self.size(), self.scale);
     }
 
     /// 用窗口逻辑尺寸重排，返回本次布局统计（P06/P09 的帧驱动调用它）。
@@ -500,6 +536,21 @@ impl Window {
         self.tree.invalidate_layout(root);
         // a11y 的 bounds 全是物理像素 ⇒ 比例变了必须整棵重发（P11 §5.5）。
         self.a11y.note_bounds_changed();
+        self.surface = covering_surface(self.size(), self.scale);
+    }
+
+    /// Windows 平台层：写入真实客户区物理尺寸（`WM_SIZE` / `WM_DPICHANGED` 之后）。
+    ///
+    /// 值变化 ⇒ 标全量重绘（新暴露的像素没有对应 damage）；**不**标 layout、**不**动
+    /// `scale_epoch`：本方法只改渲染目标，不改布局；DPI 的布局变化由 `set_scale` / `set_size` 负责。
+    #[cfg(windows)]
+    pub(crate) fn set_surface(&mut self, surface: (u32, u32)) {
+        let surface = (surface.0.max(1), surface.1.max(1));
+        if self.surface == surface {
+            return;
+        }
+        self.surface = surface;
+        self.full_damage_pending = true;
     }
 
     // ── P11：a11y（快照交付 + 捕获） ─────────────────────────────────────────
@@ -725,11 +776,26 @@ impl Window {
         Ok(())
     }
 
-    /// 窗口的物理像素尺寸（`size × scale` 的 covering 结果）。
+    /// 窗口的物理像素尺寸（Windows = 真实客户区；其它平台 = `size × scale` 的 covering）。
     fn physical_surface(&self) -> (u32, u32) {
-        let rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
-            .to_physical_covering(self.scale);
-        (rect.width().max(1) as u32, rect.height().max(1) as u32)
+        self.surface
+    }
+
+    /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
+    ///
+    /// Windows：真实 surface（平台层给的客户区，至少 1 px）。
+    #[cfg(windows)]
+    fn frame_rect(&self) -> PhysicalRect {
+        PhysicalRect::new(0, 0, self.surface.0 as i32, self.surface.1 as i32)
+    }
+
+    /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
+    ///
+    /// 非 Windows：保持旧值（`size × scale` 的 covering **原始结果**，0 尺寸 ⇒ 0×0；surface 的
+    /// `max(1)` 只约束渲染目标，不改变 frame）。
+    #[cfg(not(windows))]
+    fn frame_rect(&self) -> PhysicalRect {
+        Rect::new(0.0, 0.0, self.size().width, self.size().height).to_physical_covering(self.scale)
     }
 
     /// 是否有节点需要重建 lane（`LAYOUT` / `PAINT` / `REUSABLE` 不在）。
@@ -754,8 +820,7 @@ impl Window {
             self.scene.release_lane(lane);
         }
         let scale = self.scale;
-        let size = self.size();
-        let frame = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
+        let frame = self.frame_rect();
         self.damage.reset(scale);
         let has_damage = self.full_damage_pending || self.pending_damage.is_some();
         if self.full_damage_pending {
@@ -856,8 +921,7 @@ impl Window {
         }
         #[cfg(feature = "test-support")]
         {
-            let frame_rect = Rect::new(0.0, 0.0, self.size().width, self.size().height)
-                .to_physical_covering(self.scale);
+            let frame_rect = self.frame_rect();
             let stats = std::mem::take(&mut self.stats);
             let record = crate::test_support::record::capture(
                 &self.scene,
@@ -885,9 +949,23 @@ impl Window {
         damage: DamageSummary,
     ) -> crate::render::RenderStats {
         let surface = self.physical_surface();
-        let frame = Rect::new(0.0, 0.0, self.size().width, self.size().height)
-            .to_physical_covering(self.scale);
+        let frame = self.frame_rect();
         let plan = plan(damage, self.damage.rects(), frame);
+        // `plan` 已把每个 damage 矩形夹进 `frame`；这里把「不变量被破坏」变成 debug 期显式失败
+        // （否则 D3D12 的 `Present1` / scissor 会以 `DXGI_ERROR_INVALID_CALL` 形式在 GPU 线程炸）。
+        if let Plan::Partial(rects) = plan {
+            for rect in rects.as_slice() {
+                debug_assert!(
+                    rect.x0 >= 0
+                        && rect.x0 <= rect.x1
+                        && rect.x1 <= surface.0 as i32
+                        && rect.y0 >= 0
+                        && rect.y0 <= rect.y1
+                        && rect.y1 <= surface.1 as i32,
+                    "damage rect {rect:?} escapes the surface {surface:?}"
+                );
+            }
+        }
         // §4.4 兜底：没有像素要画且目标尺寸没变 ⇒ 不发布（省掉一次跨线程拷贝）。尺寸/DPI
         // 变化时必须发布——否则 GPU 线程永远看不到新的 `surface`，也就不会重建目标。
         if plan == Plan::Idle && renderer.surface() == surface {
@@ -1070,12 +1148,22 @@ impl Window {
     }
 }
 
+/// `size × scale` 的 covering 物理尺寸（向外 floor/ceil，至少 1 px）。
+///
+/// 非 Windows 平台恒等于它；Windows 只是 `set_size` / `set_scale` 重算出的初值，平台层随后用
+/// `Window::set_surface` 写入真实客户区（不是只有首帧前）。
+fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
+    let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
+    (rect.width().max(1) as u32, rect.height().max(1) as u32)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions};
+    use super::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions, covering_surface};
     use crate::{
         math::{Scale, Size},
         node::dirty::DirtyFlags,
+        paint::color::Color,
     };
 
     fn window() -> Window {
@@ -1127,6 +1215,146 @@ mod tests {
         assert_eq!(options.size.width, 800.0);
         assert_eq!(options.size.height, 600.0);
         assert_eq!(options.scale, Scale::ONE);
+        assert_eq!(
+            options.background,
+            Color::BLACK,
+            "默认背景必须是不透明黑（Color::default() 是透明）"
+        );
+    }
+
+    #[test]
+    fn set_background_color_updates_options_and_ignores_the_same_value() {
+        let mut window = window();
+        assert_eq!(window.options().background, Color::BLACK);
+        assert!(!window.full_damage_pending);
+
+        window.set_background_color(Color::WHITE);
+        assert_eq!(window.options().background, Color::WHITE);
+        #[cfg(windows)]
+        assert!(
+            window.full_damage_pending,
+            "改色必须标一帧，否则 SetBackgroundColor 可能永不被 present"
+        );
+
+        // 同值 no-op：清掉 damage 之后再调同值，不得重新置位。
+        window.full_damage_pending = false;
+        window.set_background_color(Color::WHITE);
+        assert_eq!(window.options().background, Color::WHITE);
+        assert!(!window.full_damage_pending, "同值 no-op 不得标 damage");
+    }
+
+    /// 接线：`commit_frame` 的 frame 用真实 surface（不是 `size × scale` 的 covering）。
+    #[cfg(all(windows, feature = "test-support"))]
+    #[test]
+    fn a_committed_frame_uses_the_platform_surface_not_the_covering_size() {
+        let (mut window, _node) = painted_window();
+        // 800×600 的 covering 与 449×300 不同：记录里的整帧矩形能区分两者。
+        window.set_surface((449, 300));
+
+        let outcome = window.frame().expect("帧成功");
+        assert!(matches!(outcome, FrameOutcome::Committed(_)));
+        let record = window.record().expect("已提交帧必须有记录");
+        assert!(record.damage_full, "set_surface 标全量重绘");
+        assert_eq!(
+            record.damage,
+            vec![crate::math::PhysicalRect::new(0, 0, 449, 300)],
+            "frame 必须用真实 surface，而不是 covering"
+        );
+    }
+
+    /// 非 Windows 的退化尺寸：`frame_rect` 仍是 0×0（钉住 macOS/Linux 的旧行为；本机不跑）。
+    #[cfg(not(windows))]
+    #[test]
+    fn frame_rect_keeps_the_raw_covering_for_degenerate_sizes() {
+        use crate::math::PhysicalRect;
+
+        let mut window = window();
+        window.set_size(Size::new(800.0, 600.0));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
+
+        for size in [
+            Size::new(0.0, 0.0),
+            Size::new(f32::NAN, 10.0),
+            Size::new(10.0, f32::INFINITY),
+        ] {
+            window.set_size(size);
+            assert_eq!(
+                window.frame_rect(),
+                PhysicalRect::new(0, 0, 0, 0),
+                "size {size:?} 的 frame 必须是 0×0（surface 的 max(1) 不参与）"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_starts_and_tracks_the_covering_size() {
+        let mut window = Window::new(
+            WindowId::for_test(1),
+            WindowOptions {
+                size: Size::new(800.0, 600.0),
+                ..WindowOptions::default()
+            },
+        );
+        assert_eq!(window.physical_surface(), (800, 600));
+
+        // 125 / 150 / 175%：surface = 逻辑尺寸 × scale 的 covering（向外取整）。
+        for (factor, expected) in [
+            (1.25, (1000, 750)),
+            (1.5, (1200, 900)),
+            (1.75, (1400, 1050)),
+        ] {
+            window.set_scale(Scale::new(factor).expect("合法比例"));
+            assert_eq!(window.physical_surface(), expected, "scale {factor}");
+            assert_eq!(
+                window.physical_surface(),
+                covering_surface(window.size(), window.scale()),
+                "surface 必须与 covering 公式一致"
+            );
+        }
+
+        // 亚像素：covering 向外取整（256.8 × 1.75 = 449.4 → 450），不是 round。
+        window.set_size(Size::new(256.8, 100.5));
+        assert_eq!(window.physical_surface(), (450, 176));
+        assert_eq!(
+            window.physical_surface(),
+            covering_surface(window.size(), window.scale())
+        );
+        // 零尺寸至少 1 px（不能给 DXGI 0 尺寸的 swapchain）。
+        window.set_size(Size::new(0.0, 0.0));
+        assert_eq!(window.physical_surface(), (1, 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
+        let mut window = window();
+        assert_eq!(window.physical_surface(), (800, 600));
+        assert!(!window.full_damage_pending);
+        window.tree_mut().clear_all_dirty_for_test();
+        let epoch = window.scale_epoch();
+
+        window.set_surface((0, 0));
+        assert_eq!(window.physical_surface(), (1, 1), "零尺寸钳到 1 px");
+        assert!(window.full_damage_pending, "surface 变化必须标全量 damage");
+        let root = window.tree().root();
+        assert!(
+            !window
+                .tree()
+                .get(root)
+                .expect("root")
+                .dirty()
+                .contains(DirtyFlags::LAYOUT),
+            "set_surface 不标 layout（只是目标尺寸，不是布局变化）"
+        );
+        assert_eq!(window.scale_epoch(), epoch, "set_surface 不动 scale_epoch");
+
+        window.full_damage_pending = false;
+        window.set_surface((1, 1));
+        assert!(!window.full_damage_pending, "同值 no-op 不得重复标全量");
+
+        window.set_surface((10, 20));
+        assert_eq!(window.physical_surface(), (10, 20));
+        assert!(window.full_damage_pending);
     }
 
     #[test]
@@ -1283,10 +1511,7 @@ mod tests {
 
     use crate::{
         node::builder::NodeBuilder,
-        paint::{
-            color::Color,
-            style::{PaintSpec, StylePatch},
-        },
+        paint::style::{PaintSpec, StylePatch},
     };
 
     fn painted_window() -> (Window, crate::node::id::NodeId) {

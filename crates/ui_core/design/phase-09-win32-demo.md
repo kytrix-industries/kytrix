@@ -156,7 +156,7 @@ crates/ui_core_demo/
 
 | 实测                                    | 结果                                                                                                                                                           |
 |-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `CreateSwapChainForHwnd`（隐藏窗口）    | ok；`GetDesc1`：`format=87 (B8G8R8A8_UNORM)` / `bufferCount=3` / `SwapEffect=3 (FLIP_SEQUENTIAL)` / `Scaling=0 (STRETCH)` / `AlphaMode=3 (IGNORE)` / `flags=0` |
+| `CreateSwapChainForHwnd`（隐藏窗口）    | ok；`GetDesc1`：`format=87 (B8G8R8A8_UNORM)` / `bufferCount=3` / `SwapEffect=3 (FLIP_SEQUENTIAL)` / `Scaling=0 (STRETCH)` / `AlphaMode=3 (IGNORE)` / `flags=0`。**`Scaling` 已于 2026-11-15 改为 `DXGI_SCALING_NONE`（F-184），本行是当时的 probe 记录**，现行为见 `async-render-pipeline.md` §6.2 |
 | ① 隐藏窗口 + 首帧全量 `Present1`        | **`S_OK`**（`0x00000000`），设备 `S_OK`                                                                                                                        |
 | ② `ShowWindow` 之后全量 `Present1`      | `S_OK`                                                                                                                                                         |
 | ③ 局部 dirty `(8,8)-(24,24)` `Present1` | `S_OK`                                                                                                                                                         |
@@ -357,8 +357,8 @@ WndProc(msg, wparam, lparam)
 | `WM_KEYUP` / `WM_SYSKEYUP`                        | 同上                                                                                                                                   | `Key { state: Up }`                         |
 | `WM_CHAR`                                         | `char::from_u32(w & 0xFFFF)`；代理对由两次 `WM_CHAR` 组成，`WndProcState` 拼（低代理缓存 1 个）                                        | `Char(c)`                                   |
 | `WM_SETFOCUS` / `WM_KILLFOCUS`                    | —                                                                                                                                      | `Focus(true/false)`                         |
-| `WM_SIZE`                                         | `width = LOWORD(l)`、`height = HIWORD(l)`（**客户端物理像素**）；`wParam` 是 `SIZE_*`（`SIZE_MINIMIZED=1` 时**丢弃**）                 | `Resize`                                    |
-| `WM_DPICHANGED`                                   | `dpi = LOWORD(w)`（`HIWORD` 是 y-dpi，v1 要求两者相等，否则 `InvalidDpiScale`）；`suggested = *(lParam as *const RECT)`                | `Dpi`                                       |
+| `WM_SIZE`                                         | `width = LOWORD(l)`、`height = HIWORD(l)`（**客户端物理像素**）；`wParam` 是 `SIZE_*`（`SIZE_MINIMIZED=1` 时**丢弃**）；`Resize` 的处理器随后 `window.set_surface((width, height))` | `Resize`                                    |
+| `WM_DPICHANGED`                                   | `dpi = LOWORD(w)`（`HIWORD` 是 y-dpi，v1 要求两者相等，否则 `InvalidDpiScale`）；`suggested = *(lParam as *const RECT)`；`Dpi` 的处理器回读 `client_size()` 写 `set_surface`，最小化时 `IsIconic` 跳过 | `Dpi`                                       |
 | `WM_NCCALCSIZE`                                   | `wParam==0` → 交 `DefWindowProcW`；`wParam==1` → 同样交 `DefWindowProcW`（P09 系统标题栏）；**返回值必须来自 `DefWindowProcW`**        | 无事件                                      |
 | `WM_GETMINMAXINFO`                                | 写 `ptMinTrackSize`（由 `NativeWindow.min_size` 的物理像素给出）                                                                       | 无事件                                      |
 | `WM_PAINT`                                        | `BeginPaint` → `EndPaint`（**必做**）                                                                                                  | 无事件（引擎自己 present，不靠 `WM_PAINT`） |
@@ -522,16 +522,18 @@ D8 检测在 3c 内部（`Renderer::new_for_hwnd` → `Device::new` → `GpuCaps
 
 ```text
 WM_SIZE(w, l):
-  if wParam == SIZE_MINIMIZED: return                      // 最小化不重建
-  physical = (LOWORD(l), HIWORD(l))
+  if wParam == SIZE_MINIMIZED: return                      // 最小化不重建（也只丢弃 SIZE_MINIMIZED）
+  physical = (LOWORD(l), HIWORD(l))                        // = 新的客户区物理尺寸
   logical  = scale.to_logical(每个分量)                     // I11
   window.set_size(logical)                                 // 标根 LAYOUT + full_damage_pending
+  window.set_surface(physical)                             // 真实渲染目标（F-186；值变化标全量）
   dispatcher.wake()                                        // 下一帧提交时 resize
-下一帧 commit（window.rs::submit_gpu 既有逻辑）：
-  fresh = renderer.surface() != physical || renderer.is_fresh()
-  if fresh { renderer.resize(physical)? }                  // 顺序见 §2.7
+下一帧（2026-11-15 后为异步）：GPU 线程按 FrameRequest.surface 比较并 resize（§2.7 顺序）
 ```
 
+- `set_surface` 必须写在 `set_size` 之后：`set_size` 会先按 `size × scale` 重算 covering，`set_surface` 用真实客户区覆盖它；两者都标全量，不重复。
+- 最小化只丢弃 `SIZE_MINIMIZED` 的 `WM_SIZE`；其它 `WM_SIZE`（恢复 / 拖动）照常更新 size + surface。最小化期间 `WM_DPICHANGED` 的 `GetClientRect` 是 0×0（`client_size()` 钳成 1×1），此时用 `IsIconic` 跳过 `set_surface`，目标保持 `set_scale` 重算的 covering；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖。
+- P09 同步管线里的 `fresh = renderer.surface() != physical` 已由 GPU 线程按 `async-render-pipeline.md` §6.4 取代；UI 线程不再算 `fresh`。
 - **VBO / 实例缓冲不重建**：`InstanceBuffer` 容量跨帧保留，只有 persist 纹理与 swapchain buffer 重建（主设计 §5.5 / §9.3）。
 - `ResizeBuffers` 失败 ⇒ `EngineError::Swapchain`，**不重试**（P08 §2.7 的结论不变；现在失败概率已被 F-86 降到"真故障"）。
 - 最小尺寸：`WM_GETMINMAXINFO` 拦住用户拖拽；`WM_SIZE` 里再 `clamp(320,200)` 一次（外部 `SetWindowPos` 会绕过
@@ -542,6 +544,8 @@ WM_SIZE(w, l):
 - `WM_DPICHANGED`：`scale = dpi / 96.0` → `Scale::new(scale)`；`None` ⇒ `EngineError::InvalidDpiScale`（**唯一**生产者是这里）。
   随后 `SetWindowPos` 到 `lParam` 的建议 `RECT`（**必须**采用，否则用户拖到另一块屏时窗口尺寸会跳），
   再 `window.set_scale(scale)`（P06 已有：标根 `LAYOUT|PAINT` + `scale_epoch++` ⇒ 图集换代）。
+  最后回读真实客户区 `native.client_size()` 并 `window.set_surface(...)`（F-186）；最小化时
+  `GetClientRect` 是 0×0，用 `IsIconic` 跳过（保持 `set_scale` 重算的 covering，恢复的 `WM_SIZE` 覆盖）。
 - 外观：`WM_SETTINGCHANGE` 且 `lParam` 指向 `ImmersiveColorSet` ⇒ 读
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`（`Win32_System_Registry` 已在
   features）；

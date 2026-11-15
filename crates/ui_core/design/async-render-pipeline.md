@@ -1,8 +1,8 @@
 # 三平台异步渲染管线设计（Metal / D3D12 / Vulkan）
 
-> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-182）。
+> 状态：**已实现（2026-11-14）**；实现后的对抗性审查修订见 §15（F-166 … F-186）。
 > 范围：`crates/ui_core/src/render/**`、`crates/ui_core/src/window.rs` 的提交段、三个平台的窗口循环提交段
-> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-182（§27–§29）、`macos-verification.md` §2.9/§2.11
+> 关联：`phase-08-d3d12.md` §5、`phase-12-macos-linux.md` §5/§6、`DEVIATIONS.md` F-121/F-164/F-166..F-186（§27–§31）、`macos-verification.md` §2.9/§2.11
 > 变更性质：**重写**，不保留旧路径（AGENTS §1.1）
 
 ---
@@ -208,9 +208,11 @@ UI 线程 `publish`：
 
 resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU 线程在渲染该帧前比较自己持有的 surface：
 
+- **surface 的定义分平台**：Windows = 平台层给的**真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS/Linux = `size × scale` 的 covering（`frame_rect()` 保持旧值，0 尺寸仍是 0×0）。
 - 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
 - **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 走 `set_layer_scale`（§5.3），Windows/Linux 的物理像素由平台层算好后再作为 `surface` 出现。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
+- `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` / `submit_gpu` 三处都走 `Window::frame_rect()`（Windows 与 macOS/Linux 各一份 `#[cfg]` 实现，F-186）。
 
 ### 4.5 门面接口（三平台同名、各自实现）
 
@@ -353,7 +355,7 @@ loop {
 ```
 UI 线程                                  kytrix-d3d12 线程（每窗口）
 ────────────────────────────────────    ──────────────────────────────────────────
-窗口消息（WM_SIZE 只记录尺寸）
+窗口消息（WM_SIZE 只更新尺寸/客户区，不 resize）
 publish(FrameRequest) ──► 最新帧槽      循环：等 work event / waitable
 queue_atlas_upload ─────► 图集槽              → 取最新帧
 poll() ◄──────────────── 反馈槽               → 槽 fence（通常已完成）
@@ -369,16 +371,22 @@ DXGI_SWAP_CHAIN_DESC1 {
     Format: DXGI_FORMAT_B8G8R8A8_UNORM,     // 现状（F-80），不改
     BufferCount: 3,                          // BUFFER_COUNT 保持
     SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, // 内容保留 ⇒ 可以只 copy dirty 区
-    Scaling: DXGI_SCALING_STRETCH,
+    Scaling: DXGI_SCALING_NONE,              // resize 期间 DWM 不拉伸旧 buffer
+    AlphaMode: DXGI_ALPHA_MODE_IGNORE,       // 背景色 alpha 不参与合成
     Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
 }
-chain2.SetMaximumFrameLatency(2);            // 默认 1；2 = 一帧给合成器、一帧给 GPU
+raw.SetBackgroundColor(sRGB 编码的 RGBA);      // 创建后 + 每次 ResizeBuffers 后（S-139）
+chain2.SetMaximumFrameLatency(1);             // CPU 排队深度 1（F-185）
 waitable = chain2.GetFrameLatencyWaitableObject();
 ```
 
+- `DXGI_SCALING_NONE`（[DXGI_SCALING](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling)）：resize 期间 DWM **不**把旧 buffer 拉伸到新客户区，新暴露的右/下区域由 [`IDXGISwapChain1::SetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-setbackgroundcolor) 填充。旧的 `STRETCH` 实测在 300×200 跳变时把整帧放大 1.25×（card 907×269）、文字发虚（F-184）。
+- **背景色编码（实测偏差，S-139）**：官方说 “we recommend that you perform floating point operations in a linear color space”，但在本路径（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE` 的 HWND swapchain）上 `DXGI_RGBA` 的 float **按 sRGB 编码字节直写**：传 linear 值得到 `(1,1,2)`，传 sRGB 编码分量得到 `(11,14,19)`（= `#0B0E13`）。实现固定走 `Color` → 不透明化（alpha=1、不改 RGB）→ `ColorResolver::resolve`（linear、alpha=1 ⇒ 非预乘）→ IEC 61966-2-1 linear→sRGB encode → `DXGI_RGBA`（alpha=1），见 `render/windows/renderer.rs::background_rgba`。
+- **背景色契约**：`WindowOptions.background: Color`（默认 `Color::BLACK`；不透明；仅 Windows 影响窗口底色，demo 显式设 `#0B0E13`）+ `Window::set_background_color`（运行期改写；下一次 `Present1` 生效，§6.3）。官方同时说明背景色只对 windowed 的 `SCALING_NONE` swapchain 有效，且「swapchain 内容小于目标窗口时才可见」——正是 resize 期间新暴露区域；[`IDXGISwapChain1::GetBackgroundColor`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值、不代表屏幕（§6.4）。
+- 保留 `FLIP_SEQUENTIAL`（内容保留 ⇒ 可以只 copy dirty 区）与 `FRAME_LATENCY_WAITABLE_OBJECT`（§6.3 每帧等一次）。
 - 该 flag 让 swapchain **自带有独立的最大排队帧信号量**；不设时同一进程内所有 swapchain 共享同一个隐式帧延迟计数（Chromium 的实测结论，见 [Chromium issue 40890504](https://issues.chromium.org/issues/40890504)）。
 - 官方要求：**每帧开始渲染前等待该句柄，包括第一帧**（[GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)）。等待发生在 GPU 线程，不违反 I1。
-- `SetMaximumFrameLatency` 必须在 `IDXGISwapChain2` 上调（不是 `IDXGIDevice1`）；`ResizeBuffers` 时 flag 必须原样传入（[DXGI_SWAP_CHAIN_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_chain_flag)）。
+- `SetMaximumFrameLatency` 必须在 `IDXGISwapChain2` 上调（不是 `IDXGIDevice1`，[SetMaximumFrameLatency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency)）；`ResizeBuffers` 时 flag 必须原样传入（[DXGI_SWAP_CHAIN_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_chain_flag)）。
 
 ### 6.3 每帧序列（GPU 线程）
 
@@ -387,6 +395,8 @@ loop {
     // 两个等待点，各自消费自己的对象，绝不在同一帧里重复等 waitable（auto-reset，重复等会白等一个 vsync）
     drain_completed();                                       // 观察到完成：发布反馈 + retire（见下）
     if shutdown { break; }
+    // 背景色应用点 (a)：空闲也要落地待定背景色（改色不要求提交一帧；UI 只写共享槽 + wake）。
+    if let Some(rgba) = shared.take_background() { swapchain.set_background_color(rgba)?; }
     if !has_pending_frame() {
         // 空闲：work（新帧/关闭）或 completion（在飞帧完成）任一到达；两者都是 auto-reset。
         WaitForMultipleObjects([work_event, completion_event], INFINITE);
@@ -411,6 +421,8 @@ loop {
     // 实现里这两个出口保留为不变量断言（`debug_assert!`），不是可走路径。
     let Some(frame) = take_latest_frame() else { unreachable!("pending frame was checked") };
     if frame.plan == Idle && !is_fresh { unreachable!("idle frames are never published") };
+    // 背景色应用点 (b)：等 waitable 期间到达的背景色与帧一起落地（仍在 resize / 录制之前）。
+    if let Some(rgba) = shared.take_background() { swapchain.set_background_color(rgba)?; }
     if frame.surface != surface { do_resize(frame.surface)?; }   // 见 §6.4；任何错误 ⇒ 显式失败
 
     let slot = ring.acquire();                              // 按 acquire 次数轮转，不由 FrameIndex 取模（F-176）
@@ -443,7 +455,8 @@ drain_completed():
 ```
 
 - `Present1(1, 0, dirty)`：`sync=1` 保持 vsync（与 macOS `displaySyncEnabled`、Vulkan `MAILBOX` 的观感一致：不撕裂）；dirty rect 语义完全沿用 `FramePlan`（`fresh` ⇒ 全量、矩形必须夹紧，F-72 三条继续成立）。
-- 不在 UI 线程调用任何 DXGI/D3D12 的等待函数；UI 线程只在 `WM_SIZE` 更新 `Window` 尺寸并 `wake`，新尺寸随下一帧的 `FrameRequest.surface` 到达（§4.4）。
+- GPU 循环里只有两个 `take_background` 应用点：空闲（等待 work/completion 之前）与取帧之后、resize/录制之前（伪代码 (a) (b)）；`ResizeBuffers` 内的重设是同一存储值的重新应用，不是新的取色点。`SetBackgroundColor` 只在下一次 `Present1` 生效（官方），因此 UI 线程任意时刻改色都合法，实际可见时间由 GPU 线程的下一次应用点 + present 决定；`shutdown` / `terminated` 之后的改色请求直接丢弃（`Shared::set_background` no-op），GPU 线程退出前不再应用待定色。应用背景色不消费 waitable、不是 present 出口，token 守恒不变（F-182 的关闭例外是唯一例外）。
+- 不在 UI 线程调用任何 DXGI/D3D12 的等待函数；UI 线程只在 `WM_SIZE`/`WM_DPICHANGED` 更新 `Window` 尺寸、scale 与真实客户区 surface（`set_surface`）并 `wake`，新尺寸随下一帧的 `FrameRequest.surface` 到达（§4.4 / §6.7）。
 - 反馈与 retire 都只在完成观测点推进：提交点只做 `SetEventOnCompletion`（§4.1 的跨平台契约；`completed_at` 不是 `Present1` 返回的时刻）。
 - 录制仍在一条 direct list 上（单线程录制；D3D12 的 list 本来就不是自由线程的，官方模型是「list 可并发录制、队列串行提交」，我们只有一条录制流，不需要多 list）。
 
@@ -458,6 +471,7 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
       swapchain.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
                               FRAME_LATENCY_WAITABLE_OBJECT);   // flag 原样
       backbuffers = GetBuffer(0..3);  rtv = 重建;
+      swapchain.set_background_color(background);               // 官方未承诺保留 ⇒ 无条件重设（S-139）
       persist.recreate(w, h);                     // 旧 persist 走 retire
       let again = chain2.GetFrameLatencyWaitableObject();       // 见 §11 验证项 2
       if again != waitable { CloseHandle(waitable); waitable = again; }
@@ -467,6 +481,9 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 - 官方要求：`ResizeBuffers` 前必须释放全部 back buffer 引用、且 GPU 已完成相关工作（[ResizeBuffers](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-resizebuffers)）。
 - resize 后第一帧强制 `Full`（新的后备缓冲内容未定义；`FLIP_SEQUENTIAL` 只保证「同一缓冲跨 present 保留」）。
+- **resize 目标 = 真实客户区**：`w, h` 来自 `FrameRequest.surface`，即平台层写入的 `Window.surface`（§4.4 / §6.7），不再是 `size × scale` 的 covering。`Window::set_surface` 在 `WM_SIZE` 后直接用 lParam 的客户区物理尺寸，`WM_DPICHANGED` 后回读 `client_size()`；最小化时 `GetClientRect` 是 0×0，不拿它当目标，**不重建 1×1**（§6.7 的 `IsIconic` guard）。
+- `ResizeBuffers` 之后**无条件重设背景色**：官方没有承诺 `ResizeBuffers` 保留 `SetBackgroundColor`（[GetBackgroundColor](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor) 只回读存储值），所以 `Swapchain::resize` 末尾总调 `apply_background`，不依赖重建前的值（S-139）。
+- 实现不在 resize 后重设 `SetMaximumFrameLatency`；waitable 句柄按上面的伪代码重取（§11 验证项 2）。
 
 ### 6.5 fence / retire
 
@@ -491,8 +508,9 @@ GPU 线程收到 FrameRequest，surface != 当前 surface：
 
 ### 6.7 主线程职责
 
-- `WM_SIZE`/`WM_DPICHANGED`：只更新 `Window` 的 size/scale 并 `dispatcher.wake()`（GPU 线程的 `resize_pending` 由下一帧的 `FrameRequest.surface` 派生，§4.4）。
+- `WM_SIZE`/`WM_DPICHANGED`：更新 `Window` 的 size/scale 与**真实客户区 surface**（`set_surface`；`WM_SIZE` 的 lParam 就是新客户区的物理宽高，`WM_DPICHANGED` 回读 `client_size()` 且最小化时用 `IsIconic` 跳过），然后 `dispatcher.wake()`。GPU 线程的目标尺寸由下一帧的 `FrameRequest.surface` 派生（§4.4）。
 - 不调用 `wait_idle` / `ResizeBuffers` / `Present`；窗口销毁顺序不变（先 drop `Window`→`Renderer`，再 `DestroyWindow`）。
+- 背景色：`Window::set_background_color` 只在 UI 线程写 `Shared` 的待应用槽 + `wake`（并标 full damage），不在 UI 线程调 `SetBackgroundColor` 或任何 DXGI（I1）；GPU 线程在 §6.3 的两个应用点落地，下一次 `Present1` 生效。macOS/Linux 只记录参数，本轮无渲染效果（S-140）。
 - **关闭握手**：`Renderer::drop` 先 signal shutdown + `SetEvent(work_event)` + `SetEvent(completion_event)`（GPU 线程可能阻塞在 `[waitable, completion]` 上，`work` 不在那个等待集合里），GPU 线程看到标志后停止 present、等自己的 fence、释放 back buffer 引用、销毁 swapchain 后退出。**UI 线程允许在关闭时等待 GPU 线程退出**（有界于消息泵），不再用 2 s 超时后 detach。UI 线程**不能直接 `join`**：DXGI 的 `Present` 可能同步 `SendMessage` 到窗口的消息泵线程（[DXGI overview](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi)），直接 join 会和「消息泵停转」互等；关闭期间用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）**无限**边泵消息边等退出（F-169）。
 - 平台泵的 1ms `SetTimer`（连续帧）保留：它是 UI 的动画时钟，不是 GPU 节奏。
 
@@ -632,7 +650,7 @@ recreate_swapchain():
 | 提交异步 | `MTLCommandBuffer.commit` | `ExecuteCommandLists`（异步，返回 void） | `vkQueueSubmit` |
 | 完成通知 | `addCompletedHandler` | `ID3D12Fence::SetEventOnCompletion` / 槽 fence | `VkFence` / timeline |
 | 节奏 | `CAMetalDisplayLink` | `FRAME_LATENCY_WAITABLE_OBJECT` | `vkAcquireNextImageKHR` + 合成器 |
-| 背压 | 3 drawable + semaphore(3) | `SetMaximumFrameLatency(2)` + waitable | image 数 + fence |
+| 背压 | 3 drawable + semaphore(3) | `SetMaximumFrameLatency(1)` + waitable（`SCALING_NONE`，F-185） | image 数 + fence |
 | resize | 重建 persist（无等待） | `ResizeBuffers`（GPU 线程） | `oldSwapchain`（无 wait idle） |
 | 延迟释放 | completion handler → retire | fence 值 → retire | timeline 值 → retire |
 | 局部更新 | persist + scissor + 整面 blit | persist + scissor + dirty rect copy + `Present1` | persist + scissor + 整面 copy（+ incremental hint） |
@@ -673,7 +691,7 @@ UI 线程上没有任何一行等待。
 | `render/compositor.rs` | 新增 `Plan::merge`（Full 优先、矩形并集、超限降级 Full）+ 单测 |
 | `render/windows/renderer.rs` **新增** | 门面（最新帧槽/图集槽/反馈/线程句柄），对应 macOS 的 `renderer.rs` |
 | `render/windows/queue.rs` | `submit` 去掉 `wait_for`；新增 `reset_slot`/`wait_slot_fence`；`submit_immediate` 仅测试保留 |
-| `render/windows/swapchain.rs` | 加 `IDXGISwapChain2`、waitable、`SetMaximumFrameLatency(2)`、`present1`、`resize`（带 flag）、`waitable()` |
+| `render/windows/swapchain.rs` | 加 `IDXGISwapChain2`、waitable、`SetMaximumFrameLatency(1)`、`DXGI_SCALING_NONE` + `SetBackgroundColor`（创建后 / `ResizeBuffers` 后，S-139）、`present1`、`resize`（带 flag）、`waitable()` |
 | `render/windows/compositor.rs` | 拆出 `GpuRenderer`（GPU 线程独占）；窗口循环 `gpu_loop` 落在 `render/windows/renderer.rs`（F-167）；`resize` 改由 GPU 线程调 |
 | `render/linux/swapchain.rs` | 每 image 一个 `render_finished`；`create` 带 `old`；新增 `recreate`/`retire`；present mode 改 `MAILBOX` |
 | `render/linux/compositor.rs` | 拆出 `GpuRenderer`（`gpu_loop` 落在 `render/linux/renderer.rs`，F-167）；`resize` 不再 `wait_idle`；提交去掉 `wait_for_fences`；retire 改 timeline 非阻塞推进 |
@@ -682,8 +700,8 @@ UI 线程上没有任何一行等待。
 | `render/macos/queue.rs` | 删除 `Submitted` 轮询与 `waitUntilCompleted` 背压；`begin` 只取槽；`submit` 只 commit；完成走 `addCompletedHandler` |
 | `render/macos/swapchain.rs` | 删除 `next_drawable`；加 display link 相关（或移到 `renderer.rs`）；保留 `drawableSize`/`scale` 设置（改由主线程调用） |
 | `render/macos/compositor.rs` | `submit_payload` 改为「给定 drawable 渲染」；persist 重建不等待；图层属性写接口移到 `renderer.rs` |
-| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调 |
-| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸 |
+| `window.rs` | `submit_gpu` 改为构造 `FrameRequest` 并 `publish`；删除 `renderer.resize`/`is_fresh` 调用；`poll_renderers` 去掉 `cfg`，三平台都调；新增 `surface` / `set_surface` / `frame_rect()`（F-186）与 `background`（F-184） |
+| `platform/{windows,macos,linux}` 泵 | 每轮调 `poll()`；macOS 每轮调 `sync_pacing`；`WM_SIZE`/configure 只记录尺寸；Windows 还把真实客户区写进 `Window::set_surface`（§6.7） |
 | `lib.rs` / `render.rs` | 模块声明更新（新增两个 `renderer.rs`） |
 
 ### 9.2 删除（已全部落地：F-164、F-166 … F-182）
@@ -712,9 +730,12 @@ UI 线程上没有任何一行等待。
 | 用例 | 通过判据 |
 |---|---|
 | live resize 连续拖动 2s | UI 线程单次 `frame` 耗时 max < 4ms；无 `ResizeBuffers`/`acquire`/`nextDrawable` 出现在 UI 线程的 sample 里；画面跟随拖动 |
-| resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量） |
+| live resize 无整帧缩放（Windows，`SCALING_NONE`） | 拖动期间卡片 bbox 恒定（911 帧：725×220，`stretch_w = 1.00000`）、文字/HUD 不缩放且锐度不降；新暴露的右/下区域 = 窗口背景色且 ≤ 2 帧；缩小时右/下裁切、右锚 HUD 滞后 1–2 帧后回位（可接受） |
+| 窗口背景色（`#0B0E13`） | resize 条带 100% 像素 = `(11,14,19)`（无黑带/二次编码；200 次 resize 后仍一致）；`set_background_color` 在下一次 `Present1` 生效；`GetBackgroundColor` 在**重设后**回读 == 设定（隐藏窗口测试；未做「不重设」对照） |
+| resize 到 0 宽/最小化/还原 | 不崩溃、不 device lost；恢复后首帧正确（全量）；最小化期间不重建 1×1（`IsIconic` 跳过 `set_surface`），5 s 恢复像素差 0.067% |
+| 真实 DPI 150% / 175% | **未实测**（V-120）：本轮实机只跑 125%（DPI=120）；175% 只有 `256.8 × 1.75 = 449.4` 的取整事实（covering 到 450） |
 | 空闲 2s | 0 帧；两次截图逐字节相同；UI 线程 CPU 0.0%；GPU 线程无自旋唤醒 |
-| 连续帧（HUD/动画）60s | 帧率由显示器决定（58–60 或 120）；无累积延迟（HUD 的 publish→present 延迟稳定） |
+| 连续帧（HUD/动画）60s | 帧率由显示器决定；HUD 的 FPS 是**提交率**（本机 60Hz 实测 63.9/64.0/60.6，旧版本同环境 61.6–64.4，非回归；与旧口径 58–60 不一致 ⇒ V-120）；无累积延迟（Latency 1.88–13.23 ms） |
 | 全屏转场（macOS）/ 遮挡（Win/Linux） | 不阻塞 UI；恢复后继续出帧 |
 | 设备丢失注入（D3D12 debug layer / `VK_EXT_device_fault` / Metal 错误） | UI 线程收到粘性错误并退出，不 panic |
 | 多窗口 | 各窗口独立节奏；一个窗口 resize 不改变另一个窗口帧率 |
@@ -727,15 +748,18 @@ UI 线程上没有任何一行等待。
 
 ---
 
-## 11. 实施前必须实测的三项（P0 探针）
+## 11. 探针与验证项（P0 三项 + Windows resize 追加）
 
 | # | 假设 | 实验 | 不成立时的结论 |
 |---|---|---|---|
 | 1 | `CAMetalDisplayLink` 在主 run loop **common modes** 下，live resize / 全屏转场期间仍回调；暂停/恢复 `isPaused` 不丢 drawable | 200 行探针窗口：拖动缩放 10s + 全屏进出各 5 次，统计回调次数与 drawable 尺寸变化 | 若 live resize 期间不回调：把 display link 同时挂 `.eventTracking`（同 run loop 多 mode）再测；仍不回调则本设计的 macOS 段需要重做（评审决定），**不预置运行期分支** |
 | 2 | `ResizeBuffers` 后 `GetFrameLatencyWaitableObject` 返回的句柄仍有效（或返回新句柄），`SetMaximumFrameLatency` 不需重设 | 连续 resize 200 次，每次 resize 后记录句柄值与 `GetMaximumFrameLatency`，并 present 一帧 | 若句柄失效：每次 resize 后重取并比较，不同则关闭旧的（已写进 §6.4 伪代码） |
 | 3 | GPU 线程 + calloop 并发操作同一 `wl_display`（WSI 私有队列）稳定 | 探针：GPU 线程 present 10k 帧 + UI 线程同时拖动 resize 200 次；`WAYLAND_DEBUG=1` 找协议错误；用 `perf` 看 UI 线程是否自旋 | 若出现自旋/协议错误：`acquire` 改 `timeout=0`、由 frame callback 驱动重试（引入跳帧重试状态机），需评审 |
+| 4 | `SetBackgroundColor` 的 `DXGI_RGBA` 按 linear 还是 sRGB 编码解释 | 同一 HWND swapchain（`B8G8R8A8_UNORM` + `FLIP_SEQUENTIAL` + `SCALING_NONE`）分别传 linear 与 sRGB 编码的主题色，截取 resize 条带像素 | **已实测**：按 sRGB 编码字节直写。linear 值 ⇒ 条带 `(1,1,2)`；sRGB 编码 ⇒ `(11,14,19)`（= `#0B0E13`，229 个新尺寸帧 100% 像素）。官方 “recommend linear” 在本路径不适用 ⇒ S-139 |
+| 5 | `ResizeBuffers` 是否保留背景色 | 创建后设置、`ResizeBuffers` 后 `GetBackgroundColor` 回读 | 官方未承诺；隐藏窗口测试在**重设后**回读 == 设定，无法区分 DXGI 是否保留（未做不重设对照）。实现不依赖：`Swapchain::resize` 后无条件重设（S-139 / V-120） |
+| 6 | `SetMaximumFrameLatency` 的默认值口径 | 读 Set/Get 两份官方文档；创建后 `GetMaximumFrameLatency()` 实机断言 | `IDXGISwapChain2` 的 Set/Get 两页当前都写默认 1（`IDXGIDevice1::SetMaximumFrameLatency` 才是 3；此前记录的「Set 3 / Get 1」冲突未复现）；实现显式 `SetMaximumFrameLatency(1)`，实机 `Get == 1`（F-185 / V-120） |
 
-三项都只需要一次性探针代码，不进主干。
+前三项是设计期的 P0 探针（只需要一次性探针代码，不进主干）；4–6 是 2026-11-15 Windows resize 修复时新增的验证项，结论已写入上表，未闭环部分登记 V-120。
 
 ---
 
@@ -766,8 +790,9 @@ Metal：
 - [MTLCommandBuffer addCompletedHandler](https://developer.apple.com/documentation/metal/mtlcommandbuffer/addcompletedhandler(_:))、[presentDrawable](https://developer.apple.com/documentation/metal/mtlcommandbuffer/presentdrawable(_:))
 
 D3D12 / DXGI：
-- [DXGI flip model](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model)、[DXGI_SWAP_CHAIN_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_chain_flag)
-- [GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)、[SetMaximumFrameLatency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency)
+- [DXGI flip model](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model)、[DXGI_SWAP_CHAIN_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_chain_flag)、[DXGI_SCALING](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling)
+- [IDXGISwapChain1::SetBackgroundColor](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-setbackgroundcolor)、[IDXGISwapChain1::GetBackgroundColor](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgiswapchain1-getbackgroundcolor)
+- [GetFrameLatencyWaitableObject](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)、[SetMaximumFrameLatency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency)、[GetMaximumFrameLatency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getmaximumframelatency)
 - [Reduce latency with DXGI 1.3 swap chains](https://learn.microsoft.com/en-us/windows/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains)
 - [ResizeBuffers](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-resizebuffers)、[DXGI best practices](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/dxgi-best-practices)
 - [ID3D12CommandAllocator::Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandallocator-reset)、[ExecuteCommandLists](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-executecommandlists)
@@ -785,7 +810,7 @@ Vulkan / Wayland：
 
 实现落地后的对抗性审查发现的问题与修订。**只记录已经落进代码/文档的部分**；第一轮
 （F-166 … F-175）见 §15.1–§15.4，第二轮（F-176 … F-182）与三平台当前实测数字见
-§15.5–§15.6。
+§15.5–§15.6；F-183 复审与 Windows live-resize（F-184 … F-186 / S-139 / S-140）见 §15.7–§15.9。
 
 ### 15.1 本批已闭环
 
@@ -941,4 +966,22 @@ grace 计时（`69830d2`）与完成通知门禁测试（`68758de`）已全部�
   `transport/subscription.rs:194/231` 报 2 条 `redundant_clone`（`status()` 已按值返回
   `SubscriptionStatus`，调用点的 `.clone()` 确实多余）；这两行在 `ff03aed` 就存在，本轮的
   `ui_core` 改动不涉及该 crate。`-p ui_core` 的口径全绿。
+
+### 15.9 第五轮闭环（Windows live resize：`SCALING_NONE` + 真实客户区 + 背景色契约，2026-11-15）
+
+本轮只改 Windows 窗口路径；macOS/Linux 渲染行为零变化（S-140）。偏差登记见
+[`DEVIATIONS.md`](DEVIATIONS.md) §31（F-184 … F-186 / S-139 / S-140 / V-120）。修复前
+（`DXGI_SCALING_STRETCH`）快速拖动 93% 帧 card 被拉伸（峰值 1.10%），300 px 跳变时整帧放大
+1.25×（card 907×269、+37 ms）、HUD lap 掉到 38–52%；修复后同一夹具的实测摘要如下（实机环境：
+Windows / 硬件 D3D12 / 3840×2160 @125%，窗口 DPI=120，demo client 1200×925，卡 725×220 @ (30,100)）。
+
+| 项 | 结论 |
+|---|---|
+| swapchain | `FLIP_SEQUENTIAL` + `DXGI_SCALING_NONE` + `SetBackgroundColor`（创建后 / `ResizeBuffers` 后）；3 buffers 与 waitable flag 保留（§6.2 / F-184） |
+| 背景色编码 | 本路径按 sRGB 编码字节直写：linear 主题色 ⇒ `(1,1,2)`，sRGB 编码 ⇒ `(11,14,19)`；官方 “recommend linear” 不适用（§6.2 / S-139） |
+| 帧延迟 | `SetMaximumFrameLatency(2 → 1)`；隐藏窗口实机 `GetMaximumFrameLatency() == 1`（F-185） |
+| surface | Windows = 真实客户区（`run` / `WM_SIZE` / `WM_DPICHANGED` 后 `set_surface`；最小化 `IsIconic` 跳过）；`paint_frame` / `commit_frame` / `submit_gpu` 走 `frame_rect()`（§4.4 / §6.4 / F-186） |
+| 背景色契约 | `WindowOptions.background`（默认 BLACK、不透明、仅 Windows）+ `set_background_color`；GPU 线程两个应用点，下一次 `Present1` 生效（§6.3 / §6.7） |
+| 实测（125%） | 300×200 跳变：stale 帧 9.4–11.7 ms、卡片恒 725×220、条带 100% `(11,14,19)`（229 帧 / 3 次跳变）、首原生帧 42.3–46.0 ms、HUD lap 4687.5–4696.3；911 帧拖动 `stretch_w = 1.00000`、HUD lap 4707.5–4936.2（静止 4633.7，无下降）；200 次 resize（fails=0，4.58 s）后条带不变；缩小 1500×1125→1350×1000 首帧裁切、~33 ms 后回位；60.2 s soak Latency 1.88–13.23 ms、FPS 63.9/64.0/60.6；最小化 5 s 恢复像素差 0.067%；Esc 关窗 90 ms / exit 0 / stderr 0 字节；无 `0x887A0001`（§10.2 / §11） |
+| 未验证 | 150% / 175% 真实 DPI、最小化 + `WM_DPICHANGED` 组合、`ResizeBuffers` 是否保留背景色、`SetMaximumFrameLatency` 默认值文档口径、HUD FPS 与旧口径 58–60、隐藏窗口测试仍 `#[ignore]`、非 Windows `frame_rect` 0×0 仅编译检查（V-120） |
 

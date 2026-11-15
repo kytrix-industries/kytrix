@@ -7,8 +7,11 @@
 //! ③ `pPresentParameters` 永不为 NULL。
 //!
 //! 呈现节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 对象
-//! （`design/async-render-pipeline.md` §6.2）：`SetMaximumFrameLatency(2)` + 每帧渲染前等一次
+//! （`design/async-render-pipeline.md` §6.2）：`SetMaximumFrameLatency(1)` + 每帧渲染前等一次
 //! 该句柄。flag 是 swapchain 自己的帧延迟信号量，不与同进程其它 swapchain 共享隐式计数。
+//!
+//! 缩放策略是 `DXGI_SCALING_NONE` + `SetBackgroundColor`：resize 期间 DWM 不拉伸旧 buffer，
+//! 新暴露的客户区由 DXGI 用背景色填充（拉伸旧 buffer 会让卡片变形、文字发虚）。
 //!
 //! 格式：`B8G8R8A8_UNORM`（sRGB flip swapchain 在本机创建即失败，DEVIATIONS F-80）。
 
@@ -44,6 +47,8 @@ pub(crate) struct Swapchain {
     chain2: IDXGISwapChain2,
     /// `GetFrameLatencyWaitableObject` 的句柄；本结构独占，`Drop` 时关闭。
     waitable: HANDLE,
+    /// DXGI 的背景色（官方未承诺 `ResizeBuffers` 保留背景色；本实现不依赖它，重建后无条件重设）。
+    background: DXGI_RGBA,
 }
 
 impl Swapchain {
@@ -52,6 +57,7 @@ impl Swapchain {
         queue: &Queue,
         hwnd: isize,
         size: (u32, u32),
+        background: [f32; 4],
     ) -> Result<Self, EngineError> {
         let factory = create_factory()?;
         let desc = swap_chain_desc(size);
@@ -70,15 +76,20 @@ impl Swapchain {
         let chain2: IDXGISwapChain2 = raw
             .cast()
             .map_err(|error| init_error_from("cast IDXGISwapChain2", error))?;
-        // 默认 1；2 = 一帧给合成器、一帧给 GPU（§6.2）。必须在 `IDXGISwapChain2` 上调。
+        // `max latency=1` 减小 CPU 侧排队深度；resize 期间不拉伸旧 buffer 由 `SCALING_NONE` 保证。
         // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
-        unsafe { chain2.SetMaximumFrameLatency(2) }
+        unsafe { chain2.SetMaximumFrameLatency(1) }
             .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
-        let swapchain = Self::validate(raw, chain2)?;
+        let swapchain = Self::validate(raw, chain2, dxgi_rgba(background))?;
+        swapchain.apply_background()?;
         Ok(swapchain)
     }
 
-    fn validate(raw: IDXGISwapChain1, chain2: IDXGISwapChain2) -> Result<Self, EngineError> {
+    fn validate(
+        raw: IDXGISwapChain1,
+        chain2: IDXGISwapChain2,
+        background: DXGI_RGBA,
+    ) -> Result<Self, EngineError> {
         // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let actual = unsafe { raw.GetDesc1() }
             .map_err(|error| init_error_from("SwapChain::GetDesc1", error))?;
@@ -98,12 +109,34 @@ impl Swapchain {
             raw,
             chain2,
             waitable,
+            background,
         })
     }
 
     /// 帧延迟 waitable（GPU 线程在每帧渲染前等它一次，§6.3 ①）。
     pub(crate) fn waitable(&self) -> HANDLE {
         self.waitable
+    }
+
+    /// 改背景色并立即应用（GPU 线程；`ResizeBuffers` 之后由 [`Swapchain::resize`] 重设）。
+    pub(crate) fn set_background_color(&mut self, rgba: [f32; 4]) -> Result<(), EngineError> {
+        self.background = dxgi_rgba(rgba);
+        self.apply_background()
+    }
+
+    /// `IDXGISwapChain1::SetBackgroundColor`（sRGB 编码 RGBA，不是 linear；`SCALING_NONE` 下
+    /// resize 期间新暴露的客户区由它填充）。
+    fn apply_background(&self) -> Result<(), EngineError> {
+        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；`background` 是栈上 `DXGI_RGBA`，
+        // DXGI 只读它。
+        unsafe { self.raw.SetBackgroundColor(&self.background) }.map_err(|error| {
+            EngineError::Swapchain {
+                detail: smol_str::format_smolstr!(
+                    "SetBackgroundColor: {:#010X}",
+                    error.code().0 as u32
+                ),
+            }
+        })
     }
 
     /// 当前 back buffer（**每帧重新问 DXGI**；flip model 的 current index 会随 present 轮转）。
@@ -193,7 +226,34 @@ impl Swapchain {
             }
             self.waitable = waitable;
         }
+        // 官方未承诺 `ResizeBuffers` 保留背景色：不依赖它，重建后无条件重设（否则 resize 后的
+        // 新客户区可能是黑色）。
+        self.apply_background()?;
         Ok(())
+    }
+
+    /// 测试探针：DXGI 当前的背景色（隐藏窗口实机验收）。
+    #[cfg(test)]
+    pub(crate) fn background_color(&self) -> Result<DXGI_RGBA, EngineError> {
+        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；返回值按值拷出。
+        unsafe { self.raw.GetBackgroundColor() }.map_err(|error| EngineError::Swapchain {
+            detail: smol_str::format_smolstr!(
+                "GetBackgroundColor: {:#010X}",
+                error.code().0 as u32
+            ),
+        })
+    }
+
+    /// 测试探针：`IDXGISwapChain2::GetMaximumFrameLatency`（隐藏窗口实机验收）。
+    #[cfg(test)]
+    pub(crate) fn maximum_frame_latency(&self) -> Result<u32, EngineError> {
+        // SAFETY: swapchain 句柄由本结构持有、调用期间存活；输出是栈上 `u32`。
+        unsafe { self.chain2.GetMaximumFrameLatency() }.map_err(|error| EngineError::Swapchain {
+            detail: smol_str::format_smolstr!(
+                "GetMaximumFrameLatency: {:#010X}",
+                error.code().0 as u32
+            ),
+        })
     }
 }
 
@@ -220,6 +280,16 @@ fn frame_latency_waitable(chain: &IDXGISwapChain2) -> Result<HANDLE, EngineError
     Ok(waitable)
 }
 
+/// sRGB 编码 RGBA → `DXGI_RGBA`（`SetBackgroundColor` / `GetBackgroundColor` 的交换类型）。
+fn dxgi_rgba(rgba: [f32; 4]) -> DXGI_RGBA {
+    DXGI_RGBA {
+        r: rgba[0],
+        g: rgba[1],
+        b: rgba[2],
+        a: rgba[3],
+    }
+}
+
 fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
     DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0.max(1),
@@ -232,7 +302,8 @@ fn swap_chain_desc(size: (u32, u32)) -> DXGI_SWAP_CHAIN_DESC1 {
         },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: BUFFER_COUNT,
-        Scaling: DXGI_SCALING_STRETCH,
+        // NONE：resize 期间 DWM 不把旧 buffer 拉伸到新客户区（拉伸会让卡片变形、文字发虚）。
+        Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE,
         Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
@@ -263,7 +334,8 @@ fn fill_rects(damage: &DamageRects, out: &mut [RECT; MAX_DAMAGE_RECTS]) -> u32 {
 #[cfg(test)]
 mod tests {
     use windows::Win32::Graphics::Dxgi::{
-        Common::DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+        Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM},
+        DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
         DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     };
 
@@ -278,6 +350,12 @@ mod tests {
         // sRGB flip swapchain 在本机创建即失败（DEVIATIONS F-80）：格式固定 UNORM。
         assert_eq!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM);
         assert_eq!(desc.SampleDesc.Count, 1);
+        // resize 期间 DWM 不拉伸旧 buffer（修复卡片拉伸 / 文字发虚）。
+        assert_eq!(desc.Scaling, DXGI_SCALING_NONE);
+        assert_eq!(
+            desc.AlphaMode, DXGI_ALPHA_MODE_IGNORE,
+            "背景色 alpha 不参与合成（整窗由引擎绘制）"
+        );
     }
 
     #[test]

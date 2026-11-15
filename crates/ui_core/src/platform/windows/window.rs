@@ -153,6 +153,15 @@ impl NativeWindow {
         }
     }
 
+    /// 窗口是否最小化。
+    ///
+    /// 最小化时 `GetClientRect` 是 0×0（[`NativeWindow::client_size`] 会把它钳成 1×1），
+    /// 不能拿它当新的渲染目标。
+    pub(crate) fn is_minimized(&self) -> bool {
+        // SAFETY: 窗口存活期内查询；`IsIconic` 只读窗口状态，不转移所有权。
+        unsafe { IsIconic(self.hwnd) }.as_bool()
+    }
+
     /// 显示窗口（`ShowWindow(SW_SHOWNORMAL)`）。
     pub(crate) fn show(&self) {
         // SAFETY: 窗口存活；返回值表示「之前是否可见」，这里不需要。

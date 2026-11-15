@@ -17,6 +17,7 @@ pub(super) fn setup() -> (TestApp, WindowId, Scene) {
         title: TITLE.into(),
         size: window_size(),
         scale: Scale::ONE,
+        ..WindowOptions::default()
     });
     let window = test.window_id();
     let scene = Scene::build_into(test.app_mut(), window);

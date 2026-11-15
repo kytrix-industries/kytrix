@@ -1008,7 +1008,8 @@ fn compare_rejects_dimension_mismatch() { /* 纯 CPU */ }
 
 ```text
 capture(case):
- 1. TestApp::with_options(WindowOptions { title, size: case.size, scale: case.scale })
+ 1. TestApp::with_options(WindowOptions { title, size: case.size, scale: case.scale,
+                                          ..WindowOptions::default() })
  2. mount(&mut app, case.scene, case.theme)        # 公开 NodeBuilder / Canvas 建树
  3. app.drain()?                                   # styles → text → layout_text → paint → encode
                                                    # （实例缓冲已就绪；无 renderer，present 是 no-op）
@@ -1026,6 +1027,10 @@ capture(case):
       Vulkan: host-visible buffer ← cmd_copy_image_of_buffer（P12 的 readback.rs；Linux 快照路径恒失败）
  6. SnapshotImage { width, height, rgba8 }         # sRGB 编码、预乘、RGBA 顺序
 ```
+
+> `WindowOptions` 新增 `background` 后，所有结构体字面量必须补 `background` 或
+> `..WindowOptions::default()`（F-184）。快照的离屏 surface 仍是 `case.size × case.scale` 的
+> covering——Windows headless 不经过平台 `set_surface`，真实客户区只属于窗口路径（F-186）。
 
 要点：
 

@@ -159,8 +159,9 @@ Inst       52
 - `Prims`：上一提交帧 `Scene::primitive_count()`（按绘制序，包含 clip 指令）。
 - `Inst`：上一提交帧 `Renderer::submit` 回报的实例数（与 `InstanceBuffer` 条目数同源，
   不因 damage 多矩形重复计）。
-- 末行：物理分辨率为窗口逻辑尺寸 `to_physical_covering(scale)` 的结果；DPI 为 `scale.factor()`；
-  后端为编译期选定的 `D3D12` / `Metal` / `Vulkan`。
+- 末行：物理分辨率取自 `Window.surface`（Windows = 平台层写的真实客户区；macOS/Linux 仍是
+  `size × scale` 的 covering，见 F-186）；DPI 为 `scale.factor()`；后端为编译期选定的
+  `D3D12` / `Metal` / `Vulkan`。
 - 所有浮点数固定 2 位（FPS 1 位）；未知值用 `--`，不用 0 冒充。
 
 ## 4. 指标来源与定义

@@ -256,6 +256,35 @@ mod tests {
     }
 
     #[test]
+    fn rects_beyond_the_right_and_bottom_edges_are_clipped() {
+        // 右/下边界 + 1 的矩形：与 surface 的交集为空 ⇒ 丢弃（`Present1` 的 dirty rect 不得越界）。
+        let outside = PhysicalRect::new(101, 51, 120, 70);
+        assert_eq!(plan(partial(1), &[outside], surface()), Plan::Idle);
+
+        // 跨边界：夹回 `surface.x1` / `surface.y1`。
+        let straddling = PhysicalRect::new(90, 40, 101, 51);
+        match plan(partial(1), &[straddling], surface()) {
+            Plan::Partial(rects) => {
+                assert_eq!(rects.as_slice(), &[PhysicalRect::new(90, 40, 100, 50)]);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+
+        // 全量不受 surface 影响：仍然整帧（不经过矩形夹紧路径）。
+        assert_eq!(
+            plan(
+                DamageSummary {
+                    full: true,
+                    rects: 1,
+                },
+                &[outside],
+                surface()
+            ),
+            Plan::Full
+        );
+    }
+
+    #[test]
     fn fully_outside_rects_are_dropped() {
         let rect = PhysicalRect::new(120, 60, 140, 80);
         assert_eq!(plan(partial(1), &[rect], surface()), Plan::Idle);

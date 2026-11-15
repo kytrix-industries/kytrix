@@ -119,7 +119,7 @@ warp caps:     FL=12_1 SM=6_8 binding_tier=3 heap_tier=2 tiled=3 min_precision=3
 | 4 | `D3D12_FEATURE_D3D12_OPTIONS`                                             | `ResourceBindingTier = 3`（≥2 ✓）、`ResourceHeapTier = 2`、`TiledResourcesTier = 4`（WARP 3）、`MinPrecisionSupport = 2`（WARP 3）                                        |
 | 5 | `OPTIONS4.Native16BitShaderOpsSupported`                                  | 两者 `true`（不加门槛，只记录）                                                                                                                                            |
 | 6 | `D3D12_FEATURE_ROOT_SIGNATURE` / `OPTIONS19.MaxSamplerDescriptorHeapSize` | `HighestVersion = 1`（V1_0）；`MaxSamplerDescriptorHeapSize` 硬件 **4080** / WARP **2097152**                                                                              |
-| 7 | FLIP_SEQUENTIAL + BufferCount ≥ 2                                         | 创建成功；`GetDesc1` 回读 `format=DXGI_FORMAT(87)=B8G8R8A8_UNORM`、`buffercount=3`、`SwapEffect=3`、`Scaling=0(STRETCH)`、`flags=0`                                        |
+| 7 | FLIP_SEQUENTIAL + BufferCount ≥ 2                                         | 创建成功；`GetDesc1` 回读 `format=DXGI_FORMAT(87)=B8G8R8A8_UNORM`、`buffercount=3`、`SwapEffect=3`、`Scaling=0(STRETCH)`、`flags=0`。**`Scaling` 已于 2026-11-15 改为 `DXGI_SCALING_NONE`（F-184），本行是当时的 probe 记录**，现行为见 `async-render-pipeline.md` §6.2 |
 | 8 | 可选 SM6.6 / Tier3                                                        | **两者都满足**（硬件 Tier3 + SM6.8，WARP 同）→ 若启用 `ResourceDescriptorHeap`，CI 的 WARP golden 会走与真机不同的路径（主设计 §6.4 的同一条警告）→ 决定**不启用**（S-74） |
 
 ### 2.3 offscreen clear + readback（sRGB 语义与 footprint，实测）
@@ -205,6 +205,11 @@ frame2: damage = (128,128,48,32)
 `CreateSwapChainForHwnd(queue, hwnd, {256×256, B8G8R8A8_UNORM, BufferCount 3, FLIP_SEQUENTIAL, STRETCH, IGNORE})` 成功，
 `GetDesc1` 回读与请求一致。逐条调用结果：
 
+> **已被 `async-render-pipeline.md` §6.2/§6.4 取代（2026-11-15，F-184 / F-186 / S-139）**：本段是
+> `DXGI_SCALING_STRETCH` 下的历史 probe；窗口 swapchain 现为 `DXGI_SCALING_NONE` + 创建后
+> `SetBackgroundColor`（sRGB 编码），resize 目标也改为真实客户区，见 `async-render-pipeline.md`
+> §6.2/§6.4。下面的 `Present1` 三条约束（F-72）本身仍然成立。
+
 | 调用                                                                      | 结果                                                   |
 |---------------------------------------------------------------------------|--------------------------------------------------------|
 | `Present1(sync=1, 2 dirty rects)` 作为**第一次** present                  | **`0x887A0001 DXGI_ERROR_INVALID_CALL`**               |
@@ -241,6 +246,9 @@ frame2: damage = (128,128,48,32)
 | 带 `FRAME_LATENCY_WAITABLE_OBJECT`（`SetMaximumFrameLatency(1)`），`Present` 后 `WaitForSingleObject(waitable)` 再 resize | `0x887A0001`                                                   |
 | 失败后 `GetDeviceRemovedReason`                                                                                           | `S_OK`（设备本身没丢）                                         |
 | 失败后再 `CommandAllocator::Reset`                                                                                        | 本机出现 `E_FAIL (0x80004005)`（**一次**；不能假设失败可重试） |
+
+> 表里的 `SetMaximumFrameLatency(1)` 是该 probe 的局部设置，不是当时实现（实现先用了 2，
+> 2026-11-15 改为 1，见 F-185）；本表是历史记录。
 
 **最小复现**：`CreateSwapChainForHwnd`（隐藏 `WS_POPUP`，256×256，FLIP_SEQUENTIAL，BufferCount 3）→ `GetBuffer(0)` →
 `ClearRenderTargetView` → `Present(1,0)` → `ResizeBuffers(0,0,0,DXGI_FORMAT_UNKNOWN,0)`。
@@ -694,6 +702,14 @@ BufferUsage: RENDER_TARGET_OUTPUT, BufferCount: 3, Scaling: STRETCH, SwapEffect:
 AlphaMode: IGNORE, Flags: 0 }`。创建后 `GetDesc1()` 复核 `SwapEffect == FLIP_SEQUENTIAL && BufferCount >= 2`，否则
 `EngineError::UnsupportedGpu { required: "…FLIP_SEQUENTIAL / BufferCount >= 2", actual }`。
 
+> **2026-11-15 修订（被 `async-render-pipeline.md` §6.2/§6.4 取代）**：`Scaling` 改为
+> `DXGI_SCALING_NONE`，创建后与每次 `ResizeBuffers` 后调用 `SetBackgroundColor`（**sRGB 编码**，
+> 不是官方建议的 linear；本机实测见 S-139），`SetMaximumFrameLatency(1)`（F-185）；
+> `FLIP_SEQUENTIAL`、3 buffers、`AlphaMode: IGNORE` 与 flag 保留。`resize` 的目标尺寸来自
+> 真实客户区（F-186），`ResizeBuffers` 后无条件重设背景色。本节其余创建参数（format、
+> 无 RTV、`CopyTextureRegion` 同格式）仍有效；`resize` 的 `wait_idle` 顺序是 P08 的历史流程
+> （P09 后改为 GPU 线程的 §6.4 协议）。
+
 **为什么 swapchain 用 `*_UNORM` 而不是 `*_UNORM_SRGB`**：①probe 实测 **sRGB flip swapchain 创建即失败**
 （`0x887A0001`，§2.3），所以 `*_SRGB` 不是可选项；②`CopyTextureRegion` 要求源/目标**同格式**，而 persist 的资源格式必须是
 UNORM 才能与 swapchain 匹配；③编码只发生一次——在 persist 的 **sRGB RTV 视图**上（`B8G8R8A8_UNORM` 资源 +
@@ -908,6 +924,12 @@ commit_frame(ticket, report):
   Ok(Committed(index))
 ```
 
+> **已被 `async-render-pipeline.md` §4.4/§6.4 取代（F-166 … F-186）**：这段 `commit_frame` →
+> `renderer.submit` 的同步提交是 P08 的历史流程；窗口路径现在是「构造 `FrameRequest` 发布到
+> 最新帧槽，GPU 线程 resize / 录制 / present」（`async-render-pipeline.md` §4 / §6）。其中
+> `surface = size × scale（covering）` 在 Windows 上已改为平台层写入的**真实客户区**（F-186）；
+> macOS/Linux 仍保持 covering。
+
 - **错误语义**：`renderer.submit` 的 `Err` 直接返回给 `App::frame`（`Some(Err(e))`）；`FrameIndex` **已经**递增（帧确实提交过），
   dirty/damage 已在 `settle_frame` 结算 —— 因此**不重试本帧**，错误向上冒泡（device lost 时后续帧会持续返回同一错误，见
   §8）。
@@ -1090,6 +1112,9 @@ snapshot(case):
      → 等 fence → Map → 逐行去 padding → BGRA→RGBA
   5. SnapshotImage { width, height, rgba8 }（**预乘** sRGB 编码字节）
 ```
+
+> 离屏 / 快照的物理尺寸仍是 `size × scale` 的 covering：Windows headless 不经过平台
+> `set_surface`，真实客户区只属于窗口路径（F-186）。
 
 | 项                              | 定死值                                                                                                                                                                                                                                                                             |
 |---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

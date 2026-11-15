@@ -24,6 +24,7 @@ fn app() -> TestApp {
         title: SmolStr::new_static("layout"),
         size: WINDOW,
         scale: Scale::ONE,
+        ..WindowOptions::default()
     })
 }
 

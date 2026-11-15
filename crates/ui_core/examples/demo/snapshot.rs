@@ -38,6 +38,7 @@ fn capture(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         title: TITLE.into(),
         size,
         scale: Scale::ONE,
+        ..WindowOptions::default()
     });
     let window = test.window_id();
     let scene = Scene::build_into(test.app_mut(), window);
