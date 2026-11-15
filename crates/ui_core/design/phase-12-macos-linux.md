@@ -1394,6 +1394,10 @@ Application::run(app):
       任一缺失或版本不足 ⇒ WaylandCompositor { detail: "… not advertised" }（I16：不回退 X11）
  4. wl_surface + xdg_surface + xdg_toplevel（§8.2）；set_title / set_app_id / set_min_size(320, 200)
       首帧前 surface.commit()                     // set_min_size 只在首个 commit 前设一次（F-195）
+ 4b. 缩放对象（顺序固定，全部在 renderer 之前，V-110 / §35 F-197）：
+      viewporter 与 fractional manager 成对绑定（都成功才 get_viewport / get_fractional_scale；
+      工厂对象创建子对象后 destroy）→ WlRegistry::bind 逐个绑定所有现存 wl_output
+      （不能用 GlobalList::bind，它只绑第一个）
  5. roundtrip 一次，拿到首个 configure（尺寸 + states）与分数缩放
  6. 其余**可失败的** setup（必须在 renderer 挂载之前；早退时 app 内没有 renderer，V-122 ⑨ / F-196）：
       EventLoop::try_new() + calloop::ping::make_ping() + WaylandSource::new(conn, queue).insert(handle)
@@ -1402,6 +1406,7 @@ Application::run(app):
        // Instance::new → Device::new → Swapchain::new → Pipeline/Atlas/Persist；physical = round(logical × scale)，
        // background = background_linear(WindowOptions.background)，viewport = WaylandState::take_viewport()
  8. window.set_renderer(renderer)；window.set_scale(scale)；window.set_size(size)
+    window.set_buffer_scale(state.buffer_scale()) // fractional 恒 1；整数回退 = N（V-110）
     window.set_surface(physical)                  // 真实 Wayland buffer；set_size / set_scale 不再重算平台真值（F-194），这里写真实 buffer
  9. AppHandle::wake() ⇒ 首帧；loop_.dispatch(Duration, &mut state) 直到 exit
 10. shutdown：device_wait_idle → drop(app)（循环路径显式；WaylandState 晚于 renderer 释放）→ a11y drop
@@ -1434,6 +1439,7 @@ pub(crate) struct NativeSurface {
     toplevel: xdg_toplevel::XdgToplevel,
     fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     viewport: Option<wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport>,
+    uses_viewport: bool,                   // = viewporter 与 fractional manager 同时存在
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     pending_configure: Option<u32>,        // serial
     size: Size,                            // 逻辑像素
@@ -1452,12 +1458,12 @@ pub(crate) struct NativeSurface {
 | `set_title` / `set_app_id`                                 | 窗口标题 / `"kytrix"`；`set_min_size(320, 200)`（window geometry 逻辑值，S-145；只在首个 commit 前设一次，DPI 变化**不重发**，F-195）                                                                                           |
 | 移动 / 缩放                                                | `xdg_toplevel::move(&seat, serial)` / `resize(&seat, serial, XdgToplevelResizeEdge)`（标题栏拖拽由引擎自绘区域触发）                                        |
 | 最大化 / 全屏                                              | `set_maximized()` / `unset_maximized()`（自绘标题栏的双击行为）                                                                                             |
-| 分数缩放                                                   | `wp_fractional_scale_manager_v1.get_fractional_scale(&surface)` → `Event::PreferredScale { scale }`（单位 **1/120**）⇒ `Scale::new(scale as f32 / 120.0)`   |
-| 整数缩放回退                                               | **未实现**（V-110）：`dispatch_unit!(wl_output::WlOutput)` 是 no-op，当前只有 `wp_fractional_scale_v1`；无 viewporter 时无 destination / `buffer_scale` 回退 |
-| 缓冲尺寸                                                   | `physical = round(logical × scale)`（half away from zero，至少 1 px）。fractional-scale 协议要求 round；`ceil` 在 1.25 / 1.75 下多 1 px，会让整面被 compositor 以 0.999× 重采样（F-191）                          |
-| viewporter                                                 | `WpViewporter` 全局存在即创建（不再按整数倍率判断）；`Option` = 没有 viewporter，**不**代表 compositor 不支持分数缩放（无 destination / `buffer_scale` 回退，V-122 P2-5）；destination 由 GPU 线程在 present 前写 `ceil(logical)`，与 buffer 同一次 commit 生效（F-190）                                              |
+| 分数缩放                                                   | 仅当 `wp_viewporter` 同时存在时：`wp_fractional_scale_manager_v1.get_fractional_scale(&surface)` → `Event::PreferredScale { scale }`（单位 **1/120**）⇒ `Scale::new(scale as f32 / 120.0)`；否则走整数回退 |
+| 整数缩放回退                                               | **已实现**（§35 F-197 / F-198）：无 viewporter 时不创建 fractional / viewport；`N` = `preferred_buffer_scale`（surface v6）→ 已 enter 的 `wl_output.scale` 最大 → **首次 enter 之前**全部已绑定 output 最大 → 上一个值 → 1（clamp ≥1）；buffer = `round(logical × N)`，`set_buffer_scale(N)` 由 GPU 线程 present 前写 |
+| 缓冲尺寸                                                   | `physical = round(logical × scale)`（half away from zero，至少 1 px）。fractional-scale 协议要求 round；`ceil` 在 1.25 / 1.75 下多 1 px，会让整面被 compositor 以 0.999× 重采样（F-191）。整数回退下 `N` 是整数 ⇒ buffer = `logical × N`，严格是 `buffer_scale` 的整数倍（否则 `attach` 报 `invalid_size`，F-198） |
+| viewporter                                                 | fractional manager 与 viewporter **同时存在**才创建 viewport（`uses_viewport`）；否则整数回退（`wl_surface.set_buffer_scale(N)`，无 destination）。`Option` = 没有 viewporter，**不**代表 compositor 不支持分数缩放；destination 由 GPU 线程在 present 前写 `ceil(logical)`，与 buffer 同一次 commit 生效（F-190） |
 | 客户端装饰                                                 | 有 `zxdg_decoration_manager_v1` ⇒ `get_toplevel_decoration(&toplevel).set_mode(ClientSide)`；**没有也不失败**（compositor 可能加自己的装饰；L5 记录，V-86） |
-| `wl_surface.set_buffer_scale`                              | **不调用**（默认即 1；fractional-scale 要求 `buffer_scale = 1`；旧的 `set_buffer_scale(1)` 已随 `sync_viewport` 删除）                                                                                                      |
+| `wl_surface.set_buffer_scale`                              | fractional 路径**不调用**（默认即 1；fractional-scale 要求 `buffer_scale = 1`；旧的 UI 线程 `set_buffer_scale(1)` 已随 `sync_viewport` 删除）；整数回退由 GPU 线程在 present 前写 `N`（§35 F-197）                                                                                                      |
 | `wl_surface.commit`                                        | UI 线程只在建窗时 commit 一次（取得首个 configure）；渲染期**不 commit**，attach 与 destination 都由 WSI 在 present 内部同一次 commit（D1 / D2 / D4）                                                                        |
 
 > **2026-11-15（F-190 / F-191）**：`viewport` 字段建窗后经 `WaylandState::take_viewport()` 移交窗口
@@ -1465,15 +1471,22 @@ pub(crate) struct NativeSurface {
 > 时 `destroy`。删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` 与 IME 两处
 > `wl_surface.commit()`；`FrameRequest.surface_local` 与 `surface` 同帧过线，destination 与 buffer
 > 成对（§8.4）。实机数据与未验证项见 [`linux-verification.md`](linux-verification.md) §4.7 / V-122。
+>
+> **2026-11-15 追加（§35 F-197 / F-198）**：本表第七轮原文的「整数缩放回退未实现」「viewporter
+> 全局存在即创建」「`set_buffer_scale` 不调用」是**当时状态**（无 viewporter 的缺口，V-110 /
+> V-122 ④）。第九轮改为：viewporter 与 fractional manager 成对才创建 viewport；无 viewporter
+> 走整数回退，`set_buffer_scale(N)` 由 GPU 线程在 present 前与 attach/commit 同一次生效；
+> Wayland 逻辑尺寸取整以保证 buffer 是 `N` 的整数倍。实测见
+> [`linux-verification.md`](linux-verification.md) §4.9。
 
 ### 8.3 `linux/window.rs`
 
 | 项       | 值                                                                                                                                    |
 |----------|---------------------------------------------------------------------------------------------------------------------------------------|
-| 逻辑尺寸 | `Size`（引擎单位）；物理 = `round(logical × scale)` 的 Wayland buffer，由平台层每轮 `Window::set_surface` 写入（同值 no-op）           |
+| 逻辑尺寸 | `Size`（引擎单位）；Wayland 逻辑尺寸在 `WaylandState::new` 取整（`round().max(1)`，协议层只表示整数）；物理 = `round(logical × scale)` 的 Wayland buffer。fractional 的 scale 是 `preferred_scale/120`，整数回退是 `N`（§8.2 选择链）⇒ buffer = `logical × N`；由平台层每轮 `Window::set_surface` 写入（同值 no-op）           |
 | 渲染目标 | `Window.surface` = 真实 Wayland buffer；`frame_rect()` 三平台统一为 `surface`（Linux 不再用 covering；0 尺寸 clamp 1）                 |
 | 背景色   | `WindowOptions.background` → persist `clear_color`（**linear**，Vulkan sRGB attachment）；`set_background_color` 标 full damage + `Shared` 槽（F-192） |
-| 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），逻辑值给 `set_min_size`（window geometry 坐标；viewporter destination 使 surface = 逻辑，S-145），只在建窗首个 commit 前设一次、DPI 变化不重发（F-195） |
+| 最小尺寸 | `MIN_SIZE_LOGICAL = (320, 200)`（与 Win32 / macOS 同源），逻辑值给 `set_min_size`（window geometry 坐标；fractional 的 destination 与整数回退的 `buffer_scale = N` 都使 surface = 逻辑，S-145），只在建窗首个 commit 前设一次、DPI 变化不重发（F-195） |
 | 标题栏   | 平台层不绘制标题栏，只提供 `App::request_window_control`（minimize / toggle-maximize / move / resize）；demo 在 `scene/chrome.rs` 自绘标题栏与按钮 |
 | 关闭     | `toplevel.destroy()` + `surface.destroy()`；`LinuxLoop` 见 `app.windows()` 空即退出                                                   |
 | 光标     | v1 **不设置** `wl_cursor`（无 `wayland-cursor` 依赖）；`take_cursor_change()` 的值只在 macOS/Win32 生效（V-87：Linux 光标形状 L5 补） |
@@ -1497,6 +1510,8 @@ pub(crate) fn viewport_destination(size: Size) -> (i32, i32);                   
 
 - `physical_size` 用 **round**（half away from zero），不是 covering 的 ceil：1.25 下 701×501 →
   876×626（ceil 是 877×627），差的 1 px 会让整面被 compositor 以 0.999× 重采样。
+- 整数回退时 `scale` 是整数 `N`（§8.2 的选择链），同一 `round` 公式得到 `logical × N`；逻辑
+  尺寸已取整 ⇒ buffer 严格是 `N` 的整数倍（`wl_surface.attach` 的 `invalid_size` 约束，F-198）。
 - `viewport_destination` 保持 **ceil**：compositor 按它显示 buffer，最右 / 最下 1 px 不能被裁掉。
 - 分数缩放事件 ⇒ `Event::DpiChanged { dpi: (scale*96).round() as u32, scale }`（字段对齐见 §7.4）。
 - 缩放变化 ⇒ offscreen/swapchain 重建 + 根 `LAYOUT` + 文本 measure 版本递增；**VBO/实例容量不重建**。

@@ -50,7 +50,8 @@
 
 - Linux：readback 在 submit 前 map（test-only 恒脏）；空实例 descriptor `range=0`；resize 未 `queue_wait_idle`；device-lost 不进
   sticky；atlas 局部上传 `image_offset`；退出时 WaylandState 先于 Renderer drop（2026-11-15 已修，§34 F-196）；`apply_min_size`
-  物理值（2026-11-15 已修，§34 F-195）；`sync_viewport` 的 buffer_scale+commit；IME content_type/cursor/commit 去重；clipboard
+  物理值（2026-11-15 已修，§34 F-195）；`sync_viewport` 的 buffer_scale+commit（2026-11-15 已删除，
+  §33 F-190；无 viewporter 的整数回退见 §35 F-197）；IME content_type/cursor/commit 去重；clipboard
   serial。
 - macOS：keyDown 先 Key 后 IME、commit 后重复 Text、flagsChanged 发 Key、滚轮 Y、NSTrackingArea/AppearanceChanged、
   `note_commit` 去重、`firstRect` actualRange、`presentDrawable` 时机、drawable None 仍提交、D8 maxBufferLength。

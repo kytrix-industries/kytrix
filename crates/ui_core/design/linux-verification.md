@@ -9,6 +9,8 @@
 > **2026-11-15 追加**：live resize 的第七轮闭环（destination 与 buffer 原子、buffer = round、
 > Linux 背景 clear）单独记在 §4.7；偏差登记 §33（F-190 … F-192 / S-143 / S-144 / V-122），
 > 设计落点见 [`async-render-pipeline.md`](async-render-pipeline.md) §7.1–§7.5 / §15.11。
+> **2026-11-15 追加（第九轮）**：无 viewporter 的整数回退见 §4.9，偏差登记
+> [`DEVIATIONS.md`](DEVIATIONS.md) §35（F-197 / F-198 / S-146 / S-147 / V-124）。
 > 本文前面的探针记录保持原样（不改写历史）。
 
 ---
@@ -369,8 +371,8 @@ Laplacian 615.8–1013.2（旧 buffer 被拉伸）。
 - **归因**：1.25 的 7/70 帧整窗变软 bbox 不变、稳定后 Laplacian 回到 1715.34，是 sway 分数缩放
   的采样瞬态，不是旧 buffer 被 destination 缩放（旧代码的 bbox 会变、Laplacian 616–1048）。
 - **限制**：Mutter / KWin 未跑；真实指针拖拽未构造（只用 `swaymsg resize set`）；逐次
-  `OUT_OF_DATE` / `vkQueuePresentKHR` 计数未统计；无 viewporter 回退未验（且实现没有 destination /
-  `buffer_scale` 回退，V-122 P2-5）；1.25 sway 瞬态未独立归因；HUD OCR 未验；`apply_min_size` 的
+  `OUT_OF_DATE` / `vkQueuePresentKHR` 计数未统计；无 viewporter 回退已在第九轮实现 / 验证
+  （§4.9，V-110 / V-122 ④ 闭环）；1.25 sway 瞬态未独立归因；HUD OCR 未验；`apply_min_size` 的
   物理 / 逻辑问题已由第八轮修复，协议证据见 §4.8。其余登记 V-122。
 
 ### 4.8 V-122 残留闭环（2026-11-15，第八轮）
@@ -422,6 +424,56 @@ snapshot 8 / demo 37（62）；`cargo +nightly clippy -p ui_core --all-targets -
 **已知噪声（非本轮引入）**：`--features` 的 snapshot 测试打印 **22 条**
 `VUID-vkCmdDraw-None-09600`（8/8 仍 pass；demo 运行 0 条）。旧日志已存在，建议另立 issue，
 不写成本轮回归。
+
+### 4.9 无 viewporter 的整数回退（V-110 / V-122 ④，2026-11-15）
+
+**环境**：HEAD `240aadc`，headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1`
+1280×720。偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md) §35（F-197 / F-198 / S-146 / S-147 /
+V-124），设计落点见 [`async-render-pipeline.md`](async-render-pipeline.md) §15.13。
+
+**方法**：临时隐藏 `wp_viewporter` global（未 commit，验证后已还原），同一 demo / 同一夹具分别
+跑「基线（有 viewporter）」与「回退（无 viewporter）」；`WAYLAND_DEBUG=1` 统计 `get_viewport` /
+`set_destination` / `set_buffer_scale` / `attach` / `commit` 的顺序与次数，`grim` 截图后用 PIL
+做逐像素差，卡片文字区域算 Laplacian 方差量锐度。
+
+**门禁**：
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p ui_core --lib` | **671 passed / 0 failed / 0 ignored**（新增 `platform::linux::surface::tests::*` 6 个 + `window::tests::buffer_scale_defaults_to_one_and_clamps`，真跑） |
+| `cargo test -p ui_core --features "hud,test-support"` | lib **731** + frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37（62），全 pass |
+| `cargo +nightly clippy ... -D warnings` / fmt `--check` | exit 0 |
+| Windows 主机 `--lib` | **712 passed / 0 failed / 1 ignored**（Linux-only 测试不编译）；`--features "hud,test-support"` lib **774 / 1 ignored** + frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37（62），全 pass；clippy `-D warnings`、fmt `--check` exit 0 |
+| 交叉编译 | `cargo check -p ui_core --target aarch64-apple-darwin` 与 `cargo check -p ui_core --target x86_64-unknown-linux-gnu`（stub `pkg-config`，均默认 + features）exit 0 |
+
+**协议 / 几何**：
+
+| 场景 | 协议 | tree rect | 截图 / 锐度 |
+|---|---|---|---|
+| 基线 1.25（有 viewporter） | `set_destination(701,501)` → `attach(876×626)` → `commit`；`set_buffer_scale` grep **0**；`create_buffer(876,626)` | **701×501 @100,37** | — |
+| 基线 2.0 | `set_destination(640,360)` → `attach(1280×720)`；无 `set_buffer_scale`；`create_buffer(1280,720)` | **640×360** | — |
+| 回退 1.25（临时隐藏 viewporter） | 无 `get_viewport` / `set_destination`；`set_buffer_scale(2)` **1 次** → `attach` → `commit`（位置在 attach/commit 之前）；`create_buffer(1402,1002)` | **701×501** | 窗口物理 bbox **876×627（125,46–1001,673）**，与基线完全一致；PIL mean abs diff **2.115/255（0.83%）**、max 217、>8 像素 9.68%，差异只在字形 / 圆角边缘细线（无位移 / 布局差异）；Laplacian **977.06 → 1161.99（+18.9%，更锐）**、卡片文字 **1984.6 → 2386.7（+20.3%）** |
+| 回退 2.0 | `set_buffer_scale(2)` → `attach(1280×720)`；无 destination；`create_buffer(1280,720)` | **640×360** | 截图与基线 **sha256 完全相同**（`97aca6fc…`）；Laplacian 592.3257 → 592.3257（1.0） |
+
+**动态 scale / leave / 退出**：
+
+| 场景 | 结果 |
+|---|---|
+| 动态 scale（回退，单进程） | 1.0（buffer 640×360）→ 输出 2.0：`set_buffer_scale(2)` → attach 1280×720 → commit；回 1.0：`set_buffer_scale(1)` → attach 640×360；三步 rect 恒 **640×360@320,180**，进程存活，exit 0 |
+| scratchpad（leave / 再显示） | 存活、恢复 640×360，无崩溃；Esc exit 0 |
+| 既有现象（非本提交） | 1.25 下 demo 浮动窗口在 1020×526 ↔ 960×576 间自振荡；`HEAD~1`（`a6b7192`，无回退代码）同样复现；验证时用 SIGSTOP 冻结目标帧截图 |
+
+- **判据**：回退路径没有 destination，靠 `set_buffer_scale(N)` 让 surface-local 尺寸等于
+  `buffer / N = logical`；1.25 下 tree rect 仍是 701×501（不是 fractional 的 876×626），截图
+  bbox 与基线一致 ⇒ 没有几何 / 布局回归。2.0 的截图哈希完全相同 ⇒ 整数值下与 fractional 路径
+  （destination + buffer_scale=1）像素等价。1.25 的锐度差来自 2× 渲染后由 compositor 降采样
+  vs 1.25× 原生栅格，无几何差异，不视为缺陷。
+- **未验证**（V-124）：KWin / Mutter 的真实「无 fractional 客户端」路径（只有源码事实
+  `wl_output.scale = ceil`）、混合 DPI 多屏 enter / leave、热插拔显示器、真实指针拖拽；
+  fractional 首帧可能先按整数 scale 出图（`preferred_scale` 晚到，destination 保证几何正确）。
+- **结论**：viewporter 缺失时不再创建 fractional / viewport，整数回退（`preferred_buffer_scale` /
+  `wl_output.scale` → N、buffer = `round(logical × N)`、`set_buffer_scale(N)` 与 attach/commit
+  同一次生效）已在 headless sway 上验证；V-110 / V-122 ④ 闭环，剩余实机矩阵见 V-124。
 
 ---
 
@@ -484,11 +536,12 @@ cargo test -p ui_core --features test-support --test snapshot
 | KDE / Sway 作为产品目标合成器 | 只验了 mutter（GNOME）与 sway（测试夹具） |
 | AT-SPI 真实读屏器联动 | 只验了树结构与 `do_action`，未接 Orca |
 | a11y 子节点顺序 | 引擎按 demo 建树顺序输出（① ④ ⑤ ⑥ ③ ②），与 Windows 一致；属应用侧布局，非 Linux 缺陷。**观察项**，未改动 |
-| `Wayland` 的 `wl_output` 整数 scale | 只走 `wp_fractional_scale_v1`；无该扩展的合成器回退路径**未实现**（V-110；当前只有 `wp_fractional_scale_v1`，无 viewporter 时无 destination / `buffer_scale` 回退） |
+| `Wayland` 的 `wl_output` 整数 scale | 只走 `wp_fractional_scale_v1`；无该扩展的合成器回退路径**未实现**（V-110；当前只有 `wp_fractional_scale_v1`，无 viewporter 时无 destination / `buffer_scale` 回退）。**2026-11-15 已实现（§4.9 / DEVIATIONS §35 F-197）**：启动时逐个 `WlRegistry::bind` 所有 `wl_output`、`preferred_buffer_scale` / 已 enter 的最大 scale 选择整数 `N`、`set_buffer_scale(N)` 与 buffer 同一次 present 生效 |
 | live resize：Mutter / KWin | 只跑了 headless sway 1.11 / wlroots 0.19；GNOME mutter 与 KWin 的 destination / configure 时序未验（V-122） |
 | live resize：真实指针拖拽 | 本轮用 `swaymsg resize set` 程序化 resize，没有构造真实指针拖动（`wtype` 只注入键盘）；拖动 / 缩放边缘的输入路径未验（V-122） |
 | `OUT_OF_DATE` / `vkQueuePresentKHR` 逐次计数 | 未逐次统计 present 返回值；soak 只有总数与 exit code（V-122） |
-| 无 viewporter 回退 | `WpViewporter` 缺失时的回退路径未验；当前实现跳 destination 写入（V-122） |
+| 无 viewporter 回退 | `WpViewporter` 缺失时的回退路径未验；当前实现跳 destination 写入（V-122）。**2026-11-15 已实现并验证（§4.9）**：以 viewporter 门控 fractional，无 viewporter 走整数回退（buffer = `round(logical × N)`、`set_buffer_scale(N)`）；剩余实机矩阵见 V-124 |
+| 无 viewporter 整数回退 | 第九轮验证清单（HEAD `240aadc`，headless sway 1.11 / lavapipe）：1.25 回退无 `get_viewport` / `set_destination`、`set_buffer_scale(2)` 1 次且在 attach/commit 前、buffer 1402×1002、tree 701×501、截图 bbox 876×627 与基线一致（mean abs diff 0.83%）、Laplacian +18.9%；2.0 截图 sha256 与基线相同；动态 scale 1.0 ↔ 2.0 rect 恒 640×360@320,180；scratchpad leave / 再显示存活；Esc exit 0。未验：KWin / Mutter、混合 DPI 多屏、热插拔、真实指针（V-124） |
 | `apply_min_size` 的物理 / 逻辑值 | 已修（§34 F-195，§4.8 协议证据：`set_min_size(320, 200)` 1 次、顺序正确、scale 切换不重发）；sway 不执行 xdg min size，几何钳制仍待 Mutter / KWin（V-122 ⑦） |
 
 ### 6.1 测试夹具的坑（不是引擎缺陷）

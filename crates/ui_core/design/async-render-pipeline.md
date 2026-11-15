@@ -220,7 +220,7 @@ resize 不作为独立命令：`FrameRequest.surface` 就是目标尺寸。GPU �
 - **surface 的定义分平台**（都是平台真值，不再是布局估算）：Windows = **真实客户区**（`GetClientRect` / `NativeWindow::client_size`，在 `run`、`WM_SIZE`、`WM_DPICHANGED` 之后由 `Window::set_surface` 写入；最小化时跳过，见 §6.4 / §6.7）；macOS = **真实 backing**（`NSView.convertSizeToBacking(view.bounds.size)` 的 round 值、至少 1 px，在 `sync_state` 的 Dpi / Resized 之后由 `Window::set_surface` 写入，F-187 / F-189）；Linux = **真实 Wayland buffer**（`round(logical × scale)`，`platform/linux/dpi.rs::physical_size`，在 `run` 与每轮 configure / scale 变化之后由 `Window::set_surface` 写入；fractional-scale 协议要求 round，不是 covering 的 ceil，F-191）。
 - 不同 ⇒ 先做本平台的重建（Windows `ResizeBuffers`；Vulkan 新 swapchain；Metal 只重建 persist），再渲染，并强制该帧 `Full`。
 - **surface 变化时即使没有 damage 也必须发布一帧**（UI 侧 `set_size`/`set_scale` 已经会置 full damage；这条是兜底规则，避免「只有 resize、没有脏区」时目标永远不重建）。DPI 变化本身不进入 `FrameRequest`：macOS 由 `set_surface` 先刷新图层（`contentsScale`/`drawableSize`）再把真实 backing 作为 `surface` 发布；Windows/Linux 的物理像素同样由平台层算好后再作为 `surface` 出现。
-- **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。
+- **Linux 的 destination 与 buffer 同帧成对**：`FrameRequest.surface_local`（同一 UI 帧的逻辑尺寸）由 GPU 线程在 `vkQueuePresentKHR` **之前**写成 `wp_viewport.set_destination(ceil(logical))`，与 WSI 的 attach/commit 原子生效；UI 线程不再单独 commit destination。不做 seed 帧：destination 不先于 buffer 变化，旧内容不会被缩放；Wayland 的窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局（没有 Windows 的背景条中间态，F-190 / F-192）。**整数回退没有 destination**：`wl_surface.set_buffer_scale(N)` 由 GPU 线程在 present 前与 attach/commit 同一次生效，buffer = `round(logical × N)`（§15.13）。
 - 图层/系统侧尺寸（macOS `drawableSize`、Windows 客户区）由平台层在 UI 线程同步；GPU 线程只读 drawable 纹理的实际尺寸做最后校验（§5.4）。
 - `plan()` 的 frame 与 surface 同源；dirty rect 先与 frame 求交（越出右/下 1 px 的矩形被夹紧或丢弃），因为 `Present1` 的 dirty rect 必须完全落在 surface 内——越界是 `0x887A0001`（F-72 ②）。`paint_frame` / `commit_frame` 都走 `Window::frame_rect()`，三平台都返回 `surface`（Windows 真实客户区 / macOS 真实 backing / Linux 真实 Wayland buffer，F-186 / F-189 / F-191）；`submit_gpu` 不再自行调用 `frame_rect()`，它消费 `commit_frame` 用同一份 damage 与 frame 算好的 `plan`（目标尺寸仍取 `physical_surface()`，F-193）。
 
@@ -610,8 +610,8 @@ loop {
     // ③b destination：必须在 vkQueuePresentKHR **之前**写（WSI 规范要求窗口系统变更先于
     //    present；present 内部的 `wl_surface.commit` 让 attach 与 destination **同一次**生效）。
     //    只在变化时下发；`frame.surface_local` 与 `frame.surface` 来自同一 UI 帧，旧 buffer 不会
-    //    被新 destination 单独缩放（D1 / D2）。没有 viewporter ⇒ 跳过（无 destination /
-    //    buffer_scale 回退，V-122 P2-5）。
+    //    被新 destination 单独缩放（D1 / D2）。没有 viewporter ⇒ 整数回退：不写 destination，
+    //    改在 present 前写 wl_surface.set_buffer_scale(N)（§15.13）。
     if let Some(viewport) = viewport {
         if let Some((width, height)) = destination_update(last_destination, frame.surface_local) {
             viewport.set_destination(width, height);   // ceil(logical)，至少 1 px
@@ -624,7 +624,7 @@ loop {
 }
 ```
 
-- **destination 与 buffer 的唯一配点**：`wp_viewport` 从 UI 线程移交后只由 GPU 线程使用；`set_destination` 写的是**逻辑尺寸**（`ceil(logical)`，至少 1 px），buffer 是 `round(logical × scale)`，两者按上面的顺序在同一次 present commit 里原子生效。没有 viewporter 时什么都不做（无 destination / `buffer_scale` 回退，V-122 P2-5）。`Drop` 时先 `viewport.destroy()`：正常路径下 renderer 在 `WaylandState` 之前 drop，销毁时 `wl_surface` 仍存活（例外：renderer 挂载后的 fallible setup 早退路径，V-122 ⑨，既有 P2-3，本轮不修）。
+- **destination 与 buffer 的唯一配点**：`wp_viewport` 从 UI 线程移交后只由 GPU 线程使用；`set_destination` 写的是**逻辑尺寸**（`ceil(logical)`，至少 1 px），buffer 是 `round(logical × scale)`，两者按上面的顺序在同一次 present commit 里原子生效。没有 viewporter 时没有 destination，改由 GPU 线程在 present 前写 `wl_surface.set_buffer_scale(N)`（整数回退，buffer = `round(logical × N)`，§15.13）。`Drop` 时先 `viewport.destroy()`：正常路径下 renderer 在 `WaylandState` 之前 drop，销毁时 `wl_surface` 仍存活（例外：renderer 挂载后的 fallible setup 早退路径，V-122 ⑨ / P2-3，已由 §34 F-196 闭环）。
 - **UI 线程不 commit `wl_surface`**：删除 `sync_viewport` / `viewport_applied` / `set_buffer_scale(1)` 与 IME 两处 surface commit 后，`wl_surface.frame` 回调只由 present 触发，FrameGate 的「≤1 在飞」重新成立（D4）。`zwp_text_input_v3` 的状态在它自己的 `commit` 生效（v1 不需要 surface commit）。
 - **背景 clear**：persist 的 `clear_color` 是窗口背景色（`render/color.rs::background_linear`，按 **linear** 写 Vulkan sRGB attachment，S-143）；UI 线程只写 `Shared` 背景槽 + `wake`（并标 full damage），GPU 线程在空闲或取帧后应用（`wait_for_work` 把待应用色算工作）。下一次全量录制生效；**调用方需在之后触发一帧**（与 Windows 相同）；不引入 seed 帧（F-192）。
 
@@ -661,8 +661,8 @@ recreate_swapchain():
 1. **WSI 有自己的事件队列**：规范要求每次 `vkCreateWaylandSurfaceKHR` 都新建一个 `wl_event_queue`，实现创建的所有 Wayland 对象都挂在这个队列上；应用**不得**自己 dispatch 这些对象（[Vulkan WSI: Wayland Platform](https://github.com/KhronosGroup/Vulkan-Docs/raw/main/chapters/VK_KHR_surface/wsi.adoc)）。Mesa 的实现与此一致，并在 `present` 里 `wl_display_flush`、在 `acquire` 里 dispatch 自己的队列。
 2. **应用默认队列仍归 calloop**：输入/configure/IME/`wl_surface.frame` 回调都在 UI 线程的 `WaylandSource` 上。`wl_display` 的多线程规则是「同一时刻只有一个 reader」，libwayland 用 `reader_count` + 条件变量协调；calloop-wayland-source 已显式容忍「另一个线程先读了 socket」的情况（`WouldBlock` 分支）。
 3. **帧回调请求必须早于 present，且只能由 present 触发**：UI 线程在 `publish` **之前**调用 `state.request_frame()`，WSI 的 `attach/commit` 在 present 时发生，因此 `wl_callback.done` 一定能到达；`wl_surface.frame` 只在 `wl_surface.commit` 之后生效，而 UI 线程已不再 commit（见第 4 条），所以 FrameGate 的「≤1 在飞」不会被提前回调破坏（D4）。`zwp_text_input_v3` 的状态在它自己的 `commit` 生效，v1 不需要 surface commit。
-4. **`wl_surface` 状态变更只由 GPU 线程在 present 之前发**：`wp_viewport.set_destination` 这类窗口变更按规范必须在 `vkQueuePresentKHR` 之前发给合成器。建窗后 `WpViewport` 经 `WaylandState::take_viewport()` 交给 GPU 线程（`Renderer::new_for_surface(..., viewport)`），由 `GpuRenderer` 在 present 前写 destination，与 WSI 的 attach/commit **同一次**生效；UI 线程**不** commit `wl_surface`（唯一例外：建窗的首个 commit 用来取得首个 configure），也不再调 `set_buffer_scale(1)`（fractional-scale 要求 buffer scale 恰为 1，默认即 1）。旧的 `sync_viewport` + 单独 `commit()`（未 attach 新 buffer）已删除。
-5. **buffer 尺寸按 fractional-scale 协议取 `round(logical × scale)`**：不是 covering 的 ceil；1.25 / 1.75 下多 1 px 会让整面被合成器以 0.999× 重采样（D3）。`viewport_destination` 保持 `ceil(logical)`。
+4. **`wl_surface` 状态变更只由 GPU 线程在 present 之前发**：`wp_viewport.set_destination` 这类窗口变更按规范必须在 `vkQueuePresentKHR` 之前发给合成器。建窗后 `WpViewport` 经 `WaylandState::take_viewport()` 交给 GPU 线程（`Renderer::new_for_surface(..., viewport)`），由 `GpuRenderer` 在 present 前写 destination，与 WSI 的 attach/commit **同一次**生效；UI 线程**不** commit `wl_surface`（唯一例外：建窗的首个 commit 用来取得首个 configure），也不再调 `set_buffer_scale(1)`（fractional-scale 要求 buffer scale 恰为 1，默认即 1）；整数回退的 `set_buffer_scale(N)` 同样由 GPU 线程在 present 前写（§15.13）。旧的 `sync_viewport` + 单独 `commit()`（未 attach 新 buffer）已删除。
+5. **buffer 尺寸按 fractional-scale 协议取 `round(logical × scale)`**：不是 covering 的 ceil；1.25 / 1.75 下多 1 px 会让整面被合成器以 0.999× 重采样（D3）。`viewport_destination` 保持 `ceil(logical)`；整数回退时 scale 是整数 `N`，同一公式得到 `logical × N`（§15.13）。
 6. **合成器节流优先**：即使 GPU 线程阻塞在 `acquire`，UI 线程也不受影响；帧回调让 UI 只在合成器需要时产帧。
 
 ### 7.6 present mode：`MAILBOX`
@@ -1120,7 +1120,7 @@ UI 线程的 commit 与 GPU 线程 WSI present 的 commit 没有 happens-before�
 | 不 seed 帧 | 不改 destination 时旧 buffer 不会被缩放；Wayland 窗口尺寸由客户端 commit 决定，新 buffer 到达时一次跳到新布局。没有 Windows 的「背景条中间态」，因此不引入额外的旧 layout 帧（F-192） |
 | 实测（headless sway 1.11 / wlroots 0.19 / lavapipe） | 1.25：701×501 → buffer **876×626**（round；旧 877×627）、destination 701×501，`create_buffer → set_destination → attach → commit` 相邻无中间 commit；卡片 725×220 恒定、静止 Laplacian 1715.34（旧 616–1048）；1.0：卡片 580×176 恒定、Laplacian 2019.30；2802 次 resize / 3583 次 present，**1218 次 destination 变更 1218 次原子**（0 无 attach、0 mismatch、0 `set_buffer_scale`）；FrameGate 最大间隔 79.6 ms；HUD 静止 59.1 fps / 2.13 ms、拖动 39.2 / 6.28 ms；exit 0、validation 0 VUID。1.25 下 7/70 帧整窗变软（bbox 不变；稳定复测 1715.34，归因 sway 分数缩放采样，不是旧 buffer 缩放）；缩小（1.0）右裁 576×176、下裁 580×134 |
 | clear 夹具 | `/tmp` 临时夹具（无根节点）：`#0B0E13` → 像素 `(11,14,19)`、`#402080` → `(64,32,128)`，证明 linear clear → sRGB 往返正确；demo 根节点铺满，帧内不可见（F-192 / S-143） |
-| 未验证 | Mutter / KWin、真实指针拖拽、逐次 `OUT_OF_DATE` / `vkQueuePresentKHR` 计数、无 viewporter 回退（实现没有 destination / `buffer_scale` 回退，V-122 P2-5）、1.25 sway 瞬态采样、HUD OCR（`apply_min_size` 已在第八轮修复，见 §15.12） |
+| 未验证 | Mutter / KWin、真实指针拖拽、逐次 `OUT_OF_DATE` / `vkQueuePresentKHR` 计数、无 viewporter 回退（已在 §15.13 实现 / 验证，V-110 / V-122 ④ 闭环）、1.25 sway 瞬态采样、HUD OCR（`apply_min_size` 已在第八轮修复，见 §15.12） |
 
 - **探针环境与方法**：headless sway 1.11 / wlroots 0.19 / lavapipe，`HEADLESS-1` 1280×720；
   `swaymsg resize set` 做程序化 jump / sweep（没有真实指针拖拽），`grim` 逐帧截图，
@@ -1148,6 +1148,7 @@ UI 线程的 commit 与 GPU 线程 WSI present 的 commit 没有 happens-before�
   `window.rs`（`surface` / `set_surface` / `frame_rect` / `background` 的 Linux `cfg`）。
 
 > 第八轮（V-122 残留：`Committed` ⇒ publish / surface 归属 / min size / setup 顺序）见 §15.12。
+> 第九轮（无 viewporter 的整数回退）见 §15.13。
 
 ### 15.12 第八轮闭环：V-122 残留（2026-11-15）
 
@@ -1164,7 +1165,7 @@ drop-order）、⑦（min size 物理 / 逻辑）与 F-186 / F-189 的 surface �
 | F-194 surface 归属 | `Window.surface_from_platform: bool`；`set_surface` 在 clamp 之后、同值 early-return **之前**置 `true`；`set_size` / `set_scale` 只在该标志为 `false` 时把 `surface` 重算成 `size × scale` 的 covering，平台真值写入后保留。headless / 快照 / 平台首次写入前行为不变。Windows 最小化 + DPI 变化时跳过 `set_surface`，现在保持上一次平台写入的真实客户区（恢复时 `WM_SIZE` 覆盖）；macOS `sync_state` 与 Linux 每轮都是 setter → `set_surface`，顺序不变。消除 F-186 / F-189 残留：应用代码在活窗口上调用 `set_size` / `set_scale` 不再把渲染目标重置成 covering |
 | F-195 Linux min size | `xdg_toplevel.set_min_size` 收 window geometry 坐标；本仓 `wp_viewport.set_destination(ceil(logical))` 使 surface 尺寸 = 逻辑尺寸（S-145），故直接给 320×200。`apply_min_size(toplevel)` 只在 `WaylandState::new` 的首个 `surface.commit()` 前设置一次；删除 `event_loop` 的 DPI 重发与重复 setup 调用，删除失去唯一调用者的 `WaylandState::toplevel()` |
 | F-196 Linux setup 顺序 | `event_loop::run` 把所有可失败 setup（`WaylandState::new` / roundtrip / devices / id / calloop `EventLoop` / ping / `WaylandSource` / `UnixA11y::new`）排在 `Renderer::new_for_surface` 与 `window.set_renderer` 之前；循环路径仍显式 `drop(app)`。早退时 `app` 内没有 renderer，不会出现 `WaylandState`（`wl_surface`）先于 `Renderer` 释放。panic 展开仍是局部变量先于函数参数 `app` 释放（release `panic=abort`），本轮不覆盖 |
-| S-145 坐标语义 | `set_min_size` 是 window geometry（surface-local 逻辑）坐标，不是 buffer 像素；**没有 viewporter 时**「surface = 逻辑尺寸」不成立，写入的 320×200 不保证是期望的最小客户区（V-122 ④ / P2-5）。buffer 由客户端按 `round(logical × scale)` 算（F-191），compositor 只缩放到 destination |
+| S-145 坐标语义 | `set_min_size` 是 window geometry（surface-local 逻辑）坐标，不是 buffer 像素；**没有 viewporter 时**「surface = 逻辑尺寸」不成立，写入的 320×200 不保证是期望的最小客户区（V-122 ④ / P2-5）。buffer 由客户端按 `round(logical × scale)` 算（F-191），compositor 只缩放到 destination。**2026-11-15 第九轮（§15.13 / §35 F-197）**：整数回退下 `buffer_scale = N` 使 surface-local = `buffer / N = logical`，两条路径的等价都成立；本条只描述 §35 之前的缺口 |
 
 **三平台实测**（HEAD `6a686cd`，工作树 clean）：
 
@@ -1186,8 +1187,8 @@ drop-order）、⑦（min size 物理 / 逻辑）与 F-186 / F-189 的 surface �
     `/tmp` dylib）抓的**真实窗口 surface**，不是桌面合成截图；单显示器固定 2x，**未在真实
     窗口上制造 DPI / scale 变化**（该路径由单测覆盖）。
   - Linux：`--features` 的 snapshot 测试打印 22 条 `VUID-vkCmdDraw-None-09600`（8/8 仍 pass；
-    demo 运行 0 条），旧日志已存在，建议另立 issue，不写成本轮回归。V-122 ①–③⑤⑥ 与
-    ④（P2-5）仍未验 / 未实现。
+    demo 运行 0 条），旧日志已存在，建议另立 issue，不写成本轮回归。V-122 ①–③⑤⑥ 仍未验；
+    ④（P2-5）已由第九轮（§15.13 / §35 F-197）实现并验证。
 - **新增 / 相关单测**：`frame_reaches_gpu_tracks_plan_and_target_size`（5 种组合：Full /
   Partial 有工作；`Idle` + 无 renderer 仍 `Committed`；`Idle` + 同尺寸不 publish；`Idle` +
   目标尺寸变化仍 publish）、`set_size_and_set_scale_keep_a_platform_written_surface`（平台真值
@@ -1202,4 +1203,72 @@ drop-order）、⑦（min size 物理 / 逻辑）与 F-186 / F-189 的 surface �
   `platform/linux/window.rs`（`apply_min_size`）、`platform/linux/surface.rs`（建窗调用）、
   `platform/linux/event_loop.rs`（setup 顺序、删 DPI 重发）、`platform/{windows,macos}/event_loop.rs`
   与 `platform/macos/window.rs` 的注释。
+
+### 15.13 第九轮闭环：无 viewporter 的整数回退（V-110 / V-122 ④，2026-11-15）
+
+§15.11 闭环了 fractional 路径，但「compositor 不提供 `wp_viewporter`」时仍没有回退：fractional
+对象照建、buffer 按分数放大而 `buffer_scale` 保持 1（1.25 下 surface 被放大 1.25×）。本轮以
+**viewporter 为 fractional 的门控**：只有 `wp_viewporter` 与 `wp_fractional_scale_manager_v1`
+同时存在才创建 fractional 对象与 `wp_viewport`，否则不创建二者、走整数 `wl_output.scale` +
+`wl_surface.set_buffer_scale(N)`；同时把 Wayland 逻辑尺寸取整，保证 buffer 是 `buffer_scale`
+的整数倍。偏差登记见 [`DEVIATIONS.md`](DEVIATIONS.md) §35（F-197 / F-198 / S-146 / S-147 /
+V-124），实机证据见 [`linux-verification.md`](linux-verification.md) §4.9。
+
+**决策表**（依据：Chromium / Qt / GTK 的成熟实现 + 协议原文 + sway 实测，详见 DEVIATIONS §35
+S-146 / S-147）：
+
+| 项目 | 做法 | 代码位置（文件:函数） |
+|---|---|---|
+| fractional 门控 | `WpViewporter` 存在才 bind fractional manager；两者都成功才 `get_viewport`；`uses_viewport = viewport.is_some()`；工厂对象创建子对象后 `destroy()`（不影响子对象） | `platform/linux/surface.rs::WaylandState::new` |
+| 整数 scale 选择 | `preferred_buffer_scale`（surface v6）→ 已 enter 的最大 `wl_output.scale` → 首次 enter 前全部已绑定 output 最大 → 上一个值 → 1（clamp ≥1） | `platform/linux/surface.rs::choose_integer_scale` / `WaylandState::integer_scale_value` |
+| `buffer_scale` 管道 | `Window::set_buffer_scale(N)` → `FrameRequest.buffer_scale` 同帧过线 → GPU 线程 present 前 `wl_surface.set_buffer_scale(N)`（与 attach/commit 同一次 commit，`last_buffer_scale` 去重） | `window.rs::Window::set_buffer_scale` / `render/frame.rs::FrameRequest.buffer_scale` / `render/linux/compositor.rs`（present 前写入） |
+| 逻辑尺寸整数化 | `WaylandState::new` 把请求 size `.round().max(1.0)`；整数回退 buffer = `logical × N`（否则 `round(L × N)` 可能不是 N 的倍数，`attach` 报 `invalid_size`）；compositor `debug_assert`（`buffer_scale ≥ 1`、buffer 是 N 的整数倍） | `platform/linux/surface.rs::WaylandState::new` / `render/linux/compositor.rs`（`debug_assert` 不变量） |
+| 动态 output / leave | 启动时 `WlRegistry::bind` 逐个绑定所有现存 `wl_output`（`GlobalList::bind` 只绑第一个）；`wl_registry.global` 动态绑定、`global_remove` 解绑（v3+ `release`，v1/v2 丢代理）；`enter/leave` 维护 entered 列表；`entered_once` 后 leave 清空列表但保留上一个整数 scale（避免最小化 / 切工作区的虚假 `DpiChanged`） | `platform/linux/surface.rs::bind_existing_outputs` / `unbind_output` / `Dispatch<wl_surface::WlSurface>` |
+| 事件循环镜像 | 启动与每轮 `set_buffer_scale`（同值 no-op）、`set_surface(round(logical × scale))`；scale 变化 push `DpiChanged`，随后 `set_scale` / `set_surface` / `set_buffer_scale` 并出帧 | `platform/linux/event_loop.rs::run` / `platform/linux/dpi.rs::physical_size` |
+
+**机制表**：
+
+| 项 | 结论 |
+|---|---|
+| fractional 路径（有 viewporter） | buffer = `round(logical × preferred_scale/120)`；`wp_viewport.set_destination(ceil(logical))` 由 GPU 线程在 `vkQueuePresentKHR` 前写；`wl_surface` 的 buffer scale 保持默认 1（不调用 `set_buffer_scale`） |
+| 整数回退（无 viewporter / 无 fractional manager） | 不创建 fractional / viewport；`N` 按上表选择；buffer = `round(logical × N)`（逻辑尺寸已取整 ⇒ `logical × N`）；`buffer_scale = N` 在 present 前写入，surface-local 尺寸 = `buffer / N = logical`，不会出现「buffer 按分数放大、`buffer_scale = 1`」的 1.25× 放大 |
+| 提交顺序 | `set_buffer_scale(N)` → WSI `attach(buffer)` → `commit`；`set_buffer_scale` 与 destination 互斥，且都与 buffer 同一次 `wl_surface.commit` 生效（WSI 规范要求窗口系统变更先于 `vkQueuePresentKHR`） |
+| 不变量 | `buffer_scale ≥ 1`；`N == 1` 或 buffer 两维都能被 `N` 整除（否则 `wl_surface.invalid_size`）；逻辑尺寸是整数（`round().max(1.0)`），configure 本来就是 u32 |
+| 动态 output | 热插拔的 `wl_output` 动态绑定 / 解绑；多屏 enter 两个不同 scale 的 output 时取已 enter 的最大值（避免糊）；leave 清空 entered 后保留上一个值，不产生 1× ↔ 2× 的抖动 |
+| 测试 | `platform::linux::surface::tests` 6 条 + `window::tests::buffer_scale_defaults_to_one_and_clamps`；Linux lib 671（无 features）/ 731（features） |
+
+**三平台 / 实测**（HEAD `240aadc`，headless sway 1.11 / wlroots 0.19 / lavapipe，
+`HEADLESS-1` 1280×720）：
+
+| 平台 | 门禁 | 实测 |
+|---|---|---|
+| Linux | `cargo test -p ui_core --lib` **671 passed / 0 failed / 0 ignored**；`--features "hud,test-support"` lib **731** + frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37（62），全 pass；nightly clippy `-D warnings`、fmt `--check` exit 0 | 基线（有 viewporter）：1.25 tree 701×501 @100,37、`set_destination(701,501)` → `attach(876×626)` → `commit`、`set_buffer_scale` grep 0、`create_buffer(876,626)`；2.0 tree 640×360、destination 640×360、buffer 1280×720、无 `set_buffer_scale`。回退（临时隐藏 viewporter，已还原）：1.25 无 `get_viewport` / `set_destination`、`set_buffer_scale(2)` **1 次**且在 attach/commit 之前、`create_buffer(1402,1002)`、tree 701×501；截图窗口物理 bbox 与基线一致 **876×627（125,46–1001,673）**、PIL mean abs diff **2.115/255（0.83%）**、max 217、>8 像素 9.68%（只在字形 / 圆角边缘）、Laplacian 977.06 → **1161.99（+18.9%）**、卡片文字 1984.6 → **2386.7（+20.3%）**；2.0 `set_buffer_scale(2)`、buffer 1280×720、无 destination、tree 640×360、截图 sha256 与基线完全相同（`97aca6fc…`）、Laplacian 592.3257 不变。动态 scale（单进程）：1.0（640×360）→ 2.0（`set_buffer_scale(2)` → attach 1280×720）→ 1.0（`set_buffer_scale(1)` → attach 640×360），三步 rect 恒 640×360@320,180、exit 0；scratchpad leave / 再显示存活、恢复 640×360、Esc exit 0 |
+| Windows（主机，HEAD `240aadc`，未设 `ui_core_SKIP_SHADERS`） | lib **712 passed / 0 failed / 1 ignored**；`--features "hud,test-support"` lib **774 / 1 ignored** + frame_record 6 / hud 7 / layout 4 / snapshot 8 / demo 37（62），全 pass；clippy `-D warnings`、fmt `--check` exit 0；`aarch64-apple-darwin` 交叉（默认 + features）exit 0；`x86_64-unknown-linux-gnu` 交叉（stub `pkg-config`，默认 + features）exit 0 | 本轮无 Windows 代码路径改动；`Window::set_buffer_scale` 是 Linux-only 字段，Windows 行为不变 |
+| macOS（交叉 `aarch64-apple-darwin`） | `cargo check -p ui_core --target aarch64-apple-darwin`（默认 + features）exit 0 | 本轮无 macOS 行为改动；`FrameRequest.buffer_scale` 与 `Window` 字段都在 `#[cfg(target_os = "linux")]` 下，平台路径不变；无 macOS 运行时验证 |
+
+**未验证 / 限制**（V-124）：
+
+- KWin / Mutter 的真实「无 fractional 客户端」路径未跑（只有源码事实：`wl_output.scale = ceil`）；
+  混合 DPI 多屏的 enter / leave、热插拔显示器、真实指针拖拽都未实测。
+- 1.25 字形栅格差异：整数回退是 2× 渲染后由 compositor 降采样，fractional 是 1.25× 原生栅格；
+  两者无几何 / 布局差异，不视为缺陷。fractional 首帧可能先按整数 scale 出图（`preferred_scale`
+  晚到；destination 保证几何正确）。
+- 既有 1.25 demo 浮动窗口自振荡（1020×526 ↔ 960×576）在 `HEAD~1`（`a6b7192`，无回退代码）
+  同样复现，不是本提交引入；验证时用 SIGSTOP 冻结目标帧截图。
+
+**新增单测与落点**：
+
+- `platform/linux/surface.rs`：`choose_integer_scale` 纯函数 + 6 条用例
+  （`preferred_buffer_scale_wins_over_outputs`、`entered_outputs_win_over_bound_outputs`、
+  `before_the_first_enter_the_bound_max_is_a_conservative_estimate`、
+  `after_the_first_enter_an_empty_list_keeps_the_previous_scale`、
+  `no_scale_information_at_all_falls_back_to_one`、`a_non_positive_scale_is_clamped_to_one`）；
+  `window.rs`：`buffer_scale_defaults_to_one_and_clamps`。
+- 落点：`platform/linux/surface.rs`（viewporter / fractional 门控、`choose_integer_scale`、
+  `bind_existing_outputs` / `unbind_output`、`wl_registry` / `wl_output` / `wl_surface.enter/leave`、
+  逻辑尺寸取整、`buffer_scale` / `surface_clone` / `take_viewport`）、`platform/linux/event_loop.rs`
+  （启动与每轮 `set_buffer_scale`）、`platform/linux/dpi.rs`（模块文档）、`window.rs`
+  （`buffer_scale` 字段与 `set_buffer_scale`、`FrameRequest` 构造）、`render/frame.rs`
+  （`FrameRequest.buffer_scale` 契约与配对测试）、`render/linux/compositor.rs`（present 前
+  `set_buffer_scale` + `debug_assert` 不变量）、`render/linux/renderer.rs`（`wl_surface` 副本）。
 
