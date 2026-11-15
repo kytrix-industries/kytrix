@@ -149,7 +149,8 @@ impl WaylandState {
         let toplevel = xdg_surface.get_toplevel(&queue_handle, ());
         toplevel.set_app_id(APP_ID.to_owned());
         toplevel.set_title(title.to_owned());
-        window::apply_min_size(&toplevel, Scale::ONE);
+        // 最小尺寸是 surface-local 逻辑像素，与 scale 无关：只需在首个 commit 前设置一次。
+        window::apply_min_size(&toplevel);
         surface.commit();
 
         let data_device = data_device_manager.get_data_device(&seat, &queue_handle, ());
@@ -233,10 +234,6 @@ impl WaylandState {
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
-    }
-
-    pub(crate) fn toplevel(&self) -> &xdg_toplevel::XdgToplevel {
-        &self.toplevel
     }
 
     /// `wl_display*` / `wl_surface*`（Vulkan WSI 需要；`system` backend 的真实对象）。

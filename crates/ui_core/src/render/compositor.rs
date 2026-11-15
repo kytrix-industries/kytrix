@@ -62,7 +62,8 @@ impl Default for DamageRects {
 /// 一帧要提交的像素工作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
-    /// 没有像素要动（`commit_frame` 的第二段门禁已拦掉；这里只作防御）。
+    /// 没有像素要动。目标尺寸未变时 `commit_frame` 的第二段门禁把它拦下（不 publish、按
+    /// `Idle` 结算）；目标尺寸变化时仍会发布，让 GPU 线程按新尺寸重建渲染目标。
     Idle,
     /// 整帧：全量 copy + 全量 present。
     Full,

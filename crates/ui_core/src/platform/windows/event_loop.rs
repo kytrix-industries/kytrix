@@ -801,7 +801,7 @@ fn apply_event(
                 window.set_scale(scale);
                 // `apply_scale` / `place` 已按新 DPI 重排非客户区：回读真实客户区。
                 // 最小化时 `GetClientRect` 是 0×0（`client_size()` 会钳成 1×1）：跳过 `set_surface`，
-                // 目标保持 `set_scale` 重算的 covering；恢复窗口的 `WM_SIZE` 会用真实客户区覆盖它。
+                // 目标保持上一次平台写入的真实客户区；恢复窗口的 `WM_SIZE` 会用新客户区覆盖它。
                 if !native.is_minimized() {
                     window.set_surface(native.client_size());
                 }

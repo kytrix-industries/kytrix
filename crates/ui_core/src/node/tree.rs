@@ -1125,8 +1125,9 @@ impl NodeTree {
     /// 帧结算（**唯一**的复位点，P06 §9.4 / F-59）：damage 归零、`prev_layout = layout`、
     /// 置 `REUSABLE`、清本帧已消费的 `LAYOUT | PAINT`。
     ///
-    /// **只在提交时调用**（`Window::commit_frame`）：drain 阶段的 `touch` 发生在帧前，帧初归零会吞掉
-    /// 已累积的 damage。帧内不得 `mark_*`（`&mut self` 已把写操作挡在帧外）。
+    /// **只在 `Window::commit_frame` 里、paint 已消费 lane 与 damage 之后调用**：drain 阶段的
+    /// `touch` 发生在帧前，帧初归零会吞掉已累积的 damage。帧内不得 `mark_*`（`&mut self` 已把
+    /// 写操作挡在帧外）。
     pub(crate) fn settle_frame(&mut self) {
         for id in &self.order {
             if let Some(target) = self.arena.get_mut(*id) {

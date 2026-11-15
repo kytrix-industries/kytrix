@@ -24,7 +24,7 @@ use crate::{
     render::{
         backend::Renderer,
         compositor::{Plan, plan},
-        damage::{DamageAccumulator, DamageSummary},
+        damage::DamageAccumulator,
         frame::{FramePayload, FrameRequest},
         timer::FrameTimings,
     },
@@ -171,9 +171,10 @@ pub(crate) enum FrameState {
 /// 一帧的最终结果（`FrameRecord` 只存在于 `test-support`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameOutcome {
-    /// 本帧没有像素要画：不跑 pass、不编码、不提交、`FrameIndex` 不变（I3）。
+    /// 本帧不提交：没有像素要画，或有像素但不会产生 GPU 工作（V-122 ⑧）。`FrameIndex` 不变（I3）。
     Idle,
-    /// 已交付 GPU 线程（**不等于**已呈现；纯 Idle 计划被门禁跳过时也不会交付）。
+    /// 已把帧发布给 GPU 线程（**不等于**已呈现）：有 renderer 时本帧恰好 `publish` 一次，
+    /// Linux 帧门禁（F-183）依赖这一点 —— GPU 线程 `commit` 后 `wl_callback` 才会回来。
     /// 序号 = 本次提交后的 `FrameIndex`。
     Committed(FrameIndex),
 }
@@ -253,11 +254,16 @@ pub struct Window {
     scale: Scale,
     /// 渲染目标的物理像素尺寸。
     ///
-    /// Windows 是平台层给的真实客户区（`set_surface`），macOS 是 AppKit 的真实 backing
-    /// （`convertSizeToBacking`，同样由 `set_surface` 写入），Linux 是 Wayland buffer 的真实
-    /// 像素尺寸（`round(逻辑 × scale)`，同样由平台层 `set_surface` 写入）；`set_size` / `set_scale`
-    /// 会先按 `size × scale` 的 covering 重算一次，平台层随后用真值覆盖。
+    /// 平台真值由 `set_surface` 写入：Windows 是真实客户区，macOS 是 AppKit 的真实 backing
+    /// （`convertSizeToBacking`），Linux 是 Wayland buffer 的真实像素尺寸（`round(逻辑 × scale)`）。
+    /// 在平台首次写入之前（headless / 快照 / 首帧前）才跟随 `size × scale` 的 covering。
     surface: (u32, u32),
+    /// 平台层是否已经通过 `set_surface` 写过真实渲染目标。
+    ///
+    /// `false`（构造时、headless / 快照路径）⇒ `set_size` / `set_scale` 让 `surface` 跟随
+    /// `size × scale` 的 covering；`true` 之后平台真值是唯一来源，这两个方法**不得**用 covering
+    /// 覆盖它（F-186 / F-189 / V-122）。
+    surface_from_platform: bool,
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
     /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
@@ -331,6 +337,7 @@ impl Window {
             scene: Scene::empty(),
             scale,
             surface,
+            surface_from_platform: false,
             scale_epoch: 0,
             scheduler: FrameScheduler::new(),
             encoder: InstanceEncoder::new(),
@@ -511,16 +518,21 @@ impl Window {
 
     /// 逻辑尺寸变化（消费者：P12 的 resize 事件）：写尺寸 + 标根 `LAYOUT` + 清根缓存。
     ///
-    /// **警告**：本方法会先把 `surface` 重算为 `size × scale` 的 covering；活窗口改渲染目标必须
-    /// 由平台层调用 `set_surface` 写入真值，应用代码不应在活窗口上调用本方法来改客户区
-    /// （见 F-186 / V-122）。
+    /// **不调整 OS 窗口大小**：只改逻辑布局与 damage。平台层在真实 resize 之后用 `set_surface`
+    /// 写入真实渲染目标；平台已写过真值时本方法保留它，应用代码不要在活窗口上用本方法改
+    /// 客户区（F-186 / F-189）。只有平台尚未写入过目标（headless / 快照 / 首帧前）时，
+    /// `surface` 才跟随 `size × scale` 的 covering。
     pub fn set_size(&mut self, size: Size) {
         self.options.size = size;
         self.full_damage_pending = true;
         let root = self.tree.root();
         // 与 `set_style` / `set_layout_override` 同一条失效路径（P11：它也标 `A11Y`）。
         self.tree.invalidate_layout(root);
-        self.surface = covering_surface(self.size(), self.scale);
+        // 平台真值一旦写入就不再被 covering 覆盖（F-186）：否则应用在活窗口上调本方法会把
+        // 渲染目标重置成 `size × scale` 的猜测值。
+        if !self.surface_from_platform {
+            self.surface = covering_surface(self.size(), self.scale);
+        }
     }
 
     /// 用窗口逻辑尺寸重排，返回本次布局统计（P06/P09 的帧驱动调用它）。
@@ -542,15 +554,16 @@ impl Window {
         Ok(report)
     }
 
+    /// **不调整 OS 窗口 / 渲染目标**：只改比例与布局失效。平台层随后用 `set_surface` 写入真实
+    /// 渲染目标；平台已写过真值时本方法保留它，应用代码不要在活窗口上用本方法改客户区
+    /// （F-186 / F-189）。只有平台尚未写入过目标（headless / 快照 / 首帧前）时，`surface` 才
+    /// 跟随 `size × scale` 的 covering。
+    ///
     /// DPI 变化（P12 的事件处理调用它）：更新比例并标根 `LAYOUT | PAINT`。
     ///
     /// **逻辑布局盒与 scale 无关**（I11：布局全用逻辑像素，物理化在 paint/P06），这里只保守地失效。
     ///
     /// **不**置 `App` 的唤醒请求：DPI 事件本身来自平台，平台总是会调度一帧（P12）。
-    ///
-    /// **警告**：本方法会先把 `surface` 重算为 `size × scale` 的 covering；活窗口改渲染目标必须
-    /// 由平台层调用 `set_surface` 写入真值，应用代码不应在活窗口上调用本方法来改客户区
-    /// （见 F-186 / V-122）。
     pub fn set_scale(&mut self, scale: Scale) {
         self.scale = scale;
         self.scale_epoch = self.scale_epoch.wrapping_add(1);
@@ -559,7 +572,10 @@ impl Window {
         self.tree.invalidate_layout(root);
         // a11y 的 bounds 全是物理像素 ⇒ 比例变了必须整棵重发（P11 §5.5）。
         self.a11y.note_bounds_changed();
-        self.surface = covering_surface(self.size(), self.scale);
+        // 平台真值一旦写入就不再被 covering 覆盖（F-186）。
+        if !self.surface_from_platform {
+            self.surface = covering_surface(self.size(), self.scale);
+        }
     }
 
     /// 平台层：写入真实渲染目标物理尺寸（Windows `WM_SIZE` / `WM_DPICHANGED`、macOS
@@ -568,12 +584,16 @@ impl Window {
     /// 值变化 ⇒ 标全量重绘（新暴露的像素没有对应 damage）；**不**标 layout、**不**动
     /// `scale_epoch`：本方法只改渲染目标，不改布局；DPI 的布局变化由 `set_scale` / `set_size` 负责。
     ///
+    /// 调用一次之后 `surface` 归平台层所有：`set_size` / `set_scale` 不再用 covering 覆盖它
+    /// （F-186 / F-189）。同值调用也会把 `surface` 的所有权交给平台（先于 early-return）。
+    ///
     /// macOS 还必须在这里刷新图层属性（`contentsScale` / `drawableSize`）：这是主线程的写入口，
     /// 且必须在「值没变就返回」**之前**执行 —— DPI 变化但 surface 恰好相同时也要更新
     /// `contentsScale`。只变 scale 时也必须刷新。
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn set_surface(&mut self, surface: (u32, u32)) {
         let surface = (surface.0.max(1), surface.1.max(1));
+        self.surface_from_platform = true;
         #[cfg(target_os = "macos")]
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_layer_scale(surface, self.scale.factor());
@@ -808,16 +828,17 @@ impl Window {
         Ok(())
     }
 
-    /// 窗口的物理像素尺寸（三平台都是平台层写入的真实渲染目标）。
+    /// 窗口的物理像素尺寸（平台层写入的真实渲染目标；headless / 平台首次写入前是 covering）。
     fn physical_surface(&self) -> (u32, u32) {
         self.surface
     }
 
-    /// 本帧的物理矩形（`paint_frame` / `commit_frame` / `submit_gpu` 的唯一来源）。
+    /// 本帧的物理矩形（`paint_frame` / `commit_frame` 的唯一来源）。
     ///
     /// 三平台一致：平台层通过 `set_surface` 写入的真实渲染目标 —— Windows 真实客户区
     /// （至少 1 px）、macOS 真实 backing（`convertSizeToBacking`，文字按真实像素 1:1）、
     /// Linux Wayland buffer 的 `round(逻辑 × scale)`（文字按 buffer 像素 1:1）。
+    /// headless / 平台首次写入之前是 `size × scale` 的 covering。
     fn frame_rect(&self) -> PhysicalRect {
         PhysicalRect::new(0, 0, self.surface.0 as i32, self.surface.1 as i32)
     }
@@ -898,9 +919,12 @@ impl Window {
         Ok(report)
     }
 
-    /// 提交（或在中止条件下退回 `Idle`）。
+    /// 提交（或在本帧不会产生 GPU 工作时退回 `Idle`）。
     ///
-    /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画 ⇒ 不提交、`FrameIndex` 不变。
+    /// 第二段门禁：`rebuilt == 0` 且没有任何 damage ⇒ 没有像素要画；或者有像素但
+    /// [`frame_reaches_gpu`] 判定本帧不会产生 GPU 工作（`Plan::Idle` 且目标尺寸未变）。
+    /// 两种情况都不提交、`FrameIndex` 不变，按 `Idle` 结算 —— Linux 帧门禁依赖
+    /// 「`Committed` ⇒ 已 publish」（V-122 ⑧ / F-183）。
     ///
     /// 窗口路径的 GPU 错误（device lost / present 失败 / swapchain 重建失败）**不**从这里返回：
     /// 本方法只把帧发布给 GPU 线程（不等待），错误由 `poll_renderer` 粘性冒泡。编码 / 帧结算
@@ -919,6 +943,27 @@ impl Window {
             "damage summary and accumulator disagree"
         );
         if !has_pixels {
+            // `paint_frame` 没有跑（或没产出任何 lane / 像素）：没有节点状态需要结算，
+            // damage 与 dirty 保留给下一次重试。
+            self.scheduler.abort(ticket);
+            #[cfg(feature = "hud")]
+            {
+                self.frame_started_at = None;
+                self.frame_cpu = None;
+            }
+            #[cfg(feature = "test-support")]
+            self.record_idle();
+            return FrameOutcome::Idle;
+        }
+        // 本帧只算一次：`submit_gpu` 消费同一份 `plan`（目标尺寸也来自同一次 `frame_rect`）。
+        let frame = self.frame_rect();
+        let plan = plan(report.damage, self.damage.rects(), frame);
+        let renderer_surface = self.renderer.as_ref().map(Renderer::surface);
+        if !frame_reaches_gpu(plan, renderer_surface, self.surface) {
+            // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
+            // 状态（damage / prev_layout / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
+            // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
+            self.tree.settle_frame();
             self.scheduler.abort(ticket);
             #[cfg(feature = "hud")]
             {
@@ -932,7 +977,7 @@ impl Window {
         let index = self.scheduler.commit(ticket);
         self.tree.settle_frame();
         if let Some(mut renderer) = self.renderer.take() {
-            let stats = self.submit_gpu(&mut renderer, index, report.damage);
+            let stats = self.submit_gpu(&mut renderer, index, plan);
             self.renderer = Some(renderer);
             #[cfg(feature = "hud")]
             {
@@ -945,7 +990,6 @@ impl Window {
         }
         #[cfg(feature = "test-support")]
         {
-            let frame_rect = self.frame_rect();
             let stats = std::mem::take(&mut self.stats);
             let record = crate::test_support::record::capture(
                 &self.scene,
@@ -953,7 +997,7 @@ impl Window {
                 &self.resolver,
                 &report,
                 self.damage.rects(),
-                frame_rect,
+                frame,
                 index,
                 stats,
             );
@@ -964,19 +1008,21 @@ impl Window {
 
     /// 把本帧交给 GPU：窗口路径只构造 `FrameRequest` 并 `publish`（**不等待**，I1）。
     ///
+    /// `plan` 由 [`Self::commit_frame`] 用同一份 damage 与 `frame` 算好；`Committed` 帧在这里
+    /// **恰好发布一次**（`Plan::Idle` 且目标尺寸未变的帧已在 `commit_frame` 退回 `Idle`）。
+    ///
     /// 返回最近一次**已完成**帧的统计（窗口路径落后 ≤1 帧，HUD 允许）；GPU 线程的错误在
     /// `poll_renderer` 里冒泡，提交路径没有同步错误。
     fn submit_gpu(
         &mut self,
         renderer: &mut Renderer,
         index: FrameIndex,
-        damage: DamageSummary,
+        plan: Plan,
     ) -> crate::render::RenderStats {
         let surface = self.physical_surface();
-        let frame = self.frame_rect();
-        let plan = plan(damage, self.damage.rects(), frame);
-        // `plan` 已把每个 damage 矩形夹进 `frame`；这里把「不变量被破坏」变成 debug 期显式失败
-        // （否则 D3D12 的 `Present1` / scissor 会以 `DXGI_ERROR_INVALID_CALL` 形式在 GPU 线程炸）。
+        // `plan` 的矩形已由 `commit_frame` 的 `plan(...)` 夹进本帧 frame；这里把「不变量被破坏」
+        // 变成 debug 期显式失败（否则 D3D12 的 `Present1` / scissor 会以
+        // `DXGI_ERROR_INVALID_CALL` 形式在 GPU 线程炸）。
         if let Plan::Partial(rects) = plan {
             for rect in rects.as_slice() {
                 debug_assert!(
@@ -989,11 +1035,6 @@ impl Window {
                     "damage rect {rect:?} escapes the surface {surface:?}"
                 );
             }
-        }
-        // §4.4 兜底：没有像素要画且目标尺寸没变 ⇒ 不发布（省掉一次跨线程拷贝）。尺寸/DPI
-        // 变化时必须发布——否则 GPU 线程永远看不到新的 `surface`，也就不会重建目标。
-        if plan == Plan::Idle && renderer.surface() == surface {
-            return crate::render::RenderStats::default();
         }
         #[cfg(target_os = "macos")]
         renderer.set_layer_scale(surface, self.scale.factor());
@@ -1178,21 +1219,45 @@ impl Window {
 
 /// `size × scale` 的 covering 物理尺寸（向外 floor/ceil，至少 1 px）。
 ///
-/// 平台层在 `set_size` / `set_scale` 之后、下一帧之前用 [`Window::set_surface`] 写入真值
-/// （Windows 真实客户区 / macOS backing / Linux `round(逻辑 × scale)` 的 Wayland buffer），
-/// 因此 covering 只是初值，不是只有首帧前。
+/// 只在平台层首次调用 [`Window::set_surface`] 之前使用（headless / 快照 / 首帧前）；平台真值
+/// 一旦写入，`set_size` / `set_scale` 就保留它，不再用 covering 覆盖（F-186 / F-189 / V-122）。
 fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
     let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
     (rect.width().max(1) as u32, rect.height().max(1) as u32)
 }
 
+/// 本帧是否会**产生 GPU 工作**（`commit_frame` 的提交判据之一）。
+///
+/// - 没有渲染器（`renderer_surface == None`，headless / 纯 CPU 帧）⇒ `true`：没有 GPU 线程可
+///   交付，帧仍按 `Committed` 结算。
+/// - 有渲染器 ⇒ `plan != Plan::Idle || renderer_surface != Some(surface)`。`Plan::Idle` 只表示
+///   没有像素要画；若 `surface`（本帧目标尺寸）与渲染器最近一次发布的目标尺寸不同，GPU 线程
+///   仍必须重建渲染目标，因此算有工作。
+///
+/// 返回 `false` 的帧不会 publish：`commit_frame` 必须把它按 `Idle` 结算，否则 Linux 帧门禁
+/// 会等一次永远不会到来的 `wl_callback`（V-122 ⑧ / F-183）。
+fn frame_reaches_gpu(
+    plan: Plan,
+    renderer_surface: Option<(u32, u32)>,
+    surface: (u32, u32),
+) -> bool {
+    match renderer_surface {
+        None => true,
+        Some(published) => plan != Plan::Idle || published != surface,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions, covering_surface};
+    use super::{
+        FrameIndex, FrameOutcome, Window, WindowId, WindowOptions, covering_surface,
+        frame_reaches_gpu,
+    };
     use crate::{
-        math::{Scale, Size},
+        math::{PhysicalRect, Scale, Size},
         node::dirty::DirtyFlags,
         paint::color::Color,
+        render::compositor::{DamageRects, Plan},
     };
 
     fn window() -> Window {
@@ -1296,17 +1361,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn frame_rect_uses_the_platform_buffer_on_linux() {
-        use crate::math::PhysicalRect;
-
         let mut window = window();
         // 初值是 covering（800×600）；平台层随后在 event_loop 里写入 round 后的 buffer。
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
         window.set_surface((999, 777));
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
 
-        // `set_size` 先按 covering 重算 surface；平台层下一轮用 round 覆写。
+        // 平台已写入真值：`set_size` 不得把它重算成 covering（F-186 / V-122）。
         window.set_size(Size::new(256.8, 100.5));
-        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 257, 101));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
         window.set_surface((449, 176));
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
 
@@ -1319,17 +1382,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn frame_rect_uses_the_platform_backing_on_macos() {
-        use crate::math::PhysicalRect;
-
         let mut window = window();
         // 初值是 covering（800×600）；平台层随后写入真实 backing。
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
         window.set_surface((1234, 777));
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
 
-        // `set_size` 先按 covering 重算 surface；平台层下一轮再用真实 backing 覆盖。
+        // 平台已写入真值：`set_size` 不得把它重算成 covering（F-186 / V-122）。
         window.set_size(Size::new(256.8, 100.5));
-        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 257, 101));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
         window.set_surface((449, 176));
         assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
     }
@@ -1404,6 +1465,74 @@ mod tests {
         window.set_surface((10, 20));
         assert_eq!(window.physical_surface(), (10, 20));
         assert!(window.full_damage_pending);
+    }
+
+    /// F-186 / F-189 / V-122：平台写入真实目标之后，`set_size` / `set_scale` 只做布局 / DPI
+    /// 失效，不得把 `surface` 重置成 `size × scale` 的 covering。
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn set_size_and_set_scale_keep_a_platform_written_surface() {
+        let mut window = window();
+        window.tree_mut().clear_all_dirty_for_test();
+        window.set_surface((999, 777));
+        window.full_damage_pending = false;
+        let epoch = window.scale_epoch();
+        let root = window.tree().root();
+
+        window.set_size(Size::new(256.8, 100.5));
+        assert_eq!(
+            window.physical_surface(),
+            (999, 777),
+            "平台真值不得被 covering（257×101）覆盖"
+        );
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+        assert!(window.full_damage_pending, "尺寸变化仍必须整帧重绘");
+        assert!(
+            window
+                .tree()
+                .get(root)
+                .expect("root 存在")
+                .dirty()
+                .contains(DirtyFlags::LAYOUT),
+            "尺寸变化仍必须标根 LAYOUT"
+        );
+        assert_eq!(window.scale_epoch(), epoch, "set_size 不动 scale_epoch");
+
+        window.tree_mut().clear_all_dirty_for_test();
+        window.full_damage_pending = false;
+        window.set_scale(Scale::new(1.25).expect("合法比例"));
+        assert_eq!(
+            window.physical_surface(),
+            (999, 777),
+            "DPI 变化不得覆盖平台真值"
+        );
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+        assert!(window.full_damage_pending, "DPI 变化仍必须整帧重绘");
+        assert!(
+            window
+                .tree()
+                .get(root)
+                .expect("root 存在")
+                .dirty()
+                .contains(DirtyFlags::LAYOUT),
+            "DPI 变化仍必须标根 LAYOUT"
+        );
+        assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 照常递增");
+
+        // 平台层下一次显式写入仍然生效。
+        window.set_surface((449, 176));
+        assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
+
+        // 同值 `set_surface` 也必须把 `surface` 的所有权交给平台（flag 先于 early-return）：
+        // 之后 `set_scale` 不得把它重算成 covering（1000×750）。
+        let mut same_value = Window::new(WindowId::for_test(1), WindowOptions::default());
+        same_value.set_surface(covering_surface(Size::new(800.0, 600.0), Scale::ONE));
+        same_value.set_scale(Scale::new(1.25).expect("合法比例"));
+        assert_eq!(
+            same_value.physical_surface(),
+            (800, 600),
+            "同值 set_surface 之后的 set_scale 不得把 800×600 重算成 1000×750"
+        );
     }
 
     #[test]
@@ -1575,6 +1704,118 @@ mod tests {
             .build(window.tree_mut(), root)
             .expect("挂载成功");
         (window, node)
+    }
+
+    /// V-122 ⑧：提交判据的纯函数（不碰 GPU）。Full/Partial 有工作；Idle 只在目标尺寸变化时
+    /// 才有工作；没有 renderer 的 headless 帧恒有工作。
+    #[test]
+    fn frame_reaches_gpu_tracks_plan_and_target_size() {
+        let mut rects = DamageRects::new();
+        assert!(rects.push(PhysicalRect::new(0, 0, 4, 4)));
+        let partial = Plan::Partial(rects);
+        let surface = (100, 50);
+
+        assert!(
+            frame_reaches_gpu(Plan::Full, Some(surface), surface),
+            "Full 一定有 GPU 工作"
+        );
+        assert!(
+            frame_reaches_gpu(partial, Some(surface), surface),
+            "Partial 一定有 GPU 工作"
+        );
+        assert!(
+            frame_reaches_gpu(Plan::Idle, None, surface),
+            "没有 renderer（headless / 纯 CPU 帧）：仍按 Committed 结算"
+        );
+        assert!(
+            !frame_reaches_gpu(Plan::Idle, Some(surface), surface),
+            "Idle 且目标尺寸没变 ⇒ 不 publish"
+        );
+        assert!(
+            frame_reaches_gpu(Plan::Idle, Some((99, 50)), surface),
+            "Idle 但目标尺寸变了 ⇒ GPU 线程仍要重建目标"
+        );
+    }
+
+    /// P2-1 / V-122 ⑧（端到端）：真实 renderer 下「有像素但 `plan == Plan::Idle`、目标尺寸
+    /// 未变」的帧不 publish、不递增 `FrameIndex`，但 paint 已消费 lane 与 damage，必须像已提交
+    /// 帧一样 `settle_frame` 复位节点状态（否则后续 over-damage / a11y 多标）。
+    ///
+    /// 构造：节点从一开始就在 800×600 目标之外（900,900 起）；先跑一帧结算 root 的初始布局
+    /// damage（首帧必定是全帧，会掩掉被测的 `Plan::Idle`），再只改节点颜色（PAINT-only，
+    /// 不冒泡到 root）。被测帧的 damage 只来自越界节点，被 `plan` 全部裁空 ⇒ `Plan::Idle`；
+    /// 离屏渲染器目标仍是 800×600 ⇒ 没有 GPU 工作。
+    ///
+    /// 回归保护：旧实现只有 `!has_pixels` 一道门禁，本帧 `has_pixels == true`（paint 重建了
+    /// lane 并产出 damage），因此会返回 `Committed(FrameIndex(2))` 并推进序号 —— 本测试的
+    /// `Idle` / `FrameIndex(1)` 断言会失败。
+    #[cfg(windows)]
+    #[test]
+    fn an_idle_plan_with_a_real_renderer_settles_node_damage() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        window
+            .enable_offscreen_renderer()
+            .expect("offscreen renderer");
+        let root = window.tree().root();
+        let node = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(900.0, 900.0, 40.0, 16.0))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let warmup = window.frame().expect("预热帧成功");
+        assert_eq!(
+            warmup,
+            FrameOutcome::Committed(FrameIndex(1)),
+            "预热帧用于结算 root 的初始 damage"
+        );
+        assert!(
+            window
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .damage()
+                .is_empty(),
+            "预热帧提交后节点 damage 已复位"
+        );
+
+        // 只改颜色：PAINT-only，不触发 root 布局，因此本帧 damage 只来自越界节点。
+        let patch = StylePatch {
+            background: Some(Color::BLACK),
+            ..StylePatch::default()
+        };
+        assert!(window.tree_mut().set_style_patch(node, patch));
+        assert!(window.tree_mut().mark_paint(node));
+        assert!(
+            !window
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .damage()
+                .is_empty(),
+            "PAINT 变更必须让节点累积 damage（否则下面的复位断言没有意义）"
+        );
+
+        let outcome = window.frame().expect("帧成功");
+
+        assert_eq!(outcome, FrameOutcome::Idle, "有像素但到不了 GPU ⇒ Idle");
+        assert_eq!(
+            window.frame_index(),
+            FrameIndex(1),
+            "Idle 不推进 FrameIndex"
+        );
+        assert!(
+            window
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .damage()
+                .is_empty(),
+            "paint 已消费 damage：Idle 也必须结算节点（P2-1）"
+        );
     }
 
     #[test]

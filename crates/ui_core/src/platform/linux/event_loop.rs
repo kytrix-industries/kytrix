@@ -3,8 +3,9 @@
 //!
 //! 结构（单窗口 v1，与 P09 的 `Application::run` 契约一致）：
 //! 1. 建 `WaylandState`（连接、协议对象、IME / 剪贴板）→ 首个 roundtrip 拿 configure；
-//! 2. 建 `Renderer`（Vulkan WSI 需要 `wl_display*` / `wl_surface*`）；
-//! 3. 循环：drain 事件 → 同步窗口状态 → 钩子 → 按需提交 → 回投任务 → a11y → 阻塞等待。
+//! 2. 所有可失败的 setup：calloop 事件循环 / 唤醒句柄 / `WaylandSource` / a11y；
+//! 3. 最后建 `Renderer`（Vulkan WSI 需要 `wl_display*` / `wl_surface*`）并挂到窗口；
+//! 4. 循环：drain 事件 → 同步窗口状态 → 钩子 → 按需提交 → 回投任务 → a11y → 阻塞等待。
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use crate::{
         a11y::UnixA11y,
         dpi,
         surface::{self, WaylandState},
-        wake, window,
+        wake,
     },
     render::backend::Renderer,
     window::FrameOutcome,
@@ -55,16 +56,6 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let scale = state.scale();
     let size = state.size();
     let physical = dpi::physical_size(size, scale);
-    let (display, surface_ptr) = state.raw_pointers();
-    // viewport 的所有权交给渲染器：destination 必须与 buffer 同一次 present 生效（D1 / D2）。
-    let renderer = Renderer::new_for_surface(
-        display,
-        surface_ptr,
-        physical,
-        initial_background,
-        state.take_viewport(),
-    )?;
-
     let id = app
         .windows()
         .next()
@@ -72,15 +63,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .ok_or(EngineError::AppInit {
             detail: smol_str::SmolStr::new_static("Application::run without a window"),
         })?;
-    if let Some(window) = app.window_mut(id) {
-        window.set_renderer(renderer);
-        window.set_scale(scale);
-        window.set_size(size);
-        // `set_size` 先按 covering 重算 surface；这里覆盖成 Wayland buffer 的真实尺寸。
-        window.set_surface(physical);
-    }
-    window::apply_min_size(state.toplevel(), scale);
 
+    // 下面直到 `Renderer::new_for_surface` 的 setup 全都可以失败，必须排在 renderer 挂载之前：
+    // `WaylandState` 持有 `wl_surface` / `wl_display`，而 renderer 的 Vulkan WSI surface /
+    // `wp_viewport` 依赖它们。若 `?` 在挂载后早退，局部变量的逆序释放会让 `state` 先于
+    // `app`（Window → Renderer）释放（V-122 ⑨ / P2-3）。
     let mut event_loop: EventLoop<'static, WaylandState> =
         EventLoop::try_new().map_err(|error| EngineError::AppInit {
             detail: smol_str::format_smolstr!("calloop: {error}"),
@@ -103,6 +90,24 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         })?;
 
     let mut a11y = UnixA11y::new(dispatcher.clone(), id)?;
+
+    // viewport 的所有权交给渲染器：destination 必须与 buffer 同一次 present 生效（D1 / D2）。
+    let (display, surface_ptr) = state.raw_pointers();
+    let renderer = Renderer::new_for_surface(
+        display,
+        surface_ptr,
+        physical,
+        initial_background,
+        state.take_viewport(),
+    )?;
+    if let Some(window) = app.window_mut(id) {
+        window.set_renderer(renderer);
+        window.set_scale(scale);
+        window.set_size(size);
+        // `set_size` / `set_scale` 的 covering 只是平台真值写入前的估算；真实的 Wayland buffer
+        // 尺寸（`round(逻辑 × scale)`）必须在这里写入（F-186 / V-122）。
+        window.set_surface(physical);
+    }
 
     dispatcher.wake();
     let mut last_scale = scale;
@@ -144,13 +149,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 // 每轮写入真实的 Wayland buffer 尺寸（`round(逻辑 × scale)`）；同值 no-op。
                 window.set_surface(dpi::physical_size(size_now, scale_now));
             }
-            if scale_now != last_scale {
-                last_scale = scale_now;
-                window::apply_min_size(state.toplevel(), scale_now);
-            }
-            if size_now != last_size {
-                last_size = size_now;
-            }
+            // 本轮的值记为「已镜像」：下一轮据此只在变化时调用 setter（②）。
+            last_scale = scale_now;
+            last_size = size_now;
             a11y.focus_changed(state.is_focused());
             // 交互反馈：Linux 没有全局光标 API（由客户端自绘），请求直接消费掉。
             let _ = app.take_cursor_change();
@@ -243,8 +244,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 })?;
         }
     })();
-    // `WaylandState` 持有 `wl_surface` / `wl_display`：它必须**晚于** renderer 释放，
+    // 循环路径：`WaylandState` 持有 `wl_surface` / `wl_display`，它必须**晚于** renderer 释放，
     // 所以先显式 drop `app`（Window → Renderer），再返回。
+    //
+    // 对 `?` 早退路径不需要这个兜底：所有可失败的 setup 都排在 `window.set_renderer` 之前，
+    // 早退时 `app` 里还没有 renderer（之后没有任何 `?`），`state` 先释放不会遇到
+    // 「renderer 晚于 `wl_surface` 释放」的逆序（V-122 ⑨ / P2-3）。
+    // panic 展开仍可能让局部 `state` 先于参数 `app` 释放（既有；release 是 `panic=abort`），
+    // 本兜底不覆盖该路径。
     drop(app);
     result
 }

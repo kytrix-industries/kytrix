@@ -236,7 +236,7 @@ impl NativeWindow {
             self.logical_size = logical;
             if let Some(window) = app.window_mut(self.id) {
                 window.set_size(logical);
-                // `set_size` 先按 covering 重算；这里覆盖成 AppKit 的真实 backing。
+                // `set_size` 不再重算平台真值；这里写入 AppKit 的真实 backing。
                 window.set_surface(backing);
             }
             events.push(Event::Resized { size: logical });

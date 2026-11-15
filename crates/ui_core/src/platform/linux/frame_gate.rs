@@ -4,8 +4,9 @@
 //! 把在飞帧压到 ≤ 1（`design/async-render-pipeline.md` §7.5 第 3 条）。
 //!
 //! 两条既有缺陷会让门禁**永久关闭**（F-183）：
-//! - **Idle 帧**：`App::frame` 返回 `FrameOutcome::Idle`（a11y-only 变化 / damage 全被裁空）
-//!   时不 publish、不 commit，挂起的 callback 永远不会回来；
+//! - **Idle 帧**：`App::frame` 返回 `FrameOutcome::Idle`（a11y-only 变化 / damage 全被裁空 /
+//!   有像素但 `plan == Plan::Idle` 且目标尺寸未变）时不 publish、不 commit，挂起的 callback
+//!   永远不会回来；
 //! - **present `OUT_OF_DATE`**：WSI 可能没有 attach/commit，callback 同样不回来。
 //!
 //! 前者由 [`FrameGate::note_not_committed`] 立即重新开门（保留挂起 callback：下一次 commit

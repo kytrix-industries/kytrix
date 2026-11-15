@@ -95,7 +95,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             window.set_renderer(renderer);
             window.set_scale(scale);
             window.set_size(native.logical_size());
-            // `set_size` 先按 covering 重算 surface；这里覆盖成 AppKit 的真实 backing。
+            // `set_size` 不再重算平台真值；这里写入 AppKit 的真实 backing。
             window.set_surface(size);
         }
         native.show();
