@@ -40,38 +40,48 @@ pub(crate) fn next_focusable(
     from: Option<NodeId>,
     backwards: bool,
 ) -> Option<NodeId> {
-    let candidates: Vec<NodeId> = tree
-        .order()
-        .iter()
-        .copied()
-        .filter(|node| focusable(tree, *node))
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    let Some(from) = from else {
+    let order = tree.order();
+    // 焦点不在候选集里（禁用 / 已卸载 / 无焦点）：正向取第一个可聚焦、反向取最后一个。
+    let Some(from) = from.filter(|node| focusable(tree, *node)) else {
         return if backwards {
-            candidates.last().copied()
+            order
+                .iter()
+                .rev()
+                .copied()
+                .find(|node| focusable(tree, *node))
         } else {
-            candidates.first().copied()
+            order.iter().copied().find(|node| focusable(tree, *node))
         };
     };
-    let position = candidates.iter().position(|node| *node == from);
-    match position {
-        Some(index) if backwards => {
-            let previous = (index + candidates.len() - 1) % candidates.len();
-            Some(candidates[previous])
-        }
-        Some(index) => Some(candidates[(index + 1) % candidates.len()]),
-        // 焦点不在候选集里（被禁用/卸载）⇒ 从同一位置继续：正向取第一个、反向取最后一个。
-        None => {
-            if backwards {
-                candidates.last().copied()
-            } else {
-                candidates.first().copied()
-            }
+    let Some(start) = order.iter().position(|node| *node == from) else {
+        // 焦点节点不在遍历序里（游离节点）：与「无焦点」同处理。
+        return if backwards {
+            order
+                .iter()
+                .rev()
+                .copied()
+                .find(|node| focusable(tree, *node))
+        } else {
+            order.iter().copied().find(|node| focusable(tree, *node))
+        };
+    };
+    // 单趟环形扫描（末尾回绕）：零分配。旧的「先收集全部候选再取相邻」每次 Tab 都要
+    // 分配一个与节点数同阶的 `Vec` 并扫描两遍（P2-3）。
+    let len = order.len();
+    for step in 1..=len {
+        let index = if backwards {
+            (start + len - step) % len
+        } else {
+            (start + step) % len
+        };
+        let node = order[index];
+        if focusable(tree, node) {
+            return Some(node);
         }
     }
+    // 走完一整圈没有可聚焦节点。`from` 自身可聚焦时上面 `step == len` 就会返回它，
+    // 走到这里说明连它都不可聚焦（理论上被 `filter` 挡掉了），确实没有候选。
+    None
 }
 
 /// 从命中节点向上找最近的**可聚焦**祖先（点击时的焦点落点）。
