@@ -663,7 +663,6 @@ impl GpuRenderer {
         // 本帧换代 / 扩容换下的句柄：在录制尝试之后统一挂 retire（错误路径由 teardown 兜底）。
         let mut retired: Vec<GpuResourceHandle> = Vec::new();
         let upload = self.upload.write(
-            &shared,
             slot.index,
             payload.instances(),
             bytemuck::cast_slice(payload.clips()),
@@ -1387,13 +1386,21 @@ struct UploadArena {
 struct UploadSlot {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// 创建时 map_memory 一次的**持久映射**写入指针（扩容 / 退役时解除）。
+    ///
+    /// 旧实现每帧 map/unmap：驱动每次都要走一遍页表操作，是纯开销 —— Windows 后端一直是
+    /// 持久映射。HOST_COHERENT 内存保证写入无需 flush（P2-7）。
+    ptr: *mut u8,
     buffer_handle: GpuResourceHandle,
     memory_handle: GpuResourceHandle,
     instance_capacity: u32,
     clip_capacity: u32,
     clip_offset: u64,
-    size: u64,
 }
+
+// SAFETY: `ptr` 是 `vkMapMemory` 的持久映射，只在持有它的 `GpuRenderer` 所在的
+// `kytrix-vulkan` GPU 线程上写入（与 `StagingRing` 同一约定）；结构本身不跨线程共享。
+unsafe impl Send for UploadSlot {}
 
 impl UploadArena {
     fn new(shared: &Arc<SharedGpu>) -> Result<Self, EngineError> {
@@ -1416,7 +1423,6 @@ impl UploadArena {
     /// 返回 `(instance_bytes, clip_offset, clip_bytes)`。
     fn write(
         &mut self,
-        shared: &SharedGpu,
         slot: usize,
         instances: &[u8],
         clips: &[u8],
@@ -1431,23 +1437,18 @@ impl UploadArena {
             let clips_capacity = clip_count.next_power_of_two().max(8);
             let replacement = UploadSlot::new(&self.shared, instances_capacity, clips_capacity)?;
             let old = std::mem::replace(&mut self.slots[slot], replacement);
+            // SAFETY: 映射由 `new` 建立；解除后 GPU 仍可访问该内存（unmap 只影响主机映射）。
+            unsafe { self.shared.raw().unmap_memory(old.memory) };
             // 旧缓冲/内存在本帧完成之后由 retire 队列销毁（先 buffer 后 memory）。
             retired.push(old.buffer_handle);
             retired.push(old.memory_handle);
         }
         let slot_ref = &self.slots[slot];
         // SAFETY: 缓冲容量已按 `instance_count` / `clip_count` 扩容；映射范围在分配内。
+        // SAFETY: 持久映射在 `UploadSlot::new` 建立、退役时解除；容量已按
+        // `instance_count` / `clip_count` 扩容，写入范围在分配内。
         unsafe {
-            let pointer = shared
-                .raw()
-                .map_memory(
-                    slot_ref.memory,
-                    0,
-                    slot_ref.size,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .map_err(|error| init_error("map_memory(upload)", format!("{error:?}")))?;
-            let base = pointer.cast::<u8>();
+            let base = slot_ref.ptr;
             if !instances.is_empty() {
                 std::ptr::copy_nonoverlapping(instances.as_ptr(), base, instances.len());
             }
@@ -1458,7 +1459,6 @@ impl UploadArena {
                     clips.len(),
                 );
             }
-            shared.raw().unmap_memory(slot_ref.memory);
         }
         Ok((
             instances.len() as u64,
@@ -1470,6 +1470,8 @@ impl UploadArena {
     /// teardown：把本窗口上传缓冲的句柄交回共享设备。
     fn release(&self, shared: &SharedGpu) {
         for slot in &self.slots {
+            // SAFETY: 映射由 `new` 建立；解除后 GPU 仍可访问（unmap 只影响主机映射）。
+            unsafe { shared.raw().unmap_memory(slot.memory) };
             let _ = shared.release(slot.buffer_handle);
             let _ = shared.release(slot.memory_handle);
         }
@@ -1519,17 +1521,32 @@ impl UploadSlot {
         // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定/写入的范围在其分配内。
         unsafe { shared.raw().bind_buffer_memory(buffer, memory, 0) }
             .map_err(|error| init_error("bind_buffer_memory(upload)", format!("{error:?}")))?;
+        // SAFETY: 映射范围就是整块分配；失败时两个句柄都还没交给任何人。
+        let ptr = unsafe {
+            shared
+                .raw()
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|error| {
+            // SAFETY: 句柄由本函数独占、尚未交给任何人。
+            unsafe {
+                shared.raw().destroy_buffer(buffer, None);
+                shared.raw().free_memory(memory, None);
+            }
+            init_error("map_memory(upload)", format!("{error:?}"))
+        })?
+        .cast::<u8>();
         let buffer_handle = shared.allocate(GpuObject::Buffer(buffer));
         let memory_handle = shared.allocate(GpuObject::Memory(memory));
         Ok(Self {
             buffer,
             memory,
+            ptr,
             buffer_handle,
             memory_handle,
             instance_capacity,
             clip_capacity,
             clip_offset,
-            size,
         })
     }
 }
