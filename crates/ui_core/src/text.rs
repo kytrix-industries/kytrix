@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn text_payload_sizes_are_budgeted() {
-        // P1-2.3 新增 font_features（等宽数字 tnum），同时把 amily 与它一起收进
+        // P1-2.3 新增 font_features（等宽数字 tnum），同时把 family 与它一起收进
         // `TextStyleExtras`（Blink 的 RareInheritedData 模式）：TextStyle 反而从 72 降到 56，
         // `TextContent` 从 112 到 96，`Node` 从 1144 到 1128 —— 既拿到了新能力又腾出了余量。
         assert_eq!(size_of::<TextStyle>(), 56);

@@ -275,16 +275,21 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。
     let mut closed = false;
     for native in state.windows.iter_mut() {
-        if native.take_close_request() {
-            // 观察者仍应看到 `CloseRequested`（delegate 路径下 `sync_state` 不再产生它）。
+        let Some(source) = native.take_close_request() else {
+            continue;
+        };
+        // 只有**手势**路径需要在这里补发事件（`sync_state` 不产生它）；观察路径
+        // （窗口已不可见）已经在 `sync_state` 里 dispatch 过，再发就是双投递（复审 F3）。
+        if source == crate::platform::macos::window::CloseRequestSource::Gesture {
             app.dispatch(native.id(), crate::event::Event::CloseRequested);
-            // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
-            if !app.request_close(native.id()) {
-                continue;
-            }
-            native.close();
-            closed = true;
         }
+        // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
+        // 观察路径下窗口已经不可见、拦不住（AppKit 已关），这里只决定是否从 App 侧移除。
+        if !app.request_close(native.id()) {
+            continue;
+        }
+        native.close();
+        closed = true;
     }
     if closed {
         state.windows.retain(|native| !native.is_destroyed());

@@ -137,7 +137,7 @@ pub struct App {
     handlers: ahash::HashMap<Action, ActionHandler>,
     /// 每窗口的「关闭前」处理器（App::on_close）。
     ///
-    /// 用户点窗口 X / Cmd-W 时平台**先问它**：返回 alse 就拦下这次关闭（用于保存
+    /// 用户点窗口 X / Cmd-W 时平台**先问它**：返回 false 就拦下这次关闭（用于保存
     /// 未提交状态、弹确认框）。没有处理器 ⇒ 直接关（旧行为）。
     close_handlers: ahash::HashMap<WindowId, CloseHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
@@ -3312,6 +3312,11 @@ impl App {
         let mut report = TextLayoutReport::default();
 
         for attempt in 0..2 {
+            // 统计按**本轮**计：图集换代会让整 pass 重跑，累加器必须清空，否则报告里的
+            // `rasterized` 等约等于实际值的 2 倍，而 `laid/reused` 只反映最后一轮（复审 F7）。
+            report.rasterized = 0;
+            report.tiles_reused = 0;
+            report.atlas_rebuilds = 0;
             let generation = atlas.generation();
             let mut laid = 0usize;
             let mut reused = 0usize;

@@ -548,6 +548,11 @@ impl WaylandState {
         let Some(index) = self.window_index(id) else {
             return false;
         };
+        // 关窗时必须清空客户端合成的按键重复：之后不再有 `key` 事件（含 release），
+        // `active` 又会重映射到别的窗口 ⇒ 按住键的重复会写进**另一个窗口**（复审 F5）。
+        // IME 焦点同理：窗口没了就不能继续把组合串投给它。
+        self.held_keys.clear();
+        self.set_ime_focus(index, false);
         self.windows.remove(index);
         if self.windows.is_empty() {
             self.active = 0;
@@ -979,7 +984,7 @@ impl WaylandState {
         xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let keycode = xkb::Keycode::new(key);
         let symbol = xkb_state.key_get_one_sym(keycode);
-        // seat 事件没有 surface 归属：派发给**焦点窗口**（ctive）。
+        // seat 事件没有 surface 归属：派发给**焦点窗口**（active）。
         let window = self.windows[self.active].id;
         self.events.push((
             window,
@@ -1493,15 +1498,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state.set_ime_focus(index, true);
             }
             wl_keyboard::Event::Leave { surface, .. } => {
-                let Some(index) = state.window_index_for_surface(&surface) else {
-                    return;
-                };
-                state.windows[index].focused = false;
                 // 失焦后不再有 `wl_keyboard.key`（含 release）到达：必须**主动清空**按住键，
                 // 否则客户端合成的重复会永久继续（winit/GTK 同此约定）。后果是静默的：
                 // 按住 Backspace 切走 → 后台继续删字；关窗后 `active` 重映射 → 重复键写进
                 // **另一个窗口**。
+                //
+                // 先清再解析窗口：surface 可能已经被移除（关窗流程里 `leave` 晚到），
+                // 旧实现直接 `return` 把按键状态永久留在表里（复审 F5）。
                 state.held_keys.clear();
+                let Some(index) = state.window_index_for_surface(&surface) else {
+                    return;
+                };
+                state.windows[index].focused = false;
                 let window = state.windows[index].id;
                 state
                     .events
@@ -1786,6 +1794,11 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
             state.keyboard = Some(state.seat.get_keyboard(&queue, ()));
         }
     } else {
+        // 键盘能力被撤销：之后再也不会有 key release，必须清空按住键，
+        // 否则客户端合成的重复会永远跑下去（复审 F5）。
+        if state.keyboard.is_some() {
+            state.held_keys.clear();
+        }
         state.keyboard = None;
     }
     if caps.contains(wl_seat::Capability::Pointer) {

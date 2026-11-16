@@ -79,6 +79,18 @@ impl CloseDelegate {
 /// 最小客户区（逻辑像素；与 Win32 / Wayland 同源）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
+/// 关窗请求的来源。
+///
+/// `Observed` 是「窗口已不可见」的事后观察：`sync_state` 已经 dispatch 过事件，
+/// 泵不能再补发一次（复审 F3 的双投递缺陷）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseRequestSource {
+    /// AppKit 的关窗手势（红点 / Cmd-W / performClose:）。
+    Gesture,
+    /// 「窗口已不可见」的事后观察（销毁 / 应用退出）。
+    Observed,
+}
+
 /// 一个原生窗口（`Application::run` 持有；`Drop` 时关闭）。
 pub(crate) struct NativeWindow {
     mtm: MainThreadMarker,
@@ -95,6 +107,7 @@ pub(crate) struct NativeWindow {
     seen_frame_rate: f32,
     seen_size: (f64, f64),
     was_key: bool,
+    /// 「窗口已不可见」的事后观察是否已经报过一次（同步 dispatch 一次给观察者）。
     close_requested: bool,
     destroyed: bool,
     /// 最近一次下发的 IME caret 区域（逻辑坐标）。
@@ -375,14 +388,17 @@ impl NativeWindow {
     }
 
     /// 取走「关闭已请求」标志（泵唯一读点）。
-    pub(crate) fn take_close_request(&mut self) -> bool {
+    pub(crate) fn take_close_request(&mut self) -> Option<CloseRequestSource> {
         // 两个来源：AppKit 的关窗手势（delegate 置位）与「窗口已不可见」的事后观察
-        // （销毁 / 应用退出等非手势路径）。后者用 close_requested 做一次性去重。
-        let gesture = self.close_delegate.take_request();
-        let observed = std::mem::take(&mut self.close_requested);
-        gesture || observed
+        // （销毁 / 应用退出等非手势路径）。调用方据此决定要不要补发 `CloseRequested`
+        // —— 观察路径已经在 `sync_state` 里发过了，再发就是双投递（复审 F3）。
+        if self.close_delegate.take_request() {
+            return Some(CloseRequestSource::Gesture);
+        }
+        std::mem::take(&mut self.close_requested).then_some(CloseRequestSource::Observed)
     }
 
+    /// 窗口是否已被 `close()` 销毁（泵据此从列表移除）。
     pub(crate) fn is_destroyed(&self) -> bool {
         self.destroyed
     }

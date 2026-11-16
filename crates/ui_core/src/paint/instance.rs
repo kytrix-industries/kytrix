@@ -247,8 +247,8 @@ fn bounds_of_aabb(aabb: [f32; 4]) -> PhysicalBounds {
 /// 实例包围盒的整数范围（外扩 1 px 吸收 AA / 抗锯齿边缘）。
 fn instance_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
     let [x, y, w, h] = primitive.bounds;
-    // 顶点外扩量必须与 shader 用的一致：params0.w 是 a_padding（Quad 1.0、
-    // Shadow lur + 1、图集 0）。只按 1 px 外扩会让**阴影的模糊环**落在包围盒外，
+    // 顶点外扩量必须与 shader 用的一致：params0.w 是 aa_padding（Quad 1.0、
+    // Shadow blur + 1、图集 0）。只按 1 px 外扩会让**阴影的模糊环**落在包围盒外，
     // 于是 damage 裁剪可能把阴影整个丢掉（可见缺陷）。
     let pad = primitive.params0[3];
     extent_of(x, y, w, h, pad)
@@ -429,7 +429,7 @@ impl InstanceEncoder {
         self.stack.clear();
         self.run_start = 0;
         self.colors.clear();
-        // 先解构出各字段的独立可变借用：FrameEncoder 同时需要 uffer 与 colors，
+        // 先解构出各字段的独立可变借用：FrameEncoder 同时需要 buffer 与 colors，
         // 直接写 &mut self.buffer / &mut self.colors 会与后面的 self.flush_run() 冲突。
         let Self {
             buffer,

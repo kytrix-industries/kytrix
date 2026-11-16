@@ -471,7 +471,7 @@ pub struct NodeTree {
     ///
     /// 命中测试的唯一安全子树剪枝依据（P2-2）。单看节点自己的布局盒不行：出流 / 溢出
     /// 子节点可以落在父盒之外（B2），按父盒剪枝会漏命中。这里是并集，只会偏大不会偏小。
-    /// 每次 bsolutize 末尾自底向上重算（O(N)，与布局同阶）。
+    /// 每次 absolutize 末尾自底向上重算（O(N)，与布局同阶）。
     subtree_bounds: Vec<Rect>,
     /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
     ///
@@ -849,7 +849,7 @@ impl NodeTree {
         if self.subtree_bounds.len() <= index {
             self.subtree_bounds.resize_with(index + 1, Rect::default);
         }
-        // 新节点还没有布局盒：子树包围盒先清空，bsolutize 会重算。
+        // 新节点还没有布局盒：子树包围盒先清空，absolutize 会重算。
         self.subtree_bounds[index] = Rect::default();
         // a11y 载荷同生命周期：槽位复用不得继承上一代节点的声明/补丁（P11 F-114）。
         if self.a11y_slots.len() <= index {
