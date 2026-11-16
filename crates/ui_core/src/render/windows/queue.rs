@@ -1,11 +1,18 @@
-//! 命令队列 / 每 in-flight 槽的 allocator + list / fence 记账 / retire 排空
+//! 每窗口提交流：共享 `ID3D12CommandQueue` 上的 allocator / list / fence 记账 / retire 排空
 //! （`design/phase-08-d3d12.md` §5.2、`design/async-render-pipeline.md` §6.3 / §6.5）。
+//!
+//! 进程级只有**一条** direct queue（`device::SharedGpu`）。每个窗口保留自己的 in-flight 记账：
+//! 三个 allocator + 三个命令列表 + 自己的 fence（提交后 `Signal`）。D3D12 的 command queue 是
+//! free-threaded 的：不同线程 `ExecuteCommandLists` 到同一队列是合法的，且队列保证先提交的
+//! 工作先完成 —— `ID3D12CommandQueue::ExecuteCommandLists` 文档明确「同一线程或不同线程连续
+//! 调用，前一批必然在后一批之前完成」。命令列表按提交顺序整段执行，因此图集上传的屏障序列
+//! 不会和别的窗口交错。
 //!
 //! **提交是异步的**（I2）：`submit` 关闭列表、`ExecuteCommandLists`、`Signal` 之后立刻返回，
 //! 完成状态只通过 fence 观察。等待点在调用方（GPU 线程）：复用槽位前 `wait_slot_fence`，
 //! 离屏 resize / 读回 / 退出前 `wait_idle`。
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 use windows::{
     Win32::{
@@ -21,21 +28,18 @@ use crate::{
     render::{
         frame::{FrameSlot, InFlightRing, MAX_FRAMES_IN_FLIGHT},
         retire::{GpuResourceHandle, RetireQueue},
-        windows::device::{Device, init_error, init_error_from},
+        windows::device::{SharedGpu, init_error, init_error_from},
     },
     window::FrameIndex,
 };
 
-/// 直接队列 + 每槽 allocator/list + fence + 提交记账。
 /// fence 等待的硬上限（P1-2.13）。INFINITE 会在设备被移除时永久挂住 UI 线程；
 /// 2 s 是 GPU watchdog 的常规量级，健康的帧远达不到。
-const FENCE_TIMEOUT_MS: u32 = 2_000;
+pub(crate) const FENCE_TIMEOUT_MS: u32 = 2_000;
 
-pub(crate) struct Queue {
-    raw: ID3D12CommandQueue,
-    /// 设备句柄（COM 引用计数克隆，几乎零成本）：fence 等待超时时用它取
-    /// `GetDeviceRemovedReason`，把「GPU 不响应」分类成 `DeviceLost` 而不是永久阻塞。
-    device: ID3D12Device,
+/// 一个窗口在共享队列上的提交流：allocator/list + 自己的 fence + 提交记账 + retire。
+pub(crate) struct CommandStream {
+    shared: Arc<SharedGpu>,
     allocators: Vec<ID3D12CommandAllocator>,
     lists: Vec<ID3D12GraphicsCommandList>,
     fence: ID3D12Fence,
@@ -44,9 +48,11 @@ pub(crate) struct Queue {
     /// 已提交但**尚未确认完成**的帧（FIFO：帧序号 + 它的 signal 值）。
     submitted: VecDeque<(FrameIndex, u64)>,
     retire: RetireQueue,
+    /// retire 队列里出现过的最大帧序号（teardown 的兜底释放用）。
+    last_retire_index: Option<FrameIndex>,
 }
 
-impl Drop for Queue {
+impl Drop for CommandStream {
     fn drop(&mut self) {
         // SAFETY: `event` 由本结构独占；`Drop` 只执行一次，关闭后不再使用。
         unsafe {
@@ -55,54 +61,41 @@ impl Drop for Queue {
     }
 }
 
-impl Queue {
-    pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
-        let raw: ID3D12CommandQueue = unsafe {
-            device.raw().CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                Priority: 0,
-                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
-                NodeMask: 0,
-            })
-        }
-        .map_err(|error| init_error_from("CreateCommandQueue", error))?;
-
-        let raw_device = device.raw().clone();
+impl CommandStream {
+    pub(crate) fn new(shared: &Arc<SharedGpu>) -> Result<Self, EngineError> {
         let mut allocators = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut lists = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
+            // SAFETY: 设备句柄由进程级 `SharedGpu` 持有，调用期间有效；错误按 HRESULT 返回。
             let allocator: ID3D12CommandAllocator = unsafe {
-                device
+                shared
                     .raw()
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
             }
             .map_err(|error| init_error_from("CreateCommandAllocator", error))?;
-            // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
+            // SAFETY: 同上；allocator 在列表 close 之后独占。
             let list: ID3D12GraphicsCommandList = unsafe {
-                device
+                shared
                     .raw()
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
             }
             .map_err(|error| init_error_from("CreateCommandList", error))?;
-            // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+            // SAFETY: 列表由本结构独占；创建后立即关闭，等 `reset_slot` 才重新打开。
             unsafe { list.Close() }.map_err(|error| init_error_from("Close", error))?;
             allocators.push(allocator);
             lists.push(list);
         }
 
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
-        let fence: ID3D12Fence = unsafe { device.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }
+        // SAFETY: 设备句柄由进程级 `SharedGpu` 持有，调用期间有效；错误按 HRESULT 返回。
+        let fence: ID3D12Fence = unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }
             .map_err(|error| init_error_from("CreateFence", error))?;
         // `CreateEventW` 需要 `Win32_Security` feature（DEVIATIONS F-79）。
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表在提交前独占。
+        // SAFETY: 无名称的 auto-reset 事件；句柄由本结构独占并在 `Drop` 关闭。
         let event = unsafe { CreateEventW(None, false, false, None) }
             .map_err(|error| init_error_from("CreateEventW", error))?;
 
         Ok(Self {
-            raw,
-            device: raw_device,
+            shared: Arc::clone(shared),
             allocators,
             lists,
             fence,
@@ -110,6 +103,7 @@ impl Queue {
             ring: InFlightRing::new(),
             submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
             retire: RetireQueue::new(),
+            last_retire_index: None,
         })
     }
 
@@ -133,7 +127,7 @@ impl Queue {
         unsafe { allocator.Reset() }
             .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
         let list = &self.lists[slot.index];
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；列表上一次已关闭。
+        // SAFETY: 句柄由本结构持有；列表上一次已关闭。
         unsafe { list.Reset(allocator, None) }
             .map_err(|error| init_error_from("CommandList::Reset", error))?;
         Ok(())
@@ -147,15 +141,19 @@ impl Queue {
     /// 关闭 → 执行 → `Signal`，**立即返回**（I2：完成通知只走 fence）。
     pub(crate) fn submit(&mut self, index: FrameIndex, slot: FrameSlot) -> Result<(), EngineError> {
         let list = &self.lists[slot.index];
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+        // SAFETY: 列表由本结构独占，提交前已录制完成。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
         let command_list: ID3D12CommandList = list
             .cast()
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
-        unsafe { self.raw.ExecuteCommandLists(&[Some(command_list)]) };
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
-        unsafe { self.raw.Signal(&self.fence, slot.signal_value) }
+        // SAFETY: 命令列表已关闭；队列是进程级共享队列（free-threaded，允许并发提交）。
+        unsafe {
+            self.shared
+                .queue()
+                .ExecuteCommandLists(&[Some(command_list)])
+        };
+        // SAFETY: fence 由本结构持有；Signal 只入队。
+        unsafe { self.shared.queue().Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.ring.advance(slot);
         self.submitted.push_back((index, slot.signal_value));
@@ -172,7 +170,7 @@ impl Queue {
         value: u64,
         event: HANDLE,
     ) -> Result<(), EngineError> {
-        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；`event` 由调用方保证在 `value` 到达前存活
+        // SAFETY: fence 句柄由本结构持有到 `Drop`；`event` 由调用方保证在 `value` 到达前存活
         // （Windows 层里它是 `Shared` 的 auto-reset 事件，晚于 GPU 线程释放）。
         unsafe { self.fence.SetEventOnCompletion(value, event) }
             .map_err(|error| init_error_from("SetEventOnCompletion(completion)", error))
@@ -180,21 +178,24 @@ impl Queue {
 
     /// fence 的已完成值（非阻塞；`release_completed` 与 GPU 循环的完成判据）。
     pub(crate) fn completed_value(&self) -> u64 {
-        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
+        // SAFETY: fence 句柄由本结构持有；查询无副作用。
         unsafe { self.fence.GetCompletedValue() }
     }
 
-    /// 等到最后一次提交完成（离屏 resize / 读回 / 退出）。
+    /// 等到本窗口最后一次提交完成（离屏 resize / 读回 / 退出）。
+    ///
+    /// 只等**本提交流**的 fence：别的窗口在共享队列上还有在飞工作时，本窗口的资源仍可复用
+    /// （allocator / list / persist 都是每窗口对象）。共享图集的页重建走
+    /// `SharedGpu::rebuild_atlas_pages` 的全局 idle 等待，不是这里。
     pub(crate) fn wait_idle(&mut self) -> Result<(), EngineError> {
         self.wait_for(self.ring.last_signaled())
     }
 
-    /// 复位**所有** in-flight 槽的 allocator + list 并立即关闭列表（只用于退出路径）。
+    /// 复位**所有** in-flight 槽的 allocator + list 并立即关闭列表（只用于退出 / 重建路径）。
     ///
     /// 关闭的 command list 仍记录着它引用过的资源；不 Reset 的话 swapchain 的 back buffer 会一直
-    /// 有引用（三个 buffer 全部泄漏，swapchain 也带着引用被销毁，DEVIATIONS F-86）。窗口目标的
-    /// 交换链是固定的、不再重建，所以这条清理由 [`super::compositor::GpuRenderer`] 的 `Drop`
-    /// 独占。调用方必须先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
+    /// 有引用（三个 buffer 全部泄漏，swapchain 也带着引用被销毁，DEVIATIONS F-86）。调用方必须
+    /// 先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
     pub(crate) fn reset_in_flight_lists(&mut self) -> Result<(), EngineError> {
         for index in 0..self.allocators.len() {
             let allocator = &self.allocators[index];
@@ -221,21 +222,25 @@ impl Queue {
     ) -> Result<(), EngineError> {
         self.wait_idle()?;
         let allocator = &self.allocators[0];
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 槽 0 空闲（上一提交已等到），allocator 不再被 GPU 使用。
         unsafe { allocator.Reset() }
             .map_err(|error| init_error_from("CommandAllocator::Reset", error))?;
         let list = &self.lists[0];
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+        // SAFETY: 列表已关闭；重开后由录制闭包独占。
         unsafe { list.Reset(allocator, None) }
             .map_err(|error| init_error_from("CommandList::Reset", error))?;
         record(list)?;
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+        // SAFETY: 录制完成，列表由本函数独占。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
         let command_list: ID3D12CommandList = list
             .cast()
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
-        unsafe { self.raw.ExecuteCommandLists(&[Some(command_list)]) };
+        // SAFETY: 队列 / fence 句柄由进程级 `SharedGpu` 持有；命令列表已关闭。
+        unsafe {
+            self.shared
+                .queue()
+                .ExecuteCommandLists(&[Some(command_list)])
+        };
         // 帧外提交也占一个单调递增的 fence 值，并把**实际使用的槽 0** 的记账推进到该值：
         // 调用前的 `wait_idle` 已等到最后提交值（≥ 槽 0 的上一帧），因此 `wait_value` 就是那条
         // 已经满足的前置条件；这不是只推进 `next_value` 的旁路（`InFlightRing::reserve` 已删除，
@@ -245,8 +250,8 @@ impl Queue {
             wait_value: self.ring.last_signaled(),
             signal_value: self.ring.last_signaled() + 1,
         };
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
-        unsafe { self.raw.Signal(&self.fence, slot.signal_value) }
+        // SAFETY: fence 由本结构持有；Signal 只入队。
+        unsafe { self.shared.queue().Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.ring.advance(slot);
         self.wait_for(slot.signal_value)
@@ -254,14 +259,28 @@ impl Queue {
 
     /// 延迟销毁：本帧用过的资源至少要活到 `index` 的 fence 完成。
     pub(crate) fn retire(&mut self, index: FrameIndex, handle: GpuResourceHandle) {
+        self.last_retire_index = Some(self.last_retire_index.map_or(index, |last| last.max(index)));
         self.retire.retire(index, handle);
     }
 
+    /// teardown：GPU 已空闲（调用方先 `wait_idle`），把 retire 队列里**所有**残留句柄交回
+    /// `SharedGpu` —— 包括录制失败、从未提交的帧（正常路径不会观察到它们的完成）。
+    pub(crate) fn drain_retire(&mut self) {
+        let Some(last) = self.last_retire_index else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        self.retire.on_completed(last, &mut |handle| {
+            let _ = shared.release(handle);
+        });
+        self.submitted.clear();
+    }
+
     /// **非阻塞**推进 retire：fence 已到达的帧（含被跳过的序号，§4.3）及更早的句柄交回
-    /// `device` 真正释放。返回释放数。
+    /// `SharedGpu` 真正释放。返回释放数。
     ///
     /// 只读 `GetCompletedValue`，不等 GPU（I2 / I4）。
-    pub(crate) fn release_completed(&mut self, device: &mut Device) -> usize {
+    pub(crate) fn release_completed(&mut self) -> usize {
         let completed = self.completed_value();
         let mut highest = None;
         while let Some((_, value)) = self.submitted.front() {
@@ -272,9 +291,12 @@ impl Queue {
             highest = Some(index);
         }
         match highest {
-            Some(index) => self.retire.on_completed(index, &mut |handle| {
-                device.release(handle);
-            }),
+            Some(index) => {
+                let shared = Arc::clone(&self.shared);
+                self.retire.on_completed(index, &mut |handle| {
+                    let _ = shared.release(handle);
+                })
+            }
             None => 0,
         }
     }
@@ -286,21 +308,17 @@ impl Queue {
     }
 
     pub(crate) fn timestamp_frequency(&self) -> Result<u64, EngineError> {
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
-        unsafe { self.raw.GetTimestampFrequency() }
+        // SAFETY: 队列句柄由进程级 `SharedGpu` 持有，调用期间有效；查询无副作用。
+        unsafe { self.shared.queue().GetTimestampFrequency() }
             .map_err(|error| init_error_from("GetTimestampFrequency", error))
     }
 
-    pub(crate) fn raw(&self) -> &ID3D12CommandQueue {
-        &self.raw
-    }
-
     fn wait_for(&self, value: u64) -> Result<(), EngineError> {
-        // SAFETY: fence 句柄由 `Queue` 持有到 `Drop`；查询无副作用。
+        // SAFETY: fence 句柄由本结构持有；查询无副作用。
         if value == 0 || unsafe { self.fence.GetCompletedValue() } >= value {
             return Ok(());
         }
-        // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
+        // SAFETY: fence / event 句柄由本结构持有，调用期间有效。
         unsafe { self.fence.SetEventOnCompletion(value, self.event) }
             .map_err(|error| init_error_from("SetEventOnCompletion", error))?;
         // **有界等待**（P1-2.13）：旧实现传 `INFINITE`。设备被移除 / 驱动挂死时
@@ -318,8 +336,10 @@ impl Queue {
             ));
         }
         // 超时：先确认设备是否真的被移除，给出可诊断的原因。**不能**在这里无限重试。
-        // SAFETY: 设备句柄由本结构持有到 `Drop`；查询无副作用。
-        let removed = unsafe { self.device.GetDeviceRemovedReason() };
+        // 真正的移除类错误由共享设备升级成粘性 `DeviceLost`（并落 DRED 日志）；其它情况保留
+        // 超时分类。
+        // SAFETY: 设备句柄由 `SharedGpu` 持有，调用期间有效；查询无副作用。
+        let removed = unsafe { self.shared.raw().GetDeviceRemovedReason() };
         let reason = match removed {
             Ok(()) => smol_str::format_smolstr!(
                 "GPU fence wait timed out after {FENCE_TIMEOUT_MS} ms (device still present; GPU hung or submission lost)"
@@ -330,11 +350,12 @@ impl Queue {
                 error.message()
             ),
         };
+        if let Some(error) = self.shared.note_failure() {
+            return Err(error);
+        }
         Err(EngineError::DeviceLost {
             reason,
-            // 这里不写 DRED：本结构拿不到 `Device` 的调试状态；调用方会把粘性 `DeviceLost`
-            // 作为一个整体上报，诊断文件由 `Device::note_failure` 在其它失败路径产出。
-            log_path: std::path::PathBuf::new(),
+            log_path: PathBuf::new(),
         })
     }
 }
@@ -359,8 +380,8 @@ pub(crate) fn enable_debug_layer_once() {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::Queue;
-    use crate::{render::windows::device::Device, window::FrameIndex};
+    use super::CommandStream;
+    use crate::{render::windows::device::SharedGpu, window::FrameIndex};
 
     fn index(value: u32) -> FrameIndex {
         FrameIndex::from_raw(value)
@@ -370,22 +391,22 @@ mod tests {
     fn submits_and_advances_the_fence_for_many_frames() {
         let _guard = crate::render::windows::device::gpu_test_lock();
         super::enable_debug_layer_once();
-        let device = Device::new_warp().expect("WARP device");
-        let mut queue = Queue::new(&device).expect("queue");
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        let mut stream = CommandStream::new(&shared).expect("command stream");
         for value in 1..=7u32 {
-            let slot = queue.acquire_slot();
+            let slot = stream.acquire_slot();
             assert_eq!(
                 slot.index,
                 (value as usize - 1) % 3,
                 "槽位按提交次数轮转，不从 FrameIndex 取模"
             );
-            queue.wait_slot_fence(slot.wait_value).expect("slot fence");
-            queue.reset_slot(slot).expect("reset slot");
-            queue.submit(index(value), slot).expect("submit");
+            stream.wait_slot_fence(slot.wait_value).expect("slot fence");
+            stream.reset_slot(slot).expect("reset slot");
+            stream.submit(index(value), slot).expect("submit");
             // 提交本身不等 GPU（I2）：完成状态由调用方按 fence 观察。
-            queue.wait_slot_fence(slot.signal_value).expect("signaled");
+            stream.wait_slot_fence(slot.signal_value).expect("signaled");
         }
-        queue.wait_idle().expect("idle");
-        assert_eq!(queue.pending_retire(), 0);
+        stream.wait_idle().expect("idle");
+        assert_eq!(stream.pending_retire(), 0);
     }
 }

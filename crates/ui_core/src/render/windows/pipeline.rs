@@ -1,9 +1,24 @@
-//! 根签名 / quad PSO / geometry PSO / SRV 堆 / 静态几何表
+//! 根签名 / quad PSO / geometry PSO / 描述符堆 / 静态几何表
 //! （`design/phase-08-d3d12.md` §5.4；契约见 `render/shaders/contract.md`）。
 //!
-//! 逐字照 `contract.md` 与 P07 §2.9：拓扑 `TriangleStrip`（4 顶点、无顶点缓冲、`cull = NONE`）、
+//! 进程级共享的图元只有 [`Pipeline`]（根签名 + 4 个 PSO），由 `device::SharedGpu` 创建一次。
+//! 描述符全部在**一张** shader-visible 的 CBV/SRV/UAV 堆 [`SrvHeap`] 里（D3D12 规定每个
+//! command list 每种堆最多只能绑一张，见 `SetDescriptorHeaps` 文档），布局分成两段：
+//!
+//! - 固定段 `[0, 2)`：`[glyph, image]` 图集 SRV。两张图集纹理是进程级共享资源，页重建时只重写
+//!   这两个描述符（在 `SharedGpu` 的图集写锁 + 共享队列 idle 之后）。
+//! - 窗口段：`[instances, clips]` per in-flight 槽，每窗口 `SLOT_COUNT × SLOT_SRVS` 个描述符，
+//!   由 [`DescriptorArena`] 动态分配（[`crate::render::windows::device::DescriptorLease`] 持有，
+//!   `Renderer` 销毁时归还）。实例 / 裁剪上传缓冲是每窗口对象（`UploadArena`），所以 SRV 也
+//!   必须每窗口一份；窗口只写自己的描述符区间，互不加锁。
+//!
+//! 根签名因此有两张描述符表（同一张堆的两个区间）：`t0..t1`（窗口槽段）与 `t2..t3`（图集固定段）。
+//! shader 的寄存器绑定不变（`common.hlsl`：`instances` t0 / `clips` t1 / `glyph_atlas` t2 /
+//! `image_atlas` t3）。
+//!
+//! 拓扑 / 混合 / RTV 格式照 P07 §2.9：`TriangleStrip`（4 顶点、无顶点缓冲、`cull = NONE`）、
 //! 混合 `ONE / INV_SRC_ALPHA`（RGBA 写掩码 0x0F）、`RTVFormats[0] = B8G8R8A8_UNORM_SRGB`
-//! （**视图**格式，DEVIATIONS F-80）、根签名 28 个 root constant DWORD + 1 张 4-SRV 表 + 静态采样器。
+//! （**视图**格式，DEVIATIONS F-80）、根签名 28 个 root constant DWORD + 静态采样器。
 
 use std::{ffi::CStr, mem::ManuallyDrop, path::PathBuf};
 
@@ -29,18 +44,21 @@ use crate::{
         geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
     },
     render::{
-        frame::MAX_FRAMES_IN_FLIGHT,
-        retire::GpuResourceHandle,
-        windows::device::{Device, init_error_from},
+        frame::MAX_FRAMES_IN_FLIGHT, retire::GpuResourceHandle, windows::device::init_error_from,
     },
 };
 
-/// 每个 in-flight 槽的 SRV 数：`[instances, clips, glyph, image]`。
-pub(crate) const SLOT_SRVS: usize = 4;
-const SLOT_COUNT: usize = MAX_FRAMES_IN_FLIGHT;
-const SLOT_SPARE: usize = 2;
-/// 堆容量：每槽 4 个在用 SRV + 2 个备用（S-75 的静态分区）。
-const HEAP_CAPACITY: u32 = ((SLOT_SRVS + SLOT_SPARE) * SLOT_COUNT) as u32;
+/// 每个 in-flight 槽在窗口段里的 SRV 数：`[instances, clips]`。
+const SLOT_SRVS: u32 = 2;
+const SLOT_COUNT: u32 = MAX_FRAMES_IN_FLIGHT as u32;
+/// 每窗口占用的描述符数（in-flight 槽 × 每槽 SRV）。
+const WINDOW_SRVS: u32 = SLOT_SRVS * SLOT_COUNT;
+/// 固定段：`[glyph, image]` 图集 SRV。
+const ATLAS_SRVS: u32 = 2;
+/// 堆容量：固定段 + 341 个窗口（每描述符 32 B ⇒ 约 64 KiB，相对显存可忽略）。
+const SRV_HEAP_CAPACITY: u32 = 2048;
+/// 最多同时存在的窗口数（由堆容量决定；超出时创建渲染器返回 `AppInit`）。
+pub(crate) const MAX_WINDOWS: u32 = (SRV_HEAP_CAPACITY - ATLAS_SRVS) / WINDOW_SRVS;
 
 /// P07 产物（`build.rs` 写入 `OUT_DIR/shaders`；跳过模式是占位符）。
 const QUAD_VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/quad.vs.dxil"));
@@ -74,19 +92,17 @@ fn shader(bytes: &'static [u8], name: &'static str) -> Result<&'static [u8], Eng
     }
 }
 
-/// 根签名 + 三个 PSO + shader-visible SRV 堆。
+/// 进程级共享：根签名 + 三个 PSO（创建一次，所有窗口复用）。
 pub(crate) struct Pipeline {
     root_signature: ID3D12RootSignature,
     quad: ID3D12PipelineState,
     geometry_ui: ID3D12PipelineState,
     geometry_image: ID3D12PipelineState,
     geometry_glyph: ID3D12PipelineState,
-    srv_heap: ID3D12DescriptorHeap,
-    descriptor_size: u32,
 }
 
 impl Pipeline {
-    pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
+    pub(crate) fn new(device: &ID3D12Device) -> Result<Self, EngineError> {
         let quad_vs = shader(QUAD_VS, "quad.vs.dxil")?;
         let quad_ps = shader(QUAD_PS, "quad.ps.dxil")?;
         let geometry_vs_ui = shader(GEOMETRY_VS_UI, "geometry.vs_ui.dxil")?;
@@ -95,10 +111,10 @@ impl Pipeline {
         let geometry_ps_image = shader(GEOMETRY_PS_IMAGE, "geometry.ps_textured_image.dxil")?;
         let geometry_ps_glyph = shader(GEOMETRY_PS_GLYPH, "geometry.ps_textured_glyph.dxil")?;
 
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 设备句柄由调用方持有，调用期间有效；错误按 HRESULT / `Result` 处理。
         let root_signature = unsafe { build_root_signature(device) }?;
 
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 设备 / 根签名句柄由调用方持有，调用期间有效；错误按 HRESULT 处理。
         let quad = unsafe {
             create_pipeline_state(
                 device,
@@ -110,7 +126,7 @@ impl Pipeline {
             )
         }?;
         let ui_layout = [input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0)];
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 同上。
         let geometry_ui = unsafe {
             create_pipeline_state(
                 device,
@@ -125,7 +141,7 @@ impl Pipeline {
             input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0),
             input_element(c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 0, 8),
         ];
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 同上。
         let geometry_image = unsafe {
             create_pipeline_state(
                 device,
@@ -136,7 +152,7 @@ impl Pipeline {
                 Some(&textured_layout),
             )
         }?;
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
+        // SAFETY: 同上。
         let geometry_glyph = unsafe {
             create_pipeline_state(
                 device,
@@ -148,38 +164,13 @@ impl Pipeline {
             )
         }?;
 
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
-        let srv_heap: ID3D12DescriptorHeap = unsafe {
-            device
-                .raw()
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: HEAP_CAPACITY,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-        }
-        .map_err(|error| init_error_from("CreateDescriptorHeap(CBV_SRV_UAV)", error))?;
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
-        let descriptor_size = unsafe {
-            device
-                .raw()
-                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-        };
-
         Ok(Self {
             root_signature,
             quad,
             geometry_ui,
             geometry_image,
             geometry_glyph,
-            srv_heap,
-            descriptor_size,
         })
-    }
-
-    pub(crate) fn heap(&self) -> &ID3D12DescriptorHeap {
-        &self.srv_heap
     }
 
     pub(crate) fn root_signature(&self) -> &ID3D12RootSignature {
@@ -201,72 +192,150 @@ impl Pipeline {
             },
         }
     }
+}
 
-    /// 某槽的 4-SRV 表基址（root parameter 1 的描述符表起点）。
-    pub(crate) fn slot_table(&self, slot: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
-        let base = unsafe { self.srv_heap.GetGPUDescriptorHandleForHeapStart() };
-        D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: base.ptr + u64::from(self.descriptor_size) * (slot * SLOT_SRVS) as u64,
+/// 进程级共享的 shader-visible CBV/SRV/UAV 堆。
+///
+/// 布局（描述符索引）：`[0, ATLAS_SRVS)` 是图集固定段（glyph @0、image @1）；之后是每窗口段
+/// （`[instances, clips]` × in-flight 槽）。窗口段由 [`DescriptorArena`] 分配，窗口只写自己的
+/// 区间。D3D12 每个 command list 每种堆只能绑一张（`SetDescriptorHeaps` 文档），所以实例 / 裁剪
+/// 与图集必须共用这一张堆 —— 根签名的两张描述符表指向同一张堆的两个区间。
+pub(crate) struct SrvHeap {
+    heap: ID3D12DescriptorHeap,
+    descriptor_size: u32,
+}
+
+impl SrvHeap {
+    pub(crate) fn new(device: &ID3D12Device) -> Result<Self, EngineError> {
+        // SAFETY: 设备句柄由调用方持有，调用期间有效；错误按 HRESULT 返回。
+        let heap: ID3D12DescriptorHeap = unsafe {
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: SRV_HEAP_CAPACITY,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
         }
+        .map_err(|error| init_error_from("CreateDescriptorHeap(CBV_SRV_UAV)", error))?;
+        // SAFETY: 堆由 `SrvHeap` 持有，句柄在堆生命周期内有效；查询无副作用。
+        let descriptor_size = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        Ok(Self {
+            heap,
+            descriptor_size,
+        })
     }
 
-    /// 写某槽的 `[instances, clips]` SRV（图集 SRV 由 [`Pipeline::write_atlas`] 统一维护）。
+    pub(crate) fn heap(&self) -> &ID3D12DescriptorHeap {
+        &self.heap
+    }
+
+    /// 图集表基址（root parameter 2；glyph @0、image @1）。
+    pub(crate) fn atlas_table(&self) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        self.gpu_handle(0)
+    }
+
+    /// 某窗口某槽的 `[instances, clips]` 表基址（root parameter 1）。
+    pub(crate) fn slot_table(&self, window_base: u32, slot: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        self.gpu_handle(window_base + slot as u32 * SLOT_SRVS)
+    }
+
+    /// 写某窗口某槽的 `[instances, clips]` SRV。
     pub(crate) fn write_slot(
         &self,
-        device: &Device,
+        device: &ID3D12Device,
+        window_base: u32,
         slot: usize,
         instances: &ID3D12Resource,
         instance_count: u32,
         clips: &ID3D12Resource,
         clip_count: u32,
     ) {
-        let first = slot * SLOT_SRVS;
         // `NumElements = 0` 的 SRV 非法（本机实测会让设备丢失）：空帧至少给 1 个元素。
         let instances_srv = buffer_srv(instance_count.max(1), 128);
         let clips_srv = buffer_srv(clip_count.max(1), 48);
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+        let first = window_base + slot as u32 * SLOT_SRVS;
+        // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；描述符区间在容量内。
         unsafe {
-            device.raw().CreateShaderResourceView(
+            device.CreateShaderResourceView(
                 instances,
                 Some(&instances_srv),
                 self.cpu_handle(first),
             );
-            device.raw().CreateShaderResourceView(
-                clips,
-                Some(&clips_srv),
-                self.cpu_handle(first + 1),
-            );
+            device.CreateShaderResourceView(clips, Some(&clips_srv), self.cpu_handle(first + 1));
         }
     }
 
-    /// 写图集 SRV（每个槽的 `[2]` / `[3]` 槽位，共 `SLOT_COUNT` 份）。
-    pub(crate) fn write_atlas(&self, device: &Device, kind: AtlasKind, texture: &ID3D12Resource) {
-        let offset = match kind {
-            AtlasKind::Glyph => 2,
-            AtlasKind::Image => 3,
-        };
+    /// 写一个图集的 SRV（另一个图集的描述符保持不变）。
+    pub(crate) fn write_atlas(
+        &self,
+        device: &ID3D12Device,
+        kind: AtlasKind,
+        texture: &ID3D12Resource,
+    ) {
         let srv = texture_srv(kind);
-        for slot in 0..SLOT_COUNT {
-            let index = slot * SLOT_SRVS + offset;
-            // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
-            unsafe {
-                device
-                    .raw()
-                    .CreateShaderResourceView(texture, Some(&srv), self.cpu_handle(index));
-            }
+        // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；描述符索引在固定段内。
+        unsafe {
+            device.CreateShaderResourceView(texture, Some(&srv), self.cpu_handle(kind.index()));
         }
     }
 
-    fn cpu_handle(&self, index: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        // SAFETY: 描述符堆由 `Pipeline` / `Renderer` 持有，句柄在堆生命周期内有效。
-        let base = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
+    fn cpu_handle(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // SAFETY: 描述符堆由本结构持有，句柄在堆生命周期内有效。
+        let base = unsafe { self.heap.GetCPUDescriptorHandleForHeapStart() };
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: base.ptr + (self.descriptor_size * index as u32) as usize,
+            ptr: base.ptr + (self.descriptor_size * index) as usize,
+        }
+    }
+
+    fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: 描述符堆由本结构持有，句柄在堆生命周期内有效。
+        let base = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: base.ptr + u64::from(self.descriptor_size) * u64::from(index),
         }
     }
 }
 
+/// 共享 SRV 堆的窗口段分配器：每窗口 `WINDOW_SRVS` 个描述符，`Renderer` 销毁时归还。
+pub(crate) struct DescriptorArena {
+    next: u32,
+    free: Vec<u32>,
+}
+
+impl DescriptorArena {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next: 0,
+            free: Vec::new(),
+        }
+    }
+
+    /// 分配一个窗口段，返回段内第一个描述符的**绝对索引**。
+    pub(crate) fn allocate(&mut self) -> Option<u32> {
+        if let Some(index) = self.free.pop() {
+            return Some(ATLAS_SRVS + index * WINDOW_SRVS);
+        }
+        if self.next < MAX_WINDOWS {
+            let index = self.next;
+            self.next += 1;
+            return Some(ATLAS_SRVS + index * WINDOW_SRVS);
+        }
+        None
+    }
+
+    /// 归还一个窗口段（`base` 是 [`SrvHeap::slot_table`] 用的段起始索引）。
+    pub(crate) fn free(&mut self, base: u32) {
+        debug_assert!(base >= ATLAS_SRVS);
+        debug_assert_eq!(
+            (base - ATLAS_SRVS) % WINDOW_SRVS,
+            0,
+            "window descriptor base must be aligned"
+        );
+        self.free.push((base - ATLAS_SRVS) / WINDOW_SRVS);
+    }
+}
 fn buffer_srv(num_elements: u32, stride: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_UNKNOWN,
@@ -320,16 +389,26 @@ fn input_element(
     }
 }
 
-unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, EngineError> {
-    let ranges = [D3D12_DESCRIPTOR_RANGE {
-        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: SLOT_SRVS as u32,
-        BaseShaderRegister: 0,
-        RegisterSpace: 0,
-        OffsetInDescriptorsFromTableStart: 0,
-    }];
+unsafe fn build_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature, EngineError> {
+    // 两张表（同一张共享堆的两个区间）：窗口槽段（t0..t1）与图集固定段（t2..t3）。
+    let ranges = [
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: SLOT_SRVS,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: ATLAS_SRVS,
+            BaseShaderRegister: SLOT_SRVS,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        },
+    ];
 
-    let mut parameters = [D3D12_ROOT_PARAMETER::default(); 2];
+    let mut parameters = [D3D12_ROOT_PARAMETER::default(); 3];
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Anonymous = D3D12_ROOT_PARAMETER_0 {
         Constants: D3D12_ROOT_CONSTANTS {
@@ -343,10 +422,18 @@ unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, E
     parameters[1].Anonymous = D3D12_ROOT_PARAMETER_0 {
         DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
             NumDescriptorRanges: 1,
-            pDescriptorRanges: ranges.as_ptr(),
+            pDescriptorRanges: &ranges[0],
         },
     };
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].Anonymous = D3D12_ROOT_PARAMETER_0 {
+        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+            NumDescriptorRanges: 1,
+            pDescriptorRanges: &ranges[1],
+        },
+    };
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     let sampler = D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -374,7 +461,7 @@ unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, E
 
     let mut blob: Option<ID3DBlob> = None;
     let mut error_blob: Option<ID3DBlob> = None;
-    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+    // SAFETY: 描述里的指针都指向本函数栈上的数组，调用期间有效。
     unsafe {
         D3D12SerializeRootSignature(
             &desc,
@@ -387,18 +474,18 @@ unsafe fn build_root_signature(device: &Device) -> Result<ID3D12RootSignature, E
     let blob = blob.ok_or_else(|| EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("d3d12 SerializeRootSignature returned no blob"),
     })?;
-    // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
+    // SAFETY: blob 由本函数持有，字节区间在调用期间有效。
     let bytes = unsafe {
         std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
     };
     let _ = error_blob;
-    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
-    unsafe { device.raw().CreateRootSignature(0, bytes) }
+    // SAFETY: 设备句柄由调用方持有，调用期间有效；错误按 HRESULT 处理。
+    unsafe { device.CreateRootSignature(0, bytes) }
         .map_err(|error| init_error_from("CreateRootSignature", error))
 }
 
 unsafe fn create_pipeline_state(
-    device: &Device,
+    device: &ID3D12Device,
     root_signature: &ID3D12RootSignature,
     vertex: &'static [u8],
     pixel: &'static [u8],
@@ -471,7 +558,7 @@ unsafe fn create_pipeline_state(
         ..D3D12_GRAPHICS_PIPELINE_STATE_DESC::default()
     };
     // SAFETY: desc 的字符串/字节切片指针指向本函数栈上的产物，CreateGraphicsPipelineState 同步消费。
-    let state = unsafe { device.raw().CreateGraphicsPipelineState(&desc) }
+    let state = unsafe { device.CreateGraphicsPipelineState(&desc) }
         .map_err(|error| init_error_from("CreateGraphicsPipelineState", error));
     // SAFETY: `pRootSignature` 是 `ManuallyDrop`，desc 的 drop 不会释放 root signature 的 COM 引用
     // （DEVIATIONS F-86）；PSO 已经创建完成，这里显式释放。
@@ -524,6 +611,9 @@ impl GeometryEntry {
 /// 缓冲由 GPU 线程在**首次见到某个 `GeometryId`** 时创建：编码器把注册描述附在
 /// `GeometryDrawGpu` 上随帧过线，因此这里不需要额外的跨线程注册通道。
 /// 槽位复用（`generation` 变化）会**丢弃并重建**该槽的缓冲，避免旧图元画成新几何。
+///
+/// 每窗口一份：几何缓冲只被本窗口的命令列表引用，退役句柄走本窗口的 retire 队列，因此不需要
+/// 跨窗口共享（共享它们会引入「哪个窗口的 fence 先到达」的所有权问题，见 D-1）。
 pub(crate) struct GeometryRegistry {
     entries: Vec<Option<GeometryEntry>>,
 }
@@ -535,12 +625,21 @@ impl GeometryRegistry {
         }
     }
 
+    /// teardown：把本窗口几何缓冲的句柄交回共享设备（GPU 线程已 idle，列表已重置）。
+    pub(crate) fn release(&self, shared: &super::device::SharedGpu) {
+        for entry in self.entries.iter().flatten() {
+            for handle in entry.storage() {
+                let _ = shared.release(handle);
+            }
+        }
+    }
+
     /// 取该句柄的 GPU 缓冲；没有或代际不匹配时按 `desc` 现场创建。
     ///
     /// `retired` 收集被替换掉的旧句柄（调用方在录制块结束后交给 retire 队列，I4）。
     pub(crate) fn ensure(
         &mut self,
-        device: &mut Device,
+        shared: &super::device::SharedGpu,
         id: GeometryId,
         desc: &crate::paint::geometry::GeometryDesc,
         retired: &mut Vec<GpuResourceHandle>,
@@ -557,7 +656,7 @@ impl GeometryRegistry {
             if let Some(old) = self.entries[slot].take() {
                 retired.extend(old.storage());
             }
-            let entry = upload_geometry(device, id, desc)?;
+            let entry = upload_geometry(shared, id, desc)?;
             self.entries[slot] = Some(entry);
         }
         self.entries[slot]
@@ -574,18 +673,18 @@ impl GeometryRegistry {
 
 /// 按注册描述创建顶点/索引缓冲（`UPLOAD` 堆；几何是静态数据，装载期一次写入）。
 fn upload_geometry(
-    device: &mut Device,
+    shared: &super::device::SharedGpu,
     id: GeometryId,
     desc: &crate::paint::geometry::GeometryDesc,
 ) -> Result<GeometryEntry, EngineError> {
-    let vertex = upload_buffer(device, &desc.vertex_bytes)?;
-    let index = upload_buffer(device, &desc.index_bytes)?;
+    let vertex = upload_buffer(shared, &desc.vertex_bytes)?;
+    let index = upload_buffer(shared, &desc.index_bytes)?;
     // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
     let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
     // SAFETY: 同上。
     let index_location = unsafe { index.GetGPUVirtualAddress() };
-    let vertex_handle = device.allocate(vertex);
-    let index_handle = device.allocate(index);
+    let vertex_handle = shared.allocate(vertex);
+    let index_handle = shared.allocate(index);
     let index_format = match desc.index_type {
         IndexType::U16 => DXGI_FORMAT_R16_UINT,
         IndexType::U32 => DXGI_FORMAT_R32_UINT,
@@ -612,7 +711,10 @@ fn upload_geometry(
     })
 }
 
-fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, EngineError> {
+fn upload_buffer(
+    shared: &super::device::SharedGpu,
+    bytes: &[u8],
+) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: bytes.len().max(4) as u64,
@@ -635,9 +737,9 @@ fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, En
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
-    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+    // SAFETY: COM 调用：设备句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
-        device.raw().CreateCommittedResource(
+        shared.raw().CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
@@ -651,10 +753,10 @@ fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, En
         detail: smol_str::SmolStr::new_static("d3d12 CreateCommittedResource returned no resource"),
     })?;
     let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
+    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该缓冲的创建尺寸保证。
     unsafe { resource.Map(0, None, Some(&mut pointer)) }
         .map_err(|error| init_error_from("Map(upload)", error))?;
-    // SAFETY: COM `QueryInterface` 转换：源接口非空且存活，失败以 `Result` 返回。
+    // SAFETY: `pointer` 容量 ≥ `bytes.len()`（缓冲按该长度创建），映射期间无并发访问。
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len()) };
     // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
     unsafe { resource.Unmap(0, None) };
@@ -665,7 +767,7 @@ fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, En
 mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
-    use super::Pipeline;
+    use super::{ATLAS_SRVS, DescriptorArena, Pipeline, SrvHeap, WINDOW_SRVS};
     use crate::{
         paint::geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
         render::windows::device::Device,
@@ -675,19 +777,50 @@ mod tests {
     fn pipeline_builds_on_warp() {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let device = Device::new_warp().expect("WARP device");
-        let pipeline = Pipeline::new(&device).expect("pipeline");
-        // 三张 PSO + 根签名的创建成功已由 `Pipeline::new` 的 `?` 保证；这里只查描述符表布局。
+        let pipeline = Pipeline::new(device.raw()).expect("pipeline");
+        // 4 张 PSO + 根签名的创建成功已由 `Pipeline::new` 的 `?` 保证；这里只查句柄可访问。
         let _ = pipeline.root_signature();
         let _ = pipeline.quad();
         let _ = pipeline.geometry(GeometryPipeline::Ui);
-        assert_ne!(pipeline.slot_table(0).ptr, 0);
-        assert_ne!(pipeline.slot_table(1).ptr, pipeline.slot_table(0).ptr);
+    }
+
+    /// 一张共享堆里的两段：图集固定段在索引 0/1，窗口段从 `ATLAS_SRVS` 开始。
+    #[test]
+    fn the_srv_heap_reserves_the_atlas_segment_before_window_segments() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let device = Device::new_warp().expect("WARP device");
+        let heap = SrvHeap::new(device.raw()).expect("srv heap");
+        let mut arena = DescriptorArena::new();
+        let first = arena.allocate().expect("first window segment");
+        let second = arena.allocate().expect("second window segment");
+        assert_eq!(first, ATLAS_SRVS);
+        assert_eq!(second, ATLAS_SRVS + WINDOW_SRVS);
+        assert_ne!(heap.atlas_table().ptr, 0);
+        assert_ne!(heap.slot_table(first, 0).ptr, heap.atlas_table().ptr);
+        assert_ne!(heap.slot_table(first, 1).ptr, heap.slot_table(first, 0).ptr);
+
+        // 归还的段会被复用（窗口关闭后新窗口拿回同一段）。
+        arena.free(first);
+        assert_eq!(arena.allocate(), Some(first));
+    }
+
+    /// 窗口段分配器在容量耗尽时返回 `None`（不越界写共享堆）。
+    #[test]
+    fn the_descriptor_arena_stops_at_the_heap_capacity() {
+        let mut arena = DescriptorArena::new();
+        let mut allocated = 0;
+        while let Some(base) = arena.allocate() {
+            assert!(base + WINDOW_SRVS <= super::SRV_HEAP_CAPACITY);
+            allocated += 1;
+            assert!(allocated <= super::MAX_WINDOWS);
+        }
+        assert_eq!(allocated, super::MAX_WINDOWS);
     }
 
     #[test]
     fn geometry_registry_injects_a_ui_triangle() {
         let _guard = crate::render::windows::device::gpu_test_lock();
-        let mut device = Device::new_warp().expect("WARP device");
+        let shared = super::super::device::SharedGpu::new_warp().expect("WARP shared gpu");
         let mut registry = super::GeometryRegistry::new();
         let vertices = [0.0f32, 0.0, 32.0, 0.0, 0.0, 32.0]
             .iter()
@@ -709,7 +842,7 @@ mod tests {
         let id = GeometryId::for_test(0, 1);
         let mut retired = Vec::new();
         let entry = registry
-            .ensure(&mut device, id, &desc, &mut retired)
+            .ensure(&shared, id, &desc, &mut retired)
             .expect("ensure");
         assert_eq!(entry.index_count(), 3);
         assert_eq!(entry.vertex().StrideInBytes, 8);
@@ -719,7 +852,7 @@ mod tests {
 
         // 同一 id + 同一代际：命中缓存，不重建、不产生退役句柄。
         let again = registry
-            .ensure(&mut device, id, &desc, &mut retired)
+            .ensure(&shared, id, &desc, &mut retired)
             .expect("cached");
         assert_eq!(again.index_count(), 3);
         assert!(retired.is_empty());
@@ -727,7 +860,7 @@ mod tests {
         // 槽位复用（代际 +1）：必须重建，并把旧句柄交还 retire。
         let reused = GeometryId::for_test(0, 2);
         let _ = registry
-            .ensure(&mut device, reused, &desc, &mut retired)
+            .ensure(&shared, reused, &desc, &mut retired)
             .expect("rebuilt");
         assert_eq!(retired.len(), 2, "换代必须退役旧顶点/索引缓冲");
     }

@@ -2,6 +2,9 @@
 //!
 //! 每 in-flight 槽 2 个 timestamp（帧起 / 帧末）+ 一块 READBACK buffer；fence 到达后读回
 //! 两个 `u64` 并换算成 ns。计时是**可选能力**：`new` 失败时返回 `None`，像素路径不受影响。
+//!
+//! 每个窗口一份：timestamp 槽位 / 读回缓冲按**本窗口**的 in-flight 槽轮转，多个窗口共享一条
+//! command queue 时各窗口的样本互不覆盖（query heap 本身是设备对象，可以每窗口各建一个）。
 
 use windows::Win32::Graphics::{
     Direct3D12::*,
@@ -14,8 +17,8 @@ use crate::{
         frame::MAX_FRAMES_IN_FLIGHT,
         timer::{GpuTimerSample, Section},
         windows::{
-            device::{Device, init_error_from},
-            queue::Queue,
+            device::{SharedGpu, init_error_from},
+            queue::CommandStream,
         },
     },
 };
@@ -31,14 +34,17 @@ pub(crate) struct GpuTimer {
 
 impl GpuTimer {
     /// 建计时器；不支持时返回 `Ok(None)`（不是错误）。
-    pub(crate) fn new(device: &Device, queue: &Queue) -> Result<Option<Self>, EngineError> {
-        let Ok(frequency) = queue.timestamp_frequency() else {
+    pub(crate) fn new(
+        shared: &SharedGpu,
+        stream: &CommandStream,
+    ) -> Result<Option<Self>, EngineError> {
+        let Ok(frequency) = stream.timestamp_frequency() else {
             return Ok(None);
         };
         let mut heap_out: Option<ID3D12QueryHeap> = None;
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
+        // SAFETY: 设备句柄由进程级 `SharedGpu` 持有，调用期间有效；错误按 HRESULT 返回。
         if unsafe {
-            device.raw().CreateQueryHeap(
+            shared.raw().CreateQueryHeap(
                 &D3D12_QUERY_HEAP_DESC {
                     Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
                     Count: TIMESTAMPS_PER_FRAME * MAX_FRAMES_IN_FLIGHT as u32,
@@ -57,7 +63,7 @@ impl GpuTimer {
 
         let mut resolve = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            resolve.push(create_readback(device, 16)?);
+            resolve.push(create_readback(shared.raw(), 16)?);
         }
         Ok(Some(Self {
             heap,
@@ -68,7 +74,7 @@ impl GpuTimer {
 
     /// 帧起 timestamp（在列表开头调用）。
     pub(crate) fn begin(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+        // SAFETY: 列表 / query heap 由调用方持有，调用期间有效。
         unsafe {
             list.EndQuery(
                 &self.heap,
@@ -82,7 +88,7 @@ impl GpuTimer {
     pub(crate) fn end(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let index = (slot as u32) * TIMESTAMPS_PER_FRAME + 1;
         let resolve = &self.resolve[slot];
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+        // SAFETY: 列表 / query heap / 读回缓冲由调用方持有，调用期间有效。
         unsafe {
             list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
             list.ResolveQueryData(
@@ -118,7 +124,7 @@ impl GpuTimer {
     }
 }
 
-fn create_readback(device: &Device, bytes: u64) -> Result<ID3D12Resource, EngineError> {
+fn create_readback(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: bytes.max(4),
@@ -141,9 +147,9 @@ fn create_readback(device: &Device, bytes: u64) -> Result<ID3D12Resource, Engine
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
-    // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
+    // SAFETY: COM 调用：设备句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
-        device.raw().CreateCommittedResource(
+        device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,

@@ -26,9 +26,15 @@
 //! 左上角，然后才 prime / 切 visual —— 缩容那一帧可见像素完全不变，不会闪一帧背景色。
 //!
 //! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程独占**
-//! 的对象（device / queue / swapchain / persist / upload / retire / 计时），构造发生在窗口创建时
-//! （UI 线程），构造完成后整体移交给 `kytrix-d3d12` 线程（[`super::renderer`]）。离屏 / 快照路径
-//! 不走线程：`GpuRenderer` 由门面同步调用，语义与 golden 不变（§4.5 的下半段）。
+//! 的每窗口对象（swapchain / DirectComposition / persist / 提交流 / 实例上传缓冲 / 计时），构造
+//! 发生在窗口创建时（UI 线程），构造完成后整体移交给 `kytrix-d3d12` 线程（[`super::renderer`]）。
+//! device / direct queue / 根签名 / PSO / 图集纹理是进程级共享的（[`SharedGpu`]，见 `device.rs`）；
+//! 离屏 / 快照路径不走线程：`GpuRenderer` 由门面同步调用，语义与 golden 不变（§4.5 的下半段）。
+//!
+//! 共享图集的写入规则：一帧的「对齐待上传页 → 录制 → 提交」全程持有图集**读锁**（共享页在帧内
+//! 不会变）；待上传页与共享页不一致时先释放读锁，在写锁里重建页并等共享队列 idle
+//! （[`SharedGpu::rebuild_atlas_pages`]），然后重试。多个窗口同时上传同一张纹理因此是安全的：
+//! 每窗口有自己的 staging，同一条队列上的命令列表按提交顺序整段执行。
 //!
 //! 提交是异步的（I2）：`ExecuteCommandLists` 后立即返回；节奏来自 DXGI 的帧延迟 waitable
 //! （由 GPU 循环在每帧录制前等一次），完成通知只通过 fence 观察。
@@ -70,10 +76,10 @@ use crate::{
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
-            atlas::AtlasTextures,
-            device::{Device, init_error_from},
-            pipeline::{GeometryRegistry, Pipeline},
-            queue::Queue,
+            atlas::{AtlasUploads, SharedAtlas},
+            device::{DescriptorLease, SharedGpu, init_error_from},
+            pipeline::{GeometryRegistry, Pipeline, SrvHeap},
+            queue::CommandStream,
             swapchain::Swapchain,
             timer::GpuTimer,
         },
@@ -108,11 +114,19 @@ fn on_gpu_thread() -> bool {
 }
 
 /// 一个窗口的 GPU 渲染器（**GPU 线程独占**；离屏路径由门面同步调用）。
+///
+/// 共享与每窗口的边界见 `windows.rs` 与 [`SharedGpu`]：device / direct queue / 根签名 / PSO /
+/// 图集纹理是进程级共享的；这里只持有**每窗口**的 swapchain / DirectComposition 对象 / persist
+/// 目标 / 提交流（allocator + list + fence + retire）/ 实例上传缓冲 / 几何缓冲。
 pub(crate) struct GpuRenderer {
-    device: Device,
-    queue: Queue,
-    pipeline: Pipeline,
-    atlas: AtlasTextures,
+    /// 进程级共享 GPU（设备 / 队列 / PSO / 图集纹理）。
+    shared: Arc<SharedGpu>,
+    /// 本窗口在共享队列上的提交流（allocator / list / fence / 帧槽 / retire）。
+    stream: CommandStream,
+    /// 本窗口在共享 SRV 堆里的段（[instances, clips] × in-flight 槽）。
+    descriptors: DescriptorLease,
+    /// 本窗口的图集上传路径（每槽 staging + 待上传页；纹理本身在 `shared` 里）。
+    atlas_uploads: AtlasUploads,
     persist: Persist,
     upload: UploadArena,
     geometry: GeometryRegistry,
@@ -167,7 +181,8 @@ pub(crate) struct GpuRenderer {
 
 // SAFETY: `GpuRenderer` 在构造完成后只整体移动一次到 `kytrix-d3d12` 线程，此后 UI 线程不再
 // 访问其中任何对象；D3D12/DXGI 对象本身允许跨线程使用，这里保证的是「单线程独占」而不是共享。
-// `Queue` 里的 fence 事件句柄（`HANDLE`）与 swapchain 的 waitable 句柄只在该线程上使用。
+// `CommandStream` 里的 fence 事件句柄（`HANDLE`）与 swapchain 的 waitable 句柄只在该线程上使用；
+// `Arc<SharedGpu>` 的共享语义由 `SharedGpu` 自己的 `Send + Sync` 契约负责。
 unsafe impl Send for GpuRenderer {}
 
 /// `submit_recorded` 的呈现目标。
@@ -205,15 +220,15 @@ enum PrimePersist {
 }
 
 impl GpuRenderer {
-    /// 产品路径：硬件设备 + 离屏目标（P09 在此之后 attach 原生窗口）。
+    /// 产品路径：进程级共享 GPU + 离屏目标（P09 在此之后 attach 原生窗口）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size)
+        Self::with_shared(SharedGpu::process()?, size)
     }
 
-    /// 测试用的 WARP 渲染器。
+    /// 测试用的 WARP 渲染器（进程级共享 WARP 设备；与产品路径同构）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_warp_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new_warp()?, size)
+        Self::with_shared(SharedGpu::process_warp()?, size)
     }
 
     /// 组合交换链路径（Windows 窗口）。
@@ -237,15 +252,15 @@ impl GpuRenderer {
     ) -> Result<Self, EngineError> {
         let content = (content.0.max(1), content.1.max(1));
         let buffer = buffer_size(content)?;
-        let mut renderer = Self::with_device(Device::new()?, buffer)?;
+        let mut renderer = Self::with_shared(SharedGpu::process()?, buffer)?;
         renderer.clear_color = background;
-        let mut swapchain = Swapchain::for_composition(&renderer.queue, buffer)?;
+        let mut swapchain = Swapchain::for_composition(renderer.shared.queue(), buffer)?;
         // 背景层是 1×1 的纯色交换链，由 UI 线程的 DComp scale 变换铺满客户区。
-        let mut background_swapchain = Swapchain::for_composition(&renderer.queue, (1, 1))?;
+        let mut background_swapchain = Swapchain::for_composition(renderer.shared.queue(), (1, 1))?;
         // 背景层有自己的 1×1 持久目标（RTV 堆的第二个描述符）：改色只 clear / copy 这一块，
         // 不再顺带清掉整块主内容目标（旧实现的 P2）。必须在 prime 之前建好。
-        let background_rtv = Self::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
-        let background_persist = Persist::new(&mut renderer.device, (1, 1), background_rtv)?;
+        let background_rtv = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 1);
+        let background_persist = Persist::new(&renderer.shared, (1, 1), background_rtv)?;
         renderer.background_persist = Some(background_persist);
         // prime 用显式的 swapchain / buffer / content / persist；此刻两条 visual 都还没有内容。
         renderer.prime_detached(
@@ -271,17 +286,15 @@ impl GpuRenderer {
         Ok(renderer)
     }
 
-    fn with_device(mut device: Device, size: (u32, u32)) -> Result<Self, EngineError> {
-        let queue = Queue::new(&device)?;
-        let pipeline = Pipeline::new(&device)?;
-        // 图集页懒分配：初始化只有 1×1 占位纹理，SRV 始终指向有效资源（DEVIATIONS F-208）。
-        let atlas = AtlasTextures::new(&mut device)?;
-        pipeline.write_atlas(&device, AtlasKind::Glyph, atlas.texture(AtlasKind::Glyph));
-        pipeline.write_atlas(&device, AtlasKind::Image, atlas.texture(AtlasKind::Image));
-
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
+    /// 每窗口 GPU 对象：提交流 / 共享 SRV 堆的窗口段 / 图集上传路径 / 持久目标 / RTV 堆 / 计时器。
+    ///
+    /// 设备 / 队列 / PSO / 图集纹理来自进程级 `SharedGpu`；本函数只创建每窗口对象。
+    fn with_shared(shared: Arc<SharedGpu>, size: (u32, u32)) -> Result<Self, EngineError> {
+        let stream = CommandStream::new(&shared)?;
+        let descriptors = shared.window_descriptors()?;
+        // SAFETY: 设备句柄由进程级 `SharedGpu` 持有，调用期间有效；错误按 HRESULT 返回。
         let rtv_heap: ID3D12DescriptorHeap = unsafe {
-            device
+            shared
                 .raw()
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -292,19 +305,17 @@ impl GpuRenderer {
                 })
         }
         .map_err(|error| init_error_from("CreateDescriptorHeap(RTV)", error))?;
-        // SAFETY: 描述符堆由 `Pipeline` / `GpuRenderer` 持有，句柄在堆生命周期内有效。
-        let rtv = Self::rtv_handle(&device, &rtv_heap, 0);
-
-        let mut device = device;
-        let persist = Persist::new(&mut device, size, rtv)?;
-        let upload = UploadArena::new(&mut device)?;
-        let timer = GpuTimer::new(&device, &queue)?;
+        // SAFETY: 描述符堆由本结构持有，句柄在堆生命周期内有效。
+        let rtv = rtv_handle(shared.raw(), &rtv_heap, 0);
+        let persist = Persist::new(&shared, size, rtv)?;
+        let upload = UploadArena::new(&shared)?;
+        let timer = GpuTimer::new(&shared, &stream)?;
 
         Ok(Self {
-            device,
-            queue,
-            pipeline,
-            atlas,
+            shared,
+            stream,
+            descriptors,
+            atlas_uploads: AtlasUploads::new(),
             persist,
             upload,
             geometry: GeometryRegistry::new(),
@@ -330,25 +341,6 @@ impl GpuRenderer {
     /// 写入窗口 DPI（平台层在 `set_scale` 之后调用；只影响 geometry 通道）。
     pub(crate) fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
-    }
-
-    /// RTV 堆里第 `index` 个描述符的 CPU 句柄（0 = 内容，1 = 1×1 背景）。
-    fn rtv_handle(
-        device: &Device,
-        heap: &ID3D12DescriptorHeap,
-        index: u32,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；两个查询都无副作用。
-        let size = unsafe {
-            device
-                .raw()
-                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
-        };
-        // SAFETY: 同上。
-        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
-        D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: start.ptr + index as usize * size as usize,
-        }
     }
 
     /// 当前**内容**尺寸（GPU 线程侧的真值；窗口 resize 只改这个字段）。
@@ -382,7 +374,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "window frame slots may only be acquired on the kytrix-d3d12 thread"
         );
-        self.queue.acquire_slot()
+        self.stream.acquire_slot()
     }
 
     /// 等本帧槽上一次提交完成（复用 allocator / timestamp 读回缓冲的前置条件）。
@@ -394,7 +386,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "window slot fences may only be waited on the kytrix-d3d12 thread"
         );
-        self.queue
+        self.stream
             .wait_slot_fence(slot.wait_value)
             .map_err(|error| self.classify(error))
     }
@@ -409,7 +401,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "completion events may only be armed on the kytrix-d3d12 thread"
         );
-        self.queue
+        self.stream
             .set_completion_event(signal_value, event)
             .map_err(|error| self.classify(error))
     }
@@ -420,7 +412,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "the queue fence may only be observed on the kytrix-d3d12 thread"
         );
-        self.queue.completed_value()
+        self.stream.completed_value()
     }
 
     /// 内容尺寸变化（窗口路径）：内容仍在 buffer 内时是**纯 CPU 记账**；越过 buffer 时走
@@ -471,17 +463,17 @@ impl GpuRenderer {
             });
         };
         // 1. GPU 完成 + 丢掉命令列表对旧 back buffer 的引用。
-        self.queue
+        self.stream
             .wait_idle()
             .map_err(|error| self.classify(error))?;
-        self.queue
+        self.stream
             .reset_in_flight_lists()
             .map_err(|error| self.classify(error))?;
         // 2. 新对象在旧对象销毁之前创建（失败时旧状态仍然完好）。
-        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
+        let rtv = rtv_handle(self.shared.raw(), &self.rtv_heap, 0);
         let persist =
-            Persist::new(&mut self.device, buffer, rtv).map_err(|error| self.classify(error))?;
-        let mut swapchain = Swapchain::for_composition(&self.queue, buffer)?;
+            Persist::new(&self.shared, buffer, rtv).map_err(|error| self.classify(error))?;
+        let mut swapchain = Swapchain::for_composition(self.shared.queue(), buffer)?;
         // 3. **先**把新交换链 prime 一次（全量背景 + 等 GPU fence），**再**挂到 visual 上：
         //    已 attach 但从未 present 的交换链在合成器里是透明的（P1-B）。prime 用显式的新
         //    `swapchain` / `buffer` / `content` 记账，旧 visual 在这期间继续显示旧内容。
@@ -497,7 +489,7 @@ impl GpuRenderer {
         // 4. 视觉切换**之后**才替换 / 丢弃旧对象（旧 swapchain 的已 present 内容可能仍被
         //    DWM 引用到下一次 `Commit`，本地变量保证它活到 `Commit` 之后）。
         let _old_swapchain = self.swapchain.replace(swapchain);
-        self.queue.retire(retired_index, old_persist.handle);
+        self.stream.retire(retired_index, old_persist.handle);
         self.buffer = buffer;
         self.surface = content;
         // prime 已经做过新交换链的第一次 present，后续帧不再是 `fresh`。
@@ -561,17 +553,17 @@ impl GpuRenderer {
             "the high-water bucket may only shrink on the kytrix-d3d12 thread"
         );
         // 1. GPU 完成 + 丢掉命令列表对旧 back buffer / 旧持久目标的引用。
-        self.queue
+        self.stream
             .wait_idle()
             .map_err(|error| self.classify(error))?;
-        self.queue
+        self.stream
             .reset_in_flight_lists()
             .map_err(|error| self.classify(error))?;
         // 2. 新对象在旧对象销毁之前创建（失败时旧状态仍然完好）。
-        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
+        let rtv = rtv_handle(self.shared.raw(), &self.rtv_heap, 0);
         let persist =
-            Persist::new(&mut self.device, buffer, rtv).map_err(|error| self.classify(error))?;
-        let mut swapchain = Swapchain::for_composition(&self.queue, buffer)?;
+            Persist::new(&self.shared, buffer, rtv).map_err(|error| self.classify(error))?;
+        let mut swapchain = Swapchain::for_composition(self.shared.queue(), buffer)?;
         // 3. prime 从旧持久目标拷内容，所以先把新目标换进来、旧目标留在栈上保持存活。
         let old_persist = std::mem::replace(&mut self.persist, persist);
         self.prime_detached(
@@ -590,10 +582,10 @@ impl GpuRenderer {
         //    本次 `Commit` 之后）。
         let _old_swapchain = self.swapchain.replace(swapchain);
         // prime 的命令列表刚引用过旧持久目标：重置列表把引用丢掉，再把纹理直接交回 device。
-        self.queue
+        self.stream
             .reset_in_flight_lists()
             .map_err(|error| self.classify(error))?;
-        let _ = self.device.release(old_persist.handle);
+        let _ = self.shared.release(old_persist.handle);
         drop(old_persist);
         self.buffer = buffer;
         // prime 已经做过新交换链的第一次全量 present，后续帧按内容子矩形 copy。
@@ -618,16 +610,16 @@ impl GpuRenderer {
         if size == self.surface {
             return Ok(());
         }
-        self.queue
+        self.stream
             .wait_idle()
             .map_err(|error| self.classify(error))?;
         // RTV 句柄由堆派生（堆是所有者；`Persist` 只缓存句柄本身）。
-        let rtv = Self::rtv_handle(&self.device, &self.rtv_heap, 0);
+        let rtv = rtv_handle(self.shared.raw(), &self.rtv_heap, 0);
         let old = self
             .persist
-            .recreate(&mut self.device, size, rtv)
+            .recreate(&self.shared, size, rtv)
             .map_err(|error| self.classify(error))?;
-        self.queue.retire(self.last_index, old);
+        self.stream.retire(self.last_index, old);
         self.buffer = size;
         self.surface = size;
         self.content_since = Instant::now();
@@ -675,7 +667,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "background layers may only be replaced on the kytrix-d3d12 thread"
         );
-        let mut swapchain = Swapchain::for_composition(&self.queue, (1, 1))?;
+        let mut swapchain = Swapchain::for_composition(self.shared.queue(), (1, 1))?;
         self.prime_detached(
             &mut swapchain,
             (1, 1),
@@ -721,8 +713,8 @@ impl GpuRenderer {
         persist: PrimePersist,
         source: Option<&Persist>,
     ) -> Result<(), EngineError> {
-        let slot = self.queue.acquire_slot();
-        self.queue
+        let slot = self.stream.acquire_slot();
+        self.stream
             .wait_slot_fence(slot.wait_value)
             .map_err(|error| self.classify(error))?;
         let payload = FramePayload::empty();
@@ -751,7 +743,7 @@ impl GpuRenderer {
             .present1(&mut frame, 0, content)
             .map_err(|error| self.classify(error))?;
         // 等到本帧的 GPU 工作完成（`FrameSlot::signal_value`），不是 `Present1` 的 CPU 返回。
-        self.queue
+        self.stream
             .wait_slot_fence(slot.signal_value)
             .map_err(|error| self.classify(error))?;
         Ok(())
@@ -768,8 +760,8 @@ impl GpuRenderer {
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
     ) -> Result<RenderStats, EngineError> {
-        let slot = self.queue.acquire_slot();
-        self.queue
+        let slot = self.stream.acquire_slot();
+        self.stream
             .wait_slot_fence(slot.wait_value)
             .map_err(|error| self.classify(error))?;
         let (stats, slot) =
@@ -798,7 +790,7 @@ impl GpuRenderer {
         timings: &mut FrameTimings,
     ) -> Result<(), EngineError> {
         // 同步语义：本帧命令必须完成，GPU 时间与随后的读回才有意义。
-        self.queue
+        self.stream
             .wait_slot_fence(slot.signal_value)
             .map_err(|error| self.classify(error))?;
         if let Some(sample) = self
@@ -814,7 +806,7 @@ impl GpuRenderer {
             cpu_ns: elapsed_ns(present_started),
             gpu_ns: 0,
         });
-        self.queue.release_completed(&mut self.device);
+        self.stream.release_completed();
         Ok(())
     }
 
@@ -883,7 +875,7 @@ impl GpuRenderer {
             on_gpu_thread(),
             "the retire queue may only be advanced on the kytrix-d3d12 thread"
         );
-        self.queue.release_completed(&mut self.device);
+        self.stream.release_completed();
     }
 
     /// 录制 + 提交一帧（不呈现、不等完成）。调用方先取槽并等该槽上一帧完成（§6.5）。
@@ -891,6 +883,10 @@ impl GpuRenderer {
     /// `target` 决定录制的呈现目标：常规帧用自己的交换链；`prime_detached` 用**还没挂到
     /// visual 上**的新交换链 + 显式持久目标（grow / 缩容 prime 用主持久目标，背景层 prime 用
     /// 1×1 背景持久目标）。
+    ///
+    /// 共享图集的页对齐在录制之前完成：**图集读锁**在整个录制 + 提交区间内持有（共享页在帧内
+    /// 不会变；别的窗口的页重建是写锁，会等本帧提交完）。发现待上传页与共享页不一致时先释放
+    /// 读锁、在写锁里重建（[`SharedGpu::rebuild_atlas_pages`]），然后重试。
     fn submit_recorded(
         &mut self,
         slot: FrameSlot,
@@ -900,7 +896,7 @@ impl GpuRenderer {
         timings: &mut FrameTimings,
         target: PresentTarget<'_>,
     ) -> Result<(RenderStats, FrameSlot), EngineError> {
-        if let Some(error) = self.device.lost_error() {
+        if let Some(error) = self.shared.lost_error() {
             return Err(error);
         }
         timings.reset(index);
@@ -910,96 +906,97 @@ impl GpuRenderer {
             "timings must be reset for this frame"
         );
         let frame_started = Instant::now();
+        let shared = Arc::clone(&self.shared);
+        loop {
+            // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
+            let atlas = shared.atlas();
+            // 待上传页 ≠ 共享页 ⇒ 先落地页换代：全页上传触发重建，过期增量直接丢弃。
+            let rebuild = self
+                .atlas_uploads
+                .reconcile_pages([atlas.page(AtlasKind::Glyph), atlas.page(AtlasKind::Image)]);
+            if !rebuild.is_empty() {
+                drop(atlas);
+                shared
+                    .rebuild_atlas_pages(&rebuild)
+                    .map_err(|error| self.classify(error))?;
+                continue;
+            }
+            // staging 对齐到共享页（第一次上传 / 页换代之后整组重建本窗口的 staging）。
+            self.atlas_uploads
+                .sync_staging(&shared, &atlas)
+                .map_err(|error| self.classify(error))?;
 
-        // 图集页尺寸变化必须在打开命令列表之前落地：重建纹理要重写 SRV 堆，而它可能仍被
-        // 在飞命令列表引用 ⇒ `prepare` 内部先 `wait_idle`（DEVIATIONS F-208）。
-        let atlas_rebuilt = self
-            .atlas
-            .prepare(&mut self.device, &mut self.queue)
-            .map_err(|error| self.classify(error))?;
-        if atlas_rebuilt.glyph {
-            self.pipeline.write_atlas(
-                &self.device,
-                AtlasKind::Glyph,
-                self.atlas.texture(AtlasKind::Glyph),
-            );
-        }
-        if atlas_rebuilt.image {
-            self.pipeline.write_atlas(
-                &self.device,
-                AtlasKind::Image,
-                self.atlas.texture(AtlasKind::Image),
-            );
-        }
+            self.stream
+                .reset_slot(slot)
+                .map_err(|error| self.classify(error))?;
 
-        self.queue
-            .reset_slot(slot)
-            .map_err(|error| self.classify(error))?;
-
-        let stats = {
-            let (swapchain, buffer, content, timer, persist, source) = match target {
-                PresentTarget::Own => (
-                    self.swapchain.as_ref(),
-                    self.buffer,
-                    self.surface,
-                    self.timer.as_ref(),
-                    &self.persist,
-                    None,
-                ),
-                PresentTarget::Detached {
-                    swapchain,
-                    buffer,
-                    content,
-                    persist,
-                    source,
-                } => {
-                    let persist = match persist {
-                        PrimePersist::Main => &self.persist,
-                        PrimePersist::Background => {
-                            self.background_persist.as_ref().ok_or_else(|| {
-                                EngineError::Composition {
+            let stats = {
+                let (swapchain, buffer, content, timer, persist, source) = match target {
+                    PresentTarget::Own => (
+                        self.swapchain.as_ref(),
+                        self.buffer,
+                        self.surface,
+                        self.timer.as_ref(),
+                        &self.persist,
+                        None,
+                    ),
+                    PresentTarget::Detached {
+                        swapchain,
+                        buffer,
+                        content,
+                        persist,
+                        source,
+                    } => {
+                        let persist = match persist {
+                            PrimePersist::Main => &self.persist,
+                            PrimePersist::Background => self
+                                .background_persist
+                                .as_ref()
+                                .ok_or_else(|| EngineError::Composition {
                                     detail: smol_str::SmolStr::new_static(
                                         "background prime without a 1x1 background persist",
                                     ),
-                                }
-                            })?
-                        }
-                    };
-                    (Some(swapchain), buffer, content, None, persist, source)
-                }
-            };
-            // 借用拆分：录制只碰这些字段，`buffer` / `surface` / `fresh` / `last_index` 留在外层。
-            let mut recorder = FrameRecorder {
-                device: &mut self.device,
-                queue: &mut self.queue,
-                pipeline: &self.pipeline,
-                atlas: &mut self.atlas,
-                persist,
-                upload: &mut self.upload,
-                geometry: &mut self.geometry,
-                timer,
-                swapchain,
-                source,
-                clear_color: self.clear_color,
-                buffer,
-                content,
-                scale: self.scale,
-            };
-            recorder.record(slot, index, payload, frame, timings, frame_started)
-        }
-        .map_err(|error| self.classify(error))?;
-
-        self.queue
-            .submit(index, slot)
+                                })?,
+                        };
+                        (Some(swapchain), buffer, content, None, persist, source)
+                    }
+                };
+                // 借用拆分：录制只碰这些字段，`buffer` / `surface` / `fresh` / `last_index` 留在外层。
+                let mut recorder = FrameRecorder {
+                    shared: &shared,
+                    stream: &mut self.stream,
+                    pipeline: shared.pipeline(),
+                    descriptors: &self.descriptors,
+                    atlas: &atlas,
+                    atlas_uploads: &mut self.atlas_uploads,
+                    persist,
+                    upload: &mut self.upload,
+                    geometry: &mut self.geometry,
+                    timer,
+                    swapchain,
+                    source,
+                    clear_color: self.clear_color,
+                    buffer,
+                    content,
+                    scale: self.scale,
+                };
+                recorder.record(slot, index, payload, frame, timings, frame_started)
+            }
             .map_err(|error| self.classify(error))?;
-        self.last_index = index;
-        Ok((stats, slot))
+
+            self.stream
+                .submit(index, slot)
+                .map_err(|error| self.classify(error))?;
+            self.last_index = index;
+            return Ok((stats, slot));
+        }
     }
 
     /// 图集上传入口：字形页与图片页共用（GPU 线程消费）。
     ///
     /// `pixels` 是 `rows` 顺序紧密打包的行（整页上传时就是整页），按**所有权**移动进待上传槽，
-    /// 避免槽 → 纹理之间再复制一次（DEVIATIONS F-211）。
+    /// 避免槽 → 纹理之间再复制一次（DEVIATIONS F-211）。入队时同时记录**当前共享页**
+    /// （`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的旧页」。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
@@ -1011,21 +1008,23 @@ impl GpuRenderer {
             self.swapchain.is_none() || on_gpu_thread(),
             "window atlas uploads may only be queued on the kytrix-d3d12 thread"
         );
-        self.atlas.queue_upload(kind, page, pixels, rows);
+        let queued_page = self.shared.atlas_page(kind);
+        self.atlas_uploads
+            .queue_upload(kind, page, queued_page, pixels, rows);
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。
     pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
-        self.atlas.pending(kind)
+        self.atlas_uploads.pending(kind)
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
-        self.queue.wait_idle()?;
+        self.stream.wait_idle()?;
         self.readback.capture(
-            &self.device,
-            &mut self.queue,
+            &self.shared,
+            &mut self.stream,
             &self.persist.texture,
             self.surface,
         )
@@ -1067,25 +1066,38 @@ impl GpuRenderer {
         let mut retired = Vec::new();
         let _ = self
             .geometry
-            .ensure(&mut self.device, id, &desc, &mut retired)?;
+            .ensure(&self.shared, id, &desc, &mut retired)?;
         for handle in retired {
-            self.queue.retire(self.last_index, handle);
+            self.stream.retire(self.last_index, handle);
         }
         Ok(())
     }
 
     /// 把底层错误归类为设备丢失（粘性）或原样返回。
     fn classify(&mut self, error: EngineError) -> EngineError {
-        self.device.note_failure().unwrap_or(error)
+        self.shared.note_failure().unwrap_or(error)
     }
 }
 
 impl Drop for GpuRenderer {
     fn drop(&mut self) {
         // 退出路径：等 GPU 完成所有在飞提交，并丢掉命令列表对 back buffer 的引用，
-        // 之后才销毁 swapchain / 设备（§6.7 的关闭握手由门面负责线程 join）。
-        let _ = self.queue.wait_idle();
-        let _ = self.queue.reset_in_flight_lists();
+        // 之后才销毁 swapchain（§6.7 的关闭握手由门面负责线程 join）。
+        let _ = self.stream.wait_idle();
+        let _ = self.stream.reset_in_flight_lists();
+        // 进程级设备不会随窗口销毁：本窗口的常驻资源必须在这里从共享句柄表里注销，
+        // 否则每次关窗都会把 persist / 上传缓冲 / staging / 几何缓冲留在进程里。
+        // GPU 已 idle、命令列表已重置，因此没有在飞引用；retire 队列里残留的句柄（包括
+        // 录制失败、从未提交的帧）也在这里一次性释放。
+        let _ = self.stream.release_completed();
+        self.stream.drain_retire();
+        self.upload.release(&self.shared);
+        self.geometry.release(&self.shared);
+        self.atlas_uploads.release(&self.shared);
+        let _ = self.shared.release(self.persist.handle);
+        if let Some(background) = self.background_persist.as_ref() {
+            let _ = self.shared.release(background.handle);
+        }
     }
 }
 
@@ -1120,12 +1132,15 @@ fn shrink_target(
     Ok(Some(target))
 }
 
-/// 一帧录制所需的 GPU 线程独占对象（借用拆分：`GpuRenderer` 的字段在这里按用途分组）。
+/// 一帧录制所需的 GPU 对象（借用拆分：`GpuRenderer` 的字段在这里按用途分组）。
 struct FrameRecorder<'a> {
-    device: &'a mut Device,
-    queue: &'a mut Queue,
+    shared: &'a SharedGpu,
+    stream: &'a mut CommandStream,
     pipeline: &'a Pipeline,
-    atlas: &'a mut AtlasTextures,
+    descriptors: &'a DescriptorLease,
+    /// 调用方持有的图集读锁（共享页在录制 + 提交期间不会变）。
+    atlas: &'a SharedAtlas,
+    atlas_uploads: &'a mut AtlasUploads,
     persist: &'a Persist,
     upload: &'a mut UploadArena,
     geometry: &'a mut GeometryRegistry,
@@ -1154,15 +1169,17 @@ impl FrameRecorder<'_> {
         frame_started: Instant,
     ) -> Result<RenderStats, EngineError> {
         let (instance_count, clip_count) = self.upload.write(
-            self.device,
-            self.queue,
+            self.shared,
+            self.stream,
             index,
             slot.index,
             payload.instances(),
             payload.clips(),
         )?;
-        self.pipeline.write_slot(
-            self.device,
+        let srv_heap = self.shared.srv_heap();
+        srv_heap.write_slot(
+            self.shared.raw(),
+            self.descriptors.base(),
             slot.index,
             self.upload.slot(slot.index).instances(),
             instance_count,
@@ -1185,20 +1202,18 @@ impl FrameRecorder<'_> {
         };
         // 几何绘制的下标表与 ops 同帧：`FrameOp::Geometry.index` 只有配合同一帧的表才有意义。
         let mut draw_calls = 0u32;
-        // staging 扩容造成的旧句柄：录制块结束后再 retire（`list` 借用 `self.queue`）。
-        let mut atlas_retired: Vec<GpuResourceHandle> = Vec::new();
+        // staging 扩容造成的旧句柄：录制块结束后再 retire（`list` 借用 `self.stream`）。
+        let atlas_retired: Vec<GpuResourceHandle>;
         // 几何换代（槽位复用）产生的旧缓冲句柄，同样在录制块结束后 retire。
         let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
         {
-            let list = self.queue.list(slot);
+            let list = self.stream.list(slot);
             if let Some(timer) = self.timer {
                 timer.begin(list, slot.index);
             }
-            if self.atlas.has_pending() {
-                atlas_retired = self
-                    .atlas
-                    .record_uploads(&mut *self.device, list, slot.index)?;
-            }
+            atlas_retired =
+                self.atlas_uploads
+                    .record_uploads(self.shared, self.atlas, list, slot.index)?;
             if full {
                 // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把内容 clip
                 // 更新到新尺寸之前，visual 的 clip 可能仍指向旧内容（P1-A 保证它 ≤ 新 buffer），
@@ -1232,6 +1247,8 @@ impl FrameRecorder<'_> {
             bind_frame(
                 list,
                 self.pipeline,
+                srv_heap,
+                self.descriptors.base(),
                 self.persist,
                 slot.index,
                 root,
@@ -1244,7 +1261,7 @@ impl FrameRecorder<'_> {
                         self.pipeline,
                         payload.ops(),
                         self.geometry,
-                        self.device,
+                        self.shared,
                         &mut geometry_retired,
                         payload,
                         root,
@@ -1267,7 +1284,7 @@ impl FrameRecorder<'_> {
                                 self.pipeline,
                                 payload.ops(),
                                 self.geometry,
-                                self.device,
+                                self.shared,
                                 &mut geometry_retired,
                                 payload,
                                 root,
@@ -1292,7 +1309,10 @@ impl FrameRecorder<'_> {
             }
         }
         for handle in atlas_retired {
-            self.queue.retire(index, handle);
+            self.stream.retire(index, handle);
+        }
+        for handle in geometry_retired {
+            self.stream.retire(index, handle);
         }
 
         Ok(RenderStats {
@@ -1311,13 +1331,13 @@ struct Persist {
 
 impl Persist {
     fn new(
-        device: &mut Device,
+        shared: &SharedGpu,
         size: (u32, u32),
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     ) -> Result<Self, EngineError> {
-        let texture = create_target(device, size)?;
-        let handle = device.allocate(texture.clone());
-        device.create_render_target_view(&texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, rtv);
+        let texture = create_target(shared.raw(), size)?;
+        let handle = shared.allocate(texture.clone());
+        create_render_target_view(shared.raw(), &texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, rtv);
         Ok(Self {
             texture,
             handle,
@@ -1328,13 +1348,13 @@ impl Persist {
     /// 重建；返回旧纹理的句柄（调用方决定 retire 还是立即释放，I4）。
     fn recreate(
         &mut self,
-        device: &mut Device,
+        shared: &SharedGpu,
         size: (u32, u32),
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     ) -> Result<GpuResourceHandle, EngineError> {
-        let texture = create_target(device, size)?;
-        let handle = device.allocate(texture.clone());
-        device.create_render_target_view(&texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, rtv);
+        let texture = create_target(shared.raw(), size)?;
+        let handle = shared.allocate(texture.clone());
+        create_render_target_view(shared.raw(), &texture, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, rtv);
         self.rtv = rtv;
         let old = self.handle;
         self.texture = texture;
@@ -1365,14 +1385,14 @@ struct UploadSlot {
 unsafe impl Send for UploadSlot {}
 
 impl UploadArena {
-    fn new(device: &mut Device) -> Result<Self, EngineError> {
+    fn new(shared: &SharedGpu) -> Result<Self, EngineError> {
         let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            let instances = create_upload(device, 256 * 128)?;
-            let instance_handle = device.allocate(instances.clone());
+            let instances = create_upload(shared.raw(), 256 * 128)?;
+            let instance_handle = shared.allocate(instances.clone());
             let instance_ptr = map_upload(&instances)?;
-            let clips = create_upload(device, 8 * 48)?;
-            let clip_handle = device.allocate(clips.clone());
+            let clips = create_upload(shared.raw(), 8 * 48)?;
+            let clip_handle = shared.allocate(clips.clone());
             let clip_ptr = map_upload(&clips)?;
             slots.push(UploadSlot {
                 instances,
@@ -1392,11 +1412,19 @@ impl UploadArena {
         &self.slots[slot]
     }
 
+    /// teardown：把本窗口实例 / 裁剪上传缓冲的句柄交回共享设备（GPU 线程已 idle）。
+    fn release(&self, shared: &SharedGpu) {
+        for slot in &self.slots {
+            let _ = shared.release(slot.instance_handle);
+            let _ = shared.release(slot.clip_handle);
+        }
+    }
+
     /// 写入本帧的实例/裁剪字节；容量不够时扩容（旧缓冲交 retire 队列）。返回 `(实例数, 裁剪层数)`。
     fn write(
         &mut self,
-        device: &mut Device,
-        queue: &mut Queue,
+        shared: &SharedGpu,
+        stream: &mut CommandStream,
         index: FrameIndex,
         slot: usize,
         instances: &[u8],
@@ -1407,28 +1435,28 @@ impl UploadArena {
         let needs_instances = instance_count > self.slots[slot].instance_capacity;
         if needs_instances {
             let capacity = instance_count.next_power_of_two().max(256);
-            let resource = create_upload(device, u64::from(capacity) * 128)?;
-            let handle = device.allocate(resource.clone());
+            let resource = create_upload(shared.raw(), u64::from(capacity) * 128)?;
+            let handle = shared.allocate(resource.clone());
             let pointer = map_upload(&resource)?;
             let old = self.slots[slot].instance_handle;
             self.slots[slot].instances = resource;
             self.slots[slot].instance_handle = handle;
             self.slots[slot].instance_capacity = capacity;
             self.slots[slot].instance_ptr = pointer;
-            queue.retire(index, old);
+            stream.retire(index, old);
         }
         let needs_clips = clip_count > self.slots[slot].clip_capacity;
         if needs_clips {
             let capacity = clip_count.next_power_of_two().max(8);
-            let resource = create_upload(device, u64::from(capacity) * 48)?;
-            let handle = device.allocate(resource.clone());
+            let resource = create_upload(shared.raw(), u64::from(capacity) * 48)?;
+            let handle = shared.allocate(resource.clone());
             let pointer = map_upload(&resource)?;
             let old = self.slots[slot].clip_handle;
             self.slots[slot].clips = resource;
             self.slots[slot].clip_handle = handle;
             self.slots[slot].clip_capacity = capacity;
             self.slots[slot].clip_ptr = pointer;
-            queue.retire(index, old);
+            stream.retire(index, old);
         }
 
         // SAFETY: 槽缓冲的容量已按本次字节数扩容；指针是创建时的持久映射，写入区间在容量内
@@ -1474,14 +1502,16 @@ fn map_upload(resource: &ID3D12Resource) -> Result<*mut u8, EngineError> {
 fn bind_frame(
     list: &ID3D12GraphicsCommandList,
     pipeline: &Pipeline,
+    srv_heap: &SrvHeap,
+    descriptor_base: u32,
     persist: &Persist,
     slot: usize,
     root: RootUniform,
     content: (u32, u32),
 ) {
-    // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
+    // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效；共享描述符堆由调用方持有。
     unsafe {
-        list.SetDescriptorHeaps(&[Some(pipeline.heap().clone())]);
+        list.SetDescriptorHeaps(&[Some(srv_heap.heap().clone())]);
         list.SetGraphicsRootSignature(pipeline.root_signature());
         list.SetPipelineState(pipeline.quad());
         list.SetGraphicsRoot32BitConstants(
@@ -1490,7 +1520,8 @@ fn bind_frame(
             root.words().as_ptr().cast(),
             0,
         );
-        list.SetGraphicsRootDescriptorTable(1, pipeline.slot_table(slot));
+        list.SetGraphicsRootDescriptorTable(1, srv_heap.slot_table(descriptor_base, slot));
+        list.SetGraphicsRootDescriptorTable(2, srv_heap.atlas_table());
         list.OMSetRenderTargets(1, Some(&persist.rtv), false, None);
         // 视口 = **内容**尺寸（不是 buffer）：Ndc 坐标由 root uniform 的内容尺寸给出，
         // 两者必须是同一个矩形，否则内容会被拉伸到整块 buffer 上。
@@ -1510,7 +1541,7 @@ fn draw_ops(
     pipeline: &Pipeline,
     ops: &[FrameOp],
     geometry: &mut GeometryRegistry,
-    device: &mut Device,
+    shared: &SharedGpu,
     retired: &mut Vec<GpuResourceHandle>,
     payload: &FramePayload,
     root: RootUniform,
@@ -1563,7 +1594,7 @@ fn draw_ops(
                     }
                 })?;
                 // 首次见到该 id（或槽位换代）时现场建缓冲；`desc` 随帧过线。
-                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                let entry = geometry.ensure(shared, draw.id, &draw.desc, retired)?;
                 let uniform = geometry_root(root, draw.clone(), clip_index, clip_rect);
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // `entry.topology()` 与注册时的图元类型一致。
@@ -1817,7 +1848,7 @@ fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn create_target(device: &mut Device, size: (u32, u32)) -> Result<ID3D12Resource, EngineError> {
+fn create_target(device: &ID3D12Device, size: (u32, u32)) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Width: u64::from(size.0.max(1)),
@@ -1849,7 +1880,7 @@ fn create_target(device: &mut Device, size: (u32, u32)) -> Result<ID3D12Resource
     let mut out: Option<ID3D12Resource> = None;
     // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
-        device.raw().CreateCommittedResource(
+        device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
@@ -1864,7 +1895,7 @@ fn create_target(device: &mut Device, size: (u32, u32)) -> Result<ID3D12Resource
     })
 }
 
-fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, EngineError> {
+fn create_upload(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: bytes.max(4),
@@ -1889,7 +1920,7 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
     let mut out: Option<ID3D12Resource> = None;
     // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
-        device.raw().CreateCommittedResource(
+        device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
@@ -1903,13 +1934,50 @@ fn create_upload(device: &mut Device, bytes: u64) -> Result<ID3D12Resource, Engi
         detail: smol_str::SmolStr::new_static("d3d12 upload buffer missing"),
     })
 }
+
+/// RTV 堆里第 `index` 个描述符的 CPU 句柄（0 = 内容，1 = 1×1 背景）。
+fn rtv_handle(
+    device: &ID3D12Device,
+    heap: &ID3D12DescriptorHeap,
+    index: u32,
+) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；两个查询都无副作用。
+    let size = unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) };
+    // SAFETY: 同上。
+    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: start.ptr + index as usize * size as usize,
+    }
+}
+
+/// 建一个 RTV（**视图格式**决定是否做 sRGB 编码，DEVIATIONS F-80）。
+fn create_render_target_view(
+    device: &ID3D12Device,
+    resource: &ID3D12Resource,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_RTV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            },
+        },
+    };
+    // SAFETY: 设备句柄由进程级 `SharedGpu` 持有；资源与视图描述在调用期间有效。
+    unsafe { device.CreateRenderTargetView(resource, Some(&desc), handle) };
+}
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 
     use super::{
         GpuRenderer, Persist, copy_content, copy_extent, copy_plan, geometry_root, grown_buffer,
-        root_uniform, shrink_target,
+        root_uniform, rtv_handle, shrink_target,
     };
     use crate::{
         error::EngineError,
@@ -1947,6 +2015,115 @@ mod tests {
         }
     }
 
+    /// 关窗不泄漏：渲染器销毁后，它注册进共享设备句柄表的资源必须全部注销。
+    ///
+    /// 进程级设备不会随窗口销毁，所以 persist / 上传缓冲 / staging / 几何缓冲的句柄必须在
+    /// `GpuRenderer::drop` 里主动交回（否则每关一个窗口就泄漏一份显存）。
+    #[test]
+    fn dropping_a_renderer_releases_its_shared_device_resources() {
+        let _guard = lock();
+        let shared =
+            crate::render::windows::device::SharedGpu::new_warp().expect("WARP shared gpu");
+        assert_eq!(shared.live_resources(), 0, "共享 GPU 创建时不注册资源");
+        {
+            let mut renderer = GpuRenderer::with_shared(std::sync::Arc::clone(&shared), (16, 16))
+                .expect("renderer");
+            let mut rows = crate::render::DirtyRows::default();
+            rows.mark(0, u32::MAX);
+            renderer.queue_atlas_upload(
+                AtlasKind::Glyph,
+                super::TEST_ATLAS_PAGE,
+                vec![0u8; (super::TEST_ATLAS_PAGE * super::TEST_ATLAS_PAGE) as usize],
+                rows,
+            );
+            let scene = Scene::empty();
+            let mut encoder = InstanceEncoder::new();
+            let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+            let mut frame = full_plan((16, 16));
+            let mut timings = FrameTimings::new();
+            renderer
+                .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+                .expect("submit");
+            assert!(
+                shared.live_resources() > 0,
+                "渲染器必须持有 persist / upload / staging 资源"
+            );
+        }
+        assert_eq!(
+            shared.live_resources(),
+            0,
+            "关窗后渲染器注册的所有资源句柄必须注销"
+        );
+    }
+
+    /// 多窗口共享契约：两个渲染器共享同一个进程级 `SharedGpu`，但在共享 SRV 堆里各有独立段。
+    #[test]
+    fn offscreen_renderers_share_the_process_gpu() {
+        let _guard = lock();
+        let Some(first) = warp_renderer((8, 8)) else {
+            return;
+        };
+        let Some(second) = warp_renderer((8, 8)) else {
+            return;
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&first.shared, &second.shared),
+            "两个窗口必须共享同一个 SharedGpu（device / queue / PSO / 图集纹理）"
+        );
+        assert_ne!(
+            first.descriptors.base(),
+            second.descriptors.base(),
+            "每个窗口在共享 SRV 堆里必须有各自的段"
+        );
+    }
+
+    /// 两个窗口并发录制 + 提交到同一条进程级队列：各自的 persist / readback 互不干扰。
+    ///
+    /// 两张图集纹理是共享的，所以两个线程上传**同一页的相同内容**：共享纹理的最终内容因此与
+    /// 两个线程的提交顺序无关（跨窗口图集并发上传的正确性论证见 `windows/atlas.rs` 模块文档）。
+    #[test]
+    fn two_renderers_render_concurrently_on_one_shared_gpu() {
+        let _guard = lock();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let page = super::TEST_ATLAS_PAGE;
+        let mut threads = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let mut renderer =
+                    GpuRenderer::new_warp_offscreen((8, 8)).expect("shared WARP renderer");
+                let mut pixels = vec![0u8; (page * page) as usize];
+                for row in pixels.chunks_mut(page as usize) {
+                    row.fill(0x40);
+                }
+                let mut rows = crate::render::DirtyRows::default();
+                rows.mark(0, u32::MAX);
+                renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
+
+                let text_free = one_lane_scene(quad(
+                    Rect::new(2.0, 2.0, 2.0, 2.0),
+                    Color::srgb(1.0, 0.0, 0.0, 1.0),
+                ));
+                let mut encoder = InstanceEncoder::new();
+                let buffer = encoder.encode(&text_free, Scale::ONE, &resolver());
+                // 尽量让两个线程的录制 / 提交重叠（真正的并发点）。
+                barrier.wait();
+                let mut timings = FrameTimings::new();
+                for frame in 1..=6u32 {
+                    let mut plan = full_plan((8, 8));
+                    renderer
+                        .submit_buffer(FrameIndex::from_raw(frame), buffer, &mut plan, &mut timings)
+                        .expect("concurrent submit");
+                }
+                let image = renderer.readback().expect("readback");
+                assert_eq!(pixel(&image, 8, 3, 3), [255, 0, 0, 255]);
+                assert_eq!(pixel(&image, 8, 0, 0), [0, 0, 0, 0]);
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("concurrent gpu thread must not panic");
+        }
+    }
     fn resolver() -> ColorResolver {
         ColorResolver::new(Interpolation::default())
     }
@@ -2743,12 +2920,12 @@ mod tests {
         let Some(renderer) = warp_renderer((8, 8)) else {
             return;
         };
-        let main = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 0);
-        let background = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
+        let main = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 0);
+        let background = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 1);
         // SAFETY: 设备 / 堆句柄由渲染器持有，调用期间有效；查询无副作用。
         let size = unsafe {
             renderer
-                .device
+                .shared
                 .raw()
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
         };
@@ -2886,14 +3063,14 @@ mod tests {
             .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
             .expect("old content");
         // 新目标 128×128：离屏路径不建背景层，第二个 RTV 描述符在这里空闲可用。
-        let rtv = GpuRenderer::rtv_handle(&renderer.device, &renderer.rtv_heap, 1);
-        let destination = Persist::new(&mut renderer.device, (128, 128), rtv).expect("new persist");
+        let rtv = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 1);
+        let destination = Persist::new(&renderer.shared, (128, 128), rtv).expect("new persist");
         let source = std::mem::replace(&mut renderer.persist, destination);
         {
             let destination = &renderer.persist;
             let source = &source;
             renderer
-                .queue
+                .stream
                 .submit_immediate(|list| {
                     // 缩容 prime 的固定顺序：先整块 clear，再从旧目标拷内容。
                     // SAFETY: 两个目标都处于 RENDER_TARGET；清整块不需要矩形。

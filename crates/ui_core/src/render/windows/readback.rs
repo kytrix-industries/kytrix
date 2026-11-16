@@ -13,8 +13,8 @@ use windows::Win32::Graphics::{
 use crate::{
     error::EngineError,
     render::windows::{
-        device::{Device, init_error_from},
-        queue::Queue,
+        device::{SharedGpu, init_error_from},
+        queue::CommandStream,
     },
 };
 
@@ -46,14 +46,14 @@ impl Readback {
     /// 把 `source`（持久 offscreen，状态 `RENDER_TARGET`）读回 CPU。
     pub(crate) fn capture(
         &mut self,
-        device: &Device,
-        queue: &mut Queue,
+        shared: &SharedGpu,
+        stream: &mut CommandStream,
         source: &ID3D12Resource,
         size: (u32, u32),
     ) -> Result<ReadbackImage, EngineError> {
         self.capture_from(
-            device,
-            queue,
+            shared,
+            stream,
             source,
             size,
             DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -64,15 +64,15 @@ impl Readback {
     /// 指定源资源的出入状态（图集等非 RT 资源用）。
     pub(crate) fn capture_from(
         &mut self,
-        device: &Device,
-        queue: &mut Queue,
+        shared: &SharedGpu,
+        stream: &mut CommandStream,
         source: &ID3D12Resource,
         size: (u32, u32),
         format: DXGI_FORMAT,
         resident: D3D12_RESOURCE_STATES,
     ) -> Result<ReadbackImage, EngineError> {
         if self.buffer.is_none() || self.size != size {
-            self.recreate(device, size, format)?;
+            self.recreate(shared, size, format)?;
         }
         let buffer = self.buffer.as_ref().ok_or_else(|| EngineError::AppInit {
             detail: smol_str::SmolStr::new_static("readback buffer missing"),
@@ -89,7 +89,7 @@ impl Readback {
             },
         };
 
-        queue.submit_immediate(|list| {
+        stream.submit_immediate(|list| {
             transition(list, source, resident, D3D12_RESOURCE_STATE_COPY_SOURCE);
             let mut destination = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(buffer.clone())),
@@ -171,7 +171,7 @@ impl Readback {
 
     fn recreate(
         &mut self,
-        device: &Device,
+        shared: &SharedGpu,
         size: (u32, u32),
         format: DXGI_FORMAT,
     ) -> Result<(), EngineError> {
@@ -196,7 +196,7 @@ impl Readback {
         let mut total = 0u64;
         // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
-            device.raw().GetCopyableFootprints(
+            shared.raw().GetCopyableFootprints(
                 &desc,
                 0,
                 1,
@@ -232,7 +232,7 @@ impl Readback {
         let mut out: Option<ID3D12Resource> = None;
         // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
-            device.raw().CreateCommittedResource(
+            shared.raw().CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &buffer_desc,

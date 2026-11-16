@@ -39,7 +39,7 @@ use crate::{
     render::{
         compositor::{DamageRects, FramePlan},
         damage::MAX_DAMAGE_RECTS,
-        windows::{device::init_error_from, queue::Queue},
+        windows::device::init_error_from,
     },
 };
 
@@ -62,13 +62,16 @@ impl Swapchain {
     /// 不能再 `ResizeBuffers`：内容越过 `buffer` 时调用方整条替换交换链（新的
     /// [`Swapchain::for_composition`]）；内容静止 2 s 后缩容也会替换成更小的桶（先拷旧内容），
     /// 旧链都在新 `SetContent` + `Commit` 之后丢弃。
-    pub(crate) fn for_composition(queue: &Queue, buffer: (u32, u32)) -> Result<Self, EngineError> {
+    pub(crate) fn for_composition(
+        queue: &ID3D12CommandQueue,
+        buffer: (u32, u32),
+    ) -> Result<Self, EngineError> {
         let factory = create_factory()?;
         let desc = composition_desc(buffer);
         // SAFETY: COM 调用：工厂 / 队列 / 描述符在调用期间有效；`NULL` output 表示不限制到
         // 某个显示器；失败按 HRESULT 处理。
         let raw: IDXGISwapChain1 =
-            unsafe { factory.CreateSwapChainForComposition(queue.raw(), &desc, None) }.map_err(
+            unsafe { factory.CreateSwapChainForComposition(queue, &desc, None) }.map_err(
                 |error| EngineError::Swapchain {
                     detail: smol_str::format_smolstr!(
                         "CreateSwapChainForComposition({}x{}): {:#010X}",
